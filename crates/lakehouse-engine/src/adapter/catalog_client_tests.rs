@@ -1,37 +1,49 @@
 use super::*;
 
-/// The listing pipeline cannot branch on the catalog kind.
-///
-/// This is a compile-time surface probe: `build_listing_virtual_tables` compiles
-/// with a signature naming neither `CatalogKind` nor a `CatalogClient`, so the
-/// listing pipeline is structurally incapable of consulting the kind or a client;
-/// `construct_catalog_client` is the listing path's sole kind→client construction
-/// site. The probe pins only these two signatures — it does not (and cannot) prove
-/// the kind is matched nowhere else. `validate_creds` and the pushdown path's
-/// `TableScanResolver::for_request` — the pushdown pipeline's own ONE
-/// kind→session construction site — legitimately consult the kind, both OUTSIDE
-/// this listing pipeline.
+type CatalogClientConstruction = fn(
+    CatalogKind,
+    String,
+    StorageBackend,
+    ConnectionCreds,
+    &Json,
+) -> Result<Box<dyn CatalogClient>, UdfError>;
+
 #[test]
-fn catalog_kind_is_matched_only_at_the_construction_site() {
+fn construction_site_is_exhaustive_and_fallible_for_every_kind() {
     let _pipeline: fn(
         &[String],
         &CatalogListing,
-        TimestampPrecision,
+        EngineTimestampSupport,
     ) -> Result<VirtualTables, UdfError> = build_listing_virtual_tables;
-    let _constructor: fn(
-        CatalogKind,
-        String,
-        StorageBackend,
-        ConnectionCreds,
-    ) -> Box<dyn CatalogClient> = construct_catalog_client;
+    let _constructor: CatalogClientConstruction = construct_catalog_client;
+
+    let glue_creds = |region: &str| ConnectionCreds {
+        region: region.to_string(),
+        access_key: "AKID".to_string(),
+        secret_key: "SECRET".to_string(),
+        use_sigv4: true,
+        ..ConnectionCreds::default()
+    };
+    let construct = |address: &str, creds: ConnectionCreds| {
+        let storage = connection::storage_block(&creds, false);
+        construct_catalog_client(
+            CatalogKind::Glue,
+            address.to_string(),
+            storage,
+            creds,
+            &json!({}),
+        )
+    };
+
+    assert!(construct("https://glue.us-east-1.amazonaws.com", glue_creds("")).is_ok());
+    assert!(construct("https://glue.example.test", glue_creds("eu-west-1")).is_ok());
+    let err = construct("https://glue.example.test", glue_creds(""))
+        .err()
+        .expect("a Glue address with no region must fail construction")
+        .to_string();
+    assert!(!err.contains("SECRET"), "{err}");
 }
 
-/// Both catalog kinds resolve their tables through the ONE shared listing
-/// pipeline: fed two listings that carry the same table and column names and
-/// differ only in the table's format tag and each column's source-tagged type —
-/// exactly what a real Iceberg vs Unity client attaches — the pipeline produces
-/// the same Exasol table name, the same case-folded column name, and the same
-/// `TABLE_MAP`.
 #[test]
 fn both_kinds_share_one_listing_pipeline() {
     use iceberg::spec::{PrimitiveType, Type};
@@ -51,6 +63,8 @@ fn both_kinds_share_one_listing_pipeline() {
             storage_location: None,
             format,
             vended_credential_key: None,
+            partition_columns: Vec::new(),
+            metadata_location: None,
             columns: vec![CatalogColumn {
                 name: "order_id".to_string(),
                 source_type,
@@ -66,26 +80,23 @@ fn both_kinds_share_one_listing_pipeline() {
     let unity_listing = one_table_listing(
         TableFormat::Delta,
         ColumnSourceType::Unity {
-            type_name: "LONG".to_string(),
-            precision: 0,
-            scale: 0,
+            type_json: Some(r#"{"name":"id","type":"long","nullable":true,"metadata":{}}"#.into()),
         },
     );
 
     let (ib_tables, ib_map, _) = build_listing_virtual_tables(
         &configured_ns,
         &iceberg_listing,
-        TimestampPrecision::Millisecond,
+        EngineTimestampSupport::MillisecondOnly,
     )
     .unwrap();
     let (uc_tables, uc_map, _) = build_listing_virtual_tables(
         &configured_ns,
         &unity_listing,
-        TimestampPrecision::Millisecond,
+        EngineTimestampSupport::MillisecondOnly,
     )
     .unwrap();
 
-    // One pipeline: identical flatten, case-fold, and TABLE_MAP for both kinds.
     assert_eq!(ib_tables[0]["name"], "ORDERS");
     assert_eq!(ib_tables[0]["name"], uc_tables[0]["name"]);
     assert_eq!(ib_tables[0]["columns"][0]["name"], "ORDER_ID");
@@ -99,17 +110,12 @@ fn both_kinds_share_one_listing_pipeline() {
     );
     assert_eq!(ib_map, uc_map);
 
-    // The ONE type-mapping home maps `LONG` identically for both source kinds.
     assert_eq!(
         ib_tables[0]["columns"][0]["dataType"],
         uc_tables[0]["columns"][0]["dataType"]
     );
 }
 
-/// Scenario (datafusion-scan/type-mapping): the resolved precision reaches the
-/// declared column type. The listing pipeline declares a timestamp column at the
-/// precision it is handed — the threading half of the createVirtualSchema
-/// response, with no live engine involved.
 #[test]
 fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
     use iceberg::spec::{PrimitiveType, Type};
@@ -128,6 +134,8 @@ fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
             storage_location: None,
             format: TableFormat::Iceberg,
             vended_credential_key: None,
+            partition_columns: Vec::new(),
+            metadata_location: None,
             columns: vec![
                 CatalogColumn {
                     name: "ts".to_string(),
@@ -138,9 +146,10 @@ fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
                 CatalogColumn {
                     name: "delta_ts".to_string(),
                     source_type: ColumnSourceType::Unity {
-                        type_name: "TIMESTAMP".to_string(),
-                        precision: 0,
-                        scale: 0,
+                        type_json: Some(
+                            r#"{"name":"delta_ts","type":"timestamp","nullable":true,"metadata":{}}"#
+                                .into(),
+                        ),
                     },
                 },
             ],
@@ -150,19 +159,19 @@ fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
 
     let cases = [
         (
-            TimestampPrecision::Microsecond,
+            EngineTimestampSupport::DeclaredPrecision,
             json!({"type": "timestamp", "fractionalSecondsPrecision": 6}),
         ),
         (
-            TimestampPrecision::Millisecond,
+            EngineTimestampSupport::MillisecondOnly,
             json!({"type": "timestamp"}),
         ),
     ];
-    for (precision, expected) in cases {
+    for (engine, expected) in cases {
         let (tables, _, _) =
-            build_listing_virtual_tables(&configured_ns, &listing, precision).unwrap();
+            build_listing_virtual_tables(&configured_ns, &listing, engine).unwrap();
         let columns = tables[0]["columns"].as_array().unwrap();
-        assert_eq!(columns[0]["dataType"], expected, "iceberg at {precision:?}");
-        assert_eq!(columns[1]["dataType"], expected, "delta at {precision:?}");
+        assert_eq!(columns[0]["dataType"], expected, "iceberg on {engine:?}");
+        assert_eq!(columns[1]["dataType"], expected, "delta on {engine:?}");
     }
 }

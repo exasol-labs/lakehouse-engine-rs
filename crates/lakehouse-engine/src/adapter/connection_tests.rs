@@ -3,10 +3,7 @@ use crate::adapter::catalog_kind::CatalogKind;
 use crate::scan::spec::{AdlsCred, StorageProps};
 use exasol_udf_sdk::connect_back::ConnectionObject;
 use exasol_udf_sdk::test_support::TestContext;
-
-// ---------------------------------------------------------------------------
-// TestContext construction helpers for unit tests
-// ---------------------------------------------------------------------------
+use lakehouse_catalog::{StaticStoreAddress, StorageCreds};
 
 fn with_conn(address: &str, password: &str) -> TestContext {
     TestContext::scalar(vec![]).with_connection(
@@ -36,10 +33,6 @@ fn minimal_password() -> String {
     .to_string()
 }
 
-// ---------------------------------------------------------------------------
-// Scenario: read_connection_parses_uri_and_creds
-// ---------------------------------------------------------------------------
-
 #[test]
 fn read_connection_parses_uri_and_creds() {
     let ctx = with_conn("http://catalog.example.com", &minimal_password());
@@ -56,10 +49,6 @@ fn read_connection_parses_uri_and_creds() {
     assert!(!resolved.creds.use_vended_credentials);
     assert_eq!(resolved.creds.path_style, Some(true));
 }
-
-// ---------------------------------------------------------------------------
-// Scenario: missing_connection_name_errors
-// ---------------------------------------------------------------------------
 
 #[test]
 fn missing_connection_name_errors() {
@@ -79,14 +68,9 @@ fn missing_connection_name_errors() {
             .contains("CATALOG_CONNECTION is required")
     );
 
-    // No credential value in error
     assert!(!err_none.to_string().contains("SECRET"));
     assert!(!err_empty.to_string().contains("SECRET"));
 }
-
-// ---------------------------------------------------------------------------
-// Scenario: malformed_password_no_leak
-// ---------------------------------------------------------------------------
 
 #[test]
 fn malformed_password_no_leak() {
@@ -94,16 +78,13 @@ fn malformed_password_no_leak() {
     let ctx = with_conn("http://catalog.example.com", bad_password);
     let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap_err();
 
-    // Error must say it's not a valid JSON object
     assert!(err.to_string().contains("not a valid JSON object"));
-    // Must NOT echo the password text
     assert!(!err.to_string().contains("not-json-at-all"));
     assert!(!err.to_string().contains("SECRET_VALUE_HERE"));
 }
 
 #[test]
 fn json_array_password_no_leak() {
-    // Valid JSON but not an object (array) — should also be rejected
     let array_password = r#"["SECRET_IN_ARRAY", "OTHER_VAL"]"#;
     let ctx = with_conn("http://catalog.example.com", array_password);
     let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap_err();
@@ -112,14 +93,8 @@ fn json_array_password_no_leak() {
     assert!(!err.to_string().contains("SECRET_IN_ARRAY"));
 }
 
-// ---------------------------------------------------------------------------
-// Scenario: missing_required_fields_listed
-// ---------------------------------------------------------------------------
-
 #[test]
 fn missing_warehouse_rejected_s3_not_required() {
-    // Password omitting warehouse — only warehouse is required; the four S3
-    // fields are optional and must NOT be reported as missing.
     let no_warehouse = serde_json::json!({
         "endpoint": "http://s3.example.com",
         "region": "us-east-1"
@@ -133,7 +108,6 @@ fn missing_warehouse_rejected_s3_not_required() {
         msg.contains("warehouse"),
         "must name missing field 'warehouse': {msg}"
     );
-    // The optional S3 fields must NOT be reported as missing.
     assert!(
         !msg.contains("access_key"),
         "access_key is optional and must not be reported missing: {msg}"
@@ -146,8 +120,6 @@ fn missing_warehouse_rejected_s3_not_required() {
 
 #[test]
 fn warehouse_only_password_accepted_s3_optional() {
-    // Warehouse alone is sufficient when SigV4 is not enabled; the four S3
-    // fields default to empty (orthogonality + over-strictness fix).
     let partial = serde_json::json!({ "warehouse": "wh" }).to_string();
     let ctx = with_conn("http://catalog.example.com", &partial);
     let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
@@ -164,8 +136,6 @@ fn warehouse_only_password_accepted_s3_optional() {
 
 #[test]
 fn legacy_full_static_s3_password_still_accepted() {
-    // Backward-compat guard: a legacy full static-S3 password (warehouse + the
-    // four S3 fields) validates and parses identically to before.
     let ctx = with_conn("http://catalog.example.com", &minimal_password());
     let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
     let creds = &resolved.creds;
@@ -177,13 +147,6 @@ fn legacy_full_static_s3_password_still_accepted() {
     assert_eq!(creds.secret_key, "SECRET");
 }
 
-// ---------------------------------------------------------------------------
-// Scenario: optional_fields_default
-// ---------------------------------------------------------------------------
-
-/// Warehouse-only password: the four S3 fields AND the five new auth fields
-/// must all default to absent/empty; use_sigv4 and use_vended_credentials
-/// must default false.
 #[test]
 fn optional_fields_default() {
     let warehouse_only = serde_json::json!({ "warehouse": "wh" }).to_string();
@@ -191,13 +154,11 @@ fn optional_fields_default() {
     let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
     let creds = &resolved.creds;
 
-    // The four S3 fields default to empty when not supplied.
     assert_eq!(creds.endpoint, "", "endpoint must default to empty");
     assert_eq!(creds.region, "", "region must default to empty");
     assert_eq!(creds.access_key, "", "access_key must default to empty");
     assert_eq!(creds.secret_key, "", "secret_key must default to empty");
 
-    // The five new auth fields default to None when not supplied.
     assert_eq!(creds.token, None, "token must default to None");
     assert_eq!(creds.client_id, None, "client_id must default to None");
     assert_eq!(
@@ -210,7 +171,6 @@ fn optional_fields_default() {
     );
     assert_eq!(creds.scope, None, "scope must default to None");
 
-    // Flags default to false.
     assert!(!creds.use_sigv4, "use_sigv4 must default to false");
     assert!(
         !creds.use_vended_credentials,
@@ -247,10 +207,6 @@ fn optional_fields_set_when_supplied() {
     assert!(creds.use_vended_credentials);
 }
 
-// ---------------------------------------------------------------------------
-// storage_block and catalog_block helpers
-// ---------------------------------------------------------------------------
-
 #[test]
 fn storage_block_maps_creds_to_storage_props() {
     let ctx = with_conn("http://catalog.example.com", &minimal_password());
@@ -267,16 +223,11 @@ fn storage_block_maps_creds_to_storage_props() {
     assert!(storage.path_style);
 }
 
-/// Distinctive so a "this value never reaches an error" assertion cannot pass
-/// by accident: no substring of these appears in any field name or fixed
-/// message text.
+/// Distinctive values so a never-leaks assertion cannot pass by accident.
 const AZURE_ACCOUNT_KEY: &str = "azure-shared-key-must-never-leak";
 const AZURE_SAS: &str = "sv=2024-01-01&sig=azure-sas-signature-must-never-leak";
 const S3_SECRET: &str = "s3-secret-must-never-leak";
 
-/// The account-key shape resolves to `AdlsCred::AccountKey` and leaves
-/// `sas_token` absent — the two Azure credential fields are never both
-/// populated on a well-formed CONNECTION.
 #[test]
 fn account_key_creds_select_the_adls_backend() {
     let password = serde_json::json!({
@@ -304,8 +255,6 @@ fn account_key_creds_select_the_adls_backend() {
     );
 }
 
-/// `allow_http` is an S3-only knob, so passing it enabled must leave the Azure
-/// payload identical — the variant carries no HTTP-scheme field at all.
 #[test]
 fn sas_token_creds_select_the_adls_backend() {
     let password = serde_json::json!({
@@ -329,8 +278,6 @@ fn sas_token_creds_select_the_adls_backend() {
     );
 }
 
-/// The three malformed Azure shapes: no account name, both credentials, and
-/// neither credential. Each names its own defect and no supplied value.
 #[test]
 fn azure_creds_require_account_name_and_exactly_one_credential() {
     let shapes = [
@@ -370,8 +317,6 @@ fn azure_creds_require_account_name_and_exactly_one_credential() {
     }
 }
 
-/// The rejection names every supplied field so the operator can see which
-/// two credential sets collided, while echoing none of their values.
 #[test]
 fn mixed_azure_and_s3_credential_fields_are_rejected() {
     let password = serde_json::json!({
@@ -402,8 +347,6 @@ fn mixed_azure_and_s3_credential_fields_are_rejected() {
     assert!(!err.contains(S3_SECRET), "{err}");
 }
 
-/// A CONNECTION naming no Azure field is still an S3 CONNECTION, whether or
-/// not it requests vended credentials.
 #[test]
 fn absent_optional_fields_default_and_still_select_s3() {
     for use_vended_credentials in [false, true] {
@@ -431,16 +374,6 @@ fn absent_optional_fields_default_and_still_select_s3() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Scenario: path_style tri-state — one selector serves both readers, and a
-// non-vended endpoint without a stated preference is rejected rather than
-// silently defaulted.
-// ---------------------------------------------------------------------------
-
-/// The adapter-side reader (`ConnectionCreds` -> `StorageCreds::from` ->
-/// `backend`) and the scan-side reader (`StorageCreds::from_json` ->
-/// `backend`) must derive a field-for-field equal backend from the SAME
-/// password, including when it omits `path_style` entirely.
 #[test]
 fn both_readers_derive_an_equal_backend_from_a_password_omitting_path_style() {
     let password = serde_json::json!({
@@ -469,8 +402,6 @@ fn both_readers_derive_an_equal_backend_from_a_password_omitting_path_style() {
     );
 }
 
-/// A non-vended CONNECTION that names a storage endpoint but states no
-/// `path_style` is rejected, naming the field, rather than silently resolved.
 #[test]
 fn endpoint_without_a_stated_path_style_is_rejected_naming_the_field() {
     let password = serde_json::json!({
@@ -488,8 +419,6 @@ fn endpoint_without_a_stated_path_style_is_rejected_naming_the_field() {
     assert!(err.to_string().contains("path_style"), "{err}");
 }
 
-/// Either explicit value beside an endpoint is accepted — the guard fires
-/// only on an unstated preference, never on a stated one.
 #[test]
 fn an_explicit_path_style_beside_an_endpoint_is_accepted_under_either_value() {
     for path_style in [true, false] {
@@ -510,9 +439,6 @@ fn an_explicit_path_style_beside_an_endpoint_is_accepted_under_either_value() {
     }
 }
 
-/// The guard is scoped to "endpoint present, path_style absent, vending off":
-/// it must not fire when there is no endpoint at all, nor when vending is
-/// enabled even though the endpoint would otherwise trigger it.
 #[test]
 fn the_path_style_guard_does_not_fire_without_an_endpoint_or_under_vending() {
     let no_endpoint = serde_json::json!({ "warehouse": "wh" }).to_string();
@@ -534,7 +460,6 @@ fn the_path_style_guard_does_not_fire_without_an_endpoint_or_under_vending() {
         .expect("an endpoint under vending must not trigger the path_style guard");
 }
 
-/// The rejection message names no credential value.
 #[test]
 fn the_path_style_rejection_names_no_credential_value() {
     let password = serde_json::json!({
@@ -554,15 +479,6 @@ fn the_path_style_rejection_names_no_credential_value() {
     assert!(!err.contains("SECRET_SENTINEL"), "{err}");
 }
 
-/// A single well-formed credential set (S3 XOR Azure) together with
-/// `use_vended_credentials = true` is ACCEPTED: `validate_creds` never reads that
-/// flag, because SigV4 catalog signing needs `access_key`/`secret_key` regardless
-/// of whether storage credentials end up vended. Static fields under vending go
-/// unused, never rejected.
-///
-/// Also pins the mixed-fields guard and the SigV4 field requirement WITH vending
-/// requested, so a regression skipping validation under vending would not pass
-/// unnoticed.
 #[test]
 fn static_storage_fields_with_vending_are_accepted_and_unused() {
     let s3_password = serde_json::json!({
@@ -594,7 +510,6 @@ fn static_storage_fields_with_vending_are_accepted_and_unused() {
         Some(AZURE_ACCOUNT_KEY)
     );
 
-    // The mixed-fields guard still fires under vending.
     let mixed_password = serde_json::json!({
         "warehouse": "wh",
         "account_name": "myaccount",
@@ -615,7 +530,6 @@ fn static_storage_fields_with_vending_are_accepted_and_unused() {
     assert!(!err.contains(AZURE_ACCOUNT_KEY), "{err}");
     assert!(!err.contains(S3_SECRET), "{err}");
 
-    // The SigV4 field requirement still fires under vending.
     let sigv4_password = serde_json::json!({
         "warehouse": "wh",
         "use_sigv4": true,
@@ -636,11 +550,6 @@ fn static_storage_fields_with_vending_are_accepted_and_unused() {
     assert!(!err.contains(S3_SECRET), "{err}");
 }
 
-/// `storage_block` is total. A credential set that never passed
-/// `validate_creds` — two Azure credentials at once, or a credential with no
-/// account name — resolves deterministically to S3 instead of panicking,
-/// because a panic inside a UDF is an abnormal VM exit and the engine
-/// SIGKILLs every sibling VM of the statement part when one dies that way.
 #[test]
 fn storage_block_falls_through_to_s3_for_an_unvalidated_azure_shape() {
     let both_credentials = parse_creds(&serde_json::json!({
@@ -677,10 +586,6 @@ fn catalog_block_maps_creds_to_catalog_props() {
     assert_eq!(catalog.table, "db.my_table");
 }
 
-// ---------------------------------------------------------------------------
-// Scenario: token is parsed and exposed; no leak via Debug
-// ---------------------------------------------------------------------------
-
 #[test]
 fn token_parsed_from_json() {
     let json = serde_json::json!({
@@ -714,10 +619,6 @@ fn token_redacted_in_debug_output() {
         "Debug must show [redacted] for token: {debug}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Scenario: OAuth2 client credentials are parsed and exposed; secret not leaked
-// ---------------------------------------------------------------------------
 
 #[test]
 fn oauth_client_creds_parsed_from_json() {
@@ -771,16 +672,12 @@ fn client_secret_redacted_in_debug_output() {
         debug.contains("[redacted]"),
         "Debug must show [redacted] for client_secret: {debug}"
     );
-    // client_id is not a secret — it may appear
+    // client_id is not a secret, so it may appear.
     assert!(
         debug.contains("my-client-id"),
         "client_id should appear in Debug: {debug}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Scenario: has_catalog_auth helper
-// ---------------------------------------------------------------------------
 
 #[test]
 fn has_catalog_auth_true_when_token_present() {
@@ -802,8 +699,7 @@ fn has_catalog_auth_true_when_client_creds_present() {
 
 #[test]
 fn has_catalog_auth_true_when_only_client_id_present() {
-    // Even partial oauth signals catalog-auth intent (incomplete; validation rejects it,
-    // but the helper reports presence for the SigV4 guard)
+    // Partial OAuth still signals catalog-auth intent for the SigV4 guard.
     let json = serde_json::json!({ "warehouse": "wh", "client_id": "id" });
     let creds = parse_creds(&json);
     assert!(creds.has_catalog_auth());
@@ -821,10 +717,6 @@ fn has_catalog_auth_false_when_no_auth_fields() {
     let creds = parse_creds(&json);
     assert!(!creds.has_catalog_auth());
 }
-
-// ---------------------------------------------------------------------------
-// Scenario: new auth fields absent when not supplied (optional-defaults)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn new_auth_fields_default_to_none() {
@@ -844,17 +736,9 @@ fn new_auth_fields_default_to_none() {
     assert_eq!(creds.scope, None);
 }
 
-// ---------------------------------------------------------------------------
-// Scenario Coverage tests — exact names from the plan's Scenario Coverage table
-// ---------------------------------------------------------------------------
-
-/// Static S3 credentials are optional regardless of catalog auth mode.
-///
-/// A warehouse-only password with use_sigv4=false must be accepted; all four
-/// S3 fields default to empty without triggering an error.
+/// Scenario: static S3 credentials are optional regardless of catalog auth mode.
 #[test]
 fn s3_fields_optional_when_not_sigv4() {
-    // No S3 fields, no auth fields — just warehouse.
     let pw = serde_json::json!({ "warehouse": "wh" }).to_string();
     let ctx = with_conn("http://catalog.example.com", &pw);
     let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
@@ -867,7 +751,6 @@ fn s3_fields_optional_when_not_sigv4() {
     assert_eq!(creds.secret_key, "");
     assert!(!creds.use_sigv4);
 
-    // Same should hold when a token is present (token + warehouse, still no S3).
     let pw_with_token = serde_json::json!({
         "warehouse": "wh",
         "token": "my-secret-token"
@@ -877,16 +760,9 @@ fn s3_fields_optional_when_not_sigv4() {
     read_connection(&ctx2, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
 }
 
-/// When SigV4 is enabled, access_key, secret_key, and region are required.
-///
-/// Asserts:
-/// - Missing any of the three fields with use_sigv4=true → rejected; error names the
-///   missing field(s) and references SigV4; no value leaked.
-/// - Fires identically when use_vended_credentials is also true.
-/// - A missing `endpoint` alone does NOT trigger rejection under SigV4.
+/// Scenario: When SigV4 is enabled, access_key, secret_key, and a signing region are required
 #[test]
 fn sigv4_requires_access_secret_region() {
-    // Helper: build a password with use_sigv4=true and only the supplied S3 fields.
     let make_pw = |fields: serde_json::Value| {
         let mut obj = serde_json::json!({ "warehouse": "wh", "use_sigv4": true });
         if let (serde_json::Value::Object(base), serde_json::Value::Object(extra)) =
@@ -897,7 +773,6 @@ fn sigv4_requires_access_secret_region() {
         obj.to_string()
     };
 
-    // --- Missing access_key ---
     let pw = make_pw(serde_json::json!({
         "secret_key": "s3cr3t-VALUE",
         "region": "us-east-1"
@@ -911,8 +786,11 @@ fn sigv4_requires_access_secret_region() {
         "must reference SigV4: {msg}"
     );
     assert!(!msg.contains("s3cr3t-VALUE"), "must not leak value: {msg}");
+    assert!(
+        !msg.contains("https://glue.<region>.amazonaws.com"),
+        "must not state the Glue-endpoint alternative when region is not named: {msg}"
+    );
 
-    // --- Missing secret_key ---
     let pw = make_pw(serde_json::json!({
         "access_key": "AKID-VALUE",
         "region": "us-east-1"
@@ -927,7 +805,6 @@ fn sigv4_requires_access_secret_region() {
     );
     assert!(!msg.contains("AKID-VALUE"), "must not leak value: {msg}");
 
-    // --- Missing region ---
     let pw = make_pw(serde_json::json!({
         "access_key": "AKID-VALUE",
         "secret_key": "s3cr3t-VALUE"
@@ -941,8 +818,11 @@ fn sigv4_requires_access_secret_region() {
         "must reference SigV4: {msg}"
     );
     assert!(!msg.contains("s3cr3t-VALUE"), "must not leak value: {msg}");
+    assert!(
+        msg.contains("https://glue.<region>.amazonaws.com"),
+        "must state the Glue-endpoint alternative when region is named: {msg}"
+    );
 
-    // --- Fires also when use_vended_credentials = true ---
     let pw = serde_json::json!({
         "warehouse": "wh",
         "use_sigv4": true,
@@ -962,14 +842,13 @@ fn sigv4_requires_access_secret_region() {
     assert!(!msg.contains("s3cr3t-VALUE"), "must not leak value: {msg}");
     assert!(!msg.contains("AKID-VALUE"), "must not leak value: {msg}");
 
-    // --- Missing endpoint alone does NOT trigger rejection ---
     let pw = serde_json::json!({
         "warehouse": "wh",
         "use_sigv4": true,
         "access_key": "AKID-VALUE",
         "secret_key": "s3cr3t-VALUE",
         "region": "us-east-1"
-        // endpoint absent — must NOT cause rejection
+        // endpoint intentionally absent
     })
     .to_string();
     let ctx = with_conn("http://catalog.example.com", &pw);
@@ -977,10 +856,24 @@ fn sigv4_requires_access_secret_region() {
         .expect("endpoint is optional under SigV4; must not be rejected");
 }
 
-/// Static bearer token is exposed on the resolved credentials.
-///
-/// token + warehouse-only accepted; token field exposed; use_vended_credentials
-/// defaults false; no token value appears in Debug output.
+#[test]
+fn sigv4_region_derived_from_standard_glue_endpoint_is_accepted() {
+    let pw = serde_json::json!({
+        "warehouse": "wh",
+        "use_sigv4": true,
+        "access_key": "AKID-VALUE",
+        "secret_key": "s3cr3t-VALUE"
+    })
+    .to_string();
+    let ctx = with_conn("https://glue.eu-west-1.amazonaws.com/iceberg", &pw);
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
+        .expect("a standard Glue endpoint must supply the signing region");
+
+    assert_eq!(resolved.creds.region, "");
+    assert_eq!(StorageCreds::from(&resolved.creds).region, "");
+    assert_eq!(StaticStoreAddress::from(&resolved.creds).region(), "");
+}
+
 #[test]
 fn token_exposed_on_creds() {
     let pw = serde_json::json!({
@@ -992,18 +885,15 @@ fn token_exposed_on_creds() {
     let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
     let creds = &resolved.creds;
 
-    // Token is exposed on the struct.
     assert_eq!(
         creds.token.as_deref(),
         Some("my-secret-token"),
         "token must be exposed on creds"
     );
-    // use_vended_credentials stays independent (defaults false).
     assert!(
         !creds.use_vended_credentials,
         "use_vended_credentials must default false"
     );
-    // Token value must NOT leak through Debug.
     let debug = format!("{creds:?}");
     assert!(
         !debug.contains("my-secret-token"),
@@ -1011,13 +901,8 @@ fn token_exposed_on_creds() {
     );
 }
 
-/// OAuth2 client credentials are exposed on the resolved credentials.
-///
-/// client_id + client_secret + warehouse-only accepted; fields exposed;
-/// oauth2_server_uri/scope absent when omitted; no client_secret value leaked.
 #[test]
 fn oauth_client_creds_exposed_on_creds() {
-    // With oauth2_server_uri + scope omitted.
     let pw = serde_json::json!({
         "warehouse": "wh",
         "client_id": "my-client-id",
@@ -1030,23 +915,19 @@ fn oauth_client_creds_exposed_on_creds() {
 
     assert_eq!(creds.client_id.as_deref(), Some("my-client-id"));
     assert_eq!(creds.client_secret.as_deref(), Some("my-client-secret"));
-    // Optional fields absent when not supplied.
     assert_eq!(
         creds.oauth2_server_uri, None,
         "oauth2_server_uri must be absent"
     );
     assert_eq!(creds.scope, None, "scope must be absent");
-    // token stays absent.
     assert_eq!(creds.token, None);
 
-    // client_secret must NOT leak through Debug.
     let debug = format!("{creds:?}");
     assert!(
         !debug.contains("my-client-secret"),
         "client_secret must not appear in Debug: {debug}"
     );
 
-    // With oauth2_server_uri + scope supplied — both exposed.
     let pw2 = serde_json::json!({
         "warehouse": "wh",
         "client_id": "my-client-id",
@@ -1066,13 +947,9 @@ fn oauth_client_creds_exposed_on_creds() {
     assert_eq!(creds2.scope.as_deref(), Some("catalog:read"));
 }
 
-/// Incomplete OAuth2 client credentials rejected naming only the missing field.
-///
-/// Exactly one of client_id/client_secret present → rejected; error names only the
-/// missing field; no value leaked.
+/// Scenario: incomplete OAuth2 client credentials are rejected naming only the missing field.
 #[test]
 fn incomplete_oauth_rejected_no_leak() {
-    // client_id present, client_secret missing.
     let pw = serde_json::json!({
         "warehouse": "wh",
         "client_id": "my-client-id"
@@ -1085,10 +962,8 @@ fn incomplete_oauth_rejected_no_leak() {
         msg.contains("client_secret"),
         "must name missing field client_secret: {msg}"
     );
-    // Must not echo the client_id value.
     assert!(!msg.contains("my-client-id"), "must not leak value: {msg}");
 
-    // client_secret present, client_id missing.
     let pw2 = serde_json::json!({
         "warehouse": "wh",
         "client_secret": "my-client-secret"
@@ -1101,21 +976,12 @@ fn incomplete_oauth_rejected_no_leak() {
         msg2.contains("client_id"),
         "must name missing field client_id: {msg2}"
     );
-    // Must not echo the client_secret value.
     assert!(
         !msg2.contains("my-client-secret"),
         "must not leak value: {msg2}"
     );
 }
 
-/// A CONNECTION supplying a `token` together with a complete `client_id`/
-/// `client_secret` pair is rejected under both catalog kinds, naming all
-/// three fields and leaking none of their values.
-///
-/// A third case supplies `token` and `client_id` only: rule 7 (OAuth2
-/// completeness) still fires naming the missing `client_secret`, which is
-/// the disjointness assertion — it fails if rule 6 were widened to fire on
-/// a token beside any single OAuth2 field rather than the complete pair.
 #[test]
 fn token_with_complete_oauth_pair_is_rejected_under_both_kinds() {
     let pw = serde_json::json!({
@@ -1150,8 +1016,7 @@ fn token_with_complete_oauth_pair_is_rejected_under_both_kinds() {
         );
     }
 
-    // token + client_id only (client_secret missing): the ambiguous-pair rule
-    // must not fire here, so rule 7 fires instead, naming only the missing field.
+    // token + client_id only: the ambiguous-pair rule must not fire; OAuth2 completeness does.
     let pw_partial = serde_json::json!({
         "warehouse": "wh",
         "token": "sentinel-token-value",
@@ -1175,13 +1040,9 @@ fn token_with_complete_oauth_pair_is_rejected_under_both_kinds() {
     );
 }
 
-/// Catalog token/OAuth auth and SigV4 are mutually exclusive.
-///
-/// use_sigv4=true + token → rejected; use_sigv4=true + OAuth → rejected.
-/// No auth value appears in the error message.
+/// Scenario: catalog token/OAuth auth and SigV4 are mutually exclusive.
 #[test]
 fn sigv4_and_catalog_auth_mutually_exclusive() {
-    // SigV4 + token combination.
     let pw_sigv4_token = serde_json::json!({
         "warehouse": "wh",
         "access_key": "AKID",
@@ -1198,7 +1059,6 @@ fn sigv4_and_catalog_auth_mutually_exclusive() {
         msg.to_lowercase().contains("sigv4"),
         "error must reference SigV4: {msg}"
     );
-    // No secret or token value must appear.
     assert!(
         !msg.contains("my-secret-token"),
         "must not leak token value: {msg}"
@@ -1208,7 +1068,6 @@ fn sigv4_and_catalog_auth_mutually_exclusive() {
         "must not leak secret_key value: {msg}"
     );
 
-    // SigV4 + OAuth combination.
     let pw_sigv4_oauth = serde_json::json!({
         "warehouse": "wh",
         "access_key": "AKID",
@@ -1226,7 +1085,6 @@ fn sigv4_and_catalog_auth_mutually_exclusive() {
         msg2.to_lowercase().contains("sigv4"),
         "error must reference SigV4: {msg2}"
     );
-    // No secret value must appear.
     assert!(
         !msg2.contains("my-client-secret"),
         "must not leak client_secret: {msg2}"
@@ -1237,15 +1095,8 @@ fn sigv4_and_catalog_auth_mutually_exclusive() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Scenario: unity_kind_validation_skips_warehouse_and_rejects_sigv4
-// ---------------------------------------------------------------------------
-
-/// Under the Unity Catalog kind `warehouse` is not required and enabling AWS
-/// SigV4 signing is rejected as not a Unity Catalog authentication mode.
 #[test]
 fn unity_kind_validation_skips_warehouse_and_rejects_sigv4() {
-    // No warehouse, yet a valid Unity CONNECTION: accepted under the Unity kind.
     let no_warehouse = serde_json::json!({ "token": "tok" }).to_string();
     let ctx = with_conn("http://catalog.example.com", &no_warehouse);
     let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::UnityCatalogNative)
@@ -1255,8 +1106,7 @@ fn unity_kind_validation_skips_warehouse_and_rejects_sigv4() {
         "warehouse stays empty and is not required under the Unity kind"
     );
 
-    // SigV4 is rejected even when its own required fields are absent: the error
-    // must name the Unity-mode conflict, not the generic missing-field message.
+    // SigV4 is rejected as a Unity-mode conflict even without its own required fields.
     let sigv4 = serde_json::json!({
         "use_sigv4": true,
         "secret_key": "SUPERSECRET"
@@ -1281,12 +1131,6 @@ fn unity_kind_validation_skips_warehouse_and_rejects_sigv4() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Scenario: iceberg_kind_validation_still_requires_warehouse
-// ---------------------------------------------------------------------------
-
-/// Under the default Iceberg REST kind the missing-`warehouse` error is
-/// byte-identical to the pre-feature message.
 #[test]
 fn iceberg_kind_validation_still_requires_warehouse() {
     let no_warehouse = serde_json::json!({
@@ -1303,15 +1147,8 @@ fn iceberg_kind_validation_still_requires_warehouse() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Scenario: validation_is_parameterized_by_catalog_kind
-// ---------------------------------------------------------------------------
-
-/// The identical CONNECTION validates differently by kind: the warehouse
-/// requirement and the SigV4 rule both flip on the `CatalogKind` argument.
 #[test]
 fn validation_is_parameterized_by_catalog_kind() {
-    // No warehouse: rejected under Iceberg REST, accepted under Unity Catalog.
     let no_warehouse = serde_json::json!({ "token": "tok" }).to_string();
     let ctx = with_conn("http://catalog.example.com", &no_warehouse);
     assert!(
@@ -1323,7 +1160,6 @@ fn validation_is_parameterized_by_catalog_kind() {
         "missing warehouse is accepted under Unity Catalog"
     );
 
-    // A well-formed SigV4 set: accepted under Iceberg REST, rejected under Unity.
     let sigv4 = serde_json::json!({
         "warehouse": "wh",
         "use_sigv4": true,
@@ -1343,15 +1179,8 @@ fn validation_is_parameterized_by_catalog_kind() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Scenario: unity_connection_reuses_existing_auth_fields
-// ---------------------------------------------------------------------------
-
-/// A Unity CONNECTION carries auth through the SAME fields Iceberg REST uses —
-/// no new credential field — and a no-auth Unity CONNECTION is accepted.
 #[test]
 fn unity_connection_reuses_existing_auth_fields() {
-    // OAuth client credentials via the existing fields, no warehouse.
     let oauth = serde_json::json!({
         "client_id": "my-client-id",
         "client_secret": "my-client-secret",
@@ -1376,14 +1205,13 @@ fn unity_connection_reuses_existing_auth_fields() {
         "client_secret must not leak through Debug: {debug}"
     );
 
-    // A static bearer token via the existing `token` field, no warehouse.
     let bearer = serde_json::json!({ "token": "my-secret-token" }).to_string();
     let ctx = with_conn("http://catalog.example.com", &bearer);
     let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::UnityCatalogNative)
         .expect("a Unity CONNECTION with a bearer token must be accepted");
     assert_eq!(resolved.creds.token.as_deref(), Some("my-secret-token"));
 
-    // OSS Unity Catalog runs with authentication disabled: none supplied.
+    // OSS Unity Catalog can run with authentication disabled.
     let no_auth = serde_json::json!({}).to_string();
     let ctx = with_conn("http://catalog.example.com", &no_auth);
     let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::UnityCatalogNative)
@@ -1423,4 +1251,489 @@ fn sealing_key_is_absent_for_a_password_carrying_no_secret_field_at_the_read_con
         resolved.sealed_storage_key.is_some(),
         "a non-empty secret_key is key material, so the boundary must derive a key"
     );
+}
+
+#[test]
+fn direct_storage_requires_a_non_empty_storage_base_path() {
+    let ctx = with_conn("", &serde_json::json!({}).to_string());
+
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+        .expect_err("an empty CONNECTION address must be rejected under direct storage");
+    let msg = err.to_string();
+
+    assert!(msg.contains("MY_CONN"), "must name the CONNECTION: {msg}");
+    assert!(
+        msg.to_lowercase().contains("storage base path"),
+        "must state that a storage base path is expected, not a catalog URI: {msg}"
+    );
+    assert!(
+        !msg.to_lowercase().contains("catalog uri"),
+        "must not tell the operator to supply a catalog URI this kind never contacts: {msg}"
+    );
+}
+
+#[test]
+fn direct_storage_accepts_a_connection_without_warehouse() {
+    let password = serde_json::json!({
+        "access_key": "AKID",
+        "secret_key": "SECRET",
+        "region": "us-east-1",
+    })
+    .to_string();
+    let ctx = with_conn("s3://bucket/lake", &password);
+
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+        .expect("a direct-storage CONNECTION without warehouse must be accepted");
+    assert_eq!(resolved.creds.warehouse, "");
+}
+
+#[test]
+fn direct_storage_rejects_every_catalog_auth_and_vending_field() {
+    let cases: [(serde_json::Value, &str, &str); 6] = [
+        (
+            serde_json::json!({"warehouse": "wh", "access_key": "AKID", "secret_key": "SECRET"}),
+            "warehouse",
+            "wh",
+        ),
+        (
+            serde_json::json!({"token": "SENTINEL_TOKEN", "access_key": "AKID", "secret_key": "SECRET"}),
+            "token",
+            "SENTINEL_TOKEN",
+        ),
+        (
+            serde_json::json!({"client_id": "SENTINEL_CID", "access_key": "AKID", "secret_key": "SECRET"}),
+            "client_id",
+            "SENTINEL_CID",
+        ),
+        (
+            serde_json::json!({"client_secret": "SENTINEL_CSECRET", "access_key": "AKID", "secret_key": "SECRET"}),
+            "client_secret",
+            "SENTINEL_CSECRET",
+        ),
+        (
+            serde_json::json!({"oauth2_server_uri": "https://auth.example.com", "access_key": "AKID", "secret_key": "SECRET"}),
+            "oauth2_server_uri",
+            "https://auth.example.com",
+        ),
+        (
+            serde_json::json!({"scope": "SENTINEL_SCOPE", "access_key": "AKID", "secret_key": "SECRET"}),
+            "scope",
+            "SENTINEL_SCOPE",
+        ),
+    ];
+
+    for (password, field, value) in cases {
+        let ctx = with_conn("s3://bucket/lake", &password.to_string());
+        let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+            .expect_err(&format!("{field} must be rejected under direct storage"));
+        let msg = err.to_string();
+        assert!(msg.contains(field), "must name {field}: {msg}");
+        assert!(
+            !msg.contains(value),
+            "must not leak the value of {field}: {msg}"
+        );
+    }
+}
+
+#[test]
+fn direct_storage_rejects_use_sigv4_and_use_vended_credentials_when_true() {
+    for field in ["use_sigv4", "use_vended_credentials"] {
+        let password = serde_json::json!({
+            field: true,
+            "access_key": "AKID",
+            "secret_key": "SECRET",
+        })
+        .to_string();
+        let ctx = with_conn("s3://bucket/lake", &password);
+
+        let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage).expect_err(
+            &format!("{field}=true must be rejected under direct storage"),
+        );
+        assert!(err.to_string().contains(field), "{}", err);
+    }
+}
+
+#[test]
+fn direct_storage_accepts_use_sigv4_and_use_vended_credentials_when_explicitly_false() {
+    for field in ["use_sigv4", "use_vended_credentials"] {
+        let password = serde_json::json!({
+            field: false,
+            "access_key": "AKID",
+            "secret_key": "SECRET",
+            "region": "us-east-1",
+        })
+        .to_string();
+        let ctx = with_conn("s3://bucket/lake", &password);
+
+        read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage).unwrap_or_else(|err| {
+            panic!("{field}=false explicitly must be accepted under direct storage: {err}")
+        });
+    }
+}
+
+#[test]
+fn direct_storage_rejects_s3_scheme_with_azure_shaped_credentials() {
+    let password = serde_json::json!({
+        "account_name": "myaccount",
+        "account_key": AZURE_ACCOUNT_KEY,
+    })
+    .to_string();
+    let ctx = with_conn("s3://bucket/lake", &password);
+
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+        .expect_err("an s3:// address with Azure-shaped credentials must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("s3"), "{msg}");
+    assert!(!msg.contains(AZURE_ACCOUNT_KEY), "{msg}");
+}
+
+#[test]
+fn direct_storage_rejects_abfss_scheme_with_s3_shaped_credentials() {
+    let password = serde_json::json!({
+        "access_key": "AKID",
+        "secret_key": S3_SECRET,
+    })
+    .to_string();
+    let ctx = with_conn(
+        "abfss://container@account.dfs.core.windows.net/lake",
+        &password,
+    );
+
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+        .expect_err("an abfss:// address with S3-shaped credentials must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("abfss"), "{msg}");
+    assert!(!msg.contains(S3_SECRET), "{msg}");
+}
+
+#[test]
+fn direct_storage_rejects_plaintext_abfs_naming_abfss() {
+    let password = serde_json::json!({
+        "account_name": "myaccount",
+        "account_key": AZURE_ACCOUNT_KEY,
+    })
+    .to_string();
+    let ctx = with_conn(
+        "abfs://container@account.dfs.core.windows.net/lake",
+        &password,
+    );
+
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+        .expect_err("a plaintext abfs:// address must be rejected under direct storage");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("abfss"),
+        "must name 'abfss' as the secure spelling: {msg}"
+    );
+    assert!(!msg.contains(AZURE_ACCOUNT_KEY), "{msg}");
+}
+
+#[test]
+fn direct_storage_accepts_matching_scheme_and_credential_shape() {
+    let s3_password = serde_json::json!({
+        "access_key": "AKID",
+        "secret_key": "SECRET",
+        "region": "us-east-1",
+    })
+    .to_string();
+    let ctx = with_conn("s3://bucket/lake", &s3_password);
+    read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+        .expect("an s3:// address with S3-shaped credentials must be accepted");
+
+    let azure_password = serde_json::json!({
+        "account_name": "myaccount",
+        "account_key": AZURE_ACCOUNT_KEY,
+    })
+    .to_string();
+    let ctx = with_conn(
+        "abfss://container@account.dfs.core.windows.net/lake",
+        &azure_password,
+    );
+    read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+        .expect("an abfss:// address with Azure-shaped credentials must be accepted");
+}
+
+const GLUE_ADDRESS: &str = "https://glue.us-east-1.amazonaws.com";
+
+/// `base` with every field of `extra` added or replaced.
+fn password_with(mut base: serde_json::Value, extra: serde_json::Value) -> String {
+    let serde_json::Value::Object(extra) = extra else {
+        panic!("the extra fields are an object: {extra}");
+    };
+    base.as_object_mut().expect("an object").extend(extra);
+    base.to_string()
+}
+
+fn glue_password(extra: serde_json::Value) -> String {
+    let base =
+        serde_json::json!({"region": "us-east-1", "access_key": "AKID", "secret_key": "SECRET"});
+    password_with(base, extra)
+}
+
+fn read_glue(password: &str) -> Result<Resolved, UdfError> {
+    read_connection(
+        &with_conn(GLUE_ADDRESS, password),
+        Some("MY_CONN"),
+        CatalogKind::Glue,
+    )
+}
+
+fn glue_error(extra: serde_json::Value) -> String {
+    read_glue(&glue_password(extra)).unwrap_err().to_string()
+}
+
+/// Scenario: Glue validation implies SigV4 and rejects catalog-auth and vending fields
+#[test]
+fn glue_connection_implies_sigv4_and_makes_warehouse_and_region_optional() {
+    let resolved = read_glue(&glue_password(serde_json::json!({})))
+        .expect("a Glue CONNECTION with only region and keys must be accepted");
+    assert!(resolved.creds.use_sigv4);
+    assert!(resolved.creds.warehouse.is_empty());
+
+    let catalog_id = serde_json::json!({ "warehouse": "123456789012", "use_sigv4": true });
+    let resolved =
+        read_glue(&glue_password(catalog_id)).expect("a warehouse is the optional Glue CatalogId");
+    assert!(resolved.creds.use_sigv4);
+    assert_eq!(resolved.creds.warehouse, "123456789012");
+
+    let no_region = serde_json::json!({ "access_key": "AKID", "secret_key": "SECRET" });
+    read_glue(&no_region.to_string())
+        .expect("the standard Glue address supplies the signing region");
+}
+
+/// Scenario: Glue validation implies SigV4 and rejects catalog-auth and vending fields
+#[test]
+fn glue_connection_rejects_sigv4_false_vending_catalog_auth_and_missing_sigv4_fields() {
+    let msg = glue_error(serde_json::json!({ "use_sigv4": false }));
+    assert!(msg.contains("always signs with AWS SigV4"), "{msg}");
+    assert!(!msg.contains("SECRET"), "{msg}");
+
+    let msg = glue_error(serde_json::json!({ "use_vended_credentials": true }));
+    assert!(msg.contains("no native credential vending"), "{msg}");
+
+    let msg = glue_error(serde_json::json!({
+        "token": "TOKEN_VALUE",
+        "client_id": "CLIENT_ID_VALUE",
+        "client_secret": "CLIENT_SECRET_VALUE",
+        "oauth2_server_uri": "https://idp.example.com/token",
+        "scope": "SCOPE_VALUE",
+    }));
+    for field in [
+        "token",
+        "client_id",
+        "client_secret",
+        "oauth2_server_uri",
+        "scope",
+    ] {
+        assert!(msg.contains(field), "error must name {field}: {msg}");
+    }
+    for value in [
+        "TOKEN_VALUE",
+        "CLIENT_ID_VALUE",
+        "CLIENT_SECRET_VALUE",
+        "SCOPE_VALUE",
+        "SECRET\"",
+    ] {
+        assert!(!msg.contains(value), "error must not leak {value}: {msg}");
+    }
+
+    let msg = glue_error(serde_json::json!({ "client_id": "CLIENT_ID_VALUE" }));
+    assert!(msg.contains("client_id"), "{msg}");
+    assert!(!msg.contains("CLIENT_ID_VALUE"), "{msg}");
+
+    let without_secret = serde_json::json!({ "region": "us-east-1", "access_key": "AKID" });
+    let msg = read_glue(&without_secret.to_string())
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("secret_key"), "{msg}");
+}
+
+/// Scenario: A Glue CONNECTION may name a role
+#[test]
+fn a_glue_connection_accepts_a_role_and_its_options() {
+    let password = glue_password(serde_json::json!({
+        "aws_assume_role_arn": "arn:aws:iam::123456789012:role/lakehouse-reader",
+        "aws_external_id": "EXTERNAL_ID_VALUE",
+        "aws_sts_endpoint": "https://sts.us-east-1.amazonaws.com",
+    }));
+    let resolved = read_glue(&password).expect("a Glue CONNECTION naming a role must be accepted");
+
+    assert_eq!(
+        resolved.creds.assume_role_arn(),
+        Some("arn:aws:iam::123456789012:role/lakehouse-reader")
+    );
+    assert!(resolved.creds.use_sigv4);
+    assert!(
+        resolved.sealed_storage_key.is_some(),
+        "the session must be sealable for the scan"
+    );
+}
+
+const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lakehouse-reader";
+const EXTERNAL_ID: &str = "EXTERNAL_ID_SENTINEL";
+const BASE_SECRET: &str = "BASE_SECRET_SENTINEL";
+
+fn base_identity() -> serde_json::Value {
+    serde_json::json!({
+        "warehouse": "wh",
+        "region": "us-east-1",
+        "access_key": "AKIABASEIDENTITY",
+        "secret_key": BASE_SECRET,
+    })
+}
+
+/// A role CONNECTION carrying the base key pair, extended by `extra` fields.
+fn role_password(extra: serde_json::Value) -> String {
+    let mut base = base_identity();
+    base["aws_assume_role_arn"] = ROLE_ARN.into();
+    password_with(base, extra)
+}
+
+#[test]
+fn assume_role_fields_are_parsed() {
+    let stated = role_password(serde_json::json!({
+        "aws_external_id": EXTERNAL_ID,
+        "aws_sts_endpoint": "https://sts.eu-west-1.amazonaws.com",
+    }));
+    let resolved = read_connection(
+        &with_conn("http://catalog.example.com", &stated),
+        Some("MY_CONN"),
+        CatalogKind::IcebergRest,
+    )
+    .expect("a role CONNECTION with the base key pair must be accepted");
+    assert_eq!(
+        resolved.creds.aws_assume_role_arn.as_deref(),
+        Some(ROLE_ARN)
+    );
+    assert_eq!(resolved.creds.aws_external_id.as_deref(), Some(EXTERNAL_ID));
+    assert_eq!(
+        resolved.creds.aws_sts_endpoint.as_deref(),
+        Some("https://sts.eu-west-1.amazonaws.com")
+    );
+    let rendered = format!("{resolved:?}");
+    assert!(!rendered.contains(EXTERNAL_ID), "{rendered}");
+}
+
+/// Scenario: A role option is accepted only beside a role
+/// Scenario: A Glue CONNECTION may name a role
+#[test]
+fn a_role_option_without_a_role_is_rejected_under_every_kind() {
+    for (address, kind) in [
+        ("http://catalog.example.com", CatalogKind::IcebergRest),
+        (GLUE_ADDRESS, CatalogKind::Glue),
+    ] {
+        for (field, value) in [
+            ("aws_external_id", EXTERNAL_ID),
+            ("aws_sts_endpoint", "http://minio:9000"),
+        ] {
+            let password = password_with(base_identity(), serde_json::json!({ field: value }));
+            let err = read_connection(&with_conn(address, &password), Some("MY_CONN"), kind)
+                .expect_err("a role option without a role must be rejected")
+                .to_string();
+
+            assert!(err.contains(field), "{kind:?}: must name {field}: {err}");
+            assert!(
+                err.contains("requires aws_assume_role_arn")
+                    || err.contains("require aws_assume_role_arn"),
+                "{kind:?}: must state the role it requires: {err}"
+            );
+            assert!(
+                !err.contains(EXTERNAL_ID) && !err.contains(BASE_SECRET),
+                "{kind:?}: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_role_without_an_external_id_is_accepted() {
+    for extra in [
+        serde_json::json!({}),
+        serde_json::json!({ "aws_external_id": EXTERNAL_ID }),
+    ] {
+        let password = role_password(extra.clone());
+        read_connection(
+            &with_conn("http://catalog.example.com", &password),
+            Some("MY_CONN"),
+            CatalogKind::IcebergRest,
+        )
+        .unwrap_or_else(|err| panic!("a role CONNECTION with {extra} must be accepted: {err}"));
+    }
+}
+
+/// Scenario: A CONNECTION naming a role carries the base identity's key pair
+#[test]
+fn assume_role_requires_the_base_key_pair_and_reads_no_ambient_credential() {
+    for use_sigv4 in [false, true] {
+        for omitted in [
+            vec!["access_key"],
+            vec!["secret_key"],
+            vec!["access_key", "secret_key"],
+        ] {
+            let mut password: serde_json::Value = serde_json::from_str(&role_password(
+                serde_json::json!({ "use_sigv4": use_sigv4 }),
+            ))
+            .unwrap();
+            for field in &omitted {
+                password.as_object_mut().unwrap().remove(*field);
+            }
+
+            let err = read_connection(
+                &with_conn("http://catalog.example.com", &password.to_string()),
+                Some("MY_CONN"),
+                CatalogKind::IcebergRest,
+            )
+            .expect_err("a role CONNECTION without the base key pair must be rejected")
+            .to_string();
+
+            assert!(
+                err.contains(&format!("missing field(s) {};", omitted.join(", "))),
+                "must name exactly the omitted field(s) {omitted:?} (use_sigv4={use_sigv4}): {err}"
+            );
+            assert!(
+                err.contains("the CONNECTION's own access_key and secret_key"),
+                "must state which identity assumes the role: {err}"
+            );
+            assert!(
+                err.contains("no ambient AWS credential")
+                    && err.contains("environment variable")
+                    && err.contains("instance profile"),
+                "must state that no ambient credential is read: {err}"
+            );
+            assert!(!err.contains(BASE_SECRET), "{err}");
+        }
+    }
+}
+
+#[test]
+fn the_path_style_guard_skips_a_role_with_vending() {
+    let endpoint_without_path_style = |use_vended_credentials: bool| {
+        role_password(serde_json::json!({
+            "endpoint": "http://s3.example.com",
+            "use_vended_credentials": use_vended_credentials,
+        }))
+    };
+
+    read_connection(
+        &with_conn(
+            "http://catalog.example.com",
+            &endpoint_without_path_style(true),
+        ),
+        Some("MY_CONN"),
+        CatalogKind::IcebergRest,
+    )
+    .expect("a vending role CONNECTION must skip the path_style guard");
+
+    let err = read_connection(
+        &with_conn(
+            "http://catalog.example.com",
+            &endpoint_without_path_style(false),
+        ),
+        Some("MY_CONN"),
+        CatalogKind::IcebergRest,
+    )
+    .expect_err("a non-vending role CONNECTION must still hit the path_style guard")
+    .to_string();
+    assert!(err.contains("path_style"), "{err}");
+    assert!(!err.contains(BASE_SECRET), "{err}");
 }

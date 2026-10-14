@@ -1,7 +1,3 @@
-//! Contract tests for the native Unity Catalog REST client: listing, single-table
-//! load, pagination, credential-safe failures, and the OSS/Databricks request
-//! shape. Every request is served by an in-process mock; no live network.
-
 use super::*;
 use crate::test_support::base_creds;
 use crate::unity::mock_server::spawn;
@@ -10,9 +6,7 @@ use exasol_udf_sdk::error::UdfError;
 
 const PAT_SENTINEL: &str = "PAT_SECRET_SENTINEL_VALUE";
 
-/// A single-table wire body whose `data_source_format` member is the given raw
-/// JSON fragment — `"data_source_format":"CSV",`, `"data_source_format":null,`,
-/// or `""` for a body that omits the member entirely.
+/// `raw_format_member` is a JSON fragment with trailing comma, or `""` to omit it.
 fn table_body_with_raw_format(raw_format_member: &str) -> String {
     format!(
         r#"{{"name":"orders","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders","table_type":"MANAGED",{raw_format_member}"storage_location":"s3://bucket/orders","table_id":"uuid-1","columns":[]}}"#
@@ -29,8 +23,8 @@ fn orders_ident() -> CatalogTableIdent {
 fn tables_page_body() -> String {
     r#"{"tables":[
         {"name":"orders","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://bucket/orders","table_id":"uuid-1","columns":[
-            {"name":"id","type_name":"LONG","type_precision":0,"type_scale":0,"position":0},
-            {"name":"amount","type_name":"DECIMAL","type_precision":10,"type_scale":2,"position":1}
+            {"name":"id","type_name":"LONG","type_text":"bigint","type_precision":0,"type_scale":0,"position":0},
+            {"name":"amount","type_name":"DECIMAL","type_text":"decimal(10,2)","type_json":"{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}","type_precision":0,"type_scale":0,"position":1}
         ]},
         {"name":"orders_summary","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders_summary","table_type":"VIEW","data_source_format":null,"columns":[
             {"name":"total","type_name":"DOUBLE"}
@@ -41,8 +35,8 @@ fn tables_page_body() -> String {
 
 fn single_table_body() -> String {
     r#"{"name":"orders","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://bucket/orders","table_id":"uuid-1","columns":[
-        {"name":"id","type_name":"LONG"},
-        {"name":"amount","type_name":"DECIMAL","type_precision":10,"type_scale":2}
+        {"name":"id","type_name":"LONG","partition_index":0},
+        {"name":"amount","type_name":"DECIMAL","type_text":"decimal(10,2)","type_json":"{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}"}
     ]}"#
     .to_string()
 }
@@ -92,9 +86,10 @@ async fn lists_tables_in_catalog_schema() {
     assert_eq!(
         orders.columns[1].source_type,
         ColumnSourceType::Unity {
-            type_name: "DECIMAL".to_string(),
-            precision: 10,
-            scale: 2,
+            type_json: Some(
+                r#"{"name":"amount","type":"decimal(10,2)","nullable":true,"metadata":{}}"#
+                    .to_string()
+            ),
         }
     );
 
@@ -169,7 +164,7 @@ async fn includes_managed_and_external_delta_base_tables() {
 }
 
 #[tokio::test]
-async fn skips_view_non_delta_and_other_type_with_reason() {
+async fn skips_view_unplannable_format_and_other_type_with_reason() {
     let body = r#"{"tables":[
         {"name":"orders_summary","table_type":"VIEW","data_source_format":null,"columns":[]},
         {"name":"legacy_orders","table_type":"MANAGED","data_source_format":"ICEBERG","columns":[]},
@@ -242,6 +237,15 @@ async fn loads_table_metadata_with_columns() {
             .collect::<Vec<_>>(),
         vec!["id", "amount"]
     );
+    assert_eq!(
+        table.columns[1].source_type,
+        ColumnSourceType::Unity {
+            type_json: Some(
+                r#"{"name":"amount","type":"decimal(10,2)","nullable":true,"metadata":{}}"#
+                    .to_string()
+            ),
+        }
+    );
 
     let requests = server.requests();
     assert_eq!(requests[0].method, "GET");
@@ -311,8 +315,7 @@ async fn follows_pagination_across_pages() {
 
 #[tokio::test]
 async fn request_failure_is_credential_safe_error() {
-    // The mock echoes the bearer it received into its error body, so the test
-    // proves the token is stripped from the surfaced error.
+    // The mock echoes the received bearer into its error body.
     let server = spawn(|req| {
         (
             500,
@@ -351,7 +354,6 @@ async fn identical_request_shape_oss_and_databricks() {
     let oss = spawn(|_req| (200, empty_tables_body())).await;
     let databricks = spawn(|_req| (200, empty_tables_body())).await;
 
-    // OSS with auth disabled; Databricks-managed reached with a PAT.
     let oss_session = UnityCatalogSession::new(&oss.base_url, base_creds());
     let mut databricks_creds = base_creds();
     databricks_creds.token = Some("dbx-pat".to_string());
@@ -426,15 +428,16 @@ async fn posts_temporary_table_credentials() {
     );
 }
 
-/// Every table the listing ADMITS carries the Delta tag and its vending key,
-/// while the admission filter itself is unchanged: the tag restates the filter's
-/// outcome, so a `VIEW` and a non-`DELTA` base table still reach `skipped` with
-/// their own reasons rather than being returned under a tag.
 #[tokio::test]
-async fn list_tables_tags_every_admitted_table_delta_and_keeps_the_skip_filter() {
+async fn list_tables_tags_each_admitted_table_by_its_own_format() {
     let body = r#"{"tables":[
         {"name":"orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://b/orders","table_id":"uuid-managed","columns":[]},
         {"name":"external_orders","table_type":"EXTERNAL","data_source_format":"DELTA","storage_location":"s3://b/external","table_id":"uuid-external","columns":[]},
+        {"name":"raw_orders","table_type":"EXTERNAL","data_source_format":"PARQUET","storage_location":"s3://b/raw","table_id":"uuid-parquet","columns":[
+            {"name":"region","type_name":"STRING","partition_index":1},
+            {"name":"payload","type_name":"STRING"},
+            {"name":"event_date","type_name":"DATE","partition_index":0}
+        ]},
         {"name":"orders_summary","table_type":"VIEW","data_source_format":null,"columns":[]},
         {"name":"legacy_orders","table_type":"MANAGED","data_source_format":"ICEBERG","table_id":"uuid-iceberg","columns":[]}
     ]}"#
@@ -456,8 +459,9 @@ async fn list_tables_tags_every_admitted_table_delta_and_keeps_the_skip_filter()
         vec![
             ("orders", TableFormat::Delta),
             ("external_orders", TableFormat::Delta),
+            ("raw_orders", TableFormat::Parquet),
         ],
-        "every admitted entry carries the Delta tag"
+        "each admitted entry carries its own format tag"
     );
     assert_eq!(
         listing
@@ -465,7 +469,11 @@ async fn list_tables_tags_every_admitted_table_delta_and_keeps_the_skip_filter()
             .iter()
             .map(|table| table.vended_credential_key.as_deref())
             .collect::<Vec<_>>(),
-        vec![Some("uuid-managed"), Some("uuid-external")],
+        vec![
+            Some("uuid-managed"),
+            Some("uuid-external"),
+            Some("uuid-parquet")
+        ],
         "each admitted entry carries its own vending key"
     );
     assert_eq!(
@@ -488,14 +496,17 @@ async fn list_tables_tags_every_admitted_table_delta_and_keeps_the_skip_filter()
                 }
             ),
         ],
-        "the admission filter is unchanged: an ICEBERG base table is still skipped, not tagged"
+        "an ICEBERG base table is skipped, not tagged"
+    );
+    assert_eq!(
+        listing.tables[2].partition_columns,
+        vec!["event_date".to_string(), "region".to_string()],
+        "partition columns are reported in partition_index order"
     );
 }
 
-/// The single-table load returns the mapped format tag, the vending key, and the
-/// columns in the order the response declares them.
 #[tokio::test]
-async fn load_table_returns_format_tag_vending_key_and_ordered_columns() {
+async fn load_table_returns_format_tag_vending_key_partition_columns_and_ordered_columns() {
     let server = spawn(|_req| (200, single_table_body())).await;
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
@@ -507,6 +518,11 @@ async fn load_table_returns_format_tag_vending_key_and_ordered_columns() {
     assert_eq!(table.format, TableFormat::Delta);
     assert_eq!(table.vended_credential_key.as_deref(), Some("uuid-1"));
     assert_eq!(
+        table.partition_columns,
+        vec!["id".to_string()],
+        "partition columns are reported in partition_index order"
+    );
+    assert_eq!(
         table
             .columns
             .iter()
@@ -517,31 +533,30 @@ async fn load_table_returns_format_tag_vending_key_and_ordered_columns() {
     );
 }
 
-/// A Unity Catalog UniForm table reporting `ICEBERG` is named accurately rather
-/// than refused: the load applies no admission filter, so both formats the engine
-/// can plan map to their own tag.
 #[tokio::test]
-async fn load_table_maps_the_uppercase_iceberg_format_to_the_iceberg_tag() {
-    let body = table_body_with_raw_format(r#""data_source_format":"ICEBERG","#);
-    let server = spawn(move |_req| (200, body.clone())).await;
-    let session = UnityCatalogSession::new(&server.base_url, base_creds());
+async fn load_table_maps_the_uppercase_iceberg_and_parquet_formats_to_their_tags() {
+    for (raw_format, expected) in [
+        ("ICEBERG", TableFormat::Iceberg),
+        ("PARQUET", TableFormat::Parquet),
+    ] {
+        let body = table_body_with_raw_format(&format!(r#""data_source_format":"{raw_format}","#));
+        let server = spawn(move |_req| (200, body.clone())).await;
+        let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
-    let table = session
-        .load_table(&orders_ident())
-        .await
-        .expect("an ICEBERG table loads under the Iceberg tag");
+        let table = session
+            .load_table(&orders_ident())
+            .await
+            .expect("the table loads under its own tag");
 
-    assert_eq!(table.format, TableFormat::Iceberg);
+        assert_eq!(table.format, expected, "{raw_format}");
+    }
 }
 
-/// The load applies no admission filter, so an absent or unrecognized
-/// `data_source_format` is a refusal naming the table and the value — never a tag
-/// defaulted to Delta, which would route the table into the Delta log reader.
 #[tokio::test]
 async fn load_table_refuses_an_absent_or_unrecognized_data_source_format() {
     for (raw_format_member, expected_value) in [
         (r#""data_source_format":"CSV","#, "CSV"),
-        (r#""data_source_format":"PARQUET","#, "PARQUET"),
+        (r#""data_source_format":"JSON","#, "JSON"),
         (r#""data_source_format":"DELTASHARING","#, "DELTASHARING"),
         (r#""data_source_format":"delta","#, "delta"),
         (r#""data_source_format":null,"#, ABSENT_DATA_SOURCE_FORMAT),
@@ -571,8 +586,6 @@ async fn load_table_refuses_an_absent_or_unrecognized_data_source_format() {
     }
 }
 
-/// The format refusal carries the table's identity and the reported format value
-/// only — never the resolved bearer the request was sent with.
 #[tokio::test]
 async fn load_table_format_refusal_carries_no_credential() {
     let body = table_body_with_raw_format(r#""data_source_format":"CSV","#);
@@ -595,9 +608,6 @@ async fn load_table_format_refusal_carries_no_credential() {
     );
 }
 
-/// A whitespace-only `table_id` is not a catalog-assigned key: it must project to
-/// an absent vending key through the public `load_table` path, matching the
-/// crate's own published guarantee that an empty-or-whitespace key is absent.
 #[tokio::test]
 async fn a_whitespace_only_table_id_projects_to_an_absent_vending_key() {
     let body = r#"{"name":"orders","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://bucket/orders","table_id":"   ","columns":[]}"#.to_string();
@@ -615,9 +625,6 @@ async fn a_whitespace_only_table_id_projects_to_an_absent_vending_key() {
     );
 }
 
-/// An entry carrying no key — or an empty one — projects to an ABSENT key, so a
-/// caller that requires one fails naming the table instead of requesting
-/// credentials against an empty scope.
 #[test]
 fn neutral_table_reports_an_absent_vending_key_rather_than_an_empty_one() {
     for raw_key_member in ["", r#""table_id":null,"#, r#""table_id":"","#] {
@@ -636,35 +643,17 @@ fn neutral_table_reports_an_absent_vending_key_rather_than_an_empty_one() {
 }
 
 #[test]
-fn delta_base_skip_reason_admits_a_table_with_delta_format() {
-    assert_eq!(delta_base_skip_reason("MANAGED", Some("DELTA")), None);
-}
-
-#[test]
-fn delta_base_skip_reason_type_wins_over_format_for_a_view_even_when_delta() {
-    assert_eq!(
-        delta_base_skip_reason("VIEW", Some("DELTA")),
-        Some(SkipReason::NotDeltaBaseTable {
-            detail: "table_type=VIEW".to_string()
+fn admission_admits_delta_and_parquet_base_tables_and_names_every_refusal() {
+    let skip = |detail: &str| {
+        Err(SkipReason::NotDeltaBaseTable {
+            detail: detail.to_string(),
         })
-    );
-}
-
-#[test]
-fn delta_base_skip_reason_type_wins_over_format_for_other_even_when_delta() {
-    assert_eq!(
-        delta_base_skip_reason("STREAMING_TABLE", Some("DELTA")),
-        Some(SkipReason::NotDeltaBaseTable {
-            detail: "table_type=STREAMING_TABLE".to_string()
-        })
-    );
-}
-
-/// The detail must name the spelling the catalog actually sent, for every
-/// disqualifying `table_type` — including one the neutral mapping folds onto
-/// `View`, whose raw spelling would otherwise be lost.
-#[test]
-fn delta_base_skip_reason_names_the_raw_table_type_it_was_handed() {
+    };
+    let mut cases = vec![
+        ("MANAGED", Some("DELTA"), Ok(TableFormat::Delta)),
+        ("EXTERNAL", Some("PARQUET"), Ok(TableFormat::Parquet)),
+        ("MANAGED", None, skip("data_source_format=absent")),
+    ];
     for raw in [
         "VIEW",
         "MATERIALIZED_VIEW",
@@ -672,54 +661,21 @@ fn delta_base_skip_reason_names_the_raw_table_type_it_was_handed() {
         "FOREIGN",
         "MANAGED_SHALLOW_CLONE",
     ] {
+        cases.push((raw, Some("DELTA"), skip(&format!("table_type={raw}"))));
+    }
+    for format in ["ICEBERG", "CSV", "delta", "Delta", "parquet", "Parquet"] {
+        cases.push((
+            "EXTERNAL",
+            Some(format),
+            skip(&format!("data_source_format={format}")),
+        ));
+    }
+
+    for (table_type, format, expected) in cases {
         assert_eq!(
-            delta_base_skip_reason(raw, Some("DELTA")),
-            Some(SkipReason::NotDeltaBaseTable {
-                detail: format!("table_type={raw}")
-            }),
-            "raw table_type {raw} must be reported by its own spelling"
+            admission(table_type, format),
+            expected,
+            "{table_type} / {format:?}"
         );
     }
-}
-
-#[test]
-fn delta_base_skip_reason_reports_a_non_delta_format_verbatim() {
-    assert_eq!(
-        delta_base_skip_reason("MANAGED", Some("ICEBERG")),
-        Some(SkipReason::NotDeltaBaseTable {
-            detail: "data_source_format=ICEBERG".to_string()
-        })
-    );
-    assert_eq!(
-        delta_base_skip_reason("EXTERNAL", Some("CSV")),
-        Some(SkipReason::NotDeltaBaseTable {
-            detail: "data_source_format=CSV".to_string()
-        })
-    );
-}
-
-#[test]
-fn delta_base_skip_reason_reports_an_absent_format() {
-    assert_eq!(
-        delta_base_skip_reason("MANAGED", None),
-        Some(SkipReason::NotDeltaBaseTable {
-            detail: "data_source_format=absent".to_string()
-        })
-    );
-}
-
-#[test]
-fn delta_base_skip_reason_rejects_a_lowercase_or_mixed_case_delta_spelling() {
-    assert_eq!(
-        delta_base_skip_reason("MANAGED", Some("delta")),
-        Some(SkipReason::NotDeltaBaseTable {
-            detail: "data_source_format=delta".to_string()
-        })
-    );
-    assert_eq!(
-        delta_base_skip_reason("MANAGED", Some("Delta")),
-        Some(SkipReason::NotDeltaBaseTable {
-            detail: "data_source_format=Delta".to_string()
-        })
-    );
 }

@@ -25,7 +25,7 @@ Then run the query. Compare the actual result with the result that the scan spec
 
 ## Try it against the bundled local stack first
 
-If you have no Virtual Schema deployed yet, use `scripts/capture-pushdown-payload.sh`. The script runs a query against the bundled local Docker stack (Exasol + MinIO + Iceberg REST) and a small seeded table. It prints the `EXPLAIN VIRTUAL` output and the real result in one step.
+If you have no Virtual Schema deployed yet, use `scripts/capture-pushdown-payload.sh`. The script runs a query against the bundled local Docker stack (Exasol + SeaweedFS + Iceberg REST) and a small seeded table. It prints the `EXPLAIN VIRTUAL` output and the real result in one step.
 
 ```bash
 scripts/capture-pushdown-payload.sh 'SELECT COUNT(*) FROM {table} WHERE c_date LIKE '"'"'2024%'"'"''
@@ -81,7 +81,7 @@ against `docker.io/exasol/docker-db:2025.2.1` (WebSocket protocol v3):
 | `GROUP BY` aggregate | Yes | Correctly withheld from beneath the aggregate — outer `LIMIT` only |
 | `COUNT(DISTINCT)` | Yes | Correctly withheld from beneath the per-shard `DISTINCT` row-scan — outer `LIMIT` only |
 | `ORDER BY … LIMIT` | Yes, on top of the statement's own SQL `LIMIT` | Applied safely alongside the existing top-N pushdown |
-| broadcast-eligible inner equi-join | Yes | **Applied safely; the join stays broadcast.** A bare `LIMIT` becomes a per-shard post-join cap (`JoinSpec::post_join_limit`, `crates/lakehouse-engine/src/scan/spec.rs`) plus an outer `LIMIT` wrapper; a bare-column `ORDER BY` rides an outer wrapper over the broadcast fan-out. Only the surviving forcing conditions — aggregate, `GROUP BY`, group-by-aggregation, `HAVING` — fall back to the unaccelerated two-scan (`LHS_T0`/`LHS_T1`) plan |
+| broadcast-eligible inner equi-join | Yes | **Applied safely; the join stays broadcast.** A bare `LIMIT` becomes a per-shard post-join cap (`JoinSpec::post_join_limit`, `crates/lakehouse-engine/src/scan/spec.rs`) plus an outer `LIMIT` wrapper; a bare-column `ORDER BY` rides an outer wrapper over the broadcast fan-out. A zero-offset `ORDER BY … LIMIT n` also bounds each shard through `JoinSpec::post_join_order_by` plus `post_join_limit` — every shard keeps its own top-`n` joined rows, and the wrapper still merges and re-cuts the global top-`n` (issue #309). Only the surviving forcing conditions — aggregate, `GROUP BY`, group-by-aggregation, `HAVING` — fall back to the unaccelerated two-scan (`LHS_T0`/`LHS_T1`) plan |
 
 An earlier version of this table, built by diffing `EXPLAIN VIRTUAL` output only, concluded
 the opposite — that no shape converts a declared cap into a pushdown `limit`. That conclusion

@@ -1,26 +1,11 @@
-//! Cloud E2E smoke tests for the lakehouse-engine Virtual Schema against
-//! a real AWS Glue Iceberg REST catalog.
+//! Cloud E2E smoke tests against a real AWS Glue Iceberg REST catalog. Unlike
+//! the local `exasol-e2e` suite, these SKIP when their env vars are absent.
+//! `GLUE_WAREHOUSE` is the AWS account id, not an S3 URI.
 //!
-//! These tests are gated behind the `cloud-e2e` cargo feature and SKIP
-//! cleanly when the required environment variables are absent — the opposite
-//! of the local `exasol-e2e` suite, which FAILS when its stack is down.
-//!
-//! Required environment variables (all absent → test skips, no network call):
-//!   GLUE_CATALOG_URI     — Glue Iceberg REST endpoint (catalog CONNECTION address)
-//!   GLUE_WAREHOUSE       — Glue catalog routing id: your AWS account id (e.g. 123456789012),
-//!                          NOT an S3 URI or storage location
-//!   GLUE_TABLE           — Fully-qualified table name (e.g. my_db.my_table)
-//!   AWS_REGION           — AWS region (e.g. us-east-1)
-//!   AWS_ACCESS_KEY_ID    — AWS static access key ID
-//!   AWS_SECRET_ACCESS_KEY — AWS static secret access key
-//!   AWS_SESSION_TOKEN    — (optional) AWS STS session token
-//!   EXASOL_HOST          — Exasol hostname/IP
-//!   LH_EXASOL_PORT       — Exasol WebSocket SQL port (default 28563)
-//!   LH_EXASOL_USER       — Exasol username (default "sys")
-//!   LH_EXASOL_PASSWORD   — Exasol password
-//!
-//! All DSN/connection strings include validateservercertificate=0.
-//! No credential value is printed to test output.
+//! Cloud assume-role E2E (issue #139) additionally needs four variables, read from
+//! SSM under `deploy/data-stack`'s `${ssm_root}/assume_role/*` (see `deploy/README.md`):
+//! `ASSUME_ROLE_BASE_ACCESS_KEY_ID`/`ASSUME_ROLE_BASE_SECRET_ACCESS_KEY` (the base
+//! identity granted only `sts:AssumeRole`), `AWS_ASSUME_ROLE_ARN`, and `AWS_EXTERNAL_ID`.
 #![cfg(feature = "cloud-e2e")]
 
 mod common;
@@ -28,10 +13,6 @@ use common::exasol_ws::ExaConn;
 use common::stack::{CatalogConnectionPassword, build_create_connection_sql};
 use lakehouse_catalog::{CatalogProps, CatalogSession, ConnectionCreds, load_table_any_auth};
 use std::collections::HashMap;
-
-// ---------------------------------------------------------------------------
-// Environment variable names
-// ---------------------------------------------------------------------------
 
 const ENV_GLUE_CATALOG_URI: &str = "GLUE_CATALOG_URI";
 const ENV_GLUE_WAREHOUSE: &str = "GLUE_WAREHOUSE";
@@ -45,11 +26,6 @@ const ENV_EXASOL_PORT: &str = "LH_EXASOL_PORT";
 const ENV_EXASOL_USER: &str = "LH_EXASOL_USER";
 const ENV_EXASOL_PASSWORD: &str = "LH_EXASOL_PASSWORD";
 
-// Catalog-auth E2E env vars (token or OAuth2 client-credentials REST catalog).
-// Required: CATALOG_AUTH_URI, CATALOG_AUTH_WAREHOUSE, CATALOG_AUTH_TABLE, EXASOL_HOST,
-//           LH_EXASOL_PASSWORD, and at least one of CATALOG_AUTH_TOKEN or
-//           (CATALOG_AUTH_CLIENT_ID + CATALOG_AUTH_CLIENT_SECRET).
-// Optional: CATALOG_AUTH_OAUTH2_SERVER_URI, CATALOG_AUTH_SCOPE (OAuth path only).
 const ENV_CATALOG_AUTH_URI: &str = "CATALOG_AUTH_URI";
 const ENV_CATALOG_AUTH_WAREHOUSE: &str = "CATALOG_AUTH_WAREHOUSE";
 const ENV_CATALOG_AUTH_TABLE: &str = "CATALOG_AUTH_TABLE";
@@ -59,20 +35,21 @@ const ENV_CATALOG_AUTH_CLIENT_SECRET: &str = "CATALOG_AUTH_CLIENT_SECRET";
 const ENV_CATALOG_AUTH_OAUTH2_SERVER_URI: &str = "CATALOG_AUTH_OAUTH2_SERVER_URI";
 const ENV_CATALOG_AUTH_SCOPE: &str = "CATALOG_AUTH_SCOPE";
 
+const ENV_ASSUME_ROLE_BASE_ACCESS_KEY_ID: &str = "ASSUME_ROLE_BASE_ACCESS_KEY_ID";
+const ENV_ASSUME_ROLE_BASE_SECRET_ACCESS_KEY: &str = "ASSUME_ROLE_BASE_SECRET_ACCESS_KEY";
+const ENV_AWS_ASSUME_ROLE_ARN: &str = "AWS_ASSUME_ROLE_ARN";
+const ENV_AWS_EXTERNAL_ID: &str = "AWS_EXTERNAL_ID";
+
 const CLOUD_SCHEMA_NAME: &str = "CLOUD_LHVS";
 const CLOUD_VS_NAME: &str = "CLOUD_LAKEHOUSE";
 const CLOUD_ADAPTER_SCRIPT: &str = "LAKEHOUSE_ADAPTER";
 const CLOUD_CATALOG_CONN: &str = "GLUE_CATALOG_CREDS";
 const CLOUD_CATALOG_CONN_VENDED: &str = "GLUE_CATALOG_CREDS_VENDED";
+const CLOUD_CATALOG_CONN_NO_REGION: &str = "GLUE_CATALOG_CREDS_NO_REGION";
 const CLOUD_CATALOG_CONN_AUTH: &str = "CATALOG_AUTH_CREDS";
+const CLOUD_CATALOG_CONN_ASSUME_ROLE: &str = "GLUE_CATALOG_CREDS_ASSUME_ROLE";
+const CLOUD_CATALOG_CONN_ASSUME_ROLE_BASE_ONLY: &str = "GLUE_CATALOG_CREDS_ASSUME_ROLE_BASE_ONLY";
 
-// ---------------------------------------------------------------------------
-// CloudEnv: discovered credentials and endpoints
-// ---------------------------------------------------------------------------
-
-/// Credentials and endpoints discovered from environment variables.
-///
-/// `None` when any required variable is absent — callers early-return (skip).
 struct CloudEnv {
     glue_catalog_uri: String,
     glue_warehouse: String,
@@ -88,10 +65,6 @@ struct CloudEnv {
 }
 
 impl CloudEnv {
-    /// Attempt to read all required environment variables.
-    ///
-    /// Returns `None` when any required variable is absent or empty.
-    /// Never panics; never makes a network call.
     fn from_env() -> Option<Self> {
         let required = [
             ENV_GLUE_CATALOG_URI,
@@ -103,7 +76,6 @@ impl CloudEnv {
             ENV_EXASOL_HOST,
             ENV_EXASOL_PASSWORD,
         ];
-        // If any required var is absent or empty, return None (skip signal).
         for var in required {
             match std::env::var(var) {
                 Ok(v) if !v.trim().is_empty() => {}
@@ -138,7 +110,6 @@ impl CloudEnv {
         })
     }
 
-    /// Build a `CatalogConnectionPassword` with SigV4 enabled (standard cloud path).
     fn catalog_connection_password(&self) -> CatalogConnectionPassword {
         CatalogConnectionPassword {
             warehouse: self.glue_warehouse.clone(),
@@ -154,7 +125,6 @@ impl CloudEnv {
         }
     }
 
-    /// Build a `CatalogConnectionPassword` with SigV4 + vended credentials.
     fn catalog_connection_password_vended(&self) -> CatalogConnectionPassword {
         CatalogConnectionPassword {
             use_vended_credentials: true,
@@ -162,10 +132,15 @@ impl CloudEnv {
         }
     }
 
-    /// The `ConnectionCreds` the adapter parses out of this suite's vended CONNECTION,
-    /// derived from `catalog_connection_password_vended` so the two cannot describe
-    /// different CONNECTIONs. `sas_token` is absent: `CatalogConnectionPassword` carries
-    /// no inline-SAS field to project from.
+    fn catalog_connection_password_without_region(&self) -> CatalogConnectionPassword {
+        CatalogConnectionPassword {
+            region: String::new(),
+            ..self.catalog_connection_password()
+        }
+    }
+
+    /// Derived from `catalog_connection_password_vended` so the two cannot describe
+    /// different CONNECTIONs.
     fn vended_connection_creds(&self) -> ConnectionCreds {
         let password = self.catalog_connection_password_vended();
         ConnectionCreds {
@@ -186,32 +161,21 @@ impl CloudEnv {
             account_name: password.account_name,
             account_key: password.account_key,
             sas_token: None,
+            ..Default::default()
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// CatalogAuthEnv: credentials for the catalog-auth (token/OAuth) E2E test
-// ---------------------------------------------------------------------------
-
-/// Credentials and endpoints for a token/OAuth2-authenticated REST catalog E2E test.
-///
-/// Gating: same convention as the other cloud-e2e tests — returns `None` when
-/// any required variable is absent; the test early-returns (skip) rather than
-/// failing. A live catalog auth smoke run sets all vars and exercises the live path.
 struct CatalogAuthEnv {
     catalog_uri: String,
     catalog_warehouse: String,
     catalog_table: String,
-    /// Static bearer token (token mode). `None` when `CATALOG_AUTH_TOKEN` is absent.
     catalog_token: Option<String>,
-    /// OAuth2 client ID (client-credentials mode). `None` when absent.
     catalog_client_id: Option<String>,
-    /// OAuth2 client secret (client-credentials mode). `None` when absent.
     catalog_client_secret: Option<String>,
-    /// Optional OAuth2 token endpoint. Absent → catalog defaults to `{uri}/v1/oauth/tokens`.
+    /// Absent: the catalog defaults to `{uri}/v1/oauth/tokens`.
     catalog_oauth2_server_uri: Option<String>,
-    /// Optional OAuth2 scope. Absent → catalog applies its default (`catalog`).
+    /// Absent: the catalog applies its default scope (`catalog`).
     catalog_scope: Option<String>,
     exasol_host: String,
     exasol_port: u16,
@@ -220,13 +184,7 @@ struct CatalogAuthEnv {
 }
 
 impl CatalogAuthEnv {
-    /// Attempt to read all required environment variables.
-    ///
-    /// Returns `None` when any base-required variable is absent or empty, or when
-    /// neither a token nor both OAuth client credentials are present.
-    /// Never panics; never makes a network call.
     fn from_env() -> Option<Self> {
-        // Base required vars (catalog endpoint + Exasol connection).
         let base_required = [
             ENV_CATALOG_AUTH_URI,
             ENV_CATALOG_AUTH_WAREHOUSE,
@@ -254,7 +212,6 @@ impl CatalogAuthEnv {
             .ok()
             .filter(|s| !s.trim().is_empty());
 
-        // At least one auth mode must be configured: token or both OAuth fields.
         let has_token = catalog_token.is_some();
         let has_oauth = catalog_client_id.is_some() && catalog_client_secret.is_some();
         if !has_token && !has_oauth {
@@ -290,23 +247,15 @@ impl CatalogAuthEnv {
         })
     }
 
-    /// Build the `CREATE OR REPLACE CONNECTION` SQL for the catalog-auth connection.
-    ///
-    /// Constructs the JSON password directly, injecting token or OAuth2 client-credentials
-    /// fields from the environment (mirrors the `ConnectionCreds` JSON schema consumed by
-    /// `connection.rs::parse_creds`). No credential value is embedded in any printed output.
     fn build_create_connection_sql(&self) -> String {
         let mut obj = serde_json::json!({
             "warehouse": self.catalog_warehouse,
             "use_sigv4": false,
             "use_vended_credentials": false,
         });
-        // Token mode: inject `token`.
         if let Some(token) = &self.catalog_token {
             obj["token"] = serde_json::Value::String(token.clone());
         } else {
-            // OAuth2 client-credentials mode: inject `client_id`, `client_secret`, and
-            // optionally `oauth2_server_uri` and `scope`.
             if let Some(client_id) = &self.catalog_client_id {
                 obj["client_id"] = serde_json::Value::String(client_id.clone());
             }
@@ -328,74 +277,148 @@ impl CatalogAuthEnv {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Schema + VS setup helpers
-// ---------------------------------------------------------------------------
+/// Credentials and endpoints for the cloud assume-role E2E tests; a separate
+/// struct from `CloudEnv` because it names a base identity plus a role, never
+/// a static Glue key pair. Gating follows the same convention as `CloudEnv`.
+struct AssumeRoleCloudEnv {
+    glue_catalog_uri: String,
+    glue_warehouse: String,
+    glue_table: String,
+    aws_region: String,
+    base_access_key_id: String,
+    base_secret_access_key: String,
+    assume_role_arn: String,
+    external_id: String,
+    exasol_host: String,
+    exasol_port: u16,
+    exasol_user: String,
+    exasol_password: String,
+}
 
-fn vs_table(glue_table: &str) -> String {
-    // The adapter uppercases the table's last component.
-    let table_part = glue_table
+impl AssumeRoleCloudEnv {
+    /// Returns `None` when any required variable is absent or empty, printing which one.
+    fn from_env() -> Option<Self> {
+        let required = [
+            ENV_GLUE_CATALOG_URI,
+            ENV_GLUE_WAREHOUSE,
+            ENV_GLUE_TABLE,
+            ENV_AWS_REGION,
+            ENV_ASSUME_ROLE_BASE_ACCESS_KEY_ID,
+            ENV_ASSUME_ROLE_BASE_SECRET_ACCESS_KEY,
+            ENV_AWS_ASSUME_ROLE_ARN,
+            ENV_AWS_EXTERNAL_ID,
+            ENV_EXASOL_HOST,
+            ENV_EXASOL_PASSWORD,
+        ];
+        for var in required {
+            match std::env::var(var) {
+                Ok(v) if !v.trim().is_empty() => {}
+                _ => {
+                    println!(
+                        "SKIPPED: cloud assume-role E2E requires env var {var} — set it to enable"
+                    );
+                    return None;
+                }
+            }
+        }
+
+        let exasol_port = std::env::var(ENV_EXASOL_PORT)
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .unwrap_or(28563);
+
+        Some(AssumeRoleCloudEnv {
+            glue_catalog_uri: std::env::var(ENV_GLUE_CATALOG_URI).unwrap(),
+            glue_warehouse: std::env::var(ENV_GLUE_WAREHOUSE).unwrap(),
+            glue_table: std::env::var(ENV_GLUE_TABLE).unwrap(),
+            aws_region: std::env::var(ENV_AWS_REGION).unwrap(),
+            base_access_key_id: std::env::var(ENV_ASSUME_ROLE_BASE_ACCESS_KEY_ID).unwrap(),
+            base_secret_access_key: std::env::var(ENV_ASSUME_ROLE_BASE_SECRET_ACCESS_KEY).unwrap(),
+            assume_role_arn: std::env::var(ENV_AWS_ASSUME_ROLE_ARN).unwrap(),
+            external_id: std::env::var(ENV_AWS_EXTERNAL_ID).unwrap(),
+            exasol_host: std::env::var(ENV_EXASOL_HOST).unwrap(),
+            exasol_port,
+            exasol_user: std::env::var(ENV_EXASOL_USER).unwrap_or_else(|_| "sys".to_string()),
+            exasol_password: std::env::var(ENV_EXASOL_PASSWORD).unwrap(),
+        })
+    }
+
+    /// Build a `CatalogConnectionPassword` naming the role and the external id —
+    /// the base key pair alone cannot reach Glue, only the assumed session can.
+    fn catalog_connection_password_role(&self) -> CatalogConnectionPassword {
+        CatalogConnectionPassword {
+            warehouse: self.glue_warehouse.clone(),
+            endpoint: String::new(),
+            region: self.aws_region.clone(),
+            access_key: self.base_access_key_id.clone(),
+            secret_key: self.base_secret_access_key.clone(),
+            path_style: false,
+            use_sigv4: true,
+            use_vended_credentials: false,
+            aws_assume_role_arn: Some(self.assume_role_arn.clone()),
+            aws_external_id: Some(self.external_id.clone()),
+            ..Default::default()
+        }
+    }
+
+    /// Build a `CatalogConnectionPassword` carrying only the base identity —
+    /// no role, no STS call — which Glue denies on its own.
+    fn catalog_connection_password_base_only(&self) -> CatalogConnectionPassword {
+        CatalogConnectionPassword {
+            warehouse: self.glue_warehouse.clone(),
+            endpoint: String::new(),
+            region: self.aws_region.clone(),
+            access_key: self.base_access_key_id.clone(),
+            secret_key: self.base_secret_access_key.clone(),
+            path_style: false,
+            use_sigv4: true,
+            use_vended_credentials: false,
+            ..Default::default()
+        }
+    }
+}
+
+fn vs_table_name(glue_table: &str) -> String {
+    glue_table
         .split('.')
         .next_back()
         .unwrap_or(glue_table)
-        .to_uppercase();
-    format!("{CLOUD_VS_NAME}.{table_part}")
+        .to_uppercase()
 }
 
-/// The Iceberg namespace of a `namespace.table` identifier (everything before the
-/// trailing table segment), used as the `NAMESPACE` VS property.
+fn vs_table(glue_table: &str) -> String {
+    format!("{CLOUD_VS_NAME}.{}", vs_table_name(glue_table))
+}
+
 fn glue_namespace(glue_table: &str) -> &str {
     glue_table.rsplit_once('.').map_or(glue_table, |(ns, _)| ns)
 }
 
-fn setup_cloud_vs(conn: &mut ExaConn, env: &CloudEnv, conn_name: &str, vs_name: &str) {
+struct CloudVsTarget<'a> {
+    conn_name: &'a str,
+    vs_name: &'a str,
+    password: CatalogConnectionPassword,
+}
+
+fn setup_cloud_vs(conn: &mut ExaConn, env: &CloudEnv, target: &CloudVsTarget) {
     conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
 
-    let password = env.catalog_connection_password();
-    let create_conn_sql = build_create_connection_sql(conn_name, &env.glue_catalog_uri, &password);
+    let create_conn_sql =
+        build_create_connection_sql(target.conn_name, &env.glue_catalog_uri, &target.password);
     conn.execute(&create_conn_sql);
 
+    let vs_name = target.vs_name;
     let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs_name} CASCADE"));
     conn.execute(&format!(
         r#"CREATE VIRTUAL SCHEMA {vs_name}
 USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
-  CATALOG_CONNECTION = '{conn_name}'
+  CATALOG_CONNECTION = '{}'
   NAMESPACE  = '{}'"#,
+        target.conn_name,
         glue_namespace(&env.glue_table)
     ));
 }
 
-fn setup_cloud_vs_vended(conn: &mut ExaConn, env: &CloudEnv) {
-    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
-
-    let password = env.catalog_connection_password_vended();
-    let create_conn_sql =
-        build_create_connection_sql(CLOUD_CATALOG_CONN_VENDED, &env.glue_catalog_uri, &password);
-    conn.execute(&create_conn_sql);
-
-    let _ = conn.try_execute(&format!(
-        "DROP VIRTUAL SCHEMA IF EXISTS {CLOUD_VS_NAME}_VENDED CASCADE"
-    ));
-    conn.execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA {CLOUD_VS_NAME}_VENDED
-USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
-  CATALOG_CONNECTION = '{CLOUD_CATALOG_CONN_VENDED}'
-  NAMESPACE  = '{}'"#,
-        glue_namespace(&env.glue_table)
-    ));
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-/// Skip test: asserts the skip path returns cleanly with no network call
-/// when any required environment variable is absent.
-///
-/// Reads the current process environment without mutation. If all required vars
-/// happen to be present (a live cloud run), the assertion is skipped with a note —
-/// the other smoke tests cover that path. When any var is absent the test asserts
-/// `CloudEnv::from_env()` returns `None` and makes no network call.
 #[test]
 fn cloud_test_skips_when_creds_absent() {
     let required = [
@@ -416,16 +439,12 @@ fn cloud_test_skips_when_creds_absent() {
     });
 
     if all_present {
-        // All required vars are set — we are in a real cloud run. The other
-        // smoke tests exercise the live path; nothing to assert here.
         println!(
             "cloud_test_skips_when_creds_absent: all vars present, assertion skipped (live cloud run)"
         );
         return;
     }
 
-    // At least one required var is absent in the current environment.
-    // Verify that from_env() returns None cleanly with no network call.
     let result = CloudEnv::from_env();
     assert!(
         result.is_none(),
@@ -434,10 +453,6 @@ fn cloud_test_skips_when_creds_absent() {
     println!("cloud_test_skips_when_creds_absent: skip path verified (no network call)");
 }
 
-/// Cloud smoke test: creates a Glue-backed VS and runs a projection + filter query.
-///
-/// Skips when AWS credentials or Exasol coords are absent from the environment.
-/// No credential value is printed.
 #[test]
 fn cloud_smoke_projection_filter_query() {
     let env = match CloudEnv::from_env() {
@@ -455,11 +470,18 @@ fn cloud_smoke_projection_filter_query() {
         &env.exasol_password,
     );
 
-    setup_cloud_vs(&mut conn, &env, CLOUD_CATALOG_CONN, CLOUD_VS_NAME);
+    setup_cloud_vs(
+        &mut conn,
+        &env,
+        &CloudVsTarget {
+            conn_name: CLOUD_CATALOG_CONN,
+            vs_name: CLOUD_VS_NAME,
+            password: env.catalog_connection_password(),
+        },
+    );
 
     let table = vs_table(&env.glue_table);
 
-    // Run a simple SELECT to verify rows come back (projection only).
     let all_cols = conn.query_columns(&format!("SELECT * FROM {table} LIMIT 10"));
     assert!(
         !all_cols.is_empty(),
@@ -476,7 +498,6 @@ fn cloud_smoke_projection_filter_query() {
         row_count
     );
 
-    // Run a COUNT(*) to verify aggregation works.
     let count_cols = conn.query_columns(&format!("SELECT COUNT(*) FROM {table}"));
     assert_eq!(count_cols.len(), 1, "COUNT(*) must return one column");
     let total = count_cols[0][0]
@@ -488,16 +509,71 @@ fn cloud_smoke_projection_filter_query() {
         "COUNT(*) must return a positive row count for the seeded Glue table"
     );
     println!("cloud_smoke_projection_filter_query: COUNT(*) = {total}");
-
-    // No credential values must appear in the output above.
-    // (The assert is on the test logic, not output capture — credentials are never
-    // embedded in any variable printed above.)
 }
 
-/// Cloud performance + aggregate smoke test: grouped COUNT/SUM, wall-clock timing.
-///
-/// Records the query duration for manual inspection. No hard latency threshold.
-/// Skips when credentials are absent.
+#[test]
+fn cloud_sigv4_region_derived_from_glue_endpoint_lists_table() {
+    let env = match CloudEnv::from_env() {
+        Some(e) => e,
+        None => {
+            println!(
+                "SKIPPED: cloud_sigv4_region_derived_from_glue_endpoint_lists_table — env vars absent"
+            );
+            return;
+        }
+    };
+
+    let standard_glue_uri = format!("https://glue.{}.amazonaws.com/iceberg", env.aws_region);
+    let env = CloudEnv {
+        glue_catalog_uri: standard_glue_uri,
+        ..env
+    };
+
+    let mut conn = ExaConn::connect_redacting(
+        &env.exasol_host,
+        env.exasol_port,
+        &env.exasol_user,
+        &env.exasol_password,
+    );
+
+    let vs_name = format!("{CLOUD_VS_NAME}_NO_REGION");
+
+    setup_cloud_vs(
+        &mut conn,
+        &env,
+        &CloudVsTarget {
+            conn_name: CLOUD_CATALOG_CONN_NO_REGION,
+            vs_name: &vs_name,
+            password: env.catalog_connection_password_without_region(),
+        },
+    );
+
+    let table_names = conn.query_columns(&format!(
+        "SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA = '{vs_name}'"
+    ));
+    let listed: Vec<String> = table_names
+        .first()
+        .map(|c| {
+            c.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_uppercase()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let expected_table = vs_table_name(&env.glue_table);
+
+    assert!(
+        listed.contains(&expected_table),
+        "SigV4-signed catalog requests using the endpoint-derived region must list \
+         the configured Glue table; found {listed:?}, expected {expected_table}"
+    );
+
+    println!(
+        "cloud_sigv4_region_derived_from_glue_endpoint_lists_table: listed {} table(s), including {expected_table}",
+        listed.len()
+    );
+}
+
 #[test]
 fn cloud_perf_grouped_aggregate_smoke() {
     let env = match CloudEnv::from_env() {
@@ -515,11 +591,18 @@ fn cloud_perf_grouped_aggregate_smoke() {
         &env.exasol_password,
     );
 
-    setup_cloud_vs(&mut conn, &env, CLOUD_CATALOG_CONN, CLOUD_VS_NAME);
+    setup_cloud_vs(
+        &mut conn,
+        &env,
+        &CloudVsTarget {
+            conn_name: CLOUD_CATALOG_CONN,
+            vs_name: CLOUD_VS_NAME,
+            password: env.catalog_connection_password(),
+        },
+    );
 
     let table = vs_table(&env.glue_table);
 
-    // First, get the total row count to establish what "sane" means.
     let count_cols = conn.query_columns(&format!("SELECT COUNT(*) FROM {table}"));
     let total_rows = count_cols[0][0]
         .as_i64()
@@ -531,11 +614,7 @@ fn cloud_perf_grouped_aggregate_smoke() {
     );
     println!("cloud_perf_grouped_aggregate_smoke: total rows = {total_rows}");
 
-    // Run a grouped aggregate and time it.
-    // We use COUNT(*) grouped by the first column as a generic aggregate that
-    // works regardless of the table schema.
     let describe_cols = conn.query_columns(&format!("DESCRIBE {table}"));
-    // describe_cols[0] = column names
     let first_col = describe_cols[0]
         .first()
         .and_then(|v| v.as_str())
@@ -557,7 +636,6 @@ fn cloud_perf_grouped_aggregate_smoke() {
         "GROUP BY query must return at least one group"
     );
 
-    // Sum of per-group counts must equal total rows.
     if agg_cols.len() >= 2 {
         let group_total: i64 = agg_cols[1]
             .iter()
@@ -572,14 +650,9 @@ fn cloud_perf_grouped_aggregate_smoke() {
         );
     }
 
-    // Record timing (observational only — no hard threshold).
     println!("cloud_perf_grouped_aggregate_smoke: {group_count} groups, {elapsed:.2?} wall-clock");
 }
 
-/// Vended credentials end-to-end: scan reads Glue data files via vended creds.
-///
-/// Asserts the scan succeeds and that no credential value appears in test output.
-/// Skips when credentials are absent.
 #[test]
 fn cloud_scan_reads_with_vended_credentials() {
     let env = match CloudEnv::from_env() {
@@ -597,19 +670,18 @@ fn cloud_scan_reads_with_vended_credentials() {
         &env.exasol_password,
     );
 
-    setup_cloud_vs_vended(&mut conn, &env);
+    setup_cloud_vs(
+        &mut conn,
+        &env,
+        &CloudVsTarget {
+            conn_name: CLOUD_CATALOG_CONN_VENDED,
+            vs_name: &format!("{CLOUD_VS_NAME}_VENDED"),
+            password: env.catalog_connection_password_vended(),
+        },
+    );
 
-    let vended_table = {
-        let table_part = env
-            .glue_table
-            .split('.')
-            .next_back()
-            .unwrap_or(&env.glue_table)
-            .to_uppercase();
-        format!("{CLOUD_VS_NAME}_VENDED.{table_part}")
-    };
+    let vended_table = format!("{CLOUD_VS_NAME}_VENDED.{}", vs_table_name(&env.glue_table));
 
-    // A simple scan via vended credentials must return rows.
     let cols = conn.query_columns(&format!("SELECT * FROM {vended_table} LIMIT 5"));
     assert!(
         !cols.is_empty(),
@@ -624,17 +696,11 @@ fn cloud_scan_reads_with_vended_credentials() {
         cols.len(),
         cols[0].len()
     );
-
-    // Credential values must not appear in printed output above.
-    // (Static keys and vended keys are never embedded in any printed variable.)
 }
 
-/// The one vended credential source that applies to `location`: the
-/// `storage_credentials` entry whose non-empty `prefix` is the longest prefix of
-/// `location`, else the flat `config` map. Mirrors the shipped resolver's selection
-/// rule — including comparing both sides with the URI scheme lowercased (RFC 3986
-/// §3.1) — since reading the response instead of calling the resolver is the point: a
-/// resolved backend cannot say which config key the catalog left out.
+/// Mirrors the resolver's longest-prefix selection (scheme lowercased, RFC 3986
+/// §3.1) instead of calling it, because a resolved backend cannot say which config
+/// key the catalog left out.
 fn vended_source_for<'a>(
     result: &'a iceberg_catalog_rest::LoadTableResult,
     location: &str,
@@ -655,8 +721,6 @@ fn vended_source_for<'a>(
         .map_or(&result.config, |entry| &entry.config)
 }
 
-/// `uri` with its URI scheme lowercased and everything after `://` verbatim, mirroring
-/// the resolver's own scheme folding.
 fn lowercase_scheme(uri: &str) -> String {
     match uri.split_once("://") {
         Some((scheme, rest)) => format!("{}://{rest}", scheme.to_ascii_lowercase()),
@@ -664,41 +728,20 @@ fn lowercase_scheme(uri: &str) -> String {
     }
 }
 
-/// Whether the vended source carries a usable value for `key`, spelling absence as
-/// the shipped resolver does: omitted and empty are both ABSENT. Answers with the
-/// presence alone, so no credential value can reach an assertion message.
+/// Omitted and empty are both absent, as in the resolver. Returns presence only so
+/// no credential value can reach an assertion message.
 fn vended_key_present(vended: &HashMap<String, String>, key: &str) -> bool {
     vended.get(key).is_some_and(|value| !value.is_empty())
 }
 
-/// One key's presence as a word for the report line.
 fn presence_label(present: bool) -> &'static str {
     if present { "VENDED" } else { "ABSENT" }
 }
 
-/// AWS Glue's vended payload carries a usable S3 credential set for the table's
-/// own location, and what it says about that location's store address.
-///
-/// Evidence `cloud_scan_reads_with_vended_credentials` cannot supply: that CONNECTION
-/// also carries static AWS keys, so a green scan there is compatible with Glue vending
-/// nothing at all. This test issues the access-delegated `loadTable` GET itself and
-/// reads the response's vended config keys, which no static CONNECTION value can
-/// populate. An absent KEY PAIR is a plan-time failure for every vended Glue virtual
-/// schema, which is why those assertions name the absent key rather than a failed scan.
-///
-/// The anchor is the table's OWN location, derived exactly as the Iceberg reader
-/// derives it; there is no fallback for it, so this test asserts it is present rather
-/// than substituting the CONNECTION's `warehouse`.
-///
-/// `client.region`, `s3.endpoint`, and `s3.session-token` are REPORTED, not required.
-/// A permanent IAM identity vends a key pair with no token, and the store address is
-/// resolved with the CONNECTION's `endpoint`/`region` winning when set — so a payload
-/// vending neither addressing key still resolves, through the CONNECTION or AWS's own
-/// default chain. Only the credentials must be vended. Run with `--nocapture` to read
-/// the report line. Skips when the cloud env vars are absent, like every test in this
-/// module.
 #[test]
 fn cloud_glue_vends_the_s3_key_pair_for_the_table_location() {
+    // Reads the `loadTable` response directly: the vended CONNECTION also carries
+    // static keys, so a green scan alone cannot prove Glue vended anything.
     let env = match CloudEnv::from_env() {
         Some(e) => e,
         None => {
@@ -781,27 +824,6 @@ fn cloud_glue_vends_the_s3_key_pair_for_the_table_location() {
     );
 }
 
-/// Catalog token/OAuth2 auth end-to-end: resolves a file list from a REST catalog
-/// that requires catalog-level authentication (static bearer token or OAuth2
-/// client-credentials grant), then asserts the VS returns rows.
-///
-/// Gating: mirrors `cloud_scan_reads_with_vended_credentials` — skips when any
-/// required environment variable is absent; env vars documented at the top of this
-/// module. No credential value is printed to test output.
-///
-/// Required env vars:
-///   CATALOG_AUTH_URI          — Iceberg REST catalog endpoint requiring auth
-///   CATALOG_AUTH_WAREHOUSE    — catalog routing identifier (a bare warehouse name or account
-///                               id), NOT an S3 URI or storage location
-///   CATALOG_AUTH_TABLE        — Fully-qualified table name (e.g. my_db.my_table)
-///   EXASOL_HOST               — Exasol hostname/IP
-///   LH_EXASOL_PASSWORD        — Exasol password
-/// Auth (at least one mode required):
-///   CATALOG_AUTH_TOKEN                 — static bearer token (token mode)
-///   CATALOG_AUTH_CLIENT_ID             — OAuth2 client ID   \  client-credentials
-///   CATALOG_AUTH_CLIENT_SECRET         — OAuth2 client secret /  mode
-///   CATALOG_AUTH_OAUTH2_SERVER_URI     — (optional) OAuth2 token endpoint
-///   CATALOG_AUTH_SCOPE                 — (optional) OAuth2 scope
 #[test]
 fn catalog_token_oauth_auth_resolves_files_e2e() {
     let env = match CatalogAuthEnv::from_env() {
@@ -849,7 +871,6 @@ USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
         .to_uppercase();
     let vs_table = format!("{auth_vs_name}.{table_part}");
 
-    // A SELECT proves that the Iceberg reader succeeded against the auth-gated catalog.
     let cols = conn.query_columns(&format!("SELECT * FROM {vs_table} LIMIT 5"));
     assert!(
         !cols.is_empty(),
@@ -871,24 +892,11 @@ USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
         cols[0].len(),
         auth_mode
     );
-
-    // Token and client_secret values must not appear in any printed output above.
-    // (Auth credentials are never embedded in any variable printed above.)
 }
 
-// ---------------------------------------------------------------------------
-// Redaction negative test
-// ---------------------------------------------------------------------------
-
-/// A failing, credential-bearing DDL executed through a redacting `ExaConn` must
-/// not surface the SQL text or any credential value in the `execute()` failure.
-///
-/// Skips (like the other cloud tests) when the required env vars are absent.
-/// Mirrors the no-leak assertion style in `e2e_refresh_test.rs`.
 #[test]
 fn cloud_redacting_conn_omits_credentials_on_failure() {
-    // Obviously-fake sentinels — never real credentials, so they are safe to
-    // surface in a failing-assertion diagnostic below.
+    // Fake sentinels, safe to surface in assertion messages.
     const SENTINEL_ACCESS_KEY: &str = "AKIA_DUMMY_REDACTION_SENTINEL_KEY";
     const SENTINEL_SECRET_KEY: &str = "DUMMY_REDACTION_SENTINEL_SECRET_VALUE";
 
@@ -909,9 +917,6 @@ fn cloud_redacting_conn_omits_credentials_on_failure() {
         &env.exasol_password,
     );
 
-    // A realistic credential-bearing CONNECTION DDL carrying the sentinels in its
-    // JSON password, plus an invalid trailing token so Exasol rejects it at parse
-    // time — driving the execute() DDL-failure path that redaction governs.
     let sentinel_password = CatalogConnectionPassword {
         warehouse: "s3://redaction-probe/".to_string(),
         endpoint: String::new(),
@@ -931,11 +936,7 @@ fn cloud_redacting_conn_omits_credentials_on_failure() {
     );
     let failing_sql = format!("{base_sql} THIS_TRAILING_TOKEN_MAKES_THE_STATEMENT_INVALID");
 
-    // Deliberately trigger the execute() failure panic and capture it. We do NOT
-    // touch the global panic hook: it is process-wide and Rust runs this binary's
-    // tests in parallel, so silencing it could swallow panic output from other
-    // concurrently running tests. The redacting `ExaConn` already omits the SQL
-    // and response body from this message, so letting the hook print it is safe.
+    // The panic hook is left alone: it is process-wide and tests run in parallel.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         conn.execute(&failing_sql);
     }));
@@ -954,8 +955,6 @@ fn cloud_redacting_conn_omits_credentials_on_failure() {
         String::new()
     };
 
-    // A non-empty string payload proves the failure message was actually
-    // captured, so the no-leak assertions below are not vacuously satisfied.
     assert!(
         !panic_msg.is_empty(),
         "expected a string panic payload from the failed redacting execute()"
@@ -971,5 +970,197 @@ fn cloud_redacting_conn_omits_credentials_on_failure() {
 
     println!(
         "cloud_redacting_conn_omits_credentials_on_failure: redaction verified (no SQL, no credentials in failure output)"
+    );
+}
+
+/// Cloud assume-role E2E (issue #139): a SigV4 CONNECTION naming the base
+/// identity, the role, and the external id reaches Glue and S3 through a real
+/// AWS STS `AssumeRole` call — proving STS accepts the engine's signed request
+/// and that Glue/S3 accept the resulting session.
+///
+/// Skips when any of the four assume-role env vars (or the Glue vars this
+/// suite already reads) is absent, naming it. No credential value or the
+/// external id is printed to test output.
+#[test]
+fn cloud_assume_role_reaches_glue_and_s3_through_the_role() {
+    let env = match AssumeRoleCloudEnv::from_env() {
+        Some(e) => e,
+        None => {
+            println!(
+                "SKIPPED: cloud_assume_role_reaches_glue_and_s3_through_the_role — env vars absent"
+            );
+            return;
+        }
+    };
+
+    let mut conn = ExaConn::connect_redacting(
+        &env.exasol_host,
+        env.exasol_port,
+        &env.exasol_user,
+        &env.exasol_password,
+    );
+
+    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
+
+    let create_conn_sql = build_create_connection_sql(
+        CLOUD_CATALOG_CONN_ASSUME_ROLE,
+        &env.glue_catalog_uri,
+        &env.catalog_connection_password_role(),
+    );
+    conn.execute(&create_conn_sql);
+
+    let vs_name = format!("{CLOUD_VS_NAME}_ASSUME_ROLE");
+    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs_name} CASCADE"));
+    conn.execute(&format!(
+        r#"CREATE VIRTUAL SCHEMA {vs_name}
+USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
+  CATALOG_CONNECTION = '{CLOUD_CATALOG_CONN_ASSUME_ROLE}'
+  NAMESPACE  = '{}'"#,
+        glue_namespace(&env.glue_table)
+    ));
+
+    let table = format!("{vs_name}.{}", vs_table_name(&env.glue_table));
+
+    let all_cols = conn.query_columns(&format!("SELECT * FROM {table} LIMIT 10"));
+    assert!(
+        !all_cols.is_empty(),
+        "query through the assumed role must return at least one column"
+    );
+    let row_count = all_cols[0].len();
+    assert!(
+        row_count > 0,
+        "query through the assumed role must return at least one row"
+    );
+
+    let count_cols = conn.query_columns(&format!("SELECT COUNT(*) FROM {table}"));
+    assert_eq!(count_cols.len(), 1, "COUNT(*) must return one column");
+    let total = count_cols[0][0]
+        .as_i64()
+        .or_else(|| count_cols[0][0].as_str().and_then(|s| s.parse().ok()))
+        .expect("COUNT(*) must be an integer");
+    assert!(
+        total > 0,
+        "COUNT(*) through the assumed role must return a positive row count"
+    );
+
+    println!(
+        "cloud_assume_role_reaches_glue_and_s3_through_the_role: {} columns, {} rows, COUNT(*) = {total}",
+        all_cols.len(),
+        row_count
+    );
+}
+
+/// Cloud assume-role E2E (issue #139): the base identity alone — no role, no
+/// STS call — is denied by Glue. Shares the environment of
+/// `cloud_assume_role_reaches_glue_and_s3_through_the_role`.
+#[test]
+fn cloud_assume_role_base_identity_alone_is_denied() {
+    let env = match AssumeRoleCloudEnv::from_env() {
+        Some(e) => e,
+        None => {
+            println!("SKIPPED: cloud_assume_role_base_identity_alone_is_denied — env vars absent");
+            return;
+        }
+    };
+
+    let mut conn = ExaConn::connect_redacting(
+        &env.exasol_host,
+        env.exasol_port,
+        &env.exasol_user,
+        &env.exasol_password,
+    );
+
+    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
+
+    let create_conn_sql = build_create_connection_sql(
+        CLOUD_CATALOG_CONN_ASSUME_ROLE_BASE_ONLY,
+        &env.glue_catalog_uri,
+        &env.catalog_connection_password_base_only(),
+    );
+    conn.execute(&create_conn_sql);
+
+    let vs_name = format!("{CLOUD_VS_NAME}_ASSUME_ROLE_BASE_ONLY");
+    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs_name} CASCADE"));
+    let result = conn.try_execute(&format!(
+        r#"CREATE VIRTUAL SCHEMA {vs_name}
+USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
+  CATALOG_CONNECTION = '{CLOUD_CATALOG_CONN_ASSUME_ROLE_BASE_ONLY}'
+  NAMESPACE  = '{}'"#,
+        glue_namespace(&env.glue_table)
+    ));
+
+    assert_eq!(
+        result["status"].as_str(),
+        Some("error"),
+        "the base identity alone must be denied by Glue: {result}"
+    );
+    let msg = result["exception"]["text"].as_str().unwrap_or("");
+    assert!(
+        msg.to_ascii_lowercase().contains("accessdenied"),
+        "Glue must deny the base identity: {msg}"
+    );
+    assert!(
+        !msg.contains(&env.base_secret_access_key),
+        "credential leaked in denial: {msg}"
+    );
+
+    println!("cloud_assume_role_base_identity_alone_is_denied: denied as expected");
+}
+
+/// Cloud assume-role E2E (issue #139): real AWS STS enforces the role's `sts:ExternalId`
+/// condition, which the local SeaweedFS stack does not evaluate. Shares the environment of
+/// `cloud_assume_role_reaches_glue_and_s3_through_the_role`.
+///
+/// Scenario: A wrong external id is denied by AWS STS
+#[test]
+fn cloud_assume_role_wrong_external_id_is_denied() {
+    let env = match AssumeRoleCloudEnv::from_env() {
+        Some(e) => e,
+        None => {
+            println!("SKIPPED: cloud_assume_role_wrong_external_id_is_denied — env vars absent");
+            return;
+        }
+    };
+    const WRONG_EXTERNAL_ID: &str = "wrong-external-id";
+
+    let mut conn = ExaConn::connect_redacting(
+        &env.exasol_host,
+        env.exasol_port,
+        &env.exasol_user,
+        &env.exasol_password,
+    );
+    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
+
+    let conn_name = "GLUE_CATALOG_CREDS_ASSUME_ROLE_BAD_EXTERNAL_ID";
+    let password = CatalogConnectionPassword {
+        aws_external_id: Some(WRONG_EXTERNAL_ID.to_string()),
+        ..env.catalog_connection_password_role()
+    };
+    conn.execute(&build_create_connection_sql(
+        conn_name,
+        &env.glue_catalog_uri,
+        &password,
+    ));
+
+    let vs_name = format!("{CLOUD_VS_NAME}_ASSUME_ROLE_BAD_EXTERNAL_ID");
+    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs_name} CASCADE"));
+    let result = conn.try_execute(&format!(
+        r#"CREATE VIRTUAL SCHEMA {vs_name}
+USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
+  CATALOG_CONNECTION = '{conn_name}'
+  NAMESPACE  = '{}'"#,
+        glue_namespace(&env.glue_table)
+    ));
+
+    assert_eq!(
+        result["status"].as_str(),
+        Some("error"),
+        "a wrong external id must fail CREATE VIRTUAL SCHEMA: {result}"
+    );
+    let msg = result["exception"]["text"].as_str().unwrap_or("");
+    assert!(msg.contains("AccessDenied"), "{msg}");
+    assert!(
+        !msg.contains(WRONG_EXTERNAL_ID) && !msg.contains(&env.base_secret_access_key),
+        "credential or external id leaked: {msg}"
     );
 }

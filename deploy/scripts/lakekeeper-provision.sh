@@ -1,30 +1,8 @@
 #!/usr/bin/env bash
-# Registers Iceberg tables already cataloged in a source catalog into a target Lakekeeper
-# warehouse by reference (register-table) — no data rewrite, no Parquet/manifest/metadata
-# file is ever written by this script.
-#
-# Configuration is via LK_SOURCE_* / LK_TARGET_* environment variables ONLY. The only accepted
-# command-line argument is --source-only. No credential is ever placed on this script's own
-# command line, and no credential reaches any process this script spawns through THAT process's
-# command line either — every credential travels via an environment variable, an SSM
-# SecureString (read by the caller before invoking this script), or a curl/jq file descriptor.
-# Shell tracing MUST NOT be enabled anywhere in this file: it prints every expanded command,
-# including the credential-bearing ones. The banned option is not spelled out here on purpose —
-# an offline source-text scan asserts the whole file is free of it, and a comment quoting the
-# token would fail that scan.
-#
-# Section 1 (task 2.1 — source half): env validation, the two source producers (glue|rest)
-# normalized to one (name, metadata_location, table_location) triple per table, bucket/key-prefix
-# derivation, target S3 flavor/path-style derivation, and the --source-only mode.
-# Section 2 (task 2.2 — target half): OAuth2 token, server-info read, bootstrap, warehouse create
-# + confirming read-back, warehouse-prefix resolution, namespace create, one register call per
-# table, and the per-table summary. Each register outcome is settled by its own confirming
-# read-back (task 2.3), for the reason confirm_registered_metadata_location documents.
+# Credentials never appear on any process's argv: they travel via environment variables or a
+# curl/jq stdin config. Shell tracing must never be enabled in this file (it would print them);
+# the option is deliberately not named here because a source scan asserts its absence.
 set -euo pipefail
-
-# ==============================================================================================
-# Section 1: source half (task 2.1)
-# ==============================================================================================
 
 usage() {
   echo "usage: $(basename "$0") [--source-only]" >&2
@@ -47,8 +25,6 @@ require_var() {
   fi
 }
 
-# --- Environment validation --------------------------------------------------------------------
-
 LK_SOURCE_KIND="${LK_SOURCE_KIND:-glue}"
 
 case "$LK_SOURCE_KIND" in
@@ -69,10 +45,6 @@ case "$LK_SOURCE_KIND" in
     ;;
 esac
 
-# The target half (task 2.2) needs every one of these, but validating their presence up front —
-# before any source read runs — means a misconfigured full run fails fast rather than after
-# already reading Glue/S3. Skipped entirely in --source-only mode, which never touches the
-# target catalog at all.
 if [ "$SOURCE_ONLY" -eq 0 ]; then
   require_var LK_TARGET_CATALOG_URI
   require_var LK_TARGET_TOKEN_URI
@@ -85,14 +57,7 @@ if [ "$SOURCE_ONLY" -eq 0 ]; then
   require_var LK_TARGET_SECRET_ACCESS_KEY
 fi
 
-# Target S3 flavor + path-style — DERIVED from whether LK_TARGET_S3_ENDPOINT is set, never a
-# separate toggle (plan.md "Derive, don't configure"). Unset => real AWS S3, virtual-hosted
-# addressing. Set (e.g. MinIO for local verification) => S3-compatible, path-style addressing.
-#
-# Both hold Lakekeeper's own WIRE values, not internal enum names: the storage profile's `flavor`
-# field is a kebab-case tagged value ("aws" / "s3-compat") and `path-style-access` is a JSON
-# boolean. Keeping the wire spelling here rather than translating it in section 2 leaves one
-# owner for the decision instead of a derivation and a lookup table that can disagree.
+# Lakekeeper wire values for the storage profile's `flavor` and `path-style-access`.
 if [ -n "${LK_TARGET_S3_ENDPOINT:-}" ]; then
   TARGET_S3_FLAVOR="s3-compat"
   TARGET_S3_PATH_STYLE="true"
@@ -101,11 +66,7 @@ else
   TARGET_S3_PATH_STYLE="false"
 fi
 
-# --- Shared no-argv-credential helpers (used by both the "rest" source producer here and by the
-# target half task 2.2 appends) ------------------------------------------------------------------
-
-# OAuth2 client-credentials token request. client_secret reaches curl ONLY via --config on stdin,
-# never via -d/--data on curl's own argv, because argv is a world-readable process listing.
+# client_secret goes via --config on stdin, never argv (world-readable process listing).
 oauth2_token() {
   local token_uri="$1" client_id="$2" client_secret="$3"
   curl -sf --request POST "$token_uri" --config - <<CURLCFG | jq -r '.access_token // empty'
@@ -115,9 +76,7 @@ data = "client_secret=$client_secret"
 CURLCFG
 }
 
-# Bearer-authenticated curl call. The token reaches curl ONLY via --config on stdin, never via a
-# -H argv token. Remaining args are passed straight through to curl (method, URL, --data-binary,
-# etc.) and MUST carry no credential themselves.
+# Token goes via --config on stdin; the passed-through args must carry no credential.
 curl_bearer() {
   local token="$1"; shift
   curl -sf --config - "$@" <<CURLCFG
@@ -129,13 +88,8 @@ urlencode() {
   jq -rn --arg v "$1" '$v|@uri'
 }
 
-# --- Bucket / common key-prefix derivation ------------------------------------------------------
-#
-# dirname_path / is_ancestor_or_equal implement the "shorten-to-parent" rule by walking whole
-# PATH SEGMENTS, never raw substrings. This is what makes the derivation safe for TPC-H's
-# part/partsupp shape: "part" is a byte-wise prefix of "partsupp", but dirname_path("tpch.db/part")
-# and dirname_path("tpch.db/partsupp") are both exactly "tpch.db" — the segment boundary is never
-# split mid-word the way a raw longest-common-substring computation would split it.
+# The common prefix is computed over whole path segments, never raw substrings: "part" is a
+# byte-wise prefix of "partsupp", but both tables share only "tpch.db".
 
 dirname_path() {
   local p="$1"
@@ -155,9 +109,7 @@ is_ancestor_or_equal() {
   esac
 }
 
-# arg: JSON array of triples -> prints "bucket<TAB>key_prefix" on success, exits non-zero on
-# a table location that is not an s3://<bucket>/<key> URL, a mixed-bucket set, or an empty
-# derived prefix.
+# Prints "bucket<TAB>key_prefix".
 derive_bucket_and_prefix() {
   local triples="$1"
 
@@ -198,12 +150,7 @@ derive_bucket_and_prefix() {
   printf '%s\t%s\n' "$bucket" "$common"
 }
 
-# --- Source producers -----------------------------------------------------------------------
-#
-# Both producers normalize to the SAME shape: a JSON array of {name, metadata_location,
-# table_location} objects. Everything downstream of fetch_source_triples (bucket/prefix
-# derivation and, in task 2.2, registration) knows only this triple — never how a catalog is
-# read (plan.md "Source read normalizes to one triple").
+# Both producers emit a JSON array of {name, metadata_location, table_location}.
 
 fetch_source_triples_glue() {
   local tables_json
@@ -291,34 +238,15 @@ if [ "$SOURCE_ONLY" -eq 1 ]; then
   exit 0
 fi
 
-# ==============================================================================================
-# Section 2: target half (task 2.2)
-# ==============================================================================================
-# Consumes: $SOURCE_TRIPLES (the normalized JSON array), $SOURCE_BUCKET, $SOURCE_KEY_PREFIX,
-# $TARGET_S3_FLAVOR, $TARGET_S3_PATH_STYLE, the oauth2_token / urlencode helpers above, and
-# every validated LK_TARGET_* variable.
-#
-# Order (plan.md "Provisioning order"): token -> server info -> bootstrap -> warehouse create ->
-# confirming read-back -> warehouse prefix -> namespace -> one register call per table, each with
-# its own confirming read-back -> summary.
-
-# One week. Lakekeeper v0.13.1's soft TabularDeleteProfile variant carries no serde default for
-# `expiration-seconds`, so the field is REQUIRED and a body omitting it fails warehouse creation.
-# The value matches upstream's own tests/migrations/create-warehouse/soft-delete-1week.json.
+# One week. Required by Lakekeeper v0.13.1's soft-delete profile (no serde default).
 SOFT_DELETE_EXPIRATION_SECONDS=604800
 
-# --- Target endpoint bases ----------------------------------------------------------------------
-#
-# LK_TARGET_CATALOG_URI is used VERBATIM for the Iceberg REST surface. Its HOST fixes the vantage
-# (public IP from a laptop, private IP from inside the VPC) and the caller owns that choice, so
-# nothing here rewrites, derives, or vantage-corrects the host. The management API is the same
-# deployment's other API root on that same host and no LK_TARGET_* variable carries it, so its
-# PATH — and only its path — is derived by swapping the /catalog suffix for /management/v1.
+# The caller's catalog host fixes the vantage (public vs private IP); only the management path
+# is derived from it.
 TARGET_CATALOG_BASE="${LK_TARGET_CATALOG_URI%/}"
 TARGET_MANAGEMENT_BASE="${TARGET_CATALOG_BASE%/catalog}/management/v1"
 
-# Lakekeeper reserves these namespace names. Rejecting one up front fails the whole run with a
-# clear cause instead of surfacing as eight identical per-table registration errors.
+# Reserved by Lakekeeper.
 case "$LK_TARGET_NAMESPACE" in
   system|examples|information_schema)
     echo "FATAL: target namespace '$LK_TARGET_NAMESPACE' is reserved by Lakekeeper" >&2
@@ -326,36 +254,22 @@ case "$LK_TARGET_NAMESPACE" in
     ;;
 esac
 
-# --- Captured response bodies -------------------------------------------------------------------
-#
-# Classifying an idempotent re-run needs the body of calls that may legitimately fail, so each
-# response is captured to a file in a mktemp -d directory removed by an EXIT trap. It is NEVER
-# printed on any path: the warehouse request carries the storage secret access key, and an error
-# response can quote the offending request back.
+# Response bodies are captured for classification but NEVER printed: an error response can
+# quote back the warehouse request, which carries the storage secret access key.
 RESPONSE_DIR="$(mktemp -d)"
 trap 'rm -rf "$RESPONSE_DIR"' EXIT
 RESPONSE_BODY="$RESPONSE_DIR/response.json"
 
-# The warehouse body's two credential fields reach jq through jq's own ENVIRONMENT rather than a
-# --arg token, because /proc/<pid>/cmdline is world-readable while /proc/<pid>/environ is not.
-# This export is what puts them there: a value that arrived as a plain shell variable rather than
-# an exported one satisfies the section-1 validation but renders as JSON null inside `jq -n`.
+# jq reads these from its environment rather than --arg: /proc/<pid>/cmdline is world-readable,
+# /proc/<pid>/environ is not. Without the export they render as JSON null.
 export LK_TARGET_ACCESS_KEY_ID LK_TARGET_SECRET_ACCESS_KEY
 
-# --- Target request plumbing ----------------------------------------------------------------------
-
-# Bearer-authenticated request that CLASSIFIES rather than fails. Writes the response body to
-# $RESPONSE_BODY and prints ONLY the HTTP status code on stdout ("000" when the request never
-# reached a server). The body deliberately does not come back as a return value — keeping it in a
-# file is what makes it impossible to interpolate a credential-bearing response into a message.
-#
-# The token reaches curl through --config on stdin, never a -H argv token. Remaining args pass
-# straight through and MUST carry no credential themselves.
+# Prints only the HTTP status ("000" if unreachable); the body stays in $RESPONSE_BODY so a
+# credential-bearing response can never be interpolated into a message.
 curl_bearer_status() {
   local token="$1"; shift
   local status
-  # curl leaves a previous call's body in place when it never connects, so truncate first: a
-  # stale body would be classified as if it belonged to this request.
+  # curl leaves a stale body in place when it never connects.
   : >"$RESPONSE_BODY"
   status="$(
     curl -s -o "$RESPONSE_BODY" -w '%{http_code}' --config - "$@" <<CURLCFG
@@ -373,20 +287,13 @@ response_reports_location_already_taken() {
   grep -qiE 'locationalreadytaken|location.{0,40}already.{0,40}taken' "$RESPONSE_BODY" 2>/dev/null
 }
 
-# --- Request bodies -------------------------------------------------------------------------------
-#
-# Every body is built by `jq -n`, never by string interpolation or a heredoc: bash has no
-# compile-time JSON checking, and jq -n is the only construction that guarantees a well-formed
-# body and correct escaping of a value carrying a quote, a backslash, or a newline.
+# Bodies are built with `jq -n`, never string interpolation, for correct escaping.
 
 bootstrap_request_body() {
   jq -n -c '{"accept-terms-of-use": true, "is-operator": true}'
 }
 
-# The S3 storage profile. `sts-enabled` is false, so the profile carries no STS role identifier —
-# that field is required only when AWS-flavored credential vending is on. The endpoint and
-# path-style pair appear only for an S3-compatible store, so the AWS run and the local MinIO
-# verification differ by exactly the values section 1 derived.
+# No STS role identifier: it is required only when sts-enabled is true.
 target_storage_profile() {
   local profile
   profile="$(jq -n -c \
@@ -405,12 +312,7 @@ target_storage_profile() {
   printf '%s' "$profile"
 }
 
-# The one credential-bearing body. `access-key-id` and `secret-access-key` are read from jq's
-# environment (env.LK_TARGET_*) and MUST NOT be moved to --arg or --argjson: that would place the
-# storage secret in jq's own world-readable process listing, exactly the exposure the --config
-# rule closes for curl. Every non-credential field keeps --arg. The canonical credential field
-# names are used rather than the aliased aws-* spellings the in-repo Rust E2E harness happens to
-# send. The soft delete-profile is named explicitly rather than left to the server default.
+# Credentials MUST stay env.LK_TARGET_*, never --arg/--argjson (world-readable argv).
 warehouse_request_body() {
   jq -n -c \
     --arg warehouse_name "$LK_TARGET_WAREHOUSE" \
@@ -433,23 +335,16 @@ namespace_request_body() {
   jq -n -c --arg namespace "$LK_TARGET_NAMESPACE" '{namespace: [$namespace], properties: {}}'
 }
 
-# `overwrite` is a literal JSON false in the program text rather than an omitted or null field,
-# so a re-run can never replace a table's recorded metadata pointer.
+# A re-run must never replace a table's recorded metadata pointer.
 register_request_body() {
   jq -n -c --arg name "$1" --arg metadata_location "$2" \
     '{name: $name, "metadata-location": $metadata_location, overwrite: false}'
 }
 
-# --- Provisioning steps ---------------------------------------------------------------------------
-#
-# Every step below that can fail fatally is called at TOP LEVEL, never inside a command
-# substitution: `exit` inside `$( )` leaves only the subshell, which would turn a fatal
-# misconfiguration into a silently-empty value.
+# Steps that can fail fatally are called at top level, never inside `$( )`: `exit` there leaves
+# only the subshell.
 
-# The server-info endpoint answers 401 to an anonymous caller once authentication is enabled, so
-# the token is obtained before the first management call. Any ambiguity — unreachable, non-2xx,
-# unparseable, or field absent — answers "not bootstrapped" so the request is attempted rather
-# than silently skipped. The server id is NOT consulted: it is always populated.
+# Any ambiguity answers "not bootstrapped" so bootstrap is attempted rather than skipped.
 server_is_bootstrapped() {
   local token="$1" status
   status="$(curl_bearer_status "$token" --request GET "$TARGET_MANAGEMENT_BASE/info")"
@@ -472,11 +367,8 @@ bootstrap_server() {
   exit 1
 }
 
-# 2xx, 409, and a 400 whose body reports a storage-profile overlap are all accepted, because
-# Lakekeeper 0.13.1 reports a duplicate warehouse as a 400 rather than a 409. Every accepted
-# outcome is then confirmed by confirm_warehouse_storage_profile: the reported error is about
-# OVERLAPPING profiles rather than an identical warehouse, so for warehouses sharing a bucket the
-# already-present reading is an inference and only a read-back makes it a fact.
+# Lakekeeper 0.13.1 reports a duplicate warehouse as a 400 storage-profile overlap, not a 409.
+# An overlap is not proof of an identical warehouse, so confirm_warehouse_storage_profile follows.
 create_warehouse() {
   local token="$1" status
   status="$(curl_bearer_status "$token" --request POST "$TARGET_MANAGEMENT_BASE/warehouse" \
@@ -503,10 +395,6 @@ create_warehouse() {
   exit 1
 }
 
-# Without this read-back a shifted key prefix, or a different overlapping warehouse in the same
-# bucket, is swallowed as success and every table is then registered into a warehouse whose
-# bucket and prefix the script never confirmed. Both the expected and the returned values are
-# named; neither is a credential, and the listing does not echo storage credentials.
 confirm_warehouse_storage_profile() {
   local token="$1" status profile returned_bucket returned_prefix
   status="$(curl_bearer_status "$token" --request GET "$TARGET_MANAGEMENT_BASE/warehouse")"
@@ -535,14 +423,8 @@ confirm_warehouse_storage_profile() {
   echo "==> warehouse '$LK_TARGET_WAREHOUSE': confirmed at s3://$returned_bucket/$returned_prefix"
 }
 
-# Lakekeeper serves the Iceberg REST surface under a per-warehouse prefix. Sets WAREHOUSE_PREFIX
-# rather than printing it, so its own fatal paths really terminate the script.
-#
-# The Iceberg REST config document carries catalog properties in two objects, `defaults` and
-# `overrides`, and the spec lets a server publish a property in either; a client merges defaults
-# first and lets overrides win. Lakekeeper 0.13.1 publishes `prefix` in `defaults` (confirmed
-# against the local stack), so reading `overrides` alone yields an empty prefix and every
-# subsequent catalog call lands on an unprefixed path the server answers 404 for.
+# Sets rather than prints WAREHOUSE_PREFIX so its fatal paths terminate the script.
+# Lakekeeper 0.13.1 publishes `prefix` in `defaults`, not `overrides`.
 WAREHOUSE_PREFIX=""
 resolve_warehouse_prefix() {
   local token="$1" status config_uri
@@ -558,8 +440,7 @@ resolve_warehouse_prefix() {
   WAREHOUSE_PREFIX="$(jq -r '.overrides.prefix // .defaults.prefix // empty' "$RESPONSE_BODY" 2>/dev/null || printf '')"
 }
 
-# Lakekeeper does not auto-create a namespace on register, so this runs first and treats an
-# already-exists answer as success.
+# Lakekeeper does not auto-create a namespace on register.
 create_namespace() {
   local namespaces_uri="$1" token="$2" status
   status="$(curl_bearer_status "$token" --request POST "$namespaces_uri" \
@@ -579,30 +460,11 @@ create_namespace() {
   exit 1
 }
 
-# The word confirm_registered_metadata_location prints when the read-back agrees with what this run
-# submitted. Named rather than repeated as a literal, because that function and register_table have
-# to spell it identically for a confirmed table to keep its provisional outcome.
 CONFIRMED_OUTCOME="confirmed"
 
-# Reads the just-registered table back and prints CONFIRMED_OUTCOME when the catalog really holds
-# the metadata location this run submitted for it, or the failing outcome word when it does not.
-#
-# This read-back — not the register response's own text — is what the exit code rests on, because
-# Lakekeeper 0.13.1 answers a genuine registration gap and an ordinary already-registered re-run
-# with a BYTE-IDENTICAL body (decision [29]):
-#
-#   409 {"error":{"message":"Tabular with the same name already exists in the namespace",
-#                 "type":"AlreadyExistsException","code":409, ...}}
-#
-# Verified live on 0.13.1, the two gap shapes behind that one body read back differently, so each
-# gets its own outcome rather than one blurred label: a target table holding a DIFFERENT pointer
-# answers 2xx with the stale location, while a location already held under ANOTHER table name
-# answers 404 — the table was never created. Reporting that 404 as a pointer mismatch would send an
-# operator looking for a discrepancy that does not exist.
-#
-# A read-back that cannot be performed at all confirms nothing and so is never a success either.
-#
-# The URI is the source producer's own loadTable path, built on the target's prefixed base.
+# The read-back decides the outcome because Lakekeeper 0.13.1 returns a byte-identical 409 for a
+# real registration gap and an ordinary re-run. A different pointer reads back 2xx with the stale
+# location; a location held under another table name reads back 404 (never created).
 confirm_registered_metadata_location() {
   local namespaces_uri="$1" token="$2" name="$3" submitted="$4" status returned
   status="$(curl_bearer_status "$token" --request GET \
@@ -619,19 +481,8 @@ confirm_registered_metadata_location() {
   fi
 }
 
-# Registers one table BY REFERENCE and prints an outcome word.
-#
-# A 2xx and a 409 are both only PROVISIONAL here: neither proves the catalog ends up holding this
-# run's metadata location for this name, so each is confirmed by a read-back before it becomes a
-# success. Any other status is a definitive failure and is reported without a read-back — there is
-# nothing to confirm.
-#
-# response_reports_location_already_taken is read BEFORE the read-back and only ever logged on the
-# provisional path: it and the read-back share $RESPONSE_BODY, so the read-back overwrites the
-# register response, and its text is a documentation aid rather than the classification.
-#
-# Never exits: one table's failure must not stop the remaining tables from being attempted, so
-# the caller collects every outcome and decides the exit code once.
+# 2xx and 409 are provisional until the read-back confirms them. The location-taken check must
+# run before the read-back, which overwrites $RESPONSE_BODY. Never exits, so every table is tried.
 register_table() {
   local register_uri="$1" namespaces_uri="$2" token="$3" name="$4" metadata_location="$5"
   local status reports_location_taken=0
@@ -668,10 +519,6 @@ register_table() {
   fi
 }
 
-# Registers every table in $SOURCE_TRIPLES into the given register/namespaces URIs, populating
-# the module-level REGISTERED / ALREADY_PRESENT / FAILED outcome arrays and printing one line per
-# table. Never exits on a single table's failure — see register_table's own doc comment — so the
-# caller decides the run's overall exit code once every table has been attempted.
 register_all_tables() {
   local token="$1" register_uri="$2" namespaces_uri="$3"
   local table_name table_metadata_location table_outcome
@@ -708,7 +555,6 @@ register_all_tables() {
   done < <(jq -r '.[] | [.name, .metadata_location] | @tsv' <<<"$SOURCE_TRIPLES")
 }
 
-# Prints the per-outcome tally and exits 1 naming every failed table when any registration failed.
 report_registration_summary() {
   echo "==> Summary: ${#REGISTERED[@]} registered, ${#ALREADY_PRESENT[@]} already present, ${#FAILED[@]} failed"
 
@@ -717,8 +563,6 @@ report_registration_summary() {
     exit 1
   fi
 }
-
-# --- Run ------------------------------------------------------------------------------------------
 
 TARGET_TOKEN="$(oauth2_token "$LK_TARGET_TOKEN_URI" "$LK_TARGET_CLIENT_ID" "$LK_TARGET_CLIENT_SECRET")" \
   || TARGET_TOKEN=""

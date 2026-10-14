@@ -1,25 +1,15 @@
 use super::*;
 use crate::test_support::*;
+use std::sync::{Arc, Mutex};
 
-// ---------------------------------------------------------------------------
-// Task 3.3 / 3.4 — SigV4 wiring: signed/unsigned request routing
-// ---------------------------------------------------------------------------
-
-/// Scenario: Unsigned catalog path is unchanged when SigV4 is disabled.
-///
-/// Tests that with use_sigv4=false, the ConnectionCreds does not affect the
-/// path logic (the unsigned RestCatalogBuilder path is selected). We verify
-/// this by confirming an unsigned request carries no Authorization header.
 #[test]
 fn disabled_sigv4_produces_no_auth_header_in_request() {
-    // Construct a raw reqwest::Request without signing it.
     let client = reqwest::Client::new();
     let request = client
         .get("https://minio.local:9000/iceberg/v1/namespaces/db/tables/events")
         .build()
         .expect("valid request");
 
-    // An unsigned request must carry no Authorization or x-amz-date headers.
     assert!(
         request.headers().get("authorization").is_none(),
         "unsigned path: no Authorization header expected"
@@ -30,11 +20,6 @@ fn disabled_sigv4_produces_no_auth_header_in_request() {
     );
 }
 
-/// Scenario: Signing keys must not appear in any error output from sign_request.
-///
-/// The SigningError type from aws-sigv4 carries no credential fields.
-/// We verify this indirectly: a successful sign followed by inspection of all
-/// header values must not contain the secret key in plaintext.
 #[test]
 fn signed_request_does_not_leak_keys_in_headers() {
     let secret = "wJalrXUtnFEMI_EXAMPLE_KEY";
@@ -57,21 +42,12 @@ fn signed_request_does_not_leak_keys_in_headers() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Task 4.2 — auth-mode selection and header construction
-// ---------------------------------------------------------------------------
-
 /// Scenario: Static bearer token is attached to unsigned catalog requests.
-///
-/// Constructs a reqwest request with a bearer token and verifies the
-/// `Authorization: Bearer <token>` header is set — mirroring the
-/// `authed_get_json` bearer-auth branch.
 #[test]
 fn bearer_token_attached_to_load_table_request() {
     let client = reqwest::Client::new();
     let url = "https://catalog.example.com/v1/namespaces/db/tables/t";
 
-    // Build the request exactly as authed_get_json does for CatalogAuth::Bearer.
     let request = client
         .get(url)
         .header("accept", "application/json")
@@ -94,9 +70,6 @@ fn bearer_token_attached_to_load_table_request() {
         "bearer token must appear in the authorization header"
     );
 
-    // The token value is NOT a signing key — it's sent literally; the leak
-    // guard is that it must NOT appear in any *error* message (tested in 4.5).
-    // Confirm the SigV4 signing headers (x-amz-*) are absent.
     assert!(
         request.headers().get("x-amz-date").is_none(),
         "bearer-auth must not set x-amz-date"
@@ -107,13 +80,9 @@ fn bearer_token_attached_to_load_table_request() {
     );
 }
 
-/// Scenario: No catalog auth props are set when neither token nor OAuth
-/// credentials are supplied — the request carries no Authorization header.
 #[test]
 fn no_auth_load_table_sends_no_authorization() {
     let client = reqwest::Client::new();
-    // Build the request as authed_get_json does for CatalogAuth::None:
-    // only the "accept" header, no bearer_auth, no signing.
     let request = client
         .get("https://catalog.example.com/v1/namespaces/db/tables/t")
         .header("accept", "application/json")
@@ -130,17 +99,6 @@ fn no_auth_load_table_sends_no_authorization() {
     );
 }
 
-/// Contract pin: the catalog error site emits the exact
-/// `catalog returned HTTP <status>: <body>` prefix that `adapter::mod`'s
-/// `is_table_not_found` classifier keys on via `starts_with`.
-///
-/// This drives the REAL `authed_get_json` non-success branch
-/// (`format!("catalog returned HTTP {}: {}", status.as_u16(), redact(&body))`)
-/// against a local server returning 404, so a future edit to the message
-/// shape here breaks this test rather than silently making the skip-non-
-/// Iceberg-table logic dead. The body is credential-free, so `redact`
-/// leaves it verbatim, pinning both the `404` status rendering and the
-/// `": "` separator.
 #[tokio::test]
 async fn catalog_error_message_uses_http_status_prefix() {
     use std::net::SocketAddr;
@@ -154,7 +112,6 @@ async fn catalog_error_message_uses_http_status_prefix() {
     let addr: SocketAddr = listener.local_addr().expect("local_addr");
     let port = addr.port();
 
-    // Reply to a single request with an HTTP 404 and a Hive-table body.
     tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept");
         let mut buf = vec![0u8; 4096];
@@ -186,21 +143,35 @@ async fn catalog_error_message_uses_http_status_prefix() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Task 4.5 / 3.1 — Redaction: secrets never in errors from the new paths
-// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn sigv4_request_is_signed_for_the_carried_region() {
+    let (catalog_uri, heads) = spawn_recording_catalog("{}").await;
+    let mut creds = creds_no_auth();
+    creds.use_sigv4 = true;
+    creds.region = String::new();
+    let auth = CatalogAuth::Sigv4 {
+        region: "eu-west-1".into(),
+    };
+    let url = format!("{catalog_uri}/v1/catalogs/123456789012/namespaces/db/tables/t");
 
-/// Scenario: a `loadTable` error surfaced through the REAL `authed_get_json`
-/// redact closure, with the session's resolved auth set to
-/// `CatalogAuth::Bearer(<live token>)`, strips BOTH the static catalog-auth
-/// secrets (via `redact_catalog_auth_error`, keyed on `creds.client_secret`)
-/// AND the live bearer token (added to the redaction set only because
-/// `auth` is `CatalogAuth::Bearer` — the live token is never present in
-/// `creds`, so `redact_catalog_auth_error` alone could not strip it).
-///
-/// The local server echoes both secrets in the error body — the failure
-/// mode the closure guards against — so this drives the real function
-/// rather than re-implementing its redaction logic inline.
+    authed_get_json::<serde_json::Value>(&reqwest::Client::new(), &url, &auth, false, &creds)
+        .await
+        .expect("the signed request must reach the stub and succeed");
+
+    let heads = heads.lock().unwrap();
+    let [head] = heads.as_slice() else {
+        panic!(
+            "exactly one catalog request must be sent, got {}",
+            heads.len()
+        );
+    };
+    let authorization = authorization_header(head).expect("the request must be signed");
+    assert!(
+        authorization.contains("/eu-west-1/glue/aws4_request"),
+        "the credential scope must name the carried region: {authorization}"
+    );
+}
+
 #[tokio::test]
 async fn load_table_error_redacts_session_bearer_and_static_secrets() {
     use std::net::SocketAddr;
@@ -248,4 +219,97 @@ async fn load_table_error_redacts_session_bearer_and_static_secrets() {
         !msg.contains(OAUTH_ACCESS_TOKEN),
         "live session bearer token must not appear in error: {msg}"
     );
+}
+
+async fn post_to(
+    status: u16,
+    body: String,
+) -> (Result<PostAnswer, UdfError>, Arc<Mutex<Vec<String>>>) {
+    let (uri, requests) = spawn_server("application/json", move |_| (status, body.clone())).await;
+    let auth = CatalogAuth::Bearer(BEARER_TOK.into());
+    let answer = authed_post_json(
+        &reqwest::Client::new(),
+        &format!("{uri}/check"),
+        &serde_json::json!({"k": 1}),
+        &auth,
+        &base_creds(),
+        Duration::from_secs(5),
+    )
+    .await;
+    (answer, requests)
+}
+
+#[tokio::test]
+async fn a_post_sends_its_json_body_with_the_bearer_and_returns_the_answer() {
+    let (answer, requests) = post_to(200, r#"{"ok":true}"#.into()).await;
+
+    assert!(
+        matches!(answer, Ok(PostAnswer::Accepted { status: 200, ref body }) if body == r#"{"ok":true}"#)
+    );
+    let request = requests.lock().unwrap()[0].to_lowercase();
+    assert!(request.starts_with("post /check"), "{request}");
+    assert!(request.contains(&format!("bearer {}", BEARER_TOK.to_lowercase())));
+    assert!(request.ends_with(r#"{"k":1}"#), "{request}");
+}
+
+#[tokio::test]
+async fn a_refusal_is_a_value_whose_quoted_body_is_redacted_and_cut() {
+    let echoed = format!("{BEARER_TOK} {}", "x".repeat(MAX_QUOTED_BODY_BYTES * 2));
+
+    let (answer, _) = post_to(403, echoed).await;
+
+    let Ok(PostAnswer::Refused { status: 403, body }) = answer else {
+        panic!("a non-2xx answer must be a refusal");
+    };
+    assert!(!body.contains(BEARER_TOK), "{body}");
+    assert!(body.contains("truncated"), "{body}");
+}
+
+#[tokio::test]
+async fn an_answer_over_the_read_limit_is_an_error() {
+    let (answer, _) = post_to(200, "x".repeat(MAX_ANSWER_BYTES + 1)).await;
+
+    let Err(UdfError::User(message)) = answer else {
+        panic!("an oversized answer must be an error");
+    };
+    assert!(message.contains("exceeds"), "{message}");
+}
+
+#[tokio::test]
+async fn a_post_to_a_closed_port_is_an_error() {
+    let auth = CatalogAuth::None;
+
+    let answer = authed_post_json(
+        &reqwest::Client::new(),
+        "http://127.0.0.1:1/check",
+        &serde_json::json!({}),
+        &auth,
+        &base_creds(),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(matches!(answer, Err(UdfError::User(m)) if m.contains("catalog request failed")));
+}
+
+#[tokio::test]
+async fn a_catalog_that_never_answers_fails_within_the_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/check", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _held = listener.accept().await;
+        std::future::pending::<()>().await;
+    });
+
+    let answer = authed_post_json(
+        &reqwest::Client::new(),
+        &url,
+        &serde_json::json!({}),
+        &CatalogAuth::None,
+        &base_creds(),
+        Duration::from_millis(200),
+    )
+    .await;
+
+    assert!(matches!(answer, Err(UdfError::User(m)) if m.contains("200ms")));
 }

@@ -1,15 +1,8 @@
 use super::*;
 use std::collections::HashSet;
 
-// ---------------------------------------------------------------------------
-// partition_files_by_bytes tests
-// ---------------------------------------------------------------------------
-
-/// Scenario: G shards are byte-balanced — the maximum cumulative shard size
-/// minus the minimum is less than the largest single file size.
 #[test]
 fn partition_by_bytes_balances_cumulative_size() {
-    // 6 files with sizes: 100, 200, 300, 400, 500, 600 → total 2100
     let files: Vec<(String, u64)> = vec![
         ("a.parquet".into(), 100),
         ("b.parquet".into(), 200),
@@ -21,7 +14,6 @@ fn partition_by_bytes_balances_cumulative_size() {
     let shards = partition_files_by_bytes(files, 3);
     assert_eq!(shards.len(), 3, "expected 3 shards");
 
-    // Compute cumulative byte size per shard.
     let sizes_map: std::collections::HashMap<String, u64> = vec![
         ("a.parquet".to_string(), 100),
         ("b.parquet".to_string(), 200),
@@ -51,7 +43,6 @@ fn partition_by_bytes_balances_cumulative_size() {
     );
 }
 
-/// Scenario: All files appear exactly once across the shards (disjoint + full coverage).
 #[test]
 fn partition_by_bytes_disjoint_full_coverage() {
     let files: Vec<(String, u64)> = (0..10)
@@ -70,7 +61,6 @@ fn partition_by_bytes_disjoint_full_coverage() {
     );
 }
 
-/// Scenario: Files with size 0 are treated as size 1 and are never skipped.
 #[test]
 fn partition_by_bytes_zero_size_treated_as_one_never_skipped() {
     let files: Vec<(String, u64)> = vec![
@@ -82,7 +72,6 @@ fn partition_by_bytes_zero_size_treated_as_one_never_skipped() {
     let shards = partition_files_by_bytes(files.clone(), 2);
 
     let all_files: Vec<String> = shards.iter().flatten().map(|(p, _)| p.clone()).collect();
-    // All 4 files must appear.
     assert_eq!(all_files.len(), 4, "a zero-size file was dropped");
 
     let unique: HashSet<&String> = all_files.iter().collect();
@@ -97,7 +86,6 @@ fn partition_by_bytes_zero_size_treated_as_one_never_skipped() {
     );
 }
 
-/// Scenario: When G >= file_count, each file gets its own shard.
 #[test]
 fn partition_by_bytes_one_file_per_shard_when_g_exceeds_count() {
     let files: Vec<(String, u64)> = vec![
@@ -105,7 +93,6 @@ fn partition_by_bytes_one_file_per_shard_when_g_exceeds_count() {
         ("b.parquet".into(), 200),
         ("c.parquet".into(), 300),
     ];
-    // Request more shards than files.
     let shards = partition_files_by_bytes(files.clone(), 10);
 
     assert_eq!(shards.len(), 3_usize, "shard count must equal file count");
@@ -118,9 +105,6 @@ fn partition_by_bytes_one_file_per_shard_when_g_exceeds_count() {
     }
 }
 
-/// Scenario: Each shard entry carries `(path, size)` and the size matches the
-/// original input size for that path — including a 0-byte file, whose reported
-/// size stays `0` (the 0→1 rule affects only balancing, not the emitted size).
 #[test]
 fn partition_by_bytes_propagates_size_into_shards() {
     let files: Vec<(String, u64)> = vec![

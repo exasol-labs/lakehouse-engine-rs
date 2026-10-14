@@ -1,21 +1,8 @@
-//! Pure convention test (no I/O): asserts the build documentation states that a
-//! host `cargo build --release` of the UDF crate produces an artifact that
-//! cannot be loaded inside Exasol.
-//!
-//! Covers packaging/single-so-two-entry-points scenario:
-//! "Host release build of the .so is rejected by convention" — the documentation
-//! MUST state that host `cargo build --release` produces an unloadable artifact.
-//!
-//! The documentation is embedded at compile time via `include_str!`, so this is
-//! a pure test: it reads no files at runtime and needs no live services.
-
-/// Workspace build-convention documentation, embedded at compile time.
-/// Path is relative to this source file: crates/lakehouse-engine/tests -> workspace root.
-const WORKSPACE_CLAUDE_MD: &str = include_str!("../../../CLAUDE.md");
+const WORKSPACE_AGENTS_MD: &str = include_str!("../../../AGENTS.md");
 
 #[test]
 fn host_release_build_documented_unloadable() {
-    let doc = WORKSPACE_CLAUDE_MD.to_lowercase();
+    let doc = WORKSPACE_AGENTS_MD.to_lowercase();
 
     assert!(
         doc.contains("cargo build --release"),
@@ -54,11 +41,27 @@ fn the_type_relaxation_suite_and_fixture_are_wired_into_run_fixtures_and_make_te
         recipe_line.contains("--test e2e_type_relaxation_test"),
         "test-e2e target must run --test e2e_type_relaxation_test"
     );
-
     let fixture_sql =
         workspace_root.join("scripts/spark-fixtures/create_iceberg_type_promotion_fixture.sql");
     assert!(
         fixture_sql.exists(),
         "scripts/spark-fixtures/create_iceberg_type_promotion_fixture.sql must exist on disk"
+    );
+}
+
+#[test]
+fn make_test_e2e_runs_the_direct_storage_binary() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let makefile = std::fs::read_to_string(workspace_root.join("Makefile"))
+        .expect("Makefile must be readable");
+    let mut lines = makefile.lines();
+    let recipe_line = lines
+        .find(|line| line.starts_with("test-e2e:"))
+        .and_then(|_| lines.next())
+        .expect("Makefile must have a test-e2e target followed by a recipe line");
+
+    assert!(
+        recipe_line.contains("--test e2e_direct_storage_test"),
+        "test-e2e target must run --test e2e_direct_storage_test"
     );
 }

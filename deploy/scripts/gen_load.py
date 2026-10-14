@@ -23,7 +23,6 @@ import tempfile
 import duckdb
 import pyarrow.parquet as pq
 
-# 20-column wide perf schema (varied typical types). Generated from a row index `i`.
 PERF_SELECT = """
 SELECT
   i                                                            AS id,
@@ -52,11 +51,8 @@ FROM range({start}, {end}) t(i)
 TPCH_TABLES = ["region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem"]
 TPCH_BIG = {"lineitem", "orders"}
 
-# Bronze ERP dataset: every "real world messy" column is deliberately a STRING, even the ones that
-# are conceptually a date/number/boolean — same idea as a real dirty ERP extract, cleaned up later
-# in a downstream silver layer. i % 3 cycles through 3 dirty variants per column so no format
-# happens to dominate. FK columns reference the other tables' id format directly (no join needed,
-# same style as PERF_SELECT's pure range()-driven generation).
+# Bronze ERP dataset: messy columns are deliberately strings even when conceptually a
+# date/number/boolean, like a dirty ERP extract; i % 3 cycles through 3 dirty formats per column.
 
 ERP_CUSTOMERS_SELECT = """
 SELECT
@@ -116,7 +112,6 @@ SELECT
 FROM range({start}, {end}) t(i)
 """
 
-# Two line items per order, deterministic product refs (mod n_products keeps them valid ids).
 ERP_ORDERS_SELECT = """
 SELECT
   'ORD' || lpad(i::VARCHAR, 8, '0')                                              AS order_id,
@@ -144,9 +139,8 @@ SELECT
 FROM range({start}, {end}) t(i)
 """
 
-# order_index = (i*3) % n_orders is a bijection over 0..n_orders-1 (3 and n_orders are coprime for
-# the default 250000), so sampling i in [0, n_invoices) with n_invoices < n_orders picks that many
-# distinct orders with no collisions and leaves the rest uninvoiced (matches a real dirty source).
+# (i*3) % n_orders is a bijection when gcd(3, n_orders) == 1, so invoices hit distinct orders and
+# the rest stay uninvoiced.
 ERP_INVOICES_SELECT = """
 SELECT
   'INV' || lpad(i::VARCHAR, 8, '0')                                              AS invoice_id,
@@ -198,7 +192,7 @@ def ensure_namespace(catalog, ns):
     try:
         catalog.create_namespace(ns)
     except Exception:
-        pass  # already exists (Glue dbs are created by OpenTofu; sqlite needs this)
+        pass  # Glue dbs already exist via OpenTofu; only sqlite needs this
 
 
 def recreate_table(catalog, ident, schema):
@@ -257,7 +251,7 @@ def gen_perf(con, catalog, db, sizes_gb, n_files):
         for start in range(0, total_rows, step):
             end = min(start + step, total_rows)
             arrow = con.execute(PERF_SELECT.format(start=start, end=end)).to_arrow_table()
-            t.append(arrow)          # one data file per chunk; memory bounded by chunk size
+            t.append(arrow)
             written += arrow.num_rows
         print(f"  perf.{ident[1]}: {written} rows (~{gb} GB)", flush=True)
 
@@ -336,17 +330,14 @@ def self_check(con, catalog):
     """Offline: tiny tpch + a tiny perf table + a tiny erp dataset into a local sqlite Iceberg
     catalog; assert round-trip."""
     gen_tpch(con, catalog, "tpch", scale=0.01, n_files=3)
-    # tiny perf table (~50k rows), reuse the slicing path
     ensure_namespace(catalog, ("perf",))
     arrow = con.execute(PERF_SELECT.format(start=0, end=50_000)).to_arrow_table()
     assert len(arrow.schema) == 20, f"perf schema must be 20 cols, got {len(arrow.schema)}"
     t = recreate_table(catalog, ("perf", "t_tiny"), arrow.schema)
     write_in_slices(t, arrow, 4)
 
-    # tiny erp dataset (customers=50, products=40, orders=60, invoices=20)
     gen_erp(con, catalog, "erp", n_customers=50, n_products=40, n_orders=61, n_invoices=20)
 
-    # read back via the catalog and assert counts
     n_perf = catalog.load_table(("perf", "t_tiny")).scan().to_arrow().num_rows
     n_region = catalog.load_table(("tpch", "region")).scan().to_arrow().num_rows
     n_erp_orders = catalog.load_table(("erp", "orders")).scan().to_arrow().num_rows
@@ -355,7 +346,6 @@ def self_check(con, catalog):
     assert n_region == 5, f"tpch.region readback {n_region} != 5"
     assert n_erp_orders == 61, f"erp.orders readback {n_erp_orders} != 61"
     assert n_erp_invoices == 20, f"erp.invoices readback {n_erp_invoices} != 20"
-    # >=4 data files were requested for the perf table
     files = list(catalog.load_table(("perf", "t_tiny")).scan().plan_files())
     assert len(files) >= 4, f"expected >=4 perf data files, got {len(files)}"
     print(f"SELF-CHECK OK: perf={n_perf} rows in {len(files)} files, tpch.region={n_region} rows, "

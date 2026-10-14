@@ -2,11 +2,11 @@
 
 Gives each repeated read-a-JSON-field shape in the adapter-root modules (`adapter/mod.rs`, `adapter/connection.rs`) exactly one implementation, so a change to how the adapter reads a property, a credential field, or a resource count has one place to land. Behavior is unchanged: this feature constrains where the code lives, never what the adapter returns.
 
-This is the adapter root's structural feature, the sibling of `vs-adapter/pushdown-module-structure` and `datafusion-scan/scan-module-structure`. It exists because the duplication it removes spans four behavioral features at once — `vs-adapter/create-virtual-schema`, `vs-adapter/create-virtual-schema-adapter-notes-resources`, `vs-adapter/refresh-and-set-properties`, and `vs-adapter/connection-credentials` — so no single behavioral feature can own it without leaking a structural decision across a boundary.
+This is the adapter root's structural feature, the sibling of `pushdown/pushdown-module-structure` and `datafusion-scan/scan-module-structure`. It exists because the duplication it removes spans four behavioral features at once — `vs-adapter/create-virtual-schema`, `vs-adapter/create-virtual-schema-adapter-notes-resources`, `vs-adapter/refresh-and-set-properties`, and `connection/connection-credentials` — so no single behavioral feature can own it without leaking a structural decision across a boundary.
 
 ## Background
 
-* Both scenarios are pure refactors. Every scenario of `vs-adapter/create-virtual-schema`, `vs-adapter/create-virtual-schema-adapter-notes`, `vs-adapter/create-virtual-schema-adapter-notes-resources`, `vs-adapter/refresh-and-set-properties`, `vs-adapter/connection-credentials`, and `vs-adapter/connection-credentials-catalog-auth` stays accurate and unedited, and those suites are the characterization gate that makes "behavior unchanged" falsifiable.
+* Both scenarios are pure refactors. Every scenario of `vs-adapter/create-virtual-schema`, `vs-adapter/create-virtual-schema-adapter-notes`, `vs-adapter/create-virtual-schema-adapter-notes-resources`, `vs-adapter/refresh-and-set-properties`, `connection/connection-credentials`, and `connection/connection-credentials-catalog-auth` stays accurate and unedited, and those suites are the characterization gate that makes "behavior unchanged" falsifiable.
 * `adapter::connection` is a child module of `adapter`, so it can name a private item of `adapter` directly. A helper shared between the two therefore stays private to `adapter` — hoisting it widens nothing.
 * A helper whose whole body is a call to another helper with the same arguments is a pass-through, the shallow-module red flag from `/speq:design-philosophy`. Both scenarios below delete the single-purpose names rather than keep them as pass-throughs, so the deduplication actually removes indirection instead of adding a layer.
 * `Json` in `adapter/mod.rs` is an alias for `serde_json::Value`; the two duplicated accessors differ only in which spelling they use.
@@ -24,7 +24,7 @@ This is the adapter root's structural feature, the sibling of `vs-adapter/pushdo
 * *AND* both `str_prop` and `str_field` SHALL be deleted rather than retained as pass-through wrappers, and every call site in both files SHALL call `nonempty_str` directly
 * *AND* the accessor MUST keep the present-string-non-empty contract exactly — an absent field, a JSON null, a non-string value, and an empty string all yield `None` — so every property default and every credential default is reached on exactly the same inputs as before
 * *AND* every prose reference to a deleted name SHALL name `nonempty_str` instead, including the `S3_MAX_CONNECTIONS` resolver's doc comment, which cites the shared parse shape by name
-* *AND* the `vs-adapter/connection-credentials`, `vs-adapter/connection-credentials-catalog-auth`, `vs-adapter/create-virtual-schema`, `vs-adapter/create-virtual-schema-adapter-notes`, `vs-adapter/create-virtual-schema-adapter-notes-resources`, and `vs-adapter/refresh-and-set-properties` suites MUST pass with no change to any test assertion or expected value
+* *AND* the `connection/connection-credentials`, `connection/connection-credentials-catalog-auth`, `vs-adapter/create-virtual-schema`, `vs-adapter/create-virtual-schema-adapter-notes`, `vs-adapter/create-virtual-schema-adapter-notes-resources`, and `vs-adapter/refresh-and-set-properties` suites MUST pass with no change to any test assertion or expected value
 
 ### Scenario: One resolver reads both DataFusion FIXED-mode count properties
 

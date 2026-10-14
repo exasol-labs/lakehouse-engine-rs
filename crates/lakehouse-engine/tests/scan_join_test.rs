@@ -1,20 +1,3 @@
-//! Host DataFusion join-execution tests over local Parquet (Group D, tasks 4.1–4.3).
-//!
-//! Drives the EXACT production broadcast-join execution path
-//! ([`run_join_scan_with_session`] / [`build_join_physical_plan`]) against local
-//! `file://` Parquet fixtures — no S3 / MinIO, no Iceberg catalog. A join `ScanSpec`
-//! carries the sharded fact file list in `files` and the full dimension file list in
-//! `join.files`; the scan registers both in one session, wraps each in an aliased
-//! sub-SELECT exposing uppercase Exasol-facing names, runs the inner equi-join, and
-//! streams the joined batches as Arrow IPC via `emit_batch`.
-//!
-//! Covers the `datafusion-scan/scan-execution-join` scenarios:
-//! - `join_spec_reconstitutes_two_file_lists`
-//! - `join_executes_inner_equi`
-//! - `join_projection_filter_limit_streamed`
-//! - `join_build_side_is_dimension`
-//! - `join_unreadable_file_errors_without_secrets`
-
 mod scan_fixture;
 
 use std::any::Any;
@@ -25,14 +8,15 @@ use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::{ExecutionPlan, displayable};
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::test_support::{EmitPolicy, TestContext};
 use exasol_udf_sdk::value::{ExaType, Value};
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec, ScanStorage,
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec, ScanStorage, SortKey,
     StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
@@ -66,8 +50,7 @@ fn sized(url: String) -> (String, u64) {
     (url, len)
 }
 
-/// Write the fact (orders) Parquet fixture and return its sized `(url, bytes)`.
-/// Disjoint column names from the dimension side (VS disjoint-column guarantee).
+/// Column names are disjoint from the dimension side (the VS disjoint-column guarantee).
 fn write_orders(dir: &std::path::Path) -> (String, u64) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("o_orderkey", DataType::Int64, false),
@@ -81,7 +64,6 @@ fn write_orders(dir: &std::path::Path) -> (String, u64) {
         schema,
         vec![
             Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5, 6])),
-            // custkey 999 has NO matching customer -> excluded by the inner join.
             Arc::new(Int64Array::from(vec![10i64, 20, 30, 10, 20, 999])),
             Arc::new(Float64Array::from(vec![
                 100.0, 200.0, 300.0, 400.0, 500.0, 600.0,
@@ -94,7 +76,6 @@ fn write_orders(dir: &std::path::Path) -> (String, u64) {
     sized(file_url(&path))
 }
 
-/// Write the dimension (customer) Parquet fixture and return its sized `(url, bytes)`.
 fn write_customer(dir: &std::path::Path) -> (String, u64) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("c_custkey", DataType::Int64, false),
@@ -116,12 +97,29 @@ fn write_customer(dir: &std::path::Path) -> (String, u64) {
     sized(file_url(&path))
 }
 
-/// Write a fact fixture whose FIRST two rows match no dimension row (custkey 999)
-/// and whose remaining three rows each match a distinct customer. Distinguishes a
-/// post-join cap (applied to the JOINED output) from a pre-join cap (applied to the
-/// fact scan before the join runs): with `post_join_limit = 2`, a post-join cap
-/// truncates the 3 matching joined rows to 2, while a pre-join cap would instead
-/// truncate the fact scan to its first 2 (unmatched) rows and emit zero.
+/// Custkey 10's empty name is emitted as `""`, which Exasol receives as NULL.
+fn write_customer_with_blank_names(dir: &std::path::Path) -> (String, u64) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("c_custkey", DataType::Int64, false),
+        Field::new("c_name", DataType::Utf8, false),
+    ]));
+    let path = dir.join("customer_blank_names.parquet");
+    let file = std::fs::File::create(&path).expect("create customer parquet");
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![10i64, 20, 30])),
+            Arc::new(StringArray::from(vec!["", "Bob", "Carol"])),
+        ],
+    )
+    .expect("customer batch");
+    writer.write(&batch).expect("write customer");
+    writer.close().expect("close customer");
+    sized(file_url(&path))
+}
+
+/// The first two rows match no dimension row, so a pre-join `LIMIT 2` would emit zero rows.
 fn write_orders_leading_unmatched(dir: &std::path::Path) -> (String, u64) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("o_orderkey", DataType::Int64, false),
@@ -135,7 +133,6 @@ fn write_orders_leading_unmatched(dir: &std::path::Path) -> (String, u64) {
         schema,
         vec![
             Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5])),
-            // Rows 1-2: custkey 999 matches no customer. Rows 3-5: match 10/20/30.
             Arc::new(Int64Array::from(vec![999i64, 999, 10, 20, 30])),
             Arc::new(Float64Array::from(vec![100.0, 200.0, 300.0, 400.0, 500.0])),
         ],
@@ -146,10 +143,6 @@ fn write_orders_leading_unmatched(dir: &std::path::Path) -> (String, u64) {
     sized(file_url(&path))
 }
 
-/// An S3 backend reaching `endpoint` and carrying `secret` as its secret key —
-/// the two fields a test tells one side's store, and one side's redaction set,
-/// from the other's by. Path-style (the `StorageProps` default) is what makes a
-/// bespoke `endpoint` reachable at all.
 fn s3_backend(endpoint: &str, secret: &str) -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: endpoint.into(),
@@ -165,16 +158,11 @@ fn storage() -> StorageBackend {
     s3_backend("http://localhost:9000", "TOPSECRETVALUE")
 }
 
-/// The dimension side's backend — deliberately DISTINCT from `storage()`'s
-/// `secret_key`, so every test built through `join_spec` runs credential-divergent:
-/// the fact side and the dimension side never share a secret.
+/// A secret distinct from `storage()`'s, so the two join sides never share a credential.
 fn dim_storage() -> StorageBackend {
     s3_backend("http://localhost:9000", "DIMSECRETVALUE")
 }
 
-/// A join `ScanSpec`: `fact_files` is the sharded fact side (`files`); `dim_files`
-/// is the full dimension side (`join.files`). `projection` is uppercase, spanning
-/// both tables; `condition` is a rendered DataFusion equi-join predicate.
 fn join_spec(
     fact_files: Vec<(String, u64)>,
     dim_files: Vec<(String, u64)>,
@@ -194,6 +182,7 @@ fn join_spec(
                 join_type: JoinType::Inner,
                 condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
                 post_join_limit: limit,
+                post_join_order_by: Vec::new(),
                 partition_columns: Vec::new(),
                 storage: ScanStorage::Inline(dim_storage()),
             }),
@@ -204,8 +193,6 @@ fn join_spec(
     }
 }
 
-/// Run the production join scan for `spec` against a capturing context declaring
-/// `emits` as its output columns, returning the decoded emitted batches.
 fn run_join(spec: &ScanSpec, emits: &[ExaType]) -> Vec<RecordBatch> {
     block_on(async {
         let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
@@ -229,11 +216,75 @@ fn run_join(spec: &ScanSpec, emits: &[ExaType]) -> Vec<RecordBatch> {
     })
 }
 
+fn ordered_join_spec(
+    fact: (String, u64),
+    dim: (String, u64),
+    order_by: Vec<SortKey>,
+    limit: u64,
+) -> ScanSpec {
+    let mut spec = join_spec(
+        vec![fact],
+        vec![dim],
+        vec!["O_ORDERKEY", "C_NAME"],
+        None,
+        Some(limit),
+    );
+    spec.common
+        .join
+        .as_mut()
+        .expect("join_spec carries a join block")
+        .post_join_order_by = order_by;
+    spec
+}
+
+fn ordered_top_n_join_fixture(dir_tag: &str) -> (std::path::PathBuf, ScanSpec) {
+    let dir = std::env::temp_dir().join(format!("{dir_tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let orders = write_orders(&dir);
+    let customer = write_customer(&dir);
+
+    let mut spec = ordered_join_spec(
+        orders,
+        customer,
+        vec![
+            sort_key("C_NAME", false, false),
+            sort_key("O_ORDERKEY", true, true),
+        ],
+        2,
+    );
+    spec.common.order_by = vec![sort_key("O_ORDERKEY", true, true)];
+    (dir, spec)
+}
+
+fn sort_key(column: &str, ascending: bool, nulls_last: bool) -> SortKey {
+    SortKey {
+        column: column.into(),
+        ascending,
+        nulls_last,
+    }
+}
+
+fn orderkey_name_rows(batches: &[RecordBatch]) -> Vec<(i64, String)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("O_ORDERKEY must be Int64");
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("C_NAME must be Utf8");
+        for i in 0..batch.num_rows() {
+            rows.push((keys.value(i), names.value(i).to_string()));
+        }
+    }
+    rows
+}
+
 /// Scenario: Scan reconstitutes a join scan spec carrying two file lists.
-///
-/// The two-argument split (common blob + per-shard files) round-trips a join spec:
-/// the fact file list stays in `files`, the dimension file list rides in the
-/// shard-invariant `join` block, and the two lists are distinct.
 #[test]
 fn join_spec_reconstitutes_two_file_lists() {
     let fact = vec![
@@ -249,22 +300,18 @@ fn join_spec_reconstitutes_two_file_lists() {
         None,
     );
 
-    // Split the way the adapter does: common blob (shard-invariant, carries the
-    // join block) serialized once, fact files as a separate per-shard array.
     let common_json = spec.to_common_json();
     let files_json = ScanSpec::files_json(&spec.files);
 
     let reconstituted =
         ScanSpec::from_parts_json(&common_json, &files_json).expect("from_parts_json");
 
-    // Fact side: the per-shard files list.
     assert_eq!(
         reconstituted.files,
         fact.into_iter().map(FileEntry::from).collect::<Vec<_>>(),
         "fact file list must round-trip"
     );
 
-    // Dimension side: the shard-invariant join block's full file list.
     let join = reconstituted
         .common
         .join
@@ -277,8 +324,6 @@ fn join_spec_reconstitutes_two_file_lists() {
     assert_eq!(join.join_type, JoinType::Inner);
     assert_eq!(join.condition, "\"C_CUSTKEY\" = \"O_CUSTKEY\"");
 
-    // The two file lists are genuinely distinct — no collision between the sharded
-    // fact side and the replicated dimension side.
     assert_ne!(
         reconstituted.files, join.files,
         "fact and dimension file lists must be distinct"
@@ -286,15 +331,6 @@ fn join_spec_reconstitutes_two_file_lists() {
 }
 
 /// Scenario: Scan registers both tables and executes the inner equi-join.
-///
-/// Each side is registered against its OWN backend — the fact side under
-/// `storage()`, the dimension side under `dim_storage()` (via `join_spec`) — and
-/// the join still executes correctly. Orders (fact) inner-joined to customer
-/// (dimension) on custkey. The order whose custkey has no matching customer (999)
-/// is dropped; every matched order pairs with its customer name. Per-side
-/// registration narrows WHICH backend guards each side's read; it never changes
-/// WHICH ROWS come back — that correctness is what the row assertions below still
-/// characterize.
 #[test]
 fn join_registers_each_side_against_its_own_backend() {
     let dir = std::env::temp_dir().join(format!("lh_join_inner_{}", std::process::id()));
@@ -311,14 +347,12 @@ fn join_registers_each_side_against_its_own_backend() {
     );
     let batches = run_join(&spec, &[ExaType::Int64, scan_fixture::varchar()]);
 
-    // 5 of 6 orders match a customer (custkey 999 is unmatched).
     assert_eq!(
         total_rows(&batches),
         5,
         "inner join must drop the unmatched order"
     );
 
-    // Build orderkey -> customer name from the emitted (O_ORDERKEY, C_NAME) rows.
     let mut got: HashMap<i64, String> = HashMap::new();
     for batch in &batches {
         assert_eq!(batch.num_columns(), 2, "projection is exactly two columns");
@@ -355,12 +389,7 @@ fn join_registers_each_side_against_its_own_backend() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: Join projection, filter, and LIMIT are applied and rows streamed as
-/// Arrow IPC.
-///
-/// The projection spans both tables; the WHERE filter references a fact column that
-/// is NOT projected (the aliased sub-SELECT still exposes it); LIMIT bounds the
-/// output. Rows arrive as decoded Arrow IPC batches (never row-by-row `emit`).
+/// Scenario: Join projection, filter, and LIMIT are applied and rows streamed as Arrow IPC.
 #[test]
 fn join_projection_filter_limit_streamed() {
     let dir = std::env::temp_dir().join(format!("lh_join_pfl_{}", std::process::id()));
@@ -368,7 +397,6 @@ fn join_projection_filter_limit_streamed() {
     let orders = write_orders(&dir);
     let customer = write_customer(&dir);
 
-    // custkey 10 matches orders 1 and 4 (both customer "Alice"); LIMIT 1 keeps one.
     let spec = join_spec(
         vec![orders],
         vec![customer],
@@ -392,7 +420,6 @@ fn join_projection_filter_limit_streamed() {
         3,
         "projection spans both tables: O_ORDERKEY, O_TOTALPRICE, C_NAME"
     );
-    // Column types follow the projection order.
     batch
         .column(0)
         .as_any()
@@ -408,19 +435,13 @@ fn join_projection_filter_limit_streamed() {
         .as_any()
         .downcast_ref::<StringArray>()
         .expect("C_NAME must be Utf8");
-    // Both custkey-10 orders belong to Alice, so the surviving row is deterministic
-    // in the dimension column even though which order survives is not.
+    // Which order survives is nondeterministic, but both belong to Alice.
     assert_eq!(name.value(0), "Alice", "the custkey-10 customer is Alice");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Scenario: Each side of a broadcast join materializes its own partition columns.
-///
-/// The fact side is partitioned by `o_region`, the dimension side by `c_country` —
-/// disjoint columns with distinct values — so a wiring bug that dropped, swapped, or
-/// crossed the two sides' `partition_columns` lists shows up as either a wrong value
-/// or a scan failure, never a silent pass.
 #[test]
 fn each_join_side_materializes_its_own_partition_columns() {
     let dir = std::env::temp_dir().join(format!("lh_join_partition_{}", std::process::id()));
@@ -466,6 +487,7 @@ fn each_join_side_materializes_its_own_partition_columns() {
                 join_type: JoinType::Inner,
                 condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
                 post_join_limit: None,
+                post_join_order_by: Vec::new(),
                 partition_columns: vec!["c_country".to_string()],
                 storage: ScanStorage::Inline(dim_storage()),
             }),
@@ -520,15 +542,6 @@ fn each_join_side_materializes_its_own_partition_columns() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: LIMIT bounds the JOINED output, never the scanned input.
-///
-/// The fact fixture's FIRST two rows match no dimension row; its remaining three
-/// rows each match a distinct customer. With `post_join_limit = 2`, the correct
-/// (post-join) cap truncates the 3 matching joined rows to exactly 2. A pre-join
-/// cap would instead truncate the fact scan to its first 2 rows — both unmatched —
-/// and emit zero. The physical plan additionally carries no `fetch` below the
-/// `HashJoinExec` on either input, confirming DataFusion did not turn the rendered
-/// post-join `LIMIT` into a cap on either side's scan.
 #[test]
 fn join_limit_bounds_joined_output_not_scanned_input() {
     let dir = std::env::temp_dir().join(format!("lh_join_limit_bound_{}", std::process::id()));
@@ -577,12 +590,103 @@ fn join_limit_bounds_joined_output_not_scanned_input() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn join_order_by_limit_emits_bounded_top_n_after_join() {
+    let (dir, spec) = ordered_top_n_join_fixture("lh_join_top_n");
+
+    let batches = run_join(&spec, &[ExaType::Int64, scan_fixture::varchar()]);
+    assert_eq!(
+        orderkey_name_rows(&batches),
+        vec![(3, "Carol".to_string()), (2, "Bob".to_string())],
+        "the shard must emit its own top-2 under the join block's ordering"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn join_order_by_limit_plans_as_topk_above_join() {
+    let (dir, spec) = ordered_top_n_join_fixture("lh_join_top_n_plan");
+
+    let plan = block_on(async {
+        let session = SessionContext::new_with_config(session_config_for_spec(&spec));
+        build_join_physical_plan(&session, &spec, &scan_fixture::resolved_storage(&spec))
+            .await
+            .expect("physical plan must build")
+    });
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        rendered.contains("TopK(fetch="),
+        "the post-join ordering and cap must plan as a bounded TopK:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortExec: expr=["),
+        "the post-join ordering must not plan as an unbounded full sort:\n{rendered}"
+    );
+
+    let hash_join = find_hash_join(&plan).expect("plan must contain a HashJoinExec");
+    let hj_any: &dyn Any = hash_join.as_ref();
+    let hj = hj_any
+        .downcast_ref::<HashJoinExec>()
+        .expect("downcast HashJoinExec");
+    for (side, input) in [("dimension", hj.left()), ("fact", hj.right())] {
+        assert!(
+            has_no_fetch_below(input),
+            "the post-join cap must not appear as a fetch on the {side} input:\n{rendered}"
+        );
+        assert!(
+            has_no_sort_below(input),
+            "the post-join ordering must not appear as a sort on the {side} input:\n{rendered}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scenario: A join shard ranks each sort key by the value it emits
+#[test]
+fn join_top_n_ranks_an_empty_string_key_as_null() {
+    let dir = std::env::temp_dir().join(format!("lh_join_blank_top_n_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let orders = write_orders(&dir);
+    let customer = write_customer_with_blank_names(&dir);
+    let emits = [ExaType::Int64, scan_fixture::varchar()];
+
+    let cases = [
+        (
+            true,
+            true,
+            vec![(2, "Bob".to_string()), (5, "Bob".to_string())],
+            "under ASC NULLS LAST the empty-name rows rank last, as the NULLs Exasol receives",
+        ),
+        (
+            false,
+            false,
+            vec![(1, String::new()), (4, String::new())],
+            "under DESC NULLS FIRST the empty-name rows rank first, as the NULLs Exasol receives",
+        ),
+    ];
+    for (name_ascending, name_nulls_last, expected, message) in cases {
+        let spec = ordered_join_spec(
+            orders.clone(),
+            customer.clone(),
+            vec![
+                sort_key("C_NAME", name_ascending, name_nulls_last),
+                sort_key("O_ORDERKEY", true, true),
+            ],
+            2,
+        );
+        assert_eq!(
+            orderkey_name_rows(&run_join(&spec, &emits)),
+            expected,
+            "{message}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Scenario: The bounded dimension side is the hash-join build side.
-///
-/// The physical plan's `HashJoinExec` builds its hash table from the LEFT child.
-/// The scan places the bounded dimension on the left and disables join reordering,
-/// so the dimension is deterministically the build side — its columns appear on the
-/// left input, and the fact columns do not.
 #[test]
 fn join_build_side_is_dimension() {
     let dir = std::env::temp_dir().join(format!("lh_join_build_{}", std::process::id()));
@@ -619,8 +723,7 @@ fn join_build_side_is_dimension() {
         .map(|f| f.name().to_uppercase())
         .collect();
 
-    // The build (left) side is the dimension: it carries a dimension-only column
-    // (C_NAME) and none of the fact-only columns (O_ORDERKEY / O_TOTALPRICE).
+    // `HashJoinExec` builds from its left child.
     assert!(
         build_side_cols.iter().any(|c| c == "C_NAME"),
         "build side must carry the dimension column C_NAME; got {build_side_cols:?}"
@@ -635,7 +738,6 @@ fn join_build_side_is_dimension() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Recursively locate the first `HashJoinExec` in a physical plan tree.
 fn find_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
     let any: &dyn Any = plan.as_ref();
     if any.is::<HashJoinExec>() {
@@ -649,34 +751,23 @@ fn find_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan
     None
 }
 
-/// True if no node in `plan`'s subtree carries a `fetch` (a `LIMIT`/`TopK` window,
-/// or a limit pushed down into a scan). Used to confirm a post-join `LIMIT` never
-/// turns into a cap on either join input.
 fn has_no_fetch_below(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.fetch().is_none() && plan.children().into_iter().all(has_no_fetch_below)
 }
 
+fn has_no_sort_below(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let any: &dyn Any = plan.as_ref();
+    !any.is::<SortExec>() && plan.children().into_iter().all(has_no_sort_below)
+}
+
 /// Scenario: Scan reports a clear error when an assigned join file is unreadable.
-///
-/// A nonexistent dimension file surfaces through the secret-redacting
-/// `classify_scan_error` path: the error names the read failure and NEVER contains
-/// EITHER side's storage credential value (`storage()`'s `TOPSECRETVALUE` for the
-/// fact side, `dim_storage()`'s `DIMSECRETVALUE` for the dimension side).
-///
-/// This test does NOT positively demonstrate that a credential was redacted out of
-/// a message that would otherwise contain it: `run_join_scan_with_session` here
-/// runs over a plain local-file session (no S3 store is ever registered), so
-/// neither literal could appear in the error text regardless of redaction. What it
-/// pins is that a MISSING file on the dimension side still routes through the
-/// classifier at all. The falsifiable proof that the dimension side's credential is
-/// genuinely stripped from a message that would otherwise carry it lives in
-/// [`a_dimension_side_read_failure_redacts_the_dimension_sides_credential`].
 #[test]
 fn unreadable_join_file_error_redacts_both_sides_credentials() {
+    // No S3 store is registered, so neither secret could appear anyway; the falsifiable
+    // redaction proof is [`a_dimension_side_read_failure_redacts_the_dimension_sides_credential`].
     let dir = std::env::temp_dir().join(format!("lh_join_err_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let orders = write_orders(&dir);
-    // Dimension points at a file that does not exist.
     let missing = file_url(&dir.join("does_not_exist_customer.parquet"));
 
     let spec = join_spec(
@@ -724,15 +815,10 @@ fn unreadable_join_file_error_redacts_both_sides_credentials() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A loopback endpoint refusing every request with a 403 whose XML body echoes
-/// `message`, and the URL to reach it at.
+/// A loopback endpoint refusing every request with a 403 whose XML body echoes `message`.
 ///
-/// Modelled on `object_store.rs`'s `RecordingEndpoint`, but the refusal BODY is
-/// what matters here: `object_store` folds a non-2xx response body into the error
-/// it surfaces, so an endpoint quoting a credential in its refusal — the real shape
-/// of an S3 `SignatureDoesNotMatch` — is what makes value-based redaction
-/// observable rather than vacuous. A 4xx is never retried, so each read reaches the
-/// endpoint exactly once and fails fast.
+/// `object_store` folds a non-2xx body into its error, so a body quoting a credential (like
+/// S3's `SignatureDoesNotMatch`) makes redaction observable. A 4xx is never retried.
 fn refusing_endpoint(message: &str) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback endpoint");
     let url = format!(
@@ -773,27 +859,11 @@ fn logical_field(field_id: i32, name: &str, arrow_type: &str) -> LogicalField {
     }
 }
 
-/// Scenario: A dimension-side read failure never surfaces the dimension side's
-/// credential — the FALSIFIABLE counterpart to
-/// [`unreadable_join_file_error_redacts_both_sides_credentials`].
-///
-/// Both sides share one bucket (the same-warehouse norm, so one DataFusion registry
-/// key serves two credentials through the prefix router) but reach DIFFERENT
-/// loopback endpoints, each refusing with an XML body that quotes ITS OWN secret
-/// key next to a plain marker. The dimension side is the hash-join build side, so
-/// its read is the first to touch an endpoint and the one that fails.
-///
-/// The marker assertion is what makes this test discriminate: it proves the
-/// dimension endpoint's refusal body genuinely reached the surfaced message, hence
-/// that the secret sitting beside it WOULD have leaked had the redaction set not
-/// covered the dimension side. A redaction set built from the fact side's
-/// `common.storage` alone fails this test.
-///
-/// Both sides carry a `logical_schema` so neither registration infers a schema:
-/// inference reads through `register_file_list`, which redacts per-side, and would
-/// mask the union rule under test.
 #[test]
 fn a_dimension_side_read_failure_redacts_the_dimension_sides_credential() {
+    // The marker proves the refusal body reached the message, so the secret beside it would
+    // have leaked without dimension-side redaction. Both sides carry a `logical_schema` because
+    // schema inference redacts per-side and would mask the union rule under test.
     const DIM_MARKER: &str = "dimension-side-refusal";
     const FACT_MARKER: &str = "fact-side-refusal";
 
@@ -818,6 +888,7 @@ fn a_dimension_side_read_failure_redacts_the_dimension_sides_credential() {
                 join_type: JoinType::Inner,
                 condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
                 post_join_limit: None,
+                post_join_order_by: Vec::new(),
                 partition_columns: Vec::new(),
                 storage: ScanStorage::Inline(s3_backend(&dim_endpoint, "DIMSECRETVALUE")),
             }),

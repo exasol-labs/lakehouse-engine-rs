@@ -5,37 +5,27 @@ use std::fmt;
 use super::super::support::walk_column_nodes;
 use super::planning::{DetectedJoin, JoinLeaf};
 
-/// Which leg a `column` node belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ColumnLeg {
-    /// The reference belongs to this leg.
     Leg(usize),
-    /// The reference names no leg of this binding: it carries no `tableName`, or one
-    /// no leg declares. Left unqualified, which is what the N = 1 wrapper's
-    /// deliberate name collapse relies on.
+    /// No `tableName`, or one no leg declares. Left unqualified, which the N = 1 wrapper's
+    /// name collapse relies on.
     NoLeg,
-    /// The reference's `tableName` names two or more legs and its `tableAlias`
-    /// matches none of them, so no leg can be chosen. Fails loudly rather than
-    /// resolving — an arbitrary leg is the wrong-rows failure this type removes.
+    /// `tableName` names several legs and `tableAlias` matches none; picking one arbitrarily
+    /// would return wrong rows.
     Unattributable,
 }
 
-/// The legs an expression tree references.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct LegReferences {
-    /// Every leg a `column` of the tree resolved to.
     pub legs: BTreeSet<usize>,
-    /// Whether any `column` resolved to no leg at all — untagged, naming a table no
-    /// leg declares, or unattributable. All three mean the same thing to a leg-local
-    /// decision: the tree cannot be claimed by one leg.
+    /// Untagged, naming an undeclared table, or unattributable: all mean no single leg can
+    /// claim the tree.
     pub has_unattributed: bool,
-    /// Whether the tree references any `column` node at all — a column-free
-    /// expression is distinct from one whose columns could not be attributed.
+    /// Distinguishes a column-free expression from one whose columns could not be attributed.
     pub any_column: bool,
 }
 
-/// A `column` reference no leg key matches, named well enough for a client-facing
-/// error to say which reference could not be placed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct UnattributableColumn {
     table_name: String,
@@ -84,25 +74,15 @@ struct LegKey {
     leg: usize,
 }
 
-/// The sole resolver of which JOIN LEG — one OCCURRENCE of a table in the FROM tree —
-/// a pushdown `column` node belongs to.
+/// The sole resolver of which join leg (one occurrence of a table in the FROM tree) a
+/// `column` node belongs to.
 ///
-/// `tableName` is the wrong currency for that question: it names a TABLE, and table
-/// and occurrence coincide only while no table appears twice. Keying on it collapses
-/// a self-join's occurrences into one leg, which renders every reference against the
-/// same subquery — issue #361's cross product. The leg key is therefore the PAIR
-/// (`tableName`, `tableAlias`), matched against the FROM-tree leaves'
-/// (`table_name`, `table_alias`), with the alias compared verbatim because Exasol
-/// applies no case folding to it on either side.
-///
-/// The pair is injective by SQL's own rules: within one `tableName` two occurrences
-/// cannot share an alias (`FROM T a JOIN T a` is illegal) and at most one may be
-/// alias-less (`FROM T JOIN T` is an ambiguous reference and is rejected). An absent
-/// alias is thus a leg identity of its own, not a missing value, and no alias
-/// sorting, occurrence counting, or positional guess is needed. Where a `tableName`
-/// names exactly ONE leg the alias is never consulted at all — Exasol stamps no
-/// `tableAlias` on an unaliased FROM clause, so requiring one would break every
-/// unaliased join.
+/// `tableName` alone collapses a self-join's occurrences into one leg (#361's cross
+/// product), so the key is (`tableName`, `tableAlias`), the alias compared verbatim since
+/// Exasol does not fold it. SQL makes the pair injective (`FROM T a JOIN T a` is illegal,
+/// at most one occurrence is alias-less), so an absent alias is an identity of its own.
+/// When a `tableName` names exactly one leg the alias is not consulted: Exasol stamps no
+/// `tableAlias` on an unaliased FROM clause.
 #[derive(Debug, Clone)]
 pub(super) struct JoinLegs {
     keys: Vec<LegKey>,
@@ -110,9 +90,8 @@ pub(super) struct JoinLegs {
 }
 
 impl JoinLegs {
-    /// Private on purpose: [`DetectedJoin::legs`] is the ONLY production constructor
-    /// of a multi-leg binding, so no caller can bind legs to leaves of a different
-    /// request or invent leaves of its own.
+    /// Private: [`DetectedJoin::legs`] is the only production constructor of a multi-leg
+    /// binding, so legs cannot be bound to another request's leaves.
     fn from_leaves(leaves: &[JoinLeaf]) -> Self {
         let keys = leaves
             .iter()
@@ -129,12 +108,8 @@ impl JoinLegs {
         }
     }
 
-    /// Builds a binding for the N = 1 (no join) case: every `involvedTables[].name`
-    /// in the pushdown request maps onto the single leg 0, so `resolve_column`'s
-    /// alias branch is unreachable here and [`ColumnLeg::Unattributable`] can never
-    /// arise — there is only one leg to attribute to. An absent or empty
-    /// `involvedTables` yields a binding with no keys at all, which qualifies
-    /// nothing (every column resolves to [`ColumnLeg::NoLeg`]).
+    /// Every `involvedTables[].name` maps to leg 0, so [`ColumnLeg::Unattributable`] cannot
+    /// arise. No `involvedTables` yields no keys, qualifying nothing.
     pub(super) fn for_single_scan(request: &Json) -> Self {
         let keys = request
             .get("involvedTables")
@@ -154,20 +129,15 @@ impl JoinLegs {
         Self { keys, leg_count: 1 }
     }
 
-    /// The number of legs in this binding, one per FROM-tree leaf of the join it
-    /// was derived from.
     pub(super) fn leg_count(&self) -> usize {
         self.leg_count
     }
 
-    /// The `LHS_T{leg}` alias this binding renders for the given leg's fan-out
-    /// subquery.
     pub(super) fn leg_alias(&self, leg: usize) -> String {
         format!("LHS_T{leg}")
     }
 
-    /// The leg one `column` node belongs to — the SOLE answer to that question, and
-    /// the reason no other module reads `tableName` to decide leg identity.
+    /// The sole answer to leg identity; no other module reads `tableName` for it.
     pub(super) fn resolve_column(&self, column: &serde_json::Map<String, Json>) -> ColumnLeg {
         let Some(table_name) = column.get("tableName").and_then(|name| name.as_str()) else {
             return ColumnLeg::NoLeg;
@@ -209,15 +179,9 @@ impl JoinLegs {
         referenced
     }
 
-    /// The leg whose join point an expression tree attaches to: the HIGHEST leg index
-    /// it references, which is the EARLIEST join point of a left-to-right chain at
-    /// which every leg the tree references is already in scope.
-    ///
-    /// `None` when the tree references no `column` at all, or when any of its columns
-    /// could not be attributed to a leg — neither can be placed at a join point, so
-    /// the caller must apply it where every leg is in scope instead. This is the sole
-    /// answer to "where does this condition belong", so no caller reads the leg set,
-    /// the unattributed flag, or the column-free flag itself.
+    /// The highest referenced leg index: the earliest join point of a left-to-right chain with
+    /// every referenced leg in scope. `None` when the tree has no column or an unattributed one,
+    /// so the caller must apply it where every leg is in scope.
     pub(super) fn attachment_leg(&self, expr: &Json) -> Option<usize> {
         let referenced = self.legs_referenced(expr);
         if !referenced.any_column || referenced.has_unattributed {
@@ -226,18 +190,9 @@ impl JoinLegs {
         referenced.legs.into_iter().next_back()
     }
 
-    /// The single leg a conjunct is local to, or `None` when it cannot be pruned to
-    /// one leg: the conjunct references no column at all; one of its columns
-    /// resolved to no leg ([`ColumnLeg::NoLeg`] — untagged, or naming a table this
-    /// binding does not declare); one of its columns could not be attributed to any
-    /// leg ([`ColumnLeg::Unattributable`]); or its columns span more than one leg.
-    /// In every `None` case the caller must apply the conjunct where every leg is
-    /// in scope instead of pruning early.
-    ///
-    /// Pruning IS sound for an inner join: a row on the referenced leg that fails a
-    /// conjunct mentioning only that leg can never survive the join anyway, so
-    /// filtering it out of that leg's fan-out before the join changes no downstream
-    /// row.
+    /// `None` when the conjunct has no column, an unattributed column, or spans several legs;
+    /// the caller then applies it where every leg is in scope. Pruning a single-leg conjunct
+    /// early is sound for an inner join: a row failing it can never survive the join.
     pub(super) fn conjunct_leg(&self, conjunct: &Json) -> Option<usize> {
         let referenced = self.legs_referenced(conjunct);
         if referenced.has_unattributed || !referenced.any_column || referenced.legs.len() != 1 {
@@ -246,14 +201,9 @@ impl JoinLegs {
         referenced.legs.into_iter().next()
     }
 
-    /// Rewrites every `column` node in `expr` to carry this binding's `tableAlias`
-    /// for the leg it resolves to, overwriting any `tableAlias` the request already
-    /// supplied. A bare column name is ambiguous once the same table occurs on more
-    /// than one leg; qualifying it against its own leg's `LHS_T{leg}` fan-out
-    /// subquery is unambiguous because each leg is rendered as its own subquery. A
-    /// column that resolves to [`ColumnLeg::NoLeg`] is left untouched. Fails with
-    /// [`UnattributableColumn`] the first time a column resolves to
-    /// [`ColumnLeg::Unattributable`].
+    /// Overwrites each `column`'s `tableAlias` with its leg's `LHS_T{leg}` alias, since a bare
+    /// name is ambiguous once a table occurs on several legs. [`ColumnLeg::NoLeg`] columns are
+    /// left untouched.
     pub(super) fn qualify(&self, expr: &Json) -> Result<Json, UnattributableColumn> {
         match expr {
             Json::Object(map) => {
@@ -282,16 +232,10 @@ impl JoinLegs {
     }
 }
 
-/// The leg binding of a detected join is derived HERE — in the module that owns leg
-/// identity — rather than at each render site, so the derivation from a join's leaves
-/// has exactly one owner.
+/// Leg binding is derived here, in the module owning leg identity, so it has one owner.
 impl DetectedJoin {
-    /// This join's leg binding: one leg per FROM-tree leaf, in the tree's own
-    /// left-to-right order, so a self-join's two occurrences stay two legs.
-    ///
-    /// The ONLY way to obtain a multi-leg [`JoinLegs`] (the N = 1 wrapper's binding
-    /// comes from [`JoinLegs::for_single_scan`]): a caller can neither bind a request's
-    /// references against another request's legs nor invent leaves of its own.
+    /// One leg per FROM-tree leaf in left-to-right order, so a self-join's occurrences stay
+    /// distinct legs.
     pub(super) fn legs(&self) -> JoinLegs {
         JoinLegs::from_leaves(&self.tables)
     }

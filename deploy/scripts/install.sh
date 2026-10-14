@@ -1,23 +1,11 @@
 #!/usr/bin/env bash
-# One-command installer that provisions lakehouse-engine onto an Exasol SaaS or BucketFS
-# database: registers the Rust SLC, uploads and registers the engine .so plus its four
-# scripts, and verifies the load with a version smoke test. Stops at a query-ready
-# product install and prints the next-step CONNECTION / VIRTUAL SCHEMA template; it does
-# NOT create catalog objects.
-#
-# Distributed one-liner (piped into bash over stdin). Both source repos are public, so no
-# token is required:
 #   curl -fsSL -H "Accept: application/vnd.github.raw" \
 #     https://api.github.com/repos/exasol-labs/lakehouse-engine-rs/contents/deploy/scripts/install.sh \
 #   | bash -s -- --account-id $ACC --database-id $DB --profile staging
 #
-# The file is sourceable: its functions can be sourced and unit-tested without running the
-# installer, because `main` runs only when the file is executed or piped, never when sourced.
-#
-# Bash 3.2+ (stock macOS). No jq. Every subprocess (curl/exapump) reads stdin from /dev/null
-# so a subprocess cannot consume the remaining piped script body.
+# Bash 3.2+ (stock macOS). Sourceable for unit tests: `main` runs only when executed or piped.
+# Every subprocess reads stdin from /dev/null so it cannot consume the rest of the piped script.
 
-# --- Constants ---------------------------------------------------------------
 SAAS_PROD_BASE="https://cloud.exasol.com"
 SAAS_STAGING_BASE="https://cloud-staging.exasol.com"
 ENGINE_REPO="exasol-labs/lakehouse-engine-rs"
@@ -28,14 +16,9 @@ ENGINE_SO_PATH="/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engin
 DEFAULT_SCHEMA="LHVS"
 RUST_LANG_SEGMENT="RUST=localzmq+protobuf:///uploads/default/rustslc?lang=rust#buckets/uploads/default/rustslc/exaudf/exaudfclient"
 
-# Generic-BucketFS (Exasol AsApp / Docker / on-premise) layout. Both paths are BUCKET-RELATIVE with no
-# leading slash and no bucket segment, because that is the grammar `exapump bucketfs cp|ls|rm`
-# expects: exapump builds its URL as <scheme>://<bfs-host>:<bfs-port>/<bucket>/<path>, so the
-# bucket comes from --bfs-bucket / the profile's bfs_bucket, never from the path argument.
-# (Verified against a live Exasol container: `exapump bucketfs cp f /default/x/f` with bucket
-# 'default' creates 'default/x/f' INSIDE the default bucket, and `exapump bucketfs ls /default`
-# fails with "Path not found".) The bucket DOES appear in the %udf_object / RUST alias strings
-# below, because those are read by the Exasol engine, not by exapump.
+# Bucket-relative, no bucket segment: exapump takes the bucket from --bfs-bucket, and a bucket
+# in the path is created as a subdirectory. The engine-read %udf_object / RUST alias strings do
+# include the bucket.
 DEFAULT_BFS_BUCKET="default"
 BFS_SERVICE="bfsdefault"
 BFS_SLC_PATH="slc/lakehouse-rustslc.tar.gz"
@@ -44,25 +27,22 @@ BFS_ENGINE_SO_PATH="udf/liblakehouse_engine.so"
 DEPLOYMENT_ROOT="$HOME/.exasol/personal/deployments"
 DEPLOYMENT_DESCRIPTOR="deployment.json"
 SECRETS_DESCRIPTOR="secrets.json"
-NODE_KEY_RELATIVE_PATH="local/node_access.pem"
 LOCAL_BACKEND="local"
 PERSONAL_DB_HOST_DEFAULT="127.0.0.1"
 PERSONAL_DB_PORT_DEFAULT="8563"
 PERSONAL_DB_USER_DEFAULT="sys"
-PERSONAL_SSH_USER="root"
-PERSONAL_SSH_HOST="127.0.0.1"
-VM_BUCKETFS_ROOT="/var/lib/exa/bucketfs"
-VM_RECONCILE_TRIES=30
-VM_RECONCILE_POLL_SECONDS=2
-# Env-overridable (unlike VM_RECONCILE_*) so the test suite can drive the full script through a
-# real run_file invocation without a real ~30s wait -- BUCKETFS_REACHABLE_TRIES=3
-# BUCKETFS_REACHABLE_POLL_SECONDS=0 exercises the exact same production code path fast.
+# Env-overridable so tests can run the retry loops without real waits.
 BUCKETFS_REACHABLE_TRIES="${BUCKETFS_REACHABLE_TRIES:-30}"
 BUCKETFS_REACHABLE_POLL_SECONDS="${BUCKETFS_REACHABLE_POLL_SECONDS:-2}"
-SSH_OPTIONS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR)
+# Exasol Personal 2.3+ local deployments have no BucketFS HTTP endpoint: the SLC goes through
+# `exasol slc custom`, the .so into the host-side BucketFS directory (a new <service>/<bucket>/
+# directory creates that bucket).
+LAUNCHER_SLC_ALIAS="RUST"
+LAUNCHER_SLC_LANGUAGE="rust"
+PERSONAL_EXA_RELATIVE_PATH="local/runtime/exa"
+PERSONAL_BUCKET_TRIES="${PERSONAL_BUCKET_TRIES:-30}"
+PERSONAL_BUCKET_POLL_SECONDS="${PERSONAL_BUCKET_POLL_SECONDS:-1}"
 
-# --- Global state (defaults; parse_args re-seeds arg-derived ones) -----------
 ARG_ACCOUNT_ID=""
 ARG_DATABASE_ID=""
 ARG_PROFILE=""
@@ -88,8 +68,6 @@ ARG_HELP=0
 
 DEPLOYMENT_TRANSPORT=""
 DEPLOYMENT_DIR=""
-DEPLOYMENT_SSH_PORT=""
-DEPLOYMENT_KEY_PATH=""
 CONNECTIVITY_MODE=""
 TARGET_MODE=""
 TARGET_SO_UDF_OBJECT=""
@@ -104,22 +82,16 @@ RESOLVED_ENGINE_VERSION=""
 RESOLVED_SLC_TAG=""
 RESOLVED_SLC_VERSION=""
 
-# --- Output helpers ----------------------------------------------------------
-# Progress goes to stderr; user-facing deliverables (resolved versions, template) to stdout.
+# Progress goes to stderr; deliverables (resolved versions, template) to stdout.
 emit() { printf '%s\n' "$*"; }
 log()  { printf '%s\n' "$*" >&2; }
 err()  { printf 'ERROR: %s\n' "$*" >&2; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# Auto-installs exapump via its own public one-liner when missing from PATH -- this is what makes
-# `curl .../install.sh | bash` a true one-line install rather than one that dead-ends on a missing
-# prereq. Prompts for confirmation only on a real interactive terminal (stdin AND stdout both
-# ttys; default: yes on Enter) -- anywhere else, e.g. the curl|bash one-liner itself (stdin is the
-# piped script, not a tty) or a captured/redirected run, it proceeds without asking, since asking
-# would either hang or silently no-op. exapump's own installer drops the binary into
-# $HOME/.local/bin (or $EXAPUMP_INSTALL_DIR) without updating this process's already-resolved
-# PATH, so that directory is checked and prepended directly rather than trusting a bare re-check.
+# Prompts only when stdin and stdout are both ttys: under curl|bash stdin is the script, so a
+# prompt would hang or no-op. exapump's installer does not update this process's PATH, so its
+# install dir is prepended explicitly.
 ensure_exapump() {
   have_cmd exapump && return 0
   if [[ -t 0 && -t 1 ]]; then
@@ -147,10 +119,7 @@ ensure_exapump() {
   return 0
 }
 
-# Percent-encodes a string for safe inclusion in a DSN's userinfo component (RFC 3986 unreserved
-# set only: A-Za-z0-9-_.~). --user/--password may contain reserved URI characters (@, :, /, ?, #)
-# that would otherwise corrupt or change the meaning of the exasol:// DSN built by string
-# interpolation.
+# Keeps only the RFC 3986 unreserved set, so credentials cannot corrupt the DSN userinfo.
 url_encode() {
   local s="$1" i c out=""
   local len=${#s}
@@ -164,15 +133,13 @@ url_encode() {
   printf '%s\n' "$out"
 }
 
-# Percent-decodes a string; the exact inverse of url_encode() above.
 url_decode() {
   local s="$1" i c out=""
   local len=${#s}
   for ((i = 0; i < len; i++)); do
     c="${s:i:1}"
     if [[ "$c" == "%" && $((i + 2)) -lt len && "${s:i+1:2}" =~ ^[0-9A-Fa-f]{2}$ ]]; then
-      # shellcheck disable=SC2059  # the inner printf emits only octal digits (0-7), never a
-      # format specifier, so the outer printf's format string is always a plain "\NNN" escape.
+      # shellcheck disable=SC2059  # the inner printf emits only octal digits, never a format specifier.
       out+="$(printf "\\$(printf '%03o' "0x${s:i+1:2}")")"
       i=$((i + 2))
     else
@@ -182,11 +149,8 @@ url_decode() {
   printf '%s\n' "$out"
 }
 
-# Extracts the still-percent-encoded password segment from an exasol://user:password@host...
-# DSN. Splits on the LAST '@' before the host (the greedy match preserves a RAW, un-encoded '@'
-# inside the password, e.g. 'user:pass@word@host' extracts 'pass@word') and the FIRST ':' after
-# the scheme (separating user from password). Returns 1 with no output if the DSN has no
-# ':password@' segment (no '@' at all, or no ':' before it).
+# Returns the still-encoded password. Splits on the LAST '@' so a raw '@' in the password
+# survives ('user:pass@word@host' -> 'pass@word'); returns 1 if there is no ':password@'.
 extract_dsn_password() {
   local dsn="$1"
   local re='^[a-zA-Z][a-zA-Z0-9+.-]*://[^:]*:(.*)@.*$'
@@ -197,34 +161,23 @@ extract_dsn_password() {
   return 1
 }
 
-# --- JSON helpers ------------------------------------------------------------
-# Un-escapes a raw JSON string value: the \\uXXXX numeric escape (ASCII range only -- sufficient
-# for the presigned URLs and tags this script extracts, which are pure ASCII) plus the common
-# single-char escapes. Needed because some backends (notably Go's encoding/json, which
-# HTML-escapes '&', '<', '>' by default) return presigned URLs with their '&' query-parameter
-# separators replaced by the literal six-character escape sequence for '&' -- collapsing every
-# parameter after the first into one unparsable blob. That surfaces as S3 rejecting the request
-# with AuthorizationQueryParametersError ("X-Amz-Algorithm only supports ..."), because the value
-# curl actually sends for X-Amz-Algorithm ends up being "AWS4-HMAC-SHA256" concatenated with the
-# rest of the still-escaped query string, rather than the bare algorithm name.
+# Go's encoding/json HTML-escapes '&' as & in presigned URLs; left escaped, S3 rejects the
+# request with AuthorizationQueryParametersError. \uXXXX is decoded for ASCII only.
 json_unescape() {
   local rest="$1" out="" chunk hex dec ch
-  # shellcheck disable=SC1003  # a literal single backslash inside single quotes, not an
-  # escape attempt -- this is the correct, portable way to match/emit one '\' character.
+  # shellcheck disable=SC1003  # a literal single backslash, not an escape attempt.
   while [[ "$rest" == *'\'* ]]; do
     chunk="${rest%%\\*}"
     out+="$chunk"
     rest="${rest#*\\}"
-    # shellcheck disable=SC1003  # the \\*) branch's '\' is a literal one-character backslash
-    # string, not an escape attempt -- directives can't attach to a single case branch, so this
-    # covers the whole case statement below.
+    # shellcheck disable=SC1003  # the \\*) branch's '\' is a literal backslash, not an escape attempt.
     case "$rest" in
       u[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]*)
         hex="${rest:1:4}"
         rest="${rest:5}"
         dec=$((16#$hex))
         if [[ "$dec" -lt 128 ]]; then
-          # shellcheck disable=SC2059  # same octal-only guarantee as url_decode() above.
+          # shellcheck disable=SC2059  # inner printf emits only octal digits.
           ch="$(printf "\\$(printf '%03o' "$dec")")"
         else
           ch="?"
@@ -244,8 +197,6 @@ json_unescape() {
   printf '%s\n' "$out"
 }
 
-# Extracts a top-level JSON string field by name (no jq; bash regex), un-escaping its value.
-# Returns 1 if absent.
 extract_json_string_field() {
   local json="$1" field="$2"
   local re="\"$field\"[[:space:]]*:[[:space:]]*\"([^\"]*)\""
@@ -256,19 +207,11 @@ extract_json_string_field() {
   return 1
 }
 
-# --- Credential resolution ---------------------------------------------------
-# Prints the exapump config.toml path this installer must read to mirror what
-# `exapump sql --profile <name>` itself would resolve (confirmed via `strings $(command -v
-# exapump)`: exapump honors EXAPUMP_CONFIG as a full-file-path override).
+# exapump honors EXAPUMP_CONFIG as a full-file-path override.
 exapump_config_path() {
   printf '%s\n' "${EXAPUMP_CONFIG:-$HOME/.exapump/config.toml}"
 }
 
-# Reads the named `$key` out of the named `[profile]` TOML section in $config_path. Bounded
-# scan: only lines between the
-# named section's own header and the next `[`-headed header (or EOF) are considered, so a
-# same-named key in a different section is never matched. Returns 1 with no output if the file,
-# section, or key is absent.
 read_profile_key() {
   local profile="$1" key="$2" config_path="$3" line trimmed_line
   local other_section_re='^\[.*\][[:space:]]*$'
@@ -294,9 +237,7 @@ read_profile_key() {
   return 1
 }
 
-# Sets the global RESOLVED_PAT from whichever connectivity credential is already in use: on
-# Exasol SaaS the PAT IS the SQL password, so this derives the one REST bearer credential instead
-# of asking the user to supply it a second time. Never prints the resolved value.
+# On Exasol SaaS the PAT is the SQL password, so the REST bearer is derived from the connectivity credential.
 resolve_saas_pat() {
   case "$CONNECTIVITY_MODE" in
     host)
@@ -347,7 +288,7 @@ deployment_backend() {
     return 1
   fi
   if [[ -z "$backend" ]]; then
-    err "'$dir/$DEPLOYMENT_DESCRIPTOR' carries no '.backend' field, so the install transport (local SSH copy vs cloud BucketFS HTTP upload) cannot be determined."
+    err "'$dir/$DEPLOYMENT_DESCRIPTOR' carries no '.backend' field, so the install transport (local 'exasol slc custom' vs cloud BucketFS HTTP upload) cannot be determined."
     return 1
   fi
   printf '%s\n' "$backend"
@@ -364,23 +305,6 @@ deployment_field() {
   fi
   printf '%s\n' "$value"
   return 0
-}
-
-deployment_ssh_port() {
-  local dir="$1" port
-  if ! port="$(read_descriptor_field "$dir/$DEPLOYMENT_DESCRIPTOR" '.connection.sshPort')"; then
-    return 1
-  fi
-  if [[ ! "$port" =~ ^[0-9]+$ ]]; then
-    err "'$dir/$DEPLOYMENT_DESCRIPTOR' carries no numeric '.connection.sshPort' (got '$port'). Exasol Personal writes it when the deployment starts; start the deployment and re-run."
-    return 1
-  fi
-  printf '%s\n' "$port"
-  return 0
-}
-
-deployment_key_path() {
-  printf '%s\n' "$1/$NODE_KEY_RELATIVE_PATH"
 }
 
 deployment_db_password() {
@@ -486,12 +410,14 @@ Both modes:
                             language-container-rs's own latest release)
   --skip-slc                do not download, upload or register the Rust SLC; install the engine
                             against the SLC already registered on the database
-  --arch <x86_64|aarch64>   target CPU architecture (default: x86_64); selects unsuffixed vs
-                            -aarch64-suffixed release assets
+  --arch <x86_64|aarch64>   target CPU architecture (default: x86_64, or the host's for a local
+                            --deployment); selects unsuffixed vs -aarch64-suffixed release assets
   --deployment <name>       target an Exasol Personal deployment by name, resolving connection and
                             backend from $HOME/.exasol/personal/deployments/<name>/deployment.json;
-                            local backend installs over SSH, cloud backend falls through to the
-                            BucketFS HTTP path above (--bfs-write-password required for cloud)
+                            local backend (Exasol Personal 2.3+) writes into the deployment's
+                            BucketFS directory and installs the SLC with `exasol slc custom`;
+                            cloud backend falls through to the BucketFS HTTP path above
+                            (--bfs-write-password required for cloud)
   --help                    show this help
 
 Examples:
@@ -510,7 +436,6 @@ one-liner). Set EXAPUMP_INSTALL_DIR to change where it lands (default: $HOME/.lo
 USAGE
 }
 
-# --- Argument parsing --------------------------------------------------------
 parse_args() {
   ARG_ACCOUNT_ID=""
   ARG_DATABASE_ID=""
@@ -581,9 +506,6 @@ parse_args() {
   return 0
 }
 
-
-# Prints the resolved connectivity mode (profile|dsn|host) on stdout, or errors and returns 1.
-# Reads the ARG_* globals directly (consistent with the rest of the file).
 validate_connectivity() {
   local modes=0 chosen=""
   if [[ -n "$ARG_PROFILE" ]]; then modes=$((modes + 1)); chosen="profile"; fi
@@ -609,19 +531,8 @@ validate_connectivity() {
   return 0
 }
 
-# --- Target mode & layout ----------------------------------------------------
-# Prints the resolved install target mode (saas|bucketfs) on stdout, or errors and returns 1.
-# Reads the ARG_* globals directly (consistent with the rest of the file).
-#
-# The mode is AUTO-DETECTED from the SaaS ids, because those ids are the only thing a SaaS install
-# needs that a BucketFS install cannot use: both given -> saas, neither given -> bucketfs (the
-# default target: Exasol AsApp, Docker, on-premise). Exactly one given is always a mistake and errors.
-# --target is an optional assertion: it never selects a mode, it only fails the run when the
-# caller's stated intent disagrees with what the flags actually describe.
-#
-# Also rejects flags that only make sense for the OTHER target: --staging when no SaaS ids were
-# given, or any --bfs-* flag when both SaaS ids were given. A silently-ignored flag here would
-# read as "I told it to use staging / a custom bucket" while the run quietly did something else.
+# --target only asserts, never selects. Flags for the other target are rejected rather than
+# silently ignored.
 resolve_target_mode() {
   local detected=""
   if [[ -n "$ARG_ACCOUNT_ID" && -n "$ARG_DATABASE_ID" ]]; then
@@ -704,35 +615,28 @@ resolve_deployment_transport() {
     return 0
   fi
 
-  DEPLOYMENT_TRANSPORT="ssh"
-  if [[ ! "$ARG_BFS_BUCKET" =~ ^[A-Za-z0-9._-]+$ ]]; then
-    err "--bfs-bucket '$ARG_BFS_BUCKET' is not a valid bucket name: it names the directory inside the deployment VM's BucketFS that the SSH transport replaces, and is interpolated into a remote command, so it must match [A-Za-z0-9._-]+."
+  DEPLOYMENT_TRANSPORT="launcher"
+  local bfs_flags_given=""
+  [[ -n "$ARG_BFS_HOST" ]] && bfs_flags_given="$bfs_flags_given --bfs-host"
+  [[ -n "$ARG_BFS_PORT" ]] && bfs_flags_given="$bfs_flags_given --bfs-port"
+  [[ -n "$ARG_BFS_WRITE_PASSWORD" ]] && bfs_flags_given="$bfs_flags_given --bfs-write-password"
+  if [[ -n "$bfs_flags_given" ]]; then
+    err "BucketFS HTTP flag(s)$bfs_flags_given were given, but deployment '$ARG_DEPLOYMENT' has backend '$LOCAL_BACKEND', which has no BucketFS HTTP endpoint: the engine is written straight into its BucketFS directory. Drop the flag(s); only --bfs-bucket applies."
+    return 1
+  fi
+  if [[ ! "$ARG_BFS_BUCKET" =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*$ ]]; then
+    err "--bfs-bucket '$ARG_BFS_BUCKET' is not a valid bucket name: it names a directory under the deployment's BucketFS directory, so it must match [A-Za-z0-9_-][A-Za-z0-9._-]*."
     return 1
   fi
   resolve_deployment_connection "$DEPLOYMENT_DIR" "$PERSONAL_DB_HOST_DEFAULT" || return 1
-  if ! DEPLOYMENT_SSH_PORT="$(deployment_ssh_port "$DEPLOYMENT_DIR")"; then
-    return 1
-  fi
-  DEPLOYMENT_KEY_PATH="$(deployment_key_path "$DEPLOYMENT_DIR")"
-  if [[ ! -r "$DEPLOYMENT_KEY_PATH" ]]; then
-    err "no readable node key at '$DEPLOYMENT_KEY_PATH'. Exasol Personal writes it when the deployment is created; check that '$ARG_DEPLOYMENT' is a local deployment created by this user."
-    return 1
-  fi
   if [[ "$ARG_ARCH_SET" -eq 0 ]]; then
     ARG_ARCH="$(detect_host_arch)" || return 1
   fi
-  log "Deployment '$ARG_DEPLOYMENT' has backend '$LOCAL_BACKEND': installing $ARG_ARCH artifacts over SSH into the deployment VM (ssh port $DEPLOYMENT_SSH_PORT)."
+  log "Deployment '$ARG_DEPLOYMENT' has backend '$LOCAL_BACKEND': installing $ARG_ARCH artifacts through 'exasol slc custom' and the deployment's BucketFS directory."
   return 0
 }
 
-# If bucketfs mode + profile connectivity + no explicit --bfs-bucket, resolves ARG_BFS_BUCKET
-# from the profile's own bfs_bucket field. Must run before resolve_target_layout, and before
-# exapump_bfs_flags is ever consulted. Without this, ARG_BFS_BUCKET stays at its "default" default
-# while exapump itself resolves the profile's bfs_bucket for the actual upload -- an install that
-# passes every upload/verify step (they all target the bucket exapump picks) yet builds
-# %udf_object/RUST-alias paths (via resolve_target_layout) pointing at "default", so Exasol looks
-# for the .so in a bucket it was never uploaded to. A no-op in saas mode, dsn/host connectivity
-# mode (no profile to read), or when --bfs-bucket was already given explicitly.
+# Must run before resolve_target_layout, so the DDL paths name the same bucket the upload uses.
 resolve_bfs_bucket_from_profile() {
   if [[ "$TARGET_MODE" != "bucketfs" || "$CONNECTIVITY_MODE" != "profile" || "$ARG_BFS_BUCKET_SET" -eq 1 ]]; then
     return 0
@@ -744,11 +648,6 @@ resolve_bfs_bucket_from_profile() {
   return 0
 }
 
-# Seeds the mode-parameterized TARGET_* globals used by the install steps, so those steps never
-# read a target-specific constant directly. Call only after resolve_target_mode has resolved a
-# mode, and after resolve_bfs_bucket_from_profile so ARG_BFS_BUCKET already reflects the bucket
-# exapump will actually use. TARGET_SLC_BFS_PATH / TARGET_ENGINE_BFS_PATH are BucketFS-only (SaaS
-# addresses its uploads by presigned-URL file key instead, so they stay empty there).
 resolve_target_layout() {
   case "$TARGET_MODE" in
     bucketfs)
@@ -767,10 +666,8 @@ resolve_target_layout() {
   return 0
 }
 
-# BucketFS-target required fields. Runs BEFORE any network call, so a missing write password can
-# never cost a download. `exapump bucketfs` has NO --dsn/--host/--user/--password flags of its own
-# (unlike `exapump sql`), so outside profile connectivity mode there is nothing to fall back on and
-# --bfs-host plus --bfs-write-password must be supplied explicitly.
+# `exapump bucketfs` takes no DSN/host/user flags, so outside profile mode --bfs-host and
+# --bfs-write-password must be explicit.
 validate_bucketfs_required() {
   local missing=0
   case "$CONNECTIVITY_MODE" in
@@ -809,14 +706,12 @@ check_prereqs() {
   if [[ "$TARGET_MODE" == "bucketfs" ]]; then
     have_cmd tar   || { err "required tool 'tar' not found on PATH. The BucketFS install target extracts liblakehouse_engine.so out of the engine archive locally before uploading it. Install it via your OS package manager."; ok=0; }
   fi
-  if [[ "$DEPLOYMENT_TRANSPORT" == "ssh" ]]; then
-    have_cmd ssh || { err "required tool 'ssh' not found on PATH. An Exasol Personal deployment with the '$LOCAL_BACKEND' backend exposes no BucketFS HTTP endpoint, so artifacts travel to its VM over SSH."; ok=0; }
-    have_cmd scp || { err "required tool 'scp' not found on PATH. An Exasol Personal deployment with the '$LOCAL_BACKEND' backend exposes no BucketFS HTTP endpoint, so artifacts travel to its VM over SSH."; ok=0; }
+  if [[ "$DEPLOYMENT_TRANSPORT" == "launcher" ]]; then
+    have_cmd exasol || { err "required tool 'exasol' (the Exasol Personal launcher CLI) not found on PATH. A local Exasol Personal deployment is installed through 'exasol slc custom'."; ok=0; }
   fi
   [[ "$ok" -eq 1 ]]
 }
 
-# --- Target base -------------------------------------------------------------
 resolve_saas_base() {
   if [[ "$ARG_STAGING" -eq 1 ]]; then
     printf '%s\n' "$SAAS_STAGING_BASE"
@@ -825,7 +720,6 @@ resolve_saas_base() {
   fi
 }
 
-# --- Version resolution ------------------------------------------------------
 normalize_version() {
   local v="$1"
   printf '%s\n' "${v#v}"
@@ -860,14 +754,8 @@ detect_host_arch() {
   esac
 }
 
-# Fetches the engine's root Cargo.toml AT the resolved engine release tag and extracts the
-# exasol-udf-sdk version it pins there -- the SLC version that release actually requires. This
-# repo keeps the SLC and its exasol-udf-sdk dependency in exact lockstep (same version number both
-# places; see CLAUDE.md and the Makefile's install-slc SLC_VERSION default), so the pin IS the
-# right default SLC version -- language-container-rs's own "latest" release is NOT: the two repos
-# release independently, so SLC can ship ahead of any engine release that has picked it up yet.
-# That exact drift (language-container-rs v0.21.1 with no matching engine release) broke this
-# default before this fix; see #305.
+# The SLC must match the engine's pinned exasol-udf-sdk version exactly; the SLC repo's own latest
+# release can be ahead of any engine release (#305).
 resolve_engine_pinned_slc_version() {
   local tag="$1"
   local toml line sdk_version=""
@@ -912,8 +800,6 @@ resolve_versions() {
   if [[ -n "$ARG_SLC_VERSION" ]]; then
     RESOLVED_SLC_TAG="$(version_to_tag "$ARG_SLC_VERSION")"
   else
-    # DEFAULT: the SLC version this resolved engine release was built and fingerprinted against --
-    # NOT language-container-rs's own latest release. See resolve_engine_pinned_slc_version above.
     local sdk_version
     if ! sdk_version="$(resolve_engine_pinned_slc_version "$RESOLVED_ENGINE_TAG")"; then
       return 1
@@ -927,7 +813,6 @@ resolve_versions() {
   return 0
 }
 
-# --- SaaS REST helpers -------------------------------------------------------
 saas_db_reachable() {
   local base url
   base="$(resolve_saas_base)"
@@ -947,12 +832,10 @@ saas_verify_listed() {
   if ! resp="$(curl -fsS -H "Authorization: Bearer $RESOLVED_PAT" "$url" </dev/null 2>&1)"; then
     return 1
   fi
-  # Match the quoted JSON string, not a bare substring: without the quote boundary,
-  # "rustslc.tar.gz" would also match a longer stored name like "rustslc.tar.gz.bak".
+  # Quoted so "x.tar.gz" does not match "x.tar.gz.bak".
   [[ "$resp" == *"\"$filename\""* ]]
 }
 
-# Atomic POST-presigned-then-PUT upload; verifies the file is listed afterwards.
 saas_upload_file() {
   local local_path="$1" filename="$2" base url resp presigned
   base="$(resolve_saas_base)"
@@ -965,11 +848,7 @@ saas_upload_file() {
     err "SaaS upload of $filename failed: the files endpoint response contained no presigned 'url' field. Response: $resp"
     return 1
   fi
-  # No -f here: on a non-2xx response we need the response BODY (the storage host's own error
-  # detail, e.g. an S3 <Error><Code>/<Message> block) to know WHY the PUT was rejected -- -f
-  # would suppress that body along with the status line. -w prints just the status code to
-  # stdout once the body itself is diverted to a file, and stderr is captured separately for a
-  # transport-level failure (connection refused, timeout, ...) that never got an HTTP response.
+  # No -f: a rejected PUT's body carries the storage host's error detail.
   local put_body_file="$WORKDIR/${filename}.put-response" put_err_file="$WORKDIR/${filename}.put-stderr"
   local put_http_code
   if ! put_http_code="$(curl -sS -o "$put_body_file" -w '%{http_code}' -X PUT --upload-file "$local_path" "$presigned" </dev/null 2>"$put_err_file")"; then
@@ -988,43 +867,22 @@ saas_upload_file() {
   return 0
 }
 
-# --- BucketFS helpers (exapump) ----------------------------------------------
-# Prints, space-separated, the --bfs-* overrides passed to every `exapump bucketfs` call. Host,
-# port and write-password are passed only when the caller actually supplied them, leaving those
-# to exapump's own resolution (profile field, then smart default). The bucket is the one exception:
-# ARG_BFS_BUCKET is ALWAYS passed, using its fully-resolved value (explicit --bfs-bucket, or the
-# profile's bfs_bucket via resolve_bfs_bucket_from_profile, or the script's own "default" fallback)
-# -- never left to exapump's own bucket resolution. Without this, dsn/host connectivity mode (which
-# has no profile of its own) could still have exapump silently resolve the bucket from whatever
-# default profile happens to exist in ~/.exapump/config.toml, diverging from the "default" bucket
-# this script assumes when building TARGET_SO_UDF_OBJECT/TARGET_RUST_LANG_SEGMENT -- an upload that
-# succeeds against one bucket while the DDL points at another.
-#
-# The result is meant to be word-split by the caller, so no value may contain whitespace. That is
-# true of a host, a port and a bucket name by construction; a BucketFS write password containing a
-# space is the one unsupported case -- pass it through the profile's bfs_write_password instead.
+# The bucket is always passed so exapump cannot resolve a different one from a default profile
+# than the one the DDL paths name. The output is word-split: a write password containing a space
+# must come from the profile instead.
 exapump_bfs_flags() {
   local out=""
   if [[ -n "$ARG_BFS_HOST" ]]; then out="$out --bfs-host $ARG_BFS_HOST"; fi
   if [[ -n "$ARG_BFS_PORT" ]]; then out="$out --bfs-port $ARG_BFS_PORT"; fi
   out="$out --bfs-bucket $ARG_BFS_BUCKET"
   if [[ -n "$ARG_BFS_WRITE_PASSWORD" ]]; then out="$out --bfs-write-password $ARG_BFS_WRITE_PASSWORD"; fi
-  # dsn/host connectivity mode passes no --profile (see exapump_bucketfs), so exapump >=0.13.0
-  # builds the connection purely from these overrides plus its own BucketFS defaults --
-  # certificate validation ON. Same self-signed-cert story as the SQL DSN's
-  # validateservercertificate=0 a few lines up in host mode: disable it here too, unconditionally,
-  # rather than exposing yet another user-facing flag for a target class (Exasol AsApp/Docker/
-  # on-premise) that is self-signed by default. Profile mode is unaffected -- the profile's own
-  # bfs_validate_certificate/validate_certificate field still governs, exactly as before.
+  # Without a profile, exapump validates certificates; these targets are self-signed by default.
   if [[ "$CONNECTIVITY_MODE" != "profile" ]]; then out="$out --bfs-validate-certificate false"; fi
   printf '%s\n' "${out# }"
   return 0
 }
 
-# Runs `exapump bucketfs <args...>` with this run's connectivity flag and BucketFS overrides
-# appended. Globbing is disabled around the deliberate word-split of exapump_bfs_flags so a '*'
-# inside a password can never expand into file names. stdin is /dev/null so the subprocess cannot
-# consume the piped script body.
+# Globbing is off around the word-split so a '*' in a password cannot expand to file names.
 exapump_bucketfs() {
   local conn_arg="" restore_glob=0 rc
   if [[ "$CONNECTIVITY_MODE" == "profile" ]]; then conn_arg="--profile $ARG_PROFILE"; fi
@@ -1039,24 +897,8 @@ exapump_bucketfs() {
   return "$rc"
 }
 
-# Preflight, analogous to saas_db_reachable: an empty-path listing of the target bucket. exapump
-# resolves the bucket itself (--bfs-bucket / profile), so no path argument is passed -- a bucket
-# name IS NOT a valid path component for `exapump bucketfs ls`. Retried, same shape as
-# bucketfs_wait_for_path: a freshly started Exasol container's SQL port (what this script's own
-# reachability checks and Docker healthchecks key off) can go up before BucketFS's HTTP endpoint
-# is actually listening, so a single-shot check races that startup ordering instead of waiting it
-# out. Same 30-tries/2s budget as VM_RECONCILE_TRIES/POLL_SECONDS: BucketFS coming up is exactly
-# the same kind of "engine subsystem starts asynchronously after the SQL port does" wait, and 5
-# tries/1s (10s) measurably wasn't enough headroom on a live container in CI. tries/sleep_seconds
-# are only ever overridden by the test suite (to run the retry loop with sleep_seconds=0); the one
-# production call site always takes the defaults.
-#
-# Only a connection-level failure ("not reachable", the wording exapump's own connect_error()
-# uses for a network-level failure) is retried -- that's the one shape a not-yet-up BucketFS
-# endpoint can produce. Anything else (a bad write password: "Authentication failed"; a non-2xx
-# HTTP status) is a configuration problem retrying can never fix, so it fails on the first attempt
-# instead of burying the actionable error behind up to tries*sleep_seconds seconds of identical
-# failures.
+# A fresh container's SQL port can open before BucketFS HTTP listens, so this retries, but only
+# on exapump's "not reachable" connection error; anything else is a config error and fails fast.
 # shellcheck disable=SC2120  # $1/$2 are overridden only from install.test.sh
 bucketfs_reachable() {
   local tries="${1:-$BUCKETFS_REACHABLE_TRIES}" sleep_seconds="${2:-$BUCKETFS_REACHABLE_POLL_SECONDS}" i=1 out
@@ -1077,8 +919,6 @@ bucketfs_reachable() {
   return 1
 }
 
-# Uploads one local file to a bucket-relative BucketFS path. Always via `exapump bucketfs cp`,
-# never a raw HTTP PUT.
 bucketfs_upload_file() {
   local local_path="$1" bucket_path="$2" out
   if ! out="$(exapump_bucketfs cp "$local_path" "$bucket_path" 2>&1)"; then
@@ -1089,9 +929,7 @@ bucketfs_upload_file() {
   return 0
 }
 
-# Analogous to saas_verify_listed: lists the parent directory and requires the basename to appear
-# as a WHOLE listing entry. A line-exact comparison (not a substring test) is what keeps
-# 'liblakehouse_engine.so' from matching a stored 'liblakehouse_engine.so.bak'.
+# Line-exact match so 'x.so' does not match 'x.so.bak'.
 bucketfs_verify_listed() {
   local bucket_path="$1" parent base out line
   base="${bucket_path##*/}"
@@ -1109,9 +947,7 @@ EOF_BFS_LS
   return 1
 }
 
-# Bounded retry around bucketfs_verify_listed. BucketFS unpacks an uploaded .tar.gz
-# asynchronously, so a path can be accepted by the PUT and still be absent from the very next
-# listing; this waits for it rather than racing it.
+# BucketFS unpacks an uploaded .tar.gz asynchronously, so the path can lag the upload.
 bucketfs_wait_for_path() {
   local bucket_path="$1" tries="${2:-5}" sleep_seconds="${3:-2}" i=1
   while [[ "$i" -le "$tries" ]]; do
@@ -1128,8 +964,6 @@ bucketfs_wait_for_path() {
   return 1
 }
 
-# Unpacks the engine release archive locally and prints the path of the extracted .so. The
-# BucketFS target uploads that bare .so (see install_engine for why), so the member must exist.
 extract_engine_so() {
   local tarball_path="$1" destdir="$2" so_path out
   if ! out="$(mkdir -p "$destdir" 2>&1)"; then
@@ -1149,87 +983,95 @@ extract_engine_so() {
   return 0
 }
 
-vm_bucket_dir() {
-  printf '%s\n' "$VM_BUCKETFS_ROOT/$BFS_SERVICE/$ARG_BFS_BUCKET"
+exasol_launcher() {
+  exasol "$@" --deployment-dir "$DEPLOYMENT_DIR" </dev/null
 }
 
-vm_slc_dir() {
-  printf '%s\n' "$(vm_bucket_dir)/${TARGET_SLC_BFS_PATH%.tar.gz}"
-}
-
-vm_engine_so_path() {
-  printf '%s\n' "$(vm_bucket_dir)/$TARGET_ENGINE_BFS_PATH"
-}
-
-ssh_vm() {
-  ssh "${SSH_OPTIONS[@]}" -i "$DEPLOYMENT_KEY_PATH" -p "$DEPLOYMENT_SSH_PORT" \
-    "$PERSONAL_SSH_USER@$PERSONAL_SSH_HOST" "$1" </dev/null
-}
-
-scp_to_vm() {
-  scp "${SSH_OPTIONS[@]}" -i "$DEPLOYMENT_KEY_PATH" -P "$DEPLOYMENT_SSH_PORT" \
-    "$1" "$PERSONAL_SSH_USER@$PERSONAL_SSH_HOST:$2" </dev/null
-}
-
-ssh_vm_reachable() {
+launcher_slc_list() {
   local out
-  if ! out="$(ssh_vm true 2>&1)"; then
-    err "the deployment VM is not reachable over SSH at $PERSONAL_SSH_HOST:$DEPLOYMENT_SSH_PORT with key '$DEPLOYMENT_KEY_PATH'. Check that the deployment is running ('exasol status'); the SSH port is reassigned on every start, so a stopped or restarted deployment invalidates it. ssh said: $out"
+  if ! out="$(exasol_launcher slc list --json 2>&1)"; then
+    err "'exasol slc list' failed for deployment '$ARG_DEPLOYMENT'. Check that it is running ('exasol status') and that the launcher is Exasol Personal 2.3 or later ('exasol version'). exasol said: $out"
     return 1
   fi
+  printf '%s\n' "$out"
+}
+
+launcher_slc_action() {
+  local list installed
+  list="$(launcher_slc_list)" || return 1
+  if ! installed="$(jq -r --arg alias "$LAUNCHER_SLC_ALIAS" \
+      '[.[] | select(.type == "custom" and .alias == $alias)] | length' <<<"$list" 2>&1)"; then
+    err "could not parse 'exasol slc list --json' output. jq said: $installed"
+    return 1
+  fi
+  if [[ "$installed" -gt 0 ]]; then printf 'update\n'; else printf 'install\n'; fi
+}
+
+personal_bucket_dir() {
+  printf '%s\n' "$DEPLOYMENT_DIR/$PERSONAL_EXA_RELATIVE_PATH/bucketfs/$BFS_SERVICE/$ARG_BFS_BUCKET"
+}
+
+# Replaced via rename so a UDF VM that already mapped the old .so never reads a half-written file.
+install_engine_so_into_bucket() {
+  local so_path="$1" dest dest_dir out
+  dest_dir="$(personal_bucket_dir)/${TARGET_ENGINE_BFS_PATH%/*}"
+  dest="$(personal_bucket_dir)/$TARGET_ENGINE_BFS_PATH"
+  if ! out="$(mkdir -p "$dest_dir" 2>&1 && cp "$so_path" "$dest.partial" 2>&1 && chmod 0644 "$dest.partial" 2>&1 && mv -f "$dest.partial" "$dest" 2>&1)"; then
+    rm -f "$dest.partial"
+    err "could not write the engine .so to '$dest': $out"
+    return 1
+  fi
+  log "Wrote the engine .so to $dest."
   return 0
 }
 
-push_slc_to_vm() {
-  local tarball="$1" staged="/tmp/lakehouse-rustslc.tar.gz" dest out
-  dest="$(vm_slc_dir)"
-  if ! out="$(scp_to_vm "$tarball" "$staged" 2>&1)"; then
-    err "failed to copy the Rust SLC to '$staged' on the deployment VM. scp said: $out"
-    return 1
-  fi
-  if ! out="$(ssh_vm "set -e; rm -rf '$dest'; mkdir -p '$dest'; tar -xzf '$staged' -C '$dest'; rm -f '$staged'; test -x '$dest/exaudf/exaudfclient'" 2>&1)"; then
-    err "failed to extract the Rust SLC into '$dest' on the deployment VM; the extracted tree must contain an executable exaudf/exaudfclient. ssh said: $out"
-    return 1
-  fi
-  log "Extracted the Rust SLC into $dest on the deployment VM."
-  return 0
-}
-
-push_engine_so_to_vm() {
-  local so_path="$1" staged="/tmp/liblakehouse_engine.so" dest dest_dir out
-  dest="$(vm_engine_so_path)"
-  dest_dir="${dest%/*}"
-  if ! out="$(scp_to_vm "$so_path" "$staged" 2>&1)"; then
-    err "failed to copy the engine .so to '$staged' on the deployment VM. scp said: $out"
-    return 1
-  fi
-  if ! out="$(ssh_vm "set -e; mkdir -p '$dest_dir'; mv -f '$staged' '$dest'; chmod 0644 '$dest'; test -s '$dest'" 2>&1)"; then
-    err "failed to install the engine .so at '$dest' on the deployment VM. ssh said: $out"
-    return 1
-  fi
-  log "Installed the engine .so at $dest on the deployment VM."
-  return 0
-}
-
-vm_wait_for_reconciled_path() {
-  local vm_path="$1" tries="${2:-$VM_RECONCILE_TRIES}" sleep_seconds="${3:-$VM_RECONCILE_POLL_SECONDS}" i=1
-  while [[ "$i" -le "$tries" ]]; do
-    if ssh_vm "test -e '$vm_path'" >/dev/null 2>&1; then
-      log "Verified $vm_path on the deployment VM."
-      return 0
+# The engine registers a newly created bucket directory in bucketfs.conf within seconds; scripts
+# created before that point cannot resolve their /buckets path.
+wait_for_personal_bucket() {
+  local conf="$DEPLOYMENT_DIR/$PERSONAL_EXA_RELATIVE_PATH/bucketfs.conf" i=1 path service bucket rest
+  while [[ "$i" -le "$PERSONAL_BUCKET_TRIES" ]]; do
+    if [[ -r "$conf" ]]; then
+      while read -r path service bucket rest || [[ -n "$path" ]]; do
+        if [[ "$service" == "$BFS_SERVICE" && "$bucket" == "$ARG_BFS_BUCKET" ]]; then
+          return 0
+        fi
+      done <"$conf"
     fi
-    if [[ "$i" -lt "$tries" ]]; then
-      sleep "$sleep_seconds"
+    if [[ "$i" -lt "$PERSONAL_BUCKET_TRIES" ]]; then
+      sleep "$PERSONAL_BUCKET_POLL_SECONDS"
     fi
     i=$((i + 1))
   done
-  err "the deployment VM did not expose '$vm_path' after $tries checks over $((tries * sleep_seconds))s. The copy itself reported success, so check that '$ARG_BFS_BUCKET' is the BucketFS bucket this deployment's database actually reads."
+  err "the database did not register BucketFS bucket '$BFS_SERVICE/$ARG_BFS_BUCKET' in '$conf' after $PERSONAL_BUCKET_TRIES checks. Check that deployment '$ARG_DEPLOYMENT' is running ('exasol status')."
   return 1
 }
 
-# --- Upload dispatch ---------------------------------------------------------
-# The ONE seam between the two target modes: SaaS addresses an upload by its files-API key,
-# BucketFS by its bucket-relative path. Each mode ignores the other's argument.
+deploy_personal_launcher() {
+  local so_path action out
+  log "Installing lakehouse-engine $RESOLVED_ENGINE_VERSION into the deployment's BucketFS directory ..."
+  download_engine || return 1
+  if ! so_path="$(extract_engine_so "$WORKDIR/$ENGINE_ASSET" "$WORKDIR/extracted")"; then
+    return 1
+  fi
+  install_engine_so_into_bucket "$so_path" || return 1
+
+  if [[ "$ARG_SKIP_SLC" -eq 1 ]]; then
+    log "Skipping SLC install (--skip-slc)."
+  else
+    download_slc || return 1
+    action="$(launcher_slc_action)" || return 1
+    log "Running 'exasol slc custom $action --alias $LAUNCHER_SLC_ALIAS' for Rust SLC $RESOLVED_SLC_VERSION (restarts the database) ..."
+    if ! out="$(exasol_launcher slc custom "$action" --alias "$LAUNCHER_SLC_ALIAS" \
+        --language "$LAUNCHER_SLC_LANGUAGE" --source "$WORKDIR/rustslc.tar.gz" --auto-approve 2>&1)"; then
+      err "'exasol slc custom $action' failed for deployment '$ARG_DEPLOYMENT'. exasol said: $out"
+      return 1
+    fi
+  fi
+  wait_for_personal_bucket || return 1
+  create_engine_scripts || return 1
+  return 0
+}
+
 upload_artifact() {
   local local_path="$1" saas_key="$2" bfs_path="$3"
   case "$TARGET_MODE" in
@@ -1239,7 +1081,6 @@ upload_artifact() {
   esac
 }
 
-# --- SQL execution -----------------------------------------------------------
 run_sql() {
   local sql="$1"
   case "$CONNECTIVITY_MODE" in
@@ -1250,7 +1091,6 @@ run_sql() {
   esac
 }
 
-# Filters exapump tabular output down to the first data line.
 extract_query_value() {
   local raw="$1" line
   while IFS= read -r line; do
@@ -1307,8 +1147,6 @@ read_script_languages() {
   printf '%s\n' "$value"
 }
 
-# Appends the fixed RUST segment, or replaces a single existing RUST= segment in place,
-# preserving every other language entry and its order. Yields exactly one RUST= entry.
 compute_script_languages() {
   local current="$1" segment="$2"
   local restore_glob=0
@@ -1341,7 +1179,6 @@ compute_script_languages() {
   printf '%s\n' "$result"
 }
 
-# --- DDL strings -------------------------------------------------------------
 ddl_create_schema() {
   printf 'CREATE SCHEMA IF NOT EXISTS %s' "$1"
 }
@@ -1366,7 +1203,6 @@ version_smoke_sql() {
   printf 'SELECT %s.LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION' "$1"
 }
 
-# --- Install steps -----------------------------------------------------------
 download_release_asset() {
   local repo="$1" tag="$2" asset_name="$3" dest_path="$4"
   local dl_err
@@ -1417,11 +1253,9 @@ register_script_languages() {
 register_slc() {
   log "Installing Rust SLC $RESOLVED_SLC_VERSION ..."
   download_slc || return 1
-  # The SLC goes up as a TARBALL in both modes: BucketFS itself must auto-extract it, because the
-  # RUST alias points at the extracted rustslc/ directory, not at the archive.
+  # Uploaded as a tarball: the RUST alias points at BucketFS's auto-extracted directory.
   upload_artifact "$WORKDIR/rustslc.tar.gz" "rustslc.tar.gz" "$TARGET_SLC_BFS_PATH" || return 1
   if [[ "$TARGET_MODE" == "bucketfs" ]]; then
-    # SaaS verifies synchronously inside saas_upload_file; BucketFS needs the bounded wait.
     bucketfs_wait_for_path "$TARGET_SLC_BFS_PATH" || return 1
   fi
   register_script_languages || return 1
@@ -1446,12 +1280,8 @@ create_engine_scripts() {
   return 0
 }
 
-# Deliberate artifact-shape asymmetry between the two targets:
-#  * SaaS uploads the engine TARBALL and lets the SaaS bucket auto-extract it into the layout
-#    ENGINE_SO_PATH already encodes.
-#  * BucketFS extracts locally and uploads the BARE .so to udf/liblakehouse_engine.so -- the exact
-#    path `make bucketfs-upload-so` has always used and every E2E test's %udf_object points at.
-#    Only the SLC relies on BucketFS archive auto-extraction, in both modes.
+# SaaS uploads the tarball and relies on auto-extraction into ENGINE_SO_PATH; BucketFS uploads the
+# bare .so to the path `make bucketfs-upload-so` and the E2E %udf_object use.
 install_engine() {
   log "Installing lakehouse-engine $RESOLVED_ENGINE_VERSION ..."
   download_engine || return 1
@@ -1469,37 +1299,7 @@ install_engine() {
   return 0
 }
 
-deploy_personal_local() {
-  local so_path
-  if [[ "$ARG_SKIP_SLC" -eq 1 ]]; then
-    log "Skipping SLC upload and registration (--skip-slc)."
-  else
-    log "Installing Rust SLC $RESOLVED_SLC_VERSION over SSH ..."
-    download_slc || return 1
-    push_slc_to_vm "$WORKDIR/rustslc.tar.gz" || return 1
-  fi
-
-  log "Installing lakehouse-engine $RESOLVED_ENGINE_VERSION over SSH ..."
-  download_engine || return 1
-  if ! so_path="$(extract_engine_so "$WORKDIR/$ENGINE_ASSET" "$WORKDIR/extracted")"; then
-    return 1
-  fi
-  push_engine_so_to_vm "$so_path" || return 1
-
-  if [[ "$ARG_SKIP_SLC" -eq 0 ]]; then
-    vm_wait_for_reconciled_path "$(vm_slc_dir)" || return 1
-    register_script_languages || return 1
-  fi
-  vm_wait_for_reconciled_path "$(vm_engine_so_path)" || return 1
-  create_engine_scripts || return 1
-  return 0
-}
-
-# fingerprint-mismatch -> the .so/SLC fingerprint check itself failed; other-error -> any other
-# failure to run the smoke-test query; version-mismatch -> the query succeeded but reported a
-# version different from the release the installer downloaded; pass -> exact match.
-# The fingerprint check precedes the return-code check: the SLC rejects the load with a non-zero
-# return code too, so testing rc first would bury it in the generic error path.
+# Fingerprint is checked before rc: a fingerprint rejection also exits non-zero.
 classify_version_smoke() {
   local rc="$1" output="$2" expected="$3"
   if [[ "$output" == *"Fingerprint mismatch"* ]]; then
@@ -1563,14 +1363,17 @@ print_next_step_template() {
   emit ""
   emit "-- Grant the VS OWNER's scripts CONNECTION access (BEFORE CREATE VIRTUAL SCHEMA). See docs/security.md."
   emit ""
-  if [[ "${installing_user,,}" == "sys" ]]; then
-    emit "-- SYS holds every CONNECTION implicitly; skip the grants."
-  else
-    emit "CREATE ROLE $role;"
-    emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_ADAPTER TO $role;"
-    emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_SCAN TO $role;"
-    emit "GRANT $role TO $installing_user;"
-  fi
+  case "$installing_user" in
+    [Ss][Yy][Ss])
+      emit "-- SYS holds every CONNECTION implicitly; skip the grants."
+      ;;
+    *)
+      emit "CREATE ROLE $role;"
+      emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_ADAPTER TO $role;"
+      emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_SCAN TO $role;"
+      emit "GRANT $role TO $installing_user;"
+      ;;
+  esac
   emit ""
   emit "CREATE VIRTUAL SCHEMA <MY_LAKEHOUSE>"
   emit "USING $schema.LAKEHOUSE_ADAPTER WITH"
@@ -1581,7 +1384,6 @@ print_next_step_template() {
   emit "-- Readers: GRANT SELECT ON SCHEMA <MY_LAKEHOUSE> TO <user>; CREATE OR REPLACE drops ACCESS grants."
 }
 
-# --- Entry point -------------------------------------------------------------
 main() {
   set -uo pipefail
 
@@ -1591,9 +1393,6 @@ main() {
     exit 0
   fi
 
-  # The target mode is resolved FIRST: it doubles as the --account-id/--database-id validation, and
-  # every later step (which fields are required, which tools are needed, which preflight runs)
-  # branches on it.
   if ! TARGET_MODE="$(resolve_target_mode)"; then
     exit 1
   fi
@@ -1613,16 +1412,15 @@ main() {
   fi
   check_prereqs || exit 1
 
-  # Per-target credential derivation + reachability preflight. Both arms must complete before the
-  # first download, so a misconfigured run costs no bytes.
+  # Preflight before any download, so a misconfigured run costs no bytes.
   case "$TARGET_MODE" in
     saas)
       resolve_saas_pat || exit 1
       saas_db_reachable || exit 1
       ;;
     bucketfs)
-      if [[ "$DEPLOYMENT_TRANSPORT" == "ssh" ]]; then
-        ssh_vm_reachable || exit 1
+      if [[ "$DEPLOYMENT_TRANSPORT" == "launcher" ]]; then
+        launcher_slc_list >/dev/null || exit 1
       else
         validate_bucketfs_required || exit 1
         # shellcheck disable=SC2119  # tries/sleep_seconds default; see bucketfs_reachable
@@ -1638,8 +1436,8 @@ main() {
   trap 'rm -rf "$WORKDIR"' EXIT
 
   resolve_versions || exit 1
-  if [[ "$DEPLOYMENT_TRANSPORT" == "ssh" ]]; then
-    deploy_personal_local || exit 1
+  if [[ "$DEPLOYMENT_TRANSPORT" == "launcher" ]]; then
+    deploy_personal_launcher || exit 1
   else
     if [[ "$ARG_SKIP_SLC" -eq 1 ]]; then
       log "Skipping SLC registration (--skip-slc)."

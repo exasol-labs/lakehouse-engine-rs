@@ -8,33 +8,21 @@
 
 ### Context
 
-Issue #193: when a query aliases its table (`FROM CUSTOMER c`), Exasol stamps `tableAlias:"C"`
-on every `column` node in the pushdown request — even for an unqualified `WHERE C_CUSTKEY <= 3`.
-The `crates/vs-expression` renderer honors a present `tableAlias` and emits `"C"."C_CUSTKEY"`,
-which does not resolve against the node-local DataFusion scan relation (bare column names only).
-A spike proved the failure spans every single-table shape: row-scan/projection, a scalar
-expression over a column, single-group aggregate, grouped aggregate, and ordered top-N.
+When a query aliases its table, Exasol stamps `tableAlias` on every column node, and the renderer emits `"C"."C_CUSTKEY"`. That name does not resolve against the single-table DataFusion scan, which has bare column names (issue #193). Every single-table shape fails.
 
 ### Decision
 
-Strip `tableAlias` from the whole single-table `pushdown_req` once, immediately after
-`detect_join` returns `NotAJoin` and before `filter_json_raw`/`extract_projection`. Every
-downstream single-table render site — the filter, select-list expressions, GROUP BY keys,
-HAVING, ORDER BY, aggregate arguments, and Iceberg pruning — consumes the stripped tree.
+The adapter strips `tableAlias` from the whole single-table request once, right after join detection returns not-a-join. Every downstream render site and Iceberg pruning then consume the stripped request.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| One chokepoint in `handle_pushdown`, after the join gate | ✓ Chosen — the single-table scan relation never wants qualified names, so stripping is unconditionally correct at the entry; the filter is rendered upstream of `build_dispatch_sql` and also feeds Iceberg pruning, so this is the one site covering every consumer |
-| Strip at each render site individually (filter, select-list, group keys, agg args, topn) | ✗ Rejected — fragile, duplicates logic, and risks missing a shape (the spike found five failing shapes) |
+| Strip at each render site | Rejected: fragile, duplicates logic, and can miss a shape (the spike found five failing shapes) |
 
 ### Consequences
 
-One deep JSON clone of the `pushdownRequest` per query-planning call, not per node or shard,
-buys a single provably-total site instead of five per-render-site strips that could each miss a
-shape. The join OUTER wrapper's qualified rendering is untouched, since the join path returns
-from `plan_join` before this chokepoint.
+The strip costs one deep JSON clone per query-planning call. The join OUTER wrapper keeps qualified rendering because the join path returns before the strip.
 
 ## ADR: Renderer keeps honoring tableAlias; stripping is the caller's responsibility
 
@@ -44,27 +32,18 @@ from `plan_join` before this chokepoint.
 
 ### Context
 
-The `vs-expression` renderer emits `"ALIAS"."NAME"` whenever a `column` node carries
-`tableAlias`. The join OUTER wrapper (`vs-adapter/pushdown-planning-join-fallback`) depends on
-that qualified rendering. The false assumption that the renderer's default single-table path was
-already alias-free is what caused #193.
+The join OUTER wrapper depends on the renderer emitting qualified `"ALIAS"."NAME"` when a column carries `tableAlias`. The wrong assumption that the single-table path was already alias-free caused #193.
 
 ### Decision
 
-The `vs-expression` renderer continues to emit `"ALIAS"."NAME"` whenever a `column` node carries
-`tableAlias`. The single-table caller strips the alias before rendering. The
-"Bare column reference translates to quoted identifier" scenario and the renderer's doc comment
-now document the caller/renderer contract explicitly.
+The renderer keeps emitting the qualified name, and the single-table caller strips the alias first. The spec scenario and the renderer's doc comment state this contract.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Renderer keeps honoring `tableAlias`; caller strips | ✓ Chosen — the join OUTER wrapper needs qualified rendering; documents the contract explicitly so a future planner does not re-litigate the fix in the wrong layer |
-| Make the renderer drop `tableAlias` | ✗ Rejected — would break the join OUTER wrapper, which is load-bearing on qualified rendering |
+| Renderer drops `tableAlias` | Rejected: breaks the join OUTER wrapper |
 
 ### Consequences
 
-A future single-relation caller must strip `tableAlias` itself before rendering; the renderer
-gives no free alias-free guarantee. The contract is now named in both the spec and the source
-doc comment, closing the gap that caused #193.
+A future single-relation caller must strip `tableAlias` itself, because the renderer gives no alias-free guarantee.

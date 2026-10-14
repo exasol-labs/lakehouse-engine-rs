@@ -1,27 +1,26 @@
 # Feature: Exasol Personal Deployment Install
 
-The install script gains a `--deployment` flag that targets an Exasol Personal instance by name, mirroring the lc-rs install.sh pattern. The deployment backend (local or cloud) is discriminated at runtime from the deployment directory's `deployment.json`. Local backend copies artifacts over SSH into the VM's BucketFS directory; cloud backend resolves connection details from the descriptor and falls through to the existing BucketFS HTTP upload path.
+The install script gains a `--deployment` flag that targets an Exasol Personal instance by name, mirroring the lc-rs install.sh pattern. The deployment backend (local or cloud) is discriminated at runtime from the deployment directory's `deployment.json`. Local backend writes the engine `.so` into the deployment's BucketFS directory and installs the Rust SLC with `exasol slc custom`; cloud backend resolves connection details from the descriptor and falls through to the existing BucketFS HTTP upload path.
 
 ## Background
 
 - Exasol Personal deployments live under `$HOME/.exasol/personal/deployments/<name>/`
 - Each deployment directory contains `deployment.json` (connection details, backend type) and `secrets.json` (DB password)
-- Local backend: no BucketFS HTTP endpoint; artifacts travel over SSH; SQL port is assigned per deployment and read from `deployment.json`
+- Local backend (Exasol Personal 2.3+): no BucketFS HTTP endpoint; BucketFS is the host directory `local/runtime/exa/bucketfs/`, SLCs are installed with `exasol slc custom`; SQL port is assigned per deployment and read from `deployment.json`
 - Cloud backend: exposes ordinary BucketFS HTTP endpoint; requires `--bfs-write-password`
 - The lc-rs project already implements this pattern; this feature mirrors it with the addition of architecture-aware asset selection
-- Bash 3.2+ compatibility required (stock macOS); `jq` is required for deployment descriptor parsing
+- Bash 3.2+ compatibility required (stock macOS); `jq` is required for deployment descriptor parsing, and the `exasol` CLI for a local deployment
 
 ## Scenarios
 
-### Scenario: --deployment with local backend installs over SSH
+### Scenario: --deployment with local backend installs through the deployment directory
 
 * *GIVEN* the install script is invoked with `--deployment my-local-db`
 * *AND* the deployment descriptor at `$HOME/.exasol/personal/deployments/my-local-db/deployment.json` has `"backend": "local"`
 * *WHEN* the install runs
 * *THEN* the script MUST resolve host, port, user, and password from the deployment descriptor and secrets
-* *AND* the script MUST copy artifacts to the VM over SSH using the deployment's node key
-* *AND* the script MUST register with `ALTER SYSTEM` (not `ALTER SESSION`)
-* *AND* the SCRIPT_LANGUAGES update MUST preserve all pre-existing language entries
+* *AND* the script MUST write the engine `.so` into the deployment's BucketFS directory and install the SLC with `exasol slc custom`
+* *AND* the SCRIPT_LANGUAGES registration MUST preserve all pre-existing language entries
 
 ### Scenario: --deployment with cloud backend uses BucketFS HTTP upload
 

@@ -20,6 +20,12 @@ pub struct ConnectionCreds {
     pub account_name: Option<String>,
     pub account_key: Option<String>,
     pub sas_token: Option<String>,
+    /// IAM role to assume via STS.
+    pub aws_assume_role_arn: Option<String>,
+    /// STS `ExternalId`; redacted in `Debug`.
+    pub aws_external_id: Option<String>,
+    /// STS endpoint override.
+    pub aws_sts_endpoint: Option<String>,
 }
 
 impl std::fmt::Debug for ConnectionCreds {
@@ -51,6 +57,12 @@ impl std::fmt::Debug for ConnectionCreds {
                 &self.account_key.as_ref().map(|_| "[redacted]"),
             )
             .field("sas_token", &self.sas_token.as_ref().map(|_| "[redacted]"))
+            .field("aws_assume_role_arn", &self.aws_assume_role_arn)
+            .field(
+                "aws_external_id",
+                &self.aws_external_id.as_ref().map(|_| "[redacted]"),
+            )
+            .field("aws_sts_endpoint", &self.aws_sts_endpoint)
             .finish()
     }
 }
@@ -65,6 +77,12 @@ pub(crate) enum SuppliedCatalogAuth<'a> {
 }
 
 impl ConnectionCreds {
+    /// The IAM role this set names for STS `AssumeRole`, or `None` when
+    /// `aws_assume_role_arn` is unset or empty; the one definition every consumer reads.
+    pub fn assume_role_arn(&self) -> Option<&str> {
+        non_empty(&self.aws_assume_role_arn)
+    }
+
     pub fn has_catalog_auth(&self) -> bool {
         self.token.is_some() || self.client_id.is_some() || self.client_secret.is_some()
     }
@@ -90,10 +108,31 @@ impl ConnectionCreds {
             | (Some(_), Some(_), Some(_)) => SuppliedCatalogAuth::Unauthenticated,
         }
     }
+
+    pub(crate) fn key_secret_values(&self) -> Vec<&str> {
+        key_secrets(
+            &self.access_key,
+            &self.secret_key,
+            self.session_token.as_deref(),
+        )
+    }
 }
 
 pub(crate) fn non_empty(field: &Option<String>) -> Option<&str> {
     field.as_deref().filter(|value| !value.is_empty())
+}
+
+/// The non-empty access key, secret key, and session token, in that order.
+fn key_secrets<'a>(
+    access_key: &'a str,
+    secret_key: &'a str,
+    session_token: Option<&'a str>,
+) -> Vec<&'a str> {
+    [access_key, secret_key]
+        .into_iter()
+        .chain(session_token)
+        .filter(|secret| !secret.is_empty())
+        .collect()
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,18 +186,11 @@ impl Default for StorageProps {
 
 impl StorageProps {
     pub fn secret_values(&self) -> Vec<&str> {
-        let mut secrets = Vec::new();
-        for candidate in [self.access_key.as_str(), self.secret_key.as_str()] {
-            if !candidate.is_empty() {
-                secrets.push(candidate);
-            }
-        }
-        if let Some(token) = self.session_token.as_deref()
-            && !token.is_empty()
-        {
-            secrets.push(token);
-        }
-        secrets
+        key_secrets(
+            &self.access_key,
+            &self.secret_key,
+            self.session_token.as_deref(),
+        )
     }
 }
 
@@ -218,15 +250,9 @@ impl StorageCreds {
         }
     }
 
-    /// Resolves an unstated `path_style` to `false`.
-    ///
-    /// This is the one selector both the adapter-side (`ConnectionCreds`-derived)
-    /// and scan-side (`from_json`-derived) readers call, so resolving here — not in
-    /// `from_json` — guarantees they can never disagree. A parse-time default would
-    /// also destroy the tri-state the vended-credentials path needs to distinguish
-    /// "the operator said nothing" from "the operator said false", since the vended
-    /// resolution must not silently override a response's `s3.path-style-access`
-    /// on a CONNECTION that stated no preference at all.
+    /// Resolves an unstated `path_style` to `false` here, not in `from_json`: the
+    /// vended path needs the unstated tri-state so it does not override a
+    /// response's `s3.path-style-access`.
     pub fn backend(&self, allow_http: bool) -> StorageBackend {
         let azure_cred = match (self.account_key.as_deref(), self.sas_token.as_deref()) {
             (Some(account_key), None) => Some(AdlsCred::AccountKey(account_key.to_string())),

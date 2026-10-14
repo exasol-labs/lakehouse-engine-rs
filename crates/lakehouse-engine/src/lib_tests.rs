@@ -2,6 +2,9 @@ use exasol_udf_sdk::test_support::DefaultsCtx;
 
 use super::ENGINE_VERSION;
 
+#[path = "types/hive_type_cases_tests.rs"]
+pub(crate) mod hive_type_cases;
+
 #[test]
 fn engine_version_is_a_plain_semver_string() {
     assert!(

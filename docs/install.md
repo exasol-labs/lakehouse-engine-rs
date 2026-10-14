@@ -28,10 +28,14 @@ example is a network with no path to GitHub.
   profile, plus any `--bfs-*` overrides you give. If `exapump` is missing, the install script
   offers to fetch and install it for you via its own public installer (auto-confirmed when there
   is no terminal to ask, e.g. the one-liner below) — you still need to configure a profile
-  afterward.
+  afterward. A local Exasol Personal deployment needs the `exapump` binary but no profile: the
+  connection resolves from the deployment directory.
 - `jq`, but only if you use `--deployment` to target an Exasol Personal deployment. It parses the
   deployment descriptor (`deployment.json`) to resolve connection details and backend. SaaS and
   BucketFS targets don't need it.
+- The Exasol Personal [`exasol` launcher CLI](https://github.com/exasol/exasol-personal), but only
+  for a local Exasol Personal deployment (2.3+). The install script requires it even with
+  `--skip-slc`, and otherwise installs the Rust SLC with `exasol slc custom`.
 
 ## Install with one command
 
@@ -89,10 +93,11 @@ curl -fsSL -H "Accept: application/vnd.github.raw" \
 | bash -s -- --deployment my-local-db
 ```
 
-- A **local** deployment (running on this machine) has no BucketFS HTTP endpoint, so the script
-  installs over SSH instead, using the deployment's own node key. Architecture auto-detects from
-  the host's `uname -m` unless you pass `--arch` explicitly — Personal-local on Apple Silicon
-  auto-detects as `aarch64`.
+- A **local** deployment (Exasol Personal 2.3+, running on this machine) has no BucketFS HTTP
+  endpoint, so the script writes the engine into the deployment's BucketFS directory and installs
+  the SLC with `exasol slc custom`. This needs the `exasol` CLI on PATH. Architecture
+  auto-detects from the host's `uname -m` unless you pass `--arch` explicitly — Personal-local on
+  Apple Silicon auto-detects as `aarch64`.
 - A **cloud** deployment (backend other than `local`) uses the existing BucketFS HTTP upload path
   and needs `--bfs-write-password`, since Exasol Personal provisions no BucketFS password for you:
 
@@ -131,16 +136,16 @@ in-place language-list update. Run it again on a prior install to upgrade it.
 | `--account-id <id>` | SaaS target only. SaaS account ID, from the SaaS web console. |
 | `--database-id <id>` | SaaS target only. SaaS database ID, from the SaaS web console. |
 | `--staging` | SaaS target only. Targets `cloud-staging.exasol.com` instead of `cloud.exasol.com`. |
-| `--bfs-host <host>` | BucketFS target only. Default: the profile's `bfs_host`, else its host. |
-| `--bfs-port <port>` | BucketFS target only. Default: the profile's `bfs_port`, else `2581`. |
-| `--bfs-bucket <name>` | BucketFS target only. Default: `default`. |
-| `--bfs-write-password <p>` | BucketFS target only. Default: the profile's `bfs_write_password`. |
+| `--bfs-host <host>` | BucketFS target only. Default: the profile's `bfs_host`, else its host. Rejected for a local Exasol Personal deployment. |
+| `--bfs-port <port>` | BucketFS target only. Default: the profile's `bfs_port`, else `2581`. Rejected for a local Exasol Personal deployment. |
+| `--bfs-bucket <name>` | BucketFS target only, including a local Exasol Personal deployment. Default: `default`. |
+| `--bfs-write-password <p>` | BucketFS target only. Default: the profile's `bfs_write_password`. Rejected for a local Exasol Personal deployment. |
 | `--target <saas\|bucketfs>` | Both targets. Asserts the target you expect. If it does not match the detected target, the command stops with an error. |
 | `--schema <name>` | Both targets. Default: `LHVS`. |
 | `--lakehouse-version <v>` | Both targets. Pins the engine version. Default: latest release. |
-| `--slc-version <v>` | Both targets. Pins the SLC version. Default: latest release. |
+| `--slc-version <v>` | Both targets. Pins the SLC version. Default: the version the engine release pins through its `exasol-udf-sdk` dependency. |
 | `--skip-slc` | Both targets. Skips the SLC download and registration. Every other step still runs. |
-| `--arch <x86_64\|aarch64>` | Both targets. Default: `x86_64`. Selects unsuffixed vs `-aarch64`-suffixed release assets. |
+| `--arch <x86_64\|aarch64>` | Both targets. Default: `x86_64`, or the host's architecture for a local Exasol Personal deployment. Selects unsuffixed vs `-aarch64`-suffixed release assets. |
 | `--help` | Prints this reference. Needs no network access and no credentials. |
 
 `--account-id` and `--database-id` together select the SaaS target. Neither flag selects the
@@ -171,7 +176,7 @@ creation, and the smoke test.
 ## Point the VS at your data
 
 Two statements finish the install: a catalog `CONNECTION`, then the Virtual Schema over it. The
-following example is a complete local setup with MinIO and an Iceberg REST catalog, run as a DBA.
+following example is a complete local setup with SeaweedFS and an Iceberg REST catalog, run as a DBA.
 A non-DBA needs `GRANT ACCESS ON CONNECTION ... FOR SCRIPT` for both scripts, plus
 `EXECUTE ON SCRIPT` on all three of `LAKEHOUSE_ADAPTER`, `LAKEHOUSE_SCAN`, and
 `LAKEHOUSE_DISTRIBUTE_FILES`, before `CREATE VIRTUAL SCHEMA` — see [Security](security.md).
@@ -185,10 +190,10 @@ CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
   USER ''
   IDENTIFIED BY '{
     "warehouse":  "s3://warehouse/",
-    "endpoint":   "http://minio:9000",
+    "endpoint":   "http://seaweedfs:8333",
     "region":     "us-east-1",
-    "access_key": "minioadmin",
-    "secret_key": "minioadmin",
+    "access_key": "lhadmin",
+    "secret_key": "lhadminsecret123",
     "path_style": true
   }';
 
@@ -200,7 +205,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 ```
 
 `NAMESPACE` exposes **every table in that namespace** as a virtual table. `ALLOW_HTTP =
-'true'` permits plain-HTTP catalog and S3 access. Local MinIO needs this property.
+'true'` permits plain-HTTP catalog and S3 access. Local SeaweedFS needs this property.
 
 - **AWS Glue, Lakekeeper, Unity Catalog (Delta tables), and the full credential-JSON reference** are in [Catalogs](catalogs.md).
 - **Tuning properties** (`PARALLELISM_FACTOR`, memory pool sizing, DataFusion partitions/threads,
@@ -224,11 +229,11 @@ matrix, see [Capabilities](capabilities.md).
 
 The adapter UDF runs **inside** the Exasol container. Every address in the CONNECTION and in the
 VS properties must resolve from there. Use internal hostnames, for example `iceberg-rest` and
-`minio`. Never use `localhost` or the Docker host gateway.
+`seaweedfs`. Never use `localhost` or the Docker host gateway.
 
 ## Local dev stack
 
-For an evaluation or a throwaway environment, use `docker-compose.yml`. It starts Exasol, MinIO,
+For an evaluation or a throwaway environment, use `docker-compose.yml`. It starts Exasol, SeaweedFS,
 and an Iceberg REST catalog:
 
 ```sh
@@ -239,7 +244,7 @@ These are the default host ports. Environment variables override them.
 
 - Exasol SQL `28563`
 - BucketFS `22581`
-- MinIO `19000`
+- SeaweedFS `19000`
 - Iceberg REST `18181`
 
 You can reach this local Exasol from your machine. Install to it with the
@@ -262,7 +267,7 @@ Port overrides (host side). The defaults match `docker-compose.yml`:
 |---|---|---|
 | `LH_EXASOL_PORT` | `28563` | Exasol SQL |
 | `LH_BUCKETFS_PORT` | `22581` | BucketFS |
-| `LH_MINIO_PORT` | `19000` | MinIO S3 |
+| `LH_SEAWEEDFS_PORT` | `19000` | SeaweedFS S3 |
 | `LH_REST_PORT` | `18181` | Iceberg REST |
 
 ---

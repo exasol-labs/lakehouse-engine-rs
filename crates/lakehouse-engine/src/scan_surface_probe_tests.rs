@@ -1,4 +1,3 @@
-//! Compile-time reachability probe for the `scan` module's public surface.
 #![allow(unused_imports)]
 
 use crate::scan::spec::{CommonScanSpec, JoinSpec, ScanStorage};
