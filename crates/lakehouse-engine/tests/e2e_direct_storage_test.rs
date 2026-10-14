@@ -1705,13 +1705,35 @@ fn stat_aggregates_match_native_exasol() {
             1e-9,
         );
     }
-    assert_matches_native(
-        &mut conn,
-        "G",
-        "GROUP BY G HAVING VARIANCE(C) = 0 AND STDDEV(D) = 0 ORDER BY G",
-        1,
-        0.0,
-    );
+    let having = "HAVING VARIANCE(C) = 0 AND STDDEV(D) = 0";
+    for (select, tail, keys, rows) in [
+        (
+            "G, VARIANCE(C), STDDEV(D)",
+            format!("GROUP BY G {having} ORDER BY G"),
+            1,
+            3,
+        ),
+        (
+            "VARIANCE(C), STDDEV(D)",
+            format!("WHERE G = 'A' {having}"),
+            0,
+            1,
+        ),
+        (
+            "VARIANCE(C), STDDEV(D)",
+            format!("WHERE G = 'B' {having}"),
+            0,
+            0,
+        ),
+    ] {
+        let sql = format!("SELECT {select} FROM {DIRECT_STATS} {tail}");
+        assert!(
+            explain_virtual_sql(&mut conn, &sql).contains("PARTIAL_stat_m2_"),
+            "HAVING must merge over the stat partials, not fall back: {sql}"
+        );
+        assert_eq!(conn.query_row_count(&sql), rows, "{sql}");
+        assert_matches_native(&mut conn, select, &tail, keys, 0.0);
+    }
     // docs/semantic-differences.md: about 9 digits when the mean is 1e8 times the deviation.
     assert_matches_native(
         &mut conn,

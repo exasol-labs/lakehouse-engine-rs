@@ -95,7 +95,7 @@ being pushed as a partial/merge plan.
 * *WHEN* the statistical aggregates run with and without GROUP BY
 * *THEN* each result SHALL match native Exasol within a relative tolerance of 1e-9 while the average is at most 1e6 times the standard deviation
 * *AND* a group whose non-NULL values are all equal SHALL return exactly `0`, also when they come from several shards
-* *AND* `HAVING VARIANCE(col) = 0` SHALL keep the same groups as native Exasol
+* *AND* a `HAVING VARIANCE(col) = 0` that the adapter merges over the partials SHALL keep the same groups as native Exasol, with and without GROUP BY
 * *AND* a larger ratio of average to standard deviation SHALL lose at most the precision `docs/semantic-differences.md` states
 
 ### Scenario: Adapter falls back for non-decomposable aggregates
