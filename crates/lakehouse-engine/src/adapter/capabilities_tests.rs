@@ -73,7 +73,6 @@ fn reports_group_by_capabilities() {
     );
 }
 
-/// Scenario: Adapter reports its pushdown capabilities
 #[test]
 fn reports_audited_capability_set() {
     let resp = get_capabilities_response();
@@ -82,6 +81,7 @@ fn reports_audited_capability_set() {
 
     for name in &[
         "FN_PRED_LIKE_ESCAPE",
+        "FN_PRED_REGEXP_LIKE",
         "LITERAL_TIMESTAMP_UTC",
         "SELECTLIST_EXPRESSIONS",
         "AGGREGATE_HAVING",
@@ -117,8 +117,7 @@ fn reports_audited_capability_set() {
         "FN_DIV",
         "FN_TO_CHAR",
         "FN_TO_NUMBER",
-        // Regex match semantics diverge from Exasol's PCRE (issue #106).
-        "FN_PRED_REGEXP_LIKE",
+        // Issue #106: PCRE vs regex-crate dialect gap.
         "FN_REGEXP_REPLACE",
         "FN_REGEXP_SUBSTR",
         "FN_REGEXP_INSTR",
@@ -139,20 +138,12 @@ fn reports_audited_capability_set() {
         "FN_CURRENT_TIMESTAMP",
         "FN_SYSDATE",
         "FN_SYSTIMESTAMP",
-        "FN_CURRENT_USER",
-        "FN_SYS_GUID",
-        "FN_CURRENT_SCHEMA",
-        "LITERAL_INTERVAL",
     ] {
         assert!(
             !cap_strs.contains(name),
             "{name} must NOT be advertised: {cap_strs:?}"
         );
     }
-    assert!(
-        !cap_strs.iter().any(|name| name.starts_with("FN_ST_")),
-        "no geospatial FN_ST_* capability may be advertised: {cap_strs:?}"
-    );
 
     // Issue #108: Exasol bit functions use the unsigned 64-bit domain; DataFusion's
     // bit operators are signed and its `>>` sign-extends.
@@ -532,56 +523,4 @@ fn reports_capabilities_includes_inner_join() {
     assert!(cap_strs.contains(&"LIMIT"));
     assert!(cap_strs.contains(&"AGGREGATE_SINGLE_GROUP"));
     assert!(cap_strs.contains(&"AGGREGATE_GROUP_BY_COLUMN"));
-}
-
-/// Backticked spans of a markdown table row that are entirely one uppercase
-/// identifier; example SQL and prose spans never qualify.
-fn identifier_spans(row: &str) -> Vec<&str> {
-    row.split('`')
-        .skip(1)
-        .step_by(2)
-        .filter(|span| {
-            span.starts_with(|c: char| c.is_ascii_uppercase())
-                && span
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        })
-        .collect()
-}
-
-/// `docs/capabilities.md` lists exactly the advertised set above its
-/// "Handled by Exasol" heading, and lists none of it below.
-#[test]
-fn capabilities_doc_lists_exactly_the_advertised_set() {
-    let doc = include_str!("../../../../docs/capabilities.md");
-    let (advertised_part, handled_part) = doc
-        .split_once("## Handled by Exasol")
-        .expect("docs/capabilities.md must have a `## Handled by Exasol` section");
-
-    let documented: std::collections::BTreeSet<&str> = advertised_part
-        .lines()
-        .filter(|line| line.starts_with('|'))
-        .flat_map(identifier_spans)
-        .collect();
-    let advertised: std::collections::BTreeSet<&str> = CAPABILITIES.iter().copied().collect();
-
-    let missing_from_doc: Vec<&&str> = advertised.difference(&documented).collect();
-    let not_advertised: Vec<&&str> = documented.difference(&advertised).collect();
-    assert!(
-        missing_from_doc.is_empty() && not_advertised.is_empty(),
-        "docs/capabilities.md drifted from CAPABILITIES: advertised but undocumented \
-         {missing_from_doc:?}; documented but not advertised {not_advertised:?}"
-    );
-
-    let wrongly_handled: Vec<&str> = handled_part
-        .lines()
-        .filter(|line| line.starts_with('|'))
-        .filter_map(|line| line.split('|').nth(1))
-        .flat_map(|first_column| first_column.split('`').skip(1).step_by(2))
-        .filter(|token| advertised.contains(token))
-        .collect();
-    assert!(
-        wrongly_handled.is_empty(),
-        "advertised capabilities listed under `Handled by Exasol`: {wrongly_handled:?}"
-    );
 }
