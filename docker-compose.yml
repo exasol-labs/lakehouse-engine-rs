@@ -78,7 +78,7 @@ services:
     privileged: true
     # A CPU set, not `cpus:`: the UDF sandbox has no cgroup fs, so only
     # affinity is visible to core-count detection (#421).
-    cpuset: "${LH_EXASOL_CPUSET:-0-3}"
+    cpuset: "${LH_EXASOL_CPUSET:-}"
     # UDF sandboxes need far more than Docker's 64 MB default.
     shm_size: "2g"
     # init-sc reads no EXA_* env vars; DB runs at image defaults (SYS password `exasol`).

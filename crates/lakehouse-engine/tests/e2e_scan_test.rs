@@ -1086,22 +1086,38 @@ fn create_vs_omits_cluster_nodes_from_adapter_notes() {
     );
 }
 
+/// Scenario: The adapter VM detects the Docker container's CPU affinity set
 #[test]
 fn adapter_detects_container_cpuset() {
     setup_e2e();
 
-    let cpuset_cores = exasol_container_cpuset_cores();
+    let container = exasol_container();
+    let original = exasol_container_cpuset(&container);
+    let cpus = cpu_ids(&original);
+    assert!(
+        cpus.len() >= 3,
+        "PRECONDITION UNMET: the Exasol container's CPU set {original:?} must name at \
+         least 3 CPUs, so the test can narrow it to 2 or more CPUs and stay distinct \
+         from the undetectable-platform fallback of 1"
+    );
+    let narrowed = cpus[..cpus.len() - 1]
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let _restore = CpusetGuard::narrow(&container, &original, &narrowed);
+
+    let cpuset_cores = cpu_ids(&exasol_container_cpuset(&container)).len();
     let host_cores = std::thread::available_parallelism()
         .expect("the test host must report a core count")
         .get();
     assert!(
         cpuset_cores < host_cores,
-        "PRECONDITION UNMET: the Exasol container's CPU set must name fewer CPUs \
+        "PRECONDITION UNMET: the narrowed CPU set must name fewer CPUs \
          ({cpuset_cores}) than this host's core count ({host_cores}). At an equal \
          cardinality the assertion below holds whether the adapter reads the \
          container's CPU set or the unconstrained host, so it would record no \
-         evidence. Narrow LH_EXASOL_CPUSET to a smaller set of CPUs and recreate \
-         the container."
+         evidence."
     );
 
     let mut conn = exa_conn();
@@ -1136,12 +1152,51 @@ fn adapter_detects_container_cpuset() {
     );
 }
 
-/// Read inside the container rather than from this process's environment.
-fn exasol_container_cpuset_cores() -> usize {
-    let container = exasol_container();
+struct CpusetGuard {
+    container: String,
+    original: String,
+}
+
+impl CpusetGuard {
+    fn narrow(container: &str, original: &str, narrowed: &str) -> Self {
+        docker_update_cpuset(container, narrowed).unwrap_or_else(|e| panic!("{e}"));
+        Self {
+            container: container.to_string(),
+            original: original.to_string(),
+        }
+    }
+}
+
+impl Drop for CpusetGuard {
+    fn drop(&mut self) {
+        if let Err(e) = docker_update_cpuset(&self.container, &self.original)
+            && !std::thread::panicking()
+        {
+            panic!("restoring the CPU set: {e}");
+        }
+    }
+}
+
+fn docker_update_cpuset(container: &str, cpus: &str) -> Result<(), String> {
+    let out = std::process::Command::new("docker")
+        .args(["update", "--cpuset-cpus", cpus, container])
+        .output()
+        .map_err(|e| format!("docker update {container}: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "docker update --cpuset-cpus {cpus} {container} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+fn exasol_container_cpuset(container: &str) -> String {
     let path = "/sys/fs/cgroup/cpuset.cpus.effective";
     let out = std::process::Command::new("docker")
-        .args(["exec", &container, "cat", path])
+        .args(["exec", container, "cat", path])
         .output()
         .unwrap_or_else(|e| panic!("docker exec {container} to read {path}: {e}"));
     assert!(
@@ -1153,30 +1208,26 @@ fn exasol_container_cpuset_cores() -> usize {
     let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(
         !raw.is_empty(),
-        "{path} in {container} is empty, so the container is pinned to no CPU at \
-         all — set LH_EXASOL_CPUSET to a set of CPUs this host has and recreate \
-         the container"
+        "{path} in {container} is empty, so the container is pinned to no CPU at all"
     );
-    raw.split(',')
-        .map(|entry| {
+    raw
+}
+
+fn cpu_ids(list: &str) -> Vec<usize> {
+    list.split(',')
+        .flat_map(|entry| {
             let (first, last) = entry.split_once('-').unwrap_or((entry, entry));
             let cpu_id = |bound: &str| {
                 bound.parse::<usize>().unwrap_or_else(|e| {
                     panic!(
-                        "{path} in {container} reads {raw:?}, whose entry {entry:?} is \
-                         neither a CPU id nor an inclusive range of them ({e})"
+                        "CPU list {list:?} has entry {entry:?}, which is neither a CPU id \
+                         nor an inclusive range of them ({e})"
                     )
                 })
             };
-            let (first, last) = (cpu_id(first), cpu_id(last));
-            assert!(
-                first <= last,
-                "{path} in {container} reads {raw:?}, whose entry {entry:?} names a \
-                 descending range"
-            );
-            last - first + 1
+            cpu_id(first)..=cpu_id(last)
         })
-        .sum()
+        .collect()
 }
 
 #[test]
