@@ -34,7 +34,7 @@ The enforcing sweep test MUST read the same declaration rather than a parallel h
 
 Together these make Exasol-dialect coverage structural rather than reviewed, with the two links stated precisely: an undeclared name cannot be translated at all (dispatch-enforced), and a declared name cannot lack a sweep row (test-enforced). A `VerbatimCall` name's Exasol rendering is produced by the declaration's own branch, which no per-name arm can reach, so it cannot diverge from the name Exasol sent. A `Shaped` name's Exasol rendering still lives in its arm, so its correctness rests on the sweep row the test forces it to have.
 
-The full filter-predicate operator set — comparison, logical connectives, IS NULL / IS NOT NULL, IN over a constant list (including the NULL-stripping rule Exasol's IN-list semantics require), BETWEEN, and LIKE — is specified in `sql-comprehension/vs-expression-translator-predicates`, which also records that `REGEXP_LIKE` is not translated.
+The full filter-predicate operator set — comparison, logical connectives, IS NULL / IS NOT NULL, IN over a constant list (including the NULL-stripping rule Exasol's IN-list semantics require), BETWEEN, and LIKE — is specified in `sql-comprehension/vs-expression-translator-predicates`.
 <!-- /DELTA:CHANGED -->
 
 ## Scenarios

@@ -53,9 +53,7 @@ both dialects, because verbatim is either impossible or wrong for them:
 | `CAST` | The target type, not the name, is what differs: an Exasol character target needs an explicit length and an Exasol `TIMESTAMP` target needs an explicit precision. Its per-dialect rendering is specified in `sql-comprehension/vs-expression-translator-cast` and is unchanged by this feature. |
 | `function_scalar` named `CASE` | Exasol's interleaved-argument CASE encoding; both dialects render `CASE WHEN … THEN … END`, so there is no call form to render verbatim. This is the `function_scalar`+`name=CASE` alternate encoding, distinct from the `function_scalar_case` node type scenario below. |
 
-`REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`, and `REGEXP_COUNT` are not
-translated in either dialect, and Exasol evaluates them (issue #106, (#TBD)), because DataFusion's
-Rust `regex` matching does not reproduce Exasol's PCRE matching.
+The regular-expression functions are not translated in either dialect (issue #106, #471).
 <!-- /DELTA:CHANGED -->
 
 ## Scenarios
@@ -67,5 +65,5 @@ Rust `regex` matching does not reproduce Exasol's PCRE matching.
 * *WHEN* `render_expression` processes the node in raising mode
 * *THEN* the translator SHALL return the error `unsupported scalar function: <NAME>`
 * *AND* `render_expression_safe` SHALL return `None` for the same node without panicking, and `render_expression_exasol` / `render_expression_exasol_safe` SHALL decline these five names identically — one capability set serves both dialects, so the Exasol dialect's verbatim rule MUST NOT widen the translated set
-* *AND* the adapter SHALL NOT advertise `FN_PRED_REGEXP_LIKE`, `FN_REGEXP_REPLACE`, `FN_REGEXP_SUBSTR`, `FN_REGEXP_INSTR`, or `FN_REGEXP_COUNT`, so Exasol evaluates each of them (see `pushdown-capabilities/pushdown-planning-string-conversion-capability`)
+* *AND* the adapter SHALL NOT advertise `FN_PRED_REGEXP_LIKE`, `FN_REGEXP_REPLACE`, `FN_REGEXP_SUBSTR`, `FN_REGEXP_INSTR`, or `FN_REGEXP_COUNT`, so Exasol evaluates each of them
 <!-- /DELTA:CHANGED -->

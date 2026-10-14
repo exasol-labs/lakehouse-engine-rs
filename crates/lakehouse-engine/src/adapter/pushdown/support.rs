@@ -635,12 +635,12 @@ fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Option<Json>) -> Option<
     f(&out)
 }
 
-/// Make a pushed-down `LIKE` / `REGEXP_LIKE` filter type-safe for the DataFusion
-/// scan, using the column-type map from [`extract_all_column_types`].
+/// Make a pushed-down `LIKE` filter type-safe for the DataFusion scan, using the
+/// column-type map from [`extract_all_column_types`].
 ///
-/// Exasol implicitly casts a non-string `LIKE`/`REGEXP_LIKE` subject to VARCHAR
-/// before matching; DataFusion has no such coercion, so a pushed-down `LIKE` over a
-/// DATE / DECIMAL / integer column hard-fails at scan time
+/// Exasol implicitly casts a non-string `LIKE` subject to VARCHAR before matching;
+/// DataFusion has no such coercion, so a pushed-down `LIKE` over a DATE / DECIMAL /
+/// integer column hard-fails at scan time
 /// (`There isn't a common type to coerce <Type> and Utf8 in LIKE expression`,
 /// issue #207). A `LIKE` `column` node never carries a `dataType` on the wire —
 /// column types live only in `involvedTables[0].columns` — so this type-aware
@@ -655,8 +655,8 @@ fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Option<Json>) -> Option<
 /// `function_scalar_case`, under a comparison predicate's `left`/`right`, or inside a
 /// scalar function's `arguments` is now reached the same as one sitting directly
 /// under a junction — the #207 blind spot that narrower traversal left open is
-/// closed. Any node that is not itself a `predicate_like`/`predicate_like_regexp` is
-/// returned unchanged by the closure below; this guard only inspects `LIKE` subjects.
+/// closed. Any node that is not itself a `predicate_like` is returned unchanged by
+/// the closure below; this guard only inspects `LIKE` subjects.
 ///
 /// Widening the reach widens the decline trade [`guard_like_subject`] already made,
 /// in two different directions depending on why it declines. Where the subject's
@@ -669,9 +669,8 @@ fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Option<Json>) -> Option<
 /// reached it — may now decline a filter that would have pushed down and worked:
 /// slower, never wrong.
 ///
-/// At each `predicate_like` / `predicate_like_regexp` whose `expression` (subject)
-/// is a bare `column` node, the subject name is uppercased and looked up in
-/// `col_types`, then dispatched:
+/// At each `predicate_like` whose `expression` (subject) is a bare `column` node,
+/// the subject name is uppercased and looked up in `col_types`, then dispatched:
 ///
 /// | Exasol type | Action |
 /// |-------------|--------|
@@ -693,7 +692,7 @@ fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Option<Json>) -> Option<
 /// [`rewrite_expr_tree`] is post-order, so a `LIKE` node's `expression` (subject) and
 /// `pattern` are rewritten BEFORE the node itself is dispatched to
 /// [`guard_like_subject`]. That descent cannot disturb the dispatch: the per-node
-/// closure acts on the two `LIKE` node types and clones everything else, so a bare
+/// closure acts on `predicate_like` nodes and clones everything else, so a bare
 /// `column` subject (and a literal pattern) comes back as the same value and
 /// [`guard_like_subject`] sees exactly the node it would have seen without the
 /// descent. The `function_scalar_cast` the DATE arm wraps the subject in is
@@ -716,7 +715,7 @@ fn like_subject_type_guard(filter: &Json, col_types: &[(String, String)]) -> Opt
     rewrite_expr_tree(
         filter,
         &|out: &Json| match out.get("type").and_then(|t| t.as_str()) {
-            Some("predicate_like" | "predicate_like_regexp") => guard_like_subject(out, col_types),
+            Some("predicate_like") => guard_like_subject(out, col_types),
             _ => Some(out.clone()),
         },
     )
@@ -750,9 +749,8 @@ fn column_exa_type<'t>(node: &Json, col_types: &'t [(String, String)]) -> Option
         .map(|(_, t)| t.as_str())
 }
 
-/// Type-check and, if needed, rewrite a single `predicate_like` /
-/// `predicate_like_regexp` node. See [`like_subject_type_guard`] for the dispatch
-/// table; returns `None` to decline the whole filter.
+/// Type-check and, if needed, rewrite a single `predicate_like` node. See
+/// [`like_subject_type_guard`] for the dispatch table; `None` declines the filter.
 fn guard_like_subject(like_node: &Json, col_types: &[(String, String)]) -> Option<Json> {
     let subject = like_node.get("expression");
 
@@ -1378,8 +1376,7 @@ pub(super) fn project_columns(
                     | "predicate_between"
                     | "predicate_is_null"
                     | "predicate_is_not_null"
-                    | "predicate_notequal"
-                    | "predicate_like_regexp" => {
+                    | "predicate_notequal" => {
                         // Scalar expression node — try to render it.
                         match render_expression_safe(e) {
                             Some(sql_frag) => {

@@ -2,8 +2,9 @@
 //!
 //! Exercises the full advertised → translated → executed path for each newly
 //! advertised capability group: math/string/date scalar functions in filters,
-//! REGEXP_LIKE, scalar select-list expressions, HAVING, STDDEV/VARIANCE, and
-//! CAST / unary-minus (NEG) / WEEK (#104, #105, #107).
+//! scalar select-list expressions, HAVING, STDDEV/VARIANCE, and
+//! CAST / unary-minus (NEG) / WEEK (#104, #105, #107). It also proves that
+//! `REGEXP_LIKE`, which is not advertised, returns the rows native Exasol returns.
 //!
 //! Shares the same Exasol + MinIO + Iceberg stack and seed table as
 //! `e2e_scan_test.rs`.  The setup (SLC install, BucketFS upload, VS creation)
@@ -349,51 +350,95 @@ fn e2e_date_functions_in_filter() {
 // 8.5  REGEXP_LIKE in WHERE filter
 // ---------------------------------------------------------------------------
 
-/// REGEXP_LIKE in a WHERE filter pushes down and returns correct rows.
+/// Sorted integer values of the first result column; an empty result set
+/// carries no columns, so it yields an empty list.
+fn ids_of_first_column(conn: &mut ExaConn, sql: &str) -> Vec<i64> {
+    let mut ids: Vec<i64> = conn
+        .query_columns(sql)
+        .first()
+        .map(|col| col.iter().map(parse_int).collect())
+        .unwrap_or_default();
+    ids.sort_unstable();
+    ids
+}
+
+/// Scenario: Regexp scalar functions are deliberately not translated
 ///
-/// Pattern `event-0[0-9]` matches names event-01..event-09 → 9 rows (id 1..9).
-/// event-10..20 have two digits after the dash and do NOT match `0[0-9]`.
+/// Exasol matches the whole string with PCRE semantics. Over the seeded names
+/// `event-01`..`event-20`, `'event-1'` matches nothing, an alternation with an
+/// optional group matches nothing, and a look-around matches three rows. A
+/// substring or Rust-regex evaluation returns 10, 20 rows, or a scan error.
+/// The native count over an identical generated column pins each expectation.
+///
+/// A sibling `AND` comparison is still pushed while the regex predicate stays in
+/// Exasol; id 4 satisfies `id < 5` but not the pattern, so a dropped regex
+/// predicate returns four rows instead of three.
 #[test]
-fn e2e_regexp_like_in_filter() {
+fn e2e_regexp_like_returns_native_rows() {
     setup_e2e();
     let mut conn = exa_conn();
 
+    let cases: [(&str, Vec<i64>); 4] = [
+        ("name REGEXP_LIKE 'event-1'", vec![]),
+        ("NOT (name REGEXP_LIKE 'event-1')", (1..=20).collect()),
+        ("name REGEXP_LIKE '(e|ev)(e|ent-01)?'", vec![]),
+        ("name REGEXP_LIKE '(?=event-0[1-3]).*'", vec![1, 2, 3]),
+    ];
+
+    for (predicate, expected_ids) in cases {
+        let native_sql = format!(
+            "SELECT COUNT(*) FROM (SELECT 'event-' || LPAD(TO_CHAR(LEVEL), 2, '0') AS name \
+             FROM DUAL CONNECT BY LEVEL <= 20) WHERE {predicate}"
+        );
+        let native_count = conn.query_scalar_i64(&native_sql);
+        assert_eq!(
+            native_count,
+            expected_ids.len() as i64,
+            "native Exasol must return {} rows for `{predicate}`; the fixture no longer \
+             discriminates this predicate",
+            expected_ids.len()
+        );
+
+        let sql = format!("SELECT id FROM {} WHERE {predicate}", vs_table());
+        let ids = ids_of_first_column(&mut conn, &sql);
+        assert_eq!(
+            ids, expected_ids,
+            "`{predicate}` over the virtual schema must return the native rows"
+        );
+    }
+
     let sql = format!(
-        "SELECT id, name FROM {} WHERE name REGEXP_LIKE 'event-0[0-9]' ORDER BY id",
+        "SELECT id, name FROM {} WHERE id < 5 AND name REGEXP_LIKE 'event-0[1-3]'",
         vs_table()
     );
-    let cols = conn.query_columns(&sql);
-    assert_eq!(cols.len(), 2, "expected 2 columns (id, name): {cols:?}");
 
-    // event-01..event-09 → 9 rows.
-    let expected_count = 9i64;
+    let request = explain_virtual_pushdown_request(&mut conn, &sql);
+    let filter = &request["filter"];
     assert_eq!(
-        cols[0].len() as i64,
-        expected_count,
-        "REGEXP_LIKE(name, 'event-0[0-9]') must return {expected_count} rows, got {}",
-        cols[0].len()
+        filter["type"], "predicate_less",
+        "only the id < 5 conjunct may be pushed: {request:#}"
+    );
+    assert_eq!(
+        filter["left"]["name"], "ID",
+        "the pushed conjunct must compare column ID: {request:#}"
+    );
+    assert!(
+        !filter.to_string().to_lowercase().contains("regexp"),
+        "the REGEXP_LIKE conjunct must not reach the adapter: {request:#}"
     );
 
-    // IDs must be 1..9 in order.
-    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
-    for (pos, &id) in ids.iter().enumerate() {
-        let expected = 1 + pos as i64;
-        assert_eq!(
-            id, expected,
-            "id at position {pos} must be {expected}, got {id}"
-        );
-    }
+    let advertised = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        advertised.contains("\"capabilities\":"),
+        "EXPLAIN VIRTUAL must echo the getCapabilities response:\n{advertised}"
+    );
+    assert!(
+        !advertised.contains("\"FN_PRED_REGEXP_LIKE\""),
+        "getCapabilities must not advertise FN_PRED_REGEXP_LIKE:\n{advertised}"
+    );
 
-    // All names must match the pattern.
-    for v in &cols[1] {
-        let n = v
-            .as_str()
-            .unwrap_or_else(|| panic!("name not a string: {v:?}"));
-        assert!(
-            n.starts_with("event-0"),
-            "filter violated: name '{n}' should match event-0[0-9]"
-        );
-    }
+    let ids = ids_of_first_column(&mut conn, &sql);
+    assert_eq!(ids, vec![1, 2, 3], "only ids 1..=3 match both conjuncts");
 }
 
 // ---------------------------------------------------------------------------
@@ -3914,20 +3959,9 @@ fn e2e_grouped_scalar_over_aggregate_year_matches_native_oracle() {
     );
 }
 
-/// A select-list `REGEXP_LIKE` inside `COUNT(DISTINCT ...)` compiles and
-/// matches an in-session native Exasol oracle (issue #209 repro: `SELECT
-/// COUNT(DISTINCT (c_name REGEXP_LIKE '^C')) FROM <vs>.CUSTOMER WHERE
-/// c_custkey <= 10000`). Pre-fix, the infix `REGEXP_LIKE` predicate rendered
-/// as DataFusion's `regexp_like(...)` function call inside the Exasol-parsed
-/// qualified single-table wrapper SQL, so Exasol rejected the statement with
-/// `syntax error, unexpected REGEXP_LIKE_` (42000).
-///
-/// The predicate MUST sit in the SELECT LIST, not the WHERE clause: a
-/// WHERE-clause `REGEXP_LIKE` is applied inside the scan by
-/// `build_qualified_single_table_fallback_sql`, rendered through the
-/// DataFusion trio, and never reaches the Exasol dialect at all — so it
-/// would pass identically with or without this plan's fix (plan
-/// `Verification` section).
+/// A select-list `REGEXP_LIKE` inside `COUNT(DISTINCT ...)` matches an in-session
+/// native Exasol oracle (issue #209 repro shape). `FN_PRED_REGEXP_LIKE` is not
+/// advertised, so Exasol evaluates the predicate over the rows the scan returns.
 ///
 /// Exasol's infix `REGEXP_LIKE` requires the WHOLE string to match the
 /// pattern (verified against the pinned container: `'aa' REGEXP_LIKE 'a'` =

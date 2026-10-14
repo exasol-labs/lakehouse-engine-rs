@@ -5,7 +5,7 @@
 - Q: How extend ADR 018's decline to REGEXP_LIKE? → A: new superseding ADR, not an in-place edit
 - Q: Shape of the docs-vs-CAPABILITIES drift test? → A: unit test parses backticked names from docs/capabilities.md, asserts set equality with CAPABILITIES
 - Q: Remove REGEXP_LIKE rendering from shared vs-expression? → A: yes, remove (no code handles `predicate_like_regexp` or a REGEXP_LIKE scalar)
-- Context: separate from the ongoing add-delta-pruning-e2e plan; issue number is not given, mark (#TBD); related #106, ADR 018
+- Context: separate from the ongoing add-delta-pruning-e2e plan; issue #471; related #106, ADR 018
 
 ## Design Decisions
 

@@ -933,9 +933,8 @@ fn cast_to_unsupported_target_declines() {
 fn renders_cast_nested_function_scalar_defensive() {
     // Defensive alternate encoding: CAST nested inside a generic
     // `function_scalar` node. Real Exasol traffic uses `function_scalar_cast`
-    // (see the fixtures above), but the nested arm is kept — like the
-    // REGEXP_LIKE alternate encoding — and must still render identically via
-    // the shared `render_cast` body.
+    // (see the fixtures above), but the nested arm is kept and must
+    // still render identically via the shared `render_cast` body.
     let expr = json!({
         "type": "function_scalar",
         "name": "CAST",
@@ -1198,101 +1197,6 @@ fn renders_null_valued_timestamp_literal_per_dialect() {
             );
         }
     }
-}
-
-// --- REGEXP_LIKE predicate and function_scalar ---
-
-#[test]
-fn renders_regexp_like() {
-    // Test as predicate node (Exasol's infix REGEXP_LIKE encoding)
-    let expr = json!({
-        "type": "predicate_like_regexp",
-        "expression": {"type": "column", "name": "name"},
-        "pattern": {"type": "literal_string", "value": "^A.*"}
-    });
-    let sql = render_expression(&expr).unwrap();
-    assert_eq!(sql, r#"regexp_like("NAME", '^A.*')"#);
-
-    // Test as function_scalar REGEXP_LIKE
-    let expr2 = json!({
-        "type": "function_scalar",
-        "name": "REGEXP_LIKE",
-        "arguments": [
-            {"type": "column", "name": "name"},
-            {"type": "literal_string", "value": "^B.*"}
-        ]
-    });
-    let sql2 = render_expression(&expr2).unwrap();
-    assert_eq!(sql2, r#"regexp_like("NAME", '^B.*')"#);
-}
-
-#[test]
-fn renders_regexp_like_as_infix_predicate_in_exasol_dialect() {
-    // Exasol's parser has no `regexp_like(...)` function; it accepts only the
-    // infix `(<subject> REGEXP_LIKE <pattern>)` predicate form
-    // ("syntax error, unexpected REGEXP_LIKE_", 42000). Both wire encodings —
-    // the dedicated `predicate_like_regexp` node type and the alternate
-    // `function_scalar` REGEXP_LIKE encoding — must render that same infix
-    // form on the Exasol-parsed path, byte-identically to each other, while
-    // the DataFusion-dialect rendering of both stays `regexp_like(s, p)`.
-    let predicate = json!({
-        "type": "predicate_like_regexp",
-        "expression": {"type": "column", "name": "name"},
-        "pattern": {"type": "literal_string", "value": "^A.*"}
-    });
-    let scalar = json!({
-        "type": "function_scalar",
-        "name": "REGEXP_LIKE",
-        "arguments": [
-            {"type": "column", "name": "name"},
-            {"type": "literal_string", "value": "^A.*"}
-        ]
-    });
-
-    let predicate_exasol = render_expression_exasol(&predicate).unwrap();
-    let scalar_exasol = render_expression_exasol(&scalar).unwrap();
-    assert_eq!(predicate_exasol, r#"("NAME" REGEXP_LIKE '^A.*')"#);
-    assert_eq!(
-        scalar_exasol, predicate_exasol,
-        "the two REGEXP_LIKE encodings must render byte-identically in the Exasol dialect"
-    );
-
-    assert_eq!(
-        render_expression(&predicate).unwrap(),
-        r#"regexp_like("NAME", '^A.*')"#
-    );
-    assert_eq!(
-        render_expression(&scalar).unwrap(),
-        r#"regexp_like("NAME", '^A.*')"#
-    );
-}
-
-#[test]
-fn regexp_like_predicate_missing_operand_errors_in_both_dialects() {
-    let missing_pattern = json!({
-        "type": "predicate_like_regexp",
-        "expression": {"type": "column", "name": "name"}
-    });
-    assert!(render_expression(&missing_pattern).is_err());
-    assert!(render_expression_exasol(&missing_pattern).is_err());
-
-    let missing_expression = json!({
-        "type": "predicate_like_regexp",
-        "pattern": {"type": "literal_string", "value": "^A.*"}
-    });
-    assert!(render_expression(&missing_expression).is_err());
-    assert!(render_expression_exasol(&missing_expression).is_err());
-}
-
-#[test]
-fn regexp_like_scalar_arity_errors_in_both_dialects() {
-    let one_arg = json!({
-        "type": "function_scalar",
-        "name": "REGEXP_LIKE",
-        "arguments": [{"type": "column", "name": "name"}]
-    });
-    assert!(render_expression(&one_arg).is_err());
-    assert!(render_expression_exasol(&one_arg).is_err());
 }
 
 // --- Math scalar functions (ABS/ROUND/SIGN→signum/trig/...) ---
@@ -2486,21 +2390,13 @@ fn to_char_and_to_number_fall_through_as_unsupported() {
 
 // --- Regexp scalar functions are deliberately not translated (issue #106) ---
 
+/// Scenario: Regexp scalar functions are deliberately not translated
 #[test]
 fn regexp_scalar_functions_decline_in_both_dialects() {
-    // The Rust `regex` crate (DataFusion 54) rejects backreferences and
-    // lookaround that Exasol's PCRE dialect accepts (blocks all four),
-    // lacks regexp_substr (blocks REGEXP_SUBSTR), and REGEXP_REPLACE /
-    // REGEXP_INSTR's argument shapes differ from Exasol's position/
-    // occurrence/return options (REGEXP_COUNT's shape actually aligns) —
-    // so all four scalar regexp functions decline (issue #106).
-    //
-    // The decline is a property of the declaration, not of a dialect: these
-    // names carry no TRANSLATED_SCALAR_FNS row, so the gate declines them
-    // identically in both dialects. Asserting the Exasol dialect too is what
-    // stops the verbatim rule from quietly re-admitting a name whose Exasol
-    // form would parse but whose semantics were never the reason it declined.
+    // DataFusion's regexp_like matches anywhere in the value, Exasol's PCRE only
+    // when the match spans the whole value; `regex` also lacks look-around.
     let unsupported = [
+        "REGEXP_LIKE",
         "REGEXP_REPLACE",
         "REGEXP_SUBSTR",
         "REGEXP_INSTR",
@@ -2535,6 +2431,25 @@ fn regexp_scalar_functions_decline_in_both_dialects() {
             "{name} must be None in the Exasol safe variant"
         );
     }
+}
+
+#[test]
+fn regexp_like_predicate_declines_in_both_dialects() {
+    let expr = json!({
+        "type": "predicate_like_regexp",
+        "expression": {"type": "column", "name": "name"},
+        "pattern": {"type": "literal_string", "value": "^A.*"}
+    });
+    let expected = "unsupported expression node type: predicate_like_regexp";
+    assert_eq!(render_expression(&expr).unwrap_err().to_string(), expected);
+    assert_eq!(
+        render_expression_exasol(&expr).unwrap_err().to_string(),
+        expected
+    );
+    assert!(render_expression_safe(&expr).is_none());
+    assert!(render_df_filter_safe(&expr).is_none());
+    assert!(render_expression_exasol_safe(&expr).is_none());
+    assert!(render_df_filter_exasol_safe(&expr).is_none());
 }
 
 // --- Bitwise operator functions are deliberately not translated (issue #108) ---
@@ -2665,34 +2580,6 @@ fn undeclared_scalar_function_declines_in_both_dialects() {
             "Exasol safe variant must be None for {expr}"
         );
     }
-}
-
-#[test]
-fn regexp_scalar_exclusion_leaves_regexp_like_untouched() {
-    // The scalar-regexp exclusion (issue #106) must not affect the REGEXP_LIKE
-    // predicate path (FN_PRED_REGEXP_LIKE stays advertised): both encodings
-    // still render.
-    let predicate = json!({
-        "type": "predicate_like_regexp",
-        "expression": {"type": "column", "name": "name"},
-        "pattern": {"type": "literal_string", "value": "^A.*"}
-    });
-    assert_eq!(
-        render_expression(&predicate).unwrap(),
-        r#"regexp_like("NAME", '^A.*')"#
-    );
-    let scalar = json!({
-        "type": "function_scalar",
-        "name": "REGEXP_LIKE",
-        "arguments": [
-            {"type": "column", "name": "name"},
-            {"type": "literal_string", "value": "^B.*"}
-        ]
-    });
-    assert_eq!(
-        render_expression(&scalar).unwrap(),
-        r#"regexp_like("NAME", '^B.*')"#
-    );
 }
 
 // --- Unsupported date functions return an error ---
@@ -3502,7 +3389,7 @@ fn renders_between_family_verbatim_in_exasol_dialect() {
 /// node's own uppercased `name` by the same rule the gate applies, so the 66
 /// verbatim names cannot be blessed one hand-written string at a time — a
 /// rewrite back to a DataFusion name (`signum`, `date_part`, `strpos`) fails
-/// the derived comparison. Only the ten `Shaped` names and the five
+/// the derived comparison. Only the nine `Shaped` names and the four
 /// dialect-branching node types outside `function_scalar` declare an expected
 /// string, because each of those has a shape of its own.
 ///
@@ -3621,7 +3508,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
         fixtures.push(verbatim(name, vec![col("a"), col("b")]));
     }
 
-    // The ten Shaped names, each declaring the string its own arm renders.
+    // The nine Shaped names, each declaring the string its own arm renders.
     fixtures.extend([
         shaped(
             "ADD",
@@ -3662,11 +3549,6 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
                 "dataType": {"type": "VARCHAR", "size": 50}
             }),
             r#"CAST("V" AS VARCHAR(50))"#,
-        ),
-        shaped(
-            "REGEXP_LIKE",
-            scalar("REGEXP_LIKE", vec![col("s"), text("^a")]),
-            r#"("S" REGEXP_LIKE '^a')"#,
         ),
         shaped(
             "CASE",
@@ -3780,7 +3662,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
         swept.push(rendered);
     }
 
-    // The five dialect-branching node types outside `function_scalar`. They
+    // The four dialect-branching node types outside `function_scalar`. They
     // are node types rather than function names, so the declaration does not
     // carry them and each row asserts both dialects itself.
     let node_type_rows = [
@@ -3800,14 +3682,6 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
             }),
             r#"CAST("V" AS VARCHAR(50))"#,
             r#"CAST("V" AS VARCHAR)"#,
-        ),
-        (
-            json!({
-                "type": "predicate_like_regexp",
-                "expression": col("s"), "pattern": text("^a")
-            }),
-            r#"("S" REGEXP_LIKE '^a')"#,
-            r#"regexp_like("S", '^a')"#,
         ),
         (
             json!({"type": "literal_timestamp", "value": "2024-03-01 12:34:56.789"}),
@@ -3854,7 +3728,6 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
             "arrow_cast",
             "character_length",
             "octet_length",
-            "regexp_like(",
             "current_date()",
             "now()",
             "nullif(",
@@ -3871,9 +3744,9 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
 
 // --- Dialect-invariant surface (regression freeze) ---
 //
-// This plan branches `function_scalar_extract`, `predicate_like_regexp`, the
-// `REGEXP_LIKE` alternate encoding, and the two timestamp-literal node types
-// on `dialect`. Everything else was not meant to move. These three tests
+// Only `function_scalar_extract`, `function_scalar_cast`, and the timestamp-literal
+// node types branch on `dialect`; everything else must render identically in both
+// dialects. These three tests
 // freeze the surface that MUST stay dialect-invariant, so a future change
 // that accidentally starts branching one of these paths on `dialect` fails
 // here instead of only showing up as a silent divergence downstream.

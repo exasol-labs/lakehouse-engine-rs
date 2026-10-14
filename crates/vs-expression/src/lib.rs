@@ -29,15 +29,15 @@ use serde_json::Value as Json;
 /// DataFusion-shaped rewrite its own engine cannot parse.
 ///
 /// `TRANSLATED_SCALAR_FNS` is the one declaration the `function_scalar` gate
-/// reads (76 names). Each declared name carries an `ExasolForm`:
+/// reads (75 names). Each declared name carries an `ExasolForm`:
 /// - `VerbatimCall` — rendered ahead of the per-name dispatch as
 ///   `<NAME>(<rendered args>)` from the node's own uppercased name, with NO
 ///   arity check.
 /// - `Shaped` — falls through to the per-name arm, which owns both dialects.
 ///
-/// Ten names have an Exasol form the gate's `<NAME>(<rendered args>)` rule
+/// Nine names have an Exasol form the gate's `<NAME>(<rendered args>)` rule
 /// cannot derive — either because it is not a call at all, or because the
-/// DataFusion side is not — and are `Shaped`. They fall into six groups:
+/// DataFusion side is not — and are `Shaped`. They fall into five groups:
 /// - the five operator wire names `ADD`, `SUB`, `MULT`, `FLOAT_DIV`, `NEG` —
 ///   SQL operators, not calls (`FLOAT_DIV` diverges by dialect: a
 ///   DataFusion-only `CAST(... AS DOUBLE)` on its left operand forces true
@@ -56,9 +56,6 @@ use serde_json::Value as Json;
 ///   project does not enable it), so the DataFusion target must be bare
 ///   `VARCHAR`; Exasol has no length-less VARCHAR/CHAR type, so `VARCHAR`
 ///   MUST be followed by `(n)`;
-/// - the `REGEXP_LIKE` alternate `function_scalar` encoding — Exasol's own
-///   form is the infix predicate `(<subject> REGEXP_LIKE <pattern>)`, not a
-///   call;
 /// - `CASE` — renders as `CASE WHEN ... THEN ... [ELSE ...] END`, not a call.
 ///
 /// Absence from `TRANSLATED_SCALAR_FNS` is how a translation is retired: the
@@ -69,14 +66,14 @@ use serde_json::Value as Json;
 /// zone, no clock, and no statement anchor, so these four are unadvertised
 /// and left for Exasol to evaluate itself.
 ///
-/// Six node types outside `function_scalar` also branch on dialect —
-/// `function_scalar_extract`, `function_scalar_cast`, `predicate_like_regexp`,
+/// Five node types outside `function_scalar` also branch on dialect —
+/// `function_scalar_extract`, `function_scalar_cast`,
 /// `literal_timestamp`, `literal_timestamp_utc`, and `literal_timestamputc` (the
 /// last two are the same TSTZ literal shape under two wire names — `literal_timestamputc`
 /// is the one Exasol actually sends, #242) — but none of them is
 /// declared here: they are covered by their own rows in the
-/// `exasol_dialect_renders_declared_verbatim_surface` sweep test (the first five) or
-/// their own dedicated test (`literal_timestamputc`, which unlike the other five
+/// `exasol_dialect_renders_declared_verbatim_surface` sweep test (the first four) or
+/// their own dedicated test (`literal_timestamputc`, which unlike the other four
 /// declines rather than renders in the DataFusion dialect), not by this
 /// declaration.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -95,11 +92,10 @@ enum ExasolForm {
     VerbatimCall,
     /// Rendered by the name's own per-name arm, which owns BOTH dialects. This is
     /// for names whose Exasol form the gate's `<NAME>(<rendered args>)` rule
-    /// cannot derive: either because it is not a call at all — an operator, an
-    /// infix predicate, a `CASE`, or a per-dialect CAST target — or because the
-    /// DataFusion side is not, as with `MOD`, whose Exasol form IS the call
-    /// `MOD(a, b)` but whose DataFusion side is the `%` operator, so the arm
-    /// must own both dialects.
+    /// cannot derive: either because it is not a call at all — an operator, a
+    /// `CASE`, or a per-dialect CAST target — or because the DataFusion side is
+    /// not, as with `MOD`, whose Exasol form IS the call `MOD(a, b)` but whose
+    /// DataFusion side is the `%` operator, so the arm must own both dialects.
     Shaped,
 }
 
@@ -112,12 +108,12 @@ enum ExasolForm {
 /// unreachable, rather than silently rendering DataFusion SQL on the
 /// Exasol-parsed path — and absence is likewise how a translation is retired.
 ///
-/// The ten [`ExasolForm::Shaped`] names lead the list, because they are the
+/// The nine [`ExasolForm::Shaped`] names lead the list, because they are the
 /// exceptions a reader needs first: every other name renders verbatim. Order is
 /// otherwise immaterial — the lookup is by name, not by position, which is the
 /// whole point of moving the decision out of arm ordering.
 const TRANSLATED_SCALAR_FNS: &[(&str, ExasolForm)] = &[
-    // ---- Shaped: the ten names whose Exasol form is NOT a `<NAME>(<args>)` call,
+    // ---- Shaped: the nine names whose Exasol form is NOT a `<NAME>(<args>)` call,
     // so their own arm owns both dialects.
     //
     // Arithmetic and unary negation: SQL operators, not calls.
@@ -128,8 +124,6 @@ const TRANSLATED_SCALAR_FNS: &[(&str, ExasolForm)] = &[
     ("NEG", ExasolForm::Shaped),
     // CAST: the target type is rendered per dialect by `render_cast_target`.
     ("CAST", ExasolForm::Shaped),
-    // REGEXP_LIKE: Exasol's own form is an infix predicate, not a call.
-    ("REGEXP_LIKE", ExasolForm::Shaped),
     // MOD: Exasol requires the MOD(a, b) form, DataFusion the `%` operator. The
     // Exasol side happens to be a call, but the DataFusion side is not, so the arm
     // owns both dialects rather than the gate owning one of them (#197).
@@ -311,7 +305,6 @@ fn is_boolean_producing(kind: &str) -> bool {
             | "predicate_in_constlist"
             | "predicate_between"
             | "predicate_like"
-            | "predicate_like_regexp"
     )
 }
 
@@ -833,26 +826,6 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 )),
             }
         }
-        // Exasol sends REGEXP_LIKE as node type `predicate_like_regexp`.
-        "predicate_like_regexp" => {
-            let subject =
-                render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
-                    .ok_or_else(|| {
-                        UdfError::User("predicate_like_regexp missing 'expression'".into())
-                    })?;
-            let pattern =
-                render_expression_inner(value("pattern").unwrap_or(&Json::Null), dialect)?
-                    .ok_or_else(|| {
-                        UdfError::User("predicate_like_regexp missing 'pattern'".into())
-                    })?;
-            Ok(Some(match dialect {
-                // Exasol's own parser accepts only the infix REGEXP_LIKE
-                // predicate form, not a `regexp_like(...)` call ("syntax error,
-                // unexpected REGEXP_LIKE_", 42000).
-                Dialect::Exasol => format!("({subject} REGEXP_LIKE {pattern})"),
-                Dialect::DataFusion => format!("regexp_like({subject}, {pattern})"),
-            }))
-        }
         // Exasol sends EXTRACT as its own node type with the field in `toExtract`:
         // {"type":"function_scalar_extract","name":"EXTRACT","toExtract":"DAY","arguments":[<src>]}
         "function_scalar_extract" => {
@@ -1051,32 +1024,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 // CAST as a function_scalar (defensive alternate encoding).
                 // Real Exasol traffic emits CAST as the top-level
                 // `function_scalar_cast` node handled above; this arm is kept
-                // defensively — like the REGEXP_LIKE alternate encoding below — and
-                // shares the same body via `render_cast`.
+                // defensively and shares the same body via `render_cast`.
                 "CAST" => render_cast(args, value("dataType"), dialect),
-                // REGEXP_LIKE as a function_scalar (alternate encoding)
-                "REGEXP_LIKE" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar REGEXP_LIKE missing 'arguments'".into())
-                    })?;
-                    if args.len() < 2 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar REGEXP_LIKE requires 2 arguments, got {}",
-                            args.len()
-                        )));
-                    }
-                    let subject = render_expression_inner(&args[0], dialect)?
-                        .ok_or_else(|| UdfError::User("REGEXP_LIKE subject is null".into()))?;
-                    let pattern = render_expression_inner(&args[1], dialect)?
-                        .ok_or_else(|| UdfError::User("REGEXP_LIKE pattern is null".into()))?;
-                    Ok(Some(match dialect {
-                        // Same infix form as the predicate_like_regexp node type
-                        // above — this alternate encoding must render
-                        // byte-identically to it within a dialect.
-                        Dialect::Exasol => format!("({subject} REGEXP_LIKE {pattern})"),
-                        Dialect::DataFusion => format!("regexp_like({subject}, {pattern})"),
-                    }))
-                }
                 // Math functions: name-mapping table
                 // Arity: 1-arg: ABS FLOOR CEIL SQRT EXP LN SIGN DEGREES RADIANS SIN COS TAN ASIN
                 //               ACOS ATAN SINH COSH TANH COT

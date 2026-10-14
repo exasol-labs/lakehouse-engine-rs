@@ -1353,6 +1353,8 @@ fn like_on_orderdate_join_query(vs_name: &str) -> String {
     )
 }
 
+/// Scenario: A broadcast-join filter over a non-string LIKE subject declines the broadcast plan
+///
 /// `LIKE` over the `DECIMAL` `O_CUSTKEY` column declines the broadcast plan:
 /// the pushed SQL must be the N-scan wrapper, never a broadcast
 /// common-blob join block, and no leg's scan-spec may carry the declined

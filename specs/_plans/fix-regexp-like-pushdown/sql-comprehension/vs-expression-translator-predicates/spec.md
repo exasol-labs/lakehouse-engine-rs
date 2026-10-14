@@ -3,7 +3,7 @@
 
 Extends the VS expression translator (`sql-comprehension/vs-expression-translator`) with the
 filter-predicate operator set — comparison, logical connectives, IS NULL / IS NOT NULL, IN over a
-constant list, BETWEEN, and LIKE. `REGEXP_LIKE` is not translated, and Exasol evaluates it. Split
+constant list, BETWEEN, and LIKE. Split
 out of the core translator spec to keep that spec's scenario count within the domain's convention
 (mirroring the existing `-scalar-fns`/`-date-fns`/`-scalar-ops`/`-literals` splits).
 <!-- /DELTA:CHANGED -->
@@ -19,9 +19,6 @@ out of the core translator spec to keep that spec's scenario count within the do
   BETWEEN, and LIKE all render byte-identically in both dialects, because their operator syntax is
   shared by both parsers — none needs the per-dialect branching `sql-comprehension/vs-expression-translator`
   describes for named scalar functions.
-* `REGEXP_LIKE` is declined in both dialects. DataFusion's regex matching cannot reproduce
-  Exasol's, so the adapter does not advertise `FN_PRED_REGEXP_LIKE` and Exasol evaluates the
-  predicate itself (see `sql-functions/vs-expression-translator-scalar-fns`).
 * Exasol and DataFusion diverge on NULL handling inside an IN list: Exasol ignores NULL entries
   under both `IN` and `NOT IN`, while DataFusion three-valued logic filters non-matching rows for
   `NOT IN` when the list contains NULL, so a NULL entry must be stripped from the rendered list.
@@ -55,12 +52,3 @@ out of the core translator spec to keep that spec's scenario count within the do
 * *AND* a missing operand SHALL return an error in raising mode and `None` in the safe variants, matching the DataFusion dialect
 * *AND* the DataFusion-dialect rendering of both encodings MUST remain byte-identical to the preceding scenario, and `FN_PRED_REGEXP_LIKE` SHALL stay advertised because both dialects can now render the predicate
 <!-- /DELTA:REMOVED -->
-
-<!-- DELTA:NEW -->
-### Scenario: REGEXP_LIKE predicate is not translated in either dialect
-
-* *GIVEN* a VS expression node of type `predicate_like_regexp`, Exasol's encoding of the infix `<str> REGEXP_LIKE <pat>` predicate
-* *WHEN* `render_expression` or `render_expression_exasol` processes the node in raising mode
-* *THEN* the translator SHALL return the error `unsupported expression node type: predicate_like_regexp` in both dialects
-* *AND* `render_expression_safe`, `render_df_filter_safe`, `render_expression_exasol_safe`, and `render_df_filter_exasol_safe` SHALL return `None` for the same node without panicking
-<!-- /DELTA:NEW -->

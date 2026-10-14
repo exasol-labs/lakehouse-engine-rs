@@ -2642,7 +2642,7 @@ fn selectlist_untranslatable_item_falls_back_to_column() {
 // ScanSpec.filter (DataFusion string) is preserved on both paths.
 // ---------------------------------------------------------------------------
 
-/// Scenario: Filter predicate is pushed into the scan spec.
+/// Scenario: Filter predicate is pushed into the scan spec
 ///
 /// For a translatable filter (equality on a typed column):
 /// - `ScanSpec.filter` (DataFusion SQL string) is `Some`.
@@ -2706,7 +2706,7 @@ fn filter_in_common_arg() {
 // (issue #207 regression coverage).
 // ---------------------------------------------------------------------------
 
-/// Scenario: LIKE on a VARCHAR or CHAR column pushes down unchanged.
+/// Scenario: LIKE on a VARCHAR or CHAR column pushes down unchanged
 #[test]
 fn like_guard_varchar_subject_unchanged() {
     let filter = serde_json::json!({
@@ -2724,11 +2724,13 @@ fn like_guard_varchar_subject_unchanged() {
     );
 }
 
-/// Scenario: LIKE on a genuine CHAR column pushes down unchanged.
-/// `like_subject_type_guard` already classifies any `CHAR`-prefixed Exasol type
-/// as a string subject alongside VARCHAR (`support.rs:546`), so this is a
-/// non-regression CONTROL for the CHAR-type-declaration fix (issue #192): it
-/// must pass unchanged both before and after that fix.
+/// Scenario: LIKE on a VARCHAR or CHAR column pushes down unchanged
+///
+/// A genuine CHAR column. `like_subject_type_guard` already classifies any
+/// `CHAR`-prefixed Exasol type as a string subject alongside VARCHAR
+/// (`classify_exa_type`), so this is a non-regression CONTROL for the
+/// CHAR-type-declaration fix (issue #192): it must pass unchanged both before and
+/// after that fix.
 #[test]
 fn like_guard_char_subject_unchanged() {
     let filter = serde_json::json!({
@@ -2746,7 +2748,8 @@ fn like_guard_char_subject_unchanged() {
     );
 }
 
-/// Scenario: LIKE on a DATE column pushes down wrapped in CAST-to-VARCHAR.
+/// Scenario: LIKE on a DATE column pushes down wrapped in CAST-to-VARCHAR
+///
 /// Regression: under the pre-fix code (`filter_json_raw.and_then(render_df_filter_safe)`
 /// with no guard) the tree is never mutated, so `expression` would still be the bare
 /// `column` node — this assertion on the rewritten `function_scalar_cast` shape is
@@ -2779,7 +2782,8 @@ fn like_guard_date_subject_wraps_cast() {
     );
 }
 
-/// Scenario: LIKE on a DECIMAL column declines the whole filter.
+/// Scenario: LIKE on a DECIMAL column declines the whole filter
+///
 /// Regression: the pre-fix code has no decline mechanism at this layer — a DECIMAL
 /// subject's `filter_json_raw` would pass straight through into `Some(...)` unmodified,
 /// so asserting `None` here is false under that old behavior.
@@ -2820,8 +2824,9 @@ fn type_rewrite_pipeline_runs_like_guard() {
     );
 }
 
-/// Scenario: LIKE on an integer column declines the whole filter. Exasol has no
-/// separate wire "INTEGER" type — an integer column arrives as `DECIMAL(20,0)`
+/// Scenario: LIKE on an integer column declines the whole filter
+///
+/// Exasol has no separate wire "INTEGER" type — an integer column arrives as `DECIMAL(20,0)`
 /// (confirmed via live payload capture this session).
 #[test]
 fn like_guard_integer_subject_declines() {
@@ -2839,8 +2844,10 @@ fn like_guard_integer_subject_declines() {
     );
 }
 
-/// Scenario: LIKE on a non-column subject (a computed scalar expression) is left
-/// untouched, regardless of `col_types` — this is out of scope for the guard.
+/// Scenario: LIKE on a non-column subject is left untouched
+///
+/// A computed scalar expression subject is left untouched regardless of `col_types`:
+/// out of scope for the guard.
 #[test]
 fn like_guard_non_column_subject_untouched() {
     let filter = serde_json::json!({
@@ -2864,8 +2871,9 @@ fn like_guard_non_column_subject_untouched() {
     );
 }
 
-/// Scenario: LIKE on a bare column whose name is not present in `col_types` (a
-/// lookup miss) declines the whole filter (fail-safe).
+/// Scenario: LIKE on a bare column whose type cannot be resolved declines the whole filter
+///
+/// A name absent from `col_types` (a lookup miss) is a fail-safe decline.
 #[test]
 fn like_guard_unresolvable_column_declines() {
     let filter = serde_json::json!({
@@ -3001,6 +3009,8 @@ fn nested_like_decline_routes_to_wrapper_where() {
     );
 }
 
+/// Scenario: LIKE on an integer column declines the whole filter
+///
 /// The declined half of `like_guard_integer_subject_declines`, carried through to
 /// its consequence: an integer column arrives as `DECIMAL(20,0)`, the LIKE declines
 /// the filter for the scan, and the adapter applies it itself in the wrapper.
@@ -3021,6 +3031,8 @@ fn declined_like_on_integer_column_routes_to_wrapper_where() {
     );
 }
 
+/// Scenario: LIKE on a bare column whose type cannot be resolved declines the whole filter
+///
 /// The declined half of `like_guard_unresolvable_column_declines`, carried through
 /// to its consequence: an unresolvable subject type is a FAIL-SAFE decline, and a
 /// fail-safe decline must still self-apply. It cannot omit the predicate on the
@@ -3046,36 +3058,6 @@ fn declined_like_on_unresolvable_column_routes_to_wrapper_where() {
         sql.contains(r#"AS "LHS_T0" WHERE ("LHS_T0"."MYSTERY" LIKE 'A%')"#),
         "an unresolvable-subject decline must still be applied by the adapter, \
          never omitted: {sql}"
-    );
-}
-
-/// Scenario: REGEXP_LIKE on a DATE column pushes down wrapped in CAST-to-VARCHAR,
-/// same as `predicate_like` — both node types dispatch through `guard_like_subject`.
-#[test]
-fn like_guard_regexp_date_subject_wraps_cast() {
-    let column = serde_json::json!({"type": "column", "name": "signup_date"});
-    let filter = serde_json::json!({
-        "type": "predicate_like_regexp",
-        "expression": column.clone(),
-        "pattern": {"type": "literal_string", "value": "2024.*"}
-    });
-    let col_types = vec![("SIGNUP_DATE".to_string(), "DATE".to_string())];
-
-    let result = like_subject_type_guard(&filter, &col_types);
-    let expected = serde_json::json!({
-        "type": "predicate_like_regexp",
-        "expression": {
-            "type": "function_scalar_cast",
-            "name": "CAST",
-            "dataType": {"type": "VARCHAR"},
-            "arguments": [column]
-        },
-        "pattern": {"type": "literal_string", "value": "2024.*"}
-    });
-    assert_eq!(
-        result,
-        Some(expected),
-        "REGEXP_LIKE DATE subject must be rewrapped in CAST(<col> AS VARCHAR)"
     );
 }
 
@@ -4023,6 +4005,8 @@ fn selectlist_instr_with_start_position_falls_back_to_full_row() {
 // Select-list predicate node types added to the pushable whitelist (#196)
 // ---------------------------------------------------------------------------
 
+/// Scenario: Scalar select-list expression is pushed into the scan-driving query
+///
 /// Each whitelisted select-list predicate node type (issue #196) renders as a
 /// positional `ProjectionItem::Expr` carrying the rendered SQL fragment and the
 /// declared `selectListDataTypes` type — not the full-base-row fallback.
@@ -4075,15 +4059,6 @@ fn selectlist_predicate_node_projects_as_expr() {
                 "right": {"type": "literal_exactnumeric", "value": 5},
             }),
             r#"("ID" <> 5)"#,
-        ),
-        (
-            "predicate_like_regexp",
-            serde_json::json!({
-                "type": "predicate_like_regexp",
-                "expression": column("name"),
-                "pattern": {"type": "literal_string", "value": "^a.*"},
-            }),
-            r#"regexp_like("NAME", '^a.*')"#,
         ),
     ];
 
@@ -4164,7 +4139,9 @@ fn selectlist_function_aggregate_still_widens_to_full_row() {
 // select-list LIKE type coercion
 // ---------------------------------------------------------------------------
 
-/// Scenario: `predicate_like` over `d` (`DATE`) projects a SINGLE expression that
+/// Scenario: A select-list LIKE over a DATE column projects the CAST-to-VARCHAR form
+///
+/// A `predicate_like` over `d` (`DATE`) projects a SINGLE expression that
 /// rewraps the subject as `CAST("D" AS VARCHAR)`, mirroring the filter pipeline's
 /// DATE arm — not the full base row.
 #[test]
@@ -4200,7 +4177,9 @@ fn selectlist_like_over_date_projects_cast_expr() {
     assert_eq!(types, vec!["BOOLEAN".to_string()]);
 }
 
-/// Scenario: a `predicate_like`/`predicate_like_regexp` over a subject that
+/// Scenario: A select-list LIKE over a non-string column widens the projection to the full base row
+///
+/// A `predicate_like` over a subject that
 /// resolves to a non-string Exasol type (DECIMAL, integer DECIMAL(p,0), DOUBLE,
 /// BOOLEAN, TIMESTAMP) or does not resolve at all widens the WHOLE select list to
 /// the full base row — `Ok`, never `Err`. Mirrors
@@ -4256,14 +4235,6 @@ fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
                 "type": "predicate_like",
                 "expression": column("not_a_column"),
                 "pattern": {"type": "literal_string", "value": "1%"}
-            }),
-        ),
-        (
-            "predicate_like_regexp over c_decimal_a",
-            serde_json::json!({
-                "type": "predicate_like_regexp",
-                "expression": column("c_decimal_a"),
-                "pattern": {"type": "literal_string", "value": "^1.*"}
             }),
         ),
     ];

@@ -28,9 +28,7 @@ WIDENED derived projection).
   `predicate_between`, `predicate_is_null`, `predicate_is_not_null` (issue #196), and
   `predicate_notequal`. Each is backed by an advertised capability (`FN_PRED_IN_CONSTLIST`,
   `FN_PRED_BETWEEN`, `FN_PRED_IS_NULL`, `FN_PRED_IS_NOT_NULL`, `FN_PRED_NOTEQUAL`) and a translator
-  arm, so Exasol never pushes a node the adapter then refuses to project. `predicate_like_regexp` is
-  not in the set: `FN_PRED_REGEXP_LIKE` is not advertised, so Exasol evaluates a select-list
-  `REGEXP_LIKE` itself.
+  arm, so Exasol never pushes a node the adapter then refuses to project.
 * `predicate_greater` and `predicate_greaterequal` are not in the set. They are not Exasol
   capability names — Exasol normalises `a > b` to `b < a` before the request reaches the
   adapter — so a select-list `>` already arrives as the pushable `predicate_less`.
@@ -79,7 +77,7 @@ WIDENED derived projection).
   `pushdown-joins/pushdown-joins-module-structure` owns it.
 * `n_scan_join_select_items` raises the wrapper's hard error for a node type unrenderable under
   BOTH dialects, through a shared decline constructor.
-* **This feature moves no `dispatch_golden` fixture byte.** None of the fixtures under
+* None of the fixtures under
   `adapter/pushdown/testdata/dispatch_golden/` carries an aggregate inside a row-scan
   projection, so none depends on the depth-insensitive aggregate guard. The directory holds
   twenty-four fixtures: eighteen credential-bearing ones, whose `storage` value

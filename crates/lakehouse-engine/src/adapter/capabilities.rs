@@ -38,7 +38,8 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_PRED_IS_NOT_NULL",
     "FN_PRED_LIKE",
     "FN_PRED_LIKE_ESCAPE",
-    "FN_PRED_REGEXP_LIKE",
+    // FN_PRED_REGEXP_LIKE is not advertised: DataFusion's regex matching cannot
+    // reproduce Exasol's whole-string PCRE match, so Exasol evaluates it.
     // LIMIT pushdown
     "LIMIT",
     // ORDER BY pushdown: bare-column sort keys (add-topn-pushdown) and expression
