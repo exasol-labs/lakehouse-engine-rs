@@ -340,16 +340,18 @@ fn partial_columns_arity_per_agg_kind() {
     for kind in [
         AggKind::VarPop,
         AggKind::VarSamp,
+        AggKind::Variance,
         AggKind::StddevPop,
         AggKind::StddevSamp,
+        AggKind::Stddev,
     ] {
         assert_eq!(kind.partial_columns().len(), 3, "{kind:?}");
         assert_eq!(
             kind.partial_columns(),
             &[
                 PartialAggColumn::StatCnt,
-                PartialAggColumn::StatSum,
-                PartialAggColumn::StatSumSq,
+                PartialAggColumn::StatMean,
+                PartialAggColumn::StatM2,
             ],
             "{kind:?}"
         );
@@ -371,8 +373,8 @@ fn is_counter_marks_the_four_count_columns() {
         PartialAggColumn::Min,
         PartialAggColumn::Max,
         PartialAggColumn::AvgSum,
-        PartialAggColumn::StatSum,
-        PartialAggColumn::StatSumSq,
+        PartialAggColumn::StatMean,
+        PartialAggColumn::StatM2,
     ] {
         assert!(!col.is_counter(), "{col:?} must NOT be a counter column");
     }
@@ -413,12 +415,12 @@ fn partial_column_name_renders_role_and_ordinal() {
         "PARTIAL_stat_cnt_9"
     );
     assert_eq!(
-        partial_column_name(PartialAggColumn::StatSum, 6),
-        "PARTIAL_stat_sum_6"
+        partial_column_name(PartialAggColumn::StatMean, 6),
+        "PARTIAL_stat_mean_6"
     );
     assert_eq!(
-        partial_column_name(PartialAggColumn::StatSumSq, 2),
-        "PARTIAL_stat_sumsq_2"
+        partial_column_name(PartialAggColumn::StatM2, 2),
+        "PARTIAL_stat_m2_2"
     );
 }
 

@@ -131,10 +131,10 @@ const EXPR_CAPABLE_AGG_KINDS: &[(&str, AggKind)] = &[
 ];
 
 const STAT_AGG_KINDS: &[(&str, AggKind)] = &[
-    ("STDDEV", AggKind::StddevSamp),
+    ("STDDEV", AggKind::Stddev),
     ("STDDEV_SAMP", AggKind::StddevSamp),
     ("STDDEV_POP", AggKind::StddevPop),
-    ("VARIANCE", AggKind::VarSamp),
+    ("VARIANCE", AggKind::Variance),
     ("VAR_SAMP", AggKind::VarSamp),
     ("VAR_POP", AggKind::VarPop),
 ];
@@ -167,7 +167,7 @@ pub(super) fn arg_column_or_expr(
 
 /// `None` for any `distinct: true` item, an unsupported function, or an
 /// unrenderable argument. STDDEV/VARIANCE accept only a bare column: their
-/// (cnt, sum, sum_sq) decomposition has no rendered-argument form, and a plan with
+/// (cnt, mean, m2) decomposition has no rendered-argument form, and a plan with
 /// no argument would fail inside the scan.
 pub(super) fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
     if item.get("distinct").and_then(|d| d.as_bool()) == Some(true) {
@@ -223,38 +223,75 @@ pub(super) fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
     None
 }
 
-struct StatMergeFragments {
-    numer: String,
-    pop_denom: String,
-    samp_denom: String,
+fn stat_grand_mean_name(i: usize) -> String {
+    format!("STAT_GMEAN_{i}")
 }
 
-impl StatMergeFragments {
-    fn for_ordinal(i: usize) -> Self {
+/// Adds each stat aggregate's grand mean over the partial rows of its group. Shifting by one
+/// shard's mean keeps it exact when all shard means are equal, which `SUM(n * mean) / N` is not.
+pub(super) fn with_stat_grand_means(
+    fan_out: &str,
+    aggregates: &[AggregatePlan],
+    partition_keys: &[String],
+) -> String {
+    let stats: Vec<usize> = (0..aggregates.len())
+        .filter(|&i| aggregates[i].kind.is_stat())
+        .collect();
+    if stats.is_empty() {
+        return fan_out.to_string();
+    }
+    let window = if partition_keys.is_empty() {
+        "OVER ()".to_string()
+    } else {
+        format!("OVER (PARTITION BY {})", partition_keys.join(", "))
+    };
+    let mut refs = Vec::new();
+    let mut grand_means = Vec::new();
+    for i in stats {
         let cnt = partial_column_name(PartialAggColumn::StatCnt, i);
-        let sum = partial_column_name(PartialAggColumn::StatSum, i);
-        let sumsq = partial_column_name(PartialAggColumn::StatSumSq, i);
-        let pop_denom = format!(r#"NULLIF(SUM("{cnt}"), 0)"#);
-        let samp_denom =
-            format!(r#"CASE WHEN SUM("{cnt}") <= 1 THEN NULL ELSE SUM("{cnt}") - 1 END"#);
-        let numer = format!(r#"(SUM("{sumsq}") - SUM("{sum}") * SUM("{sum}") / {pop_denom})"#);
-        Self {
-            numer,
-            pop_denom,
-            samp_denom,
-        }
+        let mean = partial_column_name(PartialAggColumn::StatMean, i);
+        let shift = format!("STAT_REF_{i}");
+        refs.push(format!(r#"MIN("{mean}") {window} AS "{shift}""#));
+        grand_means.push(format!(
+            r#""{shift}" + SUM("{cnt}" * ("{mean}" - "{shift}")) {window} / NULLIF(SUM("{cnt}") {window}, 0) AS "{}""#,
+            stat_grand_mean_name(i)
+        ));
+    }
+    format!(
+        "SELECT q.*, {} FROM (SELECT p.*, {} FROM ({fan_out}) p) q",
+        grand_means.join(", "),
+        refs.join(", ")
+    )
+}
+
+/// Chan's parallel merge of (cnt, mean, m2). Every term is non-negative, so SQRT needs no guard;
+/// expanding the deviation term into `Σ n·mean² - N·g²` would bring back the cancellation.
+fn stat_merge(kind: &AggKind, i: usize) -> String {
+    let cnt = partial_column_name(PartialAggColumn::StatCnt, i);
+    let mean = partial_column_name(PartialAggColumn::StatMean, i);
+    let m2 = partial_column_name(PartialAggColumn::StatM2, i);
+    let gmean = stat_grand_mean_name(i);
+    let n = format!(r#"SUM("{cnt}")"#);
+    let m2 = format!(
+        r#"(SUM("{m2}") + SUM("{cnt}" * ("{mean}" - "{gmean}") * ("{mean}" - "{gmean}")))"#
+    );
+    let var_pop = format!("{m2} / NULLIF({n}, 0)");
+    let var_samp = format!("{m2} / CASE WHEN {n} <= 1 THEN NULL ELSE {n} - 1 END");
+    let variance = format!("CASE WHEN {n} = 1 THEN 0 ELSE {m2} / ({n} - 1) END");
+    match kind {
+        AggKind::VarPop => var_pop,
+        AggKind::VarSamp => var_samp,
+        AggKind::Variance => variance,
+        AggKind::StddevPop => format!("SQRT({var_pop})"),
+        AggKind::StddevSamp => format!("SQRT({var_samp})"),
+        AggKind::Stddev => format!("SQRT({variance})"),
+        other => unreachable!("{other:?} is not a stat aggregate"),
     }
 }
 
-/// The `IS NULL` guard is redundant with `GREATEST`'s own NULL propagation but is
-/// kept because golden fixtures pin this SQL byte-for-byte.
-fn stddev_of(var: &str) -> String {
-    format!("CASE WHEN ({var}) IS NULL THEN NULL ELSE SQRT(GREATEST(0.0, {var})) END")
-}
-
 /// Partial column names come only from [`partial_column_name`], so the scan aliases,
-/// `EMITS`, and this merge cannot disagree. STDDEV/VARIANCE use the König–Huygens
-/// identity; `GREATEST(0.0, …)` guards SQRT against tiny negative float rounding.
+/// `EMITS`, and this merge cannot disagree. Stat merges read the grand means that
+/// [`with_stat_grand_means`] adds to the FROM.
 pub(super) fn merge_select_items(aggregates: &[AggregatePlan]) -> Vec<String> {
     aggregates
         .iter()
@@ -285,22 +322,12 @@ pub(super) fn merge_select_items(aggregates: &[AggregatePlan]) -> Vec<String> {
                 let cnt = partial_column_name(PartialAggColumn::AvgCnt, i);
                 format!(r#"SUM("{sum}") / NULLIF(SUM("{cnt}"), 0)"#)
             }
-            AggKind::VarPop => {
-                let stat = StatMergeFragments::for_ordinal(i);
-                format!("{} / {}", stat.numer, stat.pop_denom)
-            }
-            AggKind::VarSamp => {
-                let stat = StatMergeFragments::for_ordinal(i);
-                format!("{} / {}", stat.numer, stat.samp_denom)
-            }
-            AggKind::StddevPop => {
-                let stat = StatMergeFragments::for_ordinal(i);
-                stddev_of(&format!("{} / {}", stat.numer, stat.pop_denom))
-            }
-            AggKind::StddevSamp => {
-                let stat = StatMergeFragments::for_ordinal(i);
-                stddev_of(&format!("{} / {}", stat.numer, stat.samp_denom))
-            }
+            AggKind::VarPop
+            | AggKind::VarSamp
+            | AggKind::Variance
+            | AggKind::StddevPop
+            | AggKind::StddevSamp
+            | AggKind::Stddev => stat_merge(&plan.kind, i),
         })
         .collect()
 }

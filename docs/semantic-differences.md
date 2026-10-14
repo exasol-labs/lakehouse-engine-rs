@@ -60,3 +60,10 @@ or return the date as a day count, which has no range limit:
 ```sql
 SELECT ID, DAYS_BETWEEN(STORED_DATE, DATE '1970-01-01') AS STORED_DAYS FROM t;
 ```
+
+## Precision of STDDEV and VARIANCE
+
+For DECIMAL and integer columns, native Exasol computes `STDDEV`, `VARIANCE`, `VAR_POP`,
+`VAR_SAMP`, `STDDEV_POP`, and `STDDEV_SAMP` exactly. The virtual schema computes them in double
+precision, so its results can be less precise. The difference grows when the values are large
+and close to each other.
