@@ -386,7 +386,7 @@ pub(crate) fn column_source_type_to_exasol(
     engine: EngineTimestampSupport,
 ) -> String {
     match source_type {
-        ColumnSourceType::Iceberg(ty) => iceberg_type_to_exasol(ty, engine),
+        ColumnSourceType::Iceberg(field) => iceberg_type_to_exasol(&field.field_type, engine),
         ColumnSourceType::Unity { type_json } => spark_type_to_exasol(
             unity_spark_field(type_json.as_deref()).map(|field| field.data_type),
             engine,

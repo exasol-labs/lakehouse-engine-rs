@@ -107,7 +107,8 @@ predicate stays applied above the scan as the sole source of row-level correctne
   `Double`, `Date`, `Timestamp`, `TimestampNtz`, `String`, `Decimal`. `Boolean`, `Binary`, `Void`, and
   every nested type carry `nullCount` only. The translator does not model this: a predicate over a
   statless column reaches the kernel and folds to keep-all.
-* **Column mapping needs no translator handling — the kernel resolves logical→physical itself.**
+* **Column mapping needs no physical-name handling in the translator — the kernel resolves
+  logical→physical itself.**
   Under `delta.columnMapping.mode` of `name` or `id`, a table's logical column name differs from the
   physical name that keys `add.stats`. `snapshot.schema()` returns the LOGICAL names, so the
   translator resolves against logical names and emits a logical `Expression::column`; the kernel maps
@@ -120,6 +121,16 @@ predicate stays applied above the scan as the sole source of row-level correctne
   1, and `id = 99` pruned to an empty list. Changing the literal moved the surviving file
   accordingly, so the selection is bound-driven and not incidental. Column mapping is therefore NOT a
   keep-all degradation and there is no pruning-completeness gap to track.
+* **A request column resolves through its declared binding key (#426).** The table's column notes
+  record each column's binding key at `createVirtualSchema` (`vs-adapter/column-source-notes`). The
+  translator finds the request column's note by the uppercase fold, then the current snapshot field
+  carrying the note's physical name (`name` mode) or field id (`id` mode), and emits that field's
+  CURRENT logical name, which the kernel maps to the physical stat path. Under the `none` mode the
+  declared name is the field's identity and resolves case-insensitively as before. Resolving by the
+  declared name alone would read another column's statistics after a source-side rename between
+  refreshes, and PROTOCOL.md § Reader Requirements for Column Mapping resolves "column level
+  statistics" by physical name. A column whose key the current snapshot no longer carries cannot be
+  translated, so its node imposes no constraint.
 * **Exasol pre-normalises `>`→`<` and `>=`→`<=`**, recorded once in
   `file-planning/pushdown-file-pruning` and not restated here. The translator still handles the greater
   forms and still flips an operator whose column sits on the right, because the normalization governs
@@ -242,6 +253,13 @@ predicate stays applied above the scan as the sole source of row-level correctne
 * *AND* the rows each query returns SHALL be identical to the rows the same query returns with pruning inert, so pruning is observable in the plan and invisible in the result
 * *AND* every request shape SHALL prune through the SAME seam, because the format-reader seam forwards the request's filter to the reader for a single-table scan and for each join leg alike (`file-planning/pushdown-format-neutral-resolution`), so no shape is left unpruned and none is gated on the table format
 * *AND* a join SHALL prune each side by that side's OWN side-local predicate, and MUST NOT apply one side's predicate to the other's file list
+
+### Scenario: A filter column resolves through its declared binding key
+
+* *GIVEN* a local copy of a `name`-mode column-mapped Delta table with columns `a` and `b`, whose data files hold disjoint value ranges of each such that the file holding `a = 7` holds no `b = 7`, the column notes `createVirtualSchema` recorded for it, and a later commit appended to the copy's log that swaps the two display names without rewriting a data file
+* *WHEN* the Delta format reader resolves the scan for a filter `A = 7` against those notes
+* *THEN* the reader SHALL translate the filter on `A` to the field that carries `a`'s recorded physical name, now displayed as `b`, so pruning keeps the file whose statistics for that physical column admit 7
+* *AND* a filter on a declared column whose physical name the current snapshot no longer carries SHALL prune no file for that conjunct
 
 ### Scenario: Delta pruning keeps every file with a matching row for every filter shape
 

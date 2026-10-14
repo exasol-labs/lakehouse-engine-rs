@@ -34,7 +34,7 @@ pub enum CatalogTableType {
 /// exhaustive mapping.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnSourceType {
-    Iceberg(iceberg::spec::Type),
+    Iceberg(iceberg::spec::NestedFieldRef),
     Unity {
         type_json: Option<String>,
     },
@@ -58,6 +58,20 @@ pub enum TableFormat {
 pub struct CatalogColumn {
     pub name: String,
     pub source_type: ColumnSourceType,
+    /// OPAQUE: an engine-side client's own encoded declaration of this column. This crate never
+    /// reads, parses, or builds it, and every client it declares leaves it `None`.
+    pub declaration: Option<String>,
+}
+
+impl CatalogColumn {
+    /// An undeclared column, as every client in this crate produces it.
+    pub fn new(name: impl Into<String>, source_type: ColumnSourceType) -> Self {
+        Self {
+            name: name.into(),
+            source_type,
+            declaration: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +91,9 @@ pub struct CatalogTable {
     /// The current Iceberg `metadata.json` a metastore catalog points to; absent for a
     /// catalog that serves Iceberg metadata itself, and for every other format.
     pub metadata_location: Option<String>,
+    /// The table-level properties the catalog reported, verbatim and never interpreted here;
+    /// empty when it reports none.
+    pub properties: BTreeMap<String, String>,
 }
 
 /// One catalog-registered partition. Its values come from the catalog, never from its
@@ -244,9 +261,8 @@ pub(crate) fn iceberg_catalog_table(
         .as_struct()
         .fields()
         .iter()
-        .map(|field| CatalogColumn {
-            name: field.name.clone(),
-            source_type: ColumnSourceType::Iceberg(field.field_type.as_ref().clone()),
+        .map(|field| {
+            CatalogColumn::new(field.name.clone(), ColumnSourceType::Iceberg(field.clone()))
         })
         .collect();
 
@@ -259,6 +275,7 @@ pub(crate) fn iceberg_catalog_table(
         partition_columns: Vec::new(),
         columns,
         metadata_location,
+        properties: BTreeMap::new(),
     }
 }
 

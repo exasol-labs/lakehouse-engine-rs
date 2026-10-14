@@ -7,16 +7,19 @@ use std::sync::Arc;
 
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{
-    CatalogProps, CatalogSession, CatalogTable, ConnectionCreds, GlueCatalogSession,
-    StorageBackend, TableFormat, UnityCatalogSession,
+    CatalogProps, CatalogSession, CatalogTable, ColumnSourceType, ConnectionCreds,
+    GlueCatalogSession, StorageBackend, TableFormat, UnityCatalogSession,
 };
 use object_store::ObjectStore;
 use serde_json::Value as Json;
 
-use crate::adapter::parquet_directory::DirectoryOptions;
+use crate::adapter::column_notes::{ColumnDeclaration, DeclaredSchema};
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry};
 
+pub use crate::adapter::column_notes::RefusedColumn;
+
+mod catalog_declaration;
 mod catalog_parquet_format_reader;
 mod delta_format_reader;
 mod delta_predicate;
@@ -31,8 +34,6 @@ mod unity_table_storage;
 
 use catalog_parquet_format_reader::{CatalogParquetFormatReader, ParquetFileSource};
 use delta_format_reader::DeltaFormatReader;
-#[cfg(test)]
-pub(crate) use iceberg::build_logical_schema;
 use iceberg::{IcebergFormatReader, IcebergMetadataSource};
 use parquet_format_reader::ParquetFormatReader;
 use unity_table_storage::UnityTableStorage;
@@ -41,72 +42,28 @@ use unity_table_storage::UnityTableStorage;
 #[path = "format_tests.rs"]
 mod tests;
 
-/// Never a `ScanSpec` field: only the pre-scan pushdown-resolution gate reads it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RefusedColumn {
-    pub column_name: String,
-    pub reason: String,
-}
-
-/// `raw_scan` cannot scan an empty schema.
-fn ensure_table_has_a_mappable_column(
-    logical_schema: &[LogicalField],
-    refused_columns: &[RefusedColumn],
-    table_kind: &str,
-) -> Result<(), UdfError> {
-    if !logical_schema.is_empty() || refused_columns.is_empty() {
-        return Ok(());
-    }
-
-    let reasons = refused_columns
+/// The one CREATE-time declaration dispatch: each column's note, `None` for a column no source
+/// declares. An engine-side client's slot already holds the encoded note. Never fails: a column
+/// whose metadata cannot be declared is recorded with its refusal.
+pub(crate) fn declare_columns(table: &CatalogTable) -> Vec<Option<String>> {
+    let catalog_declared = catalog_declaration::declare(table);
+    table
+        .columns
         .iter()
-        .map(|column| format!("'{}': {}", column.column_name, column.reason))
-        .collect::<Vec<_>>()
-        .join("; ");
-    Err(UdfError::User(format!(
-        "{table_kind} table has no mappable column; every column is refused: {reasons}"
-    )))
-}
-
-/// Shared by every source, so each binary refusal reads alike
-/// (`vs-adapter/binary-column-refusal`).
-fn binary_cause(declared: &str) -> String {
-    format!(
-        "has type '{declared}', which this engine refuses: rendering binary data is tracked as \
-         issue #351"
-    )
-}
-
-/// `member_path` is `None` when the column's own type is the binary one.
-pub(super) fn binary_refusal(
-    label: &str,
-    column: &str,
-    member_path: Option<&str>,
-    declared: &str,
-) -> RefusedColumn {
-    let subject = match member_path {
-        Some(member_path) => format!("{label} column '{column}', whose member '{member_path}'"),
-        None => format!("{label} column '{column}'"),
-    };
-    RefusedColumn {
-        column_name: column.to_string(),
-        reason: format!("{subject} {}", binary_cause(declared)),
-    }
-}
-
-/// The listing still declares a refused column, so only a request reading one fails.
-fn without_refused_columns(
-    mut logical_schema: Vec<LogicalField>,
-    refused_columns: &[RefusedColumn],
-    table_kind: &str,
-) -> Result<Vec<LogicalField>, UdfError> {
-    logical_schema.retain(|field| {
-        refused_columns
-            .iter()
-            .all(|refused| refused.column_name != field.name)
-    });
-    ensure_table_has_a_mappable_column(&logical_schema, refused_columns, table_kind)?;
-    Ok(logical_schema)
+        .enumerate()
+        .map(
+            |(index, column)| match (&column.declaration, &column.source_type) {
+                (Some(note), _) => Some(note.clone()),
+                (None, ColumnSourceType::Iceberg(field)) => {
+                    Some(iceberg::declaration(field).encode())
+                }
+                (None, ColumnSourceType::Unity { .. } | ColumnSourceType::Glue { .. }) => {
+                    catalog_declared.get(index).map(ColumnDeclaration::encode)
+                }
+                (None, ColumnSourceType::Parquet(_)) => None,
+            },
+        )
+        .collect()
 }
 
 /// Checked before any credential or storage access; neither the catalog URI nor the
@@ -125,30 +82,66 @@ fn checked_storage_location<'t>(
     }
 }
 
+/// A table's planned files with its declared schema: the scan a pushdown renders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedScan {
     pub files: Vec<FileEntry>,
-    /// The storage the files were resolved through and must be read through (vended under
-    /// vending, the CONNECTION's own otherwise).
     pub effective_storage: StorageBackend,
     pub logical_schema: Vec<LogicalField>,
     pub table_root: String,
-    /// Physical-name-to-field-id entries for data files carrying no embedded id.
     pub name_mapping: Vec<NameMappingEntry>,
-    /// Always empty for Iceberg.
     pub partition_columns: Vec<String>,
     pub refused_columns: Vec<RefusedColumn>,
 }
 
-/// Each implementation owns its whole resolution (catalog request, credential, file
-/// discovery) because formats need different inputs to reach their file list. Returns a
-/// boxed future because `async fn` in a trait is not dyn-compatible.
+impl ResolvedScan {
+    /// Plans `reader`'s files against `declared`, the table's parsed column notes.
+    pub async fn resolve(
+        reader: &dyn FormatReader,
+        declared: DeclaredSchema,
+        filter_json: Option<&Json>,
+    ) -> Result<Self, UdfError> {
+        let planned = reader.resolve_scan(&declared, filter_json).await?;
+        Ok(Self::new(declared, planned))
+    }
+
+    /// The schema half comes from the column notes alone, so no reader can substitute its own.
+    fn new(declared: DeclaredSchema, planned: PlannedFiles) -> Self {
+        Self {
+            files: planned.files,
+            effective_storage: planned.effective_storage,
+            logical_schema: declared.logical_schema,
+            table_root: planned.table_root,
+            name_mapping: planned.name_mapping,
+            partition_columns: declared.partition_columns,
+            refused_columns: declared.refused_columns,
+        }
+    }
+}
+
+/// What a format reader resolves per query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedFiles {
+    pub files: Vec<FileEntry>,
+    /// The storage the files were resolved through and must be read through (vended under
+    /// vending, the CONNECTION's own otherwise).
+    pub effective_storage: StorageBackend,
+    pub table_root: String,
+    /// Physical-name-to-field-id entries for data files carrying no embedded id.
+    pub name_mapping: Vec<NameMappingEntry>,
+}
+
+/// Each implementation owns its whole file resolution (catalog request, credential, file
+/// discovery) because formats need different inputs to reach their file list; the schema is
+/// the declaration every reader receives. Returns a boxed future because `async fn` in a trait
+/// is not dyn-compatible.
 pub trait FormatReader: Send + Sync {
     /// `None` disables format-level pruning.
     fn resolve_scan<'a>(
         &'a self,
+        declared: &'a DeclaredSchema,
         filter_json: Option<&'a Json>,
-    ) -> Pin<Box<dyn Future<Output = Result<ResolvedScan, UdfError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<PlannedFiles, UdfError>> + Send + 'a>>;
 }
 
 /// Deliberately not the catalog kind: it carries an already-resolved session (and, for
@@ -166,13 +159,9 @@ pub enum ScanSource<'a> {
         session: &'a GlueCatalogSession,
         table: &'a CatalogTable,
     },
-    /// `declared_columns` is the request's `(Exasol name, Exasol type)` declaration, so a column
-    /// no kept file carries still resolves.
     DirectParquet {
         store: &'a Arc<dyn ObjectStore>,
         table_root: &'a str,
-        options: DirectoryOptions,
-        declared_columns: &'a [(String, String)],
     },
 }
 
@@ -203,9 +192,10 @@ pub fn format_reader<'a>(
             connection: *connection,
         })),
         ScanSource::Unity { session, table } => match table.format {
-            TableFormat::Delta => Ok(Box::new(DeltaFormatReader::new(session, table, connection))),
+            TableFormat::Delta => Ok(Box::new(DeltaFormatReader {
+                storage: UnityTableStorage::new(session, table, connection),
+            })),
             TableFormat::Parquet => Ok(Box::new(CatalogParquetFormatReader {
-                table,
                 files: ParquetFileSource::TableDirectory(UnityTableStorage::new(
                     session, table, connection,
                 )),
@@ -223,10 +213,10 @@ pub fn format_reader<'a>(
                 connection: *connection,
             })),
             TableFormat::Parquet => Ok(Box::new(CatalogParquetFormatReader {
-                table,
                 files: ParquetFileSource::GluePartitions {
                     session,
                     storage: connection.storage,
+                    table,
                 },
             })),
             TableFormat::Delta => Err(UdfError::User(format!(
@@ -235,16 +225,9 @@ pub fn format_reader<'a>(
                 table.format
             ))),
         },
-        ScanSource::DirectParquet {
+        ScanSource::DirectParquet { store, table_root } => Ok(Box::new(ParquetFormatReader {
             store,
             table_root,
-            options,
-            declared_columns,
-        } => Ok(Box::new(ParquetFormatReader {
-            store,
-            table_root,
-            options,
-            declared_columns,
             storage: connection.storage,
         })),
     }

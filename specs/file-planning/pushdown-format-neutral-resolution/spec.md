@@ -34,9 +34,15 @@ this feature. Only file resolution differs per format.
 * *GIVEN* four pushdown requests over the SAME virtual schema — a single-table projection scan, a
   single-table aggregate, a grouped aggregate, and a broadcast inner equi-join with two legs
 * *WHEN* the adapter plans each request
-* *THEN* the adapter SHALL obtain each table's file list, logical schema, partition columns, table
-  root, name mapping, and effective storage from a `ResolvedScan` returned by the format-reader seam,
-  and MUST NOT call any format-specific file resolver directly
+* *THEN* the adapter SHALL obtain each table's file list, table root, name mapping, and effective
+  storage from the format-reader seam, and each table's logical schema, partition columns, and
+  refused columns from that table's column notes (`vs-adapter/column-source-notes`), assembled into
+  one `ResolvedScan`, and MUST NOT call any format-specific file resolver directly
+* *AND* the adapter SHALL parse a table's column notes at ONE site in the per-request resolver and
+  SHALL pass the parsed declaration to the format reader, so every reader receives the same
+  declaration and no reader parses notes itself
+* *AND* every parameter the resolver and the reader take SHALL be read by every format arm, so no
+  signature carries a value only one format consumes
 * *AND* the adapter SHALL apply that rule to EVERY leg of the join, so a join leg and a single-table
   scan resolve identically
 * *AND* the adapter MUST NOT gate any request shape on the table format or the catalog kind, so

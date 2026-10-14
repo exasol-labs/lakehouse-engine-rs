@@ -6,24 +6,24 @@ This file holds the rules for how this repository tests its behavior and how it 
 
 ### Coverage rule
 
-- Every scenario in a feature spec has at least one E2E test or host integration test over local fixtures that exercises it. A test against a fake server does not count as that proof (§ Testing strategy). A unit test alone is enough only for pure computation with no I/O.
-- A test that implements a scenario carries one `/// Scenario: <title>` line per scenario, quoting the title verbatim (`AGENTS.md` § Code style).
+- Every scenario in a feature spec has at least one E2E test that exercises it. A unit test alone is enough only for pure computation with no I/O. A host test that reads fixture files, lists a store, or talks to a fake server is no proof of a scenario (§ Testing strategy).
+- A test that implements a scenario carries one `/// Scenario: <title>` line per scenario, quoting the title verbatim (`AGENTS.md` § Code style). A unit test carries the line only when it is the scenario's one proof, so a scenario an E2E test proves has no tagged unit test.
 - An E2E suite is a place where feature scenarios get proof against a live Exasol. It holds no requirement of its own. When an E2E test finds behavior that no feature spec states, that behavior goes into a feature spec, not into this file.
-- An E2E test proves the behavior a user sees through Exasol SQL. A property that Exasol SQL cannot observe stays proved by its unit or integration test, and an E2E test does not assert it.
+- An E2E test proves the behavior a user sees through Exasol SQL. A property that Exasol SQL cannot observe stays proved by its unit test, and an E2E test does not assert it.
 - A scenario whose state no well-formed Exasol request can reach is proved by a unit test over a synthesized request, not by an E2E test.
 
 ### Test tiers
 
 - Unit tests run on the host with `cargo test`. They live in a sibling `_tests.rs` file (`AGENTS.md` § Code style).
-- Integration tests run on the host with `cargo test` against local fixtures, for example a local-filesystem object store over the vendored Delta fixtures. They need no Exasol. A test against a fake server is a fault-injection test, not an integration test.
+- There is no host integration tier. A host test that writes or lists files, reads an object store, or chains several modules to prove behavior is an E2E test in the wrong place. A test against a fake server is a fault-injection test.
 - Scan UDF tests run `run()` on the host through `exasol_udf_sdk::test_support::TestContext` (`EmitPolicy`, `NextPolicy`). A new scan test uses this pattern.
 - E2E tests run against a live Exasol and a real or containerized catalog and object store. Each E2E suite is gated by its own cargo feature, so the plain `cargo test` run never needs a stack.
 
 ### Testing strategy
 
-- Two layers only. E2E tests prove the behavior a user sees, against the real stack. Unit tests cover pure logic (parsing, mapping, validation, building requests, reading answers) and what coverage needs. Each behavior is tested at one layer, not repeated at several.
+- Two layers only. E2E tests prove the behavior a user sees, against the real stack. Unit tests cover pure logic (parsing, mapping, validation, building requests, reading answers). Each behavior is tested at one layer, not repeated at several. A coverage gap is closed by a unit test of pure logic, never by a multi-module host test or a fake.
 - A fake server is for fault injection only: failures an E2E test cannot produce, such as timeouts, cut-off answers, and unreachable hosts. There is at most one shared fake per external system. A fake never stands in for a catalog, object store, or STS to prove behavior, because it tests our idea of the external system, not the system.
-- Unit tests stay simple: plain inputs and expected outputs. They assert nothing on a fake's request log or call order, and no test reads source files.
+- Unit tests stay simple: one unit, plain inputs, and expected outputs, with no I/O, no written file, and no started server. They assert nothing on a fake's request log or call order, and no test reads source files.
 - No production function exists only so a test can inject a value.
 - Access control is proved end to end. A permission feature needs E2E tests for an allowed user, a denied user, a query over several tables where only some are granted, a view, and a revoked grant.
 
@@ -95,7 +95,7 @@ This file holds the rules for how this repository tests its behavior and how it 
 
 ### Regression guards
 
-- A change that a feature spec declares behavior-preserving keeps every existing unit, integration, and E2E test assertion, golden-SQL string, and `dispatch_golden` fixture unchanged. The only exceptions are the edits the change itself requires, such as import paths and call sites of a renamed or demoted item, and the one value the spec names as changing. No assertion is weakened, disabled, or deleted to make a test pass. A dedicated test cleanup may delete a test, provided the coverage stays the same and each scenario is still proved at one layer.
+- A change that a feature spec declares behavior-preserving keeps every existing unit and E2E test assertion, golden-SQL string, and `dispatch_golden` fixture unchanged. The only exceptions are the edits the change itself requires, such as import paths and call sites of a renamed or demoted item, and the one value the spec names as changing. No assertion is weakened, disabled, or deleted to make a test pass. A dedicated test cleanup may delete a test, provided the coverage stays the same and each scenario is still proved at one layer.
 - A committed golden SQL fixture (`dispatch_golden`) changes only with an intended change of the generated SQL. A diff in any other change is a regression, not an expected update.
 - A test whose assertion a change makes false is deleted together with its section banner and its test-only imports.
 - When code moves to another crate, its test module moves with it and keeps every test name and expected value. A test of a property of the code left behind stays with that code. A helper that several test modules share is declared once in the crate's `#[cfg(test)]` support module. No test is deleted, disabled, or weakened to fit a visibility change.

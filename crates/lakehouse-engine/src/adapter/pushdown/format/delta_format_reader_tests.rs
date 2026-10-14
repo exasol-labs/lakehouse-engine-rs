@@ -1,9 +1,17 @@
+use delta_kernel::schema::DataType as DeltaType;
+
+use super::super::{ConnectionStorage, ResolvedScan};
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, UNREACHABLE_CATALOG, closed_port_storage,
-    delta_commit_zero_key, delta_object_endpoint, sample_storage, user_message,
+    SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, UNREACHABLE_CATALOG, catalog_table,
+    closed_port_storage, declared_notes, delta_commit_zero_key, delta_object_endpoint,
+    involved_notes, nullable_field, resolve_from_notes, sample_storage, unity_delta_table,
+    user_message,
 };
-use lakehouse_catalog::{CatalogTableIdent, CatalogTableType, ConnectionCreds, TableFormat};
+use lakehouse_catalog::{
+    CatalogTable, CatalogTableIdent, ConnectionCreds, StorageBackend, TableFormat,
+    UnityCatalogSession,
+};
 
 const TABLE_NAME: &str = "cat.sch.orders";
 
@@ -41,14 +49,30 @@ fn delta_table(
             namespace: vec!["cat".into(), "sch".into()],
             name: "orders".into(),
         },
-        table_type: CatalogTableType::Table,
         storage_location: storage_location.map(str::to_string),
-        format: TableFormat::Delta,
         vended_credential_key: vended_credential_key.map(str::to_string),
-        partition_columns: Vec::new(),
-        metadata_location: None,
-        columns: Vec::new(),
+        ..catalog_table(TableFormat::Delta, "")
     }
+}
+
+/// The Delta reader of `table`, planned from `notes`.
+async fn resolve_noted(
+    table: &CatalogTable,
+    notes: &[(String, String)],
+    creds: &ConnectionCreds,
+    storage: &StorageBackend,
+    filter: Option<&Json>,
+) -> Result<ResolvedScan, UdfError> {
+    let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
+    let connection = ConnectionStorage {
+        storage,
+        creds,
+        allow_http: true,
+    };
+    let reader = DeltaFormatReader {
+        storage: UnityTableStorage::new(&session, table, &connection),
+    };
+    resolve_from_notes(&reader, &involved_notes(TABLE_NAME, notes), filter).await
 }
 
 async fn refusal(table: &CatalogTable, use_vended_credentials: bool) -> String {
@@ -61,17 +85,8 @@ async fn refusal_as(
     creds: &ConnectionCreds,
     storage: &StorageBackend,
 ) -> String {
-    let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
-    let connection = ConnectionStorage {
-        storage,
-        creds,
-        allow_http: true,
-    };
-    let reader = DeltaFormatReader::new(&session, table, &connection);
-
     user_message(
-        reader
-            .resolve_scan(None)
+        resolve_noted(table, &[], creds, storage, None)
             .await
             .expect_err("resolution must fail, never answer a scan"),
     )
@@ -164,23 +179,9 @@ const DELTA_TABLE_ROOT: &str = "s3://bucket/cat/sch/orders";
 
 #[tokio::test]
 async fn a_failed_log_read_reports_no_static_credential_value() {
-    let creds = creds(false);
-    let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
-    let storage = closed_port_storage();
     let table = delta_table(Some(DELTA_TABLE_ROOT), None);
-    let connection = ConnectionStorage {
-        storage: &storage,
-        creds: &creds,
-        allow_http: true,
-    };
-    let reader = DeltaFormatReader::new(&session, &table, &connection);
 
-    let message = user_message(
-        reader
-            .resolve_scan(None)
-            .await
-            .expect_err("a log read against a closed port must fail, never answer a scan"),
-    );
+    let message = refusal_as(&table, &creds(false), &closed_port_storage()).await;
 
     assert!(
         message.contains(DELTA_TABLE_ROOT),
@@ -246,24 +247,18 @@ fn letter_equals_a_filter() -> Json {
 /// Scenario: Enabling the kernel's skipping surfaces no statistic to the engine or the wire
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pruning_changes_only_the_file_list_of_the_resolved_scan() {
-    let creds = creds(false);
-    let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
     let storage = pruning_fixture_storage().await;
     let table = delta_table(Some(&format!("s3://bucket/{PRUNING_FIXTURE_TABLE}")), None);
-    let connection = ConnectionStorage {
-        storage: &storage,
-        creds: &creds,
-        allow_http: true,
-    };
-    let reader = DeltaFormatReader::new(&session, &table, &connection);
+    let letter = StructField::nullable("letter", DeltaType::STRING);
+    let notes = declared_notes(&unity_delta_table(&[letter], None, &["letter"]));
+    let creds = creds(false);
+    let resolve = |filter| resolve_noted(&table, &notes, &creds, &storage, filter);
 
     let filter = letter_equals_a_filter();
-    let pruned = reader
-        .resolve_scan(Some(&filter))
+    let pruned = resolve(Some(&filter))
         .await
         .expect("a filter naming the partition column must resolve a pruned scan");
-    let unpruned = reader
-        .resolve_scan(None)
+    let unpruned = resolve(None)
         .await
         .expect("an unfiltered request must resolve every active file");
 
@@ -288,4 +283,35 @@ async fn pruning_changes_only_the_file_list_of_the_resolved_scan() {
     assert_eq!(pruned.table_root, unpruned.table_root);
     assert_eq!(pruned.name_mapping, unpruned.name_mapping);
     assert_eq!(pruned.refused_columns, unpruned.refused_columns);
+}
+
+fn physically_named(name: &str, physical_name: &str) -> StructField {
+    StructField::nullable(name, DeltaType::LONG).with_metadata([(
+        "delta.columnMapping.physicalName",
+        MetadataValue::String(physical_name.to_string()),
+    )])
+}
+
+/// Scenario: A filter column resolves through its declared binding key
+#[test]
+fn a_declared_field_binds_to_the_snapshot_field_holding_its_physical_name() {
+    let rename_swapped = StructType::try_new([
+        physically_named("value", "col-id"),
+        physically_named("id", "col-value"),
+    ])
+    .expect("distinct names");
+    let declared = |physical_name: &str| LogicalField {
+        physical_name: Some(physical_name.to_string()),
+        ..nullable_field("id", "int64")
+    };
+
+    assert_eq!(
+        snapshot_field(&rename_swapped, &declared("col-id")).map(|field| field.name().as_str()),
+        Some("value"),
+        "`id` declares `col-id`, which the current schema names `value`"
+    );
+    assert!(
+        snapshot_field(&rename_swapped, &declared("col-dropped")).is_none(),
+        "a key the snapshot lacks binds no field"
+    );
 }

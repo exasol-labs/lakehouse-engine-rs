@@ -1,8 +1,7 @@
 use super::super::single_group_agg::{single_group_merge_select, single_group_plan_types};
 use super::super::support::{
     AggregateMergeInputs, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, build_scan_driving_sql,
-    classify_where_filter, extract_all_column_types, extract_projection, order_by_present,
-    shard_count,
+    classify_where_filter, extract_projection, involved_columns, order_by_present, shard_count,
 };
 use super::super::test_support::*;
 use super::super::{detect_aggregates, ordinary_plans, validate_agg_col_types};
@@ -19,7 +18,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
         extract_projection(request, &pushdown_req).unwrap();
     let limit = extract_limit(&pushdown_req);
     let has_order_by = order_by_present(&pushdown_req);
-    let col_types = extract_all_column_types(request);
+    let col_types = involved_columns(request, |tables| tables.first()).types;
     // Covers only the no-decline half; a declining fixture belongs on `build_dispatch_sql`.
     let (filter, declined_filter) = classify_where_filter(
         pushdown_req.get("filter").filter(|f| !f.is_null()),

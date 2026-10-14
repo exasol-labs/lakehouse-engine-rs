@@ -30,7 +30,8 @@ pub(super) use sql_builders::{
 
 pub(super) use planning::JoinWindowPlan;
 use planning::{
-    classify_join_window, involved_table_columns, resolve_one_join_side, select_broadcast_sides,
+    classify_join_window, involved_table, involved_table_columns, resolve_one_join_side,
+    select_broadcast_sides,
 };
 use rendering::{has_no_explicit_select_list, leg_local_filter, possible_side_column_names};
 // `pub(super)` so the `#[cfg(test)]` dispatch-golden sibling module can drive both builders.
@@ -147,28 +148,28 @@ pub(super) async fn plan_join(
     let side_filters: Vec<Option<Json>> = (0..join.tables.len())
         .map(|leg| filter.and_then(|f| leg_local_filter(f, &legs, leg)))
         .collect();
-    let side_columns: Vec<Vec<(String, String)>> = join
+    let (side_columns, side_notes): (Vec<Vec<(String, String)>>, Vec<_>) = join
         .tables
         .iter()
-        .map(|leaf| involved_table_columns(request, &leaf.table_name))
-        .collect();
+        .map(|leaf| {
+            let involved = involved_table(request, &leaf.table_name);
+            (involved.types, involved.notes)
+        })
+        .unzip();
     // `try_join_all` preserves leg order, which later steps index by.
-    let sides: Vec<ResolvedJoinSide> = try_join_all(
-        join.tables
-            .iter()
-            .zip(&side_filters)
-            .zip(&side_columns)
-            .map(|((leaf, side_filter), columns)| {
+    let sides: Vec<ResolvedJoinSide> =
+        try_join_all(join.tables.iter().zip(&side_filters).zip(&side_notes).map(
+            |((leaf, side_filter), notes)| {
                 resolve_one_join_side(
                     &leaf.table_name,
                     &leaf.table_identifier,
                     &resolver,
                     side_filter.as_ref(),
-                    columns,
+                    notes,
                 )
-            }),
-    )
-    .await?;
+            },
+        ))
+        .await?;
 
     ensure_no_side_refuses_a_referenced_column(request, pushdown_req, &sides)?;
 

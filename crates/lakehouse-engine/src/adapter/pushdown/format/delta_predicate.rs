@@ -1,5 +1,5 @@
 use delta_kernel::expressions::{DecimalData, Scalar};
-use delta_kernel::schema::{DataType, DecimalType, PrimitiveType, StructType};
+use delta_kernel::schema::{DataType, DecimalType, PrimitiveType, StructField};
 use delta_kernel::{Expression, Predicate};
 use serde_json::Value as Json;
 
@@ -8,10 +8,15 @@ use super::filter_json::{
     subject_column,
 };
 
+/// Each declared column's name paired with the current snapshot field its binding key names.
+type FilterColumns<'s> = [(&'s str, &'s StructField)];
+
 /// `None` means no constraint (pass all files, never none): an untranslatable node must
-/// widen the surviving file set, never narrow it.
-pub(crate) fn to_delta_predicate(filter_json: &Json, schema: &StructType) -> Option<Predicate> {
-    translate_node(filter_json, schema).map(|translated| translated.predicate)
+/// widen the surviving file set, never narrow it. A filter column is found among `columns` by
+/// its declared name and emitted under its field's current name; one missing from `columns`
+/// constrains nothing.
+pub(crate) fn to_delta_predicate(filter_json: &Json, columns: &FilterColumns) -> Option<Predicate> {
+    translate_node(filter_json, columns).map(|translated| translated.predicate)
 }
 
 /// Only an exact translation may be negated: `NOT` over a widened child would narrow it,
@@ -31,22 +36,22 @@ impl Translated {
     }
 }
 
-fn translate_node(filter_json: &Json, schema: &StructType) -> Option<Translated> {
+fn translate_node(filter_json: &Json, columns: &FilterColumns) -> Option<Translated> {
     let kind = filter_json.get("type")?.as_str()?;
     if let Some(comparison) = Comparison::from_node_type(kind) {
-        return translate_comparison(filter_json, comparison, schema);
+        return translate_comparison(filter_json, comparison, columns);
     }
 
     match kind {
-        "predicate_in_constlist" => translate_in(filter_json, schema),
+        "predicate_in_constlist" => translate_in(filter_json, columns),
         "predicate_is_null" => {
-            let (field_name, _prim) = resolve_column(subject_column(filter_json)?, schema)?;
+            let (field_name, _prim) = resolve_column(subject_column(filter_json)?, columns)?;
             Some(Translated::exact(Predicate::is_null(Expression::column([
                 field_name,
             ]))))
         }
         "predicate_is_not_null" => {
-            let (field_name, _prim) = resolve_column(subject_column(filter_json)?, schema)?;
+            let (field_name, _prim) = resolve_column(subject_column(filter_json)?, columns)?;
             Some(Translated::exact(Predicate::is_not_null(
                 Expression::column([field_name]),
             )))
@@ -54,20 +59,20 @@ fn translate_node(filter_json: &Json, schema: &StructType) -> Option<Translated>
         "predicate_and" => fold_and(
             operands(filter_json)?
                 .iter()
-                .map(|expr| translate_node(expr, schema)),
+                .map(|expr| translate_node(expr, columns)),
         ),
         "predicate_or" => fold_or(
             operands(filter_json)?
                 .iter()
-                .map(|expr| translate_node(expr, schema)),
+                .map(|expr| translate_node(expr, columns)),
         ),
         "predicate_not" => {
             let inner = filter_json.get("expression")?;
-            let Translated { predicate, exact } = translate_node(inner, schema)?;
+            let Translated { predicate, exact } = translate_node(inner, columns)?;
             exact.then(|| Translated::exact(Predicate::not(predicate)))
         }
 
-        "predicate_between" => translate_between(filter_json, schema),
+        "predicate_between" => translate_between(filter_json, columns),
 
         _ => None,
     }
@@ -112,11 +117,12 @@ fn fold_or(children: impl Iterator<Item = Option<Translated>>) -> Option<Transla
 
 fn resolve_column<'s>(
     col_name: &str,
-    schema: &'s StructType,
+    columns: &FilterColumns<'s>,
 ) -> Option<(&'s str, &'s PrimitiveType)> {
-    let field = schema
-        .fields()
-        .find(|f| f.name().eq_ignore_ascii_case(col_name))?;
+    let column = col_name.to_uppercase();
+    let (_, field) = columns
+        .iter()
+        .find(|(declared, _)| declared.to_uppercase() == column)?;
     match field.data_type() {
         DataType::Primitive(prim) => Some((field.name().as_str(), prim)),
         _ => None,
@@ -247,10 +253,10 @@ fn rescale(unscaled: i128, from: i32, to: i32) -> Option<i128> {
 fn translate_comparison(
     node: &Json,
     comparison: Comparison,
-    schema: &StructType,
+    columns: &FilterColumns,
 ) -> Option<Translated> {
     let (col_name, lit_node, comparison) = comparison_operands(node, comparison)?;
-    let (field_name, prim) = resolve_column(col_name, schema)?;
+    let (field_name, prim) = resolve_column(col_name, columns)?;
     let scalar = literal_to_scalar(lit_node, prim)?;
     let column = Expression::column([field_name]);
     let literal = Expression::literal(scalar);
@@ -268,9 +274,9 @@ fn translate_comparison(
 }
 
 /// Desugared into ORed equalities because the kernel prunes nothing for a native IN.
-fn translate_in(node: &Json, schema: &StructType) -> Option<Translated> {
+fn translate_in(node: &Json, columns: &FilterColumns) -> Option<Translated> {
     let (col_name, args) = in_operands(node)?;
-    let (field_name, prim) = resolve_column(col_name, schema)?;
+    let (field_name, prim) = resolve_column(col_name, columns)?;
     fold_or(args.iter().map(|arg| {
         let scalar = literal_to_scalar(arg, prim)?;
         Some(Translated::exact(Predicate::eq(
@@ -281,9 +287,9 @@ fn translate_in(node: &Json, schema: &StructType) -> Option<Translated> {
 }
 
 /// Either bound alone is implied by BETWEEN, so an untranslatable bound is dropped.
-fn translate_between(node: &Json, schema: &StructType) -> Option<Translated> {
+fn translate_between(node: &Json, columns: &FilterColumns) -> Option<Translated> {
     let (col_name, low, high) = between_operands(node)?;
-    let (field_name, prim) = resolve_column(col_name, schema)?;
+    let (field_name, prim) = resolve_column(col_name, columns)?;
 
     let low_pred = low.and_then(|n| literal_to_scalar(n, prim)).map(|scalar| {
         Translated::exact(Predicate::ge(

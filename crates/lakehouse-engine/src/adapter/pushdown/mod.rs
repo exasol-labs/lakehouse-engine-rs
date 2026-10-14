@@ -21,8 +21,9 @@ use serde_json::Value as Json;
 mod support;
 pub use support::{AggregateMergeInputs, build_fan_out_inner, build_scan_driving_sql, shard_count};
 use support::{
-    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, classify_where_filter, extract_all_column_types,
-    extract_limit, extract_projection, order_by_present, scan_storage_for, strip_table_alias,
+    DISTRIBUTE_FILES_UDF_NAME, InvolvedColumns, SCAN_UDF_NAME, classify_where_filter,
+    extract_limit, extract_projection, involved_columns, order_by_present, scan_storage_for,
+    strip_table_alias,
 };
 
 mod empty_result;
@@ -32,6 +33,7 @@ mod shard_paths;
 use shard_paths::relativize_shards_to_root;
 
 mod format;
+pub(crate) use format::declare_columns;
 pub use format::{
     ConnectionStorage, FormatReader, RefusedColumn, ResolvedScan, ScanSource, format_reader,
 };
@@ -84,7 +86,7 @@ use vs_expression::render_df_filter_safe;
 
 #[cfg(test)]
 #[path = "test_support_tests.rs"]
-pub(super) mod test_support;
+pub(crate) mod test_support;
 
 #[cfg(test)]
 #[path = "dispatch_golden_tests.rs"]
@@ -150,7 +152,10 @@ pub async fn handle_pushdown(
 
     let filter_json_raw = pushdown_req.get("filter").filter(|f| !f.is_null());
 
-    let col_types = extract_all_column_types(request);
+    let InvolvedColumns {
+        types: col_types,
+        notes: col_notes,
+    } = involved_columns(request, |tables| tables.first());
 
     // `filter_json_raw` stays unmodified: format-level pruning must see the original
     // predicate tree, whatever the adapter declines.
@@ -185,7 +190,7 @@ pub async fn handle_pushdown(
         partition_columns,
         refused_columns,
     } = resolver
-        .resolve(&catalog.table, filter_json_raw, &col_types)
+        .resolve(&catalog.table, filter_json_raw, &col_notes)
         .await?;
     let scan_storage = scan_storage_for(
         &conn.creds,
@@ -577,9 +582,6 @@ pub(crate) fn build_dispatch_sql(
 
     Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
 }
-
-#[cfg(test)]
-pub(crate) use format::build_logical_schema;
 
 #[cfg(test)]
 #[path = "pushdown_tests.rs"]

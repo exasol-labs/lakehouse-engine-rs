@@ -119,18 +119,46 @@ fn both_clients_are_catalog_client_trait_objects() {
     assert_eq!(clients.len(), 2);
 }
 
+/// Scenario: The neutral column's declaration slot extends the crate's public surface through an explicit reviewed edit
+/// Scenario: The Iceberg column source carries the whole Iceberg field through an explicit reviewed edit
+/// Scenario: The neutral table's catalog properties extend the crate's public surface through an explicit reviewed edit
 #[test]
 fn catalog_client_trait_and_neutral_types_are_reachable() {
+    use iceberg::spec::{Literal, NestedField, PrimitiveType, Type};
+
     let ident = CatalogTableIdent {
         namespace: vec!["ns".into()],
         name: "t".into(),
     };
+    let unity_source = ColumnSourceType::Unity {
+        type_json: Some("{\"type\":\"integer\"}".into()),
+    };
     let column = CatalogColumn {
         name: "c".into(),
-        source_type: ColumnSourceType::Unity {
-            type_json: Some("{\"type\":\"integer\"}".into()),
-        },
+        source_type: unity_source.clone(),
+        declaration: Some("{\"sourceType\":{}}".into()),
     };
+    assert_eq!(column.declaration.as_deref(), Some("{\"sourceType\":{}}"));
+    assert_ne!(column, CatalogColumn::new("c", unity_source));
+
+    let field = NestedField::required(7, "qty", Type::Primitive(PrimitiveType::Long))
+        .with_initial_default(Literal::long(0));
+    let iceberg = CatalogColumn::new("qty", ColumnSourceType::Iceberg(field.into()));
+    let ColumnSourceType::Iceberg(field) = &iceberg.source_type else {
+        panic!(
+            "expected an Iceberg source type, got {:?}",
+            iceberg.source_type
+        );
+    };
+    assert_eq!(
+        (field.id, field.required, field.initial_default.clone()),
+        (7, true, Some(Literal::long(0)))
+    );
+
+    let properties = BTreeMap::from([
+        ("delta.columnMapping.mode".to_string(), "name".to_string()),
+        ("owner".to_string(), "Data Team".to_string()),
+    ]);
     let table = CatalogTable {
         ident: ident.clone(),
         table_type: CatalogTableType::Table,
@@ -139,8 +167,10 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
         vended_credential_key: Some("opaque-vending-key".into()),
         partition_columns: vec!["c".into()],
         metadata_location: None,
-        columns: vec![column],
+        columns: vec![column, iceberg],
+        properties: properties.clone(),
     };
+    assert_eq!(table.properties, properties);
     assert_eq!(table.format, TableFormat::Delta);
     assert_ne!(
         TableFormat::Iceberg,
@@ -191,6 +221,7 @@ fn added_neutral_variants_are_reachable_from_outside_the_crate() {
     assert_ne!(TableFormat::Parquet, TableFormat::Delta);
 
     let column = CatalogColumn {
+        declaration: None,
         name: "c".into(),
         source_type: ColumnSourceType::Parquet("int64".into()),
     };
@@ -213,6 +244,7 @@ fn added_neutral_variants_are_reachable_from_outside_the_crate() {
             partition_columns: Vec::new(),
             metadata_location: None,
             columns: vec![column],
+            properties: Default::default(),
         }],
         skipped: vec![SkippedTable {
             ident,
@@ -352,12 +384,14 @@ fn glue_additions_are_reachable_through_neutral_types_only() {
         vended_credential_key: None,
         partition_columns: vec!["p_int".to_string()],
         columns: vec![CatalogColumn {
+            declaration: None,
             name: "payload".into(),
             source_type: ColumnSourceType::Glue {
                 hive_type: "struct<x:int>".into(),
             },
         }],
         metadata_location: Some("s3://bucket/orders/metadata/00001.metadata.json".into()),
+        properties: Default::default(),
     };
     assert_eq!(catalog_identifier_string(&ident), "sales.orders");
     assert_eq!(

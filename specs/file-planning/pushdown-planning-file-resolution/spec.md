@@ -3,20 +3,21 @@
 Resolves a table's identity and current file state exactly once per pushdown, before any
 SQL is built. Recovers the target table from the Exasol involved-table name via the
 persisted `TABLE_MAP` and hands it to the format reader that owns its table format, which
-returns the active data-file list, each file's byte size, the logical schema, the table
-root, and — where the format has them — each file's associated delete references, all at one
-resolve-once seam so the scan UDF never discovers files, delete files, or sizes itself. That
+returns the active data-file list, each file's byte size, the table root, and — where the
+format has them — each file's associated delete references, all at one resolve-once seam so
+the scan UDF never discovers files, delete files, or sizes itself. The table's logical schema
+comes from its column notes (`vs-adapter/column-source-notes`), never from the reader. That
 orchestration has no Delta counterpart feature because it never needed one: a Delta table
 reaches it by the same route an Iceberg one does
 (`file-planning/pushdown-format-neutral-resolution`). This feature owns the ICEBERG reader's
-half of the seam — the multi-level `TableIdent` build, the Iceberg snapshot and
-`current_schema()` read that produce the field-id-carrying logical schema, and the
-merge-on-read positional-delete resolution; the Delta reader's half is owned by
-`delta/delta-table-planning`. A `loadTable` response that carries no table `location`
-is rejected here, before the vended/static storage split, so every path depending on a table
-root — including each join side — fails identically rather than resolving an empty root. See
-`pushdown/pushdown-planning` for how the resolved table identity, file list, byte sizes,
-delete-file references, and logical schema feed the scan-driving SQL.
+half of the seam — the multi-level `TableIdent` build, the Iceberg snapshot read, the
+field-id-carrying logical schema `createVirtualSchema` records from the table's
+`current_schema()`, and the merge-on-read positional-delete resolution; the Delta reader's half
+is owned by `delta/delta-table-planning`. A `loadTable` response that carries no table
+`location` is rejected here, before the vended/static storage split, so every path depending on
+a table root — including each join side — fails identically rather than resolving an empty
+root. See `pushdown/pushdown-planning` for how the resolved table identity, file list, byte
+sizes, delete-file references, and logical schema feed the scan-driving SQL.
 
 ## Background
 
@@ -24,11 +25,11 @@ delete-file references, and logical schema feed the scan-driving SQL.
   `ScanSpec` build — is format-neutral: every table format reaches it by the same route
   (`file-planning/pushdown-format-neutral-resolution`), and the scan UDF never discovers files,
   delete files, or sizes itself. Only the READER behind that seam is format-specific. This
-  feature owns the ICEBERG reader's half — the multi-level `TableIdent` build, the snapshot and
-  `current_schema()` read, each file's byte size from the Iceberg manifest, and merge-on-read
+  feature owns the ICEBERG reader's half — the multi-level `TableIdent` build, the snapshot read,
+  each file's byte size from the Iceberg manifest, and merge-on-read
   positional-delete resolution; the Delta reader's half is owned by
   `delta/delta-table-planning`.
-* The logical schema this feature's Iceberg reader produces identifies each column by its Iceberg field-id, current name, Arrow type, and nullability.
+* An Iceberg table's logical schema comes from its column notes. `createVirtualSchema` builds each note from the table's `current_schema()` at that time: the column's Iceberg field-id, its name then, its Arrow type, its nullability, and its `initial-default`. The pushdown reader reads the current schema only to translate the filter for pruning (`file-planning/pushdown-file-pruning`) and to refuse a recorded `date` promotion.
 * Each per-shard file entry carries both the file path and its byte size, so the scan UDF never re-discovers a size the adapter already resolved.
 * The data-file list, each file's byte size, and each file's associated positional-delete files are resolved exactly once, at the same seam; the scan UDF never discovers files or delete files.
 * Delete support keeps the wire surface minimal — per-file delete references only, with no serialized Iceberg schema and no bound predicate added to the spec.
@@ -100,6 +101,38 @@ delete-file references, and logical schema feed the scan-driving SQL.
   `file-planning/pushdown-planning-file-encoding` states the table-root-once and relative/absolute
   encoding rules but no empty-root rule.
 
+* **Iceberg table-spec grounding for a declaration older than the table's current schema, quoted
+  from `apache/iceberg` `format/spec.md` (main).** § Column Projection: "Columns in Iceberg data
+  files are selected by field id. The table schema's column names and order may change after a
+  data file is written, and projection must be done using field ids." § Schema Evolution:
+  "Renaming an existing field must change the name, but not the field ID", "Adding a new field
+  assigns a new ID for that field and for any nested fields", and "The `initial-default` must be
+  set when a field is added and cannot change". The Table Metadata field `last-column-id` is "the
+  highest assigned column ID for the table. This is used to ensure columns are always assigned an
+  unused ID when evolving schemas." A declared field id therefore names the same column for the
+  table's whole life, and its declared `initial-default` never goes stale. A source-side rename
+  between refreshes leaves the declaration correct under its old name, and no later column can
+  take over a declared id.
+* **Scoped exception: a column dropped at the source between refreshes.** § Schema Evolution:
+  "Deleting a field removes it from the current schema." The pushdown plans against the declared
+  schema, which still holds the dropped field id. Data files written before the drop still store
+  that id, so until `REFRESH` the declared column reads the values those files store, and NULL or
+  its declared `initial-default` from files written after the drop. Reading a schema other than the
+  current one is a column projection the spec defines, so no row is misread, but the column shows
+  data the current schema no longer exposes. A dropped column declared required with no
+  `initial-default` instead fails a query that reads a file written after the drop, with the
+  required-absent error `scan-read-path/scan-execution-field-id-projection-absent-fields` records
+  ("Added required column absent from a file with no initial-default errors cleanly"). `REFRESH`
+  removes the column.
+* **A declared nullability older than the current schema.** Each note fixes its column's
+  `nullable` flag from the field's `required` flag at `createVirtualSchema`. A catalog can relax a
+  required field to optional later (`UpdateSchema.makeColumnOptional` in the Iceberg Java API).
+  DataFusion rewrites `c IS NULL` to `false` and `c IS NOT NULL` to `true` for a non-nullable field,
+  so a stale `nullable: false` would drop the rows a later writer stored as NULL without an error.
+  The Iceberg reader therefore fails a query whose declared non-nullable column the current schema,
+  looked up by the declared field id, marks optional (scenario below). A declared optional column
+  that the current schema marks required plans normally, because no row is lost.
+
 ## Scenarios
 
 ### Scenario: Pushdown derives the scanned Iceberg table from the involved virtual table
@@ -116,11 +149,12 @@ delete-file references, and logical schema feed the scan-driving SQL.
 * *GIVEN* a virtual schema over a namespace whose tables are backed by SeaweedFS
 * *AND* a query that projects a subset of columns from one of those tables
 * *WHEN* Exasol sends the corresponding `pushdown` request
-* *THEN* the adapter SHALL determine the target Iceberg table from the schema-metadata mapping, resolve that table's Iceberg snapshot, data-file list, and each file's byte size exactly once, and at that same seam extract the table's current Iceberg schema (from `current_schema()`) into a logical schema carrying, per column, its `field_id`, current name, Arrow type, and nullability
+* *THEN* the adapter SHALL determine the target Iceberg table from the schema-metadata mapping, resolve that table's Iceberg snapshot, data-file list, and each file's byte size exactly once, and take the table's logical schema from its column notes, carrying, per column, its declared `field_id`, name, Arrow type, nullability, and `initial-default`
+* *AND* the adapter MUST NOT build the logical schema from the table's `current_schema()` at pushdown
 * *AND* the adapter SHALL return a JSON response of type `pushdown` containing SQL that invokes the `LAKEHOUSE_SCAN` SCALAR EMIT UDF, carrying the logical schema AND the table root in the shard-invariant common spec spliced ONCE as the scalar scan's first-argument literal, and the resolved data-file list flowed through the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor as the per-shard argument, where each per-shard entry carries the file path together with its resolved byte size
 * *AND* the outer scalar scan select MUST NOT be wrapped in a `SELECT * FROM (...)` materialization boundary
 * *AND* the adapter MUST NOT require the scan UDF to discover files itself, and MUST NOT require the scan UDF to re-fetch any file's size
-* *AND* the resolve-once orchestration this scenario describes — `TABLE_MAP` lookup, one resolve, one `ScanSpec` build — SHALL be reached identically by every table format, with the format reader supplying the file list, byte sizes, logical schema, and table root (`file-planning/pushdown-format-neutral-resolution`); only the reader behind the seam is format-specific
+* *AND* the resolve-once orchestration this scenario describes — `TABLE_MAP` lookup, one resolve, one `ScanSpec` build — SHALL be reached identically by every table format, with the format reader supplying the file list, byte sizes, and table root, and the column notes supplying the logical schema (`file-planning/pushdown-format-neutral-resolution`); only the reader behind the seam is format-specific
 
 ### Scenario: Pushdown resolves multi-level namespace identifiers into the iceberg TableIdent
 
@@ -159,3 +193,27 @@ delete-file references, and logical schema feed the scan-driving SQL.
 * *WHEN* a query over that table makes the adapter read the table's manifests from storage while it resolves the file list
 * *THEN* the query SHALL fail with an error that reports the object store's access-denied response
 * *AND* the error MUST NOT contain any credential value of the CONNECTION
+
+### Scenario: A column renamed at the source after the last REFRESH reads under its declared name
+
+* *GIVEN* an Iceberg table with columns `id` (field id 1) and `score` (field id 2) holding rows in one data file, a virtual schema created over it, and the source column `score` afterwards renamed to `rating` with no `REFRESH`
+* *WHEN* a query selects `ID, SCORE`
+* *THEN* the query SHALL return each row's `score` value under `SCORE`, because the scan binds the declared field id 2, which the rename kept
+* *AND* the virtual table SHALL NOT declare `RATING` until `ALTER VIRTUAL SCHEMA ... REFRESH` runs, after which the same values read under `RATING`
+
+### Scenario: A column dropped at the source after the last REFRESH reads what older data files store
+
+* *GIVEN* an Iceberg table with columns `id` and an optional column `note`, one data file written while `note` existed, a virtual schema created over it, and afterwards `note` dropped from the source schema and a second data file written without it, with no `REFRESH`
+* *WHEN* a query selects `ID, NOTE`
+* *THEN* the rows of the first data file SHALL carry their stored `note` values and the rows of the second SHALL carry NULL, per the scoped exception this feature's Background records
+* *AND* the query MUST NOT fail, and MUST NOT bind `NOTE` to any other column
+* *AND* after `ALTER VIRTUAL SCHEMA ... REFRESH` the virtual table SHALL NOT declare `NOTE`
+* *AND* had `note` been required with no `initial-default`, the query SHALL instead fail on the second data file with the required-absent error `scan-read-path/scan-execution-field-id-projection-absent-fields` records, until `REFRESH`
+
+### Scenario: A declared required column that the current schema marks optional fails the query
+
+* *GIVEN* an Iceberg table with a required column `qty` (field id 2), a virtual schema created over it, and afterwards `qty` made optional at the source and a data file written that stores NULL in `qty`, with no `REFRESH`
+* *WHEN* `SELECT ID FROM <table> WHERE QTY IS NULL` runs, and separately a query that reads only `ID`
+* *THEN* each query SHALL fail before any file is planned with an error naming the virtual table and the column `QTY`, stating that the declaration marks it non-nullable while the current schema allows NULL, and naming `ALTER VIRTUAL SCHEMA ... REFRESH` as the fix
+* *AND* the reader SHALL find the column in the current schema by its declared field id, not by its name
+* *AND* after `REFRESH` the first query SHALL return the row whose `qty` is NULL

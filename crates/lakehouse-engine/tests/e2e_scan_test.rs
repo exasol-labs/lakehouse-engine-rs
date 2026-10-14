@@ -297,6 +297,20 @@ fn iceberg_all_types_declare_and_return_their_mapped_values() {
     );
 }
 
+/// Scenario: A refused column's note records its refusal and the column stays declared
+#[test]
+fn iceberg_binary_column_note_records_the_refusal() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    assert_refused_column(
+        &mut conn,
+        VS_NAME,
+        &E2E_ALL_TYPES_TABLE.to_uppercase(),
+        "C_BINARY",
+        &["'c_binary'", "type 'binary'"],
+    );
+}
+
 /// Scenario: Filter predicate restricts the emitted rows
 #[test]
 fn scan_filter_restricts_rows() {
@@ -2639,6 +2653,8 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         creds: &creds,
         allow_http: true,
     };
+    // Filter columns resolve through the field ids CREATE declared, as in a pushdown.
+    let declared = declared_schema_of(&mut exa_conn(), VS_NAME, "REGIONS");
     let reader = format_reader(
         ScanSource::Iceberg {
             session: &session,
@@ -2649,7 +2665,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
     .expect("format_reader must succeed");
 
     let all_files = rt
-        .block_on(reader.resolve_scan(None))
+        .block_on(reader.resolve_scan(&declared, None))
         .expect("resolve_scan (no filter) must succeed")
         .files;
     assert_eq!(
@@ -2666,7 +2682,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         "right": {"type": "literal_string", "value": "north"}
     });
     let pruned_partition = rt
-        .block_on(reader.resolve_scan(Some(&partition_filter)))
+        .block_on(reader.resolve_scan(&declared, Some(&partition_filter)))
         .expect("resolve_scan (partition filter) must succeed")
         .files;
     assert_eq!(
@@ -2689,7 +2705,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         "right": {"type": "literal_exactnumeric", "value": "5"}
     });
     let pruned_range = rt
-        .block_on(reader.resolve_scan(Some(&range_filter)))
+        .block_on(reader.resolve_scan(&declared, Some(&range_filter)))
         .expect("resolve_scan (range filter) must succeed")
         .files;
     assert_eq!(
