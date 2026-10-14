@@ -643,6 +643,33 @@ fn neutral_table_reports_an_absent_vending_key_rather_than_an_empty_one() {
 }
 
 #[test]
+fn neutral_table_carries_the_wire_properties_verbatim_and_an_absent_map_as_empty() {
+    let reported = std::collections::BTreeMap::from([
+        ("delta.columnMapping.mode".to_string(), "name".to_string()),
+        ("Owner Note".to_string(), " kept verbatim ".to_string()),
+    ]);
+    let cases = [
+        (
+            r#""properties":{"delta.columnMapping.mode":"name","Owner Note":" kept verbatim "},"#,
+            reported,
+        ),
+        (r#""properties":{},"#, Default::default()),
+        (r#""properties":null,"#, Default::default()),
+        ("", Default::default()),
+    ];
+    for (raw_properties_member, expected) in cases {
+        let body = format!(
+            r#"{{"name":"orders","table_type":"MANAGED","data_source_format":"DELTA",{raw_properties_member}"columns":[]}}"#
+        );
+        let info: TableInfo = serde_json::from_str(&body).expect("wire body parses");
+
+        let table = neutral_table(orders_ident(), info, TableFormat::Delta);
+
+        assert_eq!(table.properties, expected, "`{raw_properties_member}`");
+    }
+}
+
+#[test]
 fn admission_admits_delta_and_parquet_base_tables_and_names_every_refusal() {
     let skip = |detail: &str| {
         Err(SkipReason::NotDeltaBaseTable {

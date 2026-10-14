@@ -71,9 +71,10 @@ path exactly as they already are for Iceberg.
   data file's partition values ride in `FileEntry::partition_values`. The table's ordered
   partition-column names ride in `CommonScanSpec::partition_columns`. Each column's binding key rides
   on its own `LogicalField`.
-* **The column-mapping MODE is no longer carried at all.** It survives as a plan-time input that
-  decides WHICH binding key each `LogicalField` gets, not as a value on the wire — see the scenario
-  below. `DeltaTableSpec`, `DeltaFileSpec`, `DeltaColumnMapping`, and `DeltaColumnMappingMode` cease to
+* **The column-mapping MODE is no longer carried at all.** It survives as a `createVirtualSchema` input,
+  read from the catalog's copy of the table property, that decides WHICH binding key each column's
+  note records, and as the pushdown reader's check of that declaration against the log, not as a
+  value on the wire or in the note — see the scenarios below. `DeltaTableSpec`, `DeltaFileSpec`, `DeltaColumnMapping`, and `DeltaColumnMappingMode` cease to
   exist; `DeltaDeletionVectorStorage` survives only as the payload enum of the deletion-vector delete
   mechanism, keeping the closed 3-kind set this feature already requires.
 * **The pushdown refusal is gone, issue #320.** Both halves of its former justification are now
@@ -156,6 +157,71 @@ path exactly as they already are for Iceberg.
   stats wire shape this feature deferred never acquired a consumer and is not designed now either. The
   scenario clause below is CHANGED only in its reason, never in its obligation, so `ScanSpec` stays
   format-neutral per CLAUDE.md and every golden scan-spec encoding is unmoved.
+* **This delta is issue #426.** A Delta table's logical schema, partition columns, and refused
+  columns are decided once, at `createVirtualSchema`, from Unity Catalog's copy of the table's
+  schema: each column's `type_json` (the Delta `StructField` JSON, column metadata included), the
+  `delta.columnMapping.mode` entry of the table's `properties`, and the columns' `partition_index`.
+  They are recorded in each column's note (`vs-adapter/column-source-notes`), and
+  `createVirtualSchema` reads no Delta log. The pushdown reader still opens the gated snapshot for
+  the reader-feature gate, the active files, the deletion vectors, and the partition values, checks
+  the declaration against that snapshot, and derives no logical field from it. Log replay, partition
+  values, deletion-vector descriptors, credential vending, and the protocol gate are unchanged.
+* **Delta protocol check for a declaration older than the log's current version.** PROTOCOL.md
+  § Writer Requirements for Column Mapping: "The physical name of the column is static and can be
+  different than the _display name_ of the column, which is changeable", and a writer must "ensure
+  the physical field path of the new column is unique across all versions of the table". § Reader
+  Requirements for Column Mapping: "In `name` mode, readers must resolve columns in the data files
+  by their physical names", "Partition values and column level statistics will also be resolved by
+  their physical names", and "In `id ` mode, readers must resolve columns by using the `field_id` in the parquet
+  metadata for each file". A recorded binding key therefore names the same column after a
+  source-side rename, so the scan and the pruning translation resolve each declared column through
+  its recorded key. Under the `none` mode the protocol offers no rename or drop without column
+  mapping ("Delta can use column mapping to avoid any column naming restrictions, and to support the
+  renaming and dropping of columns without having to rewrite all the data"), so a declared name
+  stays the column's identity.
+* **Delta protocol check for a declaration taken from the catalog.** PROTOCOL.md § Column Mapping
+  keeps the mode in a table property and the binding keys in column metadata: "The column mapping is
+  governed by the table property `delta.columnMapping.mode` being one of `none`, `id`, and `name`",
+  and "The physical name is stored as part of the column metadata with the key
+  `delta.columnMapping.physicalName`." Unity Catalog's `properties` and `type_json` are copies of
+  those two places. The same section conditions the property on the protocol: "The table property
+  should only be honored if the table's protocol has reader and writer versions and/or table
+  features that support the `columnMapping` table feature." `createVirtualSchema` cannot apply that
+  condition, because it reads no protocol, so the pushdown reader compares the declaration with the
+  mode the gated snapshot honors and fails a query on any disagreement (scenario below). A copy that
+  omits the mode or a partition column therefore fails loudly instead of binding the scan to the
+  wrong file columns.
+* **Scoped exception: a Delta type change the declaration does not record.** PROTOCOL.md § Type
+  Widening: type changes are "stored in the `metadata` of their nearest ancestor" struct field
+  "using the key `delta.typeChanges`", and § Reader Requirements for Type Widening: readers "must validate that
+  they support all type changes in the `delta.typeChanges` field in the table schema for the table
+  version they are reading and fail when finding any unsupported type change". `createVirtualSchema`
+  validates the type changes the catalog's `type_json` metadata records and records an unsupported
+  one as its column's refusal. A change the catalog's copy omits, or one recorded after the last
+  `REFRESH`, is not validated by the declaration. Until then, a data file written under an
+  unsupported change fails the query that reads it at scan time, because the scan admits only the
+  widening pairs `scan-types/type-relaxation` proves and admits, and a query that reads only files
+  written before the change returns their declared values.
+* **Scoped exception: a column dropped at the source after the last REFRESH, under `name` or `id`
+  mode.** The declared binding key still names the dropped column, so a query reads the values the
+  older data files store under that key and NULL from files written without it, until `REFRESH`
+  removes the column. A column the catalog declares and the log never carried reads NULL the same
+  way. A dropped column declared non-nullable instead fails a query that reads a file written
+  without it, with the required-absent error
+  `scan-read-path/scan-execution-field-id-projection-absent-fields` records ("Added required column
+  absent from a file with no initial-default errors cleanly"), until `REFRESH`. This mirrors the
+  Iceberg exception `file-planning/pushdown-planning-file-resolution` records.
+* **A declared nullability older than the log.** Each note fixes its column's `nullable` flag at
+  `createVirtualSchema`, from the catalog's `type_json` copy. A writer can relax a column to nullable
+  later (`ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL`), and an OSS registrant's copy can disagree
+  with the log. DataFusion rewrites `c IS NULL` to `false` and `c IS NOT NULL` to `true` for a
+  non-nullable field, so a stale `nullable: false` would drop matching rows without an error. The
+  pushdown reader therefore fails a query whose declared non-nullable column the snapshot marks
+  nullable (scenario below). A declared nullable column that the log marks non-nullable plans
+  normally, because no row is lost.
+* **The reader-feature gate stays at pushdown and stays the authority.** It needs the log's
+  protocol, which `createVirtualSchema` does not read, so a table the gate refuses is listed at
+  `createVirtualSchema` and fails at query time, unchanged (`delta/delta-reader-feature-gating`).
 
 ## Scenarios
 
@@ -235,15 +301,19 @@ path exactly as they already are for Iceberg.
 
 ### Scenario: Each logical field carries the binding key its column-mapping mode selects
 
-* *GIVEN* three Delta tables, one per column-mapping mode: one setting `delta.columnMapping.mode` to
-  `name` with each schema field carrying a `delta.columnMapping.physicalName` and a
-  `delta.columnMapping.id`, one setting it to `id` with the same annotations, and one setting no mode
-  at all
-* *WHEN* the Delta format reader resolves each table's scan
-* *THEN* the reader SHALL carry each column's binding key on that column's OWN logical field, and the
-  returned scan MUST NOT carry a table-level column-mapping mode, a per-table column list, or any
-  other Delta-named block, because the mode's only consumer is the choice of binding key and encoding
-  the choice leaves nothing for a second home to drift from
+* *GIVEN* three Delta tables registered in Unity Catalog, one per column-mapping mode: one whose
+  `properties` set `delta.columnMapping.mode` to `name` and whose columns' `type_json` metadata each
+  carry the `delta.columnMapping.physicalName` and `delta.columnMapping.id` the Delta log declares,
+  one setting it to `id` with the same annotations, and one setting no mode at all
+* *WHEN* `createVirtualSchema` declares each table's columns from that catalog metadata and the Delta
+  format reader then resolves each table's scan
+* *THEN* `createVirtualSchema` SHALL record each column's binding key in that column's OWN note, and
+  the returned scan SHALL carry it on that column's OWN logical field, and neither SHALL carry a
+  table-level column-mapping mode, a per-table column list, or any other Delta-named block, because
+  the mode's only consumer is the choice of binding key and encoding the choice leaves nothing for a
+  second home to drift from
+* *AND* the Delta format reader SHALL take each logical field from the column notes and MUST NOT
+  build one from the snapshot's schema at pushdown
 * *AND* under `id` mode each logical field SHALL carry its `delta.columnMapping.id` as its field-id
   and SHALL carry NO physical name, because Delta writes Parquet field-ids in `id` mode and only there
 * *AND* under `name` mode each logical field SHALL carry its `delta.columnMapping.physicalName` as its
@@ -253,9 +323,11 @@ path exactly as they already are for Iceberg.
   the scan binds it by its own logical name, superseding the removed scenario's 1-based-ordinal
   field-id: an ordinal is a value the writer never wrote into any file, and carrying it invites a
   false match against a file that happens to carry field-ids
-* *AND* a column under `id` or `name` mode missing the annotation its mode requires SHALL still be
-  refused with a `UdfError` naming the column, unchanged, because its ordinal position and its logical
-  name are values the writer never used
+* *AND* a column under `id` or `name` mode whose `type_json` lacks the annotation its mode requires,
+  or carries it malformed, SHALL be declared with a note whose refusal names the column, the mode,
+  and the problem, and `createVirtualSchema` SHALL neither fail nor skip the table, because its
+  ordinal position and its logical name are values the writer never used and the refusal is scoped
+  to the column as `delta/delta-type-mapping` scopes a type refusal
 * *AND* the reader SHALL still carry an EMPTY `schema.name-mapping.default` list, because a
   name-mapping entry is a table-level fallback for files lacking field-ids and the per-column physical
   name is the authoritative declaration that replaces it for Delta

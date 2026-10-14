@@ -18,14 +18,16 @@ Resolves a pushdown over a `GLUE` virtual table into the engine's `ResolvedScan`
 * *WHEN* the pushdown resolves the table
 * *THEN* the adapter SHALL load the table with `GetTable` and read that metadata file once, through the CONNECTION's static storage
 * *AND* the adapter SHALL plan the table with the SAME Iceberg planner that plans an Iceberg REST table, so delete handling, the date-promotion refusal, the name mapping, and file pruning apply to it as to an Iceberg REST table
-* *AND* the metadata file SHALL be the schema authority, per `glue/glue-catalog-client`
+* *AND* the metadata file `createVirtualSchema` read SHALL be the schema authority, per `glue/glue-catalog-client`, and the pushdown SHALL take the table's logical schema from the column notes built from it (`vs-adapter/column-source-notes`)
 
 ### Scenario: A Glue Parquet table is planned by the shared catalog-declared Parquet reader
 
 * *GIVEN* a Glue Parquet table and a Unity Parquet table
-* *WHEN* the pushdown resolves each table
-* *THEN* ONE reader SHALL plan both tables, and SHALL differ between them only in its type source (the Glue Hive type string per `glue/glue-hive-type-mapping`, or the Unity `type_json`), its file source (the registered partitions or the table directory), and its storage (the CONNECTION's static storage, or the Unity storage resolution)
+* *WHEN* `createVirtualSchema` declares each table and the pushdown resolves it
+* *THEN* ONE declaration rule SHALL classify both tables' columns at `createVirtualSchema`, differing between them only in its type source (the Glue Hive type string per `glue/glue-hive-type-mapping`, or the Unity `type_json`)
+* *AND* ONE reader SHALL plan both tables at pushdown, differing between them only in its file source (the registered partitions or the table directory) and its storage (the CONNECTION's static storage, or the Unity storage resolution)
 * *AND* the Glue table's logical schema SHALL follow the logical-schema rules of `unity-catalog/unity-parquet-table-planning` over its Glue columns: declared column order, NULLABLE fields, no field-id or declared physical name, the case-fold binding, and no footer read at plan time
+* *AND* the pushdown SHALL take the Glue table's logical schema, partition columns, and refused columns from its column notes, and MUST NOT classify a Glue column type at pushdown
 * *AND* a partition key that a data file also stores as a column SHALL read the partition value
 
 ### Scenario: Each kept partition's location is listed and its files carry the partition's Glue values

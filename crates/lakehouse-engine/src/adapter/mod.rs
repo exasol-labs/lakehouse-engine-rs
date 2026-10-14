@@ -2,6 +2,7 @@
 
 pub mod capabilities;
 pub mod catalog_kind;
+pub mod column_notes;
 pub mod connection;
 pub mod direct_storage;
 pub mod direct_storage_properties;
@@ -17,11 +18,12 @@ pub mod tables;
 
 use crate::adapter::capabilities::get_capabilities_response;
 use crate::adapter::catalog_kind::CatalogKind;
+use crate::adapter::column_notes::checked_note;
 use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::connection::{catalog_block, read_connection, storage_block};
 use crate::adapter::direct_storage::DirectStorageCatalogClient;
 use crate::adapter::permission::{PermissionCheck, PermissionSettings};
-use crate::adapter::pushdown::handle_pushdown;
+use crate::adapter::pushdown::{declare_columns, handle_pushdown};
 use crate::adapter::tables::{catalog_identifier_string, flatten_table_name};
 use crate::scan::sealed::SealedStorageKey;
 use crate::scan::spec::DEFAULT_S3_MAX_CONNECTIONS;
@@ -517,19 +519,26 @@ fn build_listing_virtual_tables(
 
     for table in &listing.tables {
         let exasol_name = flatten_table_name(configured_ns, &table.ident);
-        let columns: Vec<Json> = table
+        let columns = table
             .columns
             .iter()
-            .map(|col| {
-                json!({
-                    "name": col.name.to_uppercase(),
+            .zip(declare_columns(table))
+            .map(|(col, note)| {
+                let column_name = col.name.to_uppercase();
+                let mut column = json!({
+                    "name": column_name,
                     "dataType": exasol_type_to_json(&column_source_type_to_exasol(
                         &col.source_type,
                         engine_timestamps,
                     )),
-                })
+                });
+                if let Some(note) = note {
+                    column["adapterNotes"] =
+                        Json::String(checked_note(&exasol_name, &column_name, note)?);
+                }
+                Ok(column)
             })
-            .collect();
+            .collect::<Result<Vec<Json>, UdfError>>()?;
         tables_json.push(json!({
             "name": exasol_name,
             "columns": columns,

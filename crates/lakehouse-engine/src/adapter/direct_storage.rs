@@ -1,10 +1,11 @@
+use crate::adapter::column_notes::{ColumnDeclaration, binary_refusal};
 use crate::adapter::direct_storage_properties::join_storage_path;
 use crate::adapter::parquet_directory::{
-    DirectoryOptions, resolve_parquet_directory, store_prefix,
+    BinaryColumn, DirectoryOptions, ParquetDirectory, resolve_parquet_directory, store_prefix,
 };
-use crate::scan::spec::StorageBackend;
+use crate::scan::spec::{LogicalField, NestedField, NestedMembers, StorageBackend};
 use crate::types::mapping::{arrow_type_to_tag, needs_json_fallback};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, FieldRef};
 use exasol_udf_sdk::error::UdfError;
 use futures::future::try_join_all;
 use lakehouse_catalog::{
@@ -39,7 +40,7 @@ impl DirectStorageCatalogClient {
         Self::over_store(store, base_path, options)
     }
 
-    fn over_store(
+    pub(crate) fn over_store(
         store: Arc<dyn ObjectStore>,
         base_path: &str,
         options: DirectoryOptions,
@@ -74,14 +75,14 @@ impl CatalogClient for DirectStorageCatalogClient {
                 .collect();
             names.sort();
 
-            let directories = try_join_all(names.iter().map(|name| {
-                let table_prefix = self.prefix.clone().join(name.as_str());
-                async move {
-                    resolve_parquet_directory(&self.store, &table_prefix, self.options, &|_| true)
-                        .await
-                }
-            }))
-            .await?;
+            let directories =
+                try_join_all(names.iter().map(|name| {
+                    let table_prefix = self.prefix.clone().join(name.as_str());
+                    async move {
+                        resolve_parquet_directory(&self.store, &table_prefix, self.options).await
+                    }
+                }))
+                .await?;
 
             let mut tables = Vec::with_capacity(names.len());
             let mut skipped = Vec::new();
@@ -97,7 +98,7 @@ impl CatalogClient for DirectStorageCatalogClient {
                     });
                     continue;
                 }
-                let columns = resolve_columns(&directory.schema);
+                let columns = resolve_columns(&directory);
                 tables.push(CatalogTable {
                     ident,
                     table_type: CatalogTableType::Table,
@@ -107,6 +108,7 @@ impl CatalogClient for DirectStorageCatalogClient {
                     partition_columns: Vec::new(),
                     metadata_location: None,
                     columns,
+                    properties: Default::default(),
                 });
             }
             Ok(CatalogListing { tables, skipped })
@@ -130,10 +132,11 @@ impl CatalogClient for DirectStorageCatalogClient {
     }
 }
 
-/// Falls back to Utf8 for nested/unrepresentable columns before tagging, matching the plan path's
-/// `logical_schema` normalization — refusing them here would fail `CREATE VIRTUAL SCHEMA` outright.
-fn resolve_columns(schema: &arrow::datatypes::SchemaRef) -> Vec<CatalogColumn> {
-    schema
+/// The tag and the note come from the one folded schema, so they cannot disagree. Nested or
+/// unrepresentable columns tag as Utf8 (JSON text) instead of failing CREATE VIRTUAL SCHEMA.
+fn resolve_columns(directory: &ParquetDirectory) -> Vec<CatalogColumn> {
+    directory
+        .schema
         .fields()
         .iter()
         .map(|field| {
@@ -142,12 +145,92 @@ fn resolve_columns(schema: &arrow::datatypes::SchemaRef) -> Vec<CatalogColumn> {
             } else {
                 field.data_type().clone()
             };
+            let declaration = ColumnDeclaration {
+                source_type: logical_field(field),
+                partition: directory
+                    .partition_columns
+                    .iter()
+                    .position(|key| key == field.name()),
+                refused: directory
+                    .binary_columns
+                    .iter()
+                    .find(|binary| binary.column == *field.name())
+                    .map(binary_column_refusal),
+            };
             CatalogColumn {
                 name: field.name().clone(),
                 source_type: ColumnSourceType::Parquet(arrow_type_to_tag(&declared)),
+                declaration: Some(declaration.encode()),
             }
         })
         .collect()
+}
+
+fn binary_column_refusal(column: &BinaryColumn) -> String {
+    let mut reason = binary_refusal(
+        "Parquet",
+        &column.column,
+        column.member_path.as_deref(),
+        &column.declared,
+    );
+    if column.nested_enum {
+        reason
+            .push_str("; a Parquet ENUM is read as text only as a top-level, non-repeated column");
+    }
+    reason
+}
+
+/// No ordinal field-id is synthesized: it could falsely match a file's `PARQUET:field_id`.
+fn logical_field(field: &Field) -> LogicalField {
+    LogicalField {
+        field_id: None,
+        name: field.name().clone(),
+        arrow_type: arrow_type_to_tag(field.data_type()),
+        nullable: field.is_nullable(),
+        initial_default: None,
+        nested: nested_members(field.data_type()),
+        physical_name: None,
+    }
+}
+
+/// Its presence routes nested columns to the JSON renderer; the cast path has no string kernel
+/// for struct/list/map.
+fn nested_members(data_type: &DataType) -> Option<NestedMembers> {
+    match data_type {
+        DataType::Struct(fields) => Some(NestedMembers::Struct {
+            fields: fields
+                .iter()
+                .map(|field| NestedField {
+                    field_id: None,
+                    name: field.name().clone(),
+                    physical_name: None,
+                    nested: nested_members(field.data_type()),
+                })
+                .collect(),
+        }),
+        DataType::List(element)
+        | DataType::LargeList(element)
+        | DataType::FixedSizeList(element, _) => Some(NestedMembers::List {
+            element: nested_members(element.data_type()).map(Box::new),
+        }),
+        DataType::Map(entries, _) => {
+            let pair: &[FieldRef] = match entries.data_type() {
+                DataType::Struct(fields) => fields,
+                _ => &[],
+            };
+            Some(NestedMembers::Map {
+                key: pair
+                    .first()
+                    .and_then(|field| nested_members(field.data_type()))
+                    .map(Box::new),
+                value: pair
+                    .get(1)
+                    .and_then(|field| nested_members(field.data_type()))
+                    .map(Box::new),
+            })
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

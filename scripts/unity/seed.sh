@@ -5,8 +5,8 @@
 # Fixtures are prebuilt delta-kernel-rs test tables (fixtures/PROVENANCE.md)
 # because delta-rs cannot write deletion vectors or column mapping.
 #
-# UC columns are advisory for EXTERNAL Delta tables (the engine reads the Delta
-# log); nested/incompatible types are registered as STRING.
+# The engine declares Delta columns from the Unity Catalog entry, so each fixture is registered from its log's latest metaData;
+# delta_catalog_copy holds deliberately wrong copies for the declaration-check and refusal tests.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,6 +19,8 @@ S3_ENDPOINT="http://seaweedfs:8333"
 export UC_BASE="http://localhost:${LH_UNITY_PORT:-18080}/api/2.1/unity-catalog"
 export UC_CATALOG="unity"
 export UC_SCHEMA="delta_e2e"
+export UC_COPY_SCHEMA="delta_catalog_copy"
+export FIXTURES_DIR
 export UC_PREFIX="delta"
 
 echo "=== unity-seed: uploading Delta fixtures to SeaweedFS (bucket warehouse) ==="
@@ -66,76 +68,88 @@ python3 - <<'PY'
 import json, os, urllib.request, urllib.error
 
 BASE=os.environ["UC_BASE"]; CAT=os.environ["UC_CATALOG"]; SCH=os.environ["UC_SCHEMA"]; PFX=os.environ["UC_PREFIX"]
+COPY_SCH=os.environ["UC_COPY_SCHEMA"]; FIXTURES=os.environ["FIXTURES_DIR"]
 
-# (uc_table_name, fixture_dir, [(col, delta_type, is_partition)])
-# delta_type: primitive spark name, "decimal(p,s)", or a nested type
-# (array/map/struct/variant) which is registered as STRING (advisory — see header).
+# (uc_table_name, fixture_dir)
 TABLES = [
-    ("table_with_dv", "table-with-dv-small", [("value","int",False)]),
-    ("cm_name_mode", "cdf-column-mapping-name-mode",
-        [("id","long",False),("name","string",False),("value","double",False)]),
-    ("cm_id_mode", "cdf-column-mapping-id-mode",
-        [("id","long",False),("name","string",False),("value","double",False)]),
+    ("table_with_dv", "table-with-dv-small"),
+    ("cm_name_mode", "cdf-column-mapping-name-mode"),
+    ("cm_id_mode", "cdf-column-mapping-id-mode"),
     # #319 partition values in ScanSpec + #321 partition pruning
-    ("basic_partitioned", "basic_partitioned",
-        [("letter","string",True),("number","long",False),("a_float","double",False)]),
+    ("basic_partitioned", "basic_partitioned"),
     # #321 stats-based file pruning (multiple data files with per-file stats)
-    ("multi_part_stats", "multi-part-stats",
-        [("id","long",False),("value","string",False)]),
-    # #322 broad type mapping incl. incompatible->JSON VARCHAR; also forces the
-    # timestampNtz gate-or-map decision (declares timestampNtz + columnMapping)
-    ("stats_all_types", "stats-all-types", [
-        ("byte_col","byte",False),("short_col","short",False),("int_col","int",False),
-        ("long_col","long",False),("float_col","float",False),("double_col","double",False),
-        ("date_col","date",False),("timestamp_col","timestamp",False),
-        ("timestamp_ntz_col","timestamp_ntz",False),("string_col","string",False),
-        ("decimal_col","decimal(10,2)",False),("boolean_col","boolean",False),
-        ("binary_col","binary",False),("array_col","array",False),
-        ("map_col","map",False),("nested_struct","struct",False)]),
-    # #322 fail-loud: unsupported reader features (variantType / typeWidening).
-    # Columns are advisory; the engine reads the log, sees the reader feature,
-    # and must refuse (kernel itself reads these fine — gating is engine-side).
-    ("unshredded_variant", "unshredded-variant",
-        [("id","long",False),("v","variant",False),("array_of_variants","array",False),
-         ("struct_of_variants","struct",False),("map_of_variants","map",False)]),
-    # #349 type widening: registers all 13 columns of the vendored fixture at
-    # their WIDENED Delta type (commit 2's schema) so every widening pair gets
-    # live E2E coverage; the fixture's own bytes are unchanged (decision [3]).
-    ("type_widening", "type-widening", [
-        ("byte_long","long",False),("int_long","long",False),
-        ("float_double","double",False),("byte_double","double",False),
-        ("short_double","double",False),("int_double","double",False),
-        ("decimal_decimal_same_scale","decimal(20,2)",False),
-        ("decimal_decimal_greater_scale","decimal(20,5)",False),
-        ("byte_decimal","decimal(4,1)",False),("short_decimal","decimal(6,1)",False),
-        ("int_decimal","decimal(11,1)",False),("long_decimal","decimal(21,1)",False),
-        ("date_timestamp_ntz","timestamp_ntz",False)]),
+    ("multi_part_stats", "multi-part-stats"),
+    # #322 broad type mapping incl. incompatible->JSON VARCHAR
+    ("stats_all_types", "stats-all-types"),
+    # #322 fail-loud: the engine reads the log, sees the reader feature, and refuses
+    ("unshredded_variant", "unshredded-variant"),
+    # #349 type widening: the latest schema carries every column's delta.typeChanges
+    ("type_widening", "type-widening"),
 ]
 
-# Delta/Spark type -> (UC type_name, type_json spark type)
-NESTED = {"array","map","struct","variant"}
-PRIM = {
-    "byte":"BYTE","short":"SHORT","int":"INT","integer":"INT","long":"LONG",
-    "float":"FLOAT","double":"DOUBLE","string":"STRING","boolean":"BOOLEAN",
-    "date":"DATE","timestamp":"TIMESTAMP","timestamp_ntz":"TIMESTAMP_NTZ","binary":"BINARY",
-}
-def map_type(dt):
-    if dt.startswith("decimal("):
-        return ("DECIMAL", dt)
-    if dt in NESTED:  # advisory: surfaced to Exasol as JSON VARCHAR
-        return ("STRING","string")
-    tn = PRIM.get(dt)
-    if not tn: raise SystemExit(f"unmapped delta type: {dt}")
-    js = "integer" if dt=="int" else dt
-    return (tn, js)
+def latest_metadata(fixture_dir):
+    log = os.path.join(FIXTURES, fixture_dir, "_delta_log")
+    meta = None
+    for name in sorted(n for n in os.listdir(log) if n.endswith(".json")):
+        with open(os.path.join(log, name)) as commit:
+            for line in commit:
+                meta = json.loads(line).get("metaData", meta)
+    return meta
 
-def col(pos, name, dt, is_part):
-    tn, js = map_type(dt)
-    tj = {"name":name,"type":js,"nullable":True,"metadata":{}}
-    c = {"name":name,"type_text":dt,"type_name":tn,"type_json":json.dumps(tj),
-         "position":pos,"nullable":True}
-    if is_part: c["partition_index"]=0
-    return c
+PRIMITIVE_TYPE_NAMES = {
+    "byte":"BYTE","short":"SHORT","integer":"INT","long":"LONG","float":"FLOAT",
+    "double":"DOUBLE","string":"STRING","boolean":"BOOLEAN","date":"DATE",
+    "timestamp":"TIMESTAMP","timestamp_ntz":"TIMESTAMP_NTZ","binary":"BINARY","variant":"VARIANT",
+}
+def type_name(delta_type):
+    if isinstance(delta_type, dict):
+        return delta_type["type"].upper()
+    if delta_type.startswith("decimal("):
+        return "DECIMAL"
+    return PRIMITIVE_TYPE_NAMES[delta_type]
+
+def registration(fixture_dir):
+    meta = latest_metadata(fixture_dir)
+    partitions = meta["partitionColumns"]
+    columns = []
+    for pos, field in enumerate(json.loads(meta["schemaString"])["fields"]):
+        delta_type = field["type"]
+        c = {"name": field["name"], "type_name": type_name(delta_type),
+             "type_text": delta_type if isinstance(delta_type, str) else delta_type["type"],
+             "type_json": json.dumps(field), "position": pos, "nullable": field["nullable"]}
+        if field["name"] in partitions:
+            c["partition_index"] = partitions.index(field["name"])
+        columns.append(c)
+    return {"table_type":"EXTERNAL", "data_source_format":"DELTA",
+            "storage_location":f"s3://warehouse/{PFX}/{fixture_dir}",
+            "columns":columns, "properties":dict(meta.get("configuration") or {})}
+
+def column(entry, name):
+    return next(c for c in entry["columns"] if c["name"] == name)
+
+def edit_type_json(entry, name, edit):
+    c = column(entry, name)
+    field = json.loads(c["type_json"])
+    edit(field)
+    c["type_json"] = json.dumps(field)
+    c["nullable"] = field["nullable"]
+
+# (uc_table_name, fixture_dir, edit of the faithful registration)
+CATALOG_COPIES = [
+    ("no_mode", "cdf-column-mapping-name-mode",
+        lambda e: e["properties"].pop("delta.columnMapping.mode")),
+    ("no_partition_index", "basic_partitioned",
+        lambda e: column(e, "letter").pop("partition_index")),
+    ("value_without_physical_name", "cdf-column-mapping-name-mode",
+        lambda e: edit_type_json(e, "value",
+                                 lambda f: f["metadata"].pop("delta.columnMapping.physicalName"))),
+    ("label_mode", "cdf-column-mapping-name-mode",
+        lambda e: e["properties"].update({"delta.columnMapping.mode": "label"})),
+    ("id_not_null", "cdf-column-mapping-name-mode",
+        lambda e: edit_type_json(e, "id", lambda f: f.update({"nullable": False}))),
+    ("no_log", "basic_partitioned",
+        lambda e: e.update({"storage_location": f"s3://warehouse/{PFX}/no-log-here"})),
+]
 
 def post(path, body):
     req=urllib.request.Request(BASE+path, data=json.dumps(body).encode(),
@@ -169,13 +183,13 @@ def ensure(label, path, body):
         raise SystemExit(f"ERROR seeding {label} -> HTTP {code}: {txt}")
 
 # A table registration carries the full per-fixture payload (table_type,
-# data_source_format, storage_location, columns[]), so an existing one can be stale
+# data_source_format, storage_location, columns[], properties), so an existing one can be stale
 # after a manifest/fixture change. Delete then create: the registration is metadata
 # only (the fixture files in the bucket are untouched), so a re-create is cheap and
 # always converges. DELETE returns 200 (removed) or 404 TABLE_NOT_FOUND (absent);
 # both are acceptable, anything else aborts.
-def replace_table(label, name, body):
-    dcode, dtxt = delete(f"/tables/{CAT}.{SCH}.{name}")
+def replace_table(label, schema, name, body):
+    dcode, dtxt = delete(f"/tables/{CAT}.{schema}.{name}")
     if dcode not in (200, 404):
         raise SystemExit(f"ERROR clearing {label} -> HTTP {dcode}: {dtxt}")
     code, txt = post("/tables", body)
@@ -186,13 +200,16 @@ def replace_table(label, name, body):
 # UC does not persist its default `unity` sample catalog across a container
 # recreate, so create it explicitly rather than assuming it exists (spike).
 ensure(f"catalog {CAT}", "/catalogs", {"name":CAT})
-ensure(f"schema {SCH}",  "/schemas",  {"name":SCH,"catalog_name":CAT})
-for name, fixture_dir, cols in TABLES:
-    body = {"name":name,"catalog_name":CAT,"schema_name":SCH,"table_type":"EXTERNAL",
-            "data_source_format":"DELTA",
-            "storage_location":f"s3://warehouse/{PFX}/{fixture_dir}",
-            "columns":[col(i,c,t,p) for i,(c,t,p) in enumerate(cols)]}
-    replace_table(f"table {name}", name, body)
+for schema in (SCH, COPY_SCH):
+    ensure(f"schema {schema}", "/schemas", {"name":schema,"catalog_name":CAT})
+for name, fixture_dir in TABLES:
+    body = {"name":name,"catalog_name":CAT,"schema_name":SCH, **registration(fixture_dir)}
+    replace_table(f"table {name}", SCH, name, body)
+for name, fixture_dir, edit in CATALOG_COPIES:
+    entry = registration(fixture_dir)
+    edit(entry)
+    body = {"name":name,"catalog_name":CAT,"schema_name":COPY_SCH, **entry}
+    replace_table(f"table {COPY_SCH}.{name}", COPY_SCH, name, body)
 
 # List what we registered.
 with urllib.request.urlopen(f"{BASE}/tables?catalog_name={CAT}&schema_name={SCH}") as r:

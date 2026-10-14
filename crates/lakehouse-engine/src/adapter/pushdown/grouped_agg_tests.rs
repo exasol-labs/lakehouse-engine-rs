@@ -3,7 +3,7 @@ use super::super::joins::{
     FanOutProjection, build_qualified_single_table_fallback_sql, referenced_column_projection,
 };
 use super::super::support::{
-    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, extract_all_column_types, shard_count,
+    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, involved_columns, shard_count,
 };
 use super::super::test_support::*;
 use super::*;
@@ -1787,7 +1787,7 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
             {"name": "Y", "dataType": {"type": "double"}},
         ]}]
     });
-    let all_cols = extract_all_column_types(&request);
+    let all_cols = involved_columns(&request, |tables| tables.first()).types;
     let (proj_cols, proj_types) = referenced_column_projection(&pushdown_req, &all_cols);
     let fan_out_spec = ScanSpec {
         common: CommonScanSpec {
