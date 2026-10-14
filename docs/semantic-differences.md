@@ -33,11 +33,10 @@ The difference also reaches results built on the converted text:
 ## Dates outside Exasol's DATE range
 
 Iceberg, Delta, and Parquet can store dates outside Exasol's DATE range (0001-01-01 to
-9999-12-31), for example year 275760. A native Exasol table cannot hold such a date.
+9999-12-31).
 
-A query fails if the scan would hand such a date to Exasol, whether in a plain column, a `MIN` or
-`MAX` result, a `GROUP BY` key, or `COUNT(DISTINCT)`. The error names the column and the stored day
-count:
+A query fails if the scan would hand such a date to Exasol. The error names the column and the
+stored day count:
 
 ```
 DATE value out of range in output column STORED_DATE: 100000000 days from 1970-01-01 lies outside Exasol's DATE range 0001-01-01 to 9999-12-31
@@ -46,16 +45,18 @@ DATE value out of range in output column STORED_DATE: 100000000 days from 1970-0
 For `MIN`, `MAX`, and `GROUP BY` the column name is the scan's internal name (`PARTIAL_max_0`,
 `PARTIAL_min_0`, `GK_0`), not the column in your query.
 
-**Workaround:** filter the bad rows out in the query, because the scan applies the filter before it
-hands rows to Exasol:
+**Workaround:** evaluate the date in the query, so the scan returns a value Exasol can hold and
+every row is kept. Either replace out-of-range dates with `NULL` (or any value you choose):
 
 ```sql
-SELECT ID, STORED_DATE FROM t
-WHERE STORED_DATE BETWEEN DATE '0001-01-01' AND DATE '9999-12-31';
+SELECT ID,
+       CASE WHEN STORED_DATE > DATE '9999-12-31' OR STORED_DATE < DATE '0001-01-01'
+            THEN NULL ELSE STORED_DATE END AS STORED_DATE
+FROM t;
 ```
 
-To find the offending rows, select a column other than the date:
+or return the date as a day count, which has no range limit:
 
 ```sql
-SELECT ID FROM t WHERE STORED_DATE > DATE '9999-12-31' OR STORED_DATE < DATE '0001-01-01';
+SELECT ID, DAYS_BETWEEN(STORED_DATE, DATE '1970-01-01') AS STORED_DAYS FROM t;
 ```
