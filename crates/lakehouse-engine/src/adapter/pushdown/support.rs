@@ -39,6 +39,7 @@ pub(super) fn shard_files_json<E: Clone + Into<FileEntry>>(files: &[E]) -> Strin
 pub struct AggregateMergeInputs {
     plan_types: Vec<String>,
     merge_select: Vec<String>,
+    having: Option<String>,
     request_limit: Option<u64>,
 }
 
@@ -56,8 +57,13 @@ impl AggregateMergeInputs {
         Some(Self {
             plan_types,
             merge_select,
+            having: None,
             request_limit,
         })
+    }
+
+    pub fn with_having(self, having: Option<String>) -> Self {
+        Self { having, ..self }
     }
 }
 
@@ -168,6 +174,9 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     let fan_out = build_fan_out_inner(spec_template, shards, &emits, udf_name, distribute_udf_name);
 
     let mut sql = format!("SELECT {merge_select} FROM ({fan_out})");
+    if let Some(having) = &inputs.having {
+        sql.push_str(&format!(" HAVING {having}"));
+    }
     if let Some(n) = inputs.request_limit {
         sql.push_str(&format!(" LIMIT {n}"));
     }

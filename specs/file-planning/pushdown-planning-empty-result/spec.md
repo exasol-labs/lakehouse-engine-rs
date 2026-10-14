@@ -23,7 +23,8 @@ instead of rejecting it for a column-count/type mismatch.
   reference any resolved data file: with zero files there is nothing to scan.
 * The empty-result response's declared output column types come from the same
   type sources the non-empty path uses for that plan (the row projection's
-  declared types; `selectListDataTypes` for aggregates), so the empty and
+  declared types; `selectListDataTypes` for grouped aggregates; Exasol's own typing
+  of the request for an aggregate without GROUP BY), so the empty and
   non-empty shapes are identical for any given request — except the
   `GroupByWrapper` fall-through documented in the empty-result scenario: when an
   aggregate request carries no `selectListDataTypes` (absent or empty), the
@@ -38,9 +39,8 @@ instead of rejecting it for a column-count/type mismatch.
   Both edges only ever affect shapes the adapter declines to push down; neither
   returns wrong data.
 * Credentials MUST NOT appear in any empty-result SQL string or error message.
-* "Empty-aggregate semantics" follow single-node SQL over zero input rows: the
-  COUNT family (`COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`) yields `0`;
-  `SUM`, `MIN`, `MAX`, `AVG`, and the `STDDEV`/`VARIANCE` family yield `NULL`.
+* Exasol computes empty-aggregate semantics itself, over the zero-row relation the
+  single-group empty shape selects from.
 * This delta amends ONE clause of ONE scenario: the shared-classifier clause that
   currently requires the empty and non-empty paths to derive "the HAVING-present
   hard-error decline" from the shared request classifier. This plan deletes that
@@ -71,30 +71,13 @@ instead of rejecting it for a column-count/type mismatch.
 * *AND* the response's column count and per-column declared types SHALL equal those of the non-empty row-scan projection for the same request, aliasing each item with the SAME positional-unique naming rule (bare-column items keep their real column name; expression and literal items get a positional-unique synthetic alias), so a pruned query whose select list contains repeated literals — such as `SELECT 1, name, 1` — still yields a valid zero-row SELECT with unique column aliases and the correct arity
 * *AND* the response MUST NOT invoke the scan SET UDF
 
-### Scenario: Single-group aggregate with all files pruned returns one shape-correct empty row
+### Scenario: Aggregate without GROUP BY with all files pruned returns the native empty-set result
 
-* *GIVEN* a query whose select list is one or more supported single-group aggregates (no GROUP BY) over the whole table, e.g. `SELECT COUNT(*), SUM(x), MIN(x), MAX(x), AVG(x) FROM {vs_table} WHERE id > {beyond every file's max}`
-* *AND* the WHERE predicate prunes 100% of the table's data files during plan-time file pruning
+* *GIVEN* a query with an aggregate and no GROUP BY, whatever its select list holds: decomposable aggregates, `COUNT(DISTINCT ...)`, constants, aggregates the adapter does not decompose, or no aggregate outside HAVING, e.g. `SELECT 'X', COUNT(*) FROM {vs_table} WHERE {prunes every file} HAVING COUNT(*) = 0`
+* *AND* the WHERE predicate prunes 100% of the table's data files during plan-time file pruning, or one side of an inner join has zero files
 * *WHEN* Exasol sends the corresponding `pushdown` request
-* *THEN* the adapter SHALL return a `pushdown` response that produces exactly one row whose column count equals the number of requested aggregates
-* *AND* each `COUNT`/`COUNT(col)` output column SHALL be `0` and each `SUM`/`MIN`/`MAX`/`AVG`/`STDDEV*`/`VARIANCE*` output column SHALL be `NULL`, every column cast to the aggregate's declared result type from `selectListDataTypes`
-* *AND* the merged empty result SHALL equal the same aggregate evaluated over zero rows on a single node (the response invokes no scan UDF, per Background)
-
-### Scenario: Single-group COUNT(DISTINCT) with all files pruned returns zero
-
-* *GIVEN* a query whose select list includes `COUNT(DISTINCT col)` over the whole table with no GROUP BY, e.g. `SELECT COUNT(DISTINCT id) FROM {vs_table} WHERE id > {beyond every file's max}`
-* *AND* the WHERE predicate prunes 100% of the table's data files during plan-time file pruning
-* *WHEN* Exasol sends the corresponding `pushdown` request
-* *THEN* the adapter SHALL return a `pushdown` response that produces exactly one row whose single `COUNT(DISTINCT col)` output column is `0`, cast to the aggregate's declared result type
-* *AND* the response MUST NOT invoke the scan fan-out UDF and MUST NOT reference any resolved data file
-
-### Scenario: Multi-distinct or mixed single-group request with all files pruned matches the non-empty aggregate shape
-
-* *GIVEN* a single-group query whose select list carries more than one `COUNT(DISTINCT col)`, OR a `COUNT(DISTINCT col)` alongside one or more ordinary SUM/MIN/MAX/COUNT/AVG aggregates (Case 2/3), e.g. `SELECT COUNT(DISTINCT a), COUNT(DISTINCT b), SUM(x) FROM {vs_table} WHERE {prunes every file}`
-* *AND* the WHERE predicate prunes 100% of the table's data files during plan-time file pruning
-* *WHEN* Exasol sends the corresponding `pushdown` request
-* *THEN* the adapter SHALL return a `pushdown` response producing exactly one row of N columns — one per select-list item, in order — each cast to its declared result type: every `COUNT`/`COUNT(DISTINCT)` column is `0` and every `SUM`/`MIN`/`MAX`/`AVG` column is `NULL`
-* *AND* that N-column shape SHALL be identical to the qualified single-table wrapper the non-empty Case 2/3 path returns (`pushdown-aggregates/pushdown-planning-count-distinct`), so the empty and non-empty column counts and types never diverge and Exasol's positional pushdown validation accepts both (never a `04000` mismatch)
+* *THEN* the adapter SHALL return the request's select list, HAVING, and LIMIT rendered over one zero-row relation per table, each typed like that table's columns, so Exasol evaluates the request over the empty set
+* *AND* the result SHALL equal native Exasol: exactly one row when HAVING is absent or true (`COUNT` yields `0`, every other aggregate `NULL`, and constants and scalar expressions are evaluated over those values), and no row when HAVING is false
 * *AND* the response MUST NOT invoke the scan fan-out UDF and MUST NOT reference any resolved data file
 
 ### Scenario: Grouped aggregate with all files pruned returns zero rows in grouped shape
@@ -110,7 +93,7 @@ instead of rejecting it for a column-count/type mismatch.
 * *GIVEN* any `pushdown` request whose filter prunes 100% of the table's data files during plan-time file pruning, whichever table format's reader resolved that list
 * *WHEN* the adapter reaches the zero-files short-circuit
 * *THEN* the adapter SHALL choose the empty-result shape using the SAME plan-detection priority the non-empty path uses — grouped aggregate first, then single-group aggregate, then row scan
-* *AND* the single-group aggregate shape SHALL be chosen only when the aggregate column types pass the same numeric-type validation the non-empty path applies (so an aggregate the non-empty path demotes to a row scan produces the row-scan empty shape, not an aggregate shape)
+* *AND* a request Exasol marks `aggregationType: single_group` SHALL take the single-group empty shape whether or not the non-empty path decomposes it, and never the row-scan empty shape
 * *AND* the empty and non-empty paths SHALL derive that priority and those validation gates from one shared request classifier, so the ROUTING decision is shared by construction rather than kept in lockstep by convention; each path then renders its own shape from that shared decision
 * *AND* that shared classifier SHALL raise NO grouped-tier hard error, so a grouped request that does not decompose — for any reason, including a non-numeric aggregate column type or a HAVING the adapter cannot merge, whether or not a HAVING is present — SHALL yield the qualified single-table wrapper (`GroupByWrapper`) shape identically on the empty and non-empty paths, rather than the hard-error decline both paths previously surfaced (issue #195)
 * *AND* the empty grouped-fallback (`GroupByWrapper`) shape SHALL type its columns from `selectListDataTypes` when present — a positional shape Exasol accepts against it, not a raw row projection — and when `selectListDataTypes` is absent or empty SHALL fall back to the full-row-projection empty shape, matching the pre-refactor empty-result behavior byte-for-byte (this refactor changes routing structure, not column-shape selection)
@@ -121,4 +104,3 @@ instead of rejecting it for a column-count/type mismatch.
 * *GIVEN* a pushdown request this feature short-circuits to an empty result
 * *WHEN* the adapter generates the pushdown SQL
 * *THEN* the returned SQL SHALL carry no scan-spec storage value, neither a credential nor a connection reference, so the credential-reference guarantee holds unconditionally
-* *AND* the six `empty_*` golden fixtures SHALL stay byte-identical

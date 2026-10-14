@@ -73,7 +73,8 @@ pub(crate) use joins::{
     ResolvedJoinSide, detect_join, render_broadcast_join,
 };
 use joins::{
-    ineligible_join_decline, plan_join, qualified_single_table_fallback_pushdown, qualify_udf,
+    EmptyRelation, ineligible_join_decline, plan_join, qualified_single_table_fallback_pushdown,
+    qualify_udf,
 };
 
 #[cfg(test)]
@@ -215,6 +216,7 @@ pub async fn handle_pushdown(
             &proj_types,
             projection_widened,
             &col_types,
+            &EmptyRelation::single_scan(request, &col_types),
         );
     }
 
@@ -372,7 +374,7 @@ pub(crate) fn build_dispatch_sql(
             );
             return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
         }
-        RequestShape::GroupByWrapper => {
+        RequestShape::GroupByWrapper | RequestShape::SingleGroupWrapper => {
             // Never fall through to the bare row scan: Exasol expects exactly the
             // `selectList` columns (`04000` otherwise). The qualified wrapper lets Exasol
             // aggregate the materialized rows (#82). No outer WHERE is needed: an
@@ -389,7 +391,7 @@ pub(crate) fn build_dispatch_sql(
                 None,
             );
         }
-        RequestShape::SingleGroupAgg { items } => {
+        RequestShape::SingleGroupAgg { items, having } => {
             // Lone bare-column COUNT(DISTINCT): the only fan-out shape. LIMIT goes only on
             // the outer wrapper; inside the fan-out it would truncate a shard's distinct set.
             // Exasol rejects OFFSET in an ungrouped aggregate (`42000`) before the adapter
@@ -442,6 +444,7 @@ pub(crate) fn build_dispatch_sql(
             let merge_inputs =
                 single_group_merge_select(&items, &plans, &plan_types).and_then(|merge_select| {
                     AggregateMergeInputs::new(plan_types, merge_select, limit)
+                        .map(|inputs| inputs.with_having(having))
                 });
             let Some(merge_inputs) = merge_inputs else {
                 // Defensive: a shortened select list fails Exasol's positional validation.

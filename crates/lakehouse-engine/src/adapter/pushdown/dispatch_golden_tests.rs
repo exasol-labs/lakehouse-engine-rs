@@ -346,6 +346,7 @@ fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[String]
         proj_types,
         false,
         &base_col_types(),
+        &EmptyRelation::single_scan(request, &base_col_types()),
     )
     .expect("empty_result_sql must succeed for this golden fixture");
     result["sql"]
