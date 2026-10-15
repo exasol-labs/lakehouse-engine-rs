@@ -239,28 +239,19 @@ pub fn classify_scan_error(e: DataFusionError, secrets: &[&str]) -> UdfError {
     }
 }
 
-/// Wrapping layers' text is dropped, as in [`resources_exhausted_error`]: a `.context()` string
-/// can carry a credential-bearing fragment. Redaction still runs over what remains.
+/// Takes the raised message alone, never a wrapped error: a `.context()` string can carry a
+/// credential-bearing fragment.
 fn raised_failure_error(failure: &str, secrets: &[&str]) -> UdfError {
     UdfError::User(redact_credentials(&redact_secret_values(failure, secrets)))
 }
 
 const CONCURRENT_FAILURE_PREAMBLE: &str = "the scan also surfaced:";
 
-/// Read back by [`reframe_raised_failure`]. Unlike DataFusion's wording, this text is our own
-/// and one constant owns it for writer and reader, so matching on it is safe.
+/// Our own text, unlike DataFusion's wording, so [`reframe_raised_failure`] can match on it.
 const MEMORY_EXHAUSTED_LABEL: &str = "scan failed: memory exhausted (ResourcesExhausted):";
 
-/// A checked division or numeric overflow raised inside a pushed Parquet row filter does not
-/// survive to [`classify_scan_error`] (issue #370's route), so the session's record is consulted
-/// once per scan at the dispatcher all run paths funnel through.
-///
-/// A recorded failure REPLACES the surfaced one, except memory exhaustion, which it leads: that
-/// is the only failure separable from the flattened one without matching DataFusion's wording.
-/// Accepted limitation: an unrelated storage failure in another partition of the scan is masked.
-///
-/// Redacted here because `raw_scan` and `partial_agg` classify with the fact side's secrets
-/// alone, while this dispatcher holds the union covering a join's dimension side.
+/// The Parquet row filter flattens a raised failure to text (#370), so the session's record
+/// replaces it, keeping only a memory exhaustion after it. Redacts with a join's full secret set.
 pub fn reframe_raised_failure(
     session: &SessionContext,
     error: UdfError,
