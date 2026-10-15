@@ -257,16 +257,6 @@ fn ids_of_first_column(conn: &mut ExaConn, sql: &str) -> Vec<i64> {
 }
 
 /// Scenario: Regexp scalar functions are deliberately not translated
-///
-/// Exasol matches the whole string with PCRE semantics. Over the seeded names
-/// `event-01`..`event-20`, `'event-1'` matches nothing, an alternation with an
-/// optional group matches nothing, and a look-around matches three rows. A
-/// substring or Rust-regex evaluation returns 10, 20 rows, or a scan error.
-/// The native count over an identical generated column pins each expectation.
-///
-/// A sibling `AND` comparison is still pushed while the regex predicate stays in
-/// Exasol; id 4 satisfies `id < 5` but not the pattern, so a dropped regex
-/// predicate returns four rows instead of three.
 #[test]
 fn e2e_regexp_like_returns_native_rows() {
     setup_e2e();

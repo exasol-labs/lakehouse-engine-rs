@@ -26,8 +26,6 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_PRED_IS_NOT_NULL",
     "FN_PRED_LIKE",
     "FN_PRED_LIKE_ESCAPE",
-    // FN_PRED_REGEXP_LIKE is not advertised: DataFusion's regex matching cannot
-    // reproduce Exasol's whole-string PCRE match, so Exasol evaluates it.
     "LIMIT",
     // The per-shard bounded top-N never carries an offset: a non-zero offset
     // declines that path to the row-scan wrapper.

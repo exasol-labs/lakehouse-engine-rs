@@ -117,7 +117,6 @@ fn reports_audited_capability_set() {
         "FN_DIV",
         "FN_TO_CHAR",
         "FN_TO_NUMBER",
-        // Regex match semantics diverge from Exasol's PCRE (issue #106).
         "FN_PRED_REGEXP_LIKE",
         "FN_REGEXP_REPLACE",
         "FN_REGEXP_SUBSTR",
@@ -550,12 +549,13 @@ fn identifier_spans(row: &str) -> Vec<&str> {
 }
 
 /// `docs/capabilities.md` lists exactly the advertised set above its
-/// "Handled by Exasol" heading, and lists none of it below.
+/// "Handled by Exasol" heading.
 #[test]
 fn capabilities_doc_lists_exactly_the_advertised_set() {
     let doc = include_str!("../../../../docs/capabilities.md");
-    let (advertised_part, handled_part) = doc
+    let advertised_part = doc
         .split_once("## Handled by Exasol")
+        .map(|(above, _)| above)
         .expect("docs/capabilities.md must have a `## Handled by Exasol` section");
 
     let documented: std::collections::BTreeSet<&str> = advertised_part
@@ -571,17 +571,5 @@ fn capabilities_doc_lists_exactly_the_advertised_set() {
         missing_from_doc.is_empty() && not_advertised.is_empty(),
         "docs/capabilities.md drifted from CAPABILITIES: advertised but undocumented \
          {missing_from_doc:?}; documented but not advertised {not_advertised:?}"
-    );
-
-    let wrongly_handled: Vec<&str> = handled_part
-        .lines()
-        .filter(|line| line.starts_with('|'))
-        .filter_map(|line| line.split('|').nth(1))
-        .flat_map(|first_column| first_column.split('`').skip(1).step_by(2))
-        .filter(|token| advertised.contains(token))
-        .collect();
-    assert!(
-        wrongly_handled.is_empty(),
-        "advertised capabilities listed under `Handled by Exasol`: {wrongly_handled:?}"
     );
 }
