@@ -17,8 +17,8 @@ enum ExasolForm {
     /// re-emitting it verbatim cannot be wrong.
     VerbatimCall,
     /// The per-name arm owns both dialects: the Exasol form is not a plain call
-    /// (operator, infix predicate, `CASE`, per-dialect CAST target), or the
-    /// DataFusion side is not (`MOD` renders as `%`).
+    /// (operator, `CASE`, per-dialect CAST target), or the DataFusion side is not
+    /// (`MOD` renders as `%`).
     Shaped,
 }
 
@@ -31,7 +31,6 @@ const TRANSLATED_SCALAR_FNS: &[(&str, ExasolForm)] = &[
     ("FLOAT_DIV", ExasolForm::Shaped),
     ("NEG", ExasolForm::Shaped),
     ("CAST", ExasolForm::Shaped),
-    ("REGEXP_LIKE", ExasolForm::Shaped),
     // MOD: Exasol requires `MOD(a, b)`, DataFusion the `%` operator (#197).
     ("MOD", ExasolForm::Shaped),
     // CONCAT: Exasol's `||` treats NULL as '' and yields NULL only when all-empty;
@@ -168,7 +167,6 @@ fn is_boolean_producing(kind: &str) -> bool {
             | "predicate_in_constlist"
             | "predicate_between"
             | "predicate_like"
-            | "predicate_like_regexp"
     )
 }
 
@@ -405,6 +403,13 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             }));
         }
         "literal_string" => return Ok(Some(quote_literal(value("value")))),
+        // The scan parses bare numeric literals as DECIMAL, which rejects `1e+300`.
+        "literal_double" if dialect == Dialect::DataFusion => {
+            return Ok(Some(match value("value") {
+                None | Some(Json::Null) => "NULL".to_string(),
+                Some(v) => format!("CAST({} AS DOUBLE)", quote_literal(Some(v))),
+            }));
+        }
         "literal_exactnumeric" | "literal_double" => {
             return Ok(Some(match value("value") {
                 None | Some(Json::Null) => "NULL".to_string(),
@@ -568,24 +573,6 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 )),
             }
         }
-        // Exasol sends REGEXP_LIKE as node type `predicate_like_regexp`.
-        "predicate_like_regexp" => {
-            let subject =
-                render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
-                    .ok_or_else(|| {
-                        UdfError::User("predicate_like_regexp missing 'expression'".into())
-                    })?;
-            let pattern =
-                render_expression_inner(value("pattern").unwrap_or(&Json::Null), dialect)?
-                    .ok_or_else(|| {
-                        UdfError::User("predicate_like_regexp missing 'pattern'".into())
-                    })?;
-            Ok(Some(match dialect {
-                // Exasol accepts only the infix form (42000 on a call).
-                Dialect::Exasol => format!("({subject} REGEXP_LIKE {pattern})"),
-                Dialect::DataFusion => format!("regexp_like({subject}, {pattern})"),
-            }))
-        }
         "function_scalar_extract" => {
             let field = value("toExtract")
                 .and_then(|f| f.as_str())
@@ -748,26 +735,6 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     Ok(Some(format!("(-{operand})")))
                 }
                 "CAST" => render_cast(args, value("dataType"), dialect),
-                "REGEXP_LIKE" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar REGEXP_LIKE missing 'arguments'".into())
-                    })?;
-                    if args.len() < 2 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar REGEXP_LIKE requires 2 arguments, got {}",
-                            args.len()
-                        )));
-                    }
-                    let subject = render_expression_inner(&args[0], dialect)?
-                        .ok_or_else(|| UdfError::User("REGEXP_LIKE subject is null".into()))?;
-                    let pattern = render_expression_inner(&args[1], dialect)?
-                        .ok_or_else(|| UdfError::User("REGEXP_LIKE pattern is null".into()))?;
-                    Ok(Some(match dialect {
-                        // Must render byte-identically to `predicate_like_regexp`.
-                        Dialect::Exasol => format!("({subject} REGEXP_LIKE {pattern})"),
-                        Dialect::DataFusion => format!("regexp_like({subject}, {pattern})"),
-                    }))
-                }
                 "ABS" | "FLOOR" | "CEIL" | "SQRT" | "EXP" | "LN" | "SIGN" | "DEGREES"
                 | "RADIANS" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "SINH"
                 | "COSH" | "TANH" | "COT" => {

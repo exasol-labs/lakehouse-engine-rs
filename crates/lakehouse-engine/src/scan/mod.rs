@@ -8,10 +8,14 @@ pub mod spec;
 
 use crate::scan::spec::ScanSpec;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::optimizer::Analyzer;
 use datafusion::prelude::SessionConfig;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;
+use std::sync::Arc;
 
 mod field_id_projection;
 pub(crate) use field_id_projection::{
@@ -25,6 +29,8 @@ mod sql_support;
 pub use sql_support::build_alias_items;
 
 mod checked_div;
+mod exasol_numeric;
+mod raised_failure;
 
 mod object_store;
 pub(crate) use self::object_store::{
@@ -99,6 +105,32 @@ pub fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, Str
             .build()
             .map_err(|e| format!("failed to build multi-thread tokio runtime: {e}"))
     }
+}
+
+/// Any planning that derives the scan's result types must use this session too.
+pub(crate) fn scan_session_context(
+    config: SessionConfig,
+    runtime: Arc<RuntimeEnv>,
+) -> SessionContext {
+    let raised = Arc::new(raised_failure::RaisedFailure::default());
+    let numeric_typing = Arc::new(exasol_numeric::ExasolNumericTyping::new(raised.clone()));
+    let mut rules = Analyzer::new().rules;
+    rules.insert(0, numeric_typing.clone());
+    let state = SessionStateBuilder::new()
+        .with_config(
+            config
+                .set_bool("datafusion.sql_parser.parse_float_as_decimal", true)
+                .with_extension(raised.clone()),
+        )
+        .with_runtime_env(runtime)
+        .with_default_features()
+        .with_analyzer_rules(rules)
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    numeric_typing.register_functions(&ctx);
+    raw_scan::register_nested_json_render_udf(&ctx);
+    checked_div::register_checked_float_div_udf(&ctx, raised);
+    ctx
 }
 
 /// `pushdown_filters` defaults OFF in DataFusion, so it is enabled explicitly, except for a scan
@@ -205,9 +237,7 @@ async fn run_scan_dispatch(
         };
         emit_footer_refetch_diagnostic(ctx, session_ctx, coverage);
     }
-    // A checked division raised inside a pushed filter loses its type at the Parquet row-filter
-    // boundary; every run path funnels through here, and the session still holds it typed.
-    result.map_err(|e| emit::reframe_checked_division(session_ctx, e, &storage.all_secret_values()))
+    result.map_err(|e| emit::reframe_raised_failure(session_ctx, e, &storage.all_secret_values()))
 }
 
 /// A no-op at the production `info` level; a telemetry failure never surfaces as a scan error.

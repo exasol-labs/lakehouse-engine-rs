@@ -78,7 +78,8 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return the corresponding SQL literal:
   `literal_string` → single-quoted string with internal single-quotes escaped by doubling;
-  `literal_exactnumeric` / `literal_double` → bare numeric value;
+  `literal_exactnumeric` → bare numeric value;
+  `literal_double` → bare numeric value in the Exasol dialect, and `CAST('<value>' AS DOUBLE)` in the DataFusion dialect, because the scan reads a bare numeric literal as DECIMAL (`scan-types/scan-numeric-typing`);
   `literal_bool` → `TRUE` or `FALSE`;
   `literal_null` → `NULL`;
   `literal_date` → `DATE 'YYYY-MM-DD'`

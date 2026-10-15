@@ -8,9 +8,9 @@ use common::e2e_harness::{
     VARCHAR_JSON, VsProps, assert_decimal_orders_numerically, assert_notes_well_formed,
     assert_query_fails, assert_refused_column, assert_type_matrix, column_adapter_notes,
     create_schema_and_scripts, create_virtual_schema_with_password, declared_type, exa_conn,
-    explain_virtual_sql, install_slc, local_stack_storage, note_of, nullable_text, parse_int,
-    parse_numeric, partition_positions, reads, refuses, skip_reason, text_column,
-    try_create_virtual_schema_with_password, upload_so, value_to_string,
+    explain_virtual_sql, has_broadcast_join_block, install_slc, local_stack_storage, note_of,
+    nullable_text, parse_int, parse_numeric, partition_positions, reads, refuses, skip_reason,
+    text_column, try_create_virtual_schema_with_password, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::raw_parquet::{
@@ -684,6 +684,8 @@ fn date_range_batch() -> RecordBatch {
 /// #478 shape, one file per shard: Int64 and Int32 values whose squares overflow, constant groups
 /// at 1e9 (BIGINT) and 1e12 (DECIMAL), a one-row group, an all-NULL group, and a group whose one
 /// value sits beside a NULL-only shard. `E` is epoch milliseconds within one minute.
+/// #475 shape: `X` holds DOUBLE values beyond and below DECIMAL(36), `H` an Int64 whose sums and
+/// products leave Int64, and `W` a DECIMAL(36,6) whose first 300 rows overflow any sum.
 fn stats_batch(file: i64) -> RecordBatch {
     let ks: Vec<i64> = (1..=3003).filter(|k| k % 3 == file).collect();
     let group = |k: i64| match k {
@@ -711,6 +713,9 @@ fn stats_batch(file: i64) -> RecordBatch {
         Field::new("D", DataType::Decimal128(18, 2), true),
         Field::new("F", DataType::Float64, true),
         Field::new("E", DataType::Int64, true),
+        Field::new("X", DataType::Float64, true),
+        Field::new("H", DataType::Int64, true),
+        Field::new("W", DataType::Decimal128(36, 6), true),
     ]));
     let ints = col(|k| 50_000 + k, 77_777);
     let cents = col(
@@ -752,9 +757,57 @@ fn stats_batch(file: i64) -> RecordBatch {
                 |k| 1_767_225_600_000 + k * 7_919 % 60_000,
                 1_767_225_600_000,
             ))),
+            Arc::new(Float64Array::from_iter(ks.iter().map(|&k| {
+                let x = match k {
+                    1 => 1e300,
+                    2 => 1e-20,
+                    3 => 0.1,
+                    4 => 2.5,
+                    _ => k as f64 * 0.25,
+                };
+                (k != 3001).then_some(x)
+            }))),
+            Arc::new(Int64Array::from_iter(
+                ks.iter()
+                    .map(|&k| (k != 3001).then_some(4_000_000_000_000_000_000)),
+            )),
+            Arc::new(
+                Decimal128Array::from_iter(ks.iter().map(|&k| {
+                    let w = if k <= 300 {
+                        10i128.pow(36) - 1
+                    } else {
+                        i128::from(k) * 1_000_001
+                    };
+                    (k != 3001).then_some(w)
+                }))
+                .with_precision_and_scale(36, 6)
+                .expect("DECIMAL(36,6) is valid"),
+            ),
         ],
     )
     .expect("stats batch construction is infallible")
+}
+
+/// Broadcast-join dimension for `STATS`, its column names disjoint from the fact table's.
+fn stats_dim_batch() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("DK", DataType::Int64, false),
+        Field::new("DD", DataType::Decimal128(10, 2), true),
+        Field::new("DH", DataType::Int64, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(
+                Decimal128Array::from(vec![10i128, 250, 700])
+                    .with_precision_and_scale(10, 2)
+                    .expect("DECIMAL(10,2) is valid"),
+            ),
+            Arc::new(Int64Array::from(vec![4_000_000_000_000_000_000, 2, 7])),
+        ],
+    )
+    .expect("stats dimension batch construction is infallible")
 }
 
 fn write_delta_caveat_fixture() {
@@ -852,6 +905,10 @@ fn write_all_fixtures() {
         );
     }
 
+    write_parquet_fixture(
+        &format!("{BASE_DIRECT}stats_dim/p.parquet"),
+        stats_dim_batch(),
+    );
     write_delta_caveat_fixture();
 
     write_parquet_fixture(
@@ -1655,6 +1712,14 @@ fn assert_matches_native(conn: &mut ExaConn, select: &str, tail: &str, keys: usi
 
 const DIRECT_STATS: &str = "DIRECT_LAKEHOUSE.STATS";
 const STATS_ORACLE: &str = "LHVS.DIRECT_STATS_ORACLE";
+const DIRECT_STATS_DIM: &str = "DIRECT_LAKEHOUSE.STATS_DIM";
+const STATS_DIM_ORACLE: &str = "LHVS.DIRECT_STATS_DIM_ORACLE";
+const NUMERIC_OVERFLOW: &str = "data exception - numeric value out of range";
+/// Native Exasol's overflow message carries neither detail, so one proves the scan raised it.
+const SCAN_OVERFLOW_DETAILS: [&str; 2] = [
+    "exceeds the 128-bit internal number representation",
+    "exceeds DECIMAL(",
+];
 const STAT_SELECT: &str = "VAR_POP(B), STDDEV(B), VAR_SAMP(I), STDDEV_POP(I), VARIANCE(C), \
      STDDEV_SAMP(C), VAR_POP(D), STDDEV(D), VARIANCE(F), STDDEV_SAMP(F)";
 
@@ -1664,13 +1729,7 @@ const STAT_SELECT: &str = "VAR_POP(B), STDDEV(B), VAR_SAMP(I), STDDEV_POP(I), VA
 fn stat_aggregates_match_native_exasol() {
     setup();
     let mut conn = exa_conn();
-    conn.execute(&format!(
-        "CREATE OR REPLACE TABLE {STATS_ORACLE} AS SELECT * FROM {DIRECT_STATS}"
-    ));
-    assert_eq!(
-        parse_int(&conn.query_columns(&format!("SELECT COUNT(*) FROM {STATS_ORACLE}"))[0][0]),
-        3003
-    );
+    create_stats_oracles(&mut conn);
 
     let grouped = format!("SELECT G, {STAT_SELECT} FROM {DIRECT_STATS} GROUP BY G");
     let pushed = explain_virtual_sql(&mut conn, &grouped);
@@ -1742,6 +1801,136 @@ fn stat_aggregates_match_native_exasol() {
         1,
         1e-7,
     );
+}
+
+fn create_stats_oracles(conn: &mut ExaConn) {
+    for (oracle, source, rows) in [
+        (STATS_ORACLE, DIRECT_STATS, 3003),
+        (STATS_DIM_ORACLE, DIRECT_STATS_DIM, 3),
+    ] {
+        conn.execute(&format!(
+            "CREATE OR REPLACE TABLE {oracle} AS SELECT * FROM {source}"
+        ));
+        assert_eq!(
+            parse_int(&conn.query_columns(&format!("SELECT COUNT(*) FROM {oracle}"))[0][0]),
+            rows
+        );
+    }
+}
+
+/// `{T}` and `{D}` name the fact and dimension tables.
+fn assert_same_as_native(conn: &mut ExaConn, template: &str, overflows: bool) {
+    let mut run = |fact: &str, dim: &str| {
+        let response = conn.try_execute(&template.replace("{T}", fact).replace("{D}", dim));
+        match response["status"].as_str() {
+            Some("ok") => {
+                Ok(conn.fetch_result_columns(&response["responseData"]["results"][0]["resultSet"]))
+            }
+            _ => Err(response["exception"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()),
+        }
+    };
+    let pushed = run(DIRECT_STATS, DIRECT_STATS_DIM);
+    let native = run(STATS_ORACLE, STATS_DIM_ORACLE);
+    match (pushed, native) {
+        (Ok(got), Ok(want)) if !overflows => assert_eq!(got, want, "{template}"),
+        (Err(got), Err(want))
+            if overflows
+                && got.contains(NUMERIC_OVERFLOW)
+                && SCAN_OVERFLOW_DETAILS.iter().any(|d| got.contains(d))
+                && want.contains(NUMERIC_OVERFLOW) => {}
+        (got, want) => panic!("{template}\nvirtual schema: {got:?}\nnative: {want:?}"),
+    }
+}
+
+/// Scenario: DOUBLE combined with DECIMAL evaluates in DOUBLE
+/// Scenario: Exact arithmetic and SUM do not wrap
+/// Scenario: Exact overflow raises Exasol's numeric value out of range
+/// Scenario: Wide exact operands compare exactly and combine in DOUBLE
+/// Scenario: A fractional numeric literal compares exactly
+#[test]
+fn numeric_expressions_match_native_exasol() {
+    setup();
+    let mut conn = exa_conn();
+    create_stats_oracles(&mut conn);
+
+    let join = "SELECT K, DK FROM {T} JOIN {D} ON X = DD ORDER BY K, DK";
+    assert!(
+        has_broadcast_join_block(&explain_virtual_sql(
+            &mut conn,
+            &join
+                .replace("{T}", DIRECT_STATS)
+                .replace("{D}", DIRECT_STATS_DIM)
+        )),
+        "the DOUBLE = DECIMAL join must take the broadcast path"
+    );
+
+    for template in [
+        "SELECT K FROM {T} WHERE X = 0.1 ORDER BY K",
+        "SELECT K FROM {T} WHERE D < X ORDER BY K",
+        "SELECT K FROM {T} WHERE W > X AND K < 10 ORDER BY K",
+        "SELECT K FROM {T} WHERE X IN (D, 0.1, 2.5) ORDER BY K",
+        "SELECT K FROM {T} WHERE X BETWEEN 0 AND D AND K < 10 ORDER BY K",
+        "SELECT K FROM {T} WHERE X > 1E299 OR X < 1.0000000000000001E-19 ORDER BY K",
+        "SELECT K, CASE WHEN K < 3 THEN X ELSE D END, CASE X WHEN D THEN 1 ELSE 0 END \
+         FROM {T} WHERE K < 6 ORDER BY K",
+        "SELECT K, GREATEST(D, X), LEAST(W, X), NULLIF(X, D), COALESCE(X, D) \
+         FROM {T} WHERE K < 6 OR K = 3001 ORDER BY K",
+        "SELECT K, H * 3, H + H, -H - H, H * D, H * H * 10 - H * H * 10 \
+         FROM {T} WHERE K < 4 OR K = 3001 ORDER BY K",
+        "SELECT K, W + D, W - D * H, (D + 1) * (D - 1), W * 0.000001 \
+         FROM {T} WHERE K BETWEEN 1501 AND 1503 ORDER BY K",
+        "SELECT K, I * I, I * I * I, MOD(H * 10, 7), ABS(-H * 3), ROUND(H * 3, -1) \
+         FROM {T} WHERE K < 3 OR K > 2998 ORDER BY K",
+        "SELECT K FROM {T} WHERE H * 3 > 9000000000000000000 AND K < 5 ORDER BY K",
+        "SELECT H * 3, COUNT(*) FROM {T} GROUP BY H * 3 ORDER BY 1",
+        "SELECT AVG(W) FROM {T} WHERE K <= 50",
+        "SELECT SUM(H), SUM(H * 3), AVG(H), MIN(H * 3), MAX(H * I), COUNT(DISTINCT H * 3) FROM {T}",
+        "SELECT G, SUM(H * 3), SUM(I * I), SUM(W) FROM {T} WHERE K > 300 \
+         GROUP BY G ORDER BY G",
+        join,
+        "SELECT K, DK, H + DH, H * DK FROM {T} JOIN {D} ON H = DH WHERE K < 5 ORDER BY K, DK",
+        "SELECT K, DK FROM {T} JOIN {D} ON K = DK WHERE X > DD ORDER BY K",
+        "SELECT K FROM {T} WHERE W > H * H OR K = 7 ORDER BY K",
+        "SELECT K FROM {T} WHERE W < H * H AND K < 5 ORDER BY K",
+        "SELECT K FROM {T} WHERE W IN (H * H, 7.5, 7.000007) ORDER BY K",
+        "SELECT K FROM {T} WHERE W BETWEEN 0 AND H * H AND K < 5 ORDER BY K",
+        "SELECT K FROM {T} WHERE H * H * 10 > W AND K < 5 ORDER BY K",
+        "SELECT K FROM {T} WHERE W * 100 < H * 250000000000 * 100 \
+         AND K BETWEEN 299 AND 302 ORDER BY K",
+        "SELECT K, GREATEST(W, H * H), CASE WHEN K < 3 THEN H * H ELSE W END, \
+         COALESCE(W, H * H), NULLIF(W, H * H), NULLIF(W, X) \
+         FROM {T} WHERE K < 5 OR K = 3001 ORDER BY K",
+        "SELECT K FROM {T} WHERE H = 4000000000000000000.5",
+        "SELECT K FROM {T} WHERE H > 3999999999999999999.5 AND K < 5 ORDER BY K",
+        "SELECT K FROM {T} WHERE W > 123456789012345678901234567890.123455 \
+         AND K BETWEEN 299 AND 302 ORDER BY K",
+        "SELECT K FROM {T} WHERE W = 999999999999999999999999999999.999999 \
+         AND K BETWEEN 299 AND 302 ORDER BY K",
+        "SELECT K FROM {T} WHERE W IN (999999999999999999999999999999.999999, 302.000302) \
+         AND K BETWEEN 299 AND 302 ORDER BY K",
+        "SELECT K FROM {T} WHERE W BETWEEN 301.000301 AND 999999999999999999999999999999.999998 \
+         AND K BETWEEN 299 AND 302 ORDER BY K",
+        "SELECT K FROM {T} WHERE W <> 999999999999999999999999999999.999999 \
+         AND K BETWEEN 299 AND 302 ORDER BY K",
+        "SELECT K, W - 123456789012345678901234567890.1 FROM {T} \
+         WHERE K BETWEEN 1501 AND 1503 ORDER BY K",
+    ] {
+        assert_same_as_native(&mut conn, template, false);
+    }
+    for template in [
+        "SELECT K, H * H * 100 FROM {T} WHERE K < 3",
+        "SELECT K FROM {T} WHERE H * H * 100 > 0",
+        "SELECT K, H * H * 10 FROM {T} WHERE K < 3",
+        "SELECT SUM(W) FROM {T}",
+        "SELECT G, SUM(W) FROM {T} GROUP BY G",
+        "SELECT SUM(W * W) FROM {T}",
+        "SELECT K, DK FROM {T} JOIN {D} ON H = DH WHERE K < 4 AND H * DH * 100 > 0",
+    ] {
+        assert_same_as_native(&mut conn, template, true);
+    }
 }
 
 fn first_emitted_column(pushed_sql: &str) -> String {

@@ -4,10 +4,9 @@
 
 # Semantic differences from native Exasol
 
-A few pushed-down functions, and a filter on a date outside Exasol's DATE range, return a
-different result than the same query on a native Exasol table. Each difference on this page is a
-current compatibility gap. The [Capabilities](capabilities.md) page lists which functions are
-pushed down.
+Some pushed-down queries return a different result than the same query on a native Exasol
+table. Each difference on this page is a current compatibility gap. The
+[Capabilities](capabilities.md) page lists which functions are pushed down.
 
 ## Case conversion of non-ASCII text
 
@@ -67,3 +66,23 @@ For DECIMAL and integer columns, native Exasol computes `STDDEV`, `VARIANCE`, `V
 `VAR_SAMP`, `STDDEV_POP`, and `STDDEV_SAMP` exactly. The virtual schema computes them in double
 precision, so its results can be less precise. The difference grows when the values are large
 and close to each other.
+
+## AVG of very large values
+
+`AVG` returns an average where native Exasol fails with `data exception - numeric value out of
+range`. This happens only when the sum of the averaged values exceeds about 38 digits, counting
+the digits after the decimal point.
+
+## Addition and subtraction with different scales
+
+An expression that adds or subtracts DECIMAL values with different scales can return rows where
+native Exasol fails with `data exception - numeric value out of range`. Before it adds them,
+native Exasol converts the value with the smaller scale to `DECIMAL(36, s)`, where `s` is the
+larger scale, and fails when that value has too many integer digits for that type. The virtual
+schema converts the value to a 128-bit intermediate, which has room for it.
+
+For example, `WHERE W + 0.0000001 > W` with `W` a `DECIMAL(36,6)` value of
+`999999999999999999999999999999.999999` fails natively, because the 30 integer digits of `W` do
+not fit `DECIMAL(36,7)`. The virtual schema returns the row. `WHERE H * H + 0.5 > 0` with `H` a
+BIGINT of `4000000000000000000` differs in the same way. A projected sum that exceeds 36 digits
+still fails in the virtual schema too.

@@ -1,4 +1,6 @@
 use super::*;
+use crate::scan::raised_failure::session_raised_failure;
+use crate::scan::scan_session_context;
 use arrow::array::{
     Array, ArrayRef, AsArray, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
 };
@@ -6,11 +8,12 @@ use arrow::datatypes::{DataType, Field, Float64Type};
 use datafusion::common::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
+use datafusion::prelude::SessionConfig;
 
 /// Drives `invoke_with_args` as DataFusion does per batch, asserting observable output only.
 fn divide(left: ArrayRef, right: ArrayRef) -> Result<Float64Array, DataFusionError> {
     let rows = left.len();
-    let udf = ScalarUDF::from(CheckedFloatDivUdf::new());
+    let udf = ScalarUDF::from(CheckedFloatDivUdf::new(Arc::default()));
     let args = ScalarFunctionArgs {
         arg_fields: vec![
             Arc::new(Field::new("left", left.data_type().clone(), true)),
@@ -24,6 +27,10 @@ fn divide(left: ArrayRef, right: ArrayRef) -> Result<Float64Array, DataFusionErr
     let evaluated = udf.invoke_with_args(args)?;
     let array = evaluated.to_array(rows)?;
     Ok(array.as_primitive::<Float64Type>().clone())
+}
+
+fn scan_session() -> SessionContext {
+    scan_session_context(SessionConfig::new(), Arc::default())
 }
 
 /// The Exasol type an Iceberg `long` maps to, as a pushed `FLOAT_DIV` over integral columns sees it.
@@ -56,7 +63,7 @@ fn raised(left: ArrayRef, right: ArrayRef) -> DataFusionError {
 /// `Signature::any(2, ..)` rejects other arities at plan time, so only a direct call reaches them.
 fn invoke_with_argument_count(arguments: Vec<ArrayRef>) -> Result<ColumnarValue, DataFusionError> {
     let rows = arguments.first().map_or(0, |first| first.len());
-    let udf = ScalarUDF::from(CheckedFloatDivUdf::new());
+    let udf = ScalarUDF::from(CheckedFloatDivUdf::new(Arc::default()));
     let args = ScalarFunctionArgs {
         arg_fields: arguments
             .iter()
@@ -240,8 +247,7 @@ fn checked_float_div_returns_no_rows_for_an_empty_batch() {
 
 #[tokio::test]
 async fn checked_float_div_over_two_literals_surfaces_a_division_by_zero_message() {
-    let ctx = SessionContext::new();
-    register_checked_float_div_udf(&ctx);
+    let ctx = scan_session();
     let sql = format!("SELECT {CHECKED_FLOAT_DIV_FN}(0, 0) AS quotient");
 
     // If DataFusion ever const-folds this at plan time, the four planning sites
@@ -271,11 +277,10 @@ async fn checked_float_div_over_two_literals_surfaces_a_division_by_zero_message
 
 #[tokio::test]
 async fn checked_float_div_records_its_failure_on_the_session() {
-    let ctx = SessionContext::new();
-    register_checked_float_div_udf(&ctx);
+    let ctx = scan_session();
 
     assert!(
-        session_checked_float_div_failure(&ctx).is_none(),
+        session_raised_failure(&ctx).is_none(),
         "a session whose division has not raised must record no failure"
     );
 
@@ -288,19 +293,21 @@ async fn checked_float_div_records_its_failure_on_the_session() {
         .expect_err("a zero divisor must raise");
 
     assert_eq!(
-        session_checked_float_div_failure(&ctx),
-        Some(CheckedFloatDivError::ZeroDivisor {
-            numerator: 7.0,
-            divisor: 0.0,
-        }),
-        "the session must hold the raised failure as a typed value, not as text"
+        session_raised_failure(&ctx),
+        Some(
+            CheckedFloatDivError::ZeroDivisor {
+                numerator: 7.0,
+                divisor: 0.0,
+            }
+            .to_string()
+        ),
+        "the session must hold the raised failure"
     );
 }
 
 #[tokio::test]
 async fn a_successful_checked_division_records_no_session_failure() {
-    let ctx = SessionContext::new();
-    register_checked_float_div_udf(&ctx);
+    let ctx = scan_session();
 
     let sql = format!("SELECT {CHECKED_FLOAT_DIV_FN}(7, 2) AS quotient");
     ctx.sql(&sql)
@@ -311,17 +318,15 @@ async fn a_successful_checked_division_records_no_session_failure() {
         .expect("7 / 2 must divide cleanly");
 
     assert!(
-        session_checked_float_div_failure(&ctx).is_none(),
+        session_raised_failure(&ctx).is_none(),
         "a division that produced a finite value must record no failure"
     );
 }
 
 #[tokio::test]
 async fn a_second_session_records_no_failure_from_the_first() {
-    let divided = SessionContext::new();
-    let untouched = SessionContext::new();
-    register_checked_float_div_udf(&divided);
-    register_checked_float_div_udf(&untouched);
+    let divided = scan_session();
+    let untouched = scan_session();
 
     let sql = format!("SELECT {CHECKED_FLOAT_DIV_FN}(7, 0) AS quotient");
     divided
@@ -333,15 +338,18 @@ async fn a_second_session_records_no_failure_from_the_first() {
         .expect_err("a zero divisor must raise");
 
     assert_eq!(
-        session_checked_float_div_failure(&divided),
-        Some(CheckedFloatDivError::ZeroDivisor {
-            numerator: 7.0,
-            divisor: 0.0,
-        }),
+        session_raised_failure(&divided),
+        Some(
+            CheckedFloatDivError::ZeroDivisor {
+                numerator: 7.0,
+                divisor: 0.0,
+            }
+            .to_string()
+        ),
         "the session whose division raised must hold the failure"
     );
     assert!(
-        session_checked_float_div_failure(&untouched).is_none(),
+        session_raised_failure(&untouched).is_none(),
         "a second session must record no failure from the first, or one query's \
          division leaks into the next scan on a pooled UDF VM"
     );
