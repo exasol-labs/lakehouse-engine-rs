@@ -1,4 +1,4 @@
-use crate::scan::checked_div::{CheckedFloatDivError, find_checked_float_div_error};
+use crate::scan::checked_div::find_checked_float_div_error;
 use crate::scan::convert::check_date32_in_exasol_range;
 use crate::scan::diagnostics::PhaseTimers;
 use crate::scan::exasol_numeric::numeric_overflow;
@@ -172,10 +172,7 @@ pub(crate) fn coerce_column(
     };
     cast_with_options(column.as_ref(), target, &options).map_err(|e| {
         if let DataType::Decimal128(p, s) = target
-            && matches!(
-                column.data_type(),
-                DataType::Decimal128(..) | DataType::Decimal256(..)
-            )
+            && column.data_type().is_decimal()
         {
             return UdfError::User(numeric_overflow(format!(
                 "output column {} exceeds DECIMAL({p},{s}): {e}",
@@ -234,7 +231,7 @@ fn decimal_target(declared: &ColumnInfo, precision: u32, scale: u32) -> Result<D
 /// Credential redaction applies on every path.
 pub fn classify_scan_error(e: DataFusionError, secrets: &[&str]) -> UdfError {
     if let Some(division) = find_checked_float_div_error(&e) {
-        return checked_division_error(division, secrets);
+        return raised_failure_error(&division.to_string(), secrets);
     }
     match e.find_root() {
         DataFusionError::ResourcesExhausted(msg) => resources_exhausted_error(msg, secrets),
@@ -244,9 +241,8 @@ pub fn classify_scan_error(e: DataFusionError, secrets: &[&str]) -> UdfError {
 
 /// Wrapping layers' text is dropped, as in [`resources_exhausted_error`]: a `.context()` string
 /// can carry a credential-bearing fragment. Redaction still runs over what remains.
-fn checked_division_error(division: &CheckedFloatDivError, secrets: &[&str]) -> UdfError {
-    let safe = redact_credentials(&redact_secret_values(&division.to_string(), secrets));
-    UdfError::User(safe)
+fn raised_failure_error(failure: &str, secrets: &[&str]) -> UdfError {
+    UdfError::User(redact_credentials(&redact_secret_values(failure, secrets)))
 }
 
 const CONCURRENT_FAILURE_PREAMBLE: &str = "the scan also surfaced:";
@@ -273,10 +269,10 @@ pub fn reframe_raised_failure(
     let Some(recorded) = session_raised_failure(session) else {
         return error;
     };
-    let raised = redact_credentials(&redact_secret_values(&recorded, secrets));
+    let raised = raised_failure_error(&recorded, secrets);
     let surfaced = error.to_string();
     if !surfaced.contains(MEMORY_EXHAUSTED_LABEL) {
-        return UdfError::User(raised);
+        return raised;
     }
     let safe = redact_credentials(&redact_secret_values(&surfaced, secrets));
     UdfError::User(format!("{raised}; {CONCURRENT_FAILURE_PREAMBLE} {safe}"))

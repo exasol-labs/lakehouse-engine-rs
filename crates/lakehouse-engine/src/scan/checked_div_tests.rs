@@ -1,5 +1,6 @@
 use super::*;
 use crate::scan::raised_failure::session_raised_failure;
+use crate::scan::scan_session_context;
 use arrow::array::{
     Array, ArrayRef, AsArray, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
 };
@@ -7,14 +8,12 @@ use arrow::datatypes::{DataType, Field, Float64Type};
 use datafusion::common::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
+use datafusion::prelude::SessionConfig;
 
 /// Drives `invoke_with_args` as DataFusion does per batch, asserting observable output only.
 fn divide(left: ArrayRef, right: ArrayRef) -> Result<Float64Array, DataFusionError> {
     let rows = left.len();
-    let udf = ScalarUDF::from(CheckedFloatDivUdf {
-        signature: Signature::any(2, Volatility::Immutable),
-        raised: Arc::default(),
-    });
+    let udf = ScalarUDF::from(CheckedFloatDivUdf::new(Arc::default()));
     let args = ScalarFunctionArgs {
         arg_fields: vec![
             Arc::new(Field::new("left", left.data_type().clone(), true)),
@@ -28,6 +27,10 @@ fn divide(left: ArrayRef, right: ArrayRef) -> Result<Float64Array, DataFusionErr
     let evaluated = udf.invoke_with_args(args)?;
     let array = evaluated.to_array(rows)?;
     Ok(array.as_primitive::<Float64Type>().clone())
+}
+
+fn scan_session() -> SessionContext {
+    scan_session_context(SessionConfig::new(), Arc::default())
 }
 
 /// The Exasol type an Iceberg `long` maps to, as a pushed `FLOAT_DIV` over integral columns sees it.
@@ -60,10 +63,7 @@ fn raised(left: ArrayRef, right: ArrayRef) -> DataFusionError {
 /// `Signature::any(2, ..)` rejects other arities at plan time, so only a direct call reaches them.
 fn invoke_with_argument_count(arguments: Vec<ArrayRef>) -> Result<ColumnarValue, DataFusionError> {
     let rows = arguments.first().map_or(0, |first| first.len());
-    let udf = ScalarUDF::from(CheckedFloatDivUdf {
-        signature: Signature::any(2, Volatility::Immutable),
-        raised: Arc::default(),
-    });
+    let udf = ScalarUDF::from(CheckedFloatDivUdf::new(Arc::default()));
     let args = ScalarFunctionArgs {
         arg_fields: arguments
             .iter()
@@ -247,8 +247,7 @@ fn checked_float_div_returns_no_rows_for_an_empty_batch() {
 
 #[tokio::test]
 async fn checked_float_div_over_two_literals_surfaces_a_division_by_zero_message() {
-    let ctx = SessionContext::new();
-    register_checked_float_div_udf(&ctx);
+    let ctx = scan_session();
     let sql = format!("SELECT {CHECKED_FLOAT_DIV_FN}(0, 0) AS quotient");
 
     // If DataFusion ever const-folds this at plan time, the four planning sites
@@ -278,8 +277,7 @@ async fn checked_float_div_over_two_literals_surfaces_a_division_by_zero_message
 
 #[tokio::test]
 async fn checked_float_div_records_its_failure_on_the_session() {
-    let ctx = SessionContext::new();
-    register_checked_float_div_udf(&ctx);
+    let ctx = scan_session();
 
     assert!(
         session_raised_failure(&ctx).is_none(),
@@ -309,8 +307,7 @@ async fn checked_float_div_records_its_failure_on_the_session() {
 
 #[tokio::test]
 async fn a_successful_checked_division_records_no_session_failure() {
-    let ctx = SessionContext::new();
-    register_checked_float_div_udf(&ctx);
+    let ctx = scan_session();
 
     let sql = format!("SELECT {CHECKED_FLOAT_DIV_FN}(7, 2) AS quotient");
     ctx.sql(&sql)
@@ -328,10 +325,8 @@ async fn a_successful_checked_division_records_no_session_failure() {
 
 #[tokio::test]
 async fn a_second_session_records_no_failure_from_the_first() {
-    let divided = SessionContext::new();
-    let untouched = SessionContext::new();
-    register_checked_float_div_udf(&divided);
-    register_checked_float_div_udf(&untouched);
+    let divided = scan_session();
+    let untouched = scan_session();
 
     let sql = format!("SELECT {CHECKED_FLOAT_DIV_FN}(7, 0) AS quotient");
     divided

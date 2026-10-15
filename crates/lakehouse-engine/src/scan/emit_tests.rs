@@ -1,12 +1,14 @@
 use super::declared_columns_test_support::{declared, numeric, varchar};
 use super::*;
-use crate::scan::checked_div::{CheckedFloatDivError, register_checked_float_div_udf};
+use crate::scan::checked_div::CheckedFloatDivError;
+use crate::scan::scan_session_context;
 use arrow::array::Int32Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::RecordBatchStream;
+use datafusion::prelude::SessionConfig;
 use exasol_udf_sdk::value::{ColumnInfo, ExaType, Value};
 use futures::stream;
 use std::pin::Pin;
@@ -857,8 +859,7 @@ async fn reframe_raised_failure_replaces_a_generic_storage_failure_with_the_divi
 
 #[test]
 fn reframe_raised_failure_leaves_an_unrelated_failure_untouched() {
-    let session = SessionContext::new();
-    register_checked_float_div_udf(&session);
+    let session = scan_session_context(SessionConfig::new(), Arc::default());
     let storage = classify_scan_error(
         DataFusionError::Execution("S3 read failed: 403".into()),
         &[],
@@ -878,8 +879,7 @@ fn reframe_raised_failure_leaves_an_unrelated_failure_untouched() {
 
 /// The only state in which `reframe_raised_failure` does anything.
 async fn session_with_a_raised_division() -> SessionContext {
-    let session = SessionContext::new();
-    register_checked_float_div_udf(&session);
+    let session = scan_session_context(SessionConfig::new(), Arc::default());
     session
         .sql(&format!(
             "SELECT {}(7, 0)",

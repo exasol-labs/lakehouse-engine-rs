@@ -3,7 +3,8 @@
 //! it sees only operands of a division the pushdown synthesised, unlike `arrow_value_at`'s
 //! `is_nan()` guard, which cannot tell a computed non-finite from a stored one.
 
-use super::raised_failure::{RaisedFailure, raised_failure};
+use super::exasol_numeric::numeric_overflow;
+use super::raised_failure::RaisedFailure;
 use arrow::array::{Array, AsArray, Float64Array};
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Float64Type};
@@ -23,7 +24,7 @@ const NULL_ROW_FILLER: f64 = 0.0;
 
 /// Recognised BY TYPE via [`find_checked_float_div_error`], never by message text. `ZeroDivisor`
 /// wins whenever the divisor is zero; `NonFiniteResult` covers any other non-finite quotient.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub(super) enum CheckedFloatDivError {
     /// Either sign: IEEE-754 `-0.0` equals `0.0`.
     ZeroDivisor { numerator: f64, divisor: f64 },
@@ -48,12 +49,10 @@ impl fmt::Display for CheckedFloatDivError {
                 numerator,
                 divisor,
                 quotient,
-            } => write!(
-                f,
-                "data exception - numeric value out of range: \
-                 {CHECKED_FLOAT_DIV_FN}({numerator}, {divisor}) evaluates to \
-                 {quotient}, and Exasol's DOUBLE admits no non-finite value"
-            ),
+            } => f.write_str(&numeric_overflow(format_args!(
+                "{CHECKED_FLOAT_DIV_FN}({numerator}, {divisor}) evaluates to {quotient}, and \
+                 Exasol's DOUBLE admits no non-finite value"
+            ))),
         }
     }
 }
@@ -82,6 +81,15 @@ pub(super) fn find_checked_float_div_error(
 struct CheckedFloatDivUdf {
     signature: Signature,
     raised: Arc<RaisedFailure>,
+}
+
+impl CheckedFloatDivUdf {
+    fn new(raised: Arc<RaisedFailure>) -> Self {
+        Self {
+            signature: Signature::any(2, Volatility::Immutable),
+            raised,
+        }
+    }
 }
 
 /// The recorded failure is session state, not identity, so it is excluded from plan comparison.
@@ -183,11 +191,8 @@ fn checked_quotient(numerator: f64, divisor: f64) -> Result<f64, CheckedFloatDiv
 
 /// Registered unconditionally once per session: every scan path splices the same rendered
 /// expressions, and a spec with no division is unaffected.
-pub(super) fn register_checked_float_div_udf(ctx: &SessionContext) {
-    ctx.register_udf(ScalarUDF::from(CheckedFloatDivUdf {
-        signature: Signature::any(2, Volatility::Immutable),
-        raised: raised_failure(ctx),
-    }));
+pub(super) fn register_checked_float_div_udf(ctx: &SessionContext, raised: Arc<RaisedFailure>) {
+    ctx.register_udf(ScalarUDF::from(CheckedFloatDivUdf::new(raised)));
 }
 
 #[cfg(test)]

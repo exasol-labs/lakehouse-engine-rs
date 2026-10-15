@@ -108,7 +108,10 @@ pub fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, Str
 }
 
 /// Any planning that derives the scan's result types must use this session too.
-pub fn scan_session_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> SessionContext {
+pub(crate) fn scan_session_context(
+    config: SessionConfig,
+    runtime: Arc<RuntimeEnv>,
+) -> SessionContext {
     let raised = Arc::new(raised_failure::RaisedFailure::default());
     let numeric_typing = Arc::new(exasol_numeric::ExasolNumericTyping::new(raised.clone()));
     let mut rules = Analyzer::new().rules;
@@ -117,7 +120,7 @@ pub fn scan_session_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> 
         .with_config(
             config
                 .set_bool("datafusion.sql_parser.parse_float_as_decimal", true)
-                .with_extension(raised),
+                .with_extension(raised.clone()),
         )
         .with_runtime_env(runtime)
         .with_default_features()
@@ -126,7 +129,7 @@ pub fn scan_session_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> 
     let ctx = SessionContext::new_with_state(state);
     numeric_typing.register_functions(&ctx);
     raw_scan::register_nested_json_render_udf(&ctx);
-    checked_div::register_checked_float_div_udf(&ctx);
+    checked_div::register_checked_float_div_udf(&ctx, raised);
     ctx
 }
 
@@ -234,8 +237,6 @@ async fn run_scan_dispatch(
         };
         emit_footer_refetch_diagnostic(ctx, session_ctx, coverage);
     }
-    // A failure raised inside a pushed filter loses its type at the Parquet row-filter boundary;
-    // every run path funnels through here, and the session holds it.
     result.map_err(|e| emit::reframe_raised_failure(session_ctx, e, &storage.all_secret_values()))
 }
 

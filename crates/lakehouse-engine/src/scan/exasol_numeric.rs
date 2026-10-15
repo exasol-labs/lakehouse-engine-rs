@@ -10,7 +10,7 @@ use super::raised_failure::RaisedFailure;
 use arrow::array::{Array, ArrayRef, AsArray, Decimal128Array, Int64Array};
 use arrow::compute::cast;
 use arrow::compute::kernels::arity::{binary, try_binary, unary};
-use arrow::datatypes::{DataType, Decimal128Type, Int64Type, UInt64Type};
+use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DataType, Decimal128Type, Int64Type, UInt64Type};
 use arrow::error::ArrowError;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -26,11 +26,10 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::AnalyzerRule;
 
-const MAX_PRECISION: u16 = 38;
 const EXASOL_MAX_SCALE: i8 = 36;
 /// `SUM` adds with wrapping, also for `Decimal128`; its `Decimal128(p + 10)` total cannot wrap up
 /// to this argument precision.
-const DECIMAL128_SUM_MAX_PRECISION: u8 = 28;
+const DECIMAL128_SUM_MAX_PRECISION: u8 = DECIMAL128_MAX_PRECISION - 10;
 
 pub(crate) fn numeric_overflow(detail: impl fmt::Display) -> String {
     format!("data exception - numeric value out of range: {detail}")
@@ -81,12 +80,15 @@ impl ExasolNumericTyping {
             )?);
         }
         let preserver = NamePreserver::new(&plan);
-        plan.map_expressions(|expr| {
+        let rewritten = plan.map_expressions(|expr| {
             let name = preserver.save(&expr);
             expr.transform_up(|e| self.rewrite_expr(e, &schema))
                 .map(|t| t.update_data(|e| name.restore(e)))
-        })?
-        .map_data(|plan| plan.recompute_schema())
+        })?;
+        if !rewritten.transformed {
+            return Ok(rewritten);
+        }
+        rewritten.map_data(|plan| plan.recompute_schema())
     }
 
     fn rewrite_expr(&self, expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
@@ -96,16 +98,17 @@ impl ExasolNumericTyping {
                 expr,
                 list,
                 negated,
-            }) => unify_float(std::iter::once(*expr).chain(list).collect(), schema)?.map_data(
-                |mut all| {
-                    let list = all.split_off(1);
+            }) => {
+                unify_float(std::iter::once(*expr).chain(list).collect(), schema)?.map_data(|all| {
+                    let mut all = all.into_iter();
+                    let expr = all.next().expect("the tested operand");
                     Ok(Expr::InList(InList::new(
-                        Box::new(all.remove(0)),
-                        list,
+                        Box::new(expr),
+                        all.collect(),
                         negated,
                     )))
-                },
-            ),
+                })
+            }
             Expr::Between(Between {
                 expr,
                 negated,
@@ -122,10 +125,7 @@ impl ExasolNumericTyping {
             }),
             Expr::Case(case) => rewrite_case(case, schema),
             Expr::ScalarFunction(ScalarFunction { func, args })
-                if matches!(
-                    func.name(),
-                    "greatest" | "least" | "coalesce" | "nullif" | "nvl"
-                ) =>
+                if matches!(func.name(), "greatest" | "least" | "coalesce" | "nullif") =>
             {
                 unify_float(args, schema)?
                     .map_data(|args| Ok(Expr::ScalarFunction(ScalarFunction::new_udf(func, args))))
@@ -167,9 +167,9 @@ impl ExasolNumericTyping {
                 | Operator::IsDistinctFrom
                 | Operator::IsNotDistinctFrom
         ) {
-            return unify_float(vec![*left, *right], schema)?.map_data(|mut both| {
-                let right = both.pop().expect("two operands");
-                Ok(rebuild(Box::new(both.remove(0)), Box::new(right)))
+            return unify_float(vec![*left, *right], schema)?.map_data(|both| {
+                let [left, right] = <[Expr; 2]>::try_from(both).expect("two operands");
+                Ok(rebuild(Box::new(left), Box::new(right)))
             });
         }
         let udf = match op {
@@ -240,15 +240,13 @@ fn unify_float(exprs: Vec<Expr>, schema: &DFSchema) -> Result<Transformed<Vec<Ex
         .iter()
         .map(|e| e.get_type(schema))
         .collect::<Result<Vec<_>>>()?;
-    let is_decimal =
-        |t: &DataType| matches!(t, DataType::Decimal128(..) | DataType::Decimal256(..));
-    if !(types.iter().any(DataType::is_floating) && types.iter().any(is_decimal)) {
+    if !(types.iter().any(DataType::is_floating) && types.iter().any(DataType::is_decimal)) {
         return Ok(Transformed::no(exprs));
     }
     let unified = exprs
         .into_iter()
         .zip(&types)
-        .map(|(e, t)| match is_decimal(t) {
+        .map(|(e, t)| match t.is_decimal() {
             true => e.cast_to(&DataType::Float64, schema),
             false => Ok(e),
         })
@@ -269,7 +267,8 @@ fn tighten_literal(expr: Expr) -> Expr {
     if !value.data_type().is_integer() {
         return expr;
     }
-    let Ok(ScalarValue::Decimal128(Some(v), ..)) = value.cast_to(&DataType::Decimal128(38, 0))
+    let Ok(ScalarValue::Decimal128(Some(v), ..)) =
+        value.cast_to(&DataType::Decimal128(DECIMAL128_MAX_PRECISION, 0))
     else {
         return expr;
     };
@@ -289,10 +288,12 @@ fn integer_precision(t: &DataType) -> Option<u8> {
 }
 
 fn exact_ps(t: &DataType) -> Result<(u8, i8)> {
-    match (t, integer_precision(t)) {
-        (DataType::Decimal128(p, s), _) => Ok((*p, *s)),
-        (_, Some(p)) => Ok((p, 0)),
-        _ => plan_err!("exact arithmetic over {t}"),
+    match t {
+        DataType::Decimal128(p, s) => Ok((*p, *s)),
+        _ => match integer_precision(t) {
+            Some(p) => Ok((p, 0)),
+            None => plan_err!("exact arithmetic over {t}"),
+        },
     }
 }
 
@@ -386,28 +387,27 @@ impl ExactArithmeticUdf {
         };
         let op = self.op;
         let rows = args.number_rows;
-        if op.result_type(a, b).0 <= MAX_PRECISION {
+        let (left, right) = (Operand::of(left, rows)?, Operand::of(right, rows)?);
+        if op.result_type(a, b).0 <= u16::from(DECIMAL128_MAX_PRECISION) {
             let f = move |x: i128, y: i128| op.apply_wrapping(x, y, fa, fb);
-            return Ok(
-                match (
-                    int64_array(left)?,
-                    scalar_i128(left),
-                    int64_array(right)?,
-                    scalar_i128(right),
-                ) {
-                    (Some(x), _, Some(y), _) => binary(&x, &y, |x, y| f(x.into(), y.into()))?,
-                    (Some(x), _, _, Some(c)) => unary(&x, |x| f(x.into(), c)),
-                    (_, Some(c), Some(y), _) => unary(&y, |y| f(c, y.into())),
-                    _ => binary(&as_i128(left, rows)?, &as_i128(right, rows)?, f)?,
-                },
-            );
+            return Ok(match (left, right) {
+                (Operand::Int64(x), Operand::Int64(y)) => {
+                    binary(&x, &y, |x, y| f(x.into(), y.into()))?
+                }
+                (Operand::Int64(x), Operand::Scalar(c)) => unary(&x, |x| f(x.into(), c)),
+                (Operand::Scalar(c), Operand::Int64(y)) => unary(&y, |y| f(c, y.into())),
+                (Operand::Wide(x), Operand::Scalar(c)) => unary(&x, |x| f(x, c)),
+                (Operand::Scalar(c), Operand::Wide(y)) => unary(&y, |y| f(c, y)),
+                (left, right) => binary(&left.into_wide(rows), &right.into_wide(rows), f)?,
+            });
         }
-        try_binary(&as_i128(left, rows)?, &as_i128(right, rows)?, |x, y| {
-            op.apply_checked(x, y, fa, fb)
-                .ok_or(ArrowError::ArithmeticOverflow(format!(
+        try_binary(&left.into_wide(rows), &right.into_wide(rows), |x, y| {
+            op.apply_checked(x, y, fa, fb).ok_or_else(|| {
+                ArrowError::ArithmeticOverflow(format!(
                     "{} exceeds the 128-bit internal number representation",
                     op.name()
-                )))
+                ))
+            })
         })
         .map_err(|e| match e {
             ArrowError::ArithmeticOverflow(detail) => {
@@ -439,7 +439,10 @@ impl ScalarUDFImpl for ExactArithmeticUdf {
         if s > EXASOL_MAX_SCALE {
             return plan_err!("data exception - An exact numeric operation needs a too big scale");
         }
-        Ok(DataType::Decimal128(p.min(MAX_PRECISION) as u8, s))
+        Ok(DataType::Decimal128(
+            p.min(DECIMAL128_MAX_PRECISION.into()) as u8,
+            s,
+        ))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -456,29 +459,33 @@ impl ScalarUDFImpl for ExactArithmeticUdf {
     }
 }
 
-fn int64_array(value: &ColumnarValue) -> Result<Option<Int64Array>> {
-    Ok(match value {
-        ColumnarValue::Array(a)
-            if matches!(
-                a.data_type(),
-                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-            ) =>
-        {
-            Some(
+/// Each side is classified once, so signed integers skip the `i128` copy wherever they can.
+enum Operand {
+    Scalar(i128),
+    Int64(Int64Array),
+    Wide(Decimal128Array),
+}
+
+impl Operand {
+    fn of(value: &ColumnarValue, rows: usize) -> Result<Self> {
+        Ok(match value {
+            ColumnarValue::Scalar(ScalarValue::Decimal128(Some(v), ..)) => Self::Scalar(*v),
+            ColumnarValue::Scalar(ScalarValue::Int64(Some(v))) => Self::Scalar((*v).into()),
+            ColumnarValue::Array(a) if a.data_type().is_signed_integer() => Self::Int64(
                 cast(a, &DataType::Int64)?
                     .as_primitive::<Int64Type>()
                     .clone(),
-            )
-        }
-        _ => None,
-    })
-}
+            ),
+            _ => Self::Wide(as_i128(value, rows)?),
+        })
+    }
 
-fn scalar_i128(value: &ColumnarValue) -> Option<i128> {
-    match value {
-        ColumnarValue::Scalar(ScalarValue::Decimal128(Some(v), ..)) => Some(*v),
-        ColumnarValue::Scalar(ScalarValue::Int64(Some(v))) => Some((*v).into()),
-        _ => None,
+    fn into_wide(self, rows: usize) -> Decimal128Array {
+        match self {
+            Self::Scalar(v) => Decimal128Array::from_value(v, rows),
+            Self::Int64(a) => unary(&a, i128::from),
+            Self::Wide(a) => a,
+        }
     }
 }
 
