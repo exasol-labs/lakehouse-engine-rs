@@ -110,7 +110,7 @@ The wrong row count of issue #370 is removed in both directions. The over-raise 
 
 **ID:** checked-float-division-session-scoped-failure-recording
 **Plan:** fix-float-div-predicate-divzero
-**Status:** Accepted
+**Status:** Superseded by scan-functions-share-a-session-failure-slot
 
 ### Context
 

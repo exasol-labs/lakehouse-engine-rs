@@ -2572,7 +2572,7 @@ fn renders_sign_as_native_sign_in_exasol_dialect() {
     );
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"signum((SUM("L_DISCOUNT") - 0.5))"#
+        r#"signum((SUM("L_DISCOUNT") - CAST('0.5' AS DOUBLE)))"#
     );
 }
 
@@ -3297,7 +3297,7 @@ fn float_div_renders_checked_division_call_only_in_the_datafusion_dialect() {
 
 #[test]
 fn non_timestamp_literals_render_identically_in_both_dialects() {
-    let cases: [(Json, &str); 7] = [
+    let cases: [(Json, &str); 6] = [
         (json!({"type": "literal_null"}), "NULL"),
         (json!({"type": "literal_bool", "value": true}), "TRUE"),
         (json!({"type": "literal_bool", "value": false}), "FALSE"),
@@ -3306,7 +3306,6 @@ fn non_timestamp_literals_render_identically_in_both_dialects() {
             "'it''s'",
         ),
         (json!({"type": "literal_exactnumeric", "value": 42}), "42"),
-        (json!({"type": "literal_double", "value": 0.5}), "0.5"),
         (
             json!({"type": "literal_date", "value": "2024-01-15"}),
             "DATE '2024-01-15'",
@@ -3324,6 +3323,24 @@ fn non_timestamp_literals_render_identically_in_both_dialects() {
             expected,
             "{node_type} Exasol dialect"
         );
+    }
+}
+
+/// Scenario: Literal nodes translate to SQL literal forms
+#[test]
+fn literal_double_renders_as_a_double_cast_only_in_the_datafusion_dialect() {
+    for (value, datafusion, exasol) in [
+        (
+            json!("1.0000000000000001e+299"),
+            "CAST('1.0000000000000001e+299' AS DOUBLE)",
+            "1.0000000000000001e+299",
+        ),
+        (json!(0.5), "CAST('0.5' AS DOUBLE)", "0.5"),
+        (Json::Null, "NULL", "NULL"),
+    ] {
+        let node = json!({"type": "literal_double", "value": value});
+        assert_eq!(render_expression(&node).unwrap(), datafusion);
+        assert_eq!(render_expression_exasol(&node).unwrap(), exasol);
     }
 }
 
