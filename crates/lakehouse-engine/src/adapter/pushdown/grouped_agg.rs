@@ -8,7 +8,7 @@ use vs_expression::render_expression;
 
 use super::scalar_over_agg::{
     cast_merge_items, classify_scalar_over_aggregate, fold_aggregate_plan, merge_select_items,
-    parse_agg_item, render_scalar_over_merge,
+    parse_agg_item, render_scalar_over_merge, with_stat_grand_means,
 };
 use super::support::{
     build_fan_out_inner, cast_to_declared_type, declared_select_type, render_limit_offset,
@@ -398,8 +398,9 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
         distribute_udf_name,
     );
 
-    let mut sql =
-        format!("SELECT {outer_select_str} FROM ({fan_out}) GROUP BY {outer_group_by_str}");
+    let from = with_stat_grand_means(&fan_out, aggregates, &outer_group_by);
+
+    let mut sql = format!("SELECT {outer_select_str} FROM ({from}) GROUP BY {outer_group_by_str}");
 
     // HAVING only in the outer wrapper: per shard it would discard groups that clear
     // the threshold only after merging.
@@ -438,8 +439,8 @@ pub(super) fn partial_emits_items(
                     | PartialAggColumn::AvgCnt
                     | PartialAggColumn::StatCnt => "DECIMAL(20,0)".to_string(),
                     PartialAggColumn::AvgSum
-                    | PartialAggColumn::StatSum
-                    | PartialAggColumn::StatSumSq => "DOUBLE PRECISION".to_string(),
+                    | PartialAggColumn::StatMean
+                    | PartialAggColumn::StatM2 => "DOUBLE PRECISION".to_string(),
                     PartialAggColumn::Sum => sum_emit_type(&col_type_for(
                         plan.column.as_deref(),
                         plan.arg_expr.as_deref(),
@@ -503,15 +504,7 @@ pub fn validate_agg_col_types(
     col_types: &[(String, String)],
 ) -> bool {
     for plan in aggregates {
-        let needs_numeric = matches!(
-            plan.kind,
-            AggKind::Sum
-                | AggKind::VarPop
-                | AggKind::VarSamp
-                | AggKind::StddevPop
-                | AggKind::StddevSamp
-        );
-        if needs_numeric {
+        if plan.kind == AggKind::Sum || plan.kind.is_stat() {
             let ty = col_type_for(
                 plan.column.as_deref(),
                 plan.arg_expr.as_deref(),

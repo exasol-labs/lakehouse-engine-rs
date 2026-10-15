@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// AVG decomposes into (sum, count) and the STDDEV/VARIANCE family into (cnt, sum, sum_sq); the
+/// AVG decomposes into (sum, count) and the STDDEV/VARIANCE family into (cnt, mean, m2); the
 /// wrapper finishes them. Single-group `COUNT(DISTINCT col)` is not an aggregate partial but a
 /// DISTINCT row-scan fan-out (`CommonScanSpec::distinct`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,13 +19,14 @@ pub enum AggKind {
     Min,
     Max,
     Avg,
-    /// VAR_POP / VARIANCE_POP.
     VarPop,
-    /// VAR_SAMP / VARIANCE / VARIANCE_SAMP.
     VarSamp,
+    /// Exasol's VARIANCE: 0 for one non-NULL value, where VAR_SAMP is NULL.
+    Variance,
     StddevPop,
-    /// STDDEV / STDDEV_SAMP.
     StddevSamp,
+    /// Exasol's STDDEV: 0 for one non-NULL value, where STDDEV_SAMP is NULL.
+    Stddev,
 }
 
 /// One partial-aggregate column. The scan renders its DataFusion expression and the adapter its
@@ -41,9 +42,9 @@ pub enum PartialAggColumn {
     AvgSum,
     AvgCnt,
     StatCnt,
-    StatSum,
-    /// `SUM(<arg> * <arg>)`.
-    StatSumSq,
+    StatMean,
+    /// Sum of squared deviations from the shard mean.
+    StatM2,
 }
 
 impl PartialAggColumn {
@@ -52,7 +53,7 @@ impl PartialAggColumn {
     pub fn is_counter(&self) -> bool {
         match self {
             Self::CountStar | Self::CountArg | Self::AvgCnt | Self::StatCnt => true,
-            Self::Sum | Self::Min | Self::Max | Self::AvgSum | Self::StatSum | Self::StatSumSq => {
+            Self::Sum | Self::Min | Self::Max | Self::AvgSum | Self::StatMean | Self::StatM2 => {
                 false
             }
         }
@@ -71,13 +72,25 @@ pub fn partial_column_name(col: PartialAggColumn, ordinal: usize) -> String {
         PartialAggColumn::AvgSum => "avg_sum",
         PartialAggColumn::AvgCnt => "avg_cnt",
         PartialAggColumn::StatCnt => "stat_cnt",
-        PartialAggColumn::StatSum => "stat_sum",
-        PartialAggColumn::StatSumSq => "stat_sumsq",
+        PartialAggColumn::StatMean => "stat_mean",
+        PartialAggColumn::StatM2 => "stat_m2",
     };
     format!("PARTIAL_{role}_{ordinal}")
 }
 
 impl AggKind {
+    pub fn is_stat(&self) -> bool {
+        matches!(
+            self,
+            AggKind::VarPop
+                | AggKind::VarSamp
+                | AggKind::Variance
+                | AggKind::StddevPop
+                | AggKind::StddevSamp
+                | AggKind::Stddev
+        )
+    }
+
     /// The single owner of the COLUMN CONTRACT's arity and order. Emit paths address columns
     /// positionally, so any site disagreeing would shift every later aggregate's value.
     pub fn partial_columns(&self) -> &'static [PartialAggColumn] {
@@ -88,10 +101,15 @@ impl AggKind {
             AggKind::Min => &[PartialAggColumn::Min],
             AggKind::Max => &[PartialAggColumn::Max],
             AggKind::Avg => &[PartialAggColumn::AvgSum, PartialAggColumn::AvgCnt],
-            AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp => &[
+            AggKind::VarPop
+            | AggKind::VarSamp
+            | AggKind::Variance
+            | AggKind::StddevPop
+            | AggKind::StddevSamp
+            | AggKind::Stddev => &[
                 PartialAggColumn::StatCnt,
-                PartialAggColumn::StatSum,
-                PartialAggColumn::StatSumSq,
+                PartialAggColumn::StatMean,
+                PartialAggColumn::StatM2,
             ],
         }
     }

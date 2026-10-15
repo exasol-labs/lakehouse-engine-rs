@@ -266,7 +266,10 @@ fn single_group_numeric_aggregate_classifies_as_single_group() {
     });
     let shape = classify_request_shape(&req, &col_types());
     match shape {
-        RequestShape::SingleGroupAgg { items } => assert_eq!(items.len(), 1),
+        RequestShape::SingleGroupAgg {
+            items,
+            having: None,
+        } => assert_eq!(items.len(), 1),
         other => panic!("expected SingleGroupAgg, got {other:?}"),
     }
 }
@@ -298,14 +301,71 @@ fn plain_projection_classifies_as_row_scan() {
     );
 }
 
+fn single_group(select_list: Json, having: Option<Json>) -> Json {
+    serde_json::json!({
+        "aggregationType": "single_group",
+        "selectList": select_list,
+        "having": having,
+    })
+}
+
+fn count_greater_than(n: i64) -> Json {
+    serde_json::json!({
+        "type": "predicate_greater",
+        "left": agg_item("COUNT", None, false),
+        "right": {"type": "literal_exactnumeric", "value": n},
+    })
+}
+
 #[test]
-fn non_numeric_single_group_aggregate_demotes_to_row_scan() {
-    let req = serde_json::json!({
-        "selectList": [agg_item("SUM", Some("NAME"), false)],
-    });
-    let shape = classify_request_shape(&req, &col_types());
-    assert!(
-        matches!(shape, RequestShape::RowScan),
-        "a non-numeric single-group aggregate demotes to a row scan: {shape:?}"
+fn single_group_having_over_a_split_aggregate_renders_over_the_merge() {
+    let req = single_group(
+        serde_json::json!([agg_item("COUNT", None, false)]),
+        Some(count_greater_than(100)),
     );
+    match classify_request_shape(&req, &col_types()) {
+        RequestShape::SingleGroupAgg {
+            having: Some(having),
+            ..
+        } => assert!(having.contains("> 100"), "{having}"),
+        other => panic!("expected SingleGroupAgg with HAVING, got {other:?}"),
+    }
+}
+
+#[test]
+fn single_group_that_does_not_split_never_classifies_as_row_scan() {
+    let literal = serde_json::json!({"type": "literal_string", "value": "X"});
+    for req in [
+        single_group(
+            serde_json::json!([agg_item("SUM", Some("NAME"), false)]),
+            None,
+        ),
+        single_group(
+            serde_json::json!([literal.clone(), agg_item("COUNT", None, false)]),
+            None,
+        ),
+        single_group(serde_json::json!([literal]), Some(count_greater_than(0))),
+        single_group(
+            serde_json::json!([agg_item("COUNT", None, false)]),
+            Some(serde_json::json!({
+                "type": "predicate_greater",
+                "left": agg_item("MAX", Some("AMOUNT"), false),
+                "right": {"type": "literal_exactnumeric", "value": 0},
+            })),
+        ),
+        single_group(
+            serde_json::json!([agg_item("COUNT", Some("ID"), true)]),
+            Some(serde_json::json!({
+                "type": "predicate_equal",
+                "left": {"type": "literal_exactnumeric", "value": 1},
+                "right": {"type": "literal_exactnumeric", "value": 1},
+            })),
+        ),
+    ] {
+        let shape = classify_request_shape(&req, &col_types());
+        assert!(
+            matches!(shape, RequestShape::SingleGroupWrapper),
+            "{req}: {shape:?}"
+        );
+    }
 }

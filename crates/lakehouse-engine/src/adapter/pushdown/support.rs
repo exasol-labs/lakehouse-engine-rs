@@ -1,4 +1,5 @@
 use super::grouped_agg::{col_type_for, is_literal_selectlist_item, partial_emits_items};
+use super::scalar_over_agg::with_stat_grand_means;
 use super::single_group_agg::{DistinctCount, SingleGroupItem};
 use crate::adapter::column_notes::TableNotes;
 use crate::adapter::connection::ConnectionCreds;
@@ -39,6 +40,7 @@ pub(super) fn shard_files_json<E: Clone + Into<FileEntry>>(files: &[E]) -> Strin
 pub struct AggregateMergeInputs {
     plan_types: Vec<String>,
     merge_select: Vec<String>,
+    having: Option<String>,
     request_limit: Option<u64>,
 }
 
@@ -56,8 +58,13 @@ impl AggregateMergeInputs {
         Some(Self {
             plan_types,
             merge_select,
+            having: None,
             request_limit,
         })
+    }
+
+    pub fn with_having(self, having: Option<String>) -> Self {
+        Self { having, ..self }
     }
 }
 
@@ -166,8 +173,12 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     let merge_select = inputs.merge_select.join(", ");
 
     let fan_out = build_fan_out_inner(spec_template, shards, &emits, udf_name, distribute_udf_name);
+    let from = with_stat_grand_means(&fan_out, aggregates, &[]);
 
-    let mut sql = format!("SELECT {merge_select} FROM ({fan_out})");
+    let mut sql = format!("SELECT {merge_select} FROM ({from})");
+    if let Some(having) = &inputs.having {
+        sql.push_str(&format!(" HAVING {having}"));
+    }
     if let Some(n) = inputs.request_limit {
         sql.push_str(&format!(" LIMIT {n}"));
     }

@@ -23,9 +23,13 @@ select item that is a scalar function wrapping aggregates.
 * **Detection is no longer "every item is literally `function_aggregate`".** A select-list
   item may also be a decomposable scalar-over-aggregate, classified by the shared mechanism
   the grouped planner already uses. The gate on `groupBy` being absent or empty is
-  unchanged, no `aggregationType` check is added, and a select-list item carrying no nested
-  aggregate still declines the aggregate tiers and reaches the row-scan projection exactly
-  as before.
+  unchanged.
+* **A request Exasol marks `aggregationType: single_group` never reaches the row-scan
+  projection.** Exasol sets that mark for every aggregate without GROUP BY, including an
+  aggregate referenced only in HAVING. A row scan would return the raw rows instead of the one
+  aggregated row.
+* Exasol does not re-apply a HAVING the adapter receives, because the adapter advertises
+  `AGGREGATE_HAVING`.
 * **The per-plan and per-select-item declared-type lists split.** Once a
   scalar-over-aggregate item is present, the aggregate plan list and the `selectList` stop
   being 1:1, so `aggregate_exasol_types` — which filters `selectList` down to
@@ -116,3 +120,20 @@ select item that is a scalar function wrapping aggregates.
 * *AND* the merge SELECT builder SHALL therefore take NO offset parameter and render NO `OFFSET`, keeping its existing `LIMIT n` rendering byte-identical to the pre-change output — including the `LIMIT 0` → zero-rows behaviour (issue #198)
 * *AND* the adapter MUST NOT add collapse arithmetic, offset rendering, or a `User` decline at this site, because no production request can execute that code and an untested branch here would be a live failure mode on an unreachable path
 * *AND* the per-shard scan spec SHALL carry NEITHER the row limit NOR any offset, so no shard's aggregate input is truncated
+
+### Scenario: A single-group request that does not decompose routes to the qualified wrapper
+
+* *GIVEN* a `pushdown` request marked `aggregationType: single_group` whose select list does not decompose, for example a constant beside an aggregate (`SELECT 'X', COUNT(*)`), `SUM` or `VARIANCE` over a text column, `STDDEV` or `VARIANCE` over an expression, or no aggregate outside HAVING (`SELECT 1 ... HAVING COUNT(*) > 0`)
+* *WHEN* the adapter plans the request over a non-empty file list
+* *THEN* the adapter SHALL route it to the qualified single-table wrapper, whose own rendered SQL computes the select list and HAVING over the materialized sharded raw scan
+* *AND* the adapter MUST NOT return a bare row scan
+* *AND* the result SHALL equal native Exasol: one row, or no row when HAVING is false
+
+### Scenario: Single-group HAVING is applied on every path
+
+* *GIVEN* an ungrouped aggregate query with a HAVING, for example `SELECT COUNT(*) FROM t HAVING COUNT(*) > 100`
+* *WHEN* Exasol sends the `pushdown` request
+* *THEN* the adapter SHALL render the HAVING after the outer merge when every aggregate the HAVING references is merged from a select-list aggregate
+* *AND* the adapter SHALL otherwise route the request to the qualified single-table wrapper, which renders the HAVING itself
+* *AND* a request carrying a `COUNT(DISTINCT ...)` and a HAVING SHALL route to the qualified single-table wrapper
+* *AND* the result SHALL equal native Exasol: no row when the HAVING is false over the merged values

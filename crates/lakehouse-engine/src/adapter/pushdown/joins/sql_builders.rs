@@ -891,6 +891,51 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
     Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
 }
 
+pub(in super::super) struct EmptyRelation {
+    legs: JoinLegs,
+    cols_per_leg: Vec<Vec<(String, String)>>,
+}
+
+impl EmptyRelation {
+    pub(in super::super) fn single_scan(request: &Json, col_types: &[(String, String)]) -> Self {
+        Self {
+            legs: JoinLegs::for_single_scan(request),
+            cols_per_leg: vec![col_types.to_vec()],
+        }
+    }
+
+    pub(super) fn join(join: &DetectedJoin, cols_per_leg: Vec<Vec<(String, String)>>) -> Self {
+        Self {
+            legs: join.legs(),
+            cols_per_leg,
+        }
+    }
+
+    pub(in super::super) fn pushdown(&self, pushdown_req: &Json) -> Result<Json, UdfError> {
+        let OuterWrapperClauses { select, trailing } =
+            outer_wrapper_clauses(pushdown_req, &self.legs, &self.cols_per_leg)?;
+        let from = self
+            .cols_per_leg
+            .iter()
+            .enumerate()
+            .map(|(leg, cols)| {
+                let nulls = cols
+                    .iter()
+                    .map(|(name, ty)| format!("CAST(NULL AS {ty}) AS {}", quote_ident(name)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "(SELECT {nulls} FROM DUAL WHERE 1=0) AS {}",
+                    quote_ident(&self.legs.leg_alias(leg))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {select} FROM {from}{trailing}");
+        Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
+    }
+}
+
 #[cfg(test)]
 #[path = "sql_builders_tests.rs"]
 mod tests;

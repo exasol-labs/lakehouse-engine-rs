@@ -15,7 +15,8 @@ use common::e2e_harness::{
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
-    Format, VS_DELTA, assert_cases_hold, assert_one_shaped_file_per_label, read_footer,
+    Format, VS_DELTA, assert_cases_hold, assert_one_shaped_file_per_label,
+    assert_single_group_aggregates_match_oracle, read_footer,
 };
 use common::pruning_fixture::{
     PRUNING_FILES, PRUNING_PARTITION_COLUMN, PRUNING_TABLE, labels_named, oracle_statements,
@@ -2632,4 +2633,14 @@ fn footer_k_statistics(footer: &ParquetMetaData, cannot: &str) -> (Option<i64>, 
 fn delta_pruning_keeps_every_file_with_a_matching_row() {
     setup();
     assert_cases_hold(&mut exa_conn(), Format::Delta);
+}
+
+/// Scenario: Aggregate without GROUP BY with all files pruned returns the native empty-set result
+/// Scenario: A single-group request that does not decompose routes to the qualified wrapper
+/// Scenario: Single-group HAVING is applied on every path
+/// Scenario: A fully-pruned file list yields one shape-correct empty row for a scalar-over-aggregate select list
+#[test]
+fn delta_single_group_aggregates_match_the_oracle() {
+    setup();
+    assert_single_group_aggregates_match_oracle(&mut exa_conn(), Format::Delta);
 }

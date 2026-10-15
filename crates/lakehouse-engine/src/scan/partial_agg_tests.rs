@@ -395,12 +395,14 @@ fn grouped_partial_agg_sql_expression_key_verbatim() {
 }
 
 #[test]
-fn partial_agg_sql_stat_emits_cnt_sum_sumsq() {
+fn partial_agg_sql_stat_emits_cnt_mean_m2() {
     for kind in &[
         AggKind::VarPop,
         AggKind::VarSamp,
+        AggKind::Variance,
         AggKind::StddevPop,
         AggKind::StddevSamp,
+        AggKind::Stddev,
     ] {
         let plans = vec![AggregatePlan {
             kind: kind.clone(),
@@ -413,20 +415,20 @@ fn partial_agg_sql_stat_emits_cnt_sum_sumsq() {
             "{kind:?} must emit COUNT(col) as PARTIAL_stat_cnt_0: {sql}"
         );
         assert!(
-            sql.contains(r#"SUM("SCORE") AS "PARTIAL_stat_sum_0""#),
-            "{kind:?} must emit SUM(col) as PARTIAL_stat_sum_0: {sql}"
+            sql.contains(
+                r#"CASE WHEN MIN("SCORE") = MAX("SCORE") THEN CAST(MIN("SCORE") AS DOUBLE) ELSE AVG(CAST("SCORE" AS DOUBLE)) END AS "PARTIAL_stat_mean_0""#
+            ),
+            "{kind:?} must emit the guarded mean as PARTIAL_stat_mean_0: {sql}"
         );
         assert!(
-            sql.contains(r#"SUM("SCORE" * "SCORE") AS "PARTIAL_stat_sumsq_0""#),
-            "{kind:?} must emit SUM(col*col) as PARTIAL_stat_sumsq_0: {sql}"
+            sql.contains(
+                r#"CASE WHEN MIN("SCORE") = MAX("SCORE") THEN 0.0 ELSE VAR_POP(CAST("SCORE" AS DOUBLE)) * COUNT("SCORE") END AS "PARTIAL_stat_m2_0""#
+            ),
+            "{kind:?} must emit the guarded M2 as PARTIAL_stat_m2_0: {sql}"
         );
         assert!(
-            !sql.contains("STDDEV"),
-            "{kind:?} must not emit STDDEV: {sql}"
-        );
-        assert!(
-            !sql.contains("VARIANCE"),
-            "{kind:?} must not emit VARIANCE: {sql}"
+            !sql.contains(r#""SCORE" * "SCORE""#),
+            "{kind:?} must not square the raw value: {sql}"
         );
     }
 }
@@ -437,8 +439,10 @@ fn stat_aggregate_null_fallback_row_has_three_values() {
     for kind in &[
         AggKind::VarPop,
         AggKind::VarSamp,
+        AggKind::Variance,
         AggKind::StddevPop,
         AggKind::StddevSamp,
+        AggKind::Stddev,
     ] {
         let plans = vec![AggregatePlan {
             kind: kind.clone(),
@@ -568,12 +572,12 @@ fn stat_aggregate_index_follows_plan_order() {
         "stat at index 1 must use suffix _1: {sql}"
     );
     assert!(
-        sql.contains("PARTIAL_stat_sum_1"),
-        "stat sum at index 1: {sql}"
+        sql.contains("PARTIAL_stat_mean_1"),
+        "stat mean at index 1: {sql}"
     );
     assert!(
-        sql.contains("PARTIAL_stat_sumsq_1"),
-        "stat sumsq at index 1: {sql}"
+        sql.contains("PARTIAL_stat_m2_1"),
+        "stat m2 at index 1: {sql}"
     );
 }
 

@@ -9,7 +9,7 @@
 use serde_json::Value as Json;
 
 use super::grouped_agg::{GroupedOrderBy, build_grouped_order_by_clause, render_having_over_merge};
-use super::single_group_agg::SingleGroupItem;
+use super::single_group_agg::{SingleGroupItem, has_distinct};
 use super::{
     GroupedAggregateDetection, detect_aggregates, detect_group_by_aggregates, ordinary_plans,
     validate_agg_col_types,
@@ -31,7 +31,9 @@ pub(super) enum RequestShape {
     /// Ordinary aggregate column types passed [`validate_agg_col_types`].
     SingleGroupAgg {
         items: Vec<SingleGroupItem>,
+        having: Option<String>,
     },
+    SingleGroupWrapper,
     RowScan,
 }
 
@@ -75,11 +77,30 @@ pub(super) fn classify_request_shape(
     }
 
     // Validated against ordinary plans only: a distinct item is a row-scan fan-out.
-    match detect_aggregates(pushdown_req)
+    let Some(items) = detect_aggregates(pushdown_req)
         .filter(|it| validate_agg_col_types(&ordinary_plans(it), col_types))
-    {
-        Some(items) => RequestShape::SingleGroupAgg { items },
-        None => RequestShape::RowScan,
+    else {
+        return if pushdown_req.get("aggregationType").and_then(|v| v.as_str())
+            == Some("single_group")
+        {
+            RequestShape::SingleGroupWrapper
+        } else {
+            RequestShape::RowScan
+        };
+    };
+    match pushdown_req.get("having").filter(|h| !h.is_null()) {
+        None => RequestShape::SingleGroupAgg {
+            items,
+            having: None,
+        },
+        Some(_) if has_distinct(&items) => RequestShape::SingleGroupWrapper,
+        Some(node) => match render_having_over_merge(node, &ordinary_plans(&items)) {
+            Some(sql) => RequestShape::SingleGroupAgg {
+                items,
+                having: Some(sql),
+            },
+            None => RequestShape::SingleGroupWrapper,
+        },
     }
 }
 

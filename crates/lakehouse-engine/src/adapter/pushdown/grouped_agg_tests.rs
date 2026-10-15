@@ -2392,8 +2392,10 @@ fn stat_aggregate_emits_three_partial_columns() {
     for kind in &[
         AggKind::VarPop,
         AggKind::VarSamp,
+        AggKind::Variance,
         AggKind::StddevPop,
         AggKind::StddevSamp,
+        AggKind::Stddev,
     ] {
         let plans = vec![AggregatePlan {
             kind: kind.clone(),
@@ -2412,12 +2414,12 @@ fn stat_aggregate_emits_three_partial_columns() {
             "first column must be cnt: {items:?}"
         );
         assert!(
-            items[1].contains("PARTIAL_stat_sum_0"),
-            "second column must be sum: {items:?}"
+            items[1].contains("PARTIAL_stat_mean_0"),
+            "second column must be mean: {items:?}"
         );
         assert!(
-            items[2].contains("PARTIAL_stat_sumsq_0"),
-            "third column must be sumsq: {items:?}"
+            items[2].contains("PARTIAL_stat_m2_0"),
+            "third column must be m2: {items:?}"
         );
     }
 }
@@ -2553,41 +2555,23 @@ fn stddev_samp_merge_formula_uses_sqrt_and_n_minus_1() {
 }
 
 #[test]
-fn stddev_pop_merge_null_passthrough_for_n_zero() {
-    let plans = vec![AggregatePlan {
-        kind: AggKind::StddevPop,
-        column: Some("X".into()),
-        arg_expr: None,
-    }];
-    let sql = merge_select_items(&plans).join(", ");
-    assert!(
-        sql.contains("IS NULL"),
-        "stddev_pop must pass NULL through for N=0 via IS NULL guard: {sql}"
-    );
-    // Guards against tiny-negative float rounding.
-    assert!(
-        sql.contains("GREATEST"),
-        "stddev_pop must keep GREATEST rounding guard: {sql}"
-    );
-}
-
-#[test]
-fn stddev_samp_merge_null_passthrough_for_n_zero_and_n_one() {
-    let plans = vec![AggregatePlan {
-        kind: AggKind::StddevSamp,
-        column: Some("X".into()),
-        arg_expr: None,
-    }];
-    let sql = merge_select_items(&plans).join(", ");
-    assert!(
-        sql.contains("IS NULL"),
-        "stddev_samp must pass NULL through for N<=1 via IS NULL guard: {sql}"
-    );
-    // Guards against tiny-negative float rounding.
-    assert!(
-        sql.contains("GREATEST"),
-        "stddev_samp must keep GREATEST rounding guard: {sql}"
-    );
+fn variance_and_stddev_merge_return_zero_for_one_value() {
+    for kind in [AggKind::Variance, AggKind::Stddev] {
+        let plans = vec![AggregatePlan {
+            kind: kind.clone(),
+            column: Some("X".into()),
+            arg_expr: None,
+        }];
+        let sql = merge_select_items(&plans).join(", ");
+        assert!(
+            sql.contains(r#"CASE WHEN SUM("PARTIAL_stat_cnt_0") = 1 THEN 0 ELSE"#),
+            "{kind:?} must return 0 for one non-NULL value: {sql}"
+        );
+        assert!(
+            sql.contains(r#""STAT_GMEAN_0""#),
+            "{kind:?} must merge around the grand mean: {sql}"
+        );
+    }
 }
 
 #[test]
