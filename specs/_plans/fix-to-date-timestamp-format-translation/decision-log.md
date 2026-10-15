@@ -10,9 +10,9 @@
 
 ### [1] Translate a closed set of format elements and decline the rest
 
-- **Decision:** `FN_TO_DATE` and `FN_TO_TIMESTAMP` stay advertised. The DataFusion dialect translates a string-literal format built from the core elements and declines every other format, and the caller self-applies the declined call in Exasol. Input strings on which the two parsers differ are listed in `docs/semantic-differences.md`, not declined.
+- **Decision:** `FN_TO_DATE` and `FN_TO_TIMESTAMP` stay advertised. The DataFusion dialect translates a string-literal format built from the core elements and declines every other format, and the caller self-applies the declined call in Exasol. Input strings on which the two parsers differ are listed in `docs/semantic-differences.md`, not declined. The two-argument form renders `nullif(<src>, '')` so an empty string yields NULL as in Exasol.
 - **Rationale:** A render decline of an advertised call already reaches native Exasol: measured on the deployed 0.52.2 build with a DataFusion-declined `SECOND(ts, 2)` over 16 query shapes (select list, filter, LIMIT, single-group and grouped aggregates, aggregate argument, HAVING, top-N, `COUNT(DISTINCT)`, join filter, join select list, join `ON`, join aggregate, `OR` filter), with join pushdown on and off, every result matched the native table. The listed differences depend on the data, not on the format, so no plan-time check can decline them. Each one either fails the query or accepts a string Exasol rejects. None returns a different value for a string both engines accept.
-- **Alternatives:** Withdraw both capabilities, as ADR `exclude-fn-to-char-and-fn-to-number-format-model-incompatibility` does for `TO_CHAR` and `TO_NUMBER`. Rejected: that ADR's reason, that partial support cannot be expressed, no longer holds once a declined call is self-applied (ADR `no-exasol-side-fallback-for-an-advertised-capability`), and withdrawal would also stop pushing the one-argument forms. Decline every format with a space. Rejected: the reported `TO_TIMESTAMP` format has a space. Rewrite the source with `rtrim` or `nullif` to close the trailing-space and empty-string differences. Rejected for this fix: it changes the one-argument renderings, and the interview limited the first cut to the core elements.
+- **Alternatives:** Withdraw both capabilities, as ADR `exclude-fn-to-char-and-fn-to-number-format-model-incompatibility` does for `TO_CHAR` and `TO_NUMBER`. Rejected: that ADR's reason, that partial support cannot be expressed, no longer holds once a declined call is self-applied (ADR `no-exasol-side-fallback-for-an-advertised-capability`), and withdrawal would also stop pushing the one-argument forms. Decline every format with a space. Rejected: the reported `TO_TIMESTAMP` format has a space. Rewrite the source with `rtrim` to close the trailing-space difference. Rejected for this fix: it changes the one-argument renderings. The empty-string difference closes with `nullif(<src>, '')` on the two-argument form only, which leaves the one-argument form unchanged (review round 2).
 - **Consequences:** The format-model knowledge lives in one new private module of `vs-expression`. Its one function maps a format to a strftime pattern or reports that none exists, so the `TO_DATE`/`TO_TIMESTAMP` arm knows no element. A declined filter routes to the qualified single-table wrapper and pushes no filter into the scan, so that query reads more rows.
 - **Promotes to ADR:** no
 
@@ -27,6 +27,12 @@
 - **Decision:** `FF3`, `FF6`, and `FF9` map to a fraction of exactly that many digits. `FF1`, `FF2`, `FF4`, `FF5`, `FF7`, `FF8`, and a bare `FF` decline.
 - **Rationale:** Exasol's `FFn` keeps the first n digits (`'.1234'` under `FF3` is `.123`). chrono's exact-width forms raise on any other digit count, so they never return a different value. chrono has no 1-, 2-, 4-, 5-, 7-, or 8-digit fraction form (`%1f` is a bad format string).
 - **Alternatives:** Map every `FFn` to the variable-width `%.f`. Rejected: it keeps up to nine digits, so `'.1234'` under `FF3` returns `.1234` where Exasol returns `.123`.
+- **Promotes to ADR:** no
+
+### [4] `_` is a supported separator
+
+- **Decision:** `_` is copied unchanged like the other separators.
+- **Rationale:** Review round 1 confirmed on a live Exasol that `_` is an exact separator, and the scan's parser treats it as a literal.
 - **Promotes to ADR:** no
 
 ## Review Findings
