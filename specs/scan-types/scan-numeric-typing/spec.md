@@ -26,12 +26,10 @@ The scan evaluates pushed numeric expressions with Exasol's typing rules, so a p
 * *THEN* the result type SHALL follow Exasol's rule: `*` adds the operands' precisions and scales, `+` and `-` keep the larger scale and the larger integer part plus one digit, and an integer literal counts only its own digits
 * *AND* the scan SHALL compute the result in 128 bits, so an intermediate value beyond 36 digits that fits 128 bits SHALL NOT raise
 * *AND* a `SUM` SHALL accumulate in a type that cannot wrap around: a 128-bit decimal for an argument of at most 28 digits, and a 256-bit decimal for a wider one
-* *AND* the partial sum of an `AVG` over an integer or decimal column SHALL be declared `DECIMAL(36,s)`, as a `SUM` partial is
 
 ### Scenario: Exact overflow raises Exasol's numeric value out of range
 
-* *GIVEN* a pushed exact expression whose value exceeds 128 bits, or a projected value, `SUM` total, or `AVG` partial sum that exceeds its declared `DECIMAL` precision
+* *GIVEN* a pushed exact expression whose value exceeds 128 bits, or a projected value or `SUM` total that exceeds its declared `DECIMAL` precision
 * *WHEN* the scan evaluates it in a projection, a filter, a broadcast join, or an aggregate
 * *THEN* the query SHALL fail with a message that starts with `data exception - numeric value out of range`, as native Exasol's message does
 * *AND* the scan SHALL recognise the overflow by its type, including when the Parquet row filter flattens it to text
-* *AND* the error SHALL carry SQL state `22002` instead of native Exasol's `22003`, as `docs/semantic-differences.md` documents

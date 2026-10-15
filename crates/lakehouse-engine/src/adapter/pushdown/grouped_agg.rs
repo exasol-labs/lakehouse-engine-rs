@@ -418,9 +418,9 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     sql
 }
 
-/// Counts are DECIMAL(20,0); SUM and AVG sums widen DECIMAL(p,s) to DECIMAL(36,s), so they
-/// overflow where native Exasol does; stat partials are DOUBLE PRECISION; MIN/MAX use the
-/// argument's exact type.
+/// Counts are DECIMAL(20,0); SUM widens DECIMAL(p,s) to DECIMAL(36,s) against
+/// overflow; AVG and stat sums are DOUBLE PRECISION (reconstructed in floating
+/// point); MIN/MAX use the argument's exact type.
 pub(super) fn partial_emits_items(
     aggregates: &[AggregatePlan],
     col_types: &[(String, String)],
@@ -438,17 +438,15 @@ pub(super) fn partial_emits_items(
                     | PartialAggColumn::CountArg
                     | PartialAggColumn::AvgCnt
                     | PartialAggColumn::StatCnt => "DECIMAL(20,0)".to_string(),
-                    PartialAggColumn::StatMean | PartialAggColumn::StatM2 => {
-                        "DOUBLE PRECISION".to_string()
-                    }
-                    PartialAggColumn::Sum | PartialAggColumn::AvgSum => {
-                        sum_emit_type(&col_type_for(
-                            plan.column.as_deref(),
-                            plan.arg_expr.as_deref(),
-                            col_types,
-                            declared,
-                        ))
-                    }
+                    PartialAggColumn::AvgSum
+                    | PartialAggColumn::StatMean
+                    | PartialAggColumn::StatM2 => "DOUBLE PRECISION".to_string(),
+                    PartialAggColumn::Sum => sum_emit_type(&col_type_for(
+                        plan.column.as_deref(),
+                        plan.arg_expr.as_deref(),
+                        col_types,
+                        declared,
+                    )),
                     PartialAggColumn::Min | PartialAggColumn::Max => col_type_for(
                         plan.column.as_deref(),
                         plan.arg_expr.as_deref(),

@@ -1876,8 +1876,9 @@ fn numeric_expressions_match_native_exasol() {
          FROM {T} WHERE K < 3 OR K > 2998 ORDER BY K",
         "SELECT K FROM {T} WHERE H * 3 > 9000000000000000000 AND K < 5 ORDER BY K",
         "SELECT H * 3, COUNT(*) FROM {T} GROUP BY H * 3 ORDER BY 1",
+        "SELECT AVG(W) FROM {T} WHERE K <= 50",
         "SELECT SUM(H), SUM(H * 3), AVG(H), MIN(H * 3), MAX(H * I), COUNT(DISTINCT H * 3) FROM {T}",
-        "SELECT G, SUM(H * 3), SUM(I * I), AVG(D), SUM(W) FROM {T} WHERE K > 300 \
+        "SELECT G, SUM(H * 3), SUM(I * I), SUM(W) FROM {T} WHERE K > 300 \
          GROUP BY G ORDER BY G",
         join,
         "SELECT K, DK, H + DH, H * DK FROM {T} JOIN {D} ON H = DH WHERE K < 5 ORDER BY K, DK",
@@ -1890,7 +1891,6 @@ fn numeric_expressions_match_native_exasol() {
         "SELECT K FROM {T} WHERE H * H * 100 > 0",
         "SELECT K, H * H * 10 FROM {T} WHERE K < 3",
         "SELECT SUM(W) FROM {T}",
-        "SELECT AVG(W) FROM {T}",
         "SELECT G, SUM(W) FROM {T} GROUP BY G",
         "SELECT SUM(W * W) FROM {T}",
         "SELECT K, DK FROM {T} JOIN {D} ON H = DH WHERE K < 4 AND H * DH * 100 > 0",

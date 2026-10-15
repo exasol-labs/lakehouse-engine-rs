@@ -4,10 +4,9 @@
 
 # Semantic differences from native Exasol
 
-A few pushed-down functions, a filter on a date outside Exasol's DATE range, and some numeric
-overflows return a different result than the same query on a native Exasol table. Each difference on this page is a
-current compatibility gap. The [Capabilities](capabilities.md) page lists which functions are
-pushed down.
+Some pushed-down queries return a different result than the same query on a native Exasol
+table. Each difference on this page is a current compatibility gap. The
+[Capabilities](capabilities.md) page lists which functions are pushed down.
 
 ## Case conversion of non-ASCII text
 
@@ -68,12 +67,8 @@ For DECIMAL and integer columns, native Exasol computes `STDDEV`, `VARIANCE`, `V
 precision, so its results can be less precise. The difference grows when the values are large
 and close to each other.
 
-## Numeric overflow
+## AVG of very large values
 
-A query fails where native Exasol fails when an exact value leaves Exasol's range, with the same
-message, `data exception - numeric value out of range`. Two differences remain:
-
-- The error carries SQL state `22002` instead of `22003`.
-- `AVG` over an integer expression, such as `AVG(amount * amount)`, returns a rounded value
-  where native Exasol fails, when the sum of the expression exceeds 36 digits. `AVG` over a
-  column, or over an expression with decimal places, fails as native Exasol does.
+`AVG` returns an average where native Exasol fails with `data exception - numeric value out of
+range`. This happens only when the sum of the averaged values exceeds about 38 digits, counting
+the digits after the decimal point.
