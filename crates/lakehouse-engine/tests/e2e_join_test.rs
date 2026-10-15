@@ -1226,6 +1226,7 @@ fn like_on_orderdate_join_query(vs_name: &str) -> String {
     )
 }
 
+/// Scenario: A broadcast-join filter over a non-string LIKE subject declines the broadcast plan
 #[test]
 fn e2e_broadcast_like_on_decimal_column_falls_back_and_filters() {
     setup_e2e();

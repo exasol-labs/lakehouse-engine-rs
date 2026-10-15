@@ -52,17 +52,7 @@ both dialects, because verbatim is either impossible or wrong for them:
 | `CAST` | The target type, not the name, is what differs: an Exasol character target needs an explicit length and an Exasol `TIMESTAMP` target needs an explicit precision. Its per-dialect rendering is specified in `sql-comprehension/vs-expression-translator-cast` and is unchanged by this feature. |
 | `function_scalar` named `CASE` | Exasol's interleaved-argument CASE encoding; both dialects render `CASE WHEN … THEN … END`, so there is no call form to render verbatim. This is the `function_scalar`+`name=CASE` alternate encoding, distinct from the `function_scalar_case` node type scenario below. |
 
-The scalar regexp functions (`REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`, `REGEXP_COUNT`)
-are deliberately not translated. Re-verified for issue #106 against the pinned DataFusion 54.0.0
-and `regex` 1.12.4: DataFusion runs the Rust `regex` crate, whose dialect rejects the pattern
-backreferences and lookaround Exasol's PCRE dialect accepts; DataFusion has no `regexp_substr`; and
-Exasol's position, occurrence, and return-option arguments have no matching DataFusion argument
-shape. A compile-time literal-pattern check would certify pattern syntax, not match parity with
-Exasol's PCRE, so it cannot lift the decline (see issue #106). The decline holds in BOTH dialects:
-the adapter advertises one capability set for both, so a name renderable only in the Exasol wrapper
-would still be pushed at the DataFusion scan. This is separate from the `FN_PRED_REGEXP_LIKE`
-predicate, which stays advertised and whose per-dialect rendering is specified in
-`sql-comprehension/vs-expression-translator`.
+The regular-expression functions are not translated in either dialect (issue #106, #471).
 
 ## Scenarios
 
@@ -136,9 +126,8 @@ predicate, which stays advertised and whose per-dialect rendering is specified i
 
 ### Scenario: Regexp scalar functions are deliberately not translated
 
-* *GIVEN* a VS expression node of type `function_scalar` named `REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`, or `REGEXP_COUNT`
+* *GIVEN* a VS expression node of type `function_scalar` named `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`, or `REGEXP_COUNT`
 * *WHEN* `render_expression` processes the node in raising mode
-* *THEN* the translator SHALL return an error naming the function as unsupported
-* *AND* `render_expression_safe` SHALL return `None` for the same node without panicking, and `render_expression_exasol` / `render_expression_exasol_safe` SHALL decline these four names identically — one capability set serves both dialects, so the Exasol dialect's verbatim rule MUST NOT widen the translated set
-* *AND* the adapter SHALL omit the expression and let Exasol evaluate it, so `FN_REGEXP_REPLACE`, `FN_REGEXP_SUBSTR`, `FN_REGEXP_INSTR`, and `FN_REGEXP_COUNT` remain unadvertised — the investigation recorded under issue #106 re-verified this decline against the pinned DataFusion 54.0.0 and `regex` 1.12.4 and found no change (see issue #106)
-* *AND* the exclusion MUST NOT alter the pre-existing `FN_PRED_REGEXP_LIKE` predicate advertisement
+* *THEN* the translator SHALL return the error `unsupported scalar function: <NAME>`
+* *AND* `render_expression_safe` SHALL return `None` for the same node without panicking, and `render_expression_exasol` / `render_expression_exasol_safe` SHALL decline these five names identically — one capability set serves both dialects, so the Exasol dialect's verbatim rule MUST NOT widen the translated set
+* *AND* the adapter SHALL NOT advertise `FN_PRED_REGEXP_LIKE`, `FN_REGEXP_REPLACE`, `FN_REGEXP_SUBSTR`, `FN_REGEXP_INSTR`, or `FN_REGEXP_COUNT`, so Exasol evaluates each of them

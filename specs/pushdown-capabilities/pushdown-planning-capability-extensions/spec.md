@@ -5,7 +5,7 @@ advertisements for arithmetic operator scalar functions and ISO week, plus the d
 absent bitwise operator functions. Each advertised capability is gated on a
 `crates/vs-expression` translator arm. Sibling features:
 `pushdown-planning-order-by-capability` (sort keys),
-`pushdown-planning-string-conversion-capability` (CAST/NEG, regexp absence, SUBSTR/LEFT),
+`pushdown-planning-string-conversion-capability` (CAST/NEG, SUBSTR/LEFT),
 `pushdown-planning-selectlist-expressions`, `pushdown-planning-aggregate-extensions`,
 `pushdown-planning-literal-projection`,
 `pushdown-planning-capability-extensions-credential-reference`.
@@ -14,8 +14,7 @@ absent bitwise operator functions. Each advertised capability is gated on a
 
 * A scalar-function capability is advertised only once a `crates/vs-expression` arm renders it and
   the DataFusion 54 result matches Exasol. `FN_CAST`, `FN_NEG`, and `FN_WEEK` meet this bar;
-  `FN_DIV`, `FN_TO_CHAR`, `FN_TO_NUMBER`, the regexp scalar functions, the divergent date
-  functions, and the bitwise operator functions do not and stay unadvertised.
+  `FN_DIV`, `FN_TO_CHAR`, `FN_TO_NUMBER`, the divergent date functions, and the bitwise operator functions do not and stay unadvertised.
 * Iceberg spec compliance: checked, not engaged. Verified against the Apache Iceberg table
   spec (https://iceberg.apache.org/spec/) rather than from memory: the normative sections
   that could bear on this change are the ones governing what a reader must resolve —
