@@ -416,7 +416,7 @@ fn like_subject_type_guard(filter: &Json, col_types: &[(String, String)]) -> Opt
     rewrite_expr_tree(
         filter,
         &|out: &Json| match out.get("type").and_then(|t| t.as_str()) {
-            Some("predicate_like" | "predicate_like_regexp") => guard_like_subject(out, col_types),
+            Some("predicate_like") => guard_like_subject(out, col_types),
             _ => Some(out.clone()),
         },
     )
@@ -796,8 +796,7 @@ pub(super) fn project_columns(
                     | "predicate_between"
                     | "predicate_is_null"
                     | "predicate_is_not_null"
-                    | "predicate_notequal"
-                    | "predicate_like_regexp" => {
+                    | "predicate_notequal" => {
                         match render_expression_safe(e) {
                             Some(sql_frag) => {
                                 let ty = declared_type.clone();
