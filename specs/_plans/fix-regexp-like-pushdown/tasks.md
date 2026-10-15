@@ -1,5 +1,13 @@
 # Tasks: fix-regexp-like-pushdown
 
+## PR Lifecycle
+- [x] resolved
+- [x] implemented
+- [x] version-bumped
+- [ ] tested-green
+- [ ] recorded
+- [ ] pr-ready
+
 ## Phase 2: Implementation (Group A)
 - [x] 1.1 Translator tests: decline REGEXP_LIKE (add decline tests, scenario lines)
 - [x] 1.2 Remove REGEXP_LIKE rendering from vs-expression lib.rs
