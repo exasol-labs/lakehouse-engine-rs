@@ -1044,90 +1044,6 @@ fn renders_null_valued_timestamp_literal_per_dialect() {
 }
 
 #[test]
-fn renders_regexp_like() {
-    let expr = json!({
-        "type": "predicate_like_regexp",
-        "expression": {"type": "column", "name": "name"},
-        "pattern": {"type": "literal_string", "value": "^A.*"}
-    });
-    let sql = render_expression(&expr).unwrap();
-    assert_eq!(sql, r#"regexp_like("NAME", '^A.*')"#);
-
-    let expr2 = json!({
-        "type": "function_scalar",
-        "name": "REGEXP_LIKE",
-        "arguments": [
-            {"type": "column", "name": "name"},
-            {"type": "literal_string", "value": "^B.*"}
-        ]
-    });
-    let sql2 = render_expression(&expr2).unwrap();
-    assert_eq!(sql2, r#"regexp_like("NAME", '^B.*')"#);
-}
-
-#[test]
-fn renders_regexp_like_as_infix_predicate_in_exasol_dialect() {
-    let predicate = json!({
-        "type": "predicate_like_regexp",
-        "expression": {"type": "column", "name": "name"},
-        "pattern": {"type": "literal_string", "value": "^A.*"}
-    });
-    let scalar = json!({
-        "type": "function_scalar",
-        "name": "REGEXP_LIKE",
-        "arguments": [
-            {"type": "column", "name": "name"},
-            {"type": "literal_string", "value": "^A.*"}
-        ]
-    });
-
-    let predicate_exasol = render_expression_exasol(&predicate).unwrap();
-    let scalar_exasol = render_expression_exasol(&scalar).unwrap();
-    assert_eq!(predicate_exasol, r#"("NAME" REGEXP_LIKE '^A.*')"#);
-    assert_eq!(
-        scalar_exasol, predicate_exasol,
-        "the two REGEXP_LIKE encodings must render byte-identically in the Exasol dialect"
-    );
-
-    assert_eq!(
-        render_expression(&predicate).unwrap(),
-        r#"regexp_like("NAME", '^A.*')"#
-    );
-    assert_eq!(
-        render_expression(&scalar).unwrap(),
-        r#"regexp_like("NAME", '^A.*')"#
-    );
-}
-
-#[test]
-fn regexp_like_predicate_missing_operand_errors_in_both_dialects() {
-    let missing_pattern = json!({
-        "type": "predicate_like_regexp",
-        "expression": {"type": "column", "name": "name"}
-    });
-    assert!(render_expression(&missing_pattern).is_err());
-    assert!(render_expression_exasol(&missing_pattern).is_err());
-
-    let missing_expression = json!({
-        "type": "predicate_like_regexp",
-        "pattern": {"type": "literal_string", "value": "^A.*"}
-    });
-    assert!(render_expression(&missing_expression).is_err());
-    assert!(render_expression_exasol(&missing_expression).is_err());
-}
-
-#[test]
-fn regexp_like_scalar_arity_errors_in_both_dialects() {
-    let one_arg = json!({
-        "type": "function_scalar",
-        "name": "REGEXP_LIKE",
-        "arguments": [{"type": "column", "name": "name"}]
-    });
-    assert!(render_expression(&one_arg).is_err());
-    assert!(render_expression_exasol(&one_arg).is_err());
-}
-
-#[test]
 fn renders_math_scalar_functions() {
     let cases_1arg = [
         ("ABS", "abs"),
@@ -2178,11 +2094,13 @@ fn to_char_and_to_number_fall_through_as_unsupported() {
     }
 }
 
+/// Scenario: Regexp scalar functions are deliberately not translated
 #[test]
 fn regexp_scalar_functions_decline_in_both_dialects() {
-    // The `regex` crate lacks backreferences, lookaround, and `regexp_substr`, and the
-    // argument shapes differ from Exasol's (#106).
+    // DataFusion's regexp_like matches anywhere in the value, Exasol's PCRE only
+    // when the match spans the whole value; `regex` also lacks look-around.
     let unsupported = [
+        "REGEXP_LIKE",
         "REGEXP_REPLACE",
         "REGEXP_SUBSTR",
         "REGEXP_INSTR",
@@ -2219,6 +2137,24 @@ fn regexp_scalar_functions_decline_in_both_dialects() {
     }
 }
 
+#[test]
+fn regexp_like_predicate_declines_in_both_dialects() {
+    let expr = json!({
+        "type": "predicate_like_regexp",
+        "expression": {"type": "column", "name": "name"},
+        "pattern": {"type": "literal_string", "value": "^A.*"}
+    });
+    let expected = "unsupported expression node type: predicate_like_regexp";
+    assert_eq!(render_expression(&expr).unwrap_err().to_string(), expected);
+    assert_eq!(
+        render_expression_exasol(&expr).unwrap_err().to_string(),
+        expected
+    );
+    assert!(render_expression_safe(&expr).is_none());
+    assert!(render_df_filter_safe(&expr).is_none());
+    assert!(render_expression_exasol_safe(&expr).is_none());
+    assert!(render_df_filter_exasol_safe(&expr).is_none());
+}
 #[test]
 fn bitwise_operator_functions_fall_through() {
     // Exasol's bit functions use an unsigned 64-bit domain: DataFusion's bitwise operators
@@ -2308,31 +2244,6 @@ fn undeclared_scalar_function_declines_in_both_dialects() {
             "Exasol safe variant must be None for {expr}"
         );
     }
-}
-
-#[test]
-fn regexp_scalar_exclusion_leaves_regexp_like_untouched() {
-    let predicate = json!({
-        "type": "predicate_like_regexp",
-        "expression": {"type": "column", "name": "name"},
-        "pattern": {"type": "literal_string", "value": "^A.*"}
-    });
-    assert_eq!(
-        render_expression(&predicate).unwrap(),
-        r#"regexp_like("NAME", '^A.*')"#
-    );
-    let scalar = json!({
-        "type": "function_scalar",
-        "name": "REGEXP_LIKE",
-        "arguments": [
-            {"type": "column", "name": "name"},
-            {"type": "literal_string", "value": "^B.*"}
-        ]
-    });
-    assert_eq!(
-        render_expression(&scalar).unwrap(),
-        r#"regexp_like("NAME", '^B.*')"#
-    );
 }
 
 #[test]
@@ -3142,11 +3053,6 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
             r#"CAST("V" AS VARCHAR(50))"#,
         ),
         shaped(
-            "REGEXP_LIKE",
-            scalar("REGEXP_LIKE", vec![col("s"), text("^a")]),
-            r#"("S" REGEXP_LIKE '^a')"#,
-        ),
-        shaped(
             "CASE",
             scalar(
                 "CASE",
@@ -3269,14 +3175,6 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
             r#"CAST("V" AS VARCHAR)"#,
         ),
         (
-            json!({
-                "type": "predicate_like_regexp",
-                "expression": col("s"), "pattern": text("^a")
-            }),
-            r#"("S" REGEXP_LIKE '^a')"#,
-            r#"regexp_like("S", '^a')"#,
-        ),
-        (
             json!({"type": "literal_timestamp", "value": "2024-03-01 12:34:56.789"}),
             "TIMESTAMP '2024-03-01 12:34:56.789'",
             "arrow_cast('2024-03-01 12:34:56.789', 'Timestamp(Microsecond, None)')",
@@ -3317,7 +3215,6 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
             "arrow_cast",
             "character_length",
             "octet_length",
-            "regexp_like(",
             "current_date()",
             "now()",
             "nullif(",

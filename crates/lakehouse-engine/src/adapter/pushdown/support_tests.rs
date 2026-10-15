@@ -2251,6 +2251,7 @@ fn like_guard_varchar_subject_unchanged() {
     );
 }
 
+/// Scenario: LIKE on a VARCHAR or CHAR column pushes down unchanged.
 #[test]
 fn like_guard_char_subject_unchanged() {
     let filter = serde_json::json!({
@@ -2330,6 +2331,7 @@ fn type_rewrite_pipeline_runs_like_guard() {
     );
 }
 
+/// Scenario: LIKE on an integer column declines the whole filter.
 #[test]
 fn like_guard_integer_subject_declines() {
     let filter = serde_json::json!({
@@ -2346,6 +2348,7 @@ fn like_guard_integer_subject_declines() {
     );
 }
 
+/// Scenario: LIKE on a non-column subject is left untouched.
 #[test]
 fn like_guard_non_column_subject_untouched() {
     let filter = serde_json::json!({
@@ -2367,6 +2370,7 @@ fn like_guard_non_column_subject_untouched() {
     );
 }
 
+/// Scenario: LIKE on a bare column whose type cannot be resolved declines the whole filter.
 #[test]
 fn like_guard_unresolvable_column_declines() {
     let filter = serde_json::json!({
@@ -2491,6 +2495,7 @@ fn nested_like_decline_routes_to_wrapper_where() {
     );
 }
 
+/// Scenario: LIKE on an integer column declines the whole filter.
 #[test]
 fn declined_like_on_integer_column_routes_to_wrapper_where() {
     let filter = serde_json::json!({
@@ -2508,6 +2513,7 @@ fn declined_like_on_integer_column_routes_to_wrapper_where() {
     );
 }
 
+/// Scenario: LIKE on a bare column whose type cannot be resolved declines the whole filter.
 #[test]
 fn declined_like_on_unresolvable_column_routes_to_wrapper_where() {
     let filter = serde_json::json!({
@@ -2523,34 +2529,6 @@ fn declined_like_on_unresolvable_column_routes_to_wrapper_where() {
         sql.contains(r#"AS "LHS_T0" WHERE ("LHS_T0"."MYSTERY" LIKE 'A%')"#),
         "an unresolvable-subject decline must still be applied by the adapter, \
          never omitted: {sql}"
-    );
-}
-
-#[test]
-fn like_guard_regexp_date_subject_wraps_cast() {
-    let column = serde_json::json!({"type": "column", "name": "signup_date"});
-    let filter = serde_json::json!({
-        "type": "predicate_like_regexp",
-        "expression": column.clone(),
-        "pattern": {"type": "literal_string", "value": "2024.*"}
-    });
-    let col_types = vec![("SIGNUP_DATE".to_string(), "DATE".to_string())];
-
-    let result = like_subject_type_guard(&filter, &col_types);
-    let expected = serde_json::json!({
-        "type": "predicate_like_regexp",
-        "expression": {
-            "type": "function_scalar_cast",
-            "name": "CAST",
-            "dataType": {"type": "VARCHAR"},
-            "arguments": [column]
-        },
-        "pattern": {"type": "literal_string", "value": "2024.*"}
-    });
-    assert_eq!(
-        result,
-        Some(expected),
-        "REGEXP_LIKE DATE subject must be rewrapped in CAST(<col> AS VARCHAR)"
     );
 }
 
@@ -3360,6 +3338,7 @@ fn selectlist_instr_with_start_position_falls_back_to_full_row() {
     );
 }
 
+/// Scenario: Scalar select-list expression is pushed into the scan-driving query.
 #[test]
 fn selectlist_predicate_node_projects_as_expr() {
     let cases: Vec<(&str, serde_json::Value, &str)> = vec![
@@ -3409,15 +3388,6 @@ fn selectlist_predicate_node_projects_as_expr() {
                 "right": {"type": "literal_exactnumeric", "value": 5},
             }),
             r#"("ID" <> 5)"#,
-        ),
-        (
-            "predicate_like_regexp",
-            serde_json::json!({
-                "type": "predicate_like_regexp",
-                "expression": column("name"),
-                "pattern": {"type": "literal_string", "value": "^a.*"},
-            }),
-            r#"regexp_like("NAME", '^a.*')"#,
         ),
     ];
 
@@ -3489,6 +3459,7 @@ fn selectlist_function_aggregate_still_widens_to_full_row() {
     assert_eq!(types, expected_types);
 }
 
+/// Scenario: A select-list LIKE over a DATE column projects the CAST-to-VARCHAR form.
 #[test]
 fn selectlist_like_over_date_projects_cast_expr() {
     let item = serde_json::json!({
@@ -3522,6 +3493,7 @@ fn selectlist_like_over_date_projects_cast_expr() {
     assert_eq!(types, vec!["BOOLEAN".to_string()]);
 }
 
+/// Scenario: A select-list LIKE over a non-string column widens the projection to the full base row.
 #[test]
 fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
     let col_types = decimal_rewrite_col_types();
@@ -3572,14 +3544,6 @@ fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
                 "type": "predicate_like",
                 "expression": column("not_a_column"),
                 "pattern": {"type": "literal_string", "value": "1%"}
-            }),
-        ),
-        (
-            "predicate_like_regexp over c_decimal_a",
-            serde_json::json!({
-                "type": "predicate_like_regexp",
-                "expression": column("c_decimal_a"),
-                "pattern": {"type": "literal_string", "value": "^1.*"}
             }),
         ),
     ];

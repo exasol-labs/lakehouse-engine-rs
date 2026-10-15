@@ -244,44 +244,85 @@ fn e2e_date_functions_in_filter() {
     }
 }
 
+/// Sorted integer values of the first result column; an empty result set
+/// carries no columns, so it yields an empty list.
+fn ids_of_first_column(conn: &mut ExaConn, sql: &str) -> Vec<i64> {
+    let mut ids: Vec<i64> = conn
+        .query_columns(sql)
+        .first()
+        .map(|col| col.iter().map(parse_int).collect())
+        .unwrap_or_default();
+    ids.sort_unstable();
+    ids
+}
+
+/// Scenario: Regexp scalar functions are deliberately not translated
 #[test]
-fn e2e_regexp_like_in_filter() {
+fn e2e_regexp_like_returns_native_rows() {
     setup_e2e();
     let mut conn = exa_conn();
 
+    let cases: [(&str, Vec<i64>); 4] = [
+        ("name REGEXP_LIKE 'event-1'", vec![]),
+        ("NOT (name REGEXP_LIKE 'event-1')", (1..=20).collect()),
+        ("name REGEXP_LIKE '(e|ev)(e|ent-01)?'", vec![]),
+        ("name REGEXP_LIKE '(?=event-0[1-3]).*'", vec![1, 2, 3]),
+    ];
+
+    for (predicate, expected_ids) in cases {
+        let native_sql = format!(
+            "SELECT COUNT(*) FROM (SELECT 'event-' || LPAD(TO_CHAR(LEVEL), 2, '0') AS name \
+             FROM DUAL CONNECT BY LEVEL <= 20) WHERE {predicate}"
+        );
+        let native_count = conn.query_scalar_i64(&native_sql);
+        assert_eq!(
+            native_count,
+            expected_ids.len() as i64,
+            "native Exasol must return {} rows for `{predicate}`; the fixture no longer \
+             discriminates this predicate",
+            expected_ids.len()
+        );
+
+        let sql = format!("SELECT id FROM {} WHERE {predicate}", vs_table());
+        let ids = ids_of_first_column(&mut conn, &sql);
+        assert_eq!(
+            ids, expected_ids,
+            "`{predicate}` over the virtual schema must return the native rows"
+        );
+    }
+
     let sql = format!(
-        "SELECT id, name FROM {} WHERE name REGEXP_LIKE 'event-0[0-9]' ORDER BY id",
+        "SELECT id, name FROM {} WHERE id < 5 AND name REGEXP_LIKE 'event-0[1-3]'",
         vs_table()
     );
-    let cols = conn.query_columns(&sql);
-    assert_eq!(cols.len(), 2, "expected 2 columns (id, name): {cols:?}");
 
-    let expected_count = 9i64;
+    let request = explain_virtual_pushdown_request(&mut conn, &sql);
+    let filter = &request["filter"];
     assert_eq!(
-        cols[0].len() as i64,
-        expected_count,
-        "REGEXP_LIKE(name, 'event-0[0-9]') must return {expected_count} rows, got {}",
-        cols[0].len()
+        filter["type"], "predicate_less",
+        "only the id < 5 conjunct may be pushed: {request:#}"
+    );
+    assert_eq!(
+        filter["left"]["name"], "ID",
+        "the pushed conjunct must compare column ID: {request:#}"
+    );
+    assert!(
+        !filter.to_string().to_lowercase().contains("regexp"),
+        "the REGEXP_LIKE conjunct must not reach the adapter: {request:#}"
     );
 
-    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
-    for (pos, &id) in ids.iter().enumerate() {
-        let expected = 1 + pos as i64;
-        assert_eq!(
-            id, expected,
-            "id at position {pos} must be {expected}, got {id}"
-        );
-    }
+    let advertised = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        advertised.contains("\"capabilities\":"),
+        "EXPLAIN VIRTUAL must echo the getCapabilities response:\n{advertised}"
+    );
+    assert!(
+        !advertised.contains("\"FN_PRED_REGEXP_LIKE\""),
+        "getCapabilities must not advertise FN_PRED_REGEXP_LIKE:\n{advertised}"
+    );
 
-    for v in &cols[1] {
-        let n = v
-            .as_str()
-            .unwrap_or_else(|| panic!("name not a string: {v:?}"));
-        assert!(
-            n.starts_with("event-0"),
-            "filter violated: name '{n}' should match event-0[0-9]"
-        );
-    }
+    let ids = ids_of_first_column(&mut conn, &sql);
+    assert_eq!(ids, vec![1, 2, 3], "only ids 1..=3 match both conjuncts");
 }
 
 #[test]
