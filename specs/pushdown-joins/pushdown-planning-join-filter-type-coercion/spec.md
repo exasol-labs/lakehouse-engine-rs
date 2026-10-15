@@ -71,12 +71,12 @@ not have: WHICH column-type universe a surface may screen against.
 
 ### Scenario: A broadcast-join filter over a non-string LIKE subject declines the broadcast plan
 
-* *GIVEN* a broadcast-eligible inner equi-join `pushdown` request meeting every other broadcast condition, whose `filter` carries a `predicate_like` or `predicate_regexp_like` whose subject is a bare `column` node
+* *GIVEN* a broadcast-eligible inner equi-join `pushdown` request meeting every other broadcast condition, whose `filter` carries a `predicate_like` whose subject is a bare `column` node
 * *AND* the column's Exasol type in the union of the two involved tables' column metadata is a non-string, non-DATE type — `DECIMAL(p,s)` (including an Exasol integer, which the wire carries as `DECIMAL(p,0)`), `DOUBLE PRECISION`, `BOOLEAN`, or `TIMESTAMP` — or the column's name does not resolve in that union at all
 * *WHEN* the adapter renders the broadcast join pushdown
 * *THEN* the type-rewrite pipeline SHALL decline the filter, and the adapter SHALL decline the WHOLE broadcast plan and fall through to the unified unaccelerated N-scan fallback, which self-applies the predicate in its own qualified outer `WHERE`
 * *AND* the decline SHALL be the SAME clean `Ok(None)`-shaped fall-through the syntactically-unrenderable-filter decline already takes, NOT an error and NOT a new route — see `pushdown/pushdown-declined-filter-self-apply`
-* *AND* the adapter MUST NOT emit a broadcast plan carrying the predicate rendered bare, which is what previously reached DataFusion's `type_coercion` planner and failed the scan with no result at all (issue #215)
+* *AND* the adapter MUST NOT emit a broadcast plan carrying the predicate rendered bare, which DataFusion's `type_coercion` planner rejects, failing the scan with no result (issue #215)
 * *AND* the adapter MUST NOT emit a broadcast plan whose scan spec simply OMITS the predicate, because broadcast SQL carries no outer `WHERE` in which anything could apply it
 * *AND* the returned rows SHALL equal native Exasol evaluation of the same join
 
