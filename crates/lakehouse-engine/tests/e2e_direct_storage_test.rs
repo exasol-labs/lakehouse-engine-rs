@@ -1715,6 +1715,11 @@ const STATS_ORACLE: &str = "LHVS.DIRECT_STATS_ORACLE";
 const DIRECT_STATS_DIM: &str = "DIRECT_LAKEHOUSE.STATS_DIM";
 const STATS_DIM_ORACLE: &str = "LHVS.DIRECT_STATS_DIM_ORACLE";
 const NUMERIC_OVERFLOW: &str = "data exception - numeric value out of range";
+/// Native Exasol's overflow message carries neither detail, so one proves the scan raised it.
+const SCAN_OVERFLOW_DETAILS: [&str; 2] = [
+    "exceeds the 128-bit internal number representation",
+    "exceeds DECIMAL(",
+];
 const STAT_SELECT: &str = "VAR_POP(B), STDDEV(B), VAR_SAMP(I), STDDEV_POP(I), VARIANCE(C), \
      STDDEV_SAMP(C), VAR_POP(D), STDDEV(D), VARIANCE(F), STDDEV_SAMP(F)";
 
@@ -1832,7 +1837,10 @@ fn assert_same_as_native(conn: &mut ExaConn, template: &str, overflows: bool) {
     match (pushed, native) {
         (Ok(got), Ok(want)) if !overflows => assert_eq!(got, want, "{template}"),
         (Err(got), Err(want))
-            if overflows && got.contains(NUMERIC_OVERFLOW) && want.contains(NUMERIC_OVERFLOW) => {}
+            if overflows
+                && got.contains(NUMERIC_OVERFLOW)
+                && SCAN_OVERFLOW_DETAILS.iter().any(|d| got.contains(d))
+                && want.contains(NUMERIC_OVERFLOW) => {}
         (got, want) => panic!("{template}\nvirtual schema: {got:?}\nnative: {want:?}"),
     }
 }
@@ -1840,6 +1848,8 @@ fn assert_same_as_native(conn: &mut ExaConn, template: &str, overflows: bool) {
 /// Scenario: DOUBLE combined with DECIMAL evaluates in DOUBLE
 /// Scenario: Exact arithmetic and SUM do not wrap
 /// Scenario: Exact overflow raises Exasol's numeric value out of range
+/// Scenario: Wide exact operands compare exactly and combine in DOUBLE
+/// Scenario: A fractional numeric literal compares exactly
 #[test]
 fn numeric_expressions_match_native_exasol() {
     setup();
@@ -1883,6 +1893,30 @@ fn numeric_expressions_match_native_exasol() {
         join,
         "SELECT K, DK, H + DH, H * DK FROM {T} JOIN {D} ON H = DH WHERE K < 5 ORDER BY K, DK",
         "SELECT K, DK FROM {T} JOIN {D} ON K = DK WHERE X > DD ORDER BY K",
+        "SELECT K FROM {T} WHERE W > H * H OR K = 7 ORDER BY K",
+        "SELECT K FROM {T} WHERE W < H * H AND K < 5 ORDER BY K",
+        "SELECT K FROM {T} WHERE W IN (H * H, 7.5, 7.000007) ORDER BY K",
+        "SELECT K FROM {T} WHERE W BETWEEN 0 AND H * H AND K < 5 ORDER BY K",
+        "SELECT K FROM {T} WHERE H * H * 10 > W AND K < 5 ORDER BY K",
+        "SELECT K FROM {T} WHERE W * 100 < H * 250000000000 * 100 \
+         AND K BETWEEN 299 AND 302 ORDER BY K",
+        "SELECT K, GREATEST(W, H * H), CASE WHEN K < 3 THEN H * H ELSE W END, \
+         COALESCE(W, H * H), NULLIF(W, H * H), NULLIF(W, X) \
+         FROM {T} WHERE K < 5 OR K = 3001 ORDER BY K",
+        "SELECT K FROM {T} WHERE H = 4000000000000000000.5",
+        "SELECT K FROM {T} WHERE H > 3999999999999999999.5 AND K < 5 ORDER BY K",
+        "SELECT K FROM {T} WHERE W > 123456789012345678901234567890.123455 \
+         AND K BETWEEN 299 AND 302 ORDER BY K",
+        "SELECT K FROM {T} WHERE W = 999999999999999999999999999999.999999 \
+         AND K BETWEEN 299 AND 302 ORDER BY K",
+        "SELECT K FROM {T} WHERE W IN (999999999999999999999999999999.999999, 302.000302) \
+         AND K BETWEEN 299 AND 302 ORDER BY K",
+        "SELECT K FROM {T} WHERE W BETWEEN 301.000301 AND 999999999999999999999999999999.999998 \
+         AND K BETWEEN 299 AND 302 ORDER BY K",
+        "SELECT K FROM {T} WHERE W <> 999999999999999999999999999999.999999 \
+         AND K BETWEEN 299 AND 302 ORDER BY K",
+        "SELECT K, W - 123456789012345678901234567890.1 FROM {T} \
+         WHERE K BETWEEN 1501 AND 1503 ORDER BY K",
     ] {
         assert_same_as_native(&mut conn, template, false);
     }

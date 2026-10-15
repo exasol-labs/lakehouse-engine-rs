@@ -10,7 +10,10 @@ use super::raised_failure::RaisedFailure;
 use arrow::array::{Array, ArrayRef, AsArray, Decimal128Array, Int64Array};
 use arrow::compute::cast;
 use arrow::compute::kernels::arity::{binary, try_binary, unary};
-use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DataType, Decimal128Type, Int64Type, UInt64Type};
+use arrow::datatypes::{
+    DECIMAL128_MAX_PRECISION, DECIMAL256_MAX_PRECISION, DataType, Decimal128Type, Int64Type,
+    UInt64Type,
+};
 use arrow::error::ArrowError;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -27,6 +30,7 @@ use datafusion::logical_expr::{
 use datafusion::optimizer::AnalyzerRule;
 
 const EXASOL_MAX_SCALE: i8 = 36;
+const EXASOL_MAX_PRECISION: u8 = 36;
 /// `SUM` adds with wrapping, also for `Decimal128`; its `Decimal128(p + 10)` total cannot wrap up
 /// to this argument precision.
 const DECIMAL128_SUM_MAX_PRECISION: u8 = DECIMAL128_MAX_PRECISION - 10;
@@ -98,23 +102,26 @@ impl ExasolNumericTyping {
                 expr,
                 list,
                 negated,
-            }) => {
-                unify_float(std::iter::once(*expr).chain(list).collect(), schema)?.map_data(|all| {
-                    let mut all = all.into_iter();
-                    let expr = all.next().expect("the tested operand");
-                    Ok(Expr::InList(InList::new(
-                        Box::new(expr),
-                        all.collect(),
-                        negated,
-                    )))
-                })
-            }
+            }) => unify(
+                std::iter::once(*expr).chain(list).collect(),
+                schema,
+                Unify::Compare,
+            )?
+            .map_data(|all| {
+                let mut all = all.into_iter();
+                let expr = all.next().expect("the tested operand");
+                Ok(Expr::InList(InList::new(
+                    Box::new(expr),
+                    all.collect(),
+                    negated,
+                )))
+            }),
             Expr::Between(Between {
                 expr,
                 negated,
                 low,
                 high,
-            }) => unify_float(vec![*expr, *low, *high], schema)?.map_data(|all| {
+            }) => unify(vec![*expr, *low, *high], schema, Unify::Compare)?.map_data(|all| {
                 let [expr, low, high] = <[Expr; 3]>::try_from(all).expect("three operands");
                 Ok(Expr::Between(Between::new(
                     Box::new(expr),
@@ -125,9 +132,9 @@ impl ExasolNumericTyping {
             }),
             Expr::Case(case) => rewrite_case(case, schema),
             Expr::ScalarFunction(ScalarFunction { func, args })
-                if matches!(func.name(), "greatest" | "least" | "coalesce" | "nullif") =>
+                if matches!(func.name(), "greatest" | "least" | "coalesce") =>
             {
-                unify_float(args, schema)?
+                unify(args, schema, Unify::Combine)?
                     .map_data(|args| Ok(Expr::ScalarFunction(ScalarFunction::new_udf(func, args))))
             }
             Expr::Negative(inner) if inner.get_type(schema)?.is_integer() => Ok(Transformed::yes(
@@ -167,7 +174,7 @@ impl ExasolNumericTyping {
                 | Operator::IsDistinctFrom
                 | Operator::IsNotDistinctFrom
         ) {
-            return unify_float(vec![*left, *right], schema)?.map_data(|both| {
+            return unify(vec![*left, *right], schema, Unify::Compare)?.map_data(|both| {
                 let [left, right] = <[Expr; 2]>::try_from(both).expect("two operands");
                 Ok(rebuild(Box::new(left), Box::new(right)))
             });
@@ -210,10 +217,15 @@ fn rewrite_case(
     let has_else = else_expr.is_some();
     let (whens, thens): (Vec<Expr>, Vec<Expr>) =
         when_then_expr.into_iter().map(|(w, t)| (*w, *t)).unzip();
-    let keys = unify_float(expr.map(|e| *e).into_iter().chain(whens).collect(), schema)?;
-    let results = unify_float(
+    let keys = unify(
+        expr.map(|e| *e).into_iter().chain(whens).collect(),
+        schema,
+        Unify::Compare,
+    )?;
+    let results = unify(
         thens.into_iter().chain(else_expr.map(|e| *e)).collect(),
         schema,
+        Unify::Combine,
     )?;
     let transformed = keys.transformed || results.transformed;
     let (mut keys, mut results) = (keys.data, results.data);
@@ -234,24 +246,66 @@ fn rewrite_case(
     ))
 }
 
+/// How Exasol unifies wide exact operands: a comparison stays exact past `Decimal128`'s 38 digits,
+/// and a value combinator such as `COALESCE` returns DOUBLE past Exasol's 36.
+#[derive(Debug, Clone, Copy)]
+enum Unify {
+    Compare,
+    Combine,
+}
+
 /// Each operand is typed on its own: before coercion, a `CASE` reports only its first result type.
-fn unify_float(exprs: Vec<Expr>, schema: &DFSchema) -> Result<Transformed<Vec<Expr>>> {
+fn unify(exprs: Vec<Expr>, schema: &DFSchema, how: Unify) -> Result<Transformed<Vec<Expr>>> {
     let types = exprs
         .iter()
         .map(|e| e.get_type(schema))
         .collect::<Result<Vec<_>>>()?;
-    if !(types.iter().any(DataType::is_floating) && types.iter().any(DataType::is_decimal)) {
-        return Ok(Transformed::no(exprs));
-    }
+    let (target, convert): (DataType, fn(&DataType) -> bool) =
+        if types.iter().any(DataType::is_floating) && types.iter().any(DataType::is_decimal) {
+            (DataType::Float64, DataType::is_decimal)
+        } else {
+            match (how, common_exact(&types, how)) {
+                (Unify::Compare, Some((p, s))) if p > DECIMAL128_MAX_PRECISION => {
+                    (DataType::Decimal256(p, s), is_exact)
+                }
+                (Unify::Combine, Some((p, _))) if p > EXASOL_MAX_PRECISION => {
+                    (DataType::Float64, is_exact)
+                }
+                _ => return Ok(Transformed::no(exprs)),
+            }
+        };
     let unified = exprs
         .into_iter()
         .zip(&types)
-        .map(|(e, t)| match t.is_decimal() {
-            true => e.cast_to(&DataType::Float64, schema),
+        .map(|(e, t)| match convert(t) {
+            true => e.cast_to(&target, schema),
             false => Ok(e),
         })
         .collect::<Result<_>>()?;
     Ok(Transformed::yes(unified))
+}
+
+/// The common type of all-exact operands, as `(precision, scale)`. Exasol declares a value at most
+/// 36 digits wide, so `Combine` caps each operand at 36 before it widens.
+fn common_exact(types: &[DataType], how: Unify) -> Option<(u8, i8)> {
+    let (mut integer_digits, mut scale) = (0i16, 0i8);
+    for t in types.iter().filter(|t| !t.is_null()) {
+        if !is_exact(t) {
+            return None;
+        }
+        let (p, s) = exact_ps(t).ok()?;
+        if s < 0 {
+            return None;
+        }
+        let p = match how {
+            Unify::Compare => p,
+            Unify::Combine => p.min(EXASOL_MAX_PRECISION),
+        };
+        integer_digits = integer_digits.max(i16::from(p) - i16::from(s));
+        scale = scale.max(s);
+    }
+    let p = (integer_digits + i16::from(scale)).min(i16::from(DECIMAL256_MAX_PRECISION));
+    Some((p as u8, scale))
 }
 
 fn is_exact(t: &DataType) -> bool {

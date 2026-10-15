@@ -117,6 +117,48 @@ async fn double_meets_decimal_in_double() {
     }
 }
 
+/// Scenario: Wide exact operands compare exactly and combine in DOUBLE
+#[tokio::test]
+async fn wide_exact_operands_compare_exactly_and_combine_in_double() {
+    let ctx = session();
+    for (sql, expected) in [
+        ("SELECT COUNT(*) FROM t WHERE dec36 < l * l", "2"),
+        ("SELECT COUNT(*) FROM t WHERE dec36 > l * l", "0"),
+        ("SELECT COUNT(*) FROM t WHERE dec36 IN (l * l, 0.1)", "1"),
+        (
+            "SELECT COUNT(*) FROM t WHERE dec36 BETWEEN 0 AND l * l",
+            "2",
+        ),
+        (
+            "SELECT COUNT(*) FROM t WHERE CASE l * l WHEN dec36 THEN 1 ELSE 0 END = 0",
+            "3",
+        ),
+        (
+            "SELECT arrow_cast(1000000000000000, 'Int64') * arrow_cast(1000000000000000, 'Int64') \
+             > CAST(999999999999999999999999999999.999999 AS DECIMAL(36,6))",
+            "true",
+        ),
+        (
+            "SELECT arrow_typeof(coalesce(dec36, l * l)) FROM t LIMIT 1",
+            "Float64",
+        ),
+        (
+            "SELECT arrow_typeof(CASE WHEN l > 3 THEN l * l ELSE dec36 END) FROM t LIMIT 1",
+            "Float64",
+        ),
+        (
+            "SELECT arrow_typeof(coalesce(dec36, l)) FROM t LIMIT 1",
+            "Decimal128(36, 6)",
+        ),
+        (
+            "SELECT arrow_typeof(coalesce(l * l, 0)) FROM t LIMIT 1",
+            "Decimal128(38, 0)",
+        ),
+    ] {
+        assert_eq!(rows(&ctx, sql).await, [expected], "{sql}");
+    }
+}
+
 /// Scenario: Exact overflow raises Exasol's numeric value out of range
 #[tokio::test]
 async fn overflow_past_128_bits_raises_and_is_recorded_on_the_session() {
