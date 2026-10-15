@@ -4,7 +4,7 @@
 - [x] resolved
 - [x] implemented
 - [x] version-bumped
-- [ ] tested-green
+- [!] tested-green — red: e2e (logs: target/speq-e2e.log)
 - [ ] recorded
 - [ ] pr-ready
 
