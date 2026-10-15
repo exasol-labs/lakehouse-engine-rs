@@ -39,7 +39,7 @@
 | `cargo test -p vs-expression regexp` | ✓ |
 | `cargo test -p lakehouse-engine --lib -- like_guard selectlist_ filter_in_common_arg` | ✓ (48 passed) |
 | `capabilities_doc_lists_exactly_the_advertised_set` | ✓ (failed on 10 undocumented names before the docs edit, passes after) |
-| `REGEXP_LIKE 'event-1'` count, look-around count, `EXPLAIN VIRTUAL` filter | Not run by hand. Asserted by `e2e_regexp_like_returns_native_rows` and `e2e_regexp_like_conjunct_stays_in_exasol_while_sibling_pushes`, which passed. |
+| `REGEXP_LIKE 'event-1'` count, look-around count, `EXPLAIN VIRTUAL` filter | Not run by hand. Asserted by `e2e_regexp_like_returns_native_rows`, which passed. |
 
 ## Tool Evidence
 
@@ -58,9 +58,8 @@
 | sql-comprehension | vs-expression-translator-predicates | REGEXP_LIKE predicate is not translated in either dialect | `crates/vs-expression/src/lib_tests.rs` | `regexp_like_predicate_declines_in_both_dialects` | Pass |
 | sql-functions | vs-expression-translator-scalar-fns | Regexp scalar functions are deliberately not translated | `crates/vs-expression/src/lib_tests.rs` | `regexp_scalar_functions_decline_in_both_dialects` | Pass |
 | pushdown-types, pushdown, pushdown-joins | LIKE type coercion and select-list | the nine existing LIKE and select-list scenarios in plan.md | `support_tests.rs`, `e2e_join_test.rs` | `like_guard_*`, `declined_like_on_*`, `selectlist_*`, `filter_in_common_arg`, `e2e_broadcast_like_on_decimal_column_falls_back_and_filters` | Pass |
-| pushdown-capabilities | string-conversion-capability | Regular-expression capabilities are not advertised | `capabilities_tests.rs`, `tests/e2e_capability_test.rs` | `reports_audited_capability_set`, `e2e_regexp_like_conjunct_stays_in_exasol_while_sibling_pushes` | Pass |
-| pushdown-capabilities | string-conversion-capability | REGEXP_LIKE returns the rows native Exasol returns | `tests/e2e_capability_test.rs` | `e2e_regexp_like_returns_native_rows` | Pass |
-| pushdown-capabilities | string-conversion-capability | A REGEXP_LIKE conjunct stays in Exasol while its sibling conjunct is pushed | `tests/e2e_capability_test.rs` | `e2e_regexp_like_conjunct_stays_in_exasol_while_sibling_pushes` | Pass |
+| pushdown-capabilities | string-conversion-capability | Regexp scalar function capabilities remain absent | `capabilities_tests.rs` | `reports_audited_capability_set` | Pass |
+| pushdown-capabilities | string-conversion-capability | Regexp scalar functions are deliberately not translated | `tests/e2e_capability_test.rs` | `e2e_regexp_like_returns_native_rows` (result counts and sibling-conjunct pushdown assertions) | Pass |
 | vs-adapter | create-virtual-schema | Adapter reports its pushdown capabilities | `capabilities_tests.rs` | `capabilities_doc_lists_exactly_the_advertised_set`, `reports_audited_capability_set` | Pass |
 
 ## Notes
@@ -68,5 +67,4 @@
 - The new E2E tests were not run against the pre-fix `.so`. Their ability to detect the defect is based on the measurements in plan.md (defect: 10, 20 and a scan error; native: 0, 0 and 3).
 - The E2E run happened before the 7 review fixes. Those fixes only changed comments, and `cargo test --workspace`, clippy and fmt were rerun afterwards.
 - The E2E run used an isolated Docker project (`lhe-regexp`), because the stack already running did not match this tree's `docker-compose.yml`. The isolated project was torn down. The existing stack was left alone.
-- `specs/testing.md`, referenced by `AGENTS.md`, does not exist in this tree.
-- No GitHub issue exists for this defect. The deltas and plan still carry `(#TBD)`, and the implementing commit needs `Closes #<n>`.
+- The plan tracks this defect as #471, and the implementing commit uses `Closes #471`.
