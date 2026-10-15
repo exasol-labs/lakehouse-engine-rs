@@ -32,4 +32,4 @@ The scan evaluates pushed numeric expressions with Exasol's typing rules, so a p
 * *GIVEN* a pushed exact expression whose value exceeds 128 bits, or a projected value or `SUM` total that exceeds its declared `DECIMAL` precision
 * *WHEN* the scan evaluates it in a projection, a filter, a broadcast join, or an aggregate
 * *THEN* the query SHALL fail with a message that starts with `data exception - numeric value out of range`, as native Exasol's message does
-* *AND* the scan SHALL recognise the overflow by its type, including when the Parquet row filter flattens it to text
+* *AND* the overflow SHALL be recorded in the session's failure slot, so the message survives the Parquet row filter, which flattens errors to text

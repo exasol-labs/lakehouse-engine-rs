@@ -3,20 +3,19 @@
 //! it sees only operands of a division the pushdown synthesised, unlike `arrow_value_at`'s
 //! `is_nan()` guard, which cannot tell a computed non-finite from a stored one.
 
+use super::raised_failure::{RaisedFailure, raised_failure};
 use arrow::array::{Array, AsArray, Float64Array};
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Float64Type};
 use datafusion::error::DataFusionError;
-use datafusion::execution::FunctionRegistry;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
-use std::any::Any;
 use std::error::Error;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use vs_expression::CHECKED_FLOAT_DIV_FN;
 
 /// Arrow keeps the values buffer full-length behind the null mask; nothing reads this slot.
@@ -75,37 +74,6 @@ pub(super) fn find_checked_float_div_error(
     }
 }
 
-/// DataFusion's Parquet row filter flattens any predicate error into
-/// `ArrowError::ComputeError(format!("Error evaluating filter predicate: {e:?}"))`
-/// (`datafusion-datasource-parquet` 54.1, `row_filter.rs`), destroying the type on exactly the
-/// #370 route, so the failure is also recorded here as a typed value. Scoped to one session,
-/// i.e. one scan invocation.
-#[derive(Debug, Default)]
-struct RaisedFailure(OnceLock<CheckedFloatDivError>);
-
-impl RaisedFailure {
-    /// Partitions run concurrently but every failure names the same defect, so the first suffices.
-    fn record(&self, failure: CheckedFloatDivError) {
-        let _ = self.0.set(failure);
-    }
-
-    fn recorded(&self) -> Option<CheckedFloatDivError> {
-        self.0.get().cloned()
-    }
-}
-
-/// Reached by type through the session's function registry; see [`RaisedFailure`].
-pub(super) fn session_checked_float_div_failure(
-    session: &SessionContext,
-) -> Option<CheckedFloatDivError> {
-    let registered = session.state().udf(CHECKED_FLOAT_DIV_FN).ok()?;
-    let implementation: &dyn Any = registered.inner().as_ref();
-    implementation
-        .downcast_ref::<CheckedFloatDivUdf>()?
-        .raised
-        .recorded()
-}
-
 /// `Signature::any` with a self-cast to `Float64`, because pushed operand types vary (an Iceberg
 /// `long` arrives as `Decimal128(20, 0)` against an `Int64` literal). `Immutable` keeps it
 /// eligible for the Parquet row filter, where a guard conjunct evaluated first stops a guarded
@@ -113,16 +81,7 @@ pub(super) fn session_checked_float_div_failure(
 #[derive(Debug)]
 struct CheckedFloatDivUdf {
     signature: Signature,
-    raised: RaisedFailure,
-}
-
-impl CheckedFloatDivUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(2, Volatility::Immutable),
-            raised: RaisedFailure::default(),
-        }
-    }
+    raised: Arc<RaisedFailure>,
 }
 
 /// The recorded failure is session state, not identity, so it is excluded from plan comparison.
@@ -169,7 +128,7 @@ impl ScalarUDFImpl for CheckedFloatDivUdf {
         let nulls = NullBuffer::union(left.nulls(), right.nulls());
         let quotients =
             divide_checked(left.values(), right.values(), nulls.as_ref()).map_err(|failure| {
-                self.raised.record(failure.clone());
+                self.raised.record(failure.to_string());
                 DataFusionError::External(Box::new(failure))
             })?;
 
@@ -225,7 +184,10 @@ fn checked_quotient(numerator: f64, divisor: f64) -> Result<f64, CheckedFloatDiv
 /// Registered unconditionally once per session: every scan path splices the same rendered
 /// expressions, and a spec with no division is unaffected.
 pub(super) fn register_checked_float_div_udf(ctx: &SessionContext) {
-    ctx.register_udf(ScalarUDF::from(CheckedFloatDivUdf::new()));
+    ctx.register_udf(ScalarUDF::from(CheckedFloatDivUdf {
+        signature: Signature::any(2, Volatility::Immutable),
+        raised: raised_failure(ctx),
+    }));
 }
 
 #[cfg(test)]

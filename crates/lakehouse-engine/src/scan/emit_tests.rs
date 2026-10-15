@@ -786,7 +786,7 @@ fn a_relaxed_column_coerces_to_its_declared_exatype_without_a_relaxation_branch(
 }
 
 #[tokio::test]
-async fn reframe_checked_division_names_a_failure_the_error_chain_lost() {
+async fn reframe_raised_failure_names_a_failure_the_error_chain_lost() {
     let session = session_with_a_raised_division().await;
 
     // What the row-filter route produces: only the Debug rendering survives in a string.
@@ -806,7 +806,7 @@ async fn reframe_checked_division_names_a_failure_the_error_chain_lost() {
          storage failure to the classifier, else this test proves nothing: {flattened}"
     );
 
-    let reframed = reframe_checked_division(&session, flattened, &[]).to_string();
+    let reframed = reframe_raised_failure(&session, flattened, &[]).to_string();
 
     assert!(
         reframed.starts_with("data exception - division by zero"),
@@ -827,14 +827,14 @@ async fn reframe_checked_division_names_a_failure_the_error_chain_lost() {
 }
 
 #[tokio::test]
-async fn reframe_checked_division_replaces_a_generic_storage_failure_with_the_division() {
+async fn reframe_raised_failure_replaces_a_generic_storage_failure_with_the_division() {
     let session = session_with_a_raised_division().await;
     let storage = classify_scan_error(
         DataFusionError::Execution("S3 read failed: 403".into()),
         &[],
     );
 
-    let reframed = reframe_checked_division(&session, storage, &[]).to_string();
+    let reframed = reframe_raised_failure(&session, storage, &[]).to_string();
 
     assert!(
         reframed.contains("division by zero"),
@@ -856,7 +856,7 @@ async fn reframe_checked_division_replaces_a_generic_storage_failure_with_the_di
 }
 
 #[test]
-fn reframe_checked_division_leaves_an_unrelated_failure_untouched() {
+fn reframe_raised_failure_leaves_an_unrelated_failure_untouched() {
     let session = SessionContext::new();
     register_checked_float_div_udf(&session);
     let storage = classify_scan_error(
@@ -864,7 +864,7 @@ fn reframe_checked_division_leaves_an_unrelated_failure_untouched() {
         &[],
     );
 
-    let reframed = reframe_checked_division(&session, storage, &[]).to_string();
+    let reframed = reframe_raised_failure(&session, storage, &[]).to_string();
 
     assert!(
         reframed.contains("assigned data could not be read"),
@@ -876,7 +876,7 @@ fn reframe_checked_division_leaves_an_unrelated_failure_untouched() {
     );
 }
 
-/// The only state in which `reframe_checked_division` does anything.
+/// The only state in which `reframe_raised_failure` does anything.
 async fn session_with_a_raised_division() -> SessionContext {
     let session = SessionContext::new();
     register_checked_float_div_udf(&session);
@@ -894,14 +894,14 @@ async fn session_with_a_raised_division() -> SessionContext {
 }
 
 #[tokio::test]
-async fn reframe_checked_division_keeps_a_concurrent_memory_exhaustion_failure_visible() {
+async fn reframe_raised_failure_keeps_a_concurrent_memory_exhaustion_failure_visible() {
     let session = session_with_a_raised_division().await;
     let exhausted = classify_scan_error(
         DataFusionError::ResourcesExhausted("pool of 100 bytes".into()),
         &[],
     );
 
-    let reframed = reframe_checked_division(&session, exhausted, &[]).to_string();
+    let reframed = reframe_raised_failure(&session, exhausted, &[]).to_string();
 
     assert!(
         reframed.starts_with("data exception - division by zero"),
@@ -925,7 +925,7 @@ async fn reframe_checked_division_keeps_a_concurrent_memory_exhaustion_failure_v
 }
 
 #[tokio::test]
-async fn reframe_checked_division_redacts_secrets_from_the_appended_failure() {
+async fn reframe_raised_failure_redacts_secrets_from_the_appended_failure() {
     const DIMENSION_SIDE_TOKEN: &str = "tw1l1ght-vended-token";
     let session = session_with_a_raised_division().await;
     // Classified without the token, as a fact-side-only secret set upstream leaves it.
@@ -941,8 +941,7 @@ async fn reframe_checked_division_redacts_secrets_from_the_appended_failure() {
          place, else this test proves nothing: {exhausted}"
     );
 
-    let reframed =
-        reframe_checked_division(&session, exhausted, &[DIMENSION_SIDE_TOKEN]).to_string();
+    let reframed = reframe_raised_failure(&session, exhausted, &[DIMENSION_SIDE_TOKEN]).to_string();
 
     assert!(
         !reframed.contains(DIMENSION_SIDE_TOKEN),

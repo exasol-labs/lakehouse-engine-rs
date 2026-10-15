@@ -1,9 +1,8 @@
-use crate::scan::checked_div::{
-    CheckedFloatDivError, find_checked_float_div_error, session_checked_float_div_failure,
-};
+use crate::scan::checked_div::{CheckedFloatDivError, find_checked_float_div_error};
 use crate::scan::convert::check_date32_in_exasol_range;
 use crate::scan::diagnostics::PhaseTimers;
-use crate::scan::exasol_numeric::{NumericOverflow, find_numeric_overflow};
+use crate::scan::exasol_numeric::numeric_overflow;
+use crate::scan::raised_failure::session_raised_failure;
 use crate::types::mapping::TimestampPrecision;
 use arrow::array::ArrayRef;
 use arrow::compute::CastOptions;
@@ -178,13 +177,10 @@ pub(crate) fn coerce_column(
                 DataType::Decimal128(..) | DataType::Decimal256(..)
             )
         {
-            return UdfError::User(
-                NumericOverflow(format!(
-                    "output column {} exceeds DECIMAL({p},{s}): {e}",
-                    declared.name
-                ))
-                .to_string(),
-            );
+            return UdfError::User(numeric_overflow(format!(
+                "output column {} exceeds DECIMAL({p},{s}): {e}",
+                declared.name
+            )));
         }
         UdfError::User(format!(
             "emit failed: output column {} could not be coerced from {:?} to {target:?}: {e}",
@@ -240,9 +236,6 @@ pub fn classify_scan_error(e: DataFusionError, secrets: &[&str]) -> UdfError {
     if let Some(division) = find_checked_float_div_error(&e) {
         return checked_division_error(division, secrets);
     }
-    if let Some(overflow) = find_numeric_overflow(&e) {
-        return UdfError::User(overflow.to_string());
-    }
     match e.find_root() {
         DataFusionError::ResourcesExhausted(msg) => resources_exhausted_error(msg, secrets),
         _ => redact_storage_error(e.to_string(), secrets),
@@ -258,40 +251,39 @@ fn checked_division_error(division: &CheckedFloatDivError, secrets: &[&str]) -> 
 
 const CONCURRENT_FAILURE_PREAMBLE: &str = "the scan also surfaced:";
 
-/// Read back by [`reframe_checked_division`]. Unlike DataFusion's wording, this text is our own
+/// Read back by [`reframe_raised_failure`]. Unlike DataFusion's wording, this text is our own
 /// and one constant owns it for writer and reader, so matching on it is safe.
 const MEMORY_EXHAUSTED_LABEL: &str = "scan failed: memory exhausted (ResourcesExhausted):";
 
-/// The type of a division raised inside a pushed Parquet row filter does not survive to
-/// [`classify_scan_error`] (DataFusion flattens it to text, issue #370's route), so the session's
-/// typed record is consulted once per scan at the dispatcher all run paths funnel through.
+/// A checked division or numeric overflow raised inside a pushed Parquet row filter does not
+/// survive to [`classify_scan_error`] (issue #370's route), so the session's record is consulted
+/// once per scan at the dispatcher all run paths funnel through.
 ///
-/// A recorded division REPLACES the surfaced failure, except memory exhaustion, which it leads:
-/// that is the only failure separable from the flattened division without matching DataFusion's
-/// wording. Accepted limitation: an unrelated storage failure in another partition of a scan
-/// that also divided by zero is masked.
+/// A recorded failure REPLACES the surfaced one, except memory exhaustion, which it leads: that
+/// is the only failure separable from the flattened one without matching DataFusion's wording.
+/// Accepted limitation: an unrelated storage failure in another partition of the scan is masked.
 ///
 /// Redacted here because `raw_scan` and `partial_agg` classify with the fact side's secrets
 /// alone, while this dispatcher holds the union covering a join's dimension side.
-pub fn reframe_checked_division(
+pub fn reframe_raised_failure(
     session: &SessionContext,
     error: UdfError,
     secrets: &[&str],
 ) -> UdfError {
-    let Some(recorded) = session_checked_float_div_failure(session) else {
+    let Some(recorded) = session_raised_failure(session) else {
         return error;
     };
-    let division = checked_division_error(&recorded, secrets);
+    let raised = redact_credentials(&redact_secret_values(&recorded, secrets));
     let surfaced = error.to_string();
     if !surfaced.contains(MEMORY_EXHAUSTED_LABEL) {
-        return division;
+        return UdfError::User(raised);
     }
     let safe = redact_credentials(&redact_secret_values(&surfaced, secrets));
-    UdfError::User(format!("{division}; {CONCURRENT_FAILURE_PREAMBLE} {safe}"))
+    UdfError::User(format!("{raised}; {CONCURRENT_FAILURE_PREAMBLE} {safe}"))
 }
 
 /// Only the innermost `msg` is surfaced: a wrapping `.context()` may carry credential-bearing
-/// fragments. Opens with [`MEMORY_EXHAUSTED_LABEL`] for [`reframe_checked_division`].
+/// fragments. Opens with [`MEMORY_EXHAUSTED_LABEL`] for [`reframe_raised_failure`].
 fn resources_exhausted_error(msg: &str, secrets: &[&str]) -> UdfError {
     let safe = redact_credentials(&redact_secret_values(msg, secrets));
     UdfError::User(format!("{MEMORY_EXHAUSTED_LABEL} {safe}"))

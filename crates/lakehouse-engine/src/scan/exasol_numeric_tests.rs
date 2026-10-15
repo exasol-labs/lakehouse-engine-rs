@@ -1,4 +1,5 @@
 use super::*;
+use crate::scan::raised_failure::session_raised_failure;
 use crate::scan::scan_session_context;
 use arrow::array::{Decimal128Array, Float64Array, Int64Array, RecordBatch};
 use arrow::buffer::NullBuffer;
@@ -120,7 +121,7 @@ async fn double_meets_decimal_in_double() {
 #[tokio::test]
 async fn overflow_past_128_bits_raises_and_is_recorded_on_the_session() {
     let ctx = session();
-    assert_eq!(session_numeric_overflow(&ctx), None);
+    assert_eq!(session_raised_failure(&ctx), None);
     assert_eq!(
         rows(
             &ctx,
@@ -136,17 +137,15 @@ async fn overflow_past_128_bits_raises_and_is_recorded_on_the_session() {
         "a NULL slot's value must not raise"
     );
 
-    let error = ctx
-        .sql("SELECT l * l * 100 FROM t")
+    ctx.sql("SELECT l * l * 100 FROM t")
         .await
         .unwrap()
         .collect()
         .await
         .expect_err("BIG * BIG * 100 exceeds 128 bits");
 
-    assert!(find_numeric_overflow(&error).is_some(), "{error}");
-    assert!(session_numeric_overflow(&ctx).is_some_and(|o| {
-        o.to_string()
-            .starts_with("data exception - numeric value out of range")
-    }),);
+    assert!(
+        session_raised_failure(&ctx)
+            .is_some_and(|o| o.starts_with("data exception - numeric value out of range"))
+    );
 }

@@ -1,11 +1,11 @@
 //! Exasol's numeric typing ahead of DataFusion's `TypeCoercion` (#475): DOUBLE wins over DECIMAL,
 //! and exact `+`, `-`, `*` and `SUM` overflow at Exasol's 128 bits instead of wrapping.
 
-use std::any::Any;
-use std::error::Error;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+
+use super::raised_failure::RaisedFailure;
 
 use arrow::array::{Array, ArrayRef, AsArray, Decimal128Array, Int64Array};
 use arrow::compute::cast;
@@ -16,7 +16,6 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DFSchema, Result, ScalarValue, exec_err, plan_err};
 use datafusion::error::DataFusionError;
-use datafusion::execution::FunctionRegistry;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::expr::{Case, InList, ScalarFunction};
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
@@ -33,37 +32,8 @@ const EXASOL_MAX_SCALE: i8 = 36;
 /// to this argument precision.
 const DECIMAL128_SUM_MAX_PRECISION: u8 = 28;
 
-/// Recognised by type through [`find_numeric_overflow`] and [`session_numeric_overflow`].
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct NumericOverflow(pub(crate) String);
-
-impl fmt::Display for NumericOverflow {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "data exception - numeric value out of range: {}", self.0)
-    }
-}
-
-impl Error for NumericOverflow {}
-
-pub(crate) fn find_numeric_overflow(error: &DataFusionError) -> Option<&NumericOverflow> {
-    let mut level: &(dyn Error + 'static) = error;
-    loop {
-        if let Some(found) = level.downcast_ref::<NumericOverflow>() {
-            return Some(found);
-        }
-        level = level.source()?;
-    }
-}
-
-/// The Parquet row filter flattens a predicate's error to text, so the kernels also record it.
-pub(crate) fn session_numeric_overflow(session: &SessionContext) -> Option<NumericOverflow> {
-    let registered = session.state().udf(ExactOp::Mul.name()).ok()?;
-    let implementation: &dyn Any = registered.inner().as_ref();
-    implementation
-        .downcast_ref::<ExactArithmeticUdf>()?
-        .raised
-        .get()
-        .cloned()
+pub(crate) fn numeric_overflow(detail: impl fmt::Display) -> String {
+    format!("data exception - numeric value out of range: {detail}")
 }
 
 #[derive(Debug)]
@@ -75,8 +45,7 @@ pub(crate) struct ExasolNumericTyping {
 }
 
 impl ExasolNumericTyping {
-    pub(crate) fn new() -> Self {
-        let raised = Arc::new(OnceLock::new());
+    pub(crate) fn new(raised: Arc<RaisedFailure>) -> Self {
         let udf = |op: ExactOp| {
             Arc::new(ScalarUDF::new_from_impl(ExactArithmeticUdf {
                 op,
@@ -384,7 +353,7 @@ impl ExactOp {
 struct ExactArithmeticUdf {
     op: ExactOp,
     signature: Signature,
-    raised: Arc<OnceLock<NumericOverflow>>,
+    raised: Arc<RaisedFailure>,
 }
 
 impl PartialEq for ExactArithmeticUdf {
@@ -442,9 +411,9 @@ impl ExactArithmeticUdf {
         })
         .map_err(|e| match e {
             ArrowError::ArithmeticOverflow(detail) => {
-                let overflow = NumericOverflow(detail);
-                let _ = self.raised.set(overflow.clone());
-                DataFusionError::External(Box::new(overflow))
+                let overflow = numeric_overflow(detail);
+                self.raised.record(overflow.clone());
+                DataFusionError::Execution(overflow)
             }
             other => other.into(),
         })

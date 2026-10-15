@@ -25,3 +25,28 @@ One constructor builds every scan session, and any planning that derives the sca
 
 - A DataFusion upgrade that changes the analyzer or its type coercion can break the rule. The native-parity E2E test detects it.
 - An exact expression costs up to 1.5 times its previous scan time on Parquet. Most shapes cost 1.0 to 1.25 times.
+
+## ADR: Scan functions record a user failure in one session-scoped slot
+
+**ID:** scan-functions-share-a-session-failure-slot
+**Plan:** fix-exasol-numeric-typing
+**Status:** Accepted
+**Supersedes:** checked-float-division-session-scoped-failure-recording
+
+### Context
+
+The checked division and the exact-arithmetic functions both raise user errors that the Parquet row filter flattens to text.
+
+### Decision
+
+`scan_session_context` adds one `RaisedFailure` slot to the session config as an extension. Each raising function records its first failure's message there. The scan dispatcher replaces a failed scan's error with the recorded message, or puts it before a memory exhaustion.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| One typed record per function, read through the function registry | Rejected: each raising function needs its own lookup and its own dispatcher step |
+
+### Consequences
+
+An unrelated storage failure in another partition of a scan that recorded a failure is masked, as before.

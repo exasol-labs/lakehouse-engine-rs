@@ -30,6 +30,7 @@ pub use sql_support::build_alias_items;
 
 mod checked_div;
 mod exasol_numeric;
+mod raised_failure;
 
 mod object_store;
 pub(crate) use self::object_store::{
@@ -108,11 +109,16 @@ pub fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, Str
 
 /// Any planning that derives the scan's result types must use this session too.
 pub fn scan_session_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> SessionContext {
-    let numeric_typing = Arc::new(exasol_numeric::ExasolNumericTyping::new());
+    let raised = Arc::new(raised_failure::RaisedFailure::default());
+    let numeric_typing = Arc::new(exasol_numeric::ExasolNumericTyping::new(raised.clone()));
     let mut rules = Analyzer::new().rules;
     rules.insert(0, numeric_typing.clone());
     let state = SessionStateBuilder::new()
-        .with_config(config.set_bool("datafusion.sql_parser.parse_float_as_decimal", true))
+        .with_config(
+            config
+                .set_bool("datafusion.sql_parser.parse_float_as_decimal", true)
+                .with_extension(raised),
+        )
         .with_runtime_env(runtime)
         .with_default_features()
         .with_analyzer_rules(rules)
@@ -228,16 +234,9 @@ async fn run_scan_dispatch(
         };
         emit_footer_refetch_diagnostic(ctx, session_ctx, coverage);
     }
-    // A checked division or numeric overflow raised inside a pushed filter loses its type at the
-    // Parquet row-filter boundary; every run path funnels through here, and the session holds it.
-    result
-        .map_err(|e| emit::reframe_checked_division(session_ctx, e, &storage.all_secret_values()))
-        .map_err(
-            |e| match exasol_numeric::session_numeric_overflow(session_ctx) {
-                Some(overflow) => UdfError::User(overflow.to_string()),
-                None => e,
-            },
-        )
+    // A failure raised inside a pushed filter loses its type at the Parquet row-filter boundary;
+    // every run path funnels through here, and the session holds it.
+    result.map_err(|e| emit::reframe_raised_failure(session_ctx, e, &storage.all_secret_values()))
 }
 
 /// A no-op at the production `info` level; a telemetry failure never surfaces as a scan error.
