@@ -2428,7 +2428,7 @@ fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
          back to the raw-row wrapper, got:\n{pushed2}"
     );
     assert!(
-        pushed2.contains("ORDER BY SUM(\"PARTIAL_sum_"),
+        pushed2.contains("ORDER BY CAST(SUM(\"PARTIAL_sum_"),
         "the merge ORDER BY must reference the merged partial column, not a \
          base column, got:\n{pushed2}"
     );
@@ -3403,6 +3403,17 @@ fn over_length_char_group_key_raises_truncation_error_like_native() {
         "expected Exasol's UDF-emit truncation error (sqlCode 22002, \"string \
          data, right truncation\"), got sqlCode={sql_code:?} message={message:?}: {resp}"
     );
+
+    let unprojected = format!(
+        "SELECT COUNT(*) c FROM {} GROUP BY CAST({CHAR_PAD_COL} AS CHAR(20))",
+        vs_char_pad_table()
+    );
+    let resp = conn.try_execute(&unprojected);
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "an unprojected over-length CHAR(20) key must fail like native: {resp}"
+    );
 }
 
 #[test]
@@ -3492,5 +3503,198 @@ fn e2e_float_div_decimal_over_decimal_matches_native_oracle() {
         "pushed-down C_DECIMAL_A/C_DECIMAL_B at id=6 must match the native \
          oracle {oracle_value} (decimal/decimal FLOAT_DIV must not truncate \
          to scale 6), got {vs_value}"
+    );
+}
+
+const SPLIT_ORACLE_SCHEMA: &str = "SPLIT_AGG_ORACLE";
+
+/// `None` leaves the path unasserted, for a shape whose routing Exasol decides.
+const SPLIT_AGGREGATE_CASES: &[(&str, Option<bool>)] = &[
+    ("SELECT LENGTH(MAX(UPPER(C_VARCHAR))) FROM {T}", Some(false)),
+    (
+        "SELECT C_BOOL, LENGTH(MAX(UPPER(C_VARCHAR))) FROM {T} GROUP BY C_BOOL",
+        Some(false),
+    ),
+    ("SELECT MAX(UPPER(C_VARCHAR)) || '!' FROM {T}", Some(false)),
+    (
+        "SELECT MIN(LOWER(C_VARCHAR)) || MAX(UPPER(C_VARCHAR)) FROM {T}",
+        Some(false),
+    ),
+    (
+        "SELECT CASE WHEN MAX(CASE WHEN C_VARCHAR = 'aa' THEN 'Y' ELSE 'N' END) = 'Y' \
+         THEN 1 ELSE 0 END FROM {T}",
+        Some(false),
+    ),
+    (
+        "SELECT YEAR(MAX(DATE_TRUNC('month', C_DATE))) FROM {T}",
+        Some(false),
+    ),
+    (
+        "SELECT C_BOOL, YEAR(MAX(DATE_TRUNC('month', C_DATE))) FROM {T} GROUP BY C_BOOL",
+        Some(false),
+    ),
+    (
+        "SELECT ROUND(SUM(C_DECIMAL_B * C_DECIMAL_B), 8) FROM {T}",
+        Some(false),
+    ),
+    (
+        "SELECT C_BOOL, ROUND(SUM(C_DECIMAL_B * C_DECIMAL_B), 8) FROM {T} GROUP BY C_BOOL",
+        Some(false),
+    ),
+    (
+        "SELECT MAX(C_DOUBLE * 2) + 1, SUM(C_DOUBLE * 3) + 1 FROM {T}",
+        Some(false),
+    ),
+    (
+        "SELECT 'X', LENGTH(MAX(UPPER(C_VARCHAR))) FROM {T}",
+        Some(false),
+    ),
+    (
+        "SELECT MONTH(MIN(CAST(C_DATE AS TIMESTAMP))) FROM {T}",
+        Some(true),
+    ),
+    (
+        "SELECT MAX(UPPER(C_VARCHAR)), LENGTH(MAX(UPPER(C_VARCHAR))) FROM {T}",
+        Some(true),
+    ),
+    (
+        "SELECT LENGTH(MAX(C_VARCHAR)), YEAR(MAX(C_DATE)) FROM {T}",
+        Some(true),
+    ),
+    ("SELECT AVG(LENGTH(C_VARCHAR)) FROM {T}", Some(true)),
+    ("SELECT COUNT(UPPER(C_VARCHAR)) * 2 FROM {T}", Some(true)),
+    ("SELECT SUM(C_DECIMAL_B) / 2 FROM {T}", Some(true)),
+    (
+        "SELECT C_BOOL, SUM(C_DECIMAL_B) / 2 FROM {T} GROUP BY C_BOOL",
+        Some(true),
+    ),
+    (
+        "SELECT C_DECIMAL_A, COUNT(*) FROM {T} GROUP BY C_DECIMAL_A ORDER BY C_DECIMAL_A",
+        Some(true),
+    ),
+    (
+        "SELECT C_DOUBLE, COUNT(*) FROM {T} GROUP BY C_DOUBLE ORDER BY C_DOUBLE DESC",
+        Some(true),
+    ),
+    (
+        "SELECT (C_DOUBLE - 2) * 0, COUNT(*) FROM {T} GROUP BY (C_DOUBLE - 2) * 0",
+        Some(true),
+    ),
+    (
+        "SELECT C_VARCHAR, COUNT(*) FROM {T} GROUP BY C_VARCHAR HAVING C_VARCHAR > 'b'",
+        None,
+    ),
+    (
+        "SELECT C_DATE, COUNT(*) FROM {T} GROUP BY C_DATE ORDER BY C_DATE",
+        Some(true),
+    ),
+    (
+        "SELECT C_TS, COUNT(*) FROM {T} GROUP BY C_TS ORDER BY 1 DESC",
+        Some(true),
+    ),
+    (
+        "SELECT C_BOOL, COUNT(*) FROM {T} GROUP BY C_BOOL HAVING COUNT(*) > 1",
+        Some(true),
+    ),
+    (
+        "SELECT C_BOOL, C_DATE, SUM(C_QTY) FROM {T} GROUP BY C_BOOL, C_DATE ORDER BY 2, 1",
+        Some(true),
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY C_DOUBLE ORDER BY C_DOUBLE",
+        Some(true),
+    ),
+    (
+        "SELECT UPPER(C_VARCHAR), COUNT(*) FROM {T} GROUP BY UPPER(C_VARCHAR)",
+        Some(true),
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY UPPER(C_VARCHAR)",
+        Some(false),
+    ),
+    (
+        "SELECT CAST(VAL AS CHAR(4)), COUNT(*) FROM {C} \
+         WHERE VAL <> 'over-length-value-abcdefg' GROUP BY CAST(VAL AS CHAR(4))",
+        Some(true),
+    ),
+    (
+        "SELECT COUNT(*) FROM {C} \
+         WHERE VAL <> 'over-length-value-abcdefg' GROUP BY CAST(VAL AS CHAR(4))",
+        Some(true),
+    ),
+    (
+        "SELECT CAST(VAL AS CHAR(4)) FROM {C} WHERE VAL = 'ab   '",
+        None,
+    ),
+];
+
+fn split_aggregate_mismatch(
+    conn: &mut ExaConn,
+    query: &str,
+    split: Option<bool>,
+) -> Option<String> {
+    let on = |typed: &str, chars: &str| query.replace("{T}", typed).replace("{C}", chars);
+    let vs_query = on(&vs_typed_table(), &vs_char_pad_table());
+    let oracle_query = on(
+        &format!("{SPLIT_ORACLE_SCHEMA}.TYPED"),
+        &format!("{SPLIT_ORACLE_SCHEMA}.CHAR_PAD"),
+    );
+    let read = |conn: &mut ExaConn, sql: &str| {
+        let (types, mut rows) = typed_result(conn, sql);
+        if !sql.contains("ORDER BY") {
+            rows.sort();
+        }
+        (types, rows)
+    };
+    let actual = read(conn, &vs_query);
+    let expected = read(conn, &oracle_query);
+    if actual != expected {
+        return Some(format!(
+            "`{query}`: got {actual:?}, the oracle {expected:?}"
+        ));
+    }
+    let split = split?;
+    let plan = isolated_pushdown_statement(conn, &vs_query);
+    let holds = if split {
+        plan.contains("PARTIAL_")
+    } else {
+        plan.contains("AS \"LHS_T0\"") && !plan.contains("PARTIAL_")
+    };
+    (!holds).then(|| format!("`{query}` took the wrong path (split: {split}): {plan}"))
+}
+
+/// Scenario: A nested aggregate over an expression declines the split
+/// Scenario: A nested aggregate takes the result type Exasol gives it
+/// Scenario: A merged aggregate under a scalar keeps its native type
+/// Scenario: A group key travels with its exact type
+/// Scenario: An unprojected bare-column group key takes its column type
+/// Scenario: An unprojected group key without an exact type declines the split
+/// Scenario: A CHAR(n) emit drops trailing blanks beyond n
+#[test]
+fn e2e_split_aggregate_columns_match_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    conn.execute(&format!(
+        "CREATE SCHEMA IF NOT EXISTS {SPLIT_ORACLE_SCHEMA}"
+    ));
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {SPLIT_ORACLE_SCHEMA}.TYPED AS SELECT * FROM {}",
+        vs_typed_table()
+    ));
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {SPLIT_ORACLE_SCHEMA}.CHAR_PAD AS SELECT * FROM {}",
+        vs_char_pad_table()
+    ));
+
+    let failures: Vec<String> = SPLIT_AGGREGATE_CASES
+        .iter()
+        .filter_map(|(query, split)| split_aggregate_mismatch(&mut conn, query, *split))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} split-aggregate cases failed:\n{}",
+        failures.len(),
+        SPLIT_AGGREGATE_CASES.len(),
+        failures.join("\n")
     );
 }

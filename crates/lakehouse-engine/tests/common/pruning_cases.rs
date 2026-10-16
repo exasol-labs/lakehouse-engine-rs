@@ -2,7 +2,7 @@
 //! binary provisions its format's copy of the fixture; these checks are shared by every format.
 
 use super::e2e_harness::{
-    SCAN_SCRIPT_NAME, isolated_pushdown_statement, parse_int, value_to_string,
+    SCAN_SCRIPT_NAME, isolated_pushdown_statement, parse_int, typed_result, value_to_string,
 };
 use super::exasol_ws::ExaConn;
 use super::pruning_fixture::{
@@ -377,6 +377,12 @@ const SINGLE_GROUP_SELECTS: &[&str] = &[
     "STDDEV(ID * 2)",
     "COUNT(*), STDDEV(ID * 2)",
     "1",
+    "LENGTH(MAX(UPPER(P)))",
+    "MAX(UPPER(P)) || '!'",
+    "YEAR(MAX(DATE_TRUNC('month', TS)))",
+    "MONTH(MIN(CAST(TS AS DATE)))",
+    "SUM(K) / 2",
+    "LENGTH(MAX(P)), COUNT(*)",
 ];
 
 const JOIN_SELECTS: &[&str] = &["COUNT(*), 'X'", "SUM(B.S)"];
@@ -398,22 +404,7 @@ impl Format {
 }
 
 fn typed_rows(conn: &mut ExaConn, sql: &str) -> (Vec<serde_json::Value>, Vec<Vec<String>>) {
-    let resp = conn.execute(sql);
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let types = result_set["columns"]
-        .as_array()
-        .map(|columns| columns.iter().map(|c| c["dataType"].clone()).collect())
-        .unwrap_or_default();
-    let columns = conn.fetch_result_columns(result_set);
-    let row_count = columns.first().map_or(0, Vec::len);
-    let mut rows: Vec<Vec<String>> = (0..row_count)
-        .map(|row| {
-            columns
-                .iter()
-                .map(|col| value_to_string(&col[row]))
-                .collect()
-        })
-        .collect();
+    let (types, mut rows) = typed_result(conn, sql);
     rows.sort();
     (types, rows)
 }
@@ -442,12 +433,18 @@ const SINGLE_GROUP_SHAPES: &[(&str, bool)] = &[
     ),
     ("SELECT 'X', COUNT(*) FROM {T} WHERE {F}", false),
     ("SELECT 1 FROM {T} WHERE {F} HAVING COUNT(*) > 0", false),
+    ("SELECT LENGTH(MAX(UPPER(P))) FROM {T} WHERE {F}", false),
+    (
+        "SELECT MONTH(MIN(CAST(TS AS DATE))) FROM {T} WHERE {F}",
+        true,
+    ),
+    ("SELECT SUM(K) / 2 FROM {T} WHERE {F}", true),
 ];
 
 fn shape_mismatch(conn: &mut ExaConn, query: &str, format: Format, split: bool) -> Option<String> {
     let plan = isolated_pushdown_statement(conn, &query.replace("{T}", &format.table()));
     let holds = if split {
-        plan.contains("PARTIAL_") && plan.contains(" HAVING ")
+        plan.contains("PARTIAL_") && (!query.contains(" HAVING ") || plan.contains(" HAVING "))
     } else {
         plan.contains(&format!("AS \"{OUTER_WHERE_ALIAS}\"")) && !plan.contains("PARTIAL_")
     };
@@ -491,6 +488,61 @@ pub fn assert_single_group_aggregates_match_oracle(conn: &mut ExaConn, format: F
     assert!(
         failures.is_empty(),
         "{} single-group queries failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// `{H}` takes each of `GROUPED_HAVINGS`.
+const GROUPED_SHAPES: &[(&str, bool)] = &[
+    ("SELECT P, COUNT(*) FROM {T} WHERE {F} GROUP BY P{H}", true),
+    (
+        "SELECT K, MAX(P) || '!' FROM {T} WHERE {F} GROUP BY K{H}",
+        true,
+    ),
+    (
+        "SELECT K, MAX(UPPER(P)) || '!' FROM {T} WHERE {F} GROUP BY K{H}",
+        false,
+    ),
+    (
+        "SELECT K, LENGTH(MAX(UPPER(P))) FROM {T} WHERE {F} GROUP BY K{H}",
+        false,
+    ),
+    (
+        "SELECT P, SUM(K) / 2 FROM {T} WHERE {F} GROUP BY P{H}",
+        true,
+    ),
+    ("SELECT COUNT(*) FROM {T} WHERE {F} GROUP BY K{H}", true),
+    (
+        "SELECT K, X, COUNT(*) FROM {T} WHERE {F} GROUP BY K, X{H}",
+        true,
+    ),
+];
+
+const GROUPED_HAVINGS: &[&str] = &["", " HAVING COUNT(*) > 0"];
+
+pub fn assert_grouped_aggregates_match_oracle(conn: &mut ExaConn, format: Format) {
+    let pruned = format.prunes_every_file().iter().map(|f| (*f, true));
+    let scanned = [(NO_ROW_SCANNED, false), (ROWS_SCANNED, false)];
+    let mut failures = Vec::new();
+    for (query, split) in GROUPED_SHAPES {
+        let query = query.replace("{F}", "K IS NOT NULL").replace("{H}", "");
+        failures.extend(shape_mismatch(conn, &query, format, *split));
+    }
+    for (filter, pruned) in pruned.chain(scanned) {
+        for (query, _) in GROUPED_SHAPES {
+            for having in GROUPED_HAVINGS {
+                let query = query.replace("{F}", filter).replace("{H}", having);
+                if having.is_empty() {
+                    failures.extend(path_mismatch(conn, &query, format, pruned));
+                }
+                failures.extend(oracle_mismatch(conn, &query, format));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} grouped queries failed:\n{}",
         failures.len(),
         failures.join("\n")
     );

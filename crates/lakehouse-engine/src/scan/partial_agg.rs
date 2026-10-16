@@ -87,9 +87,8 @@ pub(super) async fn run_partial_aggregate(
     Ok(())
 }
 
-/// Group keys are emitted as `Value::String`, since the adapter declares every GK column
-/// `VARCHAR(2000000)`. An empty shard emits zero rows, not a null fallback row: the outer
-/// wrapper re-groups partials from all shards.
+/// An empty shard emits zero rows, not a null fallback row: the outer wrapper re-groups
+/// partials from all shards.
 async fn run_grouped_partial_aggregate(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
@@ -127,27 +126,17 @@ async fn run_grouped_partial_aggregate(
         .await
         .map_err(|e| classify_scan_error(e, &secrets))?;
 
-    let n_group_keys = group_keys.len();
     let declared = declared_output_columns(ctx)?;
 
     while let Some(result) = stream.next().await {
         let batch = result.map_err(|e| classify_scan_error(e, &secrets))?;
-        // Group keys pass through uncoerced so their merge identity is unchanged.
-        let columns = coerce_partial_agg_columns(&batch, &declared, n_group_keys)?;
+        let columns = coerce_partial_agg_columns(&batch, &declared)?;
 
         for row_idx in 0..batch.num_rows() {
-            let mut row_values: Vec<Value> = Vec::with_capacity(columns.len());
-
-            for column in columns.iter().take(n_group_keys) {
-                let raw = arrow_value_at(column.as_ref(), row_idx)?;
-                let gk_str = value_to_gk_string(raw);
-                row_values.push(gk_str);
-            }
-
-            for column in columns.iter().skip(n_group_keys) {
-                row_values.push(arrow_value_at(column.as_ref(), row_idx)?);
-            }
-
+            let row_values = columns
+                .iter()
+                .map(|column| arrow_value_at(column.as_ref(), row_idx))
+                .collect::<Result<Vec<Value>, UdfError>>()?;
             ctx.emit(row_values)?;
         }
         // Never hold two batches at once.
@@ -191,21 +180,6 @@ pub fn build_grouped_partial_agg_sql(
     sql.push_str(&group_keys.join(", "));
 
     sql
-}
-
-/// NULL group keys stay NULL so the outer wrapper groups them together.
-fn value_to_gk_string(v: Value) -> Value {
-    match v {
-        Value::Null => Value::Null,
-        Value::String(s) => Value::String(s),
-        Value::Bool(b) => Value::String(if b { "true" } else { "false" }.to_string()),
-        Value::Int32(n) => Value::String(n.to_string()),
-        Value::Int64(n) => Value::String(n.to_string()),
-        Value::Double(f) => Value::String(f.to_string()),
-        Value::Numeric(d) => Value::String(d.to_string()),
-        Value::Date(nd) => Value::String(nd.to_string()),
-        Value::Timestamp(ndt) => Value::String(ndt.to_string()),
-    }
 }
 
 /// A counter column contributes `0` (the shard counted none) and a value column NULL. The order
@@ -339,7 +313,7 @@ fn partial_row_from_batch(
     batch: &arrow::record_batch::RecordBatch,
     declared: &[ColumnInfo],
 ) -> Result<Vec<Value>, UdfError> {
-    let columns = coerce_partial_agg_columns(batch, declared, 0)?;
+    let columns = coerce_partial_agg_columns(batch, declared)?;
     let mut row: Vec<Value> = Vec::with_capacity(columns.len());
     let mut col = 0usize;
     for plan in aggregates {
@@ -352,27 +326,18 @@ fn partial_row_from_batch(
     Ok(row)
 }
 
-/// Columns before `first_agg_column` (grouped-path keys) are returned uncoerced: an Arrow cast
-/// to `Utf8` formats differently from [`value_to_gk_string`] and would change a group's merge
-/// identity across shards.
 fn coerce_partial_agg_columns(
     batch: &arrow::record_batch::RecordBatch,
     declared: &[ColumnInfo],
-    first_agg_column: usize,
 ) -> Result<Vec<ArrayRef>, UdfError> {
     check_declared_arity(declared, batch.num_columns())?;
     let columns: Vec<ArrayRef> = batch
         .columns()
         .iter()
         .zip(declared)
-        .enumerate()
-        .map(|(idx, (column, declared))| {
-            if idx < first_agg_column {
-                Ok(column.clone())
-            } else {
-                let target = target_arrow_type(declared)?;
-                coerce_column(column, declared, &target)
-            }
+        .map(|(column, declared)| {
+            let target = target_arrow_type(declared)?;
+            coerce_column(column, declared, &target)
         })
         .collect::<Result<_, UdfError>>()?;
     check_emitted_dates_in_range(&columns, declared)?;

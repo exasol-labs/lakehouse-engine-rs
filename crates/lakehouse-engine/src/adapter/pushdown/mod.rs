@@ -49,16 +49,13 @@ use topn::{detect_topn, parse_order_by_keys};
 
 mod single_group_agg;
 pub use single_group_agg::{detect_aggregates, ordinary_plans};
-use single_group_agg::{
-    has_distinct, is_lone_count_distinct, single_group_merge_select, single_group_plan_types,
-};
+use single_group_agg::{has_distinct, is_lone_count_distinct, single_group_merge_select};
 
 mod grouped_agg;
 pub use grouped_agg::{
     GroupedAggregateDetection, GroupedSelectItem, build_grouped_aggregate_scan_sql,
     detect_group_by_aggregates, validate_agg_col_types,
 };
-use grouped_agg::{blank_pad_char_group_keys, group_key_exasol_types};
 
 mod scalar_over_agg;
 
@@ -327,6 +324,7 @@ pub(crate) fn build_dispatch_sql(
     let single_group_merge = match classify_request_shape(pushdown_req, &col_types) {
         RequestShape::Grouped {
             detection,
+            group_key_types,
             having,
             order_by: grouped_order_by,
         } => {
@@ -339,16 +337,13 @@ pub(crate) fn build_dispatch_sql(
             // Safe to apply the outer LIMIT: the merge renders its own ORDER BY, and the
             // per-shard partial never carries a LIMIT (decision [4]).
             let grouped_limit = limit;
-            // A CHAR(n) key must be blank-padded to reproduce Exasol's CHAR grouping (#192).
-            // Only the spec copy is padded; ORDER BY matching uses the unpadded fragments.
-            let group_key_types = group_key_exasol_types(pushdown_req, &group_keys, &select_items);
             // Empty `projection` is inert on an aggregate dispatch (#145).
             let spec_template = ScanSpec {
                 common: CommonScanSpec {
                     filter,
                     limit: grouped_limit,
                     aggregates: Some(grouped_agg_plans.clone()),
-                    group_keys: Some(blank_pad_char_group_keys(&group_keys, &group_key_types)),
+                    group_keys: Some(group_keys.clone()),
                     ..base.clone()
                 },
                 files: vec![],
@@ -391,7 +386,11 @@ pub(crate) fn build_dispatch_sql(
                 None,
             );
         }
-        RequestShape::SingleGroupAgg { items, having } => {
+        RequestShape::SingleGroupAgg {
+            items,
+            plan_types,
+            having,
+        } => {
             // Lone bare-column COUNT(DISTINCT): the only fan-out shape. LIMIT goes only on
             // the outer wrapper; inside the fan-out it would truncate a shard's distinct set.
             // Exasol rejects OFFSET in an ungrouped aggregate (`42000`) before the adapter
@@ -439,7 +438,6 @@ pub(crate) fn build_dispatch_sql(
                 );
             }
             let plans = ordinary_plans(&items);
-            let plan_types = single_group_plan_types(pushdown_req, &items);
             // Assembled here because it depends on select-list classification.
             let merge_inputs =
                 single_group_merge_select(&items, &plans, &plan_types).and_then(|merge_select| {

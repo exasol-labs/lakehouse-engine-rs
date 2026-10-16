@@ -366,3 +366,17 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
          shape: {not_widened}"
     );
 }
+
+#[test]
+fn empty_grouped_sql_casts_a_varchar_scalar_over_aggregate() {
+    let select_items = vec![GroupedSelectItem::ScalarOverAggregate {
+        select_index: 0,
+        node: serde_json::json!({}),
+        declared_type: "VARCHAR(2000000)".to_string(),
+    }];
+    let resp = empty_grouped_sql(&[], &[], &select_items);
+    assert_eq!(
+        resp["sql"].as_str().unwrap(),
+        "SELECT CAST(NULL AS VARCHAR(2000000)) FROM DUAL WHERE 1=0"
+    );
+}

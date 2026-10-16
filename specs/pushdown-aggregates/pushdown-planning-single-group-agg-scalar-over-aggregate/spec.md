@@ -152,7 +152,7 @@ the scalar-wrapper shape.
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL classify that item as a scalar-over-aggregate single-group item rather than declining to a row scan, and SHALL decompose every `function_aggregate` nested inside it into the same partial `AggregatePlan` list it builds for a top-level aggregate, so each inner aggregate contributes the `PARTIAL_*` columns the scan UDF emits once per shard
 * *AND* the returned scan-driving SQL SHALL carry the aggregates in the scan spec's `aggregates` field and MUST NOT carry any `function_aggregate` inside the per-shard `EMITS` projection, so no shard computes a whole-table aggregate of its own
-* *AND* the outer merge SELECT SHALL render the scalar function applied to the MERGED form of each inner aggregate — `ROUND(SUM("PARTIAL_sum_0"), 2)` for `ROUND(SUM(x), 2)` — at that item's original `selectList` ordinal, and MUST NOT reference any source column of the base table
+* *AND* the outer merge SELECT SHALL render the scalar function applied to the MERGED form of each inner aggregate — `ROUND(CAST(SUM("PARTIAL_sum_0") AS <SUM result type>), 2)` for `ROUND(SUM(x), 2)` — at that item's original `selectList` ordinal, and MUST NOT reference any source column of the base table
 * *AND* the query SHALL return EXACTLY ONE row whose value equals the same expression evaluated over all rows on a single node — `SELECT ROUND(SUM(l_quantity), 2) FROM LINEITEM` returning `25304.00` against the seeded TPC-H fixture, never one partial row per shard (issue #194)
 * *AND* an `EXPLAIN VIRTUAL` of that query SHALL show a non-empty `"aggregates"` list and an empty `"projection"` in the emitted `LAKEHOUSE_SCAN` common spec, matching the shape a bare `SUM(l_quantity)` already emits
 
@@ -172,7 +172,7 @@ the scalar-wrapper shape.
 * *WHEN* the adapter decomposes the select list into partial `AggregatePlan`s
 * *THEN* the adapter SHALL collapse aggregates equal by kind and argument into a SINGLE plan slot and a single set of `PARTIAL_*` columns, through the same deduplicating fold the grouped planner uses, rather than emitting one plan per occurrence
 * *AND* the deduplication SHALL be treated as a correctness requirement rather than an optimization, because the merge rewrite resolves each nested aggregate to the FIRST structurally-equal plan slot: an un-deduplicated `[Count, Sum, Count]` list would bind the nested `COUNT(*)` to slot 0 while its `EMITS` column was declared at slot 2
-* *AND* a plan slot created by a NESTED-only occurrence SHALL take the default declared type, and a top-level occurrence of that same aggregate SHALL overwrite it with the authoritative `selectListDataTypes` entry at its own ordinal, regardless of which occurrence the select list places first
+* *AND* a plan slot created by a NESTED-only occurrence SHALL take the type `pushdown-aggregates/pushdown-planning-split-aggregate-types` derives, and a top-level occurrence of that same aggregate SHALL overwrite it with the authoritative `selectListDataTypes` entry at its own ordinal, regardless of which occurrence the select list places first
 * *AND* both the bare occurrence and the nested occurrence SHALL render to the merged expression over that one shared partial column, and the returned row SHALL equal the same select list evaluated over all rows on a single node
 
 ### Scenario: Scalar-over-aggregate and plain aggregate items interleave in select-list order with per-item declared types

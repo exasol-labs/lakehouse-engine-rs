@@ -1,5 +1,5 @@
 use super::*;
-use crate::scan::emit::declared_columns_test_support::{declared, numeric, varchar};
+use crate::scan::emit::declared_columns_test_support::{declared, numeric};
 use crate::scan::spec::AggKind;
 use arrow::array::{ArrayRef, Decimal128Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -885,30 +885,28 @@ fn partial_agg_fails_when_a_value_does_not_fit_its_declared_target() {
 }
 
 #[test]
-fn grouped_coercion_leaves_the_group_key_columns_untouched() {
-    use arrow::array::Date32Array;
-
+fn grouped_coercion_coerces_group_keys_to_their_declared_type() {
     let batch = one_row_batch(vec![
-        ("GK_0", Arc::new(Date32Array::from(vec![19_000i32]))),
+        ("GK_0", Arc::new(Int64Array::from(vec![7i64]))),
         ("PARTIAL_sum_0", decimal_column(vec![5], 10, 0)),
     ]);
     let columns = coerce_partial_agg_columns(
         &batch,
-        &declared(&[("GK_0", varchar()), ("PARTIAL_sum_0", ExaType::Int64)]),
-        1,
+        &declared(&[
+            (
+                "GK_0",
+                ExaType::Numeric {
+                    precision: 20,
+                    scale: 0,
+                },
+            ),
+            ("PARTIAL_sum_0", ExaType::Int64),
+        ]),
     )
     .expect("the grouped coercion must succeed");
 
-    assert_eq!(
-        columns[0].data_type(),
-        &DataType::Date32,
-        "the group-key column must keep its source type, uncoerced"
-    );
-    assert_eq!(
-        columns[1].data_type(),
-        &DataType::Int64,
-        "the partial-aggregate column must be coerced to its declared target"
-    );
+    assert_eq!(columns[0].data_type(), &DataType::Decimal128(20, 0));
+    assert_eq!(columns[1].data_type(), &DataType::Int64);
 }
 
 #[test]
