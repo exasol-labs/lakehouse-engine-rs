@@ -124,9 +124,9 @@ the sibling feature `sql-functions/vs-expression-translator-date-diff-fns`.
 
 * *GIVEN* a VS expression node of type `function_scalar` named `TO_DATE` or `TO_TIMESTAMP` with a string source argument and an optional format argument
 * *WHEN* `render_expression` processes the node
-* *THEN* `TO_DATE` SHALL render as `to_date(<args>)` and `TO_TIMESTAMP` SHALL render as `to_timestamp(<args>)` over the recursively rendered arguments
-* *AND* when a format argument is present it SHALL be forwarded as the corresponding DataFusion format argument
-* *AND* `render_expression_exasol` SHALL render `TO_DATE(<args>)` / `TO_TIMESTAMP(<args>)`, forwarding the format argument unchanged, so Exasol interprets the format model it sent rather than the translator forwarding an Exasol format string to a DataFusion parser
+* *THEN* with one argument `TO_DATE` SHALL render as `to_date(<source_sql>)` and `TO_TIMESTAMP` SHALL render as `to_timestamp(<source_sql>)`
+* *AND* with a format argument the DataFusion dialect SHALL translate the format or decline the node, as `sql-functions/vs-expression-translator-datetime-format` specifies, and MUST NOT forward an Exasol format model to a DataFusion parser
+* *AND* `render_expression_exasol` SHALL render `TO_DATE(<args>)` / `TO_TIMESTAMP(<args>)`, forwarding the format argument unchanged, so Exasol interprets the format model it sent
 
 ### Scenario: WEEK translates to the DataFusion date_part('week') ISO-8601 call
 
