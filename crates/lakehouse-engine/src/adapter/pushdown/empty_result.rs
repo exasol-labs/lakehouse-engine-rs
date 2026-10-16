@@ -4,10 +4,10 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 use super::GroupedSelectItem;
-use super::grouped_agg::{group_key_exasol_types, select_item_index};
+use super::grouped_agg::select_item_index;
 use super::joins::EmptyRelation;
 use super::request_shape::{RequestShape, classify_request_shape};
-use super::support::{cast_to_declared_type, emits_ident};
+use super::support::emits_ident;
 
 /// Routes through the same [`classify_request_shape`] as the non-empty dispatcher,
 /// so empty and non-empty positional column shapes cannot diverge.
@@ -23,18 +23,15 @@ pub(super) fn empty_result_sql(
     relation: &EmptyRelation,
 ) -> Result<Json, UdfError> {
     match classify_request_shape(pushdown_req, col_types) {
-        RequestShape::Grouped { detection, .. } => {
-            let group_key_types = group_key_exasol_types(
-                pushdown_req,
-                &detection.group_keys,
-                &detection.select_items,
-            );
-            Ok(empty_grouped_sql(
-                &group_key_types,
-                &detection.plan_types,
-                &detection.select_items,
-            ))
-        }
+        RequestShape::Grouped {
+            detection,
+            group_key_types,
+            ..
+        } => Ok(empty_grouped_sql(
+            &group_key_types,
+            &detection.plan_types,
+            &detection.select_items,
+        )),
         // Mirrors the non-empty wrapper's `selectList`-shaped output; a full-row shape
         // would trip Exasol's positional `04000` check.
         RequestShape::GroupByWrapper => Ok(empty_select_list_typed_sql(pushdown_req)
@@ -82,7 +79,7 @@ fn empty_grouped_sql(
                 .map(|ty| format!("CAST(NULL AS {ty})")),
             GroupedSelectItem::Constant { projection, .. } => Some(projection.clone()),
             GroupedSelectItem::ScalarOverAggregate { declared_type, .. } => {
-                Some(cast_to_declared_type("NULL", Some(declared_type)))
+                Some(format!("CAST(NULL AS {declared_type})"))
             }
         })
         .collect();

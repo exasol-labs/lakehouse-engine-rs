@@ -5,35 +5,52 @@ use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column
 use serde_json::Value as Json;
 use vs_expression::{render_expression, render_expression_exasol};
 
-use super::support::{cast_to_declared_type, quote_ident};
-
-/// Declared type of a plan slot reached only through a nested aggregate. Numeric,
-/// not `VARCHAR`, because the per-plan type also types the scan's `EMITS`: a
-/// character type would make an expression-argument MIN/MAX lexicographic.
-pub(super) const NESTED_AGGREGATE_PLAN_TYPE: &str = "DOUBLE PRECISION";
+use super::support::{cast_to_declared_type, expression_type, quote_ident, sum_result_type};
 
 /// Deduplicates by `AggregatePlan` equality so an aggregate used bare and nested
 /// collapses to one `PARTIAL_*` column (decision-log [4]). A `Some` declared type
-/// always overwrites a slot a nested occurrence created with the default.
+/// always overwrites the slot's type.
 pub(super) fn fold_aggregate_plan(
     plans: &mut Vec<AggregatePlan>,
-    plan_types: &mut Vec<String>,
+    plan_types: &mut Vec<Option<String>>,
     plan: AggregatePlan,
     declared: Option<String>,
 ) -> usize {
     match plans.iter().position(|p| *p == plan) {
         Some(slot) => {
-            if let Some(ty) = declared {
-                plan_types[slot] = ty;
+            if declared.is_some() {
+                plan_types[slot] = declared;
             }
             slot
         }
         None => {
             let slot = plans.len();
             plans.push(plan);
-            plan_types.push(declared.unwrap_or_else(|| NESTED_AGGREGATE_PLAN_TYPE.to_string()));
+            plan_types.push(declared);
             slot
         }
+    }
+}
+
+/// Exasol's result type of an aggregate the select list does not type. `None` when it
+/// depends on an argument whose type is unknown: a guess breaks the merge (#476).
+pub(super) fn nested_aggregate_type(
+    agg: &Json,
+    plan: &AggregatePlan,
+    col_types: &[(String, String)],
+) -> Option<String> {
+    match plan.kind {
+        AggKind::Count | AggKind::CountCol => Some("DECIMAL(18,0)".to_string()),
+        AggKind::Sum | AggKind::Min | AggKind::Max => {
+            let arg = agg.get("arguments")?.as_array()?.first()?;
+            let arg_type = expression_type(arg, col_types)?;
+            if plan.kind == AggKind::Sum {
+                sum_result_type(&arg_type)
+            } else {
+                Some(arg_type)
+            }
+        }
+        _ => Some("DOUBLE PRECISION".to_string()),
     }
 }
 
@@ -90,7 +107,7 @@ pub(super) fn sentinelize_aggregates(
     }
 }
 
-pub(super) fn classify_scalar_over_aggregate(node: &Json) -> Option<Vec<AggregatePlan>> {
+pub(super) fn classify_scalar_over_aggregate(node: &Json) -> Option<Vec<(AggregatePlan, Json)>> {
     let mut aggregates = Vec::new();
     let mut residual_column = false;
     let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
@@ -98,7 +115,10 @@ pub(super) fn classify_scalar_over_aggregate(node: &Json) -> Option<Vec<Aggregat
         return None;
     }
     render_expression(&sentinel_tree).ok()?;
-    aggregates.iter().map(parse_agg_item).collect()
+    aggregates
+        .into_iter()
+        .map(|agg| Some((parse_agg_item(&agg)?, agg)))
+        .collect()
 }
 
 /// Reuses the `vs-expression` translator by substitution (sentinel columns, then

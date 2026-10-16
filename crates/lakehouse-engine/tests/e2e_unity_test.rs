@@ -15,8 +15,8 @@ use common::e2e_harness::{
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
-    Format, VS_DELTA, assert_cases_hold, assert_one_shaped_file_per_label,
-    assert_single_group_aggregates_match_oracle, read_footer,
+    Format, VS_DELTA, assert_cases_hold, assert_grouped_aggregates_match_oracle,
+    assert_one_shaped_file_per_label, assert_single_group_aggregates_match_oracle, read_footer,
 };
 use common::pruning_fixture::{
     PRUNING_FILES, PRUNING_PARTITION_COLUMN, PRUNING_TABLE, labels_named, oracle_statements,
@@ -2643,4 +2643,14 @@ fn delta_pruning_keeps_every_file_with_a_matching_row() {
 fn delta_single_group_aggregates_match_the_oracle() {
     setup();
     assert_single_group_aggregates_match_oracle(&mut exa_conn(), Format::Delta);
+}
+
+/// Scenario: A nested aggregate over an expression declines the split
+/// Scenario: A group key travels with its exact type
+/// Scenario: An unprojected bare-column group key takes its column type
+/// Scenario: An all-pruned grouped request types a text scalar over an aggregate
+#[test]
+fn delta_grouped_aggregates_match_the_oracle() {
+    setup();
+    assert_grouped_aggregates_match_oracle(&mut exa_conn(), Format::Delta);
 }

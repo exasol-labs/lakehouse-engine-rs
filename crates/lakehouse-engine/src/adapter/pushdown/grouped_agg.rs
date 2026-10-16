@@ -7,11 +7,12 @@ use serde_json::Value as Json;
 use vs_expression::render_expression;
 
 use super::scalar_over_agg::{
-    cast_merge_items, classify_scalar_over_aggregate, fold_aggregate_plan, merge_select_items,
+    cast_merge_items, classify_scalar_over_aggregate, fold_aggregate_plan, nested_aggregate_type,
     parse_agg_item, render_scalar_over_merge, with_stat_grand_means,
 };
 use super::support::{
-    build_fan_out_inner, cast_to_declared_type, declared_select_type, render_limit_offset,
+    build_fan_out_inner, cast_to_declared_type, declared_select_type, expression_type,
+    render_limit_offset,
 };
 use super::topn::parse_sort_flags;
 
@@ -91,9 +92,12 @@ pub(super) fn is_literal_selectlist_item(item_type: &str) -> bool {
     LITERAL_SELECTLIST_TYPES.contains(&item_type)
 }
 
-/// `None` on any unsupported shape; the caller falls back to single-group detection
-/// or a row scan.
-pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregateDetection> {
+/// `None` on any unsupported shape, including an aggregate whose type is unknown; the
+/// caller falls back to single-group detection or a row scan.
+pub fn detect_group_by_aggregates(
+    pushdown_req: &Json,
+    col_types: &[(String, String)],
+) -> Option<GroupedAggregateDetection> {
     if pushdown_req.get("aggregationType").and_then(|v| v.as_str()) != Some("group_by") {
         return None;
     }
@@ -158,9 +162,12 @@ pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregat
                 }
                 // Otherwise a scalar wrapping aggregates; `None` declines the whole grouped
                 // detection, routing to the qualified wrapper (never a bare row scan).
-                let nested = classify_scalar_over_aggregate(item)?;
-                for plan in nested {
-                    fold_aggregate_plan(&mut plans, &mut plan_types, plan, None);
+                for (plan, agg) in classify_scalar_over_aggregate(item)? {
+                    let derived = nested_aggregate_type(&agg, &plan, col_types);
+                    let slot = fold_aggregate_plan(&mut plans, &mut plan_types, plan, None);
+                    if plan_types[slot].is_none() {
+                        plan_types[slot] = derived;
+                    }
                 }
                 select_items.push(GroupedSelectItem::ScalarOverAggregate {
                     select_index,
@@ -174,21 +181,21 @@ pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregat
     Some(GroupedAggregateDetection {
         group_keys,
         plans,
-        plan_types,
+        plan_types: plan_types.into_iter().collect::<Option<_>>()?,
         select_items,
     })
 }
 
 /// A projected key takes `selectListDataTypes` (matched by index, not rendered SQL,
-/// and authoritative since Exasol type-checks it). An unprojected key takes its
-/// `groupBy` node's own `dataType` when present (e.g. a CAST): without it a
-/// `CHAR(n)` key reached DataFusion unpadded and trailing-blank variants stayed
-/// separate groups (#192). Falls back to `VARCHAR(2000000)`.
+/// and authoritative since Exasol type-checks it); an unprojected key takes its
+/// `groupBy` node's type through [`expression_type`]. `None` when a key has no exact
+/// type: a guessed key type splits or merges groups (#476).
 pub(super) fn group_key_exasol_types(
     pushdown_req: &Json,
     group_keys: &[String],
     select_items: &[GroupedSelectItem],
-) -> Vec<String> {
+    col_types: &[(String, String)],
+) -> Option<Vec<String>> {
     let declared_types = pushdown_req
         .get("selectListDataTypes")
         .and_then(|v| v.as_array());
@@ -207,72 +214,35 @@ pub(super) fn group_key_exasol_types(
         }
     }
     let group_by = pushdown_req.get("groupBy").and_then(|v| v.as_array());
-    for (slot, resolved) in types.iter_mut().enumerate() {
-        if resolved.is_none() {
-            *resolved = group_by
-                .and_then(|nodes| nodes.get(slot))
-                .and_then(|node| node.get("dataType"))
-                .map(exasol_type_from_json);
-        }
-    }
     types
         .into_iter()
-        .map(|ty| ty.unwrap_or_else(|| "VARCHAR(2000000)".to_string()))
-        .collect()
-}
-
-/// Exasol's `CAST(x AS CHAR(n))` blank-pads, so trailing-blank variants are one
-/// group natively; DataFusion does not pad, so the merge would return a row per
-/// variant (#192).
-///
-/// Guarded by a length test rather than a bare `rpad`, which truncates: an
-/// over-length value passes through so the outer `CAST("GK_i" AS CHAR(n))` still
-/// raises Exasol's 22001 error. Only this copy is padded; the unpadded fragments
-/// stay the match keys for [`build_grouped_order_by_clause`].
-///
-/// The one DataFusion SQL fragment the adapter synthesises directly instead of via
-/// `vs-expression`; DataFusion-executing tests pin it.
-pub(super) fn blank_pad_char_group_keys(
-    group_keys: &[String],
-    group_key_types: &[String],
-) -> Vec<String> {
-    group_keys
-        .iter()
         .enumerate()
-        .map(
-            |(slot, fragment)| match group_key_types.get(slot).and_then(|ty| char_width(ty)) {
-                Some(width) => format!(
-                    "CASE WHEN character_length({fragment}) < {width} \
-                     THEN rpad({fragment}, {width}) ELSE {fragment} END"
-                ),
-                None => fragment.clone(),
-            },
-        )
+        .map(|(slot, resolved)| {
+            resolved.or_else(|| {
+                let node = group_by?.get(slot)?;
+                // A constant key forms one group whatever type carries it.
+                let constant = node
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(is_literal_selectlist_item);
+                expression_type(node, col_types)
+                    .or_else(|| constant.then(|| "VARCHAR(2000000)".to_string()))
+            })
+        })
         .collect()
-}
-
-/// Reads the digits between the parentheses so `CHAR(3) ASCII` still yields a
-/// width; the anchored `CHAR(` prefix never matches `VARCHAR(n)`.
-fn char_width(declared_type: &str) -> Option<u32> {
-    declared_type
-        .strip_prefix("CHAR(")?
-        .split_once(')')?
-        .0
-        .parse()
-        .ok()
 }
 
 /// Exasol does not re-sort a delegated `ORDER BY`, so the merge must sort itself.
-/// Group keys render as positional output ordinals so they sort the type-cast
-/// output, not the lexicographic VARCHAR `GK_*` staging column (`1,10,2,…`).
-/// Aggregate keys render as their merged expression; no hidden output column is
-/// added, so Exasol's positional validation is unaffected.
+/// A group key sorts as its typed `GK_*` column, projected or not; an aggregate key
+/// as its merged expression. No hidden output column is added, so Exasol's
+/// positional validation is unaffected.
 ///
 /// `None` without an `orderBy`. Anything unexpressible over the merge is
 /// [`GroupedOrderBy::Unresolvable`], routing to the qualified wrapper (#198).
 pub(super) fn build_grouped_order_by_clause(
     pushdown_req: &Json,
     detection: &GroupedAggregateDetection,
+    merged: &[String],
 ) -> Option<GroupedOrderBy> {
     let elements = pushdown_req.get("orderBy").and_then(|v| v.as_array())?;
     if elements.is_empty() {
@@ -287,9 +257,12 @@ pub(super) fn build_grouped_order_by_clause(
         let Some(expr) = element.get("expression") else {
             return Some(GroupedOrderBy::Unresolvable);
         };
-        let ordering = match group_key_output_ordinal(expr, detection) {
-            Some(ordinal) => ordinal.to_string(),
-            None => match render_having_over_merge(expr, &detection.plans) {
+        let rendered_key = render_expression(expr)
+            .ok()
+            .and_then(|sql| detection.group_keys.iter().position(|gk| *gk == sql));
+        let ordering = match rendered_key {
+            Some(slot) => group_key_column(slot),
+            None => match render_having_over_merge(expr, &detection.plans, merged) {
                 Some(merged) => merged,
                 None => return Some(GroupedOrderBy::Unresolvable),
             },
@@ -299,17 +272,8 @@ pub(super) fn build_grouped_order_by_clause(
     Some(GroupedOrderBy::Clause(parts.join(", ")))
 }
 
-/// 1-based merge-output ordinal of a sort key that is a projected group key.
-fn group_key_output_ordinal(expr: &Json, detection: &GroupedAggregateDetection) -> Option<usize> {
-    let rendered = render_expression(expr).ok()?;
-    let slot = detection.group_keys.iter().position(|gk| *gk == rendered)?;
-    detection.select_items.iter().find_map(|it| match it {
-        GroupedSelectItem::GroupKey {
-            group_key_slot,
-            select_index,
-        } if *group_key_slot == slot => Some(select_index + 1),
-        _ => None,
-    })
+fn group_key_column(slot: usize) -> String {
+    format!(r#""GK_{slot}""#)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -336,8 +300,10 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     having: Option<&str>,
     order_by: Option<&str>,
 ) -> String {
-    let gk_emits: Vec<String> = (0..group_keys.len())
-        .map(|i| format!(r#""GK_{i}" VARCHAR(2000000)"#))
+    let gk_emits: Vec<String> = group_key_types
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| format!("{} {ty}", group_key_column(i)))
         .collect();
     let partial_items = partial_emits_items(aggregates, col_types, aggregate_types);
     let all_emits: Vec<String> = gk_emits
@@ -347,17 +313,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
         .collect();
     let emits = all_emits.join(", ");
 
-    // The scan stringifies group keys; cast back so result types match Exasol's.
-    let gk_select: Vec<String> = (0..group_keys.len())
-        .map(|i| {
-            cast_to_declared_type(
-                &format!(r#""GK_{i}""#),
-                group_key_types.get(i).map(String::as_str),
-            )
-        })
-        .collect();
     let merge_items = cast_merge_items(aggregates, aggregate_types);
-    let merged_partials = merge_select_items(aggregates);
 
     // Exasol validates this SELECT positionally, so it follows `selectList` order,
     // not the inner keys-first fan-out order.
@@ -367,7 +323,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
         .iter()
         .filter_map(|item| match item {
             GroupedSelectItem::GroupKey { group_key_slot, .. } => {
-                gk_select.get(*group_key_slot).cloned()
+                Some(group_key_column(*group_key_slot))
             }
             GroupedSelectItem::Aggregate { plan_slot, .. } => merge_items.get(*plan_slot).cloned(),
             GroupedSelectItem::Constant { projection, .. } => Some(projection.clone()),
@@ -375,15 +331,13 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
                 node,
                 declared_type,
                 ..
-            } => render_scalar_over_merge(node, aggregates, &merged_partials)
+            } => render_scalar_over_merge(node, aggregates, &merge_items)
                 .map(|expr| cast_to_declared_type(&expr, Some(declared_type))),
         })
         .collect();
     let outer_select_str = outer_select.join(", ");
 
-    let outer_group_by: Vec<String> = (0..group_keys.len())
-        .map(|i| format!(r#""GK_{i}""#))
-        .collect();
+    let outer_group_by: Vec<String> = (0..group_keys.len()).map(group_key_column).collect();
     let outer_group_by_str = outer_group_by.join(", ");
 
     // The common blob is shared by all shards, so building it with `limit = None`
@@ -524,28 +478,30 @@ fn is_numeric_exasol_type(ty: &str) -> bool {
 }
 
 /// The merge wrapper has only `GK_*`/`PARTIAL_*` columns, so each aggregate is
-/// rewritten to its merged expression. `None` for an aggregate not among `plans` or
-/// an unsupported node, so the caller never emits a wrong or dropped HAVING.
-pub(super) fn render_having_over_merge(node: &Json, plans: &[AggregatePlan]) -> Option<String> {
+/// rewritten to its entry in `merged`, aligned with `plans`. `None` for an aggregate not
+/// among `plans` or an unsupported node, so the caller never emits a wrong or dropped HAVING.
+pub(super) fn render_having_over_merge(
+    node: &Json,
+    plans: &[AggregatePlan],
+    merged: &[String],
+) -> Option<String> {
     if !node.is_object() {
         return None;
     }
     let kind = node.get("type").and_then(|t| t.as_str())?;
     let child = |key: &str| node.get(key);
 
-    // Uncast: the comparison is against the merged value; `cast_merge_items`'s CAST is
-    // only for output-column typing.
     if kind == "function_aggregate" {
         let plan = parse_agg_item(node)?;
         let idx = plans.iter().position(|p| *p == plan)?;
-        return merge_select_items(plans).into_iter().nth(idx);
+        return merged.get(idx).cloned();
     }
 
     match kind {
-        "predicate_and" => render_having_junction(child("expressions"), plans, " AND "),
-        "predicate_or" => render_having_junction(child("expressions"), plans, " OR "),
+        "predicate_and" => render_having_junction(child("expressions"), plans, merged, " AND "),
+        "predicate_or" => render_having_junction(child("expressions"), plans, merged, " OR "),
         "predicate_not" => {
-            let inner = render_having_operand(child("expression"), plans)?;
+            let inner = render_having_operand(child("expression"), plans, merged)?;
             Some(format!("(NOT {inner})"))
         }
         "predicate_equal"
@@ -563,29 +519,33 @@ pub(super) fn render_having_over_merge(node: &Json, plans: &[AggregatePlan]) -> 
                 "predicate_greaterequal" => ">=",
                 _ => unreachable!(),
             };
-            let left = render_having_operand(child("left"), plans)?;
-            let right = render_having_operand(child("right"), plans)?;
+            let left = render_having_operand(child("left"), plans, merged)?;
+            let right = render_having_operand(child("right"), plans, merged)?;
             Some(format!("({left} {op} {right})"))
         }
         "predicate_between" => {
-            let target = render_having_operand(child("expression"), plans)?;
-            let low = render_having_operand(child("left"), plans)?;
-            let high = render_having_operand(child("right"), plans)?;
+            let target = render_having_operand(child("expression"), plans, merged)?;
+            let low = render_having_operand(child("left"), plans, merged)?;
+            let high = render_having_operand(child("right"), plans, merged)?;
             Some(format!("({target} BETWEEN {low} AND {high})"))
         }
         "predicate_is_null" => {
-            let inner = render_having_operand(child("expression"), plans)?;
+            let inner = render_having_operand(child("expression"), plans, merged)?;
             Some(format!("({inner} IS NULL)"))
         }
         "predicate_is_not_null" => {
-            let inner = render_having_operand(child("expression"), plans)?;
+            let inner = render_having_operand(child("expression"), plans, merged)?;
             Some(format!("({inner} IS NOT NULL)"))
         }
         _ => None,
     }
 }
 
-fn render_having_operand(node: Option<&Json>, plans: &[AggregatePlan]) -> Option<String> {
+fn render_having_operand(
+    node: Option<&Json>,
+    plans: &[AggregatePlan],
+    merged: &[String],
+) -> Option<String> {
     let node = node.filter(|n| !n.is_null())?;
     let kind = node.get("type").and_then(|t| t.as_str())?;
     match kind {
@@ -601,22 +561,23 @@ fn render_having_operand(node: Option<&Json>, plans: &[AggregatePlan]) -> Option
         | "predicate_greaterequal"
         | "predicate_between"
         | "predicate_is_null"
-        | "predicate_is_not_null" => render_having_over_merge(node, plans),
+        | "predicate_is_not_null" => render_having_over_merge(node, plans, merged),
         // Rewrites every nested aggregate, so a scalar wrapping an aggregate never renders
         // over absent source columns (#82).
-        _ => render_scalar_over_merge(node, plans, &merge_select_items(plans)),
+        _ => render_scalar_over_merge(node, plans, merged),
     }
 }
 
 fn render_having_junction(
     expressions: Option<&Json>,
     plans: &[AggregatePlan],
+    merged: &[String],
     op: &str,
 ) -> Option<String> {
     let items = expressions?.as_array()?;
     let mut parts = Vec::with_capacity(items.len());
     for item in items {
-        parts.push(render_having_over_merge(item, plans)?);
+        parts.push(render_having_over_merge(item, plans, merged)?);
     }
     match parts.len() {
         0 => None,

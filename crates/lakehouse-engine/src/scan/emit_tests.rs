@@ -1122,3 +1122,21 @@ async fn coerce_fails_when_a_value_does_not_fit_its_declared_target() {
         "no batch may be emitted, and no NULL may be substituted for the value"
     );
 }
+
+#[test]
+fn char_emit_cuts_only_blank_excess() {
+    let column: ArrayRef = Arc::new(arrow::array::StringArray::from(vec![
+        Some("ab"),
+        Some("ab     "),
+        Some("abcdef"),
+        Some("äö  "),
+        None,
+    ]));
+    let declared = declared(&[("C", ExaType::Char { size: 2 })]);
+    let coerced = coerce_column(&column, &declared[0], &DataType::Utf8).expect("coerces");
+    let values: Vec<Option<&str>> = coerced.as_string::<i32>().iter().collect();
+    assert_eq!(
+        values,
+        vec![Some("ab"), Some("ab"), Some("abcdef"), Some("äö"), None]
+    );
+}

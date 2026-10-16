@@ -674,6 +674,27 @@ pub fn note_of<'a>(
         .1
 }
 
+/// The result's column data types and its rows as strings, in result order.
+pub fn typed_result(conn: &mut ExaConn, sql: &str) -> (Vec<serde_json::Value>, Vec<Vec<String>>) {
+    let resp = conn.execute(sql);
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let types = result_set["columns"]
+        .as_array()
+        .map(|columns| columns.iter().map(|c| c["dataType"].clone()).collect())
+        .unwrap_or_default();
+    let columns = conn.fetch_result_columns(result_set);
+    let row_count = columns.first().map_or(0, Vec::len);
+    let rows = (0..row_count)
+        .map(|row| {
+            columns
+                .iter()
+                .map(|col| value_to_string(&col[row]))
+                .collect()
+        })
+        .collect();
+    (types, rows)
+}
+
 pub fn value_to_string(v: &serde_json::Value) -> String {
     v.as_str()
         .map(str::to_string)

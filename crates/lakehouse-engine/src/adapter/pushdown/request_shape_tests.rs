@@ -6,6 +6,7 @@ fn col_types() -> Vec<(String, String)> {
         ("AMOUNT".to_string(), "DECIMAL(18,2)".to_string()),
         ("NAME".to_string(), "VARCHAR(2000000)".to_string()),
         ("ID".to_string(), "DECIMAL(20,0)".to_string()),
+        ("REGION".to_string(), "VARCHAR(10) UTF8".to_string()),
     ]
 }
 
@@ -189,7 +190,7 @@ fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only
         "limit": 5,
     });
     assert!(
-        detect_group_by_aggregates(&req)
+        detect_group_by_aggregates(&req, &[])
             .expect("a group-key-only select list still detects as grouped")
             .plans
             .is_empty(),
@@ -219,7 +220,7 @@ fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper
         }],
     });
     assert_eq!(
-        detect_group_by_aggregates(&req)
+        detect_group_by_aggregates(&req, &[])
             .expect("grouped aggregate")
             .plans
             .len(),
@@ -252,7 +253,7 @@ fn grouped_order_by_group_key_classifies_grouped_with_resolved_clause() {
     match classify_request_shape(&req, &col_types()) {
         RequestShape::Grouped { order_by, .. } => assert_eq!(
             order_by.as_deref(),
-            Some("1 ASC NULLS LAST"),
+            Some(r#""GK_0" ASC NULLS LAST"#),
             "the classifier must carry the resolved merge ORDER BY"
         ),
         other => panic!("expected Grouped, got {other:?}"),
@@ -269,6 +270,7 @@ fn single_group_numeric_aggregate_classifies_as_single_group() {
         RequestShape::SingleGroupAgg {
             items,
             having: None,
+            ..
         } => assert_eq!(items.len(), 1),
         other => panic!("expected SingleGroupAgg, got {other:?}"),
     }

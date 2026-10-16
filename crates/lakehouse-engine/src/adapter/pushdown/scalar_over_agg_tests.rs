@@ -77,7 +77,7 @@ fn fold_keeps_structurally_different_aggregates_in_separate_slots() {
 }
 
 #[test]
-fn fold_defaults_a_nested_only_occurrence_to_double_precision() {
+fn fold_leaves_a_nested_only_occurrence_untyped() {
     let mut plans = Vec::new();
     let mut types = Vec::new();
 
@@ -88,7 +88,49 @@ fn fold_defaults_a_nested_only_occurrence_to_double_precision() {
         None,
     );
 
-    assert_eq!(types, vec!["DOUBLE PRECISION".to_string()]);
+    assert_eq!(types, vec![None]);
+}
+
+#[test]
+fn nested_aggregate_type_follows_exasol_result_types() {
+    let col_types = [
+        ("X".to_string(), "DECIMAL(15,2)".to_string()),
+        ("W".to_string(), "DECIMAL(30,4)".to_string()),
+        ("S".to_string(), "VARCHAR(10) UTF8".to_string()),
+    ];
+    let ty = |node: serde_json::Value| nested_aggregate_type(&node, &plan_of(&node), &col_types);
+    assert_eq!(ty(agg("SUM", "X", false)).as_deref(), Some("DECIMAL(26,2)"));
+    assert_eq!(ty(agg("SUM", "W", false)).as_deref(), Some("DECIMAL(36,4)"));
+    assert_eq!(
+        ty(agg("MAX", "S", false)).as_deref(),
+        Some("VARCHAR(10) UTF8")
+    );
+    assert_eq!(
+        ty(agg("AVG", "X", false)).as_deref(),
+        Some("DOUBLE PRECISION")
+    );
+    assert_eq!(ty(count_star()).as_deref(), Some("DECIMAL(18,0)"));
+    assert_eq!(ty(agg("SUM", "S", false)), None);
+    assert_eq!(ty(agg("MIN", "UNKNOWN", false)), None);
+}
+
+#[test]
+fn nested_aggregate_type_reads_a_cast_argument_type() {
+    let node = serde_json::json!({
+        "type": "function_aggregate",
+        "name": "MIN",
+        "arguments": [{
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "arguments": [{"type": "column", "name": "D"}],
+            "dataType": {"type": "TIMESTAMP", "withLocalTimeZone": false, "fractionalSecondsPrecision": 3},
+        }],
+    });
+    let plan = parse_agg_item(&node).expect("MIN over a CAST parses");
+    assert_eq!(
+        nested_aggregate_type(&node, &plan, &[]).as_deref(),
+        Some("TIMESTAMP(3)")
+    );
 }
 
 #[test]
@@ -110,11 +152,7 @@ fn fold_declared_type_overwrites_a_slot_created_by_a_nested_occurrence() {
     );
 
     assert_eq!(slot, 0);
-    assert_eq!(
-        types,
-        vec!["DECIMAL(18,2)".to_string()],
-        "a top-level occurrence's declared type must win over the nested default"
-    );
+    assert_eq!(types, vec![Some("DECIMAL(18,2)".to_string())]);
 }
 
 #[test]
@@ -135,7 +173,7 @@ fn fold_keeps_a_declared_type_when_a_nested_occurrence_follows_it() {
         None,
     );
 
-    assert_eq!(types, vec!["DECIMAL(18,2)".to_string()]);
+    assert_eq!(types, vec![Some("DECIMAL(18,2)".to_string())]);
 }
 
 #[test]
@@ -194,8 +232,11 @@ fn sentinelize_flags_a_bare_column_outside_any_aggregate() {
 fn classify_returns_the_nested_plans_in_encounter_order() {
     let node = round_of(sum_over_count(), 2);
 
-    let plans = classify_scalar_over_aggregate(&node)
-        .expect("ROUND(SUM(x) / COUNT(*), 2) must classify as a scalar-over-aggregate");
+    let plans: Vec<AggregatePlan> = classify_scalar_over_aggregate(&node)
+        .expect("ROUND(SUM(x) / COUNT(*), 2) must classify as a scalar-over-aggregate")
+        .into_iter()
+        .map(|(plan, _)| plan)
+        .collect();
 
     assert_eq!(
         plans,
@@ -220,7 +261,10 @@ fn classify_accepts_a_bare_aggregate_as_its_own_single_plan() {
     let plans = classify_scalar_over_aggregate(&agg("SUM", "X", false))
         .expect("a bare aggregate is structurally decomposable");
 
-    assert_eq!(plans, vec![plan_of(&agg("SUM", "X", false))]);
+    assert_eq!(
+        plans,
+        vec![(plan_of(&agg("SUM", "X", false)), agg("SUM", "X", false))]
+    );
 }
 
 #[test]
@@ -297,14 +341,14 @@ fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
         .expect("ROUND(SUM(X) / COUNT(*), 2) must classify as scalar-over-aggregate");
 
     let mut grouped_plans = vec![plan_of(&agg("COUNT", "L_ORDERKEY", false))];
-    let mut grouped_types = vec!["DECIMAL(18,0)".to_string()];
-    for plan in &nested {
+    let mut grouped_types = vec![Some("DECIMAL(18,0)".to_string())];
+    for (plan, _) in &nested {
         fold_aggregate_plan(&mut grouped_plans, &mut grouped_types, plan.clone(), None);
     }
 
     let mut single_group_plans: Vec<AggregatePlan> = Vec::new();
-    let mut single_group_types: Vec<String> = Vec::new();
-    for plan in &nested {
+    let mut single_group_types = Vec::new();
+    for (plan, _) in &nested {
         fold_aggregate_plan(
             &mut single_group_plans,
             &mut single_group_types,

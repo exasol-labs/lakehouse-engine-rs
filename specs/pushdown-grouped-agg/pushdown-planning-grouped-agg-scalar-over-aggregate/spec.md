@@ -24,15 +24,16 @@ undecomposable-shape-fallback scenarios shared by every grouped-aggregate pushdo
   wrapper over the *merged* partials in the outer wrapper SELECT (never per shard).
   The scalar wrapper itself is not decomposable — only its inner aggregates are.
 * The outer wrapper renders a nested `function_aggregate` by rewriting it to its
-  merged expression (e.g. `SUM(x)` → `SUM("PARTIAL_sum_0")`, `COUNT(*)` →
-  `SUM("PARTIAL_count_0")`, `AVG(x)` → the merged SUM/COUNT pair), matched to the
+  merged expression cast to the aggregate's Exasol result type (e.g. `SUM(x)` over a
+  `DECIMAL(15,2)` column → `CAST(SUM("PARTIAL_sum_0") AS DECIMAL(26,2))`, `COUNT(*)` →
+  `CAST(SUM("PARTIAL_count_0") AS DECIMAL(18,0))`), matched to the
   decomposed `AggregatePlan` list, exactly as a `function_aggregate` in a HAVING is
   rewritten. The scalar/arithmetic structure around the aggregates is preserved; only
   the aggregate leaves are rewritten — the outer wrapper has only `GK_*` and
   `PARTIAL_*` columns available, never a source column.
 * When a grouped select item cannot be decomposed into supported partials (an inner
   aggregate that is `DISTINCT`, a SUM/stat over a non-numeric type, an untranslatable
-  argument, or a non-aggregate/non-group-key node), the adapter falls back to the
+  argument, a nested aggregate without an exact type, or a non-aggregate/non-group-key node), the adapter falls back to the
   qualified single-table wrapper described in `pushdown-grouped-agg/pushdown-planning-grouped-agg`
   rather than a column-count-mismatched raw scan.
 
@@ -41,7 +42,7 @@ undecomposable-shape-fallback scenarios shared by every grouped-aggregate pushdo
 ### Scenario: Single-table grouped select item that is a scalar function wrapping aggregates is pushed down
 
 * *GIVEN* a virtual schema over an Iceberg table backed by SeaweedFS
-* *AND* a single-table grouped `pushdown` request (`aggregationType: "group_by"`, non-empty `groupBy`) whose select list contains a select item that is a scalar function wrapping one or more aggregates — e.g. `ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG = 'R' THEN 1 ELSE 0 END) / COUNT(*), 2)` — alongside a group key `L_RETURNFLAG` and plain aggregates `SUM(L_QUANTITY)` and `AVG(L_EXTENDEDPRICE)`
+* *AND* a single-table grouped `pushdown` request (`aggregationType: "group_by"`, non-empty `groupBy`) whose select list contains a select item that is a scalar function wrapping one or more aggregates — e.g. `ROUND(100.0 * SUM(L_EXTENDEDPRICE) / COUNT(*), 2)` — alongside a group key `L_RETURNFLAG` and plain aggregates `SUM(L_QUANTITY)` and `AVG(L_EXTENDEDPRICE)`
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL NOT decline the request and SHALL NOT return an error for the scalar-over-aggregate select item
 * *AND* the adapter SHALL decompose every `function_aggregate` nested inside that select item into the same partial `AggregatePlan` list it builds for a top-level aggregate, so each inner aggregate contributes a `PARTIAL_*` column the scan UDF emits per group per shard
@@ -69,7 +70,7 @@ undecomposable-shape-fallback scenarios shared by every grouped-aggregate pushdo
 ### Scenario: Scalar-over-aggregate items interleaved with keys and plain aggregates preserve select-list order
 
 * *GIVEN* a grouped pushdown whose select list places a scalar-over-aggregate item before, after, or between group keys and plain aggregates
-* *WHEN* the adapter builds the outer wrapper SELECT, its cast list, and its GROUP BY list
-* *THEN* the adapter SHALL emit the outer SELECT items in the exact order the corresponding items appear in `selectList`, interleaving group-key cast expressions, merged plain-aggregate expressions, and merged scalar-over-aggregate expressions as required
+* *WHEN* the adapter builds the outer wrapper SELECT and its GROUP BY list
+* *THEN* the adapter SHALL emit the outer SELECT items in the exact order the corresponding items appear in `selectList`, interleaving group-key columns, merged plain-aggregate expressions, and merged scalar-over-aggregate expressions as required
 * *AND* the Exasol-declared type applied to each item's CAST SHALL be resolved from the `selectListDataTypes` entry at that item's own `selectList` ordinal, matched by index rather than by comparing rendered SQL strings
 * *AND* the resulting pushdown query SHALL pass Exasol's positional pushdown-column-type check for every arrangement of keys, plain aggregates, and scalar-over-aggregate items

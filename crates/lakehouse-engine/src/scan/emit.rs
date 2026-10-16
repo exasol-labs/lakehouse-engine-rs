@@ -4,7 +4,7 @@ use crate::scan::diagnostics::PhaseTimers;
 use crate::scan::exasol_numeric::numeric_overflow;
 use crate::scan::raised_failure::session_raised_failure;
 use crate::types::mapping::TimestampPrecision;
-use arrow::array::ArrayRef;
+use arrow::array::{ArrayRef, AsArray, StringArray};
 use arrow::compute::CastOptions;
 use arrow::compute::kernels::cast::cast_with_options;
 use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, Field, Schema};
@@ -90,8 +90,7 @@ pub(crate) fn check_declared_arity(
     )))
 }
 
-/// Keyed on the Arrow type, not the declaration, because a `GROUP BY` key is declared `VARCHAR`
-/// yet leaves as Date32. Errors name `declared[i].name` for `columns[i]`.
+/// Errors name `declared[i].name` for `columns[i]`.
 pub(crate) fn check_emitted_dates_in_range(
     columns: &[ArrayRef],
     declared: &[ColumnInfo],
@@ -121,7 +120,8 @@ pub fn coerce_batch_to_exa_types(
         .fields()
         .iter()
         .zip(&targets)
-        .all(|(f, t)| f.data_type() == t)
+        .zip(declared)
+        .all(|((f, t), d)| f.data_type() == t && !matches!(d.typ, ExaType::Char { .. }))
     {
         check_emitted_dates_in_range(batch.columns(), declared)?;
         return Ok(batch);
@@ -159,6 +159,38 @@ pub fn coerce_batch_to_exa_types(
 /// would be merged by Exasol's outer wrapper as "this shard contributed nothing" instead of
 /// surfacing as the error it is.
 pub(crate) fn coerce_column(
+    column: &ArrayRef,
+    declared: &ColumnInfo,
+    target: &DataType,
+) -> Result<ArrayRef, UdfError> {
+    let coerced = cast_to_target(column, declared, target)?;
+    Ok(match declared.typ {
+        ExaType::Char { size } => cut_char_blank_excess(coerced, size as usize),
+        _ => coerced,
+    })
+}
+
+/// Exasol's `CAST(x AS CHAR(n))` drops trailing blanks beyond `n`, but the emit rejects any
+/// value longer than `n` (#301). Non-blank excess is kept, so it still fails at the emit.
+fn cut_char_blank_excess(column: ArrayRef, size: usize) -> ArrayRef {
+    let cut = |s: &str| -> Option<usize> {
+        let (byte, _) = s.char_indices().nth(size)?;
+        s[byte..].bytes().all(|b| b == b' ').then_some(byte)
+    };
+    let Some(strings) = column.as_string_opt::<i32>() else {
+        return column;
+    };
+    if strings.iter().flatten().all(|s| cut(s).is_none()) {
+        return column;
+    }
+    let trimmed: StringArray = strings
+        .iter()
+        .map(|v| v.map(|s| cut(s).map_or(s, |byte| &s[..byte])))
+        .collect();
+    Arc::new(trimmed)
+}
+
+fn cast_to_target(
     column: &ArrayRef,
     declared: &ColumnInfo,
     target: &DataType,

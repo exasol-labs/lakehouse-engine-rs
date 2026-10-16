@@ -8,7 +8,9 @@ use crate::scan::spec::{
     AggregatePlan, CommonScanSpec, FileEntry, ProjectionItem, ScanSpec, ScanStorage,
     StorageBackend, render_order_by_clause,
 };
-use crate::types::mapping::{ExaTypeClass, classify_exa_type, exasol_type_from_json};
+use crate::types::mapping::{
+    ExaTypeClass, classify_exa_type, exasol_type_from_json, parse_decimal_args,
+};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
@@ -917,6 +919,31 @@ pub(super) fn declared_select_type(pushdown_req: &Json, select_index: usize) -> 
         .and_then(|types| types.get(select_index))
         .map(exasol_type_from_json)
         .unwrap_or_else(|| "VARCHAR(2000000)".to_string())
+}
+
+/// The exact Exasol type of an expression node: the type Exasol attaches to it (a CAST)
+/// or a bare column's type. `None` otherwise; callers decline rather than guess (#476).
+pub(super) fn expression_type(node: &Json, col_types: &[(String, String)]) -> Option<String> {
+    if let Some(data_type) = node.get("dataType") {
+        return Some(exasol_type_from_json(data_type));
+    }
+    if node.get("type").and_then(|t| t.as_str()) != Some("column") {
+        return None;
+    }
+    let name = node.get("name")?.as_str()?.to_uppercase();
+    col_types
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, ty)| ty.clone())
+}
+
+/// Exasol types `SUM` over `DECIMAL(p,s)` as `DECIMAL(min(p+11, 36), s)`.
+pub(super) fn sum_result_type(arg_type: &str) -> Option<String> {
+    if arg_type == "DOUBLE PRECISION" {
+        return Some(arg_type.to_string());
+    }
+    let (p, s) = parse_decimal_args(arg_type)?;
+    Some(format!("DECIMAL({},{s})", (p + 11).min(36)))
 }
 
 /// `VARCHAR(2000000)` is exempt: it is the mapping's catch-all for unmappable types,

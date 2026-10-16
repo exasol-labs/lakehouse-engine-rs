@@ -710,7 +710,7 @@ fn stat_aggregate_over_bare_column_still_parses() {
 #[test]
 fn single_group_plan_types_returns_empty_vec_for_no_items() {
     let req = serde_json::json!({});
-    assert_eq!(single_group_plan_types(&req, &[]), Vec::<String>::new());
+    assert_eq!(single_group_plan_types(&req, &[], &[]), Some(Vec::new()));
 }
 
 #[test]
@@ -725,17 +725,21 @@ fn single_group_plan_types_aligns_with_bare_aggregate_select_list() {
     });
     let items = detect_aggregates(&req).expect("a bare aggregate list must decompose");
     assert_eq!(
-        single_group_plan_types(&req, &items),
-        vec![
+        single_group_plan_types(&req, &items, &[]),
+        Some(vec![
             "DECIMAL(36,2)".to_string(),
             "DECIMAL(18,0)".to_string(),
             "DECIMAL(9,4)".to_string(),
-        ]
+        ])
     );
 }
 
+fn quantity_types() -> Vec<(String, String)> {
+    vec![("L_QUANTITY".to_string(), "DECIMAL(15,2)".to_string())]
+}
+
 #[test]
-fn single_group_plan_types_defaults_when_reached_only_through_scalar_wrapper() {
+fn single_group_plan_types_derives_nested_only_slots_from_the_argument_type() {
     let req = serde_json::json!({
         "selectList": [round_expr(
             float_div(
@@ -748,13 +752,11 @@ fn single_group_plan_types_defaults_when_reached_only_through_scalar_wrapper() {
     });
     let items = detect_aggregates(&req).expect("ROUND(SUM/COUNT) must decompose");
     assert_eq!(
-        single_group_plan_types(&req, &items),
-        vec![
-            "DOUBLE PRECISION".to_string(),
-            "DOUBLE PRECISION".to_string()
-        ],
-        "neither nested aggregate has a top-level select-list entry of its own, so \
-         both slots take the nested-only numeric default"
+        single_group_plan_types(&req, &items, &quantity_types()),
+        Some(vec![
+            "DECIMAL(26,2)".to_string(),
+            "DECIMAL(18,0)".to_string()
+        ]),
     );
 }
 
@@ -775,10 +777,11 @@ fn single_group_plan_types_prefers_top_level_declared_type_for_shared_slot() {
     });
     let items = detect_aggregates(&req).expect("COUNT(*) + ROUND(SUM/COUNT) must decompose");
     assert_eq!(
-        single_group_plan_types(&req, &items),
-        vec!["DECIMAL(18,0)".to_string(), "DOUBLE PRECISION".to_string()],
-        "slot 0 (COUNT) takes its bare declared type; slot 1 (SUM) has no top-level \
-         occurrence and keeps the nested-only numeric default"
+        single_group_plan_types(&req, &items, &quantity_types()),
+        Some(vec![
+            "DECIMAL(18,0)".to_string(),
+            "DECIMAL(26,2)".to_string()
+        ]),
     );
 }
 
@@ -800,8 +803,11 @@ fn single_group_plan_types_resolves_both_ends_of_an_interleaved_list() {
     });
     let items = detect_aggregates(&req).expect("an interleaved list must decompose");
     assert_eq!(
-        single_group_plan_types(&req, &items),
-        vec!["DECIMAL(36,2)".to_string(), "DECIMAL(18,0)".to_string()],
+        single_group_plan_types(&req, &items, &[]),
+        Some(vec![
+            "DECIMAL(36,2)".to_string(),
+            "DECIMAL(18,0)".to_string()
+        ]),
         "slot 0 (SUM) takes ordinal 0's type; slot 1 (COUNT) takes ordinal 2's type, \
          never ordinal 1's scalar-item type"
     );
@@ -818,14 +824,14 @@ fn single_group_plan_types_skips_distinct_items() {
     });
     let items = detect_aggregates(&req).expect("SUM + COUNT(DISTINCT) must decompose");
     assert_eq!(
-        single_group_plan_types(&req, &items),
-        vec!["DECIMAL(36,2)".to_string()],
+        single_group_plan_types(&req, &items, &[]),
+        Some(vec!["DECIMAL(36,2)".to_string()]),
         "the COUNT(DISTINCT) item contributes no ordinary-aggregate slot"
     );
 }
 
 #[test]
-fn nested_only_expression_argument_min_emits_a_numeric_partial_column() {
+fn nested_only_expression_argument_min_has_no_plan_type() {
     let req = serde_json::json!({
         "selectList": [round_expr(
             serde_json::json!({
@@ -838,13 +844,11 @@ fn nested_only_expression_argument_min_emits_a_numeric_partial_column() {
         "selectListDataTypes": [decimal_type(36, 2)],
     });
     let items = detect_aggregates(&req).expect("ROUND(MIN(A * B), 2) must decompose");
-    let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
-    assert_eq!(
-        partial_emits_items(&plans, &[], &plan_types),
-        vec![r#""PARTIAL_min_0" DOUBLE PRECISION"#.to_string()],
-        "a nested-only MIN over an expression must emit a numeric partial column"
-    );
+    let col_types = [
+        ("A".to_string(), "DECIMAL(15,2)".to_string()),
+        ("B".to_string(), "DECIMAL(15,2)".to_string()),
+    ];
+    assert_eq!(single_group_plan_types(&req, &items, &col_types), None);
 }
 
 #[test]
@@ -855,12 +859,13 @@ fn merge_select_wraps_scalar_structure_around_the_merged_partial() {
     });
     let items = detect_aggregates(&req).expect("ROUND(SUM(col), 2) must decompose");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(&req, &items, &quantity_types()).expect("typed plans");
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types),
         Some(vec![
-            r#"CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(36,2))"#.to_string()
+            r#"CAST(ROUND(CAST(SUM("PARTIAL_sum_0") AS DECIMAL(26,2)), 2) AS DECIMAL(36,2))"#
+                .to_string()
         ])
     );
 }
@@ -883,13 +888,13 @@ fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
     });
     let items = detect_aggregates(&req).expect("an interleaved list must decompose");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(&req, &items, &quantity_types()).expect("typed plans");
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types),
         Some(vec![
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2))"#.to_string(),
-            r#"CAST(ROUND((SUM("PARTIAL_sum_0") / SUM("PARTIAL_count_1")), 2) AS DECIMAL(9,4))"#
+            r#"CAST(ROUND((CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2)) / CAST(SUM("PARTIAL_count_1") AS DECIMAL(18,0))), 2) AS DECIMAL(9,4))"#
                 .to_string(),
             r#"CAST(SUM("PARTIAL_count_1") AS DECIMAL(18,0))"#.to_string(),
         ])
@@ -906,13 +911,13 @@ fn merge_select_leaves_items_uncast_without_a_declared_type() {
     });
     let items = detect_aggregates(&req).expect("must decompose without declared types");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(&req, &items, &quantity_types()).expect("typed plans");
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types),
         Some(vec![
             r#"SUM("PARTIAL_count_0")"#.to_string(),
-            r#"ROUND(SUM("PARTIAL_sum_1"), 2)"#.to_string(),
+            r#"ROUND(CAST(SUM("PARTIAL_sum_1") AS DECIMAL(26,2)), 2)"#.to_string(),
         ])
     );
 }
@@ -928,7 +933,7 @@ fn merge_select_declines_a_list_holding_a_distinct_item() {
     });
     let items = detect_aggregates(&req).expect("SUM + COUNT(DISTINCT) must decompose");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(&req, &items, &quantity_types()).expect("typed plans");
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types),
@@ -949,7 +954,8 @@ fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
         declared_type: "DECIMAL(18,0)".to_string(),
     }];
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&serde_json::json!({}), &items);
+    let plan_types =
+        single_group_plan_types(&serde_json::json!({}), &items, &[]).expect("typed plans");
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types),
@@ -970,7 +976,7 @@ fn merge_select_emits_one_item_per_selectlist_item_for_duplicate_aggregates() {
     });
     let items = detect_aggregates(&req).expect("a duplicated aggregate must decompose");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(&req, &items, &quantity_types()).expect("typed plans");
     assert_eq!(plans.len(), 1, "one partial column for both occurrences");
 
     assert_eq!(

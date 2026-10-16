@@ -2348,7 +2348,7 @@ fn ensure_ground_truth_lineitem_table(conn: &mut ExaConn) {
 
 fn scalar_over_aggregate_round_select_list() -> &'static str {
     "L_RETURNFLAG, SUM(L_QUANTITY), AVG(L_EXTENDEDPRICE), \
-     ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END)/COUNT(*), 2)"
+     ROUND(100.0 * SUM(L_QUANTITY)/COUNT(*), 2)"
 }
 
 fn distinct_numeric_suffixes(haystack: &str, marker: &str) -> std::collections::BTreeSet<String> {
@@ -2445,7 +2445,7 @@ fn test_group_by_shared_inner_aggregate_dedup() {
 
     let sql = format!(
         "SELECT L_RETURNFLAG, COUNT(*), \
-         ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END)/COUNT(*), 2) \
+         ROUND(100.0 * SUM(L_QUANTITY)/COUNT(*), 2) \
          FROM {} GROUP BY L_RETURNFLAG ORDER BY L_RETURNFLAG",
         vs_lineitem_table()
     );
@@ -2483,7 +2483,7 @@ fn test_group_by_shared_inner_aggregate_dedup() {
     ensure_ground_truth_lineitem_table(&mut conn);
     let ground_truth_sql = format!(
         "SELECT L_RETURNFLAG, COUNT(*), \
-         ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END)/COUNT(*), 2) \
+         ROUND(100.0 * SUM(L_QUANTITY)/COUNT(*), 2) \
          FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_SCAN_TABLE} \
          GROUP BY L_RETURNFLAG ORDER BY L_RETURNFLAG"
     );
@@ -3228,7 +3228,7 @@ fn e2e_single_group_scalar_over_aggregate_interleaved_matches_native_oracle() {
     let mut conn = exa_conn();
 
     let select_list = "SUM(L_QUANTITY), ROUND(AVG(L_EXTENDEDPRICE), 3), MIN(L_QUANTITY), \
-                       ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END) \
+                       ROUND(100.0 * SUM(L_QUANTITY) \
                        / COUNT(*), 2)";
     let sql = format!("SELECT {select_list} FROM {}", vs_lineitem_table());
     assert_single_group_aggregate_pushed_down(&mut conn, &sql);

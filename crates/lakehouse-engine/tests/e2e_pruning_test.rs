@@ -9,8 +9,8 @@ use common::e2e_harness::{
     exa_conn, install_slc, resolve_fixture_files, upload_so,
 };
 use common::pruning_cases::{
-    Format, VS_HIVE, VS_ICEBERG, assert_cases_hold, assert_one_shaped_file_per_label,
-    assert_single_group_aggregates_match_oracle,
+    Format, VS_HIVE, VS_ICEBERG, assert_cases_hold, assert_grouped_aggregates_match_oracle,
+    assert_one_shaped_file_per_label, assert_single_group_aggregates_match_oracle,
 };
 use common::pruning_fixture::{
     PRUNING_FILES, PRUNING_HIVE_BASE, PRUNING_NAMESPACE, PRUNING_TABLE, hive_object_uri,
@@ -117,6 +117,16 @@ fn iceberg_single_group_aggregates_match_the_oracle() {
     assert_single_group_aggregates_match_oracle(&mut exa_conn(), Format::Iceberg);
 }
 
+/// Scenario: A nested aggregate over an expression declines the split
+/// Scenario: A group key travels with its exact type
+/// Scenario: An unprojected bare-column group key takes its column type
+/// Scenario: An all-pruned grouped request types a text scalar over an aggregate
+#[test]
+fn iceberg_grouped_aggregates_match_the_oracle() {
+    setup();
+    assert_grouped_aggregates_match_oracle(&mut exa_conn(), Format::Iceberg);
+}
+
 /// Scenario: Aggregate without GROUP BY with all files pruned returns the native empty-set result
 /// Scenario: A single-group request that does not decompose routes to the qualified wrapper
 /// Scenario: Single-group HAVING is applied on every path
@@ -125,4 +135,14 @@ fn iceberg_single_group_aggregates_match_the_oracle() {
 fn hive_single_group_aggregates_match_the_oracle() {
     setup();
     assert_single_group_aggregates_match_oracle(&mut exa_conn(), Format::Hive);
+}
+
+/// Scenario: A nested aggregate over an expression declines the split
+/// Scenario: A group key travels with its exact type
+/// Scenario: An unprojected bare-column group key takes its column type
+/// Scenario: An all-pruned grouped request types a text scalar over an aggregate
+#[test]
+fn hive_grouped_aggregates_match_the_oracle() {
+    setup();
+    assert_grouped_aggregates_match_oracle(&mut exa_conn(), Format::Hive);
 }

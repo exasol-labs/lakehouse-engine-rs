@@ -1032,7 +1032,9 @@ fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
     }));
 
     assert!(
-        sql.starts_with(r#"SELECT CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(36,2)) FROM ("#),
+        sql.starts_with(
+            r#"SELECT CAST(ROUND(CAST(SUM("PARTIAL_sum_0") AS DECIMAL(29,2)), 2) AS DECIMAL(36,2)) FROM ("#
+        ),
         "the merge SELECT must wrap the merged partial in the scalar structure, \
          not emit a bare unwrapped SUM: {sql}"
     );
@@ -2518,7 +2520,7 @@ fn embedded_group_keys(fragments: &[String]) -> String {
 }
 
 #[test]
-fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
+fn grouped_char_declared_group_key_is_emitted_as_char() {
     let request = char_grouped_request(
         char_cast_key(20, "UTF8"),
         serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"}),
@@ -2534,23 +2536,18 @@ fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
         Vec::new(),
     );
 
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#;
-    let padded = format!(
-        "CASE WHEN character_length({fragment}) < 20 THEN rpad({fragment}, 20) \
-             ELSE {fragment} END"
-    );
     assert!(
-        sql.contains(&embedded_group_keys(std::slice::from_ref(&padded))),
-        "the scan spec must carry the blank-padded group key {padded}: {sql}"
+        sql.contains(&embedded_group_keys(&[
+            r#"CAST("NAME" AS VARCHAR)"#.to_string()
+        ])),
+        "{sql}"
     );
-    assert!(
-        sql.contains(r#"CAST("GK_0" AS CHAR(20))"#),
-        "the outer merge wrapper must still cast the staging column to CHAR(20): {sql}"
-    );
+    assert!(sql.contains(r#"EMITS ("GK_0" CHAR(20),"#), "{sql}");
+    assert!(sql.starts_with(r#"SELECT "GK_0", "#), "{sql}");
 }
 
 #[test]
-fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
+fn unprojected_char_declared_group_key_is_emitted_as_char() {
     let request = unprojected_char_grouped_request(char_cast_key(20, "UTF8"));
 
     let sql = guard_dispatch_sql(
@@ -2562,15 +2559,7 @@ fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
         Vec::new(),
     );
 
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#;
-    let padded = format!(
-        "CASE WHEN character_length({fragment}) < 20 THEN rpad({fragment}, 20) \
-             ELSE {fragment} END"
-    );
-    assert!(
-        sql.contains(&embedded_group_keys(std::slice::from_ref(&padded))),
-        "an unprojected CHAR(20) group key must still reach the scan padded: {sql}"
-    );
+    assert!(sql.contains(r#"EMITS ("GK_0" CHAR(20),"#), "{sql}");
 }
 
 #[test]
@@ -2604,7 +2593,7 @@ fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
 }
 
 #[test]
-fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
+fn grouped_ascii_char_group_key_keeps_its_character_set() {
     let request = char_grouped_request(
         char_cast_key(3, "ASCII"),
         serde_json::json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"}),
@@ -2620,19 +2609,7 @@ fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
         Vec::new(),
     );
 
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#;
-    let padded = format!(
-        "CASE WHEN character_length({fragment}) < 3 THEN rpad({fragment}, 3) \
-             ELSE {fragment} END"
-    );
-    assert!(
-        sql.contains(&embedded_group_keys(std::slice::from_ref(&padded))),
-        "a `CHAR(3) ASCII` group key must reach the scan padded to 3: {sql}"
-    );
-    assert!(
-        sql.contains(r#"CAST("GK_0" AS CHAR(3) ASCII)"#),
-        "the outer merge wrapper must still cast the staging column to CHAR(3) ASCII: {sql}"
-    );
+    assert!(sql.contains(r#"EMITS ("GK_0" CHAR(3) ASCII"#), "{sql}");
 }
 
 #[test]
@@ -2663,7 +2640,7 @@ fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
 }
 
 #[test]
-fn order_by_on_a_char_declared_group_key_still_resolves_to_its_output_ordinal() {
+fn order_by_on_a_char_declared_group_key_sorts_its_typed_column() {
     let request = char_grouped_request(
         serde_json::json!({"type": "column", "name": "NAME"}),
         serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"}),
@@ -2684,15 +2661,7 @@ fn order_by_on_a_char_declared_group_key_still_resolves_to_its_output_ordinal() 
         Vec::new(),
     );
 
-    assert!(
-        sql.contains("ORDER BY 1"),
-        "the sort on the CHAR-declared group key must resolve to output ordinal 1: {sql}"
-    );
-    assert!(
-        sql.contains("rpad("),
-        "the DataFusion-side copy must still be padded alongside the resolved \
-             ORDER BY: {sql}"
-    );
+    assert!(sql.contains(r#"ORDER BY "GK_0" ASC NULLS LAST"#), "{sql}");
 }
 
 const PRUNED_TO_EMPTY_TABLE: &str = "pruned_to_empty";
