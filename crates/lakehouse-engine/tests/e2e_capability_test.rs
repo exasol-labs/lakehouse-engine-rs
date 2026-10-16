@@ -3551,6 +3551,17 @@ fn e2e_to_date_to_timestamp_translated_format_matches_native() {
 
     assert_pushed_into_scan(&mut conn, &date_sql, "%Y-%m-%d");
     assert_pushed_into_scan(&mut conn, &filter_sql, "%H:%M:%S%.3f");
+
+    assert_eq!(
+        first_cell(&mut conn, "SELECT TO_DATE('', 'YYYY-MM-DD')"),
+        serde_json::Value::Null
+    );
+    let empty_sql = format!(
+        "SELECT TO_DATE(SUBSTR(name, 1, 0), 'YYYY-MM-DD') FROM {} WHERE id = 1",
+        vs_table()
+    );
+    assert_eq!(first_cell(&mut conn, &empty_sql), serde_json::Value::Null);
+    assert_pushed_into_scan(&mut conn, &empty_sql, "nullif(");
 }
 
 /// Scenario: A string Exasol rejects for a translated format fails the query
@@ -3608,23 +3619,4 @@ fn e2e_to_date_declined_format_matches_native() {
         !pushed.contains("to_date("),
         "the declined call must not reach the scan:\n{pushed}"
     );
-}
-
-/// Scenario: A string-literal format translates to a strftime pattern
-#[test]
-fn e2e_to_date_translated_format_empty_string_is_null() {
-    setup_e2e();
-    let mut conn = exa_conn();
-
-    assert_eq!(
-        first_cell(&mut conn, "SELECT TO_DATE('', 'YYYY-MM-DD')"),
-        serde_json::Value::Null
-    );
-
-    let sql = format!(
-        "SELECT TO_DATE(SUBSTR(name, 1, 0), 'YYYY-MM-DD') FROM {} WHERE id = 1",
-        vs_table()
-    );
-    assert_eq!(first_cell(&mut conn, &sql), serde_json::Value::Null);
-    assert_pushed_into_scan(&mut conn, &sql, "nullif(");
 }

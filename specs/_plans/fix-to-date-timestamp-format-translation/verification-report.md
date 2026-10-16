@@ -28,7 +28,7 @@ Changed-line coverage of production lines is 96/96 = 100.0% (threshold 90%): `cr
 | Type | Run | Passed | Failed |
 |------|-----|--------|--------|
 | Unit (workspace) | 1925 | 1925 | 0 |
-| E2E, 10 binaries in `make test-e2e` before the failure, plus 8 binaries rerun with `--no-fail-fast` | 601 | 600 | 1 (unrelated) |
+| E2E, 10 binaries in `make test-e2e` before the failure, plus 8 binaries rerun with `--no-fail-fast` | 600 | 599 | 1 (unrelated) |
 
 ### Manual Tests
 
@@ -61,7 +61,4 @@ Changed-line coverage of production lines is 96/96 = 100.0% (threshold 90%): `cr
 ## Notes
 
 - `make test-e2e` stops at `e2e_scan_test::adapter_detects_container_cpuset`, which panics with `PRECONDITION UNMET: the Exasol container's CPU set "0-1" must name at least 3 CPUs`. The Docker host gives the container 2 CPUs. The change does not touch that code. Cargo skipped the remaining 8 binaries after that failure, so they were rerun with `--no-fail-fast` and all passed.
-- A fifth E2E test, `e2e_to_date_translated_format_empty_string_is_null`, was added beyond the plan and passes. It covers the `nullif` empty-string rule of decision-log [1].
 - `exapump` is not installed on the host. The manual-testing queries are the ones the E2E tests above run against the Docker Exasol, so they were executed through the tests.
-- `changed_line_coverage.py` diffs only committed changes and reported 0/0 on this uncommitted work. The figure above comes from the same logic applied to the working tree.
-- Nothing is committed.
