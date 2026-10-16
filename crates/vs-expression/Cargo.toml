@@ -1,6 +1,6 @@
 [package]
 name = "vs-expression"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license.workspace = true
 
@@ -10,3 +10,4 @@ name = "vs_expression"
 [dependencies]
 exasol-udf-sdk = { workspace = true }
 serde_json     = { workspace = true }
+regex          = { workspace = true }

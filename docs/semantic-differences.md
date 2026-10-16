@@ -86,3 +86,20 @@ For example, `WHERE W + 0.0000001 > W` with `W` a `DECIMAL(36,6)` value of
 not fit `DECIMAL(36,7)`. The virtual schema returns the row. `WHERE H * H + 0.5 > 0` with `H` a
 BIGINT of `4000000000000000000` differs in the same way. A projected sum that exceeds 36 digits
 still fails in the virtual schema too.
+
+## TO_DATE and TO_TIMESTAMP with a format
+
+The scan runs `TO_DATE` and `TO_TIMESTAMP` with a string-literal format built from `YYYY`, `MM`, and
+`DD` once each, in any letter case. `TO_TIMESTAMP` also accepts `HH24` and `MI`, then optionally
+`SS`, then optionally one `FF3`, `FF6`, or `FF9`. The separators are `-` `/` `.` `,` `;` `:` `_`
+and space. Other formats run in Exasol.
+
+For a few input strings the scan and native Exasol parse differently:
+
+| Expression | Virtual schema | Native Exasol |
+|---|---|---|
+| `TO_DATE('2024-01-01 ', 'YYYY-MM-DD')` (trailing space) | error | `2024-01-01` |
+| `TO_TIMESTAMP('2024-01-01', 'YYYY-MM-DD HH24:MI:SS')` (input shorter than the format) | error | `2024-01-01 00:00:00` |
+| `TO_TIMESTAMP('1600-01-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')` | error | `1600-01-01 00:00:00` |
+
+The scan also accepts some strings Exasol rejects, such as a sign before the year, seconds 60, or a tab inside the value. Those queries return a result where Exasol raises an error.
