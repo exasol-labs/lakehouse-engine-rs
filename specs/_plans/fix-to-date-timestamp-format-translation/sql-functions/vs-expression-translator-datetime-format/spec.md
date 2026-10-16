@@ -13,7 +13,7 @@ call itself.
   Separators are `-` `/` `.` `,` `;` `:` `_` and space.
 * **Everything else** runs in Exasol.
 
-The inputs on which the scan and Exasol differ are listed in `docs/semantic-differences.md`.
+The inputs on which the scan and Exasol differ are documented in `docs/semantic-differences.md`.
 
 ## Scenarios
 
@@ -22,7 +22,7 @@ The inputs on which the scan and Exasol differ are listed in `docs/semantic-diff
 * *GIVEN* a `function_scalar` node named `TO_DATE` or `TO_TIMESTAMP` with a source argument and a `literal_string` format that is a supported format
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL render `to_date(nullif(<source_sql>, ''), '<pattern>')` or `to_timestamp(nullif(<source_sql>, ''), '<pattern>')`, so an empty string yields NULL as in Exasol, where `<pattern>` replaces each element with its strftime form, so `'YYYY-MM-DD'` renders as `'%Y-%m-%d'` and `'yyyy-mm-dd hh24:mi:ss.ff3'` as `'%Y-%m-%d %H:%M:%S%.3f'`
-* *AND* a query over a virtual schema table that pushes such a call into the scan SHALL return the value native Exasol returns for a string that is not one of the listed parse differences, so the strings `1996-03-13` and `1996-03-13 10:11:12` under `YYYY-MM-DD` and `YYYY-MM-DD HH24:MI:SS` yield the DATE `1996-03-13` and the TIMESTAMP `1996-03-13 10:11:12`
+* *AND* a query over a virtual schema table that pushes such a call into the scan SHALL return the value native Exasol returns for a string that is not one of the documented parse differences, so the strings `1996-03-13` and `1996-03-13 10:11:12` under `YYYY-MM-DD` and `YYYY-MM-DD HH24:MI:SS` yield the DATE `1996-03-13` and the TIMESTAMP `1996-03-13 10:11:12`
 
 ### Scenario: A format the translation cannot express declines in the DataFusion dialect
 
@@ -42,6 +42,6 @@ The inputs on which the scan and Exasol differ are listed in `docs/semantic-diff
 ### Scenario: A string Exasol rejects for a translated format fails the query
 
 * *GIVEN* a query over a virtual schema table that pushes a `TO_DATE` or `TO_TIMESTAMP` call with a translated format into the scan
-* *WHEN* the scan reads a string that native Exasol rejects for that format, such as `event-01` or `2024-02-30` for `YYYY-MM-DD`, and that is not one of the listed parse differences
+* *WHEN* the scan reads a string that native Exasol rejects for that format, such as `event-01` or `2024-02-30` for `YYYY-MM-DD`, and that is not one of the documented parse differences
 * *THEN* the query SHALL fail with an error, in the select list and in a filter, as it does on a native Exasol table
 * *AND* the scan MUST NOT return NULL for that string or silently drop its row
