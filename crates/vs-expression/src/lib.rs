@@ -1,6 +1,9 @@
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
+mod datetime_format;
+use datetime_format::{FormatTarget, strftime_pattern};
+
 /// Which parser consumes the rendered fragment: DataFusion inside the scan UDF
 /// (`ScanSpec` filter/projection/group keys) or Exasol for the outer wrapper SQL.
 /// The `Exasol` dialect re-emits what Exasol sent (name, argument order and count),
@@ -237,6 +240,61 @@ fn render_args(args: &[Json], dialect: Dialect) -> Result<Vec<String>, UdfError>
                 .ok_or_else(|| UdfError::User(format!("argument[{i}] rendered to null")))
         })
         .collect()
+}
+
+/// Renders a one-argument conversion as is. With a format it renders only a `literal_string` the
+/// translation covers, and errs otherwise so the caller declines.
+fn render_to_datetime(
+    target: FormatTarget,
+    args: Option<&Vec<Json>>,
+    dialect: Dialect,
+) -> Result<Option<String>, UdfError> {
+    let (node, function) = match target {
+        FormatTarget::Date => ("TO_DATE", "to_date"),
+        FormatTarget::Timestamp => ("TO_TIMESTAMP", "to_timestamp"),
+    };
+    let args =
+        args.ok_or_else(|| UdfError::User(format!("function_scalar {node} missing 'arguments'")))?;
+    match args.as_slice() {
+        [] => Err(UdfError::User(format!(
+            "function_scalar {node} requires at least 1 argument"
+        ))),
+        [source] => {
+            let source = render_conversion_source(node, source, dialect)?;
+            Ok(Some(format!("{function}({source})")))
+        }
+        [source, format] => {
+            let pattern = format
+                .get("type")
+                .and_then(Json::as_str)
+                .filter(|kind| *kind == "literal_string")
+                .and_then(|_| format.get("value").and_then(Json::as_str))
+                .and_then(|model| strftime_pattern(model, target))
+                .ok_or_else(|| {
+                    UdfError::User(format!(
+                        "function_scalar {node} format {format} is not a string literal with an exact strftime equivalent"
+                    ))
+                })?;
+            let source = render_conversion_source(node, source, dialect)?;
+            Ok(Some(format!(
+                "{function}(nullif({source}, ''), '{}')",
+                sql_escape(&pattern)
+            )))
+        }
+        _ => Err(UdfError::User(format!(
+            "function_scalar {node} accepts at most 2 arguments, got {}",
+            args.len()
+        ))),
+    }
+}
+
+fn render_conversion_source(
+    function: &str,
+    source: &Json,
+    dialect: Dialect,
+) -> Result<String, UdfError> {
+    render_expression_inner(source, dialect)?
+        .ok_or_else(|| UdfError::User(format!("{function} source rendered to null")))
 }
 
 const DOUBLE_TYPE: &str = "DOUBLE";
@@ -1044,30 +1102,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                         .ok_or_else(|| UdfError::User("DATE_TRUNC source is null".into()))?;
                     Ok(Some(format!("date_trunc({unit}, {src})")))
                 }
-                "TO_DATE" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar TO_DATE missing 'arguments'".into())
-                    })?;
-                    if args.is_empty() {
-                        return Err(UdfError::User(
-                            "function_scalar TO_DATE requires at least 1 argument".into(),
-                        ));
-                    }
-                    let rendered = render_args(args, dialect)?;
-                    Ok(Some(format!("to_date({})", rendered.join(", "))))
-                }
-                "TO_TIMESTAMP" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar TO_TIMESTAMP missing 'arguments'".into())
-                    })?;
-                    if args.is_empty() {
-                        return Err(UdfError::User(
-                            "function_scalar TO_TIMESTAMP requires at least 1 argument".into(),
-                        ));
-                    }
-                    let rendered = render_args(args, dialect)?;
-                    Ok(Some(format!("to_timestamp({})", rendered.join(", "))))
-                }
+                "TO_DATE" => render_to_datetime(FormatTarget::Date, args, dialect),
+                "TO_TIMESTAMP" => render_to_datetime(FormatTarget::Timestamp, args, dialect),
                 // ADD_HOURS/ADD_MINUTES are not translated: Exasol types
                 // ADD_HOURS(DATE, n) as TIMESTAMP(0), which a type-blind translator
                 // cannot reproduce.
