@@ -1,22 +1,18 @@
 //! The positional-delete fixtures are authored once at stack bring-up by the
 //! `spark-iceberg-fixtures` Compose job (`scripts/spark-fixtures/`);
 //! `tests/common/pos_delete_fixtures.rs` MUST stay in lockstep with those scripts.
-#![cfg(feature = "exasol-e2e")]
 
-mod common;
-use common::e2e_harness::*;
-use common::exasol_ws::ExaConn;
-use common::pos_delete_fixtures::{
+use crate::common::e2e_harness::*;
+use crate::common::pos_delete_fixtures::{
     DELETION_VECTOR_TABLE, FILE_GRANULARITY_DELETED_IDS, FILE_GRANULARITY_REMAINING_ROWS,
     FILE_GRANULARITY_TABLE, FILE_GRANULARITY_TOTAL_ROWS, NAMESPACE, PARTITION_COL,
     PARTITION_EAST_DELETED_IDS, PARTITION_GRANULARITY_DELETED_IDS,
     PARTITION_GRANULARITY_REMAINING_ROWS, PARTITION_GRANULARITY_TABLE,
     PARTITION_GRANULARITY_TOTAL_ROWS, PARTITION_WEST_DELETED_IDS,
 };
-use common::seed::{E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, seed_events};
-use common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
-};
+use crate::common::seed::{E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS};
+
+use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, vs_table};
 
 use lakehouse_engine::adapter::pushdown::shard_count;
 use lakehouse_engine::adapter::sharding::partition_files_by_bytes;
@@ -25,38 +21,17 @@ use lakehouse_engine::scan::spec::DeleteMechanism;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-/// Shared across E2E binaries; recreation is idempotent with an identical body.
-const VS_NAME: &str = "MY_LAKEHOUSE";
 const SAMESHARD_VS_NAME: &str = "POSDEL_SAMESHARD_VS";
 const SPLITSHARD_VS_NAME: &str = "POSDEL_SPLITSHARD_VS";
 /// Equals `mor_pos_partition`'s data-file count, so a 1-node cluster gets exactly
 /// one file per shard.
 const SPLIT_PARALLELISM_FACTOR: usize = 4;
 
-static SETUP_DONE: OnceLock<()> = OnceLock::new();
-
 fn setup_e2e() {
-    SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        wait_for_seaweedfs();
-        wait_for_iceberg_catalog();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            seed_events(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed Iceberg events table")
-        });
-
-        install_slc();
-        upload_so();
-
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        lakehouse_vs();
         let mut conn = exa_conn();
-        create_schema_and_scripts(&mut conn);
-        create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, NAMESPACE));
         create_virtual_schema(
             &mut conn,
             &VsProps::new(SAMESHARD_VS_NAME, NAMESPACE).with_parallelism_factor(1),
@@ -67,10 +42,6 @@ fn setup_e2e() {
                 .with_parallelism_factor(SPLIT_PARALLELISM_FACTOR),
         );
     });
-}
-
-fn vs_table(vs_name: &str, table: &str) -> String {
-    format!("{vs_name}.{}", table.to_uppercase())
 }
 
 fn ids_column(cols: &[Vec<serde_json::Value>]) -> Vec<i64> {
@@ -84,10 +55,7 @@ fn ids_column(cols: &[Vec<serde_json::Value>]) -> Vec<i64> {
 fn fixture_spark_file_granularity_delete_table() {
     setup_e2e();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let rt = runtime();
     let files = rt.block_on(resolve_fixture_files(NAMESPACE, FILE_GRANULARITY_TABLE));
     assert_eq!(
         files.len(),
@@ -147,10 +115,7 @@ fn fixture_spark_file_granularity_delete_table() {
 fn fixture_spark_partition_granularity_delete_table() {
     setup_e2e();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let rt = runtime();
     let files = rt.block_on(resolve_fixture_files(
         NAMESPACE,
         PARTITION_GRANULARITY_TABLE,
@@ -211,7 +176,7 @@ fn e2e_file_granularity_returns_post_delete_rows() {
 
     let sql = format!(
         "SELECT id FROM {} ORDER BY id",
-        vs_table(VS_NAME, FILE_GRANULARITY_TABLE)
+        vs_table(LAKEHOUSE_VS, FILE_GRANULARITY_TABLE)
     );
     let cols = conn.query_columns(&sql);
     let ids = ids_column(&cols);
@@ -248,7 +213,7 @@ fn e2e_partition_granularity_returns_post_delete_rows() {
 
     let sql = format!(
         "SELECT id FROM {} ORDER BY id",
-        vs_table(VS_NAME, PARTITION_GRANULARITY_TABLE)
+        vs_table(LAKEHOUSE_VS, PARTITION_GRANULARITY_TABLE)
     );
     let cols = conn.query_columns(&sql);
     let ids = ids_column(&cols);
@@ -276,7 +241,7 @@ fn e2e_partition_delete_spans_multiple_partitions() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    let table = vs_table(VS_NAME, PARTITION_GRANULARITY_TABLE);
+    let table = vs_table(LAKEHOUSE_VS, PARTITION_GRANULARITY_TABLE);
 
     let east_sql = format!("SELECT id FROM {table} WHERE {PARTITION_COL} = 'east' ORDER BY id");
     let east_ids = ids_column(&conn.query_columns(&east_sql));
@@ -323,10 +288,7 @@ fn e2e_partition_delete_spans_multiple_partitions() {
 fn e2e_partition_delete_invariant_across_fanout() {
     setup_e2e();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let rt = runtime();
     let files = rt.block_on(resolve_fixture_files(
         NAMESPACE,
         PARTITION_GRANULARITY_TABLE,
@@ -417,7 +379,7 @@ fn e2e_deletes_with_projection_filter_limit() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    let table = vs_table(VS_NAME, PARTITION_GRANULARITY_TABLE);
+    let table = vs_table(LAKEHOUSE_VS, PARTITION_GRANULARITY_TABLE);
     let sql =
         format!("SELECT id, val FROM {table} WHERE {PARTITION_COL} = 'west' ORDER BY id LIMIT 3");
     let cols = conn.query_columns(&sql);
@@ -464,7 +426,7 @@ fn e2e_deletes_with_single_and_grouped_agg() {
 
     let single_sql = format!(
         "SELECT COUNT(*), SUM(id) FROM {}",
-        vs_table(VS_NAME, FILE_GRANULARITY_TABLE)
+        vs_table(LAKEHOUSE_VS, FILE_GRANULARITY_TABLE)
     );
     let single_cols = conn.query_columns(&single_sql);
     let count = parse_int(&single_cols[0][0]);
@@ -483,7 +445,7 @@ fn e2e_deletes_with_single_and_grouped_agg() {
 
     let grouped_sql = format!(
         "SELECT {PARTITION_COL}, COUNT(*) FROM {} GROUP BY {PARTITION_COL} ORDER BY {PARTITION_COL}",
-        vs_table(VS_NAME, PARTITION_GRANULARITY_TABLE)
+        vs_table(LAKEHOUSE_VS, PARTITION_GRANULARITY_TABLE)
     );
     let grouped_cols = conn.query_columns(&grouped_sql);
     assert_eq!(
@@ -530,7 +492,7 @@ fn e2e_unsupported_delete_fails_loud() {
 
     let sql = format!(
         "SELECT * FROM {} LIMIT 1",
-        vs_table(VS_NAME, DELETION_VECTOR_TABLE)
+        vs_table(LAKEHOUSE_VS, DELETION_VECTOR_TABLE)
     );
     let resp = conn.try_execute(&sql);
 
@@ -577,7 +539,7 @@ fn e2e_delete_free_table_no_regression() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    let table = vs_table(VS_NAME, E2E_TABLE);
+    let table = vs_table(LAKEHOUSE_VS, E2E_TABLE);
 
     let filter_count = conn.query_row_count(&format!("SELECT id FROM {table} WHERE score > 15.0"));
     assert_eq!(
@@ -610,14 +572,5 @@ fn e2e_delete_free_table_no_regression() {
         (total_score - expected_total_score).abs() < 1e-6,
         "delete-free aggregate regression: expected SUM(score)≈{expected_total_score}, \
          got {total_score}"
-    );
-}
-
-#[test]
-fn positional_delete_suite_fails_when_stack_unavailable() {
-    let result = std::panic::catch_unwind(|| ExaConn::connect("192.0.2.1", 8563, "sys", "exasol"));
-    assert!(
-        result.is_err(),
-        "ExaConn::connect to an unreachable host must panic, not return Ok"
     );
 }

@@ -4,7 +4,6 @@
 //! `adls` profile can't address it. The container is created under an Entra ID
 //! service principal because the Azure blob crate accepts no account key. Tests
 //! share one Exasol provisioning and run with `--test-threads=1`.
-#![cfg(feature = "azure-e2e")]
 
 mod common;
 
@@ -13,7 +12,7 @@ use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SO_UDF_OBJECT_PATH, SYS_PASSWORD, VsProps,
     assert_decimal_orders_numerically, create_schema_and_scripts,
     create_virtual_schema_with_password, declared_type, exa_conn, explain_virtual_sql, install_slc,
-    parse_int, upload_so, value_to_string,
+    parse_int, projection_rows, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
@@ -289,29 +288,6 @@ fn assert_projection_filter_limit(conn: &mut ExaConn, arm: &AzureArm) {
         "ADLS warehouse '{}' must hold {SEED_TOTAL_ROWS} seeded rows, got {total}",
         arm.warehouse
     );
-}
-
-fn projection_rows(conn: &mut ExaConn, table: &str) -> Vec<(i64, String, f64)> {
-    let cols = conn.query_columns(&format!("SELECT id, name, score FROM {table} ORDER BY id"));
-    assert_eq!(
-        cols.len(),
-        3,
-        "expected 3 columns (id, name, score): {cols:?}"
-    );
-    (0..cols[0].len())
-        .map(|i| {
-            let id = parse_int(&cols[0][i]);
-            let name = cols[1][i]
-                .as_str()
-                .unwrap_or_else(|| panic!("name not string: {:?}", cols[1][i]))
-                .to_string();
-            let score = cols[2][i]
-                .as_f64()
-                .or_else(|| cols[2][i].as_str().and_then(|s| s.parse().ok()))
-                .unwrap_or_else(|| panic!("score not numeric: {:?}", cols[2][i]));
-            (id, name, score)
-        })
-        .collect()
 }
 
 fn azure_direct_events_batch(ids: &[i64]) -> RecordBatch {

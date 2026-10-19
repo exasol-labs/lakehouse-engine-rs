@@ -7,16 +7,16 @@
 //! Two distinct OAuth2 client-credentials implementations are verified:
 //! `iceberg-catalog-rest`'s built-in client (createVirtualSchema enumeration) and
 //! the adapter's own `oauth2_client_credentials_grant` (scan/file resolution).
-#![cfg(feature = "lakekeeper-e2e")]
 
 mod common;
 
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VsProps,
     assert_decimal_orders_numerically, assert_text_columns, create_schema_and_scripts,
-    create_virtual_schema_with_password, declared_type, exa_conn, expected_join_rows,
-    explain_virtual_sql, fetch_join_rows, has_broadcast_join_block, has_two_scan_wrapper,
-    install_slc, join_query, parse_int, upload_so, value_to_string,
+    create_virtual_schema_with_password, declared_type, enumerated_table_names, exa_conn,
+    expected_join_rows, explain_virtual_sql, fetch_join_rows, has_broadcast_join_block,
+    has_two_scan_wrapper, install_slc, join_query, parse_int, projection_rows, upload_so,
+    value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
@@ -139,43 +139,6 @@ fn setup() {
             &vended_pw,
         );
     });
-}
-
-fn enumerated_table_names(conn: &mut ExaConn, vs_name: &str) -> Vec<String> {
-    let cols = conn.query_columns(&format!(
-        "SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA = '{vs_name}'"
-    ));
-    cols.first()
-        .map(|c| {
-            c.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_uppercase()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn projection_rows(conn: &mut ExaConn, table: &str) -> Vec<(i64, String, f64)> {
-    let cols = conn.query_columns(&format!("SELECT id, name, score FROM {table} ORDER BY id"));
-    assert_eq!(
-        cols.len(),
-        3,
-        "expected 3 columns (id, name, score): {cols:?}"
-    );
-    let n = cols[0].len();
-    (0..n)
-        .map(|i| {
-            let id = parse_int(&cols[0][i]);
-            let name = cols[1][i]
-                .as_str()
-                .unwrap_or_else(|| panic!("name not string: {:?}", cols[1][i]))
-                .to_string();
-            let score = cols[2][i]
-                .as_f64()
-                .or_else(|| cols[2][i].as_str().and_then(|s| s.parse().ok()))
-                .unwrap_or_else(|| panic!("score not numeric: {:?}", cols[2][i]));
-            (id, name, score)
-        })
-        .collect()
 }
 
 #[test]

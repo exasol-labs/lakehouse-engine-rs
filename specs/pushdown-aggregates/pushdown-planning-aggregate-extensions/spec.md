@@ -32,9 +32,8 @@ being pushed as a partial/merge plan.
   clause may depend on it. Live precedent under `add-topn-pushdown` B5/B6 (issues #225 / #189):
   an `orderBy` pushed TOGETHER with a `limit` is fully delegated — Exasol re-applies neither, so
   the withheld-limit fallback returned wrong, unsorted, unbounded rows and the adapter now
-  renders a self-contained global `ORDER BY … LIMIT` (`topn.rs` lines 444-449, `mod.rs` lines
-  690-694). An `orderBy` pushed WITHOUT a `limit` behaves differently: Exasol keeps its own
-  top-level `ORDER BY` and re-sorts the returned rows (`tests/e2e_scan_test.rs` lines 1133-1138).
+  renders a self-contained global `ORDER BY … LIMIT`. An `orderBy` pushed WITHOUT a `limit`
+  behaves differently: Exasol keeps its own top-level `ORDER BY` and re-sorts the returned rows.
 * The correct handling for a HAVING the adapter cannot render over the partial/merge
   decomposition is therefore neither omission nor an error: route the request to the qualified
   single-table wrapper, which renders the HAVING as ordinary Exasol SQL over materialized rows.

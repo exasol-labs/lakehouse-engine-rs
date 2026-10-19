@@ -1,26 +1,24 @@
 //! Runs the pruning case table (`common/pruning_cases.rs`) on Iceberg and Hive direct storage.
 //! FAILS (never skips) when the stack is unreachable.
-#![cfg(feature = "exasol-e2e")]
 
-mod common;
-
-use common::e2e_harness::{
-    VsProps, create_schema_and_scripts, create_virtual_schema, create_virtual_schema_with_password,
-    exa_conn, install_slc, resolve_fixture_files, upload_so,
+use crate::common::e2e_harness::runtime;
+use crate::common::e2e_harness::{
+    VsProps, create_virtual_schema, create_virtual_schema_with_password, exa_conn,
+    resolve_fixture_files,
 };
-use common::pruning_cases::{
+use crate::common::pruning_cases::{
     Format, VS_HIVE, VS_ICEBERG, assert_cases_hold, assert_one_shaped_file_per_label,
     assert_single_group_aggregates_match_oracle,
 };
-use common::pruning_fixture::{
+use crate::common::pruning_fixture::{
     PRUNING_FILES, PRUNING_HIVE_BASE, PRUNING_NAMESPACE, PRUNING_TABLE, hive_object_uri,
     oracle_statements, write_pruning_hive_copy,
 };
-use common::seed::seed_pruning_cases;
-use common::stack::{
+use crate::common::seed::seed_pruning_cases;
+use crate::common::stack::{
     CatalogConnectionPassword, iceberg_catalog_url, local_stack_connection_password,
-    wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
 };
+use crate::fixtures::stack;
 
 use std::sync::OnceLock;
 
@@ -30,10 +28,7 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
 fn setup() {
     SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        wait_for_seaweedfs();
-        wait_for_iceberg_catalog();
-
+        stack();
         runtime().block_on(async {
             seed_pruning_cases(&iceberg_catalog_url(), "s3://warehouse/")
                 .await
@@ -41,13 +36,10 @@ fn setup() {
         });
         write_pruning_hive_copy();
 
-        install_slc();
-        upload_so();
         let mut conn = exa_conn();
         for statement in oracle_statements() {
             conn.execute(&statement);
         }
-        create_schema_and_scripts(&mut conn);
         create_virtual_schema(&mut conn, &VsProps::new(VS_ICEBERG, PRUNING_NAMESPACE));
         create_virtual_schema_with_password(
             &mut conn,
@@ -66,13 +58,6 @@ fn hive_storage_password() -> CatalogConnectionPassword {
         warehouse: String::new(),
         ..local_stack_connection_password()
     }
-}
-
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
 }
 
 /// Scenario: Pruning keeps every file with a matching row for every filter shape

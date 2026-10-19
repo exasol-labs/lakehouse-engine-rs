@@ -2,85 +2,28 @@
 //! advertised → translated → executed path. Seed: id 1..=20, score = 5.0 * id,
 //! name = "event-NN", event_date = 2024-01-01 + (id-1) days. Fail, never skip,
 //! without the stack.
-#![cfg(feature = "exasol-e2e")]
 
-mod common;
-use common::e2e_harness::*;
-use common::exasol_ws::ExaConn;
-use common::seed::{
+use crate::common::e2e_harness::*;
+use crate::common::exasol_ws::ExaConn;
+use crate::common::seed::{
     CHAR_PAD_COL, CHAR_PAD_OTHER, CHAR_PAD_OVER_LENGTH, CHAR_PAD_SHORT,
-    CHAR_PAD_SHORT_TRAILING_SPACE, CHAR_PAD_TOTAL_ROWS, E2E_CHAR_PAD_TABLE, E2E_DIM_TABLE,
-    E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, E2E_TYPED_TABLE, ExpectedValue, seed_events,
-    seed_typed_distinct_probe,
+    CHAR_PAD_SHORT_TRAILING_SPACE, CHAR_PAD_TOTAL_ROWS, E2E_CHAR_PAD_TABLE, ExpectedValue,
 };
-use common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
+use crate::common::timestamp_precision::expected_timestamp_precision;
+use crate::fixtures::{
+    LAKEHOUSE_VS, events_table, lakehouse_vs, typed_table, vs_dim_table, vs_fact_table,
 };
-use common::timestamp_precision::expected_timestamp_precision;
-
-use std::sync::OnceLock;
-
-const VS_NAME: &str = "MY_LAKEHOUSE";
 
 /// The fix's measured worst-case divergence from native Exasol is ~1 ULP (3.17e-16).
 const FLOAT_DIV_ORACLE_REL_TOLERANCE: f64 = 1e-15;
 
-// Each test binary runs independently, so this file needs its own OnceLock setup.
-
-static SETUP_DONE: OnceLock<()> = OnceLock::new();
-
-fn setup_e2e() {
-    SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        wait_for_seaweedfs();
-        wait_for_iceberg_catalog();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            seed_events(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed Iceberg events table");
-            // Same namespace as `events`, so it is queryable through the one `MY_LAKEHOUSE` VS.
-            seed_typed_distinct_probe(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed typed_distinct_probe table")
-        });
-
-        install_slc();
-        upload_so();
-
-        let mut conn = exa_conn();
-        create_schema_and_scripts(&mut conn);
-        create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, E2E_NAMESPACE));
-    });
-}
-
-fn vs_table() -> String {
-    format!("{VS_NAME}.{}", E2E_TABLE.to_uppercase())
-}
-
-fn vs_dim_table() -> String {
-    format!("{VS_NAME}.{}", E2E_DIM_TABLE.to_uppercase())
-}
-
-fn vs_fact_table() -> String {
-    format!("{VS_NAME}.{}", E2E_FACT_TABLE.to_uppercase())
-}
-
-fn vs_typed_table() -> String {
-    format!("{VS_NAME}.{}", E2E_TYPED_TABLE.to_uppercase())
-}
-
 fn vs_char_pad_table() -> String {
-    format!("{VS_NAME}.{}", E2E_CHAR_PAD_TABLE.to_uppercase())
+    format!("{LAKEHOUSE_VS}.{}", E2E_CHAR_PAD_TABLE.to_uppercase())
 }
 
 #[test]
 fn e2e_advertises_inner_equi_join_capability() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     // EXPLAIN VIRTUAL echoes the adapter's capability response; the comma-adjacent
@@ -110,10 +53,10 @@ fn e2e_advertises_inner_equi_join_capability() {
 
 #[test]
 fn advertises_count_distinct_capability() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let query = format!("SELECT COUNT(DISTINCT name) FROM {}", vs_table());
+    let query = format!("SELECT COUNT(DISTINCT name) FROM {}", events_table());
     let advertised = explain_virtual_sql(&mut conn, &query);
 
     assert!(
@@ -133,12 +76,12 @@ fn advertises_count_distinct_capability() {
 
 #[test]
 fn e2e_math_functions_in_filter() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, score FROM {} WHERE ABS(score - 50.0) < 20.0 ORDER BY id",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, score): {cols:?}");
@@ -172,12 +115,12 @@ fn e2e_math_functions_in_filter() {
 
 #[test]
 fn e2e_string_functions_in_filter() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, name FROM {} WHERE LOWER(name) LIKE 'event-1%' ORDER BY id",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, name): {cols:?}");
@@ -212,12 +155,12 @@ fn e2e_string_functions_in_filter() {
 
 #[test]
 fn e2e_date_functions_in_filter() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, event_date FROM {} WHERE EXTRACT(DAY FROM event_date) > 10 ORDER BY id",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(
@@ -259,7 +202,7 @@ fn ids_of_first_column(conn: &mut ExaConn, sql: &str) -> Vec<i64> {
 /// Scenario: Regexp scalar functions are deliberately not translated
 #[test]
 fn e2e_regexp_like_returns_native_rows() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let cases: [(&str, Vec<i64>); 4] = [
@@ -283,7 +226,7 @@ fn e2e_regexp_like_returns_native_rows() {
             expected_ids.len()
         );
 
-        let sql = format!("SELECT id FROM {} WHERE {predicate}", vs_table());
+        let sql = format!("SELECT id FROM {} WHERE {predicate}", events_table());
         let ids = ids_of_first_column(&mut conn, &sql);
         assert_eq!(
             ids, expected_ids,
@@ -293,7 +236,7 @@ fn e2e_regexp_like_returns_native_rows() {
 
     let sql = format!(
         "SELECT id, name FROM {} WHERE id < 5 AND name REGEXP_LIKE 'event-0[1-3]'",
-        vs_table()
+        events_table()
     );
 
     let request = explain_virtual_pushdown_request(&mut conn, &sql);
@@ -327,12 +270,12 @@ fn e2e_regexp_like_returns_native_rows() {
 
 #[test]
 fn e2e_selectlist_expression_pushdown() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, score * 2.0, UPPER(name) FROM {} WHERE id <= 3 ORDER BY id",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(
@@ -375,13 +318,13 @@ fn has_expr_after_projection(pushed_sql: &str) -> bool {
 
 #[test]
 fn e2e_selectlist_predicate_projection_pushdown() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     {
         let sql = format!(
             "SELECT id, id IN (1,2,3) FROM {} WHERE id <= 5 ORDER BY id",
-            vs_table()
+            events_table()
         );
         let cols = conn.query_columns(&sql);
         assert_eq!(
@@ -410,7 +353,7 @@ fn e2e_selectlist_predicate_projection_pushdown() {
     {
         let sql = format!(
             "SELECT id, id BETWEEN 2 AND 4 FROM {} WHERE id <= 5 ORDER BY id",
-            vs_table()
+            events_table()
         );
         let cols = conn.query_columns(&sql);
         assert_eq!(
@@ -440,7 +383,7 @@ fn e2e_selectlist_predicate_projection_pushdown() {
     {
         let sql = format!(
             "SELECT id, c_decimal_a IS NULL FROM {} WHERE id <= 4 ORDER BY id",
-            vs_typed_table()
+            typed_table()
         );
         let cols = conn.query_columns(&sql);
         assert_eq!(
@@ -474,7 +417,7 @@ fn e2e_selectlist_predicate_projection_pushdown() {
     {
         let sql = format!(
             "SELECT id, c_decimal_a IS NOT NULL FROM {} WHERE id <= 4 ORDER BY id",
-            vs_typed_table()
+            typed_table()
         );
         let cols = conn.query_columns(&sql);
         assert_eq!(
@@ -508,7 +451,7 @@ fn e2e_selectlist_predicate_projection_pushdown() {
     {
         let sql = format!(
             "SELECT id, id <> 3 FROM {} WHERE id <= 5 ORDER BY id",
-            vs_table()
+            events_table()
         );
         let cols = conn.query_columns(&sql);
         assert_eq!(
@@ -675,14 +618,14 @@ fn assert_typed_probe_prefix(cols: &[Vec<serde_json::Value>], i: usize) {
 
 #[test]
 fn e2e_selectlist_between_at_matching_arity_projects_as_expr() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, c_decimal_a, c_decimal_b, c_double, c_varchar, c_date, \
          c_ts, c_bool, c_price, (c_qty BETWEEN 1 AND 3) FROM {} WHERE id <= 3 \
          ORDER BY id",
-        vs_typed_table()
+        typed_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 10, "expected 10 columns: {cols:?}");
@@ -712,7 +655,7 @@ fn e2e_selectlist_between_at_matching_arity_projects_as_expr() {
 
 #[test]
 fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     {
@@ -720,7 +663,7 @@ fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
             "SELECT id, c_decimal_a, c_decimal_b, c_double, c_varchar, c_date, \
              c_ts, c_bool, c_price, LENGTH(c_double) FROM {} WHERE id <= 3 \
              ORDER BY id",
-            vs_typed_table()
+            typed_table()
         );
         let cols = conn.query_columns(&sql);
         assert_eq!(cols.len(), 10, "expected 10 columns: {cols:?}");
@@ -766,7 +709,7 @@ fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
         let sql = format!(
             "SELECT id, score, name, event_date, event_ts, id, score, name, \
              event_date, LENGTH(score) FROM {} WHERE id <= 3 ORDER BY id",
-            vs_table()
+            events_table()
         );
         let cols = conn.query_columns(&sql);
         assert_eq!(cols.len(), 10, "expected 10 columns: {cols:?}");
@@ -798,9 +741,9 @@ fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
 
 #[test]
 fn e2e_selectlist_literal_projection_pushdown() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
-    let table = vs_table();
+    let table = events_table();
 
     {
         let sql = format!("SELECT 1 FROM {table}");
@@ -872,9 +815,9 @@ fn e2e_selectlist_literal_projection_pushdown() {
 
 #[test]
 fn e2e_count_star_over_limited_subselect_pushdown() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
-    let table = vs_table();
+    let table = events_table();
 
     let primary_sql = format!("SELECT COUNT(*) FROM (SELECT id FROM {table} LIMIT 5)");
     assert_eq!(
@@ -910,10 +853,10 @@ fn e2e_count_star_over_limited_subselect_pushdown() {
 
 #[test]
 fn e2e_all_files_pruned_literal_projection_empty_shape() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let sql = format!("SELECT 1, name, 1 FROM {} WHERE id > 1000", vs_table());
+    let sql = format!("SELECT 1, name, 1 FROM {} WHERE id > 1000", events_table());
     // `execute` panics if Exasol rejects the shape. `query_columns` cannot observe the
     // column count of a zero-row result, so the metadata is asserted instead.
     let resp = conn.execute(&sql);
@@ -955,9 +898,9 @@ fn session_utc_offset_seconds(conn: &mut ExaConn) -> f64 {
 
 #[test]
 fn e2e_now_family_projection_matches_native_session_local_value() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
-    let table = vs_table();
+    let table = events_table();
     pin_session_time_zone(&mut conn);
     let offset_seconds = session_utc_offset_seconds(&mut conn);
     assert!(
@@ -987,9 +930,9 @@ fn e2e_now_family_projection_matches_native_session_local_value() {
 
 #[test]
 fn e2e_projected_tstz_literal_matches_native_and_pruned_scan_succeeds() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
-    let table = vs_table();
+    let table = events_table();
     pin_session_time_zone(&mut conn);
 
     let projection = "CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)";
@@ -1049,12 +992,12 @@ fn e2e_projected_tstz_literal_matches_native_and_pruned_scan_succeeds() {
 
 #[test]
 fn e2e_having_clause_pushdown() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) HAVING COUNT(*) > 3 ORDER BY MOD(id, 4)",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (key, count): {cols:?}");
@@ -1084,12 +1027,12 @@ fn e2e_having_clause_pushdown() {
 
 #[test]
 fn e2e_stddev_variance_pushdown() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT STDDEV(score), VARIANCE(score), STDDEV_POP(score), VAR_POP(score) FROM {}",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 4, "expected 4 aggregate columns: {cols:?}");
@@ -1137,10 +1080,10 @@ fn e2e_stddev_variance_pushdown() {
 
 #[test]
 fn e2e_stddev_over_expression_falls_back_and_returns_correct_value() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let sql = format!("SELECT STDDEV(score + id) FROM {}", vs_table());
+    let sql = format!("SELECT STDDEV(score + id) FROM {}", events_table());
 
     // A statistical partial column here is the accepted-then-failing shape the decline removes.
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
@@ -1155,7 +1098,7 @@ fn e2e_stddev_over_expression_falls_back_and_returns_correct_value() {
     assert_eq!(cols[0].len(), 1, "expected exactly 1 row: {cols:?}");
     let actual = parse_numeric(&cols[0][0]);
 
-    let row_cols = conn.query_columns(&format!("SELECT score, id FROM {}", vs_table()));
+    let row_cols = conn.query_columns(&format!("SELECT score, id FROM {}", events_table()));
     let values: Vec<f64> = row_cols[0]
         .iter()
         .zip(row_cols[1].iter())
@@ -1200,13 +1143,13 @@ fn sample_stddev(values: &[f64]) -> f64 {
 fn e2e_grouped_stddev_over_expression_falls_back_and_returns_correct_value() {
     const GROUP_MODULUS: i64 = 4;
 
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT MOD(id, {GROUP_MODULUS}), STDDEV(score + id) FROM {} \
          GROUP BY MOD(id, {GROUP_MODULUS}) ORDER BY 1",
-        vs_table()
+        events_table()
     );
 
     // A statistical partial column here is the accepted-then-failing shape the decline removes.
@@ -1217,7 +1160,7 @@ fn e2e_grouped_stddev_over_expression_falls_back_and_returns_correct_value() {
          partial/merge decomposition, got:\n{pushed_sql}"
     );
 
-    let row_cols = conn.query_columns(&format!("SELECT id, score FROM {}", vs_table()));
+    let row_cols = conn.query_columns(&format!("SELECT id, score FROM {}", events_table()));
     let mut group_values: std::collections::BTreeMap<i64, Vec<f64>> =
         std::collections::BTreeMap::new();
     for (id, score) in row_cols[0].iter().zip(row_cols[1].iter()) {
@@ -1292,12 +1235,12 @@ fn assert_filter_pushed_down(conn: &mut ExaConn, query_sql: &str) {
 
 #[test]
 fn e2e_cast_in_filter() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, score FROM {} WHERE CAST(id AS VARCHAR(2000000)) = '15' ORDER BY id",
-        vs_table()
+        events_table()
     );
     assert_filter_pushed_down(&mut conn, &sql);
 
@@ -1324,12 +1267,12 @@ fn e2e_cast_in_filter() {
 
 #[test]
 fn e2e_unary_minus_in_filter() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, score FROM {} WHERE -score < -50.0 ORDER BY id",
-        vs_table()
+        events_table()
     );
     assert_filter_pushed_down(&mut conn, &sql);
 
@@ -1361,12 +1304,12 @@ fn e2e_unary_minus_in_filter() {
 
 #[test]
 fn e2e_week_in_filter() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, event_date FROM {} WHERE WEEK(event_date) = 2 ORDER BY id",
-        vs_table()
+        events_table()
     );
     assert_filter_pushed_down(&mut conn, &sql);
 
@@ -1408,9 +1351,9 @@ fn assert_select_pushed_down(conn: &mut ExaConn, query_sql: &str, fragment: &str
 
 #[test]
 fn e2e_days_between_matches_exasol() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
-    let t = vs_table();
+    let t = events_table();
 
     let sql = format!("SELECT DAYS_BETWEEN(event_date, DATE '2024-01-10') FROM {t} WHERE id = 1");
     // "AS DATE" can also match Exasol's echoed request; "- CAST(" only appears in the
@@ -1427,9 +1370,9 @@ fn e2e_days_between_matches_exasol() {
 
 #[test]
 fn e2e_time_between_matches_exasol() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
-    let t = vs_table();
+    let t = events_table();
 
     let anchor = "TIMESTAMP '2024-01-01 02:30:00'";
 
@@ -1462,13 +1405,13 @@ fn e2e_time_between_matches_exasol() {
 
 #[test]
 fn e2e_selectlist_cast_extract_case_pushdown() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, CAST(id AS VARCHAR(2000000)), EXTRACT(YEAR FROM event_date), \
          CASE WHEN id > 10 THEN 'high' ELSE 'low' END FROM {} WHERE id <= 3 ORDER BY id",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(
@@ -1514,10 +1457,13 @@ fn e2e_selectlist_cast_extract_case_pushdown() {
 
 #[test]
 fn e2e_order_by_unprojected_column_bare_projection() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let sql = format!("SELECT score FROM {} WHERE id = 1 ORDER BY id", vs_table());
+    let sql = format!(
+        "SELECT score FROM {} WHERE id = 1 ORDER BY id",
+        events_table()
+    );
 
     // Scoped to the adapter's own `"projection":[...]`: EVENTS field names are lowercase,
     // so an uppercase whole-string check would pass by casing accident.
@@ -1544,7 +1490,7 @@ fn e2e_order_by_unprojected_column_bare_projection() {
 
     let sql_desc = format!(
         "SELECT name FROM {} WHERE id <= 5 ORDER BY id DESC",
-        vs_table()
+        events_table()
     );
     let cols_desc = conn.query_columns(&sql_desc);
     assert_eq!(
@@ -1572,12 +1518,12 @@ fn e2e_order_by_unprojected_column_bare_projection() {
 
 #[test]
 fn e2e_order_by_column_referenced_only_in_projected_expression() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id || '-' || name FROM {} WHERE id <= 3 ORDER BY id",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(
@@ -1658,12 +1604,12 @@ fn exasol_trim_decimal_string_matches_documented_values() {
 
 #[test]
 fn e2e_decimal_cast_trims_trailing_zeros() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, CAST(c_decimal_a AS VARCHAR(20)) FROM {} WHERE id IN (1,4,6) ORDER BY id",
-        vs_typed_table()
+        typed_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, CAST): {cols:?}");
@@ -1684,7 +1630,7 @@ fn e2e_decimal_cast_trims_trailing_zeros() {
 
 #[test]
 fn e2e_issue_189_shape_equivalent_local_verification() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -1720,12 +1666,12 @@ fn e2e_issue_189_shape_equivalent_local_verification() {
 
 #[test]
 fn e2e_decimal_concat_trims_trailing_zeros() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, id||'-'||c_decimal_a FROM {} WHERE id IN (1,4) ORDER BY id",
-        vs_typed_table()
+        typed_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, CONCAT): {cols:?}");
@@ -1746,12 +1692,12 @@ fn e2e_decimal_concat_trims_trailing_zeros() {
 
 #[test]
 fn e2e_decimal_length_reflects_trimmed_string() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, LENGTH(c_decimal_a) FROM {} WHERE id IN (1,4,6) ORDER BY id",
-        vs_typed_table()
+        typed_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, LENGTH): {cols:?}");
@@ -1771,9 +1717,9 @@ fn e2e_decimal_length_reflects_trimmed_string() {
 
 #[test]
 fn e2e_decimal_length_where_count_matches_trimmed_semantics() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
-    let t = vs_typed_table();
+    let t = typed_table();
 
     let expected_lengths: Vec<(i64, Option<i64>)> = TYPED_DECIMAL_A_UNSCALED
         .iter()
@@ -1851,12 +1797,12 @@ fn e2e_decimal_length_where_count_matches_trimmed_semantics() {
 
 #[test]
 fn e2e_upper_varchar_pushdown() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT UPPER(c_varchar) FROM {} WHERE id = 1",
-        vs_typed_table()
+        typed_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(
@@ -1877,10 +1823,10 @@ fn e2e_upper_varchar_pushdown() {
 
 #[test]
 fn e2e_upper_id_trims_to_plain_integer_string() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let sql = format!("SELECT UPPER(id) FROM {} WHERE id = 4", vs_typed_table());
+    let sql = format!("SELECT UPPER(id) FROM {} WHERE id = 4", typed_table());
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 1, "expected 1 column (UPPER(id)): {cols:?}");
     assert_eq!(cols[0].len(), 1, "expected 1 row (id=4): {cols:?}");
@@ -1896,12 +1842,12 @@ fn e2e_upper_id_trims_to_plain_integer_string() {
 
 #[test]
 fn e2e_ltrim_decimal_trims_trailing_zeros() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, LTRIM(c_decimal_a) FROM {} WHERE id IN (1,4,6) ORDER BY id",
-        vs_typed_table()
+        typed_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, LTRIM): {cols:?}");
@@ -1935,13 +1881,10 @@ fn e2e_ltrim_decimal_trims_trailing_zeros() {
 
 #[test]
 fn e2e_lower_date_formats_as_iso() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let sql = format!(
-        "SELECT LOWER(c_date) FROM {} WHERE id = 1",
-        vs_typed_table()
-    );
+    let sql = format!("SELECT LOWER(c_date) FROM {} WHERE id = 1", typed_table());
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 1, "expected 1 column (LOWER(c_date)): {cols:?}");
     assert_eq!(cols[0].len(), 1, "expected 1 row (id=1): {cols:?}");
@@ -1957,12 +1900,12 @@ fn e2e_lower_date_formats_as_iso() {
 
 #[test]
 fn e2e_instr_decimal_finds_dot_position_in_trimmed_text() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, INSTR(c_decimal_a, '.') FROM {} WHERE id IN (1,4,6) ORDER BY id",
-        vs_typed_table()
+        typed_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, INSTR): {cols:?}");
@@ -2000,13 +1943,10 @@ fn e2e_instr_decimal_finds_dot_position_in_trimmed_text() {
 
 #[test]
 fn e2e_upper_double_declines_to_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let vs_sql = format!(
-        "SELECT UPPER(c_double) FROM {} WHERE id = 1",
-        vs_typed_table()
-    );
+    let vs_sql = format!("SELECT UPPER(c_double) FROM {} WHERE id = 1", typed_table());
     let vs_cols = conn.query_columns(&vs_sql);
     assert_eq!(
         vs_cols.len(),
@@ -2033,10 +1973,10 @@ fn e2e_upper_double_declines_to_native_oracle() {
 
 #[test]
 fn e2e_upper_timestamp_declines_to_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let vs_sql = format!("SELECT UPPER(c_ts) FROM {} WHERE id = 1", vs_typed_table());
+    let vs_sql = format!("SELECT UPPER(c_ts) FROM {} WHERE id = 1", typed_table());
     let vs_cols = conn.query_columns(&vs_sql);
     assert_eq!(
         vs_cols.len(),
@@ -2066,13 +2006,10 @@ fn e2e_upper_timestamp_declines_to_native_oracle() {
 
 #[test]
 fn e2e_upper_boolean_declines_to_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let vs_sql = format!(
-        "SELECT UPPER(c_bool) FROM {} WHERE id = 1",
-        vs_typed_table()
-    );
+    let vs_sql = format!("SELECT UPPER(c_bool) FROM {} WHERE id = 1", typed_table());
     let vs_cols = conn.query_columns(&vs_sql);
     assert_eq!(
         vs_cols.len(),
@@ -2098,12 +2035,12 @@ fn e2e_upper_boolean_declines_to_native_oracle() {
 
 #[test]
 fn e2e_substr_left_pushdown() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT SUBSTR(name, 1, 5), LEFT(name, 5), SUBSTR(name, 7, 2) FROM {} WHERE id = 1",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(
@@ -2148,7 +2085,7 @@ fn e2e_substr_left_pushdown() {
 
 #[test]
 fn e2e_instr_arity_decline_selectlist_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let oracle = parse_int(&conn.query_columns("SELECT INSTR('aa', 'a', 2)")[0][0]);
@@ -2159,7 +2096,7 @@ fn e2e_instr_arity_decline_selectlist_matches_native_oracle() {
 
     let vs_sql = format!(
         "SELECT INSTR(c_varchar, 'a', 2) FROM {} WHERE id = 1",
-        vs_typed_table()
+        typed_table()
     );
     let vs_cols = conn.query_columns(&vs_sql);
     assert_eq!(vs_cols.len(), 1, "expected 1 column (INSTR): {vs_cols:?}");
@@ -2175,7 +2112,7 @@ fn e2e_instr_arity_decline_selectlist_matches_native_oracle() {
 
 #[test]
 fn e2e_instr_arity_decline_where_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let oracle = parse_int(&conn.query_columns("SELECT INSTR('bb', 'b', 3)")[0][0]);
@@ -2186,7 +2123,7 @@ fn e2e_instr_arity_decline_where_matches_native_oracle() {
 
     let vs_sql = format!(
         "SELECT id FROM {} WHERE INSTR(c_varchar, 'b', 3) = 0",
-        vs_typed_table()
+        typed_table()
     );
     let vs_cols = conn.query_columns(&vs_sql);
     assert_eq!(vs_cols.len(), 1, "expected 1 column (id): {vs_cols:?}");
@@ -2256,12 +2193,12 @@ fn int_set(values: &[serde_json::Value]) -> std::collections::HashSet<i64> {
 
 #[test]
 fn e2e_order_by_expression_not_selected_leaks_no_hidden_column() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, c_price FROM {} WHERE id<=5 ORDER BY ABS(c_price) DESC",
-        vs_typed_table()
+        typed_table()
     );
 
     // The sort expression references only the already-projected C_PRICE, so the projection
@@ -2299,7 +2236,7 @@ fn e2e_order_by_expression_not_selected_leaks_no_hidden_column() {
 
     let sql2 = format!(
         "SELECT id, c_price FROM {} ORDER BY ABS(c_price) DESC, c_qty+1 ASC",
-        vs_typed_table()
+        typed_table()
     );
 
     let pushed2 = explain_virtual_sql(&mut conn, &sql2);
@@ -2345,12 +2282,12 @@ fn e2e_order_by_expression_not_selected_leaks_no_hidden_column() {
 
 #[test]
 fn e2e_grouped_order_by_aggregate_not_selected_top_n_groups_limit_applies() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id FROM {} GROUP BY id ORDER BY SUM(c_qty) DESC LIMIT 4",
-        vs_typed_table()
+        typed_table()
     );
 
     let (names, cols) = query_named_columns(&mut conn, &sql);
@@ -2384,12 +2321,12 @@ fn e2e_grouped_order_by_aggregate_not_selected_top_n_groups_limit_applies() {
 
 #[test]
 fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT c_bool, COUNT(*) FROM {} GROUP BY c_bool ORDER BY SUM(c_price) DESC",
-        vs_typed_table()
+        typed_table()
     );
 
     let (names, cols) = query_named_columns(&mut conn, &sql);
@@ -2417,7 +2354,7 @@ fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
 
     let sql2 = format!(
         "SELECT c_bool, SUM(c_price) FROM {} GROUP BY c_bool ORDER BY SUM(c_price) DESC",
-        vs_typed_table()
+        typed_table()
     );
 
     let pushed2 = explain_virtual_sql(&mut conn, &sql2);
@@ -2457,12 +2394,12 @@ fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
 
 #[test]
 fn e2e_order_by_expression_also_selected_control() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, c_price, ABS(c_price) AS a FROM {} ORDER BY ABS(c_price)",
-        vs_typed_table()
+        typed_table()
     );
 
     let (names, cols) = query_named_columns(&mut conn, &sql);
@@ -2512,13 +2449,13 @@ fn e2e_order_by_expression_also_selected_control() {
 
 #[test]
 fn e2e_multi_count_distinct_order_by_expression_renders_on_wrapper() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT COUNT(DISTINCT c_bool), COUNT(DISTINCT id) FROM {} \
          ORDER BY COUNT(DISTINCT id) DESC",
-        vs_typed_table()
+        typed_table()
     );
 
     let pushed = explain_virtual_sql(&mut conn, &sql);
@@ -2546,12 +2483,12 @@ fn e2e_multi_count_distinct_order_by_expression_renders_on_wrapper() {
 
 #[test]
 fn e2e_order_by_aggregate_with_limit_zero_returns_no_rows() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT COUNT(*) FROM {} ORDER BY COUNT(*) DESC LIMIT 0",
-        vs_typed_table()
+        typed_table()
     );
 
     // Exasol pushes no `orderBy`/`limit` for a single-group aggregate; these keys do appear
@@ -2657,7 +2594,7 @@ fn grouped_by_label<T>(
 
 #[test]
 fn e2e_count_distinct_sign_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let oracle = conn.query_scalar_i64(
@@ -2675,7 +2612,7 @@ fn e2e_count_distinct_sign_matches_native_oracle() {
 
     let vs_sql = format!(
         "SELECT COUNT(DISTINCT SIGN(c_price - 3)) FROM {}",
-        vs_typed_table()
+        typed_table()
     );
     let vs_value = conn.query_scalar_i64(&vs_sql);
     assert_eq!(
@@ -2687,7 +2624,7 @@ fn e2e_count_distinct_sign_matches_native_oracle() {
 
 #[test]
 fn e2e_count_distinct_date_field_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let oracle_year = conn.query_scalar_i64(
@@ -2711,7 +2648,7 @@ fn e2e_count_distinct_date_field_matches_native_oracle() {
 
     let year_sql = format!(
         "SELECT COUNT(DISTINCT YEAR(event_date)) FROM {}",
-        vs_table()
+        events_table()
     );
     let vs_year = conn.query_scalar_i64(&year_sql);
     assert_eq!(
@@ -2722,7 +2659,7 @@ fn e2e_count_distinct_date_field_matches_native_oracle() {
 
     let week_sql = format!(
         "SELECT COUNT(DISTINCT WEEK(event_date)) FROM {}",
-        vs_table()
+        events_table()
     );
     let vs_week = conn.query_scalar_i64(&week_sql);
     assert_eq!(
@@ -2734,7 +2671,7 @@ fn e2e_count_distinct_date_field_matches_native_oracle() {
 
 #[test]
 fn e2e_count_distinct_hours_between_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let oracle = conn.query_scalar_i64(
@@ -2751,7 +2688,7 @@ fn e2e_count_distinct_hours_between_matches_native_oracle() {
     let vs_sql = format!(
         "SELECT COUNT(DISTINCT HOURS_BETWEEN(event_ts, TIMESTAMP '2024-01-01 00:00:00')) \
          FROM {}",
-        vs_table()
+        events_table()
     );
     let vs_value = conn.query_scalar_i64(&vs_sql);
     assert_eq!(
@@ -2763,7 +2700,7 @@ fn e2e_count_distinct_hours_between_matches_native_oracle() {
 
 #[test]
 fn e2e_count_distinct_instr_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let oracle = conn.query_scalar_i64(
@@ -2781,7 +2718,7 @@ fn e2e_count_distinct_instr_matches_native_oracle() {
 
     let vs_sql = format!(
         "SELECT COUNT(DISTINCT INSTR(c_varchar, 'a')) FROM {}",
-        vs_typed_table()
+        typed_table()
     );
     let vs_value = conn.query_scalar_i64(&vs_sql);
     assert_eq!(
@@ -2793,7 +2730,7 @@ fn e2e_count_distinct_instr_matches_native_oracle() {
 
 #[test]
 fn e2e_grouped_scalar_over_aggregate_sign_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let oracle_sql = "\
@@ -2821,7 +2758,7 @@ fn e2e_grouped_scalar_over_aggregate_sign_matches_native_oracle() {
 
     let vs_sql = format!(
         "SELECT c_bool, SIGN(SUM(c_price) - 10) FROM {} GROUP BY c_bool",
-        vs_typed_table()
+        typed_table()
     );
     let vs_cols = conn.query_columns(&vs_sql);
     let vs_map = grouped_by_label(&vs_cols[0], &vs_cols[1], parse_int);
@@ -2834,7 +2771,7 @@ fn e2e_grouped_scalar_over_aggregate_sign_matches_native_oracle() {
 
 #[test]
 fn e2e_grouped_scalar_over_aggregate_year_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let oracle_sql = "\
@@ -2867,7 +2804,7 @@ fn e2e_grouped_scalar_over_aggregate_year_matches_native_oracle() {
 
     let vs_sql = format!(
         "SELECT c_bool, YEAR(MIN(c_ts)) FROM {} GROUP BY c_bool",
-        vs_typed_table()
+        typed_table()
     );
     let vs_cols = conn.query_columns(&vs_sql);
     let vs_map = grouped_by_label(&vs_cols[0], &vs_cols[1], parse_int_opt);
@@ -2880,7 +2817,7 @@ fn e2e_grouped_scalar_over_aggregate_year_matches_native_oracle() {
 
 #[test]
 fn e2e_count_distinct_regexp_like_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let oracle = conn.query_scalar_i64(
@@ -2899,7 +2836,7 @@ fn e2e_count_distinct_regexp_like_matches_native_oracle() {
 
     let vs_sql = format!(
         "SELECT COUNT(DISTINCT (c_varchar REGEXP_LIKE 'a.*')) FROM {}",
-        vs_typed_table()
+        typed_table()
     );
     let vs_value = conn.query_scalar_i64(&vs_sql);
     assert_eq!(
@@ -2911,7 +2848,7 @@ fn e2e_count_distinct_regexp_like_matches_native_oracle() {
 
 #[test]
 fn e2e_count_distinct_timestamp_literal_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let oracle = conn.query_scalar_i64(
@@ -2939,7 +2876,7 @@ fn e2e_count_distinct_timestamp_literal_matches_native_oracle() {
     let vs_sql = format!(
         "SELECT COUNT(DISTINCT (CASE WHEN c_ts > TIMESTAMP '2020-01-01 00:00:00' \
          THEN 1 ELSE 0 END)) FROM {}",
-        vs_typed_table()
+        typed_table()
     );
     let vs_value = conn.query_scalar_i64(&vs_sql);
     assert_eq!(
@@ -2951,7 +2888,7 @@ fn e2e_count_distinct_timestamp_literal_matches_native_oracle() {
 
 #[test]
 fn e2e_now_family_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     // A UTC DBTIMEZONE would make the offset comparison vacuous.
@@ -2968,7 +2905,7 @@ fn e2e_now_family_matches_native_oracle() {
          {db_timezone:?}"
     );
 
-    let vs_sql = format!("SELECT SYSTIMESTAMP FROM {}", vs_typed_table());
+    let vs_sql = format!("SELECT SYSTIMESTAMP FROM {}", typed_table());
     let vs_cols = conn.query_columns(&vs_sql);
     let vs_values: Vec<&str> = vs_cols[0]
         .iter()
@@ -2980,7 +2917,7 @@ fn e2e_now_family_matches_native_oracle() {
     assert!(
         !vs_values.is_empty(),
         "SELECT SYSTIMESTAMP FROM {} returned no rows",
-        vs_typed_table()
+        typed_table()
     );
     let distinct_vs: std::collections::HashSet<&str> = vs_values.iter().copied().collect();
     assert_eq!(
@@ -2991,7 +2928,7 @@ fn e2e_now_family_matches_native_oracle() {
          regressed pushdown of now() into the scan instead returns one \
          value PER SHARD (measured as two over this two-file table \
          pre-withdrawal), got {distinct_vs:?}",
-        vs_typed_table()
+        typed_table()
     );
     let vs_ts = parse_exasol_timestamp(vs_values[0]);
 
@@ -3023,13 +2960,10 @@ fn e2e_now_family_matches_native_oracle() {
 
 #[test]
 fn e2e_declined_filter_second_arity_returns_filtered_rows() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let sql = format!(
-        "SELECT ID FROM {} WHERE SECOND(C_TS, 3) > 1",
-        vs_typed_table()
-    );
+    let sql = format!("SELECT ID FROM {} WHERE SECOND(C_TS, 3) > 1", typed_table());
     let row_count = conn.query_row_count(&sql);
     assert_eq!(
         row_count, 0,
@@ -3052,12 +2986,12 @@ fn e2e_declined_filter_second_arity_returns_filtered_rows() {
 
 #[test]
 fn e2e_declined_filter_like_on_decimal_returns_filtered_rows() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT ID FROM {} WHERE C_DECIMAL_A LIKE '1%' ORDER BY ID",
-        vs_typed_table()
+        typed_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 1, "expected 1 column (ID): {cols:?}");
@@ -3072,12 +3006,12 @@ fn e2e_declined_filter_like_on_decimal_returns_filtered_rows() {
 
 #[test]
 fn e2e_declined_filter_instr_three_arg_returns_filtered_rows() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT ID FROM {} WHERE INSTR(C_VARCHAR, 'a', 2) = 0 ORDER BY ID",
-        vs_typed_table()
+        typed_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 1, "expected 1 column (ID): {cols:?}");
@@ -3092,12 +3026,12 @@ fn e2e_declined_filter_instr_three_arg_returns_filtered_rows() {
 
 #[test]
 fn e2e_declined_filter_under_aggregate_filters_before_aggregating() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let count = conn.query_scalar_i64(&format!(
         "SELECT COUNT(*) FROM {} WHERE C_DECIMAL_A LIKE '1%'",
-        vs_typed_table()
+        typed_table()
     ));
     assert_eq!(
         count, 3,
@@ -3108,12 +3042,12 @@ fn e2e_declined_filter_under_aggregate_filters_before_aggregating() {
 
 #[test]
 fn e2e_declined_filter_under_order_by_limit_filters_before_truncating() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let cols = conn.query_columns(&format!(
         "SELECT ID FROM {} WHERE C_DECIMAL_A LIKE '1%' ORDER BY ID LIMIT 2",
-        vs_typed_table()
+        typed_table()
     ));
     assert_eq!(cols.len(), 1, "expected 1 column (ID): {cols:?}");
     let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
@@ -3128,13 +3062,10 @@ fn e2e_declined_filter_under_order_by_limit_filters_before_truncating() {
 
 #[test]
 fn e2e_declined_filter_select_star_returns_full_row_shape() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let sql = format!(
-        "SELECT * FROM {} WHERE SECOND(C_TS, 3) > 1",
-        vs_typed_table()
-    );
+    let sql = format!("SELECT * FROM {} WHERE SECOND(C_TS, 3) > 1", typed_table());
     // `execute` panics on a rejected pushdown, so reaching here proves Exasol accepted it.
     let resp = conn.execute(&sql);
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
@@ -3158,13 +3089,13 @@ fn e2e_declined_filter_select_star_returns_full_row_shape() {
 
 #[test]
 fn e2e_both_dialects_unrenderable_predicate_errors_without_rows() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT ID FROM {} WHERE CAST(C_VARCHAR AS HASHTYPE) = \
          CAST('00000000000000000000000000000000' AS HASHTYPE)",
-        vs_typed_table()
+        typed_table()
     );
     let resp = conn.try_execute(&sql);
     assert_eq!(
@@ -3188,13 +3119,13 @@ fn e2e_both_dialects_unrenderable_predicate_errors_without_rows() {
 
 #[test]
 fn char_declared_pushdown_shapes_match_native() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT CASE WHEN score <= 50.0 THEN 'LOW' ELSE 'BIG' END g, COUNT(*) c \
          FROM {} GROUP BY 1 ORDER BY 1",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (g, c): {cols:?}");
@@ -3224,7 +3155,7 @@ fn char_declared_pushdown_shapes_match_native() {
 
     let sql = format!(
         "SELECT CAST(name AS CHAR(20)) FROM {} WHERE id = 1",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 1, "expected 1 column: {cols:?}");
@@ -3252,7 +3183,10 @@ fn char_declared_pushdown_shapes_match_native() {
          (not VARCHAR(20)), got: {pushed_sql}"
     );
 
-    let sql = format!("SELECT 'X' g, COUNT(*) c FROM {} GROUP BY 1", vs_table());
+    let sql = format!(
+        "SELECT 'X' g, COUNT(*) c FROM {} GROUP BY 1",
+        events_table()
+    );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (g, c): {cols:?}");
     assert_eq!(
@@ -3279,7 +3213,7 @@ fn char_declared_pushdown_shapes_match_native() {
          CHAR(1) (not VARCHAR(1)), got: {pushed_sql}"
     );
 
-    let sql = format!("SELECT name, COUNT(*) c FROM {} GROUP BY 1", vs_table());
+    let sql = format!("SELECT name, COUNT(*) c FROM {} GROUP BY 1", events_table());
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (name, c): {cols:?}");
     assert_eq!(
@@ -3298,7 +3232,7 @@ fn char_declared_pushdown_shapes_match_native() {
 
 #[test]
 fn char_group_key_merges_trailing_space_variants_like_native() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -3369,7 +3303,7 @@ fn char_group_key_merges_trailing_space_variants_like_native() {
 
 #[test]
 fn over_length_char_group_key_raises_truncation_error_like_native() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -3407,7 +3341,7 @@ fn over_length_char_group_key_raises_truncation_error_like_native() {
 
 #[test]
 fn over_length_char_projection_fails_cleanly() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -3445,7 +3379,7 @@ fn over_length_char_projection_fails_cleanly() {
 
 #[test]
 fn e2e_float_div_decimal_over_int_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let oracle_cols = conn.query_columns("SELECT CAST(40.99 AS DECIMAL(9,2)) / 7");
@@ -3456,7 +3390,7 @@ fn e2e_float_div_decimal_over_int_matches_native_oracle() {
         "native oracle 40.99/7 must be ~5.855714285714286, got {oracle_value}"
     );
 
-    let vs_sql = format!("SELECT C_DECIMAL_A/7 FROM {} WHERE ID=6", vs_typed_table());
+    let vs_sql = format!("SELECT C_DECIMAL_A/7 FROM {} WHERE ID=6", typed_table());
     let vs_cols = conn.query_columns(&vs_sql);
     let vs_value = parse_numeric(&vs_cols[0][0]);
     assert!(
@@ -3469,7 +3403,7 @@ fn e2e_float_div_decimal_over_int_matches_native_oracle() {
 
 #[test]
 fn e2e_float_div_decimal_over_decimal_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let oracle_cols = conn
@@ -3483,7 +3417,7 @@ fn e2e_float_div_decimal_over_decimal_matches_native_oracle() {
 
     let vs_sql = format!(
         "SELECT C_DECIMAL_A/C_DECIMAL_B FROM {} WHERE ID=6",
-        vs_typed_table()
+        typed_table()
     );
     let vs_cols = conn.query_columns(&vs_sql);
     let vs_value = parse_numeric(&vs_cols[0][0]);
@@ -3517,12 +3451,12 @@ fn assert_pushed_into_scan(conn: &mut ExaConn, sql: &str, pattern: &str) {
 /// Scenario: A string-literal format translates to a strftime pattern
 #[test]
 fn e2e_to_date_to_timestamp_translated_format_matches_native() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let date_sql = format!(
         "SELECT TO_DATE(CAST(event_date AS VARCHAR(10)), 'YYYY-MM-DD') FROM {} WHERE id = 1",
-        vs_table()
+        events_table()
     );
     let native_date = first_cell(&mut conn, "SELECT TO_DATE('2024-01-01', 'YYYY-MM-DD')");
     assert_eq!(first_cell(&mut conn, &date_sql), native_date);
@@ -3531,7 +3465,7 @@ fn e2e_to_date_to_timestamp_translated_format_matches_native() {
     let timestamp_sql = format!(
         "SELECT TO_TIMESTAMP(CAST(event_date AS VARCHAR(10)) || ' 10:11:12', \
          'YYYY-MM-DD HH24:MI:SS') FROM {} WHERE id = 1",
-        vs_table()
+        events_table()
     );
     let native_timestamp = first_cell(
         &mut conn,
@@ -3542,7 +3476,7 @@ fn e2e_to_date_to_timestamp_translated_format_matches_native() {
     let filter_sql = format!(
         "SELECT id FROM {} WHERE TO_TIMESTAMP(CAST(event_date AS VARCHAR(10)) || ' 10:11:12.250', \
          'yyyy-mm-dd hh24:mi:ss.ff3') > TIMESTAMP '2024-01-15 10:11:12.000' ORDER BY id",
-        vs_table()
+        events_table()
     );
     assert_eq!(
         ids_of_first_column(&mut conn, &filter_sql),
@@ -3559,7 +3493,7 @@ fn e2e_to_date_to_timestamp_translated_format_matches_native() {
     );
     let empty_sql = format!(
         "SELECT TO_DATE(SUBSTR(name, 1, 0), 'YYYY-MM-DD') FROM {} WHERE id = 1",
-        vs_table()
+        events_table()
     );
     assert_eq!(first_cell(&mut conn, &empty_sql), serde_json::Value::Null);
     assert_pushed_into_scan(&mut conn, &empty_sql, "nullif(");
@@ -3568,13 +3502,13 @@ fn e2e_to_date_to_timestamp_translated_format_matches_native() {
 /// Scenario: A string-literal format translates to a strftime pattern
 #[test]
 fn e2e_to_timestamp_microsecond_fraction_filters_in_scan() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id FROM {} WHERE TO_TIMESTAMP(CAST(event_date AS VARCHAR(10)) || ' 10:11:12.000500', \
          'YYYY-MM-DD HH24:MI:SS.FF6') > TIMESTAMP '2024-01-15 10:11:12.000' ORDER BY id",
-        vs_table()
+        events_table()
     );
     // The scan filters at full precision on every engine; 8.x only renders the output in
     // milliseconds, because a native 8.x table cannot hold the microseconds to filter on.
@@ -3588,21 +3522,21 @@ fn e2e_to_timestamp_microsecond_fraction_filters_in_scan() {
 /// Scenario: A string Exasol rejects for a translated format fails the query
 #[test]
 fn e2e_to_date_translated_format_fails_on_rejected_input() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     query_error(&mut conn, "SELECT TO_DATE('event-01', 'YYYY-MM-DD')");
 
     let select_sql = format!(
         "SELECT TO_DATE(name, 'YYYY-MM-DD') FROM {} WHERE id = 1",
-        vs_table()
+        events_table()
     );
     assert_query_fails(&mut conn, &select_sql, &["event-01", "%Y-%m-%d"]);
     assert_query_fails(
         &mut conn,
         &format!(
             "SELECT COUNT(*) FROM {} WHERE TO_DATE(name, 'YYYY-MM-DD') > DATE '2000-01-01'",
-            vs_table()
+            events_table()
         ),
         &["Error parsing timestamp", "%Y-%m-%d"],
     );
@@ -3610,7 +3544,7 @@ fn e2e_to_date_translated_format_fails_on_rejected_input() {
         &mut conn,
         &format!(
             "SELECT TO_DATE(CAST(event_date AS VARCHAR(10)), 'YYYY-DD-MM') FROM {} WHERE id = 13",
-            vs_table()
+            events_table()
         ),
         &["2024-01-13", "%Y-%d-%m"],
     );
@@ -3633,13 +3567,13 @@ fn assert_evaluated_in_exasol(conn: &mut ExaConn, sql: &str) {
 /// Scenario: A declined format returns the native result in the select list and in a filter
 #[test]
 fn e2e_to_date_declined_format_matches_native() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let filter_sql = format!(
         "SELECT id FROM {} WHERE TO_DATE(CAST(id AS VARCHAR(2)) || '-JAN-2024', 'DD-MON-YYYY') \
          > DATE '2024-01-17' ORDER BY id",
-        vs_table()
+        events_table()
     );
     assert_eq!(
         ids_of_first_column(&mut conn, &filter_sql),
@@ -3650,7 +3584,7 @@ fn e2e_to_date_declined_format_matches_native() {
     let select_sql = format!(
         "SELECT TO_DATE(CAST(id AS VARCHAR(2)) || '-JAN-2024', 'DD-MON-YYYY') FROM {} \
          WHERE id = 18",
-        vs_table()
+        events_table()
     );
     let native = first_cell(&mut conn, "SELECT TO_DATE('18-JAN-2024', 'DD-MON-YYYY')");
     assert_eq!(first_cell(&mut conn, &select_sql), native);

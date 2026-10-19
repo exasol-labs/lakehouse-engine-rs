@@ -38,10 +38,9 @@ single-table and N-scan join wrapper), `pushdown-aggregates/pushdown-planning-si
   not rely on Exasol to restore. Live precedent under `add-topn-pushdown` B5/B6 (issues #225 /
   #189): an `orderBy` pushed TOGETHER with a `limit` is fully delegated — Exasol re-applies
   neither, so the withheld-limit fallback returned wrong, unsorted, unbounded rows and the
-  adapter now renders a self-contained global `ORDER BY … LIMIT` (`topn.rs` lines 444-449,
-  `mod.rs` lines 690-694). An `orderBy` pushed WITHOUT a `limit` behaves differently: Exasol
-  keeps its own top-level `ORDER BY` and re-sorts the returned rows (`tests/e2e_scan_test.rs`
-  lines 1133-1138).
+  adapter now renders a self-contained global `ORDER BY … LIMIT`. An `orderBy` pushed WITHOUT a
+  `limit` behaves differently: Exasol keeps its own top-level `ORDER BY` and re-sorts the
+  returned rows.
 * **The advertisement retires the recorded structural-unreachability argument, and exposes a
   separate missing-`LIMIT` defect on the single-group aggregate merge.** It was previously argued
   that the `effective_limit` drop site never executes for the single-group aggregate, because

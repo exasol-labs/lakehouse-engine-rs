@@ -1,14 +1,11 @@
-#![cfg(feature = "exasol-e2e")]
-
-mod common;
-use common::e2e_harness::*;
-use common::exasol_ws::ExaConn;
-use common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, seed_events};
-use common::stack::{
-    exasol_host, exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal,
-    local_stack_connection_password, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
+use crate::common::e2e_harness::*;
+use crate::common::exasol_ws::ExaConn;
+use crate::common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS};
+use crate::common::stack::{
+    exasol_host, exasol_sql_port, iceberg_catalog_url_internal, local_stack_connection_password,
 };
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use crate::fixtures::{events, stack, vs_table};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 const CONN_NAME: &str = "CREDEXP_CATALOG_CREDS";
 const VS_NAME: &str = "CREDEXP_VS";
@@ -21,7 +18,7 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|p| p.into_inner())
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn owner_conn() -> ExaConn {
@@ -42,10 +39,6 @@ fn reader_conn() -> ExaConn {
     )
 }
 
-fn vs_table() -> String {
-    format!("{VS_NAME}.{}", E2E_TABLE.to_uppercase())
-}
-
 fn scan_grant_sql(verb: &str, preposition: &str) -> String {
     format!(
         "{verb} ACCESS ON CONNECTION {CONN_NAME} FOR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME} {preposition} {OWNER_USER}"
@@ -54,25 +47,10 @@ fn scan_grant_sql(verb: &str, preposition: &str) -> String {
 
 fn setup_e2e() {
     SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        wait_for_seaweedfs();
-        wait_for_iceberg_catalog();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            seed_events(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed");
-        });
-
-        install_slc();
-        upload_so();
+        stack();
+        events();
 
         let mut sys = exa_conn();
-        create_schema_and_scripts(&mut sys);
 
         let _ = sys.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {VS_NAME} CASCADE"));
         sys.execute(&format!("DROP USER IF EXISTS {READER_USER} CASCADE"));
@@ -122,8 +100,11 @@ fn a_least_privilege_reader_gets_the_owners_rows_without_a_connection_grant() {
     let _serial = serial();
     setup_e2e();
 
-    let count_sql = format!("SELECT COUNT(*) FROM {}", vs_table());
-    let filtered_sql = format!("SELECT COUNT(*) FROM {} WHERE SCORE > 15.0", vs_table());
+    let count_sql = format!("SELECT COUNT(*) FROM {}", vs_table(VS_NAME, E2E_TABLE));
+    let filtered_sql = format!(
+        "SELECT COUNT(*) FROM {} WHERE SCORE > 15.0",
+        vs_table(VS_NAME, E2E_TABLE)
+    );
 
     let owner_total = owner_conn().query_scalar_i64(&count_sql);
     let owner_filtered = owner_conn().query_scalar_i64(&filtered_sql);
@@ -155,7 +136,7 @@ fn the_readers_pushdown_plan_names_the_connection_and_carries_no_credential() {
         &mut reader_conn(),
         &format!(
             "SELECT ID, NAME, SCORE FROM {} WHERE SCORE > 15.0",
-            vs_table()
+            vs_table(VS_NAME, E2E_TABLE)
         ),
     );
 
@@ -188,7 +169,7 @@ fn revoking_the_owners_scan_grant_denies_the_reader_without_leaking_the_credenti
     let password = local_stack_connection_password();
     let query = format!(
         "SELECT ID, NAME, SCORE FROM {} WHERE SCORE > 15.0",
-        vs_table()
+        vs_table(VS_NAME, E2E_TABLE)
     );
 
     assert_eq!(
@@ -235,7 +216,7 @@ fn the_reader_cannot_execute_the_pushdown_plan_it_captured() {
     let password = local_stack_connection_password();
     let query = format!(
         "SELECT ID, NAME, SCORE FROM {} WHERE SCORE > 15.0",
-        vs_table()
+        vs_table(VS_NAME, E2E_TABLE)
     );
 
     let isolated = isolated_pushdown_statement(&mut reader_conn(), &query);

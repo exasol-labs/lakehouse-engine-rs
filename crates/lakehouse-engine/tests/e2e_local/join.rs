@@ -1,18 +1,14 @@
 //! E2E inner equi-join pushdown tests: broadcast join and the unaccelerated fallback,
 //! which must return identical results. Fail, never skip, without the stack.
-#![cfg(feature = "exasol-e2e")]
 
-mod common;
-use common::e2e_harness::*;
-use common::exasol_ws::ExaConn;
-use common::seed::{
+use crate::common::e2e_harness::*;
+use crate::common::exasol_ws::ExaConn;
+use crate::common::seed::{
     DIM_CUSTOMER_ROWS, E2E_BLANK_LABEL_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE,
     E2E_SUPPLIER_TABLE, FACT_ORDERS_ROWS, LINEITEM_ROWS, O_TOTALPRICE_PS, order_custkey,
-    order_date_days, order_totalprice_unscaled, seed_events,
+    order_date_days, order_totalprice_unscaled,
 };
-use common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
-};
+use crate::fixtures::{events, stack, vs_table};
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -26,25 +22,9 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
 fn setup_e2e() {
     SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        wait_for_seaweedfs();
-        wait_for_iceberg_catalog();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            seed_events(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed Iceberg star-schema tables")
-        });
-
-        install_slc();
-        upload_so();
-
+        stack();
+        events();
         let mut conn = exa_conn();
-        create_schema_and_scripts(&mut conn);
         // Each `create_virtual_schema` re-issues the catalog CONNECTION idempotently.
         create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, E2E_NAMESPACE));
         create_virtual_schema(
@@ -54,25 +34,13 @@ fn setup_e2e() {
     });
 }
 
-fn vs_lineitem_table(vs_name: &str) -> String {
-    format!("{vs_name}.{}", E2E_LINEITEM_TABLE.to_uppercase())
-}
-
-fn vs_supplier_table(vs_name: &str) -> String {
-    format!("{vs_name}.{}", E2E_SUPPLIER_TABLE.to_uppercase())
-}
-
-fn vs_blank_label_table(vs_name: &str) -> String {
-    format!("{vs_name}.{}", E2E_BLANK_LABEL_TABLE.to_uppercase())
-}
-
 fn blank_label_join_query(vs_name: &str, order_by: &str, limit: usize) -> String {
     format!(
         "SELECT b.B_LABEL, o.O_ORDERKEY FROM {} o \
          JOIN {} b ON o.O_CUSTKEY = b.B_CUSTKEY \
          ORDER BY {order_by} LIMIT {limit}",
         vs_fact_table(vs_name),
-        vs_blank_label_table(vs_name)
+        vs_table(vs_name, E2E_BLANK_LABEL_TABLE)
     )
 }
 
@@ -635,7 +603,7 @@ fn three_table_join_query(vs_name: &str) -> String {
          JOIN {} l ON o.O_ORDERKEY = l.L_ORDERKEY",
         vs_dim_table(vs_name),
         vs_fact_table(vs_name),
-        vs_lineitem_table(vs_name)
+        vs_table(vs_name, E2E_LINEITEM_TABLE)
     )
 }
 
@@ -647,8 +615,8 @@ fn four_table_join_query(vs_name: &str) -> String {
          JOIN {} s ON l.L_SUPPKEY = s.S_SUPPKEY",
         vs_dim_table(vs_name),
         vs_fact_table(vs_name),
-        vs_lineitem_table(vs_name),
-        vs_supplier_table(vs_name)
+        vs_table(vs_name, E2E_LINEITEM_TABLE),
+        vs_table(vs_name, E2E_SUPPLIER_TABLE)
     )
 }
 
@@ -687,7 +655,7 @@ fn expected_three_table_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<Vec<
 
     let line_cols = conn.query_columns(&format!(
         "SELECT L_ORDERKEY, L_LINENUMBER, L_QUANTITY FROM {}",
-        vs_lineitem_table(vs_name)
+        vs_table(vs_name, E2E_LINEITEM_TABLE)
     ));
     assert_eq!(line_cols.len(), 3, "lineitem query must return 3 columns");
 
@@ -721,12 +689,12 @@ fn expected_four_table_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<Vec<S
     )));
     let suppkey_to_name = build_key_to_value_map(&conn.query_columns(&format!(
         "SELECT S_SUPPKEY, S_NAME FROM {}",
-        vs_supplier_table(vs_name)
+        vs_table(vs_name, E2E_SUPPLIER_TABLE)
     )));
 
     let line_cols = conn.query_columns(&format!(
         "SELECT L_ORDERKEY, L_LINENUMBER, L_QUANTITY, L_SUPPKEY FROM {}",
-        vs_lineitem_table(vs_name)
+        vs_table(vs_name, E2E_LINEITEM_TABLE)
     ));
     assert_eq!(line_cols.len(), 4, "lineitem query must return 4 columns");
 
@@ -851,7 +819,7 @@ fn scalar_over_aggregate_join_query(vs_name: &str) -> String {
          GROUP BY l.L_RETURNFLAG HAVING COUNT(*) > 0 ORDER BY 1 LIMIT 2",
         scalar_over_aggregate_select_list("l."),
         vs_fact_table(vs_name),
-        vs_lineitem_table(vs_name)
+        vs_table(vs_name, E2E_LINEITEM_TABLE)
     )
 }
 
@@ -864,7 +832,7 @@ fn scalar_over_aggregate_n_table_join_query(vs_name: &str) -> String {
         scalar_over_aggregate_select_list("l."),
         vs_dim_table(vs_name),
         vs_fact_table(vs_name),
-        vs_lineitem_table(vs_name)
+        vs_table(vs_name, E2E_LINEITEM_TABLE)
     )
 }
 
@@ -876,7 +844,7 @@ fn ensure_ground_truth_lineitem_table(conn: &mut ExaConn) {
     conn.execute(&format!(
         "CREATE OR REPLACE TABLE {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE} AS \
          SELECT L_RETURNFLAG, L_QUANTITY, L_EXTENDEDPRICE FROM {}",
-        vs_lineitem_table(VS_NAME)
+        vs_table(VS_NAME, E2E_LINEITEM_TABLE)
     ));
 }
 
@@ -1102,7 +1070,7 @@ fn three_table_join_with_mixed_filters_query(vs_name: &str) -> String {
          AND SECOND(o.O_ORDERDATE, 3) = 0",
         vs_dim_table(vs_name),
         vs_fact_table(vs_name),
-        vs_lineitem_table(vs_name)
+        vs_table(vs_name, E2E_LINEITEM_TABLE)
     )
 }
 
@@ -1122,7 +1090,7 @@ fn expected_three_table_join_rows_with_orderdate_filter(
 
     let line_cols = conn.query_columns(&format!(
         "SELECT L_ORDERKEY, L_LINENUMBER, L_QUANTITY FROM {}",
-        vs_lineitem_table(vs_name)
+        vs_table(vs_name, E2E_LINEITEM_TABLE)
     ));
     assert_eq!(line_cols.len(), 3, "lineitem query must return 3 columns");
 
@@ -1675,7 +1643,7 @@ fn e2e_scalar_over_aggregate_ungrouped_join_matches_native_oracle() {
         "SELECT ROUND(SUM(l.L_QUANTITY), 2) FROM {} o \
          JOIN {} l ON o.O_ORDERKEY = l.L_ORDERKEY",
         vs_fact_table(VS_NAME),
-        vs_lineitem_table(VS_NAME)
+        vs_table(VS_NAME, E2E_LINEITEM_TABLE)
     );
 
     let pushed = explain_virtual_sql(&mut conn, &query);
