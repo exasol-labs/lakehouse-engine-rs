@@ -1849,12 +1849,12 @@ fn renders_to_date_to_timestamp() {
         "name": "TO_DATE",
         "arguments": [
             {"type": "column", "name": "s"},
-            {"type": "literal_string", "value": "%Y-%m-%d"}
+            {"type": "literal_string", "value": "YYYY-MM-DD"}
         ]
     });
     assert_eq!(
         render_expression(&expr2).unwrap(),
-        r#"to_date("S", '%Y-%m-%d')"#
+        r#"to_date(nullif("S", ''), '%Y-%m-%d')"#
     );
 
     let expr3 = json!({
@@ -1869,12 +1869,12 @@ fn renders_to_date_to_timestamp() {
         "name": "TO_TIMESTAMP",
         "arguments": [
             {"type": "column", "name": "s"},
-            {"type": "literal_string", "value": "%Y-%m-%d %H:%M:%S"}
+            {"type": "literal_string", "value": "YYYY-MM-DD HH24:MI:SS"}
         ]
     });
     assert_eq!(
         render_expression(&expr4).unwrap(),
-        r#"to_timestamp("S", '%Y-%m-%d %H:%M:%S')"#
+        r#"to_timestamp(nullif("S", ''), '%Y-%m-%d %H:%M:%S')"#
     );
 }
 
@@ -2853,8 +2853,66 @@ fn renders_to_date_to_timestamp_verbatim_in_exasol_dialect() {
         );
         assert_eq!(
             render_expression(&formatted).unwrap(),
-            format!(r#"{df_name}("S", 'YYYY-MM-DD')"#),
-            "the DataFusion dialect must stay unchanged for {exasol_name} with a format"
+            format!(r#"{df_name}(nullif("S", ''), '%Y-%m-%d')"#),
+            "the DataFusion dialect must translate the format of {exasol_name}"
+        );
+    }
+}
+
+/// Scenario: A format the translation cannot express declines in the DataFusion dialect
+#[test]
+fn to_date_to_timestamp_decline_untranslatable_format() {
+    let cases = [
+        (
+            "TO_DATE",
+            vec![
+                json!({"type": "column", "name": "s"}),
+                json!({"type": "column", "name": "f"}),
+            ],
+            r#"TO_DATE("S", "F")"#,
+        ),
+        (
+            "TO_TIMESTAMP",
+            vec![
+                json!({"type": "column", "name": "s"}),
+                json!({"type": "literal_null"}),
+            ],
+            r#"TO_TIMESTAMP("S", NULL)"#,
+        ),
+        (
+            "TO_DATE",
+            vec![
+                json!({"type": "column", "name": "s"}),
+                json!({"type": "literal_string", "value": "DD-MON-YYYY"}),
+            ],
+            r#"TO_DATE("S", 'DD-MON-YYYY')"#,
+        ),
+        (
+            "TO_DATE",
+            vec![
+                json!({"type": "column", "name": "s"}),
+                json!({"type": "literal_string", "value": "YYYY-MM-DD HH24:MI"}),
+            ],
+            r#"TO_DATE("S", 'YYYY-MM-DD HH24:MI')"#,
+        ),
+        (
+            "TO_TIMESTAMP",
+            vec![
+                json!({"type": "column", "name": "s"}),
+                json!({"type": "literal_string", "value": "YYYY-MM-DD"}),
+                json!({"type": "literal_string", "value": "extra"}),
+            ],
+            r#"TO_TIMESTAMP("S", 'YYYY-MM-DD', 'extra')"#,
+        ),
+        ("TO_DATE", vec![], "TO_DATE()"),
+    ];
+    for (name, arguments, exasol_sql) in cases {
+        let expr = json!({"type": "function_scalar", "name": name, "arguments": arguments});
+        assert!(render_expression(&expr).is_err(), "{exasol_sql} must err");
+        assert_eq!(render_expression_safe(&expr), None, "{exasol_sql}");
+        assert_eq!(
+            render_expression_exasol(&expr).as_deref().ok(),
+            Some(exasol_sql)
         );
     }
 }

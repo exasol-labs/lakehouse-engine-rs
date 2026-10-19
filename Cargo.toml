@@ -26,6 +26,8 @@ datafusion = { version = "54.1", default-features = false, features = ["parquet"
 
 object_store = { version = "0.13.2", features = ["aws"] }
 
+regex = { version = "1" }
+
 # Same line iceberg resolves, so the vendored `build_deletes_row_selection` shares its type.
 roaring = { version = "0.11" }
 
