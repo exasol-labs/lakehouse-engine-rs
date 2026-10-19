@@ -13,15 +13,15 @@ Resolves a Unity Catalog table whose `data_source_format` is `PARQUET` into the 
 ### Scenario: A Unity Parquet table lists its files through the shared directory seam and reads no footer
 
 * *GIVEN* a Unity Catalog table reporting `data_source_format` `PARQUET` whose storage location holds Parquet data files at more than one directory depth, plus a `_SUCCESS` object, a `_temporary/` directory, and a `.hidden` object
-* *WHEN* the Unity Parquet format reader resolves that table's scan
-* *THEN* the reader SHALL obtain the file list, each file's byte size, and each file's partition values from the listing answer of the ONE shared directory seam (`direct-storage/parquet-directory-seam-file-listing`), under that seam's data-file rule unchanged
+* *WHEN* the catalog-declared Parquet format reader resolves that table's scan
+* *THEN* the reader SHALL obtain the file list, each file's byte size, and each file's partition values from the listing answer of the ONE shared directory seam (`direct-storage/parquet-directory-seam-file-listing`), under that seam's data-file rule
 * *AND* the reader MUST NOT read any Parquet footer at plan time, because the catalog already declares the schema
 * *AND* each returned file entry SHALL carry its path percent-encoded relative to the table root, its byte size, and an EMPTY delete-mechanism list, exactly as a direct-storage file entry does
 
 ### Scenario: A Unity Parquet scan carries no field-id mapping and is file-pruning-blind
 
 * *GIVEN* the same Unity Catalog Parquet table
-* *WHEN* the Unity Parquet format reader resolves that table's scan
+* *WHEN* the catalog-declared Parquet format reader resolves that table's scan
 * *THEN* the returned table root SHALL be the table's catalog-reported storage location, and the returned name mapping SHALL be EMPTY
 * *AND* a data file whose name lacks the `.parquet` suffix SHALL NOT be read, as a documented trade-off: a Spark or Databricks writer always names a Parquet data file with that suffix, and the user documentation SHALL state the rule
 * *AND* a filter on a non-partition column SHALL narrow the rows the scan emits but not the files it reads, because Unity Catalog carries no per-file statistics for a Parquet table and this reader reads no footer
@@ -78,7 +78,7 @@ Resolves a Unity Catalog table whose `data_source_format` is `PARQUET` into the 
 
 * *GIVEN* a Unity Parquet table and a CONNECTION that either enables `use_vended_credentials` or supplies static storage credentials
 * *WHEN* the reader resolves that table's scan
-* *THEN* the reader SHALL resolve its storage through the SAME component the Delta reader uses, so the empty-location refusal, the per-table `READ`-scoped vend against the table's own vending key, the refusal without a static fallback when no vending key is reported, the static backend when vending is disabled, and the shared vended-storage policy all apply unchanged (`delta/delta-table-planning`, `unity-catalog/unity-catalog-vended-credentials`)
+* *THEN* the reader SHALL resolve its storage through the SAME component the Delta reader uses, so the empty-location refusal, the per-table `READ`-scoped vend against the table's own vending key, the refusal without a static fallback when no vending key is reported, the static backend when vending is disabled, and the shared vended-storage policy all apply (`delta/delta-table-planning`, `unity-catalog/unity-catalog-vended-credentials`)
 * *AND* the reader SHALL list the files through an object store built from that effective storage, and SHALL return that effective storage, which the shard-invariant common spec carries sealed under vending and as a CONNECTION reference otherwise
 * *AND* every error the reader surfaces SHALL be redacted against the effective storage's secret values, and MUST NOT contain any vended or static credential value
 

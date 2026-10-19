@@ -1,6 +1,6 @@
 # Decisions: change-iceberg-datafusion-deps
 
-## ADR: Pin iceberg 0.10.0 via crates.io registry version, not git tag
+## ADR: Pin iceberg via the crates.io registry release, not a git tag
 
 **ID:** pin-iceberg-0-10-0-via-crates-io-registry-version-not-git-tag
 **Plan:** change-iceberg-datafusion-deps
@@ -8,7 +8,7 @@
 
 ### Context
 
-The final iceberg release is on crates.io, so a git pin is no longer needed.
+A released iceberg version is on crates.io, so a git pin is no longer needed.
 
 ### Decision
 

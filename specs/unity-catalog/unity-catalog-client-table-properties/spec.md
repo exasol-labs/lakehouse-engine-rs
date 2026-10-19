@@ -2,8 +2,6 @@
 
 Extends `unity-catalog/unity-catalog-client` with the carriage of each table's properties from the list sweep and the single-table load.
 
-This is a sibling of `unity-catalog/unity-catalog-client`, split out once that feature's scenario count crossed this library's per-spec organization threshold. The parent feature keeps its original scope.
-
 ## Background
 
 * The scenarios here share the parent feature's Background.

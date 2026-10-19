@@ -13,10 +13,10 @@ Removes the per-column `tableAlias` that Exasol stamps on a single-table query w
 
 ### Scenario: Single-table pushdown strips each column's table alias so the scan resolves bare names
 
-* *GIVEN* a single-table (non-join) `pushdown` request whose `from` aliases the table (e.g. `FROM customer c`), so Exasol stamps a `tableAlias` on every `column` node — including nodes the user wrote unqualified (an unqualified `WHERE c_custkey <= 3` under `FROM customer c` still carries `tableAlias`)
+* *GIVEN* a single-table (non-join) `pushdown` request whose `from` aliases the table (e.g. `FROM customer c`), so Exasol stamps a `tableAlias` on every `column` node, including nodes the user wrote unqualified (an unqualified `WHERE c_custkey <= 3` under `FROM customer c` still carries `tableAlias`)
 * *AND* the request may take any single-table shape the spike proved leaks the alias: row-scan projection, a scalar expression over a column in the select list (e.g. `c.C_CUSTKEY + 1`), single-group aggregate, grouped aggregate, or an ordered top-N
 * *WHEN* the adapter plans the single-table push, after the join classifier reports the request is not a join
-* *THEN* the adapter SHALL remove every `column` node's `tableAlias` from the pushdown-request subtrees it renders into the DataFusion scan-driving SQL — the filter predicate, the projected select-list expressions, the GROUP BY keys, the HAVING, the ORDER BY keys, and every aggregate argument — before rendering them, so each column renders as a BARE double-quoted name (`"C_CUSTKEY"`) that resolves against the single scan relation
+* *THEN* the adapter SHALL remove every `column` node's `tableAlias` from the pushdown-request subtrees it renders into the DataFusion scan-driving SQL, the filter predicate, the projected select-list expressions, the GROUP BY keys, the HAVING, the ORDER BY keys, and every aggregate argument, before rendering them, so each column renders as a BARE double-quoted name (`"C_CUSTKEY"`) that resolves against the single scan relation
 * *AND* the adapter MUST NOT render any such column as an alias-qualified name (`"C"."C_CUSTKEY"`), which does not resolve against the single scan relation
 * *AND* the adapter SHALL leave each `column` node's `tableName` intact, so alias removal does not disturb any reader that keys on `tableName`
 

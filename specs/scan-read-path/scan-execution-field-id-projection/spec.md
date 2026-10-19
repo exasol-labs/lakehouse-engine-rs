@@ -72,7 +72,7 @@ Binds each logical column of the scan spec's logical schema to a physical Parque
 
 ### Scenario: A logical field carrying no binding key binds by its own name
 
-* *GIVEN* a scan spec whose logical schema carries a field with NO field-id and NO declared physical name — the identity binding a Delta `none` column mapping produces, and the one a direct-storage table's merged Parquet schema produces for EVERY field — a second such field that is ABSENT from one assigned file and nullable, and a third such field that is absent from that file, required, and carries no `initial-default`
+* *GIVEN* a scan spec whose logical schema carries a field with NO field-id and NO declared physical name, the identity binding a Delta `none` column mapping produces, and the one a direct-storage table's merged Parquet schema produces for EVERY field, a second such field that is ABSENT from one assigned file and nullable, and a third such field that is absent from that file, required, and carries no `initial-default`
 * *WHEN* the scan UDF reads the assigned files
 * *THEN* the UDF SHALL install the column-binding adapter, because the scan spec CARRIES a logical schema, and SHALL bind the identity-bound field to the physical column whose name equals its logical name
 * *AND* the UDF SHALL emit NULL for the absent nullable field for rows from the file lacking it, and SHALL emit its `initial-default` instead when one is encoded, per file

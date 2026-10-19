@@ -25,14 +25,14 @@ The `createVirtualSchema` declaration flattens multi-level namespaces into table
 
 ### Scenario: A non-ASCII Iceberg table and column name stay queryable end to end
 
-* *GIVEN* a live Exasol instance, an Iceberg REST catalog, and an Iceberg table whose TABLE name and one of whose COLUMN names are both the non-ASCII identifier `straße` — that column an Iceberg `string` column whose seeded values carry distinguishable prefixes, alongside an `id` column
+* *GIVEN* a live Exasol instance, an Iceberg REST catalog, and an Iceberg table whose TABLE name and one of whose COLUMN names are both the non-ASCII identifier `straße`, that column an Iceberg `string` column whose seeded values carry distinguishable prefixes, alongside an `id` column
 * *AND* a virtual schema created over that namespace through a real `createVirtualSchema`
 * *WHEN* an Exasol user queries that table and that column through the virtual schema
 * *THEN* `SYS.EXA_ALL_COLUMNS` and `SYS.EXA_ALL_TABLES` SHALL report both identifiers as `STRASSE`, pinning the full-Unicode `ß`-to-`SS` expansion as observed behavior rather than as documentation
 * *AND* an unquoted `SELECT COUNT(*)` over the table SHALL return the seeded row count, so the uppercased table name still resolves through `TABLE_MAP` back to the original-cased Iceberg identifier `straße` and the scan reaches the real table
 * *AND* an unquoted projection of the column SHALL return the seeded values in full, so the uppercased column name still maps back to the Iceberg field's own casing at scan time
 * *AND* a `LIKE` predicate over that column SHALL return the correct subset of rows
-* *AND* the adapter-generated pushdown SQL for that same `LIKE` query SHALL carry the predicate over `"STRASSE"` rather than declining it, so the type-rewrite guards resolved the column's Exasol type from a `col_types` entry whose name came through this fold — the one pushdown path whose `col_types` lookup issue #265 consolidates
+* *AND* the adapter-generated pushdown SQL for that same `LIKE` query SHALL carry the predicate over `"STRASSE"` rather than declining it, so the type-rewrite guards resolved the column's Exasol type from a `col_types` entry whose name came through this fold
 
 ### Scenario: createVirtualSchema reads the database version once and threads the resolved precision
 
@@ -43,15 +43,15 @@ The `createVirtualSchema` declaration flattens multi-level namespaces into table
 * *AND* the read SHALL happen inline in `handle_create_virtual_schema` alongside the other per-request resolutions and MUST NOT be wrapped in a helper whose whole body forwards the one call
 * *AND* the resolved precision MUST NOT be recorded in `adapterNotes`, persisted, or round-tripped: it is re-derived from the handshake on every request, exactly as the cluster node count is, so a virtual schema created against one engine version and queried after an upgrade declares the upgraded engine's precision on its next `refresh`
 * *AND* the scan UDF entry point MUST NOT read `database_version()`: its `EMITS` types come from the pushdown request's own `dataType` JSON, so a second read there would give one decision two owners
-* *AND* no other per-column behavior SHALL change — the column-name fold, its single owner, the `__`-flattened table name, `TABLE_MAP`, the 404 skip, and every non-timestamp declared type stay byte-identical
+* *AND* no other per-column behavior SHALL change, the column-name fold, its single owner, the `__`-flattened table name, `TABLE_MAP`, the 404 skip, and every non-timestamp declared type stay byte-identical
 
 ### Scenario: A TIMESTAMP(p) column declaration serializes fractionalSecondsPrecision
 
 * *GIVEN* a resolved Exasol type string of the form `TIMESTAMP(p)` for an integer precision `p` in 0-9, the shape the version gate now produces for a catalog timestamp column
 * *WHEN* `exasol_type_to_json` converts that string into the response's column `dataType` object
-* *THEN* it SHALL return `{"type": "timestamp", "fractionalSecondsPrecision": p}`, reading the field name `fractionalSecondsPrecision` — the same name its inverse `exasol_type_from_json` reads — and MUST NOT emit a `precision` field, which Exasol uses only for `DECIMAL` and `INTERVAL`
-* *AND* it MUST NOT fall through to the catch-all VARCHAR arm for a `TIMESTAMP(p)` string, because that arm would declare a timestamp column as `{"type": "varchar", "size": 2000000}` — a silently wrong column type rather than a rejected request
+* *THEN* it SHALL return `{"type": "timestamp", "fractionalSecondsPrecision": p}`, reading the field name `fractionalSecondsPrecision`, the same name its inverse `exasol_type_from_json` reads, and MUST NOT emit a `precision` field, which Exasol uses only for `DECIMAL` and `INTERVAL`
+* *AND* it MUST NOT fall through to the catch-all VARCHAR arm for a `TIMESTAMP(p)` string, because that arm would declare a timestamp column as `{"type": "varchar", "size": 2000000}`, a silently wrong column type rather than a rejected request
 * *AND* a bare `TIMESTAMP` string SHALL keep returning `{"type": "timestamp"}` with NO `fractionalSecondsPrecision` field, so the 8.x arm's declaration is byte-identical to the one recorded today
-* *AND* `TIMESTAMP WITH LOCAL TIME ZONE` SHALL keep returning `{"type": "timestamp", "withLocalTimeZone": true}`, matched before any precision logic, so no precision-aware variant of that arm is introduced — its inverse short-circuits the same way
+* *AND* `TIMESTAMP WITH LOCAL TIME ZONE` SHALL keep returning `{"type": "timestamp", "withLocalTimeZone": true}`, matched before any precision logic, so no precision-aware variant of that arm is introduced, its inverse short-circuits the same way
 * *AND* every other type string SHALL keep its recorded `dataType` object byte-identical, including `BOOLEAN`, `DOUBLE PRECISION`, `DATE`, every `DECIMAL(p,s)`, and every `VARCHAR(n)`/`CHAR(n)` form
 * *AND* Exasol SHALL declare the resulting virtual column as `TIMESTAMP(6)` in `SYS.EXA_ALL_COLUMNS` and echo `fractionalSecondsPrecision` back on the pushdown request's `involvedTables` column `dataType`, both captured against a live Exasol 2025.x instance rather than asserted from documentation

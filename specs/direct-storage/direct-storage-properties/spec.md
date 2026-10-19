@@ -18,10 +18,10 @@ A `DIRECT_STORAGE` virtual schema reads three properties. `NAMESPACE` scopes whi
 
 * *GIVEN* a `createVirtualSchema` request resolving `CatalogKind::DirectStorage`, whose CONNECTION address is a storage base path
 * *WHEN* the adapter resolves the virtual schema's base path
-* *THEN* a request that supplies NO `NAMESPACE` property SHALL succeed and SHALL resolve the base path to the CONNECTION address alone, SUPERSEDING for this kind the `vs-adapter/create-virtual-schema` rule that an absent `NAMESPACE` fails with a required-property error, because direct storage has no catalog namespace to name and the CONNECTION address alone denotes a complete storage subtree
+* *THEN* a request that supplies NO `NAMESPACE` property SHALL succeed and SHALL resolve the base path to the CONNECTION address alone, unlike the `vs-adapter/create-virtual-schema` rule that an absent `NAMESPACE` fails with a required-property error, because direct storage has no catalog namespace to name and the CONNECTION address alone denotes a complete storage subtree
 * *AND* a request that supplies a non-empty `NAMESPACE` SHALL resolve the base path to the CONNECTION address followed by that value, joined by exactly ONE `/` regardless of whether either side already carries one, so `s3://bucket/lake/` with `finance` and `s3://bucket/lake` with `finance/` both resolve `s3://bucket/lake/finance/`
 * *AND* the adapter SHALL treat the `NAMESPACE` value as SLASH-delimited, so `finance/eu` names the subtree two levels below the address, and MUST NOT split it on `.`, because a directory name legitimately contains a dot
-* *AND* the adapter SHALL keep requiring `NAMESPACE` under the Iceberg REST and the Unity Catalog kinds, so this relaxation is scoped to the one kind that has no catalog
+* *AND* the adapter SHALL keep requiring `NAMESPACE` under every other catalog kind, so this relaxation is scoped to the one kind that has no catalog
 
 ### Scenario: A NAMESPACE carrying a scheme or a leading slash is rejected at create time
 
@@ -38,7 +38,7 @@ A `DIRECT_STORAGE` virtual schema reads three properties. `NAMESPACE` scopes whi
 * *WHEN* the adapter resolves that property
 * *THEN* the adapter SHALL return an error naming the property, naming the rejected value, and naming the accepted spellings
 * *AND* the adapter MUST NOT fall back to the property's default, because `MERGE_SCHEMA` decides how wide a table's declared schema is and a typo silently selecting the opposite mode returns a narrower schema rather than an error
-* *AND* an ABSENT or EMPTY value SHALL resolve to the property's default — TRUE for both — and SHALL NOT be treated as unparseable, so a virtual schema that names neither property keeps working
+* *AND* an ABSENT or EMPTY value SHALL resolve to the property's default, TRUE for both, and SHALL NOT be treated as unparseable, so a virtual schema that names neither property keeps working
 * *AND* this rejection SHALL apply to these two properties only and MUST NOT change how any other virtual-schema property handles an unrecognized value
 * *AND* all three of this feature's properties SHALL be IGNORED rather than rejected under the Iceberg REST and the Unity Catalog kinds, even when a value is unparseable, because those kinds never read them and rejecting a property one kind ignores would make a virtual schema fail on a value nothing consumes
 

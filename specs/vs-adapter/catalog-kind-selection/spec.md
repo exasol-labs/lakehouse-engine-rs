@@ -5,9 +5,9 @@ The adapter reads the `CATALOG_KIND` virtual-schema property to choose the catal
 ## Background
 
 * `CATALOG_KIND` is a plain VS property of the createVirtualSchema request, not a field in the CONNECTION password JSON. Its value is compared case-insensitively.
-* `CatalogKind` is an adapter-layer enum in `crates/lakehouse-engine` with four variants: `IcebergRest`, `UnityCatalogNative`, `DirectStorage`, and `Glue`. The `lakehouse-catalog` crate does not name it. Credential validation takes the kind as an explicit parameter.
+* `CatalogKind` is an adapter-layer enum with four variants: `IcebergRest`, `UnityCatalogNative`, `DirectStorage`, and `Glue`. The `lakehouse-catalog` crate does not name it. Credential validation takes the kind as an explicit parameter.
 * The accepted values are `UNITY_CATALOG`, `DIRECT_STORAGE`, and `GLUE`. `ICEBERG_REST` is not accepted, because Iceberg REST is selected by leaving the property absent.
-* Four production files may name a `CatalogKind` variant: the enum and its resolver (`adapter/catalog_kind.rs`), the catalog-client construction site (`adapter/mod.rs`), credential validation (`adapter/connection.rs`), and the pushdown scan-source construction site (`adapter/pushdown/scan_resolution.rs`). Every match on the kind is exhaustive, so a new variant is a build failure at each site.
+* Production code names a `CatalogKind` variant in the enum and its resolver, the catalog-client construction site, credential validation, permission-setting validation, the namespace requirement of the createVirtualSchema pipeline, and the pushdown scan-source construction site. Every match on the kind is exhaustive, so a new variant is a build failure at each site.
 * The pushdown resolver carries an already-resolved session in a private enum with one variant per kind. That enum names no `CatalogKind` variant.
 
 ## Scenarios
@@ -52,7 +52,7 @@ The adapter reads the `CATALOG_KIND` virtual-schema property to choose the catal
 * *GIVEN* a createVirtualSchema request resolving `CatalogKind::IcebergRest` through an absent `CATALOG_KIND`, whose CONNECTION JSON password omits `warehouse`
 * *WHEN* the adapter resolves and validates the connection under the Iceberg REST kind
 * *THEN* the adapter SHALL return the same missing-`warehouse` error it returned before this feature, so the Iceberg REST credential contract is unchanged
-* *AND* every Iceberg REST validation rule — the Azure/S3 mutual exclusion, the Azure-shape rules, the SigV4-versus-catalog-auth exclusion, the SigV4 required-fields rule, and the OAuth2 completeness rule — SHALL apply exactly as before
+* *AND* every Iceberg REST validation rule, the Azure/S3 mutual exclusion, the Azure-shape rules, the SigV4-versus-catalog-auth exclusion, the SigV4 required-fields rule, and the OAuth2 completeness rule, SHALL apply exactly as before
 
 ### Scenario: An unrecognized CATALOG_KIND value is rejected with a clear error
 

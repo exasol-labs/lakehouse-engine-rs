@@ -16,31 +16,26 @@ Decomposes the virtual-schema pushdown-planning code into single-responsibility 
 
 ### Scenario: Public pushdown façade resolves at every pre-refactor path
 
-* *GIVEN* a `name → visibility` snapshot of every symbol reachable via `crate::adapter::pushdown::<name>`, captured from the pre-refactor module before any code moves, as amended once by the catalog extraction's planned three-item release
-* *WHEN* the same extraction re-runs against the refactored `pushdown/mod.rs` façade and all in-repo consumers compile
-* *THEN* the re-extracted `name → visibility` set MUST diff empty against the CURRENT baseline — the 21-item in-crate probe `use` list and the 11-item external probe `use` list — so no reachable item is added, removed, narrowed, or widened outside a scenario that plans it
-* *AND* every path `crate::adapter::pushdown::<name>` that survives the catalog extraction MUST still resolve to the same item at the same external visibility (`pub` or `pub(crate)`), the three released items being `extract_vended_keys`, `merge_vended_into_storage`, and `list_namespace_tables`
-* *AND* the `adapter`, `scan`, and `capabilities` consumers MUST compile without editing any surviving `use crate::adapter::pushdown::...` path
+* *GIVEN* a `name → visibility` snapshot of every symbol reachable via `crate::adapter::pushdown::<name>`
+* *WHEN* the same extraction re-runs against the `pushdown/mod.rs` façade and all in-repo consumers compile
+* *THEN* the re-extracted `name → visibility` set MUST diff empty against the current baseline, the 27-item in-crate probe `use` list and the 17-item external probe `use` list, so no reachable item is added, removed, narrowed, or widened outside a scenario that plans it
+* *AND* every path `crate::adapter::pushdown::<name>` MUST resolve to the same item at the same external visibility (`pub` or `pub(crate)`) for the `adapter`, `scan`, and `capabilities` consumers
 * *AND* a `#[cfg(test)]` reachability probe naming every remaining `pub` and `pub(crate)` item from outside the `pushdown` module MUST compile, so an effective narrowing masked by a re-export is a compile error
 
 ### Scenario: The pushdown façade releases exactly the three items the catalog extraction relocates
 
-* *GIVEN* the frozen `crate::adapter::pushdown::<name>` baseline asserted by two compile-time probes — `src/adapter/pushdown_surface_probe_tests.rs` naming 25 items from an in-crate vantage and `tests/pushdown_public_surface.rs` naming the 15 externally-`pub` items — both citing a baseline file that `/speq:record` archived into the gitignored `specs/_recorded/` tree and that therefore no longer exists
-* *WHEN* the catalog access layer moves into the `lakehouse-catalog` crate and the vended mechanism functions are demoted
-* *THEN* EXACTLY THREE items SHALL leave the façade and no other item SHALL be added, removed, narrowed, or widened: `extract_vended_keys` and `merge_vended_into_storage` leave because the vended mechanism moves into `lakehouse-catalog`, where it now lives as `resolve_vended_storage`, and `list_namespace_tables` leaves because it relocates to `lakehouse_catalog::list_namespace_tables`
-* *AND* the in-crate probe SHALL name 21 items and the external probe SHALL name 11, and both MUST compile, so any further narrowing is a build failure rather than a silent gap
-* *AND* `resolve_file_list` ALONE SHALL KEEP its name and its `pub` visibility on the façade while its first parameter becomes `&lakehouse_catalog::CatalogSession`, because a signature change is not a surface change and `catalog/pushdown-catalog-session` owns it; `resolve_table_schema` is DELETED from the façade by the `add-native-unity-catalog-client` plan (issue #318), recorded in the scenario below
-* *AND* `resolve_vended_storage` MUST NOT be added to the pushdown façade; it SHALL be reachable only as `lakehouse_catalog::resolve_vended_storage`
-* *AND* `CatalogSession` MUST NOT be re-exported at `crate::adapter::pushdown::CatalogSession`, because external callers name it on the crate that declares it and a second path would be a redundant alias
-* *AND* both probe doc comments SHALL state that the probe's own `use` list IS the baseline, and NEITHER SHALL cite `specs/_plans/refactor-adapter-pushdown-modules/public-surface-baseline.txt`, so the surface contract stops depending on a file that cannot be read
-* *AND* the `lakehouse-catalog` crate SHALL carry its own external-vantage probe, so the boundary the three departing items move to is guarded the same way the one they left is — `catalog/catalog-crate-structure` owns that probe's contents
+* *GIVEN* the façade baseline asserted by two compile-time probes: `src/adapter/pushdown_surface_probe_tests.rs` naming 27 items from an in-crate vantage and `tests/pushdown_public_surface.rs` naming the 17 externally-`pub` items
+* *WHEN* the catalog access layer lives in the `lakehouse-catalog` crate
+* *THEN* `extract_vended_keys`, `merge_vended_into_storage`, and `list_namespace_tables` SHALL NOT be on the façade, because the vended mechanism is `lakehouse_catalog::resolve_vended_storage` and the namespace listing is internal to `lakehouse-catalog`
+* *AND* `resolve_vended_storage` and `CatalogSession` MUST NOT be re-exported at `crate::adapter::pushdown::`, because external callers name them on the crate that declares them and a second path would be a redundant alias
+* *AND* both probe doc comments SHALL state that the probe's own `use` list IS the baseline and the item count, and the `lakehouse-catalog` crate SHALL carry its own external-vantage probe (`catalog/catalog-crate-structure` owns its contents)
 
 ### Scenario: Behavior is unchanged across the refactor
 
-* *GIVEN* the pre-refactor unit and integration test suites for the pushdown planning layer
-* *WHEN* the suites run against the refactored code
+* *GIVEN* the unit and integration test suites for the pushdown planning layer
+* *WHEN* the suites run against the decomposed code
 * *THEN* every test MUST pass with no change to any test assertion or expected value, EXCEPT the scan spec's `storage` value wherever an assertion embeds one
-* *AND* the scan-driving SQL generated for a given pushdown request MUST be byte-identical to the pre-refactor output EXCEPT for that `storage` VALUE, which `storage-access/scan-spec-credential-reference` re-encodes as a connection reference carrying no credential or as a sealed envelope over the backend's own encoding — a WIDENING of the recorded variant-tag exception to the granularity the clause above already uses, because the value itself now changes rather than only what encloses it; the backend's own encoding stays byte-identical either way, per `storage-access/storage-backend-enum`
+* *AND* the scan-driving SQL generated for a given pushdown request MUST be byte-identical to the output of the undecomposed module EXCEPT for that `storage` VALUE, which `storage-access/scan-spec-credential-reference` encodes as a connection reference carrying no credential or as a sealed envelope over the backend's own encoding, and the backend's own encoding stays byte-identical either way, per `storage-access/storage-backend-enum`
 
 ### Scenario: Each pushdown submodule owns its tests
 
@@ -52,100 +47,47 @@ Decomposes the virtual-schema pushdown-planning code into single-responsibility 
 
 ### Scenario: The pushdown façade drops resolve_table_schema when the shared catalog-client pipeline replaces its only caller
 
-* *GIVEN* the frozen `crate::adapter::pushdown::<name>` baseline asserted by two compile-time probes — `src/adapter/pushdown_surface_probe_tests.rs` naming 22 items from an in-crate vantage and `tests/pushdown_public_surface.rs` naming 12 externally-`pub` items — with `resolve_table_schema` among both lists
-* *WHEN* the shared `CatalogClient` listing pipeline (plan `add-native-unity-catalog-client`, issue #318) replaces `resolve_table_schema`'s only production caller and the function is deleted
-* *THEN* `resolve_table_schema` SHALL leave the façade and no other item SHALL be added, removed, narrowed, or widened, so the in-crate probe SHALL name 21 items and the external probe SHALL name 11 items, and both MUST compile
-* *AND* `resolve_file_list` SHALL KEEP its name and its `pub` visibility on the façade, so the scan path's file-resolution entry point is unaffected by the deletion
-* *AND* both probe doc comments SHALL state the reduced count — 21 in-crate, 11 external — because the compiler catches only narrowing, not deletion, so the count is what makes the removal visible in review
-* *AND* the façade SHALL stay FROZEN after this redraw: any further change to the item set requires its own spec delta against `pushdown/pushdown-module-structure`
+* *GIVEN* the façade baseline asserted by two compile-time probes: `src/adapter/pushdown_surface_probe_tests.rs` naming 27 items from an in-crate vantage and `tests/pushdown_public_surface.rs` naming 17 externally-`pub` items
+* *WHEN* the shared `CatalogClient` listing pipeline declares each table's columns at `createVirtualSchema`
+* *THEN* `resolve_table_schema` SHALL NOT be on the façade, and neither probe SHALL name it
+* *AND* both probe doc comments SHALL state the item count, because the compiler catches only narrowing, not deletion, so the count is what makes a removal visible in review
+* *AND* the façade SHALL stay FROZEN: any change to the item set requires its own spec delta against `pushdown/pushdown-module-structure`
 
 ### Scenario: The format-reader seam extends the pushdown façade through an explicit reviewed edit
 
-* *GIVEN* the frozen façade baseline asserted by two compile-time probes — the in-crate probe
-  `crates/lakehouse-engine/src/adapter/pushdown_surface_probe_tests.rs` naming 21 items and the
-  external-vantage probe `crates/lakehouse-engine/tests/pushdown_public_surface.rs` naming 11
-* *WHEN* the table-format reader seam lands as a `format` submodule of `adapter::pushdown`
-* *THEN* EXACTLY FIVE items SHALL be ADDED to the façade at `pub` visibility and no item SHALL be
-  removed, narrowed, or widened: the format-reader trait, the resolved-scan result type the trait
-  returns, the scan-source type the selection matches on, the selection function itself, and
-  `ConnectionStorage` — a code-review fix (`TOO_MANY_ARGUMENTS`) that collapsed the CONNECTION's
-  static storage backend, its resolved credentials, and the resolved `ALLOW_HTTP` consent gate,
-  previously threaded as three separate parameters through the selection function and both reader
-  constructors, into one struct
-* *AND* the in-crate probe SHALL name 26 items and the external probe SHALL name 16, and both MUST
-  compile, so any narrowing is a build failure rather than a silent gap
-* *AND* both concrete format readers — the Iceberg one and the Delta one — SHALL stay private to the
-  `format` submodule and SHALL appear on NEITHER probe, because the selection function returns a boxed
-  trait object and a caller that could name a reader type could bypass the selection this seam exists
-  to centralize
-* *AND* each new submodule of `format` MUST carry its own sibling `_tests.rs` covering only that
-  submodule's own items, per this feature's recorded per-submodule test rule
-* *AND* `resolve_file_list` SHALL keep its name, its `pub` visibility, its signature, and every one of
-  its call sites, so no existing probe entry changes and the shipped Iceberg planning path is
-  byte-identical (see `delta/delta-table-planning`)
-* *AND* both probe doc comments SHALL be updated to state their new counts, keeping the recorded rule
-  that the probe's own `use` list IS the baseline and no separate baseline file is consulted
+* *GIVEN* the façade baseline asserted by two compile-time probes: the in-crate probe `crates/lakehouse-engine/src/adapter/pushdown_surface_probe_tests.rs` naming 27 items and the external-vantage probe `crates/lakehouse-engine/tests/pushdown_public_surface.rs` naming 17
+* *WHEN* the table-format reader seam lives in the `format` submodule of `adapter::pushdown`
+* *THEN* the façade SHALL carry, at `pub` visibility, the format-reader trait, the resolved-scan result type the trait returns, the scan-source type the selection matches on, the selection function itself, and `ConnectionStorage`, the struct that bundles the CONNECTION's static storage backend, its resolved credentials, and the resolved `ALLOW_HTTP` consent gate
+* *AND* both concrete format readers, the Iceberg one and the Delta one, SHALL stay private to the `format` submodule and SHALL appear on NEITHER probe, because the selection function returns a boxed trait object and a caller that could name a reader type could bypass the selection this seam exists to centralize
+* *AND* each submodule of `format` MUST carry its own sibling `_tests.rs` covering only that submodule's own items, per this feature's per-submodule test rule
 
 ### Scenario: Collapsing the Iceberg file resolver removes exactly one item from the pushdown façade
 
-* *GIVEN* the frozen façade baseline asserted by two compile-time probes — the in-crate probe naming 26
-  items and the external-vantage probe `tests/pushdown_public_surface.rs` naming 16 — with
-  `resolve_file_list` on BOTH lists
-* *WHEN* `file-planning/pushdown-format-neutral-resolution` routes every production and test caller through
-  the format-reader seam and the Iceberg reader absorbs the resolver's body
-* *THEN* EXACTLY ONE item SHALL be REMOVED from the façade — `resolve_file_list` — and no item SHALL be
-  added, narrowed, or widened, so the in-crate probe SHALL name 25 items and the external probe SHALL
-  name 15, and both MUST compile
-* *AND* the per-request scan-source resolver this feature's caller introduces MUST NOT be added to the
-  façade; it SHALL be reachable only through its own submodule path, because its only consumers are the
-  single-table path and the join legs, both descendants of `adapter::pushdown`
-* *AND* both probe doc comments SHALL state the reduced counts — 25 in-crate, 15 external — because the
-  compiler catches only narrowing, not deletion, so the count is what makes the removal visible in
-  review
-* *AND* the recorded rule that the probe's own `use` list IS the baseline SHALL hold unchanged, and
-  neither probe SHALL cite a separate baseline file
-* *AND* any submodule of `adapter::pushdown` this collapse adds MUST carry its own sibling `_tests.rs`
-  covering only that submodule's own items, per this feature's recorded per-submodule test rule
+* *GIVEN* the façade baseline asserted by two compile-time probes: the in-crate probe naming 27 items and the external-vantage probe `tests/pushdown_public_surface.rs` naming 17
+* *WHEN* `file-planning/pushdown-format-neutral-resolution` routes every production and test caller through the format-reader seam and the Iceberg reader holds the resolver's body
+* *THEN* the façade SHALL NOT carry a separate Iceberg file-resolution function, and the per-request scan-source resolver MUST NOT be added to it; it SHALL be reachable only through its own submodule path, because its only consumers are the single-table path and the join legs, both descendants of `adapter::pushdown`
+* *AND* both probe doc comments SHALL state their counts, 27 in-crate and 17 external, and the probe's own `use` list IS the baseline, so neither probe cites a separate baseline file
+* *AND* any submodule of `adapter::pushdown` MUST carry its own sibling `_tests.rs` covering only that submodule's own items, per this feature's per-submodule test rule
 
 ### Scenario: The pushdown façade admits exactly one item for the Delta refused-column list
 
-* *GIVEN* the frozen `crate::adapter::pushdown::<name>` baseline asserted by two compile-time probes —
-  `src/adapter/pushdown_surface_probe_tests.rs` naming 25 items from an in-crate vantage and
-  `tests/pushdown_public_surface.rs` naming the 15 externally-`pub` items
-* *WHEN* `ResolvedScan` gains the field that carries the columns the format reader refused
-* *THEN* EXACTLY ONE item SHALL be added to the façade — the type naming one refused column and its
-  refusal reason — and no other item SHALL be added, removed, narrowed, or widened
-* *AND* the in-crate probe SHALL name 26 items and the external probe SHALL name 16, and both probe doc
-  comments SHALL state the new counts, so a later removal stays visible in review
-* *AND* the added type SHALL be a named struct rather than a `(String, String)` tuple, because an
-  external test crate reads `ResolvedScan`'s fields and a positional pair gives its two strings no
-  distinguishing name at the read site
-* *AND* the Delta reader-protocol gate and the Delta type classifier MUST NOT be added to the façade,
-  because both are reached only from inside `adapter::pushdown::format` and a probe entry for either
-  would freeze a submodule-internal helper
+* *GIVEN* the façade baseline asserted by two compile-time probes: `src/adapter/pushdown_surface_probe_tests.rs` from an in-crate vantage and `tests/pushdown_public_surface.rs` naming the externally-`pub` items
+* *WHEN* `ResolvedScan` carries the columns the format reader refused
+* *THEN* the façade SHALL carry the type naming one refused column and its refusal reason, as a named struct rather than a `(String, String)` tuple, because an external test crate reads `ResolvedScan`'s fields and a positional pair gives its two strings no distinguishing name at the read site
+* *AND* the in-crate probe SHALL name 27 items and the external probe 17, and both probe doc comments SHALL state the counts
+* *AND* the Delta reader-protocol gate and the Delta type classifier MUST NOT be added to the façade, because both are reached only from inside `adapter::pushdown::format` and a probe entry for either would freeze a submodule-internal helper
 
 ### Scenario: The pushdown façade admits exactly one item for the aggregate merge inputs
 
-* *GIVEN* the frozen `crate::adapter::pushdown::<name>` baseline asserted by two compile-time probes —
-  `src/adapter/pushdown_surface_probe_tests.rs` naming 26 items from an in-crate vantage and
-  `tests/pushdown_public_surface.rs` naming the 16 externally-`pub` items
-* *WHEN* `build_scan_driving_sql`'s `aggregate_types`, `merge_select`, and `request_limit` parameters
-  collapse into a single optional value carrying all three
-* *THEN* EXACTLY ONE item SHALL be added to the façade — the type carrying those aggregate merge
-  inputs — and no other item SHALL be added, removed, narrowed, or widened
-* *AND* the in-crate probe SHALL name 27 items and the external probe SHALL name 17, and both probe doc
-  comments SHALL state the new counts, so a later removal stays visible in review
-* *AND* `build_scan_driving_sql` SHALL KEEP its name and its `pub` visibility on the façade, because a
-  signature change is not a surface change
-* *AND* the added type's fields SHALL be private, constructed only through a fallible constructor that
-  refuses an empty merge SELECT, so the malformed `SELECT  FROM (...)` an empty one would render is
-  unrepresentable rather than documented
+* *GIVEN* the façade baseline asserted by two compile-time probes: `src/adapter/pushdown_surface_probe_tests.rs` naming 27 items from an in-crate vantage and `tests/pushdown_public_surface.rs` naming the 17 externally-`pub` items
+* *WHEN* `build_scan_driving_sql` takes `aggregate_types`, `merge_select`, and `request_limit` as a single optional value
+* *THEN* the façade SHALL carry the type holding those aggregate merge inputs, and `build_scan_driving_sql` SHALL keep its `pub` visibility on the façade
+* *AND* both probe doc comments SHALL state the counts, 27 and 17
+* *AND* the type's fields SHALL be private, constructed only through a fallible constructor that refuses an empty merge SELECT, so the malformed `SELECT  FROM (...)` an empty one would render is unrepresentable rather than documented
 
 ### Scenario: The column declaration entry point replaces the Iceberg logical-schema builder on the pushdown façade
 
-* *GIVEN* the frozen `crate::adapter::pushdown::<name>` baseline asserted by two compile-time probes: `src/adapter/pushdown_surface_probe_tests.rs` naming 27 items from an in-crate vantage and `tests/pushdown_public_surface.rs` naming the 17 externally-`pub` items
-* *WHEN* the declaration of each catalog-declared column moves from the format readers' pushdown path to `createVirtualSchema`, per `vs-adapter/column-source-notes`
-* *THEN* EXACTLY ONE item SHALL be added to the façade at crate visibility: the function that declares a listed table's columns from their neutral source types, and EXACTLY ONE item SHALL be removed, `build_logical_schema`, whose only production caller was the Iceberg reader's pushdown path
-* *AND* the in-crate probe SHALL still name 27 items and the external probe 17, and both probe doc comments SHALL state the counts, so the swap stays visible in review
-* *AND* every test that built an Iceberg logical schema through `build_logical_schema` SHALL build it through the added item, keeping its expected values unchanged
-* *AND* the per-format declaration helpers (the Iceberg field builder, the Spark-type classifier, and the Delta schema classifier) MUST NOT be added to the façade, because the added item is their only caller outside `adapter::pushdown::format`
+* *GIVEN* the façade baseline asserted by two compile-time probes: `src/adapter/pushdown_surface_probe_tests.rs` naming 27 items from an in-crate vantage and `tests/pushdown_public_surface.rs` naming the 17 externally-`pub` items
+* *WHEN* each catalog-declared column is declared at `createVirtualSchema`, per `vs-adapter/column-source-notes`
+* *THEN* the façade SHALL carry, at crate visibility, the function that declares a listed table's columns from their neutral source types, and SHALL NOT carry an Iceberg logical-schema builder
+* *AND* the per-format declaration helpers (the Iceberg field builder, the Spark-type classifier, and the Delta schema classifier) MUST NOT be added to the façade, because the declaration function is their only caller outside `adapter::pushdown::format`

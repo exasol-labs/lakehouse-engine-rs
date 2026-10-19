@@ -10,7 +10,7 @@ The adapter sets how many DataFusion partitions and Tokio worker threads each sc
 * The SDK calls the scan `run()` once per input row, so the runtime is built per call; see `datafusion-scan/scan-execution`.
 * The `DATAFUSION_THREADING_MODE` VS/connection property takes `AUTO` or `FIXED`. The adapter resolves it at `createVirtualSchema` time and records it in `adapterNotes`. Only the resulting integer fields reach the scan UDF, which does not know the mode.
 * `nr_of_cores` comes from `std::thread::available_parallelism()` on the adapter's executing node, resolved once per request and defaulting to `1` when the platform cannot report it. It is not recorded in `adapterNotes`; see `vs-adapter/create-virtual-schema-adapter-notes`.
-* In AUTO mode, `threads_per_udf = max(1, floor(nr_of_cores / udf_instances_per_node))`. `udf_instances_per_node` is the per-node share of the work-unit shard count (`G = node_count × parallelism_factor`, capped at 300; see `parallelism/work-unit-sharding`). `df_target_partitions` equals the derived `df_threads_per_udf`.
+* In AUTO mode, `threads_per_udf = max(1, floor(nr_of_cores / udf_instances_per_node))`. `udf_instances_per_node` is the per-node share of the work-unit shard count, which equals the parallelism factor (`G = node_count × parallelism_factor`, capped at 300; see `parallelism/work-unit-sharding`). `df_target_partitions` equals the derived `df_threads_per_udf`.
 * In FIXED mode the adapter uses the supplied `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF` values as given, each defaulting to `max(nr_of_cores, 1)` when absent.
 
 ## Scenarios
@@ -73,4 +73,4 @@ The adapter sets how many DataFusion partitions and Tokio worker threads each sc
 * *WHEN* the scan UDF builds the Tokio runtime that drives one `run()` call's DataFusion scan
 * *THEN* the UDF SHALL construct a fresh runtime sized from THAT call's `df_threads_per_udf` (current-thread when `1`, multi-thread with that many workers otherwise) and tear it down deterministically via `run_on_runtime` before the call returns
 * *AND* the UDF MUST NOT reuse a runtime cached at process or `static` scope (for example via `OnceLock`) across `run()` calls
-* *AND* because Exasol pools and reuses a UDF VM process across invocations that MAY belong to different queries carrying different `df_threads_per_udf` values, a process-cached runtime would apply stale sizing — so a resource whose construction depends on a per-call `UdfContext` input parameter MUST be rebuilt every call, preserving the stateless, no-cross-call-state UDF invariant
+* *AND* because Exasol pools and reuses a UDF VM process across invocations that MAY belong to different queries carrying different `df_threads_per_udf` values, a process-cached runtime would apply stale sizing, so a resource whose construction depends on a per-call `UdfContext` input parameter MUST be rebuilt every call, preserving the stateless, no-cross-call-state UDF invariant

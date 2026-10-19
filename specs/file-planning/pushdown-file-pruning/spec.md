@@ -43,7 +43,7 @@ Translates the soundly translatable conjuncts of the Exasol WHERE predicate into
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL emit an Iceberg pruning predicate carrying only the translatable conjunct
 * *AND* the adapter SHALL drop the untranslatable conjunct from the pruning predicate
-* *AND* the full original predicate SHALL still be applied — in `ScanSpec.filter` for DataFusion when the DataFusion dialect renders it, and otherwise in the adapter's own outer `WHERE` per `pushdown/pushdown-declined-filter-self-apply` — so "untranslatable for Iceberg pruning" never means "unapplied"
+* *AND* the full original predicate SHALL still be applied, in `ScanSpec.filter` for DataFusion when the DataFusion dialect renders it, and otherwise in the adapter's own outer `WHERE` per `pushdown/pushdown-declined-filter-self-apply`, so "untranslatable for Iceberg pruning" never means "unapplied"
 * *AND* the query result SHALL be identical to the result without any Iceberg pruning
 
 ### Scenario: An untranslatable branch of an OR disables pruning entirely
@@ -60,11 +60,11 @@ Translates the soundly translatable conjuncts of the Exasol WHERE predicate into
 * *WHEN* Exasol sends the corresponding pushdown request and the adapter resolves the file list once
 * *THEN* the adapter MUST NOT discard a data file's associated positional-delete files, and SHALL carry each delete file's path, byte size, and delete content type into the per-shard file entry for the data file(s) it applies to
 * *AND* the association between a data file and its delete files SHALL follow the Iceberg sequence-number rules exactly as `plan_files` resolved them, so a delete file is carried for exactly the data files it applies to and no others
-* *AND* the adapter SHALL carry the delete-file references as the ONLY delete-related addition to the per-shard files argument — it MUST NOT add a serialized Iceberg schema or a bound predicate to the spec for delete support
+* *AND* the adapter SHALL carry the delete-file references as the ONLY delete-related addition to the per-shard files argument, it MUST NOT add a serialized Iceberg schema or a bound predicate to the spec for delete support
 
 ### Scenario: An unsupported delete mechanism fails loud at plan time
 
-* *GIVEN* a virtual schema over an Iceberg table whose current snapshot carries a delete mechanism this engine cannot apply — an equality-delete file, a v3 / Puffin deletion vector, or a delete file (or data file) in ORC or Avro format
+* *GIVEN* a virtual schema over an Iceberg table whose current snapshot carries a delete mechanism this engine cannot apply, an equality-delete file, a v3 / Puffin deletion vector, or a delete file (or data file) in ORC or Avro format
 * *WHEN* Exasol sends the corresponding pushdown request and the adapter inspects the snapshot's delete files at the manifest / `DataFile` level, where the Puffin discriminator and file format are still visible
 * *THEN* the adapter SHALL fail the request at plan time with a clean error naming the unsupported delete mechanism, BEFORE building or returning any scan-driving SQL and before fan-out
 * *AND* the adapter MUST NOT silently return pre-delete rows and MUST NOT emit scan-driving SQL for that request
@@ -74,7 +74,7 @@ Translates the soundly translatable conjuncts of the Exasol WHERE predicate into
 ### Scenario: A NOT over a partly translated predicate keeps every file with a matching row
 
 * *GIVEN* a virtual schema over a partitioned Iceberg table whose files hold rows on both sides of the comparison `k < 30`
-* *AND* a query whose WHERE clause is `NOT (k < 30 AND name LIKE 'x%')`, with the conjuncts in either order (#466)
+* *AND* a query whose WHERE clause is `NOT (k < 30 AND name LIKE 'x%')`, with the conjuncts in either order
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter MUST NOT prune by the negation of the partly translated conjunction, and every file that holds a row the `NOT` matches SHALL be scanned
 * *AND* the query SHALL return the rows and the `COUNT(*)` that native Exasol returns for the same predicate over the same rows, and MUST NOT answer with the empty result

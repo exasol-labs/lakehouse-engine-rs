@@ -2,7 +2,7 @@
 
 Extends `delta/delta-table-planning` with the checks that fail a query when the declared columns disagree with the Delta log.
 
-This is a sibling of `delta/delta-table-planning`, split out once that feature's scenario count crossed this library's per-spec organization threshold. The parent feature keeps its original scope.
+This is a sibling of `delta/delta-table-planning`, which owns the rest of Delta planning.
 
 ## Background
 

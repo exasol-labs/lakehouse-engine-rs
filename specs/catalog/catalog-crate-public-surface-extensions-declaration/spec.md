@@ -2,7 +2,7 @@
 
 Extends `catalog/catalog-crate-public-surface-extensions` with the reviewed public-surface additions that carry a table's declaration through the crate: the neutral column's declaration slot, the whole Iceberg field, and the neutral table's catalog properties.
 
-This is a sibling of `catalog/catalog-crate-public-surface-extensions`, split out once that feature's scenario count crossed this library's per-spec organization threshold. The parent feature keeps its original scope.
+This is a sibling of `catalog/catalog-crate-public-surface-extensions`, which owns the other reviewed additions.
 
 ## Background
 

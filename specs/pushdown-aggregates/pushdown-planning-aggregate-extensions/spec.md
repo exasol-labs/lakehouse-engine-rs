@@ -1,10 +1,10 @@
 # Feature: Pushdown Planning, Aggregate Extensions (HAVING & Statistical Aggregates)
 
-The adapter pushes HAVING and the statistical aggregates (STDDEV and VARIANCE families) down over the partial/merge decomposition, and falls back to row scanning for aggregates that do not decompose.
+The adapter pushes HAVING and the statistical aggregates (STDDEV and VARIANCE families) down over the partial/merge decomposition, and routes aggregates that do not decompose to the qualified single-table wrapper.
 
 ## Background
 
-* An aggregate is pushed down only when it decomposes into a shard-associative partial/merge plan. Otherwise the adapter falls back to row scanning.
+* An aggregate is pushed down only when it decomposes into a shard-associative partial/merge plan. Otherwise the adapter routes the request to the qualified single-table wrapper, because Exasol never re-aggregates a declined pushdown.
 * Exasol does not re-apply a HAVING or a WHERE predicate that the adapter advertised and then omitted, so omission returns wrong rows.
 * The qualified single-table wrapper evaluates any clause the partial/merge decomposition cannot express, as ordinary Exasol SQL over materialized rows. A declined WHERE renders as the wrapper's `WHERE`, ahead of the aggregate. A declined HAVING renders as the wrapper's `HAVING`, after it.
 * The statistical family accepts a bare column argument only. An expression argument declines the aggregate pushdown, because the scan would render an aggregate plan with no source column and fail.
@@ -26,8 +26,8 @@ The adapter pushes HAVING and the statistical aggregates (STDDEV and VARIANCE fa
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL render the HAVING predicate to a DataFusion SQL fragment using the same VS expression translator path used for WHERE predicates
 * *AND* the adapter SHALL apply the rendered HAVING predicate only in the OUTER wrapper SQL that merges the per-shard partial-aggregate rows, never inside the per-shard partial scan (a per-shard HAVING would discard groups that only meet the threshold after merge)
-* *AND* the adapter MUST NOT omit a HAVING it cannot render from the returned SQL, because Exasol does not re-apply a HAVING whose `AGGREGATE_HAVING` capability the adapter advertises — omission returns wrong rows
-* *AND* a HAVING the adapter cannot render over the partial/merge decomposition SHALL instead route the request to the qualified single-table wrapper, which renders the HAVING as ordinary Exasol SQL over materialized rows so the predicate is preserved rather than dropped (see `pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`, issue #195)
+* *AND* the adapter MUST NOT omit a HAVING it cannot render from the returned SQL, because Exasol does not re-apply a HAVING whose `AGGREGATE_HAVING` capability the adapter advertises, omission returns wrong rows
+* *AND* a HAVING the adapter cannot render over the partial/merge decomposition SHALL instead route the request to the qualified single-table wrapper, which renders the HAVING as ordinary Exasol SQL over materialized rows so the predicate is preserved rather than dropped (see `pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`)
 
 ### Scenario: Decomposable statistical aggregate is pushed down via sufficient statistics
 
@@ -51,22 +51,22 @@ The adapter pushes HAVING and the statistical aggregates (STDDEV and VARIANCE fa
 
 ### Scenario: Adapter falls back for non-decomposable aggregates
 
-* *GIVEN* a `pushdown` request whose select list contains an aggregate the adapter does not advertise as decomposable (e.g. `MEDIAN`, `APPROXIMATE_COUNT_DISTINCT`, `LISTAGG`, `GROUP_CONCAT`, or a `COUNT(DISTINCT ...)` that appears inside a GROUP BY request)
+* *GIVEN* a `pushdown` request whose select list contains an aggregate the adapter cannot decompose into a partial/merge plan (e.g. a `COUNT(DISTINCT ...)` that appears inside a GROUP BY request; `MEDIAN`, `APPROXIMATE_COUNT_DISTINCT`, `LISTAGG`, and `GROUP_CONCAT` are unadvertised, so Exasol evaluates them itself)
 * *WHEN* Exasol sends the request
-* *THEN* the adapter SHALL fall back to row scanning (emitting a row-scan ScanSpec with no aggregates field)
-* *AND* Exasol SHALL compute the aggregate on the returned rows using its own engine
+* *THEN* the adapter SHALL route the request to the qualified single-table wrapper, which renders every aggregate as ordinary Exasol SQL over a materialized sharded raw scan, and the scan spec MUST NOT carry an aggregates field
+* *AND* the wrapper SQL SHALL compute each aggregate, so the adapter MUST NOT return a bare row scan that Exasol would not re-aggregate
 * *AND* the adapter MUST NOT emit a partial/merge plan for any aggregate it cannot decompose into a shard-associative partial/merge plan, because doing so would yield an incorrect result
-* *AND* a single-group (no GROUP BY) `COUNT(DISTINCT col)` SHALL NOT fall back here — it is decomposed via `pushdown-aggregates/pushdown-planning-count-distinct` — while a `COUNT(DISTINCT ...)` inside a GROUP BY request SHALL still fall back
+* *AND* a single-group (no GROUP BY) lone `COUNT(DISTINCT col)` SHALL NOT take this route, because it is decomposed via `pushdown-aggregates/pushdown-planning-count-distinct`, while a `COUNT(DISTINCT ...)` inside a GROUP BY request SHALL still take it
 
 ### Scenario: Statistical aggregate over an expression argument declines the partial/merge pushdown
 
-* *GIVEN* a `pushdown` request whose select list contains a statistical aggregate — `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP`, `VARIANCE`, `VAR_POP`, or `VAR_SAMP` — whose single argument is NOT a bare `column` node (for example `STDDEV(a + b)` or `STDDEV(LENGTH(name))`), with or without a GROUP BY clause
+* *GIVEN* a `pushdown` request whose select list contains a statistical aggregate, `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP`, `VARIANCE`, `VAR_POP`, or `VAR_SAMP`, whose single argument is NOT a bare `column` node (for example `STDDEV(a + b)` or `STDDEV(LENGTH(name))`), with or without a GROUP BY clause
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL decline the aggregate pushdown for that item, returning no `AggregatePlan` for it, so the request routes to row scanning or to the qualified single-table wrapper and Exasol computes the statistic natively over the returned rows
+* *THEN* the adapter SHALL decline the aggregate pushdown for that item, returning no `AggregatePlan` for it, so the request routes to the qualified single-table wrapper and its Exasol SQL computes the statistic over the materialized rows
 * *AND* the adapter MUST NOT emit an `AggregatePlan` carrying neither a `column` nor an `arg_expr`, because such a plan passes `validate_agg_col_types` on the `DOUBLE PRECISION` default and then renders `COUNT("")`, `SUM("")`, and `SUM("" * "")` in the scan, failing the whole query where a decline returns the correct result
 * *AND* a statistical aggregate over a BARE COLUMN SHALL continue to push down unchanged through the sufficient-statistics decomposition, with a byte-identical scan spec, `EMITS` clause, and merge expression
-* *AND* the decline SHALL apply at ALL FIVE `parse_agg_item` call sites, not only the two detection entry points, so no path can emit or consume the malformed plan: `detect_aggregates` (`single_group_agg.rs:78`) SHALL decline the whole single-group select list, routing the request to the row scan; `detect_group_by_aggregates` (`grouped_agg.rs:215`) SHALL decline the whole grouped detection, routing it to the qualified single-table wrapper; `classify_scalar_over_aggregate` (`grouped_agg.rs:399`) SHALL decline a select item that WRAPS such an aggregate (for example `SQRT(STDDEV(a + b))` over a GROUP BY), so the grouped detection declines to that same wrapper instead of sizing three `EMITS` columns from the `DOUBLE PRECISION` default; and `render_scalar_over_merge` (`grouped_agg.rs:427`) and `render_having_over_merge` (`grouped_agg.rs:988`) SHALL return `None`, routing a HAVING or a merge ORDER BY over such an aggregate to the qualified wrapper — which is the outcome those two already produce through their `AggregatePlan` lookup against the detected plans, so their observable behavior is UNCHANGED and only the decline's reason moves to parse time
-* *AND* the statistical family SHALL keep its bare-column-only argument rule; the adapter MUST NOT resolve the argument through `arg_column_or_expr` and MUST NOT populate `arg_expr` for a statistical aggregate, because rendering `SUM(<expr> * <expr>)` over a doubly-evaluated fragment and sizing the partial `EMITS` columns without a source column are new behavior outside this delta's scope
+* *AND* the decline SHALL apply at ALL FIVE `parse_agg_item` call sites, so no path can emit or consume the malformed plan: the single-group detection (`detect_aggregates`) SHALL decline the whole select list, routing the request to the qualified single-table wrapper; the grouped detection (`detect_group_by_aggregates`) SHALL decline the whole detection, routing it to that same wrapper; `classify_scalar_over_aggregate` SHALL decline a select item that WRAPS such an aggregate (for example `SQRT(STDDEV(a + b))` over a GROUP BY), so detection declines to that same wrapper instead of sizing three `EMITS` columns from the `DOUBLE PRECISION` default; and `render_scalar_over_merge` and `render_having_over_merge` SHALL return `None`, routing a HAVING or a merge ORDER BY over such an aggregate to the qualified wrapper
+* *AND* the statistical family SHALL keep its bare-column-only argument rule; the adapter MUST NOT resolve the argument through `arg_column_or_expr` and MUST NOT populate `arg_expr` for a statistical aggregate, because the decomposition has no rendered-argument form: rendering `SUM(<expr> * <expr>)` would evaluate the fragment twice, and the partial `EMITS` columns would have no source column
 
 ### Scenario: Generated SQL carries a credential reference, not a credential
 

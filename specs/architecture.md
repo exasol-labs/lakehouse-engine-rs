@@ -69,10 +69,10 @@
 
 ## Constraints
 
-- The toolchain is pinned to Rust 1.94 with edition 2024.
-- The release `.so` builds only in the `rust:1.94-trixie` image (glibc 2.41), because the SLC rejects a `.so` whose SDK fingerprint (`exasol-udf-sdk` version and rustc hash) differs from its own.
-- `exasol-udf-sdk` and `exasol-udf-macros` stay pinned at 0.30.0 in the workspace manifest, and that version is also the SLC version.
-- `arrow` and `parquet` stay on major 58 to match `datafusion` 54 and the SDK.
+- The Rust toolchain, edition, and every dependency version are pinned in `rust-toolchain.toml` and the workspace manifest, not in the specs.
+- The release `.so` builds only in the Rust build image whose glibc matches the SLC, because the SLC rejects a `.so` whose SDK fingerprint (`exasol-udf-sdk` version and rustc hash) differs from its own.
+- `exasol-udf-sdk` and `exasol-udf-macros` are pinned only in the workspace manifest, and their version is also the SLC version.
+- `arrow` and `parquet` stay on the same major as `datafusion` and the SDK.
 - Arrow types never cross the `.so` boundary. Only SDK `Value`s or Arrow IPC bytes from `ctx.emit_batch` cross it.
 - UDFs keep no cross-call state. The scan UDF builds its Tokio runtime per call and never caches it.
 - The engine owns no persisted metadata. Exasol stores the adapterNotes values (`TABLE_MAP`, `SKIPPED_TABLES`, tuning values) and the column notes between CREATE and pushdown.

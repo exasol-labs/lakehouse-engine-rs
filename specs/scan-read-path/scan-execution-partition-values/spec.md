@@ -20,7 +20,7 @@ Produces a partition column that has no physical counterpart in a data file from
   logged for the file that row came from, so one scan invocation emits different partition values for
   rows originating in different files
 * *AND* the emitted column SHALL appear under the partition column's declared logical name, at its
-  declared position in the scan's output, with its declared logical type — the position and type the
+  declared position in the scan's output, with its declared logical type, the position and type the
   scan already declares for it
 * *AND* the UDF MUST NOT emit NULL for a partition column whose file entry logs a value, which is
   what a Parquet-only read would produce
@@ -40,8 +40,8 @@ Produces a partition column that has no physical counterpart in a data file from
 
 ### Scenario: A partition value is converted to its column's declared type
 
-* *GIVEN* a scan invocation whose partition columns include a non-string column — an integer, a
-  decimal, a date, and a boolean column — each file entry carrying that column's value in the
+* *GIVEN* a scan invocation whose partition columns include a non-string column, an integer, a
+  decimal, a date, and a boolean column, each file entry carrying that column's value in the
   protocol's string serialization
 * *WHEN* the scan UDF materializes those columns
 * *THEN* the UDF SHALL convert each serialized value into the column's DECLARED logical type before it
@@ -55,7 +55,7 @@ Produces a partition column that has no physical counterpart in a data file from
 ### Scenario: The logged partition value wins over a physically present partition column
 
 * *GIVEN* a scan invocation whose assigned data file DOES carry a physical Parquet column bearing a
-  partition column's name — the shape a writer produces under the Delta IcebergCompat features
+  partition column's name, the shape a writer produces under the Delta IcebergCompat features
 * *WHEN* the scan UDF reads that file
 * *THEN* the UDF SHALL emit the value logged for that file in its partition values, and MUST NOT read
   the physical column, because the protocol makes the transaction log the authoritative source for a
@@ -66,8 +66,8 @@ Produces a partition column that has no physical counterpart in a data file from
 ### Scenario: A materialized partition column is a first-class scan column
 
 * *GIVEN* a scan spec over a partitioned table whose common spec carries a projection that omits one
-  partition column, a filter predicate over another partition column, and — in a second spec over the
-  same table — a grouped aggregate whose group key is a partition column
+  partition column, a filter predicate over another partition column, and, in a second spec over the
+  same table, a grouped aggregate whose group key is a partition column
 * *WHEN* the scan UDF builds and runs each DataFusion plan
 * *THEN* the filter SHALL be evaluated against the MATERIALIZED partition values, so the emitted rows
   are exactly those whose partition value satisfies the predicate, because Exasol re-applies nothing
@@ -81,7 +81,7 @@ Produces a partition column that has no physical counterpart in a data file from
 ### Scenario: A scan with no partition columns is unchanged
 
 * *GIVEN* a scan invocation whose common spec names NO partition columns and whose file entries carry
-  EMPTY partition values — every Iceberg scan, and every unpartitioned Delta scan
+  EMPTY partition values, every Iceberg scan, and every unpartitioned Delta scan
 * *WHEN* the scan UDF registers those files and runs the scan
 * *THEN* the registered table's schema, the generated scan-driving SQL, the physical plan shape, and
   the emitted rows SHALL all be identical to their pre-feature form for the same spec

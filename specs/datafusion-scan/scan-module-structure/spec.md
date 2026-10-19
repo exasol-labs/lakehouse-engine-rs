@@ -16,7 +16,7 @@ The DataFusion scan-execution code in `scan/mod.rs` is split into single-respons
 
 * *GIVEN* a `name → visibility` snapshot of every symbol reachable via the flat path `crate::scan::<name>`, captured from the pre-refactor `scan/mod.rs` before any code moves
 * *WHEN* the same extraction re-runs against the refactored `scan/mod.rs` re-export façade
-* *THEN* the re-extracted `name → visibility` set MUST diff empty against the captured baseline — no reachable item added, removed, narrowed, or widened
+* *THEN* the re-extracted `name → visibility` set MUST diff empty against the captured baseline, no reachable item added, removed, narrowed, or widened
 * *AND* every pre-refactor path `crate::scan::<name>` MUST still resolve to the same item at the same external visibility (`pub` or `pub(crate)`)
 * *AND* a `#[cfg(test)]` reachability probe naming every pre-refactor `pub` and `pub(crate)` item through the flat façade MUST compile, so an effective narrowing masked by a re-export is a compile error
 
@@ -33,7 +33,7 @@ The DataFusion scan-execution code in `scan/mod.rs` is split into single-respons
 * *GIVEN* the pre-refactor unit and integration test suites for the scan-execution layer
 * *WHEN* the suites run against the refactored code
 * *THEN* every test MUST pass with no change to any test assertion or expected value, EXCEPT for the two edits this delta's `storage` carve-out forces and no others: the eighteen credential-bearing golden dispatch fixtures are REGENERATED so their `storage` value carries the wrapper, and `common_blob_wire_is_byte_stable`'s pinned bytes gain the wrapper around the same backend encoding
-* *AND* those two edits MUST change the `storage` value and nothing else — the six `empty_*` fixtures carry no `storage` value and SHALL stay byte-identical, and no assertion MUST be weakened, disabled, or deleted to accommodate the change
+* *AND* those two edits MUST change the `storage` value and nothing else, the six `empty_*` fixtures carry no `storage` value and SHALL stay byte-identical, and no assertion MUST be weakened, disabled, or deleted to accommodate the change
 * *AND* the scan-driving SQL generated for a given raw-scan, broadcast-join, single-group partial-aggregate, and grouped partial-aggregate spec MUST be byte-identical to the pre-refactor output EXCEPT for the `storage` value, which carries the tagged wrapper of `storage-access/scan-spec-credential-reference`
 
 ### Scenario: Consolidated SQL-builder helpers produce identical output

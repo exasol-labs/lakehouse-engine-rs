@@ -45,9 +45,9 @@ Enumerates a Unity Catalog namespace during createVirtualSchema and returns one 
 
 * *GIVEN* one createVirtualSchema request resolving `CatalogKind::UnityCatalogNative` and one resolving `CatalogKind::IcebergRest`, each over a namespace holding the same table names with the same column names
 * *WHEN* the adapter handles each request
-* *THEN* the adapter SHALL run the SAME listing pipeline for both — one code path that reads neutral table metadata through the shared trait, flattens and case-folds names, maps each column through the single type-mapping home, builds `TABLE_MAP`, and assembles the response
+* *THEN* the adapter SHALL run the SAME listing pipeline for both, one code path that reads neutral table metadata through the shared trait, flattens and case-folds names, maps each column through the single type-mapping home, builds `TABLE_MAP`, and assembles the response
 * *AND* that pipeline MUST NOT name or match `CatalogKind` and MUST NOT branch on which client it holds, so the flattening rule, the collision rule, the case-fold, and the `adapterNotes` shape are provably identical across the two kinds rather than identical by coincidence
-* *AND* each client SHALL remain free to source its columns its own way — the Unity Catalog client from its single inline sweep, the Iceberg REST client from its per-table load — because that choice is hidden inside the client and never reaches the pipeline
+* *AND* each client SHALL remain free to source its columns its own way, the Unity Catalog client from its single inline sweep, the Iceberg REST client from its per-table load, because that choice is hidden inside the client and never reaches the pipeline
 
 ### Scenario: Create virtual schema lists the namespace with no per-table get-table call
 
@@ -67,23 +67,23 @@ Enumerates a Unity Catalog namespace during createVirtualSchema and returns one 
 
 ### Scenario: Unity Catalog Spark column types map to Exasol types sufficient for listing
 
-* *GIVEN* a Unity Catalog table whose columns declare in their `type_json` the Spark types `boolean`, `integer`, `long`, `double`, `string`, `date`, `timestamp`, and `decimal(p,s)` whose `p` and `s` fall inside Exasol's `DECIMAL` domain — `1 ≤ p ≤ 36` and `s ≤ p`
+* *GIVEN* a Unity Catalog table whose columns declare in their `type_json` the Spark types `boolean`, `integer`, `long`, `double`, `string`, `date`, `timestamp`, and `decimal(p,s)` whose `p` and `s` fall inside Exasol's `DECIMAL` domain, `1 ≤ p ≤ 36` and `s ≤ p`
 * *AND* each column's `type_precision` and `type_scale` are 0 or absent
 * *WHEN* the adapter builds the virtual table's column list
 * *THEN* the adapter SHALL declare `boolean` as `BOOLEAN`, `integer` as `DECIMAL(10,0)`, `long` as `DECIMAL(20,0)`, `double` as `DOUBLE PRECISION`, `string` as `VARCHAR(2000000)`, `date` as `DATE`, and `decimal(p,s)` as `DECIMAL(p,s)`, reusing the project's Arrow-to-Exasol convention
-* *AND* the adapter SHALL declare `timestamp` and `timestamp_ntz` as `TIMESTAMP(6)` on an Exasol version of 2025.x or later and as the bare string `TIMESTAMP` on 8.x, reading BOTH the version rule and both declaration strings from the single owner `scan-types/type-mapping` specifies — so a Delta timestamp column and an Iceberg timestamp column are declared at the same precision by construction, and this feature carries no copy of either literal
+* *AND* the adapter SHALL declare `timestamp` and `timestamp_ntz` as `TIMESTAMP(6)` on an Exasol version of 2025.x or later and as the bare string `TIMESTAMP` on 8.x, reading BOTH the version rule and both declaration strings from the single owner `scan-types/type-mapping` specifies, so a Delta timestamp column and an Iceberg timestamp column are declared at the same precision by construction, and this feature carries no copy of either literal
 * *AND* the adapter SHALL read each column's type from its `type_json` and MUST NOT read `type_name`, `type_precision`, or `type_scale`
 * *AND* the adapter SHALL reach that mapping through the SAME exhaustive match over the neutral column's source-tagged type descriptor that maps an Iceberg column, so the two catalog kinds have ONE Exasol type-mapping home and a third source type is a build failure there
 * *AND* the adapter SHALL declare each column name uppercased through the shared case-fold site, so an unquoted column reference in user SQL resolves against the declared name
 
 ### Scenario: An incompatible Unity Catalog column type is declared as VARCHAR rather than failing
 
-* *GIVEN* a Unity Catalog table whose columns include an array, map, struct, binary, interval, or variant type, or a `DECIMAL` whose precision and scale fall outside Exasol's `DECIMAL` domain — a precision above 36, or a scale exceeding its own precision, or a column whose `type_json` is absent or unparseable
+* *GIVEN* a Unity Catalog table whose columns include an array, map, struct, binary, interval, or variant type, or a `DECIMAL` whose precision and scale fall outside Exasol's `DECIMAL` domain, a precision above 36, or a scale exceeding its own precision, or a column whose `type_json` is absent or unparseable
 * *WHEN* the adapter builds the virtual table's column list
 * *THEN* the adapter SHALL declare each such column as `VARCHAR(2000000)` rather than aborting the enumeration
 * *AND* the adapter SHALL resolve the `DECIMAL` cases through the SINGLE shared guard `scan-types/type-mapping` owns, and MUST NOT carry a Unity-local copy of the precision/scale predicate, so a Unity `DECIMAL(0,0)` and an Iceberg `decimal(0,0)` are declared identically by construction rather than by coincidence
-* *AND* the adapter MUST NOT declare an Exasol type Exasol rejects — in particular MUST NOT declare `DECIMAL(0,0)` or a `DECIMAL(p,s)` with `s > p` — because such a declaration fails `createVirtualSchema` outright, which is the failure this VARCHAR fallback exists to prevent
-* *AND* the adapter SHALL treat this listing-sufficient mapping as a deliberate boundary, deferring reader-feature gating and full Delta type fidelity to #322, so #318 never produces an untyped or silently-dropped column
+* *AND* the adapter MUST NOT declare an Exasol type Exasol rejects, in particular MUST NOT declare `DECIMAL(0,0)` or a `DECIMAL(p,s)` with `s > p`, because such a declaration fails `createVirtualSchema` outright, which is the failure this VARCHAR fallback exists to prevent
+* *AND* the adapter SHALL treat this listing-sufficient mapping as a deliberate boundary, deferring reader-feature gating and full Delta type fidelity to the pushdown gate (`delta/delta-reader-feature-gating`), so the listing never produces an untyped or silently-dropped column
 
 ### Scenario: Create virtual schema records the Exasol-name to Unity-Catalog-identifier map in adapterNotes
 

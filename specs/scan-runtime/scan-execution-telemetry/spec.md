@@ -5,7 +5,7 @@ The scan UDF can report phase timings so an operator running a benchmark can att
 ## Background
 
 * Telemetry uses the per-UDF-tagged debug emit channel keyed by `LAKEHOUSE_UDF_DEBUG_LEVEL` (default `info`), `udf_log!`, and `ctx.debug_level()`. Phase-timing lines appear only at `debug` level.
-* Timing builds on the checkpoint infrastructure in `crates/lakehouse-engine/src/scan/diagnostics.rs`: a process-global monotonic sequence, per-PID file isolation so concurrent shard VMs never interleave, and best-effort RSS sampling from `/proc/self/statm`.
+* Timing builds on the checkpoint infrastructure in the scan diagnostics module: a process-global monotonic sequence, per-PID file isolation so concurrent shard VMs never interleave, and best-effort RSS sampling from `/proc/self/statm`.
 * Three phases are timed with a monotonic clock. Startup runs from UDF entry through Tokio-runtime build, session-context build, and plan construction, up to the first batch fetch. Object-storage import is the cumulative time awaiting batches from the DataFusion stream (the S3 read and Parquet decode). Send-back/emit is the cumulative time inside `emit_batch` and `emit` flushes. The three sum to the scan body's wall-clock within measurement error.
 * Telemetry never alters scan results. A timing or logging failure does not fail the query, and the instrumentation does not change the streaming discipline: one batch fetched, emitted, and dropped before the next.
 

@@ -11,20 +11,20 @@ Resolves the authentication strategy a `UnityCatalogSession` applies to every Un
 
 ### Scenario: A personal access token is applied as the bearer verbatim
 
-* *GIVEN* resolved Unity Catalog CONNECTION credentials that supply a non-empty `token` and no OAuth client credentials — the only shape credential validation admits for the personal-access-token mode
+* *GIVEN* resolved Unity Catalog CONNECTION credentials that supply a non-empty `token` and no OAuth client credentials, the only shape credential validation admits for the personal-access-token mode
 * *WHEN* the session resolves its authentication strategy and issues a Unity Catalog request
 * *THEN* the strategy SHALL set the request's `Authorization` header to `Bearer` followed by the supplied `token` verbatim
 * *AND* the strategy MUST NOT perform any token exchange, because a personal access token is already a bearer credential
-* *AND* the session SHALL select this mode through the ONE shared catalog-auth mode classifier `connection/connection-credentials-catalog-auth` specifies, and MUST NOT test the `token` ahead of the `client_id`/`client_secret` pair, because that ordering answered an ambiguous CONNECTION the opposite way from the Iceberg REST path
+* *AND* the session SHALL select this mode through the ONE shared catalog-auth mode classifier `connection/connection-credentials-catalog-auth` specifies, and MUST NOT test the `token` ahead of the `client_id`/`client_secret` pair, because the two orderings answer an ambiguous CONNECTION differently and the Iceberg REST path must agree
 * *AND* the supplied `token` MUST NOT appear in any error message, returned SQL, or log line
 
 ### Scenario: OAuth machine-to-machine mints a bearer token via the client-credentials grant
 
-* *GIVEN* resolved Unity Catalog CONNECTION credentials that supply `client_id` and `client_secret` and no static `token` — the only shape credential validation admits for the OAuth machine-to-machine mode
+* *GIVEN* resolved Unity Catalog CONNECTION credentials that supply `client_id` and `client_secret` and no static `token`, the only shape credential validation admits for the OAuth machine-to-machine mode
 * *WHEN* the session resolves its authentication strategy for the first request
 * *THEN* the strategy SHALL POST `grant_type=client_credentials&scope=all-apis` with HTTP Basic authentication carrying `client_id` and `client_secret` to the token endpoint, defaulting the endpoint to `{host}/oidc/v1/token` when `oauth2_server_uri` is absent and the scope to `all-apis` when `scope` is absent
 * *AND* the strategy SHALL read the returned `access_token` and apply it as the request's bearer token
-* *AND* the session SHALL select this mode through that same shared classifier, and the classifier SHALL carry only the three mutually exclusive auth fields — the `oauth2_server_uri` and `scope` defaults SHALL stay owned by this feature, because the Unity endpoint default derives from the CONNECTION address while the Iceberg REST default leaves the property unset for the catalog to fill
+* *AND* the session SHALL select this mode through that same shared classifier, and the classifier SHALL carry only the three mutually exclusive auth fields, the `oauth2_server_uri` and `scope` defaults SHALL stay owned by this feature, because the Unity endpoint default derives from the CONNECTION address while the Iceberg REST default leaves the property unset for the catalog to fill
 * *AND* the `client_secret`, the Basic authentication header, and the minted `access_token` MUST NOT appear in any error message, returned SQL, or log line
 
 ### Scenario: A minted OAuth token is cached and refreshed before expiry rather than re-minted per request

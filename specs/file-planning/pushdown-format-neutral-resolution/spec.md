@@ -13,7 +13,7 @@ Routes every pushdown request through the table-format reader seam. The reader t
 
 ### Scenario: Every pushdown request shape resolves through the one format-reader seam
 
-* *GIVEN* four pushdown requests over the SAME virtual schema — a single-table projection scan, a
+* *GIVEN* four pushdown requests over the SAME virtual schema, a single-table projection scan, a
   single-table aggregate, a grouped aggregate, and a broadcast inner equi-join with two legs
 * *WHEN* the adapter plans each request
 * *THEN* the adapter SHALL obtain each table's file list, table root, name mapping, and effective
@@ -49,9 +49,9 @@ Routes every pushdown request through the table-format reader seam. The reader t
 
 * *GIVEN* the resolved catalog kind and the recorded rule that its variant names appear in no production module beyond the enum's own declaration, its resolver, the catalog-client construction site, credential validation, and the pushdown scan-source construction site
 * *WHEN* the pushdown path builds the per-request scan-source resolver
-* *THEN* the adapter SHALL match the catalog kind EXHAUSTIVELY at exactly ONE site in the pushdown path, which yields the per-request resolver, so a FOURTH catalog kind is a compile error there rather than a silent fall-through
-* *AND* that site SHALL REPLACE the pushdown refusal in the recorded list of production sites permitted to name a catalog-kind variant, so the permitted-site count is unchanged and no per-request-shape fork is introduced
-* *AND* that list SHALL be held by EXHAUSTIVE matching plus review rather than by a source-level probe, SUPERSEDING the recorded clause that the probe asserting it SHALL be updated to name this site instead of the refusal: no such probe was ever built, and `vs-adapter/catalog-kind-selection` records why this plan declines to build one
+* *THEN* the adapter SHALL match the catalog kind EXHAUSTIVELY at exactly ONE site in the pushdown path, which yields the per-request resolver, so a further catalog kind is a compile error there rather than a silent fall-through
+* *AND* that site SHALL be one of the production sites in the list of production sites permitted to name a catalog-kind variant, so the permitted-site count is unchanged and no per-request-shape fork is introduced
+* *AND* that list SHALL be held by EXHAUSTIVE matching plus review rather than by a source-level probe, and `vs-adapter/catalog-kind-selection` records why no such probe exists
 * *AND* the private already-resolved-session value the resolver carries SHALL gain one variant per catalog kind and SHALL be matched exhaustively wherever it is read, and it MUST NOT name a catalog-kind variant, so it adds no site to the permitted list
 * *AND* the format-reader selection site MUST NOT match the catalog kind, because it matches the scan source
 
@@ -71,7 +71,7 @@ Routes every pushdown request through the table-format reader seam. The reader t
 
 ### Scenario: Iceberg pushdown output is byte-identical across the rewiring
 
-* *GIVEN* the shipped Iceberg pushdown suites — the golden dispatch fixtures, the scan-spec encodings,
+* *GIVEN* the shipped Iceberg pushdown suites, the golden dispatch fixtures, the scan-spec encodings,
   the generated scan-driving SQL for raw, TopN, single-group aggregate, grouped aggregate, and
   broadcast-join requests, and the Iceberg E2E suites
 * *WHEN* those requests are planned through the format-reader seam instead of the direct file resolver

@@ -32,7 +32,7 @@ Extends `connection/connection-credentials` with the AWS Glue SigV4 requirement:
 * *WHEN* the adapter resolves the connection and issues its SigV4-signed catalog requests
 * *THEN* the adapter SHALL accept the CONNECTION without reporting `region` as missing, per the standard-AWS-Glue-endpoint definition in § Background
 * *AND* the adapter SHALL sign every SigV4-signed catalog request for the region `eu-west-1`, covering both the namespace-enumeration requests and the `loadTable` request
-* *AND* the adapter MUST NOT write the derived signing region into the CONNECTION's `region`, so `ConnectionCreds.region` SHALL stay empty and every other rule that reads it — the store-addressing precedence of `storage-access/pushdown-planning-cloud-credentials-vended-storage`, the S3 region `storage_block` builds, and the Azure-and-S3 mixed-fields guard — SHALL see it as unstated
+* *AND* the adapter MUST NOT write the derived signing region into the CONNECTION's `region`, so `ConnectionCreds.region` SHALL stay empty and every other rule that reads it, the store-addressing precedence of `storage-access/pushdown-planning-cloud-credentials-vended-storage`, the S3 region `storage_block` builds, and the Azure-and-S3 mixed-fields guard, SHALL see it as unstated
 
 ### Scenario: A standard AWS Glue endpoint signs the catalog request even when the CONNECTION states a different region
 
@@ -41,4 +41,4 @@ Extends `connection/connection-credentials` with the AWS Glue SigV4 requirement:
 * *WHEN* the adapter resolves the connection and issues its SigV4-signed catalog requests
 * *THEN* the adapter SHALL accept the CONNECTION
 * *AND* the adapter SHALL sign every SigV4-signed catalog request for `eu-west-1`, the region the address names, and NOT for the stated `us-east-1`
-* *AND* `ConnectionCreds.region` SHALL stay `us-east-1` for every other rule that reads it, so the stated `region` places the S3 store in a region DIFFERENT from the one that signs the catalog request — the deployment shape where a Glue catalog and its tables' S3 bucket sit in different AWS regions
+* *AND* `ConnectionCreds.region` SHALL stay `us-east-1` for every other rule that reads it, so the stated `region` places the S3 store in a region DIFFERENT from the one that signs the catalog request, the deployment shape where a Glue catalog and its tables' S3 bucket sit in different AWS regions

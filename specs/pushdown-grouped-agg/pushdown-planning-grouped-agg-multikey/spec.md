@@ -24,7 +24,7 @@ Extends `pushdown-grouped-agg/pushdown-planning-grouped-agg` to a GROUP BY with 
 
 ### Scenario: Every element of a multi-key tuple may be an expression
 
-* *GIVEN* a grouped aggregate `pushdown` request whose `groupBy` array contains two or more elements where each element is itself a scalar expression (e.g. `GROUP BY MOD(id,4), UPPER(name)`, or `GROUP BY YEAR(ts), LOWER(region)`), not merely a single expression key — the scalar functions being ones Exasol advertises and therefore actually sends as pushed group keys (arithmetic `/`/`*` and `CAST` are rendered by the translator but not advertised, so Exasol does not send them as group keys; that advertisement is future scope)
+* *GIVEN* a grouped aggregate `pushdown` request whose `groupBy` array contains two or more elements where each element is itself a scalar expression (e.g. `GROUP BY MOD(id,4), UPPER(name)`, or `GROUP BY YEAR(ts), LOWER(region)`), not merely a single expression key, the scalar functions being ones Exasol advertises and therefore actually sends as pushed group keys (arithmetic `/`/`*` and `CAST` are rendered by the translator but not advertised, so Exasol does not send them as group keys; that advertisement is future scope)
 * *WHEN* the adapter builds the grouped scan spec
 * *THEN* the adapter SHALL render EACH group-key expression element independently via the VS expression translator (raising mode) and carry the rendered fragments in `group_keys` in `groupBy` order
 * *AND* the scan UDF SHALL use those same rendered expressions verbatim in its per-shard DataFusion GROUP BY clause, one per `GK_{i}` column

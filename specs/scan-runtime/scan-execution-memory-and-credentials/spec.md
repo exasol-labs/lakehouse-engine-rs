@@ -13,7 +13,7 @@ The scan UDF sizes its DataFusion memory pool from the per-instance memory limit
 * The UDF resolves the spec's storage blocks once at the top of the invocation, not at each store-construction site. A join spec has a block per side, so the result is a pair. `ctx.connection()` is engine-local, so it does not contact the table catalog.
 * Each side has one registered object store. It serves that side's data files and that side's positional-delete files. The single-table path registers one store over one backend.
 * Each side's store answers per-file metadata lookups from a size index over that side's files only. A routing decorator wraps one spec-sized store per side, so every operation is routed before the sized-`head` shortcut can answer it (`scan-aggregation/scan-execution-join`).
-* Seven sites under `crates/lakehouse-engine/src/scan/` build a value-based redaction secret set. Two read the whole-spec union, three read the fact side off the spec, and two take a `&StorageBackend` parameter. A spec that carries only a connection name has no secret to yield, so the set must come from the resolved backends. The wire wrapper exposes no secret accessor, so a site that still reads the unresolved value fails to compile. The redaction set for a routed store is the union of every side's `secret_values()`.
+* Every site in the scan path that builds a value-based redaction secret set takes it from the resolved storage backends. A spec that carries only a connection name has no secret to yield, so the set must come from the resolved backends. The wire wrapper exposes no secret accessor, so a site that still reads the unresolved value fails to compile. The redaction set for a routed store is the union of every side's `secret_values()`.
 * DataFusion's `FileMetadataCache` keys entries by object-store path. It admits a stored entry only when the requesting `ObjectMeta` has the same byte size and the same `last_modified`. Access-plan construction and the opener agree because the access plan builds one `ObjectMeta` (spec-supplied size, fixed epoch timestamp) and clones it onto the file's `PartitionedFile`. A re-derived `ObjectMeta` would miss on every lookup and restore the duplicate footer fetch.
 * The per-side store split does not change cache reuse, because the cache is keyed by path. Both join sides share one bounded cache.
 * The default `FileMetadataCache` holds 50 MiB (`DEFAULT_METADATA_CACHE_LIMIT`) and evicts least-recently-used entries. An entry larger than the limit is never cached. Entry size scales with a file's `columns × row_groups`, so no fixed shard-file count is safe for every table. The access-plan fetch requests row-group metadata only, with no page index, which keeps entries small.
@@ -53,15 +53,15 @@ The scan UDF sizes its DataFusion memory pool from the per-instance memory limit
 * *AND* the UDF MUST NOT decide the storage backend itself, derive it from a file URI scheme, or read the backend's payload outside the single backend-dispatching registration function specified by `storage-access/storage-backend-enum`
 * *AND* when the spec also carries a join block, the UDF SHALL build a SECOND store from the join block's OWN resolved storage backend and read the dimension side's files through it, so the whole-spec backend serves only the side whose files the whole-spec `table_root` and per-shard `files` describe
 * *AND* the store the UDF builds for a side SHALL answer that side's per-file metadata lookups from a size index over THAT side's files only, so one side's `head` can never be satisfied by the other side's store
-* *AND* the credentials or their reference SHALL travel in the shard-invariant common spec argument, serialized once for the whole fan-out, NOT be repeated per shard — the dimension side's included, since the join block is itself shard-invariant
+* *AND* the credentials or their reference SHALL travel in the shard-invariant common spec argument, serialized once for the whole fan-out, NOT be repeated per shard, the dimension side's included, since the join block is itself shard-invariant
 * *AND* the UDF MUST NOT re-authenticate to the catalog or re-request vended credentials; resolving a CONNECTION by name through `ctx.connection()` is NOT such a request, because it reaches the database's own catalog rather than the table catalog and discovers no file, mints no token, and reads no snapshot
 * *AND* a credential value from ANY resolved backend MUST NOT appear in any error message the UDF returns
 
 ### Scenario: Every redaction secret set in the scan path is built from the resolved backends
 
-* *GIVEN* the sites under the scan path that build a value-based redaction secret set — the two that read the whole-spec union, the three that read the fact side off the spec, and the two that already receive a storage backend as a parameter
+* *GIVEN* every site in the scan path that builds a value-based redaction secret set, whether it reads the whole-spec union, the fact side, or receives a storage backend as a parameter
 * *WHEN* the scan spec's storage block carries a connection reference rather than a credential
-* *THEN* EVERY one of those sites SHALL take its secret set from the RESOLVED storage backend or backends, and NONE SHALL read it from the scan spec's own storage block
+* *THEN* EVERY such site SHALL take its secret set from the RESOLVED storage backend or backends, and NONE SHALL read it from the scan spec's own storage block
 * *AND* the wire wrapper MUST NOT expose a secret-value accessor, so a site left reading the unresolved value fails to COMPILE rather than returning an empty set and silently disarming redaction
 * *AND* an error raised on the RAW-SCAN path and an error raised on the PARTIAL-AGGREGATE path SHALL each be asserted to carry no resolved credential value, because those two paths read the fact-side set directly and no recorded scenario covered either
 * *AND* a spec whose storage block carries a reference MUST NOT yield an empty secret set once resolution has run, and a test SHALL assert the set is NON-empty for a resolved reference
@@ -80,7 +80,7 @@ The scan UDF sizes its DataFusion memory pool from the per-instance memory limit
 * *WHEN* the UDF builds the session config and the `ParquetExec` for its assigned files
 * *THEN* the UDF SHALL enable Parquet predicate pushdown, row-group statistics pruning, and page-index pruning on the Parquet scan options rather than relying on the DataFusion defaults
 * *AND* a row group whose column statistics provably exclude the predicate SHALL NOT be decoded
-* *AND* this Parquet-level pruning SHALL compose with the Iceberg file-level pruning of `file-planning/pushdown-file-pruning` — files dropped by Iceberg are never opened, and within the surviving files non-matching row groups and pages are skipped
+* *AND* this Parquet-level pruning SHALL compose with the Iceberg file-level pruning of `file-planning/pushdown-file-pruning`, files dropped by Iceberg are never opened, and within the surviving files non-matching row groups and pages are skipped
 * *AND* the emitted rows SHALL be identical to a scan with pruning disabled (pruning narrows what is read, never the result set)
 
 ### Scenario: Positional-delete files are read with the same resolved credentials
@@ -104,7 +104,7 @@ The scan UDF sizes its DataFusion memory pool from the per-instance memory limit
 
 ### Scenario: A metadata-cache eviction that re-fetches a footer is observable
 
-* *GIVEN* a scan whose delete-carrying data files' parsed footers do not all fit in the session metadata cache, so a footer that access-plan construction fetched is not available from that cache when the Parquet opener reads it — because the entry was evicted, or because it exceeded the cache limit and was never admitted
+* *GIVEN* a scan whose delete-carrying data files' parsed footers do not all fit in the session metadata cache, so a footer that access-plan construction fetched is not available from that cache when the Parquet opener reads it, because the entry was evicted, or because it exceeded the cache limit and was never admitted
 * *WHEN* the opener fetches that data file's footer a second time within the same scan invocation
 * *THEN* the UDF SHALL count that second footer fetch as a metadata-cache re-fetch, per scan invocation
 * *AND* the UDF SHALL surface the accumulated re-fetch count on its debug diagnostic channel, so an operator running the scan at debug level observes the double-fetch directly instead of inferring it from object-store request volume

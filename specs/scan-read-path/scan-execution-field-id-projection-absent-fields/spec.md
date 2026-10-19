@@ -46,7 +46,7 @@ The VS reads each field's `initial-default` once per query and encodes a primiti
 
 ### Scenario: Absent field with a defined initial-default returns the default value per file
 
-* *GIVEN* a scan spec whose logical schema carries two columns that each define a primitive `initial-default` — one REQUIRED and one NULLABLE — each bound to a field-id that is absent from one assigned file (an older file written before the column was added) and present in another assigned file
+* *GIVEN* a scan spec whose logical schema carries two columns that each define a primitive `initial-default`, one REQUIRED and one NULLABLE, each bound to a field-id that is absent from one assigned file (an older file written before the column was added) and present in another assigned file
 * *WHEN* the scan UDF reads both files
 * *THEN* the UDF SHALL emit each column's defined `initial-default` value for rows from the file that lacks the column's field-id, for both the required and the nullable column
 * *AND* the UDF SHALL emit the real physical values for those columns for rows from the file that carries the field-id, so the default fill is decided per file from that file's present field-ids
@@ -64,11 +64,11 @@ The VS reads each field's `initial-default` once per query and encodes a primiti
 
 ### Scenario: A decimal initial-default outside Exasol's catalog-decimal domain is not encoded as a numeric default
 
-* *GIVEN* a virtual schema query whose Iceberg current schema defines a field of type `decimal(P,S)` whose precision and scale fall OUTSIDE Exasol's catalog-decimal domain — `P = 0`, or `S > P` — and which declares a non-null primitive `initial-default`
+* *GIVEN* a virtual schema query whose Iceberg current schema defines a field of type `decimal(P,S)` whose precision and scale fall OUTSIDE Exasol's catalog-decimal domain, `P = 0`, or `S > P`, and which declares a non-null primitive `initial-default`
 * *AND* that field's Arrow-type tag is therefore `utf8` rather than `decimal128(P,S)`, per `scan-types/type-mapping`
 * *WHEN* the VS planning layer builds the logical schema from the Iceberg current schema and encodes each field's `initial-default`
 * *THEN* the VS SHALL gate the decimal encoding on the SAME predicate `scan-types/type-mapping` owns, and MUST NOT carry its own copy of the precision/scale condition, so one predicate decides both the Arrow-type tag and whether a default is encoded
 * *AND* the VS SHALL leave that field's encoded default ABSENT, so the field falls through to NULL (nullable) or the required-absent error at scan time, exactly as a field carrying a non-primitive `initial-default` already does
 * *AND* the VS MUST NOT encode the decimal literal's raw unscaled `i128` mantissa as that field's default, because the scan side reconstructs an encoded default against the Arrow-type tag alone: under a `utf8` tag that mantissa reconstructs as its DIGITS in a string column, a fabricated value rather than a clean fallback
-* *AND* a decimal field INSIDE the domain SHALL keep its recorded behavior byte-identical — its tag stays `decimal128(P,S)`, its `initial-default` is still encoded, and it still reconstructs to a `ScalarValue` matching that tag across the serialization round-trip
+* *AND* a decimal field INSIDE the domain SHALL keep its recorded behavior byte-identical, its tag stays `decimal128(P,S)`, its `initial-default` is still encoded, and it still reconstructs to a `ScalarValue` matching that tag across the serialization round-trip
 * *AND* the field-id expression adapter MUST NOT be installed for that scan

@@ -7,7 +7,7 @@ One Rust crate builds a single `.so` that exports the VS adapter, the DataFusion
 * The scan entry point is a SCALAR EMIT script. The version entry point is a SCALAR RETURNS script.
 * The `LAKEHOUSE_DISTRIBUTE_FILES` fan-out distributor is a separate LUA SET script created by its own DDL. It is not a Rust entry point and is not part of the `.so`.
 * Each `CREATE SCRIPT` statement references its entry point by registered name against the same `%udf_object`.
-* The `.so` is built only inside the `rust:1.94-trixie` builder image, never with host `cargo build --release`.
+* The `.so` is built only inside the builder image, never with host `cargo build --release`.
 
 ## Scenarios
 
@@ -34,7 +34,7 @@ One Rust crate builds a single `.so` that exports the VS adapter, the DataFusion
 * *GIVEN* the deployment DDL that creates the scan scripts
 * *WHEN* the fan-out distributor is provisioned
 * *THEN* the deployment SHALL create `LAKEHOUSE_DISTRIBUTE_FILES` as a standalone LUA SET SCRIPT (a pure passthrough re-emitting its `files` input, one row per group), independent of the uploaded `.so`
-* *AND* the pushdown wrapper SQL SHALL reference `LAKEHOUSE_DISTRIBUTE_FILES` schema-qualified so it resolves outside the adapter script's schema context, using the same schema resolution the scan script uses — the schema of the running adapter script, read from the UDF handshake via `ctx.script_schema()`, NOT a VS property
+* *AND* the pushdown wrapper SQL SHALL reference `LAKEHOUSE_DISTRIBUTE_FILES` schema-qualified so it resolves outside the adapter script's schema context, using the same schema resolution the scan script uses: the schema of the running adapter script, read from the UDF handshake via `ctx.script_schema()`, NOT a VS property
 * *AND* the distributor DDL MUST NOT reference the uploaded scan `.so` and MUST NOT declare a Rust `%udf_object` entry point
 
 ### Scenario: Host release build of the .so is rejected by convention

@@ -35,7 +35,7 @@ An Exasol user re-reads the source of an existing virtual schema in place with `
 
 * *GIVEN* a `refresh` request whose `schemaMetadataInfo.adapterNotes` carries the persisted notes from creation (`PARALLELISM_FACTOR`, the DataFusion threading and memory-budget entries, and `TABLE_MAP`)
 * *WHEN* the adapter builds the `refresh` response
-* *THEN* the adapter SHALL rebuild `TABLE_MAP` from the re-enumerated tables — a full rebuild, never a diff or patch of the prior map
+* *THEN* the adapter SHALL rebuild `TABLE_MAP` from the re-enumerated tables, a full rebuild, never a diff or patch of the prior map
 * *AND* the adapter SHALL preserve every other pre-existing `adapterNotes` entry when writing the rebuilt `TABLE_MAP`, including an entry the adapter does not itself write, which survives the rebuild unread and inert
 * *AND* the adapter MUST NOT persist the map anywhere other than the returned `schemaMetadata.adapterNotes`
 
@@ -44,14 +44,14 @@ An Exasol user re-reads the source of an existing virtual schema in place with `
 * *GIVEN* a virtual schema created over an Iceberg namespace reachable through its CONNECTION
 * *WHEN* Exasol sends a `refresh` request that carries a `requestedTables` array (a partial `ALTER VIRTUAL SCHEMA ... REFRESH TABLES ...`)
 * *THEN* the adapter SHALL echo the same `requestedTables` array in the response because the protocol requires a well-formed response of type `refresh` to mirror the fields of the request it answers
-* *AND* the adapter MUST NOT be relied upon to scope the resulting refresh to the echoed `requestedTables` — verified against the live engine, Exasol applies the adapter's full `schemaMetadata.tables` response to the whole namespace regardless of `requestedTables`, so a partial `REFRESH TABLES <t>` has the same real-world effect as a full `REFRESH`
+* *AND* the adapter MUST NOT be relied upon to scope the resulting refresh to the echoed `requestedTables`, verified against the live engine, Exasol applies the adapter's full `schemaMetadata.tables` response to the whole namespace regardless of `requestedTables`, so a partial `REFRESH TABLES <t>` has the same real-world effect as a full `REFRESH`
 * *AND* when the request carries no `requestedTables`, the response SHALL omit `requestedTables` so Exasol applies a full refresh
 
 ### Scenario: Set properties overrides persisted properties and re-enumerates
 
 * *GIVEN* a virtual schema created with property `NAMESPACE` set to one namespace, whose persisted properties arrive in `schemaMetadataInfo.properties`
 * *WHEN* Exasol sends a request of type `setProperties` (the literal protocol string for `ALTER VIRTUAL SCHEMA ... SET`) whose `properties` object sets `NAMESPACE` to a different namespace
-* *THEN* the adapter SHALL treat the request's `properties` as overriding the persisted `schemaMetadataInfo.properties` on conflict — the newly set value wins — and a `null` value in the request's `properties` SHALL unset that property
+* *THEN* the adapter SHALL treat the request's `properties` as overriding the persisted `schemaMetadataInfo.properties` on conflict, the newly set value wins, and a `null` value in the request's `properties` SHALL unset that property
 * *AND* the adapter SHALL re-enumerate using the effective merged properties and return a JSON response of type `setProperties` whose `schemaMetadata` describes the tables of the newly targeted namespace
 * *AND* a `setProperties` request that leaves a required property (`NAMESPACE` or `CATALOG_CONNECTION`) unset SHALL return a clear error naming the missing property
 

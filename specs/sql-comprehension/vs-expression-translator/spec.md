@@ -28,27 +28,27 @@ A standalone workspace crate (`crates/vs-expression`) that translates Exasol Vir
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return the column name uppercased and double-quoted as a DataFusion identifier
 * *AND* any embedded double-quote characters in the name MUST be escaped by doubling
-* *AND* when the `column` node ALSO carries a non-empty `tableAlias`, the translator SHALL render the reference table-qualified as `"ALIAS"."NAME"` — the multi-relation form `pushdown-joins/pushdown-planning-join-fallback` depends on
+* *AND* when the `column` node ALSO carries a non-empty `tableAlias`, the translator SHALL render the reference table-qualified as `"ALIAS"."NAME"`, the multi-relation form `pushdown-joins/pushdown-planning-join-fallback` depends on
 * *AND* the translator MUST NOT drop a `tableAlias` on its own; removing a `tableAlias` so a single-relation scan target resolves bare names is the CALLER's responsibility (`pushdown/pushdown-planning`), NOT the translator's
 
 ### Scenario: An undeclared scalar function name is not translated in either dialect
 
 * *GIVEN* a VS expression node of type `function_scalar` whose `name` is absent from the crate's one declaration of translated `function_scalar` names (for example `SUBSTRING`), whether or not a per-name rendering arm exists for that name
 * *WHEN* `render_expression` or `render_expression_exasol` processes the node in raising mode
-* *THEN* the translator SHALL return an error reading `unsupported scalar function: <NAME>` in both dialects, which is the same error an unrecognised name raises today
+* *THEN* the translator SHALL return an error reading `unsupported scalar function: <NAME>` in both dialects, the same error an unrecognised name raises
 * *AND* `render_expression_safe` and `render_expression_exasol_safe` SHALL return `None` for the same node without panicking
 * *AND* the declaration lookup MUST happen before any per-name rendering arm is reached, so an arm added without a declaration entry is unreachable and cannot emit DataFusion SQL on the Exasol path
-* *AND* the adapter SHALL omit the expression and let Exasol evaluate it, exactly as it does for any other untranslated name, so the gate changes no capability advertisement
+* *AND* the adapter SHALL omit the expression and let Exasol evaluate it, exactly as it does for any other untranslated name
 
 ### Scenario: Aggregate function nodes render with the aggregate name spliced verbatim
 
-* *GIVEN* a VS expression node of type `function_aggregate` — either standalone (e.g. `SUM(col)`, `COUNT(*)`, `COUNT(DISTINCT col)`, `AVG(col)`) or nested inside a scalar function (e.g. the `SUM(CASE WHEN … END)` and `COUNT(*)` inside `ROUND(100.0 * SUM(CASE WHEN … END) / COUNT(*), 2)`)
+* *GIVEN* a VS expression node of type `function_aggregate`, either standalone (e.g. `SUM(col)`, `COUNT(*)`, `COUNT(DISTINCT col)`, `AVG(col)`) or nested inside a scalar function (e.g. the `SUM(CASE WHEN … END)` and `COUNT(*)` inside `ROUND(100.0 * SUM(CASE WHEN … END) / COUNT(*), 2)`)
 * *WHEN* `render_expression` processes the node (directly, or by recursion from an enclosing `function_scalar`/arithmetic node)
-* *THEN* the translator SHALL splice the aggregate `name` verbatim (uppercased — it is NOT mapped to a DataFusion function alias the way scalar functions are), rendering `<NAME>(<rendered args>)`
+* *THEN* the translator SHALL splice the aggregate `name` verbatim (uppercased, it is NOT mapped to a DataFusion function alias the way scalar functions are), rendering `<NAME>(<rendered args>)`
 * *AND* a node with empty `arguments` or a star argument SHALL render as `COUNT(*)`
 * *AND* a node carrying `distinct: true` SHALL render as `<NAME>(DISTINCT <rendered arg>)`
 * *AND* each argument SHALL be rendered recursively by the translator (so `CASE`, arithmetic, and column-reference arguments render correctly), and a column argument carrying a `tableAlias` SHALL render table-qualified as `"ALIAS"."COL"`
-* *AND* the translator MUST NOT fall through to the unsupported-node catch-all for a `function_aggregate` node (which previously returned an error in raising mode and `None` in the safe variants, causing a scalar-over-aggregate select item to be wrongly declined)
+* *AND* the translator MUST NOT fall through to the unsupported-node catch-all for a `function_aggregate` node (which returns an error in raising mode and `None` in the safe variants and would wrongly decline a scalar-over-aggregate select item)
 * *AND* an aggregate node whose argument cannot be rendered SHALL return an error in raising mode and `None` in the safe variants, consistent with every other node type
 
 ### Scenario: The Exasol dialect never contains a DataFusion-only function name

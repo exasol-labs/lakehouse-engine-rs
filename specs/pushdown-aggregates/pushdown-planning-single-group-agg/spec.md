@@ -10,7 +10,7 @@ The adapter advertises the supported aggregate capabilities, translates an ungro
 * Exasol marks every aggregate without GROUP BY `aggregationType: single_group`, including an aggregate referenced only in HAVING. Such a request never reaches the row-scan projection, because a row scan returns raw rows instead of the aggregated row.
 * Exasol does not re-apply a HAVING, because the adapter advertises `AGGREGATE_HAVING`.
 * A select item may also be a scalar function wrapping aggregates (`pushdown-aggregates/pushdown-planning-single-group-agg-scalar-over-aggregate`).
-* Exactly one `COUNT(DISTINCT ...)` and no other select-list item (Case 1) becomes a DISTINCT row-scan fan-out (`pushdown-aggregates/pushdown-planning-count-distinct`). More than one distinct aggregate, or a distinct aggregate beside an ordinary aggregate (Case 2/3), routes to a qualified single-table wrapper (`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`). The wrapper computes every aggregate over a materialized sharded raw scan.
+* Exactly one `COUNT(DISTINCT <bare column>)` and no other select-list item (Case 1) becomes a DISTINCT row-scan fan-out (`pushdown-aggregates/pushdown-planning-count-distinct`). More than one distinct aggregate, or a distinct aggregate beside an ordinary aggregate (Case 2/3), routes to a qualified single-table wrapper (`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`). The wrapper computes every aggregate over a materialized sharded raw scan.
 * Exasol never re-aggregates a declined pushdown, so a bare row scan where `selectListDataTypes` expects aggregate columns fails with `sqlCode 04000`. Exasol also rejects an emitting UDF call nested in a scalar subquery (`sqlCode 04000`).
 * Exasol rejects an `OFFSET` in any ungrouped aggregated select (`sqlCode 42000`) and pushes no `orderBy` on an ungrouped aggregate request. The merge SELECT therefore takes no offset and renders no `ORDER BY`.
 
@@ -32,14 +32,14 @@ The adapter advertises the supported aggregate capabilities, translates an ungro
 * *AND* a query whose select list is one or more supported aggregate functions over the whole table, each either a bare aggregate or a scalar function wrapping aggregates (see `pushdown-aggregates/pushdown-planning-single-group-agg-scalar-over-aggregate`)
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL recognise the request as an aggregate query and resolve the data-file list exactly once
-* *AND* the adapter SHALL build a scan spec carrying, for each requested aggregate — including every aggregate nested inside a scalar wrapper — its function kind and target column (the wildcard for `COUNT(*)`), plus any pushed-down filter so the partial aggregate covers filtered rows only
+* *AND* the adapter SHALL build a scan spec carrying, for each requested aggregate, including every aggregate nested inside a scalar wrapper, its function kind and target column (the wildcard for `COUNT(*)`), plus any pushed-down filter so the partial aggregate covers filtered rows only
 * *AND* the adapter MUST NOT push down an aggregate the scan UDF cannot compute, falling back to the qualified single-table wrapper for that query instead of a bare row scan whenever the select list carries an aggregate at any depth, because Exasol never re-aggregates a declined pushdown
 
 ### Scenario: Aggregate wrapper SQL merges per-shard partial results
 
 * *GIVEN* an aggregate pushdown over a file list partitioned into one or more shards
 * *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the generated SQL SHALL drive the `LAKEHOUSE_SCAN` SCALAR EMIT UDF — fired once per distributed shard row from the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor (or once directly for a single-shard plan) — to emit one partial-aggregate row per shard
+* *THEN* the generated SQL SHALL drive the `LAKEHOUSE_SCAN` SCALAR EMIT UDF, fired once per distributed shard row from the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor (or once directly for a single-shard plan), to emit one partial-aggregate row per shard
 * *AND* the SQL SHALL wrap those partial rows in an OUTER ungrouped aggregation over the scalar scan select that merges them into the final result: `SUM` over per-shard partial counts for `COUNT`, `SUM` over partial sums for `SUM`, `MIN`/`MAX` over partial extrema for `MIN`/`MAX`
 * *AND* the `GROUP BY shard_key` used for cluster fan-out SHALL live only inside the nested distributor subquery, never at the outer merge level
 * *AND* the merged result SHALL equal the result of the same aggregate evaluated over all rows on a single node
@@ -58,25 +58,25 @@ The adapter advertises the supported aggregate capabilities, translates an ungro
 * *WHEN* the adapter builds the partial-aggregate scan spec
 * *THEN* the shard-invariant common spec's `projection` field SHALL be empty, NOT the full base-table column list
 * *AND* the referenced-column information SHALL be carried in the `aggregates` field, which is the field the aggregate scan-dispatch path consults; the `projection` field MUST NOT be read on that path
-* *AND* an `EXPLAIN VIRTUAL` of the same query SHALL show `"projection":[]` in the emitted `LAKEHOUSE_SCAN` common spec, so the diagnostic output no longer misreports a full-column projection for an aggregate query
-* *AND* for a scalar-over-aggregate select item the emitted `"projection"` SHALL likewise be empty and the emitted `"aggregates"` SHALL be non-empty, so the diagnostic output MUST NOT show the aggregate rendered as a projection expression (`"projection":[{"expr":"round(SUM(\"L_QUANTITY\"), 2)"}]`, the `EXPLAIN VIRTUAL` signature of issue #194)
+* *AND* an `EXPLAIN VIRTUAL` of the same query SHALL show `"projection":[]` in the emitted `LAKEHOUSE_SCAN` common spec, so the diagnostic output does not show a full-column projection for an aggregate query
+* *AND* for a scalar-over-aggregate select item the emitted `"projection"` SHALL likewise be empty and the emitted `"aggregates"` SHALL be non-empty, so the diagnostic output MUST NOT show the aggregate rendered as a projection expression (`"projection":[{"expr":"round(SUM(\"L_QUANTITY\"), 2)"}]`)
 * *AND* the physical Parquet read SHALL remain pruned to the aggregate-referenced columns via DataFusion's own projection pushdown (see `scan-aggregation/scan-execution-partial-agg`), so the empty `projection` field does not widen the scan
 
 ### Scenario: Single-group COUNT(DISTINCT) detection fans out a lone distinct and declines multi-distinct or mixed shapes
 
 * *GIVEN* a single-group (no GROUP BY) `pushdown` request whose select list carries one or more `function_aggregate` items
 * *WHEN* the adapter classifies the select list to choose a dispatch path
-* *THEN* a select list of EXACTLY one `COUNT(DISTINCT col)` or `COUNT(DISTINCT expr)` and no other item (Case 1) SHALL be planned as the dedicated DISTINCT row-scan fan-out counted by an outer native `COUNT(DISTINCT "V")` (see `pushdown-aggregates/pushdown-planning-count-distinct`), using the existing fan-out builder unchanged
-* *AND* a select list carrying MORE THAN ONE distinct aggregate, OR a `COUNT(DISTINCT ...)` alongside any ordinary SUM/MIN/MAX/COUNT/AVG aggregate (Case 2/3), SHALL decline the fan-out and route to a qualified single-table wrapper whose OWN rendered SQL computes every aggregate (including every DISTINCT) over a materialized sharded raw scan, so Exasol passes the one-row result through; the wrapper's output SHALL be N columns, one per select-list item
-* *AND* the wrapper's inner materialized scan projection SHALL be narrowed to only the columns the request references — including columns nested inside aggregate arguments and CASE branches, plus filter, HAVING, and ORDER BY references — via the shared referenced-column helper the grouped-aggregate fallback also uses (`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`; issue #160), NEVER the full base-table schema
+* *THEN* a select list of EXACTLY one `COUNT(DISTINCT col)` over a bare column and no other item (Case 1) SHALL be planned as the dedicated DISTINCT row-scan fan-out counted by an outer native `COUNT(DISTINCT "V")` (see `pushdown-aggregates/pushdown-planning-count-distinct`)
+* *AND* a select list carrying MORE THAN ONE distinct aggregate, OR a `COUNT(DISTINCT ...)` alongside any ordinary SUM/MIN/MAX/COUNT/AVG aggregate, OR a `COUNT(DISTINCT <expression>)` (Case 2/3), SHALL decline the fan-out and route to a qualified single-table wrapper whose OWN rendered SQL computes every aggregate (including every DISTINCT) over a materialized sharded raw scan, so Exasol passes the one-row result through; the wrapper's output SHALL be N columns, one per select-list item
+* *AND* the wrapper's inner materialized scan projection SHALL be narrowed to only the columns the request references, including columns nested inside aggregate arguments and CASE branches, plus filter, HAVING, and ORDER BY references, via the shared referenced-column helper the grouped-aggregate fallback also uses (`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`), NEVER the full base-table schema
 * *AND* the adapter MUST NOT return a bare row scan (`sqlCode 04000` column-count mismatch, since Exasol never re-aggregates a declined pushdown) and MUST NOT compose any distinct fan-out as a SELECT-list scalar subquery (`sqlCode 04000`, emitting UDF nested in a scalar subquery)
 
 ### Scenario: The single-row aggregate merge renders no OFFSET, because no offset can reach it
 
-* *GIVEN* an ungrouped single-group aggregate query carrying a `LIMIT` and a non-zero `OFFSET` — for example `SELECT COUNT(*) FROM t ORDER BY 1 LIMIT 5 OFFSET 2`
+* *GIVEN* an ungrouped single-group aggregate query carrying a `LIMIT` and a non-zero `OFFSET`, for example `SELECT COUNT(*) FROM t ORDER BY 1 LIMIT 5 OFFSET 2`
 * *WHEN* the statement is submitted to Exasol
 * *THEN* Exasol SHALL reject it with `sqlCode 42000` ("OFFSET not allowed in aggregated selects") without issuing a `pushdown` request, so the adapter's single-group aggregate merge SELECT SHALL never receive a non-zero `limit.offset`
-* *AND* the merge SELECT builder SHALL therefore take NO offset parameter and render NO `OFFSET`, keeping its existing `LIMIT n` rendering byte-identical to the pre-change output — including the `LIMIT 0` → zero-rows behaviour (issue #198)
+* *AND* the merge SELECT builder SHALL therefore take NO offset parameter and render NO `OFFSET`, and SHALL render `LIMIT n` for a request `LIMIT`, including `LIMIT 0` returning zero rows
 * *AND* the adapter MUST NOT add collapse arithmetic, offset rendering, or a `User` decline at this site, because no production request can execute that code and an untested branch here would be a live failure mode on an unreachable path
 * *AND* the per-shard scan spec SHALL carry NEITHER the row limit NOR any offset, so no shard's aggregate input is truncated
 

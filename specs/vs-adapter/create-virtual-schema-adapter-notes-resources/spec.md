@@ -76,4 +76,4 @@ The adapter records the computed resource budgets in the `createVirtualSchema` r
 * *GIVEN* a `createVirtualSchema` request that records a memory-pool fraction and instance-overhead megabytes in `adapterNotes`
 * *WHEN* Exasol round-trips those `adapterNotes` back to the adapter at pushdown time and the adapter builds each per-shard scan spec
 * *THEN* the adapter SHALL carry the resolved memory-pool fraction and instance-overhead bytes into every per-shard scan spec
-* *AND* a scan spec that lacks these fields (a pre-existing spec) SHALL deserialize to the default fraction `0.6` and default overhead `200` megabytes
+* *AND* a scan spec that lacks these fields (an older spec) SHALL deserialize to the default fraction `0.6` and default overhead `200` megabytes

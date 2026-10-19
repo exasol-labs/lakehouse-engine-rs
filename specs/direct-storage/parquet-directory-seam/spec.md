@@ -40,7 +40,7 @@ The Parquet directory seam answers three questions about a storage prefix: which
 * *AND* the merge mode that folds every file
 * *WHEN* the seam folds those footers
 * *THEN* it SHALL read every file's footer and SHALL resolve each column to the WIDER member of the pair, so the folded schema carries a 64-bit integer, a 64-bit float, and `decimal(12,2)`
-* *AND* it SHALL widen ONLY across pairs the recorded relaxation set already proves castable, reading that set from its ONE owner and MUST NOT carry its own pair table, because a pair the fold invented would declare a type the scan cannot cast a file up to
+* *AND* it SHALL widen ONLY across pairs the relaxation set of `scan-types/type-relaxation` proves castable, reading that set from its ONE owner and MUST NOT carry its own pair table, because a pair the fold invented would declare a type the scan cannot cast a file up to
 * *AND* it SHALL fold a column PAIRWISE across files in the deterministic listing order, so a column appearing at three types resolves to the widest one reachable by successive supported widenings
 * *AND* it SHALL read the footers CONCURRENTLY through the caller's store, bounded by the admission limiter that store carries, so a prefix holding many files costs one bounded fan-out rather than one serialized round-trip per file
 * *AND* a column whose two declared types are covered by NO supported pair SHALL fail the fold with an error naming the column, BOTH conflicting types, and BOTH file paths, so an operator can locate the offending files without listing the prefix

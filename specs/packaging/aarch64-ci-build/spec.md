@@ -4,7 +4,7 @@ CI builds the UDF `.so` for both x86_64 and aarch64 on native runners and publis
 
 ## Background
 
-- The UDF `.so` is built inside `rust:1.94-trixie` via `make cross-udf-build`
+- The UDF `.so` is built inside the builder image via `make cross-udf-build`
 - `about.toml` controls which targets `cargo-about` checks for license compliance
 
 ## Scenarios
@@ -13,8 +13,8 @@ CI builds the UDF `.so` for both x86_64 and aarch64 on native runners and publis
 
 * *GIVEN* the CI workflow is triggered on a non-draft PR, push to main, or merge_group event
 * *WHEN* the `build-so` job runs
-* *THEN* it MUST execute two matrix legs: `{runner: ubuntu-latest, arch: x86_64}` and `{runner: ubuntu-24.04-arm, arch: aarch64}`
-* *AND* each leg MUST build the `.so` inside the `rust:1.94-trixie` builder image on its native runner architecture
+* *THEN* it MUST execute two matrix legs: an x86_64 leg on an x86_64 runner and an aarch64 leg on a native aarch64 runner
+* *AND* each leg MUST build the `.so` inside the builder image on its native runner architecture
 * *AND* each leg MUST upload the build artifact with a distinct name including the architecture (`lakehouse-engine-so-x86_64`, `lakehouse-engine-so-aarch64`)
 
 ### Scenario: Release publishes architecture-distinguished tarballs

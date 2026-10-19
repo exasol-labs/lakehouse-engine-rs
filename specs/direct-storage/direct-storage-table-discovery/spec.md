@@ -17,13 +17,13 @@ The adapter turns a storage prefix holding directories of Parquet files into enu
 
 * *GIVEN* the shared `CatalogClient` trait declared in `lakehouse-catalog`, and the engine-side object-store builder that opens a store over a storage root
 * *WHEN* the adapter constructs the catalog client for `CatalogKind::DirectStorage`
-* *THEN* the direct-storage client type SHALL be declared in `lakehouse-engine` and SHALL implement `CatalogClient`, so the adapter reaches this client's ENUMERATION through `list_tables` exactly as it does for the other two kinds
-* *AND* `load_table` SHALL be UNREACHABLE for this kind, because the pushdown path resolves a direct-storage table from its COMPOSED ROOT rather than from a catalog load, and the trait's single engine-side `load_table` call site serves the Unity Catalog path alone
-* *AND* this client's `load_table` SHALL nevertheless return a clear error naming the direct-storage kind and stating that a direct-storage table is not loaded through the catalog trait, and MUST NOT panic and MUST NOT return an empty or synthesized table, so a future caller meets a message rather than a crash or a silently wrong result
-* *AND* `lakehouse-catalog` SHALL gain NO source file, NO manifest dependency, and NO public item for this kind, so the one-way crate dependency and the catalog crate's forbidden-dependency list are both unchanged
-* *AND* the adapter SHALL run the SAME listing pipeline over this client's result that it runs for the other two kinds, and that pipeline MUST NOT name or match the catalog kind
+* *THEN* the direct-storage client type SHALL be declared in `lakehouse-engine` and SHALL implement `CatalogClient`, so the adapter reaches this client's ENUMERATION through `list_tables` exactly as it does for the other kinds
+* *AND* `load_table` SHALL be UNREACHABLE for this kind, because the pushdown path resolves a direct-storage table from its COMPOSED ROOT rather than from a catalog load, and the trait's engine-side `load_table` call sites serve the catalog-backed kinds alone
+* *AND* this client's `load_table` SHALL nevertheless return a clear error naming the direct-storage kind and stating that a direct-storage table is not loaded through the catalog trait, and MUST NOT panic and MUST NOT return an empty or synthesized table, so a caller meets a message rather than a crash or a silently wrong result
+* *AND* `lakehouse-catalog` SHALL hold NO source file, NO manifest dependency, and NO public item for this kind, so the one-way crate dependency and the catalog crate's forbidden-dependency list are both unaffected
+* *AND* the adapter SHALL run the SAME listing pipeline over this client's result that it runs for the other kinds, and that pipeline MUST NOT name or match the catalog kind
 * *AND* the client SHALL surface every failure as an error value rather than a panic, and no error message SHALL contain a credential value
-* *AND* this placement SHALL be recorded as a deliberate decision rather than left implicit, because the two shipped implementors live in the catalog crate and a reader would otherwise read the third as a mistake
+* *AND* this placement SHALL be deliberate, because the catalog-backed implementors live in the catalog crate and a reader would otherwise read this one as a mistake
 
 ### Scenario: A first-level directory under the base path is a table
 
@@ -32,7 +32,7 @@ The adapter turns a storage prefix holding directories of Parquet files into enu
 * *THEN* the client SHALL return exactly TWO tables, named for the FIRST-LEVEL directories `orders` and `events`, so table identity is a directory and nothing else
 * *AND* the client MUST NOT return a table for `notes.parquet`, because a data file directly under the base path belongs to no directory and naming a table after a file would make the base path's own contents a table
 * *AND* the client MUST NOT return a table for `orders/2026/`, because every directory below a table root supplies files to that table rather than a table of its own
-* *AND* each returned table SHALL carry its own table root — the base path followed by that directory name — as its storage location, so planning needs no second composition rule
+* *AND* each returned table SHALL carry its own table root, the base path followed by that directory name, as its storage location, so planning needs no second composition rule
 * *AND* each returned table SHALL carry the Parquet table-format tag and NO credential-vending key, because this kind vends nothing
 
 ### Scenario: A table's columns and data files come from the one shared directory seam
@@ -54,7 +54,7 @@ The adapter turns a storage prefix holding directories of Parquet files into enu
 * *THEN* the client SHALL exclude `empty/` from its resolved tables and SHALL report it in the listing's skipped set, pairing its identifier with a neutral skip reason naming the absence of a data file
 * *AND* `createVirtualSchema` SHALL complete successfully with the remaining tables, and the shared listing pipeline SHALL write one warning line per skipped entry without branching on catalog kind
 * *AND* the skipped table's name SHALL be excluded from `TABLE_MAP`, so no unqueryable virtual table is advertised
-* *AND* a base path holding NO first-level directory with a data file SHALL yield a successful, EMPTY virtual schema rather than an error, matching the recorded all-non-Iceberg-namespace behaviour
+* *AND* a base path holding NO first-level directory with a data file SHALL yield a successful, EMPTY virtual schema rather than an error, matching the behavior for a namespace that holds no Iceberg table
 * *AND* the skip reason SHALL name no catalog kind, no table format, and no engine symbol, so it stays a neutral value of the catalog crate
 * *AND* the absence of a data file SHALL be the ONLY reason to skip a directory: a directory whose enumeration fails for any other reason, such as a column pair no widening rule folds (`direct-storage/parquet-directory-seam`), SHALL fail the whole `CREATE VIRTUAL SCHEMA` or `REFRESH` statement, and the client MUST NOT skip that directory or return a partial table set
 
@@ -76,7 +76,7 @@ The adapter turns a storage prefix holding directories of Parquet files into enu
 * *AND* the cap SHALL therefore bound the WHOLE call, so a two-table join holds at most the cap in flight in total rather than the cap per side
 * *AND* the store's HTTP connection-retention budget SHALL be at least the limiter's cap, so an admitted request never finds its connection already evicted, and the two values SHALL be derived from ONE declared constant rather than set independently
 * *AND* the limiter SHALL be an application-level admission gate, DISTINCT from the scan UDF's per-instance connection budget that `scan-runtime/scan-execution-connection-concurrency` owns, and MUST NOT read or modify that budget
-* *AND* the chosen cap SHALL be recorded as a deliberately conservative starting value to revisit with measurements, because a refresh sweeping many thousands of footers tolerates far more concurrency than a per-query plan
+* *AND* the cap SHALL be a deliberately conservative fixed value, because a refresh sweeping many thousands of footers tolerates far more concurrency than a per-query plan
 
 ### Scenario: A refresh that a column pair fails keeps the previous declaration queryable
 

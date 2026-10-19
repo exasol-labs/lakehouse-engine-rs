@@ -5,10 +5,10 @@ The adapter refuses a Delta table whose reader protocol version or reader-featur
 ## Background
 
 * The Delta protocol requires a reader to implement and respect every feature in `readerFeatures`. `readerFeatures` exists only when `minReaderVersion` is 3, and a table at Reader Version 3 must carry it. A reader does not gate `writerFeatures`, so a write-only feature never refuses a table.
-* The gate is default-deny. It matches an allow-list of seven reader features (`columnMapping`, `deletionVectors`, `timestampNtz`, `typeWidening`, `typeWidening-preview`, `v2Checkpoint`, `vacuumProtocolCheck`) and refuses every other feature. A `delta_kernel` upgrade that adds a `TableFeature` variant is refused until reviewed. The allow-list is the only enumeration in production code.
+* The gate is default-deny. It matches an allow-list of seven reader features (`columnMapping`, `deletionVectors`, `timestampNtz`, `typeWidening`, `typeWidening-preview`, `v2Checkpoint`, `vacuumProtocolCheck`) and refuses every other feature. A `TableFeature` variant that a newer `delta_kernel` adds is refused until reviewed. The allow-list is the only enumeration in production code.
 * `delta_kernel`'s own `ensure_operation_supported(Operation::Scan)` is not a substitute. It reports whether the kernel can read the log, not whether this engine can interpret the data the log describes. It accepts every reader feature its enum parses, including the `type-widening` and `unshredded-variant` fixtures.
 * `TableFeature::Unknown(_)` is the kernel's catch-all for an unrecognized `readerFeatures` name. The gate refuses it and reports the name verbatim.
-* `typeWidening` and `typeWidening-preview` name the same read contract at Reader Version 3 and Writer Version 7. The preview name identifies the client that enabled the feature. The engine's format-neutral column-binding adapter chain performs the widening cast per file (`scan-types/type-relaxation`). `delta_kernel` 0.26 performs no cast. `delta/delta-type-mapping` refuses a column whose recorded `delta.typeChanges` the engine cannot perform.
+* `typeWidening` and `typeWidening-preview` name the same read contract at Reader Version 3 and Writer Version 7. The preview name identifies the client that enabled the feature. The engine's format-neutral column-binding adapter chain performs the widening cast per file (`scan-types/type-relaxation`). `delta_kernel` performs no cast. `delta/delta-type-mapping` refuses a column whose recorded `delta.typeChanges` the engine cannot perform.
 * Writer-only features never appear in `readerFeatures`, so they are not on the allow-list. This includes `domainMetadata` and `inCommitTimestamp`.
 * The protocol-version bounds come from `delta_kernel::table_features::MIN_VALID_RW_VERSION` (1) and `MAX_VALID_READER_VERSION` (3). The version at which `readerFeatures` becomes mandatory is `TABLE_FEATURES_MIN_READER_VERSION` (3). The gate uses those constants, not literals.
 * `delta_kernel` rejects reader version 3 without `readerFeatures` while it parses the log. The gate checks that shape too, so it does not depend on the kernel's validation.
@@ -21,20 +21,17 @@ The adapter refuses a Delta table whose reader protocol version or reader-featur
 ### Scenario: A reader feature outside the allow-list refuses the table before any log replay
 
 * *GIVEN* a Delta table whose `protocol` action declares `minReaderVersion` 3 and a `readerFeatures`
-  list holding at least one feature outside this engine's allow-list — one of exactly
+  list holding at least one feature outside this engine's allow-list, one of exactly
   `variantType`, `variantType-preview`, `variantShredding`, `variantShredding-preview`,
-  `catalogManaged`, `catalogOwned-preview`, `adaptiveMetadata-preview`, or a name `delta_kernel` 0.26
+  `catalogManaged`, `catalogOwned-preview`, `adaptiveMetadata-preview`, or a name `delta_kernel`
   does not recognize and surfaces as `TableFeature::Unknown`
 * *WHEN* the Delta format reader resolves that table's scan
 * *THEN* the reader SHALL return a `UdfError` naming the table root and EVERY refused feature by its
-  Delta protocol name — the `readerFeatures` spelling, so `variantType-preview` is reported as
+  Delta protocol name, the `readerFeatures` spelling, so `variantType-preview` is reported as
   `variantType-preview` and an unrecognized name is reported verbatim
 * *AND* the reader SHALL name every refused feature in ONE error rather than the first alone, so a
   table carrying two unsupported features is diagnosed in one query instead of two
-* *AND* the refusal formatter SHALL carry NO per-feature special case, because the only one it ever
-  held was the `typeWidening` issue-#349 citation and both type-widening variants are now
-  allow-listed — a formatter arm for an allow-listed feature is unreachable code that reads as a
-  refusal still in force
+* *AND* the refusal formatter SHALL carry NO per-feature special case, because a formatter arm for an allow-listed feature is unreachable code that reads as a refusal still in force
 * *AND* the reader MUST NOT replay one Delta log commit, read one checkpoint, list one object-store
   prefix, or build the table's logical schema after the refusal, because the refusal exists to stop
   an unsupported table before it costs object-storage access
@@ -53,10 +50,10 @@ The adapter refuses a Delta table whose reader protocol version or reader-featur
   file list unchanged
 * *AND* `typeWidening` and `typeWidening-preview` SHALL both be admitted, because they name the same
   read contract at the same Reader Version 3 floor and differ only in which client enabled the
-  feature — admitting one and refusing the other would refuse a table this engine reads correctly
+  feature, admitting one and refusing the other would refuse a table this engine reads correctly
 * *AND* admitting the feature SHALL NOT by itself admit every type change a table records: a table
   whose `delta.typeChanges` names a change this engine cannot perform is still refused, per column,
-  by `delta/delta-type-mapping` — the protocol gate answers whether the FEATURE is implemented
+  by `delta/delta-type-mapping`, the protocol gate answers whether the FEATURE is implemented
   and the schema gate answers whether each recorded CHANGE is
 * *AND* the gate MUST NOT refuse a table because its `writerFeatures` list holds a feature outside the
   allow-list, because the protocol obliges a READER to respect `readerFeatures` alone and a
@@ -64,13 +61,7 @@ The adapter refuses a Delta table whose reader protocol version or reader-featur
 * *AND* the allow-list SHALL be the ONLY enumeration in the production code: the gate SHALL match the
   seven allow-listed variants and refuse the `_` remainder, so a `delta_kernel` upgrade that adds a
   `TableFeature` variant refuses it rather than admitting it unreviewed
-* *AND* every shipped Delta fixture whose reader features are wholly allow-listed SHALL keep passing
-  every scenario already recorded for it in
-  `scan-read-path/scan-execution-delta-deletion-vectors`,
-  `scan-read-path/scan-execution-partition-values`, `delta/delta-table-planning`, and
-  `delta/delta-type-mapping` — namely `table_with_dv` and
-  `multi_part_stats` (`deletionVectors`) and `stats_all_types` (`timestampNtz` + `columnMapping`) —
-  and the `type_widening` fixture SHALL join that set rather than staying refused
+* *AND* a table that declares `deletionVectors`, `timestampNtz` with `columnMapping`, or `typeWidening` SHALL stay queryable under `scan-read-path/scan-execution-delta-deletion-vectors`, `scan-read-path/scan-execution-partition-values`, `delta/delta-table-planning`, and `delta/delta-type-mapping`
 
 ### Scenario: A reader protocol version outside the readable range is refused
 
@@ -90,7 +81,7 @@ The adapter refuses a Delta table whose reader protocol version or reader-featur
 ### Scenario: A legacy-protocol table carries no explicit reader-feature list
 
 * *GIVEN* a Delta table whose `protocol` action declares a `minReaderVersion` of 1 or 2 and therefore,
-  per the protocol, carries no `readerFeatures` array — the shape of the `basic_partitioned`,
+  per the protocol, carries no `readerFeatures` array, the shape of the `basic_partitioned`,
   `cm_id_mode`, and `cm_name_mode` fixtures
 * *WHEN* the Delta format reader resolves that table's scan
 * *THEN* the reader SHALL pass the gate on the version check alone, because the only reader feature a
@@ -101,14 +92,13 @@ The adapter refuses a Delta table whose reader protocol version or reader-featur
 * *AND* conversely, a table declaring `minReaderVersion` equal to
   `delta_kernel::table_features::TABLE_FEATURES_MIN_READER_VERSION` (`3`) while carrying NO
   `readerFeatures` array SHALL be refused with a `UdfError` naming the missing list, because the
-  protocol makes the array mandatory at that version — a default-deny gate fails loud on a malformed
-  `protocol` action rather than reading it as feature-free and admitting every unimplemented reader
-  feature the table may actually use
+  protocol makes the array mandatory at that version, and a default-deny gate fails loud on a malformed
+  `protocol` action rather than reading it as feature-free
 * *AND* a version-3 table carrying an EMPTY `readerFeatures` array SHALL pass the gate, because an
   empty list is a well-formed declaration of no reader features rather than a missing one
-* *AND* the `cm_id_mode` and `cm_name_mode` fixtures — Reader Version 2 with
-  `delta.columnMapping.mode` set — SHALL keep resolving their column-mapping binding keys exactly as
-  `delta/delta-table-planning` records, so the gate regresses neither column-mapping mode
+* *AND* the `cm_id_mode` and `cm_name_mode` fixtures, Reader Version 2 with
+  `delta.columnMapping.mode` set, SHALL keep resolving their column-mapping binding keys exactly as
+  `delta/delta-table-planning` specifies, so the gate regresses neither column-mapping mode
 
 ### Scenario: The gate runs inside snapshot construction, so no resolution path can bypass it
 
@@ -116,14 +106,14 @@ The adapter refuses a Delta table whose reader protocol version or reader-featur
   partition-column list, its column-mapping mode, and its active file list
 * *WHEN* a `DeltaSnapshot` is constructed for a table root
 * *THEN* the gate SHALL run inside that construction, so construction either returns a gated snapshot
-  or returns the refusal — no code path SHALL be able to obtain a `DeltaSnapshot` whose protocol was
+  or returns the refusal, no code path SHALL be able to obtain a `DeltaSnapshot` whose protocol was
   never checked
 * *AND* the gate SHALL therefore run BEFORE the logical schema is built, BEFORE the partition columns
   are read, BEFORE the column-mapping mode is resolved, and BEFORE the active file list is replayed,
   so an unsupported table costs exactly the object-store reads that resolving the current version
   already needed and no more
 * *AND* the check MUST NOT be added at the format reader's own entry point instead, because that
-  leaves the constructor reachable from a second caller — including a test — that would then exercise
+  leaves the constructor reachable from a second caller, including a test, that would then exercise
   an ungated snapshot and record the ungated behavior as correct
 * *AND* the refusal SHALL be returned as a `UdfError` value, never raised as a panic, and MUST NOT
   contain any vended or static credential value

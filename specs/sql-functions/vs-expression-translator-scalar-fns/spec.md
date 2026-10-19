@@ -27,7 +27,7 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 
 * *GIVEN* a VS expression node of type `function_scalar` whose `name` is one of the supported Exasol math functions: `ABS`, `ROUND`, `FLOOR`, `CEIL`, `SQRT`, `POWER`, `EXP`, `LN`, `LOG`, `SIGN`, `TRUNC`, `SIN`, `COS`, `TAN`, `ASIN`, `ACOS`, `ATAN`, `ATAN2`, `SINH`, `COSH`, `TANH`, `COT`, `DEGREES`, or `RADIANS`
 * *WHEN* `render_expression` processes the node
-* *THEN* the translator SHALL render the node as the corresponding DataFusion SQL function applied to its rendered arguments in order, using these name mappings: `SIGN`→`signum`, `CEIL`→`ceil`, `POWER`→`power`, and all other listed names lower-cased to their identically-named DataFusion function
+* *THEN* the translator SHALL render the node as the corresponding DataFusion SQL function applied to its rendered arguments in order, using these name mappings: `SIGN`→`signum`, and all other listed names lower-cased to their identically-named DataFusion function
 * *AND* each argument SHALL be rendered recursively by the translator
 * *AND* a node whose argument count does not match the function arity SHALL return an error in raising mode and `None` in the safe variants
 
@@ -36,9 +36,9 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *GIVEN* a VS expression node of type `function_scalar` named with one of the math functions listed in the preceding scenario
 * *WHEN* `render_expression_exasol` processes the node
 * *THEN* the translator SHALL return `<NAME>(<arg1_sql>[, <arg2_sql>])` using the function's own uppercased Exasol name and its arguments in the order received, each rendered recursively in the Exasol dialect
-* *AND* `SIGN` in particular MUST render as `SIGN(<arg_sql>)` and MUST NOT render as `signum(...)`, which Exasol rejects with `function or script SIGNUM not found` (SQL code 42000) when the fragment reaches an Exasol-parsed wrapper (issue #209)
+* *AND* `SIGN` in particular MUST render as `SIGN(<arg_sql>)` and MUST NOT render as `signum(...)`, which Exasol rejects with `function or script SIGNUM not found` (SQL code 42000) when the fragment reaches an Exasol-parsed wrapper
 * *AND* the DataFusion-dialect rendering of every listed name MUST remain byte-identical to the preceding scenario
-* *AND* the Exasol dialect SHALL NOT impose its own arity check, because Exasol's compiler emitted a call its own engine accepts — the same rule the string-function family already follows for Exasol's three-argument `INSTR`
+* *AND* the Exasol dialect SHALL NOT impose its own arity check, because Exasol's compiler emitted a call its own engine accepts, the same rule the string-function family already follows for Exasol's three-argument `INSTR`
 
 ### Scenario: MOD translates to the modulo operator
 
@@ -46,14 +46,14 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return `(<left> % <right>)`, because DataFusion exposes modulo as the `%` operator rather than a `mod()` function
 * *AND* both operands SHALL be rendered recursively
-* *AND* `render_expression_exasol` SHALL return `MOD(<left>, <right>)` instead, because Exasol's parser rejects `%` (issue #197)
+* *AND* `render_expression_exasol` SHALL return `MOD(<left>, <right>)` instead, because Exasol's parser rejects `%`
 * *AND* a node whose argument count is not exactly two SHALL return an error in raising mode and `None` in the safe variants, in BOTH dialects
 
 ### Scenario: String scalar functions translate to DataFusion string calls
 
 * *GIVEN* a VS expression node of type `function_scalar` whose `name` is one of the supported Exasol string functions: `CONCAT`, `LENGTH`, `LOWER`, `UPPER`, `SUBSTR`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `REPEAT`, `REVERSE`, `LPAD`, `RPAD`, `ASCII`, `CHR`, `INITCAP`, `LEFT`, `RIGHT`, `TRANSLATE`, `INSTR`, `LOCATE`, `OCTET_LENGTH`, `UNICODE`, or `UNICODECHR`
 * *WHEN* `render_expression` processes the node
-* *THEN* the translator SHALL render the node as the corresponding DataFusion SQL function applied to its rendered arguments in order, using these name mappings: `SUBSTR`→`substr`, `LENGTH`→`character_length`, `OCTET_LENGTH`→`octet_length`, `INSTR`/`LOCATE`→`strpos` (with operands ordered string-then-substring per DataFusion `strpos(string, substring)`), `UNICODE`→`ascii`, `UNICODECHR`→`chr`, and all other listed names lower-cased to their identically-named DataFusion function
+* *THEN* the translator SHALL render the node as the corresponding DataFusion SQL function applied to its rendered arguments in order, using these name mappings: `LENGTH`→`character_length`, `INSTR`/`LOCATE`→`strpos` (with operands ordered string-then-substring per DataFusion `strpos(string, substring)`), `UNICODE`→`ascii`, `UNICODECHR`→`chr`, and all other listed names lower-cased to their identically-named DataFusion function
 * *AND* each argument SHALL be rendered recursively by the translator
 * *AND* `LOCATE`/`INSTR` argument reordering MUST preserve the Exasol semantics of "position of substring within string"
 * *AND* `CONCAT` SHALL be rendered by its own dedicated per-dialect rule, specified in `sql-functions/vs-expression-translator-concat`, not by this name-mapping table
@@ -64,7 +64,7 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *WHEN* `render_expression_exasol` processes the node
 * *THEN* the translator SHALL return `<NAME>(<args_sql>)` using the function's own uppercased Exasol name and its arguments in the order received, with no name mapping and no operand reordering
 * *AND* `INSTR` and `LOCATE` in particular MUST keep Exasol's own argument order and MUST NOT render as `strpos(...)`, which Exasol rejects with `function or script STRPOS not found` (SQL code 42000)
-* *AND* an `INSTR` or `LOCATE` node carrying Exasol's optional start-position or occurrence argument SHALL render with that argument forwarded unchanged, because Exasol's native function accepts it — this is what lets the arity decline in `pushdown-types/pushdown-planning-string-fn-type-coercion` still evaluate correctly on the Exasol side
+* *AND* an `INSTR` or `LOCATE` node carrying Exasol's optional start-position or occurrence argument SHALL render with that argument forwarded unchanged, because Exasol's native function accepts it, this is what lets the arity decline in `pushdown-types/pushdown-planning-string-fn-type-coercion` still evaluate correctly on the Exasol side
 * *AND* the DataFusion-dialect rendering of every listed name MUST remain byte-identical to the preceding scenario
 
 ### Scenario: CASE expression translates to SQL CASE WHEN
@@ -96,5 +96,5 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *GIVEN* a VS expression node of type `function_scalar` named `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`, or `REGEXP_COUNT`
 * *WHEN* `render_expression` processes the node in raising mode
 * *THEN* the translator SHALL return the error `unsupported scalar function: <NAME>`
-* *AND* `render_expression_safe` SHALL return `None` for the same node without panicking, and `render_expression_exasol` / `render_expression_exasol_safe` SHALL decline these five names identically — one capability set serves both dialects, so the Exasol dialect's verbatim rule MUST NOT widen the translated set
+* *AND* `render_expression_safe` SHALL return `None` for the same node without panicking, and `render_expression_exasol` / `render_expression_exasol_safe` SHALL decline these five names identically, one capability set serves both dialects, so the Exasol dialect's verbatim rule MUST NOT widen the translated set
 * *AND* the adapter SHALL NOT advertise `FN_PRED_REGEXP_LIKE`, `FN_REGEXP_REPLACE`, `FN_REGEXP_SUBSTR`, `FN_REGEXP_INSTR`, or `FN_REGEXP_COUNT`, so Exasol evaluates each of them

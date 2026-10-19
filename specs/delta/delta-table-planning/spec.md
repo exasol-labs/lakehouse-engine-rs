@@ -4,7 +4,7 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 
 ## Background
 
-* Delta resolution uses `delta-kernel-rs` 0.26 log replay behind the `FormatReader` trait in `lakehouse-engine`. The Iceberg path uses `iceberg`'s `plan_files()` (`file-planning/pushdown-planning-file-resolution`). Both paths emit the same `ScanSpec`.
+* Delta resolution uses `delta-kernel-rs` log replay behind the `FormatReader` trait in `lakehouse-engine`. The Iceberg path uses `iceberg`'s `plan_files()` (`file-planning/pushdown-planning-file-resolution`). Both paths emit the same `ScanSpec`.
 * `FormatReader` lives in the engine, not in `lakehouse-catalog`, because Iceberg file planning and the `ScanSpec` wire format live there and the catalog crate must not name `iceberg`, `datafusion`, `arrow`, `parquet`, `object_store`, or `delta_kernel`. `CatalogClient` stays metadata-only.
 * Each `FormatReader` owns its whole resolution: catalog request, storage credential, and file discovery. The Iceberg path needs the catalog's `TableMetadata`. The Delta path needs a table-root URL and a credentialed object store.
 * Format dispatch is one exhaustive match over `ScanSource`, which pairs a live catalog session with the table it reads. `ScanSource` is not `CatalogKind`, so the permitted `CatalogKind` match sites in `vs-adapter/catalog-kind-selection` gain no entry.
@@ -33,8 +33,8 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
   credentialed object store at a table-root URL
 * *WHEN* the Delta format reader resolves that table's scan
 * *THEN* the reader SHALL resolve the log's CURRENT version and replay every JSON commit and any
-  checkpoint up to it, and SHALL return exactly the data files active at that version — each entry
-  carrying the `add` action's `path` verbatim and its `size` — so a file added at one version and
+  checkpoint up to it, and SHALL return exactly the data files active at that version, each entry
+  carrying the `add` action's `path` verbatim and its `size`, so a file added at one version and
   removed at a later one is absent and a file added at a later version is present
 * *AND* the reader SHALL return one entry per active path even when the same path is removed and
   re-added within one commit, because a Delta `DELETE` that writes a deletion vector emits a
@@ -47,8 +47,7 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
   storage location, so the shard-invariant common spec carries it once
 * *AND* the returned scan MUST NOT carry any per-file minimum or maximum statistic, because
   `delta_kernel` compares those bounds itself during log replay and returns a selection vector rather
-  than values — so plan-time pruning (`delta/delta-file-pruning`) needs no wire shape for them,
-  SUPERSEDING the recorded reason that stats-based pruning was deferred to issue #321
+  than values, so plan-time pruning (`delta/delta-file-pruning`) needs no wire shape for them
 * *AND* the reader MUST NOT construct its own object store: it SHALL read the log through the store
   it is given, so the replay is exercised over a local filesystem store as well as over S3
 
@@ -58,12 +57,11 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
   Hive default partition directory because that row's partition value is NULL
 * *WHEN* the Delta format reader resolves that table's scan
 * *THEN* each returned file entry SHALL carry that file's Delta `partitionValues` in the
-  format-neutral per-file `partition_values` map — one entry per partition column, holding the
-  serialized value or an explicit absent value for NULL — because Delta stores a partition column's
+  format-neutral per-file `partition_values` map, one entry per partition column, holding the
+  serialized value or an explicit absent value for NULL, because Delta stores a partition column's
   value ONLY in the transaction log and never inside the data file, so a scan that reads the Parquet
   file alone cannot recover it
-* *AND* that map SHALL be the SAME field an Iceberg identity-transform partition value (issue #99) and
-  a future Hive-style partition value would populate, and MUST NOT be reachable only through a
+* *AND* that map SHALL be the SAME field a Hive-style partition value populates, and MUST NOT be reachable only through a
   format-named block, because resolving a per-file partition value at plan time is a property of
   partitioned tables rather than of Delta
 * *AND* the file whose logged partition value is NULL SHALL carry an explicit absent value, and MUST NOT
@@ -82,10 +80,10 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 * *WHEN* the Delta format reader resolves that table's scan
 * *THEN* the reader SHALL return exactly ONE entry for that path, carrying the deletion vector from
   the re-added `add` action and NOT the earlier delete-free `add`
-* *AND* that entry SHALL carry the Delta `deletionVector` descriptor verbatim — its storage kind, its
-  `pathOrInlineDv`, its `offset`, its `sizeInBytes`, and its `cardinality` — as ONE deletion-vector
+* *AND* that entry SHALL carry the Delta `deletionVector` descriptor verbatim, its storage kind, its
+  `pathOrInlineDv`, its `offset`, its `sizeInBytes`, and its `cardinality`, as ONE deletion-vector
   delete mechanism in the entry's single format-neutral `deletes` list, resolved into no path and
-  applied to no row at plan time, because applying it belongs to #320
+  applied to no row at plan time, because applying it belongs to scan time (`scan-read-path/scan-execution-delta-deletion-vectors`)
 * *AND* the storage kind SHALL be modelled as a closed set of the Delta protocol's three kinds
   (UUID-relative, inline, absolute path), so a descriptor naming a kind outside that set fails at
   plan time rather than reaching the scan as an unread string
@@ -95,8 +93,7 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
   file
 * *AND* a Delta entry's `deletes` list SHALL hold ONLY its deletion vector and MUST NOT hold any
   Iceberg delete-file reference, so the Iceberg positional-delete reader is never handed a reference
-  it would misread — the same guarantee the pre-#342 "`FileEntry::deletes` stays EMPTY on every Delta
-  entry" rule gave, restated for the unified list
+  it would misread
 * *AND* the plan-time relativization of file paths against the table root SHALL apply to Iceberg
   delete-file references ONLY, and MUST leave a deletion vector's `pathOrInlineDv` untouched, because
   that member is a UUID token or an inline payload rather than an object-store path
@@ -122,8 +119,7 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
   physical name and SHALL carry NO field-id, because the Delta protocol requires a `name`-mode reader
   to match on the physical name and a carried field-id would offer a second, unauthorized key
 * *AND* under `none` mode each logical field SHALL carry NEITHER a field-id NOR a physical name, so
-  the scan binds it by its own logical name, superseding the removed scenario's 1-based-ordinal
-  field-id: an ordinal is a value the writer never wrote into any file, and carrying it invites a
+  the scan binds it by its own logical name, because an ordinal is a value the writer never wrote into any file, and carrying it invites a
   false match against a file that happens to carry field-ids
 * *AND* a column under `id` or `name` mode whose `type_json` lacks the annotation its mode requires,
   or carries it malformed, SHALL be declared with a note whose refusal names the column, the mode,
@@ -162,7 +158,7 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
   `use_vended_credentials` report the IDENTICAL error text
 * *AND* the reader MUST NOT substitute the catalog URI, the CONNECTION's endpoint, or any other
   CONNECTION-derived value for the empty location, because none of them denotes the table's object
-  store — matching the rule `file-planning/pushdown-planning-file-resolution` already applies to an
+  store, matching the rule `file-planning/pushdown-planning-file-resolution` applies to an
   empty Iceberg table `location`
 * *AND* the reader MUST NOT request vended credentials, build an object store, or read one log file,
   so a malformed catalog response costs zero object-storage access
@@ -171,30 +167,19 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 
 * *GIVEN* a `ScanSource` whose variant pairs one resolved session with the table it reads
 * *WHEN* the adapter selects the format reader for that source
-* *THEN* the adapter SHALL match `ScanSource` EXHAUSTIVELY at exactly ONE site, which returns a boxed `FormatReader`, so adding a FOURTH table format or a FOURTH catalog kind is a compile error at that site rather than a silent fall-through
+* *THEN* the adapter SHALL match `ScanSource` EXHAUSTIVELY at exactly ONE site, which returns a boxed `FormatReader`, so adding a table format or a catalog source is a compile error at that site rather than a silent fall-through
 * *AND* the Unity Catalog variant SHALL match the loaded table's FORMAT tag exhaustively: the Delta tag selects the Delta reader, the Parquet tag selects the Unity Parquet reader of `unity-catalog/unity-parquet-table-planning`, and the Iceberg tag returns a `UdfError` naming the table and the reported format, because a table routed into another format's reader surfaces a missing log or a wrong schema instead of a clear format refusal
 * *AND* that match MUST NOT be replaced by an assumption that the Unity Catalog listing filter already excluded a format, because the single-table load applies no listing filter
 * *AND* the selection site MUST NOT match `CatalogKind`, so the permitted-site set of `vs-adapter/catalog-kind-selection` (the enum with its resolver, the catalog-client construction site, credential validation, and the pushdown scan-source construction site) stays intact and gains no file
 
 ### Scenario: Iceberg planning is byte-identical through the new seam
 
-* *GIVEN* the shipped Iceberg file-resolution logic and its former callers — the single-table pushdown
-  path, every join leg, and the external test callers
+* *GIVEN* the Iceberg file-resolution logic, reached by the single-table pushdown path and every join leg
 * *WHEN* the Iceberg format reader resolves a table's scan through the trait
-* *THEN* the reader SHALL OWN that resolution logic outright: the separately published
-  `resolve_file_list` entry point SHALL be deleted and its body SHALL live in the reader, SUPERSEDING
-  the recorded rule that its name, `pub` visibility, signature, and call sites stay unchanged, because
-  `file-planning/pushdown-format-neutral-resolution` routes every former caller through this seam
-* *AND* the reader SHALL construct each associated positional-delete reference as the Iceberg
-  positional-delete variant of the format-neutral delete mechanism, and its SERIALIZED per-shard file
-  list SHALL stay byte-identical to the pre-#342 encoding, including the delete-carrying 3-tuple form
-  and its `{"path":…,"size":…,"content_type":"position_deletes"}` member encoding
-* *AND* the returned scan SHALL carry EMPTY partition columns, and each of its file entries SHALL carry
-  EMPTY partition values, so the serialized shard-invariant common blob and per-shard file list for
-  every Iceberg request stay byte-identical to their pre-#342 encoding
-* *AND* every logical field the Iceberg reader emits SHALL carry its Iceberg field-id and NO physical
-  name, so an Iceberg column is still bound by field-id and the physical-name and identity binding
-  strategies are unreachable from the Iceberg path
+* *THEN* the reader SHALL OWN that resolution logic outright, with no separately published file-resolution entry point, because `file-planning/pushdown-format-neutral-resolution` routes every caller through this seam
+* *AND* the reader SHALL construct each associated positional-delete reference as the Iceberg positional-delete variant of the format-neutral delete mechanism, serialized as `{"path":…,"size":…,"content_type":"position_deletes"}` inside the per-shard file list
+* *AND* the returned scan SHALL carry EMPTY partition columns, and each of its file entries SHALL carry EMPTY partition values
+* *AND* every logical field the Iceberg reader emits SHALL carry its Iceberg field-id and NO physical name, so an Iceberg column is still bound by field-id and the physical-name and identity binding strategies are unreachable from the Iceberg path
 
 ### Scenario: The Delta reader is reached from production pushdown under the Unity Catalog kind
 
@@ -204,17 +189,10 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 * *THEN* the adapter SHALL select the Delta format reader through the scan-source seam and SHALL plan
   the query from the `ResolvedScan` that reader returns
 * *AND* the reader's resolved partition columns SHALL reach the shard-invariant common spec and its
-  per-file partition values SHALL reach the per-shard file entries, so the deferred scan-side partition
-  reconstruction this reader's contract names is satisfied by
-  `scan-read-path/scan-execution-partition-values` rather than left open
-* *AND* the reader SHALL now PRUNE the file list by the request's filter, on partition values and on
-  per-file statistics alike (`delta/delta-file-pruning`), SUPERSEDING the recorded rule that it
-  applies NO filter-based file pruning: a filter now narrows the files the scan reads as well as the
-  rows it emits, so this feature records NO remaining pruning exception
-* *AND* the reader SHALL now GATE the Delta reader protocol and reader-feature set
-  (`delta/delta-reader-feature-gating`), SUPERSEDING the recorded rule that it performs no such
-  gating: a table whose reader features this engine does not implement is no longer query-reachable,
-  so this feature records NO remaining reader-feature exception
+  per-file partition values SHALL reach the per-shard file entries, so the scan reconstructs partition columns as
+  `scan-read-path/scan-execution-partition-values` specifies
+* *AND* the reader SHALL PRUNE the file list by the request's filter, on partition values and on per-file statistics alike (`delta/delta-file-pruning`), so a filter narrows the files the scan reads as well as the rows it emits
+* *AND* the reader SHALL GATE the Delta reader protocol and reader-feature set (`delta/delta-reader-feature-gating`), so a table whose reader features this engine does not implement is not query-reachable
 * *AND* the reader SHALL refuse a request that reads or emits a column whose Delta type this engine
   cannot render faithfully, per column rather than per table
   (`delta/delta-type-mapping`), so a table carrying one struct column stays queryable on its

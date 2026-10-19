@@ -19,7 +19,7 @@ The scan UDF registers each assigned file from the `(path, size)` entry the adap
 
 * *GIVEN* a scan invocation whose per-shard files argument carries every assigned file's byte size alongside its path
 * *WHEN* the scan UDF registers its assigned files and builds the scan
-* *THEN* the UDF SHALL construct each assigned file's object metadata — at minimum its byte size — from the per-shard spec entry
+* *THEN* the UDF SHALL construct each assigned file's object metadata, at minimum its byte size, from the per-shard spec entry
 * *AND* the UDF MUST NOT issue a per-file object-store metadata (`HEAD`) request to discover a file's size before scanning, because the size is authoritative from the spec
 * *AND* the rows the UDF emits SHALL be identical to those produced when the size is instead discovered from object storage, so supplying the size changes only the pre-scan metadata round-trips, never the result
 
@@ -36,7 +36,7 @@ The scan UDF registers each assigned file from the `(path, size)` entry the adap
 
 * *GIVEN* a scan invocation whose per-shard files argument carries, for each associated positional-delete file, its byte size alongside its path
 * *WHEN* the scan UDF reads a data file's associated delete files
-* *THEN* the UDF SHALL construct each delete file's object metadata — at minimum its byte size — from the per-shard spec entry
+* *THEN* the UDF SHALL construct each delete file's object metadata, at minimum its byte size, from the per-shard spec entry
 * *AND* the UDF MUST NOT issue a per-file object-store metadata (HEAD) request for a delete file to discover its size, because the size is authoritative from the spec
 * *AND* the emitted rows SHALL be identical to those produced when a delete file's size is instead discovered from object storage
 
@@ -45,10 +45,10 @@ The scan UDF registers each assigned file from the `(path, size)` entry the adap
 * *GIVEN* a data file that carries positional deletes, whose per-row-group row counts are needed to build the base `ParquetAccessPlan`
 * *WHEN* the scan UDF constructs the access plan for that data file
 * *THEN* the UDF SHALL obtain the per-row-group row counts by reading the Parquet footer via an object-store range GET (the file size is already known from the spec), and MUST NOT issue a HEAD request
-* *AND* the UDF SHALL supply that read with a metadata size hint, so a data file whose Parquet footer and metadata fit within the hint costs EXACTLY ONE object-store range GET rather than a suffix probe followed by a second GET, and that hint SHALL be the SAME value the Parquet opener uses for its own footer reads — read back from the one `ParquetFormat` the provider both builds access plans against and hands to the physical-plan builder, so the two sites cannot drift and no separate constant and no operator-facing knob is introduced
-* *AND* the UDF SHALL request only the metadata the access plan consumes — the per-row-group row counts — and MUST NOT additionally request the Parquet page index, which access-plan construction never reads
+* *AND* the UDF SHALL supply that read with a metadata size hint, so a data file whose Parquet footer and metadata fit within the hint costs EXACTLY ONE object-store range GET rather than a suffix probe followed by a second GET, and that hint SHALL be the SAME value the Parquet opener uses for its own footer reads, read back from the one `ParquetFormat` the provider both builds access plans against and hands to the physical-plan builder, so the two sites cannot drift and no separate constant and no operator-facing knob is introduced
+* *AND* the UDF SHALL request only the metadata the access plan consumes, the per-row-group row counts, and MUST NOT additionally request the Parquet page index, which access-plan construction never reads
 * *AND* the UDF SHOULD parse each data file's footer at most once per scan, reusing the parsed metadata for both access-plan construction and the Parquet opener (via a shared reader factory / cached metadata) rather than reading the footer twice
-* *AND* attaching positional deletes to a data file MUST NOT increase the number of object-store requests issued against THAT data file, compared with the same scan of the same file with no deletes attached, measured with a non-empty `logical_schema` — the production configuration in which no `ParquetFormat::infer_schema` pass pre-populates the metadata cache, since measuring it under the legacy inference fallback proves nothing about the access-plan fetch
+* *AND* attaching positional deletes to a data file MUST NOT increase the number of object-store requests issued against THAT data file, compared with the same scan of the same file with no deletes attached, measured with a non-empty `logical_schema`, the production configuration in which no `ParquetFormat::infer_schema` pass pre-populates the metadata cache, since measuring it under the legacy inference fallback proves nothing about the access-plan fetch
 * *AND* the emitted rows SHALL be identical regardless of how many times the footer is physically fetched
 
 ### Scenario: Delete-file relative and absolute paths resolve like data-file paths

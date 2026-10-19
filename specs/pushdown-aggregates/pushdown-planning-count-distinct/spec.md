@@ -23,8 +23,8 @@ The adapter pushes a lone `COUNT(DISTINCT col)` over the whole table (no GROUP B
 * *AND* a query whose select list is a LONE `COUNT(DISTINCT col)` over the whole table with no GROUP BY, no other select-list item, and a BARE COLUMN argument (Case 1), e.g. `SELECT COUNT(DISTINCT L_SHIPMODE) FROM {vs_table}`
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL recognise the distinct aggregate, resolve the file list once, and build a row-scan-shaped scan spec whose projection is that single bare column with the `distinct` flag set and NULLs excluded
-* *AND* the fan-out SHALL emit one row per shard-local distinct value through the existing row-scan streaming path, declaring that column with its actual Exasol EMITS type — NEVER a `VARCHAR(2000000)` value or any other VARCHAR-typed intermediate — and crossing the `.so` boundary as no Arrow type
-* *AND* the scan spec MUST NOT carry a `CountDistinct` aggregate partial, the wrapper SQL MUST NOT invoke any custom distinct-merge UDF, and a `COUNT(DISTINCT <expression>)` argument (e.g. `COUNT(DISTINCT UPPER(L_SHIPMODE))`) MUST NOT engage this fan-out even as the lone select-list item — it always declines to the Case 2/3 qualified single-table wrapper (see "Multiple distinct columns or a distinct mixed with ordinary aggregates decline the fan-out and route to a qualified single-table wrapper")
+* *AND* the fan-out SHALL emit one row per shard-local distinct value through the existing row-scan streaming path, declaring that column with its actual Exasol EMITS type, NEVER a `VARCHAR(2000000)` value or any other VARCHAR-typed intermediate, and crossing the `.so` boundary as no Arrow type
+* *AND* the scan spec MUST NOT carry a `CountDistinct` aggregate partial, the wrapper SQL MUST NOT invoke any custom distinct-merge UDF, and a `COUNT(DISTINCT <expression>)` argument (e.g. `COUNT(DISTINCT UPPER(L_SHIPMODE))`) MUST NOT engage this fan-out even as the lone select-list item, it always declines to the Case 2/3 qualified single-table wrapper (see "Multiple distinct columns or a distinct mixed with ordinary aggregates decline the fan-out and route to a qualified single-table wrapper")
 
 ### Scenario: Outer wrapper counts the unioned per-shard distinct rows with a native COUNT(DISTINCT)
 
@@ -45,7 +45,7 @@ The adapter pushes a lone `COUNT(DISTINCT col)` over the whole table (no GROUP B
 ### Scenario: High-cardinality COUNT(DISTINCT) completes past the former per-shard cap
 
 * *GIVEN* an Exasol Docker container with the lakehouse VS adapter and scan UDF installed over SeaweedFS
-* *AND* an Iceberg table whose target column holds enough near-unique values per shard that the former per-shard distinct-set serialization would have exceeded its 1,048,576-byte cap
+* *AND* an Iceberg table whose target column holds enough near-unique values per shard that a serialized per-shard distinct set would be large
 * *WHEN* `SELECT COUNT(DISTINCT col) FROM {vs_table}` is executed against the virtual schema
 * *THEN* the query SHALL complete and its result MUST equal the same `COUNT(DISTINCT col)` executed on the raw Iceberg data via single-node DataFusion
 * *AND* the scan SHALL NOT abort under any per-shard element or byte cap, because no such cap exists on this path
@@ -54,10 +54,10 @@ The adapter pushes a lone `COUNT(DISTINCT col)` over the whole table (no GROUP B
 
 * *GIVEN* a single-group query whose select list carries more than one `COUNT(DISTINCT col)`, OR a `COUNT(DISTINCT col)` alongside one or more ordinary SUM/MIN/MAX/COUNT/AVG aggregates (optionally expression-argument), e.g. Q9b `SELECT COUNT(DISTINCT category), COUNT(DISTINCT region), SUM(LENGTH(comment)) FROM {vs_table}`
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter MUST NOT build any DISTINCT row-scan fan-out or compose a distinct count as a SELECT-list scalar subquery — Exasol rejects an emitting UDF call nested in a scalar subquery at compile time (`sqlCode 04000`)
-* *AND* the adapter MUST NOT return a bare row scan of the source columns — Exasol never re-aggregates a declined pushdown, so a raw-column response where `selectListDataTypes` expects N aggregate columns is rejected at pushdown-validation time (`sqlCode 04000`, column-count mismatch)
-* *AND* the adapter SHALL decline the fan-out and return a qualified single-table wrapper — `SELECT <the exact select list, every aggregate incl. each COUNT(DISTINCT) spliced verbatim> FROM (<materialized sharded raw scan> AS <alias>)` — so the adapter's OWN SQL computes every aggregate, including every DISTINCT, and Exasol passes the one-row result through unchanged; the wrapper's output SHALL be N columns, one per select-list item
-* *AND* the inner materialized scan's projection SHALL be narrowed to only the columns the request references — including columns nested inside aggregate arguments and CASE branches, plus filter, HAVING, and ORDER BY references — NEVER the full table schema, via the same referenced-column helper the grouped-aggregate qualified-wrapper fallback uses (`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`; issue #160)
+* *THEN* the adapter MUST NOT build any DISTINCT row-scan fan-out or compose a distinct count as a SELECT-list scalar subquery, Exasol rejects an emitting UDF call nested in a scalar subquery at compile time (`sqlCode 04000`)
+* *AND* the adapter MUST NOT return a bare row scan of the source columns, Exasol never re-aggregates a declined pushdown, so a raw-column response where `selectListDataTypes` expects N aggregate columns is rejected at pushdown-validation time (`sqlCode 04000`, column-count mismatch)
+* *AND* the adapter SHALL decline the fan-out and return a qualified single-table wrapper, `SELECT <the exact select list, every aggregate incl. each COUNT(DISTINCT) spliced verbatim> FROM (<materialized sharded raw scan> AS <alias>)`, so the adapter's OWN SQL computes every aggregate, including every DISTINCT, and Exasol passes the one-row result through unchanged; the wrapper's output SHALL be N columns, one per select-list item
+* *AND* the inner materialized scan's projection SHALL be narrowed to only the columns the request references, including columns nested inside aggregate arguments and CASE branches, plus filter, HAVING, and ORDER BY references, NEVER the full table schema, via the same referenced-column helper the grouped-aggregate qualified-wrapper fallback uses (`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`)
 * *AND* every returned aggregate value, including each `COUNT(DISTINCT col)`, SHALL equal the corresponding aggregate evaluated over all rows on a single node
 
 ### Scenario: LIMIT, OFFSET, and ORDER BY are NOT pushed into the distinct fan-out sub-scan
@@ -66,8 +66,8 @@ The adapter pushes a lone `COUNT(DISTINCT col)` over the whole table (no GROUP B
 * *WHEN* the adapter builds the distinct-column fan-out and its shard-invariant common spec
 * *THEN* the distinct fan-out's shard-invariant common spec MUST NOT carry any LIMIT, OFFSET, or ORDER BY value from the outer request, so no per-shard DISTINCT sub-scan runs a bounded top-N that would drop shard-local distinct values before the merge counts them
 * *AND* any request-level LIMIT SHALL appear only on the outer `COUNT(DISTINCT "V")` wrapper SELECT, never on the per-shard fan-out sub-scan, matching how the grouped-aggregate path confines LIMIT to the outer merge
-* *AND* the wrapper SHALL receive the request's RAW `limit`, and MUST NOT have it withheld on the grounds that an `ORDER BY` the adapter did not render is present — the withholding once implemented has been deleted as dead code, since it never fired (issue #191)
-* *AND* the wrapper SHALL render NO `OFFSET`, because a non-zero request `limit.offset` cannot reach it: Exasol rejects `SELECT COUNT(DISTINCT c) FROM t ORDER BY 1 LIMIT 5 OFFSET 2` with `sqlCode 42000` ("OFFSET not allowed in aggregated selects") before issuing a `pushdown` request — so the adapter adds no offset rendering, no collapse arithmetic, and no failure branch here
+* *AND* the wrapper SHALL receive the request's RAW `limit`, and MUST NOT have it withheld on the grounds that an `ORDER BY` the adapter did not render is present
+* *AND* the wrapper SHALL render NO `OFFSET`, because a non-zero request `limit.offset` cannot reach it: Exasol rejects `SELECT COUNT(DISTINCT c) FROM t ORDER BY 1 LIMIT 5 OFFSET 2` with `sqlCode 42000` ("OFFSET not allowed in aggregated selects") before issuing a `pushdown` request, so the adapter adds no offset rendering, no collapse arithmetic, and no failure branch here
 * *AND* the merged distinct count SHALL therefore equal `COUNT(DISTINCT col)` evaluated over all rows on a single node, exactly, whenever the request's `LIMIT` admits that row, and SHALL return zero rows for `LIMIT 0`
 * *AND* the Case 2/3 qualified single-table wrapper (see "Multiple distinct columns …") SHALL confine any request-level LIMIT and OFFSET to the OUTER wrapper SELECT, keeping the inner materialized sharded scan LIMIT-free and sort-free, exactly as the grouped-aggregate qualified-wrapper fallback confines LIMIT to its outer SELECT
 

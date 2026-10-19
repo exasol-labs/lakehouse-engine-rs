@@ -37,7 +37,7 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 
 ### Scenario: A declined WHERE filter routes the single-table request to the qualified wrapper
 
-* *GIVEN* a single-table `pushdown` request carrying a non-null `filter` that the DataFusion-bound render declines, of any dispatch shape — row scan, top-N, single-group aggregate, grouped aggregate, or `COUNT(DISTINCT)`
+* *GIVEN* a single-table `pushdown` request carrying a non-null `filter` that the DataFusion-bound render declines, of any dispatch shape, row scan, top-N, single-group aggregate, grouped aggregate, or `COUNT(DISTINCT)`
 * *WHEN* the pushdown dispatcher selects the SQL shape
 * *THEN* the dispatcher SHALL route the request to the qualified single-table wrapper BEFORE the routing classifier runs, so one route serves every dispatch shape
 * *AND* the request's ORIGINAL filter tree SHALL still be forwarded to Iceberg-level file pruning unchanged, because pruning reads the un-rewritten tree and only ever removes files that provably cannot match
@@ -64,9 +64,9 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 
 ### Scenario: Projected CAST expression preserves the declared TIMESTAMP fractional-seconds precision in its EMITS type
 
-* *GIVEN* a row-scan `pushdown` request whose select list carries an expression item — for example `CAST(c_ts AS TIMESTAMP(6))` — whose parallel `selectListDataTypes` entry is `{"type":"TIMESTAMP","fractionalSecondsPrecision":6}`
+* *GIVEN* a row-scan `pushdown` request whose select list carries an expression item, for example `CAST(c_ts AS TIMESTAMP(6))`, whose parallel `selectListDataTypes` entry is `{"type":"TIMESTAMP","fractionalSecondsPrecision":6}`
 * *WHEN* the adapter derives the scalar scan UDF's EMITS column type for that item via `exasol_type_from_json`
-* *THEN* the derived EMITS type SHALL be `TIMESTAMP(6)`, reading the precision from the `fractionalSecondsPrecision` field — Exasol's documented data-type field for a TIMESTAMP's fractional-seconds precision (default 3), verified against Exasol's virtual-schema data-type API and the reference fixture `pushdown_request_alltypes.json`; the `DECIMAL` arm's `precision`/`scale` keys MUST NOT be read for a TIMESTAMP
+* *THEN* the derived EMITS type SHALL be `TIMESTAMP(6)`, reading the precision from the `fractionalSecondsPrecision` field, Exasol's documented data-type field for a TIMESTAMP's fractional-seconds precision (default 3), verified against Exasol's virtual-schema data-type API and the reference fixture `pushdown_request_alltypes.json`; the `DECIMAL` arm's `precision`/`scale` keys MUST NOT be read for a TIMESTAMP
 * *AND* when `fractionalSecondsPrecision` is absent the derived EMITS type SHALL be bare `TIMESTAMP`, equivalent to Exasol's default `TIMESTAMP(3)`, preserving the current behavior asserted by `exasol_type_from_json_reads_with_local_time_zone_flag`
 * *AND* a `withLocalTimeZone: true` timestamp dataType SHALL still map to `TIMESTAMP WITH LOCAL TIME ZONE` and SHALL take precedence over any precision rendering, leaving the WLTZ branch unchanged
 * *AND* this EMITS-precision derivation and the vs-expression CAST-render precision fix (`sql-comprehension/vs-expression-translator-cast`) SHALL ship together, because Exasol's `EXPLAIN VIRTUAL` type check (`Data type mismatch ... Expected TIMESTAMP(6), but got TIMESTAMP(3)`, SQL error 04000) compares the outer query's expected column type against the EMITS-declared type, and fixing only one of the two collapse points still fails the check; this scenario governs the pushed-down CAST *expression's* declared target type and MUST NOT be conflated with `scan-types/type-mapping`'s "Iceberg timestamptz maps to plain Exasol TIMESTAMP" scenario, which governs a raw column's `createVirtualSchema` schema declaration (always bare `TIMESTAMP`)

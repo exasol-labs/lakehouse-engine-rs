@@ -17,7 +17,7 @@ The Virtual Schema authenticates to an Iceberg REST Catalog in one of three mode
 
 ### Scenario: Static bearer token is attached to unsigned catalog requests
 
-* *GIVEN* a virtual schema whose CONNECTION credentials supply a non-empty `token`, supply neither `client_id` nor `client_secret` — the only shape credential validation admits for the token mode — and do not enable `use_sigv4`
+* *GIVEN* a virtual schema whose CONNECTION credentials supply a non-empty `token`, supply neither `client_id` nor `client_secret`, the only shape credential validation admits for the token mode, and do not enable `use_sigv4`
 * *AND* a query that requires resolving the Iceberg snapshot and file list from a REST catalog endpoint
 * *WHEN* the adapter resolves the file list through the unsigned catalog path
 * *THEN* the adapter SHALL set the catalog `token` property from the resolved credentials when building the REST catalog
@@ -27,7 +27,7 @@ The Virtual Schema authenticates to an Iceberg REST Catalog in one of three mode
 
 ### Scenario: OAuth2 client credentials drive the catalog client-credentials grant
 
-* *GIVEN* a virtual schema whose CONNECTION credentials supply `client_id` and `client_secret`, supply no `token` — the only shape credential validation admits for the OAuth2 mode — and do not enable `use_sigv4`
+* *GIVEN* a virtual schema whose CONNECTION credentials supply `client_id` and `client_secret`, supply no `token`, the only shape credential validation admits for the OAuth2 mode, and do not enable `use_sigv4`
 * *WHEN* the adapter resolves the file list through the unsigned catalog path
 * *THEN* the adapter SHALL set the catalog `credential` property to the string formed by joining `client_id` and `client_secret` with a single colon
 * *AND* the adapter SHALL set the catalog `oauth2-server-uri` property only when a non-empty `oauth2_server_uri` was supplied, otherwise leaving it unset so the catalog defaults to `{uri}/v1/oauth/tokens`
@@ -40,14 +40,14 @@ The Virtual Schema authenticates to an Iceberg REST Catalog in one of three mode
 * *GIVEN* a virtual schema whose CONNECTION credentials supply no `token`, `client_id`, or `client_secret`
 * *WHEN* the adapter resolves the file list through the unsigned catalog path
 * *THEN* the adapter SHALL NOT set the catalog `token`, `credential`, `oauth2-server-uri`, or `scope` properties
-* *AND* the catalog build SHALL be identical in shape to the pre-feature behaviour
+* *AND* the catalog build SHALL carry no auth property, so the catalog is reached unauthenticated
 
 ### Scenario: Catalog auth props are never placed in any scan spec
 
 * *GIVEN* a virtual schema whose CONNECTION credentials supply a `token` or OAuth2 client credentials, with `use_vended_credentials` either enabled or disabled
 * *WHEN* the adapter builds the per-shard scan specs after resolving the file list
 * *THEN* the adapter MUST NOT place `token`, `client_id`, `client_secret`, `oauth2_server_uri`, or `scope` into any `ScanSpec` field
-* *AND* the `ScanSpec` SHALL carry no catalog identifier block at all — the scan UDF never contacts the catalog, so `ScanSpec` MUST NOT include catalog `uri`, `warehouse`, or `table` fields
+* *AND* the `ScanSpec` SHALL carry no catalog identifier block at all, the scan UDF never contacts the catalog, so `ScanSpec` MUST NOT include catalog `uri`, `warehouse`, or `table` fields
 * *AND* each `ScanSpec` storage block SHALL carry only storage material, in the wire variant that `storage-access/scan-spec-credential-reference` § "One pure function selects the wire variant and gates the sealed envelope" selects
 
 ### Scenario: OAuth2 client-credentials path resolves tables from a multi-warehouse catalog served under a base path

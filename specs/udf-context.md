@@ -9,7 +9,7 @@
 
 **Instance = a UDF process.** Per UDF call, a node starts up to `#cores` instances
 (its fixed per-node VM pool, sized to `NR_OF_CORES`). A node starts as many
-instances as it needs — or is allowed — up to that ceiling. This is the unit of
+instances as it needs, or is allowed, up to that ceiling. This is the unit of
 *actual* OS-level parallelism.
 
 **Group = a `GROUP BY` partition of the input.** Groups are the unit of *work
@@ -44,7 +44,7 @@ group 1:            group 2:
 ```
 
 **One node, one instance:** the single instance processes group 1 to completion,
-then processes group 2 — sequentially, on the same process. Two groups, one
+then processes group 2, sequentially, on the same process. Two groups, one
 instance → serial.
 
 **Add instances (up to `#cores`):** the two groups distribute across instances and
@@ -58,7 +58,7 @@ This is exactly why the engine fans out on `GROUP BY shard_key` and **not** on
 
 * Each shard is one group carrying one file subset. G shards = G groups.
 * Groups multiplex onto each node's instance pool. More groups than a node's cores
-  is fine and *desirable* — extra groups queue onto instances as cores free up,
+  is fine and *desirable*, extra groups queue onto instances as cores free up,
   which smooths out stragglers (uneven file sizes / scan times).
 * `GROUP BY IPROC()` would collapse to exactly one group per node → one instance
   busy, the node's other cores idle.
@@ -67,13 +67,13 @@ This is exactly why the engine fans out on `GROUP BY shard_key` and **not** on
 
 Because only `#cores` instances run **concurrently** on a node regardless of how
 many groups are queued, peak concurrent DataFusion runtimes on a node is bounded
-by the core pool — **not** by G. Oversubscribing G does **not** raise peak memory;
+by the core pool, **not** by G. Oversubscribing G does **not** raise peak memory;
 it only improves load balancing. (Memory is bounded by `#cores × per-instance
 pool`, with the engine's 80% concurrency throttle on top.)
 
 ### Consequence: the real cost of oversubscription
 
-The cost of a larger G is **not** memory — it is **per-invocation fixed overhead**:
+The cost of a larger G is **not** memory, it is **per-invocation fixed overhead**:
 each shard group is a separate UDF invocation that stands up its own DataFusion
 session, registers the table, and parses its scan spec. Too many tiny shards means
 session-startup cost dominates the actual scan. So G has a sweet spot: enough

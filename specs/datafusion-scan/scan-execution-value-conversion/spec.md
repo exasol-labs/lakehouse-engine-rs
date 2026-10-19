@@ -23,11 +23,11 @@ The scan UDF converts each output Arrow column to the SDK `Value` variant, or th
 
 ### Scenario: Incompatible Arrow columns are emitted as JSON strings
 
-* *GIVEN* a scan result containing columns of types Exasol cannot represent — a NESTED type (list, struct, map) or a NON-NESTED one (binary or an out-of-range decimal)
+* *GIVEN* a scan result containing columns of types Exasol cannot represent, a NESTED type (list, struct, map) or a NON-NESTED one (binary or an out-of-range decimal)
 * *WHEN* the scan UDF prepares a batch of those columns for emission
 * *THEN* a NESTED column SHALL have been rendered to a `Utf8` column of valid JSON documents at the Arrow COLUMN level, before the batch reaches the per-value conversion boundary, per `scan-types/nested-json-rendering`
 * *AND* the per-value converter SHALL therefore receive that column already as `Utf8` and emit `Value::String`, and a null cell SHALL emit `Value::Null`
-* *AND* a NON-NESTED incompatible column SHALL keep its recorded path unchanged — `CAST(col AS VARCHAR)` in the generated scan SQL, then `Value::String` — and this feature MUST NOT claim strict JSON conformance for it (issue #351)
+* *AND* a NON-NESTED incompatible column SHALL keep its recorded path unchanged, `CAST(col AS VARCHAR)` in the generated scan SQL, then `Value::String`, and this feature MUST NOT claim strict JSON conformance for it
 * *AND* the UDF MUST NOT emit any array, list, struct, or map `Value`
 * *AND* `arrow_value_at`'s wildcard display-string fallback arm SHALL be left byte-identical, gaining no nested arm, because a nested column can no longer reach it: the JSON rendering happens upstream, and the only columns the partial-aggregate path carries are group keys and aggregate results
 

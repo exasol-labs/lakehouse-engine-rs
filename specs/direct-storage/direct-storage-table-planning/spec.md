@@ -19,11 +19,11 @@ The adapter resolves a directory of Parquet files into the engine's `ScanSpec` a
 
 * *GIVEN* the scan source whose variant pairs one resolved session with the table it reads, matched exhaustively at exactly ONE site returning a boxed format reader
 * *WHEN* the adapter selects the reader for a direct-storage table
-* *THEN* the scan source SHALL gain a THIRD variant carrying the request's object store and the table root, and the selection site SHALL match all three variants EXHAUSTIVELY, so a fourth table format is a compile error there rather than a silent fall-through
+* *THEN* the scan source SHALL have a direct-storage variant carrying the request's object store and the table root, and the selection site SHALL match every variant EXHAUSTIVELY, so a new source is a compile error there rather than a silent fall-through
 * *AND* that variant MUST NOT carry the directory options or a declared-column list, because the table's declaration reaches every reader from the column notes, and the directory options take effect only at enumeration
-* *AND* the selection site MUST NOT match the catalog kind, so the permitted-site set `vs-adapter/catalog-kind-selection` records gains no file
-* *AND* the direct-storage variant SHALL carry NO catalog table metadata, because this kind loads no table: its root is composed from the CONNECTION address, the namespace property, and the recorded directory name
-* *AND* the Iceberg and Delta arms SHALL be UNCHANGED, and every existing Iceberg and Delta test MUST pass with no change to any assertion or expected value, except the error text of the two refusals that now run before the format is known (a table with no mappable column, and a refused partition column), which names the virtual table instead of a format label
+* *AND* the selection site MUST NOT match the catalog kind, so the permitted-site set `vs-adapter/catalog-kind-selection` records includes no file for it
+* *AND* the direct-storage variant SHALL carry NO catalog table metadata, because this kind loads no table: its root is composed from the CONNECTION address, the namespace property, and the directory name recorded in the column notes
+* *AND* the error text of the two refusals that run before the format is known, a table with no mappable column and a refused partition column, SHALL name the virtual table instead of a format label
 
 ### Scenario: A direct-storage table resolves its files and schema through the shared seam
 
@@ -44,7 +44,7 @@ The adapter resolves a directory of Parquet files into the engine's `ScanSpec` a
 * *WHEN* an Exasol user queries the virtual table that directory produces
 * *THEN* the engine SHALL read every Parquet file under that directory as raw data, and SHALL apply NO Delta deletion vector, NO Delta `remove` action, NO Iceberg delete file, and NO Iceberg snapshot selection
 * *AND* the returned rows MAY therefore include rows the table format considers deleted, and MAY include one logical row more than once where several snapshots reference overlapping files
-* *AND* this SHALL be a recorded, deliberate trade-off rather than a defect of this reader, because the operator selected a `CATALOG_KIND` that names no table format, and an operator who wants table-format semantics selects the catalog kind that supplies them
+* *AND* this SHALL be a deliberate trade-off rather than a defect of this reader, because the operator selected a `CATALOG_KIND` that names no table format, and an operator who wants table-format semantics selects the catalog kind that supplies them
 * *AND* the trade-off SHALL be stated in the user documentation alongside the direct-storage recipe, naming the correct `CATALOG_KIND` as the fix, so an operator meets it before the result surprises them
 * *AND* the engine MUST NOT detect a table-format directory and refuse it, because a user may legitimately want the raw files, and a detection heuristic would make a supported read fail on a directory layout it guessed wrong about
 

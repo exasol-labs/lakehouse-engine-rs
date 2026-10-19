@@ -16,7 +16,7 @@ Governs the object-store I/O shape of applying positional deletes: a shared conn
 * *GIVEN* a shard whose assigned data files include MORE delete-carrying data files than the resolved `s3_max_connections` budget N
 * *WHEN* the scan UDF builds those files' base `ParquetAccessPlan`s, each of which needs its data file's per-row-group row counts from that file's Parquet footer
 * *THEN* the UDF SHALL fetch those footers CONCURRENTLY rather than awaiting one before starting the next
-* *AND* the number of concurrently in-flight footer fetches MUST NOT exceed N at any instant, counted across every fan-out active in the scan invocation — a single table, or both sides of a broadcast join sharing the ONE size-N limiter that also bounds the delete-file reads
+* *AND* the number of concurrently in-flight footer fetches MUST NOT exceed N at any instant, counted across every fan-out active in the scan invocation, a single table, or both sides of a broadcast join sharing the ONE size-N limiter that also bounds the delete-file reads
 * *AND* the returned `PartitionedFile` list SHALL preserve the per-shard spec's assigned-file order, so each file occupies the same position in the shard's single `FileGroup` as it did under the serial build
 * *AND* the post-delete row set SHALL be identical to a strictly serial footer fetch, because a data file's per-row-group row counts and its delete set are both independent of fetch order
 * *AND* a footer fetch that fails SHALL surface as a credential-redacted user error naming the failure, with the remaining fetches abandoned, no partial access plan attached, and no row emitted for the shard
@@ -42,7 +42,7 @@ Governs the object-store I/O shape of applying positional deletes: a shared conn
 
 * *GIVEN* a shard whose assigned data files reference more unique positional-delete files than the resolved `s3_max_connections` budget N
 * *WHEN* the scan UDF reads those delete files to build its per-data-file delete sets
-* *THEN* the number of concurrently in-flight delete-file object-store reads MUST NOT exceed N at any instant, counted across every delete-read fan-out active in the scan invocation — a single table, or both sides of a broadcast join sharing one size-N limiter
+* *THEN* the number of concurrently in-flight delete-file object-store reads MUST NOT exceed N at any instant, counted across every delete-read fan-out active in the scan invocation, a single table, or both sides of a broadcast join sharing one size-N limiter
 * *AND* the UDF SHALL read delete files concurrently up to N in flight rather than strictly one at a time
 * *AND* the resulting per-data-file delete sets SHALL be identical to a strictly serial read, because unioning delete positions is order-independent
 
@@ -61,4 +61,4 @@ Governs the object-store I/O shape of applying positional deletes: a shared conn
 >
 > Parquet statistics truncation keeps this skip safe only when it is range-based. A truncated min is rounded DOWN and a truncated max is rounded UP, so `[min, max]` stays a loose superset of the row group's true `file_path` values, and `target < min OR target > max` never wrongly skips a row group that could hold the target. An equality shortcut (`min == max == target`) is NOT safe: truncation can collapse two distinct long paths to an equal truncated min/max pair, so a match there does not prove the row group holds the target. A row group with ABSENT `file_path` statistics carries no bound and MUST be decoded.
 >
-> Page-level (page-index) pruning is a deliberate NON-goal of this plan: row-group-level pruning already exploits the spec-guaranteed sort, and positional-delete files are small. This is an optimization scope trim, not an Iceberg-spec deviation — the spec permits but does not require reader-side pruning at any granularity.
+> Page-level (page-index) pruning is a deliberate NON-goal of this plan: row-group-level pruning already exploits the spec-guaranteed sort, and positional-delete files are small. This is an optimization scope trim, not an Iceberg-spec deviation, the spec permits but does not require reader-side pruning at any granularity.

@@ -31,7 +31,7 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the per-shard file
 
 * *GIVEN* a resolved merge-on-read file list whose data files carry associated Parquet positional-delete files, some under the table root and (possibly) some not
 * *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the adapter SHALL encode each delete-file path with the SAME rule it applies to data-file paths — relative (root-stripped) when the table root is an actual prefix, absolute unchanged otherwise
+* *THEN* the adapter SHALL encode each delete-file path with the SAME rule it applies to data-file paths, relative (root-stripped) when the table root is an actual prefix, absolute unchanged otherwise
 * *AND* the reconstructed absolute delete-file path (table root joined with a relative entry, or an absolute entry passed through) SHALL equal the original resolved delete-file URI
 * *AND* the adapter MUST NOT corrupt an absolute delete-file path by stripping a non-prefix match
 
@@ -40,7 +40,7 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the per-shard file
 * *GIVEN* a resolved file list whose data files carry associated delete files
 * *WHEN* the adapter emits each data file's associated delete-file references into the per-shard files argument
 * *THEN* the adapter SHALL carry, per delete-file entry, its delete content type (e.g. positional) alongside its path and byte size, so the scan UDF's read-time backstop can reject any non-positional delete file
-* *AND* the per-delete-file surface SHALL be limited to path, byte size, and content type — no additional Iceberg metadata is carried per delete file
+* *AND* the per-delete-file surface SHALL be limited to path, byte size, and content type, no additional Iceberg metadata is carried per delete file
 
 ### Scenario: Generated SQL carries a credential reference, not a credential
 

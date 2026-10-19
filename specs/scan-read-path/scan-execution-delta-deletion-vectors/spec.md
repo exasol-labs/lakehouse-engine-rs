@@ -81,7 +81,7 @@ The engine carries the descriptor unresolved in the `DeltaDeletionVector` varian
   the resolved connection budget N
 * *WHEN* the scan UDF fetches those sidecars to build its per-data-file access plans
 * *THEN* the number of concurrently in-flight deletion-vector object-store reads MUST NOT exceed N at
-  any instant, counted across every fan-out active in the scan invocation — a single table, or both
+  any instant, counted across every fan-out active in the scan invocation, a single table, or both
   sides of a broadcast join sharing the ONE size-N limiter that already bounds delete-file reads and
   data-file footer fetches
 * *AND* the UDF SHALL fetch sidecars concurrently up to N in flight rather than strictly one at a time
@@ -99,8 +99,8 @@ The engine carries the descriptor unresolved in the `DeltaDeletionVector` varian
 * *THEN* the UDF SHALL satisfy the decoder's storage dependency with a read-only adapter that serves
   the ALREADY-FETCHED bytes from memory, so decoding performs no I/O, opens no object store, and
   starts no second async runtime inside the UDF
-* *AND* every operation on that adapter other than reading an already-fetched object — listing,
-  writing, copying, deleting, and metadata lookup — SHALL return a clean error naming the operation
+* *AND* every operation on that adapter other than reading an already-fetched object, listing,
+  writing, copying, deleting, and metadata lookup, SHALL return a clean error naming the operation
   as unsupported, and MUST NOT panic, because a panic inside a UDF is an abnormal VM exit that makes
   the engine SIGKILL every sibling VM of the statement part
 * *AND* the UDF MUST NOT construct a `delta_kernel` engine, a Delta snapshot, or any other
@@ -110,7 +110,7 @@ The engine carries the descriptor unresolved in the `DeltaDeletionVector` varian
 ### Scenario: A deletion vector the scan cannot trust fails loud before any row is emitted
 
 * *GIVEN* a scan invocation whose assigned Delta data file carries a deletion vector that the decoder
-  rejects — a container whose leading version byte is not `1`, a stored size that disagrees with the
+  rejects, a container whose leading version byte is not `1`, a stored size that disagrees with the
   descriptor's declared size, a bitmap whose magic number is not the portable-format value, a bitmap
   whose CRC-32 checksum does not match, or a Z85 payload that does not decode
 * *WHEN* the scan UDF prepares that data file's scan

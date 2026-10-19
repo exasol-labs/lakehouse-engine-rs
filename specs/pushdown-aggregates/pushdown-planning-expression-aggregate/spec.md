@@ -4,7 +4,7 @@ The adapter pushes an aggregate whose argument is a scalar expression over table
 
 ## Background
 
-* The `vs-expression` translator (`render_expression`) renders the aggregate argument. An argument it cannot render makes the adapter decline the aggregate pushdown and fall back to row scanning.
+* The `vs-expression` translator (`render_expression`) renders the aggregate argument. An argument it cannot render makes the adapter decline the aggregate pushdown and route the request to the qualified single-table wrapper.
 * `COUNT(expr)`, `SUM(expr)`, `MIN(expr)`, `MAX(expr)`, and `AVG(expr)` decompose as their bare-column forms do. `COUNT(*)` has no argument.
 * An expression has no single source column, so the partial and merge column types come from the aggregate item's declared type in the top-level `selectListDataTypes` array.
 
@@ -31,14 +31,14 @@ The adapter pushes an aggregate whose argument is a scalar expression over table
 
 * *GIVEN* a `pushdown` request whose aggregate argument is an expression the VS expression translator cannot render
 * *WHEN* Exasol sends the request
-* *THEN* the adapter SHALL fall back to row scanning (emitting a row-scan ScanSpec with no aggregates field) so Exasol computes the aggregate on the returned rows using its own engine
+* *THEN* the adapter SHALL route the request to the qualified single-table wrapper, whose own rendered SQL computes the aggregate over a materialized sharded raw scan, and the scan spec MUST NOT carry an aggregates field
 * *AND* the adapter MUST NOT emit a partial/merge plan referencing an argument it could not render soundly
 
 ### Scenario: Bare-column aggregates continue to decompose unchanged
 
 * *GIVEN* a `pushdown` request whose aggregates all take bare column arguments (`COUNT(*)`, `COUNT(col)`, `SUM(col)`, `MIN(col)`, `MAX(col)`, `AVG(col)`, and the STDDEV/VARIANCE family)
 * *WHEN* Exasol sends the request
-* *THEN* the adapter SHALL produce the identical partial EMITS clause, per-shard partial SQL, and outer merge SELECT it produced before expression-argument support was added
+* *THEN* the adapter SHALL produce the partial EMITS clause, per-shard partial SQL, and outer merge SELECT of the bare-column decomposition, with no rendered argument expression in the aggregate plan
 * *AND* the merged result SHALL equal the same aggregate evaluated over all rows on a single node
 
 ### Scenario: SUM over a two-column binary-arithmetic argument is pushed down
@@ -55,7 +55,7 @@ The adapter pushes an aggregate whose argument is a scalar expression over table
 
 * *GIVEN* a `pushdown` request carrying `SUM(col_a * col_b)` where both operands are DECIMAL columns (e.g. `DECIMAL(15,2) * DECIMAL(15,2)`)
 * *WHEN* the adapter builds the partial EMITS clause and the outer merge SELECT for that aggregate
-* *THEN* the adapter SHALL derive the partial column's Exasol type from the SUM item's declared result type in `selectListDataTypes` at that select-list ordinal — never from either source column's type
+* *THEN* the adapter SHALL derive the partial column's Exasol type from the SUM item's declared result type in `selectListDataTypes` at that select-list ordinal, never from either source column's type
 * *AND* when that declared result type is a DECIMAL the adapter SHALL widen the partial column to `DECIMAL(36,s)` (preserving scale `s`, capping precision at Exasol's maximum 36) so per-shard partial sums of the product do not overflow mid-merge
 * *AND* the derived partial and merge types SHALL remain within Exasol's `DECIMAL(p<=36, s<=36)` limits
 

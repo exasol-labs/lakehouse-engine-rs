@@ -5,7 +5,7 @@ The adapter translates the soundly translatable nodes of the Exasol WHERE predic
 ## Background
 
 * The kernel prunes and the engine only translates. `ScanBuilder::with_predicate` drives partition pruning and statistics-based skipping in one pass. The adapter builds the predicate and consumes the selection vector from `scan_metadata()`. It reads no statistic, compares no bound, and does not filter the resolved files itself.
-* The reader must not build its scan with `StatsOptions::none()`, which disables internal data skipping even when a predicate is set. Removing that call restores the scan builder's default, which keeps skipping on.
+* The reader builds its scan with the scan builder's default `StatsOptions`, never `StatsOptions::none()`, because `none()` disables internal data skipping even when a predicate is set.
 * No statistic reaches the engine or the wire format. `ScanSpec`, `FileEntry`, and `LogicalField` gain no field, and the reader does not request the kernel's parsed-statistics column.
 * Pruning is sound but not complete. Every emitted node is implied by the user predicate. A node that cannot be translated soundly is dropped, so the scan opens more files and never skips a file that could hold a matching row. The full predicate is applied in the scan's DataFusion filter when the DataFusion dialect renders it, and otherwise in the adapter's outer `WHERE` (`pushdown/pushdown-declined-filter-self-apply`).
 * The kernel keeps a file when it cannot evaluate the predicate: a column outside the statistics set folds to NULL, a predicate ineligible for skipping keeps all files, and a predicate that is true or null keeps the file. The translator therefore never checks whether a column carries statistics.
@@ -20,7 +20,7 @@ The adapter translates the soundly translatable nodes of the Exasol WHERE predic
 * `delta.dataSkippingNumIndexedCols` defaults to 32 leaf fields, and only skipping-eligible types carry min/max. A predicate over a column without statistics reaches the kernel and keeps every file.
 * Exasol rewrites `>` to `<` and `>=` to `<=` (see `file-planning/pushdown-file-pruning`). The translator still handles the greater forms and flips the operator when the column sits on the right.
 * The translator is private to `adapter::pushdown::format`, so the pushdown façade gains no item.
-* A `TIMESTAMP WITH LOCAL TIME ZONE` comparison never prunes, because Exasol's wire node type is `literal_timestamputc` and the translator matches only `literal_timestamp_utc`. The Iceberg translator has the same gap (#242). The gap fails open.
+* A `TIMESTAMP WITH LOCAL TIME ZONE` comparison never prunes, because Exasol's wire node type is `literal_timestamputc` and the translator matches only `literal_timestamp_utc`. The Iceberg translator has the same gap. The gap fails open: it forgoes pruning and returns no wrong rows.
 * Every error is a `UdfError`, never a panic, and no error text carries a credential value.
 
 
@@ -51,11 +51,11 @@ The adapter translates the soundly translatable nodes of the Exasol WHERE predic
 
 ### Scenario: An untranslatable conjunct disables pruning for that conjunct only
 
-* *GIVEN* a query whose WHERE clause is a translatable predicate AND an untranslatable one — for example an equality the translator emits alongside a `LIKE`, or alongside the explicitly-untranslatable not-equal
+* *GIVEN* a query whose WHERE clause is a translatable predicate AND an untranslatable one, for example an equality the translator emits alongside a `LIKE`, or alongside the explicitly-untranslatable not-equal
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the reader SHALL emit a pruning predicate carrying ONLY the translatable conjunct and SHALL drop the untranslatable one
 * *AND* a conjunction whose EVERY child is untranslatable SHALL yield NO predicate at all, and the reader MUST NOT substitute a literal-true predicate, because handing the kernel a trivial predicate buys no pruning and costs a stats pass
-* *AND* the full original predicate SHALL still be applied — in the scan spec's filter when the DataFusion dialect renders it, and otherwise in the adapter's own outer `WHERE` per `pushdown/pushdown-declined-filter-self-apply` — so "untranslatable for Delta pruning" never means "unapplied"
+* *AND* the full original predicate SHALL still be applied, in the scan spec's filter when the DataFusion dialect renders it, and otherwise in the adapter's own outer `WHERE` per `pushdown/pushdown-declined-filter-self-apply`, so "untranslatable for Delta pruning" never means "unapplied"
 * *AND* the query result SHALL be identical to the result the same query returns with no pruning predicate at all
 
 ### Scenario: An untranslatable branch of an OR disables pruning entirely
@@ -87,17 +87,17 @@ The adapter translates the soundly translatable nodes of the Exasol WHERE predic
 * *AND* a column the table's schema does not declare SHALL yield no predicate for its node, resolved case-insensitively against the schema so an Exasol-upper-cased name still reaches its declared field
 * *AND* a column whose Delta type is not a primitive SHALL yield no predicate for its node
 * *AND* a not-equal comparison SHALL yield no predicate, because it is not soundly reducible to a bound test on a single range
-* *AND* a `TIMESTAMP WITH LOCAL TIME ZONE` comparison SHALL yield no predicate and therefore never prune a Delta table today, because Exasol's real wire node type is `literal_timestamputc` while this translator's arm matches only the pre-existing synthetic name `literal_timestamp_utc`; this is the same gap already tracked against the Iceberg translator's identically-misspelled range-pruning arm as `(#242)`, inherited here rather than introduced, and it fails open — no wrong rows, only forgone pruning
+* *AND* a `TIMESTAMP WITH LOCAL TIME ZONE` comparison SHALL yield no predicate and therefore never prune a Delta table, because Exasol's wire node type is `literal_timestamputc` while this translator's arm matches only `literal_timestamp_utc`; the Iceberg translator has the same gap, and it fails open with no wrong rows and only forgone pruning
 
 ### Scenario: Enabling the kernel's skipping surfaces no statistic to the engine or the wire
 
-* *GIVEN* the shipped Delta reader, which builds its scan with the stats option that disables all stats work
-* *WHEN* the reader is changed to hand the scan builder a pruning predicate
-* *THEN* that stats option SHALL be removed so the scan builder keeps its own default, because the option's own contract disables internal data skipping even when a predicate is set, which would leave both partition and stats pruning inert
-* *AND* the resolved scan MUST NOT carry any per-file minimum, maximum, null count, or record count, and the scan spec's file entries, common spec, and logical fields SHALL gain NO field, so every serialized Delta scan spec stays byte-identical for a request that prunes nothing
+* *GIVEN* the Delta reader building its scan
+* *WHEN* the reader hands the scan builder a pruning predicate
+* *THEN* the reader SHALL NOT set the stats option that disables all stats work, so the scan builder keeps its own default, because that option disables internal data skipping even when a predicate is set, which would leave both partition and stats pruning inert
+* *AND* the resolved scan MUST NOT carry any per-file minimum, maximum, null count, or record count, and the scan spec's file entries, common spec, and logical fields SHALL gain NO field, so a request that prunes nothing serializes the same scan spec as before
 * *AND* the reader MUST NOT request the kernel's parsed-statistics output column, because it compares no bound itself and paying for a stats projection it never reads would cost metadata bandwidth for nothing
 * *AND* the reader SHALL still replay the log ONCE per query and SHALL still return one entry per active path, so deletion-vector carriage, partition-value carriage, path verbatimness, and the size field are unchanged
-* *AND* every scenario of `delta/delta-table-planning`, `delta/delta-reader-feature-gating`, and `delta/delta-type-mapping` MUST still hold, except the pruning statements that feature's own delta supersedes
+* *AND* every scenario of `delta/delta-table-planning`, `delta/delta-reader-feature-gating`, and `delta/delta-type-mapping` MUST still hold
 
 ### Scenario: A predicate the kernel cannot evaluate keeps every file
 

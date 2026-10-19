@@ -79,7 +79,7 @@ Extends `pushdown/pushdown-planning` with GROUP BY aggregate detection and scan-
 
 ### Scenario: Grouped aggregate scan spec leaves the projection field empty
 
-* *GIVEN* a grouped aggregate `pushdown` request (`aggregationType: "group_by"`) over a table with more than one column (e.g. `SELECT a, COUNT(*) FROM t GROUP BY a`) that is decomposed into a partial/merge grouped aggregate — NOT the undecomposable single-table fallback that dispatches as a raw scan and legitimately carries a non-empty `projection`
+* *GIVEN* a grouped aggregate `pushdown` request (`aggregationType: "group_by"`) over a table with more than one column (e.g. `SELECT a, COUNT(*) FROM t GROUP BY a`) that is decomposed into a partial/merge grouped aggregate, NOT the undecomposable single-table fallback that dispatches as a raw scan and legitimately carries a non-empty `projection`
 * *WHEN* the adapter builds the grouped partial-aggregate scan spec
 * *THEN* the shard-invariant grouped common spec's `projection` field SHALL be empty, NOT the full base-table column list
 * *AND* the referenced-column information SHALL be carried in the `group_keys` and `aggregates` fields, which are the fields the grouped scan-dispatch path consults; the `projection` field MUST NOT be read on that path
@@ -92,16 +92,16 @@ Extends `pushdown/pushdown-planning` with GROUP BY aggregate detection and scan-
 * *WHEN* the adapter builds the outer merge SQL
 * *THEN* the merge `ORDER BY` element SHALL be that aggregate's merged expression over the `PARTIAL_*` columns (for example `SUM("PARTIAL_sum_1")`), produced by the SAME merge rewriter and the SAME `AggregatePlan` equality match (kind plus source column) the merged HAVING uses
 * *AND* the element SHALL render its direction and NULL placement through the one shared direction/NULL seam every `ORDER BY` the adapter emits routes through, so the grouped merge cannot drift from the other ordered paths
-* *AND* the outer wrapper's visible SELECT list, its cast list, and its GROUP BY list SHALL be UNCHANGED — the merge `ORDER BY` references an aggregate expression, not an output column, so no hidden output column is added and Exasol's positional `selectListDataTypes` validation is unaffected
+* *AND* the outer wrapper's visible SELECT list, its cast list, and its GROUP BY list SHALL be UNCHANGED, the merge `ORDER BY` references an aggregate expression, not an output column, so no hidden output column is added and Exasol's positional `selectListDataTypes` validation is unaffected
 * *AND* a group-key sort key SHALL still render as its positional output ordinal, unchanged by this delta, including in an `orderBy` that mixes a group-key key with an aggregate key
 * *AND* the per-shard partial scan SHALL still carry no `LIMIT` and no sort keys, so the anti-wrong-truncation invariant holds unchanged
 * *AND* the merged result SHALL equal the same grouped query with the same `ORDER BY` evaluated over all rows on a single node
 
 ### Scenario: The grouped merge wrapper renders the request's OFFSET alongside its LIMIT
 
-* *GIVEN* a `GROUP BY` aggregate `pushdown` request that decomposes into the partial/merge shape, carrying a merge-resolvable `orderBy`, a `limit` with `numElements` = `n`, and a non-zero `limit.offset` = `m` — for example `SELECT MOD(id,4) AS k, COUNT(*) FROM t GROUP BY MOD(id,4) ORDER BY k LIMIT 2 OFFSET 1`
+* *GIVEN* a `GROUP BY` aggregate `pushdown` request that decomposes into the partial/merge shape, carrying a merge-resolvable `orderBy`, a `limit` with `numElements` = `n`, and a non-zero `limit.offset` = `m`, for example `SELECT MOD(id,4) AS k, COUNT(*) FROM t GROUP BY MOD(id,4) ORDER BY k LIMIT 2 OFFSET 1`
 * *WHEN* the adapter builds the grouped scan-driving SQL
 * *THEN* the outer merge SELECT SHALL render `GROUP BY <keys> [HAVING …] ORDER BY <keys> LIMIT n OFFSET m`, in that clause order, with the offset rendered through the SAME shared limit-and-offset seam every other wrapper uses
 * *AND* the per-shard grouped scan spec SHALL carry NEITHER the row limit NOR any offset, so no shard drops a group before the merge re-groups the partials
-* *AND* a request whose `limit.offset` is zero or absent SHALL produce byte-identical SQL to the pre-change output, so no already-correct grouped plan changes
-* *AND* the returned groups SHALL equal the same `GROUP BY … ORDER BY … LIMIT n OFFSET m` evaluated over all rows on a single node — for the seeded 20-row `events` fixture the example query SHALL return the groups ranked 2-3, NOT the groups ranked 1-2
+* *AND* a request whose `limit.offset` is zero or absent SHALL render no OFFSET clause
+* *AND* the returned groups SHALL equal the same `GROUP BY … ORDER BY … LIMIT n OFFSET m` evaluated over all rows on a single node, for the seeded 20-row `events` fixture the example query SHALL return the groups ranked 2-3, NOT the groups ranked 1-2

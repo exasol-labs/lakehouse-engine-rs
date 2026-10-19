@@ -20,7 +20,7 @@ The scan UDF takes two arguments, a shard-invariant common-spec JSON blob (arg 0
 
 * *GIVEN* a scan invocation whose first argument is a common-spec JSON blob carrying every shard-invariant field (including the table root) and whose second argument is a JSON array of `[path, size]` 2-tuples
 * *WHEN* the scan UDF parses its two input arguments
-* *THEN* the UDF SHALL deserialize the common-spec JSON and the per-shard file-list JSON and MERGE them into one `ScanSpec` value whose `files` are the `(path, size)` entries from the second argument and whose every other field — including the table root — comes from the first argument, equivalent to the pre-split single-argument spec for the same shard
+* *THEN* the UDF SHALL deserialize the common-spec JSON and the per-shard file-list JSON and MERGE them into one `ScanSpec` value whose `files` are the `(path, size)` entries from the second argument and whose every other field, including the table root, comes from the first argument, equivalent to the pre-split single-argument spec for the same shard
 * *AND* the merge SHALL store each file entry's path verbatim (relative or absolute) without resolving it, so path reconstruction is deferred to file registration (see `datafusion-scan/scan-execution`)
 * *AND* a parse failure on either argument SHALL surface an error that identifies scan-spec deserialization failure and MUST NOT contain any storage access key, secret key, or session token
 * *AND* the reconstituted `ScanSpec` MUST NOT carry any catalog identifier field, because the scan UDF never contacts the catalog
@@ -31,7 +31,7 @@ The scan UDF takes two arguments, a shard-invariant common-spec JSON blob (arg 0
 * *GIVEN* a scan invocation whose second argument is a JSON array of per-shard file entries, each carrying a data-file path, its byte size, and zero or more associated delete mechanisms (an Iceberg positional-delete reference carrying a path, byte size, and delete content type)
 * *WHEN* the scan UDF parses its two input arguments
 * *THEN* the UDF SHALL deserialize each file entry together with its associated delete mechanisms and MERGE them into one scan spec whose per-shard files (with deletes) come from the second argument and whose every other field comes from the first
-* *AND* each Iceberg positional-delete member SHALL deserialize from, and re-serialize to, its pre-#342 `{"path":…,"size":…,"content_type":"position_deletes"}` encoding with its key order unchanged, so every committed 3-tuple golden encoding passes unedited
+* *AND* each Iceberg positional-delete member SHALL deserialize from, and re-serialize to, its original `{"path":…,"size":…,"content_type":"position_deletes"}` encoding with its key order unchanged, so every committed 3-tuple golden encoding passes unedited
 * *AND* the merge SHALL store each data-file and delete-file path verbatim (relative or absolute) without resolving it, so path reconstruction is deferred to file registration
 * *AND* the reconstituted scan spec MUST NOT carry any catalog identifier field, because the scan UDF never contacts the catalog
 
@@ -40,10 +40,10 @@ The scan UDF takes two arguments, a shard-invariant common-spec JSON blob (arg 0
 * *GIVEN* a `ScanSpec` whose shard-invariant fields are held in one embedded `CommonScanSpec` value and whose only own field beside it is the per-shard `files` list
 * *WHEN* the adapter serializes the shard-invariant common blob (UDF argument 0) and the per-shard files list (UDF argument 1)
 * *THEN* the common-blob JSON SHALL carry every shard-invariant field at the top level, MUST NOT contain a `files` key, a `catalog` key, or an `emit_exa_types` key, and MUST NOT carry any declared output types (the call-site `EMITS (...)` clause is the sole declaration, read through `UdfContext::output_column`)
-* *AND* the `storage` value SHALL be the externally-tagged scan-spec storage WRAPPER specified by `storage-access/scan-spec-credential-reference` — a `connection` reference variant carrying a name and `allow_http` and no credential; a `sealed` variant carrying a connection name and the base64 nonce-plus-AES-GCM-ciphertext of the externally-tagged storage-backend encoding of `storage-access/storage-backend-enum`; or an `inline` variant whose payload is that same backend encoding in plaintext, accepted for host-test spec construction
+* *AND* the `storage` value SHALL be the externally-tagged scan-spec storage WRAPPER specified by `storage-access/scan-spec-credential-reference`, a `connection` reference variant carrying a name and `allow_http` and no credential; a `sealed` variant carrying a connection name and the base64 nonce-plus-AES-GCM-ciphertext of the externally-tagged storage-backend encoding of `storage-access/storage-backend-enum`; or an `inline` variant whose payload is that same backend encoding in plaintext, accepted for host-test spec construction
 * *AND* the join block's `storage` value SHALL use that SAME wrapper encoding and SHALL be a REQUIRED key of the join block, so a join block serialized without it fails to deserialize instead of defaulting to the whole-spec value
 * *AND* the per-shard files-list JSON SHALL be unaffected by the common blob's encoding, because `storage` and declared output types are both shard-invariant and appear only in the common blob
-* *AND* `from_parts_json` over the two arguments SHALL reconstitute a `ScanSpec` value equal to the one the pre-consolidation two-argument contract produced for the same shard, with the storage backend in place of the bare storage props
+* *AND* `from_parts_json` over the two arguments SHALL reconstitute a `ScanSpec` value equal to the one the two-argument contract produces for the same shard, with the storage backend in place of the bare storage props
 * *AND* `files` SHALL remain the sole per-shard field, now guaranteed structurally by the single embedded common value rather than by a field-by-field copy
 
 ### Scenario: A file-list argument that predates the delete encoding still reconstitutes
@@ -74,7 +74,7 @@ The scan UDF takes two arguments, a shard-invariant common-spec JSON blob (arg 0
   scan side reads one delete list and dispatches on its content without ever asking which table format
   produced the spec
 * *AND* the neutral fields SHALL each be absent from JSON when empty, so an Iceberg common blob and an
-  Iceberg file-list entry serialize byte-identically to their pre-#342 encoding and every committed
+  Iceberg file-list entry serialize byte-identically to their original encoding and every committed
   golden fixture passes unedited
 * *AND* a file-list entry carrying partition values SHALL be a self-describing JSON OBJECT rather than
   a fourth tuple slot, so the 2-tuple legacy form and the 3-tuple delete-carrying form keep their

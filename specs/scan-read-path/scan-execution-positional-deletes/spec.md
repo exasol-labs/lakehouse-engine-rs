@@ -54,10 +54,10 @@ Applies Iceberg merge-on-read positional deletes on read, so a query over a tabl
 
 ### Scenario: An unapplicable delete file is rejected with a clean error (read-time backstop)
 
-* *GIVEN* a scan invocation whose assigned files include a delete mechanism the scan cannot apply — an Iceberg equality-delete file or an Iceberg Puffin deletion-vector payload
+* *GIVEN* a scan invocation whose assigned files include a delete mechanism the scan cannot apply, an Iceberg equality-delete file or an Iceberg Puffin deletion-vector payload
 * *WHEN* the scan UDF prepares that data file's scan
 * *THEN* the UDF SHALL return a clean error that names the unsupported delete mechanism BEFORE emitting any row for the affected data file
-* *AND* the UDF SHALL dispatch on the delete mechanism's own variant rather than on the table format that produced the scan spec, so exactly TWO variants — the Iceberg positional delete and the Delta deletion vector — reach the delete-application pipeline and every other variant is refused, SUPERSEDING the recorded "exactly one variant" rule now that `scan-read-path/scan-execution-delta-deletion-vectors` applies the Delta deletion vector
+* *AND* the UDF SHALL dispatch on the delete mechanism's own variant rather than on the table format that produced the scan spec, so exactly TWO variants, the Iceberg positional delete and the Delta deletion vector, reach the delete-application pipeline and every other variant is refused, SUPERSEDING the recorded "exactly one variant" rule now that `scan-read-path/scan-execution-delta-deletion-vectors` applies the Delta deletion vector
 * *AND* the error for an Iceberg equality delete or a Puffin deletion vector SHALL keep naming the offending delete FILE
 * *AND* the refusal MUST NOT name a Delta deletion vector and MUST NOT cite issue #320, SUPERSEDING the recorded clause that scoped that refusal to #320, because #320 is what implements it
 * *AND* the UDF MUST NOT silently emit pre-delete rows for that file

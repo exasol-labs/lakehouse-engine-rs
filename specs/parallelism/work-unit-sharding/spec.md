@@ -43,7 +43,7 @@ Partitions the once-resolved data-file list into G oversubscribed shards and dri
 
 * *GIVEN* a file list partitioned into more than one shard
 * *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the generated SQL SHALL nest a `GROUP BY shard_key` distributor subquery — a `LAKEHOUSE_DISTRIBUTE_FILES` LUA SET UDF invoked over a `VALUES` relation of `(shard_key, files)` rows grouped on `shard_key` (NOT on `IPROC()`) — inside an outer ungrouped select that invokes the `LAKEHOUSE_SCAN` scalar EMIT UDF once per distributed row
+* *THEN* the generated SQL SHALL nest a `GROUP BY shard_key` distributor subquery, a `LAKEHOUSE_DISTRIBUTE_FILES` LUA SET UDF invoked over a `VALUES` relation of `(shard_key, files)` rows grouped on `shard_key` (NOT on `IPROC()`), inside an outer ungrouped select that invokes the `LAKEHOUSE_SCAN` scalar EMIT UDF once per distributed row
 * *AND* the shard-invariant common spec (including the table root) SHALL be serialized EXACTLY ONCE as a single SQL string literal spliced as the scalar scan UDF's first argument, shared by every shard invocation, rather than repeated per shard and rather than flowed through the distributor
 * *AND* only each shard's per-file `files` subset SHALL flow through the distributor's `VALUES` rows as the scalar scan UDF's second argument, and the table root SHALL NOT appear in any per-shard argument
 * *AND* the outer scalar select MUST NOT be wrapped in a `SELECT * FROM (...)` materialization boundary, so the scalar scan streams its rows rather than Exasol buffering them into a temp table
@@ -54,7 +54,7 @@ Partitions the once-resolved data-file list into G oversubscribed shards and dri
 * *GIVEN* the fan-out distributor subquery driving cluster distribution
 * *WHEN* the `LAKEHOUSE_DISTRIBUTE_FILES` SET UDF is invoked for one `shard_key` group
 * *THEN* the distributor SHALL be a pure LUA SET script (created by its own DDL, carrying NO scan logic and NO data-file access) that re-emits the group's `files` VARCHAR value unchanged, one output row per `shard_key` group
-* *AND* the distributor MUST NOT be a Rust entry point in the scan `.so` and MUST NOT open, resolve, or read any data file — it moves only the per-shard file-list string, so its buffered footprint is negligible and independent of the data volume scanned
+* *AND* the distributor MUST NOT be a Rust entry point in the scan `.so` and MUST NOT open, resolve, or read any data file, it moves only the per-shard file-list string, so its buffered footprint is negligible and independent of the data volume scanned
 * *AND* `GROUP BY shard_key` over the distributor SHALL cause Exasol to distribute the shard groups round-robin across nodes (for G ≤ 300) so each distributed file list is scanned on the node it lands on
 
 ### Scenario: Single shard short-circuits the distributor and calls the scalar scan directly
@@ -66,4 +66,4 @@ Partitions the once-resolved data-file list into G oversubscribed shards and dri
 * *AND* the common spec literal SHALL appear exactly once and the file-list literal exactly once
 * *AND* the generated SQL SHALL be behaviourally identical (as an order-independent multiset) to the multi-shard fan-out collapsed to one shard
 
-*Credential-reference invariant:* the shard-invariant common literal carries one credential reference for the whole fan-out, never repeated per shard — see `storage-access/scan-spec-credential-reference`.
+*Credential-reference invariant:* the shard-invariant common literal carries one credential reference for the whole fan-out, never repeated per shard, see `storage-access/scan-spec-credential-reference`.

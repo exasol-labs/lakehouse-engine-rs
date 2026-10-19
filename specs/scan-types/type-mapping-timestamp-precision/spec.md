@@ -9,7 +9,7 @@ Defines the version-gated fractional-second precision Exasol declares for a cata
 * Zone-awareness and precision are independent decisions.
 * Exasol version strings look like `8.29.13` (8.x line) and `2025.2.1` (calendar-versioned line). A leading-component parse separates the two lines.
 * The default on an unreadable or empty version is the unclamped arm. A loud failure on an unknown engine is preferred over silent data loss on every known one.
-* `arrow_to_exasol_type` is not threaded through the version gate, because no production path declares an Exasol type from an Arrow type. `needs_json_fallback` answers `false` for every `Timestamp(_, _)` at any precision.
+* `arrow_to_exasol_type` is not threaded through the version gate, because the only production path that declares an Exasol type from an Arrow type is the direct-storage kind, whose Parquet-footer columns keep the bare `TIMESTAMP` at every precision. `needs_json_fallback` answers `false` for every `Timestamp(_, _)` at any precision.
 * `ExaType::Timestamp { precision }` carries the declared fractional-second precision, so the emit boundary reads it and the Arrow coercion target follows it.
 * A timestamp column's precision has two independent axes, each owned by one type in `types/mapping.rs`. `TimestampPrecision` owns the source axis: the width the catalog declares for one column, its Exasol declaration string, its Arrow `TimeUnit`, and the reverse reading of a declared Exasol precision. `EngineTimestampSupport` owns the engine axis: the width the running engine can emit, which is a property of the request. It owns the version rule and the clamp, and takes a version `&str` rather than a `UdfContext`, so the module performs no I/O and the single `ctx.database_version()` read stays in `vs-adapter/create-virtual-schema`. Both producers name a source width and clamp it through the engine value, and neither carries a declaration literal.
 * The source axis takes three values: millisecond, microsecond, nanosecond. These are the three sub-second Parquet timestamp encodings and the three sub-second Arrow `TimeUnit`s, so the set is format-neutral. A format reader names a value, never an Exasol type.
@@ -17,7 +17,7 @@ Defines the version-gated fractional-second precision Exasol declares for a cata
 * The Delta Lake protocol defines no nanosecond timestamp type. § Schema Serialization Format types `timestamp` as "Microsecond precision timestamp elapsed since the Unix epoch". Spark's type vocabulary, which Unity's `type_json` uses, carries only `timestamp` and `timestamp_ntz`. The Delta/Unity producer therefore stays at microsecond by protocol, not by omission.
 * The engine axis is an emit capability. An Exasol 8.x UDF emits only millisecond precision, and Exasol 2025.x and later emit 3, 6, and 9. A nanosecond Iceberg column queried through an 8.x engine loses six digits, as a microsecond one loses three.
 * `[C1]` on 2025.2.1: a column declared `{"type":"timestamp","fractionalSecondsPrecision":9}` is accepted and honored, reported by `SYS.EXA_ALL_COLUMNS` as `TIMESTAMP(9)`. `[C1]` on 8.29.13: the same DDL is accepted and both 6 and 9 are silently downgraded to `TIMESTAMP(3)`. `[C2]` on 2025.2.1: the pushdown request echoes `fractionalSecondsPrecision`. On 8.29.13 it omits the key, so `exasol_type_from_json` declares bare `TIMESTAMP`.
-* The nanosecond digits reach DataFusion intact: iceberg 0.10.0 maps `TimestampNs`/`TimestamptzNs` to Arrow `Timestamp(Nanosecond, _)`, and the scan reads through DataFusion's `ParquetSource` with a field-id adapter.
+* The nanosecond digits reach DataFusion intact: the `iceberg` dependency maps `TimestampNs`/`TimestamptzNs` to Arrow `Timestamp(Nanosecond, _)`, and the scan reads through DataFusion's `ParquetSource` with a field-id adapter.
 * `raw_scan.rs` sets DataFusion's `coerce_int96 = "us"`, which forces an INT96 physical column to microseconds whatever its logical type. Iceberg writes `timestamp_ns` as an INT64 `TIMESTAMP(NANOS)` column, so a spec-conformant column is unaffected. A legacy file storing a nanosecond-typed column as INT96 arrives at microsecond.
 * For a catalog timestamp column, the adapter declares the clamped width and the scan emits at exactly that width, so no component truncates afterwards. For a projected `CAST(x AS TIMESTAMP(p))`, the adapter echoes Exasol's own `selectListDataTypes` type verbatim. DataFusion computes the value when `p` is in `{0, 3, 6, 9}`, and Exasol computes it in the adapter's wrapper otherwise (`sql-comprehension/vs-expression-translator-cast`).
 
@@ -53,13 +53,13 @@ Defines the version-gated fractional-second precision Exasol declares for a cata
 
 ### Scenario: The Arrow-input type resolver stays outside the version gate
 
-* *GIVEN* `arrow_to_exasol_type` and its private `compatible_exasol_type` — the ARROW-INPUT direction, whose `DataType::Timestamp(_, _)` arm returns the bare string `TIMESTAMP`
+* *GIVEN* `arrow_to_exasol_type` and its private `compatible_exasol_type`, the ARROW-INPUT direction, whose `DataType::Timestamp(_, _)` arm returns the bare string `TIMESTAMP`
 * *WHEN* the version gate is threaded through the catalog-declared producers
 * *THEN* neither function SHALL gain a precision parameter, and both SHALL keep their recorded signature and their recorded answer for every input byte-identical, including `TIMESTAMP` for every `Timestamp(_, _)`
-* *AND* the exclusion SHALL hold because no production path declares an Exasol type from an Arrow type: `scan-types/type-mapping-module-structure` records that `arrow_to_exasol_type` has no call site anywhere in the crate, and the only production consumer of `compatible_exasol_type` is `needs_json_fallback`, whose answer for a `Timestamp(_, _)` is `false` at every precision
+* *AND* the exclusion SHALL hold because the only production path that declares an Exasol type from an Arrow type is the direct-storage kind, whose Parquet-footer columns keep the bare `TIMESTAMP` at every precision, and the only production consumer of `compatible_exasol_type` is `needs_json_fallback`, whose answer for a `Timestamp(_, _)` is `false` at every precision
 * *AND* `needs_json_fallback` SHALL keep its recorded `fn(&DataType) -> bool` signature and its answer for every input unchanged, so none of its call sites move
 * *AND* the compatible-Arrow-types table's `Timestamp(_, _) | TIMESTAMP` row SHALL stay unamended (`scan-types/type-mapping`), and a reader MUST NOT read it as governing the catalog-declared declaration this delta version-gates
-* *AND* the exclusion SHALL be recorded rather than left silent, because issue #359's scope text names `arrow_to_exasol_type` as a gate target and an unexplained omission is indistinguishable from an oversight
+* *AND* the exclusion SHALL be stated here rather than left silent, because `arrow_to_exasol_type` looks like a gate target and an unexplained omission is indistinguishable from an oversight
 
 ### Scenario: An empty or unparseable database version declares the microsecond precision
 
@@ -68,7 +68,7 @@ Defines the version-gated fractional-second precision Exasol declares for a cata
 * *THEN* the resolver SHALL resolve the ENGINE axis to the unclamped arm, the SAME answer it returns for a recognised `>= 2025` version, so a microsecond source is declared `TIMESTAMP(6)` and a nanosecond source `TIMESTAMP(9)`
 * *AND* the EMPTY string and every UNPARSEABLE string SHALL take that one default arm and MUST NOT be distinguished from each other, because neither carries information the other lacks and a second arm would invite the two to drift
 * *AND* the resolver MUST NOT error, panic, log a warning, or fall back to the bare `TIMESTAMP` declaration on either input, so an unrecognised engine gets the fidelity-preserving declaration and, if it rejects it, fails loudly at `createVirtualSchema` rather than silently truncating every timestamp value
-* *AND* this default SHALL be recorded as a deliberate reversal of the conservative alternative, so a later reader does not "fix" it back to the bare declaration
+* *AND* this default SHALL be deliberate, and a later change MUST NOT replace it with the bare declaration
 
 ### Scenario: Iceberg timestamptz maps to plain Exasol TIMESTAMP
 
