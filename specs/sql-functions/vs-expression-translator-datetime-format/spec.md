@@ -32,9 +32,9 @@ The inputs on which the scan and Exasol differ are documented in `docs/semantic-
 * *AND* the Exasol dialect SHALL render the call verbatim, with the name, arguments, and format model Exasol sent
 * *AND* the caller SHALL treat that asymmetry as a decline to self-apply (`pushdown/pushdown-declined-filter-self-apply`), because `FN_TO_DATE` and `FN_TO_TIMESTAMP` stay advertised and Exasol delegates every pushed call
 
-### Scenario: A declined format returns the native result on every pushdown path
+### Scenario: A declined format returns the native result in the select list and in a filter
 
-* *GIVEN* a query over virtual schema tables with a `TO_DATE` call in a `WHERE` filter whose format the DataFusion dialect declines
+* *GIVEN* a query over virtual schema tables with a `TO_DATE` call in the select list or in a `WHERE` filter whose format the DataFusion dialect declines
 * *WHEN* the query runs
 * *THEN* the query SHALL return the rows the same query returns on native Exasol tables
 * *AND* the generated pushdown SQL SHALL evaluate the call in Exasol, outside the scan UDF

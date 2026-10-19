@@ -3550,6 +3550,7 @@ fn e2e_to_date_to_timestamp_translated_format_matches_native() {
     );
 
     assert_pushed_into_scan(&mut conn, &date_sql, "%Y-%m-%d");
+    assert_pushed_into_scan(&mut conn, &timestamp_sql, "%Y-%m-%d %H:%M:%S");
     assert_pushed_into_scan(&mut conn, &filter_sql, "%H:%M:%S%.3f");
 
     assert_eq!(
@@ -3562,6 +3563,26 @@ fn e2e_to_date_to_timestamp_translated_format_matches_native() {
     );
     assert_eq!(first_cell(&mut conn, &empty_sql), serde_json::Value::Null);
     assert_pushed_into_scan(&mut conn, &empty_sql, "nullif(");
+}
+
+/// Scenario: A string-literal format translates to a strftime pattern
+#[test]
+fn e2e_to_timestamp_microsecond_fraction_filters_in_scan() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id FROM {} WHERE TO_TIMESTAMP(CAST(event_date AS VARCHAR(10)) || ' 10:11:12.000500', \
+         'YYYY-MM-DD HH24:MI:SS.FF6') > TIMESTAMP '2024-01-15 10:11:12.000' ORDER BY id",
+        vs_table()
+    );
+    // The scan filters at full precision on every engine; 8.x only renders the output in
+    // milliseconds, because a native 8.x table cannot hold the microseconds to filter on.
+    assert_eq!(
+        ids_of_first_column(&mut conn, &sql),
+        (15..=20).collect::<Vec<i64>>()
+    );
+    assert_pushed_into_scan(&mut conn, &sql, "%H:%M:%S%.6f");
 }
 
 /// Scenario: A string Exasol rejects for a translated format fails the query
@@ -3597,20 +3618,8 @@ fn e2e_to_date_translated_format_fails_on_rejected_input() {
     assert_pushed_into_scan(&mut conn, &select_sql, "%Y-%m-%d");
 }
 
-/// Scenario: A declined format returns the native result on every pushdown path
-#[test]
-fn e2e_to_date_declined_format_matches_native() {
-    setup_e2e();
-    let mut conn = exa_conn();
-
-    let sql = format!(
-        "SELECT id FROM {} WHERE TO_DATE(CAST(id AS VARCHAR(2)) || '-JAN-2024', 'DD-MON-YYYY') \
-         > DATE '2024-01-17' ORDER BY id",
-        vs_table()
-    );
-    assert_eq!(ids_of_first_column(&mut conn, &sql), vec![18, 19, 20]);
-
-    let pushed = isolated_pushdown_statement(&mut conn, &sql);
+fn assert_evaluated_in_exasol(conn: &mut ExaConn, sql: &str) {
+    let pushed = isolated_pushdown_statement(conn, sql);
     assert!(
         pushed.contains("TO_DATE("),
         "Exasol must evaluate the declined call:\n{pushed}"
@@ -3619,4 +3628,32 @@ fn e2e_to_date_declined_format_matches_native() {
         !pushed.contains("to_date("),
         "the declined call must not reach the scan:\n{pushed}"
     );
+}
+
+/// Scenario: A declined format returns the native result in the select list and in a filter
+#[test]
+fn e2e_to_date_declined_format_matches_native() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let filter_sql = format!(
+        "SELECT id FROM {} WHERE TO_DATE(CAST(id AS VARCHAR(2)) || '-JAN-2024', 'DD-MON-YYYY') \
+         > DATE '2024-01-17' ORDER BY id",
+        vs_table()
+    );
+    assert_eq!(
+        ids_of_first_column(&mut conn, &filter_sql),
+        vec![18, 19, 20]
+    );
+    assert_evaluated_in_exasol(&mut conn, &filter_sql);
+
+    let select_sql = format!(
+        "SELECT TO_DATE(CAST(id AS VARCHAR(2)) || '-JAN-2024', 'DD-MON-YYYY') FROM {} \
+         WHERE id = 18",
+        vs_table()
+    );
+    let native = first_cell(&mut conn, "SELECT TO_DATE('18-JAN-2024', 'DD-MON-YYYY')");
+    assert_eq!(first_cell(&mut conn, &select_sql), native);
+    assert_eq!(native, "2024-01-18");
+    assert_evaluated_in_exasol(&mut conn, &select_sql);
 }
