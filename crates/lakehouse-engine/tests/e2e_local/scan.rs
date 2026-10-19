@@ -21,9 +21,8 @@ use crate::common::timestamp_precision::{
     ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
 };
 use crate::fixtures::{
-    GROUND_TRUTH_LINEITEM_TABLE, LAKEHOUSE_VS, events_table, explain_virtual_pushdown_sql,
-    ground_truth_lineitem, lakehouse_vs, typed_table, vs_dim_table, vs_fact_table,
-    vs_lineitem_table,
+    LAKEHOUSE_VS, events_table, explain_virtual_pushdown_sql, lakehouse_vs, typed_table,
+    vs_dim_table, vs_fact_table, vs_lineitem_table,
 };
 
 use lakehouse_catalog::CatalogSession;
@@ -2280,6 +2279,16 @@ fn test_high_cardinality_multi_key_group_by_spill() {
 // Single-table scalar-over-aggregate GROUP BY (#82), checked against a native
 // ground-truth table built from the same `fact_lineitem` columns.
 
+const GROUND_TRUTH_LINEITEM_SCAN_TABLE: &str = "GROUND_TRUTH_LINEITEM_SCAN";
+
+fn ensure_ground_truth_lineitem_table(conn: &mut ExaConn) {
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_SCAN_TABLE} AS \
+         SELECT L_RETURNFLAG, L_QUANTITY, L_EXTENDEDPRICE FROM {}",
+        vs_lineitem_table()
+    ));
+}
+
 fn scalar_over_aggregate_round_select_list() -> &'static str {
     "L_RETURNFLAG, SUM(L_QUANTITY), AVG(L_EXTENDEDPRICE), \
      ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END)/COUNT(*), 2)"
@@ -2324,9 +2333,9 @@ fn test_group_by_scalar_over_aggregate_round() {
         "GROUP BY L_RETURNFLAG must return exactly 2 groups (R, N): {actual:?}"
     );
 
-    ground_truth_lineitem();
+    ensure_ground_truth_lineitem_table(&mut conn);
     let ground_truth_sql = format!(
-        "SELECT {} FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE} \
+        "SELECT {} FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_SCAN_TABLE} \
          GROUP BY L_RETURNFLAG ORDER BY L_RETURNFLAG",
         scalar_over_aggregate_round_select_list()
     );
@@ -2414,11 +2423,11 @@ fn test_group_by_shared_inner_aggregate_dedup() {
         "total COUNT(*) across both groups must be {LINEITEM_ROWS}, got {total_count}"
     );
 
-    ground_truth_lineitem();
+    ensure_ground_truth_lineitem_table(&mut conn);
     let ground_truth_sql = format!(
         "SELECT L_RETURNFLAG, COUNT(*), \
          ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END)/COUNT(*), 2) \
-         FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE} \
+         FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_SCAN_TABLE} \
          GROUP BY L_RETURNFLAG ORDER BY L_RETURNFLAG"
     );
     let expected = conn.query_columns(&ground_truth_sql);

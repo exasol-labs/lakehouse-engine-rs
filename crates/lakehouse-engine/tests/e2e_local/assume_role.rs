@@ -7,41 +7,40 @@
 //! FAILS (never skips) when the stack is unreachable.
 
 use crate::common::e2e_harness::{
-    VsProps, exa_conn, explain_virtual_sql, try_create_virtual_schema_with_password,
+    VsProps, create_virtual_schema_with_password, exa_conn, explain_virtual_sql,
+    try_create_virtual_schema_with_password,
 };
+use crate::common::raw_parquet::write_parquet_fixture;
 use crate::common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS};
 use crate::common::stack::{
     ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
     ASSUME_ROLE_EXTERNAL_ID, ASSUME_ROLE_UNKNOWN_ARN, CatalogConnectionPassword,
     iceberg_catalog_url_internal, seaweedfs_url_internal,
 };
-use crate::fixtures::{assume_role_vss, vs_table};
+use crate::fixtures::{events, stack, vs_table};
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const UNREACHABLE_STS_ENDPOINT: &str = "http://seaweedfs:1";
 const WRONG_BASE_SECRET: &str = "totally-wrong-base-secret-key-value";
 
-pub(crate) const CONN_BASE: &str = "ASSUME_ROLE_BASE_CREDS";
-pub(crate) const CONN_ROLE: &str = "ASSUME_ROLE_ROLE_CREDS";
-pub(crate) const CONN_DIRECT: &str = "ASSUME_ROLE_DIRECT_CREDS";
+const CONN_BASE: &str = "ASSUME_ROLE_BASE_CREDS";
+const CONN_ROLE: &str = "ASSUME_ROLE_ROLE_CREDS";
+const CONN_DIRECT: &str = "ASSUME_ROLE_DIRECT_CREDS";
 
-pub(crate) const VS_BASE: &str = "ASSUME_ROLE_BASE_VS";
-pub(crate) const VS_ROLE: &str = "ASSUME_ROLE_VS";
-pub(crate) const VS_DIRECT: &str = "ASSUME_ROLE_DIRECT_VS";
+const VS_BASE: &str = "ASSUME_ROLE_BASE_VS";
+const VS_ROLE: &str = "ASSUME_ROLE_VS";
+const VS_DIRECT: &str = "ASSUME_ROLE_DIRECT_VS";
 
-pub(crate) const BASE_DIRECT: &str = "s3://warehouse/assume_role_direct/";
+const BASE_DIRECT: &str = "s3://warehouse/assume_role_direct/";
 
 /// A CONNECTION password naming the role, the given external id, and the
 /// SeaweedFS STS endpoint as `aws_sts_endpoint`. `access_key`/`secret_key` are always
 /// the base identity's — a role CONNECTION requires the base key pair.
-pub(crate) fn assume_role_password(
-    secret_key: &str,
-    external_id: &str,
-) -> CatalogConnectionPassword {
+fn assume_role_password(secret_key: &str, external_id: &str) -> CatalogConnectionPassword {
     assume_role_password_at(secret_key, external_id, &seaweedfs_url_internal())
 }
 
@@ -65,7 +64,7 @@ fn assume_role_password_at(
 }
 
 /// A CONNECTION password carrying only the base identity — no role, no STS call.
-pub(crate) fn base_only_password() -> CatalogConnectionPassword {
+fn base_only_password() -> CatalogConnectionPassword {
     CatalogConnectionPassword {
         warehouse: "s3://warehouse/".to_string(),
         endpoint: seaweedfs_url_internal(),
@@ -79,7 +78,7 @@ pub(crate) fn base_only_password() -> CatalogConnectionPassword {
 
 /// A direct-storage CONNECTION password naming the role: no `warehouse`
 /// field (the direct-storage kind rejects it — it reaches no catalog service).
-pub(crate) fn direct_storage_role_password() -> CatalogConnectionPassword {
+fn direct_storage_role_password() -> CatalogConnectionPassword {
     CatalogConnectionPassword {
         endpoint: seaweedfs_url_internal(),
         region: "us-east-1".to_string(),
@@ -93,15 +92,51 @@ pub(crate) fn direct_storage_role_password() -> CatalogConnectionPassword {
     }
 }
 
-pub(crate) fn direct_batch(ids: &[i64]) -> RecordBatch {
+fn direct_batch(ids: &[i64]) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ids.to_vec()))])
         .expect("build direct-storage fixture batch")
 }
 
+static SETUP_DONE: OnceLock<()> = OnceLock::new();
+
+fn setup() {
+    SETUP_DONE.get_or_init(|| {
+        stack();
+        events();
+        write_parquet_fixture(
+            &format!("{BASE_DIRECT}rows/file1.parquet"),
+            direct_batch(&[1, 2, 3]),
+        );
+
+        let mut conn = exa_conn();
+
+        create_virtual_schema_with_password(
+            &mut conn,
+            &VsProps::new(VS_BASE, E2E_NAMESPACE).with_catalog_conn_name(CONN_BASE),
+            &iceberg_catalog_url_internal(),
+            &base_only_password(),
+        );
+        create_virtual_schema_with_password(
+            &mut conn,
+            &VsProps::new(VS_ROLE, E2E_NAMESPACE).with_catalog_conn_name(CONN_ROLE),
+            &iceberg_catalog_url_internal(),
+            &assume_role_password(ASSUME_ROLE_BASE_SECRET_KEY, ASSUME_ROLE_EXTERNAL_ID),
+        );
+        create_virtual_schema_with_password(
+            &mut conn,
+            &VsProps::new(VS_DIRECT, "")
+                .with_catalog_kind("DIRECT_STORAGE")
+                .with_catalog_conn_name(CONN_DIRECT),
+            BASE_DIRECT,
+            &direct_storage_role_password(),
+        );
+    });
+}
+
 #[test]
 fn the_base_identity_alone_is_denied_the_warehouse_bucket() {
-    assume_role_vss();
+    setup();
     let query = format!("SELECT COUNT(*) FROM {}", vs_table(VS_BASE, E2E_TABLE));
     let denied = exa_conn().try_execute(&query);
     assert_eq!(
@@ -123,7 +158,7 @@ fn the_base_identity_alone_is_denied_the_warehouse_bucket() {
 
 #[test]
 fn role_connection_reads_the_rows_the_base_identity_was_denied() {
-    assume_role_vss();
+    setup();
     let count_sql = format!("SELECT COUNT(*) FROM {}", vs_table(VS_ROLE, E2E_TABLE));
     let filtered_sql = format!(
         "SELECT COUNT(*) FROM {} WHERE SCORE > 15.0",
@@ -159,7 +194,7 @@ fn role_connection_reads_the_rows_the_base_identity_was_denied() {
 
 #[test]
 fn an_unknown_role_arn_fails_create_with_access_denied() {
-    assume_role_vss();
+    setup();
     let mut password = assume_role_password(ASSUME_ROLE_BASE_SECRET_KEY, ASSUME_ROLE_EXTERNAL_ID);
     password.aws_assume_role_arn = Some(ASSUME_ROLE_UNKNOWN_ARN.to_string());
     let resp = try_create_virtual_schema_with_password(
@@ -178,7 +213,7 @@ fn an_unknown_role_arn_fails_create_with_access_denied() {
 
 #[test]
 fn a_user_outside_the_trust_policy_fails_create_with_access_denied() {
-    assume_role_vss();
+    setup();
     let mut password = assume_role_password(ASSUME_ROLE_BASE_SECRET_KEY, ASSUME_ROLE_EXTERNAL_ID);
     password.access_key = "lhadmin".to_string();
     password.secret_key = "lhadminsecret123".to_string();
@@ -198,7 +233,7 @@ fn a_user_outside_the_trust_policy_fails_create_with_access_denied() {
 
 #[test]
 fn an_unreachable_sts_endpoint_fails_create_naming_the_host_without_leaking_secrets() {
-    assume_role_vss();
+    setup();
     let resp = try_create_virtual_schema_with_password(
         &mut exa_conn(),
         &VsProps::new("ASSUME_ROLE_BAD_STS_VS", E2E_NAMESPACE)
@@ -225,7 +260,7 @@ fn an_unreachable_sts_endpoint_fails_create_naming_the_host_without_leaking_secr
 
 #[test]
 fn a_wrong_base_secret_fails_create_with_http_403() {
-    assume_role_vss();
+    setup();
     let resp = try_create_virtual_schema_with_password(
         &mut exa_conn(),
         &VsProps::new("ASSUME_ROLE_BAD_SECRET_VS", E2E_NAMESPACE)
@@ -252,7 +287,7 @@ fn a_wrong_base_secret_fails_create_with_http_403() {
 
 #[test]
 fn direct_storage_role_connection_lists_and_reads_through_the_session() {
-    assume_role_vss();
+    setup();
     // CREATE already listed the bucket under the session; this asserts the read path.
     assert_eq!(
         exa_conn().query_row_count(&format!("SELECT * FROM {VS_DIRECT}.ROWS")),

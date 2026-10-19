@@ -4,12 +4,31 @@
 use crate::common::e2e_harness::*;
 use crate::common::seed::{
     COMPLEX_ROW_ALT, COMPLEX_ROW_EMPTY, COMPLEX_ROW_NULL, COMPLEX_ROW_POPULATED,
-    COMPLEX_TOTAL_ROWS, E2E_COMPLEX_JOIN_TABLE, E2E_COMPLEX_TABLE,
+    COMPLEX_TOTAL_ROWS, E2E_COMPLEX_JOIN_TABLE, E2E_COMPLEX_TABLE, E2E_NAMESPACE,
+    seed_complex_types_join_probe,
 };
-use crate::fixtures::{assert_pushed_to_scan_udf, complex_type_vs};
+use crate::common::stack::iceberg_catalog_url;
+use crate::fixtures::{assert_pushed_to_scan_udf, complex_probe, stack};
 use serde_json::json;
+use std::sync::OnceLock;
 
-pub(crate) const VS_NAME: &str = "COMPLEX_TYPE_VS";
+const VS_NAME: &str = "COMPLEX_TYPE_VS";
+
+static SETUP_DONE: OnceLock<()> = OnceLock::new();
+
+fn setup() {
+    SETUP_DONE.get_or_init(|| {
+        stack();
+        complex_probe();
+        runtime()
+            .block_on(seed_complex_types_join_probe(
+                &iceberg_catalog_url(),
+                "s3://warehouse/",
+            ))
+            .expect("seed complex-types join partner table");
+        create_virtual_schema(&mut exa_conn(), &VsProps::new(VS_NAME, E2E_NAMESPACE));
+    });
+}
 
 fn served_table() -> String {
     E2E_COMPLEX_TABLE.to_uppercase()
@@ -30,7 +49,7 @@ fn assert_rendered(cell: &serde_json::Value, expected: Option<serde_json::Value>
 /// Scenario: A list, struct, or map value renders as one valid JSON document
 #[test]
 fn iceberg_nested_columns_return_valid_json_end_to_end() {
-    complex_type_vs();
+    setup();
     let mut conn = exa_conn();
     let table = served_table();
     let qualified = format!("{VS_NAME}.{table}");
@@ -179,7 +198,7 @@ fn iceberg_nested_columns_return_valid_json_end_to_end() {
 /// Scenario: Every pushdown shape treats a nested column as the VARCHAR Exasol declared
 #[test]
 fn nested_columns_push_down_as_the_declared_varchar_in_every_shape() {
-    complex_type_vs();
+    setup();
     let mut conn = exa_conn();
     let table = served_table();
     let qualified = format!("{VS_NAME}.{table}");
@@ -283,7 +302,7 @@ fn nested_columns_push_down_as_the_declared_varchar_in_every_shape() {
 
 #[test]
 fn e2e_self_join_on_nested_json_column_matches_single_node() {
-    complex_type_vs();
+    setup();
     let mut conn = exa_conn();
     let table = served_table();
     let qualified = format!("{VS_NAME}.{table}");

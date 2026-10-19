@@ -4,18 +4,35 @@
 use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
 use crate::common::seed::{
-    DIM_CUSTOMER_ROWS, E2E_BLANK_LABEL_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE,
+    DIM_CUSTOMER_ROWS, E2E_BLANK_LABEL_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE,
     E2E_SUPPLIER_TABLE, FACT_ORDERS_ROWS, LINEITEM_ROWS, O_TOTALPRICE_PS, order_custkey,
     order_date_days, order_totalprice_unscaled,
 };
-use crate::fixtures::{GROUND_TRUTH_LINEITEM_TABLE, ground_truth_lineitem, join_vss, vs_table};
+use crate::fixtures::{events, stack, vs_table};
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// Default broadcast threshold: the small dimension side is broadcast-eligible.
-pub(crate) const VS_NAME: &str = "MY_LAKEHOUSE_JOIN";
+const VS_NAME: &str = "MY_LAKEHOUSE_JOIN";
 /// `JOIN_BROADCAST_MAX_BYTES = '1'` forces every join onto the unaccelerated fallback.
-pub(crate) const VS_NAME_LOW: &str = "MY_LAKEHOUSE_JOIN_LOW";
+const VS_NAME_LOW: &str = "MY_LAKEHOUSE_JOIN_LOW";
+
+static SETUP_DONE: OnceLock<()> = OnceLock::new();
+
+fn setup_e2e() {
+    SETUP_DONE.get_or_init(|| {
+        stack();
+        events();
+        let mut conn = exa_conn();
+        // Each `create_virtual_schema` re-issues the catalog CONNECTION idempotently.
+        create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, E2E_NAMESPACE));
+        create_virtual_schema(
+            &mut conn,
+            &VsProps::new(VS_NAME_LOW, E2E_NAMESPACE).with_join_broadcast_max_bytes("1"),
+        );
+    });
+}
 
 fn blank_label_join_query(vs_name: &str, order_by: &str, limit: usize) -> String {
     format!(
@@ -56,7 +73,7 @@ fn expected_join_rows_by_orderdate_desc(
 
 #[test]
 fn e2e_broadcast_join_pushdown_shape() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let pushed = explain_virtual_sql(&mut conn, &join_query(VS_NAME));
@@ -74,7 +91,7 @@ fn e2e_broadcast_join_pushdown_shape() {
 
 #[test]
 fn e2e_broadcast_join_result_correct() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let actual = fetch_join_rows(&mut conn, VS_NAME);
@@ -95,7 +112,7 @@ fn e2e_broadcast_join_result_correct() {
 
 #[test]
 fn e2e_broadcast_join_bare_limit_stays_broadcast_and_truncates() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     const LIMIT_ROWS: usize = 3;
@@ -136,7 +153,7 @@ fn e2e_broadcast_join_bare_limit_stays_broadcast_and_truncates() {
 
 #[test]
 fn e2e_broadcast_join_order_by_limit_stays_broadcast_and_top_n_correct() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     const TOP_N: usize = 3;
@@ -181,7 +198,7 @@ fn e2e_broadcast_join_order_by_limit_stays_broadcast_and_top_n_correct() {
 
 #[test]
 fn e2e_broadcast_join_float_div_by_zero_in_fact_leg_filter_fails() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let query = format!(
@@ -226,7 +243,7 @@ fn e2e_broadcast_join_float_div_by_zero_in_fact_leg_filter_fails() {
 
 #[test]
 fn e2e_broadcast_join_order_by_without_limit_and_with_offset_stay_broadcast() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let unlimited_query = format!("{} ORDER BY o.O_ORDERDATE DESC", join_query(VS_NAME));
@@ -297,7 +314,7 @@ fn e2e_broadcast_join_order_by_without_limit_and_with_offset_stay_broadcast() {
 
 #[test]
 fn e2e_broadcast_join_top_n_ranks_empty_string_as_null() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     for (order_by, expected_rows) in [
@@ -356,7 +373,7 @@ fn e2e_broadcast_join_top_n_ranks_empty_string_as_null() {
 
 #[test]
 fn e2e_broadcast_join_top_n_keeps_the_single_node_sort_keys_across_a_tie() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let tie_query = blank_label_join_query(VS_NAME, "b.B_LABEL ASC NULLS LAST", 3);
@@ -404,7 +421,7 @@ fn e2e_broadcast_join_top_n_keeps_the_single_node_sort_keys_across_a_tie() {
 
 #[test]
 fn e2e_join_offset_and_aggregate_shapes_still_use_two_scan_fallback() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let offset_without_order_by = format!("{} LIMIT 3 OFFSET 2", join_query(VS_NAME));
@@ -442,7 +459,7 @@ fn e2e_join_offset_and_aggregate_shapes_still_use_two_scan_fallback() {
 
 #[test]
 fn e2e_above_threshold_unaccelerated_fallback_shape() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let pushed = explain_virtual_sql(&mut conn, &join_query(VS_NAME_LOW));
@@ -460,7 +477,7 @@ fn e2e_above_threshold_unaccelerated_fallback_shape() {
 
 #[test]
 fn e2e_above_threshold_result_matches_broadcast() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let broadcast = fetch_join_rows(&mut conn, VS_NAME);
@@ -491,7 +508,7 @@ fn aggregate_join_query(vs_name: &str) -> String {
 
 #[test]
 fn e2e_aggregate_over_join_uses_two_scan_wrapper() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let pushed = explain_virtual_sql(&mut conn, &aggregate_join_query(VS_NAME));
@@ -513,7 +530,7 @@ fn e2e_aggregate_over_join_uses_two_scan_wrapper() {
 
 #[test]
 fn e2e_aggregate_over_join_result_correct() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let truth = conn.query_columns(&format!(
@@ -707,7 +724,7 @@ fn expected_four_table_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<Vec<S
 
 #[test]
 fn e2e_three_table_join_result_correct() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let pushed = explain_virtual_sql(&mut conn, &three_table_join_query(VS_NAME));
@@ -745,7 +762,7 @@ fn e2e_three_table_join_result_correct() {
 
 #[test]
 fn e2e_four_table_join_result_correct() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let pushed = explain_virtual_sql(&mut conn, &four_table_join_query(VS_NAME));
@@ -819,6 +836,18 @@ fn scalar_over_aggregate_n_table_join_query(vs_name: &str) -> String {
     )
 }
 
+const GROUND_TRUTH_LINEITEM_TABLE: &str = "GROUND_TRUTH_LINEITEM";
+
+/// Materialized natively so Exasol computes the ground truth independently of the
+/// pushdown path, formatted identically to the wrapper's Exasol-side aggregation.
+fn ensure_ground_truth_lineitem_table(conn: &mut ExaConn) {
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE} AS \
+         SELECT L_RETURNFLAG, L_QUANTITY, L_EXTENDEDPRICE FROM {}",
+        vs_table(VS_NAME, E2E_LINEITEM_TABLE)
+    ));
+}
+
 fn scalar_over_aggregate_ground_truth_query() -> String {
     format!(
         "SELECT {} FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE} \
@@ -841,7 +870,7 @@ fn fetch_scalar_over_aggregate_rows(conn: &mut ExaConn, query_sql: &str) -> Vec<
 
 #[test]
 fn e2e_scalar_over_aggregate_grouped_join_result_correct() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let query = scalar_over_aggregate_join_query(VS_NAME);
@@ -858,7 +887,7 @@ fn e2e_scalar_over_aggregate_grouped_join_result_correct() {
          common-blob join block may appear:\n{pushed}"
     );
 
-    ground_truth_lineitem();
+    ensure_ground_truth_lineitem_table(&mut conn);
     let actual = fetch_scalar_over_aggregate_rows(&mut conn, &query);
     let expected =
         fetch_scalar_over_aggregate_rows(&mut conn, &scalar_over_aggregate_ground_truth_query());
@@ -877,7 +906,7 @@ fn e2e_scalar_over_aggregate_grouped_join_result_correct() {
 
 #[test]
 fn e2e_scalar_over_aggregate_grouped_join_n_table_result_correct() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let query = scalar_over_aggregate_n_table_join_query(VS_NAME);
@@ -894,7 +923,7 @@ fn e2e_scalar_over_aggregate_grouped_join_n_table_result_correct() {
          carry a common-blob join block:\n{pushed}"
     );
 
-    ground_truth_lineitem();
+    ensure_ground_truth_lineitem_table(&mut conn);
     let actual = fetch_scalar_over_aggregate_rows(&mut conn, &query);
     let expected =
         fetch_scalar_over_aggregate_rows(&mut conn, &scalar_over_aggregate_ground_truth_query());
@@ -964,7 +993,7 @@ fn expected_full_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, St
 
 #[test]
 fn e2e_broadcast_declined_filter_falls_back_to_n_scan_and_filters() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let query = broadcast_declined_filter_join_query(VS_NAME);
@@ -1005,7 +1034,7 @@ fn e2e_broadcast_declined_filter_falls_back_to_n_scan_and_filters() {
 
 #[test]
 fn e2e_broadcast_declined_filter_excludes_rows() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let query = format!(
@@ -1084,7 +1113,7 @@ fn expected_three_table_join_rows_with_orderdate_filter(
 
 #[test]
 fn e2e_n_scan_declined_side_local_conjunct_applied_in_outer_where() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let query = three_table_join_with_mixed_filters_query(VS_NAME);
@@ -1168,7 +1197,7 @@ fn like_on_orderdate_join_query(vs_name: &str) -> String {
 /// Scenario: A broadcast-join filter over a non-string LIKE subject declines the broadcast plan
 #[test]
 fn e2e_broadcast_like_on_decimal_column_falls_back_and_filters() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let query = like_on_custkey_join_query(VS_NAME);
@@ -1210,7 +1239,7 @@ fn e2e_broadcast_like_on_decimal_column_falls_back_and_filters() {
 
 #[test]
 fn e2e_broadcast_like_on_date_column_stays_broadcast_and_filters() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let query = like_on_orderdate_join_query(VS_NAME);
@@ -1245,7 +1274,7 @@ fn e2e_broadcast_like_on_date_column_stays_broadcast_and_filters() {
 
 #[test]
 fn e2e_n_scan_like_on_decimal_side_column_applied_in_outer_where() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let query = like_on_custkey_join_query(VS_NAME_LOW);
@@ -1282,7 +1311,7 @@ fn e2e_n_scan_like_on_decimal_side_column_applied_in_outer_where() {
 
 #[test]
 fn e2e_join_instr_with_start_position_returns_native_result() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let query = format!(
@@ -1356,7 +1385,7 @@ fn expected_orderdate_text(order_key: usize) -> String {
 
 #[test]
 fn e2e_join_decimal_stringification_matches_native_at_both_surfaces() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
     let where_clause = "LENGTH(O_TOTALPRICE) > 3";
 
@@ -1419,7 +1448,7 @@ fn fetch_order_rows(conn: &mut ExaConn) -> Vec<(String, String)> {
 
 #[test]
 fn e2e_self_join_on_primitive_column_matches_single_node() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
     let fact = vs_fact_table(VS_NAME);
 
@@ -1460,7 +1489,7 @@ fn e2e_self_join_on_primitive_column_matches_single_node() {
 
 #[test]
 fn e2e_self_join_with_one_unaliased_occurrence_matches_single_node() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
     let fact = vs_fact_table(VS_NAME);
     let bare = E2E_FACT_TABLE.to_uppercase();
@@ -1513,7 +1542,7 @@ fn e2e_self_join_with_one_unaliased_occurrence_matches_single_node() {
 
 #[test]
 fn e2e_three_leg_self_join_matches_single_node() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
     let fact = vs_fact_table(VS_NAME);
 
@@ -1556,7 +1585,7 @@ fn e2e_three_leg_self_join_matches_single_node() {
 
 #[test]
 fn e2e_self_join_with_one_sided_filter_matches_single_node() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
     let fact = vs_fact_table(VS_NAME);
     let threshold = DIM_CUSTOMER_ROWS as i64;
@@ -1607,7 +1636,7 @@ fn e2e_self_join_with_one_sided_filter_matches_single_node() {
 
 #[test]
 fn e2e_scalar_over_aggregate_ungrouped_join_matches_native_oracle() {
-    join_vss();
+    setup_e2e();
     let mut conn = exa_conn();
 
     let query = format!(
@@ -1629,7 +1658,7 @@ fn e2e_scalar_over_aggregate_ungrouped_join_matches_native_oracle() {
          the broadcast in-UDF join, which renders projection only:\n{pushed}"
     );
 
-    ground_truth_lineitem();
+    ensure_ground_truth_lineitem_table(&mut conn);
     let actual = conn.query_columns(&query);
     assert_eq!(actual.len(), 1, "expected 1 column: {actual:?}");
     assert_eq!(

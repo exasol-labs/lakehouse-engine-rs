@@ -87,7 +87,7 @@ pub fn put_fixture_object(uri: &str, bytes: Bytes) {
     let (bucket, key) = split_s3_bucket_and_key(uri);
     let store = local_stack_s3_store(bucket);
     runtime()
-        .block_on(put_object(store.as_ref(), key, bytes))
+        .block_on(put_object(&store, key, bytes))
         .unwrap_or_else(|e| panic!("PUT fixture object at {uri}: {e:#}"));
 }
 
@@ -130,7 +130,7 @@ pub fn delete_fixture_prefix(uri: &str) {
     let (bucket, key) = split_s3_bucket_and_key(uri);
     let store = local_stack_s3_store(bucket);
     runtime()
-        .block_on(delete_objects_under(store.as_ref(), key))
+        .block_on(delete_objects_under(&store, key))
         .unwrap_or_else(|e| panic!("DELETE fixture objects under {uri}: {e:#}"));
 }
 

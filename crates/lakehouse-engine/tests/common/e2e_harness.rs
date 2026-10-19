@@ -16,8 +16,8 @@ use lakehouse_engine::adapter::pushdown::{ConnectionStorage, ScanSource, format_
 use lakehouse_engine::scan::spec::{CatalogProps, FileEntry, StorageBackend, StorageProps};
 
 use object_store::aws::{AmazonS3, AmazonS3Builder};
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 pub const SYS_PASSWORD: &str = "exasol";
@@ -448,7 +448,6 @@ pub fn split_s3_bucket_and_key(uri: &str) -> (&str, &str) {
         .unwrap_or_else(|| panic!("expected a <bucket>/<key> URI, got: {uri}"))
 }
 
-/// The one runtime every fixture uses, so a cached client never outlives the runtime it ran on.
 pub fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
@@ -459,28 +458,20 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-pub fn local_stack_s3_store(bucket: &str) -> Arc<AmazonS3> {
-    static STORES: Mutex<BTreeMap<String, Arc<AmazonS3>>> = Mutex::new(BTreeMap::new());
-    let mut stores = STORES.lock().unwrap_or_else(|p| p.into_inner());
-    let store = stores.entry(bucket.to_string()).or_insert_with(|| {
-        let StorageBackend::S3(storage) = local_stack_storage() else {
-            panic!("local_stack_storage() must be S3 to build a SeaweedFS object store")
-        };
-        let store = AmazonS3Builder::new()
-            .with_bucket_name(bucket)
-            .with_region(&storage.region)
-            .with_access_key_id(&storage.access_key)
-            .with_secret_access_key(&storage.secret_key)
-            .with_endpoint(&storage.endpoint)
-            .with_allow_http(storage.allow_http)
-            .with_virtual_hosted_style_request(!storage.path_style)
-            .build()
-            .unwrap_or_else(|e| {
-                panic!("configure SeaweedFS object store for bucket '{bucket}': {e}")
-            });
-        Arc::new(store)
-    });
-    Arc::clone(store)
+pub fn local_stack_s3_store(bucket: &str) -> AmazonS3 {
+    let StorageBackend::S3(storage) = local_stack_storage() else {
+        panic!("local_stack_storage() must be S3 to build a SeaweedFS object store")
+    };
+    AmazonS3Builder::new()
+        .with_bucket_name(bucket)
+        .with_region(&storage.region)
+        .with_access_key_id(&storage.access_key)
+        .with_secret_access_key(&storage.secret_key)
+        .with_endpoint(&storage.endpoint)
+        .with_allow_http(storage.allow_http)
+        .with_virtual_hosted_style_request(!storage.path_style)
+        .build()
+        .unwrap_or_else(|e| panic!("configure SeaweedFS object store for bucket '{bucket}': {e}"))
 }
 
 pub fn local_stack_catalog(table: &str) -> CatalogProps {
