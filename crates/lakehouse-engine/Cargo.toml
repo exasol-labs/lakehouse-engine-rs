@@ -103,3 +103,39 @@ rsa                 = { version = "0.9", features = ["sha2", "pkcs5"] }
 futures             = { workspace = true }
 anyhow              = { workspace = true }
 aws-sdk-glue        = { workspace = true }
+
+[[test]]
+name = "e2e_local"
+required-features = ["exasol-e2e"]
+
+[[test]]
+name = "e2e_capture_pushdown"
+required-features = ["exasol-e2e"]
+
+[[test]]
+name = "tpch_loader"
+required-features = ["exasol-e2e"]
+
+[[test]]
+name = "two_entry_points_test"
+required-features = ["exasol-e2e"]
+
+[[test]]
+name = "e2e_lakekeeper_test"
+required-features = ["lakekeeper-e2e"]
+
+[[test]]
+name = "e2e_unity_test"
+required-features = ["unity-e2e"]
+
+[[test]]
+name = "e2e_azure_test"
+required-features = ["azure-e2e"]
+
+[[test]]
+name = "e2e_glue_test"
+required-features = ["glue-e2e"]
+
+[[test]]
+name = "cloud_e2e_test"
+required-features = ["cloud-e2e"]

@@ -2,19 +2,13 @@
 //!
 //! Does not compare `EMITS` against the SDK's runtime `output_column`: that
 //! agreement is the SDK/SLC's own contract.
-#![cfg(feature = "exasol-e2e")]
 
-mod common;
-use common::e2e_harness::*;
-use common::exasol_ws::ExaConn;
-use common::seed::{
+use crate::common::e2e_harness::*;
+use crate::common::seed::{
     COMPLEX_ROW_POPULATED, E2E_COMPLEX_TABLE, E2E_NAMESPACE, E2E_TYPED_TABLE, TYPED_COL_BOOL,
     TYPED_COL_DATE, TYPED_COL_DECIMAL_A, TYPED_COL_DOUBLE, TYPED_COL_TS, TYPED_COL_VARCHAR,
-    seed_complex_types_probe, seed_typed_distinct_probe,
 };
-use common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
-};
+use crate::fixtures::{complex_probe, explain_virtual_pushdown_sql, stack, typed_probe};
 use serde_json::json;
 use std::sync::OnceLock;
 
@@ -24,28 +18,10 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
 fn setup() {
     SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        wait_for_seaweedfs();
-        wait_for_iceberg_catalog();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            seed_typed_distinct_probe(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed typed_distinct_probe table");
-            seed_complex_types_probe(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed complex_probe table");
-        });
-
-        install_slc();
-        upload_so();
-        let mut conn = exa_conn();
-        create_schema_and_scripts(&mut conn);
-        create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, E2E_NAMESPACE));
+        stack();
+        typed_probe();
+        complex_probe();
+        create_virtual_schema(&mut exa_conn(), &VsProps::new(VS_NAME, E2E_NAMESPACE));
     });
 }
 
@@ -55,19 +31,6 @@ fn typed_table() -> String {
 
 fn complex_table() -> String {
     format!("{VS_NAME}.{}", E2E_COMPLEX_TABLE.to_uppercase())
-}
-
-/// `PUSHDOWN_SQL` only: the echoed request JSON repeats the user's select list
-/// and would satisfy a naive substring probe.
-fn explain_virtual_pushdown_sql(conn: &mut ExaConn, query_sql: &str) -> String {
-    let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let cols = conn.fetch_result_columns(result_set);
-    cols[1]
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn emits_clause(pushed_sql: &str) -> String {

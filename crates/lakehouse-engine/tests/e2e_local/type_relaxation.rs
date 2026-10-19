@@ -2,71 +2,20 @@
 //! promotion, so no fixture can carry it (unit-tested instead, ADR 074). The fixture is authored by
 //! `scripts/spark-fixtures/create_iceberg_type_promotion_fixture.sql`; ground truth in
 //! `tests/common/type_promotion_fixtures.rs` must stay in lockstep with it.
-#![cfg(feature = "exasol-e2e")]
 
-mod common;
-use common::e2e_harness::*;
-use common::stack::{wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs};
-use common::type_promotion_fixtures::{
+use crate::common::e2e_harness::*;
+use crate::common::raw_parquet::get_fixture_object;
+use crate::common::type_promotion_fixtures::{
     DECIMAL_DECIMAL_COLUMN, DECIMAL_DECIMAL_PRE_PROMOTION_PHYSICAL_TYPE, FLOAT_DOUBLE_COLUMN,
     FLOAT_DOUBLE_PRE_PROMOTION_PHYSICAL_TYPE, ICEBERG_TYPE_PROMOTION_TABLE, ID_COLUMN,
     INT_LONG_COLUMN, INT_LONG_PRE_PROMOTION_PHYSICAL_TYPE, NAMESPACE, POST_PROMOTION_ROWS,
     PRE_PROMOTION_ROWS, TypePromotionRow,
 };
+use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, runtime, stack, vs_table};
 
-use object_store::ObjectStoreExt;
-use object_store::path::Path as ObjectStorePath;
 use parquet::basic::ConvertedType;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::schema::types::ColumnDescPtr;
-
-use std::sync::OnceLock;
-
-static SETUP_DONE: OnceLock<()> = OnceLock::new();
-
-fn setup() {
-    SETUP_DONE.get_or_init(|| {
-        wait_for_seaweedfs();
-        wait_for_iceberg_catalog();
-    });
-}
-
-/// Shared with other E2E binaries; recreation uses an identical body, so it is harmless.
-const VS_NAME: &str = "MY_LAKEHOUSE";
-
-static FULL_STACK_SETUP_DONE: OnceLock<()> = OnceLock::new();
-
-fn setup_full_stack() {
-    setup();
-    FULL_STACK_SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        install_slc();
-        upload_so();
-
-        let mut conn = exa_conn();
-        create_schema_and_scripts(&mut conn);
-        create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, NAMESPACE));
-    });
-}
-
-fn vs_table(vs_name: &str, table: &str) -> String {
-    format!("{vs_name}.{}", table.to_uppercase())
-}
-
-/// Reads through the same `object_store` S3 client the scan UDF uses, so the guard inspects the
-/// exact bytes the scan would decode.
-async fn fetch_object_bytes(uri: &str) -> bytes::Bytes {
-    let (bucket, key) = split_s3_bucket_and_key(uri);
-    let store = local_stack_s3_store(bucket);
-
-    store
-        .get(&ObjectStorePath::from(key))
-        .await
-        .unwrap_or_else(|e| panic!("GET {uri} from SeaweedFS: {e}"))
-        .bytes()
-        .await
-        .unwrap_or_else(|e| panic!("read bytes of {uri}: {e}"))
-}
 
 fn find_column(schema: &parquet::schema::types::SchemaDescriptor, column: &str) -> ColumnDescPtr {
     schema
@@ -82,12 +31,9 @@ fn find_column(schema: &parquet::schema::types::SchemaDescriptor, column: &str) 
 
 #[test]
 fn e2e_type_promotion_pre_promotion_data_file_is_physically_narrow() {
-    setup();
+    stack();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let rt = runtime();
 
     let files = rt.block_on(resolve_fixture_files(
         NAMESPACE,
@@ -104,7 +50,7 @@ fn e2e_type_promotion_pre_promotion_data_file_is_physically_narrow() {
     let readers: Vec<(String, SerializedFileReader<bytes::Bytes>)> = files
         .iter()
         .map(|file| {
-            let bytes = rt.block_on(fetch_object_bytes(&file.path));
+            let bytes = get_fixture_object(&file.path);
             let reader = SerializedFileReader::new(bytes)
                 .unwrap_or_else(|e| panic!("open committed Parquet file {}: {e}", file.path));
             (file.path.clone(), reader)
@@ -193,13 +139,13 @@ fn e2e_type_promotion_pre_promotion_data_file_is_physically_narrow() {
 
 #[test]
 fn iceberg_type_promotion_returns_both_layouts_at_the_promoted_types() {
-    setup_full_stack();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT {ID_COLUMN}, {INT_LONG_COLUMN}, {FLOAT_DOUBLE_COLUMN}, {DECIMAL_DECIMAL_COLUMN} \
          FROM {} ORDER BY {ID_COLUMN}",
-        vs_table(VS_NAME, ICEBERG_TYPE_PROMOTION_TABLE)
+        vs_table(LAKEHOUSE_VS, ICEBERG_TYPE_PROMOTION_TABLE)
     );
     let cols = conn.query_columns(&sql);
 

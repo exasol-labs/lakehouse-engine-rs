@@ -34,7 +34,7 @@ being pushed as a partial/merge plan.
   the withheld-limit fallback returned wrong, unsorted, unbounded rows and the adapter now
   renders a self-contained global `ORDER BY … LIMIT` (`topn.rs` lines 444-449, `mod.rs` lines
   690-694). An `orderBy` pushed WITHOUT a `limit` behaves differently: Exasol keeps its own
-  top-level `ORDER BY` and re-sorts the returned rows (`tests/e2e_scan_test.rs` lines 1133-1138).
+  top-level `ORDER BY` and re-sorts the returned rows (`tests/e2e_local/scan.rs`, `order_by_without_limit_falls_back_correctly`).
 * The correct handling for a HAVING the adapter cannot render over the partial/merge
   decomposition is therefore neither omission nor an error: route the request to the qualified
   single-table wrapper, which renders the HAVING as ordinary Exasol SQL over materialized rows.

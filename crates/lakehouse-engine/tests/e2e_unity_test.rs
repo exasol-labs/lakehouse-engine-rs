@@ -1,7 +1,6 @@
 //! All tests share one virtual schema, so they must run serially (`--test-threads=1`).
 //! The OSS Unity Catalog server has authorization disabled and vends no S3 endpoint, so the
 //! CONNECTION carries no catalog-auth field but does carry SeaweedFS's endpoint and static keys.
-#![cfg(feature = "unity-e2e")]
 
 mod common;
 

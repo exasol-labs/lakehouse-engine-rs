@@ -1,112 +1,55 @@
 //! E2E tests against a live Exasol + SeaweedFS + Iceberg REST stack. They fail, never
 //! skip, when the stack is unavailable, and share one VS, so run with
 //! `--test-threads=1`.
-#![cfg(feature = "exasol-e2e")]
 
-mod common;
-use common::e2e_harness::*;
-use common::exasol_ws::ExaConn;
-use common::seed::{
+use crate::common::e2e_harness::*;
+use crate::common::exasol_ws::ExaConn;
+use crate::common::seed::{
     ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT,
     DECIMAL_36_6_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT, DIM_CUSTOMER_ROWS, E2E_ALL_TYPES_TABLE,
-    E2E_BINARY_VALUES_TABLE, E2E_DIM_TABLE, E2E_EVO_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE,
-    E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2, E2E_TYPED_TABLE,
-    EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS,
-    EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FLOAT32_VALUES_TEXT, INT32_VALUES_TEXT,
-    LINEITEM_ROWS, LINES_PER_ORDER, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE,
-    PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15,
-    SEED_TOTAL_ROWS, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT, TYPED_COL_DECIMAL_A,
-    TYPED_COL_DECIMAL_B, initdef_columns, seed_added_columns_initial_default, seed_all_types,
-    seed_events, seed_renamed_column, seed_typed_distinct_probe, typed_decimal_a_avg_stddev,
-    typed_decimal_b_avg_stddev, typed_id_avg_stddev,
+    E2E_BINARY_VALUES_TABLE, E2E_EVO_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_PART_TABLE,
+    E2E_TABLE, E2E_TABLE_2, EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE,
+    EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FLOAT32_VALUES_TEXT,
+    INT32_VALUES_TEXT, LINEITEM_ROWS, LINES_PER_ORDER, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS,
+    PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS,
+    SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
+    TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, initdef_columns, seed_added_columns_initial_default,
+    seed_renamed_column, typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev,
+    typed_id_avg_stddev,
 };
-use common::stack::{
-    build_create_connection_sql, exasol_container, iceberg_catalog_url, wait_for_exasol,
-    wait_for_iceberg_catalog, wait_for_seaweedfs,
-};
-use common::timestamp_precision::{
+use crate::common::stack::{build_create_connection_sql, exasol_container, iceberg_catalog_url};
+use crate::common::timestamp_precision::{
     ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
+};
+use crate::fixtures::{
+    LAKEHOUSE_VS, events_table, explain_virtual_pushdown_sql, lakehouse_vs, runtime, typed_table,
+    vs_dim_table, vs_fact_table,
 };
 
 use lakehouse_catalog::CatalogSession;
 use lakehouse_engine::adapter::pushdown::{ConnectionStorage, ScanSource, format_reader};
 
-use std::sync::OnceLock;
-
-const VS_NAME: &str = "MY_LAKEHOUSE";
-
 /// `PARALLELISM_FACTOR = '1'` so its recorded `DF_THREADS_PER_UDF` reads back the core
 /// count the adapter VM detected.
 const CPU_PROBE_VS_NAME: &str = "LHVS_CPU_PROBE";
 
-static SETUP_DONE: OnceLock<()> = OnceLock::new();
-
-fn setup_e2e() {
-    SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        wait_for_seaweedfs();
-        wait_for_iceberg_catalog();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            seed_events(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed Iceberg events table");
-            seed_typed_distinct_probe(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed Iceberg typed_distinct_probe table");
-            seed_all_types(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed Iceberg all_types and binary_values tables");
-        });
-
-        install_slc();
-
-        upload_so();
-
-        let mut conn = exa_conn();
-        create_schema_and_scripts(&mut conn);
-        create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, E2E_NAMESPACE));
-    });
-}
-
-fn vs_table() -> String {
-    format!("{VS_NAME}.{}", E2E_TABLE.to_uppercase())
-}
-
-fn typed_table() -> String {
-    format!("{VS_NAME}.{}", E2E_TYPED_TABLE.to_uppercase())
-}
-
 fn vs_labels_table() -> String {
-    format!("{VS_NAME}.{}", E2E_TABLE_2.to_uppercase())
+    format!("{LAKEHOUSE_VS}.{}", E2E_TABLE_2.to_uppercase())
 }
 
 fn vs_lineitem_table() -> String {
-    format!("{VS_NAME}.{}", E2E_LINEITEM_TABLE.to_uppercase())
-}
-
-/// Used only for the #193 outer-join-decline shape, which `events` cannot express.
-fn vs_dim_table() -> String {
-    format!("{VS_NAME}.{}", E2E_DIM_TABLE.to_uppercase())
-}
-
-fn vs_fact_table() -> String {
-    format!("{VS_NAME}.{}", E2E_FACT_TABLE.to_uppercase())
+    format!("{LAKEHOUSE_VS}.{}", E2E_LINEITEM_TABLE.to_uppercase())
 }
 
 #[test]
 fn e2e_projection_filter_limit_returns_correct_rows() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     // score = 5.0*id, so score > 15.0 is ids 4..=20 and LIMIT 5 yields ids 4..=8.
     let sql = format!(
         "SELECT id, name, score FROM {} WHERE score > 15.0 LIMIT 5",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(
@@ -158,7 +101,7 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
     // `tableAlias`.
     let sql_aliased = format!(
         "SELECT e.id, e.name, e.score FROM {} e WHERE e.score > 15.0 ORDER BY e.score LIMIT 5",
-        vs_table()
+        events_table()
     );
     let cols_aliased = conn.query_columns(&sql_aliased);
     assert_eq!(
@@ -182,7 +125,7 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
     // #193: `e.score + 1` must render the bare "SCORE" under the scan relation, not "E"."SCORE".
     let sql_expr = format!(
         "SELECT e.score + 1 FROM {} e WHERE e.score > 15.0",
-        vs_table()
+        events_table()
     );
     let cols_expr = conn.query_columns(&sql_expr);
     assert_eq!(
@@ -208,7 +151,7 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
     // #193: Exasol stamps `tableAlias:"E"` even on an unqualified column under an aliased FROM.
     let row_count_unqualified = conn.query_row_count(&format!(
         "SELECT id FROM {} e WHERE score > 15.0",
-        vs_table()
+        events_table()
     ));
     assert_eq!(
         row_count_unqualified, SEED_ROWS_SCORE_GT_15 as i64,
@@ -219,12 +162,12 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
 
 #[test]
 fn create_vs_maps_iceberg_schema() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
     let timestamp = expected_timestamp_precision(&mut conn).declared_column_type;
 
     assert_eq!(
-        declared_types(&mut conn, VS_NAME, E2E_TABLE),
+        declared_types(&mut conn, LAKEHOUSE_VS, E2E_TABLE),
         pairs(&[
             ("ID", "DECIMAL(20,0)"),
             ("NAME", VARCHAR_JSON),
@@ -237,7 +180,7 @@ fn create_vs_maps_iceberg_schema() {
         &mut conn,
         &format!(
             "SELECT ID, NAME, SCORE, EVENT_DATE, EVENT_TS FROM {} WHERE ID = 2",
-            vs_table()
+            events_table()
         ),
         &[
             [Some("2")],
@@ -254,7 +197,7 @@ fn create_vs_maps_iceberg_schema() {
 /// Scenario: The listing declares a binary column
 #[test]
 fn iceberg_all_types_declare_and_return_their_mapped_values() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
     let timestamp = expected_timestamp_precision(&mut conn).declared_column_type;
     let timestamp_ns = if engine_honors_declared_precision(&mut conn) {
@@ -264,7 +207,7 @@ fn iceberg_all_types_declare_and_return_their_mapped_values() {
     };
     assert_type_matrix(
         &mut conn,
-        VS_NAME,
+        LAKEHOUSE_VS,
         E2E_ALL_TYPES_TABLE,
         &[
             reads("ID", "DECIMAL(20,0)", ALL_TYPES_IDS_TEXT),
@@ -288,10 +231,15 @@ fn iceberg_all_types_declare_and_return_their_mapped_values() {
             ),
         ],
     );
-    assert_decimal_orders_numerically(&mut conn, VS_NAME, E2E_ALL_TYPES_TABLE, "C_DECIMAL_18_0");
+    assert_decimal_orders_numerically(
+        &mut conn,
+        LAKEHOUSE_VS,
+        E2E_ALL_TYPES_TABLE,
+        "C_DECIMAL_18_0",
+    );
     assert_binary_values_refused(
         &mut conn,
-        VS_NAME,
+        LAKEHOUSE_VS,
         E2E_BINARY_VALUES_TABLE,
         "non UTF-8 data",
     );
@@ -300,11 +248,11 @@ fn iceberg_all_types_declare_and_return_their_mapped_values() {
 /// Scenario: A refused column's note records its refusal and the column stays declared
 #[test]
 fn iceberg_binary_column_note_records_the_refusal() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
     assert_refused_column(
         &mut conn,
-        VS_NAME,
+        LAKEHOUSE_VS,
         &E2E_ALL_TYPES_TABLE.to_uppercase(),
         "C_BINARY",
         &["'c_binary'", "type 'binary'"],
@@ -314,11 +262,13 @@ fn iceberg_binary_column_note_records_the_refusal() {
 /// Scenario: Filter predicate restricts the emitted rows
 #[test]
 fn scan_filter_restricts_rows() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let row_count =
-        conn.query_row_count(&format!("SELECT id FROM {} WHERE score > 15.0", vs_table()));
+    let row_count = conn.query_row_count(&format!(
+        "SELECT id FROM {} WHERE score > 15.0",
+        events_table()
+    ));
     assert_eq!(
         row_count, SEED_ROWS_SCORE_GT_15 as i64,
         "WHERE score > 15.0 should return {SEED_ROWS_SCORE_GT_15} rows, got {row_count}"
@@ -327,10 +277,10 @@ fn scan_filter_restricts_rows() {
 
 #[test]
 fn scan_limit_caps_rows() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let row_count = conn.query_row_count(&format!("SELECT id FROM {} LIMIT 3", vs_table()));
+    let row_count = conn.query_row_count(&format!("SELECT id FROM {} LIMIT 3", events_table()));
     assert_eq!(
         row_count, 3,
         "LIMIT 3 should return exactly 3 rows, got {row_count}"
@@ -339,7 +289,7 @@ fn scan_limit_caps_rows() {
 
 #[test]
 fn both_scripts_resolve_one_artifact() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let resp_adapter = conn.execute(&format!(
@@ -370,12 +320,12 @@ fn both_scripts_resolve_one_artifact() {
 
 #[test]
 fn mixed_column_parquet_round_trips() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let cols = conn.query_columns(&format!(
         "SELECT id, name, score, event_date, event_ts FROM {} WHERE id = 1",
-        vs_table()
+        events_table()
     ));
     assert_eq!(cols.len(), 5, "expected 5 columns: {cols:?}");
     for (i, col) in cols.iter().enumerate() {
@@ -410,10 +360,10 @@ fn mixed_column_parquet_round_trips() {
 
 #[test]
 fn create_vs_unreachable_catalog_errors_no_secret() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let bogus_password = common::stack::CatalogConnectionPassword {
+    let bogus_password = crate::common::stack::CatalogConnectionPassword {
         warehouse: "s3://warehouse/".to_string(),
         endpoint: "http://does-not-exist.invalid:9000".to_string(),
         region: "us-east-1".to_string(),
@@ -451,10 +401,10 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
 
 #[test]
 fn create_vs_ambiguous_catalog_auth_errors_no_secret() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let ambiguous_password = common::stack::CatalogConnectionPassword {
+    let ambiguous_password = crate::common::stack::CatalogConnectionPassword {
         warehouse: "s3://warehouse/".to_string(),
         endpoint: "http://does-not-exist.invalid:9000".to_string(),
         region: "us-east-1".to_string(),
@@ -501,10 +451,12 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
 
 #[test]
 fn scan_unknown_virtual_table_errors() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let resp = conn.try_execute(&format!("SELECT * FROM {VS_NAME}.NO_SUCH_TABLE LIMIT 1"));
+    let resp = conn.try_execute(&format!(
+        "SELECT * FROM {LAKEHOUSE_VS}.NO_SUCH_TABLE LIMIT 1"
+    ));
     assert_eq!(
         resp["status"].as_str(),
         Some("error"),
@@ -514,12 +466,9 @@ fn scan_unknown_virtual_table_errors() {
 
 #[test]
 fn e2e_renamed_column_resolves_by_field_id() {
-    setup_e2e();
+    lakehouse_vs();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let rt = runtime();
     rt.block_on(async {
         seed_renamed_column(&iceberg_catalog_url(), "s3://warehouse/")
             .await
@@ -575,12 +524,9 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
 
 #[test]
 fn e2e_added_columns_initial_default_fill_all_types() {
-    setup_e2e();
+    lakehouse_vs();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let rt = runtime();
     rt.block_on(async {
         seed_added_columns_initial_default(&iceberg_catalog_url(), "s3://warehouse/")
             .await
@@ -680,10 +626,10 @@ fn e2e_fails_when_stack_unavailable() {
 
 #[test]
 fn scan_emits_partial_aggregate_row() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let cols = conn.query_columns(&format!("SELECT COUNT(*) FROM {}", vs_table()));
+    let cols = conn.query_columns(&format!("SELECT COUNT(*) FROM {}", events_table()));
     assert_eq!(cols.len(), 1, "COUNT(*) must return one column: {cols:?}");
     assert_eq!(cols[0].len(), 1, "COUNT(*) must return one row: {cols:?}");
     let count = cols[0][0]
@@ -695,13 +641,13 @@ fn scan_emits_partial_aggregate_row() {
 
 #[test]
 fn partial_count_sum_min_max_merge_ready() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     // SUM(score) = 5 * (1 + ... + 20) = 1050.
     let cols = conn.query_columns(&format!(
         "SELECT COUNT(*), SUM(score), MIN(score), MAX(score) FROM {}",
-        vs_table()
+        events_table()
     ));
     assert_eq!(cols.len(), 4, "must return 4 columns: {cols:?}");
 
@@ -741,10 +687,10 @@ fn partial_count_sum_min_max_merge_ready() {
 
 #[test]
 fn partial_avg_emits_sum_count_pair() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let cols = conn.query_columns(&format!("SELECT AVG(score) FROM {}", vs_table()));
+    let cols = conn.query_columns(&format!("SELECT AVG(score) FROM {}", events_table()));
     assert_eq!(cols.len(), 1, "AVG must return one column: {cols:?}");
     let avg = cols[0][0]
         .as_f64()
@@ -758,7 +704,7 @@ fn partial_avg_emits_sum_count_pair() {
     // score > 15.0 is ids 4..=20: SUM = 5 * 204 = 1020, AVG = 60.0.
     let cols_filtered = conn.query_columns(&format!(
         "SELECT AVG(score) FROM {} WHERE score > 15.0",
-        vs_table()
+        events_table()
     ));
     let avg_filtered = cols_filtered[0][0]
         .as_f64()
@@ -772,7 +718,7 @@ fn partial_avg_emits_sum_count_pair() {
 
 #[test]
 fn partial_avg_stddev_over_non_double_columns() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let cases: [(&str, (f64, f64)); 3] = [
@@ -828,12 +774,12 @@ fn assert_single_group_aggregate_pushed_down(conn: &mut ExaConn, query_sql: &str
 
 #[test]
 fn single_group_aggregate_scan_spec_projection_is_empty() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     for sql in [
-        format!("SELECT COUNT(*) FROM {}", vs_table()),
-        format!("SELECT SUM(score) FROM {}", vs_table()),
+        format!("SELECT COUNT(*) FROM {}", events_table()),
+        format!("SELECT SUM(score) FROM {}", events_table()),
     ] {
         let pushed_sql = explain_virtual_sql(&mut conn, &sql);
         assert!(
@@ -853,10 +799,10 @@ fn single_group_aggregate_scan_spec_projection_is_empty() {
 
 #[test]
 fn sum_length_expression_argument_pushed_down() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let sql = format!("SELECT SUM(LENGTH(name)) FROM {}", vs_table());
+    let sql = format!("SELECT SUM(LENGTH(name)) FROM {}", events_table());
     assert_single_group_aggregate_pushed_down(&mut conn, &sql);
 
     let cols = conn.query_columns(&sql);
@@ -874,14 +820,14 @@ fn sum_length_expression_argument_pushed_down() {
 
 #[test]
 fn sum_two_column_product_pushes_down_matches_single_node() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT SUM(id * score) AS revenue FROM {} \
          WHERE event_date >= DATE '2024-01-05' AND event_date < DATE '2024-01-15' \
            AND score BETWEEN 30.0 AND 60.0 AND id <= 12",
-        vs_table()
+        events_table()
     );
 
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
@@ -917,10 +863,10 @@ fn sum_two_column_product_pushes_down_matches_single_node() {
 
 #[test]
 fn untranslatable_aggregate_argument_falls_back_to_row_scan() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let sql = format!("SELECT SUM(BIT_AND(id, 7)) FROM {}", vs_table());
+    let sql = format!("SELECT SUM(BIT_AND(id, 7)) FROM {}", events_table());
 
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
     assert!(
@@ -944,12 +890,12 @@ fn untranslatable_aggregate_argument_falls_back_to_row_scan() {
 
 #[test]
 fn ordered_topn_pushes_down_matches_single_node() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, score FROM {} ORDER BY score DESC LIMIT 12",
-        vs_table()
+        events_table()
     );
 
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
@@ -1002,10 +948,13 @@ fn ordered_topn_pushes_down_matches_single_node() {
 
 #[test]
 fn order_by_without_limit_falls_back_correctly() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let sql = format!("SELECT id, score FROM {} ORDER BY score DESC", vs_table());
+    let sql = format!(
+        "SELECT id, score FROM {} ORDER BY score DESC",
+        events_table()
+    );
 
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
     // Field-shaped marker: a bare `contains("order_by")` false-positives on Exasol's echo.
@@ -1042,12 +991,12 @@ fn order_by_without_limit_falls_back_correctly() {
 
 #[test]
 fn create_vs_omits_cluster_nodes_from_adapter_notes() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let cols = conn.query_columns(&format!(
         "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS \
-         WHERE SCHEMA_NAME = '{VS_NAME}'"
+         WHERE SCHEMA_NAME = '{LAKEHOUSE_VS}'"
     ));
     assert_eq!(
         cols.len(),
@@ -1089,7 +1038,7 @@ fn create_vs_omits_cluster_nodes_from_adapter_notes() {
 /// Scenario: The adapter detects the node's CPU affinity set
 #[test]
 fn adapter_detects_container_cpuset() {
-    setup_e2e();
+    lakehouse_vs();
 
     let container = exasol_container();
     let original = exasol_container_cpuset(&container);
@@ -1232,10 +1181,10 @@ fn cpu_ids(list: &str) -> Vec<usize> {
 
 #[test]
 fn pushdown_shards_from_handshake_node_count_without_note() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let sql = format!("SELECT id, name, score FROM {}", vs_table());
+    let sql = format!("SELECT id, name, score FROM {}", events_table());
 
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
     assert!(
@@ -1252,10 +1201,10 @@ fn pushdown_shards_from_handshake_node_count_without_note() {
 
 #[test]
 fn aggregate_count_col_returns_correct_value() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let cols = conn.query_columns(&format!("SELECT COUNT(score) FROM {}", vs_table()));
+    let cols = conn.query_columns(&format!("SELECT COUNT(score) FROM {}", events_table()));
     assert_eq!(
         cols.len(),
         1,
@@ -1274,7 +1223,7 @@ fn aggregate_count_col_returns_correct_value() {
 
     let cols_filtered = conn.query_columns(&format!(
         "SELECT COUNT(score) FROM {} WHERE score > 15.0",
-        vs_table()
+        events_table()
     ));
     let count_filtered = cols_filtered[0][0]
         .as_i64()
@@ -1292,7 +1241,7 @@ fn aggregate_count_col_returns_correct_value() {
 
     let cols_star = conn.query_columns(&format!(
         "SELECT COUNT(*) FROM {} WHERE score > 15.0",
-        vs_table()
+        events_table()
     ));
     let count_star = cols_star[0][0]
         .as_i64()
@@ -1306,7 +1255,7 @@ fn aggregate_count_col_returns_correct_value() {
     // #193: alias stripping must leave single-group aggregate pushdown unchanged.
     let cols_aliased_col = conn.query_columns(&format!(
         "SELECT COUNT(e.score) FROM {} e WHERE e.score > 15.0",
-        vs_table()
+        events_table()
     ));
     let count_aliased_col = cols_aliased_col[0][0]
         .as_i64()
@@ -1325,7 +1274,7 @@ fn aggregate_count_col_returns_correct_value() {
 
     let cols_aliased_star = conn.query_columns(&format!(
         "SELECT COUNT(*) FROM {} e WHERE e.score > 15.0",
-        vs_table()
+        events_table()
     ));
     let count_aliased_star = cols_aliased_star[0][0]
         .as_i64()
@@ -1350,7 +1299,7 @@ fn aggregate_count_col_returns_correct_value() {
     // group per matching row.
     let cols_grouped = conn.query_columns(&format!(
         "SELECT e.id, COUNT(e.score) FROM {} e WHERE e.score > 15.0 GROUP BY e.id",
-        vs_table()
+        events_table()
     ));
     assert_eq!(
         cols_grouped.len(),
@@ -1378,7 +1327,7 @@ fn aggregate_count_col_returns_correct_value() {
 
 #[test]
 fn e2e_declined_outer_join_repushes_aliased_single_table_scan() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -1406,10 +1355,10 @@ fn e2e_declined_outer_join_repushes_aliased_single_table_scan() {
 
 #[test]
 fn multi_shard_row_query_matches_single_shard() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let cols = conn.query_columns(&format!("SELECT id FROM {} ORDER BY id", vs_table()));
+    let cols = conn.query_columns(&format!("SELECT id FROM {} ORDER BY id", events_table()));
     assert_eq!(cols.len(), 1, "SELECT id must return one column: {cols:?}");
     assert_eq!(
         cols[0].len(),
@@ -1438,10 +1387,10 @@ fn multi_shard_row_query_matches_single_shard() {
 
 #[test]
 fn scan_registers_assigned_files_with_path_size_payload() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
-    let sql = format!("SELECT id, name, score FROM {} ORDER BY id", vs_table());
+    let sql = format!("SELECT id, name, score FROM {} ORDER BY id", events_table());
     let cols = conn.query_columns(&sql);
     assert_eq!(
         cols.len(),
@@ -1533,12 +1482,12 @@ fn assert_group_by_pushed_down(conn: &mut ExaConn, query_sql: &str) {
 
 #[test]
 fn grouped_aggregate_scan_spec_projection_is_empty() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT MOD(id, 4), COUNT(*), SUM(score) FROM {} GROUP BY MOD(id, 4)",
-        vs_table()
+        events_table()
     );
     assert_group_by_pushed_down(&mut conn, &sql);
 
@@ -1554,12 +1503,12 @@ fn grouped_aggregate_scan_spec_projection_is_empty() {
 
 #[test]
 fn test_group_by_sum_count() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT MOD(id, 4), COUNT(*), SUM(score) FROM {} GROUP BY MOD(id, 4) ORDER BY MOD(id, 4)",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 3, "expected 3 columns: {cols:?}");
@@ -1592,14 +1541,14 @@ fn test_group_by_sum_count() {
 
 #[test]
 fn test_group_by_multi_key_with_filter() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT MOD(id, 4), MOD(id, 2), COUNT(*) \
          FROM {} WHERE score > 50.0 \
          GROUP BY MOD(id, 4), MOD(id, 2)",
-        vs_table()
+        events_table()
     );
 
     assert_group_by_pushed_down(&mut conn, &sql);
@@ -1625,7 +1574,7 @@ fn test_group_by_multi_key_with_filter() {
 
 #[test]
 fn test_group_by_expression_key() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -1633,7 +1582,7 @@ fn test_group_by_expression_key() {
          FROM {} \
          GROUP BY CAST(score / 25.0 AS DECIMAL(4,0)) \
          ORDER BY CAST(score / 25.0 AS DECIMAL(4,0))",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (key, count): {cols:?}");
@@ -1668,7 +1617,7 @@ fn test_group_by_expression_key() {
 
 #[test]
 fn test_group_by_avg_correctness() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -1676,7 +1625,7 @@ fn test_group_by_avg_correctness() {
          FROM {} \
          GROUP BY CAST(score / 25.0 AS DECIMAL(4,0)) \
          ORDER BY CAST(score / 25.0 AS DECIMAL(4,0))",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (key, avg): {cols:?}");
@@ -1705,12 +1654,12 @@ fn test_group_by_avg_correctness() {
 
 #[test]
 fn test_high_cardinality_group_by_spill() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, COUNT(*) FROM {} GROUP BY id ORDER BY id",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, count): {cols:?}");
@@ -1743,12 +1692,12 @@ fn test_high_cardinality_group_by_spill() {
 
 #[test]
 fn test_shard_key_fanout_explain() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "EXPLAIN VIRTUAL SELECT id, COUNT(*) FROM {} GROUP BY id",
-        vs_table()
+        events_table()
     );
     let resp = conn.execute(&sql);
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
@@ -1777,7 +1726,7 @@ fn test_shard_key_fanout_explain() {
 
 #[test]
 fn test_group_by_null_key_grouping() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     // id = 5, 10, 15, 20 yield the NULL group; every group has 4 rows.
@@ -1786,7 +1735,7 @@ fn test_group_by_null_key_grouping() {
          FROM {} \
          GROUP BY NULLIF(MOD(id, 5), 0) \
          ORDER BY NULLIF(MOD(id, 5), 0) NULLS LAST",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (key, count): {cols:?}");
@@ -1832,12 +1781,12 @@ fn test_group_by_null_key_grouping() {
 
 #[test]
 fn test_group_by_agg_before_key() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT SUM(score), MOD(id, 4) FROM {} GROUP BY MOD(id, 4)",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (sum, key): {cols:?}");
@@ -1872,12 +1821,12 @@ fn test_group_by_agg_before_key() {
 
 #[test]
 fn test_group_by_interleaved_multi_key() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT MOD(id, 4), SUM(score), MOD(id, 2) FROM {} GROUP BY MOD(id, 4), MOD(id, 2)",
-        vs_table()
+        events_table()
     );
 
     assert_group_by_pushed_down(&mut conn, &sql);
@@ -1929,12 +1878,12 @@ fn test_group_by_interleaved_multi_key() {
 
 #[test]
 fn test_group_by_expr_key_after_agg() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT COUNT(*), MOD(id, 4) FROM {} GROUP BY MOD(id, 4)",
-        vs_table()
+        events_table()
     );
     let resp = conn.execute(&sql);
 
@@ -1978,12 +1927,12 @@ fn test_group_by_expr_key_after_agg() {
 
 #[test]
 fn test_group_by_agg_first_with_having() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT SUM(score), MOD(id, 4) FROM {} GROUP BY MOD(id, 4) HAVING SUM(score) > 250.0",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (sum, key): {cols:?}");
@@ -2021,7 +1970,7 @@ fn test_group_by_agg_first_with_having() {
     // query must succeed via the wrapper fallback.
     let unmatched_sql = format!(
         "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) HAVING SUM(score) > 250.0",
-        vs_table()
+        events_table()
     );
     let unmatched_pushed_sql = explain_virtual_sql(&mut conn, &unmatched_sql);
     assert!(
@@ -2060,7 +2009,7 @@ fn test_group_by_agg_first_with_having() {
     let mixed_sql = format!(
         "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) \
          HAVING COUNT(*) > 0 AND SUM(score) > 250.0",
-        vs_table()
+        events_table()
     );
     let mixed_pushed_sql = explain_virtual_sql(&mut conn, &mixed_sql);
     assert!(
@@ -2099,7 +2048,7 @@ fn test_group_by_agg_first_with_having() {
     let distinct_sql = format!(
         "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) \
          HAVING COUNT(DISTINCT name) > 4",
-        vs_table()
+        events_table()
     );
     let distinct_cols = conn.query_columns(&distinct_sql);
     assert_eq!(
@@ -2123,7 +2072,7 @@ fn test_group_by_agg_first_with_having() {
     let distinct_zero_sql = format!(
         "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) \
          HAVING COUNT(DISTINCT name) > 5",
-        vs_table()
+        events_table()
     );
     assert_eq!(
         conn.query_row_count(&distinct_zero_sql),
@@ -2136,13 +2085,13 @@ fn test_group_by_agg_first_with_having() {
 
 #[test]
 fn test_group_by_expr_multi_key_tuple() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT MOD(id, 4), UPPER(name), COUNT(*) \
          FROM {} GROUP BY MOD(id, 4), UPPER(name)",
-        vs_table()
+        events_table()
     );
 
     assert_group_by_pushed_down(&mut conn, &sql);
@@ -2225,13 +2174,13 @@ fn test_group_by_expr_multi_key_tuple() {
 
 #[test]
 fn test_group_by_multi_key_having_limit() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT MOD(id, 4), MOD(id, 3), SUM(score) FROM {} \
          GROUP BY MOD(id, 4), MOD(id, 3) HAVING SUM(score) > 100.0 LIMIT 2",
-        vs_table()
+        events_table()
     );
 
     assert_group_by_pushed_down(&mut conn, &sql);
@@ -2282,12 +2231,12 @@ fn test_group_by_multi_key_having_limit() {
 /// Scenario: High-cardinality multi-key grouped scan completes under the bounded memory pool
 #[test]
 fn test_high_cardinality_multi_key_group_by_spill() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, MOD(id, 2), COUNT(*) FROM {} GROUP BY id, MOD(id, 2) ORDER BY id",
-        vs_table()
+        events_table()
     );
 
     assert_group_by_pushed_down(&mut conn, &sql);
@@ -2367,7 +2316,7 @@ fn distinct_numeric_suffixes(haystack: &str, marker: &str) -> std::collections::
 
 #[test]
 fn test_group_by_scalar_over_aggregate_round() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -2440,7 +2389,7 @@ fn test_group_by_scalar_over_aggregate_round() {
 
 #[test]
 fn test_group_by_shared_inner_aggregate_dedup() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -2524,12 +2473,12 @@ fn test_group_by_shared_inner_aggregate_dedup() {
 
 #[test]
 fn e2e_create_vs_enumerates_namespace_tables() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let cols = conn.query_columns(&format!(
         "SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES \
-         WHERE TABLE_SCHEMA = '{VS_NAME}' \
+         WHERE TABLE_SCHEMA = '{LAKEHOUSE_VS}' \
          ORDER BY TABLE_NAME"
     ));
     assert_eq!(
@@ -2551,7 +2500,7 @@ fn e2e_create_vs_enumerates_namespace_tables() {
 
 #[test]
 fn e2e_pushdown_scans_table_from_involved_tables() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let cols = conn.query_columns(&format!(
@@ -2586,12 +2535,12 @@ fn e2e_pushdown_scans_table_from_involved_tables() {
 // Iceberg file-pruning E2E tests over the partitioned `regions` table.
 
 fn vs_regions_table() -> String {
-    format!("{VS_NAME}.{}", E2E_PART_TABLE.to_uppercase())
+    format!("{LAKEHOUSE_VS}.{}", E2E_PART_TABLE.to_uppercase())
 }
 
 #[test]
 fn e2e_partition_filter_prunes_and_returns_correct_rows() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let north_sql = format!(
@@ -2681,9 +2630,9 @@ fn e2e_partition_filter_prunes_and_returns_correct_rows() {
 
 #[test]
 fn e2e_range_filter_prunes_by_file_bounds() {
-    setup_e2e();
+    lakehouse_vs();
 
-    let catalog_uri = common::stack::iceberg_catalog_url();
+    let catalog_uri = crate::common::stack::iceberg_catalog_url();
     let catalog_props = local_stack_catalog(&format!("{E2E_NAMESPACE}.{E2E_PART_TABLE}"));
     let storage = local_stack_storage();
     let creds = local_stack_creds();
@@ -2705,7 +2654,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         allow_http: true,
     };
     // Filter columns resolve through the field ids CREATE declared, as in a pushdown.
-    let declared = declared_schema_of(&mut exa_conn(), VS_NAME, "REGIONS");
+    let declared = declared_schema_of(&mut exa_conn(), LAKEHOUSE_VS, "REGIONS");
     let reader = format_reader(
         ScanSource::Iceberg {
             session: &session,
@@ -2769,7 +2718,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
 
 #[test]
 fn e2e_pushdown_resolves_files_once_multi_table() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -2777,7 +2726,7 @@ fn e2e_pushdown_resolves_files_once_multi_table() {
          JOIN {labels} b ON a.id = b.id \
          WHERE a.id <= 5 \
          ORDER BY a.id",
-        events = vs_table(),
+        events = events_table(),
         labels = vs_labels_table(),
     );
     let cols = conn.query_columns(&sql);
@@ -2817,14 +2766,14 @@ fn e2e_pushdown_resolves_files_once_multi_table() {
 
 #[test]
 fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     // Must be 4, not the 20 a row-scan fallback would return; `GROUP BY id` alone cannot
     // tell the two apart.
     let sql_duplicate_keys = format!(
         "SELECT COUNT(*) FROM (SELECT MOD(id, 4) AS k, COUNT(*) AS cnt FROM {} GROUP BY MOD(id, 4)) t",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&sql_duplicate_keys);
     assert_eq!(
@@ -2847,7 +2796,7 @@ fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
 
     let sql_unique_key = format!(
         "SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM {} GROUP BY id) t",
-        vs_table()
+        events_table()
     );
     let cols_unique = conn.query_columns(&sql_unique_key);
     let unique_group_count = parse_int(&cols_unique[0][0]);
@@ -2864,12 +2813,12 @@ fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
 
 #[test]
 fn ordered_limit_offset_returns_shifted_window() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id, score FROM {} ORDER BY score DESC LIMIT 12 OFFSET 3",
-        vs_table()
+        events_table()
     );
 
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
@@ -2902,12 +2851,12 @@ fn ordered_limit_offset_returns_shifted_window() {
 
 #[test]
 fn ordered_limit_offset_unprojected_sort_key_returns_shifted_window() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id FROM {} ORDER BY score DESC LIMIT 5 OFFSET 2",
-        vs_table()
+        events_table()
     );
 
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
@@ -2930,13 +2879,13 @@ fn ordered_limit_offset_unprojected_sort_key_returns_shifted_window() {
 
 #[test]
 fn grouped_order_by_limit_offset_returns_shifted_groups() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT MOD(id,4) AS k, COUNT(*) AS c FROM {} GROUP BY MOD(id,4) \
          ORDER BY 1 LIMIT 2 OFFSET 1",
-        vs_table()
+        events_table()
     );
 
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
@@ -2976,13 +2925,13 @@ fn grouped_order_by_limit_offset_returns_shifted_groups() {
 
 #[test]
 fn qualified_wrapper_limit_offset_returns_shifted_window() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT MOD(id,4) AS k, COUNT(DISTINCT id) AS c FROM {} \
          GROUP BY MOD(id,4) ORDER BY 1 LIMIT 2 OFFSET 1",
-        vs_table()
+        events_table()
     );
 
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
@@ -3024,12 +2973,12 @@ fn qualified_wrapper_limit_offset_returns_shifted_window() {
 
 #[test]
 fn offset_on_single_group_aggregate_is_rejected_by_exasol() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT COUNT(*) FROM {} ORDER BY 1 LIMIT 5 OFFSET 2",
-        vs_table()
+        events_table()
     );
     let resp = conn.try_execute(&sql);
 
@@ -3054,12 +3003,12 @@ fn offset_on_single_group_aggregate_is_rejected_by_exasol() {
 
 #[test]
 fn unrenderable_ordering_with_offset_matches_single_node() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
         "SELECT id FROM {} ORDER BY HASH_MD5(id) LIMIT 5 OFFSET 2",
-        vs_table()
+        events_table()
     );
 
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
@@ -3116,19 +3065,6 @@ fn ensure_single_group_ground_truth_table(conn: &mut ExaConn) {
     ));
 }
 
-/// Excludes Exasol's echoed request JSON, which repeats the user's select list and would
-/// satisfy a naive substring probe.
-fn explain_virtual_pushdown_sql(conn: &mut ExaConn, query_sql: &str) -> String {
-    let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let cols = conn.fetch_result_columns(result_set);
-    cols[1]
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// The virtual result must be exactly one merged row, never one row per shard (#194).
 fn assert_single_group_matches_native_oracle(conn: &mut ExaConn, select_list: &str, tail: &str) {
     ensure_single_group_ground_truth_table(conn);
@@ -3176,7 +3112,7 @@ fn assert_single_group_matches_native_oracle(conn: &mut ExaConn, select_list: &s
 
 #[test]
 fn e2e_single_group_scalar_over_aggregate_round_sum_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let select_list = "ROUND(SUM(L_QUANTITY), 2)";
@@ -3187,7 +3123,7 @@ fn e2e_single_group_scalar_over_aggregate_round_sum_matches_native_oracle() {
 
 #[test]
 fn e2e_single_group_scalar_over_variance_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let select_list = "ROUND(VARIANCE(L_EXTENDEDPRICE), 4)";
@@ -3201,7 +3137,7 @@ fn e2e_single_group_scalar_over_variance_matches_native_oracle() {
 
 #[test]
 fn e2e_single_group_scalar_over_aggregate_shared_count_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let select_list = "COUNT(*), ROUND(SUM(L_QUANTITY) / COUNT(*), 2)";
@@ -3224,7 +3160,7 @@ fn e2e_single_group_scalar_over_aggregate_shared_count_matches_native_oracle() {
 
 #[test]
 fn e2e_single_group_scalar_over_aggregate_interleaved_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let select_list = "SUM(L_QUANTITY), ROUND(AVG(L_EXTENDEDPRICE), 3), MIN(L_QUANTITY), \
@@ -3237,7 +3173,7 @@ fn e2e_single_group_scalar_over_aggregate_interleaved_matches_native_oracle() {
 
 #[test]
 fn e2e_single_group_scalar_over_aggregate_all_files_pruned_returns_one_row() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let select_list = "COUNT(*), ROUND(SUM(L_EXTENDEDPRICE), 2)";
@@ -3256,7 +3192,7 @@ fn e2e_single_group_scalar_over_aggregate_all_files_pruned_returns_one_row() {
 
 #[test]
 fn e2e_single_group_scalar_over_aggregate_explain_virtual_shows_empty_projection() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -3284,7 +3220,7 @@ fn e2e_single_group_scalar_over_aggregate_explain_virtual_shows_empty_projection
 
 #[test]
 fn e2e_float_div_int_over_int_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let oracle_cols = conn.query_columns(
@@ -3314,7 +3250,7 @@ fn e2e_float_div_int_over_int_matches_native_oracle() {
 
 #[test]
 fn e2e_float_div_pushes_checked_division_call_projection() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -3373,7 +3309,7 @@ const UDF_ERROR_SQL_CODE: &str = "22002";
 
 #[test]
 fn e2e_float_div_by_zero_projected_fails_with_division_by_zero() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -3391,7 +3327,7 @@ fn e2e_float_div_by_zero_projected_fails_with_division_by_zero() {
 
 #[test]
 fn e2e_zero_div_zero_projected_fails_with_division_by_zero() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -3411,7 +3347,7 @@ fn e2e_zero_div_zero_projected_fails_with_division_by_zero() {
 
 #[test]
 fn e2e_float_div_filter_row_count_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let oracle_count = conn.query_scalar_i64(
@@ -3505,7 +3441,7 @@ fn assert_checked_division_reached_the_pushed_filter(pushed: &str) {
 
 #[test]
 fn e2e_float_div_by_zero_in_filter_fails_like_native_exasol() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let x_over_zero = "L_ORDERKEY / (L_LINENUMBER - L_LINENUMBER)";
@@ -3533,7 +3469,7 @@ fn e2e_float_div_by_zero_in_filter_fails_like_native_exasol() {
 
 #[test]
 fn e2e_float_div_null_divisor_in_filter_returns_no_rows() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -3554,7 +3490,7 @@ fn e2e_float_div_null_divisor_in_filter_returns_no_rows() {
 
 #[test]
 fn e2e_float_div_guarded_by_a_non_zero_conjunct_matches_the_measured_outcome() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let guard = "(L_LINENUMBER - 1) <> 0";
@@ -3632,7 +3568,7 @@ fn e2e_float_div_guarded_by_a_non_zero_conjunct_matches_the_measured_outcome() {
 
 #[test]
 fn e2e_float_div_by_zero_in_aggregate_argument_fails() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -3662,12 +3598,12 @@ fn e2e_float_div_by_zero_in_aggregate_argument_fails() {
 
 #[test]
 fn test_greatest_least_propagate_null_argument() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let predicate_sql = format!(
         "SELECT COUNT(*) FROM {} WHERE LEAST(id, NULLIF(MOD(id, 5), 0)) IS NULL",
-        vs_table()
+        events_table()
     );
     let null_row_count = conn.query_scalar_i64(&predicate_sql);
     assert_eq!(
@@ -3685,7 +3621,7 @@ fn test_greatest_least_propagate_null_argument() {
 
     let value_sql = format!(
         "SELECT id, GREATEST(id, NULLIF(MOD(id, 5), 0)) FROM {} ORDER BY id",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&value_sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, greatest): {cols:?}");
@@ -3723,12 +3659,12 @@ fn test_greatest_least_propagate_null_argument() {
 
 #[test]
 fn test_concat_null_operand_concatenates_non_null_parts() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let value_sql = format!(
         "SELECT id, name || NULLIF(name, name) || '-suffix' FROM {} WHERE id <= 3 ORDER BY id",
-        vs_table()
+        events_table()
     );
     let cols = conn.query_columns(&value_sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, concat): {cols:?}");
@@ -3752,7 +3688,7 @@ fn test_concat_null_operand_concatenates_non_null_parts() {
 
     let filter_sql = format!(
         "SELECT COUNT(*) FROM {} WHERE (name || NULLIF(name, name)) = name",
-        vs_table()
+        events_table()
     );
     let filter_count = conn.query_scalar_i64(&filter_sql);
     assert_eq!(
@@ -3771,7 +3707,7 @@ fn test_concat_null_operand_concatenates_non_null_parts() {
     // Exasol's VARCHAR domain has no empty string, so an all-NULL CONCAT is NULL.
     let all_null_filter_sql = format!(
         "SELECT COUNT(*) FROM {} WHERE (NULLIF(name, name) || NULLIF(name, name)) IS NULL",
-        vs_table()
+        events_table()
     );
     let all_null_count = conn.query_scalar_i64(&all_null_filter_sql);
     assert_eq!(

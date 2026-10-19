@@ -7,7 +7,6 @@
 //! Two distinct OAuth2 client-credentials implementations are verified:
 //! `iceberg-catalog-rest`'s built-in client (createVirtualSchema enumeration) and
 //! the adapter's own `oauth2_client_credentials_grant` (scan/file resolution).
-#![cfg(feature = "lakekeeper-e2e")]
 
 mod common;
 

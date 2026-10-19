@@ -1,18 +1,14 @@
 //! Issue #350: Iceberg `list`/`struct`/`map` columns render as JSON and behave
 //! as the declared `VARCHAR(2000000)` in every pushdown shape.
-#![cfg(feature = "exasol-e2e")]
 
-mod common;
-use common::e2e_harness::*;
-use common::exasol_ws::ExaConn;
-use common::seed::{
+use crate::common::e2e_harness::*;
+use crate::common::seed::{
     COMPLEX_ROW_ALT, COMPLEX_ROW_EMPTY, COMPLEX_ROW_NULL, COMPLEX_ROW_POPULATED,
     COMPLEX_TOTAL_ROWS, E2E_COMPLEX_JOIN_TABLE, E2E_COMPLEX_TABLE, E2E_NAMESPACE,
-    seed_complex_types_join_probe, seed_complex_types_probe,
+    seed_complex_types_join_probe,
 };
-use common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
-};
+use crate::common::stack::iceberg_catalog_url;
+use crate::fixtures::{assert_pushed_to_scan_udf, complex_probe, runtime, stack};
 use serde_json::json;
 use std::sync::OnceLock;
 
@@ -22,28 +18,15 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
 fn setup() {
     SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        wait_for_seaweedfs();
-        wait_for_iceberg_catalog();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            seed_complex_types_probe(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed complex-types probe table");
-            seed_complex_types_join_probe(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed complex-types join partner table")
-        });
-
-        install_slc();
-        upload_so();
-        let mut conn = exa_conn();
-        create_schema_and_scripts(&mut conn);
-        create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, E2E_NAMESPACE));
+        stack();
+        complex_probe();
+        runtime()
+            .block_on(seed_complex_types_join_probe(
+                &iceberg_catalog_url(),
+                "s3://warehouse/",
+            ))
+            .expect("seed complex-types join partner table");
+        create_virtual_schema(&mut exa_conn(), &VsProps::new(VS_NAME, E2E_NAMESPACE));
     });
 }
 
@@ -209,14 +192,6 @@ fn iceberg_nested_columns_return_valid_json_end_to_end() {
         &items[row_index(COMPLEX_ROW_ALT)],
         Some(json!([{"a": 3}])),
         "ITEMS alt",
-    );
-}
-
-fn assert_pushed_to_scan_udf(conn: &mut ExaConn, sql: &str, shape: &str) {
-    let pushed = explain_virtual_sql(conn, sql);
-    assert!(
-        pushed.contains(SCAN_SCRIPT_NAME),
-        "{shape} must drive the scan UDF: {pushed}"
     );
 }
 

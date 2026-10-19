@@ -1,6 +1,5 @@
 //! `CATALOG_KIND = 'GLUE'` against real AWS Glue and S3 with a local Exasol. Run with
 //! `--test-threads=1`: the tests share one Exasol provisioning and one virtual schema name.
-#![cfg(feature = "glue-e2e")]
 
 mod common;
 

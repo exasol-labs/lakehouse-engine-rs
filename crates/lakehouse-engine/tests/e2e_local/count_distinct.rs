@@ -1,75 +1,26 @@
 //! E2E correctness for `COUNT(DISTINCT)` pushdown: the Case 1 native-merge
 //! fan-out and the Case 2/3 qualified single-table wrapper.
-#![cfg(feature = "exasol-e2e")]
 
-mod common;
-use common::e2e_harness::*;
-use common::exasol_ws::ExaConn;
-use common::seed::{
+use crate::common::e2e_harness::*;
+use crate::common::exasol_ws::ExaConn;
+use crate::common::seed::{
     DISTINCT_CATEGORY_COL, DISTINCT_CATEGORY_COUNT, DISTINCT_COMMENT_COL,
     DISTINCT_COMMENT_LENGTH_SUM, DISTINCT_REGION_COL, DISTINCT_REGION_COUNT, E2E_DISTINCT_TABLE,
-    E2E_HIGH_CARD_TABLE, E2E_NAMESPACE, E2E_TYPED_TABLE, HIGH_CARD_COL, HIGH_CARD_ROWS,
-    TYPED_COL_BOOL, TYPED_COL_DATE, TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, TYPED_COL_DOUBLE,
-    TYPED_COL_PRICE, TYPED_COL_QTY, TYPED_COL_TS, TYPED_COL_VARCHAR, seed_distinct_probe,
-    seed_events, seed_high_card_probe, seed_typed_distinct_probe, typed_bool_distinct,
-    typed_date_distinct, typed_decimal_a_distinct, typed_decimal_b_distinct, typed_double_distinct,
+    E2E_HIGH_CARD_TABLE, HIGH_CARD_COL, HIGH_CARD_ROWS, TYPED_COL_BOOL, TYPED_COL_DATE,
+    TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, TYPED_COL_DOUBLE, TYPED_COL_PRICE, TYPED_COL_QTY,
+    TYPED_COL_TS, TYPED_COL_VARCHAR, typed_bool_distinct, typed_date_distinct,
+    typed_decimal_a_distinct, typed_decimal_b_distinct, typed_double_distinct,
     typed_product_distinct, typed_ts_case_distinct, typed_ts_distinct, typed_varchar_char_distinct,
     typed_varchar_distinct, typed_varchar_upper_distinct,
 };
-use common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
-};
-
-use std::sync::OnceLock;
-
-const VS_NAME: &str = "MY_LAKEHOUSE";
-
-static SETUP_DONE: OnceLock<()> = OnceLock::new();
-
-fn setup_e2e() {
-    SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        wait_for_seaweedfs();
-        wait_for_iceberg_catalog();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            seed_events(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed Iceberg events table");
-            seed_distinct_probe(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed Iceberg distinct_probe table");
-            seed_high_card_probe(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed Iceberg high_card_probe table");
-            seed_typed_distinct_probe(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed Iceberg typed_distinct_probe table");
-        });
-
-        install_slc();
-        upload_so();
-
-        let mut conn = exa_conn();
-        create_schema_and_scripts(&mut conn);
-        create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, E2E_NAMESPACE));
-    });
-}
+use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, typed_table};
 
 fn distinct_table() -> String {
-    format!("{VS_NAME}.{}", E2E_DISTINCT_TABLE.to_uppercase())
+    format!("{LAKEHOUSE_VS}.{}", E2E_DISTINCT_TABLE.to_uppercase())
 }
 
 fn high_card_table() -> String {
-    format!("{VS_NAME}.{}", E2E_HIGH_CARD_TABLE.to_uppercase())
-}
-
-fn typed_table() -> String {
-    format!("{VS_NAME}.{}", E2E_TYPED_TABLE.to_uppercase())
+    format!("{LAKEHOUSE_VS}.{}", E2E_HIGH_CARD_TABLE.to_uppercase())
 }
 
 /// Case 2/3 cannot use per-distinct scalar subqueries (Exasol rejects an emitting
@@ -143,7 +94,7 @@ fn assert_count_distinct_fan_out_pushed_down(conn: &mut ExaConn, query_sql: &str
 
 #[test]
 fn count_distinct_dedups_across_shards_excludes_nulls_empty() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -186,7 +137,7 @@ fn count_distinct_dedups_across_shards_excludes_nulls_empty() {
 
 #[test]
 fn high_cardinality_count_distinct_completes() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -211,7 +162,7 @@ fn harness_reads_high_cardinality_result_set_to_completion() {
     // small budget is needed to force multiple fetches.
     const CHUNKED_FETCH_NUM_BYTES: u64 = 65_536;
 
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!("SELECT {HIGH_CARD_COL} FROM {}", high_card_table());
@@ -239,7 +190,7 @@ fn harness_reads_high_cardinality_result_set_to_completion() {
 
 #[test]
 fn q9b_multi_count_distinct_matches_single_node() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -286,7 +237,7 @@ fn q9b_multi_count_distinct_matches_single_node() {
 
 #[test]
 fn count_distinct_string_expression_argument_matches_single_node() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let upper_sql = format!(
@@ -318,7 +269,7 @@ fn count_distinct_string_expression_argument_matches_single_node() {
 
 #[test]
 fn count_distinct_expression_arg_combined_matches_single_node() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -368,7 +319,7 @@ fn count_distinct_expression_arg_combined_matches_single_node() {
 fn count_distinct_bare_column_type_matrix_matches_single_node() {
     // CHAR is absent: no Iceberg type maps to Exasol CHAR, so a bare CHAR column is
     // unreachable; a CHAR cast is covered in the wrapper test instead.
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let cases: [(&str, i64); 7] = [
@@ -395,7 +346,7 @@ fn count_distinct_bare_column_type_matrix_matches_single_node() {
 
 #[test]
 fn count_distinct_expression_arg_via_wrapper_matches_single_node() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let numeric_sql = format!(
@@ -464,7 +415,7 @@ fn count_distinct_expression_arg_via_wrapper_matches_single_node() {
 
 #[test]
 fn count_distinct_expression_arg_empty_returns_zero() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let scenarios: [(&str, String); 3] = [
@@ -502,7 +453,7 @@ fn count_distinct_expression_arg_empty_returns_zero() {
 
 #[test]
 fn count_distinct_all_files_pruned_returns_zero() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -521,7 +472,7 @@ fn count_distinct_all_files_pruned_returns_zero() {
 
 #[test]
 fn sum_all_files_pruned_returns_null() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!("SELECT SUM(id) FROM {} WHERE id > 1000", distinct_table());
@@ -537,7 +488,7 @@ fn sum_all_files_pruned_returns_null() {
 
 #[test]
 fn grouped_aggregate_all_files_pruned_returns_no_rows() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -556,7 +507,7 @@ const GROUND_TRUTH_DISTINCT_TABLE: &str = "GT_DISTINCT_PROBE";
 
 #[test]
 fn e2e_scalar_wrapped_count_distinct_routes_to_wrapper_and_matches_native_oracle() {
-    setup_e2e();
+    lakehouse_vs();
     let mut conn = exa_conn();
 
     let select_list = format!("ROUND(COUNT(DISTINCT {DISTINCT_REGION_COL}), 2)");

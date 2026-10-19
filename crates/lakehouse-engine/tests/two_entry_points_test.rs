@@ -1,5 +1,4 @@
 //! Gated under `exasol-e2e`: it inspects the release `.so` that `make test-e2e` builds first.
-#![cfg(feature = "exasol-e2e")]
 
 use std::path::PathBuf;
 use std::process::Command;

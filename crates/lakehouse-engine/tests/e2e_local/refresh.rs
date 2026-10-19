@@ -1,17 +1,15 @@
 //! Every test uses its own Iceberg namespace and Virtual Schema: these scenarios mutate the
 //! catalog out of band, and doing so in the shared `e2e_lakehouse` namespace would break every
-//! other E2E binary's `createVirtualSchema` for the rest of the Docker session.
-#![cfg(feature = "exasol-e2e")]
+//! other module's `createVirtualSchema` for the rest of the Docker session.
 
-mod common;
-use common::e2e_harness::*;
-use common::exasol_ws::ExaConn;
-use common::seed::{build_seed_catalog, rest_replace_current_schema};
-use common::stack::{
+use crate::common::e2e_harness::*;
+use crate::common::exasol_ws::ExaConn;
+use crate::common::seed::{build_seed_catalog, rest_replace_current_schema};
+use crate::common::stack::{
     CatalogConnectionPassword, build_create_connection_sql, iceberg_catalog_url,
-    iceberg_catalog_url_internal, local_stack_connection_password, wait_for_exasol,
-    wait_for_iceberg_catalog, wait_for_seaweedfs,
+    iceberg_catalog_url_internal, local_stack_connection_password,
 };
+use crate::fixtures::{runtime, stack, vs_table};
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -23,9 +21,9 @@ use iceberg_catalog_rest::RestCatalog;
 use serde_json::Value as Json;
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
-/// Distinct from other binaries' connection so the unreachable-catalog test's
+/// Distinct from other modules' connection so the unreachable-catalog test's
 /// `CREATE OR REPLACE CONNECTION` cannot race with them.
 const CATALOG_CONN_NAME: &str = "REFRESH_CATALOG_CREDS";
 
@@ -43,38 +41,11 @@ const NS_DROP: &str = "e2e_refresh_drop";
 const NS_OPTIONAL: &str = "e2e_refresh_optional";
 const NS_SWAP: &str = "e2e_refresh_swap";
 
-static SETUP_DONE: OnceLock<()> = OnceLock::new();
-
-fn setup_e2e() {
-    SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        wait_for_seaweedfs();
-        wait_for_iceberg_catalog();
-
-        install_slc();
-        upload_so();
-
-        let mut conn = exa_conn();
-        create_schema_and_scripts(&mut conn);
-    });
-}
-
 fn create_virtual_schema(conn: &mut ExaConn, vs_name: &str, namespace: &str) {
-    common::e2e_harness::create_virtual_schema(
+    crate::common::e2e_harness::create_virtual_schema(
         conn,
         &VsProps::new(vs_name, namespace).with_catalog_conn_name(CATALOG_CONN_NAME),
     );
-}
-
-fn vs_table(vs_name: &str, table_name: &str) -> String {
-    format!("{vs_name}.{}", table_name.to_uppercase())
-}
-
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
 }
 
 fn seed_catalog(rt: &tokio::runtime::Runtime, label: &str) -> RestCatalog {
@@ -132,7 +103,7 @@ async fn ensure_id_val_table(
     id: i64,
     val: f64,
 ) {
-    common::seed::create_and_append(
+    crate::common::seed::create_and_append(
         catalog,
         namespace,
         table_name,
@@ -187,9 +158,9 @@ async fn drop_table_if_exists(catalog: &impl Catalog, ns: &NamespaceIdent, table
 /// Scenario: Refresh re-enumerates the namespace and returns a refresh response
 #[test]
 fn refresh_reenumerates_namespace() {
-    setup_e2e();
-    let rt = rt();
-    let catalog = seed_catalog(&rt, "refresh-reenum");
+    stack();
+    let rt = runtime();
+    let catalog = seed_catalog(rt, "refresh-reenum");
 
     let reenum_ns = NamespaceIdent::new(NS_REENUM.to_string());
     rt.block_on(drop_table_if_exists(&catalog, &reenum_ns, "t_orig"));
@@ -232,9 +203,9 @@ fn refresh_reenumerates_namespace() {
 
 #[test]
 fn refresh_reflects_added_table_and_column_change() {
-    setup_e2e();
-    let rt = rt();
-    let catalog = seed_catalog(&rt, "refresh-colchange");
+    stack();
+    let rt = runtime();
+    let catalog = seed_catalog(rt, "refresh-colchange");
 
     rt.block_on(ensure_id_val_table(&catalog, NS_COLCHANGE, "evt", 1, 10.0));
 
@@ -284,9 +255,9 @@ fn refresh_reflects_added_table_and_column_change() {
 
 #[test]
 fn set_properties_retargets_namespace() {
-    setup_e2e();
-    let rt = rt();
-    let catalog = seed_catalog(&rt, "refresh-setprops");
+    stack();
+    let rt = runtime();
+    let catalog = seed_catalog(rt, "refresh-setprops");
 
     rt.block_on(ensure_id_val_table(
         &catalog,
@@ -352,9 +323,9 @@ fn set_properties_retargets_namespace() {
 
 #[test]
 fn refresh_unreachable_catalog_redacts_credentials() {
-    setup_e2e();
-    let rt = rt();
-    let catalog = seed_catalog(&rt, "refresh-unreachable");
+    stack();
+    let rt = runtime();
+    let catalog = seed_catalog(rt, "refresh-unreachable");
     rt.block_on(ensure_id_val_table(
         &catalog,
         NS_UNREACHABLE,
@@ -415,9 +386,9 @@ fn refresh_unreachable_catalog_redacts_credentials() {
 
 #[test]
 fn refresh_partial_requested_tables_still_refreshes_whole_namespace() {
-    setup_e2e();
-    let rt = rt();
-    let catalog = seed_catalog(&rt, "refresh-partial");
+    stack();
+    let rt = runtime();
+    let catalog = seed_catalog(rt, "refresh-partial");
 
     rt.block_on(ensure_id_val_table(
         &catalog,
@@ -501,9 +472,9 @@ fn refresh_partial_requested_tables_still_refreshes_whole_namespace() {
 
 #[test]
 fn refresh_flatten_collision_returns_same_error_as_create() {
-    setup_e2e();
-    let rt = rt();
-    let catalog = seed_catalog(&rt, "refresh-collision");
+    stack();
+    let rt = runtime();
+    let catalog = seed_catalog(rt, "refresh-collision");
 
     let top_ns = NamespaceIdent::new(NS_COLLISION.to_string());
     let eu_ns = NamespaceIdent::from_vec(vec![NS_COLLISION.to_string(), "eu".to_string()])
@@ -615,7 +586,7 @@ async fn fresh_table(
     files: Vec<RecordBatch>,
 ) {
     drop_table_if_exists(catalog, &NamespaceIdent::new(namespace.to_string()), table).await;
-    common::seed::create_and_append_files(
+    crate::common::seed::create_and_append_files(
         catalog,
         namespace,
         table,
@@ -651,7 +622,7 @@ async fn evolve_schema(
 /// Writes one data file under the table's current schema.
 async fn append_file(catalog: &impl Catalog, namespace: &str, table: &str, batch: RecordBatch) {
     let loaded = load(catalog, namespace, table).await;
-    common::seed::write_one_file_append(catalog, &loaded, table, [batch])
+    crate::common::seed::write_one_file_append(catalog, &loaded, table, [batch])
         .await
         .unwrap_or_else(|e| panic!("append to {namespace}.{table}: {e}"));
 }
@@ -663,9 +634,9 @@ fn source_type(notes: &[(String, Json)], column: &str) -> Json {
 /// Scenario: Every declared column carries its source shape in its adapterNotes
 #[test]
 fn iceberg_columns_persist_source_notes() {
-    setup_e2e();
-    let rt = rt();
-    let catalog = seed_catalog(&rt, "refresh-notes");
+    stack();
+    let rt = runtime();
+    let catalog = seed_catalog(rt, "refresh-notes");
     let fields = [long_field(1, "id", true), long_field(2, "score", false)];
     rt.block_on(fresh_table(
         &catalog,
@@ -700,9 +671,9 @@ fn iceberg_columns_persist_source_notes() {
 /// Scenario: Refresh and set properties rebuild every column note from the source
 #[test]
 fn refresh_and_set_properties_rebuild_column_notes_from_the_source() {
-    setup_e2e();
-    let rt = rt();
-    let catalog = seed_catalog(&rt, "refresh-renotes");
+    stack();
+    let rt = runtime();
+    let catalog = seed_catalog(rt, "refresh-renotes");
     let fields = [long_field(1, "id", true), long_field(2, "score", false)];
     rt.block_on(fresh_table(
         &catalog,
@@ -743,9 +714,9 @@ fn refresh_and_set_properties_rebuild_column_notes_from_the_source() {
 /// Scenario: A column renamed at the source after the last REFRESH reads under its declared name
 #[test]
 fn renamed_iceberg_column_reads_under_its_declared_name() {
-    setup_e2e();
-    let rt = rt();
-    let catalog = seed_catalog(&rt, "refresh-rename");
+    stack();
+    let rt = runtime();
+    let catalog = seed_catalog(rt, "refresh-rename");
     let fields = [long_field(1, "id", true), long_field(2, "score", false)];
     rt.block_on(fresh_table(
         &catalog,
@@ -783,9 +754,9 @@ fn renamed_iceberg_column_reads_under_its_declared_name() {
 /// Scenario: A column dropped at the source after the last REFRESH reads what older data files store
 #[test]
 fn dropped_iceberg_column_reads_what_older_files_store() {
-    setup_e2e();
-    let rt = rt();
-    let catalog = seed_catalog(&rt, "refresh-drop");
+    stack();
+    let rt = runtime();
+    let catalog = seed_catalog(rt, "refresh-drop");
     let fields = [
         long_field(1, "id", true),
         long_field(2, "note", false),
@@ -853,9 +824,9 @@ fn dropped_iceberg_column_reads_what_older_files_store() {
 /// Scenario: A declared required column that the current schema marks optional fails the query
 #[test]
 fn iceberg_column_made_optional_after_refresh_fails_until_refresh() {
-    setup_e2e();
-    let rt = rt();
-    let catalog = seed_catalog(&rt, "refresh-optional");
+    stack();
+    let rt = runtime();
+    let catalog = seed_catalog(rt, "refresh-optional");
     let fields = [long_field(1, "id", true), long_field(2, "qty", true)];
     rt.block_on(fresh_table(
         &catalog,
@@ -899,9 +870,9 @@ fn iceberg_column_made_optional_after_refresh_fails_until_refresh() {
 /// Scenario: A filter column resolves through its declared field id
 #[test]
 fn filter_on_rename_swapped_iceberg_columns_prunes_by_declared_field_id() {
-    setup_e2e();
-    let rt = rt();
-    let catalog = seed_catalog(&rt, "refresh-swap");
+    stack();
+    let rt = runtime();
+    let catalog = seed_catalog(rt, "refresh-swap");
     let fields = [long_field(1, "a", false), long_field(2, "b", false)];
     rt.block_on(fresh_table(
         &catalog,

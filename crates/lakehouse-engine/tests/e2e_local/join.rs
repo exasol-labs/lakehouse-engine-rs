@@ -1,18 +1,14 @@
 //! E2E inner equi-join pushdown tests: broadcast join and the unaccelerated fallback,
 //! which must return identical results. Fail, never skip, without the stack.
-#![cfg(feature = "exasol-e2e")]
 
-mod common;
-use common::e2e_harness::*;
-use common::exasol_ws::ExaConn;
-use common::seed::{
+use crate::common::e2e_harness::*;
+use crate::common::exasol_ws::ExaConn;
+use crate::common::seed::{
     DIM_CUSTOMER_ROWS, E2E_BLANK_LABEL_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE,
     E2E_SUPPLIER_TABLE, FACT_ORDERS_ROWS, LINEITEM_ROWS, O_TOTALPRICE_PS, order_custkey,
-    order_date_days, order_totalprice_unscaled, seed_events,
+    order_date_days, order_totalprice_unscaled,
 };
-use common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
-};
+use crate::fixtures::{events, stack};
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -26,25 +22,9 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
 fn setup_e2e() {
     SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        wait_for_seaweedfs();
-        wait_for_iceberg_catalog();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            seed_events(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed Iceberg star-schema tables")
-        });
-
-        install_slc();
-        upload_so();
-
+        stack();
+        events();
         let mut conn = exa_conn();
-        create_schema_and_scripts(&mut conn);
         // Each `create_virtual_schema` re-issues the catalog CONNECTION idempotently.
         create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, E2E_NAMESPACE));
         create_virtual_schema(

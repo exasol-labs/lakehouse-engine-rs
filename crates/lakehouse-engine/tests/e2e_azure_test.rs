@@ -4,7 +4,6 @@
 //! `adls` profile can't address it. The container is created under an Entra ID
 //! service principal because the Azure blob crate accepts no account key. Tests
 //! share one Exasol provisioning and run with `--test-threads=1`.
-#![cfg(feature = "azure-e2e")]
 
 mod common;
 

@@ -1,13 +1,10 @@
-#![cfg(feature = "exasol-e2e")]
-
-mod common;
-use common::e2e_harness::*;
-use common::exasol_ws::ExaConn;
-use common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, seed_events};
-use common::stack::{
-    exasol_host, exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal,
-    local_stack_connection_password, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
+use crate::common::e2e_harness::*;
+use crate::common::exasol_ws::ExaConn;
+use crate::common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS};
+use crate::common::stack::{
+    exasol_host, exasol_sql_port, iceberg_catalog_url_internal, local_stack_connection_password,
 };
+use crate::fixtures::{events, stack};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const CONN_NAME: &str = "CREDEXP_CATALOG_CREDS";
@@ -54,25 +51,10 @@ fn scan_grant_sql(verb: &str, preposition: &str) -> String {
 
 fn setup_e2e() {
     SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        wait_for_seaweedfs();
-        wait_for_iceberg_catalog();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            seed_events(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed");
-        });
-
-        install_slc();
-        upload_so();
+        stack();
+        events();
 
         let mut sys = exa_conn();
-        create_schema_and_scripts(&mut sys);
 
         let _ = sys.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {VS_NAME} CASCADE"));
         sys.execute(&format!("DROP USER IF EXISTS {READER_USER} CASCADE"));

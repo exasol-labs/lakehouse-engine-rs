@@ -1,7 +1,6 @@
 //! TPC-H data loader for the live benchmark (not part of `make test-e2e`); run by
 //! `bench/run.sh`. Columns are built by hand from `tpchgen` core because `tpchgen-arrow`
 //! has no arrow-58 release. Idempotent: tables that already have data files are skipped.
-#![cfg(feature = "exasol-e2e")]
 
 mod common;
 
