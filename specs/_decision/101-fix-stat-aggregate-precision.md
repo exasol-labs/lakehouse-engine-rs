@@ -5,7 +5,6 @@
 **ID:** stat-aggregates-merge-mean-and-m2-in-double
 **Plan:** fix-stat-aggregate-precision
 **Status:** Accepted
-**Supersedes:** stddev-variance-pushdown-via-count-sum-sum-sq-sufficient-statistics
 
 ### Context
 

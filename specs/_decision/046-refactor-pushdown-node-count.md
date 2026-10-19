@@ -5,7 +5,6 @@
 **ID:** adapternotes-admits-only-create-time-values-a-pushdown-cannot-recompute
 **Plan:** refactor-pushdown-node-count
 **Status:** Accepted
-**Supersedes:** source-cluster-node-count-from-udfcontext-node-count-not-a-connect-back-select-nproc-supersedes-adr-006
 
 ### Context
 

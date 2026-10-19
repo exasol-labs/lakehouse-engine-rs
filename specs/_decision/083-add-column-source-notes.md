@@ -33,7 +33,6 @@ Each format reader derives a table's schema again at every pushdown, and the der
 **ID:** unity-parquet-catalog-schema-classified-at-create
 **Plan:** add-column-source-notes
 **Status:** Accepted
-**Supersedes:** unity-parquet-schema-from-catalog-not-footer
 
 ### Context
 

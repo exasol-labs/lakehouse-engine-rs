@@ -1,39 +1,10 @@
 # Decisions: fix-vs-expression-dialect
 
-## ADR: One gated dispatch owns the Exasol-dialect rendering rule
-
-**ID:** exasol-dialect-render-what-exasol-sent
-**Plan:** fix-vs-expression-dialect
-**Status:** Accepted
-
-### Context
-
-The `vs-expression` walker takes a `Dialect` parameter, but only the CAST target renderer read it, and every other arm rendered the DataFusion form. The question of which parser reads a fragment was answered separately in three places (CAST, `MOD` in #197, string functions in #210) and not at all elsewhere, which caused issue #209.
-
-### Decision
-
-In the Exasol dialect, `vs-expression` renders what Exasol sent, and one gate ahead of the whole `function_scalar` dispatch owns that rule through a single declaration. The math family, field-shortcut date functions, `WEEK`, `*_BETWEEN`, `DATE_TRUNC`, `TO_DATE`, `TO_TIMESTAMP`, `GREATEST`, `LEAST`, `NULLIF`, `NULLIFZERO`, and `ZEROIFNULL` are declared there. Declared `Shaped` constructs and node types outside `function_scalar` branch inline on the dialect, as the #197 `MOD` fix does.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Per-dialect name lookup table | Rejected: a second mechanism that cannot express the `EXTRACT`, `REGEXP_LIKE`, and timestamp-literal shape changes |
-| A `Dialect` trait with two implementations | Rejected: the dialects differ in about a dozen of fifty arms, so two implementations would duplicate the rest and drift |
-| A private dialect match inside each affected arm | Rejected: scatters one decision across ten arms with no inheritance point |
-
-### Consequences
-
-The names and their Exasol forms live in one declaration, and exclusions are stated there instead of implied by arm order, which left `SIGN` rendering `signum(...)` in the Exasol dialect.
-
-The verbatim rule covers every Exasol-native scalar function, including those that already parse, and the Exasol arm forwards arguments without an arity check.
-
 ## ADR: One declaration gates the function_scalar dispatch and drives the sweep table
 
 **ID:** declaration-gates-dispatch-and-sweep
 **Plan:** fix-vs-expression-dialect
 **Status:** Accepted
-**Supersedes:** exasol-dialect-render-what-exasol-sent
 
 ### Context
 
@@ -81,36 +52,11 @@ The adapter withdraws `FN_CURRENT_DATE`, `FN_CURRENT_TIMESTAMP`, `FN_SYSDATE`, a
 
 Predicates containing a now-family name are applied by Exasol over returned rows, and three of the four lose select-list pushdown. Other date/time capabilities stay advertised because they take their value from their arguments. The lost pushdown returned wrong values. Restoring it with full time-zone fidelity is issue #263.
 
-## ADR: One declared name set closes the gate/dispatch mapping gap review found
-
-**ID:** one-declared-name-set-for-gate-and-sweep-test
-**Plan:** fix-vs-expression-dialect
-**Status:** Accepted
-
-### Context
-
-The translated-name set existed twice: in the guarded arm's inline list and across the DataFusion arms, with nothing enforcing agreement.
-
-### Decision
-
-The eligible names are declared once in a flat set, read by both the guarded arm and the sweep assertion, so drift fails a test.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Keep the inline list and add a comment | Rejected: does not close the drift risk |
-
-### Consequences
-
-A name missing from the set is undeclared in both dialects. A later per-name declaration superseded this flat set (see `translated-scalar-fns-declaration-gates-dispatch-and-sweep`).
-
 ## ADR: The declaration is rewritten into a structural, per-name form after a second review round
 
 **ID:** translated-scalar-fns-declaration-gates-dispatch-and-sweep
 **Plan:** fix-vs-expression-dialect
 **Status:** Accepted
-**Supersedes:** one-declared-name-set-for-gate-and-sweep-test
 
 ### Context
 

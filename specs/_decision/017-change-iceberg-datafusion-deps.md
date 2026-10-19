@@ -5,7 +5,6 @@
 **ID:** pin-iceberg-0-10-0-via-crates-io-registry-version-not-git-tag
 **Plan:** change-iceberg-datafusion-deps
 **Status:** Accepted
-**Supersedes:** pin-iceberg-0-10-0-rc-2-via-git-tag-not-a-crates-io-exact-version-pin
 
 ### Context
 

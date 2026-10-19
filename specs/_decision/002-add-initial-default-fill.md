@@ -24,4 +24,3 @@ The scan returns the defined `initial-default` for an absent field, whether the 
 
 The scenario "nullable absent column is NULL-filled" applies only when the column defines no default.
 
----

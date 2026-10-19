@@ -51,66 +51,11 @@ An approximate sketch (HyperLogLog, about 1-2% error) could scale `COUNT(DISTINC
 
 Every scaling fix for this function must preserve byte-exact results.
 
-## ADR: Apply to every query shape via dedicated per-distinct fan-outs
-
-**ID:** count-distinct-per-distinct-fan-outs
-**Plan:** `fix-count-distinct-shard-cap`
-**Status:** Accepted
-
-> Superseded by `count-distinct-case-2-3-row-scan-fallback`: Exasol rejects an emitting UDF nested in a scalar subquery at compile time (`sqlCode 04000`). Case 1 (a lone single-group `COUNT(DISTINCT)`) is unaffected.
-
-### Context
-
-A distinct column needs one row per local distinct value, which does not fit the one-row-per-shard partial-aggregate shape.
-
-### Decision
-
-Every `COUNT(DISTINCT col)` gets its own fan-out, composed as an independent SELECT-list scalar subquery (Case 2). Non-distinct aggregates keep their shared partial-aggregate scan, with distinct subqueries added (Case 3).
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Support only the single-distinct repro shape | Rejected: too narrow a fix |
-
-### Consequences
-
-Exasol does not compile this design for any multi-distinct or mixed-aggregate shape. `count-distinct-case-2-3-row-scan-fallback` and then `count-distinct-case-2-3-qualified-wrapper` replace it.
-
-## ADR: Case 2/3 declines to the row-scan fallback
-
-**ID:** count-distinct-case-2-3-row-scan-fallback
-**Plan:** `fix-count-distinct-shard-cap`
-**Status:** Accepted
-**Supersedes:** count-distinct-per-distinct-fan-outs
-
-> Superseded by `count-distinct-case-2-3-qualified-wrapper`: the decline trigger is unchanged, but a bare row scan assumed Exasol re-aggregates a declined pushdown, which is false.
-
-### Context
-
-Exasol rejects an emitting UDF call nested in a SELECT-list scalar subquery at compile time (`sqlCode 04000`). No composition of scalar-subquery UDF calls in one SELECT list can work.
-
-### Decision
-
-Case 1 (exactly one single-group `COUNT(DISTINCT)`, nothing else) is unchanged. Case 2/3 (more than one distinct item, or a distinct beside an ordinary aggregate) declines pushdown and falls back to the plain single-group row scan.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Another scalar-subquery composition | Rejected: every shape nests an emitting UDF in a scalar subquery |
-| UNION-ALL of fan-outs plus outer grouping | Rejected: more complex than the row-scan fallback |
-
-### Consequences
-
-Case 2/3 streams the referenced columns' rows, so more rows cross the wire than with a fan-out.
-
 ## ADR: Case 2/3 routes to a qualified single-table wrapper
 
 **ID:** count-distinct-case-2-3-qualified-wrapper
 **Plan:** `fix-count-distinct-shard-cap`
 **Status:** Accepted
-**Supersedes:** count-distinct-case-2-3-row-scan-fallback
 
 ### Context
 

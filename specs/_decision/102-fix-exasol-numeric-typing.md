@@ -31,7 +31,6 @@ One constructor builds every scan session, and any planning that derives the sca
 **ID:** scan-functions-share-a-session-failure-slot
 **Plan:** fix-exasol-numeric-typing
 **Status:** Accepted
-**Supersedes:** checked-float-division-session-scoped-failure-recording
 
 ### Context
 

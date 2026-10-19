@@ -5,7 +5,6 @@
 **ID:** checked-float-division-rendering-layer-fix
 **Plan:** fix-float-div-predicate-divzero
 **Status:** Accepted
-**Supersedes:** float-div-zero-behaviour-from-measurement-not-emulation
 
 ### Context
 
@@ -60,7 +59,6 @@ A consumer that forgets to register the function fails loudly at first use.
 **ID:** checked-float-division-drops-datafusion-cast
 **Plan:** fix-float-div-predicate-divzero
 **Status:** Accepted
-**Supersedes:** float-div-cast-datafusion-dialect-only
 
 ### Context
 
@@ -106,30 +104,3 @@ Both directions are one tracked exception, issue #392, cited inline in both spec
 
 The wrong row count of issue #370 is removed in both directions. The over-raise direction can turn a working query into an intermittent failure, so it is recorded.
 
-## ADR: The checked division records its first failure on the session because the Parquet row filter destroys the error type
-
-**ID:** checked-float-division-session-scoped-failure-recording
-**Plan:** fix-float-div-predicate-divzero
-**Status:** Superseded by scan-functions-share-a-session-failure-slot
-
-### Context
-
-`datafusion-datasource-parquet` flattens any predicate error into a text-only `ArrowError::ComputeError`, so a checked division raised in a predicate pushed into the Parquet row filter, issue #370's route, reaches `classify_scan_error` looking like a storage failure.
-
-### Decision
-
-The checked division records its first failure as a typed `CheckedFloatDivError` in a `OnceLock` on the registered UDF instance. `session_checked_float_div_failure` reads it through the session's function registry. `run_scan_dispatch`, the dispatcher for all three run paths, calls `emit::reframe_checked_division` once on a failed scan. The reframing replaces the surfaced failure with the division, except for a memory exhaustion, where it reports the division first and then the memory exhaustion, both redacted. `ResourcesExhausted` is the one case recognised from the typed error root before any text exists.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Rely on the DataFusion error chain | Rejected: does not survive the Parquet row filter |
-| Recover the value from the flattened error text | Rejected: couples to DataFusion's wording |
-| Process-global `static` or `LazyLock` | Rejected: violates the stateless-UDF rule, and one query's division would leak into the next scan |
-| Thread an `Arc<OnceLock<...>>` through `build_session_context` | Rejected: `build_session` is an injected test seam, and every substituting test would change signature |
-| Compose with every incoming classification | Rejected: live E2E showed the row-filter route's surfaced failure is the same division under storage framing, so composing republished that framing |
-
-### Consequences
-
-An unrelated storage failure in another partition of a scan that also divided by zero is masked, because DataFusion surfaces one partition's error. This is rarer than issue #370's route and never observed live. Recovering it needs a channel that survives `UdfError`, which carries only a `String`, so revisit it if a live case appears.

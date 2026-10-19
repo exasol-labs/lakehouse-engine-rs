@@ -5,7 +5,6 @@
 **ID:** two-vended-static-selectors-on-disjoint-inputs
 **Plan:** `change-vended-storage-resolution-scheme-driven`
 **Status:** Accepted
-**Supersedes:** storage-backend-exhaustive-variant-naming-owners
 
 ### Context
 
@@ -52,28 +51,3 @@ The resolved `ALLOW_HTTP` virtual-schema property is passed into `resolve_vended
 
 Passing the value adds a 4-tuple to `resolve_connection_config` (2 call sites) and one boolean to four functions, following the convention for `s3_max_connections` and the DataFusion tuning knobs. Removing `ALLOW_HTTP` from the vended path was a planner decision, not an interview outcome.
 
-## ADR: Per-side scheme selection needs a plan-time join guard scoped to variant and account, not full backend equality
-
-**ID:** join-backend-guard-scoped-to-variant-and-account
-**Plan:** `change-vended-storage-resolution-scheme-driven`
-**Status:** Accepted
-
-### Context
-
-Each join side resolves its own storage, but the scan spec keeps only the primary side's storage, and the registration backend is shared by every side. That was safe only while both sides took their variant from one `storage_block` output. With per-side scheme selection, an `s3://` fact joined to an `abfss://` dimension would run the S3 arm over Azure files, and two `abfss://` sides on different accounts would read one through the other's account and SAS. `validate_sides_share_one_store` misses both cases because different schemes produce different registry keys.
-
-### Decision
-
-`plan_join` calls a pure function, `validate_sides_share_one_backend`, right after per-side resolution and before the empty-side shortcut. It compares each side's storage with the first side's by variant and, for `Adls`, by `account_name`, and errors naming the differing variants and accounts with no credential value.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Inline guard in `plan_join` | Rejected: the backends are outputs of live catalog I/O, so no unit test could supply them |
-| Guard on full backend equality, including per-prefix vended credentials | Rejected: could break every vended join against a catalog that mints per-table STS keys, which is unverified |
-| Leave the collapse unguarded | Rejected: reads one side's files through another side's backend with no error |
-
-### Consequences
-
-Joins whose sides select the same backend are unchanged. The existing per-prefix vended-credential collapse in `join_fan_out_scan_spec` stays out of scope, tracked as issue #294, because widening the guard needs its own live verification.

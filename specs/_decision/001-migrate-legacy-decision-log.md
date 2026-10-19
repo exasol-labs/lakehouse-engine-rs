@@ -105,61 +105,6 @@ Every Iceberg column is surfaced. A future type addition must update both code s
 
 ---
 
-## ADR: Cluster Node Count Captured Once at createVirtualSchema via adapterNotes
-
-**ID:** cluster-node-count-captured-once-at-createvirtualschema-via-adapternotes
-**Plan:** `add-multinode-sharding-and-agg-pushdown`
-**Status:** Superseded by source-cluster-node-count-from-udfcontext-node-count-not-a-connect-back-select-nproc-supersedes-adr-006
-
-### Context
-
-The adapter needs the cluster node count at pushdown time to choose the shard count, without a per-query connect-back. Exasol 2025.2.1 silently drops adapter-returned `schemaMetadata.properties`, but it persists `adapterNotes` and returns them on every pushdown request.
-
-### Decision
-
-The adapter runs `SELECT NPROC()` over connect-back once during `createVirtualSchema` and stores it as `CLUSTER_NODES` in `adapterNotes`, defaulting to 1 on failure. Pushdown reads `CLUSTER_NODES` to choose the shard count.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Store the count in `schemaMetadata.properties` | Rejected: Exasol drops adapter-returned properties |
-| Fetch `NPROC()` on every pushdown | Rejected: adds connect-back latency for a value stable over the VS lifetime |
-| Require a static node-count property | Rejected: error-prone and drifts as the cluster scales |
-
-### Consequences
-
-Pushdown has no connect-back overhead. The default of 1 keeps single-node execution unchanged when the cluster is single-node or the connect-back fails.
-
----
-
-## ADR: IPROC Fan-Out via Derived VALUES + GROUP BY IPROC(), shard_key
-
-**ID:** iproc-fan-out-via-derived-values-group-by-iproc-shard-key
-**Plan:** `add-multinode-sharding-and-agg-pushdown`
-**Status:** Accepted
-
-### Context
-
-The adapter must distribute N file shards across N cluster nodes so each node's UDF invocation scans only its shard. Grouping over `IPROC()` makes Exasol route each group to a distinct node when driving a SET UDF.
-
-### Decision
-
-The fan-out is one scan-driving query: a derived `VALUES` table of `(shard_key, per-shard ScanSpec)` rows, with the scan SET UDF invoked under `GROUP BY IPROC(), shard_key`.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| UNION ALL of N UDF SELECTs | Rejected: does not guarantee node placement and grows the SQL with shard count |
-| One UDF row per file | Rejected: no node-level batching and loses shard-level locality |
-
-### Consequences
-
-Exasol guarantees node placement, and more shards add `VALUES` rows without changing the query structure.
-
----
-
 ## ADR: Partial/Merge Aggregate Decomposition; AVG as (sum, count) Pair
 
 **ID:** partial-merge-aggregate-decomposition-avg-as-sum-count-pair
@@ -274,7 +219,6 @@ Nodes with tmpfs `/tmp` get a clean error instead of a crash. The 0.6 fraction l
 **ID:** oversubscribed-group-by-shard-key-work-unit-sharding-supersedes-adr-007
 **Plan:** `add-group-by-and-sql-comprehension`
 **Status:** Accepted
-**Supersedes:** iproc-fan-out-via-derived-values-group-by-iproc-shard-key
 
 ### Context
 
@@ -320,33 +264,6 @@ Every name in `CAPABILITIES` must have a correct path: a translator arm that emi
 ### Consequences
 
 A new `FN_*` entry needs its translator arm or decomposition first.
-
----
-
-## ADR: STDDEV/VARIANCE Pushdown via (count, sum, sum_sq) Sufficient Statistics
-
-**ID:** stddev-variance-pushdown-via-count-sum-sum-sq-sufficient-statistics
-**Plan:** `add-capability-alignment`
-**Status:** Accepted
-
-### Context
-
-STDDEV and VARIANCE are not shard-associative, but `COUNT(col)`, `SUM(col)`, and `SUM(col*col)` each merge via SUM and together reconstruct variance exactly.
-
-### Decision
-
-The STDDEV and VARIANCE family is advertised by emitting a `(COUNT, SUM, SUM of squares)` triple per shard. The outer wrapper computes variance as `(SUM(sum_sq) - SUM(sum)^2/SUM(cnt)) / d`, with `d` equal to the count for population forms and count minus 1 for sample forms. Standard deviation is its square root, with NULL guards for zero and single-sample counts.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Average per-shard standard deviations | Rejected: incorrect for unequal shard sizes |
-| Skip statistical aggregates | Rejected: leaves supportable capabilities off |
-
-### Consequences
-
-The wrapper SQL carries three partial columns per statistical aggregate and the NULL guards that avoid division by zero and negative radicands.
 
 ---
 
@@ -402,34 +319,6 @@ Files are sorted by size descending, with size 0 treated as 1 byte, and each is 
 ### Consequences
 
 A zero-size file counts as 1 byte, so it goes to the lightest shard and is never dropped.
-
----
-
-## ADR: Hardware-Aware Default Parallelism Factor (`max(NR_OF_CORES × 2, 8)`)
-
-**ID:** hardware-aware-default-parallelism-factor-max-nr-of-cores-2-8
-**Plan:** `change-shard-parallelism`
-**Status:** Superseded by source-per-node-core-count-from-available-parallelism-not-the-bogus-param-value-nr-of-cores-connect-back-query-supersedes-the-core-count-capture-in-adr-023
-
-### Context
-
-The default `PARALLELISM_FACTOR` was the constant 8. Per-node parallelism is bounded by a VM pool sized to `NR_OF_CORES`, so a fixed default under-subscribes large nodes and may over-subscribe tiny ones.
-
-### Decision
-
-The adapter reads `NR_OF_CORES` with `SELECT PARAM_VALUE('NR_OF_CORES')` during `createVirtualSchema`, in the existing connect-back session. The default `PARALLELISM_FACTOR` is `max(NR_OF_CORES × 2, 8)`, and an explicit property overrides it.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Keep the constant 8 | Rejected: unrelated to the node's core pool |
-| Multiplier of 1 | Rejected: no headroom to absorb stragglers |
-| Multiplier of 4 | Rejected: excessive session-startup overhead |
-
-### Consequences
-
-The floor of 8 keeps a single-core VM or a failed lookup (0) from collapsing the factor.
 
 ---
 
@@ -908,40 +797,11 @@ Null-fill, cast, and error behavior stay in sync with DataFusion upgrades.
 
 ---
 
-## ADR: Source Cluster Node Count from `UdfContext::node_count()`, Not a Connect-Back `SELECT NPROC()` (Supersedes ADR-006)
-
-**ID:** source-cluster-node-count-from-udfcontext-node-count-not-a-connect-back-select-nproc-supersedes-adr-006
-**Plan:** `fix-createvs-cores-nodecount`
-**Status:** Accepted
-**Supersedes:** cluster-node-count-captured-once-at-createvirtualschema-via-adapternotes
-
-### Context
-
-The node count came from `SELECT NPROC()` over connect-back, in a closure whose `?` also propagated the failure of the sibling `PARAM_VALUE('NR_OF_CORES')` query. `PARAM_VALUE` is not a real Exasol function and always errors, so the valid node count was discarded and `(cluster_nodes, nr_of_cores)` collapsed to `(1, 0)` on every real cluster (#32). SDK 0.20.0 exposes `UdfContext::node_count()` from the live handshake.
-
-### Decision
-
-The adapter reads the node count from `UdfContext::node_count()` in-process. The value `0` (no live handshake) maps to a `CLUSTER_NODES` default of 1, and any live value is used as is. The connect-back branch, the `CONNECTION_NAME` VS property, and the `SELECT NPROC()` query are deleted, with no fallback.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Keep `SELECT NPROC()` over connect-back | Rejected: root cause of #32 and less reliable than an in-process read |
-| Keep connect-back as a fallback behind `node_count()` | Rejected: connect-back served only topology, and a fallback reintroduces the fragile SQL path |
-
-### Consequences
-
-Topology discovery opens no SQL session. Existing VS instances that set `CONNECTION_NAME` ignore it silently. `CATALOG_CONNECTION` is untouched.
-
----
-
 ## ADR: Source Per-Node Core Count from `available_parallelism()`, Not the Bogus `PARAM_VALUE('NR_OF_CORES')` Connect-Back Query (Supersedes the Core-Count Capture in ADR-023)
 
 **ID:** source-per-node-core-count-from-available-parallelism-not-the-bogus-param-value-nr-of-cores-connect-back-query-supersedes-the-core-count-capture-in-adr-023
 **Plan:** `fix-createvs-cores-nodecount`
 **Status:** Accepted
-**Supersedes:** hardware-aware-default-parallelism-factor-max-nr-of-cores-2-8
 
 ### Context
 
@@ -1446,33 +1306,6 @@ Empty and non-empty column shapes cannot drift apart. Unit tests cover each plan
 
 ---
 
-## ADR: Pin iceberg 0.10.0-rc.2 via git tag, not a crates.io exact-version pin
-
-**ID:** pin-iceberg-0-10-0-rc-2-via-git-tag-not-a-crates-io-exact-version-pin
-**Plan:** `change-iceberg-rust-0-10-bump`
-**Status:** Superseded by pin-iceberg-0-10-0-via-crates-io-registry-version-not-git-tag
-
-### Context
-
-The iceberg-rust release candidate is a pre-release whose API can still change. crates.io does not publish it, so it resolves only as a git tag of `apache/iceberg-rust`. A later release candidate or GA bump should be deliberate and reviewed.
-
-### Decision
-
-The `iceberg`, `iceberg-catalog-rest`, and `iceberg-storage-opendal` dependencies are pinned to the release candidate's git tag, not a crates.io version.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Exact crates.io version | Rejected: crates.io does not publish this version |
-| Bare commit `rev` | Rejected: loses the human-readable tag |
-
-### Consequences
-
-The pin is immutable and self-documenting, and a later bump is an explicit edit, not a `cargo update` side effect.
-
----
-
 ## ADR: Drop `tpchgen-arrow`; build arrow-58 batches from `tpchgen` core directly
 
 **ID:** drop-tpchgen-arrow-build-arrow-58-batches-from-tpchgen-core-directly
@@ -1527,32 +1360,6 @@ Each shard reads the dimension side itself, bounded by `JOIN_BROADCAST_MAX_BYTES
 
 ---
 
-## ADR: Ineligible Joins Fall Back to Deterministic Unaccelerated SQL, Not an Error
-
-**ID:** ineligible-joins-fall-back-to-deterministic-unaccelerated-sql-not-an-error
-**Plan:** `add-join-pushdown-broadcast`
-**Status:** Accepted
-
-### Context
-
-Capabilities are advertised once and statically. Once `JOIN`, `JOIN_TYPE_INNER`, and `JOIN_CONDITION_EQUI` are advertised, Exasol pushes every inner equi-join to the adapter, including shapes the broadcast contract does not cover. Those must not regress working join queries.
-
-### Decision
-
-For an inner equi-join it cannot broadcast, the adapter emits SQL that scans each table through its own sharded fan-out subquery and lets Exasol join the results. A hard error is reserved for when even that fallback SQL cannot be built. ADR-085 corrects the fallback's rendering without changing this routing.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Decline ineligible joins with an error and rely on Exasol re-planning | Rejected: Exasol does not re-plan cleanly on an adapter error, so working join queries could fail |
-
-### Consequences
-
-The adapter keeps two join-rendering paths, broadcast fan-out and unaccelerated two-scan, each tested independently.
-
----
-
 ## ADR: Shard Only the Fact Side; the Large-Side Sharding Model Is Unchanged
 
 **ID:** shard-only-the-fact-side-the-large-side-sharding-model-is-unchanged
@@ -1584,7 +1391,6 @@ Broadcast join pushdown is additive, and the work-unit sharding model is untouch
 **ID:** two-scan-fallback-renders-table-qualified-columns-independent-of-the-disjoint-column-guard
 **Plan:** `add-join-pushdown-broadcast`
 **Status:** Accepted
-**Supersedes:** ineligible-joins-fall-back-to-deterministic-unaccelerated-sql-not-an-error
 
 ### Context
 
@@ -1762,93 +1568,11 @@ Both routes get manifest pruning per side, and the fallback legs filter and prun
 
 ---
 
-## ADR: N-Table Inner Joins Fall Back to an N-Scan Unaccelerated Wrapper (Generalizes ADR-083 to N Tables)
-
-**ID:** n-table-inner-joins-fall-back-to-an-n-scan-unaccelerated-wrapper-generalizes-adr-083-to-n-tables
-**Plan:** `fix-join-decline-hard-fail`
-**Status:** Superseded by single-unified-n-2-unaccelerated-join-renderer-supersedes-adr-092-adr-093-adr-094
-
-### Context
-
-An inner join over three or more tables hard-failed with `F-UDF-CL-RUST-9001: join pushdown declined` (#76). The `exasol-udf-macros` FFI shim turns every `UdfError` into a hard SQL error, and no native-retry path exists for a declined pushdown. The spec already required N-table fallback.
-
-### Decision
-
-A pushdown over an inner join of three or more tables materializes each table through its own sharded scan fan-out and rebuilds the join in Exasol's core engine. An error is reserved for a shape whose fallback cannot be built: a non-inner join node, a table absent from `TABLE_MAP` or without column metadata, or a clause the translator cannot render.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Keep declining `TooManyTables` | Rejected: hard-fails a query class the spec requires |
-| Advertise fewer join capabilities so Exasol never pushes multi-table joins | Rejected: regresses the two-table broadcast benefit and still does not match the spec |
-
-### Consequences
-
-The two-table broadcast and two-scan paths are unaffected.
-
----
-
-## ADR: N-Scan Wrapper Renders as Cross-Join + Conjunctive Table-Qualified WHERE
-
-**ID:** n-scan-wrapper-renders-as-cross-join-conjunctive-table-qualified-where
-**Plan:** `fix-join-decline-hard-fail`
-**Status:** Superseded by single-unified-n-2-unaccelerated-join-renderer-supersedes-adr-092-adr-093-adr-094
-
-### Context
-
-Rebuilding an all-inner join tree over N fan-out subqueries as a chained `INNER JOIN ... ON` needs ON-scope bookkeeping, so each condition references only tables already introduced. That is error-prone for arbitrary trees.
-
-### Decision
-
-The N-scan wrapper selects from the N fan-outs as a comma cross join. Its WHERE holds all N-1 join conditions and the qualified residual filter, with every column table-qualified from its `tableName` through the ADR-085 alias machinery.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Chained `INNER JOIN ... ON` tree reproducing the pushed join tree | Rejected: needs ON-scope bookkeeping, and Exasol re-optimizes anyway |
-
-### Consequences
-
-Cross join with conjunctive WHERE is equivalent to any join order for all-inner joins, and Exasol turns equi-conditioned cross joins into hash joins. The builder needs no per-condition table tracking, and the ADR-085 qualified-rendering functions are reused.
-
----
-
-## ADR: Freeze the Two-Table Join Path; Add the N-Table Path Additively
-
-**ID:** freeze-the-two-table-join-path-add-the-n-table-path-additively
-**Plan:** `fix-join-decline-hard-fail`
-**Status:** Superseded by single-unified-n-2-unaccelerated-join-renderer-supersedes-adr-092-adr-093-adr-094
-
-### Context
-
-N-table support could be retrofitted into the two-table join structures or added as a separate path. The two-table broadcast and two-scan code (ADR-081 to 086) is live-tested.
-
-### Decision
-
-A new `JoinShape::MultiTable` path serves N of 3 or more, and the two-table path and its tests stay unchanged.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Retrofit N tables into the existing two-table structures | Rejected: churns working code and its E2E assertions |
-
-### Consequences
-
-The two-table paths carry no regression risk. Extensions should build on the `MultiTable` path unless an N-way broadcast join is pursued, which the mission's "no N-table broadcast" non-goal currently excludes.
-
----
-
 ## ADR: Single Unified N≥2 Unaccelerated Join Renderer (Supersedes ADR-092, ADR-093, ADR-094)
 
 **ID:** single-unified-n-2-unaccelerated-join-renderer-supersedes-adr-092-adr-093-adr-094
 **Plan:** `fix-join-decline-hard-fail`
 **Status:** Accepted
-**Supersedes:** n-table-inner-joins-fall-back-to-an-n-scan-unaccelerated-wrapper-generalizes-adr-083-to-n-tables
-**Supersedes:** n-scan-wrapper-renders-as-cross-join-conjunctive-table-qualified-where
-**Supersedes:** freeze-the-two-table-join-path-add-the-n-table-path-additively
 
 ### Context
 

@@ -5,7 +5,6 @@
 **ID:** azure-e2e-ci-no-fork-coverage-goal
 **Plan:** azure-e2e-ci-scope-simplification
 **Status:** Accepted
-**Supersedes:** azure-e2e-ci-job-non-release-gating
 
 ### Context
 

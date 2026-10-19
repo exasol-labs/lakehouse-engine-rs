@@ -5,7 +5,6 @@
 **ID:** exclude-fn-div-no-faithful-datafusion-truncated-division
 **Plan:** `add-fn-div-pushdown`
 **Status:** Accepted
-**Supersedes:** exclude-fn-div-no-faithful-datafusion-floor-division
 
 ### Context
 

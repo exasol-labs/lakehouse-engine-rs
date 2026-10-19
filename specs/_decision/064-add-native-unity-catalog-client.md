@@ -99,30 +99,3 @@ Unity Catalog auth reuses the existing CONNECTION credential fields and adds non
 
 The auth mode is selected from which fields are present. Iceberg REST acceptance and error text are unchanged.
 
-## ADR: One shared CatalogClient trait with catalog-neutral return types, listing-only in #318
-
-**ID:** shared-catalog-client-trait-neutral-types
-**Plan:** add-native-unity-catalog-client
-**Status:** Accepted
-
-### Context
-
-A second catalog kind risks forking the createVirtualSchema listing pipeline into two paths that drift apart. #318 reads no Delta log, so it has no consumer for a file-planning type.
-
-### Decision
-
-Both catalog kinds implement one `CatalogClient` trait in the catalog crate, with a list operation and a single-table load operation. The trait returns catalog-neutral types, so the engine writes the listing pipeline once. Each implementation populates columns its own cheapest way, with a source-tagged type that the engine maps to an Exasol type in one place. The trait has no file-planning or scan method.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Two divergent listing paths matched on kind | Rejected: every listing change lands twice |
-| Return each catalog's wire types and map them in the adapter | Rejected: puts the fork back into the pipeline |
-| Map columns to Exasol types inside the catalog crate | Rejected: the crate must not name the Exasol delivery mechanism |
-| Normalize both sources to one neutral scalar type | Rejected: gives the Iceberg type decision two homes and loses source fidelity needed by #322 |
-| Define a neutral file-planning type now | Rejected: no consumer exists |
-
-### Consequences
-
-The Iceberg listing guarantee softens from "identical code path" to "behavior-identical, refactored behind the shared trait." The single-table load is promoted to the trait for the scan path of #319/#320 and is exercised only by trait-contract tests in #318.

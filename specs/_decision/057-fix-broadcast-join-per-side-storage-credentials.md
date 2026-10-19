@@ -98,32 +98,6 @@ The scan-time guard stays, and only its doc comment changes. It refuses a spec w
 
 This guard is the only guard over the ADLS different-container case, because `join-backend-guard-deleted-store-url-collision-is-the-rule` deletes the plan-time comparison that never covered it.
 
-## ADR: Per-side scheme selection needs a plan-time join guard scoped to variant and account, not full backend equality
-
-**ID:** join-backend-guard-scoped-to-variant-and-credential-served
-**Plan:** fix-broadcast-join-per-side-storage-credentials
-**Status:** Superseded by join-backend-guard-deleted-store-url-collision-is-the-rule
-**Supersedes:** join-backend-guard-scoped-to-variant-and-account
-
-### Context
-
-The earlier ADR scoped the plan-time backend comparison to variant and, for ADLS, `account_name`, because a per-prefix vended-credential collapse (#294) was deferred. This plan fixes that collapse, so that justification no longer applies.
-
-### Decision
-
-The plan-time comparison keeps its scope of variant and ADLS `account_name`, justified by what the scan cannot serve: a variant difference and an ADLS account difference. A credential difference is now served.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Widen to full backend equality | Rejected: rejects the credential divergence this plan now serves |
-| Delete the guard | Rejected: variant and account divergence were believed unserveable |
-
-### Consequences
-
-The narrow scope states what is unserveable, not what is unverified.
-
 ## ADR: Strip Exasol's native `tableAlias` in `render_broadcast_join`, render everything bare
 
 **ID:** join-strip-table-alias-render-bare-in-broadcast-renderer
@@ -155,7 +129,6 @@ Aliased broadcast joins now resolve, with no wire-format change. The specs' clai
 **ID:** join-backend-guard-deleted-store-url-collision-is-the-rule
 **Plan:** fix-broadcast-join-per-side-storage-credentials
 **Status:** Accepted
-**Supersedes:** join-backend-guard-scoped-to-variant-and-credential-served
 
 ### Context
 

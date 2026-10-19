@@ -25,38 +25,11 @@ A `FormatReader` trait in the engine crate, as the per-format counterpart of `Ca
 
 A caller learns nothing about catalog protocol, credential vending, or whether files come from Iceberg manifests or a Delta commit log. The `CatalogClient` clause that adding an operation stays additive holds unedited.
 
-## ADR: Format dispatch matches `ScanSource`, never `CatalogKind` and never a bare format tag
-
-**ID:** format-dispatch-matches-scansource-not-catalogkind
-**Plan:** `add-delta-table-planning`
-**Status:** Accepted
-
-### Context
-
-A source-level probe freezes the match sites of `CatalogKind`. Format dispatch needs a selection site that does not weaken that probe and carries the context each reader needs.
-
-### Decision
-
-A `ScanSource` enum pairs a live catalog session with the table it reads. `format_reader` matches it exhaustively at one site and fails with the table name and reported format when the Unity variant gets a non-Delta table.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Match `CatalogKind` | Rejected: the probe forbids a second match site |
-| Match a bare format tag | Rejected: it cannot carry the session, and recovering it would load the table twice |
-| One input struct with both sessions as options | Rejected: an unset field becomes a runtime error instead of a type error |
-
-### Consequences
-
-`ScanSource` is a resolved session plus a loaded table, not a second `CatalogKind`. The `UnityDelta` variant name states that Unity implies Delta. A second Delta-hosting catalog is the trigger to revisit it.
-
 ## ADR: `CatalogTable` gains a neutral format tag and an opaque vending key
 
 **ID:** catalog-table-neutral-format-tag-opaque-vending-key
 **Plan:** `add-delta-table-planning`
 **Status:** Accepted
-**Supersedes:** shared-catalog-client-trait-neutral-types
 
 ### Context
 

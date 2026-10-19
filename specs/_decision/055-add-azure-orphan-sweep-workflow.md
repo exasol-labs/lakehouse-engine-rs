@@ -5,7 +5,6 @@
 **ID:** azure-orphan-sweep-in-repo-workflow
 **Plan:** `add-azure-orphan-sweep-workflow`
 **Status:** Accepted
-**Supersedes:** azure-e2e-orphan-sweep-out-of-band
 
 ### Context
 

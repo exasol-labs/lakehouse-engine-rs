@@ -25,31 +25,6 @@ The vended S3 store address is resolved per field. The CONNECTION value wins whe
 
 The consent gate describes the transport the store will use. A deployment that sets vended credentials plus a non-empty CONNECTION endpoint or region now uses the CONNECTION value, where the vended one used to win.
 
-## ADR: path_style does not read the CONNECTION, because the field cannot express "unstated"
-
-**ID:** path-style-connection-read-excluded-type-limitation
-**Plan:** fix-vended-storage-shared-policy
-**Status:** Accepted
-
-### Context
-
-The CONNECTION-wins rule for endpoint and region left open whether the CONNECTION's `path_style` field participates, and how it composes with the vended `s3.path-style-access` key.
-
-### Decision
-
-`path_style` is the vended `s3.path-style-access` value when the response states a parseable boolean, else whether an endpoint was resolved. The CONNECTION's `path_style` does not participate and is not passed to the vended selectors.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Apply the CONNECTION-wins rule to `path_style` | Rejected: it is a plain boolean defaulting to true, so it cannot distinguish "set false" from "unset", and the vended override would be unreachable whenever the key is omitted |
-| Widen the CONNECTION field to an optional boolean | Rejected: changes the shipped default on the static storage path and every CONNECTION literal in the tests, for a value the vended derivation already answers |
-
-### Consequences
-
-The exclusion follows from a type limitation, not a preference. The non-vended static path is unaffected.
-
 ## ADR: Extraction stays forked; policy does not
 
 **ID:** vended-extraction-forked-policy-shared

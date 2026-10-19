@@ -5,7 +5,6 @@
 **ID:** admit-connection-path-style-into-vended-wins-rule
 **Plan:** fix-path-style-default
 **Status:** Accepted
-**Supersedes:** path-style-connection-read-excluded-type-limitation
 
 ### Context
 

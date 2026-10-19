@@ -1,29 +1,5 @@
 # Decisions: add-lakekeeper-aws-perf-catalog
 
-## ADR: The provisioning tool is a separate binary-only workspace member
-
-**ID:** lakekeeper-provisioning-rust-binary-member
-**Plan:** add-lakekeeper-aws-perf-catalog
-**Status:** Accepted
-
-### Context
-
-Lakekeeper provisioning needed a code home that keeps its HTTP-client and runtime dependencies out of the shipped `.so`'s build graph.
-
-### Decision
-
-Provisioning would live in a binary-only workspace member, `crates/lakekeeper-provision`, that depends on `lakehouse-catalog` and stays out of the `.so` through the package-scoped build line and a `dependency_direction.rs` test.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| A `[[bin]]` inside `lakehouse-catalog` | Rejected: a crate's dependencies apply to every target, so the bin's dependencies would enter the `.so` build |
-
-### Consequences
-
-Superseded by `lakekeeper-provisioning-bash-not-rust` before implementation. No crate, manifest change, or test was ever created.
-
 ## ADR: The Lakekeeper write side is raw authenticated HTTP, not an `iceberg_catalog_rest::RestCatalog`
 
 **ID:** lakekeeper-write-side-raw-http-not-rest-catalog
@@ -179,7 +155,6 @@ The offline harness stubs `jq`, `curl`, `aws`, `tofu`, and `ssh` as recording wr
 **ID:** lakekeeper-provisioning-bash-not-rust
 **Plan:** add-lakekeeper-aws-perf-catalog
 **Status:** Accepted
-**Supersedes:** lakekeeper-provisioning-rust-binary-member
 
 ### Context
 

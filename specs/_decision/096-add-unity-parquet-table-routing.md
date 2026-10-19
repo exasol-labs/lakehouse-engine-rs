@@ -1,37 +1,10 @@
 # Decisions: add-unity-parquet-table-routing
 
-## ADR: A Unity Catalog Parquet table takes its schema and partition columns from the catalog, and only its file listing from the directory seam
-
-**ID:** unity-parquet-schema-from-catalog-not-footer
-**Plan:** add-unity-parquet-table-routing
-**Status:** Accepted
-
-### Context
-
-The Unity Catalog client admitted only `DELTA` tables, so a `PARQUET` external table was skipped at listing and refused at plan time. The engine's existing Parquet reader for `DIRECT_STORAGE` derives its schema from footers. For a Unity table the catalog is the schema authority, as the requester stated. Unity Catalog declares partition columns through each column's `partition_index` and discovers their values by listing Hive-style directories under the table location.
-
-### Decision
-
-The Unity Parquet reader builds its logical schema from the catalog's declared columns and takes partition columns from each column's `partition_index`. It classifies each column's `type_json` through the Delta reader's Spark-type classifier with no column mapping. It asks the parquet-directory seam only for the file list, filled against the catalog-declared partition columns, and reads no footer.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Reuse the direct-storage `ParquetFormatReader` | Rejected: its footer-folded schema would let data files redefine catalog-declared columns |
-| Classify the Unity `type_name` through a new Spark-name-to-Arrow table | Rejected: `type_name` has no nested structure, so it refuses every struct, array, and map column, and it adds a third classifier |
-| Infer partition columns from `key=value` path segments | Rejected: Unity Catalog already declares them |
-
-### Consequences
-
-`ColumnSourceType::Unity` gains `type_json`, and `CatalogTable` gains ordered `partition_columns`, which are empty for the Iceberg REST and direct-storage clients. Every logical field is nullable, because a raw Parquet directory does not guarantee that every file carries every column. Partition values come from `key=value` segments matched by the uppercase fold, and a missing segment reads NULL. Only `string` partition columns reach the partition-pruning predicate, which compares strings. A data file without the `.parquet` suffix is not read, a trade-off inherited from the seam. The Unity admission filter now admits `DELTA` and `PARQUET` base tables. `SkipReason::NotDeltaBaseTable` and its warning keep their names, because every skipped entry is still not a Delta base table.
-
 ## ADR: The Unity scan source selects its reader by format tag, and both Unity readers share one table-storage component
 
 **ID:** unity-scan-source-dispatches-by-format-tag
 **Plan:** add-unity-parquet-table-routing
 **Status:** Accepted
-**Supersedes:** format-dispatch-matches-scansource-not-catalogkind
 
 ### Context
 

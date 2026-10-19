@@ -29,7 +29,6 @@ Every declined predicate must be self-applied in the adapter's returned SQL, bec
 **ID:** correct-recorded-like-guard-consequence-not-merely-superseded
 **Plan:** fix-declined-filter-self-apply
 **Status:** Accepted
-**Supersedes:** like-guard-in-adapter-not-vs-expression
 
 ### Context
 

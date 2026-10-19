@@ -5,7 +5,6 @@
 **ID:** exasol-evaluates-every-regular-expression-function-and-predicate
 **Plan:** fix-regexp-like-pushdown
 **Status:** Accepted
-**Supersedes:** affirm-regexp-scalar-function-decline-re-verified-pinned-versions
 
 ### Context
 
