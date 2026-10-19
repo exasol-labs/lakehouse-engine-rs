@@ -8,7 +8,7 @@
 
 ### Context
 
-The scan UDF NULL-filled every absent column and ignored the Iceberg `initial-default`. The Iceberg table spec returns the `initial-default` for any absent field, required or nullable.
+The Iceberg table spec returns a field's `initial-default` when the field is absent from a data file, whether the field is required or nullable. The scan must not NULL-fill such fields.
 
 ### Decision
 
@@ -18,9 +18,9 @@ The scan returns the defined `initial-default` for an absent field, whether the 
 
 | Option | Verdict |
 |--------|---------|
-| Fix only the required-column case named in #27 | Rejected: leaves a known deviation for nullable columns with a default |
+| Fix only the required-column case | Rejected: leaves a spec deviation for nullable columns with a default |
 
 ### Consequences
 
-The scenario "nullable absent column is NULL-filled" applies only when the column defines no default.
+- A nullable absent column is NULL-filled only when it defines no default.
 

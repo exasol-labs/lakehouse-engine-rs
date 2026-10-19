@@ -8,19 +8,20 @@
 
 ### Context
 
-`CLUSTER_NODES` was written into `schemaMetadata.adapterNotes` at virtual schema creation and read at pushdown, so a writer and a reader agreed only through an untyped string key. This contradicts the mission rule that UDFs hold no cross-call state and resolve metadata per query, and it froze shard fan-out at the creation-time node count until `REFRESH`.
+The node count was stored in the adapter notes at virtual schema creation and read at pushdown. This froze shard fan-out at the creation-time node count until `REFRESH` and contradicts the rule that metadata is resolved per query.
 
 ### Decision
 
-`adapterNotes` holds a value only when it is derived at create time and a pushdown cannot recompute it. `TABLE_MAP` qualifies because recomputing it costs a namespace enumeration per query, and handshake metadata never qualifies. The adapter stops writing `CLUSTER_NODES` and adds no migration. Per architect review (PR #282), an operator upgrading past this change drops and recreates the virtual schema, so an inherited `CLUSTER_NODES` entry stays unread and inert.
+The adapter notes hold a value only when it is derived at create time and a pushdown cannot recompute it. The table map qualifies because recomputing it costs a namespace enumeration per query. The node count does not, so the adapter reads it live at each pushdown and stops writing it. An inherited node-count entry stays unread and inert.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Actively remove an inherited key on every response | Rejected: needs removal code, a follow-up issue, and a manual test gate for a problem that drop-and-recreate already solves |
-| Use `adapterNotes` as a general cache for anything convenient at pushdown | Rejected: this status quo produced `CLUSTER_NODES` |
+| Actively remove an inherited key on every response | Rejected: needs removal code for a problem that dropping and recreating the virtual schema already solves |
+| Use `adapterNotes` as a general cache for anything convenient at pushdown | Rejected: this is how the stale node count arose |
 
 ### Consequences
 
-The node count now comes live per pushdown instead of frozen at creation, which `plan.md` § Impact states. The superseded ADR's `UdfContext::node_count()` source and `0 => 1` floor stay. No tombstone constant, removal path, or cleanup issue exists.
+- The node count follows the cluster at each pushdown.
+- No migration or cleanup code exists.

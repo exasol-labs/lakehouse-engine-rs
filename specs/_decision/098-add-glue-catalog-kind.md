@@ -12,7 +12,7 @@ The Glue client needs SigV4 signing, retry, error-code parsing, and clock-skew c
 
 ### Decision
 
-The client uses `aws-sdk-glue` with default features off, and the SDK features `rustls` and `legacy-https-client` stay off. `reqwest` moves to rustls with native roots, so the `.so` links no OpenSSL.
+The client uses the AWS Glue SDK without the AWS config crate and with default features off. The HTTP client uses rustls with native roots, so the `.so` links no OpenSSL.
 
 ### Options Considered
 
@@ -23,4 +23,5 @@ The client uses `aws-sdk-glue` with default features off, and the SDK features `
 
 ### Consequences
 
-The MSRV rises to 1.94.1, so every CI compiler must be at least that. One TLS stack (rustls) serves the whole `.so`.
+- The minimum Rust version rises to 1.94.1, so every CI compiler must be at least that.
+- One TLS stack (rustls) serves the whole `.so`.

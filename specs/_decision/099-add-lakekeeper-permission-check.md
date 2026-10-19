@@ -8,7 +8,7 @@
 
 ### Context
 
-Every query shape loads its tables through one point: row scan, aggregates, COUNT(DISTINCT), top-N, fallback wrappers, and joins.
+Every query shape (row scan, aggregates, COUNT(DISTINCT), top-N, fallback wrappers, joins) loads its tables through one point.
 
 ### Decision
 

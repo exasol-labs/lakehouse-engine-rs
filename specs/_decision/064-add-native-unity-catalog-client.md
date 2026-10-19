@@ -8,23 +8,24 @@
 
 ### Context
 
-The engine needs a Unity Catalog client to list catalogs, schemas, and tables and to load table metadata, with PAT and Databricks OAuth machine-to-machine authentication. The catalog crate already carries an HTTP client and serde for the Iceberg REST path, and no mature standalone Rust Unity Catalog client exists.
+The engine needs a Unity Catalog client to list catalogs, schemas, and tables and to load table metadata, with PAT and OAuth machine-to-machine authentication. No mature standalone Rust client exists.
 
 ### Decision
 
-Build a thin Unity Catalog client in the catalog crate over the standard Unity Catalog API. The client passes a PAT through as a bearer token and mints and refreshes OAuth machine-to-machine tokens itself. One client serves both OSS and Databricks-managed Unity Catalog.
+Build a thin client in the catalog crate over the standard Unity Catalog API. It passes a PAT through as a bearer token and mints and refreshes OAuth machine-to-machine tokens itself. One client serves both OSS and Databricks-managed Unity Catalog.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| `unitycatalog` and `unitycatalog-client` crates | Rejected: reserved placeholders, not real crates |
-| `roeap/unitycatalog-rs` | Rejected: dead, folded into delta-kernel-rs |
-| delta-kernel-rs Unity Catalog crates | Rejected: they target the `delta/v1` API, which has no list endpoints and is gated on Databricks behind an allowlisted User-Agent |
+| `unitycatalog` and `unitycatalog-client` crates | Rejected: placeholder names, not real crates |
+| `roeap/unitycatalog-rs` | Rejected: abandoned, folded into delta-kernel-rs |
+| delta-kernel-rs Unity Catalog crates | Rejected: they target an API with no list endpoints that Databricks gates behind an allowlisted User-Agent |
 
 ### Consequences
 
-The client fits the existing REST-catalog shape and adds no dependency. Both auth modes end in a bearer header, so the only real work is the OAuth exchange and lifecycle. The delta-kernel crates stay on a watch-list only for the coordinated-commits risk.
+- The client fits the existing REST-catalog shape and adds no dependency.
+- Both auth modes end in a bearer header, so the only real work is the OAuth exchange and token lifecycle.
 
 ## ADR: CATALOG_KIND as a virtual-schema property that selects a client at one construction site
 
@@ -34,11 +35,11 @@ The client fits the existing REST-catalog shape and adds no dependency. Both aut
 
 ### Context
 
-Unity Catalog is a second catalog kind. A virtual schema needs a way to select its catalog without breaking existing Iceberg REST virtual schemas or making every operation re-decide the kind.
+Unity Catalog is a second catalog kind. A virtual schema must select its catalog without breaking existing Iceberg REST virtual schemas or making every operation re-decide the kind.
 
 ### Decision
 
-A `CATALOG_KIND` virtual-schema property selects the catalog kind, defaulting to Iceberg REST. The kind is read from the properties, not from the CONNECTION credentials, and is matched exhaustively at exactly one site: the one that constructs the catalog client. After construction, createVirtualSchema runs one listing pipeline for both kinds.
+A `CATALOG_KIND` virtual-schema property selects the catalog kind and defaults to Iceberg REST. The kind is matched exhaustively at one site, the one that constructs the catalog client. After construction, one listing pipeline serves both kinds.
 
 ### Options Considered
 
@@ -49,7 +50,8 @@ A `CATALOG_KIND` virtual-schema property selects the catalog kind, defaulting to
 
 ### Consequences
 
-Existing virtual schemas keep their behavior with no configuration change. A third kind is a build failure at the one construction site, not a silent fall-through.
+- Existing virtual schemas keep their behavior.
+- A third kind fails the build at the construction site instead of falling through silently.
 
 ## ADR: Unity Catalog vending is a third backend-selection site
 
@@ -59,21 +61,21 @@ Existing virtual schemas keep their behavior with no configuration change. A thi
 
 ### Context
 
-The Storage Backend Enum invariant allows exactly two backend-selection sites, which read disjoint inputs. Unity Catalog credential vending returns a response shape that neither site's input covers.
+The storage-backend invariant allows exactly two backend-selection sites. Unity Catalog credential vending returns a response shape that neither site reads.
 
 ### Decision
 
-Unity Catalog vending is a third backend-selection site. It reads the Unity Catalog temporary-credentials response and selects the variant from the storage-location scheme. The "exactly two sites" and "no third selector" clauses of the invariant are superseded, and the scheme-to-variant decision lives in one place shared by both vended selectors.
+Unity Catalog vending is a third backend-selection site. It reads the temporary-credentials response and selects the variant from the storage-location scheme. The invariant is revised to allow it, and the scheme-to-variant decision lives in one place shared by both vended selectors.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Reshape Unity Catalog credentials into an Iceberg `LoadTableResult` | Rejected: couples Unity Catalog to a provider type it does not use |
+| Reshape Unity Catalog credentials into an Iceberg `LoadTableResult` | Rejected: couples Unity Catalog to an Iceberg type it does not use |
 
 ### Consequences
 
-Scan-path wiring of the third selector is deferred to #319/#320. The invariant is revised so it stays true.
+- The invariant stays true after revision.
 
 ## ADR: Unity Catalog auth reuses the existing CONNECTION credential fields
 
@@ -83,11 +85,11 @@ Scan-path wiring of the third selector is deferred to #319/#320. The invariant i
 
 ### Context
 
-Unity Catalog needs PAT, OAuth machine-to-machine, and unauthenticated (OSS) modes. The CONNECTION password JSON already parses the token, client ID, client secret, OAuth server URI, and scope fields for Iceberg REST.
+Unity Catalog needs PAT, OAuth machine-to-machine, and unauthenticated (OSS) modes. The CONNECTION credential JSON already parses the token, client ID, client secret, OAuth server URI, and scope fields for Iceberg REST.
 
 ### Decision
 
-Unity Catalog auth reuses the existing CONNECTION credential fields and adds none. Validation depends on the catalog kind: `warehouse` is required only for Iceberg REST, SigV4 is rejected for Unity Catalog, and other Iceberg rules are unchanged. A Unity Catalog CONNECTION with no auth field is accepted for OSS.
+Unity Catalog auth reuses the existing CONNECTION credential fields and adds none. Validation depends on the catalog kind: `warehouse` is required only for Iceberg REST and SigV4 is rejected for Unity Catalog. A Unity Catalog CONNECTION with no auth field is accepted for OSS.
 
 ### Options Considered
 
@@ -97,5 +99,6 @@ Unity Catalog auth reuses the existing CONNECTION credential fields and adds non
 
 ### Consequences
 
-The auth mode is selected from which fields are present. Iceberg REST acceptance and error text are unchanged.
+- The auth mode follows from which fields are present.
+- Iceberg REST validation is unchanged.
 

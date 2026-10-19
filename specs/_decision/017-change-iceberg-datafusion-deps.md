@@ -8,7 +8,7 @@
 
 ### Context
 
-The iceberg crates were pinned to a git tag because crates.io had no matching release. The final release is now on crates.io.
+The final iceberg release is on crates.io, so a git pin is no longer needed.
 
 ### Decision
 
@@ -23,4 +23,4 @@ The workspace uses the crates.io registry release for the iceberg crates, with a
 
 ### Consequences
 
-Version bumps remain explicit, reviewed edits.
+- Version bumps are explicit, reviewed edits.

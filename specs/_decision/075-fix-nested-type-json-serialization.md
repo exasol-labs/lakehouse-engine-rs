@@ -8,19 +8,19 @@
 
 ### Context
 
-Issue #350 proposed a recursive nested Arrow tag, which would make the column a real `Struct` or `Map` during DataFusion execution. DataFusion has no comparison, ordering, hashing, or aggregation for those types. That would force new decline gates at five pushdown decision sites, a re-sequenced `handle_pushdown`, and a wider shared `col_types` shape.
+A recursive nested Arrow tag would make the column a real struct or map during DataFusion execution. DataFusion has no comparison, ordering, hashing, or aggregation for those types, so every pushdown decision site would need a new decline gate.
 
 ### Decision
 
-The logical Arrow type of a nested column stays `Utf8`. The scan's physical-expression adapter, and the generated SQL on the legacy path, render the JSON, so the column is the JSON string in the DataFusion schema, the `ScanSpec` tag vocabulary, the pushdown planner, and Exasol's `VARCHAR(2000000)` declaration.
+The logical Arrow type of a nested column stays a string. The scan renders the JSON, so the column is a JSON string in the DataFusion schema, the scan spec, the pushdown planner, and Exasol's `VARCHAR(2000000)` declaration.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Recursive nested Arrow tag grammar | Rejected: the column becomes a real nested type, forcing five decline gates and a re-sequenced `handle_pushdown` |
+| Recursive nested Arrow tag grammar | Rejected: the column becomes a real nested type and forces new decline gates at five pushdown sites |
 
 ### Consequences
 
-No expression over such a column ever sees a nested type, so no new gate or error path is needed. The live check of the pushdown shapes stays as plan task 16.
+- No expression over such a column sees a nested type, so no new gate or error path is needed.
 
