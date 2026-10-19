@@ -344,7 +344,7 @@ fn shard_count_oversubscribes_and_caps_at_300() {
     assert_eq!(shard_count(1, 301, 1000), 300, "301 must be capped at 300");
 }
 
-/// Scenario: Fewer files than G produces one shard per file with no empty shards.
+/// Scenario: Fewer files than G produces one shard per file with no empty shards
 #[test]
 fn shard_count_clamped_to_file_count_no_empty_shards() {
     assert_eq!(shard_count(10, 8, 3), 3, "must clamp to file_count=3");
@@ -2183,7 +2183,7 @@ fn selectlist_untranslatable_item_falls_back_to_column() {
     assert_eq!(proj_types[0], "DECIMAL(18,2)");
 }
 
-/// Scenario: Filter predicate is pushed into the scan spec.
+/// Scenario: Filter predicate is pushed into the scan spec
 #[test]
 fn filter_in_common_arg() {
     use crate::adapter::iceberg_predicate::to_iceberg_predicate;
@@ -2233,7 +2233,7 @@ fn filter_in_common_arg() {
     );
 }
 
-/// Scenario: LIKE on a VARCHAR or CHAR column pushes down unchanged.
+/// Scenario: LIKE on a VARCHAR or CHAR column pushes down unchanged
 #[test]
 fn like_guard_varchar_subject_unchanged() {
     let filter = serde_json::json!({
@@ -2251,7 +2251,7 @@ fn like_guard_varchar_subject_unchanged() {
     );
 }
 
-/// Scenario: LIKE on a VARCHAR or CHAR column pushes down unchanged.
+/// Scenario: LIKE on a VARCHAR or CHAR column pushes down unchanged
 #[test]
 fn like_guard_char_subject_unchanged() {
     let filter = serde_json::json!({
@@ -2269,7 +2269,7 @@ fn like_guard_char_subject_unchanged() {
     );
 }
 
-/// Scenario: LIKE on a DATE column pushes down wrapped in CAST-to-VARCHAR.
+/// Scenario: LIKE on a DATE column pushes down wrapped in CAST-to-VARCHAR
 #[test]
 fn like_guard_date_subject_wraps_cast() {
     let column = serde_json::json!({"type": "column", "name": "signup_date"});
@@ -2298,7 +2298,7 @@ fn like_guard_date_subject_wraps_cast() {
     );
 }
 
-/// Scenario: LIKE on a DECIMAL column declines the whole filter.
+/// Scenario: LIKE on a DECIMAL column declines the whole filter
 #[test]
 fn like_guard_decimal_subject_declines() {
     let filter = serde_json::json!({
@@ -2331,7 +2331,7 @@ fn type_rewrite_pipeline_runs_like_guard() {
     );
 }
 
-/// Scenario: LIKE on an integer column declines the whole filter.
+/// Scenario: LIKE on an integer column declines the whole filter
 #[test]
 fn like_guard_integer_subject_declines() {
     let filter = serde_json::json!({
@@ -2348,7 +2348,7 @@ fn like_guard_integer_subject_declines() {
     );
 }
 
-/// Scenario: LIKE on a non-column subject is left untouched.
+/// Scenario: LIKE on a non-column subject is left untouched
 #[test]
 fn like_guard_non_column_subject_untouched() {
     let filter = serde_json::json!({
@@ -2370,7 +2370,7 @@ fn like_guard_non_column_subject_untouched() {
     );
 }
 
-/// Scenario: LIKE on a bare column whose type cannot be resolved declines the whole filter.
+/// Scenario: LIKE on a bare column whose type cannot be resolved declines the whole filter
 #[test]
 fn like_guard_unresolvable_column_declines() {
     let filter = serde_json::json!({
@@ -2387,7 +2387,7 @@ fn like_guard_unresolvable_column_declines() {
     );
 }
 
-/// Scenario: A nested non-string LIKE declines the entire enclosing filter.
+/// Scenario: A nested non-string LIKE declines the entire enclosing filter
 #[test]
 fn like_guard_nested_decimal_declines_whole_filter() {
     let filter = serde_json::json!({
@@ -2495,7 +2495,7 @@ fn nested_like_decline_routes_to_wrapper_where() {
     );
 }
 
-/// Scenario: LIKE on an integer column declines the whole filter.
+/// Scenario: LIKE on an integer column declines the whole filter
 #[test]
 fn declined_like_on_integer_column_routes_to_wrapper_where() {
     let filter = serde_json::json!({
@@ -2513,7 +2513,7 @@ fn declined_like_on_integer_column_routes_to_wrapper_where() {
     );
 }
 
-/// Scenario: LIKE on a bare column whose type cannot be resolved declines the whole filter.
+/// Scenario: LIKE on a bare column whose type cannot be resolved declines the whole filter
 #[test]
 fn declined_like_on_unresolvable_column_routes_to_wrapper_where() {
     let filter = serde_json::json!({
@@ -3338,7 +3338,7 @@ fn selectlist_instr_with_start_position_falls_back_to_full_row() {
     );
 }
 
-/// Scenario: Scalar select-list expression is pushed into the scan-driving query.
+/// Scenario: Scalar select-list expression is pushed into the scan-driving query
 #[test]
 fn selectlist_predicate_node_projects_as_expr() {
     let cases: Vec<(&str, serde_json::Value, &str)> = vec![
@@ -3459,7 +3459,7 @@ fn selectlist_function_aggregate_still_widens_to_full_row() {
     assert_eq!(types, expected_types);
 }
 
-/// Scenario: A select-list LIKE over a DATE column projects the CAST-to-VARCHAR form.
+/// Scenario: A select-list LIKE over a DATE column projects the CAST-to-VARCHAR form
 #[test]
 fn selectlist_like_over_date_projects_cast_expr() {
     let item = serde_json::json!({
@@ -3493,7 +3493,7 @@ fn selectlist_like_over_date_projects_cast_expr() {
     assert_eq!(types, vec!["BOOLEAN".to_string()]);
 }
 
-/// Scenario: A select-list LIKE over a non-string column widens the projection to the full base row.
+/// Scenario: A select-list LIKE over a non-string column widens the projection to the full base row
 #[test]
 fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
     let col_types = decimal_rewrite_col_types();
@@ -3833,7 +3833,7 @@ fn string_fn_guard_passes_through_non_object_node() {
     }
 }
 
-/// Scenario: A string-position VARCHAR or CHAR column argument pushes down unchanged.
+/// Scenario: A string-position VARCHAR or CHAR column argument pushes down unchanged
 #[test]
 fn string_fn_guard_leaves_varchar_argument_unchanged() {
     let col_types = decimal_rewrite_col_types();

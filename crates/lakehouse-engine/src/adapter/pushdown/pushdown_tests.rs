@@ -1790,7 +1790,7 @@ async fn seam_handle_pushdown(
     .await
 }
 
-/// Scenario: Every pushdown request shape resolves through the one format-reader seam.
+/// Scenario: Every pushdown request shape resolves through the one format-reader seam
 #[tokio::test]
 async fn every_request_shape_resolves_through_the_format_reader_seam() {
     let iceberg = iceberg_catalog().await;
@@ -1851,7 +1851,7 @@ async fn every_request_shape_resolves_through_the_format_reader_seam() {
     );
 }
 
-/// Scenario: One catalog session per request serves every table the request resolves.
+/// Scenario: One catalog session per request serves every table the request resolves
 #[tokio::test]
 async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
     let iceberg = iceberg_catalog().await;
@@ -1923,7 +1923,7 @@ async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
     );
 }
 
-/// Scenario: A Unity Catalog table's identity survives the round trip from the involved table.
+/// Scenario: A Unity Catalog table's identity survives the round trip from the involved table
 #[tokio::test]
 async fn a_malformed_unity_identifier_is_refused_in_unity_terms_before_any_catalog_contact() {
     let unity = RecordingCatalog::spawn(|_| (200, locationless_delta_table_body())).await;
@@ -2371,7 +2371,7 @@ async fn a_count_star_filtered_on_a_refused_column_is_refused() {
     assert_refuses_binary_col(error);
 }
 
-/// Scenario: Resolved partition columns reach the scan spec for every side.
+/// Scenario: Resolved partition columns reach the scan spec for every side
 #[test]
 fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
     let request = guard_events_request(serde_json::json!({"type": "select"}));

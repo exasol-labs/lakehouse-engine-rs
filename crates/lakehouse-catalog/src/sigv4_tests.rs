@@ -1,6 +1,6 @@
 use super::*;
 
-/// Scenario: Catalog REST requests to Glue are SigV4-signed when enabled.
+/// Scenario: Catalog REST requests to Glue are SigV4-signed when enabled
 #[test]
 fn signed_request_carries_sigv4_header() {
     let client = reqwest::Client::new();
@@ -190,7 +190,7 @@ const NON_STANDARD_ADDRESSES: [(&str, &str); 18] = [
     ),
 ];
 
-/// Scenario: A standard AWS Glue endpoint supplies the SigV4 signing region when the CONNECTION omits region.
+/// Scenario: A standard AWS Glue endpoint supplies the SigV4 signing region when the CONNECTION omits region
 #[test]
 fn standard_glue_endpoint_supplies_the_signing_region_when_none_is_stated() {
     let creds = creds_stating_region("");
@@ -204,7 +204,7 @@ fn standard_glue_endpoint_supplies_the_signing_region_when_none_is_stated() {
     }
 }
 
-/// Scenario: A standard AWS Glue endpoint signs the catalog request even when the CONNECTION states a different region.
+/// Scenario: A standard AWS Glue endpoint signs the catalog request even when the CONNECTION states a different region
 #[test]
 fn standard_glue_endpoint_region_signs_even_when_a_different_region_is_stated() {
     let creds = creds_stating_region("us-east-1");

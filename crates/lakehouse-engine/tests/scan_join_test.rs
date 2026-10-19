@@ -284,7 +284,7 @@ fn orderkey_name_rows(batches: &[RecordBatch]) -> Vec<(i64, String)> {
     rows
 }
 
-/// Scenario: Scan reconstitutes a join scan spec carrying two file lists.
+/// Scenario: Scan reconstitutes a join scan spec carrying two file lists
 #[test]
 fn join_spec_reconstitutes_two_file_lists() {
     let fact = vec![
@@ -330,7 +330,7 @@ fn join_spec_reconstitutes_two_file_lists() {
     );
 }
 
-/// Scenario: Scan registers both tables and executes the inner equi-join.
+/// Scenario: Scan registers both tables and executes the inner equi-join
 #[test]
 fn join_registers_each_side_against_its_own_backend() {
     let dir = std::env::temp_dir().join(format!("lh_join_inner_{}", std::process::id()));
@@ -389,7 +389,7 @@ fn join_registers_each_side_against_its_own_backend() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: Join projection, filter, and LIMIT are applied and rows streamed as Arrow IPC.
+/// Scenario: Join projection, filter, and LIMIT are applied and rows streamed as Arrow IPC
 #[test]
 fn join_projection_filter_limit_streamed() {
     let dir = std::env::temp_dir().join(format!("lh_join_pfl_{}", std::process::id()));
@@ -441,7 +441,7 @@ fn join_projection_filter_limit_streamed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: Each side of a broadcast join materializes its own partition columns.
+/// Scenario: Each side of a broadcast join materializes its own partition columns
 #[test]
 fn each_join_side_materializes_its_own_partition_columns() {
     let dir = std::env::temp_dir().join(format!("lh_join_partition_{}", std::process::id()));
@@ -686,7 +686,7 @@ fn join_top_n_ranks_an_empty_string_key_as_null() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: The bounded dimension side is the hash-join build side.
+/// Scenario: The bounded dimension side is the hash-join build side
 #[test]
 fn join_build_side_is_dimension() {
     let dir = std::env::temp_dir().join(format!("lh_join_build_{}", std::process::id()));
@@ -760,7 +760,7 @@ fn has_no_sort_below(plan: &Arc<dyn ExecutionPlan>) -> bool {
     !any.is::<SortExec>() && plan.children().into_iter().all(has_no_sort_below)
 }
 
-/// Scenario: Scan reports a clear error when an assigned join file is unreadable.
+/// Scenario: Scan reports a clear error when an assigned join file is unreadable
 #[test]
 fn unreadable_join_file_error_redacts_both_sides_credentials() {
     // No S3 store is registered, so neither secret could appear anyway; the falsifiable
