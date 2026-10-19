@@ -25,26 +25,3 @@ Each architecture builds on its own native GitHub Actions runner, `ubuntu-latest
 
 CI gains a second native build leg at the cost of extra runner minutes.
 
-## ADR: `--arch` defaults to x86_64, not auto-detection
-
-**ID:** arch-flag-defaults-x86_64
-**Plan:** add-aarch64-build-and-personal-install
-**Status:** Accepted
-
-### Context
-
-The install script runs on an operator's machine, which for SaaS and BucketFS targets has no relationship to the cluster's architecture.
-
-### Decision
-
-`--arch` defaults to `x86_64`. Auto-detection from `uname -m` runs only for `--deployment local`, where the operator's machine is the Exasol Personal VM host.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Always auto-detect from the operator's machine | Rejected: wrong for every target whose architecture differs from the operator's |
-
-### Consequences
-
-Existing x86_64 invocations are unchanged. Inference applies only where host and target match.

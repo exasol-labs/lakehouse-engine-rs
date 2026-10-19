@@ -26,27 +26,3 @@ A refused column is omitted from the logical schema and recorded on `ResolvedSca
 
 Omitting the column from the logical schema is defense in depth: a gate miss fails with an unresolved-column error instead of emitting a silent NULL column.
 
-## ADR: The refused-column gate reads a total recursive JSON walk, never a per-clause enumeration
-
-**ID:** delta-refused-column-gate-total-recursive-json-walk
-**Plan:** `add-delta-reader-gating-and-type-mapping`
-**Status:** Accepted
-
-### Context
-
-The gate needs every column a pushdown request touches, through a filter, GROUP BY, ORDER BY, aggregate argument, join condition, or the emitted projection.
-
-### Decision
-
-The gate collects the name of every `column` node in one recursive walk over the whole request JSON. It unions the rendered projection only when the request's select list is absent or empty, a genuine `SELECT *`. The synthetic full-row projection rendered for an aggregate or untranslatable select item is never unioned, because the scan never reads it and each item's own columns are already covered by the walk. The widened-versus-not distinction is an `Option` argument, so the invalid combination cannot be expressed.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Enumerate the clauses that can carry a column | Rejected: omits every later pushdown capability, and a miss routes a refused column into the scan |
-| Union the full-row projection unconditionally | Rejected: refuses `COUNT(*)`, which reads no column, against any table with an unrelated refused column |
-
-### Consequences
-
-The walk catches filters that compare a `binary` column as text, where every non-UTF-8 value would silently become NULL. The join path charges each tagged reference to its own side, and untagged or ambiguous references to every side. This stops a refused column on one side from refusing a select that names only an identically named mappable column on the other.

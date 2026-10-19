@@ -102,26 +102,3 @@ A per-request `TableScanResolver` holds the request's one catalog session and ma
 
 Keeping the resolver out of the pushdown facade shrinks the frozen surface by exactly one item.
 
-## ADR: The Unity table identity is recovered by splitting the recorded dotted identifier
-
-**ID:** unity-table-identity-recovered-by-splitting-dotted-identifier
-**Plan:** `add-delta-scan-execution`
-**Status:** Accepted
-
-### Context
-
-The resolver must recover a table's namespace segments and name for Unity Catalog, as it does for Iceberg, from the identifier `TABLE_MAP` records at create time.
-
-### Decision
-
-The resolver splits the recorded dotted identifier into namespace segments and table name for both kinds, and fails naming the identifier when no table name results. The Unity loader re-joins the segments, so the split round-trips losslessly.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Re-encode `TABLE_MAP` with explicit namespace segments | Rejected: changes a create-time wire format and forces a REFRESH story for existing virtual schemas |
-
-### Consequences
-
-The rule against re-splitting a joined identifier still applies to any future catalog kind that addresses tables by a different string, and the rejected option becomes right only then.

@@ -1,29 +1,5 @@
 # Decisions: fix-198-orderby-expr-hidden-col
 
-## ADR: Advertise ORDER_BY_EXPRESSION rather than detect the appended select-list item
-
-**ID:** advertise-order-by-expression-not-selectlist-detection
-**Plan:** fix-198-orderby-expr-hidden-col
-**Status:** Accepted
-
-### Context
-
-While `ORDER_BY_EXPRESSION` is unadvertised, Exasol appends the sort key of an expression `ORDER BY` to the pushed `selectList`, which leaks a `HIDDEN_COL_n` column (issue #198). The payload is byte-identical to a query that genuinely selects that expression, and no field distinguishes the two.
-
-### Decision
-
-The adapter advertises `ORDER_BY_EXPRESSION`, so Exasol pushes a structured `orderBy` element.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Detect and strip the appended select-list item | Rejected: impossible, since no test on the payload is correct for both shapes |
-
-### Consequences
-
-The adapter must render every ordered shape it can now receive. The fix covers every consumer of a pushed `orderBy`.
-
 ## ADR: Render a declined-path expression ORDER BY over hidden base columns in the Exasol dialect
 
 **ID:** declined-order-by-expression-hidden-base-columns-exasol-dialect

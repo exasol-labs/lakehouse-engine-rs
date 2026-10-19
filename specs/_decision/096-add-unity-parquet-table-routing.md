@@ -1,30 +1,5 @@
 # Decisions: add-unity-parquet-table-routing
 
-## ADR: The Unity scan source selects its reader by format tag, and both Unity readers share one table-storage component
-
-**ID:** unity-scan-source-dispatches-by-format-tag
-**Plan:** add-unity-parquet-table-routing
-**Status:** Accepted
-
-### Context
-
-A second table format under Unity Catalog means the scan-source dispatch can no longer assume that Unity implies Delta. The storage-location check, the vended-or-static storage decision, and error redaction lived in `DeltaFormatReader`, and a second reader needs the same rules without a drifting copy.
-
-### Decision
-
-`ScanSource::UnityDelta` becomes `ScanSource::Unity`, and its arm in `format_reader` matches the table's `TableFormat` exhaustively. Delta selects `DeltaFormatReader`, Parquet selects `UnityParquetFormatReader`, and Iceberg is refused. The storage-location check, the vended-or-static decision, and error redaction move into one `UnityTableStorage` component that both readers compose.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Duplicate the vending logic in the new reader | Rejected: the no-fallback rule and `READ` scope can drift, and drift reads storage with an unselected credential |
-| One `UnityFormatReader` that branches on format internally | Rejected: hides a second format dispatch, while `format_reader` is the one recorded dispatch site |
-
-### Consequences
-
-This supersedes the naming consequence of the earlier ADR, which kept the name `UnityDelta` until a second format appeared. The dispatch rule (match `ScanSource`, never `CatalogKind`) is unchanged, as are `DeltaFormatReader`'s behavior and error texts.
-
 ## ADR: The scan binds an identity-bound column across letter case and refuses a physical type it cannot admit, for every format
 
 **ID:** scan-case-folds-identity-binding-refuses-unadmitted-types

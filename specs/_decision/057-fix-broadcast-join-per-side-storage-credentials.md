@@ -26,54 +26,6 @@ The adapter registers one `PrefixRoutingObjectStore` per bucket, holding one inn
 
 One code path serves every join with no credential comparison. Two credentials live behind one registered store.
 
-## ADR: Route on each side's enumerated file paths first, table root only as a fallback
-
-**ID:** join-route-by-enumerated-paths-then-table-root
-**Plan:** fix-broadcast-join-per-side-storage-credentials
-**Status:** Accepted
-
-### Context
-
-The router must match a requested path to its owning side. The Iceberg spec permits a table's files outside its `location` (Appendix E, Version 4: absolute paths for files that share no prefix with the table location), so a root-prefix match alone can misroute.
-
-### Decision
-
-Each side's routing table is the set of its own data-file and positional-delete-file paths, matched exactly first. A path no side enumerated falls to a longest-table-root-prefix match, and a path matching neither is an error.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Longest table-root prefix only | Rejected: misroutes a spec-legal table whose files sit outside its `location` |
-
-### Consequences
-
-The scan discovers no files, so each side's spec names every path it requests, and the root-prefix fallback is unreachable on a well-formed spec. It stays as the interviewed prescription and is labelled unreachable, not load-bearing.
-
-## ADR: Layer the router OUTSIDE the spec-sized store, one size index per side
-
-**ID:** join-router-outside-spec-sized-store-per-side-index
-**Plan:** fix-broadcast-join-per-side-storage-credentials
-**Status:** Accepted
-
-### Context
-
-The scan's spec-sized store answers `head` calls from a size index without a network call. With one whole-spec index, one side's store could answer the other side's metadata lookup.
-
-### Decision
-
-The router sits outside, wrapping one spec-sized store per side, each with its own size index.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| One sized layer outside the router with the whole-spec index | Rejected: an unroutable `head` is answered from the index, so the routing failure surfaces later as an access denial instead of a plan defect |
-
-### Consequences
-
-One side's store cannot satisfy the other side's metadata lookup.
-
 ## ADR: `validate_sides_share_one_store` stays; prefix routing does not subsume it
 
 **ID:** join-keep-validate-sides-share-one-store-guard
@@ -97,32 +49,6 @@ The scan-time guard stays, and only its doc comment changes. It refuses a spec w
 ### Consequences
 
 This guard is the only guard over the ADLS different-container case, because `join-backend-guard-deleted-store-url-collision-is-the-rule` deletes the plan-time comparison that never covered it.
-
-## ADR: Strip Exasol's native `tableAlias` in `render_broadcast_join`, render everything bare
-
-**ID:** join-strip-table-alias-render-bare-in-broadcast-renderer
-**Plan:** fix-broadcast-join-per-side-storage-credentials
-**Status:** Accepted
-
-### Context
-
-The broadcast renderer keeps Exasol's `tableAlias` in the join condition, filter, and projection, but the scan's derived sub-SELECTs are unaliased. Any aliased join query fails with a DataFusion schema error at scan time (issue #303), before the credential path is reached.
-
-### Decision
-
-The broadcast renderer strips `tableAlias` from the join condition, the WHERE filter, and the request passed to join projection extraction, right after the disjoint-schema guard passes. `build_join_sql` is unchanged. The N-scan side renderer already strips for the same reason, and the disjoint-schema guard already proves bare names are unambiguous.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Thread each side's alias through the wire and alias the sub-SELECTs | Rejected: needs the fact side's alias as well, must handle asymmetric aliasing and live-Exasol verification, and bare rendering already solves the problem |
-| Parse the alias out of the rendered condition string | Rejected: string surgery on opaque SQL that cannot tell which alias belongs to which side |
-| Declare aliased joins ineligible for broadcast | Rejected: forfeits broadcast for every aliased query |
-
-### Consequences
-
-Aliased broadcast joins now resolve, with no wire-format change. The specs' claim that broadcast rendering is side-agnostic bare-name is now true by construction.
 
 ## ADR: Delete the plan-time backend guard; the store-URL collision is the only rule, and the scan owns it
 

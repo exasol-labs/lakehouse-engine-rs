@@ -1,29 +1,5 @@
 # Decisions: add-lakekeeper-aws-perf-catalog
 
-## ADR: The Lakekeeper write side is raw authenticated HTTP, not an `iceberg_catalog_rest::RestCatalog`
-
-**ID:** lakekeeper-write-side-raw-http-not-rest-catalog
-**Plan:** add-lakekeeper-aws-perf-catalog
-**Status:** Accepted
-
-### Context
-
-Lakekeeper's Management API and its Iceberg REST namespace-create and register-table calls need OAuth2 client-credentials auth. A full `RestCatalog` would need REST auth property keys that `lakehouse-catalog` holds crate-private.
-
-### Decision
-
-The provisioning script issues the Management API and Iceberg REST calls itself over one HTTP client with one Keycloak token.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Build a `RestCatalog` and call `register_table` | Rejected: needs crate-private auth keys with no exported constants, forcing a duplicated literal or a widened public surface |
-
-### Consequences
-
-Once the tool moved to bash, `lakekeeper-bash-json-body-construction-controls` superseded the part where the library owns wire shapes. The raw-HTTP, one-client, one-token part survives, now with `curl`.
-
 ## ADR: The catalog gets its own write-capable storage credential; the engine keeps read-only keys
 
 **ID:** lakekeeper-storage-credential-separate-from-engine-reader

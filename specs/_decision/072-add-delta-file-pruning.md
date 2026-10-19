@@ -48,26 +48,3 @@ The adapter translates comparisons over string columns and relies on `maxValues`
 
 delta-spark and `parquet` both keep the bound valid, and the kernel compensates only for timestamps. A writer that emitted a bare untagged prefix would defeat pruning undetectably, an assumption every Delta reader shares.
 
-## ADR: Never construct a false predicate or an empty junction
-
-**ID:** delta-pruning-never-construct-false-predicate
-**Plan:** add-delta-file-pruning
-**Status:** Accepted
-
-### Context
-
-The kernel turns an empty disjunction into literal `false`, which prunes every file and returns no rows. The kernel has no usable IN, so every IN list becomes an OR-chain, and an IN list whose elements all fail to convert is the empty case.
-
-### Decision
-
-The translator returns no predicate before any junction constructor sees an empty set. Tests assert that no input produces a literal false predicate.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Rely on the translator's structure to make the empty case unreachable | Rejected: one forgotten early return from a silent wrong-results bug |
-
-### Consequences
-
-An explicit guard and a dedicated test prevent a later edit from reintroducing the hazard unnoticed.
