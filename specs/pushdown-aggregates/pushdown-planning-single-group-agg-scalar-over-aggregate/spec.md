@@ -1,147 +1,16 @@
-# Feature: Pushdown Planning — Single-Group Scalar-Over-Aggregate Select Items
+# Feature: Pushdown Planning, Single-Group Scalar-Over-Aggregate Select Items
 
-Extends `pushdown-aggregates/pushdown-planning-single-group-agg` so an ungrouped `selectList` item
-that is a scalar function wrapping one or more aggregates — `ROUND(SUM(L_QUANTITY), 2)`,
-`ROUND(VARIANCE(C_ACCTBAL), 4)` — is decomposed into the same per-shard partial /
-outer-merge plan a bare aggregate already gets, and so a nested aggregate the merge cannot
-decompose routes to the qualified single-table wrapper instead of being evaluated per
-shard. Closes issue
-[#194](https://github.com/exasol-labs/lakehouse-engine-rs/issues/194) (unmerged
-per-shard partial rows returned as the answer) and issue
-[#188](https://github.com/exasol-labs/lakehouse-engine-rs/issues/188) (a scalar-wrapped
-`VARIANCE` reaching DataFusion under a name DataFusion does not define). Mirrors the split
-`pushdown-grouped-agg/pushdown-planning-grouped-agg-scalar-over-aggregate` made against
-`pushdown-grouped-agg/pushdown-planning-grouped-agg`: the base feature keeps capability
-advertisement, bare-aggregate detection, the AVG sum/count pair, the empty-`projection`
-contract, the `COUNT(DISTINCT)` branch, and the no-`OFFSET` merge; this feature owns only
-the scalar-wrapper shape.
+The adapter decomposes an ungrouped select item that is a scalar function wrapping aggregates, such as `ROUND(SUM(L_QUANTITY), 2)`, into the same per-shard partial and outer-merge plan a bare aggregate gets. A nested aggregate the merge cannot decompose routes to the qualified single-table wrapper.
 
 ## Background
 
-* **The defect is a silent wrong answer, verified live.** `SELECT ROUND(SUM(l_quantity), 2)
-  FROM LINEITEM` returns one row (`25304.00`) against a native Exasol schema and FOUR rows
-  (`7477.00`, `7033.00`, `8018.00`, `2776.00` — summing to `25304.00`) through the
-  lakehouse virtual schema, one per shard, with no error raised. `EXPLAIN VIRTUAL` shows
-  why: the broken query carries `"projection":[{"expr":"round(SUM(\"L_QUANTITY\"), 2)"}]`
-  with no `"aggregates"` and no merge, while the working bare `SUM(l_quantity)` carries
-  `"aggregates":[{"kind":"sum","column":"L_QUANTITY"}]` and a per-shard PARTIAL merged by
-  an outer wrapper.
-* **The defect does NOT live in aggregate classification.** `detect_aggregates`
-  (`adapter/pushdown/single_group_agg.rs`) requires every select-list item to be literally
-  `"function_aggregate"`; `ROUND(…)` is `"function_scalar"`, so single-group detection
-  ALREADY declines it today and `classify_request_shape` ALREADY yields
-  `RequestShape::RowScan`. `parse_agg_item` — which issue #194's own "Decided approach"
-  names — is never reached, so declining there would change nothing. The defect lives one
-  layer down, in the projection builder: `project_columns`'s `function_scalar`-family arm
-  calls `render_expression_safe`, whose `function_aggregate` arm renders a nested aggregate
-  verbatim as SQL text (deliberately — that arm is what the grouped merge-substitution
-  trick depends on). The item therefore renders SUCCESSFULLY as a `ProjectionItem::Expr`,
-  the widening signal stays `false`, and `build_dispatch_sql`'s `RowScan` arm feeds the
-  expression into the per-shard `EMITS` clause. Each shard's DataFusion then computes the
-  whole aggregate over its own files.
-* **`function_aggregate` is excluded from the pushable projection set only at the TOP
-  level.** `pushdown/pushdown-planning-selectlist-expressions` already requires that "the
-  pushable node-type set SHALL be exactly the set the translator renders MINUS
-  `function_aggregate` — so an aggregate select item reaches the aggregate planner or the
-  wrapper rather than being evaluated per shard as a projection item". A top-level
-  aggregate satisfies that rule through the projection builder's unknown-node arm. A
-  NESTED one does not, and this feature's companion delta to that feature extends the rule
-  to every depth.
-* **This feature is layered: a correctness floor plus a performance path.** The floor is
-  the depth-insensitive projection guard (delta to
-  `pushdown/pushdown-planning-selectlist-expressions`): any select-list item whose
-  subtree contains a `function_aggregate` widens the derived projection, so it can never be
-  evaluated per shard, on EVERY path that consumes that projection — single-table row scan,
-  broadcast join, and empty result. The performance path is the decomposition below, which
-  keeps the common shape on the partial/merge plan so the floor is reached only by shapes
-  the merge genuinely cannot express. The floor holds independently of the decomposition;
-  the decomposition is what stops the floor from being the normal outcome.
-* **The floor is reached only when decomposition declines, never instead of it.**
-  `build_dispatch_sql` reads the widening signal ONLY inside its `RequestShape::RowScan`
-  arm, and `classify_request_shape` reaches that arm only after both aggregate tiers
-  decline. A decomposable scalar-over-aggregate is therefore classified as
-  `RequestShape::SingleGroupAgg` and never consults the widening signal at all.
-* **The decomposition mechanism already exists and is already generic.** The grouped planner
-  (`adapter/pushdown/grouped_agg.rs`) carries `sentinelize_aggregates` (replace each nested
-  `function_aggregate` with a `__LH_AGG_MERGE_{i}__` sentinel `column`, collecting the
-  aggregates in encounter order, stopping recursion at an aggregate boundary, flagging a
-  bare `column` found OUTSIDE any aggregate as a disqualifying residual),
-  `classify_scalar_over_aggregate` (that traversal plus `parse_agg_item` on each collected
-  aggregate plus a renderability check on the sentinel tree),
-  `render_scalar_over_merge` (re-sentinelize, render the sentinel tree once through the
-  Exasol-dialect translator, then string-replace each sentinel token with that aggregate's
-  merged `PARTIAL_*` expression), and `fold_aggregate_plan` (dedup by `AggregatePlan`
-  equality, with a top-level occurrence's declared type overwriting a nested occurrence's
-  default). None of the four carries GROUP BY state: they operate on a `Vec<AggregatePlan>`
-  keyed by structural equality. The single-group merge already consumes the same
-  `merge_select_items` formulas through `cast_merge_items`, so the merged expressions
-  `render_scalar_over_merge` substitutes are the ones the single-group outer merge already
-  emits.
-* **Deduplication is a correctness requirement here, not an optimization.**
-  `render_scalar_over_merge` matches each nested aggregate to its merged expression by
-  `plans.iter().position(|p| *p == plan)` — the FIRST structurally-equal slot. Given
-  `SELECT COUNT(*), ROUND(SUM(q) / COUNT(*), 2)` an un-deduplicated plan list
-  `[Count, Sum, Count]` would resolve the nested `COUNT(*)` to slot 0 rather than slot 2,
-  so the ordinal the merge expression names and the ordinal the `EMITS` clause declares
-  diverge. Folding through `fold_aggregate_plan` collapses them to one slot and makes the
-  position lookup total.
-* **The plan list and the select-list item list stop being 1:1, so their declared-type
-  sources split.** `aggregate_exasol_types` (`adapter/pushdown/support.rs`) FILTERS
-  `selectList` to `function_aggregate` items, so a scalar-over-aggregate item is skipped
-  and every later index shifts — it cannot serve either consumer once a scalar item is
-  present. `partial_emits_items` needs a PER-PLAN type list (its `aggregate_types.get(i)`
-  is the sole type source for an expression-argument aggregate's `SUM`/`MIN`/`MAX` `EMITS`
-  column), and `cast_merge_items` needs a PER-SELECT-ITEM type list for the outer CAST.
-  This is the same split the grouped planner already made: `plan_types` built by
-  `fold_aggregate_plan` for the former, each `GroupedSelectItem`'s own `declared_type` for
-  the latter.
-* **Issue #188 is the same defect reached through the same node.** `VARIANCE` is Exasol's
-  alias for `VAR_SAMP`; DataFusion defines `var`, `var_samp`, and `var_pop` but no
-  `variance`. `vs-expression`'s `function_aggregate` arm splices the uppercased name
-  verbatim, so a per-shard projection carrying `variance(…)` fails DataFusion planning with
-  `Invalid function 'variance'. Did you mean 'radians'?`. Bare `VARIANCE(c_acctbal)` works
-  because `parse_agg_item` resolves the name through the `STAT_AGG_KINDS` table
-  (`pushdown-aggregates/pushdown-agg-sql-consolidation`) and the aggregate never reaches DataFusion
-  by name at all — the scan computes `(cnt, sum, sum_sq)` sufficient statistics.
-  `ROUND(VAR_SAMP(…), 4)` works because DataFusion happens to know that name.
-  `ROUND(VARIANCE(…), 4)`, `ABS(VARIANCE(…))`, and `VARIANCE(…) + 1` all fail identically.
-  Decomposition routes the nested aggregate through `parse_agg_item` and therefore through
-  the same two `AggKind` tables, so no aggregate function name crosses into DataFusion —
-  the alias mapping is not re-implemented, it is reached.
-* **No capability changes.** `SELECTLIST_EXPRESSIONS` and every aggregate capability this
-  shape needs are already advertised — which is exactly why the adapter owns the answer:
-  once a capability is advertised Exasol delegates it fully and never re-checks or
-  re-applies it, so a shape the adapter cannot faithfully push must be rendered as
-  equivalent SQL by the adapter itself, never omitted.
-* **The new classification adds no `aggregationType` check, matching the existing
-  detection.** `detect_aggregates` gates on `groupBy` being absent or empty and on the
-  select list's own shape, never on `aggregationType`. A select-list item with no nested
-  `function_aggregate` — `ROUND(price, 2)`, `UPPER(name)` — yields no aggregate to
-  decompose, declines the classification, and reaches the row-scan projection exactly as
-  today.
-* `dispatch_golden` fixtures: `storage-access/scan-spec-credential-reference` regenerates credential-bearing fixtures for their `storage` value; a diff outside that value is a regression. The relocation gate's full-string golden assertion holds against the fixtures as regenerated.
-* Iceberg spec compliance: checked, not engaged; quotes retrieved from the published spec,
-  not recalled. This feature changes how the adapter classifies an Exasol `selectList` item
-  and which SQL it assembles for the outer merge. It reads no manifest, resolves no
-  snapshot, touches no field-id projection, applies no delete file, and changes no type
-  mapping. The predicate tree handed to Iceberg file resolution is the unmodified `filter`
-  node, which this feature does not touch, and Iceberg-level file selection is driven by
-  column predicates: "Deriving partition predicates from column predicates on the table
-  data is used to separate the logical queries from physical storage: the partitioning can
-  change and the correct partition filters are always derived from column predicates"
-  (Apache Iceberg table spec, Specification → Partitioning).
-* Iceberg spec compliance, the one clause that could have been engaged and is not: this
-  feature does NOT answer any aggregate from manifest- or data-file-level statistics. Every
-  aggregate it plans is computed by scanning data files, which is what the spec requires
-  unconditionally — "Data files that match the query filter must be read by the scan" and
-  "Delete files and deletion vector metadata that match the filters must be applied to data
-  files at read time" (Specification → Scan Planning). A metadata-only aggregate would be
-  the deviation to justify, and this feature does not attempt one: `record_count` is
-  `required` in v1/v2/v3 but counts rows BEFORE delete application, and all five per-column
-  stat maps (`value_counts`, `null_value_counts`, `nan_value_counts`, `lower_bounds`,
-  `upper_bounds`) are `optional` in every format version (Specification → Manifests → Data
-  File Fields), so neither is a sound aggregate source. There is no deviation to fix and
-  none to track.
+* Without decomposition the scalar item renders as a per-shard projection expression, so each shard computes a whole aggregate over its own files and Exasol returns one row per shard.
+* `VARIANCE` is Exasol's alias for `VAR_SAMP`, and DataFusion has no function named `variance`. The decomposition resolves each nested aggregate name to an `AggKind` through the tables of `pushdown-aggregates/pushdown-agg-sql-consolidation`, so no aggregate function name reaches DataFusion.
+* The decomposition reuses the grouped planner's four primitives: the aggregate-sentinelizing tree walk, the scalar-over-aggregate classifier, the merge rewrite that substitutes each sentinel with its merged partial expression, and the deduplicating plan fold.
+* The merge rewrite binds each nested aggregate to the first structurally-equal plan slot, so the plan list must be deduplicated.
+* The plan list and the select list are no longer one-to-one. `aggregate_exasol_types` skips scalar items and shifts later indexes, so partial `EMITS` types come from the per-plan declared-type list and the outer CAST types come from each select item's own `selectListDataTypes` ordinal.
+* A select item with no nested aggregate, such as `ROUND(price, 2)`, yields no aggregate to decompose and reaches the row-scan projection.
+* Exasol delegates an advertised capability fully and never re-applies it, so the adapter renders equivalent SQL for any shape it cannot push.
 
 ## Scenarios
 

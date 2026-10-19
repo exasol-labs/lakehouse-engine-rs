@@ -1,49 +1,21 @@
 # Feature: Connection-Object Credential Source
 
-Lets the Virtual Schema read its catalog endpoint and object-storage credentials from a named Exasol CONNECTION object instead of plain VS properties, so credentials are managed and access-controlled by Exasol (never typed inline into `CREATE VIRTUAL SCHEMA`), and so the engine can authenticate to a cloud Iceberg REST catalog (AWS Glue, Databricks) and its backing object storage. The credential set carried by the CONNECTION selects WHICH storage backend the scan reads through whenever `use_vended_credentials` is false, selects whether requests to the catalog are AWS SigV4-signed, and selects whether the engine requests short-lived vended credentials at table-load time. Under vending, the CONNECTION's storage CREDENTIALS are ignored while its configured store `endpoint`, `region`, and `path_style` participate in ADDRESSING; `storage-access/pushdown-planning-cloud-credentials-vended-storage` specifies the effective storage and the precedence between the two sources. The REST-catalog authentication
-mode (none / static bearer token / OAuth2 client-credentials) is carried on the same
-CONNECTION and specified by the sibling feature `connection-credentials-catalog-auth`.
-The Azure Data Lake Storage Gen2 credential shape is specified by the sibling feature
-`connection-credentials-azure`. Parameterizing validation by the resolved `CatalogKind`
-and the Unity Catalog reuse of these auth fields is specified by the sibling feature
-`connection-credentials-unity-catalog`. The AWS Glue SigV4 catalog-signing requirement —
-`access_key`, `secret_key`, a signing region, and the standard-AWS-Glue-endpoint region
-derivation — is specified by the sibling feature `connection-credentials-sigv4`.
-The sibling feature `connection-credentials-assume-role` specifies AWS IAM role assumption:
-`aws_assume_role_arn`, `aws_external_id`, and `aws_sts_endpoint`.
+Lets the Virtual Schema read its catalog address and object-storage credentials from a named Exasol CONNECTION object instead of plain VS properties. The CONNECTION selects the storage backend, whether catalog requests are AWS SigV4-signed, and whether the engine requests vended credentials at table-load time.
 
 ## Background
 
-* **This delta discharges one deferral and changes no parsing or validation rule.** It implements issue #276, slice D of six (A-F). Every field this feature parses, every guard `validate_creds` applies, and every error text it produces are unchanged; what changes is only what a supplied storage credential MEANS once `use_vended_credentials` is true.
-* **SUPERSEDES the "Vended Azure credentials are out of scope (issue #276, slice D)" bullet.** That bullet recorded that an Azure CONNECTION setting `use_vended_credentials` "is accepted and reads with its STATIC credentials", citing a tracked exception in `storage-access/pushdown-planning-cloud-credentials-vended-storage`. Vended Azure credentials are now IN scope, that exception is discharged, and no `#276` citation remains in this feature.
-* **Under vending, a supplied storage credential is IRRELEVANT — ignored, not rejected.** `validate_creds` gains no rule about static storage fields appearing alongside `use_vended_credentials = true`. Rejecting the combination was considered and declined: the fields are optional on every path, a CONNECTION legitimately carries a static `region` and key pair for SigV4 catalog signing while vending its storage credentials, and adding a rejection would break exactly that shape. Saying "ignored" explicitly is the point of this bullet — an unstated irrelevance is the same silent ambiguity the rest of these rules exist to prevent.
-* **The Azure-and-S3 mixed-fields rejection still applies under vending, deliberately.** A CONNECTION supplying both credential sets declares two incompatible intents, and that stays an error even though vending would read neither set. Relaxing the guard because the values happen to be unused would trade a loud, cheap error for a class of misconfiguration nobody can observe.
-* **A vended-only Azure CONNECTION supplies NO Azure field, so no Azure guard fires.** Such a CONNECTION carries `warehouse`, its catalog-auth fields, and `use_vended_credentials = true` and nothing else. `validate_creds` accepts it, `storage_block` produces an S3 backend with every field empty, and the vended resolution never reads that backend — the table location's `abfss://` scheme selects the ADLS backend instead. This is why the vended path cannot be reached from `storage_block`'s output and had to become its own selector.
-* **The SigV4 requirement on `access_key`, `secret_key`, and `region` is unchanged and stays independent of vending.** Those three sign the catalog `load_table` request before any credential is vended, so they are catalog-authentication inputs. What this delta separates is their second, previously conflated use: they no longer reach the scan's storage once vending is requested.
-* **This delta separates CREDENTIALS from ADDRESSING under vending and is issue #330. It changes no parsing rule, no guard, and no error text.** `ConnectionCreds` gains no field and loses none; `validate_creds` gains no rule. What changes is only what a supplied `endpoint` and `region` MEAN once `use_vended_credentials` is true.
-* **SUPERSEDES the `region` half of the SigV4-static-values bullet.** That bullet read: "**The SigV4 requirement on `access_key`, `secret_key`, and `region` is unchanged and stays independent of vending.** … What this delta separates is their second, previously conflated use: **they no longer reach the scan's storage once vending is requested.**" The static `access_key` and `secret_key` still do not reach the scan's storage under vending. The static `region` DOES, as addressing. The SigV4 REQUIREMENT itself is untouched — those three fields still sign the catalog `load_table` request when the CONNECTION states them — so what widens is the consequence of supplying `region`, not the rule that demands it.
-* **SUPERSEDES this feature's earlier description sentence "Under vending, the CONNECTION's storage credentials are ignored; `storage-access/pushdown-planning-cloud-credentials-vended-storage` specifies the effective storage."** This feature is where the CONNECTION's field vocabulary is defined, and it elsewhere groups `endpoint` and `region` with `access_key` and `secret_key` under "static S3 credentials" — so a summary saying the storage credentials are ignored under vending would contradict the scenario below in the SAME spec file. The corrected sentence names the split: credentials ignored, `endpoint` and `region` read as addressing.
-* **The precedence rule itself stays single-homed and is CITED here, not restated.** `storage-access/pushdown-planning-cloud-credentials-vended-storage` § "Vended-credentials request advertises access delegation and resolves the store address with the CONNECTION winning when set" is the one normative home for which source wins per field. Restating it here would recreate the duplicated-rule-in-two-homes failure this plan exists to remove — that duplication is why this delta is needed at all.
-* **This delta widens `path_style` to a tri-state and flips its unstated meaning from `true` to `false` (#130).** `ConnectionCreds.path_style` and `StorageCreds.path_style` become `Option<bool>`: absent = unstated, supplied = the operator chose. AMENDS three scenarios, ADDS one, SUPERSEDES two Background bullets.
-* **SUPERSEDES "path_style is NOT admitted, and the reason is a type limitation".** The field CAN now express "unstated" and an explicitly stated value DOES participate in the CONNECTION-wins rule (`storage-access/pushdown-planning-cloud-credentials-vended-storage`).
-* **SUPERSEDES "The vending-DISABLED path is untouched".** The `true` default is the defect #130 reports. An unstated `path_style` now resolves to `false`, matching AWS S3 client convention.
-* **A resolved `false` DISCARDS a configured endpoint** (`build_undecorated_store`, `object_store.rs:226-231`, passes `endpoint` to `AmazonS3Builder` only inside `if storage.path_style`). This forces the new guard: a non-vended CONNECTION with an `endpoint` and no stated `path_style` is rejected rather than silently reaching the wrong host.
-* **`StorageProps` keeps its `bool` and `true` serde default.** It is the resolved wire type; the adapter always serializes the field. Decision [5] in the decision-log records the rationale.
-* **Neither the Iceberg table spec nor the Delta protocol constrain this choice.** `s3.path-style-access` appears nowhere in the Iceberg REST spec; Delta's `PROTOCOL.md` contains no `path-style`/`path_style`/`virtual-hosted`. Decision [9] records the evidence.
-* **The SigV4 signing region is a separate value from the CONNECTION's `region`.** `connection-credentials-sigv4` specifies the AWS Glue SigV4 catalog-signing requirement and the standard-AWS-Glue-endpoint region derivation. `region` itself holds exactly what the CONNECTION states and independently places the S3 store, whether or not a SigV4 signing region is derived from the address.
-
-The connection name is supplied as the VS property `CATALOG_CONNECTION`. The adapter
-resolves it with `ctx.connection(name)`. The resolved `ConnectionObject.address` is the
-catalog URI; the resolved `ConnectionObject.password` is a JSON object string carrying
-the credential fields. The resolved password value MUST NEVER appear in any error
-message, returned SQL, or log line. Both adapter entry points
-(`createVirtualSchema`/`refreshVirtualSchema` and `pushdown`) resolve credentials through
-this same path. `warehouse` is the only unconditionally-required field. Catalog
-authentication and S3 storage credentials are fully orthogonal: any combination is valid,
-including an unauthenticated catalog that vends S3 credentials and an OAuth-authenticated
-catalog used with static S3 credentials (the catalog-auth modes themselves are specified in
-`connection-credentials-catalog-auth`). The one conditional requirement is the AWS Glue SigV4
-path, specified by the sibling feature `connection-credentials-sigv4`. `endpoint` stays optional.
+* The VS property `CATALOG_CONNECTION` names the CONNECTION, and the adapter resolves it with `ctx.connection(name)`. The resolved `address` is the catalog URI, and the resolved `password` is a JSON object string with the credential fields.
+* Both adapter entry points (`createVirtualSchema`/`refreshVirtualSchema` and `pushdown`) resolve credentials through the same path.
+* The resolved password never appears in any error message, returned SQL, or log line.
+* `warehouse` is required under every catalog kind except `DIRECT_STORAGE`, which rejects it (`connection/connection-credentials-direct-storage`). `endpoint` stays optional.
+* Catalog authentication and S3 storage credentials are independent: any combination is valid (`connection/connection-credentials-catalog-auth`). The SigV4 requirement is in `connection/connection-credentials-sigv4`.
+* Under vending (`use_vended_credentials` true), storage credentials are ignored, not rejected. A CONNECTION can carry a static key pair and `region` for SigV4 catalog signing while vending its storage credentials.
+* Under vending, `endpoint`, `region`, and `path_style` are read as addressing. `storage-access/pushdown-planning-cloud-credentials-vended-storage` owns the precedence between the CONNECTION and the catalog response.
+* The Azure-and-S3 mixed-fields rejection applies under vending too, because a CONNECTION that supplies both sets declares two incompatible intents.
+* A vended-only CONNECTION supplies no Azure field. `storage_block` returns an S3 backend with every field empty and the vended resolution never reads it. The table location's `abfss://` scheme selects the ADLS backend.
+* `path_style` is optional: absent means unstated. `storage_block` resolves an unstated value to `false`, which addresses the bucket virtual-hosted as an AWS S3 client does.
+* A resolved `path_style` of `false` discards a configured `endpoint`, because the object-store builder takes `endpoint` only when `path_style` is true. A non-vended CONNECTION with an `endpoint` and no stated `path_style` is therefore rejected.
+* The storage-backend selection rule: Azure when `account_name` is present with exactly one of `account_key` and `sas_token`, S3 otherwise.
 
 ## Scenarios
 

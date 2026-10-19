@@ -1,65 +1,12 @@
-# Feature: VS Expression Translator — GREATEST/LEAST NULL Semantics
+# Feature: VS Expression Translator, GREATEST/LEAST NULL Semantics
 
-Splits `GREATEST`/`LEAST` out of the shared scalar-function shape in
-`sql-functions/vs-expression-translator-scalar-fns`, because merging this feature's new
-regression scenario into that feature would have pushed it past the 10-scenario library threshold
-(the same reason `FLOAT_DIV` was already split out of `vs-expression-translator-scalar-ops` into
-`sql-comprehension/vs-expression-translator-float-div`). `GREATEST`/`LEAST` diverge from their
-DataFusion counterpart on the NULL CONTRACT, not on name or arity (issue #202): Exasol returns NULL
-if ANY argument is NULL, while DataFusion's `greatest`/`least` return NULL only if ALL arguments are
-NULL. Both names still follow the verbatim rule on the Exasol dialect specified in
-`sql-functions/vs-expression-translator-scalar-fns` — this split covers only the DataFusion-
-dialect NULL-guard rendering and its live regression coverage.
+Renders `GREATEST` and `LEAST` in the DataFusion dialect with a NULL guard, so they match Exasol's NULL contract. The Exasol dialect follows the verbatim rule in `sql-functions/vs-expression-translator-scalar-fns`.
 
 ## Background
 
-**GREATEST/LEAST diverge on the NULL CONTRACT, not on the name (issue #202).** Exasol returns
-NULL if ANY argument is NULL; DataFusion returns NULL only if ALL arguments are NULL. Both halves
-were captured for issue #202 rather than recalled. On the Exasol 2025.2.1 container pinned in
-`docker-compose.yml`, `SELECT GREATEST(0.0, NULL), LEAST(1.0, NULL), GREATEST(1, 2, NULL),
-SQRT(GREATEST(0.0, NULL)), GREATEST(CAST(NULL AS DOUBLE)), LEAST(NULL, NULL), GREATEST('a', NULL)
-FROM dual` returned NULL in EVERY column, while `GREATEST(5)` returned `5`. The pinned DataFusion
-54.1.0 documents the opposite for both names — "Returns the greatest value in a list of expressions.
-Returns _null_ if all expressions are _null_" and the matching sentence for `least`
-(`datafusion-functions-54.1.0/src/core/greatest.rs:40` and `.../least.rs:40`). Issue #202 captured
-the end-to-end consequence against a native Exasol `TEST` schema: `WHERE LEAST(l_tax, l_discount,
-NULL) IS NULL` matched all 9965 rows natively and 0 rows through the virtual schema, and
-`GREATEST(c_acctbal, NULLIF(c_acctbal, c_acctbal))` returned NULL natively and `711.56` through the
-virtual schema.
-
-**The adapter owns the equivalence, so the guard belongs in the rendering.** `capabilities.rs`
-advertises `FN_GREATEST` and `FN_LEAST`, and Exasol never independently re-checks or re-applies an
-advertised capability — there is no Exasol-side fallback once a capability is advertised. The
-adapter therefore MUST generate SQL equivalent to Exasol's own semantics for anything it advertises,
-and a NULL contract is part of those semantics. Both capabilities stay advertised; the DataFusion
-dialect carries the guard.
-
-**The divergence is confined to this one pair.** Every arm of the `function_scalar` match was
-audited against DataFusion's documented NULL semantics for issue #202. DataFusion documents
-NULL-skipping for exactly five functions — `coalesce`, `concat`, `concat_ws`, `greatest`, and
-`least` — and of the names this translator maps, only `CONCAT` and `GREATEST`/`LEAST` reach that
-set. `CONCAT` is fixed in its own right, and in the OPPOSITE direction to this pair: Exasol's `||`
-treats a NULL operand as the empty string, so `concat`'s NULL-skipping is what `CONCAT` NEEDS —
-`sql-functions/vs-expression-translator-scalar-fns` records its `nullif(concat(...), '')`
-rendering and the live evidence for it (issue #374, superseding the chained-`||` rendering issue
-\#200 had introduced on a since-refuted reading of Exasol's `||`). `NULLIF` matches
-Exasol's own documented `CASE WHEN expr1 = expr2 THEN NULL ELSE expr1 END` definition under
-identical three-valued logic, so no divergence exists. `NULLIFZERO`→`nullif(x, 0)` and
-`ZEROIFNULL`→`coalesce(x, 0)` pass a single argument plus a literal, so `coalesce`'s NULL-skipping is
-the INTENDED behavior there rather than an accident. `MOD` renders the `%` operator, which propagates
-NULL in both engines. The remaining multi-argument names — `LPAD`/`RPAD`, `TRANSLATE`, `REPLACE`,
-`INSTR`/`LOCATE`, `POWER`/`ATAN2`, two-argument `ROUND`/`TRUNC`/`LOG`, `TO_DATE`/`TO_TIMESTAMP`, and
-the `*_BETWEEN` family — carry no ignore-NULL behavior on either side. The scope boundary is
-deliberate: no further name needs a guard, and this bullet exists so the question is not
-re-litigated.
-
-**The guard duplicates each argument's rendered TEXT, and that is safe here.** The rendered SQL
-names every argument twice — once in its `IS NULL` clause, once inside the call — so DataFusion may
-evaluate a nested argument expression twice. No translated `function_scalar` name is
-non-deterministic: `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, and `SYSTIMESTAMP` are
-deliberately absent from the declaration table and their capabilities are withdrawn, precisely
-because their value depends on context the scan never receives. Two copies of one argument therefore
-always evaluate to the same value.
+* Exasol returns NULL if any argument of `GREATEST` or `LEAST` is NULL. DataFusion's `greatest` and `least` return NULL only if all arguments are NULL.
+* The adapter advertises `FN_GREATEST` and `FN_LEAST`, and Exasol does not re-apply an advertised capability. The adapter must therefore generate SQL with Exasol's semantics, and the DataFusion dialect carries the guard.
+* The guard names each argument twice, once in its `IS NULL` clause and once in the call, so DataFusion may evaluate a nested argument twice. That is safe because no translated `function_scalar` name is non-deterministic. `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP` and `SYSTIMESTAMP` are absent from the declaration table, and their capabilities are withdrawn.
 
 ## Scenarios
 

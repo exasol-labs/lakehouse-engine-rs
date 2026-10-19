@@ -1,21 +1,13 @@
-# Feature: VS Expression Translator — Scalar Operations
+# Feature: VS Expression Translator, Scalar Operations
 
-Extends the VS expression translator (`sql-comprehension/vs-expression-translator`) with arithmetic operators and the safe/fallback entry points. CAST target-type rendering is covered in `sql-comprehension/vs-expression-translator-cast`. Named math/string/conditional scalar functions are covered in `sql-functions/vs-expression-translator-scalar-fns`; date/time functions in `sql-functions/vs-expression-translator-date-fns`. Floating-point division (`FLOAT_DIV`) is split out into its own dedicated feature, `sql-comprehension/vs-expression-translator-float-div`, because its rendering diverges by dialect — every other arithmetic operator here still renders byte-identically in both dialects.
+Extends the VS expression translator (`sql-comprehension/vs-expression-translator`) with arithmetic operators and the safe entry points. CAST targets are in `sql-comprehension/vs-expression-translator-cast`, named scalar functions in `sql-functions/vs-expression-translator-scalar-fns`, date/time functions in `sql-functions/vs-expression-translator-date-fns`, and floating-point division (`FLOAT_DIV`) in `sql-comprehension/vs-expression-translator-float-div`.
 
 ## Background
 
-The `crates/vs-expression` crate exposes six public entry points in two dialect trios. The DataFusion trio feeds DataFusion's SQL frontend inside the scan UDF:
-- `render_expression` — raising mode, returns `Err` for unsupported nodes
-- `render_expression_safe` — returns `None` for unsupported nodes, never panics
-- `render_df_filter_safe` — same as `render_expression_safe` but also returns `None` for trivially-true results (e.g. `TRUE`, `NULL`) so the adapter can omit no-op filters from the scan spec
-
-The Exasol trio — `render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe` — carries the same three contracts for fragments Exasol's own core engine parses.
-
-The arithmetic operator nodes and every decline in this feature behave identically in both dialects with ONE exception: `+`, `-`, `*` and unary `-` are the same syntax in both parsers, and a declined function is declined in both because the adapter advertises one capability set for both dialects — but `/` (`FLOAT_DIV`) diverges by dialect, specified in `sql-comprehension/vs-expression-translator-float-div`.
-
-A conversion or operator node is translated only when its DataFusion 54 result matches Exasol. Exasol `DIV` returns the integer quotient by truncating toward zero — verified live: `DIV(-7,2) = -3` and `DIV(15.7,6.2) = 2` — and raises a division-by-zero error (SQL state 22012). DataFusion 54 has no `div` builtin; its `/` truncates only integer operands and divides non-integer operands fractionally. No single rendering reproduces `DIV` across every operand type, so `DIV` stays unsupported — the disqualifier is that a wrong rendering would be wrong on EVERY row for non-integer operands, the per-row problem rather than the zero-divisor one (see the `FLOAT_DIV` feature for why that same type-blindness does not disqualify `FLOAT_DIV`). DataFusion 54 `to_char` uses strftime masks rather than Exasol's Oracle-style format models and rejects numeric formatting, and DataFusion 54 has no `to_number`. These three functions are therefore left unsupported and fall back to Exasol. The bitwise operator functions (`BIT_AND`, `BIT_OR`, `BIT_XOR`, `BIT_NOT`, `BIT_LSHIFT`, `BIT_RSHIFT`, `BIT_LROTATE`, `BIT_RROTATE`, `BIT_CHECK`, `BIT_SET`, `BIT_TO_NUM`) are likewise unsupported: Exasol defines them over an unsigned 64-bit integer domain that DataFusion's signed-integer operators and the `Int64` → `DECIMAL(20,0)` mapping do not reproduce, and six of the eleven have no DataFusion builtin at all (issue #108).
-
-The `crates/vs-expression` crate stays a pure, stateless JSON-to-SQL translator with no column-type context. The adapter-synthesized node type `decimal_to_varchar_exasol` and the crate-visible pure helper `format_decimal_exasol_style` let an adapter that has already resolved a column as DECIMAL inject an Exasol-faithful DECIMAL→string trim without the translator inspecting types (see `pushdown-types/pushdown-planning-decimal-string-format`).
+* The DataFusion entry points are `render_expression` (returns `Err` for unsupported nodes), `render_expression_safe` (returns `None` for unsupported nodes, never panics), and `render_df_filter_safe` (as safe, and also returns `None` for trivially-true results such as `TRUE` and `NULL`). The Exasol entry points `render_expression_exasol`, `render_expression_exasol_safe`, and `render_df_filter_exasol_safe` carry the same three contracts.
+* `+`, `-`, `*`, and unary `-` use the same syntax in both parsers. `/` (`FLOAT_DIV`) renders differently per dialect.
+* A conversion or operator node is translated only when its DataFusion 54 result matches Exasol. `DIV`, `TO_CHAR`, `TO_NUMBER`, and the bitwise functions fail that test and fall back to Exasol.
+* The crate is a pure, stateless translator with no column-type context. An adapter that has resolved a column as DECIMAL injects the synthesized node `decimal_to_varchar_exasol`, rendered with the crate-visible helper `format_decimal_exasol_style` (`pushdown-types/pushdown-planning-decimal-string-format`).
 
 ## Scenarios
 

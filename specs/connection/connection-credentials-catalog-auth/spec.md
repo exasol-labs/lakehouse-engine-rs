@@ -1,30 +1,16 @@
 # Feature: Catalog Authentication Credentials
 
-Carries the REST-catalog authentication credentials on the resolved CONNECTION, beyond the
-static-S3 storage credentials covered by `connection-credentials`. The Virtual Schema can reach
-an Iceberg REST catalog in one of three mutually exclusive modes: no catalog authentication, a
-static bearer `token`, or an OAuth2 client-credentials exchange (`client_id` + `client_secret`,
-with optional `oauth2_server_uri` and `scope`). Catalog authentication is fully orthogonal to S3
-storage credentials and to credential vending — an unauthenticated catalog may still vend S3
-credentials, and an OAuth-authenticated catalog may be used with static S3 credentials.
+Carries the REST-catalog authentication credentials on the resolved CONNECTION. A CONNECTION uses one of three mutually exclusive modes: no catalog authentication, a static bearer `token`, or an OAuth2 client-credentials exchange (`client_id` and `client_secret`, with optional `oauth2_server_uri` and `scope`).
 
 ## Background
 
-The catalog-auth fields live on the same JSON CONNECTION password parsed by
-`connection-credentials` and are exposed on the resolved credentials for the planning layer to
-consume; they never cross the UDF boundary. Catalog authentication and AWS SigV4 request signing
-are mutually exclusive strategies: SigV4 signs the `load_table` request with static AWS
-credentials, whereas catalog token/OAuth authenticates to the REST catalog itself, so enabling
-both is a configuration error. Every authentication value (`token`, `client_secret`) MUST NEVER
-appear in any error message, returned SQL, or log line.
-
-* **This feature is issue #331. It adds ONE validation rule and ONE structural guarantee, and it changes no accepted CONNECTION and no existing error text.** The rule makes the three mutually exclusive modes this feature already declares ENFORCED rather than assumed. Before it, a CONNECTION supplying a `token` together with a complete `client_id`/`client_secret` pair was accepted and one mode silently won — with OPPOSITE precedence per catalog kind: `resolve_catalog_auth` (`crates/lakehouse-catalog/src/auth.rs`) resolved the pair ahead of the `token`, while `resolve_unity_auth` (`crates/lakehouse-catalog/src/unity/auth.rs`) resolved the `token` ahead of the pair. Nothing declared which answer was correct.
-* **The rule fires only when ALL THREE of `token`, `client_id`, and `client_secret` are supplied, and the narrowness is deliberate.** A `token` alongside HALF a pair is already rejected by the OAuth2-completeness rule with its existing message, so the two rules are DISJOINT and every error this feature already produces stays byte-identical. Widening the new rule to "a `token` plus ANY OAuth2 field" would replace a recorded error text for an input that is rejected either way — buying one fewer operator round-trip on a doubly-malformed CONNECTION at the cost of changing a message the spec already pins.
-* **The two rules together leave exactly three accepted shapes, which is what turns "mutually exclusive" into a guarantee.** Those shapes are: no auth field; a `token` alone; a complete `client_id` + `client_secret` pair. Every other combination of the three fields is a named user error. That closure is the precondition the shared mode classifier below depends on.
-* **The rule is kind-independent and lives in the ONE shared validation path.** A native Unity Catalog reuses these same three fields and adds no CONNECTION field of its own (`connection/connection-credentials`), so a per-kind copy of the rule would be the same duplication that produced the opposite-precedence defect in the first place.
-* **The mode DECISION gets one owner, and that is the fix's other half.** Three functions independently re-derived the mode from the same three fields — `resolve_catalog_auth` and `inject_catalog_auth_props` (`crates/lakehouse-catalog/src/auth.rs`) and `resolve_unity_auth` (`crates/lakehouse-catalog/src/unity/auth.rs`) — which is precisely why two of them could disagree. One decision with three homes is the back-door leakage `/speq:design-philosophy` singles out; rejecting the ambiguous input without removing the duplication would leave the three free to drift apart again.
-* **`inject_catalog_auth_props`' doc comment already asserted "Token and client-credentials are mutually exclusive by construction" while its own body encoded a precedence.** The claim becomes TRUE by enforcement rather than being deleted, which is the resolution issue #331 chose over deleting the sentence.
-* **AWS SigV4 stays OUTSIDE the mode classification, deliberately.** SigV4 is a catalog-auth strategy this feature already declares mutually exclusive with token/OAuth, but only the Iceberg REST path can carry it: the Unity kind rejects `use_sigv4` outright, and the prop-injection path never receives it. Folding SigV4 into the shared classification would force two of the three consumers to handle a case that cannot reach them. The Iceberg strategy resolution therefore dispatches on `use_sigv4` ahead of the classification — a choice between two upstream-exclusive strategies, NOT a precedence.
+* Catalog authentication is independent of S3 storage credentials and of credential vending. An unauthenticated catalog can vend S3 credentials, and an OAuth-authenticated catalog can use static S3 credentials.
+* The catalog-auth fields live on the JSON CONNECTION password parsed by `connection-credentials` and never cross the UDF boundary.
+* Catalog token or OAuth authentication and AWS SigV4 signing are mutually exclusive. SigV4 signs the `load_table` request with static AWS credentials, and token or OAuth authenticates to the REST catalog itself.
+* The validation rules leave exactly three accepted shapes: no auth field, a `token` alone, or a complete `client_id` and `client_secret` pair. A `token` with only one of the pair is rejected by the OAuth2-completeness rule, which is disjoint from the token-plus-pair rule.
+* The token-plus-pair rule applies to every catalog kind, because Unity Catalog reuses the same three fields.
+* An empty-string field is absent.
+* No authentication value (`token`, `client_secret`) appears in any error message, returned SQL, or log line.
 
 ## Scenarios
 

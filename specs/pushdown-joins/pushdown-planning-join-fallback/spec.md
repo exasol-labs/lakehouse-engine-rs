@@ -1,137 +1,18 @@
-# Feature: Pushdown Planning — Unified Unaccelerated Join Fallback
+# Feature: Pushdown Planning, Unified Unaccelerated Join Fallback
 
-Extends pushdown planning with the SINGLE unified renderer that serves every inner
-equi-join outside the two-table broadcast contract. Each involved table is scanned
-independently through its own sharded fan-out subquery — nested `LAKEHOUSE_DISTRIBUTE_FILES`
-distributor over an ungrouped `LAKEHOUSE_SCAN` SCALAR EMIT UDF — and all N legs are
-reconstructed into the original inner join by Exasol's core engine. The FROM clause is
-rendered as a left-to-right `INNER JOIN … ON` chain (not a comma cross-join with one flat
-`WHERE`): each join condition attaches to the `ON` of the join point at which every table
-it references is in scope, and each leg's leg-local `WHERE` conjuncts are pushed into
-that leg's fan-out so DataFusion prunes and filters per leg. Column references are
-attributed to a JOIN LEG — one occurrence of a table in the FROM tree — never to a table
-name; the leg-attribution binding itself, and its self-join-specific correctness properties,
-are owned by the sibling feature `pushdown-joins/pushdown-planning-join-fallback-self-join`. The
-unaccelerated fallback has exactly one implementation for all N ≥ 2 legs.
+One renderer serves every inner equi-join outside the two-table broadcast contract. It scans each involved table through its own sharded fan-out subquery (a nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor over an ungrouped `LAKEHOUSE_SCAN` SCALAR EMIT UDF) and rebuilds the join in Exasol's core engine as a left-to-right `INNER JOIN ... ON` chain, with leg-local `WHERE` conjuncts pushed into each leg.
 
 ## Background
 
-* Column-to-leg attribution for a table joined to itself — including leaf alias retention, the
-  `(tableName, alias)` leg key, and the unattributable-reference hard error — is owned by the
-  sibling feature `pushdown-joins/pushdown-planning-join-fallback-self-join`. Every attribution
-  decision described here (expression rendering, leg-local WHERE attribution, join-condition
-  attachment, per-leg projection narrowing) is resolved through that feature's single `JoinLegs`
-  binding, which this feature's renderers consult rather than re-derive.
-* **Leaf order is the FROM tree's left-to-right traversal, not the SQL text order.** A three-leg
-  join arrives as ONE request with left-deep nesting (`join(join(A,B),C)`), and the existing
-  recursive walk already flattens any nesting to N leaves in traversal order. Leg indexes, and
-  therefore subquery aliases, are assigned in that order; no decision depends on it matching the
-  written order.
-* **The N = 1 qualified wrapper's name collapse is deliberate and unchanged.** That entry point
-  maps EVERY involved table name onto its single `LHS_T0` subquery, because there is exactly one
-  scan and no leg to disambiguate. It keeps that behavior, including leaving a column whose
-  `tableName` is not an involved table unqualified.
-* **The refusal check stays name-keyed, deliberately.** `ensure_no_side_refuses_a_referenced_column`
-  charges a format reader's refused column to every side whose name matches, and already charges an
-  untagged column to every side. Over-charging is the fail-safe direction for a refusal — it
-  refuses a query that might read a refused column, never admits one that does — so name-keying is
-  correct there and is left unchanged rather than narrowed to a leg.
-* **The Iceberg table spec does not bear on this delta.** The change is Exasol-SQL column-to-leg
-  attribution over the pushdown JSON and the generated wrapper SQL. It reads no manifest, no
-  snapshot, no field id, and no type mapping, and it behaves identically on Iceberg and Delta
-  tables — the established format-agnostic property of every SQL-shape pushdown decision. There is
-  no normative spec section to quote and no deviation to track.
-* This delta corrects which conjuncts reach a fan-out leg. A conjunct reaches a leg only if the leg
-  can actually apply it, so a leg-local conjunct the DataFusion dialect cannot render is residual
-  and lands in the outer wrapper's `WHERE` rather than being pushed into a leg that then drops it.
-  The set the legs receive and the set the outer wrapper renders stay exact complements, so the
-  partition remains total and disjoint. See `pushdown/pushdown-declined-filter-self-apply`.
-* The renderability screen governs the RENDER path only. Each leg's Iceberg manifest-pruning
-  predicate keeps EVERY conjunct attributed to that leg, renderable or not, because pruning only
-  ever removes files that provably cannot match; narrowing that input would silently open more
-  files and buy no correctness.
-* The stale claim that the outer Exasol query "still applies the FULL `WHERE`" is corrected in the
-  same change: it applies exactly the residual set, and the residual set is now defined so that
-  every conjunct no leg applies is in it.
-* The outer wrapper's `WHERE` is rendered from ONE renderer over ONE combined residual tree, and that
-  render has THREE outcomes, not two. An ABSENT residual set emits no clause. A residual set that
-  renders TRIVIALLY TRUE emits no clause and is not an error — the trivially-true-suppressing
-  renderer returns nothing for it exactly as it does for an unrenderable one, so that renderer alone
-  cannot decide the error. A residual set the NON-SUPPRESSING qualified render also cannot express is
-  UNRENDERABLE and returns the wrapper's existing client-facing error. Only the third outcome errors.
-* The adapter advertises exactly `JOIN`, `JOIN_TYPE_INNER`, and `JOIN_CONDITION_EQUI` (`pushdown-joins/pushdown-planning-join`); there is no per-query opt-out, so Exasol pushes every inner equi-join of any arity — including a table joined to itself — and expects this fallback (or the broadcast path) to serve it.
-* Each leg's Iceberg snapshot, data-file list, and logical schema are resolved exactly once per leg per pushdown, in the planning layer, recovering each leg's original-cased Iceberg identifier from `TABLE_MAP` by its involved-table name; no scan UDF invocation discovers files itself.
-* The unaccelerated fallback is a SINGLE unified renderer for every inner join with N ≥ 2 legs: the two-leg case is exactly N = 2, and there is only one implementation. Each leg is scanned through its own nested-distributor + scalar-scan fan-out subquery, and all N subquery results are reconstructed into the original inner join by Exasol's core engine. Broadcast (strictly two-table, node-local in the scan UDF, `pushdown-joins/pushdown-planning-join`) is an optimization SELECTED WITHIN the one join path, not a second rendering implementation; when broadcast is unavailable for a two-table join it takes the same N = 2 unified fallback.
-* Because each advertised capability is served statically and Exasol never re-plans on an adapter error (a declined pushdown is erased by the `exasol-udf-macros` FFI shim into a hard `F-UDF-CL-RUST-9001` SQL error — there is NO native-retry response in the protocol), an advertised join capability MUST always be renderable by the join path: either by broadcast or by the unified unaccelerated fallback. "Decline at runtime and let Exasol retry natively" is not an available behavior. A hard error is a genuine last resort, raised ONLY for a shape the adapter cannot render at all — a non-inner join node in the tree, an involved table absent from `TABLE_MAP` or carrying no column metadata, a join condition/clause the translator cannot render, or a column reference no leg key matches — and it is a hard client-facing error, not a retry.
-* Every clause the wrapper renders (join conditions, WHERE, select list, GROUP BY, HAVING, ORDER BY) uses table-qualified column references resolved to each `column` node's own LEG, so the wrapper is correct whether or not two legs share a column name and whether or not two legs are the same table.
-* This ONE wrapper serves four production entry points, all reaching the same `ORDER BY`-rendering seam: a real inner equi-join of N ≥ 2 legs; a grouped request that did not decompose into the partial/merge shape (`GroupByWrapper`); a single-group request with more than one `COUNT(DISTINCT)` or a distinct mixed with an ordinary aggregate (the Case 2/3 count-distinct decline, `pushdown-aggregates/pushdown-planning-count-distinct`); and a row scan whose derived projection the pre-existing fallback widened. Advertising `ORDER_BY_EXPRESSION` (`pushdown-capabilities/pushdown-planning-order-by-capability`) makes an expression sort key reachable on ALL FOUR at once: the wrapper already renders arbitrary expressions for its own clauses through the qualified expression renderer, so relaxing the sort-key parser's bare-column gate is what makes an expression key render on every entry point, with no per-entry-point rendering work added. The `User` decline for an expression the renderer cannot render is stated once, in `pushdown-capabilities/pushdown-planning-topn`, and covers this wrapper too.
-* **This wrapper renders its own final window, so it owns the offset too (issue #191).** The
-  wrapper resolves its `LIMIT` from the request independently of the row-scan dispatcher's
-  withheld binding, and renders it on its own outer SELECT over limit-free, sort-free fan-out
-  legs. The offset therefore belongs on that same outer SELECT, through the one shared
-  limit-and-offset seam. All four entry points that reach this wrapper — an N-scan inner
-  equi-join, a non-decomposing grouped request, a Case 2/3 `COUNT(DISTINCT)` decline, and a
-  widened-projection row scan — share the single render site, so one seam change covers all
-  four with no per-entry-point work.
-* **Issue #307 withdraws the former "every LIMIT-carrying join reaches this wrapper, never broadcast" claim.** A bare `LIMIT` with a zero or absent `limit.offset`, and a bare-projected-column `ORDER BY` — with or without a `LIMIT`, and with or without an `OFFSET` — are now served by the broadcast path instead, per `pushdown-joins/pushdown-planning-join`: the bare `LIMIT` as a per-shard post-join cap plus the outer merge limit, the ordering as an outer wrapper over the broadcast fan-out (`(#309)`). Those shapes were DECLINED by the broadcast gate, not unrenderable there, so "never broadcast", "every offset-bearing join shape lands here by construction", and "the broadcast renderer emits no `LIMIT` or `ORDER BY` at all and needs no offset handling" are each false after this delta. What still reaches this wrapper is the NARROWER set enumerated below. The offset-implies-ordering reasoning of this feature's recorded OFFSET scenario is UNCHANGED for the shapes that do reach here: that scenario reasons about which shapes arrive carrying an offset, and only the MEMBERSHIP of that set narrows — the invariant it rests on, that a non-zero `limit.offset` never arrives without a non-empty `orderBy` (`pushdown-capabilities/pushdown-planning-order-by-capability`), is untouched, and a `LIMIT` carrying a non-zero `limit.offset` with no `orderBy` still lands here.
-* **What still reaches this wrapper is now a NARROWER, explicitly enumerated set.** From the ordering-and-window family: a `limit` with a non-zero `limit.offset` and no `orderBy`; any non-`column` sort key; a sort key missing its direction or NULL-placement flag; and a sort key naming a column absent from the broadcast projection. From the postprocessing family, unchanged: an aggregate select item, a non-empty `groupBy`, `aggregationType == "group_by"`, and a non-null `having`. Everything else that reached this wrapper before — above threshold, non-equi, N ≥ 3, overlapping column names, a table joined to itself, unrenderable condition or filter, widened projection — is untouched by this delta.
-* **This wrapper's own limit and offset handling is UNCHANGED.** It still resolves `LIMIT`/`OFFSET` from the request independently, renders them on its own outer SELECT after GROUP BY / HAVING / ORDER BY, through the one shared limit-and-offset seam, over limit-free and sort-free fan-out legs. No clause of the recorded offset scenario is narrowed or superseded; only which requests arrive here changes.
-* **A fallback leg's fan-out spec must stay limit-free for a reason that is NOT merely "the outer SELECT applies it".** A row limit means something categorically different on the two paths the shared fan-out helper serves: on a broadcast spec the scan UDF applies it AFTER the node-local join, whereas a leg spec feeds a bare single-table scan whose rows Exasol has yet to join. A limit that leaked into a leg would cap that leg's pre-join INPUT — discarding rows that would have matched and keeping rows that produce no output — and silently return wrong rows with no error. The recorded "no leg drops a row that the join or the window still needs" clause states the consequence; this delta names the mechanism and pins it with a test, because a sibling path built by the same helper now carries a cap.
-* **The two meanings are separated by the TYPE, not by a shared field plus a rule.** The broadcast per-shard cap is a field OF THE JOIN BLOCK (`post_join_limit`), not of the shard-invariant common spec, so it exists only where a join block exists. The shard-invariant `limit` field the single-table, TopN, and raw-scan paths use is left out of the join path entirely: the broadcast builder MUST NOT set it, and the scan reads the cap from the join block. That field's own doc comment names `post_join_limit` as the join path's cap; `post_join_limit`'s doc comment is the authoritative statement of what a post-join cap means, and the leg builder, the broadcast builder, and the scan-side renderer defer to it instead of restating the rule.
-* The leg-eligibility test grows a THIRD condition. It was "local to exactly one leg AND
-  syntactically renderable for DataFusion"; it becomes "…AND accepted by the type-rewrite pipeline
-  run against THAT LEG's own column metadata AND whose REWRITTEN form the DataFusion dialect can
-  render". Issue #215: the syntactic screen (`datafusion_renderable`) carries no column-type
-  awareness, so a leg-local LIKE over a non-string column was classified leg-eligible and rendered
-  bare into the leg's scan spec — the tree that hard-fails DataFusion's `type_coercion` planner at
-  scan execution time.
-* The renderability half of that condition MUST target the REWRITTEN tree, not the raw one, because
-  the REWRITTEN tree is what the leg renders. Screening the raw tree for renderability and the
-  rewritten tree only for type-acceptance would let a conjunct that is type-accepted but
-  rewritten-unrenderable fall out of the leg half AND out of the residual half — applied nowhere,
-  returning extra rows with no error. That is the defect #279 found at the broadcast site, and the
-  single-table owner already carries the arm that prevents it
-  (`classify_where_filter`'s `(Some(raw), Some(tree)) if !datafusion_renderable(tree) => (None, Some(raw))`).
-  The N-scan site inherits that arm rather than diverging from it.
-* The new condition CANNOT be folded into the existing pre-attribution screen, and that is a
-  structural constraint rather than an implementation preference. `renderable_only` /
-  `declined_only` partition the WHOLE top-level conjunct set with ONE predicate BEFORE
-  leg-local attribution runs, whereas the type screen needs the OWNING leg's own `col_types` — and
-  unlike broadcast, the N-scan path has NO disjoint-column-name precondition, so two legs MAY
-  declare the same column name with different Exasol types, and two legs of the SAME table declare
-  every column name twice. The type screen therefore runs PER LEG, PER CONJUNCT, AFTER attribution,
-  and the leg/residual partition is computed in that order: per-leg legs first, residual last.
-* The screen is per CONJUNCT, not per leg-local tree, so one type-declining conjunct does not
-  forfeit the other leg-local conjuncts' pushdown. This is a deliberate difference from the
-  single-table WHERE surface, where a decline is necessarily whole-filter because there is one
-  filter and one wrapper; here the partition already exists and can absorb a single conjunct.
-* The residual set gains a third disjoint component: the cross-leg complement of the leg-eligible
-  half, the syntactically-declined half, and now the per-leg TYPE-declined conjuncts. All three
-  are disjoint by construction — the type-declined set is drawn from conjuncts that are inside the
-  leg-eligible half AND local to one leg, which is exactly the complement of the other two.
-* The per-leg split is FAIL-CLOSED in BOTH directions: if the re-formed accepted-conjunct tree does
-  not itself survive the pipeline, OR survives but is not renderable for DataFusion (either must hold,
-  since each of its conjuncts satisfied both, but nothing in the type system forbids it), the WHOLE
-  leg-local set goes to the residual rather than being silently lost. A conjunct applied nowhere
-  returns wrong rows, so the safe direction is always "residual".
-* The tree a leg receives is now the pipeline's REWRITTEN tree, not the raw one, so a leg-local
-  DATE-column LIKE keeps its leg pushdown as `CAST(<col> AS VARCHAR) LIKE …` instead of becoming
-  residual. Only what the LEG renders changes; each leg's Iceberg manifest-pruning predicate keeps
-  every conjunct attributed to it in RAW form, unchanged by this delta.
-* The residual conjunct rendered into the outer wrapper's `WHERE` is the RAW conjunct, in the
-  Exasol dialect, because Exasol applies the implicit non-string-to-VARCHAR coercion DataFusion
-  refuses — which is the whole reason the predicate is safe there and not in the leg.
-* This delta adds no new residual MECHANISM and no new error path for a filter. The residual bucket, its
-  qualified render, and its both-dialects-unrenderable error are owned by
-  `pushdown/pushdown-declined-filter-self-apply`; only the set of triggers that reaches the bucket
-  widens. See `pushdown-types/pushdown-planning-like-type-coercion` for the per-surface type dispatch.
-* **Every offset-carrying request reaching this seam carries a resolvable ordering.** Verified
-  live on the four shapes that reach it with a non-zero `limit.offset`: a grouped
-  `COUNT(DISTINCT)` (`GROUP BY MOD(id,4)`, `ORDER BY 1 LIMIT 2 OFFSET 1`), a self-join ordered
-  by an ordinal, a self-join ordered by a qualified column, and a self-join with a `GROUP BY`.
-  All four pushed a non-empty `orderBy` alongside the offset. The wrapper therefore never has
-  to choose between a bare `OFFSET` and a failure, and MUST NOT be given a failure branch for
-  that choice.
+* One implementation serves all N >= 2 legs. Broadcast (`pushdown-joins/pushdown-planning-join`) is an optimization selected within the join path, not a second renderer.
+* A leg is one occurrence of a table in the FROM tree. Column-to-leg attribution is owned by `pushdown-joins/pushdown-planning-join-fallback-self-join`.
+* Legs are numbered in the FROM tree's left-to-right traversal order, and subquery aliases follow that order.
+* The adapter advertises `JOIN`, `JOIN_TYPE_INNER`, and `JOIN_CONDITION_EQUI` with no per-query opt-out, and Exasol never re-plans on an adapter error. Every advertised join shape must therefore render by broadcast or by this fallback. A hard client-facing error (`F-UDF-CL-RUST-9001`) is raised only for a shape the adapter cannot render at all.
+* The wrapper has four entry points: an inner equi-join of N >= 2 legs, a grouped request that did not decompose into the partial/merge shape (`GroupByWrapper`), a single-group request with more than one `COUNT(DISTINCT)` or a distinct mixed with an ordinary aggregate (`pushdown-aggregates/pushdown-planning-count-distinct`), and a row scan whose derived projection was widened. All four share one `ORDER BY` and window rendering site.
+* The wrapper resolves its own `LIMIT` and `OFFSET` and renders them on its outer SELECT over limit-free, sort-free fan-out legs. A row limit that leaked into a leg would cap that leg's pre-join input and return wrong rows. A non-zero `limit.offset` never arrives without a non-empty `orderBy` (`pushdown-capabilities/pushdown-planning-order-by-capability`).
+* The broadcast path declines, and this wrapper serves: a non-zero offset without `orderBy`, a non-column sort key, a sort key missing its direction or NULL-placement flag, a sort key absent from the broadcast projection, and the four Exasol-postprocessing conditions.
+* A top-level WHERE conjunct reaches a leg only if it is local to that leg, accepted by the type-rewrite pipeline against that leg's own column metadata, and renderable for DataFusion in its rewritten form. Every other conjunct is residual and lands in the outer wrapper's `WHERE`. The leg and residual sets are exact complements (`pushdown/pushdown-declined-filter-self-apply`).
+* The outer `WHERE` render has three outcomes. An absent residual set emits no clause. A residual set that renders trivially true emits no clause and is not an error. A residual set the non-suppressing qualified render cannot express returns the wrapper's client-facing error.
 
 ## Scenarios
 

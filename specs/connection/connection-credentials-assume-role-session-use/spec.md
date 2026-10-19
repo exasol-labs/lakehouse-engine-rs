@@ -1,14 +1,11 @@
 # Feature: Assumed-Role Session Use
 
-Defines where the session of an assumed AWS IAM role replaces the CONNECTION's own key pair. The session signs SigV4 catalog requests and native Glue requests, serves as the storage credential when the CONNECTION does not vend, and reaches the scan only inside the sealed envelope. A CONNECTION that names no role reaches the catalog with its own key pair, and a CONNECTION that vends keeps its vended storage credentials. Tracked by issue [#139](https://github.com/exasol-labs/lakehouse-engine-rs/issues/139).
+Defines where the session of an assumed AWS IAM role replaces the CONNECTION's own key pair: SigV4 catalog requests, native Glue requests, and non-vended object storage. The scan receives the session only inside the sealed envelope.
 
 ## Background
 
-* **The base identity is the CONNECTION's own key pair.** `access_key`, `secret_key`, and an optional `session_token` sign the request. No ambient AWS credential is read: no environment variable, instance profile, or web-identity token.
-* **STS region.** The region is the SigV4 signing region of `connection/connection-credentials-sigv4`, else `us-east-1`. Without `aws_sts_endpoint`, the SDK resolves the regional endpoint. A China-region CONNECTION states `aws_sts_endpoint`, because the AWS STS endpoint table lists China endpoints under `.amazonaws.com.cn`.
-* **The session replaces the key pair only where the pair is read.** Those reads are SigV4 catalog signing, the native Glue API requests of the `GLUE` catalog kind, and non-vended object storage.
-* **A cross-account Glue `CatalogId` is an untested exception (#TBD).** A `GLUE` CONNECTION whose `warehouse` names another account's `CatalogId` sends that id unchanged, but no test covers it. The supported way to read another account's Glue catalog is a role in that account with `warehouse` omitted, so Glue resolves the role's own account.
-* See `connection/connection-credentials-assume-role` for the CONNECTION fields that name the role, their validation, and the `AssumeRole` call.
+* The base identity is the CONNECTION's own `access_key`, `secret_key`, and optional `session_token`. A CONNECTION that names no role reaches the catalog with this key pair.
+* The session replaces the key pair only where the pair is read: SigV4 catalog signing, the native Glue API requests of the `GLUE` catalog kind, and non-vended object storage. A CONNECTION that vends keeps its vended storage credentials.
 
 ## Scenarios
 

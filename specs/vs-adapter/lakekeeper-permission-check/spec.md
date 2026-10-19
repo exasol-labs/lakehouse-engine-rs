@@ -1,13 +1,13 @@
 # Feature: Lakekeeper Permission Check
 
-Refuses a query over a table that the querying Exasol user holds no Lakekeeper grant to read. When a virtual schema sets `PERMISSION_CHECK = 'LAKEKEEPER'`, the adapter maps the querying user to a Lakekeeper principal with the `USER_MAPPING` template and asks Lakekeeper once per query whether that principal can read each table. Without that property the adapter behaves as before and contacts no management API (#415).
+The adapter refuses a query over a table that the querying Exasol user holds no Lakekeeper grant to read. When a virtual schema sets `PERMISSION_CHECK = 'LAKEKEEPER'`, the adapter maps the querying user to a Lakekeeper principal with the `USER_MAPPING` template and asks Lakekeeper once per query whether that principal can read each table. Without that property the adapter contacts no management API.
 
 ## Background
 
 * `PERMISSION_CHECK` is a virtual-schema property. Absent or empty means off. `LAKEKEEPER`, in any letter case, means on. With the check on, `USER_MAPPING` is required. With the check off, `USER_MAPPING` is ignored.
 * The check works only for a virtual schema over an Iceberg REST catalog whose URI ends in `/catalog`, and only against a Lakekeeper server. Lakekeeper reports a missing table the same way as a denied one.
-* The check covers every Iceberg REST pushdown shape. Creating, refreshing, and altering a virtual schema run no check, so the table listing shows tables that a querying user holds no grant to read (#416 asserts this limitation end to end).
-* To check another identity, the CONNECTION's identity needs a Lakekeeper grant that includes `can_read_assignments` on each checked table, for example `manage_grants` on the warehouse or the namespace (#414).
+* The check covers every Iceberg REST pushdown shape. Creating, refreshing, and altering a virtual schema run no check, so the table listing shows tables that a querying user holds no grant to read.
+* To check another identity, the CONNECTION's identity needs a Lakekeeper grant that includes `can_read_assignments` on each checked table, for example `manage_grants` on the warehouse or the namespace.
 * `USER_MAPPING` is a template. Its one variable, `user`, holds the querying user's name exactly as Exasol reports it, which is uppercase for an undelimited name. The template's output, without leading and trailing whitespace, is the Lakekeeper user id. The adapter assumes no id format.
 * A template may use conditions, lookup tables, filters, and tests, and may span several indented lines. It cannot include other templates. A lookup of a missing value fails the query instead of yielding a partial id, and a template that runs too long is refused.
 * A mapped id is refused when it is empty or holds a whitespace or control character.

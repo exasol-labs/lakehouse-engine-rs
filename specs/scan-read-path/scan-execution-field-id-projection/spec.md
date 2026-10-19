@@ -1,81 +1,17 @@
-# Feature: DataFusion Scan Execution — Field-Id-Based Column Projection
+# Feature: DataFusion Scan Execution, Field-Id-Based Column Projection
 
-When the scan spec carries a logical schema, the scan UDF binds each logical column to a physical Parquet column, file by file. A logical field binds by Iceberg field-id, by a declared physical name, or by its own name, depending on which key it carries. For a file field with no embedded field-id, field-id binding falls back to the table's `schema.name-mapping.default` and then to the physical name. Projection therefore stays correct across Iceberg schema evolution and Delta column mapping, and a renamed column returns its real values in every file.
-
-This feature covers the three binding strategies, the per-physical-field resolution order, the once-per-query resolution of `schema.name-mapping.default`, and the first-file inference fallback for a scan spec that carries no logical schema.
+Binds each logical column of the scan spec's logical schema to a physical Parquet column, file by file. A logical field binds by Iceberg field-id, by a declared physical name, or by its own name, depending on which key it carries. Projection therefore stays correct across Iceberg schema evolution and Delta column mapping, and a renamed column returns its real values in every file.
 
 ## Background
 
-* When the scan spec carries a logical schema (a list of `{field_id, name, arrow_type,
-  nullable, initial_default}` tuples), the scan UDF registers its file-list table provider with that
-  schema (each field tagged with `PARQUET:field_id` metadata) and installs a
-  `FieldIdExprAdapter` that resolves each logical column to its physical Parquet column by,
-  in order: (1) an embedded `PARQUET:field_id` match; (2) for a physical field that carries
-  NO embedded field-id, the table's `schema.name-mapping.default` mapping of that physical
-  name to a field-id present in the logical schema; (3) a physical-name match. Steps (2) and
-  (3) apply only to fields without an embedded field-id; step (2) augments — never
-  replaces — the physical-name fallback of step (3).
-* The adapter is applied per file by the Parquet opener, so files with divergent physical
-  layouts within one shard each bind correctly, and the default fill is decided per file
-  from that file's actually-present field-ids.
-* The `schema.name-mapping.default` table property and each field's `initial-default` are
-  resolved ONCE per query in the VS planning layer (at `resolve_file_list`, when the logical
-  schema is read from the Iceberg current schema). The scan UDF never re-reads Iceberg table
-  metadata. The encoded `initial-default` carried in the scan spec is JSON-portable and
-  credential-free.
-* When the scan spec does NOT carry a logical schema, the field-id adapter is not installed
-  and the scan falls back to first-file schema inference unchanged.
-* Out-of-scope: parsing nested `fields` entries of `schema.name-mapping.default` for
-  struct / map / list children (#83); and Iceberg column-projection rule (1) — substituting
-  an Identity-Transform partition value for an absent field — which is not implemented
-  anywhere in this engine. Because rule (1) is unimplemented, if BOTH an Identity-Transform
-  partition value and an `initial-default` could resolve the same absent field-id, this
-  engine returns the `initial-default` (rule 3) rather than the partition value (rule 1). For
-  an ADDED column read from older files this is the correct and only-available value, so this
-  ordering is a deliberate, accurately-scoped trade-off, not a silent gap.
-* **This delta is issue #342.** It generalizes the column-binding adapter from ONE binding strategy
-  to THREE, so a logical field declares HOW it binds instead of the adapter assuming every field binds
-  by Iceberg field-id. A logical field carries either a field-id, or a physical name, or neither; the
-  adapter dispatches on which one is populated.
-* **The three strategies and who populates them.** By field-id — Iceberg (always) and Delta `id`
-  column mapping, matched against the physical field's `PARQUET:field_id`. By physical name — Delta
-  `name` column mapping, matched against the Parquet column's own name. By identity — Delta `none`
-  column mapping, matched against the logical name itself.
-* **Iceberg behavior is unchanged, and the recorded field-id scenarios stay accurate.** The Iceberg
-  planning path populates a field-id on EVERY logical field and never populates a physical name, so
-  the recorded embedded-field-id, `schema.name-mapping.default`, and physical-name-fallback scenarios
-  describe exactly what an Iceberg scan still does. They are now scoped by construction to fields that
-  carry a field-id.
-* **Per-physical-field resolution order, extended by one step.** For each physical field: (1) an
-  embedded `PARQUET:field_id` matching a logical field's id is authoritative, and a field carrying an
-  id that no logical field declares keeps its physical name; (2) a logical field DECLARING this
-  physical field's name as its physical name claims it; (3) `schema.name-mapping.default` maps this
-  physical name to a field-id present in the logical schema; (4) the physical name is kept unchanged,
-  which is what makes identity binding resolve. Step (2) is new and sits ABOVE the name-mapping
-  because a per-column declaration read from the table's own metadata is authoritative, while a
-  name-mapping entry is a table-level fallback for files that carry no field-id at all. The two never
-  co-occur today: the Iceberg path populates no physical name and the Delta path carries an empty
-  name-mapping.
-* **`name_mapping` and `initial_default` are unchanged.** Their resolution, their once-per-query VS
-  encoding step, their round-trip vocabulary, and the decimal-domain gate on the encoding step all
-  stay exactly as recorded.
-* **Every strategy wraps the SAME `DefaultPhysicalExprAdapterFactory`.** Type-divergence cast, per-file
-  NULL-fill for an absent nullable column, `initial-default` substitution, and the required-absent
-  clean error are decided by one delegate for all three strategies, so a Delta `none`-mode table gets
-  the same semantics as an Iceberg table rather than a thinner path.
-* **Apache Iceberg spec check — no Iceberg rule changes and no deviation is introduced.** The table
-  spec's Column Projection section states "Columns in Iceberg data files are selected by field id" and
-  that "projection must be done using field ids"; the Iceberg reader still gives every logical field
-  its field-id, so this holds unchanged. The spec's ordered resolution for a field id not present in a
-  data file — "(1) Return the value from partition metadata if an Identity Transform exists for the
-  field and the partition value is present in the `partition` struct on `data_file` object in the
-  manifest. (2) Use `schema.name-mapping.default` metadata to map field id to columns without field id
-  ... (3) Return the default value if it has a defined `initial-default` ... (4) Return `null` in all
-  other cases." — keeps its recorded implementation status exactly: rules (2), (3), and (4) are
-  implemented and unchanged, and rule (1) stays the deliberate, accurately-scoped trade-off this
-  feature already records. This delta neither closes nor widens that gap, and the physical-name and
-  identity strategies are unreachable from an Iceberg scan.
-* See `scan-read-path/scan-execution-field-id-projection-absent-fields` for absent-field resolution: `initial-default` encoding and substitution, NULL-fill, and the required-absent error.
+* The logical schema is a list of `{field_id, name, arrow_type, nullable, initial_default}` tuples. The scan UDF registers its file-list table provider with that schema, tags each field with `PARQUET:field_id` metadata, and installs a `FieldIdExprAdapter`. The Parquet opener applies the adapter per file, so files with divergent physical layouts in one shard each bind correctly.
+* A logical field carries a field-id, a physical name, or neither. By field-id: Iceberg (always) and Delta `id` column mapping. By physical name: Delta `name` column mapping. By identity, matching the logical name itself: Delta `none` column mapping and every field of a direct-storage table. The Iceberg planning path populates a field-id on every logical field and never a physical name.
+* The adapter resolves each physical field in this order. (1) An embedded `PARQUET:field_id` matching a logical field's id is authoritative. A field carrying an id that no logical field declares keeps its physical name. (2) A logical field that declares this physical name claims it. (3) `schema.name-mapping.default` maps this physical name to a field-id present in the logical schema. (4) The physical name stays unchanged, which makes identity binding resolve. Steps (2) to (4) apply only to a field without an embedded field-id. Step (2) sits above the name-mapping because a per-column declaration from the table's own metadata is authoritative, while a name-mapping entry is a table-level fallback.
+* All three strategies wrap the same `DefaultPhysicalExprAdapterFactory`, which decides type-divergence cast, per-file NULL-fill, `initial-default` substitution, and the required-absent error.
+* The VS resolves `schema.name-mapping.default` and each field's `initial-default` once per query. The scan UDF never re-reads Iceberg table metadata.
+* A scan spec without a logical schema installs no adapter and infers the schema from the first file.
+* Out of scope: parsing nested `fields` entries of `schema.name-mapping.default` for struct, map and list children. Also out of scope is Iceberg Column Projection rule (1), which substitutes an Identity-Transform partition value for an absent field. When both a partition value and an `initial-default` could resolve an absent field-id, the engine returns the `initial-default`. That is a named trade-off, and for an added column read from older files it is the only available value.
+* `scan-read-path/scan-execution-field-id-projection-absent-fields` specifies absent-field resolution.
 
 ## Scenarios
 

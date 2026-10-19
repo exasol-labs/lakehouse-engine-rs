@@ -1,4 +1,4 @@
-# Feature: VS Expression Translator — Datetime Format Models
+# Feature: VS Expression Translator, Datetime Format Models
 
 Translates the format model of a pushed `TO_DATE` or `TO_TIMESTAMP` call into the strftime pattern
 that the node-local scan parses, so the conversion runs in the scan and returns the value native

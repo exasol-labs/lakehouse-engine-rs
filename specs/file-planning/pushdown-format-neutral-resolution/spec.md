@@ -1,31 +1,13 @@
 # Feature: Format-Neutral Pushdown Resolution
 
-Routes every pushdown request through the table-format reader seam, so the ONE thing a pushdown needs
-from a table's format — its active file list, its logical schema, its partition columns, its table
-root, and the storage those were resolved through — is produced by the reader that owns that format
-and consumed by a pipeline that names no format at all. This is what makes a Delta table queryable:
-the refusal that blocked every Unity Catalog pushdown is replaced by a resolution seam, not by a
-Delta-shaped branch, so a single-table scan, each leg of a broadcast join, and every aggregate shape
-reach a Delta table by the same route they reach an Iceberg one.
+Routes every pushdown request through the table-format reader seam. The reader that owns a table's format produces its active file list, logical schema, partition columns, table root, and storage, and the rest of the pipeline names no format. A single-table scan, each leg of a broadcast join, and every aggregate shape therefore reach a Delta table by the same route as an Iceberg table.
 
 ## Background
 
-The seam already exists and is exercised only by tests: a `FormatReader` returns a `ResolvedScan`,
-`format_reader` selects the reader by exhaustively matching a `ScanSource`, and both concrete readers
-are private to that module. Production pushdown reaches none of it — it calls the Iceberg-only file
-resolver directly, from the single-table path and from each join leg, and the adapter refuses a Unity
-Catalog pushdown outright before any of that runs.
-
-Resolution economy is a recorded property this feature preserves: a request resolves its catalog
-session ONCE and reuses it for every table it touches, so a two-leg join performs no more catalog
-authentication round-trips than a single-table scan.
-
-Pushdown SQL shape is format-agnostic in this engine: projection, filter, LIMIT, ORDER BY, aggregate
-decomposition, and join eligibility are decided from the request's SQL alone and are unchanged by
-this feature. Only file resolution differs per format.
-
-* **This delta is issue #135. It amends ONE scenario and changes no resolution rule.** The one format-reader seam, the one catalog session per request, the single catalog-kind match site, the Unity identity round trip, the resolver collapse, the partition-column propagation, the loud plan-time failure, and the kind-blind capability advertisement are all UNCHANGED.
-* **SUPERSEDES this feature's byte-identity gate for the `storage` value alone.** The generated SQL and the serialized per-shard scan specs stay byte-identical EXCEPT for the `storage` value, which becomes the tagged wrapper of `storage-access/scan-spec-credential-reference`. Every other byte of every request's output is unchanged, which is what keeps this gate meaningful rather than waived.
+* A `FormatReader` returns a `ResolvedScan`. `format_reader` selects the reader by matching a `ScanSource` exhaustively, and both concrete readers are private to that module.
+* A request resolves its catalog session once and reuses it for every table it touches, so a two-leg join performs no more catalog authentication round-trips than a single-table scan.
+* Pushdown SQL shape (projection, filter, LIMIT, ORDER BY, aggregate decomposition, join eligibility) is decided from the request's SQL alone. Only file resolution differs per format.
+* The generated SQL and the serialized per-shard scan specs are byte-identical to the output before the format-reader seam, except for the `storage` value, which is the tagged wrapper of `storage-access/scan-spec-credential-reference`.
 
 ## Scenarios
 

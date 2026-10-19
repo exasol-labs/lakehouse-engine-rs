@@ -1,50 +1,19 @@
-# Feature: DataFusion Scan Execution — Partial Aggregate Output
+# Feature: DataFusion Scan Execution, Partial Aggregate Output
 
-The scan UDF partial-aggregate path: computing node-local aggregates inside
-DataFusion, emitting per-shard partial results in a form the Exasol wrapper SQL
-can merge into the final query result.
+The scan UDF computes node-local aggregates in DataFusion and emits per-shard partial results that the Exasol wrapper SQL merges into the final result.
 
 ## Background
 
-* When a scan spec carries partial-aggregate instructions the UDF runs a DataFusion
-  aggregation over its assigned files and emits partial results rather than raw rows.
-* The partial results are shaped so the Exasol wrapper can combine them across shards
-  with standard SQL aggregate functions (`SUM`, `MIN`, `MAX`). `COUNT(DISTINCT)` is NOT a
-  partial aggregate on this path — the adapter dispatches it as a DISTINCT row-scan (see
-  `pushdown-aggregates/pushdown-planning-count-distinct` and the DISTINCT row-scan scenario below).
-* The same file-assignment, filter, and pushdown rules from `datafusion-scan/scan-execution`
-  apply on the partial-aggregate path.
-* The partial-aggregate path registers the full logical table schema and builds its
-  DataFusion query from the `aggregates` field. It does not consult the scan spec's
-  `projection` field; DataFusion's own projection pushdown derives the physical column
-  set from the partial-aggregate query text.
-* Only SDK Value types cross the `.so` boundary; no Arrow types.
-* See `datafusion-scan/scan-execution` for the base raw-row scan scenarios and emit model.
-* See `scan-aggregation/scan-execution-grouped-agg` for grouped partial-aggregate
-  memory, spill, and group-key scenarios.
-* The SDK validates every emitted `Value` against the declared output column before buffering
-  it. Each partial-aggregate column is coerced to the Arrow type its declared `ExaType` (read
-  from `UdfContext::output_column`) requires before per-cell conversion — the same emit-boundary
-  coercion the raw-row path uses.
-* Group-key columns keep their existing `value_to_gk_string` stringification (declared
-  `VARCHAR(2000000)`) and are NOT coerced, because an Arrow cast would change the group-key text
-  and therefore the merge identity across shards.
-* The declared-`Numeric` payload rule is owned by `datafusion-scan/scan-execution-value-conversion`
-  and applied identically on both emit paths. Since `exasol-udf-sdk` 0.28.1 that rule covers an
-  out-of-range `precision` or `scale` only, because `ExaType::Numeric` no longer holds an absent one
-  (issue #405).
-* This path carries a SECOND timestamp conversion site, independent of the Arrow `emit_batch` one.
-  `partial_row_from_batch` coerces each column to the declared Arrow type, then converts the single
-  cell to a `Value` through `arrow_value_at`. That conversion reads the array at its OWN unit, so a
-  `TIMESTAMP(9)` column keeps the digits the coercion preserved.
-* The site is reachable rather than theoretical. `validate_agg_col_types` requires a numeric column
-  for `SUM` and the statistical family only, and `MIN`/`MAX` are valid over any comparable type
-  (DATE, TIMESTAMP, VARCHAR included), so `MIN`/`MAX` over a nanosecond timestamp column is pushed
-  into this path.
-* `Value::Timestamp` carries a nanosecond-resolved `chrono::NaiveDateTime`, so the SDK type imposes
-  no limit here. Whether the SLC's `Value` wire encoding preserves those digits is measured on the
-  live engine rather than inspected, because the encoding lives in the language container rather
-  than in the SDK crate.
+* A scan spec with partial-aggregate instructions makes the UDF run a DataFusion aggregation over its assigned files and emit partial results instead of raw rows. The wrapper combines them across shards with `SUM`, `MIN`, and `MAX`.
+* `COUNT(DISTINCT)` is not a partial aggregate. The adapter dispatches it as a DISTINCT row-scan (`pushdown-aggregates/pushdown-planning-count-distinct`).
+* The partial-aggregate path applies the file-assignment, filter, and pushdown rules of `datafusion-scan/scan-execution`.
+* The path registers the full logical table schema and builds its DataFusion query from `aggregates`. It does not consult `projection`. DataFusion's projection pushdown derives the physical column set from the query text.
+* Only SDK `Value` types cross the `.so` boundary, no Arrow types.
+* The SDK validates every emitted `Value` against the declared output column. The UDF coerces each partial-aggregate column to the Arrow type its declared `ExaType` (from `UdfContext::output_column`) requires before converting the cell, as the raw-row path does.
+* Group-key columns keep their `value_to_gk_string` stringification (declared `VARCHAR(2000000)`) and are not coerced, because an Arrow cast would change the group-key text and the merge identity across shards.
+* The declared-`Numeric` payload rule is owned by `datafusion-scan/scan-execution-value-conversion` and applies on both emit paths. It covers an out-of-range `precision` or `scale` only, because `ExaType::Numeric` holds no absent one.
+* `partial_row_from_batch` converts each coerced cell to a `Value` through `arrow_value_at`, which reads the array at its own unit, so a `TIMESTAMP(9)` column keeps its digits. `MIN` and `MAX` are valid over any comparable type, so `MIN`/`MAX` over a nanosecond timestamp column reaches this path.
+* `Value::Timestamp` carries a nanosecond-resolved `chrono::NaiveDateTime`. Whether the SLC's wire encoding preserves those digits is measured on the live engine, because the encoding lives in the language container.
 
 ## Scenarios
 

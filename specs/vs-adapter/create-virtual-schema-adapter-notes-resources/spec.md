@@ -1,43 +1,15 @@
-# Feature: Create Virtual Schema — AdapterNotes Resource Configuration
+# Feature: Create Virtual Schema, AdapterNotes Resource Configuration
 
-Records the computed resource budgets — parallelism factor, DataFusion threading
-mode and per-instance thread/partition allocation, and memory-pool parameters — in
-the `createVirtualSchema` response `adapterNotes` so that every per-shard scan UDF
-instance receives a correctly sized CPU and memory envelope without the adapter
-persisting any state between requests.
+The adapter records the computed resource budgets in the `createVirtualSchema` response `adapterNotes`: parallelism factor, DataFusion threading mode and per-instance thread and partition counts, and memory-pool parameters. Each per-shard scan UDF instance then gets a sized CPU and memory envelope, and the adapter persists no state between requests.
 
 ## Background
 
-* All resource values are resolved at `createVirtualSchema` time from VS/connection
-  properties and returned in `adapterNotes` (stringified JSON), which Exasol persists
-  and round-trips back at pushdown time.
-* The adapter MUST NOT use `schemaMetadata.properties` for this purpose, as Exasol
-  2025.2.1 silently drops adapter-returned properties. The `adapterNotes` channel is
-  queryable via `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES`.
-* The per-node core count `nr_of_cores` comes from `std::thread::available_parallelism()`
-  alone, resolved once per request and defaulting to `1` when the platform cannot report
-  it. No VS property overrides it, and it is not itself recorded in `adapterNotes` (see
-  `vs-adapter/create-virtual-schema-adapter-notes`). Each derivation below takes the
-  resolved count as a plain argument, so a unit test injects an arbitrary count without
-  touching the host.
-* The parallelism factor is supplied as a VS/connection property and recorded in
-  `adapterNotes`; when absent it defaults to a hardware-aware value derived from
-  `nr_of_cores`.
-* The DataFusion threading configuration is selected by a `DATAFUSION_THREADING_MODE`
-  VS/connection property (`AUTO` or `FIXED`, default `AUTO`). In `FIXED` mode the two
-  independent properties `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF`
-  are used verbatim (each defaulting to `max(nr_of_cores, 1)`); in `AUTO` mode the
-  adapter derives a per-instance thread budget that does not oversubscribe a node (see
-  `scan-runtime/scan-execution-threading`). Only the resolved integer fields are
-  round-tripped into the per-shard scan spec.
-* The per-instance memory budget is two independent VS/connection properties —
-  `MEMORY_POOL_FRACTION` (default `0.6`) and `INSTANCE_OVERHEAD_MB` (default `200`) —
-  each recorded in `adapterNotes` and round-tripped into every per-shard scan spec,
-  where the scan UDF sizes its DataFusion pool to
-  `fraction × (per_instance_limit − overhead_bytes)`.
-* See `vs-adapter/create-virtual-schema-adapter-notes` for how the per-node core count
-  is discovered, for why it is not recorded, and for why the cluster node count is
-  deliberately NOT recorded here.
+* The adapter resolves all resource values at `createVirtualSchema` time from VS and connection properties and returns them in `adapterNotes` (stringified JSON). Exasol persists them and returns them at pushdown time. `schemaMetadata.properties` is not used, because Exasol 2025.2.1 silently drops adapter-returned properties. `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES` exposes the notes.
+* `nr_of_cores` comes from `std::thread::available_parallelism()` alone, resolved once per request and defaulting to `1` when the platform cannot report it. No VS property overrides it, and it is not recorded in `adapterNotes` (see `vs-adapter/create-virtual-schema-adapter-notes`). Each derivation takes the count as an argument, so a unit test can inject any count.
+* The parallelism factor is a VS or connection property recorded in `adapterNotes`. When absent, it defaults to a value derived from `nr_of_cores`.
+* `DATAFUSION_THREADING_MODE` (`AUTO` or `FIXED`, default `AUTO`) selects the threading configuration. `FIXED` uses `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF` as given, each defaulting to `max(nr_of_cores, 1)`. `AUTO` derives a per-instance budget that does not oversubscribe a node (`scan-runtime/scan-execution-threading`). Only the resolved integers reach the per-shard scan spec.
+* `MEMORY_POOL_FRACTION` (default `0.6`) and `INSTANCE_OVERHEAD_MB` (default `200`) are independent VS or connection properties. The adapter records both in `adapterNotes` and copies them into every per-shard scan spec. The scan UDF sizes its DataFusion pool to `fraction × (per_instance_limit − overhead_bytes)`.
+* `vs-adapter/create-virtual-schema-adapter-notes` covers how the core count is discovered, why it is not recorded, and why the cluster node count is not recorded.
 
 ## Scenarios
 

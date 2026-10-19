@@ -1,29 +1,14 @@
 # Feature: Parquet Directory Seam: File Listing
 
-This feature covers how the Parquet directory seam lists the data files under a storage prefix. It lists recursively in a deterministic order, applies one of two file patterns, and excludes hidden segments and zero-length objects. It applies a file-keep predicate to each file's partition values before any footer is read, and it lists a catalog-registered location by its raw object key.
-
-It also covers the listing answer, which serves a caller whose catalog already declares the schema and the partition columns. That answer returns the files and their partition values, reads no footer, and shares its file rules with the schema-resolving answer.
+The Parquet directory seam lists the data files under a storage prefix recursively in a deterministic order. It applies one of two file patterns, excludes hidden segments and zero-length objects, applies a file-keep predicate to each file's partition values before any footer is read, and lists a catalog-registered location by its raw object key.
 
 ## Background
 
-* The seam names NO catalog kind, NO table format, and NO Exasol virtual-schema property. The
-  listing answer takes an object store, a prefix, the caller's declared partition columns, and a
-  file-keep predicate over partition values. Any later consumer that needs "the Parquet files under
-  this prefix" calls it directly.
-* It answers TWO questions. The schema-resolving answer serves direct-storage table enumeration,
-  which maps the folded schema to the neutral catalog columns and their declarations
-  (`direct-storage/parquet-directory-seam`). The listing answer serves every pushdown over Parquet
-  files: direct-storage query planning, whose partition columns come from the column notes
-  (`vs-adapter/column-source-notes`), and the catalog-declared Parquet reader
-  (`unity-catalog/unity-parquet-table-planning`, `glue/glue-table-planning`), whose catalog
-  declares the schema.
-* The plain listing step, which applies the file pattern and the fixed hidden-segment rule, is
-  separate from the folder-name partition inference layered on it. The Glue reader uses the plain
-  step alone, because Glue supplies each partition's values.
-* Hive-style partition discovery belongs to this seam. `direct-storage/direct-storage-hive-partitioning`
-  specifies its rules, including the one key-name rule both answers apply: a key matches its column
-  under the uppercase fold, and two spellings of one key fail.
-* See `direct-storage/parquet-directory-seam` for the seam's single-function contract, the merge mode, and the schema fold over Parquet footers.
+* The seam names no catalog kind, no table format, and no Exasol virtual-schema property. The listing answer takes an object store, a prefix, the caller's declared partition columns, and a file-keep predicate over partition values. It returns the files and their partition values, reads no footer, and shares its file rules with the schema-resolving answer.
+* The schema-resolving answer serves direct-storage table enumeration (`direct-storage/parquet-directory-seam`). The listing answer serves every pushdown over Parquet files: direct-storage planning, whose partition columns come from the column notes (`vs-adapter/column-source-notes`), and the catalog-declared Parquet readers (`unity-catalog/unity-parquet-table-planning`, `glue/glue-table-planning`).
+* The plain listing step applies the file pattern and the fixed hidden-segment rule. The folder-name partition inference is layered on it. The Glue reader uses the plain step alone, because Glue supplies each partition's values.
+* `direct-storage/direct-storage-hive-partitioning` specifies Hive-style partition discovery, including the key-name rule both answers apply: a key matches its column under the uppercase fold, and two spellings of one key fail.
+
 
 ## Scenarios
 

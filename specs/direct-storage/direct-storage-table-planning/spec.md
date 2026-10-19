@@ -1,38 +1,17 @@
 # Feature: Direct-Storage Table Planning
 
-Resolves a directory of Parquet files into the engine's existing `ScanSpec` shape at plan time.
-That shape serves a catalog-free table exactly as it already serves an Iceberg and a Delta table.
-File-level sharding, the pushdown wire format, streaming emit, and the memory model are unchanged.
+The adapter resolves a directory of Parquet files into the engine's `ScanSpec` at plan time. File-level sharding, the pushdown wire format, streaming emit, and the memory model are the same as for an Iceberg or Delta table.
 
 ## Background
 
-* There is no snapshot, no transaction log, and no manifest. The reader's whole job is to turn a
-  table root plus the table's column notes into the resolved scan every other reader returns.
-* Format dispatch stays ONE exhaustive match over the scan source. That source pairs a resolved
-  session with the table it reads. A third variant is a compile error at that one site.
-  `delta/delta-table-planning` already records that guarantee.
-* The reader owns NO listing and NO partition parsing of its own: both come from the listing answer
-  of `direct-storage/parquet-directory-seam-file-listing`, the seam table enumeration also reads.
-  The reader parses NO footer. Its logical schema, partition columns, and refused columns come from
-  the column notes that enumeration recorded (`vs-adapter/column-source-notes`).
-* Identity column binding is not a new mechanism. A logical field carrying neither a field-id nor a
-  declared physical name binds by its own name. Delta's `none` column-mapping mode already ships
-  that binding, and `scan-read-path/scan-execution-field-id-projection` already specifies it.
-* This reader has no catalog statistics to prune from. Its plan-time file list is every file under
-  the table root that `direct-storage/direct-storage-hive-partitioning` keeps. Footer-statistics
-  pruning would need the footer reads planning no longer performs, so issue
-  [#412](https://github.com/exasol-labs/lakehouse-engine-rs/issues/412) is closed as superseded by
-  #426. This is recorded here as an explicit exception rather than an unstated gap.
-* Nothing bounds a table's file count. Enumeration reads the footers the merge mode selects, so its
-  footer-read cost is unbounded on a directory holding hundreds of thousands of files. That bound is
-  issue [#419](https://github.com/exasol-labs/lakehouse-engine-rs/issues/419), recorded here as an
-  explicit exception.
-* **Apache Iceberg and Delta specification check.** This reader implements NEITHER format and
-  claims conformance to neither. Reading a directory that happens to hold an Iceberg or a Delta
-  table as raw Parquet is therefore not a deviation from either specification. It is a different
-  read, selected by the operator through `CATALOG_KIND`. The scenario below states that trade-off
-  normatively, with the correct `CATALOG_KIND` named as the fix. The behavior is therefore a
-  recorded decision rather than a silent gap.
+* There is no snapshot, transaction log, or manifest. The reader turns a table root and the table's column notes into the resolved scan every other reader returns.
+* Format dispatch is one exhaustive match over the scan source, which pairs a resolved session with the table it reads. A further variant is a compile error at that site (`delta/delta-table-planning`).
+* The reader does no listing and no partition parsing of its own. Both come from the listing answer of `direct-storage/parquet-directory-seam-file-listing`, which table enumeration also reads. The reader parses no footer. Its logical schema, partition columns, and refused columns come from the column notes that enumeration recorded (`vs-adapter/column-source-notes`).
+* A logical field with neither a field-id nor a declared physical name binds by its own name, the same binding as Delta's `none` column-mapping mode (`scan-read-path/scan-execution-field-id-projection`).
+* The reader has no catalog statistics to prune from. Its plan-time file list is every file under the table root that `direct-storage/direct-storage-hive-partitioning` keeps. Footer-statistics pruning is not available, because planning reads no footer.
+* Nothing bounds a table's file count. Enumeration reads the footers the merge mode selects, so its cost is unbounded on a directory holding hundreds of thousands of files.
+* The reader implements neither the Iceberg nor the Delta format. Reading a directory that holds an Iceberg or Delta table as raw Parquet is a different read, selected through `CATALOG_KIND`, not a deviation from either specification.
+
 
 ## Scenarios
 

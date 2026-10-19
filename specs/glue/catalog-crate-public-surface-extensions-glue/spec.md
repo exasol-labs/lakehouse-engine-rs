@@ -1,11 +1,10 @@
-# Feature: Catalog Crate Public Surface Extensions — Glue Catalog Kind
+# Feature: Catalog Crate Public Surface Extensions, Glue Catalog Kind
 
 Records the reviewed extension of `lakehouse-catalog`'s public surface that lets the engine list and plan AWS Glue Data Catalog tables. It is the sibling of `unity-catalog/catalog-crate-public-surface-extensions-unity-parquet` and owns every addition made for the Glue catalog kind.
 
 ## Background
 
-* Each addition is an explicit reviewed edit to the reachability probe at `crates/lakehouse-catalog/tests/catalog_public_surface.rs`.
-* The Hive type string crosses the boundary verbatim, and only `lakehouse-engine` parses it.
+* The Hive type string crosses the crate boundary verbatim, and only `lakehouse-engine` parses it.
 
 ## Scenarios
 

@@ -1,17 +1,15 @@
 # Feature: Adapter Module Structure
 
-Gives each repeated read-a-JSON-field shape in the adapter-root modules (`adapter/mod.rs`, `adapter/connection.rs`) exactly one implementation, so a change to how the adapter reads a property, a credential field, or a resource count has one place to land. Behavior is unchanged: this feature constrains where the code lives, never what the adapter returns.
-
-This is the adapter root's structural feature, the sibling of `pushdown/pushdown-module-structure` and `datafusion-scan/scan-module-structure`. It exists because the duplication it removes spans four behavioral features at once — `vs-adapter/create-virtual-schema`, `vs-adapter/create-virtual-schema-adapter-notes-resources`, `vs-adapter/refresh-and-set-properties`, and `connection/connection-credentials` — so no single behavioral feature can own it without leaking a structural decision across a boundary.
+Each repeated read-a-JSON-field shape in the adapter-root modules (`adapter/mod.rs`, `adapter/connection.rs`) has exactly one implementation. Behavior is unchanged: this feature constrains where the code lives, not what the adapter returns.
 
 ## Background
 
-* Both scenarios are pure refactors. Every scenario of `vs-adapter/create-virtual-schema`, `vs-adapter/create-virtual-schema-adapter-notes`, `vs-adapter/create-virtual-schema-adapter-notes-resources`, `vs-adapter/refresh-and-set-properties`, `connection/connection-credentials`, and `connection/connection-credentials-catalog-auth` stays accurate and unedited, and those suites are the characterization gate that makes "behavior unchanged" falsifiable.
-* `adapter::connection` is a child module of `adapter`, so it can name a private item of `adapter` directly. A helper shared between the two therefore stays private to `adapter` — hoisting it widens nothing.
-* A helper whose whole body is a call to another helper with the same arguments is a pass-through, the shallow-module red flag from `/speq:design-philosophy`. Both scenarios below delete the single-purpose names rather than keep them as pass-throughs, so the deduplication actually removes indirection instead of adding a layer.
-* `Json` in `adapter/mod.rs` is an alias for `serde_json::Value`; the two duplicated accessors differ only in which spelling they use.
-* The adapter has eleven `resolve_*` property readers. Only ONE pair has byte-identical bodies, and only that pair is folded. A generic property-parsing framework over all eleven was considered and rejected in issue #177 — the readers are individually documented one-liners whose per-property defaults and validation differ, so a generic plus a config table would relocate them into indirection without removing complexity.
-* Seven `UdfContext` doubles across `adapter_tests.rs`, `connection_tests.rs`, and `unity_schema_tests.rs` repeat the same four required trait methods. `exasol-udf-sdk` 0.24.0 provides SDK-maintained test doubles as replacements.
+* Every scenario of `vs-adapter/create-virtual-schema`, `vs-adapter/create-virtual-schema-adapter-notes`, `vs-adapter/create-virtual-schema-adapter-notes-resources`, `vs-adapter/refresh-and-set-properties`, `connection/connection-credentials`, and `connection/connection-credentials-catalog-auth` stays accurate. Those suites are the characterization gate for "behavior unchanged".
+* `adapter::connection` is a child module of `adapter`, so it can name a private item of `adapter`. A shared helper stays private to `adapter`.
+* A helper whose whole body calls another helper with the same arguments is a pass-through. The scenarios delete the single-purpose names instead of keeping pass-throughs.
+* `Json` in `adapter/mod.rs` aliases `serde_json::Value`.
+* The adapter has eleven `resolve_*` property readers. Only one pair has byte-identical bodies, and only that pair is folded. The other readers have per-property defaults and validation, so a generic framework over all eleven would add indirection without removing complexity.
+* Seven `UdfContext` doubles across `adapter_tests.rs`, `connection_tests.rs`, and `unity_schema_tests.rs` repeat the same four required trait methods. `exasol-udf-sdk` provides test doubles that replace them.
 
 ## Scenarios
 

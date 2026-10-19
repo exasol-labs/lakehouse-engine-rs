@@ -1,62 +1,17 @@
-# Feature: DataFusion Scan Execution — Threading Configuration
+# Feature: DataFusion Scan Execution, Threading Configuration
 
-Controls how many DataFusion partitions and Tokio worker threads each scan UDF
-instance uses, so that the product of (per-node concurrent UDF instances) ×
-(per-instance threads) does not oversubscribe a node's cores. Configuration is
-round-tripped from `adapterNotes` through `ScanSpec` to the scan UDF, and is
-selected by an explicit AUTO-vs-FIXED mode so an operator can either let the
-adapter derive a non-oversubscribing thread/partition budget per UDF instance
-or pin exact values.
+The adapter sets how many DataFusion partitions and Tokio worker threads each scan UDF instance uses, so that concurrent UDF instances per node times threads per instance does not oversubscribe the node's cores. An AUTO or FIXED mode selects whether the adapter derives the budget or uses operator-supplied values.
 
 ## Background
 
-* The ScanSpec carries two CPU-bounding fields, `df_target_partitions` and
-  `df_threads_per_udf`, both defaulting to `1` when absent from the JSON (so
-  pre-existing scan specs remain backward-compatible). They are resolved in the
-  adapter from the `DATAFUSION_TARGET_PARTITIONS` / `DATAFUSION_THREADS_PER_UDF`
-  adapterNotes and round-tripped through the spec.
-* Exasol runs multiple concurrent UDF instances per node, bounded by that node's
-  VM pool, which Exasol sizes to the node's own core count. DataFusion's
-  `SessionConfig::new()` otherwise defaults `target_partitions` to the host core
-  count, so without an explicit setting each instance would spawn core-count
-  partitions and the node would be oversubscribed by `(instances × cores)`. Setting
-  both fields to `1` by default makes each instance use exactly one core; the
-  cluster-level shard fan-out provides the parallelism.
-* The ScanSpec fields are resolved before the Tokio runtime is constructed, so the
-  runtime kind is chosen from the spec value.
-* Under SDK-0.21.0 per-row scalar dispatch the scan `run()` is invoked once per input row,
-  so runtime construction happens per call rather than once per batch; see
-  `datafusion-scan/scan-execution` for the per-row dispatch contract.
-* The thread/partition budget is selected by a `DATAFUSION_THREADING_MODE`
-  VS/connection property with two values, `AUTO` and `FIXED`, resolved in the
-  adapter at `createVirtualSchema` time and recorded in `adapterNotes`. The mode
-  is a planning-time concept: it determines how `df_target_partitions` and
-  `df_threads_per_udf` are computed, and only the resulting integer fields ever
-  reach the scan UDF — the UDF stays mode-agnostic.
-* The per-node core count `nr_of_cores` that both modes read comes from
-  `std::thread::available_parallelism()` on the adapter's executing node, resolved
-  once per request and defaulting to `1` when the platform cannot report it. It is
-  not recorded in `adapterNotes`; see
-  `vs-adapter/create-virtual-schema-adapter-notes`.
-* In AUTO mode the adapter derives a per-instance thread budget that does not
-  oversubscribe a node:
-  `threads_per_udf = max(1, floor(nr_of_cores / udf_instances_per_node))`, where
-  `udf_instances_per_node` is the per-node share of the oversubscribed work-unit
-  shard count (`G = node_count × parallelism_factor`, capped 300; see
-  `parallelism/work-unit-sharding`). `df_target_partitions` is held in lockstep
-  with the derived `df_threads_per_udf` so partition count never exceeds the
-  thread budget.
-* In FIXED mode the adapter uses the operator-supplied `DATAFUSION_TARGET_PARTITIONS`
-  / `DATAFUSION_THREADS_PER_UDF` values verbatim, each defaulting to
-  `max(nr_of_cores, 1)` when absent.
-* The current production default of one thread / one partition per instance has
-  NEVER been measured against a multi-thread / multi-partition configuration;
-  whether single-thread per instance is a throughput bottleneck is an open
-  empirical question answered by benchmark sweeps, not by this spec. This spec
-  only guarantees the configuration is selectable and correctly derived.
-* See `datafusion-scan/scan-execution` for the core scan scenarios and
-  `vs-adapter/create-virtual-schema-adapter-notes` for how the threading mode and
-  properties are recorded in `adapterNotes`.
+* `ScanSpec` carries `df_target_partitions` and `df_threads_per_udf`, both defaulting to `1` when absent from the JSON. The adapter resolves them from the `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF` adapterNotes and passes them through the spec.
+* Exasol runs several concurrent UDF instances per node, bounded by a VM pool sized to the node's core count. DataFusion's `SessionConfig::new()` defaults `target_partitions` to the host core count, which would oversubscribe the node by instances times cores. A default of `1` for both fields gives each instance one core, and the shard fan-out provides the parallelism.
+* The scan UDF reads `df_threads_per_udf` from the spec before it builds the Tokio runtime, so the spec value chooses the runtime kind.
+* The SDK calls the scan `run()` once per input row, so the runtime is built per call; see `datafusion-scan/scan-execution`.
+* The `DATAFUSION_THREADING_MODE` VS/connection property takes `AUTO` or `FIXED`. The adapter resolves it at `createVirtualSchema` time and records it in `adapterNotes`. Only the resulting integer fields reach the scan UDF, which does not know the mode.
+* `nr_of_cores` comes from `std::thread::available_parallelism()` on the adapter's executing node, resolved once per request and defaulting to `1` when the platform cannot report it. It is not recorded in `adapterNotes`; see `vs-adapter/create-virtual-schema-adapter-notes`.
+* In AUTO mode, `threads_per_udf = max(1, floor(nr_of_cores / udf_instances_per_node))`. `udf_instances_per_node` is the per-node share of the work-unit shard count (`G = node_count × parallelism_factor`, capped at 300; see `parallelism/work-unit-sharding`). `df_target_partitions` equals the derived `df_threads_per_udf`.
+* In FIXED mode the adapter uses the supplied `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF` values as given, each defaulting to `max(nr_of_cores, 1)` when absent.
 
 ## Scenarios
 

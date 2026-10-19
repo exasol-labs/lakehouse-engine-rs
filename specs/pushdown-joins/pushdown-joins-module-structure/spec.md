@@ -1,23 +1,13 @@
 # Feature: Pushdown Joins Module Structure
 
-Splits the oversized `pushdown::joins` submodule into a nested `joins/` directory module organized by concern behind an unchanged public façade, keeping generated SQL byte-identical and co-locating each concern's tests.
+Splits the `pushdown::joins` submodule into a nested `joins/` directory module organized by concern behind an unchanged public façade. Generated SQL stays byte-identical and each concern's tests live beside it.
 
 ## Background
 
-* The refactor changes code organization only. It changes no query, pushdown, file-pruning, or type-handling behavior, so every scenario in `pushdown-joins/pushdown-planning-join` and `pushdown-joins/pushdown-planning-join-fallback` stays accurate and unedited.
-* `pushdown::joins` becomes a directory module: `joins/mod.rs` plus concern submodules (join planning, alias-qualified expression/filter/projection rendering, broadcast + N-scan SQL assembly). The exact submodule list is a design decision recorded in the plan, not a normative contract.
-* `pushdown/mod.rs` keeps its `mod joins;`, `pub(crate) use joins::{...}`, and `use joins::{...}` statements byte-unchanged: a `joins.rs` file and a `joins/mod.rs` directory are interchangeable to `mod joins;`, so no consumer `use` path is edited.
-* A helper used across concern submodules widens to the narrowest visibility that compiles (`pub(super)`, `super` = `joins`), never to a broader visibility than it held before.
-* The shared `pushdown::test_support` fixtures stay at their pre-refactor location and visibility. Each joins concern submodule's test module reaches them across the added nesting level without duplicating them.
-* This is the first nested module-within-a-module in `pushdown/`; every existing `pushdown/` submodule is a flat sibling file.
-* The CI/lint file-size guardrail (the second half of issue #129) is out of scope for this feature and remains open under issue #129, alongside the other oversized files that issue tracks.
-* A second duplication-reduction pass (issue #181) runs inside the already-split `joins/` directory module. It moves no code between submodules and changes no visibility upward, so the façade baseline and the concern split recorded above stay accurate and unedited.
-* Two reductions have no observable surface of their own and are verified entirely by the golden-SQL scenario below, so they get no scenario: `collect_column_tables` returning its three outputs as `column_tables` instead of writing three `&mut` out-params (its two callers each build a fresh set per use, so the tuple form is the natural one), and the shared `shard_count` → `partition_files_by_bytes` → `relativize_shards_to_root` prefix of `build_side_fan_out_sql` and `build_broadcast_join_sql` moving into one side-sharding helper.
-* The trailing `build_scan_driving_sql(…, None, None, &[], &[], …)` argument tail that both fan-out builders repeat is deliberately NOT wrapped. A wrapper taking the six arguments that genuinely differ, to elide four literal empties, would be a shallow layer rather than a reduction.
-* Issue #181's finding 2 (`involved_table_columns` versus `extract_all_column_types`) is tracked separately as issue #265 and is out of scope here; neither function is touched.
-* This delta carves the scan spec's `storage` value out of ONE clause — the byte-for-byte golden-baseline clause of the "Generated join SQL is byte-identical across the split" scenario. It amends no other clause, supersedes no Background bullet, and changes no module boundary, visibility rule, or render path.
-* `storage-access/storage-backend-enum` (issue #274) wraps the scan spec's `storage` value in an externally-tagged backend variant, and `storage-access/scan-spec-credential-reference` then replaces it with a connection reference or a sealed envelope over that same payload. Three of the four golden strings embed a scan spec and therefore change: the broadcast join, the N-scan fallback, and the grouped-qualified fallback. The fourth — `ineligible_join_decline`'s `UdfError` message — embeds no scan spec and is unedited, so the decline path keeps an untouched full-string gate.
-* The carve-out permits an edit to the `storage` value ALONE. Every other byte of each golden string stays as captured, which is what keeps this scenario's full-string equality assertion a working proof rather than a retired one.
+* The split changes code organization only. No query, pushdown, file-pruning, or type-handling behavior changes.
+* `joins/mod.rs` plus concern submodules (join planning, alias-qualified expression, filter and projection rendering, broadcast and N-scan SQL assembly) replace `pushdown/joins.rs`. The exact submodule list is not a normative contract.
+* `pushdown/mod.rs` keeps its `mod joins;`, `pub(crate) use joins::{...}`, and `use joins::{...}` statements unchanged.
+* The shared `pushdown::test_support` fixtures stay at their location and visibility.
 
 ## Scenarios
 

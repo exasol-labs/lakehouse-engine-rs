@@ -1,23 +1,12 @@
-# Feature: Pushdown Planning — File-List Encoding (Table Root + Relative Paths)
+# Feature: Pushdown Planning, File-List Encoding (Table Root + Relative Paths)
 
-Extends pushdown planning (`pushdown/pushdown-planning`) with the per-shard file-list wire
-encoding: the table root is carried once in the shard-invariant common spec, and each
-per-shard file entry (data file and its associated delete files) is emitted relative to that
-root when the root is an actual prefix of the file's path, or as an absolute URI otherwise.
+Extends pushdown planning (`pushdown/pushdown-planning`) with the per-shard file-list wire encoding. The table root is carried once in the shard-invariant common spec. Each per-shard file entry (data file and its delete files) is relative to that root when the root is a prefix of the path, and an absolute URI otherwise.
 
 ## Background
 
-* The table root is the neutral value the format reader resolves at the resolve-once seam — the
-  Iceberg reader's own source is `table.metadata().location()`, which doubles as its
-  vended-credential anchor. The root is shard-invariant, so it is carried ONCE in the common
-  scan-spec argument — never repeated per shard.
-* A file path is emitted RELATIVE to the table root only when the root is an actual prefix of
-  the path; any path not under the root is emitted unchanged as an absolute URI.
-* Iceberg data-file paths are NOT guaranteed to live under `metadata.location()` —
-  `write.data.path`, `write.object-storage.enabled` hash injection, and migrated/Databricks
-  layouts can place files elsewhere — so stripping is conditional, never unconditional.
-* Delete-file paths follow the SAME relative/absolute encoding as data-file paths, and each
-  delete-file entry additionally carries its delete content type.
+* The table root is the value the format reader resolves for the table. For Iceberg it is `table.metadata().location()`.
+* A path is emitted relative only when the root is an actual prefix of it, because Iceberg data-file paths can live outside `metadata.location()` (`write.data.path`, `write.object-storage.enabled` hash injection, migrated or Databricks layouts).
+* Delete-file paths use the same relative or absolute encoding, and each delete-file entry also carries its delete content type.
 
 ## Scenarios
 

@@ -1,66 +1,21 @@
-# Feature: Pushdown Planning — Cloud Credentials (SigV4 + Vended)
+# Feature: Pushdown Planning, Cloud Credentials (SigV4 + Vended)
 
-Resolves cloud credentials once in the pushdown planning layer. The adapter signs catalog requests with AWS SigV4 when enabled and derives the Glue REST catalog prefix. When vending is enabled, it extracts short-lived vended credentials from the `loadTable` response on every catalog-authentication mode and seals them into every per-shard scan spec. When vending is disabled, each scan spec carries a reference to the CONNECTION instead.
+The adapter signs catalog requests with AWS SigV4 when enabled and derives the Glue REST catalog prefix. When vending is enabled, it extracts short-lived vended credentials from the `loadTable` response on every catalog-authentication mode and seals them into every per-shard scan spec. When vending is disabled, each scan spec carries a reference to the CONNECTION instead.
 
 ## Background
 
-* SigV4 signing and credential vending are opt-in per CONNECTION (`use_sigv4`,
-  `use_vended_credentials`); both default to false so existing SeaweedFS/REST stacks
-  behave exactly as before.
-* On the SigV4/Glue path the adapter derives the REST catalog prefix `catalogs/{warehouse}`
-  by unconditionally prepending `catalogs/` to the configured bare-account-id `warehouse`,
-  because AWS Glue's Iceberg REST catalog requires that form; the user-facing `warehouse`
-  stays the bare AWS account id. The derivation applies only to Glue — `CatalogAuth::Sigv4`
-  is exclusively the Glue path today — and does NOT generalize to other SigV4-style
-  catalogs such as S3 Tables (tracked exception: #123).
-* **`use_vended_credentials` is orthogonal to catalog authentication.** Vended S3
-  credential extraction is gated SOLELY on `use_vended_credentials`, identically across all
-  four catalog-auth modes (no-auth, static bearer `token`, OAuth2 client-credentials, AWS
-  SigV4); the catalog-auth mode selects only how the table-load request authenticates.
-* The adapter resolves the table once per query via a single self-issued `loadTable` GET,
-  authenticated per the catalog-auth mode. Its raw `LoadTableResult` feeds BOTH Iceberg file
-  planning AND vended-credential extraction — `iceberg-catalog-rest` 0.9.1's
-  `RestCatalog::load_table` drops the response `config`/`storage_credentials`, so it cannot
-  surface vended creds on its own.
-* When `use_vended_credentials` is false, no `loadTable` response field is read for
-  credentials and the static storage credentials flow through unchanged on every auth mode.
-* See `pushdown/pushdown-planning` for the base pushdown planning scenarios and
-  `catalog/rest-catalog-oauth-auth` for the catalog-auth modes.
-* **A catalog MUST NOT downgrade the transport on its own authority.** A resolved plaintext
-  address — a vended or CONNECTION-configured `http://` S3 endpoint, or an `abfs://` ADLS
-  location — is honoured only when the `ALLOW_HTTP` virtual-schema property is true (default
-  false); otherwise it is a clear plan-time error, regardless of which source supplied the
-  address. `ALLOW_HTTP` is resolved once outside the catalog crate and threaded in as a plain
-  boolean; it names no credential and cannot supply one. The non-vended `storage_block` path
-  carries no such gate.
-* **Effective scan storage under vending splits credentials from addressing.** CREDENTIALS
-  (the S3 key pair and session token, or the ADLS SAS) come from the selected `loadTable`
-  credential source ALONE — never backfilled from the CONNECTION — and an unmet credential
-  request is a plan-time error. ADDRESSING (`endpoint`, `region`) comes from the CONNECTION
-  when the CONNECTION states a non-empty value, else from the selected source, resolved
-  independently per field; when neither states one, that field is legal-empty and resolves to
-  the AWS default chain. `path_style` resolves in three ordered steps: the CONNECTION's stated
-  value, else the source's `s3.path-style-access`, else whether an `endpoint` was resolved at
-  all (the last-resort step stays because `register_side_store` gates `endpoint` on
-  `path_style`). The backend variant still comes from the table location's scheme alone,
-  regardless of any of this. Both catalog kinds share this precedence through one function,
-  `s3_backend`. A Glue CONNECTION that states `region` places the store with that value (it
-  also signs the catalog request, per `connection/connection-credentials`); a Glue CONNECTION
-  that omits `region` places the store from Glue's vended `client.region` alone, which stays
-  UNVERIFIED — the opt-in cloud E2E suite (`specs/testing.md`) reports that key without asserting it.
-* The static `access_key` and `secret_key` a SigV4 CONNECTION supplies, and a `region` it
-  states, are CATALOG-authentication inputs (`connection/connection-credentials`) and keep
-  their existing guard independent of vending: they sign the `loadTable` request before any
-  credential is vended, and no longer reach the scan's storage as credentials once vending is
-  requested (the stated `region` still reaches it, as addressing).
-* Credentials (signing keys, bearer tokens, OAuth2 client secrets, vended STS tokens, a vended
-  SAS) MUST NEVER appear in any returned SQL string or error message. `redact_credentials`
-  matches the `adls.sas-token` label by case-insensitive substring, so its host-suffixed wire
-  spelling is redacted too. Every new error path returns `Result`, never panics — a panic
-  inside a UDF is an abnormal VM exit that SIGKILLs every sibling VM of the statement part —
-  and every such error names the location's storage host, scheme, or expected config key,
-  never a credential value.
-* See `storage-access/pushdown-planning-cloud-credentials-vended-storage` for how the effective scan storage is resolved from a `loadTable` response under vending.
+* SigV4 signing and credential vending are opt-in per CONNECTION (`use_sigv4`, `use_vended_credentials`) and both default to false.
+* On the SigV4 path the adapter derives the REST catalog prefix `catalogs/{warehouse}` by prepending `catalogs/` to the configured bare AWS account id, because AWS Glue's Iceberg REST catalog requires that form. `CatalogAuth::Sigv4` is the Glue path only, and the derivation does not generalize to other SigV4-style catalogs such as S3 Tables.
+* `use_vended_credentials` is independent of catalog authentication. Vended credential extraction depends only on that flag, identically across the four catalog-auth modes (no-auth, static bearer `token`, OAuth2 client credentials, AWS SigV4). The mode selects only how the `loadTable` request authenticates.
+* The adapter resolves each table once per query with one self-issued `loadTable` GET. The raw `LoadTableResult` feeds both file planning and vended-credential extraction, because `RestCatalog::load_table` drops the response `config` and `storage_credentials`.
+* With vending disabled, no `loadTable` response field is read for credentials and the static storage credentials flow through unchanged.
+* Under vending, credentials (the S3 key pair and session token, or the ADLS SAS) come from the selected `loadTable` credential source alone and are never backfilled from the CONNECTION. An unmet credential request is a plan-time error. The store `endpoint` and `region` come from the CONNECTION when it states a non-empty value, else from the response, per field (`storage-access/pushdown-planning-cloud-credentials-vended-storage`).
+* A resolved plaintext address is honoured only when the `ALLOW_HTTP` virtual-schema property is true, so a catalog cannot downgrade the transport on its own authority.
+* The static `access_key` and `secret_key` of a SigV4 CONNECTION sign the `loadTable` request and do not reach the scan's storage once vending is requested. A stated `region` still reaches it as addressing.
+* A CONNECTION that names `aws_assume_role_arn` gets a sealed storage block instead of a reference (`storage-access/scan-spec-credential-reference`).
+* A catalog-auth secret never crosses the UDF boundary as a parsed value. It contributes to the sealed envelope's key only as unparsed HKDF input.
+* A credential never appears in returned SQL or in an error message, except that a vended value appears in the SQL as the sealed envelope's ciphertext. `redact_credentials` matches the `adls.sas-token` label by case-insensitive substring. Every error path returns `Result` and never panics, because a panic in a UDF is an abnormal VM exit that kills every sibling VM.
+* See `pushdown/pushdown-planning` for the base planning scenarios and `catalog/rest-catalog-oauth-auth` for the catalog-auth modes.
 
 ## Scenarios
 

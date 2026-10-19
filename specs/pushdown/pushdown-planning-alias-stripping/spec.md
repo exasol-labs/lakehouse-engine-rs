@@ -1,26 +1,13 @@
-# Feature: Pushdown Planning — Alias Stripping
+# Feature: Pushdown Planning, Alias Stripping
 
-Strips the per-column `tableAlias` Exasol stamps on an aliased-`FROM` single-table query
-(see `pushdown/pushdown-planning`'s "Filter predicate is pushed into the scan spec"
-scenario, which this feature specializes) before the request is rendered into the
-DataFusion scan-driving SQL. When a query aliases its table (`FROM CUSTOMER c`), Exasol
-stamps `tableAlias:"C"` on every `column` node in the pushdown request — even for an
-unqualified `WHERE C_CUSTKEY <= 3`. The `crates/vs-expression` renderer honors a present
-`tableAlias` and would otherwise emit `"C"."C_CUSTKEY"`, which does not resolve against the
-node-local DataFusion scan relation (aliased `scan_target`, exposing only bare column
-names). The fix strips the alias once at the single-table entry point, immediately after
-the join classifier reports the request is not a join, so every downstream single-table
-render site — filter, projected select-list expressions, GROUP BY keys, HAVING, ORDER BY
-keys, and aggregate arguments — renders bare names. A declined outer join re-pushes a
-PLAIN single-table scan carrying the same alias-stamped filter, so this fix also resolves
-that symptom. Closes #193.
+Removes the per-column `tableAlias` that Exasol stamps on a single-table query with an aliased `FROM`, before the adapter renders the request into the DataFusion scan-driving SQL. The scan relation exposes only bare column names, so an alias-qualified reference would not resolve.
 
 ## Background
 
-* `strip_table_alias` removes each `column` node's `tableAlias` while leaving `tableName` and `name` intact, recursing through nested objects and arrays; it is shared by the single-table path and the join fan-out's inner leg.
-* The strip happens ONCE, in `handle_pushdown`, immediately after `detect_join` reports the request is not a join and before the filter is rendered or the Iceberg file-pruning predicate is built — a single chokepoint that every single-table render site consumes, rather than N per-render-site strips that risk missing a shape.
-* The unified qualified fallback path (the N = 1 case of `pushdown-joins/pushdown-planning-join-fallback`, taken for a multi-`COUNT(DISTINCT)` or non-numeric grouped shape) re-qualifies every column from its `tableName` and its own subquery alias, never from Exasol's `tableAlias`, so it is unaffected by the strip.
-* The `crates/vs-expression` translator (`sql-comprehension/vs-expression-translator`) always honors a present `tableAlias`; it never drops one on its own. The join OUTER wrapper depends on that qualified rendering, so the renderer default is unchanged — stripping is the single-table caller's responsibility.
+* When a query aliases its table (`FROM CUSTOMER c`), Exasol stamps `tableAlias:"C"` on every `column` node, including columns the user wrote unqualified.
+* The adapter strips the alias once, at the single-table entry point, immediately after the join classifier reports the request is not a join. Every downstream single-table render site then renders bare names.
+* The `crates/vs-expression` translator always honors a present `tableAlias`, so stripping is the single-table caller's job.
+* The unified qualified fallback path (the N = 1 case of `pushdown-joins/pushdown-planning-join-fallback`) re-qualifies every column from its `tableName` and its own subquery alias, never from `tableAlias`.
 
 ## Scenarios
 

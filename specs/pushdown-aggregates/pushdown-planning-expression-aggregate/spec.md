@@ -1,25 +1,12 @@
-# Feature: Pushdown Planning — Expression-Argument Aggregates
+# Feature: Pushdown Planning, Expression-Argument Aggregates
 
-Extends single-group aggregate pushdown (`pushdown/pushdown-planning`) so a supported
-aggregate whose argument is a scalar expression over table columns — not just a bare
-column reference — is decomposed into the same shard-associative partial/merge plan. This
-lets queries like `SUM(LENGTH(L_COMMENT))` push their scan and node-local aggregation into
-DataFusion instead of forcing a full raw row-scan fallback that ships every projected
-column to Exasol.
+The adapter pushes an aggregate whose argument is a scalar expression over table columns, such as `SUM(LENGTH(L_COMMENT))`, into the same shard-associative partial/merge plan as a bare-column aggregate.
 
 ## Background
 
-* The aggregate argument is rendered by the shared `crates/vs-expression` translator
-  (`render_expression`), the same mechanism `detect_group_by_aggregates` already uses for
-  GROUP BY keys; an argument the translator cannot render causes the adapter to decline the
-  aggregate pushdown for that query and fall back to row scanning.
-* Only the aggregate's argument shape changes: `COUNT(expr)`, `SUM(expr)`, `MIN(expr)`,
-  `MAX(expr)`, and `AVG(expr)` decompose exactly as their bare-column forms do; `COUNT(*)`
-  has no argument and is unaffected.
-* The partial/merge column types for an expression-argument aggregate are read from the
-  aggregate item's declared result type in the parallel top-level `selectListDataTypes`
-  array, because there is no single source column whose Exasol type could be looked up.
-* The merged result MUST equal the same aggregate evaluated over all rows on a single node.
+* The `vs-expression` translator (`render_expression`) renders the aggregate argument. An argument it cannot render makes the adapter decline the aggregate pushdown and fall back to row scanning.
+* `COUNT(expr)`, `SUM(expr)`, `MIN(expr)`, `MAX(expr)`, and `AVG(expr)` decompose as their bare-column forms do. `COUNT(*)` has no argument.
+* An expression has no single source column, so the partial and merge column types come from the aggregate item's declared type in the top-level `selectListDataTypes` array.
 
 ## Scenarios
 

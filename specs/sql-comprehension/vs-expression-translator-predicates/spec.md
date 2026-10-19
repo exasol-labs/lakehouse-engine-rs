@@ -1,29 +1,10 @@
-# Feature: VS Expression Translator — Predicates
+# Feature: VS Expression Translator, Predicates
 
-Extends the VS expression translator (`sql-comprehension/vs-expression-translator`) with the
-filter-predicate operator set — comparison, logical connectives, IS NULL / IS NOT NULL, IN over a
-constant list, BETWEEN, and LIKE. Split
-out of the core translator spec to keep that spec's scenario count within the domain's convention
-(mirroring the existing `-scalar-fns`/`-date-fns`/`-scalar-ops`/`-literals` splits).
+Extends the VS expression translator (`sql-comprehension/vs-expression-translator`) with the filter-predicate operator set: comparison, logical connectives, IS NULL / IS NOT NULL, IN over a constant list, BETWEEN, and LIKE.
 
 ## Background
 
-* This feature shares the six public entry points of `crates/vs-expression` — the DataFusion trio
-  (`render_expression`, `render_expression_safe`, `render_df_filter_safe`) and the Exasol trio
-  (`render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe`);
-  predicate rendering is a set of arms inside the same recursive walker.
-* Comparison predicates, logical connectives, IS NULL / IS NOT NULL, IN over a constant list,
-  BETWEEN, and LIKE all render byte-identically in both dialects, because their operator syntax is
-  shared by both parsers — none needs the per-dialect branching `sql-comprehension/vs-expression-translator`
-  describes for named scalar functions.
-* Exasol and DataFusion diverge on NULL handling inside an IN list: Exasol ignores NULL entries
-  under both `IN` and `NOT IN`, while DataFusion three-valued logic filters non-matching rows for
-  `NOT IN` when the list contains NULL, so a NULL entry must be stripped from the rendered list.
-  NULL entries reach the const list as several distinct node shapes — a `literal_null` node, or any
-  typed literal (`literal_date`, `literal_timestamp`, `literal_exactnumeric`, etc.) carrying a null
-  `value` — and these render to divergent strings (`NULL`, `DATE NULL`, `arrow_cast(NULL, ...)`),
-  so stripping must key on the argument node's null-ness before rendering, not on the rendered
-  string.
+* Exasol ignores NULL entries in an IN list under both `IN` and `NOT IN`. DataFusion three-valued logic filters non-matching rows for `NOT IN` when the list contains NULL, so the translator strips NULL entries. A NULL entry is a `literal_null` node or any typed literal carrying a null `value`, and these render to divergent strings, so stripping keys on the node, not the rendered string.
 
 ## Scenarios
 

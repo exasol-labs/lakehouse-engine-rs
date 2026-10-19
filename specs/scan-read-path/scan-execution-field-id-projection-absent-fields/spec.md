@@ -1,131 +1,20 @@
 # Feature: DataFusion Scan Execution: Absent Fields and Initial Defaults
 
-This feature covers what the scan UDF emits for a logical field that is absent from a data file. A field that defines an Iceberg `initial-default` returns that value for the file's rows. A nullable field with no default returns NULL. A required field with no default fails the scan with a clean error.
+Defines what the scan UDF emits for a logical field that is absent from a data file. A field that defines an Iceberg `initial-default` returns that value for the file's rows. A nullable field with no default returns NULL. A required field with no default fails the scan with a clean error.
 
-The VS reads each field's `initial-default` once per query and encodes a primitive default into the scan spec in a JSON-portable, credential-free form that survives the serialization round-trip. It leaves the default absent for a non-primitive default and for a decimal whose precision and scale fall outside Exasol's catalog-decimal domain.
+The VS reads each field's `initial-default` once per query and encodes a primitive default into the scan spec in a JSON-portable, credential-free form. It leaves the default absent for a non-primitive default and for a decimal outside Exasol's catalog-decimal domain.
 
 ## Background
 
-* When the scan spec carries a logical schema (a list of `{field_id, name, arrow_type,
-  nullable, initial_default}` tuples), the scan UDF registers its file-list table provider with that
-  schema (each field tagged with `PARQUET:field_id` metadata) and installs a
-  `FieldIdExprAdapter` that resolves each logical column to its physical Parquet column by,
-  in order: (1) an embedded `PARQUET:field_id` match; (2) for a physical field that carries
-  NO embedded field-id, the table's `schema.name-mapping.default` mapping of that physical
-  name to a field-id present in the logical schema; (3) a physical-name match. Steps (2) and
-  (3) apply only to fields without an embedded field-id; step (2) augments — never
-  replaces — the physical-name fallback of step (3).
-* This feature implements the Iceberg table-spec "Column Projection" ordered resolution for
-  a logical field-id NOT present in a data file. The spec defines the ordered process:
-  (1) "Return the value from partition metadata if an Identity Transform exists for the
-  field and the partition value is present in the `partition` struct on `data_file` object
-  in the manifest"; (2) name-mapping fallback (locate columns lacking field IDs via the
-  table's `schema.name-mapping.default`); (3) "Return the default value if it has a defined
-  `initial-default`"; (4) "Return `null` in all other cases". The spec defines
-  `initial-default` as applied to "all records that were written before the field was added
-  to the schema" and `write-default` as used for "any records written after the field was
-  added to the schema, if the writer does not supply the field's value".
-* This engine implements rule (2) (name-mapping) and rule (3) (`initial-default`) and the
-  rule (4) NULL fallback. Rule (3) reads ONLY `initial-default`; `write-default` is
-  irrelevant to reads and MUST NOT be consulted (it governs writer-side backfill, not the
-  read of pre-existing rows).
-* Resolution for a logical field-id absent from a data file, applied per file:
-  the field defines an `initial-default` → emit that default value for that file's rows
-  (whether the field is required or nullable); else the field is nullable → emit NULL; else
-  the field is required with no default → return a clean error. A field that DOES resolve to
-  a physical column (by field-id or name-mapping) always binds to that column's real values
-  and is never defaulted.
-* Only PRIMITIVE-typed `initial-default` values are applied. The logical schema's compact
-  Arrow-type tag vocabulary is primitive-only (bool, int32, int64, float32, float64, utf8,
-  date32, timestamp/timestamptz, decimal128); a Struct / List / Map `initial-default` is not
-  represented and such a column falls through to NULL (nullable) or the required-absent
-  error. This is a deliberate trade-off: Exasol has no struct / list / map types (those
-  columns surface only as JSON-fallback VARCHAR), and the Iceberg spec itself requires
-  columns of `unknown`, `variant`, `geometry`, and `geography` types to default to null.
-* Timestamptz IS covered by the all-types initial-default E2E fixture: an Iceberg
-  `timestamptz` column is declared and emitted as plain Exasol `TIMESTAMP` (see
-  `scan-types/type-mapping`) carrying the UTC-instant value, so it crosses the scan UDF
-  emit boundary like any other primitive. Micros-precision `timestamptz` is exercised
-  end-to-end by the fixture; nanosecond-precision `timestamptz_ns` (like `timestamp_ns`) is
-  not Iceberg-expressible in this catalog version and stays covered by the unit round-trip
-  test (the `timestamptz_us` / `timestamptz_ns` tags in the round-trip scenario). The former
-  `TIMESTAMP WITH LOCAL TIME ZONE` emit exclusion is closed (#118).
-* The adapter delegates type divergence → cast and, for an absent field with no encoded
-  default, null-fill (nullable) or required-missing → clean error to
-  `DefaultPhysicalExprAdapter`. The `initial-default` fill intercepts the absent-field case
-  BEFORE that delegation: a required-absent field would otherwise error before any
-  post-processing could substitute a default.
-* The adapter is applied per file by the Parquet opener, so files with divergent physical
-  layouts within one shard each bind correctly, and the default fill is decided per file
-  from that file's actually-present field-ids.
-* The `schema.name-mapping.default` table property and each field's `initial-default` are
-  resolved ONCE per query in the VS planning layer (at `resolve_file_list`, when the logical
-  schema is read from the Iceberg current schema). The scan UDF never re-reads Iceberg table
-  metadata. The encoded `initial-default` carried in the scan spec is JSON-portable and
-  credential-free.
-* Non-null Iceberg `initial-default` values require table format-version 3. The Iceberg
-  table spec defines `initial-default` as "used to populate the field's value for all records
-  that were written before the field was added to the schema" (Schemas and Data Types →
-  Default values), and Iceberg's schema-compatibility check rejects a non-null `initial-default`
-  on a v1/v2 table ("non-null default ... is not supported until v3"). This constrains only
-  tables that DEFINE such defaults; the READ path here is format-version-agnostic — it reads
-  `initial-default` off the current-schema metadata regardless of the table's format version,
-  so no format-version handling exists or is needed in the scan or VS code. (The E2E fixture
-  that exercises this therefore creates its table at v3.)
-* Out-of-scope: parsing nested `fields` entries of `schema.name-mapping.default` for
-  struct / map / list children (#83); and Iceberg column-projection rule (1) — substituting
-  an Identity-Transform partition value for an absent field — which is not implemented
-  anywhere in this engine. Because rule (1) is unimplemented, if BOTH an Identity-Transform
-  partition value and an `initial-default` could resolve the same absent field-id, this
-  engine returns the `initial-default` (rule 3) rather than the partition value (rule 1). For
-  an ADDED column read from older files this is the correct and only-available value, so this
-  ordering is a deliberate, accurately-scoped trade-off, not a silent gap.
-* **This delta adds ONE scenario and is issue #329.** It records the domain gate on the VS's
-  `initial-default` encoding step for an Iceberg `decimal(P,S)` whose precision and scale fall
-  outside Exasol's catalog-decimal domain. `encode_initial_default`
-  (`crates/lakehouse-engine/src/adapter/pushdown/format/iceberg.rs`) carried its own copy of the
-  predicate `precision <= 36 && scale <= 36`, held in agreement with the Arrow-type tag only by
-  convention. Nothing else in this feature changes: field-id resolution, the
-  `schema.name-mapping.default` fallback, the per-file default fill, the required-absent error,
-  the round-trip vocabulary, and the no-logical-schema fallback are all untouched.
-* **The gate reads the domain from `scan-types/type-mapping` and does NOT restate it.** That
-  feature owns the predicate `exasol_representable_catalog_decimal` (`1 ≤ p ≤ 36` and `s ≤ p`), its
-  single-owner requirement, and the Exasol target-type trade-off behind it. This feature records
-  only that the encoding gate reads its answer from that one owner, which is what makes the encoded
-  default agree with the field's Arrow-type tag by construction rather than by two guards happening
-  to carry the same text.
-* **Divergence here is a silent WRONG VALUE, not a stale duplicate.** `scan-types/type-mapping`
-  now maps a catalog decimal outside the domain to the `utf8` tag. The scan side reconstructs an
-  encoded default against that tag ALONE, so a decimal default still encoded as the literal's raw
-  unscaled `i128` mantissa comes back as that mantissa's DIGITS in a string column — an
-  `initial-default` of unscaled `1234` on a `decimal(5,10)` field surfacing as the string `"1234"`.
-  That is fabricated data, the outcome this feature's required-absent error and NULL fallback exist
-  to avoid.
-* **Leaving the default absent lands the field on an EXISTING recorded path, so no new scan-time
-  behavior is introduced.** The recorded scenario "The VS encodes each field's Iceberg
-  initial-default once per query into the scan spec" already leaves the encoded default absent for a
-  field whose `initial-default` is non-primitive, "so those fields fall through to NULL or the
-  required-absent error at scan time". A decimal outside Exasol's domain joins that same class: its
-  default is not representable under the tag its column actually carries.
-* **Apache Iceberg spec check — the field takes Column Projection rule (4) where the spec would take
-  rule (3), and that is a named Exasol target-type trade-off rather than a silent gap.** The spec's
-  ordered process runs "(3) Return the default value if it has a defined `initial-default`" before
-  "(4) Return `null` in all other cases". A `decimal(P,S)` with `P = 0` or `S > P` is spec-legal —
-  the Primitive Types table constrains only "Scale is fixed, precision must be 38 or less" — so a
-  field of that type carrying an `initial-default` is a case where this engine returns NULL, or the
-  required-absent error, where the spec defines a default. Exasol has no such `DECIMAL`, so the
-  column carries the `utf8` tag and the compact tag vocabulary holds no scale to render the literal
-  against. Rendering the correctly-scaled decimal TEXT under that tag would restore rule (3) and is
-  NOT implemented here.
-* **No tracked-exception issue is opened for that deviation, and the reachability that justifies it
-  is stated rather than assumed.** The alternative on offer was never rule (3) but a fabricated
-  value, since the unchanged gate encoded the raw unscaled mantissa. Reaching the case at all needs
-  all three of: a catalog serving a `decimal(P,S)` with `P = 0` or `S > P`, a non-null
-  `initial-default` declared on that field, and therefore a format-version-3 table — this feature
-  already records that "Non-null Iceberg `initial-default` values require table format-version 3".
-  Nothing is dropped or left untyped: the column itself stays queryable as a JSON-fallback
-  `VARCHAR(2000000)` string.
-* See `scan-read-path/scan-execution-field-id-projection` for how logical fields bind to physical columns by field-id, declared physical name, or identity.
+* The Iceberg table spec's Column Projection process for a field-id absent from a data file is: (1) the Identity-Transform partition value, (2) the `schema.name-mapping.default` fallback, (3) the field's `initial-default`, (4) `null`. This engine implements rules (2), (3) and (4). Rule (3) reads only `initial-default`, never `write-default`, which governs writer-side backfill.
+* The adapter resolves a field-id absent from a file per file. A field with an `initial-default` emits that default, whether required or nullable. Otherwise a nullable field emits NULL, and a required field returns a clean error. A field that resolves to a physical column always binds to its real values. The `initial-default` fill intercepts the absent field before `DefaultPhysicalExprAdapter`, which would otherwise raise the required-absent error first.
+* Only primitive `initial-default` values apply. The logical schema's Arrow-type tag vocabulary is primitive-only, and `scan-types/type-mapping` owns it. A struct, list or map default is not represented, so such a column falls through to NULL or the required-absent error. Exasol has no struct, list or map types, and the Iceberg spec requires `unknown`, `variant`, `geometry` and `geography` columns to default to null.
+* An Iceberg `timestamptz` column is declared and emitted as plain Exasol `TIMESTAMP`: see `scan-types/type-mapping`.
+* Non-null `initial-default` values require table format-version 3. The read path reads `initial-default` from the current schema regardless of format version.
+* Iceberg rule (1), substituting an Identity-Transform partition value, is not implemented. When both a partition value and an `initial-default` could resolve an absent field-id, the engine returns the `initial-default`. For an added column read from older files this is the only available value. The engine also does not parse nested `fields` entries of `schema.name-mapping.default`.
+* `scan-types/type-mapping` owns the predicate `exasol_representable_catalog_decimal` (`1 ≤ p ≤ 36` and `s ≤ p`). It maps a decimal outside that domain to the `utf8` tag. The scan side reconstructs an encoded default against the tag alone, so a decimal default encoded as the raw unscaled `i128` mantissa would surface as that mantissa's digits in a string column, for example `"1234"` for an unscaled `1234` on a `decimal(5,10)` field. That is a fabricated value.
+* The VS leaves such a default absent, the same as a non-primitive default. The field then takes rule (4) where the Iceberg spec would take rule (3). This is a named Exasol target-type trade-off. It is reachable only with a `decimal(P,S)` where `P = 0` or `S > P`, a non-null `initial-default` on that field, and a format-version-3 table. The column stays queryable as a JSON-fallback `VARCHAR(2000000)`.
+* `scan-read-path/scan-execution-field-id-projection` specifies how logical fields bind to physical columns.
 
 ## Scenarios
 

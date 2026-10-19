@@ -1,12 +1,12 @@
 # Feature: Unity Catalog Parquet Table Planning
 
-Resolves a Unity Catalog table whose `data_source_format` is `PARQUET` into the engine's existing `ResolvedScan` shape at plan time. Unity Catalog is this table's catalog: it declares the columns, the partition columns, the storage location, and the credential-vending key. The data files are the Parquet objects under the storage location. File-level sharding, the pushdown wire format, streaming emit, and the memory model are unchanged. The same catalog-declared Parquet reader plans a Glue Parquet table under these logical-schema rules (`glue/glue-table-planning`).
+Resolves a Unity Catalog table whose `data_source_format` is `PARQUET` into the engine's `ResolvedScan` shape at plan time. Unity Catalog declares the columns, the partition columns, the storage location, and the credential-vending key, and the data files are the Parquet objects under the storage location. The same catalog-declared Parquet reader plans a Glue Parquet table (`glue/glue-table-planning`).
 
 ## Background
 
-* Unity Catalog reports a Parquet external table with `table_type` `EXTERNAL`, `data_source_format` `PARQUET`, a `storage_location`, and a `columns[]` array whose entries carry `type_json` and `partition_index`. Verified live against the project's OSS Unity Catalog fixture (`docker-compose.unity.yml`): `GET /tables/{full_name}` and `GET /tables?catalog_name=...&schema_name=...` both return that shape, with `partition_index` `null` on a data column and `0` on the first partition column.
-* A column's `type_json` is its Spark SQL `StructField` JSON (Databricks Tables API: "Full data type specification, JSON-serialized."). The Delta protocol records a table schema in the same representation: "Delta uses a subset of Spark SQL's JSON Schema representation to record the schema of a table in the transaction log" (PROTOCOL.md § Schema Serialization Format).
-* Unity Catalog reads a partitioned external table's partition values from its directory layout: "By default, Unity Catalog recursively lists all directories in the table location to automatically discover partitions", for tables that "use Parquet, ORC, CSV, Avro, or JSON" (Databricks, *Partition discovery for external tables*).
+* Unity Catalog reports a Parquet external table with `table_type` `EXTERNAL`, `data_source_format` `PARQUET`, a `storage_location`, and a `columns[]` array whose entries carry `type_json` and `partition_index`. `partition_index` is `null` on a data column and `0` on the first partition column.
+* A column's `type_json` is its Spark SQL `StructField` JSON, the same representation the Delta protocol uses to record a table schema.
+* Unity Catalog reads a partitioned external table's partition values from its directory layout.
 
 ## Scenarios
 

@@ -1,22 +1,13 @@
 # Feature: Single Shared Object, Three Entry Points
 
-Packages the VS adapter, the DataFusion scan UDF, and the version query UDF as named
-entry points in one Rust crate that builds to a single `.so`, exploiting
-language-container-rs's multiple-entry-points-per-`.so` capability. The scan entry point
-is a SCALAR EMIT script. The version entry point is a SCALAR RETURNS script. The cluster
-fan-out distributor (`LAKEHOUSE_DISTRIBUTE_FILES`) is a separate LUA SET script created
-by its own DDL — NOT a Rust entry point in the `.so`. One artifact is uploaded to
-BucketFS and each Exasol script references it.
+One Rust crate builds a single `.so` that exports the VS adapter, the DataFusion scan UDF, and the version query UDF as named entry points. One artifact is uploaded to BucketFS and each Exasol script references it.
 
 ## Background
 
-* All three Rust entry points (adapter, scan, version) are exported from the single uploaded `.so`; the `LAKEHOUSE_DISTRIBUTE_FILES` fan-out distributor is a separate LUA SET script created by its own DDL and is not part of the `.so`.
-* The crate is a `cdylib` depending on `exasol-udf-sdk` 0.23.0 (connect-back feature)
-  and `exasol-udf-macros` 0.23.0.
-* The `.so` is built only inside the `rust:1.94-trixie` builder image; it is never
-  built with host `cargo build --release`.
-* Each entry point is declared with the `exasol_udf` macro; Exasol's `CREATE SCRIPT`
-  statements reference each by its registered name against the same `%udf_object`.
+* The scan entry point is a SCALAR EMIT script. The version entry point is a SCALAR RETURNS script.
+* The `LAKEHOUSE_DISTRIBUTE_FILES` fan-out distributor is a separate LUA SET script created by its own DDL. It is not a Rust entry point and is not part of the `.so`.
+* Each `CREATE SCRIPT` statement references its entry point by registered name against the same `%udf_object`.
+* The `.so` is built only inside the `rust:1.94-trixie` builder image, never with host `cargo build --release`.
 
 ## Scenarios
 

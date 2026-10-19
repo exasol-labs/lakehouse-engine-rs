@@ -1,23 +1,10 @@
-# Feature: DataFusion Scan Execution — Raw-Scan Physical Plan Shape
+# Feature: DataFusion Scan Execution, Raw-Scan Physical Plan Shape
 
-Guarantees the raw-row scan path's DataFusion physical plan stays the lean single-partition
-pipeline it needs to be for throughput: no needless repartition, coalesce-partitions,
-global sort, or global aggregate stage, with a bounded local top-N as the one intentional
-exception when the scan spec carries an `order_by`. Split out of
-`datafusion-scan/scan-execution` to keep that feature's core reconstitution/I/O/type-
-mapping scenarios separate from physical-plan-shape scenarios.
+The raw-row scan path keeps a lean single-partition DataFusion physical plan. The one intentional extra stage is a bounded local top-N when the scan spec carries an `order_by`.
 
 ## Background
 
-* The raw-row scan pipeline is throughput-sensitive: needless physical-plan stages
-  (a `RepartitionExec`, a `CoalescePartitionsExec`, a global `SortExec`, or a global
-  aggregate) on the single-shard raw-scan path add CPU and latency without changing
-  the result, and MUST be avoided so the per-instance pipeline stays
-  `ParquetExec → FilterExec → ProjectionExec → CoalesceBatchesExec → emit`. A bounded
-  top-N (an `ORDER BY … LIMIT n` TopK) is the one intentional exception, present only
-  when the scan spec carries an `order_by`.
-* See `datafusion-scan/scan-execution` for the core scan-invocation, reconstitution, and
-  type-mapping scenarios this plan shape applies to.
+* The raw-row pipeline is `ParquetExec → FilterExec → ProjectionExec → CoalesceBatchesExec → emit`. A repartition, coalesce-partitions, global sort, or global aggregate stage on this path adds CPU and latency without changing the result.
 
 ## Scenarios
 

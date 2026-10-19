@@ -1,78 +1,15 @@
-# Feature: Pushdown Planning — Self-Join Leg Attribution
+# Feature: Pushdown Planning, Self-Join Leg Attribution
 
-Extends the unified unaccelerated join fallback (`pushdown-joins/pushdown-planning-join-fallback`) with
-correct column-to-leg attribution for a table joined to itself. Every attribution decision —
-expression rendering, leg-local WHERE attribution, join-condition attachment, and per-leg
-projection narrowing — resolves a `column` node to a JOIN LEG (one occurrence of a table in the
-FROM tree) by matching the pair (`tableName`, `tableAlias`) against the FROM-tree leaves' (`name`,
-`alias`) pairs, never by `tableName` alone. `tableName` names a TABLE; a leg is an OCCURRENCE, and
-the two coincide only while no table appears twice.
+Extends the unified unaccelerated join fallback (`pushdown-joins/pushdown-planning-join-fallback`) so a table joined to itself renders correctly. The adapter resolves each `column` node to a join leg (one occurrence of a table in the FROM tree) by the pair (`tableName`, `tableAlias`), never by `tableName` alone.
 
 ## Background
 
-* **This delta fixes issue #361: a self-join returned a cross product.** Every attribution
-  decision in the fallback keyed on a `column` node's `tableName`, and a self-join's legs all
-  carry the SAME `tableName`, so the name-keyed alias map collapsed to one entry
-  (last-write-wins) and both sides of the `ON` rendered against the same subquery alias.
-  Captured live from `EXPLAIN VIRTUAL`'s `PUSHDOWN_JSON` column on the Docker container for
-  `SELECT a.O_ORDERKEY, a.O_CUSTKEY FROM FACT_ORDERS a JOIN FACT_ORDERS b ON a.O_ORDERKEY = b.O_ORDERKEY`
-  over a 10-row table, which returned 100 rows:
-  `SELECT "LHS_T1"."O_ORDERKEY", "LHS_T1"."O_CUSTKEY" FROM (…) AS "LHS_T0" INNER JOIN (…) AS "LHS_T1" ON (("LHS_T1"."O_ORDERKEY" = "LHS_T1"."O_ORDERKEY"))`
-  — a tautological `ON`, an unconstrained `LHS_T0`, and a select list wrongly all-`LHS_T1`. The
-  three-leg shape returned 1000 rows instead of 10 and rendered `ON 1=1` at one join point plus
-  the same tautology twice at the next.
-* **SUPERSEDES every recorded clause that resolves a column reference "from its `tableName`".**
-  `tableName` names a TABLE; a wrapper leg is an OCCURRENCE of a table in the FROM tree. The two
-  coincide only while no table appears twice. The attribution signal is the JOIN LEG INDEX.
-* **The signal was already in the request and was discarded at collection time.** Exasol stamps
-  the per-occurrence SQL alias on BOTH ends of the pushdown JSON, under two DIFFERENT key names:
-  a FROM-tree leaf carries `alias` (`{"type":"table","name":"FACT_ORDERS","alias":"A"}`), and a
-  `column` node carries `tableAlias`
-  (`{"type":"column","name":"O_ORDERKEY","tableName":"FACT_ORDERS","tableAlias":"A"}`). Both were
-  captured live. `collect_join_tree` read only the leaf's `name` and dropped its `alias`, and
-  `JoinLeaf` had no field to hold it — so the defect is two-part: identity is LOST at collection
-  and then re-derived from `tableName` at render. Recovering the leaf alias is what makes leg
-  resolution exact rather than reconstructed.
-* **`(tableName, alias)` is an injective leg key, guaranteed by SQL itself.** Within one
-  `tableName`, two occurrences cannot share an alias (`FROM T a JOIN T a` is illegal) and at most
-  one occurrence can be alias-LESS (`FROM T JOIN T` is an ambiguous reference and is rejected).
-  The pair therefore identifies exactly one leg, and no alias sorting, occurrence counting, or
-  positional guess is needed. Aliases are compared VERBATIM: the leaf `alias` and the column
-  `tableAlias` come from one parse of one statement, and both were observed identical (`a` → `"A"`,
-  `o` → `"O"`).
-* **One leg of a genuine self-join MAY carry no alias, and that is a valid identity.** Captured
-  live: `FROM FACT_ORDERS JOIN FACT_ORDERS b ON FACT_ORDERS.O_ORDERKEY = b.O_ORDERKEY` yields
-  leaves `{"name":"FACT_ORDERS"}` and `{"name":"FACT_ORDERS","alias":"B"}`, and the condition's
-  two `column` nodes carry no `tableAlias` and `"B"` respectively. It returned 100 rows instead of
-  10. An absent alias is part of the key, never a reason to fall back to a bare name.
-* **A `tableName` naming exactly ONE leg resolves by name alone, so no existing SQL changes.**
-  Exasol stamps no `tableAlias` at all when the user writes no alias — captured live for a
-  two-table join, whose `column` nodes carry only `tableName` and whose leaves carry no `alias`
-  key. Resolving a single-leg name without consulting an alias is what keeps that common case
-  working and keeps the wrapper's output BYTE-IDENTICAL to its pre-change output for every request
-  in which no table occurs twice. That covers every recorded golden-SQL fixture and every
-  non-self-join E2E shape, and is asserted rather than assumed.
-* **One owner, not four re-derivations.** The leg binding is derived from the detected join's
-  leaves and is the SOLE resolver of column-to-leg attribution. Before this delta four call sites
-  independently re-derived side identity from `tableName`: the qualified expression renderer's
-  alias map, the leg-local WHERE attribution feeding each leg's manifest pruning and DataFusion
-  filter, the FROM-chain's condition-attachment scope set, and the per-leg projection narrowing.
-  Each was a separate instance of ONE defect. A single owner is what makes the three N-leg
-  decisions — which alias a reference renders as, which leg a conjunct pushes into, which join
-  point a condition attaches at — impossible to answer inconsistently.
-* **The binding is reachable only THROUGH the detected join, never rebuilt by a caller.** It is
-  derived from the same leaf list the join-tree walk produced, so no renderer can be handed a
-  binding built from a different request and no call site can invent its own.
-* **A leg no clause references is still scanned.** `SELECT a.ID FROM T a JOIN T b ON a.ID = a.ID`
-  references one occurrence only. The other leg binds normally, nothing resolves to it, the
-  existing join-point clamp attaches the one-leg condition at a real join point, and the result
-  stays the cross product SQL means rather than becoming an error.
-* **A column reference matching no leg key is unattributable and FAILS LOUDLY.** The wrapper
-  raises its existing client-facing hard error rather than render the reference against an
-  arbitrarily chosen leg. Wrong rows are the failure mode this delta removes; a hard error is not
-  a regression from it. The state is unreachable for a well-formed request — Exasol stamps the
-  alias on every `column` node of an aliased FROM clause, including columns written UNQUALIFIED
-  (verified live, and the premise `strip_table_alias` already documents).
+* A `column` node carries the per-occurrence alias under `tableAlias`, and a FROM-tree leaf carries it under `alias`. The adapter matches (`tableName`, `tableAlias`) against the leaves' (`name`, `alias`) pairs, comparing the alias verbatim.
+* The pair identifies exactly one leg. SQL forbids two occurrences of a table with the same alias and allows at most one occurrence without an alias. An absent alias is part of the key.
+* A `tableName` that names exactly one leg resolves by name alone, because Exasol stamps no `tableAlias` on an unaliased FROM clause.
+* One binding, derived from the detected join's leaves, is the only resolver of column-to-leg attribution. Expression rendering, leg-local WHERE attribution, join-condition attachment, and per-leg projection narrowing all use it.
+* A leg that no clause references is still scanned.
+* A column reference that matches no leg key is a hard client error, because rendering it against an arbitrary leg returns wrong rows.
 
 ## Scenarios
 

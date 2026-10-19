@@ -1,89 +1,17 @@
-# Feature: Pushdown Planning — Capability Extensions
+# Feature: Pushdown Planning, Capability Extensions
 
-Extends pushdown planning (`pushdown/pushdown-planning`) with `getCapabilities`-level
-advertisements for arithmetic operator scalar functions and ISO week, plus the deliberately
-absent bitwise operator functions. Each advertised capability is gated on a
-`crates/vs-expression` translator arm. Sibling features:
-`pushdown-planning-order-by-capability` (sort keys),
-`pushdown-planning-string-conversion-capability` (CAST/NEG, SUBSTR/LEFT),
-`pushdown-planning-selectlist-expressions`, `pushdown-planning-aggregate-extensions`,
-`pushdown-planning-literal-projection`,
-`pushdown-planning-capability-extensions-credential-reference`.
+The adapter advertises the arithmetic operator scalar functions and ISO week in `getCapabilities`, and leaves the bitwise operator functions and the now-family date/time functions unadvertised. It also routes a select-list item the scan cannot emit to the qualified single-table wrapper.
 
 ## Background
 
-* A scalar-function capability is advertised only once a `crates/vs-expression` arm renders it and
-  the DataFusion 54 result matches Exasol. `FN_CAST`, `FN_NEG`, and `FN_WEEK` meet this bar;
-  `FN_DIV`, `FN_TO_CHAR`, `FN_TO_NUMBER`, the divergent date functions, and the bitwise operator functions do not and stay unadvertised.
-* Iceberg spec compliance: checked, not engaged. Verified against the Apache Iceberg table
-  spec (https://iceberg.apache.org/spec/) rather than from memory: the normative sections
-  that could bear on this change are the ones governing what a reader must resolve —
-  schema/field-id resolution ("Schemas and Data Types", "Column Projection") and scan
-  planning ("Scan Planning", manifest/partition filtering). This feature touches none of
-  them: it changes only which scalar/type-conversion capabilities the adapter advertises,
-  reading no manifest and resolving no snapshot, field id, delete, or type mapping. No
-  normative requirement applies, so there is no deviation to fix and none to track.
-* See also: sibling features listed in the intro paragraph.
-* **A capability is withdrawn when the scan cannot evaluate the function faithfully, not only when the translator cannot render it.** The four now-family names — `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, `SYSTIMESTAMP` — render as valid SQL in both dialects today, yet the node-local scan cannot produce Exasol's value for any of them. Exasol's four names are three distinct semantics over one instant: `CURRENT_TIMESTAMP` interprets it in the session time zone (`TIMESTAMP(3) WITH LOCAL TIME ZONE`), `SYSTIMESTAMP` interprets the same instant in the database time zone (`TIMESTAMP(3)`), and `CURRENT_DATE`/`SYSDATE` are `TO_DATE` of each. Rendering that distinction needs `SESSIONTIMEZONE` and `DBTIMEZONE`. Neither value reaches the scan UDF: the pushdown request carries no zone, `CommonScanSpec` carries no temporal field, the scan script declares only the common blob and the per-file list, the scan opens no connect-back session, and the SDK's `UdfContext` exposes no clock and no zone. The scan therefore reads its own container clock in UTC. It also reads that clock once per shard — the fan-out builds and drops a `SessionContext` per invocation — so a pushed clock call is evaluated G times with no statement anchor, while Exasol's now-family is statement-constant. Withdrawal is the correctness fix: Exasol never delegates a capability the adapter does not advertise, so Exasol evaluates its own clock, once, in its own zones. All three claims were measured against live Exasol 2025.2.1 rather than inferred from the advertised capability set: `EXPLAIN VIRTUAL` over a select-list `SYSTIMESTAMP` pushes `"projection":[{"expr":"now()"}, …]` with `"emit_exa_types":["TIMESTAMP(3)", …]`, and a filter-position `CURRENT_TIMESTAMP` pushes `"filter":"(now() < \"EVENT_TS\")"`, so the node is genuinely delegated; the same select returned `15:02:02.716` through the virtual schema against `17:02:03.141` from Exasol in one session, with `DBTIMEZONE` and `SESSIONTIMEZONE` both `EUROPE/BERLIN` over a UTC container clock; and `GROUP BY SYSTIMESTAMP` over a two-file table returned two distinct timestamps against one statement-constant native value. A pure-constant predicate is not a valid probe, because Exasol constant-folds it before building the pushdown request.
-* **Withdrawing a capability is the safe direction; advertising without a backing path is the unsafe one.** An unadvertised function is never delegated, so Exasol keeps it and evaluates it over the returned rows (`docs/capabilities.md` § Handled by Exasol). Advertising a capability the adapter cannot honour is what produces silent wrong answers — verified live for `ORDER_BY_EXPRESSION` with no backing path (see `pushdown-capabilities/pushdown-planning-order-by-capability`). The now-family withdrawal moves these four names from the delegated side to the Exasol-evaluated side, so it cannot lose or mistranslate a clause.
-* **Fixing `#218`/`#238` (row-scan decline routing).** A select-list item the scan UDF cannot
-  emit — its declared `selectListDataTypes` type is `TIMESTAMP WITH LOCAL TIME ZONE`, which
-  Exasol rejects as a UDF EMITS output type (sqlCode 22002) — used to decline to the
-  full-base-row projection. That decline is an INVALID pushdown response, not a
-  correct-but-unaccelerated one: Exasol validates the response POSITIONALLY against the
-  request's `selectList`, so a full-row response to an N-item select list is rejected with SQL
-  state `04000` "Expected number of columns is N but pushdown query has M" and the query FAILS.
-  Verified on the live E2E container (Exasol 2025.2.1):
-  `SELECT CURRENT_TIMESTAMP FROM <vs_table> WHERE ID = 1` →
-  "Expected number of columns is 1 but pushdown query has 5"; likewise
-  `SELECT CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE) FROM <vs_table>`,
-  and likewise at every item position. The repair — routing to the qualified single-table
-  wrapper (`qualified_single_table_fallback_pushdown`, the join N-scan fallback at N = 1)
-  already used by `pushdown-planning-grouped-agg` and `pushdown-planning-count-distinct` —
-  already exists and is already specified: `SELECT <select list rendered as Exasol SQL> FROM
-  (<sharded raw fan-out narrowed to referenced columns>) AS "LHS_T0"`. The row-scan path was the
-  one decline path that never adopted it; this fix adopts it there too. Substituting plain
-  `TIMESTAMP` for the declared type is not an alternative: Exasol returns a
-  `TIMESTAMP WITH LOCAL TIME ZONE` value converted into the SESSION time zone while plain
-  `TIMESTAMP` is returned verbatim, so the emitted UTC instant would surface as the UTC wall
-  clock.
-* **Reconciled against `main` at implementation time (2026-08-03).** This fix was drafted
-  assuming `FN_CURRENT_TIMESTAMP`/`FN_SYSTIMESTAMP`/`FN_CURRENT_DATE`/`FN_SYSDATE` were still
-  advertised capabilities, reachable by the adapter as `function_scalar` items and requiring a
-  session-context routing rule to catch. Between drafting and implementation, the independent
-  `fix-vs-expression-dialect` plan (PR #258, see the "Now-family date/time capabilities are
-  withdrawn" scenario above) withdrew all four capabilities from the advertised set entirely,
-  so Exasol never delegates any of them — in a filter or a select list — and evaluates its own
-  clock instead. That independently resolves the SYSTIMESTAMP-ships-UTC defect (`#238`) and the
-  filter-side divergence (`#239`) as a side effect, verified live during this implementation.
-  Both issues stay open only for bookkeeping — closed by this fix's PR alongside `#218`, with
-  the withdrawal cited as the actual fix. This fix's own scope therefore narrows to the
-  `TIMESTAMP WITH LOCAL TIME ZONE`-declared item (the literal/constant case, `#218` proper).
-* `specs/parallelism/work-unit-sharding` and `specs/pushdown/pushdown-planning` forbid
-  wrapping the outer scalar select in a `SELECT * FROM (...)` materialization boundary. That
-  `MUST NOT` governs the streaming row-scan HAPPY path and is textually scoped to the star
-  form; it does not reach a non-star decline wrapper, which three recorded specs already emit
-  (`pushdown-planning-grouped-agg`, `pushdown-planning-count-distinct`,
-  `pushdown-planning-single-group-agg`). This fix keeps the happy path star-free and
-  wrapper-free.
-* The routing decision is a REASON-based predicate over the request, not a comparison of the
-  `selectList` length against the projection length. An arity comparison also fires on the
-  absent, empty, and non-array `selectList` arms, where the full base row IS the correct
-  response; a reason-based predicate cannot regress those.
-* **Scope: the SINGLE-TABLE row-scan path only.** The broadcast-join fast path reaches
-  `project_columns` through `extract_join_projection` and splices its projection into the
-  broadcast join SQL with no equivalent check, so a join query with a non-emittable
-  select-list item still emits the invalid response and still fails with `04000`. That is a
-  known, deliberately unfixed gap, tracked as `(#231)`, which documents the identical
-  mechanism and its fix shape (fall through to `build_n_scan_join_sql`) for the join path.
-* A select-list item the translator cannot render in the EXASOL dialect at all is NOT fixed
-  by this. `CAST(<column> AS TIMESTAMP WITH LOCAL TIME ZONE)` is the live example:
-  `render_cast_target` declines `withLocalTimeZone: true` in BOTH dialects, and
-  `specs/sql-comprehension/vs-expression-translator-cast/spec.md` records that decline
-  normatively. Such an item is still routed away from the invalid full-row response — its
-  declared type is `TIMESTAMP WITH LOCAL TIME ZONE`, so the classifier catches it — and the
-  wrapper's renderer then fails with a named hard error instead of a misleading column-count
-  `04000`. A clearer failure, not a fix; the same underlying `04000` `(#218)` already covers.
+* A scalar-function capability is advertised only when a `crates/vs-expression` arm renders it and the DataFusion result matches Exasol. `FN_CAST`, `FN_NEG`, and `FN_WEEK` meet this bar. `FN_DIV`, `FN_TO_CHAR`, `FN_TO_NUMBER`, the divergent date functions, and the bitwise operator functions do not.
+* Exasol never delegates an unadvertised capability and evaluates it over the returned rows. Advertising a capability the adapter cannot honour returns wrong rows.
+* The now-family (`CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, `SYSTIMESTAMP`) is unadvertised, because the scan UDF receives no time zone, clock, or statement anchor. It would read its own container clock in UTC once per shard, while Exasol's now-family is constant per statement and uses the session or database time zone.
+* A select-list item whose declared `selectListDataTypes` type is `TIMESTAMP WITH LOCAL TIME ZONE` cannot be a UDF EMITS type (`sqlCode 22002`). A full-base-row response to such a request fails Exasol's positional check with SQL state `04000` ("Expected number of columns is N but pushdown query has M"). The adapter routes the request to the qualified single-table wrapper (`qualified_single_table_fallback_pushdown`) instead: `SELECT <select list as Exasol SQL> FROM (<sharded raw fan-out narrowed to referenced columns>) AS "LHS_T0"`.
+* The routing decision depends on the item's declared type, not on the `selectList` length. An absent, `null`, empty, or non-array `selectList` correctly receives the full base row.
+* The scan cannot substitute plain `TIMESTAMP` for `TIMESTAMP WITH LOCAL TIME ZONE`, because Exasol returns the latter in the session time zone and the former verbatim. The `vs-expression` literal arm (`render_exasol_tstz_literal`) renders the value as `CAST(CONVERT_TZ(TIMESTAMP '<utc value>', 'UTC', SESSIONTIMEZONE) AS TIMESTAMP WITH LOCAL TIME ZONE)`, so Exasol evaluates `SESSIONTIMEZONE` in the caller's session.
+* Exasol bit functions operate on unsigned 64-bit integers, while DataFusion's operators act on signed Arrow integers, and Iceberg has no unsigned integer type. DataFusion has no operator or function for `BIT_NOT`, `BIT_LROTATE`, `BIT_RROTATE`, `BIT_CHECK`, `BIT_SET`, or `BIT_TO_NUM`.
+* The broadcast-join path does not apply this routing.
 
 ## Scenarios
 

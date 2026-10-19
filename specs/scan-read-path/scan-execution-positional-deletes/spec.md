@@ -1,72 +1,17 @@
-# Feature: DataFusion Scan Execution — Iceberg Positional Delete Application
+# Feature: DataFusion Scan Execution, Iceberg Positional Delete Application
 
-Extends the scan UDF so that Iceberg merge-on-read (MOR) **positional deletes** are applied on
-read, so a query over a table with positional-delete files returns the post-delete row set.
-The scan keeps DataFusion's own `ParquetSource` as the scan engine — projection/filter/LIMIT
-pushdown, row-group and page pruning, statistics, and streaming are all preserved — and applies
-positional deletes by attaching a per-data-file `ParquetAccessPlan` (a base row selection) to
-that file's `PartitionedFile`, which the Parquet opener intersects with predicate/row-group/page
-pruning rather than defeating it. This is the DataFusion-native alternative to swapping in
-iceberg-rust's `ArrowReader`, and it exists to close the issue #11 silent-correctness bug for the
-positional-delete case (tracked as issue #68).
+Applies Iceberg merge-on-read positional deletes on read, so a query over a table with positional-delete files returns the post-delete row set. The scan keeps DataFusion's `ParquetSource` and attaches a per-data-file `ParquetAccessPlan` (a base row selection) to the file's `PartitionedFile`. The Parquet opener intersects that selection with predicate, row-group and page pruning.
 
 ## Background
 
-* This feature closes the positional-delete half of the silent-correctness bug in issue #11:
-  before this change the scan collapsed each iceberg `FileScanTask` to a bare `(path, size)` pair
-  and discarded its `.deletes`, so every MOR query returned pre-delete rows with no error.
-* Scope is **Parquet data files + Parquet positional-delete files only**, at both
-  `write.delete.granularity=file` and `write.delete.granularity=partition`. Equality deletes,
-  v3/Puffin deletion vectors, and ORC or Avro data or delete files are OUT OF SCOPE and MUST fail
-  loud (the authoritative gate is at plan time — see `file-planning/pushdown-file-pruning`).
-* The scan reads each associated positional-delete Parquet file (columns `file_path` Utf8,
-  field-id `2147483546`, and `pos` Int64, field-id `2147483545`), keeps only the rows whose
-  `file_path` equals the data file currently being read, and accumulates the `pos` values into a
-  per-data-file delete set (an ascending set of deleted row positions). Filtering by `file_path`
-  is REQUIRED for `partition` granularity, where one delete file references many data files.
-* Multiple positional-delete files MAY apply to one data file; their deleted positions are
-  unioned into a single delete set for that data file.
-* The delete set + the data file's per-row-group row counts (from its Parquet footer) are
-  converted into a per-row-group Arrow `RowSelection` and attached to the data file's
-  `PartitionedFile` as a base `ParquetAccessPlan`. The Parquet opener reads this as the base
-  access plan and intersects predicate/bloom-filter/row-group/page pruning ON TOP of it, so the
-  injected row selection composes with pushdown rather than disabling it.
-* **Sequence-number applicability is decided by the planning layer**, not the scan: the planning
-  layer associates each delete file with exactly the data files it applies to. The scan MUST
-  preserve that association verbatim and MUST NOT re-derive it.
-* Deletes are applied at the scan/decode layer, so the rows the DataFusion filter, LIMIT, top-N,
-  and aggregation operate on are already the post-delete rows — no downstream stage can
-  reintroduce a deleted row.
-* **Fail-loud backstop (read-time):** the primary, authoritative gate is at plan time; this
-  scan-time check is cheap defense-in-depth. If an assigned delete file is not a Parquet
-  positional delete (a Puffin / deletion-vector payload, an equality-delete file, or an unknown
-  content type), the scan MUST return a clean, credential-redacted error naming the unsupported
-  mechanism rather than silently returning pre-delete rows.
-* See `datafusion-scan/scan-execution` for the base scan flow and the unified-provider plan
-  shape, `datafusion-scan/scan-execution-spec-reconstitution` for the delete-carrying wire
-  format, and `datafusion-scan/scan-execution-file-metadata` for the no-HEAD footer read.
-* **The concurrency bounds, read-once-per-shard guarantee, and row-group pruning that the two-phase
-  pipeline below relies on are specified in
-  `scan-read-path/scan-execution-positional-deletes-fanout`**, split out once this feature's
-  scenario count crossed this library's per-spec organization threshold. This feature specifies WHAT
-  the pipeline removes and how mechanisms compose; the sibling feature specifies the I/O SHAPE of
-  reading delete files and data-file footers.
-* **This delta is issue #342 and changes no applied-delete behavior.** A data file's delete list stops
-  being an Iceberg-only list of delete-FILE references and becomes one format-neutral list of delete
-  MECHANISMS, each naming itself. The scan reads that one list and dispatches on the variant, so it
-  never asks which table format produced the spec.
-* **Two variants are applied and every other variant is refused.** The Iceberg positional-delete
-  variant keeps the whole read-once, concurrent, row-group-pruned pipeline unchanged. The Delta
-  deletion-vector variant (issue #320) joins it: both mechanisms feed the same accumulated
-  data-file-path → deleted-position map and the same access-plan pipeline, dispatching on the
-  mechanism's own variant rather than the table format. The Iceberg equality-delete and
-  Puffin-deletion-vector variants keep their existing refusal, with their existing message text.
-* **This delta changes no Iceberg behavior.** The two-phase pipeline, the shared limiter, the
-  row-selection builder, and the access-plan builder are unchanged. What changed is which delete
-  mechanisms reach that pipeline: the Delta deletion vector now does, and its refusal arm is gone.
-  The Delta side of the pipeline — descriptor resolution, sidecar fetching, and bitmap decoding —
-  is specified in `scan-read-path/scan-execution-delta-deletion-vectors`; this feature specifies
-  only what the SHARED pipeline guarantees once both mechanisms feed it.
+* The scope is Parquet data files and Parquet positional-delete files, at `write.delete.granularity=file` and `write.delete.granularity=partition`. Equality deletes, Puffin deletion vectors, and ORC or Avro files fail loud. The authoritative gate is at plan time: see `file-planning/pushdown-file-pruning`.
+* A positional-delete file has the columns `file_path` (Utf8, field-id `2147483546`) and `pos` (Int64, field-id `2147483545`). The scan keeps the rows whose `file_path` equals the data file being read and accumulates their `pos` values into a per-data-file delete set. The `file_path` filter is required for `partition` granularity, where one delete file references many data files.
+* Several delete files can apply to one data file. The scan unions their positions.
+* The delete set and the data file's per-row-group row counts, read from its Parquet footer, become a per-row-group Arrow `RowSelection`.
+* A data file's delete list is one format-neutral list of delete mechanisms, each naming its own variant. The scan dispatches on the variant and never on the table format. The Iceberg positional-delete variant and the Delta deletion-vector variant are applied, and both feed one data-file-path to deleted-position map and one access-plan pipeline. The Iceberg equality-delete and Puffin deletion-vector variants are refused.
+* The read-time backstop is defense in depth behind the plan-time gate. It returns a clean, credential-redacted error naming the unsupported mechanism.
+* `scan-read-path/scan-execution-delta-deletion-vectors` specifies the Delta side. `scan-read-path/scan-execution-positional-deletes-fanout` specifies the concurrency bounds, the read-once-per-shard guarantee, and row-group pruning.
+* See `datafusion-scan/scan-execution` for the base scan flow, `datafusion-scan/scan-execution-spec-reconstitution` for the delete-carrying wire format, and `datafusion-scan/scan-execution-file-metadata` for the no-HEAD footer read.
 
 ## Scenarios
 

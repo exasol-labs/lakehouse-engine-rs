@@ -1,98 +1,22 @@
-# Feature: Pushdown Planning — Ordered Top-N
+# Feature: Pushdown Planning, Ordered Top-N
 
-Pushes an ordered top-N query (single table, no GROUP BY, no aggregate, no non-zero OFFSET)
-down as a decomposed partial/merge top-N: each shard computes its own bounded local top-N
-over only its assigned files and emits at most `n` rows, and Exasol merges the per-shard
-rows with a final `ORDER BY … LIMIT n`. The merge `ORDER BY … LIMIT n` attaches DIRECTLY
-to the outer ungrouped scalar scan select over the nested distributor subquery (or the
-from-less single-shard select), with no `SELECT * FROM (...)` wrapper. This replaces the
-raw-emit-the-whole-table-then-sort-in-Exasol path for the common "top-N by a sort key"
-query, so only `≤ (shard_count × n)` rows cross the UDF boundary instead of every
-matching row. Every ordered shape the adapter cannot bound that way — including an
-expression or aggregate sort key, and any non-zero OFFSET — takes the declined path, which
-renders the retained ordering AND the retained final window itself.
+The adapter pushes an ordered top-N query (single table, no GROUP BY, no aggregate, no non-zero OFFSET) as a per-shard bounded top-N. Each shard emits at most `n` rows, and Exasol merges them with a final `ORDER BY … LIMIT n`. Every other ordered shape takes the declined path, which renders the ordering and the final window itself.
 
 ## Background
 
-* The per-shard bounded local top-N is carried once in the shard-invariant common spec; the merge `ORDER BY … LIMIT n` renders through the same order-by seam as the per-shard sort, so direction and NULL placement always agree.
-* This path applies only when the `pushdown` request carries an `order_by` list AND a
-  `limit` (with `numElements`), targets a single involved table, and carries NO `having`,
-  NO `aggregationType`/aggregate select items, and NO group keys. Any other shape declines
-  to the pre-existing behavior.
-* **A `limit` MAY carry a non-zero OFFSET (issue #191).** This REPLACES the recorded bullet
-  claiming "a `limit` never carries an OFFSET … the adapter builds no offset-handling path",
-  which rested on `LIMIT_WITH_OFFSET` staying unadvertised. That premise was disproven live:
-  while the capability is unadvertised Exasol strips the offset from the request AND applies
-  no offset itself, so `ORDER BY score DESC LIMIT 12 OFFSET 3` returned ranks 1-12 instead of
-  ranks 4-15. The capability is now advertised (`pushdown-capabilities/pushdown-planning-order-by-capability`)
-  and `limit.offset` arrives on the request, so the adapter owns the offset.
-* **A non-zero offset declines the bounded path; the declined wrapper renders the window.**
-  A per-shard `LIMIT n OFFSET m` is not composable: each shard would skip its OWN first `m`
-  rows, so the union of the per-shard windows is not the global window. The bounded path
-  therefore declines any non-zero offset outright and the declined wrapper — which already
-  renders a self-contained global `ORDER BY` over an unbounded fan-out — renders
-  `LIMIT n OFFSET m` on itself, where the window is exact.
-* **The bounded path's offset guard MUST test for a non-zero offset, not for the key's
-  presence.** Exasol normalises a zero offset away — `LIMIT 5 OFFSET 0` pushes
-  `{"numElements":5}` with NO `offset` key, byte-identical to a bare `LIMIT 5` (verified live
-  with the capability advertised) — so a presence test would behave identically on Exasol
-  `2025.2.1`. The non-zero test is nonetheless the required form, because it encodes the actual
-  predicate and stays correct on any future build that DOES attach `offset: 0`, where a
-  presence test would decline EVERY ordered LIMIT query into the unbounded declined path: a
-  silent cluster-wide loss of top-N pushdown, not a correctness bug and therefore invisible to
-  a result-value assertion. The existing scenario asserting the matched bounded shape is the
-  regression canary for this.
-* **A non-zero offset never arrives without a non-empty `orderBy`.** Established live across
-  11 offset-carrying shapes (see the offset-implies-ordering invariant in
-  `pushdown-capabilities/pushdown-planning-order-by-capability`). This is what makes the bounded path's
-  row-scan SQL unreachable with an offset: the offset declines the bounded path, and the
-  anti-wrong-truncation rule below then withholds the limit — but that rule is itself gated on
-  a pushed `orderBy`, so the two steps are a CHAIN, not independent guards. The invariant is
-  the link that closes it.
-* **The offset is never carried per shard.** `ScanSpec` has no offset field and gains none:
-  every offset the adapter honours is applied by an Exasol-side wrapper SELECT over the
-  complete fan-out, so no shard's row set is skipped ahead of the global ordering.
-* A sort key is MATCHED only when its `order_by` entry is a bare column reference that is
-  also one of the query's projected output columns. Exasol NOW pushes expression sort keys
-  too (`ORDER_BY_EXPRESSION` is advertised, see `pushdown-capabilities/pushdown-planning-order-by-capability`),
-  and every one of them declines to the unbounded declined path: an expression sort key does
-  not parse as a bare column, so it never matches the bounded shape. The matched bounded
-  top-N path itself — eligibility gates, per-shard bounded sort, and merge rendering — is
-  unchanged; the scan-spec wire shape and the scan UDF are untouched by expression-key support.
-* The declined path is the unoptimized correctness restoration for an ordered shape the
-  adapter cannot bound. It renders the ordering itself because Exasol delegates a pushed
-  `orderBy` and no longer re-sorts the returned rows.
-* Exasol declares a result type for each `selectList` item (`selectListDataTypes`) but NO type
-  for a sort-key expression. The declined path therefore emits the sort expression's
-  REFERENCED BASE COLUMNS as hidden scan columns — each carrying its declared type from
-  `involvedTables[0].columns` — and has Exasol evaluate the sort expression over them. No
-  Exasol result type is ever derived for an expression the adapter was not given one for.
-* The Exasol-dialect renderer (`crates/vs-expression`, the twin of the DataFusion-dialect
-  renderer, differing only in CAST target rendering) is the one seam that translates a sort
-  expression for an Exasol-evaluated clause. It is already the renderer the qualified
-  single-table wrapper and the N-scan join wrapper use for their own clauses.
-* Each `order_by` entry carries a direction (`isAscending`) and a NULL placement
-  (`nullsLast`); the per-shard bounded sort and the Exasol-side merge sort MUST use the
-  identical key order, direction, and NULL placement, or the merged top-N can differ from
-  single-node evaluation.
-* The correctness of the per-shard bound is the standard distributed top-N argument: a row
-  in the global top-N cannot be outranked by `n` or more rows across all shards, so it
-  cannot be outranked by `n` rows within its OWN shard, so it survives that shard's local
-  `ORDER BY … LIMIT n` cut — hence the global top-N is a subset of the union of the
-  per-shard local top-Ns, and the outer `ORDER BY … LIMIT n` over that union is exact.
-* Direction and NULL placement for every `ORDER BY` element the adapter emits — per-shard
-  sort, declined wrapper, grouped merge, join wrapper — render through ONE shared seam, so
-  they cannot drift. An expression sort key reuses that seam with the rendered expression in
-  place of a quoted column identifier.
-* A declined ordered shape may cause the adapter to emit extra hidden sort-key columns
-  from the per-shard scan (see `pushdown-capabilities/pushdown-planning-order-by-capability`).
-  Those columns exist only to make the declined wrapper's outer `ORDER BY` resolvable;
-  they are not a top-N optimization and are never visible in the returned result.
-* Shapes whose sort key falls outside the derived projection now take the declined path
-  rather than matching a bounded top-N over a widened projection. Those shapes never
-  returned a usable result before (the widened match returned more columns than the select
-  list, which Exasol rejects), so the declined path trades an unbounded per-shard scan for
-  a correct answer; a bounded variant for them is possible future work, not a regression.
+* The per-shard bounded top-N is carried once in the shard-invariant common spec. The merge `ORDER BY … LIMIT n` renders through the same order-by seam as the per-shard sort, so direction and NULL placement agree.
+* The bounded path applies only to a request with an `order_by` list and a `limit` with `numElements`, a single involved table, and no `having`, no aggregates, and no group keys.
+* A sort key is matched only when its `order_by` entry is a bare column reference that is also a projected output column. An expression or aggregate sort key never matches, because the per-shard sort key in the scan spec is a bare column.
+* Each `order_by` entry carries a direction (`isAscending`) and a NULL placement (`nullsLast`). The per-shard sort and the merge sort must use the same key order, direction, and NULL placement, or the merged top-N can differ from single-node evaluation.
+* A row in the global top-N cannot be outranked by `n` rows within its own shard, so it survives that shard's local `ORDER BY … LIMIT n`. The global top-N is therefore a subset of the union of the per-shard top-Ns.
+* A non-zero offset declines the bounded path, because each shard would skip its own first `m` rows and the union of the per-shard windows is not the global window. The declined wrapper renders `LIMIT n OFFSET m` on itself. `ScanSpec` has no offset field.
+* The offset guard tests for a non-zero offset, not for the key's presence. Exasol pushes no `offset` key for `OFFSET 0`, but a presence test would decline every ordered LIMIT query on a build that attached `offset: 0`.
+* A non-zero offset always arrives with a non-empty `orderBy` (`pushdown-capabilities/pushdown-planning-order-by-capability`). The declined path then withholds the per-shard limit, because that rule is gated on a pushed `orderBy`.
+* Exasol delegates a pushed `orderBy` and does not re-sort the returned rows, so the declined path renders the ordering itself.
+* Exasol declares a result type for each `selectList` item but none for a sort-key expression. The declined path emits the expression's referenced base columns as hidden scan columns, each with its declared type from `involvedTables[0].columns`, and Exasol evaluates the expression over them.
+* The Exasol-dialect renderer in `crates/vs-expression` translates a sort expression for an Exasol-evaluated clause. The qualified single-table wrapper and the N-scan join wrapper use the same renderer.
+* Direction and NULL placement for every `ORDER BY` element the adapter emits render through one shared seam. An expression sort key reuses it with the rendered expression in place of a quoted column identifier.
+* Hidden sort-key columns exist only to make the declined wrapper's outer `ORDER BY` resolvable (`pushdown-capabilities/pushdown-planning-order-by-capability`). They never appear in the returned result.
 
 ## Scenarios
 

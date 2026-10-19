@@ -1,4 +1,4 @@
-# Feature: Connection-Object Credential Source — Unity Catalog Kind Parameterization
+# Feature: Connection-Object Credential Source, Unity Catalog Kind Parameterization
 
 Extends `connection/connection-credentials` so credential validation takes the resolved `CatalogKind` as input: `warehouse`-required applies under `IcebergRest` only; Unity Catalog carries no warehouse.
 

@@ -1,14 +1,11 @@
 # Feature: Connection-Object Credential Source: AWS IAM Role Assumption
 
-Lets a CONNECTION name an AWS IAM role that the engine assumes through AWS STS `AssumeRole`, so a base identity that holds only `sts:AssumeRole` permission reaches Glue and S3 as that role. This feature covers the CONNECTION fields that name the role, how the adapter validates them, and the `AssumeRole` call: its parameters, the plaintext-endpoint gate, the checks on its response, and the error when it fails. Tracked by issue [#139](https://github.com/exasol-labs/lakehouse-engine-rs/issues/139).
+Lets a CONNECTION name an AWS IAM role that the engine assumes through AWS STS `AssumeRole`, so a base identity that holds only `sts:AssumeRole` permission reaches Glue and S3 as that role.
 
 ## Background
 
-* **Three optional CONNECTION password fields.** `aws_assume_role_arn` names the role. `aws_external_id` is the optional `ExternalId` for a role whose trust policy requires one. `aws_sts_endpoint` overrides the STS endpoint. An empty string is absent, per `connection/connection-credentials`.
-* **The base identity is the CONNECTION's own key pair.** `access_key`, `secret_key`, and an optional `session_token` sign the request. No ambient AWS credential is read: no environment variable, instance profile, or web-identity token.
-* **The official `aws-sdk-sts` client owns the wire protocol.** It owns request encoding, SigV4 signing, response parsing, endpoint resolution, and retries. The engine owns only the fields above, the fixed session name `lakehouse-engine`, the plaintext-endpoint gate, and the session's use.
-* **STS region.** The region is the SigV4 signing region of `connection/connection-credentials-sigv4`, else `us-east-1`. Without `aws_sts_endpoint`, the SDK resolves the regional endpoint. A China-region CONNECTION states `aws_sts_endpoint`, because the AWS STS endpoint table lists China endpoints under `.amazonaws.com.cn`.
-* See `connection/connection-credentials-assume-role-session-use` for where the session replaces the base key pair once the role is assumed.
+* Three optional CONNECTION password fields: `aws_assume_role_arn` names the role, `aws_external_id` is the optional `ExternalId` for a role whose trust policy requires one, and `aws_sts_endpoint` overrides the STS endpoint. An empty string is absent.
+* The base identity is the CONNECTION's own `access_key`, `secret_key`, and optional `session_token`, which sign the request. No ambient AWS credential is read.
 
 ## Scenarios
 

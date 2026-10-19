@@ -1,82 +1,19 @@
-# Feature: Pushdown Planning — Single-Group COUNT(DISTINCT)
+# Feature: Pushdown Planning, Single-Group COUNT(DISTINCT)
 
-Extends single-group aggregate pushdown (`pushdown/pushdown-planning`) so a
-`COUNT(DISTINCT col)` over the whole table (no GROUP BY) is decomposed into a dedicated
-DISTINCT row-scan fan-out whose shard-local distinct values are counted by an outer
-Exasol-native `COUNT(DISTINCT)`. Each shard streams one row per locally-distinct value
-through the existing row-scan path; the outer wrapper's `COUNT(DISTINCT "V")` performs the
-cross-shard deduplication, so distinct cardinality is bounded by Exasol's own aggregate
-engine rather than a fixed per-shard serialization cap.
+The adapter pushes a lone `COUNT(DISTINCT col)` over the whole table (no GROUP BY) as a DISTINCT row-scan fan-out. Each shard streams its locally-distinct values, and an outer Exasol `COUNT(DISTINCT "V")` deduplicates across shards.
 
 ## Background
 
-* Only the single-group (no GROUP BY) `COUNT(DISTINCT col)` case is in scope. A
-  `COUNT(DISTINCT ...)` that appears inside a GROUP BY request MUST still cause the grouped
-  detection to decline (fall back to row scanning); it is explicitly out of scope.
-* The DISTINCT row-scan fan-out applies ONLY to a lone single-group `COUNT(DISTINCT col)` —
-  exactly one distinct aggregate and no other select-list item (Case 1). A request carrying
-  more than one distinct aggregate, or a distinct aggregate alongside any ordinary
-  SUM/MIN/MAX/COUNT/AVG aggregate (Case 2/3), MUST decline the fan-out and route to a
-  qualified single-table wrapper — the same shape the grouped-aggregate decline fallback uses
-  (`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`). The wrapper renders the exact single-group
-  select list, every aggregate (including each `COUNT(DISTINCT)`) spliced verbatim, over a
-  materialized sharded raw scan aliased once, so the adapter's OWN SQL produces the one-row
-  aggregated result and Exasol only passes it through. A BARE row scan MUST NOT be returned for
-  a Case 2/3 request: Exasol never re-aggregates a declined pushdown, so returning the raw
-  source columns where the request's `selectListDataTypes` expects the aggregate columns is
-  rejected at pushdown-validation time (`sqlCode 04000`, column-count mismatch). An emitting UDF
-  call is likewise only valid as a top-level FROM item; Exasol rejects it inside a SELECT-list
-  scalar subquery at compile time (`sqlCode 04000`, "emitting function in expression"), so
-  multiple distinct fan-outs cannot be composed as sibling scalar subqueries in one outer SELECT.
-* `COUNT(DISTINCT col)` is NOT a partial aggregate. For the lone-distinct case the adapter
-  plans it as a row-scan whose projection is the single distinct column with a `distinct`
-  flag set, reusing the same fan-out, streaming, and per-column EMITS-type machinery the raw
-  row-scan path uses. The scan spec MUST NOT carry a
-  `CountDistinct` aggregate partial, and no per-shard JSON distinct-set is produced.
-* The Case 1 fan-out engages ONLY for a bare-column distinct argument. It emits one row per
-  shard-local distinct value declaring that column's actual Exasol EMITS type — the standard
-  Arrow-to-Exasol mapping, including the JSON-string fallback for Exasol-incompatible types, the
-  same type resolution MIN/MAX partials use — never a hardcoded `VARCHAR(2000000)` JSON array
-  and never any other VARCHAR-typed intermediate value. A `COUNT(DISTINCT <expression>)` — lone
-  or combined with any other aggregate — NEVER reaches this fan-out: it always declines to the
-  Case 2/3 qualified single-table wrapper, where Exasol evaluates the expression and the
-  DISTINCT natively over the expression's exact-typed base columns.
-* `COUNT(DISTINCT col)` excludes NULLs, matching single-node SQL semantics: the pushed-down
-  fan-out filter excludes NULL values.
-* The cross-shard merge is a plain Exasol `COUNT(DISTINCT "V")` over the union of every
-  shard's locally-distinct rows. The adapter MUST NOT generate a custom merge UDF, a
-  `LISTAGG` concatenation, or bespoke SQL string-splitting. Distinct cardinality is bounded
-  only by Exasol's own distinct-aggregate engine (its spill and resize behavior), NOT by a
-  fixed per-shard element or byte cap.
-* The distinct fan-out reuses the row-scan builder, which also renders `ORDER BY … LIMIT n`
-  for matched top-N row scans. That top-N machinery MUST NOT engage for a distinct fan-out:
-  the fan-out's shard-invariant common spec carries no LIMIT, OFFSET, or ORDER BY from the
-  outer request. A per-shard LIMIT would drop shard-local distinct values before the merge
-  counts them, producing a WRONG count — the same hazard the grouped-aggregate path already
-  guards (`pushdown-grouped-agg/pushdown-planning-grouped-agg`, "LIMIT is NOT pushed into per-shard
-  scan for a grouped query"). Any request-level LIMIT applies only to the outer
-  `COUNT(DISTINCT "V")` wrapper SELECT. This narrows to LIMIT alone: no request-level OFFSET
-  can ever reach this wrapper, because Exasol rejects an `OFFSET` in ANY ungrouped aggregated
-  select with `sqlCode 42000` ("OFFSET not allowed in aggregated selects") at parse time,
-  before the adapter is consulted — verified live on `SELECT COUNT(DISTINCT id) FROM t ORDER
-  BY 1 LIMIT 5 OFFSET 2` and on a two-`COUNT(DISTINCT)` Case 2/3 select (issue #191).
-* **The limit withholding once implemented was dead code, and has been deleted (issue #191).**
-  Two rules require the lone-`COUNT(DISTINCT)` wrapper to render the request's LIMIT on
-  its own outer SELECT and to NOT withhold it because an unrendered `ORDER BY` is present: the
-  "LIMIT, OFFSET, and ORDER BY are NOT pushed into the distinct fan-out sub-scan" scenario
-  below, and the single-row-aggregate scenario in
-  `pushdown-capabilities/pushdown-planning-order-by-capability`. The withholding branch never fired,
-  because Exasol pushes NO `orderBy` on an ungrouped aggregate request (verified live: `SELECT
-  COUNT(DISTINCT id) FROM t ORDER BY 1 LIMIT 5` and `ORDER BY COUNT(DISTINCT id) LIMIT 5` both
-  push `limit` with `orderBy` ABSENT). Deleting the branch makes both rules hold BY
-  CONSTRUCTION rather than by an accident of what Exasol currently sends.
-* **No offset can reach this wrapper, so it renders none.** Exasol rejects an `OFFSET` in ANY
-  ungrouped aggregated select with `sqlCode 42000` ("OFFSET not allowed in aggregated selects")
-  — verified live on `SELECT COUNT(DISTINCT id) FROM t ORDER BY 1 LIMIT 5 OFFSET 2` and on a
-  two-`COUNT(DISTINCT)` Case 2/3 select. The statement fails at parse time, before the adapter
-  is consulted. This wrapper therefore takes the SAME treatment as the single-group aggregate
-  merge (`pushdown-aggregates/pushdown-planning-single-group-agg`): no offset parameter, no collapse
-  arithmetic, and no failure branch.
+* Only the single-group case is in scope. A `COUNT(DISTINCT ...)` inside a GROUP BY request makes the grouped detection decline and fall back to row scanning.
+* The fan-out applies to exactly one distinct aggregate with a bare-column argument and no other select-list item (Case 1). Any other single-group shape with a distinct aggregate (Case 2/3) routes to a qualified single-table wrapper: more than one distinct aggregate, a distinct aggregate beside an ordinary aggregate, or an expression argument.
+* The wrapper renders the exact select list over a materialized sharded raw scan, so the adapter's own SQL produces the aggregated row. Exasol never re-aggregates a declined pushdown, so a bare row scan fails pushdown validation (`sqlCode 04000`, column-count mismatch).
+* Exasol rejects an emitting UDF call inside a SELECT-list scalar subquery (`sqlCode 04000`), so several distinct fan-outs cannot be composed as sibling subqueries.
+* `COUNT(DISTINCT col)` is not a partial aggregate. The scan spec is a row scan whose projection is the distinct column with a `distinct` flag set, and it carries no `CountDistinct` partial.
+* The fan-out declares the column's actual Exasol EMITS type, the same type resolution MIN/MAX partials use, including the JSON-string fallback for Exasol-incompatible types. It never declares a `VARCHAR(2000000)` intermediate.
+* The fan-out filter excludes NULLs.
+* The cross-shard merge is a plain `COUNT(DISTINCT "V")`. Distinct cardinality is bounded only by Exasol's aggregate engine, not by a per-shard cap.
+* A per-shard LIMIT would drop locally-distinct values before the merge, so the fan-out carries no LIMIT, OFFSET, or ORDER BY. A request-level LIMIT applies only to the outer wrapper SELECT.
+* Exasol pushes no `orderBy` on an ungrouped aggregate request and rejects an `OFFSET` in an ungrouped aggregated select at parse time (`sqlCode 42000`). The wrapper therefore renders no OFFSET.
 
 ## Scenarios
 

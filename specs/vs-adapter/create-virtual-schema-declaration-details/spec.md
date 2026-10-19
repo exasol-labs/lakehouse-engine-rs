@@ -1,74 +1,17 @@
-# Feature: Create Virtual Schema — Declaration Details
+# Feature: Create Virtual Schema, Declaration Details
 
-Covers the identifier-casing and timestamp-precision details of the `createVirtualSchema` column
-and table declaration that `vs-adapter/create-virtual-schema` does not itself carry: multi-level
-namespace flattening and its `__`-collision guard, the full-Unicode uppercasing fold end-to-end
-over a non-ASCII identifier, the single per-request `database_version()` read that resolves the
-declared timestamp precision, and the `fractionalSecondsPrecision` JSON a `TIMESTAMP(p)`
-declaration serializes to. Split out of `vs-adapter/create-virtual-schema` once that feature's
-scenario count crossed this library's per-spec organization threshold.
+The `createVirtualSchema` declaration flattens multi-level namespaces into table names, uppercases identifiers with the full Unicode fold, resolves the declared timestamp precision from one `database_version()` read per request, and serializes a `TIMESTAMP(p)` column as `fractionalSecondsPrecision` JSON.
 
 ## Background
 
-* `str::to_uppercase` is FULL Unicode case mapping, not a one-to-one fold, and the difference is
-  observable: it maps `ß` to `SS`, expanding one character into two. Rust's own `str::to_uppercase`
-  documentation pins that example. `flatten_table_name` (`adapter/tables.rs:29`, folding at `:42`)
-  applies the same `to_uppercase` to the table name, so both halves of a declared identifier go
-  through one rule — the same rule `vs-adapter/create-virtual-schema`'s enumeration scenario
-  declares for column names.
-* The `ß`-to-`SS` expansion is a deliberate trade-off, not a gap. An Iceberg column `straße` is
-  queryable ONLY as `STRASSE`; the `ß`-bearing form `"STRAßE"` resolves against no declared column.
-  Two Iceberg columns in one table differing only in that expansion (`strasse` and `straße`) would
-  both declare `STRASSE`, which the response would carry as a duplicate column name. No table-name
-  equivalent exists, because `flatten_table_name`'s output feeds the `__`-collision check the
-  multi-level-namespace scenario below already errors on — the column path has no such check.
-* Apache Iceberg spec check: NOT implicated as a schema or type question. The spec's Schemas and
-  Data Types section defines a `struct` field as carrying a "field name" string and constrains
-  field IDs, not the SQL identifier casing a downstream engine uses to expose that name. The spec
-  mandates no case-sensitivity rule for consumers, so uppercasing at declaration is an Exasol
-  identifier-resolution decision rather than an Iceberg deviation.
-* **This delta is issue #359.** It adds TWO scenarios and AMENDS NO recorded clause. The first records
-  the single `ctx.database_version()` read and how the resolved timestamp precision reaches the
-  declaration pipeline. The second records the column `dataType` JSON a `TIMESTAMP(p)` declaration
-  serializes to.
-* **`scan-types/type-mapping-timestamp-precision` owns WHICH declaration each version gets; this
-  feature owns WHERE the version is read and HOW the answer travels.** The split matters because the
-  type-mapping module must stay free of `UdfContext` — it reads no ambient state and does no I/O —
-  so the context read has to happen at the adapter edge and the answer has to travel as a plain
-  value.
-* **`cluster_nodes_from_context` is the recorded precedent for this shape.** It reads
-  `ctx.node_count()` once at the adapter edge, normalizes it, and passes a plain `usize` onward; it
-  never threads `ctx` into a helper module. `ctx.database_version()` follows the same shape. There is
-  no wrapper function for it, because a wrapper whose whole body forwards one call adds a name without
-  adding a decision — the read happens inline in `handle_create_virtual_schema`, where every other
-  per-request value is already resolved.
-* **`ctx` is already live at the one site that needs it.** `handle_create_virtual_schema(ctx: &mut dyn
-  UdfContext, request: &Json)` receives the context and already calls `resolve_connection_config(ctx,
-  …)` and `udf_log!(ctx, warn, …)`. `build_listing_virtual_tables(configured_ns, listing)` is the
-  declaration pipeline it calls, and it currently takes no precision argument — so exactly one new
-  plain parameter reaches it, and from there `column_source_type_to_exasol`.
-* **The scan UDF entry point needs NO version read.** `UdfContext::database_version` is available on
-  both entry points, but the scan's `EMITS` types arrive in the adapter-generated pushdown SQL and in
-  `ScanSpec::emit_exa_types`, both derived from the pushdown request's own `dataType` JSON. Adding a
-  second version read there would create a second owner of one decision.
-* **`exasol_type_to_json` today has no `TIMESTAMP(p)` arm, which is why this feature needs a
-  scenario and not just a threading change.** Its timestamp branch matches the string `TIMESTAMP`
-  EXACTLY; a `TIMESTAMP(6)` string falls through every arm to the catch-all and would be declared
-  `{"type": "varchar", "size": 2000000}` — a silently wrong column type, not a rejected request. The
-  field name is `fractionalSecondsPrecision`, pinned by the
-  Exasol type declaration: Exasol uses `precision` only for
-  `DECIMAL` and `INTERVAL`, never for a TIMESTAMP.
-* **The round trip closes at `exasol_type_from_json`, which already reads the same field.** Once the
-  declaration carries `fractionalSecondsPrecision: 6`, Exasol echoes it in the pushdown request's
-  `involvedTables` column `dataType`, `exasol_type_from_json` renders `TIMESTAMP(6)`, and the `EMITS`
-  clause and emit-boundary coercion follow with no further change — the pair is a matched inverse over
-  one grammar, so making the forward direction precision-aware completes a path the inverse already
-  handles.
-* **Live verification is required before implementation, per CLAUDE.md § Verification discipline.**
-  That Exasol accepts `fractionalSecondsPrecision` in a `createVirtualSchema` column `dataType`, that
-  it declares the resulting VS column as `TIMESTAMP(6)`, and that it echoes the field back on the
-  pushdown request are all claims about live SQL behavior that no documentation or capability registry
-  settles. They are captured against the Docker Exasol container before the declaration changes.
+* `str::to_uppercase` is full Unicode case mapping, not a one-to-one fold. It maps `ß` to `SS`. `flatten_table_name` applies the same `to_uppercase` to the table name, so both halves of a declared identifier follow one rule, the one `vs-adapter/create-virtual-schema` declares for column names.
+* The `ß`-to-`SS` expansion is a deliberate trade-off. An Iceberg column `straße` is queryable only as `STRASSE`, and `"STRAßE"` resolves against no declared column. Two Iceberg columns that differ only in that expansion would both declare `STRASSE`, and the column path has no collision check. Table names have one: `flatten_table_name`'s output feeds the `__`-collision check.
+* `scan-types/type-mapping-timestamp-precision` owns which timestamp declaration each Exasol version gets. This feature owns where the version is read and how the answer travels. The type-mapping module stays free of `UdfContext`, so the read happens at the adapter edge and the answer travels as a plain value.
+* `cluster_nodes_from_context` is the precedent. It reads `ctx.node_count()` once at the adapter edge and passes a plain `usize` onward. `ctx.database_version()` follows the same shape, inline in `handle_create_virtual_schema` with no forwarding wrapper.
+* `handle_create_virtual_schema` already holds the `UdfContext`. It calls `build_listing_virtual_tables(configured_ns, listing)`, which takes one new plain precision parameter and passes it on to `column_source_type_to_exasol`.
+* The scan UDF entry point reads no version. Its `EMITS` types come from the pushdown request's own `dataType` JSON and `ScanSpec::emit_exa_types`.
+* `exasol_type_to_json` matches the string `TIMESTAMP` exactly and has no `TIMESTAMP(p)` arm, so a `TIMESTAMP(6)` string would fall through to the catch-all and declare `{"type": "varchar", "size": 2000000}`. The field name is `fractionalSecondsPrecision`. Exasol uses `precision` only for `DECIMAL` and `INTERVAL`.
+* `exasol_type_from_json` already reads `fractionalSecondsPrecision`. Exasol echoes it in the pushdown request's `involvedTables` column `dataType`, so the `EMITS` clause and emit-boundary coercion follow without further change.
 
 ## Scenarios
 

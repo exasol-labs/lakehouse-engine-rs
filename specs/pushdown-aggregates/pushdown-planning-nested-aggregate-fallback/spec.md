@@ -1,22 +1,11 @@
-# Feature: Pushdown Planning — Nested Aggregate Fallback
+# Feature: Pushdown Planning, Nested Aggregate Fallback
 
-Extends `pushdown/pushdown-planning` with the guard against composed pushdown requests
-whose `selectList`, `groupBy`, or `filter` nodes do not all resolve to plain columns of the
-involved source table's current Iceberg schema — e.g. an outer aggregate over an inner
-grouped-aggregate sub-select. Rather than rendering a scan-driving SQL that references a
-phantom identifier absent from the source schema, the adapter falls back to row scanning so
-Exasol applies the outer computation itself.
+The adapter falls back to row scanning for a composed pushdown request, such as an outer aggregate over an inner grouped-aggregate sub-select, whose nodes do not all resolve to columns of the source table.
 
 ## Background
 
-* A composed pushdown request (an outer aggregate over an inner grouped-aggregate sub-select,
-  or any other shape with select-list/group-by/filter nodes that don't map onto the source
-  table's own columns) MUST NOT be rendered into scan-driving SQL that references a column
-  absent from the involved table's resolved logical schema.
-* When the adapter cannot map every `selectList`/`groupBy` node of a composed request onto a
-  supported single-group aggregate, grouped aggregate, or projection over the source table's
-  own columns, it falls back to row scanning (a row-scan ScanSpec with no aggregates field) so
-  Exasol applies the outer computation on the returned rows using its own engine.
+* A `selectList`, `groupBy`, or `filter` node that does not map onto a column of the involved table's resolved logical schema must not appear in scan-driving SQL.
+* A row-scan ScanSpec has no aggregates field. Exasol then applies the outer computation on the returned rows.
 
 ## Scenarios
 

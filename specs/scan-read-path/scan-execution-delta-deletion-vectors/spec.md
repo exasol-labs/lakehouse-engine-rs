@@ -1,60 +1,18 @@
-# Feature: DataFusion Scan Execution — Delta Deletion Vector Application
+# Feature: DataFusion Scan Execution, Delta Deletion Vector Application
 
-Extends the scan UDF so a Delta Lake deletion vector is applied on read, so a query over a Delta
-table whose rows were deleted returns the post-delete row set rather than the raw Parquet content.
-A deletion vector names row positions inside ONE data file, so it converges on the machinery Iceberg
-positional deletes already use: a `RoaringTreemap` of deleted positions becomes a base
-`RowSelection`, which becomes a `ParquetAccessPlan` the Parquet opener intersects with predicate,
-row-group, and page pruning. Only the step that PRODUCES the bitmap is new, and it is delegated to
-`delta_kernel`'s own protocol-conformant decoder rather than re-implemented. This closes the refusal
-the read-time backstop currently raises for the `DeltaDeletionVector` delete mechanism.
+Applies a Delta Lake deletion vector on read, so a query over a Delta table returns the post-delete row set. The decoded positions feed the same `RowSelection` and `ParquetAccessPlan` machinery as Iceberg positional deletes, and `delta_kernel`'s decoder produces the bitmap.
 
 ## Background
 
-The Delta protocol's normative shapes this feature reads, quoted from the Delta Lake protocol
-specification (`delta-io/delta`, `PROTOCOL.md`, `master`):
+The Delta protocol (`delta-io/delta`, `PROTOCOL.md`) defines these shapes:
 
-- Semantics — *"Deletion Vectors are basically sets of row indexes, that is 64-bit integers that
-  describe the position (index) of a row in a parquet file starting from zero."* and *"If a snapshot
-  contains logical files with records that are invalidated by a DV, then these records must not be
-  returned in the output."*
-- Descriptor — `storageType` is *"A single character to indicate how to access the DV. Legal options
-  are: `['u', 'i', 'p']`."*; `offset` is *"Start of the data for this DV in number of bytes from the
-  beginning of the file it is stored in. Always `None` (absent in JSON) when `storageType = 'i'`.
-  Interpret as `0` if absent for other `storageType`s."*; `sizeInBytes` is *"Size of the serialized
-  DV in bytes (raw data size, i.e. before base85 encoding, if inline)."*; `cardinality` is *"Number
-  of rows the given DV logically removes from the file."*
-- Path reconstruction — *"If `storageType='p'`, just use the already absolute path. If
-  `storageType='u'`, the DV is stored at `<parent path>/<random prefix>/deletion_vector_<uuid in
-  canonical textual representation>.bin`."*, where *"The random prefix is recovered as the extra
-  characters before the (20 characters fixed length) uuid"* and *"The concrete Base85 variant used
-  is Z85"*.
-- File container — *"The format for storing DVs in file storage is one (or more) DV ... per file,
-  together with a checksum for each DV."*, framed *"with all numerical values written in big endian
-  byte order"* as byte `0` = *"The format version of this file: `1` for the format described here."*,
-  then per DV a 4-byte `dataSize`, then `bitmapData`, then a *"CRC-32 checksum of `bitmapData`"*.
-- Bitmap payload — *"all numerical values are written in little endian byte order"*: 4-byte
-  `magicNumber` = *"1681511377"*, then *"A serialized 64-bit bitmap in the portable standard format
-  ... This can be treated as a black box by any Delta implementation that has a native,
-  standard-compliant RoaringBitmap library available to pass these bytes to."*
-- Sharing — *"A DV file contains one or more serialised DV, each describing the set of invalidated
-  ... rows for a particular data file it is associated with. For data with partition values, DV
-  files are not kept in the same directory hierarchy as data files, as each one can contain DVs for
-  files from multiple partitions."*
+* A deletion vector is a set of 0-based 64-bit row indexes into one Parquet file. Records a deletion vector invalidates must not be returned.
+* The descriptor carries `storageType` (`u` UUID-relative, `i` inline, `p` absolute path), `offset` (bytes from the start of the file, absent for `i`, read as `0` if absent otherwise), `sizeInBytes`, and `cardinality` (rows removed).
+* For `p`, the path is already absolute. For `u`, the sidecar is at `<parent path>/<random prefix>/deletion_vector_<uuid>.bin`. The random prefix is the characters before the 20-character Z85-encoded UUID in the payload.
+* A sidecar holds one or more deletion vectors for different data files, each with a checksum. It starts with a format-version byte `1`. Each deletion vector is a 4-byte `dataSize`, the bitmap, and a CRC-32 of the bitmap, all big endian.
+* A bitmap payload is little endian. It starts with the 4-byte magic number `1681511377`, then a serialized 64-bit portable Roaring bitmap.
 
-The engine already carries the descriptor verbatim to the scan: the `DeltaDeletionVector` variant of
-the format-neutral delete mechanism holds the storage kind, the path-or-inline payload, the offset,
-the size in bytes, and the cardinality (see `delta/delta-table-planning`). Nothing about the
-descriptor is resolved at plan time.
-
-The decoder is `delta_kernel`'s `DeletionVectorDescriptor::read`, already a workspace dependency and
-already reachable without any additional feature flag. It returns the `roaring::RoaringTreemap` type
-this crate already uses for Iceberg positional deletes — one `roaring` crate instance resolves for
-the whole workspace — so the bitmap drops straight into the shipped `RowSelection` and
-`ParquetAccessPlan` builders with no conversion and no second delete pipeline.
-
-Every scenario below runs inside the scan UDF, under the same bounded memory pool, the same shared
-object-store connection budget, and the same streaming `emit_batch` path as every other scan.
+The engine carries the descriptor unresolved in the `DeltaDeletionVector` variant of the format-neutral delete mechanism: see `delta/delta-table-planning`. The decoder is `delta_kernel`'s `DeletionVectorDescriptor::read`. It returns the `roaring::RoaringTreemap` that the Iceberg positional-delete pipeline already uses. Every scenario runs inside the scan UDF under the bounded memory pool, the shared object-store connection budget and the streaming `emit_batch` path.
 
 ## Scenarios
 

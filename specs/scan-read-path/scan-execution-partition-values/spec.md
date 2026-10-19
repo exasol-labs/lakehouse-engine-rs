@@ -1,44 +1,12 @@
-# Feature: DataFusion Scan Execution — Partition Value Materialization
+# Feature: DataFusion Scan Execution, Partition Value Materialization
 
-Extends the scan UDF so a partition column that has no physical counterpart in a data file is
-produced from that file's logged partition value instead of read from Parquet. A partitioned table
-stores a partition column's value once per file in its catalog metadata rather than once per row in
-the file, so a scan that reads only Parquet returns NULL for every partition column. This feature
-closes that gap by giving each assigned file its partition values as scan-time constants, inside
-DataFusion, so projection, filters, aggregation, and pruning all observe the real values.
+Produces a partition column that has no physical counterpart in a data file from the file's logged partition value, as a scan-time constant inside DataFusion. Projection, filters, aggregation and pruning then see the real values instead of NULL.
 
 ## Background
 
-The scan spec already carries both halves of this, format-neutrally and unread: the shard-invariant
-common spec carries the table's ordered `partition_columns`, and each file entry carries its own
-`partition_values` map — one entry per partition column, holding the serialized value or an explicit
-absent value for NULL (see `delta/delta-table-planning`). Nothing in this feature is
-Delta-specific: the same two fields are what an Iceberg identity-transform partition value (issue
-#99) and a future Hive-style partition value would populate, and the scan dispatches on whether the
-fields are populated, never on which table format produced them.
-
-The Delta Lake protocol specification (`delta-io/delta`, `PROTOCOL.md`, `master`) is what makes the
-log authoritative rather than the directory layout or the file content:
-
-- *"By default, the reference implementation stores data files in directories that are named based
-  on the partition values for data in that file (i.e. `part1=value1/part2=value2/...`). This
-  directory format is only used to follow existing conventions and is not required by the protocol.
-  Actual partition values for a file must be read from the transaction log."*
-- *"Values for all partition columns present in the schema MUST be present for all files in the
-  table."* and *"Columns present in the schema of the table MAY be missing from data files. Readers
-  SHOULD fill these missing columns in with `null`."*
-- Partition Value Serialization — *"Partition values are stored as strings, using the following
-  formats. An empty string for any type translates to a `null` partition value."*, with `numeric
-  types` as *"The string representation of the number"*, `date` as *"Encoded as
-  `{year}-{month}-{day}`"*, `boolean` as *"Encoded as the string \"true\" or \"false\""*.
-- A partition column is not always absent from the file: under IcebergCompatV1 a writer must
-  *"Require that partition column values are materialized into any Parquet data file that is present
-  in the table, placed after the data columns in the parquet schema"*. The log stays authoritative
-  in that case too, per the quote above.
-
-Exasol delegates an advertised predicate fully and never re-applies it, so a filter over a partition
-column is this engine's to satisfy: materializing the value is what makes that filter correct rather
-than merely deferred.
+* The shard-invariant common spec carries the table's ordered `partition_columns`. Each file entry carries a `partition_values` map with one entry per partition column, holding the serialized value or an explicit absent value for NULL: see `delta/delta-table-planning`. The scan dispatches on whether these fields are populated, never on the table format.
+* The Delta protocol (`delta-io/delta`, `PROTOCOL.md`) makes the transaction log the authoritative source of a file's partition values. The directory layout is a writer convention. A writer may also materialize the partition column into the Parquet file, and the log stays authoritative then too.
+* The protocol stores partition values as strings: numbers as their string form, dates as `{year}-{month}-{day}`, booleans as `"true"` or `"false"`. An empty string means a null partition value.
 
 ## Scenarios
 

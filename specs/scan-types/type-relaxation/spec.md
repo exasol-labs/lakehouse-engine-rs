@@ -1,136 +1,39 @@
 # Feature: Type Relaxation
 
-Reads a data file whose physical column type is NARROWER than the table's current logical type — the
-shape Delta type widening and Iceberg type promotion both leave behind — by casting each file's
-column up to the current type at scan time, so a schema-evolved table returns its real values under
-its current types instead of wrong values or an unresolved-column error.
+Reads a data file whose physical column type is narrower than the table's current logical type, the shape Delta type widening and Iceberg type promotion both leave behind. The scan casts each file's column up to the current type, so a schema-evolved table returns its real values under its current types.
 
 ## Background
 
-**Type relaxation is ONE format-neutral read behavior with two writers.** Delta calls it type
-widening and Iceberg calls it type promotion; both leave older data files carrying the pre-change
-physical type while the table's current schema carries the changed one. This feature owns the read
-answer for both. It owns no format-specific rule: which pairs a writer may produce is
-`delta/delta-type-mapping`'s and `file-planning/iceberg-type-promotion`'s business, and this
-feature reads whatever the logical schema declares.
+* Type relaxation is one format-neutral read behavior with two writers. Delta calls it type widening and Iceberg calls it type promotion. Both leave older data files with the pre-change physical type while the current schema carries the changed one. Which pairs a writer can produce is the business of `delta/delta-type-mapping` and `file-planning/iceberg-type-promotion`. This feature reads whatever the logical schema declares.
+* Delta protocol, § Reader Requirements for Type Widening: "Readers must allow reading data files written before the table underwent any supported type change, and must convert such values to the current, wider type." § Consistency Between Table Metadata and Data Files: "Any data file column that exists in the table schema MUST have the same type (except as allowed by the [Type Widening] table feature, if enabled)."
+* The Iceberg spec has no equivalently direct sentence. Its obligation is derived: § Column Projection says "Columns in Iceberg data files are selected by field id … projection must be done using field ids", and promotion never rewrites a data file, so the cast is the reader's only way to answer. The spec's nearest analogue is its manifest rule, "reading `int` as `long` for promoted fields".
+* The cast mechanism already exists. `register_file_list` registers the DataFusion table schema from the scan spec's `LogicalField` list, never from a Parquet footer, for every Iceberg and Delta scan. The Parquet opener then sees a logical file schema with the current type and a physical file schema with the old one. `FieldIdExprAdapterFactory` hands both to DataFusion's `DefaultPhysicalExprAdapterFactory`, whose `rewrite_column` wraps the column in a `CastExpr` on any field inequality. `bind_columns` renames a physical field to the logical name that claims it and never compares data types.
+* The cast is inserted per file, because the Parquet opener creates the adapter from each file's own footer schema. A shard whose files straddle the change binds the old files through a cast and the new files through the identity path.
+* DataFusion validates castability with `arrow::compute::can_cast_types`, not with either format's promotion rule, and a rejected pair becomes a clean `DataFusionError::Execution` naming the column and both types. `can_cast_types` also accepts narrowing casts that no format permits, so the supported set is decided at plan time by the two format features.
+* The two cast sites carry opposite overflow policies. DataFusion's read-side `CastExpr` uses `safe: false` and errors on overflow. The emit boundary's `coerce_batch_to_exa_types` calls `arrow::compute::cast` with the default `safe: true`, which turns an overflowing value into NULL. Every pair in the supported set is a widening, so no value overflows at either site.
+* The emit boundary needs no pair knowledge. `coerce_batch_to_exa_types` casts every column whose Arrow type differs from the type `exasol_type_to_arrow` derives from the declared EMITS type. A relaxed column arrives with the current logical type.
+* A relaxation can change a column's declared Exasol type: `int` declares `DECIMAL(10,0)` and `long` declares `DECIMAL(20,0)`. `createVirtualSchema` reads the catalog's current schema, so a virtual schema created before the relaxation declares the old type until `REFRESH` (`vs-adapter/refresh-and-set-properties`).
+* The supported set is the union of the two formats' rules. Every row is a widening for which `arrow::compute::can_cast_types` reports `true` and no value is lost. This engine tags `byte`, `short`, and `integer` all as `int32` (`delta/delta-type-mapping`), so those widenings show only as an `Int8` or `Int16` physical column under an `Int32` logical one.
 
-**Both formats state the reader obligation normatively.** The Delta Lake protocol specification
-(`delta-io/delta`, `PROTOCOL.md`, `master`, § Reader Requirements for Type Widening) states:
-*"Readers must allow reading data files written before the table underwent any supported type
-change, and must convert such values to the current, wider type."* Its § Consistency Between Table
-Metadata and Data Files supplies the licence the old file relies on: *"Any data file column that
-exists in the table schema MUST have the same type (except as allowed by the [Type Widening] table
-feature, if enabled)."* The Apache Iceberg table specification
-(<https://iceberg.apache.org/spec/#schema-evolution>) carries no equivalently direct sentence — its
-obligation is derived, and this feature records that honestly rather than quoting a MUST that does
-not exist: *"Columns in Iceberg data files are selected by field id … projection must be done using
-field ids"* (§ Column Projection), combined with promotion never rewriting a data file, leaves the
-cast as the reader's only way to answer. The spec's nearest direct analogue is its manifest rule,
-*"reading `int` as `long` for promoted fields"*.
+  | # | Source → target | Delta | Iceberg | Physical → logical Arrow |
+  |---|---|---|---|---|
+  | 1 | `int` → `long` | yes | v1+ | `Int32` → `Int64` |
+  | 2 | `float` → `double` | yes | v1+ | `Float32` → `Float64` |
+  | 3 | `decimal(P,S)` → `decimal(P',S)`, `P' > P` | yes | v1+ | `Decimal128(P,S)` → `Decimal128(P',S)` |
+  | 4 | `byte` → `short` | yes | no | `Int8` → `Int32` |
+  | 5 | `byte` → `int` | yes | no | `Int8` → `Int32` |
+  | 6 | `byte` → `long` | yes | no | `Int8` → `Int64` |
+  | 7 | `short` → `int` | yes | no | `Int16` → `Int32` |
+  | 8 | `short` → `long` | yes | no | `Int16` → `Int64` |
+  | 9 | `byte` / `short` / `int` → `double` | yes | no | `Int8` / `Int16` / `Int32` → `Float64` |
+  | 10 | `byte` / `short` / `int` → `decimal(10+k1,k2)` | yes | no | `Int8` / `Int16` / `Int32` → `Decimal128` |
+  | 11 | `long` → `decimal(20+k1,k2)` | yes | no | `Int64` → `Decimal128` |
+  | 12 | `decimal(p,s)` → `decimal(p+k1,s+k2)`, `k1 ≥ k2 > 0` | yes | no | `Decimal128(p,s)` → `Decimal128(p+k1,s+k2)` |
+  | 13 | `date` → `timestamp without time zone` | yes | no | `Date32` → `Timestamp(us, None)` |
 
-**The cast mechanism ALREADY EXISTS and this feature is not building it.** `register_file_list`
-(`crates/lakehouse-engine/src/scan/raw_scan.rs`) registers the DataFusion table schema from the scan
-spec's `LogicalField` list — never from a Parquet footer — whenever that list is non-empty, which it
-is for every Iceberg and every Delta scan. The Parquet opener then sees a logical file schema
-carrying the CURRENT type and a physical file schema carrying the OLD one, and
-`FieldIdExprAdapterFactory` (`crates/lakehouse-engine/src/scan/field_id_projection.rs`) hands both to
-DataFusion's `DefaultPhysicalExprAdapterFactory`, whose `rewrite_column` wraps the resolved column in
-a `CastExpr` on any field inequality. `bind_columns` renames a physical field to the logical name
-that claims it and NEVER compares data types, which is precisely why a narrow physical field arrives
-at the delegate under the logical name still carrying its narrow type. This feature's work is to
-verify that path over every pair in the supported set and to record the answer, not to add a cast
-layer.
-
-**The recorded claim that `.without_row_transforms()` opens a type-widening hole is WRONG and this
-feature supersedes it.** `delta/delta-reader-feature-gating` records that
-*"`DeltaSnapshot::active_files` builds its kernel scan with `.without_row_transforms()`, so no
-per-file cast transform is applied"*. `delta_kernel` 0.26's own doc on that builder method scopes it
-to *"partition column injection, column-mapping renames, and generated row ids"*, and `delta_kernel`
-0.26 implements NO type-widening cast anywhere — its `TableFeature::TypeWidening` handling is a
-capability declaration and a schema-comparison validator, never a cast. There was therefore no cast
-transform for `.without_row_transforms()` to discard. The correct statement is that ANY engine on
-`delta_kernel` 0.26 must apply the widening cast itself, and this engine already does, through the
-format-neutral adapter chain above.
-
-**The cast is inserted per FILE, not per table**, because the Parquet opener creates the adapter from
-each file's own footer schema. A scan whose assigned files straddle the change therefore binds the
-old files through a cast and the new files through the zero-cost identity path, within one shard.
-
-**DataFusion validates castability with `arrow::compute::can_cast_types`, not with either format's
-promotion rule.** `validate_data_type_compatibility` (`datafusion-common`) is the whole check for a
-scalar pair, and a pair it rejects becomes a clean `DataFusionError::Execution` naming the column and
-both types — never a silent passthrough. That permissiveness is why this engine's supported set is
-decided at PLAN time by the two format features, not left to the cast to police: `can_cast_types`
-would equally accept a NARROWING cast that no format permits.
-
-**The two cast sites carry OPPOSITE overflow policies, and only the widening direction makes that
-safe.** DataFusion's read-side `CastExpr` uses `safe: false` and errors on overflow; the emit
-boundary's `coerce_batch_to_exa_types` calls `arrow::compute::cast`, whose default `CastOptions` is
-`safe: true` and turns an overflowing value into a NULL with an `Ok` result. Every pair in the
-supported set is a WIDENING, so no value can overflow either site, and the asymmetry is unreachable
-from this feature. It is recorded because it is what makes the supported set's widening-only
-membership load-bearing rather than incidental.
-
-**The emit boundary needs no pair knowledge and gains none.** `coerce_batch_to_exa_types`
-(`crates/lakehouse-engine/src/scan/emit.rs`) already casts every column whose Arrow type differs from
-the target `exasol_type_to_arrow` derives from the declared EMITS type, through one unguarded
-`arrow::compute::cast` call with no per-pair match. A relaxed column reaches it already carrying the
-CURRENT logical type, so the emit cast sees exactly what it would have seen had the table never
-evolved.
-
-**A relaxation can change a column's DECLARED Exasol type, which a stale virtual schema will not
-show.** `int` declares `DECIMAL(10,0)` and `long` declares `DECIMAL(20,0)`, so an `int → long`
-relaxation moves the declaration. `createVirtualSchema` reads the catalog's CURRENT schema, so a
-virtual schema created BEFORE the relaxation still declares the old type until it is refreshed
-(`vs-adapter/refresh-and-set-properties`). This is the ordinary stale-metadata consequence of schema
-evolution, not a defect of the cast, and it is recorded here because a type change is the case where
-a stale declaration is most likely to be read as a bug in this feature.
-
-**The supported set is the union of the two formats' rules, decided pair by pair.** Every row below
-is a WIDENING for which `arrow::compute::can_cast_types` reports `true` and no value can be lost. The
-"Physical → logical Arrow" column names what the scan actually casts, which is what makes several
-Delta rows collapse: this engine tags `byte`, `short`, and `integer` all as `int32`
-(`delta/delta-type-mapping`), so those three widenings are invisible in the logical schema and
-show up only as an `Int8`/`Int16` physical column under an `Int32` logical one.
-
-| # | Source → target | Delta | Iceberg | Physical → logical Arrow |
-|---|---|---|---|---|
-| 1 | `int` → `long` | yes | v1+ | `Int32` → `Int64` |
-| 2 | `float` → `double` | yes | v1+ | `Float32` → `Float64` |
-| 3 | `decimal(P,S)` → `decimal(P',S)`, `P' > P` | yes | v1+ | `Decimal128(P,S)` → `Decimal128(P',S)` |
-| 4 | `byte` → `short` | yes | — | `Int8` → `Int32` |
-| 5 | `byte` → `int` | yes | — | `Int8` → `Int32` |
-| 6 | `byte` → `long` | yes | — | `Int8` → `Int64` |
-| 7 | `short` → `int` | yes | — | `Int16` → `Int32` |
-| 8 | `short` → `long` | yes | — | `Int16` → `Int64` |
-| 9 | `byte` / `short` / `int` → `double` | yes | — | `Int8` / `Int16` / `Int32` → `Float64` |
-| 10 | `byte` / `short` / `int` → `decimal(10+k1,k2)` | yes | — | `Int8` / `Int16` / `Int32` → `Decimal128` |
-| 11 | `long` → `decimal(20+k1,k2)` | yes | — | `Int64` → `Decimal128` |
-| 12 | `decimal(p,s)` → `decimal(p+k1,s+k2)`, `k1 ≥ k2 > 0` | yes | — | `Decimal128(p,s)` → `Decimal128(p+k1,s+k2)` |
-| 13 | `date` → `timestamp without time zone` | yes | — | `Date32` → `Timestamp(us, None)` |
-
-**Three Iceberg promotions are NOT in the supported set, and each is refused rather than attempted.**
-Iceberg's `date` → `timestamp` and `date` → `timestamp_ns` (both v3+) are refused at plan time by
-`file-planning/iceberg-type-promotion`, which also owns the reason; Iceberg's `unknown` → any type is
-unreachable because `iceberg` 0.10.0 has no `PrimitiveType::Unknown`. Delta's `date` →
-`timestampNtz` (row 13) IS supported, and that asymmetry between two spellings of the same logical
-pair is deliberate: the difference lives entirely in how each format stores per-file bounds, not in
-the cast, and `file-planning/iceberg-type-promotion` records it.
-
-**`long` → `double` is in NEITHER format's rules and is therefore NOT in the supported set.** The
-Delta protocol lists *"`Byte`, `Short` or `Int` -> `Double`"* and deliberately omits `Long`, which is
-lossy above 2^53; Iceberg's promotion table has no such row at all. It is named here because a reader
-scanning the widening list for "integer to floating point" would otherwise assume it.
-
-**Apache Iceberg spec check.** The three Iceberg promotions this feature DOES support — rows 1, 2,
-and 3 — are exactly the `int` → `long`, `float` → `double`, and `decimal(P,S)` → `decimal(P',S)` rows
-of the spec's § Schema Evolution promotion table, whose decimal Requirements cell reads *"Widen
-precision only"* with the scale symbol `S` unchanged on both sides. Row 12's scale growth is
-therefore Delta-only and MUST NOT be read as an Iceberg promotion. The spec's § Column Projection
-ordered resolution for an absent field id is untouched by this feature, and
-`scan-read-path/scan-execution-field-id-projection`'s recorded deviation on its rule (1) stays
-exactly as recorded — relaxation changes what a PRESENT column is cast to, never how an ABSENT one is
-resolved.
+* Iceberg's `date` → `timestamp` and `date` → `timestamp_ns` (both v3+) are refused at plan time by `file-planning/iceberg-type-promotion`. Iceberg's `unknown` → any type is unreachable because `iceberg` 0.10.0 has no `PrimitiveType::Unknown`. Delta's `date` → `timestampNtz` (row 13) is supported.
+* `long` → `double` is in neither format's rules and is not supported. The Delta protocol lists "`Byte`, `Short` or `Int` -> `Double`" and omits `Long`, which is lossy above 2^53. Iceberg's promotion table has no such row.
+* The Iceberg promotions in the supported set (rows 1, 2, and 3) are the `int` → `long`, `float` → `double`, and `decimal(P,S)` → `decimal(P',S)` rows of § Schema Evolution, whose decimal Requirements cell reads "Widen precision only". Row 12's scale growth is Delta-only. Relaxation changes what a present column is cast to, never how an absent one is resolved (`scan-read-path/scan-execution-field-id-projection`).
 
 ## Scenarios
 

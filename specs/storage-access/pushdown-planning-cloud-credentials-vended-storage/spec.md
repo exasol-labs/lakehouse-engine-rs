@@ -1,100 +1,20 @@
 # Feature: Vended Storage Resolution
 
-Resolves the effective scan storage from a `loadTable` response when the CONNECTION sets `use_vended_credentials` to true. This feature covers the one function that owns that sequence, the `X-Iceberg-Access-Delegation` header, how the store address is resolved from the CONNECTION and the vended response, how the backend is selected from the table location's URI scheme, how a vended Azure SAS is selected by host, the error when the catalog vends no usable credential, and joins whose sides resolve to different backends.
+When the CONNECTION sets `use_vended_credentials` to true, the adapter resolves the effective scan storage from a `loadTable` response through one function. The feature covers the `X-Iceberg-Access-Delegation` header, store-address resolution, backend selection from the table location's URI scheme, host-based selection of a vended Azure SAS, the error when the catalog vends no usable credential, and joins whose sides resolve to different backends.
 
 ## Background
 
-* The adapter resolves the table once per query via a single self-issued `loadTable` GET,
-  authenticated per the catalog-auth mode. Its raw `LoadTableResult` feeds BOTH Iceberg file
-  planning AND vended-credential extraction — `iceberg-catalog-rest` 0.9.1's
-  `RestCatalog::load_table` drops the response `config`/`storage_credentials`, so it cannot
-  surface vended creds on its own.
-* **Iceberg REST compliance, quoted from `apache/iceberg` `open-api/rest-catalog-open-api.yaml`
-  (main), verified against the fetched file.** `StorageCredential.prefix`: "Indicates a
-  storage location prefix where the credential is relevant. Clients should choose the most
-  specific prefix (by selecting the longest prefix) if several credentials of the same type
-  are available." `LoadTableResult`, under `## Storage Credentials`: "Credentials for ADLS /
-  GCS / S3 / ... are provided through the `storage-credentials` field. Clients must first
-  check whether the respective credentials exist in the `storage-credentials` field before
-  checking the `config` for credentials." The `## AWS Configurations` section enumerates
-  `client.region`, `s3.access-key-id`, `s3.secret-access-key`, `s3.session-token`,
-  `s3.remote-signing-enabled`, and `s3.cross-region-access-enabled`, and the document
-  enumerates no ADLS key at all (checked by searching the fetched file for `adls.`). The
-  host-suffixed `adls.sas-token.<host>` spelling is the Iceberg Java `AzureProperties`
-  convention that Lakekeeper emits, live-verified against a real Lakekeeper response. Both
-  maps stay readable under the spec's `additionalProperties: string` allowance, so reading a
-  key the spec doesn't enumerate (`s3.endpoint`, `s3.path-style-access`, the ADLS SAS key) is
-  not a deviation, and neither spec constrains a client's own precedence between a stated
-  value and a vended one for `endpoint`, `region`, or `path_style`.
-* ONE credential-source selection serves both backends: the longest `storage_credentials`
-  entry whose non-empty `prefix` prefixes the table location, else the flat `config` map. A
-  matched entry is authoritative for the WHOLE credential set — a key it omits does NOT fall
-  back to the flat `config` map, because the REST rule above is read per credential set, not
-  per key. The prefix comparison lowercases the URI scheme on both sides and compares
-  everything after `://` byte-exactly.
-* **The storage backend variant is selected from the table location's URI scheme alone, and
-  the mapping is closed.** `s3://`/`s3a://` select the S3 backend; `abfss://`/`abfs://` select
-  the ADLS backend; every other scheme (or a scheme-less location) is an error naming the
-  scheme; there is no default backend.
-* **Iceberg table-spec grounding for reading the scheme off the table location**, quoted from
-  `apache/iceberg` `format/spec.md` (main). Table metadata field `location` is "The table's
-  base location...", marked `_required_` in v1, v2, and v3; v4 makes it `_optional_` but "Must
-  be an absolute path when present". The spec defines a "Relative path" as one that does not
-  start with a URI scheme, so an absolute location by definition starts with one — a
-  scheme-less or absent location is a malformed catalog response.
-* **The vended ADLS SAS is recovered by host, and the account name is derived from that same
-  host.** The vended key is host-suffixed on the wire (`adls.sas-token.<host>`) but flat in
-  the backend (`adls.sas-token`), because the downstream reader
-  (`iceberg-0.10.0/src/io/storage/config/azdls.rs`) accepts only the flat form. The host
-  comparison against the table location's host is case-insensitive (RFC 3986 §3.2.2); the
-  account name is taken VERBATIM (not case-folded) from that host's first dot-separated
-  label, because `iceberg-storage-opendal` compares it byte-exactly against the account in
-  each file URI as a wrong-account guard (`adls.account-name`).
-* **A catalog MUST NOT downgrade the transport on its own authority.** A resolved plaintext
-  address — a vended or CONNECTION-configured `http://` S3 endpoint, or an `abfs://` ADLS
-  location — is honoured only when the `ALLOW_HTTP` virtual-schema property is true (default
-  false); otherwise it is a clear plan-time error, regardless of which source supplied the
-  address. `ALLOW_HTTP` is resolved once outside the catalog crate and threaded in as a plain
-  boolean; it names no credential and cannot supply one. The non-vended `storage_block` path
-  carries no such gate.
-* **Effective scan storage under vending splits credentials from addressing.** CREDENTIALS
-  (the S3 key pair and session token, or the ADLS SAS) come from the selected `loadTable`
-  credential source ALONE — never backfilled from the CONNECTION — and an unmet credential
-  request is a plan-time error. ADDRESSING (`endpoint`, `region`) comes from the CONNECTION
-  when the CONNECTION states a non-empty value, else from the selected source, resolved
-  independently per field; when neither states one, that field is legal-empty and resolves to
-  the AWS default chain. `path_style` resolves in three ordered steps: the CONNECTION's stated
-  value, else the source's `s3.path-style-access`, else whether an `endpoint` was resolved at
-  all (the last-resort step stays because `register_side_store` gates `endpoint` on
-  `path_style`). The backend variant still comes from the table location's scheme alone,
-  regardless of any of this. Both catalog kinds share this precedence through one function,
-  `s3_backend`. A Glue CONNECTION that states `region` places the store with that value (it
-  also signs the catalog request, per `connection/connection-credentials`); a Glue CONNECTION
-  that omits `region` places the store from Glue's vended `client.region` alone, which stays
-  UNVERIFIED — the opt-in cloud E2E suite (`specs/testing.md`) reports that key without asserting it.
-* Remote signing (`s3.remote-signing-enabled`, `remote-signing-config`) is not implemented and
-  is read nowhere in this engine; a warehouse configured for it vends no access key, so it
-  fails loud at plan time rather than silently falling through to static credentials.
-* **Per-side credential and backend resolution for joins.** Each side of a broadcast-eligible
-  or fallback join resolves its own effective storage independently, and its own backend
-  travels with it into the scan spec; the adapter never compares sides' resolved backends at
-  plan time. A backend-variant difference (`s3://` vs `abfss://`) and an ADLS storage-account
-  difference are both served, because each yields a distinct DataFusion registry key. The one
-  shape the scan cannot serve — two sides needing different stores under one registry key
-  (two ADLS containers of one account) — is refused by the scan's own store-registration
-  precondition, not restated at plan time.
-* Credentials (signing keys, bearer tokens, OAuth2 client secrets, vended STS tokens, a vended
-  SAS) MUST NEVER appear in any returned SQL string or error message. `redact_credentials`
-  matches the `adls.sas-token` label by case-insensitive substring, so its host-suffixed wire
-  spelling is redacted too. Every new error path returns `Result`, never panics — a panic
-  inside a UDF is an abnormal VM exit that SIGKILLs every sibling VM of the statement part —
-  and every such error names the location's storage host, scheme, or expected config key,
-  never a credential value.
-* An ABSENT table location is rejected by `file-planning/pushdown-planning-file-resolution`
-  before the vended/static split, so this feature's vended and static resolution paths never
-  see one; that rule is path-independent (vending disabled, vending enabled, every join side)
-  and is owned there, not restated here.
-* See `storage-access/pushdown-planning-cloud-credentials` for SigV4 catalog signing, the Glue REST prefix, vended-credential extraction on each catalog-auth mode, and the static-credential path.
+* The adapter resolves each table once per query with one self-issued `loadTable` GET. The raw `LoadTableResult` feeds both Iceberg file planning and vended-credential extraction, because `RestCatalog::load_table` drops the response `config` and `storage_credentials`.
+* One credential-source selection serves both backends: the longest `storage_credentials` entry whose non-empty `prefix` prefixes the table location, else the flat `config` map. The Iceberg REST spec says clients choose the longest prefix. A matched entry is authoritative for the whole credential set, so a key it omits does not fall back to `config`. The prefix comparison lowercases the URI scheme on both sides and compares everything after `://` byte-exactly.
+* The backend comes from the table location's URI scheme alone: `s3://` and `s3a://` select S3, `abfss://` and `abfs://` select ADLS, and any other or missing scheme is an error naming the scheme. The Iceberg table spec makes `location` an absolute path, so a location without a scheme is a malformed catalog response.
+* Under vending, credentials (the S3 key pair and session token, or the ADLS SAS) come from the selected credential source alone and are never backfilled from the CONNECTION. Addressing (`endpoint`, `region`) comes from the CONNECTION when it states a non-empty value, else from the selected source, resolved per field. When neither states one, the field is empty and the AWS default chain applies.
+* `path_style` resolves in three ordered steps: the CONNECTION's stated value, else the source's `s3.path-style-access`, else whether an `endpoint` was resolved. The last step stays because `register_side_store` gates `endpoint` on `path_style`. Both catalog kinds share this precedence through `s3_backend`.
+* The vended ADLS SAS key is host-suffixed on the wire (`adls.sas-token.<host>`) and flat in the backend (`adls.sas-token`), because the downstream reader accepts only the flat form. The host comparison with the table location's host is case-insensitive (RFC 3986 §3.2.2). The account name is the first dot-separated label of that host, taken verbatim, because `iceberg-storage-opendal` compares it byte-exactly against the account in each file URI as a wrong-account guard.
+* A catalog cannot downgrade the transport on its own authority. A resolved plaintext address, either a vended or CONNECTION-configured `http://` S3 endpoint or an `abfs://` ADLS location, is honoured only when the `ALLOW_HTTP` virtual-schema property is true (default false). `ALLOW_HTTP` is resolved outside the catalog crate and passed in as a plain boolean.
+* Each side of a join resolves its own effective storage and backend, and the adapter never compares them at plan time. A backend difference or an ADLS storage-account difference yields distinct DataFusion registry keys. Two ADLS containers of one account collapse onto one key, and the scan's store-registration precondition refuses that case (`scan-aggregation/scan-execution-join`).
+* A credential never appears in returned SQL or in an error message, except that a vended value appears in the SQL as the sealed envelope's ciphertext (`storage-access/scan-spec-credential-reference`). `redact_credentials` matches the `adls.sas-token` label by case-insensitive substring and truncates to the next delimiter. Every error path returns `Result` and never panics, because a panic in a UDF is an abnormal VM exit that kills every sibling VM of the statement part. Every error names the location's storage host, scheme, or expected config key.
+* `file-planning/pushdown-planning-file-resolution` rejects an absent table location before the vended and static split, so this feature never sees one.
+* See `storage-access/pushdown-planning-cloud-credentials` for SigV4 catalog signing, the Glue REST prefix, and the static-credential path.
 
 ## Scenarios
 

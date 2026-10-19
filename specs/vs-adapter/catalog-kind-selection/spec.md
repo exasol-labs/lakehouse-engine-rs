@@ -1,16 +1,14 @@
 # Feature: Catalog Kind Selection
 
-Selects which catalog kind a virtual schema resolves against from the `CATALOG_KIND` virtual-schema property, and CONSTRUCTS the matching catalog client. The four kinds are the Iceberg REST catalog, a native Unity Catalog, direct storage with no catalog service, and the native AWS Glue Data Catalog. The kind decides only which client is built. Every createVirtualSchema listing operation then runs through the shared `CatalogClient` trait on one pipeline. The property is a createVirtualSchema adapter property read from the request's plain VS properties, not a field inside the CONNECTION password JSON. When the property is absent the adapter resolves Iceberg REST, so every pre-existing virtual schema keeps its current behavior with no configuration change.
+The adapter reads the `CATALOG_KIND` virtual-schema property to choose the catalog kind: Iceberg REST, native Unity Catalog, direct storage, or native AWS Glue. It then builds the matching catalog client, and every createVirtualSchema listing runs through the shared `CatalogClient` trait. An absent property selects Iceberg REST.
 
 ## Background
 
-The catalog kind is a `CatalogKind` enum with exactly four variants: `IcebergRest`, `UnityCatalogNative`, `DirectStorage`, and `Glue`. The variant IS the catalog kind. The `CATALOG_KIND` property value is compared case-insensitively. `CatalogKind` is an adapter-layer type in `crates/lakehouse-engine`, read from an Exasol virtual-schema property. The `lakehouse-catalog` crate must not name that delivery mechanism. Credential validation takes the kind as an explicit parameter rather than re-deriving it.
-
-* The accepted non-absent values are exactly `UNITY_CATALOG`, `DIRECT_STORAGE`, and `GLUE`. The literal `ICEBERG_REST` stays an UNRECOGNIZED value, because Iceberg REST is selected by leaving `CATALOG_KIND` absent.
-* The production files permitted to name a `CatalogKind` variant are FOUR: the enum and its resolver (`adapter/catalog_kind.rs`), the catalog-client construction site (`adapter/mod.rs`), credential validation (`adapter/connection.rs`), and the pushdown scan-source construction site (`adapter/pushdown/scan_resolution.rs`).
-* Exhaustive matching and review hold that set. Every match on the kind is exhaustive, so a new variant is a build failure at each site. No source-level probe exists, because this project does not accept a probe that reads production source text. A fifth site added later is visible in review as a new `CatalogKind` import.
-* The direct-storage client implements `CatalogClient` but is declared in `lakehouse-engine`, not in `lakehouse-catalog`. `direct-storage/direct-storage-table-discovery` owns that placement. The Glue client is declared in `lakehouse-catalog` (`glue/glue-catalog-client`).
-* `RequestSession` is not a second `CatalogKind` match. The pushdown resolver carries an already-resolved session in a private enum with one variant per kind, matched exhaustively when a table resolves. That enum names no `CatalogKind` variant.
+* `CATALOG_KIND` is a plain VS property of the createVirtualSchema request, not a field in the CONNECTION password JSON. Its value is compared case-insensitively.
+* `CatalogKind` is an adapter-layer enum in `crates/lakehouse-engine` with four variants: `IcebergRest`, `UnityCatalogNative`, `DirectStorage`, and `Glue`. The `lakehouse-catalog` crate does not name it. Credential validation takes the kind as an explicit parameter.
+* The accepted values are `UNITY_CATALOG`, `DIRECT_STORAGE`, and `GLUE`. `ICEBERG_REST` is not accepted, because Iceberg REST is selected by leaving the property absent.
+* Four production files may name a `CatalogKind` variant: the enum and its resolver (`adapter/catalog_kind.rs`), the catalog-client construction site (`adapter/mod.rs`), credential validation (`adapter/connection.rs`), and the pushdown scan-source construction site (`adapter/pushdown/scan_resolution.rs`). Every match on the kind is exhaustive, so a new variant is a build failure at each site.
+* The pushdown resolver carries an already-resolved session in a private enum with one variant per kind. That enum names no `CatalogKind` variant.
 
 ## Scenarios
 

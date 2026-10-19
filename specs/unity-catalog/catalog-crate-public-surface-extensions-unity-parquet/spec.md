@@ -1,28 +1,11 @@
-# Feature: Catalog Crate Public Surface Extensions — Unity Parquet Table Planning
+# Feature: Catalog Crate Public Surface Extensions, Unity Parquet Table Planning
 
-Records the reviewed extension of `lakehouse-catalog`'s enumerated public surface that lets the
-engine plan a Unity Catalog table whose `data_source_format` is `PARQUET`: the neutral table's
-ordered partition-column names and the neutral Unity column's Spark `type_json` string.
-
-This is the sibling of `catalog/catalog-crate-public-surface-extensions`, split out once that
-feature's own scenario count crossed this library's per-spec organization threshold. The parent
-feature keeps every prior reviewed addition; this feature owns the entry this plan
-(`add-unity-parquet-table-routing`, issue #409) adds and any later addition made for the same
-Unity Parquet planning seam.
+Extends `lakehouse-catalog`'s enumerated public surface so the engine can plan a Unity Catalog table whose `data_source_format` is `PARQUET`: the neutral table's ordered partition-column names and the neutral Unity column's Spark `type_json` string.
 
 ## Background
 
-* `catalog/catalog-crate-structure` owns the crate's existence, its behavior-preservation
-  guarantee, and its concept-level API shape. `catalog/catalog-crate-public-surface-extensions`
-  and this feature together own the running history of what gets ADDED to that `pub` set and why,
-  each entry an explicit reviewed edit to the crate's reachability probe at
-  `crates/lakehouse-catalog/tests/catalog_public_surface.rs`.
-* The one-way dependency holds unchanged: no `lakehouse-catalog` source names `lakehouse-engine`,
-  `iceberg`, `datafusion`, `arrow`, `parquet`, `object_store`, or `delta_kernel`. The raw Unity
-  Catalog `partition_index` wire field stays crate-private; only the derived, ordered
-  partition-column name list crosses the boundary. The `type_json` string crosses the boundary
-  verbatim and is parsed only in `lakehouse-engine`, because this crate MUST NOT declare
-  `delta_kernel`.
+* Each addition to the crate's `pub` set is an explicit reviewed edit to the reachability probe at `crates/lakehouse-catalog/tests/catalog_public_surface.rs`. `catalog/catalog-crate-structure` and `catalog/catalog-crate-public-surface-extensions` own the crate's shape and earlier additions.
+* No `lakehouse-catalog` source names `lakehouse-engine`, `iceberg`, `datafusion`, `arrow`, `parquet`, `object_store`, or `delta_kernel`. The raw Unity Catalog `partition_index` wire field stays crate-private, and only the derived, ordered partition-column name list crosses the boundary. The `type_json` string crosses verbatim and is parsed only in `lakehouse-engine`.
 
 ## Scenarios
 

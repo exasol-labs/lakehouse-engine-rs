@@ -1,33 +1,15 @@
 # Feature: Direct-Storage Table Discovery
 
-Turns a storage prefix holding directories of Parquet files into the same enumerated, named, and
-mapped virtual tables a catalog produces. A lakehouse with no catalog service is therefore
-queryable through the unchanged `createVirtualSchema` listing pipeline.
+The adapter turns a storage prefix holding directories of Parquet files into enumerated, named, and mapped virtual tables through the unchanged `createVirtualSchema` listing pipeline. A lakehouse with no catalog service is therefore queryable.
 
 ## Background
 
-* **The direct-storage client implements `CatalogClient` but is DECLARED IN `lakehouse-engine`, not
-  in `lakehouse-catalog`.** It needs the engine-side object-store builder.
-  `catalog/catalog-crate-structure` forbids the catalog crate from declaring `object_store` as a
-  direct dependency. Declaring the client there would point the dependency edge backwards. Rust's
-  orphan rule permits the impl, because the type is local even though the trait is not. No recorded
-  rule requires an implementor to live in the catalog crate. The recorded requirement is that the
-  engine reach every enumeration and table-load operation THROUGH the trait. This placement keeps
-  that requirement.
-* The single `Box<dyn CatalogClient>` construction site is already engine-side, so the placement
-  adds no new seam.
-* The client's base path is resolved at CONSTRUCTION from the CONNECTION address and the `NAMESPACE`
-  property (`direct-storage/direct-storage-properties`). That resolution happens inside the one
-  construction site already permitted to name a catalog kind.
-* `direct-storage/parquet-directory-seam-file-listing` owns which objects under a table root count as data files and
-  in what order they are returned. This feature owns which directories are tables and how each one
-  is named. It reads the file rules from that seam rather than restating them.
-* `lakehouse-catalog`'s neutral skip reason gains one variant for a directory holding no data file,
-  per `catalog/catalog-crate-public-surface-extensions`.
-* The neutral table identifier this client returns carries an EMPTY namespace, because a
-  direct-storage table's identity inside its virtual schema is its directory name alone. That makes
-  the shared flatten and `TABLE_MAP` construction produce the bare directory name with no branch on
-  catalog kind.
+* The direct-storage client implements `CatalogClient` and is declared in `lakehouse-engine`, not in `lakehouse-catalog`. It needs the engine-side object-store builder, and `catalog/catalog-crate-structure` forbids the catalog crate from declaring `object_store`. The engine still reaches every enumeration and table-load operation through the trait.
+* The client's base path is resolved at construction from the CONNECTION address and the `NAMESPACE` property (`direct-storage/direct-storage-properties`), inside the one construction site that may name a catalog kind.
+* `direct-storage/parquet-directory-seam-file-listing` owns which objects under a table root count as data files and their order. This feature owns which directories are tables and how each is named.
+* `lakehouse-catalog`'s neutral skip reason has a variant for a directory holding no data file (`catalog/catalog-crate-public-surface-extensions`).
+* The neutral table identifier the client returns has an empty namespace, because a direct-storage table's identity is its directory name. The shared flatten and `TABLE_MAP` construction then produce the bare directory name without branching on catalog kind.
+
 
 ## Scenarios
 

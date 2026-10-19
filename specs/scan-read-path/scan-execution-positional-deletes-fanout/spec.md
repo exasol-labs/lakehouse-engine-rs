@@ -1,41 +1,13 @@
-# Feature: DataFusion Scan Execution — Positional Delete I/O Fan-Out and Pruning
+# Feature: DataFusion Scan Execution, Positional Delete I/O Fan-Out and Pruning
 
-Governs the object-store I/O SHAPE of applying positional deletes: the shared connection-budget
-limiter that bounds concurrent delete-file reads and delete-carrying data-file footer fetches, the
-read-once-per-shard guarantee for a delete file referenced by multiple data files, and the
-row-group-level pruning that skips decoding a partition-granularity delete file's irrelevant row
-groups. Split out of `scan-read-path/scan-execution-positional-deletes` once that feature's
-scenario count crossed this library's per-spec organization threshold; the delete-APPLICATION
-guarantees (what gets removed, how mechanisms compose, the read-time backstop) stay in that sibling
-feature.
+Governs the object-store I/O shape of applying positional deletes: a shared connection-budget limiter that bounds concurrent reads, one read per delete file per shard, and row-group pruning of partition-granularity delete files. `scan-read-path/scan-execution-positional-deletes` governs which rows the deletes remove.
 
 ## Background
 
-* **Split from `scan-read-path/scan-execution-positional-deletes`, issue #320.** That feature keeps
-  every scenario about WHICH rows a delete mechanism removes and how the shared pipeline composes
-  with projection/filter/LIMIT/pruning and the read-time backstop. This feature owns every scenario
-  about the I/O SHAPE — concurrency bounds, read-once-per-shard, and row-group pruning — that the
-  same pipeline exercises to build its per-data-file access plans.
-* Phase A (`collect_delete_positions`) reads each unique delete file once into a data-file-path →
-  deleted-position map. Phase B looks up that map per data file with no delete-file I/O of its own,
-  but does fetch each delete-carrying data file's own Parquet footer for its per-row-group row
-  counts. Phase B is no longer serial and no longer I/O-free: those footer fetches run as a
-  bounded-concurrent fan-out under the shared limiter instead of a serial `for` loop. Issue
-  [#165](https://github.com/exasol-labs/lakehouse-engine-rs/issues/165).
-* Two properties make the concurrent fan-out safe to reason about. Each fan-out task targets a
-  DISTINCT data-file path, so no two concurrent tasks contend for the same session
-  `FileMetadataCache` key. And the fan-out preserves the per-shard spec's file ORDER in the
-  `PartitionedFile` list it returns, so the shard's single `FileGroup` is byte-identical to the
-  serial build and the concurrency cannot perturb emission order.
-* Delete positions and access plans are unchanged by the restructure: the delete set for a data file
-  is fixed by Phase A, and Phase B's footer fetch reads only the per-row-group row counts, which are
-  a property of the file rather than of the fetch order.
-* The Delta deletion-vector mechanism shares this same connection-budget limiter and read-once
-  discipline for its own sidecar fetches — see `scan-read-path/scan-execution-delta-deletion-vectors`
-  — but decodes a different container format, so its fan-out scenarios live there rather than here.
-* See `scan-runtime/scan-execution-connection-concurrency` for the operator-facing budget knob
-  itself (`s3_max_connections`); this feature governs how the positional-delete pipeline spends that
-  budget, not how the budget is derived or configured.
+* Phase A (`collect_delete_positions`) reads each unique delete file once into a data-file-path to deleted-position map. Phase B looks up that map per data file and fetches each delete-carrying data file's Parquet footer for its per-row-group row counts. The footer fetches run as a bounded-concurrent fan-out under the shared limiter.
+* Each fan-out task targets a distinct data-file path, so no two tasks contend for the same `FileMetadataCache` key. The fan-out returns the `PartitionedFile` list in the per-shard spec's file order.
+* The Delta deletion-vector mechanism shares the limiter and the read-once discipline: see `scan-read-path/scan-execution-delta-deletion-vectors`.
+* `scan-runtime/scan-execution-connection-concurrency` owns the budget knob `s3_max_connections`. This feature governs how the pipeline spends the budget.
 
 ## Scenarios
 

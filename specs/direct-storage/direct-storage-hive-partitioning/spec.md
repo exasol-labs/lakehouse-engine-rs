@@ -1,25 +1,13 @@
 # Feature: Direct-Storage Hive Partitioning
 
-Declares the `key=value` directory segments of a direct-storage table as partition columns, and
-prunes the table's files on those values at plan time. A partitioned directory therefore exposes
-its keys as columns, and a query that filters on them reads only the matching files.
+The adapter declares the `key=value` directory segments of a direct-storage table as partition columns and prunes the table's files on those values at plan time. A query that filters on a partition key reads only the matching files.
 
 ## Background
 
-* A partition value is directory text, constant for every row of its file. Pruning evaluates it
-  directly.
-* A partition key NAME matches its column under the uppercase fold, while its VALUE stays verbatim.
-  Writers keep the case a column was declared with in the directory name, while metastores and
-  query engines resolve names case-insensitively: the Hive metastore stores partition column names
-  lowercased (SPARK-19359), Spark resolves partition columns case-insensitively under its default
-  `spark.sql.caseSensitive=false`, and Exasol folds unquoted identifiers to upper case. Two
-  spellings of one key cannot be told apart by name, so they are an error rather than a silent pick.
-* Enumeration decides a table's partition columns once and records each one's position in its
-  column note (`vs-adapter/column-source-notes`). A pushdown fills and prunes against those recorded
-  columns.
-* Apache Iceberg and Delta specification check: NOT implicated. Hive-style directory partitioning
-  belongs to neither specification, and this kind implements neither format
-  (`direct-storage/direct-storage-table-planning`).
+* A partition value is directory text, constant for every row of its file, so pruning evaluates it directly.
+* A partition key name matches its column under the uppercase fold, and its value stays verbatim. Writers keep the declared case in the directory name, the Hive metastore lowercases partition column names, Spark resolves them case-insensitively, and Exasol folds unquoted identifiers to upper case. Two spellings of one key cannot be told apart, so they are an error.
+* Enumeration decides a table's partition columns once and records each one's position in its column note (`vs-adapter/column-source-notes`). A pushdown fills and prunes against those recorded columns.
+
 
 ## Scenarios
 

@@ -1,16 +1,10 @@
 # Feature: Iceberg Type Promotion
 
-Decides, at plan time, which Apache Iceberg type promotions this engine reads — `int` → `long`,
-`float` → `double`, and decimal precision widening are read through the format-neutral relaxation
-cast; a `date` → `timestamp` or `date` → `timestamp_ns` promotion is refused by name — so a promoted
-Iceberg table either returns correct rows or says why it cannot, and never fails with an opaque
-byte-slice error from inside a manifest decode.
+Decides at plan time which Iceberg type promotions this engine reads. The engine reads `int` to `long`, `float` to `double`, and decimal precision widening through the format-neutral relaxation cast, and refuses a `date` to `timestamp` or `timestamp_ns` promotion by name. A promoted table either returns correct rows or says why it cannot.
 
 ## Background
 
-The Apache Iceberg table specification (<https://iceberg.apache.org/spec/>, `apache/iceberg` `main`,
-`format/spec.md` at commit `d8170b0dfae4ecc0716de8b823c5d0987fc21fa8`) defines the whole promotion
-surface in ONE five-row table (§ Schema Evolution). Quoted verbatim:
+* Iceberg table spec, § Schema Evolution, defines the promotion surface:
 
 > Valid primitive type promotions are:
 >
@@ -22,79 +16,16 @@ surface in ONE five-row table (§ Schema Evolution). Quoted verbatim:
 > | `float`          | `double`                     | `double`                     | |
 > | `decimal(P, S)`  | `decimal(P', S)` if `P' > P` | `decimal(P', S)` if `P' > P` | Widen precision only |
 
-* **The decimal rule is precision-only.** The Requirements cell reads *"Widen precision only"* and
-  the scale symbol `S` is literally unchanged on both sides, with the constraint strictly `P' > P`.
-  Iceberg permits NO scale change. Delta separately permits scale growth
-  (`delta/delta-type-mapping`), and `scan-types/type-relaxation` records that row as
-  Delta-only for exactly this reason.
-* **The bounds-width inference rule, § Schema Evolution, is the one that decides this feature's
-  shape.** Quoted verbatim: *"Iceberg's Avro manifest format does not store the type of lower and
-  upper bounds, and type promotion does not rewrite existing bounds. For example, when a `float` is
-  promoted to `double`, existing data file bounds are encoded as 4 little-endian bytes rather than 8
-  little-endian bytes for `double`. To correctly decode the value, the original type at the time the
-  file was written must be inferred according to the following table:"* — whose rows include
-  `long`/4 bytes → `int`, `double`/4 bytes → `float`, `timestamp`/4 bytes → `date`, and
-  `timestamp_ns`/4 bytes → `date`.
-* **`iceberg` 0.10.0 implements that table for TWO of its four non-decimal rows.**
-  `Datum::try_from_bytes` branches on a 4-byte buffer for `PrimitiveType::Long` and
-  `PrimitiveType::Double` only; `Timestamp`, `TimestampNs`, `Timestamptz`, and `TimestamptzNs` each
-  read 8 bytes unconditionally. A 4-byte bound under a `timestamp` column therefore fails
-  `bytes.try_into()` and surfaces as `DataInvalid: failed to convert byte slice to array`. The
-  decimal row needs no branch: the decode is a length-agnostic big-endian two's-complement read and
-  the spec keeps the scale unchanged.
-* **That failure is NOT scoped to pruning, which is why it cannot be worked around.** The bounds
-  decode runs inside manifest Avro deserialization, so it fires for every manifest entry whether or
-  not a filter predicate was supplied — and in this engine it fires FIRST from
-  `ensure_supported_delete_mechanisms`, which loads every manifest to read only content type and file
-  format. An unfiltered `SELECT *` against a `date`-promoted table therefore fails just as a filtered
-  one does, with a message naming neither bounds nor promotion. `iceberg` 0.10.0 also carries a
-  second bounds decode that `unwrap()`s rather than propagating (manifest-list partition field
-  summaries), so the same shape has a reachable panic path — and a panic inside the adapter aborts
-  the UDF's VM, which makes the engine SIGKILL every sibling VM of the statement part.
-* **The refusal is therefore a plan-time gate on the SCHEMA HISTORY, not on a decode error.** A gate
-  that caught and re-worded the decode error would sit downstream of the panic path and would depend
-  on an error string. `TableMetadata::schemas_iter` already carries every schema the table has held,
-  so the promotion is visible before any manifest is read and before any object-store byte is spent.
-* **The gate is deliberately CONSERVATIVE and this is stated rather than hidden.** It refuses on the
-  recorded promotion alone, without checking whether any pre-promotion data file survives. A table
-  whose files were all rewritten after the promotion carries only 8-byte bounds and would read fine,
-  and is refused anyway. Establishing that no old file remains requires reading the manifests, which
-  is the operation that fails — so the cheap conservative answer is the only one available, and it
-  errs toward a named refusal rather than toward an opaque failure.
-* **Iceberg `date` → `timestamp` is refused while Delta `date` → `timestampNtz` is supported, and the
-  asymmetry is real rather than an oversight.** The two are the same logical pair and the same Arrow
-  cast. They differ because Delta records per-file statistics as typed JSON in the `add` action,
-  which carries its own lexical form and has no width-versus-type ambiguity, while Iceberg records
-  them as untyped Avro byte buffers whose width must be inferred. The gap lives entirely in the
-  metadata format, not in the read path, and `scan-types/type-relaxation` owns the shared cast
-  both formats reach.
-* **`unknown` → any type is UNREACHABLE rather than refused.** `iceberg` 0.10.0's `PrimitiveType` has
-  16 variants and none of them is `Unknown`; the type name has no `serde` arm, so a v3 schema
-  declaring `"unknown"` fails deserialization and takes the whole table-metadata parse with it,
-  before any code in this engine runs. No gate can improve on that, and writing one would be dead
-  code. What this feature DOES record is the tripwire: `iceberg_primitive_to_exasol` and
-  `iceberg_primitive_to_arrow` (`crates/lakehouse-engine/src/types/mapping.rs`) are both EXHAUSTIVE
-  over `PrimitiveType` with no catch-all arm, so an `iceberg` upgrade that adds `Unknown` breaks the
-  BUILD rather than silently mapping it to the `utf8` fallback.
-* **The `unknown` read rule is quoted so the future implementation is not re-derived.** The spec's
-  § Primitive Types requires `unknown` to be *"Must be optional with `null` defaults; not stored in
-  data files"*, its § Parquet states *"When reading an `unknown` column, any corresponding column
-  must be ignored and replaced with `null` values"*, and its § Default values adds *"All columns of
-  `unknown`, `variant`, `geometry`, and `geography` types must default to null."* Once the dependency
-  represents the type, an `unknown` column is a column absent from every data file, which
-  `scan-read-path/scan-execution-field-id-projection-absent-fields`'s existing per-file NULL fill already answers
-  — so `unknown` → any type needs no cast at all.
-* **Format version is not gated and this feature adds no gate.** `iceberg` 0.10.0 parses
-  `FormatVersion::V3` with no rejection path, and
-  `scan-read-path/scan-execution-field-id-projection-absent-fields` already records that this engine's read path
-  is format-version-agnostic. The v3 shortfall is the TYPE VOCABULARY (`unknown`, `variant`,
-  `geometry`, `geography`), never the metadata envelope.
-* **The logical schema already carries the promoted type and nothing changes there.**
-  `build_logical_schema` reads `table.metadata().current_schema()`, so a promoted column's
-  `LogicalField` names the current type without this feature touching it. `scan-types/type-relaxation`
-  owns what the scan then does with it.
-* Every error this feature surfaces is a `UdfError`, never a panic, and carries no vended or static
-  credential value.
+* The decimal rule is precision-only: the scale `S` is unchanged and `P' > P`.
+* Bounds-width inference, § Schema Evolution: "Iceberg's Avro manifest format does not store the type of lower and upper bounds, and type promotion does not rewrite existing bounds. For example, when a `float` is promoted to `double`, existing data file bounds are encoded as 4 little-endian bytes rather than 8 little-endian bytes for `double`." The original type must be inferred from the width, and the spec's table includes `timestamp` with 4 bytes as `date` and `timestamp_ns` with 4 bytes as `date`.
+* `iceberg` 0.10.0 implements that inference for `long` and `double` only. `Timestamp`, `TimestampNs`, `Timestamptz`, and `TimestamptzNs` read 8 bytes unconditionally, so a 4-byte bound under a `timestamp` column fails with `DataInvalid: failed to convert byte slice to array`. A decimal bound decodes length-agnostically at the unchanged scale.
+* That failure is not limited to pruning. The bounds decode runs during manifest Avro deserialization, so an unfiltered `SELECT *` fails too, first from `ensure_supported_delete_mechanisms`. A second bounds decode in `iceberg` 0.10.0 uses `unwrap()` and can panic, which aborts the UDF's VM and makes the engine SIGKILL every sibling VM of the statement part.
+* The refusal is therefore a plan-time gate on the schema history, decided from `TableMetadata::schemas_iter` before any manifest is read.
+* The gate is conservative: it refuses on the recorded promotion alone, without checking whether a pre-promotion data file survives. Establishing that requires the manifest read that fails.
+* `unknown` to any type is unreachable. `iceberg` 0.10.0's `PrimitiveType` has 16 variants and none is `Unknown`, so a v3 schema declaring `"unknown"` fails deserialization before engine code runs. `iceberg_primitive_to_exasol` and `iceberg_primitive_to_arrow` match `PrimitiveType` exhaustively with no catch-all arm, so an `iceberg` upgrade that adds `Unknown` breaks the build instead of mapping it to the `utf8` fallback.
+* The spec's read rule for `unknown`: § Primitive Types requires it to be "Must be optional with `null` defaults; not stored in data files", and § Parquet states "When reading an `unknown` column, any corresponding column must be ignored and replaced with `null` values". Such a column is absent from every data file, which the per-file NULL fill of `scan-read-path/scan-execution-field-id-projection-absent-fields` already answers.
+* `build_logical_schema` reads `table.metadata().current_schema()`, so a promoted column's `LogicalField` names the current type. `scan-types/type-relaxation` owns the scan's cast.
+* Every error is a `UdfError`, never a panic, and carries no credential value.
 
 ## Scenarios
 

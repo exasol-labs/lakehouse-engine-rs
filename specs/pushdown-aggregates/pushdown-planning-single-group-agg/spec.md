@@ -1,59 +1,18 @@
-# Feature: Pushdown Planning — Single-Group Aggregate
+# Feature: Pushdown Planning, Single-Group Aggregate
 
-Single-group (ungrouped) aggregate pushdown: advertising which aggregate functions the
-adapter supports, translating an ungrouped aggregate query into a partial-aggregate scan
-spec, and merging each shard's partial-aggregate row into the final result. Split out of
-`pushdown/pushdown-planning` to keep that feature's core file-resolution/projection/
-filter/LIMIT scenarios separate from aggregate-specific ones. See
-`pushdown-grouped-agg/pushdown-planning-grouped-agg` for GROUP BY aggregate pushdown,
-`pushdown-aggregates/pushdown-planning-count-distinct` for `COUNT(DISTINCT ...)` decomposition, and
-`pushdown-aggregates/pushdown-planning-single-group-agg-scalar-over-aggregate` for an ungrouped
-select item that is a scalar function wrapping aggregates.
+The adapter advertises the supported aggregate capabilities, translates an ungrouped aggregate query into a partial-aggregate scan spec, and merges each shard's partial row into the final result.
 
 ## Background
 
-* **The scalar-wrapper shape is split out into its own feature.**
-  `pushdown-aggregates/pushdown-planning-single-group-agg-scalar-over-aggregate` owns the case where
-  an ungrouped `selectList` item is a scalar function WRAPPING one or more aggregates
-  (`ROUND(SUM(L_QUANTITY), 2)`, `ROUND(VARIANCE(C_ACCTBAL), 4)`), mirroring the split
-  `pushdown-grouped-agg/pushdown-planning-grouped-agg-scalar-over-aggregate` made against the grouped
-  base feature. This feature keeps capability advertisement, bare-aggregate detection, the
-  AVG sum/count pair, the empty-`projection` contract, the `COUNT(DISTINCT)` branch, and
-  the no-`OFFSET` merge.
-* **Detection is no longer "every item is literally `function_aggregate`".** A select-list
-  item may also be a decomposable scalar-over-aggregate, classified by the shared mechanism
-  the grouped planner already uses. The gate on `groupBy` being absent or empty is
-  unchanged.
-* **A request Exasol marks `aggregationType: single_group` never reaches the row-scan
-  projection.** Exasol sets that mark for every aggregate without GROUP BY, including an
-  aggregate referenced only in HAVING. A row scan would return the raw rows instead of the one
-  aggregated row.
-* Exasol does not re-apply a HAVING the adapter receives, because the adapter advertises
-  `AGGREGATE_HAVING`.
-* **The per-plan and per-select-item declared-type lists split.** Once a
-  scalar-over-aggregate item is present, the aggregate plan list and the `selectList` stop
-  being 1:1, so `aggregate_exasol_types` — which filters `selectList` down to
-  `function_aggregate` items and therefore shifts every index after a skipped scalar item —
-  serves neither the `EMITS` types nor the outer CAST. The sibling feature records the
-  replacement: a per-plan type list built by the deduplicating fold, and each select item's
-  own `selectListDataTypes` entry.
-* Single-group aggregate pushdown is decomposed into a per-shard partial aggregate (computed by the `LAKEHOUSE_SCAN` scalar EMIT UDF) and an outer ungrouped merge aggregation in the wrapper SQL.
+* A single-group aggregate splits into a per-shard partial aggregate, computed by the `LAKEHOUSE_SCAN` scalar EMIT UDF, and an outer ungrouped merge aggregation in the wrapper SQL.
 * The `GROUP BY shard_key` used for cluster fan-out lives only inside the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery, never at the outer merge level.
-* The shard-invariant common spec's `projection` field is consulted only on the row-scan dispatch path. On the aggregate dispatch path the scan UDF reads the `aggregates` field and derives the DataFusion physical projection from the partial-aggregate query text, so `projection` is left empty.
-* A single-group `COUNT(DISTINCT ...)` is handled by a branch condition in detection, NOT by the ordinary partial/merge machinery. EXACTLY one `COUNT(DISTINCT col)`/`COUNT(DISTINCT expr)` and no other select-list item (Case 1) is decomposed into a dedicated DISTINCT row-scan fan-out (see `pushdown-aggregates/pushdown-planning-count-distinct`). MORE THAN ONE distinct aggregate, or a distinct aggregate alongside any ordinary SUM/MIN/MAX/COUNT/AVG aggregate (Case 2/3), MUST decline the fan-out and route to a qualified single-table wrapper — the same shape the grouped-aggregate decline fallback uses (`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`) — whose OWN rendered SQL computes every aggregate (including every DISTINCT) over a materialized sharded raw scan, so Exasol passes the one-row result through. The adapter MUST NOT return a bare row scan for such a request: Exasol never re-aggregates a declined pushdown, so raw source columns where `selectListDataTypes` expects the aggregate columns are rejected (`sqlCode 04000`, column-count mismatch). A distinct fan-out MUST NOT be composed as a SELECT-list scalar subquery either: Exasol rejects an emitting UDF call nested in a scalar subquery at compile time (`sqlCode 04000`, "emitting function in expression").
-* See `pushdown/pushdown-planning` for the shard-invariant common spec, file-list resolution, and non-aggregate pushdown scenarios.
-* **No offset can reach the one-row merge SELECT, so it renders none (issue #191).** Exasol
-  rejects an `OFFSET` in ANY ungrouped aggregated select with `sqlCode 42000` ("OFFSET not
-  allowed in aggregated selects") — verified live on `SELECT COUNT(*) FROM t ORDER BY 1 LIMIT 5
-  OFFSET 2`, on `ORDER BY COUNT(*)`, and on a single-group aggregate over a join. The
-  statement fails at parse time, before the adapter is consulted, so the merge SELECT never
-  receives a non-zero `limit.offset`. This site therefore takes NO offset parameter, NO
-  collapse arithmetic, and NO failure branch.
-* **Exasol pushes no `orderBy` on an ungrouped aggregate request either.** Verified live:
-  `SELECT COUNT(*) FROM t ORDER BY COUNT(*) LIMIT 5` and `ORDER BY 1 LIMIT 5` both push `limit`
-  with `orderBy` ABSENT, because a one-row result admits exactly one ordering and Exasol
-  resolves it itself. So the merge SELECT renders no `ORDER BY` and needs none, and no
-  anti-wrong-truncation withholding applies to its `LIMIT`.
+* The scan UDF reads the `aggregates` field of the common spec on the aggregate path and derives the DataFusion projection from the partial-aggregate query text, so `projection` is left empty. Only the row-scan path reads `projection`.
+* Exasol marks every aggregate without GROUP BY `aggregationType: single_group`, including an aggregate referenced only in HAVING. Such a request never reaches the row-scan projection, because a row scan returns raw rows instead of the aggregated row.
+* Exasol does not re-apply a HAVING, because the adapter advertises `AGGREGATE_HAVING`.
+* A select item may also be a scalar function wrapping aggregates (`pushdown-aggregates/pushdown-planning-single-group-agg-scalar-over-aggregate`).
+* Exactly one `COUNT(DISTINCT ...)` and no other select-list item (Case 1) becomes a DISTINCT row-scan fan-out (`pushdown-aggregates/pushdown-planning-count-distinct`). More than one distinct aggregate, or a distinct aggregate beside an ordinary aggregate (Case 2/3), routes to a qualified single-table wrapper (`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`). The wrapper computes every aggregate over a materialized sharded raw scan.
+* Exasol never re-aggregates a declined pushdown, so a bare row scan where `selectListDataTypes` expects aggregate columns fails with `sqlCode 04000`. Exasol also rejects an emitting UDF call nested in a scalar subquery (`sqlCode 04000`).
+* Exasol rejects an `OFFSET` in any ungrouped aggregated select (`sqlCode 42000`) and pushes no `orderBy` on an ungrouped aggregate request. The merge SELECT therefore takes no offset and renders no `ORDER BY`.
 
 ## Scenarios
 

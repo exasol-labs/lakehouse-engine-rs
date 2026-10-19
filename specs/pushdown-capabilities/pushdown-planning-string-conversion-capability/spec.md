@@ -1,17 +1,11 @@
-# Feature: Pushdown Planning — String Function and Type-Conversion Capability Extensions
+# Feature: Pushdown Planning, String Function and Type-Conversion Capability Extensions
 
-Extends pushdown planning (`pushdown/pushdown-planning`) with `FN_CAST`/`FN_NEG` and
-`FN_SUBSTR`/`FN_LEFT` capability advertisements. Split from
-`pushdown-capabilities/pushdown-planning-capability-extensions`.
+The adapter advertises `FN_CAST`, `FN_NEG`, `FN_SUBSTR`, and `FN_LEFT`.
 
 ## Background
 
-* A scalar-function capability is advertised only once a `crates/vs-expression` arm renders
-  it and the DataFusion result matches Exasol. `FN_CAST`, `FN_NEG`, `FN_SUBSTR`, and
-  `FN_LEFT` meet this bar.
-* Iceberg spec compliance: checked, not engaged. This feature changes only which scalar capabilities the adapter advertises, touching no manifest, snapshot, field-id, delete, or type mapping. No normative requirement applies.
-* Exasol delegates an advertised capability fully and never re-applies it. A capability the
-  scan UDF cannot plan fails the query with no fallback (issue #187).
+* A scalar-function capability is advertised only when a `crates/vs-expression` arm renders it and the DataFusion result matches Exasol.
+* Exasol delegates an advertised capability fully and never re-applies it, so a capability the scan UDF cannot plan fails the query with no fallback.
 
 ## Scenarios
 

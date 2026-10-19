@@ -1,13 +1,13 @@
 # Feature: Scan-Spec Credential Reference
 
-Replaces the storage credentials the adapter embedded in the scan-driving SQL with a REFERENCE to the Exasol CONNECTION: the scan spec carries the connection NAME, and the scan UDF resolves credentials at execution time through `ctx.connection()`. Closes #135 (credential visible in `EXPLAIN VIRTUAL`). A storage credential the CONNECTION does not state, such as a vended credential or an assumed AWS role's session credential, cannot be referenced and travels only inside an AES-GCM-sealed envelope (closing #378); vending without key material is refused at plan time.
+The scan spec carries the Exasol CONNECTION name instead of storage credentials, and the scan UDF resolves the credentials at execution time through `ctx.connection()`. A credential the CONNECTION does not state, such as a vended credential or an assumed AWS role's session credential, travels only inside an AES-GCM-sealed envelope. Vending without key material is refused at plan time.
 
 ## Background
 
-* **The pushdown response carries exactly one field.** `EXPLAIN VIRTUAL` returns it verbatim — the leak surface. Profiling/audit `SQL_TEXT` carry only the user's literal statement.
-* **The scoped credential claim.** A CONNECTION-supplied credential MUST NOT appear in any returned SQL. A VENDED credential or an assumed role's session credential appears ONLY inside the sealed envelope, never in plaintext.
-* **The sealed envelope's threat model is deliberately bounded.** Defeats plaintext reads, not offline cryptanalysis. See `docs/security.md`.
-* **`ctx.connection()` is engine-local, not a catalog round-trip.** The wire wrapper exposes no secret accessor (compile failure, not an empty redaction set). The required grant is a BREAKING deployment change.
+* The pushdown response is the leak surface, because `EXPLAIN VIRTUAL` returns it verbatim. Profiling and audit `SQL_TEXT` carry only the user's literal statement.
+* A CONNECTION-supplied credential never appears in returned SQL. A vended or assumed-role session credential appears only inside the sealed envelope.
+* The sealed envelope defeats plaintext reads, not offline cryptanalysis (`docs/security.md`).
+* `ctx.connection()` is engine-local, not a catalog round-trip. The wire wrapper exposes no secret accessor. The required script-scoped grant is a breaking deployment change.
 
 ## Scenarios
 

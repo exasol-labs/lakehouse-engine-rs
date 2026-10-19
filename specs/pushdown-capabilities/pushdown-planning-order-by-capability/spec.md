@@ -1,157 +1,20 @@
-# Feature: Pushdown Planning — Ordered Sort-Key Capability
+# Feature: Pushdown Planning, Ordered Sort-Key Capability
 
-Extends pushdown planning (`pushdown/pushdown-planning`) with the getCapabilities-level
-advertisement of ordered-sort-key capabilities — `ORDER_BY_COLUMN` (bare column sort keys)
-and `ORDER_BY_EXPRESSION` (expression or aggregate sort keys, issue #198) — plus
-`LIMIT_WITH_OFFSET` (issue #191), each gated on a correctness-safe rendering path across
-every ordered shape the adapter can reach. Per-path rendering mechanics live in the sibling
-pushdown-planning features: `pushdown-capabilities/pushdown-planning-topn` (declined row-scan wrapper
-and the matched bounded top-N), `pushdown-grouped-agg/pushdown-planning-grouped-agg` (grouped merge
-`ORDER BY`), `pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback` (unresolvable
-grouped `ORDER BY`), `pushdown-joins/pushdown-planning-join-fallback` (the qualified
-single-table and N-scan join wrapper), `pushdown-aggregates/pushdown-planning-single-group-agg` and
-`pushdown-aggregates/pushdown-planning-count-distinct` (the one-row merge SELECTs).
+The adapter advertises `ORDER_BY_COLUMN`, `ORDER_BY_EXPRESSION`, and `LIMIT_WITH_OFFSET`. Each is backed by a correctness-safe rendering path for every ordered shape the adapter can reach.
 
 ## Background
 
-* **Why `ORDER_BY_EXPRESSION` must be advertised at all.** While it is unadvertised and the
-  client's `ORDER BY` sorts on an expression or aggregate absent from the client's select list,
-  Exasol silently APPENDS that sort key to the `selectList` it pushes and names the resulting
-  extra result column `HIDDEN_COL_n` (issue #198). Verified on the wire against the local Docker
-  stack: `SELECT id, c_price FROM t ORDER BY ABS(c_price)` (2 client columns) and `SELECT id,
-  c_price, ABS(c_price) AS a FROM t ORDER BY ABS(c_price)` (3 client columns, the key genuinely
-  selected) push a BYTE-IDENTICAL `selectList` and yield identical adapter-generated SQL — the
-  only difference is the client-facing column name Exasol picks server-side. No disambiguating
-  field exists anywhere in the payload, so no `selectList`-side detection can separate the
-  leaking shape from the correct one. Advertising the capability is the only mechanism that
-  removes the ambiguity: Exasol then pushes a structured `orderBy` element and leaves the
-  `selectList` alone.
-* **Why the advertisement and its backing paths are inseparable.** Advertising
-  `ORDER_BY_EXPRESSION` makes Exasol DELEGATE the ordering: it stops re-sorting the returned
-  rows. Verified live by advertising the capability with no backing path — the row-scan repro
-  returned rows in raw file order with no error (a silent wrong-order regression, strictly worse
-  than the leak) and the grouped repro hard-errored on the pre-existing unresolvable-ORDER-BY
-  decline. So the capability MUST NOT be advertised in any commit that does not already carry a
-  correctness-safe backing path for every reachable ordered shape.
-* Exasol's re-apply behavior for a declined pushed clause varies by shape, which is why the
-  scenarios below are careful to state exactly what each capability's fallback does and does
-  not rely on Exasol to restore. Live precedent under `add-topn-pushdown` B5/B6 (issues #225 /
-  #189): an `orderBy` pushed TOGETHER with a `limit` is fully delegated — Exasol re-applies
-  neither, so the withheld-limit fallback returned wrong, unsorted, unbounded rows and the
-  adapter now renders a self-contained global `ORDER BY … LIMIT` (`topn.rs` lines 444-449,
-  `mod.rs` lines 690-694). An `orderBy` pushed WITHOUT a `limit` behaves differently: Exasol
-  keeps its own top-level `ORDER BY` and re-sorts the returned rows (`tests/e2e_scan_test.rs`
-  lines 1133-1138).
-* **The advertisement retires the recorded structural-unreachability argument, and exposes a
-  separate missing-`LIMIT` defect on the single-group aggregate merge.** It was previously argued
-  that the `effective_limit` drop site never executes for the single-group aggregate, because
-  that shape's output has no bare column to sort on and only `ORDER_BY_COLUMN` was advertised.
-  Advertising `ORDER_BY_EXPRESSION` retires that argument: Exasol can now push an `orderBy` over
-  an aggregate expression for an ungrouped aggregate and for a lone `COUNT(DISTINCT)`.
-* **The single-group aggregate merge SELECT renders NO `LIMIT` at all**, independently of any
-  `orderBy`. Verified in source: the aggregate branch of the scan-driving SQL builder takes no
-  limit argument and emits `SELECT <merge items> FROM (<fan-out>)` unconditionally, so a pushed
-  `LIMIT 0` returns the one aggregate row. The `effective_limit` binding is therefore NOT the
-  drop site to change — it is inert on this sub-path in both directions: the per-shard partial
-  scan never reads the scan spec's `limit` field (the partial-aggregate scan path consumes
-  `aggregates` only), so the withheld value truncates nothing, and the value never reaches the
-  emitted SQL either. The fix site is the outer merge SELECT. The lone-`COUNT(DISTINCT)`
-  wrapper already renders its caller-supplied limit correctly on its outer
-  `SELECT COUNT(DISTINCT "V") FROM (<fan-out>)`, so only its caller-side withholding is at
-  issue there.
-* **`effective_limit` serves two sub-paths with opposite requirements, so it stays unchanged.**
-  It is computed once, before the aggregate/row-scan split, and `None` is LOAD-BEARING for
-  correctness on the row-scan declined path: that path re-applies the real limit on its own
-  outer wrapper AFTER the global `ORDER BY`, and a limit left in the per-shard blob is exactly
-  the wrong-truncation defect `fix-225` removed. Every rule below therefore leaves the
-  per-shard `LIMIT` withheld on the row-scan declined path and changes only where the outer
-  SQL renders it.
-* A declined `ORDER BY` no longer widens the derived projection to the full base row.
-  Instead, each sort-key column absent from the adapter's DERIVED PROJECTION — the
-  projection-item list the adapter builds from the select list, normally one item per
-  select-list item but separately widened to the full base row when a select-list item is
-  untranslatable, an unknown/aggregate node, or carries an EMITS-incompatible declared type
-  (see `pushdown/pushdown-planning-literal-projection`'s "Projected constant whose declared
-  EMITS type Exasol rejects declines to the full base row") — is appended, resolved by name
-  from `involvedTables[0].columns`, AFTER every item the derivation already produced, as a
-  hidden scan column. The declined wrapper then names the derived projection's pre-extension
-  items EXPLICITLY by their EMITS identifiers instead of `SELECT *`, so the returned column
-  count and order equal the derived projection's pre-extension shape. Exasol validates a
-  returned pushdown query's column count POSITIONALLY against the original `selectList` and
-  never re-projects a declined pushdown, so a widened full-base-row projection is rejected
-  with `sqlCode 04000` whenever the base row's column count differs from the select list's.
-  A request whose derived projection the separate full-base-row fallback above has ALREADY
-  widened never reaches the hidden-sort-key-column rule: the dispatcher routes it to the
-  qualified single-table wrapper first, before the declined-`ORDER BY` path runs.
-* A select-list item's quoted EMITS identifier is produced by ONE seam: the real
-  source-column name for a bare column, the positional synthetic `_LH_PROJ_{index}` for a
-  rendered expression. The per-shard EMITS clause and any outer wrapper's explicit column
-  list render through that same seam, so they agree positionally by construction.
-* Column Exasol types are read from `involvedTables[0].columns`. A sort key MAY be any
-  expression node once `ORDER_BY_EXPRESSION` is advertised — a scalar-function, arithmetic, or
-  CAST node as well as a bare `column`. Exasol declares result types only for `selectList`
-  items (`selectListDataTypes`); it declares NO type for a sort-key expression. Every rule
-  below therefore renders an expression sort key over columns whose declared types are already
-  known, and never derives a type for an expression.
-* Iceberg spec compliance: checked, not engaged. Verified against the Apache Iceberg table
-  spec (https://iceberg.apache.org/spec/) rather than from memory: the normative sections
-  that could bear on this change are the ones governing what a reader must resolve —
-  schema/field-id resolution ("Schemas and Data Types", "Column Projection") and scan
-  planning ("Scan Planning", manifest/partition filtering). This feature touches none of them.
-  It changes which sort-key capabilities the adapter advertises and the Exasol-side SQL shape
-  it returns; no manifest read, snapshot resolution, field-id projection, delete application, or
-  type mapping is added or altered, and the hidden columns it emits are ordinary base columns
-  already resolved through the existing projection path. No normative requirement applies, so
-  there is no deviation to fix and none to track.
-* **Why `LIMIT_WITH_OFFSET` must be advertised (issue #191).** While it is unadvertised,
-  Exasol pushes `orderBy` for any ORDER BY query but strips the offset from the request AND
-  applies no offset itself. Verified live against the local Docker stack (Exasol + SeaweedFS +
-  Iceberg REST, seeded `events` table, 20 rows, `score = 5.0 * id`): `SELECT id, score FROM t
-  ORDER BY score DESC LIMIT 12 OFFSET 3` pushed `"limit":{"numElements":12}` with NO `offset`
-  key, and the query returned ids 20…9 — ranks 1-12 — instead of the correct ids 17…6, ranks
-  4-15. The collapse is deterministic, not the non-deterministic ordering issue #191's title
-  describes; Exasol silently treats the OFFSET as 0. The same collapse reproduced on the
-  declined row-scan path and on a `GROUP BY MOD(id,4) ORDER BY MOD(id,4) LIMIT 2 OFFSET 1`.
-  No `pushdownRequest` field carries the offset while the capability is unadvertised, so no
-  adapter-side detection can recover it. Advertising the capability is the only mechanism
-  that surfaces it: Exasol then pushes `"limit":{"numElements":12,"offset":3}`, the same
-  semantics as the SQL clause, needing no absolute-position arithmetic.
-* **Why the offset advertisement and its rendering are inseparable.** Advertising
-  `LIMIT_WITH_OFFSET` makes Exasol delegate the ENTIRE final window: it then applies neither
-  the LIMIT nor the OFFSET itself. Verified live by flipping only the capability flag with no
-  other change — the query result was UNCHANGED (still ids 20…9), proving Exasol's own
-  windowing had gone away entirely and the adapter's returned SQL had become the only source
-  of truth. Advertising without rendering therefore replaces a wrongly-unshifted result with
-  a wrongly-UNBOUNDED one. The advertisement and the offset rendering on every reachable
-  wrapper MUST land at the same commit.
-* **Exasol's grammar constrains where an OFFSET may be rendered.** Verified live: `ORDER BY
-  score DESC OFFSET 3` with no LIMIT fails with `sqlCode 42000` ("unexpected OFFSET_");
-  `LIMIT 12 OFFSET 3` with no ORDER BY fails with `sqlCode 42000` ("OFFSET not allowed in
-  LIMIT without ORDER BY"); and an `OFFSET` in any UNGROUPED aggregated select fails with
-  `sqlCode 42000` ("OFFSET not allowed in aggregated selects") — reproduced on
-  `SELECT COUNT(*) … ORDER BY 1 LIMIT 5 OFFSET 2`, on `ORDER BY COUNT(*)`, on
-  `SELECT COUNT(DISTINCT id) …`, on a two-`COUNT(DISTINCT)` select, and on a single-group
-  aggregate over a join. A `GROUP BY` select accepts the OFFSET and pushes it. Two
-  consequences: a wrapper SELECT that renders NO `ORDER BY` MUST NOT render an `OFFSET` on
-  itself, because the returned SQL would be a syntax error rather than a correct result; and
-  the two one-row merge SELECTs — the single-group aggregate merge and the lone-`COUNT(DISTINCT)`
-  wrapper — can never receive an offset at all, because Exasol rejects such a statement before
-  the adapter is consulted.
-* **A non-zero `limit.offset` always arrives with a non-empty `orderBy` (the offset-implies-
-  ordering invariant).** Verified live across 11 offset-carrying shapes spanning all three
-  reachable render sites: a projected sort key, an ordinal sort key, a select-list alias, an
-  unprojected sort key, four grouped shapes (including an ordinal on the aggregate and a group
-  key absent from the select list), and three join shapes. Every one pushed a non-empty
-  `orderBy`. Two independent Exasol-side mechanisms enforce it: the grammar above makes the
-  user query carry an ORDER BY, and Exasol withholds `limit` ENTIRELY when it cannot delegate
-  that ordering — `SELECT id FROM t ORDER BY HASH_MD5(id) LIMIT 5 OFFSET 2` pushed NEITHER
-  `orderBy` NOR `limit`. So no adapter path has to handle an offset without a pushed ordering,
-  and no path SHALL be given a failure branch for that state.
-* **Exasol never pushes `offset: 0`, and never pushes an `orderBy` on an ungrouped aggregate.**
-  Verified live: `LIMIT 5 OFFSET 0` pushes `{"numElements":5}` with NO `offset` key,
-  byte-identical to a bare `LIMIT 5`; and `SELECT COUNT(DISTINCT id) FROM t ORDER BY 1 LIMIT 5`
-  pushes `limit` with `orderBy` ABSENT (likewise for `ORDER BY COUNT(*)` and
-  `ORDER BY COUNT(DISTINCT id)`), because Exasol resolves the no-op one-row ordering itself.
+* Exasol delegates an advertised ordering and window and does not re-sort or re-window the returned rows. An advertised capability without a backing path returns wrong rows, so each advertisement and its rendering paths land together.
+* Without `ORDER_BY_EXPRESSION`, Exasol appends an expression sort key absent from the client's select list to the pushed `selectList` as an extra result column named `HIDDEN_COL_n`. The pushed `selectList` is then byte-identical to a query that selects the key, so the adapter cannot tell the two apart. With the capability, Exasol pushes a structured `orderBy` element and leaves the `selectList` alone.
+* Without `LIMIT_WITH_OFFSET`, Exasol strips the offset from the pushed request and applies none itself, so `LIMIT 12 OFFSET 3` returns ranks 1 to 12. With the capability, Exasol pushes `"limit":{"numElements":12,"offset":3}`.
+* Exasol's grammar constrains an OFFSET. `OFFSET` without `LIMIT` fails, `LIMIT ... OFFSET` without `ORDER BY` fails, and `OFFSET` in an ungrouped aggregated select fails (`sqlCode 42000`). A wrapper SELECT that renders no `ORDER BY` therefore never renders an `OFFSET`, and the single-group aggregate merge and the lone-`COUNT(DISTINCT)` wrapper never receive one.
+* A non-zero `limit.offset` always arrives with a non-empty `orderBy`, because Exasol withholds `limit` when it cannot delegate the ordering. Exasol never pushes `offset: 0`. It pushes no `orderBy` on an ungrouped aggregate request, because a one-row result admits one ordering.
+* The single-group aggregate merge SELECT takes the request's raw `limit` as its own input. The per-shard partial scan never reads `limit`.
+* The row-scan declined path withholds the per-shard `LIMIT` and re-applies the request's `LIMIT` on its outer wrapper after the global `ORDER BY`. A per-shard limit would truncate rows before the global ordering.
+* The derived projection is the projection-item list the adapter builds from the select list, one item per select-list item. Exasol validates the returned column count positionally against the original `selectList`, so a projection widened to the full base row fails with `sqlCode 04000`. A sort-key column absent from the derived projection is appended as a hidden scan column after every existing item, and the declined wrapper names the pre-extension items explicitly by their EMITS identifiers instead of `SELECT *`.
+* A request whose derived projection is already widened to the full base row routes to the qualified single-table wrapper before the declined-`ORDER BY` path runs.
+* A select-list item's quoted EMITS identifier is the source-column name for a bare column and `_LH_PROJ_{index}` for a rendered expression. The per-shard EMITS clause and the outer wrapper's column list use the same seam.
+* Column Exasol types come from `involvedTables[0].columns`. Exasol declares no type for a sort-key expression, so an expression sort key is rendered over columns whose types are known.
 
 ## Scenarios
 

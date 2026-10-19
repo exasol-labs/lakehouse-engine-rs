@@ -1,58 +1,25 @@
-# Feature: VS Expression Translator — Scalar Functions
+# Feature: VS Expression Translator, Scalar Functions
 
-Extends the VS expression translator (`sql-comprehension/vs-expression-translator`) with
-named scalar function translation: math functions, the modulo operator, string functions,
-CASE expressions, and the NULLIF/COALESCE shorthands. These are distinct from the arithmetic
-operators and CAST scenarios in `vs-expression-translator-scalar-ops`. `GREATEST`/`LEAST` are
-specified in the sibling feature `sql-functions/vs-expression-translator-greatest-least`, and
-`CONCAT`'s NULL-semantics rendering in `sql-functions/vs-expression-translator-concat`, both
-split out to keep this feature's scenario count under the library threshold — the same treatment
-`FLOAT_DIV` already received into `vs-expression-translator-float-div`.
+Extends the VS expression translator (`sql-comprehension/vs-expression-translator`) with named scalar function translation: math functions, the modulo operator, string functions, CASE expressions, and the NULLIF and COALESCE shorthands. `vs-expression-translator-scalar-ops` covers the arithmetic operators and CAST. `sql-functions/vs-expression-translator-greatest-least` covers `GREATEST` and `LEAST`, and `sql-functions/vs-expression-translator-concat` covers the `CONCAT` NULL rendering.
 
 ## Background
 
-The translator serves two SQL parsers through one recursive walker, selected by the entry point:
-the DataFusion trio (`render_expression`, `render_expression_safe`, `render_df_filter_safe`) feeds
-DataFusion's SQL frontend inside the scan UDF, and the Exasol trio (`render_expression_exasol`,
-`render_expression_exasol_safe`, `render_df_filter_exasol_safe`) feeds outer wrapper SQL that
-Exasol's own core engine parses.
+The translator serves two SQL parsers through one recursive walker. The DataFusion entry points (`render_expression`, `render_expression_safe`, `render_df_filter_safe`) feed DataFusion's SQL frontend inside the scan UDF. The Exasol entry points (`render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe`) feed outer wrapper SQL that Exasol's own engine parses.
 
-**In the DataFusion dialect**, most Exasol `FN_*` names lower-case directly to the DataFusion
-function of the same name; a documented set needs explicit aliasing: `SIGN`→`signum`,
-`LENGTH`→`character_length`, `MOD`→`%` operator, `INSTR`/`LOCATE`→`strpos` (with operand reorder),
-`UNICODE`→`ascii`, `UNICODECHR`→`chr`, `NULLIFZERO`→`nullif(x,0)`, `ZEROIFNULL`→`coalesce(x,0)`.
+In the DataFusion dialect, most Exasol `FN_*` names lower-case to the DataFusion function of the same name. These need explicit aliasing: `SIGN`→`signum`, `LENGTH`→`character_length`, `MOD`→`%` operator, `INSTR`/`LOCATE`→`strpos` (with operand reorder), `UNICODE`→`ascii`, `UNICODECHR`→`chr`, `NULLIFZERO`→`nullif(x,0)`, `ZEROIFNULL`→`coalesce(x,0)`.
 
-**In the Exasol dialect** every one of those aliases is wrong, because the fragment is evaluated by
-Exasol and Exasol has no function of the aliased name. The rule is therefore inverted and uniform:
-an Exasol scalar function renders VERBATIM — original name, original argument order, original
-argument count — because Exasol's own compiler emitted that call and Exasol can evaluate exactly
-what it sent. Every translated `function_scalar` name is declared exactly once in the crate with its
-Exasol-dialect form, and that one declaration both gates the dispatch and drives the enforcing sweep
-test (see `sql-comprehension/vs-expression-translator`). A name that joins a DataFusion arm without
-joining the declaration is therefore not translated at all, rather than silently rendering DataFusion
-SQL on the Exasol path. Verified on live Exasol 2025.2.1 (the image pinned in `docker-compose.yml`),
-the aliases are hard compilation errors there: `SIGNUM` and `STRPOS` both return `function or script
-<NAME> not found` (SQL code 42000), and `%` is rejected by Exasol's parser (issue #197).
-`GREATEST`/`LEAST` also follow this verbatim rule on the Exasol dialect — both names keep the
-`ExasolForm::VerbatimCall` declaration — but their DataFusion-dialect NULL-guard rendering and its
-full evidence live in `sql-functions/vs-expression-translator-greatest-least`. `CONCAT` keeps
-its `ExasolForm::Shaped` declaration and follows the verbatim rule on the Exasol dialect too — its
-DataFusion-dialect NULL-guard rendering and its full evidence live in
-`sql-functions/vs-expression-translator-concat`.
+In the Exasol dialect every one of those aliases is wrong, because Exasol has no function of the aliased name: `SIGNUM` and `STRPOS` return `function or script <NAME> not found` (SQL code 42000), and Exasol's parser rejects `%`. An Exasol scalar function therefore renders verbatim, with its original name, argument order and argument count, because Exasol's compiler emitted the call. The crate declares every translated `function_scalar` name once, with its Exasol-dialect form. That declaration gates the dispatch and drives the enforcing sweep test (see `sql-comprehension/vs-expression-translator`). A name with a DataFusion arm but no declaration is not translated. `GREATEST` and `LEAST` keep the `ExasolForm::VerbatimCall` declaration, and `CONCAT` keeps `ExasolForm::Shaped`.
 
-Five constructs are deliberately EXCLUDED from the verbatim rule and keep a dedicated rendering in
-both dialects, because verbatim is either impossible or wrong for them:
+These constructs are excluded from the verbatim rule and keep a dedicated rendering, because verbatim is impossible or wrong for them:
 
 | Construct | Why it is not rendered verbatim |
 |---|---|
-| `ADD`, `SUB`, `MULT`, `NEG` | Wire names for operators, not Exasol function names — Exasol has no function called `ADD`. Both dialects render `(<l> + <r>)` and the rest. |
-| `FLOAT_DIV` | Also an operator wire name, and one of the TWO whose rendering DIVERGES by dialect: `(CAST(<l> AS DOUBLE) / <r>)` in the DataFusion dialect, a bare `(<l> / <r>)` in the Exasol dialect. Exasol's `/` IS `FN_FLOAT_DIV` — always true float division, whatever the operand types — while DataFusion's `/` is operand-typed and truncates integer and decimal operands (issue #186). The cast is what makes DataFusion reproduce Exasol; Exasol needs no help. Specified in `sql-comprehension/vs-expression-translator-float-div`, including the sweep-test scenario that keeps `FLOAT_DIV` out of this table's verbatim rule. |
-| `MOD` | Exasol requires `MOD(a, b)`, DataFusion offers only the `%` operator (issue #197). Its arm branches on dialect and validates arity, which the verbatim rule does not. |
-| `CONCAT` | Also the wire encoding of Exasol's `\|\|` operator, and the SECOND of the five whose rendering diverges by dialect: `nullif(concat(<a1>, <a2>, ...), '')` in the DataFusion dialect, chained `(<a1> \|\| <a2> ...)` in the Exasol dialect, because Exasol's `\|\|` treats a NULL operand as the empty string while DataFusion's `\|\|` propagates NULL (issue #374). Specified in `sql-functions/vs-expression-translator-concat`, including the sweep-test scenario that keeps `CONCAT` out of this table's verbatim rule. |
-| `CAST` | The target type, not the name, is what differs: an Exasol character target needs an explicit length and an Exasol `TIMESTAMP` target needs an explicit precision. Its per-dialect rendering is specified in `sql-comprehension/vs-expression-translator-cast` and is unchanged by this feature. |
-| `function_scalar` named `CASE` | Exasol's interleaved-argument CASE encoding; both dialects render `CASE WHEN … THEN … END`, so there is no call form to render verbatim. This is the `function_scalar`+`name=CASE` alternate encoding, distinct from the `function_scalar_case` node type scenario below. |
-
-The regular-expression functions are not translated in either dialect (issue #106, #471).
+| `ADD`, `SUB`, `MULT`, `NEG` | Wire names for operators, not Exasol function names. Both dialects render `(<l> + <r>)` and the rest. |
+| `FLOAT_DIV` | An operator wire name whose rendering differs by dialect: `(CAST(<l> AS DOUBLE) / <r>)` in the DataFusion dialect, `(<l> / <r>)` in the Exasol dialect. Exasol's `/` is always float division, while DataFusion's `/` truncates integer and decimal operands. Specified in `sql-comprehension/vs-expression-translator-float-div`. |
+| `MOD` | Exasol requires `MOD(a, b)`, and DataFusion offers only `%`. Its arm branches on dialect and validates arity. |
+| `CONCAT` | Also the wire encoding of Exasol's `\|\|`, with a different rendering per dialect. Specified in `sql-functions/vs-expression-translator-concat`. |
+| `CAST` | The target type differs: an Exasol character target needs an explicit length, and an Exasol `TIMESTAMP` target needs an explicit precision. Specified in `sql-comprehension/vs-expression-translator-cast`. |
+| `function_scalar` named `CASE` | Exasol's interleaved-argument CASE encoding. Both dialects render `CASE WHEN … THEN … END`. It is distinct from the `function_scalar_case` node type. |
 
 ## Scenarios
 

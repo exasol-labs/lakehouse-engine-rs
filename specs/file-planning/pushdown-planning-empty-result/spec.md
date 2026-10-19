@@ -1,64 +1,17 @@
-# Feature: Pushdown Planning — Empty Result When All Files Are Pruned
+# Feature: Pushdown Planning, Empty Result When All Files Are Pruned
 
-When plan-time file pruning (driven by the pushed-down filter) eliminates
-every data file for a query, the adapter still returns a `pushdown` response
-whose output column shape matches what the same query would have produced with
-matching data. The short-circuit is shape-aware: it emits the correct empty
-instance of whichever plan the non-empty path would have committed to — a
-row-scan projection, a single-group aggregate row, or a grouped-aggregate
-result — so Exasol's positional pushdown validation always accepts the response
-instead of rejecting it for a column-count/type mismatch.
+When plan-time file pruning eliminates every data file, the adapter returns a `pushdown` response whose column shape matches what the same query returns with data. The response is the empty instance of the plan the non-empty path would commit to: a row-scan projection, a single-group aggregate row, or a grouped-aggregate result.
 
 ## Background
 
-* File pruning happens at the resolve-once seam (`pushdown/pushdown-planning`):
-  the adapter resolves the data-file list exactly once (from whichever format
-  reader, Iceberg or Delta, the table uses), and the pushed filter MAY reduce
-  that list to zero files.
-* Exasol validates every `pushdown` response's projected columns positionally
-  against the request's `selectListDataTypes` at pushdown-validation time; a
-  response whose column count or declared types disagree is rejected (SQL code
-  04000, e.g. `Expected number of columns is 1 but pushdown query has 4`).
-* The empty-result response MUST NOT invoke the scan fan-out UDF, and MUST NOT
-  reference any resolved data file: with zero files there is nothing to scan.
-* The empty-result response's declared output column types come from the same
-  type sources the non-empty path uses for that plan (the row projection's
-  declared types; `selectListDataTypes` for grouped aggregates; Exasol's own typing
-  of the request for an aggregate without GROUP BY), so the empty and
-  non-empty shapes are identical for any given request — except the
-  `GroupByWrapper` fall-through documented in the empty-result scenario: when an
-  aggregate request carries no `selectListDataTypes` (absent or empty), the
-  empty path renders the full-row-projection shape while the non-empty path
-  renders its `selectList`-derived shape, so the two can differ in column count
-  in that edge. A second such edge is the declined-ORDER-BY literal-only shape
-  (`pushdown/pushdown-planning-literal-projection`): for a row-scan query
-  projecting only literals with an ORDER BY on an unprojected column, the
-  non-empty path falls back to the full base row (so the declined-ORDER-BY
-  wrapper resolves), while the empty path keeps the narrow literal-only
-  projection — so the two can differ in column count for that unsupported shape.
-  Both edges only ever affect shapes the adapter declines to push down; neither
-  returns wrong data.
-* Credentials MUST NOT appear in any empty-result SQL string or error message.
-* Exasol computes empty-aggregate semantics itself, over the zero-row relation the
-  single-group empty shape selects from.
-* This delta amends ONE clause of ONE scenario: the shared-classifier clause that
-  currently requires the empty and non-empty paths to derive "the HAVING-present
-  hard-error decline" from the shared request classifier. This plan deletes that
-  decline from the classifier entirely (`pushdown/pushdown-module-structure`,
-  `pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`, issue #195), so the clause must be
-  amended or the recorded library would hold two contradictory normative statements
-  about the same classifier.
-* Nothing about the empty path's own behavior changes. The classifier is still the
-  single owner of the routing decision, and each path still renders its own shape
-  from it. Only the SET of outcomes that classifier can return narrows: the grouped
-  tier no longer returns an error, so a grouped request that does not decompose
-  yields the qualified single-table wrapper (`GroupByWrapper`) shape on both paths
-  instead of failing on both.
-* The empty path therefore gains no new branch: `empty_result_sql` re-invokes the
-  same classifier and already renders the `GroupByWrapper` shape, which is exactly
-  the shape a non-decomposable grouped request now classifies as.
-* The `selectListDataTypes` typing rule for the empty `GroupByWrapper` shape is
-  unchanged by this delta, including its documented absent/empty fall-back edge.
+* The adapter resolves the data-file list once (`pushdown/pushdown-planning`), from the Iceberg or Delta reader, and the pushed filter can reduce that list to zero files.
+* Exasol validates each `pushdown` response's columns positionally against the request's `selectListDataTypes`. A response with a different column count or declared types is rejected (SQL code 04000, for example `Expected number of columns is 1 but pushdown query has 4`).
+* With zero files there is nothing to scan, so the empty-result response does not invoke the scan fan-out UDF and references no data file.
+* The declared column types come from the same sources the non-empty path uses: the row projection's declared types, `selectListDataTypes` for grouped aggregates, and Exasol's own typing of the request for an aggregate without GROUP BY.
+* When an aggregate request carries no `selectListDataTypes` (absent or empty), the empty path renders the full-row-projection shape while the non-empty path renders its select-list shape. The column counts can differ in that case, which affects only shapes the adapter declines to push down.
+* Exasol computes empty-aggregate semantics itself, over the zero-row relation the single-group empty shape selects from.
+* A single request classifier owns the routing decision for both paths. A grouped request that does not decompose yields the qualified single-table wrapper (`GroupByWrapper`) shape on both.
+* Credentials never appear in any empty-result SQL string or error message.
 
 ## Scenarios
 

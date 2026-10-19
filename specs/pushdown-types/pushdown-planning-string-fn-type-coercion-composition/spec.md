@@ -1,21 +1,12 @@
-# Feature: Pushdown Planning — String Function Type Guard Composition
+# Feature: Pushdown Planning, String Function Type Guard Composition
 
-Verifies that `string_function_arg_type_guard` (`pushdown-types/pushdown-planning-string-fn-type-coercion`)
-composes correctly with the two other filter-side rewrite passes it is wired next to —
-`like_subject_type_guard` (`pushdown-types/pushdown-planning-like-type-coercion`) and
-`rewrite_decimal_stringifications` (`pushdown-types/pushdown-planning-decimal-string-format`) — in the
-chain `like_subject_type_guard` → `string_function_arg_type_guard` → `rewrite_decimal_stringifications`
-→ `render_df_filter_safe`. Split out of `pushdown-planning-string-fn-type-coercion` as a pure
-file-organization move (no content change) once that feature crossed the per-spec scenario
-threshold.
+`string_function_arg_type_guard`, `like_subject_type_guard`, and `rewrite_decimal_stringifications` run in that order before `render_df_filter_safe`. This feature checks that the passes compose without double coercion.
 
 ## Background
 
-* `like_subject_type_guard` is no longer junction-only: both guards now traverse the identical curated field set through the same shared post-order rewrite primitive (`pushdown/pushdown-module-structure`), so the difference between them is confined to their per-node decision, not their reach. Where a governed string function is used as a LIKE subject, the operative reason `like_subject_type_guard` leaves it alone is that its per-node decision declines to act on a non-bare-`column` subject — not that it cannot reach the node.
-* The DECIMAL branch of `string_function_arg_type_guard` reuses the existing `decimal_to_varchar_exasol` node and `wrap_decimal_to_varchar` helper introduced by `pushdown-types/pushdown-planning-decimal-string-format`; the DATE branch reuses the same `function_scalar_cast` shape as `guard_like_subject`. Neither formatting rule is reimplemented.
-* The three-pass order this feature verifies is now owned by one named pipeline function in `pushdown/support.rs` rather than spelled out at its call site (`pushdown/pushdown-module-structure`, issue #259). The passes and their order are unchanged; only their owner is. Rendered SQL is byte-identical.
-* All three passes are now private to `pushdown/support.rs` and reachable only through that pipeline function, so no module outside `support` can sequence them itself. This is what makes the order enforced by the compiler rather than by comment. Inside `support` the passes remain directly callable, which is how this feature's own unit tests exercise each pass in isolation.
-* The pipeline function does NOT absorb `render_df_filter_safe`. Rendering lives in the `vs-expression` crate and stays a separate step at the call site, so this feature's chain is now "pipeline function, then render".
+* Both type guards traverse the same curated field set through the shared post-order rewrite primitive (`pushdown/pushdown-module-structure`), so they differ only in their per-node decision. `like_subject_type_guard` leaves a governed string function used as a LIKE subject alone because the subject is not a bare `column` node.
+* The DECIMAL branch of `string_function_arg_type_guard` reuses the `decimal_to_varchar_exasol` node and `wrap_decimal_to_varchar` helper from `pushdown-types/pushdown-planning-decimal-string-format`. The DATE branch reuses the `function_scalar_cast` shape of `guard_like_subject`.
+* One named pipeline function in `pushdown/support.rs` owns the three-pass order. The three passes are private to `support.rs`, so the compiler enforces the order. `render_df_filter_safe` lives in the `vs-expression` crate and runs after the pipeline function.
 
 ## Scenarios
 

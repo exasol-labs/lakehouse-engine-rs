@@ -1,4 +1,4 @@
-# Feature: Pushdown Planning — Capability Extensions Credential Reference
+# Feature: Pushdown Planning, Capability Extensions Credential Reference
 
 Extends `pushdown-capabilities/pushdown-planning-capability-extensions`: the credential-reference guarantee of `storage-access/scan-spec-credential-reference` applies to this feature's generated SQL.
 

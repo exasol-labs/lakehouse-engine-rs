@@ -1,81 +1,20 @@
 # Feature: Pushdown Declined-Filter Self-Application
 
-Guarantees every WHERE predicate the adapter accepts is evaluated, by self-applying in the adapter's
-own returned SQL any predicate it cannot push to DataFusion.
+Guarantees that the adapter evaluates every WHERE predicate it accepts. The adapter applies, in its own returned SQL, any predicate it cannot push to DataFusion.
 
 ## Background
 
-* The protocol fact this feature rests on — there is no Exasol-side fallback for a predicate whose
-  capability the adapter advertised, and no envelope field with which to hand one back — is recorded
-  once, in ADR `specs/_decision/045` and CLAUDE.md § "Virtual Schema pushdown delegation". This spec
-  states only what the adapter must therefore DO, and does not restate the fact.
-* Three sites render the DataFusion-bound WHERE filter and each returns `Option<String>`: the
-  single-table path (`handle_pushdown`), the broadcast-join path (`render_broadcast_join`), and the
-  N-scan per-leg path (`build_side_fan_out_sql`). `None` conflates three outcomes — no filter in the
-  request, a filter that renders trivially true, and a filter that declined. The first two are safe
-  to omit; the third is not, and omitting it returned extra unfiltered rows.
-* A decline arises from two independent sources: the adapter's own type-rewrite guards
-  (`apply_type_rewrites`, single-table path only) returning `None`, and the DataFusion-dialect
-  renderer failing on a node it cannot express. Both are in scope; this feature names neither
-  source, only the outcome.
-* Declined and trivially-true are distinguishable with the translator's existing entry points and
-  need no new renderer: `render_expression_safe` does not suppress a trivially-true result, so it
-  returns `None` for exactly the declined case. The trivially-true rule stays owned by
-  `crates/vs-expression` and is never re-tested at a call site.
-* Self-application renders the ORIGINAL request filter tree, not the type-rewritten one. The
-  rewrites exist to make a predicate safe for DataFusion; Exasol evaluates the predicate with its
-  own implicit coercions and needs the tree as sent.
-* A predicate unrenderable under BOTH dialects can be applied nowhere. That returns a clean
-  adapter error, never a result. This is not a new failure mode: it is the same refusal site every
-  existing route into the qualified wrapper already reaches, and the same
-  correctness-over-availability outcome `pushdown/pushdown-planning-selectlist-expressions`
-  records for a select-list node untranslatable under both dialects.
-* A self-applied predicate whose Exasol render is TRIVIALLY TRUE is a third outcome, not that error:
-  it emits no clause. The WHERE-filter renderers suppress a trivially-true result to nothing exactly
-  as they report an unrenderable one, so the error MUST be decided by a NON-SUPPRESSING render. Taking
-  it from a WHERE-filter renderer's empty result would re-create, one dialect over, the same
-  three-way conflation this feature exists to remove.
-* The decline classification has ONE owner per path. On the single-table path `handle_pushdown`
-  computes it once, beside the scan filter it already derives from the same request filter and column
-  types, and passes the result down; no downstream site recomputes renderability. This mirrors
-  `crates/vs-expression` owning the trivially-true rule — one decision, one site, nothing to drift.
-* Self-application MUST place the predicate ahead of any aggregation, grouping, or truncation the
-  request also carries. Wrapping already-aggregated or already-truncated output in a WHERE would
-  filter the wrong rows, so the single-table path routes a declined filter through the qualified
-  single-table wrapper, whose raw fan-out is aggregate-free, sort-free, and LIMIT-free.
-* The wrapper-free single-table fast path is unchanged for every request whose filter renders. A
-  materialization boundary appears only on the decline path, which is rare and already slower.
-* On the decline path the fan-out carries NO filter — the predicate is self-applied above it — so
-  every row of the table crosses the UDF boundary and projection width is the only remaining lever.
-  That is why the wrapper's referenced-column narrowing must survive the decline rather than be
-  traded away with it; the one shape that cannot narrow is a `SELECT *`, whose result Exasol
-  validates positionally against the full base row.
-* Iceberg-level file pruning is unaffected and stays sound at BOTH pruning inputs — the single-table
-  `resolve_file_list` tree and each join side's side-local predicate. Both keep every conjunct,
-  renderable or not: pruning only ever removes files that provably cannot match, and the predicate is
-  still evaluated — in the wrapper's WHERE rather than in the scan.
-* Apache Iceberg spec check: checked, not engaged. This feature changes only where a SQL predicate
-  is evaluated between Exasol's engine and the node-local DataFusion scan. It reads no manifest
-  field, evaluates no column bound, and touches no schema-resolution, field-id, or type-mapping
-  surface, so no normative Iceberg requirement applies and there is no deviation to fix or track.
-* This delta changes no MECHANISM here. Both join scenarios describe an OUTCOME — broadcast forfeits
-  its plan, an N-scan side-local conjunct becomes residual — and this delta only widens the set of
-  TRIGGERS that reaches those outcomes to include a type-rewrite decline at the two join WHERE
-  surfaces, which previously ran no type screen at all. See
-  `pushdown-joins/pushdown-planning-join-filter-type-coercion` (issue #215).
-* The single-table scenario already names both trigger classes explicitly ("either because a
-  type-rewrite guard returned `None` or because the DataFusion dialect cannot express a node in the
-  tree"). The two join scenarios named only the second, which was accurate only because the join
-  sites ran no type guard. Making the trigger set explicit at all three sites removes an asymmetry
-  a reader would otherwise have to infer.
-* The N-scan partition's leg-eligibility rule gains a THIRD condition and, with it, a per-side
-  dimension the recorded two-condition rule did not have: the type screen needs the OWNING side's
-  own column metadata, so it runs per side and per conjunct AFTER attribution, not over the combined
-  pre-attribution set. `pushdown-joins/pushdown-planning-join-fallback` owns that rule's full statement.
-* The both-dialects-unrenderable clean-error backstop is unaffected and needs no new route: a
-  type-declined predicate is by construction renderable in the Exasol dialect — Exasol applies the
-  implicit non-string-to-VARCHAR coercion DataFusion refuses, which is exactly why the outer `WHERE`
-  is a safe home for it.
+* Exasol does not re-apply a predicate whose capability the adapter advertised, and the response has no field to hand one back. An omitted predicate returns extra unfiltered rows.
+* Three sites render the DataFusion-bound WHERE filter, and each returns `Option<String>`: the single-table path (`handle_pushdown`), the broadcast-join path (`render_broadcast_join`) and the N-scan per-leg path (`build_side_fan_out_sql`). `None` covers three outcomes: no filter, a filter that renders trivially true, and a declined filter. Only the declined filter must not be omitted.
+* A filter declines when an adapter type-rewrite guard returns `None` or when the DataFusion-dialect renderer cannot express a node.
+* `render_expression_safe` does not suppress a trivially-true result, so it returns `None` only for a declined filter. `crates/vs-expression` owns the trivially-true rule, and no call site re-tests it.
+* Self-application renders the original request filter tree, not the type-rewritten tree. Exasol applies its own implicit coercions, including non-string-to-VARCHAR, which DataFusion refuses.
+* A predicate unrenderable under both the DataFusion and the Exasol dialect is applied nowhere. The adapter returns a clean error, the same refusal as `pushdown/pushdown-planning-selectlist-expressions`. A self-applied predicate whose Exasol render is trivially true emits no clause and is not an error, so the adapter decides the error from a non-suppressing render.
+* `handle_pushdown` computes the decline classification once per path and passes it down.
+* The self-applied predicate must precede any aggregation, grouping or truncation the request carries. The single-table path therefore routes a declined filter through the qualified single-table wrapper, whose raw fan-out has no aggregate, sort or LIMIT.
+* On the decline path the fan-out carries no filter, so projection width is the only remaining lever. A `SELECT *` cannot narrow, because Exasol validates its result positionally against the full base row.
+* Iceberg file pruning keeps every conjunct, renderable or not, at both pruning inputs: the single-table `resolve_file_list` tree and each join side's side-local predicate. Pruning only removes files that cannot match.
+* The N-scan partition runs the type screen per side and per conjunct after attribution, because it needs the owning side's column metadata. `pushdown-joins/pushdown-planning-join-fallback` owns the leg-eligibility rule.
 
 ## Scenarios
 

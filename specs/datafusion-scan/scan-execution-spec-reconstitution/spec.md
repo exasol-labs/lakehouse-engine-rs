@@ -1,42 +1,18 @@
-# Feature: DataFusion Scan Execution — Spec Reconstitution
+# Feature: DataFusion Scan Execution, Spec Reconstitution
 
-Extends `datafusion-scan/scan-execution` with the mechanics of the scan UDF's two-argument
-input: a shard-invariant common-spec JSON blob (arg 0) and a per-shard file list (arg 1),
-which the UDF deserializes and merges into one `ScanSpec` before running the shared scan path.
+The scan UDF takes two arguments, a shard-invariant common-spec JSON blob (arg 0) and a per-shard file list (arg 1). It deserializes both and merges them into one `ScanSpec` before running the shared scan path.
 
 ## Background
 
-* The scan UDF's first argument is the shard-invariant common spec (projection, filter,
-  limit, aggregates, group keys, logical schema, a storage reference the UDF resolves
-  itself, the table root, partition-column names, and tuning knobs), serialized once per
-  fan-out; the second argument is this shard's file list. The scan reads its declared
-  output types from `UdfContext::output_column`, not from the spec. See
-  `datafusion-scan/scan-execution` for the scan behavior once the spec is merged.
-* The per-shard file list is a JSON array of compact `[path, size]` 2-tuples, where `path` is
-  either relative to the common spec's table root or an absolute URI, and `size` is the file's
-  byte size resolved from the table's own metadata by its format reader — an Iceberg manifest's
-  `file_size_in_bytes` for an Iceberg table, a Delta `add` action's `size` for a Delta one.
-* `ScanSpec` carries no catalog identifier block — the scan UDF never contacts the catalog.
-  Every field the spec carries is scan-time data (a path, a partition value, a deletion-vector
-  byte range, a physical column name), never a catalog handle.
-* A parse failure on either argument MUST surface an error identifying scan-spec
-  deserialization failure and MUST NOT contain any storage access key, secret key, or
-  session token.
-* Per-file positional-delete references and per-file partition values travel with their
-  data-file entry in the per-shard argument.
-* The `storage` value in the common blob is an externally-tagged credential WRAPPER specified
-  by `storage-access/scan-spec-credential-reference`. A join block carries its own REQUIRED
-  `storage` value in the same wrapper encoding, so a join block that names no dimension
-  backend fails to deserialize rather than silently reusing the fact-side backend.
-* Delete mechanisms are format-neutral and self-describing. `DeleteMechanism` routes
-  (de)serialization through a private wire enum so the Rust-level type and the frozen JSON
-  encoding are independent decisions. An entry whose delete list mixes a deletion vector
-  with an Iceberg delete-file reference is refused.
-* File-entry serialization form is selected by content: compact 2-tuple when neither
-  deletes nor partition values are present, 3-tuple when deletes but no partition values,
-  self-describing JSON object when partition values are present.
-* There is no cross-version wire-compatibility requirement — the same `.so` produces and
-  consumes the spec within one deploy.
+* The common spec carries the projection, filter, limit, aggregates, group keys, logical schema, a storage reference, the table root, partition-column names, and tuning knobs. The adapter serializes it once per fan-out.
+* The scan reads its declared output types from `UdfContext::output_column`, not from the spec.
+* The per-shard file list is a JSON array of entries. Each entry has a `path`, either relative to the table root or an absolute URI, and a `size`, the file's byte size from the table's own metadata (an Iceberg manifest's `file_size_in_bytes`, a Delta `add` action's `size`).
+* A file entry serializes in the shortest form its content allows: a `[path, size]` 2-tuple with no deletes and no partition values, a 3-tuple with deletes and no partition values, a JSON object with partition values.
+* Per-file positional-delete references and per-file partition values travel with their data-file entry in the per-shard argument.
+* `ScanSpec` carries no catalog identifier block. Every field is scan-time data (a path, a partition value, a deletion-vector byte range, a physical column name), never a catalog handle.
+* The `storage` value in the common blob is the externally-tagged credential wrapper of `storage-access/scan-spec-credential-reference`. A join block carries its own required `storage` value in the same encoding.
+* `DeleteMechanism` is format-neutral and self-describing, and serializes through a private wire enum.
+* The same `.so` produces and consumes the spec within one deploy, so there is no cross-version wire-compatibility requirement.
 
 ## Scenarios
 

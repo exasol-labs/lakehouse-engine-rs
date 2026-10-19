@@ -1,33 +1,12 @@
-# Feature: Pushdown Planning — Literal/Constant Select-List Projection
+# Feature: Pushdown Planning, Literal/Constant Select-List Projection
 
-Extends pushdown planning (`pushdown/pushdown-planning`) so a select list made up of bare
-literal/constant items — not only column references or scalar expressions — is projected
-positionally into the scan-driving query instead of triggering the full-base-row fallback,
-and records the shape where a literal-only projection still declines to the full base
-row (an EMITS-incompatible declared type). A literal-only select list with an `ORDER BY` on
-an unprojected column is now covered by `pushdown-capabilities/pushdown-planning-order-by-capability`'s
-hidden-sort-key-column rule instead of the full-base-row fallback.
+Projects bare literal or constant select-list items positionally into the scan-driving query instead of falling back to the full base row. A literal whose declared EMITS type Exasol rejects routes to the qualified single-table wrapper.
 
 ## Background
 
-* Literal select-list items are rendered through the same `crates/vs-expression` translator
-  and the same positional, `selectListDataTypes`-typed `Expr`-projection mechanism as the
-  scalar select-list expression path (`pushdown/pushdown-planning-selectlist-expressions`);
-  this feature covers the literal-specific triggers and decline shapes.
-* Iceberg spec compliance: checked, not engaged. This delta changes only how the adapter
-  projects literal select-list items and declines to the full base row; it touches no
-  manifest, schema-resolution, field-id, or type-mapping surface, so no normative Iceberg
-  requirement applies and there is no deviation to fix or track.
-* **This feature's own "decline scenario" was corrected while implementing `#218`
-  (`fix-pushdown-tstz-literal-emits`).** It previously stated that a
-  `TIMESTAMP WITH LOCAL TIME ZONE`-declared constant "hits the full-base-row fallback and
-  Exasol post-processes the select list" — describing the full base row as a
-  correct-but-unaccelerated backstop. Verified false on the live E2E container: Exasol
-  validates the pushdown response POSITIONALLY against the request's `selectList` and rejects
-  a column-count mismatch with SQL state `04000`, so the query FAILS outright rather than
-  falling back to a slower but correct path. `pushdown-capabilities/pushdown-planning-capability-extensions`
-  fixes the actual routing — the qualified single-table wrapper, not the full base row — and
-  this feature's scenario now reflects that fix rather than the disproven premise.
+* The adapter renders literal items through the same `crates/vs-expression` translator and the same positional, `selectListDataTypes`-typed `Expr` projection as the scalar select-list path (`pushdown/pushdown-planning-selectlist-expressions`).
+* Exasol validates the pushdown response positionally against the request's `selectList` and rejects a column-count mismatch with SQL state `04000`. A full-base-row response therefore fails the query instead of falling back.
+* `pushdown-capabilities/pushdown-planning-capability-extensions` owns the routing of a declined item to the qualified single-table wrapper.
 
 ## Scenarios
 
