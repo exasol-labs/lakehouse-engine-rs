@@ -5,7 +5,7 @@ use crate::common::stack::{
     exasol_host, exasol_sql_port, iceberg_catalog_url_internal, local_stack_connection_password,
 };
 use crate::fixtures::{events, stack, vs_table};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 const CONN_NAME: &str = "CREDEXP_CATALOG_CREDS";
 const VS_NAME: &str = "CREDEXP_VS";
@@ -18,7 +18,7 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|p| p.into_inner())
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn owner_conn() -> ExaConn {

@@ -6,7 +6,7 @@ use std::process::Command;
 fn so_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .and_then(|p| p.parent())
+        .and_then(std::path::Path::parent)
         .expect("navigate to workspace root from CARGO_MANIFEST_DIR")
         .join("target/release/liblakehouse_engine.so")
 }

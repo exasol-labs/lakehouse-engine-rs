@@ -2299,7 +2299,7 @@ fn distinct_numeric_suffixes(haystack: &str, marker: &str) -> std::collections::
     let mut rest = haystack;
     while let Some(pos) = rest.find(marker) {
         let after = &rest[pos + marker.len()..];
-        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
         if !digits.is_empty() {
             indices.insert(digits.clone());
         }
