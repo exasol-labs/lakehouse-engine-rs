@@ -12,37 +12,19 @@ use crate::common::pos_delete_fixtures::{
 };
 use crate::common::seed::{E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS};
 
-use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, runtime, vs_table};
+use crate::fixtures::{LAKEHOUSE_VS, pos_delete_vss, vs_table};
 
 use lakehouse_engine::adapter::pushdown::shard_count;
 use lakehouse_engine::adapter::sharding::partition_files_by_bytes;
 use lakehouse_engine::scan::spec::DeleteMechanism;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 
-const SAMESHARD_VS_NAME: &str = "POSDEL_SAMESHARD_VS";
-const SPLITSHARD_VS_NAME: &str = "POSDEL_SPLITSHARD_VS";
+pub(crate) const SAMESHARD_VS_NAME: &str = "POSDEL_SAMESHARD_VS";
+pub(crate) const SPLITSHARD_VS_NAME: &str = "POSDEL_SPLITSHARD_VS";
 /// Equals `mor_pos_partition`'s data-file count, so a 1-node cluster gets exactly
 /// one file per shard.
-const SPLIT_PARALLELISM_FACTOR: usize = 4;
-
-fn setup_e2e() {
-    static DONE: OnceLock<()> = OnceLock::new();
-    DONE.get_or_init(|| {
-        lakehouse_vs();
-        let mut conn = exa_conn();
-        create_virtual_schema(
-            &mut conn,
-            &VsProps::new(SAMESHARD_VS_NAME, NAMESPACE).with_parallelism_factor(1),
-        );
-        create_virtual_schema(
-            &mut conn,
-            &VsProps::new(SPLITSHARD_VS_NAME, NAMESPACE)
-                .with_parallelism_factor(SPLIT_PARALLELISM_FACTOR),
-        );
-    });
-}
+pub(crate) const SPLIT_PARALLELISM_FACTOR: usize = 4;
 
 fn ids_column(cols: &[Vec<serde_json::Value>]) -> Vec<i64> {
     cols[0].iter().map(parse_int).collect()
@@ -53,7 +35,7 @@ fn ids_column(cols: &[Vec<serde_json::Value>]) -> Vec<i64> {
 // one delete file per data file.
 #[test]
 fn fixture_spark_file_granularity_delete_table() {
-    setup_e2e();
+    pos_delete_vss();
 
     let rt = runtime();
     let files = rt.block_on(resolve_fixture_files(NAMESPACE, FILE_GRANULARITY_TABLE));
@@ -113,7 +95,7 @@ fn fixture_spark_file_granularity_delete_table() {
 
 #[test]
 fn fixture_spark_partition_granularity_delete_table() {
-    setup_e2e();
+    pos_delete_vss();
 
     let rt = runtime();
     let files = rt.block_on(resolve_fixture_files(
@@ -171,7 +153,7 @@ fn fixture_spark_partition_granularity_delete_table() {
 
 #[test]
 fn e2e_file_granularity_returns_post_delete_rows() {
-    setup_e2e();
+    pos_delete_vss();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -208,7 +190,7 @@ fn e2e_file_granularity_returns_post_delete_rows() {
 
 #[test]
 fn e2e_partition_granularity_returns_post_delete_rows() {
-    setup_e2e();
+    pos_delete_vss();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -238,7 +220,7 @@ fn e2e_partition_granularity_returns_post_delete_rows() {
 
 #[test]
 fn e2e_partition_delete_spans_multiple_partitions() {
-    setup_e2e();
+    pos_delete_vss();
     let mut conn = exa_conn();
 
     let table = vs_table(LAKEHOUSE_VS, PARTITION_GRANULARITY_TABLE);
@@ -286,7 +268,7 @@ fn e2e_partition_delete_spans_multiple_partitions() {
 
 #[test]
 fn e2e_partition_delete_invariant_across_fanout() {
-    setup_e2e();
+    pos_delete_vss();
 
     let rt = runtime();
     let files = rt.block_on(resolve_fixture_files(
@@ -376,7 +358,7 @@ fn e2e_partition_delete_invariant_across_fanout() {
 /// Scenario: Positional deletes compose with projection, filter, LIMIT, and pruning
 #[test]
 fn e2e_deletes_with_projection_filter_limit() {
-    setup_e2e();
+    pos_delete_vss();
     let mut conn = exa_conn();
 
     let table = vs_table(LAKEHOUSE_VS, PARTITION_GRANULARITY_TABLE);
@@ -421,7 +403,7 @@ fn e2e_deletes_with_projection_filter_limit() {
 
 #[test]
 fn e2e_deletes_with_single_and_grouped_agg() {
-    setup_e2e();
+    pos_delete_vss();
     let mut conn = exa_conn();
 
     let single_sql = format!(
@@ -487,7 +469,7 @@ fn e2e_deletes_with_single_and_grouped_agg() {
 // and needs replacing.
 #[test]
 fn e2e_unsupported_delete_fails_loud() {
-    setup_e2e();
+    pos_delete_vss();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -536,7 +518,7 @@ fn e2e_unsupported_delete_fails_loud() {
 
 #[test]
 fn e2e_delete_free_table_no_regression() {
-    setup_e2e();
+    pos_delete_vss();
     let mut conn = exa_conn();
 
     let table = vs_table(LAKEHOUSE_VS, E2E_TABLE);

@@ -5,25 +5,13 @@
 
 use crate::common::e2e_harness::*;
 use crate::common::seed::{
-    COMPLEX_ROW_POPULATED, E2E_COMPLEX_TABLE, E2E_NAMESPACE, E2E_TYPED_TABLE, TYPED_COL_BOOL,
-    TYPED_COL_DATE, TYPED_COL_DECIMAL_A, TYPED_COL_DOUBLE, TYPED_COL_TS, TYPED_COL_VARCHAR,
+    COMPLEX_ROW_POPULATED, E2E_COMPLEX_TABLE, E2E_TYPED_TABLE, TYPED_COL_BOOL, TYPED_COL_DATE,
+    TYPED_COL_DECIMAL_A, TYPED_COL_DOUBLE, TYPED_COL_TS, TYPED_COL_VARCHAR,
 };
-use crate::fixtures::{complex_probe, explain_virtual_pushdown_sql, stack, typed_probe};
+use crate::fixtures::{emit_declaration_vs, emits_clause, explain_virtual_pushdown_sql};
 use serde_json::json;
-use std::sync::OnceLock;
 
-const VS_NAME: &str = "EMIT_DECL_VS";
-
-static SETUP_DONE: OnceLock<()> = OnceLock::new();
-
-fn setup() {
-    SETUP_DONE.get_or_init(|| {
-        stack();
-        typed_probe();
-        complex_probe();
-        create_virtual_schema(&mut exa_conn(), &VsProps::new(VS_NAME, E2E_NAMESPACE));
-    });
-}
+pub(crate) const VS_NAME: &str = "EMIT_DECL_VS";
 
 fn typed_table() -> String {
     format!("{VS_NAME}.{}", E2E_TYPED_TABLE.to_uppercase())
@@ -31,30 +19,6 @@ fn typed_table() -> String {
 
 fn complex_table() -> String {
     format!("{VS_NAME}.{}", E2E_COMPLEX_TABLE.to_uppercase())
-}
-
-fn emits_clause(pushed_sql: &str) -> String {
-    let marker = "EMITS (";
-    let start = pushed_sql
-        .find(marker)
-        .unwrap_or_else(|| panic!("no EMITS clause in pushed SQL:\n{pushed_sql}"))
-        + marker.len();
-    let mut depth = 1i32;
-    let mut end = pushed_sql.len();
-    for (i, c) in pushed_sql[start..].char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = start + i;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    pushed_sql[start..end].to_string()
 }
 
 fn split_top_level(s: &str) -> Vec<String> {
@@ -109,7 +73,7 @@ fn assert_emits_clause_declares(pushed: &str, expected_types: &[&str]) {
 // is independent of the engine-version-dependent TIMESTAMP display precision.
 #[test]
 fn scan_returns_correct_values_across_type_mix_with_no_spec_carried_emit_types() {
-    setup();
+    emit_declaration_vs();
     let mut conn = exa_conn();
 
     let typed_sql = format!(

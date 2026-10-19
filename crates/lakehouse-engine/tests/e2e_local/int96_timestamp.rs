@@ -14,7 +14,7 @@ use crate::common::int96_fixtures::{
     NAMESPACE,
 };
 use crate::common::raw_parquet::get_fixture_object;
-use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, runtime, stack, vs_table};
+use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, stack, vs_table};
 
 use parquet::file::reader::{FileReader, SerializedFileReader};
 

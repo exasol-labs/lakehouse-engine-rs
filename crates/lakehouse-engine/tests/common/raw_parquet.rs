@@ -8,7 +8,7 @@
     feature = "glue-e2e"
 ))]
 
-use super::e2e_harness::{local_stack_s3_store, split_s3_bucket_and_key};
+use super::e2e_harness::{local_stack_s3_store, runtime, split_s3_bucket_and_key};
 
 use anyhow::Context;
 use arrow::record_batch::RecordBatch;
@@ -86,7 +86,8 @@ pub fn write_parquet_fixture(uri: &str, batch: RecordBatch) {
 pub fn put_fixture_object(uri: &str, bytes: Bytes) {
     let (bucket, key) = split_s3_bucket_and_key(uri);
     let store = local_stack_s3_store(bucket);
-    block_on_fixture(put_object(&store, key, bytes))
+    runtime()
+        .block_on(put_object(store.as_ref(), key, bytes))
         .unwrap_or_else(|e| panic!("PUT fixture object at {uri}: {e:#}"));
 }
 
@@ -95,16 +96,9 @@ pub fn get_fixture_object(uri: &str) -> Bytes {
     let store = local_stack_s3_store(bucket);
     let path = ObjectStorePath::parse(key)
         .unwrap_or_else(|e| panic!("fixture key of {uri} is not a valid object path: {e}"));
-    block_on_fixture(async { store.get(&path).await?.bytes().await })
+    runtime()
+        .block_on(async { store.get(&path).await?.bytes().await })
         .unwrap_or_else(|e| panic!("GET fixture object at {uri}: {e}"))
-}
-
-fn block_on_fixture<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime for a fixture object operation")
-        .block_on(future)
 }
 
 /// Removes the object at `uri`; an absent object counts as removed, so a fixture can reset a
@@ -113,7 +107,7 @@ pub fn delete_fixture_object(uri: &str) {
     let (bucket, key) = split_s3_bucket_and_key(uri);
     let store = local_stack_s3_store(bucket);
     let path = ObjectStorePath::parse(key).unwrap_or_else(|e| panic!("fixture key {key}: {e}"));
-    match block_on_fixture(store.delete(&path)) {
+    match runtime().block_on(store.delete(&path)) {
         Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
         Err(e) => panic!("DELETE fixture object at {uri}: {e}"),
     }
@@ -135,7 +129,8 @@ pub async fn put_object(store: &impl ObjectStore, key: &str, bytes: Bytes) -> an
 pub fn delete_fixture_prefix(uri: &str) {
     let (bucket, key) = split_s3_bucket_and_key(uri);
     let store = local_stack_s3_store(bucket);
-    block_on_fixture(delete_objects_under(&store, key))
+    runtime()
+        .block_on(delete_objects_under(store.as_ref(), key))
         .unwrap_or_else(|e| panic!("DELETE fixture objects under {uri}: {e:#}"));
 }
 

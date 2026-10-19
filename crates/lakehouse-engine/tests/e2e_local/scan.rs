@@ -7,23 +7,23 @@ use crate::common::exasol_ws::ExaConn;
 use crate::common::seed::{
     ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT,
     DECIMAL_36_6_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT, DIM_CUSTOMER_ROWS, E2E_ALL_TYPES_TABLE,
-    E2E_BINARY_VALUES_TABLE, E2E_EVO_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_PART_TABLE,
-    E2E_TABLE, E2E_TABLE_2, EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE,
-    EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FLOAT32_VALUES_TEXT,
-    INT32_VALUES_TEXT, LINEITEM_ROWS, LINES_PER_ORDER, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS,
-    PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS,
-    SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
-    TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, initdef_columns, seed_added_columns_initial_default,
-    seed_renamed_column, typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev,
-    typed_id_avg_stddev,
+    E2E_BINARY_VALUES_TABLE, E2E_EVO_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2,
+    EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS,
+    EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FLOAT32_VALUES_TEXT, INT32_VALUES_TEXT,
+    LINEITEM_ROWS, LINES_PER_ORDER, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE,
+    PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15,
+    SEED_TOTAL_ROWS, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT, TYPED_COL_DECIMAL_A,
+    TYPED_COL_DECIMAL_B, initdef_columns, seed_added_columns_initial_default, seed_renamed_column,
+    typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev, typed_id_avg_stddev,
 };
 use crate::common::stack::{build_create_connection_sql, exasol_container, iceberg_catalog_url};
 use crate::common::timestamp_precision::{
     ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
 };
 use crate::fixtures::{
-    LAKEHOUSE_VS, events_table, explain_virtual_pushdown_sql, lakehouse_vs, runtime, typed_table,
-    vs_dim_table, vs_fact_table,
+    GROUND_TRUTH_LINEITEM_TABLE, LAKEHOUSE_VS, events_table, explain_virtual_pushdown_sql,
+    ground_truth_lineitem, lakehouse_vs, typed_table, vs_dim_table, vs_fact_table,
+    vs_lineitem_table,
 };
 
 use lakehouse_catalog::CatalogSession;
@@ -35,10 +35,6 @@ const CPU_PROBE_VS_NAME: &str = "LHVS_CPU_PROBE";
 
 fn vs_labels_table() -> String {
     format!("{LAKEHOUSE_VS}.{}", E2E_TABLE_2.to_uppercase())
-}
-
-fn vs_lineitem_table() -> String {
-    format!("{LAKEHOUSE_VS}.{}", E2E_LINEITEM_TABLE.to_uppercase())
 }
 
 #[test]
@@ -2284,17 +2280,6 @@ fn test_high_cardinality_multi_key_group_by_spill() {
 // Single-table scalar-over-aggregate GROUP BY (#82), checked against a native
 // ground-truth table built from the same `fact_lineitem` columns.
 
-/// Named distinctly from `e2e_join_test.rs`'s ground-truth table to keep fixtures unambiguous.
-const GROUND_TRUTH_LINEITEM_SCAN_TABLE: &str = "GROUND_TRUTH_LINEITEM_SCAN";
-
-fn ensure_ground_truth_lineitem_table(conn: &mut ExaConn) {
-    conn.execute(&format!(
-        "CREATE OR REPLACE TABLE {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_SCAN_TABLE} AS \
-         SELECT L_RETURNFLAG, L_QUANTITY, L_EXTENDEDPRICE FROM {}",
-        vs_lineitem_table()
-    ));
-}
-
 fn scalar_over_aggregate_round_select_list() -> &'static str {
     "L_RETURNFLAG, SUM(L_QUANTITY), AVG(L_EXTENDEDPRICE), \
      ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END)/COUNT(*), 2)"
@@ -2339,9 +2324,9 @@ fn test_group_by_scalar_over_aggregate_round() {
         "GROUP BY L_RETURNFLAG must return exactly 2 groups (R, N): {actual:?}"
     );
 
-    ensure_ground_truth_lineitem_table(&mut conn);
+    ground_truth_lineitem();
     let ground_truth_sql = format!(
-        "SELECT {} FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_SCAN_TABLE} \
+        "SELECT {} FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE} \
          GROUP BY L_RETURNFLAG ORDER BY L_RETURNFLAG",
         scalar_over_aggregate_round_select_list()
     );
@@ -2429,11 +2414,11 @@ fn test_group_by_shared_inner_aggregate_dedup() {
         "total COUNT(*) across both groups must be {LINEITEM_ROWS}, got {total_count}"
     );
 
-    ensure_ground_truth_lineitem_table(&mut conn);
+    ground_truth_lineitem();
     let ground_truth_sql = format!(
         "SELECT L_RETURNFLAG, COUNT(*), \
          ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END)/COUNT(*), 2) \
-         FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_SCAN_TABLE} \
+         FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE} \
          GROUP BY L_RETURNFLAG ORDER BY L_RETURNFLAG"
     );
     let expected = conn.query_columns(&ground_truth_sql);
@@ -2637,10 +2622,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
     let storage = local_stack_storage();
     let creds = local_stack_creds();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime for file-count pruning test");
+    let rt = runtime();
 
     // One session reused across the pruning calls, mirroring the single-session-per-query
     // contract of the format-reader seam.

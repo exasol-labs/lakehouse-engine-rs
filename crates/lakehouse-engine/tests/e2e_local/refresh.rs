@@ -9,7 +9,7 @@ use crate::common::stack::{
     CatalogConnectionPassword, build_create_connection_sql, iceberg_catalog_url,
     iceberg_catalog_url_internal, local_stack_connection_password,
 };
-use crate::fixtures::{runtime, stack, vs_table};
+use crate::fixtures::{stack, vs_table};
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};

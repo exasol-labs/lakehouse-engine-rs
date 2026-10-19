@@ -11,7 +11,7 @@ use crate::common::type_promotion_fixtures::{
     INT_LONG_COLUMN, INT_LONG_PRE_PROMOTION_PHYSICAL_TYPE, NAMESPACE, POST_PROMOTION_ROWS,
     PRE_PROMOTION_ROWS, TypePromotionRow,
 };
-use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, runtime, stack, vs_table};
+use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, stack, vs_table};
 
 use parquet::basic::ConvertedType;
 use parquet::file::reader::{FileReader, SerializedFileReader};

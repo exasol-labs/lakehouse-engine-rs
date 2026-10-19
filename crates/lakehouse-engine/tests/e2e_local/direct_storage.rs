@@ -24,7 +24,7 @@ use crate::common::seed::{
     time64_values,
 };
 use crate::common::stack::{CatalogConnectionPassword, seaweedfs_url_internal};
-use crate::fixtures::{stack, vs_table};
+use crate::fixtures::{direct_storage_vss, vs_table};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
@@ -45,33 +45,33 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde_json::Value as Json;
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
-const BASE_DIRECT: &str = "s3://warehouse/direct/";
+pub(crate) const BASE_DIRECT: &str = "s3://warehouse/direct/";
 const BASE_INCOMPATIBLE: &str = "s3://warehouse/direct_incompatible/";
-const BASE_DISCOVERY: &str = "s3://warehouse/direct_discovery/";
+pub(crate) const BASE_DISCOVERY: &str = "s3://warehouse/direct_discovery/";
 const BASE_COLLISION_MISSING: &str = "s3://warehouse/direct_hive_collision_missing/";
 const BASE_REFRESH: &str = "s3://warehouse/direct_refresh/";
 
-const VS_DIRECT: &str = "DIRECT_LAKEHOUSE";
-const VS_DIRECT_NARROW: &str = "DIRECT_LAKEHOUSE_NARROW";
-const VS_HIVE_OFF: &str = "DIRECT_HIVE_OFF";
+pub(crate) const VS_DIRECT: &str = "DIRECT_LAKEHOUSE";
+pub(crate) const VS_DIRECT_NARROW: &str = "DIRECT_LAKEHOUSE_NARROW";
+pub(crate) const VS_HIVE_OFF: &str = "DIRECT_HIVE_OFF";
 const VS_INCOMPATIBLE: &str = "DIRECT_INCOMPATIBLE_VS";
-const VS_DISCOVERY: &str = "DIRECT_DISCOVERY_VS";
-const VS_DISCOVERY_NS: &str = "DIRECT_DISCOVERY_NS_VS";
-const VS_DISCOVERY_EMPTY_NS: &str = "DIRECT_DISCOVERY_EMPTY_NS_VS";
+pub(crate) const VS_DISCOVERY: &str = "DIRECT_DISCOVERY_VS";
+pub(crate) const VS_DISCOVERY_NS: &str = "DIRECT_DISCOVERY_NS_VS";
+pub(crate) const VS_DISCOVERY_EMPTY_NS: &str = "DIRECT_DISCOVERY_EMPTY_NS_VS";
 const VS_COLLISION_MISSING: &str = "DIRECT_HIVE_COLLISION_MISSING";
 const VS_COLLISION_MISSING_HIVE_OFF: &str = "DIRECT_HIVE_COLLISION_MISSING_OFF";
 const VS_REFRESH: &str = "DIRECT_REFRESH_VS";
 
-const CONN_DIRECT: &str = "DIRECT_STORAGE_CREDS";
+pub(crate) const CONN_DIRECT: &str = "DIRECT_STORAGE_CREDS";
 const CONN_INCOMPATIBLE: &str = "DIRECT_STORAGE_INCOMPATIBLE_CREDS";
-const CONN_DISCOVERY: &str = "DIRECT_STORAGE_DISCOVERY_CREDS";
+pub(crate) const CONN_DISCOVERY: &str = "DIRECT_STORAGE_DISCOVERY_CREDS";
 const CONN_COLLISION_MISSING: &str = "DIRECT_STORAGE_COLLISION_MISSING_CREDS";
 const CONN_REFRESH: &str = "DIRECT_STORAGE_REFRESH_CREDS";
 
 /// No `warehouse`: the direct-storage kind rejects that field.
-fn direct_storage_password() -> CatalogConnectionPassword {
+pub(crate) fn direct_storage_password() -> CatalogConnectionPassword {
     CatalogConnectionPassword {
         endpoint: seaweedfs_url_internal(),
         region: "us-east-1".to_string(),
@@ -82,13 +82,13 @@ fn direct_storage_password() -> CatalogConnectionPassword {
     }
 }
 
-fn direct_vs<'a>(vs_name: &'a str, conn_name: &'a str) -> VsProps<'a> {
+pub(crate) fn direct_vs<'a>(vs_name: &'a str, conn_name: &'a str) -> VsProps<'a> {
     VsProps::new(vs_name, "")
         .with_catalog_kind("DIRECT_STORAGE")
         .with_catalog_conn_name(conn_name)
 }
 
-fn create_direct_vs(conn: &mut ExaConn, vs_name: &str, conn_name: &str, base: &str) {
+pub(crate) fn create_direct_vs(conn: &mut ExaConn, vs_name: &str, conn_name: &str, base: &str) {
     create_virtual_schema_with_password(
         conn,
         &direct_vs(vs_name, conn_name),
@@ -119,54 +119,6 @@ fn assert_mentions(msg: &str, needles: &[&str]) {
     for needle in needles {
         assert!(msg.contains(needle), "error must mention {needle:?}: {msg}");
     }
-}
-
-static SETUP_DONE: OnceLock<()> = OnceLock::new();
-
-fn setup() {
-    SETUP_DONE.get_or_init(|| {
-        stack();
-        write_all_fixtures();
-
-        let mut conn = exa_conn();
-
-        create_virtual_schema_with_password(
-            &mut conn,
-            &VsProps::new(VS_DIRECT, "").with_catalog_kind("DIRECT_STORAGE"),
-            BASE_DIRECT,
-            &direct_storage_password(),
-        );
-        create_virtual_schema_with_password(
-            &mut conn,
-            &direct_vs(VS_DIRECT_NARROW, CONN_DIRECT).with_merge_schema("FALSE"),
-            BASE_DIRECT,
-            &direct_storage_password(),
-        );
-        create_virtual_schema_with_password(
-            &mut conn,
-            &direct_vs(VS_HIVE_OFF, CONN_DIRECT).with_hive_partitioning("FALSE"),
-            BASE_DIRECT,
-            &direct_storage_password(),
-        );
-
-        create_direct_vs(&mut conn, VS_DISCOVERY, CONN_DISCOVERY, BASE_DISCOVERY);
-        create_virtual_schema_with_password(
-            &mut conn,
-            &VsProps::new(VS_DISCOVERY_NS, "sub")
-                .with_catalog_kind("DIRECT_STORAGE")
-                .with_catalog_conn_name(CONN_DISCOVERY),
-            BASE_DISCOVERY,
-            &direct_storage_password(),
-        );
-        create_virtual_schema_with_password(
-            &mut conn,
-            &VsProps::new(VS_DISCOVERY_EMPTY_NS, "nonexistent_ns")
-                .with_catalog_kind("DIRECT_STORAGE")
-                .with_catalog_conn_name(CONN_DISCOVERY),
-            BASE_DISCOVERY,
-            &direct_storage_password(),
-        );
-    });
 }
 
 fn events_schema() -> Arc<Schema> {
@@ -817,7 +769,7 @@ fn write_delta_caveat_fixture() {
     );
 }
 
-fn write_all_fixtures() {
+pub(crate) fn write_all_fixtures() {
     write_parquet_fixture(
         &format!("{BASE_DIRECT}events/file1.parquet"),
         events_batch(&[1, 2, 3]),
@@ -1016,7 +968,7 @@ fn declared_columns(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<Strin
 
 #[test]
 fn raw_parquet_fixtures_are_physically_the_types_they_declare() {
-    setup();
+    direct_storage_vss();
 
     let bytes = get_fixture_object(&format!("{BASE_DIRECT}events/file1.parquet"));
     let reader = SerializedFileReader::new(bytes).expect("open committed raw-Parquet fixture file");
@@ -1041,7 +993,7 @@ fn raw_parquet_fixtures_are_physically_the_types_they_declare() {
 
 #[test]
 fn events_directory_declares_and_returns_mixed_types_across_both_files() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     for (column, expected) in [
@@ -1090,7 +1042,7 @@ fn events_directory_declares_and_returns_mixed_types_across_both_files() {
 
 #[test]
 fn nested_directory_unions_subdirectory_files_with_zero_partition_columns() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let column_count = conn.query_columns(&format!(
@@ -1115,7 +1067,7 @@ fn nested_directory_unions_subdirectory_files_with_zero_partition_columns() {
 
 #[test]
 fn complex_directory_declares_varchar_and_returns_parseable_json() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     for column in ["TAGS", "ADDRESS", "ATTRS"] {
@@ -1170,7 +1122,7 @@ fn complex_directory_declares_varchar_and_returns_parseable_json() {
 /// Scenario: The listing declares a binary column
 #[test]
 fn all_types_directories_declare_and_return_their_mapped_values() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let binary: &[&str] = &["type 'binary'", "#351"];
@@ -1278,7 +1230,7 @@ fn all_types_directories_declare_and_return_their_mapped_values() {
 
 #[test]
 fn loose_file_and_empty_directory_serve_no_table() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
     let tables = served_tables(&mut conn, VS_DIRECT);
     assert!(!tables.contains(&"LOOSE".to_string()));
@@ -1288,7 +1240,7 @@ fn loose_file_and_empty_directory_serve_no_table() {
 
 #[test]
 fn widened_columns_declare_the_wider_type_and_every_row_reads_back() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     assert_eq!(
@@ -1315,7 +1267,7 @@ fn widened_columns_declare_the_wider_type_and_every_row_reads_back() {
 
 #[test]
 fn missing_column_declares_the_union_and_nulls_the_absent_column() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let cols = conn.query_columns(&format!(
@@ -1334,7 +1286,7 @@ fn missing_column_declares_the_union_and_nulls_the_absent_column() {
 
 #[test]
 fn incompatible_pair_fails_create_naming_column_and_files() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let resp = try_create_direct_vs(
@@ -1353,7 +1305,7 @@ fn incompatible_pair_fails_create_naming_column_and_files() {
 
 #[test]
 fn merge_schema_false_declares_the_narrow_sampled_type_and_refuses_a_wider_file_column() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     assert_eq!(
@@ -1400,7 +1352,7 @@ fn merge_schema_false_declares_the_narrow_sampled_type_and_refuses_a_wider_file_
 
 #[test]
 fn delta_directory_read_as_raw_parquet_returns_tombstoned_rows() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let cols = conn.query_columns(&format!(
@@ -1418,7 +1370,7 @@ fn delta_directory_read_as_raw_parquet_returns_tombstoned_rows() {
 
 #[test]
 fn discovery_scopes_to_first_level_directories_and_namespace_narrows_to_a_subtree() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let tables = served_tables(&mut conn, VS_DISCOVERY);
@@ -1460,7 +1412,7 @@ fn discovery_scopes_to_first_level_directories_and_namespace_narrows_to_a_subtre
 
 #[test]
 fn malformed_connections_are_rejected_at_create_virtual_schema() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let s3_secret = "SUPER_SECRET_S3_KEY";
@@ -1565,7 +1517,7 @@ fn malformed_connections_are_rejected_at_create_virtual_schema() {
 
 #[test]
 fn projection_filter_and_limit_reach_the_scan() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -1596,7 +1548,7 @@ fn projection_filter_and_limit_reach_the_scan() {
 
 #[test]
 fn group_by_aggregate_matches_the_unpushed_answer() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let table = vs_table(VS_DIRECT, "EVENTS");
@@ -1682,7 +1634,7 @@ const STAT_SELECT: &str = "VAR_POP(B), STDDEV(B), VAR_SAMP(I), STDDEV_POP(I), VA
 /// Scenario: Statistical aggregates match native Exasol where the values are large, constant, or single
 #[test]
 fn stat_aggregates_match_native_exasol() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
     create_stats_oracles(&mut conn);
 
@@ -1807,7 +1759,7 @@ fn assert_same_as_native(conn: &mut ExaConn, template: &str, overflows: bool) {
 /// Scenario: A fractional numeric literal compares exactly
 #[test]
 fn numeric_expressions_match_native_exasol() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
     create_stats_oracles(&mut conn);
 
@@ -1903,7 +1855,7 @@ fn first_emitted_column(pushed_sql: &str) -> String {
 /// Scenario: A DATE value outside Exasol's DATE range fails the query
 #[test]
 fn out_of_range_date_fails_the_query_on_every_emit_path() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
     let table = vs_table(VS_DIRECT, "DATE_RANGE");
 
@@ -1980,7 +1932,7 @@ fn out_of_range_date_fails_the_query_on_every_emit_path() {
 
 #[test]
 fn two_table_join_matches_the_unpushed_answer_in_one_request() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let events_table = vs_table(VS_DIRECT, "EVENTS");
@@ -2043,7 +1995,7 @@ fn sorted_int_column(cells: &[Json]) -> Vec<i64> {
 /// Scenario: A key=value directory segment declares a VARCHAR partition column
 #[test]
 fn hive_segments_declare_varchar_partition_columns_with_decoded_values() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     assert_eq!(
@@ -2097,7 +2049,7 @@ fn hive_segments_declare_varchar_partition_columns_with_decoded_values() {
 /// Scenario: A table's partition columns are the union of its files' keys
 #[test]
 fn mixed_layout_unions_partition_keys_and_nulls_the_missing_key() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     assert_eq!(
@@ -2135,7 +2087,7 @@ fn mixed_layout_unions_partition_keys_and_nulls_the_missing_key() {
 
 #[test]
 fn partition_key_colliding_with_a_parquet_column_overrides_it() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     assert_eq!(
@@ -2173,7 +2125,7 @@ fn partition_key_colliding_with_a_parquet_column_overrides_it() {
 
 #[test]
 fn partition_key_collision_with_a_missing_segment_fails_the_refresh() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let resp = try_create_direct_vs(
@@ -2220,7 +2172,7 @@ fn partition_key_collision_with_a_missing_segment_fails_the_refresh() {
 
 #[test]
 fn hive_partitioning_false_declares_no_partition_columns() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let expected: [(&str, &[&str]); 4] = [
@@ -2245,7 +2197,7 @@ fn hive_partitioning_false_declares_no_partition_columns() {
 
 #[test]
 fn partition_filter_prunes_the_resolved_file_list() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     for predicate in ["\"YEAR\" = '2026'", "\"YEAR\" > '2025'"] {
@@ -2272,7 +2224,7 @@ fn partition_filter_prunes_the_resolved_file_list() {
 
 #[test]
 fn a_column_only_pruned_files_carry_reads_null() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -2328,7 +2280,7 @@ fn returned_regions(conn: &mut ExaConn, predicate: &str) -> BTreeSet<String> {
 
 #[test]
 fn range_pruning_matches_exasols_native_varchar_ordering() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let templates = [
@@ -2385,7 +2337,7 @@ fn range_pruning_matches_exasols_native_varchar_ordering() {
 
 #[test]
 fn zero_matching_files_prune_to_zero_rows_without_error() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let sql = format!(
@@ -2424,7 +2376,7 @@ const CONN_NOTES: &str = "DIRECT_STORAGE_COLUMN_NOTES_CREDS";
 /// Scenario: Every declared column carries its source shape in its adapterNotes
 #[test]
 fn direct_storage_columns_persist_source_notes() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let notes = column_adapter_notes(&mut conn, VS_DIRECT, "SALES");
@@ -2464,7 +2416,7 @@ fn direct_storage_columns_persist_source_notes() {
 /// Scenario: A partition column's note carries its position among the partition columns
 #[test]
 fn partition_column_notes_carry_their_position() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     let notes = column_adapter_notes(&mut conn, VS_DIRECT, "SALES");
@@ -2483,7 +2435,7 @@ fn partition_column_notes_carry_their_position() {
 /// Scenario: A refused column's note records its refusal and the column stays declared
 #[test]
 fn direct_storage_binary_column_note_records_the_refusal() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     for (table, refused) in [
@@ -2516,7 +2468,7 @@ fn dimension_batch(id: i64) -> RecordBatch {
 /// Scenario: Pushdown takes the declared schema from the column notes for every kind
 #[test]
 fn pushdown_plans_from_column_notes_without_reading_a_footer() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
     let kept_2025 = format!("{BASE_NOTES}sales/year=2025/p1.parquet");
     let pruned_2026 = format!("{BASE_NOTES}sales/year=2026/p2.parquet");
@@ -2578,7 +2530,7 @@ fn drift_batch(id: i64, n: ArrayRef, extra: Option<i32>) -> RecordBatch {
 /// Scenario: A source change after the last REFRESH plans against the declaration
 #[test]
 fn source_change_after_refresh_plans_against_the_declaration() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
     let drifted = format!("{BASE_DRIFT}drift/p2.parquet");
     delete_fixture_object(&drifted);
@@ -2638,7 +2590,7 @@ fn source_change_after_refresh_plans_against_the_declaration() {
 /// Scenario: Two spellings of one partition key fail the refresh and the query
 #[test]
 fn two_spellings_of_one_partition_key_fail_refresh_and_query() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     write_parquet_fixture(
@@ -2705,7 +2657,7 @@ fn two_spellings_of_one_partition_key_fail_refresh_and_query() {
 /// Scenario: A partition key matches its declared column across letter case
 #[test]
 fn partition_key_matches_its_declared_column_across_letter_case() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
     let years = [("2026", 1), ("2025", 2)];
     let uri = |key: &str, year: &str| format!("{BASE_KEY_CASE}ledger/{key}={year}/p.parquet");
@@ -2772,7 +2724,7 @@ fn over_limit_struct_batch() -> RecordBatch {
 /// Scenario: A column note longer than the per-column limit fails the statement
 #[test]
 fn over_limit_column_note_fails_create_and_refresh() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
     let wide = format!("{BASE_OVER_LIMIT}wide/p.parquet");
     delete_fixture_object(&wide);
@@ -2913,7 +2865,7 @@ fn assert_fails_naming(conn: &mut ExaConn, case: &str, sql: &str, fragments: &[&
 /// Scenario: A first-level directory holding no data file is skipped, not failed
 #[test]
 fn refresh_tracks_storage_changes_and_a_failed_refresh_keeps_the_schema() {
-    setup();
+    direct_storage_vss();
     let mut conn = exa_conn();
 
     delete_fixture_prefix(BASE_REFRESH);

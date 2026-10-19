@@ -7,7 +7,7 @@ use crate::common::seed::{
     NONASCII_VALUES, seed_non_ascii_identifier,
 };
 use crate::common::stack::iceberg_catalog_url;
-use crate::fixtures::{runtime, stack};
+use crate::fixtures::stack;
 
 const VS_NAME: &str = "STRASSE_VS";
 /// Full-Unicode `to_uppercase` expands `ß` to `SS` for both table and column.
