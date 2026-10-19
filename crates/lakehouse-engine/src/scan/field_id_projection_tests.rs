@@ -212,7 +212,7 @@ fn builds_logical_arrow_schema_with_field_ids() {
     assert_eq!(field_id_of(rating), Some(2));
 }
 
-/// Scenario: a logical field carrying no binding key binds by its own name.
+/// Scenario: A logical field carrying no binding key binds by its own name
 #[test]
 fn identity_bound_logical_field_carries_no_parquet_field_id_metadata() {
     use super::{build_logical_arrow_schema, field_id_of};
@@ -388,7 +388,7 @@ fn embedded_field_id_absent_from_logical_schema_skips_name_mapping() {
     );
 }
 
-/// Scenario: column projection binds by a logical field's declared physical name.
+/// Scenario: Column projection binds by a logical field's declared physical name
 #[test]
 fn declared_physical_name_wins_over_a_covering_name_mapping_entry() {
     // Name-mapping also reaches `other` (id 7) from `col-abc`; the declaration must win.
@@ -771,7 +771,7 @@ fn default_fill_decision_is_per_file() {
     );
 }
 
-/// Scenario: column projection binds by Iceberg field-id across physical layouts.
+/// Scenario: Column projection binds by Iceberg field-id across physical layouts
 #[tokio::test]
 async fn field_id_adapter_reads_renamed_column_rows() {
     use super::super::raw_scan::{build_scan_sql, register_files};

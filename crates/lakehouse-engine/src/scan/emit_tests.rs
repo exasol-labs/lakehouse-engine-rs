@@ -669,7 +669,7 @@ async fn emit_stream_coerces_columns_to_declared_exatypes_before_emit_batch() {
     assert_eq!(str_col.value(2), "event-03");
 }
 
-/// Scenario: a relaxed column crosses the emit boundary at its declared Exasol type.
+/// Scenario: A relaxed column crosses the emit boundary at its declared Exasol type
 #[test]
 fn a_relaxed_column_coerces_to_its_declared_exatype_without_a_relaxation_branch() {
     use arrow::array::{

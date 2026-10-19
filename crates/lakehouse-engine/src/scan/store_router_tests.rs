@@ -233,7 +233,7 @@ async fn a_deletion_vector_contributes_no_owned_path() {
     );
 }
 
-/// Scenario: delete-file relative and absolute paths resolve like data-file paths.
+/// Scenario: Delete-file relative and absolute paths resolve like data-file paths
 #[test]
 fn delete_file_paths_resolve_against_the_table_root_like_data_file_paths() {
     let rooted = [

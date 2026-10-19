@@ -375,7 +375,7 @@ fn reports_projection_filter_and_limit_capabilities() {
     assert_eq!(resp["type"].as_str().unwrap(), "getCapabilities");
 }
 
-/// Scenario: adapter advertises aggregate pushdown for supported functions.
+/// Scenario: Adapter advertises aggregate pushdown for supported functions
 #[test]
 fn reports_supported_aggregate_capabilities() {
     let resp = get_capabilities_response();

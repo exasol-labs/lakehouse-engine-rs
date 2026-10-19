@@ -278,7 +278,7 @@ async fn collect_rows(ctx: &SessionContext, spec: &ScanSpec) -> Vec<(i64, String
     rows
 }
 
-/// Scenario: scan emits a bounded local top-N when the spec carries an order-by
+/// Scenario: Scan emits a bounded local top-N when the spec carries an order-by
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn order_by_spec_emits_bounded_topk_not_global_sort() {
     // Both SortExec display forms contain "SortExec", so the check discriminates on
@@ -418,7 +418,7 @@ fn row_scan_spec() -> ScanSpec {
     }
 }
 
-/// Scenario: scan-driving query fans out via a nested distributor over a scalar scan UDF
+/// Scenario: Scan-driving query fans out via a nested distributor over a scalar scan UDF
 #[test]
 fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
     let proj = vec![ProjectionItem::Column("L_ORDERKEY".into())];
@@ -526,7 +526,7 @@ fn test_storage() -> StorageBackend {
     })
 }
 
-/// Scenario: broadcast-eligible inner equi-join is planned as a broadcast fan-out
+/// Scenario: Broadcast-eligible inner equi-join is planned as a broadcast fan-out
 #[test]
 fn broadcast_fact_side_uses_distributor_scalar_scan() {
     let join = JoinSpec {

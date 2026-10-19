@@ -352,7 +352,7 @@ fn leaf_chunk_facts(file_url: &str, row_group: usize, leaf_path: &str) -> LeafCh
     }
 }
 
-/// Scenario: a predicate over a rendered nested column is evaluated, never silently dropped
+/// Scenario: A predicate over a rendered nested column is evaluated, never silently dropped
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn predicate_over_a_rendered_nested_column_is_applied_not_dropped() {
     let dir = std::env::temp_dir().join(format!("lh_nested_pushdown_{}", std::process::id()));

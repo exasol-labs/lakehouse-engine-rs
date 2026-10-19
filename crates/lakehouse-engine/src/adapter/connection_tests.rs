@@ -736,7 +736,7 @@ fn new_auth_fields_default_to_none() {
     assert_eq!(creds.scope, None);
 }
 
-/// Scenario: static S3 credentials are optional regardless of catalog auth mode.
+/// Scenario: Static S3 credentials are optional regardless of catalog auth mode
 #[test]
 fn s3_fields_optional_when_not_sigv4() {
     let pw = serde_json::json!({ "warehouse": "wh" }).to_string();
@@ -947,7 +947,7 @@ fn oauth_client_creds_exposed_on_creds() {
     assert_eq!(creds2.scope.as_deref(), Some("catalog:read"));
 }
 
-/// Scenario: incomplete OAuth2 client credentials are rejected naming only the missing field.
+/// Scenario: Incomplete OAuth2 client credentials are rejected naming only the missing field
 #[test]
 fn incomplete_oauth_rejected_no_leak() {
     let pw = serde_json::json!({
@@ -1040,7 +1040,7 @@ fn token_with_complete_oauth_pair_is_rejected_under_both_kinds() {
     );
 }
 
-/// Scenario: catalog token/OAuth auth and SigV4 are mutually exclusive.
+/// Scenario: Catalog token/OAuth auth and SigV4 are mutually exclusive
 #[test]
 fn sigv4_and_catalog_auth_mutually_exclusive() {
     let pw_sigv4_token = serde_json::json!({

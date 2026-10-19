@@ -129,7 +129,7 @@ fn delete_path_read_limiter_clamps_zero_connections_to_one() {
     assert_eq!(delete_path_read_limiter(&spec).available_permits(), 1);
 }
 
-/// Scenario: scan without a logical schema falls back to first-file inference.
+/// Scenario: Scan without a logical schema falls back to first-file inference
 #[tokio::test]
 async fn register_files_falls_back_without_logical_schema() {
     use arrow::array::Int64Array;
@@ -304,7 +304,7 @@ async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter(
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: ordered top-N preserves descending and NULL ordering.
+/// Scenario: Scan emits a bounded local top-N when the spec carries an order-by
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ordered_scan_sql_preserves_desc_and_null_placement() {
     use crate::scan::spec::SortKey;
@@ -522,7 +522,7 @@ async fn build_scan_sql_disambiguates_column_and_cast_of_same_column() {
     );
 }
 
-/// Scenario: a Delta type Exasol cannot represent natively is surfaced as a VARCHAR rendering.
+/// Scenario: A Delta type Exasol cannot represent natively is surfaced as a VARCHAR rendering
 #[tokio::test]
 async fn a_list_column_tagged_utf8_is_json_rendered_by_the_field_id_expression_adapter() {
     use crate::scan::spec::LogicalField;
