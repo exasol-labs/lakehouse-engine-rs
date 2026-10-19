@@ -46,7 +46,7 @@ The scan UDF takes two arguments, a shard-invariant common-spec JSON blob (arg 0
 * *AND* `from_parts_json` over the two arguments SHALL reconstitute a `ScanSpec` value equal to the one the two-argument contract produces for the same shard, with the storage backend in place of the bare storage props
 * *AND* `files` SHALL remain the sole per-shard field, now guaranteed structurally by the single embedded common value rather than by a field-by-field copy
 
-### Scenario: A file-list argument that predates the delete encoding still reconstitutes
+### Scenario: A file-list entry without delete references reconstitutes as a delete-free data file
 
 * *GIVEN* a scan invocation whose second argument holds legacy file entries that carry a path and byte size but NO delete-file references (a spec that predates positional-delete support)
 * *WHEN* the scan UDF parses its two input arguments

@@ -8,7 +8,6 @@
 * Count, CountCol, Sum, Min, and Max contribute 1 column. Avg contributes 2 (sum, then count). The STDDEV/VARIANCE family contributes 3 (cnt, mean, m2).
 * `AggKind` lives in `scan/spec.rs`, which both the scan and the adapter already import. `scan/spec.rs` imports only `serde` and must not depend on `exasol_udf_sdk`, so the descriptor expresses an empty shard's value as a boolean counter property and the emit site maps it to `Value::Int64(0)` or `Value::Null`.
 * `empty_agg_literal` and `validate_agg_col_types` match on `AggKind` for other questions and are not part of the contract.
-* `dispatch_golden_tests.rs` asserts full-string equality against committed fixtures under `testdata/dispatch_golden/`. Its `single_group_all_agg_kinds` and `grouped_all_agg_kinds` fixtures cover every aggregate kind, including AVG and the statistical family.
 
 ## Scenarios
 
@@ -39,16 +38,6 @@
 * *AND* the rendered SQL for a bare-column statistical aggregate SHALL quote the column identifier, because `agg_arg_sql` returns `quote_ident(column)` for a plan with no `arg_expr`
 * *AND* routing through `agg_arg_sql` SHALL NOT be treated as making expression-argument statistical aggregates work: a plan with neither column nor expression is declined upstream per `pushdown-aggregates/pushdown-planning-aggregate-extensions`, so it never reaches the scan
 
-### Scenario: Generated SQL, EMITS clauses, and partial rows are byte-identical across the refactor
-
-* *GIVEN* committed golden baselines captured through the production seams for every arity the contract admits, the single-column kinds, `AVG`'s two-column pair, and the statistical family's three-column triple, in both the single-group and the grouped shape
-* *WHEN* the same requests and specs are rendered
-* *THEN* the scan's partial-aggregate DataFusion SQL, the grouped partial-aggregate DataFusion SQL, the `EMITS` clause, and the outer merge SELECT MUST each equal the baseline, asserted by full-string equality and NEVER by `.contains(...)`
-* *AND* the emitted partial row for a non-empty shard and the fallback row for an empty single-group shard MUST carry, for every `AggKind`, the values, order, and lengths the descriptor prescribes
-* *AND* the baselines SHALL include the AVG and statistical arities, because a baseline set without them would pass a change that shifted a multi-column aggregate's values
-* *AND* the partial-aggregate unit tests (`partial_agg_sql_stat_emits_cnt_mean_m2`, `stat_aggregate_null_fallback_row_has_three_values`, `stat_aggregate_index_follows_plan_order`, `partial_agg_sql_avg_emits_sum_count_pair`, `partial_agg_sql_mixed_column_order_and_indices`, `partial_sql_uses_rendered_expression_argument`, and `stat_aggregate_emits_three_partial_columns`) SHALL assert LITERAL column names and arities
-* *AND* those tests MUST NOT read `partial_columns()` or the shared name function for their expectations, because a test that derives its expectation from the code under test asserts the descriptor against itself and would pass any consistent renaming
-
 ### Scenario: One in-crate test pins the scan-to-adapter column alignment per aggregate kind
 
 * *GIVEN* that the scan's SELECT list and the adapter's `EMITS` clause are produced in two different modules and validated against each other only at query time inside Exasol, where a mismatch surfaces as a wrong value or an `EMITS` arity error rather than as a test failure
@@ -56,3 +45,10 @@
 * *THEN* ONE test SHALL assert, for EVERY `AggKind` variant, that the scan's partial SELECT list and the adapter's `EMITS` item list contain the same number of columns in the same `PARTIAL_*` order
 * *AND* that test SHALL reach both sides through the visibility that already exists, `crate::scan::build_partial_agg_sql` is re-exported under `#[cfg(test)]` in `scan/mod.rs` and `partial_emits_items` is `pub(super)` in `adapter::pushdown::grouped_agg`, so it SHALL be declared inside the crate, and NO production item's visibility SHALL widen and NO `#[cfg(test)]`-only export SHALL be added to enable it
 * *AND* the test SHALL enumerate the `AggKind` variants it covers as an explicit literal list, and a variant added later that the list omits SHALL be caught by the compile error `partial_columns` raises rather than by this test, so the test asserts alignment and never doubles as an exhaustiveness check it cannot enforce
+
+### Scenario: Partial-aggregate unit tests assert literal column names
+
+* *GIVEN* the partial-aggregate unit tests (`partial_agg_sql_stat_emits_cnt_mean_m2`, `stat_aggregate_null_fallback_row_has_three_values`, `stat_aggregate_index_follows_plan_order`, `partial_agg_sql_avg_emits_sum_count_pair`, `partial_agg_sql_mixed_column_order_and_indices`, `partial_sql_uses_rendered_expression_argument`, `stat_aggregate_emits_three_partial_columns`)
+* *WHEN* a test states its expected partial columns
+* *THEN* it SHALL assert literal column names and arities
+* *AND* it MUST NOT read `partial_columns()` or the shared name function for its expectation, because a test that derives its expectation from the code under test passes any consistent renaming

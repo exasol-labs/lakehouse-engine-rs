@@ -80,18 +80,7 @@ A `StorageBackend` enum names the storage backend, so other modules ask the enum
 * *AND* the label-based redaction SHALL additionally cover the exact literal `"sas":`, the serialized `AdlsCred::Sas` wire key, and MUST NOT be given a bare `sas` pattern, because the matcher redacts from a matched label to the next delimiter and would destroy unrelated text
 * *AND* every production site that composes the two redaction passes SHALL apply the VALUE pass before the LABEL pass, the order this crate's own redaction module documents as required for a SAS token, so no site keeps the inverted composition
 
-### Scenario: S3 behavior is unchanged across the refactor
-
-* *GIVEN* the unit, integration, and S3 E2E suites
-* *WHEN* the suites run
-* *THEN* every test MUST pass, and no S3 assertion MUST be weakened, disabled, or deleted to accommodate the `StorageBackend` type
-* *AND* the catalog request URLs, the header set on each request, the OAuth2 grant request body, and the props map `build_rest_catalog` builds MUST NOT depend on the storage backend variant, on every auth mode
-* *AND* the file list resolved for a given table and the vended-versus-static storage resolved from a given `loadTable` response MUST NOT depend on the Azure variant
-* *AND* the scan-driving SQL generated for a given pushdown request SHALL differ by backend only in the `storage` VALUE, which `storage-access/scan-spec-credential-reference` sets to a connection reference or a sealed envelope
-* *AND* `make test-e2e` MUST pass against a `.so` built from the current source, because the S3 E2E suite is this feature's declared characterization gate and a stale `.so` would make that gate vacuous
-* *AND* no storage credential, catalog secret, or live bearer token SHALL appear in any returned SQL string or error message, and no VENDED STS key SHALL appear there in PLAINTEXT, because a vended key travels only inside the AES-GCM-sealed envelope of `storage-access/scan-spec-credential-reference`
-
-### Scenario: Adding the Azure backend leaves the S3 path unchanged
+### Scenario: The S3 path stays independent of the Azure backend variant
 
 * *GIVEN* the unit, integration, and S3 E2E suites
 * *WHEN* the S3 path runs beside the Azure variant, its three enum arms, its object-store arm, and the whole-spec store precondition

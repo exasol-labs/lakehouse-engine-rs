@@ -1,10 +1,9 @@
 # Feature: Pushdown Module Structure
 
-Decomposes the virtual-schema pushdown-planning code into single-responsibility submodules behind a frozen public façade. Behavior stays byte-identical, and each submodule owns its tests. `pushdown/pushdown-module-dedup-consolidation` tracks the shared helpers extracted from the duplicated code.
+Decomposes the virtual-schema pushdown-planning code into single-responsibility submodules behind a frozen public façade. Each submodule owns its tests. `pushdown/pushdown-module-dedup-consolidation` tracks the shared helpers extracted from the duplicated code.
 
 ## Background
 
-* The decomposition changes code organization only, so it changes no query, pushdown, file-pruning or type-handling behavior.
 * `crate::adapter::pushdown` is a directory module (`pushdown/mod.rs` plus sibling files). The import path `crate::adapter::pushdown::<name>` stays the same for every consumer. The set of capability submodules is a design decision, not a contract.
 * Two compile-time probes freeze the façade: `crates/lakehouse-engine/src/adapter/pushdown_surface_probe_tests.rs` from an in-crate vantage, and `crates/lakehouse-engine/tests/pushdown_public_surface.rs` from an external vantage that names the externally `pub` items. Each probe's `use` list is the baseline, and its doc comment states the item count. The build fails on any unplanned narrowing. A change to the item set or the counts needs a spec delta against this feature.
 * A signature change on a façade item is not a surface change.
@@ -14,7 +13,7 @@ Decomposes the virtual-schema pushdown-planning code into single-responsibility 
 
 ## Scenarios
 
-### Scenario: Public pushdown façade resolves at every pre-refactor path
+### Scenario: The public pushdown façade matches the item sets of both surface probes
 
 * *GIVEN* a `name → visibility` snapshot of every symbol reachable via `crate::adapter::pushdown::<name>`
 * *WHEN* the same extraction re-runs against the `pushdown/mod.rs` façade and all in-repo consumers compile
@@ -22,20 +21,13 @@ Decomposes the virtual-schema pushdown-planning code into single-responsibility 
 * *AND* every path `crate::adapter::pushdown::<name>` MUST resolve to the same item at the same external visibility (`pub` or `pub(crate)`) for the `adapter`, `scan`, and `capabilities` consumers
 * *AND* a `#[cfg(test)]` reachability probe naming every remaining `pub` and `pub(crate)` item from outside the `pushdown` module MUST compile, so an effective narrowing masked by a re-export is a compile error
 
-### Scenario: The pushdown façade releases exactly the three items the catalog extraction relocates
+### Scenario: The pushdown façade carries no catalog access items and no re-export of the catalog crate's types
 
 * *GIVEN* the façade baseline asserted by two compile-time probes: `src/adapter/pushdown_surface_probe_tests.rs` naming 27 items from an in-crate vantage and `tests/pushdown_public_surface.rs` naming the 17 externally-`pub` items
 * *WHEN* the catalog access layer lives in the `lakehouse-catalog` crate
 * *THEN* `extract_vended_keys`, `merge_vended_into_storage`, and `list_namespace_tables` SHALL NOT be on the façade, because the vended mechanism is `lakehouse_catalog::resolve_vended_storage` and the namespace listing is internal to `lakehouse-catalog`
 * *AND* `resolve_vended_storage` and `CatalogSession` MUST NOT be re-exported at `crate::adapter::pushdown::`, because external callers name them on the crate that declares them and a second path would be a redundant alias
 * *AND* both probe doc comments SHALL state that the probe's own `use` list IS the baseline and the item count, and the `lakehouse-catalog` crate SHALL carry its own external-vantage probe (`catalog/catalog-crate-structure` owns its contents)
-
-### Scenario: Behavior is unchanged across the refactor
-
-* *GIVEN* the unit and integration test suites for the pushdown planning layer
-* *WHEN* the suites run against the decomposed code
-* *THEN* every test MUST pass with no change to any test assertion or expected value, EXCEPT the scan spec's `storage` value wherever an assertion embeds one
-* *AND* the scan-driving SQL generated for a given pushdown request MUST be byte-identical to the output of the undecomposed module EXCEPT for that `storage` VALUE, which `storage-access/scan-spec-credential-reference` encodes as a connection reference carrying no credential or as a sealed envelope over the backend's own encoding, and the backend's own encoding stays byte-identical either way, per `storage-access/storage-backend-enum`
 
 ### Scenario: Each pushdown submodule owns its tests
 
@@ -45,7 +37,7 @@ Decomposes the virtual-schema pushdown-planning code into single-responsibility 
 * *AND* no single central pushdown test module SHALL remain
 * *AND* a test helper shared across submodules MUST live in one shared `#[cfg(test)]` support module rather than being duplicated
 
-### Scenario: The pushdown façade drops resolve_table_schema when the shared catalog-client pipeline replaces its only caller
+### Scenario: The pushdown façade carries no resolve_table_schema because the shared catalog-client pipeline declares columns
 
 * *GIVEN* the façade baseline asserted by two compile-time probes: `src/adapter/pushdown_surface_probe_tests.rs` naming 27 items from an in-crate vantage and `tests/pushdown_public_surface.rs` naming 17 externally-`pub` items
 * *WHEN* the shared `CatalogClient` listing pipeline declares each table's columns at `createVirtualSchema`
@@ -61,7 +53,7 @@ Decomposes the virtual-schema pushdown-planning code into single-responsibility 
 * *AND* both concrete format readers, the Iceberg one and the Delta one, SHALL stay private to the `format` submodule and SHALL appear on NEITHER probe, because the selection function returns a boxed trait object and a caller that could name a reader type could bypass the selection this seam exists to centralize
 * *AND* each submodule of `format` MUST carry its own sibling `_tests.rs` covering only that submodule's own items, per this feature's per-submodule test rule
 
-### Scenario: Collapsing the Iceberg file resolver removes exactly one item from the pushdown façade
+### Scenario: The pushdown façade carries no separate Iceberg file-resolution function
 
 * *GIVEN* the façade baseline asserted by two compile-time probes: the in-crate probe naming 27 items and the external-vantage probe `tests/pushdown_public_surface.rs` naming 17
 * *WHEN* `file-planning/pushdown-format-neutral-resolution` routes every production and test caller through the format-reader seam and the Iceberg reader holds the resolver's body
@@ -85,7 +77,7 @@ Decomposes the virtual-schema pushdown-planning code into single-responsibility 
 * *AND* both probe doc comments SHALL state the counts, 27 and 17
 * *AND* the type's fields SHALL be private, constructed only through a fallible constructor that refuses an empty merge SELECT, so the malformed `SELECT  FROM (...)` an empty one would render is unrepresentable rather than documented
 
-### Scenario: The column declaration entry point replaces the Iceberg logical-schema builder on the pushdown façade
+### Scenario: The pushdown façade carries the column declaration entry point and no Iceberg logical-schema builder
 
 * *GIVEN* the façade baseline asserted by two compile-time probes: `src/adapter/pushdown_surface_probe_tests.rs` naming 27 items from an in-crate vantage and `tests/pushdown_public_surface.rs` naming the 17 externally-`pub` items
 * *WHEN* each catalog-declared column is declared at `createVirtualSchema`, per `vs-adapter/column-source-notes`

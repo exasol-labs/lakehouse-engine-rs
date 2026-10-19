@@ -4,7 +4,6 @@ The Iceberg REST catalog access layer lives in the standalone `lakehouse-catalog
 
 ## Background
 
-* The crate boundary changes code location and visibility only. It changes no query, pushdown, catalog-request, file-pruning, or type-handling behavior.
 * The crate lives at `crates/lakehouse-catalog`, a path dependency of `lakehouse-engine`. `make cross-udf-build` still builds `-p lakehouse-engine` and emits one `.so`.
 * The crate owns how the engine authenticates to a catalog and its object store, and how credentials are kept out of returned output. The credential types (`ConnectionCreds`, `StorageProps`, `CatalogProps`), the redaction functions (`redact_credentials`, `redact_secret_values`), and AWS SigV4 request signing therefore live beside the session code.
 * `StorageProps` is produced by the catalog (a `loadTable` response vends S3 credentials, region, endpoint, and path-style) and consumed by the scan UDF as a `CommonScanSpec` field that crosses the UDF boundary as JSON. It is declared once, in the catalog crate, and re-exported at the path the scan layer imports.
@@ -30,7 +29,7 @@ The Iceberg REST catalog access layer lives in the standalone `lakehouse-catalog
 * *AND* `make cross-udf-build` SHALL still build `-p lakehouse-engine` and still emit exactly one `.so` exporting both entry points
 * *AND* the `.so` staleness guard SHALL list the crate's sources and manifest: `Makefile`'s `VS_SRCS` SHALL include `crates/lakehouse-catalog/src` among its `find` roots and `crates/lakehouse-catalog/Cargo.toml` plus the root workspace `Cargo.toml` among its files, so that editing a catalog source file rebuilds the `.so`
 
-### Scenario: One crate declares each shared credential type, re-exported at its pre-move engine path
+### Scenario: One crate declares each shared credential type, re-exported at its engine path
 
 * *GIVEN* `StorageProps`, `CatalogProps`, `ConnectionCreds`, `redact_credentials`, and `redact_secret_values` declared in `lakehouse-catalog`
 * *WHEN* the engine names any of them
@@ -48,12 +47,3 @@ The Iceberg REST catalog access layer lives in the standalone `lakehouse-catalog
 * *AND* `CatalogSession`'s fields SHALL stay private and `CatalogAuth` SHALL stay crate-private, so the auth strategy never leaks through the public interface
 * *AND* these SHALL be crate-private: `StorageBackend::catalog_storage_props`, `CatalogAuth`, `resolve_catalog_auth`, `oauth2_client_credentials_grant`, `authed_get_json`, `resolve_load_table_prefix`, `prefix_from_config`, `build_load_table_url`, `glue_catalog_prefix`, `build_rest_catalog`, `inject_catalog_auth_props`, `non_empty`, `redact_catalog_auth_error`, `sign_request`, `list_namespace_tables`, and the shared catalog-auth mode classifier with the mode type it returns
 * *AND* `non_empty` SHALL have exactly ONE declaration in the crate, read by `auth`, by `unity::auth`, and by the mode classifier, and the classifier SHALL sit beside the `ConnectionCreds` fields it reads rather than beside either consumer
-
-### Scenario: Behavior is unchanged across the extraction
-
-* *GIVEN* a pushdown request, a `createVirtualSchema` request, or a catalog request
-* *WHEN* the crate layout serves the request
-* *THEN* its query, pushdown, catalog-request, file-pruning, and type-handling behavior MUST NOT depend on which crate holds the code, EXCEPT the scan spec's `storage` value
-* *AND* the scan spec's `storage` value SHALL be the externally-tagged backend variant of `storage-access/storage-backend-enum`, encoded by `storage-access/scan-spec-credential-reference` as a connection reference carrying no credential or as a sealed envelope over the backend encoding, and the committed `dispatch_golden` goldens and the join golden-SQL assertions SHALL pin that value
-* *AND* the catalog request URLs, the header set on each request, and the OAuth2 grant request body MUST be the same on every auth mode for the same query
-* *AND* no catalog secret, no live bearer token, no vended STS key in plaintext, and no CONNECTION-supplied storage credential SHALL appear in any returned SQL string or error message, because a vended key travels only inside the AES-GCM-sealed envelope and a CONNECTION credential travels as the CONNECTION name

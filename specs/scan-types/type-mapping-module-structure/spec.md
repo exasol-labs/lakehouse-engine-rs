@@ -4,12 +4,11 @@ Gives each repeated type-classification shape in the Arrow/Exasol mapping one im
 
 ## Background
 
-* Every scenario is a pure refactor. The scenarios of `scan-types/type-mapping`, `datafusion-scan/scan-execution`, `datafusion-scan/scan-execution-value-conversion`, `vs-adapter/create-virtual-schema`, and the `pushdown-planning*` family stay accurate and unedited, and their suites are the characterization gate for "behavior unchanged".
 * The Arrow-to-Exasol table is a compliance surface (CLAUDE.md § Data types), so "behavior unchanged" means byte-identical output. The byte-identity holds over the reachable input domain, which is every string this repo's producers emit. The unreachable inputs where consolidation changes the answer are named per parser in the DECIMAL-parser scenario.
 * A helper whose whole body calls another helper with the same arguments is a pass-through, a shallow-module red flag. Each consolidation deletes the duplicate instead of keeping a wrapper. A wrapper that supplies arguments the shared helper does not choose is a partial application and may stay. `pushdown/pushdown-col-types-consolidation` owns the shared column-type builder's contract.
 * `Json` in the adapter modules is an alias for `serde_json::Value`. Relocating the two JSON-shaped mapping functions gives `types/mapping.rs` a `serde_json` import. The dependency direction stays correct, because `adapter` depends on `types` and never the reverse.
 * This crate's CI gate is `cargo clippy --workspace --all-targets -- -D warnings`, under which an unused non-`pub` item fails the build.
-* `classify_exa_type` is `pub` to keep the change API-neutral. Narrowing it to `pub(crate)` is deferred to a separate API-pruning change, which is what keeps the "public API gains exactly two items" clause true. `lakehouse-engine` ships as a UDF `.so` with no out-of-crate consumer.
+* `classify_exa_type` is `pub` to keep the change API-neutral. Narrowing it to `pub(crate)` is deferred to a separate API-pruning change. `lakehouse-engine` ships as a UDF `.so` with no out-of-crate consumer.
 * `pushdown/pushdown-module-structure` owns the three pushdown guards' file set and which guards call `classify_exa_type`. This feature owns what `classify_exa_type` returns.
 * The shared catalog-decimal guard `(1..=36).contains(&precision) && scale <= precision` is strictly narrower than `precision <= 36 && scale <= 36`, so `0 <= p,s <= 36` still holds and every `DECIMAL` string reaching `exasol_type_to_json` and `sum_emit_type` stays inside the parser's `u8`/`i8` range. The Iceberg and Unity Catalog producers (`iceberg_primitive_to_exasol`, `spark_primitive_to_exasol`) share that one guard.
 
@@ -75,12 +74,3 @@ Gives each repeated type-classification shape in the Arrow/Exasol mapping one im
 * *AND* the three guards' rewiring SHALL be specified by `pushdown/pushdown-module-structure`, which owns the guards, and this feature SHALL NOT restate how any guard branches
 * *AND* a unit test SHALL pin these representative strings: `VARCHAR(4) ASCII` and `CHAR(2)` as `Character`; `DECIMAL(20,0)` AND bare `DECIMAL` with no arguments as `Decimal`, where the bare case separates the correct predicate from `starts_with("DECIMAL(")`; `DATE` as `Date`; and `TIMESTAMP` and `DOUBLE PRECISION` as `Other`
 * *AND* the doc comment on `classify_exa_type` SHALL describe what it matches and SHALL NOT claim the guards run their own predicates, because the guards call the classifier
-
-### Scenario: Behavior is unchanged across the refactor
-
-* *GIVEN* the pre-refactor unit and integration suites for the type-mapping, scan-execution, and pushdown-planning layers
-* *WHEN* the suites run against the refactored code
-* *THEN* every test MUST pass with no change to any test assertion or expected value, and the only permitted test edits are the module a relocated test lives in and the import path it names
-* *AND* the Exasol type string returned by `arrow_to_exasol_type`, `iceberg_type_to_exasol`, `exasol_type_from_json`, and `sum_emit_type` MUST be byte-identical to the pre-refactor output for every input any producer in this repo emits
-* *AND* the `createVirtualSchema` column `dataType` JSON MUST be byte-identical to the pre-refactor output, and the scan-driving SQL generated for a given pushdown request MUST be byte-identical to it EXCEPT for the scan-spec `storage` value, which this refactor does not touch and which `storage-access/storage-backend-enum` re-encodes as a tagged backend variant and `storage-access/scan-spec-credential-reference` then replaces with a connection reference or a sealed envelope
-* *AND* the public API of the crate SHALL gain exactly two items, `ExaTypeClass` and `classify_exa_type`, and SHALL lose none

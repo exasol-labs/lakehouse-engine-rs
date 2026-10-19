@@ -172,7 +172,7 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 * *AND* that match MUST NOT be replaced by an assumption that the Unity Catalog listing filter already excluded a format, because the single-table load applies no listing filter
 * *AND* the selection site MUST NOT match `CatalogKind`, so the permitted-site set of `vs-adapter/catalog-kind-selection` (the enum with its resolver, the catalog-client construction site, credential validation, and the pushdown scan-source construction site) stays intact and gains no file
 
-### Scenario: Iceberg planning is byte-identical through the new seam
+### Scenario: The Iceberg format reader owns file resolution and binds columns by field-id
 
 * *GIVEN* the Iceberg file-resolution logic, reached by the single-table pushdown path and every join leg
 * *WHEN* the Iceberg format reader resolves a table's scan through the trait

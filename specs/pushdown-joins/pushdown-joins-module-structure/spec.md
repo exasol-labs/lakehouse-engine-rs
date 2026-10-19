@@ -1,6 +1,6 @@
 # Feature: Pushdown Joins Module Structure
 
-Organizes the `pushdown::joins` submodule as a nested `joins/` directory module split by concern behind a stable `pub(crate)` surface. Generated SQL is pinned by golden tests and each concern's tests live beside it.
+Organizes the `pushdown::joins` submodule as a nested `joins/` directory module split by concern behind a stable `pub(crate)` surface. Each concern's tests live beside it.
 
 ## Background
 
@@ -11,7 +11,7 @@ Organizes the `pushdown::joins` submodule as a nested `joins/` directory module 
 
 ## Scenarios
 
-### Scenario: Join pushdown façade resolves at every pre-refactor path
+### Scenario: Join pushdown façade exposes the nine pub(crate) join items to the pushdown module
 
 * *GIVEN* the `joins` module's exports to `crate::adapter::pushdown`: the nine `pub(crate)` items (`DetectedJoin`, `IneligibleJoinReason`, `JoinLeaf`, `JoinShape`, `JoinSides`, `RenderedJoinPushdown`, `ResolvedJoinSide`, `detect_join`, `render_broadcast_join`) and the `pub(super)` items the dispatcher and its tests consume
 * *WHEN* the whole crate compiles
@@ -27,14 +27,6 @@ Organizes the `pushdown::joins` submodule as a nested `joins/` directory module 
 * *AND* `joins/mod.rs` MUST retain the `plan_join` orchestrator and the cross-cutting `qualify_udf` and `ineligible_join_decline` helpers
 * *AND* each concern submodule MUST own a single responsibility: leg attribution; join-shape detection with broadcast-side selection; alias-qualified expression, filter, and projection rendering; broadcast and N-scan SQL assembly
 * *AND* a helper used across concern submodules MUST be no wider than `pub(super)` (`super` = `joins`)
-
-### Scenario: Generated join SQL is byte-identical across the split
-
-* *GIVEN* a golden-SQL baseline capturing the exact built string from each join code path: a broadcast join (`build_broadcast_join_sql`), an N-scan fallback (`build_n_scan_join_sql`, with a fixture that includes both a side-local WHERE conjunct and a cross-side residual conjunct), a grouped-qualified fallback, and an ineligible decline (`ineligible_join_decline`'s `UdfError` message)
-* *WHEN* each code path is planned against the current code
-* *THEN* a full-string equality assertion over each code path's built SQL, or the decline `UdfError` message, MUST equal its golden baseline byte-for-byte except for the scan spec's `storage` value, which `storage-access/storage-backend-enum` and `storage-access/scan-spec-credential-reference` own, asserted over the entire returned string rather than a substring
-* *AND* the `ineligible_join_decline` message MUST be asserted in full with no exception, because it embeds no scan spec
-* *AND* every scenario in `pushdown-joins/pushdown-planning-join` and `pushdown-joins/pushdown-planning-join-fallback` MUST pass, including `plan_join`'s empty-side short-circuit, which delegates to `pushdown::empty_result::empty_result_sql`
 
 ### Scenario: Each joins submodule owns its tests behind the shared fixtures
 
@@ -62,7 +54,7 @@ Organizes the `pushdown::joins` submodule as a nested `joins/` directory module 
 * *AND* the two narrowing policies MUST stay divergent: an absent or empty `selectList` MUST make `referenced_leg_columns` return every column of `full_cols` without inspecting any other clause while `referenced_column_projection` MUST still narrow through the remaining clauses in that same case, and a narrowing that selects no column MUST yield all of `full_cols` for `referenced_leg_columns` but exactly the first column of `all_cols` for `referenced_column_projection`, which MUST NOT return a zero-column projection because an empty Exasol `EMITS` clause is invalid
 * *AND* `referenced_leg_columns` MUST collect from the join condition passed to it separately, a clause `referenced_column_projection` has no equivalent of and MUST NOT acquire
 
-### Scenario: The two join-rendering pass-through wrappers are deleted rather than retained
+### Scenario: Join rendering names the shared expression renderers directly with no wrapper functions
 
 * *GIVEN* the pass-through wrappers `render_join_condition` and `render_selectlist_item_qualified`, whose entire bodies would be one call to `vs_expression::render_expression_safe` and to `render_expression_qualified` respectively
 * *WHEN* the crate is built

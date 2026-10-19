@@ -85,7 +85,7 @@ Applies Iceberg merge-on-read positional deletes on read, so a query over a tabl
 > pruning of a partition-granularity delete file are specified in
 > `scan-read-path/scan-execution-positional-deletes-fanout`.
 
-### Scenario: The refactor preserves the delete-application safety invariants
+### Scenario: Positional delete application keeps its safety invariants
 
 * *GIVEN* a shard whose assigned data files carry associated Parquet positional-delete files at file or partition granularity
 * *WHEN* the two-phase pipeline applies those deletes (Phase A reads each unique delete file once into a data-file-path → deleted-position map; Phase B looks up that map per data file with no delete-file I/O, and fetches each delete-carrying data file's own Parquet footer as a bounded-concurrent fan-out under the same shared limiter)

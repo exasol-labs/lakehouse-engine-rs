@@ -16,7 +16,7 @@ Extends `lakehouse-catalog`'s enumerated public surface so the engine can plan a
 * *THEN* the neutral table SHALL carry its ordered partition-column names, and the Unity Catalog variant of the neutral column source type SHALL carry the column's optional Spark `StructField` JSON as a plain string
 * *AND* the Iceberg REST client and the direct-storage client SHALL set an EMPTY partition-column list on every neutral table they return, because neither catalog declares partition columns by name: the Iceberg reader reads its partition spec from the table metadata, and the direct-storage reader discovers its keys from the paths
 
-### Scenario: The addition stays narrow, and its reviewed probe supersedes the format-guard clause it replaces
+### Scenario: The Unity Parquet additions stay narrow and the reader is selected by an exhaustive format match
 
 * *GIVEN* the same two neutral-type additions and the same external-vantage reachability probe
 * *WHEN* the engine consumes the new fields to plan a Unity Catalog Parquet table

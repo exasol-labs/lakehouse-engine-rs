@@ -38,7 +38,7 @@ The adapter advertises `ORDER_BY_COLUMN`, `ORDER_BY_EXPRESSION`, and `LIMIT_WITH
 * *AND* the declined-`ORDER BY` wrapper SHALL name the derived projection's pre-extension items EXPLICITLY by their EMITS identifiers rather than using `SELECT *`, so each appended sort-key column is visible to the outer `ORDER BY` but absent from the returned result, and the returned column count and order EQUAL the derived projection's pre-extension column count and order
 * *AND* the returned result SHALL equal the same query evaluated over all matching rows on a single node, in the requested sort-key order, direction, and NULL placement, EXCEPT for a sort key whose column requires the JSON-fallback VARCHAR cast, which orders on the emitted JSON string rather than the native value
 
-### Scenario: A sort key absent from the select list no longer leaks a synthetic result column
+### Scenario: A sort key absent from the select list adds no synthetic result column
 
 * *GIVEN* the adapter advertises `ORDER_BY_EXPRESSION` and a query whose `ORDER BY` sorts on an expression or aggregate that is NOT an item of the client's select list, `SELECT id, c_price FROM t WHERE id <= 5 ORDER BY ABS(c_price) DESC` (row scan), or `SELECT c_bool, COUNT(*) FROM t GROUP BY c_bool ORDER BY SUM(c_price) DESC` (grouped)
 * *WHEN* Exasol sends the `pushdown` request and runs the returned SQL

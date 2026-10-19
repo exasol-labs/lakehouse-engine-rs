@@ -15,7 +15,7 @@ The adapter resolves a directory of Parquet files into the engine's `ScanSpec` a
 
 ## Scenarios
 
-### Scenario: The format reader is selected at the same one site for a third source
+### Scenario: The format reader is selected at one exhaustive site for a direct-storage source
 
 * *GIVEN* the scan source whose variant pairs one resolved session with the table it reads, matched exhaustively at exactly ONE site returning a boxed format reader
 * *WHEN* the adapter selects the reader for a direct-storage table

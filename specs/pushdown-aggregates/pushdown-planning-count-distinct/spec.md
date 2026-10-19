@@ -42,7 +42,7 @@ The adapter pushes a lone `COUNT(DISTINCT col)` over the whole table (no GROUP B
 * *THEN* the merged count SHALL equal `COUNT(DISTINCT col)` evaluated over all rows on a single node, proving the outer native `COUNT(DISTINCT "V")` deduplicates the shared value ACROSS the shard boundary rather than summing per-shard counts
 * *AND* NULL values SHALL never be counted, and a zero-match or all-NULL result SHALL yield a distinct count of zero, not an error
 
-### Scenario: High-cardinality COUNT(DISTINCT) completes past the former per-shard cap
+### Scenario: High-cardinality COUNT(DISTINCT) completes without a per-shard cap
 
 * *GIVEN* an Exasol Docker container with the lakehouse VS adapter and scan UDF installed over SeaweedFS
 * *AND* an Iceberg table whose target column holds enough near-unique values per shard that a serialized per-shard distinct set would be large

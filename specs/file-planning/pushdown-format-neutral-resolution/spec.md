@@ -69,7 +69,7 @@ Routes every pushdown request through the table-format reader seam. The reader t
   unresolvable identifier, and MUST NOT resolve a different table
 * *AND* a pushdown request whose involved virtual table name is absent from the recorded mapping SHALL keep failing with the error naming the unknown virtual table, unchanged for both catalog kinds
 
-### Scenario: Iceberg pushdown output is byte-identical across the rewiring
+### Scenario: Iceberg requests planned through the format-reader seam keep their golden SQL, scan specs, and file pruning
 
 * *GIVEN* the shipped Iceberg pushdown suites, the golden dispatch fixtures, the scan-spec encodings,
   the generated scan-driving SQL for raw, TopN, single-group aggregate, grouped aggregate, and
