@@ -44,9 +44,8 @@ surface in ONE five-row table (§ Schema Evolution). Quoted verbatim:
   the spec keeps the scale unchanged.
 * **That failure is NOT scoped to pruning, which is why it cannot be worked around.** The bounds
   decode runs inside manifest Avro deserialization, so it fires for every manifest entry whether or
-  not a filter predicate was supplied — and in this engine it fires FIRST from
-  `ensure_supported_delete_mechanisms`, which loads every manifest to read only content type and file
-  format. An unfiltered `SELECT *` against a `date`-promoted table therefore fails just as a filtered
+  not a filter predicate was supplied — and in this engine it fires FIRST inside `plan_files`, which
+  reads every manifest when no filter prunes one. An unfiltered `SELECT *` against a `date`-promoted table therefore fails just as a filtered
   one does, with a message naming neither bounds nor promotion. `iceberg` 0.10.0 also carries a
   second bounds decode that `unwrap()`s rather than propagating (manifest-list partition field
   summaries), so the same shape has a reachable panic path — and a panic inside the adapter aborts
@@ -126,7 +125,7 @@ surface in ONE five-row table (§ Schema Evolution). Quoted verbatim:
   the earlier and the current Iceberg type, and issue #355 — the repository issue that tracks this
   gap — so the refusal reads as scoped work rather than a permanent limitation
 * *AND* the refusal SHALL be decided from `TableMetadata::schemas_iter` alone, BEFORE any manifest is
-  loaded and before `ensure_supported_delete_mechanisms` runs, because the failure it replaces occurs
+  loaded and before `plan_files` runs, because the failure it replaces occurs
   inside manifest deserialization and would otherwise surface as `failed to convert byte slice to
   array`, naming neither the column nor the promotion
 * *AND* the refusal SHALL fire for an unfiltered request as well as a filtered one, because the

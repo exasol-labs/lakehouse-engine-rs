@@ -48,7 +48,7 @@ the engine cannot apply.
   Iceberg sequence-number rules) MUST be preserved into the scan spec, never discarded.
 * Delete mechanisms this engine cannot apply (equality deletes, Puffin/v3 deletion
   vectors, and ORC/Avro data or delete files) MUST be detected at plan time and fail the
-  request loud.
+  request loud when they apply to a planned data file.
 * See `pushdown/pushdown-planning` for the broader pushdown plan and the scenario that
   covers wiring of the Iceberg predicate alongside the DataFusion filter string.
 * A filter names an Exasol column, and the table's column notes record which Iceberg field id that
@@ -107,12 +107,18 @@ the engine cannot apply.
 
 ### Scenario: An unsupported delete mechanism fails loud at plan time
 
-* *GIVEN* a virtual schema over an Iceberg table whose current snapshot carries a delete mechanism this engine cannot apply — an equality-delete file, a v3 / Puffin deletion vector, or a delete file (or data file) in ORC or Avro format
-* *WHEN* Exasol sends the corresponding pushdown request and the adapter inspects the snapshot's delete files at the manifest / `DataFile` level, where the Puffin discriminator and file format are still visible
-* *THEN* the adapter SHALL fail the request at plan time with a clean error naming the unsupported delete mechanism, BEFORE building or returning any scan-driving SQL and before fan-out
+* *GIVEN* a virtual schema over an Iceberg table where a planned data file is in ORC or Avro format, or has an equality delete, a Puffin deletion vector, or an ORC or Avro delete file applied to it
+* *WHEN* Exasol sends the corresponding pushdown request
+* *THEN* the adapter SHALL fail the request at plan time with a clean error naming the unsupported mechanism or file format, BEFORE building or returning any scan-driving SQL and before fan-out
 * *AND* the adapter MUST NOT silently return pre-delete rows and MUST NOT emit scan-driving SQL for that request
-* *AND* the error message MUST NOT contain any storage access key, secret key, or session token
-* *AND* this plan-time detection SHALL be the authoritative correctness gate; any scan-time check is a secondary backstop only
+* *AND* the error message MUST NOT contain any file path, storage access key, secret key, or session token
+* *AND* the adapter SHALL decide which delete files apply to a data file by the matching rules of Iceberg's planning library, and any scan-time check is a secondary backstop only
+
+### Scenario: An unsupported delete mechanism on a pruned file does not fail the query
+
+* *GIVEN* a virtual schema over an Iceberg table where an unsupported mechanism applies only to data files that the query's filter prunes
+* *WHEN* Exasol sends the corresponding pushdown request
+* *THEN* the query SHALL return the rows of the remaining data files
 
 ### Scenario: A NOT over a partly translated predicate keeps every file with a matching row
 
