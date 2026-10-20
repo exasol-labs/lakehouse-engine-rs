@@ -48,7 +48,7 @@ the engine cannot apply.
   Iceberg sequence-number rules) MUST be preserved into the scan spec, never discarded.
 * Delete mechanisms this engine cannot apply (equality deletes, Puffin/v3 deletion
   vectors, and ORC/Avro data or delete files) MUST be detected at plan time and fail the
-  request loud.
+  request loud when they apply to a planned data file.
 * See `pushdown/pushdown-planning` for the broader pushdown plan and the scenario that
   covers wiring of the Iceberg predicate alongside the DataFusion filter string.
 * A filter names an Exasol column, and the table's column notes record which Iceberg field id that

@@ -18,7 +18,9 @@ positional-delete case (tracked as issue #68).
 * Scope is **Parquet data files + Parquet positional-delete files only**, at both
   `write.delete.granularity=file` and `write.delete.granularity=partition`. Equality deletes,
   v3/Puffin deletion vectors, and ORC or Avro data or delete files are OUT OF SCOPE and MUST fail
-  loud (the authoritative gate is at plan time — see `file-planning/pushdown-file-pruning`).
+  loud. The primary gate is at plan time (`file-planning/pushdown-file-pruning`). It checks each
+  planned data file and each delete file iceberg-rust applies to it, so it relies on iceberg-rust's
+  delete matching (ADR `unsupported-deletes-classified-from-planned-tasks`).
 * The scan reads each associated positional-delete Parquet file (columns `file_path` Utf8,
   field-id `2147483546`, and `pos` Int64, field-id `2147483545`), keeps only the rows whose
   `file_path` equals the data file currently being read, and accumulates the `pos` values into a
@@ -37,11 +39,14 @@ positional-delete case (tracked as issue #68).
 * Deletes are applied at the scan/decode layer, so the rows the DataFusion filter, LIMIT, top-N,
   and aggregation operate on are already the post-delete rows — no downstream stage can
   reintroduce a deleted row.
-* **Fail-loud backstop (read-time):** the primary, authoritative gate is at plan time; this
-  scan-time check is cheap defense-in-depth. If an assigned delete file is not a Parquet
-  positional delete (a Puffin / deletion-vector payload, an equality-delete file, or an unknown
-  content type), the scan MUST return a clean, credential-redacted error naming the unsupported
-  mechanism rather than silently returning pre-delete rows.
+* **Fail-loud backstop (read-time):** the primary gate is at plan time and follows iceberg-rust's
+  delete matching; this scan-time check is cheap defense-in-depth. If an assigned delete file is
+  not a Parquet positional delete (a Puffin / deletion-vector payload, an equality-delete file, or
+  an unknown content type), the scan MUST return a clean, credential-redacted error naming the
+  unsupported mechanism rather than silently returning pre-delete rows.
+* The adapter tags an Iceberg position delete stored in Puffin format as the Puffin
+  deletion-vector variant, not as a positional delete. That tag is what lets the backstop refuse a
+  Puffin deletion vector by its own variant.
 * See `datafusion-scan/scan-execution` for the base scan flow and the unified-provider plan
   shape, `datafusion-scan/scan-execution-spec-reconstitution` for the delete-carrying wire
   format, and `datafusion-scan/scan-execution-file-metadata` for the no-HEAD footer read.

@@ -361,8 +361,8 @@ fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &
 /// `iceberg` reads such bounds as 8 bytes, skipping the spec's bounds-width
 /// inference, so a pre-promotion file's 4-byte bound fails manifest decoding with an
 /// unhelpful error, and a second decode path `unwrap()`s. Deciding from schema history
-/// alone avoids that decode and spends no object-store byte; it must run before
-/// [`ensure_supported_delete_mechanisms`].
+/// alone avoids that decode and spends no object-store byte; it must run before `plan_files`
+/// reads any manifest.
 ///
 /// Any schema declaring the field id as `date` counts, at any nesting depth (manifest bounds
 /// are keyed by field id). Deliberately conservative: a table whose files were all rewritten
