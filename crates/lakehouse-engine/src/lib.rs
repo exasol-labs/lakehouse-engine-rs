@@ -1,7 +1,7 @@
 //! One `.so`, three entry points: VS adapter, DataFusion scan UDF, version UDF.
 //!
-//! Invariants: only SDK `Value` types (or Arrow IPC bytes) cross the `.so` boundary, never
-//! Arrow types; the scan UDF discovers no files itself; credentials never appear in errors.
+//! Invariants: only SDK `Value` types (or Arrow C Data Interface structs) cross the `.so`
+//! boundary, never Arrow types; the scan UDF discovers no files itself; credentials never appear in errors.
 //! Build only via `make cross-udf-build`; a host `cargo build --release` yields an
 //! unloadable host-glibc `.so`.
 

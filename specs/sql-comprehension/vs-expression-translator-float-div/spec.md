@@ -16,7 +16,7 @@ position rather than only where the value happens to reach an emit-time check.
 
 ## Background
 
-A conversion or operator node is translated only when its DataFusion 54 result matches Exasol's to
+A conversion or operator node is translated only when its DataFusion result matches Exasol's to
 the precision of the target type, and only when a mismatch cannot produce a silently wrong value.
 `FLOAT_DIV` qualifies under both halves of that rule and is the reason the rule needs both halves
 stated: its cast rendering is bit-exact against Exasol for a scale-0 numerator and within ~1 ULP
@@ -34,7 +34,7 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
   against the Docker Exasol container (`exasol/docker-db:2025.2.1`): `7/2` is `3.5`, and a CTAS over
   every operand pairing (`DECIMAL(18,0)/DECIMAL(18,0)`, `DECIMAL(18,2)/DECIMAL(18,0)`,
   `DECIMAL(18,2)/DOUBLE`, `DECIMAL(18,0)/DOUBLE`) types the result column `DOUBLE` in
-  `EXA_ALL_COLUMNS`. DataFusion 54.1's `/` is operand-typed: `Int64/Int64` gives truncating integer
+  `EXA_ALL_COLUMNS`. DataFusion's `/` is operand-typed: `Int64/Int64` gives truncating integer
   division typed `Int64`, `Decimal128(18,2)/Decimal128(18,2)` gives `Decimal128(24,6)` and
   `Decimal128(18,2)/Int64` gives `Decimal128(22,6)` — the scale-6 cap that is issue #186's second
   facet. Rendering the node as a bare `/` therefore returned silently wrong values on the DataFusion
@@ -58,7 +58,7 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
   kind, so no single `DIV` rendering exists. The same limitation unblocks one operator and blocks
   the other.
 * **Casting only the LEFT operand is sufficient, and it is enough for every operand pairing.**
-  Measured on DataFusion 54.1 / arrow 58.3: `CAST(<int64> AS DOUBLE) / <int64>`,
+  Measured: `CAST(<int64> AS DOUBLE) / <int64>`,
   `CAST(<dec(18,2)> AS DOUBLE) / <int64>`, `CAST(<int64> AS DOUBLE) / <dec(18,2)>`,
   `CAST(<dec(18,2)> AS DOUBLE) / <dec(18,2)>` and `CAST(<float64> AS DOUBLE) / <float64>` all plan
   and execute, and all yield `Float64`. `Float64 ÷ Decimal128` in particular coerces cleanly rather
@@ -94,7 +94,7 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
   `{2,3,7,11,13}`, 1027 of 3335 results (31%) differ by exactly one ULP — max absolute difference
   `4.44e-16`, max relative difference `3.17e-16`. The same sweep over `DECIMAL(p,0)/DECIMAL(p,0)` was
   **bit-exact, 0 of 3335 differing**. The residual is Exasol-internal, not a DataFusion mismatch:
-  DataFusion 54.1 returns byte-identical values to Exasol's *own* `CAST(A AS DOUBLE)/B` form. Set
+  DataFusion returns byte-identical values to Exasol's *own* `CAST(A AS DOUBLE)/B` form. Set
   against the pre-fix scale-6 truncation, relative error drops from ~1e-7 to ~2e-16. It is named
   rather than claimed away.
 * **The 2^53+1 literal is a false divergence — do not report it as one.** Native Exasol
@@ -145,23 +145,22 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
   from the design, and is the point of the fix, is that the returned rows never disagree with
   Exasol: a row reaches the result only when its division was evaluated and finite. The residual is
   therefore scoped to error-raising alone, never to row content, and is tracked as a separate
-  issue rather than left unstated `(#392)`. The divergence runs in both directions.
-  DataFusion 54.1 may also evaluate the division for a row an adjacent conjunct already excluded,
-  so a query that succeeds today can raise after this change. That direction is part of the same
-  tracked exception, and the next bullet states its mechanism.
-* **A guarded division is not protected by its guard, and the protection that does exist is
-  batch-selectivity dependent.** `datafusion-physical-expr` 54.1 defines
-  `PRE_SELECTION_THRESHOLD: f32 = 0.2` in `src/expressions/binary.rs` and applies it in
-  `check_short_circuit`. For an `AND`, that function returns `ReturnLeft` when the left conjunct is
-  all-false over the batch, `ReturnRight` when it is all-true, and a pre-selection filter only when
-  the left conjunct's true ratio is at or below 0.2. Above that ratio it returns no strategy and
-  `BinaryExpr::evaluate` evaluates the right conjunct over the FULL batch, including rows the left
-  conjunct excluded. A null in the left conjunct disables the strategy entirely. Nothing protects a
-  division that sits in the LEFT conjunct at all. So `WHERE <d> <> 0 AND <n> / <d> > 0` can raise
-  after this change even though every surviving row has a non-zero divisor, and whether it raises
-  depends on per-batch selectivity and on conjunct order. Task 1.2 measures native Exasol's own
-  behaviour for the guarded shape, in both conjunct orders, because CLAUDE.md forbids assuming it.
-  This over-raise direction is part of the same tracked exception `(#392)`.
+  issue rather than left unstated `(#392)`. The divergence runs in both directions:
+  DataFusion may also evaluate the division for a row an adjacent conjunct already excluded, so a
+  query native Exasol answers can raise.
+* **A guard protects a division only when DataFusion orders the guard first.** DataFusion's
+  `PushDownFilter` moves every cheap conjunct ahead of every expensive one and keeps the written
+  order within each class. A conjunct is cheap when each of its nodes is a column, a literal, a
+  cast, a comparison or arithmetic operator, or another node `reorder_predicates` lists. Any
+  function call is expensive, and the checked division is a function call. The Parquet row filter
+  then evaluates the conjuncts in that order and narrows the row selection after each one, because
+  `datafusion.execution.parquet.reorder_filters` stays at its default `false`. So a cheap guard
+  such as `<d> <> 0` protects the division in both conjunct orders. An expensive guard such as
+  `ABS(<d>) <> 0` protects it only when written first. Written second, the query raises, and so
+  does the same query over a native Exasol table. A cheap guard written second is the reverse case:
+  the scan returns rows where a native Exasol table raises. This suppression direction is part of
+  the same tracked exception `(#392)`. An inline `UNION ALL` of literal rows raises in neither
+  order, so it is no oracle for a guarded division.
 * **The `0/0` NaN route into `#246` closes; `#246` itself stays open.** A `0/0` now raises at the
   checked division and never reaches `emit_batch`, so the widening this feature previously recorded
   against `#246` is withdrawn. `#246` continues to cover every other way a `NaN` reaches the
@@ -257,12 +256,10 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
 * *AND* a NULL divisor SHALL still yield NULL and SHALL NOT raise, so `WHERE <a> / NULL > 0` returns no rows rather than failing
 * *AND* the error SHALL be raised only for a row whose division the scan actually evaluates: DataFusion MAY skip the division for a row that another conjunct, file pruning, row-group pruning, or a LIMIT already removed, and whether native Exasol raises for such a row is NOT measured, so the residual is scoped to error-raising alone and recorded as a tracked exception `(#392)`
 * *AND* the rows a successful query returns SHALL NOT be affected by that residual: a row reaches the result only when its division was evaluated and finite, so a query that does not raise returns exactly the rows native Exasol returns
-* *AND* a GUARDED division, the concrete shape `WHERE (L_LINENUMBER - 1) <> 0 AND 0 < L_ORDERKEY / (L_LINENUMBER - 1)` and its reversed conjunct order — a divisor that is zero on only half the 20-row fixture, so the guard actually excludes rows rather than the identically-zero `(L_LINENUMBER - L_LINENUMBER)` shape task 1.1 measures — was MEASURED live against a native Exasol oracle by task 1.2, rather than assumed, because a guard does NOT prevent the checked division from raising and this is the one shape where a query that succeeds today can start failing. `LHVS.GT_LINEITEM_SCAN` does not exist in the test harness, so the oracle used the same inline-literal-subquery pattern the other `float_div` oracles in `e2e_scan_test.rs` already use: the 20-row `L_ORDERKEY` (1 to 10) × `L_LINENUMBER` (1, 2) cross product the fixture seeds. `EXPLAIN VIRTUAL` `PUSHDOWN_SQL` confirmed both conjuncts reach the scan in ONE pushed filter for each conjunct order — guard-first: `(((\"L_LINENUMBER\" - 1) <> 0) AND (0 < (CAST(\"L_ORDERKEY\" AS DOUBLE) / (\"L_LINENUMBER\" - 1))))`; guard-second: `((0 < (CAST(\"L_ORDERKEY\" AS DOUBLE) / (\"L_LINENUMBER\" - 1))) AND ((\"L_LINENUMBER\" - 1) <> 0))`. Pre-fix, the pushed-down GUARDED query returned `10` rows in BOTH conjunct orders, against `20` for the identical divisor with the guard removed (the UNGUARDED shape) — the guard is shown to actually remove the ten zero-divisor rows. Native Exasol raised `data exception - division by zero` (SQL state `22012`) for the UNGUARDED shape (a genuine division by zero, unlike DataFusion's pre-fix `x/0 = +Inf` rendering), and returned `10`, WITHOUT raising, for the GUARDED shape in BOTH conjunct orders — so pre-fix, native Exasol's own guard already protects the division regardless of textual conjunct order, and `10` is therefore the row count the post-fix checked division must also return for the GUARDED shape whenever it does not raise
-* *AND* the mechanism SHALL be recorded as batch-selectivity dependence rather than as a stable property: `datafusion-physical-expr` 54.1 defines `PRE_SELECTION_THRESHOLD: f32 = 0.2` in `src/expressions/binary.rs`, and `check_short_circuit` returns a pre-selection filter for an `AND` only when the left conjunct's true ratio over the batch is at or below that threshold, returns `ReturnLeft` when the left conjunct is all-false, returns `ReturnRight` when it is all-true, and otherwise lets `BinaryExpr::evaluate` evaluate the right conjunct over the FULL batch including the rows the left conjunct excluded
-* *AND* a division sitting in the LEFT conjunct SHALL be understood to have NO protection at all from this mechanism, and a null in the left conjunct SHALL be understood to disable it entirely, so conjunct order and per-batch data both change the outcome
-* *AND* this over-raise direction SHALL be covered by the SAME tracked exception as the suppression direction `(#392)`, because both are the same underlying fact: the error is a per-row side effect of an expression DataFusion is free to evaluate over a row set of its own choosing
-* *AND* the POST-FIX outcome for that same guarded shape SHALL be recorded from a live run rather than inferred from native Exasol's, because the two differ: with divisor `(L_LINENUMBER - 1)` over the 20-row fixture, GUARD FIRST (`(L_LINENUMBER - 1) <> 0 AND 0 < L_ORDERKEY / (L_LINENUMBER - 1)`) returns 10 rows WITHOUT raising, matching native Exasol, while DIVISION FIRST (the reversed conjunct order) RAISES `data exception - division by zero` where native Exasol returns 10 rows. The over-raise is therefore real, conjunct-order dependent, and covered by `(#392)`
-* *AND* the protection the guard-first order does get SHALL be attributed to the mechanism that actually provides it, which was MEASURED: the Parquet ROW FILTER evaluates the pushed conjuncts in the textual order `split_conjunction` produces, and narrows the row selection as it goes, so the division never sees a zero divisor. That textual order is a consequence of one config default, not a DataFusion guarantee: `datafusion.execution.parquet.reorder_filters` defaults to `false` (`datafusion-common` 54.1 `src/config.rs`) and `session_config_for_spec` leaves the key unset. Enabling the key makes `datafusion-datasource-parquet` 54.1 `row_filter.rs` sort the split conjuncts by `required_bytes` instead, which puts the one-column guard ahead of the two-column division in BOTH conjunct orders and removes the DIVISION FIRST raise the clause above records. It is NOT `check_short_circuit`, which at this fixture's 0.5 true ratio — above `PRE_SELECTION_THRESHOLD = 0.2` — would evaluate the division over the full batch and raise in BOTH orders. This is why the checked division MUST stay `Immutable`: a `Volatile` declaration would keep it out of the row filter and lose the only protection a guarded division has
+* *AND* a GUARDED division with a cheap guard SHALL return the guarded rows without raising in BOTH conjunct orders: over the 20-row fixture, `WHERE (L_LINENUMBER - 1) <> 0 AND 0 < L_ORDERKEY / (L_LINENUMBER - 1)` and its reversed order each return 10 rows, while native Exasol raises `22012` for the same division without the guard. Over a native Exasol table, the reversed order also raises `22012`, which the suppression direction of the tracked exception covers `(#392)`
+* *AND* that protection SHALL come from conjunct order, not from batch selectivity: DataFusion's `PushDownFilter` places cheap conjuncts before expensive ones, the checked division is an expensive function call, and the Parquet row filter evaluates the conjuncts in that order while `datafusion.execution.parquet.reorder_filters` stays `false`
+* *AND* the checked division MUST stay `Immutable`: DataFusion neither reorders a conjunction that holds a `Volatile` expression nor pushes such a filter into the scan, so a `Volatile` declaration would remove the only protection a guarded division has
+* *AND* a guard that is itself a function call, such as `ABS(L_LINENUMBER - 1) <> 0`, SHALL protect the division only when written first: written second, the query raises `data exception - division by zero`, and the same query over a native Exasol table raises `22012`
 
 ### Scenario: Zero divided by zero fails the query instead of reaching the NaN-at-emit gap
 

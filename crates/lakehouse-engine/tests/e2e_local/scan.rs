@@ -3480,81 +3480,43 @@ fn e2e_float_div_null_divisor_in_filter_returns_no_rows() {
 }
 
 #[test]
-fn e2e_float_div_guarded_by_a_non_zero_conjunct_matches_the_measured_outcome() {
+fn e2e_float_div_guarded_by_a_non_zero_conjunct_matches_native_exasol() {
     lakehouse_vs();
     let mut conn = exa_conn();
 
     let guard = "(L_LINENUMBER - 1) <> 0";
     let division = "0 < L_ORDERKEY / (L_LINENUMBER - 1)";
     let oracle = native_lineitem_oracle();
-    let guarded_rows = (LINEITEM_ROWS / 2) as i64;
 
     let unguarded_oracle =
         conn.try_execute(&format!("SELECT L_ORDERKEY FROM {oracle} WHERE {division}"));
     assert_eq!(
         unguarded_oracle["status"].as_str(),
         Some("error"),
-        "the oracle must really hold zero-divisor rows: native Exasol has to \
-         raise for the UNGUARDED shape, else the guard below guards \
-         nothing: {unguarded_oracle}"
+        "the fixture must hold zero-divisor rows, else the guard guards nothing: \
+         {unguarded_oracle}"
     );
 
-    let guard_first = format!("{guard} AND {division}");
-    let division_first = format!("{division} AND {guard}");
-
-    for predicate in [&guard_first, &division_first] {
+    for predicate in [
+        format!("{guard} AND {division}"),
+        format!("{division} AND {guard}"),
+    ] {
         let oracle_rows = conn.query_row_count(&format!(
             "SELECT L_ORDERKEY FROM {oracle} WHERE {predicate}"
         ));
-        assert_eq!(
-            oracle_rows, guarded_rows,
-            "native Exasol must return {guarded_rows} guarded rows WITHOUT \
-             raising for `{predicate}` — the outcome task 1.2 recorded"
-        );
-
         let vs_sql = format!(
             "SELECT L_ORDERKEY FROM {} WHERE {predicate}",
             vs_lineitem_table()
         );
-        let filter = pushed_scan_filter(&explain_virtual_pushdown_sql(&mut conn, &vs_sql));
-        assert!(
-            filter.contains(r#"("L_LINENUMBER" - 1) <> 0"#)
-                && filter.contains(&format!(
-                    r#"{}("L_ORDERKEY", ("L_LINENUMBER" - 1))"#,
-                    vs_expression::CHECKED_FLOAT_DIV_FN
-                )),
-            "both conjuncts must reach the scan in ONE pushed filter for \
-             `{predicate}`, got `{filter}`"
+        assert_checked_division_reached_the_pushed_filter(&explain_virtual_pushdown_sql(
+            &mut conn, &vs_sql,
+        ));
+        assert_eq!(
+            conn.query_row_count(&vs_sql),
+            oracle_rows,
+            "`{predicate}` must return native Exasol's rows without raising"
         );
     }
-
-    let guard_first_rows = conn.query_row_count(&format!(
-        "SELECT L_ORDERKEY FROM {} WHERE {guard_first}",
-        vs_lineitem_table()
-    ));
-    assert_eq!(
-        guard_first_rows, guarded_rows,
-        "GUARD FIRST must match native Exasol — {guarded_rows} rows, no error \
-         — because the Parquet row filter applies the guard's row selection \
-         before the division is evaluated"
-    );
-
-    // Holds while `datafusion.execution.parquet.reorder_filters` stays false: enabling it
-    // sorts the one-column guard ahead of the division in both orders.
-    let division_first_code = division_by_zero_failure_sql_code(
-        &mut conn,
-        &format!(
-            "SELECT L_ORDERKEY FROM {} WHERE {division_first}",
-            vs_lineitem_table()
-        ),
-    );
-    assert_eq!(
-        division_first_code, UDF_ERROR_SQL_CODE,
-        "DIVISION FIRST raises where native Exasol returns {guarded_rows} rows: \
-         the over-raise direction of tracked exception #392. If this ever stops \
-         raising, the guard has started protecting the division in this order \
-         too and #392 can narrow."
-    );
 }
 
 #[test]

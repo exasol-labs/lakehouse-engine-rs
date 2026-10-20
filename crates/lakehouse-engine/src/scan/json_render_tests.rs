@@ -1,9 +1,10 @@
 use super::*;
+use arrow::array::{Array, ArrayData};
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, FixedSizeListArray, Int32Array,
     LargeListArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
 };
-use arrow::buffer::{NullBuffer, OffsetBuffer};
+use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
 use arrow::datatypes::{DataType, Field, Fields};
 use std::sync::Arc;
 
@@ -439,16 +440,13 @@ fn a_map_column_with_a_null_key_is_refused_with_a_clean_error() {
     )
     .expect("the entries struct must build even with a null key");
     let entries_field = Arc::new(Field::new("entries", entries.data_type().clone(), false));
-    let column: ArrayRef = Arc::new(
-        MapArray::try_new(
-            entries_field,
-            OffsetBuffer::new(vec![0, 2].into()),
-            entries,
-            None,
-            false,
-        )
-        .expect("a map array with a null key child must still build"),
-    );
+    let data = ArrayData::builder(DataType::Map(entries_field, false))
+        .len(1)
+        .add_buffer(Buffer::from_slice_ref([0i32, 2]))
+        .add_child_data(entries.into_data());
+    // SAFETY: the offsets and child are consistent. Arrow's Parquet map reader builds the same
+    // way, which skips the nullable-key check that `MapArray::try_new` would apply.
+    let column: ArrayRef = Arc::new(MapArray::from(unsafe { data.build_unchecked() }));
 
     let error = render_nested_column_as_json(&column)
         .expect_err("a map with a null key must be refused, not silently rendered");

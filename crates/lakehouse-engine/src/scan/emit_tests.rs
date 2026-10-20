@@ -33,7 +33,7 @@ fn redact_storage_error_redacts_secret_values_end_to_end() {
 
 struct CapturingCtx {
     rows: Vec<Vec<Value>>,
-    ipc_batches: Vec<Vec<u8>>,
+    batches: Vec<RecordBatch>,
     output_columns: Vec<exasol_udf_sdk::value::ColumnInfo>,
     /// Arity beyond what `output_column` hands out: a truncated declaration.
     declared_arity_override: Option<usize>,
@@ -44,7 +44,7 @@ impl CapturingCtx {
     fn with_columns(columns: Vec<ColumnInfo>) -> Self {
         Self {
             rows: Vec::new(),
-            ipc_batches: Vec::new(),
+            batches: Vec::new(),
             output_columns: columns,
             declared_arity_override: None,
         }
@@ -55,18 +55,7 @@ impl CapturingCtx {
     }
 
     fn decoded_batches(&self) -> Vec<RecordBatch> {
-        use arrow::ipc::reader::StreamReader;
-        use std::io::Cursor;
-        self.ipc_batches
-            .iter()
-            .map(|bytes| {
-                StreamReader::try_new(Cursor::new(bytes), None)
-                    .expect("IPC bytes must be a valid Arrow IPC stream")
-                    .next()
-                    .expect("IPC stream must contain exactly one batch")
-                    .expect("IPC read must not error")
-            })
-            .collect()
+        self.batches.clone()
     }
 }
 
@@ -105,10 +94,25 @@ impl exasol_udf_sdk::context::UdfContext for CapturingCtx {
     fn next(&mut self) -> Result<bool, exasol_udf_sdk::error::UdfError> {
         Ok(false)
     }
-    fn emit_record_batch_ipc(&mut self, ipc: &[u8]) -> Result<(), exasol_udf_sdk::error::UdfError> {
-        self.ipc_batches.push(ipc.to_vec());
+    fn emit_record_batch_ffi(
+        &mut self,
+        array: *mut core::ffi::c_void,
+        schema: *mut core::ffi::c_void,
+    ) -> Result<(), exasol_udf_sdk::error::UdfError> {
+        self.batches.push(import_ffi_batch(array, schema));
         Ok(())
     }
+}
+
+/// Takes ownership of the exported array the way the SLC host does.
+fn import_ffi_batch(array: *mut core::ffi::c_void, schema: *mut core::ffi::c_void) -> RecordBatch {
+    use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+    let array =
+        unsafe { std::ptr::replace(array.cast::<FFI_ArrowArray>(), FFI_ArrowArray::empty()) };
+    let schema = unsafe { &*schema.cast::<FFI_ArrowSchema>() };
+    let data =
+        unsafe { arrow::ffi::from_ffi(array, schema) }.expect("valid C Data Interface batch");
+    RecordBatch::from(arrow::array::StructArray::from(data))
 }
 
 struct VecStream {
@@ -166,7 +170,7 @@ async fn emits_batch_by_batch_without_materializing() {
     assert_eq!(total, 6, "total must equal sum of all batch row counts");
 
     assert_eq!(
-        ctx.ipc_batches.len(),
+        ctx.batches.len(),
         3,
         "exactly 3 IPC payloads must be captured (one per input batch)"
     );
@@ -636,7 +640,7 @@ async fn emit_stream_coerces_columns_to_declared_exatypes_before_emit_batch() {
         .expect("emit_stream must succeed and coerce to declared ExaTypes");
 
     assert_eq!(total, 3, "all 3 rows must be counted");
-    assert_eq!(ctx.ipc_batches.len(), 1, "exactly 1 IPC payload");
+    assert_eq!(ctx.batches.len(), 1, "exactly 1 emitted batch");
 
     let decoded = ctx.decoded_batches();
     let decoded_batch = &decoded[0];
@@ -986,7 +990,7 @@ async fn emit_stream_fails_when_declared_column_count_disagrees() {
             "{label}: the error must name both counts: {text}"
         );
         assert!(
-            ctx.ipc_batches.is_empty(),
+            ctx.batches.is_empty(),
             "{label}: no batch may be emitted when the declaration disagrees"
         );
     }
@@ -1016,7 +1020,7 @@ async fn emit_stream_fails_on_an_out_of_range_date_and_emits_nothing() {
         "the error must name the column and the day count: {text}"
     );
     assert!(
-        ctx.ipc_batches.is_empty(),
+        ctx.batches.is_empty(),
         "no batch may be emitted when a date is out of range"
     );
 }
@@ -1038,7 +1042,7 @@ async fn emit_stream_fails_when_a_declared_column_cannot_be_read() {
         "the error must name the column index it could not read: {text}"
     );
     assert!(
-        ctx.ipc_batches.is_empty(),
+        ctx.batches.is_empty(),
         "no batch may be emitted when a declared column cannot be read"
     );
 }
@@ -1067,7 +1071,7 @@ async fn emit_stream_fails_on_numeric_with_out_of_range_payload() {
             "{label}: the error must name the offending column: {text}"
         );
         assert!(
-            ctx.ipc_batches.is_empty(),
+            ctx.batches.is_empty(),
             "{label}: no batch may be emitted, and no Utf8 may be substituted"
         );
     }
@@ -1118,7 +1122,7 @@ async fn coerce_fails_when_a_value_does_not_fit_its_declared_target() {
         "the error must name the column that could not be coerced: {text}"
     );
     assert!(
-        ctx.ipc_batches.is_empty(),
+        ctx.batches.is_empty(),
         "no batch may be emitted, and no NULL may be substituted for the value"
     );
 }

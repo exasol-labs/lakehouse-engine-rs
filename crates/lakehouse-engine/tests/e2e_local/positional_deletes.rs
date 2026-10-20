@@ -48,9 +48,6 @@ fn ids_column(cols: &[Vec<serde_json::Value>]) -> Vec<i64> {
     cols[0].iter().map(parse_int).collect()
 }
 
-// #345: iceberg-rust's `DeleteFileIndex` ignores `referenced_data_file`, so each
-// data file resolves BOTH delete files. Once fixed upstream, tighten to exactly
-// one delete file per data file.
 #[test]
 fn fixture_spark_file_granularity_delete_table() {
     setup_e2e();
@@ -74,9 +71,8 @@ fn fixture_spark_file_granularity_delete_table() {
     for entry in &files {
         assert_eq!(
             entry.deletes.len(),
-            2,
-            "file granularity (pending #345): data file {} \
-             must resolve both partition-scoped delete files, got {}",
+            1,
+            "file granularity: data file {} must resolve only its own delete file, got {}",
             entry.path,
             entry.deletes.len()
         );
@@ -104,9 +100,8 @@ fn fixture_spark_file_granularity_delete_table() {
     );
     for (path, count) in &refs_per_delete_path {
         assert_eq!(
-            *count, 2,
-            "delete file {path} must be resolved by both data files under the \
-             current iceberg-rust partition-scoped matching, got {count}"
+            *count, 1,
+            "delete file {path} must be resolved by exactly one data file, got {count}"
         );
     }
 }

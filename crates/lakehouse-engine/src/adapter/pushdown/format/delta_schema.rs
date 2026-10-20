@@ -7,7 +7,7 @@ use crate::scan::spec::{LogicalField, NestedField, NestedMembers};
 use crate::types::mapping::exasol_representable_catalog_decimal;
 
 use super::RefusedColumn;
-use crate::adapter::column_notes::binary_cause;
+use crate::adapter::column_notes::{binary_cause, variant_cause};
 
 #[cfg(test)]
 #[path = "delta_schema_tests.rs"]
@@ -366,12 +366,6 @@ fn refused_container_member(
         column.name(),
         column.data_type(),
     )
-}
-
-fn variant_cause() -> String {
-    "has type 'variant', whose on-disk form is an opaque (metadata, value) binary pair this engine \
-     cannot render as a meaningful value"
-        .to_string()
 }
 
 /// Per the Delta protocol's § Type Change Metadata.

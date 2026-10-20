@@ -534,7 +534,7 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
 }
 
 /// The default adapter binds by name, so fed logical names it emits `Column`s with LOGICAL
-/// names. In DataFusion 54 the Parquet opener applies the adapter to the projection too, and
+/// names. DataFusion's Parquet opener applies the adapter to the projection too, and
 /// `build_projection_read_plan`, `reassign_expr_columns`, and `make_projector` resolve by name
 /// against the REAL file schema, failing with `Unable to get field named "rating"`. So resolved
 /// columns are renamed back to the physical name at their already-correct index.

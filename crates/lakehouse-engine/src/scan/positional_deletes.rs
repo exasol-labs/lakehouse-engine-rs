@@ -7,6 +7,7 @@
 
 use crate::scan::deletion_vectors::{DeletionVector, LoggedDeletionVector};
 use crate::scan::diagnostics;
+use crate::scan::parquet_reader::SizedParquetReader;
 use crate::scan::partition_values::PartitionedScanSchema;
 use crate::scan::raw_scan::scan_table_parquet_format;
 use crate::scan::spec::{DeleteMechanism, FileEntry, StorageBackend};
@@ -32,7 +33,7 @@ use futures::StreamExt;
 use futures::future::try_join_all;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::{PageIndexPolicy, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 use roaring::RoaringTreemap;
@@ -47,9 +48,9 @@ const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
 /// `selected_row_groups` lists surviving row groups; deletes in pruned ones are stepped over.
 ///
 /// Vendored from apache/iceberg-rust
-/// (`crates/iceberg/src/arrow/reader/positional_deletes.rs::build_deletes_row_selection`, tag
-/// `v0.10.0`), where it is not importable. Algorithmically identical, but takes a
-/// [`RoaringTreemap`] directly instead of iceberg's private `DeleteVector`. Upstream tracking: #344.
+/// (`crates/iceberg/src/arrow/reader/positional_deletes.rs::build_deletes_row_selection`), where
+/// it is `pub(super)`. Algorithmically identical, but takes the mechanism-agnostic
+/// [`RoaringTreemap`] that Delta deletion vectors also merge into. #344.
 pub(crate) fn build_deletes_row_selection(
     row_group_metadata_list: &[RowGroupMetaData],
     selected_row_groups: &Option<Vec<usize>>,
@@ -285,8 +286,7 @@ async fn read_delete_file_positions(
     assigned: &HashSet<String>,
     secrets: &[String],
 ) -> Result<HashMap<String, RoaringTreemap>, UdfError> {
-    let reader = ParquetObjectReader::new(store, delete_meta.location.clone())
-        .with_file_size(delete_meta.size);
+    let reader = SizedParquetReader::new(store, delete_meta.location.clone(), delete_meta.size);
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
         .await
         .map_err(|e| UdfError::User(redact(format!("failed to open delete file: {e}"), secrets)))?;
@@ -717,7 +717,8 @@ impl TableProvider for PositionalDeleteScanTable {
             }) as Arc<_>
         });
 
-        // One file group ⇒ one output partition; with `target_partitions = 1` no repartition.
+        // DataFusion splits the one file group into `target_partitions` byte ranges, and each
+        // range keeps its file's base access plan.
         let config = FileScanConfigBuilder::new(self.object_store_url.clone(), file_source)
             .with_file_group(FileGroup::new(files))
             .with_projection_indices(self.schema.remap_projection(projection))?

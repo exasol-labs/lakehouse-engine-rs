@@ -15,7 +15,7 @@
  │ LAKEHOUSE_DISTRIBUTE_FILES │──────────────────────▶│ LAKEHOUSE_SCAN x G shards        │
  │ (Lua SET passthrough)      │                       │  datafusion-scan ─▶ object store ─┼──▶ S3 / ADLS Gen2 Parquet
  └────────────────────────────┘                       └───────────────┬──────────────────┘
-                                                                      │ Arrow IPC or Value rows
+                                                                      │ Arrow C Data or Value rows
                                                                       ▼
                                                       Exasol merge (final agg, ORDER BY, LIMIT) ─▶ result
 ```
@@ -50,7 +50,7 @@
 - format-readers -> sharding -> pushdown-planner: the file list becomes G byte-balanced shards, each serialized as `common` and `files` JSON strings in the dispatch SQL
 - dispatch SQL -> LAKEHOUSE_DISTRIBUTE_FILES -> GROUP BY shard_key -> LAKEHOUSE_SCAN: Exasol runs one scan invocation per shard row on its node VM pool
 - LAKEHOUSE_SCAN -> datafusion-scan -> scan-object-store -> object storage: Parquet byte ranges stream into one DataFusion plan per invocation
-- datafusion-scan -> Exasol: raw and join rows leave as Arrow IPC bytes via `ctx.emit_batch`, partial aggregates leave as SDK `Value` rows via `ctx.emit`
+- datafusion-scan -> Exasol: raw and join rows leave through the Arrow C Data Interface via `ctx.emit_batch`, partial aggregates leave as SDK `Value` rows via `ctx.emit`
 - Exasol -> result: the dispatch SQL wrapper merges partial aggregates and applies the final ORDER BY and LIMIT
 
 ## Interfaces
@@ -69,11 +69,11 @@
 
 ## Constraints
 
-- The toolchain is pinned to Rust 1.94 with edition 2024.
-- The release `.so` builds only in the `rust:1.94-trixie` image (glibc 2.41), because the SLC rejects a `.so` whose SDK fingerprint (`exasol-udf-sdk` version and rustc hash) differs from its own.
-- `exasol-udf-sdk` and `exasol-udf-macros` stay pinned at 0.30.0 in the workspace manifest, and that version is also the SLC version.
+- The toolchain is pinned in `rust-toolchain.toml`, with edition 2024.
+- The release `.so` builds only in the Makefile's `UDF_BUILDER_IMAGE`, whose rustc and glibc match the SLC, because the SLC rejects a `.so` whose SDK fingerprint (`exasol-udf-sdk` version and rustc hash) differs from its own.
+- `exasol-udf-sdk` and `exasol-udf-macros` are pinned in the workspace manifest to the SLC's own version.
 - `arrow` and `parquet` stay on major 58 to match `datafusion` 54 and the SDK.
-- Arrow types never cross the `.so` boundary. Only SDK `Value`s or Arrow IPC bytes from `ctx.emit_batch` cross it.
+- Arrow types never cross the `.so` boundary. Only SDK `Value`s or the Arrow C Data Interface structs from `ctx.emit_batch` cross it.
 - UDFs keep no cross-call state. The scan UDF builds its Tokio runtime per call and never caches it.
 - The engine owns no persisted metadata. Exasol stores the adapterNotes values (`TABLE_MAP`, `SKIPPED_TABLES`, tuning values) and the column notes between CREATE and pushdown.
 - A table's declared schema is decided at CREATE, REFRESH, or SET and read from its column notes at pushdown. No format reader derives a logical schema, a partition column, or a refusal at pushdown.

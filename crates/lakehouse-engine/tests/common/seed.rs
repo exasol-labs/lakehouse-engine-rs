@@ -1221,11 +1221,12 @@ pub async fn seed_partitioned(catalog_url: &str, warehouse: &str) -> Result<()> 
     // The partition field needs an explicit field-id (partition ids start at 1000): an
     // unbound spec serializes `field-id: null`, which the REST catalog rejects.
     let partition_field = UnboundPartitionField::builder()
-        .source_id(2)
+        .source_ids(vec![2])
         .field_id(1000)
         .name(PART_COL.to_string())
         .transform(Transform::Identity)
-        .build();
+        .build()
+        .context("build regions partition field")?;
     let partition_spec = UnboundPartitionSpec::builder()
         .with_spec_id(1)
         .add_partition_fields([partition_field])
@@ -1397,11 +1398,12 @@ pub async fn seed_pruning_cases(catalog_url: &str, warehouse: &str) -> Result<()
         .build()
         .context("build pruning fixture Iceberg schema")?;
     let partition_field = UnboundPartitionField::builder()
-        .source_id(2)
+        .source_ids(vec![2])
         .field_id(1000)
         .name(PRUNING_PARTITION_COLUMN.to_string())
         .transform(Transform::Identity)
-        .build();
+        .build()
+        .context("build pruning fixture partition field")?;
     let partition_spec = UnboundPartitionSpec::builder()
         .with_spec_id(1)
         .add_partition_fields([partition_field])
@@ -1468,7 +1470,7 @@ async fn write_pruning_file(table: &Table, file: &PruningFile) -> Result<Vec<Dat
         .with_context(|| format!("close the {} data file writer", file.label))
 }
 
-// iceberg-rust 0.10 has no schema-evolution API, so the rename (#26) is applied via a
+// iceberg-rust has no rename in its schema-evolution API, so the rename (#26) is applied via a
 // raw REST `add-schema` + `set-current-schema` commit to the Java REST fixture.
 
 pub const E2E_EVO_TABLE: &str = "evo";

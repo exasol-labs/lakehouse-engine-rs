@@ -33,7 +33,7 @@ impl PartitionedScanSchema {
         if partition_columns.is_empty() {
             return Ok(Self {
                 scan_index_by_declared: (0..declared.fields().len()).collect(),
-                file_source: TableSchema::from_file_schema(Arc::clone(&declared)),
+                file_source: TableSchema::from(Arc::clone(&declared)),
                 declared,
             });
         }
@@ -90,13 +90,14 @@ impl PartitionedScanSchema {
 
         partition_slots.sort_by_key(|(position, _)| *position);
         Ok(Self {
-            file_source: TableSchema::new(
-                Arc::new(Schema::new(file_fields)),
-                partition_slots
-                    .into_iter()
-                    .map(|(_, field)| field)
-                    .collect(),
-            ),
+            file_source: TableSchema::builder(Arc::new(Schema::new(file_fields)))
+                .with_table_partition_cols(
+                    partition_slots
+                        .into_iter()
+                        .map(|(_, field)| field)
+                        .collect::<Vec<_>>(),
+                )
+                .build(),
             scan_index_by_declared,
             declared,
         })

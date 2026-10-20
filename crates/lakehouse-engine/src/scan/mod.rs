@@ -32,6 +32,8 @@ mod checked_div;
 mod exasol_numeric;
 mod raised_failure;
 
+pub(crate) mod parquet_reader;
+
 mod object_store;
 pub(crate) use self::object_store::{
     build_admission_limited_store, build_table_root_store, store_root_url,
@@ -150,8 +152,8 @@ pub fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
         );
 
     if spec.common.join.is_some() {
-        // `HashJoinExec` builds from the left child, where the dimension sits. Statistics
-        // collection is disabled, so `JoinSelection` swaps would be non-deterministic; turning
+        // `HashJoinExec` builds from the left child, where the dimension sits. The scan provider
+        // reports no statistics, so `JoinSelection` swaps would be non-deterministic; turning
         // reordering off pins the bounded dimension as the build side.
         config.set_bool("datafusion.optimizer.join_reordering", false)
     } else {

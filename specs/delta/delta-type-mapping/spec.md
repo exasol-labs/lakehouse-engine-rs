@@ -181,8 +181,8 @@ surface this feature maps, quoted from its § Schema Serialization Format:
   struct and map on both formats and removing Delta's refusal once it lands.
 * **`binary` has no faithful text rendering, so it is refused rather than tagged `utf8`.**
   `can_cast_types(Binary, Utf8)` is `true`, but a byte sequence that is not valid UTF-8 has no text
-  value. A `utf8`-tagged column over such bytes fails the whole query (sqlCode 22002,
-  `emit_batch: IPC read: Invalid UTF8 sequence`, measured live). Issue #351 owns a rendering.
+  value. A `utf8`-tagged column over such bytes fails the whole query (Exasol rejects the emitted
+  bytes with `Invalid bytestream`, measured live on the Glue path). Issue #351 owns a rendering.
 * **`byte` and `short` reuse the existing `int32` tag rather than adding `int8`/`int16` tags.** The
   compact tag vocabulary shared by `arrow_type_to_tag`/`arrow_type_from_tag` in
   `crates/lakehouse-engine/src/types/mapping.rs` has no `int8` or `int16` entry, and Exasol's own

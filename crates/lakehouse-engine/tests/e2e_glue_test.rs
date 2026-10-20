@@ -647,7 +647,7 @@ fn check_all_types_declare_and_return_their_mapped_values(_run: &GlueRun, conn: 
         ],
     );
     assert_decimal_orders_numerically(conn, VS, ALL_TYPES, "H_DECIMAL_18_0");
-    assert_binary_values_refused(conn, VS, BINARY_VALUES, "Invalid UTF8 sequence");
+    assert_binary_values_refused(conn, VS, BINARY_VALUES, "Invalid bytestream");
 }
 
 /// Scenario: Session credentials sign every native Glue request

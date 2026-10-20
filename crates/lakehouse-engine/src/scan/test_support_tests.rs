@@ -179,7 +179,11 @@ impl exasol_udf_sdk::context::UdfContext for SinkCtx {
     fn next(&mut self) -> Result<bool, exasol_udf_sdk::error::UdfError> {
         Ok(false)
     }
-    fn emit_record_batch_ipc(&mut self, _: &[u8]) -> Result<(), exasol_udf_sdk::error::UdfError> {
+    fn emit_record_batch_ffi(
+        &mut self,
+        _: *mut core::ffi::c_void,
+        _: *mut core::ffi::c_void,
+    ) -> Result<(), exasol_udf_sdk::error::UdfError> {
         Ok(())
     }
 }
