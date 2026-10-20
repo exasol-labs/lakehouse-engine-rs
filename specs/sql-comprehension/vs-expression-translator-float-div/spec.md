@@ -147,7 +147,7 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
   therefore scoped to error-raising alone, never to row content, and is tracked as a separate
   issue rather than left unstated `(#392)`. The divergence runs in both directions:
   DataFusion may also evaluate the division for a row an adjacent conjunct already excluded, so a
-  query native Exasol answers can raise. The next bullet states when that happens.
+  query native Exasol answers can raise.
 * **A guard protects a division only when DataFusion orders the guard first.** DataFusion's
   `PushDownFilter` moves every cheap conjunct ahead of every expensive one and keeps the written
   order within each class. A conjunct is cheap when each of its nodes is a column, a literal, a
@@ -156,9 +156,11 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
   then evaluates the conjuncts in that order and narrows the row selection after each one, because
   `datafusion.execution.parquet.reorder_filters` stays at its default `false`. So a cheap guard
   such as `<d> <> 0` protects the division in both conjunct orders. An expensive guard such as
-  `ABS(<d>) <> 0` protects it only when written first. Written second, the query raises where
-  native Exasol returns rows. This over-raise direction is part of the same tracked exception
-  `(#392)`.
+  `ABS(<d>) <> 0` protects it only when written first. Written second, the query raises, and so
+  does the same query over a native Exasol table. A cheap guard written second is the reverse case:
+  the scan returns rows where a native Exasol table raises. This suppression direction is part of
+  the same tracked exception `(#392)`. An inline `UNION ALL` of literal rows raises in neither
+  order, so it is no oracle for a guarded division.
 * **The `0/0` NaN route into `#246` closes; `#246` itself stays open.** A `0/0` now raises at the
   checked division and never reaches `emit_batch`, so the widening this feature previously recorded
   against `#246` is withdrawn. `#246` continues to cover every other way a `NaN` reaches the
@@ -254,10 +256,10 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
 * *AND* a NULL divisor SHALL still yield NULL and SHALL NOT raise, so `WHERE <a> / NULL > 0` returns no rows rather than failing
 * *AND* the error SHALL be raised only for a row whose division the scan actually evaluates: DataFusion MAY skip the division for a row that another conjunct, file pruning, row-group pruning, or a LIMIT already removed, and whether native Exasol raises for such a row is NOT measured, so the residual is scoped to error-raising alone and recorded as a tracked exception `(#392)`
 * *AND* the rows a successful query returns SHALL NOT be affected by that residual: a row reaches the result only when its division was evaluated and finite, so a query that does not raise returns exactly the rows native Exasol returns
-* *AND* a GUARDED division with a cheap guard SHALL return native Exasol's rows without raising in BOTH conjunct orders: over the 20-row fixture, `WHERE (L_LINENUMBER - 1) <> 0 AND 0 < L_ORDERKEY / (L_LINENUMBER - 1)` and its reversed order each return the 10 rows native Exasol returns, while native Exasol raises `22012` for the same division without the guard
+* *AND* a GUARDED division with a cheap guard SHALL return the guarded rows without raising in BOTH conjunct orders: over the 20-row fixture, `WHERE (L_LINENUMBER - 1) <> 0 AND 0 < L_ORDERKEY / (L_LINENUMBER - 1)` and its reversed order each return 10 rows, while native Exasol raises `22012` for the same division without the guard. Over a native Exasol table, the reversed order also raises `22012`, which the suppression direction of the tracked exception covers `(#392)`
 * *AND* that protection SHALL come from conjunct order, not from batch selectivity: DataFusion's `PushDownFilter` places cheap conjuncts before expensive ones, the checked division is an expensive function call, and the Parquet row filter evaluates the conjuncts in that order while `datafusion.execution.parquet.reorder_filters` stays `false`
 * *AND* the checked division MUST stay `Immutable`: DataFusion neither reorders a conjunction that holds a `Volatile` expression nor pushes such a filter into the scan, so a `Volatile` declaration would remove the only protection a guarded division has
-* *AND* a guard that is itself a function call, such as `ABS(L_LINENUMBER - 1) <> 0`, SHALL protect the division only when written first: written second, the query raises `data exception - division by zero` where native Exasol returns rows. This over-raise direction is covered by the SAME tracked exception as the suppression direction `(#392)`, because both follow from one fact: the error is a per-row side effect of an expression DataFusion evaluates over a row set of its own choosing
+* *AND* a guard that is itself a function call, such as `ABS(L_LINENUMBER - 1) <> 0`, SHALL protect the division only when written first: written second, the query raises `data exception - division by zero`, and the same query over a native Exasol table raises `22012`
 
 ### Scenario: Zero divided by zero fails the query instead of reaching the NaN-at-emit gap
 
