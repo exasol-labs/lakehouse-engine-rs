@@ -1,5 +1,5 @@
 use crate::scan::checked_div::find_checked_float_div_error;
-use crate::scan::convert::check_date32_in_exasol_range;
+use crate::scan::convert::{check_date32_in_exasol_range, check_strings_are_utf8};
 use crate::scan::diagnostics::PhaseTimers;
 use crate::scan::exasol_numeric::numeric_overflow;
 use crate::scan::raised_failure::session_raised_failure;
@@ -92,14 +92,17 @@ pub(crate) fn check_declared_arity(
 
 /// Keyed on the Arrow type, not the declaration, because a `GROUP BY` key is declared `VARCHAR`
 /// yet leaves as Date32. Errors name `declared[i].name` for `columns[i]`.
-pub(crate) fn check_emitted_dates_in_range(
+pub(crate) fn check_emitted_values(
     columns: &[ArrayRef],
     declared: &[ColumnInfo],
 ) -> Result<(), UdfError> {
     columns
         .iter()
         .zip(declared)
-        .try_for_each(|(column, declared)| check_date32_in_exasol_range(column, &declared.name))
+        .try_for_each(|(column, declared)| {
+            check_date32_in_exasol_range(column, &declared.name)?;
+            check_strings_are_utf8(column, &declared.name)
+        })
 }
 
 /// `declared[i]` is positionally aligned with the batch columns. Matching columns are kept as
@@ -123,7 +126,7 @@ pub fn coerce_batch_to_exa_types(
         .zip(&targets)
         .all(|(f, t)| f.data_type() == t)
     {
-        check_emitted_dates_in_range(batch.columns(), declared)?;
+        check_emitted_values(batch.columns(), declared)?;
         return Ok(batch);
     }
 
@@ -146,7 +149,7 @@ pub fn coerce_batch_to_exa_types(
         new_columns.push(coerced);
     }
 
-    check_emitted_dates_in_range(&new_columns, declared)?;
+    check_emitted_values(&new_columns, declared)?;
     let new_schema = Arc::new(Schema::new(new_fields));
     RecordBatch::try_new(new_schema, new_columns).map_err(|e| {
         UdfError::User(format!(

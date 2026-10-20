@@ -1026,6 +1026,44 @@ async fn emit_stream_fails_on_an_out_of_range_date_and_emits_nothing() {
 }
 
 #[tokio::test]
+async fn emit_stream_fails_on_a_string_that_is_not_utf8_and_emits_nothing() {
+    use arrow::array::StringArray;
+    use arrow::buffer::{Buffer, OffsetBuffer};
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "C_BYTES",
+        DataType::Utf8,
+        true,
+    )]));
+    // SAFETY: the offsets are in bounds. The Parquet reader builds an unannotated BYTE_ARRAY read
+    // as Utf8 the same way, without checking that the bytes are UTF-8.
+    let column = unsafe {
+        StringArray::new_unchecked(
+            OffsetBuffer::new(vec![0, 2, 4].into()),
+            Buffer::from_slice_ref(b"ok\xff\xfe"),
+            None,
+        )
+    };
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(column)]).unwrap();
+    let mut ctx = CapturingCtx::declaring(&[("C_BYTES", varchar())]);
+    let stream = Box::pin(VecStream::new(vec![batch]));
+    let mut timers = PhaseTimers::start();
+
+    let err = emit_stream(&mut ctx, stream, &[], &mut timers)
+        .await
+        .expect_err("a string that is not UTF-8 must fail the call");
+    let text = err.to_string();
+    assert!(
+        text.contains("C_BYTES") && text.contains("Invalid UTF8 sequence"),
+        "the error must name the column and the invalid UTF-8: {text}"
+    );
+    assert!(
+        ctx.batches.is_empty(),
+        "no batch may be emitted when a string is not UTF-8"
+    );
+}
+
+#[tokio::test]
 async fn emit_stream_fails_when_a_declared_column_cannot_be_read() {
     // Arity 2 but only column 0 available: a truncated declaration.
     let mut ctx = CapturingCtx::with_columns(declared(&[("C0", ExaType::Int32)]));

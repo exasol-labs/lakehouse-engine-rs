@@ -35,6 +35,7 @@ Refuses at plan time every column whose type is binary, on every source and at e
 * *WHEN* a query reads `name`
 * *THEN* the scan SHALL admit the column and render it as text (`scan-types/type-relaxation`), because the catalog declares it a string
 * *AND* a value that is not valid UTF-8 SHALL fail the query and MUST NOT be returned altered
+* *AND* the scan SHALL check every emitted string column for valid UTF-8 and fail naming the column, because DataFusion reads such a column straight into a string type and the Parquet reader checks UTF-8 only for annotated columns
 * *AND* a catalog-declared source SHALL refuse a column only by its declared type
 
 ### Scenario: A direct-storage unannotated BYTE_ARRAY column is refused
