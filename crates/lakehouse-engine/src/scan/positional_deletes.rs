@@ -717,7 +717,8 @@ impl TableProvider for PositionalDeleteScanTable {
             }) as Arc<_>
         });
 
-        // One file group ⇒ one output partition; with `target_partitions = 1` no repartition.
+        // DataFusion splits the one file group into `target_partitions` byte ranges, and each
+        // range keeps its file's base access plan.
         let config = FileScanConfigBuilder::new(self.object_store_url.clone(), file_source)
             .with_file_group(FileGroup::new(files))
             .with_projection_indices(self.schema.remap_projection(projection))?
