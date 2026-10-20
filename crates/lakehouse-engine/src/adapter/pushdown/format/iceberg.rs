@@ -465,32 +465,38 @@ async fn plan_files_from_table(
     })?;
 
     // Delete paths are relativized later in `relativize_shards_to_root`, like data-file paths.
-    let refuse = |mechanism| unsupported_delete_error(mechanism, table_name);
     tasks
-        .into_iter()
-        .map(|t| {
-            classify_planned_file(iceberg::spec::DataContentType::Data, t.data_file_format())
-                .map_err(refuse)?;
-            let deletes = t
-                .deletes()
-                .iter()
-                .map(|d| {
-                    classify_planned_file(d.file_type(), d.file_format()).map_err(refuse)?;
-                    Ok(iceberg_delete_mechanism(
-                        d.file_path().to_string(),
-                        d.file_size_in_bytes(),
-                        d.file_type(),
-                        d.file_format(),
-                    ))
-                })
-                .collect::<Result<_, UdfError>>()?;
-            Ok(FileEntry::with_deletes(
-                t.data_file_path().to_string(),
-                t.file_size_in_bytes(),
-                deletes,
+        .iter()
+        .map(planned_file_entry)
+        .collect::<Result<_, _>>()
+        .map_err(|mechanism| unsupported_delete_error(mechanism, table_name))
+}
+
+fn planned_file_entry(
+    task: &iceberg::scan::FileScanTask,
+) -> Result<FileEntry, UnsupportedDeleteMechanism> {
+    classify_planned_file(
+        iceberg::spec::DataContentType::Data,
+        task.data_file_format(),
+    )?;
+    let deletes = task
+        .deletes()
+        .iter()
+        .map(|d| {
+            classify_planned_file(d.file_type(), d.file_format())?;
+            Ok(iceberg_delete_mechanism(
+                d.file_path().to_string(),
+                d.file_size_in_bytes(),
+                d.file_type(),
+                d.file_format(),
             ))
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok(FileEntry::with_deletes(
+        task.data_file_path().to_string(),
+        task.file_size_in_bytes(),
+        deletes,
+    ))
 }
 
 fn first_refused_member(field_type: &iceberg::spec::Type, path: &str) -> Option<(String, String)> {

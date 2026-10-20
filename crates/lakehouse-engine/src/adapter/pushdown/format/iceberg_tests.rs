@@ -279,6 +279,122 @@ fn iceberg_delete_mechanism_maps_position_equality_and_the_data_sentinel() {
     );
 }
 
+fn scan_task(
+    format: DataFileFormat,
+    deletes: Vec<iceberg::scan::FileScanTaskDeleteFile>,
+) -> iceberg::scan::FileScanTask {
+    iceberg::scan::FileScanTask::builder()
+        .with_file_size_in_bytes(100)
+        .with_start(0)
+        .with_length(100)
+        .with_data_file_path("s3://bucket/t/data-0".to_string())
+        .with_data_file_format(format)
+        .with_schema(std::sync::Arc::new(
+            iceberg::spec::Schema::builder()
+                .build()
+                .expect("an empty schema"),
+        ))
+        .with_project_field_ids(vec![])
+        .with_deletes(deletes)
+        .with_case_sensitive(true)
+        .build()
+        .expect("a scan task")
+}
+
+fn delete_file(
+    path: &str,
+    content: DataContentType,
+    format: DataFileFormat,
+) -> iceberg::scan::FileScanTaskDeleteFile {
+    let is_dv = format == DataFileFormat::Puffin;
+    iceberg::scan::FileScanTaskDeleteFile::builder()
+        .with_file_path(path.to_string())
+        .with_file_size_in_bytes(50)
+        .with_file_type(content)
+        .with_file_format(format)
+        .with_partition_spec_id(0)
+        .with_referenced_data_file(is_dv.then(|| "s3://bucket/t/data-0".to_string()))
+        .with_content_offset(is_dv.then_some(4))
+        .with_content_size_in_bytes(is_dv.then_some(40))
+        .with_record_count(is_dv.then_some(2))
+        .build()
+        .expect("a delete file")
+}
+
+#[test]
+fn planned_file_entry_carries_parquet_positional_deletes() {
+    let task = scan_task(
+        DataFileFormat::Parquet,
+        vec![delete_file(
+            "s3://bucket/t/del-0",
+            DataContentType::PositionDeletes,
+            DataFileFormat::Parquet,
+        )],
+    );
+
+    let entry = planned_file_entry(&task).expect("Parquet data with a Parquet positional delete");
+
+    assert_eq!(
+        (entry.path.as_str(), entry.size),
+        ("s3://bucket/t/data-0", 100)
+    );
+    assert_eq!(
+        entry.deletes,
+        vec![DeleteMechanism::IcebergPositionalDelete {
+            path: "s3://bucket/t/del-0".into(),
+            size: 50,
+        }]
+    );
+}
+
+#[test]
+fn planned_file_entry_refuses_an_unsupported_data_or_applied_delete_file() {
+    let positional = delete_file(
+        "s3://bucket/t/del-0",
+        DataContentType::PositionDeletes,
+        DataFileFormat::Parquet,
+    );
+    let cases = [
+        (
+            scan_task(DataFileFormat::Orc, vec![]),
+            UnsupportedDeleteMechanism::OrcDataFile,
+        ),
+        (
+            scan_task(
+                DataFileFormat::Parquet,
+                vec![delete_file(
+                    "s3://bucket/t/dv-0",
+                    DataContentType::PositionDeletes,
+                    DataFileFormat::Puffin,
+                )],
+            ),
+            UnsupportedDeleteMechanism::DeletionVector,
+        ),
+        (
+            scan_task(
+                DataFileFormat::Parquet,
+                vec![
+                    positional,
+                    delete_file(
+                        "s3://bucket/t/eq-0",
+                        DataContentType::EqualityDeletes,
+                        DataFileFormat::Parquet,
+                    ),
+                ],
+            ),
+            UnsupportedDeleteMechanism::EqualityDelete,
+        ),
+    ];
+
+    for (task, expected) in cases {
+        assert_eq!(
+            planned_file_entry(&task).map(|_| ()),
+            Err(expected),
+            "{task:?}"
+        );
+    }
+}
+
 #[test]
 fn resolves_name_mapping_flat_entries_once() {
     let raw = r#"
