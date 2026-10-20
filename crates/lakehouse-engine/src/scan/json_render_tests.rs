@@ -1,9 +1,10 @@
 use super::*;
+use arrow::array::{Array, ArrayData};
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, FixedSizeListArray, Int32Array,
     LargeListArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
 };
-use arrow::buffer::{NullBuffer, OffsetBuffer};
+use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
 use arrow::datatypes::{DataType, Field, Fields};
 use std::sync::Arc;
 
@@ -425,10 +426,8 @@ fn a_non_nested_column_is_refused_by_the_nested_renderer() {
     );
 }
 
-/// The renderer has no null-key branch: arrow 59 makes a null map key unrepresentable, and this
-/// pins that guarantee so a relaxation upstream fails here first.
 #[test]
-fn a_map_array_with_a_nullable_key_field_cannot_be_built() {
+fn a_map_column_with_a_null_key_is_refused_with_a_clean_error() {
     let keys = StringArray::from(vec![None, Some("b")]);
     let values = utf8(&["a", "b"]);
     let entries = StructArray::try_new(
@@ -441,18 +440,24 @@ fn a_map_array_with_a_nullable_key_field_cannot_be_built() {
     )
     .expect("the entries struct must build even with a null key");
     let entries_field = Arc::new(Field::new("entries", entries.data_type().clone(), false));
+    let data = ArrayData::builder(DataType::Map(entries_field, false))
+        .len(1)
+        .add_buffer(Buffer::from_slice_ref([0i32, 2]))
+        .add_child_data(entries.into_data());
+    // SAFETY: the offsets and child are consistent. Arrow's Parquet map reader builds the same
+    // way, which skips the nullable-key check that `MapArray::try_new` would apply.
+    let column: ArrayRef = Arc::new(MapArray::from(unsafe { data.build_unchecked() }));
 
-    let error = MapArray::try_new(
-        entries_field,
-        OffsetBuffer::new(vec![0, 2].into()),
-        entries,
-        None,
-        false,
-    )
-    .expect_err("arrow must refuse a map whose key field admits nulls");
+    let error = render_nested_column_as_json(&column)
+        .expect_err("a map with a null key must be refused, not silently rendered");
 
+    let message = error.to_string();
     assert!(
-        error.to_string().contains("keys field cannot be nullable"),
-        "unexpected refusal: {error}"
+        message.contains("Map"),
+        "the refusal must name the column type: {message}"
+    );
+    assert!(
+        message.to_lowercase().contains("null"),
+        "the refusal must name the null-key cause: {message}"
     );
 }

@@ -12,7 +12,7 @@ use parquet::errors::{ParquetError, Result};
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 
 /// Reads one Parquet object whose size the planner already knows, so the footer fetch issues
-/// no HEAD. Replaces parquet's `ParquetObjectReader`, deprecated in 59.2 (apache/arrow-rs#10308).
+/// no HEAD.
 pub(crate) struct SizedParquetReader {
     store: Arc<dyn ObjectStore>,
     path: Path,

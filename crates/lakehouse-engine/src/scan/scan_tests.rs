@@ -52,6 +52,15 @@ fn session_config_uses_spec_target_partitions() {
 }
 
 #[test]
+fn session_config_disables_listing_statistics_collection() {
+    let config = session_config_for_spec(&minimal_spec());
+    assert!(
+        !config.collect_statistics(),
+        "listing must not read every assigned file's footer for statistics before the scan starts"
+    );
+}
+
+#[test]
 fn runtime_is_current_thread_when_threads_is_one() {
     let rt = build_scan_runtime(1).expect("runtime must build");
     assert_eq!(

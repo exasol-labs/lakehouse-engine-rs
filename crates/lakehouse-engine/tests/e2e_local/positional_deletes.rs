@@ -48,8 +48,6 @@ fn ids_column(cols: &[Vec<serde_json::Value>]) -> Vec<i64> {
     cols[0].iter().map(parse_int).collect()
 }
 
-// #345: `DeleteFileIndex` scopes a file-granularity delete by `referenced_data_file`
-// (apache/iceberg-rust#3024), so each data file resolves only its own delete file.
 #[test]
 fn fixture_spark_file_granularity_delete_table() {
     setup_e2e();

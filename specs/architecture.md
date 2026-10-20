@@ -69,9 +69,9 @@
 
 ## Constraints
 
-- The toolchain is pinned to Rust 1.98.1 with edition 2024.
-- The release `.so` builds only in the `rust:1.98.1-trixie` image (glibc 2.41), because the SLC rejects a `.so` whose SDK fingerprint (`exasol-udf-sdk` version and rustc hash) differs from its own.
-- `exasol-udf-sdk` and `exasol-udf-macros` stay pinned at 0.32.0 in the workspace manifest, and that version is also the SLC version.
+- The toolchain is pinned in `rust-toolchain.toml`, with edition 2024.
+- The release `.so` builds only in the Makefile's `UDF_BUILDER_IMAGE`, whose rustc and glibc match the SLC, because the SLC rejects a `.so` whose SDK fingerprint (`exasol-udf-sdk` version and rustc hash) differs from its own.
+- `exasol-udf-sdk` and `exasol-udf-macros` are pinned in the workspace manifest to the SLC's own version.
 - `arrow` and `parquet` stay on major 58 to match `datafusion` 54 and the SDK.
 - Arrow types never cross the `.so` boundary. Only SDK `Value`s or the Arrow C Data Interface structs from `ctx.emit_batch` cross it.
 - UDFs keep no cross-call state. The scan UDF builds its Tokio runtime per call and never caches it.

@@ -246,8 +246,8 @@ async fn plan_checked_table(
 
     ensure_supported_delete_mechanisms(&table, &table_name, &secrets).await?;
 
-    // A scan without a pinned snapshot binds its filter by name against the current schema
-    // (apache/iceberg-rust#2904), so each declared field id is named as that schema names it.
+    // A scan without a pinned snapshot binds its filter by name against the current schema,
+    // so each declared field id is named as that schema names it.
     let metadata = table.metadata();
     let scanned = metadata
         .current_snapshot()

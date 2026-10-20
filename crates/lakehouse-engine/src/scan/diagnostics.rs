@@ -85,9 +85,9 @@ pub enum OpenerCoverage {
 /// A recorded path absent from `entries` is always a re-fetch (evicted or never admitted).
 ///
 /// A present path with `hits == 0` is ambiguous: `put` counts no hit
-/// (`datafusion-execution-55.2.0/src/cache/default_cache.rs:116`), so it is both a
+/// (`datafusion-execution` `src/cache/default_cache.rs`), so it is both a
 /// looked-up-missed-re-put entry and one the opener never opened. A pushed LIMIT ends the stream
-/// before later files open (`datafusion-datasource-55.2.0/src/file_stream/scan_state.rs:166-186`)
+/// before later files open (`datafusion-datasource` `src/file_stream/scan_state.rs`)
 /// and an inner join with an empty build side never polls the probe side, so `hits == 0` counts
 /// only under [`OpenerCoverage::EveryAssignedFile`].
 pub fn footer_refetch_count(

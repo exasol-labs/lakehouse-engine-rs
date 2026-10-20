@@ -48,9 +48,9 @@ const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
 /// `selected_row_groups` lists surviving row groups; deletes in pruned ones are stepped over.
 ///
 /// Vendored from apache/iceberg-rust
-/// (`crates/iceberg/src/arrow/reader/positional_deletes.rs::build_deletes_row_selection`, rev
-/// `da5cc19`), where it is `pub(super)`. Algorithmically identical, but takes a
-/// [`RoaringTreemap`] directly: iceberg's public `DeleteVector` exposes no inner bitmap. #344.
+/// (`crates/iceberg/src/arrow/reader/positional_deletes.rs::build_deletes_row_selection`), where
+/// it is `pub(super)`. Algorithmically identical, but takes the mechanism-agnostic
+/// [`RoaringTreemap`] that Delta deletion vectors also merge into. #344.
 pub(crate) fn build_deletes_row_selection(
     row_group_metadata_list: &[RowGroupMetaData],
     selected_row_groups: &Option<Vec<usize>>,

@@ -92,14 +92,16 @@ for it instead of failing the scan or returning Arrow display text.
   exceeds the declared length fails at the Exasol emit boundary with a length error rather than being
   truncated, because a truncated JSON document is both invalid and silently wrong.
 * **The encoder is `arrow::json::writer::make_encoder`,** reachable today with no new external
-  dependency: `arrow-json` 58.3.0 is already in `Cargo.lock` and the `arrow` umbrella re-exports it
+  dependency: `arrow-json` is already in `Cargo.lock` and the `arrow` umbrella re-exports it
   as `arrow::json` under its `json` feature, which `datafusion`'s `arrow/default` edge already
   enables. The engine crate declares `features = ["json"]` explicitly so the availability stops
   resting on a transitive feature another crate happens to turn on.
 * **`make_encoder` returns `Result` and three of its failure modes are reachable**, so the encoder is
   fallible rather than infallible: a non-`Utf8` map key (`"Only UTF8 keys supported by JSON MapArray
   Writer"`), a null map key or entry, and a `Union` type. The first is what the map-key
-  stringification exists to remove; the remaining two surface as clean errors.
+  stringification exists to remove; the remaining two surface as clean errors. Arrow's
+  `MapArray::try_new` refuses a nullable key field, but the Parquet map reader builds its array
+  without that check, so a file that writes a null key still reaches the encoder.
 * **A top-level null cell MUST be guarded before encoding.** `make_encoder`'s `Encoder::encode`
   documents *"The behaviour is unspecified if `idx` corresponds to a null index"*, and unguarded it
   renders a null struct as `{}` and a null list as `[]` — both valid JSON and both wrong — while a

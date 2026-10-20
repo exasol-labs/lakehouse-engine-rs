@@ -90,26 +90,34 @@ normative obligations this feature enforces:
   this engine does not implement is therefore query-reachable and its correctness is bounded by
   #322 rather than by a refusal". This feature closes that gap; both recorded clauses are superseded
   in the same plan.
-* **`delta_kernel`'s own support check is not a substitute for this gate.** `ScanBuilder::build()`
-  calls `TableConfiguration::ensure_operation_supported(Operation::Scan)`, whose per-feature
-  classification reports support for essentially every reader feature its enum can parse — the
-  kernel's own doc comment on `TableFeature` states *"The kernel currently supports all reader
-  features"*. That answers whether the KERNEL can read the LOG, not whether THIS ENGINE can interpret
-  the data the log describes. Spike #325 verified the kernel reads both the `type-widening` and the
-  `unshredded-variant` fixture without error, which is why the engine must inspect
-  `protocol.readerFeatures` itself.
+* **`delta_kernel`'s own support check is not a substitute for this gate.** The kernel checks
+  reader features when it loads a snapshot (`Operation::SnapshotLoad`) and again when it builds a
+  scan (`Operation::Scan`). It classifies `variantType`, `variantType-preview`, `variantShredding`,
+  and `variantShredding-preview` as supported, because it can read their LOG, not because this
+  engine can interpret their DATA. Spike #325 verified the kernel reads the `unshredded-variant`
+  fixture without error, so for those four features this gate is the only refusal.
+* **For the other refused features the kernel's snapshot-load error surfaces first.** The kernel
+  classifies `geospatial`, `adaptiveMetadata-preview`, and every unrecognized name as not
+  supported, and it fails a `catalogManaged` or `catalogOwned-preview` table at load because this
+  engine supplies no maximum catalog version. `DeltaSnapshot::open` loads the snapshot before it
+  runs this gate, so such a table fails with the kernel's error, wrapped with the table root. That
+  error names only the first feature the kernel rejects. This is a scoped exception to the
+  one-error-names-every-refusal rule: a table carrying two refused features is still refused
+  before any file is read, but may need two queries to diagnose. The allow-list still omits these
+  features, so a kernel that starts loading them leaves them refused by this gate.
 * **The gate is default-deny.** It matches an explicit allow-list and refuses every other feature, so
   a `delta_kernel` upgrade that adds a `TableFeature` variant refuses that feature by construction
-  rather than admitting it silently. The refusal list in the scenario below is the enumeration as of
-  `delta_kernel` 0.26, recorded so a reader can see what is refused today — the CODE enumerates the
+  rather than admitting it silently. The refusal list in the scenario below is the current kernel's enumeration,
+  recorded so a reader can see what is refused today — the CODE enumerates the
   allow-list only.
 * **`TableFeature::Unknown(_)` is `delta_kernel`'s forward-compatibility catch-all** for a
   `readerFeatures` entry whose name its enum does not recognize. Default-deny refuses it, and its
   inner string names the feature in the error.
 * **Writer-only features are structurally absent from `readerFeatures` and are therefore NOT on the
-  allow-list.** `delta_kernel` 0.26 classifies `appendOnly`, `invariants`, `checkConstraints`,
+  allow-list.** `delta_kernel` classifies `appendOnly`, `invariants`, `checkConstraints`,
   `changeDataFeed`, `generatedColumns`, `identityColumns`, `inCommitTimestamp`, `rowTracking`,
-  `domainMetadata`, `icebergCompatV1`, `icebergCompatV2`, `icebergCompatV3`, `clustering`,
+  `domainMetadata`, `icebergCompatV1`, `icebergCompatV2`, `icebergCompatV3`,
+  `icebergNativeV4-preview`, `clustering`,
   `materializePartitionColumns`, and `allowColumnDefaults` in its enum's writer-only block, so they
   can never appear in a reader-feature list. `domainMetadata` and `inCommitTimestamp` are called out
   because they read as read-affecting and are not: their absence from the allow-list is a
@@ -122,14 +130,17 @@ normative obligations this feature enforces:
   protocol makes `readerFeatures` mandatory — is likewise plain `pub`, so the gate names that version
   by the kernel's own constant rather than by the literal `3` or by reusing
   `MAX_VALID_READER_VERSION`, which happens to hold the same value today for an unrelated reason.
+  The kernel's own `check_reader_version_range` already rejects an out-of-range version at snapshot
+  load, so this check is defense in depth, like the malformed-version-3 check below.
 * **The malformed version-3-without-a-feature-list refusal is defense in depth, not a reachable path
-  today.** `delta_kernel` 0.26 constructs every `Protocol` through `Protocol::try_new`, which already
+  today.** `delta_kernel` constructs every `Protocol` through `Protocol::try_new`, which already
   rejects reader version 3 with no `readerFeatures` (and reader version ≠ 3 WITH one) while parsing
   the log, so a table of that shape fails before this gate sees it. The gate still checks it, because
   the gate's contract is default-deny on its own inputs and the kernel's validation is not this
   engine's to rely on — the same reason `ensure_operation_supported` is not a substitute above.
 * **The reader-feature and reader-version accessors need the `internal-api` cargo feature**, already
-  enabled on `delta_kernel` for `TableConfiguration::partition_columns` and `::column_mapping_mode`.
+  enabled on `delta_kernel` for `TableConfiguration::logical_partition_columns` and
+  `::column_mapping_mode`.
   `Snapshot::table_configuration`, `TableConfiguration::protocol`, `Protocol::reader_features`,
   `Protocol::min_reader_version`, and the `TableFeature` enum are all `#[internal_api]` and become
   `pub` under it. `delta_kernel`'s own `extract_enabled_reader_features` and
@@ -146,14 +157,17 @@ normative obligations this feature enforces:
 * *GIVEN* a Delta table whose `protocol` action declares `minReaderVersion` 3 and a `readerFeatures`
   list holding at least one feature outside this engine's allow-list — one of exactly
   `variantType`, `variantType-preview`, `variantShredding`, `variantShredding-preview`,
-  `catalogManaged`, `catalogOwned-preview`, `adaptiveMetadata-preview`, or a name `delta_kernel` 0.26
-  does not recognize and surfaces as `TableFeature::Unknown`
+  `catalogManaged`, `catalogOwned-preview`, `adaptiveMetadata-preview`, `geospatial`, or a name
+  `delta_kernel` does not recognize and surfaces as `TableFeature::Unknown`
 * *WHEN* the Delta format reader resolves that table's scan
 * *THEN* the reader SHALL return a `UdfError` naming the table root and EVERY refused feature by its
   Delta protocol name — the `readerFeatures` spelling, so `variantType-preview` is reported as
   `variantType-preview` and an unrecognized name is reported verbatim
 * *AND* the reader SHALL name every refused feature in ONE error rather than the first alone, so a
   table carrying two unsupported features is diagnosed in one query instead of two
+* *AND* where `delta_kernel` itself rejects a feature at snapshot load, the reader SHALL instead
+  return the kernel's error wrapped with the table root, which names the first feature the kernel
+  rejects, as the Background records
 * *AND* the refusal formatter SHALL carry NO per-feature special case, because the only one it ever
   held was the `typeWidening` issue-#349 citation and both type-widening variants are now
   allow-listed — a formatter arm for an allow-listed feature is unreachable code that reads as a
@@ -162,9 +176,7 @@ normative obligations this feature enforces:
   prefix, or build the table's logical schema after the refusal, because the refusal exists to stop
   an unsupported table before it costs object-storage access
 * *AND* the reader MUST NOT rely on `delta_kernel` raising the refusal, because
-  `delta_kernel`'s own `ensure_operation_supported(Operation::Scan)` reports support for every reader
-  feature its enum parses and reads both the `type-widening` and `unshredded-variant` fixtures
-  without error
+  `delta_kernel` loads and scans a table carrying any of the four variant features without error
 
 ### Scenario: Every allow-listed reader feature keeps its table queryable
 
@@ -206,6 +218,8 @@ normative obligations this feature enforces:
 * *AND* the bounds SHALL be read from those two `delta_kernel` constants rather than from the
   literals `1` and `3`, so the readable range has ONE owner and a kernel upgrade that widens it does
   not leave a stale copy behind
+* *AND* `delta_kernel` rejects such a version at snapshot load before this check runs, so the table
+  fails with the kernel's error wrapped with the table root, and this check stays as defense in depth
 * *AND* the version check SHALL run BEFORE the per-feature check, so a table declaring an unreadable
   reader version is refused on the version rather than on a feature list the protocol forbids it to
   carry

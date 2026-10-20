@@ -146,6 +146,9 @@ pub fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
         .with_batch_size(spec.common.df_batch_size.max(1))
         .with_parquet_pruning(true)
         .with_parquet_page_index_pruning(true)
+        // DataFusion defaults it on, so listing would read every assigned file's footer for
+        // statistics before the scan opens any file.
+        .with_collect_statistics(false)
         .set_bool(
             "datafusion.execution.parquet.pushdown_filters",
             !raw_scan::scan_renders_nested_json(spec),

@@ -78,7 +78,7 @@ impl DeltaSnapshot {
     }
 
     /// In metadata declaration order (neither schema nor sorted order). Read via the kernel's
-    /// `internal-api` because 0.30 exposes `partitionColumns` nowhere else; re-reading the log
+    /// `internal-api` because the kernel exposes `partitionColumns` nowhere else; re-reading the log
     /// ourselves would duplicate the kernel's current-metadata and checkpoint resolution.
     pub(super) fn partition_columns(&self) -> Vec<String> {
         self.snapshot

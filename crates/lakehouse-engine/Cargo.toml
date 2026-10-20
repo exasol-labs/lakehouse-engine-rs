@@ -45,7 +45,7 @@ iceberg = { workspace = true }
 # Declared here, not in `[workspace.dependencies]`: member manifests enter CI's cache key.
 # `default-features = false` on the default engine: its defaults pick the arrow major and TLS
 # stack, and both must match the rest of the `.so`.
-# `internal-api` is the only way 0.30 exposes partition columns, column-mapping mode, and
+# `internal-api` is the only way the kernel exposes partition columns, column-mapping mode, and
 # the reader protocol; it has no semver guarantee, so its accessors are confined to
 # `format::delta_replay` and `format::delta_protocol`.
 delta_kernel = { version = "0.30.0", features = [
