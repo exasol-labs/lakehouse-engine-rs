@@ -903,7 +903,7 @@ fn path_sorted_letter_values(files: &[FileEntry]) -> Vec<Option<String>> {
             (entry.path.as_str(), value.clone())
         })
         .collect();
-    carried.sort_by(|(left, _), (right, _)| left.cmp(right));
+    carried.sort_by_key(|(left, _)| *left);
     carried.into_iter().map(|(_, value)| value).collect()
 }
 
@@ -1423,7 +1423,7 @@ fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
         .map(|(letter, number)| (letter.as_str().map(str::to_string), parse_int(number)))
         .filter(|(_, number)| cm_ids.contains(number))
         .collect();
-    expected_join.sort_by(|a, b| a.1.cmp(&b.1));
+    expected_join.sort_by_key(|a| a.1);
 
     let join_cols = conn.query_columns(&join_sql);
     let mut actual_join: Vec<(Option<String>, i64)> = join_cols[0]
@@ -1431,7 +1431,7 @@ fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
         .zip(join_cols[1].iter())
         .map(|(letter, id)| (letter.as_str().map(str::to_string), parse_int(id)))
         .collect();
-    actual_join.sort_by(|a, b| a.1.cmp(&b.1));
+    actual_join.sort_by_key(|a| a.1);
 
     assert!(
         !actual_join.is_empty(),
@@ -1941,7 +1941,7 @@ fn unity_delta_pruned_queries_return_unchanged_rows() {
         .filter(|(letter, _)| letter.as_deref() == Some("a"))
         .cloned()
         .collect();
-    expected_letter_a.sort_by(|a, b| a.1.cmp(&b.1));
+    expected_letter_a.sort_by_key(|a| a.1);
     assert_eq!(
         expected_letter_a.len(),
         2,
@@ -1956,7 +1956,7 @@ fn unity_delta_pruned_queries_return_unchanged_rows() {
         .zip(letter_a[1].iter())
         .map(|(letter, number)| (letter.as_str().map(str::to_string), parse_int(number)))
         .collect();
-    actual_letter_a.sort_by(|a, b| a.1.cmp(&b.1));
+    actual_letter_a.sort_by_key(|a| a.1);
     assert_eq!(
         actual_letter_a, expected_letter_a,
         "the partition predicate LETTER = 'a' must return the same rows pruning \
@@ -1983,7 +1983,7 @@ fn unity_delta_pruned_queries_return_unchanged_rows() {
         .filter(|(id, _)| *id <= 2)
         .cloned()
         .collect();
-    expected_id_le_2.sort_by(|a, b| a.0.cmp(&b.0));
+    expected_id_le_2.sort_by_key(|a| a.0);
     assert_eq!(
         expected_id_le_2.len(),
         2,
@@ -1998,7 +1998,7 @@ fn unity_delta_pruned_queries_return_unchanged_rows() {
         .zip(id_le_2[1].iter())
         .map(|(id, value)| (parse_int(id), value.as_str().map(str::to_string)))
         .collect();
-    actual_id_le_2.sort_by(|a, b| a.0.cmp(&b.0));
+    actual_id_le_2.sort_by_key(|a| a.0);
     assert_eq!(
         actual_id_le_2, expected_id_le_2,
         "the range predicate ID <= 2 must return the same rows pruning inert \

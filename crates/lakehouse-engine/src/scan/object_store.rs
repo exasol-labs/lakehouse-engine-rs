@@ -407,7 +407,7 @@ pub(crate) fn store_root_url(uri: &str) -> Result<Url, UdfError> {
 }
 
 /// DataFusion keys its registry by scheme, host and port only (`get_url_key`,
-/// `datafusion-execution-54.1.0/src/object_store.rs:268-274`), dropping userinfo. On `abfss://`
+/// `datafusion-execution-55.2.0/src/object_store.rs:268-274`), dropping userinfo. On `abfss://`
 /// that is the container, so two sides in different containers of one account would share one
 /// store and silently read one side's files from the other's container.
 ///

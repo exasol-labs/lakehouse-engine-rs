@@ -154,6 +154,13 @@ pub fn binary_cause(declared: &str) -> String {
     )
 }
 
+/// Shared by every source whose format can carry a `variant` column.
+pub fn variant_cause() -> String {
+    "has type 'variant', whose on-disk form is an opaque (metadata, value) binary pair this engine \
+     cannot render as a meaningful value"
+        .to_string()
+}
+
 /// `member_path` is `None` when the column's own type is the binary one.
 pub fn binary_refusal(
     label: &str,
@@ -161,11 +168,16 @@ pub fn binary_refusal(
     member_path: Option<&str>,
     declared: &str,
 ) -> String {
+    column_refusal(label, column, member_path, &binary_cause(declared))
+}
+
+/// `member_path` is `None` when the column's own type is the refused one.
+pub fn column_refusal(label: &str, column: &str, member_path: Option<&str>, cause: &str) -> String {
     let subject = match member_path {
         Some(member_path) => format!("{label} column '{column}', whose member '{member_path}'"),
         None => format!("{label} column '{column}'"),
     };
-    format!("{subject} {}", binary_cause(declared))
+    format!("{subject} {cause}")
 }
 
 #[cfg(test)]

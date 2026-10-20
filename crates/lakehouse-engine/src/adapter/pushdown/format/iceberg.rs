@@ -13,7 +13,9 @@ use lakehouse_catalog::{
 use serde_json::Value as Json;
 
 use super::{ConnectionStorage, FormatReader, PlannedFiles};
-use crate::adapter::column_notes::{ColumnDeclaration, DeclaredSchema, binary_refusal};
+use crate::adapter::column_notes::{
+    ColumnDeclaration, DeclaredSchema, binary_cause, column_refusal, variant_cause,
+};
 use crate::adapter::iceberg_predicate::to_iceberg_predicate;
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{
@@ -238,19 +240,18 @@ async fn plan_checked_table(
         table
             .metadata()
             .properties()
-            .get(iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
+            .get(iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING)
             .map(String::as_str),
     )?;
 
-    // Must run before `plan_files_from_table`, which drops the information needed to tell
-    // a Puffin deletion vector from a Parquet positional delete.
     ensure_supported_delete_mechanisms(&table, &table_name, &secrets).await?;
 
-    // `iceberg` 0.10.0 binds the filter by name against the snapshot's schema, which can predate
-    // the current one, so each declared field id is named as that schema names it.
+    // A scan without a pinned snapshot binds its filter by name against the current schema
+    // (apache/iceberg-rust#2904), so each declared field id is named as that schema names it.
     let metadata = table.metadata();
-    let snapshot = metadata.current_snapshot();
-    let scanned = snapshot.and_then(|s| s.schema(metadata).ok());
+    let scanned = metadata
+        .current_snapshot()
+        .map(|_| metadata.current_schema().clone());
     let predicate = filter_json
         .zip(scanned)
         .and_then(|(filter, scanned)| to_iceberg_predicate(filter, declared, &scanned));
@@ -274,7 +275,7 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
     let mapping: iceberg::spec::NameMapping = serde_json::from_str(raw).map_err(|e| {
         UdfError::User(format!(
             "failed to parse Iceberg '{}' table property: {e}",
-            iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING
+            iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING
         ))
     })?;
     let mut entries = Vec::new();
@@ -320,8 +321,8 @@ impl UnsupportedDeleteMechanism {
     }
 }
 
-/// Must run at manifest level: `plan_files` drops the Puffin discriminator and file format,
-/// making a deletion vector indistinguishable from a Parquet positional delete.
+/// Applied to every alive manifest entry, not only the planned tasks: the plan-time fail-loud
+/// ADR makes the manifest level the authoritative gate.
 fn classify_manifest_file(
     content: iceberg::spec::DataContentType,
     format: iceberg::spec::DataFileFormat,
@@ -361,7 +362,7 @@ fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &
 
 /// Refuses a recorded `date` → `timestamp`/`timestamp_ns` promotion (#355).
 ///
-/// `iceberg` 0.10.0 reads such bounds as 8 bytes, skipping the spec's bounds-width
+/// `iceberg` reads such bounds as 8 bytes, skipping the spec's bounds-width
 /// inference, so a pre-promotion file's 4-byte bound fails manifest decoding with an
 /// unhelpful error, and a second decode path `unwrap()`s. Deciding from schema history
 /// alone avoids that decode and spends no object-store byte; it must run before
@@ -403,7 +404,7 @@ fn refuse_date_promotion(
         let msg = format!(
             "lakehouse pushdown declined for table '{table_name}': column '{column}' is \
              declared Iceberg type '{current_type}' in the current schema and 'date' in an \
-             earlier one, and this engine cannot read that promotion — `iceberg` 0.10.0 \
+             earlier one, and this engine cannot read that promotion — `iceberg` \
              omits the spec's bounds-width inference for '{current_type}', so a \
              pre-promotion data file's 4-byte manifest bound fails to decode; tracked as \
              issue #355. The refusal is deliberately conservative: it fires on the recorded \
@@ -461,13 +462,17 @@ async fn ensure_supported_delete_mechanisms(
     })?;
 
     for manifest_file in manifest_list.entries() {
-        let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
-            UdfError::User(format!(
-                "failed to load Iceberg manifest for '{}': {}",
-                table_name,
-                redact_error_text(&e.to_string(), secrets)
-            ))
-        })?;
+        let manifest = table
+            .manifest_reader()
+            .read(manifest_file)
+            .await
+            .map_err(|e| {
+                UdfError::User(format!(
+                    "failed to load Iceberg manifest for '{}': {}",
+                    table_name,
+                    redact_error_text(&e.to_string(), secrets)
+                ))
+            })?;
         for entry in manifest.entries() {
             // A DELETED entry no longer applies; failing on it would spuriously reject queries.
             if !entry.is_alive() {
@@ -541,47 +546,60 @@ async fn plan_files_from_table(
         .into_iter()
         .map(|t| {
             let deletes: Vec<DeleteMechanism> = t
-                .deletes
+                .deletes()
                 .iter()
                 .map(|d| {
-                    iceberg_delete_mechanism(d.file_path.clone(), d.file_size_in_bytes, d.file_type)
+                    iceberg_delete_mechanism(
+                        d.file_path().to_string(),
+                        d.file_size_in_bytes(),
+                        d.file_type(),
+                    )
                 })
                 .collect();
             FileEntry::with_deletes(
                 t.data_file_path().to_string(),
-                t.file_size_in_bytes,
+                t.file_size_in_bytes(),
                 deletes,
             )
         })
         .collect())
 }
 
-fn first_binary_member(field_type: &iceberg::spec::Type, path: &str) -> Option<(String, String)> {
+fn first_refused_member(field_type: &iceberg::spec::Type, path: &str) -> Option<(String, String)> {
     use iceberg::spec::Type;
 
     match field_type {
         Type::Primitive(primitive) => {
-            declared_binary_type(primitive).map(|declared| (path.to_string(), declared))
+            refused_primitive_cause(primitive).map(|cause| (path.to_string(), cause))
         }
+        Type::Variant(_) => Some((path.to_string(), variant_cause())),
         Type::Struct(members) => members.fields().iter().find_map(|member| {
-            first_binary_member(&member.field_type, &format!("{path}.{}", member.name))
+            first_refused_member(&member.field_type, &format!("{path}.{}", member.name))
         }),
         Type::List(list) => {
-            first_binary_member(&list.element_field.field_type, &format!("{path}.element"))
+            first_refused_member(&list.element_field.field_type, &format!("{path}.element"))
         }
-        Type::Map(map) => first_binary_member(&map.key_field.field_type, &format!("{path}.key"))
-            .or_else(|| first_binary_member(&map.value_field.field_type, &format!("{path}.value"))),
+        Type::Map(map) => first_refused_member(&map.key_field.field_type, &format!("{path}.key"))
+            .or_else(|| {
+                first_refused_member(&map.value_field.field_type, &format!("{path}.value"))
+            }),
     }
 }
 
 /// Exhaustive, so a new Iceberg primitive must be classified before the build passes.
-fn declared_binary_type(primitive: &iceberg::spec::PrimitiveType) -> Option<String> {
+/// `geometry` and `geography` are WKB binary on disk, so they share the binary refusal.
+fn refused_primitive_cause(primitive: &iceberg::spec::PrimitiveType) -> Option<String> {
     use iceberg::spec::PrimitiveType::*;
 
     match primitive {
-        Binary => Some("binary".to_string()),
-        Fixed(length) => Some(format!("fixed({length})")),
-        Uuid => Some("uuid".to_string()),
+        Binary => Some(binary_cause("binary")),
+        Fixed(length) => Some(binary_cause(&format!("fixed({length})"))),
+        Uuid => Some(binary_cause("uuid")),
+        Geometry(_) => Some(binary_cause("geometry")),
+        Geography(_) => Some(binary_cause("geography")),
+        Unknown => Some(
+            "has type 'unknown', which holds only nulls and has no Exasol column type".to_string(),
+        ),
         Boolean
         | Int
         | Long
@@ -598,12 +616,12 @@ fn declared_binary_type(primitive: &iceberg::spec::PrimitiveType) -> Option<Stri
     }
 }
 
-/// The Iceberg arm of [`super::declare_columns`]. Refuses every `binary`, `fixed(L)`, and `uuid`
-/// column at any depth until #351.
+/// The Iceberg arm of [`super::declare_columns`]. Refuses every `binary`, `fixed(L)`, `uuid`,
+/// `geometry`, and `geography` column at any depth until #351, and every `variant` and `unknown`.
 pub(super) fn declaration(field: &iceberg::spec::NestedField) -> ColumnDeclaration {
-    let refused = first_binary_member(&field.field_type, &field.name).map(|(path, declared)| {
-        let member_path = (!field.field_type.is_primitive()).then_some(path.as_str());
-        binary_refusal("Iceberg", &field.name, member_path, &declared)
+    let refused = first_refused_member(&field.field_type, &field.name).map(|(path, cause)| {
+        let member_path = (path != field.name).then_some(path.as_str());
+        column_refusal("Iceberg", &field.name, member_path, &cause)
     });
     let arrow_type = crate::types::mapping::iceberg_type_to_arrow(&field.field_type);
     ColumnDeclaration {
@@ -625,7 +643,8 @@ fn derive_nested_members(ty: &iceberg::spec::Type) -> Option<NestedMembers> {
     use iceberg::spec::Type;
 
     match ty {
-        Type::Primitive(_) => None,
+        // A variant is refused at declaration, so it never reaches the nested renderer.
+        Type::Primitive(_) | Type::Variant(_) => None,
         Type::Struct(s) => Some(NestedMembers::Struct {
             fields: s
                 .fields()

@@ -257,7 +257,8 @@ pub fn iceberg_primitive_to_exasol(
             .declaration()
             .to_string(),
         String | Uuid => "VARCHAR(2000000)".to_string(),
-        Fixed(_) | Binary => "VARCHAR(2000000)".to_string(),
+        // Refused at declaration; the type only fills the column's declared slot.
+        Fixed(_) | Binary | Geometry(_) | Geography(_) | Unknown => "VARCHAR(2000000)".to_string(),
     }
 }
 
@@ -287,7 +288,7 @@ pub fn iceberg_primitive_to_arrow(pt: &iceberg::spec::PrimitiveType) -> DataType
         Timestamptz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         TimestamptzNs => DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         String | Uuid => DataType::Utf8,
-        Fixed(_) | Binary => DataType::Utf8,
+        Fixed(_) | Binary | Geometry(_) | Geography(_) | Unknown => DataType::Utf8,
     }
 }
 

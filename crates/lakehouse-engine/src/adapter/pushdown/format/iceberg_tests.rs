@@ -308,7 +308,7 @@ fn malformed_name_mapping_errors_cleanly() {
 
     let msg = user_message(err);
     assert!(
-        msg.contains(iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING),
+        msg.contains(iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING),
         "error must name the offending property: {msg}"
     );
     assert!(
@@ -1039,4 +1039,47 @@ fn relaxed_nullability_is_matched_by_declared_field_id() {
     for fragment in ["'QTY'", "'ORDERS'", "ALTER VIRTUAL SCHEMA ... REFRESH"] {
         assert!(message.contains(fragment), "{message}");
     }
+}
+
+#[test]
+fn iceberg_v3_types_without_an_exasol_rendering_are_refused_at_declaration() {
+    use iceberg::spec::{
+        GeographyType, GeometryType, ListType, NestedField, PrimitiveType, Type, VariantType,
+    };
+
+    let refusal = |field: NestedField| declaration(&field).refused.expect("must be refused");
+    let primitive = |pt| NestedField::optional(1, "c", Type::Primitive(pt));
+
+    assert_eq!(
+        refusal(NestedField::optional(1, "v", Type::Variant(VariantType))),
+        format!("Iceberg column 'v' {}", variant_cause())
+    );
+    assert_eq!(
+        refusal(primitive(PrimitiveType::Geometry(
+            GeometryType::new(None).unwrap()
+        ))),
+        format!("Iceberg column 'c' {}", binary_cause("geometry"))
+    );
+    assert_eq!(
+        refusal(primitive(
+            PrimitiveType::Geography(GeographyType::default())
+        )),
+        format!("Iceberg column 'c' {}", binary_cause("geography"))
+    );
+    assert!(
+        refusal(primitive(PrimitiveType::Unknown))
+            .starts_with("Iceberg column 'c' has type 'unknown'")
+    );
+
+    let list_of_variant = NestedField::optional(
+        1,
+        "l",
+        Type::List(ListType::new(
+            NestedField::list_element(2, Type::Variant(VariantType), false).into(),
+        )),
+    );
+    assert!(
+        refusal(list_of_variant)
+            .starts_with("Iceberg column 'l', whose member 'l.element' has type 'variant'")
+    );
 }

@@ -20,7 +20,7 @@ serde      = { workspace = true }
 serde_json = { workspace = true }
 url        = { workspace = true }
 
-# MSRV 1.94.1 (aws-sdk-glue, aws-smithy-runtime-api): must stay buildable by the rust:1.94-trixie UDF builder.
+# MSRV 1.94.1 (aws-sdk-glue, aws-smithy-runtime-api): must stay buildable by the rust:1.98.1-trixie UDF builder.
 aws-sigv4              = { workspace = true }
 aws-credential-types   = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }

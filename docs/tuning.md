@@ -86,7 +86,7 @@ LHTELEM pid=12345 phase_startup_ms=110.2 phase_import_ms=650.8 phase_emit_ms=2.5
 | `pid` | Process id of the shard VM (unique per UDF instance). |
 | `phase_startup_ms` | UDF entry → runtime + session + plan build, up to first batch fetch. |
 | `phase_import_ms` | Cumulative wait time for batches from the stream (S3 read + Parquet decode). |
-| `phase_emit_ms` | Cumulative time in `emit_batch` / flush (column coercion + Arrow IPC). |
+| `phase_emit_ms` | Cumulative time in `emit_batch` / flush (column coercion + Arrow C Data export). |
 | `body_ms` | Total scan-body wall-clock. `startup + import + emit ≈ body`. |
 
 ### Interpret

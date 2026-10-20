@@ -3,10 +3,11 @@
 //! panicking thread before that abort, so it is the only seam that can capture it; the hook logs
 //! to stderr and [`PANIC_LOG_PATH`], then chains the previous hook.
 
-use datafusion::execution::cache::cache_manager::FileMetadataCacheEntry;
+use datafusion::execution::cache::CacheEntryInfo;
+use datafusion::execution::cache::cache_manager::CachedFileMetadataEntry;
 use object_store::path::Path;
 use std::backtrace::Backtrace;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Write;
 use std::panic::PanicHookInfo;
@@ -84,13 +85,13 @@ pub enum OpenerCoverage {
 /// A recorded path absent from `entries` is always a re-fetch (evicted or never admitted).
 ///
 /// A present path with `hits == 0` is ambiguous: `put` counts no hit
-/// (`datafusion-execution-54.1.0/src/cache/file_metadata_cache.rs:75`), so it is both a
+/// (`datafusion-execution-55.2.0/src/cache/default_cache.rs:116`), so it is both a
 /// looked-up-missed-re-put entry and one the opener never opened. A pushed LIMIT ends the stream
-/// before later files open (`datafusion-datasource-54.1.0/src/file_stream/scan_state.rs:166-186`)
+/// before later files open (`datafusion-datasource-55.2.0/src/file_stream/scan_state.rs:166-186`)
 /// and an inner join with an empty build side never polls the probe side, so `hits == 0` counts
 /// only under [`OpenerCoverage::EveryAssignedFile`].
 pub fn footer_refetch_count(
-    entries: &HashMap<Path, FileMetadataCacheEntry>,
+    entries: &datafusion::common::HashMap<Path, CacheEntryInfo<CachedFileMetadataEntry>>,
     coverage: OpenerCoverage,
 ) -> u64 {
     let Ok(paths) = access_plan_cached_footers().lock() else {

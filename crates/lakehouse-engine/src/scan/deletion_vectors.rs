@@ -7,7 +7,9 @@ use crate::scan::emit::{redact_credentials, redact_secret_values};
 use crate::scan::spec::DeltaDeletionVectorStorage;
 use bytes::Bytes;
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
-use delta_kernel::{DeltaResult, Error as KernelError, FileMeta, FileSlice, StorageHandler};
+use delta_kernel::{
+    FileMeta, FileSlice, KernelError, KernelResult, KernelResultIteratorStatic, StorageHandler,
+};
 use exasol_udf_sdk::error::UdfError;
 use roaring::RoaringTreemap;
 use std::collections::HashMap;
@@ -210,7 +212,7 @@ impl PrefetchedDeletionVectorBytes {
         }
     }
 
-    fn body(&self, location: &Url, range: Option<Range<u64>>) -> DeltaResult<Bytes> {
+    fn body(&self, location: &Url, range: Option<Range<u64>>) -> KernelResult<Bytes> {
         let body = self.bodies.get(location).ok_or_else(|| {
             KernelError::missing_data(format!(
                 "no pre-fetched deletion-vector body for {location}"
@@ -240,37 +242,31 @@ fn unsupported(operation: &str) -> KernelError {
 }
 
 impl StorageHandler for PrefetchedDeletionVectorBytes {
-    fn list_from(
-        &self,
-        _path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    fn list_from(&self, _path: &Url) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
         Err(unsupported("list_from"))
     }
 
-    fn read_files(
-        &self,
-        files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
-        let bodies: Vec<DeltaResult<Bytes>> = files
+    fn read_files(&self, files: Vec<FileSlice>) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
+        let bodies: Vec<KernelResult<Bytes>> = files
             .into_iter()
             .map(|(location, range)| self.body(&location, range))
             .collect();
         Ok(Box::new(bodies.into_iter()))
     }
 
-    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> KernelResult<()> {
         Err(unsupported("copy_atomic"))
     }
 
-    fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> DeltaResult<()> {
+    fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> KernelResult<()> {
         Err(unsupported("put"))
     }
 
-    fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+    fn head(&self, _path: &Url) -> KernelResult<FileMeta> {
         Err(unsupported("head"))
     }
 
-    fn delete(&self, _path: &Url) -> DeltaResult<()> {
+    fn delete(&self, _path: &Url) -> KernelResult<()> {
         Err(unsupported("delete"))
     }
 }

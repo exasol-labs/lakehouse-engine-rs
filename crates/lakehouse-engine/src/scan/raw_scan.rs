@@ -147,8 +147,7 @@ pub(super) async fn register_file_list(
         build_logical_arrow_schema(logical_schema)
     } else {
         let listing_options = ListingOptions::new(Arc::new(int96_coerced_parquet_format()))
-            .with_file_extension(".parquet")
-            .with_collect_stat(false);
+            .with_file_extension(".parquet");
         let first_url = ListingTableUrl::parse(&first_abs)
             .map_err(|e| UdfError::User(format!("invalid listing URL '{first_abs}': {e}")))?;
         listing_options

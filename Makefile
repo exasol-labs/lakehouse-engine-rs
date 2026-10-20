@@ -11,7 +11,7 @@ LAKEHOUSE_ENGINE_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 
 # MUST match the SLC toolchain and glibc (Trixie = 2.41): the SDK fingerprint
 # embeds the rustc hash, so a host-built .so is rejected by the SLC at load time.
-UDF_BUILDER_IMAGE ?= rust:1.94-trixie
+UDF_BUILDER_IMAGE ?= rust:1.98.1-trixie
 
 # Real-file target so E2E targets never run against a stale binary.
 VS_SO   := target/release/liblakehouse_engine.so

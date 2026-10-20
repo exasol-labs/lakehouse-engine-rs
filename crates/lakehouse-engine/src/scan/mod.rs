@@ -32,6 +32,8 @@ mod checked_div;
 mod exasol_numeric;
 mod raised_failure;
 
+pub(crate) mod parquet_reader;
+
 mod object_store;
 pub(crate) use self::object_store::{
     build_admission_limited_store, build_table_root_store, store_root_url,

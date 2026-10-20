@@ -78,12 +78,12 @@ impl DeltaSnapshot {
     }
 
     /// In metadata declaration order (neither schema nor sorted order). Read via the kernel's
-    /// `internal-api` because 0.26 exposes `partitionColumns` nowhere else; re-reading the log
+    /// `internal-api` because 0.30 exposes `partitionColumns` nowhere else; re-reading the log
     /// ourselves would duplicate the kernel's current-metadata and checkpoint resolution.
     pub(super) fn partition_columns(&self) -> Vec<String> {
         self.snapshot
             .table_configuration()
-            .partition_columns()
+            .logical_partition_columns()
             .to_vec()
     }
 
@@ -132,7 +132,7 @@ impl DeltaSnapshot {
         Ok(active)
     }
 
-    fn failed_to(&self, attempted: &str, cause: &delta_kernel::Error) -> UdfError {
+    fn failed_to(&self, attempted: &str, cause: &delta_kernel::KernelError) -> UdfError {
         UdfError::User(format!(
             "failed to {attempted} for Delta table root '{}': {cause}",
             self.snapshot.table_root()

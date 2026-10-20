@@ -281,7 +281,7 @@ make cross-udf-build           # → target/release/liblakehouse_engine.so
 make bucketfs-upload-so        # → BucketFS udf/liblakehouse_engine.so
 ```
 
-The build runs inside `rust:1.94-trixie` (glibc 2.41, which matches the SLC). It rebuilds only
+The build runs inside `rust:1.98.1-trixie` (glibc 2.41, which matches the SLC). It rebuilds only
 when crate sources, manifests, or the lockfile change. One `.so` exports **all three** RUST entry
 points (VS adapter, scan SCALAR UDF, and version query). This path needs Docker and
 [`exapump`](https://github.com/exasol-labs/exapump). It also needs the Rust SLC already

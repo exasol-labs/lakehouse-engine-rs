@@ -3528,33 +3528,18 @@ fn e2e_float_div_guarded_by_a_non_zero_conjunct_matches_the_measured_outcome() {
         );
     }
 
-    let guard_first_rows = conn.query_row_count(&format!(
-        "SELECT L_ORDERKEY FROM {} WHERE {guard_first}",
-        vs_lineitem_table()
-    ));
-    assert_eq!(
-        guard_first_rows, guarded_rows,
-        "GUARD FIRST must match native Exasol — {guarded_rows} rows, no error \
-         — because the Parquet row filter applies the guard's row selection \
-         before the division is evaluated"
-    );
-
-    // Holds while `datafusion.execution.parquet.reorder_filters` stays false: enabling it
-    // sorts the one-column guard ahead of the division in both orders.
-    let division_first_code = division_by_zero_failure_sql_code(
-        &mut conn,
-        &format!(
-            "SELECT L_ORDERKEY FROM {} WHERE {division_first}",
+    // DataFusion's `PushDownFilter` runs cheap conjuncts before function calls
+    // (apache/datafusion#22343), so the guard precedes the checked division in either order.
+    for predicate in [&guard_first, &division_first] {
+        let vs_rows = conn.query_row_count(&format!(
+            "SELECT L_ORDERKEY FROM {} WHERE {predicate}",
             vs_lineitem_table()
-        ),
-    );
-    assert_eq!(
-        division_first_code, UDF_ERROR_SQL_CODE,
-        "DIVISION FIRST raises where native Exasol returns {guarded_rows} rows: \
-         the over-raise direction of tracked exception #392. If this ever stops \
-         raising, the guard has started protecting the division in this order \
-         too and #392 can narrow."
-    );
+        ));
+        assert_eq!(
+            vs_rows, guarded_rows,
+            "`{predicate}` must match native Exasol — {guarded_rows} rows, no error"
+        );
+    }
 }
 
 #[test]
