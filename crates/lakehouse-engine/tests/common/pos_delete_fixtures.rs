@@ -1,5 +1,5 @@
-//! Ground truth for the Spark merge-on-read positional-delete fixtures and the v3
-//! Puffin deletion-vector fixture. Authored at stack bring-up by the
+//! Ground truth for the Spark merge-on-read positional-delete fixtures and the
+//! unsupported-delete fixture. Authored at stack bring-up by the
 //! `spark-iceberg-fixtures` job because iceberg-rust has no position-delete writer
 //! (#344). Must stay in lockstep with the `scripts/spark-fixtures/*.sql` scripts.
 
@@ -36,6 +36,12 @@ pub const PARTITION_EAST_DELETED_IDS: [i64; 4] = [2, 4, 7, 9];
 
 pub const PARTITION_WEST_DELETED_IDS: [i64; 4] = [13, 14, 17, 19];
 
-/// Its DELETE commits a Puffin deletion vector, which the engine rejects at plan
-/// time; becomes readable once iceberg-rust supports v3 deletion vectors (#12).
 pub const DELETION_VECTOR_TABLE: &str = "mor_dv_unsupported";
+
+/// The Parquet data file a Puffin deletion vector applies to.
+pub const DELETION_VECTOR_FILE_IDS: (i64, i64) = (1, 10);
+
+/// A Parquet data file with no delete.
+pub const DELETE_FREE_FILE_IDS: (i64, i64) = (11, 20);
+
+pub const ORC_FILE_IDS: (i64, i64) = (21, 30);

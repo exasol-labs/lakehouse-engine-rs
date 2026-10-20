@@ -1688,7 +1688,7 @@ A regression in the unified provider would affect every query, so the plan-shape
 
 **ID:** plan-time-fail-loud-at-the-manifest-datafile-level-is-the-authoritative-correctness-gate-for-unsupported-deletes
 **Plan:** `add-positional-delete-application`
-**Status:** Accepted
+**Status:** Superseded by unsupported-deletes-classified-from-planned-tasks
 
 ### Context
 

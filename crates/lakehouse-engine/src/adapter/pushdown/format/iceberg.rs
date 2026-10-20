@@ -244,8 +244,6 @@ async fn plan_checked_table(
             .map(String::as_str),
     )?;
 
-    ensure_supported_delete_mechanisms(&table, &table_name, &secrets).await?;
-
     // A scan without a pinned snapshot binds its filter by name against the current schema,
     // so each declared field id is named as that schema names it.
     let metadata = table.metadata();
@@ -321,9 +319,7 @@ impl UnsupportedDeleteMechanism {
     }
 }
 
-/// Applied to every alive manifest entry, not only the planned tasks: the plan-time fail-loud
-/// ADR makes the manifest level the authoritative gate.
-fn classify_manifest_file(
+fn classify_planned_file(
     content: iceberg::spec::DataContentType,
     format: iceberg::spec::DataFileFormat,
 ) -> Result<(), UnsupportedDeleteMechanism> {
@@ -417,94 +413,21 @@ fn refuse_date_promotion(
     Ok(())
 }
 
-/// Classifies every alive manifest `DataFile`. This is the authoritative correctness gate:
-/// `plan_files` drops the information needed to detect unsupported mechanisms.
-async fn ensure_supported_delete_mechanisms(
-    table: &iceberg::table::Table,
-    table_name: &str,
-    secrets: &[&str],
-) -> Result<(), UdfError> {
-    let metadata = table.metadata();
-    let Some(snapshot) = metadata.current_snapshot() else {
-        return Ok(());
-    };
-    let file_io = table.file_io();
-
-    let manifest_list_bytes = file_io
-        .new_input(snapshot.manifest_list())
-        .map_err(|e| {
-            UdfError::User(format!(
-                "failed to open Iceberg manifest list for '{}': {}",
-                table_name,
-                redact_error_text(&e.to_string(), secrets)
-            ))
-        })?
-        .read()
-        .await
-        .map_err(|e| {
-            UdfError::User(format!(
-                "failed to read Iceberg manifest list for '{}': {}",
-                table_name,
-                redact_error_text(&e.to_string(), secrets)
-            ))
-        })?;
-
-    let manifest_list = iceberg::spec::ManifestList::parse_with_version(
-        &manifest_list_bytes,
-        metadata.format_version(),
-    )
-    .map_err(|e| {
-        UdfError::User(format!(
-            "failed to parse Iceberg manifest list for '{}': {}",
-            table_name,
-            redact_error_text(&e.to_string(), secrets)
-        ))
-    })?;
-
-    for manifest_file in manifest_list.entries() {
-        let manifest = table
-            .manifest_reader()
-            .read(manifest_file)
-            .await
-            .map_err(|e| {
-                UdfError::User(format!(
-                    "failed to load Iceberg manifest for '{}': {}",
-                    table_name,
-                    redact_error_text(&e.to_string(), secrets)
-                ))
-            })?;
-        for entry in manifest.entries() {
-            // A DELETED entry no longer applies; failing on it would spuriously reject queries.
-            if !entry.is_alive() {
-                continue;
-            }
-            let data_file = entry.data_file();
-            classify_manifest_file(data_file.content_type(), data_file.file_format())
-                .map_err(|mechanism| unsupported_delete_error(mechanism, table_name))?;
-        }
-    }
-
-    Ok(())
-}
-
-/// The plan-time gate has already rejected equality deletes and deletion vectors; the other
-/// arms exist for defense-in-depth so the read-time backstop rejects anything that slips
-/// past. `Data` never appears here and maps to a non-positional sentinel for the same reason.
+/// Plan time refuses everything but Parquet positional deletes; the other arms let the read-time
+/// backstop refuse anything that slips past. `Data` maps to a non-positional sentinel likewise.
 fn iceberg_delete_mechanism(
     path: String,
     size: u64,
     content_type: iceberg::spec::DataContentType,
+    format: iceberg::spec::DataFileFormat,
 ) -> DeleteMechanism {
-    match content_type {
-        iceberg::spec::DataContentType::PositionDeletes => {
-            DeleteMechanism::IcebergPositionalDelete { path, size }
+    use iceberg::spec::DataContentType::{Data, EqualityDeletes, PositionDeletes};
+    match (content_type, format) {
+        (PositionDeletes, iceberg::spec::DataFileFormat::Puffin) => {
+            DeleteMechanism::IcebergPuffinDeletionVector { path, size }
         }
-        iceberg::spec::DataContentType::EqualityDeletes => {
-            DeleteMechanism::IcebergEqualityDelete { path, size }
-        }
-        iceberg::spec::DataContentType::Data => {
-            DeleteMechanism::IcebergEqualityDelete { path, size }
-        }
+        (PositionDeletes, _) => DeleteMechanism::IcebergPositionalDelete { path, size },
+        (EqualityDeletes | Data, _) => DeleteMechanism::IcebergEqualityDelete { path, size },
     }
 }
 
@@ -542,27 +465,32 @@ async fn plan_files_from_table(
     })?;
 
     // Delete paths are relativized later in `relativize_shards_to_root`, like data-file paths.
-    Ok(tasks
+    let refuse = |mechanism| unsupported_delete_error(mechanism, table_name);
+    tasks
         .into_iter()
         .map(|t| {
-            let deletes: Vec<DeleteMechanism> = t
+            classify_planned_file(iceberg::spec::DataContentType::Data, t.data_file_format())
+                .map_err(refuse)?;
+            let deletes = t
                 .deletes()
                 .iter()
                 .map(|d| {
-                    iceberg_delete_mechanism(
+                    classify_planned_file(d.file_type(), d.file_format()).map_err(refuse)?;
+                    Ok(iceberg_delete_mechanism(
                         d.file_path().to_string(),
                         d.file_size_in_bytes(),
                         d.file_type(),
-                    )
+                        d.file_format(),
+                    ))
                 })
-                .collect();
-            FileEntry::with_deletes(
+                .collect::<Result<_, UdfError>>()?;
+            Ok(FileEntry::with_deletes(
                 t.data_file_path().to_string(),
                 t.file_size_in_bytes(),
                 deletes,
-            )
+            ))
         })
-        .collect())
+        .collect()
 }
 
 fn first_refused_member(field_type: &iceberg::spec::Type, path: &str) -> Option<(String, String)> {

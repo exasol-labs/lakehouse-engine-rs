@@ -4,8 +4,9 @@
 
 use crate::common::e2e_harness::*;
 use crate::common::pos_delete_fixtures::{
-    DELETION_VECTOR_TABLE, FILE_GRANULARITY_DELETED_IDS, FILE_GRANULARITY_REMAINING_ROWS,
-    FILE_GRANULARITY_TABLE, FILE_GRANULARITY_TOTAL_ROWS, NAMESPACE, PARTITION_COL,
+    DELETE_FREE_FILE_IDS, DELETION_VECTOR_FILE_IDS, DELETION_VECTOR_TABLE,
+    FILE_GRANULARITY_DELETED_IDS, FILE_GRANULARITY_REMAINING_ROWS, FILE_GRANULARITY_TABLE,
+    FILE_GRANULARITY_TOTAL_ROWS, NAMESPACE, ORC_FILE_IDS, PARTITION_COL,
     PARTITION_EAST_DELETED_IDS, PARTITION_GRANULARITY_DELETED_IDS,
     PARTITION_GRANULARITY_REMAINING_ROWS, PARTITION_GRANULARITY_TABLE,
     PARTITION_GRANULARITY_TOTAL_ROWS, PARTITION_WEST_DELETED_IDS,
@@ -476,56 +477,69 @@ fn e2e_deletes_with_single_and_grouped_agg() {
     );
 }
 
-// Equality deletes have no E2E fixture (only Flink writes them); they share the
-// same plan-time gate, covered by `classify_manifest_file`'s unit tests.
-// #12: once iceberg-rust reads v3 deletion vectors, this fixture becomes readable
-// and needs replacing.
+// Equality deletes have no E2E fixture (only Flink writes them); their refusal is
+// covered by `classify_planned_file`'s unit tests.
+/// Scenario: An unsupported delete mechanism fails loud at plan time
+/// Scenario: An unsupported delete mechanism on a pruned file does not fail the query
 #[test]
 fn e2e_unsupported_delete_fails_loud() {
     setup_e2e();
     let mut conn = exa_conn();
+    let table = vs_table(LAKEHOUSE_VS, DELETION_VECTOR_TABLE);
+    let (_, dv_last) = DELETION_VECTOR_FILE_IDS;
+    let (orc_first, _) = ORC_FILE_IDS;
 
-    let sql = format!(
-        "SELECT * FROM {} LIMIT 1",
-        vs_table(LAKEHOUSE_VS, DELETION_VECTOR_TABLE)
-    );
-    let resp = conn.try_execute(&sql);
-
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "query over an unsupported-delete table must fail, got: {resp}"
-    );
-
-    let message = resp["exception"]["text"]
-        .as_str()
-        .or_else(|| resp["message"].as_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    assert!(
-        message.contains("equality")
-            || message.contains("deletion vector")
-            || message.contains("puffin"),
-        "error must name the unsupported delete mechanism (equality delete or \
-         deletion vector/Puffin), got: {resp}"
-    );
-
-    for secret_marker in [
-        "access_key",
-        "secret_key",
-        "session_token",
-        "secretaccesskey",
+    for (filter, mechanisms) in [
+        (String::new(), &["deletion vector", "orc data files"][..]),
+        (format!("WHERE id <= {dv_last}"), &["deletion vector"][..]),
+        (format!("WHERE id >= {orc_first}"), &["orc data files"][..]),
     ] {
+        let resp = conn.try_execute(&format!("SELECT id FROM {table} {filter}"));
+        assert_eq!(
+            resp["status"].as_str(),
+            Some("error"),
+            "a scan planning a file with an unsupported mechanism must fail ({filter}), got: {resp}"
+        );
+        let message = resp["exception"]["text"]
+            .as_str()
+            .or_else(|| resp["message"].as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         assert!(
-            !message.contains(secret_marker),
-            "error must not leak credentials (found '{secret_marker}'): {resp}"
+            message.contains("lakehouse pushdown declined")
+                && mechanisms.iter().any(|m| message.contains(m)),
+            "error must be the plan-time refusal naming one of {mechanisms:?} ({filter}), got: {resp}"
+        );
+        for leak in [
+            "access_key",
+            "secret_key",
+            "session_token",
+            "secretaccesskey",
+            "s3://",
+            ".puffin",
+            ".orc",
+        ] {
+            assert!(
+                !message.contains(leak),
+                "error must name no credential or file path (found '{leak}'): {resp}"
+            );
+        }
+        assert_eq!(
+            resp["responseData"]["results"][0]["resultSet"]["numRows"].as_i64(),
+            None,
+            "a plan-time failure must not carry a result set: {resp}"
         );
     }
 
+    let (first, last) = DELETE_FREE_FILE_IDS;
+    let cols = conn.query_columns(&format!(
+        "SELECT id FROM {table} WHERE id >= {first} AND id <= {last} ORDER BY id"
+    ));
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
     assert_eq!(
-        resp["responseData"]["results"][0]["resultSet"]["numRows"].as_i64(),
-        None,
-        "a plan-time failure must not carry a result set: {resp}"
+        ids,
+        (first..=last).collect::<Vec<_>>(),
+        "a filter that prunes every file an unsupported mechanism applies to must read the rest"
     );
 }
 
