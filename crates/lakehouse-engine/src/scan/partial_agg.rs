@@ -8,7 +8,7 @@ use futures::StreamExt;
 
 use crate::scan::convert::arrow_value_at;
 use crate::scan::emit::{
-    check_declared_arity, check_emitted_values, classify_scan_error, coerce_column,
+    check_declared_arity, check_emitted_dates_in_range, classify_scan_error, coerce_column,
     declared_output_columns, target_arrow_type,
 };
 use crate::scan::spec::{AggregatePlan, PartialAggColumn, ScanSpec, partial_column_name};
@@ -375,7 +375,7 @@ fn coerce_partial_agg_columns(
             }
         })
         .collect::<Result<_, UdfError>>()?;
-    check_emitted_values(&columns, declared)?;
+    check_emitted_dates_in_range(&columns, declared)?;
     Ok(columns)
 }
 

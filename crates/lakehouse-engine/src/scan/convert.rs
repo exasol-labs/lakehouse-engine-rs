@@ -53,25 +53,6 @@ pub(crate) fn check_date32_in_exasol_range(
     }
 }
 
-/// DataFusion reads an unannotated Parquet `BYTE_ARRAY` straight into a declared `Utf8` column,
-/// and the Parquet reader checks UTF-8 only for annotated columns. Any other type passes.
-pub(crate) fn check_strings_are_utf8(
-    column: &dyn Array,
-    output_column: &str,
-) -> Result<(), UdfError> {
-    if !matches!(
-        column.data_type(),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-    ) {
-        return Ok(());
-    }
-    column.to_data().validate_values().map_err(|e| {
-        UdfError::User(format!(
-            "output column {output_column} holds a value that is not valid UTF-8: {e}"
-        ))
-    })
-}
-
 pub fn arrow_value_at(col: &dyn Array, row: usize) -> Result<Value, UdfError> {
     if col.is_null(row) {
         return Ok(Value::Null);
