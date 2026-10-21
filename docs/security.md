@@ -19,7 +19,7 @@ GRANT CREATE SESSION TO <reader>;
 GRANT SELECT ON SCHEMA <vs> TO <reader>;
 ```
 
-A reader needs no `EXECUTE` on a script, no grant on the CONNECTION, and no role membership. A CONNECTION grant to a reader does not let the reader query the virtual schema, because only the owner's grants count. Do not grant one: together with `EXECUTE` on the scan script it lets the reader bypass the adapter (see [Plan visibility versus plan execution](#plan-visibility-versus-plan-execution)).
+A reader needs no `EXECUTE` on a script, no grant on the CONNECTION, and no role membership. A CONNECTION grant to a reader has no effect on its queries, because only the owner's grants count. Do not grant one: it is half of what a user needs to [bypass the adapter](#who-can-bypass-the-adapter).
 
 ### Owner grants
 
@@ -29,7 +29,7 @@ An owner with the system privileges `EXECUTE ANY SCRIPT` and `ACCESS ANY CONNECT
 - `ACCESS` on the CONNECTION for `LAKEHOUSE_ADAPTER` and `LAKEHOUSE_SCAN`, because both scripts read it.
 - `CREATE VIRTUAL SCHEMA`, if it creates the virtual schema itself.
 
-The owner can hold each grant directly or through a role it is a member of. Grant them before `CREATE VIRTUAL SCHEMA`, because creating the virtual schema already runs the adapter as its owner. Choose one of two forms.
+The owner can hold each grant directly or through a role it holds. Grant them before `CREATE VIRTUAL SCHEMA`, because creating the virtual schema already runs the adapter as its owner. Choose one of two forms.
 
 **Per script.** These grants cover only the engine's scripts. A re-install drops them (see [Re-installing](#re-installing)).
 
@@ -50,7 +50,11 @@ GRANT ACCESS ON CONNECTION <conn> FOR SCHEMA <schema> TO <owner>;
 
 They cover every script in `<schema>`, including scripts created later. An owner that can create a script in `<schema>` can therefore read the CONNECTION's credentials through a script of its own. Use the per-schema form only when the owner cannot create scripts in `<schema>`.
 
+### The install script's template
+
 The install script prints the per-script CONNECTION grants as a template. It puts them on the role `LAKEHOUSE_ENGINE_ROLE_<schema>` and grants that role to the installing user. That user owns `<schema>`, so it needs no `EXECUTE` grant, and it owns the virtual schemas it creates. The role is for owners only. Never grant it to a reader.
+
+Run the template's grants as a DBA, because granting a role needs `GRANT ANY ROLE`, even for the role's creator. After a re-install, run only its two `GRANT ACCESS` statements again. The role and its members remain.
 
 ### A role as owner
 
@@ -60,11 +64,11 @@ A role can own the virtual schema. Give the role the owner grants above, create 
 ALTER VIRTUAL SCHEMA <vs> CHANGE OWNER <role>;
 ```
 
-Readers still need only the reader grants, not membership in the role. Every member of the role acts as the owner: it can refresh the virtual schema and change its properties, including `PERMISSION_CHECK` and `USER_MAPPING`. It also holds the role's `EXECUTE` and CONNECTION grants, so it can run a scan plan directly and bypass the adapter (see [Plan visibility versus plan execution](#plan-visibility-versus-plan-execution)). Grant the role only to administrators.
+Readers still need only the reader grants, not membership in the role. Every member of the role acts as the owner: it can refresh the virtual schema, change its properties, including `PERMISSION_CHECK` and `USER_MAPPING`, and [bypass the adapter](#who-can-bypass-the-adapter). Grant the role only to administrators.
 
 ### Re-installing
 
-Re-running the installer replaces the scripts with `CREATE OR REPLACE SCRIPT`. That drops every per-script grant on them, `EXECUTE` and `ACCESS` alike, so queries fail until you issue the grants again. Per-schema grants survive. A re-install never changes a reader's grants.
+Re-running the installer replaces the scripts with `CREATE OR REPLACE SCRIPT`. That drops every per-script grant on them, `EXECUTE` and `ACCESS` alike, including those of the install script's role, so queries fail until you issue the grants again. Per-schema grants survive. A re-install never changes a reader's grants.
 
 `CREATE OR REPLACE CONNECTION` drops every grant on the CONNECTION. `ALTER CONNECTION` keeps them, so change an existing CONNECTION with `ALTER CONNECTION`.
 
@@ -99,25 +103,28 @@ FROM EXA_DBA_OBJ_PRIVS
 WHERE PRIVILEGE = 'EXECUTE' AND (OBJECT_SCHEMA = '<SCHEMA>' OR OBJECT_NAME = '<SCHEMA>');
 ```
 
-Each owner grant needs a row whose `GRANTEE` is the owner or one of its roles. A `SCHEMA` row covers every script in that schema. The owner of `<SCHEMA>` holds `EXECUTE` without a row. Without DBA rights, read the same columns from `EXA_USER_*` and `EXA_ROLE_*` in place of `EXA_DBA_*`.
+Each owner grant needs a row whose `GRANTEE` is the owner or a role it holds. A role can hold another role, so repeat the role query with each role as `<OWNER>`. A `SCHEMA` row covers every script in that schema. The owner of `<SCHEMA>` holds `EXECUTE` without a row.
 
-### Credentials in plan text
+Without DBA rights, the owner runs the same queries on `EXA_USER_*` and on `EXA_ROLE_*` in place of `EXA_DBA_*`. They list its own grants and those of every role it holds, directly or through another role. They list nothing for another user.
 
-`EXPLAIN VIRTUAL` and pushdown-path errors carry the pushdown SQL verbatim, and credential values never appear in it. See [Plan visibility versus plan execution](#plan-visibility-versus-plan-execution) for what else that plan text exposes and why reading it is safe while running it is not.
+## Plan text and plan execution
 
-## Plan visibility versus plan execution
+Any user who can query the virtual schema can read the scan plan that `EXPLAIN VIRTUAL` returns, and pushdown-path errors carry the same SQL. The plan names the table root, the bucket layout, file names and byte sizes, and the CONNECTION, but no credential value. A sealed vended-credential envelope travels in it as ciphertext that only the CONNECTION password opens (see [Sealed vended-credential envelope](#sealed-vended-credential-envelope)).
 
-Any user who can query the virtual schema can read the pushdown plan that `EXPLAIN VIRTUAL` returns, so the plan is not a secret. Safety comes from `EXECUTE` on `LAKEHOUSE_SCAN` and `LAKEHOUSE_DISTRIBUTE_FILES` being separate from `SELECT` on the virtual schema. Running a script against real data needs both that grant and `ACCESS` on the CONNECTION for the script, per script or per schema (see [Owner grants](#owner-grants)). The two gates are independent, and neither replaces the other.
+### Who can bypass the adapter
 
-Granting `EXECUTE ON SCRIPT` on `LAKEHOUSE_SCAN`, or `EXECUTE ANY SCRIPT`, to a querying user makes every adapter-side predicate advisory for that user once they also hold connection access: they can submit a hand-edited plan directly instead of the one the adapter generated. `LAKEHOUSE_DISTRIBUTE_FILES` is not an independent path to that outcome. Every generated plan calls it only inside the `FROM` clause of the `LAKEHOUSE_SCAN` call, so a user without `EXECUTE` on `LAKEHOUSE_SCAN`, or `EXECUTE ANY SCRIPT`, is denied before the distributor runs, even with `EXECUTE` on the distributor itself.
+A user who submits a scan plan directly, instead of querying the virtual schema, bypasses every check the adapter makes, including the [Lakekeeper permission check](#lakekeeper-permission-check). That user can also edit the plan. Running a plan needs both:
 
-A reader with only `SELECT` on the virtual schema still sees, in the plan text: the table root, the bucket layout, file names and byte sizes, and the catalog CONNECTION name. None of that is a credential. A sealed vended-credential envelope, when present, travels in the plan as ciphertext, readable but not openable without the CONNECTION password (see [Sealed vended-credential envelope](#sealed-vended-credential-envelope-378) below).
+- `EXECUTE` on `LAKEHOUSE_SCAN`, and on `LAKEHOUSE_DISTRIBUTE_FILES` when the scan spans several shards, or `EXECUTE ANY SCRIPT`.
+- `ACCESS` on the CONNECTION for `LAKEHOUSE_SCAN`, per script or per schema, or `ACCESS ANY CONNECTION`.
 
-## Lakekeeper permission check (#415)
+The virtual schema's owner holds both, and so does every member of a role that owns it. A reader with only the [reader grants](#reader-grants) holds neither, and Exasol refuses its plan with `insufficient privileges for calling script`. Grant these privileges only to users who may read every table the CONNECTION can read.
+
+## Lakekeeper permission check
 
 With `PERMISSION_CHECK = 'LAKEKEEPER'`, the adapter maps the querying Exasol user to a Lakekeeper principal through `USER_MAPPING` and refuses a query over any table that principal may not read. The check runs when the adapter plans a query, so it covers `SELECT` and `EXPLAIN VIRTUAL`. Creating, refreshing, or altering a virtual schema lists tables as the CONNECTION's identity and checks no user.
 
-A user with `EXECUTE ON SCRIPT` on `LAKEHOUSE_SCAN`, or `EXECUTE ANY SCRIPT`, bypasses this check. That user submits a scan plan directly, so the adapter never plans it and Lakekeeper is never asked. See [Plan visibility versus plan execution](#plan-visibility-versus-plan-execution). Grant those privileges only to users who may read every table the CONNECTION can read.
+A user who can [bypass the adapter](#who-can-bypass-the-adapter) bypasses this check too, because the adapter never plans that user's scan and Lakekeeper is never asked.
 
 ### Setup
 
@@ -168,14 +175,14 @@ If Lakekeeper is unreachable or does not answer within 30 seconds, every query o
 
 - **Table listing.** Every user who may query the virtual schema sees all table names, column names, and column types, including those of tables the user cannot read. Querying such a table is refused.
 - **Storage access.** Data is read with the CONNECTION's storage credentials, including credentials that Lakekeeper vends, and these are not scoped to the querying user. The check is enforced by the adapter, not by the catalog or the storage layer.
-- **Users with script privileges.** A user with `EXECUTE` on the scan script bypasses the check, as described above. That includes every member of a role that owns the virtual schema. A user without that privilege cannot obtain a scan plan or run one captured by another user. The [Privilege model](#privilege-model) lists the grants that matter.
+- **Users who can bypass the adapter.** The virtual schema's owner, every member of an owning role, and every other user listed in [Who can bypass the adapter](#who-can-bypass-the-adapter) can run a scan plan without the check. A reader with only the reader grants cannot obtain a scan plan for a table it may not read, or run one captured by another user.
 - **Changing the settings.** The virtual schema's owner, every member of an owning role, a user with `ALTER` on the virtual schema, and a user with `ALTER ANY VIRTUAL SCHEMA` can set `PERMISSION_CHECK` to an empty value or change `USER_MAPPING`. Either change turns the check off, or changes the principal, for every user of the virtual schema. A user with only `SELECT` on the virtual schema cannot change either property.
 
 ### Out of scope
 
 The check does not provide row-level or column-level authorization, which need a policy engine. It does not cover other catalog kinds, and it does not scope storage credentials per user.
 
-## Sealed vended-credential envelope (#378)
+## Sealed vended-credential envelope
 
 A vended credential has no CONNECTION name to reference. It travels as AES-256-GCM ciphertext (HKDF-SHA256 key from the CONNECTION password, fresh 96-bit nonce). Vending without key material is refused at plan time.
 

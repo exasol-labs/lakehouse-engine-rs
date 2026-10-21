@@ -28,7 +28,7 @@ GROUP BY l_returnflag;
 |-------|----------------|
 | [Install](install.md) | One command installs the engine on any Exasol deployment: SaaS, Exasol AsApp, Docker, or on-premise. It uploads the `.so`, registers the Rust SLC, and creates the scripts. Build-from-source and fully manual paths are covered too, as appendices. |
 | [Catalogs](catalogs.md) | Connect to Iceberg REST (including Lakekeeper), Unity Catalog, AWS Glue, and direct storage: CONNECTION objects, credentials, and object-storage access. |
-| [Security](security.md) | Who needs which grant: a reader needs only `SELECT`, the Virtual Schema's owner holds the script and CONNECTION grants (per script or per schema, directly or through a role), what a re-install drops, and the error each missing grant gives. Also what a `SELECT`-only Virtual Schema user can and cannot read, the Lakekeeper per-user permission check (setup, `USER_MAPPING`, and its trust model), the sealed vended-credential envelope, and rotation. |
+| [Security](security.md) | Who needs which grant: a reader needs only `SELECT`, and the Virtual Schema's owner holds the script and CONNECTION grants. Also what a re-install drops, the error each missing grant gives, who can bypass the adapter, the Lakekeeper per-user permission check, the sealed vended-credential envelope, and rotation. |
 | [Benchmark](benchmark.md) | The benchmark query set and how to run it yourself. |
 | [Architecture](architecture.md) | How cluster and DataFusion parallelism combine: file sharding, `GROUP BY shard_key` fan-out, and how pushdown meets parent-level Exasol execution. |
 | [Capabilities](capabilities.md) | Pushdown support matrix: what runs in DataFusion versus Exasol. |

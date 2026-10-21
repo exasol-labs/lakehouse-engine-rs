@@ -30,6 +30,8 @@ example is a network with no path to GitHub.
   is no terminal to ask, e.g. the one-liner below) — you still need to configure a profile
   afterward. A local Exasol Personal deployment needs the `exapump` binary but no profile: the
   connection resolves from the deployment directory.
+- A database user with the `CREATE SCHEMA` and `CREATE SCRIPT` privileges, plus `ALTER SYSTEM`
+  unless you pass [`--skip-slc`](#skip-the-slc-step).
 - `jq`, but only if you use `--deployment` to target an Exasol Personal deployment. It parses the
   deployment descriptor (`deployment.json`) to resolve connection details and backend. SaaS and
   BucketFS targets don't need it.
@@ -123,7 +125,9 @@ curl -fsSL -H "Accept: application/vnd.github.raw" \
    It creates no dataset-specific object itself.
 
 The command is idempotent. It uses `CREATE OR REPLACE`, `CREATE SCHEMA IF NOT EXISTS`, and an
-in-place language-list update. Run it again on a prior install to upgrade it.
+in-place language-list update. Run it again on a prior install to upgrade it. An upgrade drops
+every per-script grant on the scripts, so issue those grants again afterward (see
+[Re-installing](security.md#re-installing)).
 
 ## Flags
 

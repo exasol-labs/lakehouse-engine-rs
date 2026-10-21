@@ -7,7 +7,7 @@ Replaces the storage credentials the adapter embedded in the scan-driving SQL wi
 * **The pushdown response carries exactly one field.** `EXPLAIN VIRTUAL` returns it verbatim — the leak surface. Profiling/audit `SQL_TEXT` carry only the user's literal statement.
 * **The scoped credential claim.** A CONNECTION-supplied credential MUST NOT appear in any returned SQL. A VENDED credential or an assumed role's session credential appears ONLY inside the sealed envelope, never in plaintext.
 * **The sealed envelope's threat model is deliberately bounded.** Defeats plaintext reads, not offline cryptanalysis. See `docs/security.md`.
-* **`ctx.connection()` is engine-local, not a catalog round-trip.** The wire wrapper exposes no secret accessor (compile failure, not an empty redaction set). The required grant is a BREAKING deployment change.
+* **`ctx.connection()` is engine-local, not a catalog round-trip.** The wire wrapper exposes no secret accessor (compile failure, not an empty redaction set).
 
 ## Scenarios
 
@@ -50,14 +50,13 @@ Replaces the storage credentials the adapter embedded in the scan-driving SQL wi
 * *AND* the connection NAME SHALL be positively asserted present (static) or the envelope SHALL unseal correctly (vended)
 * *AND* the eighteen credential-bearing golden fixtures SHALL carry the reference encoding, and the six `empty_*` fixtures SHALL stay byte-identical
 
-### Scenario: The scan script requires a script-scoped grant; rotation is observed per shard
+### Scenario: The scan script needs the owner's CONNECTION grant
 
 * *GIVEN* a deployment with the adapter grant already in place
 * *WHEN* a scan runs
-* *THEN* the scan script SHALL additionally need `GRANT ACCESS ON CONNECTION ... FOR SCRIPT <schema>.LAKEHOUSE_SCAN TO <owner>`, and a missing grant SHALL fail with a named error and no inline fallback
+* *THEN* the scan script SHALL additionally need `GRANT ACCESS ON CONNECTION ... FOR SCRIPT <schema>.LAKEHOUSE_SCAN TO <owner>` or the same grant `FOR SCHEMA <schema>`, and a missing grant SHALL fail with a named error and no inline fallback
 * *AND* that grant SHALL be checked against the virtual schema's OWNER, not the querying user, so a user holding only `CREATE SESSION` and `SELECT` on the virtual schema, and no privilege on the CONNECTION, SHALL receive the owner's rows
-* *AND* when the owner's grant is missing, the error a reader receives SHALL name the CONNECTION, the scan script, and the virtual schema's owner as the grantee, and MUST NOT contain any credential value
-* *AND* each shard SHALL read the CONNECTION value current at ITS resolution time, and a sealed envelope under a rotated password SHALL fail AEAD with no plaintext
+* *AND* when the owner's grant is missing, the error a reader receives SHALL name the CONNECTION, both the script-scoped and the schema-scoped grant, and the virtual schema's owner as the grantee, and MUST NOT contain any credential value
 
 ### Scenario: A role can own the virtual schema and hold its grants
 
@@ -123,11 +122,13 @@ Replaces the storage credentials the adapter embedded in the scan-driving SQL wi
 * *WHEN* the owner creates its own script in `<schema>` that reads the CONNECTION
 * *THEN* the script SHALL read the CONNECTION, because the schema-scoped grant covers every script in the schema, including scripts created later
 
-### Scenario: ALTER CONNECTION keeps the CONNECTION grants, CREATE OR REPLACE CONNECTION drops them
+### Scenario: ALTER CONNECTION rotates the CONNECTION and keeps its grants, CREATE OR REPLACE CONNECTION drops them
 
 * *GIVEN* a virtual schema whose owner holds the script-scoped grants on its CONNECTION
-* *WHEN* a DBA runs `ALTER CONNECTION` with the same values
-* *THEN* the grants SHALL remain and a reader SHALL receive the owner's rows
+* *WHEN* a DBA changes the CONNECTION's storage secret with `ALTER CONNECTION`
+* *THEN* the grants SHALL remain and a reader's next query SHALL use the changed secret, with no restart and no credential value in an error
+* *AND* after `ALTER CONNECTION` restores the secret, a reader SHALL receive the owner's rows
+* *AND* each shard SHALL read the CONNECTION value current at ITS resolution time, and a sealed envelope under a rotated password SHALL fail AEAD with no plaintext
 * *AND* after `CREATE OR REPLACE CONNECTION` the grants SHALL be gone and a reader's query SHALL fail with the adapter's named error
 
 ### Scenario: A missing EXECUTE grant of the owner fails the query with Exasol's privilege error
@@ -145,3 +146,4 @@ Replaces the storage credentials the adapter embedded in the scan-driving SQL wi
 * *WHEN* the reader takes the scan-driving statement that `EXPLAIN VIRTUAL` returns for a query over the virtual schema and submits it verbatim as its own SQL
 * *THEN* Exasol SHALL reject the statement with an insufficient-privilege error on the script call, and that error MUST NOT contain any CONNECTION credential value
 * *AND* the reader's ordinary query over the virtual schema SHALL still return the owner's rows, because the denial applies only to a direct script call and not to the scan the virtual schema runs on the reader's behalf
+* *AND* the virtual schema's owner SHALL run the same statement, because it holds the script and CONNECTION grants

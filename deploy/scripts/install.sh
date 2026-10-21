@@ -1370,6 +1370,8 @@ print_next_step_template() {
       emit "-- SYS holds every CONNECTION implicitly; skip the grants."
       ;;
     *)
+      emit "-- Run this block as a DBA: GRANT <role> TO <user> needs GRANT ANY ROLE."
+      emit "-- After a re-install, run only the two GRANT ACCESS lines again."
       emit "CREATE ROLE $role;"
       emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_ADAPTER TO $role;"
       emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_SCAN TO $role;"
