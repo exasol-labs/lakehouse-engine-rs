@@ -48,6 +48,8 @@ GRANT EXECUTE ON SCHEMA <schema> TO <owner>;
 GRANT ACCESS ON CONNECTION <conn> FOR SCHEMA <schema> TO <owner>;
 ```
 
+They also cover scripts created or replaced in `<schema>` later. Anyone who can put a script there that the owner runs, including the owner itself, can read the CONNECTION's secret with it. Prefer the per-script form unless that is acceptable.
+
 ### The install script's template
 
 The install script prints the per-script CONNECTION grants as a template. It puts them on the role `LAKEHOUSE_ENGINE_ROLE_<schema>` and grants that role to the installing user. That user owns `<schema>`, so it needs no `EXECUTE` grant, and it owns the virtual schemas it creates. The role holds no `EXECUTE` grant, so any other owner that gets the role also needs the three `EXECUTE` grants of the [owner grants](#owner-grants). The role is for owners only. Never grant it to a reader.
@@ -89,7 +91,7 @@ Any user who can query the virtual schema can read the scan plan that `EXPLAIN V
 
 A user who submits a scan plan directly, instead of querying the virtual schema, bypasses every check the adapter makes, including the [Lakekeeper permission check](#lakekeeper-permission-check). That user can also edit the plan. Running a plan needs both:
 
-- `EXECUTE` on `LAKEHOUSE_SCAN`, and on `LAKEHOUSE_DISTRIBUTE_FILES` when the scan spans several shards.
+- `EXECUTE` on `LAKEHOUSE_SCAN`.
 - `ACCESS` on the CONNECTION for `LAKEHOUSE_SCAN`.
 
 The virtual schema's owner holds both, and so does every member of a role that owns it. A reader with only the [reader grants](#reader-grants) holds neither, and Exasol refuses its plan with `insufficient privileges for calling script`. Grant these privileges only to users who may read every table the CONNECTION can read.
