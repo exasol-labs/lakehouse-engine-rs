@@ -2,7 +2,6 @@
 
 [advisories]
 ignore = [
-    { id = "RUSTSEC-2024-0436", reason = "Transitive dep from parquet, unmaintained but not vulnerable" },
     { id = "RUSTSEC-2023-0071", reason = "Dev-dependency only (E2E test harness), not shipped in liblakehouse_engine.so" },
     # Fixed in quick-xml >=0.41.0; re-evaluate when reqsign (^0.37), opendal
     # (^0.38) and object_store (^0.39) allow it.

@@ -409,14 +409,13 @@ pub enum DeltaDeletionVectorStorage {
 /// never on which format produced the spec. Carries only the minimum payload (ADR-085): no
 /// serialized Iceberg `Schema` or `BoundPredicate`.
 ///
-/// Only [`IcebergPositionalDelete`](DeleteMechanism::IcebergPositionalDelete) and
-/// [`DeltaDeletionVector`](DeleteMechanism::DeltaDeletionVector) are applied. Plan time rejects
-/// the others; they exist so the read-time backstop can refuse one cleanly if it slips through.
+/// [`IcebergEqualityDelete`](DeleteMechanism::IcebergEqualityDelete) is never applied. Plan time
+/// rejects it; it exists so the read-time backstop can refuse one cleanly if it slips through.
 ///
 /// Serde routes through [`DeleteMechanismWire`]: an internally-tagged enum would emit its
 /// discriminant first and break the pinned `{"path":…,"size":…,"content_type":…}` key order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "DeleteMechanismWire", into = "DeleteMechanismWire")]
+#[serde(try_from = "DeleteMechanismWire", into = "DeleteMechanismWire")]
 pub enum DeleteMechanism {
     /// An Iceberg Parquet positional-delete file (`file_path`/`pos` columns).
     IcebergPositionalDelete {
@@ -427,8 +426,16 @@ pub enum DeleteMechanism {
     },
     /// Never applied by this engine.
     IcebergEqualityDelete { path: String, size: u64 },
-    /// A Puffin-encoded Iceberg v3 deletion vector. Never applied by this engine.
-    IcebergPuffinDeletionVector { path: String, size: u64 },
+    /// An Iceberg v3 `deletion-vector-v1` blob at a byte range of a Puffin file that may hold
+    /// the vectors of many data files.
+    IcebergPuffinDeletionVector {
+        path: String,
+        size: u64,
+        content_offset: u64,
+        content_size_in_bytes: u64,
+        /// The manifest's `record_count`: the vector's cardinality.
+        record_count: u64,
+    },
     /// A byte RANGE inside a possibly-shared `.bin` file, resolved into no path at plan time.
     DeltaDeletionVector {
         storage: DeltaDeletionVectorStorage,
@@ -454,7 +461,7 @@ impl DeleteMechanism {
         }
     }
 
-    /// `None` for a deletion vector, which is resolved at file registration and never
+    /// `None` for a Delta deletion vector, which is resolved at file registration and never
     /// addressed from the delete list, whatever its value looks like. Callers treating a delete
     /// as an addressable file ask here, so that refusal is stated once.
     pub fn object_store_path(&self) -> Option<&str> {
@@ -488,7 +495,7 @@ enum IcebergDeleteContentType {
 
 /// `untagged` over DISJOINT key sets, so neither arm matches the other's encoding and a member
 /// matching neither is refused. The Iceberg arm's field order is the frozen key order
-/// `{"path":…,"size":…,"content_type":…}`.
+/// `{"path":…,"size":…,"content_type":…}`; the blob coordinates follow only for a deletion vector.
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum DeleteMechanismWire {
@@ -496,6 +503,12 @@ enum DeleteMechanismWire {
         path: String,
         size: u64,
         content_type: IcebergDeleteContentType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_offset: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_size_in_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record_count: Option<u64>,
     },
     DeltaDeletionVector {
         storage: DeltaDeletionVectorStorage,
@@ -507,22 +520,47 @@ enum DeleteMechanismWire {
     },
 }
 
-impl From<DeleteMechanismWire> for DeleteMechanism {
-    fn from(wire: DeleteMechanismWire) -> Self {
-        match wire {
+impl TryFrom<DeleteMechanismWire> for DeleteMechanism {
+    type Error = String;
+
+    fn try_from(wire: DeleteMechanismWire) -> Result<Self, String> {
+        Ok(match wire {
             DeleteMechanismWire::IcebergDeleteFile {
                 path,
                 size,
                 content_type,
-            } => match content_type {
-                IcebergDeleteContentType::PositionDeletes => {
+                content_offset,
+                content_size_in_bytes,
+                record_count,
+            } => match (
+                content_type,
+                content_offset,
+                content_size_in_bytes,
+                record_count,
+            ) {
+                (IcebergDeleteContentType::PositionDeletes, None, None, None) => {
                     DeleteMechanism::IcebergPositionalDelete { path, size }
                 }
-                IcebergDeleteContentType::EqualityDeletes => {
+                (IcebergDeleteContentType::EqualityDeletes, None, None, None) => {
                     DeleteMechanism::IcebergEqualityDelete { path, size }
                 }
-                IcebergDeleteContentType::PuffinDeletionVector => {
-                    DeleteMechanism::IcebergPuffinDeletionVector { path, size }
+                (
+                    IcebergDeleteContentType::PuffinDeletionVector,
+                    Some(content_offset),
+                    Some(content_size_in_bytes),
+                    Some(record_count),
+                ) => DeleteMechanism::IcebergPuffinDeletionVector {
+                    path,
+                    size,
+                    content_offset,
+                    content_size_in_bytes,
+                    record_count,
+                },
+                _ => {
+                    return Err("an Iceberg delete entry must carry content_offset, \
+                                content_size_in_bytes, and record_count exactly when it is a \
+                                Puffin deletion vector"
+                        .to_string());
                 }
             },
             DeleteMechanismWire::DeltaDeletionVector {
@@ -538,7 +576,7 @@ impl From<DeleteMechanismWire> for DeleteMechanism {
                 size_in_bytes,
                 cardinality,
             },
-        }
+        })
     }
 }
 
@@ -550,6 +588,9 @@ impl From<DeleteMechanism> for DeleteMechanismWire {
                     path,
                     size,
                     content_type: IcebergDeleteContentType::PositionDeletes,
+                    content_offset: None,
+                    content_size_in_bytes: None,
+                    record_count: None,
                 }
             }
             DeleteMechanism::IcebergEqualityDelete { path, size } => {
@@ -557,15 +598,25 @@ impl From<DeleteMechanism> for DeleteMechanismWire {
                     path,
                     size,
                     content_type: IcebergDeleteContentType::EqualityDeletes,
+                    content_offset: None,
+                    content_size_in_bytes: None,
+                    record_count: None,
                 }
             }
-            DeleteMechanism::IcebergPuffinDeletionVector { path, size } => {
-                DeleteMechanismWire::IcebergDeleteFile {
-                    path,
-                    size,
-                    content_type: IcebergDeleteContentType::PuffinDeletionVector,
-                }
-            }
+            DeleteMechanism::IcebergPuffinDeletionVector {
+                path,
+                size,
+                content_offset,
+                content_size_in_bytes,
+                record_count,
+            } => DeleteMechanismWire::IcebergDeleteFile {
+                path,
+                size,
+                content_type: IcebergDeleteContentType::PuffinDeletionVector,
+                content_offset: Some(content_offset),
+                content_size_in_bytes: Some(content_size_in_bytes),
+                record_count: Some(record_count),
+            },
             DeleteMechanism::DeltaDeletionVector {
                 storage,
                 path_or_inline_dv,
@@ -597,7 +648,7 @@ pub struct FileEntry {
     /// Builds the file's `ObjectMeta` without an object-store HEAD.
     pub size: u64,
     /// Every deletion mechanism, whichever format planned the scan. Holds Iceberg delete-file
-    /// references OR one deletion vector, never both: applying both returns wrong rows, and
+    /// references OR one Delta deletion vector, never both: applying both returns wrong rows, and
     /// [`ScanSpec::files_from_json`] refuses the mix.
     pub deletes: Vec<DeleteMechanism>,
     /// One entry per [`CommonScanSpec::partition_columns`] column, recorded outside the data
@@ -689,7 +740,7 @@ impl FileEntry {
         }
     }
 
-    /// Callers must not mix a deletion vector with an Iceberg delete-file reference.
+    /// Callers must not mix a Delta deletion vector with an Iceberg delete-file reference.
     pub fn with_deletes(path: impl Into<String>, size: u64, deletes: Vec<DeleteMechanism>) -> Self {
         FileEntry {
             path: path.into(),
@@ -917,7 +968,7 @@ impl ScanSpec {
         serde_json::to_string(files).expect("files list serialization is infallible")
     }
 
-    /// Refuses an entry mixing a deletion vector with an Iceberg delete-file
+    /// Refuses an entry mixing a Delta deletion vector with an Iceberg delete-file
     /// reference: applying both returns wrong rows, and this is the one gate that
     /// holds for a payload this process did not build.
     pub fn files_from_json(s: &str) -> Result<Vec<FileEntry>, String> {
@@ -933,19 +984,19 @@ impl ScanSpec {
 
         for (index, entry) in files.iter().enumerate() {
             let mut delete_files = false;
-            let mut deletion_vectors = false;
+            let mut delta_vectors = false;
             for mechanism in &entry.deletes {
                 if mechanism.is_delete_file_reference() {
                     delete_files = true;
                 } else {
-                    deletion_vectors = true;
+                    delta_vectors = true;
                 }
             }
-            if delete_files && deletion_vectors {
+            if delete_files && delta_vectors {
                 return Err(format!(
-                    "scan files deserialization failed (entry {index} mixes a deletion vector \
-                     with an Iceberg delete-file reference; the two are independent delete \
-                     mechanisms, so applying both to one data file returns wrong rows)"
+                    "scan files deserialization failed (entry {index} mixes a Delta deletion \
+                     vector with an Iceberg delete-file reference; the two are independent \
+                     delete mechanisms, so applying both to one data file returns wrong rows)"
                 ));
             }
         }

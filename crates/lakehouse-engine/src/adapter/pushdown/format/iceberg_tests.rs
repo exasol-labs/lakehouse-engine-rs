@@ -108,7 +108,7 @@ async fn iceberg_reader_owns_resolution_and_keeps_its_encoding() {
 }
 
 #[test]
-fn classify_accepts_parquet_data_and_parquet_positional_delete() {
+fn classify_accepts_parquet_data_parquet_positional_delete_and_puffin_deletion_vector() {
     assert!(
         classify_planned_file(DataContentType::Data, DataFileFormat::Parquet).is_ok(),
         "Parquet data file must be supported"
@@ -116,6 +116,10 @@ fn classify_accepts_parquet_data_and_parquet_positional_delete() {
     assert!(
         classify_planned_file(DataContentType::PositionDeletes, DataFileFormat::Parquet).is_ok(),
         "Parquet positional delete must be supported"
+    );
+    assert!(
+        classify_planned_file(DataContentType::PositionDeletes, DataFileFormat::Puffin).is_ok(),
+        "Puffin deletion vector must be supported"
     );
 }
 
@@ -132,15 +136,6 @@ fn classify_rejects_equality_deletes() {
             "equality delete ({fmt:?}) must fail loud"
         );
     }
-}
-
-#[test]
-fn classify_rejects_puffin_deletion_vector() {
-    assert_eq!(
-        classify_planned_file(DataContentType::PositionDeletes, DataFileFormat::Puffin),
-        Err(UnsupportedDeleteMechanism::DeletionVector),
-        "Puffin position delete (deletion vector) must fail loud"
-    );
 }
 
 #[test]
@@ -166,16 +161,16 @@ fn classify_rejects_orc_and_avro_data_and_delete_files() {
 #[test]
 fn unsupported_delete_error_names_mechanism_and_redacts() {
     let err = unsupported_delete_error(
-        UnsupportedDeleteMechanism::DeletionVector,
-        "db.mor_dv_table",
+        UnsupportedDeleteMechanism::EqualityDelete,
+        "db.mor_eq_table",
     );
     let msg = user_message(err);
     assert!(
-        msg.contains("Iceberg v3 Puffin deletion vectors"),
+        msg.contains("Iceberg equality deletes"),
         "error must name the mechanism: {msg}"
     );
     assert!(
-        msg.contains("db.mor_dv_table"),
+        msg.contains("db.mor_eq_table"),
         "error must name the offending table: {msg}"
     );
     assert!(
@@ -227,10 +222,11 @@ fn plan_errors_redact_the_literal_azure_secret_values() {
 
 #[test]
 fn iceberg_delete_mechanism_maps_position_equality_and_the_data_sentinel() {
+    let mechanism =
+        |path: &str, content, format| iceberg_delete_mechanism(&delete_file(path, content, format));
     assert_eq!(
-        iceberg_delete_mechanism(
-            "d0.parquet".into(),
-            50,
+        mechanism(
+            "d0.parquet",
             DataContentType::PositionDeletes,
             DataFileFormat::Parquet
         ),
@@ -240,40 +236,36 @@ fn iceberg_delete_mechanism_maps_position_equality_and_the_data_sentinel() {
         }
     );
     assert_eq!(
-        iceberg_delete_mechanism(
-            "d1.parquet".into(),
-            60,
+        mechanism(
+            "d1.parquet",
             DataContentType::EqualityDeletes,
             DataFileFormat::Parquet
         ),
         DeleteMechanism::IcebergEqualityDelete {
             path: "d1.parquet".into(),
-            size: 60,
+            size: 50,
         }
     );
     assert_eq!(
-        iceberg_delete_mechanism(
-            "d3.puffin".into(),
-            80,
+        mechanism(
+            "d3.puffin",
             DataContentType::PositionDeletes,
             DataFileFormat::Puffin
         ),
         DeleteMechanism::IcebergPuffinDeletionVector {
             path: "d3.puffin".into(),
-            size: 80,
+            size: 50,
+            content_offset: 4,
+            content_size_in_bytes: 40,
+            record_count: 2,
         },
-        "a Puffin position delete is a deletion vector, never a Parquet positional delete"
+        "a Puffin position delete is a deletion vector carrying its blob range and cardinality"
     );
     assert_eq!(
-        iceberg_delete_mechanism(
-            "d2.parquet".into(),
-            70,
-            DataContentType::Data,
-            DataFileFormat::Parquet
-        ),
+        mechanism("d2.parquet", DataContentType::Data, DataFileFormat::Parquet),
         DeleteMechanism::IcebergEqualityDelete {
             path: "d2.parquet".into(),
-            size: 70,
+            size: 50,
         },
         "the Data sentinel must map to a non-positional mechanism"
     );
@@ -321,18 +313,26 @@ fn delete_file(
         .expect("a delete file")
 }
 
+/// Scenario: Delete files and deletion vectors are preserved into the scan spec
 #[test]
-fn planned_file_entry_carries_parquet_positional_deletes() {
+fn planned_file_entry_carries_parquet_positional_deletes_and_deletion_vectors() {
     let task = scan_task(
         DataFileFormat::Parquet,
-        vec![delete_file(
-            "s3://bucket/t/del-0",
-            DataContentType::PositionDeletes,
-            DataFileFormat::Parquet,
-        )],
+        vec![
+            delete_file(
+                "s3://bucket/t/del-0",
+                DataContentType::PositionDeletes,
+                DataFileFormat::Parquet,
+            ),
+            delete_file(
+                "s3://bucket/t/dv-0",
+                DataContentType::PositionDeletes,
+                DataFileFormat::Puffin,
+            ),
+        ],
     );
 
-    let entry = planned_file_entry(&task).expect("Parquet data with a Parquet positional delete");
+    let entry = planned_file_entry(&task).expect("Parquet data with supported deletes");
 
     assert_eq!(
         (entry.path.as_str(), entry.size),
@@ -340,10 +340,19 @@ fn planned_file_entry_carries_parquet_positional_deletes() {
     );
     assert_eq!(
         entry.deletes,
-        vec![DeleteMechanism::IcebergPositionalDelete {
-            path: "s3://bucket/t/del-0".into(),
-            size: 50,
-        }]
+        vec![
+            DeleteMechanism::IcebergPositionalDelete {
+                path: "s3://bucket/t/del-0".into(),
+                size: 50,
+            },
+            DeleteMechanism::IcebergPuffinDeletionVector {
+                path: "s3://bucket/t/dv-0".into(),
+                size: 50,
+                content_offset: 4,
+                content_size_in_bytes: 40,
+                record_count: 2,
+            },
+        ]
     );
 }
 
@@ -358,17 +367,6 @@ fn planned_file_entry_refuses_an_unsupported_data_or_applied_delete_file() {
         (
             scan_task(DataFileFormat::Orc, vec![]),
             UnsupportedDeleteMechanism::OrcDataFile,
-        ),
-        (
-            scan_task(
-                DataFileFormat::Parquet,
-                vec![delete_file(
-                    "s3://bucket/t/dv-0",
-                    DataContentType::PositionDeletes,
-                    DataFileFormat::Puffin,
-                )],
-            ),
-            UnsupportedDeleteMechanism::DeletionVector,
         ),
         (
             scan_task(

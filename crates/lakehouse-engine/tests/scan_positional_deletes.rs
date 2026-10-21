@@ -456,38 +456,6 @@ fn scan_rejects_unapplicable_delete_file() {
 }
 
 #[test]
-fn scan_rejects_puffin_deletion_vector() {
-    let dir = temp_dir("puffin_dv");
-    let data_url = write_data_parquet(&dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);
-
-    let bogus_delete = DeleteMechanism::IcebergPuffinDeletionVector {
-        path: format!("{}/does-not-need-to-exist.puffin", dir.to_string_lossy()),
-        size: 10,
-    };
-    let entry = FileEntry::with_deletes(
-        data_url.clone(),
-        local_file_size(&data_url),
-        vec![bogus_delete],
-    );
-    let spec = scan_spec(vec![entry], None, None);
-
-    let err = block_on(try_run_scan_with_store(
-        &spec,
-        &data_url,
-        Arc::new(LocalFileSystem::new()),
-        &id_name_emits(),
-    ))
-    .expect_err("a Puffin deletion vector must be rejected, not applied");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Puffin deletion vector"),
-        "error must name the unsupported mechanism: {msg}"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn scan_rejects_negative_positional_delete() {
     let dir = temp_dir("neg_pos");
     let data_url = write_data_parquet(&dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);

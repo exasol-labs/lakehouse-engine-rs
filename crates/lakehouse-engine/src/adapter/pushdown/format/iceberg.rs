@@ -291,13 +291,11 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
     Ok(entries)
 }
 
-/// Only Parquet positional deletes over Parquet data files are applied; everything else
-/// must fail loud at plan time. Carries no path or secret.
+/// Only Parquet positional deletes and Puffin deletion vectors over Parquet data files are
+/// applied; everything else must fail loud at plan time. Carries no path or secret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnsupportedDeleteMechanism {
     EqualityDelete,
-    /// Iceberg v3 Puffin deletion vector.
-    DeletionVector,
     OrcDataFile,
     AvroDataFile,
     OrcDeleteFile,
@@ -309,7 +307,6 @@ impl UnsupportedDeleteMechanism {
     fn describe(self) -> &'static str {
         match self {
             UnsupportedDeleteMechanism::EqualityDelete => "Iceberg equality deletes",
-            UnsupportedDeleteMechanism::DeletionVector => "Iceberg v3 Puffin deletion vectors",
             UnsupportedDeleteMechanism::OrcDataFile => "ORC data files",
             UnsupportedDeleteMechanism::AvroDataFile => "Avro data files",
             UnsupportedDeleteMechanism::OrcDeleteFile => "ORC delete files",
@@ -334,9 +331,7 @@ fn classify_planned_file(
             Puffin => Err(U::NonParquetDataFile),
         },
         PositionDeletes => match format {
-            Parquet => Ok(()),
-            // A position delete stored as a Puffin blob IS a v3 deletion vector.
-            Puffin => Err(U::DeletionVector),
+            Parquet | Puffin => Ok(()),
             Orc => Err(U::OrcDeleteFile),
             Avro => Err(U::AvroDeleteFile),
         },
@@ -348,7 +343,8 @@ fn classify_planned_file(
 fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &str) -> UdfError {
     let msg = format!(
         "lakehouse pushdown declined for table '{}': it uses {}, which this engine \
-         cannot apply on read (only Parquet positional deletes are supported); \
+         cannot apply on read (only Parquet positional deletes and deletion vectors are \
+         supported); \
          this is a hard error, not a native re-plan",
         table_name,
         mechanism.describe(),
@@ -413,18 +409,23 @@ fn refuse_date_promotion(
     Ok(())
 }
 
-/// Plan time refuses everything but Parquet positional deletes; the other arms let the read-time
-/// backstop refuse anything that slips past. `Data` maps to a non-positional sentinel likewise.
-fn iceberg_delete_mechanism(
-    path: String,
-    size: u64,
-    content_type: iceberg::spec::DataContentType,
-    format: iceberg::spec::DataFileFormat,
-) -> DeleteMechanism {
+/// Plan time refuses equality deletes; that arm lets the read-time backstop refuse one that
+/// slips past. `Data` maps to the same non-positional sentinel.
+fn iceberg_delete_mechanism(delete: &iceberg::scan::FileScanTaskDeleteFile) -> DeleteMechanism {
     use iceberg::spec::DataContentType::{Data, EqualityDeletes, PositionDeletes};
-    match (content_type, format) {
+    let path = delete.file_path().to_string();
+    let size = delete.file_size_in_bytes();
+    match (delete.file_type(), delete.file_format()) {
+        // iceberg-rust refuses to build a deletion-vector task missing these, so the defaults
+        // never apply.
         (PositionDeletes, iceberg::spec::DataFileFormat::Puffin) => {
-            DeleteMechanism::IcebergPuffinDeletionVector { path, size }
+            DeleteMechanism::IcebergPuffinDeletionVector {
+                path,
+                size,
+                content_offset: delete.content_offset().unwrap_or_default(),
+                content_size_in_bytes: delete.content_size_in_bytes().unwrap_or_default(),
+                record_count: delete.record_count().unwrap_or_default(),
+            }
         }
         (PositionDeletes, _) => DeleteMechanism::IcebergPositionalDelete { path, size },
         (EqualityDeletes | Data, _) => DeleteMechanism::IcebergEqualityDelete { path, size },
@@ -484,12 +485,7 @@ fn planned_file_entry(
         .iter()
         .map(|d| {
             classify_planned_file(d.file_type(), d.file_format())?;
-            Ok(iceberg_delete_mechanism(
-                d.file_path().to_string(),
-                d.file_size_in_bytes(),
-                d.file_type(),
-                d.file_format(),
-            ))
+            Ok(iceberg_delete_mechanism(d))
         })
         .collect::<Result<_, _>>()?;
     Ok(FileEntry::with_deletes(

@@ -22,16 +22,20 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 * A parse failure on either argument MUST surface an error identifying scan-spec
   deserialization failure and MUST NOT contain any storage access key, secret key, or
   session token.
-* Per-file positional-delete references and per-file partition values travel with their
-  data-file entry in the per-shard argument.
+* Per-file delete references (positional-delete files, Iceberg deletion vectors, and Delta
+  deletion vectors) and per-file partition values travel with their data-file entry in the
+  per-shard argument.
 * The `storage` value in the common blob is an externally-tagged credential WRAPPER specified
   by `storage-access/scan-spec-credential-reference`. A join block carries its own REQUIRED
   `storage` value in the same wrapper encoding, so a join block that names no dimension
   backend fails to deserialize rather than silently reusing the fact-side backend.
-* Delete mechanisms are format-neutral and self-describing. `DeleteMechanism` routes
-  (de)serialization through a private wire enum so the Rust-level type and the frozen JSON
-  encoding are independent decisions. An entry whose delete list mixes a deletion vector
-  with an Iceberg delete-file reference is refused.
+* Delete mechanisms are format-neutral and self-describing. Their in-memory form and their
+  frozen JSON encoding are independent decisions, because (de)serialization goes through a
+  separate private wire form. An entry whose delete list mixes a Delta deletion vector
+  with an Iceberg delete-file reference is refused. An Iceberg deletion-vector member appends
+  `content_offset`, `content_size_in_bytes`, and `record_count` to the `path`, `size`, and
+  `content_type` keys; every other Iceberg member carries none of them, and a member that breaks
+  this rule is refused.
 * File-entry serialization form is selected by content: compact 2-tuple when neither
   deletes nor partition values are present, 3-tuple when deletes but no partition values,
   self-describing JSON object when partition values are present.
@@ -50,12 +54,13 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 * *AND* the reconstituted `ScanSpec` MUST NOT carry any catalog identifier field, because the scan UDF never contacts the catalog
 * *AND* the merge SHALL follow these same rules for arguments produced by EITHER format reader, because the table root and each entry's byte size are neutral values both populate
 
-### Scenario: Reconstitution carries per-file positional-delete references
+### Scenario: Reconstitution carries per-file delete references
 
-* *GIVEN* a scan invocation whose second argument is a JSON array of per-shard file entries, each carrying a data-file path, its byte size, and zero or more associated delete mechanisms (an Iceberg positional-delete reference carrying a path, byte size, and delete content type)
+* *GIVEN* a scan invocation whose second argument is a JSON array of per-shard file entries, each carrying a data-file path, its byte size, and zero or more associated delete mechanisms (an Iceberg positional-delete reference carrying a path, byte size, and delete content type, or an Iceberg deletion-vector reference that also carries its blob's offset, length, and cardinality)
 * *WHEN* the scan UDF parses its two input arguments
 * *THEN* the UDF SHALL deserialize each file entry together with its associated delete mechanisms and MERGE them into one scan spec whose per-shard files (with deletes) come from the second argument and whose every other field comes from the first
 * *AND* each Iceberg positional-delete member SHALL deserialize from, and re-serialize to, its pre-#342 `{"path":…,"size":…,"content_type":"position_deletes"}` encoding with its key order unchanged, so every committed 3-tuple golden encoding passes unedited
+* *AND* an Iceberg deletion-vector member SHALL carry `content_offset`, `content_size_in_bytes`, and `record_count` after those three keys, and a member that carries any of them without being a deletion vector, or is a deletion vector missing one, SHALL fail with an error identifying scan-files deserialization
 * *AND* the merge SHALL store each data-file and delete-file path verbatim (relative or absolute) without resolving it, so path reconstruction is deferred to file registration
 * *AND* the reconstituted scan spec MUST NOT carry any catalog identifier field, because the scan UDF never contacts the catalog
 
@@ -67,7 +72,7 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 * *AND* the `storage` value SHALL be the externally-tagged scan-spec storage WRAPPER specified by `storage-access/scan-spec-credential-reference` — a `connection` reference variant carrying a name and `allow_http` and no credential; a `sealed` variant carrying a connection name and the base64 nonce-plus-AES-GCM-ciphertext of the externally-tagged storage-backend encoding of `storage-access/storage-backend-enum`; or an `inline` variant whose payload is that same backend encoding in plaintext, accepted for host-test spec construction
 * *AND* the join block's `storage` value SHALL use that SAME wrapper encoding and SHALL be a REQUIRED key of the join block, so a join block serialized without it fails to deserialize instead of defaulting to the whole-spec value
 * *AND* the per-shard files-list JSON SHALL be unaffected by the common blob's encoding, because `storage` and declared output types are both shard-invariant and appear only in the common blob
-* *AND* `from_parts_json` over the two arguments SHALL reconstitute a `ScanSpec` value equal to the one the pre-consolidation two-argument contract produced for the same shard, with the storage backend in place of the bare storage props
+* *AND* reconstitution from the two arguments SHALL produce a `ScanSpec` value equal to the one the pre-consolidation two-argument contract produced for the same shard, with the storage backend in place of the bare storage props
 * *AND* `files` SHALL remain the sole per-shard field, now guaranteed structurally by the single embedded common value rather than by a field-by-field copy
 
 ### Scenario: A file-list argument that predates the delete encoding still reconstitutes
@@ -84,7 +89,7 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
   ordered partition-column names and a logical schema whose fields carry a field-id, a physical name,
   or neither, and whose second argument is a JSON array of per-shard file entries, each carrying a
   data-file path, its byte size, its partition values, and a delete list holding either Iceberg
-  positional-delete references or one deletion-vector descriptor
+  delete-file references or one Delta deletion-vector descriptor
 * *WHEN* the scan UDF parses its two input arguments
 * *THEN* the UDF SHALL deserialize both arguments and MERGE them into one scan spec whose per-shard
   partition values and delete mechanisms come from the second argument and whose partition-column
@@ -105,7 +110,7 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
   exact encodings and their deserialization precedence
 * *AND* the round trip SHALL be LOSSLESS in both directions for every combination the types admit, so
   no field is silently dropped by the shortest-form serialization rule
-* *AND* an entry whose delete list MIXES a deletion vector with an Iceberg delete-file reference
+* *AND* an entry whose delete list MIXES a Delta deletion vector with an Iceberg delete-file reference
   SHALL be REFUSED with an error naming the entry by index, because the two are independent delete
   mechanisms and applying both to one data file returns wrong rows; the error MUST NOT echo the raw
   input
