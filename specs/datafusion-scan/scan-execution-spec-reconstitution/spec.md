@@ -30,8 +30,11 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
   backend fails to deserialize rather than silently reusing the fact-side backend.
 * Delete mechanisms are format-neutral and self-describing. `DeleteMechanism` routes
   (de)serialization through a private wire enum so the Rust-level type and the frozen JSON
-  encoding are independent decisions. An entry whose delete list mixes a deletion vector
-  with an Iceberg delete-file reference is refused.
+  encoding are independent decisions. An entry whose delete list mixes a Delta deletion vector
+  with an Iceberg delete-file reference is refused. An Iceberg deletion-vector member appends
+  `content_offset`, `content_size_in_bytes`, and `record_count` to the `path`, `size`, and
+  `content_type` keys; every other Iceberg member carries none of them, and a member that breaks
+  this rule is refused.
 * File-entry serialization form is selected by content: compact 2-tuple when neither
   deletes nor partition values are present, 3-tuple when deletes but no partition values,
   self-describing JSON object when partition values are present.
@@ -84,7 +87,7 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
   ordered partition-column names and a logical schema whose fields carry a field-id, a physical name,
   or neither, and whose second argument is a JSON array of per-shard file entries, each carrying a
   data-file path, its byte size, its partition values, and a delete list holding either Iceberg
-  positional-delete references or one deletion-vector descriptor
+  delete-file references or one Delta deletion-vector descriptor
 * *WHEN* the scan UDF parses its two input arguments
 * *THEN* the UDF SHALL deserialize both arguments and MERGE them into one scan spec whose per-shard
   partition values and delete mechanisms come from the second argument and whose partition-column
@@ -105,7 +108,7 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
   exact encodings and their deserialization precedence
 * *AND* the round trip SHALL be LOSSLESS in both directions for every combination the types admit, so
   no field is silently dropped by the shortest-form serialization rule
-* *AND* an entry whose delete list MIXES a deletion vector with an Iceberg delete-file reference
+* *AND* an entry whose delete list MIXES a Delta deletion vector with an Iceberg delete-file reference
   SHALL be REFUSED with an error naming the entry by index, because the two are independent delete
   mechanisms and applying both to one data file returns wrong rows; the error MUST NOT echo the raw
   input

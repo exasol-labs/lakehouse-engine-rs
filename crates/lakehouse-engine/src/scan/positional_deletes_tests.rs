@@ -300,21 +300,21 @@ fn only_iceberg_equality_and_puffin_delete_mechanisms_are_refused() {
     assert!(!err.contains(SECRET), "must not leak credentials: {err}");
 
     let puffin = DeleteMechanism::IcebergPuffinDeletionVector {
-        path: format!("s3://{SECRET}@bucket/db/t/data/dv.puffin"),
-        size: 10,
+        path: "data/dv.puffin".to_string(),
+        size: 100,
+        content_offset: 4,
+        content_size_in_bytes: 44,
+        record_count: 2,
     };
-    let err = applicable_delete_mechanism(&puffin, data_file, &table_root, &secrets)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("Puffin deletion vector"),
-        "names the mechanism: {err}"
+    let applied = applicable_delete_mechanism(&puffin, data_file, &table_root, &secrets).unwrap();
+    let ApplicableDelete::PuffinDeletionVector(vector) = applied else {
+        panic!("a Puffin deletion vector reaches the delete-application pipeline, not a refusal");
+    };
+    assert_eq!(
+        (vector.path, vector.range),
+        ("data/dv.puffin", 4..48),
+        "the vector arrives resolved to the blob range the shard must fetch"
     );
-    assert!(
-        err.contains("dv.puffin"),
-        "names the offending delete file: {err}"
-    );
-    assert!(!err.contains(SECRET), "must not leak credentials: {err}");
 }
 
 /// Statistics are omitted entirely when `with_stats` is false.

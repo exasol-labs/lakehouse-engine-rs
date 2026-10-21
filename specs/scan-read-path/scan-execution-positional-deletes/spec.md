@@ -16,9 +16,9 @@ positional-delete case (tracked as issue #68).
   before this change the scan collapsed each iceberg `FileScanTask` to a bare `(path, size)` pair
   and discarded its `.deletes`, so every MOR query returned pre-delete rows with no error.
 * Scope is **Parquet data files + Parquet positional-delete files only**, at both
-  `write.delete.granularity=file` and `write.delete.granularity=partition`. Equality deletes,
-  v3/Puffin deletion vectors, and ORC or Avro data or delete files are OUT OF SCOPE and MUST fail
-  loud. The primary gate is at plan time (`file-planning/pushdown-file-pruning`). It checks each
+  `write.delete.granularity=file` and `write.delete.granularity=partition`. Equality deletes and
+  ORC or Avro data or delete files are OUT OF SCOPE and MUST fail loud. Iceberg deletion vectors are
+  specified in `scan-read-path/scan-execution-iceberg-deletion-vectors`. The primary gate is at plan time (`file-planning/pushdown-file-pruning`). It checks each
   planned data file and each delete file iceberg-rust applies to it, so it relies on iceberg-rust's
   delete matching (ADR `unsupported-deletes-classified-from-planned-tasks`).
 * The scan reads each associated positional-delete Parquet file (columns `file_path` Utf8,
@@ -41,12 +41,10 @@ positional-delete case (tracked as issue #68).
   reintroduce a deleted row.
 * **Fail-loud backstop (read-time):** the primary gate is at plan time and follows iceberg-rust's
   delete matching; this scan-time check is cheap defense-in-depth. If an assigned delete file is
-  not a Parquet positional delete (a Puffin / deletion-vector payload, an equality-delete file, or
-  an unknown content type), the scan MUST return a clean, credential-redacted error naming the
+  an equality-delete file or of an unknown content type, the scan MUST return a clean, credential-redacted error naming the
   unsupported mechanism rather than silently returning pre-delete rows.
 * The adapter tags an Iceberg position delete stored in Puffin format as the Puffin
-  deletion-vector variant, not as a positional delete. That tag is what lets the backstop refuse a
-  Puffin deletion vector by its own variant.
+  deletion-vector variant, not as a positional delete, because the scan reads it by blob range.
 * See `datafusion-scan/scan-execution` for the base scan flow and the unified-provider plan
   shape, `datafusion-scan/scan-execution-spec-reconstitution` for the delete-carrying wire
   format, and `datafusion-scan/scan-execution-file-metadata` for the no-HEAD footer read.
@@ -60,12 +58,12 @@ positional-delete case (tracked as issue #68).
   being an Iceberg-only list of delete-FILE references and becomes one format-neutral list of delete
   MECHANISMS, each naming itself. The scan reads that one list and dispatches on the variant, so it
   never asks which table format produced the spec.
-* **Two variants are applied and every other variant is refused.** The Iceberg positional-delete
+* **Three variants are applied and every other variant is refused.** The Iceberg positional-delete
   variant keeps the whole read-once, concurrent, row-group-pruned pipeline unchanged. The Delta
-  deletion-vector variant (issue #320) joins it: both mechanisms feed the same accumulated
-  data-file-path → deleted-position map and the same access-plan pipeline, dispatching on the
-  mechanism's own variant rather than the table format. The Iceberg equality-delete and
-  Puffin-deletion-vector variants keep their existing refusal, with their existing message text.
+  deletion-vector variant (issue #320) and the Iceberg deletion-vector variant (issue #12) join it:
+  every mechanism feeds the same accumulated data-file-path → deleted-position map and the same
+  access-plan pipeline, dispatching on the mechanism's own variant rather than the table format.
+  The Iceberg equality-delete variant keeps its refusal.
 * **This delta changes no Iceberg behavior.** The two-phase pipeline, the shared limiter, the
   row-selection builder, and the access-plan builder are unchanged. What changed is which delete
   mechanisms reach that pipeline: the Delta deletion vector now does, and its refusal arm is gone.
@@ -114,22 +112,22 @@ positional-delete case (tracked as issue #68).
 
 ### Scenario: An unapplicable delete file is rejected with a clean error (read-time backstop)
 
-* *GIVEN* a scan invocation whose assigned files include a delete mechanism the scan cannot apply — an Iceberg equality-delete file or an Iceberg Puffin deletion-vector payload
+* *GIVEN* a scan invocation whose assigned files include a delete mechanism the scan cannot apply — an Iceberg equality-delete file
 * *WHEN* the scan UDF prepares that data file's scan
 * *THEN* the UDF SHALL return a clean error that names the unsupported delete mechanism BEFORE emitting any row for the affected data file
-* *AND* the UDF SHALL dispatch on the delete mechanism's own variant rather than on the table format that produced the scan spec, so exactly TWO variants — the Iceberg positional delete and the Delta deletion vector — reach the delete-application pipeline and every other variant is refused, SUPERSEDING the recorded "exactly one variant" rule now that `scan-read-path/scan-execution-delta-deletion-vectors` applies the Delta deletion vector
-* *AND* the error for an Iceberg equality delete or a Puffin deletion vector SHALL keep naming the offending delete FILE
+* *AND* the UDF SHALL dispatch on the delete mechanism's own variant rather than on the table format that produced the scan spec, so exactly THREE variants — the Iceberg positional delete, the Iceberg deletion vector, and the Delta deletion vector — reach the delete-application pipeline and every other variant is refused
+* *AND* the error for an Iceberg equality delete SHALL name the offending delete FILE
 * *AND* the refusal MUST NOT name a Delta deletion vector and MUST NOT cite issue #320, SUPERSEDING the recorded clause that scoped that refusal to #320, because #320 is what implements it
 * *AND* the UDF MUST NOT silently emit pre-delete rows for that file
 * *AND* the error message MUST NOT contain any storage access key, secret key, or session token
 
-### Scenario: Both delete mechanisms converge on one position map and one access-plan pipeline
+### Scenario: All delete mechanisms converge on one position map and one access-plan pipeline
 
-* *GIVEN* a shard whose assigned data files mix Iceberg data files carrying Parquet positional-delete files with Delta data files carrying deletion vectors
+* *GIVEN* a shard whose assigned data files mix Iceberg data files carrying Parquet positional-delete files or deletion vectors with Delta data files carrying deletion vectors
 * *WHEN* the scan UDF builds the shard's per-data-file access plans
-* *THEN* the read phase SHALL accumulate BOTH mechanisms into ONE map from data-file path to deleted row positions, and the access-plan phase SHALL consume that map WITHOUT knowing which mechanism produced an entry
+* *THEN* the read phase SHALL accumulate EVERY mechanism into ONE map from data-file path to deleted row positions, and the access-plan phase SHALL consume that map WITHOUT knowing which mechanism produced an entry
 * *AND* the row-selection builder and the access-plan builder SHALL be the SHIPPED ones, unchanged, because a decoded deletion vector and an accumulated positional-delete set are both a bitmap of 0-based row positions in one data file
-* *AND* both mechanisms SHALL share the ONE size-N connection limiter that already bounds delete-file reads and data-file footer fetches, so a mixed shard's total in-flight object-store reads MUST NOT exceed N
+* *AND* every mechanism SHALL share the ONE size-N connection limiter that already bounds delete-file reads and data-file footer fetches, so a mixed shard's total in-flight object-store reads MUST NOT exceed N
 * *AND* the read-time backstop SHALL still run BEFORE any I/O, so an unapplicable delete anywhere in the shard fails loud before a single delete-file body, deletion-vector file, or data-file footer is fetched
 * *AND* the post-delete row set for every data file MUST be identical to applying that file's own mechanism alone
 

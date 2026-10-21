@@ -276,3 +276,79 @@ fn decoded_set_disagreeing_with_the_declared_cardinality_fails_the_scan() {
         "the refusal states which validation failed: {err}"
     );
 }
+
+/// Delta and Iceberg share the blob layout, so the fixture sidecar's one vector is a valid
+/// `deletion-vector-v1` blob at the logged offset, spanning size, magic, bitmap, and CRC.
+const PUFFIN_BLOB_RANGE: Range<u64> = 1..45;
+
+fn puffin_vector(
+    file_size: u64,
+    offset: u64,
+    length: u64,
+    cardinality: u64,
+) -> Result<PuffinDeletionVector<'static>, UdfError> {
+    PuffinDeletionVector::resolve(
+        "dv.puffin",
+        file_size,
+        offset,
+        length,
+        cardinality,
+        &data_file(),
+        &secrets(),
+    )
+}
+
+fn decode_puffin_blob(blob: &[u8], cardinality: u64) -> Result<RoaringTreemap, UdfError> {
+    let length = blob.len() as u64;
+    puffin_vector(length, 0, length, cardinality)
+        .unwrap()
+        .decode(blob, &data_file(), &secrets())
+}
+
+#[test]
+fn puffin_blob_decodes_to_the_same_positions_as_its_delta_twin() {
+    let range = PUFFIN_BLOB_RANGE;
+    let blob = &SIDECAR_BODY[range.start as usize..range.end as usize];
+    let vector = puffin_vector(SIDECAR_BODY.len() as u64, range.start, 44, 2).unwrap();
+    assert_eq!(vector.range, range);
+
+    assert_eq!(
+        vector.decode(blob, &data_file(), &secrets()).unwrap(),
+        decode_sidecar(SIDECAR_BODY.to_vec()).unwrap()
+    );
+}
+
+/// Scenario: An Iceberg deletion vector that cannot be applied fails the scan
+#[test]
+fn untrusted_puffin_deletion_vectors_fail_loud_without_panicking() {
+    let blob = &SIDECAR_BODY[PUFFIN_BLOB_RANGE.start as usize..PUFFIN_BLOB_RANGE.end as usize];
+    let with_byte = |index: usize, value: u8| {
+        let mut bytes = blob.to_vec();
+        bytes[index] = value;
+        bytes
+    };
+
+    assert_clean_refusal(puffin_vector(44, 1, 44, 2), "a blob reaching past the file");
+    assert_clean_refusal(
+        puffin_vector(44, u64::MAX, 2, 2),
+        "a blob range that overflows",
+    );
+    assert_clean_refusal(
+        decode_puffin_blob(&with_byte(3, 0x23), 2),
+        "a length prefix the blob contradicts",
+    );
+    assert_clean_refusal(
+        decode_puffin_blob(&with_byte(4, 0x00), 2),
+        "a foreign magic",
+    );
+    assert_clean_refusal(
+        decode_puffin_blob(&with_byte(43, 0x00), 2),
+        "a broken CRC-32",
+    );
+    assert_clean_refusal(decode_puffin_blob(&blob[..20], 2), "a truncated blob");
+    let err = assert_clean_refusal(
+        decode_puffin_blob(blob, 3),
+        "a decoded set disagreeing with the manifest cardinality",
+    );
+    assert!(err.contains("Iceberg deletion vector"), "{err}");
+}

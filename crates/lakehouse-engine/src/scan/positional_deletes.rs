@@ -1,11 +1,12 @@
-//! Applies row-position deletes (Iceberg positional-delete files and Delta deletion vectors).
+//! Applies row-position deletes (Iceberg positional-delete files, Iceberg and Delta deletion
+//! vectors).
 //! Phase A reads every unique delete payload once within one shared connection budget and
 //! merges positions into one `HashMap<data_file_path, RoaringTreemap>`, mechanism-agnostic.
 //! Phase B turns each set into a base [`ParquetAccessPlan`] on the data file's
 //! `PartitionedFile`, so DataFusion's opener intersects predicate/row-group/page pruning on
 //! top and deletes compose with pushdown.
 
-use crate::scan::deletion_vectors::{DeletionVector, LoggedDeletionVector};
+use crate::scan::deletion_vectors::{DeletionVector, LoggedDeletionVector, PuffinDeletionVector};
 use crate::scan::diagnostics;
 use crate::scan::parquet_reader::SizedParquetReader;
 use crate::scan::partition_values::PartitionedScanSchema;
@@ -167,13 +168,17 @@ fn object_meta_for(abs_uri: &str, size: u64) -> Result<ObjectMeta, UdfError> {
     })
 }
 
-/// Both variants feed ONE position map, so nothing downstream learns which mechanism produced it.
+/// Every variant feeds ONE position map, so nothing downstream learns which mechanism produced
+/// it. A deletion vector's positions index the ONE data file carrying it.
 #[derive(Debug)]
 enum ApplicableDelete<'a> {
     /// One such file may carry deletes for many data files.
-    PositionalDeleteFile { path: &'a str, size: u64 },
-    /// `sidecar` is `None` for an inline vector. Positions index the ONE data file carrying it.
+    PositionalDeleteFile {
+        path: &'a str,
+        size: u64,
+    },
     DeletionVector(DeletionVector),
+    PuffinDeletionVector(PuffinDeletionVector<'a>),
 }
 
 /// Read-time backstop behind the plan-time adapter gate: an unapplicable mechanism is refused
@@ -214,15 +219,30 @@ fn applicable_delete_mechanism<'a>(
             )?;
             return Ok(ApplicableDelete::DeletionVector(vector));
         }
-        DeleteMechanism::IcebergEqualityDelete { path, .. } => (path, "an Iceberg equality delete"),
-        DeleteMechanism::IcebergPuffinDeletionVector { path, .. } => {
-            (path, "a Puffin deletion vector")
+        DeleteMechanism::IcebergPuffinDeletionVector {
+            path,
+            size,
+            content_offset,
+            content_size_in_bytes,
+            record_count,
+        } => {
+            let vector = PuffinDeletionVector::resolve(
+                path,
+                *size,
+                *content_offset,
+                *content_size_in_bytes,
+                *record_count,
+                data_file_path,
+                secrets,
+            )?;
+            return Ok(ApplicableDelete::PuffinDeletionVector(vector));
         }
+        DeleteMechanism::IcebergEqualityDelete { path, .. } => (path, "an Iceberg equality delete"),
     };
     let path = redact(path.clone(), secrets);
     Err(UdfError::User(format!(
         "assigned delete file '{path}' is {mechanism}, which this engine cannot apply on read \
-         (only Iceberg Parquet positional deletes and Delta deletion vectors are supported); \
+         (only Iceberg Parquet positional deletes and deletion vectors are supported); \
          refusing to emit rows for the affected data file"
     )))
 }
@@ -476,6 +496,7 @@ impl PositionalDeleteScanTable {
 
         let mut delete_files: HashMap<&str, u64> = HashMap::new();
         let mut vectors: Vec<(&str, DeletionVector)> = Vec::new();
+        let mut puffin_vectors: Vec<(&str, PuffinDeletionVector)> = Vec::new();
         for entry in &self.files {
             for delete in &entry.deletes {
                 match applicable_delete_mechanism(
@@ -490,17 +511,21 @@ impl PositionalDeleteScanTable {
                     ApplicableDelete::DeletionVector(vector) => {
                         vectors.push((entry.path.as_str(), vector));
                     }
+                    ApplicableDelete::PuffinDeletionVector(vector) => {
+                        puffin_vectors.push((entry.path.as_str(), vector));
+                    }
                 }
             }
         }
 
-        if delete_files.is_empty() && vectors.is_empty() {
+        if delete_files.is_empty() && vectors.is_empty() && puffin_vectors.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let (per_delete_file, sidecars) = futures::future::try_join(
+        let (per_delete_file, sidecars, per_puffin_vector) = futures::future::try_join3(
             self.read_delete_files(store, delete_files, &assigned),
             self.fetch_deletion_vector_sidecars(store, &vectors),
+            self.read_puffin_deletion_vectors(store, &puffin_vectors),
         )
         .await?;
 
@@ -519,7 +544,51 @@ impl PositionalDeleteScanTable {
             let abs = reconstruct_abs_uri(data_file, &self.table_root);
             *merged.entry(abs).or_default() |= positions;
         }
+        for (abs, positions) in per_puffin_vector {
+            *merged.entry(abs).or_default() |= positions;
+        }
         Ok(merged)
+    }
+
+    /// Fetches only each vector's blob range: one Puffin file holds the vectors of many data
+    /// files, and the blob is self-delimiting. Returns positions keyed by absolute data-file URI.
+    async fn read_puffin_deletion_vectors(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+        vectors: &[(&str, PuffinDeletionVector<'_>)],
+    ) -> Result<Vec<(String, RoaringTreemap)>, UdfError> {
+        let reads = vectors.iter().map(|(data_file, vector)| {
+            let store = Arc::clone(store);
+            let limiter = Arc::clone(&self.delete_path_read_limiter);
+            let secrets = self.secrets.as_slice();
+            let table_root = self.table_root.as_str();
+            async move {
+                let unreadable = |e: String| {
+                    UdfError::User(redact(
+                        format!(
+                            "data file '{data_file}': its deletion vector could not be read: {e}"
+                        ),
+                        secrets,
+                    ))
+                };
+                let _permit = limiter
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| unreadable(format!("delete-read limiter unavailable: {e}")))?;
+                let puffin_abs = reconstruct_abs_uri(vector.path, table_root);
+                let location = ListingTableUrl::parse(&puffin_abs)
+                    .map_err(|e| unreadable(format!("invalid Puffin file URL: {e}")))?
+                    .prefix()
+                    .clone();
+                let blob = store
+                    .get_range(&location, vector.range.clone())
+                    .await
+                    .map_err(|e| unreadable(e.to_string()))?;
+                let positions = vector.decode(&blob, data_file, secrets)?;
+                Ok::<_, UdfError>((reconstruct_abs_uri(data_file, table_root), positions))
+            }
+        });
+        try_join_all(reads).await
     }
 
     /// No HEAD: each [`ObjectMeta`] is built from the spec-supplied size.

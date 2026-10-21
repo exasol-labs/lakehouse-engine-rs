@@ -1426,6 +1426,16 @@ fn sample_deletion_vector() -> DeleteMechanism {
     }
 }
 
+fn sample_puffin_deletion_vector() -> DeleteMechanism {
+    DeleteMechanism::IcebergPuffinDeletionVector {
+        path: "deletes/d2.puffin".into(),
+        size: 70,
+        content_offset: 4,
+        content_size_in_bytes: 44,
+        record_count: 2,
+    }
+}
+
 /// Every delete-mechanism list production can build. A list mixing a deletion vector
 /// with an Iceberg delete-file reference is excluded: `files_from_json` refuses it.
 fn every_delete_mechanism_list() -> Vec<Vec<DeleteMechanism>> {
@@ -1437,10 +1447,7 @@ fn every_delete_mechanism_list() -> Vec<Vec<DeleteMechanism>> {
         path: "deletes/d1.parquet".into(),
         size: 60,
     };
-    let puffin = DeleteMechanism::IcebergPuffinDeletionVector {
-        path: "deletes/d2.puffin".into(),
-        size: 70,
-    };
+    let puffin = sample_puffin_deletion_vector();
     vec![
         Vec::new(),
         vec![positional.clone()],
@@ -1813,11 +1820,8 @@ fn every_delete_mechanism_serializes_its_own_self_describing_form() {
             r#"[["f.parquet",1,[{"path":"deletes/d1.parquet","size":60,"content_type":"equality_deletes"}]]]"#,
         ),
         (
-            DeleteMechanism::IcebergPuffinDeletionVector {
-                path: "deletes/d2.puffin".into(),
-                size: 70,
-            },
-            r#"[["f.parquet",1,[{"path":"deletes/d2.puffin","size":70,"content_type":"puffin_deletion_vector"}]]]"#,
+            sample_puffin_deletion_vector(),
+            r#"[["f.parquet",1,[{"path":"deletes/d2.puffin","size":70,"content_type":"puffin_deletion_vector","content_offset":4,"content_size_in_bytes":44,"record_count":2}]]]"#,
         ),
         (
             sample_deletion_vector(),
@@ -1856,11 +1860,7 @@ fn only_a_delete_file_mechanism_exposes_an_object_store_path() {
         Some("deletes/d1.parquet")
     );
     assert_eq!(
-        DeleteMechanism::IcebergPuffinDeletionVector {
-            path: "deletes/d2.puffin".into(),
-            size: 70,
-        }
-        .object_store_path(),
+        sample_puffin_deletion_vector().object_store_path(),
         Some("deletes/d2.puffin")
     );
     assert_eq!(
@@ -2078,6 +2078,22 @@ fn a_nested_descriptor_round_trips_every_container_kind_at_depth() {
             serde_json::from_str::<LogicalField>(&json).unwrap(),
             field,
             "{field:?} must survive its own encoding"
+        );
+    }
+}
+
+#[test]
+fn iceberg_blob_coordinates_are_refused_unless_the_entry_is_a_deletion_vector() {
+    for json in [
+        r#"[["f.parquet",1,[{"path":"d.puffin","size":70,"content_type":"puffin_deletion_vector"}]]]"#,
+        r#"[["f.parquet",1,[{"path":"d.puffin","size":70,"content_type":"puffin_deletion_vector","content_offset":4,"content_size_in_bytes":44}]]]"#,
+        r#"[["f.parquet",1,[{"path":"d.parquet","size":70,"content_type":"position_deletes","content_offset":4,"content_size_in_bytes":44,"record_count":2}]]]"#,
+    ] {
+        let err = ScanSpec::files_from_json(json)
+            .expect_err("blob coordinates must come complete and only on a deletion vector");
+        assert!(
+            err.contains("scan files deserialization failed"),
+            "the refusal identifies scan-files deserialization: {err}"
         );
     }
 }

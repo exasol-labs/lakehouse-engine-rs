@@ -42,7 +42,7 @@ echo "=== spark-iceberg-fixtures: write.delete.granularity=file MOR fixture ==="
 echo "=== spark-iceberg-fixtures: write.delete.granularity=partition MOR fixture ==="
 /opt/spark/bin/spark-sql "${SPARK_CONF[@]}" -f /fixtures/create_partition_granularity_fixture.sql
 
-echo "=== spark-iceberg-fixtures: format-version=3 unsupported-delete fixture ==="
+echo "=== spark-iceberg-fixtures: format-version=3 deletion-vector and unsupported-format fixtures ==="
 /opt/spark/bin/spark-sql "${SPARK_CONF[@]}" -f /fixtures/create_deletion_vector_fixture.sql
 
 echo "=== spark-iceberg-fixtures: type-promotion fixture ==="

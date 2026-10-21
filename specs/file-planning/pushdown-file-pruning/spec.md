@@ -44,10 +44,11 @@ the engine cannot apply.
   (`direct-storage/direct-storage-hive-partitioning`).
 * Exasol pre-normalises `>`→`<` and `>=`→`<=`, so only LESS/LESSEQUAL comparison nodes
   reach the adapter.
-* A data file's associated positional-delete files (as resolved by `plan_files` per the
-  Iceberg sequence-number rules) MUST be preserved into the scan spec, never discarded.
-* Delete mechanisms this engine cannot apply (equality deletes, Puffin/v3 deletion
-  vectors, and ORC/Avro data or delete files) MUST be detected at plan time and fail the
+* A data file's associated positional-delete files and deletion vector (as resolved by
+  `plan_files` per the Iceberg sequence-number rules) MUST be preserved into the scan spec, never
+  discarded.
+* Delete mechanisms this engine cannot apply (equality deletes and ORC/Avro data or delete
+  files) MUST be detected at plan time and fail the
   request loud when they apply to a planned data file.
 * See `pushdown/pushdown-planning` for the broader pushdown plan and the scenario that
   covers wiring of the Iceberg predicate alongside the DataFusion filter string.
@@ -107,7 +108,7 @@ the engine cannot apply.
 
 ### Scenario: An unsupported delete mechanism fails loud at plan time
 
-* *GIVEN* a virtual schema over an Iceberg table where a planned data file is in ORC or Avro format, or has an equality delete, a Puffin deletion vector, or an ORC or Avro delete file applied to it
+* *GIVEN* a virtual schema over an Iceberg table where a planned data file is in ORC or Avro format, or has an equality delete or an ORC or Avro delete file applied to it
 * *WHEN* Exasol sends the corresponding pushdown request
 * *THEN* the adapter SHALL fail the request at plan time with a clean error naming the unsupported mechanism or file format, BEFORE building or returning any scan-driving SQL and before fan-out
 * *AND* the adapter MUST NOT silently return pre-delete rows and MUST NOT emit scan-driving SQL for that request
