@@ -13,6 +13,9 @@ const OWNER_USER: &str = "CREDEXP_OWNER";
 const OWNER_PASSWORD: &str = "CredExpOwner2026x";
 const READER_USER: &str = "CREDEXP_READER";
 const READER_PASSWORD: &str = "CredExpReader2026x";
+const OWNER_ROLE: &str = "CREDEXP_OWNER_ROLE";
+const ROLE_VS_NAME: &str = "CREDEXP_ROLE_VS";
+const SCAN_DENIAL: &str = "the scan cannot access CONNECTION";
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -40,9 +43,40 @@ fn reader_conn() -> ExaConn {
 }
 
 fn scan_grant_sql(verb: &str, preposition: &str) -> String {
+    script_grant_sql(verb, preposition, SCAN_SCRIPT_NAME, OWNER_USER)
+}
+
+fn script_grant_sql(verb: &str, preposition: &str, script: &str, grantee: &str) -> String {
     format!(
-        "{verb} ACCESS ON CONNECTION {CONN_NAME} FOR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME} {preposition} {OWNER_USER}"
+        "{verb} ACCESS ON CONNECTION {CONN_NAME} FOR SCRIPT {SCHEMA_NAME}.{script} {preposition} {grantee}"
     )
+}
+
+fn schema_grant_sql(verb: &str, preposition: &str) -> String {
+    format!(
+        "{verb} ACCESS ON CONNECTION {CONN_NAME} FOR SCHEMA {SCHEMA_NAME} {preposition} {OWNER_USER}"
+    )
+}
+
+fn count_sql(vs: &str) -> String {
+    format!("SELECT COUNT(*) FROM {}", vs_table(vs, E2E_TABLE))
+}
+
+fn denial_text(denied: &serde_json::Value) -> String {
+    assert_eq!(
+        denied["status"].as_str(),
+        Some("error"),
+        "query must be denied: {denied}"
+    );
+    let msg = denied["exception"]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let password = local_stack_connection_password();
+    for value in [&password.access_key, &password.secret_key] {
+        assert!(!msg.contains(value.as_str()), "credential leaked: {msg}");
+    }
+    msg
 }
 
 fn setup_e2e() {
@@ -52,7 +86,10 @@ fn setup_e2e() {
 
         let mut sys = exa_conn();
 
-        let _ = sys.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {VS_NAME} CASCADE"));
+        for vs in [ROLE_VS_NAME, VS_NAME] {
+            let _ = sys.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs} CASCADE"));
+        }
+        sys.execute(&format!("DROP ROLE IF EXISTS {OWNER_ROLE} CASCADE"));
         sys.execute(&format!("DROP USER IF EXISTS {READER_USER} CASCADE"));
         sys.execute(&format!("DROP USER IF EXISTS {OWNER_USER} CASCADE"));
         sys.execute(&format!("DROP CONNECTION IF EXISTS {CONN_NAME}"));
@@ -91,6 +128,31 @@ fn setup_e2e() {
         );
         owner.execute(&format!(
             "GRANT SELECT ON SCHEMA {VS_NAME} TO {READER_USER}"
+        ));
+
+        sys.execute(&format!("CREATE ROLE {OWNER_ROLE}"));
+        for script in [
+            ADAPTER_SCRIPT_NAME,
+            SCAN_SCRIPT_NAME,
+            DISTRIBUTOR_SCRIPT_NAME,
+        ] {
+            sys.execute(&format!(
+                "GRANT EXECUTE ON SCRIPT {SCHEMA_NAME}.{script} TO {OWNER_ROLE}"
+            ));
+        }
+        for script in [ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME] {
+            sys.execute(&script_grant_sql("GRANT", "TO", script, OWNER_ROLE));
+        }
+        // Not the harness helper: it re-creates the CONNECTION, which drops every grant on it.
+        sys.execute(&format!(
+            "CREATE VIRTUAL SCHEMA {ROLE_VS_NAME} USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH \
+             CATALOG_CONNECTION = '{CONN_NAME}' NAMESPACE = '{E2E_NAMESPACE}' ALLOW_HTTP = 'true'"
+        ));
+        sys.execute(&format!(
+            "ALTER VIRTUAL SCHEMA {ROLE_VS_NAME} CHANGE OWNER {OWNER_ROLE}"
+        ));
+        sys.execute(&format!(
+            "GRANT SELECT ON SCHEMA {ROLE_VS_NAME} TO {READER_USER}"
         ));
     });
 }
@@ -297,5 +359,133 @@ fn the_reader_cannot_execute_the_pushdown_plan_it_captured() {
     assert_eq!(
         reader_conn().query_row_count(&query),
         SEED_ROWS_SCORE_GT_15 as i64
+    );
+}
+
+/// Scenario: A role can own the virtual schema and hold its grants
+#[test]
+fn a_role_owned_virtual_schema_serves_a_reader_through_the_roles_grants() {
+    let _serial = serial();
+    setup_e2e();
+    let mut sys = exa_conn();
+
+    assert_eq!(
+        sys.query_row_count(&format!(
+            "SELECT * FROM EXA_DBA_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = '{ROLE_VS_NAME}' AND SCHEMA_OWNER = '{OWNER_ROLE}'"
+        )),
+        1
+    );
+    assert_eq!(
+        sys.query_row_count(&format!(
+            "SELECT * FROM EXA_DBA_RESTRICTED_OBJ_PRIVS WHERE OBJECT_NAME = '{CONN_NAME}' AND FOR_OBJECT_SCHEMA = '{SCHEMA_NAME}' AND FOR_OBJECT_NAME = '{SCAN_SCRIPT_NAME}' AND GRANTEE = '{OWNER_ROLE}'"
+        )),
+        1
+    );
+    assert_eq!(
+        reader_conn().query_scalar_i64(&count_sql(ROLE_VS_NAME)),
+        SEED_TOTAL_ROWS as i64
+    );
+
+    let role_scan_grant =
+        |verb, preposition| script_grant_sql(verb, preposition, SCAN_SCRIPT_NAME, OWNER_ROLE);
+    sys.execute(&role_scan_grant("REVOKE", "FROM"));
+    let denied = reader_conn().try_execute(&count_sql(ROLE_VS_NAME));
+    sys.execute(&role_scan_grant("GRANT", "TO"));
+
+    let msg = denial_text(&denied);
+    assert!(msg.contains(SCAN_DENIAL), "scan denial expected: {msg}");
+}
+
+/// Scenario: A schema-scoped CONNECTION grant covers both scripts
+#[test]
+fn a_schema_scoped_grant_replaces_both_script_grants() {
+    let _serial = serial();
+    setup_e2e();
+    let mut owner = owner_conn();
+
+    for script in [ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME] {
+        owner.execute(&script_grant_sql("REVOKE", "FROM", script, OWNER_USER));
+    }
+    let without_grants = reader_conn().try_execute(&count_sql(VS_NAME));
+    owner.execute(&schema_grant_sql("GRANT", "TO"));
+    let with_schema_grant = reader_conn().try_execute(&count_sql(VS_NAME));
+    owner.execute(&schema_grant_sql("REVOKE", "FROM"));
+    for script in [ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME] {
+        owner.execute(&script_grant_sql("GRANT", "TO", script, OWNER_USER));
+    }
+
+    denial_text(&without_grants);
+    assert_eq!(
+        with_schema_grant["status"].as_str(),
+        Some("ok"),
+        "schema-scoped grant must allow the query: {with_schema_grant}"
+    );
+    assert_eq!(
+        reader_conn().query_scalar_i64(&count_sql(VS_NAME)),
+        SEED_TOTAL_ROWS as i64
+    );
+}
+
+/// Scenario: A reader's own CONNECTION grant does not replace the owner's
+#[test]
+fn a_readers_own_scan_grant_does_not_replace_the_owners() {
+    let _serial = serial();
+    setup_e2e();
+    let mut owner = owner_conn();
+
+    owner.execute(&scan_grant_sql("REVOKE", "FROM"));
+    owner.execute(&script_grant_sql(
+        "GRANT",
+        "TO",
+        SCAN_SCRIPT_NAME,
+        READER_USER,
+    ));
+    let denied = reader_conn().try_execute(&count_sql(VS_NAME));
+    owner.execute(&script_grant_sql(
+        "REVOKE",
+        "FROM",
+        SCAN_SCRIPT_NAME,
+        READER_USER,
+    ));
+    owner.execute(&scan_grant_sql("GRANT", "TO"));
+
+    let msg = denial_text(&denied);
+    assert!(msg.contains(SCAN_DENIAL), "scan denial expected: {msg}");
+    assert_eq!(
+        reader_conn().query_scalar_i64(&count_sql(VS_NAME)),
+        SEED_TOTAL_ROWS as i64
+    );
+}
+
+/// Scenario: A missing adapter grant fails with the adapter's named error
+#[test]
+fn revoking_the_owners_adapter_grant_fails_with_the_adapter_error() {
+    let _serial = serial();
+    setup_e2e();
+    let mut owner = owner_conn();
+
+    owner.execute(&script_grant_sql(
+        "REVOKE",
+        "FROM",
+        ADAPTER_SCRIPT_NAME,
+        OWNER_USER,
+    ));
+    let denied = reader_conn().try_execute(&count_sql(VS_NAME));
+    owner.execute(&script_grant_sql(
+        "GRANT",
+        "TO",
+        ADAPTER_SCRIPT_NAME,
+        OWNER_USER,
+    ));
+
+    let msg = denial_text(&denied);
+    assert!(
+        msg.contains(&format!("CONNECTION '{CONN_NAME}' could not be resolved")),
+        "adapter denial expected: {msg}"
+    );
+    assert!(!msg.contains(SCAN_DENIAL), "not a scan denial: {msg}");
+    assert_eq!(
+        reader_conn().query_scalar_i64(&count_sql(VS_NAME)),
+        SEED_TOTAL_ROWS as i64
     );
 }

@@ -59,6 +59,32 @@ Replaces the storage credentials the adapter embedded in the scan-driving SQL wi
 * *AND* when the owner's grant is missing, the error a reader receives SHALL name the CONNECTION, the scan script, and the virtual schema's owner as the grantee, and MUST NOT contain any credential value
 * *AND* each shard SHALL read the CONNECTION value current at ITS resolution time, and a sealed envelope under a rotated password SHALL fail AEAD with no plaintext
 
+### Scenario: A role can own the virtual schema and hold its grants
+
+* *GIVEN* a virtual schema whose owner is a role, and the role holds `EXECUTE` on the adapter, scan, and distributor scripts and the script-scoped CONNECTION grants for the adapter and scan scripts
+* *WHEN* a reader that holds only `CREATE SESSION` and `SELECT` on the virtual schema, and is not a member of the role, queries it
+* *THEN* the reader SHALL receive the owner's rows
+* *AND* when the role's scan grant is revoked, the reader's query SHALL fail with the scan's named error
+
+### Scenario: A schema-scoped CONNECTION grant covers both scripts
+
+* *GIVEN* a virtual schema whose owner holds `GRANT ACCESS ON CONNECTION ... FOR SCHEMA <schema>` on the deployment schema and no script-scoped CONNECTION grant
+* *WHEN* a reader queries the virtual schema
+* *THEN* the reader SHALL receive the owner's rows
+
+### Scenario: A reader's own CONNECTION grant does not replace the owner's
+
+* *GIVEN* a virtual schema whose owner lacks the scan script's CONNECTION grant
+* *AND* a reader that holds `GRANT ACCESS ON CONNECTION ... FOR SCRIPT <schema>.LAKEHOUSE_SCAN` itself
+* *WHEN* the reader queries the virtual schema
+* *THEN* the query SHALL fail with the scan's named error
+
+### Scenario: A missing adapter grant fails with the adapter's named error
+
+* *GIVEN* a virtual schema whose owner holds the scan script's CONNECTION grant but not the adapter script's
+* *WHEN* a reader queries the virtual schema
+* *THEN* the query SHALL fail with an error stating `CONNECTION '<name>' could not be resolved`, distinct from the scan's named error, and MUST NOT contain any credential value
+
 ### Scenario: A virtual schema reader can read the pushdown plan but cannot execute it
 
 * *GIVEN* a virtual schema whose owner holds `EXECUTE` on the adapter, scan, and distributor scripts and the script-scoped CONNECTION grant

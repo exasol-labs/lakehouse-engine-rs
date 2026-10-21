@@ -24,6 +24,43 @@ grants: `CREATE OR REPLACE SCRIPT` and `CREATE OR REPLACE CONNECTION` only drop 
 the scripts and the CONNECTION, and a reader holds none of those. The re-grant burden described
 above falls entirely on the VS owner/operator.
 
+A CONNECTION grant to a querying user has no effect. Only the owner's grants count.
+
+One schema-wide grant can replace the two script grants:
+
+```sql
+GRANT ACCESS ON CONNECTION <conn> FOR SCHEMA <schema> TO <vs-owner>;
+```
+
+### A role as owner
+
+A role can own the virtual schema. Give the role the CONNECTION grants above and `EXECUTE` on `LAKEHOUSE_ADAPTER`, `LAKEHOUSE_SCAN`, and `LAKEHOUSE_DISTRIBUTE_FILES`, then hand the virtual schema to it:
+
+```sql
+ALTER VIRTUAL SCHEMA <vs> CHANGE OWNER <role>;
+```
+
+Readers still need only `SELECT` on the virtual schema, not membership in the role.
+
+### Missing grants
+
+When the owner lacks a grant, the query fails with one of these errors:
+
+| Error contains | Missing owner grant |
+|----------------|---------------------|
+| `CONNECTION '<conn>' could not be resolved` | `FOR SCRIPT <schema>.LAKEHOUSE_ADAPTER` |
+| `the scan cannot access CONNECTION '<conn>'` | `FOR SCRIPT <schema>.LAKEHOUSE_SCAN` |
+
+To list the grants on a CONNECTION, run as a DBA:
+
+```sql
+SELECT FOR_OBJECT_SCHEMA, FOR_OBJECT_NAME, FOR_OBJECT_TYPE, GRANTEE
+FROM EXA_DBA_RESTRICTED_OBJ_PRIVS
+WHERE OBJECT_NAME = '<CONN>';
+```
+
+The owner, `SCHEMA_OWNER` in `EXA_DBA_VIRTUAL_SCHEMAS`, needs a row for each of the two scripts, or one row with `FOR_OBJECT_TYPE = SCHEMA`.
+
 `EXPLAIN VIRTUAL` and pushdown-path errors carry the pushdown SQL verbatim — credential VALUES must never appear in it. See [Plan visibility versus plan execution](#plan-visibility-versus-plan-execution) for what else that plan text exposes and why reading it is safe while running it is not.
 
 ## Plan visibility versus plan execution
