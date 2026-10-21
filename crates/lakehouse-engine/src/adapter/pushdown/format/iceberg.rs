@@ -296,9 +296,6 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnsupportedDeleteMechanism {
     EqualityDelete,
-    /// iceberg-rust validates a deletion vector's coordinates when building its task, so this
-    /// guards only against a future relaxation there.
-    IncompleteDeletionVector,
     OrcDataFile,
     AvroDataFile,
     OrcDeleteFile,
@@ -310,9 +307,6 @@ impl UnsupportedDeleteMechanism {
     fn describe(self) -> &'static str {
         match self {
             UnsupportedDeleteMechanism::EqualityDelete => "Iceberg equality deletes",
-            UnsupportedDeleteMechanism::IncompleteDeletionVector => {
-                "Iceberg deletion vectors without a blob range or cardinality"
-            }
             UnsupportedDeleteMechanism::OrcDataFile => "ORC data files",
             UnsupportedDeleteMechanism::AvroDataFile => "Avro data files",
             UnsupportedDeleteMechanism::OrcDeleteFile => "ORC delete files",
@@ -417,32 +411,25 @@ fn refuse_date_promotion(
 
 /// Plan time refuses equality deletes; that arm lets the read-time backstop refuse one that
 /// slips past. `Data` maps to the same non-positional sentinel.
-fn iceberg_delete_mechanism(
-    delete: &iceberg::scan::FileScanTaskDeleteFile,
-) -> Result<DeleteMechanism, UnsupportedDeleteMechanism> {
+fn iceberg_delete_mechanism(delete: &iceberg::scan::FileScanTaskDeleteFile) -> DeleteMechanism {
     use iceberg::spec::DataContentType::{Data, EqualityDeletes, PositionDeletes};
     let path = delete.file_path().to_string();
     let size = delete.file_size_in_bytes();
-    Ok(match (delete.file_type(), delete.file_format()) {
+    match (delete.file_type(), delete.file_format()) {
+        // iceberg-rust refuses to build a deletion-vector task missing these, so the defaults
+        // never apply.
         (PositionDeletes, iceberg::spec::DataFileFormat::Puffin) => {
-            let (Some(content_offset), Some(content_size_in_bytes), Some(record_count)) = (
-                delete.content_offset(),
-                delete.content_size_in_bytes(),
-                delete.record_count(),
-            ) else {
-                return Err(UnsupportedDeleteMechanism::IncompleteDeletionVector);
-            };
             DeleteMechanism::IcebergPuffinDeletionVector {
                 path,
                 size,
-                content_offset,
-                content_size_in_bytes,
-                record_count,
+                content_offset: delete.content_offset().unwrap_or_default(),
+                content_size_in_bytes: delete.content_size_in_bytes().unwrap_or_default(),
+                record_count: delete.record_count().unwrap_or_default(),
             }
         }
         (PositionDeletes, _) => DeleteMechanism::IcebergPositionalDelete { path, size },
         (EqualityDeletes | Data, _) => DeleteMechanism::IcebergEqualityDelete { path, size },
-    })
+    }
 }
 
 /// Iceberg predicate pruning is best-effort; DataFusion remains the row-level backstop.
@@ -498,7 +485,7 @@ fn planned_file_entry(
         .iter()
         .map(|d| {
             classify_planned_file(d.file_type(), d.file_format())?;
-            iceberg_delete_mechanism(d)
+            Ok(iceberg_delete_mechanism(d))
         })
         .collect::<Result<_, _>>()?;
     Ok(FileEntry::with_deletes(

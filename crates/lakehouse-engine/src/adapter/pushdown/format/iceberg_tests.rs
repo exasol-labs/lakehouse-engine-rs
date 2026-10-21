@@ -222,9 +222,8 @@ fn plan_errors_redact_the_literal_azure_secret_values() {
 
 #[test]
 fn iceberg_delete_mechanism_maps_position_equality_and_the_data_sentinel() {
-    let mechanism = |path: &str, content, format| {
-        iceberg_delete_mechanism(&delete_file(path, content, format)).expect("a mechanism")
-    };
+    let mechanism =
+        |path: &str, content, format| iceberg_delete_mechanism(&delete_file(path, content, format));
     assert_eq!(
         mechanism(
             "d0.parquet",
