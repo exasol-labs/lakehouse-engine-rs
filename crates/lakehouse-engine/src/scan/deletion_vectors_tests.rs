@@ -286,7 +286,7 @@ fn puffin_vector(
     offset: u64,
     length: u64,
     cardinality: u64,
-) -> Result<IcebergDeletionVector<'static>, UdfError> {
+) -> Result<IcebergDeletionVector, UdfError> {
     IcebergDeletionVector::resolve(
         ManifestDeletionVector {
             path: "dv.puffin",

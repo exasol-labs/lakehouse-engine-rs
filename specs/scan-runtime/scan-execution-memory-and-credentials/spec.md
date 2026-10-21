@@ -26,6 +26,11 @@ shard-invariant common spec argument, serialized once for the whole fan-out.
 * The DataFusion memory pool bounds aggregation, sort, and join — but NOT the
   Parquet→Arrow decode and scan buffers. The configured `batch_size` is the lever
   that bounds that out-of-pool working set.
+* The row-position delete state (`scan-read-path/scan-execution-row-position-deletes`) is built
+  before the first row is emitted and lives as long as the scan. Its size is reserved in the
+  memory pool as a non-spillable reservation. A large delete set therefore shrinks the pool left
+  for aggregation, sort, and join, and a delete set larger than the pool fails the scan instead
+  of exhausting the instance.
 * The `batch_size` is carried in the scan spec; a spec lacking it deserializes to a
   conservative built-in default, and a sub-1 value is clamped to 1.
 * Scan efficiency depends on the Parquet reader skipping data the predicate cannot
@@ -124,6 +129,14 @@ shard-invariant common spec argument, serialized once for the whole fan-out.
 * *AND* the wire wrapper MUST NOT expose a secret-value accessor, so a site left reading the unresolved value fails to COMPILE rather than returning an empty set and silently disarming redaction
 * *AND* an error raised on the RAW-SCAN path and an error raised on the PARTIAL-AGGREGATE path SHALL each be asserted to carry no resolved credential value, because those two paths read the fact-side set directly
 * *AND* a spec whose storage block carries a reference MUST NOT yield an empty secret set once resolution has run, and a test SHALL assert the set is NON-empty for a resolved reference
+
+### Scenario: Row-position delete state is reserved in the memory pool
+
+* *GIVEN* a shard whose data files carry row-position deletes
+* *WHEN* the scan UDF builds the deleted-position sets and the base access plans
+* *THEN* the UDF SHALL reserve their size in the DataFusion memory pool until the scan finishes
+* *AND* the UDF SHALL release the reservation for the deleted-position sets once the access plans are built
+* *AND* a shard whose delete state does not fit the pool SHALL fail with an error naming the memory pool before any row is emitted
 
 ### Scenario: Scan bounds the Parquet decode working set via a configured batch size
 

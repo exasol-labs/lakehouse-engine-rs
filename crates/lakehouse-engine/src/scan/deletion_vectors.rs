@@ -194,15 +194,15 @@ pub(crate) struct ManifestDeletionVector<'a> {
 
 /// One `deletion-vector-v1` blob inside a Puffin file that may hold many data files' vectors.
 #[derive(Debug, Clone)]
-pub(crate) struct IcebergDeletionVector<'a> {
-    pub(crate) path: &'a str,
+pub(crate) struct IcebergDeletionVector {
+    pub(crate) path: String,
     pub(crate) range: Range<u64>,
     cardinality: u64,
 }
 
-impl<'a> IcebergDeletionVector<'a> {
+impl IcebergDeletionVector {
     pub(crate) fn resolve(
-        manifest: ManifestDeletionVector<'a>,
+        manifest: ManifestDeletionVector<'_>,
         data_file_path: &str,
         secrets: &[String],
     ) -> Result<Self, UdfError> {
@@ -224,7 +224,7 @@ impl<'a> IcebergDeletionVector<'a> {
                 refusal("Iceberg", data_file_path, &reason, secrets)
             })?;
         Ok(Self {
-            path,
+            path: path.to_string(),
             range: content_offset..end,
             cardinality: record_count,
         })

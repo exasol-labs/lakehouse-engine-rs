@@ -25,6 +25,9 @@ files, Iceberg deletion vectors, and Delta deletion vectors.
   * Phase B looks up that map per data file. For each delete-carrying data file it fetches the
     Parquet footer for the per-row-group row counts, builds a per-row-group `RowSelection`, and
     attaches it as the file's base `ParquetAccessPlan`.
+* Every read, decode, and access-plan build is its own Tokio task on the scan runtime
+  (`scan-runtime/scan-execution-threading`). A multi-thread runtime therefore spreads the delete
+  path's CPU work across its workers, and a current-thread runtime keeps it on one core.
 * Phase A and Phase B share one size-N connection-budget limiter per scan invocation, including both
   sides of a broadcast join. `scan-runtime/scan-execution-connection-concurrency` owns the budget
   knob (`s3_max_connections`).
@@ -66,6 +69,21 @@ files, Iceberg deletion vectors, and Delta deletion vectors.
 * *WHEN* the scan UDF registers those files
 * *THEN* the UDF SHALL scan them through the same DataFusion `ParquetSource`-backed provider with NO base `ParquetAccessPlan` attached (an absent or all-selected access plan)
 * *AND* the emitted rows SHALL be identical to a scan of the same files without delete support for the same query
+
+### Scenario: Delete preparation spreads across the scan runtime's workers
+
+* *GIVEN* a scan runtime with more than one worker thread and a shard whose data files carry row-position deletes
+* *WHEN* the scan UDF reads and decodes those deletes and builds the access plans
+* *THEN* each read and decode, and each data file's access-plan build, SHALL run as its own task on the runtime's workers, so the CPU work uses more than one core
+* *AND* the UDF MUST NOT run that work on threads beyond the runtime's workers, so the instance stays within its thread budget
+* *AND* the first failing task SHALL abort the remaining tasks and fail the scan before any row is emitted
+
+### Scenario: Access-plan construction cost does not grow with the row-group count
+
+* *GIVEN* a delete-carrying data file with many row groups
+* *WHEN* the scan UDF builds the file's base `ParquetAccessPlan`
+* *THEN* the UDF SHALL build every row group's selection in one pass over the file's deleted positions, so the cost grows with the deletes and not with deletes times row groups
+* *AND* a row group with no deleted row SHALL be scanned without a selection, and a row group whose every row is deleted SHALL be skipped
 
 ### Scenario: Concurrent data-file footer fetches stay within the connection budget
 

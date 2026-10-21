@@ -13,7 +13,7 @@ The normative shapes this feature reads, quoted from the Iceberg table spec and 
 
 The adapter carries each deletion vector as the Puffin deletion-vector delete mechanism: the Puffin file's path and size, the blob's offset and length, and the manifest's `record_count`. Which vector applies to which data file follows iceberg-rust's delete matching, which also drops a data file's positional delete files when a vector applies to it.
 
-The scan fetches only the blobs' byte ranges, because one Puffin file holds the vectors of many data files. It merges the ranges of one Puffin file that lie less than 1 MiB apart (object_store's `OBJECT_STORE_COALESCE_DEFAULT`) into one request. Each request holds its own permit of the connection-budget limiter that every delete read shares. It decodes the blob with iceberg-rust's decoder and feeds the positions into the pipeline that every row-position delete mechanism shares (`scan-read-path/scan-execution-row-position-deletes`).
+The scan fetches only the blobs' byte ranges, because one Puffin file holds the vectors of many data files. It merges the ranges of one Puffin file that lie less than 1 MiB apart (object_store's `OBJECT_STORE_COALESCE_DEFAULT`) into one request of at most 8 MiB. Each request holds its own permit of the connection-budget limiter that every delete read shares. It decodes each blob as soon as its request returns, with iceberg-rust's decoder, and feeds the positions into the pipeline that every row-position delete mechanism shares (`scan-read-path/scan-execution-row-position-deletes`).
 
 ## Scenarios
 
@@ -35,7 +35,7 @@ The scan fetches only the blobs' byte ranges, because one Puffin file holds the 
 * *GIVEN* a shard whose assigned data files carry deletion vectors stored as blobs of one Puffin file
 * *WHEN* the scan reads those vectors
 * *THEN* the scan SHALL fetch only the byte ranges of the blobs that the shard's data files need, never the whole Puffin file
-* *AND* the scan SHALL fetch blobs that lie less than 1 MiB apart in one ranged request
+* *AND* the scan SHALL fetch blobs that lie less than 1 MiB apart in one ranged request, unless that request would exceed 8 MiB
 * *AND* each ranged request SHALL hold its own permit of the shared size-N limiter, so the shard's in-flight Puffin reads never exceed N
 * *AND* each data file SHALL receive the positions of its own blob only
 
