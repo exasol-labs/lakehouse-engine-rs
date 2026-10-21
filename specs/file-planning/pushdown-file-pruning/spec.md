@@ -100,11 +100,11 @@ the engine cannot apply.
 
 ### Scenario: Positional-delete files are preserved into the scan spec
 
-* *GIVEN* a virtual schema over an Iceberg merge-on-read table whose resolved `FileScanTask`s carry associated Parquet positional-delete files, at either `write.delete.granularity=file` or `write.delete.granularity=partition`
+* *GIVEN* a virtual schema over an Iceberg merge-on-read table whose resolved `FileScanTask`s carry associated Parquet positional-delete files at either `write.delete.granularity=file` or `write.delete.granularity=partition`, or a Puffin deletion vector
 * *WHEN* Exasol sends the corresponding pushdown request and the adapter resolves the file list once
-* *THEN* the adapter MUST NOT discard a data file's associated positional-delete files, and SHALL carry each delete file's path, byte size, and delete content type into the per-shard file entry for the data file(s) it applies to
+* *THEN* the adapter MUST NOT discard a data file's associated positional-delete files or deletion vector, and SHALL carry each delete file's path, byte size, and delete content type into the per-shard file entry for the data file(s) it applies to, plus a deletion vector's blob coordinates as `file-planning/pushdown-planning-file-encoding` defines them
 * *AND* the association between a data file and its delete files SHALL follow the Iceberg sequence-number rules exactly as `plan_files` resolved them, so a delete file is carried for exactly the data files it applies to and no others
-* *AND* the adapter SHALL carry the delete-file references as the ONLY delete-related addition to the per-shard files argument — it MUST NOT add a serialized Iceberg schema or a bound predicate to the spec for delete support
+* *AND* the adapter SHALL carry the delete-file references, with a deletion vector's blob coordinates, as the ONLY delete-related addition to the per-shard files argument — it MUST NOT add a serialized Iceberg schema or a bound predicate to the spec for delete support
 
 ### Scenario: An unsupported delete mechanism fails loud at plan time
 

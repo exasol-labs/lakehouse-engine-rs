@@ -4,10 +4,11 @@ The scan UDF applies Iceberg v3 deletion vectors on read, so a query over a merg
 
 ## Background
 
-The normative shapes this feature reads, quoted from the Iceberg table spec and the Puffin spec (`apache/iceberg`, `format/spec.md` and `format/puffin-spec.md`, `main`):
+The normative shapes this feature reads, quoted from the Iceberg table spec and the Puffin spec (`apache/iceberg`, `format/spec.md` and `format/puffin-spec.md`, tag `apache-iceberg-1.12.0`):
 
 - Manifest fields: `referenced_data_file` — *"Setting the referenced file is required for deletion vectors."* `content_offset` and `content_size_in_bytes` — *"these values are required and must exactly match the `offset` and `length` stored in the Puffin footer for the deletion vector blob."* `record_count` — *"Number of records in this file, or the cardinality of a deletion vector"*.
-- Scan Planning: a position delete file applies only when *"There is no deletion vector that must be applied to the data file"*, and *"there can be at most one deletion vector for a given data file in a snapshot."*
+- Scan Planning: a position delete file applies only when *"There is no deletion vector that must be applied to the data file"*.
+- Delete Formats: *"there can be at most one deletion vector for a given data file in a snapshot."*
 - Puffin `deletion-vector-v1`: *"Omit `compression-codec`; `deletion-vector-v1` is not compressed"*.
 
 The adapter carries each deletion vector as the Puffin deletion-vector delete mechanism: the Puffin file's path and size, the blob's offset and length, and the manifest's `record_count`. Which vector applies to which data file follows iceberg-rust's delete matching, which also drops a data file's positional delete files when a vector applies to it.

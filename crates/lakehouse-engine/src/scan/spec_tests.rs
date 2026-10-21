@@ -1802,6 +1802,7 @@ fn a_delete_list_holding_one_mechanism_kind_is_accepted() {
     );
 }
 
+/// Scenario: Each delete-file entry carries its content type so the scan can reject unsupported deletes
 #[test]
 fn every_delete_mechanism_serializes_its_own_self_describing_form() {
     let cases = [
