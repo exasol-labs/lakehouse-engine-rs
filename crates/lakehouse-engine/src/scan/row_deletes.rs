@@ -22,15 +22,19 @@ use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
 use datafusion::execution::memory_pool::MemoryReservation;
 use exasol_udf_sdk::error::UdfError;
-use futures::StreamExt;
 use futures::future::BoxFuture;
+use futures::{FutureExt, StreamExt};
 use object_store::{OBJECT_STORE_COALESCE_DEFAULT, ObjectMeta, ObjectStore, ObjectStoreExt};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, RowSelection, RowSelector,
 };
-use parquet::arrow::async_reader::{ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder};
-use parquet::file::metadata::RowGroupMetaData;
+use parquet::arrow::async_reader::{
+    AsyncFileReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
+};
+use parquet::errors::ParquetError;
+use parquet::file::FOOTER_SIZE;
+use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 use roaring::RoaringTreemap;
 use std::collections::hash_map::Entry;
@@ -283,48 +287,162 @@ fn delete_row_group_may_match(
 }
 
 /// A positional-delete file whose footer has been read, with the row groups that can hold
-/// deletes of an assigned data file.
+/// deletes of an assigned data file. A row group flagged `true` lies inside the kept footer
+/// prefetch and decodes with no request.
 struct OpenedDeleteFile {
-    reader: SizedParquetReader,
+    reader: DeleteFileReader,
     metadata: ArrowReaderMetadata,
     projection: ProjectionMask,
-    row_groups: Vec<usize>,
+    row_groups: Vec<(usize, bool)>,
+}
+
+/// The bytes the footer GET fetched, kept while a row group inside them is still to be read and
+/// reserved in the memory pool for that time.
+struct Prefetched {
+    start: u64,
+    bytes: Bytes,
+    reservation: Arc<MemoryReservation>,
+}
+
+impl Prefetched {
+    fn slice(&self, range: &Range<u64>) -> Option<Bytes> {
+        let end = self.start + self.bytes.len() as u64;
+        (range.start >= self.start && range.end <= end).then(|| {
+            self.bytes
+                .slice((range.start - self.start) as usize..(range.end - self.start) as usize)
+        })
+    }
+}
+
+impl Drop for Prefetched {
+    fn drop(&mut self) {
+        self.reservation.shrink(self.bytes.len());
+    }
+}
+
+/// Serves a read inside the kept footer prefetch from memory and every other read from the store.
+#[derive(Clone)]
+struct DeleteFileReader {
+    store: SizedParquetReader,
+    prefetched: Option<Arc<Prefetched>>,
+}
+
+impl AsyncFileReader for DeleteFileReader {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+        match self.prefetched.as_ref().and_then(|tail| tail.slice(&range)) {
+            Some(bytes) => futures::future::ready(Ok(bytes)).boxed(),
+            None => self.store.get_bytes(range),
+        }
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
+        let cached: Option<Vec<Bytes>> = self
+            .prefetched
+            .as_ref()
+            .and_then(|tail| ranges.iter().map(|range| tail.slice(range)).collect());
+        match cached {
+            Some(bytes) => futures::future::ready(Ok(bytes)).boxed(),
+            None => self.store.get_byte_ranges(ranges),
+        }
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+        self.store.get_metadata(options)
+    }
 }
 
 /// Restricted to `assigned` because one partition-granularity delete file references many data
 /// files. Row groups whose `file_path` range cannot overlap are skipped, exploiting Iceberg's
-/// required (`file_path`, `pos`) sort. No HEAD is issued, and a footer that fits
-/// `metadata_size_hint` costs one GET.
+/// required (`file_path`, `pos`) sort. No HEAD is issued. The footer is one GET of the file's last
+/// `metadata_size_hint` bytes, kept while a surviving row group lies inside them, so a delete file
+/// within the hint costs one request in total.
 async fn open_delete_file(
     store: Arc<dyn ObjectStore>,
     delete_meta: ObjectMeta,
     metadata_size_hint: Option<usize>,
     assigned: &HashSet<String>,
+    reservation: &Arc<MemoryReservation>,
     secrets: &[String],
     limiter: &Semaphore,
 ) -> Result<OpenedDeleteFile, UdfError> {
-    let mut reader = SizedParquetReader::new(store, delete_meta.location, delete_meta.size)
-        .with_metadata_size_hint(metadata_size_hint);
-    let metadata = {
+    let failed =
+        |e: String| UdfError::User(redact(format!("failed to open delete file: {e}"), secrets));
+    let size = delete_meta.size;
+    let (tail_start, tail, parquet_metadata) = {
         let _permit = acquire(limiter).await?;
-        ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::new())
-            .await
-            .map_err(|e| {
-                UdfError::User(redact(format!("failed to open delete file: {e}"), secrets))
-            })?
+        let mut want = metadata_size_hint.unwrap_or(0).max(FOOTER_SIZE) as u64;
+        loop {
+            let start = size.saturating_sub(want);
+            let tail = store
+                .get_range(&delete_meta.location, start..size)
+                .await
+                .map_err(|e| failed(e.to_string()))?;
+            let mut parser = ParquetMetaDataReader::new();
+            match parser.try_parse_sized(&tail, size) {
+                Ok(()) => {
+                    let parsed = parser.finish().map_err(|e| failed(e.to_string()))?;
+                    break (start, tail, parsed);
+                }
+                // A footer larger than the hint costs one more GET, still under this permit.
+                Err(ParquetError::NeedMoreData(needed)) if needed as u64 > want => {
+                    want = needed as u64;
+                }
+                Err(e) => return Err(failed(e.to_string())),
+            }
+        }
     };
+    let metadata =
+        ArrowReaderMetadata::try_new(Arc::new(parquet_metadata), ArrowReaderOptions::new())
+            .map_err(|e| failed(e.to_string()))?;
+
     let (file_path_idx, pos_idx) = locate_delete_columns(metadata.schema())?;
-    let projection = ProjectionMask::roots(metadata.parquet_schema(), [file_path_idx, pos_idx]);
-    let row_groups = metadata
+    let parquet_schema = metadata.parquet_schema();
+    let projection = ProjectionMask::roots(parquet_schema, [file_path_idx, pos_idx]);
+    let projected_leaves: Vec<usize> = (0..parquet_schema.num_columns())
+        .filter(|&leaf| {
+            let root = parquet_schema.get_column_root_idx(leaf);
+            root == file_path_idx || root == pos_idx
+        })
+        .collect();
+    let mut row_groups: Vec<(usize, bool)> = metadata
         .metadata()
         .row_groups()
         .iter()
         .enumerate()
         .filter(|(_, row_group)| delete_row_group_may_match(row_group, file_path_idx, assigned))
-        .map(|(idx, _)| idx)
+        .map(|(idx, row_group)| {
+            let in_tail = projected_leaves
+                .iter()
+                .all(|&leaf| row_group.column(leaf).byte_range().0 >= tail_start);
+            (idx, in_tail)
+        })
         .collect();
+    // The prefetch is only an optimization, so a pool that cannot hold it reads from the store.
+    let keep =
+        row_groups.iter().any(|&(_, in_tail)| in_tail) && reservation.try_grow(tail.len()).is_ok();
+    if !keep {
+        row_groups
+            .iter_mut()
+            .for_each(|(_, in_tail)| *in_tail = false);
+    }
+    let prefetched = keep.then(|| {
+        Arc::new(Prefetched {
+            start: tail_start,
+            bytes: tail,
+            reservation: Arc::clone(reservation),
+        })
+    });
     Ok(OpenedDeleteFile {
-        reader,
+        reader: DeleteFileReader {
+            store: SizedParquetReader::new(store, delete_meta.location, size),
+            prefetched,
+        },
         metadata,
         projection,
         row_groups,
@@ -332,7 +450,8 @@ async fn open_delete_file(
 }
 
 impl OpenedDeleteFile {
-    /// One read per surviving row group, each under its own permit.
+    /// One read per surviving row group, each under its own permit unless it decodes from the kept
+    /// footer prefetch and issues no request.
     fn row_group_reads(
         self,
         assigned: &Arc<HashSet<String>>,
@@ -342,7 +461,7 @@ impl OpenedDeleteFile {
     ) -> Vec<Read<HashMap<String, RoaringTreemap>>> {
         self.row_groups
             .iter()
-            .map(|&row_group| {
+            .map(|&(row_group, in_prefetch)| {
                 let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
                     self.reader.clone(),
                     self.metadata.clone(),
@@ -355,7 +474,10 @@ impl OpenedDeleteFile {
                 let limiter = Arc::clone(limiter);
                 let reservation = Arc::clone(reservation);
                 let read: Read<_> = Box::pin(async move {
-                    let _permit = acquire(&limiter).await?;
+                    let _permit = match in_prefetch {
+                        true => None,
+                        false => Some(acquire(&limiter).await?),
+                    };
                     let stream = builder.build().map_err(|e| {
                         UdfError::User(redact(format!("failed to read delete file: {e}"), &secrets))
                     })?;
@@ -401,7 +523,7 @@ async fn delete_file_positions(
 /// positions join their set before the next batch decodes, so the reservation follows the sets as
 /// they grow and an oversized delete set fails mid-read.
 async fn row_group_positions(
-    mut stream: ParquetRecordBatchStream<SizedParquetReader>,
+    mut stream: ParquetRecordBatchStream<DeleteFileReader>,
     assigned: &HashSet<String>,
     reservation: &MemoryReservation,
     secrets: &[String],
@@ -703,8 +825,18 @@ impl ShardDeletes<'_> {
                 let secrets = Arc::clone(&self.secrets);
                 let limiter = Arc::clone(&self.limiter);
                 let hint = self.metadata_size_hint;
+                let reservation = Arc::clone(&self.reservation);
                 let open: Read<_> = Box::pin(async move {
-                    open_delete_file(store, delete_meta, hint, &assigned, &secrets, &limiter).await
+                    open_delete_file(
+                        store,
+                        delete_meta,
+                        hint,
+                        &assigned,
+                        &reservation,
+                        &secrets,
+                        &limiter,
+                    )
+                    .await
                 });
                 Ok(open)
             })

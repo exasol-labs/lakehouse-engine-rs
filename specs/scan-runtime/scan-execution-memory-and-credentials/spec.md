@@ -35,7 +35,9 @@ shard-invariant common spec argument, serialized once for the whole fan-out.
   file joins its set before the next batch decodes, so no unreserved copy of the positions
   outlives one batch. The reservation equals the sets' serialized size. A decoded deletion vector
   is reserved once it is decoded. Like any decode buffer, the Arrow batch itself stays outside the
-  pool.
+  pool. A delete file's kept footer bytes (at most the metadata size hint, 512 KiB by default)
+  are reserved until its last row group is read, and they are not kept when the pool cannot hold
+  them.
 * The `batch_size` is carried in the scan spec; a spec lacking it deserializes to a
   conservative built-in default, and a sub-1 value is clamped to 1.
 * Scan efficiency depends on the Parquet reader skipping data the predicate cannot

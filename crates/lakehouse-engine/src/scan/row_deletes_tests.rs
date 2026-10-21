@@ -231,7 +231,7 @@ fn reads_and_filters_delete_positions_by_file_path() {
             e_tag: None,
             version: None,
         };
-        read_positions(store, meta, &[target], 1).await
+        read_positions(store, meta, Some(DEFAULT_METADATA_SIZE_HINT), &[target], 1).await
     });
 
     assert_eq!(
@@ -480,7 +480,7 @@ fn reads_multi_row_group_delete_file_correctly() {
             e_tag: None,
             version: None,
         };
-        read_positions(store, meta, &[f2], 1).await
+        read_positions(store, meta, Some(DEFAULT_METADATA_SIZE_HINT), &[f2], 1).await
     });
 
     assert_eq!(
@@ -549,6 +549,9 @@ fn delete_file_row_groups_are_read_concurrently_without_the_row_column() {
         .collect();
     assert_eq!(row_column_chunks.len(), 3);
     let file_size = buf.len() as u64;
+    // A hint covering exactly the footer leaves every row group outside the prefetch.
+    let metadata_len = u32::from_le_bytes(buf[buf.len() - 8..buf.len() - 4].try_into().unwrap());
+    let footer_len = metadata_len as usize + 8;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -568,7 +571,7 @@ fn delete_file_row_groups_are_read_concurrently_without_the_row_column() {
             version: None,
         };
         let store = Arc::clone(&counting) as Arc<dyn ObjectStore>;
-        let by_data_file = read_positions(store, meta, &[f1, f2, f3], 2).await;
+        let by_data_file = read_positions(store, meta, Some(footer_len), &[f1, f2, f3], 2).await;
         (
             by_data_file,
             counting.ranges_of("multi.parquet"),
@@ -605,6 +608,78 @@ fn delete_file_row_groups_are_read_concurrently_without_the_row_column() {
             "read {range:?} overlaps a `row` column chunk {row_column_chunks:?}"
         );
     }
+}
+
+/// Scenario: A delete file's row groups are read as separate requests
+#[test]
+fn a_delete_file_within_the_size_hint_costs_one_get_in_total() {
+    use arrow::array::{Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use object_store::memory::InMemory;
+    use object_store::path::Path as StorePath;
+    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let field_id_meta = |id: i32| {
+        HashMap::from([(
+            super::super::PARQUET_FIELD_ID_META_KEY.to_string(),
+            id.to_string(),
+        )])
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("file_path", DataType::Utf8, false)
+            .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_FILE_PATH)),
+        Field::new("pos", DataType::Int64, false)
+            .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_POS)),
+    ]));
+    let f1 = "s3://bucket/db/t/data/f1.parquet";
+    let f2 = "s3://bucket/db/t/data/f2.parquet";
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec![f1, f1, f2, f2])),
+            Arc::new(Int64Array::from(vec![1_i64, 4, 2, 8])),
+        ],
+    )
+    .unwrap();
+    let mut buf: Vec<u8> = Vec::new();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(2))
+        .build();
+    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (by_data_file, reads) = rt.block_on(async move {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let location = StorePath::from("db/t/deletes/small.parquet");
+        let size = buf.len() as u64;
+        inner.put(&location, PutPayload::from(buf)).await.unwrap();
+        let counting = Arc::new(CountingObjectStore::new(inner));
+        let meta = ObjectMeta {
+            location,
+            last_modified: chrono::Utc.timestamp_nanos(0),
+            size,
+            e_tag: None,
+            version: None,
+        };
+        let store = Arc::clone(&counting) as Arc<dyn ObjectStore>;
+        let by_data_file =
+            read_positions(store, meta, Some(DEFAULT_METADATA_SIZE_HINT), &[f1, f2], 1).await;
+        (by_data_file, counting.reads_of("small.parquet"))
+    });
+
+    assert_eq!(by_data_file[f1].iter().collect::<Vec<u64>>(), vec![1, 4]);
+    assert_eq!(by_data_file[f2].iter().collect::<Vec<u64>>(), vec![2, 8]);
+    assert_eq!(
+        reads, 1,
+        "the footer GET returns the whole file, so both row groups decode from it"
+    );
 }
 
 /// Scenario: Delete preparation spreads across the scan runtime's workers
@@ -766,10 +841,11 @@ fn phase_a_fails_as_soon_as_its_sets_outgrow_the_pool() {
     );
 }
 
-/// Phase A's positional-delete steps over one delete file, with DataFusion's default footer hint.
+/// Phase A's positional-delete steps over one delete file.
 async fn read_positions(
     store: Arc<dyn ObjectStore>,
     meta: ObjectMeta,
+    metadata_size_hint: Option<usize>,
     assigned: &[&str],
     permits: usize,
 ) -> HashMap<String, RoaringTreemap> {
@@ -781,8 +857,9 @@ async fn read_positions(
     let opened = open_delete_file(
         store,
         meta,
-        Some(DEFAULT_METADATA_SIZE_HINT),
+        metadata_size_hint,
         &assigned,
+        &reservation,
         &secrets,
         &limiter,
     )
@@ -792,11 +869,20 @@ async fn read_positions(
         join_spawned(opened.row_group_reads(&assigned, &secrets, &limiter, &reservation))
             .await
             .unwrap();
-    delete_file_positions(row_groups, &reservation, &secrets)
+    let positions = delete_file_positions(row_groups, &reservation, &secrets)
         .await
         .unwrap()
         .into_iter()
-        .collect()
+        .collect::<HashMap<_, _>>();
+    assert_eq!(
+        reservation.size(),
+        positions
+            .values()
+            .map(RoaringTreemap::serialized_size)
+            .sum::<usize>(),
+        "the footer prefetch is released once its row groups are read"
+    );
+    positions
 }
 
 /// DataFusion's default `metadata_size_hint`, which the scan's Parquet format keeps.
