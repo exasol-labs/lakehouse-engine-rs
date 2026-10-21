@@ -31,6 +31,27 @@ pub(super) fn write_parquet(path: &Path, columns: Vec<(&str, ArrayRef)>) -> Stri
         .to_string()
 }
 
+/// `batch` as Parquet bytes, cut into row groups of `rows_per_row_group` rows when given.
+pub(super) fn parquet_bytes(batch: RecordBatch, rows_per_row_group: Option<usize>) -> Vec<u8> {
+    let props = rows_per_row_group.map(|rows| {
+        parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows))
+            .build()
+    });
+    let mut buf = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), props).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    buf
+}
+
+pub(super) fn current_thread_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
 pub(super) async fn run_scan(spec: &ScanSpec) -> Vec<RecordBatch> {
     try_run_scan(spec)
         .await

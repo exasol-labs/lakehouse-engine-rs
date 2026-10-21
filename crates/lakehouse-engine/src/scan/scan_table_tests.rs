@@ -1,5 +1,6 @@
 use super::*;
 use crate::scan::spec::DeleteMechanism;
+use crate::scan::test_support::{current_thread_runtime, parquet_bytes};
 use datafusion::execution::session_state::SessionState;
 use std::collections::HashMap;
 
@@ -108,10 +109,7 @@ fn each_partitioned_file_carries_its_own_logged_partition_values() {
         &["part".to_string()],
     );
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = current_thread_runtime();
     let files = rt
         .block_on(async { table.partitioned_files(&memory_session()).await })
         .expect("no delete needs reading");
@@ -145,10 +143,7 @@ fn an_unpartitioned_scan_attaches_no_partition_values() {
         Vec::new(),
     )]);
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = current_thread_runtime();
     let files = rt
         .block_on(async { table.partitioned_files(&memory_session()).await })
         .expect("no delete needs reading");
@@ -164,10 +159,7 @@ fn an_unrepresentable_partition_value_fails_the_scan() {
         &["part".to_string()],
     );
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = current_thread_runtime();
     let error = rt
         .block_on(async { table.partitioned_files(&memory_session()).await })
         .expect_err("an unrepresentable partition value must never reach the query");
@@ -176,18 +168,6 @@ fn an_unrepresentable_partition_value_fails_the_scan() {
     assert!(message.contains("part"), "{message}");
     assert!(message.contains("Int32"), "{message}");
     assert!(message.contains("not-a-number"), "{message}");
-}
-
-fn parquet_bytes(batch: arrow::array::RecordBatch, rows_per_row_group: usize) -> Vec<u8> {
-    let props = parquet::file::properties::WriterProperties::builder()
-        .set_max_row_group_row_count(Some(rows_per_row_group))
-        .build();
-    let mut buf = Vec::new();
-    let mut writer =
-        parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
-    buf
 }
 
 /// A 1000-row data file in ten row groups whose every other row is deleted, in a session whose
@@ -202,7 +182,7 @@ fn session_with_deleted_rows(pool_bytes: usize) -> (ParquetScanTable, SessionSta
     let data = parquet_bytes(
         RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from_iter_values(0..1000)) as _)])
             .unwrap(),
-        100,
+        Some(100),
     );
     let deleted: Vec<i64> = (0..1000).step_by(2).collect();
     let deletes = parquet_bytes(
@@ -217,7 +197,7 @@ fn session_with_deleted_rows(pool_bytes: usize) -> (ParquetScanTable, SessionSta
             ("pos", Arc::new(Int64Array::from(deleted)) as _),
         ])
         .unwrap(),
-        1000,
+        Some(1000),
     );
 
     let table = scan_table_over(vec![FileEntry::with_deletes(
@@ -252,10 +232,7 @@ fn session_with_deleted_rows(pool_bytes: usize) -> (ParquetScanTable, SessionSta
 #[test]
 fn delete_state_is_reserved_in_the_memory_pool_while_the_provider_lives() {
     let (table, state) = session_with_deleted_rows(1024 * 1024);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = current_thread_runtime();
 
     rt.block_on(table.partitioned_files(&state)).unwrap();
     let pool = &state.runtime_env().memory_pool;
@@ -277,10 +254,7 @@ fn delete_state_is_reserved_in_the_memory_pool_while_the_provider_lives() {
 #[test]
 fn delete_state_beyond_the_memory_pool_fails_the_scan_cleanly() {
     let (table, state) = session_with_deleted_rows(4096);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = current_thread_runtime();
 
     let error = rt
         .block_on(table.partitioned_files(&state))

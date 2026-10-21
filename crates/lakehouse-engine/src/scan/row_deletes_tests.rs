@@ -1,8 +1,14 @@
 use super::*;
 use crate::scan::spec::DeltaDeletionVectorStorage;
+use crate::scan::test_support::{current_thread_runtime, parquet_bytes};
+use arrow::array::RecordBatch;
+use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use chrono::TimeZone;
 use object_store::GetRange;
+use object_store::PutPayload;
+use object_store::memory::InMemory;
+use object_store::path::Path as StorePath;
 use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
 use parquet::schema::types::{SchemaDescPtr, SchemaDescriptor};
 use std::sync::Arc;
@@ -179,58 +185,14 @@ fn access_plan_cost_does_not_grow_with_the_row_group_count() {
 
 #[test]
 fn reads_and_filters_delete_positions_by_file_path() {
-    use arrow::array::{Int64Array, RecordBatch, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use object_store::memory::InMemory;
-    use object_store::path::Path as StorePath;
-    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-    use parquet::arrow::ArrowWriter;
-
-    let field_id_meta = |id: i32| {
-        HashMap::from([(
-            super::super::PARQUET_FIELD_ID_META_KEY.to_string(),
-            id.to_string(),
-        )])
-    };
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("file_path", DataType::Utf8, false)
-            .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_FILE_PATH)),
-        Field::new("pos", DataType::Int64, false)
-            .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_POS)),
-    ]));
-
     let target = "s3://bucket/db/t/data/f1.parquet";
     let other = "s3://bucket/db/t/data/f2.parquet";
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(StringArray::from(vec![target, target, other, target])),
-            Arc::new(Int64Array::from(vec![3_i64, 7, 5, 9])),
-        ],
-    )
-    .unwrap();
+    let bytes =
+        positional_delete_file_bytes(&[(target, 3), (target, 7), (other, 5), (target, 9)], None);
 
-    let mut buf: Vec<u8> = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let by_data_file = rt.block_on(async move {
+    let by_data_file = current_thread_runtime().block_on(async move {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let location = StorePath::from("db/t/deletes/d.parquet");
-        let size = buf.len() as u64;
-        store.put(&location, PutPayload::from(buf)).await.unwrap();
-        let meta = ObjectMeta {
-            location,
-            last_modified: chrono::Utc.timestamp_nanos(0),
-            size,
-            e_tag: None,
-            version: None,
-        };
+        let meta = put_object(store.as_ref(), "db/t/deletes/d.parquet", bytes).await;
         read_positions(store, meta, Some(DEFAULT_METADATA_SIZE_HINT), &[target], 1).await
     });
 
@@ -422,64 +384,18 @@ fn truncated_bounds_keep_range_valid() {
 
 #[test]
 fn reads_multi_row_group_delete_file_correctly() {
-    use arrow::array::{Int64Array, RecordBatch, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use object_store::memory::InMemory;
-    use object_store::path::Path as StorePath;
-    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
-
-    let field_id_meta = |id: i32| {
-        HashMap::from([(
-            super::super::PARQUET_FIELD_ID_META_KEY.to_string(),
-            id.to_string(),
-        )])
-    };
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("file_path", DataType::Utf8, false)
-            .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_FILE_PATH)),
-        Field::new("pos", DataType::Int64, false)
-            .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_POS)),
-    ]));
-
     // Sorted by (file_path, pos) as Iceberg requires, one data file per row group.
     let f1 = "s3://bucket/db/t/data/f1.parquet";
     let f2 = "s3://bucket/db/t/data/f2.parquet";
     let f3 = "s3://bucket/db/t/data/f3.parquet";
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(StringArray::from(vec![f1, f1, f2, f2, f3, f3])),
-            Arc::new(Int64Array::from(vec![10_i64, 20, 5, 15, 7, 30])),
-        ],
-    )
-    .unwrap();
+    let bytes = positional_delete_file_bytes(
+        &[(f1, 10), (f1, 20), (f2, 5), (f2, 15), (f3, 7), (f3, 30)],
+        Some(2),
+    );
 
-    let mut buf: Vec<u8> = Vec::new();
-    let props = WriterProperties::builder()
-        .set_max_row_group_row_count(Some(2))
-        .build();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let by_data_file = rt.block_on(async move {
+    let by_data_file = current_thread_runtime().block_on(async move {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let location = StorePath::from("db/t/deletes/multi.parquet");
-        let size = buf.len() as u64;
-        store.put(&location, PutPayload::from(buf)).await.unwrap();
-        let meta = ObjectMeta {
-            location,
-            last_modified: chrono::Utc.timestamp_nanos(0),
-            size,
-            e_tag: None,
-            version: None,
-        };
+        let meta = put_object(store.as_ref(), "db/t/deletes/multi.parquet", bytes).await;
         read_positions(store, meta, Some(DEFAULT_METADATA_SIZE_HINT), &[f2], 1).await
     });
 
@@ -495,34 +411,17 @@ fn reads_multi_row_group_delete_file_correctly() {
 /// Scenario: A delete file's row groups are read as separate requests
 #[test]
 fn delete_file_row_groups_are_read_concurrently_without_the_row_column() {
-    use arrow::array::{Int64Array, RecordBatch, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use object_store::memory::InMemory;
-    use object_store::path::Path as StorePath;
-    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
-    let field_id_meta = |id: i32| {
-        HashMap::from([(
-            super::super::PARQUET_FIELD_ID_META_KEY.to_string(),
-            id.to_string(),
-        )])
-    };
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("file_path", DataType::Utf8, false)
-            .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_FILE_PATH)),
-        Field::new("pos", DataType::Int64, false)
-            .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_POS)),
-        Field::new("row", DataType::Utf8, true).with_metadata(field_id_meta(2_147_483_544)),
-    ]));
+    let mut fields = delete_file_fields();
+    fields
+        .push(Field::new("row", DataType::Utf8, true).with_metadata(field_id_meta(2_147_483_544)));
     let f1 = "s3://bucket/db/t/data/f1.parquet";
     let f2 = "s3://bucket/db/t/data/f2.parquet";
     let f3 = "s3://bucket/db/t/data/f3.parquet";
     let payload = "x".repeat(4096);
     let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
+        Arc::new(Schema::new(fields)),
         vec![
             Arc::new(StringArray::from(vec![f1, f1, f2, f2, f3, f3])),
             Arc::new(Int64Array::from(vec![10_i64, 20, 5, 15, 7, 30])),
@@ -530,13 +429,7 @@ fn delete_file_row_groups_are_read_concurrently_without_the_row_column() {
         ],
     )
     .unwrap();
-    let mut buf: Vec<u8> = Vec::new();
-    let props = WriterProperties::builder()
-        .set_max_row_group_row_count(Some(2))
-        .build();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
+    let buf = parquet_bytes(batch, Some(2));
     let row_column_chunks: Vec<Range<u64>> = SerializedFileReader::new(Bytes::from(buf.clone()))
         .unwrap()
         .metadata()
@@ -553,23 +446,10 @@ fn delete_file_row_groups_are_read_concurrently_without_the_row_column() {
     let metadata_len = u32::from_le_bytes(buf[buf.len() - 8..buf.len() - 4].try_into().unwrap());
     let footer_len = metadata_len as usize + 8;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let (by_data_file, ranges, max_in_flight) = rt.block_on(async move {
+    let (by_data_file, ranges, max_in_flight) = current_thread_runtime().block_on(async move {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let location = StorePath::from("db/t/deletes/multi.parquet");
-        let size = buf.len() as u64;
-        inner.put(&location, PutPayload::from(buf)).await.unwrap();
+        let meta = put_object(inner.as_ref(), "db/t/deletes/multi.parquet", buf).await;
         let counting = Arc::new(CountingObjectStore::new(inner));
-        let meta = ObjectMeta {
-            location,
-            last_modified: chrono::Utc.timestamp_nanos(0),
-            size,
-            e_tag: None,
-            version: None,
-        };
         let store = Arc::clone(&counting) as Arc<dyn ObjectStore>;
         let by_data_file = read_positions(store, meta, Some(footer_len), &[f1, f2, f3], 2).await;
         (
@@ -613,61 +493,14 @@ fn delete_file_row_groups_are_read_concurrently_without_the_row_column() {
 /// Scenario: A delete file's row groups are read as separate requests
 #[test]
 fn a_delete_file_within_the_size_hint_costs_one_get_in_total() {
-    use arrow::array::{Int64Array, RecordBatch, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use object_store::memory::InMemory;
-    use object_store::path::Path as StorePath;
-    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
-
-    let field_id_meta = |id: i32| {
-        HashMap::from([(
-            super::super::PARQUET_FIELD_ID_META_KEY.to_string(),
-            id.to_string(),
-        )])
-    };
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("file_path", DataType::Utf8, false)
-            .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_FILE_PATH)),
-        Field::new("pos", DataType::Int64, false)
-            .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_POS)),
-    ]));
     let f1 = "s3://bucket/db/t/data/f1.parquet";
     let f2 = "s3://bucket/db/t/data/f2.parquet";
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(StringArray::from(vec![f1, f1, f2, f2])),
-            Arc::new(Int64Array::from(vec![1_i64, 4, 2, 8])),
-        ],
-    )
-    .unwrap();
-    let mut buf: Vec<u8> = Vec::new();
-    let props = WriterProperties::builder()
-        .set_max_row_group_row_count(Some(2))
-        .build();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
+    let bytes = positional_delete_file_bytes(&[(f1, 1), (f1, 4), (f2, 2), (f2, 8)], Some(2));
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let (by_data_file, reads) = rt.block_on(async move {
+    let (by_data_file, reads) = current_thread_runtime().block_on(async move {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let location = StorePath::from("db/t/deletes/small.parquet");
-        let size = buf.len() as u64;
-        inner.put(&location, PutPayload::from(buf)).await.unwrap();
+        let meta = put_object(inner.as_ref(), "db/t/deletes/small.parquet", bytes).await;
         let counting = Arc::new(CountingObjectStore::new(inner));
-        let meta = ObjectMeta {
-            location,
-            last_modified: chrono::Utc.timestamp_nanos(0),
-            size,
-            e_tag: None,
-            version: None,
-        };
         let store = Arc::clone(&counting) as Arc<dyn ObjectStore>;
         let by_data_file =
             read_positions(store, meta, Some(DEFAULT_METADATA_SIZE_HINT), &[f1, f2], 1).await;
@@ -723,13 +556,9 @@ fn merged_puffin_requests_respect_the_gap_and_the_size_cap() {
 /// Scenario: Row-position delete state is reserved in the memory pool
 #[test]
 fn phase_a_reserves_the_serialized_size_of_the_sets_it_returns() {
-    use object_store::memory::InMemory;
-    use object_store::path::Path as StorePath;
-    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-
     let data_file = "memory:///db/t/data/x.parquet";
-    let first = positional_delete_file_bytes(&[(data_file, 3), (data_file, 7)]);
-    let second = positional_delete_file_bytes(&[(data_file, 7), (data_file, 9)]);
+    let first = positional_delete_file_bytes(&[(data_file, 3), (data_file, 7)], None);
+    let second = positional_delete_file_bytes(&[(data_file, 7), (data_file, 9)], None);
     let (puffin_file, [puffin_a, _]) = puffin_file_with_two_vectors();
     // Two delete files and a deletion vector for one data file exercise both set merges.
     let files = vec![entry_with(
@@ -747,19 +576,12 @@ fn phase_a_reserves_the_serialized_size_of_the_sets_it_returns() {
         ],
     )];
     let reservation = unbounded_reservation();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = current_thread_runtime();
     let positions = rt.block_on(async {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        for (path, payload) in [
-            ("db/t/deletes/d1.parquet", PutPayload::from(first)),
-            ("db/t/deletes/d2.parquet", PutPayload::from(second)),
-            ("db/t/deletes/dv.puffin", PutPayload::from(puffin_file)),
-        ] {
-            store.put(&StorePath::from(path), payload).await.unwrap();
-        }
+        put_object(store.as_ref(), "db/t/deletes/d1.parquet", first).await;
+        put_object(store.as_ref(), "db/t/deletes/d2.parquet", second).await;
+        put_object(store.as_ref(), "db/t/deletes/dv.puffin", puffin_file).await;
         collect_positions_within(
             &files,
             "memory:///db/t",
@@ -786,14 +608,10 @@ fn phase_a_reserves_the_serialized_size_of_the_sets_it_returns() {
 /// Scenario: Row-position delete state is reserved in the memory pool
 #[test]
 fn phase_a_fails_as_soon_as_its_sets_outgrow_the_pool() {
-    use object_store::memory::InMemory;
-    use object_store::path::Path as StorePath;
-    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-
     const ROWS: i64 = 300_000;
     let data_file = "memory:///db/t/data/x.parquet";
     let rows: Vec<(&str, i64)> = (0..ROWS).map(|pos| (data_file, pos)).collect();
-    let bytes = positional_delete_file_bytes(&rows);
+    let bytes = positional_delete_file_bytes(&rows, None);
     let files = vec![entry_with(
         "data/x.parquet",
         vec![DeleteMechanism::IcebergPositionalDelete {
@@ -804,20 +622,11 @@ fn phase_a_fails_as_soon_as_its_sets_outgrow_the_pool() {
     let set_bytes = (0..ROWS as u64)
         .collect::<RoaringTreemap>()
         .serialized_size();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = current_thread_runtime();
     let collect_within = |pool_bytes: usize| {
         rt.block_on(async {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-            store
-                .put(
-                    &StorePath::from("db/t/deletes/d.parquet"),
-                    PutPayload::from(bytes.clone()),
-                )
-                .await
-                .unwrap();
+            put_object(store.as_ref(), "db/t/deletes/d.parquet", bytes.clone()).await;
             collect_positions_within(
                 &files,
                 "memory:///db/t",
@@ -844,16 +653,12 @@ fn phase_a_fails_as_soon_as_its_sets_outgrow_the_pool() {
 /// Scenario: A delete file's row groups are read as separate requests
 #[test]
 fn footer_bytes_of_many_small_delete_files_leave_the_pool_to_the_sets() {
-    use object_store::memory::InMemory;
-    use object_store::path::Path as StorePath;
-    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-
     const DELETE_FILES: usize = 40;
     let mut files = Vec::new();
     let mut payloads = Vec::new();
     for i in 0..DELETE_FILES {
         let data_file = format!("memory:///db/t/data/f{i:02}.parquet");
-        let bytes = positional_delete_file_bytes(&[(data_file.as_str(), 5)]);
+        let bytes = positional_delete_file_bytes(&[(data_file.as_str(), 5)], None);
         files.push(entry_with(
             &format!("data/f{i:02}.parquet"),
             vec![DeleteMechanism::IcebergPositionalDelete {
@@ -871,21 +676,12 @@ fn footer_bytes_of_many_small_delete_files_leave_the_pool_to_the_sets() {
     let pool_bytes = (DELETE_FILES / 2) * payloads[0].1.len() + 1;
     assert!(DELETE_FILES * set_bytes * 5 < pool_bytes);
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = current_thread_runtime();
     let positions = rt
         .block_on(async {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
             for (path, bytes) in &payloads {
-                store
-                    .put(
-                        &StorePath::from(path.as_str()),
-                        PutPayload::from(bytes.clone()),
-                    )
-                    .await
-                    .unwrap();
+                put_object(store.as_ref(), path, bytes.clone()).await;
             }
             collect_positions_within(
                 &files,
@@ -908,33 +704,23 @@ async fn read_positions(
     assigned: &[&str],
     permits: usize,
 ) -> HashMap<String, RoaringTreemap> {
-    let assigned: Arc<HashSet<String>> =
-        Arc::new(assigned.iter().map(|path| path.to_string()).collect());
-    let secrets: Arc<[String]> = Arc::from([]);
-    let limiter = Arc::new(Semaphore::new(permits));
-    let reservation = unbounded_reservation();
-    let opened = open_delete_file(
+    let ctx = Arc::new(DeleteReadContext {
         store,
-        meta,
+        table_root: String::new(),
+        assigned: assigned.iter().map(|path| path.to_string()).collect(),
+        secrets: Arc::from([]),
+        limiter: Arc::new(Semaphore::new(permits)),
+        reservation: unbounded_reservation(),
         metadata_size_hint,
-        &assigned,
-        &reservation,
-        &secrets,
-        &limiter,
-    )
-    .await
-    .unwrap();
-    let row_groups =
-        join_spawned(opened.row_group_reads(&assigned, &secrets, &limiter, &reservation))
-            .await
-            .unwrap();
-    let positions = delete_file_positions(row_groups, &reservation, &secrets)
+    });
+    let opened = ctx.open_delete_file(meta).await.unwrap();
+    let row_groups = join_spawned(opened.row_group_reads(&ctx)).await.unwrap();
+    let positions = ctx
+        .union_by_data_file(row_groups.into_iter().flatten())
         .await
-        .unwrap()
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        .unwrap();
     assert_eq!(
-        reservation.size(),
+        ctx.reservation.size(),
         positions
             .values()
             .map(RoaringTreemap::serialized_size)
@@ -942,6 +728,25 @@ async fn read_positions(
         "the reservation holds the position sets and nothing else"
     );
     positions
+}
+
+/// Stores `payload` at `path` and returns the metadata a delete read is handed.
+async fn put_object(
+    store: &dyn ObjectStore,
+    path: &str,
+    payload: impl Into<PutPayload>,
+) -> ObjectMeta {
+    let location = StorePath::from(path);
+    let payload = payload.into();
+    let size = payload.content_length() as u64;
+    store.put(&location, payload).await.unwrap();
+    ObjectMeta {
+        location,
+        last_modified: chrono::Utc.timestamp_nanos(0),
+        size,
+        e_tag: None,
+        version: None,
+    }
 }
 
 /// DataFusion's default `metadata_size_hint`, which the scan's Parquet format keeps.
@@ -997,25 +802,28 @@ async fn collect_positions_within(
     .await
 }
 
-fn positional_delete_file_bytes(rows: &[(&str, i64)]) -> Vec<u8> {
-    use arrow::array::{Int64Array, RecordBatch, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use parquet::arrow::ArrowWriter;
+fn field_id_meta(id: i32) -> HashMap<String, String> {
+    HashMap::from([(
+        super::super::PARQUET_FIELD_ID_META_KEY.to_string(),
+        id.to_string(),
+    )])
+}
 
-    let field_id_meta = |id: i32| {
-        HashMap::from([(
-            super::super::PARQUET_FIELD_ID_META_KEY.to_string(),
-            id.to_string(),
-        )])
-    };
-    let schema = Arc::new(Schema::new(vec![
+fn delete_file_fields() -> Vec<Field> {
+    vec![
         Field::new("file_path", DataType::Utf8, false)
             .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_FILE_PATH)),
         Field::new("pos", DataType::Int64, false)
             .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_POS)),
-    ]));
+    ]
+}
+
+fn positional_delete_file_bytes(
+    rows: &[(&str, i64)],
+    rows_per_row_group: Option<usize>,
+) -> Vec<u8> {
     let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
+        Arc::new(Schema::new(delete_file_fields())),
         vec![
             Arc::new(StringArray::from(
                 rows.iter().map(|(path, _)| *path).collect::<Vec<_>>(),
@@ -1026,12 +834,7 @@ fn positional_delete_file_bytes(rows: &[(&str, i64)]) -> Vec<u8> {
         ],
     )
     .unwrap();
-
-    let mut buf: Vec<u8> = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
-    buf
+    parquet_bytes(batch, rows_per_row_group)
 }
 
 /// Real Delta writer output for the `table-with-dv-small` fixture.
@@ -1071,13 +874,10 @@ fn puffin_file_with_two_vectors() -> (Vec<u8>, [DeleteMechanism; 2]) {
 /// Scenario: A shard fetches only its own blobs of a shared Puffin file within the connection budget
 #[test]
 fn all_delete_mechanisms_converge_on_one_position_map() {
-    use object_store::memory::InMemory;
-    use object_store::path::Path as StorePath;
-    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-
     const TABLE_ROOT: &str = "memory:///db/t";
     let iceberg_file = "memory:///db/t/data/iceberg.parquet";
-    let delete_file_bytes = positional_delete_file_bytes(&[(iceberg_file, 3), (iceberg_file, 7)]);
+    let delete_file_bytes =
+        positional_delete_file_bytes(&[(iceberg_file, 3), (iceberg_file, 7)], None);
     let delete_file_size = delete_file_bytes.len() as u64;
     let (puffin_file, [puffin_a, puffin_b]) = puffin_file_with_two_vectors();
 
@@ -1096,33 +896,13 @@ fn all_delete_mechanisms_converge_on_one_position_map() {
         entry_with("data/no_deletes.parquet", Vec::new()),
     ];
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = current_thread_runtime();
     let (positions, reads, puffin_reads) = rt.block_on(async move {
         let inner = Arc::new(InMemory::new());
-        inner
-            .put(
-                &StorePath::from("db/t/deletes/dv.puffin"),
-                PutPayload::from(puffin_file),
-            )
-            .await
-            .unwrap();
-        inner
-            .put(
-                &StorePath::from("db/t/deletes/d.parquet"),
-                PutPayload::from(delete_file_bytes),
-            )
-            .await
-            .unwrap();
-        inner
-            .put(
-                &StorePath::from(format!("db/t/{DV_SIDECAR_NAME}")),
-                PutPayload::from_static(DV_SIDECAR_BODY),
-            )
-            .await
-            .unwrap();
+        put_object(inner.as_ref(), "db/t/deletes/dv.puffin", puffin_file).await;
+        put_object(inner.as_ref(), "db/t/deletes/d.parquet", delete_file_bytes).await;
+        let sidecar = format!("db/t/{DV_SIDECAR_NAME}");
+        put_object(inner.as_ref(), &sidecar, DV_SIDECAR_BODY).await;
         let counting = Arc::new(CountingObjectStore::new(inner));
         let store: Arc<dyn ObjectStore> = Arc::clone(&counting) as Arc<dyn ObjectStore>;
         let positions = collect_positions(&files, TABLE_ROOT, 2, &store)
@@ -1183,10 +963,6 @@ fn all_delete_mechanisms_converge_on_one_position_map() {
 /// Scenario: A shard fetches only its own blobs of a shared Puffin file within the connection budget
 #[test]
 fn distant_puffin_blobs_are_fetched_by_range_each_under_its_own_permit() {
-    use object_store::memory::InMemory;
-    use object_store::path::Path as StorePath;
-    use object_store::{ObjectStoreExt, PutPayload};
-
     const TABLE_ROOT: &str = "memory:///db/t";
     let blob = &DV_SIDECAR_BODY[1..45];
     let gap = vec![0_u8; 2 * OBJECT_STORE_COALESCE_DEFAULT as usize];
@@ -1207,19 +983,10 @@ fn distant_puffin_blobs_are_fetched_by_range_each_under_its_own_permit() {
         entry_with("data/b.parquet", vec![vector(second.start)]),
     ];
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = current_thread_runtime();
     let (positions, mut ranges, max_in_flight) = rt.block_on(async move {
         let inner = Arc::new(InMemory::new());
-        inner
-            .put(
-                &StorePath::from("db/t/deletes/dv.puffin"),
-                PutPayload::from(puffin_file),
-            )
-            .await
-            .unwrap();
+        put_object(inner.as_ref(), "db/t/deletes/dv.puffin", puffin_file).await;
         let counting = Arc::new(CountingObjectStore::new(inner));
         let store: Arc<dyn ObjectStore> = Arc::clone(&counting) as Arc<dyn ObjectStore>;
         let positions = collect_positions(&files, TABLE_ROOT, 1, &store)
@@ -1259,9 +1026,6 @@ fn distant_puffin_blobs_are_fetched_by_range_each_under_its_own_permit() {
 
 #[test]
 fn an_unapplicable_mechanism_fails_the_shard_before_any_read() {
-    use object_store::ObjectStore;
-    use object_store::memory::InMemory;
-
     let files = vec![
         entry_with("data/delta.parquet", vec![logged_deletion_vector()]),
         entry_with(
@@ -1273,10 +1037,7 @@ fn an_unapplicable_mechanism_fails_the_shard_before_any_read() {
         ),
     ];
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = current_thread_runtime();
     let (err, reads) = rt.block_on(async move {
         let counting = Arc::new(CountingObjectStore::new(Arc::new(InMemory::new())));
         let store: Arc<dyn ObjectStore> = Arc::clone(&counting) as Arc<dyn ObjectStore>;

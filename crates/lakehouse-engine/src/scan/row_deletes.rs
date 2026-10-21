@@ -29,9 +29,7 @@ use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, RowSelection, RowSelector,
 };
-use parquet::arrow::async_reader::{
-    AsyncFileReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
-};
+use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
 use parquet::errors::ParquetError;
 use parquet::file::FOOTER_SIZE;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData};
@@ -203,39 +201,6 @@ fn applicable_delete_mechanism<'a>(
     }
 }
 
-/// Reads `url` whole, or only `range` of it, under one permit of the shared limiter. A failure
-/// names `data_file`, because a deletion vector has no identity of its own.
-async fn read_deletion_vector_payload(
-    store: &dyn ObjectStore,
-    limiter: &Semaphore,
-    url: &str,
-    range: Option<Range<u64>>,
-    data_file: &str,
-    secrets: &[String],
-) -> Result<Bytes, UdfError> {
-    let unreadable = |e: String| {
-        UdfError::User(redact(
-            format!("data file '{data_file}': its deletion vector could not be read: {e}"),
-            secrets,
-        ))
-    };
-    let _permit = acquire(limiter)
-        .await
-        .map_err(|e| unreadable(e.to_string()))?;
-    let location = ListingTableUrl::parse(url)
-        .map_err(|e| unreadable(format!("invalid deletion-vector URL: {e}")))?
-        .prefix()
-        .clone();
-    let body = match range {
-        Some(range) => store.get_range(&location, range).await,
-        None => match store.get(&location).await {
-            Ok(result) => result.bytes().await,
-            Err(e) => Err(e),
-        },
-    };
-    body.map_err(|e| unreadable(e.to_string()))
-}
-
 /// Field-id is authoritative; the spec column names are the fallback.
 fn locate_delete_columns(schema: &SchemaRef) -> Result<(usize, usize), UdfError> {
     let by_field_id = |target: i32| {
@@ -341,109 +306,12 @@ impl AsyncFileReader for FooterBytes {
     }
 }
 
-/// Restricted to `assigned` because one partition-granularity delete file references many data
-/// files. Row groups whose `file_path` range cannot overlap are skipped, exploiting Iceberg's
-/// required (`file_path`, `pos`) sort. No HEAD is issued. The footer is one GET of the file's last
-/// `metadata_size_hint` bytes, and the row groups inside them decode here, so a delete file within
-/// the hint costs one request in total.
-async fn open_delete_file(
-    store: Arc<dyn ObjectStore>,
-    delete_meta: ObjectMeta,
-    metadata_size_hint: Option<usize>,
-    assigned: &HashSet<String>,
-    reservation: &MemoryReservation,
-    secrets: &[String],
-    limiter: &Semaphore,
-) -> Result<OpenedDeleteFile, UdfError> {
-    let failed =
-        |e: String| UdfError::User(redact(format!("failed to open delete file: {e}"), secrets));
-    let size = delete_meta.size;
-    let (tail_start, tail, parquet_metadata) = {
-        let _permit = acquire(limiter).await?;
-        let mut want = metadata_size_hint.unwrap_or(0).max(FOOTER_SIZE) as u64;
-        loop {
-            let start = size.saturating_sub(want);
-            let tail = store
-                .get_range(&delete_meta.location, start..size)
-                .await
-                .map_err(|e| failed(e.to_string()))?;
-            let mut parser = ParquetMetaDataReader::new();
-            match parser.try_parse_sized(&tail, size) {
-                Ok(()) => {
-                    let parsed = parser.finish().map_err(|e| failed(e.to_string()))?;
-                    break (start, tail, parsed);
-                }
-                // A footer larger than the hint costs one more GET, still under this permit.
-                Err(ParquetError::NeedMoreData(needed)) if needed as u64 > want => {
-                    want = needed as u64;
-                }
-                Err(e) => return Err(failed(e.to_string())),
-            }
-        }
-    };
-    let metadata =
-        ArrowReaderMetadata::try_new(Arc::new(parquet_metadata), ArrowReaderOptions::new())
-            .map_err(|e| failed(e.to_string()))?;
-
-    let (file_path_idx, pos_idx) = locate_delete_columns(metadata.schema())?;
-    let parquet_schema = metadata.parquet_schema();
-    let projection = ProjectionMask::roots(parquet_schema, [file_path_idx, pos_idx]);
-    let projected_leaves: Vec<usize> = (0..parquet_schema.num_columns())
-        .filter(|&leaf| {
-            let root = parquet_schema.get_column_root_idx(leaf);
-            root == file_path_idx || root == pos_idx
-        })
-        .collect();
-    let (in_tail, row_groups): (Vec<usize>, Vec<usize>) = metadata
-        .metadata()
-        .row_groups()
-        .iter()
-        .enumerate()
-        .filter(|(_, row_group)| delete_row_group_may_match(row_group, file_path_idx, assigned))
-        .map(|(idx, _)| idx)
-        .partition(|&idx| {
-            let row_group = metadata.metadata().row_group(idx);
-            projected_leaves
-                .iter()
-                .all(|&leaf| row_group.column(leaf).byte_range().0 >= tail_start)
-        });
-    // Decoded before the bytes drop, so they never outlive this task, stay a transient read
-    // buffer like any decode buffer, and cannot crowd the pool while other files load.
-    let decoded = if in_tail.is_empty() {
-        HashMap::new()
-    } else {
-        let stream = ParquetRecordBatchStreamBuilder::new_with_metadata(
-            FooterBytes {
-                start: tail_start,
-                bytes: tail,
-            },
-            metadata.clone(),
-        )
-        .with_row_groups(in_tail)
-        .with_projection(projection.clone())
-        .with_batch_size(DELETE_FILE_BATCH_ROWS)
-        .build()
-        .map_err(|e| UdfError::User(redact(format!("failed to read delete file: {e}"), secrets)))?;
-        row_group_positions(stream, assigned, reservation, secrets).await?
-    };
-    Ok(OpenedDeleteFile {
-        reader: SizedParquetReader::new(store, delete_meta.location, size),
-        metadata,
-        projection,
-        row_groups,
-        decoded,
-    })
-}
-
 impl OpenedDeleteFile {
     /// One read per remaining row group, each under its own permit. The positions decoded from
     /// the footer bytes lead as a ready read, so callers merge them like any row group's.
     fn row_group_reads(
         self,
-        assigned: &Arc<HashSet<String>>,
-        secrets: &Arc<[String]>,
-        limiter: &Arc<Semaphore>,
-        reservation: &Arc<MemoryReservation>,
+        ctx: &Arc<DeleteReadContext>,
     ) -> Vec<Read<HashMap<String, RoaringTreemap>>> {
         let Self {
             reader,
@@ -457,146 +325,18 @@ impl OpenedDeleteFile {
         decoded
             .into_iter()
             .chain(row_groups.into_iter().map(|row_group| {
-                let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
-                    reader.clone(),
-                    metadata.clone(),
-                )
-                .with_row_groups(vec![row_group])
-                .with_projection(projection.clone())
-                .with_batch_size(DELETE_FILE_BATCH_ROWS);
-                let assigned = Arc::clone(assigned);
-                let secrets = Arc::clone(secrets);
-                let limiter = Arc::clone(limiter);
-                let reservation = Arc::clone(reservation);
+                let ctx = Arc::clone(ctx);
+                let (reader, metadata, projection) =
+                    (reader.clone(), metadata.clone(), projection.clone());
                 let read: Read<_> = Box::pin(async move {
-                    let _permit = acquire(&limiter).await?;
-                    let stream = builder.build().map_err(|e| {
-                        UdfError::User(redact(format!("failed to read delete file: {e}"), &secrets))
-                    })?;
-                    row_group_positions(stream, &assigned, &reservation, &secrets).await
+                    let _permit = acquire(&ctx.limiter).await?;
+                    ctx.decode_row_groups(reader, metadata, projection, vec![row_group])
+                        .await
                 });
                 read
             }))
             .collect()
     }
-}
-
-/// Unions each data file's per-row-group sets, one task per data file.
-async fn delete_file_positions(
-    row_groups: Vec<HashMap<String, RoaringTreemap>>,
-    reservation: &Arc<MemoryReservation>,
-    secrets: &Arc<[String]>,
-) -> Result<Positions, UdfError> {
-    let mut sets_by_data_file: HashMap<String, Vec<RoaringTreemap>> = HashMap::new();
-    for row_group in row_groups {
-        for (path, positions) in row_group {
-            sets_by_data_file.entry(path).or_default().push(positions);
-        }
-    }
-    join_spawned(sets_by_data_file.into_iter().map(|(path, sets)| {
-        let reservation = Arc::clone(reservation);
-        let secrets = Arc::clone(secrets);
-        async move {
-            let before = sets.iter().map(RoaringTreemap::serialized_size).sum();
-            let union = sets
-                .into_iter()
-                .fold(RoaringTreemap::new(), |mut union, set| {
-                    union |= set;
-                    union
-                });
-            track(&reservation, before, union.serialized_size(), &secrets)?;
-            Ok((path, union))
-        }
-    }))
-    .await
-}
-
-/// The file is sorted by `file_path`, so one run of equal paths costs one set lookup. Each batch's
-/// positions join their set before the next batch decodes, so the reservation follows the sets as
-/// they grow and an oversized delete set fails mid-read.
-async fn row_group_positions<R: AsyncFileReader + Unpin + Send + 'static>(
-    mut stream: ParquetRecordBatchStream<R>,
-    assigned: &HashSet<String>,
-    reservation: &MemoryReservation,
-    secrets: &[String],
-) -> Result<HashMap<String, RoaringTreemap>, UdfError> {
-    let (file_path_idx, pos_idx) = locate_delete_columns(stream.schema())?;
-    let mut positions_by_data_file: HashMap<String, RoaringTreemap> = HashMap::new();
-    let mut run: Option<(String, Option<Vec<u64>>)> = None;
-
-    while let Some(batch) = stream.next().await {
-        let batch = batch.map_err(|e| {
-            UdfError::User(redact(format!("error decoding delete file: {e}"), secrets))
-        })?;
-        let file_paths = batch.column(file_path_idx);
-        let positions = batch
-            .column(pos_idx)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| UdfError::User("positional-delete pos column is not Int64".into()))?;
-
-        // Fail loud on any other type: a silent `None` would drop every positional delete.
-        let utf8 = file_paths.as_any().downcast_ref::<StringArray>();
-        let large_utf8 = file_paths.as_any().downcast_ref::<LargeStringArray>();
-        if utf8.is_none() && large_utf8.is_none() {
-            return Err(UdfError::User(format!(
-                "positional-delete file_path column has unexpected type {:?} \
-                 (expected Utf8 or LargeUtf8)",
-                file_paths.data_type()
-            )));
-        }
-        let path_at = |row: usize| -> Option<&str> {
-            if file_paths.is_null(row) {
-                return None;
-            }
-            match (utf8, large_utf8) {
-                (Some(a), _) => Some(a.value(row)),
-                (_, Some(a)) => Some(a.value(row)),
-                _ => None,
-            }
-        };
-
-        for row in 0..batch.num_rows() {
-            if positions.is_null(row) {
-                continue;
-            }
-            let Some(path) = path_at(row) else { continue };
-            if run.as_ref().is_none_or(|(current, _)| current != path) {
-                if let Some((ended, Some(bucket))) = run.as_mut() {
-                    add_positions(
-                        &mut positions_by_data_file,
-                        ended,
-                        bucket,
-                        reservation,
-                        secrets,
-                    )?;
-                }
-                run = Some((path.to_string(), assigned.contains(path).then(Vec::new)));
-            }
-            let Some((_, Some(bucket))) = run.as_mut() else {
-                continue;
-            };
-            let pos = positions.value(row);
-            // Casting a negative `pos` to u64 would wrap and silently drop the delete.
-            if pos < 0 {
-                return Err(UdfError::User(format!(
-                    "positional-delete file has a negative pos ({pos}); refusing to \
-                     apply a malformed delete"
-                )));
-            }
-            bucket.push(pos as u64);
-        }
-        if let Some((path, Some(bucket))) = run.as_mut() {
-            add_positions(
-                &mut positions_by_data_file,
-                path,
-                bucket,
-                reservation,
-                secrets,
-            )?;
-        }
-    }
-    Ok(positions_by_data_file)
 }
 
 /// Drains `positions` into `path`'s set. Positions normally arrive sorted per the Iceberg spec and
@@ -755,82 +495,352 @@ impl ShardDeletes<'_> {
             }
         }
 
-        let mut vector_reads = self.delta_vector_reads(store, delta_vectors);
-        vector_reads.extend(self.iceberg_vector_reads(store, iceberg_vectors));
-        let assigned: Arc<HashSet<String>> = Arc::new(
-            self.files
+        let ctx = Arc::new(DeleteReadContext {
+            store: Arc::clone(store),
+            table_root: self.table_root.to_string(),
+            assigned: self
+                .files
                 .iter()
                 .map(|entry| reconstruct_abs_uri(&entry.path, self.table_root))
                 .collect(),
-        );
+            secrets: Arc::clone(&self.secrets),
+            limiter: Arc::clone(&self.limiter),
+            reservation: Arc::clone(&self.reservation),
+            metadata_size_hint: self.metadata_size_hint,
+        });
+        let mut vector_reads = ctx.delta_vector_reads(delta_vectors);
+        vector_reads.extend(ctx.iceberg_vector_reads(iceberg_vectors));
         let (opened, vector_positions) = futures::future::try_join(
-            join_spawned(self.delete_file_opens(store, delete_files, &assigned)?),
+            join_spawned(ctx.delete_file_opens(delete_files)?),
             join_spawned(vector_reads),
         )
         .await?;
-        let row_groups = join_spawned(opened.into_iter().flat_map(|file| {
-            file.row_group_reads(&assigned, &self.secrets, &self.limiter, &self.reservation)
-        }))
+        let row_groups = join_spawned(
+            opened
+                .into_iter()
+                .flat_map(|file| file.row_group_reads(&ctx)),
+        )
         .await?;
 
-        let mut merged: HashMap<String, RoaringTreemap> = HashMap::new();
-        for (path, positions) in vector_positions
-            .into_iter()
-            .flatten()
-            .chain(delete_file_positions(row_groups, &self.reservation, &self.secrets).await?)
-        {
-            match merged.entry(path) {
-                Entry::Vacant(slot) => {
-                    slot.insert(positions);
-                }
-                Entry::Occupied(mut slot) => {
-                    let before = slot.get().serialized_size() + positions.serialized_size();
-                    *slot.get_mut() |= positions;
-                    track(
-                        &self.reservation,
-                        before,
-                        slot.get().serialized_size(),
-                        &self.secrets,
-                    )?;
+        ctx.union_by_data_file(
+            vector_positions
+                .into_iter()
+                .flatten()
+                .chain(row_groups.into_iter().flatten()),
+        )
+        .await
+    }
+}
+
+/// What every delete-read task of one shard shares, so each task holds one `Arc` of it.
+struct DeleteReadContext {
+    store: Arc<dyn ObjectStore>,
+    table_root: String,
+    /// The shard's data files, as absolute URIs.
+    assigned: HashSet<String>,
+    secrets: Arc<[String]>,
+    limiter: Arc<Semaphore>,
+    reservation: Arc<MemoryReservation>,
+    metadata_size_hint: Option<usize>,
+}
+
+impl DeleteReadContext {
+    /// Restricted to `assigned` because one partition-granularity delete file references many
+    /// data files. Row groups whose `file_path` range cannot overlap are skipped, exploiting
+    /// Iceberg's required (`file_path`, `pos`) sort. No HEAD is issued. The footer is one GET of
+    /// the file's last `metadata_size_hint` bytes, and the row groups inside them decode here, so
+    /// a delete file within the hint costs one request in total.
+    async fn open_delete_file(
+        &self,
+        delete_meta: ObjectMeta,
+    ) -> Result<OpenedDeleteFile, UdfError> {
+        let failed = |e: String| {
+            UdfError::User(redact(
+                format!("failed to open delete file: {e}"),
+                &self.secrets,
+            ))
+        };
+        let size = delete_meta.size;
+        let (tail_start, tail, parquet_metadata) = {
+            let _permit = acquire(&self.limiter).await?;
+            let mut want = self.metadata_size_hint.unwrap_or(0).max(FOOTER_SIZE) as u64;
+            loop {
+                let start = size.saturating_sub(want);
+                let tail = self
+                    .store
+                    .get_range(&delete_meta.location, start..size)
+                    .await
+                    .map_err(|e| failed(e.to_string()))?;
+                let mut parser = ParquetMetaDataReader::new();
+                match parser.try_parse_sized(&tail, size) {
+                    Ok(()) => {
+                        let parsed = parser.finish().map_err(|e| failed(e.to_string()))?;
+                        break (start, tail, parsed);
+                    }
+                    // A footer larger than the hint costs one more GET, still under this permit.
+                    Err(ParquetError::NeedMoreData(needed)) if needed as u64 > want => {
+                        want = needed as u64;
+                    }
+                    Err(e) => return Err(failed(e.to_string())),
                 }
             }
+        };
+        let metadata =
+            ArrowReaderMetadata::try_new(Arc::new(parquet_metadata), ArrowReaderOptions::new())
+                .map_err(|e| failed(e.to_string()))?;
+
+        let (file_path_idx, pos_idx) = locate_delete_columns(metadata.schema())?;
+        let parquet_schema = metadata.parquet_schema();
+        let projection = ProjectionMask::roots(parquet_schema, [file_path_idx, pos_idx]);
+        let projected_leaves: Vec<usize> = (0..parquet_schema.num_columns())
+            .filter(|&leaf| {
+                let root = parquet_schema.get_column_root_idx(leaf);
+                root == file_path_idx || root == pos_idx
+            })
+            .collect();
+        let (in_tail, row_groups): (Vec<usize>, Vec<usize>) = metadata
+            .metadata()
+            .row_groups()
+            .iter()
+            .enumerate()
+            .filter(|(_, row_group)| {
+                delete_row_group_may_match(row_group, file_path_idx, &self.assigned)
+            })
+            .map(|(idx, _)| idx)
+            .partition(|&idx| {
+                let row_group = metadata.metadata().row_group(idx);
+                projected_leaves
+                    .iter()
+                    .all(|&leaf| row_group.column(leaf).byte_range().0 >= tail_start)
+            });
+        // Decoded before the bytes drop, so they never outlive this task, stay a transient read
+        // buffer like any decode buffer, and cannot crowd the pool while other files load.
+        let decoded = if in_tail.is_empty() {
+            HashMap::new()
+        } else {
+            let footer_bytes = FooterBytes {
+                start: tail_start,
+                bytes: tail,
+            };
+            self.decode_row_groups(footer_bytes, metadata.clone(), projection.clone(), in_tail)
+                .await?
+        };
+        Ok(OpenedDeleteFile {
+            reader: SizedParquetReader::new(Arc::clone(&self.store), delete_meta.location, size),
+            metadata,
+            projection,
+            row_groups,
+            decoded,
+        })
+    }
+
+    /// The file is sorted by `file_path`, so one run of equal paths costs one set lookup. Each
+    /// batch's positions join their set before the next batch decodes, so the reservation follows
+    /// the sets as they grow and an oversized delete set fails mid-read.
+    async fn decode_row_groups<R: AsyncFileReader + Unpin + Send + 'static>(
+        &self,
+        reader: R,
+        metadata: ArrowReaderMetadata,
+        projection: ProjectionMask,
+        row_groups: Vec<usize>,
+    ) -> Result<HashMap<String, RoaringTreemap>, UdfError> {
+        let mut stream = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata)
+            .with_row_groups(row_groups)
+            .with_projection(projection)
+            .with_batch_size(DELETE_FILE_BATCH_ROWS)
+            .build()
+            .map_err(|e| {
+                UdfError::User(redact(
+                    format!("failed to read delete file: {e}"),
+                    &self.secrets,
+                ))
+            })?;
+        let (file_path_idx, pos_idx) = locate_delete_columns(stream.schema())?;
+        let mut positions_by_data_file: HashMap<String, RoaringTreemap> = HashMap::new();
+        let mut run: Option<(String, Option<Vec<u64>>)> = None;
+
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|e| {
+                UdfError::User(redact(
+                    format!("error decoding delete file: {e}"),
+                    &self.secrets,
+                ))
+            })?;
+            let file_paths = batch.column(file_path_idx);
+            let positions = batch
+                .column(pos_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    UdfError::User("positional-delete pos column is not Int64".into())
+                })?;
+
+            // Fail loud on any other type: a silent `None` would drop every positional delete.
+            let utf8 = file_paths.as_any().downcast_ref::<StringArray>();
+            let large_utf8 = file_paths.as_any().downcast_ref::<LargeStringArray>();
+            if utf8.is_none() && large_utf8.is_none() {
+                return Err(UdfError::User(format!(
+                    "positional-delete file_path column has unexpected type {:?} \
+                     (expected Utf8 or LargeUtf8)",
+                    file_paths.data_type()
+                )));
+            }
+            let path_at = |row: usize| -> Option<&str> {
+                if file_paths.is_null(row) {
+                    return None;
+                }
+                match (utf8, large_utf8) {
+                    (Some(a), _) => Some(a.value(row)),
+                    (_, Some(a)) => Some(a.value(row)),
+                    _ => None,
+                }
+            };
+
+            for row in 0..batch.num_rows() {
+                if positions.is_null(row) {
+                    continue;
+                }
+                let Some(path) = path_at(row) else { continue };
+                if run.as_ref().is_none_or(|(current, _)| current != path) {
+                    if let Some((ended, Some(bucket))) = run.as_mut() {
+                        add_positions(
+                            &mut positions_by_data_file,
+                            ended,
+                            bucket,
+                            &self.reservation,
+                            &self.secrets,
+                        )?;
+                    }
+                    run = Some((
+                        path.to_string(),
+                        self.assigned.contains(path).then(Vec::new),
+                    ));
+                }
+                let Some((_, Some(bucket))) = run.as_mut() else {
+                    continue;
+                };
+                let pos = positions.value(row);
+                // Casting a negative `pos` to u64 would wrap and silently drop the delete.
+                if pos < 0 {
+                    return Err(UdfError::User(format!(
+                        "positional-delete file has a negative pos ({pos}); refusing to \
+                         apply a malformed delete"
+                    )));
+                }
+                bucket.push(pos as u64);
+            }
+            if let Some((path, Some(bucket))) = run.as_mut() {
+                add_positions(
+                    &mut positions_by_data_file,
+                    path,
+                    bucket,
+                    &self.reservation,
+                    &self.secrets,
+                )?;
+            }
         }
-        Ok(merged)
+        Ok(positions_by_data_file)
+    }
+
+    /// Unions each data file's sets, one task per data file.
+    async fn union_by_data_file(
+        self: &Arc<Self>,
+        sets: impl IntoIterator<Item = (String, RoaringTreemap)>,
+    ) -> Result<HashMap<String, RoaringTreemap>, UdfError> {
+        let mut sets_by_data_file: HashMap<String, Vec<RoaringTreemap>> = HashMap::new();
+        for (path, positions) in sets {
+            sets_by_data_file.entry(path).or_default().push(positions);
+        }
+        let unions = join_spawned(sets_by_data_file.into_iter().map(|(path, sets)| {
+            let ctx = Arc::clone(self);
+            async move {
+                let before = sets.iter().map(RoaringTreemap::serialized_size).sum();
+                let union = sets
+                    .into_iter()
+                    .fold(RoaringTreemap::new(), |mut union, set| {
+                        union |= set;
+                        union
+                    });
+                track(
+                    &ctx.reservation,
+                    before,
+                    union.serialized_size(),
+                    &ctx.secrets,
+                )?;
+                Ok((path, union))
+            }
+        }))
+        .await?;
+        Ok(unions.into_iter().collect())
     }
 
     /// No HEAD: each [`ObjectMeta`] is built from the spec-supplied size.
     fn delete_file_opens(
-        &self,
-        store: &Arc<dyn ObjectStore>,
+        self: &Arc<Self>,
         delete_files: HashMap<&str, u64>,
-        assigned: &Arc<HashSet<String>>,
     ) -> Result<Vec<Read<OpenedDeleteFile>>, UdfError> {
         delete_files
             .into_iter()
             .map(|(delete_path, delete_size)| {
                 let delete_meta = object_meta_for(
-                    &reconstruct_abs_uri(delete_path, self.table_root),
+                    &reconstruct_abs_uri(delete_path, &self.table_root),
                     delete_size,
                 )?;
-                let store = Arc::clone(store);
-                let assigned = Arc::clone(assigned);
-                let secrets = Arc::clone(&self.secrets);
-                let limiter = Arc::clone(&self.limiter);
-                let hint = self.metadata_size_hint;
-                let reservation = Arc::clone(&self.reservation);
-                let open: Read<_> = Box::pin(async move {
-                    open_delete_file(
-                        store,
-                        delete_meta,
-                        hint,
-                        &assigned,
-                        &reservation,
-                        &secrets,
-                        &limiter,
-                    )
-                    .await
-                });
+                let ctx = Arc::clone(self);
+                let open: Read<_> =
+                    Box::pin(async move { ctx.open_delete_file(delete_meta).await });
                 Ok(open)
+            })
+            .collect()
+    }
+
+    /// Reads `url` whole, or only `range` of it, under one permit of the shared limiter. A failure
+    /// names `data_file`, because a deletion vector has no identity of its own.
+    async fn read_deletion_vector_payload(
+        &self,
+        url: &str,
+        range: Option<Range<u64>>,
+        data_file: &str,
+    ) -> Result<Bytes, UdfError> {
+        let unreadable = |e: String| {
+            UdfError::User(redact(
+                format!("data file '{data_file}': its deletion vector could not be read: {e}"),
+                &self.secrets,
+            ))
+        };
+        let _permit = acquire(&self.limiter)
+            .await
+            .map_err(|e| unreadable(e.to_string()))?;
+        let location = ListingTableUrl::parse(url)
+            .map_err(|e| unreadable(format!("invalid deletion-vector URL: {e}")))?
+            .prefix()
+            .clone();
+        let body = match range {
+            Some(range) => self.store.get_range(&location, range).await,
+            None => match self.store.get(&location).await {
+                Ok(result) => result.bytes().await,
+                Err(e) => Err(e),
+            },
+        };
+        body.map_err(|e| unreadable(e.to_string()))
+    }
+
+    /// Reserves each member's decoded set and keys it by absolute data-file URI.
+    fn decode_vectors<V>(
+        &self,
+        members: &[(String, V)],
+        decode: impl Fn(&str, &V) -> Result<RoaringTreemap, UdfError>,
+    ) -> Result<Positions, UdfError> {
+        members
+            .iter()
+            .map(|(data_file, vector)| {
+                let positions = decode(data_file, vector)?;
+                reserve(
+                    &self.reservation,
+                    positions.serialized_size(),
+                    &self.secrets,
+                )?;
+                Ok((reconstruct_abs_uri(data_file, &self.table_root), positions))
             })
             .collect()
     }
@@ -840,8 +850,7 @@ impl ShardDeletes<'_> {
     /// descriptors carry the vector's size, never the sidecar's. An inline vector is decoded in
     /// its own task.
     fn delta_vector_reads(
-        &self,
-        store: &Arc<dyn ObjectStore>,
+        self: &Arc<Self>,
         vectors: Vec<(&str, DeltaDeletionVector)>,
     ) -> Vec<Read<Positions>> {
         let mut by_sidecar: HashMap<Url, Vec<(String, DeltaDeletionVector)>> = HashMap::new();
@@ -859,35 +868,19 @@ impl ShardDeletes<'_> {
             .map(|(sidecar, members)| (Some(sidecar), members))
             .chain(inline.into_iter().map(|member| (None, vec![member])))
             .map(|(sidecar, members)| {
-                let store = Arc::clone(store);
-                let limiter = Arc::clone(&self.limiter);
-                let secrets = Arc::clone(&self.secrets);
-                let table_root = self.table_root.to_string();
-                let reservation = Arc::clone(&self.reservation);
+                let ctx = Arc::clone(self);
                 let read: Read<_> = Box::pin(async move {
                     // A shared sidecar is named by its first referrer.
                     let body = match &sidecar {
                         Some(url) => Some(
-                            read_deletion_vector_payload(
-                                store.as_ref(),
-                                &limiter,
-                                url.as_str(),
-                                None,
-                                &members[0].0,
-                                &secrets,
-                            )
-                            .await?,
+                            ctx.read_deletion_vector_payload(url.as_str(), None, &members[0].0)
+                                .await?,
                         ),
                         None => None,
                     };
-                    members
-                        .iter()
-                        .map(|(data_file, vector)| {
-                            let positions = vector.decode(body.clone(), data_file, &secrets)?;
-                            reserve(&reservation, positions.serialized_size(), &secrets)?;
-                            Ok((reconstruct_abs_uri(data_file, &table_root), positions))
-                        })
-                        .collect()
+                    ctx.decode_vectors(&members, |data_file, vector| {
+                        vector.decode(body.clone(), data_file, &ctx.secrets)
+                    })
                 });
                 read
             })
@@ -898,8 +891,7 @@ impl ShardDeletes<'_> {
     /// the vectors of a whole table. Each merged request is its own task under its own permit and
     /// decodes its blobs as soon as its bytes arrive.
     fn iceberg_vector_reads(
-        &self,
-        store: &Arc<dyn ObjectStore>,
+        self: &Arc<Self>,
         vectors: Vec<(&str, IcebergDeletionVector)>,
     ) -> Vec<Read<Positions>> {
         let mut by_puffin_file: HashMap<String, Vec<(String, IcebergDeletionVector)>> =
@@ -914,7 +906,7 @@ impl ShardDeletes<'_> {
         let mut reads = Vec::new();
         for (puffin_path, mut members) in by_puffin_file {
             members.sort_by_key(|(_, vector)| vector.range.start);
-            let url = reconstruct_abs_uri(&puffin_path, self.table_root);
+            let url = reconstruct_abs_uri(&puffin_path, &self.table_root);
             let ranges: Vec<Range<u64>> = members.iter().map(|(_, v)| v.range.clone()).collect();
             let mut members = members.into_iter();
             for (request, blob_count) in merge_blob_ranges(
@@ -924,35 +916,20 @@ impl ShardDeletes<'_> {
             ) {
                 let blobs: Vec<(String, IcebergDeletionVector)> =
                     members.by_ref().take(blob_count).collect();
-                let store = Arc::clone(store);
-                let limiter = Arc::clone(&self.limiter);
-                let secrets = Arc::clone(&self.secrets);
-                let table_root = self.table_root.to_string();
+                let ctx = Arc::clone(self);
                 let url = url.clone();
-                let reservation = Arc::clone(&self.reservation);
                 reads.push(Box::pin(async move {
                     // A shared Puffin request is named by its first referrer.
-                    let body = read_deletion_vector_payload(
-                        store.as_ref(),
-                        &limiter,
-                        &url,
-                        Some(request.clone()),
-                        &blobs[0].0,
-                        &secrets,
-                    )
-                    .await?;
-                    blobs
-                        .iter()
-                        .map(|(data_file, vector)| {
-                            let blob = body.slice(
-                                (vector.range.start - request.start) as usize
-                                    ..(vector.range.end - request.start) as usize,
-                            );
-                            let positions = vector.decode(&blob, data_file, &secrets)?;
-                            reserve(&reservation, positions.serialized_size(), &secrets)?;
-                            Ok((reconstruct_abs_uri(data_file, &table_root), positions))
-                        })
-                        .collect()
+                    let body = ctx
+                        .read_deletion_vector_payload(&url, Some(request.clone()), &blobs[0].0)
+                        .await?;
+                    ctx.decode_vectors(&blobs, |data_file, vector| {
+                        let blob = body.slice(
+                            (vector.range.start - request.start) as usize
+                                ..(vector.range.end - request.start) as usize,
+                        );
+                        vector.decode(&blob, data_file, &ctx.secrets)
+                    })
                 }) as Read<_>);
             }
         }
