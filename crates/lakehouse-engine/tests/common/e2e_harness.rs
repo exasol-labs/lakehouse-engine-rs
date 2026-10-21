@@ -127,26 +127,31 @@ pub fn exa_conn() -> ExaConn {
 
 /// All `CREATE OR REPLACE`, so concurrent recreation across binaries is harmless.
 pub fn create_schema_and_scripts(conn: &mut ExaConn) {
-    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME}"));
+    create_schema_and_scripts_in(conn, SCHEMA_NAME);
+}
+
+/// Re-running it over an existing schema is the installer's re-install.
+pub fn create_schema_and_scripts_in(conn: &mut ExaConn, schema: &str) {
+    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"));
     conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} ADAPTER SCRIPT {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} AS
+        r#"CREATE OR REPLACE {LANG_ALIAS} ADAPTER SCRIPT {schema}.{ADAPTER_SCRIPT_NAME} AS
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));
     conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}(common VARCHAR(2000000), files VARCHAR(2000000))
+        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {schema}.{SCAN_SCRIPT_NAME}(common VARCHAR(2000000), files VARCHAR(2000000))
 EMITS (...) AS
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));
     conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {SCHEMA_NAME}.{VERSION_SCRIPT_NAME}()
+        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {schema}.{VERSION_SCRIPT_NAME}()
 RETURNS VARCHAR(100) AS
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));
     conn.execute(&format!(
-        r#"CREATE OR REPLACE LUA SET SCRIPT {SCHEMA_NAME}.{DISTRIBUTOR_SCRIPT_NAME}(files VARCHAR(2000000))
+        r#"CREATE OR REPLACE LUA SET SCRIPT {schema}.{DISTRIBUTOR_SCRIPT_NAME}(files VARCHAR(2000000))
 EMITS (files VARCHAR(2000000)) AS
 function run(ctx)
     repeat
@@ -354,6 +359,19 @@ pub fn enumerated_table_names(conn: &mut ExaConn, vs_name: &str) -> Vec<String> 
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The exception text of a response that must be an error.
+pub fn error_text(response: &serde_json::Value) -> String {
+    assert_eq!(
+        response["status"].as_str(),
+        Some("error"),
+        "the statement must fail: {response}"
+    );
+    response["exception"]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {

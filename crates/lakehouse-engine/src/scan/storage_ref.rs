@@ -71,37 +71,38 @@ fn connection_password(ctx: &dyn UdfContext, name: &str) -> Result<String, UdfEr
     match ctx.connection(name) {
         Ok(connection) => Ok(connection.password),
         Err(cause) => {
-            let script = script_reference(ctx);
+            let grant = connection_grant_hint(ctx, name, SCAN_SCRIPT_NAME);
             Err(UdfError::User(format!(
-                "the scan cannot access CONNECTION '{name}' ({cause}); the scan script needs \
-                 GRANT ACCESS ON CONNECTION {name} FOR SCRIPT {script} TO <vs_owner>, granted \
-                 directly or through a role, to the OWNER of the virtual schema being queried \
-                 (one deployment-time grant — a querying user needs no connection privilege)"
+                "the scan cannot access CONNECTION '{name}' ({cause}); the OWNER of the virtual \
+                 schema being queried needs {grant}"
             )))
         }
     }
 }
 
-fn script_reference(ctx: &dyn UdfContext) -> String {
-    let schema = ctx.script_schema();
-    let script = ctx.script_name();
+const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
+
+/// `fallback_script` stands in when the handshake reports no script name.
+pub(crate) fn connection_grant_hint(
+    ctx: &dyn UdfContext,
+    name: &str,
+    fallback_script: &str,
+) -> String {
+    let schema = non_empty_or(ctx.script_schema(), "<schema>");
+    let script = non_empty_or(ctx.script_name(), fallback_script);
     format!(
-        "{}.{}",
-        if schema.is_empty() {
-            UNREPORTED_SCRIPT_SCHEMA
-        } else {
-            schema.as_str()
-        },
-        if script.is_empty() {
-            UNREPORTED_SCRIPT_NAME
-        } else {
-            script.as_str()
-        }
+        "GRANT ACCESS ON CONNECTION {name} FOR SCRIPT {schema}.{script} (or FOR SCHEMA \
+         {schema}), directly or through a role; a querying user needs no connection privilege"
     )
 }
 
-const UNREPORTED_SCRIPT_SCHEMA: &str = "<schema>";
-const UNREPORTED_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
+fn non_empty_or(value: String, fallback: &str) -> String {
+    if value.is_empty() {
+        fallback.to_string()
+    } else {
+        value
+    }
+}
 
 fn password_object(name: &str, password: &str) -> Result<serde_json::Value, UdfError> {
     let refusal = || {

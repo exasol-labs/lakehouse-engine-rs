@@ -1207,13 +1207,21 @@ test_stops_at_product_prints_template() {
   reset_env
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_zero "template: install succeeds" "$LAST_RC"
-  assert_contains "template: prints CREATE CONNECTION" "$LAST_OUT" "CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS"
+  assert_contains "template: prints CREATE CONNECTION" "$LAST_OUT" "CREATE CONNECTION LAKEHOUSE_CATALOG_CREDS"
   assert_contains "template: prints CREATE VIRTUAL SCHEMA" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
   assert_contains "template: prints the NAMESPACE property" "$LAST_OUT" "NAMESPACE          = "
   assert_contains "template: references the adapter script" "$LAST_OUT" "LHVS.LAKEHOUSE_ADAPTER"
+  # The E2E test the_install_scripts_role_recipe_serves_a_reader runs these grants.
+  local script
+  for script in LAKEHOUSE_ADAPTER LAKEHOUSE_SCAN; do
+    assert_contains "template: role holds the $script CONNECTION grant" "$LAST_OUT" \
+      "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT LHVS.$script TO LAKEHOUSE_ENGINE_ROLE_LHVS;"
+  done
+  assert_contains "template: grants the role to the installing user" "$LAST_OUT" "GRANT LAKEHOUSE_ENGINE_ROLE_LHVS TO "
+  assert_contains "template: the role grants need a DBA" "$LAST_OUT" "Run this block as a DBA"
   local log; log="$(log_content)"
   assert_not_contains "template: does NOT execute CREATE VIRTUAL SCHEMA" "$log" "CREATE VIRTUAL SCHEMA"
-  assert_not_contains "template: does NOT execute CREATE CONNECTION" "$log" "CREATE OR REPLACE CONNECTION"
+  assert_not_contains "template: does NOT execute CREATE CONNECTION" "$log" "CREATE CONNECTION"
 }
 
 test_target_base_default_and_override() {

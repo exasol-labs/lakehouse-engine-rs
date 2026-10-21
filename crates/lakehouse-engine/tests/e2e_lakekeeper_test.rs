@@ -13,8 +13,8 @@ mod common;
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VsProps,
     assert_decimal_orders_numerically, assert_text_columns, create_schema_and_scripts,
-    create_virtual_schema_with_password, declared_type, enumerated_table_names, exa_conn,
-    expected_join_rows, explain_virtual_sql, fetch_join_rows, has_broadcast_join_block,
+    create_virtual_schema_with_password, declared_type, enumerated_table_names, error_text,
+    exa_conn, expected_join_rows, explain_virtual_sql, fetch_join_rows, has_broadcast_join_block,
     has_two_scan_wrapper, install_slc, join_query, parse_int, projection_rows, upload_so,
     value_to_string,
 };
@@ -1171,18 +1171,6 @@ fn events_query(vs: &str) -> String {
     )
 }
 
-fn refusal_text(response: &Value) -> String {
-    assert_eq!(
-        response["status"].as_str(),
-        Some("error"),
-        "the query must be refused: {response}"
-    );
-    response["exception"]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string()
-}
-
 fn assert_no_secret_or_token(message: &str) {
     for secret in [
         OPERATOR.client_secret,
@@ -1199,7 +1187,7 @@ fn assert_no_secret_or_token(message: &str) {
 
 /// Runs `sql` as `user`, which Lakekeeper must refuse for each table in `denied` only.
 fn assert_refused(user: ExasolUser, sql: &str, denied: &[&str], allowed: &[&str]) {
-    let message = refusal_text(&connect_as(user).try_execute(sql));
+    let message = error_text(&connect_as(user).try_execute(sql));
     for table in denied {
         assert!(
             message.contains(table),
@@ -1278,8 +1266,7 @@ fn permission_check_grants_decide_each_mapped_users_query() {
 fn permission_check_refuses_when_the_connection_cannot_inspect_permissions() {
     permission_setup();
 
-    let message =
-        refusal_text(&connect_as(ALLOWED_USER).try_execute(&events_query(VS_UNINSPECTING)));
+    let message = error_text(&connect_as(ALLOWED_USER).try_execute(&events_query(VS_UNINSPECTING)));
 
     for fragment in ["403", "CannotInspectPermissions", "manage_grants"] {
         assert!(
@@ -1413,7 +1400,7 @@ fn permission_check_refuses_explain_virtual_without_a_grant() {
     permission_setup();
     grant_only(DENIED_USER, &[select_table(TABLE_ALPHA)]);
 
-    let message = refusal_text(
+    let message = error_text(
         &connect_as(DENIED_USER)
             .try_execute(&format!("EXPLAIN VIRTUAL {}", events_query(VS_PERMISSION))),
     );
