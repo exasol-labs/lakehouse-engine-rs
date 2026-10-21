@@ -32,6 +32,7 @@ pub(crate) fn object_meta_for(
 
 /// Reads one Parquet object whose size the planner already knows, so the footer fetch issues
 /// no HEAD.
+#[derive(Clone)]
 pub(crate) struct SizedParquetReader {
     store: Arc<dyn ObjectStore>,
     path: Path,
