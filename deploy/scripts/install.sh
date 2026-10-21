@@ -1351,7 +1351,7 @@ print_next_step_template() {
   emit "=== Next step: create the catalog CONNECTION and VIRTUAL SCHEMA (NOT created by this installer) ==="
   emit "-- These objects are dataset-specific. Edit the placeholders below and run the SQL yourself:"
   emit ""
-  emit "CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS"
+  emit "CREATE CONNECTION LAKEHOUSE_CATALOG_CREDS"
   emit "  TO '<catalog-uri>'"
   emit "  USER ''"
   emit "  IDENTIFIED BY '{"
@@ -1361,6 +1361,8 @@ print_next_step_template() {
   emit "    \"secret_key\": \"<secret_key>\""
   emit "  }';"
   emit ""
+  emit "-- Change it later with ALTER CONNECTION: CREATE OR REPLACE CONNECTION drops its grants."
+  emit ""
   emit "-- Grant the VS OWNER's scripts CONNECTION access (BEFORE CREATE VIRTUAL SCHEMA). See docs/security.md."
   emit ""
   case "$installing_user" in
@@ -1368,9 +1370,13 @@ print_next_step_template() {
       emit "-- SYS holds every CONNECTION implicitly; skip the grants."
       ;;
     *)
+      emit "-- Run this block as a DBA: GRANT <role> TO <user> needs GRANT ANY ROLE."
+      emit "-- After a re-install, run only the two GRANT ACCESS lines again."
       emit "CREATE ROLE $role;"
       emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_ADAPTER TO $role;"
       emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_SCAN TO $role;"
+      emit "-- The role is for VS owners only. Never grant it to a reader."
+      emit "-- It holds no EXECUTE grant: an owner other than $installing_user also needs EXECUTE on the scripts."
       emit "GRANT $role TO $installing_user;"
       ;;
   esac
@@ -1381,7 +1387,7 @@ print_next_step_template() {
   emit "  NAMESPACE          = '<namespace>'"
   emit "  ALLOW_HTTP         = 'false';"
   emit ""
-  emit "-- Readers: GRANT SELECT ON SCHEMA <MY_LAKEHOUSE> TO <user>; CREATE OR REPLACE drops ACCESS grants."
+  emit "-- Readers need only: GRANT CREATE SESSION TO <user>; GRANT SELECT ON SCHEMA <MY_LAKEHOUSE> TO <user>;"
 }
 
 main() {

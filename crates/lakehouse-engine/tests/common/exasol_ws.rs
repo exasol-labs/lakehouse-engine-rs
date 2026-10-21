@@ -18,6 +18,15 @@ const DEFAULT_FETCH_NUM_BYTES: u64 = 67_108_864;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The first cell of an execute response. A `DECIMAL` result comes back as a JSON string,
+/// so a string is parsed too.
+pub fn scalar_i64(resp: &Value) -> Option<i64> {
+    let value = &resp["responseData"]["results"][0]["resultSet"]["data"][0][0];
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+}
+
 pub struct ExaConn {
     ws: WebSocket<MaybeTlsStream<TcpStream>>,
     redact_sql: bool,
@@ -137,13 +146,9 @@ impl ExaConn {
         self
     }
 
-    /// A `DECIMAL` result comes back as a JSON string, so a string is parsed too.
     pub fn query_scalar_i64(&mut self, sql: &str) -> i64 {
         let resp = self.execute(sql);
-        let value = &resp["responseData"]["results"][0]["resultSet"]["data"][0][0];
-        value
-            .as_i64()
-            .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+        scalar_i64(&resp)
             .unwrap_or_else(|| panic!("expected i64 scalar from:\n{sql}\n\nResponse: {resp}"))
     }
 
