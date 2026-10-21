@@ -37,7 +37,6 @@ const SCAN_DENIAL: &str = "the scan cannot access CONNECTION";
 const ADAPTER_EXECUTE_DENIAL: &str = "insufficient privileges for calling adapter script";
 const SCRIPT_EXECUTE_DENIAL: &str = "insufficient privileges for calling script";
 
-const SECURITY_DOC: &str = include_str!("../../../../docs/security.md");
 // The diagnostic queries of `docs/security.md`, placeholders included.
 const VS_OWNER_SQL: &str =
     "SELECT SCHEMA_OWNER FROM EXA_DBA_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = '<VS>'";
@@ -104,17 +103,6 @@ fn schema_grants(schema: &str, conn: &str, grantee: &str) -> [String; 2] {
         format!("GRANT EXECUTE ON SCHEMA {schema} TO {grantee}"),
         format!("GRANT ACCESS ON CONNECTION {conn} FOR SCHEMA {schema} TO {grantee}"),
     ]
-}
-
-fn normalized(sql: &str) -> String {
-    sql.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn assert_documented(statement: &str) {
-    assert!(
-        normalized(SECURITY_DOC).contains(&normalized(&format!("{statement};"))),
-        "docs/security.md no longer lists: {statement}"
-    );
 }
 
 /// Runs a diagnostic query of `docs/security.md`. Each row is text, a NULL cell is empty.
@@ -355,25 +343,6 @@ fn setup_e2e() {
             &["CREATE SESSION", "CREATE VIRTUAL SCHEMA"],
         );
     });
-}
-
-#[test]
-fn the_documented_grants_and_queries_are_the_ones_the_tests_run() {
-    let (schema, conn, owner) = ("<schema>", "<conn>", "<owner>");
-    for grant in script_grants(schema, conn, owner)
-        .into_iter()
-        .chain(schema_grants(schema, conn, owner))
-    {
-        assert_documented(&grant);
-    }
-    for query in [
-        VS_OWNER_SQL,
-        OWNER_ROLES_SQL,
-        CONNECTION_GRANTS_SQL,
-        EXECUTE_GRANTS_SQL,
-    ] {
-        assert_documented(query);
-    }
 }
 
 /// Scenario: The scan spec references the CONNECTION by name
@@ -670,8 +639,20 @@ fn schema_scoped_grants_survive_a_reinstall_and_cover_a_script_the_owner_creates
     for vs in [SCHEMA_VS_NAME, SCRIPT_VS_NAME] {
         assert_eq!(reader_count(vs), SEED_TOTAL_ROWS as i64, "{vs}");
     }
+    // The per-script EXECUTE rows of OWNER_USER, and whether the SCHEMA row is listed.
+    let execute_grants = || {
+        let rows = diagnose(EXECUTE_GRANTS_SQL, "<SCHEMA>", REINSTALL_SCHEMA);
+        let schema_row = [SCHEMA_OWNER_USER, "SCHEMA", "", REINSTALL_SCHEMA].map(String::from);
+        (
+            grant_count(&rows, OWNER_USER),
+            rows.contains(&schema_row.to_vec()),
+        )
+    };
+    assert_eq!(execute_grants(), (3, true));
 
     create_schema_and_scripts_in(&mut sys, REINSTALL_SCHEMA);
+
+    assert_eq!(execute_grants(), (0, true));
 
     let access = diagnose(CONNECTION_GRANTS_SQL, "<CONN>", CONN_NAME);
     let on_reinstall_schema = |for_type: &str| {

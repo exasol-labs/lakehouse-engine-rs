@@ -52,7 +52,7 @@ They cover every script in `<schema>`, including scripts created later. An owner
 
 ### The install script's template
 
-The install script prints the per-script CONNECTION grants as a template. It puts them on the role `LAKEHOUSE_ENGINE_ROLE_<schema>` and grants that role to the installing user. That user owns `<schema>`, so it needs no `EXECUTE` grant, and it owns the virtual schemas it creates. The role is for owners only. Never grant it to a reader.
+The install script prints the per-script CONNECTION grants as a template. It puts them on the role `LAKEHOUSE_ENGINE_ROLE_<schema>` and grants that role to the installing user. That user owns `<schema>`, so it needs no `EXECUTE` grant, and it owns the virtual schemas it creates. The role holds no `EXECUTE` grant, so any other owner that gets the role also needs the three `EXECUTE` grants of the [owner grants](#owner-grants). The role is for owners only. Never grant it to a reader.
 
 Run the template's grants as a DBA, because granting a role needs `GRANT ANY ROLE`, even for the role's creator. After a re-install, run only its two `GRANT ACCESS` statements again. The role and its members remain.
 
@@ -115,8 +115,8 @@ Any user who can query the virtual schema can read the scan plan that `EXPLAIN V
 
 A user who submits a scan plan directly, instead of querying the virtual schema, bypasses every check the adapter makes, including the [Lakekeeper permission check](#lakekeeper-permission-check). That user can also edit the plan. Running a plan needs both:
 
-- `EXECUTE` on `LAKEHOUSE_SCAN`, and on `LAKEHOUSE_DISTRIBUTE_FILES` when the scan spans several shards, or `EXECUTE ANY SCRIPT`.
-- `ACCESS` on the CONNECTION for `LAKEHOUSE_SCAN`, per script or per schema, or `ACCESS ANY CONNECTION`.
+- `EXECUTE` on `LAKEHOUSE_SCAN`, and on `LAKEHOUSE_DISTRIBUTE_FILES` when the scan spans several shards: per script, per schema, as owner of the scripts' schema, or through `EXECUTE ANY SCRIPT`.
+- `ACCESS` on the CONNECTION for `LAKEHOUSE_SCAN`: per script, per schema, or through `ACCESS ANY CONNECTION`.
 
 The virtual schema's owner holds both, and so does every member of a role that owns it. A reader with only the [reader grants](#reader-grants) holds neither, and Exasol refuses its plan with `insufficient privileges for calling script`. Grant these privileges only to users who may read every table the CONNECTION can read.
 
