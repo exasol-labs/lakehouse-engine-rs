@@ -11,7 +11,7 @@ use datafusion::scalar::ScalarValue;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Declared order (what the query and [`crate::scan::positional_deletes::PositionalDeleteScanTable::schema`]
+/// Declared order (what the query and [`crate::scan::scan_table::ParquetScanTable::schema`]
 /// expose) differs from DataFusion's `file_schema ++ table_partition_cols` order whenever a
 /// partition column is not last; [`Self::remap_projection`] alone reconciles them.
 #[derive(Debug, Clone)]

@@ -35,6 +35,10 @@ Find the row that matches your catalog. Then copy its recipe.
 | [Unity Catalog (Delta and Parquet tables)](#unity-catalog-delta-and-parquet-tables) | Unity Catalog | none, PAT, or Databricks OAuth M2M | Supported |
 | [Direct storage (raw Parquet, no catalog)](#direct-storage-raw-parquet-no-catalog) | Direct storage | none (storage credentials only) | Supported |
 
+Iceberg tables are read with their deletes applied: Parquet positional-delete files and
+format-version-3 deletion vectors. A query on a table that needs equality deletes, or that holds
+ORC or Avro data or delete files, fails with an error naming the mechanism.
+
 The steps here cover only the catalog CONNECTION and the Virtual Schema. They are the
 [Point the VS at your data](install.md#point-the-vs-at-your-data) step of [Install](install.md).
 First copy the `.so` to BucketFS and create the scripts.

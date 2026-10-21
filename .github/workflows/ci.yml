@@ -362,7 +362,7 @@ jobs:
           docker compose up -d spark-iceberg-fixtures
           SPARK_FIXTURES_EXIT=$(docker wait lakehouse-engine-rs-spark-iceberg-fixtures-1)
           if [ "$SPARK_FIXTURES_EXIT" != "0" ]; then
-            echo "::error::spark-iceberg-fixtures exited $SPARK_FIXTURES_EXIT (positional-delete fixture authoring failed)"
+            echo "::error::spark-iceberg-fixtures exited $SPARK_FIXTURES_EXIT (Spark fixture authoring failed)"
             docker compose logs spark-iceberg-fixtures
             exit 1
           fi

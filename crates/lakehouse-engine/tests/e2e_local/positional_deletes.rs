@@ -4,12 +4,13 @@
 
 use crate::common::e2e_harness::*;
 use crate::common::pos_delete_fixtures::{
-    DELETE_FREE_FILE_IDS, DELETION_VECTOR_FILE_IDS, DELETION_VECTOR_TABLE,
+    DELETION_VECTOR_CARDINALITIES, DELETION_VECTOR_FILE_ID_RANGES, DELETION_VECTOR_TABLE,
     FILE_GRANULARITY_DELETED_IDS, FILE_GRANULARITY_REMAINING_ROWS, FILE_GRANULARITY_TABLE,
-    FILE_GRANULARITY_TOTAL_ROWS, NAMESPACE, ORC_FILE_IDS, PARTITION_COL,
+    FILE_GRANULARITY_TOTAL_ROWS, NAMESPACE, ORC_FILE_IDS, PARQUET_FILE_IDS, PARTITION_COL,
     PARTITION_EAST_DELETED_IDS, PARTITION_GRANULARITY_DELETED_IDS,
     PARTITION_GRANULARITY_REMAINING_ROWS, PARTITION_GRANULARITY_TABLE,
-    PARTITION_GRANULARITY_TOTAL_ROWS, PARTITION_WEST_DELETED_IDS,
+    PARTITION_GRANULARITY_TOTAL_ROWS, PARTITION_WEST_DELETED_IDS, UNSUPPORTED_FORMAT_TABLE,
+    deletion_vector_deleted, deletion_vector_remaining_ids,
 };
 use crate::common::seed::{E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS};
 
@@ -24,8 +25,8 @@ use std::sync::OnceLock;
 
 const SAMESHARD_VS_NAME: &str = "POSDEL_SAMESHARD_VS";
 const SPLITSHARD_VS_NAME: &str = "POSDEL_SPLITSHARD_VS";
-/// Equals `mor_pos_partition`'s data-file count, so a 1-node cluster gets exactly
-/// one file per shard.
+/// Equals the data-file count of `mor_pos_partition` and `mor_dv`, so a 1-node cluster
+/// gets exactly one file per shard.
 const SPLIT_PARALLELISM_FACTOR: usize = 4;
 
 fn setup_e2e() {
@@ -477,23 +478,121 @@ fn e2e_deletes_with_single_and_grouped_agg() {
     );
 }
 
+/// Scenario: Delete-file references are carried in the per-shard files argument
+#[test]
+fn fixture_spark_deletion_vector_table() {
+    setup_e2e();
+
+    let files = runtime().block_on(resolve_fixture_files(NAMESPACE, DELETION_VECTOR_TABLE));
+    assert_eq!(
+        files.len(),
+        4,
+        "mor_dv must resolve 4 data files: {files:?}"
+    );
+
+    let mut positional = 0;
+    let mut vectors = Vec::new();
+    for entry in &files {
+        match entry.deletes.as_slice() {
+            [DeleteMechanism::IcebergPositionalDelete { .. }] => positional += 1,
+            [
+                DeleteMechanism::IcebergPuffinDeletionVector {
+                    path,
+                    content_offset,
+                    record_count,
+                    ..
+                },
+            ] => vectors.push((path.as_str(), *content_offset, *record_count)),
+            other => panic!("data file {} has unexpected deletes {other:?}", entry.path),
+        }
+    }
+    assert_eq!(
+        positional, 1,
+        "one data file keeps its v2 positional delete"
+    );
+
+    let mut cardinalities: Vec<u64> = vectors.iter().map(|v| v.2).collect();
+    cardinalities.sort_unstable();
+    assert_eq!(cardinalities, DELETION_VECTOR_CARDINALITIES);
+
+    let (large_path, large_offset, _) = vectors.iter().max_by_key(|v| v.2).unwrap();
+    assert!(
+        vectors
+            .iter()
+            .any(|(path, offset, _)| path == large_path && offset != large_offset),
+        "the large vector shares its Puffin file with another blob: {vectors:?}"
+    );
+}
+
+/// Scenario: Iceberg deletion vectors are applied on read
+/// Scenario: Iceberg deletion vectors compose with projection, filter, LIMIT, and aggregates
+#[test]
+fn e2e_deletion_vectors_return_post_delete_rows() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let mut small_expected: Vec<i64> = deletion_vector_remaining_ids()
+        .filter(|id| *id < 1000)
+        .collect();
+    small_expected.sort_unstable();
+    let count = deletion_vector_remaining_ids().count() as i64;
+    let sum: i64 = deletion_vector_remaining_ids().sum();
+    let (_, last) = DELETION_VECTOR_FILE_ID_RANGES[3];
+    let top: Vec<i64> = (149_990..=last)
+        .filter(|id| !deletion_vector_deleted(*id))
+        .take(5)
+        .collect();
+    let after_range = (150_000..=last)
+        .find(|id| !deletion_vector_deleted(*id))
+        .unwrap();
+
+    for vs in [LAKEHOUSE_VS, SAMESHARD_VS_NAME, SPLITSHARD_VS_NAME] {
+        let table = vs_table(vs, DELETION_VECTOR_TABLE);
+
+        let small = ids_column(&conn.query_columns(&format!(
+            "SELECT id FROM {table} WHERE id < 1000 ORDER BY id"
+        )));
+        assert_eq!(small, small_expected, "{vs}: post-delete ids below 1000");
+
+        let agg = conn.query_columns(&format!("SELECT COUNT(*), SUM(id) FROM {table}"));
+        assert_eq!(
+            (parse_int(&agg[0][0]), parse_int(&agg[1][0])),
+            (count, sum),
+            "{vs}: post-delete COUNT(*) and SUM(id)"
+        );
+
+        let cols = conn.query_columns(&format!(
+            "SELECT id, val FROM {table} WHERE id >= 149990 ORDER BY id LIMIT 5"
+        ));
+        assert_eq!(ids_column(&cols), top, "{vs}: TopN skips deleted rows");
+        let vals: Vec<&str> = cols[1].iter().map(|v| v.as_str().unwrap()).collect();
+        let expected_vals: Vec<String> = top.iter().map(|id| format!("row-{id:02}")).collect();
+        assert_eq!(
+            vals, expected_vals,
+            "{vs}: projected values follow their rows"
+        );
+
+        let min = conn.query_columns(&format!("SELECT MIN(id) FROM {table} WHERE id >= 150000"));
+        assert_eq!(
+            parse_int(&min[0][0]),
+            after_range,
+            "{vs}: a deleted range spanning several row groups stays deleted"
+        );
+    }
+}
+
 // Equality deletes have no E2E fixture (only Flink writes them); their refusal is
 // covered by `classify_planned_file`'s unit tests.
 /// Scenario: An unsupported delete mechanism fails loud at plan time
 /// Scenario: An unsupported delete mechanism on a pruned file does not fail the query
 #[test]
-fn e2e_unsupported_delete_fails_loud() {
+fn e2e_unsupported_data_file_format_fails_loud() {
     setup_e2e();
     let mut conn = exa_conn();
-    let table = vs_table(LAKEHOUSE_VS, DELETION_VECTOR_TABLE);
-    let (_, dv_last) = DELETION_VECTOR_FILE_IDS;
+    let table = vs_table(LAKEHOUSE_VS, UNSUPPORTED_FORMAT_TABLE);
     let (orc_first, _) = ORC_FILE_IDS;
 
-    for (filter, mechanisms) in [
-        (String::new(), &["deletion vector", "orc data files"][..]),
-        (format!("WHERE id <= {dv_last}"), &["deletion vector"][..]),
-        (format!("WHERE id >= {orc_first}"), &["orc data files"][..]),
-    ] {
+    for filter in [String::new(), format!("WHERE id >= {orc_first}")] {
         let resp = conn.try_execute(&format!("SELECT id FROM {table} {filter}"));
         assert_eq!(
             resp["status"].as_str(),
@@ -506,9 +605,8 @@ fn e2e_unsupported_delete_fails_loud() {
             .unwrap_or_default()
             .to_ascii_lowercase();
         assert!(
-            message.contains("lakehouse pushdown declined")
-                && mechanisms.iter().any(|m| message.contains(m)),
-            "error must be the plan-time refusal naming one of {mechanisms:?} ({filter}), got: {resp}"
+            message.contains("lakehouse pushdown declined") && message.contains("orc data files"),
+            "error must be the plan-time refusal naming ORC data files ({filter}), got: {resp}"
         );
         for leak in [
             "access_key",
@@ -516,7 +614,6 @@ fn e2e_unsupported_delete_fails_loud() {
             "session_token",
             "secretaccesskey",
             "s3://",
-            ".puffin",
             ".orc",
         ] {
             assert!(
@@ -531,7 +628,7 @@ fn e2e_unsupported_delete_fails_loud() {
         );
     }
 
-    let (first, last) = DELETE_FREE_FILE_IDS;
+    let (first, last) = PARQUET_FILE_IDS;
     let cols = conn.query_columns(&format!(
         "SELECT id FROM {table} WHERE id >= {first} AND id <= {last} ORDER BY id"
     ));

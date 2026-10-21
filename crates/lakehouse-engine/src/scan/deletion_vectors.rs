@@ -1,6 +1,6 @@
-//! Decodes Delta deletion vectors into the [`RoaringTreemap`] the positional-delete pipeline
-//! consumes. `delta_kernel`'s decoder is used only as a pure bytes-to-bitmap function: the scan
-//! fetches sidecar bodies itself, and [`DeletionVector::decode`] hands them over through an
+//! Decodes Delta and Iceberg deletion vectors into the [`RoaringTreemap`] the row-delete pipeline
+//! consumes. Both decoders are used only as pure bytes-to-bitmap functions: the scan fetches the
+//! bytes itself, and [`DeltaDeletionVector::decode`] hands them to `delta_kernel` through an
 //! in-memory [`StorageHandler`] that performs no I/O.
 
 use crate::scan::emit::{redact_credentials, redact_secret_values};
@@ -11,6 +11,7 @@ use delta_kernel::{
     FileMeta, FileSlice, KernelError, KernelResult, KernelResultIteratorStatic, StorageHandler,
 };
 use exasol_udf_sdk::error::UdfError;
+use iceberg::delete_vector::DeleteVector;
 use roaring::RoaringTreemap;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -40,13 +41,13 @@ pub(crate) struct LoggedDeletionVector<'a> {
 /// Resolution and decoding are separate so the scan can dedup and fetch sidecars on its own
 /// bounded path; decoding takes the bytes as an argument so this type cannot perform I/O.
 #[derive(Debug, Clone)]
-pub(crate) struct DeletionVector {
+pub(crate) struct DeltaDeletionVector {
     descriptor: DeletionVectorDescriptor,
     sidecar: Option<Url>,
     cardinality: u64,
 }
 
-impl DeletionVector {
+impl DeltaDeletionVector {
     /// `data_file_path` is what a refusal names: a deletion vector has no identity of its own.
     pub(crate) fn resolve(
         logged: LoggedDeletionVector<'_>,
@@ -55,7 +56,7 @@ impl DeletionVector {
         secrets: &[String],
     ) -> Result<Self, UdfError> {
         resolve_descriptor(logged, table_root)
-            .map_err(|reason| refusal(data_file_path, &reason, secrets))
+            .map_err(|reason| refusal("Delta", data_file_path, &reason, secrets))
     }
 
     /// `None` for an inline vector.
@@ -72,7 +73,7 @@ impl DeletionVector {
         secrets: &[String],
     ) -> Result<RoaringTreemap, UdfError> {
         self.decode_positions(sidecar_bytes)
-            .map_err(|reason| refusal(data_file_path, &reason, secrets))
+            .map_err(|reason| refusal("Delta", data_file_path, &reason, secrets))
     }
 
     fn decode_positions(&self, sidecar_bytes: Option<Bytes>) -> Result<RoaringTreemap, String> {
@@ -105,7 +106,7 @@ impl DeletionVector {
 fn resolve_descriptor(
     logged: LoggedDeletionVector<'_>,
     table_root: &str,
-) -> Result<DeletionVector, String> {
+) -> Result<DeltaDeletionVector, String> {
     let cardinality = u64::try_from(logged.cardinality).map_err(|_| {
         format!(
             "the log declares a negative cardinality of {}",
@@ -150,7 +151,7 @@ fn resolve_descriptor(
         ),
         None => (DeletionVectorStorageType::Inline, logged.path_or_inline_dv),
     };
-    Ok(DeletionVector {
+    Ok(DeltaDeletionVector {
         descriptor: kernel_descriptor(storage_type, path, &logged)?,
         sidecar,
         cardinality,
@@ -180,11 +181,86 @@ fn table_root_url(table_root: &str) -> Result<Url, String> {
     Url::parse(&base).map_err(|e| format!("the scan's table root is not a URL: {e}"))
 }
 
+/// A Puffin deletion vector's manifest coordinates, as the scan spec carries them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ManifestDeletionVector<'a> {
+    pub(crate) path: &'a str,
+    /// The Puffin file's size; a blob range reaching past it is refused before any fetch.
+    pub(crate) size: u64,
+    pub(crate) content_offset: u64,
+    pub(crate) content_size_in_bytes: u64,
+    pub(crate) record_count: u64,
+}
+
+/// One `deletion-vector-v1` blob inside a Puffin file that may hold many data files' vectors.
+#[derive(Debug, Clone)]
+pub(crate) struct IcebergDeletionVector<'a> {
+    pub(crate) path: &'a str,
+    pub(crate) range: Range<u64>,
+    cardinality: u64,
+}
+
+impl<'a> IcebergDeletionVector<'a> {
+    pub(crate) fn resolve(
+        manifest: ManifestDeletionVector<'a>,
+        data_file_path: &str,
+        secrets: &[String],
+    ) -> Result<Self, UdfError> {
+        let ManifestDeletionVector {
+            path,
+            size,
+            content_offset,
+            content_size_in_bytes,
+            record_count,
+        } = manifest;
+        let end = content_offset
+            .checked_add(content_size_in_bytes)
+            .filter(|end| *end <= size)
+            .ok_or_else(|| {
+                let reason = format!(
+                    "its blob at offset {content_offset} with {content_size_in_bytes} bytes lies \
+                     outside the {size}-byte Puffin file"
+                );
+                refusal("Iceberg", data_file_path, &reason, secrets)
+            })?;
+        Ok(Self {
+            path,
+            range: content_offset..end,
+            cardinality: record_count,
+        })
+    }
+
+    /// `blob` must be exactly [`Self::range`] of the Puffin file.
+    pub(crate) fn decode(
+        &self,
+        blob: &[u8],
+        data_file_path: &str,
+        secrets: &[String],
+    ) -> Result<RoaringTreemap, UdfError> {
+        self.decode_positions(blob)
+            .map_err(|reason| refusal("Iceberg", data_file_path, &reason, secrets))
+    }
+
+    fn decode_positions(&self, blob: &[u8]) -> Result<RoaringTreemap, String> {
+        let vector =
+            DeleteVector::deserialize(blob).map_err(|e| format!("it could not be decoded: {e}"))?;
+        if vector.len() != self.cardinality {
+            return Err(format!(
+                "it decodes to {} positions but the manifest declares a cardinality of {}",
+                vector.len(),
+                self.cardinality
+            ));
+        }
+        RoaringTreemap::from_sorted_iter(vector.iter())
+            .map_err(|e| format!("its positions are not ascending: {e}"))
+    }
+}
+
 /// Names the data file but never echoes an opaque inline payload or credential.
-fn refusal(data_file_path: &str, reason: &str, secrets: &[String]) -> UdfError {
+fn refusal(format: &str, data_file_path: &str, reason: &str, secrets: &[String]) -> UdfError {
     let message = format!(
-        "data file '{data_file_path}' carries a Delta deletion vector this scan cannot apply: \
-         {reason}; refusing to emit rows for the affected data file"
+        "data file '{data_file_path}' carries a {format} deletion vector this scan cannot \
+         apply: {reason}; refusing to emit rows for the affected data file"
     );
     let borrowed: Vec<&str> = secrets.iter().map(String::as_str).collect();
     UdfError::User(redact_credentials(&redact_secret_values(

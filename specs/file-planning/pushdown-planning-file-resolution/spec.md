@@ -27,11 +27,11 @@ sizes, delete-file references, and logical schema feed the scan-driving SQL.
   delete files, or sizes itself. Only the READER behind that seam is format-specific. This
   feature owns the ICEBERG reader's half — the multi-level `TableIdent` build, the snapshot read,
   each file's byte size from the Iceberg manifest, and merge-on-read
-  positional-delete resolution; the Delta reader's half is owned by
+  positional-delete and deletion-vector resolution; the Delta reader's half is owned by
   `delta/delta-table-planning`.
 * An Iceberg table's logical schema comes from its column notes. `createVirtualSchema` builds each note from the table's `current_schema()` at that time: the column's Iceberg field-id, its name then, its Arrow type, its nullability, and its `initial-default`. The pushdown reader reads the current schema only to translate the filter for pruning (`file-planning/pushdown-file-pruning`) and to refuse a recorded `date` promotion.
 * Each per-shard file entry carries both the file path and its byte size, so the scan UDF never re-discovers a size the adapter already resolved.
-* The data-file list, each file's byte size, and each file's associated positional-delete files are resolved exactly once, at the same seam; the scan UDF never discovers files or delete files.
+* The data-file list, each file's byte size, and each file's associated positional-delete files and deletion vector are resolved exactly once, at the same seam; the scan UDF never discovers files or delete files.
 * Delete support keeps the wire surface minimal — per-file delete references only, with no serialized Iceberg schema and no bound predicate added to the spec.
 * **This feature is the single owner of the absent-table-location rule.** The rule was
   previously stated only inside `storage-access/pushdown-planning-cloud-credentials-vended-storage`' vended
@@ -42,20 +42,15 @@ sizes, delete-file references, and logical schema feed the scan-driving SQL.
 * **"Absent" covers TWO wire shapes, and each is rejected by a DIFFERENT mechanism.** A
   `loadTable` body may carry `"location": ""` (key present, value empty) or omit the
   `location` key entirely. Only the EMPTY shape reaches this feature's guard. An OMITTED key
-  fails deserialization strictly earlier: `iceberg-0.10.0` declares `location: String` —
-  non-`Option`, with no `#[serde(default)]` — on all three metadata variants
-  (`src/spec/table_metadata.rs:810` `TableMetadataV2V3Shared`, `:855` `TableMetadataV1`),
-  and `TableMetadata` deserializes via `#[serde(try_from = "TableMetadataEnum")]` over
-  `#[serde(untagged)] enum TableMetadataEnum { V3, V2, V1 }` (`:783-788`), so an omitted key
-  matches no variant. The catalog read therefore fails in `authed_get_json`
-  (`crates/lakehouse-catalog/src/iceberg_io.rs:89-94`) with
-  `UdfError::User("failed to parse catalog response: …")` before any location is read. Both
-  shapes are consequently rejected as a `UdfError::User` and neither can substitute the
-  `warehouse`; they differ ONLY in message specificity, which is a diagnostic-quality
-  difference and not an Iceberg-spec deviation, because the spec constrains the field's
-  presence rather than a reader's error wording. The guard is deliberately NOT widened to
-  name the field on the omitted-key path: doing so requires inspecting the raw body in
-  `load_table_any_auth`, which also serves `createVirtualSchema` — a path this feature leaves
+  fails deserialization strictly earlier. iceberg-rust 0.10 deserializes `TableMetadata` with
+  `location` as a required string in every format version, so a body without it matches no
+  version. The catalog read therefore fails with a "failed to parse catalog response" user error
+  before any location is read. Both shapes are consequently rejected as a user error, and neither
+  can substitute the `warehouse`. They differ ONLY in message specificity. That is a
+  diagnostic-quality difference and not an Iceberg-spec deviation, because the spec constrains the
+  field's presence rather than a reader's error wording. The guard is deliberately NOT widened to
+  name the field on the omitted-key path. Doing so would require inspecting the raw body in the
+  catalog's table load, which also serves `createVirtualSchema`, a path this feature leaves
   untouched by design.
 * **Iceberg table-spec grounding, quoted from `apache/iceberg` `format/spec.md` (main),
   verified against the fetched file rather than from memory.** The Table Metadata field
@@ -77,23 +72,22 @@ sizes, delete-file references, and logical schema feed the scan-driving SQL.
   credentials, and the non-SigV4 no-override prefix fallback is already the EMPTY string
   rather than the warehouse.
 * **The rejection is sited at the resolve-once seam, ABOVE the vended/static split, and
-  deliberately not at the catalog-load seam.** Placing it in `load_table_any_auth`
-  (`crates/lakehouse-catalog/src/session.rs`) would also reject the response on the
+  deliberately not at the catalog-load seam.** Placing it in the catalog's table load would also
+  reject the response on the
   `createVirtualSchema` schema-resolution path, which reads no location at all — failing a
   whole virtual-schema creation over a field that path never uses. The resolve-once seam is
   the narrowest site at which every path that DOES depend on a table location passes exactly
   once.
-* **The `createVirtualSchema` path needs no second check to be consistent.**
-  `resolve_table_schema` reads only `result.metadata.current_schema()`; it resolves no
-  storage anchor and no table root, so there is no value for the `warehouse` to be
-  substituted into. Consistency across that path is a property of what it reads, not of a
-  guard it carries.
-* **The join path inherits the rejection rather than repeating it.** `resolve_one_join_side`
-  builds a per-side `CatalogProps` by overriding only `table` and then delegates entirely to
-  `resolve_file_list`, so each side of a join is checked by the same single guard.
+* **The `createVirtualSchema` path needs no second check to be consistent.** Its schema
+  resolution reads only the table metadata's `current_schema()`. It resolves no storage anchor
+  and no table root, so there is no value for the `warehouse` to be substituted into.
+  Consistency across that path is a property of what it reads, not of a guard it carries.
+* **The join path inherits the rejection rather than repeating it.** Each join side changes only
+  the table it names and then resolves its files through the same file resolution as a
+  single-table pushdown, so each side of a join is checked by the same single guard.
 * **The empty-table-root branch of the file-list encoding is retained deliberately.** After
-  this rejection, an empty table root is unreachable from a `loadTable` response, but
-  `relativize_path_to_root`'s empty-root handling (empty root ⇒ every path stays absolute)
+  this rejection, an empty table root is unreachable from a `loadTable` response, but the
+  adapter's empty-root path relativization (empty root ⇒ every path stays absolute)
   is a total-function property of the wire encoding, not a storage-anchor fallback. It stays
   as written. The scan-side half of that property is owned by
   `datafusion-scan/scan-execution-file-metadata`, which keeps three empty-table-root clauses —
@@ -141,7 +135,7 @@ sizes, delete-file references, and logical schema feed the scan-driving SQL.
 * *AND* a `pushdown` request whose `involvedTables[0].name` is the Exasol (uppercased, `__`-flattened) name of one of those tables
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL read `TABLE_MAP` back from `schemaMetadataInfo.adapterNotes` and look up the involved virtual table name to recover its original-cased fully-qualified Iceberg identifier
-* *AND* the adapter SHALL resolve the data-file list and build the scan-driving SQL for exactly that one Iceberg table, carrying its identifier in the per-shard `CatalogProps.table`
+* *AND* the adapter SHALL resolve the data-file list and build the scan-driving SQL for exactly that one Iceberg table, loading it from the catalog under that identifier
 * *AND* a `pushdown` request whose involved virtual table name is absent from `TABLE_MAP` SHALL fail with an error naming the unknown virtual table, never silently scanning a different or stale table
 
 ### Scenario: Pushdown resolves the file list once and builds a scan-driving query
@@ -163,12 +157,12 @@ sizes, delete-file references, and logical schema feed the scan-driving SQL.
 * *THEN* the adapter SHALL split the identifier into all namespace segments and the trailing table name, building the iceberg `TableIdent` from a multi-segment `NamespaceIdent` rather than treating only the first segment as the namespace
 * *AND* both the SigV4-signed and the unsigned catalog paths SHALL build the identifier the same way so multi-level namespaces load correctly under either path
 
-### Scenario: Positional-delete file references are carried in the per-shard files argument
+### Scenario: Delete-file references are carried in the per-shard files argument
 
-* *GIVEN* a virtual schema over an Iceberg merge-on-read table backed by SeaweedFS, where `plan_files` associates each data file with its applicable Parquet positional-delete files (at `file` or `partition` granularity)
+* *GIVEN* a virtual schema over an Iceberg merge-on-read table backed by SeaweedFS, where `plan_files` associates each data file with its applicable Parquet positional-delete files (at `file` or `partition` granularity) or its deletion vector
 * *WHEN* Exasol sends the corresponding pushdown request
-* *THEN* the adapter SHALL resolve the data-file list, each file's byte size, and each file's associated positional-delete files exactly once, at the same resolve-once seam, and MUST NOT require the scan UDF to discover delete files itself
-* *AND* the adapter SHALL carry each data file's associated positional-delete file references (path, byte size, delete content type) in the per-shard files argument alongside the data-file entry, keeping the wire surface minimal — no serialized Iceberg schema and no bound predicate are added for delete support
+* *THEN* the adapter SHALL resolve the data-file list, each file's byte size, and each file's associated positional-delete files and deletion vector exactly once, at the same resolve-once seam, and MUST NOT require the scan UDF to discover delete files itself
+* *AND* the adapter SHALL carry each data file's associated positional-delete file references (path, byte size, delete content type) and deletion vector (the same keys plus the blob's offset and length and its cardinality) in the per-shard files argument alongside the data-file entry, keeping the wire surface minimal — no serialized Iceberg schema and no bound predicate are added for delete support
 * *AND* the shard-invariant common spec (logical schema, projection, filter, LIMIT, credentials, table root) SHALL be unchanged by delete support, so a delete-free table produces a byte-identical common spec to before this feature
 
 ### Scenario: File resolution rejects a loadTable response that carries no table location
@@ -176,16 +170,16 @@ sizes, delete-file references, and logical schema feed the scan-driving SQL.
 * *GIVEN* a `pushdown` request for a table whose `loadTable` response carries an EMPTY table metadata `location`
 * *AND* a CONNECTION that supplies a non-empty `warehouse`
 * *WHEN* the adapter resolves the file list for that table, under EITHER value of `use_vended_credentials`
-* *THEN* the adapter SHALL return a `UdfError::User` naming the EMPTY table `location`, from ONE check that runs BEFORE the vended/static storage split, so both values of `use_vended_credentials` report the IDENTICAL error text
+* *THEN* the adapter SHALL return a user error naming the EMPTY table `location`, from ONE check that runs BEFORE the vended/static storage split, so both values of `use_vended_credentials` report the IDENTICAL error text
 * *AND* that error text MUST be path-independent: it MUST NOT frame the failure as a vended-storage-backend resolution failure, because on the non-vended path the static storage backend resolves normally and only the table location is missing
 * *AND* the adapter MUST NOT substitute the CONNECTION's `warehouse`, `endpoint`, or any other CONNECTION-derived value for the empty location, because the REST `warehouse` is a routing identifier — a bare AWS account id on the Glue path, a warehouse name on the Lakekeeper path — that denotes no object store
 * *AND* the adapter MUST NOT go on to resolve the effective storage, build the Iceberg table, or plan any file, so a malformed response costs zero object-storage access
-* *AND* that error MUST be returned as a `Result`, never raised as a panic, because a panic inside a UDF is an abnormal VM exit that makes the engine SIGKILL every sibling VM of the statement part
+* *AND* that error MUST be returned as an error value, never raised as a panic, because a panic inside a UDF is an abnormal VM exit that makes the engine SIGKILL every sibling VM of the statement part
 * *AND* that error MUST NOT contain any credential value
 * *AND* every join side SHALL inherit this rejection through the same file-resolution call, so a join whose dimension side carries no location fails at plan time with the same error
 * *AND* the `createVirtualSchema` schema-resolution path SHALL be unchanged, because it reads only the table's `current_schema()` and reads no table location, so nothing there can be substituted for one
-* *AND* the empty-table-root branch SHALL be retained on both sides of the wire — `relativize_path_to_root` in the adapter and the three empty-table-root clauses of `datafusion-scan/scan-execution-file-metadata` (two normative `SHALL` clauses and one descriptive Background bullet) — because this rejection makes an empty root unreachable from a `loadTable` response, which makes that branch unreachable rather than dead, and it MUST NOT be deleted or converted into a second error
-* *AND* a `loadTable` body that OMITS the `location` key SHALL also be rejected as a `UdfError::User`, at deserialization rather than by this guard, and MUST NOT be reported by any message that substitutes the `warehouse`; that message names the unparseable response rather than the `location` field, which this feature records as a known diagnostic-specificity difference rather than leaving it unstated
+* *AND* the empty-table-root branch SHALL be retained on both sides of the wire — the adapter's path relativization and the three empty-table-root clauses of `datafusion-scan/scan-execution-file-metadata` (two normative `SHALL` clauses and one descriptive Background bullet) — because this rejection makes an empty root unreachable from a `loadTable` response, which makes that branch unreachable rather than dead, and it MUST NOT be deleted or converted into a second error
+* *AND* a `loadTable` body that OMITS the `location` key SHALL also be rejected as a user error, at deserialization rather than by this guard, and MUST NOT be reported by any message that substitutes the `warehouse`; that message names the unparseable response rather than the `location` field, which this feature records as a known diagnostic-specificity difference rather than leaving it unstated
 
 ### Scenario: A storage read the object store denies fails the pushdown with the store's denial
 

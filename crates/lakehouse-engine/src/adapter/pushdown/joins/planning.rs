@@ -134,7 +134,7 @@ pub(crate) struct ResolvedJoinSide {
     pub table_identifier: String,
     /// Empty ⇒ every `files` path is absolute.
     pub table_root: String,
-    /// Includes positional deletes, so the scan applies them per side.
+    /// Includes each file's delete mechanisms, so the scan applies them per side.
     pub files: Vec<FileEntry>,
     pub logical_schema: Vec<LogicalField>,
     /// Empty when the table has no name-mapping property, and on every Delta side.
