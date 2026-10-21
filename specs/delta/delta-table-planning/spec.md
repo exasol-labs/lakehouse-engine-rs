@@ -79,7 +79,7 @@ path exactly as they already are for Iceberg.
   mechanism, keeping the closed 3-kind set this feature already requires.
 * **The pushdown refusal is gone, issue #320.** Both halves of its former justification are now
   closed: the Delta deletion vector is modelled AND applied at read time
-  (`scan-read-path/scan-execution-positional-deletes`), and the scan now materializes a partition
+  (`scan-read-path/scan-execution-delta-deletion-vectors`), and the scan now materializes a partition
   column absent from the physical Parquet file
   (`scan-read-path/scan-execution-partition-values`). Production pushdown reaches the Delta reader
   through the scan-source seam — see the scenario below.
@@ -384,9 +384,11 @@ path exactly as they already are for Iceberg.
   the recorded rule that its name, `pub` visibility, signature, and call sites stay unchanged, because
   `file-planning/pushdown-format-neutral-resolution` routes every former caller through this seam
 * *AND* the reader SHALL construct each associated positional-delete reference as the Iceberg
-  positional-delete variant of the format-neutral delete mechanism, and its SERIALIZED per-shard file
-  list SHALL stay byte-identical to the pre-#342 encoding, including the delete-carrying 3-tuple form
-  and its `{"path":…,"size":…,"content_type":"position_deletes"}` member encoding
+  positional-delete variant of the format-neutral delete mechanism, and each Puffin deletion vector
+  as the Iceberg deletion-vector variant
+* *AND* a per-shard file list without deletion vectors SHALL serialize byte-identically to the
+  pre-#342 encoding, including the delete-carrying 3-tuple form and its
+  `{"path":…,"size":…,"content_type":"position_deletes"}` member encoding
 * *AND* the returned scan SHALL carry EMPTY partition columns, and each of its file entries SHALL carry
   EMPTY partition values, so the serialized shard-invariant common blob and per-shard file list for
   every Iceberg request stay byte-identical to their pre-#342 encoding

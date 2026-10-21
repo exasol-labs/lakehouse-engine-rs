@@ -22,8 +22,9 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 * A parse failure on either argument MUST surface an error identifying scan-spec
   deserialization failure and MUST NOT contain any storage access key, secret key, or
   session token.
-* Per-file positional-delete references and per-file partition values travel with their
-  data-file entry in the per-shard argument.
+* Per-file delete references (positional-delete files, Iceberg deletion vectors, and Delta
+  deletion vectors) and per-file partition values travel with their data-file entry in the
+  per-shard argument.
 * The `storage` value in the common blob is an externally-tagged credential WRAPPER specified
   by `storage-access/scan-spec-credential-reference`. A join block carries its own REQUIRED
   `storage` value in the same wrapper encoding, so a join block that names no dimension

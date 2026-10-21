@@ -60,7 +60,7 @@ CPU thread/partition budget of `scan-runtime/scan-execution-threading`.
   delete-free scan of the same files had its footers fetched concurrently by DataFusion's own
   opener. Issue [#165](https://github.com/exasol-labs/lakehouse-engine-rs/issues/165).
 * One semaphore, two phases, one field. The limiter is named `delete_path_read_limiter`
-  (`crates/lakehouse-engine/src/scan/positional_deletes.rs`), renamed from `delete_read_limiter`
+  (`crates/lakehouse-engine/src/scan/scan_table.rs`), renamed from `delete_read_limiter`
   because it no longer bounds only reads OF delete files: it bounds every object-store read the
   delete path issues while preparing a delete-carrying scan. Adding a second size-N semaphore for
   Phase B would double the instance's in-flight bound to 2N and break the guarantee this feature

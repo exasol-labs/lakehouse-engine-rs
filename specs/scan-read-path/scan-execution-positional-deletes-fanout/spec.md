@@ -1,63 +1,26 @@
-# Feature: DataFusion Scan Execution — Positional Delete I/O Fan-Out and Pruning
+# Feature: DataFusion Scan Execution — Positional-Delete File I/O Fan-Out and Pruning
 
-Governs the object-store I/O SHAPE of applying positional deletes: the shared connection-budget
-limiter that bounds concurrent delete-file reads and delete-carrying data-file footer fetches, the
-read-once-per-shard guarantee for a delete file referenced by multiple data files, and the
-row-group-level pruning that skips decoding a partition-granularity delete file's irrelevant row
-groups. Split out of `scan-read-path/scan-execution-positional-deletes` once that feature's
-scenario count crossed this library's per-spec organization threshold; the delete-APPLICATION
-guarantees (what gets removed, how mechanisms compose, the read-time backstop) stay in that sibling
-feature.
+Governs the object-store I/O shape of reading Iceberg Parquet positional-delete files: the
+read-once-per-shard guarantee for a delete file that several data files reference, the
+connection-budget bound on concurrent delete-file reads, and the row-group pruning that skips the
+irrelevant row groups of a partition-granularity delete file. Which rows a delete file removes is
+specified in `scan-read-path/scan-execution-positional-deletes`.
 
 ## Background
 
-* **Split from `scan-read-path/scan-execution-positional-deletes`, issue #320.** That feature keeps
-  every scenario about WHICH rows a delete mechanism removes and how the shared pipeline composes
-  with projection/filter/LIMIT/pruning and the read-time backstop. This feature owns every scenario
-  about the I/O SHAPE — concurrency bounds, read-once-per-shard, and row-group pruning — that the
-  same pipeline exercises to build its per-data-file access plans.
-* Phase A (`collect_delete_positions`) reads each unique delete file once into a data-file-path →
-  deleted-position map. Phase B looks up that map per data file with no delete-file I/O of its own,
-  but does fetch each delete-carrying data file's own Parquet footer for its per-row-group row
-  counts. Phase B is no longer serial and no longer I/O-free: those footer fetches run as a
-  bounded-concurrent fan-out under the shared limiter instead of a serial `for` loop. Issue
-  [#165](https://github.com/exasol-labs/lakehouse-engine-rs/issues/165).
-* Two properties make the concurrent fan-out safe to reason about. Each fan-out task targets a
-  DISTINCT data-file path, so no two concurrent tasks contend for the same session
-  `FileMetadataCache` key. And the fan-out preserves the per-shard spec's file ORDER in the
-  `PartitionedFile` list it returns, so the shard's single `FileGroup` is byte-identical to the
-  serial build and the concurrency cannot perturb emission order.
-* Delete positions and access plans are unchanged by the restructure: the delete set for a data file
-  is fixed by Phase A, and Phase B's footer fetch reads only the per-row-group row counts, which are
-  a property of the file rather than of the fetch order.
-* Both deletion-vector mechanisms share this same connection-budget limiter and read-once
-  discipline: the Delta mechanism for its sidecar fetches, and the Iceberg mechanism for its Puffin
-  blob reads. Each decodes its own container format, so their fan-out scenarios live in
+* These reads are Phase A of the pipeline that every row-position delete mechanism shares
+  (`scan-read-path/scan-execution-row-position-deletes`). That feature owns Phase B, including the
+  concurrent data-file footer fetches, and the size-N limiter that Phase A and Phase B share.
+* Both deletion-vector mechanisms read under the same limiter with their own read-once discipline:
+  the Delta mechanism for its sidecar fetches, and the Iceberg mechanism for its Puffin blob reads.
+  Each decodes its own container format, so their fan-out scenarios live in
   `scan-read-path/scan-execution-delta-deletion-vectors` and
   `scan-read-path/scan-execution-iceberg-deletion-vectors` rather than here.
 * See `scan-runtime/scan-execution-connection-concurrency` for the operator-facing budget knob
-  itself (`s3_max_connections`); this feature governs how the positional-delete pipeline spends that
+  itself (`s3_max_connections`); this feature governs how positional-delete file reads spend that
   budget, not how the budget is derived or configured.
 
 ## Scenarios
-
-### Scenario: Concurrent data-file footer fetches stay within the connection budget
-
-* *GIVEN* a shard whose assigned data files include MORE delete-carrying data files than the resolved `s3_max_connections` budget N
-* *WHEN* the scan UDF builds those files' base `ParquetAccessPlan`s, each of which needs its data file's per-row-group row counts from that file's Parquet footer
-* *THEN* the UDF SHALL fetch those footers CONCURRENTLY rather than awaiting one before starting the next
-* *AND* the number of concurrently in-flight footer fetches MUST NOT exceed N at any instant, counted across every fan-out active in the scan invocation — a single table, or both sides of a broadcast join sharing the ONE size-N limiter that also bounds the delete-file reads
-* *AND* the returned `PartitionedFile` list SHALL preserve the per-shard spec's assigned-file order, so each file occupies the same position in the shard's single `FileGroup` as it did under the serial build
-* *AND* the post-delete row set SHALL be identical to a strictly serial footer fetch, because a data file's per-row-group row counts and its delete set are both independent of fetch order
-* *AND* a footer fetch that fails SHALL surface as a credential-redacted user error naming the failure, with the remaining fetches abandoned, no partial access plan attached, and no row emitted for the shard
-
-### Scenario: A delete-free data file still costs no footer fetch of its own
-
-* *GIVEN* a shard mixing delete-carrying data files with data files that carry no associated delete files
-* *WHEN* the scan UDF builds the shard's `PartitionedFile` list
-* *THEN* the UDF SHALL fetch a Parquet footer ONLY for the delete-carrying data files, because only those need a base `ParquetAccessPlan`
-* *AND* a delete-free data file MUST NOT acquire a permit from the shared fan-out limiter, so delete-free files in a mixed shard neither consume nor wait on the connection budget
-* *AND* each delete-free data file SHALL still appear in the returned `PartitionedFile` list, in its spec order, with no access plan attached
 
 ### Scenario: A shared delete file is read once per shard regardless of referencing data-file count
 

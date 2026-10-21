@@ -2,12 +2,12 @@
 
 Extends the scan UDF so a Delta Lake deletion vector is applied on read, so a query over a Delta
 table whose rows were deleted returns the post-delete row set rather than the raw Parquet content.
-A deletion vector names row positions inside ONE data file, so it converges on the machinery Iceberg
-positional deletes already use: a `RoaringTreemap` of deleted positions becomes a base
+A deletion vector names row positions inside ONE data file, so it converges on the pipeline every
+row-position delete mechanism shares (`scan-read-path/scan-execution-row-position-deletes`): a
+`RoaringTreemap` of deleted positions becomes a base
 `RowSelection`, which becomes a `ParquetAccessPlan` the Parquet opener intersects with predicate,
 row-group, and page pruning. Only the step that PRODUCES the bitmap is new, and it is delegated to
-`delta_kernel`'s own protocol-conformant decoder rather than re-implemented. This closes the refusal
-the read-time backstop currently raises for the `DeltaDeletionVector` delete mechanism.
+`delta_kernel`'s own protocol-conformant decoder rather than re-implemented.
 
 ## Background
 

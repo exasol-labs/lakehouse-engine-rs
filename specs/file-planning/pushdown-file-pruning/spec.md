@@ -4,9 +4,9 @@ Translates the soundly-translatable conjuncts of the Exasol WHERE predicate into
 `iceberg::expr::Predicate` that is applied to the Iceberg table scan at file-resolution
 time, so `plan_files` prunes data files on partition values and per-file min/max bounds
 before any S3 I/O — while the DataFusion scan keeps applying the full filter as the sole
-source of row-level correctness. This delta extends the same resolve-once seam to preserve
-each data file's associated positional-delete files and to fail loud on delete mechanisms
-the engine cannot apply.
+source of row-level correctness. The same resolve-once seam preserves each data file's
+associated positional-delete files and deletion vector, and fails loud on delete mechanisms the
+engine cannot apply.
 
 ## Background
 
@@ -48,8 +48,8 @@ the engine cannot apply.
   `plan_files` per the Iceberg sequence-number rules) MUST be preserved into the scan spec, never
   discarded.
 * Delete mechanisms this engine cannot apply (equality deletes and ORC/Avro data or delete
-  files) MUST be detected at plan time and fail the
-  request loud when they apply to a planned data file.
+  files) MUST be detected at plan time and fail the request loud when they apply to a planned
+  data file.
 * See `pushdown/pushdown-planning` for the broader pushdown plan and the scenario that
   covers wiring of the Iceberg predicate alongside the DataFusion filter string.
 * A filter names an Exasol column, and the table's column notes record which Iceberg field id that

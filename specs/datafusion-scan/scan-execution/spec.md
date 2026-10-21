@@ -41,7 +41,7 @@ column JSON rendering, and EMITS-type coercion — is owned by
   object-storage import phase do not already overlap and that decoupling them yields a
   measured throughput gain. Until that evidence exists, the streaming discipline stays
   strictly fetch-one / emit / drop with no buffer.
-* The scan registers files through a custom `ParquetSource`-backed table provider (`PositionalDeleteScanTable`); it does not use iceberg-rust's own Arrow reader, so it does not inherit that reader's INT96 coercion.
+* The scan registers files through a custom `ParquetSource`-backed table provider (`ParquetScanTable`); it does not use iceberg-rust's own Arrow reader, so it does not inherit that reader's INT96 coercion.
 * INT96 is a legacy pre-Iceberg Parquet/Hive/Spark physical timestamp encoding absent from the Iceberg spec, whose Parquet mapping is INT64-only. Tolerating INT96 on read is a real-world-compatibility affordance for non-compliant writers, not a spec deviation.
 * Logical Iceberg-to-Arrow and Arrow-to-Exasol type mapping is owned by `scan-types/type-mapping`; this feature owns only the physical Parquet decode configuration.
 * INT96 physically carries nanosecond precision (Julian day + nanoseconds-within-day). Coercing to `"us"` deliberately truncates any sub-microsecond digits — a named trade-off, consistent with Iceberg's microsecond `timestamp` model, which promises no sub-microsecond precision. The engine never claimed to preserve INT96's extra precision.
@@ -62,12 +62,12 @@ column JSON rendering, and EMITS-type coercion — is owned by
   common/per-shard merge, malformed-input handling, and the no-catalog-block guarantee.
 * See `datafusion-scan/scan-execution-file-metadata` for spec-backed per-file metadata
   (no per-file `HEAD`) and relative/absolute path resolution against the table root.
-* Positional-delete application (see `scan-read-path/scan-execution-positional-deletes`)
+* Row-position delete application (see `scan-read-path/scan-execution-row-position-deletes`)
   attaches a per-data-file base `ParquetAccessPlan` to the same `ParquetSource`-backed
   provider without changing this plan shape.
-* See `scan-read-path/scan-execution-positional-deletes` for delete-application scenarios
-  (base `ParquetAccessPlan` attachment, delete-set composition with pushdown, and the
-  read-time backstop for unsupported delete mechanisms).
+* See `scan-read-path/scan-execution-row-position-deletes` for the shared delete-application
+  scenarios (base `ParquetAccessPlan` attachment, composition with pushdown, and the read-time
+  backstop for unsupported delete mechanisms), and the three mechanism features it names.
 * Per-call Tokio runtime construction and the no-process-caching rule for the scan runtime
   are owned by `scan-runtime/scan-execution-threading`.
 * See `datafusion-scan/scan-execution-value-conversion` for Arrow-to-`Value` type mapping,

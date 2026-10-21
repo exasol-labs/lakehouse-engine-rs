@@ -3,7 +3,8 @@
 Extends `datafusion-scan/scan-execution` with how the scan UDF turns a per-shard `(path,
 size)` file entry into a registered, absolute, sized file — without issuing a per-file
 object-store `HEAD` request the adapter's already-resolved size makes redundant — and extends
-the same no-HEAD guarantee to the associated positional-delete files.
+the same no-HEAD guarantee to the associated positional-delete files and Puffin deletion-vector
+files.
 
 ## Background
 
@@ -90,7 +91,7 @@ the same no-HEAD guarantee to the associated positional-delete files.
 
 ### Scenario: Delete files also carry their size and incur no per-file HEAD
 
-* *GIVEN* a scan invocation whose per-shard files argument carries, for each associated positional-delete file, its byte size alongside its path
+* *GIVEN* a scan invocation whose per-shard files argument carries, for each associated positional-delete file or Puffin deletion-vector file, its byte size alongside its path
 * *WHEN* the scan UDF reads a data file's associated delete files
 * *THEN* the UDF SHALL construct each delete file's object metadata — at minimum its byte size — from the per-shard spec entry
 * *AND* the UDF MUST NOT issue a per-file object-store metadata (HEAD) request for a delete file to discover its size, because the size is authoritative from the spec

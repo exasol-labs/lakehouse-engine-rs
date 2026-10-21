@@ -7,7 +7,7 @@ Decomposes the DataFusion scan-execution code in `scan/mod.rs` into single-respo
 * The refactor changes code organization only. It changes no scan, pushdown, aggregate, join, field-id-projection, positional-delete, type-mapping, memory, concurrency, threading, or telemetry behavior, so every scenario in the `datafusion-scan/scan-execution`, `scan-runtime/scan-execution-connection-concurrency`, `datafusion-scan/scan-execution-expression-pushdown`, `scan-read-path/scan-execution-field-id-projection`, `datafusion-scan/scan-execution-file-metadata`, `scan-aggregation/scan-execution-grouped-agg`, `scan-aggregation/scan-execution-join`, `scan-runtime/scan-execution-memory-and-credentials`, `scan-aggregation/scan-execution-partial-agg`, `datafusion-scan/scan-execution-plan-shape`, `scan-read-path/scan-execution-positional-deletes`, `datafusion-scan/scan-execution-spec-reconstitution`, `scan-runtime/scan-execution-telemetry`, `scan-runtime/scan-execution-threading`, `datafusion-scan/scan-execution-value-conversion`, and `scan-types/type-mapping` features stays accurate and unedited.
 * Because the refactor changes no scanning, pushdown, or schema/type behavior, the project's Iceberg-table-spec compliance check does not apply — the move touches file layout only, not read semantics. A behavior correction found during the close read is out of scope for this structural refactor and MUST be raised as a separate finding, never folded into a move.
 * The scan layer decomposes into cohesive submodules (raw-row scan, broadcast join, partial aggregate, object-store and session setup, field-id projection) plus one shared SQL-support submodule for cross-cutting identifier helpers and one shared test-support submodule. The exact submodule list is a design decision recorded in the plan, not a normative contract.
-* `crate::scan` stays a directory module. The pre-existing `pub mod` submodules (`convert`, `diagnostics`, `emit`, `positional_deletes`, `runtime`, `spec`) are untouched and keep their qualified `crate::scan::<submodule>::<name>` paths. New submodules are declared private (`mod`) and their public items are re-exported flat from `scan/mod.rs`, so the flat import path `crate::scan::<name>` is unchanged for every consumer.
+* `crate::scan` stays a directory module. The pre-existing `pub mod` submodules (`convert`, `diagnostics`, `emit`, `runtime`, `spec`) are untouched and keep their qualified `crate::scan::<submodule>::<name>` paths. New submodules are declared private (`mod`) and their public items are re-exported flat from `scan/mod.rs`, so the flat import path `crate::scan::<name>` is unchanged for every consumer.
 * A cross-submodule private helper widens to the narrowest visibility that compiles (`pub(super)`), never to a broader visibility than it had before.
 * The CI/lint file-size guardrail (the second half of issue #129) is out of scope for this feature and remains open under issue #129. This feature is partial progress on issue #129 and does not close it.
 * **This delta is issue #135. It amends ONE scenario and changes no module boundary.** The public scan façade, the import-free consumer compilation, the consolidated SQL-builder helpers, and the per-submodule test layout are all UNCHANGED.
@@ -27,11 +27,10 @@ Decomposes the DataFusion scan-execution code in `scan/mod.rs` into single-respo
 
 ### Scenario: Existing scan consumers compile without import edits
 
-* *GIVEN* the untouched sibling module `crate::scan::positional_deletes` and every `tests/` integration crate
+* *GIVEN* every `tests/` integration crate
 * *WHEN* they compile against the refactored code
-* *THEN* `positional_deletes` MUST compile without editing its `use crate::scan::{...}` import
-* *AND* every `tests/` integration crate MUST compile without editing any flat `use lakehouse_engine::scan::<name>` path
-* *AND* the qualified `scan::<submodule>::...` paths of the untouched `pub mod` submodules (`convert`, `diagnostics`, `emit`, `positional_deletes`, `runtime`, `spec`) MUST remain resolvable unchanged
+* *THEN* every `tests/` integration crate MUST compile without editing any flat `use lakehouse_engine::scan::<name>` path
+* *AND* the qualified `scan::<submodule>::...` paths of the untouched `pub mod` submodules (`convert`, `diagnostics`, `emit`, `runtime`, `spec`) MUST remain resolvable unchanged
 
 ### Scenario: Behavior is unchanged across the refactor
 

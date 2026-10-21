@@ -9,7 +9,7 @@
 
 ### Context
 
-The engine applies only Parquet positional deletes over Parquet data files. iceberg-rust's planned file tasks now carry the format of each data file and each applied delete file.
+The engine applies only Parquet positional deletes over Parquet data files. iceberg-rust's planned file tasks now carry the format of each data file and each applied delete file. ADR `iceberg-deletion-vectors-decoded-by-iceberg-rust` later adds Iceberg deletion vectors to the applied set, and this classification still decides what the adapter refuses.
 
 ### Decision
 
