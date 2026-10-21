@@ -163,7 +163,7 @@ enum ApplicableDelete<'a> {
 /// Read-time backstop behind the plan-time adapter gate: an unapplicable mechanism is refused
 /// before any row of its data file is emitted, and the payload is reachable only through here,
 /// so it can neither be read nor silently skipped. A deletion vector's refusal names
-/// `data_file_path`, because the vector has no identity of its own.
+/// `data_file_path`: a Delta vector may be inline, and a Puffin file holds many data files' vectors.
 fn applicable_delete_mechanism<'a>(
     delete: &'a DeleteMechanism,
     data_file_path: &str,

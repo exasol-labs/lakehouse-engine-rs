@@ -98,7 +98,7 @@ engine cannot apply.
 * *AND* the resolved file list SHALL equal the unpruned file list for that `OR`
 * *AND* the query result SHALL be correct because DataFusion applies the full predicate
 
-### Scenario: Positional-delete files are preserved into the scan spec
+### Scenario: Delete files and deletion vectors are preserved into the scan spec
 
 * *GIVEN* a virtual schema over an Iceberg merge-on-read table whose resolved `FileScanTask`s carry associated Parquet positional-delete files at either `write.delete.granularity=file` or `write.delete.granularity=partition`, or a Puffin deletion vector
 * *WHEN* Exasol sends the corresponding pushdown request and the adapter resolves the file list once

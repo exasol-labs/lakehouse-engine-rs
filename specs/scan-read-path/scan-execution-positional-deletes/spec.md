@@ -81,11 +81,3 @@ positional-delete case (tracked as issue #68).
 * *THEN* the Parquet opener SHALL intersect the injected delete row selection WITH predicate, row-group, and page pruning, so a row group provably excluded by the predicate is still skipped and a deleted row is still removed
 * *AND* the rows the filter, LIMIT, and any aggregation observe SHALL already be the post-delete rows
 * *AND* the emitted result SHALL equal the result of applying the deletes, projection, filter, and LIMIT over the full data on a single node
-
-### Scenario: The refactor preserves the delete-application safety invariants
-
-* *GIVEN* a shard whose assigned data files carry associated Parquet positional-delete files at file or partition granularity
-* *WHEN* the two-phase pipeline applies those deletes (Phase A reads each unique delete file once into a data-file-path → deleted-position map; Phase B looks up that map per data file with no delete-file I/O, and fetches each delete-carrying data file's own Parquet footer as a bounded-concurrent fan-out under the same shared limiter)
-* *THEN* the post-delete row set for every data file MUST be identical to applying every associated delete file's positions per data file, unchanged by the read-once, concurrent, pruned restructure and unchanged by the concurrent Phase B footer fetch
-* *AND* the read-time backstop refusing equality deletes, credential redaction on every error path, and the no-object-store-HEAD invariant MUST all hold unchanged
-* *AND* the backstop SHALL still run BEFORE any I/O, so an unapplicable delete anywhere in the shard fails loud before a single delete-file body or data-file footer is fetched

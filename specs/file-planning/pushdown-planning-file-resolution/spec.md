@@ -163,7 +163,7 @@ sizes, delete-file references, and logical schema feed the scan-driving SQL.
 * *THEN* the adapter SHALL split the identifier into all namespace segments and the trailing table name, building the iceberg `TableIdent` from a multi-segment `NamespaceIdent` rather than treating only the first segment as the namespace
 * *AND* both the SigV4-signed and the unsigned catalog paths SHALL build the identifier the same way so multi-level namespaces load correctly under either path
 
-### Scenario: Positional-delete file references are carried in the per-shard files argument
+### Scenario: Delete-file references are carried in the per-shard files argument
 
 * *GIVEN* a virtual schema over an Iceberg merge-on-read table backed by SeaweedFS, where `plan_files` associates each data file with its applicable Parquet positional-delete files (at `file` or `partition` granularity) or its deletion vector
 * *WHEN* Exasol sends the corresponding pushdown request

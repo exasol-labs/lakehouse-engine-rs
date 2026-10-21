@@ -143,11 +143,11 @@ shard-invariant common spec argument, serialized once for the whole fan-out.
 * *AND* this Parquet-level pruning SHALL compose with the Iceberg file-level pruning of `file-planning/pushdown-file-pruning` — files dropped by Iceberg are never opened, and within the surviving files non-matching row groups and pages are skipped
 * *AND* the emitted rows SHALL be identical to a scan with pruning disabled (pruning narrows what is read, never the result set)
 
-### Scenario: Positional-delete files are read with the same resolved credentials
+### Scenario: Delete payloads are read with the same resolved credentials
 
 * *GIVEN* a scan invocation whose shard-invariant common spec references or carries, per side, the storage credentials for that side
-* *WHEN* the scan UDF reads a data file's associated positional-delete files or Puffin deletion-vector files from object storage
-* *THEN* the UDF SHALL read the delete files through the SAME registered object store used for the data files OF THAT SIDE, configured from that side's RESOLVED backend credentials
+* *WHEN* the scan UDF reads a data file's associated positional-delete files, Puffin deletion-vector files, or Delta deletion-vector sidecars from object storage
+* *THEN* the UDF SHALL read those delete payloads through the SAME registered object store used for the data files OF THAT SIDE, configured from that side's RESOLVED backend credentials
 * *AND* on a join spec, the dimension side's delete files SHALL be read with the DIMENSION side's credentials and the fact side's with the FACT side's, never one side's delete files with the other side's credentials
 * *AND* the UDF MUST NOT re-authenticate to the catalog, re-request vended credentials, or resolve the referenced CONNECTION a second time to read a delete file, because the one per-invocation resolution already supplied it
 * *AND* a credential value MUST NOT appear in any error message the UDF returns while reading a delete file, for whichever side's delete file failed

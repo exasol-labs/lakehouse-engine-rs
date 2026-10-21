@@ -54,7 +54,7 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 * *AND* the reconstituted `ScanSpec` MUST NOT carry any catalog identifier field, because the scan UDF never contacts the catalog
 * *AND* the merge SHALL follow these same rules for arguments produced by EITHER format reader, because the table root and each entry's byte size are neutral values both populate
 
-### Scenario: Reconstitution carries per-file positional-delete references
+### Scenario: Reconstitution carries per-file delete references
 
 * *GIVEN* a scan invocation whose second argument is a JSON array of per-shard file entries, each carrying a data-file path, its byte size, and zero or more associated delete mechanisms (an Iceberg positional-delete reference carrying a path, byte size, and delete content type, or an Iceberg deletion-vector reference that also carries its blob's offset, length, and cardinality)
 * *WHEN* the scan UDF parses its two input arguments

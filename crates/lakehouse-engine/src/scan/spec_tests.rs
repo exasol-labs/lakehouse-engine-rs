@@ -1741,7 +1741,7 @@ fn deletion_vector_storage_kind_outside_the_closed_set_is_refused() {
 }
 
 #[test]
-fn a_file_entry_mixing_a_deletion_vector_with_an_iceberg_delete_reference_is_refused() {
+fn a_file_entry_mixing_a_delta_deletion_vector_with_an_iceberg_delete_reference_is_refused() {
     let json = r#"[
         ["clean.parquet", 1],
         ["contested.parquet", 2, [
@@ -2083,7 +2083,7 @@ fn a_nested_descriptor_round_trips_every_container_kind_at_depth() {
     }
 }
 
-/// Scenario: Reconstitution carries per-file positional-delete references
+/// Scenario: Reconstitution carries per-file delete references
 #[test]
 fn iceberg_blob_coordinates_are_refused_unless_the_entry_is_a_deletion_vector() {
     for json in [

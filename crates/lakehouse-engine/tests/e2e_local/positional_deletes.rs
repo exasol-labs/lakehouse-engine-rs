@@ -478,7 +478,7 @@ fn e2e_deletes_with_single_and_grouped_agg() {
     );
 }
 
-/// Scenario: Positional-delete file references are carried in the per-shard files argument
+/// Scenario: Delete-file references are carried in the per-shard files argument
 #[test]
 fn fixture_spark_deletion_vector_table() {
     setup_e2e();
