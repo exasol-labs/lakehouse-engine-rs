@@ -288,11 +288,13 @@ fn puffin_vector(
     cardinality: u64,
 ) -> Result<PuffinDeletionVector<'static>, UdfError> {
     PuffinDeletionVector::resolve(
-        "dv.puffin",
-        file_size,
-        offset,
-        length,
-        cardinality,
+        ManifestDeletionVector {
+            path: "dv.puffin",
+            size: file_size,
+            content_offset: offset,
+            content_size_in_bytes: length,
+            record_count: cardinality,
+        },
         &data_file(),
         &secrets(),
     )
@@ -309,7 +311,13 @@ fn decode_puffin_blob(blob: &[u8], cardinality: u64) -> Result<RoaringTreemap, U
 fn puffin_blob_decodes_to_the_same_positions_as_its_delta_twin() {
     let range = PUFFIN_BLOB_RANGE;
     let blob = &SIDECAR_BODY[range.start as usize..range.end as usize];
-    let vector = puffin_vector(SIDECAR_BODY.len() as u64, range.start, 44, 2).unwrap();
+    let vector = puffin_vector(
+        SIDECAR_BODY.len() as u64,
+        range.start,
+        range.end - range.start,
+        2,
+    )
+    .unwrap();
     assert_eq!(vector.range, range);
 
     assert_eq!(

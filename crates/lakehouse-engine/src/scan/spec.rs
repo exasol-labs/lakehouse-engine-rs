@@ -461,7 +461,7 @@ impl DeleteMechanism {
         }
     }
 
-    /// `None` for a deletion vector, which is resolved at file registration and never
+    /// `None` for a Delta deletion vector, which is resolved at file registration and never
     /// addressed from the delete list, whatever its value looks like. Callers treating a delete
     /// as an addressable file ask here, so that refusal is stated once.
     pub fn object_store_path(&self) -> Option<&str> {

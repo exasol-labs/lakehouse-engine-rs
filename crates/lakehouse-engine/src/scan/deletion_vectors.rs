@@ -181,6 +181,17 @@ fn table_root_url(table_root: &str) -> Result<Url, String> {
     Url::parse(&base).map_err(|e| format!("the scan's table root is not a URL: {e}"))
 }
 
+/// A Puffin deletion vector's manifest coordinates, as the scan spec carries them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ManifestDeletionVector<'a> {
+    pub(crate) path: &'a str,
+    /// The Puffin file's size; a blob range reaching past it is refused before any fetch.
+    pub(crate) size: u64,
+    pub(crate) content_offset: u64,
+    pub(crate) content_size_in_bytes: u64,
+    pub(crate) record_count: u64,
+}
+
 /// One `deletion-vector-v1` blob inside a Puffin file that may hold many data files' vectors.
 #[derive(Debug, Clone)]
 pub(crate) struct PuffinDeletionVector<'a> {
@@ -190,16 +201,18 @@ pub(crate) struct PuffinDeletionVector<'a> {
 }
 
 impl<'a> PuffinDeletionVector<'a> {
-    /// `size` is the Puffin file's size; a blob range reaching past it is refused before any fetch.
     pub(crate) fn resolve(
-        path: &'a str,
-        size: u64,
-        content_offset: u64,
-        content_size_in_bytes: u64,
-        record_count: u64,
+        manifest: ManifestDeletionVector<'a>,
         data_file_path: &str,
         secrets: &[String],
     ) -> Result<Self, UdfError> {
+        let ManifestDeletionVector {
+            path,
+            size,
+            content_offset,
+            content_size_in_bytes,
+            record_count,
+        } = manifest;
         let end = content_offset
             .checked_add(content_size_in_bytes)
             .filter(|end| *end <= size)

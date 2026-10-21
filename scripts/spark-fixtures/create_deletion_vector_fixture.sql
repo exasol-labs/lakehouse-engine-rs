@@ -5,12 +5,9 @@
 --     B id 11..=20      deletion vector {15}, replaced by {15, 17}
 --     C id 1001..=200000 deletion vector {id % 3 = 0} plus 150000..=160000
 --   A's and C's vectors share one Puffin file; B's replacement sits in another.
---   rest_catalog.e2e_lakehouse.unsupported_format:
---     id 1..=10 Parquet, id 21..=30 ORC
 
 CREATE NAMESPACE IF NOT EXISTS rest_catalog.e2e_lakehouse;
 
-DROP TABLE IF EXISTS rest_catalog.e2e_lakehouse.mor_dv_unsupported;
 DROP TABLE IF EXISTS rest_catalog.e2e_lakehouse.mor_dv;
 
 CREATE TABLE rest_catalog.e2e_lakehouse.mor_dv (
@@ -49,20 +46,3 @@ WHERE id IN (5, 15)
    OR (id > 1000 AND (id % 3 = 0 OR id BETWEEN 150000 AND 160000));
 
 DELETE FROM rest_catalog.e2e_lakehouse.mor_dv WHERE id = 17;
-
-DROP TABLE IF EXISTS rest_catalog.e2e_lakehouse.unsupported_format;
-
-CREATE TABLE rest_catalog.e2e_lakehouse.unsupported_format (
-  id  BIGINT,
-  val STRING
-)
-USING iceberg;
-
-INSERT INTO rest_catalog.e2e_lakehouse.unsupported_format
-SELECT /*+ REPARTITION(1) */ id, printf('row-%02d', id) FROM range(1, 11) AS t(id);
-
-ALTER TABLE rest_catalog.e2e_lakehouse.unsupported_format
-SET TBLPROPERTIES ('write.format.default' = 'orc');
-
-INSERT INTO rest_catalog.e2e_lakehouse.unsupported_format
-SELECT /*+ REPARTITION(1) */ id, printf('row-%02d', id) FROM range(21, 31) AS t(id);

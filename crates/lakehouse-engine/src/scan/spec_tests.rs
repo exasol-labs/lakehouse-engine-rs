@@ -2082,6 +2082,7 @@ fn a_nested_descriptor_round_trips_every_container_kind_at_depth() {
     }
 }
 
+/// Scenario: Reconstitution carries per-file positional-delete references
 #[test]
 fn iceberg_blob_coordinates_are_refused_unless_the_entry_is_a_deletion_vector() {
     for json in [

@@ -59,6 +59,7 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 * *WHEN* the scan UDF parses its two input arguments
 * *THEN* the UDF SHALL deserialize each file entry together with its associated delete mechanisms and MERGE them into one scan spec whose per-shard files (with deletes) come from the second argument and whose every other field comes from the first
 * *AND* each Iceberg positional-delete member SHALL deserialize from, and re-serialize to, its pre-#342 `{"path":…,"size":…,"content_type":"position_deletes"}` encoding with its key order unchanged, so every committed 3-tuple golden encoding passes unedited
+* *AND* an Iceberg deletion-vector member SHALL carry `content_offset`, `content_size_in_bytes`, and `record_count` after those three keys, and a member that carries any of them without being a deletion vector, or is a deletion vector missing one, SHALL fail with an error identifying scan-files deserialization
 * *AND* the merge SHALL store each data-file and delete-file path verbatim (relative or absolute) without resolving it, so path reconstruction is deferred to file registration
 * *AND* the reconstituted scan spec MUST NOT carry any catalog identifier field, because the scan UDF never contacts the catalog
 

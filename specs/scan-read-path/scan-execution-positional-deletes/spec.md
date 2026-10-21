@@ -54,22 +54,21 @@ positional-delete case (tracked as issue #68).
   scenario count crossed this library's per-spec organization threshold. This feature specifies WHAT
   the pipeline removes and how mechanisms compose; the sibling feature specifies the I/O SHAPE of
   reading delete files and data-file footers.
-* **This delta is issue #342 and changes no applied-delete behavior.** A data file's delete list stops
-  being an Iceberg-only list of delete-FILE references and becomes one format-neutral list of delete
-  MECHANISMS, each naming itself. The scan reads that one list and dispatches on the variant, so it
-  never asks which table format produced the spec.
+* **A data file's delete list is one format-neutral list of delete MECHANISMS, each naming itself
+  (#342).** The scan reads that one list and dispatches on the variant, so it never asks which
+  table format produced the spec.
 * **Three variants are applied and every other variant is refused.** The Iceberg positional-delete
   variant keeps the whole read-once, concurrent, row-group-pruned pipeline unchanged. The Delta
   deletion-vector variant (issue #320) and the Iceberg deletion-vector variant (issue #12) join it:
   every mechanism feeds the same accumulated data-file-path → deleted-position map and the same
   access-plan pipeline, dispatching on the mechanism's own variant rather than the table format.
   The Iceberg equality-delete variant keeps its refusal.
-* **This delta changes no Iceberg behavior.** The two-phase pipeline, the shared limiter, the
-  row-selection builder, and the access-plan builder are unchanged. What changed is which delete
-  mechanisms reach that pipeline: the Delta deletion vector now does, and its refusal arm is gone.
-  The Delta side of the pipeline — descriptor resolution, sidecar fetching, and bitmap decoding —
-  is specified in `scan-read-path/scan-execution-delta-deletion-vectors`; this feature specifies
-  only what the SHARED pipeline guarantees once both mechanisms feed it.
+* **The shared pipeline is mechanism-agnostic.** The two-phase pipeline, the shared limiter, the
+  row-selection builder, and the access-plan builder are the same for every applied mechanism.
+  Each deletion-vector side (descriptor or blob resolution, payload fetching, and bitmap decoding)
+  is specified in `scan-read-path/scan-execution-delta-deletion-vectors` and
+  `scan-read-path/scan-execution-iceberg-deletion-vectors`. This feature specifies only what the
+  SHARED pipeline guarantees once all three mechanisms feed it.
 
 ## Scenarios
 

@@ -6,7 +6,9 @@
 //! `PartitionedFile`, so DataFusion's opener intersects predicate/row-group/page pruning on
 //! top and deletes compose with pushdown.
 
-use crate::scan::deletion_vectors::{DeletionVector, LoggedDeletionVector, PuffinDeletionVector};
+use crate::scan::deletion_vectors::{
+    DeletionVector, LoggedDeletionVector, ManifestDeletionVector, PuffinDeletionVector,
+};
 use crate::scan::diagnostics;
 use crate::scan::parquet_reader::SizedParquetReader;
 use crate::scan::partition_values::PartitionedScanSchema;
@@ -32,6 +34,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use exasol_udf_sdk::error::UdfError;
 use futures::StreamExt;
 use futures::future::try_join_all;
+use object_store::path::Path as ObjectPath;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
@@ -39,6 +42,7 @@ use parquet::file::metadata::{PageIndexPolicy, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use url::Url;
@@ -191,12 +195,12 @@ fn applicable_delete_mechanism<'a>(
     table_root: &str,
     secrets: &[String],
 ) -> Result<ApplicableDelete<'a>, UdfError> {
-    let (path, mechanism) = match delete {
+    match delete {
         DeleteMechanism::IcebergPositionalDelete { path, size } => {
-            return Ok(ApplicableDelete::PositionalDeleteFile {
+            Ok(ApplicableDelete::PositionalDeleteFile {
                 path: path.as_str(),
                 size: *size,
-            });
+            })
         }
         DeleteMechanism::DeltaDeletionVector {
             storage,
@@ -204,47 +208,78 @@ fn applicable_delete_mechanism<'a>(
             offset,
             size_in_bytes,
             cardinality,
-        } => {
-            let vector = DeletionVector::resolve(
-                LoggedDeletionVector {
-                    storage: *storage,
-                    path_or_inline_dv,
-                    offset: *offset,
-                    size_in_bytes: *size_in_bytes,
-                    cardinality: *cardinality,
-                },
-                table_root,
-                data_file_path,
-                secrets,
-            )?;
-            return Ok(ApplicableDelete::DeletionVector(vector));
-        }
+        } => DeletionVector::resolve(
+            LoggedDeletionVector {
+                storage: *storage,
+                path_or_inline_dv,
+                offset: *offset,
+                size_in_bytes: *size_in_bytes,
+                cardinality: *cardinality,
+            },
+            table_root,
+            data_file_path,
+            secrets,
+        )
+        .map(ApplicableDelete::DeletionVector),
         DeleteMechanism::IcebergPuffinDeletionVector {
             path,
             size,
             content_offset,
             content_size_in_bytes,
             record_count,
-        } => {
-            let vector = PuffinDeletionVector::resolve(
+        } => PuffinDeletionVector::resolve(
+            ManifestDeletionVector {
                 path,
-                *size,
-                *content_offset,
-                *content_size_in_bytes,
-                *record_count,
-                data_file_path,
-                secrets,
-            )?;
-            return Ok(ApplicableDelete::PuffinDeletionVector(vector));
+                size: *size,
+                content_offset: *content_offset,
+                content_size_in_bytes: *content_size_in_bytes,
+                record_count: *record_count,
+            },
+            data_file_path,
+            secrets,
+        )
+        .map(ApplicableDelete::PuffinDeletionVector),
+        DeleteMechanism::IcebergEqualityDelete { path, .. } => {
+            let path = redact(path.clone(), secrets);
+            Err(UdfError::User(format!(
+                "assigned delete file '{path}' is an Iceberg equality delete, which this engine \
+                 cannot apply on read (only Iceberg Parquet positional deletes and deletion \
+                 vectors are supported); refusing to emit rows for the affected data file"
+            )))
         }
-        DeleteMechanism::IcebergEqualityDelete { path, .. } => (path, "an Iceberg equality delete"),
+    }
+}
+
+/// Runs `read` against `url` under one permit of the shared limiter. A failure names
+/// `data_file`, because a deletion vector has no identity of its own.
+async fn read_deletion_vector_payload<T, Fut>(
+    store: &Arc<dyn ObjectStore>,
+    limiter: &Semaphore,
+    url: &str,
+    data_file: &str,
+    secrets: &[String],
+    read: impl FnOnce(Arc<dyn ObjectStore>, ObjectPath) -> Fut,
+) -> Result<T, UdfError>
+where
+    Fut: Future<Output = object_store::Result<T>>,
+{
+    let unreadable = |e: String| {
+        UdfError::User(redact(
+            format!("data file '{data_file}': its deletion vector could not be read: {e}"),
+            secrets,
+        ))
     };
-    let path = redact(path.clone(), secrets);
-    Err(UdfError::User(format!(
-        "assigned delete file '{path}' is {mechanism}, which this engine cannot apply on read \
-         (only Iceberg Parquet positional deletes and deletion vectors are supported); \
-         refusing to emit rows for the affected data file"
-    )))
+    let _permit = limiter
+        .acquire()
+        .await
+        .map_err(|e| unreadable(format!("delete-read limiter unavailable: {e}")))?;
+    let location = ListingTableUrl::parse(url)
+        .map_err(|e| unreadable(format!("invalid deletion-vector URL: {e}")))?
+        .prefix()
+        .clone();
+    read(Arc::clone(store), location)
+        .await
+        .map_err(|e| unreadable(e.to_string()))
 }
 
 /// Field-id is authoritative; the spec column names are the fallback.
@@ -482,7 +517,7 @@ impl PositionalDeleteScanTable {
     }
 
     /// Every mechanism passes [`applicable_delete_mechanism`] BEFORE any I/O, so an unapplicable
-    /// one fails before anything is fetched. The two fan-outs share one limiter; `RoaringTreemap`
+    /// one fails before anything is fetched. The three fan-outs share one limiter; `RoaringTreemap`
     /// union is commutative, so completion order cannot change the result.
     async fn collect_delete_positions(
         &self,
@@ -550,45 +585,48 @@ impl PositionalDeleteScanTable {
         Ok(merged)
     }
 
-    /// Fetches only each vector's blob range: one Puffin file holds the vectors of many data
-    /// files, and the blob is self-delimiting. Returns positions keyed by absolute data-file URI.
+    /// Reads each Puffin file once, fetching only the blob ranges this shard's data files need:
+    /// one Puffin file may hold the vectors of a whole table. Returns positions keyed by absolute
+    /// data-file URI.
     async fn read_puffin_deletion_vectors(
         &self,
         store: &Arc<dyn ObjectStore>,
         vectors: &[(&str, PuffinDeletionVector<'_>)],
     ) -> Result<Vec<(String, RoaringTreemap)>, UdfError> {
-        let reads = vectors.iter().map(|(data_file, vector)| {
-            let store = Arc::clone(store);
-            let limiter = Arc::clone(&self.delete_path_read_limiter);
-            let secrets = self.secrets.as_slice();
-            let table_root = self.table_root.as_str();
-            async move {
-                let unreadable = |e: String| {
-                    UdfError::User(redact(
-                        format!(
-                            "data file '{data_file}': its deletion vector could not be read: {e}"
-                        ),
-                        secrets,
-                    ))
-                };
-                let _permit = limiter
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| unreadable(format!("delete-read limiter unavailable: {e}")))?;
-                let puffin_abs = reconstruct_abs_uri(vector.path, table_root);
-                let location = ListingTableUrl::parse(&puffin_abs)
-                    .map_err(|e| unreadable(format!("invalid Puffin file URL: {e}")))?
-                    .prefix()
-                    .clone();
-                let blob = store
-                    .get_range(&location, vector.range.clone())
-                    .await
-                    .map_err(|e| unreadable(e.to_string()))?;
-                let positions = vector.decode(&blob, data_file, secrets)?;
-                Ok::<_, UdfError>((reconstruct_abs_uri(data_file, table_root), positions))
-            }
-        });
-        try_join_all(reads).await
+        let mut by_puffin_file: HashMap<&str, Vec<&(&str, PuffinDeletionVector<'_>)>> =
+            HashMap::new();
+        for vector in vectors {
+            by_puffin_file
+                .entry(vector.1.path)
+                .or_default()
+                .push(vector);
+        }
+
+        let reads = by_puffin_file
+            .into_iter()
+            .map(|(puffin_path, members)| async move {
+                let ranges: Vec<Range<u64>> =
+                    members.iter().map(|(_, v)| v.range.clone()).collect();
+                // A shared Puffin file is named by its first referrer.
+                let blobs = read_deletion_vector_payload(
+                    store,
+                    &self.delete_path_read_limiter,
+                    &reconstruct_abs_uri(puffin_path, &self.table_root),
+                    members[0].0,
+                    &self.secrets,
+                    |store, location| async move { store.get_ranges(&location, &ranges).await },
+                )
+                .await?;
+                members
+                    .iter()
+                    .zip(blobs)
+                    .map(|((data_file, vector), blob)| {
+                        let positions = vector.decode(&blob, data_file, &self.secrets)?;
+                        Ok((reconstruct_abs_uri(data_file, &self.table_root), positions))
+                    })
+                    .collect::<Result<Vec<_>, UdfError>>()
+            });
+        Ok(try_join_all(reads).await?.into_iter().flatten().collect())
     }
 
     /// No HEAD: each [`ObjectMeta`] is built from the spec-supplied size.
@@ -632,36 +670,17 @@ impl PositionalDeleteScanTable {
             }
         }
 
-        let reads = unique.into_iter().map(|(url, data_file)| {
-            let store = Arc::clone(store);
-            let limiter = Arc::clone(&self.delete_path_read_limiter);
-            let secrets = self.secrets.as_slice();
-            async move {
-                let unreadable = |e: String| {
-                    UdfError::User(redact(
-                        format!(
-                            "data file '{data_file}': its deletion vector could not be read: {e}"
-                        ),
-                        secrets,
-                    ))
-                };
-                let _permit = limiter
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| unreadable(format!("delete-read limiter unavailable: {e}")))?;
-                let location = ListingTableUrl::parse(url.as_str())
-                    .map_err(|e| unreadable(format!("invalid sidecar URL: {e}")))?
-                    .prefix()
-                    .clone();
-                let body = store
-                    .get(&location)
-                    .await
-                    .map_err(|e| unreadable(e.to_string()))?
-                    .bytes()
-                    .await
-                    .map_err(|e| unreadable(e.to_string()))?;
-                Ok::<_, UdfError>((url.clone(), body))
-            }
+        let reads = unique.into_iter().map(|(url, data_file)| async move {
+            let body = read_deletion_vector_payload(
+                store,
+                &self.delete_path_read_limiter,
+                url.as_str(),
+                data_file,
+                &self.secrets,
+                |store, location| async move { store.get(&location).await?.bytes().await },
+            )
+            .await?;
+            Ok::<_, UdfError>((url.clone(), body))
         });
         Ok(try_join_all(reads).await?.into_iter().collect())
     }

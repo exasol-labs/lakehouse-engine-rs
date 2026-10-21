@@ -10,6 +10,8 @@
 
 An Iceberg `deletion-vector-v1` blob has the same byte layout as one Delta deletion vector, and the engine already decodes Delta vectors with `delta_kernel`.
 
+Applying deletion vectors widens the support set that `unsupported-deletes-classified-from-planned-tasks` states in its context. That ADR's classification still decides what the adapter refuses.
+
 ### Decision
 
 The scan decodes Iceberg deletion vectors with iceberg-rust's public deletion-vector decoder and passes it only the fetched blob bytes.
@@ -23,5 +25,5 @@ The scan decodes Iceberg deletion vectors with iceberg-rust's public deletion-ve
 
 ### Consequences
 
-- The scan fetches only the blob's byte range, not the whole Puffin file.
+- The scan fetches only the blobs' byte ranges, not the whole Puffin file, and reads each Puffin file once per shard.
 - A change to the Iceberg blob format arrives with an iceberg-rust upgrade.

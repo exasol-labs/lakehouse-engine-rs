@@ -27,11 +27,11 @@ sizes, delete-file references, and logical schema feed the scan-driving SQL.
   delete files, or sizes itself. Only the READER behind that seam is format-specific. This
   feature owns the ICEBERG reader's half — the multi-level `TableIdent` build, the snapshot read,
   each file's byte size from the Iceberg manifest, and merge-on-read
-  positional-delete resolution; the Delta reader's half is owned by
+  positional-delete and deletion-vector resolution; the Delta reader's half is owned by
   `delta/delta-table-planning`.
 * An Iceberg table's logical schema comes from its column notes. `createVirtualSchema` builds each note from the table's `current_schema()` at that time: the column's Iceberg field-id, its name then, its Arrow type, its nullability, and its `initial-default`. The pushdown reader reads the current schema only to translate the filter for pruning (`file-planning/pushdown-file-pruning`) and to refuse a recorded `date` promotion.
 * Each per-shard file entry carries both the file path and its byte size, so the scan UDF never re-discovers a size the adapter already resolved.
-* The data-file list, each file's byte size, and each file's associated positional-delete files are resolved exactly once, at the same seam; the scan UDF never discovers files or delete files.
+* The data-file list, each file's byte size, and each file's associated positional-delete files and deletion vector are resolved exactly once, at the same seam; the scan UDF never discovers files or delete files.
 * Delete support keeps the wire surface minimal — per-file delete references only, with no serialized Iceberg schema and no bound predicate added to the spec.
 * **This feature is the single owner of the absent-table-location rule.** The rule was
   previously stated only inside `storage-access/pushdown-planning-cloud-credentials-vended-storage`' vended
@@ -165,10 +165,10 @@ sizes, delete-file references, and logical schema feed the scan-driving SQL.
 
 ### Scenario: Positional-delete file references are carried in the per-shard files argument
 
-* *GIVEN* a virtual schema over an Iceberg merge-on-read table backed by SeaweedFS, where `plan_files` associates each data file with its applicable Parquet positional-delete files (at `file` or `partition` granularity)
+* *GIVEN* a virtual schema over an Iceberg merge-on-read table backed by SeaweedFS, where `plan_files` associates each data file with its applicable Parquet positional-delete files (at `file` or `partition` granularity) or its deletion vector
 * *WHEN* Exasol sends the corresponding pushdown request
-* *THEN* the adapter SHALL resolve the data-file list, each file's byte size, and each file's associated positional-delete files exactly once, at the same resolve-once seam, and MUST NOT require the scan UDF to discover delete files itself
-* *AND* the adapter SHALL carry each data file's associated positional-delete file references (path, byte size, delete content type) in the per-shard files argument alongside the data-file entry, keeping the wire surface minimal — no serialized Iceberg schema and no bound predicate are added for delete support
+* *THEN* the adapter SHALL resolve the data-file list, each file's byte size, and each file's associated positional-delete files and deletion vector exactly once, at the same resolve-once seam, and MUST NOT require the scan UDF to discover delete files itself
+* *AND* the adapter SHALL carry each data file's associated positional-delete file references (path, byte size, delete content type) and deletion vector (the same keys plus the blob's offset and length and its cardinality) in the per-shard files argument alongside the data-file entry, keeping the wire surface minimal — no serialized Iceberg schema and no bound predicate are added for delete support
 * *AND* the shard-invariant common spec (logical schema, projection, filter, LIMIT, credentials, table root) SHALL be unchanged by delete support, so a delete-free table produces a byte-identical common spec to before this feature
 
 ### Scenario: File resolution rejects a loadTable response that carries no table location

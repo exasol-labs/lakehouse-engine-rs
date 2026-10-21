@@ -30,9 +30,11 @@ feature.
 * Delete positions and access plans are unchanged by the restructure: the delete set for a data file
   is fixed by Phase A, and Phase B's footer fetch reads only the per-row-group row counts, which are
   a property of the file rather than of the fetch order.
-* The Delta deletion-vector mechanism shares this same connection-budget limiter and read-once
-  discipline for its own sidecar fetches — see `scan-read-path/scan-execution-delta-deletion-vectors`
-  — but decodes a different container format, so its fan-out scenarios live there rather than here.
+* Both deletion-vector mechanisms share this same connection-budget limiter and read-once
+  discipline: the Delta mechanism for its sidecar fetches, and the Iceberg mechanism for its Puffin
+  blob reads. Each decodes its own container format, so their fan-out scenarios live in
+  `scan-read-path/scan-execution-delta-deletion-vectors` and
+  `scan-read-path/scan-execution-iceberg-deletion-vectors` rather than here.
 * See `scan-runtime/scan-execution-connection-concurrency` for the operator-facing budget knob
   itself (`s3_max_connections`); this feature governs how the positional-delete pipeline spends that
   budget, not how the budget is derived or configured.

@@ -242,8 +242,9 @@ fn reads_and_filters_delete_positions_by_file_path() {
     );
 }
 
+/// Scenario: An unapplicable delete file is rejected with a clean error (read-time backstop)
 #[test]
-fn only_iceberg_equality_and_puffin_delete_mechanisms_are_refused() {
+fn only_the_iceberg_equality_delete_mechanism_is_refused() {
     const SECRET: &str = "SECRETKEY";
     let secrets = [SECRET.to_string()];
     let table_root = format!("s3://{SECRET}@bucket/db/t");
@@ -578,8 +579,26 @@ fn logged_deletion_vector() -> DeleteMechanism {
     }
 }
 
+/// The sidecar's one vector is also a valid Iceberg `deletion-vector-v1` blob: both formats share
+/// the layout, so a Puffin file of two copies after the 4-byte magic holds two vectors.
+fn puffin_file_with_two_vectors() -> (Vec<u8>, [DeleteMechanism; 2]) {
+    let blob = &DV_SIDECAR_BODY[1..45];
+    let file = [b"PFA1".as_slice(), blob, blob].concat();
+    let vector = |content_offset| DeleteMechanism::IcebergPuffinDeletionVector {
+        path: "deletes/dv.puffin".to_string(),
+        size: file.len() as u64,
+        content_offset,
+        content_size_in_bytes: blob.len() as u64,
+        record_count: 2,
+    };
+    let vectors = [vector(4), vector(4 + blob.len() as u64)];
+    (file, vectors)
+}
+
+/// Scenario: All delete mechanisms converge on one position map and one access-plan pipeline
+/// Scenario: A Puffin file holding several of a shard's vectors is read once
 #[test]
-fn both_delete_mechanisms_converge_on_one_position_map() {
+fn all_delete_mechanisms_converge_on_one_position_map() {
     use object_store::memory::InMemory;
     use object_store::path::Path as StorePath;
     use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
@@ -588,6 +607,7 @@ fn both_delete_mechanisms_converge_on_one_position_map() {
     let iceberg_file = "memory:///db/t/data/iceberg.parquet";
     let delete_file_bytes = positional_delete_file_bytes(&[(iceberg_file, 3), (iceberg_file, 7)]);
     let delete_file_size = delete_file_bytes.len() as u64;
+    let (puffin_file, [puffin_a, puffin_b]) = puffin_file_with_two_vectors();
 
     let table = scan_table_over(
         vec![
@@ -600,6 +620,8 @@ fn both_delete_mechanisms_converge_on_one_position_map() {
             ),
             entry_with("data/delta_a.parquet", vec![logged_deletion_vector()]),
             entry_with("data/delta_b.parquet", vec![logged_deletion_vector()]),
+            entry_with("data/puffin_a.parquet", vec![puffin_a]),
+            entry_with("data/puffin_b.parquet", vec![puffin_b]),
             entry_with("data/no_deletes.parquet", Vec::new()),
         ],
         TABLE_ROOT,
@@ -610,8 +632,15 @@ fn both_delete_mechanisms_converge_on_one_position_map() {
         .enable_all()
         .build()
         .unwrap();
-    let (positions, reads) = rt.block_on(async move {
+    let (positions, reads, puffin_reads) = rt.block_on(async move {
         let inner = Arc::new(InMemory::new());
+        inner
+            .put(
+                &StorePath::from("db/t/deletes/dv.puffin"),
+                PutPayload::from(puffin_file),
+            )
+            .await
+            .unwrap();
         inner
             .put(
                 &StorePath::from("db/t/deletes/d.parquet"),
@@ -629,7 +658,11 @@ fn both_delete_mechanisms_converge_on_one_position_map() {
         let counting = Arc::new(CountingObjectStore::new(inner));
         let store: Arc<dyn ObjectStore> = Arc::clone(&counting) as Arc<dyn ObjectStore>;
         let positions = table.collect_delete_positions(&store).await.unwrap();
-        (positions, counting.reads_of(DV_SIDECAR_NAME))
+        (
+            positions,
+            counting.reads_of(DV_SIDECAR_NAME),
+            counting.reads_of("dv.puffin"),
+        )
     });
 
     assert_eq!(
@@ -663,6 +696,17 @@ fn both_delete_mechanisms_converge_on_one_position_map() {
     assert_eq!(
         reads, 1,
         "a sidecar shared by several data files is fetched once for the whole shard"
+    );
+    for data_file in ["puffin_a", "puffin_b"] {
+        assert_eq!(
+            positions.get(&format!("memory:///db/t/data/{data_file}.parquet")),
+            Some(delta_a),
+            "{data_file} gets its own blob's positions, which equal the sidecar's"
+        );
+    }
+    assert_eq!(
+        puffin_reads, 1,
+        "a Puffin file holding several of the shard's vectors is read in one request"
     );
 }
 
