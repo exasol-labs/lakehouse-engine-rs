@@ -135,8 +135,8 @@ object-store connection budget, and the same streaming `emit_batch` path as ever
 
 ### Scenario: The decoder is handed bytes and never a live storage client
 
-* *GIVEN* the scan UDF's deletion-vector pipeline, which fetches every sidecar it needs on the scan's
-  own asynchronous, budget-bounded path before decoding anything
+* *GIVEN* the scan UDF's deletion-vector pipeline, which fetches each sidecar on the scan's own
+  asynchronous, budget-bounded path before it decodes any descriptor that names that sidecar
 * *WHEN* the UDF invokes the `delta_kernel` deletion-vector decoder for a descriptor
 * *THEN* the UDF SHALL satisfy the decoder's storage dependency with a read-only adapter that serves
   the ALREADY-FETCHED bytes from memory, so decoding performs no I/O, opens no object store, and

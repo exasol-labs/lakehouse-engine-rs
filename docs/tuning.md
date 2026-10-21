@@ -37,6 +37,8 @@ The adapter qualifies its calls to these scripts from its own running-script sch
 
 **Pool sizing:** `pool = MEMORY_POOL_FRACTION × (memory_limit − INSTANCE_OVERHEAD_MB)`. When the per-instance limit is reported as 0 (unknown), a conservative default budget applies instead.
 
+**Tables with deletes:** A scan of a table with positional deletes or deletion vectors holds its deleted row positions and row selections in this pool until the scan finishes, and that memory cannot spill. When a shard's delete state does not fit, the query fails with `the row-position delete state does not fit the memory pool`. Raise `PARALLELISM_FACTOR` so each shard holds fewer data files, or raise `MEMORY_POOL_FRACTION`. Reading and decoding the deletes runs on the scan's worker threads, so `DATAFUSION_THREADS_PER_UDF` also speeds up the delete preparation.
+
 **Quick recommendation:** For read-bound remote scans, set `DATAFUSION_THREADING_MODE='FIXED'`, `DATAFUSION_THREADS_PER_UDF='<detected core count>'`, and `DATAFUSION_TARGET_PARTITIONS='<detected core count>'`. These values are ~39 % faster than the `AUTO` default on a full scan.
 
 ### `S3_MAX_CONNECTIONS`

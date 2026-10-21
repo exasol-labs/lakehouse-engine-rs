@@ -7,7 +7,7 @@ use crate::scan::parquet_reader::object_meta_for;
 use crate::scan::partition_values::PartitionedScanSchema;
 use crate::scan::raw_scan::scan_table_parquet_format;
 use crate::scan::row_deletes::{
-    ShardDeletes, access_plan_bytes, build_access_plan, join_spawned, redact,
+    ShardDeletes, access_plan_bytes, build_access_plan, join_spawned, redact, reserve,
 };
 use crate::scan::spec::{FileEntry, StorageBackend};
 use crate::scan::{FieldIdExprAdapterFactory, FieldIdResolution, reconstruct_abs_uri};
@@ -100,8 +100,8 @@ impl ParquetScanTable {
     /// fetched footer is recorded via [`diagnostics::record_access_plan_cached_footer`] so a
     /// cache eviction is observable.
     ///
-    /// The position maps and the access plans are reserved in the session memory pool, so a shard
-    /// whose delete state outgrows the pool fails cleanly instead of exhausting the instance.
+    /// The position sets are reserved in the session memory pool as they decode, and the access
+    /// plans as they are built, so a shard whose delete state outgrows the pool fails mid-build.
     ///
     /// [`FileMetadataCache`]: datafusion::execution::cache::cache_manager::FileMetadataCache
     async fn partitioned_files(
@@ -142,11 +142,20 @@ impl ParquetScanTable {
             })
             .collect::<Result<Vec<_>, UdfError>>()?;
 
+        if self.files.iter().all(|entry| entry.deletes.is_empty()) {
+            return Ok(files);
+        }
+        let reservation = Arc::new(
+            MemoryConsumer::new("row-position deletes").register(&state.runtime_env().memory_pool),
+        );
+        let size_hint = self.format.metadata_size_hint();
         let delete_positions = ShardDeletes {
             files: &self.files,
             table_root: &self.table_root,
             secrets: Arc::clone(&self.secrets),
             limiter: Arc::clone(&self.delete_path_read_limiter),
+            reservation: Arc::clone(&reservation),
+            metadata_size_hint: size_hint,
         }
         .collect_positions(&store)
         .await?;
@@ -154,21 +163,13 @@ impl ParquetScanTable {
             return Ok(files);
         }
 
-        let reservation = Arc::new(
-            MemoryConsumer::new("row-position deletes").register(&state.runtime_env().memory_pool),
-        );
-        let positions_bytes = delete_positions
-            .values()
-            .map(RoaringTreemap::serialized_size)
-            .sum();
-        reserve(&reservation, positions_bytes, &self.secrets)?;
+        let positions_bytes = reservation.size();
         let delete_positions: HashMap<String, Arc<RoaringTreemap>> = delete_positions
             .into_iter()
             .filter(|(_, positions)| !positions.is_empty())
             .map(|(path, positions)| (path, Arc::new(positions)))
             .collect();
 
-        let size_hint = self.format.metadata_size_hint();
         let builds = files
             .iter()
             .zip(&abs_paths)
@@ -225,19 +226,6 @@ impl ParquetScanTable {
         }
         Ok(files)
     }
-}
-
-fn reserve(
-    reservation: &MemoryReservation,
-    bytes: usize,
-    secrets: &[String],
-) -> Result<(), UdfError> {
-    reservation.try_grow(bytes).map_err(|e| {
-        UdfError::User(redact(
-            format!("the row-position delete state does not fit the memory pool: {e}"),
-            secrets,
-        ))
-    })
 }
 
 #[async_trait]

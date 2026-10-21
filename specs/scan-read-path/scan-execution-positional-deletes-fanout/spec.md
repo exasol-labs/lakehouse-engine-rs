@@ -44,6 +44,7 @@ specified in `scan-read-path/scan-execution-positional-deletes`.
 * *GIVEN* a positional-delete file with several row groups that can hold an assigned data file's deletes
 * *WHEN* the scan UDF reads that delete file
 * *THEN* the UDF SHALL read the footer first, then each such row group as its own request under its own permit of the shared limiter, so the row groups are read concurrently up to N in flight
+* *AND* the UDF SHALL read the footer with the format's metadata size hint, so a footer and metadata that fit the hint cost ONE ranged GET rather than a footer GET followed by a metadata GET
 * *AND* the UDF SHALL read only the `file_path` and `pos` columns, never the optional `row` column
 
 ### Scenario: Row groups that cannot contain an assigned data file's deletes are skipped

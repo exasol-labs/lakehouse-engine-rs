@@ -6,7 +6,8 @@
 //! [`ParquetAccessPlan`], so DataFusion's opener intersects predicate/row-group/page pruning on top
 //! and deletes compose with pushdown. Every read and decode is a top-level [`join_spawned`] task,
 //! so a multi-thread runtime spreads the work across its workers. Only the orchestrating call awaits
-//! tasks, so no permit holder ever waits on another task.
+//! tasks, so no permit holder ever waits on another task. Phase A reserves each set in the memory
+//! pool as it grows, so no unreserved copy of the positions outlives one decoded batch.
 
 use crate::scan::deletion_vectors::{
     DeltaDeletionVector, IcebergDeletionVector, LoggedDeletionVector, ManifestDeletionVector,
@@ -19,6 +20,7 @@ use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
+use datafusion::execution::memory_pool::MemoryReservation;
 use exasol_udf_sdk::error::UdfError;
 use futures::StreamExt;
 use futures::future::BoxFuture;
@@ -31,6 +33,7 @@ use parquet::arrow::async_reader::{ParquetRecordBatchStream, ParquetRecordBatchS
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics;
 use roaring::RoaringTreemap;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
@@ -88,6 +91,34 @@ async fn acquire(limiter: &Semaphore) -> Result<SemaphorePermit<'_>, UdfError> {
         .acquire()
         .await
         .map_err(|e| UdfError::User(format!("delete-read limiter unavailable: {e}")))
+}
+
+pub(super) fn reserve(
+    reservation: &MemoryReservation,
+    bytes: usize,
+    secrets: &[String],
+) -> Result<(), UdfError> {
+    reservation.try_grow(bytes).map_err(|e| {
+        UdfError::User(redact(
+            format!("the row-position delete state does not fit the memory pool: {e}"),
+            secrets,
+        ))
+    })
+}
+
+/// Moves `reservation` from the `before` bytes it holds for a set to the set's `after` size.
+fn track(
+    reservation: &MemoryReservation,
+    before: usize,
+    after: usize,
+    secrets: &[String],
+) -> Result<(), UdfError> {
+    if after > before {
+        reserve(reservation, after - before, secrets)
+    } else {
+        reservation.shrink(before - after);
+        Ok(())
+    }
 }
 
 /// Every variant feeds ONE position map, so nothing downstream learns which mechanism produced
@@ -262,15 +293,18 @@ struct OpenedDeleteFile {
 
 /// Restricted to `assigned` because one partition-granularity delete file references many data
 /// files. Row groups whose `file_path` range cannot overlap are skipped, exploiting Iceberg's
-/// required (`file_path`, `pos`) sort. No HEAD is issued.
+/// required (`file_path`, `pos`) sort. No HEAD is issued, and a footer that fits
+/// `metadata_size_hint` costs one GET.
 async fn open_delete_file(
     store: Arc<dyn ObjectStore>,
     delete_meta: ObjectMeta,
+    metadata_size_hint: Option<usize>,
     assigned: &HashSet<String>,
     secrets: &[String],
     limiter: &Semaphore,
 ) -> Result<OpenedDeleteFile, UdfError> {
-    let mut reader = SizedParquetReader::new(store, delete_meta.location, delete_meta.size);
+    let mut reader = SizedParquetReader::new(store, delete_meta.location, delete_meta.size)
+        .with_metadata_size_hint(metadata_size_hint);
     let metadata = {
         let _permit = acquire(limiter).await?;
         ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::new())
@@ -304,7 +338,8 @@ impl OpenedDeleteFile {
         assigned: &Arc<HashSet<String>>,
         secrets: &Arc<[String]>,
         limiter: &Arc<Semaphore>,
-    ) -> Vec<Read<HashMap<String, Vec<u64>>>> {
+        reservation: &Arc<MemoryReservation>,
+    ) -> Vec<Read<HashMap<String, RoaringTreemap>>> {
         self.row_groups
             .iter()
             .map(|&row_group| {
@@ -318,12 +353,13 @@ impl OpenedDeleteFile {
                 let assigned = Arc::clone(assigned);
                 let secrets = Arc::clone(secrets);
                 let limiter = Arc::clone(limiter);
+                let reservation = Arc::clone(reservation);
                 let read: Read<_> = Box::pin(async move {
                     let _permit = acquire(&limiter).await?;
                     let stream = builder.build().map_err(|e| {
                         UdfError::User(redact(format!("failed to read delete file: {e}"), &secrets))
                     })?;
-                    row_group_positions(stream, &assigned, &secrets).await
+                    row_group_positions(stream, &assigned, &reservation, &secrets).await
                 });
                 read
             })
@@ -331,54 +367,48 @@ impl OpenedDeleteFile {
     }
 }
 
-/// Builds one set per data file, each in its own task. Positions normally arrive sorted per the
-/// Iceberg spec; sort + dedup keeps the bulk `from_sorted_iter` build robust to deviations.
+/// Unions each data file's per-row-group sets, one task per data file.
 async fn delete_file_positions(
-    row_groups: Vec<HashMap<String, Vec<u64>>>,
+    row_groups: Vec<HashMap<String, RoaringTreemap>>,
+    reservation: &Arc<MemoryReservation>,
+    secrets: &Arc<[String]>,
 ) -> Result<Positions, UdfError> {
-    let mut positions_by_data_file: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut sets_by_data_file: HashMap<String, Vec<RoaringTreemap>> = HashMap::new();
     for row_group in row_groups {
-        for (path, mut positions) in row_group {
-            positions_by_data_file
-                .entry(path)
-                .or_default()
-                .append(&mut positions);
+        for (path, positions) in row_group {
+            sets_by_data_file.entry(path).or_default().push(positions);
         }
     }
-    join_spawned(
-        positions_by_data_file
-            .into_iter()
-            .map(|(path, mut positions)| async move {
-                positions.sort_unstable();
-                positions.dedup();
-                let treemap = RoaringTreemap::from_sorted_iter(positions).map_err(|e| {
-                    UdfError::User(format!(
-                        "failed to build positional-delete set for a data file: {e}"
-                    ))
-                })?;
-                Ok((path, treemap))
-            }),
-    )
+    join_spawned(sets_by_data_file.into_iter().map(|(path, sets)| {
+        let reservation = Arc::clone(reservation);
+        let secrets = Arc::clone(secrets);
+        async move {
+            let before = sets.iter().map(RoaringTreemap::serialized_size).sum();
+            let union = sets
+                .into_iter()
+                .fold(RoaringTreemap::new(), |mut union, set| {
+                    union |= set;
+                    union
+                });
+            track(&reservation, before, union.serialized_size(), &secrets)?;
+            Ok((path, union))
+        }
+    }))
     .await
 }
 
-/// The file is sorted by `file_path`, so one run of equal paths costs one set lookup.
+/// The file is sorted by `file_path`, so one run of equal paths costs one set lookup. Each batch's
+/// positions join their set before the next batch decodes, so the reservation follows the sets as
+/// they grow and an oversized delete set fails mid-read.
 async fn row_group_positions(
     mut stream: ParquetRecordBatchStream<SizedParquetReader>,
     assigned: &HashSet<String>,
+    reservation: &MemoryReservation,
     secrets: &[String],
-) -> Result<HashMap<String, Vec<u64>>, UdfError> {
+) -> Result<HashMap<String, RoaringTreemap>, UdfError> {
     let (file_path_idx, pos_idx) = locate_delete_columns(stream.schema())?;
-    let mut positions_by_data_file: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut positions_by_data_file: HashMap<String, RoaringTreemap> = HashMap::new();
     let mut run: Option<(String, Option<Vec<u64>>)> = None;
-    let mut flush = |run: Option<(String, Option<Vec<u64>>)>| {
-        if let Some((path, Some(mut positions))) = run {
-            positions_by_data_file
-                .entry(path)
-                .or_default()
-                .append(&mut positions);
-        }
-    };
 
     while let Some(batch) = stream.next().await {
         let batch = batch.map_err(|e| {
@@ -418,7 +448,15 @@ async fn row_group_positions(
             }
             let Some(path) = path_at(row) else { continue };
             if run.as_ref().is_none_or(|(current, _)| current != path) {
-                flush(run.take());
+                if let Some((ended, Some(bucket))) = run.as_mut() {
+                    add_positions(
+                        &mut positions_by_data_file,
+                        ended,
+                        bucket,
+                        reservation,
+                        secrets,
+                    )?;
+                }
                 run = Some((path.to_string(), assigned.contains(path).then(Vec::new)));
             }
             let Some((_, Some(bucket))) = run.as_mut() else {
@@ -434,9 +472,52 @@ async fn row_group_positions(
             }
             bucket.push(pos as u64);
         }
+        if let Some((path, Some(bucket))) = run.as_mut() {
+            add_positions(
+                &mut positions_by_data_file,
+                path,
+                bucket,
+                reservation,
+                secrets,
+            )?;
+        }
     }
-    flush(run);
     Ok(positions_by_data_file)
+}
+
+/// Drains `positions` into `path`'s set. Positions normally arrive sorted per the Iceberg spec and
+/// append in bulk; sort + dedup keeps a deviating file correct.
+fn add_positions(
+    sets: &mut HashMap<String, RoaringTreemap>,
+    path: &str,
+    positions: &mut Vec<u64>,
+    reservation: &MemoryReservation,
+    secrets: &[String],
+) -> Result<(), UdfError> {
+    if positions.is_empty() {
+        return Ok(());
+    }
+    positions.sort_unstable();
+    positions.dedup();
+    // A new set starts from zero reserved bytes, so the reservation equals the sets' sizes.
+    let (set, before) = match sets.entry(path.to_string()) {
+        Entry::Occupied(slot) => {
+            let set = slot.into_mut();
+            let before = set.serialized_size();
+            (set, before)
+        }
+        Entry::Vacant(slot) => (slot.insert(RoaringTreemap::new()), 0),
+    };
+    if set.max().is_none_or(|max| positions[0] > max) {
+        set.append(positions.drain(..)).map_err(|e| {
+            UdfError::User(format!(
+                "failed to build positional-delete set for a data file: {e}"
+            ))
+        })?;
+    } else {
+        set.extend(positions.drain(..));
+    }
+    track(reservation, before, set.serialized_size(), secrets)
 }
 
 /// One pass over `deletes`, cut at row-group boundaries as it goes, so the cost does not grow
@@ -521,6 +602,9 @@ pub(super) struct ShardDeletes<'a> {
     /// Shared by every provider of one invocation (both join sides included), so the whole
     /// instance stays within one N-permit budget.
     pub(super) limiter: Arc<Semaphore>,
+    /// Grown as positions decode, so it holds the returned sets' serialized size.
+    pub(super) reservation: Arc<MemoryReservation>,
+    pub(super) metadata_size_hint: Option<usize>,
 }
 
 impl ShardDeletes<'_> {
@@ -528,6 +612,7 @@ impl ShardDeletes<'_> {
     /// one fails before anything is fetched. Delete-file footers are read before their row groups,
     /// alongside the deletion vectors. Every read shares one limiter; `RoaringTreemap` union is
     /// commutative, so completion order cannot change the result. Keyed by absolute data-file URI.
+    /// On return, [`Self::reservation`] holds the serialized size of every returned set.
     pub(super) async fn collect_positions(
         &self,
         store: &Arc<dyn ObjectStore>,
@@ -569,20 +654,32 @@ impl ShardDeletes<'_> {
             join_spawned(vector_reads),
         )
         .await?;
-        let row_groups = join_spawned(
-            opened
-                .into_iter()
-                .flat_map(|file| file.row_group_reads(&assigned, &self.secrets, &self.limiter)),
-        )
+        let row_groups = join_spawned(opened.into_iter().flat_map(|file| {
+            file.row_group_reads(&assigned, &self.secrets, &self.limiter, &self.reservation)
+        }))
         .await?;
 
         let mut merged: HashMap<String, RoaringTreemap> = HashMap::new();
         for (path, positions) in vector_positions
             .into_iter()
             .flatten()
-            .chain(delete_file_positions(row_groups).await?)
+            .chain(delete_file_positions(row_groups, &self.reservation, &self.secrets).await?)
         {
-            *merged.entry(path).or_default() |= positions;
+            match merged.entry(path) {
+                Entry::Vacant(slot) => {
+                    slot.insert(positions);
+                }
+                Entry::Occupied(mut slot) => {
+                    let before = slot.get().serialized_size() + positions.serialized_size();
+                    *slot.get_mut() |= positions;
+                    track(
+                        &self.reservation,
+                        before,
+                        slot.get().serialized_size(),
+                        &self.secrets,
+                    )?;
+                }
+            }
         }
         Ok(merged)
     }
@@ -605,8 +702,9 @@ impl ShardDeletes<'_> {
                 let assigned = Arc::clone(assigned);
                 let secrets = Arc::clone(&self.secrets);
                 let limiter = Arc::clone(&self.limiter);
+                let hint = self.metadata_size_hint;
                 let open: Read<_> = Box::pin(async move {
-                    open_delete_file(store, delete_meta, &assigned, &secrets, &limiter).await
+                    open_delete_file(store, delete_meta, hint, &assigned, &secrets, &limiter).await
                 });
                 Ok(open)
             })
@@ -641,6 +739,7 @@ impl ShardDeletes<'_> {
                 let limiter = Arc::clone(&self.limiter);
                 let secrets = Arc::clone(&self.secrets);
                 let table_root = self.table_root.to_string();
+                let reservation = Arc::clone(&self.reservation);
                 let read: Read<_> = Box::pin(async move {
                     // A shared sidecar is named by its first referrer.
                     let body = match &sidecar {
@@ -661,6 +760,7 @@ impl ShardDeletes<'_> {
                         .iter()
                         .map(|(data_file, vector)| {
                             let positions = vector.decode(body.clone(), data_file, &secrets)?;
+                            reserve(&reservation, positions.serialized_size(), &secrets)?;
                             Ok((reconstruct_abs_uri(data_file, &table_root), positions))
                         })
                         .collect()
@@ -705,6 +805,7 @@ impl ShardDeletes<'_> {
                 let secrets = Arc::clone(&self.secrets);
                 let table_root = self.table_root.to_string();
                 let url = url.clone();
+                let reservation = Arc::clone(&self.reservation);
                 reads.push(Box::pin(async move {
                     // A shared Puffin request is named by its first referrer.
                     let body = read_deletion_vector_payload(
@@ -724,6 +825,7 @@ impl ShardDeletes<'_> {
                                     ..(vector.range.end - request.start) as usize,
                             );
                             let positions = vector.decode(&blob, data_file, &secrets)?;
+                            reserve(&reservation, positions.serialized_size(), &secrets)?;
                             Ok((reconstruct_abs_uri(data_file, &table_root), positions))
                         })
                         .collect()

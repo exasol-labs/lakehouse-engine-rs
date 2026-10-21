@@ -548,6 +548,7 @@ fn delete_file_row_groups_are_read_concurrently_without_the_row_column() {
         })
         .collect();
     assert_eq!(row_column_chunks.len(), 3);
+    let file_size = buf.len() as u64;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -583,7 +584,17 @@ fn delete_file_row_groups_are_read_concurrently_without_the_row_column() {
         max_in_flight, 2,
         "row groups are read concurrently, one permit each, up to the two-permit budget"
     );
-    for range in ranges {
+    let (footer, row_group_reads) = ranges.split_first().expect("the footer is read first");
+    assert!(
+        matches!(footer, Some(GetRange::Bounded(range)) if range.end == file_size),
+        "a footer within the size hint is one ranged GET: {footer:?}"
+    );
+    assert_eq!(
+        row_group_reads.len(),
+        3,
+        "one GET per row group: {row_group_reads:?}"
+    );
+    for range in row_group_reads.iter().cloned() {
         let Some(GetRange::Bounded(range)) = range else {
             continue;
         };
@@ -634,7 +645,128 @@ fn merged_puffin_requests_respect_the_gap_and_the_size_cap() {
     );
 }
 
-/// Phase A's positional-delete steps over one delete file.
+/// Scenario: Row-position delete state is reserved in the memory pool
+#[test]
+fn phase_a_reserves_the_serialized_size_of_the_sets_it_returns() {
+    use object_store::memory::InMemory;
+    use object_store::path::Path as StorePath;
+    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+
+    let data_file = "memory:///db/t/data/x.parquet";
+    let first = positional_delete_file_bytes(&[(data_file, 3), (data_file, 7)]);
+    let second = positional_delete_file_bytes(&[(data_file, 7), (data_file, 9)]);
+    let (puffin_file, [puffin_a, _]) = puffin_file_with_two_vectors();
+    // Two delete files and a deletion vector for one data file exercise both set merges.
+    let files = vec![entry_with(
+        "data/x.parquet",
+        vec![
+            DeleteMechanism::IcebergPositionalDelete {
+                path: "deletes/d1.parquet".to_string(),
+                size: first.len() as u64,
+            },
+            DeleteMechanism::IcebergPositionalDelete {
+                path: "deletes/d2.parquet".to_string(),
+                size: second.len() as u64,
+            },
+            puffin_a,
+        ],
+    )];
+    let reservation = unbounded_reservation();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let positions = rt.block_on(async {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        for (path, payload) in [
+            ("db/t/deletes/d1.parquet", PutPayload::from(first)),
+            ("db/t/deletes/d2.parquet", PutPayload::from(second)),
+            ("db/t/deletes/dv.puffin", PutPayload::from(puffin_file)),
+        ] {
+            store.put(&StorePath::from(path), payload).await.unwrap();
+        }
+        collect_positions_within(
+            &files,
+            "memory:///db/t",
+            2,
+            &store,
+            Arc::clone(&reservation),
+        )
+        .await
+        .unwrap()
+    });
+
+    let set = &positions[data_file];
+    assert!(
+        [3, 7, 9].into_iter().all(|pos| set.contains(pos)),
+        "{set:?}"
+    );
+    assert_eq!(
+        reservation.size(),
+        set.serialized_size(),
+        "the reservation equals the merged set's size, with no per-position copy left in it"
+    );
+}
+
+/// Scenario: Row-position delete state is reserved in the memory pool
+#[test]
+fn phase_a_fails_as_soon_as_its_sets_outgrow_the_pool() {
+    use object_store::memory::InMemory;
+    use object_store::path::Path as StorePath;
+    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+
+    const ROWS: i64 = 300_000;
+    let data_file = "memory:///db/t/data/x.parquet";
+    let rows: Vec<(&str, i64)> = (0..ROWS).map(|pos| (data_file, pos)).collect();
+    let bytes = positional_delete_file_bytes(&rows);
+    let files = vec![entry_with(
+        "data/x.parquet",
+        vec![DeleteMechanism::IcebergPositionalDelete {
+            path: "deletes/d.parquet".to_string(),
+            size: bytes.len() as u64,
+        }],
+    )];
+    let set_bytes = (0..ROWS as u64)
+        .collect::<RoaringTreemap>()
+        .serialized_size();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let collect_within = |pool_bytes: usize| {
+        rt.block_on(async {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            store
+                .put(
+                    &StorePath::from("db/t/deletes/d.parquet"),
+                    PutPayload::from(bytes.clone()),
+                )
+                .await
+                .unwrap();
+            collect_positions_within(
+                &files,
+                "memory:///db/t",
+                2,
+                &store,
+                reservation_within(pool_bytes),
+            )
+            .await
+        })
+    };
+
+    assert!(
+        collect_within(set_bytes).is_ok(),
+        "decoding {} bytes of positions fits a pool of the final set's {set_bytes} bytes",
+        ROWS * 8
+    );
+    let error = collect_within(set_bytes / 2).expect_err("the set outgrows half its size");
+    assert!(
+        error.to_string().contains("does not fit the memory pool"),
+        "{error}"
+    );
+}
+
+/// Phase A's positional-delete steps over one delete file, with DataFusion's default footer hint.
 async fn read_positions(
     store: Arc<dyn ObjectStore>,
     meta: ObjectMeta,
@@ -645,17 +777,41 @@ async fn read_positions(
         Arc::new(assigned.iter().map(|path| path.to_string()).collect());
     let secrets: Arc<[String]> = Arc::from([]);
     let limiter = Arc::new(Semaphore::new(permits));
-    let opened = open_delete_file(store, meta, &assigned, &secrets, &limiter)
-        .await
-        .unwrap();
-    let row_groups = join_spawned(opened.row_group_reads(&assigned, &secrets, &limiter))
-        .await
-        .unwrap();
-    delete_file_positions(row_groups)
+    let reservation = unbounded_reservation();
+    let opened = open_delete_file(
+        store,
+        meta,
+        Some(DEFAULT_METADATA_SIZE_HINT),
+        &assigned,
+        &secrets,
+        &limiter,
+    )
+    .await
+    .unwrap();
+    let row_groups =
+        join_spawned(opened.row_group_reads(&assigned, &secrets, &limiter, &reservation))
+            .await
+            .unwrap();
+    delete_file_positions(row_groups, &reservation, &secrets)
         .await
         .unwrap()
         .into_iter()
         .collect()
+}
+
+/// DataFusion's default `metadata_size_hint`, which the scan's Parquet format keeps.
+const DEFAULT_METADATA_SIZE_HINT: usize = 512 * 1024;
+
+fn unbounded_reservation() -> Arc<MemoryReservation> {
+    use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool};
+    let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+    Arc::new(MemoryConsumer::new("test").register(&pool))
+}
+
+fn reservation_within(pool_bytes: usize) -> Arc<MemoryReservation> {
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryPool};
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(pool_bytes));
+    Arc::new(MemoryConsumer::new("test").register(&pool))
 }
 
 fn entry_with(path: &str, deletes: Vec<DeleteMechanism>) -> FileEntry {
@@ -674,11 +830,23 @@ async fn collect_positions(
     permits: usize,
     store: &Arc<dyn ObjectStore>,
 ) -> Result<HashMap<String, RoaringTreemap>, UdfError> {
+    collect_positions_within(files, table_root, permits, store, unbounded_reservation()).await
+}
+
+async fn collect_positions_within(
+    files: &[FileEntry],
+    table_root: &str,
+    permits: usize,
+    store: &Arc<dyn ObjectStore>,
+    reservation: Arc<MemoryReservation>,
+) -> Result<HashMap<String, RoaringTreemap>, UdfError> {
     ShardDeletes {
         files,
         table_root,
         secrets: Arc::from([]),
         limiter: Arc::new(Semaphore::new(permits)),
+        reservation,
+        metadata_size_hint: Some(DEFAULT_METADATA_SIZE_HINT),
     }
     .collect_positions(store)
     .await
