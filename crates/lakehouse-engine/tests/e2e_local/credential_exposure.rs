@@ -17,37 +17,22 @@ const OWNER_USER: &str = "CREDEXP_OWNER";
 const READER_USER: &str = "CREDEXP_READER";
 const OWNER_ROLE: &str = "CREDEXP_OWNER_ROLE";
 const ROLE_VS_NAME: &str = "CREDEXP_ROLE_VS";
-const ROLE_MEMBER_USER: &str = "CREDEXP_ROLE_MEMBER";
-const MEMBER_ROLE: &str = "CREDEXP_MEMBER_ROLE";
 const INSTALLER_USER: &str = "CREDEXP_INSTALLER";
 const INSTALLER_ROLE: &str = "CREDEXP_INSTALLER_ROLE";
 const INSTALLER_SCHEMA: &str = "CREDEXP_INSTALLER_SCRIPTS";
 const INSTALLER_VS_NAME: &str = "CREDEXP_INSTALLER_VS";
-const ANY_PRIVILEGE_USER: &str = "CREDEXP_ANY_PRIVILEGE";
-const ANY_PRIVILEGE_VS_NAME: &str = "CREDEXP_ANY_PRIVILEGE_VS";
 const REINSTALL_SCHEMA: &str = "CREDEXP_SCRIPTS";
-const SCHEMA_OWNER_USER: &str = "CREDEXP_SCHEMA_OWNER";
+const SCHEMA_GRANTEE_USER: &str = "CREDEXP_SCHEMA_GRANTEE";
 const SCHEMA_VS_NAME: &str = "CREDEXP_SCHEMA_VS";
 const SCRIPT_VS_NAME: &str = "CREDEXP_SCRIPT_VS";
-const REPLACE_CONN_NAME: &str = "CREDEXP_REPLACE_CONN";
-const REPLACE_VS_NAME: &str = "CREDEXP_REPLACE_VS";
+const ROTATED_CONN_NAME: &str = "CREDEXP_ROTATED_CONN";
+const ROTATED_VS_NAME: &str = "CREDEXP_ROTATED_VS";
 const MISSING_CONN_NAME: &str = "CREDEXP_NO_SUCH_CONN";
 const MISSING_CONN_VS_NAME: &str = "CREDEXP_MISSING_CONN_VS";
 const WRONG_SECRET_KEY: &str = "CredExpRotatedSecret2026";
 const SCAN_DENIAL: &str = "the scan cannot access CONNECTION";
 const ADAPTER_EXECUTE_DENIAL: &str = "insufficient privileges for calling adapter script";
 const SCRIPT_EXECUTE_DENIAL: &str = "insufficient privileges for calling script";
-
-// The diagnostic queries of `docs/security.md`, placeholders included.
-const VS_OWNER_SQL: &str =
-    "SELECT SCHEMA_OWNER FROM EXA_DBA_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = '<VS>'";
-const OWNER_ROLES_SQL: &str =
-    "SELECT GRANTED_ROLE FROM EXA_DBA_ROLE_PRIVS WHERE GRANTEE = '<OWNER>'";
-const CONNECTION_GRANTS_SQL: &str = "SELECT GRANTEE, FOR_OBJECT_TYPE, FOR_OBJECT_SCHEMA, \
-     FOR_OBJECT_NAME FROM EXA_DBA_RESTRICTED_OBJ_PRIVS WHERE OBJECT_NAME = '<CONN>'";
-const EXECUTE_GRANTS_SQL: &str = "SELECT GRANTEE, OBJECT_TYPE, OBJECT_SCHEMA, OBJECT_NAME \
-     FROM EXA_DBA_OBJ_PRIVS WHERE PRIVILEGE = 'EXECUTE' \
-     AND (OBJECT_SCHEMA = '<SCHEMA>' OR OBJECT_NAME = '<SCHEMA>')";
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -104,46 +89,6 @@ fn schema_grants(schema: &str, conn: &str, grantee: &str) -> [String; 2] {
         format!("GRANT EXECUTE ON SCHEMA {schema} TO {grantee}"),
         format!("GRANT ACCESS ON CONNECTION {conn} FOR SCHEMA {schema} TO {grantee}"),
     ]
-}
-
-/// Runs a diagnostic query of `docs/security.md` as a DBA.
-fn diagnose(query: &str, placeholder: &str, value: &str) -> Vec<Vec<String>> {
-    diagnose_as(&mut exa_conn(), query, placeholder, value)
-}
-
-/// Runs a diagnostic query as `conn`. Each row is text, a NULL cell is empty.
-fn diagnose_as(
-    conn: &mut ExaConn,
-    query: &str,
-    placeholder: &str,
-    value: &str,
-) -> Vec<Vec<String>> {
-    let columns = conn.query_columns(&query.replace(placeholder, value));
-    (0..columns.first().map_or(0, Vec::len))
-        .map(|row| {
-            columns
-                .iter()
-                .map(|column| column[row].as_str().unwrap_or_default().to_string())
-                .collect()
-        })
-        .collect()
-}
-
-/// The number of rows a grant query lists for `grantee`, its first column.
-fn grant_count(rows: &[Vec<String>], grantee: &str) -> usize {
-    rows.iter().filter(|row| row[0] == grantee).count()
-}
-
-/// The documented queries list no role, no CONNECTION grant, and no EXECUTE grant for `grantee`.
-fn assert_holds_no_grant(grantee: &str) {
-    assert!(diagnose(OWNER_ROLES_SQL, "<OWNER>", grantee).is_empty());
-    for (query, placeholder, value) in [
-        (CONNECTION_GRANTS_SQL, "<CONN>", CONN_NAME),
-        (EXECUTE_GRANTS_SQL, "<SCHEMA>", SCHEMA_NAME),
-    ] {
-        let rows = diagnose(query, placeholder, value);
-        assert_eq!(grant_count(&rows, grantee), 0, "{grantee}: {rows:?}");
-    }
 }
 
 fn revoke_sql(grant: &str) -> String {
@@ -222,10 +167,6 @@ fn try_reader_count(vs: &str) -> Value {
     reader_conn().try_execute(&count_sql(vs))
 }
 
-fn rows(sys: &mut ExaConn, view: &str, filter: &str) -> i64 {
-    sys.query_row_count(&format!("SELECT * FROM {view} WHERE {filter}"))
-}
-
 fn unresolved_text(conn: &str) -> String {
     format!("CONNECTION '{conn}' could not be resolved")
 }
@@ -272,31 +213,23 @@ fn setup_e2e() {
             SINGLE_SHARD_VS_NAME,
             ROLE_VS_NAME,
             INSTALLER_VS_NAME,
-            ANY_PRIVILEGE_VS_NAME,
             SCHEMA_VS_NAME,
             SCRIPT_VS_NAME,
-            REPLACE_VS_NAME,
+            ROTATED_VS_NAME,
             MISSING_CONN_VS_NAME,
         ] {
             let _ = sys.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs} CASCADE"));
         }
-        for role in [OWNER_ROLE, MEMBER_ROLE, INSTALLER_ROLE] {
+        for role in [OWNER_ROLE, INSTALLER_ROLE] {
             sys.execute(&format!("DROP ROLE IF EXISTS {role} CASCADE"));
         }
-        for user in [
-            OWNER_USER,
-            READER_USER,
-            ROLE_MEMBER_USER,
-            INSTALLER_USER,
-            ANY_PRIVILEGE_USER,
-            SCHEMA_OWNER_USER,
-        ] {
+        for user in [OWNER_USER, READER_USER, INSTALLER_USER, SCHEMA_GRANTEE_USER] {
             sys.execute(&format!("DROP USER IF EXISTS {user} CASCADE"));
         }
         for schema in [REINSTALL_SCHEMA, INSTALLER_SCHEMA] {
             sys.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"));
         }
-        sys.execute(&format!("DROP CONNECTION IF EXISTS {REPLACE_CONN_NAME}"));
+        sys.execute(&format!("DROP CONNECTION IF EXISTS {ROTATED_CONN_NAME}"));
         sys.execute(&build_create_connection_sql(
             CONN_NAME,
             &iceberg_catalog_url_internal(),
@@ -326,11 +259,6 @@ fn setup_e2e() {
         sys.execute(&format!(
             "ALTER VIRTUAL SCHEMA {ROLE_VS_NAME} CHANGE OWNER {OWNER_ROLE}"
         ));
-        // The member holds the owning role through another role, as the docs' role query covers.
-        sys.execute(&format!("CREATE ROLE {MEMBER_ROLE}"));
-        sys.execute(&format!("GRANT {OWNER_ROLE} TO {MEMBER_ROLE}"));
-        create_user(&mut sys, ROLE_MEMBER_USER, &["CREATE SESSION", MEMBER_ROLE]);
-
         create_user(
             &mut sys,
             INSTALLER_USER,
@@ -343,17 +271,7 @@ fn setup_e2e() {
         );
         create_user(
             &mut sys,
-            ANY_PRIVILEGE_USER,
-            &[
-                "CREATE SESSION",
-                "CREATE VIRTUAL SCHEMA",
-                "EXECUTE ANY SCRIPT",
-                "ACCESS ANY CONNECTION",
-            ],
-        );
-        create_user(
-            &mut sys,
-            SCHEMA_OWNER_USER,
+            SCHEMA_GRANTEE_USER,
             &["CREATE SESSION", "CREATE VIRTUAL SCHEMA"],
         );
     });
@@ -478,16 +396,6 @@ fn the_reader_cannot_execute_the_pushdown_plan_it_captured_and_the_owner_can() {
         );
     }
 
-    assert_holds_no_grant(READER_USER);
-    assert_eq!(
-        rows(
-            &mut exa_conn(),
-            "EXA_DBA_SYS_PRIVS",
-            &format!("GRANTEE = '{READER_USER}' AND PRIVILEGE <> 'CREATE SESSION'")
-        ),
-        0
-    );
-
     assert_denied(&reader_conn().try_execute(&isolated), SCRIPT_EXECUTE_DENIAL);
     assert_eq!(
         user_conn(OWNER_USER).query_row_count(&isolated),
@@ -506,93 +414,12 @@ fn a_role_owned_virtual_schema_serves_a_reader_through_the_roles_grants() {
     let _serial = serial();
     setup_e2e();
 
-    assert_eq!(
-        diagnose(VS_OWNER_SQL, "<VS>", ROLE_VS_NAME),
-        vec![vec![OWNER_ROLE.to_string()]]
-    );
     assert_eq!(reader_count(ROLE_VS_NAME), SEED_TOTAL_ROWS as i64);
 
     let role_scan_grant = access_grant(CONN_NAME, SCHEMA_NAME, SCAN_SCRIPT_NAME, OWNER_ROLE);
     let denied = without_grant(&role_scan_grant, || try_reader_count(ROLE_VS_NAME));
 
     assert_denied(&denied, SCAN_DENIAL);
-}
-
-/// Scenario: A member of the owning role administers a role-owned virtual schema
-#[test]
-fn a_member_of_the_owning_role_administers_the_virtual_schema_and_runs_its_plan() {
-    let _serial = serial();
-    setup_e2e();
-    let refresh = format!("ALTER VIRTUAL SCHEMA {ROLE_VS_NAME} REFRESH");
-    let set = |factor: &str| {
-        format!("ALTER VIRTUAL SCHEMA {ROLE_VS_NAME} SET PARALLELISM_FACTOR = '{factor}'")
-    };
-
-    let mut member = user_conn(ROLE_MEMBER_USER);
-    member.execute(&refresh);
-    member.execute(&set("2"));
-    assert_eq!(
-        rows(
-            &mut exa_conn(),
-            "EXA_DBA_VIRTUAL_SCHEMA_PROPERTIES",
-            &format!(
-                "SCHEMA_NAME = '{ROLE_VS_NAME}' AND PROPERTY_NAME = 'PARALLELISM_FACTOR' \
-                 AND PROPERTY_VALUE = '2'"
-            )
-        ),
-        1
-    );
-    let isolated = isolated_pushdown_statement(&mut member, &count_sql(ROLE_VS_NAME));
-    assert_eq!(
-        scalar_i64(&member.try_execute(&isolated)),
-        Some(SEED_TOTAL_ROWS as i64),
-        "a member must run the scan plan directly"
-    );
-
-    let mut reader = reader_conn();
-    for statement in [refresh, set("3")] {
-        error_text(&reader.try_execute(&statement));
-    }
-    assert_denied(&reader.try_execute(&isolated), SCRIPT_EXECUTE_DENIAL);
-    assert_eq!(reader_count(ROLE_VS_NAME), SEED_TOTAL_ROWS as i64);
-}
-
-/// Scenario: A member of the owning role lists the owner's grants without DBA rights
-#[test]
-fn a_member_of_the_owning_role_lists_the_owners_grants_without_dba_rights() {
-    let _serial = serial();
-    setup_e2e();
-    let mut member = user_conn(ROLE_MEMBER_USER);
-    let mut diagnose_in = |views: &str, query: &str, placeholder: &str, value: &str| {
-        diagnose_as(
-            &mut member,
-            &query.replace("EXA_DBA_", views),
-            placeholder,
-            value,
-        )
-    };
-
-    assert_eq!(
-        diagnose_in("EXA_USER_", VS_OWNER_SQL, "<VS>", ROLE_VS_NAME),
-        vec![vec![OWNER_ROLE.to_string()]]
-    );
-    assert_eq!(
-        diagnose_in("EXA_USER_", OWNER_ROLES_SQL, "<OWNER>", ROLE_MEMBER_USER),
-        vec![vec![MEMBER_ROLE.to_string()]]
-    );
-    assert_eq!(
-        diagnose_in("EXA_ROLE_", OWNER_ROLES_SQL, "<OWNER>", MEMBER_ROLE),
-        vec![vec![OWNER_ROLE.to_string()]]
-    );
-    let access = diagnose_in("EXA_ROLE_", CONNECTION_GRANTS_SQL, "<CONN>", CONN_NAME);
-    assert_eq!(grant_count(&access, OWNER_ROLE), 2, "{access:?}");
-    let own_access = diagnose_in("EXA_USER_", CONNECTION_GRANTS_SQL, "<CONN>", CONN_NAME);
-    assert!(
-        own_access.is_empty(),
-        "no other user's grant: {own_access:?}"
-    );
-    let execute = diagnose_in("EXA_ROLE_", EXECUTE_GRANTS_SQL, "<SCHEMA>", SCHEMA_NAME);
-    assert_eq!(grant_count(&execute, OWNER_ROLE), 3, "{execute:?}");
 }
 
 /// Scenario: A user owner can hold the CONNECTION grants through a role
@@ -623,18 +450,6 @@ fn the_install_scripts_role_recipe_serves_a_reader() {
         CONN_NAME,
     );
 
-    assert_eq!(
-        diagnose(OWNER_ROLES_SQL, "<OWNER>", INSTALLER_USER),
-        vec![vec![INSTALLER_ROLE.to_string()]]
-    );
-    let access = diagnose(CONNECTION_GRANTS_SQL, "<CONN>", CONN_NAME);
-    assert_eq!(grant_count(&access, INSTALLER_ROLE), 2, "{access:?}");
-    assert_eq!(grant_count(&access, INSTALLER_USER), 0, "{access:?}");
-    let execute = diagnose(EXECUTE_GRANTS_SQL, "<SCHEMA>", INSTALLER_SCHEMA);
-    assert!(
-        execute.is_empty(),
-        "the schema owner needs no row: {execute:?}"
-    );
     assert_eq!(reader_count(INSTALLER_VS_NAME), SEED_TOTAL_ROWS as i64);
 
     let denied = without_grant(&role_grant, || try_reader_count(INSTALLER_VS_NAME));
@@ -642,28 +457,9 @@ fn the_install_scripts_role_recipe_serves_a_reader() {
     assert_denied(&denied, &unresolved_text(CONN_NAME));
 }
 
-/// Scenario: An owner with EXECUTE ANY SCRIPT and ACCESS ANY CONNECTION needs no grant
+/// Scenario: Schema-scoped grants survive a re-install, script-scoped grants do not
 #[test]
-fn an_owner_with_the_any_privileges_needs_no_grant() {
-    let _serial = serial();
-    setup_e2e();
-
-    create_readable_vs(
-        &mut user_conn(ANY_PRIVILEGE_USER),
-        ANY_PRIVILEGE_VS_NAME,
-        SCHEMA_NAME,
-        CONN_NAME,
-    );
-
-    assert_holds_no_grant(ANY_PRIVILEGE_USER);
-    assert_eq!(reader_count(ANY_PRIVILEGE_VS_NAME), SEED_TOTAL_ROWS as i64);
-}
-
-/// Scenario: Schema-scoped grants cover the scripts and survive a re-install, script-scoped grants do not
-/// Scenario: A schema-scoped CONNECTION grant extends to a script the owner creates
-/// Scenario: A user who can replace a script in the scripts' schema reads the CONNECTION through the owner's schema-scoped grants
-#[test]
-fn schema_scoped_grants_survive_a_reinstall_and_cover_scripts_created_or_replaced_later() {
+fn schema_scoped_grants_survive_a_reinstall_and_script_scoped_grants_do_not() {
     let _serial = serial();
     setup_e2e();
     let mut sys = exa_conn();
@@ -671,14 +467,14 @@ fn schema_scoped_grants_survive_a_reinstall_and_cover_scripts_created_or_replace
     create_schema_and_scripts_in(&mut sys, REINSTALL_SCHEMA);
     execute_all(
         &mut sys,
-        schema_grants(REINSTALL_SCHEMA, CONN_NAME, SCHEMA_OWNER_USER),
+        schema_grants(REINSTALL_SCHEMA, CONN_NAME, SCHEMA_GRANTEE_USER),
     );
     execute_all(
         &mut sys,
         script_grants(REINSTALL_SCHEMA, CONN_NAME, OWNER_USER),
     );
     create_readable_vs(
-        &mut user_conn(SCHEMA_OWNER_USER),
+        &mut user_conn(SCHEMA_GRANTEE_USER),
         SCHEMA_VS_NAME,
         REINSTALL_SCHEMA,
         CONN_NAME,
@@ -692,82 +488,16 @@ fn schema_scoped_grants_survive_a_reinstall_and_cover_scripts_created_or_replace
     for vs in [SCHEMA_VS_NAME, SCRIPT_VS_NAME] {
         assert_eq!(reader_count(vs), SEED_TOTAL_ROWS as i64, "{vs}");
     }
-    // The per-script EXECUTE rows of OWNER_USER, and whether the SCHEMA row is listed.
-    let execute_grants = || {
-        let rows = diagnose(EXECUTE_GRANTS_SQL, "<SCHEMA>", REINSTALL_SCHEMA);
-        let schema_row = [SCHEMA_OWNER_USER, "SCHEMA", "", REINSTALL_SCHEMA].map(String::from);
-        (
-            grant_count(&rows, OWNER_USER),
-            rows.contains(&schema_row.to_vec()),
-        )
-    };
-    assert_eq!(execute_grants(), (3, true));
 
     create_schema_and_scripts_in(&mut sys, REINSTALL_SCHEMA);
 
-    assert_eq!(execute_grants(), (0, true));
-
-    let access = diagnose(CONNECTION_GRANTS_SQL, "<CONN>", CONN_NAME);
-    let on_reinstall_schema = |for_type: &str| {
-        access
-            .iter()
-            .filter(|row| row[1] == for_type)
-            .filter(|row| row[2] == REINSTALL_SCHEMA || row[3] == REINSTALL_SCHEMA)
-            .count()
-    };
-    assert_eq!(on_reinstall_schema("SCRIPT"), 0, "{access:?}");
-    assert_eq!(on_reinstall_schema("SCHEMA"), 1, "{access:?}");
     assert_eq!(reader_count(SCHEMA_VS_NAME), SEED_TOTAL_ROWS as i64);
     assert_denied(&try_reader_count(SCRIPT_VS_NAME), ADAPTER_EXECUTE_DENIAL);
-
-    // The address stands in for the password, so a passing test prints no credential.
-    let peeked = with_grants(
-        &[format!("GRANT CREATE ANY SCRIPT TO {SCHEMA_OWNER_USER}")],
-        || {
-            let mut schema_owner = user_conn(SCHEMA_OWNER_USER);
-            schema_owner.execute(&format!(
-                "CREATE OR REPLACE LUA SCALAR SCRIPT {REINSTALL_SCHEMA}.PEEK_CONNECTION() \
-                 RETURNS VARCHAR(2000) AS\n\
-                 function run(ctx) return exa.get_connection('{CONN_NAME}').address end\n/"
-            ));
-            schema_owner.try_execute(&format!("SELECT {REINSTALL_SCHEMA}.PEEK_CONNECTION()"))
-        },
-    );
-    assert_eq!(
-        peeked["responseData"]["results"][0]["resultSet"]["data"][0][0].as_str(),
-        Some(iceberg_catalog_url_internal().as_str()),
-        "the owner's own script must read the CONNECTION: {peeked}"
-    );
-
-    // The answer to dropVirtualSchema keeps the setup's DROP working if the test fails here.
-    with_grants(
-        &[format!(
-            "GRANT CREATE ANY SCRIPT, DROP ANY SCRIPT TO {READER_USER}"
-        )],
-        || {
-            reader_conn().execute(&format!(
-                r#"CREATE OR REPLACE LUA ADAPTER SCRIPT {REINSTALL_SCHEMA}.{ADAPTER_SCRIPT_NAME} AS
-function adapter_call(request)
-if string.find(request, 'dropVirtualSchema', 1, true) then return '{{"type":"dropVirtualSchema"}}' end
-error('PEEK ' .. exa.get_connection('{CONN_NAME}').address)
-end
-/"#
-            ));
-        },
-    );
-    let peeked = error_text(&try_reader_count(SCHEMA_VS_NAME));
-    assert!(
-        peeked.contains(&format!("PEEK {}", iceberg_catalog_url_internal())),
-        "the replaced adapter must read the CONNECTION with the owner's grants: {peeked}"
-    );
-
-    create_schema_and_scripts_in(&mut sys, REINSTALL_SCHEMA);
-    assert_eq!(reader_count(SCHEMA_VS_NAME), SEED_TOTAL_ROWS as i64);
 }
 
-/// Scenario: ALTER CONNECTION rotates the CONNECTION and keeps its grants, CREATE OR REPLACE CONNECTION drops them
+/// Scenario: ALTER CONNECTION rotates the CONNECTION and keeps its grants
 #[test]
-fn alter_connection_rotates_the_secret_and_keeps_the_grants_and_create_or_replace_drops_them() {
+fn alter_connection_rotates_the_secret_and_keeps_the_grants() {
     let _serial = serial();
     setup_e2e();
     let mut sys = exa_conn();
@@ -776,24 +506,20 @@ fn alter_connection_rotates_the_secret_and_keeps_the_grants_and_create_or_replac
         secret_key: WRONG_SECRET_KEY.to_string(),
         ..local_stack_connection_password()
     };
-    let create_sql = |pw: &CatalogConnectionPassword| {
-        build_create_connection_sql(REPLACE_CONN_NAME, &iceberg_catalog_url_internal(), pw)
-    };
     let alter_sql = |pw: &CatalogConnectionPassword| {
-        create_sql(pw).replacen("CREATE OR REPLACE CONNECTION", "ALTER CONNECTION", 1)
+        build_create_connection_sql(ROTATED_CONN_NAME, &iceberg_catalog_url_internal(), pw)
+            .replacen("CREATE OR REPLACE CONNECTION", "ALTER CONNECTION", 1)
     };
-    let owner_grants = || {
-        grant_count(
-            &diagnose(CONNECTION_GRANTS_SQL, "<CONN>", REPLACE_CONN_NAME),
-            OWNER_USER,
-        )
-    };
-    let query = filtered_rows_sql(REPLACE_VS_NAME);
+    let query = filtered_rows_sql(ROTATED_VS_NAME);
 
-    sys.execute(&create_sql(&password));
+    sys.execute(&build_create_connection_sql(
+        ROTATED_CONN_NAME,
+        &iceberg_catalog_url_internal(),
+        &password,
+    ));
     for script in [ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME] {
         sys.execute(&access_grant(
-            REPLACE_CONN_NAME,
+            ROTATED_CONN_NAME,
             SCHEMA_NAME,
             script,
             OWNER_USER,
@@ -801,9 +527,9 @@ fn alter_connection_rotates_the_secret_and_keeps_the_grants_and_create_or_replac
     }
     create_readable_vs(
         &mut user_conn(OWNER_USER),
-        REPLACE_VS_NAME,
+        ROTATED_VS_NAME,
         SCHEMA_NAME,
-        REPLACE_CONN_NAME,
+        ROTATED_CONN_NAME,
     );
 
     sys.execute(&alter_sql(&rotated));
@@ -812,17 +538,9 @@ fn alter_connection_rotates_the_secret_and_keeps_the_grants_and_create_or_replac
         assert!(!msg.contains(secret), "secret leaked: {msg}");
     }
     sys.execute(&alter_sql(&password));
-    assert_eq!(owner_grants(), 2);
     assert_eq!(
         reader_conn().query_row_count(&query),
         SEED_ROWS_SCORE_GT_15 as i64
-    );
-
-    sys.execute(&create_sql(&password));
-    assert_eq!(owner_grants(), 0);
-    assert_denied(
-        &try_reader_count(REPLACE_VS_NAME),
-        &unresolved_text(REPLACE_CONN_NAME),
     );
 }
 

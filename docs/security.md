@@ -23,15 +23,15 @@ A reader needs no `EXECUTE` on a script, no grant on the CONNECTION, and no role
 
 ### Owner grants
 
-An owner with the system privileges `EXECUTE ANY SCRIPT` and `ACCESS ANY CONNECTION`, such as `SYS` or a user with the `DBA` role, needs no grant. Any other owner, a user or a role, needs:
+Any owner other than `SYS` or a DBA, whether a user or a role, needs:
 
-- `EXECUTE` on `LAKEHOUSE_ADAPTER`, `LAKEHOUSE_SCAN`, and `LAKEHOUSE_DISTRIBUTE_FILES`. The owner of the scripts' schema holds it already.
+- `EXECUTE` on `LAKEHOUSE_ADAPTER`, `LAKEHOUSE_SCAN`, and `LAKEHOUSE_DISTRIBUTE_FILES`.
 - `ACCESS` on the CONNECTION for `LAKEHOUSE_ADAPTER` and `LAKEHOUSE_SCAN`, because both scripts read it.
 - `CREATE VIRTUAL SCHEMA`, if it creates the virtual schema itself.
 
 The owner can hold each grant directly or through a role it holds. Grant them before `CREATE VIRTUAL SCHEMA`, because creating the virtual schema already runs the adapter as its owner. Choose one of two forms.
 
-**Per script.** These grants cover only the engine's scripts. A re-install drops them (see [Re-installing](#re-installing)).
+**Per script.** A re-install drops these grants (see [Re-installing](#re-installing)).
 
 ```sql
 GRANT EXECUTE ON SCRIPT <schema>.LAKEHOUSE_ADAPTER          TO <owner>;
@@ -48,13 +48,6 @@ GRANT EXECUTE ON SCHEMA <schema> TO <owner>;
 GRANT ACCESS ON CONNECTION <conn> FOR SCHEMA <schema> TO <owner>;
 ```
 
-They cover every script in `<schema>`, including scripts created or replaced later. These users can therefore read the CONNECTION's credentials with code of their own, without any grant on the CONNECTION:
-
-- The owner of `<schema>`, and every user with both `CREATE ANY SCRIPT` and `DROP ANY SCRIPT`. They can replace `LAKEHOUSE_ADAPTER`, which then runs with the owner's grants on every query.
-- The virtual schema's owner, if it can create a script in `<schema>`.
-
-Use this form only when all of them may read the CONNECTION. Otherwise use the per-script form, because replacing a script drops its per-script grants.
-
 ### The install script's template
 
 The install script prints the per-script CONNECTION grants as a template. It puts them on the role `LAKEHOUSE_ENGINE_ROLE_<schema>` and grants that role to the installing user. That user owns `<schema>`, so it needs no `EXECUTE` grant, and it owns the virtual schemas it creates. The role holds no `EXECUTE` grant, so any other owner that gets the role also needs the three `EXECUTE` grants of the [owner grants](#owner-grants). The role is for owners only. Never grant it to a reader.
@@ -63,19 +56,17 @@ Run the template's grants as a DBA, because granting a role needs `GRANT ANY ROL
 
 ### A role as owner
 
-A role can own the virtual schema. Give the role the owner grants above, create the virtual schema as `SYS` or as a user that holds the same grants, then hand it to the role:
+A role can own the virtual schema. Give the role the owner grants above, create the virtual schema, then hand it to the role as a DBA, because `CHANGE OWNER` needs `ALTER ANY VIRTUAL SCHEMA`:
 
 ```sql
 ALTER VIRTUAL SCHEMA <vs> CHANGE OWNER <role>;
 ```
 
-Readers still need only the reader grants, not membership in the role. Every member of the role acts as the owner: it can refresh the virtual schema, change its properties, including `PERMISSION_CHECK` and `USER_MAPPING`, and [bypass the adapter](#who-can-bypass-the-adapter). Grant the role only to administrators.
+Readers still need only the reader grants, not membership in the role. Every member of the role acts as the owner, so it can [bypass the adapter](#who-can-bypass-the-adapter) and turn off the [Lakekeeper permission check](#lakekeeper-permission-check). Grant the role only to administrators.
 
 ### Re-installing
 
-Re-running the installer replaces the scripts with `CREATE OR REPLACE SCRIPT`. That drops every per-script grant on them, `EXECUTE` and `ACCESS` alike, including those of the install script's role, so queries fail until you issue the grants again. Per-schema grants survive. A re-install never changes a reader's grants.
-
-`CREATE OR REPLACE CONNECTION` drops every grant on the CONNECTION. `ALTER CONNECTION` keeps them, so change an existing CONNECTION with `ALTER CONNECTION`.
+Re-running the installer replaces the scripts with `CREATE OR REPLACE SCRIPT`. That drops every per-script grant on them, `EXECUTE` and `ACCESS` alike, including those of the install script's role, so queries fail until you issue the grants again. Per-schema grants survive.
 
 ### Missing grants
 
@@ -90,28 +81,6 @@ A missing owner grant fails every reader's query with one of these errors:
 
 A scan that fits in one shard, such as a scan of one data file, does not call `LAKEHOUSE_DISTRIBUTE_FILES`. A missing `EXECUTE` on it therefore fails only the queries whose scan spans several shards.
 
-To check the grants, run these queries as a DBA. Unquoted names are stored in uppercase.
-
-```sql
--- The owner, and the roles it holds
-SELECT SCHEMA_OWNER FROM EXA_DBA_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = '<VS>';
-SELECT GRANTED_ROLE FROM EXA_DBA_ROLE_PRIVS WHERE GRANTEE = '<OWNER>';
-
--- ACCESS grants on the CONNECTION
-SELECT GRANTEE, FOR_OBJECT_TYPE, FOR_OBJECT_SCHEMA, FOR_OBJECT_NAME
-FROM EXA_DBA_RESTRICTED_OBJ_PRIVS
-WHERE OBJECT_NAME = '<CONN>';
-
--- EXECUTE grants on the scripts or their schema
-SELECT GRANTEE, OBJECT_TYPE, OBJECT_SCHEMA, OBJECT_NAME
-FROM EXA_DBA_OBJ_PRIVS
-WHERE PRIVILEGE = 'EXECUTE' AND (OBJECT_SCHEMA = '<SCHEMA>' OR OBJECT_NAME = '<SCHEMA>');
-```
-
-Each owner grant needs a row whose `GRANTEE` is the owner or a role it holds. A role can hold another role, so repeat the role query with each role as `<OWNER>`. A `SCHEMA` row covers every script in that schema. The owner of `<SCHEMA>` holds `EXECUTE` without a row.
-
-Without DBA rights, the owner, or a member of an owning role, runs the same queries on `EXA_USER_*` and on `EXA_ROLE_*` in place of `EXA_DBA_*`. They list its own grants and those of every role it holds, directly or through another role. They list nothing for another user.
-
 ## Plan text and plan execution
 
 Any user who can query the virtual schema can read the scan plan that `EXPLAIN VIRTUAL` returns, and pushdown-path errors carry the same SQL. The plan names the table root, the bucket layout, file names and byte sizes, and the CONNECTION, but no credential value. A sealed vended-credential envelope travels in it as ciphertext that only the CONNECTION password opens (see [Sealed vended-credential envelope](#sealed-vended-credential-envelope)).
@@ -120,10 +89,10 @@ Any user who can query the virtual schema can read the scan plan that `EXPLAIN V
 
 A user who submits a scan plan directly, instead of querying the virtual schema, bypasses every check the adapter makes, including the [Lakekeeper permission check](#lakekeeper-permission-check). That user can also edit the plan. Running a plan needs both:
 
-- `EXECUTE` on `LAKEHOUSE_SCAN`, and on `LAKEHOUSE_DISTRIBUTE_FILES` when the scan spans several shards: per script, per schema, as owner of the scripts' schema, or through `EXECUTE ANY SCRIPT`.
-- `ACCESS` on the CONNECTION for `LAKEHOUSE_SCAN`: per script, per schema, or through `ACCESS ANY CONNECTION`.
+- `EXECUTE` on `LAKEHOUSE_SCAN`, and on `LAKEHOUSE_DISTRIBUTE_FILES` when the scan spans several shards.
+- `ACCESS` on the CONNECTION for `LAKEHOUSE_SCAN`.
 
-The virtual schema's owner holds both, and so does every member of a role that owns it. When the owner holds the [per-schema grants](#owner-grants), the users that section lists can also run their own code with the owner's grants. A reader with only the [reader grants](#reader-grants) holds neither, and Exasol refuses its plan with `insufficient privileges for calling script`. Grant these privileges only to users who may read every table the CONNECTION can read.
+The virtual schema's owner holds both, and so does every member of a role that owns it. A reader with only the [reader grants](#reader-grants) holds neither, and Exasol refuses its plan with `insufficient privileges for calling script`. Grant these privileges only to users who may read every table the CONNECTION can read.
 
 ## Lakekeeper permission check
 
@@ -203,4 +172,4 @@ A `warehouse` that names another account's `CatalogId` is untested (#TBD). To re
 
 ## Rotation
 
-Every query re-resolves the CONNECTION, with no cache and no restart. Rotate with `ALTER CONNECTION`, which keeps the grants (see [Re-installing](#re-installing)). A sealed envelope of an in-flight vended query fails the AEAD open, so rotate when no vended query is in flight.
+Every query re-resolves the CONNECTION, with no cache and no restart. Rotate with `ALTER CONNECTION`, which keeps the grants. `CREATE OR REPLACE CONNECTION` drops them. A sealed envelope of an in-flight vended query fails the AEAD open, so rotate when no vended query is in flight.

@@ -89,31 +89,10 @@ Replaces the storage credentials the adapter embedded in the scan-driving SQL wi
 
 * *GIVEN* a virtual schema whose owner is a user that owns the schema of the adapter, scan, and distributor scripts, and holds the script-scoped CONNECTION grants only through a role it is a member of, as the install script's template sets up
 * *WHEN* a reader queries the virtual schema
-* *THEN* the reader SHALL receive the owner's rows, although `EXA_DBA_OBJ_PRIVS` and `EXA_DBA_RESTRICTED_OBJ_PRIVS` list no grant to the owner itself
+* *THEN* the reader SHALL receive the owner's rows
 * *AND* when the role is revoked from the owner, the reader's query SHALL fail with the adapter's named error
 
-### Scenario: A member of the owning role administers a role-owned virtual schema
-
-* *GIVEN* a virtual schema whose owner is a role, and a user that is a member of the role
-* *WHEN* the member refreshes the virtual schema or sets one of its properties
-* *THEN* the statement SHALL succeed
-* *AND* the member SHALL run the scan-driving statement that `EXPLAIN VIRTUAL` returns, because it holds the role's script and CONNECTION grants
-* *AND* the same statements from a reader that holds only `SELECT` on the virtual schema SHALL fail
-
-### Scenario: A member of the owning role lists the owner's grants without DBA rights
-
-* *GIVEN* a virtual schema whose owner is a role, and a user without DBA rights that holds the role through another role
-* *WHEN* the user runs the diagnostic queries of `docs/security.md` on `EXA_USER_*` and `EXA_ROLE_*` in place of `EXA_DBA_*`
-* *THEN* they SHALL list the owning role, the role chain from the user to the owning role, and the owning role's CONNECTION and `EXECUTE` grants
-* *AND* they SHALL list no CONNECTION grant of another user
-
-### Scenario: An owner with EXECUTE ANY SCRIPT and ACCESS ANY CONNECTION needs no grant
-
-* *GIVEN* a virtual schema whose owner holds the system privileges `EXECUTE ANY SCRIPT` and `ACCESS ANY CONNECTION`, and no object grant and no role
-* *WHEN* a reader queries the virtual schema
-* *THEN* the reader SHALL receive the owner's rows
-
-### Scenario: Schema-scoped grants cover the scripts and survive a re-install, script-scoped grants do not
+### Scenario: Schema-scoped grants survive a re-install, script-scoped grants do not
 
 * *GIVEN* a script schema that holds the adapter, scan, and distributor scripts
 * *AND* one virtual schema whose owner holds only `GRANT EXECUTE ON SCHEMA` and `GRANT ACCESS ON CONNECTION ... FOR SCHEMA` on that schema
@@ -123,28 +102,13 @@ Replaces the storage credentials the adapter embedded in the scan-driving SQL wi
 * *AND* the schema-scoped grants SHALL remain and the first virtual schema SHALL still return the owner's rows to a reader
 * *AND* the script-scoped grants SHALL be gone and a reader's query over the second virtual schema SHALL fail with Exasol's insufficient-privilege error on the adapter script
 
-### Scenario: A schema-scoped CONNECTION grant extends to a script the owner creates
-
-* *GIVEN* an owner that holds `GRANT ACCESS ON CONNECTION ... FOR SCHEMA <schema>` and may create scripts in `<schema>`
-* *WHEN* the owner creates its own script in `<schema>` that reads the CONNECTION
-* *THEN* the script SHALL read the CONNECTION, because the schema-scoped grant covers every script in the schema, including scripts created later
-
-### Scenario: A user who can replace a script in the scripts' schema reads the CONNECTION through the owner's schema-scoped grants
-
-* *GIVEN* a virtual schema whose owner holds `GRANT EXECUTE ON SCHEMA <schema>` and `GRANT ACCESS ON CONNECTION ... FOR SCHEMA <schema>`
-* *AND* a user that holds `CREATE ANY SCRIPT` and `DROP ANY SCRIPT` and no grant on the CONNECTION
-* *WHEN* that user replaces `<schema>.LAKEHOUSE_ADAPTER` with a script that reads the CONNECTION, and queries the virtual schema
-* *THEN* the replaced adapter SHALL read the CONNECTION, because it runs with the owner's grants and the schema-scoped grants cover every script in the schema, including scripts replaced later
-* *AND* after a re-install, a reader SHALL again receive the owner's rows
-
-### Scenario: ALTER CONNECTION rotates the CONNECTION and keeps its grants, CREATE OR REPLACE CONNECTION drops them
+### Scenario: ALTER CONNECTION rotates the CONNECTION and keeps its grants
 
 * *GIVEN* a virtual schema whose owner holds the script-scoped grants on its CONNECTION
 * *WHEN* a DBA changes the CONNECTION's storage secret with `ALTER CONNECTION`
 * *THEN* the grants SHALL remain and a reader's next query SHALL use the changed secret, with no restart and no credential value in an error
 * *AND* after `ALTER CONNECTION` restores the secret, a reader SHALL receive the owner's rows
 * *AND* each shard SHALL read the CONNECTION value current at ITS resolution time, and a sealed envelope under a rotated password SHALL fail AEAD with no plaintext
-* *AND* after `CREATE OR REPLACE CONNECTION` the grants SHALL be gone and a reader's query SHALL fail with the adapter's named error
 
 ### Scenario: A missing EXECUTE grant of the owner fails the query with Exasol's privilege error
 

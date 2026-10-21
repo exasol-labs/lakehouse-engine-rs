@@ -182,8 +182,7 @@ creation, and the smoke test.
 Two statements finish the install: a catalog `CONNECTION`, then the Virtual Schema over it. The
 following example is a complete local setup with SeaweedFS and an Iceberg REST catalog, run as `SYS`.
 Any other user that creates the Virtual Schema owns it and needs the
-[owner grants](security.md#owner-grants) first. A re-install drops per-script grants, and
-`CREATE OR REPLACE CONNECTION` drops the CONNECTION's grants (see
+[owner grants](security.md#owner-grants) first. A re-install drops per-script grants (see
 [Re-installing](security.md#re-installing)).
 
 ```sql
