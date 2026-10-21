@@ -87,7 +87,7 @@ engine cannot apply.
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL emit an Iceberg pruning predicate carrying only the translatable conjunct
 * *AND* the adapter SHALL drop the untranslatable conjunct from the pruning predicate
-* *AND* the full original predicate SHALL still be applied — in `ScanSpec.filter` for DataFusion when the DataFusion dialect renders it, and otherwise in the adapter's own outer `WHERE` per `pushdown/pushdown-declined-filter-self-apply` — so "untranslatable for Iceberg pruning" never means "unapplied"
+* *AND* the full original predicate SHALL still be applied — in the scan spec's `filter` for DataFusion when the DataFusion dialect renders it, and otherwise in the adapter's own outer `WHERE` per `pushdown/pushdown-declined-filter-self-apply` — so "untranslatable for Iceberg pruning" never means "unapplied"
 * *AND* the query result SHALL be identical to the result without any Iceberg pruning
 
 ### Scenario: An untranslatable branch of an OR disables pruning entirely

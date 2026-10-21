@@ -29,9 +29,9 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
   by `storage-access/scan-spec-credential-reference`. A join block carries its own REQUIRED
   `storage` value in the same wrapper encoding, so a join block that names no dimension
   backend fails to deserialize rather than silently reusing the fact-side backend.
-* Delete mechanisms are format-neutral and self-describing. `DeleteMechanism` routes
-  (de)serialization through a private wire enum so the Rust-level type and the frozen JSON
-  encoding are independent decisions. An entry whose delete list mixes a Delta deletion vector
+* Delete mechanisms are format-neutral and self-describing. Their in-memory form and their
+  frozen JSON encoding are independent decisions, because (de)serialization goes through a
+  separate private wire form. An entry whose delete list mixes a Delta deletion vector
   with an Iceberg delete-file reference is refused. An Iceberg deletion-vector member appends
   `content_offset`, `content_size_in_bytes`, and `record_count` to the `path`, `size`, and
   `content_type` keys; every other Iceberg member carries none of them, and a member that breaks
@@ -72,7 +72,7 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 * *AND* the `storage` value SHALL be the externally-tagged scan-spec storage WRAPPER specified by `storage-access/scan-spec-credential-reference` — a `connection` reference variant carrying a name and `allow_http` and no credential; a `sealed` variant carrying a connection name and the base64 nonce-plus-AES-GCM-ciphertext of the externally-tagged storage-backend encoding of `storage-access/storage-backend-enum`; or an `inline` variant whose payload is that same backend encoding in plaintext, accepted for host-test spec construction
 * *AND* the join block's `storage` value SHALL use that SAME wrapper encoding and SHALL be a REQUIRED key of the join block, so a join block serialized without it fails to deserialize instead of defaulting to the whole-spec value
 * *AND* the per-shard files-list JSON SHALL be unaffected by the common blob's encoding, because `storage` and declared output types are both shard-invariant and appear only in the common blob
-* *AND* `from_parts_json` over the two arguments SHALL reconstitute a `ScanSpec` value equal to the one the pre-consolidation two-argument contract produced for the same shard, with the storage backend in place of the bare storage props
+* *AND* reconstitution from the two arguments SHALL produce a `ScanSpec` value equal to the one the pre-consolidation two-argument contract produced for the same shard, with the storage backend in place of the bare storage props
 * *AND* `files` SHALL remain the sole per-shard field, now guaranteed structurally by the single embedded common value rather than by a field-by-field copy
 
 ### Scenario: A file-list argument that predates the delete encoding still reconstitutes

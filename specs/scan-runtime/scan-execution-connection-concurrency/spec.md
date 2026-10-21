@@ -13,7 +13,7 @@ CPU thread/partition budget of `scan-runtime/scan-execution-threading`.
 
 ## Background
 
-* The `ScanSpec` carries a shard-invariant `s3_max_connections` field (a
+* The scan spec carries a shard-invariant `s3_max_connections` field (a
   positive integer connection-concurrency budget) that defaults to a
   conservative built-in value when absent from the JSON, so pre-existing scan
   specs remain backward-compatible.
@@ -48,8 +48,8 @@ CPU thread/partition budget of `scan-runtime/scan-execution-threading`.
   recorded in `adapterNotes`.
 * **The budget is per built object store, and a join now builds one per side.** Issue #294 gives each join side its own inner object store so each reads through its own credential (`scan-aggregation/scan-execution-join`). Each inner store gets its own HTTP client, so each is configured with the budget N and a two-side join can hold up to 2N warm idle connections to one host rather than N.
 * **Dividing the budget across the sides was rejected.** `budget / side_count` would silently halve fact-side fetch parallelism on EVERY broadcast join, making a tuning knob's effective value depend on whether the query happens to be a join — a data-dependent performance regression, in exchange for bounding a resource that is not the bottleneck.
-* **What doubles is warm idle sockets, not concurrency.** The knob maps to `object_store` 0.13.2's `pool_max_idle_per_host`, which bounds how many established connections the pool keeps warm and reusable; `object_store` 0.13.2 exposes no hard in-flight ceiling. The bound this delta widens is therefore a socket / file-descriptor bound, not a request-rate bound.
-* **A join whose sides live in different buckets already held 2N before this delta**, because two buckets already yielded two registered stores with two clients. This delta makes the shared-bucket join match that shape rather than introducing a new one.
+* **What doubles is warm idle sockets, not concurrency.** The knob maps to `object_store` 0.13.2's `pool_max_idle_per_host`, which bounds how many established connections the pool keeps warm and reusable; `object_store` 0.13.2 exposes no hard in-flight ceiling. The bound that a two-side join widens is therefore a socket / file-descriptor bound, not a request-rate bound.
+* **A join whose sides live in different buckets holds 2N as well**, because two buckets yield two registered stores with two clients. The shared-bucket join matches that shape rather than introducing a new one.
 * **The per-side store split does NOT split the delete-path semaphore.** The size-N limiter below is instance-level and shared across both sides' registrations, so the delete path's in-flight bound stays N even though the HTTP connection pools are now per side. What is per side is the credential a read goes out under, not how many reads may be in flight.
 * The row-position delete pipeline (`scan-read-path/scan-execution-row-position-deletes`) issues
   object-store reads in TWO phases, and BOTH draw from the one size-N limiter. Phase A reads every
@@ -112,17 +112,17 @@ CPU thread/partition budget of `scan-runtime/scan-execution-threading`.
 ### Scenario: AUTO derivation yields the single-core budget when the core count cannot be detected
 
 * *GIVEN* a `createVirtualSchema` request that supplies no positive-integer `S3_MAX_CONNECTIONS` property
-* *AND* an executing node where `std::thread::available_parallelism()` cannot report a core count, so the adapter resolves a core count of `1`
+* *AND* an executing node whose operating system cannot report a core count, so the adapter resolves a core count of `1`
 * *WHEN* the adapter resolves the connection-concurrency budget
-* *THEN* the adapter SHALL apply the ordinary AUTO formula to that core count of `1`, yielding `1 × S3_CONNECTIONS_PER_THREAD`, which is 4 at the recorded multiplier
-* *AND* the scan-side built-in default `DEFAULT_S3_MAX_CONNECTIONS` SHALL serve as the serde default for a `ScanSpec` JSON payload that omits `s3_max_connections`, and as the pushdown-side fallback when the `S3_MAX_CONNECTIONS` adapterNote is absent or not a positive integer
+* *THEN* the adapter SHALL apply the ordinary AUTO formula to that core count of `1`, yielding one times the per-thread connection multiplier, a budget of 4 at the recorded multiplier
+* *AND* the scan-side built-in default budget SHALL serve as the default for a scan-spec JSON payload that omits `s3_max_connections`, and as the pushdown-side fallback when the `S3_MAX_CONNECTIONS` adapterNote is absent or not a positive integer
 
 ### Scenario: Connection budget travels once in the shard-invariant common spec
 
 * *GIVEN* a scan-driving query fanned across more than one work-unit shard
 * *WHEN* the adapter serializes the scan-driving SQL arguments
 * *THEN* the resolved connection-concurrency budget SHALL travel in the shard-invariant common spec argument, serialized EXACTLY ONCE for the whole fan-out, and MUST NOT be repeated in any per-shard argument
-* *AND* the `ScanSpec` reconstituted for every shard SHALL carry the same connection-concurrency budget
+* *AND* the scan spec reconstituted for every shard SHALL carry the same connection-concurrency budget
 
 ### Scenario: The connection budget also bounds the delete path's object-store reads
 

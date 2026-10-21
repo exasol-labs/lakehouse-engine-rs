@@ -36,9 +36,8 @@ files.
   a scan spec reaching the UDF with an empty root still resolves deterministically instead of
   joining paths onto nothing. They MUST NOT be deleted or converted into an error — an empty root
   is unreachable from a `loadTable` response, which makes the branch unreachable rather than dead,
-  and the UDF is not the component that validates a catalog response. The scan-side rejoin this
-  property governs is `reconstruct_abs_uri`
-  (`crates/lakehouse-engine/src/scan/object_store.rs:250`).
+  and the UDF is not the component that validates a catalog response. This property governs the
+  scan-side rejoin of a relative path onto the table root.
 * A footer read without a size hint costs TWO object-store round-trips, not one. DataFusion's
   `DFParquetMetadata` drives a push decoder that first requests the last 8 bytes to learn the
   metadata length, then requests the metadata range itself. A `metadata_size_hint` of N
@@ -59,16 +58,14 @@ files.
   page index. Requesting the page index alongside the footer would add a round-trip and inflate
   the cached entry for metadata the access plan discards, so the request must be scoped to what
   the access plan consumes.
-* **The pre-existing footer-once guard was vacuous on the production path, and this delta makes
-  it real.** `scan_reads_footer_via_range_get_once`
-  (`crates/lakehouse-engine/tests/scan_no_head_test.rs`) builds its spec with an EMPTY
-  `logical_schema`, which sends `register_file_list` down the legacy `ParquetFormat::infer_schema`
-  fallback. Inference fetches and caches the footer BEFORE access-plan construction runs, so the
-  access-plan fetch the test means to measure is a pure cache hit and the assertion holds no
-  matter how many round-trips that fetch would otherwise cost. Production never takes that branch:
-  the adapter supplies a logical schema, no inference runs, and access-plan construction is the
-  FIRST reader of the footer. The test must therefore carry a non-empty `logical_schema` to
-  exercise the configuration the scan actually runs in.
+* **A footer-once guard must exercise the production path, or it is vacuous.** A footer-read-once
+  test whose spec carries an EMPTY `logical_schema` sends the scan's file registration down the
+  legacy `ParquetFormat::infer_schema` fallback. Inference fetches and caches the footer BEFORE
+  access-plan construction runs, so the access-plan fetch the test means to measure is a pure cache
+  hit and the assertion holds no matter how many round-trips that fetch would otherwise cost.
+  Production never takes that branch: the adapter supplies a logical schema, no inference runs, and
+  access-plan construction is the FIRST reader of the footer. The test must therefore carry a
+  non-empty `logical_schema` to exercise the configuration the scan actually runs in.
 
 ## Scenarios
 

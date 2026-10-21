@@ -42,7 +42,7 @@ specification (`delta-io/delta`, `PROTOCOL.md`, `master`):
   files are not kept in the same directory hierarchy as data files, as each one can contain DVs for
   files from multiple partitions."*
 
-The engine already carries the descriptor verbatim to the scan: the `DeltaDeletionVector` variant of
+The engine already carries the descriptor verbatim to the scan: the Delta deletion-vector variant of
 the format-neutral delete mechanism holds the storage kind, the path-or-inline payload, the offset,
 the size in bytes, and the cardinality (see `delta/delta-table-planning`). Nothing about the
 descriptor is resolved at plan time.
