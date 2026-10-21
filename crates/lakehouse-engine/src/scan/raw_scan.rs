@@ -110,7 +110,7 @@ pub async fn register_files(
 /// `delete_path_read_limiter` must be the SAME `Arc` for every call in one invocation, including
 /// both join sides, so the instance stays within one N-permit budget.
 ///
-/// [`PositionalDeleteScanTable`]: crate::scan::positional_deletes::PositionalDeleteScanTable
+/// [`ParquetScanTable`]: crate::scan::scan_table::ParquetScanTable
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn register_file_list(
     ctx: &SessionContext,
@@ -164,7 +164,7 @@ pub(super) async fn register_file_list(
     let schema = PartitionedScanSchema::split(table_schema, partition_columns)
         .map_err(|e| UdfError::User(format!("cannot register '{table_name}': {e}")))?;
 
-    let table = crate::scan::positional_deletes::PositionalDeleteScanTable::new(
+    let table = crate::scan::scan_table::ParquetScanTable::new(
         object_store_url,
         schema,
         use_field_id_adapter,

@@ -1,44 +1,32 @@
-//! Applies row-position deletes (Iceberg positional-delete files, Iceberg and Delta deletion
-//! vectors).
-//! Phase A reads every unique delete payload once within one shared connection budget and
-//! merges positions into one `HashMap<data_file_path, RoaringTreemap>`, mechanism-agnostic.
-//! Phase B turns each set into a base [`ParquetAccessPlan`] on the data file's
-//! `PartitionedFile`, so DataFusion's opener intersects predicate/row-group/page pruning on
-//! top and deletes compose with pushdown.
+//! Applies row-position deletes: Iceberg positional-delete files, Iceberg deletion vectors, and
+//! Delta deletion vectors.
+//! Phase A ([`ShardDeletes::collect_positions`]) reads every unique delete payload once within one
+//! shared connection budget and merges positions into one `HashMap<data_file_path,
+//! RoaringTreemap>`, mechanism-agnostic. Phase B ([`build_access_plan`]) turns each set into a base
+//! [`ParquetAccessPlan`], so DataFusion's opener intersects predicate/row-group/page pruning on top
+//! and deletes compose with pushdown.
 
 use crate::scan::deletion_vectors::{
-    DeletionVector, LoggedDeletionVector, ManifestDeletionVector, PuffinDeletionVector,
+    DeltaDeletionVector, IcebergDeletionVector, LoggedDeletionVector, ManifestDeletionVector,
 };
-use crate::scan::diagnostics;
-use crate::scan::parquet_reader::SizedParquetReader;
-use crate::scan::partition_values::PartitionedScanSchema;
-use crate::scan::raw_scan::scan_table_parquet_format;
-use crate::scan::spec::{DeleteMechanism, FileEntry, StorageBackend};
-use crate::scan::{FieldIdExprAdapterFactory, FieldIdResolution, reconstruct_abs_uri};
+use crate::scan::parquet_reader::{SizedParquetReader, object_meta_for};
+use crate::scan::reconstruct_abs_uri;
+use crate::scan::spec::{DeleteMechanism, FileEntry};
 use arrow::array::{Array, Int64Array, LargeStringArray, StringArray};
 use arrow::datatypes::SchemaRef;
-use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::TimeZone;
-use datafusion::catalog::{Session, TableProvider};
-use datafusion::datasource::TableType;
-use datafusion::datasource::file_format::FileFormat;
-use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::listing::{ListingTableUrl, PartitionedFile};
-use datafusion::datasource::object_store::ObjectStoreUrl;
+use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
-use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
-use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder};
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_plan::ExecutionPlan;
 use exasol_udf_sdk::error::UdfError;
 use futures::StreamExt;
 use futures::future::try_join_all;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
+use object_store::{
+    OBJECT_STORE_COALESCE_DEFAULT, ObjectMeta, ObjectStore, ObjectStoreExt, coalesce_ranges,
+};
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
-use parquet::file::metadata::{PageIndexPolicy, RowGroupMetaData};
+use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics;
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
@@ -55,8 +43,8 @@ const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
 /// Vendored from apache/iceberg-rust
 /// (`crates/iceberg/src/arrow/reader/positional_deletes.rs::build_deletes_row_selection`), where
 /// it is `pub(super)`. Algorithmically identical, but takes the mechanism-agnostic
-/// [`RoaringTreemap`] that Delta deletion vectors also merge into. #344.
-pub(crate) fn build_deletes_row_selection(
+/// [`RoaringTreemap`] that every delete mechanism merges into. #344.
+fn build_deletes_row_selection(
     row_group_metadata_list: &[RowGroupMetaData],
     selected_row_groups: &Option<Vec<usize>>,
     positional_deletes: &RoaringTreemap,
@@ -153,23 +141,10 @@ pub(crate) fn build_deletes_row_selection(
     results.into()
 }
 
-fn redact(msg: String, secrets: &[String]) -> String {
+pub(super) fn redact(msg: String, secrets: &[String]) -> String {
     let borrowed: Vec<&str> = secrets.iter().map(String::as_str).collect();
     let stripped = crate::scan::emit::redact_secret_values(&msg, &borrowed);
     crate::scan::emit::redact_credentials(&stripped)
-}
-
-/// Built without a HEAD; the caller supplies the size.
-fn object_meta_for(abs_uri: &str, size: u64) -> Result<ObjectMeta, UdfError> {
-    let url = ListingTableUrl::parse(abs_uri)
-        .map_err(|e| UdfError::User(format!("invalid file URL '{abs_uri}': {e}")))?;
-    Ok(ObjectMeta {
-        location: url.prefix().clone(),
-        last_modified: chrono::Utc.timestamp_nanos(0),
-        size,
-        e_tag: None,
-        version: None,
-    })
 }
 
 /// Every variant feeds ONE position map, so nothing downstream learns which mechanism produced
@@ -181,14 +156,14 @@ enum ApplicableDelete<'a> {
         path: &'a str,
         size: u64,
     },
-    DeletionVector(DeletionVector),
-    PuffinDeletionVector(PuffinDeletionVector<'a>),
+    DeltaDeletionVector(DeltaDeletionVector),
+    IcebergDeletionVector(IcebergDeletionVector<'a>),
 }
 
 /// Read-time backstop behind the plan-time adapter gate: an unapplicable mechanism is refused
 /// before any row of its data file is emitted, and the payload is reachable only through here,
-/// so it can neither be read nor silently skipped. `data_file_path` is what a deletion-vector
-/// refusal names, since its `path_or_inline_dv` is opaque.
+/// so it can neither be read nor silently skipped. A deletion vector's refusal names
+/// `data_file_path`, because the vector has no identity of its own.
 fn applicable_delete_mechanism<'a>(
     delete: &'a DeleteMechanism,
     data_file_path: &str,
@@ -208,7 +183,7 @@ fn applicable_delete_mechanism<'a>(
             offset,
             size_in_bytes,
             cardinality,
-        } => DeletionVector::resolve(
+        } => DeltaDeletionVector::resolve(
             LoggedDeletionVector {
                 storage: *storage,
                 path_or_inline_dv,
@@ -220,14 +195,14 @@ fn applicable_delete_mechanism<'a>(
             data_file_path,
             secrets,
         )
-        .map(ApplicableDelete::DeletionVector),
+        .map(ApplicableDelete::DeltaDeletionVector),
         DeleteMechanism::IcebergPuffinDeletionVector {
             path,
             size,
             content_offset,
             content_size_in_bytes,
             record_count,
-        } => PuffinDeletionVector::resolve(
+        } => IcebergDeletionVector::resolve(
             ManifestDeletionVector {
                 path,
                 size: *size,
@@ -238,7 +213,7 @@ fn applicable_delete_mechanism<'a>(
             data_file_path,
             secrets,
         )
-        .map(ApplicableDelete::PuffinDeletionVector),
+        .map(ApplicableDelete::IcebergDeletionVector),
         DeleteMechanism::IcebergEqualityDelete { path, .. } => {
             let path = redact(path.clone(), secrets);
             Err(UdfError::User(format!(
@@ -252,13 +227,13 @@ fn applicable_delete_mechanism<'a>(
 
 /// Runs `read` against `url` under one permit of the shared limiter. A failure names
 /// `data_file`, because a deletion vector has no identity of its own.
-async fn read_deletion_vector_payload<T, Fut>(
-    store: &Arc<dyn ObjectStore>,
+async fn read_deletion_vector_payload<'a, T, Fut>(
+    store: &'a dyn ObjectStore,
     limiter: &Semaphore,
     url: &str,
     data_file: &str,
     secrets: &[String],
-    read: impl FnOnce(Arc<dyn ObjectStore>, ObjectPath) -> Fut,
+    read: impl FnOnce(&'a dyn ObjectStore, ObjectPath) -> Fut,
 ) -> Result<T, UdfError>
 where
     Fut: Future<Output = object_store::Result<T>>,
@@ -277,7 +252,7 @@ where
         .map_err(|e| unreadable(format!("invalid deletion-vector URL: {e}")))?
         .prefix()
         .clone();
-    read(Arc::clone(store), location)
+    read(store, location)
         .await
         .map_err(|e| unreadable(e.to_string()))
 }
@@ -442,7 +417,7 @@ async fn read_delete_file_positions(
 }
 
 /// Splits the whole-file selection at row-group boundaries; untouched row groups stay `Scan`.
-fn build_access_plan(
+pub(super) fn build_access_plan(
     row_groups: &[RowGroupMetaData],
     deletes: &RoaringTreemap,
 ) -> ParquetAccessPlan {
@@ -458,109 +433,63 @@ fn build_access_plan(
     plan
 }
 
-/// All files go into ONE `FileGroup` (one output partition, no repartition). The plan is built
-/// through [`ParquetFormat::create_physical_plan`], which applies THIS provider's Parquet
-/// options (making row-filter pushdown per table) and a `CachedParquetFileReaderFactory` over
-/// the session [`FileMetadataCache`]. Access-plan construction reads through that same cache
-/// with the same [`ParquetFormat::metadata_size_hint`], so a footer parses once. That holds only
-/// because access-plan construction is the FIRST footer reader: the adapter always supplies a
-/// `logical_schema`, keeping `register_file_list` off the `infer_schema` fallback.
-///
-/// [`FileMetadataCache`]: datafusion::execution::cache::cache_manager::FileMetadataCache
-#[derive(Debug)]
-pub(crate) struct PositionalDeleteScanTable {
-    object_store_url: ObjectStoreUrl,
-    schema: PartitionedScanSchema,
-    use_field_id_adapter: bool,
-    field_id_resolution: FieldIdResolution,
-    files: Vec<FileEntry>,
-    table_root: String,
-    secrets: Vec<String>,
-    format: Arc<ParquetFormat>,
+/// One shard's delete mechanisms, read within the invocation's shared connection budget.
+pub(super) struct ShardDeletes<'a> {
+    pub(super) files: &'a [FileEntry],
+    pub(super) table_root: &'a str,
+    pub(super) secrets: &'a [String],
     /// Shared by every provider of one invocation (both join sides included), so the whole
     /// instance stays within one N-permit budget.
-    delete_path_read_limiter: Arc<Semaphore>,
+    pub(super) limiter: &'a Semaphore,
 }
 
-impl PositionalDeleteScanTable {
-    /// `use_field_id_adapter` is false only for legacy specs that fell back to first-file
-    /// inference. `field_id_resolution`'s nested member trees also decide this table's Parquet
-    /// read options via [`scan_table_parquet_format`].
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        object_store_url: ObjectStoreUrl,
-        schema: PartitionedScanSchema,
-        use_field_id_adapter: bool,
-        field_id_resolution: FieldIdResolution,
-        files: Vec<FileEntry>,
-        table_root: String,
-        storage: &StorageBackend,
-        delete_path_read_limiter: Arc<Semaphore>,
-    ) -> Self {
-        let secrets = storage
-            .secret_values()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let format = Arc::new(scan_table_parquet_format(&field_id_resolution));
-        Self {
-            object_store_url,
-            schema,
-            use_field_id_adapter,
-            field_id_resolution,
-            files,
-            table_root,
-            secrets,
-            format,
-            delete_path_read_limiter,
-        }
-    }
-
+impl ShardDeletes<'_> {
     /// Every mechanism passes [`applicable_delete_mechanism`] BEFORE any I/O, so an unapplicable
     /// one fails before anything is fetched. The three fan-outs share one limiter; `RoaringTreemap`
-    /// union is commutative, so completion order cannot change the result.
-    async fn collect_delete_positions(
+    /// union is commutative, so completion order cannot change the result. Keyed by absolute
+    /// data-file URI.
+    pub(super) async fn collect_positions(
         &self,
         store: &Arc<dyn ObjectStore>,
     ) -> Result<HashMap<String, RoaringTreemap>, UdfError> {
         let assigned: HashSet<String> = self
             .files
             .iter()
-            .map(|entry| reconstruct_abs_uri(&entry.path, &self.table_root))
+            .map(|entry| reconstruct_abs_uri(&entry.path, self.table_root))
             .collect();
 
         let mut delete_files: HashMap<&str, u64> = HashMap::new();
-        let mut vectors: Vec<(&str, DeletionVector)> = Vec::new();
-        let mut puffin_vectors: Vec<(&str, PuffinDeletionVector)> = Vec::new();
-        for entry in &self.files {
+        let mut delta_vectors: Vec<(&str, DeltaDeletionVector)> = Vec::new();
+        let mut iceberg_vectors: Vec<(&str, IcebergDeletionVector)> = Vec::new();
+        for entry in self.files {
             for delete in &entry.deletes {
                 match applicable_delete_mechanism(
                     delete,
                     &entry.path,
-                    &self.table_root,
-                    &self.secrets,
+                    self.table_root,
+                    self.secrets,
                 )? {
                     ApplicableDelete::PositionalDeleteFile { path, size } => {
                         delete_files.entry(path).or_insert(size);
                     }
-                    ApplicableDelete::DeletionVector(vector) => {
-                        vectors.push((entry.path.as_str(), vector));
+                    ApplicableDelete::DeltaDeletionVector(vector) => {
+                        delta_vectors.push((entry.path.as_str(), vector));
                     }
-                    ApplicableDelete::PuffinDeletionVector(vector) => {
-                        puffin_vectors.push((entry.path.as_str(), vector));
+                    ApplicableDelete::IcebergDeletionVector(vector) => {
+                        iceberg_vectors.push((entry.path.as_str(), vector));
                     }
                 }
             }
         }
 
-        if delete_files.is_empty() && vectors.is_empty() && puffin_vectors.is_empty() {
+        if delete_files.is_empty() && delta_vectors.is_empty() && iceberg_vectors.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let (per_delete_file, sidecars, per_puffin_vector) = futures::future::try_join3(
+        let (per_delete_file, sidecars, per_iceberg_vector) = futures::future::try_join3(
             self.read_delete_files(store, delete_files, &assigned),
-            self.fetch_deletion_vector_sidecars(store, &vectors),
-            self.read_puffin_deletion_vectors(store, &puffin_vectors),
+            self.fetch_delta_sidecars(store.as_ref(), &delta_vectors),
+            self.read_iceberg_deletion_vectors(store.as_ref(), &iceberg_vectors),
         )
         .await?;
 
@@ -570,63 +499,19 @@ impl PositionalDeleteScanTable {
                 *merged.entry(path).or_default() |= positions;
             }
         }
-        for (data_file, vector) in &vectors {
+        for (data_file, vector) in &delta_vectors {
             let body = vector
                 .sidecar_url()
                 .and_then(|url| sidecars.get(url))
                 .cloned();
-            let positions = vector.decode(body, data_file, &self.secrets)?;
-            let abs = reconstruct_abs_uri(data_file, &self.table_root);
+            let positions = vector.decode(body, data_file, self.secrets)?;
+            let abs = reconstruct_abs_uri(data_file, self.table_root);
             *merged.entry(abs).or_default() |= positions;
         }
-        for (abs, positions) in per_puffin_vector {
+        for (abs, positions) in per_iceberg_vector {
             *merged.entry(abs).or_default() |= positions;
         }
         Ok(merged)
-    }
-
-    /// Reads each Puffin file once, fetching only the blob ranges this shard's data files need:
-    /// one Puffin file may hold the vectors of a whole table. Returns positions keyed by absolute
-    /// data-file URI.
-    async fn read_puffin_deletion_vectors(
-        &self,
-        store: &Arc<dyn ObjectStore>,
-        vectors: &[(&str, PuffinDeletionVector<'_>)],
-    ) -> Result<Vec<(String, RoaringTreemap)>, UdfError> {
-        let mut by_puffin_file: HashMap<&str, Vec<&(&str, PuffinDeletionVector<'_>)>> =
-            HashMap::new();
-        for vector in vectors {
-            by_puffin_file
-                .entry(vector.1.path)
-                .or_default()
-                .push(vector);
-        }
-
-        let reads = by_puffin_file
-            .into_iter()
-            .map(|(puffin_path, members)| async move {
-                let ranges: Vec<Range<u64>> =
-                    members.iter().map(|(_, v)| v.range.clone()).collect();
-                // A shared Puffin file is named by its first referrer.
-                let blobs = read_deletion_vector_payload(
-                    store,
-                    &self.delete_path_read_limiter,
-                    &reconstruct_abs_uri(puffin_path, &self.table_root),
-                    members[0].0,
-                    &self.secrets,
-                    |store, location| async move { store.get_ranges(&location, &ranges).await },
-                )
-                .await?;
-                members
-                    .iter()
-                    .zip(blobs)
-                    .map(|((data_file, vector), blob)| {
-                        let positions = vector.decode(&blob, data_file, &self.secrets)?;
-                        Ok((reconstruct_abs_uri(data_file, &self.table_root), positions))
-                    })
-                    .collect::<Result<Vec<_>, UdfError>>()
-            });
-        Ok(try_join_all(reads).await?.into_iter().flatten().collect())
     }
 
     /// No HEAD: each [`ObjectMeta`] is built from the spec-supplied size.
@@ -636,31 +521,28 @@ impl PositionalDeleteScanTable {
         delete_files: HashMap<&str, u64>,
         assigned: &HashSet<String>,
     ) -> Result<Vec<HashMap<String, RoaringTreemap>>, UdfError> {
-        let reads = delete_files.into_iter().map(|(delete_path, delete_size)| {
-            let store = Arc::clone(store);
-            let limiter = Arc::clone(&self.delete_path_read_limiter);
-            let secrets = self.secrets.as_slice();
-            let table_root = self.table_root.as_str();
-            async move {
-                let _permit = limiter
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| UdfError::User(format!("delete-read limiter unavailable: {e}")))?;
-                let delete_abs = reconstruct_abs_uri(delete_path, table_root);
+        let reads = delete_files
+            .into_iter()
+            .map(|(delete_path, delete_size)| async move {
+                let _permit =
+                    self.limiter.acquire().await.map_err(|e| {
+                        UdfError::User(format!("delete-read limiter unavailable: {e}"))
+                    })?;
+                let delete_abs = reconstruct_abs_uri(delete_path, self.table_root);
                 let delete_meta = object_meta_for(&delete_abs, delete_size)?;
-                read_delete_file_positions(store, delete_meta, assigned, secrets).await
-            }
-        });
+                read_delete_file_positions(Arc::clone(store), delete_meta, assigned, self.secrets)
+                    .await
+            });
         try_join_all(reads).await
     }
 
     /// Fetched WHOLE, not by the descriptor's range: the decoder validates the version byte at
     /// position 0, and one body can then serve every descriptor naming it. No HEAD: descriptors
     /// carry the vector's size, never the sidecar's.
-    async fn fetch_deletion_vector_sidecars(
+    async fn fetch_delta_sidecars(
         &self,
-        store: &Arc<dyn ObjectStore>,
-        vectors: &[(&str, DeletionVector)],
+        store: &dyn ObjectStore,
+        vectors: &[(&str, DeltaDeletionVector)],
     ) -> Result<HashMap<Url, Bytes>, UdfError> {
         // A failed fetch must name a DATA file; a shared sidecar is named by its first referrer.
         let mut unique: HashMap<&Url, &str> = HashMap::new();
@@ -673,10 +555,10 @@ impl PositionalDeleteScanTable {
         let reads = unique.into_iter().map(|(url, data_file)| async move {
             let body = read_deletion_vector_payload(
                 store,
-                &self.delete_path_read_limiter,
+                self.limiter,
                 url.as_str(),
                 data_file,
-                &self.secrets,
+                self.secrets,
                 |store, location| async move { store.get(&location).await?.bytes().await },
             )
             .await?;
@@ -685,148 +567,56 @@ impl PositionalDeleteScanTable {
         Ok(try_join_all(reads).await?.into_iter().collect())
     }
 
-    /// Partition values convert first, so a spec-content failure precedes every fetch.
-    ///
-    /// Only delete-carrying entries take a limiter permit, fetching their own footer through the
-    /// shared session [`FileMetadataCache`] with the opener's size hint and page index skipped
-    /// ([`build_access_plan`] needs only row counts), so the footer parses once for both. Each
-    /// fetched footer is recorded via [`diagnostics::record_access_plan_cached_footer`] so a
-    /// cache eviction is observable.
-    ///
-    /// [`FileMetadataCache`]: datafusion::execution::cache::cache_manager::FileMetadataCache
-    async fn partitioned_files(
+    /// Fetches only the blob ranges this shard's data files need, because one Puffin file may hold
+    /// the vectors of a whole table. Ranges of one Puffin file are merged into as few requests as
+    /// the gaps allow, each under its own permit. Returns positions keyed by absolute data-file
+    /// URI.
+    async fn read_iceberg_deletion_vectors(
         &self,
-        state: &dyn Session,
-    ) -> Result<Vec<PartitionedFile>, UdfError> {
-        let partition_values = self
-            .files
-            .iter()
-            .map(|entry| self.schema.partition_values_for(entry))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| UdfError::User(redact(e, &self.secrets)))?;
+        store: &dyn ObjectStore,
+        vectors: &[(&str, IcebergDeletionVector<'_>)],
+    ) -> Result<Vec<(String, RoaringTreemap)>, UdfError> {
+        let mut by_puffin_file: HashMap<&str, Vec<&(&str, IcebergDeletionVector<'_>)>> =
+            HashMap::new();
+        for vector in vectors {
+            by_puffin_file
+                .entry(vector.1.path)
+                .or_default()
+                .push(vector);
+        }
 
-        let store = state
-            .runtime_env()
-            .object_store(&self.object_store_url)
-            .map_err(|e| {
-                UdfError::User(redact(
-                    format!("scan object store unavailable: {e}"),
-                    &self.secrets,
-                ))
-            })?;
-        let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
-
-        let delete_positions = self.collect_delete_positions(&store).await?;
-
-        let size_hint = self.format.metadata_size_hint();
-        let delete_positions_ref = &delete_positions;
-        let builds = self.files.iter().zip(partition_values).map(|(entry, values)| {
-            let store = Arc::clone(&store);
-            let metadata_cache = Arc::clone(&metadata_cache);
-            let limiter = Arc::clone(&self.delete_path_read_limiter);
-            let secrets = self.secrets.as_slice();
-            let table_root = self.table_root.as_str();
-            async move {
-                let abs = reconstruct_abs_uri(&entry.path, table_root);
-                let meta = object_meta_for(&abs, entry.size)?;
-                let partitioned = PartitionedFile::from(meta.clone()).with_partition_values(values);
-
-                let Some(deletes) = delete_positions_ref
-                    .get(abs.as_str())
-                    .filter(|positions| !positions.is_empty())
-                else {
-                    return Ok(partitioned);
+        let reads = by_puffin_file
+            .into_iter()
+            .map(|(puffin_path, members)| async move {
+                let url = reconstruct_abs_uri(puffin_path, self.table_root);
+                let ranges: Vec<Range<u64>> =
+                    members.iter().map(|(_, v)| v.range.clone()).collect();
+                // A shared Puffin file is named by its first referrer. `get_ranges` would run its
+                // merged requests concurrently under the caller's single permit.
+                let fetch = |range| {
+                    read_deletion_vector_payload(
+                        store,
+                        self.limiter,
+                        &url,
+                        members[0].0,
+                        self.secrets,
+                        |store, location| async move { store.get_range(&location, range).await },
+                    )
                 };
-
-                let permit = limiter.acquire_owned().await.map_err(|e| {
-                    UdfError::User(redact(
-                        format!(
-                            "delete_path_read_limiter permit unavailable for data-file footer fetch of {abs}: {e}"
-                        ),
-                        secrets,
-                    ))
-                })?;
-                let parquet_metadata = DFParquetMetadata::new(store.as_ref(), &meta)
-                    .with_file_metadata_cache(Some(metadata_cache))
-                    .with_metadata_size_hint(size_hint)
-                    .with_page_index_policy(Some(PageIndexPolicy::Skip))
-                    .fetch_metadata()
-                    .await
-                    .map_err(|e| {
-                        UdfError::User(redact(
-                            format!(
-                                "failed to read data-file metadata for delete application: {e}"
-                            ),
-                            secrets,
-                        ))
-                    })?;
-                diagnostics::record_access_plan_cached_footer(&meta.location);
-                drop(permit);
-
-                let access_plan = build_access_plan(parquet_metadata.row_groups(), deletes);
-                Ok(partitioned.with_extension(access_plan))
-            }
-        });
-        try_join_all(builds).await
-    }
-}
-
-#[async_trait]
-impl TableProvider for PositionalDeleteScanTable {
-    /// DECLARED column order; the `file ++ partition` split stays inside [`Self::scan`].
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(self.schema.declared_schema())
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        limit: Option<usize>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let files = self
-            .partitioned_files(state)
-            .await
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-
-        let file_source = self
-            .format
-            .file_source(self.schema.file_source_schema().clone());
-
-        let expr_adapter = self.use_field_id_adapter.then(|| {
-            Arc::new(FieldIdExprAdapterFactory {
-                resolution: self.field_id_resolution.clone(),
-                table_root: self.table_root.clone(),
-            }) as Arc<_>
-        });
-
-        // DataFusion splits the one file group into `target_partitions` byte ranges, and each
-        // range keeps its file's base access plan.
-        let config = FileScanConfigBuilder::new(self.object_store_url.clone(), file_source)
-            .with_file_group(FileGroup::new(files))
-            .with_projection_indices(self.schema.remap_projection(projection))?
-            .with_limit(limit)
-            .with_expr_adapter(expr_adapter)
-            .build();
-
-        self.format.create_physical_plan(state, config).await
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
-        // Inexact, like `ListingTable`: the scan prunes with it, but a `FilterExec` above keeps
-        // correctness independent of the scan.
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+                let blobs = coalesce_ranges(&ranges, fetch, OBJECT_STORE_COALESCE_DEFAULT).await?;
+                members
+                    .iter()
+                    .zip(blobs)
+                    .map(|((data_file, vector), blob)| {
+                        let positions = vector.decode(&blob, data_file, self.secrets)?;
+                        Ok((reconstruct_abs_uri(data_file, self.table_root), positions))
+                    })
+                    .collect::<Result<Vec<_>, UdfError>>()
+            });
+        Ok(try_join_all(reads).await?.into_iter().flatten().collect())
     }
 }
 
 #[cfg(test)]
-#[path = "positional_deletes_tests.rs"]
+#[path = "row_deletes_tests.rs"]
 mod tests;

@@ -740,7 +740,7 @@ impl FileEntry {
         }
     }
 
-    /// Callers must not mix a deletion vector with an Iceberg delete-file reference.
+    /// Callers must not mix a Delta deletion vector with an Iceberg delete-file reference.
     pub fn with_deletes(path: impl Into<String>, size: u64, deletes: Vec<DeleteMechanism>) -> Self {
         FileEntry {
             path: path.into(),
@@ -968,7 +968,7 @@ impl ScanSpec {
         serde_json::to_string(files).expect("files list serialization is infallible")
     }
 
-    /// Refuses an entry mixing a deletion vector with an Iceberg delete-file
+    /// Refuses an entry mixing a Delta deletion vector with an Iceberg delete-file
     /// reference: applying both returns wrong rows, and this is the one gate that
     /// holds for a payload this process did not build.
     pub fn files_from_json(s: &str) -> Result<Vec<FileEntry>, String> {
@@ -984,19 +984,19 @@ impl ScanSpec {
 
         for (index, entry) in files.iter().enumerate() {
             let mut delete_files = false;
-            let mut deletion_vectors = false;
+            let mut delta_vectors = false;
             for mechanism in &entry.deletes {
                 if mechanism.is_delete_file_reference() {
                     delete_files = true;
                 } else {
-                    deletion_vectors = true;
+                    delta_vectors = true;
                 }
             }
-            if delete_files && deletion_vectors {
+            if delete_files && delta_vectors {
                 return Err(format!(
-                    "scan files deserialization failed (entry {index} mixes a deletion vector \
-                     with an Iceberg delete-file reference; the two are independent delete \
-                     mechanisms, so applying both to one data file returns wrong rows)"
+                    "scan files deserialization failed (entry {index} mixes a Delta deletion \
+                     vector with an Iceberg delete-file reference; the two are independent \
+                     delete mechanisms, so applying both to one data file returns wrong rows)"
                 ));
             }
         }

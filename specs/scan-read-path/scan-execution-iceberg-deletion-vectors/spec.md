@@ -13,7 +13,7 @@ The normative shapes this feature reads, quoted from the Iceberg table spec and 
 
 The adapter carries each deletion vector as the Puffin deletion-vector delete mechanism: the Puffin file's path and size, the blob's offset and length, and the manifest's `record_count`. Which vector applies to which data file follows iceberg-rust's delete matching, which also drops a data file's positional delete files when a vector applies to it.
 
-The scan fetches only the blobs' byte ranges, because one Puffin file holds the vectors of many data files. It reads each Puffin file once per shard, under one permit of the connection-budget limiter that delete-file reads and Delta sidecar fetches share (`scan-read-path/scan-execution-positional-deletes-fanout`). It decodes the blob with iceberg-rust's decoder and feeds the positions into the position map and access-plan pipeline that positional deletes and Delta deletion vectors share (`scan-read-path/scan-execution-positional-deletes`).
+The scan fetches only the blobs' byte ranges, because one Puffin file holds the vectors of many data files. It merges the ranges of one Puffin file that lie less than 1 MiB apart (object_store's `OBJECT_STORE_COALESCE_DEFAULT`) into one request. Each request holds its own permit of the connection-budget limiter that every delete read shares. It decodes the blob with iceberg-rust's decoder and feeds the positions into the pipeline that every row-position delete mechanism shares (`scan-read-path/scan-execution-row-position-deletes`).
 
 ## Scenarios
 
@@ -30,12 +30,13 @@ The scan fetches only the blobs' byte ranges, because one Puffin file holds the 
 * *WHEN* a query projects columns, filters, applies ORDER BY with LIMIT, or aggregates
 * *THEN* the rows that the filter, the LIMIT, and the aggregates see SHALL already exclude the deleted rows
 
-### Scenario: A Puffin file holding several of a shard's vectors is read once
+### Scenario: A shard fetches only its own blobs of a shared Puffin file within the connection budget
 
 * *GIVEN* a shard whose assigned data files carry deletion vectors stored as blobs of one Puffin file
 * *WHEN* the scan reads those vectors
-* *THEN* the scan SHALL read that Puffin file once for the whole shard, under one permit of the shared connection-budget limiter
-* *AND* the scan SHALL fetch only the byte ranges of the blobs that the shard's data files need, never the whole Puffin file
+* *THEN* the scan SHALL fetch only the byte ranges of the blobs that the shard's data files need, never the whole Puffin file
+* *AND* the scan SHALL fetch blobs that lie less than 1 MiB apart in one ranged request
+* *AND* each ranged request SHALL hold its own permit of the shared size-N limiter, so the shard's in-flight Puffin reads never exceed N
 * *AND* each data file SHALL receive the positions of its own blob only
 
 ### Scenario: An Iceberg deletion vector that cannot be applied fails the scan

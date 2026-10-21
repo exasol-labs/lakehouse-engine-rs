@@ -478,6 +478,7 @@ fn e2e_deletes_with_single_and_grouped_agg() {
     );
 }
 
+/// Scenario: Positional-delete file references are carried in the per-shard files argument
 #[test]
 fn fixture_spark_deletion_vector_table() {
     setup_e2e();
@@ -585,7 +586,7 @@ fn e2e_deletion_vectors_return_post_delete_rows() {
 /// Scenario: An unsupported delete mechanism fails loud at plan time
 /// Scenario: An unsupported delete mechanism on a pruned file does not fail the query
 #[test]
-fn e2e_unsupported_delete_fails_loud() {
+fn e2e_unsupported_data_file_format_fails_loud() {
     setup_e2e();
     let mut conn = exa_conn();
     let table = vs_table(LAKEHOUSE_VS, UNSUPPORTED_FORMAT_TABLE);

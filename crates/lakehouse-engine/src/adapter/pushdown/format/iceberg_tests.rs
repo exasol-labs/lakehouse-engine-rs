@@ -313,6 +313,7 @@ fn delete_file(
         .expect("a delete file")
 }
 
+/// Scenario: Positional-delete files are preserved into the scan spec
 #[test]
 fn planned_file_entry_carries_parquet_positional_deletes_and_deletion_vectors() {
     let task = scan_task(

@@ -25,5 +25,5 @@ The scan decodes Iceberg deletion vectors with iceberg-rust's public deletion-ve
 
 ### Consequences
 
-- The scan fetches only the blobs' byte ranges, not the whole Puffin file, and reads each Puffin file once per shard.
+- The scan fetches only the blobs' byte ranges, not the whole Puffin file. Ranges less than 1 MiB apart share one request, and each request holds its own limiter permit.
 - A change to the Iceberg blob format arrives with an iceberg-rust upgrade.

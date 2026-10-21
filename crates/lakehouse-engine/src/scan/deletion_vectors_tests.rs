@@ -44,8 +44,8 @@ fn logged(
 fn resolve(
     storage: DeltaDeletionVectorStorage,
     path_or_inline_dv: &str,
-) -> Result<DeletionVector, UdfError> {
-    DeletionVector::resolve(
+) -> Result<DeltaDeletionVector, UdfError> {
+    DeltaDeletionVector::resolve(
         logged(storage, path_or_inline_dv),
         TABLE_ROOT,
         &data_file(),
@@ -224,7 +224,7 @@ fn descriptors_the_protocol_forbids_are_refused_before_any_fetch() {
         );
     }
 
-    let short_size = DeletionVector::resolve(
+    let short_size = DeltaDeletionVector::resolve(
         LoggedDeletionVector {
             size_in_bytes: 3,
             ..logged(DeltaDeletionVectorStorage::UuidRelative, LOGGED_PATH)
@@ -243,7 +243,7 @@ fn descriptors_the_protocol_forbids_are_refused_before_any_fetch() {
         "a UUID-relative path with no Z85 UUID",
     );
     assert_clean_refusal(
-        DeletionVector::resolve(
+        DeltaDeletionVector::resolve(
             LoggedDeletionVector {
                 cardinality: -1,
                 ..logged(DeltaDeletionVectorStorage::UuidRelative, LOGGED_PATH)
@@ -258,7 +258,7 @@ fn descriptors_the_protocol_forbids_are_refused_before_any_fetch() {
 
 #[test]
 fn decoded_set_disagreeing_with_the_declared_cardinality_fails_the_scan() {
-    let overstated = DeletionVector::resolve(
+    let overstated = DeltaDeletionVector::resolve(
         LoggedDeletionVector {
             cardinality: LOGGED_CARDINALITY + 1,
             ..logged(DeltaDeletionVectorStorage::UuidRelative, LOGGED_PATH)
@@ -286,8 +286,8 @@ fn puffin_vector(
     offset: u64,
     length: u64,
     cardinality: u64,
-) -> Result<PuffinDeletionVector<'static>, UdfError> {
-    PuffinDeletionVector::resolve(
+) -> Result<IcebergDeletionVector<'static>, UdfError> {
+    IcebergDeletionVector::resolve(
         ManifestDeletionVector {
             path: "dv.puffin",
             size: file_size,

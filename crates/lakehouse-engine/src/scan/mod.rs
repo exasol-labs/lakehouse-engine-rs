@@ -1,7 +1,6 @@
 pub mod convert;
 pub mod diagnostics;
 pub mod emit;
-pub mod positional_deletes;
 pub mod runtime;
 pub(crate) mod sealed;
 pub mod spec;
@@ -48,6 +47,8 @@ use storage_ref::resolve_scan_storage;
 mod store_router;
 
 mod deletion_vectors;
+mod row_deletes;
+mod scan_table;
 
 mod partition_values;
 pub(crate) use partition_values::{non_null_partition_value, partition_scalar};

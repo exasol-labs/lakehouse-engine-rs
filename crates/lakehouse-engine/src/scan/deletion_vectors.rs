@@ -1,7 +1,7 @@
-//! Decodes Delta and Iceberg deletion vectors into the [`RoaringTreemap`] the positional-delete
-//! pipeline consumes. Both decoders are used only as pure bytes-to-bitmap functions: the scan
-//! fetches the bytes itself, and [`DeletionVector::decode`] hands them to `delta_kernel` through
-//! an in-memory [`StorageHandler`] that performs no I/O.
+//! Decodes Delta and Iceberg deletion vectors into the [`RoaringTreemap`] the row-delete pipeline
+//! consumes. Both decoders are used only as pure bytes-to-bitmap functions: the scan fetches the
+//! bytes itself, and [`DeltaDeletionVector::decode`] hands them to `delta_kernel` through an
+//! in-memory [`StorageHandler`] that performs no I/O.
 
 use crate::scan::emit::{redact_credentials, redact_secret_values};
 use crate::scan::spec::DeltaDeletionVectorStorage;
@@ -41,13 +41,13 @@ pub(crate) struct LoggedDeletionVector<'a> {
 /// Resolution and decoding are separate so the scan can dedup and fetch sidecars on its own
 /// bounded path; decoding takes the bytes as an argument so this type cannot perform I/O.
 #[derive(Debug, Clone)]
-pub(crate) struct DeletionVector {
+pub(crate) struct DeltaDeletionVector {
     descriptor: DeletionVectorDescriptor,
     sidecar: Option<Url>,
     cardinality: u64,
 }
 
-impl DeletionVector {
+impl DeltaDeletionVector {
     /// `data_file_path` is what a refusal names: a deletion vector has no identity of its own.
     pub(crate) fn resolve(
         logged: LoggedDeletionVector<'_>,
@@ -106,7 +106,7 @@ impl DeletionVector {
 fn resolve_descriptor(
     logged: LoggedDeletionVector<'_>,
     table_root: &str,
-) -> Result<DeletionVector, String> {
+) -> Result<DeltaDeletionVector, String> {
     let cardinality = u64::try_from(logged.cardinality).map_err(|_| {
         format!(
             "the log declares a negative cardinality of {}",
@@ -151,7 +151,7 @@ fn resolve_descriptor(
         ),
         None => (DeletionVectorStorageType::Inline, logged.path_or_inline_dv),
     };
-    Ok(DeletionVector {
+    Ok(DeltaDeletionVector {
         descriptor: kernel_descriptor(storage_type, path, &logged)?,
         sidecar,
         cardinality,
@@ -194,13 +194,13 @@ pub(crate) struct ManifestDeletionVector<'a> {
 
 /// One `deletion-vector-v1` blob inside a Puffin file that may hold many data files' vectors.
 #[derive(Debug, Clone)]
-pub(crate) struct PuffinDeletionVector<'a> {
+pub(crate) struct IcebergDeletionVector<'a> {
     pub(crate) path: &'a str,
     pub(crate) range: Range<u64>,
     cardinality: u64,
 }
 
-impl<'a> PuffinDeletionVector<'a> {
+impl<'a> IcebergDeletionVector<'a> {
     pub(crate) fn resolve(
         manifest: ManifestDeletionVector<'a>,
         data_file_path: &str,

@@ -1,8 +1,12 @@
 use super::*;
 use crate::scan::spec::DeltaDeletionVectorStorage;
+use async_trait::async_trait;
+use chrono::TimeZone;
+use object_store::GetRange;
 use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
 use parquet::schema::types::{SchemaDescPtr, SchemaDescriptor};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn build_test_row_group_meta(
     schema_descr: SchemaDescPtr,
@@ -275,7 +279,7 @@ fn only_the_iceberg_equality_delete_mechanism_is_refused() {
         cardinality: 2,
     };
     let applied = applicable_delete_mechanism(&delta, data_file, &table_root, &secrets).unwrap();
-    let ApplicableDelete::DeletionVector(vector) = applied else {
+    let ApplicableDelete::DeltaDeletionVector(vector) = applied else {
         panic!("a Delta deletion vector reaches the delete-application pipeline, not a refusal");
     };
     assert!(
@@ -308,8 +312,8 @@ fn only_the_iceberg_equality_delete_mechanism_is_refused() {
         record_count: 2,
     };
     let applied = applicable_delete_mechanism(&puffin, data_file, &table_root, &secrets).unwrap();
-    let ApplicableDelete::PuffinDeletionVector(vector) = applied else {
-        panic!("a Puffin deletion vector reaches the delete-application pipeline, not a refusal");
+    let ApplicableDelete::IcebergDeletionVector(vector) = applied else {
+        panic!("an Iceberg deletion vector reaches the delete-application pipeline, not a refusal");
     };
     assert_eq!(
         (vector.path, vector.range),
@@ -498,31 +502,21 @@ fn entry_with(path: &str, deletes: Vec<DeleteMechanism>) -> FileEntry {
     }
 }
 
-/// Built field-by-field since Phase A needs no session-bound state; the Parquet format still comes
-/// from the production decision.
-fn scan_table_over(
-    files: Vec<FileEntry>,
+/// Phase A over `files`, under a limiter of `permits`.
+async fn collect_positions(
+    files: &[FileEntry],
     table_root: &str,
     permits: usize,
-) -> PositionalDeleteScanTable {
-    let field_id_resolution = FieldIdResolution {
-        name_mapping: Vec::new(),
-        declared_physical_names: HashMap::new(),
-        defaults: HashMap::new(),
-        nested_members: HashMap::new(),
-    };
-    PositionalDeleteScanTable {
-        object_store_url: ObjectStoreUrl::parse("memory://").unwrap(),
-        schema: PartitionedScanSchema::split(Arc::new(arrow::datatypes::Schema::empty()), &[])
-            .expect("an empty schema declares no partition column"),
-        use_field_id_adapter: false,
-        format: Arc::new(scan_table_parquet_format(&field_id_resolution)),
-        field_id_resolution,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<HashMap<String, RoaringTreemap>, UdfError> {
+    ShardDeletes {
         files,
-        table_root: table_root.to_string(),
-        secrets: Vec::new(),
-        delete_path_read_limiter: Arc::new(Semaphore::new(permits)),
+        table_root,
+        secrets: &[],
+        limiter: &Semaphore::new(permits),
     }
+    .collect_positions(store)
+    .await
 }
 
 fn positional_delete_file_bytes(rows: &[(&str, i64)]) -> Vec<u8> {
@@ -596,7 +590,7 @@ fn puffin_file_with_two_vectors() -> (Vec<u8>, [DeleteMechanism; 2]) {
 }
 
 /// Scenario: All delete mechanisms converge on one position map and one access-plan pipeline
-/// Scenario: A Puffin file holding several of a shard's vectors is read once
+/// Scenario: A shard fetches only its own blobs of a shared Puffin file within the connection budget
 #[test]
 fn all_delete_mechanisms_converge_on_one_position_map() {
     use object_store::memory::InMemory;
@@ -609,24 +603,20 @@ fn all_delete_mechanisms_converge_on_one_position_map() {
     let delete_file_size = delete_file_bytes.len() as u64;
     let (puffin_file, [puffin_a, puffin_b]) = puffin_file_with_two_vectors();
 
-    let table = scan_table_over(
-        vec![
-            entry_with(
-                "data/iceberg.parquet",
-                vec![DeleteMechanism::IcebergPositionalDelete {
-                    path: "deletes/d.parquet".to_string(),
-                    size: delete_file_size,
-                }],
-            ),
-            entry_with("data/delta_a.parquet", vec![logged_deletion_vector()]),
-            entry_with("data/delta_b.parquet", vec![logged_deletion_vector()]),
-            entry_with("data/puffin_a.parquet", vec![puffin_a]),
-            entry_with("data/puffin_b.parquet", vec![puffin_b]),
-            entry_with("data/no_deletes.parquet", Vec::new()),
-        ],
-        TABLE_ROOT,
-        2,
-    );
+    let files = vec![
+        entry_with(
+            "data/iceberg.parquet",
+            vec![DeleteMechanism::IcebergPositionalDelete {
+                path: "deletes/d.parquet".to_string(),
+                size: delete_file_size,
+            }],
+        ),
+        entry_with("data/delta_a.parquet", vec![logged_deletion_vector()]),
+        entry_with("data/delta_b.parquet", vec![logged_deletion_vector()]),
+        entry_with("data/puffin_a.parquet", vec![puffin_a]),
+        entry_with("data/puffin_b.parquet", vec![puffin_b]),
+        entry_with("data/no_deletes.parquet", Vec::new()),
+    ];
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -657,7 +647,9 @@ fn all_delete_mechanisms_converge_on_one_position_map() {
             .unwrap();
         let counting = Arc::new(CountingObjectStore::new(inner));
         let store: Arc<dyn ObjectStore> = Arc::clone(&counting) as Arc<dyn ObjectStore>;
-        let positions = table.collect_delete_positions(&store).await.unwrap();
+        let positions = collect_positions(&files, TABLE_ROOT, 2, &store)
+            .await
+            .unwrap();
         (
             positions,
             counting.reads_of(DV_SIDECAR_NAME),
@@ -706,7 +698,84 @@ fn all_delete_mechanisms_converge_on_one_position_map() {
     }
     assert_eq!(
         puffin_reads, 1,
-        "a Puffin file holding several of the shard's vectors is read in one request"
+        "adjacent blobs of one Puffin file are fetched in one request"
+    );
+}
+
+/// Scenario: A shard fetches only its own blobs of a shared Puffin file within the connection budget
+#[test]
+fn distant_puffin_blobs_are_fetched_by_range_each_under_its_own_permit() {
+    use object_store::memory::InMemory;
+    use object_store::path::Path as StorePath;
+    use object_store::{ObjectStoreExt, PutPayload};
+
+    const TABLE_ROOT: &str = "memory:///db/t";
+    let blob = &DV_SIDECAR_BODY[1..45];
+    let gap = vec![0_u8; 2 * OBJECT_STORE_COALESCE_DEFAULT as usize];
+    let puffin_file = [b"PFA1".as_slice(), blob, &gap, blob].concat();
+    let blob_len = blob.len() as u64;
+    let first = 4..4 + blob_len;
+    let second_offset = 4 + blob_len + gap.len() as u64;
+    let second = second_offset..second_offset + blob_len;
+    let vector = |content_offset| DeleteMechanism::IcebergPuffinDeletionVector {
+        path: "deletes/dv.puffin".to_string(),
+        size: puffin_file.len() as u64,
+        content_offset,
+        content_size_in_bytes: blob_len,
+        record_count: 2,
+    };
+    let files = vec![
+        entry_with("data/a.parquet", vec![vector(first.start)]),
+        entry_with("data/b.parquet", vec![vector(second.start)]),
+    ];
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (positions, mut ranges, max_in_flight) = rt.block_on(async move {
+        let inner = Arc::new(InMemory::new());
+        inner
+            .put(
+                &StorePath::from("db/t/deletes/dv.puffin"),
+                PutPayload::from(puffin_file),
+            )
+            .await
+            .unwrap();
+        let counting = Arc::new(CountingObjectStore::new(inner));
+        let store: Arc<dyn ObjectStore> = Arc::clone(&counting) as Arc<dyn ObjectStore>;
+        let positions = collect_positions(&files, TABLE_ROOT, 1, &store)
+            .await
+            .unwrap();
+        (
+            positions,
+            counting.ranges_of("dv.puffin"),
+            counting.max_in_flight(),
+        )
+    });
+
+    for data_file in ["a", "b"] {
+        assert_eq!(
+            positions[&format!("{TABLE_ROOT}/data/{data_file}.parquet")].len(),
+            2,
+            "{data_file} gets its own blob's positions"
+        );
+    }
+    ranges.sort_by_key(|range| match range {
+        Some(GetRange::Bounded(range)) => range.start,
+        _ => u64::MAX,
+    });
+    assert_eq!(
+        ranges,
+        vec![
+            Some(GetRange::Bounded(first)),
+            Some(GetRange::Bounded(second))
+        ],
+        "only the two blob ranges are fetched, never the gap between them"
+    );
+    assert_eq!(
+        max_in_flight, 1,
+        "a one-permit budget admits one Puffin range request at a time"
     );
 }
 
@@ -715,20 +784,16 @@ fn an_unapplicable_mechanism_fails_the_shard_before_any_read() {
     use object_store::ObjectStore;
     use object_store::memory::InMemory;
 
-    let table = scan_table_over(
-        vec![
-            entry_with("data/delta.parquet", vec![logged_deletion_vector()]),
-            entry_with(
-                "data/iceberg.parquet",
-                vec![DeleteMechanism::IcebergEqualityDelete {
-                    path: "deletes/eq.parquet".to_string(),
-                    size: 10,
-                }],
-            ),
-        ],
-        "memory:///db/t",
-        2,
-    );
+    let files = vec![
+        entry_with("data/delta.parquet", vec![logged_deletion_vector()]),
+        entry_with(
+            "data/iceberg.parquet",
+            vec![DeleteMechanism::IcebergEqualityDelete {
+                path: "deletes/eq.parquet".to_string(),
+                size: 10,
+            }],
+        ),
+    ];
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -737,7 +802,9 @@ fn an_unapplicable_mechanism_fails_the_shard_before_any_read() {
     let (err, reads) = rt.block_on(async move {
         let counting = Arc::new(CountingObjectStore::new(Arc::new(InMemory::new())));
         let store: Arc<dyn ObjectStore> = Arc::clone(&counting) as Arc<dyn ObjectStore>;
-        let err = table.collect_delete_positions(&store).await.unwrap_err();
+        let err = collect_positions(&files, "memory:///db/t", 2, &store)
+            .await
+            .unwrap_err();
         (err.to_string(), counting.total_reads())
     });
 
@@ -748,11 +815,14 @@ fn an_unapplicable_mechanism_fails_the_shard_before_any_read() {
     assert_eq!(reads, 0, "no body is fetched once the backstop has refused");
 }
 
-/// Records every forwarded data read so a test can count storage trips per object.
+/// Records every forwarded data read, with its range, so a test can count storage trips per
+/// object. Each read yields once while in flight, so concurrent reads overlap observably.
 #[derive(Debug)]
 struct CountingObjectStore {
     inner: Arc<dyn ObjectStore>,
-    reads: std::sync::Mutex<Vec<String>>,
+    reads: std::sync::Mutex<Vec<(String, Option<GetRange>)>>,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
 }
 
 impl CountingObjectStore {
@@ -760,20 +830,31 @@ impl CountingObjectStore {
         Self {
             inner,
             reads: std::sync::Mutex::new(Vec::new()),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
         }
     }
 
     fn reads_of(&self, name: &str) -> usize {
+        self.ranges_of(name).len()
+    }
+
+    fn ranges_of(&self, name: &str) -> Vec<Option<GetRange>> {
         self.reads
             .lock()
             .unwrap()
             .iter()
-            .filter(|location| location.ends_with(name))
-            .count()
+            .filter(|(location, _)| location.ends_with(name))
+            .map(|(_, range)| range.clone())
+            .collect()
     }
 
     fn total_reads(&self) -> usize {
         self.reads.lock().unwrap().len()
+    }
+
+    fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
     }
 }
 
@@ -807,10 +888,19 @@ impl ObjectStore for CountingObjectStore {
         location: &object_store::path::Path,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
-        if !options.head {
-            self.reads.lock().unwrap().push(location.to_string());
+        if options.head {
+            return self.inner.get_opts(location, options).await;
         }
-        self.inner.get_opts(location, options).await
+        self.reads
+            .lock()
+            .unwrap()
+            .push((location.to_string(), options.range.clone()));
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        let result = self.inner.get_opts(location, options).await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        result
     }
 
     fn list(
@@ -845,155 +935,4 @@ impl ObjectStore for CountingObjectStore {
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
         self.inner.delete_stream(locations)
     }
-}
-
-fn scan_table_partitioned_by(
-    files: Vec<FileEntry>,
-    declared: SchemaRef,
-    partition_columns: &[String],
-) -> PositionalDeleteScanTable {
-    PositionalDeleteScanTable {
-        schema: PartitionedScanSchema::split(declared, partition_columns)
-            .expect("every partition column is declared"),
-        ..scan_table_over(files, "memory:///db/t", 1)
-    }
-}
-
-fn partitioned_declared_schema() -> SchemaRef {
-    use arrow::datatypes::{DataType, Field, Schema};
-    Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, true),
-        Field::new("part", DataType::Int32, true),
-        Field::new("payload", DataType::Utf8, true),
-    ]))
-}
-
-fn entry_in_partition(path: &str, part: Option<&str>) -> FileEntry {
-    FileEntry::with_partition_values(
-        path,
-        1,
-        std::collections::BTreeMap::from([("part".to_string(), part.map(str::to_string))]),
-    )
-}
-
-fn memory_session() -> datafusion::execution::session_state::SessionState {
-    use datafusion::prelude::SessionContext;
-    let ctx = SessionContext::new();
-    ctx.register_object_store(
-        &url::Url::parse("memory://").unwrap(),
-        Arc::new(object_store::memory::InMemory::new()),
-    );
-    ctx.state()
-}
-
-#[test]
-fn the_provider_reports_the_declared_schema_while_scanning_the_split_one() {
-    let declared = partitioned_declared_schema();
-    let table = scan_table_partitioned_by(
-        vec![entry_in_partition("data/a.parquet", Some("1"))],
-        Arc::clone(&declared),
-        &["part".to_string()],
-    );
-
-    assert_eq!(TableProvider::schema(&table).as_ref(), declared.as_ref());
-
-    let scan_schema = table.schema.file_source_schema();
-    let file_names: Vec<&str> = scan_schema
-        .file_schema()
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
-    assert_eq!(
-        file_names,
-        ["id", "payload"],
-        "the partition column is not read from any data file"
-    );
-    assert_eq!(
-        table.schema.remap_projection(None),
-        Some(vec![0, 2, 1]),
-        "declared order is restored by the projection alone"
-    );
-}
-
-#[test]
-fn each_partitioned_file_carries_its_own_logged_partition_values() {
-    let table = scan_table_partitioned_by(
-        vec![
-            entry_in_partition("data/a.parquet", Some("1")),
-            entry_in_partition("data/b.parquet", Some("2")),
-            entry_in_partition("data/default.parquet", None),
-        ],
-        partitioned_declared_schema(),
-        &["part".to_string()],
-    );
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let files = rt
-        .block_on(async { table.partitioned_files(&memory_session()).await })
-        .expect("no delete needs reading");
-
-    let values: Vec<&datafusion::scalar::ScalarValue> = files
-        .iter()
-        .map(|f| {
-            assert_eq!(
-                f.partition_values.len(),
-                1,
-                "one value per partition column"
-            );
-            &f.partition_values[0]
-        })
-        .collect();
-    assert_eq!(
-        values,
-        vec![
-            &datafusion::scalar::ScalarValue::Int32(Some(1)),
-            &datafusion::scalar::ScalarValue::Int32(Some(2)),
-            &datafusion::scalar::ScalarValue::Int32(None),
-        ]
-    );
-}
-
-#[test]
-fn an_unpartitioned_scan_attaches_no_partition_values() {
-    let table = scan_table_over(
-        vec![entry_with("data/a.parquet", Vec::new())],
-        "memory:///db/t",
-        1,
-    );
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let files = rt
-        .block_on(async { table.partitioned_files(&memory_session()).await })
-        .expect("no delete needs reading");
-
-    assert!(files[0].partition_values.is_empty());
-}
-
-#[test]
-fn an_unrepresentable_partition_value_fails_the_scan() {
-    let table = scan_table_partitioned_by(
-        vec![entry_in_partition("data/a.parquet", Some("not-a-number"))],
-        partitioned_declared_schema(),
-        &["part".to_string()],
-    );
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let error = rt
-        .block_on(async { table.partitioned_files(&memory_session()).await })
-        .expect_err("an unrepresentable partition value must never reach the query");
-
-    let message = error.to_string();
-    assert!(message.contains("part"), "{message}");
-    assert!(message.contains("Int32"), "{message}");
-    assert!(message.contains("not-a-number"), "{message}");
 }
