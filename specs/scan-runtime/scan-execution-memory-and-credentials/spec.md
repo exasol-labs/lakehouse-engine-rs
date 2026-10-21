@@ -27,7 +27,8 @@ shard-invariant common spec argument, serialized once for the whole fan-out.
   Parquet→Arrow decode and scan buffers. The configured `batch_size` is the lever
   that bounds that out-of-pool working set.
 * The row-position delete state (`scan-read-path/scan-execution-row-position-deletes`) is built
-  before the first row is emitted and lives as long as the scan. Its size is reserved in the
+  before the first row is emitted. The deleted-position sets live until the access plans are
+  built, and the access plans live until the scan finishes. Their size is reserved in the
   memory pool as a non-spillable reservation. A large delete set therefore shrinks the pool left
   for aggregation, sort, and join, and a delete set larger than the pool fails the scan instead
   of exhausting the instance.
@@ -35,9 +36,9 @@ shard-invariant common spec argument, serialized once for the whole fan-out.
   file joins its set before the next batch decodes, so no unreserved copy of the positions
   outlives one batch. The reservation equals the sets' serialized size. A decoded deletion vector
   is reserved once it is decoded. Like any decode buffer, the Arrow batch itself stays outside the
-  pool. A delete file's kept footer bytes (at most the metadata size hint, 512 KiB by default)
-  are reserved until its last row group is read, and they are not kept when the pool cannot hold
-  them.
+  pool. So do a delete file's footer bytes (at most the metadata size hint, 512 KiB by default):
+  the row groups inside them decode in the footer read's own task, and the bytes drop before that
+  task ends, so a footer's bytes are held only while its own file is fetched and decoded.
 * The `batch_size` is carried in the scan spec; a spec lacking it deserializes to a
   conservative built-in default, and a sub-1 value is clamped to 1.
 * Scan efficiency depends on the Parquet reader skipping data the predicate cannot
@@ -141,9 +142,8 @@ shard-invariant common spec argument, serialized once for the whole fan-out.
 
 * *GIVEN* a shard whose data files carry row-position deletes
 * *WHEN* the scan UDF builds the deleted-position sets and the base access plans
-* *THEN* the UDF SHALL reserve their size in the DataFusion memory pool until the scan finishes
+* *THEN* the UDF SHALL reserve the deleted-position sets in the DataFusion memory pool until the access plans are built, and the access plans until the scan finishes
 * *AND* the UDF SHALL reserve each deleted-position set as it grows, batch by batch, so a delete set larger than the pool fails while it is read rather than after it is fully built
-* *AND* the UDF SHALL release the reservation for the deleted-position sets once the access plans are built
 * *AND* a shard whose delete state does not fit the pool SHALL fail with an error naming the memory pool before any row is emitted
 
 ### Scenario: Scan bounds the Parquet decode working set via a configured batch size

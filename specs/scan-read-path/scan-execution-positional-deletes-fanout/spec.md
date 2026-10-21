@@ -46,7 +46,7 @@ specified in `scan-read-path/scan-execution-positional-deletes`.
 * *THEN* the UDF SHALL read the footer first, as ONE ranged GET of the file's last metadata-size-hint bytes, with a second GET only when the footer and metadata do not fit the hint
 * *AND* the UDF SHALL decode a row group whose `file_path` and `pos` column chunks lie inside those footer bytes from memory, issuing no request and taking no permit, so a delete file that fits the hint costs ONE GET in total
 * *AND* the UDF SHALL read every other such row group as its own request under its own permit of the shared limiter, so those row groups are read concurrently up to N in flight
-* *AND* the UDF SHALL hold the kept footer bytes in the memory pool reservation until the file's last row group is read, and SHALL read from the store instead when the pool cannot hold them
+* *AND* the UDF SHALL decode those row groups in the footer read's own task, after releasing its permit, and SHALL drop the footer bytes before that task ends, so the bytes never wait on another file's read and never hold memory-pool room that the deleted-position sets need
 * *AND* the UDF SHALL read only the `file_path` and `pos` columns, never the optional `row` column
 
 ### Scenario: Row groups that cannot contain an assigned data file's deletes are skipped

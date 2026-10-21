@@ -286,88 +286,72 @@ fn delete_row_group_may_match(
     })
 }
 
-/// A positional-delete file whose footer has been read, with the row groups that can hold
-/// deletes of an assigned data file. A row group flagged `true` lies inside the kept footer
-/// prefetch and decodes with no request.
+/// A positional-delete file whose footer has been read. The row groups inside the footer GET's
+/// bytes are already in `decoded`; `row_groups` lists the others that can hold deletes of an
+/// assigned data file.
 struct OpenedDeleteFile {
-    reader: DeleteFileReader,
+    reader: SizedParquetReader,
     metadata: ArrowReaderMetadata,
     projection: ProjectionMask,
-    row_groups: Vec<(usize, bool)>,
+    row_groups: Vec<usize>,
+    decoded: HashMap<String, RoaringTreemap>,
 }
 
-/// The bytes the footer GET fetched, kept while a row group inside them is still to be read and
-/// reserved in the memory pool for that time.
-struct Prefetched {
+/// Serves reads from the footer GET's bytes only, so decoding from them can never issue a request
+/// outside the connection budget.
+struct FooterBytes {
     start: u64,
     bytes: Bytes,
-    reservation: Arc<MemoryReservation>,
 }
 
-impl Prefetched {
-    fn slice(&self, range: &Range<u64>) -> Option<Bytes> {
+impl FooterBytes {
+    fn slice(&self, range: &Range<u64>) -> parquet::errors::Result<Bytes> {
         let end = self.start + self.bytes.len() as u64;
-        (range.start >= self.start && range.end <= end).then(|| {
-            self.bytes
-                .slice((range.start - self.start) as usize..(range.end - self.start) as usize)
-        })
-    }
-}
-
-impl Drop for Prefetched {
-    fn drop(&mut self) {
-        self.reservation.shrink(self.bytes.len());
-    }
-}
-
-/// Serves a read inside the kept footer prefetch from memory and every other read from the store.
-#[derive(Clone)]
-struct DeleteFileReader {
-    store: SizedParquetReader,
-    prefetched: Option<Arc<Prefetched>>,
-}
-
-impl AsyncFileReader for DeleteFileReader {
-    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
-        match self.prefetched.as_ref().and_then(|tail| tail.slice(&range)) {
-            Some(bytes) => futures::future::ready(Ok(bytes)).boxed(),
-            None => self.store.get_bytes(range),
+        if range.start < self.start || range.end > end {
+            return Err(ParquetError::General(format!(
+                "range {range:?} lies outside the delete file's footer bytes"
+            )));
         }
+        Ok(self
+            .bytes
+            .slice((range.start - self.start) as usize..(range.end - self.start) as usize))
+    }
+}
+
+impl AsyncFileReader for FooterBytes {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+        futures::future::ready(self.slice(&range)).boxed()
     }
 
     fn get_byte_ranges(
         &mut self,
         ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
-        let cached: Option<Vec<Bytes>> = self
-            .prefetched
-            .as_ref()
-            .and_then(|tail| ranges.iter().map(|range| tail.slice(range)).collect());
-        match cached {
-            Some(bytes) => futures::future::ready(Ok(bytes)).boxed(),
-            None => self.store.get_byte_ranges(ranges),
-        }
+        futures::future::ready(ranges.iter().map(|range| self.slice(range)).collect()).boxed()
     }
 
     fn get_metadata<'a>(
         &'a mut self,
-        options: Option<&'a ArrowReaderOptions>,
+        _options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
-        self.store.get_metadata(options)
+        futures::future::ready(Err(ParquetError::General(
+            "the footer is parsed before its bytes are decoded".into(),
+        )))
+        .boxed()
     }
 }
 
 /// Restricted to `assigned` because one partition-granularity delete file references many data
 /// files. Row groups whose `file_path` range cannot overlap are skipped, exploiting Iceberg's
 /// required (`file_path`, `pos`) sort. No HEAD is issued. The footer is one GET of the file's last
-/// `metadata_size_hint` bytes, kept while a surviving row group lies inside them, so a delete file
-/// within the hint costs one request in total.
+/// `metadata_size_hint` bytes, and the row groups inside them decode here, so a delete file within
+/// the hint costs one request in total.
 async fn open_delete_file(
     store: Arc<dyn ObjectStore>,
     delete_meta: ObjectMeta,
     metadata_size_hint: Option<usize>,
     assigned: &HashSet<String>,
-    reservation: &Arc<MemoryReservation>,
+    reservation: &MemoryReservation,
     secrets: &[String],
     limiter: &Semaphore,
 ) -> Result<OpenedDeleteFile, UdfError> {
@@ -410,48 +394,50 @@ async fn open_delete_file(
             root == file_path_idx || root == pos_idx
         })
         .collect();
-    let mut row_groups: Vec<(usize, bool)> = metadata
+    let (in_tail, row_groups): (Vec<usize>, Vec<usize>) = metadata
         .metadata()
         .row_groups()
         .iter()
         .enumerate()
         .filter(|(_, row_group)| delete_row_group_may_match(row_group, file_path_idx, assigned))
-        .map(|(idx, row_group)| {
-            let in_tail = projected_leaves
+        .map(|(idx, _)| idx)
+        .partition(|&idx| {
+            let row_group = metadata.metadata().row_group(idx);
+            projected_leaves
                 .iter()
-                .all(|&leaf| row_group.column(leaf).byte_range().0 >= tail_start);
-            (idx, in_tail)
-        })
-        .collect();
-    // The prefetch is only an optimization, so a pool that cannot hold it reads from the store.
-    let keep =
-        row_groups.iter().any(|&(_, in_tail)| in_tail) && reservation.try_grow(tail.len()).is_ok();
-    if !keep {
-        row_groups
-            .iter_mut()
-            .for_each(|(_, in_tail)| *in_tail = false);
-    }
-    let prefetched = keep.then(|| {
-        Arc::new(Prefetched {
-            start: tail_start,
-            bytes: tail,
-            reservation: Arc::clone(reservation),
-        })
-    });
+                .all(|&leaf| row_group.column(leaf).byte_range().0 >= tail_start)
+        });
+    // Decoded before the bytes drop, so they never outlive this task, stay a transient read
+    // buffer like any decode buffer, and cannot crowd the pool while other files load.
+    let decoded = if in_tail.is_empty() {
+        HashMap::new()
+    } else {
+        let stream = ParquetRecordBatchStreamBuilder::new_with_metadata(
+            FooterBytes {
+                start: tail_start,
+                bytes: tail,
+            },
+            metadata.clone(),
+        )
+        .with_row_groups(in_tail)
+        .with_projection(projection.clone())
+        .with_batch_size(DELETE_FILE_BATCH_ROWS)
+        .build()
+        .map_err(|e| UdfError::User(redact(format!("failed to read delete file: {e}"), secrets)))?;
+        row_group_positions(stream, assigned, reservation, secrets).await?
+    };
     Ok(OpenedDeleteFile {
-        reader: DeleteFileReader {
-            store: SizedParquetReader::new(store, delete_meta.location, size),
-            prefetched,
-        },
+        reader: SizedParquetReader::new(store, delete_meta.location, size),
         metadata,
         projection,
         row_groups,
+        decoded,
     })
 }
 
 impl OpenedDeleteFile {
-    /// One read per surviving row group, each under its own permit unless it decodes from the kept
-    /// footer prefetch and issues no request.
+    /// One read per remaining row group, each under its own permit. The positions decoded from
+    /// the footer bytes lead as a ready read, so callers merge them like any row group's.
     fn row_group_reads(
         self,
         assigned: &Arc<HashSet<String>>,
@@ -459,32 +445,38 @@ impl OpenedDeleteFile {
         limiter: &Arc<Semaphore>,
         reservation: &Arc<MemoryReservation>,
     ) -> Vec<Read<HashMap<String, RoaringTreemap>>> {
-        self.row_groups
-            .iter()
-            .map(|&(row_group, in_prefetch)| {
+        let Self {
+            reader,
+            metadata,
+            projection,
+            row_groups,
+            decoded,
+        } = self;
+        let decoded: Option<Read<_>> =
+            (!decoded.is_empty()).then(|| futures::future::ready(Ok(decoded)).boxed());
+        decoded
+            .into_iter()
+            .chain(row_groups.into_iter().map(|row_group| {
                 let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
-                    self.reader.clone(),
-                    self.metadata.clone(),
+                    reader.clone(),
+                    metadata.clone(),
                 )
                 .with_row_groups(vec![row_group])
-                .with_projection(self.projection.clone())
+                .with_projection(projection.clone())
                 .with_batch_size(DELETE_FILE_BATCH_ROWS);
                 let assigned = Arc::clone(assigned);
                 let secrets = Arc::clone(secrets);
                 let limiter = Arc::clone(limiter);
                 let reservation = Arc::clone(reservation);
                 let read: Read<_> = Box::pin(async move {
-                    let _permit = match in_prefetch {
-                        true => None,
-                        false => Some(acquire(&limiter).await?),
-                    };
+                    let _permit = acquire(&limiter).await?;
                     let stream = builder.build().map_err(|e| {
                         UdfError::User(redact(format!("failed to read delete file: {e}"), &secrets))
                     })?;
                     row_group_positions(stream, &assigned, &reservation, &secrets).await
                 });
                 read
-            })
+            }))
             .collect()
     }
 }
@@ -522,8 +514,8 @@ async fn delete_file_positions(
 /// The file is sorted by `file_path`, so one run of equal paths costs one set lookup. Each batch's
 /// positions join their set before the next batch decodes, so the reservation follows the sets as
 /// they grow and an oversized delete set fails mid-read.
-async fn row_group_positions(
-    mut stream: ParquetRecordBatchStream<DeleteFileReader>,
+async fn row_group_positions<R: AsyncFileReader + Unpin + Send + 'static>(
+    mut stream: ParquetRecordBatchStream<R>,
     assigned: &HashSet<String>,
     reservation: &MemoryReservation,
     secrets: &[String],

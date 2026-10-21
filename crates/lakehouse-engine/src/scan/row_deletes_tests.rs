@@ -549,7 +549,7 @@ fn delete_file_row_groups_are_read_concurrently_without_the_row_column() {
         .collect();
     assert_eq!(row_column_chunks.len(), 3);
     let file_size = buf.len() as u64;
-    // A hint covering exactly the footer leaves every row group outside the prefetch.
+    // A hint covering exactly the footer leaves every row group outside the footer bytes.
     let metadata_len = u32::from_le_bytes(buf[buf.len() - 8..buf.len() - 4].try_into().unwrap());
     let footer_len = metadata_len as usize + 8;
 
@@ -841,6 +841,65 @@ fn phase_a_fails_as_soon_as_its_sets_outgrow_the_pool() {
     );
 }
 
+/// Scenario: A delete file's row groups are read as separate requests
+#[test]
+fn footer_bytes_of_many_small_delete_files_leave_the_pool_to_the_sets() {
+    use object_store::memory::InMemory;
+    use object_store::path::Path as StorePath;
+    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+
+    const DELETE_FILES: usize = 40;
+    let mut files = Vec::new();
+    let mut payloads = Vec::new();
+    for i in 0..DELETE_FILES {
+        let data_file = format!("memory:///db/t/data/f{i:02}.parquet");
+        let bytes = positional_delete_file_bytes(&[(data_file.as_str(), 5)]);
+        files.push(entry_with(
+            &format!("data/f{i:02}.parquet"),
+            vec![DeleteMechanism::IcebergPositionalDelete {
+                path: format!("deletes/d{i:02}.parquet"),
+                size: bytes.len() as u64,
+            }],
+        ));
+        payloads.push((format!("db/t/deletes/d{i:02}.parquet"), bytes));
+    }
+    let set_bytes = [5_u64]
+        .into_iter()
+        .collect::<RoaringTreemap>()
+        .serialized_size();
+    // Half the files' footer bytes would fill this pool, while all the sets fit it many times.
+    let pool_bytes = (DELETE_FILES / 2) * payloads[0].1.len() + 1;
+    assert!(DELETE_FILES * set_bytes * 5 < pool_bytes);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let positions = rt
+        .block_on(async {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            for (path, bytes) in &payloads {
+                store
+                    .put(
+                        &StorePath::from(path.as_str()),
+                        PutPayload::from(bytes.clone()),
+                    )
+                    .await
+                    .unwrap();
+            }
+            collect_positions_within(
+                &files,
+                "memory:///db/t",
+                4,
+                &store,
+                reservation_within(pool_bytes),
+            )
+            .await
+        })
+        .expect("footer bytes never hold pool room the position sets need");
+    assert_eq!(positions.len(), DELETE_FILES);
+}
+
 /// Phase A's positional-delete steps over one delete file.
 async fn read_positions(
     store: Arc<dyn ObjectStore>,
@@ -880,7 +939,7 @@ async fn read_positions(
             .values()
             .map(RoaringTreemap::serialized_size)
             .sum::<usize>(),
-        "the footer prefetch is released once its row groups are read"
+        "the reservation holds the position sets and nothing else"
     );
     positions
 }

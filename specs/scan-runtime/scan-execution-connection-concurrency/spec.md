@@ -68,8 +68,8 @@ CPU thread/partition budget of `scan-runtime/scan-execution-threading`.
   object storage acquires EXACTLY ONE permit, holds it across ONE object-store read, and releases
   it on completion. A footer read, of a delete file or a data file, is one read when the footer
   and metadata fit the format's metadata size hint. A larger footer adds a second, sequential read
-  under the same permit. A task that only decodes positions or builds a set takes no permit, and
-  neither does a delete-file row group decoded from its file's kept footer bytes. No
+  under the same permit. A task that only decodes positions or builds a set takes no permit. A delete-file
+  footer task releases its permit before it decodes the row groups inside the footer bytes. No
   task holds a permit while awaiting another permit, and no task awaits another task. Only the
   orchestrating call awaits tasks, and it holds no permit. Phase A also completes and releases its
   permits before Phase B's fan-out starts, but the safety argument does not rely on that order.

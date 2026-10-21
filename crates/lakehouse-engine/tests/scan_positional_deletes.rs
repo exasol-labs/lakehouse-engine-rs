@@ -1202,8 +1202,9 @@ fn one_row_group_per_file_entries(files: [&str; 3], rows_per_file: usize) -> Vec
 
 #[test]
 fn scan_prunes_delete_row_groups_by_file_path() {
-    // Large enough that row-group data dwarfs the footer bytes the counter also captures.
-    const ROWS_PER_FILE: usize = 500;
+    // About 2 MB per row group, so row-group reads dwarf the footer GET, which fetches the file's
+    // last 512 KiB (DataFusion's metadata size hint) whatever is assigned.
+    const ROWS_PER_FILE: usize = 250_000;
 
     let dir = temp_dir("row_group_pruning");
     let f1 = write_data_parquet(&dir, "f1.parquet", &(0..5).collect::<Vec<_>>(), 8);
