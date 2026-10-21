@@ -176,16 +176,14 @@ creation, and the smoke test.
 ## Point the VS at your data
 
 Two statements finish the install: a catalog `CONNECTION`, then the Virtual Schema over it. The
-following example is a complete local setup with SeaweedFS and an Iceberg REST catalog, run as a DBA.
-A non-DBA needs `GRANT ACCESS ON CONNECTION ... FOR SCRIPT` for both scripts, plus
-`EXECUTE ON SCRIPT` on all three of `LAKEHOUSE_ADAPTER`, `LAKEHOUSE_SCAN`, and
-`LAKEHOUSE_DISTRIBUTE_FILES`, before `CREATE VIRTUAL SCHEMA` — see [Security](security.md).
-Re-running the installer re-creates all three scripts (`CREATE OR REPLACE SCRIPT`), which drops
-every one of those `EXECUTE ON SCRIPT` grants along with the connection-access grant; re-issue all
-of them afterward.
+following example is a complete local setup with SeaweedFS and an Iceberg REST catalog, run as `SYS`.
+Any other user that creates the Virtual Schema owns it and needs the
+[owner grants](security.md#owner-grants) first. A re-install drops per-script grants, and
+`CREATE OR REPLACE CONNECTION` drops the CONNECTION's grants (see
+[Re-installing](security.md#re-installing)).
 
 ```sql
-CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
+CREATE CONNECTION LAKEHOUSE_CATALOG_CREDS
   TO 'http://iceberg-rest:8181'
   USER ''
   IDENTIFIED BY '{
@@ -210,11 +208,8 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 - **AWS Glue, Lakekeeper, Unity Catalog (Delta tables), and the full credential-JSON reference** are in [Catalogs](catalogs.md).
 - **Tuning properties** (`PARALLELISM_FACTOR`, memory pool sizing, DataFusion partitions/threads,
   and more) are in [Tuning](tuning.md).
-- **Before granting other users access**, read [Security](security.md) — both scripts need a
-  CONNECTION grant held by the VS owner, and `GRANT SELECT ON SCHEMA` is the real auth boundary.
-  An end user needs only `GRANT CREATE SESSION` plus `GRANT SELECT ON SCHEMA <vs>` — nothing else,
-  and re-running this installer never touches that grant. Only the owner-held `EXECUTE ON SCRIPT`
-  and `GRANT ACCESS ON CONNECTION` grants above need re-issuing after a re-install.
+- **Before granting other users access**, read [Security](security.md). A user who only queries
+  the Virtual Schema needs `CREATE SESSION` and `SELECT` on it, and nothing else.
 
 ## Query
 

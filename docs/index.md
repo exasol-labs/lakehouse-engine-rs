@@ -28,7 +28,7 @@ GROUP BY l_returnflag;
 |-------|----------------|
 | [Install](install.md) | One command installs the engine on any Exasol deployment: SaaS, Exasol AsApp, Docker, or on-premise. It uploads the `.so`, registers the Rust SLC, and creates the scripts. Build-from-source and fully manual paths are covered too, as appendices. |
 | [Catalogs](catalogs.md) | Connect to Iceberg REST (including Lakekeeper), Unity Catalog, AWS Glue, and direct storage: CONNECTION objects, credentials, and object-storage access. |
-| [Security](security.md) | The CONNECTION-access privilege model (the grant belongs to the Virtual Schema's OWNER, once per deployment — not to each reader), a role as owner, the errors a missing grant gives, what a `SELECT`-only Virtual Schema user can and cannot read, the Lakekeeper per-user permission check (setup, `USER_MAPPING`, and its trust model), the sealed vended-credential envelope, and rotation. |
+| [Security](security.md) | Who needs which grant: a reader needs only `SELECT`, the Virtual Schema's owner holds the script and CONNECTION grants (per script or per schema, directly or through a role), what a re-install drops, and the error each missing grant gives. Also what a `SELECT`-only Virtual Schema user can and cannot read, the Lakekeeper per-user permission check (setup, `USER_MAPPING`, and its trust model), the sealed vended-credential envelope, and rotation. |
 | [Benchmark](benchmark.md) | The benchmark query set and how to run it yourself. |
 | [Architecture](architecture.md) | How cluster and DataFusion parallelism combine: file sharding, `GROUP BY shard_key` fan-out, and how pushdown meets parent-level Exasol execution. |
 | [Capabilities](capabilities.md) | Pushdown support matrix: what runs in DataFusion versus Exasol. |
@@ -38,7 +38,7 @@ GROUP BY l_returnflag;
 
 ## Start here
 
-- **Deploying for the first time?** Read [Install](install.md). Then read [Catalogs](catalogs.md) to point the VS at your data, and [Security](security.md) to grant the adapter and scan scripts access to the CONNECTION safely (on the Virtual Schema's owner, before creating it).
+- **Deploying for the first time?** Read [Install](install.md). Then read [Catalogs](catalogs.md) to point the VS at your data, and [Security](security.md) to give the Virtual Schema's owner its grants before creating it.
 - **Evaluating the approach?** Read [Architecture](architecture.md) and [Benchmark](benchmark.md).
 - **Tuning a running deployment?** Read [Capabilities](capabilities.md) and [Tuning](tuning.md).
 - **A query does not push down the way you expect?** Read [Debugging pushdown](debugging-pushdown.md).

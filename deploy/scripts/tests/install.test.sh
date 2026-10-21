@@ -1207,13 +1207,13 @@ test_stops_at_product_prints_template() {
   reset_env
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_zero "template: install succeeds" "$LAST_RC"
-  assert_contains "template: prints CREATE CONNECTION" "$LAST_OUT" "CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS"
+  assert_contains "template: prints CREATE CONNECTION" "$LAST_OUT" "CREATE CONNECTION LAKEHOUSE_CATALOG_CREDS"
   assert_contains "template: prints CREATE VIRTUAL SCHEMA" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
   assert_contains "template: prints the NAMESPACE property" "$LAST_OUT" "NAMESPACE          = "
   assert_contains "template: references the adapter script" "$LAST_OUT" "LHVS.LAKEHOUSE_ADAPTER"
   local log; log="$(log_content)"
   assert_not_contains "template: does NOT execute CREATE VIRTUAL SCHEMA" "$log" "CREATE VIRTUAL SCHEMA"
-  assert_not_contains "template: does NOT execute CREATE CONNECTION" "$log" "CREATE OR REPLACE CONNECTION"
+  assert_not_contains "template: does NOT execute CREATE CONNECTION" "$log" "CREATE CONNECTION"
 }
 
 test_target_base_default_and_override() {
