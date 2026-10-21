@@ -415,10 +415,13 @@ fn a_schema_scoped_grant_replaces_both_script_grants() {
     }
 
     denial_text(&without_grants);
+    let count = &with_schema_grant["responseData"]["results"][0]["resultSet"]["data"][0][0];
     assert_eq!(
-        with_schema_grant["status"].as_str(),
-        Some("ok"),
-        "schema-scoped grant must allow the query: {with_schema_grant}"
+        count
+            .as_i64()
+            .or_else(|| count.as_str().and_then(|s| s.parse().ok())),
+        Some(SEED_TOTAL_ROWS as i64),
+        "schema-scoped grant must return the owner's rows: {with_schema_grant}"
     );
     assert_eq!(
         reader_conn().query_scalar_i64(&count_sql(VS_NAME)),
