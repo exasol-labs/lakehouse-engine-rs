@@ -18,6 +18,7 @@ const READER_USER: &str = "CREDEXP_READER";
 const OWNER_ROLE: &str = "CREDEXP_OWNER_ROLE";
 const ROLE_VS_NAME: &str = "CREDEXP_ROLE_VS";
 const ROLE_MEMBER_USER: &str = "CREDEXP_ROLE_MEMBER";
+const MEMBER_ROLE: &str = "CREDEXP_MEMBER_ROLE";
 const INSTALLER_USER: &str = "CREDEXP_INSTALLER";
 const INSTALLER_ROLE: &str = "CREDEXP_INSTALLER_ROLE";
 const INSTALLER_SCHEMA: &str = "CREDEXP_INSTALLER_SCRIPTS";
@@ -105,9 +106,19 @@ fn schema_grants(schema: &str, conn: &str, grantee: &str) -> [String; 2] {
     ]
 }
 
-/// Runs a diagnostic query of `docs/security.md`. Each row is text, a NULL cell is empty.
+/// Runs a diagnostic query of `docs/security.md` as a DBA.
 fn diagnose(query: &str, placeholder: &str, value: &str) -> Vec<Vec<String>> {
-    let columns = exa_conn().query_columns(&query.replace(placeholder, value));
+    diagnose_as(&mut exa_conn(), query, placeholder, value)
+}
+
+/// Runs a diagnostic query as `conn`. Each row is text, a NULL cell is empty.
+fn diagnose_as(
+    conn: &mut ExaConn,
+    query: &str,
+    placeholder: &str,
+    value: &str,
+) -> Vec<Vec<String>> {
+    let columns = conn.query_columns(&query.replace(placeholder, value));
     (0..columns.first().map_or(0, Vec::len))
         .map(|row| {
             columns
@@ -269,7 +280,7 @@ fn setup_e2e() {
         ] {
             let _ = sys.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs} CASCADE"));
         }
-        for role in [OWNER_ROLE, INSTALLER_ROLE] {
+        for role in [OWNER_ROLE, MEMBER_ROLE, INSTALLER_ROLE] {
             sys.execute(&format!("DROP ROLE IF EXISTS {role} CASCADE"));
         }
         for user in [
@@ -315,7 +326,10 @@ fn setup_e2e() {
         sys.execute(&format!(
             "ALTER VIRTUAL SCHEMA {ROLE_VS_NAME} CHANGE OWNER {OWNER_ROLE}"
         ));
-        create_user(&mut sys, ROLE_MEMBER_USER, &["CREATE SESSION", OWNER_ROLE]);
+        // The member holds the owning role through another role, as the docs' role query covers.
+        sys.execute(&format!("CREATE ROLE {MEMBER_ROLE}"));
+        sys.execute(&format!("GRANT {OWNER_ROLE} TO {MEMBER_ROLE}"));
+        create_user(&mut sys, ROLE_MEMBER_USER, &["CREATE SESSION", MEMBER_ROLE]);
 
         create_user(
             &mut sys,
@@ -543,6 +557,44 @@ fn a_member_of_the_owning_role_administers_the_virtual_schema_and_runs_its_plan(
     assert_eq!(reader_count(ROLE_VS_NAME), SEED_TOTAL_ROWS as i64);
 }
 
+/// Scenario: A member of the owning role lists the owner's grants without DBA rights
+#[test]
+fn a_member_of_the_owning_role_lists_the_owners_grants_without_dba_rights() {
+    let _serial = serial();
+    setup_e2e();
+    let mut member = user_conn(ROLE_MEMBER_USER);
+    let mut diagnose_in = |views: &str, query: &str, placeholder: &str, value: &str| {
+        diagnose_as(
+            &mut member,
+            &query.replace("EXA_DBA_", views),
+            placeholder,
+            value,
+        )
+    };
+
+    assert_eq!(
+        diagnose_in("EXA_USER_", VS_OWNER_SQL, "<VS>", ROLE_VS_NAME),
+        vec![vec![OWNER_ROLE.to_string()]]
+    );
+    assert_eq!(
+        diagnose_in("EXA_USER_", OWNER_ROLES_SQL, "<OWNER>", ROLE_MEMBER_USER),
+        vec![vec![MEMBER_ROLE.to_string()]]
+    );
+    assert_eq!(
+        diagnose_in("EXA_ROLE_", OWNER_ROLES_SQL, "<OWNER>", MEMBER_ROLE),
+        vec![vec![OWNER_ROLE.to_string()]]
+    );
+    let access = diagnose_in("EXA_ROLE_", CONNECTION_GRANTS_SQL, "<CONN>", CONN_NAME);
+    assert_eq!(grant_count(&access, OWNER_ROLE), 2, "{access:?}");
+    let own_access = diagnose_in("EXA_USER_", CONNECTION_GRANTS_SQL, "<CONN>", CONN_NAME);
+    assert!(
+        own_access.is_empty(),
+        "no other user's grant: {own_access:?}"
+    );
+    let execute = diagnose_in("EXA_ROLE_", EXECUTE_GRANTS_SQL, "<SCHEMA>", SCHEMA_NAME);
+    assert_eq!(grant_count(&execute, OWNER_ROLE), 3, "{execute:?}");
+}
+
 /// Scenario: A user owner can hold the CONNECTION grants through a role
 #[test]
 fn the_install_scripts_role_recipe_serves_a_reader() {
@@ -609,8 +661,9 @@ fn an_owner_with_the_any_privileges_needs_no_grant() {
 
 /// Scenario: Schema-scoped grants cover the scripts and survive a re-install, script-scoped grants do not
 /// Scenario: A schema-scoped CONNECTION grant extends to a script the owner creates
+/// Scenario: A user who can replace a script in the scripts' schema reads the CONNECTION through the owner's schema-scoped grants
 #[test]
-fn schema_scoped_grants_survive_a_reinstall_and_cover_a_script_the_owner_creates() {
+fn schema_scoped_grants_survive_a_reinstall_and_cover_scripts_created_or_replaced_later() {
     let _serial = serial();
     setup_e2e();
     let mut sys = exa_conn();
@@ -685,6 +738,31 @@ fn schema_scoped_grants_survive_a_reinstall_and_cover_a_script_the_owner_creates
         Some(iceberg_catalog_url_internal().as_str()),
         "the owner's own script must read the CONNECTION: {peeked}"
     );
+
+    // The answer to dropVirtualSchema keeps the setup's DROP working if the test fails here.
+    with_grants(
+        &[format!(
+            "GRANT CREATE ANY SCRIPT, DROP ANY SCRIPT TO {READER_USER}"
+        )],
+        || {
+            reader_conn().execute(&format!(
+                r#"CREATE OR REPLACE LUA ADAPTER SCRIPT {REINSTALL_SCHEMA}.{ADAPTER_SCRIPT_NAME} AS
+function adapter_call(request)
+if string.find(request, 'dropVirtualSchema', 1, true) then return '{{"type":"dropVirtualSchema"}}' end
+error('PEEK ' .. exa.get_connection('{CONN_NAME}').address)
+end
+/"#
+            ));
+        },
+    );
+    let peeked = error_text(&try_reader_count(SCHEMA_VS_NAME));
+    assert!(
+        peeked.contains(&format!("PEEK {}", iceberg_catalog_url_internal())),
+        "the replaced adapter must read the CONNECTION with the owner's grants: {peeked}"
+    );
+
+    create_schema_and_scripts_in(&mut sys, REINSTALL_SCHEMA);
+    assert_eq!(reader_count(SCHEMA_VS_NAME), SEED_TOTAL_ROWS as i64);
 }
 
 /// Scenario: ALTER CONNECTION rotates the CONNECTION and keeps its grants, CREATE OR REPLACE CONNECTION drops them

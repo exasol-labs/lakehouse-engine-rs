@@ -100,6 +100,13 @@ Replaces the storage credentials the adapter embedded in the scan-driving SQL wi
 * *AND* the member SHALL run the scan-driving statement that `EXPLAIN VIRTUAL` returns, because it holds the role's script and CONNECTION grants
 * *AND* the same statements from a reader that holds only `SELECT` on the virtual schema SHALL fail
 
+### Scenario: A member of the owning role lists the owner's grants without DBA rights
+
+* *GIVEN* a virtual schema whose owner is a role, and a user without DBA rights that holds the role through another role
+* *WHEN* the user runs the diagnostic queries of `docs/security.md` on `EXA_USER_*` and `EXA_ROLE_*` in place of `EXA_DBA_*`
+* *THEN* they SHALL list the owning role, the role chain from the user to the owning role, and the owning role's CONNECTION and `EXECUTE` grants
+* *AND* they SHALL list no CONNECTION grant of another user
+
 ### Scenario: An owner with EXECUTE ANY SCRIPT and ACCESS ANY CONNECTION needs no grant
 
 * *GIVEN* a virtual schema whose owner holds the system privileges `EXECUTE ANY SCRIPT` and `ACCESS ANY CONNECTION`, and no object grant and no role
@@ -121,6 +128,14 @@ Replaces the storage credentials the adapter embedded in the scan-driving SQL wi
 * *GIVEN* an owner that holds `GRANT ACCESS ON CONNECTION ... FOR SCHEMA <schema>` and may create scripts in `<schema>`
 * *WHEN* the owner creates its own script in `<schema>` that reads the CONNECTION
 * *THEN* the script SHALL read the CONNECTION, because the schema-scoped grant covers every script in the schema, including scripts created later
+
+### Scenario: A user who can replace a script in the scripts' schema reads the CONNECTION through the owner's schema-scoped grants
+
+* *GIVEN* a virtual schema whose owner holds `GRANT EXECUTE ON SCHEMA <schema>` and `GRANT ACCESS ON CONNECTION ... FOR SCHEMA <schema>`
+* *AND* a user that holds `CREATE ANY SCRIPT` and `DROP ANY SCRIPT` and no grant on the CONNECTION
+* *WHEN* that user replaces `<schema>.LAKEHOUSE_ADAPTER` with a script that reads the CONNECTION, and queries the virtual schema
+* *THEN* the replaced adapter SHALL read the CONNECTION, because it runs with the owner's grants and the schema-scoped grants cover every script in the schema, including scripts replaced later
+* *AND* after a re-install, a reader SHALL again receive the owner's rows
 
 ### Scenario: ALTER CONNECTION rotates the CONNECTION and keeps its grants, CREATE OR REPLACE CONNECTION drops them
 

@@ -41,14 +41,19 @@ GRANT ACCESS ON CONNECTION <conn> FOR SCRIPT <schema>.LAKEHOUSE_ADAPTER TO <owne
 GRANT ACCESS ON CONNECTION <conn> FOR SCRIPT <schema>.LAKEHOUSE_SCAN    TO <owner>;
 ```
 
-**Per schema.** These two grants survive a re-install:
+**Per scripts' schema.** These two grants survive a re-install:
 
 ```sql
 GRANT EXECUTE ON SCHEMA <schema> TO <owner>;
 GRANT ACCESS ON CONNECTION <conn> FOR SCHEMA <schema> TO <owner>;
 ```
 
-They cover every script in `<schema>`, including scripts created later. An owner that can create a script in `<schema>` can therefore read the CONNECTION's credentials through a script of its own. Use the per-schema form only when the owner cannot create scripts in `<schema>`.
+They cover every script in `<schema>`, including scripts created or replaced later. These users can therefore read the CONNECTION's credentials with code of their own, without any grant on the CONNECTION:
+
+- The owner of `<schema>`, and every user with both `CREATE ANY SCRIPT` and `DROP ANY SCRIPT`. They can replace `LAKEHOUSE_ADAPTER`, which then runs with the owner's grants on every query.
+- The virtual schema's owner, if it can create a script in `<schema>`.
+
+Use this form only when all of them may read the CONNECTION. Otherwise use the per-script form, because replacing a script drops its per-script grants.
 
 ### The install script's template
 
@@ -105,7 +110,7 @@ WHERE PRIVILEGE = 'EXECUTE' AND (OBJECT_SCHEMA = '<SCHEMA>' OR OBJECT_NAME = '<S
 
 Each owner grant needs a row whose `GRANTEE` is the owner or a role it holds. A role can hold another role, so repeat the role query with each role as `<OWNER>`. A `SCHEMA` row covers every script in that schema. The owner of `<SCHEMA>` holds `EXECUTE` without a row.
 
-Without DBA rights, the owner runs the same queries on `EXA_USER_*` and on `EXA_ROLE_*` in place of `EXA_DBA_*`. They list its own grants and those of every role it holds, directly or through another role. They list nothing for another user.
+Without DBA rights, the owner, or a member of an owning role, runs the same queries on `EXA_USER_*` and on `EXA_ROLE_*` in place of `EXA_DBA_*`. They list its own grants and those of every role it holds, directly or through another role. They list nothing for another user.
 
 ## Plan text and plan execution
 
@@ -118,7 +123,7 @@ A user who submits a scan plan directly, instead of querying the virtual schema,
 - `EXECUTE` on `LAKEHOUSE_SCAN`, and on `LAKEHOUSE_DISTRIBUTE_FILES` when the scan spans several shards: per script, per schema, as owner of the scripts' schema, or through `EXECUTE ANY SCRIPT`.
 - `ACCESS` on the CONNECTION for `LAKEHOUSE_SCAN`: per script, per schema, or through `ACCESS ANY CONNECTION`.
 
-The virtual schema's owner holds both, and so does every member of a role that owns it. A reader with only the [reader grants](#reader-grants) holds neither, and Exasol refuses its plan with `insufficient privileges for calling script`. Grant these privileges only to users who may read every table the CONNECTION can read.
+The virtual schema's owner holds both, and so does every member of a role that owns it. When the owner holds the [per-schema grants](#owner-grants), the users that section lists can also run their own code with the owner's grants. A reader with only the [reader grants](#reader-grants) holds neither, and Exasol refuses its plan with `insufficient privileges for calling script`. Grant these privileges only to users who may read every table the CONNECTION can read.
 
 ## Lakekeeper permission check
 
