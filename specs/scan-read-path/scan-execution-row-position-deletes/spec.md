@@ -1,4 +1,4 @@
-# Feature: DataFusion Scan Execution — Row-Position Delete Pipeline
+# Feature: DataFusion Scan Execution, Row-Position Delete Pipeline
 
 The scan UDF applies every row-position delete mechanism through one pipeline. Each mechanism turns
 its payload into the deleted row positions of one data file. The pipeline turns those positions into

@@ -75,8 +75,8 @@ The adapter refuses a Delta table whose reader protocol version or reader-featur
 * *AND* the bounds SHALL be read from those two `delta_kernel` constants rather than from the
   literals `1` and `3`, so the readable range has ONE owner and a kernel upgrade that widens it does
   not leave a stale copy behind
-* *AND* `delta_kernel` rejects such a version at snapshot load before this check runs, so the table
-  fails with the kernel's error wrapped with the table root, and this check stays as defense in depth
+* *AND* the table SHALL fail at snapshot load, before this check runs, because `delta_kernel` rejects
+  such a version there. It fails with the kernel's error wrapped with the table root, and this check stays as defense in depth
 * *AND* the version check SHALL run BEFORE the per-feature check, so a table declaring an unreadable
   reader version is refused on the version rather than on a feature list the protocol forbids it to
   carry
