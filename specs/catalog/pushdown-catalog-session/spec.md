@@ -6,7 +6,7 @@ The adapter builds the catalog HTTP state once per pushdown request and reuses i
 
 * The catalog-auth token and the `/v1/config` prefix are catalog-scoped, so the session computes them once per query. The `loadTable` GET stays per-table because each response carries that table's own vended storage credentials.
 * A `CatalogSession` is valid for one `(catalog_uri, warehouse)` tuple. Join legs override only `CatalogProps.table`.
-* `CatalogSession` is a `pub` type of the `lakehouse-catalog` crate. The scan-resolution seam in the engine takes the session by shared reference for an Iceberg scan source, so every file resolution of a request runs on one session. `catalog/catalog-crate-structure` owns the crate boundary.
+* `CatalogSession` is a `pub` type of the `lakehouse-catalog` crate. The scan-resolution seam in the engine takes the session by shared reference for an Iceberg scan source, so every file resolution of a request runs on one session. `architecture.md` states the crate boundary.
 * The session holds the live OAuth2 bearer token in its auth strategy. Redaction at the `loadTable` error site strips both the static catalog-auth secrets and that token.
 * The caller validates every involved-table identifier before it builds the session. A malformed identifier issues no catalog HTTP request.
 * The scan spec's `storage` value is the only part of the scan-driving SQL that depends on how the credential is delivered. `storage-access/scan-spec-credential-reference` encodes it as a connection reference or as a sealed envelope over the backend's encoding. Each table's own vended keys still land in that table's storage block, field for field, before sealing. `storage-access/pushdown-planning-cloud-credentials` owns that gate.

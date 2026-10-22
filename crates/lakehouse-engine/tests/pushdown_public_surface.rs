@@ -1,7 +1,6 @@
 //! External-crate reachability probe: only genuinely `pub` items of `pushdown` compile here
 //! (17 items, a subset of the in-crate probe's 27). The count is stated because the compiler
-//! catches narrowing, not deletion; changing it requires a spec delta against
-//! `pushdown/pushdown-module-structure`.
+//! catches narrowing, not deletion.
 #![allow(unused_imports)]
 
 use lakehouse_engine::adapter::pushdown::{

@@ -203,10 +203,9 @@ pub(super) fn has_no_explicit_select_list(pushdown_req: &Json) -> bool {
 
 /// The single owner of which clauses can name a source column. The collector is a
 /// parameter because the callers must stay divergent: they fold case differently (see
-/// `walk_column_nodes` and `pushdown/pushdown-module-structure`) and fall back differently.
+/// `walk_column_nodes`) and fall back differently.
 /// [`referenced_leg_columns`]'s empty-`selectList` short-circuit must not move in here:
-/// `referenced_column_projection` must keep narrowing through the remaining clauses
-/// (`pushdown-joins/pushdown-joins-module-structure`).
+/// `referenced_column_projection` must keep narrowing through the remaining clauses.
 pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMut(&Json)) {
     if let Some(list) = pushdown_req.get("selectList") {
         visit(list);

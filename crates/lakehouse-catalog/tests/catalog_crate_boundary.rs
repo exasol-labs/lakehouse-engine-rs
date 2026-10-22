@@ -37,7 +37,6 @@ fn declared_dependency_names(manifest: &str) -> Vec<&str> {
     names
 }
 
-/// Scenario: The catalog access layer lives in a standalone crate the engine depends on one way
 #[test]
 fn catalog_manifest_declares_no_execution_engine_dependency() {
     let declared = declared_dependency_names(CATALOG_MANIFEST);

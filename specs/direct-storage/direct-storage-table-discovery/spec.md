@@ -4,10 +4,10 @@ The adapter turns a storage prefix holding directories of Parquet files into enu
 
 ## Background
 
-* The direct-storage client implements `CatalogClient` and is declared in `lakehouse-engine`, not in `lakehouse-catalog`. It needs the engine-side object-store builder, and `catalog/catalog-crate-structure` forbids the catalog crate from declaring `object_store`. The engine still reaches every enumeration and table-load operation through the trait.
+* The direct-storage client implements `CatalogClient` and is declared in `lakehouse-engine`, not in `lakehouse-catalog`. It needs the engine-side object-store builder, and the catalog crate does not depend on `object_store` (`architecture.md`). The engine still reaches every enumeration and table-load operation through the trait.
 * The client's base path is resolved at construction from the CONNECTION address and the `NAMESPACE` property (`direct-storage/direct-storage-properties`), inside the one construction site that may name a catalog kind.
 * `direct-storage/parquet-directory-seam-file-listing` owns which objects under a table root count as data files and their order. This feature owns which directories are tables and how each is named.
-* `lakehouse-catalog`'s neutral skip reason has a variant for a directory holding no data file (`catalog/catalog-crate-public-surface-extensions`).
+* `lakehouse-catalog`'s neutral skip reason has a variant for a directory holding no data file.
 * The neutral table identifier the client returns has an empty namespace, because a direct-storage table's identity is its directory name. The shared flatten and `TABLE_MAP` construction then produce the bare directory name without branching on catalog kind.
 
 
@@ -41,7 +41,7 @@ The adapter turns a storage prefix holding directories of Parquet files into enu
 * *WHEN* the client resolves that table's columns
 * *THEN* the client SHALL obtain the table's data-file list, its folded schema, its partition columns, and its binary columns from the ONE shared seam `direct-storage/parquet-directory-seam` specifies, passing that seam the table root and the resolved directory options, and MUST NOT carry its own listing filter, its own footer reader, or its own partition parser
 * *AND* the client SHALL map the folded schema, partition columns included, to the neutral ordered column list the shared listing pipeline consumes, each column carrying a SOURCE-TAGGED type descriptor rather than an Exasol type, so the catalog crate stays free of the Exasol type mapping
-* *AND* that descriptor SHALL carry the column's logical Arrow type as the TAG STRING of the engine's existing scan-spec tag vocabulary, rather than as an Arrow type value, because `catalog/catalog-crate-structure` forbids the catalog crate's manifest from declaring `arrow`, so a neutral column type names no Arrow type
+* *AND* that descriptor SHALL carry the column's logical Arrow type as the TAG STRING of the engine's existing scan-spec tag vocabulary, rather than as an Arrow type value, because the catalog crate does not depend on `arrow` (`architecture.md`), so a neutral column type names no Arrow type
 * *AND* each column SHALL ALSO carry its engine-encoded declaration: the logical field built from the same folded field (nested member descriptor included, no binding key), its position among the partition columns when it is one, and the refusal reason `vs-adapter/binary-column-refusal` gives a binary column, which the listing pipeline records as the column's note per `vs-adapter/column-source-notes`
 * *AND* the client SHALL apply the string substitution for a nested or unrepresentable column BEFORE it renders that tag, so every tag it emits names a type the vocabulary can express and the round trip back to an Arrow type is lossless
 * *AND* a folded Arrow type that SURVIVES that substitution and that the tag vocabulary still cannot express SHALL FAIL the enumeration with an error naming the column and that Arrow type, and the client MUST NOT render it as the string tag, because a silent string tag declares the column `VARCHAR(2000000)` and registers it as a string with no error anywhere, so the losslessness this clause asserts is proven by a failure rather than assumed

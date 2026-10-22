@@ -5,7 +5,7 @@ The adapter decomposes an ungrouped select item that is a scalar function wrappi
 ## Background
 
 * Without decomposition the scalar item renders as a per-shard projection expression, so each shard computes a whole aggregate over its own files and Exasol returns one row per shard.
-* `VARIANCE` is Exasol's alias for `VAR_SAMP`, and DataFusion has no function named `variance`. The decomposition resolves each nested aggregate name to an `AggKind` through the tables of `pushdown-aggregates/pushdown-agg-sql-consolidation`, so no aggregate function name reaches DataFusion.
+* `VARIANCE` is Exasol's alias for `VAR_SAMP`, and DataFusion has no function named `variance`. The decomposition resolves each nested aggregate name to an `AggKind` through the same name tables a bare aggregate uses, so no aggregate function name reaches DataFusion.
 * The decomposition reuses the grouped planner's four primitives: the aggregate-sentinelizing tree walk, the scalar-over-aggregate classifier, the merge rewrite that substitutes each sentinel with its merged partial expression, and the deduplicating plan fold.
 * The merge rewrite binds each nested aggregate to the first structurally-equal plan slot, so the plan list must be deduplicated.
 * The plan list and the select list are not one-to-one. A scalar item contributes no plan of its own and shifts later select-list indexes, so partial `EMITS` types come from the per-plan declared-type list and the outer CAST types come from each select item's own `selectListDataTypes` ordinal.
@@ -29,9 +29,9 @@ The adapter decomposes an ungrouped select item that is a scalar function wrappi
 
 * *GIVEN* an ungrouped `pushdown` request whose select list is a scalar function wrapping a statistical aggregate under an Exasol-only alias, `ROUND(VARIANCE(C_ACCTBAL), 4)`, and likewise `ABS(VARIANCE(C_ACCTBAL))`, `VARIANCE(C_ACCTBAL) + 1`, and `ROUND(STDDEV(C_ACCTBAL), 4)`
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL resolve each nested aggregate's function name to its `AggKind` through the SAME two name-mapping tables `pushdown-aggregates/pushdown-agg-sql-consolidation` gives one owner each, `VARIANCE` to `Variance`, `VAR_SAMP` to `VarSamp`, `VAR_POP` to `VarPop`, `STDDEV` to `Stddev`, `STDDEV_SAMP` to `StddevSamp`, `STDDEV_POP` to `StddevPop`, and MUST NOT introduce a second alias mapping of its own
+* *THEN* the adapter SHALL resolve each nested aggregate's function name to its `AggKind` through the SAME name tables a bare aggregate uses, `VARIANCE` to `Variance`, `VAR_SAMP` to `VarSamp`, `VAR_POP` to `VarPop`, `STDDEV` to `Stddev`, `STDDEV_SAMP` to `StddevSamp`, `STDDEV_POP` to `StddevPop`, and MUST NOT introduce a second alias mapping of its own
 * *AND* the per-shard scan SQL SHALL carry only the aggregate's `(cnt, mean, m2)` sufficient-statistic partial columns, so NO aggregate function name is spliced into the DataFusion query text and the query MUST NOT fail with `Error during planning: Invalid function 'variance'`
-* *AND* the outer merge SELECT SHALL reconstruct the statistic through the single statistical merge owner `pushdown-aggregates/pushdown-agg-sql-consolidation` records, so a scalar-wrapped statistical aggregate and a bare one produce the same merge formula
+* *AND* the outer merge SELECT SHALL reconstruct the statistic through the same statistical merge a bare aggregate uses, so a scalar-wrapped statistical aggregate and a bare one produce the same merge formula
 * *AND* `SELECT ROUND(VARIANCE(c_acctbal), 4) FROM CUSTOMER` SHALL return one row equal to the same query evaluated against a native Exasol schema over the same rows
 * *AND* a bare `VARIANCE(c_acctbal)` and `ROUND(VAR_SAMP(c_acctbal), 4)` SHALL each return one row equal to native Exasol
 
@@ -49,7 +49,7 @@ The adapter decomposes an ungrouped select item that is a scalar function wrappi
 * *GIVEN* an ungrouped `pushdown` request whose select list places one or more scalar-over-aggregate items before, after, and between plain aggregates, for example `SELECT MIN(L_QUANTITY), ROUND(SUM(L_QUANTITY), 2), COUNT(*), ROUND(AVG(L_EXTENDEDPRICE), 3) FROM LINEITEM`
 * *WHEN* the adapter builds the outer merge SELECT and the fan-out `EMITS` clause
 * *THEN* the adapter SHALL emit the outer merge SELECT items in the exact order the corresponding items appear in `selectList`, interleaving merged plain-aggregate expressions and merged scalar-over-aggregate expressions as required, so Exasol's positional pushdown validation passes for every arrangement
-* *AND* the adapter SHALL resolve the outer CAST for each item from the `selectListDataTypes` entry at that item's OWN `selectList` ordinal, matched by index rather than by comparing rendered SQL strings, through the single declared-type CAST helper `pushdown-aggregates/pushdown-agg-sql-consolidation` records
+* *AND* the adapter SHALL resolve the outer CAST for each item from the `selectListDataTypes` entry at that item's OWN `selectList` ordinal, matched by index rather than by comparing rendered SQL strings, through the same declared-type CAST a bare aggregate uses
 * *AND* the adapter SHALL resolve each partial column's `EMITS` type from the PER-PLAN declared-type list the deduplicating fold builds, and MUST NOT index the declared types by position among the `function_aggregate` items alone, because a skipped scalar item shifts every later index
 * *AND* the returned row SHALL carry exactly one column per `selectList` item, with each column equal to that item evaluated over all rows on a single node
 
@@ -76,6 +76,5 @@ The adapter decomposes an ungrouped select item that is a scalar function wrappi
 * *GIVEN* the four primitives of scalar-over-aggregate decomposition, the aggregate-sentinelizing tree walk, the scalar-over-aggregate classifier, the merge rewrite that substitutes each sentinel with its merged partial expression, and the deduplicating plan fold, all declared in the `scalar_over_agg` submodule of `adapter::pushdown`
 * *WHEN* the grouped planner and the single-group planner both decompose a select item that wraps aggregates
 * *THEN* those four primitives SHALL have exactly ONE owner reachable by BOTH planners, and the single-group planner MUST NOT carry a second copy of the tree walk, the sentinel token format, the classifier's decline rules, or the substitution rewrite
-* *AND* the owning module SHALL expose the primitives at the narrowest visibility that compiles, and its tests SHALL live in its own sibling test file per `pushdown/pushdown-module-structure`
 * *AND* the grouped planner's rendered SQL SHALL match the committed `dispatch_golden` fixtures by full-string equality
 * *AND* a top-level bare aggregate, a grouped scalar-over-aggregate item, and a single-group scalar-over-aggregate item SHALL be rewritten by the SAME merge-rewriting path, so the three produce consistent merged SQL for the same inner aggregate
