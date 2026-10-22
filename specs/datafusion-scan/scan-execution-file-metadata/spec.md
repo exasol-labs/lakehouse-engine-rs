@@ -1,6 +1,6 @@
 # Feature: DataFusion Scan Execution, File Metadata (No-HEAD Registration)
 
-The scan UDF registers each assigned file from the `(path, size)` entry the adapter already resolved, resolves it to an absolute URI, and issues no per-file object-store `HEAD` request. The same holds for positional-delete files.
+The scan UDF registers each assigned file from the `(path, size)` entry the adapter already resolved, resolves it to an absolute URI, and issues no per-file object-store `HEAD` request. The same holds for positional-delete files and Puffin deletion-vector files.
 
 ## Background
 
@@ -11,7 +11,7 @@ The scan UDF registers each assigned file from the `(path, size)` entry the adap
 * A footer read without a size hint costs two object-store round-trips: the last 8 bytes, then the metadata range. A `metadata_size_hint` of N fetches the last N bytes first, so a footer that fits in N costs one request.
 * DataFusion already carries the hint as `datafusion.execution.parquet.metadata_size_hint` (default `Some(512 * 1024)`) on the `ParquetFormat` the provider owns, and `ParquetFormat::create_physical_plan` copies it to the `ParquetSource` the opener uses.
 * A footer larger than the hint is re-requested in full. The result is still correct.
-* With an empty `logical_schema`, `register_file_list` runs `ParquetFormat::infer_schema`, which fetches and caches the footer before access-plan construction. Only a non-empty `logical_schema`, as the adapter supplies in production, measures the access-plan fetch.
+* With an empty `logical_schema`, the scan's file registration runs `ParquetFormat::infer_schema`, which fetches and caches the footer before access-plan construction. Only a non-empty `logical_schema`, as the adapter supplies in production, measures the access-plan fetch.
 
 ## Scenarios
 
@@ -34,7 +34,7 @@ The scan UDF registers each assigned file from the `(path, size)` entry the adap
 
 ### Scenario: Delete files also carry their size and incur no per-file HEAD
 
-* *GIVEN* a scan invocation whose per-shard files argument carries, for each associated positional-delete file, its byte size alongside its path
+* *GIVEN* a scan invocation whose per-shard files argument carries, for each associated positional-delete file or Puffin deletion-vector file, its byte size alongside its path
 * *WHEN* the scan UDF reads a data file's associated delete files
 * *THEN* the UDF SHALL construct each delete file's object metadata, at minimum its byte size, from the per-shard spec entry
 * *AND* the UDF MUST NOT issue a per-file object-store metadata (HEAD) request for a delete file to discover its size, because the size is authoritative from the spec

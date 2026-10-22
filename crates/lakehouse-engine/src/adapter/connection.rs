@@ -1,5 +1,6 @@
 //! Credential values never appear in an error message produced by this module.
 
+use crate::scan::connection_grant_hint;
 use crate::scan::sealed::{
     SealedStorageKey, connection_password_carries_key_material, derive_sealed_storage_key,
 };
@@ -35,9 +36,14 @@ pub fn read_connection(
         }
     };
 
-    let conn = ctx
-        .connection(name)
-        .map_err(|_| UdfError::User(format!("CONNECTION '{name}' could not be resolved")))?;
+    // Exasol reports a missing CONNECTION and a missing owner grant the same way.
+    let conn = ctx.connection(name).map_err(|_| {
+        UdfError::User(format!(
+            "CONNECTION '{name}' could not be resolved: it does not exist, or the OWNER of the \
+             virtual schema lacks {}",
+            connection_grant_hint(ctx, name, "LAKEHOUSE_ADAPTER")
+        ))
+    })?;
 
     let uri = conn.address;
     if uri.is_empty() && kind != CatalogKind::DirectStorage {

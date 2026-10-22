@@ -7,13 +7,16 @@ The scan UDF sizes its DataFusion memory pool from the per-instance memory limit
 * `ctx.memory_limit()` returns the per-instance limit in bytes, with `0` meaning unknown. For a positive limit the pool is `fraction × (limit − overhead_bytes)`, floored at a minimum non-zero budget, which leaves headroom below the Exasol engine's 80% concurrency-stall threshold. For `0`, the UDF uses a conservative default budget and ignores the fraction and overhead.
 * The memory-pool fraction (default `0.6`) and the per-instance container overhead in megabytes (default `200`) are VS properties carried in the scan spec. A spec without them deserializes to those defaults.
 * The DataFusion memory pool bounds aggregation, sort, and join, but not the Parquet-to-Arrow decode and scan buffers. The scan spec's `batch_size` bounds that working set. A spec without it deserializes to a built-in default, and a value below 1 is clamped to 1.
+* The row-position delete state (`scan-read-path/scan-execution-row-position-deletes`) is built before the first row is emitted. The deleted-position sets live until the access plans are built, and the access plans live until the scan finishes. Their size is a non-spillable reservation in the memory pool, so a large delete set shrinks the pool left for aggregation, sort, and join, and a delete set larger than the pool fails the scan instead of exhausting the instance.
+* The deleted-position sets are reserved as they grow. Each decoded batch of a positional-delete file joins its set before the next batch decodes, so no unreserved copy of the positions outlives one batch. The reservation equals the sets' serialized size. A decoded deletion vector is reserved once it is decoded.
+* The Arrow decode batch stays outside the pool, like any decode buffer. So do a delete file's footer bytes, at most the metadata size hint: the row groups inside them decode in the footer read's own task, and the bytes drop before that task ends.
 * Row-group pruning, page-index pruning, and filter pushdown into the `ParquetExec` are DataFusion session and Parquet scan options. They differ from Iceberg file-level pruning (`file-planning/pushdown-file-pruning`), which drops whole files before the reader opens them.
 * A delete-carrying data file needs its Parquet footer for access-plan construction and again in the opener. A shared reader factory or cached metadata reader avoids parsing it twice.
 * The common spec carries, per side, a reference to the Exasol CONNECTION that supplies the storage credentials, or a sealed envelope with the backend the planning layer vended. `storage-access/scan-spec-credential-reference` owns the wire contract, the sealed envelope, the required grant, and the rotation consequence. `storage-access/storage-backend-enum` owns how the registered store derives from the backend.
 * The UDF resolves the spec's storage blocks once at the top of the invocation, not at each store-construction site. A join spec has a block per side, so the result is a pair. `ctx.connection()` is engine-local, so it does not contact the table catalog.
-* Each side has one registered object store. It serves that side's data files and that side's positional-delete files. The single-table path registers one store over one backend.
+* Each side has one registered object store. It serves that side's data files and every delete payload they reference: positional-delete files, Puffin deletion-vector files, and Delta deletion-vector sidecars. The single-table path registers one store over one backend.
 * Each side's store answers per-file metadata lookups from a size index over that side's files only. A routing decorator wraps one spec-sized store per side, so every operation is routed before the sized-`head` shortcut can answer it (`scan-aggregation/scan-execution-join`).
-* Every site in the scan path that builds a value-based redaction secret set takes it from the resolved storage backends. A spec that carries only a connection name has no secret to yield, so the set must come from the resolved backends. The wire wrapper exposes no secret accessor, so a site that still reads the unresolved value fails to compile. The redaction set for a routed store is the union of every side's `secret_values()`.
+* Every scan-path site that builds a value-based redaction secret set takes it from the resolved storage backends: on the raw-scan path, the partial-aggregate path, the join path, and in the scan's Parquet table provider. A spec that carries only a connection name has no secret to yield. The wire wrapper exposes no secret accessor, so a site that still reads the unresolved value fails to compile. The redaction set for a routed store is the union of every side's `secret_values()`.
 * DataFusion's `FileMetadataCache` keys entries by object-store path. It admits a stored entry only when the requesting `ObjectMeta` has the same byte size and the same `last_modified`. Access-plan construction and the opener agree because the access plan builds one `ObjectMeta` (spec-supplied size, fixed epoch timestamp) and clones it onto the file's `PartitionedFile`. A re-derived `ObjectMeta` would miss on every lookup and restore the duplicate footer fetch.
 * The per-side store split does not change cache reuse, because the cache is keyed by path. Both join sides share one bounded cache.
 * The default `FileMetadataCache` holds 50 MiB (`DEFAULT_METADATA_CACHE_LIMIT`) and evicts least-recently-used entries. An entry larger than the limit is never cached. Entry size scales with a file's `columns × row_groups`, so no fixed shard-file count is safe for every table. The access-plan fetch requests row-group metadata only, with no page index, which keeps entries small.
@@ -59,17 +62,25 @@ The scan UDF sizes its DataFusion memory pool from the per-instance memory limit
 
 ### Scenario: Every redaction secret set in the scan path is built from the resolved backends
 
-* *GIVEN* every site in the scan path that builds a value-based redaction secret set, whether it reads the whole-spec union, the fact side, or receives a storage backend as a parameter
+* *GIVEN* every scan-path site that builds a value-based redaction secret set, on the raw-scan path, the partial-aggregate path, the join path, and in the scan's Parquet table provider
 * *WHEN* the scan spec's storage block carries a connection reference rather than a credential
 * *THEN* EVERY such site SHALL take its secret set from the RESOLVED storage backend or backends, and NONE SHALL read it from the scan spec's own storage block
 * *AND* the wire wrapper MUST NOT expose a secret-value accessor, so a site left reading the unresolved value fails to COMPILE rather than returning an empty set and silently disarming redaction
-* *AND* an error raised on the RAW-SCAN path and an error raised on the PARTIAL-AGGREGATE path SHALL each be asserted to carry no resolved credential value, because those two paths read the fact-side set directly and no recorded scenario covered either
+* *AND* an error raised on the RAW-SCAN path and an error raised on the PARTIAL-AGGREGATE path SHALL each be asserted to carry no resolved credential value, because those two paths read the fact-side set directly
 * *AND* a spec whose storage block carries a reference MUST NOT yield an empty secret set once resolution has run, and a test SHALL assert the set is NON-empty for a resolved reference
+
+### Scenario: Row-position delete state is reserved in the memory pool
+
+* *GIVEN* a shard whose data files carry row-position deletes
+* *WHEN* the scan UDF builds the deleted-position sets and the base access plans
+* *THEN* the UDF SHALL reserve the deleted-position sets in the DataFusion memory pool until the access plans are built, and the access plans until the scan finishes
+* *AND* the UDF SHALL reserve each deleted-position set as it grows, batch by batch, so a delete set larger than the pool fails while it is read rather than after it is fully built
+* *AND* a shard whose delete state does not fit the pool SHALL fail with an error naming the memory pool before any row is emitted
 
 ### Scenario: Scan bounds the Parquet decode working set via a configured batch size
 
 * *GIVEN* a scan UDF building its DataFusion session configuration for a scan spec
-* *WHEN* the UDF builds the `SessionConfig` (`session_config_for_spec`)
+* *WHEN* the UDF builds the DataFusion `SessionConfig`
 * *THEN* the UDF SHALL set the DataFusion `batch_size` so the per-batch Parquet decode and scan working set stays bounded, rather than leaving it at the DataFusion default
 * *AND* the configured `batch_size` SHALL be sourced from the scan spec when present and otherwise from a conservative built-in default, clamped to at least 1
 * *AND* the bound SHALL apply on both the raw-row scan path and the partial-aggregate path, since both decode source Parquet files
@@ -83,11 +94,11 @@ The scan UDF sizes its DataFusion memory pool from the per-instance memory limit
 * *AND* this Parquet-level pruning SHALL compose with the Iceberg file-level pruning of `file-planning/pushdown-file-pruning`, files dropped by Iceberg are never opened, and within the surviving files non-matching row groups and pages are skipped
 * *AND* the emitted rows SHALL be identical to a scan with pruning disabled (pruning narrows what is read, never the result set)
 
-### Scenario: Positional-delete files are read with the same resolved credentials
+### Scenario: Delete payloads are read with the same resolved credentials
 
 * *GIVEN* a scan invocation whose shard-invariant common spec references or carries, per side, the storage credentials for that side
-* *WHEN* the scan UDF reads a data file's associated positional-delete files from object storage
-* *THEN* the UDF SHALL read the delete files through the SAME registered object store used for the data files OF THAT SIDE, configured from that side's RESOLVED backend credentials
+* *WHEN* the scan UDF reads a data file's associated positional-delete files, Puffin deletion-vector files, or Delta deletion-vector sidecars from object storage
+* *THEN* the UDF SHALL read those delete payloads through the SAME registered object store used for the data files OF THAT SIDE, configured from that side's RESOLVED backend credentials
 * *AND* on a join spec, the dimension side's delete files SHALL be read with the DIMENSION side's credentials and the fact side's with the FACT side's, never one side's delete files with the other side's credentials
 * *AND* the UDF MUST NOT re-authenticate to the catalog, re-request vended credentials, or resolve the referenced CONNECTION a second time to read a delete file, because the one per-invocation resolution already supplied it
 * *AND* a credential value MUST NOT appear in any error message the UDF returns while reading a delete file, for whichever side's delete file failed

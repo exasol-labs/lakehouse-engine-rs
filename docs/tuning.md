@@ -37,13 +37,17 @@ The adapter qualifies its calls to these scripts from its own running-script sch
 
 **Pool sizing:** `pool = MEMORY_POOL_FRACTION × (memory_limit − INSTANCE_OVERHEAD_MB)`. When the per-instance limit is reported as 0 (unknown), a conservative default budget applies instead.
 
+**Tables with deletes:** A scan of a table with positional deletes or deletion vectors holds its deleted row positions in this pool until the row selections are built, and the row selections until the scan finishes. That memory cannot spill. When a shard's delete state does not fit, the query fails with `the row-position delete state does not fit the memory pool`. Raise `PARALLELISM_FACTOR` so each shard holds fewer data files, or raise `MEMORY_POOL_FRACTION`. Reading and decoding the deletes runs on the scan's worker threads, so the thread budget set by `DATAFUSION_THREADING_MODE` also speeds up the delete preparation.
+
 **Quick recommendation:** For read-bound remote scans, set `DATAFUSION_THREADING_MODE='FIXED'`, `DATAFUSION_THREADS_PER_UDF='<detected core count>'`, and `DATAFUSION_TARGET_PARTITIONS='<detected core count>'`. These values are ~39 % faster than the `AUTO` default on a full scan.
 
 ### `S3_MAX_CONNECTIONS`
 
 This property sizes the HTTP client connection pool of the object store for the scan instance. It sets how many connections to S3 the client keeps warm (idle and reusable) per host.
 
-The property has no hard cap on in-flight request concurrency. It only bounds how many established connections stay open for reuse. Without reuse, the client tears down a connection and negotiates a new one. The property therefore improves connection reuse on a best-effort basis. It is not a guaranteed ceiling on concurrent fetches.
+The property has no hard cap on in-flight request concurrency. It only bounds how many established connections stay open for reuse. Without reuse, the client tears down a connection and negotiates a new one. The property therefore improves connection reuse on a best-effort basis. It is not a guaranteed ceiling on concurrent data-file fetches.
+
+One read path does have a hard cap. When a scan instance reads a table with deletes, it first fetches the positional-delete files, the deletion vectors, and the Parquet footers of the data files they apply to. The instance keeps at most this many of those reads in flight at once, across both sides of a join.
 
 The property says nothing about how many shards run (`PARALLELISM_FACTOR`). It also says nothing about how many CPU threads decode them (`DATAFUSION_THREADING_MODE`). Those two axes stay separate and orthogonal.
 
@@ -86,7 +90,7 @@ LHTELEM pid=12345 phase_startup_ms=110.2 phase_import_ms=650.8 phase_emit_ms=2.5
 | `pid` | Process id of the shard VM (unique per UDF instance). |
 | `phase_startup_ms` | UDF entry → runtime + session + plan build, up to first batch fetch. |
 | `phase_import_ms` | Cumulative wait time for batches from the stream (S3 read + Parquet decode). |
-| `phase_emit_ms` | Cumulative time in `emit_batch` / flush (column coercion + Arrow IPC). |
+| `phase_emit_ms` | Cumulative time in `emit_batch` / flush (column coercion + Arrow C Data export). |
 | `body_ms` | Total scan-body wall-clock. `startup + import + emit ≈ body`. |
 
 ### Interpret

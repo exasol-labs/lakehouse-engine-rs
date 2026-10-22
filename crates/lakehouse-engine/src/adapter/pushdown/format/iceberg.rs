@@ -13,7 +13,9 @@ use lakehouse_catalog::{
 use serde_json::Value as Json;
 
 use super::{ConnectionStorage, FormatReader, PlannedFiles};
-use crate::adapter::column_notes::{ColumnDeclaration, DeclaredSchema, binary_refusal};
+use crate::adapter::column_notes::{
+    ColumnDeclaration, DeclaredSchema, binary_cause, column_refusal, variant_cause,
+};
 use crate::adapter::iceberg_predicate::to_iceberg_predicate;
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{
@@ -238,19 +240,16 @@ async fn plan_checked_table(
         table
             .metadata()
             .properties()
-            .get(iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
+            .get(iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING)
             .map(String::as_str),
     )?;
 
-    // Must run before `plan_files_from_table`, which drops the information needed to tell
-    // a Puffin deletion vector from a Parquet positional delete.
-    ensure_supported_delete_mechanisms(&table, &table_name, &secrets).await?;
-
-    // `iceberg` 0.10.0 binds the filter by name against the snapshot's schema, which can predate
-    // the current one, so each declared field id is named as that schema names it.
+    // A scan without a pinned snapshot binds its filter by name against the current schema,
+    // so each declared field id is named as that schema names it.
     let metadata = table.metadata();
-    let snapshot = metadata.current_snapshot();
-    let scanned = snapshot.and_then(|s| s.schema(metadata).ok());
+    let scanned = metadata
+        .current_snapshot()
+        .map(|_| metadata.current_schema().clone());
     let predicate = filter_json
         .zip(scanned)
         .and_then(|(filter, scanned)| to_iceberg_predicate(filter, declared, &scanned));
@@ -274,7 +273,7 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
     let mapping: iceberg::spec::NameMapping = serde_json::from_str(raw).map_err(|e| {
         UdfError::User(format!(
             "failed to parse Iceberg '{}' table property: {e}",
-            iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING
+            iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING
         ))
     })?;
     let mut entries = Vec::new();
@@ -292,13 +291,11 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
     Ok(entries)
 }
 
-/// Only Parquet positional deletes over Parquet data files are applied; everything else
-/// must fail loud at plan time. Carries no path or secret.
+/// Only Parquet positional deletes and Puffin deletion vectors over Parquet data files are
+/// applied; everything else must fail loud at plan time. Carries no path or secret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnsupportedDeleteMechanism {
     EqualityDelete,
-    /// Iceberg v3 Puffin deletion vector.
-    DeletionVector,
     OrcDataFile,
     AvroDataFile,
     OrcDeleteFile,
@@ -310,7 +307,6 @@ impl UnsupportedDeleteMechanism {
     fn describe(self) -> &'static str {
         match self {
             UnsupportedDeleteMechanism::EqualityDelete => "Iceberg equality deletes",
-            UnsupportedDeleteMechanism::DeletionVector => "Iceberg v3 Puffin deletion vectors",
             UnsupportedDeleteMechanism::OrcDataFile => "ORC data files",
             UnsupportedDeleteMechanism::AvroDataFile => "Avro data files",
             UnsupportedDeleteMechanism::OrcDeleteFile => "ORC delete files",
@@ -320,9 +316,7 @@ impl UnsupportedDeleteMechanism {
     }
 }
 
-/// Must run at manifest level: `plan_files` drops the Puffin discriminator and file format,
-/// making a deletion vector indistinguishable from a Parquet positional delete.
-fn classify_manifest_file(
+fn classify_planned_file(
     content: iceberg::spec::DataContentType,
     format: iceberg::spec::DataFileFormat,
 ) -> Result<(), UnsupportedDeleteMechanism> {
@@ -337,9 +331,7 @@ fn classify_manifest_file(
             Puffin => Err(U::NonParquetDataFile),
         },
         PositionDeletes => match format {
-            Parquet => Ok(()),
-            // A position delete stored as a Puffin blob IS a v3 deletion vector.
-            Puffin => Err(U::DeletionVector),
+            Parquet | Puffin => Ok(()),
             Orc => Err(U::OrcDeleteFile),
             Avro => Err(U::AvroDeleteFile),
         },
@@ -351,7 +343,8 @@ fn classify_manifest_file(
 fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &str) -> UdfError {
     let msg = format!(
         "lakehouse pushdown declined for table '{}': it uses {}, which this engine \
-         cannot apply on read (only Parquet positional deletes are supported); \
+         cannot apply on read (only Parquet positional deletes and deletion vectors are \
+         supported); \
          this is a hard error, not a native re-plan",
         table_name,
         mechanism.describe(),
@@ -361,11 +354,11 @@ fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &
 
 /// Refuses a recorded `date` → `timestamp`/`timestamp_ns` promotion (#355).
 ///
-/// `iceberg` 0.10.0 reads such bounds as 8 bytes, skipping the spec's bounds-width
+/// `iceberg` reads such bounds as 8 bytes, skipping the spec's bounds-width
 /// inference, so a pre-promotion file's 4-byte bound fails manifest decoding with an
 /// unhelpful error, and a second decode path `unwrap()`s. Deciding from schema history
-/// alone avoids that decode and spends no object-store byte; it must run before
-/// [`ensure_supported_delete_mechanisms`].
+/// alone avoids that decode and spends no object-store byte; it must run before `plan_files`
+/// reads any manifest.
 ///
 /// Any schema declaring the field id as `date` counts, at any nesting depth (manifest bounds
 /// are keyed by field id). Deliberately conservative: a table whose files were all rewritten
@@ -403,7 +396,7 @@ fn refuse_date_promotion(
         let msg = format!(
             "lakehouse pushdown declined for table '{table_name}': column '{column}' is \
              declared Iceberg type '{current_type}' in the current schema and 'date' in an \
-             earlier one, and this engine cannot read that promotion — `iceberg` 0.10.0 \
+             earlier one, and this engine cannot read that promotion — `iceberg` \
              omits the spec's bounds-width inference for '{current_type}', so a \
              pre-promotion data file's 4-byte manifest bound fails to decode; tracked as \
              issue #355. The refusal is deliberately conservative: it fires on the recorded \
@@ -416,90 +409,26 @@ fn refuse_date_promotion(
     Ok(())
 }
 
-/// Classifies every alive manifest `DataFile`. This is the authoritative correctness gate:
-/// `plan_files` drops the information needed to detect unsupported mechanisms.
-async fn ensure_supported_delete_mechanisms(
-    table: &iceberg::table::Table,
-    table_name: &str,
-    secrets: &[&str],
-) -> Result<(), UdfError> {
-    let metadata = table.metadata();
-    let Some(snapshot) = metadata.current_snapshot() else {
-        return Ok(());
-    };
-    let file_io = table.file_io();
-
-    let manifest_list_bytes = file_io
-        .new_input(snapshot.manifest_list())
-        .map_err(|e| {
-            UdfError::User(format!(
-                "failed to open Iceberg manifest list for '{}': {}",
-                table_name,
-                redact_error_text(&e.to_string(), secrets)
-            ))
-        })?
-        .read()
-        .await
-        .map_err(|e| {
-            UdfError::User(format!(
-                "failed to read Iceberg manifest list for '{}': {}",
-                table_name,
-                redact_error_text(&e.to_string(), secrets)
-            ))
-        })?;
-
-    let manifest_list = iceberg::spec::ManifestList::parse_with_version(
-        &manifest_list_bytes,
-        metadata.format_version(),
-    )
-    .map_err(|e| {
-        UdfError::User(format!(
-            "failed to parse Iceberg manifest list for '{}': {}",
-            table_name,
-            redact_error_text(&e.to_string(), secrets)
-        ))
-    })?;
-
-    for manifest_file in manifest_list.entries() {
-        let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
-            UdfError::User(format!(
-                "failed to load Iceberg manifest for '{}': {}",
-                table_name,
-                redact_error_text(&e.to_string(), secrets)
-            ))
-        })?;
-        for entry in manifest.entries() {
-            // A DELETED entry no longer applies; failing on it would spuriously reject queries.
-            if !entry.is_alive() {
-                continue;
+/// Plan time refuses equality deletes; that arm lets the read-time backstop refuse one that
+/// slips past. `Data` maps to the same non-positional sentinel.
+fn iceberg_delete_mechanism(delete: &iceberg::scan::FileScanTaskDeleteFile) -> DeleteMechanism {
+    use iceberg::spec::DataContentType::{Data, EqualityDeletes, PositionDeletes};
+    let path = delete.file_path().to_string();
+    let size = delete.file_size_in_bytes();
+    match (delete.file_type(), delete.file_format()) {
+        // iceberg-rust refuses to build a deletion-vector task missing these, so the defaults
+        // never apply.
+        (PositionDeletes, iceberg::spec::DataFileFormat::Puffin) => {
+            DeleteMechanism::IcebergPuffinDeletionVector {
+                path,
+                size,
+                content_offset: delete.content_offset().unwrap_or_default(),
+                content_size_in_bytes: delete.content_size_in_bytes().unwrap_or_default(),
+                record_count: delete.record_count().unwrap_or_default(),
             }
-            let data_file = entry.data_file();
-            classify_manifest_file(data_file.content_type(), data_file.file_format())
-                .map_err(|mechanism| unsupported_delete_error(mechanism, table_name))?;
         }
-    }
-
-    Ok(())
-}
-
-/// The plan-time gate has already rejected equality deletes and deletion vectors; the other
-/// arms exist for defense-in-depth so the read-time backstop rejects anything that slips
-/// past. `Data` never appears here and maps to a non-positional sentinel for the same reason.
-fn iceberg_delete_mechanism(
-    path: String,
-    size: u64,
-    content_type: iceberg::spec::DataContentType,
-) -> DeleteMechanism {
-    match content_type {
-        iceberg::spec::DataContentType::PositionDeletes => {
-            DeleteMechanism::IcebergPositionalDelete { path, size }
-        }
-        iceberg::spec::DataContentType::EqualityDeletes => {
-            DeleteMechanism::IcebergEqualityDelete { path, size }
-        }
-        iceberg::spec::DataContentType::Data => {
-            DeleteMechanism::IcebergEqualityDelete { path, size }
-        }
+        (PositionDeletes, _) => DeleteMechanism::IcebergPositionalDelete { path, size },
+        (EqualityDeletes | Data, _) => DeleteMechanism::IcebergEqualityDelete { path, size },
     }
 }
 
@@ -537,51 +466,70 @@ async fn plan_files_from_table(
     })?;
 
     // Delete paths are relativized later in `relativize_shards_to_root`, like data-file paths.
-    Ok(tasks
-        .into_iter()
-        .map(|t| {
-            let deletes: Vec<DeleteMechanism> = t
-                .deletes
-                .iter()
-                .map(|d| {
-                    iceberg_delete_mechanism(d.file_path.clone(), d.file_size_in_bytes, d.file_type)
-                })
-                .collect();
-            FileEntry::with_deletes(
-                t.data_file_path().to_string(),
-                t.file_size_in_bytes,
-                deletes,
-            )
-        })
-        .collect())
+    tasks
+        .iter()
+        .map(planned_file_entry)
+        .collect::<Result<_, _>>()
+        .map_err(|mechanism| unsupported_delete_error(mechanism, table_name))
 }
 
-fn first_binary_member(field_type: &iceberg::spec::Type, path: &str) -> Option<(String, String)> {
+fn planned_file_entry(
+    task: &iceberg::scan::FileScanTask,
+) -> Result<FileEntry, UnsupportedDeleteMechanism> {
+    classify_planned_file(
+        iceberg::spec::DataContentType::Data,
+        task.data_file_format(),
+    )?;
+    let deletes = task
+        .deletes()
+        .iter()
+        .map(|d| {
+            classify_planned_file(d.file_type(), d.file_format())?;
+            Ok(iceberg_delete_mechanism(d))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(FileEntry::with_deletes(
+        task.data_file_path().to_string(),
+        task.file_size_in_bytes(),
+        deletes,
+    ))
+}
+
+fn first_refused_member(field_type: &iceberg::spec::Type, path: &str) -> Option<(String, String)> {
     use iceberg::spec::Type;
 
     match field_type {
         Type::Primitive(primitive) => {
-            declared_binary_type(primitive).map(|declared| (path.to_string(), declared))
+            refused_primitive_cause(primitive).map(|cause| (path.to_string(), cause))
         }
+        Type::Variant(_) => Some((path.to_string(), variant_cause())),
         Type::Struct(members) => members.fields().iter().find_map(|member| {
-            first_binary_member(&member.field_type, &format!("{path}.{}", member.name))
+            first_refused_member(&member.field_type, &format!("{path}.{}", member.name))
         }),
         Type::List(list) => {
-            first_binary_member(&list.element_field.field_type, &format!("{path}.element"))
+            first_refused_member(&list.element_field.field_type, &format!("{path}.element"))
         }
-        Type::Map(map) => first_binary_member(&map.key_field.field_type, &format!("{path}.key"))
-            .or_else(|| first_binary_member(&map.value_field.field_type, &format!("{path}.value"))),
+        Type::Map(map) => first_refused_member(&map.key_field.field_type, &format!("{path}.key"))
+            .or_else(|| {
+                first_refused_member(&map.value_field.field_type, &format!("{path}.value"))
+            }),
     }
 }
 
 /// Exhaustive, so a new Iceberg primitive must be classified before the build passes.
-fn declared_binary_type(primitive: &iceberg::spec::PrimitiveType) -> Option<String> {
+/// `geometry` and `geography` are WKB binary on disk, so they share the binary refusal.
+fn refused_primitive_cause(primitive: &iceberg::spec::PrimitiveType) -> Option<String> {
     use iceberg::spec::PrimitiveType::*;
 
     match primitive {
-        Binary => Some("binary".to_string()),
-        Fixed(length) => Some(format!("fixed({length})")),
-        Uuid => Some("uuid".to_string()),
+        Binary => Some(binary_cause("binary")),
+        Fixed(length) => Some(binary_cause(&format!("fixed({length})"))),
+        Uuid => Some(binary_cause("uuid")),
+        Geometry(_) => Some(binary_cause("geometry")),
+        Geography(_) => Some(binary_cause("geography")),
+        Unknown => Some(
+            "has type 'unknown', which holds only nulls and has no Exasol column type".to_string(),
+        ),
         Boolean
         | Int
         | Long
@@ -598,12 +546,12 @@ fn declared_binary_type(primitive: &iceberg::spec::PrimitiveType) -> Option<Stri
     }
 }
 
-/// The Iceberg arm of [`super::declare_columns`]. Refuses every `binary`, `fixed(L)`, and `uuid`
-/// column at any depth until #351.
+/// The Iceberg arm of [`super::declare_columns`]. Refuses every `binary`, `fixed(L)`, `uuid`,
+/// `geometry`, and `geography` column at any depth until #351, and every `variant` and `unknown`.
 pub(super) fn declaration(field: &iceberg::spec::NestedField) -> ColumnDeclaration {
-    let refused = first_binary_member(&field.field_type, &field.name).map(|(path, declared)| {
-        let member_path = (!field.field_type.is_primitive()).then_some(path.as_str());
-        binary_refusal("Iceberg", &field.name, member_path, &declared)
+    let refused = first_refused_member(&field.field_type, &field.name).map(|(path, cause)| {
+        let member_path = (path != field.name).then_some(path.as_str());
+        column_refusal("Iceberg", &field.name, member_path, &cause)
     });
     let arrow_type = crate::types::mapping::iceberg_type_to_arrow(&field.field_type);
     ColumnDeclaration {
@@ -625,7 +573,8 @@ fn derive_nested_members(ty: &iceberg::spec::Type) -> Option<NestedMembers> {
     use iceberg::spec::Type;
 
     match ty {
-        Type::Primitive(_) => None,
+        // A variant is refused at declaration, so it never reaches the nested renderer.
+        Type::Primitive(_) | Type::Variant(_) => None,
         Type::Struct(s) => Some(NestedMembers::Struct {
             fields: s
                 .fields()

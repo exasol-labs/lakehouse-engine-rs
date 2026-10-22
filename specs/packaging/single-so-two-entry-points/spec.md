@@ -7,7 +7,7 @@ One Rust crate builds a single `.so` that exports the VS adapter, the DataFusion
 * The scan entry point is a SCALAR EMIT script. The version entry point is a SCALAR RETURNS script.
 * The `LAKEHOUSE_DISTRIBUTE_FILES` fan-out distributor is a separate LUA SET script created by its own DDL. It is not a Rust entry point and is not part of the `.so`.
 * Each `CREATE SCRIPT` statement references its entry point by registered name against the same `%udf_object`.
-* The `.so` is built only inside the builder image, never with host `cargo build --release`.
+* The `.so` is built only inside the `UDF_BUILDER_IMAGE` Rust builder image the Makefile names, never with host `cargo build --release`.
 
 ## Scenarios
 

@@ -1,22 +1,20 @@
 //! The positional-delete fixtures are authored once at stack bring-up by the
 //! `spark-iceberg-fixtures` Compose job (`scripts/spark-fixtures/`);
 //! `tests/common/pos_delete_fixtures.rs` MUST stay in lockstep with those scripts.
-#![cfg(feature = "exasol-e2e")]
 
-mod common;
-use common::e2e_harness::*;
-use common::exasol_ws::ExaConn;
-use common::pos_delete_fixtures::{
-    DELETION_VECTOR_TABLE, FILE_GRANULARITY_DELETED_IDS, FILE_GRANULARITY_REMAINING_ROWS,
-    FILE_GRANULARITY_TABLE, FILE_GRANULARITY_TOTAL_ROWS, NAMESPACE, PARTITION_COL,
+use crate::common::e2e_harness::*;
+use crate::common::pos_delete_fixtures::{
+    DELETION_VECTOR_CARDINALITIES, DELETION_VECTOR_FILE_ID_RANGES, DELETION_VECTOR_TABLE,
+    FILE_GRANULARITY_DELETED_IDS, FILE_GRANULARITY_REMAINING_ROWS, FILE_GRANULARITY_TABLE,
+    FILE_GRANULARITY_TOTAL_ROWS, NAMESPACE, ORC_FILE_IDS, PARQUET_FILE_IDS, PARTITION_COL,
     PARTITION_EAST_DELETED_IDS, PARTITION_GRANULARITY_DELETED_IDS,
     PARTITION_GRANULARITY_REMAINING_ROWS, PARTITION_GRANULARITY_TABLE,
-    PARTITION_GRANULARITY_TOTAL_ROWS, PARTITION_WEST_DELETED_IDS,
+    PARTITION_GRANULARITY_TOTAL_ROWS, PARTITION_WEST_DELETED_IDS, UNSUPPORTED_FORMAT_TABLE,
+    deletion_vector_deleted, deletion_vector_remaining_ids,
 };
-use common::seed::{E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, seed_events};
-use common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
-};
+use crate::common::seed::{E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS};
+
+use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, vs_table};
 
 use lakehouse_engine::adapter::pushdown::shard_count;
 use lakehouse_engine::adapter::sharding::partition_files_by_bytes;
@@ -25,38 +23,17 @@ use lakehouse_engine::scan::spec::DeleteMechanism;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-/// Shared across E2E binaries; recreation is idempotent with an identical body.
-const VS_NAME: &str = "MY_LAKEHOUSE";
 const SAMESHARD_VS_NAME: &str = "POSDEL_SAMESHARD_VS";
 const SPLITSHARD_VS_NAME: &str = "POSDEL_SPLITSHARD_VS";
-/// Equals `mor_pos_partition`'s data-file count, so a 1-node cluster gets exactly
-/// one file per shard.
+/// Equals the data-file count of `mor_pos_partition` and `mor_dv`, so a 1-node cluster
+/// gets exactly one file per shard.
 const SPLIT_PARALLELISM_FACTOR: usize = 4;
 
-static SETUP_DONE: OnceLock<()> = OnceLock::new();
-
 fn setup_e2e() {
-    SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        wait_for_seaweedfs();
-        wait_for_iceberg_catalog();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            seed_events(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed Iceberg events table")
-        });
-
-        install_slc();
-        upload_so();
-
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        lakehouse_vs();
         let mut conn = exa_conn();
-        create_schema_and_scripts(&mut conn);
-        create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, NAMESPACE));
         create_virtual_schema(
             &mut conn,
             &VsProps::new(SAMESHARD_VS_NAME, NAMESPACE).with_parallelism_factor(1),
@@ -69,25 +46,15 @@ fn setup_e2e() {
     });
 }
 
-fn vs_table(vs_name: &str, table: &str) -> String {
-    format!("{vs_name}.{}", table.to_uppercase())
-}
-
 fn ids_column(cols: &[Vec<serde_json::Value>]) -> Vec<i64> {
     cols[0].iter().map(parse_int).collect()
 }
 
-// #345: iceberg-rust's `DeleteFileIndex` ignores `referenced_data_file`, so each
-// data file resolves BOTH delete files. Once fixed upstream, tighten to exactly
-// one delete file per data file.
 #[test]
 fn fixture_spark_file_granularity_delete_table() {
     setup_e2e();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let rt = runtime();
     let files = rt.block_on(resolve_fixture_files(NAMESPACE, FILE_GRANULARITY_TABLE));
     assert_eq!(
         files.len(),
@@ -106,9 +73,8 @@ fn fixture_spark_file_granularity_delete_table() {
     for entry in &files {
         assert_eq!(
             entry.deletes.len(),
-            2,
-            "file granularity (pending #345): data file {} \
-             must resolve both partition-scoped delete files, got {}",
+            1,
+            "file granularity: data file {} must resolve only its own delete file, got {}",
             entry.path,
             entry.deletes.len()
         );
@@ -136,9 +102,8 @@ fn fixture_spark_file_granularity_delete_table() {
     );
     for (path, count) in &refs_per_delete_path {
         assert_eq!(
-            *count, 2,
-            "delete file {path} must be resolved by both data files under the \
-             current iceberg-rust partition-scoped matching, got {count}"
+            *count, 1,
+            "delete file {path} must be resolved by exactly one data file, got {count}"
         );
     }
 }
@@ -147,10 +112,7 @@ fn fixture_spark_file_granularity_delete_table() {
 fn fixture_spark_partition_granularity_delete_table() {
     setup_e2e();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let rt = runtime();
     let files = rt.block_on(resolve_fixture_files(
         NAMESPACE,
         PARTITION_GRANULARITY_TABLE,
@@ -211,7 +173,7 @@ fn e2e_file_granularity_returns_post_delete_rows() {
 
     let sql = format!(
         "SELECT id FROM {} ORDER BY id",
-        vs_table(VS_NAME, FILE_GRANULARITY_TABLE)
+        vs_table(LAKEHOUSE_VS, FILE_GRANULARITY_TABLE)
     );
     let cols = conn.query_columns(&sql);
     let ids = ids_column(&cols);
@@ -248,7 +210,7 @@ fn e2e_partition_granularity_returns_post_delete_rows() {
 
     let sql = format!(
         "SELECT id FROM {} ORDER BY id",
-        vs_table(VS_NAME, PARTITION_GRANULARITY_TABLE)
+        vs_table(LAKEHOUSE_VS, PARTITION_GRANULARITY_TABLE)
     );
     let cols = conn.query_columns(&sql);
     let ids = ids_column(&cols);
@@ -276,7 +238,7 @@ fn e2e_partition_delete_spans_multiple_partitions() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    let table = vs_table(VS_NAME, PARTITION_GRANULARITY_TABLE);
+    let table = vs_table(LAKEHOUSE_VS, PARTITION_GRANULARITY_TABLE);
 
     let east_sql = format!("SELECT id FROM {table} WHERE {PARTITION_COL} = 'east' ORDER BY id");
     let east_ids = ids_column(&conn.query_columns(&east_sql));
@@ -323,10 +285,7 @@ fn e2e_partition_delete_spans_multiple_partitions() {
 fn e2e_partition_delete_invariant_across_fanout() {
     setup_e2e();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let rt = runtime();
     let files = rt.block_on(resolve_fixture_files(
         NAMESPACE,
         PARTITION_GRANULARITY_TABLE,
@@ -417,7 +376,7 @@ fn e2e_deletes_with_projection_filter_limit() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    let table = vs_table(VS_NAME, PARTITION_GRANULARITY_TABLE);
+    let table = vs_table(LAKEHOUSE_VS, PARTITION_GRANULARITY_TABLE);
     let sql =
         format!("SELECT id, val FROM {table} WHERE {PARTITION_COL} = 'west' ORDER BY id LIMIT 3");
     let cols = conn.query_columns(&sql);
@@ -464,7 +423,7 @@ fn e2e_deletes_with_single_and_grouped_agg() {
 
     let single_sql = format!(
         "SELECT COUNT(*), SUM(id) FROM {}",
-        vs_table(VS_NAME, FILE_GRANULARITY_TABLE)
+        vs_table(LAKEHOUSE_VS, FILE_GRANULARITY_TABLE)
     );
     let single_cols = conn.query_columns(&single_sql);
     let count = parse_int(&single_cols[0][0]);
@@ -483,7 +442,7 @@ fn e2e_deletes_with_single_and_grouped_agg() {
 
     let grouped_sql = format!(
         "SELECT {PARTITION_COL}, COUNT(*) FROM {} GROUP BY {PARTITION_COL} ORDER BY {PARTITION_COL}",
-        vs_table(VS_NAME, PARTITION_GRANULARITY_TABLE)
+        vs_table(LAKEHOUSE_VS, PARTITION_GRANULARITY_TABLE)
     );
     let grouped_cols = conn.query_columns(&grouped_sql);
     assert_eq!(
@@ -519,56 +478,165 @@ fn e2e_deletes_with_single_and_grouped_agg() {
     );
 }
 
-// Equality deletes have no E2E fixture (only Flink writes them); they share the
-// same plan-time gate, covered by `classify_manifest_file`'s unit tests.
-// #12: once iceberg-rust reads v3 deletion vectors, this fixture becomes readable
-// and needs replacing.
+/// Scenario: Delete-file references are carried in the per-shard files argument
 #[test]
-fn e2e_unsupported_delete_fails_loud() {
+fn fixture_spark_deletion_vector_table() {
+    setup_e2e();
+
+    let files = runtime().block_on(resolve_fixture_files(NAMESPACE, DELETION_VECTOR_TABLE));
+    assert_eq!(
+        files.len(),
+        4,
+        "mor_dv must resolve 4 data files: {files:?}"
+    );
+
+    let mut positional = 0;
+    let mut vectors = Vec::new();
+    for entry in &files {
+        match entry.deletes.as_slice() {
+            [DeleteMechanism::IcebergPositionalDelete { .. }] => positional += 1,
+            [
+                DeleteMechanism::IcebergPuffinDeletionVector {
+                    path,
+                    content_offset,
+                    record_count,
+                    ..
+                },
+            ] => vectors.push((path.as_str(), *content_offset, *record_count)),
+            other => panic!("data file {} has unexpected deletes {other:?}", entry.path),
+        }
+    }
+    assert_eq!(
+        positional, 1,
+        "one data file keeps its v2 positional delete"
+    );
+
+    let mut cardinalities: Vec<u64> = vectors.iter().map(|v| v.2).collect();
+    cardinalities.sort_unstable();
+    assert_eq!(cardinalities, DELETION_VECTOR_CARDINALITIES);
+
+    let (large_path, large_offset, _) = vectors.iter().max_by_key(|v| v.2).unwrap();
+    assert!(
+        vectors
+            .iter()
+            .any(|(path, offset, _)| path == large_path && offset != large_offset),
+        "the large vector shares its Puffin file with another blob: {vectors:?}"
+    );
+}
+
+/// Scenario: Iceberg deletion vectors are applied on read
+/// Scenario: Iceberg deletion vectors compose with projection, filter, LIMIT, and aggregates
+#[test]
+fn e2e_deletion_vectors_return_post_delete_rows() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    let sql = format!(
-        "SELECT * FROM {} LIMIT 1",
-        vs_table(VS_NAME, DELETION_VECTOR_TABLE)
-    );
-    let resp = conn.try_execute(&sql);
+    let mut small_expected: Vec<i64> = deletion_vector_remaining_ids()
+        .filter(|id| *id < 1000)
+        .collect();
+    small_expected.sort_unstable();
+    let count = deletion_vector_remaining_ids().count() as i64;
+    let sum: i64 = deletion_vector_remaining_ids().sum();
+    let (_, last) = DELETION_VECTOR_FILE_ID_RANGES[3];
+    let top: Vec<i64> = (149_990..=last)
+        .filter(|id| !deletion_vector_deleted(*id))
+        .take(5)
+        .collect();
+    let after_range = (150_000..=last)
+        .find(|id| !deletion_vector_deleted(*id))
+        .unwrap();
 
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "query over an unsupported-delete table must fail, got: {resp}"
-    );
+    for vs in [LAKEHOUSE_VS, SAMESHARD_VS_NAME, SPLITSHARD_VS_NAME] {
+        let table = vs_table(vs, DELETION_VECTOR_TABLE);
 
-    let message = resp["exception"]["text"]
-        .as_str()
-        .or_else(|| resp["message"].as_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    assert!(
-        message.contains("equality")
-            || message.contains("deletion vector")
-            || message.contains("puffin"),
-        "error must name the unsupported delete mechanism (equality delete or \
-         deletion vector/Puffin), got: {resp}"
-    );
+        let small = ids_column(&conn.query_columns(&format!(
+            "SELECT id FROM {table} WHERE id < 1000 ORDER BY id"
+        )));
+        assert_eq!(small, small_expected, "{vs}: post-delete ids below 1000");
 
-    for secret_marker in [
-        "access_key",
-        "secret_key",
-        "session_token",
-        "secretaccesskey",
-    ] {
+        let agg = conn.query_columns(&format!("SELECT COUNT(*), SUM(id) FROM {table}"));
+        assert_eq!(
+            (parse_int(&agg[0][0]), parse_int(&agg[1][0])),
+            (count, sum),
+            "{vs}: post-delete COUNT(*) and SUM(id)"
+        );
+
+        let cols = conn.query_columns(&format!(
+            "SELECT id, val FROM {table} WHERE id >= 149990 ORDER BY id LIMIT 5"
+        ));
+        assert_eq!(ids_column(&cols), top, "{vs}: TopN skips deleted rows");
+        let vals: Vec<&str> = cols[1].iter().map(|v| v.as_str().unwrap()).collect();
+        let expected_vals: Vec<String> = top.iter().map(|id| format!("row-{id:02}")).collect();
+        assert_eq!(
+            vals, expected_vals,
+            "{vs}: projected values follow their rows"
+        );
+
+        let min = conn.query_columns(&format!("SELECT MIN(id) FROM {table} WHERE id >= 150000"));
+        assert_eq!(
+            parse_int(&min[0][0]),
+            after_range,
+            "{vs}: a deleted range spanning several row groups stays deleted"
+        );
+    }
+}
+
+// Equality deletes have no E2E fixture (only Flink writes them); their refusal is
+// covered by `classify_planned_file`'s unit tests.
+/// Scenario: An unsupported delete mechanism fails loud at plan time
+/// Scenario: An unsupported delete mechanism on a pruned file does not fail the query
+#[test]
+fn e2e_unsupported_data_file_format_fails_loud() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let table = vs_table(LAKEHOUSE_VS, UNSUPPORTED_FORMAT_TABLE);
+    let (orc_first, _) = ORC_FILE_IDS;
+
+    for filter in [String::new(), format!("WHERE id >= {orc_first}")] {
+        let resp = conn.try_execute(&format!("SELECT id FROM {table} {filter}"));
+        assert_eq!(
+            resp["status"].as_str(),
+            Some("error"),
+            "a scan planning a file with an unsupported mechanism must fail ({filter}), got: {resp}"
+        );
+        let message = resp["exception"]["text"]
+            .as_str()
+            .or_else(|| resp["message"].as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         assert!(
-            !message.contains(secret_marker),
-            "error must not leak credentials (found '{secret_marker}'): {resp}"
+            message.contains("lakehouse pushdown declined") && message.contains("orc data files"),
+            "error must be the plan-time refusal naming ORC data files ({filter}), got: {resp}"
+        );
+        for leak in [
+            "access_key",
+            "secret_key",
+            "session_token",
+            "secretaccesskey",
+            "s3://",
+            ".orc",
+        ] {
+            assert!(
+                !message.contains(leak),
+                "error must name no credential or file path (found '{leak}'): {resp}"
+            );
+        }
+        assert_eq!(
+            resp["responseData"]["results"][0]["resultSet"]["numRows"].as_i64(),
+            None,
+            "a plan-time failure must not carry a result set: {resp}"
         );
     }
 
+    let (first, last) = PARQUET_FILE_IDS;
+    let cols = conn.query_columns(&format!(
+        "SELECT id FROM {table} WHERE id >= {first} AND id <= {last} ORDER BY id"
+    ));
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
     assert_eq!(
-        resp["responseData"]["results"][0]["resultSet"]["numRows"].as_i64(),
-        None,
-        "a plan-time failure must not carry a result set: {resp}"
+        ids,
+        (first..=last).collect::<Vec<_>>(),
+        "a filter that prunes every file an unsupported mechanism applies to must read the rest"
     );
 }
 
@@ -577,7 +645,7 @@ fn e2e_delete_free_table_no_regression() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    let table = vs_table(VS_NAME, E2E_TABLE);
+    let table = vs_table(LAKEHOUSE_VS, E2E_TABLE);
 
     let filter_count = conn.query_row_count(&format!("SELECT id FROM {table} WHERE score > 15.0"));
     assert_eq!(
@@ -610,14 +678,5 @@ fn e2e_delete_free_table_no_regression() {
         (total_score - expected_total_score).abs() < 1e-6,
         "delete-free aggregate regression: expected SUM(score)≈{expected_total_score}, \
          got {total_score}"
-    );
-}
-
-#[test]
-fn positional_delete_suite_fails_when_stack_unavailable() {
-    let result = std::panic::catch_unwind(|| ExaConn::connect("192.0.2.1", 8563, "sys", "exasol"));
-    assert!(
-        result.is_err(),
-        "ExaConn::connect to an unreachable host must panic, not return Ok"
     );
 }

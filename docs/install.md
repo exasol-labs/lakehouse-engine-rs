@@ -30,6 +30,8 @@ example is a network with no path to GitHub.
   is no terminal to ask, e.g. the one-liner below) — you still need to configure a profile
   afterward. A local Exasol Personal deployment needs the `exapump` binary but no profile: the
   connection resolves from the deployment directory.
+- A database user with the `CREATE SCHEMA` and `CREATE SCRIPT` privileges, plus `ALTER SYSTEM`
+  unless you pass [`--skip-slc`](#skip-the-slc-step).
 - `jq`, but only if you use `--deployment` to target an Exasol Personal deployment. It parses the
   deployment descriptor (`deployment.json`) to resolve connection details and backend. SaaS and
   BucketFS targets don't need it.
@@ -123,7 +125,9 @@ curl -fsSL -H "Accept: application/vnd.github.raw" \
    It creates no dataset-specific object itself.
 
 The command is idempotent. It uses `CREATE OR REPLACE`, `CREATE SCHEMA IF NOT EXISTS`, and an
-in-place language-list update. Run it again on a prior install to upgrade it.
+in-place language-list update. Run it again on a prior install to upgrade it. An upgrade drops
+every per-script grant on the scripts, so issue those grants again afterward (see
+[Re-installing](security.md#re-installing)).
 
 ## Flags
 
@@ -176,16 +180,13 @@ creation, and the smoke test.
 ## Point the VS at your data
 
 Two statements finish the install: a catalog `CONNECTION`, then the Virtual Schema over it. The
-following example is a complete local setup with SeaweedFS and an Iceberg REST catalog, run as a DBA.
-A non-DBA needs `GRANT ACCESS ON CONNECTION ... FOR SCRIPT` for both scripts, plus
-`EXECUTE ON SCRIPT` on all three of `LAKEHOUSE_ADAPTER`, `LAKEHOUSE_SCAN`, and
-`LAKEHOUSE_DISTRIBUTE_FILES`, before `CREATE VIRTUAL SCHEMA` — see [Security](security.md).
-Re-running the installer re-creates all three scripts (`CREATE OR REPLACE SCRIPT`), which drops
-every one of those `EXECUTE ON SCRIPT` grants along with the connection-access grant; re-issue all
-of them afterward.
+following example is a complete local setup with SeaweedFS and an Iceberg REST catalog, run as `SYS`.
+Any other user that creates the Virtual Schema owns it and needs the
+[owner grants](security.md#owner-grants) first. A re-install drops per-script grants (see
+[Re-installing](security.md#re-installing)).
 
 ```sql
-CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
+CREATE CONNECTION LAKEHOUSE_CATALOG_CREDS
   TO 'http://iceberg-rest:8181'
   USER ''
   IDENTIFIED BY '{
@@ -210,11 +211,8 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 - **AWS Glue, Lakekeeper, Unity Catalog (Delta tables), and the full credential-JSON reference** are in [Catalogs](catalogs.md).
 - **Tuning properties** (`PARALLELISM_FACTOR`, memory pool sizing, DataFusion partitions/threads,
   and more) are in [Tuning](tuning.md).
-- **Before granting other users access**, read [Security](security.md) — both scripts need a
-  CONNECTION grant held by the VS owner, and `GRANT SELECT ON SCHEMA` is the real auth boundary.
-  An end user needs only `GRANT CREATE SESSION` plus `GRANT SELECT ON SCHEMA <vs>` — nothing else,
-  and re-running this installer never touches that grant. Only the owner-held `EXECUTE ON SCRIPT`
-  and `GRANT ACCESS ON CONNECTION` grants above need re-issuing after a re-install.
+- **Before granting other users access**, read [Security](security.md). A user who only queries
+  the Virtual Schema needs `CREATE SESSION` and `SELECT` on it, and nothing else.
 
 ## Query
 
@@ -281,7 +279,7 @@ make cross-udf-build           # → target/release/liblakehouse_engine.so
 make bucketfs-upload-so        # → BucketFS udf/liblakehouse_engine.so
 ```
 
-The build runs inside `rust:1.94-trixie` (glibc 2.41, which matches the SLC). It rebuilds only
+The build runs inside `rust:1.98.1-trixie` (glibc 2.41, which matches the SLC). It rebuilds only
 when crate sources, manifests, or the lockfile change. One `.so` exports **all three** RUST entry
 points (VS adapter, scan SCALAR UDF, and version query). This path needs Docker and
 [`exapump`](https://github.com/exasol-labs/exapump). It also needs the Rust SLC already

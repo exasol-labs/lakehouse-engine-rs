@@ -1,5 +1,5 @@
 //! Ground truth for the Spark Iceberg type-promotion fixture. Authored at stack
-//! bring-up by the `spark-iceberg-fixtures` job because no `iceberg` 0.10 API can
+//! bring-up by the `spark-iceberg-fixtures` job because no `iceberg` API can
 //! change a column's type. Must stay in lockstep with
 //! `scripts/spark-fixtures/create_iceberg_type_promotion_fixture.sql`.
 //!

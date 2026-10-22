@@ -1105,6 +1105,9 @@ fn iceberg_primitive_mappings_are_exhaustive_so_a_new_variant_breaks_the_build()
         PrimitiveType::Uuid,
         PrimitiveType::Fixed(16),
         PrimitiveType::Binary,
+        PrimitiveType::Geometry(iceberg::spec::GeometryType::new(None).unwrap()),
+        PrimitiveType::Geography(iceberg::spec::GeographyType::default()),
+        PrimitiveType::Unknown,
     ];
 
     for variant in &every_variant {
@@ -1158,6 +1161,9 @@ fn expected_mapping(pt: &PrimitiveType) -> (&'static str, DataType) {
         PrimitiveType::Uuid => ("VARCHAR(2000000)", DataType::Utf8),
         PrimitiveType::Fixed(_) => ("VARCHAR(2000000)", DataType::Utf8),
         PrimitiveType::Binary => ("VARCHAR(2000000)", DataType::Utf8),
+        PrimitiveType::Geometry(_) => ("VARCHAR(2000000)", DataType::Utf8),
+        PrimitiveType::Geography(_) => ("VARCHAR(2000000)", DataType::Utf8),
+        PrimitiveType::Unknown => ("VARCHAR(2000000)", DataType::Utf8),
     }
 }
 

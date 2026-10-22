@@ -1,7 +1,6 @@
 pub mod convert;
 pub mod diagnostics;
 pub mod emit;
-pub mod positional_deletes;
 pub mod runtime;
 pub(crate) mod sealed;
 pub mod spec;
@@ -32,6 +31,8 @@ mod checked_div;
 mod exasol_numeric;
 mod raised_failure;
 
+pub(crate) mod parquet_reader;
+
 mod object_store;
 pub(crate) use self::object_store::{
     build_admission_limited_store, build_table_root_store, store_root_url,
@@ -41,11 +42,14 @@ pub(crate) use spec::{encode_file_path, reconstruct_abs_uri};
 
 mod storage_ref;
 pub use storage_ref::ResolvedScanStorage;
+pub(crate) use storage_ref::connection_grant_hint;
 use storage_ref::resolve_scan_storage;
 
 mod store_router;
 
 mod deletion_vectors;
+mod row_deletes;
+mod scan_table;
 
 mod partition_values;
 pub(crate) use partition_values::{non_null_partition_value, partition_scalar};
@@ -150,8 +154,8 @@ pub fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
         );
 
     if spec.common.join.is_some() {
-        // `HashJoinExec` builds from the left child, where the dimension sits. Statistics
-        // collection is disabled, so `JoinSelection` swaps would be non-deterministic; turning
+        // `HashJoinExec` builds from the left child, where the dimension sits. The scan provider
+        // reports no statistics, so `JoinSelection` swaps would be non-deterministic; turning
         // reordering off pins the bounded dimension as the build side.
         config.set_bool("datafusion.optimizer.join_reordering", false)
     } else {

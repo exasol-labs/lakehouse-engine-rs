@@ -1,26 +1,9 @@
-#![cfg(feature = "exasol-e2e")]
-
-mod common;
-use common::e2e_harness::*;
-use common::stack::wait_for_exasol;
-
-use std::sync::OnceLock;
-
-static SETUP_DONE: OnceLock<()> = OnceLock::new();
-
-fn setup_e2e() {
-    SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        install_slc();
-        upload_so();
-        let mut conn = exa_conn();
-        create_schema_and_scripts(&mut conn);
-    });
-}
+use crate::common::e2e_harness::*;
+use crate::fixtures::stack;
 
 #[test]
 fn version_udf_returns_the_compiled_crate_version() {
-    setup_e2e();
+    stack();
     let mut conn = exa_conn();
 
     let resp = conn.execute(&format!(

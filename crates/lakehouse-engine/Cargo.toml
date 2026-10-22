@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.53.2"
+version = "0.55.0"
 edition = "2024"
 license.workspace = true
 
@@ -43,18 +43,18 @@ roaring = { workspace = true }
 iceberg = { workspace = true }
 
 # Declared here, not in `[workspace.dependencies]`: member manifests enter CI's cache key.
-# `default-features = false` on the default engine: its defaults pull in `arrow-59`, a
-# second arrow tree next to `arrow-58`.
-# `internal-api` is the only way 0.26 exposes partition columns, column-mapping mode, and
+# `default-features = false` on the default engine: its defaults pick the arrow major and TLS
+# stack, and both must match the rest of the `.so`.
+# `internal-api` is the only way the kernel exposes partition columns, column-mapping mode, and
 # the reader protocol; it has no semver guarantee, so its accessors are confined to
 # `format::delta_replay` and `format::delta_protocol`.
-delta_kernel = { version = "0.26", features = [
+delta_kernel = { version = "0.30.0", features = [
     "default-engine-base",
-    "arrow-58",
+    "arrow-59",
     "internal-api",
 ] }
-delta_kernel_default_engine = { version = "0.26", default-features = false, features = [
-    "arrow-58",
+delta_kernel_default_engine = { version = "0.30.0", default-features = false, features = [
+    "arrow-59",
     "rustls",
 ] }
 
@@ -103,3 +103,39 @@ rsa                 = { version = "0.9", features = ["sha2", "pkcs5"] }
 futures             = { workspace = true }
 anyhow              = { workspace = true }
 aws-sdk-glue        = { workspace = true }
+
+[[test]]
+name = "e2e_local"
+required-features = ["exasol-e2e"]
+
+[[test]]
+name = "e2e_capture_pushdown"
+required-features = ["exasol-e2e"]
+
+[[test]]
+name = "tpch_loader"
+required-features = ["exasol-e2e"]
+
+[[test]]
+name = "two_entry_points_test"
+required-features = ["exasol-e2e"]
+
+[[test]]
+name = "e2e_lakekeeper_test"
+required-features = ["lakekeeper-e2e"]
+
+[[test]]
+name = "e2e_unity_test"
+required-features = ["unity-e2e"]
+
+[[test]]
+name = "e2e_azure_test"
+required-features = ["azure-e2e"]
+
+[[test]]
+name = "e2e_glue_test"
+required-features = ["glue-e2e"]
+
+[[test]]
+name = "cloud_e2e_test"
+required-features = ["cloud-e2e"]

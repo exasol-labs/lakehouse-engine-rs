@@ -110,7 +110,7 @@ pub async fn register_files(
 /// `delete_path_read_limiter` must be the SAME `Arc` for every call in one invocation, including
 /// both join sides, so the instance stays within one N-permit budget.
 ///
-/// [`PositionalDeleteScanTable`]: crate::scan::positional_deletes::PositionalDeleteScanTable
+/// [`ParquetScanTable`]: crate::scan::scan_table::ParquetScanTable
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn register_file_list(
     ctx: &SessionContext,
@@ -147,8 +147,7 @@ pub(super) async fn register_file_list(
         build_logical_arrow_schema(logical_schema)
     } else {
         let listing_options = ListingOptions::new(Arc::new(int96_coerced_parquet_format()))
-            .with_file_extension(".parquet")
-            .with_collect_stat(false);
+            .with_file_extension(".parquet");
         let first_url = ListingTableUrl::parse(&first_abs)
             .map_err(|e| UdfError::User(format!("invalid listing URL '{first_abs}': {e}")))?;
         listing_options
@@ -165,7 +164,7 @@ pub(super) async fn register_file_list(
     let schema = PartitionedScanSchema::split(table_schema, partition_columns)
         .map_err(|e| UdfError::User(format!("cannot register '{table_name}': {e}")))?;
 
-    let table = crate::scan::positional_deletes::PositionalDeleteScanTable::new(
+    let table = crate::scan::scan_table::ParquetScanTable::new(
         object_store_url,
         schema,
         use_field_id_adapter,

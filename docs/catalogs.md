@@ -35,6 +35,10 @@ Find the row that matches your catalog. Then copy its recipe.
 | [Unity Catalog (Delta and Parquet tables)](#unity-catalog-delta-and-parquet-tables) | Unity Catalog | none, PAT, or Databricks OAuth M2M | Supported |
 | [Direct storage (raw Parquet, no catalog)](#direct-storage-raw-parquet-no-catalog) | Direct storage | none (storage credentials only) | Supported |
 
+Iceberg tables are read with their deletes applied: Parquet positional-delete files and
+format-version-3 deletion vectors. A query on a table that needs equality deletes, or that holds
+ORC or Avro data or delete files, fails with an error naming the mechanism.
+
 The steps here cover only the catalog CONNECTION and the Virtual Schema. They are the
 [Point the VS at your data](install.md#point-the-vs-at-your-data) step of [Install](install.md).
 First copy the `.so` to BucketFS and create the scripts.
@@ -106,7 +110,7 @@ does not construct.
 For local testing, the STS endpoint MUST evaluate `RoleArn`. The bundled SeaweedFS stack does. It does not enforce `aws_external_id`, which needs real AWS STS.
 
 ```sql
-CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
+CREATE CONNECTION LAKEHOUSE_CATALOG_CREDS
   TO 'https://glue.us-east-1.amazonaws.com/iceberg'
   USER ''
   IDENTIFIED BY '{
@@ -136,7 +140,7 @@ region signs the catalog request.
 Use this recipe for the bundled Docker stack or any plain, unauthenticated Iceberg REST catalog. It uses static S3 credentials, `path_style: true` for SeaweedFS, and no catalog auth.
 
 ```sql
-CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
+CREATE CONNECTION LAKEHOUSE_CATALOG_CREDS
   TO 'http://iceberg-rest:8181'
   USER ''
   IDENTIFIED BY '{
@@ -178,7 +182,7 @@ those notes against the table's current snapshot.
 The catalog URI is the Glue Iceberg REST endpoint. `warehouse` is the AWS **account id**, not an `s3://` path. The adapter derives the Glue REST prefix `catalogs/{account-id}` from it automatically. Turn `use_sigv4` on. `access_key` and `secret_key` then become required, and they sign the catalog requests. When the CONNECTION's address is a standard, commercial AWS Glue endpoint of the form `https://glue.<region>.amazonaws.com` — as below — that endpoint supplies its own SigV4 signing region, so `region` may be omitted for signing purposes; any other Glue endpoint (AWS GovCloud, AWS China, FIPS, a VPC interface endpoint, a private or proxy host) still requires a stated `region`. `region` also places the S3 store, independently of whatever region signs the catalog request, so state it whenever a scan reads data with static S3 keys — even against a standard endpoint. Omit `endpoint`. With `path_style: false`, the S3 client derives the standard AWS endpoint from `region`. The account id below is a placeholder, so substitute your own.
 
 ```sql
-CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
+CREATE CONNECTION LAKEHOUSE_CATALOG_CREDS
   TO 'https://glue.us-east-1.amazonaws.com/iceberg'
   USER ''
   IDENTIFIED BY '{
@@ -204,7 +208,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 **Static bearer token.** Supply `token`. S3 access still uses the static key pair. If the catalog vends credentials, omit the S3 fields.
 
 ```sql
-CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
+CREATE CONNECTION LAKEHOUSE_CATALOG_CREDS
   TO '<rest-catalog-uri>'
   USER ''
   IDENTIFIED BY '{
@@ -216,7 +220,7 @@ CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
 **OAuth2 client credentials.** Supply `client_id` and `client_secret` together. The adapter rejects one without the other. `oauth2_server_uri` and `scope` are optional overrides.
 
 ```sql
-CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
+CREATE CONNECTION LAKEHOUSE_CATALOG_CREDS
   TO '<rest-catalog-uri>'
   USER ''
   IDENTIFIED BY '{
@@ -246,14 +250,14 @@ If the catalog or its storage uses plain HTTP, add `ALLOW_HTTP = 'true'`. If not
 - **Base path.** Lakekeeper serves its REST API under the `/catalog` base path, so `TO` must include it, for example `http://lakekeeper:8181/catalog`. The adapter negotiates this base path automatically from the `GET /v1/config?warehouse=` response of the catalog. No other configuration is necessary.
 - **Warehouse is a name, not a path.** Lakekeeper supports many warehouses. `warehouse` is the warehouse **name** that you register with the management API of Lakekeeper, for example `lakehouse_static`. It is not an `s3://` location. The `warehouse` field of Glue uses the same shape with an account id.
 
-A virtual schema over Lakekeeper can also refuse queries per Exasol user with `PERMISSION_CHECK = 'LAKEKEEPER'`. See [Lakekeeper permission check](security.md#lakekeeper-permission-check-415) for setup and its limits.
+A virtual schema over Lakekeeper can also refuse queries per Exasol user with `PERMISSION_CHECK = 'LAKEKEEPER'`. See [Lakekeeper permission check](security.md#lakekeeper-permission-check) for setup and its limits.
 
 The adapter supports both credential modes below. They differ only in the Lakekeeper warehouse and the CONNECTION fields that you use.
 
 **Static credentials** (`sts-enabled: false` on the Lakekeeper warehouse). The adapter reads SeaweedFS directly with the static key pair, like any other backend:
 
 ```sql
-CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
+CREATE CONNECTION LAKEHOUSE_CATALOG_CREDS
   TO 'http://lakekeeper:8181/catalog'
   USER ''
   IDENTIFIED BY '{
@@ -284,7 +288,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 The adapter then requests short-lived credentials from the `load_table` response of Lakekeeper. In this stack these credentials are SeaweedFS STS AssumeRole credentials, scoped to the bucket of the warehouse.
 
 ```sql
-CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
+CREATE CONNECTION LAKEHOUSE_CATALOG_CREDS
   TO 'http://lakekeeper:8181/catalog'
   USER ''
   IDENTIFIED BY '{
@@ -386,7 +390,7 @@ has auth disabled and whose Delta files sit in the same SeaweedFS bucket the Ice
 stack's seed script registers its fixture tables under the `unity.delta_e2e` catalog/schema):
 
 ```sql
-CREATE OR REPLACE CONNECTION UNITY_CATALOG_CREDS
+CREATE CONNECTION UNITY_CATALOG_CREDS
   TO 'http://unitycatalog:8080'
   USER ''
   IDENTIFIED BY '{
@@ -410,7 +414,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 handing out a static key pair):
 
 ```sql
-CREATE OR REPLACE CONNECTION UNITY_CATALOG_CREDS
+CREATE CONNECTION UNITY_CATALOG_CREDS
   TO 'https://<workspace-host>.cloud.databricks.com'
   USER ''
   IDENTIFIED BY '{
@@ -439,7 +443,7 @@ The [AWS Glue Iceberg REST](#aws-glue-iceberg-rest-sigv4) recipe above is a diff
 **CONNECTION shape.** `TO` is the Glue endpoint. A standard `https://glue.<region>.amazonaws.com` address supplies the SigV4 signing region. Any other address needs a stated `region`. The password carries static IAM credentials. The same `access_key`, `secret_key`, and optional `session_token` sign the Glue requests and read S3. With `aws_assume_role_arn`, the role's session replaces them for both (see [Assuming an AWS IAM role](#assuming-an-aws-iam-role)). State `region` so the S3 store is placed. `warehouse` is optional and names the Glue `CatalogId`. If you omit it, Glue uses the AWS account of the credentials, which is the role's account when a role is assumed. The account id below is a placeholder.
 
 ```sql
-CREATE OR REPLACE CONNECTION GLUE_CATALOG_CREDS
+CREATE CONNECTION GLUE_CATALOG_CREDS
   TO 'https://glue.us-east-1.amazonaws.com'
   USER ''
   IDENTIFIED BY '{
@@ -554,7 +558,7 @@ credential shape: `s3`/`s3a` for S3 credentials, `abfss` only for Azure credenti
 the trailing `s`) is rejected, naming `abfss` as the accepted spelling.
 
 ```sql
-CREATE OR REPLACE CONNECTION DIRECT_STORAGE_CREDS
+CREATE CONNECTION DIRECT_STORAGE_CREDS
   TO 's3://warehouse/events'
   USER ''
   IDENTIFIED BY '{

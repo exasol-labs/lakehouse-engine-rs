@@ -35,12 +35,13 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the per-shard file
 * *AND* the reconstructed absolute delete-file path (table root joined with a relative entry, or an absolute entry passed through) SHALL equal the original resolved delete-file URI
 * *AND* the adapter MUST NOT corrupt an absolute delete-file path by stripping a non-prefix match
 
-### Scenario: Each delete-file entry carries its content type so the scan can reject non-positional deletes
+### Scenario: Each delete-file entry carries its content type so the scan can reject unsupported deletes
 
 * *GIVEN* a resolved file list whose data files carry associated delete files
 * *WHEN* the adapter emits each data file's associated delete-file references into the per-shard files argument
-* *THEN* the adapter SHALL carry, per delete-file entry, its delete content type (e.g. positional) alongside its path and byte size, so the scan UDF's read-time backstop can reject any non-positional delete file
-* *AND* the per-delete-file surface SHALL be limited to path, byte size, and content type, no additional Iceberg metadata is carried per delete file
+* *THEN* the adapter SHALL carry, per delete-file entry, its delete content type (positional delete, Puffin deletion vector, or equality delete) alongside its path and byte size, so the scan UDF's read-time backstop can reject an equality delete
+* *AND* a Puffin deletion-vector entry SHALL also carry the blob's `content_offset` and `content_size_in_bytes` and the manifest's `record_count`, because the scan fetches only that blob and checks its cardinality
+* *AND* every other delete-file entry SHALL be limited to path, byte size, and content type, with no additional Iceberg metadata
 
 ### Scenario: Generated SQL carries a credential reference, not a credential
 

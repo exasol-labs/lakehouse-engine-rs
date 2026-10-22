@@ -205,7 +205,7 @@ async fn an_out_of_tree_positional_delete_file_routes_to_its_data_files_side() {
 }
 
 #[tokio::test]
-async fn a_deletion_vector_contributes_no_owned_path() {
+async fn a_delta_deletion_vector_contributes_no_owned_path() {
     let files = [FileEntry::with_deletes(
         "data/f1.parquet",
         1,
@@ -230,6 +230,35 @@ async fn a_deletion_vector_contributes_no_owned_path() {
     assert_eq!(
         side.owned, expected,
         "a deletion vector must contribute no owned path, only the data file's own"
+    );
+}
+
+#[tokio::test]
+async fn an_iceberg_deletion_vector_contributes_its_puffin_file_as_an_owned_path() {
+    let files = [FileEntry::with_deletes(
+        "data/f1.parquet",
+        1,
+        vec![DeleteMechanism::IcebergPuffinDeletionVector {
+            path: "data/dv.puffin".to_string(),
+            size: 100,
+            content_offset: 4,
+            content_size_in_bytes: 44,
+            record_count: 2,
+        }],
+    )];
+    let side = RoutedSide::new(
+        &scan_side(FACT_LABEL, &files, FACT_ROOT),
+        store_labelled(FACT_LABEL, &[]).await,
+    )
+    .expect("fact side");
+
+    let expected: HashSet<ObjectStorePath> = ["data/f1.parquet", "data/dv.puffin"]
+        .into_iter()
+        .map(|path| store_path(path, FACT_ROOT).expect("valid path"))
+        .collect();
+    assert_eq!(
+        side.owned, expected,
+        "the Puffin file a join side's vector lives in routes to that side"
     );
 }
 

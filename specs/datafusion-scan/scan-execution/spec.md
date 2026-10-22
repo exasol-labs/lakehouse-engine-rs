@@ -9,7 +9,7 @@ A disposable Rust SCALAR EMIT UDF. For one call it builds a DataFusion session, 
 * Only serialized bytes cross the `.so` boundary: VARCHAR JSON in, Arrow IPC bytes out. The raw-row path emits each `RecordBatch` through the SDK's `EmitBatch` Arrow-IPC path (feature `emit-arrow`) and builds no `Vec<Value>` per batch.
 * Per-file metadata and path resolution against the table root are in `datafusion-scan/scan-execution-file-metadata`.
 * When the scan spec carries a logical schema, column projection binds each logical field by the key its format reader populated: field-id (Iceberg, Delta `id` column mapping), physical name (Delta `name` column mapping), or logical name (Delta `none` column mapping). Without a logical schema, the UDF infers the schema from the first file and binds by physical name.
-* The scan registers files through the `ParquetSource`-backed table provider `PositionalDeleteScanTable`, not the iceberg-rust Arrow reader, so it sets INT96 coercion itself.
+* The scan registers files through a custom `ParquetSource`-backed table provider, not the iceberg-rust Arrow reader, so it sets INT96 coercion itself.
 * INT96 is a legacy Parquet/Hive/Spark timestamp encoding that the Iceberg spec does not define. It carries nanosecond precision, and coercing to `"us"` truncates sub-microsecond digits.
 * `coerce_int96_tz = "UTC"` makes the decoded physical type `Timestamp(Microsecond, "UTC")` for every column. An Iceberg `timestamp` column's logical type is `Timestamp(Microsecond, None)`, and `datafusion-scan/scan-execution-value-conversion` reconciles the difference at emit.
 * DataFusion execution is memory-bounded. A bound that cannot spill surfaces as a clean error, never an OOM VM crash.

@@ -2,7 +2,6 @@
 //! `CAPTURE_SQL` through `EXPLAIN VIRTUAL` and for real; optional
 //! `CAPTURE_RESULT_SET_MAX_ROWS` caps the connection. Usage: see
 //! `scripts/capture-pushdown-payload.sh`.
-#![cfg(feature = "exasol-e2e")]
 
 mod common;
 use common::e2e_harness::*;

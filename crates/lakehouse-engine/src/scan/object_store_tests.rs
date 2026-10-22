@@ -747,7 +747,7 @@ fn a_delete_file_under_a_different_root_is_rejected() {
 }
 
 #[test]
-fn a_deletion_vector_is_not_checked_against_the_object_store_root() {
+fn a_delta_deletion_vector_is_not_checked_against_the_object_store_root() {
     let files = vec![FileEntry::with_deletes(
         "s3://bucket-a/data/f1.parquet",
         1,

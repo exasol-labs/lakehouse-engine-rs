@@ -36,7 +36,7 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  # Built inside rust:1.94-trixie, never on the runner: the SDK fingerprint
+  # Built inside rust:1.98.1-trixie, never on the runner: the SDK fingerprint
   # embeds the rustc hash, so a host-built .so is rejected by the SLC.
   build-so:
     name: Build release .so (Docker, ${{ matrix.arch }})
@@ -103,11 +103,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust 1.94
-        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1 branch (toolchain 1.98.1 baked into action.yml)
 
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
-        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
+        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.98\.1' | xargs -r -n1 rustup toolchain uninstall
 
       - name: Cache cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -124,19 +124,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust 1.94
-        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1 branch (toolchain 1.98.1 baked into action.yml)
         with:
           components: clippy, rustfmt
 
       # `components:` above doesn't reliably provision these on every snapshot.
-      - name: Ensure rustfmt/clippy available on 1.94
-        run: rustup component add rustfmt clippy --toolchain 1.94
+      - name: Ensure rustfmt/clippy available on 1.98.1
+        run: rustup component add rustfmt clippy --toolchain 1.98.1
 
       # rust-cache keys on every installed toolchain, and the runner's
       # preinstalled Rust drifts across images, diverging writer/reader keys (#133).
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
-        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
+        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.98\.1' | xargs -r -n1 rustup toolchain uninstall
 
       # Keep inputs identical across every workspace-rlib step, or readers stay cold (#133).
       - name: Restore cargo & build artifacts
@@ -158,16 +158,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust 1.94
-        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1 branch (toolchain 1.98.1 baked into action.yml)
         with:
           components: llvm-tools-preview
 
-      - name: Ensure llvm-tools-preview available on 1.94
-        run: rustup component add llvm-tools-preview --toolchain 1.94
+      - name: Ensure llvm-tools-preview available on 1.98.1
+        run: rustup component add llvm-tools-preview --toolchain 1.98.1
 
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
-        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
+        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.98\.1' | xargs -r -n1 rustup toolchain uninstall
 
       # The distinct shared-key is the only thing separating this tree from
       # workspace-rlib: the coverage env never reaches rust-cache's key.
@@ -234,11 +234,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust 1.94
-        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1 branch (toolchain 1.98.1 baked into action.yml)
 
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
-        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
+        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.98\.1' | xargs -r -n1 rustup toolchain uninstall
 
       # rust-cache embeds the platform in the key and ignores `key:` with `shared-key`.
       - name: Cache cargo & build artifacts
@@ -256,8 +256,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust 1.94
-        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1 branch (toolchain 1.98.1 baked into action.yml)
 
       # Deliberately uncached: a registry cache costs 2 GB of the 10 GB quota for ~9s.
       - name: Install cargo-deny
@@ -362,7 +362,7 @@ jobs:
           docker compose up -d spark-iceberg-fixtures
           SPARK_FIXTURES_EXIT=$(docker wait lakehouse-engine-rs-spark-iceberg-fixtures-1)
           if [ "$SPARK_FIXTURES_EXIT" != "0" ]; then
-            echo "::error::spark-iceberg-fixtures exited $SPARK_FIXTURES_EXIT (positional-delete fixture authoring failed)"
+            echo "::error::spark-iceberg-fixtures exited $SPARK_FIXTURES_EXIT (Spark fixture authoring failed)"
             docker compose logs spark-iceberg-fixtures
             exit 1
           fi
@@ -676,9 +676,9 @@ jobs:
           tar -czf lakehouse-engine.tar.gz -C pkg/x86_64 udf
           tar -czf lakehouse-engine-aarch64.tar.gz -C pkg/aarch64 udf
 
-      - name: Install Rust 1.94
+      - name: Install Rust 1.98.1
         if: steps.gate.outputs.release == 'true'
-        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
+        uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1 branch (toolchain 1.98.1 baked into action.yml)
 
       - name: Install cargo-about
         if: steps.gate.outputs.release == 'true'

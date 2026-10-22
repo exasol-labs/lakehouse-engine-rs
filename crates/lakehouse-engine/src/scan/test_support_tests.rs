@@ -31,6 +31,27 @@ pub(super) fn write_parquet(path: &Path, columns: Vec<(&str, ArrayRef)>) -> Stri
         .to_string()
 }
 
+/// `batch` as Parquet bytes, cut into row groups of `rows_per_row_group` rows when given.
+pub(super) fn parquet_bytes(batch: RecordBatch, rows_per_row_group: Option<usize>) -> Vec<u8> {
+    let props = rows_per_row_group.map(|rows| {
+        parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows))
+            .build()
+    });
+    let mut buf = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), props).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    buf
+}
+
+pub(super) fn current_thread_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
 pub(super) async fn run_scan(spec: &ScanSpec) -> Vec<RecordBatch> {
     try_run_scan(spec)
         .await
@@ -179,7 +200,11 @@ impl exasol_udf_sdk::context::UdfContext for SinkCtx {
     fn next(&mut self) -> Result<bool, exasol_udf_sdk::error::UdfError> {
         Ok(false)
     }
-    fn emit_record_batch_ipc(&mut self, _: &[u8]) -> Result<(), exasol_udf_sdk::error::UdfError> {
+    fn emit_record_batch_ffi(
+        &mut self,
+        _: *mut core::ffi::c_void,
+        _: *mut core::ffi::c_void,
+    ) -> Result<(), exasol_udf_sdk::error::UdfError> {
         Ok(())
     }
 }

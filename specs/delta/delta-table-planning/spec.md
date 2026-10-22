@@ -137,7 +137,7 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 * *WHEN* the Delta format reader resolves that table's scan
 * *THEN* under vending the reader SHALL request per-table, short-lived, scoped credentials from that
   Unity Catalog against the table's own catalog-assigned vending key, and SHALL terminate the
-  response in a `StorageBackend` through the ONE shared vended-storage policy
+  response in a storage backend through the ONE shared vended-storage policy
   (`unity-catalog/unity-catalog-vended-credentials`), so the `abfs://` plaintext-consent gate and the S3
   address rule apply identically to the Iceberg and the Delta path
 * *AND* under vending the reader SHALL fail with an error naming the table when its catalog reported
@@ -153,7 +153,7 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 
 * *GIVEN* a Delta table whose catalog metadata carries an absent or empty storage location
 * *WHEN* the Delta format reader resolves that table's scan
-* *THEN* the reader SHALL return a `UdfError` naming the table and its empty storage location, from
+* *THEN* the reader SHALL return a clean user error naming the table and its empty storage location, from
   ONE check that runs BEFORE the vended/static storage split, so both values of
   `use_vended_credentials` report the IDENTICAL error text
 * *AND* the reader MUST NOT substitute the catalog URI, the CONNECTION's endpoint, or any other
@@ -165,19 +165,19 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 
 ### Scenario: The format reader is selected at one site and refuses a mismatched pairing
 
-* *GIVEN* a `ScanSource` whose variant pairs one resolved session with the table it reads
+* *GIVEN* a `ScanSource` that pairs one resolved session with the table it reads
 * *WHEN* the adapter selects the format reader for that source
-* *THEN* the adapter SHALL match `ScanSource` EXHAUSTIVELY at exactly ONE site, which returns a boxed `FormatReader`, so adding a table format or a catalog source is a compile error at that site rather than a silent fall-through
+* *THEN* the adapter SHALL match `ScanSource` EXHAUSTIVELY at exactly ONE site, which returns a `FormatReader`, so adding a table format or a catalog source is a compile error at that site rather than a silent fall-through
 * *AND* the Unity Catalog variant SHALL match the loaded table's FORMAT tag exhaustively: the Delta tag selects the Delta reader, the Parquet tag selects the Unity Parquet reader of `unity-catalog/unity-parquet-table-planning`, and the Iceberg tag returns a `UdfError` naming the table and the reported format, because a table routed into another format's reader surfaces a missing log or a wrong schema instead of a clear format refusal
 * *AND* that match MUST NOT be replaced by an assumption that the Unity Catalog listing filter already excluded a format, because the single-table load applies no listing filter
-* *AND* the selection site MUST NOT match `CatalogKind`, so the permitted-site set of `vs-adapter/catalog-kind-selection` (the enum with its resolver, the catalog-client construction site, credential validation, and the pushdown scan-source construction site) stays intact and gains no file
+* *AND* the selection site MUST NOT match the catalog kind, so the permitted-site set of `vs-adapter/catalog-kind-selection` (the enum with its resolver, the catalog-client construction site, credential validation, and the pushdown scan-source construction site) stays intact and gains no file
 
 ### Scenario: The Iceberg format reader owns file resolution and binds columns by field-id
 
 * *GIVEN* the Iceberg file-resolution logic, reached by the single-table pushdown path and every join leg
 * *WHEN* the Iceberg format reader resolves a table's scan through the trait
 * *THEN* the reader SHALL OWN that resolution logic outright, with no separately published file-resolution entry point, because `file-planning/pushdown-format-neutral-resolution` routes every caller through this seam
-* *AND* the reader SHALL construct each associated positional-delete reference as the Iceberg positional-delete variant of the format-neutral delete mechanism, serialized as `{"path":…,"size":…,"content_type":"position_deletes"}` inside the per-shard file list
+* *AND* the reader SHALL construct each associated positional-delete reference as the Iceberg positional-delete variant of the format-neutral delete mechanism, serialized as `{"path":…,"size":…,"content_type":"position_deletes"}` inside the per-shard file list, and each Puffin deletion vector as the Iceberg deletion-vector variant
 * *AND* the returned scan SHALL carry EMPTY partition columns, and each of its file entries SHALL carry EMPTY partition values
 * *AND* every logical field the Iceberg reader emits SHALL carry its Iceberg field-id and NO physical name, so an Iceberg column is still bound by field-id and the physical-name and identity binding strategies are unreachable from the Iceberg path
 
@@ -187,7 +187,7 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
   of its Delta tables
 * *WHEN* the adapter handles the resulting pushdown request
 * *THEN* the adapter SHALL select the Delta format reader through the scan-source seam and SHALL plan
-  the query from the `ResolvedScan` that reader returns
+  the query from the resolved scan that reader returns
 * *AND* the reader's resolved partition columns SHALL reach the shard-invariant common spec and its
   per-file partition values SHALL reach the per-shard file entries, so the scan reconstructs partition columns as
   `scan-read-path/scan-execution-partition-values` specifies

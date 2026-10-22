@@ -1,6 +1,5 @@
 //! `CATALOG_KIND = 'GLUE'` against real AWS Glue and S3 with a local Exasol. Run with
 //! `--test-threads=1`: the tests share one Exasol provisioning and one virtual schema name.
-#![cfg(feature = "glue-e2e")]
 
 mod common;
 
@@ -10,7 +9,7 @@ use common::e2e_harness::{
     assert_decimal_orders_numerically, assert_notes_well_formed, assert_text_columns,
     assert_type_matrix, column_adapter_notes, create_schema_and_scripts, declared_types, exa_conn,
     explain_virtual_sql, install_slc, int_column, note_of, pairs, parse_int, partition_positions,
-    query_error, reads, refuses, try_create_virtual_schema_with_password, upload_so,
+    query_error, reads, refuses, runtime, try_create_virtual_schema_with_password, upload_so,
     value_to_string,
 };
 use common::exasol_ws::ExaConn;
@@ -59,13 +58,6 @@ fn setup() {
         upload_so();
         create_schema_and_scripts(&mut exa_conn());
     });
-}
-
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
 }
 
 /// The environment is read before anything else, so a missing variable leaves no resource, and
@@ -655,7 +647,7 @@ fn check_all_types_declare_and_return_their_mapped_values(_run: &GlueRun, conn: 
         ],
     );
     assert_decimal_orders_numerically(conn, VS, ALL_TYPES, "H_DECIMAL_18_0");
-    assert_binary_values_refused(conn, VS, BINARY_VALUES, "Invalid UTF8 sequence");
+    assert_binary_values_refused(conn, VS, BINARY_VALUES, "Invalid bytestream");
 }
 
 /// Scenario: Session credentials sign every native Glue request

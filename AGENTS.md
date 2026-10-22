@@ -44,7 +44,7 @@ Project specifics:
 - Each node scans only its assigned files. Assignments never overlap.
 - `ScanSpec`, `FileEntry`, and `LogicalField` stay format-neutral. Widen an existing field before adding one, and never add a format-specific struct or `Option<FormatXSpec>`. Format knowledge lives in the plan-time `FormatReader`, and the scan side dispatches on field content, never on format identity.
 - Once the adapter advertises a capability, Exasol delegates it fully and never re-checks it. There is no Exasol-side fallback. The adapter must generate equivalent SQL for anything within an advertised capability that it cannot push into the DataFusion scan, because omitting it returns wrong rows.
-- Arrow types never cross the `.so` boundary, because Arrow `TypeId` is not stable across it. Only SDK `Value`s and Arrow IPC bytes (`ctx.emit_batch`) cross it.
+- Arrow types never cross the `.so` boundary, because Arrow `TypeId` is not stable across it. Only SDK `Value`s and the Arrow C Data Interface structs that `ctx.emit_batch` exports cross it.
 
 ## Exasol UDF behavior
 
@@ -69,7 +69,7 @@ Exasol has no arrays, lists, structs, or maps. `specs/scan-types/type-mapping/sp
 
 ## Build
 
-- Build the `.so` only with `make cross-udf-build`, inside `rust:1.94-trixie` (glibc 2.41, matching the SLC). A host `cargo build --release` writes a host-glibc `.so` that fails to load in Exasol. Host `cargo test` is fine.
+- Build the `.so` only with `make cross-udf-build`, inside `rust:1.98.1-trixie` (glibc 2.41, matching the SLC). A host `cargo build --release` writes a host-glibc `.so` that fails to load in Exasol. Host `cargo test` is fine.
 - `crates/lakehouse-catalog` and `crates/vs-expression` compile into `crates/lakehouse-engine`'s cdylib, so one `.so` exports all three entry points.
 - Pin `exasol-udf-sdk` and `exasol-udf-macros` only in the root `[workspace.dependencies]`. Enable `emit-arrow` for `ctx.emit_batch`.
 

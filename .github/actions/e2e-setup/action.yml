@@ -10,13 +10,13 @@ runs:
       shell: bash
       run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
 
-    - name: Install Rust 1.94
-      uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
+    - name: Install Rust 1.98.1
+      uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1 branch (toolchain 1.98.1 baked into action.yml)
 
     # Keeps the rust-cache key stable across runner image drift (#133).
     - name: Drop the runner's preinstalled Rust (stabilize cache key)
       shell: bash
-      run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
+      run: rustup toolchain list | awk '{print $1}' | grep -v '1\.98\.1' | xargs -r -n1 rustup toolchain uninstall
 
     # On a non-exact match rust-cache wipes target/release/, so the .so
     # download must stay after this step.

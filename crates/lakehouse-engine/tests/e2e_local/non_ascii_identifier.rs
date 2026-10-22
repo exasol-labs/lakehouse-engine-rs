@@ -1,16 +1,13 @@
 //! Seeds its own `e2e_nonascii` namespace so the `straße` table never enters
 //! another suite's `createVirtualSchema` table enumeration.
-#![cfg(feature = "exasol-e2e")]
 
-mod common;
-use common::e2e_harness::*;
-use common::seed::{
+use crate::common::e2e_harness::*;
+use crate::common::seed::{
     E2E_NONASCII_NAMESPACE, NONASCII_LIKE_MATCH_COUNT, NONASCII_LIKE_PATTERN, NONASCII_TOTAL_ROWS,
     NONASCII_VALUES, seed_non_ascii_identifier,
 };
-use common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
-};
+use crate::common::stack::iceberg_catalog_url;
+use crate::fixtures::stack;
 
 const VS_NAME: &str = "STRASSE_VS";
 /// Full-Unicode `to_uppercase` expands `ß` to `SS` for both table and column.
@@ -18,25 +15,15 @@ const SERVED_NAME: &str = "STRASSE";
 
 #[test]
 fn non_ascii_table_and_column_stay_queryable() {
-    wait_for_exasol();
-    wait_for_seaweedfs();
-    wait_for_iceberg_catalog();
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    rt.block_on(async {
-        seed_non_ascii_identifier(&iceberg_catalog_url(), "s3://warehouse/")
-            .await
-            .expect("seed straße table")
-    });
-
-    install_slc();
-    upload_so();
+    stack();
+    runtime()
+        .block_on(seed_non_ascii_identifier(
+            &iceberg_catalog_url(),
+            "s3://warehouse/",
+        ))
+        .expect("seed straße table");
 
     let mut conn = exa_conn();
-    create_schema_and_scripts(&mut conn);
     create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, E2E_NONASCII_NAMESPACE));
 
     let qualified_table = format!("{VS_NAME}.{SERVED_NAME}");

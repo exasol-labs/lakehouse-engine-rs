@@ -1,23 +1,20 @@
 //! `CATALOG_KIND = 'DIRECT_STORAGE'`: a plain directory of Parquet files on SeaweedFS,
 //! queried with no catalog service. FAILS (never skips) when the stack is unreachable.
-#![cfg(feature = "exasol-e2e")]
 
-mod common;
-
-use common::e2e_harness::{
+use crate::common::e2e_harness::{
     VARCHAR_JSON, VsProps, assert_decimal_orders_numerically, assert_notes_well_formed,
     assert_query_fails, assert_refused_column, assert_type_matrix, column_adapter_notes,
-    create_schema_and_scripts, create_virtual_schema_with_password, declared_type, exa_conn,
-    explain_virtual_sql, has_broadcast_join_block, install_slc, local_stack_storage, note_of,
-    nullable_text, parse_int, parse_numeric, partition_positions, reads, refuses, skip_reason,
-    text_column, try_create_virtual_schema_with_password, upload_so, value_to_string,
+    create_virtual_schema_with_password, declared_type, exa_conn, explain_virtual_sql,
+    has_broadcast_join_block, note_of, nullable_text, parse_int, parse_numeric,
+    partition_positions, reads, refuses, skip_reason, text_column,
+    try_create_virtual_schema_with_password, value_to_string,
 };
-use common::exasol_ws::ExaConn;
-use common::raw_parquet::{
-    delete_fixture_object, delete_fixture_prefix, encode_parquet_message, put_fixture_object,
-    write_parquet_column, write_parquet_fixture,
+use crate::common::exasol_ws::ExaConn;
+use crate::common::raw_parquet::{
+    delete_fixture_object, delete_fixture_prefix, encode_parquet_message, get_fixture_object,
+    put_fixture_object, write_parquet_column, write_parquet_fixture,
 };
-use common::seed::{
+use crate::common::seed::{
     ALL_TYPES_DATE_DAYS, ALL_TYPES_IDS, ALL_TYPES_IDS_TEXT, ALL_TYPES_TIME_MICROS,
     DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT,
     DECIMAL_38_10_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT8_VALUES_TEXT, INT16_VALUES_TEXT,
@@ -26,11 +23,8 @@ use common::seed::{
     float32_values, int8_values, int16_values, int32_values, struct_binary_values, text_values,
     time64_values,
 };
-use common::stack::{
-    CatalogConnectionPassword, seaweedfs_url_internal, wait_for_exasol, wait_for_seaweedfs,
-};
-
-use lakehouse_engine::scan::spec::StorageBackend;
+use crate::common::stack::{CatalogConnectionPassword, seaweedfs_url_internal};
+use crate::fixtures::{stack, vs_table};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
@@ -44,9 +38,6 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Fields, IntervalDayTime, Schema, TimeUnit, i256};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use object_store::ObjectStoreExt;
-use object_store::aws::AmazonS3Builder;
-use object_store::path::Path as ObjectStorePath;
 use parquet::data_type::{
     ByteArray, ByteArrayType, FixedLenByteArray, FixedLenByteArrayType, Int64Type, Int96, Int96Type,
 };
@@ -134,16 +125,10 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
 fn setup() {
     SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        wait_for_seaweedfs();
-
+        stack();
         write_all_fixtures();
 
-        install_slc();
-        upload_so();
-
         let mut conn = exa_conn();
-        create_schema_and_scripts(&mut conn);
 
         create_virtual_schema_with_password(
             &mut conn,
@@ -182,10 +167,6 @@ fn setup() {
             &direct_storage_password(),
         );
     });
-}
-
-fn vs_table(vs_name: &str, table: &str) -> String {
-    format!("{vs_name}.{}", table.to_uppercase())
 }
 
 fn events_schema() -> Arc<Schema> {
@@ -1037,33 +1018,7 @@ fn declared_columns(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<Strin
 fn raw_parquet_fixtures_are_physically_the_types_they_declare() {
     setup();
 
-    let StorageBackend::S3(storage) = local_stack_storage() else {
-        panic!("local_stack_storage() must be S3")
-    };
-    let store = AmazonS3Builder::new()
-        .with_bucket_name("warehouse")
-        .with_region(&storage.region)
-        .with_access_key_id(&storage.access_key)
-        .with_secret_access_key(&storage.secret_key)
-        .with_endpoint(&storage.endpoint)
-        .with_allow_http(storage.allow_http)
-        .with_virtual_hosted_style_request(!storage.path_style)
-        .build()
-        .expect("configure SeaweedFS object store for the fixture-shape guard");
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    let bytes = rt.block_on(async {
-        store
-            .get(&ObjectStorePath::from("direct/events/file1.parquet"))
-            .await
-            .expect("GET direct/events/file1.parquet")
-            .bytes()
-            .await
-            .expect("read direct/events/file1.parquet bytes")
-    });
+    let bytes = get_fixture_object(&format!("{BASE_DIRECT}events/file1.parquet"));
     let reader = SerializedFileReader::new(bytes).expect("open committed raw-Parquet fixture file");
     let schema_descr = reader.metadata().file_metadata().schema_descr();
 

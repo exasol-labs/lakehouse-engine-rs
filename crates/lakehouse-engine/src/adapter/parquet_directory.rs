@@ -1,5 +1,6 @@
 //! Single source of truth for a prefix's Parquet file list, partition columns, and folded schema,
 //! so table enumeration and query planning can't disagree about a table's columns.
+use crate::scan::parquet_reader::SizedParquetReader;
 use crate::types::widening::widen;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use exasol_udf_sdk::error::UdfError;
@@ -9,7 +10,6 @@ use lakehouse_catalog::HIVE_DEFAULT_PARTITION;
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::basic::{ConvertedType, LogicalType, Type as PhysicalType};
 use parquet::schema::types::ColumnDescriptor;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -382,7 +382,7 @@ async fn read_footer(
     path: &StorePath,
     size: u64,
 ) -> Result<ArrowReaderMetadata, UdfError> {
-    let mut reader = ParquetObjectReader::new(store, path.clone()).with_file_size(size);
+    let mut reader = SizedParquetReader::new(store, path.clone(), size);
     ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::new())
         .await
         .map_err(|e| {

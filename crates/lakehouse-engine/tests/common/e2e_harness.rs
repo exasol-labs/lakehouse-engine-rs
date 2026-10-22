@@ -15,7 +15,9 @@ use lakehouse_engine::adapter::connection::ConnectionCreds;
 use lakehouse_engine::adapter::pushdown::{ConnectionStorage, ScanSource, format_reader};
 use lakehouse_engine::scan::spec::{CatalogProps, FileEntry, StorageBackend, StorageProps};
 
+use object_store::aws::{AmazonS3, AmazonS3Builder};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 pub const SYS_PASSWORD: &str = "exasol";
@@ -125,26 +127,31 @@ pub fn exa_conn() -> ExaConn {
 
 /// All `CREATE OR REPLACE`, so concurrent recreation across binaries is harmless.
 pub fn create_schema_and_scripts(conn: &mut ExaConn) {
-    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME}"));
+    create_schema_and_scripts_in(conn, SCHEMA_NAME);
+}
+
+/// Re-running it over an existing schema is the installer's re-install.
+pub fn create_schema_and_scripts_in(conn: &mut ExaConn, schema: &str) {
+    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"));
     conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} ADAPTER SCRIPT {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} AS
+        r#"CREATE OR REPLACE {LANG_ALIAS} ADAPTER SCRIPT {schema}.{ADAPTER_SCRIPT_NAME} AS
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));
     conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}(common VARCHAR(2000000), files VARCHAR(2000000))
+        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {schema}.{SCAN_SCRIPT_NAME}(common VARCHAR(2000000), files VARCHAR(2000000))
 EMITS (...) AS
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));
     conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {SCHEMA_NAME}.{VERSION_SCRIPT_NAME}()
+        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {schema}.{VERSION_SCRIPT_NAME}()
 RETURNS VARCHAR(100) AS
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));
     conn.execute(&format!(
-        r#"CREATE OR REPLACE LUA SET SCRIPT {SCHEMA_NAME}.{DISTRIBUTOR_SCRIPT_NAME}(files VARCHAR(2000000))
+        r#"CREATE OR REPLACE LUA SET SCRIPT {schema}.{DISTRIBUTOR_SCRIPT_NAME}(files VARCHAR(2000000))
 EMITS (files VARCHAR(2000000)) AS
 function run(ctx)
     repeat
@@ -318,6 +325,55 @@ pub fn grant_connection_access_to_vs_owner(conn: &mut ExaConn, conn_name: &str) 
     }
 }
 
+pub fn projection_rows(conn: &mut ExaConn, table: &str) -> Vec<(i64, String, f64)> {
+    let cols = conn.query_columns(&format!("SELECT id, name, score FROM {table} ORDER BY id"));
+    assert_eq!(
+        cols.len(),
+        3,
+        "expected 3 columns (id, name, score): {cols:?}"
+    );
+    (0..cols[0].len())
+        .map(|i| {
+            let id = parse_int(&cols[0][i]);
+            let name = cols[1][i]
+                .as_str()
+                .unwrap_or_else(|| panic!("name not string: {:?}", cols[1][i]))
+                .to_string();
+            let score = cols[2][i]
+                .as_f64()
+                .or_else(|| cols[2][i].as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or_else(|| panic!("score not numeric: {:?}", cols[2][i]));
+            (id, name, score)
+        })
+        .collect()
+}
+
+pub fn enumerated_table_names(conn: &mut ExaConn, vs_name: &str) -> Vec<String> {
+    let cols = conn.query_columns(&format!(
+        "SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA = '{vs_name}'"
+    ));
+    cols.first()
+        .map(|c| {
+            c.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_uppercase()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The exception text of a response that must be an error.
+pub fn error_text(response: &serde_json::Value) -> String {
+    assert_eq!(
+        response["status"].as_str(),
+        Some("error"),
+        "the statement must fail: {response}"
+    );
+    response["exception"]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
 pub fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
     let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
@@ -410,11 +466,21 @@ pub fn split_s3_bucket_and_key(uri: &str) -> (&str, &str) {
         .unwrap_or_else(|| panic!("expected a <bucket>/<key> URI, got: {uri}"))
 }
 
-pub fn local_stack_s3_store(bucket: &str) -> object_store::aws::AmazonS3 {
+pub fn runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+    })
+}
+
+pub fn local_stack_s3_store(bucket: &str) -> AmazonS3 {
     let StorageBackend::S3(storage) = local_stack_storage() else {
         panic!("local_stack_storage() must be S3 to build a SeaweedFS object store")
     };
-    object_store::aws::AmazonS3Builder::new()
+    AmazonS3Builder::new()
         .with_bucket_name(bucket)
         .with_region(&storage.region)
         .with_access_key_id(&storage.access_key)

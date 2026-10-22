@@ -6,15 +6,15 @@ The adapter refuses a Delta table whose reader protocol version or reader-featur
 
 * The Delta protocol requires a reader to implement and respect every feature in `readerFeatures`. `readerFeatures` exists only when `minReaderVersion` is 3, and a table at Reader Version 3 must carry it. A reader does not gate `writerFeatures`, so a write-only feature never refuses a table.
 * The gate is default-deny. It matches an allow-list of seven reader features (`columnMapping`, `deletionVectors`, `timestampNtz`, `typeWidening`, `typeWidening-preview`, `v2Checkpoint`, `vacuumProtocolCheck`) and refuses every other feature. A `TableFeature` variant that a newer `delta_kernel` adds is refused until reviewed. The allow-list is the only enumeration in production code.
-* `delta_kernel`'s own `ensure_operation_supported(Operation::Scan)` is not a substitute. It reports whether the kernel can read the log, not whether this engine can interpret the data the log describes. It accepts every reader feature its enum parses, including the `type-widening` and `unshredded-variant` fixtures.
+* `delta_kernel`'s own support check is not a substitute. The kernel checks reader features at snapshot load (`Operation::SnapshotLoad`) and at scan build (`Operation::Scan`). It classifies `variantType`, `variantType-preview`, `variantShredding`, and `variantShredding-preview` as supported because it can read their log, not because this engine can interpret their data, so for those four features this gate is the only refusal.
+* The kernel rejects `geospatial`, `adaptiveMetadata-preview`, and every unrecognized name at snapshot load, and fails a `catalogManaged` or `catalogOwned-preview` table at load because the engine supplies no maximum catalog version. `DeltaSnapshot::open` loads the snapshot before this gate runs, so such a table fails with the kernel's error wrapped with the table root, naming only the first feature the kernel rejects. This is a scoped exception to the one-error-names-every-refusal rule. The allow-list still omits these features, so a kernel that starts loading them leaves them refused by this gate.
 * `TableFeature::Unknown(_)` is the kernel's catch-all for an unrecognized `readerFeatures` name. The gate refuses it and reports the name verbatim.
 * `typeWidening` and `typeWidening-preview` name the same read contract at Reader Version 3 and Writer Version 7. The preview name identifies the client that enabled the feature. The engine's format-neutral column-binding adapter chain performs the widening cast per file (`scan-types/type-relaxation`). `delta_kernel` performs no cast. `delta/delta-type-mapping` refuses a column whose recorded `delta.typeChanges` the engine cannot perform.
 * Writer-only features never appear in `readerFeatures`, so they are not on the allow-list. This includes `domainMetadata` and `inCommitTimestamp`.
-* The protocol-version bounds come from `delta_kernel::table_features::MIN_VALID_RW_VERSION` (1) and `MAX_VALID_READER_VERSION` (3). The version at which `readerFeatures` becomes mandatory is `TABLE_FEATURES_MIN_READER_VERSION` (3). The gate uses those constants, not literals.
+* The protocol-version bounds come from `delta_kernel::table_features::MIN_VALID_RW_VERSION` (1) and `MAX_VALID_READER_VERSION` (3). The version at which `readerFeatures` becomes mandatory is `TABLE_FEATURES_MIN_READER_VERSION` (3). The gate uses those constants, not literals. The kernel's own `check_reader_version_range` already rejects an out-of-range version at snapshot load, so the gate's version check is defense in depth.
 * `delta_kernel` rejects reader version 3 without `readerFeatures` while it parses the log. The gate checks that shape too, so it does not depend on the kernel's validation.
 * The reader-feature accessors (`Snapshot::table_configuration`, `TableConfiguration::protocol`, `Protocol::reader_features`, `Protocol::min_reader_version`, `TableFeature`) need the `internal-api` cargo feature on `delta_kernel`. The kernel's `extract_enabled_reader_features` and `check_reader_version_range` are unreachable, so the engine implements the equivalent logic.
 * Every error is a `UdfError`, never a panic, and no error text carries a credential value.
-
 
 ## Scenarios
 
@@ -23,22 +23,23 @@ The adapter refuses a Delta table whose reader protocol version or reader-featur
 * *GIVEN* a Delta table whose `protocol` action declares `minReaderVersion` 3 and a `readerFeatures`
   list holding at least one feature outside this engine's allow-list, one of exactly
   `variantType`, `variantType-preview`, `variantShredding`, `variantShredding-preview`,
-  `catalogManaged`, `catalogOwned-preview`, `adaptiveMetadata-preview`, or a name `delta_kernel`
-  does not recognize and surfaces as `TableFeature::Unknown`
+  `catalogManaged`, `catalogOwned-preview`, `adaptiveMetadata-preview`, `geospatial`, or a name
+  `delta_kernel` does not recognize and surfaces as `TableFeature::Unknown`
 * *WHEN* the Delta format reader resolves that table's scan
 * *THEN* the reader SHALL return a `UdfError` naming the table root and EVERY refused feature by its
   Delta protocol name, the `readerFeatures` spelling, so `variantType-preview` is reported as
   `variantType-preview` and an unrecognized name is reported verbatim
 * *AND* the reader SHALL name every refused feature in ONE error rather than the first alone, so a
   table carrying two unsupported features is diagnosed in one query instead of two
+* *AND* where `delta_kernel` itself rejects a feature at snapshot load, the reader SHALL instead
+  return the kernel's error wrapped with the table root, which names the first feature the kernel
+  rejects, as the Background records
 * *AND* the refusal formatter SHALL carry NO per-feature special case, because a formatter arm for an allow-listed feature is unreachable code that reads as a refusal still in force
 * *AND* the reader MUST NOT replay one Delta log commit, read one checkpoint, list one object-store
   prefix, or build the table's logical schema after the refusal, because the refusal exists to stop
   an unsupported table before it costs object-storage access
 * *AND* the reader MUST NOT rely on `delta_kernel` raising the refusal, because
-  `delta_kernel`'s own `ensure_operation_supported(Operation::Scan)` reports support for every reader
-  feature its enum parses and reads both the `type-widening` and `unshredded-variant` fixtures
-  without error
+  `delta_kernel` loads and scans a table carrying any of the four variant features without error
 
 ### Scenario: Every allow-listed reader feature keeps its table queryable
 
@@ -74,6 +75,8 @@ The adapter refuses a Delta table whose reader protocol version or reader-featur
 * *AND* the bounds SHALL be read from those two `delta_kernel` constants rather than from the
   literals `1` and `3`, so the readable range has ONE owner and a kernel upgrade that widens it does
   not leave a stale copy behind
+* *AND* `delta_kernel` rejects such a version at snapshot load before this check runs, so the table
+  fails with the kernel's error wrapped with the table root, and this check stays as defense in depth
 * *AND* the version check SHALL run BEFORE the per-feature check, so a table declaring an unreadable
   reader version is refused on the version rather than on a feature list the protocol forbids it to
   carry

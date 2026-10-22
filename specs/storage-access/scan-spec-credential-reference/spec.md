@@ -7,7 +7,7 @@ The scan spec carries the Exasol CONNECTION name instead of storage credentials,
 * The pushdown response is the leak surface, because `EXPLAIN VIRTUAL` returns it verbatim. Profiling and audit `SQL_TEXT` carry only the user's literal statement.
 * A CONNECTION-supplied credential never appears in returned SQL. A vended or assumed-role session credential appears only inside the sealed envelope.
 * The sealed envelope defeats plaintext reads, not offline cryptanalysis (`docs/security.md`).
-* `ctx.connection()` is engine-local, not a catalog round-trip. The wire wrapper exposes no secret accessor. The required script-scoped grant is a breaking deployment change.
+* `ctx.connection()` is engine-local, not a catalog round-trip. The wire wrapper exposes no secret accessor.
 
 ## Scenarios
 
@@ -50,14 +50,73 @@ The scan spec carries the Exasol CONNECTION name instead of storage credentials,
 * *AND* the connection NAME SHALL be positively asserted present (static) or the envelope SHALL unseal correctly (vended)
 * *AND* the eighteen credential-bearing golden fixtures SHALL carry the reference encoding, and the six `empty_*` fixtures SHALL stay byte-identical
 
-### Scenario: The scan script requires a script-scoped grant; rotation is observed per shard
+### Scenario: The scan script needs the owner's CONNECTION grant
 
 * *GIVEN* a deployment with the adapter grant already in place
 * *WHEN* a scan runs
-* *THEN* the scan script SHALL additionally need `GRANT ACCESS ON CONNECTION ... FOR SCRIPT <schema>.LAKEHOUSE_SCAN TO <owner>`, and a missing grant SHALL fail with a named error and no inline fallback
+* *THEN* the scan script SHALL additionally need `GRANT ACCESS ON CONNECTION ... FOR SCRIPT <schema>.LAKEHOUSE_SCAN TO <owner>` or the same grant `FOR SCHEMA <schema>`, and a missing grant SHALL fail with a named error and no inline fallback
 * *AND* that grant SHALL be checked against the virtual schema's OWNER, not the querying user, so a user holding only `CREATE SESSION` and `SELECT` on the virtual schema, and no privilege on the CONNECTION, SHALL receive the owner's rows
-* *AND* when the owner's grant is missing, the error a reader receives SHALL name the CONNECTION, the scan script, and the virtual schema's owner as the grantee, and MUST NOT contain any credential value
+* *AND* when the owner's grant is missing, the error a reader receives SHALL name the CONNECTION, both the script-scoped and the schema-scoped grant, and the virtual schema's owner as the grantee, and MUST NOT contain any credential value
+
+### Scenario: A role can own the virtual schema and hold its grants
+
+* *GIVEN* a virtual schema whose owner is a role, and the role holds `EXECUTE` on the adapter, scan, and distributor scripts and the script-scoped CONNECTION grants for the adapter and scan scripts
+* *WHEN* a reader that holds only `CREATE SESSION` and `SELECT` on the virtual schema, and is not a member of the role, queries it
+* *THEN* the reader SHALL receive the owner's rows
+* *AND* when the role's scan grant is revoked, the reader's query SHALL fail with the scan's named error
+
+### Scenario: A reader's own CONNECTION grant does not replace the owner's
+
+* *GIVEN* a virtual schema whose owner lacks the CONNECTION grant of the scan script, or of the adapter script
+* *AND* a reader that holds that grant itself, and for the adapter script also `GRANT CONNECTION`
+* *WHEN* the reader queries the virtual schema
+* *THEN* the query SHALL fail with the named error of the script whose owner grant is missing
+
+### Scenario: A missing adapter grant fails with the adapter's named error
+
+* *GIVEN* a virtual schema whose owner holds the scan script's CONNECTION grant but not the adapter script's
+* *WHEN* a reader queries the virtual schema
+* *THEN* the query SHALL fail with an error stating `CONNECTION '<name>' could not be resolved`, distinct from the scan's named error, and MUST NOT contain any credential value
+* *AND* the error SHALL state that the CONNECTION does not exist or that the virtual schema's OWNER lacks `GRANT ACCESS ON CONNECTION <name> FOR SCRIPT <schema>.LAKEHOUSE_ADAPTER` or the same grant `FOR SCHEMA <schema>`, because Exasol reports both cases the same way
+
+### Scenario: A CONNECTION that does not exist fails with the adapter's named error
+
+* *GIVEN* a `CATALOG_CONNECTION` that names no existing CONNECTION
+* *WHEN* a DBA creates a virtual schema with it
+* *THEN* the statement SHALL fail with an error stating `CONNECTION '<name>' could not be resolved: it does not exist`
+
+### Scenario: A user owner can hold the CONNECTION grants through a role
+
+* *GIVEN* a virtual schema whose owner is a user that owns the schema of the adapter, scan, and distributor scripts, and holds the script-scoped CONNECTION grants only through a role it is a member of, as the install script's template sets up
+* *WHEN* a reader queries the virtual schema
+* *THEN* the reader SHALL receive the owner's rows
+* *AND* when the role is revoked from the owner, the reader's query SHALL fail with the adapter's named error
+
+### Scenario: Schema-scoped grants survive a re-install, script-scoped grants do not
+
+* *GIVEN* a script schema that holds the adapter, scan, and distributor scripts
+* *AND* one virtual schema whose owner holds only `GRANT EXECUTE ON SCHEMA` and `GRANT ACCESS ON CONNECTION ... FOR SCHEMA` on that schema
+* *AND* another virtual schema whose owner holds `EXECUTE` on each script and the script-scoped CONNECTION grants
+* *WHEN* the scripts are re-created with `CREATE OR REPLACE SCRIPT`, as a re-install does
+* *THEN* both virtual schemas SHALL return the owner's rows to a reader before the re-install
+* *AND* the schema-scoped grants SHALL remain and the first virtual schema SHALL still return the owner's rows to a reader
+* *AND* the script-scoped grants SHALL be gone and a reader's query over the second virtual schema SHALL fail with Exasol's insufficient-privilege error on the adapter script
+
+### Scenario: ALTER CONNECTION rotates the CONNECTION and keeps its grants
+
+* *GIVEN* a virtual schema whose owner holds the script-scoped grants on its CONNECTION
+* *WHEN* a DBA changes the CONNECTION's storage secret with `ALTER CONNECTION`
+* *THEN* the grants SHALL remain and a reader's next query SHALL use the changed secret, with no restart and no credential value in an error
+* *AND* after `ALTER CONNECTION` restores the secret, a reader SHALL receive the owner's rows
 * *AND* each shard SHALL read the CONNECTION value current at ITS resolution time, and a sealed envelope under a rotated password SHALL fail AEAD with no plaintext
+
+### Scenario: A missing EXECUTE grant of the owner fails the query with Exasol's privilege error
+
+* *GIVEN* a virtual schema whose owner holds every grant, and whose scan of the queried table spans more than one shard
+* *WHEN* the owner's `EXECUTE` on the adapter script is revoked and a reader queries the virtual schema
+* *THEN* the query SHALL fail with `insufficient privileges for calling adapter script`
+* *AND* when the owner's `EXECUTE` on the scan script or the distributor script is revoked instead, the query SHALL fail with `insufficient privileges for calling script`
+* *AND* a query whose scan spans a single shard MUST NOT call the distributor, so it SHALL succeed without the owner's `EXECUTE` on the distributor script
 
 ### Scenario: A virtual schema reader can read the pushdown plan but cannot execute it
 
@@ -66,3 +125,4 @@ The scan spec carries the Exasol CONNECTION name instead of storage credentials,
 * *WHEN* the reader takes the scan-driving statement that `EXPLAIN VIRTUAL` returns for a query over the virtual schema and submits it verbatim as its own SQL
 * *THEN* Exasol SHALL reject the statement with an insufficient-privilege error on the script call, and that error MUST NOT contain any CONNECTION credential value
 * *AND* the reader's ordinary query over the virtual schema SHALL still return the owner's rows, because the denial applies only to a direct script call and not to the scan the virtual schema runs on the reader's behalf
+* *AND* the virtual schema's owner SHALL run the same statement, because it holds the script and CONNECTION grants

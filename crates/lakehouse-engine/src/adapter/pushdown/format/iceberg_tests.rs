@@ -108,14 +108,18 @@ async fn iceberg_reader_owns_resolution_and_keeps_its_encoding() {
 }
 
 #[test]
-fn classify_accepts_parquet_data_and_parquet_positional_delete() {
+fn classify_accepts_parquet_data_parquet_positional_delete_and_puffin_deletion_vector() {
     assert!(
-        classify_manifest_file(DataContentType::Data, DataFileFormat::Parquet).is_ok(),
+        classify_planned_file(DataContentType::Data, DataFileFormat::Parquet).is_ok(),
         "Parquet data file must be supported"
     );
     assert!(
-        classify_manifest_file(DataContentType::PositionDeletes, DataFileFormat::Parquet).is_ok(),
+        classify_planned_file(DataContentType::PositionDeletes, DataFileFormat::Parquet).is_ok(),
         "Parquet positional delete must be supported"
+    );
+    assert!(
+        classify_planned_file(DataContentType::PositionDeletes, DataFileFormat::Puffin).is_ok(),
+        "Puffin deletion vector must be supported"
     );
 }
 
@@ -127,7 +131,7 @@ fn classify_rejects_equality_deletes() {
         DataFileFormat::Orc,
     ] {
         assert_eq!(
-            classify_manifest_file(DataContentType::EqualityDeletes, fmt),
+            classify_planned_file(DataContentType::EqualityDeletes, fmt),
             Err(UnsupportedDeleteMechanism::EqualityDelete),
             "equality delete ({fmt:?}) must fail loud"
         );
@@ -135,30 +139,21 @@ fn classify_rejects_equality_deletes() {
 }
 
 #[test]
-fn classify_rejects_puffin_deletion_vector() {
-    assert_eq!(
-        classify_manifest_file(DataContentType::PositionDeletes, DataFileFormat::Puffin),
-        Err(UnsupportedDeleteMechanism::DeletionVector),
-        "Puffin position delete (deletion vector) must fail loud"
-    );
-}
-
-#[test]
 fn classify_rejects_orc_and_avro_data_and_delete_files() {
     assert_eq!(
-        classify_manifest_file(DataContentType::Data, DataFileFormat::Orc),
+        classify_planned_file(DataContentType::Data, DataFileFormat::Orc),
         Err(UnsupportedDeleteMechanism::OrcDataFile),
     );
     assert_eq!(
-        classify_manifest_file(DataContentType::Data, DataFileFormat::Avro),
+        classify_planned_file(DataContentType::Data, DataFileFormat::Avro),
         Err(UnsupportedDeleteMechanism::AvroDataFile),
     );
     assert_eq!(
-        classify_manifest_file(DataContentType::PositionDeletes, DataFileFormat::Orc),
+        classify_planned_file(DataContentType::PositionDeletes, DataFileFormat::Orc),
         Err(UnsupportedDeleteMechanism::OrcDeleteFile),
     );
     assert_eq!(
-        classify_manifest_file(DataContentType::PositionDeletes, DataFileFormat::Avro),
+        classify_planned_file(DataContentType::PositionDeletes, DataFileFormat::Avro),
         Err(UnsupportedDeleteMechanism::AvroDeleteFile),
     );
 }
@@ -166,16 +161,16 @@ fn classify_rejects_orc_and_avro_data_and_delete_files() {
 #[test]
 fn unsupported_delete_error_names_mechanism_and_redacts() {
     let err = unsupported_delete_error(
-        UnsupportedDeleteMechanism::DeletionVector,
-        "db.mor_dv_table",
+        UnsupportedDeleteMechanism::EqualityDelete,
+        "db.mor_eq_table",
     );
     let msg = user_message(err);
     assert!(
-        msg.contains("Iceberg v3 Puffin deletion vectors"),
+        msg.contains("Iceberg equality deletes"),
         "error must name the mechanism: {msg}"
     );
     assert!(
-        msg.contains("db.mor_dv_table"),
+        msg.contains("db.mor_eq_table"),
         "error must name the offending table: {msg}"
     );
     assert!(
@@ -189,7 +184,7 @@ fn unsupported_delete_error_names_mechanism_and_redacts() {
 }
 
 #[test]
-fn manifest_read_errors_redact_the_literal_azure_secret_values() {
+fn plan_errors_redact_the_literal_azure_secret_values() {
     let account_key = "Zm9vYmFyYmF6cXV1eGNvcmdlc2VjcmV0QUNDT1VOVEtFWT09";
     let sas_permissions = "sp=racwdlmeop";
     let sas_token = format!(
@@ -203,7 +198,7 @@ fn manifest_read_errors_redact_the_literal_azure_secret_values() {
     let secrets = [account_key, sas_token.as_str()];
 
     let surfaced = format!(
-        "failed to read Iceberg manifest list for 'ns.tbl': {}",
+        "failed to plan Iceberg files for 'ns.tbl': {}",
         redact_error_text(&raw, &secrets)
     );
 
@@ -220,36 +215,182 @@ fn manifest_read_errors_redact_the_literal_azure_secret_values() {
         "the SAS token's permission field must not survive either: {surfaced}"
     );
     assert!(
-        surfaced.contains("failed to read Iceberg manifest list for 'ns.tbl'"),
+        surfaced.contains("failed to plan Iceberg files for 'ns.tbl'"),
         "the actionable context must be preserved: {surfaced}"
     );
 }
 
 #[test]
 fn iceberg_delete_mechanism_maps_position_equality_and_the_data_sentinel() {
-    use iceberg::spec::DataContentType;
+    let mechanism =
+        |path: &str, content, format| iceberg_delete_mechanism(&delete_file(path, content, format));
     assert_eq!(
-        iceberg_delete_mechanism("d0.parquet".into(), 50, DataContentType::PositionDeletes),
+        mechanism(
+            "d0.parquet",
+            DataContentType::PositionDeletes,
+            DataFileFormat::Parquet
+        ),
         DeleteMechanism::IcebergPositionalDelete {
             path: "d0.parquet".into(),
             size: 50,
         }
     );
     assert_eq!(
-        iceberg_delete_mechanism("d1.parquet".into(), 60, DataContentType::EqualityDeletes),
+        mechanism(
+            "d1.parquet",
+            DataContentType::EqualityDeletes,
+            DataFileFormat::Parquet
+        ),
         DeleteMechanism::IcebergEqualityDelete {
             path: "d1.parquet".into(),
-            size: 60,
+            size: 50,
         }
     );
     assert_eq!(
-        iceberg_delete_mechanism("d2.parquet".into(), 70, DataContentType::Data),
+        mechanism(
+            "d3.puffin",
+            DataContentType::PositionDeletes,
+            DataFileFormat::Puffin
+        ),
+        DeleteMechanism::IcebergPuffinDeletionVector {
+            path: "d3.puffin".into(),
+            size: 50,
+            content_offset: 4,
+            content_size_in_bytes: 40,
+            record_count: 2,
+        },
+        "a Puffin position delete is a deletion vector carrying its blob range and cardinality"
+    );
+    assert_eq!(
+        mechanism("d2.parquet", DataContentType::Data, DataFileFormat::Parquet),
         DeleteMechanism::IcebergEqualityDelete {
             path: "d2.parquet".into(),
-            size: 70,
+            size: 50,
         },
         "the Data sentinel must map to a non-positional mechanism"
     );
+}
+
+fn scan_task(
+    format: DataFileFormat,
+    deletes: Vec<iceberg::scan::FileScanTaskDeleteFile>,
+) -> iceberg::scan::FileScanTask {
+    iceberg::scan::FileScanTask::builder()
+        .with_file_size_in_bytes(100)
+        .with_start(0)
+        .with_length(100)
+        .with_data_file_path("s3://bucket/t/data-0".to_string())
+        .with_data_file_format(format)
+        .with_schema(std::sync::Arc::new(
+            iceberg::spec::Schema::builder()
+                .build()
+                .expect("an empty schema"),
+        ))
+        .with_project_field_ids(vec![])
+        .with_deletes(deletes)
+        .with_case_sensitive(true)
+        .build()
+        .expect("a scan task")
+}
+
+fn delete_file(
+    path: &str,
+    content: DataContentType,
+    format: DataFileFormat,
+) -> iceberg::scan::FileScanTaskDeleteFile {
+    let is_dv = format == DataFileFormat::Puffin;
+    iceberg::scan::FileScanTaskDeleteFile::builder()
+        .with_file_path(path.to_string())
+        .with_file_size_in_bytes(50)
+        .with_file_type(content)
+        .with_file_format(format)
+        .with_partition_spec_id(0)
+        .with_referenced_data_file(is_dv.then(|| "s3://bucket/t/data-0".to_string()))
+        .with_content_offset(is_dv.then_some(4))
+        .with_content_size_in_bytes(is_dv.then_some(40))
+        .with_record_count(is_dv.then_some(2))
+        .build()
+        .expect("a delete file")
+}
+
+/// Scenario: Delete files and deletion vectors are preserved into the scan spec
+#[test]
+fn planned_file_entry_carries_parquet_positional_deletes_and_deletion_vectors() {
+    let task = scan_task(
+        DataFileFormat::Parquet,
+        vec![
+            delete_file(
+                "s3://bucket/t/del-0",
+                DataContentType::PositionDeletes,
+                DataFileFormat::Parquet,
+            ),
+            delete_file(
+                "s3://bucket/t/dv-0",
+                DataContentType::PositionDeletes,
+                DataFileFormat::Puffin,
+            ),
+        ],
+    );
+
+    let entry = planned_file_entry(&task).expect("Parquet data with supported deletes");
+
+    assert_eq!(
+        (entry.path.as_str(), entry.size),
+        ("s3://bucket/t/data-0", 100)
+    );
+    assert_eq!(
+        entry.deletes,
+        vec![
+            DeleteMechanism::IcebergPositionalDelete {
+                path: "s3://bucket/t/del-0".into(),
+                size: 50,
+            },
+            DeleteMechanism::IcebergPuffinDeletionVector {
+                path: "s3://bucket/t/dv-0".into(),
+                size: 50,
+                content_offset: 4,
+                content_size_in_bytes: 40,
+                record_count: 2,
+            },
+        ]
+    );
+}
+
+#[test]
+fn planned_file_entry_refuses_an_unsupported_data_or_applied_delete_file() {
+    let positional = delete_file(
+        "s3://bucket/t/del-0",
+        DataContentType::PositionDeletes,
+        DataFileFormat::Parquet,
+    );
+    let cases = [
+        (
+            scan_task(DataFileFormat::Orc, vec![]),
+            UnsupportedDeleteMechanism::OrcDataFile,
+        ),
+        (
+            scan_task(
+                DataFileFormat::Parquet,
+                vec![
+                    positional,
+                    delete_file(
+                        "s3://bucket/t/eq-0",
+                        DataContentType::EqualityDeletes,
+                        DataFileFormat::Parquet,
+                    ),
+                ],
+            ),
+            UnsupportedDeleteMechanism::EqualityDelete,
+        ),
+    ];
+
+    for (task, expected) in cases {
+        assert_eq!(
+            planned_file_entry(&task).map(|_| ()),
+            Err(expected),
+            "{task:?}"
+        );
+    }
 }
 
 #[test]
@@ -308,7 +449,7 @@ fn malformed_name_mapping_errors_cleanly() {
 
     let msg = user_message(err);
     assert!(
-        msg.contains(iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING),
+        msg.contains(iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING),
         "error must name the offending property: {msg}"
     );
     assert!(
@@ -1039,4 +1180,47 @@ fn relaxed_nullability_is_matched_by_declared_field_id() {
     for fragment in ["'QTY'", "'ORDERS'", "ALTER VIRTUAL SCHEMA ... REFRESH"] {
         assert!(message.contains(fragment), "{message}");
     }
+}
+
+#[test]
+fn iceberg_v3_types_without_an_exasol_rendering_are_refused_at_declaration() {
+    use iceberg::spec::{
+        GeographyType, GeometryType, ListType, NestedField, PrimitiveType, Type, VariantType,
+    };
+
+    let refusal = |field: NestedField| declaration(&field).refused.expect("must be refused");
+    let primitive = |pt| NestedField::optional(1, "c", Type::Primitive(pt));
+
+    assert_eq!(
+        refusal(NestedField::optional(1, "v", Type::Variant(VariantType))),
+        format!("Iceberg column 'v' {}", variant_cause())
+    );
+    assert_eq!(
+        refusal(primitive(PrimitiveType::Geometry(
+            GeometryType::new(None).unwrap()
+        ))),
+        format!("Iceberg column 'c' {}", binary_cause("geometry"))
+    );
+    assert_eq!(
+        refusal(primitive(
+            PrimitiveType::Geography(GeographyType::default())
+        )),
+        format!("Iceberg column 'c' {}", binary_cause("geography"))
+    );
+    assert!(
+        refusal(primitive(PrimitiveType::Unknown))
+            .starts_with("Iceberg column 'c' has type 'unknown'")
+    );
+
+    let list_of_variant = NestedField::optional(
+        1,
+        "l",
+        Type::List(ListType::new(
+            NestedField::list_element(2, Type::Variant(VariantType), false).into(),
+        )),
+    );
+    assert!(
+        refusal(list_of_variant)
+            .starts_with("Iceberg column 'l', whose member 'l.element' has type 'variant'")
+    );
 }

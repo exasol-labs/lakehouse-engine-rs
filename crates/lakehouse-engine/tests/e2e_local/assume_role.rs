@@ -5,22 +5,19 @@
 //! (`seaweedfs-iam.json`). SeaweedFS does not evaluate `sts:ExternalId`; that enforcement is
 //! covered by the opt-in real-AWS `cloud_assume_role` tests. Per project rules this suite
 //! FAILS (never skips) when the stack is unreachable.
-#![cfg(feature = "exasol-e2e")]
 
-mod common;
-
-use common::e2e_harness::{
-    VsProps, create_schema_and_scripts, create_virtual_schema_with_password, exa_conn,
-    explain_virtual_sql, install_slc, try_create_virtual_schema_with_password, upload_so,
+use crate::common::e2e_harness::{
+    VsProps, create_virtual_schema_with_password, exa_conn, explain_virtual_sql,
+    try_create_virtual_schema_with_password,
 };
-use common::raw_parquet::write_parquet_fixture;
-use common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, seed_events};
-use common::stack::{
+use crate::common::raw_parquet::write_parquet_fixture;
+use crate::common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS};
+use crate::common::stack::{
     ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
     ASSUME_ROLE_EXTERNAL_ID, ASSUME_ROLE_UNKNOWN_ARN, CatalogConnectionPassword,
-    iceberg_catalog_url, iceberg_catalog_url_internal, seaweedfs_url_internal, wait_for_exasol,
-    wait_for_iceberg_catalog, wait_for_seaweedfs,
+    iceberg_catalog_url_internal, seaweedfs_url_internal,
 };
+use crate::fixtures::{events, stack, vs_table};
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -95,10 +92,6 @@ fn direct_storage_role_password() -> CatalogConnectionPassword {
     }
 }
 
-fn vs_table(vs_name: &str, table: &str) -> String {
-    format!("{vs_name}.{}", table.to_uppercase())
-}
-
 fn direct_batch(ids: &[i64]) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ids.to_vec()))])
@@ -109,29 +102,14 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
 fn setup() {
     SETUP_DONE.get_or_init(|| {
-        wait_for_exasol();
-        wait_for_seaweedfs();
-        wait_for_iceberg_catalog();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
-        rt.block_on(async {
-            seed_events(&iceberg_catalog_url(), "s3://warehouse/")
-                .await
-                .expect("seed events table");
-        });
+        stack();
+        events();
         write_parquet_fixture(
             &format!("{BASE_DIRECT}rows/file1.parquet"),
             direct_batch(&[1, 2, 3]),
         );
 
-        install_slc();
-        upload_so();
-
         let mut conn = exa_conn();
-        create_schema_and_scripts(&mut conn);
 
         create_virtual_schema_with_password(
             &mut conn,

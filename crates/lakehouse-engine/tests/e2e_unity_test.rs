@@ -1,7 +1,6 @@
 //! All tests share one virtual schema, so they must run serially (`--test-threads=1`).
 //! The OSS Unity Catalog server has authorization disabled and vends no S3 endpoint, so the
 //! CONNECTION carries no catalog-auth field but does carry SeaweedFS's endpoint and static keys.
-#![cfg(feature = "unity-e2e")]
 
 mod common;
 
@@ -9,9 +8,10 @@ use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VARCHAR_JSON, VsProps,
     assert_decimal_orders_numerically, assert_query_fails, assert_type_matrix,
     column_adapter_notes, create_schema_and_scripts, create_virtual_schema_with_password,
-    declared_schema_of, declared_types, exa_conn, explain_virtual_sql, has_broadcast_join_block,
-    has_two_scan_wrapper, install_slc, local_stack_creds, note_of, pairs, parse_int, parse_numeric,
-    partition_positions, query_error, reads, refuses, upload_so, value_to_string,
+    declared_schema_of, declared_types, enumerated_table_names, exa_conn, explain_virtual_sql,
+    has_broadcast_join_block, has_two_scan_wrapper, install_slc, local_stack_creds, note_of, pairs,
+    parse_int, parse_numeric, partition_positions, query_error, reads, refuses, runtime, upload_so,
+    value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
@@ -718,19 +718,6 @@ fn k_stats(k_values: &[Option<i64>]) -> Json {
     stats
 }
 
-fn enumerated_table_names(conn: &mut ExaConn, vs_name: &str) -> Vec<String> {
-    let cols = conn.query_columns(&format!(
-        "SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA = '{vs_name}'"
-    ));
-    cols.first()
-        .map(|c| {
-            c.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_uppercase()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn assert_col_type(cols: &[(String, String)], column: &str, expected: &str) {
     let (_, actual) = cols
         .iter()
@@ -916,15 +903,8 @@ fn path_sorted_letter_values(files: &[FileEntry]) -> Vec<Option<String>> {
             (entry.path.as_str(), value.clone())
         })
         .collect();
-    carried.sort_by(|(left, _), (right, _)| left.cmp(right));
+    carried.sort_by_key(|(left, _)| *left);
     carried.into_iter().map(|(_, value)| value).collect()
-}
-
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
 }
 
 /// Scenario: Vended and static credentials resolve the same scan
@@ -932,7 +912,7 @@ fn rt() -> tokio::runtime::Runtime {
 fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
     setup();
 
-    let rt = rt();
+    let rt = runtime();
     let vended = rt.block_on(resolve_unity_scan("basic_partitioned", true, None));
     let static_creds = rt.block_on(resolve_unity_scan("basic_partitioned", false, None));
 
@@ -995,7 +975,7 @@ fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
 fn unity_delta_filters_prune_the_resolved_file_list() {
     setup();
 
-    let rt = rt();
+    let rt = runtime();
 
     let all_partitioned = rt.block_on(resolve_unity_scan("basic_partitioned", true, None));
     assert_eq!(
@@ -1443,7 +1423,7 @@ fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
         .map(|(letter, number)| (letter.as_str().map(str::to_string), parse_int(number)))
         .filter(|(_, number)| cm_ids.contains(number))
         .collect();
-    expected_join.sort_by(|a, b| a.1.cmp(&b.1));
+    expected_join.sort_by_key(|a| a.1);
 
     let join_cols = conn.query_columns(&join_sql);
     let mut actual_join: Vec<(Option<String>, i64)> = join_cols[0]
@@ -1451,7 +1431,7 @@ fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
         .zip(join_cols[1].iter())
         .map(|(letter, id)| (letter.as_str().map(str::to_string), parse_int(id)))
         .collect();
-    actual_join.sort_by(|a, b| a.1.cmp(&b.1));
+    actual_join.sort_by_key(|a| a.1);
 
     assert!(
         !actual_join.is_empty(),
@@ -1961,7 +1941,7 @@ fn unity_delta_pruned_queries_return_unchanged_rows() {
         .filter(|(letter, _)| letter.as_deref() == Some("a"))
         .cloned()
         .collect();
-    expected_letter_a.sort_by(|a, b| a.1.cmp(&b.1));
+    expected_letter_a.sort_by_key(|a| a.1);
     assert_eq!(
         expected_letter_a.len(),
         2,
@@ -1976,7 +1956,7 @@ fn unity_delta_pruned_queries_return_unchanged_rows() {
         .zip(letter_a[1].iter())
         .map(|(letter, number)| (letter.as_str().map(str::to_string), parse_int(number)))
         .collect();
-    actual_letter_a.sort_by(|a, b| a.1.cmp(&b.1));
+    actual_letter_a.sort_by_key(|a| a.1);
     assert_eq!(
         actual_letter_a, expected_letter_a,
         "the partition predicate LETTER = 'a' must return the same rows pruning \
@@ -2003,7 +1983,7 @@ fn unity_delta_pruned_queries_return_unchanged_rows() {
         .filter(|(id, _)| *id <= 2)
         .cloned()
         .collect();
-    expected_id_le_2.sort_by(|a, b| a.0.cmp(&b.0));
+    expected_id_le_2.sort_by_key(|a| a.0);
     assert_eq!(
         expected_id_le_2.len(),
         2,
@@ -2018,7 +1998,7 @@ fn unity_delta_pruned_queries_return_unchanged_rows() {
         .zip(id_le_2[1].iter())
         .map(|(id, value)| (parse_int(id), value.as_str().map(str::to_string)))
         .collect();
-    actual_id_le_2.sort_by(|a, b| a.0.cmp(&b.0));
+    actual_id_le_2.sort_by_key(|a| a.0);
     assert_eq!(
         actual_id_le_2, expected_id_le_2,
         "the range predicate ID <= 2 must return the same rows pruning inert \
@@ -2269,7 +2249,7 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
 fn unity_parquet_planning_agrees_under_vended_and_static_credentials() {
     setup();
 
-    let rt = rt();
+    let rt = runtime();
     let vended = rt.block_on(resolve_unity_scan("sales_parquet", true, None));
     let static_creds = rt.block_on(resolve_unity_scan("sales_parquet", false, None));
 
@@ -2434,7 +2414,7 @@ fn unity_session_carries_table_properties_from_list_and_load() {
         ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
     ]);
 
-    let rt = rt();
+    let rt = runtime();
     let listing = rt
         .block_on(session.list_tables(&namespace))
         .expect("the namespace lists");

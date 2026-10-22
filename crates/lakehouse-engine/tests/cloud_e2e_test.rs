@@ -6,7 +6,6 @@
 //! SSM under `deploy/data-stack`'s `${ssm_root}/assume_role/*` (see `deploy/README.md`):
 //! `ASSUME_ROLE_BASE_ACCESS_KEY_ID`/`ASSUME_ROLE_BASE_SECRET_ACCESS_KEY` (the base
 //! identity granted only `sts:AssumeRole`), `AWS_ASSUME_ROLE_ARN`, and `AWS_EXTERNAL_ID`.
-#![cfg(feature = "cloud-e2e")]
 
 mod common;
 use common::exasol_ws::ExaConn;

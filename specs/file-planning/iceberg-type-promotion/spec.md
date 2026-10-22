@@ -19,7 +19,7 @@ Decides at plan time which Iceberg type promotions this engine reads. The engine
 * The decimal rule is precision-only: the scale `S` is unchanged and `P' > P`.
 * Bounds-width inference, § Schema Evolution: "Iceberg's Avro manifest format does not store the type of lower and upper bounds, and type promotion does not rewrite existing bounds. For example, when a `float` is promoted to `double`, existing data file bounds are encoded as 4 little-endian bytes rather than 8 little-endian bytes for `double`." The original type must be inferred from the width, and the spec's table includes `timestamp` with 4 bytes as `date` and `timestamp_ns` with 4 bytes as `date`.
 * The `iceberg` dependency implements that inference for `long` and `double` only. `Timestamp`, `TimestampNs`, `Timestamptz`, and `TimestamptzNs` read 8 bytes unconditionally, so a 4-byte bound under a `timestamp` column fails with `DataInvalid: failed to convert byte slice to array`. A decimal bound decodes length-agnostically at the unchanged scale.
-* That failure is not limited to pruning. The bounds decode runs during manifest Avro deserialization, so an unfiltered `SELECT *` fails too, first from `ensure_supported_delete_mechanisms`. A second bounds decode in the `iceberg` dependency uses `unwrap()` and can panic, which aborts the UDF's VM and makes the engine SIGKILL every sibling VM of the statement part.
+* That failure is not limited to pruning. The bounds decode runs during manifest Avro deserialization, so an unfiltered `SELECT *` fails too, first inside `plan_files`, which reads every manifest when no filter prunes one. A second bounds decode in the `iceberg` dependency uses `unwrap()` and can panic, which aborts the UDF's VM and makes the engine SIGKILL every sibling VM of the statement part.
 * The refusal is therefore a plan-time gate on the schema history, decided from `TableMetadata::schemas_iter` before any manifest is read.
 * The gate is conservative: it refuses on the recorded promotion alone, without checking whether a pre-promotion data file survives. Establishing that requires the manifest read that fails.
 * `unknown` to any type is unreachable. The `iceberg` dependency's `PrimitiveType` has no `Unknown` variant, so a v3 schema declaring `"unknown"` fails deserialization before engine code runs. `iceberg_primitive_to_exasol` and `iceberg_primitive_to_arrow` match `PrimitiveType` exhaustively with no catch-all arm, so an `iceberg` upgrade that adds `Unknown` breaks the build instead of mapping it to the `utf8` fallback.
@@ -57,7 +57,7 @@ Decides at plan time which Iceberg type promotions this engine reads. The engine
   the earlier and the current Iceberg type, and issue #355, the repository issue that tracks this
   gap, so the refusal reads as scoped work rather than a permanent limitation
 * *AND* the refusal SHALL be decided from `TableMetadata::schemas_iter` alone, BEFORE any manifest is
-  loaded and before `ensure_supported_delete_mechanisms` runs, because the failure it replaces occurs
+  loaded and before `plan_files` runs, because the failure it replaces occurs
   inside manifest deserialization and would otherwise surface as `failed to convert byte slice to
   array`, naming neither the column nor the promotion
 * *AND* the refusal SHALL fire for an unfiltered request as well as a filtered one, because the

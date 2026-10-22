@@ -1,33 +1,14 @@
-# Feature: DataFusion Scan Execution, Positional Delete I/O Fan-Out and Pruning
+# Feature: DataFusion Scan Execution, Positional-Delete File I/O Fan-Out and Pruning
 
-Governs the object-store I/O shape of applying positional deletes: a shared connection-budget limiter that bounds concurrent reads, one read per delete file per shard, and row-group pruning of partition-granularity delete files. `scan-read-path/scan-execution-positional-deletes` governs which rows the deletes remove.
+Governs the object-store I/O shape of reading Iceberg Parquet positional-delete files: one read per delete file per shard, the connection-budget bound on concurrent delete-file reads, and row-group pruning of partition-granularity delete files. `scan-read-path/scan-execution-positional-deletes` governs which rows a delete file removes.
 
 ## Background
 
-* Phase A (`collect_delete_positions`) reads each unique delete file once into a data-file-path to deleted-position map. Phase B looks up that map per data file and fetches each delete-carrying data file's Parquet footer for its per-row-group row counts. The footer fetches run as a bounded-concurrent fan-out under the shared limiter.
-* Each fan-out task targets a distinct data-file path, so no two tasks contend for the same `FileMetadataCache` key. The fan-out returns the `PartitionedFile` list in the per-shard spec's file order.
-* The Delta deletion-vector mechanism shares the limiter and the read-once discipline: see `scan-read-path/scan-execution-delta-deletion-vectors`.
-* `scan-runtime/scan-execution-connection-concurrency` owns the budget knob `s3_max_connections`. This feature governs how the pipeline spends the budget.
+* These reads are Phase A of the pipeline every row-position delete mechanism shares. `scan-read-path/scan-execution-row-position-deletes` owns Phase B, including the concurrent data-file footer fetches, and the size-N limiter that both phases share.
+* Both deletion-vector mechanisms read under the same limiter with their own read-once discipline: see `scan-read-path/scan-execution-delta-deletion-vectors` and `scan-read-path/scan-execution-iceberg-deletion-vectors`.
+* `scan-runtime/scan-execution-connection-concurrency` owns the budget knob `s3_max_connections`. This feature governs how positional-delete file reads spend the budget.
 
 ## Scenarios
-
-### Scenario: Concurrent data-file footer fetches stay within the connection budget
-
-* *GIVEN* a shard whose assigned data files include MORE delete-carrying data files than the resolved `s3_max_connections` budget N
-* *WHEN* the scan UDF builds those files' base `ParquetAccessPlan`s, each of which needs its data file's per-row-group row counts from that file's Parquet footer
-* *THEN* the UDF SHALL fetch those footers CONCURRENTLY rather than awaiting one before starting the next
-* *AND* the number of concurrently in-flight footer fetches MUST NOT exceed N at any instant, counted across every fan-out active in the scan invocation, a single table, or both sides of a broadcast join sharing the ONE size-N limiter that also bounds the delete-file reads
-* *AND* the returned `PartitionedFile` list SHALL preserve the per-shard spec's assigned-file order, so each file occupies the same position in the shard's single `FileGroup` as it did under the serial build
-* *AND* the post-delete row set SHALL be identical to a strictly serial footer fetch, because a data file's per-row-group row counts and its delete set are both independent of fetch order
-* *AND* a footer fetch that fails SHALL surface as a credential-redacted user error naming the failure, with the remaining fetches abandoned, no partial access plan attached, and no row emitted for the shard
-
-### Scenario: A delete-free data file still costs no footer fetch of its own
-
-* *GIVEN* a shard mixing delete-carrying data files with data files that carry no associated delete files
-* *WHEN* the scan UDF builds the shard's `PartitionedFile` list
-* *THEN* the UDF SHALL fetch a Parquet footer ONLY for the delete-carrying data files, because only those need a base `ParquetAccessPlan`
-* *AND* a delete-free data file MUST NOT acquire a permit from the shared fan-out limiter, so delete-free files in a mixed shard neither consume nor wait on the connection budget
-* *AND* each delete-free data file SHALL still appear in the returned `PartitionedFile` list, in its spec order, with no access plan attached
 
 ### Scenario: A shared delete file is read once per shard regardless of referencing data-file count
 
@@ -45,6 +26,16 @@ Governs the object-store I/O shape of applying positional deletes: a shared conn
 * *THEN* the number of concurrently in-flight delete-file object-store reads MUST NOT exceed N at any instant, counted across every delete-read fan-out active in the scan invocation, a single table, or both sides of a broadcast join sharing one size-N limiter
 * *AND* the UDF SHALL read delete files concurrently up to N in flight rather than strictly one at a time
 * *AND* the resulting per-data-file delete sets SHALL be identical to a strictly serial read, because unioning delete positions is order-independent
+
+### Scenario: A delete file's row groups are read as separate requests
+
+* *GIVEN* a positional-delete file with several row groups that can hold an assigned data file's deletes
+* *WHEN* the scan UDF reads that delete file
+* *THEN* the UDF SHALL read the footer first, as ONE ranged GET of the file's last metadata-size-hint bytes, with a second GET only when the footer and metadata do not fit the hint
+* *AND* the UDF SHALL decode a row group whose `file_path` and `pos` column chunks lie inside those footer bytes from memory, issuing no request and taking no permit, so a delete file that fits the hint costs ONE GET in total
+* *AND* the UDF SHALL read every other such row group as its own request under its own permit of the shared limiter, so those row groups are read concurrently up to N in flight
+* *AND* the UDF SHALL decode those row groups in the footer read's own task, after releasing its permit, and SHALL drop the footer bytes before that task ends, so the bytes never wait on another file's read and never hold memory-pool room that the deleted-position sets need
+* *AND* the UDF SHALL read only the `file_path` and `pos` columns, never the optional `row` column
 
 ### Scenario: Row groups that cannot contain an assigned data file's deletes are skipped
 

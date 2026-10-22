@@ -15,7 +15,7 @@
  │ LAKEHOUSE_DISTRIBUTE_FILES │──────────────────────▶│ LAKEHOUSE_SCAN x G shards        │
  │ (Lua SET passthrough)      │                       │  datafusion-scan ─▶ object store ─┼──▶ S3 / ADLS Gen2 Parquet
  └────────────────────────────┘                       └───────────────┬──────────────────┘
-                                                                      │ Arrow IPC or Value rows
+                                                                      │ Arrow C Data or Value rows
                                                                       ▼
                                                       Exasol merge (final agg, ORDER BY, LIMIT) ─▶ result
 ```
@@ -34,7 +34,7 @@
 - sharding (crates/lakehouse-engine/src/adapter/sharding.rs): computes the shard count G and partitions the file list into G byte-balanced shards | owns: none | depends on: scan-spec
 - scan-spec (crates/lakehouse-engine/src/scan/spec.rs): defines the format-neutral JSON wire format between the adapter and the scan UDF (`CommonScanSpec`, `FileEntry`, `LogicalField`, `ScanStorage`) | owns: scan spec wire format | depends on: lakehouse-catalog
 - sealed-storage (crates/lakehouse-engine/src/scan/sealed.rs): encrypts storage credentials into the scan spec with AES-GCM under a key derived by HKDF-SHA256 from the CONNECTION password, and decrypts them in the scan UDF | owns: sealed storage envelope format | depends on: none
-- datafusion-scan (crates/lakehouse-engine/src/scan/): runs one shard per invocation as a raw scan, a partial aggregate, or a broadcast join scan, applies Iceberg positional deletes and Delta deletion vectors, and emits results batch by batch | owns: per-invocation Tokio runtime, DataFusion session, memory pool | depends on: scan-spec, sealed-storage, scan-object-store, type-mapping, vs-expression
+- datafusion-scan (crates/lakehouse-engine/src/scan/): runs one shard per invocation as a raw scan, a partial aggregate, or a broadcast join scan, applies Iceberg positional deletes and Iceberg and Delta deletion vectors, and emits results batch by batch | owns: per-invocation Tokio runtime, DataFusion session, memory pool | depends on: scan-spec, sealed-storage, scan-object-store, type-mapping, vs-expression
 - scan-object-store (crates/lakehouse-engine/src/scan/object_store.rs): builds S3 or ADLS Gen2 object stores with a connection budget and an admission limit, and routes the two join sides by path prefix | owns: per-invocation HTTP connection pool | depends on: lakehouse-catalog
 - type-mapping (crates/lakehouse-engine/src/types/): maps Arrow, Iceberg, Delta, and Hive types to Exasol types and applies type widening rules | owns: none | depends on: none
 - lakehouse-catalog (crates/lakehouse-catalog/): implements `CatalogClient` for Iceberg REST, Unity Catalog, and AWS Glue, with OAuth2, bearer, and SigV4 auth, STS role assumption, vended-storage resolution, and credential redaction; its neutral table carries the catalog's table properties verbatim and its neutral column an opaque engine-encoded declaration slot, and it interprets neither | owns: per-request catalog sessions | depends on: none
@@ -50,7 +50,7 @@
 - format-readers -> sharding -> pushdown-planner: the file list becomes G byte-balanced shards, each serialized as `common` and `files` JSON strings in the dispatch SQL
 - dispatch SQL -> LAKEHOUSE_DISTRIBUTE_FILES -> GROUP BY shard_key -> LAKEHOUSE_SCAN: Exasol runs one scan invocation per shard row on its node VM pool
 - LAKEHOUSE_SCAN -> datafusion-scan -> scan-object-store -> object storage: Parquet byte ranges stream into one DataFusion plan per invocation
-- datafusion-scan -> Exasol: raw and join rows leave as Arrow IPC bytes via `ctx.emit_batch`, partial aggregates leave as SDK `Value` rows via `ctx.emit`
+- datafusion-scan -> Exasol: raw and join rows leave through the Arrow C Data Interface via `ctx.emit_batch`, partial aggregates leave as SDK `Value` rows via `ctx.emit`
 - Exasol -> result: the dispatch SQL wrapper merges partial aggregates and applies the final ORDER BY and LIMIT
 
 ## Interfaces
@@ -69,11 +69,11 @@
 
 ## Constraints
 
-- The Rust toolchain, edition, and every dependency version are pinned in `rust-toolchain.toml` and the workspace manifest, not in the specs.
-- The release `.so` builds only in the Rust build image whose glibc matches the SLC, because the SLC rejects a `.so` whose SDK fingerprint (`exasol-udf-sdk` version and rustc hash) differs from its own.
-- `exasol-udf-sdk` and `exasol-udf-macros` are pinned only in the workspace manifest, and their version is also the SLC version.
+- The toolchain is pinned in `rust-toolchain.toml`, with edition 2024. Every dependency version is pinned in the workspace manifest, not in the specs.
+- The release `.so` builds only in the Makefile's `UDF_BUILDER_IMAGE`, whose rustc and glibc match the SLC, because the SLC rejects a `.so` whose SDK fingerprint (`exasol-udf-sdk` version and rustc hash) differs from its own.
+- `exasol-udf-sdk` and `exasol-udf-macros` are pinned in the workspace manifest to the SLC's own version.
 - `arrow` and `parquet` stay on the same major as `datafusion` and the SDK.
-- Arrow types never cross the `.so` boundary. Only SDK `Value`s or Arrow IPC bytes from `ctx.emit_batch` cross it.
+- Arrow types never cross the `.so` boundary. Only SDK `Value`s or the Arrow C Data Interface structs from `ctx.emit_batch` cross it.
 - UDFs keep no cross-call state. The scan UDF builds its Tokio runtime per call and never caches it.
 - The engine owns no persisted metadata. Exasol stores the adapterNotes values (`TABLE_MAP`, `SKIPPED_TABLES`, tuning values) and the column notes between CREATE and pushdown.
 - A table's declared schema is decided at CREATE, REFRESH, or SET and read from its column notes at pushdown. No format reader derives a logical schema, a partition column, or a refusal at pushdown.

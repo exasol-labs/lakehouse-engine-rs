@@ -8,7 +8,7 @@ use crate::sigv4::required_signing_region;
 use exasol_udf_sdk::error::UdfError;
 use std::collections::HashMap;
 
-/// Fixed by `iceberg-catalog-rest` 0.10.0, which exports no constants for them.
+/// Fixed by `iceberg-catalog-rest`, which exports no constants for them.
 pub(crate) const REST_CATALOG_PROP_TOKEN: &str = "token";
 pub(crate) const REST_CATALOG_PROP_CREDENTIAL: &str = "credential";
 pub(crate) const REST_CATALOG_PROP_OAUTH2_SERVER_URI: &str = "oauth2-server-uri";

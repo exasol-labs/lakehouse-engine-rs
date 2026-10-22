@@ -20,14 +20,12 @@ fn inline_backend(storage: &ScanStorage) -> StorageBackend {
     }
 }
 
-use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use exasol_udf_sdk::connect_back::{ConnectionObject, ExaConnection};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::test_support::TestContext;
 use exasol_udf_sdk::value::{ColumnInfo, ExaType, Value};
-use std::io::Cursor;
 
 /// `type_name` is only for readable assertion failures; the emit boundary reads `typ`.
 /// Integer bins render at their widest declaration since `ExaType` has no precision.
@@ -90,8 +88,8 @@ fn declared_scale(typ: &ExaType) -> Option<u32> {
     }
 }
 
-/// `TestContext` leaves `emit_record_batch_ipc` unimplemented; this captures the raw scan's
-/// IPC emits as decoded batches.
+/// `TestContext` leaves `emit_record_batch_ffi` unimplemented; this captures the raw scan's
+/// batch emits, imported through the C Data Interface as the SLC host does.
 pub struct BatchCapturingCtx {
     inner: TestContext,
     calls: Vec<Vec<RecordBatch>>,
@@ -209,15 +207,21 @@ impl UdfContext for BatchCapturingCtx {
     ) -> Result<Box<dyn ExaConnection>, UdfError> {
         self.inner.connect_back(conn)
     }
-    fn emit_record_batch_ipc(&mut self, ipc: &[u8]) -> Result<(), UdfError> {
-        let reader = StreamReader::try_new(Cursor::new(ipc), None)
-            .map_err(|e| UdfError::User(format!("ipc decode: {e}")))?;
-        let mut batches = Vec::new();
-        for batch in reader {
-            let batch = batch.map_err(|e| UdfError::User(format!("ipc batch: {e}")))?;
-            batches.push(batch);
-        }
-        self.calls.push(batches);
+    fn emit_record_batch_ffi(
+        &mut self,
+        array: *mut core::ffi::c_void,
+        schema: *mut core::ffi::c_void,
+    ) -> Result<(), UdfError> {
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+        let array =
+            unsafe { std::ptr::replace(array.cast::<FFI_ArrowArray>(), FFI_ArrowArray::empty()) };
+        let schema = unsafe { &*schema.cast::<FFI_ArrowSchema>() };
+        let data = unsafe { arrow::ffi::from_ffi(array, schema) }
+            .map_err(|e| UdfError::User(format!("ffi import: {e}")))?;
+        self.calls
+            .push(vec![RecordBatch::from(arrow::array::StructArray::from(
+                data,
+            ))]);
         Ok(())
     }
 }

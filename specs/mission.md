@@ -49,10 +49,10 @@ The payoff: open lakehouse data (Iceberg, Databricks) becomes first-class and qu
 
 ### Correctness and delivery
 
-10. **Correct read path**: applies Iceberg positional deletes and Delta deletion vectors (`scan-read-path/scan-execution-delta-deletion-vectors`) at scan time, so results reflect current table state and not raw Parquet file content. Iceberg equality deletes and Puffin deletion vectors are refused with a clean error, not applied. The adapter also refuses Delta tables that need unsupported reader features or protocol versions, and refuses binary columns at plan time.
+10. **Correct read path**: applies Iceberg positional deletes, Iceberg deletion vectors, and Delta deletion vectors at scan time, so results reflect current table state and not raw Parquet file content. Iceberg equality deletes are refused with a clean error, not applied. The adapter also refuses Delta tables that need unsupported reader features or protocol versions, and refuses binary columns at plan time.
 11. **Packaging and install**: one `.so` for x86 and aarch64, a version query UDF, an architecture-aware install script, and a personal deployment install.
 12. **Result parity**: once the adapter advertises a pushdown capability it honors it fully, so results match native Exasol. A deviation is accepted only when it is documented in `docs/semantic-differences.md`. Guards cover declined-filter self-application, empty results, DECIMAL string format, CHAR type declaration, type coercion, and ORDER BY capability.
-13. **End-to-end test infrastructure**: besides the local Exasol Docker suite, E2E suites run against real AWS (Glue and assume-role), Azure, Unity Catalog (Databricks), and Lakekeeper. Shared fixtures cover type promotion, positional deletes, and INT96 timestamps. Scheduled sweeps remove orphaned Azure containers and Glue resources. `specs/testing.md` states how the suites are built, run, and cleaned up.
+13. **End-to-end test infrastructure**: besides the local Exasol Docker suite, E2E suites run against real AWS (Glue and assume-role), Azure, Unity Catalog (Databricks), and Lakekeeper. Shared fixtures cover type promotion, positional deletes, deletion vectors, and INT96 timestamps. Scheduled sweeps remove orphaned Azure containers and Glue resources. `specs/testing.md` states how the suites are built, run, and cleaned up.
 
 ## Out of Scope
 
@@ -98,7 +98,7 @@ Architecture: see specs/architecture.md.
 | Query engine | DataFusion + Arrow/Parquet | Node-local vectorized scan and pushdown execution |
 | Lakehouse | `iceberg-rust` (Iceberg REST catalog, incl. Databricks-managed Iceberg) + `delta-kernel-rs` (Delta tables via native Unity Catalog) + `aws-sdk-glue` (AWS Glue Data Catalog: Iceberg and Hive Parquet tables) | Snapshot discovery, file resolution, table registration |
 | UDF runtime | `exasol-udf-sdk`, `exasol-udf-macros`; language-container-rs Rust SLC | Rust UDF ABI, `ctx.emit` |
-| Build | Rust build image in Docker, x86 and aarch64 | Builds a `.so` whose glibc matches the SLC; never built on host |
+| Build | Rust builder image (`UDF_BUILDER_IMAGE`) in Docker, x86 and aarch64 | Builds a `.so` whose glibc matches the SLC; never built on host |
 | Testing | `cargo test`; E2E against a local Exasol Docker container | Unit and cluster behavior validation |
 
 > The Rust SLC and UDF runtime come from `language-container-rs`; this engine follows its UDF programming model and build/E2E workflow. `crates/vs-expression` (expression translation) and `crates/lakehouse-catalog` (Iceberg REST, Unity Catalog, and AWS Glue access) are workspace-internal splits from `crates/lakehouse-engine`; all three build into the one `.so` that carries all three UDF entry points.
@@ -106,7 +106,7 @@ Architecture: see specs/architecture.md.
 ## Commands
 
 ```bash
-# Build (UDF .so, inside the Rust build container, never host `cargo build --release`)
+# Build (UDF .so, inside the UDF_BUILDER_IMAGE container, never host `cargo build --release`)
 make cross-udf-build
 
 # Test (host unit tests)

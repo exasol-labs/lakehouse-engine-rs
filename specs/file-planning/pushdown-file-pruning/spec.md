@@ -13,8 +13,8 @@ Translates the soundly translatable conjuncts of the Exasol WHERE predicate into
 * Under `OR`, an untranslatable branch makes the whole `OR` impose no constraint. An `OR` is exact only when every branch is exact.
 * `NOT` negates only an exact child, because negating a widened predicate narrows it and skips files that hold matching rows. Any other `NOT` is partly translated.
 * A `BETWEEN` whose bound does not translate keeps the other bound and is partly translated.
-* A data file's associated positional-delete files, as resolved by `plan_files`, are preserved into the scan spec.
-* Delete mechanisms this engine cannot apply (equality deletes, Puffin/v3 deletion vectors, and ORC or Avro data or delete files) are detected at plan time and fail the request.
+* A data file's associated positional-delete files and deletion vector, as resolved by `plan_files`, are preserved into the scan spec.
+* Delete mechanisms this engine cannot apply (equality deletes, and ORC or Avro data or delete files) are detected at plan time and fail the request when they apply to a planned data file.
 * A filter names an Exasol column, and the table's column notes record the Iceberg field id that column declares (`vs-adapter/column-source-notes`). The translation resolves each filter column through that field id to the field the scanned snapshot's schema carries under it, because column bounds are stored by field id in manifests. Resolving by name would read another column's bounds after a source-side rename between refreshes and skip files that hold matching rows. A filter column whose field id the schema no longer carries imposes no constraint.
 
 ## Scenarios
@@ -43,7 +43,7 @@ Translates the soundly translatable conjuncts of the Exasol WHERE predicate into
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL emit an Iceberg pruning predicate carrying only the translatable conjunct
 * *AND* the adapter SHALL drop the untranslatable conjunct from the pruning predicate
-* *AND* the full original predicate SHALL still be applied, in `ScanSpec.filter` for DataFusion when the DataFusion dialect renders it, and otherwise in the adapter's own outer `WHERE` per `pushdown/pushdown-declined-filter-self-apply`, so "untranslatable for Iceberg pruning" never means "unapplied"
+* *AND* the full original predicate SHALL still be applied, in the scan spec's `filter` for DataFusion when the DataFusion dialect renders it, and otherwise in the adapter's own outer `WHERE` per `pushdown/pushdown-declined-filter-self-apply`, so "untranslatable for Iceberg pruning" never means "unapplied"
 * *AND* the query result SHALL be identical to the result without any Iceberg pruning
 
 ### Scenario: An untranslatable branch of an OR disables pruning entirely
@@ -54,22 +54,28 @@ Translates the soundly translatable conjuncts of the Exasol WHERE predicate into
 * *AND* the resolved file list SHALL equal the unpruned file list for that `OR`
 * *AND* the query result SHALL be correct because DataFusion applies the full predicate
 
-### Scenario: Positional-delete files are preserved into the scan spec
+### Scenario: Delete files and deletion vectors are preserved into the scan spec
 
-* *GIVEN* a virtual schema over an Iceberg merge-on-read table whose resolved `FileScanTask`s carry associated Parquet positional-delete files, at either `write.delete.granularity=file` or `write.delete.granularity=partition`
+* *GIVEN* a virtual schema over an Iceberg merge-on-read table whose resolved `FileScanTask`s carry associated Parquet positional-delete files at either `write.delete.granularity=file` or `write.delete.granularity=partition`, or a Puffin deletion vector
 * *WHEN* Exasol sends the corresponding pushdown request and the adapter resolves the file list once
-* *THEN* the adapter MUST NOT discard a data file's associated positional-delete files, and SHALL carry each delete file's path, byte size, and delete content type into the per-shard file entry for the data file(s) it applies to
+* *THEN* the adapter MUST NOT discard a data file's associated positional-delete files or deletion vector, and SHALL carry each delete file's path, byte size, and delete content type into the per-shard file entry for the data file(s) it applies to, plus a deletion vector's blob coordinates as `file-planning/pushdown-planning-file-encoding` defines them
 * *AND* the association between a data file and its delete files SHALL follow the Iceberg sequence-number rules exactly as `plan_files` resolved them, so a delete file is carried for exactly the data files it applies to and no others
-* *AND* the adapter SHALL carry the delete-file references as the ONLY delete-related addition to the per-shard files argument, it MUST NOT add a serialized Iceberg schema or a bound predicate to the spec for delete support
+* *AND* the adapter SHALL carry the delete-file references, with a deletion vector's blob coordinates, as the ONLY delete-related addition to the per-shard files argument, and MUST NOT add a serialized Iceberg schema or a bound predicate to the spec for delete support
 
 ### Scenario: An unsupported delete mechanism fails loud at plan time
 
-* *GIVEN* a virtual schema over an Iceberg table whose current snapshot carries a delete mechanism this engine cannot apply, an equality-delete file, a v3 / Puffin deletion vector, or a delete file (or data file) in ORC or Avro format
-* *WHEN* Exasol sends the corresponding pushdown request and the adapter inspects the snapshot's delete files at the manifest / `DataFile` level, where the Puffin discriminator and file format are still visible
-* *THEN* the adapter SHALL fail the request at plan time with a clean error naming the unsupported delete mechanism, BEFORE building or returning any scan-driving SQL and before fan-out
+* *GIVEN* a virtual schema over an Iceberg table where a planned data file is in ORC or Avro format, or has an equality delete or an ORC or Avro delete file applied to it
+* *WHEN* Exasol sends the corresponding pushdown request
+* *THEN* the adapter SHALL fail the request at plan time with a clean error naming the unsupported mechanism or file format, BEFORE building or returning any scan-driving SQL and before fan-out
 * *AND* the adapter MUST NOT silently return pre-delete rows and MUST NOT emit scan-driving SQL for that request
-* *AND* the error message MUST NOT contain any storage access key, secret key, or session token
-* *AND* this plan-time detection SHALL be the authoritative correctness gate; any scan-time check is a secondary backstop only
+* *AND* the error message MUST NOT contain any file path, storage access key, secret key, or session token
+* *AND* the adapter SHALL decide which delete files apply to a data file by the matching rules of Iceberg's planning library, and any scan-time check is a secondary backstop only
+
+### Scenario: An unsupported delete mechanism on a pruned file does not fail the query
+
+* *GIVEN* a virtual schema over an Iceberg table where an unsupported mechanism applies only to data files that the query's filter prunes
+* *WHEN* Exasol sends the corresponding pushdown request
+* *THEN* the query SHALL return the rows of the remaining data files
 
 ### Scenario: A NOT over a partly translated predicate keeps every file with a matching row
 

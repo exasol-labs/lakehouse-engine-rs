@@ -1,6 +1,6 @@
 # Feature: DataFusion Scan Execution, Delta Deletion Vector Application
 
-Applies a Delta Lake deletion vector on read, so a query over a Delta table returns the post-delete row set. The decoded positions feed the same `RowSelection` and `ParquetAccessPlan` machinery as Iceberg positional deletes, and `delta_kernel`'s decoder produces the bitmap.
+Applies a Delta Lake deletion vector on read, so a query over a Delta table returns the post-delete row set. The decoded positions feed the pipeline every row-position delete mechanism shares (`scan-read-path/scan-execution-row-position-deletes`), and `delta_kernel`'s decoder produces the bitmap.
 
 ## Background
 
@@ -12,7 +12,7 @@ The Delta protocol (`delta-io/delta`, `PROTOCOL.md`) defines these shapes:
 * A sidecar holds one or more deletion vectors for different data files, each with a checksum. It starts with a format-version byte `1`. Each deletion vector is a 4-byte `dataSize`, the bitmap, and a CRC-32 of the bitmap, all big endian.
 * A bitmap payload is little endian. It starts with the 4-byte magic number `1681511377`, then a serialized 64-bit portable Roaring bitmap.
 
-The engine carries the descriptor unresolved in the `DeltaDeletionVector` variant of the format-neutral delete mechanism: see `delta/delta-table-planning`. The decoder is `delta_kernel`'s `DeletionVectorDescriptor::read`. It returns the `roaring::RoaringTreemap` that the Iceberg positional-delete pipeline already uses. Every scenario runs inside the scan UDF under the bounded memory pool, the shared object-store connection budget and the streaming `emit_batch` path.
+The engine carries the descriptor unresolved in the Delta deletion-vector variant of the format-neutral delete mechanism: see `delta/delta-table-planning`. The decoder is `delta_kernel`'s `DeletionVectorDescriptor::read`. It returns the `roaring::RoaringTreemap` that the row-position delete pipeline already uses. Every scenario runs inside the scan UDF under the bounded memory pool, the shared object-store connection budget and the streaming `emit_batch` path.
 
 ## Scenarios
 
@@ -93,8 +93,8 @@ The engine carries the descriptor unresolved in the `DeltaDeletionVector` varian
 
 ### Scenario: The decoder is handed bytes and never a live storage client
 
-* *GIVEN* the scan UDF's deletion-vector pipeline, which fetches every sidecar it needs on the scan's
-  own asynchronous, budget-bounded path before decoding anything
+* *GIVEN* the scan UDF's deletion-vector pipeline, which fetches each sidecar on the scan's own
+  asynchronous, budget-bounded path before it decodes any descriptor that names that sidecar
 * *WHEN* the UDF invokes the `delta_kernel` deletion-vector decoder for a descriptor
 * *THEN* the UDF SHALL satisfy the decoder's storage dependency with a read-only adapter that serves
   the ALREADY-FETCHED bytes from memory, so decoding performs no I/O, opens no object store, and
