@@ -1211,14 +1211,24 @@ test_stops_at_product_prints_template() {
   assert_contains "template: prints CREATE VIRTUAL SCHEMA" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
   assert_contains "template: prints the NAMESPACE property" "$LAST_OUT" "NAMESPACE          = "
   assert_contains "template: references the adapter script" "$LAST_OUT" "LHVS.LAKEHOUSE_ADAPTER"
-  # The E2E test the_install_scripts_role_recipe_serves_a_reader runs these grants.
+  # The E2E test the_install_scripts_grant_recipes_serve_a_reader runs these grants.
   local script
   for script in LAKEHOUSE_ADAPTER LAKEHOUSE_SCAN; do
-    assert_contains "template: role holds the $script CONNECTION grant" "$LAST_OUT" \
+    assert_contains "template: option 1 grants the installing user the $script CONNECTION access" "$LAST_OUT" \
+      "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT LHVS.$script TO <installing-user>;"
+    assert_contains "template: option 2 grants the role the $script CONNECTION access" "$LAST_OUT" \
       "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT LHVS.$script TO LAKEHOUSE_ENGINE_ROLE_LHVS;"
   done
-  assert_contains "template: grants the role to the installing user" "$LAST_OUT" "GRANT LAKEHOUSE_ENGINE_ROLE_LHVS TO "
-  assert_contains "template: the role grants need a DBA" "$LAST_OUT" "Run this block as a DBA"
+  assert_not_contains "template: no SQL is commented out" "$LAST_OUT" "-- GRANT"
+  assert_contains "template: asks for one option" "$LAST_OUT" "Run ONE of the two options below."
+  for script in LAKEHOUSE_ADAPTER LAKEHOUSE_SCAN LAKEHOUSE_DISTRIBUTE_FILES; do
+    assert_contains "template: option 2 grants the role EXECUTE on $script" "$LAST_OUT" \
+      "GRANT EXECUTE ON SCRIPT LHVS.$script TO LAKEHOUSE_ENGINE_ROLE_LHVS;"
+  done
+  assert_contains "template: option 2 grants the role CREATE VIRTUAL SCHEMA" "$LAST_OUT" "GRANT CREATE VIRTUAL SCHEMA TO LAKEHOUSE_ENGINE_ROLE_LHVS;"
+  assert_contains "template: option 2 grants the role to the installing user" "$LAST_OUT" "GRANT LAKEHOUSE_ENGINE_ROLE_LHVS TO <installing-user>;"
+  assert_contains "template: option 2 needs a DBA" "$LAST_OUT" "Run as a DBA"
+  assert_contains "template: names the CREATE VIRTUAL SCHEMA privilege" "$LAST_OUT" "Needs the CREATE VIRTUAL SCHEMA system privilege"
   local log; log="$(log_content)"
   assert_not_contains "template: does NOT execute CREATE VIRTUAL SCHEMA" "$log" "CREATE VIRTUAL SCHEMA"
   assert_not_contains "template: does NOT execute CREATE CONNECTION" "$log" "CREATE CONNECTION"

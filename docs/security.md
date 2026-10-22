@@ -52,9 +52,9 @@ They also cover scripts created or replaced in `<schema>` later. Anyone who can 
 
 ### The install script's template
 
-The install script prints the per-script CONNECTION grants as a template. It puts them on the role `LAKEHOUSE_ENGINE_ROLE_<schema>` and grants that role to the installing user. That user owns `<schema>`, so it needs no `EXECUTE` grant, and it owns the virtual schemas it creates. The role holds no `EXECUTE` grant, so any other owner that gets the role also needs the three `EXECUTE` grants of the [owner grants](#owner-grants). The role is for owners only. Never grant it to a reader.
+The install script prints the per-script CONNECTION grants as a template with two options. Run one of them. Option 1 grants them to the installing user, which owns `<schema>`, so it needs no `EXECUTE` grant, and it owns the virtual schemas it creates. It still needs `CREATE VIRTUAL SCHEMA` to create one. Run the grants as the user that created the CONNECTION, which needs no DBA privilege, or as a DBA. Run them again after a re-install.
 
-Run the template's grants as a DBA, because granting a role needs `GRANT ANY ROLE`, even for the role's creator. After a re-install, run only its two `GRANT ACCESS` statements again. The role and its members remain.
+Option 2 puts all the [owner grants](#owner-grants) in their per-script form on the role `LAKEHOUSE_ENGINE_ROLE_<schema>`, so any user that gets the role can create and own a virtual schema. Run it as a DBA, because creating a role needs `CREATE ROLE` and granting one needs `GRANT ANY ROLE`, even for the role's creator. The role is for owners only. Never grant it to a reader. After a re-install, run its `GRANT EXECUTE` and `GRANT ACCESS` statements again. The role and its members remain.
 
 ### A role as owner
 
@@ -79,7 +79,9 @@ A missing owner grant fails every reader's query with one of these errors:
 | `insufficient privileges for calling adapter script` | The owner lacks `EXECUTE` on `LAKEHOUSE_ADAPTER`. |
 | `CONNECTION '<conn>' could not be resolved` | The CONNECTION does not exist, or the owner lacks `ACCESS` on it for `LAKEHOUSE_ADAPTER`. |
 | `insufficient privileges for calling script` | The owner lacks `EXECUTE` on `LAKEHOUSE_SCAN` or `LAKEHOUSE_DISTRIBUTE_FILES`. |
-| `the scan cannot access CONNECTION '<conn>'` | The owner lacks `ACCESS` on the CONNECTION for `LAKEHOUSE_SCAN`. |
+| `the scan cannot access CONNECTION '<conn>'` | The CONNECTION does not exist, or the owner lacks `ACCESS` on it for `LAKEHOUSE_SCAN`. |
+
+Each CONNECTION error ends with the database's reason, which tells the two causes apart. Grant `ACCESS ON CONNECTION <conn> FOR SCRIPT <schema>.<script>`, or `FOR SCHEMA <schema>`, to the owner, directly or through a role. A querying user needs no CONNECTION privilege.
 
 A scan that fits in one shard, such as a scan of one data file, does not call `LAKEHOUSE_DISTRIBUTE_FILES`. A missing `EXECUTE` on it therefore fails only the queries whose scan spans several shards.
 
