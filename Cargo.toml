@@ -43,8 +43,8 @@ tokio = { version = "1", features = ["rt", "macros"] }
 
 # Also the SLC version (fingerprint must match). `make install-slc` and
 # deploy/scripts/install.sh scrape this line, so keep `version` inline.
-exasol-udf-sdk    = { version = "0.32.0", features = ["emit-arrow"] }
-exasol-udf-macros = { version = "0.32.0" }
+exasol-udf-sdk    = { version = "0.33.0", features = ["emit-arrow"] }
+exasol-udf-macros = { version = "0.33.0" }
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }

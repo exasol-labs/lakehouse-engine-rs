@@ -123,7 +123,7 @@ fn parse_request(raw: &str) -> RecordedRequest {
 fn unity_conn_ctx(address: impl Into<String>, password: impl Into<String>) -> TestContext {
     TestContext::scalar(vec![]).with_connection(
         "uc_conn",
-        exasol_udf_sdk::connect_back::ConnectionObject {
+        exasol_udf_sdk::ConnectionObject {
             kind: "PASSWORD".into(),
             address: address.into(),
             user: String::new(),

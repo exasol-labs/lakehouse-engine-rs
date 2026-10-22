@@ -114,8 +114,8 @@ fn merge_set_properties_new_wins_and_null_unsets() {
 fn password_connection(
     address: &str,
     password: impl Into<String>,
-) -> exasol_udf_sdk::connect_back::ConnectionObject {
-    exasol_udf_sdk::connect_back::ConnectionObject {
+) -> exasol_udf_sdk::ConnectionObject {
+    exasol_udf_sdk::ConnectionObject {
         kind: "PASSWORD".into(),
         address: address.into(),
         user: String::new(),

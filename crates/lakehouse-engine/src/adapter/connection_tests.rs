@@ -1,7 +1,7 @@
 use super::*;
 use crate::adapter::catalog_kind::CatalogKind;
 use crate::scan::spec::{AdlsCred, StorageProps};
-use exasol_udf_sdk::connect_back::ConnectionObject;
+use exasol_udf_sdk::ConnectionObject;
 use exasol_udf_sdk::test_support::TestContext;
 use lakehouse_catalog::{StaticStoreAddress, StorageCreds};
 

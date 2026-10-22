@@ -56,7 +56,7 @@ The scan spec carries the Exasol CONNECTION name instead of storage credentials,
 * *WHEN* a scan runs
 * *THEN* the scan script SHALL additionally need `GRANT ACCESS ON CONNECTION ... FOR SCRIPT <schema>.LAKEHOUSE_SCAN TO <owner>` or the same grant `FOR SCHEMA <schema>`, and a missing grant SHALL fail with a named error and no inline fallback
 * *AND* that grant SHALL be checked against the virtual schema's OWNER, not the querying user, so a user holding only `CREATE SESSION` and `SELECT` on the virtual schema, and no privilege on the CONNECTION, SHALL receive the owner's rows
-* *AND* when the owner's grant is missing, the error a reader receives SHALL name the CONNECTION, both the script-scoped and the schema-scoped grant, and the virtual schema's owner as the grantee, and MUST NOT contain any credential value
+* *AND* when the owner's grant is missing, the error a reader receives SHALL name the CONNECTION, followed by the SLC's reason, and MUST NOT contain any credential value
 
 ### Scenario: A role can own the virtual schema and hold its grants
 
@@ -76,20 +76,32 @@ The scan spec carries the Exasol CONNECTION name instead of storage credentials,
 
 * *GIVEN* a virtual schema whose owner holds the scan script's CONNECTION grant but not the adapter script's
 * *WHEN* a reader queries the virtual schema
-* *THEN* the query SHALL fail with an error stating `CONNECTION '<name>' could not be resolved`, distinct from the scan's named error, and MUST NOT contain any credential value
-* *AND* the error SHALL state that the CONNECTION does not exist or that the virtual schema's OWNER lacks `GRANT ACCESS ON CONNECTION <name> FOR SCRIPT <schema>.LAKEHOUSE_ADAPTER` or the same grant `FOR SCHEMA <schema>`, because Exasol reports both cases the same way
+* *THEN* the query SHALL fail with an error stating `CONNECTION '<name>' could not be resolved`, followed by the SLC's reason, distinct from the scan's named error, and MUST NOT contain any credential value
 
 ### Scenario: A CONNECTION that does not exist fails with the adapter's named error
 
 * *GIVEN* a `CATALOG_CONNECTION` that names no existing CONNECTION
-* *WHEN* a DBA creates a virtual schema with it
-* *THEN* the statement SHALL fail with an error stating `CONNECTION '<name>' could not be resolved: it does not exist`
+* *WHEN* a DBA creates a virtual schema with it, or a reader queries a virtual schema whose CONNECTION was dropped
+* *THEN* the statement SHALL fail with an error stating `CONNECTION '<name>' could not be resolved`, followed by the SLC's reason
+
+### Scenario: A CONNECTION dropped after planning fails with the scan's named error
+
+* *GIVEN* a scan-driving statement planned while its CONNECTION existed
+* *WHEN* the CONNECTION is dropped and the virtual schema's owner runs the statement
+* *THEN* the statement SHALL fail with an error stating `the scan cannot access CONNECTION '<name>'`, followed by the SLC's reason
+
+### Scenario: The CONNECTION's creator grants its own scripts access without a DBA
+
+* *GIVEN* a user without DBA privileges that owns the schema of the adapter, scan, and distributor scripts and created the CONNECTION
+* *WHEN* it grants itself the script-scoped CONNECTION grants and creates a virtual schema, as the install script's template prints
+* *THEN* a reader SHALL receive the owner's rows
 
 ### Scenario: A user owner can hold the CONNECTION grants through a role
 
-* *GIVEN* a virtual schema whose owner is a user that owns the schema of the adapter, scan, and distributor scripts, and holds the script-scoped CONNECTION grants only through a role it is a member of, as the install script's template sets up
+* *GIVEN* a virtual schema whose owner is a user that owns the schema of the adapter, scan, and distributor scripts, and holds the script-scoped CONNECTION grants only through a role it is a member of, as the install script's template offers
 * *WHEN* a reader queries the virtual schema
 * *THEN* the reader SHALL receive the owner's rows
+* *AND* another user holding only `CREATE SESSION` and that role SHALL create a virtual schema and serve its rows to a reader
 * *AND* when the role is revoked from the owner, the reader's query SHALL fail with the adapter's named error
 
 ### Scenario: Schema-scoped grants survive a re-install, script-scoped grants do not
