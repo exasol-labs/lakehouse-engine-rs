@@ -1,4 +1,5 @@
 use crate::adapter::column_notes::TableNotes;
+use crate::adapter::table_identity::read_identifier;
 use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
@@ -24,7 +25,7 @@ pub(crate) struct JoinLeaf {
     /// Verbatim (Exasol does not fold it). `None` when absent: Exasol omits the key, and an
     /// alias-less occurrence is a distinct leg identity.
     pub table_alias: Option<String>,
-    /// Original-cased catalog identifier from `TABLE_MAP`.
+    /// Original-cased catalog identifier from the identifier note of the leg's involved table.
     pub table_identifier: String,
 }
 
@@ -89,8 +90,8 @@ fn collect_join_tree(
 }
 
 /// No equi-condition gate here: only broadcast eligibility (in [`plan_join`]) requires one;
-/// the N-scan fallback renders any inner condition. A leaf absent from `TABLE_MAP` is the
-/// same stale-schema condition the single-table path reports, so a hard `Err`.
+/// the N-scan fallback renders any inner condition. A leaf without a readable identifier note is
+/// the same stale-schema condition the single-table path reports, so a hard `Err`.
 pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinShape, UdfError> {
     let from = match pushdown_req.get("from") {
         Some(from) => from,
@@ -106,15 +107,9 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
         return Ok(JoinShape::Ineligible(reason));
     }
 
-    let table_map = crate::adapter::read_table_map(request);
     let mut tables = Vec::with_capacity(leaves.len());
     for (table_name, table_alias) in leaves {
-        let table_identifier = table_map.get(&table_name).cloned().ok_or_else(|| {
-            UdfError::User(format!(
-                "pushdown: virtual table '{table_name}' is not in TABLE_MAP; \
-                 drop and recreate the virtual schema"
-            ))
-        })?;
+        let table_identifier = read_identifier(request, &table_name)?;
         tables.push(JoinLeaf {
             table_name,
             table_alias,

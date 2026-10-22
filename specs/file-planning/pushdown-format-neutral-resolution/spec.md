@@ -47,8 +47,8 @@ Routes every pushdown request through the table-format reader seam. The reader t
 
 ### Scenario: A Unity Catalog table's identity survives the round trip from the involved table
 
-* *GIVEN* a pushdown request under the Unity Catalog kind whose involved virtual table name maps,
-  through the identifier recorded at create time, to a three-level Unity Catalog identifier
+* *GIVEN* a pushdown request under the Unity Catalog kind whose involved table's identifier note,
+  recorded per `vs-adapter/create-virtual-schema`, holds a three-level Unity Catalog identifier
 * *WHEN* the adapter resolves that identifier into the table its format reader plans
 * *THEN* the adapter SHALL recover the catalog table identifier's namespace segments and table name
   from the recorded identifier and SHALL load exactly that table from the Unity Catalog
@@ -57,7 +57,7 @@ Routes every pushdown request through the table-format reader seam. The reader t
   segmentation is therefore lossless
 * *AND* a recorded identifier that yields no table name SHALL fail with an error naming the
   unresolvable identifier, and MUST NOT resolve a different table
-* *AND* a pushdown request whose involved virtual table name is absent from the recorded mapping SHALL keep failing with the error naming the unknown virtual table, unchanged for both catalog kinds
+* *AND* a pushdown request whose involved table carries no readable identifier note SHALL fail with the error `file-planning/pushdown-planning-file-resolution` specifies for a missing note, under every catalog kind
 
 ### Scenario: Iceberg requests planned through the format-reader seam keep their golden SQL, scan specs, and file pruning
 

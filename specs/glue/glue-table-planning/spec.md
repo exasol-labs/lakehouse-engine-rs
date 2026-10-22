@@ -63,7 +63,7 @@ Resolves a pushdown over a `GLUE` virtual table into the engine's `ResolvedScan`
 
 ### Scenario: A Glue table resolves from its recorded identifier and fails loud when it is no longer plannable
 
-* *GIVEN* a Glue virtual table recorded in `TABLE_MAP` as `sales.orders`, later dropped from Glue, and a second one later re-registered with an ORC input format
+* *GIVEN* a Glue virtual table whose identifier note per `vs-adapter/create-virtual-schema` records `sales.orders`, later dropped from Glue, and a second one later re-registered with an ORC input format
 * *WHEN* the pushdown resolves each table
 * *THEN* the adapter SHALL resolve the Glue database `sales` and the table `orders` from the recorded identifier, splitting it at its first dot
 * *AND* the dropped table SHALL fail with an error naming it and stating that it does not exist

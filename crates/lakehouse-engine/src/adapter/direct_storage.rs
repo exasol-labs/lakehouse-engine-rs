@@ -10,7 +10,7 @@ use exasol_udf_sdk::error::UdfError;
 use futures::future::try_join_all;
 use lakehouse_catalog::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogTable, CatalogTableIdent,
-    CatalogTableType, ColumnSourceType, SkipReason, SkippedTable, TableFormat,
+    CatalogTableType, ColumnSourceType, SkipReason, SkippedTable, TableAdmission, TableFormat,
 };
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
@@ -52,6 +52,30 @@ impl DirectStorageCatalogClient {
             options,
         })
     }
+
+    /// The one admission rule both listings share, so `SKIPPED_TABLES` reads the same after either.
+    async fn admit(&self, ident: CatalogTableIdent) -> Result<TableAdmission, UdfError> {
+        let table_prefix = self.prefix.clone().join(ident.name.as_str());
+        let directory = resolve_parquet_directory(&self.store, &table_prefix, self.options).await?;
+        if directory.files.is_empty() {
+            return Ok(TableAdmission::Skipped(SkippedTable {
+                ident,
+                reason: SkipReason::NoDataFile,
+            }));
+        }
+        let storage_location = join_storage_path(&self.base_path, Some(&ident.name));
+        Ok(TableAdmission::Admitted(CatalogTable {
+            ident,
+            table_type: CatalogTableType::Table,
+            storage_location: Some(storage_location),
+            format: TableFormat::Parquet,
+            vended_credential_key: None,
+            partition_columns: Vec::new(),
+            metadata_location: None,
+            columns: resolve_columns(&directory),
+            properties: Default::default(),
+        }))
+    }
 }
 
 impl CatalogClient for DirectStorageCatalogClient {
@@ -61,6 +85,17 @@ impl CatalogClient for DirectStorageCatalogClient {
         &self,
         _namespace: &[String],
     ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
+        Box::pin(async move {
+            let idents = self.list_table_idents(&[]).await?;
+            self.load_listed_tables(&idents).await
+        })
+    }
+
+    /// One delimiter listing of the base path, sorted by directory name; reads below no directory.
+    fn list_table_idents(
+        &self,
+        _namespace: &[String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogTableIdent>, UdfError>> + Send + '_>> {
         Box::pin(async move {
             let listed = self
                 .store
@@ -74,44 +109,25 @@ impl CatalogClient for DirectStorageCatalogClient {
                 .filter_map(|p| p.filename().map(str::to_string))
                 .collect();
             names.sort();
-
-            let directories =
-                try_join_all(names.iter().map(|name| {
-                    let table_prefix = self.prefix.clone().join(name.as_str());
-                    async move {
-                        resolve_parquet_directory(&self.store, &table_prefix, self.options).await
-                    }
-                }))
-                .await?;
-
-            let mut tables = Vec::with_capacity(names.len());
-            let mut skipped = Vec::new();
-            for (name, directory) in names.into_iter().zip(directories) {
-                let ident = CatalogTableIdent {
+            Ok(names
+                .into_iter()
+                .map(|name| CatalogTableIdent {
                     namespace: Vec::new(),
-                    name: name.clone(),
-                };
-                if directory.files.is_empty() {
-                    skipped.push(SkippedTable {
-                        ident,
-                        reason: SkipReason::NoDataFile,
-                    });
-                    continue;
-                }
-                let columns = resolve_columns(&directory);
-                tables.push(CatalogTable {
-                    ident,
-                    table_type: CatalogTableType::Table,
-                    storage_location: Some(join_storage_path(&self.base_path, Some(&name))),
-                    format: TableFormat::Parquet,
-                    vended_credential_key: None,
-                    partition_columns: Vec::new(),
-                    metadata_location: None,
-                    columns,
-                    properties: Default::default(),
-                });
-            }
-            Ok(CatalogListing { tables, skipped })
+                    name,
+                })
+                .collect())
+        })
+    }
+
+    fn load_listed_tables(
+        &self,
+        idents: &[CatalogTableIdent],
+    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
+        let idents = idents.to_vec();
+        Box::pin(async move {
+            let admissions =
+                try_join_all(idents.into_iter().map(|ident| self.admit(ident))).await?;
+            Ok(admissions.into_iter().collect())
         })
     }
 

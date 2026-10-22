@@ -14,41 +14,45 @@ use vs_expression::{render_expression_exasol_safe, render_expression_safe};
 
 /// Q1 shape: `(SUPPLIER ⋈ NATION) ⋈ REGION`.
 fn q1_join_request() -> Json {
-    serde_json::json!({
-        "involvedTables": [
-            {"name": "SUPPLIER", "columns": [
-                {"name": "S_SUPPKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "S_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "S_NAME", "dataType": {"type": "varchar", "size": 100}}]},
-            {"name": "NATION", "columns": [
-                {"name": "N_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "N_REGIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
-            {"name": "REGION", "columns": [
-                {"name": "R_REGIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "R_NAME", "dataType": {"type": "varchar", "size": 100}}]},
-        ],
-        "pushdownRequest": {
-            "type": "select",
-            "from": {"type": "join", "join_type": "inner",
-                "left": {"type": "join", "join_type": "inner",
-                    "left": {"name": "SUPPLIER", "type": "table"},
-                    "right": {"name": "NATION", "type": "table"},
+    with_identifier_notes(
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "SUPPLIER", "columns": [
+                    {"name": "S_SUPPKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "S_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "S_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "NATION", "columns": [
+                    {"name": "N_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "N_REGIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+                {"name": "REGION", "columns": [
+                    {"name": "R_REGIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "R_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"type": "join", "join_type": "inner",
+                        "left": {"name": "SUPPLIER", "type": "table"},
+                        "right": {"name": "NATION", "type": "table"},
+                        "condition": {"type": "predicate_equal",
+                            "left": {"type": "column", "name": "S_NATIONKEY", "tableName": "SUPPLIER"},
+                            "right": {"type": "column", "name": "N_NATIONKEY", "tableName": "NATION"}}},
+                    "right": {"name": "REGION", "type": "table"},
                     "condition": {"type": "predicate_equal",
-                        "left": {"type": "column", "name": "S_NATIONKEY", "tableName": "SUPPLIER"},
-                        "right": {"type": "column", "name": "N_NATIONKEY", "tableName": "NATION"}}},
-                "right": {"name": "REGION", "type": "table"},
-                "condition": {"type": "predicate_equal",
-                    "left": {"type": "column", "name": "N_REGIONKEY", "tableName": "NATION"},
-                    "right": {"type": "column", "name": "R_REGIONKEY", "tableName": "REGION"}}},
-            "selectList": [
-                {"type": "column", "name": "S_NAME", "tableName": "SUPPLIER"},
-                {"type": "column", "name": "R_NAME", "tableName": "REGION"}],
-        },
-        "schemaMetadataInfo": {"properties": {}, "adapterNotes":
-            serde_json::json!({"TABLE_MAP":
-                {"SUPPLIER": "lh.supplier", "NATION": "lh.nation", "REGION": "lh.region"}})
-                .to_string()},
-    })
+                        "left": {"type": "column", "name": "N_REGIONKEY", "tableName": "NATION"},
+                        "right": {"type": "column", "name": "R_REGIONKEY", "tableName": "REGION"}}},
+                "selectList": [
+                    {"type": "column", "name": "S_NAME", "tableName": "SUPPLIER"},
+                    {"type": "column", "name": "R_NAME", "tableName": "REGION"}],
+            },
+            "schemaMetadataInfo": {"properties": {}},
+        }),
+        &[
+            ("SUPPLIER", "lh.supplier"),
+            ("NATION", "lh.nation"),
+            ("REGION", "lh.region"),
+        ],
+    )
 }
 
 /// Scenario: A join outside the broadcast contract is declined safely
@@ -370,31 +374,32 @@ fn trivially_true_residual_emits_no_outer_where_and_does_not_error() {
 
 #[test]
 fn colliding_columns_render_qualified_unified_wrapper_without_error() {
-    let request = serde_json::json!({
-        "involvedTables": [
-            {"name": "EVENTS", "columns": [
-                {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
-                {"name": "SCORE", "dataType": {"type": "double"}}]},
-            {"name": "LABELS", "columns": [
-                {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
-                {"name": "LABEL", "dataType": {"type": "varchar", "size": 100}}]},
-        ],
-        "pushdownRequest": {
-            "type": "select",
-            "from": {"type": "join", "join_type": "inner",
-                "left": {"name": "EVENTS", "type": "table"},
-                "right": {"name": "LABELS", "type": "table"},
-                "condition": {"type": "predicate_equal",
-                    "left": {"type": "column", "name": "ID", "tableName": "EVENTS"},
-                    "right": {"type": "column", "name": "ID", "tableName": "LABELS"}}},
-            "selectList": [
-                {"type": "column", "name": "ID", "tableName": "EVENTS"},
-                {"type": "column", "name": "LABEL", "tableName": "LABELS"}],
-        },
-        "schemaMetadataInfo": {"properties": {}, "adapterNotes":
-            serde_json::json!({"TABLE_MAP": {"EVENTS": "lh.events", "LABELS": "lh.labels"}})
-                .to_string()},
-    });
+    let request = with_identifier_notes(
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "EVENTS", "columns": [
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "SCORE", "dataType": {"type": "double"}}]},
+                {"name": "LABELS", "columns": [
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "LABEL", "dataType": {"type": "varchar", "size": 100}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"name": "EVENTS", "type": "table"},
+                    "right": {"name": "LABELS", "type": "table"},
+                    "condition": {"type": "predicate_equal",
+                        "left": {"type": "column", "name": "ID", "tableName": "EVENTS"},
+                        "right": {"type": "column", "name": "ID", "tableName": "LABELS"}}},
+                "selectList": [
+                    {"type": "column", "name": "ID", "tableName": "EVENTS"},
+                    {"type": "column", "name": "LABEL", "tableName": "LABELS"}],
+            },
+            "schemaMetadataInfo": {"properties": {}},
+        }),
+        &[("EVENTS", "lh.events"), ("LABELS", "lh.labels")],
+    );
 
     let left = involved_table_columns(&request, "EVENTS");
     let right = involved_table_columns(&request, "LABELS");
@@ -566,41 +571,45 @@ fn build_n_scan_join_sql_for_nq3_shape_part_partsupp_supplier_nation() {
 
 #[test]
 fn build_n_scan_join_sql_renders_qualified_when_three_tables_share_column_name() {
-    let request = serde_json::json!({
-        "involvedTables": [
-            {"name": "EVENTS", "columns": [
-                {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
-                {"name": "SCORE", "dataType": {"type": "double"}}]},
-            {"name": "LABELS", "columns": [
-                {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
-                {"name": "LABEL", "dataType": {"type": "varchar", "size": 100}}]},
-            {"name": "TAGS", "columns": [
-                {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
-                {"name": "TAG_NAME", "dataType": {"type": "varchar", "size": 100}}]},
-        ],
-        "pushdownRequest": {
-            "type": "select",
-            "from": {"type": "join", "join_type": "inner",
-                "left": {"type": "join", "join_type": "inner",
-                    "left": {"name": "EVENTS", "type": "table"},
-                    "right": {"name": "LABELS", "type": "table"},
+    let request = with_identifier_notes(
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "EVENTS", "columns": [
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "SCORE", "dataType": {"type": "double"}}]},
+                {"name": "LABELS", "columns": [
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "LABEL", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "TAGS", "columns": [
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "TAG_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"type": "join", "join_type": "inner",
+                        "left": {"name": "EVENTS", "type": "table"},
+                        "right": {"name": "LABELS", "type": "table"},
+                        "condition": {"type": "predicate_equal",
+                            "left": {"type": "column", "name": "ID", "tableName": "EVENTS"},
+                            "right": {"type": "column", "name": "ID", "tableName": "LABELS"}}},
+                    "right": {"name": "TAGS", "type": "table"},
                     "condition": {"type": "predicate_equal",
-                        "left": {"type": "column", "name": "ID", "tableName": "EVENTS"},
-                        "right": {"type": "column", "name": "ID", "tableName": "LABELS"}}},
-                "right": {"name": "TAGS", "type": "table"},
-                "condition": {"type": "predicate_equal",
-                    "left": {"type": "column", "name": "ID", "tableName": "LABELS"},
-                    "right": {"type": "column", "name": "ID", "tableName": "TAGS"}}},
-            "selectList": [
-                {"type": "column", "name": "ID", "tableName": "EVENTS"},
-                {"type": "column", "name": "LABEL", "tableName": "LABELS"},
-                {"type": "column", "name": "TAG_NAME", "tableName": "TAGS"}],
-        },
-        "schemaMetadataInfo": {"properties": {}, "adapterNotes":
-            serde_json::json!({"TABLE_MAP":
-                {"EVENTS": "lh.events", "LABELS": "lh.labels", "TAGS": "lh.tags"}})
-                .to_string()},
-    });
+                        "left": {"type": "column", "name": "ID", "tableName": "LABELS"},
+                        "right": {"type": "column", "name": "ID", "tableName": "TAGS"}}},
+                "selectList": [
+                    {"type": "column", "name": "ID", "tableName": "EVENTS"},
+                    {"type": "column", "name": "LABEL", "tableName": "LABELS"},
+                    {"type": "column", "name": "TAG_NAME", "tableName": "TAGS"}],
+            },
+            "schemaMetadataInfo": {"properties": {}},
+        }),
+        &[
+            ("EVENTS", "lh.events"),
+            ("LABELS", "lh.labels"),
+            ("TAGS", "lh.tags"),
+        ],
+    );
     let multi = match detect_join(&request, &pd(&request)).expect("detected join shape") {
         JoinShape::Join(m) => m,
         other => panic!("expected Join, got {other:?}"),
@@ -984,43 +993,43 @@ fn join_conditions_greedy_attach_and_side_local_pushdown() {
         "type": "predicate_equal",
         "left": {"type": "column", "name": "N1_KEY", "tableName": "N1"},
         "right": {"type": "column", "name": "F_N1KEY", "tableName": "FACT"}});
-    let request = serde_json::json!({
-        "involvedTables": [
-            {"name": "N1", "columns": [
-                {"name": "N1_KEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "N1_NAME", "dataType": {"type": "varchar", "size": 100}}]},
-            {"name": "N2", "columns": [
-                {"name": "N2_KEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
-            {"name": "FACT", "columns": [
-                {"name": "F_N1KEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "F_N2KEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "F_VALUE", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
-        ],
-        "pushdownRequest": {
-            "type": "select",
-            "from": {"type": "join", "join_type": "inner",
-                "left": {"name": "N1", "type": "table"},
-                "right": {"type": "join", "join_type": "inner",
-                    "left": {"name": "N2", "type": "table"},
-                    "right": {"name": "FACT", "type": "table"},
-                    "condition": cond_n2_fact},
-                "condition": cond_n1_fact},
-            "selectList": [
-                {"type": "column", "name": "N1_NAME", "tableName": "N1"},
-                {"type": "column", "name": "F_VALUE", "tableName": "FACT"}],
-            "filter": {"type": "predicate_and", "expressions": [
-                {"type": "predicate_equal",
-                 "left": {"type": "column", "name": "N1_NAME", "tableName": "N1"},
-                 "right": {"type": "literal_string", "value": "ACME"}},
-                {"type": "predicate_greater",
-                 "left": {"type": "column", "name": "F_VALUE", "tableName": "FACT"},
-                 "right": {"type": "column", "name": "N1_KEY", "tableName": "N1"}}]},
-        },
-        "schemaMetadataInfo": {"properties": {}, "adapterNotes":
-            serde_json::json!({"TABLE_MAP":
-                {"N1": "lh.n1", "N2": "lh.n2", "FACT": "lh.fact"}})
-                .to_string()},
-    });
+    let request = with_identifier_notes(
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "N1", "columns": [
+                    {"name": "N1_KEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "N1_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "N2", "columns": [
+                    {"name": "N2_KEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+                {"name": "FACT", "columns": [
+                    {"name": "F_N1KEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "F_N2KEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "F_VALUE", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"name": "N1", "type": "table"},
+                    "right": {"type": "join", "join_type": "inner",
+                        "left": {"name": "N2", "type": "table"},
+                        "right": {"name": "FACT", "type": "table"},
+                        "condition": cond_n2_fact},
+                    "condition": cond_n1_fact},
+                "selectList": [
+                    {"type": "column", "name": "N1_NAME", "tableName": "N1"},
+                    {"type": "column", "name": "F_VALUE", "tableName": "FACT"}],
+                "filter": {"type": "predicate_and", "expressions": [
+                    {"type": "predicate_equal",
+                     "left": {"type": "column", "name": "N1_NAME", "tableName": "N1"},
+                     "right": {"type": "literal_string", "value": "ACME"}},
+                    {"type": "predicate_greater",
+                     "left": {"type": "column", "name": "F_VALUE", "tableName": "FACT"},
+                     "right": {"type": "column", "name": "N1_KEY", "tableName": "N1"}}]},
+            },
+            "schemaMetadataInfo": {"properties": {}},
+        }),
+        &[("N1", "lh.n1"), ("N2", "lh.n2"), ("FACT", "lh.fact")],
+    );
     let detected = detected_join(&request);
     let sides = vec![
         resolved_side("N1", vec![("s3://w/n1-0.parquet", 10)]),

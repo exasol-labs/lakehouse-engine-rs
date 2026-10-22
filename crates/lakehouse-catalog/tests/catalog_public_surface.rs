@@ -3,6 +3,8 @@
 #![allow(unused_imports)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 
 use exasol_udf_sdk::error::UdfError;
 use iceberg::spec::TableMetadata;
@@ -12,7 +14,7 @@ use lakehouse_catalog::{
     CatalogSession, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType,
     ConnectionCreds, GlueCatalogSession, HIVE_DEFAULT_PARTITION, IcebergRestCatalogClient,
     PartitionFormat, SkipReason, SkippedTable, StaticStoreAddress, StorageBackend, StorageCreds,
-    StorageProps, TableFormat, TemporaryTableCredentials, UnityCatalogSession,
+    StorageProps, TableAdmission, TableFormat, TemporaryTableCredentials, UnityCatalogSession,
     catalog_identifier_string, load_table_any_auth, parse_glue_table_ident, parse_table_ident,
     read_iceberg_metadata_file, redact_credentials, redact_secret_values, resolve_aws_identity,
     resolve_uc_vended_storage, resolve_vended_storage,
@@ -119,6 +121,7 @@ fn both_clients_are_catalog_client_trait_objects() {
     assert_eq!(clients.len(), 2);
 }
 
+/// Scenario: The Unity Catalog session is reached only through the shared catalog-client trait
 #[test]
 fn catalog_client_trait_and_neutral_types_are_reachable() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Type};
@@ -174,6 +177,25 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
         TableFormat::Delta,
         "both formats the engine can plan are reachable from outside the crate and distinct"
     );
+    let admissions = [
+        TableAdmission::Admitted(table.clone()),
+        TableAdmission::Skipped(SkippedTable {
+            ident: ident.clone(),
+            reason: SkipReason::NoDataFile,
+        }),
+    ];
+    let collected: CatalogListing = admissions.into_iter().collect();
+    assert_eq!((collected.tables.len(), collected.skipped.len()), (1, 1));
+
+    let unity: Box<dyn CatalogClient> =
+        Box::new(UnityCatalogSession::new("http://unity", connection_creds()));
+    // Never polled, so neither call sends a request.
+    let _idents: Pin<
+        Box<dyn Future<Output = Result<Vec<CatalogTableIdent>, UdfError>> + Send + '_>,
+    > = unity.list_table_idents(&ident.namespace);
+    let _loaded: Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> =
+        unity.load_listed_tables(std::slice::from_ref(&ident));
+
     let listing = CatalogListing {
         tables: vec![table],
         skipped: vec![SkippedTable {
@@ -191,6 +213,8 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
         "CatalogsPage",
         "SchemasPage",
         "TablesPage",
+        "TableNamesPage",
+        "TableName",
         "CatalogInfo",
         "SchemaInfo",
         "TableInfo",

@@ -13,7 +13,7 @@ Extends `unity-catalog/unity-catalog-client`'s listing and single-table load wit
 * *GIVEN* the same `UnityCatalogSession` and configured namespace
 * *WHEN* the adapter enumerates the tables in that namespace through the shared trait
 * *THEN* the crate-private wire type SHALL model `data_source_format` as optional (a `VIEW` carries it as null), and the raw `data_source_format` STRING SHALL remain a crate-private wire field that MUST NOT appear in any neutral type the engine can name
-* *AND* the client MUST NOT set the `omit_columns` request parameter, SHALL follow `page_token`/`next_page_token` pagination so every page's entries are classified and no listed table is truncated, and SHALL address every request under the `{host}/api/2.1/unity-catalog` base path, never the Iceberg-REST compatibility endpoint or the `delta/v1` Delta Tables API
+* *AND* the full listing MUST NOT set the `omit_columns` request parameter, which only the identifier-only listing of `unity-catalog/unity-catalog-client` sets, and every listing SHALL follow `page_token`/`next_page_token` pagination so every page's entries are classified and no listed table is truncated, and SHALL address every request under the `{host}/api/2.1/unity-catalog` base path, never the Iceberg-REST compatibility endpoint or the `delta/v1` Delta Tables API
 
 ### Scenario: The client admits a Parquet base table and reports its partition columns
 

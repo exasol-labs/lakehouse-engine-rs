@@ -22,38 +22,36 @@ pub(super) fn join_request(from_extra: Json, condition: Json) -> Json {
     }
     from["condition"] = condition;
 
-    serde_json::json!({
-        "involvedTables": [
-            {
-                "name": "CUSTOMER",
-                "columns": [
-                    {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                    {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
-                ],
-            },
-            {
-                "name": "ORDERS",
-                "columns": [
-                    {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                    {"name": "O_ORDERDATE", "dataType": {"type": "date"}},
-                ],
-            },
-        ],
-        "pushdownRequest": {
-            "type": "select",
-            "from": from,
-            "selectList": [
-                {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-                {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+    with_identifier_notes(
+        serde_json::json!({
+            "involvedTables": [
+                {
+                    "name": "CUSTOMER",
+                    "columns": [
+                        {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                        {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
+                    ],
+                },
+                {
+                    "name": "ORDERS",
+                    "columns": [
+                        {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                        {"name": "O_ORDERDATE", "dataType": {"type": "date"}},
+                    ],
+                },
             ],
-        },
-        "schemaMetadataInfo": {
-            "properties": {},
-            "adapterNotes": serde_json::json!({
-                "TABLE_MAP": {"CUSTOMER": "lh.customer", "ORDERS": "lh.orders"}
-            }).to_string(),
-        },
-    })
+            "pushdownRequest": {
+                "type": "select",
+                "from": from,
+                "selectList": [
+                    {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                    {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+                ],
+            },
+            "schemaMetadataInfo": {"properties": {}},
+        }),
+        &[("CUSTOMER", "lh.customer"), ("ORDERS", "lh.orders")],
+    )
 }
 
 pub(super) fn equi_condition() -> Json {
@@ -66,89 +64,97 @@ pub(super) fn equi_condition() -> Json {
 
 /// `(CUSTOMER ⋈ ORDERS) ⋈ LINEITEM`.
 pub(super) fn three_table_join_request() -> Json {
-    serde_json::json!({
-        "involvedTables": [
-            {"name": "CUSTOMER", "columns": [
-                {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}}]},
-            {"name": "ORDERS", "columns": [
-                {"name": "O_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
-            {"name": "LINEITEM", "columns": [
-                {"name": "L_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "L_QUANTITY", "dataType": {"type": "decimal", "precision": 15, "scale": 2}}]},
-        ],
-        "pushdownRequest": {
-            "type": "select",
-            "from": {"type": "join", "join_type": "inner",
-                "left": {"type": "join", "join_type": "inner",
-                    "left": {"name": "CUSTOMER", "type": "table"},
-                    "right": {"name": "ORDERS", "type": "table"},
+    with_identifier_notes(
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "CUSTOMER", "columns": [
+                    {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "ORDERS", "columns": [
+                    {"name": "O_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+                {"name": "LINEITEM", "columns": [
+                    {"name": "L_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "L_QUANTITY", "dataType": {"type": "decimal", "precision": 15, "scale": 2}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"type": "join", "join_type": "inner",
+                        "left": {"name": "CUSTOMER", "type": "table"},
+                        "right": {"name": "ORDERS", "type": "table"},
+                        "condition": {"type": "predicate_equal",
+                            "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                            "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}}},
+                    "right": {"name": "LINEITEM", "type": "table"},
                     "condition": {"type": "predicate_equal",
-                        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-                        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}}},
-                "right": {"name": "LINEITEM", "type": "table"},
-                "condition": {"type": "predicate_equal",
-                    "left": {"type": "column", "name": "O_ORDERKEY", "tableName": "ORDERS"},
-                    "right": {"type": "column", "name": "L_ORDERKEY", "tableName": "LINEITEM"}}},
-            "selectList": [
-                {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-                {"type": "column", "name": "L_QUANTITY", "tableName": "LINEITEM"}],
-        },
-        "schemaMetadataInfo": {"properties": {}, "adapterNotes":
-            serde_json::json!({"TABLE_MAP":
-                {"CUSTOMER": "lh.customer", "ORDERS": "lh.orders", "LINEITEM": "lh.lineitem"}})
-                .to_string()},
-    })
+                        "left": {"type": "column", "name": "O_ORDERKEY", "tableName": "ORDERS"},
+                        "right": {"type": "column", "name": "L_ORDERKEY", "tableName": "LINEITEM"}}},
+                "selectList": [
+                    {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                    {"type": "column", "name": "L_QUANTITY", "tableName": "LINEITEM"}],
+            },
+            "schemaMetadataInfo": {"properties": {}},
+        }),
+        &[
+            ("CUSTOMER", "lh.customer"),
+            ("ORDERS", "lh.orders"),
+            ("LINEITEM", "lh.lineitem"),
+        ],
+    )
 }
 
 /// NQ3 shape: `((PART ⋈ PARTSUPP) ⋈ SUPPLIER) ⋈ NATION`.
 pub(super) fn nq3_join_request() -> Json {
-    serde_json::json!({
-        "involvedTables": [
-            {"name": "PART", "columns": [
-                {"name": "P_PARTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "P_NAME", "dataType": {"type": "varchar", "size": 100}}]},
-            {"name": "PARTSUPP", "columns": [
-                {"name": "PS_PARTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "PS_SUPPKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "PS_AVAILQTY", "dataType": {"type": "decimal", "precision": 15, "scale": 0}}]},
-            {"name": "SUPPLIER", "columns": [
-                {"name": "S_SUPPKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "S_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
-            {"name": "NATION", "columns": [
-                {"name": "N_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "N_NAME", "dataType": {"type": "varchar", "size": 100}}]},
-        ],
-        "pushdownRequest": {
-            "type": "select",
-            "from": {"type": "join", "join_type": "inner",
-                "left": {"type": "join", "join_type": "inner",
+    with_identifier_notes(
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "PART", "columns": [
+                    {"name": "P_PARTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "P_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "PARTSUPP", "columns": [
+                    {"name": "PS_PARTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "PS_SUPPKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "PS_AVAILQTY", "dataType": {"type": "decimal", "precision": 15, "scale": 0}}]},
+                {"name": "SUPPLIER", "columns": [
+                    {"name": "S_SUPPKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "S_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+                {"name": "NATION", "columns": [
+                    {"name": "N_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "N_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
                     "left": {"type": "join", "join_type": "inner",
-                        "left": {"name": "PART", "type": "table"},
-                        "right": {"name": "PARTSUPP", "type": "table"},
+                        "left": {"type": "join", "join_type": "inner",
+                            "left": {"name": "PART", "type": "table"},
+                            "right": {"name": "PARTSUPP", "type": "table"},
+                            "condition": {"type": "predicate_equal",
+                                "left": {"type": "column", "name": "P_PARTKEY", "tableName": "PART"},
+                                "right": {"type": "column", "name": "PS_PARTKEY", "tableName": "PARTSUPP"}}},
+                        "right": {"name": "SUPPLIER", "type": "table"},
                         "condition": {"type": "predicate_equal",
-                            "left": {"type": "column", "name": "P_PARTKEY", "tableName": "PART"},
-                            "right": {"type": "column", "name": "PS_PARTKEY", "tableName": "PARTSUPP"}}},
-                    "right": {"name": "SUPPLIER", "type": "table"},
+                            "left": {"type": "column", "name": "PS_SUPPKEY", "tableName": "PARTSUPP"},
+                            "right": {"type": "column", "name": "S_SUPPKEY", "tableName": "SUPPLIER"}}},
+                    "right": {"name": "NATION", "type": "table"},
                     "condition": {"type": "predicate_equal",
-                        "left": {"type": "column", "name": "PS_SUPPKEY", "tableName": "PARTSUPP"},
-                        "right": {"type": "column", "name": "S_SUPPKEY", "tableName": "SUPPLIER"}}},
-                "right": {"name": "NATION", "type": "table"},
-                "condition": {"type": "predicate_equal",
-                    "left": {"type": "column", "name": "S_NATIONKEY", "tableName": "SUPPLIER"},
-                    "right": {"type": "column", "name": "N_NATIONKEY", "tableName": "NATION"}}},
-            "selectList": [
-                {"type": "column", "name": "P_NAME", "tableName": "PART"},
-                {"type": "column", "name": "PS_AVAILQTY", "tableName": "PARTSUPP"},
-                {"type": "column", "name": "N_NAME", "tableName": "NATION"}],
-        },
-        "schemaMetadataInfo": {"properties": {}, "adapterNotes":
-            serde_json::json!({"TABLE_MAP": {
-                "PART": "lh.part", "PARTSUPP": "lh.partsupp",
-                "SUPPLIER": "lh.supplier", "NATION": "lh.nation"}})
-                .to_string()},
-    })
+                        "left": {"type": "column", "name": "S_NATIONKEY", "tableName": "SUPPLIER"},
+                        "right": {"type": "column", "name": "N_NATIONKEY", "tableName": "NATION"}}},
+                "selectList": [
+                    {"type": "column", "name": "P_NAME", "tableName": "PART"},
+                    {"type": "column", "name": "PS_AVAILQTY", "tableName": "PARTSUPP"},
+                    {"type": "column", "name": "N_NAME", "tableName": "NATION"}],
+            },
+            "schemaMetadataInfo": {"properties": {}},
+        }),
+        &[
+            ("PART", "lh.part"),
+            ("PARTSUPP", "lh.partsupp"),
+            ("SUPPLIER", "lh.supplier"),
+            ("NATION", "lh.nation"),
+        ],
+    )
 }
 
 /// `None` omits both the leaf's `alias` and the columns' `tableAlias`, as Exasol does for an
@@ -186,20 +192,22 @@ pub(super) fn self_join_request(leg_aliases: &[Option<&str>]) -> Json {
         });
     }
 
-    serde_json::json!({
-        "involvedTables": [
-            {"name": "FACT_ORDERS", "columns": [
-                {"name": "O_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
-        ],
-        "pushdownRequest": {
-            "type": "select",
-            "from": from,
-            "selectList": [order_key(leg_aliases[0])],
-        },
-        "schemaMetadataInfo": {"properties": {}, "adapterNotes":
-            serde_json::json!({"TABLE_MAP": {"FACT_ORDERS": "lh.fact_orders"}}).to_string()},
-    })
+    with_identifier_notes(
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "FACT_ORDERS", "columns": [
+                    {"name": "O_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": from,
+                "selectList": [order_key(leg_aliases[0])],
+            },
+            "schemaMetadataInfo": {"properties": {}},
+        }),
+        &[("FACT_ORDERS", "lh.fact_orders")],
+    )
 }
 
 pub(super) fn detected_join(request: &Json) -> DetectedJoin {
@@ -312,33 +320,34 @@ fn delta_join_request_over(
     orders_columns: Json,
     select_list: Json,
 ) -> Json {
-    serde_json::json!({
-        "involvedTables": [
-            {"name": "CUSTOMER", "columns": customer_columns},
-            {"name": "ORDERS", "columns": orders_columns},
-        ],
-        "pushdownRequest": {
-            "type": "select",
-            "from": {
-                "type": "join",
-                "join_type": "inner",
-                "left": {"name": "CUSTOMER", "type": "table"},
-                "right": {"name": "ORDERS", "type": "table"},
-                "condition": {
-                    "type": "predicate_equal",
-                    "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-                    "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+    with_identifier_notes(
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "CUSTOMER", "columns": customer_columns},
+                {"name": "ORDERS", "columns": orders_columns},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {
+                    "type": "join",
+                    "join_type": "inner",
+                    "left": {"name": "CUSTOMER", "type": "table"},
+                    "right": {"name": "ORDERS", "type": "table"},
+                    "condition": {
+                        "type": "predicate_equal",
+                        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+                    },
                 },
+                "selectList": select_list,
             },
-            "selectList": select_list,
-        },
-        "schemaMetadataInfo": {
-            "properties": {},
-            "adapterNotes": serde_json::json!({
-                "TABLE_MAP": {"CUSTOMER": "cat.sch.customer", "ORDERS": "cat.sch.orders"}
-            }).to_string(),
-        },
-    })
+            "schemaMetadataInfo": {"properties": {}},
+        }),
+        &[
+            ("CUSTOMER", "cat.sch.customer"),
+            ("ORDERS", "cat.sch.orders"),
+        ],
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

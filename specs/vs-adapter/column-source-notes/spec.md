@@ -58,7 +58,7 @@ When a virtual schema is created, refreshed, or has its properties set, the adap
 ### Scenario: Refresh and set properties rebuild every column note from the source
 
 * *GIVEN* an Iceberg virtual table created over a table with columns `id` and `score`, whose source column `score` is then renamed to `rating` and gains a sibling column `extra`
-* *WHEN* Exasol sends a `refresh` request, and separately a `setProperties` request
+* *WHEN* Exasol sends a `refresh` request that carries no `requestedTables`, a `refresh` request whose `requestedTables` names the table, and separately a `setProperties` request
 * *THEN* each response SHALL declare `ID`, `RATING`, and `EXTRA`, and each column's note SHALL hold the shape the source declares now, so the note of `RATING` carries the source name `rating` and the field id that `score` carried
 * *AND* the adapter SHALL build every note from the re-enumerated source and MUST NOT copy or patch a note from the previous response
 

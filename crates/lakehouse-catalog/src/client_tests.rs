@@ -48,6 +48,33 @@ impl FixedCatalogClient {
             properties: Default::default(),
         }
     }
+
+    fn listing(namespace: Vec<String>) -> CatalogListing {
+        CatalogListing {
+            tables: vec![
+                Self::iceberg_table(namespace.clone()),
+                Self::unity_delta_table(namespace.clone()),
+            ],
+            skipped: vec![
+                SkippedTable {
+                    ident: CatalogTableIdent {
+                        namespace: namespace.clone(),
+                        name: "not_a_table".to_string(),
+                    },
+                    reason: SkipReason::NotLoadableIcebergTable,
+                },
+                SkippedTable {
+                    ident: CatalogTableIdent {
+                        namespace,
+                        name: "orders_summary".to_string(),
+                    },
+                    reason: SkipReason::NotDeltaBaseTable {
+                        detail: "table_type=VIEW".to_string(),
+                    },
+                },
+            ],
+        }
+    }
 }
 
 impl CatalogClient for FixedCatalogClient {
@@ -55,32 +82,49 @@ impl CatalogClient for FixedCatalogClient {
         &self,
         namespace: &[String],
     ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
-        let namespace = namespace.to_vec();
+        let listing = Self::listing(namespace.to_vec());
+        Box::pin(async move { Ok(listing) })
+    }
+
+    fn list_table_idents(
+        &self,
+        namespace: &[String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogTableIdent>, UdfError>> + Send + '_>> {
+        let listing = Self::listing(namespace.to_vec());
         Box::pin(async move {
-            Ok(CatalogListing {
-                tables: vec![
-                    Self::iceberg_table(namespace.clone()),
-                    Self::unity_delta_table(namespace.clone()),
-                ],
-                skipped: vec![
-                    SkippedTable {
-                        ident: CatalogTableIdent {
-                            namespace: namespace.clone(),
-                            name: "not_a_table".to_string(),
-                        },
-                        reason: SkipReason::NotLoadableIcebergTable,
-                    },
-                    SkippedTable {
-                        ident: CatalogTableIdent {
-                            namespace,
-                            name: "orders_summary".to_string(),
-                        },
-                        reason: SkipReason::NotDeltaBaseTable {
-                            detail: "table_type=VIEW".to_string(),
-                        },
-                    },
-                ],
-            })
+            Ok(listing
+                .tables
+                .into_iter()
+                .map(|table| table.ident)
+                .chain(listing.skipped.into_iter().map(|entry| entry.ident))
+                .collect())
+        })
+    }
+
+    fn load_listed_tables(
+        &self,
+        idents: &[CatalogTableIdent],
+    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
+        let idents = idents.to_vec();
+        Box::pin(async move {
+            Ok(idents
+                .into_iter()
+                .filter_map(|ident| {
+                    let listing = Self::listing(ident.namespace.clone());
+                    let admitted = listing
+                        .tables
+                        .into_iter()
+                        .find(|table| table.ident == ident)
+                        .map(TableAdmission::Admitted);
+                    admitted.or_else(|| {
+                        listing
+                            .skipped
+                            .into_iter()
+                            .find(|entry| entry.ident == ident)
+                            .map(TableAdmission::Skipped)
+                    })
+                })
+                .collect())
         })
     }
 
@@ -179,6 +223,40 @@ fn a_boxed_catalog_client_is_send_and_sync() {
 
     requires_send_sync::<dyn CatalogClient>();
     requires_send_sync::<Box<dyn CatalogClient>>();
+}
+
+#[test]
+fn a_listing_collected_from_admissions_keeps_listing_order_within_each_set() {
+    let namespace = vec!["prod".to_string()];
+    let skipped = |name: &str| SkippedTable {
+        ident: CatalogTableIdent {
+            namespace: namespace.clone(),
+            name: name.to_string(),
+        },
+        reason: SkipReason::NoDataFile,
+    };
+    let mut payments = FixedCatalogClient::iceberg_table(namespace.clone());
+    payments.ident.name = "payments".to_string();
+
+    let listing: CatalogListing = [
+        TableAdmission::Skipped(skipped("b_empty")),
+        TableAdmission::Admitted(FixedCatalogClient::iceberg_table(namespace.clone())),
+        TableAdmission::Skipped(skipped("a_empty")),
+        TableAdmission::Admitted(payments.clone()),
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(
+        listing,
+        CatalogListing {
+            tables: vec![
+                FixedCatalogClient::iceberg_table(namespace.clone()),
+                payments
+            ],
+            skipped: vec![skipped("b_empty"), skipped("a_empty")],
+        }
+    );
 }
 
 #[tokio::test]
@@ -328,6 +406,7 @@ fn oauth_creds() -> ConnectionCreds {
     creds
 }
 
+/// Scenario: A scoped refresh lists Iceberg identifiers and loads the requested tables on one session
 #[tokio::test]
 async fn empty_namespace_builds_no_session_and_no_grant() {
     let client =
@@ -364,6 +443,7 @@ async fn list_tables_over_empty_namespace_lists_nothing() {
     );
 }
 
+/// Scenario: A scoped refresh lists Iceberg identifiers and loads the requested tables on one session
 #[tokio::test]
 async fn enumeration_builds_exactly_one_session() {
     let (uri, log) =

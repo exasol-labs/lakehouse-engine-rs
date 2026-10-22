@@ -236,15 +236,20 @@ fn string_data_type() -> Json {
     json!({ "type": "varchar", "size": 2000000 })
 }
 
-fn table_map(response: &Json) -> serde_json::Map<String, Json> {
-    let notes_str = response["schemaMetadata"]["adapterNotes"]
-        .as_str()
-        .expect("adapterNotes is a JSON string");
-    let notes: Json = serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
-    notes[NOTE_TABLE_MAP]
-        .as_object()
-        .expect("TABLE_MAP must be a JSON object")
-        .clone()
+fn identifier_notes(response: &Json) -> serde_json::Map<String, Json> {
+    response_tables(response)
+        .iter()
+        .map(|table| {
+            let note = table["adapterNotes"]
+                .as_str()
+                .expect("every table carries an identifier note");
+            let note: Json = serde_json::from_str(note).expect("the note is valid JSON");
+            (
+                table["name"].as_str().unwrap().to_string(),
+                note["name"].clone(),
+            )
+        })
+        .collect()
 }
 
 #[test]
@@ -371,7 +376,7 @@ fn lists_managed_external_shallow_clone_and_parquet_base_tables() {
         2
     );
 
-    let map = table_map(&response);
+    let map = identifier_notes(&response);
     assert!(map.contains_key("ORDERS"));
     assert!(map.contains_key("CUSTOMERS"));
     assert!(map.contains_key("ORDERS_CLONE"));
@@ -407,19 +412,19 @@ fn excludes_view_non_delta_and_other_type_entries() {
     assert_eq!(names.len(), 1, "only the Delta base table is listed");
     assert!(names.contains(&"ORDERS"));
 
-    let map = table_map(&response);
+    let map = identifier_notes(&response);
     assert!(map.contains_key("ORDERS"));
     assert!(
         !map.contains_key("ORDERS_SUMMARY"),
-        "the view is excluded from TABLE_MAP"
+        "the view carries no identifier note"
     );
     assert!(
         !map.contains_key("ORDERS_RAW"),
-        "the non-Delta-format table is excluded from TABLE_MAP"
+        "the non-Delta-format table carries no identifier note"
     );
     assert!(
         !map.contains_key("ORDERS_STREAM"),
-        "the other-table_type entry is excluded from TABLE_MAP"
+        "the other-table_type entry carries no identifier note"
     );
 
     assert_eq!(mock.get_table_call_count(), 0);
@@ -445,15 +450,12 @@ fn excluding_every_entry_yields_an_empty_but_successful_schema() {
         response_tables(&response).is_empty(),
         "no entry survives the Delta-base filter"
     );
-    assert!(
-        table_map(&response).is_empty(),
-        "TABLE_MAP carries no entry for an all-excluded namespace"
-    );
     assert_eq!(mock.get_table_call_count(), 0);
 }
 
+/// Scenario: Create virtual schema records each table's Unity Catalog identifier in its identifier note
 #[test]
-fn records_table_map_and_rejects_collision() {
+fn records_identifier_notes_and_rejects_collision() {
     let happy = MockUnityCatalog::start(|req| {
         if req.is_get_table_call() {
             return unexpected_get_table();
@@ -466,11 +468,11 @@ fn records_table_map_and_rejects_collision() {
     });
 
     let response = create_vs_over(&happy).expect("Unity createVirtualSchema must succeed");
-    let map = table_map(&response);
+    let map = identifier_notes(&response);
     assert_eq!(
         map.get("ORDERS").and_then(|v| v.as_str()),
         Some("sales_catalog.public.orders"),
-        "TABLE_MAP maps the uppercased name to the original-cased identifier"
+        "the note records the original-cased identifier"
     );
     assert_eq!(
         map.get("CUSTOMERS").and_then(|v| v.as_str()),

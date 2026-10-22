@@ -709,6 +709,16 @@ Two cases break a query that worked before:
 - An Iceberg `binary` column that holds UTF-8 text is now refused.
 - A direct-storage column that a legacy writer such as Impala or Hive stored as an unannotated `BYTE_ARRAY` string is now refused. Rewrite the file with the Parquet `STRING` annotation to read it.
 
+## Refreshing named tables
+
+`ALTER VIRTUAL SCHEMA <name> REFRESH TABLES <table> [<table> ...]` re-declares only the named tables, and every other virtual table keeps its declaration. Separate the names with spaces. The adapter lists only the source's table names, then loads the metadata of the named tables alone. A table that fails to load, or a name collision among tables, therefore fails the statement only when the statement names that table or that name. A named table resolves exactly as a plain `REFRESH` resolves it, including every catalog identifier that folds to the name.
+
+- A named table the source lists and loads is re-declared, or created when it has no virtual table yet.
+- A named table the source no longer lists, or now skips, loses its virtual table.
+- A name that matches no table changes nothing and does not fail the statement.
+
+A `REFRESH TABLES` after an upgrade writes the identifier note of the named tables only. Run one plain `ALTER VIRTUAL SCHEMA <name> REFRESH` after the upgrade, so every table gets its note. A plain `REFRESH` also picks up every new table of the source.
+
 ## Reading SKIPPED_TABLES
 
 Every catalog kind records the entries its listing skips. The adapter writes one warning line per skip. It also stores the skips in the `SKIPPED_TABLES` entry of the virtual schema's adapter notes. Read them with:
@@ -725,9 +735,21 @@ SELECT ADAPTER_NOTES FROM EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = 'MY_LAKEHO
 | Unity Catalog and Glue | The catalog value that decided the skip, for example `table_type=VIEW` or `InputFormat=org.apache.hadoop.hive.ql.io.orc.OrcInputFormat` |
 | Direct storage | `holds no data file` |
 
-A listing that skips nothing records an empty array, and a refresh replaces the previous array. A namespace whose every entry is skipped still creates an empty virtual schema.
+A listing that skips nothing records an empty array, and a plain refresh replaces the previous array. A namespace whose every entry is skipped still creates an empty virtual schema.
 
-Exasol rejects an `ADAPTER_NOTES` value longer than 2,000,000 bytes. The adapter therefore keeps the longest prefix of `SKIPPED_TABLES`, in listing order, that fits. It records the number of dropped entries in `SKIPPED_TABLES_OMITTED`, a string. The entry exists only when the count is above zero, and a refresh removes it once every skip fits. The warning lines still name every skip. The cap never applies to `TABLE_MAP`.
+A `REFRESH TABLES` merges `SKIPPED_TABLES` with the persisted array instead of replacing it. A named table contributes the skip its fresh load gives it, or none when it loads. An unnamed table keeps its persisted entry only while the source still lists it. An entry whose table the source no longer lists is dropped. An unnamed table is not loaded, so its entry can be stale until the next plain `REFRESH`.
+
+Exasol rejects an `ADAPTER_NOTES` value longer than 2,000,000 bytes. The adapter therefore keeps the longest prefix of `SKIPPED_TABLES`, in listing order, that fits. It records the number of dropped entries in `SKIPPED_TABLES_OMITTED`, a string. The entry exists only when the count is above zero, and a plain refresh removes it once every skip fits. The warning lines still name every skip. A `REFRESH TABLES` adds the persisted count to the entries its own cap drops, so after it `SKIPPED_TABLES_OMITTED` is an upper bound until the next plain `REFRESH`.
+
+## Reading a table's catalog identifier
+
+Each virtual table records its catalog identifier in its own adapter notes, in the `name` member of a JSON object. Read it with:
+
+```sql
+SELECT TABLE_NAME, ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_TABLES WHERE TABLE_SCHEMA = 'MY_LAKEHOUSE';
+```
+
+Iceberg REST, Unity Catalog, and Glue record the dot-joined namespace and table name, for example `{"name":"sales.orders"}`. Direct storage records the original-cased directory name alone. A pushdown reads the identifier from this note, so a table without one fails with an error that names the table and `ALTER VIRTUAL SCHEMA ... REFRESH`.
 
 ## Addressing
 

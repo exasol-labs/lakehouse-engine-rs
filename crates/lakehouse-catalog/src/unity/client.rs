@@ -9,7 +9,8 @@ use serde::de::DeserializeOwned;
 use crate::redaction::redact_error_text;
 use crate::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogTable, CatalogTableIdent,
-    CatalogTableType, ColumnSourceType, ConnectionCreds, SkipReason, SkippedTable, TableFormat,
+    CatalogTableType, ColumnSourceType, ConnectionCreds, SkipReason, SkippedTable, TableAdmission,
+    TableFormat,
 };
 
 use super::auth::{UnityAuth, resolve_unity_auth};
@@ -62,14 +63,26 @@ impl UnityCatalogSession {
         schema: &str,
     ) -> Result<Vec<TableInfo>, UdfError> {
         let url = format!("{}/tables", self.base_url);
-        // `omit_columns` stays unset: the inline `columns[]` is the column source,
-        // avoiding a per-table get-table.
+        // The full listing leaves `omit_columns` unset: its inline `columns[]` is the column
+        // source, avoiding a per-table get-table.
         self.collect_pages::<TablesPage>(
             &url,
             &[("catalog_name", catalog), ("schema_name", schema)],
             "list tables",
         )
         .await
+    }
+
+    async fn list_table_names(&self, catalog: &str, schema: &str) -> Result<Vec<String>, UdfError> {
+        let url = format!("{}/tables", self.base_url);
+        let names = self
+            .collect_pages::<TableNamesPage>(
+                &url,
+                &identifier_listing_query(catalog, schema),
+                "list table names",
+            )
+            .await?;
+        Ok(names.into_iter().map(|entry| entry.name).collect())
     }
 
     async fn get_table_info(&self, full_name: &str) -> Result<TableInfo, UdfError> {
@@ -169,19 +182,49 @@ impl CatalogClient for UnityCatalogSession {
         Box::pin(async move {
             let (catalog, schema) = unity_namespace(&namespace)?;
             let infos = self.list_table_infos(catalog, schema).await?;
-            let mut tables = Vec::new();
-            let mut skipped = Vec::new();
-            for info in infos {
-                let ident = CatalogTableIdent {
+            Ok(infos
+                .into_iter()
+                .map(|info| {
+                    let ident = CatalogTableIdent {
+                        namespace: namespace.clone(),
+                        name: info.name.clone(),
+                    };
+                    admit(ident, info)
+                })
+                .collect())
+        })
+    }
+
+    fn list_table_idents(
+        &self,
+        namespace: &[String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogTableIdent>, UdfError>> + Send + '_>> {
+        let namespace = namespace.to_vec();
+        Box::pin(async move {
+            let (catalog, schema) = unity_namespace(&namespace)?;
+            let names = self.list_table_names(catalog, schema).await?;
+            Ok(names
+                .into_iter()
+                .map(|name| CatalogTableIdent {
                     namespace: namespace.clone(),
-                    name: info.name.clone(),
-                };
-                match admission(&info.table_type, info.data_source_format.as_deref()) {
-                    Err(reason) => skipped.push(SkippedTable { ident, reason }),
-                    Ok(format) => tables.push(neutral_table(ident, info, format)),
-                }
+                    name,
+                })
+                .collect())
+        })
+    }
+
+    fn load_listed_tables(
+        &self,
+        idents: &[CatalogTableIdent],
+    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
+        let idents = idents.to_vec();
+        Box::pin(async move {
+            let mut admissions = Vec::with_capacity(idents.len());
+            for ident in idents {
+                let info = self.get_table_info(&full_name(&ident)).await?;
+                admissions.push(admit(ident, info));
             }
-            Ok(CatalogListing { tables, skipped })
+            Ok(admissions.into_iter().collect())
         })
     }
 
@@ -206,6 +249,25 @@ fn unity_namespace(namespace: &[String]) -> Result<(&str, &str), UdfError> {
             "a Unity Catalog namespace must name a catalog and a schema (two segments), but {} were given",
             namespace.len()
         ))),
+    }
+}
+
+/// Databricks and OSS Unity Catalog honor all three omissions and keep each entry's `name`.
+fn identifier_listing_query<'a>(catalog: &'a str, schema: &'a str) -> [(&'static str, &'a str); 5] {
+    [
+        ("catalog_name", catalog),
+        ("schema_name", schema),
+        ("omit_columns", "true"),
+        ("omit_properties", "true"),
+        ("omit_username", "true"),
+    ]
+}
+
+/// The one admission rule both listings share, so `SKIPPED_TABLES` reads the same after either.
+fn admit(ident: CatalogTableIdent, info: TableInfo) -> TableAdmission {
+    match admission(&info.table_type, info.data_source_format.as_deref()) {
+        Err(reason) => TableAdmission::Skipped(SkippedTable { ident, reason }),
+        Ok(format) => TableAdmission::Admitted(neutral_table(ident, info, format)),
     }
 }
 
@@ -341,6 +403,29 @@ impl PagedResponse for TablesPage {
     fn next_page_token(&self) -> Option<String> {
         self.next_page_token.clone()
     }
+}
+
+#[derive(Deserialize)]
+struct TableNamesPage {
+    #[serde(default)]
+    tables: Vec<TableName>,
+    #[serde(default)]
+    next_page_token: Option<String>,
+}
+
+impl PagedResponse for TableNamesPage {
+    type Item = TableName;
+    fn into_items(self) -> Vec<TableName> {
+        self.tables
+    }
+    fn next_page_token(&self) -> Option<String> {
+        self.next_page_token.clone()
+    }
+}
+
+#[derive(Deserialize)]
+struct TableName {
+    name: String,
 }
 
 /// `storage_location` and `data_source_format` are optional because a VIEW

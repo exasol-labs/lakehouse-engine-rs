@@ -5,8 +5,8 @@ use crate::common::e2e_harness::{
     VARCHAR_JSON, VsProps, assert_decimal_orders_numerically, assert_notes_well_formed,
     assert_query_fails, assert_refused_column, assert_type_matrix, column_adapter_notes,
     create_virtual_schema_with_password, declared_type, exa_conn, explain_virtual_sql,
-    has_broadcast_join_block, note_of, nullable_text, parse_int, parse_numeric,
-    partition_positions, reads, refuses, skip_reason, text_column,
+    has_broadcast_join_block, identifier_note, note_of, nullable_text, parse_int, parse_numeric,
+    partition_positions, reads, refuses, skip_reason, skipped_entries, text_column,
     try_create_virtual_schema_with_password, value_to_string,
 };
 use crate::common::exasol_ws::ExaConn;
@@ -52,6 +52,8 @@ const BASE_INCOMPATIBLE: &str = "s3://warehouse/direct_incompatible/";
 const BASE_DISCOVERY: &str = "s3://warehouse/direct_discovery/";
 const BASE_COLLISION_MISSING: &str = "s3://warehouse/direct_hive_collision_missing/";
 const BASE_REFRESH: &str = "s3://warehouse/direct_refresh/";
+/// Its own base path: its name collision fails every full REFRESH of the base path it uses.
+const BASE_REFRESH_NAMES: &str = "s3://warehouse/direct_refresh_names/";
 
 const VS_DIRECT: &str = "DIRECT_LAKEHOUSE";
 const VS_DIRECT_NARROW: &str = "DIRECT_LAKEHOUSE_NARROW";
@@ -63,12 +65,14 @@ const VS_DISCOVERY_EMPTY_NS: &str = "DIRECT_DISCOVERY_EMPTY_NS_VS";
 const VS_COLLISION_MISSING: &str = "DIRECT_HIVE_COLLISION_MISSING";
 const VS_COLLISION_MISSING_HIVE_OFF: &str = "DIRECT_HIVE_COLLISION_MISSING_OFF";
 const VS_REFRESH: &str = "DIRECT_REFRESH_VS";
+const VS_REFRESH_NAMES: &str = "DIRECT_REFRESH_NAMES_VS";
 
 const CONN_DIRECT: &str = "DIRECT_STORAGE_CREDS";
 const CONN_INCOMPATIBLE: &str = "DIRECT_STORAGE_INCOMPATIBLE_CREDS";
 const CONN_DISCOVERY: &str = "DIRECT_STORAGE_DISCOVERY_CREDS";
 const CONN_COLLISION_MISSING: &str = "DIRECT_STORAGE_COLLISION_MISSING_CREDS";
 const CONN_REFRESH: &str = "DIRECT_STORAGE_REFRESH_CREDS";
+const CONN_REFRESH_NAMES: &str = "DIRECT_STORAGE_REFRESH_NAMES_CREDS";
 
 /// No `warehouse`: the direct-storage kind rejects that field.
 fn direct_storage_password() -> CatalogConnectionPassword {
@@ -2796,8 +2800,8 @@ fn over_limit_column_note_fails_create_and_refresh() {
     }
 }
 
-fn refresh_key(key: &str) -> String {
-    format!("{BASE_REFRESH}{key}")
+fn refresh_key(base: &str, key: &str) -> String {
+    format!("{base}{key}")
 }
 
 fn int64_column(values: &[i64]) -> ArrayRef {
@@ -2808,16 +2812,17 @@ fn utf8_column(values: &[&str]) -> ArrayRef {
     Arc::new(StringArray::from(values.to_vec()))
 }
 
-fn put_refresh_file(key: &str, columns: Vec<(&str, ArrayRef)>) {
+fn put_refresh_file(base: &str, key: &str, columns: Vec<(&str, ArrayRef)>) {
     let batch = RecordBatch::try_from_iter_with_nullable(
         columns.into_iter().map(|(name, array)| (name, array, true)),
     )
     .unwrap_or_else(|e| panic!("build the refresh fixture batch for {key}: {e}"));
-    write_parquet_fixture(&refresh_key(key), batch);
+    write_parquet_fixture(&refresh_key(base, key), batch);
 }
 
 fn write_refresh_initial_objects() {
     put_refresh_file(
+        BASE_REFRESH,
         "t_append/file1.parquet",
         vec![
             ("ID", int64_column(&[1, 2])),
@@ -2825,6 +2830,7 @@ fn write_refresh_initial_objects() {
         ],
     );
     put_refresh_file(
+        BASE_REFRESH,
         "t_evolve/file1.parquet",
         vec![
             ("ID", int64_column(&[1, 2])),
@@ -2833,22 +2839,39 @@ fn write_refresh_initial_objects() {
         ],
     );
     put_refresh_file(
+        BASE_REFRESH,
         "t_hive/p1.parquet",
         vec![("ID", int64_column(&[1])), ("LABEL", utf8_column(&["h1"]))],
     );
-    put_refresh_file("t_emptied/file1.parquet", vec![("ID", int64_column(&[1]))]);
+    put_refresh_file(
+        BASE_REFRESH,
+        "t_emptied/file1.parquet",
+        vec![("ID", int64_column(&[1]))],
+    );
     put_fixture_object(
-        &refresh_key("t_emptied/_SUCCESS"),
+        &refresh_key(BASE_REFRESH, "t_emptied/_SUCCESS"),
         Bytes::from_static(b"ok"),
     );
     put_refresh_file(
+        BASE_REFRESH,
         "t_conflict/file1.parquet",
         vec![("ID", int64_column(&[1])), ("X", int64_column(&[42]))],
     );
+    for skipped in REFRESH_SKIP_ONLY_DIRECTORIES {
+        put_fixture_object(
+            &refresh_key(BASE_REFRESH, &format!("{skipped}/_SUCCESS")),
+            Bytes::from_static(b"ok"),
+        );
+    }
 }
+
+/// Directories that hold only a `_SUCCESS` object, so every listing skips them.
+const REFRESH_SKIP_ONLY_DIRECTORIES: [&str; 4] =
+    ["t_gone_req", "t_gone_unreq", "t_skip_req", "t_skip_unreq"];
 
 fn write_refresh_stage_one_objects() {
     put_refresh_file(
+        BASE_REFRESH,
         "t_new/file1.parquet",
         vec![
             ("ID", int64_column(&[100])),
@@ -2856,10 +2879,12 @@ fn write_refresh_stage_one_objects() {
         ],
     );
     put_refresh_file(
+        BASE_REFRESH,
         "t_append/file2.parquet",
         vec![("ID", int64_column(&[3])), ("LABEL", utf8_column(&["a3"]))],
     );
     put_refresh_file(
+        BASE_REFRESH,
         "t_evolve/file2.parquet",
         vec![
             ("ID", int64_column(&[3, 4])),
@@ -2869,10 +2894,11 @@ fn write_refresh_stage_one_objects() {
         ],
     );
     put_refresh_file(
+        BASE_REFRESH,
         "t_hive/region=eu/p2.parquet",
         vec![("ID", int64_column(&[2])), ("LABEL", utf8_column(&["h2"]))],
     );
-    delete_fixture_object(&refresh_key("t_emptied/file1.parquet"));
+    delete_fixture_object(&refresh_key(BASE_REFRESH, "t_emptied/file1.parquet"));
 }
 
 fn assert_reads(conn: &mut ExaConn, case: &str, sql: &str, expected: &[&[Option<&str>]]) {
@@ -2911,6 +2937,11 @@ fn assert_fails_naming(conn: &mut ExaConn, case: &str, sql: &str, fragments: &[&
 /// Scenario: Until a refresh, a file the declaration cannot hold fails the query and never returns a wrong value
 /// Scenario: A refresh that a column pair fails keeps the previous declaration queryable
 /// Scenario: A first-level directory holding no data file is skipped, not failed
+/// Scenario: Every skipped table is recorded with its reason under every catalog kind
+/// Scenario: A partial refresh drops a requested virtual table the source no longer serves
+/// Scenario: A partial refresh merges SKIPPED_TABLES with the persisted list
+/// Scenario: A partial refresh loads the metadata of the requested tables only
+/// Scenario: A scoped refresh lists directory names and reads only the requested directories
 #[test]
 fn refresh_tracks_storage_changes_and_a_failed_refresh_keeps_the_schema() {
     setup();
@@ -3086,6 +3117,7 @@ fn refresh_tracks_storage_changes_and_a_failed_refresh_keeps_the_schema() {
     );
 
     put_refresh_file(
+        BASE_REFRESH,
         "t_conflict/file2.parquet",
         vec![("ID", int64_column(&[2])), ("X", utf8_column(&["hello"]))],
     );
@@ -3154,4 +3186,174 @@ fn refresh_tracks_storage_changes_and_a_failed_refresh_keeps_the_schema() {
             &[None, None, Some("x3"), Some("x4")],
         ],
     );
+
+    put_refresh_file(
+        BASE_REFRESH,
+        "t_append/file3.parquet",
+        vec![
+            ("ID", int64_column(&[4])),
+            ("LABEL", utf8_column(&["a4"])),
+            ("EXTRA", utf8_column(&["x4"])),
+        ],
+    );
+    put_refresh_file(
+        BASE_REFRESH,
+        "t_emptied/file2.parquet",
+        vec![("ID", int64_column(&[5]))],
+    );
+    delete_fixture_object(&refresh_key(BASE_REFRESH, "t_new/file1.parquet"));
+    for gone in ["t_gone_req", "t_gone_unreq"] {
+        delete_fixture_object(&refresh_key(BASE_REFRESH, &format!("{gone}/_SUCCESS")));
+        // SeaweedFS keeps listing an emptied directory until its own key is deleted.
+        delete_fixture_object(&refresh_key(BASE_REFRESH, gone));
+    }
+    let conflict_columns = declared_columns(&mut conn, VS_REFRESH, "T_CONFLICT");
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {VS_REFRESH} REFRESH TABLES T_APPEND T_EMPTIED T_SKIP_REQ T_GONE_REQ"
+    ));
+
+    assert_eq!(
+        declared_columns(&mut conn, VS_REFRESH, "T_APPEND"),
+        ["ID", "LABEL", "EXTRA"],
+        "B: REFRESH TABLES T_APPEND declares the new column"
+    );
+    assert_reads(
+        &mut conn,
+        "B",
+        &format!("SELECT ID FROM {emptied}"),
+        &[&[Some("5")]],
+    );
+    assert_eq!(
+        declared_columns(&mut conn, VS_REFRESH, "T_CONFLICT"),
+        conflict_columns,
+        "B: the unrequested T_CONFLICT keeps its declaration"
+    );
+    assert_reads(
+        &mut conn,
+        "B",
+        &format!("SELECT ID FROM {conflict} ORDER BY ID"),
+        &[&[Some("1"), Some("2")]],
+    );
+    assert!(
+        served_tables(&mut conn, VS_REFRESH).contains(&"T_NEW".to_string()),
+        "B: the unrequested T_NEW stays declared although the listing now skips it"
+    );
+    let own_directories = [
+        "t_emptied",
+        "t_gone_req",
+        "t_gone_unreq",
+        "t_new",
+        "t_skip_req",
+        "t_skip_unreq",
+    ];
+    let recorded: Vec<String> = skipped_entries(&mut conn, VS_REFRESH)
+        .into_iter()
+        .map(|(table, _)| table)
+        .filter(|table| own_directories.contains(&table.as_str()))
+        .collect();
+    assert_eq!(
+        recorded,
+        ["t_skip_req", "t_skip_unreq"],
+        "B: SKIPPED_TABLES keeps the listed skips, fresh or persisted, and drops the rest"
+    );
+
+    delete_fixture_prefix(&refresh_key(BASE_REFRESH, "t_hive/"));
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {VS_REFRESH} REFRESH TABLES T_HIVE"
+    ));
+    assert!(
+        !served_tables(&mut conn, VS_REFRESH).contains(&"T_HIVE".to_string()),
+        "B: REFRESH TABLES drops T_HIVE once its directory holds no data file"
+    );
+    assert_eq!(
+        skip_reason(&mut conn, VS_REFRESH, "t_hive").as_deref(),
+        Some("holds no data file"),
+        "B: SKIPPED_TABLES records the requested t_hive the load skipped"
+    );
+}
+
+/// Scenario: A partial refresh resolves each requested name as a full refresh would
+/// Scenario: Table naming and the identifier note round trip reuse the shared helpers
+/// Scenario: Multi-level Iceberg namespaces flatten deterministically into Exasol table names
+/// Scenario: Create virtual schema records each table's catalog identifier in the table's adapterNotes
+/// Scenario: A scoped refresh lists directory names and reads only the requested directories
+#[test]
+fn refresh_tables_resolves_a_requested_name_as_a_full_refresh_would() {
+    stack();
+    let mut conn = exa_conn();
+    let id_file = |key: &str, id: i64| {
+        put_refresh_file(BASE_REFRESH_NAMES, key, vec![("ID", int64_column(&[id]))]);
+    };
+    let sales = vs_table(VS_REFRESH_NAMES, "SALES");
+
+    delete_fixture_prefix(BASE_REFRESH_NAMES);
+    id_file("Sales/file1.parquet", 1);
+    id_file("other/file1.parquet", 3);
+    put_fixture_object(
+        &refresh_key(BASE_REFRESH_NAMES, "sales/_SUCCESS"),
+        Bytes::from_static(b"ok"),
+    );
+    create_direct_vs(
+        &mut conn,
+        VS_REFRESH_NAMES,
+        CONN_REFRESH_NAMES,
+        BASE_REFRESH_NAMES,
+    );
+    for (table, directory) in [("SALES", "Sales"), ("OTHER", "other")] {
+        assert_eq!(
+            identifier_note(&mut conn, VS_REFRESH_NAMES, table).as_deref(),
+            Some(directory),
+            "CREATE records {table}'s original-cased directory name"
+        );
+    }
+
+    let refresh_sales = format!("ALTER VIRTUAL SCHEMA {VS_REFRESH_NAMES} REFRESH TABLES SALES");
+    conn.execute(&refresh_sales);
+    assert_eq!(
+        skip_reason(&mut conn, VS_REFRESH_NAMES, "sales").as_deref(),
+        Some("holds no data file"),
+        "REFRESH TABLES SALES loads the skipped sales and collides it with nothing"
+    );
+    assert_reads(
+        &mut conn,
+        "Sales",
+        &format!("SELECT ID FROM {sales}"),
+        &[&[Some("1")]],
+    );
+
+    id_file("sales/file1.parquet", 2);
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {VS_REFRESH_NAMES} REFRESH TABLES OTHER"
+    ));
+    let collision = ["collision", "'SALES'", "'Sales'", "'sales'"];
+    assert_fails_naming(&mut conn, "partial", &refresh_sales, &collision);
+    assert_fails_naming(
+        &mut conn,
+        "full",
+        &format!("ALTER VIRTUAL SCHEMA {VS_REFRESH_NAMES} REFRESH"),
+        &collision,
+    );
+
+    delete_fixture_prefix(&refresh_key(BASE_REFRESH_NAMES, "Sales/"));
+    conn.execute(&refresh_sales);
+    assert_eq!(
+        identifier_note(&mut conn, VS_REFRESH_NAMES, "SALES").as_deref(),
+        Some("sales"),
+        "REFRESH TABLES SALES resolves the name afresh, not from the previous note"
+    );
+    assert_reads(
+        &mut conn,
+        "sales",
+        &format!("SELECT ID FROM {sales}"),
+        &[&[Some("2")]],
+    );
+
+    conn.execute(&format!("ALTER VIRTUAL SCHEMA {VS_REFRESH_NAMES} REFRESH"));
+    for (table, directory) in [("SALES", "sales"), ("OTHER", "other")] {
+        assert_eq!(
+            identifier_note(&mut conn, VS_REFRESH_NAMES, table).as_deref(),
+            Some(directory),
+            "a full REFRESH keeps {table} on {directory}"
+        );
+    }
 }

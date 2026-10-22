@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use aws_sdk_glue::error::{ProvideErrorMetadata, SdkError};
-use aws_sdk_glue::types::{Column, Table};
+use aws_sdk_glue::types::{Column, Table, TableAttributes};
 use exasol_udf_sdk::error::UdfError;
 use futures::{StreamExt, TryStreamExt, stream};
 
@@ -13,8 +13,8 @@ use crate::sigv4::required_signing_region;
 use crate::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogPartition, CatalogTable,
     CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds, PartitionFormat,
-    SkipReason, SkippedTable, StorageBackend, TableFormat, catalog_identifier_string,
-    read_iceberg_metadata_file,
+    SkipReason, SkippedTable, StorageBackend, TableAdmission, TableFormat,
+    catalog_identifier_string, read_iceberg_metadata_file,
 };
 
 use super::partitions::neutral_partition;
@@ -103,7 +103,11 @@ impl GlueCatalogSession {
         }
     }
 
-    async fn tables(&self, database: &str) -> Result<Vec<Table>, UdfError> {
+    async fn tables(
+        &self,
+        database: &str,
+        attributes: Option<Vec<TableAttributes>>,
+    ) -> Result<Vec<Table>, UdfError> {
         let mut tables = Vec::new();
         let mut token = None;
         loop {
@@ -112,6 +116,7 @@ impl GlueCatalogSession {
                 .get_tables()
                 .set_catalog_id(self.catalog_id.clone())
                 .database_name(database)
+                .set_attributes_to_get(attributes.clone())
                 .set_next_token(token.take())
                 .send()
                 .await
@@ -123,6 +128,39 @@ impl GlueCatalogSession {
             if token.is_none() {
                 return Ok(tables);
             }
+        }
+    }
+
+    async fn get_table(&self, ident: &CatalogTableIdent) -> Result<Table, UdfError> {
+        let database = glue_database(&ident.namespace)?;
+        let subject = table_subject(ident);
+        self.client
+            .get_table()
+            .set_catalog_id(self.catalog_id.clone())
+            .database_name(database)
+            .name(&ident.name)
+            .send()
+            .await
+            .map_err(|error| self.glue_error("GetTable", &subject, &error))?
+            .table
+            .ok_or_else(|| UdfError::User(format!("Glue GetTable returned no table for {subject}")))
+    }
+
+    /// The one admission rule both listings share, so `SKIPPED_TABLES` reads the same after either.
+    async fn admit(
+        &self,
+        ident: CatalogTableIdent,
+        table: Table,
+    ) -> Result<TableAdmission, UdfError> {
+        match route_of(&table) {
+            Route::Skip(detail) => Ok(TableAdmission::Skipped(SkippedTable {
+                ident,
+                reason: SkipReason::NotPlannableGlueTable { detail },
+            })),
+            route => self
+                .listed_table(ident, table, route)
+                .await
+                .map(TableAdmission::Admitted),
         }
     }
 
@@ -173,26 +211,57 @@ impl CatalogClient for GlueCatalogSession {
         let namespace = namespace.to_vec();
         Box::pin(async move {
             let database = glue_database(&namespace)?;
-            let mut admitted = Vec::new();
-            let mut skipped = Vec::new();
-            for table in self.tables(database).await? {
-                let ident = CatalogTableIdent {
-                    namespace: namespace.clone(),
-                    name: table.name().to_string(),
-                };
-                match route_of(&table) {
-                    Route::Skip(detail) => skipped.push(SkippedTable {
-                        ident,
-                        reason: SkipReason::NotPlannableGlueTable { detail },
-                    }),
-                    route => admitted.push(self.listed_table(ident, table, route)),
-                }
-            }
-            let tables = stream::iter(admitted)
+            let tables = self.tables(database, None).await?;
+            let admissions: Vec<TableAdmission> = stream::iter(tables)
+                .map(|table| {
+                    let ident = CatalogTableIdent {
+                        namespace: namespace.clone(),
+                        name: table.name().to_string(),
+                    };
+                    self.admit(ident, table)
+                })
                 .buffered(METADATA_READ_CONCURRENCY)
                 .try_collect()
                 .await?;
-            Ok(CatalogListing { tables, skipped })
+            Ok(admissions.into_iter().collect())
+        })
+    }
+
+    fn list_table_idents(
+        &self,
+        namespace: &[String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogTableIdent>, UdfError>> + Send + '_>> {
+        let namespace = namespace.to_vec();
+        Box::pin(async move {
+            let database = glue_database(&namespace)?;
+            let tables = self
+                .tables(database, Some(vec![TableAttributes::Name]))
+                .await?;
+            Ok(tables
+                .iter()
+                .map(|table| CatalogTableIdent {
+                    namespace: namespace.clone(),
+                    name: table.name().to_string(),
+                })
+                .collect())
+        })
+    }
+
+    fn load_listed_tables(
+        &self,
+        idents: &[CatalogTableIdent],
+    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
+        let idents = idents.to_vec();
+        Box::pin(async move {
+            let admissions: Vec<TableAdmission> = stream::iter(idents)
+                .map(|ident| async move {
+                    let table = self.get_table(&ident).await?;
+                    self.admit(ident, table).await
+                })
+                .buffered(METADATA_READ_CONCURRENCY)
+                .try_collect()
+                .await?;
+            Ok(admissions.into_iter().collect())
         })
     }
 
@@ -204,21 +273,7 @@ impl CatalogClient for GlueCatalogSession {
     ) -> Pin<Box<dyn Future<Output = Result<CatalogTable, UdfError>> + Send + '_>> {
         let ident = ident.clone();
         Box::pin(async move {
-            let database = glue_database(&ident.namespace)?;
-            let subject = table_subject(&ident);
-            let table = self
-                .client
-                .get_table()
-                .set_catalog_id(self.catalog_id.clone())
-                .database_name(database)
-                .name(&ident.name)
-                .send()
-                .await
-                .map_err(|error| self.glue_error("GetTable", &subject, &error))?
-                .table
-                .ok_or_else(|| {
-                    UdfError::User(format!("Glue GetTable returned no table for {subject}"))
-                })?;
+            let table = self.get_table(&ident).await?;
             let route = route_of(&table);
             planned_table(ident, &table, route)
         })

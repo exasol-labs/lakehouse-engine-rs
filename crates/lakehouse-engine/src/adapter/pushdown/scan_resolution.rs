@@ -147,7 +147,7 @@ impl<'a> TableScanResolver<'a> {
         })
     }
 
-    /// `table_identifier` is the original-cased `TABLE_MAP` identifier. `filter_json`
+    /// `table_identifier` is the original-cased identifier from the involved table's identifier note. `filter_json`
     /// is forwarded unchanged for format-side pruning. `notes` are the involved table's raw
     /// column notes, parsed here once for every format before any table is loaded.
     pub(super) async fn resolve(

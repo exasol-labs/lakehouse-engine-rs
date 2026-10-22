@@ -2,6 +2,9 @@ use super::*;
 use crate::adapter::pushdown::test_support::{iceberg_column, named_table, unity_column};
 use lakehouse_catalog::{CatalogColumn, ColumnSourceType, TableFormat};
 
+type ListingPipeline =
+    fn(&[String], &CatalogListing, EngineTimestampSupport) -> Result<Vec<Json>, UdfError>;
+
 type CatalogClientConstruction = fn(
     CatalogKind,
     String,
@@ -12,11 +15,7 @@ type CatalogClientConstruction = fn(
 
 #[test]
 fn construction_site_is_exhaustive_and_fallible_for_every_kind() {
-    let _pipeline: fn(
-        &[String],
-        &CatalogListing,
-        EngineTimestampSupport,
-    ) -> Result<VirtualTables, UdfError> = build_listing_virtual_tables;
+    let _pipeline: ListingPipeline = build_listing_virtual_tables;
     let _constructor: CatalogClientConstruction = construct_catalog_client;
 
     let glue_creds = |region: &str| ConnectionCreds {
@@ -74,13 +73,13 @@ fn both_kinds_share_one_listing_pipeline() {
         },
     );
 
-    let (ib_tables, ib_map, _) = build_listing_virtual_tables(
+    let ib_tables = build_listing_virtual_tables(
         &configured_ns,
         &iceberg_listing,
         EngineTimestampSupport::MillisecondOnly,
     )
     .unwrap();
-    let (uc_tables, uc_map, _) = build_listing_virtual_tables(
+    let uc_tables = build_listing_virtual_tables(
         &configured_ns,
         &unity_listing,
         EngineTimestampSupport::MillisecondOnly,
@@ -94,11 +93,8 @@ fn both_kinds_share_one_listing_pipeline() {
         ib_tables[0]["columns"][0]["name"],
         uc_tables[0]["columns"][0]["name"]
     );
-    assert_eq!(
-        ib_map,
-        vec![("ORDERS".to_string(), "cat.sch.orders".to_string())]
-    );
-    assert_eq!(ib_map, uc_map);
+    assert_eq!(ib_tables[0]["adapterNotes"], r#"{"name":"cat.sch.orders"}"#);
+    assert_eq!(ib_tables[0]["adapterNotes"], uc_tables[0]["adapterNotes"]);
 
     assert_eq!(
         ib_tables[0]["columns"][0]["dataType"],
@@ -136,8 +132,7 @@ fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
         ),
     ];
     for (engine, expected) in cases {
-        let (tables, _, _) =
-            build_listing_virtual_tables(&configured_ns, &listing, engine).unwrap();
+        let tables = build_listing_virtual_tables(&configured_ns, &listing, engine).unwrap();
         let columns = tables[0]["columns"].as_array().unwrap();
         assert_eq!(columns[0]["dataType"], expected, "iceberg on {engine:?}");
         assert_eq!(columns[1]["dataType"], expected, "delta on {engine:?}");
@@ -175,7 +170,6 @@ fn listed_tables(listing: &CatalogListing) -> Result<Vec<Json>, UdfError> {
         listing,
         EngineTimestampSupport::MillisecondOnly,
     )
-    .map(|(tables, _, _)| tables)
 }
 
 #[test]

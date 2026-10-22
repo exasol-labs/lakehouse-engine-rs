@@ -1,5 +1,7 @@
 use super::*;
+use crate::adapter::pushdown::test_support::{named_table, with_identifier_notes};
 use exasol_udf_sdk::test_support::{DefaultsCtx, TestContext};
+use lakehouse_catalog::{CatalogTableIdent, SkipReason, TableFormat};
 use std::sync::{Arc, Mutex};
 
 #[path = "parquet_fixture_tests.rs"]
@@ -247,24 +249,24 @@ const CLOSED_PORT_ADDRESS: &str = "http://127.0.0.1:1";
 #[test]
 
 fn unity_kind_pushdown_routes_to_the_unity_catalog_loader() {
-    let req = serde_json::json!({
-        "type": "pushdown",
-        "properties": {
-            "CATALOG_KIND": "UNITY_CATALOG",
-            "CATALOG_CONNECTION": "MY_CONN",
-        },
-        "involvedTables": [{
-            "name": "ORDERS",
-            "columns": [{
-                "name": "ID",
-                "dataType": {"type": "decimal", "precision": 20, "scale": 0},
-                "adapterNotes": r#"{"sourceType":{"name":"id","arrow_type":"int64","nullable":true}}"#,
+    let req = with_identifier_notes(
+        serde_json::json!({
+            "type": "pushdown",
+            "properties": {
+                "CATALOG_KIND": "UNITY_CATALOG",
+                "CATALOG_CONNECTION": "MY_CONN",
+            },
+            "involvedTables": [{
+                "name": "ORDERS",
+                "columns": [{
+                    "name": "ID",
+                    "dataType": {"type": "decimal", "precision": 20, "scale": 0},
+                    "adapterNotes": r#"{"sourceType":{"name":"id","arrow_type":"int64","nullable":true}}"#,
+                }],
             }],
-        }],
-        "schemaMetadataInfo": {
-            "adapterNotes": serde_json::json!({"TABLE_MAP": {"ORDERS": "cat.sch.orders"}}).to_string(),
-        },
-    });
+        }),
+        &[("ORDERS", "cat.sch.orders")],
+    );
 
     let err = dispatch(
         &mut TestContext::scalar(vec![]).with_connection(
@@ -341,13 +343,8 @@ impl Default for super::TuningNotes {
     }
 }
 
-fn parsed_notes(
-    request: &Json,
-    tuning: &TuningNotes,
-    table_map: &[(String, String)],
-    skipped: &[SkippedTable],
-) -> Json {
-    let notes = build_adapter_notes(request, tuning, table_map, skipped);
+fn parsed_notes(request: &Json, tuning: &TuningNotes, skipped: &[SkippedTable]) -> Json {
+    let notes = build_adapter_notes(request, tuning, &SkippedTables::listed(skipped));
     serde_json::from_str(notes.as_str().expect("adapterNotes is a JSON string"))
         .expect("adapterNotes is valid JSON")
 }
@@ -360,7 +357,7 @@ fn build_adapter_notes_merges_existing() {
             "adapterNotes": "{\"OTHER_KEY\":\"keep-me\",\"CLUSTER_NODES\":\"1\"}"
         },
     });
-    let parsed = parsed_notes(&req, &TuningNotes::default(), &[], &[]);
+    let parsed = parsed_notes(&req, &TuningNotes::default(), &[]);
     assert_eq!(
         parsed["OTHER_KEY"].as_str(),
         Some("keep-me"),
@@ -376,7 +373,7 @@ fn build_adapter_notes_merges_existing() {
 #[test]
 fn adapter_notes_omit_cluster_nodes() {
     let request = serde_json::json!({"type": "createVirtualSchema"});
-    let parsed = parsed_notes(&request, &TuningNotes::default(), &[], &[]);
+    let parsed = parsed_notes(&request, &TuningNotes::default(), &[]);
     assert!(
         parsed.get("CLUSTER_NODES").is_none(),
         "a freshly built createVirtualSchema response must carry no CLUSTER_NODES key"
@@ -388,45 +385,64 @@ fn adapter_notes_omit_cluster_nodes() {
     );
 }
 
+/// Scenario: Refresh rebuilds every identifier note and preserves other adapter notes
 #[test]
-fn refresh_rebuilds_table_map_preserves_notes() {
-    let req = serde_json::json!({
+fn refresh_writes_an_identifier_note_on_every_returned_table() {
+    let request = serde_json::json!({
         "type": "refresh",
         "schemaMetadataInfo": {
-            "adapterNotes": serde_json::json!({
-                "OTHER_KEY": "keep-me",
-                "TABLE_MAP": {"OLD_TABLE": "ns.old_table"},
-            })
-            .to_string(),
+            "adapterNotes": serde_json::json!({"OTHER_KEY": "keep-me"}).to_string(),
         },
     });
+    let listing = CatalogListing {
+        tables: vec![
+            named_table(&["ns"], "orders", TableFormat::Iceberg, Vec::new()),
+            named_table(&["ns", "eu"], "Events", TableFormat::Iceberg, Vec::new()),
+        ],
+        skipped: Vec::new(),
+    };
+    let tables = build_listing_virtual_tables(
+        &["ns".to_string()],
+        &listing,
+        EngineTimestampSupport::MillisecondOnly,
+    )
+    .unwrap();
 
-    let fresh_table_map = vec![("NEW_TABLE".to_string(), "ns.new_table".to_string())];
-    let parsed = parsed_notes(&req, &TuningNotes::default(), &fresh_table_map, &[]);
-
-    assert_eq!(
-        parsed["OTHER_KEY"].as_str(),
-        Some("keep-me"),
-        "an unrelated adapterNotes key must survive a refresh's TABLE_MAP rebuild"
+    let response = build_schema_response(
+        &request,
+        json!({
+            "tables": tables,
+            "adapterNotes": build_adapter_notes(
+                &request,
+                &TuningNotes::default(),
+                &SkippedTables::listed(&listing.skipped),
+            ),
+        }),
     );
 
-    let table_map = parsed[NOTE_TABLE_MAP]
-        .as_object()
-        .expect("TABLE_MAP must be an object");
+    let returned = response["schemaMetadata"]["tables"].as_array().unwrap();
+    let notes: Vec<(&str, Json)> = returned
+        .iter()
+        .map(|table| {
+            let note = table["adapterNotes"]
+                .as_str()
+                .expect("a note on every table");
+            (
+                table["name"].as_str().unwrap(),
+                serde_json::from_str(note).unwrap(),
+            )
+        })
+        .collect();
     assert_eq!(
-        table_map.len(),
-        1,
-        "TABLE_MAP must be rebuilt from the fresh enumeration, not merged with the stale one"
+        notes,
+        vec![
+            ("ORDERS", json!({"name": "ns.orders"})),
+            ("EU__EVENTS", json!({"name": "ns.eu.Events"})),
+        ]
     );
-    assert_eq!(
-        table_map.get("NEW_TABLE").and_then(|v| v.as_str()),
-        Some("ns.new_table"),
-        "the freshly resolved table must appear in the rebuilt TABLE_MAP"
-    );
-    assert!(
-        table_map.get("OLD_TABLE").is_none(),
-        "the stale TABLE_MAP entry must not survive a refresh rebuild"
-    );
+    let schema_notes: Json =
+        serde_json::from_str(response["schemaMetadata"]["adapterNotes"].as_str().unwrap()).unwrap();
+    assert_eq!(schema_notes["OTHER_KEY"], "keep-me");
 }
 
 #[test]
@@ -442,7 +458,6 @@ fn create_vs_records_parallelism_factor() {
             parallelism_factor: factor,
             ..TuningNotes::default()
         },
-        &[],
         &[],
     );
     assert_eq!(
@@ -475,8 +490,7 @@ fn adapter_notes_carry_parallelism_factor() {
             parallelism_factor: 12,
             ..TuningNotes::default()
         },
-        &[],
-        &[],
+        &SkippedTables::default(),
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
@@ -595,7 +609,6 @@ fn df_target_partitions_uses_supplied_value() {
             ..TuningNotes::default()
         },
         &[],
-        &[],
     );
     assert_eq!(
         parsed[NOTE_DF_TARGET_PARTITIONS].as_str(),
@@ -631,8 +644,7 @@ fn df_batch_size_uses_supplied_value() {
             df_batch_size: val,
             ..TuningNotes::default()
         },
-        &[],
-        &[],
+        &SkippedTables::default(),
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
@@ -684,7 +696,6 @@ fn df_threads_per_udf_uses_supplied_value() {
             df_threads_per_udf: val,
             ..TuningNotes::default()
         },
-        &[],
         &[],
     );
     assert_eq!(
@@ -835,8 +846,7 @@ fn join_broadcast_max_bytes_round_trips_through_adapter_notes() {
             join_broadcast_max_bytes: 67_108_864,
             ..TuningNotes::default()
         },
-        &[],
-        &[],
+        &SkippedTables::default(),
     );
 
     let pushdown_req = serde_json::json!({
@@ -861,8 +871,7 @@ fn memory_budget_params_round_trip_through_adapter_notes() {
             instance_overhead_mb: 256,
             ..TuningNotes::default()
         },
-        &[],
-        &[],
+        &SkippedTables::default(),
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
@@ -980,7 +989,7 @@ fn threading_mode_defaults_to_auto() {
     );
 
     let req = serde_json::json!({"type": "createVirtualSchema"});
-    let parsed = parsed_notes(&req, &TuningNotes::default(), &[], &[]);
+    let parsed = parsed_notes(&req, &TuningNotes::default(), &[]);
     assert_eq!(
         parsed[NOTE_DF_THREADING_MODE].as_str(),
         Some("AUTO"),
@@ -1044,122 +1053,33 @@ fn fixed_mode_uses_supplied_values() {
     assert_eq!(th_z, 1, "absent threads, cores=0 → 1");
 }
 
-#[test]
-fn table_map_round_trips_through_adapter_notes() {
-    let table_map = vec![
-        ("ORDERS".to_string(), "prod.finance.orders".to_string()),
-        (
-            "EU__ORDERS".to_string(),
-            "prod.finance.eu.orders".to_string(),
-        ),
-    ];
-    let create_req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(&create_req, &TuningNotes::default(), &table_map, &[]);
-    let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
-
-    let pushdown_req = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": notes_str },
-    });
-    let recovered = read_table_map(&pushdown_req);
-    assert_eq!(
-        recovered.get("ORDERS").map(|s| s.as_str()),
-        Some("prod.finance.orders"),
-        "ORDERS must map to prod.finance.orders"
-    );
-    assert_eq!(
-        recovered.get("EU__ORDERS").map(|s| s.as_str()),
-        Some("prod.finance.eu.orders"),
-        "EU__ORDERS must map to prod.finance.eu.orders"
-    );
-    assert_eq!(recovered.len(), 2, "map must have exactly two entries");
-}
-
-#[test]
-fn table_map_stored_as_nested_json_object() {
-    let table_map = vec![("EVENTS".to_string(), "db.events".to_string())];
-    let create_req = serde_json::json!({"type": "createVirtualSchema"});
-    let parsed = parsed_notes(&create_req, &TuningNotes::default(), &table_map, &[]);
-    assert!(
-        parsed[NOTE_TABLE_MAP].is_object(),
-        "TABLE_MAP must be a nested JSON object: {parsed}"
-    );
-    assert_eq!(
-        parsed[NOTE_TABLE_MAP]["EVENTS"].as_str(),
-        Some("db.events"),
-        "TABLE_MAP.EVENTS must equal 'db.events'"
-    );
-}
-
-#[test]
-fn table_map_merges_with_existing_notes() {
-    let req = serde_json::json!({
-        "type": "refresh",
-        "schemaMetadataInfo": {
-            "adapterNotes": "{\"CLUSTER_NODES\":\"5\",\"OTHER\":\"preserved\"}"
-        },
-    });
-    let parsed = parsed_notes(
-        &req,
-        &TuningNotes::default(),
-        &[("T".to_string(), "ns.t".to_string())],
-        &[],
-    );
-    assert_eq!(parsed["OTHER"].as_str(), Some("preserved"));
-    assert_eq!(
-        parsed["CLUSTER_NODES"].as_str(),
-        Some("5"),
-        "pre-existing CLUSTER_NODES must be preserved (merge, not clobber)"
-    );
-    assert!(parsed[NOTE_TABLE_MAP].is_object());
-}
-
-#[test]
-fn read_table_map_absent_returns_empty() {
-    let req = serde_json::json!({"type": "pushdown"});
-    let map = read_table_map(&req);
-    assert!(map.is_empty(), "absent TABLE_MAP must return empty map");
-
-    let req2 = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": {
-            "adapterNotes": "{\"CLUSTER_NODES\":\"1\"}"
-        },
-    });
-    let map2 = read_table_map(&req2);
-    assert!(
-        map2.is_empty(),
-        "missing TABLE_MAP key must return empty map"
-    );
-}
-
-fn pushdown_request_with_table_map(table_map: &[(String, String)], involved: &str) -> Json {
-    let create_req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(&create_req, &TuningNotes::default(), table_map, &[]);
-    let notes_str = notes.as_str().unwrap().to_string();
+fn pushdown_request_involving(involved: &str) -> Json {
     serde_json::json!({
         "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": notes_str },
         "involvedTables": [{"name": involved, "columns": []}],
     })
 }
 
+/// Scenario: Pushdown derives the scanned Iceberg table from the involved virtual table
 #[test]
-fn pushdown_unknown_involved_table_errors() {
-    let table_map = vec![("EVENTS".to_string(), "db.events".to_string())];
-    let request = pushdown_request_with_table_map(&table_map, "UNKNOWN_TABLE");
+fn pushdown_without_an_identifier_note_fails_naming_refresh() {
+    let request = pushdown_request_involving("UNKNOWN_TABLE");
 
-    let err = resolve_pushdown_identifier(&request).unwrap_err();
+    let message = resolve_pushdown_identifier(&request)
+        .unwrap_err()
+        .to_string();
     assert!(
-        err.to_string().contains("UNKNOWN_TABLE"),
-        "error must name the unknown table: {err}"
+        message.contains("UNKNOWN_TABLE") && message.contains("ALTER VIRTUAL SCHEMA ... REFRESH"),
+        "error must name the table and the refresh: {message}"
     );
 }
 
 #[test]
 fn pushdown_known_involved_table_resolves_identifier() {
-    let table_map = vec![("ORDERS".to_string(), "prod.finance.orders".to_string())];
-    let request = pushdown_request_with_table_map(&table_map, "ORDERS");
+    let request = with_identifier_notes(
+        pushdown_request_involving("ORDERS"),
+        &[("ORDERS", "prod.finance.orders")],
+    );
 
     assert_eq!(
         resolve_pushdown_identifier(&request).unwrap(),
@@ -1168,29 +1088,21 @@ fn pushdown_known_involved_table_resolves_identifier() {
     );
 }
 
+/// Scenario: Table naming and the identifier note round trip reuse the shared helpers
 #[test]
-fn table_map_records_the_bare_directory_name_and_round_trips() {
-    let idents = vec![
-        CatalogTableIdent {
-            namespace: Vec::new(),
-            name: "Orders".to_string(),
-        },
-        CatalogTableIdent {
-            namespace: Vec::new(),
-            name: "events".to_string(),
-        },
-    ];
-    let table_map = build_table_map(&[], &idents).unwrap();
+fn the_identifier_note_records_the_bare_directory_name_and_round_trips() {
+    let listing = CatalogListing {
+        tables: vec![
+            named_table(&[], "Orders", TableFormat::Iceberg, Vec::new()),
+            named_table(&[], "events", TableFormat::Iceberg, Vec::new()),
+        ],
+        skipped: Vec::new(),
+    };
+    let tables =
+        build_listing_virtual_tables(&[], &listing, EngineTimestampSupport::MillisecondOnly)
+            .unwrap();
 
-    assert_eq!(
-        table_map,
-        vec![
-            ("ORDERS".to_string(), "Orders".to_string()),
-            ("EVENTS".to_string(), "events".to_string()),
-        ]
-    );
-
-    let request = pushdown_request_with_table_map(&table_map, "ORDERS");
+    let request = json!({"type": "pushdown", "involvedTables": tables});
     assert_eq!(
         resolve_pushdown_identifier(&request).unwrap(),
         "Orders",
@@ -1206,76 +1118,71 @@ fn cat_ident(ns: &[&str], name: &str) -> CatalogTableIdent {
 }
 
 #[test]
-fn flatten_multilevel_namespace_and_detect_collision() {
-    let configured_ns = vec!["prod".to_string(), "finance".to_string()];
+fn create_vs_records_the_multi_level_identifier_in_the_table_note() {
+    let listing = CatalogListing {
+        tables: vec![
+            named_table(
+                &["prod", "finance"],
+                "orders",
+                TableFormat::Iceberg,
+                Vec::new(),
+            ),
+            named_table(
+                &["prod", "finance", "eu"],
+                "orders",
+                TableFormat::Iceberg,
+                Vec::new(),
+            ),
+        ],
+        skipped: Vec::new(),
+    };
+    let tables = build_listing_virtual_tables(
+        &["prod".to_string(), "finance".to_string()],
+        &listing,
+        EngineTimestampSupport::MillisecondOnly,
+    )
+    .unwrap();
 
-    let direct = cat_ident(&["prod", "finance"], "orders");
-    let descendant = cat_ident(&["prod", "finance", "eu"], "orders");
-
-    let result = build_table_map(&configured_ns, &[direct, descendant]).unwrap();
-    assert_eq!(result.len(), 2);
+    let request = json!({"type": "pushdown", "involvedTables": tables});
     assert_eq!(
-        result[0],
-        ("ORDERS".to_string(), "prod.finance.orders".to_string())
+        resolve_pushdown_identifier(&request).unwrap(),
+        "prod.finance.orders"
     );
     assert_eq!(
-        result[1],
-        (
-            "EU__ORDERS".to_string(),
-            "prod.finance.eu.orders".to_string()
-        )
-    );
-
-    // `prod.finance`.`eu__orders` and `prod.finance.eu`.`orders` both flatten to `EU__ORDERS`.
-    let collider_a = cat_ident(&["prod", "finance"], "eu__orders");
-    let collider_b = cat_ident(&["prod", "finance", "eu"], "orders");
-    let err = build_table_map(&configured_ns, &[collider_a, collider_b]).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("EU__ORDERS"),
-        "error must name the colliding Exasol table name: {msg}"
-    );
-    assert!(
-        msg.contains("collision"),
-        "error must mention 'collision': {msg}"
+        read_identifier(&request, "EU__ORDERS").unwrap(),
+        "prod.finance.eu.orders"
     );
 }
 
 #[test]
-fn create_vs_records_table_map_in_adapter_notes() {
-    let configured_ns = vec!["prod".to_string(), "finance".to_string()];
-    let idents = vec![
-        cat_ident(&["prod", "finance"], "orders"),
-        cat_ident(&["prod", "finance", "eu"], "orders"),
-    ];
-    let table_map = build_table_map(&configured_ns, &idents).unwrap();
-
-    let request = serde_json::json!({
-        "type": "createVirtualSchema",
-        "schemaMetadataInfo": {
-            "adapterNotes": "{\"CLUSTER_NODES\":\"3\"}"
-        }
-    });
-    let parsed = parsed_notes(&request, &TuningNotes::default(), &table_map, &[]);
-
-    let table_map_obj = parsed[NOTE_TABLE_MAP]
-        .as_object()
-        .expect("TABLE_MAP must be a JSON object");
-    assert_eq!(
-        table_map_obj.get("ORDERS").and_then(|v| v.as_str()),
-        Some("prod.finance.orders"),
-        "TABLE_MAP must map ORDERS → prod.finance.orders"
-    );
-    assert_eq!(
-        table_map_obj.get("EU__ORDERS").and_then(|v| v.as_str()),
-        Some("prod.finance.eu.orders"),
-        "TABLE_MAP must map EU__ORDERS → prod.finance.eu.orders"
-    );
-
-    assert_eq!(
-        parsed["CLUSTER_NODES"].as_str(),
-        Some("3"),
-        "pre-existing CLUSTER_NODES must be preserved (merge, not clobber)"
+fn a_flatten_collision_among_listed_tables_fails_the_listing() {
+    let listing = CatalogListing {
+        tables: vec![
+            named_table(
+                &["prod", "finance"],
+                "eu__orders",
+                TableFormat::Iceberg,
+                Vec::new(),
+            ),
+            named_table(
+                &["prod", "finance", "eu"],
+                "orders",
+                TableFormat::Iceberg,
+                Vec::new(),
+            ),
+        ],
+        skipped: Vec::new(),
+    };
+    let message = build_listing_virtual_tables(
+        &["prod".to_string(), "finance".to_string()],
+        &listing,
+        EngineTimestampSupport::MillisecondOnly,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        message.contains("EU__ORDERS") && message.contains("collision"),
+        "{message}"
     );
 }
 
@@ -1307,7 +1214,7 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
         }],
     };
 
-    let (tables_json, table_map, skipped) = build_listing_virtual_tables(
+    let tables_json = build_listing_virtual_tables(
         &configured_ns,
         &listing,
         EngineTimestampSupport::MillisecondOnly,
@@ -1330,15 +1237,12 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
     );
 
     assert_eq!(
-        table_map,
-        vec![(
-            "EU__ORDERS".to_string(),
-            "prod.finance.eu.orders".to_string()
-        )]
+        tables_json[0]["adapterNotes"],
+        r#"{"name":"prod.finance.eu.orders"}"#
     );
 
     assert_eq!(
-        skipped,
+        listing.skipped,
         vec![SkippedTable {
             ident: cat_ident(&["prod", "finance"], "hive_events"),
             reason: SkipReason::NotLoadableIcebergTable,
@@ -1382,7 +1286,6 @@ fn skipped_tables_are_recorded_with_reasons_for_every_kind() {
     let parsed = parsed_notes(
         &json!({"type": "createVirtualSchema"}),
         &TuningNotes::default(),
-        &[],
         &skipped,
     );
 
@@ -1426,17 +1329,14 @@ fn a_listing_without_skips_records_an_empty_list_replacing_the_previous() {
                     {"table": "sales.a", "reason": "holds no data file"},
                     {"table": "sales.b", "reason": "holds no data file"},
                 ],
-                "TABLE_MAP": {"STALE": "sales.stale"},
             })
             .to_string()
         },
     });
-    let table_map = vec![("FRESH".to_string(), "sales.fresh".to_string())];
 
-    let parsed = parsed_notes(&request, &TuningNotes::default(), &table_map, &[]);
+    let parsed = parsed_notes(&request, &TuningNotes::default(), &[]);
 
     assert_eq!(parsed["SKIPPED_TABLES"], json!([]));
-    assert_eq!(parsed["TABLE_MAP"], json!({"FRESH": "sales.fresh"}));
 }
 
 /// Scenario: A namespace whose every table is skipped still creates an empty virtual schema
@@ -1450,7 +1350,7 @@ fn an_all_skipped_namespace_creates_an_empty_schema_recording_every_skip() {
         ],
     };
 
-    let (tables_json, table_map, skipped) = build_listing_virtual_tables(
+    let tables_json = build_listing_virtual_tables(
         &["sales".to_string()],
         &listing,
         EngineTimestampSupport::MillisecondOnly,
@@ -1459,93 +1359,11 @@ fn an_all_skipped_namespace_creates_an_empty_schema_recording_every_skip() {
     let parsed = parsed_notes(
         &json!({"type": "createVirtualSchema"}),
         &TuningNotes::default(),
-        &table_map,
-        &skipped,
+        &listing.skipped,
     );
 
     assert!(tables_json.is_empty());
-    assert_eq!(parsed["TABLE_MAP"], json!({}));
     assert_eq!(parsed["SKIPPED_TABLES"].as_array().unwrap().len(), 2);
-}
-
-/// Scenario: A skipped-table list too long for adapterNotes is capped to the longest prefix that fits
-#[test]
-fn an_oversized_skipped_list_is_capped_to_the_longest_prefix_that_fits_the_exasol_limit() {
-    for filler in ["0", "é"] {
-        let total = 15_000;
-        let skipped: Vec<SkippedTable> = (0..total)
-            .map(|i| {
-                skipped_entry(
-                    &format!("{i:0>80}{}", filler.repeat(40)),
-                    SkipReason::NoDataFile,
-                )
-            })
-            .collect();
-
-        let notes = build_adapter_notes(
-            &json!({"type": "createVirtualSchema"}),
-            &TuningNotes::default(),
-            &[],
-            &skipped,
-        );
-        let text = notes.as_str().expect("adapterNotes is a JSON string");
-        let parsed: Json = serde_json::from_str(text).expect("valid JSON");
-
-        let recorded = parsed["SKIPPED_TABLES"].as_array().expect("an array");
-        let kept = recorded.len();
-        assert!(kept > 0 && kept < total, "{filler}: kept {kept} of {total}");
-        assert!(
-            text.len() <= ADAPTER_NOTES_MAX_BYTES,
-            "{filler}: {} bytes",
-            text.len()
-        );
-        assert_eq!(
-            parsed["SKIPPED_TABLES_OMITTED"],
-            json!((total - kept).to_string())
-        );
-        for (entry, source) in recorded.iter().zip(&skipped) {
-            assert_eq!(entry["table"], catalog_identifier_string(&source.ident));
-        }
-        let mut one_more = parsed.clone();
-        one_more["SKIPPED_TABLES"]
-            .as_array_mut()
-            .expect("an array")
-            .push(json!({
-                "table": catalog_identifier_string(&skipped[kept].ident),
-                "reason": skip_kind_and_reason(&skipped[kept]).1,
-            }));
-        let still_omitted = total - kept - 1;
-        if still_omitted == 0 {
-            one_more
-                .as_object_mut()
-                .expect("an object")
-                .remove("SKIPPED_TABLES_OMITTED");
-        } else {
-            one_more["SKIPPED_TABLES_OMITTED"] = json!(still_omitted.to_string());
-        }
-        let with_one_more = one_more.to_string().len();
-        assert!(
-            with_one_more > ADAPTER_NOTES_MAX_BYTES,
-            "{filler}: one more entry would still fit ({with_one_more} bytes)"
-        );
-    }
-}
-
-/// Scenario: A skipped-table list too long for adapterNotes is capped to the longest prefix that fits
-#[test]
-fn a_skipped_list_that_fits_keeps_every_entry_and_drops_a_stale_omitted_count() {
-    let request = json!({
-        "type": "refresh",
-        "schemaMetadataInfo": {
-            "adapterNotes": json!({ "SKIPPED_TABLES_OMITTED": "7" }).to_string()
-        },
-    });
-    let skipped = vec![skipped_entry("a", SkipReason::NoDataFile)];
-
-    let parsed = parsed_notes(&request, &TuningNotes::default(), &[], &skipped);
-
-    assert_eq!(parsed["SKIPPED_TABLES"].as_array().unwrap().len(), 1);
-    assert!(parsed.get("SKIPPED_TABLES_OMITTED").is_none());
 }
 
 #[test]
@@ -1829,7 +1647,8 @@ fn role_create_request() -> Json {
 }
 
 fn role_join_pushdown_request() -> Json {
-    serde_json::json!({
+    with_identifier_notes(
+        serde_json::json!({
         "type": "pushdown",
         "properties": { "CATALOG_CONNECTION": "MY_CONN", "ALLOW_HTTP": "true" },
         "involvedTables": [
@@ -1860,12 +1679,9 @@ fn role_join_pushdown_request() -> Json {
                 {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
             ],
         },
-        "schemaMetadataInfo": {
-            "adapterNotes": serde_json::json!({
-                "TABLE_MAP": {"CUSTOMER": "db.customer", "ORDERS": "db.orders"}
-            }).to_string(),
-        },
-    })
+        }),
+        &[("CUSTOMER", "db.customer"), ("ORDERS", "db.orders")],
+    )
 }
 
 fn assert_signed_by_the_session(requests: &[String]) {

@@ -1,5 +1,6 @@
 use super::*;
 use crate::adapter::column_notes::{DeclaredSchema, TableNotes};
+use crate::adapter::table_identity::encode_identifier_note;
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
 use lakehouse_catalog::{
@@ -539,6 +540,27 @@ pub(crate) fn with_delta_notes(
     partitions: &[&str],
 ) -> Json {
     with_notes(request, table, &delta_notes(columns, partitions))
+}
+
+/// `request` with each involved table named in `identifiers` carrying the identifier note CREATE
+/// writes for its dotted catalog identifier, `(exasol name, dotted identifier)`.
+pub(crate) fn with_identifier_notes(mut request: Json, identifiers: &[(&str, &str)]) -> Json {
+    let tables = request["involvedTables"]
+        .as_array_mut()
+        .into_iter()
+        .flatten();
+    for involved in tables {
+        let table = involved["name"].as_str().unwrap_or_default();
+        if let Some((_, dotted)) = identifiers.iter().find(|(name, _)| *name == table) {
+            let mut segments: Vec<String> = dotted.split('.').map(str::to_string).collect();
+            let ident = CatalogTableIdent {
+                name: segments.pop().unwrap_or_default(),
+                namespace: segments,
+            };
+            involved["adapterNotes"] = encode_identifier_note(&ident).into();
+        }
+    }
+    request
 }
 
 /// No storage location, so the Delta reader refuses before reaching any object store.

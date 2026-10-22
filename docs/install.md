@@ -129,6 +129,13 @@ in-place language-list update. Run it again on a prior install to upgrade it. An
 every per-script grant on the scripts, so issue those grants again afterward (see
 [Re-installing](security.md#re-installing)).
 
+Each existing virtual schema also needs one `ALTER VIRTUAL SCHEMA <name> REFRESH` after the
+upgrade. The new adapter reads each table's catalog identifier from a note on the virtual table,
+and a virtual schema created by an older adapter has none, so every query on it fails until the
+refresh writes the notes. Dependent views and grants survive the refresh. A downgrade to an older
+adapter needs one `REFRESH` under that adapter, because the older adapter reads the identifier
+from the virtual schema's notes instead.
+
 ## Flags
 
 | Flag | Meaning |
