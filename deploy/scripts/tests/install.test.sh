@@ -1223,6 +1223,7 @@ test_stops_at_product_prints_template() {
   assert_contains "template: asks for one option" "$LAST_OUT" "Run ONE of the two options below."
   assert_contains "template: option 2 grants the role to the installing user" "$LAST_OUT" "GRANT LAKEHOUSE_ENGINE_ROLE_LHVS TO <installing-user>;"
   assert_contains "template: option 2 needs a DBA" "$LAST_OUT" "Run as a DBA"
+  assert_contains "template: names the CREATE VIRTUAL SCHEMA privilege" "$LAST_OUT" "Needs the CREATE VIRTUAL SCHEMA system privilege"
   local log; log="$(log_content)"
   assert_not_contains "template: does NOT execute CREATE VIRTUAL SCHEMA" "$log" "CREATE VIRTUAL SCHEMA"
   assert_not_contains "template: does NOT execute CREATE CONNECTION" "$log" "CREATE CONNECTION"

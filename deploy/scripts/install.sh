@@ -1383,11 +1383,12 @@ print_next_step_template() {
       emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_ADAPTER TO $role;"
       emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_SCAN TO $role;"
       emit "-- The role is for VS owners only. Never grant it to a reader."
-      emit "-- It holds no EXECUTE grant: an owner other than $installing_user also needs EXECUTE on the scripts."
+      emit "-- It holds no EXECUTE or CREATE VIRTUAL SCHEMA grant: an owner other than $installing_user also needs both."
       emit "GRANT $role TO $installing_user;"
       ;;
   esac
   emit ""
+  emit "-- Needs the CREATE VIRTUAL SCHEMA system privilege, unless run as a DBA."
   emit "CREATE VIRTUAL SCHEMA <MY_LAKEHOUSE>"
   emit "USING $schema.LAKEHOUSE_ADAPTER WITH"
   emit "  CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'"
