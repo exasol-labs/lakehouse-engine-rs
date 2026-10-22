@@ -45,16 +45,6 @@ Routes every pushdown request through the table-format reader seam. The reader t
 * *AND* the number of catalog round-trips an Iceberg request performs SHALL be unchanged from before this feature, except for the one batch-check request that `vs-adapter/pushdown-catalog-session` admits while `PERMISSION_CHECK = 'LAKEKEEPER'` is set
 * *AND* under a catalog kind whose session is an OBJECT STORE rather than a catalog client, the adapter SHALL build that store EXACTLY ONCE per request and SHALL share it across every leg, so a two-table join opens one store and its admission limiter bounds the whole request rather than each leg
 
-### Scenario: The catalog kind is matched at one added construction site and nowhere else
-
-* *GIVEN* the resolved catalog kind and the recorded rule that its variant names appear in no production module beyond the enum's own declaration, its resolver, the catalog-client construction site, credential validation, and the pushdown scan-source construction site
-* *WHEN* the pushdown path builds the per-request scan-source resolver
-* *THEN* the adapter SHALL match the catalog kind EXHAUSTIVELY at exactly ONE site in the pushdown path, which yields the per-request resolver, so a further catalog kind is a compile error there rather than a silent fall-through
-* *AND* that site SHALL be one of the production sites in the list of production sites permitted to name a catalog-kind variant, so the permitted-site count is unchanged and no per-request-shape fork is introduced
-* *AND* that list SHALL be held by EXHAUSTIVE matching plus review rather than by a source-level probe, and `vs-adapter/catalog-kind-selection` records why no such probe exists
-* *AND* the private already-resolved-session value the resolver carries SHALL gain one variant per catalog kind and SHALL be matched exhaustively wherever it is read, and it MUST NOT name a catalog-kind variant, so it adds no site to the permitted list
-* *AND* the format-reader selection site MUST NOT match the catalog kind, because it matches the scan source
-
 ### Scenario: A Unity Catalog table's identity survives the round trip from the involved table
 
 * *GIVEN* a pushdown request under the Unity Catalog kind whose involved virtual table name maps,

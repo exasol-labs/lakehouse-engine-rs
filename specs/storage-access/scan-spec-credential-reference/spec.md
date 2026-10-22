@@ -18,14 +18,15 @@ The scan spec carries the Exasol CONNECTION name instead of storage credentials,
 * *THEN* the common scan-spec argument SHALL carry the `CATALOG_CONNECTION` name and `ALLOW_HTTP` and no other storage field, and the SQL MUST NOT contain any credential value in any encoding
 * *AND* the UDF SHALL re-derive store addressing from the same CONNECTION read, the reference SHALL be carried ONCE in the shard-invariant argument, and a join SHALL carry one reference PER SIDE
 
-### Scenario: One pure function selects the wire variant and gates the sealed envelope
+### Scenario: Own credentials travel by name and every other credential travels sealed
 
-* *GIVEN* the resolved connection config and the effective storage backend
-* *WHEN* any storage-block site builds the scan-spec storage block
-* *THEN* ONE function SHALL return REFERENCE when the CONNECTION neither sets `use_vended_credentials` nor names `aws_assume_role_arn` (`connection/connection-credentials-assume-role`), SEALED when it does either and key material is present, or a refusal error when it sets `use_vended_credentials` and no key material is present; every storage-block site SHALL call it, and it MUST NOT return plaintext `Inline`
-* *AND* the key-material gate SHALL be exactly ONE predicate reporting TRUE iff at least one of `token`, `client_secret`, `secret_key`, `session_token`, `account_key`, `sas_token` is non-empty; `access_key` alone MUST NOT satisfy it; a CONNECTION that names a role always satisfies it, because it requires `secret_key`
-* *AND* the refusal SHALL name both remedies (add auth or disable vending), SHALL return no pushdown SQL, and MUST NOT contain any credential
-* *AND* a vended or assumed-role JOIN SHALL seal each side independently (two envelopes, one key)
+* *GIVEN* a virtual schema and its CONNECTION
+* *WHEN* the adapter builds the storage part of the scan-driving SQL
+* *THEN* when the CONNECTION neither sets `use_vended_credentials` nor names `aws_assume_role_arn` (`connection/connection-credentials-assume-role`), the SQL SHALL reference the CONNECTION by name
+* *AND* when it sets either and has key material, the SQL SHALL carry the credentials only inside the sealed envelope, and MUST NEVER carry them in plaintext
+* *AND* when it sets `use_vended_credentials` and has no key material, the query SHALL fail at plan time with an error that names both remedies (add catalog authentication or disable vending), returns no SQL, and contains no credential
+* *AND* key material SHALL mean that at least one of `token`, `client_secret`, `secret_key`, `session_token`, `account_key`, `sas_token` is non-empty, and `access_key` alone SHALL NOT count; a CONNECTION that names a role always has key material, because it requires `secret_key`
+* *AND* a join with vended or assumed-role credentials SHALL seal each side separately
 
 ### Scenario: The scan UDF resolves the referenced CONNECTION
 
@@ -42,13 +43,12 @@ The scan spec carries the Exasol CONNECTION name instead of storage credentials,
 * *THEN* value-based redaction SHALL take its secret set from RESOLVED backends, and a join's secret set SHALL be the UNION of both sides
 * *AND* the wire wrapper MUST NOT expose a secret accessor (enforced at compile time)
 
-### Scenario: The generated SQL is asserted credential-free at every builder path
+### Scenario: No credential appears in the generated SQL for any query shape
 
-* *GIVEN* every `RequestShape` variant crossed with join/top-N/COUNT(DISTINCT) sub-paths
-* *WHEN* the adapter generates the pushdown SQL under BOTH vending settings
-* *THEN* the returned SQL STRING MUST contain no sentinel credential
-* *AND* the connection NAME SHALL be positively asserted present (static) or the envelope SHALL unseal correctly (vended)
-* *AND* the eighteen credential-bearing golden fixtures SHALL carry the reference encoding, and the six `empty_*` fixtures SHALL stay byte-identical
+* *GIVEN* any pushdown request shape (raw scan, top-N, single-group or grouped aggregate, COUNT(DISTINCT), or join), with or without vended credentials
+* *WHEN* the adapter returns the scan-driving SQL
+* *THEN* the SQL MUST NOT contain any credential value, in any encoding
+* *AND* the SQL SHALL name the CONNECTION when nothing is sealed, and its sealed envelope SHALL open to the storage backend the scan uses when something is
 
 ### Scenario: The scan script needs the owner's CONNECTION grant
 

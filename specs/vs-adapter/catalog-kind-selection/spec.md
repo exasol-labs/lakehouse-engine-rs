@@ -5,10 +5,7 @@ The adapter reads the `CATALOG_KIND` virtual-schema property to choose the catal
 ## Background
 
 * `CATALOG_KIND` is a plain VS property of the createVirtualSchema request, not a field in the CONNECTION password JSON. Its value is compared case-insensitively.
-* `CatalogKind` is an adapter-layer enum with four variants: `IcebergRest`, `UnityCatalogNative`, `DirectStorage`, and `Glue`. The `lakehouse-catalog` crate does not name it. Credential validation takes the kind as an explicit parameter.
 * The accepted values are `UNITY_CATALOG`, `DIRECT_STORAGE`, and `GLUE`. `ICEBERG_REST` is not accepted, because Iceberg REST is selected by leaving the property absent.
-* Production code names a `CatalogKind` variant in the enum and its resolver, the catalog-client construction site, credential validation, permission-setting validation, the namespace requirement of the createVirtualSchema pipeline, and the pushdown scan-source construction site. Every match on the kind is exhaustive, so a new variant is a build failure at each site.
-* The pushdown resolver carries an already-resolved session in a private enum with one variant per kind. That enum names no `CatalogKind` variant.
 
 ## Scenarios
 
@@ -27,17 +24,6 @@ The adapter reads the `CATALOG_KIND` virtual-schema property to choose the catal
 * *THEN* the adapter SHALL resolve `CatalogKind::UnityCatalogNative`
 * *AND* the adapter SHALL construct the native Unity Catalog client rather than the Iceberg REST client, and SHALL then run the SAME listing pipeline it runs for the Iceberg REST kind
 * *AND* the adapter SHALL compare the property value case-insensitively, so `unity_catalog`, `Unity_Catalog`, and `UNITY_CATALOG` all resolve the same kind
-
-### Scenario: The catalog kind is matched at one construction site and nowhere else
-
-* *GIVEN* the resolved `CatalogKind` and the shared `CatalogClient` trait every catalog kind implements
-* *WHEN* the adapter handles a createVirtualSchema request under any kind
-* *THEN* the adapter SHALL match `CatalogKind` EXHAUSTIVELY at exactly ONE construction site, which returns a `Result` holding a boxed `CatalogClient`, so a new catalog kind is a compile error at that site
-* *AND* every later createVirtualSchema step (enumerating the namespace, flattening and case-folding names, mapping column types, building `TABLE_MAP`, recording skipped tables, and assembling the response) SHALL run ONE pipeline that reads the boxed client through the trait and MUST NOT match `CatalogKind`
-* *AND* the only other production sites permitted to take `CatalogKind` as an input SHALL be credential validation, which takes it as an explicit parameter, and the pushdown scan-source construction site, which matches it EXHAUSTIVELY and yields the per-request resolver every request shape resolves through
-* *AND* the pushdown resolver's private already-resolved-session enum SHALL carry one variant per catalog kind, matched exhaustively wherever it is read, and MUST NOT name a `CatalogKind` variant
-* *AND* the direct-storage client and the Glue client SHALL each be usable as a boxed `CatalogClient` from that one construction site
-* *AND* the compile-time signature probe pinning the construction site SHALL stay in step with its signature through explicit reviewed edits
 
 ### Scenario: Unity Catalog validation does not require a warehouse and rejects SigV4
 

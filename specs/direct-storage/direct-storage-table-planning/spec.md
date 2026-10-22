@@ -21,7 +21,6 @@ The adapter resolves a directory of Parquet files into the engine's `ScanSpec` a
 * *WHEN* the adapter selects the reader for a direct-storage table
 * *THEN* the scan source SHALL have a direct-storage variant carrying the request's object store and the table root, and the selection site SHALL match every variant EXHAUSTIVELY, so a new source is a compile error there rather than a silent fall-through
 * *AND* that variant MUST NOT carry the directory options or a declared-column list, because the table's declaration reaches every reader from the column notes, and the directory options take effect only at enumeration
-* *AND* the selection site MUST NOT match the catalog kind, so the permitted-site set `vs-adapter/catalog-kind-selection` records includes no file for it
 * *AND* the direct-storage variant SHALL carry NO catalog table metadata, because this kind loads no table: its root is composed from the CONNECTION address, the namespace property, and the directory name recorded in the column notes
 * *AND* the error text of the two refusals that run before the format is known, a table with no mappable column and a refused partition column, SHALL name the virtual table instead of a format label
 
