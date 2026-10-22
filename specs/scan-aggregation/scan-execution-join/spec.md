@@ -1,10 +1,10 @@
 # Feature: DataFusion Scan Execution, Broadcast Join
 
-The scan UDF executes a node-local broadcast inner equi-join. It registers the fact side's per-shard files and the dimension side's full file list in one DataFusion session, applies the pushed projection, filter, and post-join ordering and cap, and streams the joined rows as Arrow IPC batches.
+The scan UDF executes a node-local broadcast inner equi-join. It registers the fact side's per-shard files and the dimension side's full file list in one DataFusion session, applies the pushed projection, filter, and post-join ordering and cap, and streams the joined rows as Arrow batches through the Arrow C Data Interface.
 
 ## Background
 
-* Only SDK `Value` types and Arrow IPC byte buffers cross the `.so` boundary.
+* Only SDK `Value` types and Arrow C Data Interface structs cross the `.so` boundary.
 * Both sides register from the file lists in the scan spec, the fact side from the per-shard argument and the dimension side from the common-spec join block, each against its own logical schema. The UDF holds no state and discovers no files.
 * The memory pool is sized from the per-instance memory limit as on the raw-scan path, and the bounded dimension side is the hash-join build side.
 * Storage keys and secrets never appear in an error message.
@@ -89,7 +89,7 @@ The scan UDF executes a node-local broadcast inner equi-join. It registers the f
 * *AND* an emitted empty string SHALL rank as NULL, placed by the key's NULL placement
 * *AND* a `NaN` in a `Float32` or `Float64` key SHALL rank as NULL, placed by the key's NULL placement
 
-### Scenario: Join projection, filter, and LIMIT are applied and rows streamed as Arrow IPC
+### Scenario: Join projection, filter, and LIMIT are applied and rows streamed through the Arrow C Data Interface
 
 * *GIVEN* a join scan spec carrying a projection spanning both sides, an optional filter, and an optional post-join row cap `n` and post-join ordering carried in its JOIN BLOCK
 * *WHEN* the scan UDF runs
@@ -100,7 +100,7 @@ The scan UDF executes a node-local broadcast inner equi-join. It registers the f
 * *AND* the cap SHALL bound JOINED OUTPUT rows and MUST NOT bound either side's scanned input rows, so for a fixture whose first `n` fact rows match no dimension row the UDF SHALL still emit `n` joined rows rather than zero
 * *AND* the UDF MUST NOT register either side with an input-side fetch, and the executed plan MUST NOT carry a limit below the join node on either input
 * *AND* the UDF SHALL emit each result batch via the SDK Arrow-batch emit path (`emit_batch`), fetching one batch, emitting it, and dropping it before the next, never materializing the entire joined result set
-* *AND* no typed Arrow value SHALL cross the `.so` boundary, only the serialized IPC byte buffer
+* *AND* no typed Arrow value SHALL cross the `.so` boundary, only the exported C Data Interface array and schema structs
 
 ### Scenario: The bounded dimension side is the hash-join build side
 

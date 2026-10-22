@@ -172,12 +172,12 @@ async fn emits_batch_by_batch_without_materializing() {
     assert_eq!(
         ctx.batches.len(),
         3,
-        "exactly 3 IPC payloads must be captured (one per input batch)"
+        "exactly 3 batches must be captured (one per input batch)"
     );
 
     assert!(
         ctx.rows.is_empty(),
-        "emit() must not be called on the raw IPC path; got {} row-by-row calls",
+        "emit() must not be called on the raw batch path; got {} row-by-row calls",
         ctx.rows.len()
     );
 
@@ -201,7 +201,7 @@ async fn emits_batch_by_batch_without_materializing() {
             assert_eq!(
                 col.value(row_idx),
                 expected_val,
-                "IPC-decoded value must match original"
+                "decoded value must match original"
             );
         }
     }

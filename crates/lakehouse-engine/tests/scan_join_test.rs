@@ -389,7 +389,7 @@ fn join_registers_each_side_against_its_own_backend() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: Join projection, filter, and LIMIT are applied and rows streamed as Arrow IPC
+/// Scenario: Join projection, filter, and LIMIT are applied and rows streamed through the Arrow C Data Interface
 #[test]
 fn join_projection_filter_limit_streamed() {
     let dir = std::env::temp_dir().join(format!("lh_join_pfl_{}", std::process::id()));

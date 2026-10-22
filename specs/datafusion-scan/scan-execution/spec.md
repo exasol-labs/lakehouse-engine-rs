@@ -1,12 +1,12 @@
 # Feature: DataFusion Scan Execution
 
-A disposable Rust SCALAR EMIT UDF. For one call it builds a DataFusion session, registers only the Parquet files assigned to its shard, applies the pushed-down projection, filter, and LIMIT, and streams the matching rows back as Arrow IPC batches. It holds no state and discovers no files of its own.
+A disposable Rust SCALAR EMIT UDF. For one call it builds a DataFusion session, registers only the Parquet files assigned to its shard, applies the pushed-down projection, filter, and LIMIT, and streams the matching rows back as Arrow batches through the Arrow C Data Interface. It holds no state and discovers no files of its own.
 
 ## Background
 
 * The SDK invokes `run()` once per input row of a SCALAR EMIT UDF. The UDF scans exactly that row's assigned file list per call and never iterates the input with `ctx.next()`.
 * The UDF takes two VARCHAR JSON arguments per row: `common` (shard-invariant fields) and `files` (this shard's `(path, size)` entries). It merges them into one `ScanSpec`; see `datafusion-scan/scan-execution-spec-reconstitution`.
-* Only serialized bytes cross the `.so` boundary: VARCHAR JSON in, Arrow IPC bytes out. The raw-row path emits each `RecordBatch` through the SDK's `EmitBatch` Arrow-IPC path (feature `emit-arrow`) and builds no `Vec<Value>` per batch.
+* No Arrow type crosses the `.so` boundary: VARCHAR JSON goes in, and the Arrow C Data Interface structs come out. The raw-row path emits each `RecordBatch` through the SDK's `EmitBatch` path (feature `emit-arrow`), which exports it with `arrow::ffi::to_ffi` and calls `emit_record_batch_ffi`, and builds no `Vec<Value>` per batch.
 * Per-file metadata and path resolution against the table root are in `datafusion-scan/scan-execution-file-metadata`.
 * When the scan spec carries a logical schema, column projection binds each logical field by the key its format reader populated: field-id (Iceberg, Delta `id` column mapping), physical name (Delta `name` column mapping), or logical name (Delta `none` column mapping). Without a logical schema, the UDF infers the schema from the first file and binds by physical name.
 * The scan registers files through a custom `ParquetSource`-backed table provider, not the iceberg-rust Arrow reader, so it sets INT96 coercion itself.
@@ -24,7 +24,7 @@ A disposable Rust SCALAR EMIT UDF. For one call it builds a DataFusion session, 
 * *THEN* the UDF SHALL reconstitute exactly that one row's `ScanSpec`, register and scan only that row's assigned file list, and emit that row's surviving output rows
 * *AND* the UDF MUST NOT call `ctx.next()`, which the SDK rejects with an error in scalar (`ExactlyOnce`) context
 * *AND* across a multi-shard fan-out whose distributed rows each drive a SEPARATE `run()` call, every shard's rows SHALL be emitted, so NO shard is silently dropped (the regression the removed batch loop was hand-rolling around), and the DataFusion runtime SHALL be built and torn down once per call per `scan-runtime/scan-execution-threading`
-* *AND* only serialized bytes (VARCHAR JSON arguments in, Arrow IPC bytes out) SHALL cross the `.so` boundary
+* *AND* only VARCHAR JSON arguments in and Arrow C Data Interface structs out SHALL cross the `.so` boundary
 
 ### Scenario: Scan registers only its assigned files and returns matching rows
 
@@ -49,13 +49,13 @@ A disposable Rust SCALAR EMIT UDF. For one call it builds a DataFusion session, 
 * *WHEN* the scan UDF runs
 * *THEN* the UDF SHALL emit no more rows than the limit
 
-### Scenario: Arrow batches are emitted incrementally as Arrow IPC and never double-materialized
+### Scenario: Arrow batches are emitted incrementally through the Arrow C Data Interface and never double-materialized
 
 * *GIVEN* a scan whose result spans multiple Arrow record batches
 * *WHEN* the scan UDF processes the result stream
-* *THEN* the UDF SHALL emit each batch via the SDK's Arrow-batch emit path (the `EmitBatch` API, gated by the `emit-arrow` feature), serializing the batch to Arrow IPC bytes so only IPC bytes cross the `.so` boundary
+* *THEN* the UDF SHALL emit each batch via the SDK's Arrow-batch emit path (the `EmitBatch` API, gated by the `emit-arrow` feature), exporting the batch as Arrow C Data Interface structs so no Arrow type crosses the `.so` boundary
 * *AND* the UDF SHALL fetch one batch, emit it, and drop it before fetching the next, never materializing the entire result set
-* *AND* the UDF MUST NOT build an intermediate `Vec<Value>` row collection on the raw-row scan path, and no typed Arrow value SHALL cross the `.so` boundary, only the serialized IPC byte buffer
+* *AND* the UDF MUST NOT build an intermediate `Vec<Value>` row collection on the raw-row scan path, and no typed Arrow value SHALL cross the `.so` boundary, only the exported C Data Interface array and schema structs
 
 ### Scenario: Scan reports a clear error when an assigned file is unreadable
 

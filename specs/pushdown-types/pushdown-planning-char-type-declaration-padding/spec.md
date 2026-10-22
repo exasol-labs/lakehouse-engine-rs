@@ -68,7 +68,7 @@ A pushed-down `CHAR(n)` projection relies on Exasol to space-pad a shorter value
 * *GIVEN* the same seeded table holding a value longer than the declared CHAR width
 * *WHEN* `SELECT CAST(<col> AS CHAR(20)) FROM <vs>.<table>` is executed through the Virtual Schema, the projection facet, with no GROUP BY, where the width is enforced at UDF emit rather than by an outer cast
 * *THEN* the statement SHALL fail cleanly with a truncation error rather than return a silently truncated 20-character value
-* *AND* this SHALL confirm on the Rust SLC's `emit_batch` Arrow IPC path what the LUA probe established for the classic emit path
+* *AND* this SHALL confirm on the Rust SLC's `emit_batch` Arrow C Data Interface path what the LUA probe established for the classic emit path
 * *AND* if the Rust path is found to truncate instead of erroring, that divergence MUST be recorded as an explicit, cited tracked exception in this spec rather than left as a silent gap
 
 ### Scenario: A CHAR group key over trailing-space data groups identically to native Exasol
