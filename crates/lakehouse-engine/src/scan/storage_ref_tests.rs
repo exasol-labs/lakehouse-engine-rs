@@ -77,36 +77,13 @@ fn scan_storage_variants_resolve_or_fail_correctly() {
         name: CONNECTION.into(),
         allow_http: false,
     });
-    let missing =
-        resolve_scan_storage(&conn_spec, &TestContext::scalar(vec![])).expect_err("missing");
+    let ctx = TestContext::scalar(vec![]);
+    let cause = ctx.connection(CONNECTION).expect_err("missing");
     assert_eq!(
-        missing.to_string(),
-        format!("the scan cannot access CONNECTION '{CONNECTION}': it does not exist")
-    );
-
-    let refused = || UdfError::Connection("insufficient privileges for using connection".into());
-    let deployed = connection_lookup_failure(
-        &TestContext::scalar(vec![])
-            .with_script_schema("LAKEHOUSE_OPS")
-            .with_script_name("LH_SCAN_V2"),
-        CONNECTION,
-        refused(),
-        SCAN_SCRIPT_NAME,
-    );
-    assert!(
-        deployed.starts_with("insufficient privileges")
-            && deployed.contains("FOR SCRIPT LAKEHOUSE_OPS.LH_SCAN_V2"),
-        "{deployed}"
-    );
-    let fallback = connection_lookup_failure(
-        &TestContext::scalar(vec![]),
-        CONNECTION,
-        refused(),
-        SCAN_SCRIPT_NAME,
-    );
-    assert!(
-        fallback.contains("FOR SCRIPT <schema>.LAKEHOUSE_SCAN"),
-        "{fallback}"
+        resolve_scan_storage(&conn_spec, &ctx)
+            .expect_err("missing")
+            .to_string(),
+        format!("the scan cannot access CONNECTION '{CONNECTION}': {cause}")
     );
 
     for bad in ["not json at all", "[]"] {

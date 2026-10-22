@@ -42,7 +42,6 @@ pub(crate) use spec::{encode_file_path, reconstruct_abs_uri};
 
 mod storage_ref;
 pub use storage_ref::ResolvedScanStorage;
-pub(crate) use storage_ref::connection_lookup_failure;
 use storage_ref::resolve_scan_storage;
 
 mod store_router;

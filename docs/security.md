@@ -77,11 +77,11 @@ A missing owner grant fails every reader's query with one of these errors:
 | Error contains | Cause |
 |----------------|-------|
 | `insufficient privileges for calling adapter script` | The owner lacks `EXECUTE` on `LAKEHOUSE_ADAPTER`. |
-| `CONNECTION '<conn>' could not be resolved: insufficient privileges` | The owner lacks `ACCESS` on the CONNECTION for `LAKEHOUSE_ADAPTER`. |
+| `CONNECTION '<conn>' could not be resolved` | The CONNECTION does not exist, or the owner lacks `ACCESS` on it for `LAKEHOUSE_ADAPTER`. |
 | `insufficient privileges for calling script` | The owner lacks `EXECUTE` on `LAKEHOUSE_SCAN` or `LAKEHOUSE_DISTRIBUTE_FILES`. |
-| `the scan cannot access CONNECTION '<conn>': insufficient privileges` | The owner lacks `ACCESS` on the CONNECTION for `LAKEHOUSE_SCAN`. |
+| `the scan cannot access CONNECTION '<conn>'` | The CONNECTION does not exist, or the owner lacks `ACCESS` on it for `LAKEHOUSE_SCAN`. |
 
-A CONNECTION that does not exist fails with `CONNECTION '<conn>' could not be resolved: it does not exist`.
+Each CONNECTION error ends with the database's reason, which tells the two causes apart. Grant `ACCESS ON CONNECTION <conn> FOR SCRIPT <schema>.<script>`, or `FOR SCHEMA <schema>`, to the owner, directly or through a role. A querying user needs no CONNECTION privilege.
 
 A scan that fits in one shard, such as a scan of one data file, does not call `LAKEHOUSE_DISTRIBUTE_FILES`. A missing `EXECUTE` on it therefore fails only the queries whose scan spans several shards.
 

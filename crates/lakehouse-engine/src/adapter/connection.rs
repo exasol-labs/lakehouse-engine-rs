@@ -1,6 +1,5 @@
 //! Credential values never appear in an error message produced by this module.
 
-use crate::scan::connection_lookup_failure;
 use crate::scan::sealed::{
     SealedStorageKey, connection_password_carries_key_material, derive_sealed_storage_key,
 };
@@ -38,8 +37,7 @@ pub fn read_connection(
 
     let conn = ctx.connection(name).map_err(|cause| {
         UdfError::User(format!(
-            "CONNECTION '{name}' could not be resolved: {}",
-            connection_lookup_failure(ctx, name, cause, "LAKEHOUSE_ADAPTER")
+            "CONNECTION '{name}' could not be resolved: {cause}"
         ))
     })?;
 

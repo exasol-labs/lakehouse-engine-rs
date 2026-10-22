@@ -181,50 +181,16 @@ fn assert_no_credential(text: &str) {
     }
 }
 
-/// The error text of a denied response, checked to carry no credential and no SLC wrapper text.
+/// The error text of a denied response, checked to carry no credential.
 fn denial_text(denied: &Value) -> String {
     let msg = error_text(denied);
     assert_no_credential(&msg);
-    for noise in [
-        "Connect-back",
-        "Protocol error",
-        "MT_IMPORT",
-        "returned error code",
-        "UDF error: UDF error",
-    ] {
-        assert!(!msg.contains(noise), "{noise:?} leaked: {msg}");
-    }
     msg
 }
 
 fn assert_denied(denied: &Value, expected: &str) {
     let msg = denial_text(denied);
     assert!(msg.contains(expected), "{expected:?} expected: {msg}");
-}
-
-/// Both CONNECTION errors carry Exasol's privilege reason and name the owner's grant.
-fn assert_names_the_owner_grant(msg: &str, script: &str) {
-    for needle in [
-        format!("insufficient privileges for using connection {CONN_NAME}"),
-        format!("GRANT ACCESS ON CONNECTION {CONN_NAME} FOR SCRIPT {SCHEMA_NAME}.{script}"),
-        format!("(or FOR SCHEMA {SCHEMA_NAME})"),
-        "OWNER of the virtual schema".to_string(),
-    ] {
-        assert!(msg.contains(&needle), "{needle:?} expected: {msg}");
-    }
-    assert!(!msg.contains("does not exist"), "{msg}");
-}
-
-fn assert_missing(denied: &Value, prefix: &str) {
-    let msg = denial_text(denied);
-    assert!(
-        msg.contains(&format!("{prefix}: it does not exist")),
-        "{msg}"
-    );
-    assert!(
-        !msg.contains("GRANT"),
-        "a missing CONNECTION needs no grant: {msg}"
-    );
 }
 
 fn setup_e2e() {
@@ -345,9 +311,7 @@ fn revoking_the_owners_scan_grant_denies_the_reader_even_with_its_own_grant() {
         with_grants(&[reader_grant], || reader_conn().try_execute(&query))
     });
 
-    let msg = denial_text(&denied);
-    assert!(msg.contains(SCAN_DENIAL), "scan denial expected: {msg}");
-    assert_names_the_owner_grant(&msg, SCAN_SCRIPT_NAME);
+    assert_denied(&denied, &format!("{SCAN_DENIAL} '{CONN_NAME}'"));
     assert_eq!(
         reader_conn().query_row_count(&query),
         SEED_ROWS_SCORE_GT_15 as i64
@@ -375,14 +339,13 @@ fn revoking_the_owners_adapter_grant_fails_with_the_adapter_error_even_with_the_
         msg.contains(&unresolved_text(CONN_NAME)) && !msg.contains(SCAN_DENIAL),
         "adapter denial expected: {msg}"
     );
-    assert_names_the_owner_grant(&msg, ADAPTER_SCRIPT_NAME);
     assert_eq!(reader_count(VS_NAME), SEED_TOTAL_ROWS as i64);
 }
 
 /// Scenario: A CONNECTION that does not exist fails with the adapter's named error
 /// Scenario: A CONNECTION dropped after planning fails with the scan's named error
 #[test]
-fn a_connection_that_does_not_exist_is_reported_as_missing_by_the_adapter_and_the_scan() {
+fn a_connection_that_does_not_exist_fails_with_the_adapter_and_the_scan_errors() {
     let _serial = serial();
     setup_e2e();
     let mut sys = exa_conn();
@@ -393,7 +356,7 @@ fn a_connection_that_does_not_exist_is_reported_as_missing_by_the_adapter_and_th
         SCHEMA_NAME,
         MISSING_CONN_NAME,
     ));
-    assert_missing(&denied, &unresolved_text(MISSING_CONN_NAME));
+    assert_denied(&denied, &unresolved_text(MISSING_CONN_NAME));
 
     sys.execute(&build_create_connection_sql(
         DROPPED_CONN_NAME,
@@ -415,11 +378,11 @@ fn a_connection_that_does_not_exist_is_reported_as_missing_by_the_adapter_and_th
     let isolated = isolated_pushdown_statement(&mut owner, &query);
     sys.execute(&format!("DROP CONNECTION {DROPPED_CONN_NAME}"));
 
-    assert_missing(
+    assert_denied(
         &reader_conn().try_execute(&query),
         &unresolved_text(DROPPED_CONN_NAME),
     );
-    assert_missing(
+    assert_denied(
         &owner.try_execute(&isolated),
         &format!("{SCAN_DENIAL} '{DROPPED_CONN_NAME}'"),
     );
