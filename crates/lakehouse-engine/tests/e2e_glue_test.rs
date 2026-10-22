@@ -442,7 +442,11 @@ fn check_a_broken_unrequested_table_fails_only_a_full_refresh(run: &GlueRun, con
     conn.execute(&format!(
         "ALTER VIRTUAL SCHEMA {VS} REFRESH TABLES {partitioned}"
     ));
-    conn.query_columns(&format!("SELECT COUNT(*) FROM {VS}.{partitioned}"));
+    // The predicate prunes the fixture's ORC partition, which fails any unpruned scan by design.
+    let ids = conn.query_columns(&format!(
+        "SELECT ID FROM {VS}.{partitioned} WHERE P_STR = 'a b/c' ORDER BY ID"
+    ));
+    assert_eq!(int_column(&ids[0]), [5]);
 }
 
 /// Scenario: Every declared column carries its source shape in its adapterNotes
