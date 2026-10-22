@@ -1370,18 +1370,18 @@ print_next_step_template() {
       emit "-- SYS holds every CONNECTION implicitly; skip the grants."
       ;;
     *)
-      emit "-- Run this block as a DBA: GRANT <role> TO <user> needs GRANT ANY ROLE."
+      emit "-- Run as the CONNECTION's creator or a DBA, and again after a re-install."
+      emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_ADAPTER TO $installing_user;"
+      emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_SCAN TO $installing_user;"
+      emit ""
+      emit "-- Or share the grants with other VS owners through a role. Run as a DBA: GRANT <role> TO <user> needs GRANT ANY ROLE."
       emit "-- After a re-install, run only the two GRANT ACCESS lines again."
-      emit "CREATE ROLE $role;"
-      emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_ADAPTER TO $role;"
-      emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_SCAN TO $role;"
+      emit "-- CREATE ROLE $role;"
+      emit "-- GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_ADAPTER TO $role;"
+      emit "-- GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_SCAN TO $role;"
       emit "-- The role is for VS owners only. Never grant it to a reader."
       emit "-- It holds no EXECUTE grant: an owner other than $installing_user also needs EXECUTE on the scripts."
-      emit "GRANT $role TO $installing_user;"
-      emit ""
-      emit "-- Without a DBA, the CONNECTION's creator can instead grant itself the two GRANT ACCESS lines:"
-      emit "-- GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_ADAPTER TO $installing_user;"
-      emit "-- GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_SCAN TO $installing_user;"
+      emit "-- GRANT $role TO $installing_user;"
       ;;
   esac
   emit ""
