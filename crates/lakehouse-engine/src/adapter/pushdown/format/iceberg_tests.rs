@@ -1,8 +1,8 @@
 use super::super::super::test_support::{
     BINARY_ICEBERG_LAST_COLUMN_ID, RecordingCatalog, binary_iceberg_fields, binary_refused,
-    closed_port_storage, declared_logical_schema, glue_catalog_table, involved_notes,
-    load_table_body, load_table_body_notes, load_table_body_with_columns, object_endpoint,
-    resolve_from_notes, sample_storage, sigv4_creds, user_message,
+    declared_logical_schema, glue_catalog_table, involved_notes, load_table_body,
+    load_table_body_notes, load_table_body_with_columns, object_endpoint, resolve_from_notes,
+    sample_storage, sigv4_creds, user_message,
 };
 use super::super::ResolvedScan;
 use super::*;
@@ -220,8 +220,10 @@ fn plan_errors_redact_the_literal_azure_secret_values() {
     );
 }
 
+/// A missing local file, not a closed port: object-store reads retry a refused connection with
+/// seconds of backoff, a not-found read is never retried.
 #[tokio::test]
-async fn an_unreachable_manifest_list_fails_planning_naming_its_cause() {
+async fn an_unreadable_manifest_list_fails_planning_naming_its_cause() {
     let body = load_table_body(serde_json::json!({
         "last-sequence-number": 1,
         "current-snapshot-id": 1,
@@ -229,14 +231,14 @@ async fn an_unreachable_manifest_list_fails_planning_naming_its_cause() {
             "snapshot-id": 1,
             "sequence-number": 1,
             "timestamp-ms": 0,
-            "manifest-list": "s3://bucket/db/t/metadata/snap-1.avro",
+            "manifest-list": "file:///lakehouse-engine-missing-manifest-list/snap-1.avro",
             "summary": {"operation": "append"},
             "schema-id": 0
         }]
     }));
     let table = iceberg::table::Table::builder()
         .identifier(iceberg::TableIdent::from_strs(["db", "t"]).expect("identifier"))
-        .file_io(closed_port_storage().file_io())
+        .file_io(iceberg::io::FileIO::new_with_fs())
         .runtime(iceberg::Runtime::try_current().expect("runtime"))
         .metadata(
             serde_json::from_value::<iceberg::spec::TableMetadata>(body["metadata"].clone())
@@ -247,11 +249,11 @@ async fn an_unreachable_manifest_list_fails_planning_naming_its_cause() {
 
     let error = plan_files_from_table(table, "db.t", None, &[])
         .await
-        .expect_err("an unreachable manifest list must fail planning");
+        .expect_err("an unreadable manifest list must fail planning");
 
     let text = error.to_string();
     assert!(
-        text.contains("Iceberg file") && text.contains("Connection refused"),
+        text.contains("Iceberg file") && text.contains("No such file or directory"),
         "{text}"
     );
 }
