@@ -72,7 +72,7 @@
 - The toolchain is pinned in `rust-toolchain.toml`, with edition 2024. Every dependency version is pinned in the workspace manifest, not in the specs.
 - The release `.so` builds only in the Makefile's `UDF_BUILDER_IMAGE`, whose rustc and glibc match the SLC, because the SLC rejects a `.so` whose SDK fingerprint (`exasol-udf-sdk` version and rustc hash) differs from its own.
 - `exasol-udf-sdk` and `exasol-udf-macros` are pinned in the workspace manifest to the SLC's own version.
-- `arrow` and `parquet` stay on the same major as `datafusion` and the SDK.
+- `arrow` and `parquet` stay on the Arrow major that `datafusion` and the SDK depend on, not on the major of the `datafusion` or SDK package itself.
 - Arrow types never cross the `.so` boundary. Only SDK `Value`s or the Arrow C Data Interface structs from `ctx.emit_batch` cross it.
 - UDFs keep no cross-call state. The scan UDF builds its Tokio runtime per call and never caches it.
 - The engine owns no persisted metadata. Exasol stores the adapterNotes values (`TABLE_MAP`, `SKIPPED_TABLES`, tuning values) and the column notes between CREATE and pushdown.

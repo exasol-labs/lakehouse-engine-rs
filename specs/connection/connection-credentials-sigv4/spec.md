@@ -4,7 +4,7 @@ Extends `connection/connection-credentials` with the AWS Glue SigV4 requirement:
 
 ## Background
 
-* `access_key`, `secret_key`, and a signing region are required when `use_sigv4` is true, whether or not `use_vended_credentials` is true. The key pair signs the catalog `load_table` request before any credential vending.
+* `access_key`, `secret_key`, and a signing region are required when `use_sigv4` is true, whether or not `use_vended_credentials` is true. The key pair signs the catalog `load_table` request before any credential vending. When the CONNECTION names `aws_assume_role_arn`, the key pair signs the STS `AssumeRole` request instead, and the returned session signs the catalog requests (`connection/connection-credentials-assume-role-session-use`).
 * A standard AWS Glue endpoint is an address with the `https` scheme whose host, compared case-insensitively, is exactly `glue.<region>.amazonaws.com`, where `<region>` is a commercial AWS region code such as `us-east-1` or `ap-southeast-2`. Port and path do not affect the match.
 * For a standard AWS Glue endpoint, the signing region is the region the address names, even when `region` is also stated and differs. A Glue catalog and the S3 buckets of its tables can sit in different regions, and `region` places the store, not the signature.
 * For any other address form, the signing region is the stated `region`.
