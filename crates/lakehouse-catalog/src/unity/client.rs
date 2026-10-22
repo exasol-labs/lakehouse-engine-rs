@@ -1,3 +1,4 @@
+use crate::error_chain;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -149,7 +150,7 @@ impl UnityCatalogSession {
         let response = builder.send().await.map_err(|e| {
             UdfError::User(format!(
                 "Unity Catalog {kind} request failed: {}",
-                redact(&e.to_string())
+                redact(&error_chain(&e))
             ))
         })?;
         let status = response.status();

@@ -3,6 +3,7 @@
 
 use crate::ConnectionCreds;
 use crate::creds::{SuppliedCatalogAuth, non_empty};
+use crate::error_chain;
 use crate::redaction::redact_error_text;
 use exasol_udf_sdk::error::UdfError;
 use serde::Deserialize;
@@ -96,7 +97,7 @@ impl OAuthTokenSource {
             .map_err(|e| {
                 UdfError::User(format!(
                     "Unity Catalog OAuth client-credentials grant failed: {}",
-                    redact(&e.to_string())
+                    redact(&error_chain(&e))
                 ))
             })?;
         let status = response.status();

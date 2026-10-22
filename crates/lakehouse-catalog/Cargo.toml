@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-catalog"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 license.workspace = true
 
@@ -27,6 +27,7 @@ aws-smithy-runtime-api = { workspace = true }
 aws-sdk-glue           = { workspace = true }
 
 reqwest = { workspace = true }
+rustls  = { workspace = true }
 
 # AWS STS AssumeRole.
 aws-sdk-sts = { workspace = true }

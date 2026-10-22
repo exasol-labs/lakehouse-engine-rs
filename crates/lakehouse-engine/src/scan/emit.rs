@@ -235,7 +235,7 @@ pub fn classify_scan_error(e: DataFusionError, secrets: &[&str]) -> UdfError {
     }
     match e.find_root() {
         DataFusionError::ResourcesExhausted(msg) => resources_exhausted_error(msg, secrets),
-        _ => redact_storage_error(e.to_string(), secrets),
+        _ => redact_storage_error(error_chain(&e), secrets),
     }
 }
 
@@ -285,7 +285,7 @@ pub fn redact_storage_error(msg: String, secrets: &[&str]) -> UdfError {
     ))
 }
 
-pub use lakehouse_catalog::{redact_credentials, redact_secret_values};
+pub use lakehouse_catalog::{error_chain, redact_credentials, redact_secret_values};
 
 #[cfg(test)]
 #[path = "emit_tests.rs"]

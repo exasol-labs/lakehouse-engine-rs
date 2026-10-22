@@ -7,6 +7,7 @@ use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
 use futures::future::try_join_all;
 use lakehouse_catalog::HIVE_DEFAULT_PARTITION;
+use lakehouse_catalog::error_chain;
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -231,7 +232,7 @@ pub async fn list_location_files(
             .await
             .map(|listing| listing.objects),
     }
-    .map_err(|e| UdfError::User(format!("failed to list '{prefix}': {e}")))?;
+    .map_err(|e| UdfError::User(format!("failed to list '{prefix}': {}", error_chain(&e))))?;
 
     let mut files: Vec<ListedFile> = listed
         .into_iter()

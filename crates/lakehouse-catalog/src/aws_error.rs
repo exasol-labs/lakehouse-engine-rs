@@ -1,3 +1,4 @@
+use crate::error_chain;
 use aws_sdk_glue::error::ProvideErrorMetadata;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::result::SdkError;
@@ -29,11 +30,12 @@ where
             message: context.err().message(),
         },
         SdkError::TimeoutError(_) => SdkFailure::TimedOut,
-        SdkError::DispatchFailure(failure) => SdkFailure::Request(
-            failure
-                .as_connector_error()
-                .map_or_else(|| "the request could not be sent".to_string(), |e| chain(e)),
-        ),
+        SdkError::DispatchFailure(failure) => {
+            SdkFailure::Request(failure.as_connector_error().map_or_else(
+                || "the request could not be sent".to_string(),
+                |e| error_chain(e),
+            ))
+        }
         SdkError::ConstructionFailure(_) => {
             SdkFailure::Request("the request could not be built".to_string())
         }
@@ -43,14 +45,4 @@ where
         )),
         _ => SdkFailure::Request("the request failed".to_string()),
     }
-}
-
-fn chain(error: &dyn std::error::Error) -> String {
-    let mut description = error.to_string();
-    let mut cause = error.source();
-    while let Some(source) = cause {
-        description.push_str(&format!(": {source}"));
-        cause = source.source();
-    }
-    description
 }

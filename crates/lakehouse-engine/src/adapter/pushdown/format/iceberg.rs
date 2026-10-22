@@ -6,7 +6,7 @@ use futures::TryStreamExt;
 use iceberg::spec::TableMetadata;
 use iceberg::{NamespaceIdent, TableIdent};
 use lakehouse_catalog::{
-    CatalogProps, CatalogSession, CatalogTable, StaticStoreAddress, StorageBackend,
+    CatalogProps, CatalogSession, CatalogTable, StaticStoreAddress, StorageBackend, error_chain,
     load_table_any_auth, parse_table_ident, read_iceberg_metadata_file, redact_credentials,
     redact_error_text, resolve_vended_storage,
 };
@@ -454,14 +454,14 @@ async fn plan_files_from_table(
         UdfError::User(format!(
             "failed to plan Iceberg files for '{}': {}",
             table_name,
-            redact_error_text(&e.to_string(), secrets)
+            redact_error_text(&error_chain(&e), secrets)
         ))
     })?;
 
     let tasks: Vec<_> = task_stream.try_collect().await.map_err(|e| {
         UdfError::User(format!(
             "failed to collect Iceberg file tasks: {}",
-            redact_error_text(&e.to_string(), secrets)
+            redact_error_text(&error_chain(&e), secrets)
         ))
     })?;
 

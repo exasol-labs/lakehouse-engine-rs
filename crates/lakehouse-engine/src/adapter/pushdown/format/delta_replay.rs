@@ -19,6 +19,7 @@
 //! - A logged NULL partition value stays absent; the directory literal is a naming
 //!   artifact, never the value.
 
+use lakehouse_catalog::error_chain;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
@@ -59,7 +60,8 @@ impl DeltaSnapshot {
             .map_err(|cause| {
                 UdfError::User(format!(
                     "failed to resolve the current Delta version for table root \
-                     '{table_root}': {cause}"
+                     '{table_root}': {}",
+                    error_chain(&cause)
                 ))
             })?;
         let protocol = snapshot.table_configuration().protocol();
@@ -134,8 +136,9 @@ impl DeltaSnapshot {
 
     fn failed_to(&self, attempted: &str, cause: &delta_kernel::KernelError) -> UdfError {
         UdfError::User(format!(
-            "failed to {attempted} for Delta table root '{}': {cause}",
-            self.snapshot.table_root()
+            "failed to {attempted} for Delta table root '{}': {}",
+            self.snapshot.table_root(),
+            error_chain(cause)
         ))
     }
 }

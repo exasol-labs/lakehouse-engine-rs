@@ -4,6 +4,7 @@ mod auth;
 mod aws_error;
 mod client;
 mod creds;
+mod error_chain;
 mod glue;
 mod iceberg_io;
 mod lakekeeper;
@@ -27,6 +28,7 @@ pub use client::{
     TableFormat, catalog_identifier_string,
 };
 pub use creds::{CatalogProps, ConnectionCreds, StorageCreds, StorageProps};
+pub use error_chain::error_chain;
 pub use glue::{GlueCatalogSession, parse_glue_table_ident};
 pub use iceberg_io::read_iceberg_metadata_file;
 pub use lakekeeper::{TableReadDecision, lakekeeper_batch_check, lakekeeper_management_url};

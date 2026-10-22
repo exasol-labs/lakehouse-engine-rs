@@ -16,7 +16,10 @@ use crate::common::seed::{
     TYPED_COL_DECIMAL_B, initdef_columns, seed_added_columns_initial_default, seed_renamed_column,
     typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev, typed_id_avg_stddev,
 };
-use crate::common::stack::{build_create_connection_sql, exasol_container, iceberg_catalog_url};
+use crate::common::stack::{
+    build_create_connection_sql, exasol_container, iceberg_catalog_url,
+    iceberg_catalog_url_internal,
+};
 use crate::common::timestamp_precision::{
     ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
 };
@@ -353,6 +356,7 @@ fn mixed_column_parquet_round_trips() {
     assert!(!cols[4][0].is_null(), "event_ts must not be null");
 }
 
+/// Scenario: Create virtual schema fails clearly when the catalog is unreachable
 #[test]
 fn create_vs_unreachable_catalog_errors_no_secret() {
     lakehouse_vs();
@@ -370,28 +374,39 @@ fn create_vs_unreachable_catalog_errors_no_secret() {
         use_vended_credentials: false,
         ..Default::default()
     };
-    let bogus_uri = "http://does-not-exist.invalid:8181";
-    let create_conn_sql =
-        build_create_connection_sql("BAD_CATALOG_CREDS", bogus_uri, &bogus_password);
-    conn.execute(&create_conn_sql);
+    let plain_http_as_tls = iceberg_catalog_url_internal().replacen("http://", "https://", 1);
+    for (catalog_uri, cause) in [
+        ("http://does-not-exist.invalid:8181", "dns error"),
+        (
+            plain_http_as_tls.as_str(),
+            "the server did not answer with TLS",
+        ),
+    ] {
+        conn.execute(&build_create_connection_sql(
+            "BAD_CATALOG_CREDS",
+            catalog_uri,
+            &bogus_password,
+        ));
 
-    let resp = conn.try_execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA BAD_CATALOG_VS
+        let resp = conn.try_execute(&format!(
+            r#"CREATE VIRTUAL SCHEMA BAD_CATALOG_VS
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = 'BAD_CATALOG_CREDS'
   NAMESPACE   = 'ns'
   ALLOW_HTTP          = 'true'"#
-    ));
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "expected an error when catalog is unreachable, got: {resp}"
-    );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
-    assert!(
-        !msg.contains("SUPER_SECRET_KEY") && !msg.contains("SUPER_SECRET_VALUE"),
-        "error message must not leak credentials: {msg}"
-    );
+        ));
+        assert_eq!(
+            resp["status"].as_str(),
+            Some("error"),
+            "expected an error when catalog is unreachable, got: {resp}"
+        );
+        let msg = resp["exception"]["text"].as_str().unwrap_or("");
+        assert!(msg.contains(cause), "{cause:?} expected: {msg}");
+        assert!(
+            !msg.contains("SUPER_SECRET_KEY") && !msg.contains("SUPER_SECRET_VALUE"),
+            "error message must not leak credentials: {msg}"
+        );
+    }
 }
 
 #[test]

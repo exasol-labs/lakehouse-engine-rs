@@ -2,6 +2,7 @@
 //! Credential values never appear in any returned error.
 
 use crate::auth::{CatalogAuth, redact_catalog_auth_error};
+use crate::error_chain;
 use crate::redaction::{redact_error_text, redact_secret_values};
 use crate::{ConnectionCreds, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
@@ -85,7 +86,7 @@ fn describe_transport_error(
         Some(deadline) if error.is_timeout() => {
             format!("the catalog sent no complete answer within {deadline:?}")
         }
-        _ => redact_catalog_text(&error.to_string(), auth, creds),
+        _ => redact_catalog_text(&error_chain(error), auth, creds),
     }
 }
 

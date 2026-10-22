@@ -3,6 +3,7 @@
 
 use crate::ConnectionCreds;
 use crate::creds::{SuppliedCatalogAuth, non_empty};
+use crate::error_chain;
 use crate::redaction::redact_error_text;
 use crate::sigv4::required_signing_region;
 use exasol_udf_sdk::error::UdfError;
@@ -127,7 +128,7 @@ async fn oauth2_client_credentials_grant(
         .map_err(|e| {
             UdfError::User(format!(
                 "OAuth2 token request failed: {}",
-                redact_secret(&e.to_string())
+                redact_secret(&error_chain(&e))
             ))
         })?;
 

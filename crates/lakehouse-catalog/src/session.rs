@@ -4,6 +4,7 @@
 use crate::auth::{
     CatalogAuth, inject_catalog_auth_props, redact_catalog_auth_error, resolve_catalog_auth,
 };
+use crate::error_chain;
 use crate::iceberg_io::authed_get_json;
 use crate::namespace::parse_table_ident;
 use crate::{CatalogProps, ConnectionCreds, StorageBackend};
@@ -38,7 +39,7 @@ pub(crate) async fn build_rest_catalog(
         .map_err(|e: iceberg::Error| {
             UdfError::User(format!(
                 "failed to connect to Iceberg catalog: {}",
-                redact_catalog_auth_error(&e.to_string(), creds)
+                redact_catalog_auth_error(&error_chain(&e), creds)
             ))
         })
 }

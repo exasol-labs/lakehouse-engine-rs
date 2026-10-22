@@ -67,7 +67,8 @@ An Exasol user registers every Iceberg table in a configured namespace as a virt
 
 * *GIVEN* the Iceberg REST catalog endpoint resolved from the CONNECTION cannot be reached
 * *WHEN* Exasol sends a `createVirtualSchema` request
-* *THEN* the adapter SHALL return an error describing that the catalog could not be reached or the namespace could not be listed
+* *THEN* the adapter SHALL return an error describing that the catalog could not be reached or the namespace could not be listed, followed by every cause the HTTP client reports, such as a DNS, connection, or TLS failure
+* *AND* when an `https://` endpoint answers without TLS, the error SHALL say that the server did not answer with TLS
 * *AND* the error message MUST NOT contain storage access keys, secret keys, session tokens, or any SigV4 signing key
 
 ### Scenario: Create virtual schema records each table's catalog identifier in the table's adapterNotes
