@@ -140,3 +140,29 @@ async fn signed_enumeration_refuses_without_signing_region() {
         "no catalog request may be sent without a signing region"
     );
 }
+
+#[tokio::test]
+async fn a_refused_catalog_connection_names_its_cause_signed_or_not() {
+    for use_sigv4 in [false, true] {
+        let mut creds = base_creds();
+        creds.use_sigv4 = use_sigv4;
+        creds.region = "us-east-1".into();
+
+        let Err(UdfError::User(msg)) = list_namespace_tables(
+            CLOSED_PORT_URI,
+            &["db".to_string()],
+            &static_backend(),
+            &creds,
+        )
+        .await
+        else {
+            panic!("a closed catalog port must fail the listing as a user error");
+        };
+
+        assert!(
+            msg.starts_with("failed to list tables in namespace 'db': ")
+                && msg.contains(CLOSED_PORT_CAUSE),
+            "use_sigv4={use_sigv4}: {msg}"
+        );
+    }
+}

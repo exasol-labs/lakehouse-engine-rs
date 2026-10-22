@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::base_creds;
+use crate::test_support::{CLOSED_PORT_CAUSE, CLOSED_PORT_URI, base_creds};
 use crate::unity::mock_server::spawn;
 use crate::{CatalogClient, UnityCatalogSession};
 use exasol_udf_sdk::error::UdfError;
@@ -238,24 +238,30 @@ async fn failed_oauth_grant_is_credential_safe_error() {
     let mut creds = base_creds();
     creds.client_id = Some("client-abc".to_string());
     creds.client_secret = Some(OAUTH_SECRET_SENTINEL.to_string());
-    let session = UnityCatalogSession::new(&server.base_url, creds);
 
-    let err = session
-        .list_tables(&["cat".to_string(), "sch".to_string()])
-        .await
-        .expect_err("a failed grant must surface an error");
+    for (base_url, cause) in [
+        (server.base_url.as_str(), "invalid_client"),
+        (CLOSED_PORT_URI, CLOSED_PORT_CAUSE),
+    ] {
+        let session = UnityCatalogSession::new(base_url, creds.clone());
 
-    let UdfError::User(msg) = err else {
-        panic!("expected a UdfError::User variant");
-    };
-    assert!(
-        msg.contains("OAuth client-credentials grant failed"),
-        "the error names the grant failure: {msg}"
-    );
-    assert!(
-        !msg.contains(OAUTH_SECRET_SENTINEL),
-        "the client secret must be stripped from the error: {msg}"
-    );
+        let err = session
+            .list_tables(&["cat".to_string(), "sch".to_string()])
+            .await
+            .expect_err("a failed grant must surface an error");
+
+        let UdfError::User(msg) = err else {
+            panic!("expected a UdfError::User variant");
+        };
+        assert!(
+            msg.contains("OAuth client-credentials grant failed") && msg.contains(cause),
+            "the error names the grant failure and its cause: {msg}"
+        );
+        assert!(
+            !msg.contains(OAUTH_SECRET_SENTINEL),
+            "the client secret must be stripped from the error: {msg}"
+        );
+    }
 }
 
 #[test]

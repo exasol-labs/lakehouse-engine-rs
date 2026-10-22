@@ -53,6 +53,9 @@ pub(crate) const STATIC_SK: &str = "STATIC_SK_SENTINEL";
 pub(crate) const BEARER_TOK: &str = "BEARER_TOKEN_SENTINEL_VALUE";
 pub(crate) const CLIENT_SECRET: &str = "CLIENT_SECRET_SENTINEL_VALUE";
 pub(crate) const OAUTH_ACCESS_TOKEN: &str = "OAUTH_OBTAINED_ACCESS_TOKEN";
+/// A closed loopback port; its cause sits below reqwest's own `error sending request`.
+pub(crate) const CLOSED_PORT_URI: &str = "http://127.0.0.1:1";
+pub(crate) const CLOSED_PORT_CAUSE: &str = "Connection refused";
 pub(crate) const ORC_INPUT_FORMAT: &str = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
 
 pub(crate) fn creds_no_auth() -> ConnectionCreds {
