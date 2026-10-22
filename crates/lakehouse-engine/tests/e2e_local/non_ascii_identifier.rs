@@ -13,6 +13,8 @@ const VS_NAME: &str = "STRASSE_VS";
 /// Full-Unicode `to_uppercase` expands `ß` to `SS` for both table and column.
 const SERVED_NAME: &str = "STRASSE";
 
+/// Scenario: A non-ASCII Iceberg table and column name stay queryable end to end
+/// Scenario: A partial refresh resolves each requested name as a full refresh would
 #[test]
 fn non_ascii_table_and_column_stay_queryable() {
     stack();
@@ -48,7 +50,14 @@ fn non_ascii_table_and_column_stay_queryable() {
         "expected the straße column declared as {SERVED_NAME}, got {column_names:?}"
     );
 
-    // The uppercased name must resolve through TABLE_MAP to the original-cased identifier.
+    let identifier = identifier_note(&mut conn, VS_NAME, SERVED_NAME)
+        .unwrap_or_else(|| panic!("{SERVED_NAME} must carry an identifier note"));
+    assert!(
+        identifier.ends_with("straße"),
+        "the note must round-trip the non-ASCII identifier, got {identifier}"
+    );
+
+    // The uppercased name must resolve through its identifier note to the original-cased one.
     let row_count = conn.query_scalar_i64(&format!("SELECT COUNT(*) FROM {qualified_table}"));
     assert_eq!(row_count, NONASCII_TOTAL_ROWS);
 
@@ -73,5 +82,20 @@ fn non_ascii_table_and_column_stay_queryable() {
         pushed_sql.contains("\"filter\":\""),
         "EXPLAIN VIRTUAL output must contain a non-empty 'filter' field (the LIKE \
          predicate must be pushed, not declined), got:\n{pushed_sql}"
+    );
+
+    // `STRASSE` selects `straße` only through the same full-Unicode fold a full REFRESH applies.
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {VS_NAME} REFRESH TABLES {SERVED_NAME}"
+    ));
+    let refreshed = identifier_note(&mut conn, VS_NAME, SERVED_NAME)
+        .unwrap_or_else(|| panic!("{SERVED_NAME} must stay declared with its identifier note"));
+    assert!(
+        refreshed.ends_with("straße"),
+        "REFRESH TABLES {SERVED_NAME} must select the straße identifier, got {refreshed}"
+    );
+    assert_eq!(
+        conn.query_scalar_i64(&format!("SELECT COUNT(*) FROM {qualified_table}")),
+        NONASCII_TOTAL_ROWS
     );
 }

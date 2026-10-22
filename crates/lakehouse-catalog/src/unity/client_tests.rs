@@ -129,6 +129,21 @@ async fn lists_tables_in_catalog_schema() {
     );
 }
 
+/// Scenario: A scoped refresh lists Unity table names without columns and loads only the requested tables
+#[test]
+fn identifier_listing_query_omits_columns_properties_and_username() {
+    assert_eq!(
+        identifier_listing_query("cat", "sch"),
+        [
+            ("catalog_name", "cat"),
+            ("schema_name", "sch"),
+            ("omit_columns", "true"),
+            ("omit_properties", "true"),
+            ("omit_username", "true"),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn includes_managed_and_external_delta_base_tables() {
     let body = r#"{"tables":[

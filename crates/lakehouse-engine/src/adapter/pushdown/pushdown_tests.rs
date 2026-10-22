@@ -1861,46 +1861,44 @@ async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
         table: "unused-on-the-join-path".into(),
     };
 
-    let request = with_iceberg_notes(serde_json::json!({
-        "involvedTables": [
-            {
-                "name": "CUSTOMER",
-                "columns": [
-                    {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                ],
-            },
-            {
-                "name": "ORDERS",
-                "columns": [
-                    {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                ],
-            },
-        ],
-        "pushdownRequest": {
-            "type": "select",
-            "from": {
-                "type": "join",
-                "join_type": "inner",
-                "left": {"name": "CUSTOMER", "type": "table"},
-                "right": {"name": "ORDERS", "type": "table"},
-                "condition": {
-                    "type": "predicate_equal",
-                    "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-                    "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+    let request = with_iceberg_notes(with_identifier_notes(
+        serde_json::json!({
+            "involvedTables": [
+                {
+                    "name": "CUSTOMER",
+                    "columns": [
+                        {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    ],
                 },
-            },
-            "selectList": [
-                {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-                {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+                {
+                    "name": "ORDERS",
+                    "columns": [
+                        {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    ],
+                },
             ],
-        },
-        "schemaMetadataInfo": {
-            "properties": {},
-            "adapterNotes": serde_json::json!({
-                "TABLE_MAP": {"CUSTOMER": "db.customer", "ORDERS": "db.orders"}
-            }).to_string(),
-        },
-    }));
+            "pushdownRequest": {
+                "type": "select",
+                "from": {
+                    "type": "join",
+                    "join_type": "inner",
+                    "left": {"name": "CUSTOMER", "type": "table"},
+                    "right": {"name": "ORDERS", "type": "table"},
+                    "condition": {
+                        "type": "predicate_equal",
+                        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+                    },
+                },
+                "selectList": [
+                    {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                    {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+                ],
+            },
+            "schemaMetadataInfo": {"properties": {}},
+        }),
+        &[("CUSTOMER", "db.customer"), ("ORDERS", "db.orders")],
+    ));
 
     seam_handle_pushdown(
         &request,

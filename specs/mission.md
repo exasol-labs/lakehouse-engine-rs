@@ -83,7 +83,7 @@ Architecture: see specs/architecture.md.
 | DataFusion runtime | A vectorized query engine session that one scan UDF invocation (one shard group) creates for itself; several can run on one node |
 | CATALOG_KIND | Virtual schema property that selects the catalog: absent for Iceberg REST, else `UNITY_CATALOG`, `GLUE`, or `DIRECT_STORAGE` |
 | CONNECTION | Exasol object that holds the catalog address and the JSON credentials for catalog and storage |
-| AdapterNotes | State that Exasol persists for a virtual schema between CREATE and pushdown: table map, skipped tables, and tuning values |
+| AdapterNotes | State that Exasol persists for a virtual schema between CREATE and pushdown: skipped tables and tuning values at schema level, one identifier note per virtual table, and one note per column |
 | Vended credentials | Short-lived per-table storage credentials that a catalog issues; they reach the scan UDF only inside a sealed envelope |
 | Partial result | Per-shard-group output (raw rows or aggregate) merged by Exasol into the final result |
 | Disposable execution container | One scan UDF invocation: it builds its own DataFusion session and keeps no query state after it returns. Exasol may reuse the hosting VM process for later invocations |

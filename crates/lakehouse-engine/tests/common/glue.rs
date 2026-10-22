@@ -412,8 +412,10 @@ pub const BINARY_VALUES: &str = "binary_values";
 pub const PARTITIONED: &str = "partitioned";
 const PROJECTED: &str = "projected";
 const A_VIEW: &str = "a_view";
-const ORC_TABLE: &str = "orc_table";
+pub const ORC_TABLE: &str = "orc_table";
 const DELTA_TABLE: &str = "delta_table";
+/// An Iceberg registration whose `metadata_location` names no object, so its load always fails.
+pub const BROKEN_ICEBERG: &str = "broken_iceberg";
 
 /// The tables the listing admits, in name order.
 pub const ROUTED_TABLES: [&str; 4] = [ALL_TYPES, BINARY_VALUES, ICEBERG_ORDERS, PARTITIONED];
@@ -873,6 +875,23 @@ pub async fn register_probe_table(run: &GlueRun) -> Result<()> {
         )?),
     )?;
     Ok(())
+}
+
+/// Registers [`BROKEN_ICEBERG`], which fails every full listing of the run's database from then on.
+pub async fn register_broken_iceberg_table(run: &GlueRun) -> Result<()> {
+    let location = run.uri(BROKEN_ICEBERG);
+    let input = TableInput::builder()
+        .name(BROKEN_ICEBERG)
+        .table_type(EXTERNAL_TABLE)
+        .parameters("table_type", "ICEBERG")
+        .parameters(
+            "metadata_location",
+            format!("{location}/metadata/00000-missing.metadata.json"),
+        )
+        .storage_descriptor(StorageDescriptor::builder().location(location).build())
+        .build()
+        .with_context(|| format!("describe the {BROKEN_ICEBERG} registration"))?;
+    FixtureWriter::new(run)?.create_table(input).await
 }
 
 fn hive_column(name: &str, hive_type: &str) -> Result<Column> {

@@ -1116,40 +1116,41 @@ fn render_broadcast_join_strips_native_table_alias_from_projection() {
 
 #[test]
 fn unified_join_prunes_and_narrows_each_leg() {
-    let request = serde_json::json!({
-        "involvedTables": [
-            {"name": "CUSTOMER", "columns": [
-                {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
-                {"name": "C_ADDRESS", "dataType": {"type": "varchar", "size": 100}}]},
-            {"name": "ORDERS", "columns": [
-                {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "O_ORDERDATE", "dataType": {"type": "date"}},
-                {"name": "O_TOTALPRICE", "dataType": {"type": "decimal", "precision": 20, "scale": 2}}]},
-        ],
-        "pushdownRequest": {
-            "type": "select",
-            "from": {"type": "join", "join_type": "inner",
-                "left": {"name": "CUSTOMER", "type": "table"},
-                "right": {"name": "ORDERS", "type": "table"},
-                "condition": {"type": "predicate_equal",
-                    "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-                    "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}}},
-            "selectList": [
-                {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-                {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"}],
-            "filter": {"type": "predicate_and", "expressions": [
-                {"type": "predicate_equal",
-                 "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-                 "right": {"type": "literal_string", "value": "ACME"}},
-                {"type": "predicate_greater",
-                 "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
-                 "right": {"type": "literal_string", "value": "1995-01-01"}}]},
-        },
-        "schemaMetadataInfo": {"properties": {}, "adapterNotes":
-            serde_json::json!({"TABLE_MAP": {"CUSTOMER": "lh.customer", "ORDERS": "lh.orders"}})
-                .to_string()},
-    });
+    let request = with_identifier_notes(
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "CUSTOMER", "columns": [
+                    {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
+                    {"name": "C_ADDRESS", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "ORDERS", "columns": [
+                    {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "O_ORDERDATE", "dataType": {"type": "date"}},
+                    {"name": "O_TOTALPRICE", "dataType": {"type": "decimal", "precision": 20, "scale": 2}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"name": "CUSTOMER", "type": "table"},
+                    "right": {"name": "ORDERS", "type": "table"},
+                    "condition": {"type": "predicate_equal",
+                        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}}},
+                "selectList": [
+                    {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                    {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"}],
+                "filter": {"type": "predicate_and", "expressions": [
+                    {"type": "predicate_equal",
+                     "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                     "right": {"type": "literal_string", "value": "ACME"}},
+                    {"type": "predicate_greater",
+                     "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+                     "right": {"type": "literal_string", "value": "1995-01-01"}}]},
+            },
+            "schemaMetadataInfo": {"properties": {}},
+        }),
+        &[("CUSTOMER", "lh.customer"), ("ORDERS", "lh.orders")],
+    );
 
     let detected = detected_join(&request);
     let sides = vec![

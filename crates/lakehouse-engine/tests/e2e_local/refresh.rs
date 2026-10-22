@@ -4,6 +4,7 @@
 
 use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
+use crate::common::raw_parquet::put_fixture_object;
 use crate::common::seed::{build_seed_catalog, rest_replace_current_schema};
 use crate::common::stack::{
     CatalogConnectionPassword, build_create_connection_sql, iceberg_catalog_url,
@@ -13,6 +14,7 @@ use crate::fixtures::{stack, vs_table};
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use bytes::Bytes;
 use iceberg::spec::{
     NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Type, UnboundPartitionSpec,
 };
@@ -155,7 +157,23 @@ async fn drop_table_if_exists(catalog: &impl Catalog, ns: &NamespaceIdent, table
     }
 }
 
+/// A table an earlier run left corrupt fails the existence check, so a reset drops without asking.
+async fn drop_table_ignoring_missing(
+    catalog: &impl Catalog,
+    ns: &NamespaceIdent,
+    table_name: &str,
+) {
+    let ident = TableIdent::new(ns.clone(), table_name.to_string());
+    match catalog.drop_table(&ident).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == iceberg::ErrorKind::TableNotFound => {}
+        Err(e) => panic!("drop table {}.{table_name}: {e}", ns.join(".")),
+    }
+}
+
 /// Scenario: Refresh re-enumerates the namespace and returns a refresh response
+/// Scenario: Create virtual schema records each table's catalog identifier in the table's adapterNotes
+/// Scenario: Refresh rebuilds every identifier note and preserves other adapter notes
 #[test]
 fn refresh_reenumerates_namespace() {
     stack();
@@ -176,6 +194,11 @@ fn refresh_reenumerates_namespace() {
         vs_table("REFRESH_REENUM_VS", "t_orig")
     ));
     assert_eq!(id, 1, "T_ORIG must be queryable right after CREATE");
+    assert_eq!(
+        identifier_note(&mut conn, "REFRESH_REENUM_VS", "T_ORIG").as_deref(),
+        Some("e2e_refresh_reenum.t_orig"),
+        "CREATE must record T_ORIG's catalog identifier in its identifier note"
+    );
 
     let resp = conn.try_execute(&format!(
         "SELECT * FROM {}",
@@ -199,6 +222,16 @@ fn refresh_reenumerates_namespace() {
         id, 42,
         "T_NEW must be queryable after REFRESH re-enumerates the namespace"
     );
+    for (table, identifier) in [
+        ("T_ORIG", "e2e_refresh_reenum.t_orig"),
+        ("T_NEW", "e2e_refresh_reenum.t_new"),
+    ] {
+        assert_eq!(
+            identifier_note(&mut conn, "REFRESH_REENUM_VS", table).as_deref(),
+            Some(identifier),
+            "REFRESH must leave {table} with its identifier note"
+        );
+    }
 }
 
 #[test]
@@ -316,7 +349,7 @@ fn set_properties_retargets_namespace() {
     assert_eq!(
         resp["status"].as_str(),
         Some("error"),
-        "A_TBL must no longer be registered — TABLE_MAP is a full rebuild from \
+        "A_TBL must no longer be registered — a full refresh rebuilds from \
          the newly targeted namespace, never a merge of both: {resp}"
     );
 }
@@ -384,92 +417,195 @@ fn refresh_unreachable_catalog_redacts_credentials() {
     conn.execute(&create_conn_sql);
 }
 
+/// Hands out the same three tables as the engine adapter's listing, but writes no table-level
+/// identifier note, as an adapter that predates it did.
+const LEGACY_ADAPTER_BODY: &str = r#"import json
+
+COLUMNS = [
+    {"name": "ID", "dataType": {"type": "DECIMAL", "precision": 20, "scale": 0}},
+    {"name": "VAL", "dataType": {"type": "DOUBLE"}},
+]
+
+
+def adapter_call(request_json):
+    kind = json.loads(request_json)["type"]
+    if kind == "getCapabilities":
+        return json.dumps({"type": kind, "capabilities": []})
+    if kind == "createVirtualSchema":
+        names = ["TABLE_ONE", "TABLE_TWO", "TABLE_THREE"]
+        tables = [{"name": name, "columns": COLUMNS} for name in names]
+        return json.dumps({"type": kind, "schemaMetadata": {"tables": tables}})
+    return json.dumps({"type": kind})
+"#;
+
+/// A schema of its own, so replacing the adapter script cannot touch the shared one.
+const PARTIAL_ADAPTER_SCHEMA: &str = "REFRESH_PARTIAL_ADAPTER";
+const PARTIAL_VS: &str = "REFRESH_PARTIAL_VS";
+
+/// `(table, id, val)`; `table_one` and `table_two` share an id so that they join.
+const PARTIAL_TABLES: [(&str, i64, f64); 3] = [
+    ("table_one", 1, 10.0),
+    ("table_two", 1, 20.0),
+    ("table_three", 3, 30.0),
+];
+
+fn create_legacy_virtual_schema(conn: &mut ExaConn) {
+    conn.execute(&format!(
+        "CREATE SCHEMA IF NOT EXISTS {PARTIAL_ADAPTER_SCHEMA}"
+    ));
+    conn.execute(&format!(
+        "CREATE OR REPLACE PYTHON3 ADAPTER SCRIPT {PARTIAL_ADAPTER_SCHEMA}.{ADAPTER_SCRIPT_NAME} AS\n{LEGACY_ADAPTER_BODY}\n/"
+    ));
+    conn.execute(&build_create_connection_sql(
+        CATALOG_CONN_NAME,
+        &iceberg_catalog_url_internal(),
+        &local_stack_connection_password(),
+    ));
+    let _ = conn.try_execute(&format!(
+        "DROP VIRTUAL SCHEMA IF EXISTS {PARTIAL_VS} CASCADE"
+    ));
+    conn.execute(&format!(
+        "CREATE VIRTUAL SCHEMA {PARTIAL_VS} USING {PARTIAL_ADAPTER_SCHEMA}.{ADAPTER_SCRIPT_NAME} WITH\n  \
+         CATALOG_CONNECTION = '{CATALOG_CONN_NAME}'\n  ALLOW_HTTP = 'true'\n  NAMESPACE = '{NS_PARTIAL}'"
+    ));
+}
+
+/// Scenario: Refresh rebuilds every identifier note and preserves other adapter notes
+/// Scenario: A partial refresh returns only the requested tables and keeps the others
+/// Scenario: A partial refresh drops a requested virtual table the source no longer serves
+/// Scenario: A partial refresh loads the metadata of the requested tables only
+/// Scenario: A scoped refresh lists Iceberg identifiers and loads the requested tables on one session
+/// Scenario: Pushdown derives the scanned Iceberg table from the involved virtual table
+/// Scenario: Each join leg resolves its catalog identifier from its own identifier note
 #[test]
-fn refresh_partial_requested_tables_still_refreshes_whole_namespace() {
+fn refresh_tables_heals_and_refreshes_only_the_requested_tables() {
     stack();
     let rt = runtime();
     let catalog = seed_catalog(rt, "refresh-partial");
-
-    rt.block_on(ensure_id_val_table(
-        &catalog,
-        NS_PARTIAL,
-        "table_one",
-        1,
-        10.0,
-    ));
-    rt.block_on(ensure_id_val_table(
-        &catalog,
-        NS_PARTIAL,
-        "table_two",
-        2,
-        20.0,
-    ));
-
-    let mut conn = exa_conn();
-    create_virtual_schema(&mut conn, "REFRESH_PARTIAL_VS", NS_PARTIAL);
-
-    for table in ["table_one", "table_two"] {
-        let resp = conn.try_execute(&format!(
-            "SELECT new_col FROM {}",
-            vs_table("REFRESH_PARTIAL_VS", table)
-        ));
-        assert_eq!(
-            resp["status"].as_str(),
-            Some("error"),
-            "{table} must not expose NEW_COL before any REFRESH: {resp}"
-        );
+    let namespace = NamespaceIdent::new(NS_PARTIAL.to_string());
+    for (table, id, val) in PARTIAL_TABLES {
+        rt.block_on(drop_table_ignoring_missing(&catalog, &namespace, table));
+        rt.block_on(ensure_id_val_table(&catalog, NS_PARTIAL, table, id, val));
     }
 
-    rt.block_on(evolve_schema(
-        &catalog,
-        NS_PARTIAL,
-        "table_one",
-        id_val_schema_with_new_col,
-    ));
-    rt.block_on(evolve_schema(
-        &catalog,
-        NS_PARTIAL,
-        "table_two",
-        id_val_schema_with_new_col,
+    let mut conn = exa_conn();
+    create_legacy_virtual_schema(&mut conn);
+    create_schema_and_scripts_in(&mut conn, PARTIAL_ADAPTER_SCHEMA);
+
+    let single = format!("SELECT id FROM {}", vs_table(PARTIAL_VS, "table_one"));
+    let join = format!(
+        "SELECT a.val, b.val FROM {} a JOIN {} b ON a.id = b.id",
+        vs_table(PARTIAL_VS, "table_one"),
+        vs_table(PARTIAL_VS, "table_two")
+    );
+    let unhealed = ["TABLE_ONE", "ALTER VIRTUAL SCHEMA ... REFRESH"];
+    assert_query_fails(&mut conn, &single, &unhealed);
+    assert_query_fails(&mut conn, &join, &unhealed);
+
+    for table in ["table_one", "table_two"] {
+        rt.block_on(evolve_schema(
+            &catalog,
+            NS_PARTIAL,
+            table,
+            id_val_schema_with_new_col,
+        ));
+    }
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {PARTIAL_VS} REFRESH TABLES TABLE_ONE"
     ));
 
-    conn.execute("ALTER VIRTUAL SCHEMA REFRESH_PARTIAL_VS REFRESH TABLES TABLE_ONE");
-
-    let cols = conn.query_columns(&format!(
+    let rows = conn.query_columns(&format!(
         "SELECT id, new_col FROM {}",
-        vs_table("REFRESH_PARTIAL_VS", "table_one")
+        vs_table(PARTIAL_VS, "table_one")
     ));
+    assert_eq!(rows[0].len(), 1, "TABLE_ONE must return its row: {rows:?}");
+    assert!(rows[1][0].is_null(), "NEW_COL reads NULL: {rows:?}");
     assert_eq!(
-        cols[0].len(),
-        1,
-        "TABLE_ONE must still return its one row after a partial refresh: {cols:?}"
+        identifier_note(&mut conn, PARTIAL_VS, "TABLE_ONE").as_deref(),
+        Some(format!("{NS_PARTIAL}.table_one").as_str()),
+        "REFRESH TABLES TABLE_ONE must write TABLE_ONE's identifier note"
     );
     assert!(
-        cols[1][0].is_null(),
-        "TABLE_ONE's NEW_COL must be visible (NULL, no initial-default) after \
-         REFRESH TABLES TABLE_ONE: {cols:?}"
+        !declares_column(&mut conn, "TABLE_TWO", "NEW_COL"),
+        "REFRESH TABLES TABLE_ONE must leave TABLE_TWO's declaration alone"
+    );
+    let unhealed_two = ["TABLE_TWO", "ALTER VIRTUAL SCHEMA ... REFRESH"];
+    let two_only = format!("SELECT id FROM {}", vs_table(PARTIAL_VS, "table_two"));
+    assert_query_fails(&mut conn, &two_only, &unhealed_two);
+    assert_query_fails(&mut conn, &join, &unhealed_two);
+
+    conn.execute(&format!("ALTER VIRTUAL SCHEMA {PARTIAL_VS} REFRESH"));
+
+    assert_eq!(conn.query_scalar_i64(&single), 1);
+    let joined = conn.query_columns(&join);
+    assert_eq!(
+        joined[0].len(),
+        1,
+        "the join must return its one row: {joined:?}"
+    );
+    assert_eq!(parse_numeric(&joined[0][0]), 10.0);
+    assert_eq!(parse_numeric(&joined[1][0]), 20.0);
+    for (table, _, _) in PARTIAL_TABLES {
+        assert_eq!(
+            identifier_note(&mut conn, PARTIAL_VS, &table.to_uppercase()).as_deref(),
+            Some(format!("{NS_PARTIAL}.{table}").as_str()),
+            "REFRESH must write the identifier note of {table}"
+        );
+    }
+    assert!(
+        declares_column(&mut conn, "TABLE_TWO", "NEW_COL"),
+        "a full REFRESH must declare TABLE_TWO's NEW_COL"
     );
 
-    // Exasol does not scope REFRESH TABLES to requestedTables — verified live.
-    let cols_two = conn.query_columns(&format!(
-        "SELECT id, new_col FROM {}",
-        vs_table("REFRESH_PARTIAL_VS", "table_two")
+    // The local REST fixture answers `loadTable` of a table with unparseable metadata with
+    // HTTP 500, which fails the full listing but not a load that skips the table.
+    let three_declaration = declared_types(&mut conn, PARTIAL_VS, "TABLE_THREE");
+    let three_metadata = rt
+        .block_on(load(&catalog, NS_PARTIAL, "table_three"))
+        .metadata_location()
+        .expect("a REST-catalog table has a metadata location")
+        .to_string();
+    put_fixture_object(&three_metadata, Bytes::from_static(b"not a metadata file"));
+    query_error(
+        &mut conn,
+        &format!("ALTER VIRTUAL SCHEMA {PARTIAL_VS} REFRESH"),
+    );
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {PARTIAL_VS} REFRESH TABLES TABLE_ONE"
     ));
     assert_eq!(
-        cols_two[0].len(),
-        1,
-        "TABLE_TWO must still return its one row after a refresh naming only \
-         TABLE_ONE: {cols_two:?}"
+        declared_types(&mut conn, PARTIAL_VS, "TABLE_THREE"),
+        three_declaration,
+        "TABLE_THREE must keep its declaration"
     );
+
+    rt.block_on(catalog.drop_table(&TableIdent::new(namespace.clone(), "table_two".to_string())))
+        .unwrap_or_else(|e| panic!("drop table_two: {e}"));
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {PARTIAL_VS} REFRESH TABLES TABLE_TWO NO_SUCH_TABLE"
+    ));
+    let declared = enumerated_table_names(&mut conn, PARTIAL_VS);
     assert!(
-        cols_two[1][0].is_null(),
-        "TABLE_TWO's NEW_COL must ALSO be visible after REFRESH TABLES \
-         TABLE_ONE — Exasol applies the adapter's full-namespace response to \
-         every table regardless of requestedTables, so a partial refresh has \
-         the same real-world effect as a full REFRESH: {cols_two:?}"
+        !declared.contains(&"TABLE_TWO".to_string()),
+        "the dropped TABLE_TWO must be gone: {declared:?}"
+    );
+    assert_eq!(conn.query_scalar_i64(&single), 1);
+    assert_eq!(
+        declared_types(&mut conn, PARTIAL_VS, "TABLE_THREE"),
+        three_declaration,
+        "TABLE_THREE must stay declared"
     );
 }
 
+fn declares_column(conn: &mut ExaConn, table: &str, column: &str) -> bool {
+    declared_types(conn, PARTIAL_VS, table)
+        .iter()
+        .any(|(name, _)| name == column)
+}
+
+/// Scenario: Create virtual schema records each table's catalog identifier in the table's adapterNotes
+/// Scenario: A partial refresh resolves each requested name as a full refresh would
+/// Scenario: Multi-level Iceberg namespaces flatten deterministically into Exasol table names
 #[test]
 fn refresh_flatten_collision_returns_same_error_as_create() {
     stack();
@@ -485,9 +621,15 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
     rt.block_on(drop_table_if_exists(&catalog, &eu_ns, "orders"));
 
     rt.block_on(create_empty_table(&catalog, &top_ns, "baseline"));
+    rt.block_on(create_empty_table(&catalog, &eu_ns, "orders"));
 
     let mut conn = exa_conn();
     create_virtual_schema(&mut conn, "REFRESH_COLLISION_VS", NS_COLLISION);
+    assert_eq!(
+        identifier_note(&mut conn, "REFRESH_COLLISION_VS", "EU__ORDERS").as_deref(),
+        Some(format!("{NS_COLLISION}.eu.orders").as_str()),
+        "a descendant namespace's table records its multi-level identifier"
+    );
 
     let resp = conn.try_execute(&format!(
         "SELECT * FROM {}",
@@ -501,7 +643,6 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
 
     // Direct `eu__orders` and descendant `eu.orders` both flatten to `EU__ORDERS`.
     rt.block_on(create_empty_table(&catalog, &top_ns, "eu__orders"));
-    rt.block_on(create_empty_table(&catalog, &eu_ns, "orders"));
 
     let refresh_resp = conn.try_execute("ALTER VIRTUAL SCHEMA REFRESH_COLLISION_VS REFRESH");
     assert_eq!(
@@ -517,6 +658,17 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
     assert!(
         refresh_msg.contains("collision"),
         "refresh's collision error must mention 'collision': {refresh_msg}"
+    );
+
+    conn.execute("ALTER VIRTUAL SCHEMA REFRESH_COLLISION_VS REFRESH TABLES BASELINE");
+    let partial_msg = query_error(
+        &mut conn,
+        "ALTER VIRTUAL SCHEMA REFRESH_COLLISION_VS REFRESH TABLES EU__ORDERS",
+    );
+    assert!(
+        partial_msg.contains("EU__ORDERS") && partial_msg.contains("collision"),
+        "REFRESH TABLES EU__ORDERS loads both colliding tables and fails as REFRESH does: \
+         {partial_msg}"
     );
 
     let create_resp = conn.try_execute(&format!(
@@ -709,6 +861,29 @@ fn refresh_and_set_properties_rebuild_column_notes_from_the_source() {
         );
         assert_eq!(source_type(&notes, "EXTRA")["field_id"], 3, "{vs_name}");
     }
+
+    let with_bonus = [
+        long_field(1, "id", true),
+        long_field(2, "rating", false),
+        long_field(3, "extra", false),
+        long_field(4, "bonus", false),
+    ];
+    rt.block_on(evolve_schema(&catalog, NS_RENOTES, "scores", |id| {
+        schema_of(id, &with_bonus)
+    }));
+    conn.execute("ALTER VIRTUAL SCHEMA REFRESH_RENOTES_VS REFRESH TABLES SCORES");
+
+    let notes = column_adapter_notes(&mut conn, "REFRESH_RENOTES_VS", "SCORES");
+    let columns: Vec<&str> = notes.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(columns, ["BONUS", "EXTRA", "ID", "RATING"]);
+    assert_eq!(
+        (
+            &source_type(&notes, "RATING")["name"],
+            &source_type(&notes, "BONUS")["field_id"]
+        ),
+        (&Json::from("rating"), &Json::from(4)),
+        "REFRESH TABLES SCORES must rebuild every column note from the source"
+    );
 }
 
 /// Scenario: A column renamed at the source after the last REFRESH reads under its declared name

@@ -144,6 +144,30 @@ pub struct CatalogListing {
     pub skipped: Vec<SkippedTable>,
 }
 
+/// How a listing classified one table. Each catalog kind decides it in one function that both
+/// of its listing paths call, so they agree on admission and skip reason.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableAdmission {
+    Admitted(CatalogTable),
+    Skipped(SkippedTable),
+}
+
+impl FromIterator<TableAdmission> for CatalogListing {
+    fn from_iter<I: IntoIterator<Item = TableAdmission>>(admissions: I) -> Self {
+        let mut listing = CatalogListing {
+            tables: Vec::new(),
+            skipped: Vec::new(),
+        };
+        for admission in admissions {
+            match admission {
+                TableAdmission::Admitted(table) => listing.tables.push(table),
+                TableAdmission::Skipped(entry) => listing.skipped.push(entry),
+            }
+        }
+        listing
+    }
+}
+
 /// Boxed futures instead of `async fn` keep the trait dyn-compatible without an
 /// `async-trait` dependency.
 pub trait CatalogClient: Send + Sync {
@@ -151,6 +175,20 @@ pub trait CatalogClient: Send + Sync {
     fn list_tables(
         &self,
         namespace: &[String],
+    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>>;
+
+    /// Every identifier `list_tables` would return or skip, in listing order, without loading
+    /// any table's metadata, so a caller can pick tables by name before paying for their loads.
+    fn list_table_idents(
+        &self,
+        namespace: &[String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogTableIdent>, UdfError>> + Send + '_>>;
+
+    /// Admits or skips exactly the given listed identifiers as `list_tables` would, and loads
+    /// no other table, so a table outside `idents` cannot fail the call.
+    fn load_listed_tables(
+        &self,
+        idents: &[CatalogTableIdent],
     ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>>;
 
     fn load_table(
@@ -177,7 +215,10 @@ impl IcebergRestCatalogClient {
     }
 
     /// One session for the whole batch; none (and no OAuth2 grant) for an empty one.
-    async fn resolve_listing(&self, idents: &[TableIdent]) -> Result<CatalogListing, UdfError> {
+    async fn resolve_listing(
+        &self,
+        idents: &[CatalogTableIdent],
+    ) -> Result<CatalogListing, UdfError> {
         if idents.is_empty() {
             return Ok(CatalogListing {
                 tables: Vec::new(),
@@ -188,21 +229,28 @@ impl IcebergRestCatalogClient {
         let session =
             CatalogSession::resolve(&self.catalog_uri, &self.creds.warehouse, &self.creds).await?;
 
-        let mut tables = Vec::with_capacity(idents.len());
-        let mut skipped = Vec::new();
-        for table_ident in idents {
-            let ident = neutral_ident(table_ident);
-            match self.load_on_session(&session, &ident).await {
-                Ok(table) => tables.push(table),
-                Err(err) if is_not_loadable_iceberg_table(&err) => skipped.push(SkippedTable {
-                    ident,
-                    reason: SkipReason::NotLoadableIcebergTable,
-                }),
-                Err(err) => return Err(err),
-            }
+        let mut admissions = Vec::with_capacity(idents.len());
+        for ident in idents {
+            admissions.push(self.admit_on_session(&session, ident).await?);
         }
+        Ok(admissions.into_iter().collect())
+    }
 
-        Ok(CatalogListing { tables, skipped })
+    async fn admit_on_session(
+        &self,
+        session: &CatalogSession,
+        ident: &CatalogTableIdent,
+    ) -> Result<TableAdmission, UdfError> {
+        match self.load_on_session(session, ident).await {
+            Ok(table) => Ok(TableAdmission::Admitted(table)),
+            Err(err) if is_not_loadable_iceberg_table(&err) => {
+                Ok(TableAdmission::Skipped(SkippedTable {
+                    ident: ident.clone(),
+                    reason: SkipReason::NotLoadableIcebergTable,
+                }))
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// No metadata location: this catalog serves the metadata itself, with any vended
@@ -228,11 +276,30 @@ impl CatalogClient for IcebergRestCatalogClient {
     ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
         let namespace = namespace.to_vec();
         Box::pin(async move {
+            let idents = self.list_table_idents(&namespace).await?;
+            self.resolve_listing(&idents).await
+        })
+    }
+
+    fn list_table_idents(
+        &self,
+        namespace: &[String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogTableIdent>, UdfError>> + Send + '_>> {
+        let namespace = namespace.to_vec();
+        Box::pin(async move {
             let idents =
                 list_namespace_tables(&self.catalog_uri, &namespace, &self.storage, &self.creds)
                     .await?;
-            self.resolve_listing(&idents).await
+            Ok(idents.iter().map(neutral_ident).collect())
         })
+    }
+
+    fn load_listed_tables(
+        &self,
+        idents: &[CatalogTableIdent],
+    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
+        let idents = idents.to_vec();
+        Box::pin(async move { self.resolve_listing(&idents).await })
     }
 
     fn load_table(
@@ -286,8 +353,9 @@ fn neutral_ident(ident: &TableIdent) -> CatalogTableIdent {
     }
 }
 
-/// The dotted `TABLE_MAP` value, parsed back by `parse_table_ident`. A segment carrying a dot
-/// does not round-trip, so this join is the last step.
+/// The dotted identifier recorded in a virtual table's identifier note, parsed back by
+/// `parse_table_ident`. A segment carrying a dot does not round-trip, so this join is the last
+/// step.
 pub fn catalog_identifier_string(ident: &CatalogTableIdent) -> String {
     let mut parts: Vec<&str> = ident.namespace.iter().map(String::as_str).collect();
     parts.push(&ident.name);

@@ -9,9 +9,9 @@ use common::e2e_harness::{
     assert_decimal_orders_numerically, assert_query_fails, assert_type_matrix,
     column_adapter_notes, create_schema_and_scripts, create_virtual_schema_with_password,
     declared_schema_of, declared_types, enumerated_table_names, exa_conn, explain_virtual_sql,
-    has_broadcast_join_block, has_two_scan_wrapper, install_slc, local_stack_creds, note_of, pairs,
-    parse_int, parse_numeric, partition_positions, query_error, reads, refuses, runtime, upload_so,
-    value_to_string,
+    has_broadcast_join_block, has_two_scan_wrapper, identifier_note, install_slc,
+    local_stack_creds, note_of, pairs, parse_int, parse_numeric, partition_positions, query_error,
+    reads, refuses, runtime, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
@@ -726,6 +726,9 @@ fn assert_col_type(cols: &[(String, String)], column: &str, expected: &str) {
     assert_eq!(actual, expected, "column {column}");
 }
 
+/// Scenario: A scoped refresh lists Unity table names without columns and loads only the requested tables
+/// Scenario: Create virtual schema records each table's Unity Catalog identifier in its identifier note
+/// Scenario: A Unity Catalog table's identity survives the round trip from the involved table
 #[test]
 fn unity_create_virtual_schema_lists_fixture_tables_and_columns() {
     setup();
@@ -737,6 +740,12 @@ fn unity_create_virtual_schema_lists_fixture_tables_and_columns() {
             tables.iter().any(|t| t == expected),
             "createVirtualSchema must enumerate the seeded '{expected}' fixture table; got {tables:?}"
         );
+        let identifier = identifier_note(&mut conn, VS_NAME, expected)
+            .unwrap_or_else(|| panic!("{expected} must carry an identifier note"));
+        assert!(
+            identifier.eq_ignore_ascii_case(&format!("{UNITY_NAMESPACE}.{expected}")),
+            "{expected}'s note must name its catalog.schema.table identifier, got {identifier}"
+        );
     }
 
     let cm_cols = declared_types(&mut conn, VS_NAME, "CM_NAME_MODE");
@@ -746,6 +755,60 @@ fn unity_create_virtual_schema_lists_fixture_tables_and_columns() {
 
     let stats_cols = declared_types(&mut conn, VS_NAME, "STATS_ALL_TYPES");
     assert_col_type(&stats_cols, "ARRAY_COL", "VARCHAR(2000000)");
+
+    let named = "CM_NAME_MODE";
+    let others: Vec<&str> = EXPECTED_TABLES
+        .iter()
+        .copied()
+        .filter(|table| *table != named)
+        .collect();
+    let named_notes = column_adapter_notes(&mut conn, VS_NAME, named);
+    let other_declarations: Vec<_> = others
+        .iter()
+        .map(|table| declared_types(&mut conn, VS_NAME, table))
+        .collect();
+    let other_answers = count_statuses(&mut conn, &others);
+    assert!(
+        other_answers.iter().any(|(_, status)| status == "ok"),
+        "the unrequested fixture tables must include a queryable one: {other_answers:?}"
+    );
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {VS_NAME} REFRESH TABLES {named} NO_SUCH_TABLE"
+    ));
+    assert_eq!(
+        column_adapter_notes(&mut conn, VS_NAME, named),
+        named_notes,
+        "REFRESH TABLES {named} re-declares {named} from the unchanged source"
+    );
+    let identifier = identifier_note(&mut conn, VS_NAME, named)
+        .unwrap_or_else(|| panic!("{named} must keep its identifier note"));
+    assert!(
+        identifier.eq_ignore_ascii_case(&format!("{UNITY_NAMESPACE}.{named}")),
+        "{named}'s note must still name its catalog.schema.table identifier, got {identifier}"
+    );
+    for (table, declaration) in others.iter().zip(other_declarations) {
+        assert_eq!(
+            declared_types(&mut conn, VS_NAME, table),
+            declaration,
+            "the unrequested {table} keeps its declaration"
+        );
+    }
+    assert_eq!(
+        count_statuses(&mut conn, &others),
+        other_answers,
+        "every unrequested table answers a query as it did before REFRESH TABLES"
+    );
+}
+
+/// Each table's `SELECT COUNT(*)` outcome: a fixture table that is refused at scan stays refused.
+fn count_statuses(conn: &mut ExaConn, tables: &[&str]) -> Vec<(String, String)> {
+    tables
+        .iter()
+        .map(|table| {
+            let response = conn.try_execute(&format!("SELECT COUNT(*) FROM {VS_NAME}.{table}"));
+            (table.to_string(), value_to_string(&response["status"]))
+        })
+        .collect()
 }
 
 #[test]

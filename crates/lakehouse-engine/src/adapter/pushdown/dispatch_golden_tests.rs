@@ -2,7 +2,9 @@
 //! full-string `assert_eq!`. The `empty_*` fixtures carry no `storage` value, so a
 //! diff in one of them is always a regression, never an expected update.
 
-use super::test_support::{agg_item, pd, sample_scan_storage, sample_storage};
+use super::test_support::{
+    agg_item, pd, sample_scan_storage, sample_storage, with_identifier_notes,
+};
 use super::*;
 
 fn fixed_shards() -> Vec<Vec<FileEntry>> {
@@ -791,25 +793,23 @@ fn two_table_join_request(filter: Option<Json>) -> Json {
     if let Some(f) = filter {
         pushdown_req["filter"] = f;
     }
-    serde_json::json!({
-        "involvedTables": [
-            {"name": "CUSTOMER", "columns": [
-                {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
-            ]},
-            {"name": "ORDERS", "columns": [
-                {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "O_ORDERDATE", "dataType": {"type": "date"}},
-            ]},
-        ],
-        "pushdownRequest": pushdown_req,
-        "schemaMetadataInfo": {
-            "properties": {},
-            "adapterNotes": serde_json::json!({
-                "TABLE_MAP": {"CUSTOMER": "lh.customer", "ORDERS": "lh.orders"}
-            }).to_string(),
-        },
-    })
+    with_identifier_notes(
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "CUSTOMER", "columns": [
+                    {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
+                ]},
+                {"name": "ORDERS", "columns": [
+                    {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "O_ORDERDATE", "dataType": {"type": "date"}},
+                ]},
+            ],
+            "pushdownRequest": pushdown_req,
+            "schemaMetadataInfo": {"properties": {}},
+        }),
+        &[("CUSTOMER", "lh.customer"), ("ORDERS", "lh.orders")],
+    )
 }
 
 fn two_table_detected_join(request: &Json) -> DetectedJoin {

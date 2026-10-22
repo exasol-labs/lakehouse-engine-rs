@@ -23,8 +23,8 @@ mod test_support;
 pub use client::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogPartition, CatalogTable,
     CatalogTableIdent, CatalogTableType, ColumnSourceType, HIVE_DEFAULT_PARTITION,
-    IcebergRestCatalogClient, PartitionFormat, SkipReason, SkippedTable, TableFormat,
-    catalog_identifier_string,
+    IcebergRestCatalogClient, PartitionFormat, SkipReason, SkippedTable, TableAdmission,
+    TableFormat, catalog_identifier_string,
 };
 pub use creds::{CatalogProps, ConnectionCreds, StorageCreds, StorageProps};
 pub use glue::{GlueCatalogSession, parse_glue_table_ident};

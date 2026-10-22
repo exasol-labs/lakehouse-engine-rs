@@ -713,20 +713,47 @@ pub fn assert_refused_column(
     conn.query_columns(&format!("SELECT ID FROM {table_ref}"));
 }
 
-/// The reason `SKIPPED_TABLES` records for `table`, or `None` when the table is not skipped.
-pub fn skip_reason(conn: &mut ExaConn, vs_name: &str, table: &str) -> Option<String> {
+/// Every `(table, reason)` entry of `SKIPPED_TABLES`, in its recorded order. Every skipped-table
+/// assertion reads through it, so no test parses the schema-level notes itself.
+pub fn skipped_entries(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
     let notes = conn.query_columns(&format!(
         "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = '{vs_name}'"
     ));
     let notes: serde_json::Value = serde_json::from_str(&value_to_string(&notes[0][0]))
         .unwrap_or_else(|e| panic!("ADAPTER_NOTES must be JSON: {e}"));
-    let skipped = notes["SKIPPED_TABLES"]
+    notes["SKIPPED_TABLES"]
         .as_array()
-        .unwrap_or_else(|| panic!("ADAPTER_NOTES must carry SKIPPED_TABLES: {notes}"));
-    skipped
+        .unwrap_or_else(|| panic!("ADAPTER_NOTES must carry SKIPPED_TABLES: {notes}"))
         .iter()
-        .find(|entry| value_to_string(&entry["table"]) == table)
-        .map(|entry| value_to_string(&entry["reason"]))
+        .map(|entry| {
+            (
+                value_to_string(&entry["table"]),
+                value_to_string(&entry["reason"]),
+            )
+        })
+        .collect()
+}
+
+/// The reason `SKIPPED_TABLES` records for `table`, or `None` when the table is not skipped.
+pub fn skip_reason(conn: &mut ExaConn, vs_name: &str, table: &str) -> Option<String> {
+    skipped_entries(conn, vs_name)
+        .into_iter()
+        .find(|(skipped, _)| skipped == table)
+        .map(|(_, reason)| reason)
+}
+
+/// The catalog identifier in the `name` member of the identifier note on `table`'s
+/// `SYS.EXA_ALL_VIRTUAL_TABLES.ADAPTER_NOTES`, or `None` when the table has no note or no virtual
+/// table. Every identifier-note assertion goes through it, so no test parses the note.
+pub fn identifier_note(conn: &mut ExaConn, vs_name: &str, table: &str) -> Option<String> {
+    let notes = conn.query_columns(&format!(
+        "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_TABLES \
+         WHERE TABLE_SCHEMA = '{vs_name}' AND TABLE_NAME = '{table}'"
+    ));
+    let note = notes[0].first().filter(|note| !note.is_null())?;
+    let note: serde_json::Value = serde_json::from_str(&value_to_string(note))
+        .unwrap_or_else(|e| panic!("the identifier note of {vs_name}.{table} must be JSON: {e}"));
+    note["name"].as_str().map(str::to_string)
 }
 
 pub fn note_of<'a>(

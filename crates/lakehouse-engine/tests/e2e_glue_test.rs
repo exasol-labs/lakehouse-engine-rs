@@ -8,18 +8,18 @@ use common::e2e_harness::{
     SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_binary_values_refused,
     assert_decimal_orders_numerically, assert_notes_well_formed, assert_text_columns,
     assert_type_matrix, column_adapter_notes, create_schema_and_scripts, declared_types, exa_conn,
-    explain_virtual_sql, install_slc, int_column, note_of, pairs, parse_int, partition_positions,
-    query_error, reads, refuses, runtime, try_create_virtual_schema_with_password, upload_so,
-    value_to_string,
+    explain_virtual_sql, identifier_note, install_slc, int_column, note_of, pairs, parse_int,
+    partition_positions, query_error, reads, refuses, runtime, skipped_entries,
+    try_create_virtual_schema_with_password, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::glue::{
-    ACCESS_KEY_ID_VAR, ALL_TYPES, BINARY_VALUES, FixturePartition, GlueEnv, GlueRun,
-    ICEBERG_ORDERS, ORC_INPUT_FORMAT, ORDERS, PARTITIONED, PARTITIONS, PartitionedRow,
-    ROUTED_TABLES, SECRET_ACCESS_KEY_VAR, SKIPPED_TABLES, STALE_GLUE_COLUMN, SUCCESS_MARKER,
-    glue_assume_role_connection_password, glue_base_identity_connection_password,
-    glue_connection_password, metadata_only_keys, partitioned_rows, register_fixture_set,
-    register_probe_table,
+    ACCESS_KEY_ID_VAR, ALL_TYPES, BINARY_VALUES, BROKEN_ICEBERG, FixturePartition, GlueEnv,
+    GlueRun, ICEBERG_ORDERS, ORC_INPUT_FORMAT, ORC_TABLE, ORDERS, PARTITIONED, PARTITIONS,
+    PartitionedRow, ROUTED_TABLES, SECRET_ACCESS_KEY_VAR, SKIPPED_TABLES, STALE_GLUE_COLUMN,
+    SUCCESS_MARKER, glue_assume_role_connection_password, glue_base_identity_connection_password,
+    glue_connection_password, metadata_only_keys, partitioned_rows, register_broken_iceberg_table,
+    register_fixture_set, register_probe_table,
 };
 use common::seed::{
     ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DATE_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT,
@@ -211,14 +211,15 @@ fn glue_run_resources_are_removed_when_the_scope_ends_including_on_panic() {
     assert_present(&database, &prefix, false, "a scope that ends in a panic");
 }
 
-type ReadOnlyCheck = fn(&GlueRun, &mut ExaConn);
+type FixtureCheck = fn(&GlueRun, &mut ExaConn);
 
-/// Every check here only reads the fixture, so one provisioning serves them all. Each check runs
-/// even after another failed, and the panic hook has already printed each failure.
+/// One provisioning serves every check. Each check but the last only reads the fixture, and the
+/// last breaks every later full REFRESH of it, so it runs after them. Each check runs even after
+/// another failed, and the panic hook has already printed each failure.
 #[test]
-fn glue_read_only_checks_pass_against_one_provisioned_fixture() {
+fn glue_checks_pass_against_one_provisioned_fixture() {
     let run = provision();
-    let checks: [(&str, ReadOnlyCheck); 8] = [
+    let checks: [(&str, FixtureCheck); 10] = [
         (
             "listing",
             check_listing_includes_routed_tables_and_records_every_skip,
@@ -245,6 +246,14 @@ fn glue_read_only_checks_pass_against_one_provisioned_fixture() {
             "assume role",
             check_assume_role_connection_reads_through_the_role,
         ),
+        (
+            "refresh tables",
+            check_refresh_tables_redeclares_only_the_named_tables,
+        ),
+        (
+            "broken table",
+            check_a_broken_unrequested_table_fails_only_a_full_refresh,
+        ),
     ];
     let failed: Vec<&str> = checks
         .iter()
@@ -253,7 +262,7 @@ fn glue_read_only_checks_pass_against_one_provisioned_fixture() {
         })
         .map(|(name, _)| *name)
         .collect();
-    assert!(failed.is_empty(), "failed read-only checks: {failed:?}");
+    assert!(failed.is_empty(), "failed checks: {failed:?}");
 }
 
 /// Scenario: The client routes a table by its declared table type before its storage descriptor
@@ -268,6 +277,13 @@ fn check_listing_includes_routed_tables_and_records_every_skip(run: &GlueRun, co
         listed, routed,
         "the listing admits exactly the routed tables"
     );
+    for table in ROUTED_TABLES {
+        assert_eq!(
+            identifier_note(conn, VS, &table.to_uppercase()),
+            Some(format!("{}.{table}", run.database())),
+            "{table}'s note must name its Glue identifier"
+        );
+    }
 
     assert_eq!(
         declared_types(conn, VS, ICEBERG_ORDERS),
@@ -290,37 +306,8 @@ fn check_listing_includes_routed_tables_and_records_every_skip(run: &GlueRun, co
         ]),
         "a Parquet table declares its storage columns, then its partition keys"
     );
-    let notes = conn.query_columns(&format!(
-        "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = '{VS}'"
-    ));
-    let notes: Value = serde_json::from_str(&value_to_string(&notes[0][0]))
-        .unwrap_or_else(|e| panic!("ADAPTER_NOTES must be JSON: {e}"));
-    let skipped = notes["SKIPPED_TABLES"]
-        .as_array()
-        .unwrap_or_else(|| panic!("ADAPTER_NOTES must carry SKIPPED_TABLES: {notes}"));
-    let recorded: BTreeSet<String> = skipped
-        .iter()
-        .map(|entry| value_to_string(&entry["table"]))
-        .collect();
     let database = run.database();
-    let expected: BTreeSet<String> = SKIPPED_TABLES
-        .iter()
-        .map(|(name, _)| format!("{database}.{name}"))
-        .collect();
-    assert_eq!(
-        recorded, expected,
-        "SKIPPED_TABLES records every skip: {notes}"
-    );
-    for (name, reason) in SKIPPED_TABLES {
-        let entry = skipped
-            .iter()
-            .find(|entry| value_to_string(&entry["table"]) == format!("{database}.{name}"))
-            .expect("checked above");
-        assert!(
-            value_to_string(&entry["reason"]).contains(reason),
-            "the skip of {name} must state {reason:?}: {entry}"
-        );
-    }
+    assert_records_every_skip(conn, &database);
 
     let env = run.env();
     let objects = env.expect(
@@ -335,6 +322,127 @@ fn check_listing_includes_routed_tables_and_records_every_skip(run: &GlueRun, co
              rests on metadata alone"
         );
     }
+}
+
+/// Scenario: A scoped refresh lists Glue table names and loads only the requested tables
+fn check_refresh_tables_redeclares_only_the_named_tables(run: &GlueRun, conn: &mut ExaConn) {
+    let routed: Vec<String> = ROUTED_TABLES.iter().map(|t| t.to_uppercase()).collect();
+    let database = run.database();
+    let named = ICEBERG_ORDERS.to_uppercase();
+    let others: Vec<String> = ROUTED_TABLES
+        .iter()
+        .filter(|table| **table != ICEBERG_ORDERS)
+        .map(|table| table.to_uppercase())
+        .collect();
+    let named_notes = column_adapter_notes(conn, VS, &named);
+    let other_declarations: Vec<_> = others
+        .iter()
+        .map(|table| declared_types(conn, VS, table))
+        .collect();
+    let other_answers = count_statuses(conn, &others);
+    assert!(
+        other_answers.iter().any(|(_, status)| status == "ok"),
+        "the unrequested routed tables must include a queryable one: {other_answers:?}"
+    );
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {VS} REFRESH TABLES {named} {}",
+        ORC_TABLE.to_uppercase()
+    ));
+    assert_eq!(
+        column_adapter_notes(conn, VS, &named),
+        named_notes,
+        "REFRESH TABLES {named} re-declares {named} from the unchanged source"
+    );
+    assert_eq!(
+        identifier_note(conn, VS, &named),
+        Some(format!("{database}.{ICEBERG_ORDERS}")),
+        "{named} keeps its identifier note"
+    );
+    for (table, declaration) in others.iter().zip(other_declarations) {
+        assert_eq!(
+            declared_types(conn, VS, table),
+            declaration,
+            "the unrequested {table} keeps its declaration"
+        );
+    }
+    assert_eq!(
+        count_statuses(conn, &others),
+        other_answers,
+        "every unrequested table answers a query as it did before REFRESH TABLES"
+    );
+    let listed: Vec<String> = conn.query_columns(&format!(
+        "SELECT TABLE_NAME FROM SYS.EXA_ALL_VIRTUAL_TABLES WHERE TABLE_SCHEMA = '{VS}' \
+         ORDER BY TABLE_NAME"
+    ))[0]
+        .iter()
+        .map(value_to_string)
+        .collect();
+    assert_eq!(
+        listed, routed,
+        "the requested, skipped {ORC_TABLE} stays undeclared"
+    );
+    assert_records_every_skip(conn, &database);
+}
+
+/// Each table's `SELECT COUNT(*)` outcome, so a check compares queryability before and after.
+fn count_statuses(conn: &mut ExaConn, tables: &[String]) -> Vec<(String, String)> {
+    tables
+        .iter()
+        .map(|table| {
+            let response = conn.try_execute(&format!("SELECT COUNT(*) FROM {VS}.{table}"));
+            (table.clone(), value_to_string(&response["status"]))
+        })
+        .collect()
+}
+
+/// `SKIPPED_TABLES` records exactly the fixture's skips, each stating its reason.
+fn assert_records_every_skip(conn: &mut ExaConn, database: &str) {
+    let skipped = skipped_entries(conn, VS);
+    let recorded: BTreeSet<&str> = skipped.iter().map(|(table, _)| table.as_str()).collect();
+    let expected: Vec<String> = SKIPPED_TABLES
+        .iter()
+        .map(|(name, _)| format!("{database}.{name}"))
+        .collect();
+    assert_eq!(
+        recorded,
+        expected.iter().map(String::as_str).collect(),
+        "SKIPPED_TABLES records every skip: {skipped:?}"
+    );
+    for (name, reason) in SKIPPED_TABLES {
+        let table = format!("{database}.{name}");
+        let (_, recorded_reason) = skipped
+            .iter()
+            .find(|(skipped_table, _)| *skipped_table == table)
+            .expect("checked above");
+        assert!(
+            recorded_reason.contains(reason),
+            "the skip of {name} must state {reason:?}: {recorded_reason}"
+        );
+    }
+}
+
+/// Scenario: A partial refresh loads the metadata of the requested tables only
+/// Scenario: A scoped refresh lists Glue table names and loads only the requested tables
+fn check_a_broken_unrequested_table_fails_only_a_full_refresh(run: &GlueRun, conn: &mut ExaConn) {
+    let env = run.env();
+    env.expect(
+        runtime().block_on(register_broken_iceberg_table(run)),
+        &format!("register {BROKEN_ICEBERG} in {}", run.database()),
+    );
+    let error = env.redact(&query_error(
+        conn,
+        &format!("ALTER VIRTUAL SCHEMA {VS} REFRESH"),
+    ));
+    let broken = format!("{}.{BROKEN_ICEBERG}", run.database());
+    assert!(
+        error.contains(&broken),
+        "a full REFRESH must fail naming {broken}: {error}"
+    );
+    let partitioned = PARTITIONED.to_uppercase();
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {VS} REFRESH TABLES {partitioned}"
+    ));
+    conn.query_columns(&format!("SELECT COUNT(*) FROM {VS}.{partitioned}"));
 }
 
 /// Scenario: Every declared column carries its source shape in its adapterNotes
