@@ -1,41 +1,13 @@
-# Feature: DataFusion Scan Execution — On-Demand Phase Telemetry
+# Feature: DataFusion Scan Execution, On-Demand Phase Telemetry
 
-Adds opt-in, config-gated phase timing to the scan UDF so an operator running a
-benchmark can attribute a query's wall-clock to its three coarse phases —
-UDF/DataFusion startup, object-storage import (read), and send-back/emit to
-Exasol — to localize the throughput bottleneck. Telemetry is silent and
-effectively zero-overhead in production: it emits nothing unless explicitly
-enabled, and final benchmark measurement runs execute with it OFF.
+The scan UDF can report phase timings so an operator running a benchmark can attribute a query's wall-clock to startup, object-storage import, and send-back to Exasol. Telemetry emits nothing unless enabled.
 
 ## Background
 
-* Telemetry reuses the lc-rs 0.19.0 debug surface: the per-UDF-tagged emit
-  channel keyed by `LAKEHOUSE_UDF_DEBUG_LEVEL` (default `info`), `udf_log!`, and
-  `ctx.debug_level()`. Phase-timing lines are emitted only at `debug` level (or a
-  dedicated telemetry flag); at the default level the scan UDF emits no telemetry.
-* The phase timing builds on the reusable per-process checkpoint infrastructure
-  preserved on `archive/udf-diagnostics-checkpoints`
-  (`crates/lakehouse-engine/src/scan/diagnostics.rs`): a process-global monotonic
-  sequence, per-PID file isolation so concurrent shard VMs never interleave, and
-  best-effort RSS sampling from `/proc/self/statm`. Telemetry adds wall-clock
-  phase boundaries (`std::time::Instant`) around the existing checkpoint sites
-  rather than designing a new mechanism.
-* Exactly three phases are timed, measured with a monotonic clock so they are not
-  perturbed by wall-clock adjustment: (a) **startup** — from UDF entry through
-  Tokio-runtime build, session-context build, and plan construction, up to the
-  first batch fetch; (b) **object-storage import** — cumulative time awaiting
-  batches from the DataFusion stream (the S3 read + Parquet decode the stream
-  drives); (c) **send-back/emit** — cumulative time inside `emit_batch` / `emit`
-  flushes returning batches to Exasol. The three SHALL sum to the scan body's
-  wall-clock within measurement error.
-* Telemetry is best-effort and MUST NOT alter scan results: a timing or logging
-  failure never fails the query, and the timing instrumentation MUST NOT change
-  the streaming discipline (one batch fetched, emitted, dropped before the next).
-* The object-storage-import timing is the lever that later reveals S3 travel cost
-  when an in-VPC S3 is introduced (a separate future plan); this feature only
-  provides the measurement surface.
-* See `datafusion-scan/scan-execution` for the core scan and streaming scenarios
-  and the project CLAUDE.md "Live debugging" notes for the lc-rs debug surface.
+* Telemetry uses the per-UDF-tagged debug emit channel keyed by `LAKEHOUSE_UDF_DEBUG_LEVEL` (default `info`), `udf_log!`, and `ctx.debug_level()`. Phase-timing lines appear only at `debug` level.
+* Timing builds on the checkpoint infrastructure in the scan diagnostics module: a process-global monotonic sequence, per-PID file isolation so concurrent shard VMs never interleave, and best-effort RSS sampling from `/proc/self/statm`.
+* Three phases are timed with a monotonic clock. Startup runs from UDF entry through Tokio-runtime build, session-context build, and plan construction, up to the first batch fetch. Object-storage import is the cumulative time awaiting batches from the DataFusion stream (the S3 read and Parquet decode). Send-back/emit is the cumulative time inside `emit_batch` and `emit` flushes. The three sum to the scan body's wall-clock within measurement error.
+* Telemetry never alters scan results. A timing or logging failure does not fail the query, and the instrumentation does not change the streaming discipline: one batch fetched, emitted, and dropped before the next.
 
 ## Scenarios
 

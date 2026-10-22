@@ -1,16 +1,15 @@
 # Feature: Binary Column Refusal
 
-Refuses at plan time every column whose type is binary, on every source and at every depth, until issue #351 defines a faithful rendering for binary. The listing still declares each such column, so only a query that reads it fails.
+The adapter refuses at plan time every column whose type is binary, on every source and at every depth. The listing still declares each such column, so only a query that reads it fails.
 
 ## Background
 
-* Iceberg declares three binary types. Iceberg table spec, § Primitive Types: `binary` is an "Arbitrary-length byte array", `fixed(L)` is a "Fixed-length byte array of length L", and `uuid` holds "Universally unique identifiers" and "Should use 16-byte fixed". Refusing them is a deliberate, scoped exception until #351.
-* Delta, Unity Catalog, and Glue declare one binary type, `binary`.
+* Iceberg declares three binary types: `binary`, `fixed(L)`, and `uuid` (Iceberg table spec, Primitive Types). Delta, Unity Catalog, and Glue declare one, `binary`.
 * A catalog-declared source decides by its declared type, never by a data file's physical type.
-* Direct storage declares no table type, so it decides by what each Parquet file declares. Parquet LogicalTypes, § STRING: "`STRING` may only be used to annotate the `BYTE_ARRAY` primitive type and indicates that the byte array should be interpreted as a UTF-8 encoded character string." § ENUM: "Applications using a data model lacking a native enum type should interpret `ENUM` annotated field as a UTF-8 encoded string." § UUID: "`UUID` annotates a 16-byte `FIXED_LEN_BYTE_ARRAY` primitive type."
-* `parquet` 58.3.0 (the locked version) folds an unannotated `BYTE_ARRAY` and the `ENUM`, `BSON`, `GEOMETRY`, and `GEOGRAPHY` annotations to Arrow `Binary` (`src/arrow/schema/primitive.rs:280-300`), and a `UUID`-annotated or unannotated `FIXED_LEN_BYTE_ARRAY(L)` to `FixedSizeBinary(L)` (`:348`). An embedded Arrow schema can fold an unannotated `BYTE_ARRAY` to `LargeBinary` or `BinaryView` instead.
-* An unannotated `BYTE_ARRAY` holds either a legacy string (Impala and Hive write strings this way) or arbitrary bytes, and the footer cannot tell them apart. Refusing it and a `UUID` column is a user-approved breaking change.
-* A top-level `ENUM` column is text by the Parquet spec, so it is read as text. A nested `ENUM` member is refused, because the JSON renderer reads a member's physical type and would render the text as hexadecimal (#TBD).
+* Direct storage declares no table type, so it decides by what each Parquet file declares.
+* The locked `parquet` crate folds an unannotated `BYTE_ARRAY` and the `ENUM`, `BSON`, `GEOMETRY`, and `GEOGRAPHY` annotations to Arrow `Binary`. It folds a `UUID`-annotated or unannotated `FIXED_LEN_BYTE_ARRAY(L)` to `FixedSizeBinary(L)`. An embedded Arrow schema can fold an unannotated `BYTE_ARRAY` to `LargeBinary` or `BinaryView` instead.
+* An unannotated `BYTE_ARRAY` holds either a legacy string (Impala and Hive write strings this way) or arbitrary bytes, and the footer cannot tell them apart, so the adapter refuses it.
+* The Parquet spec defines a top-level `ENUM` column as UTF-8 text, so it is read as text. A nested `ENUM` member is refused, because the JSON renderer reads a member's physical type and would render the text as hexadecimal.
 * The refusal reason names the type in the source's own terms: `binary`, `fixed(L)`, or `uuid`, and on direct storage also `bson`, `geometry`, or `geography`.
 
 ## Scenarios

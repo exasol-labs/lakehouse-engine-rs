@@ -1,29 +1,10 @@
-# Feature: VS Expression Translator — Predicates
+# Feature: VS Expression Translator, Predicates
 
-Extends the VS expression translator (`sql-comprehension/vs-expression-translator`) with the
-filter-predicate operator set — comparison, logical connectives, IS NULL / IS NOT NULL, IN over a
-constant list, BETWEEN, and LIKE. Split
-out of the core translator spec to keep that spec's scenario count within the domain's convention
-(mirroring the existing `-scalar-fns`/`-date-fns`/`-scalar-ops`/`-literals` splits).
+Extends the VS expression translator (`sql-comprehension/vs-expression-translator`) with the filter-predicate operator set: comparison, logical connectives, IS NULL / IS NOT NULL, IN over a constant list, BETWEEN, and LIKE.
 
 ## Background
 
-* This feature shares the six public entry points of `crates/vs-expression` — the DataFusion trio
-  (`render_expression`, `render_expression_safe`, `render_df_filter_safe`) and the Exasol trio
-  (`render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe`);
-  predicate rendering is a set of arms inside the same recursive walker.
-* Comparison predicates, logical connectives, IS NULL / IS NOT NULL, IN over a constant list,
-  BETWEEN, and LIKE all render byte-identically in both dialects, because their operator syntax is
-  shared by both parsers — none needs the per-dialect branching `sql-comprehension/vs-expression-translator`
-  describes for named scalar functions.
-* Exasol and DataFusion diverge on NULL handling inside an IN list: Exasol ignores NULL entries
-  under both `IN` and `NOT IN`, while DataFusion three-valued logic filters non-matching rows for
-  `NOT IN` when the list contains NULL, so a NULL entry must be stripped from the rendered list.
-  NULL entries reach the const list as several distinct node shapes — a `literal_null` node, or any
-  typed literal (`literal_date`, `literal_timestamp`, `literal_exactnumeric`, etc.) carrying a null
-  `value` — and these render to divergent strings (`NULL`, `DATE NULL`, `arrow_cast(NULL, ...)`),
-  so stripping must key on the argument node's null-ness before rendering, not on the rendered
-  string.
+* Exasol ignores NULL entries in an IN list under both `IN` and `NOT IN`. DataFusion three-valued logic filters non-matching rows for `NOT IN` when the list contains NULL, so the translator strips NULL entries. A NULL entry is a `literal_null` node or any typed literal carrying a null `value`, and these render to divergent strings, so stripping keys on the node, not the rendered string.
 
 ## Scenarios
 
@@ -56,7 +37,7 @@ out of the core translator spec to keep that spec's scenario count within the do
 
 * *GIVEN* a VS expression node of type `predicate_in_constlist` with an `expression` target and an `arguments` array of literal nodes
 * *WHEN* `render_expression` processes the node
-* *THEN* the translator SHALL omit — keyed on the argument node before rendering, not on the rendered output string — any argument whose node is a NULL-valued literal (a `literal_null` node, OR any `literal_*` node whose `value` field is JSON `null` or absent, regardless of the literal's type, so a typed null such as `DATE NULL` or `arrow_cast(NULL, ...)` is stripped as reliably as a bare `literal_null`) and SHALL render each surviving argument recursively, because Exasol ignores NULL entries in an IN list under both `IN` and `NOT IN` polarities while DataFusion three-valued logic would filter every non-matching row for `NOT IN`
+* *THEN* the translator SHALL omit, keyed on the argument node before rendering, not on the rendered output string, any argument whose node is a NULL-valued literal (a `literal_null` node, OR any `literal_*` node whose `value` field is JSON `null` or absent, regardless of the literal's type, so a typed null such as `DATE NULL` or `arrow_cast(NULL, ...)` is stripped as reliably as a bare `literal_null`) and SHALL render each surviving argument recursively, because Exasol ignores NULL entries in an IN list under both `IN` and `NOT IN` polarities while DataFusion three-valued logic would filter every non-matching row for `NOT IN`
 * *AND* for a non-empty list of surviving (non-NULL) arguments the translator SHALL return `(<target> IN (<v1>, <v2>, ...))` over the surviving arguments only
 * *AND* an `arguments` array that is empty SHALL return `FALSE` (IN over empty set is always false)
 * *AND* an `arguments` array whose entries are all NULL-valued literals (of any type) SHALL return `FALSE`, matching the empty-list result after NULL stripping

@@ -409,7 +409,7 @@ fn deletion_vector_reads_stay_within_the_connection_budget() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: deletion vectors compose with projection, filter, LIMIT, and aggregation
+/// Scenario: Deletion vectors compose with projection, filter, LIMIT, and aggregation
 #[test]
 fn deletion_vectors_compose_with_projection_filter_limit_and_aggregation() {
     let dir = temp_dir("compose");

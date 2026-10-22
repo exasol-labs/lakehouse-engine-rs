@@ -1,4 +1,4 @@
-# Feature: Connection-Object Credential Source — Azure Storage Credentials
+# Feature: Connection-Object Credential Source, Azure Storage Credentials
 
 Extends `connection/connection-credentials` with Azure Data Lake Storage Gen2: optional `account_name`, `account_key`, `sas_token` on the CONNECTION password JSON. Vending-disabled path only.
 

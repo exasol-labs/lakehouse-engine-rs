@@ -262,7 +262,6 @@ fn list_to_utf8_cast_kernel_renders_display_text_not_json() {
     );
 }
 
-/// Scenario: One arm list decides both the Exasol type string and the JSON-fallback flag
 #[test]
 fn varchar_type_string_alone_does_not_decide_the_json_fallback() {
     let out_of_range_decimal = DataType::Decimal128(38, 10);

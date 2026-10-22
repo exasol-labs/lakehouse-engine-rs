@@ -1,65 +1,21 @@
 # Feature: Pushdown File Pruning
 
-Translates the soundly-translatable conjuncts of the Exasol WHERE predicate into an
-`iceberg::expr::Predicate` that is applied to the Iceberg table scan at file-resolution
-time, so `plan_files` prunes data files on partition values and per-file min/max bounds
-before any S3 I/O — while the DataFusion scan keeps applying the full filter as the sole
-source of row-level correctness. The same resolve-once seam preserves each data file's
-associated positional-delete files and deletion vector, and fails loud on delete mechanisms the
-engine cannot apply.
+Translates the soundly translatable conjuncts of the Exasol WHERE predicate into an `iceberg::expr::Predicate` that the adapter applies at file-resolution time. `plan_files` then prunes data files on partition values and per-file min/max bounds before any S3 I/O. The DataFusion scan still applies the full filter and is the only source of row-level correctness.
 
 ## Background
 
-* Apache Iceberg table spec, § "Scan Planning": "Scan predicates are converted to partition
-  predicates using an _inclusive projection_: if a scan predicate matches a row, then the partition
-  predicate must match that row’s partition." The same section applies scan predicates to
-  statistics: "Scan predicates are also used to filter data and delete files using column bounds
-  and counts that are stored by field id in manifests." Pruning therefore never skips a file that
-  holds a matching row (#466).
-* The pruning predicate is sound-not-complete. It keeps every file that could hold a matching row
-  and may keep more. A node that cannot be translated soundly imposes no constraint.
-* The full predicate is still applied to every row: in the scan, or in the adapter's own outer
-  `WHERE` when the DataFusion dialect declines it (`pushdown/pushdown-declined-filter-self-apply`).
-  Pruning receives the full filter in both cases. It changes which files are read, never which rows
-  are returned.
-* "Untranslatable" here means untranslatable to an Iceberg pruning predicate, which costs pruning
-  only. A DataFusion-dialect decline is a separate question.
-* A translated node is exact when it is true on exactly the rows where the user predicate is true,
-  and false on exactly the rows where it is false. On a row where the user predicate is NULL, it may
-  be either. A translated node that is not exact is partly translated: it is true on every matching
-  row and may be true on more.
-* For a fully translated predicate, pruning keeps exactly the files that Iceberg's inclusive
-  evaluation of the translated predicate keeps. For a partly translated predicate, the only
-  guarantee is that every file holding a matching row is kept. Which other files it keeps is not
-  part of this feature's contract.
-* Under `AND`, an untranslatable child is dropped, because dropping a conjunct only widens the file
-  set. An `AND` that dropped a child, or holds a partly translated child, is partly translated.
-* Under `OR`, an untranslatable branch makes the whole `OR` impose no constraint. An `OR` is exact
-  only when every branch is exact.
-* `NOT` negates only an exact child. Pruning never negates an untranslatable or partly translated
-  child, because negating a widened predicate narrows it and would skip files that hold matching
-  rows. Such a `NOT` counts as partly translated.
+* Iceberg table spec, § "Scan Planning": scan predicates become partition predicates by an inclusive projection, and "Scan predicates are also used to filter data and delete files using column bounds and counts that are stored by field id in manifests." Pruning therefore never skips a file that holds a matching row.
+* The pruning predicate is sound but not complete: it keeps every file that could hold a matching row and may keep more. A node that cannot be translated imposes no constraint.
+* Pruning receives the full filter, including when the DataFusion dialect declines it and the adapter applies it in its own outer `WHERE` (`pushdown/pushdown-declined-filter-self-apply`). It changes which files are read, never which rows are returned.
+* A translated node is exact when it is true on exactly the rows where the user predicate is true and false on exactly the rows where it is false. On a row where the user predicate is NULL, it can be either. A translated node that is not exact is partly translated: it is true on every matching row and can be true on more.
+* For a fully translated predicate, pruning keeps exactly the files that Iceberg's inclusive evaluation of the translated predicate keeps. For a partly translated predicate, the only guarantee is that every file holding a matching row is kept.
+* Under `AND`, an untranslatable child is dropped, because dropping a conjunct only widens the file set. An `AND` that dropped a child, or holds a partly translated child, is partly translated.
+* Under `OR`, an untranslatable branch makes the whole `OR` impose no constraint. An `OR` is exact only when every branch is exact.
+* `NOT` negates only an exact child, because negating a widened predicate narrows it and skips files that hold matching rows. Any other `NOT` is partly translated.
 * A `BETWEEN` whose bound does not translate keeps the other bound and is partly translated.
-* Delta pruning follows the same rules (`delta/delta-file-pruning`). Direct-storage partition pruning evaluates partition values under three-valued logic instead
-  (`direct-storage/direct-storage-hive-partitioning`).
-* Exasol pre-normalises `>`→`<` and `>=`→`<=`, so only LESS/LESSEQUAL comparison nodes
-  reach the adapter.
-* A data file's associated positional-delete files and deletion vector (as resolved by
-  `plan_files` per the Iceberg sequence-number rules) MUST be preserved into the scan spec, never
-  discarded.
-* Delete mechanisms this engine cannot apply (equality deletes and ORC/Avro data or delete
-  files) MUST be detected at plan time and fail the request loud when they apply to a planned
-  data file.
-* See `pushdown/pushdown-planning` for the broader pushdown plan and the scenario that
-  covers wiring of the Iceberg predicate alongside the DataFusion filter string.
-* A filter names an Exasol column, and the table's column notes record which Iceberg field id that
-  column declares (`vs-adapter/column-source-notes`). The translation resolves each filter column
-  through its declared field id to the field the scanned snapshot's schema carries under that id (the schema the Iceberg library binds the predicate against), because
-  § Scan Planning states "Data files that match the query filter must be read by the scan" and
-  column bounds are "stored by field id in manifests". Resolving by name instead would read another
-  column's bounds after a source-side rename between refreshes and skip files that hold matching
-  rows. A filter column whose declared field id that schema no longer carries cannot be
-  translated, so it imposes no constraint under the rules above.
+* A data file's associated positional-delete files and deletion vector, as resolved by `plan_files`, are preserved into the scan spec.
+* Delete mechanisms this engine cannot apply (equality deletes, and ORC or Avro data or delete files) are detected at plan time and fail the request when they apply to a planned data file.
+* A filter names an Exasol column, and the table's column notes record the Iceberg field id that column declares (`vs-adapter/column-source-notes`). The translation resolves each filter column through that field id to the field the scanned snapshot's schema carries under it, because column bounds are stored by field id in manifests. Resolving by name would read another column's bounds after a source-side rename between refreshes and skip files that hold matching rows. A filter column whose field id the schema no longer carries imposes no constraint.
 
 ## Scenarios
 
@@ -87,7 +43,7 @@ engine cannot apply.
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL emit an Iceberg pruning predicate carrying only the translatable conjunct
 * *AND* the adapter SHALL drop the untranslatable conjunct from the pruning predicate
-* *AND* the full original predicate SHALL still be applied — in the scan spec's `filter` for DataFusion when the DataFusion dialect renders it, and otherwise in the adapter's own outer `WHERE` per `pushdown/pushdown-declined-filter-self-apply` — so "untranslatable for Iceberg pruning" never means "unapplied"
+* *AND* the full original predicate SHALL still be applied, in the scan spec's `filter` for DataFusion when the DataFusion dialect renders it, and otherwise in the adapter's own outer `WHERE` per `pushdown/pushdown-declined-filter-self-apply`, so "untranslatable for Iceberg pruning" never means "unapplied"
 * *AND* the query result SHALL be identical to the result without any Iceberg pruning
 
 ### Scenario: An untranslatable branch of an OR disables pruning entirely
@@ -104,7 +60,7 @@ engine cannot apply.
 * *WHEN* Exasol sends the corresponding pushdown request and the adapter resolves the file list once
 * *THEN* the adapter MUST NOT discard a data file's associated positional-delete files or deletion vector, and SHALL carry each delete file's path, byte size, and delete content type into the per-shard file entry for the data file(s) it applies to, plus a deletion vector's blob coordinates as `file-planning/pushdown-planning-file-encoding` defines them
 * *AND* the association between a data file and its delete files SHALL follow the Iceberg sequence-number rules exactly as `plan_files` resolved them, so a delete file is carried for exactly the data files it applies to and no others
-* *AND* the adapter SHALL carry the delete-file references, with a deletion vector's blob coordinates, as the ONLY delete-related addition to the per-shard files argument — it MUST NOT add a serialized Iceberg schema or a bound predicate to the spec for delete support
+* *AND* the adapter SHALL carry the delete-file references, with a deletion vector's blob coordinates, as the ONLY delete-related addition to the per-shard files argument, and MUST NOT add a serialized Iceberg schema or a bound predicate to the spec for delete support
 
 ### Scenario: An unsupported delete mechanism fails loud at plan time
 
@@ -124,7 +80,7 @@ engine cannot apply.
 ### Scenario: A NOT over a partly translated predicate keeps every file with a matching row
 
 * *GIVEN* a virtual schema over a partitioned Iceberg table whose files hold rows on both sides of the comparison `k < 30`
-* *AND* a query whose WHERE clause is `NOT (k < 30 AND name LIKE 'x%')`, with the conjuncts in either order (#466)
+* *AND* a query whose WHERE clause is `NOT (k < 30 AND name LIKE 'x%')`, with the conjuncts in either order
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter MUST NOT prune by the negation of the partly translated conjunction, and every file that holds a row the `NOT` matches SHALL be scanned
 * *AND* the query SHALL return the rows and the `COUNT(*)` that native Exasol returns for the same predicate over the same rows, and MUST NOT answer with the empty result

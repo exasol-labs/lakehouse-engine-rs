@@ -5,7 +5,6 @@
 **ID:** unsupported-deletes-classified-from-planned-tasks
 **Plan:** refactor-iceberg-delete-classification
 **Status:** Accepted
-**Supersedes:** plan-time-fail-loud-at-the-manifest-datafile-level-is-the-authoritative-correctness-gate-for-unsupported-deletes
 
 ### Context
 

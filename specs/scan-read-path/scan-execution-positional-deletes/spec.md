@@ -1,47 +1,16 @@
-# Feature: DataFusion Scan Execution — Iceberg Positional-Delete File Application
+# Feature: DataFusion Scan Execution, Iceberg Positional-Delete File Application
 
-Extends the scan UDF so that Iceberg merge-on-read (MOR) **positional deletes** are applied on
-read, so a query over a table with positional-delete files returns the post-delete row set.
-The scan keeps DataFusion's own `ParquetSource` as the scan engine — projection/filter/LIMIT
-pushdown, row-group and page pruning, statistics, and streaming are all preserved — and applies
-positional deletes by attaching a per-data-file `ParquetAccessPlan` (a base row selection) to
-that file's `PartitionedFile`, which the Parquet opener intersects with predicate/row-group/page
-pruning rather than defeating it. This is the DataFusion-native alternative to swapping in
-iceberg-rust's `ArrowReader`, and it exists to close the issue #11 silent-correctness bug for the
-positional-delete case (tracked as issue #68).
+Applies Iceberg merge-on-read positional deletes on read, so a query over a table with positional-delete files returns the post-delete row set. The scan keeps DataFusion's `ParquetSource` and attaches a per-data-file `ParquetAccessPlan` (a base row selection) to the file's `PartitionedFile`. The Parquet opener intersects that selection with predicate, row-group and page pruning.
 
 ## Background
 
-* This feature closes the positional-delete half of the silent-correctness bug in issue #11:
-  before this change the scan collapsed each iceberg `FileScanTask` to a bare `(path, size)` pair
-  and discarded its `.deletes`, so every MOR query returned pre-delete rows with no error.
-* This feature covers **Parquet positional-delete files over Parquet data files**, at both
-  `write.delete.granularity=file` and `write.delete.granularity=partition`. Equality deletes and
-  ORC or Avro data or delete files are OUT OF SCOPE and MUST fail loud. The primary gate is at plan
-  time (`file-planning/pushdown-file-pruning`). It checks each planned data file and each delete
-  file iceberg-rust applies to it, so it relies on iceberg-rust's delete matching (ADR
-  `unsupported-deletes-classified-from-planned-tasks`).
-* The positions this feature reads feed the pipeline that every row-position delete mechanism
-  shares (`scan-read-path/scan-execution-row-position-deletes`). That feature owns the variant
-  dispatch, the read-time backstop, the convergence of all mechanisms on one position map, and the
-  data-file footer fan-out. Iceberg deletion vectors are specified in
-  `scan-read-path/scan-execution-iceberg-deletion-vectors`.
-* The scan reads each associated positional-delete Parquet file (columns `file_path` Utf8,
-  field-id `2147483546`, and `pos` Int64, field-id `2147483545`), keeps only the rows whose
-  `file_path` equals the data file currently being read, and accumulates the `pos` values into a
-  per-data-file delete set (an ascending set of deleted row positions). Filtering by `file_path`
-  is REQUIRED for `partition` granularity, where one delete file references many data files.
-* Multiple positional-delete files MAY apply to one data file; their deleted positions are
-  unioned into a single delete set for that data file.
-* **Sequence-number applicability is decided by the planning layer**, not the scan: the planning
-  layer associates each delete file with exactly the data files it applies to. The scan MUST
-  preserve that association verbatim and MUST NOT re-derive it.
-* The adapter tags an Iceberg position delete stored in Puffin format as the Puffin
-  deletion-vector variant, not as a positional delete, because the scan reads it by blob range.
-* The read-once-per-shard guarantee, the delete-file read concurrency, and the row-group pruning
-  of a partition-granularity delete file are specified in
-  `scan-read-path/scan-execution-positional-deletes-fanout`.
-* See `datafusion-scan/scan-execution-spec-reconstitution` for the delete-carrying wire format.
+* The scope is Parquet positional-delete files over Parquet data files, at `write.delete.granularity=file` and `write.delete.granularity=partition`. Equality deletes and ORC or Avro data or delete files fail loud. The primary gate is at plan time (`file-planning/pushdown-file-pruning`). It checks each planned data file and each delete file iceberg-rust applies to it, so it relies on iceberg-rust's delete matching.
+* A positional-delete file has the columns `file_path` (Utf8, field-id `2147483546`) and `pos` (Int64, field-id `2147483545`). The scan keeps the rows whose `file_path` equals the data file being read and accumulates their `pos` values into a per-data-file delete set. The `file_path` filter is required for `partition` granularity, where one delete file references many data files.
+* Several delete files can apply to one data file. The scan unions their positions.
+* The planning layer decides sequence-number applicability by associating each delete file with exactly the data files it applies to. The scan preserves that association and never re-derives it.
+* The adapter tags an Iceberg position delete stored in Puffin format as the Puffin deletion-vector variant, not as a positional delete, because the scan reads it by blob range.
+* The positions this feature reads feed the pipeline every row-position delete mechanism shares. `scan-read-path/scan-execution-row-position-deletes` owns the variant dispatch, the read-time backstop, the convergence of all mechanisms on one position map, and the data-file footer fan-out. `scan-read-path/scan-execution-iceberg-deletion-vectors` specifies Iceberg deletion vectors.
+* `scan-read-path/scan-execution-positional-deletes-fanout` specifies the read-once-per-shard guarantee, the delete-file read concurrency, and row-group pruning. See `datafusion-scan/scan-execution-spec-reconstitution` for the delete-carrying wire format.
 
 ## Scenarios
 

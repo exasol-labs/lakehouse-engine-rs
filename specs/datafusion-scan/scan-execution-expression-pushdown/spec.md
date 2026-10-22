@@ -1,47 +1,15 @@
-# Feature: DataFusion Scan Execution — Expression Pushdown
+# Feature: DataFusion Scan Execution, Expression Pushdown
 
-Extends `datafusion-scan/scan-execution` with the two new execution capabilities enabled
-by the `add-capability-alignment` plan: rendering select-list expressions directly in the
-DataFusion scan (rather than bare column names), and emitting sufficient statistics for
-decomposable statistical aggregates (`STDDEV`/`VARIANCE` family).
+The scan UDF renders pushed select-list expressions in its DataFusion SELECT list and emits sufficient statistics for the `STDDEV`/`VARIANCE` family of aggregates. It also registers the checked float-division function that those expressions call.
 
 ## Background
 
-* The scan UDF reads its ScanSpec from a single JSON VARCHAR input column.
-* The projection may carry rendered DataFusion SQL select-list expressions (not just bare
-  column names); the UDF places them verbatim in its SELECT list.
-* Partial aggregates for statistical functions are emitted as `(count, mean, m2)`
-  sufficient statistics; the outer wrapper reconstructs variance/stddev from these.
-* Only SDK Value types cross the `.so` boundary; no Arrow types.
-* Credentials MUST NOT appear in any error message.
-
-* A rendered expression MAY call a function the scan session registers rather than a DataFusion
-  built-in. The precedent is `lakehouse_render_nested_json`, registered by
-  `build_session_context` for `scan-types/nested-json-rendering`. Issue #370 adds the second
-  such function, `vs_checked_float_div`, which `crates/vs-expression` emits for every
-  DataFusion-dialect `FLOAT_DIV` node (see `sql-comprehension/vs-expression-translator-float-div`).
-* `build_session_context` is the ONE place a scan session is built in production. All three run
-  paths take the session from it: `run_raw_scan_with_session`, `run_join_scan_with_session`, and
-  `run_partial_aggregate`, dispatched by `run_scan_one`. Registering a function there therefore
-  reaches every pushed expression the scan can evaluate: a projection item, a `WHERE` filter, an
-  `ORDER BY` key, a `GROUP BY` key, a broadcast-join fact-leg filter, and an aggregate argument.
-* A checked division is only meaningful because Exasol has no non-finite `DOUBLE`. Exasol rejects
-  `CAST('inf' AS DOUBLE)` and `CAST('nan' AS DOUBLE)` at `22018` and `1E400` at `22003`. A
-  non-finite value produced inside the scan can therefore never be a correct answer: in projection
-  position the engine already rejects it at the emit boundary, and in predicate position it
-  silently changed the row count, which is issue #370.
-* This is not the same check as `arrow_value_at`'s `is_nan()` guard, and it MUST NOT be conflated
-  with it. `arrow_value_at` sees a value read from a column and cannot tell a computed non-finite
-  from a stored one. The checked division sees only the two operands of a division the pushdown
-  itself synthesised.
-* The checked division covers `FLOAT_DIV` and nothing else. `crates/lakehouse-engine/src/adapter/capabilities.rs`
-  also advertises `FN_SQRT`, `FN_LN`, `FN_LOG`, `FN_ACOS`, `FN_ASIN`, `FN_EXP`, `FN_POWER`, and
-  `FN_MOD`. Each is translated into a pushed predicate, and each can produce `NaN` or `±Inf` from
-  in-domain column data. `WHERE SQRT(<negative_col>) > 0` and `WHERE EXP(<large_col>) > 0`
-  reproduce issue #370's mechanism exactly: the comparison consumes a non-finite value inside the
-  scan, and no emit-boundary check ever sees it. Those producers keep the gap this plan closes for
-  `FLOAT_DIV`, and they are recorded as a tracked exception rather than a silent gap
-  `(#394)`.
+* The projection may carry rendered DataFusion SQL select-list expressions, not only bare column names.
+* A partial statistical aggregate is emitted as `(count, mean, m2)`. The outer wrapper reconstructs variance and standard deviation from them.
+* A rendered expression may call a function the scan session registers instead of a DataFusion built-in. `crates/vs-expression` emits `vs_checked_float_div` for every DataFusion-dialect `FLOAT_DIV` node.
+* `build_session_context` is the one place production builds a scan session. `run_scan_one` hands that session to `run_raw_scan_with_session`, `run_join_scan_with_session`, and `run_partial_aggregate`, so a function registered there reaches every pushed expression: projection item, `WHERE` filter, `ORDER BY` key, `GROUP BY` key, broadcast-join fact-leg filter, and aggregate argument.
+* Exasol has no non-finite `DOUBLE`, so a non-finite value computed inside the scan is never a correct answer.
+* The checked division is a different check from the `is_nan()` guard in `arrow_value_at`. That guard sees a value read from a column and cannot tell a computed non-finite from a stored one.
 
 ## Scenarios
 
@@ -74,7 +42,7 @@ decomposable statistical aggregates (`STDDEV`/`VARIANCE` family).
 * *AND* a spec whose rendered SQL contains no checked division SHALL be unaffected: the registration adds one entry to the session's function registry and changes no generated SQL, no plan shape, and no scan result
 * *AND* the function SHALL be declared `Immutable`, so DataFusion treats two evaluations over equal input as equal and the expression remains eligible for the same plan-level handling any other scalar expression receives
 * *AND* the function SHALL evaluate one whole Arrow array per call rather than one row per call, so the per-row cost stays a cast, a divide, and a finiteness test, and the change adds no per-row function-call overhead over the `/` operator it replaces
-* *AND* the plan shape a scan produces SHALL be unchanged for every spec whose SQL contains no division: the scenarios of `datafusion-scan/scan-execution-plan-shape` and the Parquet pruning parity `tests/scan_parquet_pruning.rs` asserts MUST pass unedited
+* *AND* the plan shape a scan produces SHALL be unchanged for every spec whose SQL contains no division: the scenarios of `datafusion-scan/scan-execution-plan-shape` and the Parquet pruning parity test MUST pass unedited
 * *AND* the plan-shape effect on a spec that DOES contain a division SHALL be recorded rather than assumed: DataFusion cannot derive a min/max pruning bound from a function it does not know, so a conjunct containing a checked division prunes no file and no row group by itself, exactly as the `/` operator's own conjunct did not, because neither shape is a column-against-literal comparison
 
 ### Scenario: A checked float division raises rather than producing a non-finite value
@@ -92,13 +60,13 @@ decomposable statistical aggregates (`STDDEV`/`VARIANCE` family).
 * *AND* the error SHALL reach the user WITHOUT the storage-read framing `classify_scan_error` applies to a scan failure, because `scan failed: assigned data could not be read` misnames a user arithmetic error
 * *AND* the classifier SHALL recognise the error BY TYPE and MUST NOT recognise it by matching text in a message string
 * *AND* the error SHALL be carried on the DataFusion error chain, where `classify_scan_error` recognises it by walking `Error::source` and downcasting through every wrapping layer (`External`, `Context`, `ArrowError::ExternalError`, `Arc`)
-* *AND* the error chain SHALL NOT be the only carrier, because it does not survive every route, which was MEASURED rather than assumed: `datafusion-datasource-parquet` 54.1 `row_filter.rs` flattens ANY predicate error into `ArrowError::ComputeError(format!("Error evaluating filter predicate: {e:?}"))`, so a checked division raised inside a predicate DataFusion pushed into the Parquet row filter — issue #370's own route — reaches the classifier with its type destroyed and no longer distinguishable from a storage failure. Live pre-amendment evidence: `scan failed: assigned data could not be read: Parquet error: External: Compute error: Error evaluating filter predicate: External(ZeroDivisor { numerator: 1.0, divisor: 0.0 })`
+* *AND* the error chain SHALL NOT be the only carrier, because it does not survive every route, which was MEASURED rather than assumed: the DataFusion Parquet row-filter code flattens ANY predicate error into `ArrowError::ComputeError(format!("Error evaluating filter predicate: {e:?}"))`, so a checked division raised inside a predicate DataFusion pushed into the Parquet row filter reaches the classifier with its type destroyed and no longer distinguishable from a storage failure. Observed evidence: `scan failed: assigned data could not be read: Parquet error: External: Compute error: Error evaluating filter predicate: External(ZeroDivisor { numerator: 1.0, divisor: 0.0 })`
 * *AND* the function SHALL therefore ALSO record its first failure's message in the session's failure slot, which the scan's other raising functions share, and the ONE dispatcher all three run paths funnel through SHALL reframe a failed scan from it. Recovering the failure from the flattened message text is FORBIDDEN, being exactly the coupling this scenario rules out. The recorded value is scoped to one scan invocation, so no failure survives into another. A recorded failure means the division DID raise during that scan, so naming it is never a false report
 * *AND* the recorded division SHALL REPLACE the surfaced failure, so the storage-read framing appears NOWHERE in the message, not merely after the division. On the flattened row-filter route the surfaced failure IS the same division wearing that framing, so appending it would republish `scan failed: assigned data could not be read` on this scenario's own primary route, defeating the clause above that forbids it. Nothing separates that case from a genuinely unrelated failure in the same classification branch without matching DataFusion's `Error evaluating filter predicate` wording, the coupling this scenario forbids
 * *AND* the ONE exception SHALL be a memory exhaustion, which the dispatcher SHALL COMPOSE with the division rather than replace: the division first, because the user's own SQL caused it, then the memory exhaustion, so the `ResourcesExhausted` signal the bounded-execution guarantee rests on is never discarded. It is the one surfaced failure separable from the flattened division WITHOUT message matching, because `classify_scan_error` recognises `ResourcesExhausted` on the typed error root before any text exists. The dispatcher MAY recognise it from the label `classify_scan_error` writes, which is this codebase's own wording owned by a single constant read by both sides, and which is therefore NOT the forbidden coupling to DataFusion's wording
 * *AND* the composed message SHALL be redacted at the dispatcher rather than trusted, because the run paths classify with the fact side's credentials alone while the dispatcher holds the union that also covers a join's dimension side
 * *AND* an unrelated storage failure raised in another partition of a scan that also divided by zero SHALL therefore be MASKED, which is an accepted limitation rather than an oversight: the collision is real but rarer than this scenario's own route and has never been observed live, whereas the storage framing on a user's own division is MEASURED and is what `e2e_float_div_by_zero_in_filter_fails_like_native_exasol` asserts against
-* *AND* the message SHALL name a division by zero on EVERY route the error can take out of the scan, which MUST be established rather than assumed: DataFusion MAY fold a division over two literal operands during optimization, and the three scan paths surface a planning failure through `UdfError::User(format!("DataFusion SQL error: {e}"))` and `"partial aggregate SQL error: {e}"` rather than through `classify_scan_error`, so a fold that raises at plan time would otherwise bypass the framing above. MEASURED on DataFusion 54.1: `ctx.sql` plans `vs_checked_float_div(0, 0)` successfully and the raise arrives from the stream, the same route a column operand takes, so no fold happens at plan time and those four planning sites need no framing of their own. Should a later DataFusion fold it at plan time, `checked_float_div_over_two_literals_surfaces_a_division_by_zero_message` fails and they do
+* *AND* the message SHALL name a division by zero on EVERY route the error can take out of the scan, which MUST be established rather than assumed: DataFusion MAY fold a division over two literal operands during optimization, and the three scan paths surface a planning failure through `UdfError::User(format!("DataFusion SQL error: {e}"))` and `"partial aggregate SQL error: {e}"` rather than through `classify_scan_error`, so a fold that raises at plan time would otherwise bypass the framing above. MEASURED against the pinned DataFusion: `ctx.sql` plans `vs_checked_float_div(0, 0)` successfully and the raise arrives from the stream, the same route a column operand takes, so no fold happens at plan time and those four planning sites need no framing of their own. Should a later DataFusion fold it at plan time, `checked_float_div_over_two_literals_surfaces_a_division_by_zero_message` fails and they do
 * *AND* the aggregate paths SHALL raise identically: a checked division inside a pushed aggregate argument (`SUM(<a> / <b>)`) is spliced into the same SQL by `build_partial_agg_sql_filtered` and `build_grouped_partial_agg_sql`, and a zero divisor there SHALL fail the query rather than reach `arrow_value_at`'s separate `is_nan()` check
 * *AND* credentials MUST NOT appear in the surfaced message, the rule every other scan error path already follows
 * *AND* no Arrow type SHALL cross the `.so` boundary

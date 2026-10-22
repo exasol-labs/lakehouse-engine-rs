@@ -1,22 +1,10 @@
-# Feature: Unity Catalog Native REST Client — Parquet Base Table Admission
+# Feature: Unity Catalog Native REST Client, Parquet Base Table Admission
 
-Extends `unity-catalog/unity-catalog-client`'s listing and single-table load with the wire contract,
-the admission rule, and the skip routing needed to admit a Unity Catalog table whose
-`data_source_format` is `PARQUET`, alongside the `DELTA` tables the client already admits.
-
-This is the sibling of `unity-catalog/unity-catalog-client`, split out once that feature's own
-scenario count crossed this library's per-spec organization threshold. The parent feature owns the
-client's shape, its trait implementation, its pagination, and its transport-error handling; this
-feature owns the Parquet-specific admission entries this plan
-(`add-unity-parquet-table-routing`, issue #409) adds.
+Extends `unity-catalog/unity-catalog-client`'s listing and single-table load with the wire contract, admission rule, and skip routing for a Unity Catalog table whose `data_source_format` is `PARQUET`, alongside the `DELTA` tables the client already admits.
 
 ## Background
 
-* The client compares `table_type` and `data_source_format` against the uppercase Unity Catalog
-  vocabulary (`MANAGED`, `EXTERNAL`, `VIEW`, `DELTA`, `PARQUET`), matching the case Unity Catalog
-  emits on the wire.
-* A column's `type_json` and `partition_index` are wire fields `unity-catalog/unity-catalog-client`
-  already declares crate-private except through the neutral table and neutral column shapes.
+* The parent feature owns the client's shape, its trait implementation, its pagination, and its transport-error handling.
 
 ## Scenarios
 

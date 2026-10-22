@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 
-/// Scenario: Absent CATALOG_KIND resolves the Iceberg REST catalog kind.
+/// Scenario: Absent CATALOG_KIND resolves the Iceberg REST catalog kind
 #[test]
 fn absent_catalog_kind_resolves_iceberg_rest() {
     let props = json!({});

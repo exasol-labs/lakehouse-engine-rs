@@ -1,27 +1,27 @@
 # Feature: Unity Catalog Parquet Table Planning
 
-Resolves a Unity Catalog table whose `data_source_format` is `PARQUET` into the engine's existing `ResolvedScan` shape at plan time. Unity Catalog is this table's catalog: it declares the columns, the partition columns, the storage location, and the credential-vending key. The data files are the Parquet objects under the storage location. File-level sharding, the pushdown wire format, streaming emit, and the memory model are unchanged. The same catalog-declared Parquet reader plans a Glue Parquet table under these logical-schema rules (`glue/glue-table-planning`).
+Resolves a Unity Catalog table whose `data_source_format` is `PARQUET` into the engine's `ResolvedScan` shape at plan time. Unity Catalog declares the columns, the partition columns, the storage location, and the credential-vending key, and the data files are the Parquet objects under the storage location. The same catalog-declared Parquet reader plans a Glue Parquet table (`glue/glue-table-planning`).
 
 ## Background
 
-* Unity Catalog reports a Parquet external table with `table_type` `EXTERNAL`, `data_source_format` `PARQUET`, a `storage_location`, and a `columns[]` array whose entries carry `type_json` and `partition_index`. Verified live against the project's OSS Unity Catalog fixture (`docker-compose.unity.yml`): `GET /tables/{full_name}` and `GET /tables?catalog_name=...&schema_name=...` both return that shape, with `partition_index` `null` on a data column and `0` on the first partition column.
-* A column's `type_json` is its Spark SQL `StructField` JSON (Databricks Tables API: "Full data type specification, JSON-serialized."). The Delta protocol records a table schema in the same representation: "Delta uses a subset of Spark SQL's JSON Schema representation to record the schema of a table in the transaction log" (PROTOCOL.md § Schema Serialization Format).
-* Unity Catalog reads a partitioned external table's partition values from its directory layout: "By default, Unity Catalog recursively lists all directories in the table location to automatically discover partitions", for tables that "use Parquet, ORC, CSV, Avro, or JSON" (Databricks, *Partition discovery for external tables*).
+* Unity Catalog reports a Parquet external table with `table_type` `EXTERNAL`, `data_source_format` `PARQUET`, a `storage_location`, and a `columns[]` array whose entries carry `type_json` and `partition_index`. `partition_index` is `null` on a data column and `0` on the first partition column.
+* A column's `type_json` is its Spark SQL `StructField` JSON, the same representation the Delta protocol uses to record a table schema.
+* Unity Catalog reads a partitioned external table's partition values from its directory layout.
 
 ## Scenarios
 
 ### Scenario: A Unity Parquet table lists its files through the shared directory seam and reads no footer
 
 * *GIVEN* a Unity Catalog table reporting `data_source_format` `PARQUET` whose storage location holds Parquet data files at more than one directory depth, plus a `_SUCCESS` object, a `_temporary/` directory, and a `.hidden` object
-* *WHEN* the Unity Parquet format reader resolves that table's scan
-* *THEN* the reader SHALL obtain the file list, each file's byte size, and each file's partition values from the listing answer of the ONE shared directory seam (`direct-storage/parquet-directory-seam-file-listing`), under that seam's data-file rule unchanged
+* *WHEN* the catalog-declared Parquet format reader resolves that table's scan
+* *THEN* the reader SHALL obtain the file list, each file's byte size, and each file's partition values from the listing answer of the ONE shared directory seam (`direct-storage/parquet-directory-seam-file-listing`), under that seam's data-file rule
 * *AND* the reader MUST NOT read any Parquet footer at plan time, because the catalog already declares the schema
 * *AND* each returned file entry SHALL carry its path percent-encoded relative to the table root, its byte size, and an EMPTY delete-mechanism list, exactly as a direct-storage file entry does
 
 ### Scenario: A Unity Parquet scan carries no field-id mapping and is file-pruning-blind
 
 * *GIVEN* the same Unity Catalog Parquet table
-* *WHEN* the Unity Parquet format reader resolves that table's scan
+* *WHEN* the catalog-declared Parquet format reader resolves that table's scan
 * *THEN* the returned table root SHALL be the table's catalog-reported storage location, and the returned name mapping SHALL be EMPTY
 * *AND* a data file whose name lacks the `.parquet` suffix SHALL NOT be read, as a documented trade-off: a Spark or Databricks writer always names a Parquet data file with that suffix, and the user documentation SHALL state the rule
 * *AND* a filter on a non-partition column SHALL narrow the rows the scan emits but not the files it reads, because Unity Catalog carries no per-file statistics for a Parquet table and this reader reads no footer
@@ -78,7 +78,7 @@ Resolves a Unity Catalog table whose `data_source_format` is `PARQUET` into the 
 
 * *GIVEN* a Unity Parquet table and a CONNECTION that either enables `use_vended_credentials` or supplies static storage credentials
 * *WHEN* the reader resolves that table's scan
-* *THEN* the reader SHALL resolve its storage through the SAME component the Delta reader uses, so the empty-location refusal, the per-table `READ`-scoped vend against the table's own vending key, the refusal without a static fallback when no vending key is reported, the static backend when vending is disabled, and the shared vended-storage policy all apply unchanged (`delta/delta-table-planning`, `unity-catalog/unity-catalog-vended-credentials`)
+* *THEN* the reader SHALL resolve its storage through the SAME component the Delta reader uses, so the empty-location refusal, the per-table `READ`-scoped vend against the table's own vending key, the refusal without a static fallback when no vending key is reported, the static backend when vending is disabled, and the shared vended-storage policy all apply (`delta/delta-table-planning`, `unity-catalog/unity-catalog-vended-credentials`)
 * *AND* the reader SHALL list the files through an object store built from that effective storage, and SHALL return that effective storage, which the shard-invariant common spec carries sealed under vending and as a CONNECTION reference otherwise
 * *AND* every error the reader surfaces SHALL be redacted against the effective storage's secret values, and MUST NOT contain any vended or static credential value
 

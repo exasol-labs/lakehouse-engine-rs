@@ -4,13 +4,11 @@ Reads the AWS Glue Data Catalog API for the `GLUE` catalog kind. The client list
 
 ## Background
 
-* The client calls `GetTables`, `GetTable`, and `GetPartitions`. The CONNECTION address is the endpoint. The signing region is the region `connection/connection-credentials-sigv4` resolves.
-* The client requests partitions with `ExcludeColumnSchema` set, because the reader reads only values, locations, and formats.
-* The client calls Glue through `aws-sdk-glue`, which retries throttling and transient errors, parses the service error code, and corrects its signing time from the service time before it retries (ADR 097). Service behavior is verified against real Glue by the Glue E2E suite (`specs/testing.md`).
-* AWS Glue API, `CatalogId`: "If none is provided, the AWS account ID is used by default." Glue rejects an empty value with `400 InvalidInputException "CatalogId ID cannot be empty."` (verified live, #410).
-* Glue returns service errors as HTTP 400 with a JSON body whose `__type` names the error, also for a missing table or database (`EntityNotFoundException`, verified live, #410).
-* AWS Glue API, `GetPartitions` response `NextToken`: "A continuation token, if the returned list of partitions does not include the last one." Glue returned a non-null `NextToken` after the last page (verified live, #410).
-* A partition's `Values` are positional against the table's `PartitionKeys`. Hive writes a NULL partition value as the literal `__HIVE_DEFAULT_PARTITION__` (verified live against Athena, #410).
+* The client calls `GetTables`, `GetTable`, and `GetPartitions` through `aws-sdk-glue`, which retries throttling and transient errors, parses the service error code, and corrects its signing time from the service time before it retries.
+* AWS Glue API, `CatalogId`: "If none is provided, the AWS account ID is used by default." Glue rejects an empty value with `400 InvalidInputException "CatalogId ID cannot be empty."`.
+* Glue returns service errors as HTTP 400 with a JSON body whose `__type` names the error, including a missing table or database (`EntityNotFoundException`).
+* AWS Glue API, `GetPartitions` response `NextToken`: "A continuation token, if the returned list of partitions does not include the last one." Glue can return a non-null `NextToken` after the last page.
+* A partition's `Values` are positional against the table's `PartitionKeys`. Hive writes a NULL partition value as the literal `__HIVE_DEFAULT_PARTITION__`.
 
 ## Scenarios
 

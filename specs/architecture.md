@@ -69,11 +69,15 @@
 
 ## Constraints
 
-- The toolchain is pinned in `rust-toolchain.toml`, with edition 2024.
+- The toolchain is pinned in `rust-toolchain.toml`, with edition 2024. Every dependency version is pinned in the workspace manifest, not in the specs.
 - The release `.so` builds only in the Makefile's `UDF_BUILDER_IMAGE`, whose rustc and glibc match the SLC, because the SLC rejects a `.so` whose SDK fingerprint (`exasol-udf-sdk` version and rustc hash) differs from its own.
 - `exasol-udf-sdk` and `exasol-udf-macros` are pinned in the workspace manifest to the SLC's own version.
-- `arrow` and `parquet` stay on major 58 to match `datafusion` 54 and the SDK.
+- `arrow` and `parquet` stay on the Arrow major that `datafusion` and the SDK depend on, not on the major of the `datafusion` or SDK package itself.
 - Arrow types never cross the `.so` boundary. Only SDK `Value`s or the Arrow C Data Interface structs from `ctx.emit_batch` cross it.
+- `lakehouse-catalog` never depends on `lakehouse-engine`. Its manifest declares no `arrow`, `parquet`, `datafusion`, or `object_store` dependency, and it names no scan-spec type (`FileEntry`, `LogicalField`, `DeleteMechanism`, `CommonScanSpec`). A neutral catalog column carries an Arrow type only as the engine's type-tag string.
+- `lakehouse-catalog` declares the shared credential types (`ConnectionCreds`, `StorageProps`, `CatalogProps`, `StorageBackend`) and the credential redaction functions once. The engine re-exports them and declares no copy. Reading and parsing the Exasol CONNECTION object stays in the engine.
+- The engine enumerates and declares catalog tables through the `CatalogClient` trait and its neutral table and column types. In `lakehouse-catalog`, auth strategies, HTTP and signing helpers, and vended-resolution steps stay crate-private, and no AWS SDK type crosses the crate boundary.
+- The Makefile's `VS_SRCS` lists every crate's sources and manifest, so a change in `lakehouse-catalog` or `vs-expression` rebuilds the `.so` before an E2E run.
 - UDFs keep no cross-call state. The scan UDF builds its Tokio runtime per call and never caches it.
 - The engine owns no persisted metadata. Exasol stores the adapterNotes values (`TABLE_MAP`, `SKIPPED_TABLES`, tuning values) and the column notes between CREATE and pushdown.
 - A table's declared schema is decided at CREATE, REFRESH, or SET and read from its column notes at pushdown. No format reader derives a logical schema, a partition column, or a refusal at pushdown.

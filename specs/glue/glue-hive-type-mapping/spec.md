@@ -4,7 +4,7 @@ Maps a Glue column's Hive type string to the engine's types. A parser turns the 
 
 ## Background
 
-* AWS Glue API, `Column.Type`: "The data type of the `Column`." It is a free-form string. Hive and Trino write parameterized and nested forms such as `decimal(38,10)`, `varchar(1)`, `map<varchar(1),int>`, and `struct<x:int,y:string>` (verified live, #410).
+* AWS Glue API, `Column.Type`: "The data type of the `Column`." It is a free-form string. Hive and Trino write parameterized and nested forms such as `decimal(38,10)`, `varchar(1)`, `map<varchar(1),int>`, and `struct<x:int,y:string>`.
 * The Spark-type classifier and its refusal rules belong to `delta/delta-type-mapping`.
 * Exasol has no nested type, so a nested column surfaces as a JSON `VARCHAR(2000000)`. This is an Exasol target-type limitation, not a specification gap.
 

@@ -119,9 +119,6 @@ fn both_clients_are_catalog_client_trait_objects() {
     assert_eq!(clients.len(), 2);
 }
 
-/// Scenario: The neutral column's declaration slot extends the crate's public surface through an explicit reviewed edit
-/// Scenario: The Iceberg column source carries the whole Iceberg field through an explicit reviewed edit
-/// Scenario: The neutral table's catalog properties extend the crate's public surface through an explicit reviewed edit
 #[test]
 fn catalog_client_trait_and_neutral_types_are_reachable() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Type};
@@ -301,7 +298,6 @@ fn connection_creds_sigv4_signing_region_is_reachable() {
     assert_eq!(region.as_deref(), Some("eu-west-1"));
 }
 
-/// Scenario: The AWS identity resolver extends the crate's public surface through an explicit reviewed edit
 #[tokio::test]
 async fn aws_identity_resolver_is_public() {
     let stated = ConnectionCreds {
@@ -345,8 +341,6 @@ fn unity_catalog_public_items_are_reachable() {
     );
 }
 
-/// Scenario: The Glue client and its neutral additions extend the crate's public surface through an explicit reviewed edit
-/// Scenario: No AWS SDK type crosses the crate boundary
 #[test]
 fn glue_additions_are_reachable_through_neutral_types_only() {
     let new: fn(&str, StorageBackend, ConnectionCreds) -> Result<GlueCatalogSession, UdfError> =

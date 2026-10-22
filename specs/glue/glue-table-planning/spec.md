@@ -4,11 +4,10 @@ Resolves a pushdown over a `GLUE` virtual table into the engine's `ResolvedScan`
 
 ## Background
 
-* Iceberg table spec, § Optimistic Concurrency: "Once a writer has created an update, it commits by swapping the table’s metadata file pointer from the base version to the new version." § Metastore Tables: "The atomic swap needed to commit new versions of table metadata can be implemented by storing a pointer in a metastore or database that is updated with a check-and-put operation". Glue's `Parameters.metadata_location` is that pointer, so it names the snapshot a REST `loadTable` names.
-* Glue records a partition location as a raw S3 key (verified live, #410). `direct-storage/parquet-directory-seam-file-listing` owns the raw-key listing rule.
-* Trino writes unbucketed Hive Parquet data files with no file extension (verified live, #410).
-* Every pushdown re-reads the Glue metadata: one `GetTable`, the paginated `GetPartitions`, and one LIST per kept partition. The adapter caches nothing.
-* The adapter reads storage with the CONNECTION's static credentials, or with the session of the role the CONNECTION names, per `connection/connection-credentials-assume-role-session-use`.
+* Iceberg table spec, § Metastore Tables: "The atomic swap needed to commit new versions of table metadata can be implemented by storing a pointer in a metastore or database that is updated with a check-and-put operation". Glue's `Parameters.metadata_location` is that pointer, so it names the snapshot a REST `loadTable` names.
+* Glue records a partition location as a raw S3 key. `direct-storage/parquet-directory-seam-file-listing` owns the raw-key listing rule.
+* Trino writes unbucketed Hive Parquet data files with no file extension.
+* The adapter reads storage with the CONNECTION's static credentials, or with the session of the role the CONNECTION names (`connection/connection-credentials-assume-role-session-use`).
 
 ## Scenarios
 

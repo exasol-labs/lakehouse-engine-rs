@@ -5,27 +5,26 @@
 **ID:** two-vended-static-selectors-on-disjoint-inputs
 **Plan:** `change-vended-storage-resolution-scheme-driven`
 **Status:** Accepted
-**Supersedes:** storage-backend-exhaustive-variant-naming-owners
 
 ### Context
 
-`vs-adapter/storage-backend-enum` named `storage_block` as the only place a backend is selected from input. The vended path now selects its variant from the table location's URI scheme, so that clause is misleading. A single selector would need CONNECTION parsing deferred past `loadTable` for every request, and still could not serve a request that resolves no table.
+The vended path selects its storage backend from the table location's URI scheme, which is known only after the catalog loads the table. The static path selects from the CONNECTION credential shape. One selector would need CONNECTION parsing deferred for every request, and could not serve a request that resolves no table.
 
 ### Decision
 
-`storage_block` stays the static selector, reads the CONNECTION credential shape, and runs only when `use_vended_credentials` is false. `resolve_vended_storage` is the vended selector, reads the table location scheme from the `loadTable` response, and runs only when vending is true. One decision point, the `use_vended_credentials` branch in `resolve_file_list`, chooses between them.
+There are two selectors on disjoint inputs. The static selector reads the CONNECTION credential shape and runs only when vended credentials are off. The vended selector reads the table location scheme and runs only when they are on. One branch on that setting chooses between them.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| One selector that receives the URI scheme | Rejected: the scheme is known only after `loadTable`, which runs later, once per table, and never on `createVirtualSchema` |
-| The vended arm mutates the payload `storage_block` returned | Rejected: the feature already forbids reaching into the payload to finish construction |
-| Call the scheme switch "not a selection" and keep the one-site clause | Rejected: a false clause on a credentials path is worse than superseding it |
+| One selector that receives the URI scheme | Rejected: the scheme is known only after the table load, which runs later, once per table, and never at virtual schema creation |
+| The vended arm mutates the payload `storage_block` returned | Rejected: reaching into a built payload to finish construction is forbidden |
+| Call the scheme switch "not a selection" and keep the one-site clause | Rejected: a false one-site claim on a credentials path misleads |
 
 ### Consequences
 
-The spec clause becomes "exactly two selectors on disjoint inputs, one decision point". No path runs both selectors, and neither overrides the other.
+- No path runs both selectors, and neither overrides the other.
 
 ## ADR: `ALLOW_HTTP` stays the operator's consent gate for plaintext transport
 
@@ -35,45 +34,20 @@ The spec clause becomes "exactly two selectors on disjoint inputs, one decision 
 
 ### Context
 
-Deriving `allow_http` from the vended endpoint's scheme would permit plaintext to any endpoint a catalog names as `http://`. The shipped rule defaults `allow_http` to false when `ALLOW_HTTP` is absent, so it permits plaintext to no endpoint. A misconfigured or compromised catalog could then put STS credentials in cleartext with no operator control.
+Deriving plaintext permission from the vended endpoint's scheme would allow plaintext to any endpoint a catalog names as `http://`. A misconfigured or compromised catalog could then send STS credentials in cleartext with no operator control.
 
 ### Decision
 
-The resolved `ALLOW_HTTP` virtual-schema property is passed into `resolve_vended_storage` as its own boolean. A vended `http://` `s3.endpoint` or an `abfs://` anchor is honoured only when it is true. Otherwise the function returns a `UdfError::User` naming the plaintext scheme and the `ALLOW_HTTP` property.
+The `ALLOW_HTTP` virtual-schema property stays the operator's consent gate and defaults to false. A vended `http://` endpoint or `abfs://` anchor is honoured only when it is true. Otherwise the adapter returns a user error naming the plaintext scheme and the property.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Derive `allow_http` from the vended endpoint's scheme | Rejected: a security regression in the default configuration |
-| Read it from the base backend or an accessor | Rejected: reopens the CONNECTION-derived read that the dropped base-backend parameter closes |
+| Derive `allow_http` from the vended endpoint's scheme | Rejected: permits plaintext by default |
+| Read it from the base backend or an accessor | Rejected: reopens a CONNECTION-derived read |
 
 ### Consequences
 
-Passing the value adds a 4-tuple to `resolve_connection_config` (2 call sites) and one boolean to four functions, following the convention for `s3_max_connections` and the DataFusion tuning knobs. Removing `ALLOW_HTTP` from the vended path was a planner decision, not an interview outcome.
+- The value is threaded as an explicit parameter, like the other virtual-schema tuning properties.
 
-## ADR: Per-side scheme selection needs a plan-time join guard scoped to variant and account, not full backend equality
-
-**ID:** join-backend-guard-scoped-to-variant-and-account
-**Plan:** `change-vended-storage-resolution-scheme-driven`
-**Status:** Accepted
-
-### Context
-
-Each join side resolves its own storage, but the scan spec keeps only the primary side's storage, and the registration backend is shared by every side. That was safe only while both sides took their variant from one `storage_block` output. With per-side scheme selection, an `s3://` fact joined to an `abfss://` dimension would run the S3 arm over Azure files, and two `abfss://` sides on different accounts would read one through the other's account and SAS. `validate_sides_share_one_store` misses both cases because different schemes produce different registry keys.
-
-### Decision
-
-`plan_join` calls a pure function, `validate_sides_share_one_backend`, right after per-side resolution and before the empty-side shortcut. It compares each side's storage with the first side's by variant and, for `Adls`, by `account_name`, and errors naming the differing variants and accounts with no credential value.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Inline guard in `plan_join` | Rejected: the backends are outputs of live catalog I/O, so no unit test could supply them |
-| Guard on full backend equality, including per-prefix vended credentials | Rejected: could break every vended join against a catalog that mints per-table STS keys, which is unverified |
-| Leave the collapse unguarded | Rejected: reads one side's files through another side's backend with no error |
-
-### Consequences
-
-Joins whose sides select the same backend are unchanged. The existing per-prefix vended-credential collapse in `join_fan_out_scan_spec` stays out of scope, tracked as issue #294, because widening the guard needs its own live verification.

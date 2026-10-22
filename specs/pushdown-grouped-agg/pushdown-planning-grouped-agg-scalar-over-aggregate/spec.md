@@ -1,47 +1,20 @@
-# Feature: Pushdown Planning — Grouped Scalar-Over-Aggregate Select Items
+# Feature: Pushdown Planning, Grouped Scalar-Over-Aggregate Select Items
 
-Extends `pushdown-grouped-agg/pushdown-planning-grouped-agg` so a `selectList` item that is a
-scalar function wrapping one or more aggregates (e.g. `ROUND(… SUM(…) / COUNT(*) …)`)
-is decomposed into the existing shard-associative partial/merge plan — its inner
-aggregates become partial columns and the scalar wrapper is rendered over the merged
-partials in the outer wrapper — instead of declining to a bare row scan that fails
-with a `04000` pushdown column-count mismatch. See
-`pushdown-grouped-agg/pushdown-planning-grouped-agg` for the base single/simple-key grouped
-detection, wrapper-ordering, shard fan-out, LIMIT-exclusion, NULL-grouping, and
-undecomposable-shape-fallback scenarios shared by every grouped-aggregate pushdown.
+Extends `pushdown-grouped-agg/pushdown-planning-grouped-agg` so a select item that is a scalar function wrapping aggregates, such as `ROUND(... SUM(...) / COUNT(*) ...)`, is decomposed into the partial/merge plan. The inner aggregates become partial columns and the outer wrapper renders the scalar function over the merged partials.
 
 ## Background
 
-* A grouped aggregate pushdown arrives as `aggregationType: "group_by"` with a
-  non-empty `groupBy` array and a select list of supported aggregate functions; see
-  `pushdown-grouped-agg/pushdown-planning-grouped-agg` for the shared detection, fan-out, and
-  fallback scenarios.
-* A grouped select item MAY be a `function_scalar` (or arithmetic) expression that
-  wraps one or more `function_aggregate` nodes — e.g.
-  `ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG = 'R' THEN 1 ELSE 0 END) / COUNT(*), 2)`.
-  The adapter decomposes each such item's *inner* aggregates into the same
-  shard-associative partial columns as a top-level aggregate, and renders the scalar
-  wrapper over the *merged* partials in the outer wrapper SELECT (never per shard).
-  The scalar wrapper itself is not decomposable — only its inner aggregates are.
-* The outer wrapper renders a nested `function_aggregate` by rewriting it to its
-  merged expression (e.g. `SUM(x)` → `SUM("PARTIAL_sum_0")`, `COUNT(*)` →
-  `SUM("PARTIAL_count_0")`, `AVG(x)` → the merged SUM/COUNT pair), matched to the
-  decomposed `AggregatePlan` list, exactly as a `function_aggregate` in a HAVING is
-  rewritten. The scalar/arithmetic structure around the aggregates is preserved; only
-  the aggregate leaves are rewritten — the outer wrapper has only `GK_*` and
-  `PARTIAL_*` columns available, never a source column.
-* When a grouped select item cannot be decomposed into supported partials (an inner
-  aggregate that is `DISTINCT`, a SUM/stat over a non-numeric type, an untranslatable
-  argument, or a non-aggregate/non-group-key node), the adapter falls back to the
-  qualified single-table wrapper described in `pushdown-grouped-agg/pushdown-planning-grouped-agg`
-  rather than a column-count-mismatched raw scan.
+* A grouped select item can be a `function_scalar` or arithmetic expression that wraps one or more `function_aggregate` nodes, for example `ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG = 'R' THEN 1 ELSE 0 END) / COUNT(*), 2)`. The adapter decomposes the inner aggregates into the same shard-associative partial columns as a top-level aggregate. The scalar wrapper is not decomposable and is rendered once, over the merged partials, in the outer wrapper SELECT.
+* The outer wrapper rewrites a nested `function_aggregate` to its merged expression: `SUM(x)` becomes `SUM("PARTIAL_sum_0")`, `COUNT(*)` becomes `SUM("PARTIAL_count_0")`, and `AVG(x)` becomes the merged SUM/COUNT pair. The match is against the decomposed `AggregatePlan` list, as for a HAVING. The structure around the aggregates is kept, and the wrapper has only `GK_*` and `PARTIAL_*` columns, never a source column.
+* When a select item cannot be decomposed (a `DISTINCT` inner aggregate, a SUM or statistic over a non-numeric type, an untranslatable argument, or a node that is neither an aggregate nor a group key), the adapter falls back to the qualified single-table wrapper (`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`).
+
 
 ## Scenarios
 
 ### Scenario: Single-table grouped select item that is a scalar function wrapping aggregates is pushed down
 
 * *GIVEN* a virtual schema over an Iceberg table backed by SeaweedFS
-* *AND* a single-table grouped `pushdown` request (`aggregationType: "group_by"`, non-empty `groupBy`) whose select list contains a select item that is a scalar function wrapping one or more aggregates — e.g. `ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG = 'R' THEN 1 ELSE 0 END) / COUNT(*), 2)` — alongside a group key `L_RETURNFLAG` and plain aggregates `SUM(L_QUANTITY)` and `AVG(L_EXTENDEDPRICE)`
+* *AND* a single-table grouped `pushdown` request (`aggregationType: "group_by"`, non-empty `groupBy`) whose select list contains a select item that is a scalar function wrapping one or more aggregates, e.g. `ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG = 'R' THEN 1 ELSE 0 END) / COUNT(*), 2)`, alongside a group key `L_RETURNFLAG` and plain aggregates `SUM(L_QUANTITY)` and `AVG(L_EXTENDEDPRICE)`
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL NOT decline the request and SHALL NOT return an error for the scalar-over-aggregate select item
 * *AND* the adapter SHALL decompose every `function_aggregate` nested inside that select item into the same partial `AggregatePlan` list it builds for a top-level aggregate, so each inner aggregate contributes a `PARTIAL_*` column the scan UDF emits per group per shard
@@ -60,7 +33,7 @@ undecomposable-shape-fallback scenarios shared by every grouped-aggregate pushdo
 
 ### Scenario: Inner aggregates shared across the grouped select list decompose into deduplicated partial columns
 
-* *GIVEN* a grouped pushdown whose select list references the same inner aggregate more than once — e.g. `COUNT(*)` appears both as a bare select item and inside a `ROUND(... / COUNT(*) ...)` scalar-over-aggregate item
+* *GIVEN* a grouped pushdown whose select list references the same inner aggregate more than once, e.g. `COUNT(*)` appears both as a bare select item and inside a `ROUND(... / COUNT(*) ...)` scalar-over-aggregate item
 * *WHEN* the adapter decomposes the select list into partial `AggregatePlan`s
 * *THEN* the adapter SHALL collapse aggregates that are equal by kind and argument into a single `PARTIAL_*` column rather than emitting a duplicate partial column per occurrence
 * *AND* both the bare occurrence and the nested occurrence SHALL render to the same merged expression over that one shared partial column

@@ -1,37 +1,19 @@
 # Feature: Format-Neutral Pushdown Resolution
 
-Routes every pushdown request through the table-format reader seam, so the ONE thing a pushdown needs
-from a table's format — its active file list, its logical schema, its partition columns, its table
-root, and the storage those were resolved through — is produced by the reader that owns that format
-and consumed by a pipeline that names no format at all. This is what makes a Delta table queryable:
-the refusal that blocked every Unity Catalog pushdown is replaced by a resolution seam, not by a
-Delta-shaped branch, so a single-table scan, each leg of a broadcast join, and every aggregate shape
-reach a Delta table by the same route they reach an Iceberg one.
+Routes every pushdown request through the table-format reader seam. The reader that owns a table's format produces its active file list, logical schema, partition columns, table root, and storage, and the rest of the pipeline names no format. A single-table scan, each leg of a broadcast join, and every aggregate shape therefore reach a Delta table by the same route as an Iceberg table.
 
 ## Background
 
-The seam already exists and is exercised only by tests: a `FormatReader` returns a `ResolvedScan`,
-`format_reader` selects the reader by exhaustively matching a `ScanSource`, and both concrete readers
-are private to that module. Production pushdown reaches none of it — it calls the Iceberg-only file
-resolver directly, from the single-table path and from each join leg, and the adapter refuses a Unity
-Catalog pushdown outright before any of that runs.
-
-Resolution economy is a recorded property this feature preserves: a request resolves its catalog
-session ONCE and reuses it for every table it touches, so a two-leg join performs no more catalog
-authentication round-trips than a single-table scan.
-
-Pushdown SQL shape is format-agnostic in this engine: projection, filter, LIMIT, ORDER BY, aggregate
-decomposition, and join eligibility are decided from the request's SQL alone and are unchanged by
-this feature. Only file resolution differs per format.
-
-* **This delta is issue #135. It amends ONE scenario and changes no resolution rule.** The one format-reader seam, the one catalog session per request, the single catalog-kind match site, the Unity identity round trip, the resolver collapse, the partition-column propagation, the loud plan-time failure, and the kind-blind capability advertisement are all UNCHANGED.
-* **SUPERSEDES this feature's byte-identity gate for the `storage` value alone.** The generated SQL and the serialized per-shard scan specs stay byte-identical EXCEPT for the `storage` value, which becomes the tagged wrapper of `storage-access/scan-spec-credential-reference`. Every other byte of every request's output is unchanged, which is what keeps this gate meaningful rather than waived.
+* A `FormatReader` returns a `ResolvedScan`. `format_reader` selects the reader by matching a `ScanSource` exhaustively, and both concrete readers are private to that module.
+* A request resolves its catalog session once and reuses it for every table it touches, so a two-leg join performs no more catalog authentication round-trips than a single-table scan.
+* Pushdown SQL shape (projection, filter, LIMIT, ORDER BY, aggregate decomposition, join eligibility) is decided from the request's SQL alone. Only file resolution differs per format.
+* The generated SQL and the serialized per-shard scan specs are byte-identical to the output before the format-reader seam, except for the `storage` value, which is the tagged wrapper of `storage-access/scan-spec-credential-reference`.
 
 ## Scenarios
 
 ### Scenario: Every pushdown request shape resolves through the one format-reader seam
 
-* *GIVEN* four pushdown requests over the SAME virtual schema — a single-table projection scan, a
+* *GIVEN* four pushdown requests over the SAME virtual schema, a single-table projection scan, a
   single-table aggregate, a grouped aggregate, and a broadcast inner equi-join with two legs
 * *WHEN* the adapter plans each request
 * *THEN* the adapter SHALL obtain each table's file list, table root, name mapping, and effective
@@ -63,16 +45,6 @@ this feature. Only file resolution differs per format.
 * *AND* the number of catalog round-trips an Iceberg request performs SHALL be unchanged from before this feature, except for the one batch-check request that `vs-adapter/pushdown-catalog-session` admits while `PERMISSION_CHECK = 'LAKEKEEPER'` is set
 * *AND* under a catalog kind whose session is an OBJECT STORE rather than a catalog client, the adapter SHALL build that store EXACTLY ONCE per request and SHALL share it across every leg, so a two-table join opens one store and its admission limiter bounds the whole request rather than each leg
 
-### Scenario: The catalog kind is matched at one added construction site and nowhere else
-
-* *GIVEN* the resolved catalog kind and the recorded rule that its variant names appear in no production module beyond the enum's own declaration, its resolver, the catalog-client construction site, credential validation, and the pushdown scan-source construction site
-* *WHEN* the pushdown path builds the per-request scan-source resolver
-* *THEN* the adapter SHALL match the catalog kind EXHAUSTIVELY at exactly ONE site in the pushdown path, which yields the per-request resolver, so a FOURTH catalog kind is a compile error there rather than a silent fall-through
-* *AND* that site SHALL REPLACE the pushdown refusal in the recorded list of production sites permitted to name a catalog-kind variant, so the permitted-site count is unchanged and no per-request-shape fork is introduced
-* *AND* that list SHALL be held by EXHAUSTIVE matching plus review rather than by a source-level probe, SUPERSEDING the recorded clause that the probe asserting it SHALL be updated to name this site instead of the refusal: no such probe was ever built, and `vs-adapter/catalog-kind-selection` records why this plan declines to build one
-* *AND* the private already-resolved-session value the resolver carries SHALL gain one variant per catalog kind and SHALL be matched exhaustively wherever it is read, and it MUST NOT name a catalog-kind variant, so it adds no site to the permitted list
-* *AND* the format-reader selection site MUST NOT match the catalog kind, because it matches the scan source
-
 ### Scenario: A Unity Catalog table's identity survives the round trip from the involved table
 
 * *GIVEN* a pushdown request under the Unity Catalog kind whose involved virtual table name maps,
@@ -87,9 +59,9 @@ this feature. Only file resolution differs per format.
   unresolvable identifier, and MUST NOT resolve a different table
 * *AND* a pushdown request whose involved virtual table name is absent from the recorded mapping SHALL keep failing with the error naming the unknown virtual table, unchanged for both catalog kinds
 
-### Scenario: Iceberg pushdown output is byte-identical across the rewiring
+### Scenario: Iceberg requests planned through the format-reader seam keep their golden SQL, scan specs, and file pruning
 
-* *GIVEN* the shipped Iceberg pushdown suites — the golden dispatch fixtures, the scan-spec encodings,
+* *GIVEN* the shipped Iceberg pushdown suites, the golden dispatch fixtures, the scan-spec encodings,
   the generated scan-driving SQL for raw, TopN, single-group aggregate, grouped aggregate, and
   broadcast-join requests, and the Iceberg E2E suites
 * *WHEN* those requests are planned through the format-reader seam instead of the direct file resolver

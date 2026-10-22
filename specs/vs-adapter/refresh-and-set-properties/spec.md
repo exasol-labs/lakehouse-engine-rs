@@ -1,15 +1,14 @@
 # Feature: Refresh And Set Properties
 
-Lets an Exasol user re-read the source of an existing virtual schema in place, through `ALTER VIRTUAL SCHEMA ... REFRESH` and `ALTER VIRTUAL SCHEMA ... SET`. The source is the catalog namespace, or under `CATALOG_KIND = 'DIRECT_STORAGE'` the storage base path. Tables and columns the source added, dropped, renamed, or changed in type then become queryable without a `DROP ... CASCADE` + `CREATE`, which loses dependent views and grants.
+An Exasol user re-reads the source of an existing virtual schema in place with `ALTER VIRTUAL SCHEMA ... REFRESH` and `ALTER VIRTUAL SCHEMA ... SET`. The source is the catalog namespace, or under `CATALOG_KIND = 'DIRECT_STORAGE'` the storage base path. Tables and columns that the source added, dropped, renamed, or changed in type become queryable without a `DROP ... CASCADE` and `CREATE`.
 
 ## Background
 
-The Exasol virtual-schema JSON protocol sends a `refresh` request for `ALTER VIRTUAL SCHEMA ... REFRESH` and a `setProperties` request for `ALTER VIRTUAL SCHEMA ... SET`, and expects a response of the same `type`. These are the literal protocol strings; they are NOT `refreshVirtualSchema` or `refreshProperties`.
-
-* The adapter is stateless per `vs-adapter/create-virtual-schema` — it holds no catalog metadata between requests other than what it returns in `schemaMetadata.adapterNotes` and in each column's `adapterNotes` (`vs-adapter/column-source-notes`), which Exasol persists and round-trips back. `refresh` and `setProperties` are therefore not cache invalidation; each re-runs the same full namespace enumeration as `createVirtualSchema` and re-emits an updated `schemaMetadata`.
-* Enumeration, schema resolution, type mapping, `adapterNotes` construction (including `TABLE_MAP` and every column note), and credential redaction reuse the `createVirtualSchema` path verbatim; the only differences are the request `type` recognised, the merge precedence of the incoming properties, the response `type` label, and the `requestedTables` echo.
-* Iceberg schema evolution is picked up automatically because a re-enumeration re-reads each table's current metadata. Per the Apache Iceberg table spec, `current-schema-id` is the "ID of the table's current schema" and "points to the schema by ID for use when reading table data"; the allowed evolutions are "Adding, deleting, renaming, or reordering fields in structs" and "Type promotion". Columns are "selected by field id", so a re-read reflects an added, dropped, or renamed column and a promoted type without any diffing by the adapter. This feature adds no new schema-handling surface beyond `createVirtualSchema`; the known field-id projection exception (`scan-read-path/scan-execution-field-id-projection`, #27) is unchanged and out of scope here.
-* Credentials (access keys, secret keys, session tokens, SigV4 signing keys) MUST NOT appear in any returned response or error message.
+* The Exasol virtual-schema protocol sends a `refresh` request for `ALTER VIRTUAL SCHEMA ... REFRESH` and a `setProperties` request for `ALTER VIRTUAL SCHEMA ... SET`, and expects a response of the same `type`. These are the literal protocol strings.
+* The adapter is stateless per `vs-adapter/create-virtual-schema`. It keeps only what it returns in `schemaMetadata.adapterNotes` and in each column's `adapterNotes` (`vs-adapter/column-source-notes`), which Exasol persists and returns. `refresh` and `setProperties` are not cache invalidation. Each re-runs the full namespace enumeration of `createVirtualSchema` and re-emits `schemaMetadata`.
+* Enumeration, schema resolution, type mapping, `adapterNotes` construction (including `TABLE_MAP` and every column note), and credential redaction reuse the `createVirtualSchema` path. The differences are the request `type`, the merge precedence of the incoming properties, the response `type`, and the `requestedTables` echo.
+* Re-enumeration re-reads each table's current metadata, so Iceberg schema evolution (added, dropped, renamed, or reordered fields and type promotion) shows up without diffing by the adapter.
+* Credentials (access keys, secret keys, session tokens, SigV4 signing keys) never appear in a returned response or error message.
 
 ## Scenarios
 
@@ -36,7 +35,7 @@ The Exasol virtual-schema JSON protocol sends a `refresh` request for `ALTER VIR
 
 * *GIVEN* a `refresh` request whose `schemaMetadataInfo.adapterNotes` carries the persisted notes from creation (`PARALLELISM_FACTOR`, the DataFusion threading and memory-budget entries, and `TABLE_MAP`)
 * *WHEN* the adapter builds the `refresh` response
-* *THEN* the adapter SHALL rebuild `TABLE_MAP` from the re-enumerated tables — a full rebuild, never a diff or patch of the prior map
+* *THEN* the adapter SHALL rebuild `TABLE_MAP` from the re-enumerated tables, a full rebuild, never a diff or patch of the prior map
 * *AND* the adapter SHALL preserve every other pre-existing `adapterNotes` entry when writing the rebuilt `TABLE_MAP`, including an entry the adapter does not itself write, which survives the rebuild unread and inert
 * *AND* the adapter MUST NOT persist the map anywhere other than the returned `schemaMetadata.adapterNotes`
 
@@ -45,14 +44,14 @@ The Exasol virtual-schema JSON protocol sends a `refresh` request for `ALTER VIR
 * *GIVEN* a virtual schema created over an Iceberg namespace reachable through its CONNECTION
 * *WHEN* Exasol sends a `refresh` request that carries a `requestedTables` array (a partial `ALTER VIRTUAL SCHEMA ... REFRESH TABLES ...`)
 * *THEN* the adapter SHALL echo the same `requestedTables` array in the response because the protocol requires a well-formed response of type `refresh` to mirror the fields of the request it answers
-* *AND* the adapter MUST NOT be relied upon to scope the resulting refresh to the echoed `requestedTables` — verified against the live engine, Exasol applies the adapter's full `schemaMetadata.tables` response to the whole namespace regardless of `requestedTables`, so a partial `REFRESH TABLES <t>` has the same real-world effect as a full `REFRESH`
+* *AND* the adapter MUST NOT be relied upon to scope the resulting refresh to the echoed `requestedTables`, verified against the live engine, Exasol applies the adapter's full `schemaMetadata.tables` response to the whole namespace regardless of `requestedTables`, so a partial `REFRESH TABLES <t>` has the same real-world effect as a full `REFRESH`
 * *AND* when the request carries no `requestedTables`, the response SHALL omit `requestedTables` so Exasol applies a full refresh
 
 ### Scenario: Set properties overrides persisted properties and re-enumerates
 
 * *GIVEN* a virtual schema created with property `NAMESPACE` set to one namespace, whose persisted properties arrive in `schemaMetadataInfo.properties`
 * *WHEN* Exasol sends a request of type `setProperties` (the literal protocol string for `ALTER VIRTUAL SCHEMA ... SET`) whose `properties` object sets `NAMESPACE` to a different namespace
-* *THEN* the adapter SHALL treat the request's `properties` as overriding the persisted `schemaMetadataInfo.properties` on conflict — the newly set value wins — and a `null` value in the request's `properties` SHALL unset that property
+* *THEN* the adapter SHALL treat the request's `properties` as overriding the persisted `schemaMetadataInfo.properties` on conflict, the newly set value wins, and a `null` value in the request's `properties` SHALL unset that property
 * *AND* the adapter SHALL re-enumerate using the effective merged properties and return a JSON response of type `setProperties` whose `schemaMetadata` describes the tables of the newly targeted namespace
 * *AND* a `setProperties` request that leaves a required property (`NAMESPACE` or `CATALOG_CONNECTION`) unset SHALL return a clear error naming the missing property
 

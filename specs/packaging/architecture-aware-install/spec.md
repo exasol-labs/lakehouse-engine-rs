@@ -1,13 +1,11 @@
 # Feature: Architecture-Aware Install
 
-The install script and Makefile select the correct release asset for the target Exasol host's CPU architecture. x86_64 is the default. An explicit `--arch` flag overrides all paths. Exasol Personal local deployments auto-detect architecture via `uname -m`.
+The install script and Makefile select the release asset for the target Exasol host's CPU architecture. x86_64 is the default. An explicit `--arch` flag overrides all paths. Exasol Personal local deployments auto-detect architecture via `uname -m`.
 
 ## Background
 
 - Release asset naming: `lakehouse-engine.tar.gz` (x86_64), `lakehouse-engine-aarch64.tar.gz` (aarch64)
 - SLC asset naming: `lc-rust-<ver>.tar.gz` (x86_64), `lc-rust-<ver>-aarch64.tar.gz` (aarch64)
-- Bash 3.2+ compatibility required (stock macOS); no `${VAR^^}`, use `tr` for case conversion
-- The `--arch` flag is new to this project; lc-rs does not have one
 
 ## Scenarios
 

@@ -1,14 +1,15 @@
-# Feature: Connection-Object Credential Source — AWS SigV4 Catalog-Signing Credentials
+# Feature: Connection-Object Credential Source, AWS SigV4 Catalog-Signing Credentials
 
-Extends `connection/connection-credentials` with the AWS Glue SigV4 catalog-signing
-requirement: `access_key`, `secret_key`, and a signing region on the CONNECTION password
-JSON, including the standard-AWS-Glue-endpoint derivation of the signing region.
+Extends `connection/connection-credentials` with the AWS Glue SigV4 requirement: `access_key`, `secret_key`, and a signing region on the CONNECTION password JSON.
 
 ## Background
 
-* `access_key`, `secret_key`, and a signing region are required when `use_sigv4` is true, and stay required whether or not `use_vended_credentials` is true. The key pair signs the catalog `load_table` request, ahead of any credential vending. When the CONNECTION names `aws_assume_role_arn`, the key pair instead signs the STS `AssumeRole` request, and the session it returns signs the catalog requests (`connection/connection-credentials-assume-role-session-use`).
-* **The SigV4 signing region is a separate value from the CONNECTION's `region`, and for a standard AWS Glue endpoint the two are independent even when both are present.** For a standard AWS Glue endpoint — an address with the `https` scheme whose host, compared case-insensitively, is exactly `glue.<region>.amazonaws.com`, where `<region>` is a commercial AWS region code (two letters, a hyphen, one or more letters, a hyphen, one or more digits, for example `us-east-1` or `ap-southeast-2`; port and path do not affect the match) — the signing region is ALWAYS the region that address names, even when `region` is also stated and even when the two differ, because a Glue catalog and the S3 buckets of its tables can sit in different regions and `region` places the store, not the signature. For any other address form — AWS GovCloud (US), AWS China, FIPS, dual-stack, VPC interface, a private or proxy host, or any `http` address — the signing region is the stated `region`. Only the SigV4 guard, catalog request signing, and the STS `AssumeRole` request of `connection/connection-credentials-assume-role` read the signing region; `region` holds exactly what the CONNECTION states and independently places the S3 store.
-* `endpoint` stays optional even when `use_sigv4` is true.
+* `access_key`, `secret_key`, and a signing region are required when `use_sigv4` is true, whether or not `use_vended_credentials` is true. The key pair signs the catalog `load_table` request before any credential vending. When the CONNECTION names `aws_assume_role_arn`, the key pair signs the STS `AssumeRole` request instead, and the returned session signs the catalog requests (`connection/connection-credentials-assume-role-session-use`).
+* A standard AWS Glue endpoint is an address with the `https` scheme whose host, compared case-insensitively, is exactly `glue.<region>.amazonaws.com`, where `<region>` is a commercial AWS region code such as `us-east-1` or `ap-southeast-2`. Port and path do not affect the match.
+* For a standard AWS Glue endpoint, the signing region is the region the address names, even when `region` is also stated and differs. A Glue catalog and the S3 buckets of its tables can sit in different regions, and `region` places the store, not the signature.
+* For any other address form, the signing region is the stated `region`.
+* `region` holds exactly what the CONNECTION states and places the S3 store independently of the signing region.
+* `endpoint` stays optional when `use_sigv4` is true.
 
 ## Scenarios
 
@@ -31,7 +32,7 @@ JSON, including the standard-AWS-Glue-endpoint derivation of the signing region.
 * *WHEN* the adapter resolves the connection and issues its SigV4-signed catalog requests
 * *THEN* the adapter SHALL accept the CONNECTION without reporting `region` as missing, per the standard-AWS-Glue-endpoint definition in § Background
 * *AND* the adapter SHALL sign every SigV4-signed catalog request for the region `eu-west-1`, covering both the namespace-enumeration requests and the `loadTable` request
-* *AND* the adapter MUST NOT write the derived signing region into the CONNECTION's `region`, so `ConnectionCreds.region` SHALL stay empty and every other rule that reads it — the store-addressing precedence of `storage-access/pushdown-planning-cloud-credentials-vended-storage`, the S3 region `storage_block` builds, and the Azure-and-S3 mixed-fields guard — SHALL see it as unstated
+* *AND* the adapter MUST NOT write the derived signing region into the CONNECTION's `region`, so `ConnectionCreds.region` SHALL stay empty and every other rule that reads it, the store-addressing precedence of `storage-access/pushdown-planning-cloud-credentials-vended-storage`, the S3 region `storage_block` builds, and the Azure-and-S3 mixed-fields guard, SHALL see it as unstated
 
 ### Scenario: A standard AWS Glue endpoint signs the catalog request even when the CONNECTION states a different region
 
@@ -40,4 +41,4 @@ JSON, including the standard-AWS-Glue-endpoint derivation of the signing region.
 * *WHEN* the adapter resolves the connection and issues its SigV4-signed catalog requests
 * *THEN* the adapter SHALL accept the CONNECTION
 * *AND* the adapter SHALL sign every SigV4-signed catalog request for `eu-west-1`, the region the address names, and NOT for the stated `us-east-1`
-* *AND* `ConnectionCreds.region` SHALL stay `us-east-1` for every other rule that reads it, so the stated `region` places the S3 store in a region DIFFERENT from the one that signs the catalog request — the deployment shape where a Glue catalog and its tables' S3 bucket sit in different AWS regions
+* *AND* `ConnectionCreds.region` SHALL stay `us-east-1` for every other rule that reads it, so the stated `region` places the S3 store in a region DIFFERENT from the one that signs the catalog request, the deployment shape where a Glue catalog and its tables' S3 bucket sit in different AWS regions

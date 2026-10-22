@@ -1,83 +1,21 @@
-# Feature: DataFusion Scan Execution — Object-Store Connection Concurrency
+# Feature: DataFusion Scan Execution, Object-Store Connection Concurrency
 
-Controls how many concurrent connections each scan UDF instance holds open to
-the S3-compatible object store, so that a node's network / IO bandwidth is
-saturated when data-file fetching — not CPU — is the throughput bottleneck.
-The budget is a single operator-facing knob (mirroring Exasol's native
-`IMPORT FROM PARQUET` `MaxConnections` parameter): an explicit positive value
-pins it, otherwise the adapter derives a per-instance budget from the node's
-capacity. Configuration is round-tripped from a VS property through
-`adapterNotes` and the shard-invariant common spec argument to the scan UDF,
-which applies it to the object store's HTTP client — an axis independent of the
-CPU thread/partition budget of `scan-runtime/scan-execution-threading`.
+Each scan UDF instance holds a bounded number of connections open to the S3-compatible object store. An explicit positive `S3_MAX_CONNECTIONS` property pins the budget. Otherwise the adapter derives it from the node's capacity and passes it to the UDF through `adapterNotes` and the common spec.
 
 ## Background
 
-* The scan spec carries a shard-invariant `s3_max_connections` field (a
-  positive integer connection-concurrency budget) that defaults to a
-  conservative built-in value when absent from the JSON, so pre-existing scan
-  specs remain backward-compatible.
-* Data-file fetching from S3 is a distinct throughput axis from CPU work: the
-  DataFusion thread/partition budget (`scan-runtime/scan-execution-threading`)
-  governs decode/compute concurrency, while this budget governs how many
-  concurrent HTTP connections to the object store the instance may keep warm.
-  With one DataFusion instance per node (`PARALLELISM_FACTOR=1` → `G = node_count`),
-  a serial or under-concurrent fetch path can leave the node's network idle even
-  when all cores are busy; raising the connection budget lets a single instance
-  pull many byte ranges / files in parallel.
-* The budget is applied to the object store's HTTP client options when the scan
-  UDF builds its S3 store, on both the raw-row scan path and the partial-aggregate
-  path (both decode source Parquet fetched over the same object store).
-* The budget is resolved in the adapter at `createVirtualSchema` time from an
-  `S3_MAX_CONNECTIONS` VS/connection property and recorded in `adapterNotes`. An
-  explicit positive integer is used verbatim; an absent, empty, zero, or invalid
-  value triggers an AUTO derivation from the node's core count and its per-node
-  UDF-instance share (mirroring the AUTO thread-budget derivation in
-  `scan-runtime/scan-execution-threading`). Only the resolved integer reaches
-  the scan UDF; the UDF stays resolution-agnostic.
-* The budget travels in the shard-invariant common spec argument, serialized once
-  for the whole work-unit shard fan-out (see `parallelism/work-unit-sharding`),
-  never repeated per shard.
-* Whether raising connection concurrency actually closes the gap to the native
-  `IMPORT FROM PARQUET` throughput ceiling is an open empirical question answered
-  by benchmark sweeps, not by this spec. This spec only guarantees the budget is
-  selectable, correctly derived, round-tripped, and applied to the object store.
-* See `scan-runtime/scan-execution-memory-and-credentials` for how the S3
-  object store is built from vended credentials, and
-  `vs-adapter/create-virtual-schema-adapter-notes` for how the property is
-  recorded in `adapterNotes`.
-* **The budget is per built object store, and a join now builds one per side.** Issue #294 gives each join side its own inner object store so each reads through its own credential (`scan-aggregation/scan-execution-join`). Each inner store gets its own HTTP client, so each is configured with the budget N and a two-side join can hold up to 2N warm idle connections to one host rather than N.
-* **Dividing the budget across the sides was rejected.** `budget / side_count` would silently halve fact-side fetch parallelism on EVERY broadcast join, making a tuning knob's effective value depend on whether the query happens to be a join — a data-dependent performance regression, in exchange for bounding a resource that is not the bottleneck.
-* **What doubles is warm idle sockets, not concurrency.** The knob maps to `object_store` 0.13.2's `pool_max_idle_per_host`, which bounds how many established connections the pool keeps warm and reusable; `object_store` 0.13.2 exposes no hard in-flight ceiling. The bound that a two-side join widens is therefore a socket / file-descriptor bound, not a request-rate bound.
-* **A join whose sides live in different buckets holds 2N as well**, because two buckets yield two registered stores with two clients. The shared-bucket join matches that shape rather than introducing a new one.
-* **The per-side store split does NOT split the delete-path semaphore.** The size-N limiter below is instance-level and shared across both sides' registrations, so the delete path's in-flight bound stays N even though the HTTP connection pools are now per side. What is per side is the credential a read goes out under, not how many reads may be in flight.
-* The row-position delete pipeline (`scan-read-path/scan-execution-row-position-deletes`) issues
-  object-store reads in TWO phases, and BOTH draw from the one size-N limiter. Phase A reads every
-  delete payload the shard needs: the footer and then each surviving row group of each unique
-  positional-delete file, each unique Delta deletion-vector sidecar once, and each merged
-  byte-range request over a Puffin file. Phase B fetches each DELETE-CARRYING DATA FILE's Parquet
-  footer to obtain the per-row-group row counts the base `ParquetAccessPlan` needs. Phase B once
-  awaited those footers one at a time, so a shard with K delete-carrying data files paid K serial
-  round-trips while a delete-free scan of the same files had its footers fetched concurrently by
-  DataFusion's own opener (#165).
-* One limiter serves both phases and all three delete mechanisms. It bounds every object-store
-  read the delete path issues while preparing a delete-carrying scan, not only reads of delete
-  files. A second size-N limiter for Phase B, or for one mechanism, would double the instance's
-  in-flight bound to 2N and break the guarantee this feature records for Phase A.
-* Deadlock freedom rests on one property, not on phase ordering: every fan-out task that reads
-  object storage acquires EXACTLY ONE permit, holds it across ONE object-store read, and releases
-  it on completion. A footer read, of a delete file or a data file, is one read when the footer
-  and metadata fit the format's metadata size hint. A larger footer adds a second, sequential read
-  under the same permit. A task that only decodes positions or builds a set takes no permit. A delete-file
-  footer task releases its permit before it decodes the row groups inside the footer bytes. No
-  task holds a permit while awaiting another permit, and no task awaits another task. Only the
-  orchestrating call awaits tasks, and it holds no permit. Phase A also completes and releases its
-  permits before Phase B's fan-out starts, but the safety argument does not rely on that order.
-  The no-hold-and-wait property is what makes contention between the phases, and between the two
-  concurrently planned sides of a broadcast join, queue rather than deadlock.
-* What the budget does NOT bound is unchanged: the Parquet opener's own data-file reads at
-  execution time are bounded by the object store's HTTP client, which the same N configures. The
-  semaphore is an application-level admission gate over the delete path's preparation reads only.
+* The scan spec carries a shard-invariant `s3_max_connections` field, a positive integer. It defaults to a built-in value when absent from the JSON.
+* The budget is a different axis from the CPU thread and partition budget of `scan-runtime/scan-execution-threading`. It sets how many HTTP connections to the object store the instance keeps warm.
+* The scan UDF applies the budget to the object store's HTTP client options when it builds its S3 store, on the raw-row path and the partial-aggregate path.
+* The adapter resolves the budget at `createVirtualSchema` time. An explicit positive integer is used as given. An absent, empty, zero, or invalid value triggers an AUTO derivation from the node's core count and its per-node UDF-instance share (the parallelism factor of `parallelism/work-unit-sharding`), mirroring the AUTO thread-budget derivation in `scan-runtime/scan-execution-threading`. The adapter records the result in `adapterNotes`, and only the integer reaches the UDF.
+* The budget travels in the shard-invariant common spec, serialized once for the whole shard fan-out (`parallelism/work-unit-sharding`).
+* The budget applies per built object store. A broadcast join builds one inner store per side, so each side reads through its own credential (`scan-aggregation/scan-execution-join`). A two-side join can therefore hold up to 2N warm idle connections. Dividing the budget across the sides would halve fact-side fetch parallelism on every broadcast join, so it is not divided.
+* The budget maps to the `object_store` option `pool_max_idle_per_host`, which bounds warm idle connections. `object_store` exposes no hard in-flight ceiling, so the bound is on sockets and file descriptors, not request rate.
+* The row-position delete pipeline (`scan-read-path/scan-execution-row-position-deletes`) issues object-store reads in two phases. Phase A reads every delete payload the shard needs: the footer and then each surviving row group of each unique positional-delete file, each unique Delta deletion-vector sidecar once, and each merged byte-range request over a Puffin file. Phase B fetches the Parquet footer of each delete-carrying data file to get the per-row-group row counts for the base `ParquetAccessPlan`.
+* One size-N limiter serves both phases and all three delete mechanisms. It bounds every object-store read the delete path issues while preparing a delete-carrying scan. It is instance-level and shared across both join sides' registrations. A second size-N limiter, per phase or per mechanism, would double the in-flight bound to 2N.
+* Deadlock freedom rests on one property: every fan-out task that reads object storage acquires exactly one permit, holds it across one object-store read, and releases it on completion. A footer larger than the format's metadata size hint adds a second, sequential read under the same permit. A task that only decodes positions or builds a set takes no permit, and a delete-file footer task releases its permit before it decodes the row groups inside the footer bytes. No task holds a permit while awaiting another permit, and only the orchestrating call, which holds no permit, awaits tasks.
+* The limiter gates only the delete path's preparation reads. The Parquet opener's data-file reads at execution time are bounded by the HTTP client that the same N configures.
+* See `scan-runtime/scan-execution-memory-and-credentials` for how the S3 object store is built from vended credentials, and `vs-adapter/create-virtual-schema-adapter-notes` for how the property is recorded in `adapterNotes`.
 
 ## Scenarios
 
@@ -86,7 +24,7 @@ CPU thread/partition budget of `scan-runtime/scan-execution-threading`.
 * *GIVEN* a scan spec whose `s3_max_connections` field is a positive integer N
 * *WHEN* the scan UDF builds its S3 object store for the files listed in its per-shard argument
 * *THEN* the UDF SHALL configure the object store's HTTP client options with a connection-concurrency budget of N, so up to N concurrent connections to the object store are held warm per host rather than leaving the client at its default pooling behaviour
-* *AND* the UDF SHALL apply that same budget of N to EACH object store it builds, so a two-side broadcast join — which builds one store per side to read each side through its own credential — holds up to 2N warm connections rather than N
+* *AND* the UDF SHALL apply that same budget of N to EACH object store it builds, so a two-side broadcast join, which builds one store per side to read each side through its own credential, holds up to 2N warm connections rather than N
 * *AND* the UDF MUST NOT divide the budget across a join's sides, because the resulting per-side value would make a fact-side scan's fetch parallelism depend on whether the query is a join
 * *AND* the budget SHALL apply on both the raw-row scan path and the partial-aggregate path, since both decode Parquet fetched over the same object store
 * *AND* a credential value MUST NOT appear in any error the UDF surfaces while building the client options
@@ -132,9 +70,9 @@ CPU thread/partition budget of `scan-runtime/scan-execution-threading`.
 ### Scenario: The connection budget also bounds the delete path's object-store reads
 
 * *GIVEN* a scan spec whose `s3_max_connections` field is a positive integer N and whose assigned data files carry Parquet positional-delete files, Iceberg deletion vectors, or Delta deletion vectors
-* *WHEN* the scan UDF prepares those deletes across every scan table it registers for the query — a single table, or both the fact and dimension sides of a broadcast join, which DataFusion may plan concurrently
-* *THEN* a single fan-out limiter of size N — one semaphore constructed once per scan invocation and shared by every registered scan table — SHALL bound BOTH the Phase A delete-payload reads (positional-delete file footers and row groups, Delta deletion-vector sidecars, and Puffin byte-range requests) AND the Phase B data-file Parquet footer fetches that build the delete-carrying files' base access plans, so across every such fan-out active in one scan invocation AT MOST N of those object-store reads are in flight at any instant
-* *AND* a SECOND size-N limiter SHALL NOT be introduced along any axis — not one per provider, because concurrently planned join-side scan leaves would then allow up to 2N in-flight reads, not one per phase, because a Phase-B-private semaphore would let a single provider run N delete-payload reads and N footer fetches at once, and not one per delete mechanism; each breaks the instance-level bound
-* *AND* every task in either fan-out that reads object storage SHALL acquire exactly ONE permit, hold it across ONE object-store read, and release it on completion, holding no permit while awaiting another; a footer that does not fit the metadata size hint adds a second, sequential read under that same permit, and a task that only decodes positions or builds a set SHALL take no permit — so contention between the two phases, and between the two sides of a broadcast join, queues rather than deadlocks
+* *WHEN* the scan UDF prepares those deletes across every scan table it registers for the query, a single table, or both the fact and dimension sides of a broadcast join, which DataFusion may plan concurrently
+* *THEN* a single fan-out limiter of size N, one semaphore constructed once per scan invocation and shared by every registered scan table, SHALL bound BOTH the Phase A delete-payload reads (positional-delete file footers and row groups, Delta deletion-vector sidecars, and Puffin byte-range requests) AND the Phase B data-file Parquet footer fetches that build the delete-carrying files' base access plans, so across every such fan-out active in one scan invocation AT MOST N of those object-store reads are in flight at any instant
+* *AND* a SECOND size-N limiter SHALL NOT be introduced along any axis: not one per provider, because concurrently planned join-side scan leaves would then allow up to 2N in-flight reads, not one per phase, because a Phase-B-private semaphore would let a single provider run N delete-payload reads and N footer fetches at once, and not one per delete mechanism; each breaks the instance-level bound
+* *AND* every task in either fan-out that reads object storage SHALL acquire exactly ONE permit, hold it across ONE object-store read, and release it on completion, holding no permit while awaiting another; a footer that does not fit the metadata size hint adds a second, sequential read under that same permit, and a task that only decodes positions or builds a set SHALL take no permit, so contention between the two phases, and between the two sides of a broadcast join, queues rather than deadlocks
 * *AND* a data file carrying NO deletes SHALL NOT acquire a permit, because it issues no Phase B footer fetch
 * *AND* this bound SHALL be an application-level concurrency limit, distinct from the HTTP client idle-pool size that the same N configures on the object store

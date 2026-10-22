@@ -1,33 +1,15 @@
 # Feature: Direct-Storage Table Discovery
 
-Turns a storage prefix holding directories of Parquet files into the same enumerated, named, and
-mapped virtual tables a catalog produces. A lakehouse with no catalog service is therefore
-queryable through the unchanged `createVirtualSchema` listing pipeline.
+The adapter turns a storage prefix holding directories of Parquet files into enumerated, named, and mapped virtual tables through the unchanged `createVirtualSchema` listing pipeline. A lakehouse with no catalog service is therefore queryable.
 
 ## Background
 
-* **The direct-storage client implements `CatalogClient` but is DECLARED IN `lakehouse-engine`, not
-  in `lakehouse-catalog`.** It needs the engine-side object-store builder.
-  `catalog/catalog-crate-structure` forbids the catalog crate from declaring `object_store` as a
-  direct dependency. Declaring the client there would point the dependency edge backwards. Rust's
-  orphan rule permits the impl, because the type is local even though the trait is not. No recorded
-  rule requires an implementor to live in the catalog crate. The recorded requirement is that the
-  engine reach every enumeration and table-load operation THROUGH the trait. This placement keeps
-  that requirement.
-* The single `Box<dyn CatalogClient>` construction site is already engine-side, so the placement
-  adds no new seam.
-* The client's base path is resolved at CONSTRUCTION from the CONNECTION address and the `NAMESPACE`
-  property (`direct-storage/direct-storage-properties`). That resolution happens inside the one
-  construction site already permitted to name a catalog kind.
-* `direct-storage/parquet-directory-seam-file-listing` owns which objects under a table root count as data files and
-  in what order they are returned. This feature owns which directories are tables and how each one
-  is named. It reads the file rules from that seam rather than restating them.
-* `lakehouse-catalog`'s neutral skip reason gains one variant for a directory holding no data file,
-  per `catalog/catalog-crate-public-surface-extensions`.
-* The neutral table identifier this client returns carries an EMPTY namespace, because a
-  direct-storage table's identity inside its virtual schema is its directory name alone. That makes
-  the shared flatten and `TABLE_MAP` construction produce the bare directory name with no branch on
-  catalog kind.
+* The direct-storage client implements `CatalogClient` and is declared in `lakehouse-engine`, not in `lakehouse-catalog`. It needs the engine-side object-store builder, and the catalog crate does not depend on `object_store` (`architecture.md`). The engine still reaches every enumeration and table-load operation through the trait.
+* The client's base path is resolved at construction from the CONNECTION address and the `NAMESPACE` property (`direct-storage/direct-storage-properties`), inside the one construction site that may name a catalog kind.
+* `direct-storage/parquet-directory-seam-file-listing` owns which objects under a table root count as data files and their order. This feature owns which directories are tables and how each is named.
+* `lakehouse-catalog`'s neutral skip reason has a variant for a directory holding no data file.
+* The neutral table identifier the client returns has an empty namespace, because a direct-storage table's identity is its directory name. The shared flatten and `TABLE_MAP` construction then produce the bare directory name without branching on catalog kind.
+
 
 ## Scenarios
 
@@ -35,13 +17,13 @@ queryable through the unchanged `createVirtualSchema` listing pipeline.
 
 * *GIVEN* the shared `CatalogClient` trait declared in `lakehouse-catalog`, and the engine-side object-store builder that opens a store over a storage root
 * *WHEN* the adapter constructs the catalog client for `CatalogKind::DirectStorage`
-* *THEN* the direct-storage client type SHALL be declared in `lakehouse-engine` and SHALL implement `CatalogClient`, so the adapter reaches this client's ENUMERATION through `list_tables` exactly as it does for the other two kinds
-* *AND* `load_table` SHALL be UNREACHABLE for this kind, because the pushdown path resolves a direct-storage table from its COMPOSED ROOT rather than from a catalog load, and the trait's single engine-side `load_table` call site serves the Unity Catalog path alone
-* *AND* this client's `load_table` SHALL nevertheless return a clear error naming the direct-storage kind and stating that a direct-storage table is not loaded through the catalog trait, and MUST NOT panic and MUST NOT return an empty or synthesized table, so a future caller meets a message rather than a crash or a silently wrong result
-* *AND* `lakehouse-catalog` SHALL gain NO source file, NO manifest dependency, and NO public item for this kind, so the one-way crate dependency and the catalog crate's forbidden-dependency list are both unchanged
-* *AND* the adapter SHALL run the SAME listing pipeline over this client's result that it runs for the other two kinds, and that pipeline MUST NOT name or match the catalog kind
+* *THEN* the direct-storage client type SHALL be declared in `lakehouse-engine` and SHALL implement `CatalogClient`, so the adapter reaches this client's ENUMERATION through `list_tables` exactly as it does for the other kinds
+* *AND* `load_table` SHALL be UNREACHABLE for this kind, because the pushdown path resolves a direct-storage table from its COMPOSED ROOT rather than from a catalog load, and the trait's engine-side `load_table` call sites serve the catalog-backed kinds alone
+* *AND* this client's `load_table` SHALL nevertheless return a clear error naming the direct-storage kind and stating that a direct-storage table is not loaded through the catalog trait, and MUST NOT panic and MUST NOT return an empty or synthesized table, so a caller meets a message rather than a crash or a silently wrong result
+* *AND* `lakehouse-catalog` SHALL hold NO source file, NO manifest dependency, and NO public item for this kind, so the one-way crate dependency and the catalog crate's forbidden-dependency list are both unaffected
+* *AND* the adapter SHALL run the SAME listing pipeline over this client's result that it runs for the other kinds, and that pipeline MUST NOT name or match the catalog kind
 * *AND* the client SHALL surface every failure as an error value rather than a panic, and no error message SHALL contain a credential value
-* *AND* this placement SHALL be recorded as a deliberate decision rather than left implicit, because the two shipped implementors live in the catalog crate and a reader would otherwise read the third as a mistake
+* *AND* this placement SHALL be deliberate, because the catalog-backed implementors live in the catalog crate and a reader would otherwise read this one as a mistake
 
 ### Scenario: A first-level directory under the base path is a table
 
@@ -50,7 +32,7 @@ queryable through the unchanged `createVirtualSchema` listing pipeline.
 * *THEN* the client SHALL return exactly TWO tables, named for the FIRST-LEVEL directories `orders` and `events`, so table identity is a directory and nothing else
 * *AND* the client MUST NOT return a table for `notes.parquet`, because a data file directly under the base path belongs to no directory and naming a table after a file would make the base path's own contents a table
 * *AND* the client MUST NOT return a table for `orders/2026/`, because every directory below a table root supplies files to that table rather than a table of its own
-* *AND* each returned table SHALL carry its own table root — the base path followed by that directory name — as its storage location, so planning needs no second composition rule
+* *AND* each returned table SHALL carry its own table root, the base path followed by that directory name, as its storage location, so planning needs no second composition rule
 * *AND* each returned table SHALL carry the Parquet table-format tag and NO credential-vending key, because this kind vends nothing
 
 ### Scenario: A table's columns and data files come from the one shared directory seam
@@ -59,7 +41,7 @@ queryable through the unchanged `createVirtualSchema` listing pipeline.
 * *WHEN* the client resolves that table's columns
 * *THEN* the client SHALL obtain the table's data-file list, its folded schema, its partition columns, and its binary columns from the ONE shared seam `direct-storage/parquet-directory-seam` specifies, passing that seam the table root and the resolved directory options, and MUST NOT carry its own listing filter, its own footer reader, or its own partition parser
 * *AND* the client SHALL map the folded schema, partition columns included, to the neutral ordered column list the shared listing pipeline consumes, each column carrying a SOURCE-TAGGED type descriptor rather than an Exasol type, so the catalog crate stays free of the Exasol type mapping
-* *AND* that descriptor SHALL carry the column's logical Arrow type as the TAG STRING of the engine's existing scan-spec tag vocabulary, rather than as an Arrow type value, because `catalog/catalog-crate-structure` forbids the catalog crate's manifest from declaring `arrow`, so a neutral column type names no Arrow type
+* *AND* that descriptor SHALL carry the column's logical Arrow type as the TAG STRING of the engine's existing scan-spec tag vocabulary, rather than as an Arrow type value, because the catalog crate does not depend on `arrow` (`architecture.md`), so a neutral column type names no Arrow type
 * *AND* each column SHALL ALSO carry its engine-encoded declaration: the logical field built from the same folded field (nested member descriptor included, no binding key), its position among the partition columns when it is one, and the refusal reason `vs-adapter/binary-column-refusal` gives a binary column, which the listing pipeline records as the column's note per `vs-adapter/column-source-notes`
 * *AND* the client SHALL apply the string substitution for a nested or unrepresentable column BEFORE it renders that tag, so every tag it emits names a type the vocabulary can express and the round trip back to an Arrow type is lossless
 * *AND* a folded Arrow type that SURVIVES that substitution and that the tag vocabulary still cannot express SHALL FAIL the enumeration with an error naming the column and that Arrow type, and the client MUST NOT render it as the string tag, because a silent string tag declares the column `VARCHAR(2000000)` and registers it as a string with no error anywhere, so the losslessness this clause asserts is proven by a failure rather than assumed
@@ -72,7 +54,7 @@ queryable through the unchanged `createVirtualSchema` listing pipeline.
 * *THEN* the client SHALL exclude `empty/` from its resolved tables and SHALL report it in the listing's skipped set, pairing its identifier with a neutral skip reason naming the absence of a data file
 * *AND* `createVirtualSchema` SHALL complete successfully with the remaining tables, and the shared listing pipeline SHALL write one warning line per skipped entry without branching on catalog kind
 * *AND* the skipped table's name SHALL be excluded from `TABLE_MAP`, so no unqueryable virtual table is advertised
-* *AND* a base path holding NO first-level directory with a data file SHALL yield a successful, EMPTY virtual schema rather than an error, matching the recorded all-non-Iceberg-namespace behaviour
+* *AND* a base path holding NO first-level directory with a data file SHALL yield a successful, EMPTY virtual schema rather than an error, matching the behavior for a namespace that holds no Iceberg table
 * *AND* the skip reason SHALL name no catalog kind, no table format, and no engine symbol, so it stays a neutral value of the catalog crate
 * *AND* the absence of a data file SHALL be the ONLY reason to skip a directory: a directory whose enumeration fails for any other reason, such as a column pair no widening rule folds (`direct-storage/parquet-directory-seam`), SHALL fail the whole `CREATE VIRTUAL SCHEMA` or `REFRESH` statement, and the client MUST NOT skip that directory or return a partial table set
 
@@ -94,7 +76,7 @@ queryable through the unchanged `createVirtualSchema` listing pipeline.
 * *AND* the cap SHALL therefore bound the WHOLE call, so a two-table join holds at most the cap in flight in total rather than the cap per side
 * *AND* the store's HTTP connection-retention budget SHALL be at least the limiter's cap, so an admitted request never finds its connection already evicted, and the two values SHALL be derived from ONE declared constant rather than set independently
 * *AND* the limiter SHALL be an application-level admission gate, DISTINCT from the scan UDF's per-instance connection budget that `scan-runtime/scan-execution-connection-concurrency` owns, and MUST NOT read or modify that budget
-* *AND* the chosen cap SHALL be recorded as a deliberately conservative starting value to revisit with measurements, because a refresh sweeping many thousands of footers tolerates far more concurrency than a per-query plan
+* *AND* the cap SHALL be a deliberately conservative fixed value, because a refresh sweeping many thousands of footers tolerates far more concurrency than a per-query plan
 
 ### Scenario: A refresh that a column pair fails keeps the previous declaration queryable
 

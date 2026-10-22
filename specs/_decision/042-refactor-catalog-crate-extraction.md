@@ -8,23 +8,24 @@
 
 ### Context
 
-A crate boundary is the only way to make `CatalogSession` public while keeping `CatalogAuth`, the OAuth grant, and the prefix lookup unreachable. The catalog code depends on `ConnectionCreds`, `CatalogProps`, and `StorageProps`, and the dependency can only run from `lakehouse-engine` to `lakehouse-catalog`, so any type both crates name must live in the catalog crate.
+Only a crate boundary can expose the catalog session while hiding catalog authentication. The catalog code depends on three credential and config types, and the dependency runs only from the engine crate to the catalog crate, so a type both name must live in the catalog crate.
 
 ### Decision
 
-`lakehouse-catalog` declares `StorageProps`, `CatalogProps`, and `ConnectionCreds` once, and `lakehouse-engine` re-exports them at their pre-move paths, so no consumer changes. The Exasol-facing parsers stay in the engine. There are two crates, not three.
+The catalog crate declares the three types once, and the engine crate re-exports them, so no consumer changes. The Exasol-facing parsers stay in the engine crate. There are two crates, not three.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| A third `lakehouse-types` crate | Rejected: groups by technical role, the wrong axis, and separates `ConnectionCreds` from the functions that interpret it |
+| A third `lakehouse-types` crate | Rejected: groups by technical role and separates the credentials from the functions that interpret them |
 | Leave the types in `lakehouse-engine` | Rejected: creates a dependency cycle |
-| Parallel config types plus boundary conversions | Rejected: duplicates most of `ConnectionCreds` and all of `StorageProps` on a struct that must stay byte-stable on the UDF wire, and forces about 1,805 moved test lines to stop constructing `ConnectionCreds` directly |
+| Parallel config types plus boundary conversions | Rejected: duplicates the types on a struct that must stay byte-stable on the UDF wire, and forces moved tests to stop constructing the credentials directly |
 
 ### Consequences
 
-Each type lives with its producer: `CatalogProps` is mis-homed in the scan module today, `ConnectionCreds` appears only in planning-layer files, and the catalog produces `StorageProps` for the scan UDF to consume as JSON. The cost is a naming smell, an S3 storage config type in a crate named "catalog", which the crate's doc comment states.
+- Each type lives with its producer.
+- Cost: an S3 storage config type sits in a crate named "catalog".
 
 ## ADR: The crate boundary is drawn at catalog access, not at Iceberg file planning
 
@@ -34,20 +35,20 @@ Each type lives with its producer: `CatalogProps` is mis-homed in the scan modul
 
 ### Context
 
-Iceberg file planning consumes the catalog's output and produces scan-spec wire types and Arrow type tags. Issue #204 asks to extract the catalog HTTP and session code.
+Iceberg file planning consumes the catalog's output and produces scan-spec wire types and Arrow type tags. The extraction targets the catalog HTTP and session code.
 
 ### Decision
 
-File planning stays in `lakehouse-engine`. The catalog crate takes catalog authentication, the session, the table load, namespace enumeration, SigV4 signing, vended-storage resolution, the credential types, and credential redaction.
+File planning stays in the engine crate. The catalog crate takes catalog authentication, the session, table load, namespace enumeration, SigV4 signing, vended-storage resolution, the credential types, and credential redaction.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Move file resolution into the crate too | Rejected: moves the scan-spec wire types and Arrow type mapping across the boundary, giving the crate a second responsibility and a far larger blast radius than the issue asks |
+| Move file resolution into the crate too | Rejected: moves the scan-spec wire types and Arrow type mapping across the boundary, giving the crate a second responsibility |
 
 ### Consequences
 
-The catalog crate's manifest declares no `arrow`, `parquet`, `datafusion`, `object_store`, or `roaring` dependency, checked by a boundary test. The scan-spec wire format and Arrow type mapping stay in one crate.
-
-`StorageBackend` exposes three methods and the engine registers object stores in one plain function, because the dependency ban rules out a fourth method.
+- The catalog crate declares no Arrow, Parquet, DataFusion, object-store, or roaring dependency, checked by a boundary test.
+- The scan-spec wire format and Arrow type mapping stay in one crate.
+- The storage backend exposes three methods, because the dependency ban rules out a fourth.

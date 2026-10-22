@@ -1,24 +1,12 @@
-# Feature: DataFusion Scan Execution — Positional-Delete File I/O Fan-Out and Pruning
+# Feature: DataFusion Scan Execution, Positional-Delete File I/O Fan-Out and Pruning
 
-Governs the object-store I/O shape of reading Iceberg Parquet positional-delete files: the
-read-once-per-shard guarantee for a delete file that several data files reference, the
-connection-budget bound on concurrent delete-file reads, and the row-group pruning that skips the
-irrelevant row groups of a partition-granularity delete file. Which rows a delete file removes is
-specified in `scan-read-path/scan-execution-positional-deletes`.
+Governs the object-store I/O shape of reading Iceberg Parquet positional-delete files: one read per delete file per shard, the connection-budget bound on concurrent delete-file reads, and row-group pruning of partition-granularity delete files. `scan-read-path/scan-execution-positional-deletes` governs which rows a delete file removes.
 
 ## Background
 
-* These reads are Phase A of the pipeline that every row-position delete mechanism shares
-  (`scan-read-path/scan-execution-row-position-deletes`). That feature owns Phase B, including the
-  concurrent data-file footer fetches, and the size-N limiter that Phase A and Phase B share.
-* Both deletion-vector mechanisms read under the same limiter with their own read-once discipline:
-  the Delta mechanism for its sidecar fetches, and the Iceberg mechanism for its Puffin blob reads.
-  Each decodes its own container format, so their fan-out scenarios live in
-  `scan-read-path/scan-execution-delta-deletion-vectors` and
-  `scan-read-path/scan-execution-iceberg-deletion-vectors` rather than here.
-* See `scan-runtime/scan-execution-connection-concurrency` for the operator-facing budget knob
-  itself (`s3_max_connections`); this feature governs how positional-delete file reads spend that
-  budget, not how the budget is derived or configured.
+* These reads are Phase A of the pipeline every row-position delete mechanism shares. `scan-read-path/scan-execution-row-position-deletes` owns Phase B, including the concurrent data-file footer fetches, and the size-N limiter that both phases share.
+* Both deletion-vector mechanisms read under the same limiter with their own read-once discipline: see `scan-read-path/scan-execution-delta-deletion-vectors` and `scan-read-path/scan-execution-iceberg-deletion-vectors`.
+* `scan-runtime/scan-execution-connection-concurrency` owns the budget knob `s3_max_connections`. This feature governs how positional-delete file reads spend the budget.
 
 ## Scenarios
 
@@ -35,7 +23,7 @@ specified in `scan-read-path/scan-execution-positional-deletes`.
 
 * *GIVEN* a shard whose assigned data files reference more unique positional-delete files than the resolved `s3_max_connections` budget N
 * *WHEN* the scan UDF reads those delete files to build its per-data-file delete sets
-* *THEN* the number of concurrently in-flight delete-file object-store reads MUST NOT exceed N at any instant, counted across every delete-read fan-out active in the scan invocation — a single table, or both sides of a broadcast join sharing one size-N limiter
+* *THEN* the number of concurrently in-flight delete-file object-store reads MUST NOT exceed N at any instant, counted across every delete-read fan-out active in the scan invocation, a single table, or both sides of a broadcast join sharing one size-N limiter
 * *AND* the UDF SHALL read delete files concurrently up to N in flight rather than strictly one at a time
 * *AND* the resulting per-data-file delete sets SHALL be identical to a strictly serial read, because unioning delete positions is order-independent
 
@@ -64,4 +52,4 @@ specified in `scan-read-path/scan-execution-positional-deletes`.
 >
 > Parquet statistics truncation keeps this skip safe only when it is range-based. A truncated min is rounded DOWN and a truncated max is rounded UP, so `[min, max]` stays a loose superset of the row group's true `file_path` values, and `target < min OR target > max` never wrongly skips a row group that could hold the target. An equality shortcut (`min == max == target`) is NOT safe: truncation can collapse two distinct long paths to an equal truncated min/max pair, so a match there does not prove the row group holds the target. A row group with ABSENT `file_path` statistics carries no bound and MUST be decoded.
 >
-> Page-level (page-index) pruning is a deliberate NON-goal of this plan: row-group-level pruning already exploits the spec-guaranteed sort, and positional-delete files are small. This is an optimization scope trim, not an Iceberg-spec deviation — the spec permits but does not require reader-side pruning at any granularity.
+> Page-level (page-index) pruning is a deliberate non-goal: row-group-level pruning already exploits the spec-guaranteed sort, and positional-delete files are small. This is an optimization scope trim, not an Iceberg-spec deviation: the spec permits but does not require reader-side pruning at any granularity.

@@ -502,7 +502,7 @@ fn vended_storage_adopts_endpoint_from_storage_credentials() {
     assert!(merged.path_style);
 }
 
-/// Scenario: Vended S3 credentials are the sole storage source regardless of catalog auth mode.
+/// Scenario: Vended S3 credentials are the sole storage source regardless of catalog auth mode
 #[test]
 fn vended_creds_are_the_sole_storage_source_across_all_auth_modes() {
     let result = vended_result_flat_config();
@@ -531,7 +531,7 @@ fn vended_creds_are_the_sole_storage_source_across_all_auth_modes() {
     }
 }
 
-/// Scenario: Vended credentials are extracted on the static bearer-token catalog path.
+/// Scenario: Vended credentials are extracted on the static bearer-token catalog path
 #[test]
 fn bearer_token_path_extracts_vended_from_config() {
     let result = vended_result_flat_config();
@@ -555,7 +555,7 @@ fn bearer_token_path_extracts_vended_from_config() {
     assert_ne!(merged.access_key, STATIC_AK);
 }
 
-/// Scenario: Vended credentials are extracted on the OAuth2 client-credentials catalog path.
+/// Scenario: Vended credentials are extracted on the OAuth2 client-credentials catalog path
 #[test]
 fn oauth2_path_extracts_vended_credentials() {
     let result = vended_result_flat_config();

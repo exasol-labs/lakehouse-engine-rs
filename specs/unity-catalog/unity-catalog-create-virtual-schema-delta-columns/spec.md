@@ -2,8 +2,6 @@
 
 Extends `unity-catalog/unity-catalog-create-virtual-schema` with the declaration of a Delta table's columns from `type_json` and the column-mapping mode, including the refusal of an unusable column-mapping annotation.
 
-This is a sibling of `unity-catalog/unity-catalog-create-virtual-schema`, split out once that feature's scenario count crossed this library's per-spec organization threshold. The parent feature keeps its original scope.
-
 ## Background
 
 * The scenarios here share the parent feature's Background.

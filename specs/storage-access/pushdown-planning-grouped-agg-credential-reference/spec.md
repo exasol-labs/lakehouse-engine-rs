@@ -1,4 +1,4 @@
-# Feature: Pushdown Planning — Grouped Aggregate Credential Reference
+# Feature: Pushdown Planning, Grouped Aggregate Credential Reference
 
 Extends `pushdown-grouped-agg/pushdown-planning-grouped-agg`: the credential-reference guarantee of `storage-access/scan-spec-credential-reference` applies to this feature's generated SQL.
 

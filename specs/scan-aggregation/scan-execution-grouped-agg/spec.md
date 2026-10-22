@@ -1,31 +1,15 @@
-# Feature: DataFusion Scan Execution — Grouped Aggregates and Memory Safety
+# Feature: DataFusion Scan Execution, Grouped Aggregates and Memory Safety
 
-Extends `datafusion-scan/scan-execution` with the bounded `RuntimeEnv` memory pool
-(sized from the per-instance UDF memory limit with a spill backstop) and grouped
-partial aggregate execution (one partial row per distinct user group per shard).
+The scan UDF sizes a bounded DataFusion memory pool from the per-instance memory limit, with a spill backstop, and computes grouped partial aggregates, one partial row per distinct group per shard.
 
 ## Background
 
-* The per-instance memory limit is read from `ctx.memory_limit()` (bytes; `0` =
-  unbounded/unknown sentinel). Exasol enforces the same per-process heap limit via
-  `setrlimit(RLIMIT_RSS)` and stalls additional concurrent VMs once usage reaches 80%
-  of it, so a pool sized under the limit lets the engine self-manage concurrency.
-* The spill backstop directory is `/tmp`; the UDF probes at runtime whether `/tmp` is
-  real disk with free space (tmpfs detection via `/proc/mounts` plus `statvfs`
-  free-space check). Any `/tmp` spill is transient per-invocation scratch — NOT
-  persistent state.
-* A grouped scan spec carries `group_keys` (rendered DataFusion SQL fragments) and
-  partial-aggregate instructions. The scan emits one partial row per distinct user
-  group per shard; the adapter's outer wrapper SQL re-groups and merges the partials.
-* The grouped partial-aggregate path registers the full logical table schema and builds
-  its DataFusion query from the `group_keys` and `aggregates` fields. It does not consult
-  the scan spec's `projection` field; DataFusion's own projection pushdown derives the
-  physical column set from the grouped partial-aggregate query text.
-* The `group_keys` list MAY contain two or more rendered fragments; the DataFusion
-  GROUP BY is built over all of them, so the per-shard partial key space is the
-  product of the distinct values of every group key.
-* The bounded memory pool and `/tmp` spill backstop apply uniformly regardless of the
-  number of group keys.
+* `ctx.memory_limit()` returns the per-instance limit in bytes, and `0` means unknown. Exasol stalls additional concurrent VMs once usage reaches 80% of the limit, so a smaller pool lets the engine self-manage concurrency.
+* The UDF probes at runtime whether `/tmp` is real disk with free space, using `/proc/mounts` for tmpfs detection and a `statvfs` free-space check. A `/tmp` spill is transient per-invocation scratch, not persistent state.
+* A grouped scan spec carries `group_keys` (rendered DataFusion SQL fragments) and partial-aggregate instructions. The adapter's outer wrapper SQL re-groups and merges the partials.
+* The grouped path builds its DataFusion query from `group_keys` and `aggregates` and does not consult `projection`. DataFusion's projection pushdown derives the physical column set from the query text.
+* `group_keys` may hold two or more fragments, so the per-shard partial key space is the product of the distinct values of every key.
+* The memory pool and spill backstop apply regardless of the number of group keys.
 * LIMIT is never applied inside a grouped partial scan.
 
 ## Scenarios

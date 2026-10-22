@@ -1,22 +1,13 @@
 # Feature: Single Shared Object, Three Entry Points
 
-Packages the VS adapter, the DataFusion scan UDF, and the version query UDF as named
-entry points in one Rust crate that builds to a single `.so`, exploiting
-language-container-rs's multiple-entry-points-per-`.so` capability. The scan entry point
-is a SCALAR EMIT script. The version entry point is a SCALAR RETURNS script. The cluster
-fan-out distributor (`LAKEHOUSE_DISTRIBUTE_FILES`) is a separate LUA SET script created
-by its own DDL — NOT a Rust entry point in the `.so`. One artifact is uploaded to
-BucketFS and each Exasol script references it.
+One Rust crate builds a single `.so` that exports the VS adapter, the DataFusion scan UDF, and the version query UDF as named entry points. One artifact is uploaded to BucketFS and each Exasol script references it.
 
 ## Background
 
-* All three Rust entry points (adapter, scan, version) are exported from the single uploaded `.so`; the `LAKEHOUSE_DISTRIBUTE_FILES` fan-out distributor is a separate LUA SET script created by its own DDL and is not part of the `.so`.
-* The crate is a `cdylib` depending on `exasol-udf-sdk` (`emit-arrow` feature) and
-  `exasol-udf-macros`, both pinned in the workspace manifest.
-* The `.so` is built only inside the `UDF_BUILDER_IMAGE` Rust builder image the Makefile names; it is never
-  built with host `cargo build --release`.
-* Each entry point is declared with the `exasol_udf` macro; Exasol's `CREATE SCRIPT`
-  statements reference each by its registered name against the same `%udf_object`.
+* The scan entry point is a SCALAR EMIT script. The version entry point is a SCALAR RETURNS script.
+* The `LAKEHOUSE_DISTRIBUTE_FILES` fan-out distributor is a separate LUA SET script created by its own DDL. It is not a Rust entry point and is not part of the `.so`.
+* Each `CREATE SCRIPT` statement references its entry point by registered name against the same `%udf_object`.
+* The `.so` is built only inside the `UDF_BUILDER_IMAGE` Rust builder image the Makefile names, never with host `cargo build --release`.
 
 ## Scenarios
 
@@ -43,7 +34,7 @@ BucketFS and each Exasol script references it.
 * *GIVEN* the deployment DDL that creates the scan scripts
 * *WHEN* the fan-out distributor is provisioned
 * *THEN* the deployment SHALL create `LAKEHOUSE_DISTRIBUTE_FILES` as a standalone LUA SET SCRIPT (a pure passthrough re-emitting its `files` input, one row per group), independent of the uploaded `.so`
-* *AND* the pushdown wrapper SQL SHALL reference `LAKEHOUSE_DISTRIBUTE_FILES` schema-qualified so it resolves outside the adapter script's schema context, using the same schema resolution the scan script uses — the schema of the running adapter script, read from the UDF handshake via `ctx.script_schema()`, NOT a VS property
+* *AND* the pushdown wrapper SQL SHALL reference `LAKEHOUSE_DISTRIBUTE_FILES` schema-qualified so it resolves outside the adapter script's schema context, using the same schema resolution the scan script uses: the schema of the running adapter script, read from the UDF handshake via `ctx.script_schema()`, NOT a VS property
 * *AND* the distributor DDL MUST NOT reference the uploaded scan `.so` and MUST NOT declare a Rust `%udf_object` entry point
 
 ### Scenario: Host release build of the .so is rejected by convention

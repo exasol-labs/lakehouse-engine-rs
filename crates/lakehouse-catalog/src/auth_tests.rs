@@ -9,7 +9,7 @@ const AUTH_PROP_KEYS: [&str; 4] = [
     REST_CATALOG_PROP_SCOPE,
 ];
 
-/// Scenario: Static bearer token is attached to unsigned catalog requests.
+/// Scenario: Static bearer token is attached to unsigned catalog requests
 #[test]
 fn build_rest_catalog_sets_token_prop() {
     let mut creds = base_creds();
@@ -55,7 +55,7 @@ fn build_rest_catalog_empty_token_injects_nothing() {
     }
 }
 
-/// Scenario: OAuth2 client credentials drive the catalog client-credentials grant.
+/// Scenario: OAuth2 client credentials drive the catalog client-credentials grant
 #[test]
 fn build_rest_catalog_sets_credential_and_oauth_props() {
     let mut creds = base_creds();
@@ -129,7 +129,7 @@ fn build_rest_catalog_sets_credential_and_oauth_props() {
     }
 }
 
-/// Scenario: No catalog auth props are set when neither token nor OAuth credentials are supplied.
+/// Scenario: No catalog auth props are set when neither token nor OAuth credentials are supplied
 #[test]
 fn build_rest_catalog_no_auth_props_when_no_auth() {
     let creds = base_creds();

@@ -172,12 +172,12 @@ async fn emits_batch_by_batch_without_materializing() {
     assert_eq!(
         ctx.batches.len(),
         3,
-        "exactly 3 IPC payloads must be captured (one per input batch)"
+        "exactly 3 batches must be captured (one per input batch)"
     );
 
     assert!(
         ctx.rows.is_empty(),
-        "emit() must not be called on the raw IPC path; got {} row-by-row calls",
+        "emit() must not be called on the raw batch path; got {} row-by-row calls",
         ctx.rows.len()
     );
 
@@ -201,7 +201,7 @@ async fn emits_batch_by_batch_without_materializing() {
             assert_eq!(
                 col.value(row_idx),
                 expected_val,
-                "IPC-decoded value must match original"
+                "decoded value must match original"
             );
         }
     }
@@ -673,7 +673,7 @@ async fn emit_stream_coerces_columns_to_declared_exatypes_before_emit_batch() {
     assert_eq!(str_col.value(2), "event-03");
 }
 
-/// Scenario: a relaxed column crosses the emit boundary at its declared Exasol type.
+/// Scenario: A relaxed column crosses the emit boundary at its declared Exasol type
 #[test]
 fn a_relaxed_column_coerces_to_its_declared_exatype_without_a_relaxation_branch() {
     use arrow::array::{

@@ -1,12 +1,11 @@
 # Feature: aarch64 CI Build and Release
 
-CI builds the UDF `.so` for both x86_64 and aarch64 on native runners and publishes architecture-distinguished release assets. x86_64 keeps the historical unsuffixed tarball name for backward compatibility; aarch64 gets a `-aarch64` suffix.
+CI builds the UDF `.so` for both x86_64 and aarch64 on native runners and publishes architecture-distinguished release assets. x86_64 keeps the unsuffixed tarball name; aarch64 gets a `-aarch64` suffix.
 
 ## Background
 
 - The UDF `.so` is built inside the `UDF_BUILDER_IMAGE` Rust builder image the Makefile names via `make cross-udf-build`, never on the host directly
 - `about.toml` controls which targets `cargo-about` checks for license compliance
-- The lc-rs project already ships the same dual-architecture pattern: `lc-rust-<ver>.tar.gz` (x86_64) and `lc-rust-<ver>-aarch64.tar.gz` (aarch64)
 
 ## Scenarios
 
@@ -14,7 +13,7 @@ CI builds the UDF `.so` for both x86_64 and aarch64 on native runners and publis
 
 * *GIVEN* the CI workflow is triggered on a non-draft PR, push to main, or merge_group event
 * *WHEN* the `build-so` job runs
-* *THEN* it MUST execute two matrix legs: `{runner: ubuntu-latest, arch: x86_64}` and `{runner: ubuntu-24.04-arm, arch: aarch64}`
+* *THEN* it MUST execute two matrix legs: an x86_64 leg on an x86_64 runner and an aarch64 leg on a native aarch64 runner
 * *AND* each leg MUST build the `.so` inside the `UDF_BUILDER_IMAGE` Rust builder image the Makefile names on its native runner architecture
 * *AND* each leg MUST upload the build artifact with a distinct name including the architecture (`lakehouse-engine-so-x86_64`, `lakehouse-engine-so-aarch64`)
 

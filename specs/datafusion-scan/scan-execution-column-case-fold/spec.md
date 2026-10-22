@@ -1,19 +1,10 @@
-# Feature: DataFusion Scan Execution — Identity-Bound Column Case Fold
+# Feature: DataFusion Scan Execution, Identity-Bound Column Case Fold
 
-Extends the identity binding strategy of `scan-read-path/scan-execution-field-id-projection`
-so a logical field carrying neither a field-id nor a declared physical name also binds a file
-column whose name differs only in letter case. Split out as its own feature so the case-fold
-rule is not buried inside the field-id-projection scenario list, for every table format whose
-scan installs the column-binding adapter.
+A logical field that has neither a field-id nor a declared physical name also binds a file column whose name differs only in letter case. This applies to every table format whose scan installs the column-binding adapter.
 
 ## Background
 
-* Split from `scan-read-path/scan-execution-field-id-projection` for scenario size. Amends no
-  clause recorded there: the field-id, declared-physical-name, and `schema.name-mapping.default`
-  binding steps stay exact-match only, unchanged.
-* Spark resolves Parquet columns case-insensitively by default (`spark.sql.caseSensitive=false`).
-  Neither the Delta protocol nor the Iceberg table spec states a column-name case rule, so the
-  fold applies only to the identity binding, which carries no metadata-recorded key to keep exact.
+* The field-id, declared-physical-name, and `schema.name-mapping.default` binding steps stay exact-match only.
 
 ## Scenarios
 

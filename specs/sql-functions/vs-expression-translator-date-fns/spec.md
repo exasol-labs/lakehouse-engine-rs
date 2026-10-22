@@ -1,75 +1,25 @@
-# Feature: VS Expression Translator — Date and Time Functions
+# Feature: VS Expression Translator, Date and Time Functions
 
-Extends the VS expression translator (`sql-comprehension/vs-expression-translator`) with the
-Exasol date/time scalar functions that DataFusion 54 can evaluate, so date-valued filters,
-select-list expressions, and group keys push down to the node-local DataFusion scan instead of
-being post-processed in Exasol. Kept as a separate feature so the scalar-ops spec stays focused on
-arithmetic, string, and conditional functions. The date-difference (`*_BETWEEN`) family and the
-divergent date-arithmetic functions issue #107 examined but declined to translate are covered by
-the sibling feature `sql-functions/vs-expression-translator-date-diff-fns`.
+Extends the VS expression translator (`sql-comprehension/vs-expression-translator`) with the Exasol date and time scalar functions that DataFusion can evaluate, so date-valued filters, select-list expressions and group keys run in the node-local scan. `sql-functions/vs-expression-translator-date-diff-fns` covers the `*_BETWEEN` family and the date-arithmetic functions that stay unsupported.
 
 ## Background
 
-* This feature shares the six public entry points of `crates/vs-expression` — the DataFusion trio
-  (`render_expression`, `render_expression_safe`, `render_df_filter_safe`) and the Exasol trio
-  (`render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe`);
-  the date functions are additional arms inside the same recursive walker.
-
-* **Exasol-dialect rendering is verbatim.** The Exasol dialect exists because the rendered fragment
-  becomes wrapper SQL text parsed and evaluated by Exasol's own core engine, not by DataFusion.
-  Every date/time function in this feature is an Exasol function that Exasol's compiler itself
-  emitted, so the Exasol dialect renders the original name, the original argument order, and the
-  original argument count — no name mapping, no re-shaping. Every date/time `function_scalar` name
-  this feature translates is declared `VerbatimCall` in the crate's one declaration of translated
-  names (see `sql-comprehension/vs-expression-translator`). A declared name's Exasol rendering is
-  produced by the declaration's own
-  branch, ahead of every per-name arm, so no per-name arm can reach it and it cannot diverge from the
-  name Exasol sent. `EXTRACT` is the one exception in this feature: it is the separate node type
-  `function_scalar_extract`, so it branches on dialect inside its own arm and is held in place by its
-  own sweep row instead. Only the DataFusion dialect needs the `date_part`/epoch-arithmetic
-  translations below (issue #209). Verified on live Exasol 2025.2.1 (the image pinned in
-  `docker-compose.yml`):
-  `DATE_PART` is not an Exasol function
-  (`function or script DATE_PART not found`, SQL code 42000), so every `date_part`-based rendering
-  is a hard compilation error in Exasol-dialect wrapper SQL.
-* The dialect split is a rendering-time concern for every function below except the now-family.
-  Every other function named below stays advertised, because the DataFusion dialect still governs
-  what the node-local scan can evaluate, and each takes its datetime from its own arguments.
-* **The now-family is withdrawn from pushdown instead of re-rendered.** `CURRENT_DATE`, `SYSDATE`,
-  `CURRENT_TIMESTAMP`, and `SYSTIMESTAMP` are no longer translated in either dialect, and
-  `FN_CURRENT_DATE`, `FN_CURRENT_TIMESTAMP`, `FN_SYSDATE`, and `FN_SYSTIMESTAMP` are no longer
-  advertised (see `pushdown-capabilities/pushdown-planning-capability-extensions`). Renaming them would not
-  have made them correct. Exasol's four names are three semantics over one instant:
-  `CURRENT_TIMESTAMP` reads it in the session time zone, `SYSTIMESTAMP` reads the same instant in the
-  database time zone, and `CURRENT_DATE`/`SYSDATE` are `TO_DATE` of each. The scan UDF receives
-  neither zone, opens no connect-back session, and gets no statement anchor, so it can only read its
-  own container clock in UTC — once per shard, G times per statement, while Exasol's now-family is
-  statement-constant. Exasol never delegates an unadvertised capability, so withdrawal makes all four
-  correct by handing them back to the engine that owns the clock.
-
-* Exasol sends EXTRACT as node type `function_scalar_extract` with the field in a `toExtract`
-  property (not as `function_scalar` + `dateTimeField`). DataFusion 54 renders EXTRACT via
-  `date_part('<FIELD>', expr)` — not `EXTRACT(<FIELD> FROM expr)` — because DataFusion 54's default
-  feature set does not include an EXTRACT ExprPlanner. Both forms are semantically equivalent;
-  the DataFusion dialect uses `date_part` to match DataFusion's execution path, while the Exasol
-  dialect renders Exasol's own `EXTRACT(<FIELD> FROM expr)` form.
-* This delta SUPERSEDES the preceding Background bullet "Only date/time functions whose DataFusion semantics match Exasol's are translated. Functions that depend on Exasol session state or whose DataFusion equivalent diverges in result are left unsupported (the node returns an error in raising mode, `None` in the safe variants), so the adapter omits them and Exasol post-processes them as a correctness backstop. This parity gate governs the DataFusion dialect, which decides what the node-local scan evaluates. It does not govern the Exasol dialect, which renders the name Exasol sent and so has nothing to reach parity with." The parity gate itself is unchanged and still correct. The claim that the adapter can omit an unsupported node and let Exasol post-process it holds ONLY while the corresponding capability is unadvertised. Once the capability IS advertised, the caller must apply the node itself — see ADR `specs/_decision/045` for why, `pushdown-capabilities/pushdown-planning-capability-extensions` for the safe direction of that trade, and `pushdown/pushdown-declined-filter-self-apply` for what a caller does with a delegated node it cannot render.
-* An ARITY the DataFusion dialect refuses is the same case as a name it refuses, and it is reachable under an advertised capability: the Exasol dialect renders a declared verbatim-call name at any arity, while the DataFusion dialect checks each name's arity in its own arm. A pushed call whose arity no DataFusion arm accepts therefore declines in the DataFusion dialect and renders in the Exasol dialect, which is exactly the shape the caller self-applies.
-* `WEEK` is translated because Exasol `WEEK` and DataFusion 54 `date_part('week', …)` are both
-  ISO-8601. The Exasol dialect renders `WEEK(…)` and inherits Exasol's own week numbering directly.
-* The date-difference (`*_BETWEEN`) family and the divergent date-arithmetic functions issue #107
-  examined but declined to translate are specified in the sibling feature
-  `sql-functions/vs-expression-translator-date-diff-fns`, split out to keep this feature's
-  scenario count within the domain's convention.
+* The date functions are arms of the same recursive walker behind the six public entry points of `crates/vs-expression`: `render_expression`, `render_expression_safe` and `render_df_filter_safe` for DataFusion, and `render_expression_exasol`, `render_expression_exasol_safe` and `render_df_filter_exasol_safe` for Exasol.
+* The Exasol dialect renders wrapper SQL text that Exasol's own engine parses. It renders the original name, argument order and argument count of every date or time function, because Exasol's compiler emitted them. Each such name is declared `VerbatimCall` in the crate's declaration of translated names (see `sql-comprehension/vs-expression-translator`), and the declaration's own branch renders it ahead of every per-name arm. `EXTRACT` is the exception: it is the node type `function_scalar_extract` and branches on dialect inside its own arm. Only the DataFusion dialect uses the `date_part` and epoch-arithmetic translations. `DATE_PART` is not an Exasol function (`function or script DATE_PART not found`, SQL code 42000), so a `date_part` rendering in Exasol-dialect wrapper SQL fails to compile.
+* The now-family `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP` and `SYSTIMESTAMP` is translated in neither dialect, and `FN_CURRENT_DATE`, `FN_CURRENT_TIMESTAMP`, `FN_SYSDATE` and `FN_SYSTIMESTAMP` are not advertised: see `pushdown-capabilities/pushdown-planning-capability-extensions`. Exasol reads the instant in the session time zone (`CURRENT_TIMESTAMP`) or the database time zone (`SYSTIMESTAMP`), and `CURRENT_DATE` and `SYSDATE` are `TO_DATE` of each. The scan UDF receives neither zone and has no statement anchor, so it can only read its container clock in UTC, once per shard. Exasol's now-family is statement-constant. Exasol never delegates an unadvertised capability, so withdrawal hands the four names back to the engine that owns the clock.
+* Exasol sends EXTRACT as node type `function_scalar_extract` with the field in a `toExtract` property. The DataFusion dialect renders `date_part('<FIELD>', expr)`, because the DataFusion dependency's default feature set has no EXTRACT planner. The Exasol dialect renders `EXTRACT(<FIELD> FROM expr)`.
+* The DataFusion dialect translates only functions whose DataFusion semantics match Exasol's. A node it refuses returns an error in raising mode and `None` in the safe variants. An omitted node is post-processed by Exasol only while its capability is unadvertised. For an advertised capability the caller applies the node itself: see `pushdown-capabilities/pushdown-planning-capability-extensions` and `pushdown/pushdown-declined-filter-self-apply`.
+* A refused arity is the same case as a refused name. The Exasol dialect renders a declared verbatim-call name at any arity, while the DataFusion dialect checks arity in each name's arm. A call with an arity no DataFusion arm accepts declines in the DataFusion dialect and renders in the Exasol dialect, and the caller self-applies it.
+* `WEEK` is translated because Exasol `WEEK` and DataFusion `date_part('week', …)` are both ISO-8601. The Exasol dialect renders `WEEK(…)` and inherits Exasol's week numbering.
 
 ## Scenarios
 
 ### Scenario: A refused argument count declines for DataFusion and renders for Exasol
 
-* *GIVEN* a `function_scalar` node whose name is a declared verbatim-call date/time function and whose argument count exceeds what the DataFusion dialect's per-name arm accepts — for example `SECOND(<datetime>, <precision>)`, whose Exasol signature takes an optional precision and whose DataFusion arm accepts exactly one argument
+* *GIVEN* a `function_scalar` node whose name is a declared verbatim-call date/time function and whose argument count exceeds what the DataFusion dialect's per-name arm accepts, for example `SECOND(<datetime>, <precision>)`, whose Exasol signature takes an optional precision and whose DataFusion arm accepts exactly one argument
 * *WHEN* the node is rendered in each dialect
 * *THEN* the DataFusion dialect SHALL return an error in raising mode and `None` in the safe variants, because no DataFusion arm expresses that call
-* *AND* the Exasol dialect SHALL render the call verbatim — the name, argument order, and argument count Exasol sent — because Exasol's own compiler emitted it
+* *AND* the Exasol dialect SHALL render the call verbatim, the name, argument order, and argument count Exasol sent, because Exasol's own compiler emitted it
 * *AND* the caller SHALL treat that asymmetry as a decline to self-apply, not as an omission, because the function's capability is advertised and Exasol therefore delegated the call
 
 ### Scenario: EXTRACT translates to the DataFusion date_part call
@@ -83,7 +33,7 @@ the sibling feature `sql-functions/vs-expression-translator-date-diff-fns`.
 
 * *GIVEN* the same `function_scalar_extract` node as the preceding scenario
 * *WHEN* `render_expression_exasol` processes the node
-* *THEN* the translator SHALL return `EXTRACT(<FIELD> FROM <source_sql>)` with the field name rendered as a bare keyword — NOT single-quoted — and the source rendered recursively in the Exasol dialect
+* *THEN* the translator SHALL return `EXTRACT(<FIELD> FROM <source_sql>)` with the field name rendered as a bare keyword, NOT single-quoted, and the source rendered recursively in the Exasol dialect
 * *AND* the rendered fragment MUST NOT contain `date_part`, because Exasol has no `DATE_PART` function and the fragment is parsed by Exasol's own core engine (`function or script DATE_PART not found`, SQL code 42000)
 * *AND* the DataFusion-dialect rendering of the same node MUST remain byte-identical to the preceding scenario
 
@@ -108,7 +58,7 @@ the sibling feature `sql-functions/vs-expression-translator-date-diff-fns`.
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return `date_trunc(<unit_sql>, <source_sql>)` with both arguments rendered recursively
 * *AND* the unit literal MUST be passed through as a string argument DataFusion's `date_trunc` accepts (e.g. `'year'`, `'month'`, `'day'`, `'hour'`)
-* *AND* `render_expression_exasol` SHALL return `DATE_TRUNC(<unit_sql>, <source_sql>)` — Exasol's own PostgreSQL-compatible `DATE_TRUNC` takes the same argument order, so the unit literal Exasol sent is forwarded unchanged and Exasol applies its own `NLS_FIRST_DAY_OF_WEEK` for the `'week'` unit
+* *AND* `render_expression_exasol` SHALL return `DATE_TRUNC(<unit_sql>, <source_sql>)`, Exasol's own PostgreSQL-compatible `DATE_TRUNC` takes the same argument order, so the unit literal Exasol sent is forwarded unchanged and Exasol applies its own `NLS_FIRST_DAY_OF_WEEK` for the `'week'` unit
 
 ### Scenario: The now-family is not translated in either dialect
 

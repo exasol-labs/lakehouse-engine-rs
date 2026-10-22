@@ -94,11 +94,11 @@ Architecture: see specs/architecture.md.
 
 | Layer | Technology | Purpose |
 |-------|------------|---------|
-| Language | Rust (edition 2024) | UDF + VS adapter implementation |
+| Language | Rust | UDF + VS adapter implementation |
 | Query engine | DataFusion + Arrow/Parquet | Node-local vectorized scan and pushdown execution |
 | Lakehouse | `iceberg-rust` (Iceberg REST catalog, incl. Databricks-managed Iceberg) + `delta-kernel-rs` (Delta tables via native Unity Catalog) + `aws-sdk-glue` (AWS Glue Data Catalog: Iceberg and Hive Parquet tables) | Snapshot discovery, file resolution, table registration |
 | UDF runtime | `exasol-udf-sdk`, `exasol-udf-macros`; language-container-rs Rust SLC | Rust UDF ABI, `ctx.emit` |
-| Build | Rust builder image (`UDF_BUILDER_IMAGE`) in Docker, x86 and aarch64 | Builds `.so` matching the SLC; never built on host |
+| Build | Rust builder image (`UDF_BUILDER_IMAGE`) in Docker, x86 and aarch64 | Builds a `.so` whose glibc matches the SLC; never built on host |
 | Testing | `cargo test`; E2E against a local Exasol Docker container | Unit and cluster behavior validation |
 
 > The Rust SLC and UDF runtime come from `language-container-rs`; this engine follows its UDF programming model and build/E2E workflow. `crates/vs-expression` (expression translation) and `crates/lakehouse-catalog` (Iceberg REST, Unity Catalog, and AWS Glue access) are workspace-internal splits from `crates/lakehouse-engine`; all three build into the one `.so` that carries all three UDF entry points.

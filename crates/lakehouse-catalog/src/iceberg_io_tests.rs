@@ -42,7 +42,7 @@ fn signed_request_does_not_leak_keys_in_headers() {
     }
 }
 
-/// Scenario: Static bearer token is attached to unsigned catalog requests.
+/// Scenario: Static bearer token is attached to unsigned catalog requests
 #[test]
 fn bearer_token_attached_to_load_table_request() {
     let client = reqwest::Client::new();

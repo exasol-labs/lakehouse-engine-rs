@@ -1,4 +1,4 @@
-//! Host micro-benchmarks isolating the pre-SDK emit cost (coerce + Arrow IPC, excluding the
+//! Host micro-benchmarks isolating the pre-SDK emit cost (coerce + Arrow C Data export, excluding the
 //! `MT_EMIT` round-trip, which only exists inside the UDF runtime) and local scan+decode.
 //! Full numbers: `cargo test -p lakehouse-engine --test micro_bench -- --ignored --nocapture`.
 
@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{
-    ArrayRef, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
+    Array, ArrayRef, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
     TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use exasol_udf_sdk::value::{ColumnInfo, ExaType};
@@ -55,14 +56,10 @@ fn rss_bytes() -> u64 {
         .unwrap_or(0)
 }
 
-/// Mirrors the SDK's `record_batch_to_ipc` inside `emit_batch`.
-fn record_batch_to_ipc(batch: &RecordBatch) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut w = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
-        .expect("ipc writer init");
-    w.write(batch).expect("ipc write");
-    w.finish().expect("ipc finish");
-    buf
+/// Mirrors the SDK's C Data Interface export inside `emit_batch`.
+fn export_batch_ffi(batch: &RecordBatch) -> (FFI_ArrowArray, FFI_ArrowSchema) {
+    let data = arrow::array::StructArray::from(batch.clone()).into_data();
+    arrow::ffi::to_ffi(&data).expect("ffi export")
 }
 
 fn bench_emit_path(name: &str, batch: &RecordBatch, declared: &[ColumnInfo], iters: usize) {
@@ -70,17 +67,17 @@ fn bench_emit_path(name: &str, batch: &RecordBatch, declared: &[ColumnInfo], ite
     let in_mem_bytes = batch.get_array_memory_size();
 
     let warm = coerce_batch_to_exa_types(batch.clone(), declared).expect("coerce");
-    let ipc_bytes = record_batch_to_ipc(&warm).len();
+    drop(export_batch_ffi(&warm));
 
     let rss_before = rss_bytes();
     let start = Instant::now();
     let mut sink: u64 = 0;
     for _ in 0..iters {
         let coerced = coerce_batch_to_exa_types(batch.clone(), declared).expect("coerce");
-        let ipc = record_batch_to_ipc(&coerced);
-        sink = sink.wrapping_add(ipc.len() as u64);
-        std::hint::black_box(&ipc);
-        drop(ipc);
+        let exported = export_batch_ffi(&coerced);
+        sink = sink.wrapping_add(exported.0.len() as u64);
+        std::hint::black_box(&exported);
+        drop(exported);
         drop(coerced);
     }
     let elapsed = start.elapsed().as_secs_f64();
@@ -89,14 +86,12 @@ fn bench_emit_path(name: &str, batch: &RecordBatch, declared: &[ColumnInfo], ite
 
     let total_rows = (rows * iters) as f64;
     let total_in_mem = (in_mem_bytes * iters) as f64;
-    let total_ipc = (ipc_bytes * iters) as f64;
     println!(
-        "5.1 emit   {name:<12} rows/s={:>14.0}  in-mem GB/s={:>7.3}  ipc-out GB/s={:>7.3}  \
-         (rows={rows} in-mem={in_mem_bytes}B ipc={ipc_bytes}B iters={iters} t={elapsed:.3}s \
+        "5.1 emit   {name:<12} rows/s={:>14.0}  in-mem GB/s={:>7.3}  \
+         (rows={rows} in-mem={in_mem_bytes}B iters={iters} t={elapsed:.3}s \
          rss_delta={}MB)",
         total_rows / elapsed,
         total_in_mem / GB / elapsed,
-        total_ipc / GB / elapsed,
         (rss_after.saturating_sub(rss_before)) / (1024 * 1024),
     );
 }
@@ -221,9 +216,7 @@ fn lineitem_batch(n: usize) -> (RecordBatch, Vec<ColumnInfo>) {
 fn bench_emit_only() {
     let rows = 200_000usize;
     let iters = 50usize;
-    println!(
-        "\n=== 5.1 emit-only (coerce + Arrow IPC StreamWriter; pre-SDK, no ZMQ round-trip) ==="
-    );
+    println!("\n=== 5.1 emit-only (coerce + Arrow C Data export; pre-SDK, no ZMQ round-trip) ===");
     for kind in ["BIGINT", "DOUBLE", "TIMESTAMP", "DECIMAL", "VARCHAR"] {
         let (batch, exa) = primitive_batch(kind, rows);
         bench_emit_path(kind, &batch, &exa, iters);
@@ -238,9 +231,9 @@ fn emit_path_smoke_positive_throughput() {
     let in_mem = batch.get_array_memory_size();
     let start = Instant::now();
     let coerced = coerce_batch_to_exa_types(batch, &exa).expect("coerce");
-    let ipc = record_batch_to_ipc(&coerced);
+    let (array, _schema) = export_batch_ffi(&coerced);
     let secs = start.elapsed().as_secs_f64();
-    assert!(!ipc.is_empty(), "IPC serialization produced bytes");
+    assert_eq!(array.len(), 1000, "C Data export carries every row");
     let gb_per_s = (in_mem as f64 / GB) / secs.max(1e-9);
     assert!(gb_per_s > 0.0, "emit path GB/sec must be positive");
 }

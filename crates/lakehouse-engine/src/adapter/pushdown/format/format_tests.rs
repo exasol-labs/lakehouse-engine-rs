@@ -108,7 +108,7 @@ async fn format_reader_selects_an_iceberg_source_without_contacting_the_catalog(
     );
 }
 
-/// Scenario: The format reader is selected at the same one site for a third source
+/// Scenario: The format reader is selected at one exhaustive site for a direct-storage source
 #[test]
 fn third_scan_source_selects_the_parquet_reader() {
     let creds = sigv4_creds();

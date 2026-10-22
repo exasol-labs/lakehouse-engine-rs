@@ -69,7 +69,7 @@ fn utf8(values: &[&str]) -> ArrayRef {
     Arc::new(StringArray::from(values.to_vec()))
 }
 
-/// Scenario: a list, struct, or map value renders as one valid JSON document.
+/// Scenario: A list, struct, or map value renders as one valid JSON document
 #[test]
 
 fn populated_nested_values_render_as_valid_json_documents() {
@@ -201,7 +201,7 @@ fn populated_nested_values_render_as_valid_json_documents() {
     );
 }
 
-/// Scenario: a null nested value emits SQL NULL, not the text "null".
+/// Scenario: A null nested value emits SQL NULL, not the text "null"
 #[test]
 fn null_cells_emit_sql_null_and_null_members_render_explicitly() {
     let lists = rendered(list_of_strings(vec![
@@ -260,7 +260,7 @@ fn null_cells_emit_sql_null_and_null_members_render_explicitly() {
     );
 }
 
-/// Scenario: a non-string map key is stringified into the JSON object name.
+/// Scenario: A non-string map key is stringified into the JSON object name
 #[test]
 
 fn non_utf8_map_keys_stringify_into_object_names() {

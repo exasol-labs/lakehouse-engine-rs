@@ -7,7 +7,7 @@ use super::*;
 use crate::adapter::permission::PermissionCheck;
 use crate::scan::spec::{StorageBackend, StorageProps};
 
-/// Scenario: a Unity Catalog table's identity survives the round trip from the involved table
+/// Scenario: A Unity Catalog table's identity survives the round trip from the involved table
 #[tokio::test]
 async fn unity_table_identity_round_trips_through_the_recorded_identifier() {
     let catalog = RecordingCatalog::spawn(|target| {
@@ -222,7 +222,7 @@ async fn an_iceberg_identifier_resolves_through_the_iceberg_reader_with_no_parti
     );
 }
 
-/// Scenario: one catalog session per request serves every table the request resolves
+/// Scenario: One catalog session per request serves every table the request resolves
 #[tokio::test]
 async fn one_catalog_session_serves_every_table_the_resolver_resolves() {
     let catalog = iceberg_catalog().await;

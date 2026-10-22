@@ -1,43 +1,16 @@
 # Feature: Parquet Directory Seam
 
-The Parquet directory seam answers three questions about a storage prefix in one place: which data files it holds, what their partition values are, and what their combined schema is. It takes an object store, a prefix, a file pattern, and two layout switches. Table enumeration calls its schema-resolving answer, and query planning calls only its listing answer and takes the schema from the column notes enumeration recorded, so the two callers cannot disagree about a table's columns.
-
-This feature covers the seam's single-function contract, the merge mode that decides which footers are read, and how those footers fold into one schema: the column union, type widening across proven-castable pairs, and the JSON string declaration for nested and unrepresentable types.
+The Parquet directory seam answers three questions about a storage prefix: which data files it holds, what their partition values are, and what their combined schema is. It takes an object store, a prefix, a file pattern, and two layout switches. Table enumeration calls its schema-resolving answer, and query planning calls its listing answer and takes the schema from the recorded column notes, so the two callers cannot disagree about a table's columns.
 
 ## Background
 
-* The seam names NO catalog kind, NO table format, and NO Exasol virtual-schema property. Its
-  schema-resolving answer takes an object store, a prefix, a merge mode, and a partitioning switch.
-  Any later consumer that needs "the Parquet files under this prefix and their schema" calls it
-  directly.
-* It answers TWO questions. The schema-resolving answer serves direct-storage table enumeration,
-  which maps the folded schema to the neutral catalog columns and to each column's declaration that
-  the listing pipeline records as the column's note (`vs-adapter/column-source-notes`). One
-  implementation is what keeps `MERGE_SCHEMA` and `HIVE_PARTITIONING` from needing a second policy.
-  The listing answer serves every pushdown over Parquet files: direct-storage query planning and
-  the catalog-declared Parquet reader (`unity-catalog/unity-parquet-table-planning`,
-  `glue/glue-table-planning`), each of which takes its schema from the column notes.
-* The widening rules the fold applies are NOT new. `scan-types/type-relaxation` already owns
-  the set of physical-to-logical pairs this engine casts at scan time. That set is proven castable
-  pair by pair and grounded in the Apache Iceberg and Delta promotion tables. The fold picks the
-  wider member of a pair from that set and nothing else. Every column the fold widens is therefore
-  a column the scan can already read.
-* The scan side needs no new mechanism. A logical field carrying neither a field-id nor a declared
-  physical name binds by its own name. That is the identity binding
-  `scan-read-path/scan-execution-field-id-projection` already specifies. The same column-binding
-  adapter that serves Iceberg and Delta inserts the per-file cast the widened declaration implies.
-* The schema-resolving answer returns no per-file Parquet metadata. No pushdown reads a footer, so
-  footer-statistics pruning (#412) is closed as superseded, per
-  `direct-storage/direct-storage-table-planning`.
-* Hive-style partition discovery belongs to this seam. `direct-storage/direct-storage-hive-partitioning`
-  specifies its rules.
-* Apache Iceberg and Delta specification check: NOT implicated. This seam reads raw Parquet
-  footers and implements neither table format. Its ONE point of contact with either specification
-  is the widening pair set. The seam reads that set from `scan-types/type-relaxation` rather
-  than re-deriving it. That feature grounds the set in the Iceberg specification's § Schema
-  Evolution promotion table (rows 1 to 3) and in the Delta protocol's § Reader Requirements for
-  Type Widening.
-* See `direct-storage/parquet-directory-seam-file-listing` for the recursive file listing, the file patterns, the file-keep predicate, and the listing answer for a caller that declares its own schema.
+* The seam names no catalog kind, no table format, and no Exasol virtual-schema property. Its schema-resolving answer takes an object store, a prefix, a merge mode, and a partitioning switch. It maps the folded schema to the neutral catalog columns and to each column's declaration, which the listing pipeline records as the column's note (`vs-adapter/column-source-notes`). One implementation keeps `MERGE_SCHEMA` and `HIVE_PARTITIONING` from needing a second policy.
+* The listing answer serves every pushdown over Parquet files (`direct-storage/direct-storage-table-planning`, `unity-catalog/unity-parquet-table-planning`, `glue/glue-table-planning`), each of which takes its schema from the column notes.
+* The fold widens only along the pairs `scan-types/type-relaxation` already casts at scan time. Every widened column is therefore one the scan can read.
+* A logical field with neither a field-id nor a declared physical name binds by its own name (`scan-read-path/scan-execution-field-id-projection`). The column-binding adapter that serves Iceberg and Delta inserts the per-file cast the widened declaration implies.
+* The schema-resolving answer returns no per-file Parquet metadata, because no pushdown reads a footer.
+* `direct-storage/direct-storage-hive-partitioning` specifies Hive-style partition discovery. `direct-storage/parquet-directory-seam-file-listing` specifies the file listing.
+
 
 ## Scenarios
 
@@ -67,7 +40,7 @@ This feature covers the seam's single-function contract, the merge mode that dec
 * *AND* the merge mode that folds every file
 * *WHEN* the seam folds those footers
 * *THEN* it SHALL read every file's footer and SHALL resolve each column to the WIDER member of the pair, so the folded schema carries a 64-bit integer, a 64-bit float, and `decimal(12,2)`
-* *AND* it SHALL widen ONLY across pairs the recorded relaxation set already proves castable, reading that set from its ONE owner and MUST NOT carry its own pair table, because a pair the fold invented would declare a type the scan cannot cast a file up to
+* *AND* it SHALL widen ONLY across pairs the relaxation set of `scan-types/type-relaxation` proves castable, reading that set from its ONE owner and MUST NOT carry its own pair table, because a pair the fold invented would declare a type the scan cannot cast a file up to
 * *AND* it SHALL fold a column PAIRWISE across files in the deterministic listing order, so a column appearing at three types resolves to the widest one reachable by successive supported widenings
 * *AND* it SHALL read the footers CONCURRENTLY through the caller's store, bounded by the admission limiter that store carries, so a prefix holding many files costs one bounded fan-out rather than one serialized round-trip per file
 * *AND* a column whose two declared types are covered by NO supported pair SHALL fail the fold with an error naming the column, BOTH conflicting types, and BOTH file paths, so an operator can locate the offending files without listing the prefix

@@ -1,84 +1,20 @@
-# Feature: Pushdown Planning — Grouped Aggregate Queries
+# Feature: Pushdown Planning, Grouped Aggregate Queries
 
-Extends `pushdown/pushdown-planning` with the GROUP BY aggregate detection and
-scan-driving SQL generation scenarios. When Exasol delegates a `GROUP BY` aggregate
-query, the adapter detects the shape, renders group-key expressions via the VS
-expression translator, builds a grouped common scan spec spliced once as the scalar
-scan UDF's first argument, and generates fan-out SQL that runs DataFusion GROUP BY
-inside each scalar-scan invocation and merges the partials in an outer wrapper.
-Cluster fan-out (`GROUP BY shard_key`) lives inside the nested
-`LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery; the outer wrapper re-groups the
-scalar scan's emitted partial rows on the user group keys. See
-`pushdown-grouped-agg/pushdown-planning-grouped-agg-scalar-over-aggregate` for
-scalar-function-wrapping-aggregates select items on this same path,
-`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback` for what happens when a
-grouped request cannot be decomposed into this partial/merge shape at all, and
-`storage-access/pushdown-planning-grouped-agg-credential-reference` for the
-credential-exposure guarantee on this path's generated SQL.
+Extends `pushdown/pushdown-planning` with GROUP BY aggregate detection and scan-driving SQL generation. The adapter renders group-key expressions through the VS expression translator and builds a grouped common scan spec for the scalar scan UDF. DataFusion runs the GROUP BY inside each scalar-scan invocation, and an outer wrapper merges the partials.
 
 ## Background
 
-* A grouped aggregate pushdown arrives as `aggregationType: "group_by"` with a
-  non-empty `groupBy` array and a select list of supported aggregate functions.
-* The `groupBy` array MAY contain one, two, or more elements; the detection and
-  scan-driving SQL builder treat the group-key list as arbitrary-length (emitting
-  `GK_0..GK_{n-1}`) and impose no cap of one key.
-* Group-key expressions are rendered by `vs_expression::render_expression` (raising
-  mode); any failure on ANY element causes the adapter to fall back to row scanning.
-* Each group-key element is rendered independently, so a multi-key GROUP BY MAY mix
-  plain column references and scalar expressions in any combination.
-* The grouped common spec's `projection` field is consulted only on the row-scan
-  dispatch path. On the grouped aggregate dispatch path the scan UDF reads the
-  `group_keys` and `aggregates` fields and derives the DataFusion physical projection
-  from the grouped partial-aggregate query text, so `projection` is left empty.
-* DataFusion performs the user GROUP BY inside each scalar-scan invocation, emitting
-  one partial-aggregate row per distinct user group per shard; the outer wrapper
-  merges those partials on the user group keys with the same SUM/MIN/MAX/AVG-pair
-  decomposition as the single-group path.
-* LIMIT is never pushed into the per-shard grouped scan; the grouped common spec carries
-  no LIMIT, so no shard observes one — it appears only in the outer wrapper.
-* **The merge wrapper owns the request's full final window, offset included (issue #191).**
-  The grouped path already withholds the LIMIT from every per-shard scan (see "LIMIT is NOT
-  pushed into per-shard scan for a grouped query") and renders it on the outer merge SELECT
-  instead, because a per-shard bound would drop groups before the merge re-groups them. An
-  OFFSET obeys the same rule for a stronger reason — a per-shard OFFSET skips a different
-  group set on every shard — so the offset belongs on the same merge SELECT, rendered through
-  the one shared limit-and-offset seam.
-* **A grouped request carrying an offset always has a merge `ORDER BY` rendered beside it.**
-  Exasol's grammar admits an OFFSET only alongside an ORDER BY, and a grouped ORDER BY that
-  cannot resolve over the merge's `GK_*`/`PARTIAL_*` columns routes the whole request to the
-  qualified single-table wrapper instead (`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`).
-  So the merge SELECT can render an OFFSET without producing the `sqlCode 42000`
-  "OFFSET not allowed in LIMIT without ORDER BY" that a bare OFFSET would. Confirmed live on
-  three grouped shapes, each pushing a non-empty `orderBy` alongside the offset: an ordinal on
-  the group key, an ordinal on the aggregate, and a group key absent from the select list.
-* **A GROUP BY select is the ONLY aggregate shape that can carry an offset.** Exasol rejects an
-  `OFFSET` in an UNGROUPED aggregated select outright (`sqlCode 42000`, "OFFSET not allowed in
-  aggregated selects", verified live), so the grouped merge and the qualified wrapper are the
-  only aggregate-side sites the offset reaches — never the single-group aggregate merge or the
-  lone-`COUNT(DISTINCT)` wrapper.
-* Exasol validates the outer wrapper SELECT's column types positionally against
-  `selectListDataTypes`, so the wrapper SELECT must list its items in the user's
-  `selectList` order.
-* The outer merge wrapper's only columns are the stringified `GK_*` staging columns and the
-  `PARTIAL_*` partial-aggregate columns. A group-key sort key therefore renders as a
-  POSITIONAL output ordinal (pointing at the type-cast output expression, so it sorts on the
-  native value, not the lexicographic `GK_*` VARCHAR). An aggregate sort key renders as that
-  aggregate's MERGED expression over the `PARTIAL_*` columns — the same rewrite, by the same
-  `AggregatePlan`-equality match, that the merged HAVING uses (`render_having_over_merge`,
-  see `pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback` for when that rewrite
-  cannot match).
-* The merge wrapper is a GROUP BY query, so its `ORDER BY` MAY reference an aggregate
-  expression directly. No hidden output column is added, so Exasol's positional
-  `selectListDataTypes` validation of the wrapper's visible SELECT list is unaffected.
-* Iceberg spec compliance: checked, not engaged. Verified against the Apache Iceberg table
-  spec (https://iceberg.apache.org/spec/): the normative sections that could bear on a
-  pushdown change are those governing schema/field-id resolution ("Schemas and Data Types",
-  "Column Projection") and scan planning ("Scan Planning", manifest and partition filtering).
-  This feature alters only which Exasol-side SQL shape a grouped request routes to; it reads
-  no manifest, resolves no snapshot or field id, applies no delete, and maps no type. No
-  normative requirement applies, so there is no deviation to fix and none to track.
-* The credential-exposure guarantee for this path's generated SQL is specified by the sibling feature `storage-access/pushdown-planning-grouped-agg-credential-reference`.
+* A grouped aggregate pushdown arrives as `aggregationType: "group_by"` with a non-empty `groupBy` array and a select list of supported aggregate functions. The `groupBy` array can hold any number of elements, emitted as `GK_0..GK_{n-1}`.
+* `vs_expression::render_expression` (raising mode) renders each group-key element independently, so keys can mix column references and scalar expressions. If any element fails to render, the adapter falls back to row scanning.
+* Cluster fan-out (`GROUP BY shard_key`) lives in the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery. The outer wrapper re-groups the scan's partial rows on the user group keys.
+* DataFusion emits one partial-aggregate row per distinct user group per shard. The outer wrapper merges them with the same SUM/MIN/MAX/AVG-pair decomposition as the single-group path.
+* The grouped common spec's `projection` field is read only on the row-scan path. On the grouped path the scan UDF reads `group_keys` and `aggregates` and derives the DataFusion projection from the partial-aggregate query, so `projection` stays empty.
+* LIMIT and OFFSET are never pushed into a per-shard grouped scan, because a per-shard bound would drop groups before the merge re-groups them. The merge SELECT renders the request's full final window through the shared limit-and-offset seam.
+* Exasol accepts an OFFSET only alongside an ORDER BY. A grouped request with an offset always has a merge `ORDER BY` beside it, because an `ORDER BY` that cannot resolve over the merge routes the request to the qualified single-table wrapper (`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`). Exasol rejects an OFFSET in an ungrouped aggregated select (`sqlCode 42000`), so only the grouped merge and the wrapper carry one.
+* Exasol validates the outer wrapper SELECT's column types positionally against `selectListDataTypes`, so the wrapper lists its items in the user's `selectList` order.
+* The outer merge wrapper has only the stringified `GK_*` staging columns and the `PARTIAL_*` columns. A group-key sort key renders as a positional output ordinal that points at the type-cast expression, so it sorts on the native value and not on the `GK_*` VARCHAR. An aggregate sort key renders as that aggregate's merged expression over the `PARTIAL_*` columns, matched by `AggregatePlan` equality like the merged HAVING (`render_having_over_merge`). The merge wrapper is a GROUP BY query, so its `ORDER BY` can reference an aggregate expression directly without adding a hidden output column.
+* Related features: `pushdown-grouped-agg/pushdown-planning-grouped-agg-scalar-over-aggregate` (scalar functions wrapping aggregates), `pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback` (requests that cannot use the partial/merge shape), and `storage-access/pushdown-planning-grouped-agg-credential-reference` (credential exposure in the generated SQL).
+
 
 ## Scenarios
 
@@ -143,7 +79,7 @@ credential-exposure guarantee on this path's generated SQL.
 
 ### Scenario: Grouped aggregate scan spec leaves the projection field empty
 
-* *GIVEN* a grouped aggregate `pushdown` request (`aggregationType: "group_by"`) over a table with more than one column (e.g. `SELECT a, COUNT(*) FROM t GROUP BY a`) that is decomposed into a partial/merge grouped aggregate — NOT the undecomposable single-table fallback that dispatches as a raw scan and legitimately carries a non-empty `projection`
+* *GIVEN* a grouped aggregate `pushdown` request (`aggregationType: "group_by"`) over a table with more than one column (e.g. `SELECT a, COUNT(*) FROM t GROUP BY a`) that is decomposed into a partial/merge grouped aggregate, NOT the undecomposable single-table fallback that dispatches as a raw scan and legitimately carries a non-empty `projection`
 * *WHEN* the adapter builds the grouped partial-aggregate scan spec
 * *THEN* the shard-invariant grouped common spec's `projection` field SHALL be empty, NOT the full base-table column list
 * *AND* the referenced-column information SHALL be carried in the `group_keys` and `aggregates` fields, which are the fields the grouped scan-dispatch path consults; the `projection` field MUST NOT be read on that path
@@ -156,16 +92,16 @@ credential-exposure guarantee on this path's generated SQL.
 * *WHEN* the adapter builds the outer merge SQL
 * *THEN* the merge `ORDER BY` element SHALL be that aggregate's merged expression over the `PARTIAL_*` columns (for example `SUM("PARTIAL_sum_1")`), produced by the SAME merge rewriter and the SAME `AggregatePlan` equality match (kind plus source column) the merged HAVING uses
 * *AND* the element SHALL render its direction and NULL placement through the one shared direction/NULL seam every `ORDER BY` the adapter emits routes through, so the grouped merge cannot drift from the other ordered paths
-* *AND* the outer wrapper's visible SELECT list, its cast list, and its GROUP BY list SHALL be UNCHANGED — the merge `ORDER BY` references an aggregate expression, not an output column, so no hidden output column is added and Exasol's positional `selectListDataTypes` validation is unaffected
+* *AND* the outer wrapper's visible SELECT list, its cast list, and its GROUP BY list SHALL be UNCHANGED, the merge `ORDER BY` references an aggregate expression, not an output column, so no hidden output column is added and Exasol's positional `selectListDataTypes` validation is unaffected
 * *AND* a group-key sort key SHALL still render as its positional output ordinal, unchanged by this delta, including in an `orderBy` that mixes a group-key key with an aggregate key
 * *AND* the per-shard partial scan SHALL still carry no `LIMIT` and no sort keys, so the anti-wrong-truncation invariant holds unchanged
 * *AND* the merged result SHALL equal the same grouped query with the same `ORDER BY` evaluated over all rows on a single node
 
 ### Scenario: The grouped merge wrapper renders the request's OFFSET alongside its LIMIT
 
-* *GIVEN* a `GROUP BY` aggregate `pushdown` request that decomposes into the partial/merge shape, carrying a merge-resolvable `orderBy`, a `limit` with `numElements` = `n`, and a non-zero `limit.offset` = `m` — for example `SELECT MOD(id,4) AS k, COUNT(*) FROM t GROUP BY MOD(id,4) ORDER BY k LIMIT 2 OFFSET 1`
+* *GIVEN* a `GROUP BY` aggregate `pushdown` request that decomposes into the partial/merge shape, carrying a merge-resolvable `orderBy`, a `limit` with `numElements` = `n`, and a non-zero `limit.offset` = `m`, for example `SELECT MOD(id,4) AS k, COUNT(*) FROM t GROUP BY MOD(id,4) ORDER BY k LIMIT 2 OFFSET 1`
 * *WHEN* the adapter builds the grouped scan-driving SQL
 * *THEN* the outer merge SELECT SHALL render `GROUP BY <keys> [HAVING …] ORDER BY <keys> LIMIT n OFFSET m`, in that clause order, with the offset rendered through the SAME shared limit-and-offset seam every other wrapper uses
 * *AND* the per-shard grouped scan spec SHALL carry NEITHER the row limit NOR any offset, so no shard drops a group before the merge re-groups the partials
-* *AND* a request whose `limit.offset` is zero or absent SHALL produce byte-identical SQL to the pre-change output, so no already-correct grouped plan changes
-* *AND* the returned groups SHALL equal the same `GROUP BY … ORDER BY … LIMIT n OFFSET m` evaluated over all rows on a single node — for the seeded 20-row `events` fixture the example query SHALL return the groups ranked 2-3, NOT the groups ranked 1-2
+* *AND* a request whose `limit.offset` is zero or absent SHALL render no OFFSET clause
+* *AND* the returned groups SHALL equal the same `GROUP BY … ORDER BY … LIMIT n OFFSET m` evaluated over all rows on a single node, for the seeded 20-row `events` fixture the example query SHALL return the groups ranked 2-3, NOT the groups ranked 1-2

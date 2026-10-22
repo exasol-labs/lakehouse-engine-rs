@@ -289,7 +289,7 @@ fn serialize_footer_record() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Scenario: a metadata-cache eviction that re-fetches a footer is observable
+/// Scenario: A metadata-cache eviction that re-fetches a footer is observable
 #[test]
 fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
     // The three runs share one function so they cannot interleave over the process-global record.

@@ -1,27 +1,13 @@
 # Feature: Connection-Object Credential Source (Direct-Storage Kind Parameterization)
 
-Extends `connection/connection-credentials` with the `CatalogKind::DirectStorage` validation branch.
-The CONNECTION address is an object-storage base path rather than a catalog URI. The password
-carries storage credentials only. Every catalog-authentication field is refused at
-`CREATE VIRTUAL SCHEMA` rather than accepted and ignored.
+Extends `connection/connection-credentials` with the `CatalogKind::DirectStorage` validation branch. The CONNECTION address is an object-storage base path, and the password carries storage credentials only.
 
 ## Background
 
-* Validation is already parameterized by the resolved `CatalogKind` and takes it as an explicit
-  parameter. This feature adds the third arm and changes no rule of the other two.
-* Direct storage reaches NO catalog service, so credential vending is permanently unreachable for
-  this kind rather than merely unused. The vended selectors
-  (`storage-access/pushdown-planning-cloud-credentials-vended-storage`) are driven by a `loadTable` response. This
-  kind issues none.
-* The CONNECTION address carries a URI SCHEME for this kind. The other two kinds' addresses do not
-  usefully carry one. An Iceberg REST address is an HTTP endpoint. A Unity Catalog address is a
-  workspace URL. The scheme is therefore an input validation can read.
-* `storage-access/storage-backend-enum-selection` keeps the storage-backend decision single-homed. It enumerates
-  the production modules permitted to name a variant. This feature adds NO module to that list: the
-  scheme agreement is answered by a method ON the enum, whose own methods are already permitted.
-* `connection/connection-credentials-azure` owns the Azure credential SHAPE rule (`account_name`
-  present with exactly one of `account_key` and `sas_token`). This feature reads the backend that
-  rule already selects and does not restate it.
+* Credential validation takes the resolved `CatalogKind` as an explicit parameter.
+* Direct storage reaches no catalog service, so credential vending is unreachable for this kind. Vended credentials come from a `loadTable` response, and this kind issues none.
+* The CONNECTION address of this kind carries a URI scheme, which validation reads. An Iceberg REST address is an HTTP endpoint, and a Unity Catalog address is a workspace URL.
+* `connection/connection-credentials-azure` owns the Azure credential shape rule: `account_name` with exactly one of `account_key` and `sas_token`.
 
 ## Scenarios
 

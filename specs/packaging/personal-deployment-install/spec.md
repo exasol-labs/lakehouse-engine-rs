@@ -1,15 +1,14 @@
 # Feature: Exasol Personal Deployment Install
 
-The install script gains a `--deployment` flag that targets an Exasol Personal instance by name, mirroring the lc-rs install.sh pattern. The deployment backend (local or cloud) is discriminated at runtime from the deployment directory's `deployment.json`. Local backend writes the engine `.so` into the deployment's BucketFS directory and installs the Rust SLC with `exasol slc custom`; cloud backend resolves connection details from the descriptor and falls through to the existing BucketFS HTTP upload path.
+The install script's `--deployment` flag targets an Exasol Personal instance by name. The deployment backend (local or cloud) is read at runtime from the deployment directory's `deployment.json`. The local backend writes the engine `.so` into the deployment's BucketFS directory and installs the Rust SLC with `exasol slc custom`. The cloud backend resolves connection details from the descriptor and uses the BucketFS HTTP upload path.
 
 ## Background
 
 - Exasol Personal deployments live under `$HOME/.exasol/personal/deployments/<name>/`
 - Each deployment directory contains `deployment.json` (connection details, backend type) and `secrets.json` (DB password)
-- Local backend (Exasol Personal 2.3+): no BucketFS HTTP endpoint; BucketFS is the host directory `local/runtime/exa/bucketfs/`, SLCs are installed with `exasol slc custom`; SQL port is assigned per deployment and read from `deployment.json`
-- Cloud backend: exposes ordinary BucketFS HTTP endpoint; requires `--bfs-write-password`
-- The lc-rs project already implements this pattern; this feature mirrors it with the addition of architecture-aware asset selection
-- Bash 3.2+ compatibility required (stock macOS); `jq` is required for deployment descriptor parsing, and the `exasol` CLI for a local deployment
+- The local backend has no BucketFS HTTP endpoint. BucketFS is the host directory `local/runtime/exa/bucketfs/`, and the SQL port is read from `deployment.json`
+- The cloud backend exposes an ordinary BucketFS HTTP endpoint and requires `--bfs-write-password`
+- `jq` is required for deployment descriptor parsing
 
 ## Scenarios
 

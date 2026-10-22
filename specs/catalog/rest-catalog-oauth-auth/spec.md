@@ -1,69 +1,23 @@
 # Feature: REST Catalog Token & OAuth2 Authentication
 
-Lets the Virtual Schema authenticate to an Iceberg REST Catalog that requires a bearer
-token or an OAuth2 client-credentials exchange, in addition to the existing static-S3
-credential model. Three catalog-auth modes are supported: (1) no auth (the default,
-current behaviour); (2) a static bearer `token`, attached directly as the catalog's
-bearer credential; and (3) OAuth2 client credentials (`client_id` + `client_secret`,
-with optional `oauth2_server_uri` and `scope`), where the catalog performs the
-client-credentials grant itself to obtain and refresh a token. Catalog authentication and
-S3 storage credentials are orthogonal — any combination is valid. This auth path is
-separate from, and mutually exclusive with, AWS SigV4 request signing. Catalog auth
-secrets are consumed only in the planning layer and never cross the UDF boundary — and
-after the `catalog` field is dropped, `ScanSpec` carries no catalog block at all.
+The Virtual Schema authenticates to an Iceberg REST Catalog in one of three modes: no auth, a static bearer `token`, or OAuth2 client credentials (`client_id` and `client_secret`, with optional `oauth2_server_uri` and `scope`). Catalog authentication is separate from AWS SigV4 signing and from storage credentials.
 
 ## Background
 
-* Catalog authentication and credential vending are orthogonal. The catalog-auth
-  mode (no-auth / static bearer `token` / OAuth2 client-credentials) selects how
-  the table-load request is authenticated; `use_vended_credentials` independently
-  selects whether short-lived S3 STS credentials are extracted from the `loadTable`
-  response and carried in the scan specs. Either mode may combine with vending on
-  or off. The vended-credential extraction mechanics live in
-  `storage-access/pushdown-planning-cloud-credentials`; this feature only guarantees the
-  catalog-auth secrets themselves never leak into any scan spec.
-* The adapter self-issues the `loadTable` GET on every catalog-auth mode (no-auth,
-  bearer token, OAuth2-grant-derived bearer), authenticating the request accordingly.
-  The adapter performs the OAuth2 client-credentials grant itself: a form-encoded
-  POST (`grant_type=client_credentials`, `client_id`, `client_secret`, optional
-  `scope`) to `oauth2_server_uri` or the catalog default token endpoint, returning the
-  `access_token` used as the bearer.
-* Catalog auth props (`token`, `client_id`, `client_secret`, `oauth2_server_uri`,
-  `scope`) are consumed ONLY in the planning layer. They are NOT carried in `ScanSpec`
-  and MUST NOT cross the UDF boundary; the scan UDF works from pre-resolved file paths
-  and never calls the catalog.
-* `ScanSpec` carries no catalog identifier block (`uri`/`warehouse`/`table`) — those
-  fields were dropped as dead weight the scan UDF never reads.
-* Catalog auth and SigV4 are mutually exclusive auth strategies: SigV4 self-issues
-  signed HTTP requests using the SigV4 signing path; token/OAuth and SigV4 may not
-  be combined. The combination is rejected at credential-resolution time (see
-  `connection/connection-credentials`).
-* Token, `client_secret`, and obtained OAuth2 bearer token values MUST NEVER appear
-  in any returned SQL string, error message, or log line.
-* See `connection/connection-credentials` for credential parsing and the orthogonal,
-  always-optional static-S3 fields, and `storage-access/pushdown-planning-cloud-credentials`
-  for the SigV4, vended-credential, and orthogonality flows.
-* The OAuth2 client-credentials mode extends to a multi-warehouse catalog served
-  under a base-path prefix (the Lakekeeper shape), where the `warehouse` field is a
-  catalog-assigned name and the adapter resolves a per-warehouse `overrides.prefix`
-  from the catalog config endpoint; no new CONNECTION field is introduced.
-* The `prefix` config property is read from the MERGED config per the Iceberg REST
-  spec (a client merges the server's `defaults` base and `overrides`; `overrides`
-  wins). It may be served in either map: Databricks-style catalogs place it in
-  `overrides`, while Lakekeeper 0.13.1 serves the per-warehouse UUID prefix in
-  `defaults`. Reading only `overrides.prefix` yielded an empty prefix against
-  Lakekeeper and a malformed `loadTable` URL (missing the required warehouse
-  segment → HTTP 404); the adapter therefore prefers `overrides.prefix` and falls
-  back to `defaults.prefix`.
-* **This delta (issue #331) removes the token-versus-OAuth PRECEDENCE this feature's Iceberg path carried, and adds no behaviour for any CONNECTION the adapter accepts.** Both `resolve_catalog_auth` and `inject_catalog_auth_props` (`crates/lakehouse-catalog/src/auth.rs`) tested a complete `client_id`/`client_secret` pair BEFORE a non-empty `token`, so a CONNECTION supplying both silently took the OAuth2 mode — while the Unity Catalog path took the token, the opposite answer for the same input. Credential validation now rejects that CONNECTION outright (`connection/connection-credentials-catalog-auth`), which makes the ordering unreachable, and both functions now read the ONE shared mode classifier that feature specifies instead of each deciding again.
-* **Each mode's resulting props, requests, and error redaction are byte-identical.** What changes is only HOW the mode is chosen. The three scenarios below each already state their GIVEN as one mode's fields, so their THEN clauses stand unedited apart from the two clauses this delta adds.
-* **`use_sigv4` continues to be tested ahead of the mode classification, and that is not a precedence.** SigV4 and catalog token/OAuth are mutually exclusive strategies rejected in combination at credential-resolution time, so the two branches cannot both apply; the dispatch picks between two upstream-exclusive strategies. The recorded resolver test that asserted SigV4 wins "regardless of any token also being set" documented a combination validation forbids and is corrected rather than kept.
+* Catalog auth props (`token`, `client_id`, `client_secret`, `oauth2_server_uri`, `scope`) are consumed only in the planning layer. `ScanSpec` does not carry them and carries no catalog identifier block (`uri`, `warehouse`, `table`), because the scan UDF works from pre-resolved file paths and never calls the catalog.
+* Catalog auth and credential vending are orthogonal. Either auth mode combines with `use_vended_credentials` on or off. Vended-credential extraction is specified in `storage-access/pushdown-planning-cloud-credentials`.
+* Catalog token/OAuth auth and SigV4 are mutually exclusive. Credential validation rejects the combination (see `connection/connection-credentials`). The adapter tests `use_sigv4` before it classifies the auth mode.
+* The adapter chooses the auth mode with the one shared classifier specified in `connection/connection-credentials-catalog-auth`. A CONNECTION that supplies both a `token` and a `client_id`/`client_secret` pair is rejected, so the mode is never ambiguous.
+* The adapter sends the `loadTable` GET itself in every mode. In OAuth2 mode it performs the client-credentials grant: a form-encoded POST (`grant_type=client_credentials`, `client_id`, `client_secret`, optional `scope`) to `oauth2_server_uri` or the catalog default token endpoint. The returned `access_token` is the bearer.
+* A multi-warehouse catalog served under a base-path prefix (the Lakekeeper shape) uses a catalog-assigned warehouse name in the `warehouse` field. The adapter reads the per-warehouse `prefix` from the merged catalog config, where `overrides` wins over `defaults` per the Iceberg REST spec. Databricks-style catalogs serve `prefix` in `overrides`, Lakekeeper serves it in `defaults`, so the adapter prefers `overrides.prefix` and falls back to `defaults.prefix`.
+* Token, `client_secret`, and the obtained bearer token never appear in any returned SQL string, error message, or log line.
+
 
 ## Scenarios
 
 ### Scenario: Static bearer token is attached to unsigned catalog requests
 
-* *GIVEN* a virtual schema whose CONNECTION credentials supply a non-empty `token`, supply neither `client_id` nor `client_secret` — the only shape credential validation admits for the token mode — and do not enable `use_sigv4`
+* *GIVEN* a virtual schema whose CONNECTION credentials supply a non-empty `token`, supply neither `client_id` nor `client_secret`, the only shape credential validation admits for the token mode, and do not enable `use_sigv4`
 * *AND* a query that requires resolving the Iceberg snapshot and file list from a REST catalog endpoint
 * *WHEN* the adapter resolves the file list through the unsigned catalog path
 * *THEN* the adapter SHALL set the catalog `token` property from the resolved credentials when building the REST catalog
@@ -73,7 +27,7 @@ after the `catalog` field is dropped, `ScanSpec` carries no catalog block at all
 
 ### Scenario: OAuth2 client credentials drive the catalog client-credentials grant
 
-* *GIVEN* a virtual schema whose CONNECTION credentials supply `client_id` and `client_secret`, supply no `token` — the only shape credential validation admits for the OAuth2 mode — and do not enable `use_sigv4`
+* *GIVEN* a virtual schema whose CONNECTION credentials supply `client_id` and `client_secret`, supply no `token`, the only shape credential validation admits for the OAuth2 mode, and do not enable `use_sigv4`
 * *WHEN* the adapter resolves the file list through the unsigned catalog path
 * *THEN* the adapter SHALL set the catalog `credential` property to the string formed by joining `client_id` and `client_secret` with a single colon
 * *AND* the adapter SHALL set the catalog `oauth2-server-uri` property only when a non-empty `oauth2_server_uri` was supplied, otherwise leaving it unset so the catalog defaults to `{uri}/v1/oauth/tokens`
@@ -86,15 +40,15 @@ after the `catalog` field is dropped, `ScanSpec` carries no catalog block at all
 * *GIVEN* a virtual schema whose CONNECTION credentials supply no `token`, `client_id`, or `client_secret`
 * *WHEN* the adapter resolves the file list through the unsigned catalog path
 * *THEN* the adapter SHALL NOT set the catalog `token`, `credential`, `oauth2-server-uri`, or `scope` properties
-* *AND* the catalog build SHALL be identical in shape to the pre-feature behaviour
+* *AND* the catalog build SHALL carry no auth property, so the catalog is reached unauthenticated
 
 ### Scenario: Catalog auth props are never placed in any scan spec
 
 * *GIVEN* a virtual schema whose CONNECTION credentials supply a `token` or OAuth2 client credentials, with `use_vended_credentials` either enabled or disabled
 * *WHEN* the adapter builds the per-shard scan specs after resolving the file list
 * *THEN* the adapter MUST NOT place `token`, `client_id`, `client_secret`, `oauth2_server_uri`, or `scope` into any `ScanSpec` field
-* *AND* the `ScanSpec` SHALL carry no catalog identifier block at all — the scan UDF never contacts the catalog, so `ScanSpec` MUST NOT include catalog `uri`, `warehouse`, or `table` fields
-* *AND* each `ScanSpec` storage block SHALL carry only storage material, in the wire variant that `storage-access/scan-spec-credential-reference` § "One pure function selects the wire variant and gates the sealed envelope" selects
+* *AND* the `ScanSpec` SHALL carry no catalog identifier block at all, the scan UDF never contacts the catalog, so `ScanSpec` MUST NOT include catalog `uri`, `warehouse`, or `table` fields
+* *AND* each `ScanSpec` storage block SHALL carry only storage material, in the wire variant that `storage-access/scan-spec-credential-reference` § "Own credentials travel by name and every other credential travels sealed" selects
 
 ### Scenario: OAuth2 client-credentials path resolves tables from a multi-warehouse catalog served under a base path
 
