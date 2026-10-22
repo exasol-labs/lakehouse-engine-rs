@@ -21,6 +21,7 @@ const INSTALLER_USER: &str = "CREDEXP_INSTALLER";
 const INSTALLER_ROLE: &str = "CREDEXP_INSTALLER_ROLE";
 const INSTALLER_SCHEMA: &str = "CREDEXP_INSTALLER_SCRIPTS";
 const INSTALLER_VS_NAME: &str = "CREDEXP_INSTALLER_VS";
+const INSTALLER_CONN_NAME: &str = "CREDEXP_INSTALLER_CONN";
 const REINSTALL_SCHEMA: &str = "CREDEXP_SCRIPTS";
 const SCHEMA_GRANTEE_USER: &str = "CREDEXP_SCHEMA_GRANTEE";
 const SCHEMA_VS_NAME: &str = "CREDEXP_SCHEMA_VS";
@@ -221,7 +222,7 @@ fn setup_e2e() {
         for schema in [REINSTALL_SCHEMA, INSTALLER_SCHEMA] {
             sys.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"));
         }
-        for conn in [ROTATED_CONN_NAME, DROPPED_CONN_NAME] {
+        for conn in [ROTATED_CONN_NAME, DROPPED_CONN_NAME, INSTALLER_CONN_NAME] {
             sys.execute(&format!("DROP CONNECTION IF EXISTS {conn}"));
         }
         sys.execute(&build_create_connection_sql(
@@ -261,6 +262,7 @@ fn setup_e2e() {
                 "CREATE SCHEMA",
                 "CREATE SCRIPT",
                 "CREATE VIRTUAL SCHEMA",
+                "CREATE CONNECTION",
             ],
         );
         create_user(
@@ -441,39 +443,48 @@ fn a_role_owned_virtual_schema_serves_a_reader_through_the_roles_grants() {
     assert_denied(&denied, SCAN_DENIAL);
 }
 
+/// Scenario: The CONNECTION's creator grants its own scripts access without a DBA
 /// Scenario: A user owner can hold the CONNECTION grants through a role
 #[test]
-fn the_install_scripts_role_recipe_serves_a_reader() {
+fn the_install_scripts_grant_recipes_serve_a_reader() {
     let _serial = serial();
     setup_e2e();
     let mut sys = exa_conn();
     let mut installer = user_conn(INSTALLER_USER);
+    let grants_to = |grantee: &str| {
+        [ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME]
+            .map(|script| access_grant(INSTALLER_CONN_NAME, INSTALLER_SCHEMA, script, grantee))
+    };
 
     // The grants `print_next_step_template` in deploy/scripts/install.sh prints.
     create_schema_and_scripts_in(&mut installer, INSTALLER_SCHEMA);
-    sys.execute(&format!("CREATE ROLE {INSTALLER_ROLE}"));
-    for script in [ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME] {
-        sys.execute(&access_grant(
-            CONN_NAME,
-            INSTALLER_SCHEMA,
-            script,
-            INSTALLER_ROLE,
-        ));
-    }
-    let role_grant = format!("GRANT {INSTALLER_ROLE} TO {INSTALLER_USER}");
-    sys.execute(&role_grant);
+    installer.execute(&build_create_connection_sql(
+        INSTALLER_CONN_NAME,
+        &iceberg_catalog_url_internal(),
+        &local_stack_connection_password(),
+    ));
+    let direct_grants = grants_to(INSTALLER_USER);
+    execute_all(&mut installer, direct_grants.clone());
     create_readable_vs(
         &mut installer,
         INSTALLER_VS_NAME,
         INSTALLER_SCHEMA,
-        CONN_NAME,
+        INSTALLER_CONN_NAME,
     );
+
+    assert_eq!(reader_count(INSTALLER_VS_NAME), SEED_TOTAL_ROWS as i64);
+
+    execute_all(&mut sys, direct_grants.map(|grant| revoke_sql(&grant)));
+    sys.execute(&format!("CREATE ROLE {INSTALLER_ROLE}"));
+    execute_all(&mut sys, grants_to(INSTALLER_ROLE));
+    let role_grant = format!("GRANT {INSTALLER_ROLE} TO {INSTALLER_USER}");
+    sys.execute(&role_grant);
 
     assert_eq!(reader_count(INSTALLER_VS_NAME), SEED_TOTAL_ROWS as i64);
 
     let denied = without_grant(&role_grant, || try_reader_count(INSTALLER_VS_NAME));
 
-    assert_denied(&denied, &unresolved_text(CONN_NAME));
+    assert_denied(&denied, &unresolved_text(INSTALLER_CONN_NAME));
 }
 
 /// Scenario: Schema-scoped grants survive a re-install, script-scoped grants do not

@@ -52,9 +52,9 @@ They also cover scripts created or replaced in `<schema>` later. Anyone who can 
 
 ### The install script's template
 
-The install script prints the per-script CONNECTION grants as a template. It puts them on the role `LAKEHOUSE_ENGINE_ROLE_<schema>` and grants that role to the installing user. That user owns `<schema>`, so it needs no `EXECUTE` grant, and it owns the virtual schemas it creates. The role holds no `EXECUTE` grant, so any other owner that gets the role also needs the three `EXECUTE` grants of the [owner grants](#owner-grants). The role is for owners only. Never grant it to a reader.
+The install script prints the per-script CONNECTION grants as a template. It grants them to the installing user, which owns `<schema>`, so it needs no `EXECUTE` grant, and it owns the virtual schemas it creates. Run the grants as the user that created the CONNECTION, which needs no DBA privilege, or as a DBA. Run them again after a re-install.
 
-Run the template's grants as a DBA, because granting a role needs `GRANT ANY ROLE`, even for the role's creator. After a re-install, run only its two `GRANT ACCESS` statements again. The role and its members remain.
+The template also shows, commented out, the same grants on the role `LAKEHOUSE_ENGINE_ROLE_<schema>`, for sharing them with other owners. Run that variant as a DBA, because creating a role needs `CREATE ROLE` and granting one needs `GRANT ANY ROLE`, even for the role's creator. The role holds no `EXECUTE` grant, so any other owner that gets the role also needs the three `EXECUTE` grants of the [owner grants](#owner-grants). The role is for owners only. Never grant it to a reader. After a re-install, run only its two `GRANT ACCESS` statements again. The role and its members remain.
 
 ### A role as owner
 
