@@ -3,7 +3,7 @@ use crate::scan::sealed::seal_storage;
 use crate::scan::spec::{
     CommonScanSpec, JoinSpec, JoinType, ScanStorage, StorageBackend, StorageProps,
 };
-use exasol_udf_sdk::connect_back::ConnectionObject;
+use exasol_udf_sdk::ConnectionObject;
 use exasol_udf_sdk::test_support::TestContext;
 
 const CONNECTION: &str = "LAKEHOUSE_CATALOG_CREDS";
@@ -77,33 +77,35 @@ fn scan_storage_variants_resolve_or_fail_correctly() {
         name: CONNECTION.into(),
         allow_http: false,
     });
-    let err =
-        resolve_scan_storage(&conn_spec, &TestContext::scalar(vec![])).expect_err("unreadable");
-    let text = err.to_string();
-    assert!(
-        text.contains(CONNECTION) && text.contains("ACCESS ON CONNECTION"),
-        "{text}"
+    let missing =
+        resolve_scan_storage(&conn_spec, &TestContext::scalar(vec![])).expect_err("missing");
+    assert_eq!(
+        missing.to_string(),
+        format!("the scan cannot access CONNECTION '{CONNECTION}': it does not exist")
     );
 
-    let deployed = resolve_scan_storage(
-        &conn_spec,
+    let refused = || UdfError::Connection("insufficient privileges for using connection".into());
+    let deployed = connection_lookup_failure(
         &TestContext::scalar(vec![])
             .with_script_schema("LAKEHOUSE_OPS")
             .with_script_name("LH_SCAN_V2"),
-    )
-    .expect_err("unreadable");
+        CONNECTION,
+        refused(),
+        SCAN_SCRIPT_NAME,
+    );
     assert!(
-        deployed
-            .to_string()
-            .contains("FOR SCRIPT LAKEHOUSE_OPS.LH_SCAN_V2"),
+        deployed.starts_with("insufficient privileges")
+            && deployed.contains("FOR SCRIPT LAKEHOUSE_OPS.LH_SCAN_V2"),
         "{deployed}"
     );
-    let fallback =
-        resolve_scan_storage(&conn_spec, &TestContext::scalar(vec![])).expect_err("unreadable");
+    let fallback = connection_lookup_failure(
+        &TestContext::scalar(vec![]),
+        CONNECTION,
+        refused(),
+        SCAN_SCRIPT_NAME,
+    );
     assert!(
-        fallback
-            .to_string()
-            .contains("FOR SCRIPT <schema>.LAKEHOUSE_SCAN"),
+        fallback.contains("FOR SCRIPT <schema>.LAKEHOUSE_SCAN"),
         "{fallback}"
     );
 

@@ -21,7 +21,7 @@ fn inline_backend(storage: &ScanStorage) -> StorageBackend {
 }
 
 use arrow::record_batch::RecordBatch;
-use exasol_udf_sdk::connect_back::{ConnectionObject, ExaConnection};
+use exasol_udf_sdk::ConnectionObject;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::test_support::TestContext;
@@ -200,12 +200,6 @@ impl UdfContext for BatchCapturingCtx {
     }
     fn connection(&self, name: &str) -> Result<ConnectionObject, UdfError> {
         self.inner.connection(name)
-    }
-    fn connect_back(
-        &mut self,
-        conn: &ConnectionObject,
-    ) -> Result<Box<dyn ExaConnection>, UdfError> {
-        self.inner.connect_back(conn)
     }
     fn emit_record_batch_ffi(
         &mut self,

@@ -68,31 +68,36 @@ fn resolve_side(storage: &ScanStorage, ctx: &dyn UdfContext) -> Result<StorageBa
 
 /// Exasol checks the grant against the VS OWNER, not the querying user.
 fn connection_password(ctx: &dyn UdfContext, name: &str) -> Result<String, UdfError> {
-    match ctx.connection(name) {
-        Ok(connection) => Ok(connection.password),
-        Err(cause) => {
-            let grant = connection_grant_hint(ctx, name, SCAN_SCRIPT_NAME);
-            Err(UdfError::User(format!(
-                "the scan cannot access CONNECTION '{name}' ({cause}); the OWNER of the virtual \
-                 schema being queried needs {grant}"
-            )))
-        }
-    }
+    let connection = ctx.connection(name).map_err(|cause| {
+        UdfError::User(format!(
+            "the scan cannot access CONNECTION '{name}': {}",
+            connection_lookup_failure(ctx, name, cause, SCAN_SCRIPT_NAME)
+        ))
+    })?;
+    Ok(connection.password)
 }
 
 const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
 
 /// `fallback_script` stands in when the handshake reports no script name.
-pub(crate) fn connection_grant_hint(
+pub(crate) fn connection_lookup_failure(
     ctx: &dyn UdfContext,
     name: &str,
+    cause: UdfError,
     fallback_script: &str,
 ) -> String {
+    // Exasol's refusal text is the only signal that tells a missing CONNECTION from a missing grant.
+    if let UdfError::Connection(reason) = &cause
+        && reason.contains("does not exist")
+    {
+        return "it does not exist".into();
+    }
     let schema = non_empty_or(ctx.script_schema(), "<schema>");
     let script = non_empty_or(ctx.script_name(), fallback_script);
     format!(
-        "GRANT ACCESS ON CONNECTION {name} FOR SCRIPT {schema}.{script} (or FOR SCHEMA \
-         {schema}), directly or through a role; a querying user needs no connection privilege"
+        "{cause}; the OWNER of the virtual schema needs GRANT ACCESS ON CONNECTION {name} FOR \
+         SCRIPT {schema}.{script} (or FOR SCHEMA {schema}), directly or through a role; a \
+         querying user needs no connection privilege"
     )
 }
 

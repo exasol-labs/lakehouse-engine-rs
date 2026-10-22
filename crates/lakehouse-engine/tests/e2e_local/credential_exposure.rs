@@ -29,6 +29,8 @@ const ROTATED_CONN_NAME: &str = "CREDEXP_ROTATED_CONN";
 const ROTATED_VS_NAME: &str = "CREDEXP_ROTATED_VS";
 const MISSING_CONN_NAME: &str = "CREDEXP_NO_SUCH_CONN";
 const MISSING_CONN_VS_NAME: &str = "CREDEXP_MISSING_CONN_VS";
+const DROPPED_CONN_NAME: &str = "CREDEXP_DROPPED_CONN";
+const DROPPED_CONN_VS_NAME: &str = "CREDEXP_DROPPED_CONN_VS";
 const WRONG_SECRET_KEY: &str = "CredExpRotatedSecret2026";
 const SCAN_DENIAL: &str = "the scan cannot access CONNECTION";
 const ADAPTER_EXECUTE_DENIAL: &str = "insufficient privileges for calling adapter script";
@@ -179,10 +181,19 @@ fn assert_no_credential(text: &str) {
     }
 }
 
-/// The error text of a denied response, checked to carry no credential.
+/// The error text of a denied response, checked to carry no credential and no SLC wrapper text.
 fn denial_text(denied: &Value) -> String {
     let msg = error_text(denied);
     assert_no_credential(&msg);
+    for noise in [
+        "Connect-back",
+        "Protocol error",
+        "MT_IMPORT",
+        "returned error code",
+        "UDF error: UDF error",
+    ] {
+        assert!(!msg.contains(noise), "{noise:?} leaked: {msg}");
+    }
     msg
 }
 
@@ -191,15 +202,29 @@ fn assert_denied(denied: &Value, expected: &str) {
     assert!(msg.contains(expected), "{expected:?} expected: {msg}");
 }
 
-/// Both CONNECTION errors name the owner's grant, per script and per schema.
+/// Both CONNECTION errors carry Exasol's privilege reason and name the owner's grant.
 fn assert_names_the_owner_grant(msg: &str, script: &str) {
     for needle in [
+        format!("insufficient privileges for using connection {CONN_NAME}"),
         format!("GRANT ACCESS ON CONNECTION {CONN_NAME} FOR SCRIPT {SCHEMA_NAME}.{script}"),
         format!("(or FOR SCHEMA {SCHEMA_NAME})"),
         "OWNER of the virtual schema".to_string(),
     ] {
         assert!(msg.contains(&needle), "{needle:?} expected: {msg}");
     }
+    assert!(!msg.contains("does not exist"), "{msg}");
+}
+
+fn assert_missing(denied: &Value, prefix: &str) {
+    let msg = denial_text(denied);
+    assert!(
+        msg.contains(&format!("{prefix}: it does not exist")),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("GRANT"),
+        "a missing CONNECTION needs no grant: {msg}"
+    );
 }
 
 fn setup_e2e() {
@@ -217,6 +242,7 @@ fn setup_e2e() {
             SCRIPT_VS_NAME,
             ROTATED_VS_NAME,
             MISSING_CONN_VS_NAME,
+            DROPPED_CONN_VS_NAME,
         ] {
             let _ = sys.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs} CASCADE"));
         }
@@ -229,7 +255,9 @@ fn setup_e2e() {
         for schema in [REINSTALL_SCHEMA, INSTALLER_SCHEMA] {
             sys.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"));
         }
-        sys.execute(&format!("DROP CONNECTION IF EXISTS {ROTATED_CONN_NAME}"));
+        for conn in [ROTATED_CONN_NAME, DROPPED_CONN_NAME] {
+            sys.execute(&format!("DROP CONNECTION IF EXISTS {conn}"));
+        }
         sys.execute(&build_create_connection_sql(
             CONN_NAME,
             &iceberg_catalog_url_internal(),
@@ -352,20 +380,48 @@ fn revoking_the_owners_adapter_grant_fails_with_the_adapter_error_even_with_the_
 }
 
 /// Scenario: A CONNECTION that does not exist fails with the adapter's named error
+/// Scenario: A CONNECTION dropped after planning fails with the scan's named error
 #[test]
-fn a_connection_that_does_not_exist_fails_with_the_adapter_error() {
+fn a_connection_that_does_not_exist_is_reported_as_missing_by_the_adapter_and_the_scan() {
     let _serial = serial();
     setup_e2e();
+    let mut sys = exa_conn();
+    let query = filtered_rows_sql(DROPPED_CONN_VS_NAME);
 
-    let denied = exa_conn().try_execute(&create_vs_sql(
+    let denied = sys.try_execute(&create_vs_sql(
         MISSING_CONN_VS_NAME,
         SCHEMA_NAME,
         MISSING_CONN_NAME,
     ));
+    assert_missing(&denied, &unresolved_text(MISSING_CONN_NAME));
 
-    assert_denied(
-        &denied,
-        &format!("{}: it does not exist", unresolved_text(MISSING_CONN_NAME)),
+    sys.execute(&build_create_connection_sql(
+        DROPPED_CONN_NAME,
+        &iceberg_catalog_url_internal(),
+        &local_stack_connection_password(),
+    ));
+    execute_all(
+        &mut sys,
+        [ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME]
+            .map(|script| access_grant(DROPPED_CONN_NAME, SCHEMA_NAME, script, OWNER_USER)),
+    );
+    let mut owner = user_conn(OWNER_USER);
+    create_readable_vs(
+        &mut owner,
+        DROPPED_CONN_VS_NAME,
+        SCHEMA_NAME,
+        DROPPED_CONN_NAME,
+    );
+    let isolated = isolated_pushdown_statement(&mut owner, &query);
+    sys.execute(&format!("DROP CONNECTION {DROPPED_CONN_NAME}"));
+
+    assert_missing(
+        &reader_conn().try_execute(&query),
+        &unresolved_text(DROPPED_CONN_NAME),
+    );
+    assert_missing(
+        &owner.try_execute(&isolated),
+        &format!("{SCAN_DENIAL} '{DROPPED_CONN_NAME}'"),
     );
 }
 
