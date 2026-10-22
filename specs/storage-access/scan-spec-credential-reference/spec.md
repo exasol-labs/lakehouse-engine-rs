@@ -93,12 +93,12 @@ The scan spec carries the Exasol CONNECTION name instead of storage credentials,
 ### Scenario: The CONNECTION's creator grants its own scripts access without a DBA
 
 * *GIVEN* a user without DBA privileges that owns the schema of the adapter, scan, and distributor scripts and created the CONNECTION
-* *WHEN* it grants itself the script-scoped CONNECTION grants and creates a virtual schema, as the install script's template prints
+* *WHEN* it grants itself the script-scoped CONNECTION grants and creates a virtual schema, as the install script's template offers
 * *THEN* a reader SHALL receive the owner's rows
 
 ### Scenario: A user owner can hold the CONNECTION grants through a role
 
-* *GIVEN* a virtual schema whose owner is a user that owns the schema of the adapter, scan, and distributor scripts, and holds the script-scoped CONNECTION grants only through a role it is a member of, as the install script's template offers
+* *GIVEN* a virtual schema whose owner is a user that owns the schema of the adapter, scan, and distributor scripts, and holds the script-scoped CONNECTION grants only through a role it is a member of, as the install script's template sets up
 * *WHEN* a reader queries the virtual schema
 * *THEN* the reader SHALL receive the owner's rows
 * *AND* when the role is revoked from the owner, the reader's query SHALL fail with the adapter's named error

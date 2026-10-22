@@ -1214,16 +1214,13 @@ test_stops_at_product_prints_template() {
   # The E2E test the_install_scripts_grant_recipes_serve_a_reader runs these grants.
   local script
   for script in LAKEHOUSE_ADAPTER LAKEHOUSE_SCAN; do
-    assert_contains "template: installing user holds the $script CONNECTION grant" "$LAST_OUT" \
-      "
-GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT LHVS.$script TO <installing-user>;"
-    assert_contains "template: the role variant holds the $script CONNECTION grant" "$LAST_OUT" \
-      "-- GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT LHVS.$script TO LAKEHOUSE_ENGINE_ROLE_LHVS;"
+    assert_contains "template: role holds the $script CONNECTION grant" "$LAST_OUT" \
+      "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT LHVS.$script TO LAKEHOUSE_ENGINE_ROLE_LHVS;"
+    assert_contains "template: the direct variant holds the $script CONNECTION grant" "$LAST_OUT" \
+      "-- GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT LHVS.$script TO <installing-user>;"
   done
-  assert_not_contains "template: no uncommented CREATE ROLE" "$LAST_OUT" "
-CREATE ROLE"
-  assert_contains "template: the role variant grants the role to the installing user" "$LAST_OUT" "-- GRANT LAKEHOUSE_ENGINE_ROLE_LHVS TO <installing-user>;"
-  assert_contains "template: the role variant needs a DBA" "$LAST_OUT" "Run as a DBA"
+  assert_contains "template: grants the role to the installing user" "$LAST_OUT" "GRANT LAKEHOUSE_ENGINE_ROLE_LHVS TO "
+  assert_contains "template: the role grants need a DBA" "$LAST_OUT" "Run this block as a DBA"
   local log; log="$(log_content)"
   assert_not_contains "template: does NOT execute CREATE VIRTUAL SCHEMA" "$log" "CREATE VIRTUAL SCHEMA"
   assert_not_contains "template: does NOT execute CREATE CONNECTION" "$log" "CREATE CONNECTION"
