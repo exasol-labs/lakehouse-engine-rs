@@ -1221,6 +1221,11 @@ test_stops_at_product_prints_template() {
   done
   assert_not_contains "template: no SQL is commented out" "$LAST_OUT" "-- GRANT"
   assert_contains "template: asks for one option" "$LAST_OUT" "Run ONE of the two options below."
+  for script in LAKEHOUSE_ADAPTER LAKEHOUSE_SCAN LAKEHOUSE_DISTRIBUTE_FILES; do
+    assert_contains "template: option 2 grants the role EXECUTE on $script" "$LAST_OUT" \
+      "GRANT EXECUTE ON SCRIPT LHVS.$script TO LAKEHOUSE_ENGINE_ROLE_LHVS;"
+  done
+  assert_contains "template: option 2 grants the role CREATE VIRTUAL SCHEMA" "$LAST_OUT" "GRANT CREATE VIRTUAL SCHEMA TO LAKEHOUSE_ENGINE_ROLE_LHVS;"
   assert_contains "template: option 2 grants the role to the installing user" "$LAST_OUT" "GRANT LAKEHOUSE_ENGINE_ROLE_LHVS TO <installing-user>;"
   assert_contains "template: option 2 needs a DBA" "$LAST_OUT" "Run as a DBA"
   assert_contains "template: names the CREATE VIRTUAL SCHEMA privilege" "$LAST_OUT" "Needs the CREATE VIRTUAL SCHEMA system privilege"

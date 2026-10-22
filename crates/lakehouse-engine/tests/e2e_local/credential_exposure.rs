@@ -22,6 +22,8 @@ const INSTALLER_ROLE: &str = "CREDEXP_INSTALLER_ROLE";
 const INSTALLER_SCHEMA: &str = "CREDEXP_INSTALLER_SCRIPTS";
 const INSTALLER_VS_NAME: &str = "CREDEXP_INSTALLER_VS";
 const INSTALLER_CONN_NAME: &str = "CREDEXP_INSTALLER_CONN";
+const ROLE_MEMBER_USER: &str = "CREDEXP_ROLE_MEMBER";
+const ROLE_MEMBER_VS_NAME: &str = "CREDEXP_ROLE_MEMBER_VS";
 const REINSTALL_SCHEMA: &str = "CREDEXP_SCRIPTS";
 const SCHEMA_GRANTEE_USER: &str = "CREDEXP_SCHEMA_GRANTEE";
 const SCHEMA_VS_NAME: &str = "CREDEXP_SCHEMA_VS";
@@ -205,6 +207,7 @@ fn setup_e2e() {
             SINGLE_SHARD_VS_NAME,
             ROLE_VS_NAME,
             INSTALLER_VS_NAME,
+            ROLE_MEMBER_VS_NAME,
             SCHEMA_VS_NAME,
             SCRIPT_VS_NAME,
             ROTATED_VS_NAME,
@@ -216,7 +219,13 @@ fn setup_e2e() {
         for role in [OWNER_ROLE, INSTALLER_ROLE] {
             sys.execute(&format!("DROP ROLE IF EXISTS {role} CASCADE"));
         }
-        for user in [OWNER_USER, READER_USER, INSTALLER_USER, SCHEMA_GRANTEE_USER] {
+        for user in [
+            OWNER_USER,
+            READER_USER,
+            INSTALLER_USER,
+            SCHEMA_GRANTEE_USER,
+            ROLE_MEMBER_USER,
+        ] {
             sys.execute(&format!("DROP USER IF EXISTS {user} CASCADE"));
         }
         for schema in [REINSTALL_SCHEMA, INSTALLER_SCHEMA] {
@@ -451,10 +460,6 @@ fn the_install_scripts_grant_recipes_serve_a_reader() {
     setup_e2e();
     let mut sys = exa_conn();
     let mut installer = user_conn(INSTALLER_USER);
-    let grants_to = |grantee: &str| {
-        [ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME]
-            .map(|script| access_grant(INSTALLER_CONN_NAME, INSTALLER_SCHEMA, script, grantee))
-    };
 
     // The grants `print_next_step_template` in deploy/scripts/install.sh prints.
     create_schema_and_scripts_in(&mut installer, INSTALLER_SCHEMA);
@@ -463,7 +468,14 @@ fn the_install_scripts_grant_recipes_serve_a_reader() {
         &iceberg_catalog_url_internal(),
         &local_stack_connection_password(),
     ));
-    let direct_grants = grants_to(INSTALLER_USER);
+    let direct_grants = [ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME].map(|script| {
+        access_grant(
+            INSTALLER_CONN_NAME,
+            INSTALLER_SCHEMA,
+            script,
+            INSTALLER_USER,
+        )
+    });
     execute_all(&mut installer, direct_grants.clone());
     create_readable_vs(
         &mut installer,
@@ -476,11 +488,26 @@ fn the_install_scripts_grant_recipes_serve_a_reader() {
 
     execute_all(&mut sys, direct_grants.map(|grant| revoke_sql(&grant)));
     sys.execute(&format!("CREATE ROLE {INSTALLER_ROLE}"));
-    execute_all(&mut sys, grants_to(INSTALLER_ROLE));
+    sys.execute(&format!("GRANT CREATE VIRTUAL SCHEMA TO {INSTALLER_ROLE}"));
+    execute_all(
+        &mut sys,
+        script_grants(INSTALLER_SCHEMA, INSTALLER_CONN_NAME, INSTALLER_ROLE),
+    );
     let role_grant = format!("GRANT {INSTALLER_ROLE} TO {INSTALLER_USER}");
     sys.execute(&role_grant);
 
     assert_eq!(reader_count(INSTALLER_VS_NAME), SEED_TOTAL_ROWS as i64);
+
+    create_user(&mut sys, ROLE_MEMBER_USER, &["CREATE SESSION"]);
+    sys.execute(&format!("GRANT {INSTALLER_ROLE} TO {ROLE_MEMBER_USER}"));
+    create_readable_vs(
+        &mut user_conn(ROLE_MEMBER_USER),
+        ROLE_MEMBER_VS_NAME,
+        INSTALLER_SCHEMA,
+        INSTALLER_CONN_NAME,
+    );
+
+    assert_eq!(reader_count(ROLE_MEMBER_VS_NAME), SEED_TOTAL_ROWS as i64);
 
     let denied = without_grant(&role_grant, || try_reader_count(INSTALLER_VS_NAME));
 

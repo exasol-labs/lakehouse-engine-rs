@@ -101,6 +101,7 @@ The scan spec carries the Exasol CONNECTION name instead of storage credentials,
 * *GIVEN* a virtual schema whose owner is a user that owns the schema of the adapter, scan, and distributor scripts, and holds the script-scoped CONNECTION grants only through a role it is a member of, as the install script's template offers
 * *WHEN* a reader queries the virtual schema
 * *THEN* the reader SHALL receive the owner's rows
+* *AND* another user holding only `CREATE SESSION` and that role SHALL create a virtual schema and serve its rows to a reader
 * *AND* when the role is revoked from the owner, the reader's query SHALL fail with the adapter's named error
 
 ### Scenario: Schema-scoped grants survive a re-install, script-scoped grants do not
