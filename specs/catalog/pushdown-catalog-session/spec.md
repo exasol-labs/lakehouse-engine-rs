@@ -13,7 +13,7 @@ The adapter builds the catalog HTTP state once per pushdown request and reuses i
 * The namespace enumeration for `createVirtualSchema` is done by `IcebergRestCatalogClient::list_tables` in `lakehouse-catalog`, behind the shared `CatalogClient` trait. It builds one `CatalogSession` for the whole enumeration.
 * The enumeration also builds its own `RestCatalog` through `list_namespace_tables`, independent of any `CatalogSession`. With OAuth2 client credentials that `RestCatalog` runs its own grant and `/v1/config` handshake, so a request performs two grants. With a static token or no auth it runs no grant and one extra `/v1/config` lookup. With SigV4 it builds no `RestCatalog`.
 * Related features: `catalog/rest-catalog-oauth-auth` (the three auth modes), `connection/connection-credentials-catalog-auth`, and `pushdown/pushdown-planning` (file list resolved once).
-
+* The Iceberg REST `listTables` response carries only table identifiers and a next-page token (`ListTablesResponse` in `iceberg-catalog-rest`).
 
 ## Scenarios
 
@@ -86,3 +86,11 @@ The adapter builds the catalog HTTP state once per pushdown request and reuses i
 * *THEN* the OAuth2 grant and the `/v1/config` lookup SHALL each run exactly once for the request, as they do with the check off
 * *AND* the batch-check SHALL carry the bearer token of that one grant
 * *AND* the check SHALL add exactly one request, the batch-check, between the `/v1/config` lookup and the first `loadTable` GET, and SHALL leave every other request of "Single-table pushdown builds one catalog session and reuses it" and "N-table join reuses one session across all legs" unchanged
+
+### Scenario: A scoped refresh lists Iceberg identifiers and loads the requested tables on one session
+
+* *GIVEN* an Iceberg REST namespace with descendant namespaces, and a partial refresh per `vs-adapter/refresh-and-set-properties`
+* *WHEN* the Iceberg REST client lists the namespace's identifiers and then loads the tables the adapter selects
+* *THEN* the identifier listing SHALL call only the namespace and table listing endpoints, besides the listing handshake this Background records, and SHALL issue no `loadTable` GET
+* *AND* the load SHALL build exactly ONE `CatalogSession`, issue one `loadTable` GET per given identifier through the load helper the full listing uses, and build NO session for an empty batch
+* *AND* a table the catalog reports as not a loadable Iceberg table SHALL be skipped with the `NotLoadableIcebergTable` reason the full listing gives it, and any other load failure SHALL fail the load

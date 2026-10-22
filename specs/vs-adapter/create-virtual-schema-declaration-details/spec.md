@@ -20,8 +20,8 @@ The `createVirtualSchema` declaration flattens multi-level namespaces into table
 * *GIVEN* a configured namespace `prod.finance` containing an Iceberg table `orders` and a child namespace `prod.finance.eu` containing a table `orders`
 * *WHEN* Exasol sends the `createVirtualSchema` request naming namespace `prod.finance`
 * *THEN* the adapter SHALL name the first virtual table `ORDERS` and the second `EU__ORDERS`, flattening only the namespace segments below the configured namespace using `__` and uppercasing the result
-* *AND* the adapter SHALL apply the same flatten function when building the `TABLE_MAP` so the Exasol name maps back to the correct original-cased Iceberg identifier
-* *AND* when two distinct Iceberg identifiers flatten to the same Exasol name (a `__` collision) the adapter SHALL return an error naming the colliding Exasol table name rather than silently dropping or overwriting a table
+* *AND* the adapter SHALL record each virtual table's original-cased Iceberg identifier in the `name` member of that table's identifier note (its table-level `adapterNotes`), so each flattened Exasol name resolves back to the correct table
+* *AND* when two distinct Iceberg identifiers that the listing loads flatten to the same Exasol name (a `__` collision) the adapter SHALL return an error naming the colliding Exasol table name rather than silently dropping or overwriting a table
 
 ### Scenario: A non-ASCII Iceberg table and column name stay queryable end to end
 
@@ -29,7 +29,7 @@ The `createVirtualSchema` declaration flattens multi-level namespaces into table
 * *AND* a virtual schema created over that namespace through a real `createVirtualSchema`
 * *WHEN* an Exasol user queries that table and that column through the virtual schema
 * *THEN* `SYS.EXA_ALL_COLUMNS` and `SYS.EXA_ALL_TABLES` SHALL report both identifiers as `STRASSE`, pinning the full-Unicode `ß`-to-`SS` expansion as observed behavior rather than as documentation
-* *AND* an unquoted `SELECT COUNT(*)` over the table SHALL return the seeded row count, so the uppercased table name still resolves through `TABLE_MAP` back to the original-cased Iceberg identifier `straße` and the scan reaches the real table
+* *AND* an unquoted `SELECT COUNT(*)` over the table SHALL return the seeded row count, so the uppercased table name still resolves through the table's identifier note back to the original-cased Iceberg identifier `straße` and the scan reaches the real table
 * *AND* an unquoted projection of the column SHALL return the seeded values in full, so the uppercased column name still maps back to the Iceberg field's own casing at scan time
 * *AND* a `LIKE` predicate over that column SHALL return the correct subset of rows
 * *AND* the adapter-generated pushdown SQL for that same `LIKE` query SHALL carry the predicate over `"STRASSE"` rather than declining it, so the type-rewrite guards resolved the column's Exasol type from a `col_types` entry whose name came through this fold
@@ -43,7 +43,7 @@ The `createVirtualSchema` declaration flattens multi-level namespaces into table
 * *AND* the read SHALL happen inline in `handle_create_virtual_schema` alongside the other per-request resolutions and MUST NOT be wrapped in a helper whose whole body forwards the one call
 * *AND* the resolved precision MUST NOT be recorded in `adapterNotes`, persisted, or round-tripped: it is re-derived from the handshake on every request, exactly as the cluster node count is, so a virtual schema created against one engine version and queried after an upgrade declares the upgraded engine's precision on its next `refresh`
 * *AND* the scan UDF entry point MUST NOT read `database_version()`: its `EMITS` types come from the pushdown request's own `dataType` JSON, so a second read there would give one decision two owners
-* *AND* no other per-column behavior SHALL change, the column-name fold, its single owner, the `__`-flattened table name, `TABLE_MAP`, the 404 skip, and every non-timestamp declared type stay byte-identical
+* *AND* no other per-column behavior SHALL change, the column-name fold, its single owner, the `__`-flattened table name, each table's identifier note, the 404 skip, and every non-timestamp declared type stay byte-identical
 
 ### Scenario: A TIMESTAMP(p) column declaration serializes fractionalSecondsPrecision
 

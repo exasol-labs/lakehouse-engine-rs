@@ -1,10 +1,10 @@
 # Feature: Pushdown File Resolution
 
-Resolves a table's identity and current file state once per pushdown, before any SQL is built. The adapter recovers the target table from the involved-table name via the persisted `TABLE_MAP` and passes it to the format reader. The reader returns the data-file list, each file's byte size, the table root, and each file's delete references, so the scan UDF never discovers files, delete files, or sizes itself.
+Resolves a table's identity and current file state once per pushdown, before any SQL is built. The adapter recovers the target table's catalog identifier from the involved table's identifier note (`vs-adapter/create-virtual-schema`) and passes it to the format reader. The reader returns the data-file list, each file's byte size, the table root, and each file's delete references, so the scan UDF never discovers files, delete files, or sizes itself.
 
 ## Background
 
-* The resolve-once orchestration (the `TABLE_MAP` lookup, one resolve, one `ScanSpec` build) is the same for every table format (`file-planning/pushdown-format-neutral-resolution`). Only the reader behind the seam is format-specific. This feature owns the Iceberg reader: the multi-level `TableIdent` build, the snapshot read, each file's byte size from the manifest, and merge-on-read positional-delete and deletion-vector resolution. `delta/delta-table-planning` owns the Delta reader.
+* The resolve-once orchestration (the identifier-note read, one resolve, one `ScanSpec` build) is the same for every table format (`file-planning/pushdown-format-neutral-resolution`). Only the reader behind the seam is format-specific. This feature owns the Iceberg reader: the multi-level `TableIdent` build, the snapshot read, each file's byte size from the manifest, and merge-on-read positional-delete and deletion-vector resolution. `delta/delta-table-planning` owns the Delta reader.
 * The table's logical schema comes from its column notes (`vs-adapter/column-source-notes`), never from the reader. `createVirtualSchema` builds each note from the table's `current_schema()`: the Iceberg field id, the name at that time, the Arrow type, the nullability, and the `initial-default`. Pushdown reads the current schema only to translate the filter for pruning (`file-planning/pushdown-file-pruning`), to refuse a recorded `date` promotion, and to check declared nullability.
 * Each per-shard file entry carries the file path and its byte size. Delete support adds per-file delete references only, with no serialized Iceberg schema and no bound predicate.
 * A `loadTable` response with no table `location` is rejected at the resolve-once seam, above the vended/static storage split, so every path that needs a table root (including each join side) fails identically. The `createVirtualSchema` path reads no location, so the rejection does not apply there.
@@ -20,28 +20,28 @@ Resolves a table's identity and current file state once per pushdown, before any
 
 ### Scenario: Pushdown derives the scanned Iceberg table from the involved virtual table
 
-* *GIVEN* a virtual schema created over a namespace containing multiple Iceberg tables, whose `adapterNotes` carry the `TABLE_MAP` recorded at create time
+* *GIVEN* a virtual schema created over a namespace containing multiple Iceberg tables, each virtual table carrying the identifier note recorded at create or refresh time
 * *AND* a `pushdown` request whose `involvedTables[0].name` is the Exasol (uppercased, `__`-flattened) name of one of those tables
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL read `TABLE_MAP` back from `schemaMetadataInfo.adapterNotes` and look up the involved virtual table name to recover its original-cased fully-qualified Iceberg identifier
+* *THEN* the adapter SHALL read the Iceberg identifier from the `name` member of the involved table's identifier note, `involvedTables[0].adapterNotes`, ignore any other member, and never list the catalog or derive the identifier from the virtual table name
 * *AND* the adapter SHALL resolve the data-file list and build the scan-driving SQL for exactly that one Iceberg table, loading it from the catalog under that identifier
-* *AND* a `pushdown` request whose involved virtual table name is absent from `TABLE_MAP` SHALL fail with an error naming the unknown virtual table, never silently scanning a different or stale table
+* *AND* an involved table without a readable identifier note (absent, not a JSON object, or without a string `name`) SHALL fail the request with an error that names the virtual table and `ALTER VIRTUAL SCHEMA ... REFRESH`, never scanning a different or stale table
 
 ### Scenario: Pushdown resolves the file list once and builds a scan-driving query
 
 * *GIVEN* a virtual schema over a namespace whose tables are backed by SeaweedFS
 * *AND* a query that projects a subset of columns from one of those tables
 * *WHEN* Exasol sends the corresponding `pushdown` request
-* *THEN* the adapter SHALL determine the target Iceberg table from the schema-metadata mapping, resolve that table's Iceberg snapshot, data-file list, and each file's byte size exactly once, and take the table's logical schema from its column notes, carrying, per column, its declared `field_id`, name, Arrow type, nullability, and `initial-default`
+* *THEN* the adapter SHALL determine the target Iceberg table from the involved table's identifier note, resolve that table's Iceberg snapshot, data-file list, and each file's byte size exactly once, and take the table's logical schema from its column notes, carrying, per column, its declared `field_id`, name, Arrow type, nullability, and `initial-default`
 * *AND* the adapter MUST NOT build the logical schema from the table's `current_schema()` at pushdown
 * *AND* the adapter SHALL return a JSON response of type `pushdown` containing SQL that invokes the `LAKEHOUSE_SCAN` SCALAR EMIT UDF, carrying the logical schema AND the table root in the shard-invariant common spec spliced ONCE as the scalar scan's first-argument literal, and the resolved data-file list flowed through the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor as the per-shard argument, where each per-shard entry carries the file path together with its resolved byte size
 * *AND* the outer scalar scan select MUST NOT be wrapped in a `SELECT * FROM (...)` materialization boundary
 * *AND* the adapter MUST NOT require the scan UDF to discover files itself, and MUST NOT require the scan UDF to re-fetch any file's size
-* *AND* the resolve-once orchestration this scenario describes, `TABLE_MAP` lookup, one resolve, one `ScanSpec` build, SHALL be reached identically by every table format, with the format reader supplying the file list, byte sizes, and table root, and the column notes supplying the logical schema (`file-planning/pushdown-format-neutral-resolution`); only the reader behind the seam is format-specific
+* *AND* the resolve-once orchestration this scenario describes, identifier-note read, one resolve, one `ScanSpec` build, SHALL be reached identically by every table format, with the format reader supplying the file list, byte sizes, and table root, and the column notes supplying the logical schema (`file-planning/pushdown-format-neutral-resolution`); only the reader behind the seam is format-specific
 
 ### Scenario: Pushdown resolves multi-level namespace identifiers into the iceberg TableIdent
 
-* *GIVEN* a `TABLE_MAP` entry whose value is a multi-level Iceberg identifier such as `prod.finance.orders`
+* *GIVEN* an identifier note whose `name` member is a multi-level Iceberg identifier such as `prod.finance.orders`
 * *WHEN* the adapter resolves that identifier to load the table from the catalog
 * *THEN* the adapter SHALL split the identifier into all namespace segments and the trailing table name, building the iceberg `TableIdent` from a multi-segment `NamespaceIdent` rather than treating only the first segment as the namespace
 * *AND* both the SigV4-signed and the unsigned catalog paths SHALL build the identifier the same way so multi-level namespaces load correctly under either path

@@ -32,7 +32,7 @@ One renderer serves every inner equi-join outside the two-table broadcast contra
 * *THEN* the adapter SHALL NOT emit a broadcast plan for that request
 * *AND* the adapter SHALL instead render the request through the SINGLE unified unaccelerated per-table-scan fallback (N ≥ 2 involved tables, the two-table case being N = 2), so Exasol's core engine produces the correct result
 * *AND* spanning more than two involved tables, or having overlapping column names, or needing Exasol postprocessing SHALL by itself NEVER be a reason to return an error, every such inner join is served by the unified fallback
-* *AND* the adapter SHALL return a HARD error, a client-facing `F-UDF-CL-RUST-9001`, NOT a request that Exasol retries natively (Exasol does not re-plan on an adapter error), ONLY when it genuinely cannot render what it advertised: a non-inner join node in the tree, an involved table absent from `TABLE_MAP` or carrying no column metadata, or a condition/clause the translator cannot render at all
+* *AND* the adapter SHALL return a HARD error, a client-facing `F-UDF-CL-RUST-9001`, NOT a request that Exasol retries natively (Exasol does not re-plan on an adapter error), ONLY when it genuinely cannot render what it advertised: a non-inner join node in the tree, an involved table carrying no readable identifier note or no column metadata, or a condition/clause the translator cannot render at all
 * *AND* the adapter MUST NOT emit any scan spec that would compute a different result than single-node evaluation
 
 ### Scenario: A three-or-more-table inner join falls back to an N-scan unaccelerated wrapper
@@ -128,3 +128,11 @@ One renderer serves every inner equi-join outside the two-table broadcast contra
 * *GIVEN* a pushdown request through this feature's path
 * *WHEN* the adapter generates the pushdown SQL
 * *THEN* the credential-reference guarantee of `storage-access/scan-spec-credential-reference` SHALL apply, so no credential value appears in generated SQL or error messages
+
+### Scenario: Each join leg resolves its catalog identifier from its own identifier note
+
+* *GIVEN* a join `pushdown` request whose `involvedTables` carries `CUSTOMER` and `ORDERS`, whose identifier notes name `lh.customer` and `lh.orders`
+* *WHEN* the adapter plans the join
+* *THEN* each leg SHALL take its catalog identifier from the identifier note of the `involvedTables` entry whose `name` equals the leg's table name
+* *AND* every leg of a self-join, for which Exasol lists the table once per leg, SHALL resolve to the same catalog identifier
+* *AND* a leg without a readable identifier note SHALL fail the request with the error of `file-planning/pushdown-planning-file-resolution`, and the adapter MUST NOT plan the join as a different shape

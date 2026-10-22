@@ -5,8 +5,8 @@ Enumerates a Unity Catalog namespace during createVirtualSchema and returns one 
 ## Background
 
 * The configured namespace is the `catalog.schema` in the `NAMESPACE` virtual-schema property, dot-split into segments. The adapter calls the shared list operation on the Unity Catalog client, and the pipeline that consumes the result reads neutral table metadata without knowing how each client sourced its columns.
-* Every listed table's column metadata and `properties` come from the single paginated `GET /tables` list sweep. The client issues no per-table `GET /tables/{full_name}`, so enumerating a schema costs one paginated sweep.
-* An Exasol table name is the namespace segments below the configured namespace plus the table name, joined with `__` and uppercased through the one case-fold site the Iceberg path also uses. The map from Exasol name to Unity Catalog identifier is recorded in `adapterNotes.TABLE_MAP`.
+* Every listed table's column metadata and `properties` come from the single paginated `GET /tables` list sweep. During the full listing the client issues no per-table `GET /tables/{full_name}`, so enumerating a schema costs one paginated sweep.
+* An Exasol table name is the namespace segments below the configured namespace plus the table name, joined with `__` and uppercased through the one case-fold site the Iceberg path also uses. The adapter records each virtual table's catalog identifier in that table's identifier note per `vs-adapter/create-virtual-schema`.
 * Unity Catalog reports a column's Spark type in `type_json`. Real Unity clients leave `type_precision` and `type_scale` unset. The neutral column carries `type_json` verbatim, and the adapter's single type-mapping home parses it. A column whose type has no clean scalar Exasol equivalent, or whose `type_json` is absent or unparseable, is declared `VARCHAR(2000000)` instead of failing the enumeration.
 * The Unity Catalog client makes the admission decision (`unity-catalog/unity-catalog-client`) and routes every excluded entry into `CatalogListing.skipped`. The shared `build_listing_virtual_tables` pipeline stays kind-agnostic. The shared skip-warn loop writes one `udf_log!(ctx, warn, ...)` line per skipped entry from the neutral skip reason.
 * A Delta table and a Parquet table declare their columns identically from the Unity Catalog column types. Each column's note (`vs-adapter/column-source-notes`) records its `type_json`, and for a Delta table also the column-mapping mode read from the table's `properties`.
@@ -23,7 +23,7 @@ Enumerates a Unity Catalog namespace during createVirtualSchema and returns one 
 * *WHEN* Exasol sends the createVirtualSchema request
 * *THEN* the adapter SHALL list every table in that schema by calling the shared `CatalogClient` list operation on the constructed Unity Catalog client, and SHALL return one virtual table per listed PLANNABLE BASE table: an entry whose `table_type` is `MANAGED` or `EXTERNAL` AND whose `data_source_format` is `DELTA` or `PARQUET`
 * *AND* a `PARQUET` table SHALL declare every column Unity Catalog lists for it, its partition columns included, in the catalog's column order and mapped through the same type-mapping home as a Delta table's columns
-* *AND* the adapter SHALL exclude from the returned virtual tables every other listed entry (a view, a base table whose `data_source_format` is neither `DELTA` nor `PARQUET`, or an entry of any other `table_type`), and MUST NOT record an excluded entry in `TABLE_MAP`, so no unplannable entry becomes a queryable virtual table
+* *AND* the adapter SHALL exclude from the returned virtual tables every other listed entry (a view, a base table whose `data_source_format` is neither `DELTA` nor `PARQUET`, or an entry of any other `table_type`), so no identifier note is recorded for an excluded entry and no unplannable entry becomes a queryable virtual table
 
 ### Scenario: Enumeration names tables through the shared fold and stops at catalog metadata
 
@@ -39,13 +39,13 @@ Enumerates a Unity Catalog namespace during createVirtualSchema and returns one 
 * *WHEN* the adapter enumerates that namespace during createVirtualSchema
 * *THEN* the adapter SHALL return a virtual table for each of the three entries, because each satisfies the Delta-base rule
 * *AND* the adapter SHALL apply NO shallow-clone-specific handling, because a shallow clone is admitted by the same `table_type` and `data_source_format` rule as any other base table
-* *AND* each returned virtual table SHALL carry its columns mapped to Exasol types exactly as any Delta base table, and SHALL appear in `TABLE_MAP`
+* *AND* each returned virtual table SHALL carry its columns mapped to Exasol types exactly as any Delta base table, and SHALL carry its catalog identifier in the `name` member of its identifier note
 
 ### Scenario: Both catalog kinds enumerate through one shared listing pipeline
 
 * *GIVEN* one createVirtualSchema request resolving `CatalogKind::UnityCatalogNative` and one resolving `CatalogKind::IcebergRest`, each over a namespace holding the same table names with the same column names
 * *WHEN* the adapter handles each request
-* *THEN* the adapter SHALL run the SAME listing pipeline for both, one code path that reads neutral table metadata through the shared trait, flattens and case-folds names, maps each column through the single type-mapping home, builds `TABLE_MAP`, and assembles the response
+* *THEN* the adapter SHALL run the SAME listing pipeline for both, one code path that reads neutral table metadata through the shared trait, flattens and case-folds names, maps each column through the single type-mapping home, records each table's identifier note, and assembles the response
 * *AND* that pipeline MUST NOT name or match `CatalogKind` and MUST NOT branch on which client it holds, so the flattening rule, the collision rule, the case-fold, and the `adapterNotes` shape are provably identical across the two kinds rather than identical by coincidence
 * *AND* each client SHALL remain free to source its columns its own way, the Unity Catalog client from its single inline sweep, the Iceberg REST client from its per-table load, because that choice is hidden inside the client and never reaches the pipeline
 
@@ -60,10 +60,10 @@ Enumerates a Unity Catalog namespace during createVirtualSchema and returns one 
 
 * *GIVEN* a Unity Catalog namespace whose `GET /tables` list sweep returns three entries: a `VIEW` entry carrying columns, no `storage_location`, and a null `data_source_format`, a `MANAGED` entry whose `data_source_format` is neither `DELTA` nor `PARQUET` (such as `ICEBERG`, `CSV`, or `JSON`), and an entry whose `table_type` is neither `MANAGED`, `EXTERNAL`, nor `VIEW`
 * *WHEN* the adapter enumerates that namespace during createVirtualSchema
-* *THEN* the adapter SHALL exclude all three entries from the returned virtual tables and from `TABLE_MAP`, and SHALL complete createVirtualSchema successfully with only the plannable base tables in the namespace
+* *THEN* the adapter SHALL exclude all three entries from the returned virtual tables, so no identifier note is recorded for them, and SHALL complete createVirtualSchema successfully with only the plannable base tables in the namespace
 * *AND* the adapter SHALL write one `udf_log!(ctx, warn, ...)` line per excluded entry naming the excluded `catalog.schema.table` identifier and the disqualifying reason: the entry's `table_type` for a view or other-type entry, or its `data_source_format` for an unplannable base table
 * *AND* none of those warning lines MUST contain the resolved bearer token, any OAuth client secret, or any other credential value
-* *AND* a namespace whose every listed entry is excluded SHALL yield a createVirtualSchema response with an empty table list and an empty `TABLE_MAP`, rather than an error
+* *AND* a namespace whose every listed entry is excluded SHALL yield a createVirtualSchema response with an empty table list, rather than an error
 
 ### Scenario: Unity Catalog Spark column types map to Exasol types sufficient for listing
 
@@ -85,17 +85,16 @@ Enumerates a Unity Catalog namespace during createVirtualSchema and returns one 
 * *AND* the adapter MUST NOT declare an Exasol type Exasol rejects, in particular MUST NOT declare `DECIMAL(0,0)` or a `DECIMAL(p,s)` with `s > p`, because such a declaration fails `createVirtualSchema` outright, which is the failure this VARCHAR fallback exists to prevent
 * *AND* the adapter SHALL treat this listing-sufficient mapping as a deliberate boundary, deferring reader-feature gating and full Delta type fidelity to the pushdown gate (`delta/delta-reader-feature-gating`), so the listing never produces an untyped or silently-dropped column
 
-### Scenario: Create virtual schema records the Exasol-name to Unity-Catalog-identifier map in adapterNotes
-
-* *GIVEN* a createVirtualSchema request under the Unity Catalog kind that enumerates one or more tables
-* *WHEN* the adapter builds the createVirtualSchema response
-* *THEN* the adapter SHALL record, inside the response `adapterNotes` `TABLE_MAP`, a mapping from each uppercased flattened Exasol table name to its original-cased fully-qualified `catalog.schema.table` identifier
-* *AND* when two distinct Unity Catalog identifiers flatten to the same Exasol name the adapter SHALL return an error naming the colliding Exasol table name rather than dropping or overwriting a table
-* *AND* the adapter MUST NOT persist the map anywhere other than the returned `adapterNotes`
-
 ### Scenario: Create virtual schema fails clearly when the Unity Catalog is unreachable
 
 * *GIVEN* a createVirtualSchema request under the Unity Catalog kind whose CONNECTION address cannot be reached or whose namespace cannot be listed
 * *WHEN* Exasol sends the createVirtualSchema request
 * *THEN* the adapter SHALL return an error describing that the Unity Catalog could not be reached or the namespace could not be listed
 * *AND* the error message MUST NOT contain the resolved bearer token, any OAuth client secret, or any other credential value
+
+### Scenario: Create virtual schema records each table's Unity Catalog identifier in its identifier note
+
+* *GIVEN* a createVirtualSchema request under the Unity Catalog kind that enumerates one or more tables
+* *WHEN* the adapter builds the createVirtualSchema response
+* *THEN* each virtual table's identifier note SHALL name the table's original-cased `catalog.schema.table` identifier
+* *AND* when two distinct Unity Catalog identifiers flatten to the same Exasol name, the adapter SHALL return an error naming that Exasol name rather than dropping or overwriting a table
