@@ -2,7 +2,7 @@
 //! dropping its `lib.rs` re-export, fails to compile.
 #![allow(unused_imports)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 

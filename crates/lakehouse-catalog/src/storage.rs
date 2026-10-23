@@ -36,6 +36,11 @@ impl std::fmt::Debug for AdlsCred {
 /// resolve a malformed credentials payload to whichever variant happens to parse.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(
+    test,
+    derive(strum::EnumDiscriminants),
+    strum_discriminants(derive(strum::EnumIter, Hash))
+)]
 pub enum StorageBackend {
     S3(StorageProps),
     Adls {

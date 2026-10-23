@@ -147,6 +147,33 @@ fn variant_selected_from_location_scheme() {
     }
 }
 
+/// A new `StorageBackend` variant fails this test until some Unity vended scheme builds it.
+#[test]
+fn every_storage_backend_variant_is_built_from_a_unity_vended_scheme() {
+    use crate::storage::StorageBackendDiscriminants;
+    use strum::IntoEnumIterator;
+
+    let built: std::collections::HashSet<_> = [
+        "s3://bucket/tbl",
+        "s3a://bucket/tbl",
+        "abfs://c@acct.dfs.core.windows.net/p",
+        "abfss://c@acct.dfs.core.windows.net/p",
+    ]
+    .iter()
+    .map(|location| {
+        let backend = resolve_uc_vended_storage(
+            &both_families(),
+            location,
+            true,
+            &StaticStoreAddress::default(),
+        )
+        .unwrap_or_else(|e| panic!("{location} must resolve a backend: {e:?}"));
+        StorageBackendDiscriminants::from(&backend)
+    })
+    .collect();
+    assert_eq!(built, StorageBackendDiscriminants::iter().collect());
+}
+
 #[test]
 fn unsupported_scheme_is_error() {
     let response = TemporaryTableCredentials {
