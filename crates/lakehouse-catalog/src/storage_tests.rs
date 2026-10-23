@@ -101,6 +101,50 @@ fn addresses_scheme_rejects_an_unrelated_scheme_for_either_backend() {
     assert!(!adls.addresses_scheme("gs"));
 }
 
+/// No wildcard arm: a new `StorageBackend` variant fails this build until a vended kind selects
+/// it, because `classify_vended_scheme` matches a scheme string and needs a catch-all.
+#[test]
+fn every_storage_backend_variant_has_a_vended_kind() {
+    fn vended_kind_of(backend: &StorageBackend) -> VendedBackendKind {
+        match backend {
+            StorageBackend::S3(_) => VendedBackendKind::S3,
+            StorageBackend::Adls { .. } => VendedBackendKind::Adls,
+        }
+    }
+    let adls = StorageBackend::Adls {
+        account_name: "acct".into(),
+        cred: AdlsCred::AccountKey("key".into()),
+    };
+
+    assert!(matches!(
+        vended_kind_of(&StorageBackend::S3(StorageProps::default())),
+        VendedBackendKind::S3
+    ));
+    assert!(matches!(vended_kind_of(&adls), VendedBackendKind::Adls));
+}
+
+#[test]
+fn classify_vended_scheme_maps_exactly_the_four_accepted_schemes() {
+    for scheme in ["s3", "s3a"] {
+        assert!(matches!(
+            classify_vended_scheme(scheme),
+            Some(VendedBackendKind::S3)
+        ));
+    }
+    for scheme in ["abfs", "abfss"] {
+        assert!(matches!(
+            classify_vended_scheme(scheme),
+            Some(VendedBackendKind::Adls)
+        ));
+    }
+    for scheme in ["gs", "https", "file", ""] {
+        assert!(
+            classify_vended_scheme(scheme).is_none(),
+            "{scheme:?} must select no backend"
+        );
+    }
+}
+
 #[test]
 fn catalog_storage_props_emits_a_present_but_empty_session_token() {
     let backend = StorageBackend::S3(StorageProps {
