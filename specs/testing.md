@@ -102,7 +102,7 @@ This file holds the rules for how this repository tests its behavior and how it 
 - A test whose assertion a change makes false is deleted together with its section banner and its test-only imports.
 - When code moves to another crate, its test module moves with it and keeps every test name and expected value. A test of a property of the code left behind stays with that code. A helper that several test modules share is declared once in the crate's `#[cfg(test)]` support module. No test is deleted, disabled, or weakened to fit a visibility change.
 - A test-only helper that unwraps a production type's private payload is declared in its crate's `#[cfg(test)]` support module and is never `pub`.
-- A structural contract that no runtime test can observe is pinned by a compile-time test that stays intact and unweakened. `capabilities_are_assembled_without_the_catalog_kind` pins that the capability set takes no catalog-kind input, and `crates/lakehouse-engine/tests/it/catalog_session_signatures.rs` pins that the Iceberg scan source carries a shared `CatalogSession`.
+- A structural contract that no runtime test can observe is pinned by a compile-time test that stays intact and unweakened. Examples are the contracts that the capability set takes no catalog-kind input, and that the Iceberg scan source carries a shared `CatalogSession`.
 
 ### Fixtures
 
