@@ -33,6 +33,4 @@ rustls  = { workspace = true }
 aws-sdk-sts = { workspace = true }
 
 [dev-dependencies]
-# Lists `StorageBackend` variants for a test; derived under cfg(test) only.
-strum = { version = "0.28", features = ["derive"] }
 tokio = { workspace = true }

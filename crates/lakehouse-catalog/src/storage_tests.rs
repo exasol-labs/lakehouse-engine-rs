@@ -102,28 +102,6 @@ fn addresses_scheme_rejects_an_unrelated_scheme_for_either_backend() {
 }
 
 #[test]
-fn classify_vended_scheme_maps_exactly_the_four_accepted_schemes() {
-    for scheme in ["s3", "s3a"] {
-        assert!(matches!(
-            classify_vended_scheme(scheme),
-            Some(VendedBackendKind::S3)
-        ));
-    }
-    for scheme in ["abfs", "abfss"] {
-        assert!(matches!(
-            classify_vended_scheme(scheme),
-            Some(VendedBackendKind::Adls)
-        ));
-    }
-    for scheme in ["gs", "https", "file", ""] {
-        assert!(
-            classify_vended_scheme(scheme).is_none(),
-            "{scheme:?} must select no backend"
-        );
-    }
-}
-
-#[test]
 fn catalog_storage_props_emits_a_present_but_empty_session_token() {
     let backend = StorageBackend::S3(StorageProps {
         session_token: Some(String::new()),

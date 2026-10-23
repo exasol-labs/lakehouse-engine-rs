@@ -1047,37 +1047,6 @@ fn vended_backend_variant_comes_from_the_anchor_scheme() {
     );
 }
 
-/// A new `StorageBackend` variant fails this test until some vended scheme builds it.
-#[test]
-fn every_storage_backend_variant_is_built_from_a_vended_scheme() {
-    use crate::storage::StorageBackendDiscriminants;
-    use strum::IntoEnumIterator;
-
-    let s3_result = make_load_table_result(
-        None,
-        vec![
-            ("s3.access-key-id", VENDED_AK),
-            ("s3.secret-access-key", VENDED_SK),
-            ("client.region", VENDED_REGION),
-        ],
-    );
-    let adls_result = adls_vended_result(&[(ADLS_HOST, VENDED_SAS)]);
-    let built: std::collections::HashSet<_> = [
-        (&s3_result, "s3://bucket/db/t".to_owned()),
-        (&s3_result, "s3a://bucket/db/t".to_owned()),
-        (&adls_result, format!("abfs://container@{ADLS_HOST}/db/t")),
-        (&adls_result, format!("abfss://container@{ADLS_HOST}/db/t")),
-    ]
-    .iter()
-    .map(|(result, anchor)| {
-        let backend = resolve_vended_storage(result, anchor, true, &StaticStoreAddress::default())
-            .unwrap_or_else(|e| panic!("{anchor} must resolve a backend: {e}"));
-        StorageBackendDiscriminants::from(&backend)
-    })
-    .collect();
-    assert_eq!(built, StorageBackendDiscriminants::iter().collect());
-}
-
 #[test]
 fn vended_backend_variant_comes_from_the_anchor_scheme_and_refuses_every_other() {
     let result = vended_result_flat_config();

@@ -2,7 +2,7 @@
 //! dropping its `lib.rs` re-export, fails to compile.
 #![allow(unused_imports)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -558,6 +558,84 @@ fn declaration_body<'a>(source: &'a str, declaration: &str) -> &'a str {
         panic!("failed to find the matching closing brace for `{declaration}`'s body")
     });
     &source[body_start..body_end]
+}
+
+fn enum_variant_names<'a>(source: &'a str, enum_name: &str) -> Vec<&'a str> {
+    let body = declaration_body(source, &format!("enum {enum_name}"));
+
+    let variant_names: Vec<&str> = body
+        .lines()
+        .map(|line| line.split("///").next().unwrap_or(line).trim())
+        .filter_map(|code| {
+            let name = code
+                .split(['(', '{', ','])
+                .next()
+                .map(str::trim)
+                .unwrap_or("");
+            let is_variant_declaration =
+                !name.is_empty() && name.chars().next().is_some_and(char::is_uppercase);
+            is_variant_declaration.then_some(name)
+        })
+        .collect();
+
+    assert!(
+        !variant_names.is_empty(),
+        "extracted no variant names from `enum {enum_name}`'s body — the probe's own \
+         parsing is broken, not just failing to find a match"
+    );
+    variant_names
+}
+
+#[test]
+fn shared_vended_home_constructs_every_storage_backend_variant() {
+    let storage = source("storage.rs");
+    let code = production_code(storage);
+
+    for variant in enum_variant_names(storage, "StorageBackend") {
+        let constructed = format!("StorageBackend::{variant}");
+        assert!(
+            code.contains(&constructed),
+            "storage.rs's PRODUCTION code must construct `{constructed}` — the shared vended \
+             home builds every backend variant, and a variant named only in a comment or only \
+             inside `#[cfg(test)]` does not satisfy that"
+        );
+    }
+}
+
+#[test]
+fn each_vended_selector_dispatches_every_vended_backend_kind() {
+    let kinds = enum_variant_names(source("storage.rs"), "VendedBackendKind");
+
+    for selector in ["vended.rs", "unity/vended.rs"] {
+        let code = production_code(source(selector));
+        for kind in &kinds {
+            let dispatched = format!("VendedBackendKind::{kind}");
+            assert!(
+                code.contains(&dispatched),
+                "{selector}'s PRODUCTION code must dispatch on `{dispatched}` before calling \
+                 the shared home, but that literal appears in no code line outside \
+                 `#[cfg(test)]`"
+            );
+        }
+    }
+}
+
+#[test]
+fn vended_kind_and_storage_backend_variant_sets_are_equal() {
+    let storage = source("storage.rs");
+    let variants: BTreeSet<&str> = enum_variant_names(storage, "StorageBackend")
+        .into_iter()
+        .collect();
+    let kinds: BTreeSet<&str> = enum_variant_names(storage, "VendedBackendKind")
+        .into_iter()
+        .collect();
+
+    assert_eq!(
+        variants, kinds,
+        "`StorageBackend`'s variant names and `VendedBackendKind`'s must be the same set — a \
+         kind with no variant dispatches nowhere, and a variant with no kind is unreachable \
+         from a vended location's scheme"
+    );
 }
 
 fn static_store_address_field_declarations() -> Vec<&'static str> {
