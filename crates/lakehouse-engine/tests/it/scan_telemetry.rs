@@ -128,9 +128,9 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 #[test]
 fn telemetry_silent_at_default_level() {
     let _g = lock();
-    let dir = std::env::temp_dir().join(format!("lh_telem_silent_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let spec = scan_spec(write_local_parquet(&dir, 200, 64));
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let spec = scan_spec(write_local_parquet(dir, 200, 64));
 
     clear_telemetry_file();
     let ctx = block_on(run_scan(&spec, tracing::Level::INFO));
@@ -140,16 +140,14 @@ fn telemetry_silent_at_default_level() {
         telemetry_lines().is_empty(),
         "no telemetry must be emitted at the default (info) level"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn telemetry_reports_three_phases_when_enabled() {
     let _g = lock();
-    let dir = std::env::temp_dir().join(format!("lh_telem_three_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let spec = scan_spec(write_local_parquet(&dir, 200, 64));
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let spec = scan_spec(write_local_parquet(dir, 200, 64));
 
     clear_telemetry_file();
     let ctx = block_on(run_scan(&spec, tracing::Level::DEBUG));
@@ -180,16 +178,14 @@ fn telemetry_reports_three_phases_when_enabled() {
         (body - summed).abs() < 5.0 || summed <= body,
         "startup+import+emit ({summed:.3}ms) must account for body ({body:.3}ms)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn telemetry_attributes_import_separately_from_emit() {
     let _g = lock();
-    let dir = std::env::temp_dir().join(format!("lh_telem_split_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let spec = scan_spec(write_local_parquet(&dir, 1000, 32));
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let spec = scan_spec(write_local_parquet(dir, 1000, 32));
 
     clear_telemetry_file();
     let ctx = block_on(run_scan(&spec, tracing::Level::DEBUG));
@@ -209,16 +205,14 @@ fn telemetry_attributes_import_separately_from_emit() {
         import + emit > 0.0,
         "import+emit must capture measurable streaming time: import={import} emit={emit}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn telemetry_failure_never_fails_scan() {
     let _g = lock();
-    let dir = std::env::temp_dir().join(format!("lh_telem_fail_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let spec = scan_spec(write_local_parquet(&dir, 200, 64));
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let spec = scan_spec(write_local_parquet(dir, 200, 64));
 
     // A directory at the telemetry path makes the append open() fail.
     clear_telemetry_file();
@@ -247,5 +241,4 @@ fn telemetry_failure_never_fails_scan() {
     assert_eq!(ctx.total_rows(), 200, "all rows must still be emitted");
 
     let _ = std::fs::remove_dir(&sink_path);
-    let _ = std::fs::remove_dir_all(&dir);
 }

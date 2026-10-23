@@ -544,9 +544,9 @@ fn rows_of(batches: &[RecordBatch]) -> Vec<(i64, String)> {
 
 #[test]
 fn scan_uses_spec_size_and_issues_no_head() {
-    let dir = std::env::temp_dir().join(format!("lh_no_head_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let file_url = write_local_parquet(&dir, "size_data.parquet", 200);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let file_url = write_local_parquet(dir, "size_data.parquet", 200);
     let real_size = std::fs::metadata(file_url.strip_prefix("file://").unwrap())
         .expect("stat parquet")
         .len();
@@ -604,19 +604,17 @@ fn scan_uses_spec_size_and_issues_no_head() {
         spec_rows, discovered_rows,
         "spec-size scan must return rows identical to the discovery-based scan"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn relative_and_absolute_entries_resolve_to_same_files() {
-    let dir = std::env::temp_dir().join(format!("lh_rel_abs_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let abs_url = write_local_parquet(&dir, "data/f.parquet", 150);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let abs_url = write_local_parquet(dir, "data/f.parquet", 150);
     let real_size = std::fs::metadata(abs_url.strip_prefix("file://").unwrap())
         .expect("stat parquet")
         .len();
-    let table_root = url::Url::from_file_path(&dir).expect("dir url").to_string();
+    let table_root = url::Url::from_file_path(dir).expect("dir url").to_string();
 
     let abs_spec = raw_spec(vec![(abs_url.clone(), real_size)], String::new());
     let rel_spec = raw_spec(
@@ -649,19 +647,17 @@ fn relative_and_absolute_entries_resolve_to_same_files() {
         rel_rows, abs_rows,
         "relative-entry + table_root scan must return the same rows as the absolute-entry scan"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn scan_issues_no_head_for_delete_files() {
-    let dir = std::env::temp_dir().join(format!("lh_no_head_del_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let data_url = write_local_parquet(&dir, "data.parquet", 40);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_local_parquet(dir, "data.parquet", 40);
     let data_size = std::fs::metadata(data_url.strip_prefix("file://").unwrap())
         .expect("stat data parquet")
         .len();
-    let delete_url = write_delete_parquet(&dir, "deletes.parquet", &[(&data_url, 3)]);
+    let delete_url = write_delete_parquet(dir, "deletes.parquet", &[(&data_url, 3)]);
     let delete_size = std::fs::metadata(delete_url.strip_prefix("file://").unwrap())
         .expect("stat delete parquet")
         .len();
@@ -701,24 +697,22 @@ fn scan_issues_no_head_for_delete_files() {
         delete_head_calls, 0,
         "the positional-delete file must never receive an object-store HEAD: {recorded:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn scan_reads_footer_via_range_get_once() {
-    let dir = std::env::temp_dir().join(format!("lh_footer_once_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let baseline_url = write_local_parquet(&dir, "baseline/data.parquet", 200);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let baseline_url = write_local_parquet(dir, "baseline/data.parquet", 200);
     let baseline_size = std::fs::metadata(baseline_url.strip_prefix("file://").unwrap())
         .expect("stat baseline parquet")
         .len();
-    let delta_url = write_local_parquet(&dir, "delta/data.parquet", 200);
+    let delta_url = write_local_parquet(dir, "delta/data.parquet", 200);
     let delta_size = std::fs::metadata(delta_url.strip_prefix("file://").unwrap())
         .expect("stat delta parquet")
         .len();
     // One deleted position, so every row group is still opened as in the baseline.
-    let delete_url = write_delete_parquet(&dir, "delta/deletes.parquet", &[(&delta_url, 5)]);
+    let delete_url = write_delete_parquet(dir, "delta/deletes.parquet", &[(&delta_url, 5)]);
     let delete_size = std::fs::metadata(delete_url.strip_prefix("file://").unwrap())
         .expect("stat delete parquet")
         .len();
@@ -786,20 +780,18 @@ fn scan_reads_footer_via_range_get_once() {
         "attaching a positional delete must not add any extra GET against the data file's own \
          footer/content (shared FileMetadataCache => footer parsed once): baseline={baseline_data_calls:?} delta={delta_data_calls:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn scan_access_plan_footer_fetch_is_one_range_get() {
     // More than one request means Phase B lost the metadata size hint or `PageIndexPolicy::Skip`.
-    let dir = std::env::temp_dir().join(format!("lh_access_plan_footer_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let data_url = write_local_parquet(&dir, "data.parquet", 200);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_local_parquet(dir, "data.parquet", 200);
     let data_size = std::fs::metadata(data_url.strip_prefix("file://").unwrap())
         .expect("stat data parquet")
         .len();
-    let delete_url = write_delete_parquet(&dir, "deletes.parquet", &[(&data_url, 5)]);
+    let delete_url = write_delete_parquet(dir, "deletes.parquet", &[(&data_url, 5)]);
     let delete_size = std::fs::metadata(delete_url.strip_prefix("file://").unwrap())
         .expect("stat delete parquet")
         .len();
@@ -874,8 +866,6 @@ fn scan_access_plan_footer_fetch_is_one_range_get() {
         }
         other => panic!("expected a bounded suffix range for the footer fetch, got {other:?}"),
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -893,8 +883,8 @@ fn scan_footer_reuse_holds_at_shard_scale() {
     const BAND_LOW_PERCENT: usize = 70;
     const BAND_HIGH_PERCENT: usize = 90;
 
-    let dir = std::env::temp_dir().join(format!("lh_footer_shard_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
 
     let stat = |url: &str| {
         std::fs::metadata(url.strip_prefix("file://").unwrap())
@@ -906,7 +896,7 @@ fn scan_footer_reuse_holds_at_shard_scale() {
     let mut delete_files: Vec<(String, u64)> = Vec::with_capacity(SHARD_FILE_COUNT);
     for i in 0..SHARD_FILE_COUNT {
         let data_url = write_wide_local_parquet(
-            &dir,
+            dir,
             &format!("data/f{i}.parquet"),
             COLUMNS,
             ROW_GROUPS,
@@ -914,7 +904,7 @@ fn scan_footer_reuse_holds_at_shard_scale() {
         );
         // One position only, so no row group is fully deleted and both runs open every group.
         let delete_url =
-            write_delete_parquet(&dir, &format!("deletes/d{i}.parquet"), &[(&data_url, 0)]);
+            write_delete_parquet(dir, &format!("deletes/d{i}.parquet"), &[(&data_url, 0)]);
         data_files.push((data_url.clone(), stat(&data_url)));
         delete_files.push((delete_url.clone(), stat(&delete_url)));
     }
@@ -1031,6 +1021,4 @@ fn scan_footer_reuse_holds_at_shard_scale() {
          Re-calibrate COLUMNS / ROW_GROUPS / SHARD_FILE_COUNT against a fresh `list_entries()` \
          measurement and record the new numbers in decision-log [6]"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -299,13 +299,13 @@ fn run_all_rows(specs: &[ScanSpec], emits: &[ExaType], built: &AtomicUsize) -> V
 
 #[test]
 fn per_row_calls_emit_union_of_all_shards() {
-    let dir = std::env::temp_dir().join(format!("lh_perrow_multi_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
 
     let specs = vec![
-        spec_for_file(write_parquet_ids(&dir, "f0.parquet", 0, 10)),
-        spec_for_file(write_parquet_ids(&dir, "f1.parquet", 100, 10)),
-        spec_for_file(write_parquet_ids(&dir, "f2.parquet", 200, 10)),
+        spec_for_file(write_parquet_ids(dir, "f0.parquet", 0, 10)),
+        spec_for_file(write_parquet_ids(dir, "f1.parquet", 100, 10)),
+        spec_for_file(write_parquet_ids(dir, "f2.parquet", 200, 10)),
     ];
 
     let built = AtomicUsize::new(0);
@@ -324,19 +324,17 @@ fn per_row_calls_emit_union_of_all_shards() {
         expected,
         "emitted ids must be the UNION of every per-row call's file contents"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn run_scan_one_builds_and_tears_down_runtime_per_call() {
-    let dir = std::env::temp_dir().join(format!("lh_perrow_rt_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
 
     let specs = vec![
-        spec_for_file(write_parquet_ids(&dir, "r0.parquet", 0, 10)),
-        spec_for_file(write_parquet_ids(&dir, "r1.parquet", 50, 10)),
-        spec_for_file(write_parquet_ids(&dir, "r2.parquet", 100, 10)),
+        spec_for_file(write_parquet_ids(dir, "r0.parquet", 0, 10)),
+        spec_for_file(write_parquet_ids(dir, "r1.parquet", 50, 10)),
+        spec_for_file(write_parquet_ids(dir, "r2.parquet", 100, 10)),
     ];
 
     let built = AtomicUsize::new(0);
@@ -354,15 +352,13 @@ fn run_scan_one_builds_and_tears_down_runtime_per_call() {
         "every per-row call scans its shard even though its runtime is torn down \
          before the next call builds a fresh one"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn single_row_call_is_byte_identical_to_direct_raw_scan() {
-    let dir = std::env::temp_dir().join(format!("lh_perrow_single_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let spec = spec_for_file(write_parquet_ids(&dir, "only.parquet", 0, 200));
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let spec = spec_for_file(write_parquet_ids(dir, "only.parquet", 0, 200));
 
     let built = AtomicUsize::new(0);
     let per_row = run_one_row(&spec, &id_name_emits(), &built);
@@ -397,17 +393,15 @@ fn single_row_call_is_byte_identical_to_direct_raw_scan() {
         "a single per-row call must emit rows byte-for-byte identical to the direct \
          raw-scan path"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn distinct_row_scan_streams_one_row_per_distinct_value() {
-    let dir = std::env::temp_dir().join(format!("lh_distinct_row_scan_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
 
     let values = ["a", "b", "a", "c", "b", "a", "c", "b", "a", "c"];
-    let file_url = write_parquet_categories(&dir, "categories.parquet", &values);
+    let file_url = write_parquet_categories(dir, "categories.parquet", &values);
     let spec = distinct_spec_for_file(file_url);
 
     let built = AtomicUsize::new(0);
@@ -424,16 +418,14 @@ fn distinct_row_scan_streams_one_row_per_distinct_value() {
         vec!["a".to_string(), "b".to_string(), "c".to_string()],
         "emitted rows must be exactly the distinct value set, no duplicates"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn raw_scan_coerces_every_column_to_its_declared_output_type() {
-    let dir = std::env::temp_dir().join(format!("lh_emit_coercion_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
 
-    let spec = spec_for_file(write_parquet_ids(&dir, "coerce.parquet", 0, 10));
+    let spec = spec_for_file(write_parquet_ids(dir, "coerce.parquet", 0, 10));
     let built = AtomicUsize::new(0);
     let emitted = run_one_row(&spec, &id_name_emits(), &built);
 
@@ -461,15 +453,13 @@ fn raw_scan_coerces_every_column_to_its_declared_output_type() {
         (0..10).collect::<Vec<i64>>(),
         "the ID values must round-trip through the cast unchanged"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn rendered_nested_column_passes_the_emit_coercion_unchanged() {
-    let dir = std::env::temp_dir().join(format!("lh_emit_nested_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let file_url = write_parquet_tags(&dir, "tags.parquet");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let file_url = write_parquet_tags(dir, "tags.parquet");
 
     let spec = nested_spec_for_file(file_url);
 
@@ -494,6 +484,4 @@ fn rendered_nested_column_passes_the_emit_coercion_unchanged() {
         vec![Some(r#"["hello","world"]"#.to_string())],
         "the rendered nested column must cross the emit boundary as valid JSON, not display text"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

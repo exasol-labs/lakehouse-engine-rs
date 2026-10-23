@@ -211,9 +211,9 @@ fn spec_for_files(files: Vec<FileEntry>) -> ScanSpec {
 
 #[test]
 fn scan_registers_only_assigned_files_two_arg() {
-    let dir = std::env::temp_dir().join(format!("lh_two_arg_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let file_url = write_local_parquet(&dir, 200, 64);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let file_url = write_local_parquet(dir, 200, 64);
     let spec = scan_spec(file_url);
 
     let common_json = spec.to_common_json();
@@ -253,8 +253,6 @@ fn scan_registers_only_assigned_files_two_arg() {
         two_arg, single,
         "two-arg reconstitution must emit rows identical to the pre-split single-arg path"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -279,7 +277,8 @@ fn two_arg_null_in_either_argument_is_user_error() {
 
 #[test]
 fn scan_registers_assigned_files_via_parquet_provider() {
-    let dir = std::env::temp_dir().join(format!("lh_provider_{}", std::process::id()));
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let assigned_dir = dir.join("assigned");
     let decoy_dir = dir.join("decoy");
     std::fs::create_dir_all(&assigned_dir).unwrap();
@@ -308,17 +307,15 @@ fn scan_registers_assigned_files_via_parquet_provider() {
         "no decoy id (>= 10_000 range would be impossible here since decoy ids are 0..500, \
          so any leak would inflate the count/ids beyond the assigned file's own range): {ids:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn spec_reconstitutes_with_delete_entries() {
-    let dir = std::env::temp_dir().join(format!("lh_recon_del_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let data_url = write_local_parquet(&dir, 20, 8);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_local_parquet(dir, 20, 8);
     let delete_url =
-        write_delete_parquet(&dir, "deletes.parquet", &[(&data_url, 2), (&data_url, 9)]);
+        write_delete_parquet(dir, "deletes.parquet", &[(&data_url, 2), (&data_url, 9)]);
 
     let entry = FileEntry::with_deletes(
         data_url.clone(),
@@ -354,6 +351,4 @@ fn spec_reconstitutes_with_delete_entries() {
     let ids = ids_of(&rows);
     assert!(!ids.contains(&2), "position 2 must be deleted: {ids:?}");
     assert!(!ids.contains(&9), "position 9 must be deleted: {ids:?}");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -87,6 +87,7 @@ arrow               = { workspace = true, features = ["ipc"] }
 parquet             = { workspace = true }
 # Not tpchgen-arrow: it has no arrow-58 release.
 tpchgen             = { version = "2.0.2" }
+tempfile            = { version = "3" }
 iceberg             = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }

@@ -121,9 +121,9 @@ async fn collect_rows(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scan_enables_rowgroup_and_page_pruning() {
-    let dir = std::env::temp_dir().join(format!("lh_pruning_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let file_url = write_local_parquet(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let file_url = write_local_parquet(dir);
     let spec = pruning_spec(file_url.clone());
 
     let on = session_config_for_spec(&spec);
@@ -153,8 +153,6 @@ async fn scan_enables_rowgroup_and_page_pruning() {
     assert_eq!(rows_on.len(), 200, "predicate must keep exactly 200 rows");
     assert_eq!(rows_on.first().unwrap().0, 200);
     assert_eq!(rows_on.last().unwrap().0, 399);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Row 1's leaf stats are `min = "hello"`, `max = "world"`, which a min/max check would use to
@@ -355,9 +353,9 @@ fn leaf_chunk_facts(file_url: &str, row_group: usize, leaf_path: &str) -> LeafCh
 /// Scenario: A predicate over a rendered nested column is evaluated, never silently dropped
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn predicate_over_a_rendered_nested_column_is_applied_not_dropped() {
-    let dir = std::env::temp_dir().join(format!("lh_nested_pushdown_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let file_url = write_nested_parquet(&dir, 8);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let file_url = write_nested_parquet(dir, 8);
 
     let (matching, _) = run_nested_scan(&nested_spec(
         file_url.clone(),
@@ -379,17 +377,15 @@ async fn predicate_over_a_rendered_nested_column_is_applied_not_dropped() {
         compound.is_empty(),
         "a conjunction whose nested half matches no row must return no row, got {compound:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn statistics_pruning_cannot_drop_a_row_group_holding_a_rendered_nested_match() {
     // The primitive predicate at the end proves statistics pruning is enabled, so the
     // zero-pruned result is evidence rather than a stage that never ran.
-    let dir = std::env::temp_dir().join(format!("lh_nested_pruning_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let file_url = write_nested_parquet(&dir, 1);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let file_url = write_nested_parquet(dir, 1);
     let facts = leaf_chunk_facts(&file_url, 0, "tags.list.item");
     assert_eq!(
         (facts.min.as_str(), facts.max.as_str()),
@@ -442,6 +438,4 @@ async fn statistics_pruning_cannot_drop_a_row_group_holding_a_rendered_nested_ma
         "statistics pruning must stay ENABLED for a table carrying a nested column — \
          otherwise the zero-pruned assertions above prove nothing"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

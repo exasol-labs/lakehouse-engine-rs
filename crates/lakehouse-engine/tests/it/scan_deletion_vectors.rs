@@ -55,12 +55,6 @@ fn fixture_dir() -> PathBuf {
         .join("../../scripts/unity/fixtures/table-with-dv-small")
 }
 
-fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("lh_delta_dv_{tag}_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 fn file_url(path: &Path) -> String {
     Url::from_file_path(path)
         .expect("absolute path")
@@ -220,16 +214,17 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
 /// Scenario: A UUID-relative deletion vector removes exactly its flagged rows
 #[test]
 fn uuid_relative_deletion_vector_removes_its_flagged_rows() {
-    let dir = temp_dir("uuid_relative");
-    let (data_path, data_size) = copy_fixture_data_file(&dir, FIXTURE_DATA_FILE_NAME);
-    copy_fixture_sidecar(&dir, FIXTURE_SIDECAR_NAME);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let (data_path, data_size) = copy_fixture_data_file(dir, FIXTURE_DATA_FILE_NAME);
+    copy_fixture_sidecar(dir, FIXTURE_SIDECAR_NAME);
 
     let entry = FileEntry::with_deletes(
         FIXTURE_DATA_FILE_NAME,
         data_size,
         vec![fixture_deletion_vector()],
     );
-    let spec = scan_spec(vec![entry], &dir_url(&dir), None, None);
+    let spec = scan_spec(vec![entry], &dir_url(dir), None, None);
     let rows = run_scan(&spec, &file_url(&data_path));
 
     assert_eq!(total_rows(&rows), 8, "10 physical rows minus 2 deleted");
@@ -237,21 +232,20 @@ fn uuid_relative_deletion_vector_removes_its_flagged_rows() {
     assert_eq!(values, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     assert!(!values.contains(&0), "deleted value 0 must be absent");
     assert!(!values.contains(&9), "deleted value 9 must be absent");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn inline_deletion_vector_decodes_without_object_store_access() {
-    let dir = temp_dir("inline");
-    let (data_path, data_size) = copy_fixture_data_file(&dir, FIXTURE_DATA_FILE_NAME);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let (data_path, data_size) = copy_fixture_data_file(dir, FIXTURE_DATA_FILE_NAME);
 
     let entry = FileEntry::with_deletes(
         FIXTURE_DATA_FILE_NAME,
         data_size,
         vec![inline_deletion_vector()],
     );
-    let spec = scan_spec(vec![entry], &dir_url(&dir), None, None);
+    let spec = scan_spec(vec![entry], &dir_url(dir), None, None);
 
     let store = Arc::new(RefusingReadStore::refusing(".bin"));
     let rows = block_on(try_run_scan_with_store(
@@ -268,15 +262,14 @@ fn inline_deletion_vector_decodes_without_object_store_access() {
         0,
         "no sidecar read was even attempted for an inline vector"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn absolute_path_deletion_vector_is_read_verbatim() {
-    let dir = temp_dir("absolute_path");
-    let (data_path, data_size) = copy_fixture_data_file(&dir, FIXTURE_DATA_FILE_NAME);
-    let sidecar_path = copy_fixture_sidecar(&dir, FIXTURE_SIDECAR_NAME);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let (data_path, data_size) = copy_fixture_data_file(dir, FIXTURE_DATA_FILE_NAME);
+    let sidecar_path = copy_fixture_sidecar(dir, FIXTURE_SIDECAR_NAME);
 
     let entry = FileEntry::with_deletes(
         file_url(&data_path),
@@ -293,24 +286,23 @@ fn absolute_path_deletion_vector_is_read_verbatim() {
         "the absolute sidecar path was read verbatim"
     );
     assert_eq!(values_of(&rows), vec![1, 2, 3, 4, 5, 6, 7, 8]);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Scenario: A deletion-vector file shared by several data files is fetched once per shard
 #[test]
 fn shared_deletion_vector_file_is_fetched_once_per_shard() {
-    let dir = temp_dir("shared_sidecar");
-    let (data_a, size_a) = copy_fixture_data_file(&dir, "a.snappy.parquet");
-    let (_data_b, size_b) = copy_fixture_data_file(&dir, "b.snappy.parquet");
-    let sidecar_path = copy_fixture_sidecar(&dir, FIXTURE_SIDECAR_NAME);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let (data_a, size_a) = copy_fixture_data_file(dir, "a.snappy.parquet");
+    let (_data_b, size_b) = copy_fixture_data_file(dir, "b.snappy.parquet");
+    let sidecar_path = copy_fixture_sidecar(dir, FIXTURE_SIDECAR_NAME);
     let shared_dv = absolute_deletion_vector(&file_url(&sidecar_path));
 
     let entries = vec![
         FileEntry::with_deletes("a.snappy.parquet", size_a, vec![shared_dv.clone()]),
         FileEntry::with_deletes("b.snappy.parquet", size_b, vec![shared_dv]),
     ];
-    let spec = scan_spec(entries, &dir_url(&dir), None, None);
+    let spec = scan_spec(entries, &dir_url(dir), None, None);
 
     let gets = Arc::new(std::sync::Mutex::new(Vec::new()));
     let tracking = Arc::new(TrackingStore {
@@ -337,8 +329,6 @@ fn shared_deletion_vector_file_is_fetched_once_per_shard() {
         sidecar_reads, 1,
         "a sidecar shared by two data files must be fetched exactly once for the shard"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A current-thread runtime fires timers only once it parks, so every read admitted in one
@@ -351,14 +341,15 @@ fn deletion_vector_reads_stay_within_the_connection_budget() {
     const BUDGET: usize = 3;
     const UNIQUE_SIDECARS: usize = 6;
 
-    let dir = temp_dir("bounded_budget");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let mut entries = Vec::with_capacity(UNIQUE_SIDECARS);
     let mut needles = Vec::with_capacity(UNIQUE_SIDECARS);
     for i in 0..UNIQUE_SIDECARS {
         let data_name = format!("data_{i}.snappy.parquet");
-        let (_data_path, size) = copy_fixture_data_file(&dir, &data_name);
+        let (_data_path, size) = copy_fixture_data_file(dir, &data_name);
         let sidecar_name = format!("sidecar_{i}.bin");
-        let sidecar_path = copy_fixture_sidecar(&dir, &sidecar_name);
+        let sidecar_path = copy_fixture_sidecar(dir, &sidecar_name);
         entries.push(FileEntry::with_deletes(
             data_name,
             size,
@@ -367,7 +358,7 @@ fn deletion_vector_reads_stay_within_the_connection_budget() {
         needles.push(sidecar_name);
     }
 
-    let mut spec = scan_spec(entries, &dir_url(&dir), None, None);
+    let mut spec = scan_spec(entries, &dir_url(dir), None, None);
     spec.common.s3_max_connections = BUDGET;
 
     let peak = Arc::new(AtomicUsize::new(0));
@@ -382,7 +373,7 @@ fn deletion_vector_reads_stay_within_the_connection_budget() {
         }),
     });
 
-    let register_url = dir_url(&dir);
+    let register_url = dir_url(dir);
     let rows = block_on(async {
         tokio::time::timeout(
             DV_READ_TIMEOUT,
@@ -405,17 +396,16 @@ fn deletion_vector_reads_stay_within_the_connection_budget() {
         UNIQUE_SIDECARS * 8,
         "every shard file loses exactly 2 of its 10 rows"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Scenario: Deletion vectors compose with projection, filter, LIMIT, and aggregation
 #[test]
 fn deletion_vectors_compose_with_projection_filter_limit_and_aggregation() {
-    let dir = temp_dir("compose");
-    let (data_path, data_size) = copy_fixture_data_file(&dir, FIXTURE_DATA_FILE_NAME);
-    copy_fixture_sidecar(&dir, FIXTURE_SIDECAR_NAME);
-    let table_root = dir_url(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let (data_path, data_size) = copy_fixture_data_file(dir, FIXTURE_DATA_FILE_NAME);
+    copy_fixture_sidecar(dir, FIXTURE_SIDECAR_NAME);
+    let table_root = dir_url(dir);
 
     let entry = FileEntry::with_deletes(
         FIXTURE_DATA_FILE_NAME,
@@ -479,18 +469,17 @@ fn deletion_vectors_compose_with_projection_filter_limit_and_aggregation() {
         count, 8,
         "COUNT(*) over the deletion-vector-carrying table must see only live rows"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Scenario: A Delta data file carrying no deletion vector scans unchanged
 #[test]
 fn delta_file_without_a_deletion_vector_scans_unchanged() {
-    let dir = temp_dir("delete_free");
-    let (data_path, data_size) = copy_fixture_data_file(&dir, FIXTURE_DATA_FILE_NAME);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let (data_path, data_size) = copy_fixture_data_file(dir, FIXTURE_DATA_FILE_NAME);
 
     let entry = FileEntry::new(FIXTURE_DATA_FILE_NAME, data_size);
-    let spec = scan_spec(vec![entry], &dir_url(&dir), None, None);
+    let spec = scan_spec(vec![entry], &dir_url(dir), None, None);
     let rows = run_scan(&spec, &file_url(&data_path));
 
     assert_eq!(
@@ -499,8 +488,6 @@ fn delta_file_without_a_deletion_vector_scans_unchanged() {
         "no rows must be dropped absent a deletion vector"
     );
     assert_eq!(values_of(&rows), (0..10).collect::<Vec<_>>());
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn write_iceberg_delete_parquet(dir: &Path, relative: &str, entries: &[(&str, i64)]) -> String {
@@ -548,12 +535,13 @@ fn write_iceberg_data_parquet(dir: &Path, relative: &str, values: &[i32]) -> Str
 
 #[test]
 fn mixed_iceberg_and_delta_shard_shares_one_position_map_and_limiter() {
-    let dir = temp_dir("mixed_shard");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
 
     let iceberg_data_url =
-        write_iceberg_data_parquet(&dir, "iceberg_data.parquet", &[100, 101, 102, 103, 104]);
+        write_iceberg_data_parquet(dir, "iceberg_data.parquet", &[100, 101, 102, 103, 104]);
     let iceberg_delete_url = write_iceberg_delete_parquet(
-        &dir,
+        dir,
         "iceberg_deletes.parquet",
         &[(&iceberg_data_url, 1), (&iceberg_data_url, 3)],
     );
@@ -561,8 +549,8 @@ fn mixed_iceberg_and_delta_shard_shares_one_position_map_and_limiter() {
         iceberg_delete_url.strip_prefix("file://").unwrap(),
     ));
 
-    let (delta_data_path, delta_data_size) = copy_fixture_data_file(&dir, FIXTURE_DATA_FILE_NAME);
-    copy_fixture_sidecar(&dir, FIXTURE_SIDECAR_NAME);
+    let (delta_data_path, delta_data_size) = copy_fixture_data_file(dir, FIXTURE_DATA_FILE_NAME);
+    copy_fixture_sidecar(dir, FIXTURE_SIDECAR_NAME);
 
     let entries = vec![
         FileEntry::with_deletes(
@@ -579,7 +567,7 @@ fn mixed_iceberg_and_delta_shard_shares_one_position_map_and_limiter() {
             vec![fixture_deletion_vector()],
         ),
     ];
-    let spec = scan_spec(entries, &dir_url(&dir), None, None);
+    let spec = scan_spec(entries, &dir_url(dir), None, None);
     let rows = run_scan(&spec, &file_url(&delta_data_path));
 
     let values = values_of(&rows);
@@ -612,8 +600,6 @@ fn mixed_iceberg_and_delta_shard_shares_one_position_map_and_limiter() {
             "Delta-deleted {v} must be absent: {values:?}"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -649,8 +635,9 @@ fn malformed_deletion_vector_containers_fail_the_scan_without_panicking() {
     ];
 
     for (label, body) in corruptions {
-        let dir = temp_dir("malformed");
-        let (data_path, data_size) = copy_fixture_data_file(&dir, FIXTURE_DATA_FILE_NAME);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (data_path, data_size) = copy_fixture_data_file(dir, FIXTURE_DATA_FILE_NAME);
         std::fs::write(dir.join(FIXTURE_SIDECAR_NAME), &body).expect("write corrupted sidecar");
 
         let entry = FileEntry::with_deletes(
@@ -658,7 +645,7 @@ fn malformed_deletion_vector_containers_fail_the_scan_without_panicking() {
             data_size,
             vec![fixture_deletion_vector()],
         );
-        let spec = scan_spec(vec![entry], &dir_url(&dir), None, None);
+        let spec = scan_spec(vec![entry], &dir_url(dir), None, None);
 
         let session = SessionContext::new_with_config(session_config_for_spec(&spec));
         session.runtime_env().register_object_store(
@@ -692,8 +679,6 @@ fn malformed_deletion_vector_containers_fail_the_scan_without_panicking() {
             "{label}: no batch may be emitted before the scan fails: {:?}",
             ctx.into_batches()
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

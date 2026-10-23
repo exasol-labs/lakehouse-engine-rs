@@ -43,13 +43,6 @@ fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/unity/fixtures/basic_partitioned")
 }
 
-fn temp_dir(tag: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("lh_partition_values_{tag}_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 fn file_url(path: &Path) -> String {
     Url::from_file_path(path)
         .expect("absolute path")
@@ -243,9 +236,10 @@ fn letter_number_rows(batches: &[RecordBatch]) -> Vec<(Option<String>, i64)> {
 
 #[test]
 fn absent_partition_column_is_materialized_per_file() {
-    let dir = temp_dir("absent_per_file");
-    let entries = all_six_entries(&dir);
-    let table_root = dir_url(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let entries = all_six_entries(dir);
+    let table_root = dir_url(dir);
     let spec = basic_partitioned_spec(entries, &table_root, None, None);
 
     let rows = run_scan(&spec, &table_root, &letter_number_float_emits());
@@ -265,25 +259,24 @@ fn absent_partition_column_is_materialized_per_file() {
         got, expected,
         "each file's own logged letter must appear on its own row, never another file's value"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn absent_and_empty_partition_values_materialize_null() {
-    let dir = temp_dir("absent_and_empty");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let (hive_rel, hive_size) =
-        copy_partition_file(&dir, "letter=__HIVE_DEFAULT_PARTITION__", HIVE_DEFAULT_FILE);
+        copy_partition_file(dir, "letter=__HIVE_DEFAULT_PARTITION__", HIVE_DEFAULT_FILE);
     let hive_entry = FileEntry::with_partition_values(hive_rel, hive_size, letter_value(None));
 
-    let (empty_rel, empty_size) = copy_partition_file(&dir, "letter=b", LETTER_B_FILE);
+    let (empty_rel, empty_size) = copy_partition_file(dir, "letter=b", LETTER_B_FILE);
     let empty_entry = FileEntry::with_partition_values(
         empty_rel,
         empty_size,
         BTreeMap::from([("letter".to_string(), Some(String::new()))]),
     );
 
-    let table_root = dir_url(&dir);
+    let table_root = dir_url(dir);
     let spec = basic_partitioned_spec(vec![hive_entry, empty_entry], &table_root, None, None);
     let rows = run_scan(&spec, &table_root, &letter_number_float_emits());
 
@@ -304,8 +297,6 @@ fn absent_and_empty_partition_values_materialize_null() {
         numbers.contains(&2),
         "the empty-string-partition file's own row must be present: {numbers:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn logical_schema_with_flag() -> Vec<LogicalField> {
@@ -338,9 +329,10 @@ fn spec_with_flag(files: Vec<FileEntry>, table_root: &str) -> ScanSpec {
 
 #[test]
 fn partition_values_convert_to_their_declared_type_or_fail_cleanly() {
-    let dir = temp_dir("type_conversion");
-    let (rel, size) = copy_partition_file(&dir, "letter=a", LETTER_A_FILE_1);
-    let table_root = dir_url(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let (rel, size) = copy_partition_file(dir, "letter=a", LETTER_A_FILE_1);
+    let table_root = dir_url(dir);
 
     let ok_entry = FileEntry::with_partition_values(
         rel.clone(),
@@ -398,8 +390,6 @@ fn partition_values_convert_to_their_declared_type_or_fail_cleanly() {
     assert!(msg.contains("flag"), "{msg}");
     assert!(msg.contains("Int32"), "{msg}");
     assert!(msg.contains("not-a-number"), "{msg}");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn write_parquet_with_physical_letter(
@@ -453,10 +443,11 @@ fn one_off_logical_schema() -> Vec<LogicalField> {
 
 #[test]
 fn logged_partition_value_wins_over_a_physical_partition_column() {
-    let dir = temp_dir("logged_wins");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let (rel, size) =
-        write_parquet_with_physical_letter(&dir, "physical_letter.parquet", "z_physical", 99);
-    let table_root = dir_url(&dir);
+        write_parquet_with_physical_letter(dir, "physical_letter.parquet", "z_physical", 99);
+    let table_root = dir_url(dir);
 
     let entry = FileEntry::with_partition_values(
         rel,
@@ -498,15 +489,14 @@ fn logged_partition_value_wins_over_a_physical_partition_column() {
     );
     assert_ne!(letters.value(0), "z_physical");
     assert_eq!(numbers.value(0), 99);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn materialized_partition_column_serves_projection_filter_and_group_by() {
-    let dir = temp_dir("proj_filter_group");
-    let entries = all_six_entries(&dir);
-    let table_root = dir_url(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let entries = all_six_entries(dir);
+    let table_root = dir_url(dir);
 
     let mut proj_spec = basic_partitioned_spec(entries.clone(), &table_root, None, None);
     proj_spec.common.projection = vec!["LETTER".into(), "NUMBER".into()];
@@ -574,8 +564,6 @@ fn materialized_partition_column_serves_projection_filter_and_group_by() {
         total, 6,
         "every row must land in exactly one group, including the NULL group"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn collect_leaf_execs(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
@@ -628,9 +616,10 @@ fn unpartitioned_logical_schema() -> Vec<LogicalField> {
 
 #[test]
 fn scan_without_partition_columns_is_byte_identical() {
-    let dir = temp_dir("unpartitioned");
-    let (rel, size) = copy_partition_file(&dir, "letter=a", LETTER_A_FILE_1);
-    let table_root = dir_url(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let (rel, size) = copy_partition_file(dir, "letter=a", LETTER_A_FILE_1);
+    let table_root = dir_url(dir);
 
     let spec = ScanSpec {
         common: CommonScanSpec {
@@ -697,6 +686,4 @@ fn scan_without_partition_columns_is_byte_identical() {
 
     let rows = run_scan(&spec, &table_root, &[ExaType::Int64, ExaType::Double]);
     assert_eq!(total_rows(&rows), 1);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

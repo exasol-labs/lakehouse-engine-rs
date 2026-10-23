@@ -248,18 +248,13 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("lh_pos_del_{tag}_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 #[test]
 fn scan_applies_file_granularity_positional_deletes() {
-    let dir = temp_dir("file_gran");
-    let data_url = write_data_parquet(&dir, "data.parquet", &(0..20).collect::<Vec<_>>(), 8);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_data_parquet(dir, "data.parquet", &(0..20).collect::<Vec<_>>(), 8);
     let delete_url =
-        write_delete_parquet(&dir, "deletes.parquet", &[(&data_url, 3), (&data_url, 7)]);
+        write_delete_parquet(dir, "deletes.parquet", &[(&data_url, 3), (&data_url, 7)]);
 
     let entry = FileEntry::with_deletes(
         data_url.clone(),
@@ -277,17 +272,16 @@ fn scan_applies_file_granularity_positional_deletes() {
         ids,
         (0..20).filter(|i| *i != 3 && *i != 7).collect::<Vec<_>>()
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn scan_filters_partition_delete_by_file_path() {
-    let dir = temp_dir("partition_gran");
-    let f0 = write_data_parquet(&dir, "p0/data.parquet", &(100..110).collect::<Vec<_>>(), 4);
-    let f1 = write_data_parquet(&dir, "p1/data.parquet", &(200..210).collect::<Vec<_>>(), 4);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let f0 = write_data_parquet(dir, "p0/data.parquet", &(100..110).collect::<Vec<_>>(), 4);
+    let f1 = write_data_parquet(dir, "p1/data.parquet", &(200..210).collect::<Vec<_>>(), 4);
     let delete_url = write_delete_parquet(
-        &dir,
+        dir,
         "shared_delete.parquet",
         &[(&f0, 2), (&f0, 5), (&f1, 1)],
     );
@@ -314,16 +308,15 @@ fn scan_filters_partition_delete_by_file_path() {
     }
     assert!(ids.contains(&200), "f1's other rows must survive: {ids:?}");
     assert!(ids.contains(&100), "f0's other rows must survive: {ids:?}");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn scan_unions_multiple_delete_files() {
-    let dir = temp_dir("union");
-    let data_url = write_data_parquet(&dir, "data.parquet", &(0..20).collect::<Vec<_>>(), 8);
-    let delete_a = write_delete_parquet(&dir, "del_a.parquet", &[(&data_url, 1), (&data_url, 4)]);
-    let delete_b = write_delete_parquet(&dir, "del_b.parquet", &[(&data_url, 4), (&data_url, 9)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_data_parquet(dir, "data.parquet", &(0..20).collect::<Vec<_>>(), 8);
+    let delete_a = write_delete_parquet(dir, "del_a.parquet", &[(&data_url, 1), (&data_url, 4)]);
+    let delete_b = write_delete_parquet(dir, "del_b.parquet", &[(&data_url, 4), (&data_url, 9)]);
 
     let entry = FileEntry::with_deletes(
         data_url.clone(),
@@ -351,16 +344,15 @@ fn scan_unions_multiple_delete_files() {
             .filter(|i| ![1, 4, 9].contains(i))
             .collect::<Vec<_>>()
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn scan_fully_deleted_file_yields_no_rows() {
-    let dir = temp_dir("fully_deleted");
-    let data_url = write_data_parquet(&dir, "data.parquet", &(0..5).collect::<Vec<_>>(), 8);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_data_parquet(dir, "data.parquet", &(0..5).collect::<Vec<_>>(), 8);
     let delete_url = write_delete_parquet(
-        &dir,
+        dir,
         "deletes.parquet",
         &[
             (&data_url, 0),
@@ -384,16 +376,15 @@ fn scan_fully_deleted_file_yields_no_rows() {
         0,
         "a fully-deleted file must yield no rows"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn scan_deletes_compose_with_pushdown_and_pruning() {
-    let dir = temp_dir("compose");
-    let data_url = write_data_parquet(&dir, "data.parquet", &(0..100).collect::<Vec<_>>(), 16);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_data_parquet(dir, "data.parquet", &(0..100).collect::<Vec<_>>(), 16);
     let delete_url = write_delete_parquet(
-        &dir,
+        dir,
         "deletes.parquet",
         &[(&data_url, 5), (&data_url, 50), (&data_url, 95)],
     );
@@ -419,14 +410,13 @@ fn scan_deletes_compose_with_pushdown_and_pruning() {
         vec![0, 1, 2, 3, 4, 6, 7, 8, 9, 10],
         "LIMIT pushdown must count only post-delete rows (position 5 is deleted)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn scan_rejects_unapplicable_delete_file() {
-    let dir = temp_dir("unapplicable");
-    let data_url = write_data_parquet(&dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_data_parquet(dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);
 
     let bogus_delete = DeleteMechanism::IcebergEqualityDelete {
         path: format!("{}/does-not-need-to-exist.parquet", dir.to_string_lossy()),
@@ -451,15 +441,14 @@ fn scan_rejects_unapplicable_delete_file() {
         msg.contains("equality delete"),
         "error must name the unsupported mechanism: {msg}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn scan_rejects_negative_positional_delete() {
-    let dir = temp_dir("neg_pos");
-    let data_url = write_data_parquet(&dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);
-    let delete_url = write_delete_parquet(&dir, "delete.parquet", &[(data_url.as_str(), -1)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_data_parquet(dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);
+    let delete_url = write_delete_parquet(dir, "delete.parquet", &[(data_url.as_str(), -1)]);
     let entry = FileEntry::with_deletes(
         data_url.clone(),
         local_file_size(&data_url),
@@ -480,14 +469,13 @@ fn scan_rejects_negative_positional_delete() {
         msg.contains("negative") && msg.contains("(-1)"),
         "error must name the malformed negative position: {msg}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn scan_rejects_mixed_object_store_roots() {
-    let dir = temp_dir("mixed_roots");
-    let data_url = write_data_parquet(&dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_data_parquet(dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);
     let local = FileEntry::new(data_url.clone(), local_file_size(&data_url));
     let foreign = FileEntry::new("s3://other-bucket/part-0.parquet", 10);
     let spec = scan_spec(vec![local, foreign], None, None);
@@ -503,14 +491,13 @@ fn scan_rejects_mixed_object_store_roots() {
         err.to_string().contains("mixes object-store roots"),
         "error must explain the mixed-root rejection: {err}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn scan_delete_free_file_unchanged() {
-    let dir = temp_dir("delete_free");
-    let data_url = write_data_parquet(&dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_data_parquet(dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);
 
     let entry = FileEntry::new(data_url.clone(), local_file_size(&data_url));
     let spec = scan_spec(vec![entry], None, None);
@@ -522,8 +509,6 @@ fn scan_delete_free_file_unchanged() {
         "no rows must be dropped when there are no deletes"
     );
     assert_eq!(ids_of(&rows), (0..10).collect::<Vec<_>>());
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Records every non-HEAD `get` by location.
@@ -646,10 +631,11 @@ impl ObjectStore for TrackingStore {
 
 #[test]
 fn scan_reads_delete_files_with_vended_credentials() {
-    let dir = temp_dir("vended_creds");
-    let data_url = write_data_parquet(&dir, "data.parquet", &(0..20).collect::<Vec<_>>(), 8);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_data_parquet(dir, "data.parquet", &(0..20).collect::<Vec<_>>(), 8);
     let delete_url =
-        write_delete_parquet(&dir, "deletes.parquet", &[(&data_url, 2), (&data_url, 6)]);
+        write_delete_parquet(dir, "deletes.parquet", &[(&data_url, 2), (&data_url, 6)]);
 
     let entry = FileEntry::with_deletes(
         data_url.clone(),
@@ -690,8 +676,6 @@ fn scan_reads_delete_files_with_vended_credentials() {
             .any(|p| p.as_ref().contains(delete_needle.as_str())),
         "the delete file must be fetched through the registered (credentialed) store: {recorded:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn count_gets_matching(gets: &std::sync::Mutex<Vec<ObjectStorePath>>, needle: &str) -> usize {
@@ -730,11 +714,12 @@ fn run_scan_tracked(
 fn scan_reads_shared_delete_file_once_per_shard() {
     // One Parquet open issues several range GETs, so this compares against a one-referencer
     // baseline instead of asserting a magic total.
-    let dir = temp_dir("shared_delete_once");
-    let f0 = write_data_parquet(&dir, "p0/data.parquet", &(100..110).collect::<Vec<_>>(), 4);
-    let f1 = write_data_parquet(&dir, "p1/data.parquet", &(200..210).collect::<Vec<_>>(), 4);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let f0 = write_data_parquet(dir, "p0/data.parquet", &(100..110).collect::<Vec<_>>(), 4);
+    let f1 = write_data_parquet(dir, "p1/data.parquet", &(200..210).collect::<Vec<_>>(), 4);
     let delete_url = write_delete_parquet(
-        &dir,
+        dir,
         "shared_delete.parquet",
         &[(&f0, 2), (&f0, 5), (&f1, 1)],
     );
@@ -783,8 +768,6 @@ fn scan_reads_shared_delete_file_once_per_shard() {
     }
     assert!(ids.contains(&100), "f0's other rows must survive: {ids:?}");
     assert!(ids.contains(&200), "f1's other rows must survive: {ids:?}");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A current-thread runtime fires timers only once it parks, so every read admitted in one
@@ -815,14 +798,15 @@ fn scan_delete_reads_bounded_by_connection_budget() {
     const BUDGET: usize = 3;
     const UNIQUE_DELETES: usize = 6;
 
-    let dir = temp_dir("bounded_budget");
-    let data_url = write_data_parquet(&dir, "data.parquet", &(0..12).collect::<Vec<_>>(), 4);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_data_parquet(dir, "data.parquet", &(0..12).collect::<Vec<_>>(), 4);
 
     let mut delete_refs = Vec::with_capacity(UNIQUE_DELETES);
     let mut needles = Vec::with_capacity(UNIQUE_DELETES);
     for i in 0..UNIQUE_DELETES {
         let name = format!("del_{i}.parquet");
-        let url = write_delete_parquet(&dir, &name, &[(&data_url, i as i64)]);
+        let url = write_delete_parquet(dir, &name, &[(&data_url, i as i64)]);
         delete_refs.push(delete_ref(&url));
         needles.push(name);
     }
@@ -851,22 +835,21 @@ fn scan_delete_reads_bounded_by_connection_budget() {
 
     assert_eq!(total_rows(&rows), 6, "6 of 12 rows deleted");
     assert_eq!(ids_of(&rows), (6..12).collect::<Vec<_>>());
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn scan_delete_reads_serial_when_budget_is_one() {
     const UNIQUE_DELETES: usize = 4;
 
-    let dir = temp_dir("serial_budget");
-    let data_url = write_data_parquet(&dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 4);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_data_parquet(dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 4);
 
     let mut delete_refs = Vec::with_capacity(UNIQUE_DELETES);
     let mut needles = Vec::with_capacity(UNIQUE_DELETES);
     for i in 0..UNIQUE_DELETES {
         let name = format!("del_{i}.parquet");
-        let url = write_delete_parquet(&dir, &name, &[(&data_url, i as i64)]);
+        let url = write_delete_parquet(dir, &name, &[(&data_url, i as i64)]);
         delete_refs.push(delete_ref(&url));
         needles.push(name);
     }
@@ -894,8 +877,6 @@ fn scan_delete_reads_serial_when_budget_is_one() {
 
     assert_eq!(total_rows(&rows), 6, "4 of 10 rows deleted");
     assert_eq!(ids_of(&rows), (4..10).collect::<Vec<_>>());
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Join sides must use disjoint column names: the join path relies on the VS guarantee.
@@ -939,9 +920,10 @@ fn scan_delete_reads_bounded_across_join_sides() {
     // are disjoint per side so a dropped dimension-side delete shows up in the row count.
     const BUDGET: usize = 3;
 
-    let dir = temp_dir("join_shared_budget");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let orders_url = write_keyed_parquet(
-        &dir,
+        dir,
         "orders.parquet",
         "o_key",
         "o_data",
@@ -949,7 +931,7 @@ fn scan_delete_reads_bounded_across_join_sides() {
         4,
     );
     let customer_url = write_keyed_parquet(
-        &dir,
+        dir,
         "customer.parquet",
         "c_key",
         "c_data",
@@ -961,14 +943,14 @@ fn scan_delete_reads_bounded_across_join_sides() {
     let mut fact_deletes = Vec::new();
     for i in 0..2 {
         let name = format!("fact_del_{i}.parquet");
-        let url = write_delete_parquet(&dir, &name, &[(&orders_url, i as i64)]);
+        let url = write_delete_parquet(dir, &name, &[(&orders_url, i as i64)]);
         fact_deletes.push(delete_ref(&url));
         needles.push(name);
     }
     let mut dim_deletes = Vec::new();
     for i in 0..2 {
         let name = format!("dim_del_{i}.parquet");
-        let url = write_delete_parquet(&dir, &name, &[(&customer_url, (2 + i) as i64)]);
+        let url = write_delete_parquet(dir, &name, &[(&customer_url, (2 + i) as i64)]);
         dim_deletes.push(delete_ref(&url));
         needles.push(name);
     }
@@ -1046,8 +1028,6 @@ fn scan_delete_reads_bounded_across_join_sides() {
          yields 4 rows — this would be 6 if the dimension side's own delete file \
          were never applied"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Sums bytes of non-HEAD reads matching `needle`: skipped row groups transfer no column data.
@@ -1206,15 +1186,16 @@ fn scan_prunes_delete_row_groups_by_file_path() {
     // last 512 KiB (DataFusion's metadata size hint) whatever is assigned.
     const ROWS_PER_FILE: usize = 250_000;
 
-    let dir = temp_dir("row_group_pruning");
-    let f1 = write_data_parquet(&dir, "f1.parquet", &(0..5).collect::<Vec<_>>(), 8);
-    let f2 = write_data_parquet(&dir, "f2.parquet", &(1000..1005).collect::<Vec<_>>(), 8);
-    let f3 = write_data_parquet(&dir, "f3.parquet", &(2000..2005).collect::<Vec<_>>(), 8);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let f1 = write_data_parquet(dir, "f1.parquet", &(0..5).collect::<Vec<_>>(), 8);
+    let f2 = write_data_parquet(dir, "f2.parquet", &(1000..1005).collect::<Vec<_>>(), 8);
+    let f3 = write_data_parquet(dir, "f3.parquet", &(2000..2005).collect::<Vec<_>>(), 8);
 
     let entries = one_row_group_per_file_entries([&f1, &f2, &f3], ROWS_PER_FILE);
     let entry_refs: Vec<(&str, i64)> = entries.iter().map(|(p, pos)| (p.as_str(), *pos)).collect();
     let delete_url = write_delete_parquet_shaped(
-        &dir,
+        dir,
         "shared_delete.parquet",
         &entry_refs,
         ROWS_PER_FILE,
@@ -1294,15 +1275,14 @@ fn scan_prunes_delete_row_groups_by_file_path() {
         0,
         "all of f2's rows must be deleted, pruning notwithstanding"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn scan_prunes_delete_row_groups_with_truncated_statistics() {
     const ROWS_PER_FILE: usize = 20;
 
-    let dir = temp_dir("truncated_stats");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let long_prefix =
         "warehouse/analytics/very/long/namespace/orders/table/data/nested/deeply/for/truncation";
     assert!(
@@ -1311,19 +1291,19 @@ fn scan_prunes_delete_row_groups_with_truncated_statistics() {
     );
 
     let f_a = write_data_parquet(
-        &dir,
+        dir,
         &format!("{long_prefix}/part-00001-order-events.parquet"),
         &(0..5).collect::<Vec<_>>(),
         8,
     );
     let f_b = write_data_parquet(
-        &dir,
+        dir,
         &format!("{long_prefix}/part-00002-order-events.parquet"),
         &(1000..1005).collect::<Vec<_>>(),
         8,
     );
     let f_c = write_data_parquet(
-        &dir,
+        dir,
         &format!("{long_prefix}/part-00003-order-events.parquet"),
         &(2000..2005).collect::<Vec<_>>(),
         8,
@@ -1332,7 +1312,7 @@ fn scan_prunes_delete_row_groups_with_truncated_statistics() {
     let entries = one_row_group_per_file_entries([&f_a, &f_b, &f_c], ROWS_PER_FILE);
     let entry_refs: Vec<(&str, i64)> = entries.iter().map(|(p, pos)| (p.as_str(), *pos)).collect();
     let delete_url = write_delete_parquet_shaped(
-        &dir,
+        dir,
         "truncated_delete.parquet",
         &entry_refs,
         ROWS_PER_FILE,
@@ -1355,23 +1335,22 @@ fn scan_prunes_delete_row_groups_with_truncated_statistics() {
          wrongly pruned: expected all 5 of f_b's rows deleted, got {} surviving",
         total_rows(&rows)
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn scan_decodes_all_row_groups_when_file_path_statistics_absent() {
     const ROWS_PER_FILE: usize = 100;
 
-    let dir = temp_dir("no_stats");
-    let f1 = write_data_parquet(&dir, "f1.parquet", &(0..5).collect::<Vec<_>>(), 8);
-    let f2 = write_data_parquet(&dir, "f2.parquet", &(1000..1005).collect::<Vec<_>>(), 8);
-    let f3 = write_data_parquet(&dir, "f3.parquet", &(2000..2005).collect::<Vec<_>>(), 8);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let f1 = write_data_parquet(dir, "f1.parquet", &(0..5).collect::<Vec<_>>(), 8);
+    let f2 = write_data_parquet(dir, "f2.parquet", &(1000..1005).collect::<Vec<_>>(), 8);
+    let f3 = write_data_parquet(dir, "f3.parquet", &(2000..2005).collect::<Vec<_>>(), 8);
 
     let entries = one_row_group_per_file_entries([&f1, &f2, &f3], ROWS_PER_FILE);
     let entry_refs: Vec<(&str, i64)> = entries.iter().map(|(p, pos)| (p.as_str(), *pos)).collect();
     let delete_url = write_delete_parquet_shaped(
-        &dir,
+        dir,
         "no_stats_delete.parquet",
         &entry_refs,
         ROWS_PER_FILE,
@@ -1408,8 +1387,6 @@ fn scan_decodes_all_row_groups_when_file_path_statistics_absent() {
         0,
         "all of f2's rows must be deleted despite absent statistics"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn collect_leaf_execs(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
@@ -1444,15 +1421,16 @@ fn scan_footer_fetches_bounded_by_connection_budget() {
     const BUDGET: usize = 3;
     const DATA_FILES: usize = 6;
 
-    let dir = temp_dir("footer_bounded_budget");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
 
     let mut entries = Vec::with_capacity(DATA_FILES);
     let mut needles = Vec::with_capacity(DATA_FILES);
     let mut data_urls = Vec::with_capacity(DATA_FILES);
     for i in 0..DATA_FILES {
         let data_name = format!("data_{i}.parquet");
-        let data_url = write_data_parquet(&dir, &data_name, &(0..10).collect::<Vec<_>>(), 4);
-        let delete_url = write_delete_parquet(&dir, &format!("del_{i}.parquet"), &[(&data_url, 0)]);
+        let data_url = write_data_parquet(dir, &data_name, &(0..10).collect::<Vec<_>>(), 4);
+        let delete_url = write_delete_parquet(dir, &format!("del_{i}.parquet"), &[(&data_url, 0)]);
         entries.push(FileEntry::with_deletes(
             data_url.clone(),
             local_file_size(&data_url),
@@ -1517,23 +1495,20 @@ fn scan_footer_fetches_bounded_by_connection_budget() {
             group_locations[i]
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn scan_mixed_shard_fetches_footers_only_for_delete_carrying_files() {
     // The plan is never executed so execute-time reads do not contaminate the counts.
-    let dir = temp_dir("mixed_shard_footers");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
 
-    let free_a = write_data_parquet(&dir, "free_a.parquet", &(0..10).collect::<Vec<_>>(), 4);
-    let carrying_b =
-        write_data_parquet(&dir, "carrying_b.parquet", &(0..10).collect::<Vec<_>>(), 4);
-    let del_b = write_delete_parquet(&dir, "del_b.parquet", &[(&carrying_b, 0)]);
-    let free_c = write_data_parquet(&dir, "free_c.parquet", &(0..10).collect::<Vec<_>>(), 4);
-    let carrying_d =
-        write_data_parquet(&dir, "carrying_d.parquet", &(0..10).collect::<Vec<_>>(), 4);
-    let del_d = write_delete_parquet(&dir, "del_d.parquet", &[(&carrying_d, 0)]);
+    let free_a = write_data_parquet(dir, "free_a.parquet", &(0..10).collect::<Vec<_>>(), 4);
+    let carrying_b = write_data_parquet(dir, "carrying_b.parquet", &(0..10).collect::<Vec<_>>(), 4);
+    let del_b = write_delete_parquet(dir, "del_b.parquet", &[(&carrying_b, 0)]);
+    let free_c = write_data_parquet(dir, "free_c.parquet", &(0..10).collect::<Vec<_>>(), 4);
+    let carrying_d = write_data_parquet(dir, "carrying_d.parquet", &(0..10).collect::<Vec<_>>(), 4);
+    let del_d = write_delete_parquet(dir, "del_d.parquet", &[(&carrying_d, 0)]);
 
     let entries = vec![
         FileEntry::new(free_a.clone(), local_file_size(&free_a)),
@@ -1625,8 +1600,6 @@ fn scan_mixed_shard_fetches_footers_only_for_delete_carrying_files() {
             "file group entry {i} ({needle}) access-plan presence must match its delete-carrying status"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1637,7 +1610,8 @@ fn scan_footer_fetches_bounded_across_join_sides() {
     const BUDGET: usize = 3;
     const FILES_PER_SIDE: usize = 2;
 
-    let dir = temp_dir("join_footer_shared_budget");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
 
     let mut needles = Vec::with_capacity(2 * FILES_PER_SIDE);
     let mut fact_entries = Vec::with_capacity(FILES_PER_SIDE);
@@ -1646,7 +1620,7 @@ fn scan_footer_fetches_bounded_across_join_sides() {
     for i in 0..FILES_PER_SIDE {
         let keys: Vec<i64> = ((i as i64) * 8..(i as i64) * 8 + 8).collect();
         let orders_url = write_keyed_parquet(
-            &dir,
+            dir,
             &format!("orders_{i}.parquet"),
             "o_key",
             "o_data",
@@ -1654,7 +1628,7 @@ fn scan_footer_fetches_bounded_across_join_sides() {
             4,
         );
         let customer_url = write_keyed_parquet(
-            &dir,
+            dir,
             &format!("customer_{i}.parquet"),
             "c_key",
             "c_data",
@@ -1662,9 +1636,9 @@ fn scan_footer_fetches_bounded_across_join_sides() {
             4,
         );
         let fact_delete_url =
-            write_delete_parquet(&dir, &format!("fact_del_{i}.parquet"), &[(&orders_url, 0)]);
+            write_delete_parquet(dir, &format!("fact_del_{i}.parquet"), &[(&orders_url, 0)]);
         let dim_delete_url =
-            write_delete_parquet(&dir, &format!("dim_del_{i}.parquet"), &[(&customer_url, 0)]);
+            write_delete_parquet(dir, &format!("dim_del_{i}.parquet"), &[(&customer_url, 0)]);
 
         needles.push(file_needle(&orders_url));
         needles.push(file_needle(&customer_url));
@@ -1726,6 +1700,4 @@ fn scan_footer_fetches_bounded_across_join_sides() {
          lower peak means the fan-out never ran, and a peak above {BUDGET} (up to 4) would mean \
          each provider built its own size-{BUDGET} semaphore"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

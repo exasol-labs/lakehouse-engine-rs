@@ -173,10 +173,10 @@ fn id_to_new_col(batches: &[RecordBatch]) -> HashMap<i64, Option<i64>> {
 
 #[test]
 fn name_mapping_resolves_no_field_id_column() {
-    let dir = std::env::temp_dir().join(format!("lh_name_mapping_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let rows = 30;
-    let file_url = write_local_parquet_two_int_cols(&dir, "renamed.parquet", "id", "old_col", rows);
+    let file_url = write_local_parquet_two_int_cols(dir, "renamed.parquet", "id", "old_col", rows);
     let file_size = std::fs::metadata(file_url.strip_prefix("file://").unwrap())
         .expect("stat parquet")
         .len();
@@ -202,17 +202,14 @@ fn name_mapping_resolves_no_field_id_column() {
             "row {id}: NEW_COL must carry the real file value via name-mapping resolution, never NULL"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn empty_name_mapping_preserves_physical_name_binding() {
-    let dir = std::env::temp_dir().join(format!("lh_name_mapping_empty_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let rows = 30;
-    let file_url =
-        write_local_parquet_two_int_cols(&dir, "identity.parquet", "id", "new_col", rows);
+    let file_url = write_local_parquet_two_int_cols(dir, "identity.parquet", "id", "new_col", rows);
     let file_size = std::fs::metadata(file_url.strip_prefix("file://").unwrap())
         .expect("stat parquet")
         .len();
@@ -230,6 +227,4 @@ fn empty_name_mapping_preserves_physical_name_binding() {
             "row {id}: physical-name fallback must still bind NEW_COL correctly with an empty name_mapping"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

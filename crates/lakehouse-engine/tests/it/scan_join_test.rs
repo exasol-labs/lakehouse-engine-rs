@@ -237,11 +237,11 @@ fn ordered_join_spec(
     spec
 }
 
-fn ordered_top_n_join_fixture(dir_tag: &str) -> (std::path::PathBuf, ScanSpec) {
-    let dir = std::env::temp_dir().join(format!("{dir_tag}_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let orders = write_orders(&dir);
-    let customer = write_customer(&dir);
+fn ordered_top_n_join_fixture() -> (tempfile::TempDir, ScanSpec) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let orders = write_orders(dir);
+    let customer = write_customer(dir);
 
     let mut spec = ordered_join_spec(
         orders,
@@ -253,7 +253,7 @@ fn ordered_top_n_join_fixture(dir_tag: &str) -> (std::path::PathBuf, ScanSpec) {
         2,
     );
     spec.common.order_by = vec![sort_key("O_ORDERKEY", true, true)];
-    (dir, spec)
+    (tmp, spec)
 }
 
 fn sort_key(column: &str, ascending: bool, nulls_last: bool) -> SortKey {
@@ -333,10 +333,10 @@ fn join_spec_reconstitutes_two_file_lists() {
 /// Scenario: Scan registers both tables and executes the inner equi-join
 #[test]
 fn join_registers_each_side_against_its_own_backend() {
-    let dir = std::env::temp_dir().join(format!("lh_join_inner_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let orders = write_orders(&dir);
-    let customer = write_customer(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let orders = write_orders(dir);
+    let customer = write_customer(dir);
 
     let spec = join_spec(
         vec![orders],
@@ -385,17 +385,15 @@ fn join_registers_each_side_against_its_own_backend() {
         got, expected,
         "each matched order pairs with its customer name"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Scenario: Join projection, filter, and LIMIT are applied and rows streamed through the Arrow C Data Interface
 #[test]
 fn join_projection_filter_limit_streamed() {
-    let dir = std::env::temp_dir().join(format!("lh_join_pfl_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let orders = write_orders(&dir);
-    let customer = write_customer(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let orders = write_orders(dir);
+    let customer = write_customer(dir);
 
     let spec = join_spec(
         vec![orders],
@@ -437,17 +435,15 @@ fn join_projection_filter_limit_streamed() {
         .expect("C_NAME must be Utf8");
     // Which order survives is nondeterministic, but both belong to Alice.
     assert_eq!(name.value(0), "Alice", "the custkey-10 customer is Alice");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Scenario: Each side of a broadcast join materializes its own partition columns
 #[test]
 fn each_join_side_materializes_its_own_partition_columns() {
-    let dir = std::env::temp_dir().join(format!("lh_join_partition_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let (orders_url, orders_size) = write_orders(&dir);
-    let (customer_url, customer_size) = write_customer(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let (orders_url, orders_size) = write_orders(dir);
+    let (customer_url, customer_size) = write_customer(dir);
 
     let fact_file = FileEntry::with_partition_values(
         orders_url,
@@ -538,16 +534,14 @@ fn each_join_side_materializes_its_own_partition_columns() {
             );
         }
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn join_limit_bounds_joined_output_not_scanned_input() {
-    let dir = std::env::temp_dir().join(format!("lh_join_limit_bound_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let orders = write_orders_leading_unmatched(&dir);
-    let customer = write_customer(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let orders = write_orders_leading_unmatched(dir);
+    let customer = write_customer(dir);
 
     let spec = join_spec(
         vec![orders],
@@ -586,13 +580,11 @@ fn join_limit_bounds_joined_output_not_scanned_input() {
         has_no_fetch_below(hj.right()),
         "the post-join cap must not appear as a fetch on the fact input"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn join_order_by_limit_emits_bounded_top_n_after_join() {
-    let (dir, spec) = ordered_top_n_join_fixture("lh_join_top_n");
+    let (_tmp, spec) = ordered_top_n_join_fixture();
 
     let batches = run_join(&spec, &[ExaType::Int64, scan_fixture::varchar()]);
     assert_eq!(
@@ -600,13 +592,11 @@ fn join_order_by_limit_emits_bounded_top_n_after_join() {
         vec![(3, "Carol".to_string()), (2, "Bob".to_string())],
         "the shard must emit its own top-2 under the join block's ordering"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn join_order_by_limit_plans_as_topk_above_join() {
-    let (dir, spec) = ordered_top_n_join_fixture("lh_join_top_n_plan");
+    let (_tmp, spec) = ordered_top_n_join_fixture();
 
     let plan = block_on(async {
         let session = SessionContext::new_with_config(session_config_for_spec(&spec));
@@ -639,17 +629,15 @@ fn join_order_by_limit_plans_as_topk_above_join() {
             "the post-join ordering must not appear as a sort on the {side} input:\n{rendered}"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Scenario: A join shard ranks each sort key by the value it emits
 #[test]
 fn join_top_n_ranks_an_empty_string_key_as_null() {
-    let dir = std::env::temp_dir().join(format!("lh_join_blank_top_n_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let orders = write_orders(&dir);
-    let customer = write_customer_with_blank_names(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let orders = write_orders(dir);
+    let customer = write_customer_with_blank_names(dir);
     let emits = [ExaType::Int64, scan_fixture::varchar()];
 
     let cases = [
@@ -682,17 +670,15 @@ fn join_top_n_ranks_an_empty_string_key_as_null() {
             "{message}"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Scenario: The bounded dimension side is the hash-join build side
 #[test]
 fn join_build_side_is_dimension() {
-    let dir = std::env::temp_dir().join(format!("lh_join_build_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let orders = write_orders(&dir);
-    let customer = write_customer(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let orders = write_orders(dir);
+    let customer = write_customer(dir);
 
     let spec = join_spec(
         vec![orders],
@@ -734,8 +720,6 @@ fn join_build_side_is_dimension() {
             .any(|c| c == "O_ORDERKEY" || c == "O_TOTALPRICE"),
         "build side must NOT carry fact columns; got {build_side_cols:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn find_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -765,9 +749,9 @@ fn has_no_sort_below(plan: &Arc<dyn ExecutionPlan>) -> bool {
 fn unreadable_join_file_error_redacts_both_sides_credentials() {
     // No S3 store is registered, so neither secret could appear anyway; the falsifiable
     // redaction proof is [`a_dimension_side_read_failure_redacts_the_dimension_sides_credential`].
-    let dir = std::env::temp_dir().join(format!("lh_join_err_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let orders = write_orders(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let orders = write_orders(dir);
     let missing = file_url(&dir.join("does_not_exist_customer.parquet"));
 
     let spec = join_spec(
@@ -811,8 +795,6 @@ fn unreadable_join_file_error_redacts_both_sides_credentials() {
         !text.contains("DIMSECRETVALUE"),
         "error must not leak the dimension side's secret_key value: {text}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A loopback endpoint refusing every request with a 403 whose XML body echoes `message`.
