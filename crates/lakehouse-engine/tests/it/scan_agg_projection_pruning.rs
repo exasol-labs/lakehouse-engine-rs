@@ -1,7 +1,7 @@
 //! Aggregate scans are pruned by DataFusion's projection pushdown from the aggregate /
 //! group-key SQL, not by `ScanSpec.projection` (#145).
 
-mod scan_fixture;
+use crate::scan_fixture;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

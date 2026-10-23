@@ -2,7 +2,7 @@
 //! context, so "no dropped shards" holds only if the union of per-row [`run_scan_one`]
 //! calls covers every shard. This harness mirrors `run_scan` but does not call it.
 
-mod scan_fixture;
+use crate::scan_fixture;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

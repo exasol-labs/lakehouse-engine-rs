@@ -1,4 +1,4 @@
-mod scan_fixture;
+use crate::scan_fixture;
 
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};

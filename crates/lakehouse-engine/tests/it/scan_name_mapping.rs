@@ -1,6 +1,6 @@
 //! `schema.name-mapping.default` field-id resolution for Parquet columns without field-ids.
 
-mod scan_fixture;
+use crate::scan_fixture;
 
 use std::collections::HashMap;
 use std::sync::Arc;

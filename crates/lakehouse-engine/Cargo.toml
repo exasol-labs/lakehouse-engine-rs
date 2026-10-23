@@ -104,6 +104,11 @@ futures             = { workspace = true }
 anyhow              = { workspace = true }
 aws-sdk-glue        = { workspace = true }
 
+# Host integration tests share the `it` binary (tests/it/main.rs). This one keeps its own process
+# because every scan resets the process-global footer record it asserts on (#523).
+[[test]]
+name = "scan_footer_refetch_observable"
+
 [[test]]
 name = "e2e_local"
 required-features = ["exasol-e2e"]

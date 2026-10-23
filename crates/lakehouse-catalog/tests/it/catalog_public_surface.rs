@@ -21,22 +21,22 @@ use lakehouse_catalog::{
 };
 
 const CATALOG_SOURCES: &[(&str, &str)] = &[
-    ("auth.rs", include_str!("../src/auth.rs")),
-    ("client.rs", include_str!("../src/client.rs")),
-    ("creds.rs", include_str!("../src/creds.rs")),
-    ("iceberg_io.rs", include_str!("../src/iceberg_io.rs")),
-    ("lib.rs", include_str!("../src/lib.rs")),
-    ("namespace.rs", include_str!("../src/namespace.rs")),
-    ("redaction.rs", include_str!("../src/redaction.rs")),
-    ("session.rs", include_str!("../src/session.rs")),
-    ("sigv4.rs", include_str!("../src/sigv4.rs")),
-    ("storage.rs", include_str!("../src/storage.rs")),
-    ("sts.rs", include_str!("../src/sts.rs")),
-    ("vended.rs", include_str!("../src/vended.rs")),
-    ("unity/mod.rs", include_str!("../src/unity/mod.rs")),
-    ("unity/auth.rs", include_str!("../src/unity/auth.rs")),
-    ("unity/client.rs", include_str!("../src/unity/client.rs")),
-    ("unity/vended.rs", include_str!("../src/unity/vended.rs")),
+    ("auth.rs", include_str!("../../src/auth.rs")),
+    ("client.rs", include_str!("../../src/client.rs")),
+    ("creds.rs", include_str!("../../src/creds.rs")),
+    ("iceberg_io.rs", include_str!("../../src/iceberg_io.rs")),
+    ("lib.rs", include_str!("../../src/lib.rs")),
+    ("namespace.rs", include_str!("../../src/namespace.rs")),
+    ("redaction.rs", include_str!("../../src/redaction.rs")),
+    ("session.rs", include_str!("../../src/session.rs")),
+    ("sigv4.rs", include_str!("../../src/sigv4.rs")),
+    ("storage.rs", include_str!("../../src/storage.rs")),
+    ("sts.rs", include_str!("../../src/sts.rs")),
+    ("vended.rs", include_str!("../../src/vended.rs")),
+    ("unity/mod.rs", include_str!("../../src/unity/mod.rs")),
+    ("unity/auth.rs", include_str!("../../src/unity/auth.rs")),
+    ("unity/client.rs", include_str!("../../src/unity/client.rs")),
+    ("unity/vended.rs", include_str!("../../src/unity/vended.rs")),
 ];
 
 fn source(name: &str) -> &'static str {

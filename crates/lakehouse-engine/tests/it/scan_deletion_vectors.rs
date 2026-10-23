@@ -2,7 +2,7 @@
 //! fixture: 10 rows of `value` int32, with a deletion vector removing positions 0 and 9
 //! (verified against the real sidecar bytes via `delta_kernel`'s decoder).
 
-mod scan_fixture;
+use crate::scan_fixture;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

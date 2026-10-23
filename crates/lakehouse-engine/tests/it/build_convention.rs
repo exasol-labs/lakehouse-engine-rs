@@ -1,4 +1,4 @@
-const WORKSPACE_AGENTS_MD: &str = include_str!("../../../AGENTS.md");
+const WORKSPACE_AGENTS_MD: &str = include_str!("../../../../AGENTS.md");
 
 #[test]
 fn host_release_build_documented_unloadable() {
@@ -77,6 +77,55 @@ fn make_test_e2e_runs_every_e2e_local_module() {
                 main_rs.lines().any(|line| line == format!("mod {stem};")),
                 "tests/e2e_local/main.rs must declare `mod {stem};`"
             );
+        }
+    }
+}
+
+/// Each separate test binary statically links the whole engine (#523), so a top-level test file is
+/// a deliberate `[[test]]` target, and a module file the `it` binary does not declare never runs.
+#[test]
+fn integration_tests_build_into_one_binary_per_crate() {
+    let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    for crate_name in ["lakehouse-engine", "lakehouse-catalog"] {
+        let tests_dir = crates_dir.join(crate_name).join("tests");
+        let manifest = std::fs::read_to_string(crates_dir.join(crate_name).join("Cargo.toml"))
+            .expect("crate manifest must be readable");
+        let mut lines = manifest.lines();
+        let declared_targets: Vec<String> = std::iter::from_fn(|| {
+            lines.find(|line| *line == "[[test]]")?;
+            lines.next().map(str::to_owned)
+        })
+        .collect();
+        for entry in std::fs::read_dir(&tests_dir).expect("tests dir must be listable") {
+            let path = entry.expect("tests dir entry").path();
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if path.extension().is_some_and(|e| e == "rs") {
+                assert!(
+                    declared_targets.contains(&format!("name = \"{stem}\"")),
+                    "{crate_name}/tests/{stem}.rs builds its own binary: move it into tests/it/ \
+                     or declare it as a [[test]] target"
+                );
+            }
+        }
+
+        let it_dir = tests_dir.join("it");
+        let main_rs = std::fs::read_to_string(it_dir.join("main.rs"))
+            .expect("tests/it/main.rs must be readable");
+        for entry in std::fs::read_dir(&it_dir).expect("tests/it must be listable") {
+            let path = entry.expect("tests/it entry").path();
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if stem != "main" && path.extension().is_some_and(|e| e == "rs") {
+                assert!(
+                    main_rs.lines().any(|line| line == format!("mod {stem};")),
+                    "{crate_name}/tests/it/main.rs must declare `mod {stem};`"
+                );
+            }
         }
     }
 }

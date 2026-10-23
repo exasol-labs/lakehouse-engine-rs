@@ -2,7 +2,7 @@
 //! (`1`/`4` → `a`, `2` → `b`, `3` → `c`, `5` → `e`, `6` → the
 //! `__HIVE_DEFAULT_PARTITION__` file, whose commit logs `"letter": null`).
 
-mod scan_fixture;
+use crate::scan_fixture;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -20,7 +20,7 @@ use lakehouse_engine::scan::{
 use object_store::local::LocalFileSystem;
 use parquet::arrow::ArrowWriter;
 
-mod scan_fixture;
+use crate::scan_fixture;
 
 fn dummy_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
