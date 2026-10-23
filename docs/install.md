@@ -299,17 +299,21 @@ Follow these steps in order when you cannot run the [one-line command](#install-
 
 ### Which SLC version
 
-The SLC version must equal the `exasol-udf-sdk` version that the engine release pins in its root
-`Cargo.toml`. The newest SLC release is not always the right one. For example, engine v0.56.0
-needs SLC 0.32.0, and engine v0.56.1 needs SLC 0.33.0. Look up the version for your release:
+Each engine release needs one exact SLC version. The newest SLC release is not always the right
+one. For example, engine v0.56.0 needs SLC 0.32.0, and engine v0.56.1 needs SLC 0.33.0. A different
+SLC version installs without an error, but every engine call then fails with `Fingerprint mismatch`.
+
+From v0.56.3 on, the first line of the
+[release notes](https://github.com/exasol-labs/lakehouse-engine-rs/releases) names the SLC version,
+for example "Requires the Rust SLC v0.33.0".
+
+For a release before v0.56.3, read the version from the release's root `Cargo.toml`. The SLC
+version equals the `exasol-udf-sdk` version pinned there:
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/exasol-labs/lakehouse-engine-rs/v<VERSION>/Cargo.toml" \
 | grep '^exasol-udf-sdk'
 ```
-
-Newer release notes also name the SLC version. A different SLC version installs without an error,
-but every engine call then fails with `Fingerprint mismatch`.
 
 ### Privileges for a manual install
 
