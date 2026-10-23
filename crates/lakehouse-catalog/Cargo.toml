@@ -3,6 +3,7 @@ name = "lakehouse-catalog"
 version = "0.8.1"
 edition = "2024"
 license.workspace = true
+autotests = false
 
 [lib]
 name = "lakehouse_catalog"
@@ -34,3 +35,7 @@ aws-sdk-sts = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+# Test targets are listed explicitly (autotests = false), so a new top-level tests/*.rs file never adds a binary silently (#523).
+[[test]]
+name = "it"

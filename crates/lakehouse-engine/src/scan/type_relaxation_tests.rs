@@ -264,9 +264,9 @@ fn parquet_column_types(path: &Path) -> Vec<DataType> {
 
 #[tokio::test]
 async fn a_physical_type_outside_identity_and_the_supported_set_is_refused_before_any_cast() {
-    let dir = std::env::temp_dir().join(format!("lh_type_refusal_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let table_root = url::Url::from_directory_path(&dir)
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let table_root = url::Url::from_directory_path(dir)
         .expect("absolute directory")
         .to_string();
     let cases: Vec<(ArrayRef, &str)> = vec![
@@ -330,8 +330,8 @@ async fn every_supported_relaxation_pair_reads_its_real_values_from_a_narrow_par
          added without a real read fails here rather than shipping unread"
     );
 
-    let dir = std::env::temp_dir().join(format!("lh_type_relaxation_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
 
     for (index, case) in cases.into_iter().enumerate() {
         let path = dir.join(format!("pair_{index}.parquet"));
@@ -378,11 +378,8 @@ async fn every_supported_relaxation_pair_reads_its_real_values_from_a_narrow_par
 /// Scenario: A narrow physical column binds to the current wider logical type and is cast per file
 #[tokio::test]
 async fn a_narrow_physical_column_is_cast_to_the_current_logical_type_per_file() {
-    let dir = std::env::temp_dir().join(format!(
-        "lh_type_relaxation_per_file_{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
 
     let pre_widening_path = dir.join("pre_widening_int32.parquet");
     let pre_widening = write_parquet(

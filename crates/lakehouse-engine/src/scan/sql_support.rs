@@ -1,5 +1,5 @@
 /// Uppercase aliases let identifiers resolved in uppercase match any Parquet field casing.
-/// Public so `tests/scan_agg_projection_pruning.rs` builds the same inner SELECT as production.
+/// Public so `tests/it/scan_agg_projection_pruning.rs` builds the same inner SELECT as production.
 pub fn build_alias_items(schema: &datafusion::common::DFSchema) -> Vec<String> {
     schema
         .fields()

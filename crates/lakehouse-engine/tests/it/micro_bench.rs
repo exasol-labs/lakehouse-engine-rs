@@ -1,6 +1,6 @@
 //! Host micro-benchmarks isolating the pre-SDK emit cost (coerce + Arrow C Data export, excluding the
 //! `MT_EMIT` round-trip, which only exists inside the UDF runtime) and local scan+decode.
-//! Full numbers: `cargo test -p lakehouse-engine --test micro_bench -- --ignored --nocapture`.
+//! Full numbers: `cargo test -p lakehouse-engine --test it micro_bench -- --ignored --nocapture`.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -312,8 +312,8 @@ fn bench_scan_only() {
         .unwrap();
     let n = 2_000_000usize;
     let iters = 5usize;
-    let dir = std::env::temp_dir().join(format!("lh_scan_bench_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let path = dir.join("lineitem.parquet");
     let (url, disk_bytes) = write_lineitem_parquet(&path, n);
 
@@ -348,8 +348,6 @@ fn bench_scan_only() {
         total_decoded as f64 / GB / elapsed,
         (rss_after.saturating_sub(rss_before)) / (1024 * 1024),
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -358,8 +356,8 @@ fn scan_path_smoke_positive_throughput() {
         .enable_all()
         .build()
         .unwrap();
-    let dir = std::env::temp_dir().join(format!("lh_scan_smoke_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let path = dir.join("lineitem.parquet");
     let (url, disk_bytes) = write_lineitem_parquet(&path, 5000);
     let start = Instant::now();
@@ -368,5 +366,4 @@ fn scan_path_smoke_positive_throughput() {
     assert_eq!(rows, 5000, "drained every row");
     let gb_per_s = (disk_bytes as f64 / GB) / secs.max(1e-9);
     assert!(gb_per_s > 0.0, "scan path GB/sec must be positive");
-    let _ = std::fs::remove_dir_all(&dir);
 }

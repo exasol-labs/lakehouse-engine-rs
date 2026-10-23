@@ -228,7 +228,7 @@ pub(super) fn row_filter_pushdown_parquet_format() -> ParquetFormat {
 /// Statistics, page-index, and bloom-filter pruning stay ON by measured decision: leaf min/max
 /// of a nested column would falsely exclude rendered documents, but the pruning predicate is
 /// built from the adapted (rendered) expression, finding no `Column` leaf, and row-group
-/// pruning cannot map a nested field to a leaf. `tests/scan_parquet_pruning.rs` pins this.
+/// pruning cannot map a nested field to a leaf. `tests/it/scan_parquet_pruning.rs` pins this.
 pub(super) fn scan_table_parquet_format(resolution: &FieldIdResolution) -> ParquetFormat {
     if resolution.nested_members.is_empty() {
         row_filter_pushdown_parquet_format()

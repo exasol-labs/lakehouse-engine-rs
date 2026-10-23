@@ -1,4 +1,4 @@
-const CATALOG_MANIFEST: &str = include_str!("../Cargo.toml");
+const CATALOG_MANIFEST: &str = include_str!("../../Cargo.toml");
 
 const FORBIDDEN_DIRECT_DEPENDENCIES: &[&str] = &[
     "arrow",

@@ -785,8 +785,8 @@ async fn field_id_adapter_reads_renamed_column_rows() {
     use std::collections::HashMap;
 
     // Pre-rename layout: id (field-id 1), score (field-id 2) = 10 * id.
-    let dir = std::env::temp_dir().join(format!("lh_fieldid_rows_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let path = dir.join("renamed.parquet");
 
     let physical_schema = Arc::new(Schema::new(vec![
@@ -908,8 +908,8 @@ async fn field_id_adapter_reads_divergent_layouts_across_files() {
         )]))
     }
 
-    let dir = std::env::temp_dir().join(format!("lh_fieldid_multi_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
 
     // ids 1..=3 as old `score`, 4..=6 as new `rating`; value = 10 * id.
     let write_file = |name: &str, physical_col: &str, ids: &[i64]| -> String {
@@ -1606,8 +1606,8 @@ async fn identity_bound_field_reads_a_case_folded_file_column_rows() {
     use crate::scan::test_support::{run_scan, write_parquet};
     use arrow::array::{ArrayRef, Int64Array};
 
-    let dir = std::env::temp_dir().join(format!("lh_case_fold_rows_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let int64s = |values: &[i64]| Arc::new(Int64Array::from(values.to_vec())) as ArrayRef;
     let folded = write_parquet(
         &dir.join("folded.parquet"),
@@ -1638,7 +1638,6 @@ async fn identity_bound_field_reads_a_case_folded_file_column_rows() {
     spec.common.projection = vec!["CUSTOMERID".into()];
 
     let batches = run_scan(&spec).await;
-    let _ = std::fs::remove_dir_all(&dir);
     let mut got: Vec<i64> = batches
         .iter()
         .flat_map(|batch| {

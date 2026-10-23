@@ -1,4 +1,4 @@
-const WORKSPACE_AGENTS_MD: &str = include_str!("../../../AGENTS.md");
+const WORKSPACE_AGENTS_MD: &str = include_str!("../../../../AGENTS.md");
 
 #[test]
 fn host_release_build_documented_unloadable() {

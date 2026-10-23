@@ -1,4 +1,4 @@
-mod scan_fixture;
+use crate::scan_fixture;
 
 use std::sync::Arc;
 
@@ -74,9 +74,9 @@ fn single_partition_spec(file_url: String) -> ScanSpec {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_scan_plan_has_no_repartition_stage() {
-    let dir = std::env::temp_dir().join(format!("lh_plan_shape_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let file_url = write_local_parquet(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let file_url = write_local_parquet(dir);
     let spec = single_partition_spec(file_url);
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
@@ -137,8 +137,6 @@ async fn raw_scan_plan_has_no_repartition_stage() {
         rows_lean, rows_baseline,
         "lean repartition-free plan must produce the same rows as the un-optimized plan"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn write_local_parquet_with_score(dir: &std::path::Path) -> String {
@@ -172,9 +170,9 @@ fn write_local_parquet_with_score(dir: &std::path::Path) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_scan_projects_mixed_column_and_expression_items() {
-    let dir = std::env::temp_dir().join(format!("lh_mixed_proj_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let file_url = write_local_parquet_with_score(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let file_url = write_local_parquet_with_score(dir);
 
     let mut spec = single_partition_spec(file_url);
     spec.common.filter = None;
@@ -240,8 +238,6 @@ async fn raw_scan_projects_mixed_column_and_expression_items() {
         ],
         "the expression columns must evaluate: score*2 and UPPER(name)"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 async fn collect_rows(ctx: &SessionContext, spec: &ScanSpec) -> Vec<(i64, String)> {
@@ -283,9 +279,9 @@ async fn collect_rows(ctx: &SessionContext, spec: &ScanSpec) -> Vec<(i64, String
 async fn order_by_spec_emits_bounded_topk_not_global_sort() {
     // Both SortExec display forms contain "SortExec", so the check discriminates on
     // `TopK(fetch=` versus `SortExec: expr=[`.
-    let dir = std::env::temp_dir().join(format!("lh_topn_shape_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let file_url = write_local_parquet(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let file_url = write_local_parquet(dir);
 
     let mut spec = single_partition_spec(file_url);
     spec.common.filter = None;
@@ -317,8 +313,6 @@ async fn order_by_spec_emits_bounded_topk_not_global_sort() {
         !rendered.contains("SortExec: expr=["),
         "ordered top-N plan must not contain an unbounded global SortExec:\n{rendered}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) -> ScanSpec {
@@ -699,10 +693,10 @@ fn sum_row_groups_pruned(plan: &dyn ExecutionPlan) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_plan_lean_and_prunes_with_access_plan() {
     // Uses `register_files`: `register_parquet` never attaches a base `ParquetAccessPlan`.
-    let dir = std::env::temp_dir().join(format!("lh_gate_access_plan_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let data_url = write_multi_row_group_parquet(&dir);
-    let delete_url = write_positional_delete_parquet(&dir, &data_url);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_multi_row_group_parquet(dir);
+    let delete_url = write_positional_delete_parquet(dir, &data_url);
 
     let mut spec = single_partition_spec(data_url.clone());
     spec.files = vec![FileEntry::with_deletes(
@@ -781,6 +775,4 @@ async fn raw_plan_lean_and_prunes_with_access_plan() {
         rows, expected,
         "surviving rows must be exactly ids 200..=399 except the deleted 250"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

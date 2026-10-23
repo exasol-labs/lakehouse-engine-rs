@@ -221,8 +221,8 @@ script, translated from `run.sh`'s Q1-Q9b and NQ1-NQ5 — keep all four in sync 
 
 Two host-runnable micro-benchmarks isolate the two halves of the per-instance
 scan path so end-to-end throughput can be attributed (plan tasks 5.1 / 5.2).
-They live in `crates/lakehouse-engine/tests/micro_bench.rs` (an `#[ignore]`-gated
-test target — no new dependency, no `criterion`) and need neither SeaweedFS nor a
+They live in `crates/lakehouse-engine/tests/it/micro_bench.rs` (`#[ignore]`-gated tests
+in the `it` test binary, no new dependency, no `criterion`) and need neither SeaweedFS nor a
 cluster:
 
 - **5.1 emit-only** — the pre-SDK emit work on every batch: `coerce_batch_to_exa_types`
@@ -237,13 +237,13 @@ cluster:
 
 ```bash
 # full numbers (prints rows/sec, GB/sec, RSS delta per schema):
-cargo test -p lakehouse-engine --test micro_bench -- --ignored --nocapture
+cargo test -p lakehouse-engine --test it micro_bench -- --ignored --nocapture
 # release-opt numbers — write to an out-of-tree target dir so the Docker-owned
 # target/release tree (and its root-owned .cargo-lock) is never touched:
-CARGO_TARGET_DIR=/tmp/lh-bench cargo test -p lakehouse-engine --test micro_bench \
+CARGO_TARGET_DIR=/tmp/lh-bench cargo test -p lakehouse-engine --test it micro_bench \
   --release -- --ignored --nocapture
 # CI smoke (non-ignored): asserts each path yields a positive GB/sec
-cargo test -p lakehouse-engine --test micro_bench
+cargo test -p lakehouse-engine --test it micro_bench
 ```
 
 ## Notes

@@ -1,7 +1,7 @@
 //! Aggregate scans are pruned by DataFusion's projection pushdown from the aggregate /
 //! group-key SQL, not by `ScanSpec.projection` (#145).
 
-mod scan_fixture;
+use crate::scan_fixture;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -140,9 +140,9 @@ fn leaf_scan_projected_columns(plan: &Arc<dyn ExecutionPlan>) -> BTreeSet<String
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_group_agg_scan_prunes_to_referenced_columns() {
-    let dir = std::env::temp_dir().join(format!("lh_agg_prune_single_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let file_url = write_local_parquet(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let file_url = write_local_parquet(dir);
 
     let mut spec = agg_spec(file_url);
     let aggregates = vec![AggregatePlan {
@@ -168,15 +168,13 @@ async fn single_group_agg_scan_prunes_to_referenced_columns() {
         projected,
         TABLE_COLUMNS.len()
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grouped_agg_scan_prunes_to_referenced_columns() {
-    let dir = std::env::temp_dir().join(format!("lh_agg_prune_grouped_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let file_url = write_local_parquet(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let file_url = write_local_parquet(dir);
 
     let mut spec = agg_spec(file_url);
     let group_keys = vec![r#""REGION""#.to_string()];
@@ -211,6 +209,4 @@ async fn grouped_agg_scan_prunes_to_referenced_columns() {
         !projected.contains("CATEGORY"),
         "the unreferenced `category` column must be pruned, but the scan read it: {projected:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
