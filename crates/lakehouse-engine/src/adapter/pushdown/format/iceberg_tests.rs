@@ -220,6 +220,44 @@ fn plan_errors_redact_the_literal_azure_secret_values() {
     );
 }
 
+/// A missing local file, not a closed port: object-store reads retry a refused connection with
+/// seconds of backoff, a not-found read is never retried.
+#[tokio::test]
+async fn an_unreadable_manifest_list_fails_planning_naming_its_cause() {
+    let body = load_table_body(serde_json::json!({
+        "last-sequence-number": 1,
+        "current-snapshot-id": 1,
+        "snapshots": [{
+            "snapshot-id": 1,
+            "sequence-number": 1,
+            "timestamp-ms": 0,
+            "manifest-list": "file:///lakehouse-engine-missing-manifest-list/snap-1.avro",
+            "summary": {"operation": "append"},
+            "schema-id": 0
+        }]
+    }));
+    let table = iceberg::table::Table::builder()
+        .identifier(iceberg::TableIdent::from_strs(["db", "t"]).expect("identifier"))
+        .file_io(iceberg::io::FileIO::new_with_fs())
+        .runtime(iceberg::Runtime::try_current().expect("runtime"))
+        .metadata(
+            serde_json::from_value::<iceberg::spec::TableMetadata>(body["metadata"].clone())
+                .expect("metadata"),
+        )
+        .build()
+        .expect("table");
+
+    let error = plan_files_from_table(table, "db.t", None, &[])
+        .await
+        .expect_err("an unreadable manifest list must fail planning");
+
+    let text = error.to_string();
+    assert!(
+        text.contains("Iceberg file") && text.contains("No such file or directory"),
+        "{text}"
+    );
+}
+
 #[test]
 fn iceberg_delete_mechanism_maps_position_equality_and_the_data_sentinel() {
     let mechanism =

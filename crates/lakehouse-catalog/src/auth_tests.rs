@@ -206,6 +206,24 @@ async fn oauth2_grant_built_from_client_credentials() {
 }
 
 #[tokio::test]
+async fn oauth2_grant_transport_failure_names_its_cause() {
+    let mut creds = creds_no_auth();
+    creds.client_id = Some("client-id-sentinel".into());
+    creds.client_secret = Some(CLIENT_SECRET.into());
+
+    let err = oauth2_client_credentials_grant(&reqwest::Client::new(), CLOSED_PORT_URI, &creds)
+        .await
+        .expect_err("a closed token endpoint must fail the grant");
+
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("OAuth2 token request failed: ") && msg.contains(CLOSED_PORT_CAUSE),
+        "{msg}"
+    );
+    assert!(!msg.contains(CLIENT_SECRET), "{msg}");
+}
+
+#[tokio::test]
 async fn oauth2_grant_errors_for_the_validation_rejected_shape() {
     let mut creds = creds_no_auth();
     creds.token = Some(BEARER_TOK.into());

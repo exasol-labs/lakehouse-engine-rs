@@ -11,6 +11,7 @@ use futures::future::try_join_all;
 use lakehouse_catalog::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogTable, CatalogTableIdent,
     CatalogTableType, ColumnSourceType, SkipReason, SkippedTable, TableAdmission, TableFormat,
+    error_chain,
 };
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
@@ -101,7 +102,13 @@ impl CatalogClient for DirectStorageCatalogClient {
                 .store
                 .list_with_delimiter(Some(&self.prefix))
                 .await
-                .map_err(|e| UdfError::User(format!("failed to list '{}': {e}", self.prefix)))?;
+                .map_err(|e| {
+                    UdfError::User(format!(
+                        "failed to list '{}': {}",
+                        self.prefix,
+                        error_chain(&e)
+                    ))
+                })?;
 
             let mut names: Vec<String> = listed
                 .common_prefixes

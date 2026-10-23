@@ -3464,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-catalog"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "aws-credential-types",
  "aws-sdk-glue",
@@ -3477,6 +3477,7 @@ dependencies = [
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
  "reqwest 0.12.28",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
@@ -3485,7 +3486,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.56.1"
+version = "0.56.2"
 dependencies = [
  "aes-gcm",
  "anyhow",

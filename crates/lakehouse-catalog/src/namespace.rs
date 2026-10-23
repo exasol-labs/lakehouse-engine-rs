@@ -1,3 +1,4 @@
+use crate::error_chain;
 use crate::redaction::redact_credentials;
 use crate::session::{build_rest_catalog, glue_catalog_prefix};
 use crate::sigv4::required_signing_region;
@@ -80,7 +81,7 @@ fn list_in_namespace_unsigned<'a>(
             UdfError::User(format!(
                 "failed to list tables in namespace '{}': {}",
                 ns.join("."),
-                redact_credentials(&e.to_string())
+                redact_credentials(&error_chain(&e))
             ))
         })?;
         all.extend(tables);
@@ -92,7 +93,7 @@ fn list_in_namespace_unsigned<'a>(
                 UdfError::User(format!(
                     "failed to list namespaces under '{}': {}",
                     ns.join("."),
-                    redact_credentials(&e.to_string())
+                    redact_credentials(&error_chain(&e))
                 ))
             })?;
 
@@ -161,7 +162,7 @@ impl<'a> SignedEnumeration<'a> {
         let response = client.execute(signed).await.map_err(|e| {
             UdfError::User(format!(
                 "catalog request failed: {}",
-                redact_credentials(&e.to_string())
+                redact_credentials(&error_chain(&e))
             ))
         })?;
 

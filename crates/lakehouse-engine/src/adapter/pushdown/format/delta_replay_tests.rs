@@ -510,6 +510,23 @@ fn a_table_root_holding_no_delta_log_is_refused() {
     );
 }
 
+#[test]
+fn a_failed_read_after_the_snapshot_opened_names_its_transport_cause() {
+    let snapshot = open_fixture("basic_partitioned");
+    let transport = reqwest::blocking::get("http://127.0.0.1:1").expect_err("a closed port");
+
+    let error = snapshot.failed_to(
+        "replay the Delta log",
+        &delta_kernel::KernelError::generic_err(transport),
+    );
+
+    let text = error.to_string();
+    assert!(
+        text.contains("failed to replay the Delta log") && text.contains("Connection refused"),
+        "{text}"
+    );
+}
+
 #[derive(Debug)]
 struct ReadRecordingStore {
     inner: Arc<dyn ObjectStore>,
