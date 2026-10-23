@@ -291,8 +291,11 @@ Follow these steps in order when you cannot run the [one-line command](#install-
    [upload the release tarball](#appendix-manual-install-on-a-restricted-network).
 4. **Create the scripts.** See [Create the scripts by hand](#appendix-create-the-scripts-by-hand).
 5. **Check the version.** See [Version smoke test by hand](#appendix-version-smoke-test-by-hand).
-6. **Grant the virtual schema's owner its privileges.** See [Owner grants](security.md#owner-grants).
-7. **Create the CONNECTION and the virtual schema.** See [Point the VS at your data](#point-the-vs-at-your-data).
+6. **Create the CONNECTION.** See [Point the VS at your data](#point-the-vs-at-your-data).
+7. **Grant the virtual schema's owner its privileges.** The `ACCESS` grants name the CONNECTION, so
+   it must exist. See [Owner grants](security.md#owner-grants).
+8. **Create the virtual schema.** Creating it already runs the adapter as its owner, so the grants
+   must be in place. See [Point the VS at your data](#point-the-vs-at-your-data).
 
 ### Which SLC version
 
@@ -316,7 +319,7 @@ but every engine call then fails with `Fingerprint mismatch`.
 | 4. Create the scripts | `CREATE SESSION`, `CREATE SCHEMA`, and `CREATE SCRIPT` |
 | 5. Check the version | None beyond step 4. The scripts' owner can run its own scripts. |
 
-Steps 4 and 5 need no DBA role. For the privileges of steps 6 and 7, see [Security](security.md).
+Steps 4 and 5 need no DBA role. For the privileges of steps 6 to 8, see [Security](security.md).
 
 ## Appendix: build from source
 
