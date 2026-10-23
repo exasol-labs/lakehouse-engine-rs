@@ -81,39 +81,44 @@ fn make_test_e2e_runs_every_e2e_local_module() {
     }
 }
 
-/// Each separate test binary statically links the whole engine (#523), so a top-level test file is
-/// a deliberate `[[test]]` target, and a module file the `it` binary does not declare never runs.
+/// Each separate test binary statically links the whole engine (#523), so only `it` and the
+/// deliberate targets build one, and a module file the `it` binary does not declare never runs.
 #[test]
 fn integration_tests_build_into_one_binary_per_crate() {
-    let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    for crate_name in ["lakehouse-engine", "lakehouse-catalog"] {
-        let tests_dir = crates_dir.join(crate_name).join("tests");
-        let manifest = std::fs::read_to_string(crates_dir.join(crate_name).join("Cargo.toml"))
-            .expect("crate manifest must be readable");
-        let mut lines = manifest.lines();
-        let declared_targets: Vec<String> = std::iter::from_fn(|| {
-            lines.find(|line| *line == "[[test]]")?;
-            lines.next().map(str::to_owned)
-        })
-        .collect();
-        for entry in std::fs::read_dir(&tests_dir).expect("tests dir must be listable") {
-            let path = entry.expect("tests dir entry").path();
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            if path.extension().is_some_and(|e| e == "rs") {
-                assert!(
-                    declared_targets.contains(&format!("name = \"{stem}\"")),
-                    "{crate_name}/tests/{stem}.rs builds its own binary: move it into tests/it/ \
-                     or declare it as a [[test]] target"
-                );
+    let output = std::process::Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--offline",
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("cargo metadata must run");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cargo metadata must print JSON");
+    let mut extra_binaries = Vec::new();
+    for package in metadata["packages"].as_array().into_iter().flatten() {
+        let package_name = package["name"].as_str().unwrap_or_default();
+        for target in package["targets"].as_array().into_iter().flatten() {
+            let name = target["name"].as_str().unwrap_or_default();
+            let ungated = target["required-features"]
+                .as_array()
+                .is_none_or(Vec::is_empty);
+            if target["kind"] == serde_json::json!(["test"])
+                && ungated
+                && !["it", "scan_footer_refetch_observable"].contains(&name)
+            {
+                extra_binaries.push(format!("{package_name}/{name}"));
             }
         }
 
-        let it_dir = tests_dir.join("it");
-        let main_rs = std::fs::read_to_string(it_dir.join("main.rs"))
-            .expect("tests/it/main.rs must be readable");
+        let manifest_path = package["manifest_path"].as_str().unwrap_or_default();
+        let it_dir = std::path::Path::new(manifest_path).with_file_name("tests/it");
+        let Ok(main_rs) = std::fs::read_to_string(it_dir.join("main.rs")) else {
+            continue;
+        };
         for entry in std::fs::read_dir(&it_dir).expect("tests/it must be listable") {
             let path = entry.expect("tests/it entry").path();
             let stem = path
@@ -123,9 +128,13 @@ fn integration_tests_build_into_one_binary_per_crate() {
             if stem != "main" && path.extension().is_some_and(|e| e == "rs") {
                 assert!(
                     main_rs.lines().any(|line| line == format!("mod {stem};")),
-                    "{crate_name}/tests/it/main.rs must declare `mod {stem};`"
+                    "{package_name}/tests/it/main.rs must declare `mod {stem};`"
                 );
             }
         }
     }
+    assert!(
+        extra_binaries.is_empty(),
+        "each of these builds its own binary, move it into tests/it/: {extra_binaries:?}"
+    );
 }

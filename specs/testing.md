@@ -15,9 +15,9 @@ This file holds the rules for how this repository tests its behavior and how it 
 ### Test tiers
 
 - Unit tests run on the host with `cargo test`. They live in a sibling `_tests.rs` file (`AGENTS.md` § Code style).
-- There is no host integration tier. A host test that writes or lists files, reads an object store, or chains several modules to prove behavior is an E2E test in the wrong place. A test against a fake server is a fault-injection test.
+- Host integration tests live only in each crate's `it` binary. A new host test that reads an object store or chains several modules to prove behavior is an E2E test in the wrong place. A test against a fake server is a fault-injection test.
 - Scan UDF tests run `run()` on the host through `exasol_udf_sdk::test_support::TestContext` (`EmitPolicy`, `NextPolicy`). A new scan test uses this pattern.
-- Host tests under a crate's `tests/` directory build into one binary per crate, `tests/it/main.rs`, because each test binary statically links the whole engine. A new test file is a module declared in `tests/it/main.rs`. A top-level `tests/*.rs` file is a deliberate `[[test]]` target: an E2E suite, or `scan_footer_refetch_observable`, which keeps its own process because every scan resets the process-global footer record it asserts on. `tests/it/build_convention.rs` fails on an undeclared module or an unlisted top-level file.
+- Host tests under a crate's `tests/` directory build into one binary per crate, `tests/it/main.rs`, because each test binary statically links the whole engine. A new test file is a module declared in `tests/it/main.rs`. A top-level `tests/*.rs` file is a deliberate `[[test]]` target: an E2E suite, or `scan_footer_refetch_observable`, which keeps its own process because every scan resets the process-global footer record it asserts on. `tests/it/build_convention.rs` reads the test targets from `cargo metadata` and fails on any ungated test binary other than `it` and `scan_footer_refetch_observable`, or on a module file that `tests/it/main.rs` does not declare.
 - The `it` binary runs its tests as parallel threads of one process. A test that writes to the filesystem names its directory after its own module and test, and a test that asserts on process-global state either shares one lock with every test that mutates that state or keeps its own binary.
 - E2E tests run against a live Exasol and a real or containerized catalog and object store. Each E2E suite is a `[[test]]` target whose `required-features` names the suite's cargo feature, so the plain `cargo test` run never builds a suite or needs a stack.
 
@@ -25,9 +25,19 @@ This file holds the rules for how this repository tests its behavior and how it 
 
 - Two layers only. E2E tests prove the behavior a user sees, against the real stack. Unit tests cover pure logic (parsing, mapping, validation, building requests, reading answers). Each behavior is tested at one layer, not repeated at several. A coverage gap is closed by a unit test of pure logic, never by a multi-module host test or a fake.
 - A fake server is for fault injection only: failures an E2E test cannot produce, such as timeouts, cut-off answers, and unreachable hosts. There is at most one shared fake per external system. A fake never stands in for a catalog, object store, or STS to prove behavior, because it tests our idea of the external system, not the system.
-- Unit tests stay simple: one unit, plain inputs, and expected outputs, with no I/O, no written file, and no started server. They assert nothing on a fake's request log or call order, and no test reads source files.
+- Unit tests stay simple: one unit, plain inputs, and expected outputs, with no I/O, no written file, and no started server. They assert nothing on a fake's request log or call order, and no test reads source files, except a structural check (§ Structural checks).
 - No production function exists only so a test can inject a value.
 - Access control is proved end to end. A permission feature needs E2E tests for an allowed user, a denied user, a query over several tables where only some are granted, a view, and a revoked grant.
+
+### Structural checks
+
+- A structural rule covers dependency direction, visibility, the public API, or the build layout. It is enforced by the first of these that can express it:
+  1. The type system and crate boundaries: a crate split, `pub(crate)`, a sealed trait, or an exhaustive `match` with no wildcard arm.
+  2. A compile-time test: `static_assertions`, or a `trybuild` compile-fail case for code that must not compile.
+  3. A lint: `disallowed-types` or `disallowed-methods` in the crate's `clippy.toml`, `#![deny(unreachable_pub)]`, or `cargo-deny` `[bans]`.
+  4. A check over machine-readable build output: `cargo metadata` for targets and features, or a `cargo public-api` snapshot for the public API.
+  5. A check over raw source text, only for a property that exists only as text.
+- A level 4 or 5 check lives in the crate's `build_convention.rs` module. It is never part of a behavior test, and it never proves a scenario.
 
 ### Unit tests
 
