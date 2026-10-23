@@ -29,7 +29,7 @@ Any owner other than `SYS` or a DBA, whether a user or a role, needs:
 - `ACCESS` on the CONNECTION for `LAKEHOUSE_ADAPTER` and `LAKEHOUSE_SCAN`, because both scripts read it.
 - `CREATE VIRTUAL SCHEMA`, if it creates the virtual schema itself.
 
-The owner can hold each grant directly or through a role it holds. Grant them before `CREATE VIRTUAL SCHEMA`, because creating the virtual schema already runs the adapter as its owner. Choose one of two forms.
+The owner can hold each grant directly or through a role it holds. Grant them before `CREATE VIRTUAL SCHEMA`, because creating the virtual schema already runs the adapter as its owner. Choose one of three forms.
 
 **Per script.** A re-install drops these grants (see [Re-installing](#re-installing)).
 
@@ -50,6 +50,15 @@ GRANT ACCESS ON CONNECTION <conn> FOR SCHEMA <schema> TO <owner>;
 
 They also cover scripts created or replaced in `<schema>` later. Anyone who can put a script there that the owner runs, including the owner itself, can read the CONNECTION's secret with it. Prefer the per-script form unless that is acceptable.
 
+**Unscoped CONNECTION access.** This `ACCESS` grant names no script and no schema. With `EXECUTE` on the scripts' schema, these two grants also survive a re-install:
+
+```sql
+GRANT EXECUTE ON SCHEMA <schema> TO <owner>;
+GRANT ACCESS ON CONNECTION <conn> TO <owner>;
+```
+
+Any script the owner runs, in any schema, can then read the CONNECTION's secret. This is wider than the per-schema form. Use it only for an owner that may read the secret anyway.
+
 ### The install script's template
 
 The install script prints the per-script CONNECTION grants as a template with two options. Run one of them. Option 1 grants them to the installing user, which owns `<schema>`, so it needs no `EXECUTE` grant, and it owns the virtual schemas it creates. It still needs `CREATE VIRTUAL SCHEMA` to create one. Run the grants as the user that created the CONNECTION, which needs no DBA privilege, or as a DBA. Run them again after a re-install.
@@ -68,7 +77,7 @@ Readers still need only the reader grants, not membership in the role. Every mem
 
 ### Re-installing
 
-Re-running the installer replaces the scripts with `CREATE OR REPLACE SCRIPT`. That drops every per-script grant on them, `EXECUTE` and `ACCESS` alike, including those of the install script's role, so queries fail until you issue the grants again. Per-schema grants survive.
+Re-running the installer replaces the scripts with `CREATE OR REPLACE SCRIPT`. That drops every per-script grant on them, `EXECUTE` and `ACCESS` alike, including those of the install script's role, so queries fail until you issue the grants again. Per-schema grants and unscoped CONNECTION access survive.
 
 ### Missing grants
 

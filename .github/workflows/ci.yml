@@ -692,6 +692,18 @@ jobs:
             --manifest-path crates/lakehouse-engine/Cargo.toml \
             -c about.toml about.hbs -o THIRD-PARTY-LICENSES.md
 
+      # install.sh resolves the SLC the same way: it must equal the exasol-udf-sdk pin (#305).
+      - name: Read the pinned SLC version
+        if: steps.gate.outputs.release == 'true'
+        id: slc
+        run: |
+          SLC=$(sed -n 's/^exasol-udf-sdk[[:space:]]*=.*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml)
+          if [ -z "$SLC" ]; then
+            echo "::error::found no exasol-udf-sdk version pin in the root Cargo.toml"
+            exit 1
+          fi
+          echo "version=$SLC" >> "$GITHUB_OUTPUT"
+
       - name: Create and push tag
         if: steps.gate.outputs.release == 'true' && github.ref == 'refs/heads/main'
         run: |
@@ -707,6 +719,8 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
           generate_release_notes: true
+          body: |
+            Requires the Rust SLC [v${{ steps.slc.outputs.version }}](https://github.com/exasol-labs/language-container-rs/releases/tag/v${{ steps.slc.outputs.version }}). Any other SLC version fails every engine call with `Fingerprint mismatch`.
           # install.sh deliberately not attached: users fetch it from `main`
           # (`?ref=<tag>` pins); an asset would freeze installer bugs forever.
           files: |
