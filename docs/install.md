@@ -14,7 +14,8 @@ last step stays manual because it is specific to your dataset.
 
 The [build-from-source](#appendix-build-from-source) and [fully manual](#appendix-manual-install-on-a-restricted-network)
 paths still work. If the one-line command does not fit your environment, use them instead. One
-example is a network with no path to GitHub.
+example is a network with no path to GitHub. The [manual install checklist](#appendix-manual-install-checklist)
+lists every step in order.
 
 ## Prerequisites
 
@@ -276,6 +277,49 @@ Port overrides (host side). The defaults match `docker-compose.yml`:
 | `LH_REST_PORT` | `18181` | Iceberg REST |
 
 ---
+
+## Appendix: manual install checklist
+
+Follow these steps in order when you cannot run the [one-line command](#install-with-one-command).
+
+1. **Pick the versions.** Choose the engine release, then the [matching SLC version](#which-slc-version).
+   Use the CPU architecture of your Exasol host for both.
+2. **Install the Rust SLC.** Follow the
+   [manual install in language-container-rs](https://github.com/exasol-labs/language-container-rs/blob/main/docs/installation.md#manual-install).
+   Skip this step if the matching SLC is already registered.
+3. **Upload the engine.** [Build from source](#appendix-build-from-source), or
+   [upload the release tarball](#appendix-manual-install-on-a-restricted-network).
+4. **Create the scripts.** See [Create the scripts by hand](#appendix-create-the-scripts-by-hand).
+5. **Check the version.** See [Version smoke test by hand](#appendix-version-smoke-test-by-hand).
+6. **Create the CONNECTION.** See [Point the VS at your data](#point-the-vs-at-your-data).
+7. **Grant the virtual schema's owner its privileges.** The `ACCESS` grants name the CONNECTION, so
+   it must exist. See [Owner grants](security.md#owner-grants).
+8. **Create the virtual schema.** Creating it already runs the adapter as its owner, so the grants
+   must be in place. See [Point the VS at your data](#point-the-vs-at-your-data).
+
+### Which SLC version
+
+Each engine release needs one exact SLC version, named in its
+[release notes](https://github.com/exasol-labs/lakehouse-engine-rs/releases). Any other SLC version
+fails every engine call with `Fingerprint mismatch`.
+
+If the release notes don't name it, the SLC version equals the `exasol-udf-sdk` version pinned in
+the release's root `Cargo.toml`:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/exasol-labs/lakehouse-engine-rs/v<VERSION>/Cargo.toml" \
+| grep '^exasol-udf-sdk'
+```
+
+### Privileges for a manual install
+
+| Step | Database privileges |
+|---|---|
+| 2. Install the Rust SLC | `ALTER SYSTEM` |
+| 4. Create the scripts | `CREATE SESSION`, `CREATE SCHEMA`, and `CREATE SCRIPT` |
+| 5. Check the version | None beyond step 4. The scripts' owner can run its own scripts. |
+
+Steps 4 and 5 need no DBA role. For the privileges of steps 6 to 8, see [Security](security.md).
 
 ## Appendix: build from source
 
