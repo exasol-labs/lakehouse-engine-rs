@@ -18,8 +18,9 @@ use common::glue::{
     GlueRun, ICEBERG_ORDERS, ORC_INPUT_FORMAT, ORC_TABLE, ORDERS, PARTITIONED, PARTITIONS,
     PartitionedRow, ROUTED_TABLES, SECRET_ACCESS_KEY_VAR, SKIPPED_TABLES, STALE_GLUE_COLUMN,
     SUCCESS_MARKER, glue_assume_role_connection_password, glue_base_identity_connection_password,
-    glue_connection_password, metadata_only_keys, partitioned_rows, register_broken_iceberg_table,
-    register_fixture_set, register_probe_table,
+    glue_connection_password, glue_iceberg_rest_connection_password, metadata_only_keys,
+    page_padding_views, partitioned_rows, register_broken_iceberg_table, register_fixture_set,
+    register_probe_table,
 };
 use common::seed::{
     ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DATE_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT,
@@ -46,6 +47,8 @@ const ROLE_VS: &str = "GLUE_LAKEHOUSE_ROLE";
 const ROLE_CONN: &str = "GLUE_E2E_ROLE_CREDS";
 const BASE_VS: &str = "GLUE_LAKEHOUSE_BASE";
 const BASE_CONN: &str = "GLUE_E2E_BASE_CREDS";
+const REST_VS: &str = "GLUE_LAKEHOUSE_REST";
+const REST_CONN: &str = "GLUE_E2E_REST_CREDS";
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
@@ -219,7 +222,7 @@ type FixtureCheck = fn(&GlueRun, &mut ExaConn);
 #[test]
 fn glue_checks_pass_against_one_provisioned_fixture() {
     let run = provision();
-    let checks: [(&str, FixtureCheck); 10] = [
+    let checks: [(&str, FixtureCheck); 11] = [
         (
             "listing",
             check_listing_includes_routed_tables_and_records_every_skip,
@@ -245,6 +248,10 @@ fn glue_checks_pass_against_one_provisioned_fixture() {
         (
             "assume role",
             check_assume_role_connection_reads_through_the_role,
+        ),
+        (
+            "Iceberg REST paging",
+            check_iceberg_rest_listing_reaches_past_the_first_page,
         ),
         (
             "refresh tables",
@@ -399,7 +406,16 @@ fn count_statuses(conn: &mut ExaConn, tables: &[String]) -> Vec<(String, String)
 fn assert_records_every_skip(conn: &mut ExaConn, database: &str) {
     let skipped = skipped_entries(conn, VS);
     let recorded: BTreeSet<&str> = skipped.iter().map(|(table, _)| table.as_str()).collect();
-    let expected: Vec<String> = SKIPPED_TABLES
+    let padding = page_padding_views();
+    let expected_skips: Vec<(&str, &str)> = SKIPPED_TABLES
+        .into_iter()
+        .chain(
+            padding
+                .iter()
+                .map(|name| (name.as_str(), "TableType=VIRTUAL_VIEW")),
+        )
+        .collect();
+    let expected: Vec<String> = expected_skips
         .iter()
         .map(|(name, _)| format!("{database}.{name}"))
         .collect();
@@ -408,7 +424,7 @@ fn assert_records_every_skip(conn: &mut ExaConn, database: &str) {
         expected.iter().map(String::as_str).collect(),
         "SKIPPED_TABLES records every skip: {skipped:?}"
     );
-    for (name, reason) in SKIPPED_TABLES {
+    for (name, reason) in expected_skips {
         let table = format!("{database}.{name}");
         let (_, recorded_reason) = skipped
             .iter()
@@ -821,6 +837,44 @@ fn check_assume_role_connection_reads_through_the_role(run: &GlueRun, conn: &mut
         error,
         "the denial must contain no credential value"
     );
+}
+
+/// Scenario: Create virtual schema enumerates every table in the configured namespace
+fn check_iceberg_rest_listing_reaches_past_the_first_page(run: &GlueRun, conn: &mut ExaConn) {
+    let env = run.env();
+    let catalog_id = env.expect(runtime().block_on(run.catalog_id()), "read the catalog id");
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let response = try_create_virtual_schema_with_password(
+            &mut redacting_conn(),
+            &VsProps::new(REST_VS, &run.database()).with_catalog_conn_name(REST_CONN),
+            &env.iceberg_rest_endpoint(),
+            &glue_iceberg_rest_connection_password(env, &catalog_id),
+        );
+        assert_eq!(
+            response["status"].as_str(),
+            Some("ok"),
+            "CREATE VIRTUAL SCHEMA {REST_VS} failed: {}",
+            env.redact(&response["exception"].to_string())
+        );
+        let listed: Vec<String> = conn.query_columns(&format!(
+            "SELECT TABLE_NAME FROM SYS.EXA_ALL_VIRTUAL_TABLES WHERE TABLE_SCHEMA = '{REST_VS}'"
+        ))[0]
+            .iter()
+            .map(value_to_string)
+            .collect();
+        assert_eq!(
+            listed,
+            [ICEBERG_ORDERS.to_uppercase()],
+            "Glue answers the first page of {} views with no identifier and a next-page-token",
+            page_padding_views().len()
+        );
+    }));
+    let mut cleanup = redacting_conn();
+    let _ = cleanup.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {REST_VS} CASCADE"));
+    let _ = cleanup.try_execute(&format!("DROP CONNECTION IF EXISTS {REST_CONN}"));
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 /// specs/testing.md § Failure contract

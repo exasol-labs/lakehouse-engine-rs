@@ -171,7 +171,7 @@ impl FromIterator<TableAdmission> for CatalogListing {
 /// Boxed futures instead of `async fn` keep the trait dyn-compatible without an
 /// `async-trait` dependency.
 pub trait CatalogClient: Send + Sync {
-    /// Includes tables in descendant namespaces.
+    /// Includes tables in descendant namespaces, except on Glue, whose namespaces are single-level.
     fn list_tables(
         &self,
         namespace: &[String],

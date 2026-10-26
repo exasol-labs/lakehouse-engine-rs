@@ -95,14 +95,15 @@ async fn signed_enumeration_is_signed_for_the_resolved_region() {
     creds.region = "us-east-1".into();
     let ns = NamespaceIdent::new("db".into());
 
-    let enumeration = SignedEnumeration {
+    let enumeration = GlueEnumeration {
+        client: reqwest::Client::new(),
         catalog_uri: &catalog_uri,
         prefix: "catalogs/123456789012",
         creds: &creds,
         region: "eu-west-1",
     };
     enumeration
-        .list_in_namespace_signed(&ns)
+        .list_glue_tables(&ns)
         .await
         .expect("the signed enumeration must succeed against the stub");
 
