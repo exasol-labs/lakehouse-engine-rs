@@ -353,6 +353,21 @@ fn timestamp_literal_becomes_microseconds_on_a_utc_adjusted_column() {
 }
 
 #[test]
+fn timestamp_literal_finer_than_microseconds_yields_no_scalar() {
+    let finer = lit("literal_timestamp", json!("2024-01-15 10:30:00.123456789"));
+    let exact = lit("literal_timestamp", json!("2024-01-15 10:30:00.123456000"));
+
+    assert_eq!(
+        literal_to_scalar(&finer, &PrimitiveType::TimestampNtz),
+        None
+    );
+    assert_eq!(
+        literal_to_scalar(&exact, &PrimitiveType::TimestampNtz),
+        Some(Scalar::TimestampNtz(TIMESTAMP_MICROS + 123_456))
+    );
+}
+
+#[test]
 fn utc_timestamp_literal_becomes_microseconds_on_a_utc_adjusted_column() {
     let node = lit("literal_timestamp_utc", json!("2024-01-15T10:30:00Z"));
 

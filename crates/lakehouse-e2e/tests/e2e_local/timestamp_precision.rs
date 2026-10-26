@@ -10,8 +10,8 @@ use crate::common::seed::{
 };
 use crate::common::stack::iceberg_catalog_url;
 use crate::common::timestamp_precision::{
-    ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
-    live_engine_version,
+    ExpectedTimestampPrecision, assert_filters_match_native_copy, engine_honors_declared_precision,
+    expected_timestamp_precision, live_engine_version,
 };
 use crate::fixtures::{assert_pushed_to_scan_udf, emits_clause, stack};
 use std::sync::OnceLock;
@@ -106,6 +106,7 @@ fn assert_emits_declares(conn: &mut ExaConn, query_sql: &str, expected: &str) ->
     pushdown_sql
 }
 
+/// Scenario: A timestamp filter compares at full precision
 #[test]
 fn iceberg_microsecond_timestamps_round_trip_at_the_declared_precision() {
     setup();
@@ -156,6 +157,23 @@ fn iceberg_microsecond_timestamps_round_trip_at_the_declared_precision() {
             &mut conn,
             &distinct_sql,
             &format!("COUNT(DISTINCT {column})"),
+        );
+    }
+
+    if engine_honors_declared_precision(&mut conn) {
+        assert_filters_match_native_copy(
+            &mut conn,
+            &qualified,
+            "TS, TSTZ, TS_NS",
+            &[
+                "TS < TIMESTAMP '2024-01-01 00:00:00.000001001'",
+                "TS = TIMESTAMP '2024-01-01 00:00:00.000001001'",
+                "TS <= TIMESTAMP '2024-01-01 00:00:00.123456999'",
+                "TS > TIMESTAMP '2024-01-01 00:00:00.123456001'",
+                "TSTZ < TIMESTAMP '2024-01-01 00:00:00.000001001'",
+                "TS_NS = TIMESTAMP '2024-01-01 00:00:00.000000001'",
+                "TS_NS < TIMESTAMP '2024-01-01 00:00:00.000000002'",
+            ],
         );
     }
 }

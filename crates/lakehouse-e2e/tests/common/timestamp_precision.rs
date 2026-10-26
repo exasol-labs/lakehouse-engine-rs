@@ -64,3 +64,38 @@ pub fn engine_honors_declared_precision(conn: &mut ExaConn) -> bool {
     let version = live_engine_version(conn);
     leading_version_component(&version).is_none_or(|year| year >= 2025)
 }
+
+/// A native copy holds the values Exasol reads, so each filter must select the same `ID`s from
+/// it as from the virtual `table`. Holds only where the declaration keeps every source digit:
+/// on 8.x Exasol compares millisecond-truncated values, and the scan does not.
+pub fn assert_filters_match_native_copy(
+    conn: &mut ExaConn,
+    table: &str,
+    columns: &str,
+    filters: &[&str],
+) {
+    let native = "TS_FILTER_ORACLE.NATIVE_COPY";
+    conn.execute("CREATE SCHEMA IF NOT EXISTS TS_FILTER_ORACLE");
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {native} AS SELECT ID, {columns} FROM {table}"
+    ));
+    let ids = |conn: &mut ExaConn, from: &str, filter: &str| -> Vec<String> {
+        let sql = format!("SELECT TO_CHAR(ID) FROM {from} WHERE {filter} ORDER BY ID");
+        conn.query_columns(&sql)
+            .first()
+            .map(|column| {
+                column
+                    .iter()
+                    .map(|id| id.as_str().unwrap_or_default().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for filter in filters {
+        assert_eq!(
+            ids(conn, table, filter),
+            ids(conn, native, filter),
+            "WHERE {filter} on {table} must select the rows native Exasol selects"
+        );
+    }
+}

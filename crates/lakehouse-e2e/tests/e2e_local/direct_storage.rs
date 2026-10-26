@@ -24,14 +24,17 @@ use crate::common::seed::{
     time64_values,
 };
 use crate::common::stack::{CatalogConnectionPassword, seaweedfs_url_internal};
+use crate::common::timestamp_precision::{
+    assert_filters_match_native_copy, engine_honors_declared_precision,
+};
 use crate::fixtures::{stack, vs_table};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
     DurationMicrosecondArray, Float32Array, Float64Array, Int32Array, Int64Array,
     IntervalDayTimeArray, ListBuilder, MapArray, StringArray, StringBuilder, StructArray,
-    Time32MillisecondArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Time32MillisecondArray, TimestampMicrosecondArray, TimestampNanosecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::compute::cast;
@@ -533,8 +536,56 @@ fn all_types_batch() -> RecordBatch {
         ("c_largebinary", binary_values(&DataType::LargeBinary), true),
         ("c_fixedsizebinary", fixed_16_values(), true),
         ("c_struct_binary", struct_binary_values(None), true),
+        (
+            "c_ts_ms",
+            timestamp_unit_values(TimeUnit::Millisecond, None),
+            true,
+        ),
+        (
+            "c_ts_us",
+            timestamp_unit_values(TimeUnit::Microsecond, None),
+            true,
+        ),
+        (
+            "c_ts_ns",
+            timestamp_unit_values(TimeUnit::Nanosecond, None),
+            true,
+        ),
+        (
+            "c_tstz_ms",
+            timestamp_unit_values(TimeUnit::Millisecond, Some("UTC")),
+            true,
+        ),
+        (
+            "c_tstz_us",
+            timestamp_unit_values(TimeUnit::Microsecond, Some("UTC")),
+            true,
+        ),
+        (
+            "c_tstz_ns",
+            timestamp_unit_values(TimeUnit::Nanosecond, Some("UTC")),
+            true,
+        ),
     ])
     .expect("all_types batch")
+}
+
+/// 2025-06-01 00:00:00.123456789 UTC: every unit's own digits differ from the coarser units'.
+const TIMESTAMP_UNITS_NANOS: i64 = 1_748_736_000_123_456_789;
+
+/// `TIMESTAMP_UNITS_NANOS` truncated to `unit`, the epoch, and NULL.
+fn timestamp_unit_values(unit: TimeUnit, tz: Option<&str>) -> ArrayRef {
+    let divisor = match unit {
+        TimeUnit::Millisecond => 1_000_000,
+        TimeUnit::Microsecond => 1_000,
+        _ => 1,
+    };
+    let nanos: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![
+        Some(TIMESTAMP_UNITS_NANOS / divisor * divisor),
+        Some(0),
+        None,
+    ]));
+    cast(&nanos, &DataType::Timestamp(unit, tz.map(Into::into))).expect("timestamp unit cast")
 }
 
 /// Types only a Parquet logical-type annotation, or its absence, can declare, written with
@@ -1099,10 +1150,10 @@ fn events_directory_declares_and_returns_mixed_types_across_both_files() {
             "EVENTS.{column}"
         );
     }
-    let event_ts = declared_type(&mut conn, VS_DIRECT, "EVENTS", "EVENT_TS");
-    assert!(
-        event_ts.starts_with("TIMESTAMP"),
-        "EVENTS.EVENT_TS must declare a TIMESTAMP of the engine's precision, got {event_ts}"
+    assert_eq!(
+        declared_type(&mut conn, VS_DIRECT, "EVENTS", "EVENT_TS"),
+        TimestampUnitExpectations::for_engine(&mut conn).us.0,
+        "EVENTS.EVENT_TS is a microsecond Parquet timestamp"
     );
 
     let cols = conn.query_columns(&format!(
@@ -1209,12 +1260,15 @@ fn complex_directory_declares_varchar_and_returns_parseable_json() {
 /// Scenario: Out-of-range Decimal128 falls back to VARCHAR via JSON
 /// Scenario: A Parquet-sourced column maps through the Arrow-input direction
 /// Scenario: The listing declares a binary column
+/// Scenario: A direct-storage Parquet timestamp declares the precision of its unit
+/// Scenario: A timestamp filter compares at full precision
 #[test]
 fn all_types_directories_declare_and_return_their_mapped_values() {
     setup();
     let mut conn = exa_conn();
 
     let binary: &[&str] = &["type 'binary'", "#351"];
+    let units = TimestampUnitExpectations::for_engine(&mut conn);
     assert_type_matrix(
         &mut conn,
         VS_DIRECT,
@@ -1286,6 +1340,12 @@ fn all_types_directories_declare_and_return_their_mapped_values() {
                 VARCHAR_JSON,
                 &["member 'c_struct_binary.x'", "type 'binary'", "#351"],
             ),
+            reads("C_TS_MS", units.ms.0, units.ms.1),
+            reads("C_TS_US", units.us.0, units.us.1),
+            reads("C_TS_NS", units.ns.0, units.ns.1),
+            reads("C_TSTZ_MS", units.ms.0, units.ms.1),
+            reads("C_TSTZ_US", units.us.0, units.us.1),
+            reads("C_TSTZ_NS", units.ns.0, units.ns.1),
         ],
     );
     assert_decimal_orders_numerically(&mut conn, VS_DIRECT, "ALL_TYPES", "C_DECIMAL128_18_0");
@@ -1300,7 +1360,7 @@ fn all_types_directories_declare_and_return_their_mapped_values() {
             refuses("C_UUID", VARCHAR_JSON, &["type 'uuid'", "#351"]),
             reads(
                 "C_INT96",
-                "TIMESTAMP(3)",
+                units.us.0,
                 [
                     Some("2024-01-15 10:30:45.000000"),
                     Some("1970-01-01 00:00:00.000000"),
@@ -1315,6 +1375,79 @@ fn all_types_directories_declare_and_return_their_mapped_values() {
             ),
         ],
     );
+
+    if engine_honors_declared_precision(&mut conn) {
+        let all_types = vs_table(VS_DIRECT, "ALL_TYPES");
+        assert_filters_match_native_copy(
+            &mut conn,
+            &all_types,
+            "C_TS_MS, C_TS_US, C_TS_NS, C_TSTZ_MS, C_TSTZ_NS",
+            TIMESTAMP_UNIT_FILTERS,
+        );
+        conn.execute("ALTER SESSION SET NLS_TIMESTAMP_FORMAT='YYYY-MM-DD HH24:MI:SS.FF9'");
+        let nanos = conn.query_columns(&format!(
+            "SELECT C_TS_NS, C_TSTZ_NS FROM {all_types} WHERE ID = 1"
+        ));
+        for column in &nanos {
+            assert_eq!(value_to_string(&column[0]), "2025-06-01 00:00:00.123456789");
+        }
+    }
+}
+
+const TIMESTAMP_UNIT_FILTERS: &[&str] = &[
+    "C_TS_MS = TIMESTAMP '2025-06-01 00:00:00.123000000'",
+    "C_TS_MS = TIMESTAMP '2025-06-01 00:00:00.123500'",
+    "C_TS_MS <> TIMESTAMP '2025-06-01 00:00:00.123500'",
+    "NOT (C_TS_MS = TIMESTAMP '2025-06-01 00:00:00.123500')",
+    "C_TS_MS < TIMESTAMP '2025-06-01 00:00:00.123500'",
+    "C_TS_MS <= TIMESTAMP '2025-06-01 00:00:00.122500'",
+    "C_TS_MS > TIMESTAMP '2025-06-01 00:00:00.122500'",
+    "C_TS_MS >= TIMESTAMP '2025-06-01 00:00:00.123500'",
+    "TIMESTAMP '2025-06-01 00:00:00.123500' > C_TS_MS",
+    "C_TS_MS BETWEEN TIMESTAMP '2025-06-01 00:00:00.122500' \
+     AND TIMESTAMP '2025-06-01 00:00:00.123500'",
+    "C_TS_MS NOT BETWEEN TIMESTAMP '2025-06-01 00:00:00.123100' \
+     AND TIMESTAMP '2025-06-01 00:00:00.123500'",
+    "C_TS_MS IN (TIMESTAMP '2025-06-01 00:00:00.123500', TIMESTAMP '1970-01-01 00:00:00.000500')",
+    "C_TS_MS NOT IN (TIMESTAMP '2025-06-01 00:00:00.123500', TIMESTAMP '1970-01-01 00:00:00')",
+    "C_TS_MS IS NULL OR C_TS_MS = TIMESTAMP '2025-06-01 00:00:00.123500'",
+    "C_TS_US = TIMESTAMP '2025-06-01 00:00:00.123456'",
+    "C_TS_US = TIMESTAMP '2025-06-01 00:00:00.123456789'",
+    "C_TS_US < TIMESTAMP '2025-06-01 00:00:00.123456001'",
+    "C_TS_US >= TIMESTAMP '2025-06-01 00:00:00.123456001'",
+    "C_TS_US IN (TIMESTAMP '2025-06-01 00:00:00.123456789', TIMESTAMP '1970-01-01 00:00:00')",
+    "C_TS_NS = TIMESTAMP '2025-06-01 00:00:00.123456789'",
+    "C_TS_NS = TIMESTAMP '2025-06-01 00:00:00.123456'",
+    "C_TS_NS > TIMESTAMP '2025-06-01 00:00:00.123456'",
+    "C_TSTZ_MS = TIMESTAMP '2025-06-01 00:00:00.123500'",
+    "C_TSTZ_NS = TIMESTAMP '2025-06-01 00:00:00.123456789'",
+    "C_TS_MS = C_TS_NS",
+    "C_TS_US < C_TS_NS",
+];
+
+type DeclaredAndValues = (&'static str, [Option<&'static str>; 3]);
+
+/// Declared type and six-digit wire render of each [`timestamp_unit_values`] unit.
+struct TimestampUnitExpectations {
+    ms: DeclaredAndValues,
+    us: DeclaredAndValues,
+    ns: DeclaredAndValues,
+}
+
+impl TimestampUnitExpectations {
+    fn for_engine(conn: &mut ExaConn) -> Self {
+        let read = |first| [Some(first), Some("1970-01-01 00:00:00.000000"), None];
+        let ms = ("TIMESTAMP(3)", read("2025-06-01 00:00:00.123000"));
+        if !engine_honors_declared_precision(conn) {
+            return Self { ms, us: ms, ns: ms };
+        }
+        Self {
+            ms,
+            us: ("TIMESTAMP(6)", read("2025-06-01 00:00:00.123456")),
+            // The wire renders six digits; the FF9 check reads the rest.
+            ns: ("TIMESTAMP(9)", read("2025-06-01 00:00:00.123456")),
+        }
+    }
 }
 
 #[test]

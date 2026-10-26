@@ -197,6 +197,14 @@ fn render_exasol_timestamp_literal(value: Option<&Json>) -> String {
     }
 }
 
+fn timestamp_literal_unit(value: Option<&Json>) -> &'static str {
+    let fraction = value.and_then(Json::as_str).and_then(|v| v.split_once('.'));
+    match fraction {
+        Some((_, digits)) if digits.trim_end_matches('0').len() > 6 => "Nanosecond",
+        _ => "Microsecond",
+    }
+}
+
 /// Converting the UTC-normalized wire value into `SESSIONTIMEZONE` reproduces
 /// Exasol's own TSTZ-vs-TIMESTAMP coercion, which reads the naive side as
 /// session-local (verified live, #218).
@@ -480,13 +488,15 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             if dialect == Dialect::Exasol {
                 return Ok(Some(render_exasol_timestamp_literal(value("value"))));
             }
-            // Explicit microsecond precision: DataFusion types a bare `TIMESTAMP`
-            // literal as nanoseconds, which overflows on far-future values when
-            // unified with microsecond columns (#155). A NULL value renders
-            // `arrow_cast(NULL, ...)`, deliberately unlike `literal_timestamp_utc`.
+            // Explicit precision: DataFusion types a bare `TIMESTAMP` literal as
+            // nanoseconds, which overflows on far-future values when unified with
+            // microsecond columns (#155), so only sub-microsecond digits get
+            // nanoseconds (#461). A NULL value renders `arrow_cast(NULL, ...)`,
+            // deliberately unlike `literal_timestamp_utc`.
             return Ok(Some(format!(
-                "arrow_cast({}, 'Timestamp(Microsecond, None)')",
-                quote_literal(value("value"))
+                "arrow_cast({}, 'Timestamp({}, None)')",
+                quote_literal(value("value")),
+                timestamp_literal_unit(value("value"))
             )));
         }
         "literal_timestamp_utc" => {
