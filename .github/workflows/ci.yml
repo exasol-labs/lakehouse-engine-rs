@@ -456,7 +456,7 @@ jobs:
       # Flag-identical to the Makefile's `test-e2e-unity` (which would re-run
       # the bring-up); this step is the authority.
       - name: Run Unity Catalog E2E suite
-        run: cargo test -p lakehouse-engine --features unity-e2e --test e2e_unity_test -- --test-threads=1
+        run: cargo test --workspace --features lakehouse-e2e/unity-e2e --test e2e_unity_test -- --test-threads=1
 
       - name: Dump Unity stack logs on failure
         if: failure()

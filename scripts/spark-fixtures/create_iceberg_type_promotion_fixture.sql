@@ -13,7 +13,7 @@
 -- pre-promotion values are exact in binary32. Literals are CAST so the inserted
 -- type is the declared column type, not Spark's inference.
 --
--- Ground truth, in lockstep with crates/lakehouse-engine/tests/common/type_promotion_fixtures.rs:
+-- Ground truth, in lockstep with crates/lakehouse-e2e/tests/common/type_promotion_fixtures.rs:
 --   table:   rest_catalog.e2e_lakehouse.iceberg_type_promotion
 --            format-version 2
 --   columns: id              BIGINT         -- Iceberg `long`, never promoted

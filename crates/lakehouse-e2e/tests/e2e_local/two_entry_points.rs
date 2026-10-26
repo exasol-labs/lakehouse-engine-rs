@@ -1,19 +1,12 @@
-//! Gated under `exasol-e2e`: it inspects the release `.so` that `make test-e2e` builds first.
+//! Inspects the release `.so` that `make test-e2e` builds first.
 
-use std::path::PathBuf;
 use std::process::Command;
 
-fn so_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("navigate to workspace root from CARGO_MANIFEST_DIR")
-        .join("target/release/liblakehouse_engine.so")
-}
+use crate::common::stack::lakehouse_engine_so_path;
 
 #[test]
 fn so_exports_three_entry_point_symbols() {
-    let so = so_path();
+    let so = lakehouse_engine_so_path();
     assert!(
         so.exists(),
         "built artifact not found at {} — run `make cross-udf-build` first",

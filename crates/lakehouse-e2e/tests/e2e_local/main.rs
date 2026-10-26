@@ -20,5 +20,6 @@ mod pruning;
 mod refresh;
 mod scan;
 mod timestamp_precision;
+mod two_entry_points;
 mod type_relaxation;
 mod version_udf;

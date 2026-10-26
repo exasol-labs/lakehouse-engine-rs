@@ -3428,13 +3428,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "lakehouse-engine"
-version = "0.56.5"
+name = "lakehouse-e2e"
+version = "0.0.0"
 dependencies = [
- "aes-gcm",
  "anyhow",
  "arrow",
- "async-trait",
  "aws-credential-types",
  "aws-sdk-glue",
  "aws-sigv4",
@@ -3442,6 +3440,35 @@ dependencies = [
  "azure_core",
  "azure_identity",
  "azure_storage_blob",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "exasol-udf-sdk",
+ "futures",
+ "iceberg",
+ "iceberg-catalog-rest",
+ "iceberg-storage-opendal",
+ "native-tls",
+ "object_store",
+ "parquet",
+ "percent-encoding",
+ "rand 0.8.6",
+ "reqsign-core",
+ "reqwest 0.12.28",
+ "rsa",
+ "serde_json",
+ "tokio",
+ "tpchgen",
+ "tungstenite",
+]
+
+[[package]]
+name = "lakehouse-engine"
+version = "0.56.5"
+dependencies = [
+ "aes-gcm",
+ "arrow",
+ "async-trait",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -3453,27 +3480,20 @@ dependencies = [
  "futures",
  "hkdf",
  "iceberg",
- "iceberg-catalog-rest",
- "iceberg-storage-opendal",
  "lakehouse-catalog",
  "minijinja",
- "native-tls",
  "object_store",
  "parquet",
  "percent-encoding",
  "rand 0.8.6",
- "reqsign-core",
  "reqwest 0.12.28",
  "roaring",
- "rsa",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
- "tpchgen",
  "tracing",
- "tungstenite",
  "url",
  "vs-expression",
 ]

@@ -1,4 +1,4 @@
--- Ground truth, in lockstep with crates/lakehouse-engine/tests/common/pos_delete_fixtures.rs:
+-- Ground truth, in lockstep with crates/lakehouse-e2e/tests/common/pos_delete_fixtures.rs:
 --   rest_catalog.e2e_lakehouse.unsupported_format:
 --     id 1..=10 Parquet, id 21..=30 ORC
 

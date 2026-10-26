@@ -1,6 +1,17 @@
 use crate::common::e2e_harness::*;
 use crate::fixtures::stack;
 
+const ENGINE_MANIFEST: &str = include_str!("../../../lakehouse-engine/Cargo.toml");
+
+/// The `[package]` version the `.so` was built from; this crate's own version is unrelated.
+fn engine_crate_version() -> &'static str {
+    ENGINE_MANIFEST
+        .lines()
+        .find_map(|line| line.strip_prefix("version = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("crates/lakehouse-engine/Cargo.toml must declare `version = \"...\"`")
+}
+
 #[test]
 fn version_udf_returns_the_compiled_crate_version() {
     stack();
@@ -16,7 +27,7 @@ fn version_udf_returns_the_compiled_crate_version() {
 
     assert_eq!(
         value,
-        env!("CARGO_PKG_VERSION"),
+        engine_crate_version(),
         "LAKEHOUSE_VERSION() must report the compiled crate version"
     );
 }

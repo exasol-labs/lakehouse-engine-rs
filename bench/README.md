@@ -251,7 +251,7 @@ cargo test -p lakehouse-engine --test it micro_bench
 - Table names assume a flat `tpch` namespace (`LINEITEM`, …); a nested namespace
   flattens to `NS__TABLE` — adjust query names if so.
 - The TPC-H loader is a cargo test binary at
-  `crates/lakehouse-engine/tests/tpch_loader.rs` (run automatically in docker mode).
+  `crates/lakehouse-e2e/tests/tpch_loader.rs` (run automatically in docker mode).
 - `run.sh` pins `SLC_VERSION` to match the `.so` ABI — don't bump it blindly.
 
 ## Remote pre-staged artifacts (when BucketFS write is blocked)

@@ -220,7 +220,7 @@ fn e2e_broadcast_join_float_div_by_zero_in_fact_leg_filter_fails() {
          itself:\n{pushed}"
     );
     assert!(
-        pushed.contains(vs_expression::CHECKED_FLOAT_DIV_FN),
+        pushed.contains(CHECKED_FLOAT_DIV_FN),
         "the pushed broadcast plan must carry the checked-division call:\n{pushed}"
     );
 

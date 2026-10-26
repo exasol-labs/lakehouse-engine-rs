@@ -61,15 +61,16 @@ export LH_SEAWEEDFS_PORT
 export LH_REST_PORT
 
 # E2E suites FAIL (not skip) when their stack is unavailable, and run serially
-# because all tests share one VS.
+# because all tests share one VS. `--workspace` keeps dependency features identical to the
+# plain workspace build, so a suite compiles only lakehouse-e2e; `-p lakehouse-e2e` rebuilds deps.
 test-e2e: cross-udf-build
-	cargo test --features exasol-e2e --test e2e_local -- --test-threads=1
+	cargo test --workspace --features lakehouse-e2e/exasol-e2e --test e2e_local -- --test-threads=1
 
 # Requires:
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
 #     seaweedfs exasol keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper
 test-e2e-lakekeeper: cross-udf-build
-	cargo test --features lakekeeper-e2e --test e2e_lakekeeper_test -- --test-threads=1
+	cargo test --workspace --features lakehouse-e2e/lakekeeper-e2e --test e2e_lakekeeper_test -- --test-threads=1
 
 # Requires:
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
@@ -78,13 +79,13 @@ test-e2e-lakekeeper: cross-udf-build
 # plus real Azure Blob Storage credentials from ./test.env or the environment.
 # Sourcing and cargo MUST stay on one recipe line: each line runs in its own shell.
 test-e2e-azure: cross-udf-build
-	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --features azure-e2e --test e2e_azure_test -- --test-threads=1
+	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --workspace --features lakehouse-e2e/azure-e2e --test e2e_azure_test -- --test-threads=1
 
 # Requires: docker compose up -d --wait exasol
 # plus a real AWS Glue Data Catalog and S3 fixture bucket (GLUE_* in ./test.env or the environment).
 # Sourcing and cargo MUST stay on one recipe line: each line runs in its own shell.
 test-e2e-glue: cross-udf-build
-	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --features glue-e2e --test e2e_glue_test -- --test-threads=1
+	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --workspace --features lakehouse-e2e/glue-e2e --test e2e_glue_test -- --test-threads=1
 
 # Manual equivalent of the E2E harness's in-process `setup_e2e` SLC install.
 # Set BUCKETFS_WRITE_PASS to skip extracting it from EXAConf via docker exec.
@@ -166,10 +167,10 @@ fmt:
 fmt-check:
 	cargo fmt --all -- --check
 
-# The second run lints the E2E targets, which `required-features` hides from the first.
+# `--all-features` reaches the E2E targets, which `required-features` hides otherwise. Only
+# lakehouse-e2e declares features, and they enable no dependency feature.
 lint:
-	cargo clippy --workspace --all-targets -- -D warnings
-	cargo clippy -p lakehouse-engine --all-targets --all-features -- -D warnings
+	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # MUST stay flag-identical to the `cargo llvm-cov` step in ci.yml's unit-tests
 # job, which is the authority. Not a prerequisite of `test`: llvm-cov relinks
@@ -224,6 +225,6 @@ unity-down:
 # step in ci.yml's e2e-unity job, which is the authority.
 test-e2e-unity: cross-udf-build
 	$(MAKE) unity-up
-	cargo test -p lakehouse-engine --features unity-e2e --test e2e_unity_test -- --test-threads=1
+	cargo test --workspace --features lakehouse-e2e/unity-e2e --test e2e_unity_test -- --test-threads=1
 
 .PHONY: cross-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure test-e2e-glue install-slc print-slc-version bucketfs-upload-so fmt fmt-check lint coverage bench test-install lint-install unity-up unity-down test-e2e-unity test-lakekeeper-scripts test-lakekeeper-local lint-lakekeeper-scripts

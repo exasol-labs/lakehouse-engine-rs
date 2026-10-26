@@ -36,7 +36,7 @@ Live ids change with every stack, so a file holds placeholders in their place.
 ## Drift check and regeneration
 
 `authz_batch_check_fixtures_match_live_contract` in
-`crates/lakehouse-engine/tests/e2e_lakekeeper_test.rs` normalizes each live exchange (the known live
+`crates/lakehouse-e2e/tests/e2e_lakekeeper_test.rs` normalizes each live exchange (the known live
 warehouse, table and principal ids and the `Error ID:` value become the placeholders above) and compares
 it with its file on the request, `status`, `results`, `error.type`, and `error.code`. Message text may
 differ. It also fails when a file holds a client secret, a token prefix, or a live id.
