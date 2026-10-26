@@ -7,7 +7,7 @@ A pushed-down filter that compares a timestamp column with a literal finer than 
 * Exasol compares a `TIMESTAMP(p)` column with a timestamp literal at the literal's full precision. A bare `TIMESTAMP` declaration holds 3 fractional digits.
 * DataFusion truncates the literal to the column's unit before it compares (apache/datafusion#22142). The upstream fix, apache/datafusion#22906, is not in a released DataFusion version.
 * Iceberg and Delta file pruning parse a timestamp literal into microseconds.
-* On Exasol 8.x every timestamp column is declared at milliseconds. Exasol then compares millisecond-truncated values, while the scan compares at the source unit, so a filter on a microsecond or nanosecond column can return other rows than native Exasol (#TBD). This feature does not cover that engine arm.
+* On Exasol 8.x every timestamp column is declared at milliseconds, so a native table cannot hold a finer source value. A filter there compares at the source unit. This is the named Exasol 8.x target-type limitation, and this feature does not cover that engine arm.
 
 ## Scenarios
 

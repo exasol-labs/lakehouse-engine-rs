@@ -67,7 +67,7 @@ pub fn engine_honors_declared_precision(conn: &mut ExaConn) -> bool {
 
 /// A native copy holds the values Exasol reads, so each filter must select the same `ID`s from
 /// it as from the virtual `table`. Holds only where the declaration keeps every source digit:
-/// on 8.x Exasol compares millisecond-truncated values, and the scan does not.
+/// on 8.x the copy holds millisecond-truncated values, not the source data.
 pub fn assert_filters_match_native_copy(
     conn: &mut ExaConn,
     table: &str,
