@@ -133,8 +133,8 @@ impl CatalogClient for DirectStorageCatalogClient {
     ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
         let idents = idents.to_vec();
         Box::pin(async move {
-            let admits: Vec<_> = idents.into_iter().map(|ident| self.admit(ident)).collect();
-            let admissions: Vec<TableAdmission> = stream::iter(admits)
+            let admissions: Vec<TableAdmission> = stream::iter(idents)
+                .map(|ident| self.admit(ident))
                 .buffered(DIRECT_STORAGE_ADMISSION_LIMIT)
                 .try_collect()
                 .await?;

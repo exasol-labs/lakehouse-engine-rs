@@ -154,11 +154,9 @@ pub async fn resolve_parquet_directory(
     let partition_values = fill_partition_values(&raw_files, &declared_keys)?;
 
     // Folding in listing order as footers arrive bounds how many parsed footers are alive.
-    let reads: Vec<_> = sources
-        .iter()
-        .map(|raw| read_footer(Arc::clone(store), raw.path.clone(), raw.size))
-        .collect();
-    let mut footers = stream::iter(reads)
+    // Index items, because a reference item trips rustc's higher-ranked `Send` check.
+    let mut footers = stream::iter(0..sources.len())
+        .map(|i| read_footer(Arc::clone(store), sources[i].path.clone(), sources[i].size))
         .buffered(DIRECT_STORAGE_ADMISSION_LIMIT)
         .zip(stream::iter(&sources));
     let mut fold = SchemaFold::new(&key_columns);
@@ -483,8 +481,7 @@ impl<'a> SchemaFold<'a> {
     }
 
     /// Only folded columns are refused, so a stored column dropped for a partition key never is.
-    /// A column absent from one file is filled with NULL for that file's rows, so every folded
-    /// column is declared nullable.
+    /// Every folded column is nullable, because a file that lacks it reads NULL for its rows.
     fn finish(mut self) -> (Vec<Field>, Vec<BinaryColumn>) {
         let binary_columns = self
             .columns

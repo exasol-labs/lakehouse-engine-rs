@@ -157,7 +157,7 @@ pub(crate) async fn load_table_schema_metadata(
     table_name: &str,
     creds: &ConnectionCreds,
 ) -> Result<TableMetadata, UdfError> {
-    let result = match load_table(
+    load_table(
         session,
         namespace,
         table_name,
@@ -166,14 +166,7 @@ pub(crate) async fn load_table_schema_metadata(
         creds,
     )
     .await
-    {
-        // A catalog that rejects the parameter still serves the full metadata without it.
-        Err(UdfError::User(msg)) if msg.starts_with("catalog returned HTTP 400: ") => {
-            load_table(session, namespace, table_name, "", false, creds).await
-        }
-        other => other,
-    };
-    result.map(|result| result.metadata)
+    .map(|result| result.metadata)
 }
 
 async fn load_table(
