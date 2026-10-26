@@ -70,10 +70,10 @@ data-transfer cost. The only standing cost is S3 storage, about 110 GiB for the 
 | `${ssm_root}/assume_role/role_arn` | `AWS_ASSUME_ROLE_ARN` |
 | `${ssm_root}/assume_role/external_id` | `AWS_EXTERNAL_ID` |
 
-The assume-role tests in `crates/lakehouse-engine/tests/cloud_e2e_test.rs` read these four variables, plus the Glue variables the other cloud tests need. If any is absent, the tests skip and name it:
+The assume-role tests in `crates/lakehouse-e2e/tests/cloud_e2e_test.rs` read these four variables, plus the Glue variables the other cloud tests need. If any is absent, the tests skip and name it:
 
 ```bash
-cargo test -p lakehouse-engine --features cloud-e2e --test cloud_e2e_test cloud_assume_role -- --test-threads=1
+cargo test --workspace --features lakehouse-e2e/cloud-e2e --test cloud_e2e_test cloud_assume_role -- --test-threads=1
 ```
 
 ## 2. Test cluster (ephemeral — per benchmark)

@@ -1,4 +1,4 @@
--- Ground truth, in lockstep with crates/lakehouse-engine/tests/common/pos_delete_fixtures.rs:
+-- Ground truth, in lockstep with crates/lakehouse-e2e/tests/common/pos_delete_fixtures.rs:
 --   rest_catalog.e2e_lakehouse.mor_dv, data files in commit order:
 --     A id 1..=10       v2 positional delete {2}, then a v3 deletion vector {2, 5}
 --     D id 41..=50      v2 positional delete {42} only

@@ -3216,7 +3216,7 @@ fn e2e_float_div_pushes_checked_division_call_projection() {
 
     let expected_projection = format!(
         r#""projection":[{{"expr":"{}(\"L_ORDERKEY\", \"L_LINENUMBER\")"}}]"#,
-        vs_expression::CHECKED_FLOAT_DIV_FN
+        CHECKED_FLOAT_DIV_FN
     );
     assert!(
         pushed.contains(&expected_projection),
@@ -3383,7 +3383,7 @@ fn pushed_scan_filter(pushed: &str) -> String {
 fn assert_checked_division_reached_the_pushed_filter(pushed: &str) {
     let filter = pushed_scan_filter(pushed);
     assert!(
-        filter.contains(&format!("{}(", vs_expression::CHECKED_FLOAT_DIV_FN)),
+        filter.contains(&format!("{}(", CHECKED_FLOAT_DIV_FN)),
         "the pushed scan FILTER must carry the checked-division call, got \
          `{filter}`:\n{pushed}"
     );
@@ -3496,7 +3496,7 @@ fn e2e_float_div_by_zero_in_aggregate_argument_fails() {
     let pushed = explain_virtual_pushdown_sql(&mut conn, &sql);
     let expected_aggregate = format!(
         r#""aggregates":[{{"kind":"sum","arg_expr":"{}("#,
-        vs_expression::CHECKED_FLOAT_DIV_FN
+        CHECKED_FLOAT_DIV_FN
     );
     assert!(
         pushed.contains(&expected_aggregate),

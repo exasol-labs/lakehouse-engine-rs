@@ -127,7 +127,8 @@ lakehouse-engine/
 ├── crates/
 │   ├── lakehouse-engine/   # Iceberg + Delta file planning, scan-spec wire format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan
 │   ├── lakehouse-catalog/  # Iceberg REST, Unity Catalog, and AWS Glue access: CatalogSession, auth, namespace enumeration, vended-storage resolution, SigV4 signing, AWS STS role assumption
-│   └── vs-expression/      # expression-translation crate
+│   ├── vs-expression/      # expression-translation crate
+│   └── lakehouse-e2e/      # E2E suites and their harness; deploys the built .so, never links the engine
 ├── Cargo.toml      # workspace manifest
 └── Makefile        # cross-udf-build, test-e2e
 ```

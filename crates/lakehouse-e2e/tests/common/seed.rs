@@ -240,7 +240,15 @@ pub async fn build_seed_catalog_with_auth(
         SeedStorage::Adls { .. } => Arc::new(OpenDalStorageFactory::Azdls),
     };
 
+    // The runtime runs only inside `block_on`, so a pooled connection never sees the server's
+    // idle close and is reused dead; the REST fixture closes idle connections after 30 s.
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .context("build the seed catalog HTTP client")?;
+
     RestCatalogBuilder::default()
+        .with_client(client)
         .with_storage_factory(storage_factory)
         .load(label, props)
         .await

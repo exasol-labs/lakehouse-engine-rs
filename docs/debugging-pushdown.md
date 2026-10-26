@@ -100,7 +100,7 @@ execution or a direct capture of the adapter's incoming request, never against
 `EXPLAIN VIRTUAL` alone.
 
 See `ExaConn::capped_result_sets`'s doc comment
-(`crates/lakehouse-engine/tests/common/exasol_ws.rs`) for the calling convention this
+(`crates/lakehouse-e2e/tests/common/exasol_ws.rs`) for the calling convention this
 table backs, and the `fix-e2e-harness-undeclared-limit` plan's `injection-surface.md` for
 the exact statements, the real-execution capture method, the original (superseded)
 `EXPLAIN VIRTUAL`-based matrix, and every control.

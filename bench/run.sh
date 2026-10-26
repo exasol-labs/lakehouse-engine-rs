@@ -366,7 +366,7 @@ if [ "$TARGET" = "docker" ]; then
   wait_exasol
   echo "== loading TPC-H (SF=${TPCH_SCALE}, big tables in ${TPCH_FILES:-4} files) into namespace '${NAMESPACE}' =="
   TPCH_SCALE="$TPCH_SCALE" NAMESPACE="$NAMESPACE" TPCH_FILES="${TPCH_FILES:-4}" \
-    cargo test --features exasol-e2e --test tpch_loader -- --nocapture
+    cargo test --workspace --features lakehouse-e2e/exasol-e2e --test tpch_loader -- --nocapture
   if [ "$WITH_DELETES" = "1" ]; then
     echo "== authoring delete-bearing namespace '${DELETE_NS}' from baseline '${BASELINE_NS}' (docker, idempotent) =="
     "$SCRIPT_DIR/make_deletes_docker.sh" "$BASELINE_NS" "$DELETE_NS"

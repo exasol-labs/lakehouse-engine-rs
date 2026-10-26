@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lakehouse-engine", "crates/lakehouse-catalog", "crates/vs-expression"]
+members = ["crates/lakehouse-engine", "crates/lakehouse-catalog", "crates/vs-expression", "crates/lakehouse-e2e"]
 # Build the UDF .so only via `make cross-udf-build` (rust:1.98.1-trixie): the SDK
 # fingerprint embeds the rustc hash, so a host-built .so is rejected at load.
 resolver = "2"

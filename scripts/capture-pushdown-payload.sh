@@ -16,5 +16,5 @@ make cross-udf-build
 
 docker compose up -d --wait exasol seaweedfs iceberg-rest
 
-CAPTURE_SQL="$1" cargo test --features exasol-e2e --test e2e_capture_pushdown \
+CAPTURE_SQL="$1" cargo test --workspace --features lakehouse-e2e/exasol-e2e --test e2e_capture_pushdown \
   -- --nocapture --test-threads=1 capture_pushdown_payload

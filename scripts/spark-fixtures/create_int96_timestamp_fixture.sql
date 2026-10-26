@@ -8,7 +8,7 @@
 -- uses s3:// because add_files records the writer's scheme and the scan UDF
 -- registers its object store under s3://.
 --
--- Ground truth, in lockstep with crates/lakehouse-engine/tests/common/int96_fixtures.rs:
+-- Ground truth, in lockstep with crates/lakehouse-e2e/tests/common/int96_fixtures.rs:
 --   table:  rest_catalog.e2e_lakehouse.int96_ts_far_future
 --   column: ts  -- Iceberg `timestamp` WITHOUT time zone (Spark TIMESTAMP_NTZ)
 --   rows:   1

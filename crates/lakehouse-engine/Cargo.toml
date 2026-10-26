@@ -7,20 +7,6 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[features]
-# Requires a live Exasol + SeaweedFS + REST catalog stack; must FAIL (not skip) if unreachable.
-exasol-e2e = []
-# Requires real AWS Glue + Exasol; SKIPS (not fails) when required env vars are absent.
-cloud-e2e = []
-# Requires a live Exasol + SeaweedFS + Lakekeeper + Keycloak stack; same FAIL contract as exasol-e2e.
-lakekeeper-e2e = []
-# Requires the Azure (ADLS Gen2) static-credential stack; same FAIL contract as exasol-e2e.
-azure-e2e = []
-# Requires a live Exasol + SeaweedFS + Unity Catalog OSS stack; same FAIL contract as exasol-e2e.
-unity-e2e = []
-# Requires real AWS Glue + S3; same FAIL contract as exasol-e2e.
-glue-e2e = []
-
 [dependencies]
 exasol-udf-sdk    = { workspace = true }
 exasol-udf-macros = { workspace = true }
@@ -85,67 +71,12 @@ tokio               = { workspace = true, features = ["rt-multi-thread", "macros
 exasol-udf-sdk      = { workspace = true, features = ["test-support"] }
 arrow               = { workspace = true, features = ["ipc"] }
 parquet             = { workspace = true }
-# Not tpchgen-arrow: it has no arrow-58 release.
-tpchgen             = { version = "2.0.2" }
 tempfile            = { version = "3" }
 iceberg             = { workspace = true }
-iceberg-catalog-rest = { workspace = true }
-iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
 reqwest             = { workspace = true, features = ["blocking"] }
-# Seed harness forces static SeaweedFS admin credentials over Lakekeeper's vended STS token.
-reqsign-core        = "3.0.1"
-# azure-e2e harness: container lifecycle via Entra ID; the scan path uses the account key.
-azure_storage_blob  = "1.0"
-azure_identity      = "1.0"
-azure_core          = "1.1"
-tungstenite         = { version = "0.29.0", features = ["native-tls"] }
-native-tls          = "0.2"
-rsa                 = { version = "0.9", features = ["sha2", "pkcs5"] }
 futures             = { workspace = true }
-anyhow              = { workspace = true }
-aws-sdk-glue        = { workspace = true }
-# cloud-e2e: signs Glue's Iceberg REST loadTable directly, outside the adapter's catalog client.
-aws-sigv4              = { workspace = true }
-aws-credential-types   = { workspace = true }
-aws-smithy-runtime-api = { workspace = true }
 
 # Host integration tests share the `it` binary (tests/it/main.rs). This one keeps its own process
 # because every scan resets the process-global footer record it asserts on (#523).
 [[test]]
 name = "scan_footer_refetch_observable"
-
-[[test]]
-name = "e2e_local"
-required-features = ["exasol-e2e"]
-
-[[test]]
-name = "e2e_capture_pushdown"
-required-features = ["exasol-e2e"]
-
-[[test]]
-name = "tpch_loader"
-required-features = ["exasol-e2e"]
-
-[[test]]
-name = "two_entry_points_test"
-required-features = ["exasol-e2e"]
-
-[[test]]
-name = "e2e_lakekeeper_test"
-required-features = ["lakekeeper-e2e"]
-
-[[test]]
-name = "e2e_unity_test"
-required-features = ["unity-e2e"]
-
-[[test]]
-name = "e2e_azure_test"
-required-features = ["azure-e2e"]
-
-[[test]]
-name = "e2e_glue_test"
-required-features = ["glue-e2e"]
-
-[[test]]
-name = "cloud_e2e_test"
-required-features = ["cloud-e2e"]

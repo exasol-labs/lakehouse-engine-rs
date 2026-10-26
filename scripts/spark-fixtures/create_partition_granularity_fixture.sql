@@ -1,4 +1,4 @@
--- Ground truth, in lockstep with crates/lakehouse-engine/tests/common/pos_delete_fixtures.rs:
+-- Ground truth, in lockstep with crates/lakehouse-e2e/tests/common/pos_delete_fixtures.rs:
 --   table:      rest_catalog.e2e_lakehouse.mor_pos_partition
 --   partitions: region IN ('east', 'west'), TWO data files each (4 total)
 --     east: file 1 = id 1..=5,  file 2 = id 6..=10

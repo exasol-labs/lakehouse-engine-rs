@@ -31,7 +31,7 @@ fn the_type_relaxation_suite_and_fixture_are_wired_into_run_fixtures_and_make_te
     );
 
     let suite_main = std::fs::read_to_string(
-        workspace_root.join("crates/lakehouse-engine/tests/e2e_local/main.rs"),
+        workspace_root.join("crates/lakehouse-e2e/tests/e2e_local/main.rs"),
     )
     .expect("tests/e2e_local/main.rs must be readable");
     assert!(
@@ -63,7 +63,7 @@ fn make_test_e2e_runs_every_e2e_local_module() {
         "test-e2e target must run --test e2e_local"
     );
 
-    let suite_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e_local");
+    let suite_dir = workspace_root.join("crates/lakehouse-e2e/tests/e2e_local");
     let main_rs = std::fs::read_to_string(suite_dir.join("main.rs"))
         .expect("tests/e2e_local/main.rs must be readable");
     for entry in std::fs::read_dir(&suite_dir).expect("tests/e2e_local must be listable") {
@@ -81,12 +81,12 @@ fn make_test_e2e_runs_every_e2e_local_module() {
     }
 }
 
-/// Cargo builds every top-level `tests/*.rs` and `tests/*/main.rs` as its own binary, and compiles
-/// a `tests/it/` file only when `tests/it/main.rs` declares it, so both mistakes fail here (#523).
+/// Cargo builds each top-level `tests/*.rs` and `tests/*/main.rs` as its own binary (none under
+/// `autotests = false`) and a `tests/it/` file only when declared, so both mistakes fail here (#523).
 #[test]
 fn every_host_test_file_belongs_to_a_listed_test_target() {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for krate in ["lakehouse-engine", "lakehouse-catalog"] {
+    for krate in ["lakehouse-engine", "lakehouse-catalog", "lakehouse-e2e"] {
         let tests_dir = workspace_root.join("crates").join(krate).join("tests");
         let manifest = std::fs::read_to_string(tests_dir.join("../Cargo.toml"))
             .expect("crate Cargo.toml must be readable");
@@ -111,12 +111,15 @@ fn every_host_test_file_belongs_to_a_listed_test_target() {
             };
             assert!(
                 !is_target || listed.contains(&name),
-                "crates/{krate}/tests/{name} builds its own test binary: move it into tests/it/, \
+                "crates/{krate}/tests/{name} is a test target: move it into an existing binary, \
                  or list it as a [[test]] target in crates/{krate}/Cargo.toml"
             );
         }
 
         let it_dir = tests_dir.join("it");
+        if !it_dir.exists() {
+            continue;
+        }
         let it_main = std::fs::read_to_string(it_dir.join("main.rs"))
             .expect("tests/it/main.rs must be readable");
         for entry in std::fs::read_dir(&it_dir).expect("tests/it must be listable") {

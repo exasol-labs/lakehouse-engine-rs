@@ -1,4 +1,4 @@
--- Ground truth, in lockstep with crates/lakehouse-engine/tests/common/pos_delete_fixtures.rs:
+-- Ground truth, in lockstep with crates/lakehouse-e2e/tests/common/pos_delete_fixtures.rs:
 --   table:   rest_catalog.e2e_lakehouse.mor_pos_file
 --   rows:    20 (id 1..=20), TWO data files (ids 1..=10, 11..=20)
 --   deleted: id IN (3, 8, 13, 17)   -- two ids from each data file
