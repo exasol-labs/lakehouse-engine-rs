@@ -1258,7 +1258,6 @@ async fn register_partitioned(writer: &FixtureWriter<'_>) -> Result<()> {
 /// None of these gets a data file: the listing must skip each on its metadata alone.
 async fn register_metadata_only_tables(writer: &FixtureWriter<'_>) -> Result<()> {
     let run = writer.run;
-    let id_column = || hive_column("id", "bigint");
 
     let id_table = |name: &str, formats| -> Result<TableInputBuilder> {
         Ok(external_table(
@@ -1292,6 +1291,10 @@ async fn register_metadata_only_tables(writer: &FixtureWriter<'_>) -> Result<()>
     Ok(())
 }
 
+fn id_column() -> Result<Column> {
+    hive_column("id", "bigint")
+}
+
 fn view(name: &str) -> Result<TableInputBuilder> {
     Ok(TableInput::builder()
         .name(name)
@@ -1299,11 +1302,7 @@ fn view(name: &str) -> Result<TableInputBuilder> {
         .parameters("presto_view", "true")
         .view_original_text("/* Presto View */")
         .view_expanded_text("/* Presto View */")
-        .storage_descriptor(
-            StorageDescriptor::builder()
-                .columns(hive_column("id", "bigint")?)
-                .build(),
-        ))
+        .storage_descriptor(StorageDescriptor::builder().columns(id_column()?).build()))
 }
 
 /// Bounded, because Glue throttles a burst of `CreateTable` calls.

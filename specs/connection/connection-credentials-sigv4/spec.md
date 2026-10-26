@@ -10,6 +10,7 @@ Extends `connection/connection-credentials` with the AWS Glue SigV4 requirement:
 * For any other address form, the signing region is the stated `region`.
 * `region` holds exactly what the CONNECTION states and places the S3 store independently of the signing region.
 * `endpoint` stays optional when `use_sigv4` is true.
+* SigV4 signing targets AWS Glue only: every signed catalog request signs for the `glue` service under Glue's `catalogs/{warehouse}` prefix. A SigV4 catalog is therefore a Glue catalog, and Glue's single-level namespaces apply to it (`vs-adapter/create-virtual-schema`).
 
 ## Scenarios
 

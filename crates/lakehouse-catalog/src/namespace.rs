@@ -22,8 +22,8 @@ pub fn parse_table_ident(qualified: &str) -> Result<(NamespaceIdent, String), Ud
     Ok((ns_ident, table_name))
 }
 
-/// The unsigned path includes descendant namespaces. The signed path targets AWS
-/// Glue, whose namespaces are single-level, under its required `catalogs/{warehouse}` prefix.
+/// Includes descendant namespaces, except on Glue, whose namespaces are single-level.
+/// SigV4 targets Glue only: requests sign for the `glue` service under `catalogs/{warehouse}`.
 pub(crate) async fn list_namespace_tables(
     catalog_uri: &str,
     configured_ns: &[String],
@@ -41,14 +41,14 @@ pub(crate) async fn list_namespace_tables(
     if creds.use_sigv4 {
         let region = required_signing_region(creds, catalog_uri)?;
         let prefix = glue_catalog_prefix(&creds.warehouse);
-        let enumeration = SignedEnumeration {
+        let enumeration = GlueEnumeration {
             client: reqwest::Client::new(),
             catalog_uri,
             prefix: &prefix,
             creds,
             region: &region,
         };
-        enumeration.list_tables_signed(&ns_ident).await
+        enumeration.list_glue_tables(&ns_ident).await
     } else {
         list_namespace_tables_unsigned(catalog_uri, &ns_ident, &creds.warehouse, storage, creds)
             .await
@@ -117,7 +117,7 @@ fn build_list_tables_url(catalog_uri: &str, warehouse: &str, ns: &NamespaceIdent
     }
 }
 
-struct SignedEnumeration<'a> {
+struct GlueEnumeration<'a> {
     client: reqwest::Client,
     catalog_uri: &'a str,
     prefix: &'a str,
@@ -125,7 +125,7 @@ struct SignedEnumeration<'a> {
     region: &'a str,
 }
 
-impl<'a> SignedEnumeration<'a> {
+impl<'a> GlueEnumeration<'a> {
     async fn signed_get_json(
         &self,
         url: &str,
@@ -182,7 +182,7 @@ impl<'a> SignedEnumeration<'a> {
         })
     }
 
-    async fn list_tables_signed(&self, ns: &NamespaceIdent) -> Result<Vec<TableIdent>, UdfError> {
+    async fn list_glue_tables(&self, ns: &NamespaceIdent) -> Result<Vec<TableIdent>, UdfError> {
         let url = build_list_tables_url(self.catalog_uri, self.prefix, ns);
         let mut all = Vec::new();
         let mut page_token: Option<String> = None;

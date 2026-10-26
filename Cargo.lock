@@ -3407,7 +3407,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-catalog"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "aws-credential-types",
  "aws-sdk-glue",
@@ -3429,7 +3429,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.56.4"
+version = "0.56.5"
 dependencies = [
  "aes-gcm",
  "anyhow",
