@@ -37,12 +37,22 @@ fn parse_table_ident_handles_multilevel_namespace() {
     assert_eq!(tbl3, "orders");
 }
 
+fn sigv4_creds() -> ConnectionCreds {
+    let mut creds = base_creds();
+    creds.use_sigv4 = true;
+    creds.region = "eu-west-1".into();
+    creds.warehouse = "123456789012".into();
+    creds
+}
+
 #[tokio::test]
 async fn list_namespace_tables_rejects_empty_namespace() {
-    let storage = static_backend();
-    let creds = base_creds();
+    let creds = sigv4_creds();
+    let session = CatalogSession::resolve("http://unused.invalid", &creds.warehouse, &creds)
+        .await
+        .expect("a SigV4 session resolves without any network access");
 
-    let err = list_namespace_tables("http://unused.invalid", &[], &storage, &creds)
+    let err = list_namespace_tables(&session, &[], &creds)
         .await
         .unwrap_err();
 
@@ -52,118 +62,64 @@ async fn list_namespace_tables_rejects_empty_namespace() {
     );
 }
 
+/// Glue namespaces are single-level, so the signed listing sends no `parent` request.
 #[tokio::test]
-async fn list_tables_signed_url_carries_catalogs_prefix() {
+async fn signed_listing_lists_only_the_configured_namespace_under_the_catalogs_prefix() {
     let (catalog_uri, heads) = spawn_recording_catalog(EMPTY_LISTING).await;
-    let storage = static_backend();
-    let mut creds = base_creds();
-    creds.use_sigv4 = true;
-    creds.warehouse = "123456789012".into();
+    let creds = sigv4_creds();
+    let session = CatalogSession::resolve(&catalog_uri, &creds.warehouse, &creds)
+        .await
+        .expect("a SigV4 session resolves without any network access");
 
-    let result = list_namespace_tables(&catalog_uri, &["db".to_string()], &storage, &creds).await;
+    list_namespace_tables(&session, &["db".to_string()], &creds)
+        .await
+        .expect("the signed listing must succeed against the stub");
 
-    assert!(
-        result.is_ok(),
-        "expected the enumeration to succeed: {:?}",
-        result.err()
-    );
-
-    let head = heads
-        .lock()
-        .unwrap()
-        .first()
-        .cloned()
-        .expect("the list_tables request must have been captured");
+    let heads = heads.lock().unwrap();
+    let [head] = heads.as_slice() else {
+        panic!("exactly one listing request, got {}", heads.len());
+    };
     let request_line = head.lines().next().unwrap_or_default();
     assert!(
-        request_line.contains("/v1/catalogs/123456789012/namespaces/db/tables"),
-        "signed list_tables URL must carry the derived catalogs/{{account-id}} prefix: {request_line}"
+        request_line.starts_with("GET /v1/catalogs/123456789012/namespaces/db/tables "),
+        "the signed listing must address the catalogs/{{account-id}} prefix: {request_line}"
     );
+    let authorization = authorization_header(head).expect("the request must be signed");
     assert!(
-        !request_line.contains("/v1/123456789012/namespaces"),
-        "signed list_tables URL must NOT use the bare warehouse as the prefix: {request_line}"
+        authorization.contains("/eu-west-1/glue/aws4_request"),
+        "the listing must be signed for the resolved region: {authorization}"
     );
 }
 
 const EMPTY_LISTING: &str = r#"{"identifiers":[],"namespaces":[]}"#;
 
 #[tokio::test]
-async fn signed_enumeration_is_signed_for_the_resolved_region() {
-    let (catalog_uri, heads) = spawn_recording_catalog(EMPTY_LISTING).await;
+async fn a_refused_catalog_connection_names_its_cause_signed_or_not() {
     let mut creds = base_creds();
+    let Err(UdfError::User(msg)) =
+        CatalogSession::resolve(CLOSED_PORT_URI, &creds.warehouse, &creds).await
+    else {
+        panic!("an unsigned session reads /v1/config, so a closed port must fail it");
+    };
+    assert!(
+        msg.starts_with("failed to read the catalog config for warehouse ")
+            && msg.contains(CLOSED_PORT_CAUSE),
+        "{msg}"
+    );
+
     creds.use_sigv4 = true;
     creds.region = "us-east-1".into();
-    let ns = NamespaceIdent::new("db".into());
-
-    let enumeration = GlueEnumeration {
-        client: reqwest::Client::new(),
-        catalog_uri: &catalog_uri,
-        prefix: "catalogs/123456789012",
-        creds: &creds,
-        region: "eu-west-1",
-    };
-    enumeration
-        .list_glue_tables(&ns)
+    let session = CatalogSession::resolve(CLOSED_PORT_URI, &creds.warehouse, &creds)
         .await
-        .expect("the signed enumeration must succeed against the stub");
-
-    let heads = heads.lock().unwrap();
-    assert!(
-        !heads.is_empty(),
-        "the enumeration must have sent at least its list_tables request"
-    );
-    for head in heads.iter() {
-        let authorization = authorization_header(head).expect("every request must be signed");
-        assert!(
-            authorization.contains("/eu-west-1/glue/aws4_request"),
-            "every enumeration request must be signed for the resolved region: {authorization}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn signed_enumeration_refuses_without_signing_region() {
-    let (catalog_uri, heads) = spawn_recording_catalog(EMPTY_LISTING).await;
-    let storage = static_backend();
-    let mut creds = base_creds();
-    creds.use_sigv4 = true;
-    creds.region = String::new();
-
+        .expect("a SigV4 session resolves without the catalog");
     let Err(UdfError::User(msg)) =
-        list_namespace_tables(&catalog_uri, &["db".to_string()], &storage, &creds).await
+        list_namespace_tables(&session, &["db".to_string()], &creds).await
     else {
-        panic!("a SigV4 enumeration with no signing region must be refused as a user error");
+        panic!("a closed catalog port must fail the listing as a user error");
     };
-
-    assert_eq!(msg, crate::sigv4::MISSING_SIGNING_REGION);
     assert!(
-        heads.lock().unwrap().is_empty(),
-        "no catalog request may be sent without a signing region"
+        msg.starts_with("failed to list tables in namespace 'db': ")
+            && msg.contains(CLOSED_PORT_CAUSE),
+        "{msg}"
     );
-}
-
-#[tokio::test]
-async fn a_refused_catalog_connection_names_its_cause_signed_or_not() {
-    for use_sigv4 in [false, true] {
-        let mut creds = base_creds();
-        creds.use_sigv4 = use_sigv4;
-        creds.region = "us-east-1".into();
-
-        let Err(UdfError::User(msg)) = list_namespace_tables(
-            CLOSED_PORT_URI,
-            &["db".to_string()],
-            &static_backend(),
-            &creds,
-        )
-        .await
-        else {
-            panic!("a closed catalog port must fail the listing as a user error");
-        };
-
-        assert!(
-            msg.starts_with("failed to list tables in namespace 'db': ")
-                && msg.contains(CLOSED_PORT_CAUSE),
-            "use_sigv4={use_sigv4}: {msg}"
-        );
-    }
 }

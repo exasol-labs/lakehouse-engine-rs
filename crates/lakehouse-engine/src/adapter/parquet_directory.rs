@@ -1,11 +1,11 @@
 //! Single source of truth for a prefix's Parquet file list, partition columns, and folded schema,
 //! so table enumeration and query planning can't disagree about a table's columns.
+use crate::scan::DIRECT_STORAGE_ADMISSION_LIMIT;
 use crate::scan::parquet_reader::SizedParquetReader;
 use crate::types::widening::widen;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use exasol_udf_sdk::error::UdfError;
-use futures::TryStreamExt;
-use futures::future::try_join_all;
+use futures::{StreamExt, TryStreamExt, stream};
 use lakehouse_catalog::HIVE_DEFAULT_PARTITION;
 use lakehouse_catalog::error_chain;
 use object_store::ObjectStore;
@@ -153,16 +153,17 @@ pub async fn resolve_parquet_directory(
     let key_columns = uppercase_index(raw_files.iter().flat_map(segment_keys));
     let partition_values = fill_partition_values(&raw_files, &declared_keys)?;
 
-    // Concurrency is bounded by the caller's store's admission limiter, not a second one here.
-    let read: Vec<ArrowReaderMetadata> = try_join_all(
-        sources
-            .iter()
-            .map(|raw| read_footer(Arc::clone(store), &raw.path, raw.size)),
-    )
-    .await?;
-
-    let folded_fields = fold_schemas(&sources, &read, &key_columns)?;
-    let binary_columns = binary_columns(&read, &folded_fields);
+    // Folding in listing order as footers arrive bounds how many parsed footers are alive.
+    // Index items, because a reference item trips rustc's higher-ranked `Send` check.
+    let mut footers = stream::iter(0..sources.len())
+        .map(|i| read_footer(Arc::clone(store), sources[i].path.clone(), sources[i].size))
+        .buffered(DIRECT_STORAGE_ADMISSION_LIMIT)
+        .zip(stream::iter(&sources));
+    let mut fold = SchemaFold::new(&key_columns);
+    while let Some((footer, source)) = footers.next().await {
+        fold.add(source, &footer?)?;
+    }
+    let (folded_fields, binary_columns) = fold.finish();
     let files = raw_files
         .iter()
         .zip(partition_values)
@@ -378,12 +379,16 @@ fn missing_segment_error(column: &str, key: &str, path: &StorePath) -> UdfError 
     ))
 }
 
+/// Most footers fit, so one GET reads them; a larger one costs a second GET for the rest.
+const FOOTER_SIZE_HINT: usize = 64 * 1024;
+
 async fn read_footer(
     store: Arc<dyn ObjectStore>,
-    path: &StorePath,
+    path: StorePath,
     size: u64,
 ) -> Result<ArrowReaderMetadata, UdfError> {
-    let mut reader = SizedParquetReader::new(store, path.clone(), size);
+    let mut reader =
+        SizedParquetReader::new(store, path.clone(), size).with_footer_size_hint(FOOTER_SIZE_HINT);
     ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::new())
         .await
         .map_err(|e| {
@@ -403,27 +408,37 @@ struct FoldedColumn {
 
 /// A stored column named like a partition key (`key_columns`, keyed uppercase) is dropped in favor
 /// of the key; a read file that stores the column but lacks the key's segment is an error.
-fn fold_schemas(
-    sources: &[&ListedFile],
-    read: &[ArrowReaderMetadata],
-    key_columns: &HashMap<String, &str>,
-) -> Result<Vec<Field>, UdfError> {
-    let mut columns: Vec<FoldedColumn> = Vec::new();
-    let mut by_uppercase: HashMap<String, usize> = HashMap::new();
+struct SchemaFold<'a> {
+    key_columns: &'a HashMap<String, &'a str>,
+    columns: Vec<FoldedColumn>,
+    by_uppercase: HashMap<String, usize>,
+    /// The first listed file's leaf names a column's type.
+    first_binary_leaf: HashMap<String, BinaryColumn>,
+}
 
-    for (source, metadata) in sources.iter().zip(read) {
+impl<'a> SchemaFold<'a> {
+    fn new(key_columns: &'a HashMap<String, &'a str>) -> Self {
+        Self {
+            key_columns,
+            columns: Vec::new(),
+            by_uppercase: HashMap::new(),
+            first_binary_leaf: HashMap::new(),
+        }
+    }
+
+    fn add(&mut self, source: &ListedFile, metadata: &ArrowReaderMetadata) -> Result<(), UdfError> {
         let path = &source.path;
         for field in metadata.schema().fields() {
             let folded = field.name().to_uppercase();
-            if let Some(key) = key_columns.get(&folded) {
+            if let Some(key) = self.key_columns.get(&folded) {
                 if !segment_keys(source).any(|own| own.to_uppercase() == folded) {
                     return Err(missing_segment_error(field.name(), key, path));
                 }
                 continue;
             }
-            match by_uppercase.get(&folded).copied() {
-                Some(index) if columns[index].name == *field.name() => {
-                    let column = &mut columns[index];
+            match self.by_uppercase.get(&folded).copied() {
+                Some(index) if self.columns[index].name == *field.name() => {
+                    let column = &mut self.columns[index];
                     let Some(wider) = widen(&column.data_type, field.data_type()) else {
                         return Err(unfoldable_pair(column, field, path));
                     };
@@ -432,10 +447,10 @@ fn fold_schemas(
                         column.source = path.clone();
                     }
                 }
-                Some(index) => return Err(colliding_names(&columns[index], field, path)),
+                Some(index) => return Err(colliding_names(&self.columns[index], field, path)),
                 None => {
-                    by_uppercase.insert(folded, columns.len());
-                    columns.push(FoldedColumn {
+                    self.by_uppercase.insert(folded, self.columns.len());
+                    self.columns.push(FoldedColumn {
                         name: field.name().clone(),
                         data_type: field.data_type().clone(),
                         source: path.clone(),
@@ -443,21 +458,7 @@ fn fold_schemas(
                 }
             }
         }
-    }
 
-    // A column absent from one file is filled with NULL for that file's rows, so a column declared
-    // required but absent would fail the scan instead.
-    Ok(columns
-        .into_iter()
-        .map(|column| Field::new(column.name, column.data_type, true))
-        .collect())
-}
-
-/// Only columns of `folded` count, so a stored column dropped for a partition key is never
-/// refused; the first listed file's leaf names a column's type.
-fn binary_columns(read: &[ArrowReaderMetadata], folded: &[Field]) -> Vec<BinaryColumn> {
-    let mut first_by_column: HashMap<String, BinaryColumn> = HashMap::new();
-    for metadata in read {
         for leaf in metadata.metadata().file_metadata().schema_descr().columns() {
             let parts = leaf.path().parts();
             let is_top_level_scalar = parts.len() == 1 && leaf.max_rep_level() == 0;
@@ -467,7 +468,7 @@ fn binary_columns(read: &[ArrowReaderMetadata], folded: &[Field]) -> Vec<BinaryC
                 LeafKind::Enum => ("enum".to_string(), true),
                 LeafKind::Binary(declared) => (declared, false),
             };
-            first_by_column
+            self.first_binary_leaf
                 .entry(parts[0].clone())
                 .or_insert_with(|| BinaryColumn {
                     column: parts[0].clone(),
@@ -476,11 +477,24 @@ fn binary_columns(read: &[ArrowReaderMetadata], folded: &[Field]) -> Vec<BinaryC
                     nested_enum,
                 });
         }
+        Ok(())
     }
-    folded
-        .iter()
-        .filter_map(|field| first_by_column.remove(field.name()))
-        .collect()
+
+    /// Only folded columns are refused, so a stored column dropped for a partition key never is.
+    /// Every folded column is nullable, because a file that lacks it reads NULL for its rows.
+    fn finish(mut self) -> (Vec<Field>, Vec<BinaryColumn>) {
+        let binary_columns = self
+            .columns
+            .iter()
+            .filter_map(|column| self.first_binary_leaf.remove(&column.name))
+            .collect();
+        let fields = self
+            .columns
+            .into_iter()
+            .map(|column| Field::new(column.name, column.data_type, true))
+            .collect();
+        (fields, binary_columns)
+    }
 }
 
 enum LeafKind {

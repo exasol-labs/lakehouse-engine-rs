@@ -43,6 +43,14 @@ An Exasol user registers every Iceberg table in a configured namespace as a virt
 * *AND* the adapter MUST NOT persist any catalog metadata between requests other than each virtual table's identifier note and the skipped-table list (`SKIPPED_TABLES`, per `vs-adapter/create-virtual-schema-adapter-notes`) recorded in `adapterNotes`
 * *AND* a `createVirtualSchema` request that resolves to a CATALOG kind and supplies no `NAMESPACE` property SHALL fail with the required-property error naming `NAMESPACE`, SUPERSEDING the unconditional form of this clause, because the `DIRECT_STORAGE` kind reaches its tables from the CONNECTION address alone and treats an absent `NAMESPACE` as the address itself, per `direct-storage/direct-storage-properties`
 
+### Scenario: Enumeration fans out concurrently and loads only the current schema
+
+* *GIVEN* an Iceberg REST namespace whose tables and descendant namespaces outnumber the enumeration's request cap
+* *WHEN* the adapter enumerates it at `createVirtualSchema` or `REFRESH`
+* *THEN* the adapter SHALL list the namespaces of one depth concurrently and load the listed tables concurrently, at most 16 namespaces or 16 tables at a time, and SHALL declare every table with its own columns
+* *AND* every table and namespace listing SHALL request each following page with the previous page's `next-page-token` until a page carries none
+* *AND* each enumeration `loadTable` SHALL request `snapshots=refs` and SHALL NOT send `X-Iceberg-Access-Delegation`, because enumeration reads only the current schema, while the Iceberg REST OpenAPI default for `snapshots` is `all` and a delegation header asks the catalog to mint storage credentials
+
 ### Scenario: One non-Iceberg table in the namespace is skipped rather than aborting the schema
 
 * *GIVEN* a `createVirtualSchema` request whose configured namespace contains a mix of Iceberg tables and at least one non-Iceberg table (e.g. an AWS Glue Hive external table) that the catalog's table listing returns but whose per-table `loadTable` request returns HTTP 404, the Iceberg REST OpenAPI `NoSuchTableException` response ("table to load does not exist"), which AWS Glue returns as `NoSuchIcebergTableException: Input table is not an iceberg table`

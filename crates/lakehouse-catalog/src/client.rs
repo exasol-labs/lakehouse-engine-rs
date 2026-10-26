@@ -6,12 +6,14 @@ use std::future::Future;
 use std::pin::Pin;
 
 use exasol_udf_sdk::error::UdfError;
-use iceberg::TableIdent;
+use futures::{StreamExt, TryStreamExt, stream};
 use iceberg::spec::TableMetadata;
+use iceberg::{NamespaceIdent, TableIdent};
+use tokio::sync::OnceCell;
 
-use crate::namespace::list_namespace_tables;
-use crate::session::{CatalogSession, load_table_any_auth};
-use crate::{CatalogProps, ConnectionCreds, StorageBackend};
+use crate::ConnectionCreds;
+use crate::namespace::{CATALOG_REQUEST_CONCURRENCY, list_namespace_tables};
+use crate::session::{CatalogSession, load_table_schema_metadata};
 
 /// Namespace carried as segments, never a joined dotted string: a segment may
 /// itself contain the separator.
@@ -197,24 +199,31 @@ pub trait CatalogClient: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<CatalogTable, UdfError>> + Send + '_>>;
 }
 
-/// Builds its [`CatalogSession`] lazily, after enumeration, so an empty namespace
-/// performs no OAuth2 grant.
+/// One [`CatalogSession`], resolved on first use, serves the listing and every load, so a request
+/// runs one OAuth2 grant and one `/v1/config` lookup.
 pub struct IcebergRestCatalogClient {
     catalog_uri: String,
-    storage: StorageBackend,
     creds: ConnectionCreds,
+    session: OnceCell<CatalogSession>,
 }
 
 impl IcebergRestCatalogClient {
-    pub fn new(catalog_uri: String, storage: StorageBackend, creds: ConnectionCreds) -> Self {
+    pub fn new(catalog_uri: String, creds: ConnectionCreds) -> Self {
         Self {
             catalog_uri,
-            storage,
             creds,
+            session: OnceCell::new(),
         }
     }
 
-    /// One session for the whole batch; none (and no OAuth2 grant) for an empty one.
+    async fn session(&self) -> Result<&CatalogSession, UdfError> {
+        self.session
+            .get_or_try_init(|| {
+                CatalogSession::resolve(&self.catalog_uri, &self.creds.warehouse, &self.creds)
+            })
+            .await
+    }
+
     async fn resolve_listing(
         &self,
         idents: &[CatalogTableIdent],
@@ -225,14 +234,12 @@ impl IcebergRestCatalogClient {
                 skipped: Vec::new(),
             });
         }
-
-        let session =
-            CatalogSession::resolve(&self.catalog_uri, &self.creds.warehouse, &self.creds).await?;
-
-        let mut admissions = Vec::with_capacity(idents.len());
-        for ident in idents {
-            admissions.push(self.admit_on_session(&session, ident).await?);
-        }
+        let session = self.session().await?;
+        let admissions: Vec<TableAdmission> = stream::iter(idents.iter().cloned())
+            .map(|ident| async move { self.admit_on_session(session, &ident).await })
+            .buffered(CATALOG_REQUEST_CONCURRENCY)
+            .try_collect()
+            .await?;
         Ok(admissions.into_iter().collect())
     }
 
@@ -253,19 +260,21 @@ impl IcebergRestCatalogClient {
         }
     }
 
-    /// No metadata location: this catalog serves the metadata itself, with any vended
-    /// credentials inline.
+    /// No metadata location: this catalog serves the metadata itself.
     async fn load_on_session(
         &self,
         session: &CatalogSession,
         ident: &CatalogTableIdent,
     ) -> Result<CatalogTable, UdfError> {
-        let catalog = CatalogProps {
-            warehouse: self.creds.warehouse.clone(),
-            table: catalog_identifier_string(ident),
-        };
-        let result = load_table_any_auth(session, &catalog, &self.creds).await?;
-        Ok(iceberg_catalog_table(ident.clone(), &result.metadata, None))
+        let namespace = NamespaceIdent::from_vec(ident.namespace.clone()).map_err(|e| {
+            UdfError::User(format!(
+                "invalid namespace in '{}': {e}",
+                catalog_identifier_string(ident)
+            ))
+        })?;
+        let metadata =
+            load_table_schema_metadata(session, &namespace, &ident.name, &self.creds).await?;
+        Ok(iceberg_catalog_table(ident.clone(), &metadata, None))
     }
 }
 
@@ -287,9 +296,8 @@ impl CatalogClient for IcebergRestCatalogClient {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<CatalogTableIdent>, UdfError>> + Send + '_>> {
         let namespace = namespace.to_vec();
         Box::pin(async move {
-            let idents =
-                list_namespace_tables(&self.catalog_uri, &namespace, &self.storage, &self.creds)
-                    .await?;
+            let session = self.session().await?;
+            let idents = list_namespace_tables(session, &namespace, &self.creds).await?;
             Ok(idents.iter().map(neutral_ident).collect())
         })
     }
@@ -307,12 +315,7 @@ impl CatalogClient for IcebergRestCatalogClient {
         ident: &CatalogTableIdent,
     ) -> Pin<Box<dyn Future<Output = Result<CatalogTable, UdfError>> + Send + '_>> {
         let ident = ident.clone();
-        Box::pin(async move {
-            let session =
-                CatalogSession::resolve(&self.catalog_uri, &self.creds.warehouse, &self.creds)
-                    .await?;
-            self.load_on_session(&session, &ident).await
-        })
+        Box::pin(async move { self.load_on_session(self.session().await?, &ident).await })
     }
 }
 

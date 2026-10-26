@@ -43,60 +43,26 @@ fn signed_request_does_not_leak_keys_in_headers() {
 }
 
 /// Scenario: Static bearer token is attached to unsigned catalog requests
+/// Scenario: Catalog requests carry no authorization when neither token nor OAuth credentials are supplied
 #[test]
-fn bearer_token_attached_to_load_table_request() {
+fn catalog_auth_sets_the_authorization_header_per_mode() {
     let client = reqwest::Client::new();
     let url = "https://catalog.example.com/v1/namespaces/db/tables/t";
+    let authorization = |auth: &CatalogAuth| {
+        let request = build_signed_request(client.get(url), auth, &creds_no_auth())
+            .expect("an unsigned request builds");
+        assert!(request.headers().get("x-amz-date").is_none());
+        request
+            .headers()
+            .get("authorization")
+            .map(|v| v.to_str().unwrap().to_string())
+    };
 
-    let request = client
-        .get(url)
-        .header("accept", "application/json")
-        .bearer_auth(BEARER_TOK)
-        .build()
-        .expect("valid request");
-
-    let auth_header = request
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    assert!(
-        auth_header.starts_with("Bearer "),
-        "authorization header must start with 'Bearer ': {auth_header}"
+    assert_eq!(
+        authorization(&CatalogAuth::Bearer(BEARER_TOK.into())),
+        Some(format!("Bearer {BEARER_TOK}"))
     );
-    assert!(
-        auth_header.contains(BEARER_TOK),
-        "bearer token must appear in the authorization header"
-    );
-
-    assert!(
-        request.headers().get("x-amz-date").is_none(),
-        "bearer-auth must not set x-amz-date"
-    );
-    assert!(
-        request.headers().get("x-amz-security-token").is_none(),
-        "bearer-auth must not set x-amz-security-token"
-    );
-}
-
-#[test]
-fn no_auth_load_table_sends_no_authorization() {
-    let client = reqwest::Client::new();
-    let request = client
-        .get("https://catalog.example.com/v1/namespaces/db/tables/t")
-        .header("accept", "application/json")
-        .build()
-        .expect("valid request");
-
-    assert!(
-        request.headers().get("authorization").is_none(),
-        "no-auth path must not set Authorization header"
-    );
-    assert!(
-        request.headers().get("x-amz-date").is_none(),
-        "no-auth path must not set x-amz-date"
-    );
+    assert_eq!(authorization(&CatalogAuth::None), None);
 }
 
 #[tokio::test]

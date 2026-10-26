@@ -155,6 +155,7 @@ fn lakekeeper_bootstrap_and_warehouses_provision() {
     }
 }
 
+/// Scenario: Enumeration fans out concurrently and loads only the current schema
 #[test]
 fn lakekeeper_create_virtual_schema_lists_tables_over_oidc() {
     setup();

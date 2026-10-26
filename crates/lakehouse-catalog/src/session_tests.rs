@@ -139,7 +139,9 @@ async fn sigv4_resolve_prefix_derives_catalogs_segment() {
     };
 
     let client = reqwest::Client::new();
-    let result = resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds).await;
+    let result = resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds)
+        .await
+        .expect("prefix");
 
     assert_eq!(
         result,
@@ -185,7 +187,9 @@ async fn non_sigv4_config_prefix_resolution_uses_config_endpoint() {
 
     let client = reqwest::Client::new();
     let result =
-        resolve_load_table_prefix(&client, &catalog_uri, "original-warehouse", &auth, &creds).await;
+        resolve_load_table_prefix(&client, &catalog_uri, "original-warehouse", &auth, &creds)
+            .await
+            .expect("prefix");
 
     assert_eq!(
         result, resolved_prefix,
@@ -223,7 +227,9 @@ async fn non_sigv4_no_config_prefix_yields_empty_not_warehouse() {
     let auth = CatalogAuth::None;
 
     let client = reqwest::Client::new();
-    let result = resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds).await;
+    let result = resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds)
+        .await
+        .expect("prefix");
 
     assert_eq!(
         result, "",
@@ -302,10 +308,13 @@ async fn assumed_session_signs_load_table_and_namespace_enumeration() {
         load_table_any_auth(&session, &catalog, &session_creds)
             .await
             .expect("the session-signed loadTable must succeed");
+        let enumeration_session =
+            CatalogSession::resolve(&enumeration_uri, WAREHOUSE, &session_creds)
+                .await
+                .expect("a SigV4 session resolves without any network access");
         crate::namespace::list_namespace_tables(
-            &enumeration_uri,
+            &enumeration_session,
             &["db".to_string()],
-            &static_backend(),
             &session_creds,
         )
         .await
@@ -377,5 +386,46 @@ async fn catalog_session_resolve_sigv4_no_config_roundtrip() {
     assert_eq!(
         session.catalog_uri, catalog_uri,
         "catalog_uri must be carried verbatim"
+    );
+}
+
+/// Scenario: A failed config lookup fails the request
+#[tokio::test]
+async fn a_failed_config_lookup_fails_the_session() {
+    let (uri, requests) = spawn_server("application/json", |_| {
+        (404, r#"{"error":"no such warehouse"}"#.to_string())
+    })
+    .await;
+
+    let Err(UdfError::User(msg)) =
+        CatalogSession::resolve(&uri, "wrong-wh", &creds_no_auth()).await
+    else {
+        panic!("a 404 config answer must fail the session");
+    };
+
+    assert!(
+        msg.starts_with("failed to read the catalog config for warehouse 'wrong-wh': ")
+            && msg.contains("HTTP 404"),
+        "{msg}"
+    );
+    let requests = requests.lock().unwrap();
+    let [request] = requests.as_slice() else {
+        panic!("one config request, got {}", requests.len());
+    };
+    assert!(
+        request.starts_with("GET /v1/config?warehouse=wrong-wh "),
+        "{request}"
+    );
+}
+
+#[test]
+fn catalog_urls_ignore_a_trailing_slash_on_the_address() {
+    assert_eq!(
+        build_load_table_url("http://host/catalog/", "wh", "db", "t"),
+        "http://host/catalog/v1/wh/namespaces/db/tables/t"
+    );
+    assert_eq!(
+        catalog_url("http://host/catalog/", "", "namespaces"),
+        "http://host/catalog/v1/namespaces"
     );
 }
