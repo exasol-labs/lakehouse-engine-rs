@@ -20,7 +20,7 @@ use lakehouse_engine::scan::{
 use object_store::local::LocalFileSystem;
 use parquet::arrow::ArrowWriter;
 
-mod scan_fixture;
+use crate::scan_fixture;
 
 fn dummy_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
@@ -132,14 +132,11 @@ fn int64_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a Int64Array {
 
 #[test]
 fn declared_physical_name_binds_the_renamed_physical_column() {
-    let dir = std::env::temp_dir().join(format!(
-        "lh_column_binding_physical_name_{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let rows = 20;
     let file_url = write_local_parquet(
-        &dir,
+        dir,
         "physical_name.parquet",
         &[("id", false), ("col-abc", true)],
         rows,
@@ -215,17 +212,14 @@ fn declared_physical_name_binds_the_renamed_physical_column() {
         row_count += id_values.len();
     }
     assert_eq!(row_count, rows as usize, "row count");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
-    let dir =
-        std::env::temp_dir().join(format!("lh_column_binding_identity_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let rows = 15;
-    let file_url = write_local_parquet(&dir, "identity.parquet", &[("id", false)], rows);
+    let file_url = write_local_parquet(dir, "identity.parquet", &[("id", false)], rows);
     let file_size = std::fs::metadata(file_url.strip_prefix("file://").unwrap())
         .expect("stat parquet")
         .len();
@@ -321,8 +315,6 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
         text.contains("mandatory"),
         "error must name the missing required column: {text}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -330,8 +322,8 @@ fn mixed_column_parquet_file_emits_json_for_populated_list_and_struct() {
     use arrow::array::{ArrayRef, ListBuilder, StringArray, StringBuilder, StructArray};
     use arrow::datatypes::Fields;
 
-    let dir = std::env::temp_dir().join(format!("lh_column_binding_mixed_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
 
     let mut tags_builder = ListBuilder::new(StringBuilder::new());
     tags_builder.values().append_value("a");
@@ -473,6 +465,4 @@ fn mixed_column_parquet_file_emits_json_for_populated_list_and_struct() {
         parsed_addr,
         serde_json::json!({"street": "Main St", "city": "Berlin"})
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

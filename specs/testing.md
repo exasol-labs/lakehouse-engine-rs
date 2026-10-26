@@ -17,6 +17,8 @@ This file holds the rules for how this repository tests its behavior and how it 
 - Unit tests run on the host with `cargo test`. They live in a sibling `_tests.rs` file (`AGENTS.md` § Code style).
 - There is no host integration tier. A host test that writes or lists files, reads an object store, or chains several modules to prove behavior is an E2E test in the wrong place. A test against a fake server is a fault-injection test.
 - Scan UDF tests run `run()` on the host through `exasol_udf_sdk::test_support::TestContext` (`EmitPolicy`, `NextPolicy`). A new scan test uses this pattern.
+- Host tests under a crate's `tests/` directory build into one binary per crate, `tests/it/main.rs`, because each test binary statically links the whole engine. A new test file is a module declared in `tests/it/main.rs`. A top-level `tests/*.rs` file is a deliberate `[[test]]` target: an E2E suite, or `scan_footer_refetch_observable`, which keeps its own process because every scan resets the process-global footer record it asserts on.
+- The `it` binary runs its tests as parallel threads of one process. A test that writes to the filesystem writes under its own `tempfile::tempdir()`, which is unique and removed even when the test panics, and a test that asserts on process-global state either shares one lock with every test that mutates that state or keeps its own binary.
 - E2E tests run against a live Exasol and a real or containerized catalog and object store. Each E2E suite is a `[[test]]` target whose `required-features` names the suite's cargo feature, so the plain `cargo test` run never builds a suite or needs a stack.
 
 ### Testing strategy
@@ -100,7 +102,7 @@ This file holds the rules for how this repository tests its behavior and how it 
 - A test whose assertion a change makes false is deleted together with its section banner and its test-only imports.
 - When code moves to another crate, its test module moves with it and keeps every test name and expected value. A test of a property of the code left behind stays with that code. A helper that several test modules share is declared once in the crate's `#[cfg(test)]` support module. No test is deleted, disabled, or weakened to fit a visibility change.
 - A test-only helper that unwraps a production type's private payload is declared in its crate's `#[cfg(test)]` support module and is never `pub`.
-- A structural contract that no runtime test can observe is pinned by a compile-time test that stays intact and unweakened. `capabilities_are_assembled_without_the_catalog_kind` pins that the capability set takes no catalog-kind input, and `crates/lakehouse-engine/tests/catalog_session_signatures.rs` pins that the Iceberg scan source carries a shared `CatalogSession`.
+- A structural contract that no runtime test can observe is pinned by a compile-time test that stays intact and unweakened. Examples are the contracts that the capability set takes no catalog-kind input, and that the Iceberg scan source carries a shared `CatalogSession`.
 
 ### Fixtures
 

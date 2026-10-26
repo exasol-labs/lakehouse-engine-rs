@@ -87,6 +87,7 @@ arrow               = { workspace = true, features = ["ipc"] }
 parquet             = { workspace = true }
 # Not tpchgen-arrow: it has no arrow-58 release.
 tpchgen             = { version = "2.0.2" }
+tempfile            = { version = "3" }
 iceberg             = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
@@ -103,6 +104,11 @@ rsa                 = { version = "0.9", features = ["sha2", "pkcs5"] }
 futures             = { workspace = true }
 anyhow              = { workspace = true }
 aws-sdk-glue        = { workspace = true }
+
+# Host integration tests share the `it` binary (tests/it/main.rs). This one keeps its own process
+# because every scan resets the process-global footer record it asserts on (#523).
+[[test]]
+name = "scan_footer_refetch_observable"
 
 [[test]]
 name = "e2e_local"

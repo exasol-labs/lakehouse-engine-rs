@@ -139,8 +139,8 @@ async fn register_files_falls_back_without_logical_schema() {
     use parquet::arrow::ArrowWriter;
     use std::sync::Arc;
 
-    let dir = std::env::temp_dir().join(format!("lh_fallback_inference_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let path = dir.join("fallback.parquet");
 
     let schema = Arc::new(Schema::new(vec![
@@ -203,8 +203,8 @@ async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter(
     use parquet::arrow::ArrowWriter;
 
     // No field-id metadata, as in a Delta `none` column-mapping table's files.
-    let dir = std::env::temp_dir().join(format!("lh_identity_binding_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let path = dir.join("identity.parquet");
 
     let physical_schema = Arc::new(Schema::new(vec![
@@ -300,8 +300,6 @@ async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter(
         "identity-bound columns must read their real values, and the declared \
          column absent from the file must NULL-fill"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Scenario: Scan emits a bounded local top-N when the spec carries an order-by
@@ -314,8 +312,8 @@ async fn ordered_scan_sql_preserves_desc_and_null_placement() {
     use datafusion::execution::context::SessionContext;
     use parquet::arrow::ArrowWriter;
 
-    let dir = std::env::temp_dir().join(format!("lh_topn_nulls_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let path = dir.join("topn.parquet");
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -418,8 +416,6 @@ async fn ordered_scan_sql_preserves_desc_and_null_placement() {
         vec![Some(30.0), Some(20.0), Some(10.0)],
         "DESC NULLS LAST must rank non-NULLs descending ahead of NULLs: {desc_nulls_last:?}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -537,9 +533,8 @@ async fn a_list_column_tagged_utf8_is_json_rendered_by_the_field_id_expression_a
         |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
 
     // An obfuscated Delta `id`-mapping physical name with a populated, a NULL, and an empty list.
-    let dir = std::env::temp_dir().join("lh_list_utf8_cast");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let path = dir.join("list.parquet");
 
     let lists = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
@@ -644,8 +639,6 @@ async fn a_list_column_tagged_utf8_is_json_rendered_by_the_field_id_expression_a
         "a populated array must render as strict JSON, an empty array as `[]`, and a \
          NULL array must stay NULL"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -684,9 +677,8 @@ async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
     attrs_builder.append(false).expect("null map row");
     let attrs = attrs_builder.finish();
 
-    let dir = std::env::temp_dir().join("lh_struct_map_render");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let path = dir.join("nested.parquet");
     let physical_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false).with_metadata(field_id_meta(1)),
@@ -815,8 +807,6 @@ async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
         "a struct must render keyed by the TABLE's member names, a map as one JSON \
          object, and a NULL nested value must stay NULL"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -937,9 +927,8 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
     tags_builder.append(true);
     let tags = tags_builder.finish();
 
-    let dir = std::env::temp_dir().join("lh_shared_encoder_paths");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let path = dir.join("shared.parquet");
     let physical_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false).with_metadata(field_id_meta(1)),
@@ -1065,8 +1054,6 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
         "both paths call the same render_nested_column_as_json encoder, so their \
          rendered JSON for identical underlying data must be byte-identical"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

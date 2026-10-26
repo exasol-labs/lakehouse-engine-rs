@@ -296,13 +296,13 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
     let _serialized = serialize_footer_record();
     reset_access_plan_cached_footers();
 
-    let dir = std::env::temp_dir().join(format!("lh_footer_refetch_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let data_url = write_local_parquet(&dir, "data.parquet", 40);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_url = write_local_parquet(dir, "data.parquet", 40);
     let data_size = std::fs::metadata(data_url.strip_prefix("file://").unwrap())
         .expect("stat data parquet")
         .len();
-    let delete_url = write_delete_parquet(&dir, "deletes.parquet", &[(&data_url, 3)]);
+    let delete_url = write_delete_parquet(dir, "deletes.parquet", &[(&data_url, 3)]);
     let delete_size = std::fs::metadata(delete_url.strip_prefix("file://").unwrap())
         .expect("stat delete parquet")
         .len();
@@ -436,7 +436,7 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
     // Run 3: `LIMIT 1` leaves later footers unopened (`hits == 0`) though none was re-fetched.
     reset_access_plan_cached_footers();
     let limit_urls: Vec<String> = (0..4)
-        .map(|i| write_local_parquet(&dir, &format!("limit_data_{i}.parquet"), 40))
+        .map(|i| write_local_parquet(dir, &format!("limit_data_{i}.parquet"), 40))
         .collect();
     let limit_sizes: Vec<u64> = limit_urls
         .iter()
@@ -449,7 +449,7 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
     let limit_delete_entries: Vec<(&str, i64)> =
         limit_urls.iter().map(|u| (u.as_str(), 3i64)).collect();
     let limit_delete_url =
-        write_delete_parquet(&dir, "limit_deletes.parquet", &limit_delete_entries);
+        write_delete_parquet(dir, "limit_deletes.parquet", &limit_delete_entries);
     let limit_delete_size = std::fs::metadata(limit_delete_url.strip_prefix("file://").unwrap())
         .expect("stat delete parquet")
         .len();
@@ -508,8 +508,6 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
         "a footer the opener never opened was fetched once, not twice: a scan shape that can stop \
          early must report ZERO re-fetches, not one per unopened file"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -517,12 +515,12 @@ fn scan_dispatch_resets_the_footer_record_between_invocations() {
     let _serialized = serialize_footer_record();
     reset_access_plan_cached_footers();
 
-    let dir = std::env::temp_dir().join(format!("lh_footer_reset_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let data_a = write_local_parquet(&dir, "reset_data_a.parquet", 40);
-    let data_b = write_local_parquet(&dir, "reset_data_b.parquet", 40);
-    let delete_a = write_delete_parquet(&dir, "reset_deletes_a.parquet", &[(&data_a, 3)]);
-    let delete_b = write_delete_parquet(&dir, "reset_deletes_b.parquet", &[(&data_b, 7)]);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let data_a = write_local_parquet(dir, "reset_data_a.parquet", 40);
+    let data_b = write_local_parquet(dir, "reset_data_b.parquet", 40);
+    let delete_a = write_delete_parquet(dir, "reset_deletes_a.parquet", &[(&data_a, 3)]);
+    let delete_b = write_delete_parquet(dir, "reset_deletes_b.parquet", &[(&data_b, 7)]);
     let file_size = |url: &str| {
         std::fs::metadata(url.strip_prefix("file://").unwrap())
             .expect("stat parquet")
@@ -628,5 +626,4 @@ fn scan_dispatch_resets_the_footer_record_between_invocations() {
     );
 
     drop(sessions);
-    let _ = std::fs::remove_dir_all(&dir);
 }

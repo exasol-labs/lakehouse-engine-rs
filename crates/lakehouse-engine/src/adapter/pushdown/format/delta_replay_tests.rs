@@ -891,9 +891,9 @@ fn a_void_column_reads_as_all_null_under_name_column_mapping() {
     use crate::scan::{build_raw_scan_physical_plan, register_files, session_config_for_spec};
     use datafusion::execution::context::SessionContext;
 
-    let dir = std::env::temp_dir().join("lh_delta_void_column");
-    let _ = std::fs::remove_dir_all(&dir);
-    let table_root = write_void_column_table(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let table_root = write_void_column_table(dir);
 
     let snapshot = DeltaSnapshot::open(local_store(), &table_root)
         .expect("the void table opens past the gate");
@@ -973,8 +973,6 @@ fn a_void_column_reads_as_all_null_under_name_column_mapping() {
         vec![1, 2, 3],
         "the mappable sibling column still reads its real values"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Scenario: Equality on a partition column prunes every file in a non-matching partition
