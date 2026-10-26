@@ -3,9 +3,10 @@
 //! Helpers panic, never skip, and never put a secret or token in a panic message.
 #![cfg(any(feature = "lakekeeper-e2e", feature = "azure-e2e"))]
 
+use std::collections::HashMap;
 use std::time::Duration;
 
-use lakehouse_catalog::ConnectionCreds;
+use iceberg_catalog_rest::LoadTableResult;
 
 use super::stack::{self, CatalogConnectionPassword, wait_for_url};
 
@@ -384,32 +385,6 @@ pub fn lakekeeper_connection_password(
     }
 }
 
-/// `oauth2_server_uri` is the host-mapped Keycloak endpoint, since the UDF-internal
-/// Docker-network URL the CONNECTION carries is unreachable from the test process.
-pub fn lakekeeper_host_connection_creds(warehouse_name: &str, vended: bool) -> ConnectionCreds {
-    let password = lakekeeper_connection_password(warehouse_name, vended);
-    ConnectionCreds {
-        warehouse: password.warehouse,
-        endpoint: password.endpoint,
-        region: password.region,
-        access_key: password.access_key,
-        secret_key: password.secret_key,
-        session_token: password.session_token,
-        path_style: Some(password.path_style),
-        use_sigv4: password.use_sigv4,
-        use_vended_credentials: password.use_vended_credentials,
-        token: password.token,
-        client_id: password.client_id,
-        client_secret: password.client_secret,
-        oauth2_server_uri: Some(keycloak_token_endpoint_host()),
-        scope: password.scope,
-        account_name: password.account_name,
-        account_key: password.account_key,
-        sas_token: None,
-        ..Default::default()
-    }
-}
-
 /// Never the container-lifecycle service principal, which would let the suite pass
 /// without exercising the account-key path. Static S3 fields stay empty: the adapter
 /// rejects a CONNECTION naming both Azure and S3 storage fields as ambiguous.
@@ -464,6 +439,63 @@ pub fn lakekeeper_warehouse_storage_profile(warehouse_name: &str) -> serde_json:
                  '{warehouse_name}' with a storage profile"
             )
         })
+}
+
+/// The access-delegated `loadTable` response, fetched as any Iceberg REST client would, so a
+/// fixture check reads Lakekeeper's own vended credentials and not the adapter's reading of them.
+pub fn load_table_with_vended_credentials(
+    warehouse_name: &str,
+    namespace: &str,
+    table: &str,
+) -> LoadTableResult {
+    let token = keycloak_client_credentials_token();
+    let base = catalog_uri_host();
+    let config: serde_json::Value = http_client()
+        .get(format!("{base}/v1/config"))
+        .query(&[("warehouse", warehouse_name)])
+        .bearer_auth(&token)
+        .send()
+        .and_then(|resp| resp.error_for_status())
+        .and_then(|resp| resp.json())
+        .unwrap_or_else(|e| panic!("Lakekeeper config for warehouse {warehouse_name}: {e}"));
+    // The Iceberg REST spec lets `overrides` win over `defaults`; Lakekeeper serves `defaults`.
+    let prefix = ["overrides", "defaults"]
+        .iter()
+        .find_map(|map| config[map]["prefix"].as_str())
+        .unwrap_or_else(|| panic!("Lakekeeper config for {warehouse_name} names no prefix"));
+
+    let url = format!("{base}/v1/{prefix}/namespaces/{namespace}/tables/{table}");
+    let resp = http_client()
+        .get(&url)
+        .header("X-Iceberg-Access-Delegation", "vended-credentials")
+        .bearer_auth(&token)
+        .send()
+        .unwrap_or_else(|e| panic!("Lakekeeper loadTable {url} failed to send: {e}"));
+    let status = resp.status();
+    assert!(
+        status.is_success(),
+        "Lakekeeper loadTable {url} returned {status}"
+    );
+    resp.json()
+        .unwrap_or_else(|e| panic!("Lakekeeper loadTable {url} is not a LoadTableResult: {e}"))
+}
+
+/// The longest `storage-credentials` prefix matching `location` wins, else the top-level
+/// `config`, as the Iceberg REST spec describes.
+pub fn vended_storage_config<'a>(
+    result: &'a LoadTableResult,
+    location: &str,
+) -> &'a HashMap<String, String> {
+    result
+        .storage_credentials
+        .as_ref()
+        .and_then(|credentials| {
+            credentials
+                .iter()
+                .filter(|entry| !entry.prefix.is_empty() && location.starts_with(&entry.prefix))
+                .max_by_key(|entry| entry.prefix.len())
+        })
+        .map_or(&result.config, |entry| &entry.config)
 }
 
 #[cfg(test)]

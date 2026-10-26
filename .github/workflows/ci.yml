@@ -145,10 +145,10 @@ jobs:
           save-if: "false"
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: make fmt-check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: make lint
 
   unit-tests:
     name: Unit Tests

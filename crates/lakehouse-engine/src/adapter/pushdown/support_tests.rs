@@ -177,8 +177,9 @@ fn delete_spec_template() -> ScanSpec {
     }
 }
 
+/// Scenario: Delete-file references are carried in the per-shard files argument
 #[test]
-fn adapter_preserves_positional_deletes_into_scan_spec() {
+fn adapter_preserves_delete_files_and_deletion_vectors_in_the_shard_files_argument() {
     let file_gran = vec![FileEntry::with_deletes(
         "data/part-0.parquet",
         1000,
@@ -203,6 +204,20 @@ fn adapter_preserves_positional_deletes_into_scan_spec() {
         "both data files must retain the shared partition delete"
     );
     assert_eq!(back2[1].deletes[0].object_store_path(), Some(shared));
+
+    let vector = DeleteMechanism::IcebergPuffinDeletionVector {
+        path: "data/deletes/dv.puffin".into(),
+        size: 300,
+        content_offset: 4,
+        content_size_in_bytes: 40,
+        record_count: 2,
+    };
+    let with_vector = vec![FileEntry::with_deletes("data/p2.parquet", 1, vec![vector])];
+    assert_eq!(
+        ScanSpec::files_from_json(&shard_files_json(&with_vector)).unwrap(),
+        with_vector,
+        "a deletion vector keeps its blob offset, length, and cardinality"
+    );
 }
 
 #[test]

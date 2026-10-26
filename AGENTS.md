@@ -20,7 +20,7 @@ Project specifics:
 
 ## Code quality
 
-- `cargo fmt --all` and `cargo clippy --all-targets` must pass with zero warnings before committing.
+- `make fmt-check lint` must pass before committing. CI's lint job runs the same targets.
 
 ## Workflow
 

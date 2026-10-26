@@ -39,13 +39,15 @@ use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_storage_opendal::OpenDalStorageFactory;
-use lakehouse_catalog::{HIVE_DEFAULT_PARTITION, redact_error_text};
 use object_store::ObjectStore;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjectStorePath;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Hive's literal for a NULL partition value, in a partition's catalog values and its path.
+const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 
 pub const ACCESS_KEY_ID_VAR: &str = "GLUE_ACCESS_KEY_ID";
 pub const SECRET_ACCESS_KEY_VAR: &str = "GLUE_SECRET_ACCESS_KEY";
@@ -121,14 +123,16 @@ impl GlueEnv {
     }
 
     pub fn redact(&self, text: &str) -> String {
-        redact_error_text(
-            text,
-            &[
-                &self.secret_access_key,
-                &self.assume_role_base_secret_access_key,
-                &self.assume_role_external_id,
-            ],
-        )
+        [
+            &self.secret_access_key,
+            &self.assume_role_base_secret_access_key,
+            &self.assume_role_external_id,
+        ]
+        .into_iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(text.to_string(), |text, secret| {
+            text.replace(secret.as_str(), "[REDACTED]")
+        })
     }
 
     /// Panics with the redacted error chain, which may echo a request carrying the secret.

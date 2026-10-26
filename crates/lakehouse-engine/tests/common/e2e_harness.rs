@@ -2,19 +2,17 @@
 //! when the local stack is unavailable.
 
 use super::exasol_ws::ExaConn;
-use super::seed::{DECIMAL_18_0_VALUES_TEXT, E2E_DIM_TABLE, E2E_FACT_TABLE};
+use super::seed::{DECIMAL_18_0_VALUES_TEXT, E2E_DIM_TABLE, E2E_FACT_TABLE, build_seed_catalog};
 use super::stack::{
     CatalogConnectionPassword, bucketfs_port, bucketfs_write_password, build_create_connection_sql,
     exasol_host, exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal,
     lakehouse_engine_so_path, local_stack_connection_password, seaweedfs_url, upload_to_bucketfs,
 };
 
-use lakehouse_catalog::CatalogSession;
-use lakehouse_engine::adapter::column_notes::{DeclaredSchema, TableNotes};
-use lakehouse_engine::adapter::connection::ConnectionCreds;
-use lakehouse_engine::adapter::pushdown::{ConnectionStorage, ScanSource, format_reader};
-use lakehouse_engine::scan::spec::{CatalogProps, FileEntry, StorageBackend, StorageProps};
-
+use futures::TryStreamExt;
+use iceberg::scan::FileScanTaskDeleteFile;
+use iceberg::spec::{DataContentType, DataFileFormat};
+use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -422,40 +420,6 @@ pub fn parse_int(v: &serde_json::Value) -> i64 {
         .unwrap_or_else(|| panic!("expected integer value, got: {v:?}"))
 }
 
-pub fn local_stack_creds() -> ConnectionCreds {
-    ConnectionCreds {
-        warehouse: "s3://warehouse/".to_string(),
-        endpoint: seaweedfs_url(),
-        region: "us-east-1".to_string(),
-        access_key: "lhadmin".to_string(),
-        secret_key: "lhadminsecret123".to_string(),
-        session_token: None,
-        path_style: Some(true),
-        use_sigv4: false,
-        use_vended_credentials: false,
-        token: None,
-        client_id: None,
-        client_secret: None,
-        oauth2_server_uri: None,
-        scope: None,
-        account_name: None,
-        account_key: None,
-        sas_token: None,
-        ..Default::default()
-    }
-}
-
-pub fn local_stack_storage() -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: seaweedfs_url(),
-        region: "us-east-1".to_string(),
-        access_key: "lhadmin".to_string(),
-        secret_key: "lhadminsecret123".to_string(),
-        allow_http: true,
-        ..Default::default()
-    })
-}
-
 pub fn split_s3_bucket_and_key(uri: &str) -> (&str, &str) {
     let without_scheme = uri
         .strip_prefix("s3://")
@@ -477,60 +441,106 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
 }
 
 pub fn local_stack_s3_store(bucket: &str) -> AmazonS3 {
-    let StorageBackend::S3(storage) = local_stack_storage() else {
-        panic!("local_stack_storage() must be S3 to build a SeaweedFS object store")
-    };
+    let creds = local_stack_connection_password();
     AmazonS3Builder::new()
         .with_bucket_name(bucket)
-        .with_region(&storage.region)
-        .with_access_key_id(&storage.access_key)
-        .with_secret_access_key(&storage.secret_key)
-        .with_endpoint(&storage.endpoint)
-        .with_allow_http(storage.allow_http)
-        .with_virtual_hosted_style_request(!storage.path_style)
+        .with_region(&creds.region)
+        .with_access_key_id(&creds.access_key)
+        .with_secret_access_key(&creds.secret_key)
+        // The CONNECTION names the Docker-network endpoint; the test process needs the host one.
+        .with_endpoint(seaweedfs_url())
+        .with_allow_http(true)
+        .with_virtual_hosted_style_request(!creds.path_style)
         .build()
         .unwrap_or_else(|e| panic!("configure SeaweedFS object store for bucket '{bucket}': {e}"))
 }
 
-pub fn local_stack_catalog(table: &str) -> CatalogProps {
-    CatalogProps {
-        warehouse: "s3://warehouse/".to_string(),
-        table: table.to_string(),
+/// A committed data file and the delete files iceberg-rust's scan planner applies to it.
+#[derive(Debug, Clone)]
+pub struct FixtureFile {
+    /// Absolute, as the table metadata records it.
+    pub path: String,
+    pub deletes: Vec<FixtureDelete>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixtureDelete {
+    Positional {
+        path: String,
+    },
+    DeletionVector {
+        path: String,
+        content_offset: u64,
+        record_count: u64,
+    },
+    Other {
+        path: String,
+        content: DataContentType,
+    },
+}
+
+impl FixtureDelete {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Positional { path }
+            | Self::DeletionVector { path, .. }
+            | Self::Other { path, .. } => path,
+        }
+    }
+
+    fn from_task(delete: &FileScanTaskDeleteFile) -> Self {
+        let path = delete.file_path().to_string();
+        match (delete.file_type(), delete.file_format()) {
+            (DataContentType::PositionDeletes, DataFileFormat::Puffin) => Self::DeletionVector {
+                path,
+                content_offset: delete
+                    .content_offset()
+                    .expect("a deletion vector records its blob offset"),
+                record_count: delete
+                    .record_count()
+                    .expect("a deletion vector records its cardinality"),
+            },
+            (DataContentType::PositionDeletes, _) => Self::Positional { path },
+            (content, _) => Self::Other { path, content },
+        }
     }
 }
 
-/// Resolves through the same format-reader seam the adapter uses, bypassing Exasol. Each
-/// `FileEntry` carries an absolute data-file URI; no column is declared, since no filter prunes.
-pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FileEntry> {
-    let catalog_uri = iceberg_catalog_url();
-    let catalog_props = local_stack_catalog(&format!("{namespace}.{table}"));
-    let storage = local_stack_storage();
-    let creds = local_stack_creds();
-    let session = CatalogSession::resolve(&catalog_uri, &creds.warehouse, &creds)
+/// Plans through iceberg-rust, not the adapter, so a fixture guard holds whatever the engine does.
+pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FixtureFile> {
+    let catalog = build_seed_catalog(&iceberg_catalog_url(), "s3://warehouse/", "fixture-files")
         .await
-        .unwrap_or_else(|e| panic!("CatalogSession::resolve({table}) must succeed: {e}"));
-
-    let connection = ConnectionStorage {
-        storage: &storage,
-        creds: &creds,
-        allow_http: true,
-    };
-    let declared = TableNotes::default()
-        .declared_schema()
-        .expect("an empty declaration parses");
-    let reader = format_reader(
-        ScanSource::Iceberg {
-            session: &session,
-            catalog_props: &catalog_props,
-        },
-        &connection,
-    )
-    .unwrap_or_else(|e| panic!("format_reader({table}) must succeed: {e}"));
-    let planned = reader
-        .resolve_scan(&declared, None)
+        .unwrap_or_else(|e| panic!("connect to the Iceberg REST catalog for {table}: {e:#}"));
+    let ident = TableIdent::new(
+        NamespaceIdent::new(namespace.to_string()),
+        table.to_string(),
+    );
+    let loaded = catalog
+        .load_table(&ident)
         .await
-        .unwrap_or_else(|e| panic!("resolve_scan({table}) must succeed: {e}"));
-    planned.files
+        .unwrap_or_else(|e| panic!("load {namespace}.{table}: {e}"));
+    let tasks: Vec<_> = loaded
+        .scan()
+        .select_all()
+        .build()
+        .unwrap_or_else(|e| panic!("build a scan of {table}: {e}"))
+        .plan_files()
+        .await
+        .unwrap_or_else(|e| panic!("plan the files of {table}: {e}"))
+        .try_collect()
+        .await
+        .unwrap_or_else(|e| panic!("collect the file tasks of {table}: {e}"));
+    tasks
+        .iter()
+        .map(|task| FixtureFile {
+            path: task.data_file_path().to_string(),
+            deletes: task
+                .deletes()
+                .iter()
+                .map(FixtureDelete::from_task)
+                .collect(),
+        })
+        .collect()
 }
 
 /// Straddles both fact-side data files, so per-shard join results must merge across a
@@ -629,20 +639,6 @@ pub fn column_adapter_notes(
             (name, notes)
         })
         .collect()
-}
-
-/// The schema a pushdown over `table` plans from, for a test that drives a reader directly.
-pub fn declared_schema_of(conn: &mut ExaConn, vs_name: &str, table: &str) -> DeclaredSchema {
-    let notes = persisted_column_notes(conn, vs_name, table);
-    TableNotes {
-        table,
-        columns: notes
-            .iter()
-            .map(|(column, note)| (column.as_str(), Some(note.as_str())))
-            .collect(),
-    }
-    .declared_schema()
-    .unwrap_or_else(|e| panic!("the notes of {vs_name}.{table} parse: {e}"))
 }
 
 /// Each column with its recorded partition position, `None` for a data column.

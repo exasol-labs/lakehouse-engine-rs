@@ -8,10 +8,17 @@
 //! identity granted only `sts:AssumeRole`), `AWS_ASSUME_ROLE_ARN`, and `AWS_EXTERNAL_ID`.
 
 mod common;
+use aws_credential_types::Credentials;
+use aws_sigv4::http_request::{
+    PayloadChecksumKind, SignableBody, SignableRequest, SigningParams, SigningSettings, sign,
+};
+use aws_sigv4::sign::v4;
+use aws_smithy_runtime_api::client::identity::Identity;
 use common::exasol_ws::ExaConn;
 use common::stack::{CatalogConnectionPassword, build_create_connection_sql};
-use lakehouse_catalog::{CatalogProps, CatalogSession, ConnectionCreds, load_table_any_auth};
+use iceberg_catalog_rest::LoadTableResult;
 use std::collections::HashMap;
+use std::time::SystemTime;
 
 const ENV_GLUE_CATALOG_URI: &str = "GLUE_CATALOG_URI";
 const ENV_GLUE_WAREHOUSE: &str = "GLUE_WAREHOUSE";
@@ -135,32 +142,6 @@ impl CloudEnv {
         CatalogConnectionPassword {
             region: String::new(),
             ..self.catalog_connection_password()
-        }
-    }
-
-    /// Derived from `catalog_connection_password_vended` so the two cannot describe
-    /// different CONNECTIONs.
-    fn vended_connection_creds(&self) -> ConnectionCreds {
-        let password = self.catalog_connection_password_vended();
-        ConnectionCreds {
-            warehouse: password.warehouse,
-            endpoint: password.endpoint,
-            region: password.region,
-            access_key: password.access_key,
-            secret_key: password.secret_key,
-            session_token: password.session_token,
-            path_style: Some(password.path_style),
-            use_sigv4: password.use_sigv4,
-            use_vended_credentials: password.use_vended_credentials,
-            token: password.token,
-            client_id: password.client_id,
-            client_secret: password.client_secret,
-            oauth2_server_uri: password.oauth2_server_uri,
-            scope: password.scope,
-            account_name: password.account_name,
-            account_key: password.account_key,
-            sas_token: None,
-            ..Default::default()
         }
     }
 }
@@ -697,11 +678,94 @@ fn cloud_scan_reads_with_vended_credentials() {
     );
 }
 
+/// The access-delegated `loadTable` response from Glue's Iceberg REST endpoint, signed here
+/// rather than by the adapter's catalog client, so the check reads Glue's own payload.
+fn glue_load_table_with_vended_credentials(env: &CloudEnv) -> LoadTableResult {
+    let (namespace, table) = env.glue_table.rsplit_once('.').unwrap_or_else(|| {
+        panic!(
+            "{ENV_GLUE_TABLE} must be <namespace>.<table>, got {}",
+            env.glue_table
+        )
+    });
+    // Glue's REST prefix is `catalogs/{account id}`; the warehouse is the bare account id.
+    let url = format!(
+        "{}/v1/catalogs/{}/namespaces/{namespace}/tables/{table}",
+        env.glue_catalog_uri.trim_end_matches('/'),
+        env.glue_warehouse
+    );
+    let headers = [
+        ("accept", "application/json"),
+        ("x-iceberg-access-delegation", "vended-credentials"),
+    ];
+    let mut request = reqwest::blocking::Client::new().get(&url);
+    for (name, value) in sigv4_headers(env, &url, &headers)
+        .into_iter()
+        .chain(headers.map(|(n, v)| (n.to_string(), v.to_string())))
+    {
+        request = request.header(name, value);
+    }
+    let resp = request
+        .send()
+        .unwrap_or_else(|e| panic!("Glue loadTable {url} failed to send: {e}"));
+    let status = resp.status();
+    assert!(
+        status.is_success(),
+        "the access-delegated Glue loadTable {url} returned {status}"
+    );
+    resp.json()
+        .unwrap_or_else(|e| panic!("Glue loadTable {url} is not a LoadTableResult: {e}"))
+}
+
+/// The SigV4 headers for an empty-body GET to Glue, signed with the environment's keys.
+fn sigv4_headers(env: &CloudEnv, url: &str, headers: &[(&str, &str)]) -> Vec<(String, String)> {
+    let identity: Identity = Credentials::new(
+        &env.aws_access_key_id,
+        &env.aws_secret_access_key,
+        env.aws_session_token.clone(),
+        None,
+        "cloud-e2e",
+    )
+    .into();
+    let mut settings = SigningSettings::default();
+    // Without `x-amz-content-sha256`, Glue computes a different payload hash and returns 403.
+    settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+    let params: SigningParams<'_> = v4::SigningParams::builder()
+        .identity(&identity)
+        .region(&env.aws_region)
+        .name("glue")
+        .time(SystemTime::now())
+        .settings(settings)
+        .build()
+        .expect("every SigV4 signing parameter is set")
+        .into();
+
+    let parsed = reqwest::Url::parse(url).unwrap_or_else(|e| panic!("parse {url}: {e}"));
+    // reqwest adds `host` only on the wire, but SigV4 signs it.
+    let host = match parsed.port() {
+        Some(port) => format!("{}:{port}", parsed.host_str().unwrap_or_default()),
+        None => parsed.host_str().unwrap_or_default().to_string(),
+    };
+    let signable = SignableRequest::new(
+        "GET",
+        url,
+        std::iter::once(("host", host.as_str())).chain(headers.iter().copied()),
+        SignableBody::Bytes(&[]),
+    )
+    .expect("a GET with ASCII headers is signable");
+    let (instructions, _signature) = sign(signable, &params)
+        .expect("SigV4 signing of the Glue loadTable GET")
+        .into_parts();
+    instructions
+        .headers()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
 /// Mirrors the resolver's longest-prefix selection (scheme lowercased, RFC 3986
 /// §3.1) instead of calling it, because a resolved backend cannot say which config
 /// key the catalog left out.
 fn vended_source_for<'a>(
-    result: &'a iceberg_catalog_rest::LoadTableResult,
+    result: &'a LoadTableResult,
     location: &str,
 ) -> &'a HashMap<String, String> {
     let location = lowercase_scheme(location);
@@ -751,31 +815,7 @@ fn cloud_glue_vends_the_s3_key_pair_for_the_table_location() {
         }
     };
 
-    let creds = env.vended_connection_creds();
-    assert!(
-        creds.use_vended_credentials,
-        "the vended CONNECTION must request access delegation: without that flag the loadTable \
-         GET carries no X-Iceberg-Access-Delegation header and its response evidences nothing"
-    );
-
-    let catalog = CatalogProps {
-        warehouse: env.glue_warehouse.clone(),
-        table: env.glue_table.clone(),
-    };
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime for the Glue vended-payload test");
-
-    let result = rt.block_on(async {
-        let session = CatalogSession::resolve(&env.glue_catalog_uri, &catalog.warehouse, &creds)
-            .await
-            .unwrap_or_else(|e| panic!("CatalogSession::resolve must succeed against Glue: {e}"));
-        load_table_any_auth(&session, &catalog, &creds)
-            .await
-            .unwrap_or_else(|e| panic!("the access-delegated loadTable GET must succeed: {e}"))
-    });
+    let result = glue_load_table_with_vended_credentials(&env);
 
     let anchor = result.metadata.location();
     assert!(

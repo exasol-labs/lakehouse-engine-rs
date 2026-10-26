@@ -8,10 +8,10 @@ use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VARCHAR_JSON, VsProps,
     assert_decimal_orders_numerically, assert_query_fails, assert_type_matrix,
     column_adapter_notes, create_schema_and_scripts, create_virtual_schema_with_password,
-    declared_schema_of, declared_types, enumerated_table_names, exa_conn, explain_virtual_sql,
-    has_broadcast_join_block, has_two_scan_wrapper, identifier_note, install_slc,
-    local_stack_creds, note_of, pairs, parse_int, parse_numeric, partition_positions, query_error,
-    reads, refuses, runtime, upload_so, value_to_string,
+    declared_types, enumerated_table_names, exa_conn, explain_virtual_sql,
+    has_broadcast_join_block, has_two_scan_wrapper, identifier_note, install_slc, note_of, pairs,
+    parse_int, parse_numeric, partition_positions, query_error, reads, refuses, text_column,
+    upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
@@ -44,15 +44,6 @@ use common::stack::{
 };
 use common::timestamp_precision::expected_timestamp_precision;
 
-use lakehouse_catalog::{
-    CatalogClient, CatalogTableIdent, ConnectionCreds, StorageBackend, UnityCatalogSession,
-};
-use lakehouse_engine::adapter::connection::storage_block;
-use lakehouse_engine::adapter::pushdown::{
-    ConnectionStorage, ResolvedScan, ScanSource, format_reader,
-};
-use lakehouse_engine::scan::spec::{DeleteMechanism, FileEntry};
-
 use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -60,7 +51,6 @@ use bytes::Bytes;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::statistics::Statistics;
 use serde_json::{Value as Json, json};
-use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -137,6 +127,7 @@ fn setup() {
 
         create_unity_virtual_schema(&mut conn);
         create_unity_role_virtual_schema(&mut conn);
+        create_unity_vended_virtual_schema(&mut conn);
         create_catalog_copy_virtual_schema(&mut conn);
         create_virtual_schema_with_password(
             &mut conn,
@@ -216,6 +207,26 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   NAMESPACE  = '{UNITY_NAMESPACE}'
   ALLOW_HTTP         = 'true'"#
     ));
+}
+
+/// A third Virtual Schema over the SAME seeded `unity.delta_e2e` namespace, reading storage
+/// with the session credentials Unity Catalog vends per table.
+const VS_VENDED_NAME: &str = "UNITY_DELTA_VENDED_VS";
+const CONN_VENDED_NAME: &str = "UNITY_VENDED_CATALOG_CREDS";
+
+/// UC OSS vends no S3 endpoint, so the CONNECTION's endpoint and region still address SeaweedFS.
+fn create_unity_vended_virtual_schema(conn: &mut ExaConn) {
+    create_virtual_schema_with_password(
+        conn,
+        &VsProps::new(VS_VENDED_NAME, UNITY_NAMESPACE)
+            .with_catalog_kind("UNITY_CATALOG")
+            .with_catalog_conn_name(CONN_VENDED_NAME),
+        UNITY_CATALOG_URI_INTERNAL,
+        &CatalogConnectionPassword {
+            use_vended_credentials: true,
+            ..local_stack_connection_password()
+        },
+    );
 }
 
 /// `year`/`region` are partition directories, not in-file columns.
@@ -872,221 +883,90 @@ fn unity_catalog_url() -> String {
     format!("http://localhost:{}", unity_port())
 }
 
-/// Under vending, `endpoint`/`region` still reach the vended backend because the OSS server
-/// vends no S3 endpoint of its own.
-fn delta_creds(use_vended_credentials: bool) -> ConnectionCreds {
-    ConnectionCreds {
-        warehouse: String::new(),
-        endpoint: stack::seaweedfs_url(),
-        region: "us-east-1".to_string(),
-        access_key: "lhadmin".to_string(),
-        secret_key: "lhadminsecret123".to_string(),
-        session_token: None,
-        path_style: Some(true),
-        use_sigv4: false,
-        use_vended_credentials,
-        token: None,
-        client_id: None,
-        client_secret: None,
-        oauth2_server_uri: None,
-        scope: None,
-        account_name: None,
-        account_key: None,
-        sas_token: None,
-        ..Default::default()
-    }
-}
-
-fn delta_static_storage() -> StorageBackend {
-    storage_block(&delta_creds(false), true)
-}
-
-fn delta_e2e_table(name: &str) -> CatalogTableIdent {
-    CatalogTableIdent {
-        namespace: vec!["unity".to_string(), "delta_e2e".to_string()],
-        name: name.to_string(),
-    }
-}
-
-async fn resolve_unity_scan(
-    table_name: &str,
-    use_vended_credentials: bool,
-    filter: Option<&serde_json::Value>,
-) -> ResolvedScan {
-    let creds = delta_creds(use_vended_credentials);
-    let session = UnityCatalogSession::new(&unity_catalog_url(), creds.clone());
-    let table = session
-        .load_table(&delta_e2e_table(table_name))
-        .await
-        .unwrap_or_else(|e| panic!("load_table({table_name}) failed: {e}"));
-    let storage = delta_static_storage();
-    let declared = declared_schema_of(&mut exa_conn(), VS_NAME, &table_name.to_uppercase());
-
-    let reader = format_reader(
-        ScanSource::Unity {
-            session: &session,
-            table: &table,
-        },
-        &ConnectionStorage {
-            storage: &storage,
-            creds: &creds,
-            allow_http: true,
-        },
-    )
-    .unwrap_or_else(|e| panic!("format_reader({table_name}) failed: {e}"));
-
-    ResolvedScan::resolve(reader.as_ref(), declared, filter)
-        .await
-        .unwrap_or_else(|e| panic!("resolve_scan({table_name}) failed: {e}"))
-}
-
-/// Panics on an empty partition map: comparing two runs cannot detect both silently losing
-/// the values, which live only in the transaction log.
-fn path_sorted_letter_values(files: &[FileEntry]) -> Vec<Option<String>> {
-    let mut carried: Vec<(&str, Option<String>)> = files
-        .iter()
-        .map(|entry| {
-            let mut partition_values = entry.partition_values.iter();
-            let (column, value) = partition_values.next().unwrap_or_else(|| {
-                panic!(
-                    "{} must carry its logged partition value, not an empty map",
-                    entry.path
-                )
-            });
-            assert!(
-                partition_values.next().is_none(),
-                "{} must carry exactly one partition entry: {:?}",
-                entry.path,
-                entry.partition_values
-            );
-            assert_eq!(
-                column, "letter",
-                "`letter` is basic_partitioned's only partition column"
-            );
-            (entry.path.as_str(), value.clone())
-        })
-        .collect();
-    carried.sort_by_key(|(left, _)| *left);
-    carried.into_iter().map(|(_, value)| value).collect()
+/// Each table's rows as sorted text tuples, read through both the vended and the static virtual
+/// schema; each read must reach the scan UDF and both must agree.
+fn vended_and_static_rows_agree(conn: &mut ExaConn, table: &str) -> Vec<Vec<String>> {
+    let mut rows_of = |vs: &str| {
+        let sql = format!("SELECT * FROM {vs}.{table}");
+        let pushed = explain_virtual_sql(conn, &sql);
+        assert!(
+            pushed.contains(SCAN_SCRIPT_NAME),
+            "{vs}.{table} must drive the scan UDF: {pushed}"
+        );
+        let cols = conn.query_columns(&sql);
+        let mut rows: Vec<Vec<String>> = (0..cols[0].len())
+            .map(|row| cols.iter().map(|col| value_to_string(&col[row])).collect())
+            .collect();
+        rows.sort();
+        rows
+    };
+    let vended = rows_of(VS_VENDED_NAME);
+    let static_rows = rows_of(VS_NAME);
+    assert!(!vended.is_empty(), "{table} must return rows");
+    assert_eq!(
+        vended, static_rows,
+        "{table}: the vended-credential and static-credential schemas must return the same rows"
+    );
+    vended
 }
 
 /// Scenario: Vended and static credentials resolve the same scan
 #[test]
 fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
     setup();
+    let mut conn = exa_conn();
 
-    let rt = runtime();
-    let vended = rt.block_on(resolve_unity_scan("basic_partitioned", true, None));
-    let static_creds = rt.block_on(resolve_unity_scan("basic_partitioned", false, None));
-
-    assert!(
-        !vended.files.is_empty(),
-        "basic_partitioned must resolve at least one active data file"
+    vended_and_static_rows_agree(&mut conn, "BASIC_PARTITIONED");
+    let mut letters = text_column(
+        &conn.query_columns(&format!(
+            "SELECT LETTER FROM {VS_VENDED_NAME}.BASIC_PARTITIONED"
+        ))[0],
     );
-    assert_eq!(
-        vended.table_root, static_creds.table_root,
-        "vended and static credential runs must resolve the identical table root"
-    );
-    assert_eq!(
-        vended.files, static_creds.files,
-        "vended and static credential runs must agree, entry for entry, on the resolved \
-         file list"
-    );
-
-    let letters = path_sorted_letter_values(&vended.files);
+    letters.sort();
     assert_eq!(
         letters,
-        vec![
-            None,
-            Some("a".to_string()),
-            Some("a".to_string()),
-            Some("b".to_string()),
-            Some("c".to_string()),
-            Some("e".to_string()),
-        ],
-        "the live S3 path must carry every logged partition value, the Hive \
-         default-partition file's explicit NULL among them"
-    );
-    assert!(
-        !letters
-            .iter()
-            .any(|value| value.as_deref() == Some("__HIVE_DEFAULT_PARTITION__")),
-        "the Hive default-partition DIRECTORY literal is never carried as a value: \
-         {letters:?}"
+        [None, Some("a"), Some("a"), Some("b"), Some("c"), Some("e")]
+            .map(|letter| letter.map(str::to_string)),
+        "the vended path must return every logged partition value, the Hive default-partition \
+         file's as NULL and never as the directory literal __HIVE_DEFAULT_PARTITION__"
     );
 
-    let dv_scan = rt.block_on(resolve_unity_scan("table_with_dv", true, None));
+    let dv_rows = vended_and_static_rows_agree(&mut conn, "TABLE_WITH_DV");
     assert_eq!(
-        dv_scan.files.len(),
-        1,
-        "table_with_dv must resolve exactly one active data file: {:?}",
-        dv_scan.files
+        dv_rows.len(),
+        8,
+        "the deletion vector removes 2 of table_with_dv's 10 physical rows on the vended path \
+         too: {dv_rows:?}"
     );
-    let has_deletion_vector = dv_scan.files[0]
-        .deletes
-        .iter()
-        .any(|delete| matches!(delete, DeleteMechanism::DeltaDeletionVector { .. }));
+    let values = conn.query_columns(&format!(
+        "SELECT \"VALUE\" FROM {VS_VENDED_NAME}.TABLE_WITH_DV"
+    ));
+    let values: Vec<i64> = values[0].iter().map(parse_int).collect();
     assert!(
-        has_deletion_vector,
-        "table_with_dv's single active file must carry a deletion-vector reference: {:?}",
-        dv_scan.files[0]
+        !values.contains(&0) && !values.contains(&9),
+        "the deleted values 0 and 9 must be absent: {values:?}"
     );
 }
 
-/// Scenario: Pruning reaches every request shape and changes no result end to end
-#[test]
-fn unity_delta_filters_prune_the_resolved_file_list() {
-    setup();
-
-    let rt = runtime();
-
-    let all_partitioned = rt.block_on(resolve_unity_scan("basic_partitioned", true, None));
-    assert_eq!(
-        all_partitioned.files.len(),
-        6,
-        "basic_partitioned must resolve 6 unfiltered files: {:?}",
-        all_partitioned.files
+/// The distinct data-file paths the pushed SQL of `select_sql` hands the scan UDF, across every
+/// shard fragment and every echoed copy; a Delta deletion vector is a `.bin`, never counted.
+fn pushed_data_files(conn: &mut ExaConn, select_sql: &str) -> Vec<String> {
+    let pushed = explain_virtual_sql(conn, select_sql);
+    assert!(
+        pushed.contains(SCAN_SCRIPT_NAME),
+        "{select_sql} must drive the scan UDF, not an unaccelerated fallback: {pushed}"
     );
-    let letter_filter = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {"type": "column", "name": "LETTER"},
-        "right": {"type": "literal_string", "value": "a"}
-    });
-    let pruned_partitioned = rt.block_on(resolve_unity_scan(
-        "basic_partitioned",
-        true,
-        Some(&letter_filter),
-    ));
-    assert_eq!(
-        pruned_partitioned.files.len(),
-        2,
-        "LETTER = 'a' must prune basic_partitioned to 2 files: {:?}",
-        pruned_partitioned.files
-    );
-
-    let all_stats = rt.block_on(resolve_unity_scan("multi_part_stats", true, None));
-    assert_eq!(
-        all_stats.files.len(),
-        5,
-        "multi_part_stats must resolve 5 unfiltered files: {:?}",
-        all_stats.files
-    );
-    let id_filter = serde_json::json!({
-        "type": "predicate_lessequal",
-        "left": {"type": "column", "name": "ID"},
-        "right": {"type": "literal_exactnumeric", "value": "2"}
-    });
-    let pruned_stats = rt.block_on(resolve_unity_scan(
-        "multi_part_stats",
-        true,
-        Some(&id_filter),
-    ));
-    assert_eq!(
-        pruned_stats.files.len(),
-        2,
-        "ID <= 2 must prune multi_part_stats to 2 files: {:?}",
-        pruned_stats.files
-    );
+    let mut files: Vec<String> = pushed
+        .match_indices(".parquet")
+        .map(|(dot, extension)| {
+            let end = dot + extension.len();
+            let start = pushed[..end].rfind('"').map_or(0, |quote| quote + 1);
+            pushed[start..end].to_string()
+        })
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    files
 }
 
 fn table_ref(table: &str) -> String {
@@ -2136,38 +2016,33 @@ fn unity_delta_pruned_pushdown_sql_carries_fewer_files_and_drives_the_scan_udf()
     setup();
     let mut conn = exa_conn();
 
-    const BASIC_PARTITIONED_ACTIVE_FILES: usize = 6;
-    const LETTER_A_ACTIVE_FILES: usize = 2;
-
-    let select_sql = format!(
-        "SELECT LETTER, \"NUMBER\" FROM {} WHERE LETTER = 'a'",
-        table_ref("BASIC_PARTITIONED")
-    );
-    let pushed = explain_virtual_sql(&mut conn, &select_sql);
-    assert!(
-        pushed.contains(SCAN_SCRIPT_NAME),
-        "the pruned query must drive the scan UDF, not an unaccelerated \
-         fallback: {pushed}"
-    );
-
-    let mut embedded_files: Vec<&str> = pushed
-        .match_indices(".parquet")
-        .map(|(dot, extension)| {
-            let end = dot + extension.len();
-            let start = pushed[..end].rfind('"').map_or(0, |quote| quote + 1);
-            &pushed[start..end]
-        })
-        .collect();
-    embedded_files.sort_unstable();
-    embedded_files.dedup();
-    assert_eq!(
-        embedded_files.len(),
-        LETTER_A_ACTIVE_FILES,
-        "LETTER = 'a' must embed exactly its own {LETTER_A_ACTIVE_FILES} files out of \
-         basic_partitioned's {BASIC_PARTITIONED_ACTIVE_FILES} active ones — never zero — \
-         gathered across every shard fragment and every echoed copy of the pushed SQL, \
-         got {embedded_files:?}: {pushed}"
-    );
+    // Partition pruning on basic_partitioned, then min/max stats pruning on multi_part_stats.
+    for (table, filter, all_files, kept_files) in [
+        ("BASIC_PARTITIONED", "LETTER = 'a'", 6, 2),
+        ("MULTI_PART_STATS", "ID <= 2", 5, 2),
+    ] {
+        let unfiltered =
+            pushed_data_files(&mut conn, &format!("SELECT * FROM {}", table_ref(table)));
+        assert_eq!(
+            unfiltered.len(),
+            all_files,
+            "{table} must embed all {all_files} active files unfiltered, got {unfiltered:?}"
+        );
+        let kept = pushed_data_files(
+            &mut conn,
+            &format!("SELECT * FROM {} WHERE {filter}", table_ref(table)),
+        );
+        assert_eq!(
+            kept.len(),
+            kept_files,
+            "{filter} must embed exactly its own {kept_files} of {table}'s {all_files} active \
+             files, never zero, got {kept:?}"
+        );
+        assert!(
+            kept.iter().all(|file| unfiltered.contains(file)),
+            "the kept files must be a subset of the unfiltered ones: {kept:?} vs {unfiltered:?}"
+        );
+    }
 }
 
 /// Scenario: Partition columns come from the catalog and partition values from the file paths
@@ -2311,14 +2186,20 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
 #[test]
 fn unity_parquet_planning_agrees_under_vended_and_static_credentials() {
     setup();
+    let mut conn = exa_conn();
 
-    let rt = runtime();
-    let vended = rt.block_on(resolve_unity_scan("sales_parquet", true, None));
-    let static_creds = rt.block_on(resolve_unity_scan("sales_parquet", false, None));
-
-    assert_eq!(vended.table_root, static_creds.table_root);
-    assert_eq!(vended.files, static_creds.files);
-    assert_eq!(vended.files.len(), 3, "{:?}", vended.files);
+    let rows = vended_and_static_rows_agree(&mut conn, "SALES_PARQUET");
+    let mut ids: Vec<i64> = conn
+        .query_columns(&format!("SELECT ID FROM {VS_VENDED_NAME}.SALES_PARQUET"))[0]
+        .iter()
+        .map(parse_int)
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        [1, 2, 3, 4],
+        "sales_parquet's three files hold ids 1 to 4 on the vended path: {rows:?}"
+    );
 }
 
 fn copy_ref(table: &str) -> String {
@@ -2459,42 +2340,56 @@ fn unity_unusable_column_mapping_metadata_refuses_only_its_column() {
         label.contains("'label'") && label.contains("'id'"),
         "{label}"
     );
-    assert!(!label.contains(&local_stack_creds().secret_key), "{label}");
+    assert!(
+        !label.contains(&local_stack_connection_password().secret_key),
+        "{label}"
+    );
 }
 
 /// Scenario: The client carries each table's properties verbatim from the list sweep and the single-table load
 #[test]
-fn unity_session_carries_table_properties_from_list_and_load() {
+fn unity_column_mapping_property_reaches_create_and_scoped_refresh() {
     setup();
-    let session = UnityCatalogSession::new(&unity_catalog_url(), delta_creds(false));
-    let namespace = ["unity".to_string(), "delta_e2e".to_string()];
-    let expected = BTreeMap::from([
-        ("delta.columnMapping.mode".to_string(), "name".to_string()),
-        (
-            "delta.columnMapping.maxColumnId".to_string(),
-            "3".to_string(),
-        ),
-        ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
-    ]);
+    let mut conn = exa_conn();
+    const VS: &str = "UNITY_PROPERTIES_VS";
+    // A fresh schema, so CREATE's list sweep is observed before any scoped refresh reloads it.
+    create_virtual_schema_with_password(
+        &mut conn,
+        &VsProps::new(VS, UNITY_NAMESPACE)
+            .with_catalog_kind("UNITY_CATALOG")
+            .with_catalog_conn_name("UNITY_PROPERTIES_CREDS"),
+        UNITY_CATALOG_URI_INTERNAL,
+        &local_stack_connection_password(),
+    );
 
-    let rt = runtime();
-    let listing = rt
-        .block_on(session.list_tables(&namespace))
-        .expect("the namespace lists");
-    let loaded = rt
-        .block_on(session.load_table(&delta_e2e_table("cm_name_mode")))
-        .expect("the table loads");
-
-    let listed = |name: &str| {
-        let table = listing.tables.iter().find(|table| table.ident.name == name);
-        table
-            .unwrap_or_else(|| panic!("{name} is listed"))
-            .properties
-            .clone()
+    // Only the `delta.columnMapping.mode = name` property selects the physical-name binding.
+    let name_mode_effect = |conn: &mut ExaConn, path: &str| {
+        let notes = column_adapter_notes(conn, VS, "CM_NAME_MODE");
+        assert_eq!(
+            note_of(&notes, "ID")["sourceType"]["physical_name"],
+            json!("col-80396d42-d765-483e-b86e-7ac1e13ef88c"),
+            "after {path}, ID must bind by the physical name name mode selects"
+        );
+        let cols = conn.query_columns(&format!(
+            "SELECT ID, NAME, \"VALUE\" FROM {VS}.CM_NAME_MODE ORDER BY ID"
+        ));
+        assert!(
+            !cols[0].is_empty() && cols.iter().all(|col| col.iter().all(|v| !v.is_null())),
+            "after {path}, cm_name_mode must return rows with every logical column filled: {cols:?}"
+        );
+        cols
     };
-    assert_eq!(listed("cm_name_mode"), expected);
-    assert_eq!(loaded.properties, expected);
-    assert_eq!(listed("sales_parquet"), BTreeMap::new());
+    let after_create = name_mode_effect(&mut conn, "CREATE");
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {VS} REFRESH TABLES CM_NAME_MODE"
+    ));
+    let after_refresh = name_mode_effect(&mut conn, "REFRESH TABLES CM_NAME_MODE");
+    assert_eq!(
+        after_refresh, after_create,
+        "the single-table load must declare cm_name_mode as the list sweep did"
+    );
+
+    conn.execute(&format!("DROP VIRTUAL SCHEMA {VS} CASCADE"));
 }
 
 /// Scenario: A declaration that disagrees with the Delta log fails the query

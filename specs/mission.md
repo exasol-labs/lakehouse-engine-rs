@@ -116,7 +116,7 @@ cargo test
 make test-e2e
 
 # Lint & Format
-cargo clippy --all-targets && cargo fmt
+make fmt-check lint
 ```
 
 ## Project Structure

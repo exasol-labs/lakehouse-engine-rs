@@ -11,10 +11,11 @@ use crate::common::seed::{
     EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS,
     EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FLOAT32_VALUES_TEXT, INT32_VALUES_TEXT,
     LINEITEM_ROWS, LINES_PER_ORDER, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE,
-    PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15,
-    SEED_TOTAL_ROWS, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT, TYPED_COL_DECIMAL_A,
-    TYPED_COL_DECIMAL_B, initdef_columns, seed_added_columns_initial_default, seed_renamed_column,
-    typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev, typed_id_avg_stddev,
+    PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, PART_VALUES, SEED_LABELS_ROWS,
+    SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
+    TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, initdef_columns, seed_added_columns_initial_default,
+    seed_renamed_column, typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev,
+    typed_id_avg_stddev,
 };
 use crate::common::stack::{
     build_create_connection_sql, exasol_container, iceberg_catalog_url,
@@ -27,9 +28,6 @@ use crate::fixtures::{
     LAKEHOUSE_VS, events_table, explain_virtual_pushdown_sql, lakehouse_vs, typed_table,
     vs_dim_table, vs_fact_table, vs_lineitem_table,
 };
-
-use lakehouse_catalog::CatalogSession;
-use lakehouse_engine::adapter::pushdown::{ConnectionStorage, ScanSource, format_reader};
 
 /// `PARALLELISM_FACTOR = '1'` so its recorded `DF_THREADS_PER_UDF` reads back the core
 /// count the adapter VM detected.
@@ -2640,86 +2638,37 @@ fn e2e_partition_filter_prunes_and_returns_correct_rows() {
 #[test]
 fn e2e_range_filter_prunes_by_file_bounds() {
     lakehouse_vs();
+    let mut conn = exa_conn();
 
-    let catalog_uri = crate::common::stack::iceberg_catalog_url();
-    let catalog_props = local_stack_catalog(&format!("{E2E_NAMESPACE}.{E2E_PART_TABLE}"));
-    let storage = local_stack_storage();
-    let creds = local_stack_creds();
+    let north_ids: Vec<i64> = (PART_NORTH_IDS.0 as i64..=PART_NORTH_IDS.1 as i64).collect();
+    let all_ids: Vec<i64> = (1..=PART_TOTAL_ROWS as i64).collect();
+    // `ID <= 5` names no partition column, so only the per-file id bounds can prune it.
+    for (predicate, kept, expected) in [
+        ("", &PART_VALUES[..], &all_ids),
+        (
+            &*format!(" WHERE {PART_COL} = '{PART_VAL_NORTH}'"),
+            &[PART_VAL_NORTH][..],
+            &north_ids,
+        ),
+        (" WHERE id <= 5", &[PART_VAL_NORTH][..], &north_ids),
+    ] {
+        let sql = format!(
+            "SELECT id FROM {}{predicate} ORDER BY id",
+            vs_regions_table()
+        );
+        let pushed = explain_virtual_pushdown_sql(&mut conn, &sql);
+        let scanned: Vec<&str> = PART_VALUES
+            .into_iter()
+            .filter(|region| pushed.contains(&format!("{E2E_PART_TABLE}-{region}-")))
+            .collect();
+        assert_eq!(
+            scanned, kept,
+            "'{predicate}' must scan only the {kept:?} data files:\n{pushed}"
+        );
 
-    let rt = runtime();
-
-    // One session reused across the pruning calls, mirroring the single-session-per-query
-    // contract of the format-reader seam.
-    let session = rt
-        .block_on(async { CatalogSession::resolve(&catalog_uri, &creds.warehouse, &creds).await })
-        .expect("CatalogSession::resolve must succeed");
-    // The local stack's SeaweedFS is plain HTTP.
-    let connection = ConnectionStorage {
-        storage: &storage,
-        creds: &creds,
-        allow_http: true,
-    };
-    // Filter columns resolve through the field ids CREATE declared, as in a pushdown.
-    let declared = declared_schema_of(&mut exa_conn(), LAKEHOUSE_VS, "REGIONS");
-    let reader = format_reader(
-        ScanSource::Iceberg {
-            session: &session,
-            catalog_props: &catalog_props,
-        },
-        &connection,
-    )
-    .expect("format_reader must succeed");
-
-    let all_files = rt
-        .block_on(reader.resolve_scan(&declared, None))
-        .expect("resolve_scan (no filter) must succeed")
-        .files;
-    assert_eq!(
-        all_files.len(),
-        3,
-        "unfiltered REGIONS must resolve 3 data files (one per partition), got {}: {all_files:?}",
-        all_files.len()
-    );
-
-    // Column names are Exasol-uppercase; the translator resolves them case-insensitively.
-    let partition_filter = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {"type": "column", "name": "REGION"},
-        "right": {"type": "literal_string", "value": "north"}
-    });
-    let pruned_partition = rt
-        .block_on(reader.resolve_scan(&declared, Some(&partition_filter)))
-        .expect("resolve_scan (partition filter) must succeed")
-        .files;
-    assert_eq!(
-        pruned_partition.len(),
-        1,
-        "partition filter 'region = north' must resolve 1 file, got {}: {pruned_partition:?}",
-        pruned_partition.len()
-    );
-    assert!(
-        pruned_partition.len() < all_files.len(),
-        "partition filter must prune files: pruned={} is not < unfiltered={}",
-        pruned_partition.len(),
-        all_files.len()
-    );
-
-    // Iceberg's InclusiveMetricsEvaluator prunes files whose min(id) > 5.
-    let range_filter = serde_json::json!({
-        "type": "predicate_lessequal",
-        "left": {"type": "column", "name": "ID"},
-        "right": {"type": "literal_exactnumeric", "value": "5"}
-    });
-    let pruned_range = rt
-        .block_on(reader.resolve_scan(&declared, Some(&range_filter)))
-        .expect("resolve_scan (range filter) must succeed")
-        .files;
-    assert_eq!(
-        pruned_range.len(),
-        1,
-        "range filter 'id <= 5' must resolve only the north file, got {}: {pruned_range:?}",
-        pruned_range.len()
-    );
+        let ids: Vec<i64> = conn.query_columns(&sql)[0].iter().map(parse_int).collect();
+        assert_eq!(&ids, expected, "'{predicate}' rows");
+    }
 }
 
 #[test]

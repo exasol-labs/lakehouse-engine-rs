@@ -41,10 +41,6 @@ use common::stack::{
 };
 
 use futures::TryStreamExt;
-use lakehouse_catalog::{
-    CatalogProps, CatalogSession, ConnectionCreds, StaticStoreAddress, StorageBackend,
-    load_table_any_auth, redact_secret_values,
-};
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjectStorePath;
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -471,6 +467,16 @@ struct VendedProbe {
     session_token: Option<String>,
 }
 
+/// Redacts by value only: the probe knows every credential it vended.
+fn redact(text: &str, secrets: &[&str]) -> String {
+    secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(text.to_string(), |text, secret| {
+            text.replace(secret, "[REDACTED]")
+        })
+}
+
 impl VendedProbe {
     fn secrets(&self) -> Vec<&str> {
         let mut secrets = vec![self.access_key.as_str(), self.secret_key.as_str()];
@@ -490,20 +496,9 @@ fn split_s3_uri(uri: &str) -> (String, String) {
     (bucket.to_string(), key.to_string())
 }
 
-async fn probe_vended_credential(
-    session: &CatalogSession,
-    creds: &ConnectionCreds,
-    table: &'static str,
-) -> VendedProbe {
-    let catalog = CatalogProps {
-        warehouse: WAREHOUSE_VENDED.to_string(),
-        table: format!("{E2E_NAMESPACE}.{table}"),
-    };
-    let result = load_table_any_auth(session, &catalog, creds)
-        .await
-        .unwrap_or_else(|e| {
-            panic!("the access-delegated loadTable GET for {table} must succeed: {e}")
-        });
+fn probe_vended_credential(table: &'static str) -> VendedProbe {
+    let result =
+        lakekeeper::load_table_with_vended_credentials(WAREHOUSE_VENDED, E2E_NAMESPACE, table);
 
     let location = result.metadata.location().to_string();
     assert!(
@@ -512,32 +507,28 @@ async fn probe_vended_credential(
          entry is selected BY that location, so the probe has no anchor to select with"
     );
     let (bucket, key_prefix) = split_s3_uri(&location);
-    let backend = lakehouse_catalog::resolve_vended_storage(
-        &result,
-        &location,
-        true,
-        &StaticStoreAddress::from(creds),
-    )
-    .unwrap_or_else(|e| panic!("resolve_vended_storage for {table} ({location}) failed: {e}"));
-    let StorageBackend::S3(props) = backend else {
-        panic!("this fixture is SeaweedFS (s3://): {table} ({location}) vended a non-S3 backend");
-    };
+    let vended = lakekeeper::vended_storage_config(&result, &location);
+    let value = |key: &str| vended.get(key).filter(|v| !v.is_empty()).cloned();
 
-    assert!(
-        !props.access_key.is_empty() && !props.secret_key.is_empty(),
-        "the credential source Lakekeeper vended for {table} ({location}) carries no usable s3 \
-         key pair, so it cannot be signed with and the cross-table probe would prove nothing"
-    );
+    let (Some(access_key), Some(secret_key)) =
+        (value("s3.access-key-id"), value("s3.secret-access-key"))
+    else {
+        panic!(
+            "the credential source Lakekeeper vended for {table} ({location}) carries no usable \
+             s3 key pair, so it cannot be signed with and the cross-table probe would prove \
+             nothing"
+        );
+    };
 
     VendedProbe {
         table,
         location,
         bucket,
         key_prefix,
-        region: props.region,
-        access_key: props.access_key,
-        secret_key: props.secret_key,
-        session_token: props.session_token,
+        region: value("client.region").unwrap_or_default(),
+        access_key,
+        secret_key,
+        session_token: value("s3.session-token"),
     }
 }
 
@@ -572,7 +563,7 @@ async fn first_parquet_under(
     while let Some(meta) = listing.try_next().await.unwrap_or_else(|e| {
         panic!(
             "listing {key_prefix} with the table's OWN vended credential failed: {}",
-            redact_secret_values(&e.to_string(), secrets)
+            redact(&e.to_string(), secrets)
         )
     }) {
         if meta.location.as_ref().ends_with(".parquet") {
@@ -589,12 +580,10 @@ async fn first_parquet_under(
 fn lakekeeper_vended_credentials_are_scoped_per_table() {
     setup();
 
-    let creds = lakekeeper::lakekeeper_host_connection_creds(WAREHOUSE_VENDED, true);
-    assert!(
-        creds.use_vended_credentials,
-        "the probe CONNECTION must request access delegation: without that flag the loadTable \
-         GET carries no X-Iceberg-Access-Delegation header and its response evidences nothing"
-    );
+    // The loadTable GETs are blocking, so they run before the async object-store reads.
+    let fact = probe_vended_credential(E2E_FACT_TABLE);
+    let dim = probe_vended_credential(E2E_DIM_TABLE);
+    let secrets = [fact.secrets(), dim.secrets()].concat();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -602,17 +591,6 @@ fn lakekeeper_vended_credentials_are_scoped_per_table() {
         .expect("tokio runtime for the vended-credential scope probe");
 
     rt.block_on(async {
-        let session =
-            CatalogSession::resolve(&lakekeeper::catalog_uri_host(), WAREHOUSE_VENDED, &creds)
-                .await
-                .unwrap_or_else(|e| {
-                    panic!("CatalogSession::resolve against Lakekeeper must succeed: {e}")
-                });
-
-        let fact = probe_vended_credential(&session, &creds, E2E_FACT_TABLE).await;
-        let dim = probe_vended_credential(&session, &creds, E2E_DIM_TABLE).await;
-        let secrets = [fact.secrets(), dim.secrets()].concat();
-
         // Printed first so the observed state survives a failing control read.
         println!(
             "lakekeeper_vended_credentials_are_scoped_per_table:\n  \
@@ -641,7 +619,7 @@ fn lakekeeper_vended_credentials_are_scoped_per_table() {
             panic!(
                 "control read of {victim} with dim_customer's OWN vended credential failed, so a \
                  denial below could not be told apart from a broken probe: {}",
-                redact_secret_values(&e.to_string(), &secrets)
+                redact(&e.to_string(), &secrets)
             )
         });
 
@@ -656,7 +634,7 @@ fn lakekeeper_vended_credentials_are_scoped_per_table() {
             }
             Err(e) => println!(
                 "  cross-table read (fact_orders creds -> {victim}): DENIED, {}",
-                redact_secret_values(&e.to_string(), &secrets)
+                redact(&e.to_string(), &secrets)
             ),
         }
 

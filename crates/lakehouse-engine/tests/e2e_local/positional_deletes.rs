@@ -3,6 +3,7 @@
 //! `tests/common/pos_delete_fixtures.rs` MUST stay in lockstep with those scripts.
 
 use crate::common::e2e_harness::*;
+use crate::common::exasol_ws::ExaConn;
 use crate::common::pos_delete_fixtures::{
     DELETION_VECTOR_CARDINALITIES, DELETION_VECTOR_FILE_ID_RANGES, DELETION_VECTOR_TABLE,
     FILE_GRANULARITY_DELETED_IDS, FILE_GRANULARITY_REMAINING_ROWS, FILE_GRANULARITY_TABLE,
@@ -14,11 +15,7 @@ use crate::common::pos_delete_fixtures::{
 };
 use crate::common::seed::{E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS};
 
-use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, vs_table};
-
-use lakehouse_engine::adapter::pushdown::shard_count;
-use lakehouse_engine::adapter::sharding::partition_files_by_bytes;
-use lakehouse_engine::scan::spec::DeleteMechanism;
+use crate::fixtures::{LAKEHOUSE_VS, explain_virtual_pushdown_sql, lakehouse_vs, vs_table};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -80,17 +77,12 @@ fn fixture_spark_file_granularity_delete_table() {
         );
         for delete in &entry.deletes {
             assert!(
-                matches!(delete, DeleteMechanism::IcebergPositionalDelete { .. }),
+                matches!(delete, FixtureDelete::Positional { .. }),
                 "file granularity: delete file for {} must be a Parquet positional delete",
                 entry.path
             );
             *refs_per_delete_path
-                .entry(
-                    delete
-                        .object_store_path()
-                        .expect("positional delete path")
-                        .to_string(),
-                )
+                .entry(delete.path().to_string())
                 .or_insert(0) += 1;
         }
     }
@@ -135,20 +127,12 @@ fn fixture_spark_partition_granularity_delete_table() {
             entry.deletes.len()
         );
         assert!(
-            matches!(
-                entry.deletes[0],
-                DeleteMechanism::IcebergPositionalDelete { .. }
-            ),
+            matches!(entry.deletes[0], FixtureDelete::Positional { .. }),
             "partition granularity: delete file for {} must be a Parquet positional delete",
             entry.path
         );
         *refs_per_delete_path
-            .entry(
-                entry.deletes[0]
-                    .object_store_path()
-                    .expect("positional delete path")
-                    .to_string(),
-            )
+            .entry(entry.deletes[0].path().to_string())
             .or_insert(0) += 1;
     }
     assert_eq!(
@@ -285,78 +269,53 @@ fn e2e_partition_delete_spans_multiple_partitions() {
 fn e2e_partition_delete_invariant_across_fanout() {
     setup_e2e();
 
-    let rt = runtime();
-    let files = rt.block_on(resolve_fixture_files(
-        NAMESPACE,
-        PARTITION_GRANULARITY_TABLE,
-    ));
-    assert_eq!(
-        files.len(),
-        4,
-        "sanity: mor_pos_partition must have 4 data files"
-    );
-
-    let g_same = shard_count(1, 1, files.len());
-    assert_eq!(
-        g_same, 1,
-        "PARALLELISM_FACTOR=1 on a 1-node cluster must yield G=1"
-    );
-    let same_shards = partition_files_by_bytes(files.clone(), g_same);
-    assert_eq!(same_shards.len(), 1, "G=1 must yield exactly 1 shard");
-    assert_eq!(
-        same_shards[0].len(),
-        files.len(),
-        "with G=1 every data file (including any two sharing a delete file) \
-         must land in the SAME single shard"
-    );
-
-    let g_split = shard_count(1, SPLIT_PARALLELISM_FACTOR, files.len());
-    assert_eq!(
-        g_split,
-        files.len(),
-        "PARALLELISM_FACTOR={SPLIT_PARALLELISM_FACTOR} on a 1-node cluster with \
-         {} files must yield G == file_count",
-        files.len()
-    );
-    let split_shards = partition_files_by_bytes(files.clone(), g_split);
-    assert_eq!(
-        split_shards.len(),
-        files.len(),
-        "G == file_count must yield exactly file_count shards"
-    );
-    for (i, shard) in split_shards.iter().enumerate() {
-        assert_eq!(
-            shard.len(),
-            1,
-            "with G == file_count every shard must get exactly 1 file \
-             (shard {i} got {}), so every data file lands in a DIFFERENT shard",
-            shard.len()
+    let mut conn = exa_conn();
+    let pushed_sql_of = |conn: &mut ExaConn, vs: &str| {
+        let sql = format!(
+            "SELECT id FROM {}",
+            vs_table(vs, PARTITION_GRANULARITY_TABLE)
         );
-    }
+        explain_virtual_pushdown_sql(conn, &sql)
+    };
+
+    let same_sql = pushed_sql_of(&mut conn, SAMESHARD_VS_NAME);
+    assert!(
+        same_sql.contains(SCAN_SCRIPT_NAME) && !same_sql.contains("shard_key"),
+        "PARALLELISM_FACTOR=1 must push one scan over all 4 data files (including any two \
+         sharing a delete file), not a shard fan-out:\n{same_sql}"
+    );
+
+    // 4 non-empty shards over 4 data files hold one file each.
+    let split_sql = pushed_sql_of(&mut conn, SPLITSHARD_VS_NAME);
+    assert!(
+        (0..SPLIT_PARALLELISM_FACTOR).all(|i| split_sql.contains(&format!("({i},'")))
+            && !split_sql.contains(&format!("({SPLIT_PARALLELISM_FACTOR},'"))
+            && !split_sql.contains(",'[]')"),
+        "PARALLELISM_FACTOR={SPLIT_PARALLELISM_FACTOR} must fan out into exactly \
+         {SPLIT_PARALLELISM_FACTOR} shards, one data file each:\n{split_sql}"
+    );
 
     let deleted: HashSet<i64> = PARTITION_GRANULARITY_DELETED_IDS.iter().copied().collect();
     let expected: Vec<i64> = (1..=PARTITION_GRANULARITY_TOTAL_ROWS as i64)
         .filter(|id| !deleted.contains(id))
         .collect();
 
-    let mut conn = exa_conn();
-
-    let same_sql = format!(
+    let same_rows_sql = format!(
         "SELECT id FROM {} ORDER BY id",
         vs_table(SAMESHARD_VS_NAME, PARTITION_GRANULARITY_TABLE)
     );
-    let same_ids = ids_column(&conn.query_columns(&same_sql));
+    let same_ids = ids_column(&conn.query_columns(&same_rows_sql));
     assert_eq!(
         same_ids, expected,
         "same-shard placement (PARALLELISM_FACTOR=1) must return the exact \
          post-delete id set {expected:?}, got {same_ids:?}"
     );
 
-    let split_sql = format!(
+    let split_rows_sql = format!(
         "SELECT id FROM {} ORDER BY id",
         vs_table(SPLITSHARD_VS_NAME, PARTITION_GRANULARITY_TABLE)
     );
-    let split_ids = ids_column(&conn.query_columns(&split_sql));
+    let split_ids = ids_column(&conn.query_columns(&split_rows_sql));
     assert_eq!(
         split_ids, expected,
         "split-shard placement (PARALLELISM_FACTOR={SPLIT_PARALLELISM_FACTOR}) must \
@@ -478,7 +437,6 @@ fn e2e_deletes_with_single_and_grouped_agg() {
     );
 }
 
-/// Scenario: Delete-file references are carried in the per-shard files argument
 #[test]
 fn fixture_spark_deletion_vector_table() {
     setup_e2e();
@@ -494,13 +452,12 @@ fn fixture_spark_deletion_vector_table() {
     let mut vectors = Vec::new();
     for entry in &files {
         match entry.deletes.as_slice() {
-            [DeleteMechanism::IcebergPositionalDelete { .. }] => positional += 1,
+            [FixtureDelete::Positional { .. }] => positional += 1,
             [
-                DeleteMechanism::IcebergPuffinDeletionVector {
+                FixtureDelete::DeletionVector {
                     path,
                     content_offset,
                     record_count,
-                    ..
                 },
             ] => vectors.push((path.as_str(), *content_offset, *record_count)),
             other => panic!("data file {} has unexpected deletes {other:?}", entry.path),
