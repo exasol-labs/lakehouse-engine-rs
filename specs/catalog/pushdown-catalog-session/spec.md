@@ -92,3 +92,10 @@ The adapter builds the catalog HTTP state once per pushdown request and reuses i
 * *THEN* the identifier listing SHALL call only the namespace and table listing endpoints, besides the session's grant and `/v1/config` lookup, and SHALL issue no `loadTable` GET
 * *AND* the load SHALL reuse the listing's `CatalogSession` and issue one `loadTable` GET per given identifier through the load helper the full listing uses
 * *AND* a table the catalog reports as not a loadable Iceberg table SHALL be skipped with the `NotLoadableIcebergTable` reason the full listing gives it, and any other load failure SHALL fail the load
+
+### Scenario: A failed config lookup fails the request
+
+* *GIVEN* a CONNECTION without `use_sigv4` whose `GET {uri}/v1/config?warehouse={warehouse}` fails or answers a non-success status, for example for an unknown warehouse name
+* *WHEN* the adapter resolves the catalog session of a pushdown, `createVirtualSchema`, `REFRESH`, or `SET PROPERTIES` request
+* *THEN* the request SHALL fail with an error that names the warehouse and carries the catalog's answer
+* *AND* the adapter MUST NOT fall back to an empty prefix, because an unprefixed request reaches the catalog's default warehouse or answers every table with HTTP 404

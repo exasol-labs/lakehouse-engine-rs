@@ -18,29 +18,28 @@ The Virtual Schema authenticates to an Iceberg REST Catalog in one of three mode
 ### Scenario: Static bearer token is attached to unsigned catalog requests
 
 * *GIVEN* a virtual schema whose CONNECTION credentials supply a non-empty `token`, supply neither `client_id` nor `client_secret`, the only shape credential validation admits for the token mode, and do not enable `use_sigv4`
-* *AND* a query that requires resolving the Iceberg snapshot and file list from a REST catalog endpoint
-* *WHEN* the adapter resolves the file list through the unsigned catalog path
-* *THEN* the adapter SHALL set the catalog `token` property from the resolved credentials when building the REST catalog
-* *AND* the adapter SHALL NOT set the catalog `credential`, `oauth2-server-uri`, or `scope` properties, since the token mode never consults them
+* *WHEN* the adapter sends a catalog request through the unsigned catalog path
+* *THEN* the adapter SHALL send the header `Authorization: Bearer <token>` on that request
+* *AND* the adapter SHALL NOT perform the OAuth2 client-credentials grant, since the token mode never consults the client credentials
 * *AND* the adapter SHALL select the token mode through the ONE shared catalog-auth mode classifier `connection/connection-credentials-catalog-auth` specifies, and MUST NOT test the `client_id`/`client_secret` pair ahead of the `token`, because that ordering answered an ambiguous CONNECTION the opposite way from the Unity Catalog path
 * *AND* the `token` value MUST NOT appear in any returned SQL string or error message
 
 ### Scenario: OAuth2 client credentials drive the catalog client-credentials grant
 
 * *GIVEN* a virtual schema whose CONNECTION credentials supply `client_id` and `client_secret`, supply no `token`, the only shape credential validation admits for the OAuth2 mode, and do not enable `use_sigv4`
-* *WHEN* the adapter resolves the file list through the unsigned catalog path
-* *THEN* the adapter SHALL set the catalog `credential` property to the string formed by joining `client_id` and `client_secret` with a single colon
-* *AND* the adapter SHALL set the catalog `oauth2-server-uri` property only when a non-empty `oauth2_server_uri` was supplied, otherwise leaving it unset so the catalog defaults to `{uri}/v1/oauth/tokens`
-* *AND* the adapter SHALL set the catalog `scope` property only when a non-empty `scope` was supplied, otherwise leaving it unset so the catalog applies its default
+* *WHEN* the adapter resolves the catalog session of a request
+* *THEN* the adapter SHALL POST a form-encoded client-credentials grant carrying `grant_type=client_credentials`, `client_id`, and `client_secret` to `oauth2_server_uri` when a non-empty one was supplied, otherwise to `{uri}/v1/oauth/tokens`
+* *AND* the grant SHALL carry `scope` only when a non-empty `scope` was supplied
+* *AND* the adapter SHALL send the returned `access_token` as the bearer on every catalog request of that session
 * *AND* the adapter SHALL select the OAuth2 mode through that same shared classifier, so the mode it applies and the mode the Unity Catalog path applies for the same credential set are the same mode by construction
-* *AND* the adapter SHALL NOT set the catalog `token` property, and the `client_secret` value MUST NOT appear in any returned SQL string or error message
+* *AND* the `client_secret` value and the obtained bearer token MUST NOT appear in any returned SQL string or error message
 
-### Scenario: No catalog auth props are set when neither token nor OAuth credentials are supplied
+### Scenario: Catalog requests carry no authorization when neither token nor OAuth credentials are supplied
 
-* *GIVEN* a virtual schema whose CONNECTION credentials supply no `token`, `client_id`, or `client_secret`
-* *WHEN* the adapter resolves the file list through the unsigned catalog path
-* *THEN* the adapter SHALL NOT set the catalog `token`, `credential`, `oauth2-server-uri`, or `scope` properties
-* *AND* the catalog build SHALL carry no auth property, so the catalog is reached unauthenticated
+* *GIVEN* a virtual schema whose CONNECTION credentials supply no `token`, `client_id`, or `client_secret`, and do not enable `use_sigv4`
+* *WHEN* the adapter sends a catalog request through the unsigned catalog path
+* *THEN* the request SHALL carry no `Authorization` header and no SigV4 signature
+* *AND* the adapter SHALL NOT perform the OAuth2 client-credentials grant
 
 ### Scenario: Catalog auth props are never placed in any scan spec
 

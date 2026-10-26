@@ -139,7 +139,9 @@ async fn sigv4_resolve_prefix_derives_catalogs_segment() {
     };
 
     let client = reqwest::Client::new();
-    let result = resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds).await;
+    let result = resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds)
+        .await
+        .expect("prefix");
 
     assert_eq!(
         result,
@@ -185,7 +187,9 @@ async fn non_sigv4_config_prefix_resolution_uses_config_endpoint() {
 
     let client = reqwest::Client::new();
     let result =
-        resolve_load_table_prefix(&client, &catalog_uri, "original-warehouse", &auth, &creds).await;
+        resolve_load_table_prefix(&client, &catalog_uri, "original-warehouse", &auth, &creds)
+            .await
+            .expect("prefix");
 
     assert_eq!(
         result, resolved_prefix,
@@ -223,7 +227,9 @@ async fn non_sigv4_no_config_prefix_yields_empty_not_warehouse() {
     let auth = CatalogAuth::None;
 
     let client = reqwest::Client::new();
-    let result = resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds).await;
+    let result = resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds)
+        .await
+        .expect("prefix");
 
     assert_eq!(
         result, "",
@@ -380,5 +386,101 @@ async fn catalog_session_resolve_sigv4_no_config_roundtrip() {
     assert_eq!(
         session.catalog_uri, catalog_uri,
         "catalog_uri must be carried verbatim"
+    );
+}
+
+/// Answers each request with `route(request_line)` and records the request lines in order.
+async fn spawn_routed_catalog(
+    route: fn(&str) -> (&'static str, &'static str),
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+    let uri = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = lines.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let line = request.lines().next().unwrap_or_default().to_string();
+            let (status, body) = route(&line);
+            seen.lock().unwrap().push(line);
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    (uri, lines)
+}
+
+/// Scenario: A failed config lookup fails the request
+#[tokio::test]
+async fn a_failed_config_lookup_fails_the_session() {
+    let (uri, _) =
+        spawn_routed_catalog(|_| ("404 Not Found", r#"{"error":"no such warehouse"}"#)).await;
+
+    let Err(UdfError::User(msg)) =
+        CatalogSession::resolve(&uri, "wrong-wh", &creds_no_auth()).await
+    else {
+        panic!("a 404 config answer must fail the session");
+    };
+
+    assert!(
+        msg.starts_with("failed to read the catalog config for warehouse 'wrong-wh': ")
+            && msg.contains("HTTP 404"),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn a_load_rejecting_the_snapshots_parameter_is_sent_again_without_it() {
+    let (uri, lines) = spawn_routed_catalog(|line| {
+        if line.contains("snapshots=refs") {
+            ("400 Bad Request", r#"{"error":"unknown parameter"}"#)
+        } else {
+            ("200 OK", LOAD_TABLE_BODY)
+        }
+    })
+    .await;
+    let session = CatalogSession {
+        client: reqwest::Client::new(),
+        catalog_uri: uri,
+        auth: CatalogAuth::None,
+        prefix: String::new(),
+    };
+
+    let metadata = load_table_schema_metadata(
+        &session,
+        &NamespaceIdent::new("db".into()),
+        "events",
+        &creds_no_auth(),
+    )
+    .await
+    .expect("the load without the parameter succeeds");
+
+    assert_eq!(metadata.location(), "s3://warehouse/db/events");
+    assert_eq!(
+        *lines.lock().unwrap(),
+        [
+            "GET /v1/namespaces/db/tables/events?snapshots=refs HTTP/1.1",
+            "GET /v1/namespaces/db/tables/events HTTP/1.1",
+        ]
+    );
+}
+
+#[test]
+fn catalog_urls_ignore_a_trailing_slash_on_the_address() {
+    assert_eq!(
+        build_load_table_url("http://host/catalog/", "wh", "db", "t"),
+        "http://host/catalog/v1/wh/namespaces/db/tables/t"
+    );
+    assert_eq!(
+        catalog_url("http://host/catalog/", "", "namespaces"),
+        "http://host/catalog/v1/namespaces"
     );
 }

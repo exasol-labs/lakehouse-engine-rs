@@ -158,12 +158,11 @@ pub async fn resolve_parquet_directory(
         .iter()
         .map(|raw| read_footer(Arc::clone(store), raw.path.clone(), raw.size))
         .collect();
-    let mut footers = stream::iter(reads).buffered(DIRECT_STORAGE_ADMISSION_LIMIT);
+    let mut footers = stream::iter(reads)
+        .buffered(DIRECT_STORAGE_ADMISSION_LIMIT)
+        .zip(stream::iter(&sources));
     let mut fold = SchemaFold::new(&key_columns);
-    for source in &sources {
-        let Some(footer) = footers.next().await else {
-            break;
-        };
+    while let Some((footer, source)) = footers.next().await {
         fold.add(source, &footer?)?;
     }
     let (folded_fields, binary_columns) = fold.finish();

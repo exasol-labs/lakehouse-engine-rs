@@ -95,24 +95,31 @@ const EMPTY_LISTING: &str = r#"{"identifiers":[],"namespaces":[]}"#;
 
 #[tokio::test]
 async fn a_refused_catalog_connection_names_its_cause_signed_or_not() {
-    for use_sigv4 in [false, true] {
-        let mut creds = base_creds();
-        creds.use_sigv4 = use_sigv4;
-        creds.region = "us-east-1".into();
-        let session = CatalogSession::resolve(CLOSED_PORT_URI, &creds.warehouse, &creds)
-            .await
-            .expect("neither mode needs the catalog to resolve a session");
+    let mut creds = base_creds();
+    let Err(UdfError::User(msg)) =
+        CatalogSession::resolve(CLOSED_PORT_URI, &creds.warehouse, &creds).await
+    else {
+        panic!("an unsigned session reads /v1/config, so a closed port must fail it");
+    };
+    assert!(
+        msg.starts_with("failed to read the catalog config for warehouse ")
+            && msg.contains(CLOSED_PORT_CAUSE),
+        "{msg}"
+    );
 
-        let Err(UdfError::User(msg)) =
-            list_namespace_tables(&session, &["db".to_string()], &creds).await
-        else {
-            panic!("a closed catalog port must fail the listing as a user error");
-        };
-
-        assert!(
-            msg.starts_with("failed to list tables in namespace 'db': ")
-                && msg.contains(CLOSED_PORT_CAUSE),
-            "use_sigv4={use_sigv4}: {msg}"
-        );
-    }
+    creds.use_sigv4 = true;
+    creds.region = "us-east-1".into();
+    let session = CatalogSession::resolve(CLOSED_PORT_URI, &creds.warehouse, &creds)
+        .await
+        .expect("a SigV4 session resolves without the catalog");
+    let Err(UdfError::User(msg)) =
+        list_namespace_tables(&session, &["db".to_string()], &creds).await
+    else {
+        panic!("a closed catalog port must fail the listing as a user error");
+    };
+    assert!(
+        msg.starts_with("failed to list tables in namespace 'db': ")
+            && msg.contains(CLOSED_PORT_CAUSE),
+        "{msg}"
+    );
 }

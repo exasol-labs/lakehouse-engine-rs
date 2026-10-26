@@ -50,6 +50,7 @@ An Exasol user registers every Iceberg table in a configured namespace as a virt
 * *THEN* the adapter SHALL list the namespaces of one depth concurrently and load the listed tables concurrently, at most 16 namespaces or 16 tables at a time, and SHALL declare every table with its own columns
 * *AND* every table and namespace listing SHALL request each following page with the previous page's `next-page-token` until a page carries none
 * *AND* each enumeration `loadTable` SHALL request `snapshots=refs` and SHALL NOT send `X-Iceberg-Access-Delegation`, because enumeration reads only the current schema, while the Iceberg REST OpenAPI default for `snapshots` is `all` and a delegation header asks the catalog to mint storage credentials
+* *AND* a `loadTable` the catalog refuses with HTTP 400 SHALL be sent once more without `snapshots`, so a catalog that rejects the parameter still serves the table
 
 ### Scenario: One non-Iceberg table in the namespace is skipped rather than aborting the schema
 

@@ -2,14 +2,14 @@ use crate::ConnectionCreds;
 use crate::auth::CatalogAuth;
 use crate::iceberg_io::authed_get_json;
 use crate::redaction::redact_credentials;
-use crate::session::CatalogSession;
+use crate::session::{CatalogSession, catalog_url};
 use exasol_udf_sdk::error::UdfError;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::{NamespaceIdent, TableIdent};
 use iceberg_catalog_rest::{ListNamespaceResponse, ListTablesResponse};
 use serde::de::DeserializeOwned;
 
-/// Bounds the catalog requests one enumeration keeps in flight.
+/// Bounds the namespaces listed, or tables loaded, at once.
 pub(crate) const CATALOG_REQUEST_CONCURRENCY: usize = 16;
 
 /// The last `.`-delimited segment is the table name, all preceding ones the
@@ -81,7 +81,6 @@ async fn list_tables(
     .map_err(|e| listing_error("list tables in namespace", ns, e))
 }
 
-/// Only strict descendants are kept, so a catalog that ignores `parent` cannot loop the descent.
 async fn list_child_namespaces(
     session: &CatalogSession,
     ns: &NamespaceIdent,
@@ -89,7 +88,7 @@ async fn list_child_namespaces(
 ) -> Result<Vec<NamespaceIdent>, UdfError> {
     let url = namespaces_url(session, None);
     let parent = ns.to_url_string();
-    let children = list_pages(
+    list_pages(
         session,
         &url,
         &[("parent", parent.as_str())],
@@ -97,11 +96,7 @@ async fn list_child_namespaces(
         |page: ListNamespaceResponse| (page.namespaces, page.next_page_token),
     )
     .await
-    .map_err(|e| listing_error("list namespaces under", ns, e))?;
-    Ok(children
-        .into_iter()
-        .filter(|child| child.len() > ns.len() && child.starts_with(ns))
-        .collect())
+    .map_err(|e| listing_error("list namespaces under", ns, e))
 }
 
 async fn list_pages<P: DeserializeOwned, T>(
@@ -142,15 +137,11 @@ async fn list_pages<P: DeserializeOwned, T>(
 }
 
 fn namespaces_url(session: &CatalogSession, below: Option<&str>) -> String {
-    let base = session.catalog_uri().trim_end_matches('/');
-    let prefix = match session.prefix() {
-        "" => String::new(),
-        prefix => format!("/{prefix}"),
+    let path = match below {
+        Some(below) => format!("namespaces/{below}"),
+        None => "namespaces".to_string(),
     };
-    match below {
-        Some(below) => format!("{base}/v1{prefix}/namespaces/{below}"),
-        None => format!("{base}/v1{prefix}/namespaces"),
-    }
+    catalog_url(session.catalog_uri(), session.prefix(), &path)
 }
 
 fn listing_error(action: &str, ns: &NamespaceIdent, error: UdfError) -> UdfError {

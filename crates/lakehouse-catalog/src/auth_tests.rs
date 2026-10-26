@@ -2,9 +2,7 @@ use super::*;
 use crate::redaction::{redact_credentials, redact_secret_values};
 use crate::test_support::*;
 
-/// Scenario: Static bearer token is attached to unsigned catalog requests
 /// Scenario: OAuth2 client credentials drive the catalog client-credentials grant
-/// Scenario: No catalog auth props are set when neither token nor OAuth credentials are supplied
 #[tokio::test]
 async fn oauth2_grant_built_from_client_credentials() {
     use std::net::SocketAddr;
