@@ -454,11 +454,7 @@ fn construct_catalog_client(
     props: &Json,
 ) -> Result<Box<dyn CatalogClient>, UdfError> {
     match kind {
-        CatalogKind::IcebergRest => Ok(Box::new(IcebergRestCatalogClient::new(
-            catalog_uri,
-            storage,
-            creds,
-        ))),
+        CatalogKind::IcebergRest => Ok(Box::new(IcebergRestCatalogClient::new(catalog_uri, creds))),
         CatalogKind::UnityCatalogNative => {
             Ok(Box::new(UnityCatalogSession::new(&catalog_uri, creds)))
         }

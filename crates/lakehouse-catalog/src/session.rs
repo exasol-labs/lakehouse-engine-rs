@@ -1,48 +1,14 @@
 //! `load_table_any_auth` lives here because it reads `CatalogSession`'s private
 //! fields, keeping `CatalogAuth` unreachable from outside this crate.
 
-use crate::auth::{
-    CatalogAuth, inject_catalog_auth_props, redact_catalog_auth_error, resolve_catalog_auth,
-};
-use crate::error_chain;
+use crate::auth::{CatalogAuth, resolve_catalog_auth};
 use crate::iceberg_io::authed_get_json;
 use crate::namespace::parse_table_ident;
-use crate::{CatalogProps, ConnectionCreds, StorageBackend};
+use crate::{CatalogProps, ConnectionCreds};
 use exasol_udf_sdk::error::UdfError;
-use iceberg::CatalogBuilder;
-use iceberg_catalog_rest::{
-    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalog, RestCatalogBuilder,
-};
-use std::collections::HashMap;
-
-/// No `StorageFactory` is set: the only caller lists tables/namespaces, which
-/// never builds a `FileIO`.
-pub(crate) async fn build_rest_catalog(
-    catalog_uri: &str,
-    catalog: &CatalogProps,
-    storage: &StorageBackend,
-    creds: &ConnectionCreds,
-) -> Result<RestCatalog, UdfError> {
-    let mut props = HashMap::new();
-    props.insert(REST_CATALOG_PROP_URI.to_string(), catalog_uri.to_string());
-    props.insert(
-        REST_CATALOG_PROP_WAREHOUSE.to_string(),
-        catalog.warehouse.clone(),
-    );
-    props.extend(storage.catalog_storage_props());
-
-    inject_catalog_auth_props(&mut props, creds);
-
-    RestCatalogBuilder::default()
-        .load("lakehouse", props)
-        .await
-        .map_err(|e: iceberg::Error| {
-            UdfError::User(format!(
-                "failed to connect to Iceberg catalog: {}",
-                redact_catalog_auth_error(&error_chain(&e), creds)
-            ))
-        })
-}
+use iceberg::NamespaceIdent;
+use iceberg::spec::TableMetadata;
+use iceberg_catalog_rest::LoadTableResult;
 
 /// `warehouse` is the already-resolved REST prefix, not the raw CONNECTION
 /// warehouse. It is inserted verbatim (not URL-encoded) so a multi-segment prefix
@@ -157,12 +123,12 @@ pub async fn load_table_any_auth(
     session: &CatalogSession,
     catalog: &CatalogProps,
     creds: &ConnectionCreds,
-) -> Result<iceberg_catalog_rest::LoadTableResult, UdfError> {
+) -> Result<LoadTableResult, UdfError> {
     let (ns_ident, table_name) = parse_table_ident(&catalog.table)?;
     let ns_url = ns_ident.to_url_string();
     let url = build_load_table_url(&session.catalog_uri, &session.prefix, &ns_url, &table_name);
 
-    authed_get_json::<iceberg_catalog_rest::LoadTableResult>(
+    authed_get_json::<LoadTableResult>(
         &session.client,
         &url,
         &session.auth,
@@ -170,6 +136,26 @@ pub async fn load_table_any_auth(
         creds,
     )
     .await
+}
+
+/// The enumeration reads only the current schema, so it asks for no delegated access and for
+/// only the referenced snapshots (Iceberg REST `loadTable` `snapshots=refs`).
+pub(crate) async fn load_table_schema_metadata(
+    session: &CatalogSession,
+    namespace: &NamespaceIdent,
+    table_name: &str,
+    creds: &ConnectionCreds,
+) -> Result<TableMetadata, UdfError> {
+    let url = build_load_table_url(
+        &session.catalog_uri,
+        &session.prefix,
+        &namespace.to_url_string(),
+        table_name,
+    );
+    let url = format!("{url}?snapshots=refs");
+    authed_get_json::<LoadTableResult>(&session.client, &url, &session.auth, false, creds)
+        .await
+        .map(|result| result.metadata)
 }
 
 #[cfg(test)]

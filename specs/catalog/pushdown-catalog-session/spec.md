@@ -10,8 +10,7 @@ The adapter builds the catalog HTTP state once per pushdown request and reuses i
 * The session holds the live OAuth2 bearer token in its auth strategy. Redaction at the `loadTable` error site strips both the static catalog-auth secrets and that token.
 * The caller validates every involved-table identifier before it builds the session. A malformed identifier issues no catalog HTTP request.
 * The scan spec's `storage` value is the only part of the scan-driving SQL that depends on how the credential is delivered. `storage-access/scan-spec-credential-reference` encodes it as a connection reference or as a sealed envelope over the backend's encoding. Each table's own vended keys still land in that table's storage block, field for field, before sealing. `storage-access/pushdown-planning-cloud-credentials` owns that gate.
-* The namespace enumeration for `createVirtualSchema` is done by `IcebergRestCatalogClient::list_tables` in `lakehouse-catalog`, behind the shared `CatalogClient` trait. It builds one `CatalogSession` for the whole enumeration.
-* The enumeration also builds its own `RestCatalog` through `list_namespace_tables`, independent of any `CatalogSession`. With OAuth2 client credentials that `RestCatalog` runs its own grant and `/v1/config` handshake, so a request performs two grants. With a static token or no auth it runs no grant and one extra `/v1/config` lookup. With SigV4 it builds no `RestCatalog`.
+* The namespace enumeration for `createVirtualSchema` is done by `IcebergRestCatalogClient` in `lakehouse-catalog`, behind the shared `CatalogClient` trait. One `CatalogSession`, resolved at the client's first catalog request, serves the namespace listing and every `loadTable` GET, so a request runs one OAuth2 grant and one `/v1/config` lookup.
 * Related features: `catalog/rest-catalog-oauth-auth` (the three auth modes), `connection/connection-credentials-catalog-auth`, and `pushdown/pushdown-planning` (file list resolved once).
 * The Iceberg REST `listTables` response carries only table identifiers and a next-page token (`ListTablesResponse` in `iceberg-catalog-rest`).
 
@@ -55,11 +54,10 @@ The adapter builds the catalog HTTP state once per pushdown request and reuses i
 
 * *GIVEN* a createVirtualSchema request over a namespace holding N Iceberg tables, whose schema resolution runs inside the Iceberg REST catalog client's `list_tables` in `lakehouse-catalog`
 * *WHEN* the Iceberg REST catalog client enumerates the namespace and resolves every enumerated table's columns
-* *THEN* the client SHALL build exactly ONE `CatalogSession` for the whole enumeration and reuse it across every table, so an N-table namespace costs one schema-loop grant instead of N
-* *AND* an empty identifier batch (a namespace the catalog reports as holding no table) SHALL build NO resolution `CatalogSession` and perform NO resolution-phase OAuth2 grant, the resolution half of the guarantee; the enumeration-phase grant of the next clause is UNAFFECTED, so an empty namespace still costs ONE grant under OAuth2 client-credentials and ZERO under the no-auth and static-token modes
-* *AND* on the OAuth2 client-credentials mode, both `client_id` and `client_secret` set, the namespace-enumeration `RestCatalog` SHALL retain its own independent grant and `/v1/config` handshake, so such a request still performs TWO grants in total rather than one; on the static-token and no-auth modes it performs NO grant and one extra `/v1/config` lookup; on the SigV4 mode `list_namespace_tables` builds no `RestCatalog` at all
+* *THEN* the client SHALL build exactly ONE `CatalogSession` and use it for the namespace listing and every table's load, so a request runs one OAuth2 grant and one `/v1/config` lookup whatever the table count
+* *AND* an empty namespace SHALL still cost that one session, because only a catalog request can show that the namespace is empty: ONE grant under OAuth2 client-credentials and ZERO under the no-auth and static-token modes
 * *AND* a table the catalog reports as not a loadable Iceberg table SHALL still be skipped with the same warning and SHALL NOT abort the enumeration, routed into `CatalogListing.skipped`, so the non-Iceberg-table skip behavior is unchanged
-* *AND* an OAuth2 grant failure SHALL surface once, before the per-table loop, instead of once at the first table, because the session is built ahead of the enumeration
+* *AND* an OAuth2 grant failure SHALL surface once, before the namespace listing
 * *AND* the enumerated tables, each table's resolved column list, and its Exasol type mapping MUST NOT depend on how many sessions the enumeration builds
 
 ### Scenario: CatalogSession is public and every file-resolution entry point takes one
@@ -91,6 +89,6 @@ The adapter builds the catalog HTTP state once per pushdown request and reuses i
 
 * *GIVEN* an Iceberg REST namespace with descendant namespaces, and a partial refresh per `vs-adapter/refresh-and-set-properties`
 * *WHEN* the Iceberg REST client lists the namespace's identifiers and then loads the tables the adapter selects
-* *THEN* the identifier listing SHALL call only the namespace and table listing endpoints, besides the listing handshake this Background records, and SHALL issue no `loadTable` GET
-* *AND* the load SHALL build exactly ONE `CatalogSession`, issue one `loadTable` GET per given identifier through the load helper the full listing uses, and build NO session for an empty batch
+* *THEN* the identifier listing SHALL call only the namespace and table listing endpoints, besides the session's grant and `/v1/config` lookup, and SHALL issue no `loadTable` GET
+* *AND* the load SHALL reuse the listing's `CatalogSession` and issue one `loadTable` GET per given identifier through the load helper the full listing uses
 * *AND* a table the catalog reports as not a loadable Iceberg table SHALL be skipped with the `NotLoadableIcebergTable` reason the full listing gives it, and any other load failure SHALL fail the load

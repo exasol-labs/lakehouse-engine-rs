@@ -302,10 +302,13 @@ async fn assumed_session_signs_load_table_and_namespace_enumeration() {
         load_table_any_auth(&session, &catalog, &session_creds)
             .await
             .expect("the session-signed loadTable must succeed");
+        let enumeration_session =
+            CatalogSession::resolve(&enumeration_uri, WAREHOUSE, &session_creds)
+                .await
+                .expect("a SigV4 session resolves without any network access");
         crate::namespace::list_namespace_tables(
-            &enumeration_uri,
+            &enumeration_session,
             &["db".to_string()],
-            &static_backend(),
             &session_creds,
         )
         .await

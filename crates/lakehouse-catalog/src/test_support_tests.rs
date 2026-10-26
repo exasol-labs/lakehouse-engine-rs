@@ -26,21 +26,6 @@ pub(crate) fn base_creds() -> ConnectionCreds {
     }
 }
 
-pub(crate) fn static_storage() -> StorageProps {
-    StorageProps {
-        endpoint: "https://s3.amazonaws.com".into(),
-        region: "us-east-1".into(),
-        access_key: "STATIC_AK_SENTINEL".into(),
-        secret_key: "STATIC_SK_SENTINEL".into(),
-        path_style: false,
-        ..Default::default()
-    }
-}
-
-pub(crate) fn static_backend() -> StorageBackend {
-    StorageBackend::S3(static_storage())
-}
-
 pub(crate) fn s3_payload(backend: StorageBackend) -> StorageProps {
     match backend {
         StorageBackend::S3(props) => props,

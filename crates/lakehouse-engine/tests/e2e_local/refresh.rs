@@ -117,7 +117,12 @@ async fn ensure_id_val_table(
 }
 
 /// Collision detection runs before any per-table resolution, so no data file is needed.
-async fn create_empty_table(catalog: &impl Catalog, ns: &NamespaceIdent, table_name: &str) {
+async fn create_empty_table(
+    catalog: &impl Catalog,
+    ns: &NamespaceIdent,
+    table_name: &str,
+    schema: IcebergSchema,
+) {
     if !catalog
         .namespace_exists(ns)
         .await
@@ -135,7 +140,7 @@ async fn create_empty_table(catalog: &impl Catalog, ns: &NamespaceIdent, table_n
     }
     let creation = TableCreation::builder()
         .name(table_name.to_string())
-        .schema(id_val_schema(0))
+        .schema(schema)
         .partition_spec(UnboundPartitionSpec::builder().with_spec_id(0).build())
         .properties(HashMap::new())
         .build();
@@ -174,6 +179,7 @@ async fn drop_table_ignoring_missing(
 /// Scenario: Refresh re-enumerates the namespace and returns a refresh response
 /// Scenario: Create virtual schema records each table's catalog identifier in the table's adapterNotes
 /// Scenario: Refresh rebuilds every identifier note and preserves other adapter notes
+/// Scenario: Enumeration fans out concurrently and loads only the current schema
 #[test]
 fn refresh_reenumerates_namespace() {
     stack();
@@ -185,9 +191,50 @@ fn refresh_reenumerates_namespace() {
     rt.block_on(drop_table_if_exists(&catalog, &reenum_ns, "t_new"));
 
     rt.block_on(ensure_id_val_table(&catalog, NS_REENUM, "t_orig", 1, 10.0));
+    // More tables than the catalog fan-out, in sibling and nested namespaces, each with its own
+    // column, so a load answered for the wrong table would declare the wrong column.
+    let fan_out: Vec<(Vec<&str>, String)> = (0..20)
+        .map(|i| {
+            let below: Vec<&str> = match i {
+                0..10 => vec![],
+                10..15 => vec!["a"],
+                15..18 => vec!["a", "b"],
+                _ => vec!["c"],
+            };
+            (below, format!("w{i:02}"))
+        })
+        .collect();
+    for (below, table) in &fan_out {
+        let ns = NamespaceIdent::from_strs(std::iter::once(NS_REENUM).chain(below.iter().copied()))
+            .expect("build fan-out namespace");
+        let column = format!("c_{table}");
+        rt.block_on(create_empty_table(
+            &catalog,
+            &ns,
+            table,
+            schema_of(0, &[long_field(1, &column, false)]),
+        ));
+    }
 
     let mut conn = exa_conn();
     create_virtual_schema(&mut conn, "REFRESH_REENUM_VS", NS_REENUM);
+    for (below, table) in &fan_out {
+        let exasol_name = below
+            .iter()
+            .copied()
+            .chain([table.as_str()])
+            .collect::<Vec<_>>()
+            .join("__");
+        let columns: Vec<String> = declared_types(&mut conn, "REFRESH_REENUM_VS", &exasol_name)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            columns,
+            [format!("C_{}", table.to_uppercase())],
+            "{exasol_name} must declare its own column"
+        );
+    }
 
     let id = conn.query_scalar_i64(&format!(
         "SELECT id FROM {}",
@@ -620,8 +667,18 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
     rt.block_on(drop_table_if_exists(&catalog, &top_ns, "eu__orders"));
     rt.block_on(drop_table_if_exists(&catalog, &eu_ns, "orders"));
 
-    rt.block_on(create_empty_table(&catalog, &top_ns, "baseline"));
-    rt.block_on(create_empty_table(&catalog, &eu_ns, "orders"));
+    rt.block_on(create_empty_table(
+        &catalog,
+        &top_ns,
+        "baseline",
+        id_val_schema(0),
+    ));
+    rt.block_on(create_empty_table(
+        &catalog,
+        &eu_ns,
+        "orders",
+        id_val_schema(0),
+    ));
 
     let mut conn = exa_conn();
     create_virtual_schema(&mut conn, "REFRESH_COLLISION_VS", NS_COLLISION);
@@ -642,7 +699,12 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
     );
 
     // Direct `eu__orders` and descendant `eu.orders` both flatten to `EU__ORDERS`.
-    rt.block_on(create_empty_table(&catalog, &top_ns, "eu__orders"));
+    rt.block_on(create_empty_table(
+        &catalog,
+        &top_ns,
+        "eu__orders",
+        id_val_schema(0),
+    ));
 
     let refresh_resp = conn.try_execute("ALTER VIRTUAL SCHEMA REFRESH_COLLISION_VS REFRESH");
     assert_eq!(

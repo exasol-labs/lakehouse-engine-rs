@@ -278,7 +278,7 @@ async fn an_iceberg_column_carries_its_iceberg_source_type() {
 #[derive(Default)]
 struct RequestLog {
     oauth_grants: usize,
-    load_table_names: Vec<String>,
+    load_requests: Vec<String>,
 }
 
 /// Responses close the connection so a single-threaded accept loop serves the
@@ -335,8 +335,8 @@ async fn spawn_mock_catalog(
                 server_log
                     .lock()
                     .unwrap()
-                    .load_table_names
-                    .push(table.to_string());
+                    .load_requests
+                    .push(request.to_string());
                 if server_error.iter().any(|t| t == table) {
                     ("500 Internal Server Error", String::new())
                 } else if not_loadable.iter().any(|t| t == table) {
@@ -409,8 +409,7 @@ fn oauth_creds() -> ConnectionCreds {
 /// Scenario: A scoped refresh lists Iceberg identifiers and loads the requested tables on one session
 #[tokio::test]
 async fn empty_namespace_builds_no_session_and_no_grant() {
-    let client =
-        IcebergRestCatalogClient::new("http://127.0.0.1:1".into(), static_backend(), oauth_creds());
+    let client = IcebergRestCatalogClient::new("http://127.0.0.1:1".into(), oauth_creds());
 
     let listing = client
         .resolve_listing(&[])
@@ -427,7 +426,7 @@ async fn empty_namespace_builds_no_session_and_no_grant() {
 #[tokio::test]
 async fn list_tables_over_empty_namespace_lists_nothing() {
     let (uri, log) = spawn_mock_catalog(&["sales"], &[], &[], &[]).await;
-    let client = IcebergRestCatalogClient::new(uri, static_backend(), oauth_creds());
+    let client = IcebergRestCatalogClient::new(uri, oauth_creds());
 
     let listing = client
         .list_tables(&["sales".to_string()])
@@ -439,7 +438,7 @@ async fn list_tables_over_empty_namespace_lists_nothing() {
     assert_eq!(
         log.lock().unwrap().oauth_grants,
         1,
-        "only the enumeration grant; the empty load batch adds no session grant"
+        "the listing resolves the one session"
     );
 }
 
@@ -448,7 +447,11 @@ async fn list_tables_over_empty_namespace_lists_nothing() {
 async fn enumeration_builds_exactly_one_session() {
     let (uri, log) =
         spawn_mock_catalog(&["sales"], &["orders", "customers", "returns"], &[], &[]).await;
-    let client = IcebergRestCatalogClient::new(uri, static_backend(), oauth_creds());
+    let creds = ConnectionCreds {
+        use_vended_credentials: true,
+        ..oauth_creds()
+    };
+    let client = IcebergRestCatalogClient::new(uri, creds);
 
     let listing = client
         .list_tables(&["sales".to_string()])
@@ -468,15 +471,28 @@ async fn enumeration_builds_exactly_one_session() {
     }
     assert_eq!(
         log.lock().unwrap().oauth_grants,
-        2,
-        "one enumeration grant + one load-batch grant (the single reused session); per-table loads would be four"
+        1,
+        "the listing and every load share one session"
     );
+    for request in &log.lock().unwrap().load_requests {
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(
+            request_line.contains("?snapshots=refs "),
+            "a schema load asks for the referenced snapshots only: {request_line}"
+        );
+        assert!(
+            !request
+                .to_ascii_lowercase()
+                .contains("x-iceberg-access-delegation"),
+            "a schema load asks for no delegated access: {request}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
     let (uri, _log) = spawn_mock_catalog(&["sales"], &["orders", "customers"], &[], &[]).await;
-    let client = IcebergRestCatalogClient::new(uri, static_backend(), creds_no_auth());
+    let client = IcebergRestCatalogClient::new(uri, creds_no_auth());
 
     let listing = client
         .list_tables(&["sales".to_string()])
@@ -508,7 +524,7 @@ async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
 #[tokio::test]
 async fn rest_listing_projects_the_loaded_metadata_into_the_neutral_table() {
     let (uri, _log) = spawn_mock_catalog(&["sales"], &["orders"], &[], &[]).await;
-    let client = IcebergRestCatalogClient::new(uri, static_backend(), creds_no_auth());
+    let client = IcebergRestCatalogClient::new(uri, creds_no_auth());
     let ident = CatalogTableIdent {
         namespace: vec!["sales".to_string()],
         name: "orders".to_string(),
@@ -552,7 +568,7 @@ async fn rest_listing_projects_the_loaded_metadata_into_the_neutral_table() {
 async fn unloadable_table_is_reported_skipped_not_failed() {
     let (uri, _log) =
         spawn_mock_catalog(&["prod"], &["orders", "hive_events"], &["hive_events"], &[]).await;
-    let client = IcebergRestCatalogClient::new(uri, static_backend(), creds_no_auth());
+    let client = IcebergRestCatalogClient::new(uri, creds_no_auth());
 
     let listing = client
         .list_tables(&["prod".to_string()])
@@ -585,7 +601,7 @@ async fn unloadable_table_is_reported_skipped_not_failed() {
 async fn non_404_load_failure_aborts_the_batch() {
     let (uri, _log) =
         spawn_mock_catalog(&["prod"], &["orders", "hive_events"], &[], &["hive_events"]).await;
-    let client = IcebergRestCatalogClient::new(uri, static_backend(), creds_no_auth());
+    let client = IcebergRestCatalogClient::new(uri, creds_no_auth());
 
     let result = client.list_tables(&["prod".to_string()]).await;
 

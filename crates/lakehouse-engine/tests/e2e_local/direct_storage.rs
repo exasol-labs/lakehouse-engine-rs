@@ -11,8 +11,8 @@ use crate::common::e2e_harness::{
 };
 use crate::common::exasol_ws::ExaConn;
 use crate::common::raw_parquet::{
-    delete_fixture_object, delete_fixture_prefix, encode_parquet_message, get_fixture_object,
-    put_fixture_object, write_parquet_column, write_parquet_fixture,
+    delete_fixture_object, delete_fixture_prefix, encode_parquet_message, encode_parquet_with,
+    get_fixture_object, put_fixture_object, write_parquet_column, write_parquet_fixture,
 };
 use crate::common::seed::{
     ALL_TYPES_DATE_DAYS, ALL_TYPES_IDS, ALL_TYPES_IDS_TEXT, ALL_TYPES_TIME_MICROS,
@@ -41,6 +41,8 @@ use bytes::Bytes;
 use parquet::data_type::{
     ByteArray, ByteArrayType, FixedLenByteArray, FixedLenByteArrayType, Int64Type, Int96, Int96Type,
 };
+use parquet::file::metadata::KeyValue;
+use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde_json::Value as Json;
 
@@ -295,6 +297,27 @@ fn missing_col_file2() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new("A", DataType::Int64, true)]));
     RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![3i64]))])
         .expect("missing_col file2 batch construction is infallible")
+}
+
+const MANY_FILES: i64 = 20;
+
+fn own_column_file(file: i64) -> RecordBatch {
+    id_row(
+        file,
+        [(
+            Field::new(format!("C{file:02}"), DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![file * 10])) as ArrayRef,
+        )],
+    )
+}
+
+fn footer_past_the_read_hint() -> WriterProperties {
+    WriterProperties::builder()
+        .set_key_value_metadata(Some(vec![KeyValue::new(
+            "padding".to_string(),
+            "x".repeat(100_000),
+        )]))
+        .build()
 }
 
 fn incompatible_file1() -> RecordBatch {
@@ -859,6 +882,20 @@ fn write_all_fixtures() {
         missing_col_file2(),
     );
 
+    // More files than the footer fan-out, the first with the slowest footer read, so a fold in
+    // completion order would declare the columns out of listing order.
+    for file in 0..MANY_FILES {
+        let properties = if file == 0 {
+            footer_past_the_read_hint()
+        } else {
+            WriterProperties::default()
+        };
+        put_fixture_object(
+            &format!("{BASE_DIRECT}missing_col_many/file{file:02}.parquet"),
+            encode_parquet_with(&own_column_file(file), properties),
+        );
+    }
+
     write_parquet_fixture(
         &format!("{BASE_DIRECT}complex/file1.parquet"),
         complex_batch(),
@@ -1317,6 +1354,7 @@ fn widened_columns_declare_the_wider_type_and_every_row_reads_back() {
     }
 }
 
+/// Scenario: Footers fold into one schema under the proven-castable widening pairs
 #[test]
 fn missing_column_declares_the_union_and_nulls_the_absent_column() {
     setup();
@@ -1334,6 +1372,31 @@ fn missing_column_declares_the_union_and_nulls_the_absent_column() {
         "the row from the B-less file must read NULL for B"
     );
     assert_eq!(parse_int(&cols[0][2]), 3);
+
+    let expected: Vec<String> = std::iter::once("ID".to_string())
+        .chain((0..MANY_FILES).map(|file| format!("C{file:02}")))
+        .collect();
+    assert_eq!(
+        declared_columns(&mut conn, VS_DIRECT, "MISSING_COL_MANY"),
+        expected,
+        "the union declares each file's column in listing order"
+    );
+    let cols = conn.query_columns(&format!(
+        "SELECT ID, C00, C19 FROM {} ORDER BY ID",
+        vs_table(VS_DIRECT, "MISSING_COL_MANY")
+    ));
+    assert_eq!(cols[0].len(), MANY_FILES as usize);
+    for (row, id) in cols[0].iter().enumerate() {
+        let id = parse_int(id);
+        assert_eq!(id, row as i64);
+        for (column, owner) in [(1, 0), (2, 19)] {
+            if id == owner {
+                assert_eq!(parse_int(&cols[column][row]), owner * 10);
+            } else {
+                assert!(cols[column][row].is_null(), "row {id} must read NULL");
+            }
+        }
+    }
 }
 
 #[test]

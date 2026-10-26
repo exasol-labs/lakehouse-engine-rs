@@ -3,11 +3,12 @@ use crate::adapter::direct_storage_properties::join_storage_path;
 use crate::adapter::parquet_directory::{
     BinaryColumn, DirectoryOptions, ParquetDirectory, resolve_parquet_directory, store_prefix,
 };
+use crate::scan::DIRECT_STORAGE_ADMISSION_LIMIT;
 use crate::scan::spec::{LogicalField, NestedField, NestedMembers, StorageBackend};
 use crate::types::mapping::{arrow_type_to_tag, needs_json_fallback};
 use arrow::datatypes::{DataType, Field, FieldRef};
 use exasol_udf_sdk::error::UdfError;
-use futures::future::try_join_all;
+use futures::{StreamExt, TryStreamExt, stream};
 use lakehouse_catalog::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogTable, CatalogTableIdent,
     CatalogTableType, ColumnSourceType, SkipReason, SkippedTable, TableAdmission, TableFormat,
@@ -132,8 +133,11 @@ impl CatalogClient for DirectStorageCatalogClient {
     ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
         let idents = idents.to_vec();
         Box::pin(async move {
-            let admissions =
-                try_join_all(idents.into_iter().map(|ident| self.admit(ident))).await?;
+            let admits: Vec<_> = idents.into_iter().map(|ident| self.admit(ident)).collect();
+            let admissions: Vec<TableAdmission> = stream::iter(admits)
+                .buffered(DIRECT_STORAGE_ADMISSION_LIMIT)
+                .try_collect()
+                .await?;
             Ok(admissions.into_iter().collect())
         })
     }

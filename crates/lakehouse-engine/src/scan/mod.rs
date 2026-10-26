@@ -35,7 +35,8 @@ pub(crate) mod parquet_reader;
 
 mod object_store;
 pub(crate) use self::object_store::{
-    build_admission_limited_store, build_table_root_store, store_root_url,
+    DIRECT_STORAGE_ADMISSION_LIMIT, build_admission_limited_store, build_table_root_store,
+    store_root_url,
 };
 use object_store::build_session_context;
 pub(crate) use spec::{encode_file_path, reconstruct_abs_uri};

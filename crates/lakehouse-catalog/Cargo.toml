@@ -17,6 +17,7 @@ iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
 
 futures    = { workspace = true }
 serde      = { workspace = true }
+tokio      = { workspace = true, features = ["sync"] }
 serde_json = { workspace = true }
 url        = { workspace = true }
 
@@ -31,6 +32,3 @@ rustls  = { workspace = true }
 
 # AWS STS AssumeRole.
 aws-sdk-sts = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true }

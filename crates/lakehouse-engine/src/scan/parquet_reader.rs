@@ -37,11 +37,25 @@ pub(crate) struct SizedParquetReader {
     store: Arc<dyn ObjectStore>,
     path: Path,
     size: u64,
+    footer_size_hint: Option<usize>,
 }
 
 impl SizedParquetReader {
     pub(crate) fn new(store: Arc<dyn ObjectStore>, path: Path, size: u64) -> Self {
-        Self { store, path, size }
+        Self {
+            store,
+            path,
+            size,
+            footer_size_hint: None,
+        }
+    }
+
+    /// A footer no larger than the hint, length field included, is read in one GET.
+    pub(crate) fn with_footer_size_hint(self, hint: usize) -> Self {
+        Self {
+            footer_size_hint: Some(hint),
+            ..self
+        }
     }
 }
 
@@ -69,6 +83,7 @@ impl AsyncFileReader for SizedParquetReader {
     ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>>> {
         async move {
             let mut reader = ParquetMetaDataReader::new()
+                .with_prefetch_hint(self.footer_size_hint)
                 .with_metadata_options(options.map(|o| o.metadata_options().clone()));
             if let Some(options) = options {
                 reader = reader
