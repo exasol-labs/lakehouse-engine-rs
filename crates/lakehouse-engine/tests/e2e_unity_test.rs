@@ -2012,7 +2012,6 @@ fn unity_delta_pruned_queries_return_unchanged_rows() {
 
 /// Scenario: Pruning reaches every request shape and changes no result end to end
 #[test]
-
 fn unity_delta_pruned_pushdown_sql_carries_fewer_files_and_drives_the_scan_udf() {
     setup();
     let mut conn = exa_conn();
@@ -2185,7 +2184,6 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
 
 /// Scenario: Vended and static credentials resolve the same scan
 #[test]
-
 fn unity_parquet_planning_agrees_under_vended_and_static_credentials() {
     setup();
     let mut conn = exa_conn();
@@ -2350,7 +2348,6 @@ fn unity_unusable_column_mapping_metadata_refuses_only_its_column() {
 
 /// Scenario: The client carries each table's properties verbatim from the list sweep and the single-table load
 #[test]
-
 fn unity_column_mapping_property_reaches_create_and_scoped_refresh() {
     setup();
     let mut conn = exa_conn();
