@@ -80,8 +80,8 @@ The adapter signs catalog requests with AWS SigV4 when enabled and derives the G
 ### Scenario: SigV4/Glue derives the catalogs/{account-id} REST prefix on every catalog request
 
 * *GIVEN* a virtual schema whose CONNECTION credentials set `use_sigv4` to true and set `warehouse` to a bare AWS account id (e.g. `123456789012`)
-* *WHEN* the adapter issues a self-issued catalog HTTP request under SigV4, the `loadTable` GET that resolves the file list during `pushdown`, or the namespace/table list GETs that enumerate tables during `createVirtualSchema`
+* *WHEN* the adapter issues a self-issued catalog HTTP request under SigV4, the `loadTable` GET that resolves the file list during `pushdown`, or the table list GETs that enumerate tables during `createVirtualSchema`
 * *THEN* the adapter SHALL address the catalog under the REST prefix `catalogs/{warehouse}`, derived by unconditionally prepending `catalogs/` to the configured `warehouse`, so account id `123456789012` yields the path segment `catalogs/123456789012`
-* *AND* the adapter SHALL apply this identical derived prefix on both the `loadTable` path and the namespace/table enumeration path, from one shared derivation
+* *AND* the adapter SHALL apply this identical derived prefix on both the `loadTable` path and the table enumeration path, from one shared derivation
 * *AND* the adapter MUST NOT contact the `/v1/config` endpoint to resolve the prefix on the SigV4/Glue path
 * *AND* the SigV4 signing keys MUST NOT appear in any returned SQL string or error message

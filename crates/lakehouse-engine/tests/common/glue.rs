@@ -116,6 +116,10 @@ impl GlueEnv {
         format!("https://glue.{}.amazonaws.com", self.region)
     }
 
+    pub fn iceberg_rest_endpoint(&self) -> String {
+        format!("{}/iceberg", self.glue_endpoint())
+    }
+
     pub fn redact(&self, text: &str) -> String {
         redact_error_text(
             text,
@@ -268,6 +272,24 @@ impl GlueRun {
 
     pub fn database(&self) -> String {
         database_name(&self.run_id)
+    }
+
+    /// The `warehouse` an Iceberg REST CONNECTION to Glue names.
+    pub async fn catalog_id(&self) -> Result<String> {
+        let database = self.database();
+        let found = self
+            .env
+            .glue_client()
+            .get_database()
+            .name(&database)
+            .send()
+            .await
+            .with_context(|| format!("Glue GetDatabase {database}"))?;
+        found
+            .database()
+            .and_then(|db| db.catalog_id())
+            .map(str::to_string)
+            .with_context(|| format!("Glue database {database} reports no catalog id"))
     }
 
     /// The object-key prefix every fixture object of this run lives under, with its trailing `/`.
@@ -430,6 +452,12 @@ pub const SKIPPED_TABLES: [(&str, &str); 4] = [
     ),
     (PROJECTED, "projection.enabled=true"),
 ];
+
+/// Views sorting before every other table, filling the first page of a Glue listing (100 tables),
+/// so every other table sits on a later page.
+pub fn page_padding_views() -> Vec<String> {
+    (0..100).map(|i| format!("a_pad_{i:03}")).collect()
+}
 
 /// Glue's own copy of the Iceberg columns: the listing must ignore it for `metadata.json`.
 pub const STALE_GLUE_COLUMN: &str = "stale_glue_column";
@@ -770,6 +798,16 @@ pub fn glue_connection_password(env: &GlueEnv) -> CatalogConnectionPassword {
     }
 }
 
+pub fn glue_iceberg_rest_connection_password(
+    env: &GlueEnv,
+    catalog_id: &str,
+) -> CatalogConnectionPassword {
+    CatalogConnectionPassword {
+        warehouse: catalog_id.to_string(),
+        ..glue_connection_password(env)
+    }
+}
+
 /// The base identity names the role, so the adapter reaches Glue and S3 only as the role.
 pub fn glue_assume_role_connection_password(env: &GlueEnv) -> CatalogConnectionPassword {
     CatalogConnectionPassword {
@@ -855,6 +893,7 @@ pub async fn register_fixture_set(run: &GlueRun) -> Result<()> {
         register_binary_values(&writer),
         register_partitioned(&writer),
         register_metadata_only_tables(&writer),
+        register_page_padding_views(&writer),
     )?;
     Ok(())
 }
@@ -1234,13 +1273,7 @@ async fn register_metadata_only_tables(writer: &FixtureWriter<'_>) -> Result<()>
         .parameters("projection.p.type", "integer")
         .parameters("projection.p.range", "1,3")
         .partition_keys(hive_column("p", "int")?);
-    let view = TableInput::builder()
-        .name(A_VIEW)
-        .table_type(VIRTUAL_VIEW)
-        .parameters("presto_view", "true")
-        .view_original_text("/* Presto View */")
-        .view_expanded_text("/* Presto View */")
-        .storage_descriptor(StorageDescriptor::builder().columns(id_column()?).build());
+    let view = view(A_VIEW)?;
     let orc = id_table(ORC_TABLE, formats_of(ORC_INPUT_FORMAT))?;
     // A Parquet storage descriptor, so only the table_type check can skip it.
     let delta = id_table(DELTA_TABLE, parquet_formats())?.parameters("table_type", "DELTA");
@@ -1256,6 +1289,35 @@ async fn register_metadata_only_tables(writer: &FixtureWriter<'_>) -> Result<()>
             .map(|input| async { writer.create_table(input?).await }),
     )
     .await?;
+    Ok(())
+}
+
+fn view(name: &str) -> Result<TableInputBuilder> {
+    Ok(TableInput::builder()
+        .name(name)
+        .table_type(VIRTUAL_VIEW)
+        .parameters("presto_view", "true")
+        .view_original_text("/* Presto View */")
+        .view_expanded_text("/* Presto View */")
+        .storage_descriptor(
+            StorageDescriptor::builder()
+                .columns(hive_column("id", "bigint")?)
+                .build(),
+        ))
+}
+
+/// Bounded, because Glue throttles a burst of `CreateTable` calls.
+async fn register_page_padding_views(writer: &FixtureWriter<'_>) -> Result<()> {
+    stream::iter(page_padding_views())
+        .map(|name| async move {
+            let input = view(&name)?
+                .build()
+                .context("describe a page-padding view")?;
+            writer.create_table(input).await
+        })
+        .buffer_unordered(8)
+        .try_collect::<Vec<_>>()
+        .await?;
     Ok(())
 }
 
