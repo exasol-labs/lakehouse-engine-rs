@@ -847,8 +847,6 @@ fn parquet_column_source_type_reads_its_tag_in_lockstep_with_arrow_to_exasol_typ
         ("float64", "DOUBLE PRECISION"),
         ("utf8", "VARCHAR(2000000)"),
         ("date32", "DATE"),
-        ("timestamp_us", "TIMESTAMP"),
-        ("timestamptz_ns", "TIMESTAMP"),
         ("decimal128(10,2)", "DECIMAL(10,2)"),
     ] {
         assert_eq!(
@@ -866,6 +864,32 @@ fn parquet_column_source_type_reads_its_tag_in_lockstep_with_arrow_to_exasol_typ
             ),
             arrow_to_exasol_type(&arrow_type_from_tag(tag)),
             "tag `{tag}` must resolve through the same parser both routes share"
+        );
+    }
+}
+
+#[test]
+fn parquet_timestamp_tag_declares_its_unit_through_the_engine_clamp() {
+    for (tag, declared) in [
+        ("timestamp_s", "TIMESTAMP"),
+        ("timestamp_ms", "TIMESTAMP"),
+        ("timestamp_us", "TIMESTAMP(6)"),
+        ("timestamp_ns", "TIMESTAMP(9)"),
+        ("timestamptz_s", "TIMESTAMP"),
+        ("timestamptz_ms", "TIMESTAMP"),
+        ("timestamptz_us", "TIMESTAMP(6)"),
+        ("timestamptz_ns", "TIMESTAMP(9)"),
+    ] {
+        let source = ColumnSourceType::Parquet(tag.to_string());
+        assert_eq!(
+            column_source_type_to_exasol(&source, EngineTimestampSupport::DeclaredPrecision),
+            declared,
+            "tag `{tag}` on an engine honoring the declared precision"
+        );
+        assert_eq!(
+            column_source_type_to_exasol(&source, EngineTimestampSupport::MillisecondOnly),
+            "TIMESTAMP",
+            "tag `{tag}` on a millisecond-only engine"
         );
     }
 }

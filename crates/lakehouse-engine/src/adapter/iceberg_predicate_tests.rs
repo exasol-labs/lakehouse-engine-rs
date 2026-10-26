@@ -209,6 +209,18 @@ fn leaf_date_translates() {
 }
 
 #[test]
+fn timestamp_literal_finer_than_microseconds_yields_no_datum() {
+    for prim in [PrimitiveType::Timestamp, PrimitiveType::TimestampNs] {
+        let at = |value| json!({"type": "literal_timestamp", "value": value});
+        assert_eq!(
+            literal_to_datum(&at("2024-01-15 10:30:00.123456789"), &prim),
+            None
+        );
+        assert!(literal_to_datum(&at("2024-01-15 10:30:00.123456000"), &prim).is_some());
+    }
+}
+
+#[test]
 fn and_with_untranslatable_child_keeps_translatable_conjunct() {
     let translatable = json!({
         "type": "predicate_equal",

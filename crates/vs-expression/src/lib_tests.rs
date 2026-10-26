@@ -86,6 +86,23 @@ fn renders_far_future_timestamp_literal() {
 }
 
 #[test]
+fn timestamp_literal_with_sub_microsecond_digits_renders_nanoseconds() {
+    for (value, unit) in [
+        ("2025-06-01 00:00:00.123456789", "Nanosecond"),
+        ("2025-06-01 00:00:00.1234567", "Nanosecond"),
+        ("2025-06-01 00:00:00.123456000", "Microsecond"),
+        ("2025-06-01 00:00:00.123456", "Microsecond"),
+    ] {
+        let expr = json!({"type": "literal_timestamp", "value": value});
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            format!("arrow_cast('{value}', 'Timestamp({unit}, None)')"),
+            "literal {value}"
+        );
+    }
+}
+
+#[test]
 fn renders_simple_equality() {
     let expr = json!({
         "type": "predicate_equal",

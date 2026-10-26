@@ -2346,6 +2346,127 @@ fn type_rewrite_pipeline_runs_like_guard() {
     );
 }
 
+fn timestamp_comparison(op: &str, left: Json, right: Json) -> Json {
+    serde_json::json!({"type": op, "left": left, "right": right})
+}
+
+fn ts_column() -> Json {
+    serde_json::json!({"type": "column", "name": "ts"})
+}
+
+fn ts_literal(value: &str) -> Json {
+    serde_json::json!({"type": "literal_timestamp", "value": value})
+}
+
+#[test]
+fn overprecise_timestamp_literal_is_rewritten_to_the_column_precision() {
+    let col_types = vec![("TS".to_string(), "TIMESTAMP(3)".to_string())];
+    let lit = ts_literal("2025-06-01 00:00:00.123500");
+    let floor = ts_literal("2025-06-01 00:00:00.123");
+    for (op, mirrored, want_op, want_right) in [
+        ("predicate_equal", false, "predicate_notequal", ts_column()),
+        ("predicate_notequal", false, "predicate_equal", ts_column()),
+        (
+            "predicate_less",
+            false,
+            "predicate_lessequal",
+            floor.clone(),
+        ),
+        (
+            "predicate_lessequal",
+            false,
+            "predicate_lessequal",
+            floor.clone(),
+        ),
+        (
+            "predicate_greater",
+            false,
+            "predicate_greater",
+            floor.clone(),
+        ),
+        (
+            "predicate_greaterequal",
+            false,
+            "predicate_greater",
+            floor.clone(),
+        ),
+        ("predicate_less", true, "predicate_greater", floor.clone()),
+        (
+            "predicate_greaterequal",
+            true,
+            "predicate_lessequal",
+            floor.clone(),
+        ),
+    ] {
+        let filter = if mirrored {
+            timestamp_comparison(op, lit.clone(), ts_column())
+        } else {
+            timestamp_comparison(op, ts_column(), lit.clone())
+        };
+        assert_eq!(
+            apply_type_rewrites(&filter, &col_types),
+            Some(timestamp_comparison(want_op, ts_column(), want_right)),
+            "{op} mirrored={mirrored}"
+        );
+    }
+}
+
+#[test]
+fn timestamp_literal_within_the_column_precision_is_unchanged() {
+    for (declared, value) in [
+        ("TIMESTAMP", "2025-06-01 00:00:00.123000"),
+        ("TIMESTAMP(6)", "2025-06-01 00:00:00.123456"),
+        ("TIMESTAMP(9)", "2025-06-01 00:00:00.123456789"),
+        ("TIMESTAMP(3)", "2025-06-01 00:00:00"),
+    ] {
+        let col_types = vec![("TS".to_string(), declared.to_string())];
+        let filter = timestamp_comparison("predicate_equal", ts_column(), ts_literal(value));
+        assert_eq!(
+            apply_type_rewrites(&filter, &col_types),
+            Some(filter.clone()),
+            "{declared} = {value}"
+        );
+    }
+}
+
+#[test]
+fn between_and_in_with_an_overprecise_timestamp_expand_to_rewritten_comparisons() {
+    let col_types = vec![("TS".to_string(), "TIMESTAMP(3)".to_string())];
+    let fits = || ts_literal("2025-06-01 00:00:00.122");
+    let over = || ts_literal("2025-06-01 00:00:00.123500");
+    let floor = || ts_literal("2025-06-01 00:00:00.123");
+
+    let between = serde_json::json!({
+        "type": "predicate_between", "expression": ts_column(), "left": fits(), "right": over()
+    });
+    assert_eq!(
+        apply_type_rewrites(&between, &col_types),
+        Some(serde_json::json!({"type": "predicate_and", "expressions": [
+            timestamp_comparison("predicate_greaterequal", ts_column(), fits()),
+            timestamp_comparison("predicate_lessequal", ts_column(), floor()),
+        ]}))
+    );
+
+    let in_list = serde_json::json!({
+        "type": "predicate_in_constlist", "expression": ts_column(), "arguments": [over(), fits()]
+    });
+    assert_eq!(
+        apply_type_rewrites(&in_list, &col_types),
+        Some(serde_json::json!({"type": "predicate_or", "expressions": [
+            timestamp_comparison("predicate_notequal", ts_column(), ts_column()),
+            timestamp_comparison("predicate_equal", ts_column(), fits()),
+        ]}))
+    );
+
+    let fitting_in = serde_json::json!({
+        "type": "predicate_in_constlist", "expression": ts_column(), "arguments": [fits()]
+    });
+    assert_eq!(
+        apply_type_rewrites(&fitting_in, &col_types),
+        Some(fitting_in.clone())
+    );
+}
+
 /// Scenario: LIKE on an integer column declines the whole filter
 #[test]
 fn like_guard_integer_subject_declines() {

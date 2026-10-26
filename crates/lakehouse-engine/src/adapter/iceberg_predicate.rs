@@ -6,6 +6,7 @@ use iceberg::spec::{Datum, PrimitiveType, Schema};
 use serde_json::Value as Json;
 
 use crate::scan::spec::LogicalField;
+use crate::types::mapping::timestamp_literal_digits;
 
 /// Resolves a filter column through its declared field id to the field the scanned schema carries
 /// under that id: bounds are stored by field id, so a rename must not prune by another's bounds.
@@ -73,14 +74,15 @@ fn literal_to_datum(lit: &Json, prim: &PrimitiveType) -> Option<Datum> {
             Datum::date_from_str(s).ok()
         }
 
+        // `Datum` parses at most microseconds; a truncated finer literal would prune matching files.
         ("literal_timestamp", PrimitiveType::Timestamp | PrimitiveType::TimestampNs) => {
             let s = lit.get("value")?.as_str()?;
-            parse_timestamp_no_tz(s, prim)
+            (timestamp_literal_digits(s) <= 6).then(|| parse_timestamp_no_tz(s, prim))?
         }
 
         ("literal_timestamp_utc", PrimitiveType::Timestamptz | PrimitiveType::TimestamptzNs) => {
             let s = lit.get("value")?.as_str()?;
-            parse_timestamptz(s, prim)
+            (timestamp_literal_digits(s) <= 6).then(|| parse_timestamptz(s, prim))?
         }
 
         _ => None,
