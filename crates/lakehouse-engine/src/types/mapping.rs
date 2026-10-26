@@ -174,6 +174,13 @@ pub enum TimestampPrecision {
     Nanosecond,
 }
 
+/// Significant fraction digits of an Exasol timestamp literal; trailing zeros add no precision.
+pub fn timestamp_literal_digits(literal: &str) -> usize {
+    literal
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.trim_end_matches('0').len())
+}
+
 impl TimestampPrecision {
     pub fn declaration(self) -> &'static str {
         match self {
@@ -188,6 +195,15 @@ impl TimestampPrecision {
             Self::Millisecond => TimeUnit::Millisecond,
             Self::Microsecond => TimeUnit::Microsecond,
             Self::Nanosecond => TimeUnit::Nanosecond,
+        }
+    }
+
+    /// `Second` floors at millisecond like [`Self::from_declared_digits`].
+    pub fn from_arrow_unit(unit: TimeUnit) -> Self {
+        match unit {
+            TimeUnit::Second | TimeUnit::Millisecond => Self::Millisecond,
+            TimeUnit::Microsecond => Self::Microsecond,
+            TimeUnit::Nanosecond => Self::Nanosecond,
         }
     }
 
@@ -394,7 +410,13 @@ pub(crate) fn column_source_type_to_exasol(
             unity_spark_field(type_json.as_deref()).map(|field| field.data_type),
             engine,
         ),
-        ColumnSourceType::Parquet(tag) => arrow_to_exasol_type(&arrow_type_from_tag(tag)),
+        ColumnSourceType::Parquet(tag) => match arrow_type_from_tag(tag) {
+            DataType::Timestamp(unit, _) => engine
+                .clamp(TimestampPrecision::from_arrow_unit(unit))
+                .declaration()
+                .to_string(),
+            other => arrow_to_exasol_type(&other),
+        },
         ColumnSourceType::Glue { hive_type } => {
             spark_type_to_exasol(parse_hive_type(hive_type), engine)
         }

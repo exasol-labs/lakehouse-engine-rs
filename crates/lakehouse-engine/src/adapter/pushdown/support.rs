@@ -8,7 +8,9 @@ use crate::scan::spec::{
     AggregatePlan, CommonScanSpec, FileEntry, ProjectionItem, ScanSpec, ScanStorage,
     StorageBackend, render_order_by_clause,
 };
-use crate::types::mapping::{ExaTypeClass, classify_exa_type, exasol_type_from_json};
+use crate::types::mapping::{
+    ExaTypeClass, classify_exa_type, exasol_type_from_json, timestamp_literal_digits,
+};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
@@ -629,7 +631,115 @@ fn coerce_string_position_arg(arg: &Json, col_types: &[(String, String)]) -> Opt
 pub(super) fn apply_type_rewrites(expr: &Json, col_types: &[(String, String)]) -> Option<Json> {
     let expr = like_subject_type_guard(expr, col_types)?;
     let expr = string_function_arg_type_guard(&expr, col_types)?;
+    let expr = rewrite_overprecise_timestamp_comparisons(&expr, col_types)?;
     Some(rewrite_decimal_stringifications(&expr, col_types))
+}
+
+/// DataFusion truncates a timestamp literal to its column's unit, while Exasol compares at full
+/// precision (#461). Workaround for apache/datafusion#22142, fixed by apache/datafusion#22906.
+fn rewrite_overprecise_timestamp_comparisons(
+    node: &Json,
+    col_types: &[(String, String)],
+) -> Option<Json> {
+    rewrite_expr_tree(node, &|out: &Json| {
+        Some(rewrite_timestamp_comparison(out, col_types).unwrap_or_else(|| out.clone()))
+    })
+}
+
+/// `None` leaves the node unchanged.
+fn rewrite_timestamp_comparison(node: &Json, col_types: &[(String, String)]) -> Option<Json> {
+    let compare = |op: &str, column: &Json, literal: &Json| {
+        let node = serde_json::json!({"type": op, "left": column, "right": literal});
+        rewrite_timestamp_comparison(&node, col_types).unwrap_or(node)
+    };
+    match node.get("type")?.as_str()? {
+        "predicate_between" => {
+            let column = node.get("expression")?;
+            let (low, high) = (node.get("left")?, node.get("right")?);
+            timestamp_literal_floor(column, low, col_types)
+                .or_else(|| timestamp_literal_floor(column, high, col_types))?;
+            Some(serde_json::json!({"type": "predicate_and", "expressions": [
+                compare("predicate_greaterequal", column, low),
+                compare("predicate_lessequal", column, high),
+            ]}))
+        }
+        "predicate_in_constlist" => {
+            let column = node.get("expression")?;
+            let values = node.get("arguments")?.as_array()?;
+            values
+                .iter()
+                .find_map(|value| timestamp_literal_floor(column, value, col_types))?;
+            let expressions: Vec<Json> = values
+                .iter()
+                .map(|value| compare("predicate_equal", column, value))
+                .collect();
+            Some(serde_json::json!({"type": "predicate_or", "expressions": expressions}))
+        }
+        op => {
+            let (left, right) = (node.get("left")?, node.get("right")?);
+            let (column, floor, mirrored) = match timestamp_literal_floor(left, right, col_types) {
+                Some(floor) => (left, floor, false),
+                None => (
+                    right,
+                    timestamp_literal_floor(right, left, col_types)?,
+                    true,
+                ),
+            };
+            let op = match (op, mirrored) {
+                ("predicate_less", true) => "predicate_greater",
+                ("predicate_lessequal", true) => "predicate_greaterequal",
+                ("predicate_greater", true) => "predicate_less",
+                ("predicate_greaterequal", true) => "predicate_lessequal",
+                (op, _) => op,
+            };
+            // `col <> col` and `col = col` keep a NULL column NULL, so an enclosing NOT stays exact.
+            let (op, right) = match op {
+                "predicate_equal" => ("predicate_notequal", column.clone()),
+                "predicate_notequal" => ("predicate_equal", column.clone()),
+                "predicate_less" | "predicate_lessequal" => ("predicate_lessequal", floor),
+                "predicate_greater" | "predicate_greaterequal" => ("predicate_greater", floor),
+                _ => return None,
+            };
+            Some(serde_json::json!({"type": op, "left": column, "right": right}))
+        }
+    }
+}
+
+/// `None` when the literal fits the column's declared precision.
+fn timestamp_literal_floor(
+    column: &Json,
+    literal: &Json,
+    col_types: &[(String, String)],
+) -> Option<Json> {
+    let is = |node: &Json, kind: &str| node.get("type").and_then(|t| t.as_str()) == Some(kind);
+    if !is(column, "column") || !is(literal, "literal_timestamp") {
+        return None;
+    }
+    let digits = declared_timestamp_digits(column_exa_type(column, col_types)?)?;
+    let value = literal.get("value")?.as_str()?;
+    if timestamp_literal_digits(value) <= digits {
+        return None;
+    }
+    let (instant, fraction) = value.split_once('.')?;
+    let floor = match digits {
+        0 => instant.to_string(),
+        d => format!("{instant}.{}", &fraction[..d]),
+    };
+    Some(serde_json::json!({"type": "literal_timestamp", "value": floor}))
+}
+
+/// Exasol's bare `TIMESTAMP` is `TIMESTAMP(3)`.
+fn declared_timestamp_digits(exa_type: &str) -> Option<usize> {
+    let upper = exa_type.trim().to_uppercase();
+    if upper == "TIMESTAMP" {
+        return Some(3);
+    }
+    upper
+        .strip_prefix("TIMESTAMP(")?
+        .strip_suffix(')')?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Depth-insensitive: a nested aggregate is renderable SQL, so only this probe keeps

@@ -3,7 +3,8 @@
 use crate::scan::DIRECT_STORAGE_ADMISSION_LIMIT;
 use crate::scan::parquet_reader::SizedParquetReader;
 use crate::types::widening::widen;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use datafusion::datasource::physical_plan::parquet::Int96Coercer;
 use exasol_udf_sdk::error::UdfError;
 use futures::{StreamExt, TryStreamExt, stream};
 use lakehouse_catalog::HIVE_DEFAULT_PARTITION;
@@ -387,15 +388,33 @@ async fn read_footer(
     path: StorePath,
     size: u64,
 ) -> Result<ArrowReaderMetadata, UdfError> {
+    let footer_error = |e| {
+        UdfError::User(format!(
+            "failed to read the Parquet footer of '{path}': {e}"
+        ))
+    };
     let mut reader =
         SizedParquetReader::new(store, path.clone(), size).with_footer_size_hint(FOOTER_SIZE_HINT);
-    ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::new())
+    let metadata = ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::new())
         .await
-        .map_err(|e| {
-            UdfError::User(format!(
-                "failed to read the Parquet footer of '{path}': {e}"
-            ))
-        })
+        .map_err(footer_error)?;
+    // Mirrors the scan's `int96_coerced_parquet_format`, so an INT96 column is declared at the
+    // unit the scan emits, not at the nanosecond unit far-future INT96 values overflow.
+    let coerced = Int96Coercer::new(
+        metadata.parquet_schema(),
+        metadata.schema(),
+        &TimeUnit::Microsecond,
+    )
+    .with_timezone(Some("UTC".into()))
+    .coerce();
+    match coerced {
+        None => Ok(metadata),
+        Some(schema) => ArrowReaderMetadata::try_new(
+            Arc::clone(metadata.metadata()),
+            ArrowReaderOptions::new().with_schema(Arc::new(schema)),
+        )
+        .map_err(footer_error),
+    }
 }
 
 /// One column of the folded schema, with the file that contributed its current type so a later

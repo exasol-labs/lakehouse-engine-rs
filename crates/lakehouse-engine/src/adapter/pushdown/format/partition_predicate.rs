@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::scan::{non_null_partition_value, partition_scalar};
+use crate::types::mapping::timestamp_literal_digits;
 
 use super::filter_json::{
     Comparison, between_operands, comparison_operands, in_operands, non_empty_str, operands,
@@ -303,14 +304,13 @@ fn exact_numeral(value: &Json, scale: i8) -> Option<String> {
 /// The string cast truncates a fraction finer than `unit`, so such a literal does not convert.
 fn exact_timestamp(value: &Json, unit: TimeUnit) -> Option<String> {
     let text = non_empty_str(value)?;
-    let fraction = text.rsplit_once('.').map_or("", |(_, fraction)| fraction);
     let unit_digits = match unit {
         TimeUnit::Second => 0,
         TimeUnit::Millisecond => 3,
         TimeUnit::Microsecond => 6,
         TimeUnit::Nanosecond => 9,
     };
-    (fraction.trim_end_matches('0').len() <= unit_digits).then(|| text.to_string())
+    (timestamp_literal_digits(text) <= unit_digits).then(|| text.to_string())
 }
 
 #[cfg(test)]
