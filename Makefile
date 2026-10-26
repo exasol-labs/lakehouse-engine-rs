@@ -162,10 +162,14 @@ bucketfs-upload-so: $(VS_SO)
 fmt:
 	cargo fmt
 
+# CI's lint job runs `make fmt-check lint`, so these recipes are the lint gate.
+fmt-check:
+	cargo fmt --all -- --check
+
 # The second run lints the E2E targets, which `required-features` hides from the first.
 lint:
-	cargo clippy --all-targets
-	cargo clippy -p lakehouse-engine --all-targets --all-features
+	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy -p lakehouse-engine --all-targets --all-features -- -D warnings
 
 # MUST stay flag-identical to the `cargo llvm-cov` step in ci.yml's unit-tests
 # job, which is the authority. Not a prerequisite of `test`: llvm-cov relinks
@@ -222,4 +226,4 @@ test-e2e-unity: cross-udf-build
 	$(MAKE) unity-up
 	cargo test -p lakehouse-engine --features unity-e2e --test e2e_unity_test -- --test-threads=1
 
-.PHONY: cross-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure test-e2e-glue install-slc print-slc-version bucketfs-upload-so fmt lint coverage bench test-install lint-install unity-up unity-down test-e2e-unity test-lakekeeper-scripts test-lakekeeper-local lint-lakekeeper-scripts
+.PHONY: cross-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure test-e2e-glue install-slc print-slc-version bucketfs-upload-so fmt fmt-check lint coverage bench test-install lint-install unity-up unity-down test-e2e-unity test-lakekeeper-scripts test-lakekeeper-local lint-lakekeeper-scripts

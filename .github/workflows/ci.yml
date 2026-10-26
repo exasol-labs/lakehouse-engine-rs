@@ -145,14 +145,10 @@ jobs:
           save-if: "false"
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: make fmt-check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      # The E2E targets sit behind `required-features`, so only this run lints them.
-      - name: Clippy (E2E targets)
-        run: cargo clippy -p lakehouse-engine --all-targets --all-features -- -D warnings
+        run: make lint
 
   unit-tests:
     name: Unit Tests
