@@ -20,6 +20,7 @@ This file holds the rules for how this repository tests its behavior and how it 
 - Host tests under a crate's `tests/` directory build into one binary per crate, `tests/it/main.rs`, because each test binary statically links the whole engine. A new test file is a module declared in `tests/it/main.rs`. A top-level `tests/*.rs` file is a deliberate `[[test]]` target: an E2E suite, or `scan_footer_refetch_observable`, which keeps its own process because every scan resets the process-global footer record it asserts on.
 - The `it` binary runs its tests as parallel threads of one process. A test that writes to the filesystem writes under its own `tempfile::tempdir()`, which is unique and removed even when the test panics, and a test that asserts on process-global state either shares one lock with every test that mutates that state or keeps its own binary.
 - E2E tests run against a live Exasol and a real or containerized catalog and object store. Each E2E suite is a `[[test]]` target whose `required-features` names the suite's cargo feature, so the plain `cargo test` run never builds a suite or needs a stack.
+- `make lint` and CI's lint job run clippy a second time with every E2E feature enabled, because `required-features` hides the E2E targets from the plain `cargo clippy --all-targets` run.
 
 ### Testing strategy
 
@@ -67,9 +68,8 @@ This file holds the rules for how this repository tests its behavior and how it 
 - The shared virtual schema DDL sets `ALLOW_HTTP = 'true'`.
 - Every DSN and connection string sets `validateservercertificate=0`, because the Docker image uses a self-signed certificate.
 - The seed path for a cloud store selects a storage backend on the one shared seed-catalog configuration. No suite forks the table create, write, and commit logic.
-- The shared harness under `tests/common/` uses no code from `lakehouse-engine` or `lakehouse-catalog`. It treats the deployed `.so` as a black box, so the E2E suites can move into a crate that does not link the engine (#443).
+- No E2E test and no part of the shared harness under `tests/common/` uses code from `lakehouse-engine` or `lakehouse-catalog`. The suites treat the deployed `.so` as a black box, so they can move into a crate that does not link the engine (#443).
 - The E2E harness resolves fixture file lists in the test process through iceberg-rust's scan planner, with the shared seed-catalog configuration (`resolve_fixture_files` in `tests/common/e2e_harness.rs`). It returns harness-owned types, not the engine's `FileEntry`.
-- A test that drives the planner directly instead of going through Exasol takes its engine-typed helpers from `tests/planner_oracle/`, never from `tests/common/`.
 
 ### Exasol session client
 
@@ -80,10 +80,10 @@ This file holds the rules for how this repository tests its behavior and how it 
 
 ### Correctness oracles
 
-- An E2E test proves two things: the pushdown shape, read from `EXPLAIN VIRTUAL`, and the rows the query returns. An assertion about anything else belongs to a unit test.
+- An E2E test asserts only on what Exasol shows: the pushdown SQL read from `EXPLAIN VIRTUAL`, the rows a query returns, the column metadata in the `SYS` views, and the error text of a failing statement. A fixture guard is the one exception.
 - No E2E assertion uses engine code to compute its expected value or to judge its output. A credential check on error text, for example, compares against the secret values the test supplied, not against the engine's redaction heuristic.
 - Tests do not re-verify foundational libraries such as iceberg-rust, DataFusion, Arrow, and Parquet. The row oracles guard their integration with the engine.
-- A fixture guard proves only that a fixture has the shape its row test needs, so the row test cannot pass vacuously. It reads the fixture through the library that wrote or plans it, such as iceberg-rust for an Iceberg table.
+- A fixture guard proves only that a fixture has the shape its row test needs, so the row test cannot pass vacuously. It reads the fixture through the library that wrote or plans it, such as iceberg-rust for an Iceberg table, or asks the catalog server directly over its own REST API, such as a `loadTable` request for the credentials a catalog vends.
 - For row deletes, such as positional deletes and deletion vectors, the E2E proof is that deleted rows are absent from the result. How the adapter carries delete references to the scan UDF is a wire contract, and unit tests prove it.
 - A row assertion compares against one of three oracles: the seeded source data, the same query evaluated without pushdown or on a single DataFusion node, or the key-first ordering of the same grouped query with the column positions transposed.
 - A test that must prove a query reached the scan UDF captures the generated pushdown SQL or reads `EXPLAIN VIRTUAL`, and asserts that the SQL drives the scan UDF. A silent fallback to an unaccelerated wrapper then fails the test instead of passing on correct rows.

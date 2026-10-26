@@ -460,7 +460,6 @@ pub fn local_stack_s3_store(bucket: &str) -> AmazonS3 {
 pub struct FixtureFile {
     /// Absolute, as the table metadata records it.
     pub path: String,
-    pub size: u64,
     pub deletes: Vec<FixtureDelete>,
 }
 
@@ -535,7 +534,6 @@ pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FixtureF
         .iter()
         .map(|task| FixtureFile {
             path: task.data_file_path().to_string(),
-            size: task.file_size_in_bytes(),
             deletes: task
                 .deletes()
                 .iter()
@@ -607,11 +605,7 @@ pub fn columns_to_sorted_pairs(cols: &[Vec<serde_json::Value>]) -> Vec<(String, 
 }
 
 /// Each column's raw persisted note, keyed by its Exasol column name.
-pub fn persisted_column_notes(
-    conn: &mut ExaConn,
-    vs_name: &str,
-    table: &str,
-) -> Vec<(String, String)> {
+fn persisted_column_notes(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<(String, String)> {
     let cols = conn.query_columns(&format!(
         "SELECT COLUMN_NAME, ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_COLUMNS \
          WHERE COLUMN_SCHEMA='{vs_name}' AND COLUMN_TABLE='{table}' ORDER BY COLUMN_NAME"

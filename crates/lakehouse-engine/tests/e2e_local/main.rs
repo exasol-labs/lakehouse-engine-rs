@@ -3,8 +3,6 @@
 #[path = "../common/mod.rs"]
 mod common;
 mod fixtures;
-#[path = "../planner_oracle/mod.rs"]
-mod planner_oracle;
 
 mod assume_role;
 mod capability;

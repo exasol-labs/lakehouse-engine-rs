@@ -285,11 +285,12 @@ fn e2e_partition_delete_invariant_across_fanout() {
          sharing a delete file), not a shard fan-out:\n{same_sql}"
     );
 
-    // The adapter never builds an empty shard, so 4 shards over 4 files hold one file each.
+    // 4 non-empty shards over 4 data files hold one file each.
     let split_sql = pushed_sql_of(&mut conn, SPLITSHARD_VS_NAME);
     assert!(
         (0..SPLIT_PARALLELISM_FACTOR).all(|i| split_sql.contains(&format!("({i},'")))
-            && !split_sql.contains(&format!("({SPLIT_PARALLELISM_FACTOR},'")),
+            && !split_sql.contains(&format!("({SPLIT_PARALLELISM_FACTOR},'"))
+            && !split_sql.contains(",'[]')"),
         "PARALLELISM_FACTOR={SPLIT_PARALLELISM_FACTOR} must fan out into exactly \
          {SPLIT_PARALLELISM_FACTOR} shards, one data file each:\n{split_sql}"
     );

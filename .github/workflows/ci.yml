@@ -150,6 +150,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The E2E targets sit behind `required-features`, so only this run lints them.
+      - name: Clippy (E2E targets)
+        run: cargo clippy -p lakehouse-engine --all-targets --all-features -- -D warnings
+
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest

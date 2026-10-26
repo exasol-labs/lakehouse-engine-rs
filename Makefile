@@ -162,8 +162,10 @@ bucketfs-upload-so: $(VS_SO)
 fmt:
 	cargo fmt
 
+# The second run lints the E2E targets, which `required-features` hides from the first.
 lint:
 	cargo clippy --all-targets
+	cargo clippy -p lakehouse-engine --all-targets --all-features
 
 # MUST stay flag-identical to the `cargo llvm-cov` step in ci.yml's unit-tests
 # job, which is the authority. Not a prerequisite of `test`: llvm-cov relinks
