@@ -50,7 +50,7 @@
 - user query -> Exasol -> vs-adapter: a pushdown request JSON with projection, filter, aggregates, ORDER BY, LIMIT, join tree, and each involved table's identifier note and column notes
 - vs-adapter -> format-readers -> lakehouse-catalog and object storage: snapshot and file list resolve once per query against the declared schema the column notes carry; no reader derives a schema
 - format-readers -> sharding -> pushdown-planner: the file list becomes G byte-balanced shards, each serialized as `common` and `files` JSON strings in the dispatch SQL
-- dispatch SQL -> LAKEHOUSE_DISTRIBUTE_FILES -> GROUP BY shard_key -> LAKEHOUSE_SCAN: Exasol runs one scan invocation per shard row on its node VM pool
+- dispatch SQL -> LAKEHOUSE_DISTRIBUTE_FILES -> GROUP BY shard_key -> LAKEHOUSE_SCAN: Exasol runs one scan VM per node, which scans that node's shard rows one after another
 - LAKEHOUSE_SCAN -> datafusion-scan -> scan-object-store -> object storage: Parquet byte ranges stream into one DataFusion plan per invocation
 - datafusion-scan -> Exasol: raw and join rows leave through the Arrow C Data Interface via `ctx.emit_batch`, partial aggregates leave as SDK `Value` rows via `ctx.emit`
 - Exasol -> result: the dispatch SQL wrapper merges partial aggregates and applies the final ORDER BY and LIMIT
@@ -87,7 +87,7 @@
 - A table's declared schema is decided at CREATE, REFRESH, or SET and read from its column notes at pushdown. No format reader derives a logical schema, a partition column, or a refusal at pushdown.
 - The adapter resolves metadata once per query. The scan UDF never discovers files.
 - Each node scans only its assigned files, with no overlap between shards.
-- The shard count is G = node count × `PARALLELISM_FACTOR` (default 8), clamped to at least 1 and at most min(file count, 300).
+- The shard count is G = node count × `PARALLELISM_FACTOR` (default 1), clamped to at least 1 and at most min(file count, 300).
 - The DataFusion memory pool is max((memory limit − 200 MB overhead) × 0.6, 256 MiB), or 1 GiB when the limit is unknown.
 - The scan spills to `/tmp` when `/tmp` is a writable non-tmpfs disk. Otherwise it returns a `ResourcesExhausted` error past the pool budget.
 - The scan streams one `RecordBatch` at a time and never collects the full result.

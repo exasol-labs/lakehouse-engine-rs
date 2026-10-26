@@ -51,31 +51,22 @@ instance → serial.
 run concurrently. The number of instances the node spins up is independent of the
 number of groups; the groups land on whatever instances are available.
 
-## Why this is the whole basis for the engine's sharding
+## The scalar scan gets one instance per node
 
-This is exactly why the engine fans out on `GROUP BY shard_key` and **not** on
-`GROUP BY IPROC()`:
+The instance pool above applies to SET scripts. The scan runs as the scalar
+`LAKEHOUSE_SCAN` over the output of the `LAKEHOUSE_DISTRIBUTE_FILES` SET
+distributor, and Exasol runs exactly one scan VM per node for it. That VM scans
+the node's shards one after another. A SET UDF over the same `GROUP BY shard_key`
+runs on several VMs per node at once.
 
-* Each shard is one group carrying one file subset. G shards = G groups.
-* Groups multiplex onto each node's instance pool. More groups than a node's cores
-  is fine and *desirable*, extra groups queue onto instances as cores free up,
-  which smooths out stragglers (uneven file sizes / scan times).
-* `GROUP BY IPROC()` would collapse to exactly one group per node → one instance
-  busy, the node's other cores idle.
-
-### Consequence for peak memory
-
-Because only `#cores` instances run **concurrently** on a node regardless of how
-many groups are queued, peak concurrent DataFusion runtimes on a node is bounded
-by the core pool, **not** by G. Oversubscribing G does **not** raise peak memory;
-it only improves load balancing. (Memory is bounded by `#cores × per-instance
-pool`, with the engine's 80% concurrency throttle on top.)
-
-### Consequence: the real cost of oversubscription
-
-The cost of a larger G is **not** memory, it is **per-invocation fixed overhead**:
-each shard group is a separate UDF invocation that stands up its own DataFusion
-session, registers the table, and parses its scan spec. Too many tiny shards means
-session-startup cost dominates the actual scan. So G has a sweet spot: enough
-groups to keep every core busy through stragglers, not so many that startup
-overhead swamps the work.
+* Per-node CPU parallelism comes only from the DataFusion threads inside the one
+  scan instance, so AUTO sizes threads to the node's cores
+  (`scan-runtime/scan-execution-threading`).
+* A parallelism factor above 1 adds no concurrency. Each extra shard adds
+  per-invocation startup (session build, table registration, credential setup,
+  first-byte latency) to the node's serial loop, so the factor defaults to 1.
+* Peak scan memory per node is one instance's DataFusion pool.
+* `GROUP BY shard_key` still spreads the shards across nodes round-robin for
+  G ≤ 300.
+* The scalar shape keeps raw-row output streaming instead of materializing it in
+  temp DB. A SET-based scan would bring back the instance pool, at that cost.

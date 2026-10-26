@@ -164,6 +164,10 @@ end
     ));
 }
 
+// The E2E stacks are single-node, where the default factor of 1 yields one shard, so the
+// suites pin a factor that keeps the multi-shard fan-out covered.
+const E2E_PARALLELISM_FACTOR: usize = 8;
+
 pub struct VsProps<'a> {
     vs_name: &'a str,
     namespace: &'a str,
@@ -182,7 +186,7 @@ impl<'a> VsProps<'a> {
             vs_name,
             namespace,
             catalog_conn_name: DEFAULT_CATALOG_CONN_NAME,
-            parallelism_factor: None,
+            parallelism_factor: Some(E2E_PARALLELISM_FACTOR),
             join_broadcast_max_bytes: None,
             catalog_kind: None,
             merge_schema: None,

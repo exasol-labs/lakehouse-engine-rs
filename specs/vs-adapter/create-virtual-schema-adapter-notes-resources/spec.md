@@ -6,8 +6,8 @@ The adapter records the computed resource budgets in the `createVirtualSchema` r
 
 * The adapter resolves all resource values at `createVirtualSchema` time from VS and connection properties and returns them in `adapterNotes` (stringified JSON). Exasol persists them and returns them at pushdown time. `schemaMetadata.properties` is not used, because Exasol 2025.2.1 silently drops adapter-returned properties. `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES` exposes the notes.
 * `nr_of_cores` comes from `std::thread::available_parallelism()` alone, resolved once per request and defaulting to `1` when the platform cannot report it. No VS property overrides it, and it is not recorded in `adapterNotes` (see `vs-adapter/create-virtual-schema-adapter-notes`). Each derivation takes the count as an argument, so a unit test can inject any count.
-* The parallelism factor is a VS or connection property recorded in `adapterNotes`. When absent, it defaults to a value derived from `nr_of_cores`.
-* `DATAFUSION_THREADING_MODE` (`AUTO` or `FIXED`, default `AUTO`) selects the threading configuration. `FIXED` uses `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF` as given, each defaulting to `max(nr_of_cores, 1)`. `AUTO` derives a per-instance budget that does not oversubscribe a node (`scan-runtime/scan-execution-threading`). Only the resolved integers reach the per-shard scan spec.
+* The parallelism factor is a VS or connection property recorded in `adapterNotes`. When absent, it defaults to 1, one shard per node.
+* `DATAFUSION_THREADING_MODE` (`AUTO` or `FIXED`, default `AUTO`) selects the threading configuration. `FIXED` uses `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF` as given, each falling back to its `AUTO` value. `AUTO` gives the node's single scan instance every core (`scan-runtime/scan-execution-threading`). Only the resolved integers reach the per-shard scan spec.
 * `MEMORY_POOL_FRACTION` (default `0.6`) and `INSTANCE_OVERHEAD_MB` (default `200`) are independent VS or connection properties. The adapter records both in `adapterNotes` and copies them into every per-shard scan spec. The scan UDF sizes its DataFusion pool to `fraction × (per_instance_limit − overhead_bytes)`.
 * `vs-adapter/create-virtual-schema-adapter-notes` covers how the core count is discovered, why it is not recorded, and why the cluster node count is not recorded.
 
@@ -18,8 +18,7 @@ The adapter records the computed resource budgets in the `createVirtualSchema` r
 * *GIVEN* a `createVirtualSchema` request that supplies a `PARALLELISM_FACTOR` connection/VS property
 * *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
 * *THEN* the adapter SHALL record the supplied parallelism factor in the `createVirtualSchema` response's `adapterNotes` (stringified JSON)
-* *AND* when the `PARALLELISM_FACTOR` property is absent or not a positive integer the adapter SHALL default the parallelism factor to `nr_of_cores × 2`
-* *AND* the adapter SHALL floor that default at 8, so a node with 4 or fewer cores, including the single core the unavailable-detection case yields, still gets a parallelism factor of at least 8, persisting it nowhere other than that returned `adapterNotes`
+* *AND* when the `PARALLELISM_FACTOR` property is absent or not a positive integer the adapter SHALL default the parallelism factor to `1`, persisting it nowhere other than that returned `adapterNotes`
 
 ### Scenario: Adapter records the DataFusion threading mode in the virtual-schema adapterNotes
 
@@ -35,8 +34,8 @@ The adapter records the computed resource budgets in the `createVirtualSchema` r
 * *AND* a per-node core count `nr_of_cores` of at least `1`, resolved from `std::thread::available_parallelism()`
 * *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
 * *THEN* the adapter SHALL record the resolved DataFusion target partition count in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `PARALLELISM_FACTOR` and the threading mode
-* *AND* in `FIXED` mode the adapter SHALL use the supplied `DATAFUSION_TARGET_PARTITIONS` value when it is a positive integer and otherwise default to `max(nr_of_cores, 1)`
-* *AND* in `AUTO` mode the adapter SHALL set the target partition count equal to the AUTO-derived `df_threads_per_udf` (per `scan-runtime/scan-execution-threading`), ignoring any supplied `DATAFUSION_TARGET_PARTITIONS` value, persisting the count nowhere other than that returned `adapterNotes`
+* *AND* in `FIXED` mode the adapter SHALL use the supplied `DATAFUSION_TARGET_PARTITIONS` value when it is a positive integer and otherwise fall back to the `AUTO` value
+* *AND* in `AUTO` mode the adapter SHALL set the target partition count to `2 × nr_of_cores` (per `scan-runtime/scan-execution-threading`), ignoring any supplied `DATAFUSION_TARGET_PARTITIONS` value, persisting the count nowhere other than that returned `adapterNotes`
 
 ### Scenario: Adapter records the DataFusion threads-per-UDF count in the virtual-schema adapterNotes
 
@@ -44,8 +43,8 @@ The adapter records the computed resource budgets in the `createVirtualSchema` r
 * *AND* a per-node core count `nr_of_cores` of at least `1`, resolved from `std::thread::available_parallelism()`
 * *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
 * *THEN* the adapter SHALL record the resolved DataFusion threads-per-UDF count in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `PARALLELISM_FACTOR`, the threading mode, and the DataFusion target partition count
-* *AND* in `FIXED` mode the adapter SHALL use the supplied `DATAFUSION_THREADS_PER_UDF` value when it is a positive integer and otherwise default to `max(nr_of_cores, 1)`
-* *AND* in `AUTO` mode the adapter SHALL set the threads-per-UDF count to `max(1, floor(nr_of_cores / udf_instances_per_node))`, which yields `1` for the single core the unavailable-detection case produces, persisting the count nowhere other than that returned `adapterNotes`
+* *AND* in `FIXED` mode the adapter SHALL use the supplied `DATAFUSION_THREADS_PER_UDF` value when it is a positive integer and otherwise fall back to the `AUTO` value
+* *AND* in `AUTO` mode the adapter SHALL set the threads-per-UDF count to `nr_of_cores`, which yields `1` for the single core the unavailable-detection case produces, persisting the count nowhere other than that returned `adapterNotes`
 
 ### Scenario: Recorded parallelism factor drives later work-unit sharding
 

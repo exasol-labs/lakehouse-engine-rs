@@ -50,7 +50,7 @@ Extends `pushdown/pushdown-planning` with GROUP BY aggregate detection and scan-
 * *GIVEN* a grouped aggregate pushdown over a file list partitioned into G work-unit shards
 * *WHEN* the adapter builds the scan-driving SQL
 * *THEN* the generated SQL SHALL place the `GROUP BY shard_key` (one group per shard) INSIDE the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery, NOT at the outer merge level and NOT on `IPROC()`
-* *AND* G SHALL be `node_count × parallelism_factor` capped at 300 and clamped to the file count, so the shard groups distribute round-robin across nodes and multiplex onto each node's core pool
+* *AND* G SHALL be `node_count × parallelism_factor` capped at 300 and clamped to the file count, so the shard groups distribute round-robin across nodes
 * *AND* the `LAKEHOUSE_SCAN` SCALAR EMIT UDF SHALL be invoked over each distributed shard row with the shard-invariant grouped common spec spliced once as its first-argument literal and that shard's file subset as its second argument
 
 ### Scenario: LIMIT is NOT pushed into per-shard scan for a grouped query

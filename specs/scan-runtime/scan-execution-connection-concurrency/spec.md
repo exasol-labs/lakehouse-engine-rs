@@ -1,13 +1,13 @@
 # Feature: DataFusion Scan Execution, Object-Store Connection Concurrency
 
-Each scan UDF instance holds a bounded number of connections open to the S3-compatible object store. An explicit positive `S3_MAX_CONNECTIONS` property pins the budget. Otherwise the adapter derives it from the node's capacity and passes it to the UDF through `adapterNotes` and the common spec.
+Each scan UDF instance holds a bounded number of connections open to the S3-compatible object store. An explicit positive `S3_MAX_CONNECTIONS` property pins the budget. Otherwise the adapter derives it from the resolved thread count and passes it to the UDF through `adapterNotes` and the common spec.
 
 ## Background
 
 * The scan spec carries a shard-invariant `s3_max_connections` field, a positive integer. It defaults to a built-in value when absent from the JSON.
 * The budget is a different axis from the CPU thread and partition budget of `scan-runtime/scan-execution-threading`. It sets how many HTTP connections to the object store the instance keeps warm.
 * The scan UDF applies the budget to the object store's HTTP client options when it builds its S3 store, on the raw-row path and the partial-aggregate path.
-* The adapter resolves the budget at `createVirtualSchema` time. An explicit positive integer is used as given. An absent, empty, zero, or invalid value triggers an AUTO derivation from the node's core count and its per-node UDF-instance share (the parallelism factor of `parallelism/work-unit-sharding`), mirroring the AUTO thread-budget derivation in `scan-runtime/scan-execution-threading`. The adapter records the result in `adapterNotes`, and only the integer reaches the UDF.
+* The adapter resolves the budget at `createVirtualSchema` time. An explicit positive integer is used as given. An absent, empty, zero, or invalid value triggers an AUTO derivation: four connections per resolved `df_threads_per_udf` thread (`scan-runtime/scan-execution-threading`), in either threading mode. The adapter records the result in `adapterNotes`, and only the integer reaches the UDF.
 * The budget travels in the shard-invariant common spec, serialized once for the whole shard fan-out (`parallelism/work-unit-sharding`).
 * The budget applies per built object store. A broadcast join builds one inner store per side, so each side reads through its own credential (`scan-aggregation/scan-execution-join`). A two-side join can therefore hold up to 2N warm idle connections. Dividing the budget across the sides would halve fact-side fetch parallelism on every broadcast join, so it is not divided.
 * The budget maps to the `object_store` option `pool_max_idle_per_host`, which bounds warm idle connections. `object_store` exposes no hard in-flight ceiling, so the bound is on sockets and file descriptors, not request rate.
@@ -43,13 +43,12 @@ Each scan UDF instance holds a bounded number of connections open to the S3-comp
 * *THEN* the adapter SHALL record M as the connection-concurrency budget, without applying the AUTO derivation
 * *AND* the adapter SHALL record the resolved value in the `createVirtualSchema` `adapterNotes` so the per-shard scan spec carries an integer field the scan UDF consumes unchanged
 
-### Scenario: AUTO derivation sizes the per-instance budget from node capacity
+### Scenario: AUTO derivation sizes the per-instance budget from the resolved thread count
 
 * *GIVEN* a `createVirtualSchema` request that supplies no positive-integer `S3_MAX_CONNECTIONS` property (absent, empty, zero, or invalid)
-* *AND* a resolved per-node core count of at least 1 and a per-node UDF-instance share derived from the work-unit shard fan-out
+* *AND* a resolved `df_threads_per_udf` of T, in either threading mode
 * *WHEN* the adapter resolves the connection-concurrency budget
-* *THEN* the adapter SHALL derive a per-instance connection-concurrency budget from the core count and the per-node UDF-instance share, mirroring the AUTO thread-budget derivation, so the budget scales with a node's capacity and the per-node instance share without collapsing below 1
-* *AND* the adapter SHALL apply that one derivation uniformly to EVERY resolved core count
+* *THEN* the adapter SHALL derive a budget of `T × 4`
 * *AND* the adapter SHALL record the derived value in `adapterNotes`
 
 ### Scenario: AUTO derivation yields the single-core budget when the core count cannot be detected
@@ -57,7 +56,7 @@ Each scan UDF instance holds a bounded number of connections open to the S3-comp
 * *GIVEN* a `createVirtualSchema` request that supplies no positive-integer `S3_MAX_CONNECTIONS` property
 * *AND* an executing node whose operating system cannot report a core count, so the adapter resolves a core count of `1`
 * *WHEN* the adapter resolves the connection-concurrency budget
-* *THEN* the adapter SHALL apply the ordinary AUTO formula to that core count of `1`, yielding one times the per-thread connection multiplier, a budget of 4 at the recorded multiplier
+* *THEN* the adapter SHALL apply the ordinary AUTO formula to the single thread that core count yields, a budget of 4
 * *AND* the scan-side built-in default budget SHALL serve as the default for a scan-spec JSON payload that omits `s3_max_connections`, and as the pushdown-side fallback when the `S3_MAX_CONNECTIONS` adapterNote is absent or not a positive integer
 
 ### Scenario: Connection budget travels once in the shard-invariant common spec

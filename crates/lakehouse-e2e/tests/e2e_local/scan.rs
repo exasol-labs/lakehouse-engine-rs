@@ -29,8 +29,7 @@ use crate::fixtures::{
     vs_dim_table, vs_fact_table, vs_lineitem_table,
 };
 
-/// `PARALLELISM_FACTOR = '1'` so its recorded `DF_THREADS_PER_UDF` reads back the core
-/// count the adapter VM detected.
+/// Its recorded `DF_THREADS_PER_UDF` reads back the core count the adapter VM detected.
 const CPU_PROBE_VS_NAME: &str = "LHVS_CPU_PROBE";
 
 fn vs_labels_table() -> String {
@@ -1078,10 +1077,7 @@ fn adapter_detects_container_cpuset() {
     );
 
     let mut conn = exa_conn();
-    create_virtual_schema(
-        &mut conn,
-        &VsProps::new(CPU_PROBE_VS_NAME, E2E_NAMESPACE).with_parallelism_factor(1),
-    );
+    create_virtual_schema(&mut conn, &VsProps::new(CPU_PROBE_VS_NAME, E2E_NAMESPACE));
 
     let cols = conn.query_columns(&format!(
         "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS \
@@ -1102,8 +1098,8 @@ fn adapter_detects_container_cpuset() {
 
     assert_eq!(
         detected, cpuset_cores,
-        "at PARALLELISM_FACTOR = '1' the recorded DF_THREADS_PER_UDF is the core \
-         count the adapter VM detected; it must equal the number of CPUs in the \
+        "the recorded DF_THREADS_PER_UDF is the core count the adapter VM \
+         detected; it must equal the number of CPUs in the \
          container's CPU set ({cpuset_cores}), and so be neither the \
          undetectable-platform fallback of 1 nor the host's {host_cores} cores"
     );
@@ -1720,7 +1716,7 @@ fn test_shard_key_fanout_explain() {
 
     assert!(
         pushed_sql.contains("shard_key"),
-        "EXPLAIN VIRTUAL output must contain 'shard_key' (oversubscribed fan-out), got:\n{pushed_sql}"
+        "EXPLAIN VIRTUAL output must contain 'shard_key' (shard fan-out), got:\n{pushed_sql}"
     );
     assert!(
         !pushed_sql.contains("IPROC()"),

@@ -39,31 +39,30 @@ G = min(G, 300)              # cap at 300: ≤300 ⇒ round-robin (balanced), >3
 G = clamp(G, 1, file_count)  # at least 1, never more shards than files
 ```
 
-- **Oversubscription is deliberate** — a `G` larger than the core count of a node is intended. Extra shards queue on the instance pool of the node. They run when cores become free. This smooths stragglers. The VS assigns files by greedy descending-size byte-balance, not by file count. Each shard therefore carries approximately equal bytes.
-- **Cores bound the peak memory, not `G`.** The parallel instances per node come from a fixed VM pool. Exasol sizes this pool to `NR_OF_CORES`. Oversubscription improves the balance, not the peak memory. The engine also stalls new VMs at **80 %** of the per-instance limit. The scan UDF therefore sizes its DataFusion pool to a fraction of that limit (default 0.6).
+- **One scan instance per node.** The scan is a scalar UDF, so Exasol runs one scan VM per node and feeds it that node's shards one after another. CPU parallelism on a node comes from the DataFusion threads inside that instance, which `AUTO` sizes to the node's cores. A factor above 1 adds per-shard startup without adding concurrency, so `PARALLELISM_FACTOR` defaults to 1.
+- **Byte-balanced shards.** The VS assigns files by greedy descending-size byte-balance, not by file count. Each shard therefore carries approximately equal bytes.
+- **Memory.** Peak scan memory per node is one instance's DataFusion pool. The engine stalls new VMs at **80 %** of the per-instance limit, so the scan UDF sizes its pool to a fraction of that limit (default 0.6).
 
 `PARALLELISM_FACTOR`, the threading mode, and the memory fraction are fixed at `CREATE VIRTUAL SCHEMA` time. A change to one of them requires a new VS. See [Tuning](tuning.md) for the full property list.
 
 ### Example — 2 nodes × 2 cores, 10 files
 
 ```
-10 files                  G = nodes × parallelism_factor = 2 × 3 = 6 shards
+10 files                  G = nodes × parallelism_factor = 2 × 1 = 2 shards
 f1 … f10                  (cap 300, clamp to ≤ file_count)
    │  byte-balanced split (by size, not count)
    ▼
-S0[f1,f2] S1[f3,f4] S2[f5,f6] S3[f7,f8] S4[f9] S5[f10]
+S0[f1,f3,f5,f7,f9]   S1[f2,f4,f6,f8,f10]
    │  GROUP BY shard_key → round-robin across nodes
    ▼
 ┌──── Node A · 2 cores ────┐   ┌──── Node B · 2 cores ────┐
-│ core1: S0   core2: S2    │   │ core1: S1   core2: S3    │   4 shards run at once
-│ queued: S4               │   │ queued: S5               │   2 wait → oversubscription
+│ scan VM: S0              │   │ scan VM: S1              │
+│ 2 threads, 4 partitions  │   │ 2 threads, 4 partitions  │
 └──────────────────────────┘   └──────────────────────────┘
    │  partial results (rows or partial aggregates)
    ▼
 Exasol merges across shards → final result
 ```
-
-This example puts 6 shards on 4 cores. Each node runs 2 shards immediately and queues 1 shard. The queued shard fills any core that finishes early. No node stays idle while it waits for a slow shard.
 
 ## Pushdown vs. parent-level Exasol
 

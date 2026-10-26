@@ -1,18 +1,18 @@
 # Feature: Work-Unit File Sharding
 
-Partitions the once-resolved data-file list into G oversubscribed shards and drives them across the cluster. A `LAKEHOUSE_DISTRIBUTE_FILES` LUA SET script spreads the shards over nodes, and the `LAKEHOUSE_SCAN` scalar EMIT UDF scans each shard's files node-locally and streams its rows.
+Partitions the once-resolved data-file list into G shards and drives them across the cluster. A `LAKEHOUSE_DISTRIBUTE_FILES` LUA SET script spreads the shards over nodes, and the `LAKEHOUSE_SCAN` scalar EMIT UDF scans each shard's files node-locally and streams its rows.
 
 ## Background
 
 * The adapter reads the cluster node count per pushdown from `UdfContext::node_count()`. A value of `0` (no live handshake) maps to `1`.
-* The shard count G is `node_count × parallelism_factor`, where `parallelism_factor` is a virtual schema property. G is capped at `300`, Exasol's `max_dynamic_group_count` default: at or below it Exasol distributes groups round-robin, above it Exasol hash-partitions them unevenly. G is also clamped to between 1 and the file count so no shard is empty.
+* The shard count G is `node_count × parallelism_factor`, where `parallelism_factor` is a virtual schema property that defaults to 1. Exasol runs one scalar scan instance per node, which scans that node's shards one after another, so a factor above 1 adds per-shard startup without adding concurrency (see `specs/udf-context.md`). G is capped at `300`, Exasol's `max_dynamic_group_count` default: at or below it Exasol distributes groups round-robin, above it Exasol hash-partitions them unevenly. G is also clamped to between 1 and the file count so no shard is empty.
 * The split balances cumulative bytes per shard, not file count. Each file carries the byte size its format reader resolved, and a size of 0 weighs 1 byte.
 * A shard is a list of `(path, size)` entries.
 * The common spec is serialized once as the scalar scan's first-argument literal. Only each shard's file subset flows through the distributor. The credential reference lives once in the common spec: see `storage-access/scan-spec-credential-reference`.
 
 ## Scenarios
 
-### Scenario: Shard count oversubscribes the cluster and is capped at the round-robin threshold
+### Scenario: Shard count scales with the node count and is capped at the round-robin threshold
 
 * *GIVEN* a resolved data-file list, a node count read from `UdfContext::node_count()` at pushdown, and a `PARALLELISM_FACTOR` VS property
 * *WHEN* the adapter computes the shard count G for the scan-driving query
