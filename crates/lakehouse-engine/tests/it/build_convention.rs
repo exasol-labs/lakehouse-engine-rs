@@ -80,3 +80,60 @@ fn make_test_e2e_runs_every_e2e_local_module() {
         }
     }
 }
+
+/// Cargo builds every top-level `tests/*.rs` and `tests/*/main.rs` as its own binary, and compiles
+/// a `tests/it/` file only when `tests/it/main.rs` declares it, so both mistakes fail here (#523).
+#[test]
+fn every_host_test_file_belongs_to_a_listed_test_target() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for krate in ["lakehouse-engine", "lakehouse-catalog"] {
+        let tests_dir = workspace_root.join("crates").join(krate).join("tests");
+        let manifest = std::fs::read_to_string(tests_dir.join("../Cargo.toml"))
+            .expect("crate Cargo.toml must be readable");
+        let lines: Vec<&str> = manifest.lines().map(str::trim).collect();
+        let mut listed: Vec<&str> = lines
+            .windows(2)
+            .filter(|pair| pair[0] == "[[test]]")
+            .filter_map(|pair| pair[1].strip_prefix("name = \"")?.strip_suffix('"'))
+            .collect();
+        listed.push("it");
+
+        for entry in std::fs::read_dir(&tests_dir).expect("tests/ must be listable") {
+            let path = entry.expect("tests/ entry").path();
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let is_target = if path.is_dir() {
+                path.join("main.rs").exists()
+            } else {
+                path.extension().is_some_and(|e| e == "rs")
+            };
+            assert!(
+                !is_target || listed.contains(&name),
+                "crates/{krate}/tests/{name} builds its own test binary: move it into tests/it/, \
+                 or list it as a [[test]] target in crates/{krate}/Cargo.toml"
+            );
+        }
+
+        let it_dir = tests_dir.join("it");
+        let it_main = std::fs::read_to_string(it_dir.join("main.rs"))
+            .expect("tests/it/main.rs must be readable");
+        for entry in std::fs::read_dir(&it_dir).expect("tests/it must be listable") {
+            let path = entry.expect("tests/it entry").path();
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let is_module = if path.is_dir() {
+                path.join("mod.rs").exists()
+            } else {
+                name != "main" && path.extension().is_some_and(|e| e == "rs")
+            };
+            assert!(
+                !is_module || it_main.lines().any(|line| line == format!("mod {name};")),
+                "crates/{krate}/tests/it/main.rs must declare `mod {name};`, or its tests never run"
+            );
+        }
+    }
+}
