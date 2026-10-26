@@ -7,6 +7,11 @@ ignore = [
     # (^0.38) and object_store (^0.39) allow it.
     { id = "RUSTSEC-2026-0194", reason = "Blocked by reqsign/opendal/object_store's quick-xml semver pins; XML source is the operator-configured storage/catalog endpoint, not untrusted internet input" },
     { id = "RUSTSEC-2026-0195", reason = "Blocked by reqsign/opendal/object_store's quick-xml semver pins; XML source is the operator-configured storage/catalog endpoint, not untrusted internet input" },
+    # Fixed in zstd >=0.14.3 / zstd-safe >=8.2.0; re-evaluate when parquet and arrow-ipc (^0.13 until
+    # arrow 60, which datafusion 55 cannot take) and apache-avro (^0.13.3 in 0.22.0) allow it.
+    { id = "RUSTSEC-2026-0391", reason = "Blocked by parquet/arrow-ipc/apache-avro/iceberg zstd ^0.13 pins; none of them calls Encoder/Decoder::with_context, the affected constructors" },
+    { id = "RUSTSEC-2026-0398", reason = "Blocked by the zstd ^0.13 pins; zstd-safe is built without the `seekable` feature, so Seekable::decompress is not compiled" },
+    { id = "RUSTSEC-2026-0403", reason = "Blocked by the zstd ^0.13 pins; dependents decode only through stream::read::Decoder, decode_all, and bulk, which the advisory lists as unaffected" },
 ]
 
 [licenses]
