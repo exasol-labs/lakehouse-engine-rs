@@ -589,7 +589,7 @@ async fn first_parquet_under(
 fn lakekeeper_vended_credentials_are_scoped_per_table() {
     setup();
 
-    let creds = lakekeeper::lakekeeper_host_connection_creds(WAREHOUSE_VENDED, true);
+    let creds = lakekeeper_host_connection_creds(WAREHOUSE_VENDED, true);
     assert!(
         creds.use_vended_credentials,
         "the probe CONNECTION must request access delegation: without that flag the loadTable \
@@ -1522,4 +1522,30 @@ fn permission_check_lists_unreadable_tables_and_refuses_their_queries() {
     assert_events_listed_and_refused("after create");
     exa_conn().execute(&format!("ALTER VIRTUAL SCHEMA {VS_PERMISSION} REFRESH"));
     assert_events_listed_and_refused("after refresh");
+}
+
+/// `oauth2_server_uri` is the host-mapped Keycloak endpoint, since the UDF-internal
+/// Docker-network URL the CONNECTION carries is unreachable from the test process.
+fn lakekeeper_host_connection_creds(warehouse_name: &str, vended: bool) -> ConnectionCreds {
+    let password = lakekeeper::lakekeeper_connection_password(warehouse_name, vended);
+    ConnectionCreds {
+        warehouse: password.warehouse,
+        endpoint: password.endpoint,
+        region: password.region,
+        access_key: password.access_key,
+        secret_key: password.secret_key,
+        session_token: password.session_token,
+        path_style: Some(password.path_style),
+        use_sigv4: password.use_sigv4,
+        use_vended_credentials: password.use_vended_credentials,
+        token: password.token,
+        client_id: password.client_id,
+        client_secret: password.client_secret,
+        oauth2_server_uri: Some(lakekeeper::keycloak_token_endpoint_host()),
+        scope: password.scope,
+        account_name: password.account_name,
+        account_key: password.account_key,
+        sas_token: None,
+        ..Default::default()
+    }
 }

@@ -28,6 +28,10 @@ use crate::fixtures::{
     vs_dim_table, vs_fact_table, vs_lineitem_table,
 };
 
+use crate::planner_oracle::{
+    declared_schema_of, local_stack_catalog, local_stack_creds, local_stack_storage,
+};
+
 use lakehouse_catalog::CatalogSession;
 use lakehouse_engine::adapter::pushdown::{ConnectionStorage, ScanSource, format_reader};
 

@@ -3,15 +3,16 @@
 //! CONNECTION carries no catalog-auth field but does carry SeaweedFS's endpoint and static keys.
 
 mod common;
+mod planner_oracle;
 
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VARCHAR_JSON, VsProps,
     assert_decimal_orders_numerically, assert_query_fails, assert_type_matrix,
     column_adapter_notes, create_schema_and_scripts, create_virtual_schema_with_password,
-    declared_schema_of, declared_types, enumerated_table_names, exa_conn, explain_virtual_sql,
-    has_broadcast_join_block, has_two_scan_wrapper, identifier_note, install_slc,
-    local_stack_creds, note_of, pairs, parse_int, parse_numeric, partition_positions, query_error,
-    reads, refuses, runtime, upload_so, value_to_string,
+    declared_types, enumerated_table_names, exa_conn, explain_virtual_sql,
+    has_broadcast_join_block, has_two_scan_wrapper, identifier_note, install_slc, note_of, pairs,
+    parse_int, parse_numeric, partition_positions, query_error, reads, refuses, runtime, upload_so,
+    value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
@@ -43,6 +44,7 @@ use common::stack::{
     wait_for_url,
 };
 use common::timestamp_precision::expected_timestamp_precision;
+use planner_oracle::declared_schema_of;
 
 use lakehouse_catalog::{
     CatalogClient, CatalogTableIdent, ConnectionCreds, StorageBackend, UnityCatalogSession,
@@ -2459,7 +2461,10 @@ fn unity_unusable_column_mapping_metadata_refuses_only_its_column() {
         label.contains("'label'") && label.contains("'id'"),
         "{label}"
     );
-    assert!(!label.contains(&local_stack_creds().secret_key), "{label}");
+    assert!(
+        !label.contains(&local_stack_connection_password().secret_key),
+        "{label}"
+    );
 }
 
 /// Scenario: The client carries each table's properties verbatim from the list sweep and the single-table load
