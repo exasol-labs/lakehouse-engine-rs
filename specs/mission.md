@@ -115,8 +115,8 @@ cargo test
 # Test (E2E against local Exasol Docker container)
 make test-e2e
 
-# Lint & Format
-cargo clippy --all-targets && cargo fmt
+# Lint & Format (clippy without and with every E2E feature)
+make lint && cargo fmt
 ```
 
 ## Project Structure

@@ -20,7 +20,7 @@ Project specifics:
 
 ## Code quality
 
-- `cargo fmt --all` and `cargo clippy --all-targets` must pass with zero warnings before committing.
+- `cargo fmt --all` and `make lint` must pass with zero warnings before committing. `make lint` runs `cargo clippy --all-targets` and a second clippy run with every E2E feature enabled, which is the only run that checks the E2E targets.
 
 ## Workflow
 
