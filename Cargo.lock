@@ -3414,8 +3414,10 @@ dependencies = [
  "aws-sdk-sts",
  "aws-sigv4",
  "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "exasol-udf-sdk",
  "futures",
+ "hyper",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
@@ -3464,7 +3466,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.57.0"
+version = "0.57.1"
 dependencies = [
  "aes-gcm",
  "arrow",

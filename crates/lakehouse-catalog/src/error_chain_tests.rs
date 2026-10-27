@@ -1,23 +1,21 @@
 use super::*;
-use std::fmt;
+use crate::test_support::{Layer, layer};
 
-#[derive(Debug)]
-struct Layer(&'static str, Option<Box<dyn Error + Send + Sync>>);
+#[test]
+fn the_cause_walk_follows_io_payloads_where_source_stops() {
+    let rustls = rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType);
+    let io = std::io::Error::other(std::io::Error::new(std::io::ErrorKind::InvalidData, rustls));
+    let error = layer("error sending request", layer("client error (Connect)", io));
 
-impl fmt::Display for Layer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
-    }
-}
+    let walked: Vec<String> = causes(&error).map(|cause| cause.to_string()).collect();
 
-impl Error for Layer {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.1.as_deref().map(|e| e as &(dyn Error + 'static))
-    }
-}
-
-fn layer(text: &'static str, cause: impl Error + Send + Sync + 'static) -> Layer {
-    Layer(text, Some(Box::new(cause)))
+    assert_eq!(walked.len(), 5, "{walked:?}");
+    assert!(causes(&error).last().unwrap().is::<rustls::Error>());
+    assert!(
+        std::iter::successors(Some(&error as &(dyn Error + 'static)), |&e| e.source())
+            .all(|e| !e.is::<rustls::Error>()),
+        "source() alone must not reach the rustls error, or this test proves nothing"
+    );
 }
 
 #[test]

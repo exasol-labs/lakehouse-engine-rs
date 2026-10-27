@@ -3,6 +3,8 @@ use crate::test_support::base_creds;
 use crate::unity::mock_server::spawn;
 use crate::{CatalogClient, CatalogTableIdent, CatalogTableType, ColumnSourceType, TableFormat};
 use exasol_udf_sdk::error::UdfError;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const PAT_SENTINEL: &str = "PAT_SECRET_SENTINEL_VALUE";
 
@@ -361,6 +363,115 @@ async fn request_failure_is_credential_safe_error() {
     assert!(
         !msg.contains(PAT_SENTINEL),
         "the bearer token must be stripped from the error: {msg}"
+    );
+}
+
+/// Scenario: The client surfaces a transport or HTTP-status failure as a clear, credential-safe error
+#[tokio::test]
+async fn a_failed_get_table_names_the_table() {
+    let server = spawn(|req| {
+        (
+            500,
+            format!(
+                "internal error saw {}",
+                req.authorization.clone().unwrap_or_default()
+            ),
+        )
+    })
+    .await;
+    let mut creds = base_creds();
+    creds.token = Some(PAT_SENTINEL.to_string());
+    let session = UnityCatalogSession::new(&server.base_url, creds);
+    let ident = orders_ident();
+
+    let load_err = session
+        .load_table(&ident)
+        .await
+        .expect_err("a 500 must surface an error");
+    let load_listed_err = session
+        .load_listed_tables(std::slice::from_ref(&ident))
+        .await
+        .expect_err("a 500 must surface an error");
+
+    for err in [load_err, load_listed_err] {
+        let UdfError::User(msg) = err else {
+            panic!("expected a UdfError::User variant");
+        };
+        assert!(
+            msg.contains("failed to load Unity Catalog table 'cat.sch.orders'"),
+            "error names the table: {msg}"
+        );
+        assert!(msg.contains("500"), "error carries the status: {msg}");
+        assert!(
+            !msg.contains(PAT_SENTINEL),
+            "the bearer token must be stripped from the error: {msg}"
+        );
+    }
+}
+
+/// Scenario: Every catalog request kind is bounded and retried
+#[tokio::test]
+async fn every_unity_request_kind_succeeds_after_one_503() {
+    let list_attempts = Arc::new(AtomicUsize::new(0));
+    let get_attempts = Arc::new(AtomicUsize::new(0));
+    let creds_attempts = Arc::new(AtomicUsize::new(0));
+    let (list_counter, get_counter, creds_counter) = (
+        list_attempts.clone(),
+        get_attempts.clone(),
+        creds_attempts.clone(),
+    );
+    let server = spawn(move |req| {
+        if req.target.starts_with("/api/2.1/unity-catalog/tables/") {
+            match get_counter.fetch_add(1, Ordering::SeqCst) {
+                0 => (503, String::new()),
+                _ => (200, single_table_body()),
+            }
+        } else if req.method == "POST" {
+            match creds_counter.fetch_add(1, Ordering::SeqCst) {
+                0 => (503, String::new()),
+                _ => (
+                    200,
+                    r#"{"aws_temp_credentials":{"access_key_id":"AK","secret_access_key":"SK","session_token":"ST"}}"#
+                        .to_string(),
+                ),
+            }
+        } else {
+            match list_counter.fetch_add(1, Ordering::SeqCst) {
+                0 => (503, String::new()),
+                _ => (200, tables_page_body()),
+            }
+        }
+    })
+    .await;
+    let session = UnityCatalogSession::new(&server.base_url, base_creds());
+
+    session
+        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .await
+        .expect("table listing succeeds once the retry succeeds");
+    session
+        .load_table(&orders_ident())
+        .await
+        .expect("get-table succeeds once the retry succeeds");
+    session
+        .temporary_table_credentials("table-uuid-1", "READ")
+        .await
+        .expect("temporary-credentials succeeds once the retry succeeds");
+
+    assert_eq!(
+        list_attempts.load(Ordering::SeqCst),
+        2,
+        "list tables retried once"
+    );
+    assert_eq!(
+        get_attempts.load(Ordering::SeqCst),
+        2,
+        "get-table retried once"
+    );
+    assert_eq!(
+        creds_attempts.load(Ordering::SeqCst),
+        2,
+        "temporary-credentials retried once"
     );
 }
 

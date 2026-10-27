@@ -751,6 +751,43 @@ SELECT TABLE_NAME, ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_TABLES WHERE TABLE_SCH
 
 Iceberg REST, Unity Catalog, and Glue record the dot-joined namespace and table name, for example `{"name":"sales.orders"}`. Direct storage records the original-cased directory name alone. A pushdown reads the identifier from this note, so a table without one fails with an error that names the table and `ALTER VIRTUAL SCHEMA ... REFRESH`.
 
+## Catalog request timeouts and retries
+
+Every request to an Iceberg REST catalog, a Lakekeeper management API, a Unity Catalog, or an OAuth2 token endpoint stops waiting on a catalog that stays silent for 10 seconds. A catalog that hangs therefore fails `CREATE VIRTUAL SCHEMA`, `REFRESH`, `SET PROPERTIES`, or a query within 30 seconds, retries included. It no longer blocks the statement. An answer that keeps arriving is read to its end, however long the transfer takes. The Glue Iceberg REST endpoint is an Iceberg REST catalog and gets the same limits. No virtual schema property changes them.
+
+| Limit | Value |
+|---|---|
+| One connection attempt | 10 seconds |
+| Read timeout: the wait for the answer's headers, counted from the attempt's start, and then for each next part of the body | 10 seconds |
+| Attempts per request | 5, the first one included |
+| Retry window: no retry starts that could wait for its answer past it | 30 seconds after the first attempt started |
+| Wait before retry 1, 2, 3, and 4 | Up to 250 ms, 500 ms, 1 s, and 2 s, at least half of that and chosen at random, or the time a `Retry-After` header states |
+
+The adapter retries these failures:
+
+- an attempt that reaches its connect timeout or read timeout before the answer's headers arrive
+- a connection that the catalog refuses, resets, or aborts
+- an HTTP/1.1 or HTTP/2 connection that the catalog closes before its answer begins, with or without a TLS `close_notify`, as a proxy does when it reloads or ends an idle keep-alive connection
+- an answer with HTTP 408, 429, 502, 503, or 504
+
+A retry sends the same request again, with the same headers and body. A SigV4 signature and an OAuth2 token outlive the 30 seconds, so a retry is not signed again.
+
+These failures are not retried. They fail the request at the first attempt:
+
+- a DNS failure, such as a host name that does not resolve
+- a TLS failure, such as an `https://` URL to a server that answers in plain HTTP
+- an answer with any other HTTP status, such as 404 or 500
+
+`Retry-After` is read as a number of seconds or as an HTTP date in the IMF-fixdate form, such as `Sun, 06 Nov 1994 08:49:37 GMT`. The RFC 850 and asctime date forms are ignored, so the backoff wait applies. A wait counts against the 30 seconds. A retry needs at least 10 seconds of them left after its wait, the read timeout of its attempt. Otherwise the wait is not taken, and the request fails at once with the answer or error it holds.
+
+When the retries end, the error is that of the last attempt, such as its HTTP status and answer, or `operation timed out` for an attempt that reached a timeout. An error quotes at most the first 4096 bytes of an answer, so a proxy's HTML error page does not fill it.
+
+An answer body whose next part does not arrive within 10 seconds fails the request at once, without a retry. The error names the answer's HTTP status and `operation timed out`.
+
+Every `loadTable` asks only for the snapshots that branches and tags reference (`snapshots=refs`), so a long snapshot history does not enlarge the answer.
+
+The AWS Glue Data Catalog kind and direct storage do not send their requests through this client. The Glue Data Catalog client applies its own limits through the AWS SDK, see [AWS Glue Data Catalog](#aws-glue-data-catalog-catalog_kind--glue).
+
 ## Addressing
 
 The adapter UDF runs **inside** the Exasol container. Every address in the CONNECTION must resolve from there. Use internal hostnames, for example `iceberg-rest`, `seaweedfs`, `lakekeeper`, `keycloak`, or `unitycatalog`. Never use `localhost` or the Docker host gateway. A Databricks-managed Unity Catalog is a public HTTPS endpoint, so it needs no internal hostname — just network egress from the Exasol node.

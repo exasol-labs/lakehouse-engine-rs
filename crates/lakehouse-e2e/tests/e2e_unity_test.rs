@@ -2363,6 +2363,60 @@ fn unity_column_mapping_property_reaches_create_and_scoped_refresh() {
     conn.execute(&format!("DROP VIRTUAL SCHEMA {VS} CASCADE"));
 }
 
+/// Its own schema, so deleting its one table through the Unity REST API touches no shared fixture.
+const DELETED_TABLE_NAMESPACE: &str = "unity.e2e_deleted_table";
+const DELETED_TABLE_VS: &str = "UNITY_DELETED_TABLE_VS";
+const DELETED_TABLE_CONN: &str = "UNITY_DELETED_TABLE_CREDS";
+
+/// Scenario: The client surfaces a transport or HTTP-status failure as a clear, credential-safe error
+#[test]
+fn unity_pushdown_over_a_table_deleted_from_the_catalog_names_the_table() {
+    setup();
+    let mut conn = exa_conn();
+    let table_name = "orphan_table";
+    register_unity_table(&UnityTable {
+        namespace: DELETED_TABLE_NAMESPACE,
+        name: table_name,
+        format: "PARQUET",
+        location: "s3://warehouse/unity_parquet/e2e_deleted_table/orphan_table",
+        columns: &[("id", json!("long"), "LONG")],
+        partitions: &[],
+        name_mapped: false,
+    });
+    create_virtual_schema_with_password(
+        &mut conn,
+        &VsProps::new(DELETED_TABLE_VS, DELETED_TABLE_NAMESPACE)
+            .with_catalog_kind("UNITY_CATALOG")
+            .with_catalog_conn_name(DELETED_TABLE_CONN),
+        UNITY_CATALOG_URI_INTERNAL,
+        &local_stack_connection_password(),
+    );
+
+    let delete = reqwest::blocking::Client::new()
+        .delete(format!(
+            "{}/api/2.1/unity-catalog/tables/{DELETED_TABLE_NAMESPACE}.{table_name}",
+            unity_catalog_url()
+        ))
+        .send()
+        .unwrap_or_else(|e| panic!("DELETE {table_name}: {e}"));
+    assert!(
+        delete.status().is_success(),
+        "DELETE {table_name} returned {}",
+        delete.status()
+    );
+
+    assert_query_fails(
+        &mut conn,
+        &format!(
+            "SELECT * FROM {DELETED_TABLE_VS}.{}",
+            table_name.to_uppercase()
+        ),
+        &[&format!("{DELETED_TABLE_NAMESPACE}.{table_name}")],
+    );
+
+    conn.execute(&format!("DROP VIRTUAL SCHEMA {DELETED_TABLE_VS} CASCADE"));
+}
+
 /// Scenario: A declaration that disagrees with the Delta log fails the query
 #[test]
 fn unity_delta_query_fails_when_the_catalog_copy_disagrees_with_the_log() {

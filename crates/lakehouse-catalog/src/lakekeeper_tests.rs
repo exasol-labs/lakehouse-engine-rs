@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const WAREHOUSE_ID: &str = "5c25f9c4-be40-11f1-a87d-17102559a460";
 const PRINCIPAL: &str = "oidc~lakehouse-reader-a@corp.net";
@@ -216,4 +217,48 @@ async fn no_tables_need_no_batch_check() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// Scenario: Every catalog request kind is bounded and retried
+#[tokio::test]
+async fn a_batch_check_answered_503_once_succeeds_at_the_second_attempt() {
+    let tables = ["authz.authz_alpha"];
+    let (status, body) = recorded_response(include_str!(
+        "../tests/fixtures/lakekeeper/batch-check/allowed.json"
+    ));
+    let attempts = AtomicUsize::new(0);
+    let (uri, requests) = crate::test_support::spawn_server("application/json", move |request| {
+        if request.starts_with("GET /catalog/v1/config") {
+            return (
+                200,
+                format!(r#"{{"defaults":{{"prefix":"{WAREHOUSE_ID}"}}}}"#),
+            );
+        }
+        match attempts.fetch_add(1, Ordering::SeqCst) {
+            0 => (503, "{\"error\":\"busy\"}".into()),
+            _ => (status, body.clone()),
+        }
+    })
+    .await;
+    let creds = ConnectionCreds {
+        token: Some("tok".into()),
+        ..crate::test_support::base_creds()
+    };
+    let catalog_uri = format!("{uri}/catalog");
+    let session = CatalogSession::resolve(&catalog_uri, "wh", &creds)
+        .await
+        .expect("the config lookup succeeds");
+
+    let decisions = lakekeeper_batch_check(&session, PRINCIPAL, &tables, &creds)
+        .await
+        .expect("a 503 on the batch-check is retried to success");
+
+    assert!(decisions[0].allowed);
+    let posts = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.starts_with("POST"))
+        .count();
+    assert_eq!(posts, 2);
 }

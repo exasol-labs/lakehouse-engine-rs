@@ -1,4 +1,5 @@
 use crate::auth::{CatalogAuth, resolve_catalog_auth};
+use crate::catalog_http::{CatalogHttp, CatalogRequestError};
 use crate::iceberg_io::authed_get_json;
 use crate::namespace::parse_table_ident;
 use crate::redaction::redact_credentials;
@@ -24,7 +25,7 @@ fn build_load_table_url(catalog_uri: &str, prefix: &str, ns: &str, table_name: &
     catalog_url(
         catalog_uri,
         prefix,
-        &format!("namespaces/{ns}/tables/{table_name}"),
+        &format!("namespaces/{ns}/tables/{table_name}?snapshots=refs"),
     )
 }
 
@@ -55,7 +56,7 @@ fn prefix_from_config(config: &serde_json::Value) -> String {
 /// A config without a prefix yields an EMPTY prefix, never the warehouse: a warehouse like
 /// `s3://…` as a path segment gives HTTP 400.
 async fn resolve_load_table_prefix(
-    client: &reqwest::Client,
+    http: &CatalogHttp,
     catalog_uri: &str,
     warehouse: &str,
     auth: &CatalogAuth,
@@ -71,7 +72,7 @@ async fn resolve_load_table_prefix(
         "",
         &format!("config?warehouse={encoded_warehouse}"),
     );
-    authed_get_json::<serde_json::Value>(client, &config_url, auth, false, creds)
+    authed_get_json::<serde_json::Value>(http, &config_url, auth, false, creds)
         .await
         .map(|config| prefix_from_config(&config))
         .map_err(|e| {
@@ -85,7 +86,7 @@ async fn resolve_load_table_prefix(
 /// Catalog HTTP state resolved once per query and reused across every table's
 /// `loadTable` GET, so the OAuth grant and config lookup run once per query.
 pub struct CatalogSession {
-    client: reqwest::Client,
+    http: CatalogHttp,
     catalog_uri: String,
     auth: CatalogAuth,
     prefix: String,
@@ -99,20 +100,19 @@ impl CatalogSession {
         warehouse: &str,
         creds: &ConnectionCreds,
     ) -> Result<CatalogSession, UdfError> {
-        let client = reqwest::Client::new();
-        let auth = resolve_catalog_auth(&client, catalog_uri, creds).await?;
-        let prefix =
-            resolve_load_table_prefix(&client, catalog_uri, warehouse, &auth, creds).await?;
+        let http = CatalogHttp::new();
+        let auth = resolve_catalog_auth(&http, catalog_uri, creds).await?;
+        let prefix = resolve_load_table_prefix(&http, catalog_uri, warehouse, &auth, creds).await?;
         Ok(CatalogSession {
-            client,
+            http,
             catalog_uri: catalog_uri.to_string(),
             auth,
             prefix,
         })
     }
 
-    pub(crate) fn client(&self) -> &reqwest::Client {
-        &self.client
+    pub(crate) fn http(&self) -> &CatalogHttp {
+        &self.http
     }
 
     pub(crate) fn catalog_uri(&self) -> &str {
@@ -142,55 +142,51 @@ pub async fn load_table_any_auth(
         session,
         &ns_ident,
         &table_name,
-        "",
         creds.use_vended_credentials,
         creds,
     )
     .await
+    .map_err(UdfError::from)
 }
 
-/// The enumeration reads only the current schema, so it asks for no delegated access and for
-/// only the referenced snapshots (Iceberg REST `loadTable` `snapshots=refs`).
+/// The enumeration reads only the current schema, so it asks for no delegated access.
 pub(crate) async fn load_table_schema_metadata(
     session: &CatalogSession,
     namespace: &NamespaceIdent,
     table_name: &str,
     creds: &ConnectionCreds,
-) -> Result<TableMetadata, UdfError> {
-    load_table(
-        session,
-        namespace,
-        table_name,
-        "?snapshots=refs",
-        false,
-        creds,
-    )
-    .await
-    .map(|result| result.metadata)
+) -> Result<TableMetadata, CatalogRequestError> {
+    load_table(session, namespace, table_name, false, creds)
+        .await
+        .map(|result| result.metadata)
 }
 
+/// Names the table in every failure, so the enumeration load and `load_table_any_auth` both
+/// report which table could not be loaded. Asks for `snapshots=refs`: both callers read only the
+/// current snapshot, which the `main` branch always references.
 async fn load_table(
     session: &CatalogSession,
     namespace: &NamespaceIdent,
     table_name: &str,
-    query: &str,
     send_access_delegation: bool,
     creds: &ConnectionCreds,
-) -> Result<LoadTableResult, UdfError> {
+) -> Result<LoadTableResult, CatalogRequestError> {
     let url = build_load_table_url(
         &session.catalog_uri,
         &session.prefix,
         &namespace.to_url_string(),
         table_name,
     );
+    let identifier = format!("{}.{table_name}", namespace.join("."));
     authed_get_json::<LoadTableResult>(
-        &session.client,
-        &format!("{url}{query}"),
+        &session.http,
+        &url,
         &session.auth,
         send_access_delegation,
         creds,
     )
     .await
+    .map_err(|error| error.named(&identifier))
 }
 
 #[cfg(test)]

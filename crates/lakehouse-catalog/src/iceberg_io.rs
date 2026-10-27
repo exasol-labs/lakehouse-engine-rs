@@ -2,18 +2,14 @@
 //! Credential values never appear in any returned error.
 
 use crate::auth::{CatalogAuth, redact_catalog_auth_error};
-use crate::error_chain;
+use crate::catalog_http::{CatalogHttp, CatalogRequestError, quote_body};
 use crate::redaction::{redact_error_text, redact_secret_values};
 use crate::{ConnectionCreds, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::spec::TableMetadata;
-use std::time::Duration;
 
 /// A batch-check answer is small, so a larger 2xx answer is refused.
 pub(crate) const MAX_ANSWER_BYTES: usize = 64 * 1024;
-/// The most of an answer body an error quotes. The quote is cut only after the whole read is
-/// redacted, so a secret that the cut splits was already replaced.
-pub(crate) const MAX_QUOTED_BODY_BYTES: usize = 4096;
 
 /// The OAuth2 grant-obtained bearer token is not in `creds`, so it is redacted explicitly.
 fn redact_catalog_text(msg: &str, auth: &CatalogAuth, creds: &ConnectionCreds) -> String {
@@ -60,69 +56,23 @@ fn build_signed_request(
     }
 }
 
-async fn execute_request(
-    client: &reqwest::Client,
-    request: reqwest::Request,
-    auth: &CatalogAuth,
-    creds: &ConnectionCreds,
-) -> Result<reqwest::Response, UdfError> {
-    let deadline = request.timeout().copied();
-    client.execute(request).await.map_err(|e| {
-        UdfError::User(format!(
-            "catalog request failed: {}",
-            describe_transport_error(&e, deadline, auth, creds)
-        ))
-    })
-}
-
-/// reqwest's own text for an expired deadline names neither the deadline nor the timeout.
-fn describe_transport_error(
-    error: &reqwest::Error,
-    deadline: Option<Duration>,
-    auth: &CatalogAuth,
-    creds: &ConnectionCreds,
-) -> String {
-    match deadline {
-        Some(deadline) if error.is_timeout() => {
-            format!("the catalog sent no complete answer within {deadline:?}")
-        }
-        _ => redact_catalog_text(&error_chain(error), auth, creds),
-    }
-}
-
 pub(crate) async fn authed_get_json<T: serde::de::DeserializeOwned>(
-    client: &reqwest::Client,
+    http: &CatalogHttp,
     url: &str,
     auth: &CatalogAuth,
     send_access_delegation: bool,
     creds: &ConnectionCreds,
-) -> Result<T, UdfError> {
-    let mut builder = client.get(url).header("accept", "application/json");
+) -> Result<T, CatalogRequestError> {
+    let mut builder = http.get(url).header("accept", "application/json");
     if send_access_delegation {
         builder = builder.header("X-Iceberg-Access-Delegation", "vended-credentials");
     }
-    let request = build_signed_request(builder, auth, creds)?;
-    let response = execute_request(client, request, auth, creds).await?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "(unreadable body)".into());
-        return Err(UdfError::User(format!(
-            "catalog returned HTTP {}: {}",
-            status.as_u16(),
-            redact_catalog_text(&body, auth, creds)
-        )));
-    }
-
-    response.json::<T>().await.map_err(|e| {
-        UdfError::User(format!(
-            "failed to parse catalog response: {}",
-            redact_catalog_text(&e.to_string(), auth, creds)
-        ))
+    let request = build_signed_request(builder, auth, creds)
+        .map_err(|e| CatalogRequestError::without_status(e.to_string()))?;
+    http.send_json(request, "catalog request", |msg| {
+        redact_catalog_text(msg, auth, creds)
     })
+    .await
 }
 
 /// A non-2xx answer is a value, not an error, so the caller maps its status to its own failure.
@@ -133,89 +83,56 @@ pub(crate) enum PostAnswer {
     Refused { status: u16, body: String },
 }
 
-/// Bounded by `deadline`: a catalog that accepts the connection and never answers would hang it.
 pub(crate) async fn authed_post_json(
-    client: &reqwest::Client,
+    http: &CatalogHttp,
     url: &str,
     payload: &impl serde::Serialize,
     auth: &CatalogAuth,
     creds: &ConnectionCreds,
-    deadline: Duration,
 ) -> Result<PostAnswer, UdfError> {
     let body = serde_json::to_vec(payload)
         .map_err(|e| UdfError::User(format!("failed to serialize catalog request: {e}")))?;
-    let builder = client
+    let builder = http
         .post(url)
         .header("accept", "application/json")
         .header("content-type", "application/json")
         .body(body);
-    let mut request = build_signed_request(builder, auth, creds)?;
-    // reqwest applies a request's timeout until the last body byte, not only to the headers.
-    *request.timeout_mut() = Some(deadline);
-    let mut response = execute_request(client, request, auth, creds).await?;
+    let request = build_signed_request(builder, auth, creds)?;
+    let answer = http
+        .send_capped(request, MAX_ANSWER_BYTES)
+        .await
+        .map_err(|error| {
+            UdfError::User(format!(
+                "catalog request failed: {}",
+                error.render(|msg| redact_catalog_text(msg, auth, creds))
+            ))
+        })?;
 
-    let status = response.status();
-    let code = status.as_u16();
-    let answer = read_capped_body(&mut response).await.map_err(|e| {
-        UdfError::User(format!(
-            "failed to read the catalog's HTTP {code} answer: {}",
-            describe_transport_error(&e, Some(deadline), auth, creds)
-        ))
-    })?;
-    match (status.is_success(), answer.cut) {
+    let code = answer.status.as_u16();
+    let text = String::from_utf8_lossy(&answer.body).into_owned();
+    match (answer.status.is_success(), answer.cut) {
         (true, false) => Ok(PostAnswer::Accepted {
             status: code,
-            body: answer.text,
+            body: text,
         }),
         (true, true) => Err(UdfError::User(format!(
             "the catalog's HTTP {code} answer exceeds {MAX_ANSWER_BYTES} bytes: {}",
-            quote_catalog_body(&answer.text, auth, creds)
+            quote_catalog_body(&text, auth, creds)
         ))),
         (false, _) => Ok(PostAnswer::Refused {
             status: code,
-            body: quote_catalog_body(&answer.text, auth, creds),
+            body: quote_catalog_body(&text, auth, creds),
         }),
     }
 }
 
-struct CappedBody {
-    text: String,
-    cut: bool,
-}
-
-async fn read_capped_body(response: &mut reqwest::Response) -> Result<CappedBody, reqwest::Error> {
-    let mut bytes = Vec::new();
-    let mut cut = false;
-    while let Some(chunk) = response.chunk().await? {
-        let room = MAX_ANSWER_BYTES - bytes.len();
-        if chunk.len() > room {
-            bytes.extend_from_slice(&chunk[..room]);
-            cut = true;
-            break;
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(CappedBody {
-        text: String::from_utf8_lossy(&bytes).into_owned(),
-        cut,
-    })
-}
-
-/// `body` as an error may show it: redacted, then cut to [`MAX_QUOTED_BODY_BYTES`].
+/// `body` as an error may show it: redacted, then cut by [`quote_body`].
 pub(crate) fn quote_catalog_body(
     body: &str,
     auth: &CatalogAuth,
     creds: &ConnectionCreds,
 ) -> String {
-    let redacted = redact_catalog_text(body, auth, creds);
-    if redacted.len() <= MAX_QUOTED_BODY_BYTES {
-        return redacted;
-    }
-    let cut = redacted.floor_char_boundary(MAX_QUOTED_BODY_BYTES);
-    format!(
-        "{}... (truncated to {MAX_QUOTED_BODY_BYTES} bytes)",
-        &redacted[..cut]
-    )
+    quote_body(body.as_bytes(), |msg| redact_catalog_text(msg, auth, creds))
 }
 
 /// Reads the `metadata.json` a metastore points to (Iceberg § Metastore Tables) through `storage`.

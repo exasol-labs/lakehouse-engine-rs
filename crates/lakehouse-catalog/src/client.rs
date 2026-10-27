@@ -12,6 +12,7 @@ use iceberg::{NamespaceIdent, TableIdent};
 use tokio::sync::OnceCell;
 
 use crate::ConnectionCreds;
+use crate::catalog_http::CatalogRequestError;
 use crate::namespace::{CATALOG_REQUEST_CONCURRENCY, list_namespace_tables};
 use crate::session::{CatalogSession, load_table_schema_metadata};
 
@@ -250,13 +251,11 @@ impl IcebergRestCatalogClient {
     ) -> Result<TableAdmission, UdfError> {
         match self.load_on_session(session, ident).await {
             Ok(table) => Ok(TableAdmission::Admitted(table)),
-            Err(err) if is_not_loadable_iceberg_table(&err) => {
-                Ok(TableAdmission::Skipped(SkippedTable {
-                    ident: ident.clone(),
-                    reason: SkipReason::NotLoadableIcebergTable,
-                }))
-            }
-            Err(err) => Err(err),
+            Err(err) if err.is_not_found() => Ok(TableAdmission::Skipped(SkippedTable {
+                ident: ident.clone(),
+                reason: SkipReason::NotLoadableIcebergTable,
+            })),
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -265,9 +264,9 @@ impl IcebergRestCatalogClient {
         &self,
         session: &CatalogSession,
         ident: &CatalogTableIdent,
-    ) -> Result<CatalogTable, UdfError> {
+    ) -> Result<CatalogTable, CatalogRequestError> {
         let namespace = NamespaceIdent::from_vec(ident.namespace.clone()).map_err(|e| {
-            UdfError::User(format!(
+            CatalogRequestError::without_status(format!(
                 "invalid namespace in '{}': {e}",
                 catalog_identifier_string(ident)
             ))
@@ -315,7 +314,11 @@ impl CatalogClient for IcebergRestCatalogClient {
         ident: &CatalogTableIdent,
     ) -> Pin<Box<dyn Future<Output = Result<CatalogTable, UdfError>> + Send + '_>> {
         let ident = ident.clone();
-        Box::pin(async move { self.load_on_session(self.session().await?, &ident).await })
+        Box::pin(async move {
+            self.load_on_session(self.session().await?, &ident)
+                .await
+                .map_err(UdfError::from)
+        })
     }
 }
 
@@ -363,12 +366,6 @@ pub fn catalog_identifier_string(ident: &CatalogTableIdent) -> String {
     let mut parts: Vec<&str> = ident.namespace.iter().map(String::as_str).collect();
     parts.push(&ident.name);
     parts.join(".")
-}
-
-/// Matches the prefix minted by `iceberg_io::authed_get_json`, including `": "`,
-/// so a body merely containing `404` cannot false-match.
-fn is_not_loadable_iceberg_table(err: &UdfError) -> bool {
-    matches!(err, UdfError::User(msg) if msg.starts_with("catalog returned HTTP 404: "))
 }
 
 #[cfg(test)]

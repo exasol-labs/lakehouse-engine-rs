@@ -68,9 +68,10 @@ An Exasol user registers every Iceberg table in a configured namespace as a virt
 
 ### Scenario: A non-404 per-table load failure aborts createVirtualSchema
 
-* *GIVEN* a `createVirtualSchema` request whose configured namespace lists a table whose per-table `loadTable` request fails with something other than HTTP 404, a transport error, or an HTTP 401, 403, 419, 503, or any other non-404 status
+* *GIVEN* a `createVirtualSchema` request whose configured namespace lists a table whose per-table `loadTable` request fails with any failure except HTTP 404, after the retries of `catalog/catalog-http-resilience`
 * *WHEN* the adapter resolves that table's schema during enumeration
 * *THEN* the adapter SHALL abort `createVirtualSchema` with an error describing that the table could not be loaded, preserving the "fails clearly when the catalog is unreachable" contract, and MUST NOT silently skip the table, a non-404 failure signals a catalog-wide fault (auth, throttling, outage), and skipping it would hide a misconfiguration behind a partial schema
+* *AND* the error SHALL name the table by its dotted catalog identifier and carry the cause, per the scenario "A failed loadTable names the table it loads" of `catalog/pushdown-catalog-session`
 * *AND* the error message MUST NOT contain storage access keys, secret keys, session tokens, or any SigV4 signing key
 
 ### Scenario: Create virtual schema fails clearly when the catalog is unreachable
