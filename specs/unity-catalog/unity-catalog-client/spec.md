@@ -91,9 +91,10 @@ A thin client in `crates/lakehouse-catalog` for the native Unity Catalog REST AP
 
 ### Scenario: The client surfaces a transport or HTTP-status failure as a clear, credential-safe error
 
-* *GIVEN* a `UnityCatalogSession` whose next request fails with a transport error, a non-success HTTP status, or an unparseable response body
+* *GIVEN* a `UnityCatalogSession` whose next request fails with a transport error, a non-success HTTP status, or an unparseable response body, after the retries that `catalog/catalog-http-resilience` grants a transient failure
 * *WHEN* the client issues a list or get-table request
 * *THEN* the client SHALL return an error describing that the Unity Catalog request failed and naming the request kind
+* *AND* a failed get-table request SHALL also name the table by its full name `catalog.schema.table`, both in the single-table load of a pushdown and in the load of listed tables of a partial refresh
 * *AND* the error message MUST NOT contain the resolved bearer token, any OAuth client secret, or any other credential value
 * *AND* the client SHALL return the failure as an error value rather than panicking, because a panic inside a UDF is an abnormal VM exit
 
