@@ -7,9 +7,9 @@ use common::cloud_fixture::panic_message;
 use common::e2e_harness::{
     SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_binary_values_refused,
     assert_decimal_orders_numerically, assert_notes_well_formed, assert_text_columns,
-    assert_type_matrix, column_adapter_notes, create_schema_and_scripts, declared_types, exa_conn,
-    explain_virtual_sql, identifier_note, install_slc, int_column, note_of, pairs, parse_int,
-    partition_positions, query_error, reads, refuses, runtime, skipped_entries,
+    assert_type_matrix, column_adapter_notes, create_schema_and_scripts, declared_types,
+    error_text, exa_conn, explain_virtual_sql, identifier_note, install_slc, int_column, note_of,
+    pairs, parse_int, partition_positions, query_error, reads, refuses, runtime, skipped_entries,
     try_create_virtual_schema_with_password, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
@@ -816,17 +816,12 @@ fn check_assume_role_connection_reads_through_the_role(run: &GlueRun, conn: &mut
         &database,
         &glue_base_identity_connection_password(env),
     );
-    let error = value_to_string(&response["exception"]["text"]);
     let mut cleanup = redacting_conn();
     for (vs, connection) in [(ROLE_VS, ROLE_CONN), (BASE_VS, BASE_CONN)] {
         let _ = cleanup.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs} CASCADE"));
         let _ = cleanup.try_execute(&format!("DROP CONNECTION IF EXISTS {connection}"));
     }
-    assert_ne!(
-        response["status"].as_str(),
-        Some("ok"),
-        "Glue must deny the base identity without its role"
-    );
+    let error = error_text(&response);
     assert!(
         error.contains("AccessDenied"),
         "the denial must come from Glue: {}",
@@ -932,12 +927,7 @@ fn glue_credentials_never_appear_in_output() {
         &glue_connection_password(&sentinel_env),
     );
     conn.execute(&format!("DROP CONNECTION IF EXISTS {PROBE_CONN}"));
-    assert_ne!(
-        response["status"].as_str(),
-        Some("ok"),
-        "a virtual schema over sentinel credentials must fail"
-    );
-    let error = value_to_string(&response["exception"]["text"]);
+    let error = error_text(&response);
     assert!(
         error.contains("Glue"),
         "the adapter must report the rejected Glue call: {}",

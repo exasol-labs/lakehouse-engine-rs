@@ -5,13 +5,12 @@
 mod common;
 
 use common::e2e_harness::{
-    ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VARCHAR_JSON, VsProps,
-    assert_decimal_orders_numerically, assert_query_fails, assert_type_matrix,
-    column_adapter_notes, create_schema_and_scripts, create_virtual_schema_with_password,
-    declared_types, enumerated_table_names, exa_conn, explain_virtual_sql,
-    has_broadcast_join_block, has_two_scan_wrapper, identifier_note, install_slc, note_of, pairs,
-    parse_int, parse_numeric, partition_positions, query_error, reads, refuses, text_column,
-    upload_so, value_to_string,
+    SCAN_SCRIPT_NAME, SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_decimal_orders_numerically,
+    assert_query_fails, assert_type_matrix, column_adapter_notes, create_schema_and_scripts,
+    create_virtual_schema_with_password, declared_types, enumerated_table_names, exa_conn,
+    explain_virtual_sql, has_broadcast_join_block, has_two_scan_wrapper, identifier_note,
+    install_slc, note_of, pairs, parse_int, parse_numeric, partition_positions, query_error, reads,
+    refuses, text_column, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
@@ -141,21 +140,15 @@ fn setup() {
 }
 
 fn create_unity_virtual_schema(conn: &mut ExaConn) {
-    let password = local_stack_connection_password();
-    let create_conn_sql =
-        build_create_connection_sql(CONN_NAME, UNITY_CATALOG_URI_INTERNAL, &password);
-    conn.execute(&create_conn_sql);
-
-    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {VS_NAME} CASCADE"));
-
-    conn.execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA {VS_NAME}
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION = '{CONN_NAME}'
-  CATALOG_KIND       = 'UNITY_CATALOG'
-  NAMESPACE  = '{UNITY_NAMESPACE}'
-  ALLOW_HTTP         = 'true'"#
-    ));
+    create_virtual_schema_with_password(
+        conn,
+        &VsProps::new(VS_NAME, UNITY_NAMESPACE)
+            .with_catalog_kind("UNITY_CATALOG")
+            .with_catalog_conn_name(CONN_NAME)
+            .without_parallelism_factor(),
+        UNITY_CATALOG_URI_INTERNAL,
+        &local_stack_connection_password(),
+    );
 }
 
 /// Over the seeded entries whose catalog metadata deliberately disagrees with their Delta logs.
@@ -191,22 +184,15 @@ fn create_unity_role_virtual_schema(conn: &mut ExaConn) {
         aws_sts_endpoint: Some(stack::seaweedfs_url_internal()),
         ..local_stack_connection_password()
     };
-    let create_conn_sql =
-        build_create_connection_sql(CONN_ROLE_NAME, UNITY_CATALOG_URI_INTERNAL, &password);
-    conn.execute(&create_conn_sql);
-
-    let _ = conn.try_execute(&format!(
-        "DROP VIRTUAL SCHEMA IF EXISTS {VS_ROLE_NAME} CASCADE"
-    ));
-
-    conn.execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA {VS_ROLE_NAME}
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION = '{CONN_ROLE_NAME}'
-  CATALOG_KIND       = 'UNITY_CATALOG'
-  NAMESPACE  = '{UNITY_NAMESPACE}'
-  ALLOW_HTTP         = 'true'"#
-    ));
+    create_virtual_schema_with_password(
+        conn,
+        &VsProps::new(VS_ROLE_NAME, UNITY_NAMESPACE)
+            .with_catalog_kind("UNITY_CATALOG")
+            .with_catalog_conn_name(CONN_ROLE_NAME)
+            .without_parallelism_factor(),
+        UNITY_CATALOG_URI_INTERNAL,
+        &password,
+    );
 }
 
 /// A third Virtual Schema over the SAME seeded `unity.delta_e2e` namespace, reading storage

@@ -11,6 +11,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 
+use super::e2e_harness::runtime;
 use super::lakekeeper::{
     self, WAREHOUSE_AUTHZ, WarehouseProfile, http_client, keycloak_client_credentials_token,
     keycloak_client_credentials_token_for, management_base,
@@ -548,16 +549,12 @@ fn table_uuid(warehouse_id: &str, namespace: &str, table: &str) -> String {
 /// The permission-check tests scan these tables, so unlike the fixture tables they hold data.
 /// Seeding is idempotent, so the tables and their ids survive across runs.
 fn ensure_seeded_data_tables(warehouse_id: &str) -> Vec<(&'static str, String)> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime for seeding the authz warehouse");
     let auth = SeedCatalogAuth {
         token: Some(keycloak_client_credentials_token()),
         ..Default::default()
     };
     let host = lakekeeper::catalog_uri_host();
-    runtime
+    runtime()
         .block_on(async {
             seed_events_table_with_auth(&host, WAREHOUSE_AUTHZ, auth.clone()).await?;
             seed_star_schema_with_auth(&host, WAREHOUSE_AUTHZ, auth).await

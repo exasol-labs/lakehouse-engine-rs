@@ -15,7 +15,7 @@ use common::e2e_harness::{
     assert_decimal_orders_numerically, assert_text_columns, create_schema_and_scripts,
     create_virtual_schema_with_password, declared_type, enumerated_table_names, error_text,
     exa_conn, expected_join_rows, explain_virtual_sql, fetch_join_rows, has_broadcast_join_block,
-    has_two_scan_wrapper, install_slc, join_query, parse_int, projection_rows, upload_so,
+    has_two_scan_wrapper, install_slc, join_query, parse_int, projection_rows, runtime, upload_so,
     value_to_string,
 };
 use common::exasol_ws::ExaConn;
@@ -78,10 +78,7 @@ fn setup() {
         lakekeeper::lakekeeper_create_warehouse(&WarehouseProfile::vended());
 
         // A fresh token per warehouse so a short token lifetime cannot expire mid-seed.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
+        let rt = runtime();
         let host_catalog = lakekeeper::catalog_uri_host();
         for warehouse in [WAREHOUSE_STATIC, WAREHOUSE_VENDED] {
             let token = lakekeeper::keycloak_client_credentials_token();
@@ -586,12 +583,7 @@ fn lakekeeper_vended_credentials_are_scoped_per_table() {
     let dim = probe_vended_credential(E2E_DIM_TABLE);
     let secrets = [fact.secrets(), dim.secrets()].concat();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime for the vended-credential scope probe");
-
-    rt.block_on(async {
+    runtime().block_on(async {
         // Printed first so the observed state survives a failing control read.
         println!(
             "lakekeeper_vended_credentials_are_scoped_per_table:\n  \

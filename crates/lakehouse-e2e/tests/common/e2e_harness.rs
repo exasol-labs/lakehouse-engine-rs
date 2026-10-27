@@ -170,6 +170,7 @@ pub const E2E_PARALLELISM_FACTOR: usize = 2;
 
 pub struct VsProps<'a> {
     vs_name: &'a str,
+    adapter_schema: &'a str,
     namespace: &'a str,
     catalog_conn_name: &'a str,
     parallelism_factor: Option<usize>,
@@ -184,6 +185,7 @@ impl<'a> VsProps<'a> {
     pub fn new(vs_name: &'a str, namespace: &'a str) -> Self {
         Self {
             vs_name,
+            adapter_schema: SCHEMA_NAME,
             namespace,
             catalog_conn_name: DEFAULT_CATALOG_CONN_NAME,
             parallelism_factor: Some(E2E_PARALLELISM_FACTOR),
@@ -195,8 +197,19 @@ impl<'a> VsProps<'a> {
         }
     }
 
+    pub fn with_adapter_schema(mut self, schema: &'a str) -> Self {
+        self.adapter_schema = schema;
+        self
+    }
+
     pub fn with_parallelism_factor(mut self, factor: usize) -> Self {
         self.parallelism_factor = Some(factor);
+        self
+    }
+
+    /// Leaves the adapter's own default in force.
+    pub fn without_parallelism_factor(mut self) -> Self {
+        self.parallelism_factor = None;
         self
     }
 
@@ -238,6 +251,12 @@ pub fn create_virtual_schema(conn: &mut ExaConn, props: &VsProps) {
     let password = local_stack_connection_password();
     let catalog_uri = iceberg_catalog_url_internal();
     create_virtual_schema_with_password(conn, props, &catalog_uri, &password);
+}
+
+pub fn try_create_virtual_schema(conn: &mut ExaConn, props: &VsProps) -> serde_json::Value {
+    let password = local_stack_connection_password();
+    let catalog_uri = iceberg_catalog_url_internal();
+    try_create_virtual_schema_with_password(conn, props, &catalog_uri, &password)
 }
 
 fn optional_clause(key: &str, value: Option<impl std::fmt::Display>) -> String {
@@ -302,10 +321,11 @@ fn prepare_create_virtual_schema(
 
     format!(
         r#"CREATE VIRTUAL SCHEMA {vs_name}
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
+USING {adapter_schema}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = '{catalog_conn_name}'
   ALLOW_HTTP          = 'true'{namespace_clause}{parallelism_clause}{join_clause}{catalog_kind_clause}{merge_schema_clause}{hive_partitioning_clause}{property_clauses}"#,
         vs_name = props.vs_name,
+        adapter_schema = props.adapter_schema,
         catalog_conn_name = props.catalog_conn_name,
     )
 }

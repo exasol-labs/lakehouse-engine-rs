@@ -22,11 +22,7 @@ fn capture_pushdown_payload() {
     wait_for_seaweedfs();
     wait_for_iceberg_catalog();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    rt.block_on(async {
+    runtime().block_on(async {
         seed_typed_distinct_probe(&iceberg_catalog_url(), "s3://warehouse/")
             .await
             .expect("seed typed_distinct_probe")

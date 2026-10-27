@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::pruning_fixture::{
-    PRUNING_FILES, PRUNING_NAMESPACE, PRUNING_PARTITION_COLUMN, PRUNING_TABLE, PruningFile,
-    iceberg_file_prefix, pruning_batch, pruning_writer_properties,
+    PRUNING_FILES, PRUNING_NAMESPACE, PRUNING_PARTITION_COLUMN, PRUNING_TABLE, iceberg_file_prefix,
+    pruning_batch, pruning_writer_properties,
 };
 use super::raw_parquet::{encode_parquet_message, write_parquet_column};
 
@@ -311,6 +311,33 @@ where
     F: IntoIterator<Item = B>,
     B: IntoIterator<Item = RecordBatch>,
 {
+    let Some(table) = empty_table_to_fill(
+        catalog,
+        namespace,
+        table_name,
+        iceberg_schema,
+        unpartitioned(),
+        properties,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    let files = files
+        .into_iter()
+        .map(|batches| (table_name.to_string(), Struct::empty(), batches));
+    append_files(catalog, table, files).await
+}
+
+/// Creates the table when absent or stale, and returns it when it holds no data yet.
+async fn empty_table_to_fill(
+    catalog: &impl Catalog,
+    namespace: &str,
+    table_name: &str,
+    iceberg_schema: IcebergSchema,
+    partition_spec: UnboundPartitionSpec,
+    properties: HashMap<String, String>,
+) -> Result<Option<Table>> {
     let ns = NamespaceIdent::new(namespace.to_string());
     let ident = TableIdent::new(ns.clone(), table_name.to_string());
 
@@ -326,7 +353,7 @@ where
         let schema_matches = schema_field_signature(table.metadata().current_schema())
             == schema_field_signature(&iceberg_schema);
         if populated && schema_matches {
-            return Ok(false);
+            return Ok(None);
         }
         catalog
             .drop_table(&ident)
@@ -342,30 +369,69 @@ where
         let _ = catalog.create_namespace(&ns, HashMap::new()).await;
     }
 
-    let partition_spec = UnboundPartitionSpec::builder().with_spec_id(0).build();
     let creation = TableCreation::builder()
         .name(table_name.to_string())
         .schema(iceberg_schema)
         .partition_spec(partition_spec)
         .properties(properties)
         .build();
-    let mut table = match catalog.create_table(&ns, creation).await {
+    let table = match catalog.create_table(&ns, creation).await {
         Ok(t) => t,
         Err(create_error) => catalog.load_table(&ident).await.with_context(|| {
             format!("create table failed ({create_error}); loading it instead also failed")
         })?,
     };
+    let empty = collect_current_snapshot_paths(&table).await?.is_empty();
+    Ok(empty.then_some(table))
+}
 
-    if !collect_current_snapshot_paths(&table).await?.is_empty() {
-        return Ok(false);
-    }
+/// An empty spec, not a void field: a void field needs a one-value partition struct and
+/// fails the commit ("Partition value is not compatible with partition type").
+fn unpartitioned() -> UnboundPartitionSpec {
+    UnboundPartitionSpec::builder().with_spec_id(0).build()
+}
 
+/// The partition field needs an explicit field-id (partition ids start at 1000): an
+/// unbound spec serializes `field-id: null`, which the REST catalog rejects.
+fn identity_partition_spec(source_id: i32, column: &str) -> Result<UnboundPartitionSpec> {
+    let field = UnboundPartitionField::builder()
+        .source_ids(vec![source_id])
+        .field_id(1000)
+        .name(column.to_string())
+        .transform(Transform::Identity)
+        .build()
+        .with_context(|| format!("build the {column} partition field"))?;
+    Ok(UnboundPartitionSpec::builder()
+        .with_spec_id(1)
+        .add_partition_fields([field])
+        .with_context(|| format!("build the {column} partition spec"))?
+        .build())
+}
+
+/// Each `(file prefix, partition value, batches)` entry is one data file in its own
+/// fast-append, making the `GROUP BY shard_key` fan-out observable.
+async fn append_files<B>(
+    catalog: &impl Catalog,
+    mut table: Table,
+    files: impl IntoIterator<Item = (String, Struct, B)>,
+) -> Result<bool>
+where
+    B: IntoIterator<Item = RecordBatch>,
+{
     let mut wrote_any = false;
-    for batches in files {
-        write_one_file_append(catalog, &table, table_name, batches).await?;
+    for (prefix, partition, batches) in files {
+        let data_files = write_data_files(
+            &table,
+            &prefix,
+            partition,
+            WriterProperties::default(),
+            batches,
+        )
+        .await?;
+        commit_data_files(catalog, &table, data_files).await?;
         wrote_any = true;
         table = catalog
-            .load_table(&ident)
+            .load_table(table.identifier())
             .await
             .context("reload table between appends")?;
     }
@@ -378,40 +444,59 @@ pub async fn write_one_file_append(
     table_name: &str,
     batches: impl IntoIterator<Item = RecordBatch>,
 ) -> Result<()> {
+    let data_files = write_data_files(
+        table,
+        table_name,
+        Struct::empty(),
+        WriterProperties::default(),
+        batches,
+    )
+    .await?;
+    commit_data_files(catalog, table, data_files).await
+}
+
+/// Writes one uncommitted data file whose name starts with `<prefix>-`.
+async fn write_data_files(
+    table: &Table,
+    prefix: &str,
+    partition: Struct,
+    properties: WriterProperties,
+    batches: impl IntoIterator<Item = RecordBatch>,
+) -> Result<Vec<DataFile>> {
     let schema = table.metadata().current_schema().clone();
-    let file_io = table.file_io().clone();
-    let location_gen = FlatLocationGenerator {
-        base: table.metadata().location().to_string(),
-    };
     let file_name_gen = DefaultFileNameGenerator::new(
-        table_name.to_string(),
+        prefix.to_string(),
         Some(uuid_suffix()),
         DataFileFormat::Parquet,
     );
-    let parquet_builder =
-        ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone());
     let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_builder,
-        file_io,
-        location_gen,
+        ParquetWriterBuilder::new(properties, schema.clone()),
+        table.file_io().clone(),
+        FlatLocationGenerator {
+            base: table.metadata().location().to_string(),
+        },
         file_name_gen,
     );
     let partition_key = iceberg::spec::PartitionKey::new(
         table.metadata().default_partition_spec().as_ref().clone(),
         schema.clone(),
-        Struct::empty(),
+        partition,
     );
     let mut writer = DataFileWriterBuilder::new(rolling_builder)
         .build(Some(partition_key))
         .await
-        .context("build data file writer")?;
-
+        .with_context(|| format!("build the {prefix} data file writer"))?;
     for batch in batches {
         let batch = overlay_iceberg_field_ids(&batch, &schema)?;
-        writer.write(batch).await.context("write Arrow batch")?;
+        writer
+            .write(batch)
+            .await
+            .with_context(|| format!("write a {prefix} batch"))?;
     }
-    let data_files = writer.close().await.context("close data file writer")?;
-    commit_data_files(catalog, table, data_files).await
+    writer
+        .close()
+        .await
+        .with_context(|| format!("close the {prefix} data file writer"))
 }
 
 pub async fn commit_data_files(
@@ -433,7 +518,7 @@ async fn seed_events_table(catalog_url: &str, warehouse: &str) -> Result<SeedHan
 }
 
 /// Lakekeeper routes by warehouse name from `GET /v1/config?warehouse=`, so only the
-/// name is needed.
+/// name is needed. Two data files make the shard fan-out observable.
 pub async fn seed_events_table_with_auth(
     catalog_url: &str,
     warehouse: &str,
@@ -441,59 +526,29 @@ pub async fn seed_events_table_with_auth(
 ) -> Result<SeedHandle> {
     let catalog =
         build_seed_catalog_with_auth(catalog_url, warehouse, "lakehouse-e2e-seed", auth).await?;
-
-    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
-    let table_ident = TableIdent::new(ns.clone(), E2E_TABLE.to_string());
-
-    if let Some(paths) = existing_data_file_paths(&catalog, &table_ident).await?
-        && !paths.is_empty()
-    {
-        return Ok(SeedHandle {
-            data_file_paths: paths,
-        });
-    }
-
-    if !catalog
-        .namespace_exists(&ns)
+    let mid = SEED_TOTAL_ROWS / 2;
+    create_and_append_files(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_TABLE,
+        events_iceberg_schema()?,
+        [
+            [make_events_batch(1, mid)],
+            [make_events_batch(mid + 1, SEED_TOTAL_ROWS)],
+        ],
+    )
+    .await
+    .context("seed events table")?;
+    let ident = TableIdent::new(
+        NamespaceIdent::new(E2E_NAMESPACE.to_string()),
+        E2E_TABLE.to_string(),
+    );
+    let table = catalog
+        .load_table(&ident)
         .await
-        .context("check namespace")?
-    {
-        catalog
-            .create_namespace(&ns, HashMap::new())
-            .await
-            .context("create e2e_lakehouse namespace")?;
-    }
-
-    let iceberg_schema = events_iceberg_schema()?;
-    // An empty spec, not a void field: a void field needs a one-value partition struct and
-    // fails the commit ("Partition value is not compatible with partition type").
-    let partition_spec = UnboundPartitionSpec::builder().with_spec_id(0).build();
-
-    let creation = TableCreation::builder()
-        .name(E2E_TABLE.to_string())
-        .schema(iceberg_schema)
-        .partition_spec(partition_spec)
-        .properties(HashMap::new())
-        .build();
-
-    let table = match catalog.create_table(&ns, creation).await {
-        Ok(t) => t,
-        Err(_) => catalog
-            .load_table(&table_ident)
-            .await
-            .context("load existing events table after create failed")?,
-    };
-
-    let existing = collect_current_snapshot_paths(&table).await?;
-    if !existing.is_empty() {
-        return Ok(SeedHandle {
-            data_file_paths: existing,
-        });
-    }
-
-    let paths = write_events_and_commit(&catalog, table).await?;
+        .context("load events table")?;
     Ok(SeedHandle {
-        data_file_paths: paths,
+        data_file_paths: collect_current_snapshot_paths(&table).await?,
     })
 }
 
@@ -596,72 +651,6 @@ impl iceberg::writer::file_writer::location_generator::LocationGenerator for Fla
     }
 }
 
-/// Two data files make the shard fan-out observable (`GROUP BY shard_key` with G = 2).
-async fn write_events_and_commit<C: Catalog>(catalog: &C, table: Table) -> Result<Vec<String>> {
-    let mid = SEED_TOTAL_ROWS / 2;
-    let first_path = write_one_data_file(catalog, &table, 1, mid).await?;
-    let table = catalog
-        .load_table(table.identifier())
-        .await
-        .context("reload table between seed appends")?;
-    let second_path = write_one_data_file(catalog, &table, mid + 1, SEED_TOTAL_ROWS).await?;
-
-    Ok(vec![first_path, second_path])
-}
-
-async fn write_one_data_file<C: Catalog>(
-    catalog: &C,
-    table: &Table,
-    first_id: usize,
-    last_id: usize,
-) -> Result<String> {
-    let iceberg_schema = table.metadata().current_schema().clone();
-    let file_io = table.file_io().clone();
-    let table_location = table.metadata().location().to_string();
-    let partition_spec = table.metadata().default_partition_spec().as_ref().clone();
-
-    let location_gen = FlatLocationGenerator {
-        base: table_location.clone(),
-    };
-    let file_name_gen = DefaultFileNameGenerator::new(
-        "events".to_string(),
-        Some(uuid_suffix()),
-        DataFileFormat::Parquet,
-    );
-
-    let parquet_builder =
-        ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema.clone());
-    let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_builder,
-        file_io.clone(),
-        location_gen,
-        file_name_gen,
-    );
-
-    let partition_key =
-        iceberg::spec::PartitionKey::new(partition_spec, iceberg_schema.clone(), Struct::empty());
-
-    let mut writer = DataFileWriterBuilder::new(rolling_builder)
-        .build(Some(partition_key))
-        .await
-        .context("build data file writer")?;
-
-    let batch = make_events_batch(first_id, last_id);
-    let batch = overlay_iceberg_field_ids(&batch, &iceberg_schema)?;
-    writer.write(batch).await.context("write Arrow batch")?;
-    let data_files = writer.close().await.context("close data file writer")?;
-    let paths: Vec<String> = data_files
-        .iter()
-        .map(|df| df.file_path().to_string())
-        .collect();
-    commit_data_files(catalog, table, data_files).await?;
-
-    paths
-        .into_iter()
-        .next()
-        .context("data file writer produced no file for the id range")
-}
-
 /// Detects schema drift of a persisted table so it is reseeded, not reused.
 fn schema_field_signature(schema: &IcebergSchema) -> Vec<(String, Type)> {
     schema
@@ -670,22 +659,6 @@ fn schema_field_signature(schema: &IcebergSchema) -> Vec<(String, Type)> {
         .iter()
         .map(|f| (f.name.clone(), (*f.field_type).clone()))
         .collect()
-}
-
-async fn existing_data_file_paths<C: Catalog>(
-    catalog: &C,
-    ident: &TableIdent,
-) -> Result<Option<Vec<String>>> {
-    if !catalog
-        .table_exists(ident)
-        .await
-        .context("check table exists")?
-    {
-        return Ok(None);
-    }
-    let table = catalog.load_table(ident).await.context("load table")?;
-    let paths = collect_current_snapshot_paths(&table).await?;
-    Ok(Some(paths))
 }
 
 async fn collect_current_snapshot_paths(table: &Table) -> Result<Vec<String>> {
@@ -725,40 +698,15 @@ fn uuid_suffix() -> String {
 /// Ids match the events table, so an Exasol-side JOIN works.
 async fn seed_labels_table(catalog_url: &str, warehouse: &str) -> Result<()> {
     let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-labels").await?;
-
-    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
-    let table_ident = TableIdent::new(ns.clone(), E2E_TABLE_2.to_string());
-
-    if let Some(paths) = existing_data_file_paths(&catalog, &table_ident).await?
-        && !paths.is_empty()
-    {
-        return Ok(());
-    }
-
-    let iceberg_schema = labels_iceberg_schema()?;
-    let partition_spec = UnboundPartitionSpec::builder().with_spec_id(0).build();
-
-    let creation = TableCreation::builder()
-        .name(E2E_TABLE_2.to_string())
-        .schema(iceberg_schema)
-        .partition_spec(partition_spec)
-        .properties(HashMap::new())
-        .build();
-
-    let table = match catalog.create_table(&ns, creation).await {
-        Ok(t) => t,
-        Err(_) => catalog
-            .load_table(&table_ident)
-            .await
-            .context("load existing labels table after create failed")?,
-    };
-
-    let existing = collect_current_snapshot_paths(&table).await?;
-    if !existing.is_empty() {
-        return Ok(());
-    }
-
-    write_labels_and_commit(&catalog, table).await?;
+    create_and_append(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_TABLE_2,
+        labels_iceberg_schema()?,
+        [make_labels_batch(1, SEED_LABELS_ROWS)],
+    )
+    .await
+    .context("seed labels table")?;
     Ok(())
 }
 
@@ -792,68 +740,6 @@ fn make_labels_batch(first_id: usize, last_id: usize) -> RecordBatch {
         ],
     )
     .expect("labels RecordBatch construction is infallible")
-}
-
-async fn write_labels_and_commit<C: Catalog>(catalog: &C, table: Table) -> Result<Vec<String>> {
-    write_one_labels_data_file(catalog, &table, 1, SEED_LABELS_ROWS).await
-}
-
-async fn write_one_labels_data_file<C: Catalog>(
-    catalog: &C,
-    table: &Table,
-    first_id: usize,
-    last_id: usize,
-) -> Result<Vec<String>> {
-    let iceberg_schema = table.metadata().current_schema().clone();
-    let file_io = table.file_io().clone();
-    let table_location = table.metadata().location().to_string();
-    let partition_spec = table.metadata().default_partition_spec().as_ref().clone();
-
-    let location_gen = FlatLocationGenerator {
-        base: table_location.clone(),
-    };
-    let file_name_gen = DefaultFileNameGenerator::new(
-        E2E_TABLE_2.to_string(),
-        Some(uuid_suffix()),
-        DataFileFormat::Parquet,
-    );
-
-    let parquet_builder =
-        ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema.clone());
-    let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_builder,
-        file_io.clone(),
-        location_gen,
-        file_name_gen,
-    );
-
-    let partition_key =
-        iceberg::spec::PartitionKey::new(partition_spec, iceberg_schema.clone(), Struct::empty());
-
-    let mut writer = DataFileWriterBuilder::new(rolling_builder)
-        .build(Some(partition_key))
-        .await
-        .context("build labels data file writer")?;
-
-    let batch = make_labels_batch(first_id, last_id);
-    let batch = overlay_iceberg_field_ids(&batch, &iceberg_schema)?;
-    writer
-        .write(batch)
-        .await
-        .context("write labels Arrow batch")?;
-    let data_files = writer
-        .close()
-        .await
-        .context("close labels data file writer")?;
-    let paths: Vec<String> = data_files
-        .iter()
-        .map(|df| df.file_path().to_string())
-        .collect();
-    commit_data_files(catalog, table, data_files)
-        .await
-        .context("commit the labels data files")?;
-
-    Ok(paths)
 }
 
 // Star schema for join pushdown. Disjoint column prefixes (C_* vs O_*) let the
@@ -1215,53 +1101,31 @@ fn make_lineitem_batch(first_row: usize, last_row: usize) -> RecordBatch {
 /// min/max bounds are tight.
 pub async fn seed_partitioned(catalog_url: &str, warehouse: &str) -> Result<()> {
     let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-regions").await?;
-
-    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
-    let table_ident = TableIdent::new(ns.clone(), E2E_PART_TABLE.to_string());
-
-    if let Some(paths) = existing_data_file_paths(&catalog, &table_ident).await?
-        && !paths.is_empty()
-    {
+    let Some(table) = empty_table_to_fill(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_PART_TABLE,
+        regions_iceberg_schema()?,
+        identity_partition_spec(2, PART_COL)?,
+        HashMap::new(),
+    )
+    .await?
+    else {
         return Ok(());
-    }
-
-    let iceberg_schema = regions_iceberg_schema()?;
-    // The partition field needs an explicit field-id (partition ids start at 1000): an
-    // unbound spec serializes `field-id: null`, which the REST catalog rejects.
-    let partition_field = UnboundPartitionField::builder()
-        .source_ids(vec![2])
-        .field_id(1000)
-        .name(PART_COL.to_string())
-        .transform(Transform::Identity)
-        .build()
-        .context("build regions partition field")?;
-    let partition_spec = UnboundPartitionSpec::builder()
-        .with_spec_id(1)
-        .add_partition_fields([partition_field])
-        .context("build regions partition spec")?
-        .build();
-
-    let creation = TableCreation::builder()
-        .name(E2E_PART_TABLE.to_string())
-        .schema(iceberg_schema)
-        .partition_spec(partition_spec)
-        .properties(HashMap::new())
-        .build();
-
-    let table = match catalog.create_table(&ns, creation).await {
-        Ok(t) => t,
-        Err(_) => catalog
-            .load_table(&table_ident)
-            .await
-            .context("load existing regions table after create failed")?,
     };
-
-    let existing = collect_current_snapshot_paths(&table).await?;
-    if !existing.is_empty() {
-        return Ok(());
-    }
-
-    write_regions_and_commit(&catalog, table).await?;
+    let files = [
+        (PART_VAL_NORTH, PART_NORTH_IDS),
+        (PART_VAL_CENTRAL, PART_CENTRAL_IDS),
+        (PART_VAL_SOUTH, PART_SOUTH_IDS),
+    ]
+    .map(|(region, (first_id, last_id))| {
+        (
+            format!("{E2E_PART_TABLE}-{region}"),
+            Struct::from_iter([Some(Literal::string(region))]),
+            [make_regions_batch(first_id, last_id, region)],
+        )
+    });
+    append_files(&catalog, table, files).await?;
     Ok(())
 }
 
@@ -1295,99 +1159,10 @@ fn make_regions_batch(first_id: usize, last_id: usize, region: &str) -> RecordBa
     .expect("regions RecordBatch construction is infallible")
 }
 
-async fn write_regions_and_commit<C: Catalog>(catalog: &C, table: Table) -> Result<()> {
-    let ranges: [(&str, usize, usize); 3] = [
-        (PART_VAL_NORTH, PART_NORTH_IDS.0, PART_NORTH_IDS.1),
-        (PART_VAL_CENTRAL, PART_CENTRAL_IDS.0, PART_CENTRAL_IDS.1),
-        (PART_VAL_SOUTH, PART_SOUTH_IDS.0, PART_SOUTH_IDS.1),
-    ];
-
-    let mut current_table = table;
-    for (region, first_id, last_id) in ranges {
-        write_one_partitioned_file(catalog, &current_table, first_id, last_id, region).await?;
-        current_table = catalog
-            .load_table(current_table.identifier())
-            .await
-            .context("reload regions table between partition appends")?;
-    }
-    Ok(())
-}
-
-async fn write_one_partitioned_file<C: Catalog>(
-    catalog: &C,
-    table: &Table,
-    first_id: usize,
-    last_id: usize,
-    region: &str,
-) -> Result<()> {
-    let iceberg_schema = table.metadata().current_schema().clone();
-    let file_io = table.file_io().clone();
-    let table_location = table.metadata().location().to_string();
-    let partition_spec = table.metadata().default_partition_spec().as_ref().clone();
-
-    let location_gen = FlatLocationGenerator {
-        base: table_location.clone(),
-    };
-    let file_name_gen = DefaultFileNameGenerator::new(
-        format!("{E2E_PART_TABLE}-{region}"),
-        Some(uuid_suffix()),
-        DataFileFormat::Parquet,
-    );
-
-    let parquet_builder =
-        ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema.clone());
-    let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_builder,
-        file_io.clone(),
-        location_gen,
-        file_name_gen,
-    );
-
-    let partition_data = Struct::from_iter([Some(Literal::string(region))]);
-    let partition_key =
-        iceberg::spec::PartitionKey::new(partition_spec, iceberg_schema.clone(), partition_data);
-
-    let mut writer = DataFileWriterBuilder::new(rolling_builder)
-        .build(Some(partition_key))
-        .await
-        .context("build regions data file writer")?;
-
-    let batch = make_regions_batch(first_id, last_id, region);
-    let batch = overlay_iceberg_field_ids(&batch, &iceberg_schema)?;
-    writer
-        .write(batch)
-        .await
-        .context("write regions Arrow batch")?;
-    let data_files = writer
-        .close()
-        .await
-        .context("close regions data file writer")?;
-    commit_data_files(catalog, table, data_files)
-        .await
-        .context("commit the regions data files")
-}
-
 /// Identity-partitioned on `p`, one data file per fixture label. The file name starts with
 /// `pc_<label>-`, so a plan's file list names the labels it scans.
 pub async fn seed_pruning_cases(catalog_url: &str, warehouse: &str) -> Result<()> {
     let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-pruning").await?;
-    let ns = NamespaceIdent::new(PRUNING_NAMESPACE.to_string());
-    if !catalog
-        .namespace_exists(&ns)
-        .await
-        .context("check namespace for the pruning fixture")?
-    {
-        catalog
-            .create_namespace(&ns, HashMap::new())
-            .await
-            .context("create the pruning fixture namespace")?;
-    }
-    let table_ident = TableIdent::new(ns.clone(), PRUNING_TABLE.to_string());
-    let existing = existing_data_file_paths(&catalog, &table_ident).await?;
-    if existing.as_ref().is_some_and(|paths| !paths.is_empty()) {
-        return Ok(());
-    }
-
     let iceberg_schema = IcebergSchema::builder()
         .with_schema_id(0)
         .with_fields(vec![
@@ -1405,77 +1180,35 @@ pub async fn seed_pruning_cases(catalog_url: &str, warehouse: &str) -> Result<()
         ])
         .build()
         .context("build pruning fixture Iceberg schema")?;
-    let partition_field = UnboundPartitionField::builder()
-        .source_ids(vec![2])
-        .field_id(1000)
-        .name(PRUNING_PARTITION_COLUMN.to_string())
-        .transform(Transform::Identity)
-        .build()
-        .context("build pruning fixture partition field")?;
-    let partition_spec = UnboundPartitionSpec::builder()
-        .with_spec_id(1)
-        .add_partition_fields([partition_field])
-        .context("build pruning fixture partition spec")?
-        .build();
-    let creation = TableCreation::builder()
-        .name(PRUNING_TABLE.to_string())
-        .schema(iceberg_schema)
-        .partition_spec(partition_spec)
-        .properties(HashMap::new())
-        .build();
-    let table = if existing.is_some() {
-        catalog
-            .load_table(&table_ident)
-            .await
-            .context("load the empty pruning fixture table")?
-    } else {
-        catalog
-            .create_table(&ns, creation)
-            .await
-            .context("create the pruning fixture table")?
+    let Some(table) = empty_table_to_fill(
+        &catalog,
+        PRUNING_NAMESPACE,
+        PRUNING_TABLE,
+        iceberg_schema,
+        identity_partition_spec(2, PRUNING_PARTITION_COLUMN)?,
+        HashMap::new(),
+    )
+    .await?
+    else {
+        return Ok(());
     };
 
     let mut data_files = Vec::new();
     for file in &PRUNING_FILES {
-        data_files.extend(write_pruning_file(&table, file).await?);
+        data_files.extend(
+            write_data_files(
+                &table,
+                &iceberg_file_prefix(file),
+                Struct::from_iter([file.partition.map(Literal::string)]),
+                pruning_writer_properties(),
+                [pruning_batch(file)],
+            )
+            .await?,
+        );
     }
     commit_data_files(&catalog, &table, data_files)
         .await
         .context("commit the pruning fixture data files")
-}
-
-async fn write_pruning_file(table: &Table, file: &PruningFile) -> Result<Vec<DataFile>> {
-    let iceberg_schema = table.metadata().current_schema().clone();
-    let partition_spec = table.metadata().default_partition_spec().as_ref().clone();
-    let file_name_gen = DefaultFileNameGenerator::new(
-        iceberg_file_prefix(file),
-        Some(uuid_suffix()),
-        DataFileFormat::Parquet,
-    );
-    let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
-        ParquetWriterBuilder::new(pruning_writer_properties(), iceberg_schema.clone()),
-        table.file_io().clone(),
-        FlatLocationGenerator {
-            base: table.metadata().location().to_string(),
-        },
-        file_name_gen,
-    );
-    let partition_data = Struct::from_iter([file.partition.map(Literal::string)]);
-    let partition_key =
-        iceberg::spec::PartitionKey::new(partition_spec, iceberg_schema.clone(), partition_data);
-    let mut writer = DataFileWriterBuilder::new(rolling_builder)
-        .build(Some(partition_key))
-        .await
-        .with_context(|| format!("build the {} data file writer", file.label))?;
-    let batch = overlay_iceberg_field_ids(&pruning_batch(file), &iceberg_schema)?;
-    writer
-        .write(batch)
-        .await
-        .with_context(|| format!("write the {} batch", file.label))?;
-    writer
-        .close()
-        .await
-        .with_context(|| format!("close the {} data file writer", file.label))
 }
 
 // iceberg-rust has no rename in its schema-evolution API, so the rename (#26) is applied via a
@@ -2808,50 +2541,34 @@ pub const COMPLEX_TOTAL_ROWS: usize = 4;
 pub async fn seed_complex_types_probe(catalog_url: &str, warehouse: &str) -> Result<()> {
     let catalog =
         build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-complex-types").await?;
-
-    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
-    let table_ident = TableIdent::new(ns.clone(), E2E_COMPLEX_TABLE.to_string());
-
-    if let Some(paths) = existing_data_file_paths(&catalog, &table_ident).await?
-        && !paths.is_empty()
-    {
+    let Some(table) = empty_table_to_fill(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_COMPLEX_TABLE,
+        complex_types_iceberg_schema()?,
+        unpartitioned(),
+        HashMap::new(),
+    )
+    .await?
+    else {
         return Ok(());
-    }
-
-    if !catalog
-        .namespace_exists(&ns)
-        .await
-        .context("check namespace")?
-    {
-        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
-    }
-
-    let iceberg_schema = complex_types_iceberg_schema()?;
-    let partition_spec = UnboundPartitionSpec::builder().with_spec_id(0).build();
-    let creation = TableCreation::builder()
-        .name(E2E_COMPLEX_TABLE.to_string())
-        .schema(iceberg_schema)
-        .partition_spec(partition_spec)
-        .properties(HashMap::new())
-        .build();
-
-    let table = match catalog.create_table(&ns, creation).await {
-        Ok(t) => t,
-        Err(_) => catalog
-            .load_table(&table_ident)
-            .await
-            .context("load existing complex-types table after create failed")?,
     };
-
-    let existing = collect_current_snapshot_paths(&table).await?;
-    if !existing.is_empty() {
-        return Ok(());
-    }
-
-    write_complex_types_and_commit(&catalog, table).await
+    let arrow_schema = Arc::new(
+        schema_to_arrow_schema(table.metadata().current_schema())
+            .context("derive Arrow schema for complex-types batch")?,
+    );
+    write_one_file_append(
+        &catalog,
+        &table,
+        E2E_COMPLEX_TABLE,
+        [complex_types_batch(arrow_schema)?],
+    )
+    .await
+    .context("append complex-types")
 }
 
-/// As authored; `create_table` assigns its own field-ids.
+/// Field ids follow the catalog's own assignment (every struct level before its children),
+/// so a rerun's stale-schema check matches the stored table instead of rewriting it.
 fn complex_types_iceberg_schema() -> Result<IcebergSchema> {
     IcebergSchema::builder()
         .with_schema_id(0)
@@ -2861,53 +2578,54 @@ fn complex_types_iceberg_schema() -> Result<IcebergSchema> {
                 2,
                 "tags",
                 Type::List(ListType::new(
-                    NestedField::list_element(3, Type::Primitive(PrimitiveType::String), false)
+                    NestedField::list_element(8, Type::Primitive(PrimitiveType::String), false)
                         .into(),
+                )),
+            )
+            .into(),
+            NestedField::optional(
+                3,
+                "nums",
+                Type::List(ListType::new(
+                    NestedField::list_element(9, Type::Primitive(PrimitiveType::Int), false).into(),
                 )),
             )
             .into(),
             NestedField::optional(
                 4,
-                "nums",
-                Type::List(ListType::new(
-                    NestedField::list_element(5, Type::Primitive(PrimitiveType::Int), false).into(),
+                "addr",
+                Type::Struct(StructType::new(vec![
+                    NestedField::optional(10, "street", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                    NestedField::optional(11, "city", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])),
+            )
+            .into(),
+            NestedField::optional(
+                5,
+                "attrs",
+                Type::Map(MapType::optional(
+                    12,
+                    Type::Primitive(PrimitiveType::String),
+                    13,
+                    Type::Primitive(PrimitiveType::String),
                 )),
             )
             .into(),
             NestedField::optional(
                 6,
-                "addr",
-                Type::Struct(StructType::new(vec![
-                    NestedField::optional(7, "street", Type::Primitive(PrimitiveType::String))
-                        .into(),
-                    NestedField::optional(8, "city", Type::Primitive(PrimitiveType::String)).into(),
-                ])),
-            )
-            .into(),
-            NestedField::optional(
-                9,
-                "attrs",
-                Type::Map(MapType::optional(
-                    10,
-                    Type::Primitive(PrimitiveType::String),
-                    11,
-                    Type::Primitive(PrimitiveType::String),
-                )),
-            )
-            .into(),
-            NestedField::optional(
-                12,
                 "int_map",
                 Type::Map(MapType::optional(
-                    13,
-                    Type::Primitive(PrimitiveType::Int),
                     14,
+                    Type::Primitive(PrimitiveType::Int),
+                    15,
                     Type::Primitive(PrimitiveType::String),
                 )),
             )
             .into(),
             NestedField::optional(
-                15,
+                7,
                 "items",
                 Type::List(ListType::new(
                     NestedField::list_element(
@@ -2925,54 +2643,6 @@ fn complex_types_iceberg_schema() -> Result<IcebergSchema> {
         ])
         .build()
         .context("build complex-types Iceberg schema")
-}
-
-async fn write_complex_types_and_commit<C: Catalog>(catalog: &C, table: Table) -> Result<()> {
-    let iceberg_schema = table.metadata().current_schema().clone();
-    let arrow_schema = Arc::new(
-        schema_to_arrow_schema(&iceberg_schema)
-            .context("derive Arrow schema for complex-types batch")?,
-    );
-    let batch = complex_types_batch(arrow_schema)?;
-
-    let file_io = table.file_io().clone();
-    let table_location = table.metadata().location().to_string();
-    let partition_spec = table.metadata().default_partition_spec().as_ref().clone();
-
-    let location_gen = FlatLocationGenerator {
-        base: table_location,
-    };
-    let file_name_gen = DefaultFileNameGenerator::new(
-        E2E_COMPLEX_TABLE.to_string(),
-        Some(uuid_suffix()),
-        DataFileFormat::Parquet,
-    );
-    let parquet_builder =
-        ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema.clone());
-    let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_builder,
-        file_io,
-        location_gen,
-        file_name_gen,
-    );
-    let partition_key =
-        iceberg::spec::PartitionKey::new(partition_spec, iceberg_schema.clone(), Struct::empty());
-
-    let mut writer = DataFileWriterBuilder::new(rolling_builder)
-        .build(Some(partition_key))
-        .await
-        .context("build complex-types data file writer")?;
-    writer
-        .write(batch)
-        .await
-        .context("write complex-types Arrow batch")?;
-    let data_files = writer
-        .close()
-        .await
-        .context("close complex-types data file writer")?;
-    commit_data_files(catalog, &table, data_files)
-        .await
-        .context("commit the complex-types data files")
 }
 
 /// Decoded straight into the created table's Arrow schema, so nested fields already
@@ -3541,35 +3211,6 @@ fn all_types_batch(table: &Table) -> Result<RecordBatch> {
     RecordBatch::try_new(schema, columns).context("build all_types batch")
 }
 
-/// Creates the table when absent or stale, and returns it when it holds no data yet.
-async fn empty_table_to_fill(
-    catalog: &impl Catalog,
-    table_name: &str,
-    schema: IcebergSchema,
-    properties: HashMap<String, String>,
-) -> Result<Option<Table>> {
-    create_and_append_files_with_properties(
-        catalog,
-        E2E_NAMESPACE,
-        table_name,
-        schema,
-        properties,
-        std::iter::empty::<Vec<RecordBatch>>(),
-    )
-    .await
-    .with_context(|| format!("create {table_name}"))?;
-    let ident = TableIdent::new(
-        NamespaceIdent::new(E2E_NAMESPACE.to_string()),
-        table_name.to_string(),
-    );
-    let table = catalog
-        .load_table(&ident)
-        .await
-        .with_context(|| format!("load {table_name}"))?;
-    let empty = collect_current_snapshot_paths(&table).await?.is_empty();
-    Ok(empty.then_some(table))
-}
-
 pub async fn seed_all_types(catalog_url: &str, warehouse: &str) -> Result<()> {
     seed_all_types_with_auth(catalog_url, warehouse, SeedCatalogAuth::default()).await
 }
@@ -3589,8 +3230,10 @@ pub async fn seed_all_types_with_auth(
     )]);
     if let Some(table) = empty_table_to_fill(
         &catalog,
+        E2E_NAMESPACE,
         E2E_ALL_TYPES_TABLE,
         all_types_iceberg_schema()?,
+        unpartitioned(),
         format_v3,
     )
     .await?
@@ -3618,8 +3261,15 @@ async fn seed_binary_values(catalog: &impl Catalog) -> Result<()> {
         ])
         .build()
         .context("build binary_values Iceberg schema")?;
-    let Some(table) =
-        empty_table_to_fill(catalog, E2E_BINARY_VALUES_TABLE, schema, HashMap::new()).await?
+    let Some(table) = empty_table_to_fill(
+        catalog,
+        E2E_NAMESPACE,
+        E2E_BINARY_VALUES_TABLE,
+        schema,
+        unpartitioned(),
+        HashMap::new(),
+    )
+    .await?
     else {
         return Ok(());
     };
