@@ -237,13 +237,13 @@ cluster:
 
 ```bash
 # full numbers (prints rows/sec, GB/sec, RSS delta per schema):
-cargo test -p lakehouse-engine --test it micro_bench -- --ignored --nocapture
+cargo test --workspace --test it micro_bench -- --ignored --nocapture
 # release-opt numbers — write to an out-of-tree target dir so the Docker-owned
 # target/release tree (and its root-owned .cargo-lock) is never touched:
-CARGO_TARGET_DIR=/tmp/lh-bench cargo test -p lakehouse-engine --test it micro_bench \
+CARGO_TARGET_DIR=/tmp/lh-bench cargo test --workspace --test it micro_bench \
   --release -- --ignored --nocapture
 # CI smoke (non-ignored): asserts each path yields a positive GB/sec
-cargo test -p lakehouse-engine --test it micro_bench
+cargo test --workspace --test it micro_bench
 ```
 
 ## Notes
