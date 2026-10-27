@@ -48,8 +48,8 @@ async fn oauth2_grant_built_from_client_credentials() {
         assert!(has_scope, "scope must be in POST body when supplied");
     });
 
-    let client = reqwest::Client::new();
-    let token = oauth2_client_credentials_grant(&client, &catalog_uri, &creds)
+    let http = CatalogHttp::new();
+    let token = oauth2_client_credentials_grant(&http, &catalog_uri, &creds)
         .await
         .expect("grant must succeed");
 
@@ -65,7 +65,8 @@ async fn oauth2_grant_transport_failure_names_its_cause() {
     creds.client_id = Some("client-id-sentinel".into());
     creds.client_secret = Some(CLIENT_SECRET.into());
 
-    let err = oauth2_client_credentials_grant(&reqwest::Client::new(), CLOSED_PORT_URI, &creds)
+    let http = CatalogHttp::with_policy(SHORT_POLICY);
+    let err = oauth2_client_credentials_grant(&http, CLOSED_PORT_URI, &creds)
         .await
         .expect_err("a closed token endpoint must fail the grant");
 
@@ -78,15 +79,31 @@ async fn oauth2_grant_transport_failure_names_its_cause() {
 }
 
 #[tokio::test]
+async fn an_oauth2_token_url_without_a_scheme_names_the_parse_cause() {
+    let mut creds = creds_no_auth();
+    creds.client_id = Some("client-id".into());
+    creds.client_secret = Some(CLIENT_SECRET.into());
+    creds.oauth2_server_uri = Some("not-a-url".into());
+
+    let err = oauth2_client_credentials_grant(&CatalogHttp::new(), CLOSED_PORT_URI, &creds)
+        .await
+        .expect_err("an unparseable token URL must fail the grant");
+
+    let msg = err.to_string();
+    assert!(msg.contains("relative URL without a base"), "{msg}");
+    assert!(!msg.contains(CLIENT_SECRET), "{msg}");
+}
+
+#[tokio::test]
 async fn oauth2_grant_errors_for_the_validation_rejected_shape() {
     let mut creds = creds_no_auth();
     creds.token = Some(BEARER_TOK.into());
     creds.client_id = Some("client-id-sentinel".into());
     creds.client_secret = Some(CLIENT_SECRET.into());
 
-    let client = reqwest::Client::new();
+    let http = CatalogHttp::new();
     // A closed port: re-deriving pair completeness would yield a transport error instead.
-    let err = oauth2_client_credentials_grant(&client, "http://127.0.0.1:1", &creds)
+    let err = oauth2_client_credentials_grant(&http, "http://127.0.0.1:1", &creds)
         .await
         .expect_err("a validation-rejected token+pair shape must not reach the token endpoint");
 
@@ -164,11 +181,11 @@ fn auth_error_sites_apply_the_value_pass_first() {
 
 #[tokio::test]
 async fn resolve_catalog_auth_selects_one_strategy_per_non_network_shape() {
-    let client = reqwest::Client::new();
+    let http = CatalogHttp::new();
 
     let mut sigv4_creds = creds_no_auth();
     sigv4_creds.use_sigv4 = true;
-    let auth = resolve_catalog_auth(&client, "https://catalog.example.com", &sigv4_creds)
+    let auth = resolve_catalog_auth(&http, "https://catalog.example.com", &sigv4_creds)
         .await
         .expect("sigv4 resolution must not fail");
     assert!(
@@ -178,7 +195,7 @@ async fn resolve_catalog_auth_selects_one_strategy_per_non_network_shape() {
 
     let mut bearer_creds = creds_no_auth();
     bearer_creds.token = Some(BEARER_TOK.into());
-    let auth = resolve_catalog_auth(&client, "https://catalog.example.com", &bearer_creds)
+    let auth = resolve_catalog_auth(&http, "https://catalog.example.com", &bearer_creds)
         .await
         .expect("bearer resolution must not fail");
     match auth {
@@ -190,7 +207,7 @@ async fn resolve_catalog_auth_selects_one_strategy_per_non_network_shape() {
     }
 
     let no_auth_creds = creds_no_auth();
-    let auth = resolve_catalog_auth(&client, "https://catalog.example.com", &no_auth_creds)
+    let auth = resolve_catalog_auth(&http, "https://catalog.example.com", &no_auth_creds)
         .await
         .expect("no-auth resolution must not fail");
     assert!(
@@ -208,11 +225,11 @@ fn sigv4_creds_stating_region(region: &str) -> ConnectionCreds {
 
 #[tokio::test]
 async fn sigv4_auth_refuses_without_signing_region() {
-    let client = reqwest::Client::new();
+    let http = CatalogHttp::new();
     let creds = sigv4_creds_stating_region("");
 
     let Err(UdfError::User(msg)) =
-        resolve_catalog_auth(&client, "https://catalog.example.com/iceberg", &creds).await
+        resolve_catalog_auth(&http, "https://catalog.example.com/iceberg", &creds).await
     else {
         panic!("a SigV4 CONNECTION with no signing region must be refused as a user error");
     };
@@ -222,13 +239,13 @@ async fn sigv4_auth_refuses_without_signing_region() {
 
 #[tokio::test]
 async fn resolve_catalog_auth_is_unauthenticated_for_the_validation_rejected_shape() {
-    let client = reqwest::Client::new();
+    let http = CatalogHttp::new();
     let mut creds = creds_no_auth();
     creds.token = Some(BEARER_TOK.into());
     creds.client_id = Some("client-id-sentinel".into());
     creds.client_secret = Some(CLIENT_SECRET.into());
 
-    let auth = resolve_catalog_auth(&client, "http://127.0.0.1:1", &creds)
+    let auth = resolve_catalog_auth(&http, "http://127.0.0.1:1", &creds)
         .await
         .expect(
             "a validation-rejected token+pair shape must resolve without contacting the network",

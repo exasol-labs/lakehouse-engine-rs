@@ -42,6 +42,13 @@ The adapter builds the catalog HTTP state once per pushdown request and reuses i
 * *AND* the adapter SHALL extract each table's own vended storage credentials from that table's `loadTable` response and place them into that table's per-shard scan-spec storage block, which `storage-access/scan-spec-credential-reference` requires to be the SEALED envelope of that table's own backend rather than a plaintext backend, so no vended value appears there in plaintext
 * *AND* the backend each table produces MUST carry that table's vended values FIELD FOR FIELD, wrapped only by the externally-tagged backend wrapper `storage-access/storage-backend-enum` and the scan-spec storage wrapper `storage-access/scan-spec-credential-reference`, whose sealed variant encrypts exactly that encoding
 
+### Scenario: A pushdown's loadTable asks only for the referenced snapshots
+
+* *GIVEN* a pushdown request that resolves an Iceberg REST table
+* *WHEN* the adapter issues the table's `loadTable` GET
+* *THEN* the GET SHALL request `snapshots=refs`, because the scan reads only the current snapshot
+* *AND* the answer SHALL still hold the current snapshot, because the Iceberg table spec states: "There is always a `main` branch reference pointing to the `current-snapshot-id` even if the `refs` map is null"
+
 ### Scenario: The per-table loader cannot re-derive auth or prefix
 
 * *GIVEN* the per-table `loadTable` loader
@@ -99,3 +106,12 @@ The adapter builds the catalog HTTP state once per pushdown request and reuses i
 * *WHEN* the adapter resolves the catalog session of a pushdown, `createVirtualSchema`, `REFRESH`, or `SET PROPERTIES` request
 * *THEN* the request SHALL fail with an error that names the warehouse and carries the catalog's answer
 * *AND* the adapter MUST NOT fall back to an empty prefix, because an unprefixed request reaches the catalog's default warehouse or answers every table with HTTP 404
+
+### Scenario: A failed loadTable names the table it loads
+
+* *GIVEN* a `loadTable` GET on a `CatalogSession` for the table `orders` in the namespace `sales.eu`, issued either by the enumeration of a `createVirtualSchema`, `REFRESH`, or `SET PROPERTIES` request or by a pushdown's table resolution
+* *WHEN* the GET fails with an HTTP status other than 404, with a transport error, a timeout of `catalog/catalog-http-resilience` included, or with an answer that does not parse as a `loadTable` result
+* *THEN* the returned error SHALL name the table by its dotted catalog identifier `sales.eu.orders`, the form its identifier note records
+* *AND* the error SHALL carry the cause: the HTTP status and the redacted answer body, every cause the HTTP client reports, or the parse failure
+* *AND* a pushdown's `loadTable` that answers HTTP 404 SHALL fail with an error that names the table in the same way
+* *AND* naming the table MUST NOT change which enumeration loads are skipped, so an enumeration `loadTable` that answers HTTP 404 SHALL still skip the table with the `NotLoadableIcebergTable` reason

@@ -5,13 +5,12 @@
 mod common;
 
 use common::e2e_harness::{
-    ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VARCHAR_JSON, VsProps,
-    assert_decimal_orders_numerically, assert_query_fails, assert_type_matrix,
-    column_adapter_notes, create_schema_and_scripts, create_virtual_schema_with_password,
-    declared_types, enumerated_table_names, exa_conn, explain_virtual_sql,
-    has_broadcast_join_block, has_two_scan_wrapper, identifier_note, install_slc, note_of, pairs,
-    parse_int, parse_numeric, partition_positions, query_error, reads, refuses, text_column,
-    upload_so, value_to_string,
+    SCAN_SCRIPT_NAME, SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_decimal_orders_numerically,
+    assert_query_fails, assert_type_matrix, column_adapter_notes, create_schema_and_scripts,
+    create_virtual_schema_with_password, declared_types, enumerated_table_names, error_text,
+    exa_conn, explain_virtual_sql, has_broadcast_join_block, has_two_scan_wrapper, identifier_note,
+    install_slc, note_of, pairs, parse_int, parse_numeric, partition_positions, query_error, reads,
+    refuses, text_column, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
@@ -141,21 +140,15 @@ fn setup() {
 }
 
 fn create_unity_virtual_schema(conn: &mut ExaConn) {
-    let password = local_stack_connection_password();
-    let create_conn_sql =
-        build_create_connection_sql(CONN_NAME, UNITY_CATALOG_URI_INTERNAL, &password);
-    conn.execute(&create_conn_sql);
-
-    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {VS_NAME} CASCADE"));
-
-    conn.execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA {VS_NAME}
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION = '{CONN_NAME}'
-  CATALOG_KIND       = 'UNITY_CATALOG'
-  NAMESPACE  = '{UNITY_NAMESPACE}'
-  ALLOW_HTTP         = 'true'"#
-    ));
+    create_virtual_schema_with_password(
+        conn,
+        &VsProps::new(VS_NAME, UNITY_NAMESPACE)
+            .with_catalog_kind("UNITY_CATALOG")
+            .with_catalog_conn_name(CONN_NAME)
+            .without_parallelism_factor(),
+        UNITY_CATALOG_URI_INTERNAL,
+        &local_stack_connection_password(),
+    );
 }
 
 /// Over the seeded entries whose catalog metadata deliberately disagrees with their Delta logs.
@@ -191,22 +184,15 @@ fn create_unity_role_virtual_schema(conn: &mut ExaConn) {
         aws_sts_endpoint: Some(stack::seaweedfs_url_internal()),
         ..local_stack_connection_password()
     };
-    let create_conn_sql =
-        build_create_connection_sql(CONN_ROLE_NAME, UNITY_CATALOG_URI_INTERNAL, &password);
-    conn.execute(&create_conn_sql);
-
-    let _ = conn.try_execute(&format!(
-        "DROP VIRTUAL SCHEMA IF EXISTS {VS_ROLE_NAME} CASCADE"
-    ));
-
-    conn.execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA {VS_ROLE_NAME}
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION = '{CONN_ROLE_NAME}'
-  CATALOG_KIND       = 'UNITY_CATALOG'
-  NAMESPACE  = '{UNITY_NAMESPACE}'
-  ALLOW_HTTP         = 'true'"#
-    ));
+    create_virtual_schema_with_password(
+        conn,
+        &VsProps::new(VS_ROLE_NAME, UNITY_NAMESPACE)
+            .with_catalog_kind("UNITY_CATALOG")
+            .with_catalog_conn_name(CONN_ROLE_NAME)
+            .without_parallelism_factor(),
+        UNITY_CATALOG_URI_INTERNAL,
+        &password,
+    );
 }
 
 /// A third Virtual Schema over the SAME seeded `unity.delta_e2e` namespace, reading storage
@@ -1402,13 +1388,8 @@ fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
 
     let table = "UNSHREDDED_VARIANT";
     let feature = "variantType-preview";
-    let resp = conn.try_execute(&format!("SELECT * FROM {} LIMIT 1", table_ref(table)));
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "{table} must fail the query loud, not return a row: {resp}"
-    );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
+    let sql = format!("SELECT * FROM {} LIMIT 1", table_ref(table));
+    let msg = error_text(&conn.try_execute(&sql), &sql);
     assert!(
         msg.contains(feature),
         "{table}'s error must name its actual unsupported reader feature: {msg}"
@@ -1596,13 +1577,8 @@ fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
         ("BYTE_DECIMAL", "byte_decimal", "byte", "decimal(4,1)"),
         ("SHORT_DECIMAL", "short_decimal", "short", "decimal(6,1)"),
     ] {
-        let resp = conn.try_execute(&format!("SELECT {column} FROM {table}"));
-        assert_eq!(
-            resp["status"].as_str(),
-            Some("error"),
-            "{column} must refuse the query, not return a row or a NULL value: {resp}"
-        );
-        let msg = resp["exception"]["text"].as_str().unwrap_or("");
+        let sql = format!("SELECT {column} FROM {table}");
+        let msg = error_text(&conn.try_execute(&sql), &sql);
         assert!(
             msg.contains(delta_name)
                 && msg.contains(&format!("'{from_type}'"))
@@ -1803,13 +1779,8 @@ fn unity_delta_refused_column_refuses_only_the_queries_naming_it() {
     let mut conn = exa_conn();
     let table = table_ref("STATS_ALL_TYPES");
 
-    let resp = conn.try_execute(&format!("SELECT BINARY_COL FROM {table}"));
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "BINARY_COL must refuse the query, not return a row: {resp}"
-    );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
+    let sql = format!("SELECT BINARY_COL FROM {table}");
+    let msg = error_text(&conn.try_execute(&sql), &sql);
     assert!(
         msg.contains("binary_col") && msg.contains("#351") && !msg.contains("#350"),
         "BINARY_COL's refusal must name its Delta column and cite issue #351, not #350: {msg}"
@@ -2390,6 +2361,60 @@ fn unity_column_mapping_property_reaches_create_and_scoped_refresh() {
     );
 
     conn.execute(&format!("DROP VIRTUAL SCHEMA {VS} CASCADE"));
+}
+
+/// Its own schema, so deleting its one table through the Unity REST API touches no shared fixture.
+const DELETED_TABLE_NAMESPACE: &str = "unity.e2e_deleted_table";
+const DELETED_TABLE_VS: &str = "UNITY_DELETED_TABLE_VS";
+const DELETED_TABLE_CONN: &str = "UNITY_DELETED_TABLE_CREDS";
+
+/// Scenario: The client surfaces a transport or HTTP-status failure as a clear, credential-safe error
+#[test]
+fn unity_pushdown_over_a_table_deleted_from_the_catalog_names_the_table() {
+    setup();
+    let mut conn = exa_conn();
+    let table_name = "orphan_table";
+    register_unity_table(&UnityTable {
+        namespace: DELETED_TABLE_NAMESPACE,
+        name: table_name,
+        format: "PARQUET",
+        location: "s3://warehouse/unity_parquet/e2e_deleted_table/orphan_table",
+        columns: &[("id", json!("long"), "LONG")],
+        partitions: &[],
+        name_mapped: false,
+    });
+    create_virtual_schema_with_password(
+        &mut conn,
+        &VsProps::new(DELETED_TABLE_VS, DELETED_TABLE_NAMESPACE)
+            .with_catalog_kind("UNITY_CATALOG")
+            .with_catalog_conn_name(DELETED_TABLE_CONN),
+        UNITY_CATALOG_URI_INTERNAL,
+        &local_stack_connection_password(),
+    );
+
+    let delete = reqwest::blocking::Client::new()
+        .delete(format!(
+            "{}/api/2.1/unity-catalog/tables/{DELETED_TABLE_NAMESPACE}.{table_name}",
+            unity_catalog_url()
+        ))
+        .send()
+        .unwrap_or_else(|e| panic!("DELETE {table_name}: {e}"));
+    assert!(
+        delete.status().is_success(),
+        "DELETE {table_name} returned {}",
+        delete.status()
+    );
+
+    assert_query_fails(
+        &mut conn,
+        &format!(
+            "SELECT * FROM {DELETED_TABLE_VS}.{}",
+            table_name.to_uppercase()
+        ),
+        &[&format!("{DELETED_TABLE_NAMESPACE}.{table_name}")],
+    );
+
+    conn.execute(&format!("DROP VIRTUAL SCHEMA {DELETED_TABLE_VS} CASCADE"));
 }
 
 /// Scenario: A declaration that disagrees with the Delta log fails the query

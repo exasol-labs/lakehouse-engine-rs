@@ -42,12 +42,14 @@ const NS_RENAME: &str = "e2e_refresh_rename";
 const NS_DROP: &str = "e2e_refresh_drop";
 const NS_OPTIONAL: &str = "e2e_refresh_optional";
 const NS_SWAP: &str = "e2e_refresh_swap";
+const NS_DROPPED_TABLE: &str = "e2e_refresh_dropped_table";
+
+fn refresh_props<'a>(vs_name: &'a str, namespace: &'a str) -> VsProps<'a> {
+    VsProps::new(vs_name, namespace).with_catalog_conn_name(CATALOG_CONN_NAME)
+}
 
 fn create_virtual_schema(conn: &mut ExaConn, vs_name: &str, namespace: &str) {
-    crate::common::e2e_harness::create_virtual_schema(
-        conn,
-        &VsProps::new(vs_name, namespace).with_catalog_conn_name(CATALOG_CONN_NAME),
-    );
+    crate::common::e2e_harness::create_virtual_schema(conn, &refresh_props(vs_name, namespace));
 }
 
 fn seed_catalog(rt: &tokio::runtime::Runtime, label: &str) -> RestCatalog {
@@ -443,13 +445,10 @@ fn refresh_unreachable_catalog_redacts_credentials() {
         build_create_connection_sql(CATALOG_CONN_NAME, bogus_uri, &bogus_password);
     conn.execute(&replace_conn_sql);
 
-    let resp = conn.try_execute("ALTER VIRTUAL SCHEMA REFRESH_UNREACHABLE_VS REFRESH");
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "expected an error when REFRESH hits an unreachable catalog: {resp}"
+    let msg = query_error(
+        &mut conn,
+        "ALTER VIRTUAL SCHEMA REFRESH_UNREACHABLE_VS REFRESH",
     );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
     assert!(
         !msg.contains("SUPER_SECRET_KEY") && !msg.contains("SUPER_SECRET_VALUE"),
         "refresh error message must not leak credentials: {msg}"
@@ -462,6 +461,47 @@ fn refresh_unreachable_catalog_redacts_credentials() {
         &local_stack_connection_password(),
     );
     conn.execute(&create_conn_sql);
+}
+
+/// Scenario: A failed loadTable names the table it loads
+#[test]
+fn pushdown_over_a_table_dropped_from_the_catalog_names_the_table() {
+    stack();
+    let rt = runtime();
+    let catalog = seed_catalog(rt, "refresh-dropped-table");
+    let ns = NamespaceIdent::new(NS_DROPPED_TABLE.to_string());
+    rt.block_on(drop_table_if_exists(&catalog, &ns, "d_tbl"));
+    rt.block_on(ensure_id_val_table(
+        &catalog,
+        NS_DROPPED_TABLE,
+        "d_tbl",
+        1,
+        1.0,
+    ));
+
+    let mut conn = exa_conn();
+    create_virtual_schema(&mut conn, "REFRESH_DROPPED_TABLE_VS", NS_DROPPED_TABLE);
+
+    let id = conn.query_scalar_i64(&format!(
+        "SELECT id FROM {}",
+        vs_table("REFRESH_DROPPED_TABLE_VS", "d_tbl")
+    ));
+    assert_eq!(
+        id, 1,
+        "D_TBL must be queryable before it is dropped from the catalog"
+    );
+
+    rt.block_on(drop_table_ignoring_missing(&catalog, &ns, "d_tbl"));
+
+    let identifier = format!("{NS_DROPPED_TABLE}.d_tbl");
+    assert_query_fails(
+        &mut conn,
+        &format!(
+            "SELECT * FROM {}",
+            vs_table("REFRESH_DROPPED_TABLE_VS", "d_tbl")
+        ),
+        &[identifier.as_str(), "HTTP 404"],
+    );
 }
 
 /// Hands out the same three tables as the engine adapter's listing, but writes no table-level
@@ -503,18 +543,12 @@ fn create_legacy_virtual_schema(conn: &mut ExaConn) {
     conn.execute(&format!(
         "CREATE OR REPLACE PYTHON3 ADAPTER SCRIPT {PARTIAL_ADAPTER_SCHEMA}.{ADAPTER_SCRIPT_NAME} AS\n{LEGACY_ADAPTER_BODY}\n/"
     ));
-    conn.execute(&build_create_connection_sql(
-        CATALOG_CONN_NAME,
-        &iceberg_catalog_url_internal(),
-        &local_stack_connection_password(),
-    ));
-    let _ = conn.try_execute(&format!(
-        "DROP VIRTUAL SCHEMA IF EXISTS {PARTIAL_VS} CASCADE"
-    ));
-    conn.execute(&format!(
-        "CREATE VIRTUAL SCHEMA {PARTIAL_VS} USING {PARTIAL_ADAPTER_SCHEMA}.{ADAPTER_SCRIPT_NAME} WITH\n  \
-         CATALOG_CONNECTION = '{CATALOG_CONN_NAME}'\n  ALLOW_HTTP = 'true'\n  NAMESPACE = '{NS_PARTIAL}'"
-    ));
+    crate::common::e2e_harness::create_virtual_schema(
+        conn,
+        &refresh_props(PARTIAL_VS, NS_PARTIAL)
+            .with_adapter_schema(PARTIAL_ADAPTER_SCHEMA)
+            .without_parallelism_factor(),
+    );
 }
 
 /// Scenario: Refresh rebuilds every identifier note and preserves other adapter notes
@@ -706,13 +740,10 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
         id_val_schema(0),
     ));
 
-    let refresh_resp = conn.try_execute("ALTER VIRTUAL SCHEMA REFRESH_COLLISION_VS REFRESH");
-    assert_eq!(
-        refresh_resp["status"].as_str(),
-        Some("error"),
-        "REFRESH must error once the flatten-name collision exists: {refresh_resp}"
+    let refresh_msg = query_error(
+        &mut conn,
+        "ALTER VIRTUAL SCHEMA REFRESH_COLLISION_VS REFRESH",
     );
-    let refresh_msg = refresh_resp["exception"]["text"].as_str().unwrap_or("");
     assert!(
         refresh_msg.contains("EU__ORDERS"),
         "refresh's collision error must name the colliding Exasol table name: {refresh_msg}"
@@ -733,19 +764,13 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
          {partial_msg}"
     );
 
-    let create_resp = conn.try_execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA REFRESH_COLLISION_CREATE_VS
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION  = '{CATALOG_CONN_NAME}'
-  NAMESPACE   = '{NS_COLLISION}'
-  ALLOW_HTTP          = 'true'"#
-    ));
-    assert_eq!(
-        create_resp["status"].as_str(),
-        Some("error"),
-        "a fresh createVirtualSchema over the colliding namespace must also error: {create_resp}"
+    let create_msg = error_text(
+        &try_create_virtual_schema(
+            &mut conn,
+            &refresh_props("REFRESH_COLLISION_CREATE_VS", NS_COLLISION),
+        ),
+        "CREATE over the colliding namespace",
     );
-    let create_msg = create_resp["exception"]["text"].as_str().unwrap_or("");
     assert!(
         create_msg.contains("EU__ORDERS") && create_msg.contains("collision"),
         "createVirtualSchema's collision error must have the same shape as \

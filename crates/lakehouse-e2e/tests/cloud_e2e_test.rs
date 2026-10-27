@@ -14,7 +14,7 @@ use aws_sigv4::http_request::{
 };
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
-use common::exasol_ws::ExaConn;
+use common::exasol_ws::{ExaConn, error_text};
 use common::stack::{CatalogConnectionPassword, build_create_connection_sql};
 use iceberg_catalog_rest::LoadTableResult;
 use std::collections::HashMap;
@@ -1128,12 +1128,7 @@ USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
         glue_namespace(&env.glue_table)
     ));
 
-    assert_eq!(
-        result["status"].as_str(),
-        Some("error"),
-        "the base identity alone must be denied by Glue: {result}"
-    );
-    let msg = result["exception"]["text"].as_str().unwrap_or("");
+    let msg = error_text(&result, "CREATE as the base identity alone");
     assert!(
         msg.to_ascii_lowercase().contains("accessdenied"),
         "Glue must deny the base identity: {msg}"
@@ -1191,12 +1186,7 @@ USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
         glue_namespace(&env.glue_table)
     ));
 
-    assert_eq!(
-        result["status"].as_str(),
-        Some("error"),
-        "a wrong external id must fail CREATE VIRTUAL SCHEMA: {result}"
-    );
-    let msg = result["exception"]["text"].as_str().unwrap_or("");
+    let msg = error_text(&result, "CREATE with a wrong external id");
     assert!(msg.contains("AccessDenied"), "{msg}");
     assert!(
         !msg.contains(WRONG_EXTERNAL_ID) && !msg.contains(&env.base_secret_access_key),

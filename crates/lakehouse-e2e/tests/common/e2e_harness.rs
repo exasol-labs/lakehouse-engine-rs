@@ -2,6 +2,7 @@
 //! when the local stack is unavailable.
 
 use super::exasol_ws::ExaConn;
+pub use super::exasol_ws::error_text;
 use super::seed::{DECIMAL_18_0_VALUES_TEXT, E2E_DIM_TABLE, E2E_FACT_TABLE, build_seed_catalog};
 use super::stack::{
     CatalogConnectionPassword, bucketfs_port, bucketfs_write_password, build_create_connection_sql,
@@ -170,6 +171,7 @@ pub const E2E_PARALLELISM_FACTOR: usize = 2;
 
 pub struct VsProps<'a> {
     vs_name: &'a str,
+    adapter_schema: &'a str,
     namespace: &'a str,
     catalog_conn_name: &'a str,
     parallelism_factor: Option<usize>,
@@ -184,6 +186,7 @@ impl<'a> VsProps<'a> {
     pub fn new(vs_name: &'a str, namespace: &'a str) -> Self {
         Self {
             vs_name,
+            adapter_schema: SCHEMA_NAME,
             namespace,
             catalog_conn_name: DEFAULT_CATALOG_CONN_NAME,
             parallelism_factor: Some(E2E_PARALLELISM_FACTOR),
@@ -195,8 +198,19 @@ impl<'a> VsProps<'a> {
         }
     }
 
+    pub fn with_adapter_schema(mut self, schema: &'a str) -> Self {
+        self.adapter_schema = schema;
+        self
+    }
+
     pub fn with_parallelism_factor(mut self, factor: usize) -> Self {
         self.parallelism_factor = Some(factor);
+        self
+    }
+
+    /// Leaves the adapter's own default in force.
+    pub fn without_parallelism_factor(mut self) -> Self {
+        self.parallelism_factor = None;
         self
     }
 
@@ -234,10 +248,16 @@ impl<'a> VsProps<'a> {
 
 /// VS properties use docker-network-internal URLs because the adapter UDF runs inside
 /// the Exasol container.
+#[track_caller]
 pub fn create_virtual_schema(conn: &mut ExaConn, props: &VsProps) {
+    let resp = try_create_virtual_schema(conn, props);
+    assert_virtual_schema_created(conn, props, &resp);
+}
+
+pub fn try_create_virtual_schema(conn: &mut ExaConn, props: &VsProps) -> serde_json::Value {
     let password = local_stack_connection_password();
     let catalog_uri = iceberg_catalog_url_internal();
-    create_virtual_schema_with_password(conn, props, &catalog_uri, &password);
+    try_create_virtual_schema_with_password(conn, props, &catalog_uri, &password)
 }
 
 fn optional_clause(key: &str, value: Option<impl std::fmt::Display>) -> String {
@@ -246,14 +266,20 @@ fn optional_clause(key: &str, value: Option<impl std::fmt::Display>) -> String {
         .unwrap_or_default()
 }
 
+#[track_caller]
 pub fn create_virtual_schema_with_password(
     conn: &mut ExaConn,
     props: &VsProps,
     catalog_uri: &str,
     password: &CatalogConnectionPassword,
 ) {
-    let create_vs_sql = prepare_create_virtual_schema(conn, props, catalog_uri, password);
-    conn.execute(&create_vs_sql);
+    let resp = try_create_virtual_schema_with_password(conn, props, catalog_uri, password);
+    assert_virtual_schema_created(conn, props, &resp);
+}
+
+#[track_caller]
+fn assert_virtual_schema_created(conn: &ExaConn, props: &VsProps, resp: &serde_json::Value) {
+    conn.assert_ok(resp, &format!("CREATE VIRTUAL SCHEMA {}", props.vs_name));
 }
 
 pub fn try_create_virtual_schema_with_password(
@@ -262,16 +288,6 @@ pub fn try_create_virtual_schema_with_password(
     catalog_uri: &str,
     password: &CatalogConnectionPassword,
 ) -> serde_json::Value {
-    let create_vs_sql = prepare_create_virtual_schema(conn, props, catalog_uri, password);
-    conn.try_execute(&create_vs_sql)
-}
-
-fn prepare_create_virtual_schema(
-    conn: &mut ExaConn,
-    props: &VsProps,
-    catalog_uri: &str,
-    password: &CatalogConnectionPassword,
-) -> String {
     let create_conn_sql =
         build_create_connection_sql(props.catalog_conn_name, catalog_uri, password);
     conn.execute(&create_conn_sql);
@@ -300,14 +316,15 @@ fn prepare_create_virtual_schema(
         format!("\n  NAMESPACE   = '{}'", props.namespace)
     };
 
-    format!(
+    conn.try_execute(&format!(
         r#"CREATE VIRTUAL SCHEMA {vs_name}
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
+USING {adapter_schema}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = '{catalog_conn_name}'
   ALLOW_HTTP          = 'true'{namespace_clause}{parallelism_clause}{join_clause}{catalog_kind_clause}{merge_schema_clause}{hive_partitioning_clause}{property_clauses}"#,
         vs_name = props.vs_name,
+        adapter_schema = props.adapter_schema,
         catalog_conn_name = props.catalog_conn_name,
-    )
+    ))
 }
 
 pub fn current_user(conn: &mut ExaConn) -> String {
@@ -365,19 +382,6 @@ pub fn enumerated_table_names(conn: &mut ExaConn, vs_name: &str) -> Vec<String> 
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// The exception text of a response that must be an error.
-pub fn error_text(response: &serde_json::Value) -> String {
-    assert_eq!(
-        response["status"].as_str(),
-        Some("error"),
-        "the statement must fail: {response}"
-    );
-    response["exception"]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string()
 }
 
 pub fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
@@ -836,17 +840,9 @@ pub fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
+#[track_caller]
 pub fn query_error(conn: &mut ExaConn, sql: &str) -> String {
-    let response = conn.try_execute(sql);
-    assert_ne!(
-        response["status"].as_str(),
-        Some("ok"),
-        "expected the query to fail: {sql}"
-    );
-    response["exception"]["text"]
-        .as_str()
-        .unwrap_or("")
-        .to_string()
+    error_text(&conn.try_execute(sql), sql)
 }
 
 pub fn assert_query_fails(conn: &mut ExaConn, sql: &str, fragments: &[&str]) {

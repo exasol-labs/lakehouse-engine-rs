@@ -17,10 +17,7 @@ use crate::common::seed::{
     seed_renamed_column, typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev,
     typed_id_avg_stddev,
 };
-use crate::common::stack::{
-    build_create_connection_sql, exasol_container, iceberg_catalog_url,
-    iceberg_catalog_url_internal,
-};
+use crate::common::stack::{exasol_container, iceberg_catalog_url, iceberg_catalog_url_internal};
 use crate::common::timestamp_precision::{
     ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
 };
@@ -379,25 +376,13 @@ fn create_vs_unreachable_catalog_errors_no_secret() {
             "the server did not answer with TLS",
         ),
     ] {
-        conn.execute(&build_create_connection_sql(
-            "BAD_CATALOG_CREDS",
+        let resp = try_create_virtual_schema_with_password(
+            &mut conn,
+            &VsProps::new("BAD_CATALOG_VS", "ns").with_catalog_conn_name("BAD_CATALOG_CREDS"),
             catalog_uri,
             &bogus_password,
-        ));
-
-        let resp = conn.try_execute(&format!(
-            r#"CREATE VIRTUAL SCHEMA BAD_CATALOG_VS
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION  = 'BAD_CATALOG_CREDS'
-  NAMESPACE   = 'ns'
-  ALLOW_HTTP          = 'true'"#
-        ));
-        assert_eq!(
-            resp["status"].as_str(),
-            Some("error"),
-            "expected an error when catalog is unreachable, got: {resp}"
         );
-        let msg = resp["exception"]["text"].as_str().unwrap_or("");
+        let msg = error_text(&resp, &format!("CREATE against {catalog_uri}"));
         assert!(msg.contains(cause), "{cause:?} expected: {msg}");
         assert!(
             !msg.contains("SUPER_SECRET_KEY") && !msg.contains("SUPER_SECRET_VALUE"),
@@ -426,24 +411,14 @@ fn create_vs_ambiguous_catalog_auth_errors_no_secret() {
         client_secret: Some("SUPER_SECRET_CLIENT_SECRET".to_string()),
         ..Default::default()
     };
-    let bogus_uri = "http://does-not-exist.invalid:8181";
-    let create_conn_sql =
-        build_create_connection_sql("AMBIGUOUS_CATALOG_CREDS", bogus_uri, &ambiguous_password);
-    conn.execute(&create_conn_sql);
-
-    let resp = conn.try_execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA AMBIGUOUS_CATALOG_VS
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION  = 'AMBIGUOUS_CATALOG_CREDS'
-  NAMESPACE   = 'ns'
-  ALLOW_HTTP          = 'true'"#
-    ));
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "expected an error when token and client_id/client_secret are both supplied, got: {resp}"
+    let resp = try_create_virtual_schema_with_password(
+        &mut conn,
+        &VsProps::new("AMBIGUOUS_CATALOG_VS", "ns")
+            .with_catalog_conn_name("AMBIGUOUS_CATALOG_CREDS"),
+        "http://does-not-exist.invalid:8181",
+        &ambiguous_password,
     );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
+    let msg = error_text(&resp, "CREATE with both a token and client credentials");
     assert!(
         msg.contains("token") && msg.contains("client_id") && msg.contains("client_secret"),
         "error message must name token, client_id, and client_secret: {msg}"
@@ -486,15 +461,10 @@ fn e2e_renamed_column_resolves_by_field_id() {
 
     // Created after `evo` exists so the adapter enumerates it. PARALLELISM_FACTOR = 1 puts
     // both files in one shard, so one ListingTable sees both physical layouts.
-    let _ = conn.try_execute("DROP VIRTUAL SCHEMA IF EXISTS EVO_VS CASCADE");
-    conn.execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA EVO_VS
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION  = '{DEFAULT_CATALOG_CONN_NAME}'
-  NAMESPACE   = '{E2E_NAMESPACE}'
-  PARALLELISM_FACTOR  = '1'
-  ALLOW_HTTP          = 'true'"#
-    ));
+    create_virtual_schema(
+        &mut conn,
+        &VsProps::new("EVO_VS", E2E_NAMESPACE).with_parallelism_factor(1),
+    );
 
     let col = EVO_NEW_COL.to_uppercase();
     let sql = format!(
@@ -544,16 +514,12 @@ fn e2e_added_columns_initial_default_fill_all_types() {
 
     // Created after `initdef` exists so the adapter enumerates it. PARALLELISM_FACTOR = 1
     // puts both files in one shard.
-    let _ = conn.try_execute("DROP VIRTUAL SCHEMA IF EXISTS INITDEF_VS CASCADE");
-    conn.execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA INITDEF_VS
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION  = '{DEFAULT_CATALOG_CONN_NAME}'
-  NAMESPACE   = '{E2E_NAMESPACE}'
-  SCAN_SCHEMA         = '{SCHEMA_NAME}'
-  PARALLELISM_FACTOR  = '1'
-  ALLOW_HTTP          = 'true'"#
-    ));
+    create_virtual_schema(
+        &mut conn,
+        &VsProps::new("INITDEF_VS", E2E_NAMESPACE)
+            .with_parallelism_factor(1)
+            .with_property("SCAN_SCHEMA", SCHEMA_NAME),
+    );
 
     let columns = initdef_columns();
     let col_list = columns
@@ -2933,18 +2899,15 @@ fn offset_on_single_group_aggregate_is_rejected_by_exasol() {
     );
     let resp = conn.try_execute(&sql);
 
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "OFFSET on a single-group aggregate must be rejected by Exasol \
-         itself (the adapter is never consulted), got: {resp}"
+    let msg = error_text(
+        &resp,
+        &format!("OFFSET on a single-group aggregate ({sql})"),
     );
     assert_eq!(
         resp["exception"]["sqlCode"].as_str(),
         Some("42000"),
         "expected sqlCode 42000, got: {resp}"
     );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
     assert!(
         msg.contains("OFFSET") && msg.contains("aggregated"),
         "expected Exasol's 'OFFSET not allowed in aggregated selects' \
@@ -3227,19 +3190,11 @@ fn e2e_float_div_pushes_checked_division_call_projection() {
 }
 
 /// The state is the same for every UDF-raised error, so the message is what is asserted.
+#[track_caller]
 fn division_by_zero_failure_sql_code(conn: &mut ExaConn, sql: &str) -> String {
     let resp = conn.try_execute(sql);
 
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "a division by zero must fail the query rather than silently returning \
-         a value or a row count native Exasol disagrees with:\n{sql}\n{resp}"
-    );
-    let message = resp["exception"]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let message = error_text(&resp, &format!("a division by zero ({sql})")).to_ascii_lowercase();
     assert!(
         message.contains("division by zero"),
         "the surfaced message must name a division by zero:\n{sql}\n{resp}"

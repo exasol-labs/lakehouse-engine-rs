@@ -17,7 +17,7 @@ iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
 
 futures    = { workspace = true }
 serde      = { workspace = true }
-tokio      = { workspace = true, features = ["sync"] }
+tokio      = { workspace = true, features = ["sync", "time"] }
 serde_json = { workspace = true }
 url        = { workspace = true }
 
@@ -26,9 +26,11 @@ aws-sigv4              = { workspace = true }
 aws-credential-types   = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-sdk-glue           = { workspace = true }
+aws-smithy-types       = { workspace = true }
 
 reqwest = { workspace = true }
 rustls  = { workspace = true }
+hyper   = { workspace = true }
 
 # AWS STS AssumeRole.
 aws-sdk-sts = { workspace = true }

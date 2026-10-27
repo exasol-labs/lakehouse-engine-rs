@@ -1,0 +1,402 @@
+//! The one HTTP path of every catalog request. It owns the timeouts, the retries of a transient
+//! failure, and their window, so each caller keeps only its own error text and redaction.
+
+use crate::error_chain::{causes, error_chain};
+use aws_smithy_types::date_time::{DateTime, Format};
+use exasol_udf_sdk::error::UdfError;
+use reqwest::header::{HeaderMap, RETRY_AFTER};
+use reqwest::{IntoUrl, Request, RequestBuilder, Response, StatusCode};
+use serde::de::DeserializeOwned;
+use std::error::Error;
+use std::hash::{BuildHasher, RandomState};
+use std::io::ErrorKind;
+use std::time::{Duration, SystemTime};
+use tokio::time::{Instant, sleep};
+
+/// How hard one catalog request tries before it fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RetryPolicy {
+    /// Attempts in total, the first one included.
+    pub(crate) attempts: u32,
+    /// The longest one connection attempt may take.
+    pub(crate) connect_timeout: Duration,
+    /// The longest an attempt may wait for its answer's headers, its connection included, and then
+    /// for each next part of the answer body.
+    pub(crate) read_timeout: Duration,
+    /// No retry starts unless its answer's headers are due within this time after the first attempt
+    /// started. A body that keeps arriving is read past it.
+    pub(crate) retry_window: Duration,
+    /// The upper end of the first backoff wait, doubled for each later retry.
+    pub(crate) backoff_base: Duration,
+}
+
+/// The attempts and the window match the Glue native client (`glue/sdk.rs`). A 10-second read
+/// timeout leaves an attempt that stalls room for one retry within the window.
+const CATALOG_POLICY: RetryPolicy = RetryPolicy {
+    attempts: 5,
+    connect_timeout: Duration::from_secs(10),
+    read_timeout: Duration::from_secs(10),
+    retry_window: Duration::from_secs(30),
+    backoff_base: Duration::from_millis(250),
+};
+
+/// The most of an answer body an error quotes. The quote is cut only after the whole read is
+/// redacted, so a secret that the cut splits was already replaced.
+pub(crate) const MAX_QUOTED_BODY_BYTES: usize = 4096;
+
+/// The HTTP client of one catalog session. Callers build a request with [`Self::get`] or
+/// [`Self::post`] and send it only through [`Self::send_json`], [`Self::send`], or
+/// [`Self::send_capped`], so every catalog request gets the same timeouts and retries. A retry
+/// re-sends a clone of the request as the caller built and signed it: every retry starts within the
+/// window, long before a SigV4 signature or a cached OAuth token expires, so this type needs no
+/// knowledge of auth or signing.
+#[derive(Clone)]
+pub(crate) struct CatalogHttp {
+    client: reqwest::Client,
+    policy: RetryPolicy,
+}
+
+/// A complete answer of any HTTP status; the caller decides what the status means.
+#[derive(Debug)]
+pub(crate) struct CatalogAnswer {
+    pub(crate) status: StatusCode,
+    headers: HeaderMap,
+    pub(crate) body: Vec<u8>,
+    /// The body exceeded the caller's byte cap, and `body` holds only its first bytes.
+    pub(crate) cut: bool,
+}
+
+/// A failed catalog request, such as a [`CatalogHttp::send_json`], its message already redacted,
+/// with the HTTP status when the answer carried one, so a caller can tell a missing table from
+/// every other failure without parsing the message text.
+#[derive(Debug)]
+pub(crate) struct CatalogRequestError {
+    status: Option<StatusCode>,
+    message: String,
+}
+
+/// A catalog request that ended without a complete answer. [`Self::render`] gives its text.
+#[derive(Debug)]
+pub(crate) struct CatalogHttpError {
+    error: reqwest::Error,
+    /// Set when the answer's headers arrived and the read of its body broke off.
+    status: Option<StatusCode>,
+}
+
+impl CatalogHttp {
+    /// The client of every catalog session, under [`CATALOG_POLICY`].
+    pub(crate) fn new() -> Self {
+        Self::with_policy(CATALOG_POLICY)
+    }
+
+    /// Panics where `reqwest::Client::new` panics: when the TLS backend cannot start.
+    pub(crate) fn with_policy(policy: RetryPolicy) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(policy.connect_timeout)
+            .read_timeout(policy.read_timeout)
+            .build()
+            .expect("the TLS backend of the catalog HTTP client starts");
+        Self { client, policy }
+    }
+
+    pub(crate) fn get(&self, url: impl IntoUrl) -> RequestBuilder {
+        self.client.get(url)
+    }
+
+    pub(crate) fn post(&self, url: impl IntoUrl) -> RequestBuilder {
+        self.client.post(url)
+    }
+
+    /// Sends `request` and reads its whole answer body, retrying a transient failure within the
+    /// policy's window. Every HTTP answer is `Ok`, the last one when the retries run out; only a
+    /// transport failure is an error. A request whose body cannot be cloned is sent once.
+    pub(crate) async fn send(&self, request: Request) -> Result<CatalogAnswer, CatalogHttpError> {
+        self.send_capped(request, usize::MAX).await
+    }
+
+    /// [`Self::send`], then parses a 2xx answer's body as JSON. Every failure is an error whose
+    /// message starts with `what`, shows each cause through `redact`, and quotes a non-2xx
+    /// answer's body as [`quote_body`] cuts it.
+    pub(crate) async fn send_json<T: DeserializeOwned>(
+        &self,
+        request: Request,
+        what: &str,
+        redact: impl Fn(&str) -> String,
+    ) -> Result<T, CatalogRequestError> {
+        let answer = self.send(request).await.map_err(|error| {
+            CatalogRequestError::new(
+                error.status(),
+                format!("{what} failed: {}", error.render(&redact)),
+            )
+        })?;
+        if !answer.status.is_success() {
+            return Err(CatalogRequestError::new(
+                Some(answer.status),
+                format!(
+                    "{what} failed with HTTP {}: {}",
+                    answer.status.as_u16(),
+                    quote_body(&answer.body, &redact)
+                ),
+            ));
+        }
+        serde_json::from_slice(&answer.body).map_err(|error| {
+            CatalogRequestError::without_status(format!(
+                "{what} returned an unparseable response: {}",
+                redact(&error.to_string())
+            ))
+        })
+    }
+
+    /// [`Self::send`], keeping at most `max_bytes` of the answer body; [`CatalogAnswer::cut`]
+    /// reports a cut.
+    pub(crate) async fn send_capped(
+        &self,
+        mut request: Request,
+        max_bytes: usize,
+    ) -> Result<CatalogAnswer, CatalogHttpError> {
+        let window_end = Instant::now() + self.policy.retry_window;
+        let mut attempts_made = 0;
+        loop {
+            attempts_made += 1;
+            let resend = (attempts_made < self.policy.attempts)
+                .then(|| request.try_clone())
+                .flatten();
+            let outcome = self.exchange(request, max_bytes).await;
+            let Some(resend) = resend else {
+                return outcome;
+            };
+            let Some(wait) = self.wait_before_retry(attempts_made, &outcome, window_end) else {
+                return outcome;
+            };
+            sleep(wait).await;
+            request = resend;
+        }
+    }
+
+    async fn exchange(
+        &self,
+        request: Request,
+        max_bytes: usize,
+    ) -> Result<CatalogAnswer, CatalogHttpError> {
+        let mut response = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|error| CatalogHttpError::transport(error, None))?;
+        let status = response.status();
+        let headers = std::mem::take(response.headers_mut());
+        let (body, cut) = read_body(&mut response, max_bytes)
+            .await
+            .map_err(|error| CatalogHttpError::transport(error, Some(status)))?;
+        Ok(CatalogAnswer {
+            status,
+            headers,
+            body,
+            cut,
+        })
+    }
+
+    fn wait_before_retry(
+        &self,
+        retry: u32,
+        outcome: &Result<CatalogAnswer, CatalogHttpError>,
+        window_end: Instant,
+    ) -> Option<Duration> {
+        let requested = match outcome {
+            Ok(answer) if is_transient_status(answer.status) => stated_wait(&answer.headers),
+            Err(error) if error.is_transient() => None,
+            _ => return None,
+        };
+        let backoff = backoff_wait(self.policy.backoff_base, retry, random_jitter());
+        chosen_wait(
+            requested,
+            backoff,
+            window_end.saturating_duration_since(Instant::now()),
+            self.policy.read_timeout,
+        )
+    }
+}
+
+impl CatalogRequestError {
+    fn new(status: Option<StatusCode>, message: String) -> Self {
+        Self { status, message }
+    }
+
+    pub(crate) fn without_status(message: String) -> Self {
+        Self::new(None, message)
+    }
+
+    /// A 404 answer: the catalog has no loadable Iceberg table under this name.
+    pub(crate) fn is_not_found(&self) -> bool {
+        self.status == Some(StatusCode::NOT_FOUND)
+    }
+
+    /// Prefixes the message with the table's dotted identifier, for every kind of failure.
+    pub(crate) fn named(self, identifier: &str) -> Self {
+        Self::new(
+            self.status,
+            format!("failed to load table '{identifier}': {}", self.message),
+        )
+    }
+}
+
+impl std::fmt::Display for CatalogRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<CatalogRequestError> for UdfError {
+    fn from(error: CatalogRequestError) -> Self {
+        UdfError::User(error.message)
+    }
+}
+
+impl CatalogHttpError {
+    fn transport(error: reqwest::Error, status: Option<StatusCode>) -> Self {
+        Self { error, status }
+    }
+
+    /// The status of an answer whose body read broke off, so a caller can still report it.
+    pub(crate) fn status(&self) -> Option<StatusCode> {
+        self.status
+    }
+
+    /// The whole error chain passed through `redact`, preceded by the answer's HTTP status when its
+    /// body broke off.
+    pub(crate) fn render(&self, redact: impl Fn(&str) -> String) -> String {
+        let causes = redact(&error_chain(&self.error));
+        match self.status {
+            Some(status) => format!(
+                "the catalog's HTTP {} answer broke off: {causes}",
+                status.as_u16()
+            ),
+            None => causes,
+        }
+    }
+
+    fn is_transient(&self) -> bool {
+        self.status.is_none() && is_transient_transport_failure(&self.error)
+    }
+}
+
+async fn read_body(
+    response: &mut Response,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, bool), reqwest::Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        let room = max_bytes - body.len();
+        if chunk.len() > room {
+            body.extend_from_slice(&chunk[..room]);
+            return Ok((body, true));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((body, false))
+}
+
+/// `body` as an error may show it: passed through `redact`, then cut to
+/// [`MAX_QUOTED_BODY_BYTES`].
+pub(crate) fn quote_body(body: &[u8], redact: impl Fn(&str) -> String) -> String {
+    let redacted = redact(&String::from_utf8_lossy(body));
+    if redacted.len() <= MAX_QUOTED_BODY_BYTES {
+        return redacted;
+    }
+    let cut = redacted.floor_char_boundary(MAX_QUOTED_BODY_BYTES);
+    format!(
+        "{}... (truncated to {MAX_QUOTED_BODY_BYTES} bytes)",
+        &redacted[..cut]
+    )
+}
+
+fn stated_wait(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?;
+    retry_after_wait(value, SystemTime::now())
+}
+
+/// `RandomState` keys differ per instance, so hashing nothing still yields fresh bits.
+fn random_jitter() -> u32 {
+    (RandomState::new().hash_one(()) >> 32) as u32
+}
+
+/// 408, 429, 502, 503, and 504: the catalog or a proxy in front of it is briefly unable to answer.
+fn is_transient_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 429 | 502 | 503 | 504)
+}
+
+/// The wait a `Retry-After` value asks for (RFC 9110 § 10.2.3), or `None` when it is neither
+/// delay-seconds nor an IMF-fixdate. A past date asks for no wait.
+fn retry_after_wait(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(value.parse().map_or(Duration::MAX, Duration::from_secs));
+    }
+    // aws-smithy-types reads only the IMF-fixdate form, a scoped deviation of the spec delta.
+    let date = DateTime::from_str(value, Format::HttpDate).ok()?;
+    let stated = SystemTime::try_from(date).ok()?;
+    Some(stated.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
+/// A wait in [b/2, b] with b = `base` × 2^(`retry` − 1). `jitter` places it in that range: 0 at
+/// the lower end, `u32::MAX` at the upper end.
+fn backoff_wait(base: Duration, retry: u32, jitter: u32) -> Duration {
+    let ceiling = base.saturating_mul(2u32.saturating_pow(retry.saturating_sub(1)));
+    let floor = ceiling / 2;
+    let spread = (ceiling - floor).as_nanos() * u128::from(jitter) / u128::from(u32::MAX);
+    floor.saturating_add(Duration::from_nanos(
+        u64::try_from(spread).unwrap_or(u64::MAX),
+    ))
+}
+
+/// The catalog's own wait when it stated one, else `backoff`; `None` when that wait would leave
+/// less than `attempt_room`, the longest the next attempt may wait for its answer, so no attempt
+/// ends past the window.
+fn chosen_wait(
+    requested: Option<Duration>,
+    backoff: Duration,
+    time_left: Duration,
+    attempt_room: Duration,
+) -> Option<Duration> {
+    let wait = requested.unwrap_or(backoff);
+    time_left
+        .checked_sub(wait)
+        .is_some_and(|rest| rest >= attempt_room)
+        .then_some(wait)
+}
+
+/// An attempt that timed out before its answer, or a connection that the peer refused or cut with no
+/// TLS library error: a new attempt may succeed. DNS and TLS failures are final. Reads typed causes,
+/// never message text.
+fn is_transient_transport_failure(error: &reqwest::Error) -> bool {
+    error.is_timeout() || is_transient_cause_chain(error)
+}
+
+fn is_transient_cause_chain(error: &(dyn Error + 'static)) -> bool {
+    let mut cut_connection = false;
+    for cause in causes(error) {
+        if cause.is::<rustls::Error>() {
+            return false;
+        }
+        cut_connection |= cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+            )
+        });
+        // A proxy that reloads or ends idle keep-alive closes cleanly (#538): h2 reports a
+        // `BrokenPipe`, matched above, and HTTP/1.1 an incomplete message.
+        cut_connection |= cause
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message);
+    }
+    cut_connection
+}
+
+#[cfg(test)]
+#[path = "catalog_http_tests.rs"]
+mod tests;

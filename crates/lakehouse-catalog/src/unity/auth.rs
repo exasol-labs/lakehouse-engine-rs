@@ -2,6 +2,7 @@
 //! must never appear in any returned error.
 
 use crate::ConnectionCreds;
+use crate::catalog_http::CatalogHttp;
 use crate::creds::{SuppliedCatalogAuth, non_empty};
 use crate::error_chain;
 use crate::redaction::redact_error_text;
@@ -16,10 +17,12 @@ const OAUTH_REFRESH_SKEW_SECS: u64 = 60;
 
 const OAUTH_DEFAULT_SCOPE: &str = "all-apis";
 
+const GRANT: &str = "Unity Catalog OAuth client-credentials grant";
+
 pub(crate) enum UnityAuth {
     None,
     Pat(String),
-    OAuth(OAuthTokenSource),
+    OAuth(Box<OAuthTokenSource>),
 }
 
 impl UnityAuth {
@@ -50,7 +53,7 @@ type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// One source per session, so a whole enumeration reuses one minted token.
 pub(crate) struct OAuthTokenSource {
-    client: reqwest::Client,
+    http: CatalogHttp,
     token_url: String,
     client_id: String,
     client_secret: String,
@@ -86,49 +89,23 @@ impl OAuthTokenSource {
             ("grant_type", "client_credentials"),
             ("scope", self.scope.as_str()),
         ];
-        let response = self
-            .client
+        let request = self
+            .http
             .post(&self.token_url)
             .basic_auth(&self.client_id, Some(&self.client_secret))
             .header("accept", "application/json")
             .form(&form)
-            .send()
-            .await
-            .map_err(|e| {
-                UdfError::User(format!(
-                    "Unity Catalog OAuth client-credentials grant failed: {}",
-                    redact(&error_chain(&e))
-                ))
-            })?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "(unreadable body)".into());
-            return Err(UdfError::User(format!(
-                "Unity Catalog OAuth client-credentials grant failed with HTTP {}: {}",
-                status.as_u16(),
-                redact(&body)
-            )));
-        }
-        let parsed: OAuthTokenResponse = response.json().await.map_err(|e| {
-            UdfError::User(format!(
-                "Unity Catalog OAuth client-credentials grant returned an unparseable response: {}",
-                redact(&e.to_string())
-            ))
-        })?;
+            .build()
+            .map_err(|e| UdfError::User(format!("{GRANT} failed: {}", redact(&error_chain(&e)))))?;
+        let parsed: OAuthTokenResponse = self.http.send_json(request, GRANT, redact).await?;
         if parsed.access_token.is_empty() {
-            return Err(UdfError::User(
-                "Unity Catalog OAuth client-credentials grant returned no access_token".into(),
-            ));
+            return Err(UdfError::User(format!("{GRANT} returned no access_token")));
         }
         // A zero/absent lifetime would re-mint on every request.
-        let expires_in = parsed.expires_in.filter(|&secs| secs > 0).ok_or_else(|| {
-            UdfError::User(
-                "Unity Catalog OAuth client-credentials grant returned no usable expires_in".into(),
-            )
-        })?;
+        let expires_in = parsed
+            .expires_in
+            .filter(|&secs| secs > 0)
+            .ok_or_else(|| UdfError::User(format!("{GRANT} returned no usable expires_in")))?;
         Ok((parsed.access_token, expires_in))
     }
 }
@@ -143,7 +120,7 @@ struct OAuthTokenResponse {
 /// Synchronous by design: the OAuth grant is deferred to the first request, so
 /// building a session issues no request.
 pub(crate) fn resolve_unity_auth(
-    client: &reqwest::Client,
+    http: &CatalogHttp,
     address: &str,
     creds: &ConnectionCreds,
 ) -> UnityAuth {
@@ -161,15 +138,15 @@ pub(crate) fn resolve_unity_auth(
             let scope = non_empty(&creds.scope)
                 .unwrap_or(OAUTH_DEFAULT_SCOPE)
                 .to_string();
-            UnityAuth::OAuth(OAuthTokenSource {
-                client: client.clone(),
+            UnityAuth::OAuth(Box::new(OAuthTokenSource {
+                http: http.clone(),
                 token_url,
                 client_id: client_id.to_string(),
                 client_secret: client_secret.to_string(),
                 scope,
                 cache: Mutex::new(None),
                 clock: Arc::new(Instant::now),
-            })
+            }))
         }
     }
 }

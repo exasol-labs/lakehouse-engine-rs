@@ -3097,14 +3097,10 @@ fn e2e_both_dialects_unrenderable_predicate_errors_without_rows() {
          CAST('00000000000000000000000000000000' AS HASHTYPE)",
         typed_table()
     );
-    let resp = conn.try_execute(&sql);
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "a WHERE predicate unrenderable under BOTH dialects (CAST to \
-         HASHTYPE) must return a clean adapter error, not rows: {resp}"
+    let msg = error_text(
+        &conn.try_execute(&sql),
+        &format!("a WHERE predicate unrenderable under both dialects ({sql})"),
     );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
     assert!(
         !msg.contains("lhadminsecret123"),
         "adapter error message must not leak storage credentials: {msg}"
@@ -3320,18 +3316,12 @@ fn over_length_char_group_key_raises_truncation_error_like_native() {
 
     let resp = conn.try_execute(&sql);
 
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "GROUP BY on a CHAR(20) key must fail for the over-length 25-character \
-         value rather than silently truncate it, got: {resp}"
-    );
-
+    let message = error_text(
+        &resp,
+        &format!("GROUP BY on a CHAR(20) key over a 25-character value ({sql})"),
+    )
+    .to_ascii_lowercase();
     let sql_code = resp["exception"]["sqlCode"].as_str().unwrap_or_default();
-    let message = resp["exception"]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
     assert!(
         sql_code.contains("22002"),
         "expected Exasol's UDF-emit truncation error (sqlCode 22002, \"string \
@@ -3358,18 +3348,12 @@ fn over_length_char_projection_fails_cleanly() {
 
     let resp = conn.try_execute(&sql);
 
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "projecting CAST(val AS CHAR(20)) over the 25-character over-length \
-         value must fail rather than silently truncate, got: {resp}"
-    );
-
+    let message = error_text(
+        &resp,
+        &format!("CAST(val AS CHAR(20)) over a 25-character value ({sql})"),
+    )
+    .to_ascii_lowercase();
     let sql_code = resp["exception"]["sqlCode"].as_str().unwrap_or_default();
-    let message = resp["exception"]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
     assert!(
         sql_code.contains("22002"),
         "expected Exasol's UDF-emit truncation error (sqlCode 22002, \"string \

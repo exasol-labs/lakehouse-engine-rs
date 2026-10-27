@@ -7,7 +7,6 @@ use crate::{CatalogSession, ConnectionCreds};
 use exasol_udf_sdk::error::UdfError;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
 const CATALOG_SEGMENT: &str = "/catalog";
 const MANAGEMENT_SEGMENT: &str = "/management";
@@ -15,9 +14,6 @@ const BATCH_CHECK_PATH: &str = "/v1/action/batch-check";
 const READ_CHECK_ID: &str = "read-data";
 const CANNOT_INSPECT_ERROR_TYPE: &str = "CannotInspectPermissions";
 const NEEDS_LAKEKEEPER: &str = "The catalog must be a Lakekeeper server.";
-/// The pushdown waits on the batch-check, so a stalled server fails the query instead of
-/// hanging it.
-const BATCH_CHECK_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Whether the principal can read the table; a missing table is `allowed: false` too.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,16 +49,6 @@ pub async fn lakekeeper_batch_check(
     tables: &[&str],
     creds: &ConnectionCreds,
 ) -> Result<Vec<TableReadDecision>, UdfError> {
-    batch_check_within(session, principal, tables, creds, BATCH_CHECK_DEADLINE).await
-}
-
-async fn batch_check_within(
-    session: &CatalogSession,
-    principal: &str,
-    tables: &[&str],
-    creds: &ConnectionCreds,
-    deadline: Duration,
-) -> Result<Vec<TableReadDecision>, UdfError> {
     let distinct = distinct_in_first_seen_order(tables);
     if distinct.is_empty() {
         return Ok(Vec::new());
@@ -73,21 +59,14 @@ async fn batch_check_within(
     );
     let request = build_batch_check(principal, &distinct, session.prefix())?;
 
-    let answer = authed_post_json(
-        session.client(),
-        &url,
-        &request,
-        session.auth(),
-        creds,
-        deadline,
-    )
-    .await
-    .map_err(|error| {
-        UdfError::User(format!(
-            "the Lakekeeper batch-check at {url} could not be completed: {error}. \
-             {NEEDS_LAKEKEEPER}"
-        ))
-    })?;
+    let answer = authed_post_json(session.http(), &url, &request, session.auth(), creds)
+        .await
+        .map_err(|error| {
+            UdfError::User(format!(
+                "the Lakekeeper batch-check at {url} could not be completed: {error}. \
+                 {NEEDS_LAKEKEEPER}"
+            ))
+        })?;
 
     match answer {
         PostAnswer::Accepted { status, body } => {
