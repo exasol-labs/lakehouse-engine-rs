@@ -9,6 +9,7 @@ Spec-driven development with mission in: @specs/mission.md
 - Connection strings must set `validateservercertificate=0`, because the Docker image uses a self-signed certificate.
 - Read `specs/testing.md` before adding or changing any test or test helper. It holds the coverage rule, the testing strategy, the suite layout, and the ops rules for the orphan sweeps.
 - E2E for behavior, simple unit tests for logic, fake servers only for fault injection.
+- Pass `--workspace` to every host `cargo test`, `cargo check`, and `cargo clippy`, for example `cargo test --workspace --lib <filter>`. Narrow a run with `--lib`, `--test <name>`, or a test-name filter, never with `-p` or `--exclude`, because another package selection compiles a second copy of the dependency graph into `target/` (`specs/testing.md` § Test tiers).
 
 Project specifics:
 
