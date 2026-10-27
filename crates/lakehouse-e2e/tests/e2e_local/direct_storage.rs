@@ -4,7 +4,7 @@
 use crate::common::e2e_harness::{
     VARCHAR_JSON, VsProps, assert_decimal_orders_numerically, assert_notes_well_formed,
     assert_query_fails, assert_refused_column, assert_type_matrix, column_adapter_notes,
-    create_virtual_schema_with_password, declared_type, exa_conn, explain_virtual_sql,
+    create_virtual_schema_with_password, declared_type, error_text, exa_conn, explain_virtual_sql,
     has_broadcast_join_block, identifier_note, note_of, nullable_text, parse_int, parse_numeric,
     partition_positions, reads, refuses, skip_reason, skipped_entries, text_column,
     try_create_virtual_schema_with_password, value_to_string,
@@ -113,15 +113,6 @@ fn try_create_direct_vs(conn: &mut ExaConn, vs_name: &str, conn_name: &str, base
         base,
         &direct_storage_password(),
     )
-}
-
-fn rejection_message<'a>(resp: &'a Json, what: &str) -> &'a str {
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "{what} must fail its statement: {resp}"
-    );
-    resp["exception"]["text"].as_str().unwrap_or("")
 }
 
 fn assert_mentions(msg: &str, needles: &[&str]) {
@@ -1548,8 +1539,8 @@ fn incompatible_pair_fails_create_naming_column_and_files() {
         CONN_INCOMPATIBLE,
         BASE_INCOMPATIBLE,
     );
-    let msg = rejection_message(&resp, "the incompatible pair");
-    assert_mentions(msg, &["X", "file1.parquet", "file2.parquet"]);
+    let msg = error_text(&resp, "CREATE over an incompatible file pair");
+    assert_mentions(&msg, &["X", "file1.parquet", "file2.parquet"]);
     assert!(
         !msg.contains("lhadminsecret123"),
         "error must not leak credential values: {msg}"
@@ -1578,18 +1569,13 @@ fn merge_schema_false_declares_the_narrow_sampled_type_and_refuses_a_wider_file_
         "a column both files store at the declared type must return both files' rows"
     );
 
-    let resp = conn.try_execute(&format!(
+    let sql = format!(
         "SELECT ID, PRICE FROM {}",
         vs_table(VS_DIRECT_NARROW, "WIDENED")
-    ));
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "a PRICE file column wider than the declared type must be refused, not narrowed: {resp}"
     );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
+    let msg = error_text(&conn.try_execute(&sql), &sql);
     assert_mentions(
-        msg,
+        &msg,
         &[
             "PRICE",
             "Float64",
@@ -1726,7 +1712,7 @@ fn malformed_connections_are_rejected_at_create_virtual_schema() {
             &address,
             &password,
         );
-        let msg = rejection_message(&resp, label);
+        let msg = error_text(&resp, label);
         assert!(
             !msg.contains(s3_secret),
             "{label} must not leak the S3 secret: {msg}"
@@ -1736,13 +1722,13 @@ fn malformed_connections_are_rejected_at_create_virtual_schema() {
             "{label} must not leak the Azure key: {msg}"
         );
         if label == "REJECTS_WAREHOUSE" {
-            assert_mentions(msg, &["warehouse"]);
+            assert_mentions(&msg, &["warehouse"]);
         }
         if label == "REJECTS_TOKEN" {
-            assert_mentions(msg, &["token"]);
+            assert_mentions(&msg, &["token"]);
         }
         if label == "REJECTS_PLAINTEXT_ABFS" {
-            assert_mentions(msg, &["abfss"]);
+            assert_mentions(&msg, &["abfss"]);
         }
         if label == "REJECTS_EMPTY_ADDRESS" {
             assert!(
@@ -1751,7 +1737,7 @@ fn malformed_connections_are_rejected_at_create_virtual_schema() {
             );
         }
         if label == "REJECTS_AZURE_CREDS_ON_S3_SCHEME" {
-            assert_mentions(msg, &["s3"]);
+            assert_mentions(&msg, &["s3"]);
         }
     }
 
@@ -1765,7 +1751,7 @@ fn malformed_connections_are_rejected_at_create_virtual_schema() {
         BASE_DISCOVERY,
         &direct_storage_password(),
     );
-    rejection_message(&resp, "an unparseable MERGE_SCHEMA value");
+    error_text(&resp, "CREATE with MERGE_SCHEMA = 'NOTABOOL'");
 }
 
 #[test]
@@ -1981,15 +1967,13 @@ fn create_stats_oracles(conn: &mut ExaConn) {
 /// `{T}` and `{D}` name the fact and dimension tables.
 fn assert_same_as_native(conn: &mut ExaConn, template: &str, overflows: bool) {
     let mut run = |fact: &str, dim: &str| {
-        let response = conn.try_execute(&template.replace("{T}", fact).replace("{D}", dim));
+        let sql = template.replace("{T}", fact).replace("{D}", dim);
+        let response = conn.try_execute(&sql);
         match response["status"].as_str() {
             Some("ok") => {
                 Ok(conn.fetch_result_columns(&response["responseData"]["results"][0]["resultSet"]))
             }
-            _ => Err(response["exception"]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string()),
+            _ => Err(error_text(&response, &sql)),
         }
     };
     let pushed = run(DIRECT_STATS, DIRECT_STATS_DIM);
@@ -2387,9 +2371,12 @@ fn partition_key_collision_with_a_missing_segment_fails_the_refresh() {
         CONN_COLLISION_MISSING,
         BASE_COLLISION_MISSING,
     );
-    let msg = rejection_message(&resp, "a K-storing file with no k= segment");
+    let msg = error_text(
+        &resp,
+        "CREATE over a partition key collision with a missing segment",
+    );
     assert_mentions(
-        msg,
+        &msg,
         &[
             "column 'K'",
             "partition key 'k='",
@@ -2861,9 +2848,9 @@ fn two_spellings_of_one_partition_key_fail_refresh_and_query() {
             BASE_TWO_SPELLINGS,
             &direct_storage_password(),
         );
-        let msg = rejection_message(&resp, &format!("MERGE_SCHEMA = '{merge_schema}'"));
+        let msg = error_text(&resp, &format!("CREATE with MERGE_SCHEMA = {merge_schema}"));
         assert_mentions(
-            msg,
+            &msg,
             &[
                 "'Year'",
                 "'year'",
@@ -2894,9 +2881,9 @@ fn two_spellings_of_one_partition_key_fail_refresh_and_query() {
     let query = conn.try_execute(&format!("SELECT COUNT(*) FROM {table}"));
     let refresh = conn.try_execute(&format!("ALTER VIRTUAL SCHEMA {VS_SPELLING_DRIFT} REFRESH"));
     delete_fixture_object(&late);
-    for (statement, resp) in [("query", &query), ("refresh", &refresh)] {
+    for (what, resp) in [("the COUNT query", &query), ("the REFRESH", &refresh)] {
         assert_mentions(
-            rejection_message(resp, statement),
+            &error_text(resp, what),
             &[
                 "'year'",
                 "'YEAR'",
@@ -2993,11 +2980,8 @@ fn over_limit_column_note_fails_create_and_refresh() {
     let create = try_create_direct_vs(&mut conn, VS_OVER_LIMIT, CONN_NOTES, BASE_OVER_LIMIT);
     delete_fixture_object(&wide);
 
-    for (statement, resp) in [("refresh", &refresh), ("create", &create)] {
-        assert_mentions(
-            rejection_message(resp, statement),
-            &["'PAYLOAD'", "'WIDE'", "2000000"],
-        );
+    for (what, resp) in [("the REFRESH", &refresh), ("the CREATE", &create)] {
+        assert_mentions(&error_text(resp, what), &["'PAYLOAD'", "'WIDE'", "2000000"]);
     }
 }
 
@@ -3115,14 +3099,9 @@ fn assert_reads(conn: &mut ExaConn, case: &str, sql: &str, expected: &[&[Option<
     assert_eq!(observed, expected, "{case}: {sql}");
 }
 
+#[track_caller]
 fn assert_fails_naming(conn: &mut ExaConn, case: &str, sql: &str, fragments: &[&str]) -> String {
-    let resp = conn.try_execute(sql);
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "{case}: must fail: {sql}: {resp}"
-    );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("").to_string();
+    let msg = error_text(&conn.try_execute(sql), &format!("{case}: {sql}"));
     for fragment in fragments {
         assert!(
             msg.contains(fragment),

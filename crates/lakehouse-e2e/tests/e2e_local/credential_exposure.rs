@@ -190,14 +190,16 @@ fn assert_no_credential(text: &str) {
 }
 
 /// The error text of a denied response, checked to carry no credential.
-fn denial_text(denied: &Value) -> String {
-    let msg = error_text(denied);
+#[track_caller]
+fn denial_text(denied: &Value, context: &str) -> String {
+    let msg = error_text(denied, context);
     assert_no_credential(&msg);
     msg
 }
 
+#[track_caller]
 fn assert_denied(denied: &Value, expected: &str) {
-    let msg = denial_text(denied);
+    let msg = denial_text(denied, &format!("the query denied with {expected:?}"));
     assert!(msg.contains(expected), "{expected:?} expected: {msg}");
 }
 
@@ -352,7 +354,10 @@ fn revoking_the_owners_adapter_grant_fails_with_the_adapter_error_even_with_the_
         with_grants(&reader_grants, || try_reader_count(VS_NAME))
     });
 
-    let msg = denial_text(&denied);
+    let msg = denial_text(
+        &denied,
+        "the reader count without the owner's adapter grant",
+    );
     assert!(
         msg.contains(&unresolved_text(CONN_NAME)) && !msg.contains(SCAN_DENIAL),
         "adapter denial expected: {msg}"
@@ -597,7 +602,7 @@ fn alter_connection_rotates_the_secret_and_keeps_the_grants() {
     );
 
     sys.execute(&alter_sql(&rotated));
-    let msg = error_text(&reader_conn().try_execute(&query));
+    let msg = error_text(&reader_conn().try_execute(&query), &query);
     for secret in [password.secret_key.as_str(), WRONG_SECRET_KEY] {
         assert!(!msg.contains(secret), "secret leaked: {msg}");
     }

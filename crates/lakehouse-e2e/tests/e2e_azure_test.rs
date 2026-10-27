@@ -12,7 +12,7 @@ use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SO_UDF_OBJECT_PATH, SYS_PASSWORD, VsProps,
     assert_decimal_orders_numerically, create_schema_and_scripts,
     create_virtual_schema_with_password, declared_type, exa_conn, explain_virtual_sql, install_slc,
-    parse_int, projection_rows, upload_so, value_to_string,
+    parse_int, projection_rows, runtime, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
@@ -20,6 +20,7 @@ use common::lakekeeper::{
     lakekeeper_connection_password, lakekeeper_create_adls_warehouse,
     lakekeeper_warehouse_storage_profile,
 };
+use common::raw_parquet::encode_parquet;
 use common::seed::{
     E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, SeedCatalogAuth, SeedStorage,
     decimal_18_0_values, seed_events_table_with_auth,
@@ -36,7 +37,6 @@ use futures::FutureExt;
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::path::Path as ObjectStorePath;
 use object_store::{ObjectStoreExt, PutPayload};
-use parquet::arrow::ArrowWriter;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -105,10 +105,7 @@ impl AzureFixture {
         let account_name = azure::account_name();
         let account_key = azure::account_key();
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
+        let rt = runtime();
 
         let container_name = azure::per_run_container_name();
         let container = rt
@@ -318,32 +315,18 @@ fn write_azure_parquet_fixture(
     path: &str,
     batch: RecordBatch,
 ) {
-    let mut buf = Vec::new();
-    {
-        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), None)
-            .unwrap_or_else(|e| panic!("open Arrow Parquet writer for {path}: {e}"));
-        writer
-            .write(&batch)
-            .unwrap_or_else(|e| panic!("write Azure raw-Parquet fixture batch at {path}: {e}"));
-        writer
-            .close()
-            .unwrap_or_else(|e| panic!("close Azure raw-Parquet fixture writer for {path}: {e}"));
-    }
-
     let store = MicrosoftAzureBuilder::new()
         .with_account(account)
         .with_container_name(container)
         .with_access_key(key)
         .build()
         .unwrap_or_else(|e| panic!("configure Azure object store for {path}: {e}"));
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime for Azure raw-Parquet fixture write");
-    rt.block_on(async {
+    runtime().block_on(async {
         store
-            .put(&ObjectStorePath::from(path), PutPayload::from(buf))
+            .put(
+                &ObjectStorePath::from(path),
+                PutPayload::from(encode_parquet(&batch)),
+            )
             .await
             .unwrap_or_else(|e| panic!("PUT Azure raw-Parquet fixture at {path}: {e}"));
     });
@@ -562,10 +545,7 @@ fn azure_container_guard_deletes_on_panic() {
     // `Handle::block_on` in a sync closure would itself panic.
     let container_name = azure::per_run_container_name();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let rt = runtime();
 
     let outcome = rt.block_on(
         std::panic::AssertUnwindSafe(async {

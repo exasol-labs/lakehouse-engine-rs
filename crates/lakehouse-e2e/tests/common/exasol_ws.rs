@@ -18,6 +18,21 @@ const DEFAULT_FETCH_NUM_BYTES: u64 = 67_108_864;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The exception text of a response that must be an error. `context` names the statement or
+/// case, as SQL or a label.
+#[track_caller]
+pub fn error_text(response: &Value, context: &str) -> String {
+    assert_eq!(
+        response["status"].as_str(),
+        Some("error"),
+        "{context} must fail: {response}"
+    );
+    response["exception"]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// The first cell of an execute response. A `DECIMAL` result comes back as a JSON string,
 /// so a string is parsed too.
 pub fn scalar_i64(resp: &Value) -> Option<i64> {
@@ -99,16 +114,16 @@ impl ExaConn {
         }
     }
 
+    #[track_caller]
     pub fn execute(&mut self, sql: &str) -> Value {
-        let cmd = json!({
-            "command": "execute",
-            "sqlText": sql,
-            "attributes": {"resultSetMaxRows": self.result_set_max_rows}
-        });
-        self.ws
-            .send(Message::Text(cmd.to_string().into()))
-            .expect("send execute");
-        let resp = Self::read_json(&mut self.ws);
+        let resp = self.try_execute(sql);
+        self.assert_ok(&resp, sql);
+        resp
+    }
+
+    /// `context` names the statement, as SQL or a label.
+    #[track_caller]
+    pub fn assert_ok(&self, resp: &Value, context: &str) {
         if self.redact_sql {
             // The Exasol error response may echo credentials from the SQL back.
             assert_eq!(
@@ -120,10 +135,9 @@ impl ExaConn {
             assert_eq!(
                 resp["status"].as_str(),
                 Some("ok"),
-                "Exasol execute failed for SQL:\n{sql}\n\nError: {resp}"
+                "Exasol execute failed for SQL:\n{context}\n\nError: {resp}"
             );
         }
-        resp
     }
 
     pub fn try_execute(&mut self, sql: &str) -> Value {
