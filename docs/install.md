@@ -237,6 +237,37 @@ The adapter UDF runs **inside** the Exasol container. Every address in the CONNE
 VS properties must resolve from there. Use internal hostnames, for example `iceberg-rest` and
 `seaweedfs`. Never use `localhost` or the Docker host gateway.
 
+## Proxy
+
+When the Exasol nodes reach the catalog, the object store, or AWS only through a forward proxy, set
+the proxy with `%env` lines in the script source. `LAKEHOUSE_ADAPTER` plans and `LAKEHOUSE_SCAN`
+reads the data files, and they contact different hosts, so both scripts need the lines:
+
+```sql
+CREATE OR REPLACE RUST ADAPTER SCRIPT LHVS.LAKEHOUSE_ADAPTER AS
+%env HTTPS_PROXY=http://proxy.example:3128;
+%env NO_PROXY=localhost,127.0.0.1,.internal.example;
+%udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
+/
+
+CREATE OR REPLACE RUST SCALAR SCRIPT LHVS.LAKEHOUSE_SCAN(common VARCHAR(2000000), files VARCHAR(2000000))
+EMITS (...) AS
+%env HTTPS_PROXY=http://proxy.example:3128;
+%env NO_PROXY=localhost,127.0.0.1,.internal.example;
+%udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
+/
+```
+
+- `HTTPS_PROXY` applies to `https://` endpoints and `HTTP_PROXY` to `http://` endpoints.
+- `NO_PROXY` is a comma-separated list of hosts that bypass the proxy. An entry is a host name, a
+  domain suffix such as `.internal.example`, or an IP address.
+- The variables cover every request: Iceberg REST, Unity Catalog, Lakekeeper, and OAuth2 token
+  endpoints, AWS Glue and AWS STS, and S3 and ADLS storage.
+- A proxy URL may carry credentials, `http://user:password@proxy.example:3128`. Error messages
+  name the proxy without them, but anyone who can read the script source can read them.
+- Re-running the install command recreates the scripts without the `%env` lines. Add them again
+  afterwards.
+
 ## Local dev stack
 
 For an evaluation or a throwaway environment, use `docker-compose.yml`. It starts Exasol, SeaweedFS,

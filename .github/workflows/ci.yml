@@ -356,7 +356,7 @@ jobs:
       # one-shot jobs are `docker wait`-ed first.
       - name: Start stack (Exasol + SeaweedFS + Iceberg REST)
         run: |
-          docker compose up -d --wait exasol seaweedfs iceberg-rest
+          docker compose up -d --wait exasol seaweedfs iceberg-rest proxy
 
           docker compose up -d spark-iceberg-fixtures
           SPARK_FIXTURES_EXIT=$(docker wait lakehouse-engine-rs-spark-iceberg-fixtures-1)
@@ -413,7 +413,7 @@ jobs:
             exit 1
           fi
 
-          $COMPOSE up -d --wait exasol seaweedfs keycloak lakekeeper-db openfga-db openfga lakekeeper
+          $COMPOSE up -d --wait exasol seaweedfs keycloak lakekeeper-db openfga-db openfga lakekeeper proxy
 
       - name: Run Lakekeeper E2E suite
         run: make test-e2e-lakekeeper
@@ -448,7 +448,7 @@ jobs:
         run: |
           COMPOSE="docker compose -f docker-compose.yml -f docker-compose.unity.yml"
 
-          $COMPOSE up -d --wait seaweedfs exasol unitycatalog
+          $COMPOSE up -d --wait seaweedfs exasol unitycatalog proxy
 
       - name: Seed Unity Catalog fixtures
         run: ./scripts/unity/seed.sh
@@ -487,7 +487,7 @@ jobs:
         run: |
           docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
             -f docker-compose.lakekeeper.azure.yml \
-            pull --quiet exasol keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper
+            pull --quiet exasol keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper proxy
 
       - name: Start stack (Exasol + Keycloak + OpenFGA + Lakekeeper)
         run: |
@@ -509,7 +509,7 @@ jobs:
             exit 1
           fi
 
-          $COMPOSE up -d --wait exasol keycloak lakekeeper-db openfga-db openfga lakekeeper
+          $COMPOSE up -d --wait exasol keycloak lakekeeper-db openfga-db openfga lakekeeper proxy
 
       - name: Run Azure E2E suite
         env:
@@ -545,10 +545,10 @@ jobs:
       - uses: ./.github/actions/e2e-setup
 
       - name: Pull stack images
-        run: docker compose pull --quiet exasol
+        run: docker compose pull --quiet exasol proxy
 
       - name: Start stack (Exasol)
-        run: docker compose up -d --wait exasol
+        run: docker compose up -d --wait exasol proxy
 
       - name: Run Glue E2E suite
         env:

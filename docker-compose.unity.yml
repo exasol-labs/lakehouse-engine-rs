@@ -1,6 +1,6 @@
 # Overlay on docker-compose.yml:
 #   docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait \
-#     seaweedfs exasol unitycatalog
+#     seaweedfs exasol unitycatalog proxy
 #   ./scripts/unity/seed.sh
 # UC OSS 0.5.x has no S3 endpoint override (upstream #43), so the engine's
 # ObjectStore injects the SeaweedFS endpoint for vended credentials itself.
@@ -37,6 +37,10 @@ services:
     networks:
       lakehouse:
         ipv4_address: 10.84.0.50
+
+  proxy:
+    extra_hosts:
+      - "unitycatalog-via-proxy:10.84.0.50"
 
   # Re-declares the base /etc/hosts loop to add unitycatalog.
   exasol:

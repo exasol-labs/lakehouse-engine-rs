@@ -68,20 +68,20 @@ test-e2e: cross-udf-build
 
 # Requires:
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
-#     seaweedfs exasol keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper
+#     seaweedfs exasol keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper proxy
 test-e2e-lakekeeper: cross-udf-build
 	cargo test --workspace --features lakehouse-e2e/lakekeeper-e2e --test e2e_lakekeeper_test -- --test-threads=1
 
 # Requires:
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
 #     -f docker-compose.lakekeeper.azure.yml up -d --wait \
-#     exasol keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper
+#     exasol keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper proxy
 # plus real Azure Blob Storage credentials from ./test.env or the environment.
 # Sourcing and cargo MUST stay on one recipe line: each line runs in its own shell.
 test-e2e-azure: cross-udf-build
 	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --workspace --features lakehouse-e2e/azure-e2e --test e2e_azure_test -- --test-threads=1
 
-# Requires: docker compose up -d --wait exasol
+# Requires: docker compose up -d --wait exasol proxy
 # plus a real AWS Glue Data Catalog and S3 fixture bucket (GLUE_* in ./test.env or the environment).
 # Sourcing and cargo MUST stay on one recipe line: each line runs in its own shell.
 test-e2e-glue: cross-udf-build
@@ -215,7 +215,7 @@ bench: cross-udf-build
 # the docker network (extra_hosts in the overlay).
 unity-up:
 	docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait \
-	  seaweedfs exasol unitycatalog
+	  seaweedfs exasol unitycatalog proxy
 	./scripts/unity/seed.sh
 
 unity-down:

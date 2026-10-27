@@ -62,3 +62,27 @@ fn a_certificate_failure_gets_no_scheme_hint() {
         "{text}"
     );
 }
+
+#[test]
+fn the_named_proxy_carries_no_credentials() {
+    let matcher = Matcher::builder()
+        .http("http://user:s3cret@proxy.example:3128")
+        .build();
+    let url = reqwest::Url::parse("http://catalog.example/v1/config").unwrap();
+
+    assert_eq!(
+        proxy_for(&matcher, &url).as_deref(),
+        Some("http://proxy.example:3128")
+    );
+}
+
+#[test]
+fn a_no_proxy_host_names_no_proxy() {
+    let matcher = Matcher::builder()
+        .http("http://proxy.example:3128")
+        .no("catalog.example")
+        .build();
+    let url = reqwest::Url::parse("http://catalog.example/v1/config").unwrap();
+
+    assert_eq!(proxy_for(&matcher, &url), None);
+}

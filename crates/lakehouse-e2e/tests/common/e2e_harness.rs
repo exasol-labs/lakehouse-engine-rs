@@ -133,18 +133,34 @@ pub fn create_schema_and_scripts(conn: &mut ExaConn) {
     create_schema_and_scripts_in(conn, SCHEMA_NAME);
 }
 
-/// Re-running it over an existing schema is the installer's re-install.
 pub fn create_schema_and_scripts_in(conn: &mut ExaConn, schema: &str) {
+    create_schema_and_scripts_with_env(conn, schema, &[], &[]);
+}
+
+/// Each `(name, value)` pair becomes one `%env` line of the adapter or the scan script.
+pub fn create_schema_and_scripts_with_env(
+    conn: &mut ExaConn,
+    schema: &str,
+    adapter_env: &[(&str, &str)],
+    scan_env: &[(&str, &str)],
+) {
+    let env_lines = |env: &[(&str, &str)]| -> String {
+        env.iter()
+            .map(|(name, value)| format!("%env {name}={value};\n"))
+            .collect()
+    };
+    let adapter_env = env_lines(adapter_env);
+    let scan_env = env_lines(scan_env);
     conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"));
     conn.execute(&format!(
         r#"CREATE OR REPLACE {LANG_ALIAS} ADAPTER SCRIPT {schema}.{ADAPTER_SCRIPT_NAME} AS
-%udf_object {SO_UDF_OBJECT_PATH}
+{adapter_env}%udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));
     conn.execute(&format!(
         r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {schema}.{SCAN_SCRIPT_NAME}(common VARCHAR(2000000), files VARCHAR(2000000))
 EMITS (...) AS
-%udf_object {SO_UDF_OBJECT_PATH}
+{scan_env}%udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));
     conn.execute(&format!(

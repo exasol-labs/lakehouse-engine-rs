@@ -7,10 +7,10 @@ mod common;
 use common::e2e_harness::{
     SCAN_SCRIPT_NAME, SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_decimal_orders_numerically,
     assert_query_fails, assert_type_matrix, column_adapter_notes, create_schema_and_scripts,
-    create_virtual_schema_with_password, declared_types, enumerated_table_names, error_text,
-    exa_conn, explain_virtual_sql, has_broadcast_join_block, has_two_scan_wrapper, identifier_note,
-    install_slc, note_of, pairs, parse_int, parse_numeric, partition_positions, query_error, reads,
-    refuses, text_column, upload_so, value_to_string,
+    create_schema_and_scripts_with_env, create_virtual_schema_with_password, declared_types,
+    enumerated_table_names, error_text, exa_conn, explain_virtual_sql, has_broadcast_join_block,
+    has_two_scan_wrapper, identifier_note, install_slc, note_of, pairs, parse_int, parse_numeric,
+    partition_positions, query_error, reads, refuses, text_column, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
@@ -2606,4 +2606,35 @@ fn delta_pruning_keeps_every_file_with_a_matching_row() {
 fn delta_single_group_aggregates_match_the_oracle() {
     setup();
     assert_single_group_aggregates_match_oracle(&mut exa_conn(), Format::Delta);
+}
+
+/// Scenario: Catalog, storage, and STS requests go through the proxy
+#[test]
+fn unity_catalog_and_delta_log_reads_go_through_the_proxy() {
+    const ADAPTER_SCHEMA: &str = "LHVS_PROXY";
+    const VS_PROXY: &str = "UNITY_PROXY_VS";
+    setup();
+    stack::wait_for_proxy();
+    for host in ["unitycatalog-via-proxy", "seaweedfs-via-proxy"] {
+        stack::assert_resolves_only_through_proxy(host);
+    }
+    let proxy = [("HTTP_PROXY", stack::PROXY_URL_INTERNAL)];
+    let mut conn = exa_conn();
+    create_schema_and_scripts_with_env(&mut conn, ADAPTER_SCHEMA, &proxy, &proxy);
+    create_virtual_schema_with_password(
+        &mut conn,
+        &VsProps::new(VS_PROXY, UNITY_NAMESPACE)
+            .with_adapter_schema(ADAPTER_SCHEMA)
+            .with_catalog_kind("UNITY_CATALOG")
+            .with_catalog_conn_name("UNITY_PROXY_CREDS"),
+        "http://unitycatalog-via-proxy:8080",
+        &CatalogConnectionPassword {
+            endpoint: "http://seaweedfs-via-proxy:8333".to_string(),
+            ..local_stack_connection_password()
+        },
+    );
+    assert_eq!(
+        conn.query_scalar_i64(&format!("SELECT COUNT(*) FROM {VS_PROXY}.TABLE_WITH_DV")),
+        8
+    );
 }

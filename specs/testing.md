@@ -42,11 +42,11 @@ This file holds the rules for how this repository tests its behavior and how it 
 
 | Suite | Cargo feature | Test binaries | Make target | CI job (check name) | Stack | In `release` needs |
 |-------|---------------|---------------|-------------|---------------------|-------|--------------------|
-| Local Docker | `exasol-e2e` | `e2e_local` | `make test-e2e` | `e2e` (`E2E`, `E2E (8.29.x)`) | Exasol, SeaweedFS, Iceberg REST catalog (`docker-compose.yml`) | yes |
+| Local Docker | `exasol-e2e` | `e2e_local` | `make test-e2e` | `e2e` (`E2E`, `E2E (8.29.x)`) | Exasol, SeaweedFS, Iceberg REST catalog, forward proxy (`docker-compose.yml`) | yes |
 | Lakekeeper | `lakekeeper-e2e` | `e2e_lakekeeper_test` | `make test-e2e-lakekeeper` | `e2e-lakekeeper` (`E2E (Lakekeeper)`) | Local Docker stack plus Lakekeeper, its PostgreSQL database, Keycloak, OpenFGA | yes |
-| Unity Catalog | `unity-e2e` | `e2e_unity_test` | `make test-e2e-unity` | `e2e-unity` (`E2E (Unity)`) | SeaweedFS, Exasol, OSS Unity Catalog (`docker-compose.unity.yml`) | yes |
+| Unity Catalog | `unity-e2e` | `e2e_unity_test` | `make test-e2e-unity` | `e2e-unity` (`E2E (Unity)`) | SeaweedFS, Exasol, forward proxy, OSS Unity Catalog (`docker-compose.unity.yml`) | yes |
 | Azure | `azure-e2e` | `e2e_azure_test` | `make test-e2e-azure` | `e2e-azure` (`E2E (Azure)`) | Lakekeeper stack plus a real ADLS Gen2 account | no |
-| Glue | `glue-e2e` | `e2e_glue_test` | `make test-e2e-glue` | `e2e-glue` (`E2E (Glue)`) | Local Exasol plus a real AWS Glue Data Catalog and S3 bucket | no |
+| Glue | `glue-e2e` | `e2e_glue_test` | `make test-e2e-glue` | `e2e-glue` (`E2E (Glue)`) | Local Exasol and forward proxy plus a real AWS Glue Data Catalog and S3 bucket | no |
 | Cloud (opt-in) | `cloud-e2e` | `cloud_e2e_test` | none | none | A real Exasol cluster plus the AWS Glue Iceberg REST catalog | no |
 
 - A new test module of the Local Docker suite is declared in `crates/lakehouse-e2e/tests/e2e_local/main.rs`. A module file the suite does not declare never compiles and never runs.
@@ -135,6 +135,7 @@ This file holds the rules for how this repository tests its behavior and how it 
 - A fixture-shape test reads the written file's own Parquet footer and asserts its physical encoding, so a read test cannot pass against a fixture whose types were normalized.
 - Fixture authoring is idempotent across runs, because the SeaweedFS volume outlives one run. A persisted fixture table whose schema differs from the authored one is dropped and rewritten.
 - Each standalone fixture gets its own namespace and virtual schema, so it stays invisible to every other suite's enumeration.
+- A forward-proxy test addresses each local service by a `*-via-proxy` name that only the proxy container resolves, so a request that bypasses the proxy fails on DNS. The test first asserts that the name does not resolve inside the Exasol container. Its scripts sit in their own adapter schema, `LHVS_PROXY`, so their `%env` lines reach no other test. A suite against real cloud hosts, whose names resolve everywhere, proves a request went through the proxy by the `CONNECT` line in the proxy's log.
 - The Glue fixture set writes no data file for the cases the listing skips: the ORC partition, the partition-projection table, the view, the ORC table, and the Delta table.
 - A fixture whose test requires a failed enumeration sits under a base path that no passing test enumerates, because enumeration walks every first-level directory of the base path.
 - Suites that compare two credential arms seed both from one deterministic 20-row shape (`id` 1 to 20, `score` = 5.0 × `id`). Equal rows across arms then prove both arms read correctly. They do not prove both arms read the same bytes.

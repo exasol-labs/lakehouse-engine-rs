@@ -95,6 +95,7 @@
 - Errors never contain credentials. Storage credentials reach the scan UDF only as a CONNECTION name or a sealed envelope.
 - STS AssumeRole and Glue operations time out after 30 seconds.
 - Every Iceberg REST, Lakekeeper, Unity Catalog, and OAuth2 token request goes through the one crate-private catalog HTTP client of `lakehouse-catalog`. It ends an attempt that stays silent for 10 seconds, retries only a transient failure, up to 5 attempts, and starts no retry that could wait for its answer past 30 seconds after the first attempt. It reads an answer body for as long as the body keeps arriving.
+- Every outbound HTTP client of the adapter and the scan UDF honors `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY` from the process environment, which a script's `%env` lines set. A client that ignores them is a defect.
 - Exasol's own dispatcher throttles concurrent UDF VMs at 80% of the per-process memory limit.
 - DSNs in the Makefile, bench scripts, and installer include `validateservercertificate=0`.
 - The engine must be faster than single-node DataFusion, scale with added Exasol nodes, keep duplicate scanning minimal, and keep metadata overhead acceptable.
@@ -110,6 +111,7 @@
 - AWS STS: session credentials for a CONNECTION that names an IAM role (`aws_assume_role_arn`) | failure impact: every request through that CONNECTION fails, with no fallback to the static base key pair
 - S3-compatible object storage: Parquet data files and table metadata files | failure impact: scans fail or stall, and this is a measured bottleneck risk
 - Azure ADLS Gen2 (`abfss://`): Parquet data files and table metadata files for Azure-hosted tables | failure impact: scans of ADLS-hosted tables fail
+- Forward proxy, when a script's `%env` lines name one: every request to a host outside `NO_PROXY` | failure impact: every such request fails, with no direct fallback
 - Exasol cluster and Rust SLC in BucketFS: UDF execution substrate | failure impact: no execution
 - GitHub releases (`exasol-labs/lakehouse-engine-rs`, `exasol-labs/language-container-rs`): engine and SLC assets for install.sh | failure impact: installation fails, and running deployments are unaffected
 - exapump: BucketFS upload and SQL execution for install.sh | failure impact: installation fails

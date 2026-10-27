@@ -178,6 +178,90 @@ pub fn wait_for_iceberg_catalog() {
     wait_for_url(&url, DEFAULT_TIMEOUT);
 }
 
+pub const PROXY_URL_INTERNAL: &str = "http://10.84.0.12:8888";
+pub const CLOSED_PROXY_URL_INTERNAL: &str = "http://10.84.0.12:1";
+
+/// Probes from the Exasol container, because only the UDFs there reach the proxy.
+pub fn wait_for_proxy() {
+    let container = exasol_container();
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    loop {
+        let reachable = std::process::Command::new("docker")
+            .args([
+                "exec",
+                &container,
+                "bash",
+                "-c",
+                "timeout 3 bash -c '</dev/tcp/10.84.0.12/8888'",
+            ])
+            .status()
+            .is_ok_and(|s| s.success());
+        if reachable {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "forward proxy at {PROXY_URL_INTERNAL} unreachable from {container}; start the `proxy` Compose service"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Fails when `host` resolves inside the Exasol container: a proxy-only name that resolves
+/// there cannot prove a request went through the proxy.
+pub fn assert_resolves_only_through_proxy(host: &str) {
+    let container = exasol_container();
+    let out = std::process::Command::new("docker")
+        .args(["exec", &container, "getent", "hosts", host])
+        .output()
+        .unwrap_or_else(|e| panic!("docker exec {container} getent hosts {host}: {e}"));
+    assert!(
+        !out.status.success(),
+        "{host} resolves inside {container}, so a passing query would not prove the proxy was used: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// A `since` for [`proxy_log_since`]: the current Unix second.
+pub fn proxy_log_mark() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs()
+        .to_string()
+}
+
+pub fn proxy_log_since(since: &str) -> String {
+    let out = std::process::Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            "label=com.docker.compose.service=proxy",
+            "--filter",
+            "network=lakehouse-engine",
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .expect("docker ps for the proxy container");
+    let container = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .expect("no running `proxy` Compose service on the lakehouse-engine network")
+        .to_string();
+    let out = std::process::Command::new("docker")
+        .args(["logs", "--since", since, &container])
+        .output()
+        .unwrap_or_else(|e| panic!("docker logs {container}: {e}"));
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
 /// The file surfaces inside the DB at `/buckets/bfsdefault/default/<name>`.
 pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
     assert!(
