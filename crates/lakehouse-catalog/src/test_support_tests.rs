@@ -160,17 +160,17 @@ pub(crate) async fn spawn_header_stalling_server() -> String {
     base_uri
 }
 
-/// The catalog policy shrunk so a test of the bound or the backoff runs in about two seconds.
+/// The catalog policy shrunk so a test of a timeout or the backoff runs in about two seconds.
 pub(crate) const SHORT_POLICY: RetryPolicy = RetryPolicy {
     attempts: 5,
     connect_timeout: Duration::from_millis(100),
-    bound: Duration::from_secs(2),
+    read_timeout: Duration::from_millis(300),
+    retry_window: Duration::from_secs(2),
     backoff_base: Duration::from_millis(10),
 };
 
-/// What a request sent under [`SHORT_POLICY`] reports when its bound runs out.
-pub(crate) const SHORT_POLICY_SPENT_BOUND: &str =
-    "the catalog sent no complete answer within 2 seconds, retries included";
+/// reqwest's text for a request or body read that reached its read timeout.
+pub(crate) const TIMED_OUT_CAUSE: &str = "operation timed out";
 
 pub(crate) async fn read_request(stream: &mut TcpStream) -> String {
     let mut request = Vec::new();

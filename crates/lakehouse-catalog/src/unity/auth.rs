@@ -22,7 +22,7 @@ const GRANT: &str = "Unity Catalog OAuth client-credentials grant";
 pub(crate) enum UnityAuth {
     None,
     Pat(String),
-    OAuth(OAuthTokenSource),
+    OAuth(Box<OAuthTokenSource>),
 }
 
 impl UnityAuth {
@@ -138,7 +138,7 @@ pub(crate) fn resolve_unity_auth(
             let scope = non_empty(&creds.scope)
                 .unwrap_or(OAUTH_DEFAULT_SCOPE)
                 .to_string();
-            UnityAuth::OAuth(OAuthTokenSource {
+            UnityAuth::OAuth(Box::new(OAuthTokenSource {
                 http: http.clone(),
                 token_url,
                 client_id: client_id.to_string(),
@@ -146,7 +146,7 @@ pub(crate) fn resolve_unity_auth(
                 scope,
                 cache: Mutex::new(None),
                 clock: Arc::new(Instant::now),
-            })
+            }))
         }
     }
 }

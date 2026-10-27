@@ -111,7 +111,7 @@ pub(crate) fn unauthenticated_creds() -> ConnectionCreds {
 
 pub(crate) const ICEBERG_CONFIG_TARGET: &str = "/v1/config?warehouse=wh";
 
-pub(crate) const ICEBERG_LOAD_TABLE_TARGET: &str = "/v1/namespaces/db/tables/t";
+pub(crate) const ICEBERG_LOAD_TABLE_TARGET: &str = "/v1/namespaces/db/tables/t?snapshots=refs";
 
 pub(crate) const UNITY_TABLE_TARGET: &str = "/api/2.1/unity-catalog/tables/cat.sch.orders";
 

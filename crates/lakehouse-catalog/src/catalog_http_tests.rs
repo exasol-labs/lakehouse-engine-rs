@@ -156,7 +156,7 @@ fn a_tls_close_without_close_notify_is_transient() {
 }
 
 #[test]
-fn the_catalog_policy_is_five_attempts_ten_second_connect_thirty_second_budget() {
+fn the_catalog_policy_is_five_attempts_ten_second_timeouts_thirty_second_window() {
     let policy = CatalogHttp::new().policy;
 
     assert_eq!(
@@ -164,23 +164,10 @@ fn the_catalog_policy_is_five_attempts_ten_second_connect_thirty_second_budget()
         RetryPolicy {
             attempts: 5,
             connect_timeout: Duration::from_secs(10),
-            bound: Duration::from_secs(30),
+            read_timeout: Duration::from_secs(10),
+            retry_window: Duration::from_secs(30),
             backoff_base: ms(250),
         }
-    );
-}
-
-#[test]
-fn a_spent_bound_states_the_policy_bound_and_no_cause() {
-    let render = |bound| CatalogHttpError(Failure::BoundSpent(bound)).render(|_| unreachable!());
-
-    assert_eq!(
-        render(Duration::from_secs(30)),
-        "the catalog sent no complete answer within 30 seconds, retries included"
-    );
-    assert_eq!(
-        render(ms(1500)),
-        "the catalog sent no complete answer within 1.5 seconds, retries included"
     );
 }
 
@@ -274,9 +261,9 @@ fn identity(text: &str) -> String {
     text.to_owned()
 }
 
-/// Scenario: A catalog request that gets no complete answer fails within 30 seconds
+/// Scenario: A catalog that stays silent fails the request within 30 seconds
 #[tokio::test]
-async fn a_catalog_that_never_answers_fails_within_the_budget() {
+async fn a_catalog_that_never_answers_fails_within_the_retry_window() {
     let (address, accepted) = spawn_listener(|stream, _| hold_open(stream)).await;
     let http = CatalogHttp::with_policy(SHORT_POLICY);
     let started = Instant::now();
@@ -287,17 +274,73 @@ async fn a_catalog_that_never_answers_fails_within_the_budget() {
         .unwrap_err();
 
     let elapsed = started.elapsed();
+    assert!(elapsed < SHORT_POLICY.retry_window + ms(500), "{elapsed:?}");
     assert!(
-        SHORT_POLICY.bound <= elapsed && elapsed < SHORT_POLICY.bound + ms(500),
-        "{elapsed:?}"
+        error.render(identity).contains(TIMED_OUT_CAUSE),
+        "{}",
+        error.render(identity)
     );
-    assert_eq!(error.render(identity), SHORT_POLICY_SPENT_BOUND);
-    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    assert!(accepted.load(Ordering::SeqCst) > 1);
 }
 
-/// Scenario: A catalog request that gets no complete answer fails within 30 seconds
+/// Scenario: A catalog that stays silent fails the request within 30 seconds
 #[tokio::test]
-async fn a_catalog_that_stalls_after_the_headers_fails_within_the_budget() {
+async fn a_stalled_attempt_is_retried() {
+    let (address, accepted) = spawn_listener(|stream, index| async move {
+        match index {
+            0 => hold_open(stream).await,
+            _ => answer_ok(stream).await,
+        }
+    })
+    .await;
+    let http = CatalogHttp::with_policy(SHORT_POLICY);
+
+    let answer = http
+        .send(get(&http, &format!("http://{address}/")))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (answer.status, answer.body),
+        (StatusCode::OK, b"ok".to_vec())
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+}
+
+/// Scenario: An answer body is read while it keeps arriving
+#[tokio::test]
+async fn a_body_that_keeps_arriving_is_read_past_the_retry_window() {
+    const PARTS: u32 = 10;
+    let gap = SHORT_POLICY.read_timeout / 3;
+    let (address, _) = spawn_listener(move |mut stream, _| async move {
+        read_request(&mut stream).await;
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {PARTS}\r\n\r\n");
+        let _ = stream.write_all(head.as_bytes()).await;
+        for _ in 0..PARTS {
+            sleep(gap).await;
+            let _ = stream.write_all(b"x").await;
+        }
+    })
+    .await;
+    let window = gap * PARTS / 2;
+    let http = CatalogHttp::with_policy(RetryPolicy {
+        retry_window: window,
+        ..SHORT_POLICY
+    });
+    let started = Instant::now();
+
+    let answer = http
+        .send(get(&http, &format!("http://{address}/")))
+        .await
+        .unwrap();
+
+    assert!(started.elapsed() > window, "{:?}", started.elapsed());
+    assert_eq!(answer.body, b"x".repeat(PARTS as usize));
+}
+
+/// Scenario: An answer body is read while it keeps arriving
+#[tokio::test]
+async fn a_body_that_stalls_fails_at_the_read_timeout_without_a_retry() {
     let base_uri = spawn_header_stalling_server().await;
     let http = CatalogHttp::with_policy(SHORT_POLICY);
     let started = Instant::now();
@@ -306,14 +349,19 @@ async fn a_catalog_that_stalls_after_the_headers_fails_within_the_budget() {
 
     let elapsed = started.elapsed();
     assert!(
-        SHORT_POLICY.bound <= elapsed && elapsed < SHORT_POLICY.bound + ms(500),
+        SHORT_POLICY.read_timeout <= elapsed && elapsed < SHORT_POLICY.read_timeout * 2,
         "{elapsed:?}"
     );
-    assert_eq!(error.render(identity), SHORT_POLICY_SPENT_BOUND);
-    assert_eq!(error.status(), None);
+    assert_eq!(error.status(), Some(StatusCode::OK));
+    let text = error.render(identity);
+    assert!(
+        text.starts_with("the catalog's HTTP 200 answer broke off: ")
+            && text.contains(TIMED_OUT_CAUSE),
+        "{text}"
+    );
 }
 
-/// Scenario: A catalog request that gets no complete answer fails within 30 seconds
+/// Scenario: A catalog that stays silent fails the request within 30 seconds
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_connection_that_never_completes_ends_at_the_connect_timeout() {
@@ -329,7 +377,7 @@ async fn a_connection_that_never_completes_ends_at_the_connect_timeout() {
     let elapsed = started.elapsed();
     let five_connect_timeouts = SHORT_POLICY.connect_timeout * SHORT_POLICY.attempts;
     assert!(
-        five_connect_timeouts <= elapsed && elapsed < SHORT_POLICY.bound,
+        five_connect_timeouts <= elapsed && elapsed < SHORT_POLICY.retry_window,
         "{elapsed:?}"
     );
     assert!(error.is_transient(), "{}", error.render(identity));
@@ -377,7 +425,6 @@ async fn a_body_that_breaks_off_fails_once_and_keeps_the_answer_status() {
         .unwrap_err();
 
     assert_eq!(error.status(), Some(StatusCode::INTERNAL_SERVER_ERROR));
-    assert_ne!(error.render(identity), SHORT_POLICY_SPENT_BOUND);
     assert!(
         error.render(identity).contains("HTTP 500"),
         "{}",
@@ -467,7 +514,7 @@ async fn a_wait_past_the_budget_ends_the_retries_at_once() {
 
 /// Scenario: Retry-After sets the wait, and a wait that leaves no time for an attempt ends the retries
 #[tokio::test]
-async fn a_wait_that_leaves_less_than_a_connect_timeout_keeps_the_answer_at_hand() {
+async fn a_wait_that_leaves_less_than_a_read_timeout_keeps_the_answer_at_hand() {
     let (base_uri, requests) = spawn_server_with_headers("application/json", |_| {
         (
             503,
@@ -477,8 +524,8 @@ async fn a_wait_that_leaves_less_than_a_connect_timeout_keeps_the_answer_at_hand
     })
     .await;
     let http = CatalogHttp::with_policy(RetryPolicy {
-        connect_timeout: ms(600),
-        bound: ms(1500),
+        read_timeout: ms(600),
+        retry_window: ms(1500),
         ..SHORT_POLICY
     });
     let started = Instant::now();
@@ -686,6 +733,7 @@ async fn an_unresolvable_host_fails_at_the_first_attempt() {
 async fn transport_failures_are_classified_by_their_typed_cause() {
     let client = reqwest::Client::builder()
         .connect_timeout(SHORT_POLICY.connect_timeout)
+        .read_timeout(SHORT_POLICY.read_timeout)
         .build()
         .unwrap();
     let failure = |url: String| {
@@ -696,12 +744,14 @@ async fn transport_failures_are_classified_by_their_typed_cause() {
     let (tls_reset, _) = spawn_listener(|stream, _| reset_during_handshake(stream)).await;
     let (plain, _) = spawn_listener(|stream, _| answer_in_plain_http(stream)).await;
     let (closing, _) = spawn_listener(|stream, _| close_after_request(stream)).await;
+    let (silent, _) = spawn_listener(|stream, _| hold_open(stream)).await;
 
     let transient = [
         CLOSED_PORT_URI.to_owned(),
         format!("http://{reset}/"),
         format!("https://{tls_reset}/"),
         format!("http://{closing}/"),
+        format!("http://{silent}/"),
     ];
     let final_ = [
         "http://catalog.invalid/".to_owned(),

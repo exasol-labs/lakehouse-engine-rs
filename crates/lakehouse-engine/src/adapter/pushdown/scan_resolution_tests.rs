@@ -257,7 +257,7 @@ async fn one_catalog_session_serves_every_table_the_resolver_resolves() {
         vec![
             ICEBERG_CONFIG_TARGET.to_string(),
             ICEBERG_LOAD_TABLE_TARGET.to_string(),
-            "/v1/namespaces/db/tables/u".to_string()
+            "/v1/namespaces/db/tables/u?snapshots=refs".to_string()
         ],
         "the second table must be loaded on the session the first one used"
     );

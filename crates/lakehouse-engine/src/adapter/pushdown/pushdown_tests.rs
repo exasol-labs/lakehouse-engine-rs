@@ -1914,8 +1914,8 @@ async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
         iceberg.targets(),
         vec![
             ICEBERG_CONFIG_TARGET.to_string(),
-            "/v1/namespaces/db/tables/customer".to_string(),
-            "/v1/namespaces/db/tables/orders".to_string(),
+            "/v1/namespaces/db/tables/customer?snapshots=refs".to_string(),
+            "/v1/namespaces/db/tables/orders?snapshots=refs".to_string(),
         ],
         "one /v1/config for the whole request, then exactly one loadTable per leg"
     );

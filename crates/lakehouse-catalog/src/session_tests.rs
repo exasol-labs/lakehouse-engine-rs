@@ -11,16 +11,17 @@ fn build_load_table_url_with_warehouse_prefix() {
     );
     assert_eq!(
         url,
-        "https://glue.us-east-1.amazonaws.com/iceberg/v1/123456789012/namespaces/db/tables/events",
+        "https://glue.us-east-1.amazonaws.com/iceberg/v1/123456789012/namespaces/db/tables/events?snapshots=refs",
         "URL must follow {{uri}}/v1/{{warehouse}}/namespaces/{{ns}}/tables/{{table}} pattern"
     );
 }
 
+/// Scenario: A pushdown's loadTable asks only for the referenced snapshots
 #[test]
 fn build_load_table_url_without_warehouse() {
     let url = build_load_table_url("https://rest.example.com", "", "db", "events");
     assert_eq!(
-        url, "https://rest.example.com/v1/namespaces/db/tables/events",
+        url, "https://rest.example.com/v1/namespaces/db/tables/events?snapshots=refs",
         "URL must omit prefix when warehouse is empty"
     );
 }
@@ -37,7 +38,7 @@ fn build_load_table_url_inserts_prefix_verbatim_without_encoding() {
     assert_eq!(
         url,
         format!(
-            "https://glue.us-east-1.amazonaws.com/iceberg/v1/{prefix}/namespaces/mydb/tables/orders"
+            "https://glue.us-east-1.amazonaws.com/iceberg/v1/{prefix}/namespaces/mydb/tables/orders?snapshots=refs"
         ),
         "prefix must be inserted verbatim — `:` and `/` left unencoded"
     );
@@ -63,7 +64,7 @@ fn build_load_table_url_glue_carries_catalogs_prefix() {
     );
     assert_eq!(
         url,
-        "https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/123456789012/namespaces/db/tables/events",
+        "https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/123456789012/namespaces/db/tables/events?snapshots=refs",
         "derived catalogs/{{account-id}} prefix must appear verbatim in the loadTable URL: {url}"
     );
 }
@@ -422,7 +423,7 @@ async fn a_failed_config_lookup_fails_the_session() {
 fn catalog_urls_ignore_a_trailing_slash_on_the_address() {
     assert_eq!(
         build_load_table_url("http://host/catalog/", "wh", "db", "t"),
-        "http://host/catalog/v1/wh/namespaces/db/tables/t"
+        "http://host/catalog/v1/wh/namespaces/db/tables/t?snapshots=refs"
     );
     assert_eq!(
         catalog_url("http://host/catalog/", "", "namespaces"),
@@ -498,7 +499,7 @@ async fn a_failed_load_table_names_the_table() {
         .unwrap_err()
         .to_string();
     assert!(
-        message.contains(IDENT) && message.contains(SHORT_POLICY_SPENT_BOUND),
+        message.contains(IDENT) && message.contains(TIMED_OUT_CAUSE),
         "{message}"
     );
 }

@@ -25,7 +25,7 @@ fn build_load_table_url(catalog_uri: &str, prefix: &str, ns: &str, table_name: &
     catalog_url(
         catalog_uri,
         prefix,
-        &format!("namespaces/{ns}/tables/{table_name}"),
+        &format!("namespaces/{ns}/tables/{table_name}?snapshots=refs"),
     )
 }
 
@@ -142,7 +142,6 @@ pub async fn load_table_any_auth(
         session,
         &ns_ident,
         &table_name,
-        "",
         creds.use_vended_credentials,
         creds,
     )
@@ -150,33 +149,25 @@ pub async fn load_table_any_auth(
     .map_err(UdfError::from)
 }
 
-/// The enumeration reads only the current schema, so it asks for no delegated access and for
-/// only the referenced snapshots (Iceberg REST `loadTable` `snapshots=refs`).
+/// The enumeration reads only the current schema, so it asks for no delegated access.
 pub(crate) async fn load_table_schema_metadata(
     session: &CatalogSession,
     namespace: &NamespaceIdent,
     table_name: &str,
     creds: &ConnectionCreds,
 ) -> Result<TableMetadata, CatalogRequestError> {
-    load_table(
-        session,
-        namespace,
-        table_name,
-        "?snapshots=refs",
-        false,
-        creds,
-    )
-    .await
-    .map(|result| result.metadata)
+    load_table(session, namespace, table_name, false, creds)
+        .await
+        .map(|result| result.metadata)
 }
 
 /// Names the table in every failure, so the enumeration load and `load_table_any_auth` both
-/// report which table could not be loaded.
+/// report which table could not be loaded. Asks for `snapshots=refs`: both callers read only the
+/// current snapshot, which the `main` branch always references.
 async fn load_table(
     session: &CatalogSession,
     namespace: &NamespaceIdent,
     table_name: &str,
-    query: &str,
     send_access_delegation: bool,
     creds: &ConnectionCreds,
 ) -> Result<LoadTableResult, CatalogRequestError> {
@@ -189,7 +180,7 @@ async fn load_table(
     let identifier = format!("{}.{table_name}", namespace.join("."));
     authed_get_json::<LoadTableResult>(
         &session.http,
-        &format!("{url}{query}"),
+        &url,
         &session.auth,
         send_access_delegation,
         creds,

@@ -1,23 +1,31 @@
 # Feature: Catalog HTTP Resilience
 
-Every HTTP request that the adapter sends to an Iceberg REST catalog, a Lakekeeper management API, a Unity Catalog, or an OAuth2 token endpoint ends within a fixed time and retries a transient failure. A catalog that hangs therefore cannot block a `createVirtualSchema`, `REFRESH`, `SET PROPERTIES`, or pushdown request indefinitely, and one brief overload or outage of the catalog does not fail the request (#448).
+Every HTTP request that the adapter sends to an Iceberg REST catalog, a Lakekeeper management API, a Unity Catalog, or an OAuth2 token endpoint stops waiting on a catalog that stays silent and retries a transient failure. A catalog that hangs therefore cannot block a `createVirtualSchema`, `REFRESH`, `SET PROPERTIES`, or pushdown request indefinitely. An answer that keeps arriving is read to its end, and one brief overload or outage of the catalog does not fail the request (#448).
 
 ## Background
 
 * A catalog request is one HTTP request with its retries, of these kinds: the Iceberg REST OAuth2 client-credentials grant, `/v1/config` lookup, namespace and table listings, and `loadTable`, SigV4-signed ones to the AWS Glue Iceberg REST endpoint included; the Lakekeeper batch-check; and the Unity Catalog OAuth machine-to-machine grant, table listings, get-table load, and temporary-credentials request.
-* A transient failure is a connection attempt that reaches the 10-second connect timeout, a connection that is refused, reset, or aborted, an HTTP/1.1 or HTTP/2 connection that the peer closes before the answer begins, with or without a TLS `close_notify`, as a proxy does when it reloads or ends an idle keep-alive connection (#538), or an answer with HTTP status 408 (Request Timeout), 429 (Too Many Requests), 502 (Bad Gateway), 503 (Service Unavailable), or 504 (Gateway Timeout).
+* The read timeout is 10 seconds. It is the longest an attempt waits for its answer's headers, counted from the attempt's start with its connection included, and then for each next part of the answer body.
+* A transient failure is an attempt that reaches the 10-second connect timeout or the read timeout before its answer's headers arrive, a connection that is refused, reset, or aborted, an HTTP/1.1 or HTTP/2 connection that the peer closes before the answer begins, with or without a TLS `close_notify`, as a proxy does when it reloads or ends an idle keep-alive connection (#538), or an answer with HTTP status 408 (Request Timeout), 429 (Too Many Requests), 502 (Bad Gateway), 503 (Service Unavailable), or 504 (Gateway Timeout).
 * A DNS resolution failure and a TLS failure, one that the TLS library reports, are not transient.
 * RFC 9110 § 10.2.3: `Retry-After = HTTP-date / delay-seconds`.
 
 ## Scenarios
 
-### Scenario: A catalog request that gets no complete answer fails within 30 seconds
+### Scenario: A catalog that stays silent fails the request within 30 seconds
 
-* *GIVEN* a catalog request to a catalog that accepts the connection and never completes its answer, or to an address that never completes a connection
+* *GIVEN* a catalog request to a catalog that accepts the connection and never answers, or to an address that never completes a connection
 * *WHEN* the adapter sends the request
-* *THEN* each connection attempt SHALL end after at most 10 seconds
-* *AND* the request SHALL fail no later than 30 seconds after its first attempt started, its retries, its waits, and the read of the answer body included
-* *AND* when the 30 seconds run out, the error SHALL state that the catalog sent no complete answer within 30 seconds, retries included
+* *THEN* each connection attempt SHALL end after at most 10 seconds, and each attempt SHALL end when its read timeout passes without the answer's headers
+* *AND* the adapter SHALL retry each such attempt as a transient failure, so a catalog that answers a later attempt succeeds
+* *AND* the request SHALL fail no later than 30 seconds after its first attempt started, its retries and waits included, with the error of its last attempt
+
+### Scenario: An answer body is read for as long as it keeps arriving
+
+* *GIVEN* a catalog request whose answer's headers arrive within the read timeout
+* *WHEN* the adapter reads the answer body
+* *THEN* the adapter SHALL read the whole body while each next part arrives within the read timeout, also when the read ends more than 30 seconds after the first attempt started
+* *AND* a body whose next part does not arrive within the read timeout SHALL fail the request at once, without a retry, with an error that states the answer's HTTP status and the timeout
 
 ### Scenario: A transient failure is retried with exponential backoff and jitter
 
@@ -35,7 +43,7 @@ Every HTTP request that the adapter sends to an Iceberg REST catalog, a Lakekeep
 * *THEN* the adapter SHALL wait the time the header states instead of its backoff wait, and an IMF-fixdate in the past SHALL mean no wait
 * *AND* a `Retry-After` value that is neither delay-seconds nor an IMF-fixdate SHALL be ignored, and the backoff wait SHALL apply
 * *AND* an HTTP-date in the obsolete RFC 850 form, such as `Sunday, 06-Nov-94 08:49:37 GMT`, or the asctime form, such as `Sun Nov  6 08:49:37 1994`, SHALL be ignored the same way, and the backoff wait SHALL apply, a scoped deviation from RFC 9110 § 5.6.7, which states that a recipient parsing a timestamp in an HTTP field "MUST accept all three HTTP-date formats"
-* *AND* when a wait, the stated one or the backoff wait, would leave less of the request's 30 seconds than the 10-second connect timeout, the adapter MUST NOT wait and SHALL fail the request at once with the answer or error it holds, because the next attempt could only run out the bound and hide that failure
+* *AND* when a wait, the stated one or the backoff wait, would leave less of the request's 30 seconds than the read timeout, the adapter MUST NOT wait and SHALL fail the request at once with the answer or error it holds, because the next attempt could wait for its answer past the 30 seconds
 
 ### Scenario: A failure that is not transient fails the request at the first attempt
 

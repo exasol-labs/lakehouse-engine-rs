@@ -1,6 +1,5 @@
-//! The one HTTP path of every catalog request. It owns the connect timeout, the retries of a
-//! transient failure, and the bound on the whole request, so each caller keeps only its own error
-//! text and redaction.
+//! The one HTTP path of every catalog request. It owns the timeouts, the retries of a transient
+//! failure, and their window, so each caller keeps only its own error text and redaction.
 
 use crate::error_chain::{causes, error_chain};
 use aws_smithy_types::date_time::{DateTime, Format};
@@ -12,7 +11,7 @@ use std::error::Error;
 use std::hash::{BuildHasher, RandomState};
 use std::io::ErrorKind;
 use std::time::{Duration, SystemTime};
-use tokio::time::{Instant, sleep, timeout_at};
+use tokio::time::{Instant, sleep};
 
 /// How hard one catalog request tries before it fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,17 +20,23 @@ pub(crate) struct RetryPolicy {
     pub(crate) attempts: u32,
     /// The longest one connection attempt may take.
     pub(crate) connect_timeout: Duration,
-    /// The longest the whole request may take: every attempt, wait, and answer-body read.
-    pub(crate) bound: Duration,
+    /// The longest an attempt may wait for its answer's headers, its connection included, and then
+    /// for each next part of the answer body.
+    pub(crate) read_timeout: Duration,
+    /// No retry starts unless its answer's headers are due within this time after the first attempt
+    /// started. A body that keeps arriving is read past it.
+    pub(crate) retry_window: Duration,
     /// The upper end of the first backoff wait, doubled for each later retry.
     pub(crate) backoff_base: Duration,
 }
 
-/// The attempts and the bound match the Glue native client (`glue/sdk.rs`).
+/// The attempts and the window match the Glue native client (`glue/sdk.rs`). A 10-second read
+/// timeout leaves an attempt that stalls room for one retry within the window.
 const CATALOG_POLICY: RetryPolicy = RetryPolicy {
     attempts: 5,
     connect_timeout: Duration::from_secs(10),
-    bound: Duration::from_secs(30),
+    read_timeout: Duration::from_secs(10),
+    retry_window: Duration::from_secs(30),
     backoff_base: Duration::from_millis(250),
 };
 
@@ -41,9 +46,9 @@ pub(crate) const MAX_QUOTED_BODY_BYTES: usize = 4096;
 
 /// The HTTP client of one catalog session. Callers build a request with [`Self::get`] or
 /// [`Self::post`] and send it only through [`Self::send_json`], [`Self::send`], or
-/// [`Self::send_capped`], so every catalog request gets the same connect timeout, retries, and
-/// bound. A retry re-sends a clone of the request as the caller built and signed it: the bound
-/// ends long before a SigV4 signature or a cached OAuth token expires, so this type needs no
+/// [`Self::send_capped`], so every catalog request gets the same timeouts and retries. A retry
+/// re-sends a clone of the request as the caller built and signed it: every retry starts within the
+/// window, long before a SigV4 signature or a cached OAuth token expires, so this type needs no
 /// knowledge of auth or signing.
 #[derive(Clone)]
 pub(crate) struct CatalogHttp {
@@ -72,21 +77,14 @@ pub(crate) struct CatalogRequestError {
 
 /// A catalog request that ended without a complete answer. [`Self::render`] gives its text.
 #[derive(Debug)]
-pub(crate) struct CatalogHttpError(Failure);
-
-#[derive(Debug)]
-enum Failure {
-    BoundSpent(Duration),
-    /// `status` is set when the answer's headers arrived and the read of its body broke off.
-    Transport {
-        error: reqwest::Error,
-        status: Option<StatusCode>,
-    },
+pub(crate) struct CatalogHttpError {
+    error: reqwest::Error,
+    /// Set when the answer's headers arrived and the read of its body broke off.
+    status: Option<StatusCode>,
 }
 
 impl CatalogHttp {
-    /// The client of every catalog session, with 5 attempts, a 10-second connect timeout, a
-    /// 30-second bound, and a 250 ms backoff base.
+    /// The client of every catalog session, under [`CATALOG_POLICY`].
     pub(crate) fn new() -> Self {
         Self::with_policy(CATALOG_POLICY)
     }
@@ -95,6 +93,7 @@ impl CatalogHttp {
     pub(crate) fn with_policy(policy: RetryPolicy) -> Self {
         let client = reqwest::Client::builder()
             .connect_timeout(policy.connect_timeout)
+            .read_timeout(policy.read_timeout)
             .build()
             .expect("the TLS backend of the catalog HTTP client starts");
         Self { client, policy }
@@ -108,10 +107,9 @@ impl CatalogHttp {
         self.client.post(url)
     }
 
-    /// Sends `request` and reads its whole answer body, retrying a transient failure, all within
-    /// the policy's bound. Every HTTP answer is `Ok`, the last one when the retries run out; only a
-    /// transport failure or the spent bound is an error. A request whose body cannot be cloned is
-    /// sent once.
+    /// Sends `request` and reads its whole answer body, retrying a transient failure within the
+    /// policy's window. Every HTTP answer is `Ok`, the last one when the retries run out; only a
+    /// transport failure is an error. A request whose body cannot be cloned is sent once.
     pub(crate) async fn send(&self, request: Request) -> Result<CatalogAnswer, CatalogHttpError> {
         self.send_capped(request, usize::MAX).await
     }
@@ -156,34 +154,23 @@ impl CatalogHttp {
         mut request: Request,
         max_bytes: usize,
     ) -> Result<CatalogAnswer, CatalogHttpError> {
-        let deadline = Instant::now() + self.policy.bound;
+        let window_end = Instant::now() + self.policy.retry_window;
         let mut attempts_made = 0;
         loop {
             attempts_made += 1;
             let resend = (attempts_made < self.policy.attempts)
                 .then(|| request.try_clone())
                 .flatten();
-            let outcome = self.attempt(request, max_bytes, deadline).await;
+            let outcome = self.exchange(request, max_bytes).await;
             let Some(resend) = resend else {
                 return outcome;
             };
-            let Some(wait) = self.wait_before_retry(attempts_made, &outcome, deadline) else {
+            let Some(wait) = self.wait_before_retry(attempts_made, &outcome, window_end) else {
                 return outcome;
             };
             sleep(wait).await;
             request = resend;
         }
-    }
-
-    async fn attempt(
-        &self,
-        request: Request,
-        max_bytes: usize,
-        deadline: Instant,
-    ) -> Result<CatalogAnswer, CatalogHttpError> {
-        timeout_at(deadline, self.exchange(request, max_bytes))
-            .await
-            .unwrap_or_else(|_| Err(CatalogHttpError(Failure::BoundSpent(self.policy.bound))))
     }
 
     async fn exchange(
@@ -213,7 +200,7 @@ impl CatalogHttp {
         &self,
         retry: u32,
         outcome: &Result<CatalogAnswer, CatalogHttpError>,
-        deadline: Instant,
+        window_end: Instant,
     ) -> Option<Duration> {
         let requested = match outcome {
             Ok(answer) if is_transient_status(answer.status) => stated_wait(&answer.headers),
@@ -224,8 +211,8 @@ impl CatalogHttp {
         chosen_wait(
             requested,
             backoff,
-            deadline.saturating_duration_since(Instant::now()),
-            self.policy.connect_timeout,
+            window_end.saturating_duration_since(Instant::now()),
+            self.policy.read_timeout,
         )
     }
 }
@@ -267,45 +254,29 @@ impl From<CatalogRequestError> for UdfError {
 
 impl CatalogHttpError {
     fn transport(error: reqwest::Error, status: Option<StatusCode>) -> Self {
-        Self(Failure::Transport { error, status })
+        Self { error, status }
     }
 
     /// The status of an answer whose body read broke off, so a caller can still report it.
     pub(crate) fn status(&self) -> Option<StatusCode> {
-        match &self.0 {
-            Failure::Transport { status, .. } => *status,
-            Failure::BoundSpent(_) => None,
-        }
+        self.status
     }
 
-    /// The spent bound's sentence, or else the whole error chain passed through `redact`,
-    /// preceded by the answer's HTTP status when its body broke off.
+    /// The whole error chain passed through `redact`, preceded by the answer's HTTP status when its
+    /// body broke off.
     pub(crate) fn render(&self, redact: impl Fn(&str) -> String) -> String {
-        match &self.0 {
-            Failure::BoundSpent(bound) => format!(
-                "the catalog sent no complete answer within {} seconds, retries included",
-                bound.as_secs_f64()
+        let causes = redact(&error_chain(&self.error));
+        match self.status {
+            Some(status) => format!(
+                "the catalog's HTTP {} answer broke off: {causes}",
+                status.as_u16()
             ),
-            Failure::Transport {
-                error,
-                status: Some(status),
-            } => format!(
-                "the catalog's HTTP {} answer broke off: {}",
-                status.as_u16(),
-                redact(&error_chain(error))
-            ),
-            Failure::Transport {
-                error,
-                status: None,
-            } => redact(&error_chain(error)),
+            None => causes,
         }
     }
 
     fn is_transient(&self) -> bool {
-        matches!(
-            &self.0,
-            Failure::Transport { error, status: None } if is_transient_transport_failure(error)
-        )
+        self.status.is_none() && is_transient_transport_failure(&self.error)
     }
 }
 
@@ -379,8 +350,8 @@ fn backoff_wait(base: Duration, retry: u32, jitter: u32) -> Duration {
 }
 
 /// The catalog's own wait when it stated one, else `backoff`; `None` when that wait would leave
-/// less than `attempt_room` for the next attempt, which then would only spend the bound and hide
-/// the failure at hand behind it.
+/// less than `attempt_room`, the longest the next attempt may wait for its answer, so no attempt
+/// ends past the window.
 fn chosen_wait(
     requested: Option<Duration>,
     backoff: Duration,
@@ -394,10 +365,11 @@ fn chosen_wait(
         .then_some(wait)
 }
 
-/// A connection that never opened in time or that the peer cut, with no TLS library error: a new
-/// connection may succeed. DNS and TLS failures are final. Reads typed causes, never message text.
+/// An attempt that timed out before its answer, or a connection that the peer refused or cut with no
+/// TLS library error: a new attempt may succeed. DNS and TLS failures are final. Reads typed causes,
+/// never message text.
 fn is_transient_transport_failure(error: &reqwest::Error) -> bool {
-    (error.is_connect() && error.is_timeout()) || is_transient_cause_chain(error)
+    error.is_timeout() || is_transient_cause_chain(error)
 }
 
 fn is_transient_cause_chain(error: &(dyn Error + 'static)) -> bool {

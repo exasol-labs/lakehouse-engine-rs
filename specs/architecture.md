@@ -93,7 +93,7 @@
 - The scan streams one `RecordBatch` at a time and never collects the full result.
 - Errors never contain credentials. Storage credentials reach the scan UDF only as a CONNECTION name or a sealed envelope.
 - STS AssumeRole and Glue operations time out after 30 seconds.
-- Every Iceberg REST, Lakekeeper, Unity Catalog, and OAuth2 token request goes through the one crate-private catalog HTTP client of `lakehouse-catalog`. It opens a connection within 10 seconds, retries only a transient failure, up to 5 attempts, and ends each request within 30 seconds, retries included.
+- Every Iceberg REST, Lakekeeper, Unity Catalog, and OAuth2 token request goes through the one crate-private catalog HTTP client of `lakehouse-catalog`. It ends an attempt that stays silent for 10 seconds, retries only a transient failure, up to 5 attempts, and starts no retry that could wait for its answer past 30 seconds after the first attempt. It reads an answer body for as long as the body keeps arriving.
 - Exasol's own dispatcher throttles concurrent UDF VMs at 80% of the per-process memory limit.
 - DSNs in the Makefile, bench scripts, and installer include `validateservercertificate=0`.
 - The engine must be faster than single-node DataFusion, scale with added Exasol nodes, keep duplicate scanning minimal, and keep metadata overhead acceptable.
