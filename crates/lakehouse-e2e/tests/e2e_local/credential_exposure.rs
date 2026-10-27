@@ -138,9 +138,14 @@ fn with_grants<R>(grants: &[String], f: impl FnOnce() -> R) -> R {
 }
 
 fn create_vs_sql(vs: &str, script_schema: &str, conn: &str) -> String {
+    create_vs_sql_with_factor(vs, script_schema, conn, E2E_PARALLELISM_FACTOR)
+}
+
+fn create_vs_sql_with_factor(vs: &str, script_schema: &str, conn: &str, factor: usize) -> String {
     format!(
         "CREATE VIRTUAL SCHEMA {vs} USING {script_schema}.{ADAPTER_SCRIPT_NAME} WITH \
-         CATALOG_CONNECTION = '{conn}' NAMESPACE = '{E2E_NAMESPACE}' ALLOW_HTTP = 'true'"
+         CATALOG_CONNECTION = '{conn}' NAMESPACE = '{E2E_NAMESPACE}' ALLOW_HTTP = 'true' \
+         PARALLELISM_FACTOR = '{factor}'"
     )
 }
 
@@ -249,9 +254,11 @@ fn setup_e2e() {
         execute_all(&mut sys, script_grants(SCHEMA_NAME, CONN_NAME, OWNER_USER));
         let mut owner = user_conn(OWNER_USER);
         create_readable_vs(&mut owner, VS_NAME, SCHEMA_NAME, CONN_NAME);
-        owner.execute(&format!(
-            "{} PARALLELISM_FACTOR = '1'",
-            create_vs_sql(SINGLE_SHARD_VS_NAME, SCHEMA_NAME, CONN_NAME)
+        owner.execute(&create_vs_sql_with_factor(
+            SINGLE_SHARD_VS_NAME,
+            SCHEMA_NAME,
+            CONN_NAME,
+            1,
         ));
         owner.execute(&format!(
             "GRANT SELECT ON SCHEMA {SINGLE_SHARD_VS_NAME} TO {READER_USER}"
@@ -610,7 +617,7 @@ fn a_missing_execute_grant_of_the_owner_fails_with_exasols_privilege_error() {
     let multi_shard = explain_virtual_sql(&mut reader_conn(), &filtered_count_sql(VS_NAME));
     assert!(
         multi_shard.contains(DISTRIBUTOR_SCRIPT_NAME),
-        "the default plan must fan out through the distributor: {multi_shard}"
+        "the multi-shard plan must fan out through the distributor: {multi_shard}"
     );
     let single_shard = explain_virtual_sql(
         &mut reader_conn(),
