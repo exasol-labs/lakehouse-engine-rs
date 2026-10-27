@@ -1,6 +1,6 @@
 //! Host micro-benchmarks isolating the pre-SDK emit cost (coerce + Arrow C Data export, excluding the
 //! `MT_EMIT` round-trip, which only exists inside the UDF runtime) and local scan+decode.
-//! Full numbers: `cargo test -p lakehouse-engine --test it micro_bench -- --ignored --nocapture`.
+//! Full numbers: `cargo test --workspace --test it micro_bench -- --ignored --nocapture`.
 
 use std::sync::Arc;
 use std::time::Instant;
