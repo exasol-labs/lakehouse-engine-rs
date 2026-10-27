@@ -564,6 +564,7 @@ async fn rest_listing_projects_the_loaded_metadata_into_the_neutral_table() {
     assert_eq!(loaded, expected);
 }
 
+/// Scenario: A failed loadTable names the table it loads
 #[tokio::test]
 async fn unloadable_table_is_reported_skipped_not_failed() {
     let (uri, _log) =
@@ -597,6 +598,7 @@ async fn unloadable_table_is_reported_skipped_not_failed() {
     );
 }
 
+/// Scenario: A non-404 per-table load failure aborts createVirtualSchema
 #[tokio::test]
 async fn non_404_load_failure_aborts_the_batch() {
     let (uri, _log) =
@@ -605,9 +607,13 @@ async fn non_404_load_failure_aborts_the_batch() {
 
     let result = client.list_tables(&["prod".to_string()]).await;
 
-    assert!(
-        result.is_err(),
-        "a 500 on loadTable is a catalog fault and must abort enumeration, \
-         not be routed into a skipped entry: {result:?}"
-    );
+    let Err(error) = result else {
+        panic!(
+            "a 500 on loadTable is a catalog fault and must abort enumeration, \
+             not be routed into a skipped entry"
+        );
+    };
+    let message = error.to_string();
+    assert!(message.contains("prod.hive_events"), "{message}");
+    assert!(message.contains("HTTP 500"), "{message}");
 }

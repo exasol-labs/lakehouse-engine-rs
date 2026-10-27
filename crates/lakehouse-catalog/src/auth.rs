@@ -2,8 +2,9 @@
 //! string or error: every error site routes through redaction.
 
 use crate::ConnectionCreds;
+use crate::catalog_http::CatalogHttp;
 use crate::creds::{SuppliedCatalogAuth, non_empty};
-use crate::error_chain;
+use crate::error_chain::error_chain;
 use crate::redaction::redact_error_text;
 use crate::sigv4::required_signing_region;
 use exasol_udf_sdk::error::UdfError;
@@ -46,7 +47,7 @@ const OAUTH2_GRANT_TYPE: &str = "client_credentials";
 const OAUTH2_DEFAULT_TOKEN_PATH: &str = "/v1/oauth/tokens";
 
 async fn oauth2_client_credentials_grant(
-    client: &reqwest::Client,
+    http: &CatalogHttp,
     catalog_uri: &str,
     creds: &ConnectionCreds,
 ) -> Result<String, UdfError> {
@@ -80,33 +81,35 @@ async fn oauth2_client_credentials_grant(
         form.push(("scope", scope));
     }
 
-    let response = client
+    let request = http
         .post(&token_url)
         .header("accept", "application/json")
         .form(&form)
-        .send()
-        .await
+        .build()
         .map_err(|e| {
             UdfError::User(format!(
-                "OAuth2 token request failed: {}",
+                "failed to build OAuth2 token request: {}",
                 redact_secret(&error_chain(&e))
             ))
         })?;
 
-    let status = response.status();
-    if !status.is_success() {
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "(unreadable body)".into());
+    let answer = http.send(request).await.map_err(|error| {
+        UdfError::User(format!(
+            "OAuth2 token request failed: {}",
+            error.render(redact_secret)
+        ))
+    })?;
+
+    if !answer.status.is_success() {
+        let body = String::from_utf8_lossy(&answer.body).into_owned();
         return Err(UdfError::User(format!(
             "OAuth2 token endpoint returned HTTP {}: {}",
-            status.as_u16(),
+            answer.status.as_u16(),
             redact_secret(&body)
         )));
     }
 
-    let body: serde_json::Value = response.json().await.map_err(|e| {
+    let body: serde_json::Value = serde_json::from_slice(&answer.body).map_err(|e| {
         UdfError::User(format!(
             "failed to parse OAuth2 token response: {}",
             redact_secret(&e.to_string())
@@ -130,7 +133,7 @@ async fn oauth2_client_credentials_grant(
 /// SigV4 and token/OAuth never co-occur (`validate_creds` rule 4). SigV4 is
 /// refused when neither the credentials nor `catalog_uri` yield a signing region.
 pub(crate) async fn resolve_catalog_auth(
-    client: &reqwest::Client,
+    http: &CatalogHttp,
     catalog_uri: &str,
     creds: &ConnectionCreds,
 ) -> Result<CatalogAuth, UdfError> {
@@ -143,7 +146,7 @@ pub(crate) async fn resolve_catalog_auth(
         SuppliedCatalogAuth::Unauthenticated => Ok(CatalogAuth::None),
         SuppliedCatalogAuth::StaticToken(token) => Ok(CatalogAuth::Bearer(token.to_string())),
         SuppliedCatalogAuth::ClientCredentials { .. } => Ok(CatalogAuth::Bearer(
-            oauth2_client_credentials_grant(client, catalog_uri, creds).await?,
+            oauth2_client_credentials_grant(http, catalog_uri, creds).await?,
         )),
     }
 }

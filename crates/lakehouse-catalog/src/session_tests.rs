@@ -138,8 +138,8 @@ async fn sigv4_resolve_prefix_derives_catalogs_segment() {
         region: "us-east-1".into(),
     };
 
-    let client = reqwest::Client::new();
-    let result = resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds)
+    let http = CatalogHttp::new();
+    let result = resolve_load_table_prefix(&http, &catalog_uri, warehouse, &auth, &creds)
         .await
         .expect("prefix");
 
@@ -185,9 +185,9 @@ async fn non_sigv4_config_prefix_resolution_uses_config_endpoint() {
     let creds = creds_no_auth();
     let auth = CatalogAuth::None;
 
-    let client = reqwest::Client::new();
+    let http = CatalogHttp::new();
     let result =
-        resolve_load_table_prefix(&client, &catalog_uri, "original-warehouse", &auth, &creds)
+        resolve_load_table_prefix(&http, &catalog_uri, "original-warehouse", &auth, &creds)
             .await
             .expect("prefix");
 
@@ -226,8 +226,8 @@ async fn non_sigv4_no_config_prefix_yields_empty_not_warehouse() {
     let creds = creds_no_auth();
     let auth = CatalogAuth::None;
 
-    let client = reqwest::Client::new();
-    let result = resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds)
+    let http = CatalogHttp::new();
+    let result = resolve_load_table_prefix(&http, &catalog_uri, warehouse, &auth, &creds)
         .await
         .expect("prefix");
 
@@ -428,4 +428,242 @@ fn catalog_urls_ignore_a_trailing_slash_on_the_address() {
         catalog_url("http://host/catalog/", "", "namespaces"),
         "http://host/catalog/v1/namespaces"
     );
+}
+
+/// A session built directly, bypassing `resolve`'s own catalog round-trips, so a test can target
+/// only the request under study.
+fn session_over(http: CatalogHttp, catalog_uri: &str) -> CatalogSession {
+    CatalogSession {
+        http,
+        catalog_uri: catalog_uri.to_string(),
+        auth: CatalogAuth::None,
+        prefix: String::new(),
+    }
+}
+
+/// Scenario: A failed loadTable names the table it loads
+#[tokio::test]
+async fn a_failed_load_table_names_the_table() {
+    const IDENT: &str = "sales.eu.orders";
+    let catalog = CatalogProps {
+        warehouse: "wh".into(),
+        table: IDENT.into(),
+    };
+    let creds = creds_no_auth();
+
+    let (uri_500, _) = spawn_server("application/json", |_| (500, "boom".into())).await;
+    let session = session_over(CatalogHttp::new(), &uri_500);
+    let message = load_table_any_auth(&session, &catalog, &creds)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains(IDENT) && message.contains("HTTP 500"),
+        "{message}"
+    );
+
+    let (uri_404, _) = spawn_server("application/json", |_| (404, "not found".into())).await;
+    let session = session_over(CatalogHttp::new(), &uri_404);
+    let message = load_table_any_auth(&session, &catalog, &creds)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains(IDENT) && message.contains("HTTP 404"),
+        "{message}"
+    );
+
+    let (uri_bad_json, _) = spawn_server("application/json", |_| (200, "not json".into())).await;
+    let session = session_over(CatalogHttp::new(), &uri_bad_json);
+    let message = load_table_any_auth(&session, &catalog, &creds)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains(IDENT), "{message}");
+
+    let session = session_over(CatalogHttp::new(), CLOSED_PORT_URI);
+    let message = load_table_any_auth(&session, &catalog, &creds)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains(IDENT) && message.contains(CLOSED_PORT_CAUSE),
+        "{message}"
+    );
+
+    let stalling_uri = spawn_header_stalling_server().await;
+    let session = session_over(CatalogHttp::with_policy(SHORT_POLICY), &stalling_uri);
+    let message = load_table_any_auth(&session, &catalog, &creds)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains(IDENT) && message.contains(SHORT_POLICY_SPENT_BOUND),
+        "{message}"
+    );
+}
+
+/// Scenario: Every catalog request kind is bounded and retried
+#[tokio::test]
+async fn a_resent_sigv4_load_table_carries_its_first_signature() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let answered = AtomicUsize::new(0);
+    let (uri, requests) = spawn_server("application/json", move |_| {
+        match answered.fetch_add(1, Ordering::SeqCst) {
+            0 => (503, "{\"error\":\"busy\"}".into()),
+            _ => (200, LOAD_TABLE_BODY.into()),
+        }
+    })
+    .await;
+    let mut creds = base_creds();
+    creds.use_sigv4 = true;
+    creds.warehouse = "123456789012".into();
+    let session = CatalogSession::resolve(&uri, &creds.warehouse, &creds)
+        .await
+        .expect("a SigV4 session resolves without any network access");
+    let catalog = CatalogProps {
+        warehouse: creds.warehouse.clone(),
+        table: "db.events".into(),
+    };
+
+    load_table_any_auth(&session, &catalog, &creds)
+        .await
+        .expect("the retried loadTable must succeed");
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        authorization_header(&requests[0]),
+        authorization_header(&requests[1]),
+        "the re-sent request keeps its first signature"
+    );
+    assert_eq!(
+        header_value(&requests[0], "x-amz-date"),
+        header_value(&requests[1], "x-amz-date"),
+        "the re-sent request keeps its first x-amz-date"
+    );
+}
+
+/// Scenario: Every catalog request kind is bounded and retried
+#[tokio::test]
+async fn every_iceberg_rest_request_kind_succeeds_after_one_503() {
+    use crate::client::{CatalogClient, CatalogTableIdent, IcebergRestCatalogClient};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // OAuth2 grant and /v1/config: both run during `CatalogSession::resolve`.
+    let oauth_hits = AtomicUsize::new(0);
+    let config_hits = AtomicUsize::new(0);
+    let (grant_uri, grant_requests) = spawn_server("application/json", move |request| {
+        if request.starts_with("POST") {
+            return match oauth_hits.fetch_add(1, Ordering::SeqCst) {
+                0 => (503, "{\"error\":\"busy\"}".into()),
+                _ => (200, format!(r#"{{"access_token":"{OAUTH_ACCESS_TOKEN}"}}"#)),
+            };
+        }
+        match config_hits.fetch_add(1, Ordering::SeqCst) {
+            0 => (503, "{\"error\":\"busy\"}".into()),
+            _ => (200, r#"{"overrides":{},"defaults":{}}"#.into()),
+        }
+    })
+    .await;
+    let mut oauth_creds = creds_no_auth();
+    oauth_creds.client_id = Some("client-id".into());
+    oauth_creds.client_secret = Some(CLIENT_SECRET.into());
+
+    let oauth_session = CatalogSession::resolve(&grant_uri, "wh", &oauth_creds)
+        .await
+        .expect("a 503 on the grant and the config lookup is retried to success");
+    assert!(matches!(oauth_session.auth, CatalogAuth::Bearer(ref t) if t == OAUTH_ACCESS_TOKEN));
+    let posts: Vec<String> = grant_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.starts_with("POST"))
+        .cloned()
+        .collect();
+    assert_eq!(posts.len(), 2);
+    assert_eq!(request_body(&posts[0]), request_body(&posts[1]));
+    assert!(request_body(&posts[0]).contains("grant_type=client_credentials"));
+
+    let table_hits = AtomicUsize::new(0);
+    let ns_hits = AtomicUsize::new(0);
+    let (listing_uri, _) = spawn_server("application/json", move |request| {
+        if request.starts_with("GET /v1/config") {
+            (200, r#"{"overrides":{},"defaults":{}}"#.into())
+        } else if request.contains("?parent=") {
+            match ns_hits.fetch_add(1, Ordering::SeqCst) {
+                0 => (503, "{\"error\":\"busy\"}".into()),
+                _ => (200, EMPTY_LISTING.into()),
+            }
+        } else {
+            match table_hits.fetch_add(1, Ordering::SeqCst) {
+                0 => (503, "{\"error\":\"busy\"}".into()),
+                _ => (
+                    200,
+                    r#"{"identifiers":[{"namespace":["db"],"name":"orders"}]}"#.into(),
+                ),
+            }
+        }
+    })
+    .await;
+    let listing_session = CatalogSession::resolve(&listing_uri, "wh", &creds_no_auth())
+        .await
+        .expect("the config lookup succeeds");
+    let tables = crate::namespace::list_namespace_tables(
+        &listing_session,
+        &["db".to_string()],
+        &creds_no_auth(),
+    )
+    .await
+    .expect("a 503 on the listing is retried to success");
+    assert_eq!(tables.len(), 1);
+
+    let load_hits = AtomicUsize::new(0);
+    let (enum_uri, _) = spawn_server("application/json", move |request| {
+        if request.starts_with("GET /v1/config") {
+            (200, r#"{"overrides":{},"defaults":{}}"#.into())
+        } else {
+            match load_hits.fetch_add(1, Ordering::SeqCst) {
+                0 => (503, "{\"error\":\"busy\"}".into()),
+                _ => (200, LOAD_TABLE_BODY.into()),
+            }
+        }
+    })
+    .await;
+    let client = IcebergRestCatalogClient::new(enum_uri, creds_no_auth());
+    let ident = CatalogTableIdent {
+        namespace: vec!["db".into()],
+        name: "orders".into(),
+    };
+    let listing = client
+        .load_listed_tables(std::slice::from_ref(&ident))
+        .await
+        .expect("a 503 on the enumeration load is retried to success");
+    assert_eq!(listing.tables.len(), 1);
+    assert_eq!(listing.tables[0].ident.name, "orders");
+    assert!(listing.skipped.is_empty());
+
+    let pushdown_hits = AtomicUsize::new(0);
+    let (pushdown_uri, _) = spawn_server("application/json", move |request| {
+        if request.starts_with("GET /v1/config") {
+            (200, r#"{"overrides":{},"defaults":{}}"#.into())
+        } else {
+            match pushdown_hits.fetch_add(1, Ordering::SeqCst) {
+                0 => (503, "{\"error\":\"busy\"}".into()),
+                _ => (200, LOAD_TABLE_BODY.into()),
+            }
+        }
+    })
+    .await;
+    let pushdown_session = CatalogSession::resolve(&pushdown_uri, "wh", &creds_no_auth())
+        .await
+        .expect("the config lookup succeeds");
+    let catalog = CatalogProps {
+        warehouse: "wh".into(),
+        table: "db.events".into(),
+    };
+    load_table_any_auth(&pushdown_session, &catalog, &creds_no_auth())
+        .await
+        .expect("a 503 on the pushdown load is retried to success");
 }

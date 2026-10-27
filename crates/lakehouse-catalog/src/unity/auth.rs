@@ -2,6 +2,7 @@
 //! must never appear in any returned error.
 
 use crate::ConnectionCreds;
+use crate::catalog_http::CatalogHttp;
 use crate::creds::{SuppliedCatalogAuth, non_empty};
 use crate::error_chain;
 use crate::redaction::redact_error_text;
@@ -50,7 +51,7 @@ type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// One source per session, so a whole enumeration reuses one minted token.
 pub(crate) struct OAuthTokenSource {
-    client: reqwest::Client,
+    http: CatalogHttp,
     token_url: String,
     client_id: String,
     client_secret: String,
@@ -86,33 +87,34 @@ impl OAuthTokenSource {
             ("grant_type", "client_credentials"),
             ("scope", self.scope.as_str()),
         ];
-        let response = self
-            .client
+        let request = self
+            .http
             .post(&self.token_url)
             .basic_auth(&self.client_id, Some(&self.client_secret))
             .header("accept", "application/json")
             .form(&form)
-            .send()
-            .await
+            .build()
             .map_err(|e| {
                 UdfError::User(format!(
                     "Unity Catalog OAuth client-credentials grant failed: {}",
                     redact(&error_chain(&e))
                 ))
             })?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "(unreadable body)".into());
+        let answer = self.http.send(request).await.map_err(|e| {
+            UdfError::User(format!(
+                "Unity Catalog OAuth client-credentials grant failed: {}",
+                e.render(redact)
+            ))
+        })?;
+        if !answer.status.is_success() {
+            let body = String::from_utf8_lossy(&answer.body);
             return Err(UdfError::User(format!(
                 "Unity Catalog OAuth client-credentials grant failed with HTTP {}: {}",
-                status.as_u16(),
+                answer.status.as_u16(),
                 redact(&body)
             )));
         }
-        let parsed: OAuthTokenResponse = response.json().await.map_err(|e| {
+        let parsed: OAuthTokenResponse = serde_json::from_slice(&answer.body).map_err(|e| {
             UdfError::User(format!(
                 "Unity Catalog OAuth client-credentials grant returned an unparseable response: {}",
                 redact(&e.to_string())
@@ -143,7 +145,7 @@ struct OAuthTokenResponse {
 /// Synchronous by design: the OAuth grant is deferred to the first request, so
 /// building a session issues no request.
 pub(crate) fn resolve_unity_auth(
-    client: &reqwest::Client,
+    http: &CatalogHttp,
     address: &str,
     creds: &ConnectionCreds,
 ) -> UnityAuth {
@@ -162,7 +164,7 @@ pub(crate) fn resolve_unity_auth(
                 .unwrap_or(OAUTH_DEFAULT_SCOPE)
                 .to_string();
             UnityAuth::OAuth(OAuthTokenSource {
-                client: client.clone(),
+                http: http.clone(),
                 token_url,
                 client_id: client_id.to_string(),
                 client_secret: client_secret.to_string(),

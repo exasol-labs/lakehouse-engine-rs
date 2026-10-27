@@ -751,6 +751,41 @@ SELECT TABLE_NAME, ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_TABLES WHERE TABLE_SCH
 
 Iceberg REST, Unity Catalog, and Glue record the dot-joined namespace and table name, for example `{"name":"sales.orders"}`. Direct storage records the original-cased directory name alone. A pushdown reads the identifier from this note, so a table without one fails with an error that names the table and `ALTER VIRTUAL SCHEMA ... REFRESH`.
 
+## Catalog request timeouts and retries
+
+Every request to an Iceberg REST catalog, a Lakekeeper management API, a Unity Catalog, or an OAuth2 token endpoint ends within 30 seconds, retries included. A catalog that hangs therefore fails `CREATE VIRTUAL SCHEMA`, `REFRESH`, `SET PROPERTIES`, or a query with an error. It no longer blocks the statement. The Glue Iceberg REST endpoint is an Iceberg REST catalog and gets the same limits. No virtual schema property changes them.
+
+| Limit | Value |
+|---|---|
+| One connection attempt | 10 seconds |
+| Attempts per request | 5, the first one included |
+| The whole request | 30 seconds, covering every attempt, every wait, and the transfer of the answer |
+| Wait before retry 1, 2, 3, and 4 | Up to 250 ms, 500 ms, 1 s, and 2 s, at least half of that and chosen at random, or the time a `Retry-After` header states |
+
+The adapter retries these failures:
+
+- a connection attempt that reaches its 10 seconds
+- a connection that the catalog refuses, resets, or aborts
+- a TLS connection that the catalog closes without sending `close_notify`
+- an answer with HTTP 408, 429, 502, 503, or 504
+
+A retry sends the same request again, with the same headers and body. A SigV4 signature and an OAuth2 token outlive the 30 seconds, so a retry is not signed again.
+
+These failures are not retried. They fail the request at the first attempt:
+
+- a DNS failure, such as a host name that does not resolve
+- a TLS failure, such as an `https://` URL to a server that answers in plain HTTP
+- a connection that the catalog closes cleanly before its answer begins
+- an answer with any other HTTP status, such as 404 or 500
+
+`Retry-After` is read as a number of seconds or as an HTTP date in the IMF-fixdate form, such as `Sun, 06 Nov 1994 08:49:37 GMT`. The RFC 850 and asctime date forms are ignored, so the backoff wait applies. A `Retry-After` wait counts against the 30 seconds. A wait that would end after them is not taken, and the request fails at once with the answer it holds.
+
+When the 30 seconds run out, the error states that the catalog sent no complete answer within 30 seconds, retries included. When the attempts run out first, the error is that of the last attempt, such as its HTTP status and answer.
+
+The 30 seconds include the transfer of the answer. A `loadTable` answer that takes longer to arrive fails the request. This matters most for queries, because a query's `loadTable` asks for the table's full snapshot history. A table with a long snapshot history behind a slow link can therefore fail at query time.
+
+The AWS Glue Data Catalog kind and direct storage do not send their requests through this client. The Glue Data Catalog client applies its own limits through the AWS SDK, see [AWS Glue Data Catalog](#aws-glue-data-catalog-catalog_kind--glue).
+
 ## Addressing
 
 The adapter UDF runs **inside** the Exasol container. Every address in the CONNECTION must resolve from there. Use internal hostnames, for example `iceberg-rest`, `seaweedfs`, `lakekeeper`, `keycloak`, or `unitycatalog`. Never use `localhost` or the Docker host gateway. A Databricks-managed Unity Catalog is a public HTTPS endpoint, so it needs no internal hostname — just network egress from the Exasol node.

@@ -2,6 +2,7 @@
 
 mod auth;
 mod aws_error;
+mod catalog_http;
 mod client;
 mod creds;
 mod error_chain;

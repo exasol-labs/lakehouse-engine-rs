@@ -1,3 +1,4 @@
+use crate::catalog_http::CatalogHttp;
 use crate::error_chain;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -22,7 +23,7 @@ use super::vended::TemporaryTableCredentials;
 const UNITY_REST_BASE_PATH: &str = "/api/2.1/unity-catalog";
 
 pub struct UnityCatalogSession {
-    client: reqwest::Client,
+    http: CatalogHttp,
     base_url: String,
     auth: UnityAuth,
     creds: ConnectionCreds,
@@ -31,11 +32,11 @@ pub struct UnityCatalogSession {
 impl UnityCatalogSession {
     /// Issues no request: an OAuth grant, if any, is deferred to the first request.
     pub fn new(address: &str, creds: ConnectionCreds) -> Self {
-        let client = reqwest::Client::new();
+        let http = CatalogHttp::new();
         let base_url = format!("{}{UNITY_REST_BASE_PATH}", address.trim_end_matches('/'));
-        let auth = resolve_unity_auth(&client, address, &creds);
+        let auth = resolve_unity_auth(&http, address, &creds);
         Self {
-            client,
+            http,
             base_url,
             auth,
             creds,
@@ -50,7 +51,7 @@ impl UnityCatalogSession {
         let url = format!("{}/temporary-table-credentials", self.base_url);
         let body = serde_json::json!({ "table_id": table_id, "operation": operation });
         let builder = self
-            .client
+            .http
             .post(&url)
             .header("accept", "application/json")
             .json(&body);
@@ -87,14 +88,22 @@ impl UnityCatalogSession {
     }
 
     async fn get_table_info(&self, full_name: &str) -> Result<TableInfo, UdfError> {
-        // Percent-encodes reserved/non-ASCII characters into one path segment.
+        self.fetch_table_info(full_name).await.map_err(|e| {
+            UdfError::User(format!(
+                "failed to load Unity Catalog table '{full_name}': {e}"
+            ))
+        })
+    }
+
+    async fn fetch_table_info(&self, full_name: &str) -> Result<TableInfo, UdfError> {
         let mut url = url::Url::parse(&self.base_url)
             .map_err(|e| UdfError::User(format!("invalid Unity Catalog base URL: {e}")))?;
+        // Percent-encodes reserved/non-ASCII characters into one path segment.
         url.path_segments_mut()
             .map_err(|_| UdfError::User("Unity Catalog base URL cannot be a base".into()))?
             .push("tables")
             .push(full_name);
-        let builder = self.client.get(url).header("accept", "application/json");
+        let builder = self.http.get(url).header("accept", "application/json");
         self.send_json::<TableInfo>(builder, "load table").await
     }
 
@@ -108,7 +117,7 @@ impl UnityCatalogSession {
         let mut page_token: Option<String> = None;
         loop {
             let mut builder = self
-                .client
+                .http
                 .get(url)
                 .header("accept", "application/json")
                 .query(query);
@@ -147,25 +156,27 @@ impl UnityCatalogSession {
             }
             redact_error_text(msg, &secrets)
         };
-        let response = builder.send().await.map_err(|e| {
+        let request = builder.build().map_err(|e| {
             UdfError::User(format!(
                 "Unity Catalog {kind} request failed: {}",
                 redact(&error_chain(&e))
             ))
         })?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "(unreadable body)".into());
+        let answer = self.http.send(request).await.map_err(|e| {
+            UdfError::User(format!(
+                "Unity Catalog {kind} request failed: {}",
+                e.render(redact)
+            ))
+        })?;
+        if !answer.status.is_success() {
+            let body = String::from_utf8_lossy(&answer.body);
             return Err(UdfError::User(format!(
                 "Unity Catalog {kind} request failed with HTTP {}: {}",
-                status.as_u16(),
+                answer.status.as_u16(),
                 redact(&body)
             )));
         }
-        response.json::<T>().await.map_err(|e| {
+        serde_json::from_slice::<T>(&answer.body).map_err(|e| {
             UdfError::User(format!(
                 "Unity Catalog {kind} request returned an unparseable response: {}",
                 redact(&e.to_string())

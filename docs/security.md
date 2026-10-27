@@ -156,7 +156,7 @@ The adapter asks Lakekeeper once per query, before any data is read. If the user
 the Lakekeeper permission check refuses the query: Exasol user 'LK_PERM_JOINONE', mapped by 'USER_MAPPING' to the Lakekeeper principal 'oidc~lk.joinone@lakehouse.test', may not read e2e_lakehouse.fact_orders, e2e_lakehouse.dim_customer. Lakekeeper denies read_data on each, or the table does not exist. Only a Lakekeeper grant that names the principal 'oidc~lk.joinone@lakehouse.test' lets this user read a table
 ```
 
-If Lakekeeper is unreachable or does not answer within 30 seconds, every query on the virtual schema is refused.
+If Lakekeeper is unreachable or does not answer within 30 seconds, retries included, every query on the virtual schema is refused.
 
 ### What the check does not enforce
 

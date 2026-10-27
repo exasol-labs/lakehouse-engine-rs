@@ -119,7 +119,7 @@ async fn list_pages<P: DeserializeOwned, T>(
             page_url.query_pairs_mut().append_pair("pageToken", token);
         }
         let page: P = authed_get_json(
-            session.client(),
+            session.http(),
             page_url.as_str(),
             session.auth(),
             false,

@@ -66,50 +66,6 @@ fn catalog_auth_sets_the_authorization_header_per_mode() {
 }
 
 #[tokio::test]
-async fn catalog_error_message_uses_http_status_prefix() {
-    use std::net::SocketAddr;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    const NOT_ICEBERG_BODY: &str =
-        "NoSuchIcebergTableException: Input table is not an iceberg table";
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-    let addr: SocketAddr = listener.local_addr().expect("local_addr");
-    let port = addr.port();
-
-    tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.expect("accept");
-        let mut buf = vec![0u8; 4096];
-        let _ = stream.read(&mut buf).await.expect("read");
-        let response = format!(
-            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            NOT_ICEBERG_BODY.len(),
-            NOT_ICEBERG_BODY
-        );
-        stream.write_all(response.as_bytes()).await.expect("write");
-    });
-
-    let url = format!("http://127.0.0.1:{port}/v1/warehouse/namespaces/db/tables/hive_table");
-    let creds = creds_no_auth();
-    let client = reqwest::Client::new();
-    let err =
-        authed_get_json::<serde_json::Value>(&client, &url, &CatalogAuth::None, false, &creds)
-            .await
-            .expect_err("a 404 response must surface as an error");
-
-    let msg = err.to_string();
-    assert!(
-        msg.starts_with("catalog returned HTTP 404: "),
-        "the classifier's load-bearing prefix must be emitted verbatim, got: {msg}"
-    );
-    assert!(
-        msg.contains(NOT_ICEBERG_BODY),
-        "the (credential-free) response body must follow the status prefix, got: {msg}"
-    );
-}
-
-#[tokio::test]
 async fn sigv4_request_is_signed_for_the_carried_region() {
     let (catalog_uri, heads) = spawn_recording_catalog("{}").await;
     let mut creds = creds_no_auth();
@@ -120,7 +76,7 @@ async fn sigv4_request_is_signed_for_the_carried_region() {
     };
     let url = format!("{catalog_uri}/v1/catalogs/123456789012/namespaces/db/tables/t");
 
-    authed_get_json::<serde_json::Value>(&reqwest::Client::new(), &url, &auth, false, &creds)
+    authed_get_json::<serde_json::Value>(&CatalogHttp::new(), &url, &auth, false, &creds)
         .await
         .expect("the signed request must reach the stub and succeed");
 
@@ -162,13 +118,13 @@ async fn load_table_error_redacts_session_bearer_and_static_secrets() {
         stream.write_all(response.as_bytes()).await.expect("write");
     });
 
-    let client = reqwest::Client::new();
+    let http = CatalogHttp::new();
     let url = format!("http://127.0.0.1:{port}/v1/namespaces/db/tables/t");
     let mut creds = creds_no_auth();
     creds.client_secret = Some(CLIENT_SECRET.into());
     let auth = CatalogAuth::Bearer(OAUTH_ACCESS_TOKEN.to_string());
 
-    let err = authed_get_json::<serde_json::Value>(&client, &url, &auth, false, &creds)
+    let err = authed_get_json::<serde_json::Value>(&http, &url, &auth, false, &creds)
         .await
         .expect_err("a 401 response must surface as an error");
 
@@ -187,6 +143,26 @@ async fn load_table_error_redacts_session_bearer_and_static_secrets() {
     );
 }
 
+/// Scenario: Retries that run out fail with the last failure
+#[tokio::test]
+async fn a_persistent_503_fails_after_five_attempts_with_the_redacted_answer() {
+    let (base_uri, requests) = spawn_server("application/json", |_| {
+        (503, format!(r#"{{"token":"{BEARER_TOK}"}}"#))
+    })
+    .await;
+    let http = CatalogHttp::with_policy(SHORT_POLICY);
+    let auth = CatalogAuth::Bearer(BEARER_TOK.into());
+
+    let error = authed_get_json::<serde_json::Value>(&http, &base_uri, &auth, false, &base_creds())
+        .await
+        .expect_err("a persistent 503 must fail");
+
+    assert_eq!(requests.lock().unwrap().len(), 5);
+    let msg = error.to_string();
+    assert!(msg.contains("catalog returned HTTP 503"), "{msg}");
+    assert!(!msg.contains(BEARER_TOK), "{msg}");
+}
+
 async fn post_to(
     status: u16,
     body: String,
@@ -194,12 +170,11 @@ async fn post_to(
     let (uri, requests) = spawn_server("application/json", move |_| (status, body.clone())).await;
     let auth = CatalogAuth::Bearer(BEARER_TOK.into());
     let answer = authed_post_json(
-        &reqwest::Client::new(),
+        &CatalogHttp::new(),
         &format!("{uri}/check"),
         &serde_json::json!({"k": 1}),
         &auth,
         &base_creds(),
-        Duration::from_secs(5),
     )
     .await;
     (answer, requests)
@@ -246,36 +221,13 @@ async fn a_post_to_a_closed_port_is_an_error() {
     let auth = CatalogAuth::None;
 
     let answer = authed_post_json(
-        &reqwest::Client::new(),
+        &CatalogHttp::new(),
         "http://127.0.0.1:1/check",
         &serde_json::json!({}),
         &auth,
         &base_creds(),
-        Duration::from_secs(5),
     )
     .await;
 
     assert!(matches!(answer, Err(UdfError::User(m)) if m.contains("catalog request failed")));
-}
-
-#[tokio::test]
-async fn a_catalog_that_never_answers_fails_within_the_deadline() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/check", listener.local_addr().unwrap());
-    tokio::spawn(async move {
-        let _held = listener.accept().await;
-        std::future::pending::<()>().await;
-    });
-
-    let answer = authed_post_json(
-        &reqwest::Client::new(),
-        &url,
-        &serde_json::json!({}),
-        &CatalogAuth::None,
-        &base_creds(),
-        Duration::from_millis(200),
-    )
-    .await;
-
-    assert!(matches!(answer, Err(UdfError::User(m)) if m.contains("200ms")));
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::catalog_http::CatalogHttp;
 use crate::test_support::{CLOSED_PORT_CAUSE, CLOSED_PORT_URI, base_creds};
 use crate::unity::mock_server::spawn;
 use crate::{CatalogClient, UnityCatalogSession};
@@ -106,7 +107,7 @@ async fn oauth_token_is_cached_and_refreshed_before_expiry() {
     let ticks = Arc::new(Mutex::new(Instant::now()));
     let clock_ticks = ticks.clone();
     let source = OAuthTokenSource {
-        client: reqwest::Client::new(),
+        http: CatalogHttp::new(),
         token_url: format!("{}/oidc/v1/token", server.base_url),
         client_id: "client-abc".to_string(),
         client_secret: "secret-xyz".to_string(),
@@ -148,7 +149,7 @@ async fn oauth_grant_missing_expires_in_is_a_clear_error() {
     })
     .await;
     let source = OAuthTokenSource {
-        client: reqwest::Client::new(),
+        http: CatalogHttp::new(),
         token_url: format!("{}/oidc/v1/token", server.base_url),
         client_id: "client-abc".to_string(),
         client_secret: "secret-xyz".to_string(),
@@ -181,7 +182,7 @@ async fn oauth_grant_zero_expires_in_is_a_clear_error() {
     })
     .await;
     let source = OAuthTokenSource {
-        client: reqwest::Client::new(),
+        http: CatalogHttp::new(),
         token_url: format!("{}/oidc/v1/token", server.base_url),
         client_id: "client-abc".to_string(),
         client_secret: "secret-xyz".to_string(),
@@ -264,15 +265,61 @@ async fn failed_oauth_grant_is_credential_safe_error() {
     }
 }
 
+/// Scenario: Every catalog request kind is bounded and retried
+#[tokio::test]
+async fn an_oauth_grant_answered_503_once_is_resent_with_its_form_body() {
+    let grant_attempts = Arc::new(AtomicUsize::new(0));
+    let grant_bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let (attempts, bodies) = (grant_attempts.clone(), grant_bodies.clone());
+    let server = spawn(move |req| {
+        if req.target.ends_with("/oidc/v1/token") {
+            bodies.lock().unwrap().push(req.body.clone());
+            match attempts.fetch_add(1, Ordering::SeqCst) {
+                0 => (503, String::new()),
+                _ => (
+                    200,
+                    format!(
+                        r#"{{"access_token":"{MINTED_TOKEN}","token_type":"Bearer","expires_in":3600}}"#
+                    ),
+                ),
+            }
+        } else {
+            (200, r#"{"tables":[]}"#.to_string())
+        }
+    })
+    .await;
+    let mut creds = base_creds();
+    creds.client_id = Some("client-abc".to_string());
+    creds.client_secret = Some("secret-xyz".to_string());
+    let session = UnityCatalogSession::new(&server.base_url, creds);
+
+    session
+        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .await
+        .expect("the list succeeds once the grant retry succeeds");
+
+    assert_eq!(
+        grant_attempts.load(Ordering::SeqCst),
+        2,
+        "the grant is retried once"
+    );
+    let bodies = grant_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(
+        bodies[0], bodies[1],
+        "the resend carries the same form body as the first attempt"
+    );
+}
+
 #[test]
 fn resolve_unity_auth_is_unauthenticated_for_the_validation_rejected_shape() {
-    let client = reqwest::Client::new();
+    let http = CatalogHttp::new();
     let mut creds = base_creds();
     creds.token = Some("pat-sentinel".into());
     creds.client_id = Some("client-id-sentinel".into());
     creds.client_secret = Some(OAUTH_SECRET_SENTINEL.into());
 
-    let auth = resolve_unity_auth(&client, "https://unity.example.com", &creds);
+    let auth = resolve_unity_auth(&http, "https://unity.example.com", &creds);
 
     assert!(
         matches!(auth, UnityAuth::None),

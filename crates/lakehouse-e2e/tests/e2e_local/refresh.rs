@@ -42,6 +42,7 @@ const NS_RENAME: &str = "e2e_refresh_rename";
 const NS_DROP: &str = "e2e_refresh_drop";
 const NS_OPTIONAL: &str = "e2e_refresh_optional";
 const NS_SWAP: &str = "e2e_refresh_swap";
+const NS_DROPPED_TABLE: &str = "e2e_refresh_dropped_table";
 
 fn refresh_props<'a>(vs_name: &'a str, namespace: &'a str) -> VsProps<'a> {
     VsProps::new(vs_name, namespace).with_catalog_conn_name(CATALOG_CONN_NAME)
@@ -460,6 +461,47 @@ fn refresh_unreachable_catalog_redacts_credentials() {
         &local_stack_connection_password(),
     );
     conn.execute(&create_conn_sql);
+}
+
+/// Scenario: A failed loadTable names the table it loads
+#[test]
+fn pushdown_over_a_table_dropped_from_the_catalog_names_the_table() {
+    stack();
+    let rt = runtime();
+    let catalog = seed_catalog(rt, "refresh-dropped-table");
+    let ns = NamespaceIdent::new(NS_DROPPED_TABLE.to_string());
+    rt.block_on(drop_table_if_exists(&catalog, &ns, "d_tbl"));
+    rt.block_on(ensure_id_val_table(
+        &catalog,
+        NS_DROPPED_TABLE,
+        "d_tbl",
+        1,
+        1.0,
+    ));
+
+    let mut conn = exa_conn();
+    create_virtual_schema(&mut conn, "REFRESH_DROPPED_TABLE_VS", NS_DROPPED_TABLE);
+
+    let id = conn.query_scalar_i64(&format!(
+        "SELECT id FROM {}",
+        vs_table("REFRESH_DROPPED_TABLE_VS", "d_tbl")
+    ));
+    assert_eq!(
+        id, 1,
+        "D_TBL must be queryable before it is dropped from the catalog"
+    );
+
+    rt.block_on(drop_table_ignoring_missing(&catalog, &ns, "d_tbl"));
+
+    let identifier = format!("{NS_DROPPED_TABLE}.d_tbl");
+    assert_query_fails(
+        &mut conn,
+        &format!(
+            "SELECT * FROM {}",
+            vs_table("REFRESH_DROPPED_TABLE_VS", "d_tbl")
+        ),
+        &[identifier.as_str(), "HTTP 404"],
+    );
 }
 
 /// Hands out the same three tables as the engine adapter's listing, but writes no table-level

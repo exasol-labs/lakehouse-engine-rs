@@ -1,5 +1,9 @@
+use crate::catalog_http::RetryPolicy;
 use crate::{ConnectionCreds, StorageBackend, StorageProps};
+use std::error::Error;
+use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -88,6 +92,18 @@ pub(crate) async fn spawn_server(
     content_type: &'static str,
     respond: impl Fn(&str) -> (u16, String) + Send + 'static,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
+    spawn_server_with_headers(content_type, move |request| {
+        let (status, body) = respond(request);
+        (status, Vec::new(), body)
+    })
+    .await
+}
+
+/// [`spawn_server`], where `respond` also returns extra response headers, such as `Retry-After`.
+pub(crate) async fn spawn_server_with_headers(
+    content_type: &'static str,
+    respond: impl Fn(&str) -> (u16, Vec<(&'static str, String)>, String) + Send + 'static,
+) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a loopback port");
@@ -98,14 +114,18 @@ pub(crate) async fn spawn_server(
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let request = read_request(&mut stream).await;
-            let (status, body) = respond(&request);
+            let (status, headers, body) = respond(&request);
             recorded.lock().unwrap().push(request);
             let reason = reqwest::StatusCode::from_u16(status)
                 .ok()
                 .and_then(|code| code.canonical_reason())
                 .unwrap_or("Stub");
+            let extra: String = headers
+                .iter()
+                .map(|(name, value)| format!("{name}: {value}\r\n"))
+                .collect();
             let response = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{extra}\
                  Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
@@ -115,6 +135,42 @@ pub(crate) async fn spawn_server(
 
     (base_uri, requests)
 }
+
+/// Answers each request with HTTP 200 headers announcing 100 body bytes, sends 10 of them, and then
+/// holds the connection open without sending more.
+pub(crate) async fn spawn_header_stalling_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let base_uri = format!("http://{}", listener.local_addr().expect("local_addr"));
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                read_request(&mut stream).await;
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                            Content-Length: 100\r\n\r\n{\"partial\"";
+                let _ = stream.write_all(head.as_bytes()).await;
+                std::future::pending::<()>().await;
+                drop(stream);
+            });
+        }
+    });
+
+    base_uri
+}
+
+/// The catalog policy shrunk so a test of the bound or the backoff runs in about two seconds.
+pub(crate) const SHORT_POLICY: RetryPolicy = RetryPolicy {
+    attempts: 5,
+    connect_timeout: Duration::from_millis(100),
+    bound: Duration::from_secs(2),
+    backoff_base: Duration::from_millis(10),
+};
+
+/// What a request sent under [`SHORT_POLICY`] reports when its bound runs out.
+pub(crate) const SHORT_POLICY_SPENT_BOUND: &str =
+    "the catalog sent no complete answer within 2 seconds, retries included";
 
 pub(crate) async fn read_request(stream: &mut TcpStream) -> String {
     let mut request = Vec::new();
@@ -157,6 +213,29 @@ pub(crate) fn header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> 
 /// The body of a recorded request.
 pub(crate) fn request_body(request: &str) -> &str {
     request.split_once("\r\n\r\n").map_or("", |(_, body)| body)
+}
+
+/// One layer of a synthetic error chain: its text and the cause below it.
+#[derive(Debug)]
+pub(crate) struct Layer(
+    pub(crate) &'static str,
+    pub(crate) Option<Box<dyn Error + Send + Sync>>,
+);
+
+impl fmt::Display for Layer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl Error for Layer {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.1.as_deref().map(|e| e as &(dyn Error + 'static))
+    }
+}
+
+pub(crate) fn layer(text: &'static str, cause: impl Error + Send + Sync + 'static) -> Layer {
+    Layer(text, Some(Box::new(cause)))
 }
 
 /// The session credentials [`ASSUME_ROLE_RESPONSE`] carries.
