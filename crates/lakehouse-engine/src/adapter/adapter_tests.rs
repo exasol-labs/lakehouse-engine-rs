@@ -329,11 +329,12 @@ fn adapter_note_absent_or_unparseable_yields_none() {
 
 impl Default for super::TuningNotes {
     fn default() -> Self {
+        let (df_target_partitions, df_threads_per_udf) = auto_df_threading(1);
         Self {
             parallelism_factor: DEFAULT_PARALLELISM_FACTOR,
             df_threading_mode: ThreadingMode::Auto,
-            df_target_partitions: DEFAULT_DF_TARGET_PARTITIONS,
-            df_threads_per_udf: DEFAULT_DF_THREADS_PER_UDF,
+            df_target_partitions,
+            df_threads_per_udf,
             df_batch_size: DEFAULT_DF_BATCH_SIZE,
             memory_pool_fraction: DEFAULT_MEMORY_POOL_FRACTION,
             instance_overhead_mb: DEFAULT_INSTANCE_OVERHEAD_MB,
@@ -448,7 +449,7 @@ fn refresh_writes_an_identifier_note_on_every_returned_table() {
 #[test]
 fn create_vs_records_parallelism_factor() {
     let props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "4" });
-    let factor = resolve_parallelism_factor(&props, 16);
+    let factor = resolve_parallelism_factor(&props);
     assert_eq!(factor, 4, "factor must be read from the property");
 
     let request = serde_json::json!({"type": "createVirtualSchema"});
@@ -467,14 +468,14 @@ fn create_vs_records_parallelism_factor() {
     );
 
     let empty_props = serde_json::json!({});
-    let default_factor = resolve_parallelism_factor(&empty_props, 0);
+    let default_factor = resolve_parallelism_factor(&empty_props);
     assert_eq!(
         default_factor, DEFAULT_PARALLELISM_FACTOR,
-        "must default to {DEFAULT_PARALLELISM_FACTOR} when property absent and cores=0"
+        "must default to {DEFAULT_PARALLELISM_FACTOR} when property absent"
     );
 
     let zero_props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "0" });
-    let zero_factor = resolve_parallelism_factor(&zero_props, 0);
+    let zero_factor = resolve_parallelism_factor(&zero_props);
     assert_eq!(
         zero_factor, DEFAULT_PARALLELISM_FACTOR,
         "zero must fall back to default"
@@ -536,63 +537,37 @@ fn core_count_uses_the_detected_count_when_detection_succeeds() {
 }
 
 #[test]
-fn default_parallelism_factor_is_cores_times_two() {
-    let props = serde_json::json!({});
-    let factor = resolve_parallelism_factor(&props, 10);
+fn default_parallelism_factor_is_one() {
     assert_eq!(
-        factor, 20,
-        "factor must equal nr_of_cores × 2 when that exceeds 8"
-    );
-}
-
-#[test]
-fn default_parallelism_factor_floors_at_eight() {
-    let props = serde_json::json!({});
-    let factor_one_core = resolve_parallelism_factor(&props, 1);
-    assert_eq!(
-        factor_one_core, DEFAULT_PARALLELISM_FACTOR,
-        "must floor at 8 on a one-core node"
-    );
-
-    let factor_small = resolve_parallelism_factor(&props, 2);
-    assert_eq!(
-        factor_small, DEFAULT_PARALLELISM_FACTOR,
-        "must floor at 8 when cores×2 < 8"
+        resolve_parallelism_factor(&serde_json::json!({})),
+        1,
+        "the scalar scan runs one VM per node, so one shard per node is the default"
     );
 }
 
 #[test]
 fn explicit_parallelism_factor_overrides_default() {
     let props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "5" });
-    let factor = resolve_parallelism_factor(&props, 32);
     assert_eq!(
-        factor, 5,
-        "explicit property must override the nr_of_cores formula"
+        resolve_parallelism_factor(&props),
+        5,
+        "explicit property must override the default"
     );
 }
 
 #[test]
-fn df_target_partitions_defaults_to_one() {
-    let absent = serde_json::json!({});
-    assert_eq!(
-        resolve_df_fixed_count(&absent, PROP_DF_TARGET_PARTITIONS, 0),
-        1,
-        "absent → 1"
-    );
-
-    let zero = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "0" });
-    assert_eq!(
-        resolve_df_fixed_count(&zero, PROP_DF_TARGET_PARTITIONS, 0),
-        1,
-        "zero → 1"
-    );
-
-    let invalid = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "bad" });
-    assert_eq!(
-        resolve_df_fixed_count(&invalid, PROP_DF_TARGET_PARTITIONS, 0),
-        1,
-        "invalid → 1"
-    );
+fn df_target_partitions_falls_back_when_absent_or_invalid() {
+    for props in [
+        serde_json::json!({}),
+        serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "0" }),
+        serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "bad" }),
+    ] {
+        assert_eq!(
+            resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 3),
+            3,
+            "{props} must fall back"
+        );
+    }
 }
 
 #[test]
@@ -660,27 +635,18 @@ fn df_batch_size_uses_supplied_value() {
 }
 
 #[test]
-fn df_threads_per_udf_defaults_to_one() {
-    let absent = serde_json::json!({});
-    assert_eq!(
-        resolve_df_fixed_count(&absent, PROP_DF_THREADS_PER_UDF, 0),
-        1,
-        "absent → 1"
-    );
-
-    let zero = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "0" });
-    assert_eq!(
-        resolve_df_fixed_count(&zero, PROP_DF_THREADS_PER_UDF, 0),
-        1,
-        "zero → 1"
-    );
-
-    let invalid = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "not-a-number" });
-    assert_eq!(
-        resolve_df_fixed_count(&invalid, PROP_DF_THREADS_PER_UDF, 0),
-        1,
-        "invalid → 1"
-    );
+fn df_threads_per_udf_falls_back_when_absent_or_invalid() {
+    for props in [
+        serde_json::json!({}),
+        serde_json::json!({ PROP_DF_THREADS_PER_UDF: "0" }),
+        serde_json::json!({ PROP_DF_THREADS_PER_UDF: "bad" }),
+    ] {
+        assert_eq!(
+            resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 3),
+            3,
+            "{props} must fall back"
+        );
+    }
 }
 
 #[test]
@@ -897,27 +863,7 @@ fn df_target_partitions_explicit_wins() {
     assert_eq!(
         resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 8),
         3,
-        "explicit DATAFUSION_TARGET_PARTITIONS must override nr_of_cores default"
-    );
-}
-
-#[test]
-fn df_target_partitions_defaults_to_nr_of_cores() {
-    let props = serde_json::json!({});
-    assert_eq!(
-        resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 8),
-        8,
-        "absent property with nr_of_cores=8 must default to 8"
-    );
-}
-
-#[test]
-fn df_target_partitions_one_core_defaults_to_1() {
-    let props = serde_json::json!({});
-    assert_eq!(
-        resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 1),
-        1,
-        "absent property on a one-core node must default to 1"
+        "explicit DATAFUSION_TARGET_PARTITIONS must override the fallback"
     );
 }
 
@@ -927,27 +873,7 @@ fn df_threads_per_udf_explicit_wins() {
     assert_eq!(
         resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 16),
         2,
-        "explicit DATAFUSION_THREADS_PER_UDF must override nr_of_cores default"
-    );
-}
-
-#[test]
-fn df_threads_per_udf_defaults_to_nr_of_cores() {
-    let props = serde_json::json!({});
-    assert_eq!(
-        resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 8),
-        8,
-        "absent property with nr_of_cores=8 must default to 8"
-    );
-}
-
-#[test]
-fn df_threads_per_udf_one_core_defaults_to_1() {
-    let props = serde_json::json!({});
-    assert_eq!(
-        resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 1),
-        1,
-        "absent property on a one-core node must default to 1"
+        "explicit DATAFUSION_THREADS_PER_UDF must override the fallback"
     );
 }
 
@@ -997,60 +923,52 @@ fn threading_mode_defaults_to_auto() {
     );
 }
 
+/// Scenario: AUTO mode gives the node's single scan instance every core
 #[test]
-fn auto_mode_derives_non_oversubscribing_threads() {
-    let (target_partitions, threads) =
-        resolve_df_threading(ThreadingMode::Auto, &serde_json::json!({}), 16, 4);
-    assert_eq!(threads, 4, "16 cores / 4 instances → 4 threads");
+fn auto_mode_uses_every_core_with_twice_as_many_partitions() {
     assert_eq!(
-        target_partitions, threads,
-        "target_partitions must equal threads (lockstep)"
+        resolve_df_threading(ThreadingMode::Auto, &serde_json::json!({}), 8),
+        (16, 8),
+        "8 cores → 8 threads, 16 target partitions"
     );
-    assert!(
-        4 * threads <= 16,
-        "udf_instances_per_node × threads must not exceed nr_of_cores"
+    assert_eq!(
+        resolve_df_threading(
+            ThreadingMode::Auto,
+            &serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "99", PROP_DF_THREADS_PER_UDF: "99" }),
+            8,
+        ),
+        (16, 8),
+        "AUTO ignores supplied values"
     );
-
-    let (tp, th) = resolve_df_threading(ThreadingMode::Auto, &serde_json::json!({}), 10, 3);
-    assert_eq!(th, 3, "floor(10/3) = 3");
-    assert_eq!(tp, th, "lockstep");
-    assert!(3 * th <= 10, "invariant: 3 × 3 = 9 ≤ 10");
-
-    let (tp_ignored, th_ignored) = resolve_df_threading(
-        ThreadingMode::Auto,
-        &serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "99", PROP_DF_THREADS_PER_UDF: "99" }),
-        16,
-        4,
-    );
-    assert_eq!(th_ignored, 4, "AUTO ignores supplied threads");
-    assert_eq!(tp_ignored, 4, "AUTO ignores supplied target partitions");
 }
 
+/// Scenario: AUTO mode yields a single thread on a one-core node
 #[test]
 fn auto_mode_yields_one_thread_on_one_core() {
-    let (target_partitions, threads) =
-        resolve_df_threading(ThreadingMode::Auto, &serde_json::json!({}), 1, 8);
-    assert_eq!(threads, 1, "one core → 1 thread");
-    assert_eq!(target_partitions, 1, "one core → 1 target partition");
+    assert_eq!(
+        resolve_df_threading(ThreadingMode::Auto, &serde_json::json!({}), 1),
+        (2, 1),
+        "one core → 1 thread, 2 target partitions"
+    );
 }
 
+/// Scenario: FIXED mode uses the operator-supplied thread and partition values verbatim
 #[test]
 fn fixed_mode_uses_supplied_values() {
     let props = serde_json::json!({
         PROP_DF_TARGET_PARTITIONS: "3",
         PROP_DF_THREADS_PER_UDF: "2",
     });
-    let (tp, th) = resolve_df_threading(ThreadingMode::Fixed, &props, 16, 4);
-    assert_eq!(tp, 3, "FIXED uses supplied target partitions verbatim");
-    assert_eq!(th, 2, "FIXED uses supplied threads verbatim");
-
-    let (tp_d, th_d) = resolve_df_threading(ThreadingMode::Fixed, &serde_json::json!({}), 8, 4);
-    assert_eq!(tp_d, 8, "absent target partitions → max(cores,1) = 8");
-    assert_eq!(th_d, 8, "absent threads → max(cores,1) = 8");
-
-    let (tp_z, th_z) = resolve_df_threading(ThreadingMode::Fixed, &serde_json::json!({}), 0, 4);
-    assert_eq!(tp_z, 1, "absent target partitions, cores=0 → 1");
-    assert_eq!(th_z, 1, "absent threads, cores=0 → 1");
+    assert_eq!(
+        resolve_df_threading(ThreadingMode::Fixed, &props, 16),
+        (3, 2),
+        "FIXED uses supplied values verbatim"
+    );
+    assert_eq!(
+        resolve_df_threading(ThreadingMode::Fixed, &serde_json::json!({}), 8),
+        (16, 8),
+        "absent values fall back to the AUTO values"
+    );
 }
 
 fn pushdown_request_involving(involved: &str) -> Json {
@@ -1370,73 +1288,31 @@ fn an_all_skipped_namespace_creates_an_empty_schema_recording_every_skip() {
 fn resolve_s3_max_connections_fixed_value_wins() {
     let props = serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "64" });
     assert_eq!(
-        resolve_s3_max_connections(&props, 8, 1),
+        resolve_s3_max_connections(&props, 8),
         64,
         "explicit S3_MAX_CONNECTIONS must be used verbatim"
     );
-    assert_eq!(
-        resolve_s3_max_connections(&props, 1, 4),
-        64,
-        "explicit value wins even on a one-core node"
-    );
 }
 
+/// Scenario: AUTO derivation sizes the per-instance budget from the resolved thread count
 #[test]
-fn resolve_s3_max_connections_auto_scales_with_cores() {
-    let absent = serde_json::json!({});
-
-    assert_eq!(
-        resolve_s3_max_connections(&absent, 8, 1),
-        8 * S3_CONNECTIONS_PER_THREAD,
-        "single instance gets the whole node's core count * multiplier"
-    );
-
-    let per_instance = resolve_s3_max_connections(&absent, 8, 8);
-    assert_eq!(
-        per_instance, S3_CONNECTIONS_PER_THREAD,
-        "each of eight instances gets one thread's worth of connections"
-    );
-    assert_eq!(
-        8 * per_instance,
-        8 * S3_CONNECTIONS_PER_THREAD,
-        "aggregate per-node budget is invariant across the instance/thread split"
-    );
-
-    assert_eq!(
-        resolve_s3_max_connections(&absent, 16, 1),
-        16 * S3_CONNECTIONS_PER_THREAD,
-        "budget scales with core count"
-    );
-
-    for bad in ["", "0", "not-a-number", "-4"] {
-        let props = serde_json::json!({ PROP_S3_MAX_CONNECTIONS: bad });
+fn resolve_s3_max_connections_auto_scales_with_threads() {
+    for props in [
+        serde_json::json!({}),
+        serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "" }),
+        serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "0" }),
+        serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "not-a-number" }),
+        serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "-4" }),
+    ] {
         assert_eq!(
-            resolve_s3_max_connections(&props, 8, 1),
-            8 * S3_CONNECTIONS_PER_THREAD,
-            "invalid property {bad:?} must AUTO-derive, not pin a bad value"
+            resolve_s3_max_connections(&props, 2),
+            2 * S3_CONNECTIONS_PER_THREAD,
+            "{props} must derive from the resolved threads"
         );
     }
-
     assert_eq!(
-        resolve_s3_max_connections(&absent, 2, 8),
-        S3_CONNECTIONS_PER_THREAD,
-        "an instance share above the core count must yield one thread's connection \
-         share, not a collapsed budget"
-    );
-}
-
-#[test]
-fn resolve_s3_max_connections_auto_one_core_yields_one_threads_share() {
-    let absent = serde_json::json!({});
-    assert_eq!(
-        resolve_s3_max_connections(&absent, 1, 1),
-        S3_CONNECTIONS_PER_THREAD,
-        "a one-core node must get one thread's connection share"
-    );
-    assert_eq!(
-        resolve_s3_max_connections(&absent, 1, 8),
-        S3_CONNECTIONS_PER_THREAD,
-        "an instance share above the core count must not shrink the budget"
+        resolve_s3_max_connections(&serde_json::json!({}), 1),
+        S3_CONNECTIONS_PER_THREAD
     );
 }
 

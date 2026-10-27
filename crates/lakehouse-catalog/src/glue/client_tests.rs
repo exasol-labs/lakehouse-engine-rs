@@ -5,7 +5,7 @@ use std::time::Duration;
 use aws_sdk_glue::config::timeout::TimeoutConfig;
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 use serde_json::{Value, json};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 
 use super::*;
 use crate::StorageProps;
@@ -697,9 +697,11 @@ async fn a_failed_glue_call_names_the_operation_the_subject_and_the_cause() {
     }
 
     let unanswered = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let refused = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    // Bound but never listening: Linux refuses the connect, and no parallel test's fake server
+    // can take the port, as it could after a dropped listener.
+    let refused = TcpSocket::new_v4().expect("socket");
+    refused.bind("127.0.0.1:0".parse().unwrap()).expect("bind");
     let refused_address = format!("http://{}", refused.local_addr().expect("local_addr"));
-    drop(refused);
     for (address, cause) in [
         (
             format!("http://{}", unanswered.local_addr().expect("local_addr")),

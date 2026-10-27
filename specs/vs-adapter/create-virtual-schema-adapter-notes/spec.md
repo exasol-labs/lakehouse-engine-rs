@@ -45,7 +45,7 @@ The `createVirtualSchema` response's schema-level `adapterNotes` records the res
 ### Scenario: The adapter detects the node's CPU affinity set
 
 * *GIVEN* an Exasol node whose CPU affinity set holds `k` CPUs, with `2 ≤ k <` the host's core count
-* *AND* a virtual schema created with `PARALLELISM_FACTOR = '1'` and no `DATAFUSION_THREADING_MODE` property
+* *AND* a virtual schema created with no `DATAFUSION_THREADING_MODE` property
 * *WHEN* the adapter records `DF_THREADS_PER_UDF` in the schema's adapterNotes
 * *THEN* the recorded value SHALL equal `k`, not the fallback of `1` or the host's core count
 

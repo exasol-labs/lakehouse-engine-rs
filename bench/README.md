@@ -104,7 +104,7 @@ Each run writes a timestamped report to `bench/reports/` (gitignored).
 
 The adapter auto-detects the per-node core count (`std::thread::available_parallelism()`)
 and drives the DataFusion target-partitions / threads-per-UDF defaults from it; multi-file
-tables (`TPCH_FILES`) + `BENCH_PARALLELISM_FACTOR` (default 8) drive the `GROUP BY
+tables (`TPCH_FILES`) + `BENCH_PARALLELISM_FACTOR` (default 1) drive the `GROUP BY
 shard_key` fan-out. In docker mode, `LH_EXASOL_CPUSET` pins the Exasol container to a CPU
 set (for example `0-1`), and the adapter detects exactly that set, so it is the lever for
 the detected core count. Unset, the container uses every host CPU. Name CPUs the host actually has: Docker rejects a cpuset naming an

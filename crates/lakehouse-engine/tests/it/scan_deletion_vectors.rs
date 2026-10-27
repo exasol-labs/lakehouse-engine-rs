@@ -3,6 +3,7 @@
 //! (verified against the real sidecar bytes via `delta_kernel`'s decoder).
 
 use crate::scan_fixture;
+use crate::scan_fixture::concurrency_probe::ConcurrencyProbe;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -331,9 +332,6 @@ fn shared_deletion_vector_file_is_fetched_once_per_shard() {
     );
 }
 
-/// A current-thread runtime fires timers only once it parks, so every read admitted in one
-/// scheduling wave bumps the peak before any delay elapses.
-const DV_READ_DELAY: Duration = Duration::from_millis(50);
 const DV_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[test]
@@ -361,16 +359,11 @@ fn deletion_vector_reads_stay_within_the_connection_budget() {
     let mut spec = scan_spec(entries, &dir_url(dir), None, None);
     spec.common.s3_max_connections = BUDGET;
 
-    let peak = Arc::new(AtomicUsize::new(0));
+    let (probe, peak) = ConcurrencyProbe::new(needles, BUDGET);
     let store = Arc::new(TrackingStore {
         inner: Arc::new(LocalFileSystem::new()),
         gets: Arc::new(std::sync::Mutex::new(Vec::new())),
-        concurrency: Some(ConcurrencyProbe {
-            needles,
-            in_flight: Arc::new(AtomicUsize::new(0)),
-            peak: Arc::clone(&peak),
-            delay: DV_READ_DELAY,
-        }),
+        concurrency: Some(probe),
     });
 
     let register_url = dir_url(dir);
@@ -776,31 +769,6 @@ impl ObjectStore for RefusingReadStore {
 }
 
 #[derive(Debug)]
-struct ConcurrencyProbe {
-    needles: Vec<String>,
-    in_flight: Arc<AtomicUsize>,
-    peak: Arc<AtomicUsize>,
-    delay: Duration,
-}
-
-impl ConcurrencyProbe {
-    fn is_probed_read(&self, location: &ObjectStorePath) -> bool {
-        let path = location.as_ref();
-        self.needles.iter().any(|n| path.contains(n.as_str()))
-    }
-}
-
-struct InFlightGuard {
-    in_flight: Arc<AtomicUsize>,
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-#[derive(Debug)]
 struct TrackingStore {
     inner: Arc<dyn ObjectStore>,
     gets: Arc<std::sync::Mutex<Vec<ObjectStorePath>>>,
@@ -844,12 +812,7 @@ impl ObjectStore for TrackingStore {
             && let Some(probe) = &self.concurrency
             && probe.is_probed_read(location)
         {
-            let now = probe.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            probe.peak.fetch_max(now, Ordering::SeqCst);
-            let _guard = InFlightGuard {
-                in_flight: Arc::clone(&probe.in_flight),
-            };
-            tokio::time::sleep(probe.delay).await;
+            let _in_flight = probe.enter().await;
             return self.inner.get_opts(location, options).await;
         }
         self.inner.get_opts(location, options).await

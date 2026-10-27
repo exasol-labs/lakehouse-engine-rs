@@ -55,17 +55,13 @@ const PROP_CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
 const PROP_ALLOW_HTTP: &str = "ALLOW_HTTP";
 const PROP_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
 const NOTE_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
-const DEFAULT_PARALLELISM_FACTOR: usize = 8;
+const DEFAULT_PARALLELISM_FACTOR: usize = 1;
 const PROP_DF_TARGET_PARTITIONS: &str = "DATAFUSION_TARGET_PARTITIONS";
 const PROP_DF_THREADS_PER_UDF: &str = "DATAFUSION_THREADS_PER_UDF";
 const PROP_DF_THREADING_MODE: &str = "DATAFUSION_THREADING_MODE";
 const NOTE_DF_TARGET_PARTITIONS: &str = "DF_TARGET_PARTITIONS";
 const NOTE_DF_THREADS_PER_UDF: &str = "DF_THREADS_PER_UDF";
 const NOTE_DF_THREADING_MODE: &str = "DF_THREADING_MODE";
-/// Pushdown-path fallback when the adapterNote is absent or unparseable.
-const DEFAULT_DF_TARGET_PARTITIONS: usize = 1;
-/// Pushdown-path fallback when the adapterNote is absent or unparseable.
-const DEFAULT_DF_THREADS_PER_UDF: usize = 1;
 const PROP_DF_BATCH_SIZE: &str = "DATAFUSION_BATCH_SIZE";
 const NOTE_DF_BATCH_SIZE: &str = "DF_BATCH_SIZE";
 /// Pushdown-path fallback; matches DataFusion's default rows per RecordBatch.
@@ -216,17 +212,15 @@ fn handle_create_virtual_schema(
     };
 
     let nr_of_cores = resolve_nr_of_cores();
-    let parallelism_factor = resolve_parallelism_factor(&props, nr_of_cores);
-    // The file-count clamp is unknown here, so the un-clamped factor (maximal per-node fan-out)
-    // keeps the AUTO thread and connection budgets from oversubscribing a node.
+    let parallelism_factor = resolve_parallelism_factor(&props);
     let df_threading_mode = resolve_threading_mode(&props);
     let (df_target_partitions, df_threads_per_udf) =
-        resolve_df_threading(df_threading_mode, &props, nr_of_cores, parallelism_factor);
+        resolve_df_threading(df_threading_mode, &props, nr_of_cores);
     let df_batch_size = resolve_df_batch_size(&props);
     let memory_pool_fraction = resolve_memory_pool_fraction(&props);
     let instance_overhead_mb = resolve_instance_overhead_mb(&props);
     let join_broadcast_max_bytes = resolve_join_broadcast_max_bytes(&props);
-    let s3_max_connections = resolve_s3_max_connections(&props, nr_of_cores, parallelism_factor);
+    let s3_max_connections = resolve_s3_max_connections(&props, df_threads_per_udf);
 
     let client = construct_catalog_client(
         config.catalog_kind,
@@ -327,10 +321,11 @@ async fn handle_pushdown_request(
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(DEFAULT_PARALLELISM_FACTOR);
+    let (auto_partitions, auto_threads) = auto_df_threading(resolve_nr_of_cores());
     let df_target_partitions = adapter_note(request, NOTE_DF_TARGET_PARTITIONS)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(DEFAULT_DF_TARGET_PARTITIONS);
+        .unwrap_or(auto_partitions);
     let df_batch_size = adapter_note(request, NOTE_DF_BATCH_SIZE)
         .and_then(|s| s.parse::<usize>().ok())
         .map(|n| n.max(1))
@@ -338,7 +333,7 @@ async fn handle_pushdown_request(
     let df_threads_per_udf = adapter_note(request, NOTE_DF_THREADS_PER_UDF)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(DEFAULT_DF_THREADS_PER_UDF);
+        .unwrap_or(auto_threads);
     let memory_pool_fraction = adapter_note(request, NOTE_MEMORY_POOL_FRACTION)
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|&x| x > 0.0 && x <= 1.0)
@@ -599,11 +594,11 @@ fn build_adapter_notes(request: &Json, tuning: &TuningNotes, skipped: &SkippedTa
     Json::String(Json::Object(notes).to_string())
 }
 
-fn resolve_parallelism_factor(props: &Json, nr_of_cores: u32) -> usize {
+fn resolve_parallelism_factor(props: &Json) -> usize {
     nonempty_str(props, PROP_PARALLELISM_FACTOR)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or_else(|| ((nr_of_cores as usize) * 2).max(DEFAULT_PARALLELISM_FACTOR))
+        .unwrap_or(DEFAULT_PARALLELISM_FACTOR)
 }
 
 /// Planning-time only: just the resulting integers reach the scan UDF, which stays mode-agnostic.
@@ -629,54 +624,38 @@ fn resolve_threading_mode(props: &Json) -> ThreadingMode {
     }
 }
 
-fn resolve_df_threading(
-    mode: ThreadingMode,
-    props: &Json,
-    nr_of_cores: u32,
-    udf_instances_per_node: usize,
-) -> (usize, usize) {
+fn resolve_df_threading(mode: ThreadingMode, props: &Json, nr_of_cores: u32) -> (usize, usize) {
+    let (auto_partitions, auto_threads) = auto_df_threading(nr_of_cores);
     match mode {
         ThreadingMode::Fixed => (
-            resolve_df_fixed_count(props, PROP_DF_TARGET_PARTITIONS, nr_of_cores),
-            resolve_df_fixed_count(props, PROP_DF_THREADS_PER_UDF, nr_of_cores),
+            resolve_df_fixed_count(props, PROP_DF_TARGET_PARTITIONS, auto_partitions),
+            resolve_df_fixed_count(props, PROP_DF_THREADS_PER_UDF, auto_threads),
         ),
-        ThreadingMode::Auto => {
-            let threads = auto_threads_per_udf(nr_of_cores, udf_instances_per_node);
-            (threads, threads)
-        }
+        ThreadingMode::Auto => (auto_partitions, auto_threads),
     }
 }
 
-/// Guarantees `instances × threads ≤ nr_of_cores` whenever cores ≥ instances; otherwise each
-/// instance stays single-threaded and the engine multiplexes the surplus onto the core pool.
-fn auto_threads_per_udf(nr_of_cores: u32, udf_instances_per_node: usize) -> usize {
-    let instances = udf_instances_per_node.max(1);
-    ((nr_of_cores as usize) / instances).max(1)
+/// Exasol runs one scalar scan VM per node, so that instance owns every core. Partitions
+/// beyond threads overlap object-store I/O with decoding.
+fn auto_df_threading(nr_of_cores: u32) -> (usize, usize) {
+    let threads = (nr_of_cores as usize).max(1);
+    (2 * threads, threads)
 }
 
-fn resolve_df_fixed_count(props: &Json, key: &str, nr_of_cores: u32) -> usize {
+fn resolve_df_fixed_count(props: &Json, key: &str, fallback: usize) -> usize {
     nonempty_str(props, key)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or_else(|| (nr_of_cores as usize).max(1))
+        .unwrap_or(fallback)
 }
 
-/// An explicit positive value wins; otherwise the aggregate per-node budget is
-/// ≈ `nr_of_cores × S3_CONNECTIONS_PER_THREAD` however the node is sharded into instances.
-fn resolve_s3_max_connections(
-    props: &Json,
-    nr_of_cores: u32,
-    udf_instances_per_node: usize,
-) -> usize {
-    if let Some(explicit) = nonempty_str(props, PROP_S3_MAX_CONNECTIONS)
+/// An explicit positive value wins; otherwise each decode thread gets
+/// `S3_CONNECTIONS_PER_THREAD` connections.
+fn resolve_s3_max_connections(props: &Json, df_threads_per_udf: usize) -> usize {
+    nonempty_str(props, PROP_S3_MAX_CONNECTIONS)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
-    {
-        return explicit;
-    }
-
-    let per_instance_threads = auto_threads_per_udf(nr_of_cores, udf_instances_per_node);
-    per_instance_threads * S3_CONNECTIONS_PER_THREAD
+        .unwrap_or(df_threads_per_udf * S3_CONNECTIONS_PER_THREAD)
 }
 
 fn resolve_df_batch_size(props: &Json) -> usize {

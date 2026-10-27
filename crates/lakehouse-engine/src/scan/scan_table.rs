@@ -31,7 +31,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
-/// All files go into ONE `FileGroup` (one output partition, no repartition). The plan is built
+/// All files go into ONE `FileGroup`, which DataFusion's file-scan repartitioning splits into
+/// byte ranges up to `target_partitions`. The plan is built
 /// through [`ParquetFormat::create_physical_plan`], which applies THIS provider's Parquet
 /// options (making row-filter pushdown per table) and a `CachedParquetFileReaderFactory` over
 /// the session [`FileMetadataCache`]. Access-plan construction reads through that same cache

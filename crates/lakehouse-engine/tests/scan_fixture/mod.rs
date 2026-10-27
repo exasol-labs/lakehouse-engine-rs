@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod concurrency_probe;
+
 use lakehouse_engine::scan::ResolvedScanStorage;
 use lakehouse_engine::scan::spec::{ScanSpec, ScanStorage, StorageBackend};
 

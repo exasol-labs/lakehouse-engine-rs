@@ -272,7 +272,7 @@ case "$TARGET" in
     NAMESPACE="${NAMESPACE:-tpch}"
     CATALOG_URI="http://iceberg-rest:8181"          # internal: reachable from the UDF
     CONN_PW="$(build_conn_password_local)"
-    VS_EXTRA_PROPS="$(build_vs_extra_props true "${BENCH_PARALLELISM_FACTOR:-8}")"
+    VS_EXTRA_PROPS="$(build_vs_extra_props true "${BENCH_PARALLELISM_FACTOR:-1}")"
     PROFILE_ON=0
     echo "== docker: bringing up local stack (seaweedfs, iceberg-rest, exasol) =="
     docker compose up -d
@@ -303,7 +303,7 @@ case "$TARGET" in
     HOST="$EXASOL_HOST"
     SYS_PASS="$EXASOL_SYS_PASSWORD"
     export BUCKETFS_WRITE_PASS                      # make's $(shell) reads it from the environment
-    VS_EXTRA_PROPS="$(build_vs_extra_props "$CATALOG_ALLOW_HTTP" "${BENCH_PARALLELISM_FACTOR:-8}")"
+    VS_EXTRA_PROPS="$(build_vs_extra_props "$CATALOG_ALLOW_HTTP" "${BENCH_PARALLELISM_FACTOR:-1}")"
     PROFILE_ON="${BENCH_PROFILE:-1}"
     ;;
   *) echo "ERROR: BENCH_TARGET must be 'docker' or 'remote' (got '$TARGET')"; exit 1;;

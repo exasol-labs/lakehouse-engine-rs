@@ -94,8 +94,7 @@ fn run_on_runtime<T>(
     result
 }
 
-/// `threads == 1` (the default) yields a current-thread runtime, matching Exasol's per-instance
-/// model; more threads are only correct when `DATAFUSION_THREADS_PER_UDF` was widened explicitly.
+/// `threads == 1` yields a current-thread runtime, which avoids a worker pool on one-core nodes.
 pub fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, String> {
     if threads <= 1 {
         tokio::runtime::Builder::new_current_thread()

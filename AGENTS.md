@@ -50,8 +50,8 @@ Project specifics:
 
 Read `specs/udf-context.md` before changing the shard count or fan-out shape.
 
-- Groups drive UDF invocations, not OS processes. A node runs a fixed pool of VMs sized to `NR_OF_CORES`, and groups are multiplexed onto it.
-- Never shard on `IPROC()`. It yields one group per node and idles the other cores. Shard on `GROUP BY shard_key` with `G = node_count × parallelism_factor`, capped at 300 (Exasol's `max_dynamic_group_count`). At or below 300 groups are distributed round-robin, above it they are hash-partitioned and unbalanced. Clamp G to between 1 and the file count. Read the node count from `ctx.node_count()`.
+- Groups drive UDF invocations, not OS processes. A SET script's groups multiplex onto a per-node VM pool sized to `NR_OF_CORES`, but the scalar `LAKEHOUSE_SCAN` gets one VM per node, which scans that node's shards one after another. Per-node CPU parallelism comes from DataFusion threads, so `AUTO` sizes threads to the node's cores and `PARALLELISM_FACTOR` defaults to 1.
+- Never shard on `IPROC()`. Shard on `GROUP BY shard_key` with `G = node_count × parallelism_factor`, capped at 300 (Exasol's `max_dynamic_group_count`). At or below 300 groups are distributed round-robin, above it they are hash-partitioned and unbalanced. Clamp G to between 1 and the file count. Read the node count from `ctx.node_count()`.
 - `ctx.memory_limit()` returns the per-instance limit in bytes (`0` means unknown). The engine stalls new VMs at 80% of it, so size the DataFusion memory pool to about 0.6 of it.
 - Stream DataFusion results one `RecordBatch` at a time and drop each batch before fetching the next. The raw scan path calls `ctx.emit_batch(&batch)`, and the partial-aggregate path converts its single row to `Vec<Value>` and calls `ctx.emit`.
 - `ctx.emit` flushes at 4,000,000 bytes (`EMIT_BUFFER_LIMIT_BYTES`), not 4 MiB. Always flush at the end of `run()`.

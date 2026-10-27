@@ -348,7 +348,7 @@ fn single_shard_short_circuits_distributor_fromless() {
 }
 
 #[test]
-fn shard_count_oversubscribes_and_caps_at_300() {
+fn shard_count_scales_with_nodes_and_caps_at_300() {
     assert_eq!(shard_count(10, 50, 500), 300, "must be capped at 300");
     assert_eq!(
         shard_count(10, 50, 350),

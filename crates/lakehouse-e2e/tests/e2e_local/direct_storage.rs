@@ -141,7 +141,10 @@ fn setup() {
 
         create_virtual_schema_with_password(
             &mut conn,
-            &VsProps::new(VS_DIRECT, "").with_catalog_kind("DIRECT_STORAGE"),
+            // One shard per `stats` file, so a group's value and its NULL-only file stay apart.
+            &VsProps::new(VS_DIRECT, "")
+                .with_catalog_kind("DIRECT_STORAGE")
+                .with_parallelism_factor(STATS_FILES as usize),
             BASE_DIRECT,
             &direct_storage_password(),
         );
@@ -740,13 +743,15 @@ fn date_range_batch() -> RecordBatch {
     .expect("date_range batch construction is infallible")
 }
 
+const STATS_FILES: i64 = 3;
+
 /// #478 shape, one file per shard: Int64 and Int32 values whose squares overflow, constant groups
 /// at 1e9 (BIGINT) and 1e12 (DECIMAL), a one-row group, an all-NULL group, and a group whose one
 /// value sits beside a NULL-only shard. `E` is epoch milliseconds within one minute.
 /// #475 shape: `X` holds DOUBLE values beyond and below DECIMAL(36), `H` an Int64 whose sums and
 /// products leave Int64, and `W` a DECIMAL(36,6) whose first 300 rows overflow any sum.
 fn stats_batch(file: i64) -> RecordBatch {
-    let ks: Vec<i64> = (1..=3003).filter(|k| k % 3 == file).collect();
+    let ks: Vec<i64> = (1..=3003).filter(|k| k % STATS_FILES == file).collect();
     let group = |k: i64| match k {
         ..=1500 => "A",
         1501..=2999 => "B",
@@ -971,7 +976,7 @@ fn write_all_fixtures() {
         date_range_batch(),
     );
 
-    for file in 0..3 {
+    for file in 0..STATS_FILES {
         write_parquet_fixture(
             &format!("{BASE_DIRECT}stats/part-{file}.parquet"),
             stats_batch(file),
