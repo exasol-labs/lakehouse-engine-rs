@@ -32,7 +32,7 @@ An Exasol user re-reads the source of an existing virtual schema in place with `
 * *THEN* the returned `schemaMetadata.tables` SHALL include the newly added table and SHALL omit the lost table
 * *AND* the surviving table's columns SHALL reflect its current schema: the added column present, the promoted type mapped to its current Exasol type per `scan-types/type-mapping`, and for an Iceberg table the dropped column absent and the renamed column under its new name
 * *AND* for a direct-storage table, the added column SHALL read NULL for the rows of every file that lacks it, every row SHALL read back at the promoted type, and the new partition column SHALL be declared `VARCHAR(2000000)` per `direct-storage/direct-storage-hive-partitioning`, reading NULL for every file whose path lacks the segment
-* *AND* for a direct-storage base path, a lost directory that still holds an object SHALL be recorded in `SKIPPED_TABLES` with the reason `holds no data file`, per `vs-adapter/create-virtual-schema-adapter-notes`
+* *AND* for a direct-storage base path, a lost directory that still holds an object SHALL be recorded in `SKIPPED_TABLES` with the reason `holds no data file`, per `vs-properties/create-virtual-schema-adapter-notes`
 
 ### Scenario: Set properties overrides persisted properties and re-enumerates
 
@@ -87,7 +87,7 @@ An Exasol user re-reads the source of an existing virtual schema in place with `
 * *WHEN* Exasol sends a `refresh` whose `requestedTables` is `["NOW_LOADS", "STILL_SKIPPED", "DROPPED_A"]`
 * *THEN* the response SHALL declare `NOW_LOADS`, and `SKIPPED_TABLES` SHALL hold, in listing order, only the fresh entry for `still_skipped` and the persisted entry for `unrequested`
 * *AND* a persisted entry SHALL survive only when the identifier listing still returns its catalog identifier and its flattened Exasol name is not requested, and an unrequested table gains no entry, so `NEWLY_BROKEN` stays declared
-* *AND* the adapter SHALL cap the merged list per `vs-adapter/create-virtual-schema-adapter-notes`, and `SKIPPED_TABLES_OMITTED` SHALL hold the persisted count plus the entries the cap drops, or be absent when that sum is 0
+* *AND* the adapter SHALL cap the merged list per `vs-properties/create-virtual-schema-adapter-notes`, and `SKIPPED_TABLES_OMITTED` SHALL hold the persisted count plus the entries the cap drops, or be absent when that sum is 0
 
 ### Scenario: A partial refresh loads the metadata of the requested tables only
 

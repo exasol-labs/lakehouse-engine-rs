@@ -56,7 +56,6 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 ### Scenario: Scan-driving UDF invocations are schema-qualified from the running adapter script's schema
 
 * *GIVEN* a virtual schema whose adapter script, `LAKEHOUSE_SCAN` scan script, and `LAKEHOUSE_DISTRIBUTE_FILES` distributor are all deployed in one Exasol schema
-* *AND* a `CREATE VIRTUAL SCHEMA` statement that carries NO `SCAN_SCHEMA` property
 * *WHEN* Exasol sends a `pushdown` request and the adapter builds the scan-driving SQL
 * *THEN* the adapter SHALL qualify the `LAKEHOUSE_SCAN` and `LAKEHOUSE_DISTRIBUTE_FILES` UDF names with the schema reported by the running adapter script's UDF handshake (`ctx.script_schema()`), and MUST NOT read any VS property to obtain that schema
 * *AND* because those scripts are co-deployed in the adapter script's schema, the qualified names SHALL resolve when the scan-driving SQL executes outside the adapter script's own schema context
@@ -73,7 +72,7 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 
 ### Scenario: Pushdown reads the cluster node count from the UDF handshake
 
-* *GIVEN* a virtual schema over an Iceberg table whose persisted `adapterNotes` carry NO `CLUSTER_NODES` entry
+* *GIVEN* a virtual schema over an Iceberg table whose persisted `adapterNotes` carry no node-count entry
 * *AND* a live UDF handshake on the running adapter script reporting `UdfContext::node_count()` as N where N is at least 1
 * *WHEN* Exasol sends a `pushdown` request against that virtual schema
 * *THEN* the adapter SHALL use N as the node count in the shard count `G = node_count × PARALLELISM_FACTOR` (see `parallelism/work-unit-sharding`)

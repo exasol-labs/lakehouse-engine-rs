@@ -82,7 +82,7 @@ fn every_known_name_passes() {
     assert_eq!(
         PROPERTY_NAMES.into_iter().collect::<BTreeSet<&str>>(),
         ALL_NAMES.into_iter().collect::<BTreeSet<&str>>(),
-        "the adapter must accept exactly the 17 names of vs-adapter/property-validation"
+        "the adapter must accept exactly the 17 names of vs-properties/property-name-validation"
     );
 
     check_properties(&props(&valid_values)).expect("every known name with a valid value passes");
