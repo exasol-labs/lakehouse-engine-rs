@@ -165,8 +165,8 @@ end
 }
 
 // The E2E stacks are single-node, where the default factor of 1 yields one shard, so the
-// suites pin a factor that keeps the multi-shard fan-out covered.
-pub const E2E_PARALLELISM_FACTOR: usize = 8;
+// suites pin the smallest factor that still fans out through the distributor.
+pub const E2E_PARALLELISM_FACTOR: usize = 2;
 
 pub struct VsProps<'a> {
     vs_name: &'a str,
