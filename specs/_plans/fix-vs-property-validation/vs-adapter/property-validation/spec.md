@@ -4,7 +4,7 @@
 
 ## Background
 
-* Exasol passes each property name of `CREATE VIRTUAL SCHEMA ... WITH` and `ALTER VIRTUAL SCHEMA ... SET` to the adapter without checking it, so only the adapter can reject an unknown name.
+* Exasol passes each property name of `CREATE VIRTUAL SCHEMA ... WITH` and `ALTER VIRTUAL SCHEMA ... SET` to the adapter without checking it, so only the adapter can reject an unknown name. Exasol itself rejects an empty or `null` value in `CREATE VIRTUAL SCHEMA ... WITH` with `Value of property <NAME> must not be null or empty.`, and it sends `ALTER VIRTUAL SCHEMA ... SET <name> = ''` and `SET <name> = null` to the adapter as a JSON `null`.
 * A request's effective properties are its own properties merged with the persisted ones, per the precedence `vs-adapter/refresh-and-set-properties` states for each request type.
 * The value checks of `CATALOG_KIND`, `PERMISSION_CHECK`, `USER_MAPPING`, `NAMESPACE`, `MERGE_SCHEMA`, and `HIVE_PARTITIONING`, and the required-property checks of `CATALOG_CONNECTION` and `NAMESPACE`, belong to `vs-adapter/catalog-kind-selection`, `vs-adapter/lakekeeper-permission-check`, `vs-adapter/create-virtual-schema`, and `direct-storage/direct-storage-properties`.
 * The effect of each tuning property belongs to `vs-adapter/create-virtual-schema-adapter-notes-resources`, `scan-runtime/scan-execution-threading`, `scan-runtime/scan-execution-connection-concurrency`, and `pushdown-joins/pushdown-planning-join`.
@@ -77,7 +77,7 @@
 
 ### Scenario: An empty or null property value counts as absent
 
-* *GIVEN* a request whose properties hold a name with an empty or `null` value
+* *GIVEN* a `setProperties` request whose properties hold a name with a `null` value, which is what `ALTER VIRTUAL SCHEMA ... SET <name> = ''` and `SET <name> = null` send
 * *WHEN* the adapter checks the properties
 * *THEN* the adapter SHALL treat the property as absent, report neither an unknown name nor an invalid value for it, and resolve a tuning property to its default
 

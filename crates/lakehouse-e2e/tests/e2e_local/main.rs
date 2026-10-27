@@ -16,6 +16,7 @@ mod int96_timestamp;
 mod join;
 mod non_ascii_identifier;
 mod positional_deletes;
+mod property_validation;
 mod pruning;
 mod refresh;
 mod scan;

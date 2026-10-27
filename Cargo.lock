@@ -3466,7 +3466,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.57.1"
+version = "0.58.0"
 dependencies = [
  "aes-gcm",
  "arrow",

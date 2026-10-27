@@ -721,17 +721,36 @@ pub fn assert_refused_column(
     conn.query_columns(&format!("SELECT ID FROM {table_ref}"));
 }
 
-/// Every `(table, reason)` entry of `SKIPPED_TABLES`, in its recorded order. Every skipped-table
-/// assertion reads through it, so no test parses the schema-level notes itself.
-pub fn skipped_entries(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
-    let notes = conn.query_columns(&format!(
+/// The schema-level adapterNotes of `vs_name`, decoded from the JSON string Exasol stores. Every
+/// schema-level note assertion reads through it, so no test parses that encoding itself.
+pub fn schema_notes(
+    conn: &mut ExaConn,
+    vs_name: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let cols = conn.query_columns(&format!(
         "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = '{vs_name}'"
     ));
-    let notes: serde_json::Value = serde_json::from_str(&value_to_string(&notes[0][0]))
-        .unwrap_or_else(|e| panic!("ADAPTER_NOTES must be JSON: {e}"));
-    notes["SKIPPED_TABLES"]
-        .as_array()
-        .unwrap_or_else(|| panic!("ADAPTER_NOTES must carry SKIPPED_TABLES: {notes}"))
+    let raw = cols
+        .first()
+        .and_then(|col| col.first())
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("{vs_name} must have ADAPTER_NOTES: {cols:?}"));
+    match serde_json::from_str(raw) {
+        Ok(serde_json::Value::Object(notes)) => notes,
+        Ok(_) => panic!("ADAPTER_NOTES of {vs_name} must be a JSON object: {raw}"),
+        Err(e) => panic!("ADAPTER_NOTES of {vs_name} must be JSON ({e}): {raw}"),
+    }
+}
+
+/// Every `(table, reason)` entry of `SKIPPED_TABLES`, in its recorded order.
+pub fn skipped_entries(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
+    let notes = schema_notes(conn, vs_name);
+    notes
+        .get("SKIPPED_TABLES")
+        .and_then(|entries| entries.as_array())
+        .unwrap_or_else(|| {
+            panic!("ADAPTER_NOTES of {vs_name} must carry SKIPPED_TABLES: {notes:?}")
+        })
         .iter()
         .map(|entry| {
             (

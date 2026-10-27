@@ -9,6 +9,7 @@ pub mod direct_storage_properties;
 pub mod iceberg_predicate;
 pub mod parquet_directory;
 mod permission;
+mod properties;
 pub mod pushdown;
 #[cfg(test)]
 #[path = "pushdown_surface_probe_tests.rs"]
@@ -26,6 +27,10 @@ use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::connection::{catalog_block, read_connection, storage_block};
 use crate::adapter::direct_storage::DirectStorageCatalogClient;
 use crate::adapter::permission::{PermissionCheck, PermissionSettings};
+use crate::adapter::properties::{
+    PROP_CATALOG_CONNECTION, PROP_NAMESPACE, ThreadingMode, TuningProperties, check_properties,
+    resolve_allow_http,
+};
 use crate::adapter::pushdown::{declare_columns, handle_pushdown};
 use crate::adapter::scoped_refresh::{RequestedTables, ScopedRefresh};
 use crate::adapter::skipped_tables::{SkippedTables, insert_skipped_tables, skip_kind_and_reason};
@@ -49,25 +54,14 @@ use lakehouse_catalog::{
 use serde_json::{Value as Json, json};
 use std::num::NonZeroUsize;
 
-const PROP_NAMESPACE: &str = "NAMESPACE";
-// CONNECTION whose address is the catalog URI and whose password is the credential JSON.
-const PROP_CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
-const PROP_ALLOW_HTTP: &str = "ALLOW_HTTP";
-const PROP_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
 const NOTE_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
 const DEFAULT_PARALLELISM_FACTOR: usize = 1;
-const PROP_DF_TARGET_PARTITIONS: &str = "DATAFUSION_TARGET_PARTITIONS";
-const PROP_DF_THREADS_PER_UDF: &str = "DATAFUSION_THREADS_PER_UDF";
-const PROP_DF_THREADING_MODE: &str = "DATAFUSION_THREADING_MODE";
 const NOTE_DF_TARGET_PARTITIONS: &str = "DF_TARGET_PARTITIONS";
 const NOTE_DF_THREADS_PER_UDF: &str = "DF_THREADS_PER_UDF";
 const NOTE_DF_THREADING_MODE: &str = "DF_THREADING_MODE";
-const PROP_DF_BATCH_SIZE: &str = "DATAFUSION_BATCH_SIZE";
 const NOTE_DF_BATCH_SIZE: &str = "DF_BATCH_SIZE";
 /// Pushdown-path fallback; matches DataFusion's default rows per RecordBatch.
 const DEFAULT_DF_BATCH_SIZE: usize = 8192;
-const PROP_MEMORY_POOL_FRACTION: &str = "MEMORY_POOL_FRACTION";
-const PROP_INSTANCE_OVERHEAD_MB: &str = "INSTANCE_OVERHEAD_MB";
 const NOTE_MEMORY_POOL_FRACTION: &str = "MEMORY_POOL_FRACTION";
 const NOTE_INSTANCE_OVERHEAD_MB: &str = "INSTANCE_OVERHEAD_MB";
 /// Fraction of the net per-instance RSS budget allocated to the DataFusion memory pool.
@@ -75,13 +69,8 @@ const DEFAULT_MEMORY_POOL_FRACTION: f64 = 0.6;
 /// Fixed container/binary overhead (MB) subtracted from the per-instance RSS limit before
 /// applying the pool fraction.
 const DEFAULT_INSTANCE_OVERHEAD_MB: u64 = 200;
-// A join's smaller side is broadcast into every shard when its total file bytes are at or below
-// this threshold; larger joins fall back to an unaccelerated two-scan join.
-const PROP_JOIN_BROADCAST_MAX_BYTES: &str = "JOIN_BROADCAST_MAX_BYTES";
 const NOTE_JOIN_BROADCAST_MAX_BYTES: &str = "JOIN_BROADCAST_MAX_BYTES";
 const DEFAULT_JOIN_BROADCAST_MAX_BYTES: u64 = 134_217_728;
-// Mirrors the native `IMPORT FROM PARQUET` `MaxConnections` knob.
-const PROP_S3_MAX_CONNECTIONS: &str = "S3_MAX_CONNECTIONS";
 const NOTE_S3_MAX_CONNECTIONS: &str = "S3_MAX_CONNECTIONS";
 /// Connections per decode thread: S3 range GETs are latency-bound, so several in flight per
 /// thread keep the NIC busy, and idle pooled connections are far cheaper than threads.
@@ -164,9 +153,7 @@ fn resolve_connection_config(
         .ok_or_else(|| UdfError::User("CATALOG_CONNECTION is required".into()))?;
     let resolved = read_connection(ctx, Some(connection_name), kind)?;
     permission.require_management_url(&resolved.uri)?;
-    let allow_http = nonempty_str(props, PROP_ALLOW_HTTP)
-        .map(|s| s.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let allow_http = resolve_allow_http(props);
     let creds = rt.block_on(resolve_aws_identity(
         resolved.creds,
         &resolved.uri,
@@ -195,6 +182,7 @@ fn handle_create_virtual_schema(
     } else {
         get_properties(request)
     };
+    let checked = check_properties(&props)?;
     // Validated only: listing runs as the CONNECTION's identity, with no permission check.
     let permission = PermissionSettings::parse(&props)?;
     let rt = build_runtime()?;
@@ -210,17 +198,6 @@ fn handle_create_virtual_schema(
             namespace.split('.').map(|s| s.to_string()).collect()
         }
     };
-
-    let nr_of_cores = resolve_nr_of_cores();
-    let parallelism_factor = resolve_parallelism_factor(&props);
-    let df_threading_mode = resolve_threading_mode(&props);
-    let (df_target_partitions, df_threads_per_udf) =
-        resolve_df_threading(df_threading_mode, &props, nr_of_cores);
-    let df_batch_size = resolve_df_batch_size(&props);
-    let memory_pool_fraction = resolve_memory_pool_fraction(&props);
-    let instance_overhead_mb = resolve_instance_overhead_mb(&props);
-    let join_broadcast_max_bytes = resolve_join_broadcast_max_bytes(&props);
-    let s3_max_connections = resolve_s3_max_connections(&props, df_threads_per_udf);
 
     let client = construct_catalog_client(
         config.catalog_kind,
@@ -243,17 +220,7 @@ fn handle_create_virtual_schema(
         udf_log!(ctx, warn, "{}", skip_warning(entry));
     }
 
-    let tuning = TuningNotes {
-        parallelism_factor,
-        df_threading_mode,
-        df_target_partitions,
-        df_threads_per_udf,
-        df_batch_size,
-        memory_pool_fraction,
-        instance_overhead_mb,
-        s3_max_connections,
-        join_broadcast_max_bytes,
-    };
+    let tuning = resolve_tuning_notes(&checked, resolve_nr_of_cores());
     let adapter_notes = build_adapter_notes(request, &tuning, &skipped_tables);
 
     let schema_metadata = json!({
@@ -594,20 +561,6 @@ fn build_adapter_notes(request: &Json, tuning: &TuningNotes, skipped: &SkippedTa
     Json::String(Json::Object(notes).to_string())
 }
 
-fn resolve_parallelism_factor(props: &Json) -> usize {
-    nonempty_str(props, PROP_PARALLELISM_FACTOR)
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(DEFAULT_PARALLELISM_FACTOR)
-}
-
-/// Planning-time only: just the resulting integers reach the scan UDF, which stays mode-agnostic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThreadingMode {
-    Auto,
-    Fixed,
-}
-
 impl ThreadingMode {
     fn as_note(self) -> &'static str {
         match self {
@@ -617,21 +570,46 @@ impl ThreadingMode {
     }
 }
 
-fn resolve_threading_mode(props: &Json) -> ThreadingMode {
-    match nonempty_str(props, PROP_DF_THREADING_MODE) {
-        Some(s) if s.eq_ignore_ascii_case("FIXED") => ThreadingMode::Fixed,
-        _ => ThreadingMode::Auto,
-    }
-}
-
-fn resolve_df_threading(mode: ThreadingMode, props: &Json, nr_of_cores: u32) -> (usize, usize) {
+/// Applies each absent property's default and the AUTO/FIXED derivation. Absent FIXED counts take
+/// the AUTO values, and an absent `S3_MAX_CONNECTIONS` is `S3_CONNECTIONS_PER_THREAD` per thread.
+fn resolve_tuning_notes(checked: &TuningProperties, nr_of_cores: u32) -> TuningNotes {
+    let df_threading_mode = checked.threading_mode.unwrap_or(ThreadingMode::Auto);
     let (auto_partitions, auto_threads) = auto_df_threading(nr_of_cores);
-    match mode {
+    let (df_target_partitions, df_threads_per_udf) = match df_threading_mode {
         ThreadingMode::Fixed => (
-            resolve_df_fixed_count(props, PROP_DF_TARGET_PARTITIONS, auto_partitions),
-            resolve_df_fixed_count(props, PROP_DF_THREADS_PER_UDF, auto_threads),
+            checked
+                .df_target_partitions
+                .map_or(auto_partitions, |n| usize::from(n.get())),
+            checked
+                .df_threads_per_udf
+                .map_or(auto_threads, |n| usize::from(n.get())),
         ),
         ThreadingMode::Auto => (auto_partitions, auto_threads),
+    };
+    TuningNotes {
+        parallelism_factor: checked
+            .parallelism_factor
+            .map_or(DEFAULT_PARALLELISM_FACTOR, |n| usize::from(n.get())),
+        df_threading_mode,
+        df_target_partitions,
+        df_threads_per_udf,
+        df_batch_size: checked
+            .df_batch_size
+            .map_or(DEFAULT_DF_BATCH_SIZE, |n| n.get() as usize),
+        memory_pool_fraction: checked
+            .memory_pool_fraction
+            .unwrap_or(DEFAULT_MEMORY_POOL_FRACTION),
+        instance_overhead_mb: checked
+            .instance_overhead_mb
+            .map_or(DEFAULT_INSTANCE_OVERHEAD_MB, u64::from),
+        s3_max_connections: checked
+            .s3_max_connections
+            .map_or(df_threads_per_udf * S3_CONNECTIONS_PER_THREAD, |n| {
+                usize::from(n.get())
+            }),
+        join_broadcast_max_bytes: checked
+            .join_broadcast_max_bytes
+            .map_or(DEFAULT_JOIN_BROADCAST_MAX_BYTES, |n| n.get()),
     }
 }
 
@@ -640,49 +618,6 @@ fn resolve_df_threading(mode: ThreadingMode, props: &Json, nr_of_cores: u32) -> 
 fn auto_df_threading(nr_of_cores: u32) -> (usize, usize) {
     let threads = (nr_of_cores as usize).max(1);
     (2 * threads, threads)
-}
-
-fn resolve_df_fixed_count(props: &Json, key: &str, fallback: usize) -> usize {
-    nonempty_str(props, key)
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(fallback)
-}
-
-/// An explicit positive value wins; otherwise each decode thread gets
-/// `S3_CONNECTIONS_PER_THREAD` connections.
-fn resolve_s3_max_connections(props: &Json, df_threads_per_udf: usize) -> usize {
-    nonempty_str(props, PROP_S3_MAX_CONNECTIONS)
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(df_threads_per_udf * S3_CONNECTIONS_PER_THREAD)
-}
-
-fn resolve_df_batch_size(props: &Json) -> usize {
-    nonempty_str(props, PROP_DF_BATCH_SIZE)
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.max(1))
-        .unwrap_or(DEFAULT_DF_BATCH_SIZE)
-}
-
-fn resolve_memory_pool_fraction(props: &Json) -> f64 {
-    nonempty_str(props, PROP_MEMORY_POOL_FRACTION)
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|&x| x > 0.0 && x <= 1.0)
-        .unwrap_or(DEFAULT_MEMORY_POOL_FRACTION)
-}
-
-fn resolve_instance_overhead_mb(props: &Json) -> u64 {
-    nonempty_str(props, PROP_INSTANCE_OVERHEAD_MB)
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_INSTANCE_OVERHEAD_MB)
-}
-
-fn resolve_join_broadcast_max_bytes(props: &Json) -> u64 {
-    nonempty_str(props, PROP_JOIN_BROADCAST_MAX_BYTES)
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_JOIN_BROADCAST_MAX_BYTES)
 }
 
 /// `available_parallelism()` honours the CPU quota of the adapter VM's container.

@@ -499,6 +499,7 @@ fn e2e_renamed_column_resolves_by_field_id() {
     }
 }
 
+/// Scenario: Scan-driving UDF invocations are schema-qualified from the running adapter script's schema
 #[test]
 fn e2e_added_columns_initial_default_fill_all_types() {
     lakehouse_vs();
@@ -516,9 +517,7 @@ fn e2e_added_columns_initial_default_fill_all_types() {
     // puts both files in one shard.
     create_virtual_schema(
         &mut conn,
-        &VsProps::new("INITDEF_VS", E2E_NAMESPACE)
-            .with_parallelism_factor(1)
-            .with_property("SCAN_SCHEMA", SCHEMA_NAME),
+        &VsProps::new("INITDEF_VS", E2E_NAMESPACE).with_parallelism_factor(1),
     );
 
     let columns = initdef_columns();
@@ -962,50 +961,46 @@ fn order_by_without_limit_falls_back_correctly() {
     );
 }
 
+/// Scenario: createVirtualSchema adapterNotes omit the cluster node count
+/// Scenario: Adapter derives the per-node core count from available_parallelism() on every request
 #[test]
 fn create_vs_omits_cluster_nodes_from_adapter_notes() {
+    const NOTES_VS: &str = "LHVS_NOTE_KEYS";
+    const EXPECTED_KEYS: [&str; 10] = [
+        "DF_BATCH_SIZE",
+        "DF_TARGET_PARTITIONS",
+        "DF_THREADING_MODE",
+        "DF_THREADS_PER_UDF",
+        "INSTANCE_OVERHEAD_MB",
+        "JOIN_BROADCAST_MAX_BYTES",
+        "MEMORY_POOL_FRACTION",
+        "PARALLELISM_FACTOR",
+        "S3_MAX_CONNECTIONS",
+        "SKIPPED_TABLES",
+    ];
+
     lakehouse_vs();
     let mut conn = exa_conn();
+    create_virtual_schema(&mut conn, &VsProps::new(NOTES_VS, E2E_NAMESPACE));
 
-    let cols = conn.query_columns(&format!(
-        "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS \
-         WHERE SCHEMA_NAME = '{LAKEHOUSE_VS}'"
+    let assert_exact_keys = |conn: &mut ExaConn, after: &str| {
+        let notes = schema_notes(conn, NOTES_VS);
+        let mut keys: Vec<&str> = notes.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys, EXPECTED_KEYS,
+            "ADAPTER_NOTES after {after} must hold exactly the tuning keys and SKIPPED_TABLES, \
+             with no node count or core count: {notes:?}"
+        );
+    };
+
+    assert_exact_keys(&mut conn, "CREATE");
+    conn.execute(&format!("ALTER VIRTUAL SCHEMA {NOTES_VS} REFRESH"));
+    assert_exact_keys(&mut conn, "REFRESH");
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {NOTES_VS} SET PARALLELISM_FACTOR = '1'"
     ));
-    assert_eq!(
-        cols.len(),
-        1,
-        "query must return one column (ADAPTER_NOTES): {cols:?}"
-    );
-    assert_eq!(
-        cols[0].len(),
-        1,
-        "the virtual schema must exist (one row): {cols:?}"
-    );
-    let notes = cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("ADAPTER_NOTES value is not a string: {:?}", cols[0][0]));
-    assert!(
-        !notes.is_empty(),
-        "ADAPTER_NOTES must be non-empty (Exasol must have persisted it): {notes:?}"
-    );
-
-    let parsed: serde_json::Value = serde_json::from_str(notes)
-        .unwrap_or_else(|e| panic!("ADAPTER_NOTES must be valid JSON ({e}): {notes:?}"));
-    assert!(
-        parsed.get("PARALLELISM_FACTOR").is_some(),
-        "ADAPTER_NOTES must carry PARALLELISM_FACTOR: {notes:?}"
-    );
-    assert!(
-        parsed.get("NR_OF_CORES").is_none(),
-        "ADAPTER_NOTES must NOT carry NR_OF_CORES (the per-node core count is a \
-         derivation input the adapter discards, never a persisted note): {notes:?}"
-    );
-    assert!(
-        parsed.get("CLUSTER_NODES").is_none(),
-        "ADAPTER_NOTES must NOT carry CLUSTER_NODES (node count is read live \
-         from UdfContext::node_count() per pushdown request, never persisted): \
-         {notes:?}"
-    );
+    assert_exact_keys(&mut conn, "SET");
 }
 
 /// Scenario: The adapter detects the node's CPU affinity set
@@ -1045,19 +1040,10 @@ fn adapter_detects_container_cpuset() {
     let mut conn = exa_conn();
     create_virtual_schema(&mut conn, &VsProps::new(CPU_PROBE_VS_NAME, E2E_NAMESPACE));
 
-    let cols = conn.query_columns(&format!(
-        "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS \
-         WHERE SCHEMA_NAME = '{CPU_PROBE_VS_NAME}'"
-    ));
-    let notes = cols
-        .first()
-        .and_then(|col| col.first())
+    let notes = schema_notes(&mut conn, CPU_PROBE_VS_NAME);
+    let detected: usize = notes
+        .get("DF_THREADS_PER_UDF")
         .and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("{CPU_PROBE_VS_NAME} must have ADAPTER_NOTES: {cols:?}"));
-    let parsed: serde_json::Value = serde_json::from_str(notes)
-        .unwrap_or_else(|e| panic!("ADAPTER_NOTES must be valid JSON ({e}): {notes:?}"));
-    let detected: usize = parsed["DF_THREADS_PER_UDF"]
-        .as_str()
         .unwrap_or_else(|| panic!("ADAPTER_NOTES must carry DF_THREADS_PER_UDF: {notes:?}"))
         .parse()
         .unwrap_or_else(|e| panic!("DF_THREADS_PER_UDF must be an integer ({e}): {notes:?}"));
@@ -1149,6 +1135,7 @@ fn cpu_ids(list: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Scenario: Pushdown reads the cluster node count from the UDF handshake
 #[test]
 fn pushdown_shards_from_handshake_node_count_without_note() {
     lakehouse_vs();

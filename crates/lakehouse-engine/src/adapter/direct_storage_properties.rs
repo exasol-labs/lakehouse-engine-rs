@@ -1,9 +1,9 @@
 use crate::adapter::parquet_directory::{DirectoryOptions, MergeMode};
+use crate::adapter::properties::{
+    PROP_HIVE_PARTITIONING, PROP_MERGE_SCHEMA, PROP_NAMESPACE, parse_boolean,
+};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-
-const PROP_MERGE_SCHEMA: &str = "MERGE_SCHEMA";
-const PROP_HIVE_PARTITIONING: &str = "HIVE_PARTITIONING";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectStorageProperties {
@@ -57,36 +57,36 @@ pub fn join_storage_path(base: &str, segment: Option<&str>) -> String {
 }
 
 fn parse_namespace(props: &Json) -> Result<Option<String>, UdfError> {
-    let Some(value) = super::nonempty_str(props, super::PROP_NAMESPACE) else {
+    let Some(value) = super::nonempty_str(props, PROP_NAMESPACE) else {
         return Ok(None);
     };
     if value.contains("://") {
         return Err(UdfError::User(format!(
             "'{}' value '{value}' carries a URI scheme; it must be a path relative to the \
              CONNECTION address",
-            super::PROP_NAMESPACE
+            PROP_NAMESPACE
         )));
     }
     if value.starts_with('/') {
         return Err(UdfError::User(format!(
             "'{}' value '{value}' begins with '/'; it must be a path relative to the \
              CONNECTION address",
-            super::PROP_NAMESPACE
+            PROP_NAMESPACE
         )));
     }
     Ok(Some(value.to_string()))
 }
 
 fn parse_bool_property(props: &Json, key: &str, default: bool) -> Result<bool, UdfError> {
-    match super::nonempty_str(props, key) {
-        None => Ok(default),
-        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
-        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
-        Some(value) => Err(UdfError::User(format!(
+    let Some(value) = super::nonempty_str(props, key) else {
+        return Ok(default);
+    };
+    parse_boolean(value).ok_or_else(|| {
+        UdfError::User(format!(
             "'{key}' value '{value}' is neither a true nor a false spelling; accepted \
              spellings are 'TRUE' and 'FALSE' (case-insensitive)"
-        ))),
-    }
+        ))
+    })
 }
 
 #[cfg(test)]

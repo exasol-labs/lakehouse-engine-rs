@@ -34,7 +34,7 @@ The VS layer resolves metadata **once per query**, never once per node. The form
 ## Sharding rules
 
 ```
-G = CLUSTER_NODES × PARALLELISM_FACTOR
+G = node_count × PARALLELISM_FACTOR
 G = min(G, 300)              # cap at 300: ≤300 ⇒ round-robin (balanced), >300 ⇒ hash-partition (unbalanced)
 G = clamp(G, 1, file_count)  # at least 1, never more shards than files
 ```
@@ -43,7 +43,7 @@ G = clamp(G, 1, file_count)  # at least 1, never more shards than files
 - **Byte-balanced shards.** The VS assigns files by greedy descending-size byte-balance, not by file count. Each shard therefore carries approximately equal bytes.
 - **Memory.** Peak scan memory per node is one instance's DataFusion pool. The engine stalls new VMs at **80 %** of the per-instance limit, so the scan UDF sizes its pool to a fraction of that limit (default 0.6).
 
-`PARALLELISM_FACTOR`, the threading mode, and the memory fraction are fixed at `CREATE VIRTUAL SCHEMA` time. A change to one of them requires a new VS. See [Tuning](tuning.md) for the full property list.
+`PARALLELISM_FACTOR`, the threading mode, and the memory fraction are set at `CREATE VIRTUAL SCHEMA` time. Change one with `ALTER VIRTUAL SCHEMA ... SET`. See [Tuning](tuning.md) for the full property list.
 
 ### Example — 2 nodes × 2 cores, 10 files
 

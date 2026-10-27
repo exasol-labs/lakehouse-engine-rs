@@ -8,7 +8,7 @@
 ## The two concepts
 
 **Instance = a UDF process.** Per UDF call, a node starts up to `#cores` instances
-(its fixed per-node VM pool, sized to `NR_OF_CORES`). A node starts as many
+(its fixed per-node VM pool, sized to the node's core count). A node starts as many
 instances as it needs, or is allowed, up to that ceiling. This is the unit of
 *actual* OS-level parallelism.
 

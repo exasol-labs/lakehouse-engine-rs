@@ -15,7 +15,7 @@ This file is the source of truth for the benchmark harness, its remote target, a
 
 ### Tuning properties and report header
 
-- Both remote paths pass `PARALLELISM_FACTOR` as a virtual schema property from `BENCH_PARALLELISM_FACTOR`, with the same default the docker target uses, and never emit an empty extra-properties block. The harness passes no `NR_OF_CORES` property and reads no `BENCH_NR_OF_CORES` variable, because the adapter detects the core count on its executing node. The remote run sizes its per-instance thread and connection budgets from that detected count.
+- Both remote paths pass `PARALLELISM_FACTOR` as a virtual schema property from `BENCH_PARALLELISM_FACTOR`, with the same default the docker target uses, and never emit an empty extra-properties block. The adapter detects the core count on its executing node. The remote run sizes its per-instance thread and connection budgets from that detected count.
 - On the remote target only, the report header names the catalog the run used. The field carries the catalog name and never an `s3://`-shaped value, because `bench/import_ceiling.sh` greps the report for `s3://.../lineitem`. The docker target's header carries no such field.
 
 ### Leaving the virtual schema and CONNECTION queryable for a demo
