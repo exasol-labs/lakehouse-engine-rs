@@ -16,14 +16,25 @@ The adapter sets how many DataFusion partitions and Tokio worker threads each sc
 ## Scenarios
 
 <!-- DELTA:CHANGED -->
+### Scenario: AUTO mode gives the node's single scan instance every core
+
+* *GIVEN* a `createVirtualSchema` request whose `DATAFUSION_THREADING_MODE` property is `AUTO`
+* *AND* a resolved per-node core count `nr_of_cores` of at least `1`
+* *WHEN* the adapter resolves the DataFusion threading configuration
+* *THEN* the adapter SHALL set `df_threads_per_udf` to `nr_of_cores` and `df_target_partitions` to `2 × nr_of_cores`, whatever the parallelism factor
+* *AND* the adapter SHALL ignore a `DATAFUSION_TARGET_PARTITIONS` or `DATAFUSION_THREADS_PER_UDF` value that `vs-adapter/property-validation` accepts, and a value it rejects SHALL fail the request
+* *AND* the adapter SHALL record the resolved values and the selected mode in the `createVirtualSchema` response `adapterNotes`, so the per-shard scan spec carries integer fields the mode-agnostic scan UDF consumes unchanged
+<!-- /DELTA:CHANGED -->
+
+<!-- DELTA:CHANGED -->
 ### Scenario: FIXED mode uses the operator-supplied thread and partition values verbatim
 
 * *GIVEN* a `createVirtualSchema` request whose `DATAFUSION_THREADING_MODE` property is `FIXED`
-* *AND* explicit positive-integer `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF` properties
+* *AND* explicit `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF` properties whose values `vs-adapter/property-validation` accepts
 * *WHEN* the adapter resolves the DataFusion threading configuration
 * *THEN* the adapter SHALL record `df_target_partitions` and `df_threads_per_udf` equal to the supplied property values, without applying the AUTO derivation
 * *AND* when a property is absent or empty the adapter SHALL fall back to that field's AUTO value
-* *AND* a value that is not a positive integer SHALL fail the request per `vs-adapter/property-validation`, and the adapter MUST NOT fall back to the AUTO value for it
+* *AND* a value that `vs-adapter/property-validation` rejects SHALL fail the request, and the adapter MUST NOT fall back to the AUTO value for it
 <!-- /DELTA:CHANGED -->
 
 <!-- DELTA:CHANGED -->
@@ -32,6 +43,6 @@ The adapter sets how many DataFusion partitions and Tokio worker threads each sc
 * *GIVEN* a `createVirtualSchema` request that supplies no `DATAFUSION_THREADING_MODE` property, or an empty one
 * *WHEN* the adapter resolves the DataFusion threading configuration
 * *THEN* the adapter SHALL select `AUTO` mode and derive the thread/partition budget per the AUTO scenario
-* *AND* the adapter SHALL record `DATAFUSION_THREADING_MODE: AUTO` in the `createVirtualSchema` response `adapterNotes`
+* *AND* the adapter SHALL record the `adapterNotes` entry `DF_THREADING_MODE` with the value `AUTO` in the `createVirtualSchema` response
 * *AND* a value that is neither `AUTO` nor `FIXED`, compared without regard to case, SHALL fail the request per `vs-adapter/property-validation` instead of selecting `AUTO`
 <!-- /DELTA:CHANGED -->

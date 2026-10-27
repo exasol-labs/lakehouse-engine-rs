@@ -1,10 +1,10 @@
 # Feature: Virtual Schema Property Validation
 
-`CREATE VIRTUAL SCHEMA`, `ALTER VIRTUAL SCHEMA ... REFRESH`, and `ALTER VIRTUAL SCHEMA ... SET` fail when a property name is not one the adapter reads, or when a tuning property holds a value the adapter cannot use. One error names every such property, so a misspelled name or an out-of-range value never selects a default without telling the user (#534).
+`CREATE VIRTUAL SCHEMA`, `ALTER VIRTUAL SCHEMA ... REFRESH`, and `ALTER VIRTUAL SCHEMA ... SET` reject a property name the adapter does not read and a property value the adapter cannot use, with one error that names every such property (#534). The feature does nothing more: an absent property still takes its default. This feature owns the complete list of virtual schema property names.
 
 ## Background
 
-* Exasol passes every property name and value of `CREATE VIRTUAL SCHEMA ... WITH` and `ALTER VIRTUAL SCHEMA ... SET` to the adapter without checking them. Only the adapter can reject a property.
+* Exasol passes each property name of `CREATE VIRTUAL SCHEMA ... WITH` and `ALTER VIRTUAL SCHEMA ... SET` to the adapter without checking it, so only the adapter can reject an unknown name.
 * A request's effective properties are its own properties merged with the persisted ones, per the precedence `vs-adapter/refresh-and-set-properties` states for each request type.
 * The value checks of `CATALOG_KIND`, `PERMISSION_CHECK`, `USER_MAPPING`, `NAMESPACE`, `MERGE_SCHEMA`, and `HIVE_PARTITIONING`, and the required-property checks of `CATALOG_CONNECTION` and `NAMESPACE`, belong to `vs-adapter/catalog-kind-selection`, `vs-adapter/lakekeeper-permission-check`, `vs-adapter/create-virtual-schema`, and `direct-storage/direct-storage-properties`.
 * The effect of each tuning property belongs to `vs-adapter/create-virtual-schema-adapter-notes-resources`, `scan-runtime/scan-execution-threading`, `scan-runtime/scan-execution-connection-concurrency`, and `pushdown-joins/pushdown-planning-join`.
@@ -32,7 +32,7 @@
 
 * *GIVEN* a `createVirtualSchema` request under any `CATALOG_KIND`
 * *WHEN* the adapter checks the property names
-* *THEN* the adapter SHALL accept exactly these names: `CATALOG_KIND`, `CATALOG_CONNECTION`, `NAMESPACE`, `ALLOW_HTTP`, `PARALLELISM_FACTOR`, `DATAFUSION_THREADING_MODE`, `DATAFUSION_TARGET_PARTITIONS`, `DATAFUSION_THREADS_PER_UDF`, `DATAFUSION_BATCH_SIZE`, `MEMORY_POOL_FRACTION`, `INSTANCE_OVERHEAD_MB`, `JOIN_BROADCAST_MAX_BYTES`, `S3_MAX_CONNECTIONS`, `MERGE_SCHEMA`, `HIVE_PARTITIONING`, `PERMISSION_CHECK`, and `USER_MAPPING`
+* *THEN* the adapter SHALL accept exactly these 17 names: `CATALOG_KIND`, `CATALOG_CONNECTION`, `NAMESPACE`, `ALLOW_HTTP`, `PARALLELISM_FACTOR`, `DATAFUSION_THREADING_MODE`, `DATAFUSION_TARGET_PARTITIONS`, `DATAFUSION_THREADS_PER_UDF`, `DATAFUSION_BATCH_SIZE`, `MEMORY_POOL_FRACTION`, `INSTANCE_OVERHEAD_MB`, `JOIN_BROADCAST_MAX_BYTES`, `S3_MAX_CONNECTIONS`, `MERGE_SCHEMA`, `HIVE_PARTITIONING`, `PERMISSION_CHECK`, and `USER_MAPPING`
 * *AND* the set SHALL NOT depend on the catalog kind, so `MERGE_SCHEMA` under the Iceberg REST kind and `USER_MAPPING` without `PERMISSION_CHECK` are accepted and have no effect
 
 ### Scenario: An invalid tuning value fails the statement and names the accepted values
@@ -40,9 +40,18 @@
 * *GIVEN* a `createVirtualSchema`, `refresh`, or `setProperties` request whose effective properties hold a tuning property with a non-empty value
 * *WHEN* the adapter checks the value
 * *THEN* the adapter SHALL fail the request for each rejected value with an error entry `invalid value '<value>' for '<name>': expected <accepted values>`
-* *AND* the adapter SHALL reject a `PARALLELISM_FACTOR`, `DATAFUSION_TARGET_PARTITIONS`, `DATAFUSION_THREADS_PER_UDF`, `DATAFUSION_BATCH_SIZE`, `S3_MAX_CONNECTIONS`, or `JOIN_BROADCAST_MAX_BYTES` value that is not a whole number of at least 1, expecting `a whole number of at least 1`
-* *AND* the adapter SHALL reject an `INSTANCE_OVERHEAD_MB` value that is not a whole number of at least 0, expecting `a whole number of at least 0`, and a `MEMORY_POOL_FRACTION` value that is not a number greater than 0 and at most 1, expecting `a number greater than 0 and at most 1`, so `60` and `0` fail and `1` passes
+* *AND* the entry SHALL echo at most the first 100 characters of the value, followed by `…` when the value is longer, and SHALL double each `'` in the echoed text, so a long value or a value with a quote keeps the error readable
+* *AND* the adapter SHALL reject a `MEMORY_POOL_FRACTION` value that is not a number greater than 0 and at most 1, expecting `a number greater than 0 and at most 1`, so `60` and `0` fail and `1` passes
 * *AND* the adapter SHALL reject a `DATAFUSION_THREADING_MODE` value other than `AUTO` or `FIXED`, expecting `AUTO or FIXED`, and an `ALLOW_HTTP` value other than `TRUE` or `FALSE`, expecting `TRUE or FALSE`, each compared without regard to case
+
+### Scenario: A whole-number tuning value is checked against the range of its type
+
+* *GIVEN* a `createVirtualSchema`, `refresh`, or `setProperties` request whose effective properties hold a whole-number tuning property with a non-empty value
+* *WHEN* the adapter checks the value
+* *THEN* the adapter SHALL accept only a whole number in the property's range: `PARALLELISM_FACTOR` from 1 to 255; `DATAFUSION_THREADS_PER_UDF`, `DATAFUSION_TARGET_PARTITIONS`, and `S3_MAX_CONNECTIONS` from 1 to 65535; `INSTANCE_OVERHEAD_MB` from 0 to 65535; `DATAFUSION_BATCH_SIZE` from 1 to 4294967295; and `JOIN_BROADCAST_MAX_BYTES` from 1 to 18446744073709551615
+* *AND* the adapter SHALL reject every other value with the expectation `a whole number from <minimum> to <maximum>`, so `DATAFUSION_THREADS_PER_UDF = '100000'` fails with `expected a whole number from 1 to 65535`
+* *AND* a value too large for the range, however many digits it has, SHALL fail with that same expectation
+* *AND* `S3_MAX_CONNECTIONS = 'AUTO'` and `S3_MAX_CONNECTIONS = '0'` SHALL fail, because only an absent property selects the derived budget of `scan-runtime/scan-execution-connection-concurrency`
 
 ### Scenario: A tuning value is checked on its own and never replaced by its default
 
@@ -56,7 +65,7 @@
 * *GIVEN* a `createVirtualSchema` request with the properties `CATALOG_CONNECTION = '<conn>'`, `NAMESPCE = 'sales'`, `PARALLELISM_FACTR = '64'`, `DATAFUSION_BATCH_SIZE = 'abc'`, and `MADE_UP_PROPERTY = 'x'`
 * *WHEN* the adapter receives the request
 * *THEN* the request SHALL fail with one error whose message starts with `invalid virtual schema properties: ` and lists every problem, separated by `; `
-* *AND* the error SHALL list the unknown names first and the invalid values second, each group in alphabetical order of the property name, so the message reads `invalid virtual schema properties: unknown property 'MADE_UP_PROPERTY'; unknown property 'NAMESPCE' (did you mean 'NAMESPACE'?); unknown property 'PARALLELISM_FACTR' (did you mean 'PARALLELISM_FACTOR'?); invalid value 'abc' for 'DATAFUSION_BATCH_SIZE': expected a whole number of at least 1`
+* *AND* the error SHALL list the unknown names first and the invalid values second, each group in alphabetical order of the property name, so the message reads `invalid virtual schema properties: unknown property 'MADE_UP_PROPERTY'; unknown property 'NAMESPCE' (did you mean 'NAMESPACE'?); unknown property 'PARALLELISM_FACTR' (did you mean 'PARALLELISM_FACTOR'?); invalid value 'abc' for 'DATAFUSION_BATCH_SIZE': expected a whole number from 1 to 4294967295`
 
 ### Scenario: A misspelled required property reports the misspelling
 

@@ -20,7 +20,7 @@ The adapter records the computed resource budgets in the `createVirtualSchema` r
 * *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
 * *THEN* the adapter SHALL record the supplied parallelism factor in the `createVirtualSchema` response's `adapterNotes` (stringified JSON)
 * *AND* when the `PARALLELISM_FACTOR` property is absent or empty the adapter SHALL default the parallelism factor to `1`, persisting it nowhere other than that returned `adapterNotes`
-* *AND* a value that is not a positive integer SHALL fail the request per `vs-adapter/property-validation`, and the adapter MUST NOT default it to `1`
+* *AND* a value outside the range `vs-adapter/property-validation` gives the property SHALL fail the request, and the adapter MUST NOT default it to `1`
 <!-- /DELTA:CHANGED -->
 
 <!-- DELTA:CHANGED -->
@@ -43,7 +43,7 @@ The adapter records the computed resource budgets in the `createVirtualSchema` r
 * *THEN* the adapter SHALL record the resolved DataFusion target partition count in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `PARALLELISM_FACTOR` and the threading mode
 * *AND* in `FIXED` mode the adapter SHALL use the supplied `DATAFUSION_TARGET_PARTITIONS` value, and SHALL fall back to the `AUTO` value when the property is absent or empty
 * *AND* in `AUTO` mode the adapter SHALL set the target partition count to `2 × nr_of_cores` (per `scan-runtime/scan-execution-threading`), ignoring any supplied `DATAFUSION_TARGET_PARTITIONS` value, persisting the count nowhere other than that returned `adapterNotes`
-* *AND* in either mode a value that is not a positive integer SHALL fail the request per `vs-adapter/property-validation`
+* *AND* in either mode a value outside the range `vs-adapter/property-validation` gives the property SHALL fail the request
 <!-- /DELTA:CHANGED -->
 
 <!-- DELTA:CHANGED -->
@@ -55,7 +55,7 @@ The adapter records the computed resource budgets in the `createVirtualSchema` r
 * *THEN* the adapter SHALL record the resolved DataFusion threads-per-UDF count in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `PARALLELISM_FACTOR`, the threading mode, and the DataFusion target partition count
 * *AND* in `FIXED` mode the adapter SHALL use the supplied `DATAFUSION_THREADS_PER_UDF` value, and SHALL fall back to the `AUTO` value when the property is absent or empty
 * *AND* in `AUTO` mode the adapter SHALL set the threads-per-UDF count to `nr_of_cores`, which yields `1` for the single core the unavailable-detection case produces, persisting the count nowhere other than that returned `adapterNotes`
-* *AND* in either mode a value that is not a positive integer SHALL fail the request per `vs-adapter/property-validation`
+* *AND* in either mode a value outside the range `vs-adapter/property-validation` gives the property SHALL fail the request
 <!-- /DELTA:CHANGED -->
 
 <!-- DELTA:CHANGED -->
@@ -76,6 +76,6 @@ The adapter records the computed resource budgets in the `createVirtualSchema` r
 * *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
 * *THEN* the adapter SHALL record the resolved instance-overhead megabytes in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `PARALLELISM_FACTOR`, the DataFusion threading entries, and the memory-pool fraction
 * *AND* the adapter SHALL default the instance-overhead megabytes to `200` when the `INSTANCE_OVERHEAD_MB` property is absent or empty
-* *AND* the adapter SHALL use the supplied value when it is a non-negative integer, persisting the overhead nowhere other than that returned `adapterNotes`
+* *AND* the adapter SHALL use the supplied value when it is in the range `vs-adapter/property-validation` gives the property, persisting the overhead nowhere other than that returned `adapterNotes`
 * *AND* any other value SHALL fail the request per `vs-adapter/property-validation`, and the adapter MUST NOT default it to `200`
 <!-- /DELTA:CHANGED -->
