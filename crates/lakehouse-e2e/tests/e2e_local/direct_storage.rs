@@ -1649,6 +1649,7 @@ fn discovery_scopes_to_first_level_directories_and_namespace_narrows_to_a_subtre
     );
 }
 
+/// Scenario: An unparseable MERGE_SCHEMA or HIVE_PARTITIONING value is rejected, never defaulted
 #[test]
 fn malformed_connections_are_rejected_at_create_virtual_schema() {
     setup();
@@ -1751,7 +1752,35 @@ fn malformed_connections_are_rejected_at_create_virtual_schema() {
         BASE_DISCOVERY,
         &direct_storage_password(),
     );
-    error_text(&resp, "CREATE with MERGE_SCHEMA = 'NOTABOOL'");
+    let msg = error_text(&resp, "CREATE with MERGE_SCHEMA = 'NOTABOOL'");
+    assert_mentions(
+        &msg,
+        &["'MERGE_SCHEMA' value 'NOTABOOL'", "'TRUE' and 'FALSE'"],
+    );
+    assert!(
+        !msg.contains("invalid virtual schema properties:"),
+        "MERGE_SCHEMA is checked by its own feature, not the property catalog: {msg}"
+    );
+
+    let resp = try_create_virtual_schema_with_password(
+        &mut conn,
+        &direct_vs(
+            "REJECTS_HIVE_PARTITIONING",
+            "DIRECT_STORAGE_BAD_HIVE_PARTITIONING_CREDS",
+        )
+        .with_hive_partitioning("NOTABOOL"),
+        BASE_DISCOVERY,
+        &direct_storage_password(),
+    );
+    let msg = error_text(&resp, "CREATE with HIVE_PARTITIONING = 'NOTABOOL'");
+    assert_mentions(
+        &msg,
+        &["'HIVE_PARTITIONING' value 'NOTABOOL'", "'TRUE' and 'FALSE'"],
+    );
+    assert!(
+        !msg.contains("invalid virtual schema properties:"),
+        "HIVE_PARTITIONING is checked by its own feature, not the property catalog: {msg}"
+    );
 }
 
 #[test]

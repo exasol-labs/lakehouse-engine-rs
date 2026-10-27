@@ -142,6 +142,7 @@ fn telemetry_silent_at_default_level() {
     );
 }
 
+/// Scenario: Enabling telemetry emits the three phase timings for a completed scan
 #[test]
 fn telemetry_reports_three_phases_when_enabled() {
     let _g = lock();

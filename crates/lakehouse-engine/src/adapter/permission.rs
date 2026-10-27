@@ -2,6 +2,7 @@
 //! and the gate that authorizes a request's tables. No other module names the template engine.
 
 use crate::adapter::catalog_kind::CatalogKind;
+use crate::adapter::properties::{PERMISSION_CHECK, USER_MAPPING};
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{
     CatalogSession, ConnectionCreds, TableReadDecision, lakekeeper_batch_check,
@@ -10,8 +11,6 @@ use lakehouse_catalog::{
 use minijinja::{AutoEscape, Environment, UndefinedBehavior, context};
 use serde_json::Value as Json;
 
-pub(super) const PERMISSION_CHECK: &str = "PERMISSION_CHECK";
-pub(super) const USER_MAPPING: &str = "USER_MAPPING";
 const LAKEKEEPER: &str = "LAKEKEEPER";
 /// The largest planned template renders in 19 units, a 5,000-entry lookup table in 8.
 const RENDER_FUEL: u64 = 100_000;

@@ -1,8 +1,6 @@
+use super::properties::PROP_CATALOG_KIND;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-
-// Read from plain VS properties, never the CONNECTION password JSON. Absent means Iceberg REST.
-const PROP_CATALOG_KIND: &str = "CATALOG_KIND";
 
 const CATALOG_KIND_UNITY_CATALOG: &str = "UNITY_CATALOG";
 

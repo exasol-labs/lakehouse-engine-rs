@@ -28,6 +28,7 @@ Project specifics:
 - New features are tracked as GitHub issues. A human opens the issue, agents do not. Reference it in the implementing commit (`Closes #<n>`). If no issue exists, ask for one.
 - PR titles follow Conventional Commits, `<type>(<scope>): <description>`, with type one of `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `perf`. The title describes the final state of the change. A plan-only PR for a new feature is still `feat(...)`.
 - A plan that touches scanning, pushdown, or schema and type handling is checked against the governing Iceberg table spec or Delta Lake protocol. Quote the normative section. Fix each deviation in the same plan, or record it in the spec delta as a scoped exception. A deviation forced by an Exasol type limit (no struct, list, or map) is a named trade-off, not a gap.
+- A removed property, option, or note key leaves no trace. No spec step, test, or doc names it.
 - Planning never opens GitHub issues. Cite an existing issue as `(#83)`, otherwise mark `(#TBD)` and list it as an open question.
 
 ## Code style
@@ -51,7 +52,7 @@ Project specifics:
 
 Read `specs/udf-context.md` before changing the shard count or fan-out shape.
 
-- Groups drive UDF invocations, not OS processes. A SET script's groups multiplex onto a per-node VM pool sized to `NR_OF_CORES`, but the scalar `LAKEHOUSE_SCAN` gets one VM per node, which scans that node's shards one after another. Per-node CPU parallelism comes from DataFusion threads, so `AUTO` sizes threads to the node's cores and `PARALLELISM_FACTOR` defaults to 1.
+- Groups drive UDF invocations, not OS processes. A SET script's groups multiplex onto a per-node VM pool sized to the node's core count, but the scalar `LAKEHOUSE_SCAN` gets one VM per node, which scans that node's shards one after another. Per-node CPU parallelism comes from DataFusion threads, so `AUTO` sizes threads to the node's cores and `PARALLELISM_FACTOR` defaults to 1.
 - Never shard on `IPROC()`. Shard on `GROUP BY shard_key` with `G = node_count × parallelism_factor`, capped at 300 (Exasol's `max_dynamic_group_count`). At or below 300 groups are distributed round-robin, above it they are hash-partitioned and unbalanced. Clamp G to between 1 and the file count. Read the node count from `ctx.node_count()`.
 - `ctx.memory_limit()` returns the per-instance limit in bytes (`0` means unknown). The engine stalls new VMs at 80% of it, so size the DataFusion memory pool to about 0.6 of it.
 - Stream DataFusion results one `RecordBatch` at a time and drop each batch before fetching the next. The raw scan path calls `ctx.emit_batch(&batch)`, and the partial-aggregate path converts its single row to `Vec<Value>` and calls `ctx.emit`.

@@ -1,4 +1,9 @@
 use super::*;
+use crate::adapter::properties::{
+    PROP_DF_BATCH_SIZE, PROP_DF_TARGET_PARTITIONS, PROP_DF_THREADING_MODE, PROP_DF_THREADS_PER_UDF,
+    PROP_INSTANCE_OVERHEAD_MB, PROP_JOIN_BROADCAST_MAX_BYTES, PROP_MEMORY_POOL_FRACTION,
+    PROP_PARALLELISM_FACTOR, PROP_S3_MAX_CONNECTIONS,
+};
 use crate::adapter::pushdown::test_support::{named_table, with_identifier_notes};
 use exasol_udf_sdk::test_support::{DefaultsCtx, TestContext};
 use lakehouse_catalog::{CatalogTableIdent, SkipReason, TableFormat};
@@ -46,6 +51,141 @@ fn refresh_and_set_properties_dispatched_not_unsupported() {
             "{req_type} must not be rejected as an unsupported request type, got: {err}"
         );
     }
+}
+
+fn schema_request(request_type: &str, properties: serde_json::Value) -> Json {
+    match request_type {
+        "setProperties" => serde_json::json!({ "type": request_type, "properties": properties }),
+        _ => serde_json::json!({
+            "type": request_type,
+            "schemaMetadataInfo": { "properties": properties },
+        }),
+    }
+}
+
+fn checked(props: serde_json::Value) -> TuningProperties {
+    check_properties(&props).unwrap_or_else(|e| panic!("{props} must pass the check: {e}"))
+}
+
+fn resolved_tuning(props: serde_json::Value, nr_of_cores: u32) -> TuningNotes {
+    resolve_tuning_notes(&checked(props), nr_of_cores)
+}
+
+#[test]
+fn an_unknown_property_name_fails_every_schema_request_before_the_connection_is_read() {
+    for request_type in ["createVirtualSchema", "refresh", "setProperties"] {
+        let request = schema_request(
+            request_type,
+            serde_json::json!({
+                PROP_CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
+                "NAMESPCE": "sales",
+            }),
+        );
+
+        let err = dispatch(&mut TestContext::scalar(vec![]), &request)
+            .expect_err("an unknown property name must fail the request");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown property 'NAMESPCE' (did you mean 'NAMESPACE'?)"),
+            "{request_type}: {message}"
+        );
+        assert!(
+            !message.contains("NO_SUCH_CONNECTION"),
+            "{request_type} must fail before it reads the CONNECTION: {message}"
+        );
+    }
+}
+
+#[test]
+fn a_misspelled_required_property_is_reported_instead_of_the_missing_one() {
+    let request = schema_request(
+        "createVirtualSchema",
+        serde_json::json!({ "CATALOG_CONECTION": "MY_CONN", PROP_NAMESPACE: "sales" }),
+    );
+
+    let message = dispatch(&mut TestContext::scalar(vec![]), &request)
+        .expect_err("a misspelled CATALOG_CONNECTION must fail")
+        .to_string();
+
+    assert!(
+        message
+            .contains("unknown property 'CATALOG_CONECTION' (did you mean 'CATALOG_CONNECTION'?)"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("CATALOG_CONNECTION is required"),
+        "the name check precedes the required-property check: {message}"
+    );
+}
+
+#[test]
+fn an_invalid_tuning_value_fails_every_schema_request_before_the_connection_is_read() {
+    for request_type in ["createVirtualSchema", "refresh", "setProperties"] {
+        let request = schema_request(
+            request_type,
+            serde_json::json!({
+                PROP_CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
+                PROP_DF_BATCH_SIZE: "0",
+            }),
+        );
+
+        let message = dispatch(&mut TestContext::scalar(vec![]), &request)
+            .expect_err("an invalid tuning value must fail the request")
+            .to_string();
+
+        assert!(
+            message.contains(
+                "invalid value '0' for 'DATAFUSION_BATCH_SIZE': expected a whole number from 1 to 4294967295"
+            ),
+            "{request_type}: {message}"
+        );
+    }
+}
+
+#[test]
+fn a_set_properties_null_unsets_an_invalid_value_before_the_check() {
+    let request = serde_json::json!({
+        "type": "setProperties",
+        "properties": { PROP_DF_BATCH_SIZE: null },
+        "schemaMetadataInfo": { "properties": { PROP_DF_BATCH_SIZE: "0", "PV_MADE_UP": "x" } },
+    });
+
+    let message = dispatch(&mut TestContext::scalar(vec![]), &request)
+        .expect_err("the stray name is still unknown")
+        .to_string();
+
+    assert!(
+        message.contains("unknown property 'PV_MADE_UP'"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("DATAFUSION_BATCH_SIZE"),
+        "a null removes the invalid value from the effective properties: {message}"
+    );
+}
+
+#[test]
+fn a_pushdown_never_runs_the_property_check() {
+    let request = serde_json::json!({
+        "type": "pushdown",
+        "schemaMetadataInfo": {
+            "properties": {
+                PROP_CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
+                "NAMESPCE": "sales",
+                PROP_DF_BATCH_SIZE: "0",
+            },
+        },
+    });
+
+    let message = dispatch(&mut TestContext::scalar(vec![]), &request)
+        .expect_err("the CONNECTION does not exist")
+        .to_string();
+
+    assert!(
+        !message.contains("invalid virtual schema properties"),
+        "a pushdown reads the properties it needs and checks no other: {message}"
+    );
 }
 
 #[test]
@@ -158,34 +298,6 @@ fn set_properties_null_unset_required_property_errors_not_panic() {
         &req,
     )
     .expect_err("null-unsetting a required property must error, not succeed");
-
-    let expected = format!("property '{PROP_NAMESPACE}' is required");
-    assert!(
-        err.to_string().contains(&expected),
-        "expected the required-property error '{expected}', got: {err}"
-    );
-}
-
-#[test]
-fn create_virtual_schema_rejects_old_namespace_alias_without_replacement() {
-    let req = serde_json::json!({
-        "type": "createVirtualSchema",
-        "properties": {
-            "CATALOG_CONNECTION": "MY_CONN",
-            "ICEBERG_NAMESPACE": "old_ns",
-        },
-    });
-
-    let err = dispatch(
-        &mut TestContext::scalar(vec![]).with_connection(
-            "MY_CONN",
-            password_connection("http://catalog.example.com", s3_style_password()),
-        ),
-        &req,
-    )
-    .expect_err(
-        "supplying only the old ICEBERG_NAMESPACE alias must not satisfy the NAMESPACE requirement",
-    );
 
     let expected = format!("property '{PROP_NAMESPACE}' is required");
     assert!(
@@ -355,7 +467,7 @@ fn build_adapter_notes_merges_existing() {
     let req = serde_json::json!({
         "type": "refresh",
         "schemaMetadataInfo": {
-            "adapterNotes": "{\"OTHER_KEY\":\"keep-me\",\"CLUSTER_NODES\":\"1\"}"
+            "adapterNotes": "{\"OTHER_KEY\":\"keep-me\"}"
         },
     });
     let parsed = parsed_notes(&req, &TuningNotes::default(), &[]);
@@ -363,26 +475,6 @@ fn build_adapter_notes_merges_existing() {
         parsed["OTHER_KEY"].as_str(),
         Some("keep-me"),
         "pre-existing adapterNotes keys must be preserved"
-    );
-    assert_eq!(
-        parsed["CLUSTER_NODES"].as_str(),
-        Some("1"),
-        "pre-existing adapterNotes keys must be preserved, including foreign ones"
-    );
-}
-
-#[test]
-fn adapter_notes_omit_cluster_nodes() {
-    let request = serde_json::json!({"type": "createVirtualSchema"});
-    let parsed = parsed_notes(&request, &TuningNotes::default(), &[]);
-    assert!(
-        parsed.get("CLUSTER_NODES").is_none(),
-        "a freshly built createVirtualSchema response must carry no CLUSTER_NODES key"
-    );
-    assert_eq!(
-        parsed[NOTE_PARALLELISM_FACTOR].as_str(),
-        Some(DEFAULT_PARALLELISM_FACTOR.to_string().as_str()),
-        "other notes must still be recorded"
     );
 }
 
@@ -448,37 +540,24 @@ fn refresh_writes_an_identifier_note_on_every_returned_table() {
 
 #[test]
 fn create_vs_records_parallelism_factor() {
-    let props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "4" });
-    let factor = resolve_parallelism_factor(&props);
-    assert_eq!(factor, 4, "factor must be read from the property");
+    let tuning = resolved_tuning(serde_json::json!({ PROP_PARALLELISM_FACTOR: "4" }), 1);
+    assert_eq!(
+        tuning.parallelism_factor, 4,
+        "factor must be read from the property"
+    );
 
     let request = serde_json::json!({"type": "createVirtualSchema"});
-    let parsed = parsed_notes(
-        &request,
-        &TuningNotes {
-            parallelism_factor: factor,
-            ..TuningNotes::default()
-        },
-        &[],
-    );
+    let parsed = parsed_notes(&request, &tuning, &[]);
     assert_eq!(
         parsed[NOTE_PARALLELISM_FACTOR].as_str(),
         Some("4"),
         "PARALLELISM_FACTOR must be recorded in adapterNotes"
     );
 
-    let empty_props = serde_json::json!({});
-    let default_factor = resolve_parallelism_factor(&empty_props);
+    let default_factor = resolved_tuning(serde_json::json!({}), 1).parallelism_factor;
     assert_eq!(
         default_factor, DEFAULT_PARALLELISM_FACTOR,
         "must default to {DEFAULT_PARALLELISM_FACTOR} when property absent"
-    );
-
-    let zero_props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "0" });
-    let zero_factor = resolve_parallelism_factor(&zero_props);
-    assert_eq!(
-        zero_factor, DEFAULT_PARALLELISM_FACTOR,
-        "zero must fall back to default"
     );
 }
 
@@ -539,52 +618,25 @@ fn core_count_uses_the_detected_count_when_detection_succeeds() {
 #[test]
 fn default_parallelism_factor_is_one() {
     assert_eq!(
-        resolve_parallelism_factor(&serde_json::json!({})),
+        resolved_tuning(serde_json::json!({}), 1).parallelism_factor,
         1,
         "the scalar scan runs one VM per node, so one shard per node is the default"
     );
 }
 
 #[test]
-fn explicit_parallelism_factor_overrides_default() {
-    let props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "5" });
-    assert_eq!(
-        resolve_parallelism_factor(&props),
-        5,
-        "explicit property must override the default"
-    );
-}
-
-#[test]
-fn df_target_partitions_falls_back_when_absent_or_invalid() {
-    for props in [
-        serde_json::json!({}),
-        serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "0" }),
-        serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "bad" }),
-    ] {
-        assert_eq!(
-            resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 3),
-            3,
-            "{props} must fall back"
-        );
-    }
-}
-
-#[test]
 fn df_target_partitions_uses_supplied_value() {
-    let props = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "4" });
-    let val = resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 0);
-    assert_eq!(val, 4, "explicit value must be returned");
+    let tuning = resolved_tuning(
+        serde_json::json!({ PROP_DF_THREADING_MODE: "FIXED", PROP_DF_TARGET_PARTITIONS: "4" }),
+        8,
+    );
+    assert_eq!(
+        tuning.df_target_partitions, 4,
+        "explicit value must be returned"
+    );
 
     let req = serde_json::json!({"type": "createVirtualSchema"});
-    let parsed = parsed_notes(
-        &req,
-        &TuningNotes {
-            df_target_partitions: val,
-            ..TuningNotes::default()
-        },
-        &[],
-    );
+    let parsed = parsed_notes(&req, &tuning, &[]);
     assert_eq!(
         parsed[NOTE_DF_TARGET_PARTITIONS].as_str(),
         Some("4"),
@@ -594,33 +646,20 @@ fn df_target_partitions_uses_supplied_value() {
 
 #[test]
 fn df_batch_size_uses_supplied_value() {
-    let props = serde_json::json!({ PROP_DF_BATCH_SIZE: "4096" });
-    let val = resolve_df_batch_size(&props);
-    assert_eq!(val, 4096, "explicit DATAFUSION_BATCH_SIZE must be returned");
-
-    let zero_props = serde_json::json!({ PROP_DF_BATCH_SIZE: "0" });
+    let tuning = resolved_tuning(serde_json::json!({ PROP_DF_BATCH_SIZE: "4096" }), 1);
     assert_eq!(
-        resolve_df_batch_size(&zero_props),
-        1,
-        "DATAFUSION_BATCH_SIZE=0 must be clamped to 1"
+        tuning.df_batch_size, 4096,
+        "explicit DATAFUSION_BATCH_SIZE must be returned"
     );
 
-    let absent = serde_json::json!({});
     assert_eq!(
-        resolve_df_batch_size(&absent),
+        resolved_tuning(serde_json::json!({}), 1).df_batch_size,
         DEFAULT_DF_BATCH_SIZE,
         "absent property must return DEFAULT_DF_BATCH_SIZE (8192)"
     );
 
     let req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
-        &req,
-        &TuningNotes {
-            df_batch_size: val,
-            ..TuningNotes::default()
-        },
-        &SkippedTables::default(),
-    );
+    let notes = build_adapter_notes(&req, &tuning, &SkippedTables::default());
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
     let pushdown_req = serde_json::json!({
@@ -635,35 +674,18 @@ fn df_batch_size_uses_supplied_value() {
 }
 
 #[test]
-fn df_threads_per_udf_falls_back_when_absent_or_invalid() {
-    for props in [
-        serde_json::json!({}),
-        serde_json::json!({ PROP_DF_THREADS_PER_UDF: "0" }),
-        serde_json::json!({ PROP_DF_THREADS_PER_UDF: "bad" }),
-    ] {
-        assert_eq!(
-            resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 3),
-            3,
-            "{props} must fall back"
-        );
-    }
-}
-
-#[test]
 fn df_threads_per_udf_uses_supplied_value() {
-    let props = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "2" });
-    let val = resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 0);
-    assert_eq!(val, 2, "explicit value must be returned");
+    let tuning = resolved_tuning(
+        serde_json::json!({ PROP_DF_THREADING_MODE: "FIXED", PROP_DF_THREADS_PER_UDF: "2" }),
+        8,
+    );
+    assert_eq!(
+        tuning.df_threads_per_udf, 2,
+        "explicit value must be returned"
+    );
 
     let req = serde_json::json!({"type": "createVirtualSchema"});
-    let parsed = parsed_notes(
-        &req,
-        &TuningNotes {
-            df_threads_per_udf: val,
-            ..TuningNotes::default()
-        },
-        &[],
-    );
+    let parsed = parsed_notes(&req, &tuning, &[]);
     assert_eq!(
         parsed[NOTE_DF_THREADS_PER_UDF].as_str(),
         Some("2"),
@@ -672,93 +694,39 @@ fn df_threads_per_udf_uses_supplied_value() {
 }
 
 #[test]
-fn resolve_memory_pool_fraction_defaults_and_validates() {
-    let absent = serde_json::json!({});
+fn resolve_memory_pool_fraction_defaults_and_reads_the_supplied_value() {
     assert_eq!(
-        resolve_memory_pool_fraction(&absent),
+        resolved_tuning(serde_json::json!({}), 1).memory_pool_fraction,
         DEFAULT_MEMORY_POOL_FRACTION,
         "absent → default 0.6"
     );
 
-    let empty = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "" });
-    assert_eq!(
-        resolve_memory_pool_fraction(&empty),
-        DEFAULT_MEMORY_POOL_FRACTION,
-        "empty → default 0.6"
-    );
+    let valid = resolved_tuning(serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "0.5" }), 1);
+    assert_eq!(valid.memory_pool_fraction, 0.5);
 
-    let zero = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "0" });
-    assert_eq!(
-        resolve_memory_pool_fraction(&zero),
-        DEFAULT_MEMORY_POOL_FRACTION,
-        "\"0\" is out of range → default 0.6"
-    );
-
-    let too_large = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "1.5" });
-    assert_eq!(
-        resolve_memory_pool_fraction(&too_large),
-        DEFAULT_MEMORY_POOL_FRACTION,
-        "\"1.5\" is out of range → default 0.6"
-    );
-
-    let valid = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "0.5" });
-    assert_eq!(
-        resolve_memory_pool_fraction(&valid),
-        0.5,
-        "\"0.5\" must be accepted"
-    );
-
-    let one = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "1.0" });
-    assert_eq!(
-        resolve_memory_pool_fraction(&one),
-        1.0,
-        "\"1.0\" is exactly at the upper bound and must be accepted"
-    );
+    let one = resolved_tuning(serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "1.0" }), 1);
+    assert_eq!(one.memory_pool_fraction, 1.0);
 }
 
 #[test]
-fn resolve_instance_overhead_mb_defaults_and_validates() {
-    let absent = serde_json::json!({});
+fn resolve_instance_overhead_mb_defaults_and_reads_the_supplied_value() {
     assert_eq!(
-        resolve_instance_overhead_mb(&absent),
+        resolved_tuning(serde_json::json!({}), 1).instance_overhead_mb,
         DEFAULT_INSTANCE_OVERHEAD_MB,
         "absent → default 200"
     );
 
-    let empty = serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "" });
-    assert_eq!(
-        resolve_instance_overhead_mb(&empty),
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        "empty → default 200"
-    );
+    let zero = resolved_tuning(serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "0" }), 1);
+    assert_eq!(zero.instance_overhead_mb, 0, "\"0\" is a valid overhead");
 
-    let zero = serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "0" });
-    assert_eq!(
-        resolve_instance_overhead_mb(&zero),
-        0,
-        "\"0\" is a valid overhead (zero)"
-    );
-
-    let valid = serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "256" });
-    assert_eq!(
-        resolve_instance_overhead_mb(&valid),
-        256,
-        "\"256\" must be returned as-is"
-    );
-
-    let garbage = serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "not-a-number" });
-    assert_eq!(
-        resolve_instance_overhead_mb(&garbage),
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        "unparseable value → default 200"
-    );
+    let valid = resolved_tuning(serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "256" }), 1);
+    assert_eq!(valid.instance_overhead_mb, 256);
 }
 
 #[test]
-fn resolve_join_broadcast_max_bytes_defaults_and_validates() {
-    let absent = serde_json::json!({});
+fn resolve_join_broadcast_max_bytes_defaults_and_reads_the_supplied_value() {
     assert_eq!(
-        resolve_join_broadcast_max_bytes(&absent),
+        resolved_tuning(serde_json::json!({}), 1).join_broadcast_max_bytes,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
         "absent → default 128 MiB"
     );
@@ -767,40 +735,11 @@ fn resolve_join_broadcast_max_bytes_defaults_and_validates() {
         "default must be exactly 128 MiB"
     );
 
-    let empty = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "" });
-    assert_eq!(
-        resolve_join_broadcast_max_bytes(&empty),
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        "empty → default 128 MiB"
+    let valid = resolved_tuning(
+        serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "67108864" }),
+        1,
     );
-
-    let valid = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "67108864" });
-    assert_eq!(
-        resolve_join_broadcast_max_bytes(&valid),
-        67_108_864,
-        "\"67108864\" (64 MiB) must be parsed as-is"
-    );
-
-    let garbage = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "not-a-number" });
-    assert_eq!(
-        resolve_join_broadcast_max_bytes(&garbage),
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        "unparseable value → default 128 MiB"
-    );
-
-    let zero = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "0" });
-    assert_eq!(
-        resolve_join_broadcast_max_bytes(&zero),
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        "\"0\" is not positive → default 128 MiB"
-    );
-
-    let negative = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "-1" });
-    assert_eq!(
-        resolve_join_broadcast_max_bytes(&negative),
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        "\"-1\" is negative (unparseable as u64) → default 128 MiB"
-    );
+    assert_eq!(valid.join_broadcast_max_bytes, 67_108_864);
 }
 
 #[test]
@@ -858,64 +797,32 @@ fn memory_budget_params_round_trip_through_adapter_notes() {
 }
 
 #[test]
-fn df_target_partitions_explicit_wins() {
-    let props = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "3" });
-    assert_eq!(
-        resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 8),
-        3,
-        "explicit DATAFUSION_TARGET_PARTITIONS must override the fallback"
-    );
-}
-
-#[test]
-fn df_threads_per_udf_explicit_wins() {
-    let props = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "2" });
-    assert_eq!(
-        resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 16),
-        2,
-        "explicit DATAFUSION_THREADS_PER_UDF must override the fallback"
-    );
-}
-
-#[test]
 fn threading_mode_parses_case_insensitively() {
-    assert_eq!(
-        resolve_threading_mode(&serde_json::json!({ PROP_DF_THREADING_MODE: "fixed" })),
-        ThreadingMode::Fixed,
-        "lowercase 'fixed' must parse to Fixed"
-    );
-    assert_eq!(
-        resolve_threading_mode(&serde_json::json!({ PROP_DF_THREADING_MODE: "FiXeD" })),
-        ThreadingMode::Fixed,
-        "mixed-case 'FiXeD' must parse to Fixed"
-    );
-    assert_eq!(
-        resolve_threading_mode(&serde_json::json!({ PROP_DF_THREADING_MODE: "AUTO" })),
-        ThreadingMode::Auto,
-        "'AUTO' must parse to Auto"
-    );
+    for (value, expected) in [
+        ("fixed", ThreadingMode::Fixed),
+        ("FiXeD", ThreadingMode::Fixed),
+        ("AUTO", ThreadingMode::Auto),
+    ] {
+        assert_eq!(
+            resolved_tuning(serde_json::json!({ PROP_DF_THREADING_MODE: value }), 1)
+                .df_threading_mode,
+            expected,
+            "'{value}' must parse to {expected:?}"
+        );
+    }
 }
 
 #[test]
 fn threading_mode_defaults_to_auto() {
+    let tuning = resolved_tuning(serde_json::json!({}), 1);
     assert_eq!(
-        resolve_threading_mode(&serde_json::json!({})),
+        tuning.df_threading_mode,
         ThreadingMode::Auto,
         "absent property → Auto"
     );
-    assert_eq!(
-        resolve_threading_mode(&serde_json::json!({ PROP_DF_THREADING_MODE: "" })),
-        ThreadingMode::Auto,
-        "empty property → Auto"
-    );
-    assert_eq!(
-        resolve_threading_mode(&serde_json::json!({ PROP_DF_THREADING_MODE: "garbage" })),
-        ThreadingMode::Auto,
-        "unrecognized value → Auto"
-    );
 
     let req = serde_json::json!({"type": "createVirtualSchema"});
-    let parsed = parsed_notes(&req, &TuningNotes::default(), &[]);
+    let parsed = parsed_notes(&req, &tuning, &[]);
     assert_eq!(
         parsed[NOTE_DF_THREADING_MODE].as_str(),
         Some("AUTO"),
@@ -923,20 +830,25 @@ fn threading_mode_defaults_to_auto() {
     );
 }
 
-/// Scenario: AUTO mode gives the node's single scan instance every core
 #[test]
 fn auto_mode_uses_every_core_with_twice_as_many_partitions() {
+    let absent = resolved_tuning(serde_json::json!({}), 8);
     assert_eq!(
-        resolve_df_threading(ThreadingMode::Auto, &serde_json::json!({}), 8),
+        (absent.df_target_partitions, absent.df_threads_per_udf),
         (16, 8),
         "8 cores → 8 threads, 16 target partitions"
     );
+
+    let supplied = resolved_tuning(
+        serde_json::json!({
+            PROP_DF_THREADING_MODE: "AUTO",
+            PROP_DF_TARGET_PARTITIONS: "99",
+            PROP_DF_THREADS_PER_UDF: "99",
+        }),
+        8,
+    );
     assert_eq!(
-        resolve_df_threading(
-            ThreadingMode::Auto,
-            &serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "99", PROP_DF_THREADS_PER_UDF: "99" }),
-            8,
-        ),
+        (supplied.df_target_partitions, supplied.df_threads_per_udf),
         (16, 8),
         "AUTO ignores supplied values"
     );
@@ -945,27 +857,33 @@ fn auto_mode_uses_every_core_with_twice_as_many_partitions() {
 /// Scenario: AUTO mode yields a single thread on a one-core node
 #[test]
 fn auto_mode_yields_one_thread_on_one_core() {
+    let tuning = resolved_tuning(serde_json::json!({}), 1);
     assert_eq!(
-        resolve_df_threading(ThreadingMode::Auto, &serde_json::json!({}), 1),
+        (tuning.df_target_partitions, tuning.df_threads_per_udf),
         (2, 1),
         "one core → 1 thread, 2 target partitions"
     );
 }
 
-/// Scenario: FIXED mode uses the operator-supplied thread and partition values verbatim
 #[test]
 fn fixed_mode_uses_supplied_values() {
-    let props = serde_json::json!({
-        PROP_DF_TARGET_PARTITIONS: "3",
-        PROP_DF_THREADS_PER_UDF: "2",
-    });
+    let supplied = resolved_tuning(
+        serde_json::json!({
+            PROP_DF_THREADING_MODE: "FIXED",
+            PROP_DF_TARGET_PARTITIONS: "3",
+            PROP_DF_THREADS_PER_UDF: "2",
+        }),
+        16,
+    );
     assert_eq!(
-        resolve_df_threading(ThreadingMode::Fixed, &props, 16),
+        (supplied.df_target_partitions, supplied.df_threads_per_udf),
         (3, 2),
         "FIXED uses supplied values verbatim"
     );
+
+    let absent = resolved_tuning(serde_json::json!({ PROP_DF_THREADING_MODE: "FIXED" }), 8);
     assert_eq!(
-        resolve_df_threading(ThreadingMode::Fixed, &serde_json::json!({}), 8),
+        (absent.df_target_partitions, absent.df_threads_per_udf),
         (16, 8),
         "absent values fall back to the AUTO values"
     );
@@ -1286,32 +1204,27 @@ fn an_all_skipped_namespace_creates_an_empty_schema_recording_every_skip() {
 
 #[test]
 fn resolve_s3_max_connections_fixed_value_wins() {
-    let props = serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "64" });
     assert_eq!(
-        resolve_s3_max_connections(&props, 8),
+        resolved_tuning(serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "64" }), 8).s3_max_connections,
         64,
         "explicit S3_MAX_CONNECTIONS must be used verbatim"
     );
 }
 
-/// Scenario: AUTO derivation sizes the per-instance budget from the resolved thread count
+/// Scenario: AUTO derivation yields the single-core budget when the core count cannot be detected
 #[test]
 fn resolve_s3_max_connections_auto_scales_with_threads() {
-    for props in [
-        serde_json::json!({}),
-        serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "" }),
-        serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "0" }),
-        serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "not-a-number" }),
-        serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "-4" }),
-    ] {
-        assert_eq!(
-            resolve_s3_max_connections(&props, 2),
-            2 * S3_CONNECTIONS_PER_THREAD,
-            "{props} must derive from the resolved threads"
-        );
-    }
+    let two_threads_on_eight_cores = resolved_tuning(
+        serde_json::json!({ PROP_DF_THREADING_MODE: "FIXED", PROP_DF_THREADS_PER_UDF: "2" }),
+        8,
+    );
     assert_eq!(
-        resolve_s3_max_connections(&serde_json::json!({}), 1),
+        two_threads_on_eight_cores.s3_max_connections,
+        2 * S3_CONNECTIONS_PER_THREAD,
+        "an absent value derives from the resolved threads, not the cores"
+    );
+    assert_eq!(
+        resolved_tuning(serde_json::json!({}), 1).s3_max_connections,
         S3_CONNECTIONS_PER_THREAD
     );
 }

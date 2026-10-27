@@ -26,7 +26,7 @@ for c in "${configs[@]}"; do
   rc=$?
   if [ $rc -ne 0 ]; then echo "  RUN FAILED rc=$rc (see /tmp/lh-pf-sweep-$label.log)" | tee -a "$OUT"; fi
   extract_target_queries "/tmp/lh-pf-sweep-$label.log" | tee -a "$OUT"
-  grep -E "CLUSTER_NODES|9001|fingerprint|VM crashed|^  FAIL" "/tmp/lh-pf-sweep-$label.log" | tee -a "$OUT"
+  grep -E "9001|fingerprint|VM crashed|^  FAIL" "/tmp/lh-pf-sweep-$label.log" | tee -a "$OUT"
   echo | tee -a "$OUT"
 done
 echo "=== SWEEP DONE (report: ${OUT}) ===" | tee -a "$OUT"

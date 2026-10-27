@@ -4,28 +4,31 @@
 
 # Parameters & Telemetry
 
-This page lists every property and shows how to see what a scan does. Set these properties on the `CREATE VIRTUAL SCHEMA` statement from [Install](install.md). Run the [Benchmark](benchmark.md) suite to find the best values for your workload. For the architectural meaning of the values, see [Architecture](architecture.md).
+This page lists every property and shows how to see what a scan does. Set these properties on the `CREATE VIRTUAL SCHEMA` statement from [Install](install.md), and change them with `ALTER VIRTUAL SCHEMA ... SET`. Run the [Benchmark](benchmark.md) suite to find the best values for your workload. For the architectural meaning of the values, see [Architecture](architecture.md).
 
 ## Parameters
 
-All properties belong to `CREATE VIRTUAL SCHEMA` unless the table says otherwise. Each value is fixed at `CREATE VIRTUAL SCHEMA` time. To change one value, you must recreate the VS.
+`CREATE VIRTUAL SCHEMA`, `ALTER VIRTUAL SCHEMA ... SET`, and `ALTER VIRTUAL SCHEMA ... REFRESH` fail on an unknown property name or an invalid value. One error names each problem and suggests the nearest known name for a close misspelling, for example `unknown property 'NAMESPCE' (did you mean 'NAMESPACE'?)`. Names are case-sensitive. `CREATE VIRTUAL SCHEMA` rejects an empty or `null` value. `ALTER VIRTUAL SCHEMA ... SET <name> = ''` or `SET <name> = null` removes the property, which then takes its default. To change a value, run `ALTER VIRTUAL SCHEMA ... SET`. A `REFRESH` re-reads the properties too.
 
-| Property | Required | Default | Effect |
-|---|---|---|---|
-| `CATALOG_CONNECTION` | yes | — | Name of the Exasol CONNECTION that holds the catalog URI + credentials JSON. See [Install](install.md). |
-| `CATALOG_KIND` | no | absent (Iceberg REST) | Which catalog backend to resolve against. Leave it absent for an Iceberg REST catalog, or set `'UNITY_CATALOG'`, `'GLUE'`, or `'DIRECT_STORAGE'`. Any other value, including the literal `'ICEBERG_REST'`, is rejected. See [Catalogs](catalogs.md). |
-| `NAMESPACE` | yes | — | Catalog namespace: dot-delimited Iceberg namespace segments under `ICEBERG_REST`, or `catalog.schema` under `UNITY_CATALOG`. Every table in the namespace becomes a virtual table. |
-| `ALLOW_HTTP` | no | `false` | `'true'` permits plain-HTTP catalog/S3 (for example, local SeaweedFS). |
-| `PARALLELISM_FACTOR` | no | `1` | Shards per node. `G = node_count × factor`, capped 300. Exasol scans a node's shards one after another, so a higher factor adds per-shard startup, not concurrency. |
-| `DATAFUSION_THREADING_MODE` | no | `AUTO` | `AUTO` uses the detected core count as threads and twice that as target partitions. `FIXED` uses the two properties below verbatim. |
-| `DATAFUSION_THREADS_PER_UDF` | no | detected core count | Tokio worker threads per UDF instance. `FIXED` mode only. `1` = single-threaded. |
-| `DATAFUSION_TARGET_PARTITIONS` | no | 2 × detected core count | DataFusion `target_partitions` per instance (`FIXED` mode only). Partitions beyond threads overlap object-store reads with decoding. |
-| `DATAFUSION_BATCH_SIZE` | no | `8192` | Rows per Arrow `RecordBatch`. It bounds the out-of-pool decode working set. |
-| `MEMORY_POOL_FRACTION` | no | `0.6` | Fraction of the per-instance memory limit given to the DataFusion pool. Kept < the engine's 80 % stall threshold. |
-| `INSTANCE_OVERHEAD_MB` | no | `200` | Per-instance overhead subtracted from the reported limit before the pool fraction applies. |
-| `S3_MAX_CONNECTIONS` | no | `AUTO` | Object-store HTTP connection-pool budget per scan instance. `AUTO` derives the value from the resolved thread count. See below. |
-| `JOIN_BROADCAST_MAX_BYTES` | no | `134217728` (128 MiB) | Byte-size threshold from each side's total resolved file size, with no Parquet read. The size comes from the Iceberg manifest's `file_size_in_bytes`, the Delta `add` action's `size`, or, for a Parquet table (direct storage, Unity Catalog Parquet, and Glue Hive Parquet), the object size in the storage listing. Below this threshold, the engine broadcasts the smaller side of a two-table inner equi-join into every shard. Above it, the engine falls back to an unaccelerated two-scan join. |
-| `LAKEHOUSE_UDF_DEBUG_LEVEL` | no (env var) | `info` | `debug` emits per-scan phase telemetry. `info` is silent. See below. |
+| Property | Required | Default | Accepted values | Effect |
+|---|---|---|---|---|
+| `CATALOG_CONNECTION` | yes | none | Name of an Exasol CONNECTION | Holds the catalog URI and the credentials JSON. See [Install](install.md). |
+| `CATALOG_KIND` | no | absent (Iceberg REST) | `UNITY_CATALOG`, `GLUE`, `DIRECT_STORAGE`, or absent | Which catalog backend to resolve against. Leave it absent for an Iceberg REST catalog. Any other value, including the literal `'ICEBERG_REST'`, is rejected. See [Catalogs](catalogs.md). |
+| `NAMESPACE` | yes, except under `DIRECT_STORAGE` | none | Dot-delimited namespace, or `catalog.schema` under `UNITY_CATALOG`, or, under `DIRECT_STORAGE`, a path relative to the CONNECTION address with no URI scheme and no leading `/` | Catalog namespace. Every table in the namespace becomes a virtual table. See [Direct storage](catalogs.md#direct-storage-raw-parquet-no-catalog). |
+| `ALLOW_HTTP` | no | `false` | `TRUE` or `FALSE`, any letter case | `TRUE` permits plain-HTTP catalog and S3 access (for example, local SeaweedFS). |
+| `PARALLELISM_FACTOR` | no | `1` | Whole number, 1 to 255 | Shards per node. `G = node_count × factor`, capped at 300. Exasol scans a node's shards one after another, so a higher factor adds per-shard startup, not concurrency. |
+| `DATAFUSION_THREADING_MODE` | no | `AUTO` | `AUTO` or `FIXED`, any letter case | `AUTO` uses the detected core count as threads and twice that as target partitions. `FIXED` uses the two properties below verbatim. |
+| `DATAFUSION_THREADS_PER_UDF` | no | detected core count | Whole number, 1 to 65535 | Tokio worker threads per UDF instance. Read in `FIXED` mode only. `1` = single-threaded. |
+| `DATAFUSION_TARGET_PARTITIONS` | no | 2 × detected core count | Whole number, 1 to 65535 | DataFusion `target_partitions` per instance. Read in `FIXED` mode only. Partitions beyond threads overlap object-store reads with decoding. |
+| `DATAFUSION_BATCH_SIZE` | no | `8192` | Whole number, 1 to 4294967295 | Rows per Arrow `RecordBatch`. It bounds the out-of-pool decode working set. |
+| `MEMORY_POOL_FRACTION` | no | `0.6` | Number greater than 0 and at most 1 | Fraction of the per-instance memory limit given to the DataFusion pool. Keep it below the engine's 80 % stall threshold. |
+| `INSTANCE_OVERHEAD_MB` | no | `200` | Whole number, 0 to 65535 | Per-instance overhead subtracted from the reported limit before the pool fraction applies. |
+| `S3_MAX_CONNECTIONS` | no | absent, which derives 4 × the resolved thread count | Whole number, 1 to 65535 | Object-store HTTP connection-pool budget per scan instance. `AUTO` and `0` fail. See below. |
+| `JOIN_BROADCAST_MAX_BYTES` | no | `134217728` (128 MiB) | Whole number, 1 to 18446744073709551615 | Byte-size threshold from each side's total resolved file size, with no Parquet read. The size comes from the Iceberg manifest's `file_size_in_bytes`, the Delta `add` action's `size`, or, for a Parquet table (direct storage, Unity Catalog Parquet, and Glue Hive Parquet), the object size in the storage listing. Below this threshold, the engine broadcasts the smaller side of a two-table inner equi-join into every shard. Above it, the engine falls back to an unaccelerated two-scan join. |
+| `MERGE_SCHEMA` | no | `TRUE` | `TRUE` or `FALSE`, any letter case | Direct storage only: folds every file's footer into the declared schema, or samples one. Other catalog kinds accept and ignore it. See [Direct storage](catalogs.md#direct-storage-raw-parquet-no-catalog). |
+| `HIVE_PARTITIONING` | no | `TRUE` | `TRUE` or `FALSE`, any letter case | Direct storage only: declares `key=value` directory segments as partition columns. Other catalog kinds accept and ignore it. See [Direct storage](catalogs.md#direct-storage-raw-parquet-no-catalog). |
+| `PERMISSION_CHECK` | no | absent (off) | `LAKEKEEPER`, any letter case | Turns on the Lakekeeper permission check. It needs the Iceberg REST catalog kind and `USER_MAPPING`. See [Lakekeeper permission check](security.md#lakekeeper-permission-check). |
+| `USER_MAPPING` | with `PERMISSION_CHECK` | absent | A Jinja template with one variable, `user` | Maps the querying Exasol user to a Lakekeeper principal. Ignored while `PERMISSION_CHECK` is off. See [USER_MAPPING](security.md#user_mapping). |
 
 Create these three scripts in the same schema as `LAKEHOUSE_ADAPTER`:
 
@@ -51,13 +54,13 @@ One read path does have a hard cap. When a scan instance reads a table with dele
 
 The property says nothing about how many shards run (`PARALLELISM_FACTOR`). It also says nothing about how many CPU threads decode them (`DATAFUSION_THREADING_MODE`). Those two axes stay separate and orthogonal.
 
-- **Explicit value** — a positive integer applies verbatim (FIXED-like), for example `S3_MAX_CONNECTIONS='64'`.
-- **Absent, invalid, or `0`** — AUTO derives the budget as `threads × 4`, where `threads` is the resolved `DATAFUSION_THREADS_PER_UDF` in either threading mode. The `×4` multiplier oversubscribes the IO axis relative to the CPU axis on purpose. S3 fetches are latency-bound, so a decode thread waits on a network round-trip for most of a byte-range GET. Several requests in flight per thread hide that latency and keep the NIC busy (Little's law: fill-the-pipe concurrency ≈ bandwidth × latency). Idle pooled TCP connections are cheap relative to OS threads, so this asymmetry is deliberate.
+- **Explicit value** — a whole number from 1 to 65535 applies verbatim (FIXED-like), for example `S3_MAX_CONNECTIONS='64'`. `AUTO`, `0`, and any other value fail the statement.
+- **Absent** — AUTO derives the budget as `threads × 4`, where `threads` is the resolved `DATAFUSION_THREADS_PER_UDF` in either threading mode. The `×4` multiplier oversubscribes the IO axis relative to the CPU axis on purpose. S3 fetches are latency-bound, so a decode thread waits on a network round-trip for most of a byte-range GET. Several requests in flight per thread hide that latency and keep the NIC busy (Little's law: fill-the-pipe concurrency ≈ bandwidth × latency). Idle pooled TCP connections are cheap relative to OS threads, so this asymmetry is deliberate.
 - **Core-count detection failure** — the detected core count floors to `1`, so the same AUTO formula yields `4`.
 
 This property applies to the HTTP client of the object store, not to DataFusion. It does **not** change DataFusion's `target_partitions`. That value stays the job of the threading properties.
 
-**When to change it:** In practice this property moves throughput far less than the threading and parallelism properties above. On one production cluster, a change from `AUTO` to a value well beyond the derived default changed throughput by under 2%. The property is still legitimate to try on a deployment with a different network profile. Such a deployment is connection-churn-bound rather than latency-bound. Do not expect this property to close a gap against a native bulk-load path. Set `PARALLELISM_FACTOR` and the threading mode first.
+**When to change it:** In practice this property moves throughput far less than the threading and parallelism properties above. On one production cluster, a change from the derived budget to a value well beyond it changed throughput by under 2%. The property is still legitimate to try on a deployment with a different network profile. Such a deployment is connection-churn-bound rather than latency-bound. Do not expect this property to close a gap against a native bulk-load path. Set `PARALLELISM_FACTOR` and the threading mode first.
 
 ## Telemetry
 
@@ -69,7 +72,7 @@ costs nothing at the production `info` level.
 ```sql
 ALTER SESSION SET SCRIPT_OUTPUT_ADDRESS = '<listener-host>:<port>';
 ```
-Then build and deploy the scan script with the `LAKEHOUSE_UDF_DEBUG_LEVEL` environment variable set to `debug`. The script source carries this value as `%udf_debug_level`. The listener must be reachable **from the cluster nodes**. Use a jumphost or a private IP. A NAT'd local client cannot receive the connect-back.
+Then deploy the `LAKEHOUSE_SCAN` script with the `%udf_debug_level debug` directive in its script source. That directive is the switch. The bench variable `LAKEHOUSE_UDF_DEBUG_LEVEL` only writes it into the script source. The listener must be reachable **from the cluster nodes**. Use a jumphost or a private IP. A NAT'd local client cannot receive the connect-back.
 
 Capture it:
 ```sh

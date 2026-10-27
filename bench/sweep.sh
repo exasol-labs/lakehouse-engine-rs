@@ -24,7 +24,7 @@ for c in "${configs[@]}"; do
   env "${envargs[@]}" ./bench/run.sh > "/tmp/lh-sweep-$label.log" 2>&1
   rc=$?
   if [ $rc -ne 0 ]; then echo "  RUN FAILED rc=$rc (see /tmp/lh-sweep-$label.log)" | tee -a "$OUT"; fi
-  grep -E "^### Q|^elapsed:|CLUSTER_NODES|9001|fingerprint|VM crashed|FAIL" "/tmp/lh-sweep-$label.log" | tee -a "$OUT"
+  grep -E "^### Q|^elapsed:|9001|fingerprint|VM crashed|FAIL" "/tmp/lh-sweep-$label.log" | tee -a "$OUT"
   echo | tee -a "$OUT"
 done
 echo "=== SWEEP DONE ===" | tee -a "$OUT"

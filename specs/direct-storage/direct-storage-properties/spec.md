@@ -39,7 +39,7 @@ A `DIRECT_STORAGE` virtual schema reads three properties. `NAMESPACE` scopes whi
 * *THEN* the adapter SHALL return an error naming the property, naming the rejected value, and naming the accepted spellings
 * *AND* the adapter MUST NOT fall back to the property's default, because `MERGE_SCHEMA` decides how wide a table's declared schema is and a typo silently selecting the opposite mode returns a narrower schema rather than an error
 * *AND* an ABSENT or EMPTY value SHALL resolve to the property's default, TRUE for both, and SHALL NOT be treated as unparseable, so a virtual schema that names neither property keeps working
-* *AND* this rejection SHALL apply to these two properties only and MUST NOT change how any other virtual-schema property handles an unrecognized value
+* *AND* this check SHALL stay the only check of these two properties' values, because `vs-properties/property-name-validation` checks only their names, so an unparseable value is reported once
 * *AND* all three of this feature's properties SHALL be IGNORED rather than rejected under the Iceberg REST and the Unity Catalog kinds, even when a value is unparseable, because those kinds never read them and rejecting a property one kind ignores would make a virtual schema fail on a value nothing consumes
 
 ### Scenario: MERGE_SCHEMA selects one footer or every footer at enumeration

@@ -534,7 +534,8 @@ fn an_enforced_resolver_admits_only_the_tables_the_check_covered() {
 /// Scenario: One batch-check per query decides every table before any table is read
 #[tokio::test]
 async fn an_enforced_check_admits_an_allowed_table_and_refuses_a_denied_one() {
-    use crate::adapter::permission::{PERMISSION_CHECK, PermissionSettings, USER_MAPPING};
+    use crate::adapter::permission::PermissionSettings;
+    use crate::adapter::properties::{PERMISSION_CHECK, USER_MAPPING};
 
     let check = PermissionSettings::parse(&serde_json::json!({
         PERMISSION_CHECK: "LAKEKEEPER",
