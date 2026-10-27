@@ -138,7 +138,7 @@ fn setup() {
 fn the_base_identity_alone_is_denied_the_warehouse_bucket() {
     setup();
     let query = format!("SELECT COUNT(*) FROM {}", vs_table(VS_BASE, E2E_TABLE));
-    let msg = error_text(&exa_conn().try_execute(&query));
+    let msg = error_text(&exa_conn().try_execute(&query), &query);
     assert!(
         msg.to_ascii_lowercase().contains("accessdenied")
             || msg.to_ascii_lowercase().contains("access denied"),
@@ -198,7 +198,7 @@ fn an_unknown_role_arn_fails_create_with_access_denied() {
         &iceberg_catalog_url_internal(),
         &password,
     );
-    let msg = error_text(&resp);
+    let msg = error_text(&resp, "CREATE with an unknown role ARN");
     assert!(msg.contains("AccessDenied"), "{msg}");
     assert!(msg.contains(ASSUME_ROLE_UNKNOWN_ARN), "{msg}");
     assert!(!msg.contains(ASSUME_ROLE_BASE_SECRET_KEY), "{msg}");
@@ -217,7 +217,7 @@ fn a_user_outside_the_trust_policy_fails_create_with_access_denied() {
         &iceberg_catalog_url_internal(),
         &password,
     );
-    let msg = error_text(&resp);
+    let msg = error_text(&resp, "CREATE as a user outside the trust policy");
     assert!(msg.contains("AccessDenied"), "{msg}");
     assert!(msg.contains(ASSUME_ROLE_ARN), "{msg}");
     assert!(!msg.contains("lhadminsecret123"), "{msg}");
@@ -237,7 +237,7 @@ fn an_unreachable_sts_endpoint_fails_create_naming_the_host_without_leaking_secr
             UNREACHABLE_STS_ENDPOINT,
         ),
     );
-    let msg = error_text(&resp);
+    let msg = error_text(&resp, "CREATE with an unreachable STS endpoint");
     assert!(msg.contains(ASSUME_ROLE_ARN), "{msg}");
     assert!(msg.contains("seaweedfs:1"), "{msg}");
     for secret in [ASSUME_ROLE_BASE_SECRET_KEY, ASSUME_ROLE_EXTERNAL_ID] {
@@ -255,7 +255,7 @@ fn a_wrong_base_secret_fails_create_with_http_403() {
         &iceberg_catalog_url_internal(),
         &assume_role_password(WRONG_BASE_SECRET, ASSUME_ROLE_EXTERNAL_ID),
     );
-    let msg = error_text(&resp);
+    let msg = error_text(&resp, "CREATE with a wrong base secret");
     assert!(msg.contains("403"), "{msg}");
     assert!(
         !msg.contains(WRONG_BASE_SECRET),

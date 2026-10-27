@@ -225,16 +225,11 @@ fn e2e_broadcast_join_float_div_by_zero_in_fact_leg_filter_fails() {
     );
 
     let resp = conn.try_execute(&query);
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "a division by zero in a broadcast join's fact-leg filter must fail the \
-         query rather than change the joined row count: {resp}"
-    );
-    let message = resp["exception"]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let message = error_text(
+        &resp,
+        &format!("a fact-leg division by zero in a broadcast join ({query})"),
+    )
+    .to_ascii_lowercase();
     assert!(
         message.contains("division by zero"),
         "the surfaced message must name a division by zero: {resp}"
@@ -426,18 +421,15 @@ fn e2e_join_offset_and_aggregate_shapes_still_use_two_scan_fallback() {
 
     let offset_without_order_by = format!("{} LIMIT 3 OFFSET 2", join_query(VS_NAME));
     let resp = conn.try_execute(&offset_without_order_by);
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "LIMIT ... OFFSET ... with no ORDER BY must be rejected by Exasol itself \
-         (the adapter is never consulted), got: {resp}"
+    let msg = error_text(
+        &resp,
+        &format!("LIMIT ... OFFSET with no ORDER BY ({offset_without_order_by})"),
     );
     assert_eq!(
         resp["exception"]["sqlCode"].as_str(),
         Some("42000"),
         "expected sqlCode 42000, got: {resp}"
     );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
     assert!(
         msg.contains("OFFSET") && msg.contains("ORDER BY"),
         "expected Exasol's 'OFFSET not allowed in LIMIT without ORDER BY' \

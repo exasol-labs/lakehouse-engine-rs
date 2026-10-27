@@ -382,7 +382,7 @@ fn create_vs_unreachable_catalog_errors_no_secret() {
             catalog_uri,
             &bogus_password,
         );
-        let msg = error_text(&resp);
+        let msg = error_text(&resp, &format!("CREATE against {catalog_uri}"));
         assert!(msg.contains(cause), "{cause:?} expected: {msg}");
         assert!(
             !msg.contains("SUPER_SECRET_KEY") && !msg.contains("SUPER_SECRET_VALUE"),
@@ -418,7 +418,7 @@ fn create_vs_ambiguous_catalog_auth_errors_no_secret() {
         "http://does-not-exist.invalid:8181",
         &ambiguous_password,
     );
-    let msg = error_text(&resp);
+    let msg = error_text(&resp, "CREATE with both a token and client credentials");
     assert!(
         msg.contains("token") && msg.contains("client_id") && msg.contains("client_secret"),
         "error message must name token, client_id, and client_secret: {msg}"
@@ -2899,18 +2899,15 @@ fn offset_on_single_group_aggregate_is_rejected_by_exasol() {
     );
     let resp = conn.try_execute(&sql);
 
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "OFFSET on a single-group aggregate must be rejected by Exasol \
-         itself (the adapter is never consulted), got: {resp}"
+    let msg = error_text(
+        &resp,
+        &format!("OFFSET on a single-group aggregate ({sql})"),
     );
     assert_eq!(
         resp["exception"]["sqlCode"].as_str(),
         Some("42000"),
         "expected sqlCode 42000, got: {resp}"
     );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
     assert!(
         msg.contains("OFFSET") && msg.contains("aggregated"),
         "expected Exasol's 'OFFSET not allowed in aggregated selects' \
@@ -3193,19 +3190,11 @@ fn e2e_float_div_pushes_checked_division_call_projection() {
 }
 
 /// The state is the same for every UDF-raised error, so the message is what is asserted.
+#[track_caller]
 fn division_by_zero_failure_sql_code(conn: &mut ExaConn, sql: &str) -> String {
     let resp = conn.try_execute(sql);
 
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "a division by zero must fail the query rather than silently returning \
-         a value or a row count native Exasol disagrees with:\n{sql}\n{resp}"
-    );
-    let message = resp["exception"]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let message = error_text(&resp, &format!("a division by zero ({sql})")).to_ascii_lowercase();
     assert!(
         message.contains("division by zero"),
         "the surfaced message must name a division by zero:\n{sql}\n{resp}"

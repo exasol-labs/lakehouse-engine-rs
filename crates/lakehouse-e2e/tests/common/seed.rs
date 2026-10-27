@@ -94,6 +94,8 @@ const BASE_TS_MICROS: i64 = 1_704_067_200_000_000;
 
 pub struct SeedHandle {
     pub data_file_paths: Vec<String>,
+    /// False when the table already held its data and nothing was written.
+    pub written: bool,
 }
 
 pub async fn seed_events(catalog_url: &str, warehouse: &str) -> Result<SeedHandle> {
@@ -311,25 +313,81 @@ where
     F: IntoIterator<Item = B>,
     B: IntoIterator<Item = RecordBatch>,
 {
-    let Some(table) = empty_table_to_fill(
+    let files = files
+        .into_iter()
+        .map(|batches| (table_name.to_string(), Struct::empty(), batches));
+    let seeded = seed_table(
         catalog,
         namespace,
         table_name,
         iceberg_schema,
         unpartitioned(),
         properties,
+        files,
     )
-    .await?
-    else {
-        return Ok(false);
-    };
-    let files = files
-        .into_iter()
-        .map(|batches| (table_name.to_string(), Struct::empty(), batches));
-    append_files(catalog, table, files).await
+    .await?;
+    Ok(seeded.written)
 }
 
-/// Creates the table when absent or stale, and returns it when it holds no data yet.
+/// Creates the table when absent or stale, then appends each `(file prefix, partition value,
+/// batches)` entry as one data file in its own fast-append, making the `GROUP BY shard_key`
+/// fan-out observable. A table that already holds data is left as is.
+pub async fn seed_table<B>(
+    catalog: &impl Catalog,
+    namespace: &str,
+    table_name: &str,
+    iceberg_schema: IcebergSchema,
+    partition_spec: UnboundPartitionSpec,
+    properties: HashMap<String, String>,
+    files: impl IntoIterator<Item = (String, Struct, B)>,
+) -> Result<SeedHandle>
+where
+    B: IntoIterator<Item = RecordBatch>,
+{
+    let mut table = match empty_table_to_fill(
+        catalog,
+        namespace,
+        table_name,
+        iceberg_schema,
+        partition_spec,
+        properties,
+    )
+    .await?
+    {
+        Fixture::Fill(table) => table,
+        Fixture::Seeded(data_file_paths) => {
+            return Ok(SeedHandle {
+                data_file_paths,
+                written: false,
+            });
+        }
+    };
+    let mut data_file_paths = Vec::new();
+    for (prefix, partition, batches) in files {
+        let data_files = write_data_files(
+            &table,
+            &prefix,
+            partition,
+            WriterProperties::default(),
+            batches,
+        )
+        .await?;
+        data_file_paths.extend(data_files.iter().map(|f| f.file_path().to_string()));
+        table = commit_data_files(catalog, &table, data_files).await?;
+    }
+    Ok(SeedHandle {
+        written: !data_file_paths.is_empty(),
+        data_file_paths,
+    })
+}
+
+enum Fixture {
+    Fill(Table),
+    Seeded(Vec<String>),
+}
+
+/// Creates the table when absent or stale. Returns it while it holds no data, else the
+/// paths of its current data files.
 async fn empty_table_to_fill(
     catalog: &impl Catalog,
     namespace: &str,
@@ -337,7 +395,7 @@ async fn empty_table_to_fill(
     iceberg_schema: IcebergSchema,
     partition_spec: UnboundPartitionSpec,
     properties: HashMap<String, String>,
-) -> Result<Option<Table>> {
+) -> Result<Fixture> {
     let ns = NamespaceIdent::new(namespace.to_string());
     let ident = TableIdent::new(ns.clone(), table_name.to_string());
 
@@ -349,11 +407,11 @@ async fn empty_table_to_fill(
         .context("check table exists")?
     {
         let table = catalog.load_table(&ident).await.context("load table")?;
-        let populated = !collect_current_snapshot_paths(&table).await?.is_empty();
+        let paths = collect_current_snapshot_paths(&table).await?;
         let schema_matches = schema_field_signature(table.metadata().current_schema())
             == schema_field_signature(&iceberg_schema);
-        if populated && schema_matches {
-            return Ok(None);
+        if !paths.is_empty() && schema_matches {
+            return Ok(Fixture::Seeded(paths));
         }
         catalog
             .drop_table(&ident)
@@ -381,8 +439,12 @@ async fn empty_table_to_fill(
             format!("create table failed ({create_error}); loading it instead also failed")
         })?,
     };
-    let empty = collect_current_snapshot_paths(&table).await?.is_empty();
-    Ok(empty.then_some(table))
+    let paths = collect_current_snapshot_paths(&table).await?;
+    Ok(if paths.is_empty() {
+        Fixture::Fill(table)
+    } else {
+        Fixture::Seeded(paths)
+    })
 }
 
 /// An empty spec, not a void field: a void field needs a one-value partition struct and
@@ -408,36 +470,6 @@ fn identity_partition_spec(source_id: i32, column: &str) -> Result<UnboundPartit
         .build())
 }
 
-/// Each `(file prefix, partition value, batches)` entry is one data file in its own
-/// fast-append, making the `GROUP BY shard_key` fan-out observable.
-async fn append_files<B>(
-    catalog: &impl Catalog,
-    mut table: Table,
-    files: impl IntoIterator<Item = (String, Struct, B)>,
-) -> Result<bool>
-where
-    B: IntoIterator<Item = RecordBatch>,
-{
-    let mut wrote_any = false;
-    for (prefix, partition, batches) in files {
-        let data_files = write_data_files(
-            &table,
-            &prefix,
-            partition,
-            WriterProperties::default(),
-            batches,
-        )
-        .await?;
-        commit_data_files(catalog, &table, data_files).await?;
-        wrote_any = true;
-        table = catalog
-            .load_table(table.identifier())
-            .await
-            .context("reload table between appends")?;
-    }
-    Ok(wrote_any)
-}
-
 pub async fn write_one_file_append(
     catalog: &impl Catalog,
     table: &Table,
@@ -452,7 +484,8 @@ pub async fn write_one_file_append(
         batches,
     )
     .await?;
-    commit_data_files(catalog, table, data_files).await
+    commit_data_files(catalog, table, data_files).await?;
+    Ok(())
 }
 
 /// Writes one uncommitted data file whose name starts with `<prefix>-`.
@@ -503,14 +536,11 @@ pub async fn commit_data_files(
     catalog: &impl Catalog,
     table: &Table,
     data_files: Vec<DataFile>,
-) -> Result<()> {
+) -> Result<Table> {
     let tx = Transaction::new(table);
     let action = tx.fast_append().add_data_files(data_files);
     let tx = action.apply(tx).context("apply fast-append action")?;
-    tx.commit(catalog)
-        .await
-        .context("commit Iceberg snapshot")?;
-    Ok(())
+    tx.commit(catalog).await.context("commit Iceberg snapshot")
 }
 
 async fn seed_events_table(catalog_url: &str, warehouse: &str) -> Result<SeedHandle> {
@@ -527,29 +557,24 @@ pub async fn seed_events_table_with_auth(
     let catalog =
         build_seed_catalog_with_auth(catalog_url, warehouse, "lakehouse-e2e-seed", auth).await?;
     let mid = SEED_TOTAL_ROWS / 2;
-    create_and_append_files(
+    let files = [(1, mid), (mid + 1, SEED_TOTAL_ROWS)].map(|(first, last)| {
+        (
+            E2E_TABLE.to_string(),
+            Struct::empty(),
+            [make_events_batch(first, last)],
+        )
+    });
+    seed_table(
         &catalog,
         E2E_NAMESPACE,
         E2E_TABLE,
         events_iceberg_schema()?,
-        [
-            [make_events_batch(1, mid)],
-            [make_events_batch(mid + 1, SEED_TOTAL_ROWS)],
-        ],
+        unpartitioned(),
+        HashMap::new(),
+        files,
     )
     .await
-    .context("seed events table")?;
-    let ident = TableIdent::new(
-        NamespaceIdent::new(E2E_NAMESPACE.to_string()),
-        E2E_TABLE.to_string(),
-    );
-    let table = catalog
-        .load_table(&ident)
-        .await
-        .context("load events table")?;
-    Ok(SeedHandle {
-        data_file_paths: collect_current_snapshot_paths(&table).await?,
-    })
+    .context("seed events table")
 }
 
 fn events_iceberg_schema() -> Result<IcebergSchema> {
@@ -1101,18 +1126,6 @@ fn make_lineitem_batch(first_row: usize, last_row: usize) -> RecordBatch {
 /// min/max bounds are tight.
 pub async fn seed_partitioned(catalog_url: &str, warehouse: &str) -> Result<()> {
     let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-regions").await?;
-    let Some(table) = empty_table_to_fill(
-        &catalog,
-        E2E_NAMESPACE,
-        E2E_PART_TABLE,
-        regions_iceberg_schema()?,
-        identity_partition_spec(2, PART_COL)?,
-        HashMap::new(),
-    )
-    .await?
-    else {
-        return Ok(());
-    };
     let files = [
         (PART_VAL_NORTH, PART_NORTH_IDS),
         (PART_VAL_CENTRAL, PART_CENTRAL_IDS),
@@ -1125,7 +1138,16 @@ pub async fn seed_partitioned(catalog_url: &str, warehouse: &str) -> Result<()> 
             [make_regions_batch(first_id, last_id, region)],
         )
     });
-    append_files(&catalog, table, files).await?;
+    seed_table(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_PART_TABLE,
+        regions_iceberg_schema()?,
+        identity_partition_spec(2, PART_COL)?,
+        HashMap::new(),
+        files,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1180,7 +1202,7 @@ pub async fn seed_pruning_cases(catalog_url: &str, warehouse: &str) -> Result<()
         ])
         .build()
         .context("build pruning fixture Iceberg schema")?;
-    let Some(table) = empty_table_to_fill(
+    let Fixture::Fill(table) = empty_table_to_fill(
         &catalog,
         PRUNING_NAMESPACE,
         PRUNING_TABLE,
@@ -1208,7 +1230,8 @@ pub async fn seed_pruning_cases(catalog_url: &str, warehouse: &str) -> Result<()
     }
     commit_data_files(&catalog, &table, data_files)
         .await
-        .context("commit the pruning fixture data files")
+        .context("commit the pruning fixture data files")?;
+    Ok(())
 }
 
 // iceberg-rust has no rename in its schema-evolution API, so the rename (#26) is applied via a
@@ -2541,7 +2564,7 @@ pub const COMPLEX_TOTAL_ROWS: usize = 4;
 pub async fn seed_complex_types_probe(catalog_url: &str, warehouse: &str) -> Result<()> {
     let catalog =
         build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-complex-types").await?;
-    let Some(table) = empty_table_to_fill(
+    let Fixture::Fill(table) = empty_table_to_fill(
         &catalog,
         E2E_NAMESPACE,
         E2E_COMPLEX_TABLE,
@@ -3228,7 +3251,7 @@ pub async fn seed_all_types_with_auth(
         ICEBERG_FORMAT_VERSION_PROPERTY.to_string(),
         ICEBERG_FORMAT_VERSION_3.to_string(),
     )]);
-    if let Some(table) = empty_table_to_fill(
+    if let Fixture::Fill(table) = empty_table_to_fill(
         &catalog,
         E2E_NAMESPACE,
         E2E_ALL_TYPES_TABLE,
@@ -3261,7 +3284,7 @@ async fn seed_binary_values(catalog: &impl Catalog) -> Result<()> {
         ])
         .build()
         .context("build binary_values Iceberg schema")?;
-    let Some(table) = empty_table_to_fill(
+    let Fixture::Fill(table) = empty_table_to_fill(
         catalog,
         E2E_NAMESPACE,
         E2E_BINARY_VALUES_TABLE,
@@ -3304,7 +3327,8 @@ async fn seed_binary_values(catalog: &impl Catalog) -> Result<()> {
         .context("describe binary_values data file")?;
     commit_data_files(catalog, &table, vec![data_file])
         .await
-        .context("commit binary_values data file")
+        .context("commit binary_values data file")?;
+    Ok(())
 }
 
 #[cfg(test)]

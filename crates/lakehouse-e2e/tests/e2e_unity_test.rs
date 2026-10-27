@@ -7,8 +7,8 @@ mod common;
 use common::e2e_harness::{
     SCAN_SCRIPT_NAME, SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_decimal_orders_numerically,
     assert_query_fails, assert_type_matrix, column_adapter_notes, create_schema_and_scripts,
-    create_virtual_schema_with_password, declared_types, enumerated_table_names, exa_conn,
-    explain_virtual_sql, has_broadcast_join_block, has_two_scan_wrapper, identifier_note,
+    create_virtual_schema_with_password, declared_types, enumerated_table_names, error_text,
+    exa_conn, explain_virtual_sql, has_broadcast_join_block, has_two_scan_wrapper, identifier_note,
     install_slc, note_of, pairs, parse_int, parse_numeric, partition_positions, query_error, reads,
     refuses, text_column, upload_so, value_to_string,
 };
@@ -1388,13 +1388,8 @@ fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
 
     let table = "UNSHREDDED_VARIANT";
     let feature = "variantType-preview";
-    let resp = conn.try_execute(&format!("SELECT * FROM {} LIMIT 1", table_ref(table)));
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "{table} must fail the query loud, not return a row: {resp}"
-    );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
+    let sql = format!("SELECT * FROM {} LIMIT 1", table_ref(table));
+    let msg = error_text(&conn.try_execute(&sql), &sql);
     assert!(
         msg.contains(feature),
         "{table}'s error must name its actual unsupported reader feature: {msg}"
@@ -1582,13 +1577,8 @@ fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
         ("BYTE_DECIMAL", "byte_decimal", "byte", "decimal(4,1)"),
         ("SHORT_DECIMAL", "short_decimal", "short", "decimal(6,1)"),
     ] {
-        let resp = conn.try_execute(&format!("SELECT {column} FROM {table}"));
-        assert_eq!(
-            resp["status"].as_str(),
-            Some("error"),
-            "{column} must refuse the query, not return a row or a NULL value: {resp}"
-        );
-        let msg = resp["exception"]["text"].as_str().unwrap_or("");
+        let sql = format!("SELECT {column} FROM {table}");
+        let msg = error_text(&conn.try_execute(&sql), &sql);
         assert!(
             msg.contains(delta_name)
                 && msg.contains(&format!("'{from_type}'"))
@@ -1789,13 +1779,8 @@ fn unity_delta_refused_column_refuses_only_the_queries_naming_it() {
     let mut conn = exa_conn();
     let table = table_ref("STATS_ALL_TYPES");
 
-    let resp = conn.try_execute(&format!("SELECT BINARY_COL FROM {table}"));
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "BINARY_COL must refuse the query, not return a row: {resp}"
-    );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
+    let sql = format!("SELECT BINARY_COL FROM {table}");
+    let msg = error_text(&conn.try_execute(&sql), &sql);
     assert!(
         msg.contains("binary_col") && msg.contains("#351") && !msg.contains("#350"),
         "BINARY_COL's refusal must name its Delta column and cite issue #351, not #350: {msg}"

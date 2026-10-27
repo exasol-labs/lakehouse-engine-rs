@@ -444,7 +444,10 @@ fn refresh_unreachable_catalog_redacts_credentials() {
         build_create_connection_sql(CATALOG_CONN_NAME, bogus_uri, &bogus_password);
     conn.execute(&replace_conn_sql);
 
-    let msg = error_text(&conn.try_execute("ALTER VIRTUAL SCHEMA REFRESH_UNREACHABLE_VS REFRESH"));
+    let msg = query_error(
+        &mut conn,
+        "ALTER VIRTUAL SCHEMA REFRESH_UNREACHABLE_VS REFRESH",
+    );
     assert!(
         !msg.contains("SUPER_SECRET_KEY") && !msg.contains("SUPER_SECRET_VALUE"),
         "refresh error message must not leak credentials: {msg}"
@@ -695,8 +698,10 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
         id_val_schema(0),
     ));
 
-    let refresh_msg =
-        error_text(&conn.try_execute("ALTER VIRTUAL SCHEMA REFRESH_COLLISION_VS REFRESH"));
+    let refresh_msg = query_error(
+        &mut conn,
+        "ALTER VIRTUAL SCHEMA REFRESH_COLLISION_VS REFRESH",
+    );
     assert!(
         refresh_msg.contains("EU__ORDERS"),
         "refresh's collision error must name the colliding Exasol table name: {refresh_msg}"
@@ -717,10 +722,13 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
          {partial_msg}"
     );
 
-    let create_msg = error_text(&try_create_virtual_schema(
-        &mut conn,
-        &refresh_props("REFRESH_COLLISION_CREATE_VS", NS_COLLISION),
-    ));
+    let create_msg = error_text(
+        &try_create_virtual_schema(
+            &mut conn,
+            &refresh_props("REFRESH_COLLISION_CREATE_VS", NS_COLLISION),
+        ),
+        "CREATE over the colliding namespace",
+    );
     assert!(
         create_msg.contains("EU__ORDERS") && create_msg.contains("collision"),
         "createVirtualSchema's collision error must have the same shape as \

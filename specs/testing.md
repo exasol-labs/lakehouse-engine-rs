@@ -67,7 +67,7 @@ This file holds the rules for how this repository tests its behavior and how it 
 - A binary passes its own values as explicit parameters: the virtual schema name, the adapter schema, the namespace, the CONNECTION name and password, `PARALLELISM_FACTOR`, `JOIN_BROADCAST_MAX_BYTES`, `CATALOG_KIND`, and `MERGE_SCHEMA`. A parameter the binary does not supply is omitted from the generated `CREATE VIRTUAL SCHEMA`, never emitted empty. No binary re-declares the provisioning logic.
 - Each binary runs one stack setup, plus one lazy setup per fixture. A name filter for one module or one test provisions only the fixtures it uses.
 - The shared virtual schema DDL sets `ALLOW_HTTP = 'true'`.
-- A test reads the error text of a failing statement through one shared helper, which also asserts that the statement failed.
+- A test reads the error text of a failing statement only through `error_text`, which asserts the status is `error` and names the statement or case.
 - Async fixture work runs on the harness's one shared Tokio runtime. Only a teardown that runs from `Drop` builds its own runtime, on its own thread.
 - Every DSN and connection string sets `validateservercertificate=0`, because the Docker image uses a self-signed certificate.
 - The seed path for a cloud store selects a storage backend on the one shared seed-catalog configuration. No suite forks the table create, write, and commit logic.

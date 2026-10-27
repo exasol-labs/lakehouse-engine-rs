@@ -550,17 +550,9 @@ fn e2e_unsupported_data_file_format_fails_loud() {
     let (orc_first, _) = ORC_FILE_IDS;
 
     for filter in [String::new(), format!("WHERE id >= {orc_first}")] {
-        let resp = conn.try_execute(&format!("SELECT id FROM {table} {filter}"));
-        assert_eq!(
-            resp["status"].as_str(),
-            Some("error"),
-            "a scan planning a file with an unsupported mechanism must fail ({filter}), got: {resp}"
-        );
-        let message = resp["exception"]["text"]
-            .as_str()
-            .or_else(|| resp["message"].as_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
+        let sql = format!("SELECT id FROM {table} {filter}");
+        let resp = conn.try_execute(&sql);
+        let message = error_text(&resp, &sql).to_ascii_lowercase();
         assert!(
             message.contains("lakehouse pushdown declined") && message.contains("orc data files"),
             "error must be the plan-time refusal naming ORC data files ({filter}), got: {resp}"

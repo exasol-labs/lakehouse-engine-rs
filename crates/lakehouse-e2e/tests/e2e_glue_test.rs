@@ -821,7 +821,7 @@ fn check_assume_role_connection_reads_through_the_role(run: &GlueRun, conn: &mut
         let _ = cleanup.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs} CASCADE"));
         let _ = cleanup.try_execute(&format!("DROP CONNECTION IF EXISTS {connection}"));
     }
-    let error = error_text(&response);
+    let error = error_text(&response, "CREATE as the Glue base identity alone");
     assert!(
         error.contains("AccessDenied"),
         "the denial must come from Glue: {}",
@@ -927,7 +927,7 @@ fn glue_credentials_never_appear_in_output() {
         &glue_connection_password(&sentinel_env),
     );
     conn.execute(&format!("DROP CONNECTION IF EXISTS {PROBE_CONN}"));
-    let error = error_text(&response);
+    let error = error_text(&response, "CREATE with a sentinel secret access key");
     assert!(
         error.contains("Glue"),
         "the adapter must report the rejected Glue call: {}",

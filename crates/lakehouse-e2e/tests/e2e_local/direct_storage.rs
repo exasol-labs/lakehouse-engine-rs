@@ -1539,7 +1539,7 @@ fn incompatible_pair_fails_create_naming_column_and_files() {
         CONN_INCOMPATIBLE,
         BASE_INCOMPATIBLE,
     );
-    let msg = error_text(&resp);
+    let msg = error_text(&resp, "CREATE over an incompatible file pair");
     assert_mentions(&msg, &["X", "file1.parquet", "file2.parquet"]);
     assert!(
         !msg.contains("lhadminsecret123"),
@@ -1569,11 +1569,11 @@ fn merge_schema_false_declares_the_narrow_sampled_type_and_refuses_a_wider_file_
         "a column both files store at the declared type must return both files' rows"
     );
 
-    let resp = conn.try_execute(&format!(
+    let sql = format!(
         "SELECT ID, PRICE FROM {}",
         vs_table(VS_DIRECT_NARROW, "WIDENED")
-    ));
-    let msg = error_text(&resp);
+    );
+    let msg = error_text(&conn.try_execute(&sql), &sql);
     assert_mentions(
         &msg,
         &[
@@ -1712,7 +1712,7 @@ fn malformed_connections_are_rejected_at_create_virtual_schema() {
             &address,
             &password,
         );
-        let msg = error_text(&resp);
+        let msg = error_text(&resp, label);
         assert!(
             !msg.contains(s3_secret),
             "{label} must not leak the S3 secret: {msg}"
@@ -1751,7 +1751,7 @@ fn malformed_connections_are_rejected_at_create_virtual_schema() {
         BASE_DISCOVERY,
         &direct_storage_password(),
     );
-    error_text(&resp);
+    error_text(&resp, "CREATE with MERGE_SCHEMA = 'NOTABOOL'");
 }
 
 #[test]
@@ -1967,15 +1967,13 @@ fn create_stats_oracles(conn: &mut ExaConn) {
 /// `{T}` and `{D}` name the fact and dimension tables.
 fn assert_same_as_native(conn: &mut ExaConn, template: &str, overflows: bool) {
     let mut run = |fact: &str, dim: &str| {
-        let response = conn.try_execute(&template.replace("{T}", fact).replace("{D}", dim));
+        let sql = template.replace("{T}", fact).replace("{D}", dim);
+        let response = conn.try_execute(&sql);
         match response["status"].as_str() {
             Some("ok") => {
                 Ok(conn.fetch_result_columns(&response["responseData"]["results"][0]["resultSet"]))
             }
-            _ => Err(response["exception"]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string()),
+            _ => Err(error_text(&response, &sql)),
         }
     };
     let pushed = run(DIRECT_STATS, DIRECT_STATS_DIM);
@@ -2373,7 +2371,10 @@ fn partition_key_collision_with_a_missing_segment_fails_the_refresh() {
         CONN_COLLISION_MISSING,
         BASE_COLLISION_MISSING,
     );
-    let msg = error_text(&resp);
+    let msg = error_text(
+        &resp,
+        "CREATE over a partition key collision with a missing segment",
+    );
     assert_mentions(
         &msg,
         &[
@@ -2847,7 +2848,7 @@ fn two_spellings_of_one_partition_key_fail_refresh_and_query() {
             BASE_TWO_SPELLINGS,
             &direct_storage_password(),
         );
-        let msg = error_text(&resp);
+        let msg = error_text(&resp, &format!("CREATE with MERGE_SCHEMA = {merge_schema}"));
         assert_mentions(
             &msg,
             &[
@@ -2880,9 +2881,9 @@ fn two_spellings_of_one_partition_key_fail_refresh_and_query() {
     let query = conn.try_execute(&format!("SELECT COUNT(*) FROM {table}"));
     let refresh = conn.try_execute(&format!("ALTER VIRTUAL SCHEMA {VS_SPELLING_DRIFT} REFRESH"));
     delete_fixture_object(&late);
-    for resp in [&query, &refresh] {
+    for (what, resp) in [("the COUNT query", &query), ("the REFRESH", &refresh)] {
         assert_mentions(
-            &error_text(resp),
+            &error_text(resp, what),
             &[
                 "'year'",
                 "'YEAR'",
@@ -2979,8 +2980,8 @@ fn over_limit_column_note_fails_create_and_refresh() {
     let create = try_create_direct_vs(&mut conn, VS_OVER_LIMIT, CONN_NOTES, BASE_OVER_LIMIT);
     delete_fixture_object(&wide);
 
-    for resp in [&refresh, &create] {
-        assert_mentions(&error_text(resp), &["'PAYLOAD'", "'WIDE'", "2000000"]);
+    for (what, resp) in [("the REFRESH", &refresh), ("the CREATE", &create)] {
+        assert_mentions(&error_text(resp, what), &["'PAYLOAD'", "'WIDE'", "2000000"]);
     }
 }
 
@@ -3098,8 +3099,9 @@ fn assert_reads(conn: &mut ExaConn, case: &str, sql: &str, expected: &[&[Option<
     assert_eq!(observed, expected, "{case}: {sql}");
 }
 
+#[track_caller]
 fn assert_fails_naming(conn: &mut ExaConn, case: &str, sql: &str, fragments: &[&str]) -> String {
-    let msg = error_text(&conn.try_execute(sql));
+    let msg = error_text(&conn.try_execute(sql), &format!("{case}: {sql}"));
     for fragment in fragments {
         assert!(
             msg.contains(fragment),
