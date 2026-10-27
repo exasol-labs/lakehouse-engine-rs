@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::net::{TcpListener, TcpStream};
 
 /// rustls 0.23's text for a TLS peer that closes without `close_notify` (`src/conn.rs`).
 const UNEXPECTED_EOF_MESSAGE: &str = "peer closed connection without sending TLS close_notify: \
@@ -94,40 +94,42 @@ fn the_backoff_wait_doubles_within_its_jitter_range() {
     assert!(ms(125) < midway && midway < ms(250), "{midway:?}");
 }
 
+/// Scenario: Retry-After sets the wait, and a wait that leaves no time for an attempt ends the retries
 #[test]
-fn a_retry_waits_only_when_its_wait_ends_before_the_bound() {
+fn a_retry_waits_only_when_an_attempt_still_fits_after_its_wait() {
     let backoff = ms(200);
     let left = ms(1000);
+    let room = ms(100);
+    let wait = |requested, backoff, left| chosen_wait(requested, backoff, left, room);
 
-    assert_eq!(chosen_wait(None, backoff, left), Some(backoff));
-    assert_eq!(chosen_wait(Some(ms(500)), backoff, left), Some(ms(500)));
+    assert_eq!(wait(None, backoff, left), Some(backoff));
+    assert_eq!(wait(Some(ms(500)), backoff, left), Some(ms(500)));
     assert_eq!(
-        chosen_wait(Some(Duration::ZERO), backoff, left),
+        wait(Some(Duration::ZERO), backoff, left),
         Some(Duration::ZERO)
     );
-    let just_inside = left - Duration::from_nanos(1);
-    assert_eq!(
-        chosen_wait(Some(just_inside), backoff, left),
-        Some(just_inside)
-    );
-    assert_eq!(chosen_wait(Some(left), backoff, left), None);
-    assert_eq!(chosen_wait(None, left, left), None);
+    assert_eq!(wait(Some(left - room), backoff, left), Some(left - room));
+    let just_past = left - room + Duration::from_nanos(1);
+    assert_eq!(wait(Some(just_past), backoff, left), None);
+    assert_eq!(wait(Some(Duration::MAX), backoff, left), None);
+    assert_eq!(wait(None, backoff, backoff + room / 2), None);
+    assert_eq!(wait(None, left, left), None);
 }
 
 #[test]
-fn only_refused_reset_aborted_and_eof_connections_are_transient_causes() {
+fn only_refused_reset_aborted_broken_and_eof_connections_are_transient_causes() {
     let transient = |kind| is_transient_cause_chain(&hyper_connection_error(IoError::from(kind)));
 
     for kind in [
         ErrorKind::ConnectionRefused,
         ErrorKind::ConnectionReset,
         ErrorKind::ConnectionAborted,
+        ErrorKind::BrokenPipe,
         ErrorKind::UnexpectedEof,
     ] {
         assert!(transient(kind), "{kind:?}");
     }
     for kind in [
-        ErrorKind::BrokenPipe,
         ErrorKind::TimedOut,
         ErrorKind::NotConnected,
         ErrorKind::InvalidData,
@@ -241,9 +243,11 @@ async fn close_after_request(mut stream: TcpStream) {
 }
 
 /// A listener whose accept queue is full, so the kernel drops every further connection's SYN.
-/// The returned values hold the queue full and must outlive the test's requests.
+/// The returned values hold the queue full and must outlive the test's requests. The SYN drop
+/// holds on Linux but not on macOS, so this helper and its callers are Linux-only.
+#[cfg(target_os = "linux")]
 async fn spawn_full_backlog_listener() -> (SocketAddr, TcpListener, Vec<TcpStream>) {
-    let socket = TcpSocket::new_v4().expect("a TCP socket");
+    let socket = tokio::net::TcpSocket::new_v4().expect("a TCP socket");
     socket
         .bind("127.0.0.1:0".parse().unwrap())
         .expect("bind a loopback port");
@@ -310,6 +314,7 @@ async fn a_catalog_that_stalls_after_the_headers_fails_within_the_budget() {
 }
 
 /// Scenario: A catalog request that gets no complete answer fails within 30 seconds
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_connection_that_never_completes_ends_at_the_connect_timeout() {
     let (address, _listener, _queued) = spawn_full_backlog_listener().await;
@@ -412,7 +417,7 @@ async fn transient_statuses_are_retried_until_an_answer_succeeds() {
     }
 }
 
-/// Scenario: Retry-After sets the wait, and a wait past the bound ends the retries
+/// Scenario: Retry-After sets the wait, and a wait that leaves no time for an attempt ends the retries
 #[tokio::test]
 async fn a_retry_after_wait_is_honored() {
     let answered = AtomicUsize::new(0);
@@ -438,7 +443,7 @@ async fn a_retry_after_wait_is_honored() {
     assert_eq!(requests.lock().unwrap().len(), 2);
 }
 
-/// Scenario: Retry-After sets the wait, and a wait past the bound ends the retries
+/// Scenario: Retry-After sets the wait, and a wait that leaves no time for an attempt ends the retries
 #[tokio::test]
 async fn a_wait_past_the_budget_ends_the_retries_at_once() {
     let (base_uri, requests) = spawn_server_with_headers("application/json", |_| {
@@ -458,6 +463,59 @@ async fn a_wait_past_the_budget_ends_the_retries_at_once() {
     assert_eq!(answer.body, b"{\"error\":\"busy\"}");
     assert!(started.elapsed() < ms(500), "{:?}", started.elapsed());
     assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+/// Scenario: Retry-After sets the wait, and a wait that leaves no time for an attempt ends the retries
+#[tokio::test]
+async fn a_wait_that_leaves_less_than_a_connect_timeout_keeps_the_answer_at_hand() {
+    let (base_uri, requests) = spawn_server_with_headers("application/json", |_| {
+        (
+            503,
+            vec![("Retry-After", "1".into())],
+            "{\"error\":\"busy\"}".into(),
+        )
+    })
+    .await;
+    let http = CatalogHttp::with_policy(RetryPolicy {
+        connect_timeout: ms(600),
+        bound: ms(1500),
+        ..SHORT_POLICY
+    });
+    let started = Instant::now();
+
+    let answer = http.send(get(&http, &base_uri)).await.unwrap();
+
+    assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(started.elapsed() < ms(500), "{:?}", started.elapsed());
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_refused_json_answer_quotes_its_body_redacted_and_cut() {
+    let echoed = format!("{BEARER_TOK} {}", "x".repeat(MAX_QUOTED_BODY_BYTES * 2));
+    let (base_uri, _) = spawn_server("text/html", move |_| (500, echoed.clone())).await;
+    let http = CatalogHttp::with_policy(SHORT_POLICY);
+
+    let error = http
+        .send_json::<serde_json::Value>(get(&http, &base_uri), "catalog request", |msg| {
+            msg.replace(BEARER_TOK, "***")
+        })
+        .await
+        .unwrap_err();
+
+    let message = error.to_string();
+    let suffix = format!("... (truncated to {MAX_QUOTED_BODY_BYTES} bytes)");
+    assert!(
+        message.starts_with("catalog request failed with HTTP 500: *** x"),
+        "{message}"
+    );
+    assert!(message.ends_with(&suffix), "{message}");
+    assert!(!message.contains(BEARER_TOK), "{message}");
+    assert!(
+        message.len() < MAX_QUOTED_BODY_BYTES + 100,
+        "{}",
+        message.len()
+    );
 }
 
 /// Scenario: A failure that is not transient fails the request at the first attempt
@@ -530,6 +588,52 @@ async fn a_connection_reset_after_the_request_is_retried() {
     assert_eq!(accepted.load(Ordering::SeqCst), 2);
 }
 
+/// Scenario: A transient failure is retried with exponential backoff and jitter
+#[tokio::test]
+async fn a_connection_closed_cleanly_after_the_request_is_retried() {
+    let (address, accepted) = spawn_listener(|stream, index| async move {
+        match index {
+            0 => close_after_request(stream).await,
+            _ => answer_ok(stream).await,
+        }
+    })
+    .await;
+    let http = CatalogHttp::with_policy(SHORT_POLICY);
+
+    let answer = http
+        .send(get(&http, &format!("http://{address}/")))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (answer.status, answer.body),
+        (StatusCode::OK, b"ok".to_vec())
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+}
+
+/// Scenario: A transient failure is retried with exponential backoff and jitter
+#[tokio::test]
+async fn an_http2_connection_closed_cleanly_is_transient() {
+    let (closing, _) = spawn_listener(|stream, _| close_after_request(stream)).await;
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+
+    let error = client
+        .get(format!("http://{closing}/"))
+        .send()
+        .await
+        .unwrap_err();
+
+    assert!(
+        is_transient_transport_failure(&error),
+        "{}",
+        error_chain(&error)
+    );
+}
+
 /// Scenario: A failure that is not transient fails the request at the first attempt
 #[tokio::test]
 async fn a_tls_client_against_a_plain_http_listener_connects_once() {
@@ -589,7 +693,6 @@ async fn transport_failures_are_classified_by_their_typed_cause() {
         async move { client.get(&url).send().await.expect_err(&url) }
     };
     let (reset, _) = spawn_listener(|stream, _| reset_after_request(stream)).await;
-    let (backlog, _listener, _queued) = spawn_full_backlog_listener().await;
     let (tls_reset, _) = spawn_listener(|stream, _| reset_during_handshake(stream)).await;
     let (plain, _) = spawn_listener(|stream, _| answer_in_plain_http(stream)).await;
     let (closing, _) = spawn_listener(|stream, _| close_after_request(stream)).await;
@@ -597,13 +700,12 @@ async fn transport_failures_are_classified_by_their_typed_cause() {
     let transient = [
         CLOSED_PORT_URI.to_owned(),
         format!("http://{reset}/"),
-        format!("http://{backlog}/"),
         format!("https://{tls_reset}/"),
+        format!("http://{closing}/"),
     ];
     let final_ = [
         "http://catalog.invalid/".to_owned(),
         format!("https://{plain}/"),
-        format!("http://{closing}/"),
     ];
 
     for url in transient {

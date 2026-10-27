@@ -481,7 +481,7 @@ async fn a_failed_load_table_names_the_table() {
         .to_string();
     assert!(message.contains(IDENT), "{message}");
 
-    let session = session_over(CatalogHttp::new(), CLOSED_PORT_URI);
+    let session = session_over(CatalogHttp::with_policy(SHORT_POLICY), CLOSED_PORT_URI);
     let message = load_table_any_auth(&session, &catalog, &creds)
         .await
         .unwrap_err()

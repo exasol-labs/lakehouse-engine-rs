@@ -93,28 +93,9 @@ async fn oauth2_client_credentials_grant(
             ))
         })?;
 
-    let answer = http.send(request).await.map_err(|error| {
-        UdfError::User(format!(
-            "OAuth2 token request failed: {}",
-            error.render(redact_secret)
-        ))
-    })?;
-
-    if !answer.status.is_success() {
-        let body = String::from_utf8_lossy(&answer.body).into_owned();
-        return Err(UdfError::User(format!(
-            "OAuth2 token endpoint returned HTTP {}: {}",
-            answer.status.as_u16(),
-            redact_secret(&body)
-        )));
-    }
-
-    let body: serde_json::Value = serde_json::from_slice(&answer.body).map_err(|e| {
-        UdfError::User(format!(
-            "failed to parse OAuth2 token response: {}",
-            redact_secret(&e.to_string())
-        ))
-    })?;
+    let body: serde_json::Value = http
+        .send_json(request, "OAuth2 token request", redact_secret)
+        .await?;
 
     let access_token = body
         .get("access_token")

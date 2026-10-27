@@ -17,6 +17,8 @@ const OAUTH_REFRESH_SKEW_SECS: u64 = 60;
 
 const OAUTH_DEFAULT_SCOPE: &str = "all-apis";
 
+const GRANT: &str = "Unity Catalog OAuth client-credentials grant";
+
 pub(crate) enum UnityAuth {
     None,
     Pat(String),
@@ -94,43 +96,16 @@ impl OAuthTokenSource {
             .header("accept", "application/json")
             .form(&form)
             .build()
-            .map_err(|e| {
-                UdfError::User(format!(
-                    "Unity Catalog OAuth client-credentials grant failed: {}",
-                    redact(&error_chain(&e))
-                ))
-            })?;
-        let answer = self.http.send(request).await.map_err(|e| {
-            UdfError::User(format!(
-                "Unity Catalog OAuth client-credentials grant failed: {}",
-                e.render(redact)
-            ))
-        })?;
-        if !answer.status.is_success() {
-            let body = String::from_utf8_lossy(&answer.body);
-            return Err(UdfError::User(format!(
-                "Unity Catalog OAuth client-credentials grant failed with HTTP {}: {}",
-                answer.status.as_u16(),
-                redact(&body)
-            )));
-        }
-        let parsed: OAuthTokenResponse = serde_json::from_slice(&answer.body).map_err(|e| {
-            UdfError::User(format!(
-                "Unity Catalog OAuth client-credentials grant returned an unparseable response: {}",
-                redact(&e.to_string())
-            ))
-        })?;
+            .map_err(|e| UdfError::User(format!("{GRANT} failed: {}", redact(&error_chain(&e)))))?;
+        let parsed: OAuthTokenResponse = self.http.send_json(request, GRANT, redact).await?;
         if parsed.access_token.is_empty() {
-            return Err(UdfError::User(
-                "Unity Catalog OAuth client-credentials grant returned no access_token".into(),
-            ));
+            return Err(UdfError::User(format!("{GRANT} returned no access_token")));
         }
         // A zero/absent lifetime would re-mint on every request.
-        let expires_in = parsed.expires_in.filter(|&secs| secs > 0).ok_or_else(|| {
-            UdfError::User(
-                "Unity Catalog OAuth client-credentials grant returned no usable expires_in".into(),
-            )
-        })?;
+        let expires_in = parsed
+            .expires_in
+            .filter(|&secs| secs > 0)
+            .ok_or_else(|| UdfError::User(format!("{GRANT} returned no usable expires_in")))?;
         Ok((parsed.access_token, expires_in))
     }
 }

@@ -2,7 +2,7 @@
 //! Credential values never appear in any returned error.
 
 use crate::auth::{CatalogAuth, redact_catalog_auth_error};
-use crate::catalog_http::CatalogHttp;
+use crate::catalog_http::{CatalogHttp, CatalogRequestError, quote_body};
 use crate::redaction::{redact_error_text, redact_secret_values};
 use crate::{ConnectionCreds, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
@@ -10,9 +10,6 @@ use iceberg::spec::TableMetadata;
 
 /// A batch-check answer is small, so a larger 2xx answer is refused.
 pub(crate) const MAX_ANSWER_BYTES: usize = 64 * 1024;
-/// The most of an answer body an error quotes. The quote is cut only after the whole read is
-/// redacted, so a secret that the cut splits was already replaced.
-pub(crate) const MAX_QUOTED_BODY_BYTES: usize = 4096;
 
 /// The OAuth2 grant-obtained bearer token is not in `creds`, so it is redacted explicitly.
 fn redact_catalog_text(msg: &str, auth: &CatalogAuth, creds: &ConnectionCreds) -> String {
@@ -59,91 +56,23 @@ fn build_signed_request(
     }
 }
 
-/// `authed_get_json`'s failure: the redacted message, and the HTTP status when the answer carried
-/// one, so a caller can tell a missing table from every other failure without parsing the message
-/// text.
-#[derive(Debug)]
-pub(crate) struct CatalogGetError {
-    status: Option<reqwest::StatusCode>,
-    message: String,
-}
-
-impl CatalogGetError {
-    fn new(status: Option<reqwest::StatusCode>, message: String) -> Self {
-        Self { status, message }
-    }
-
-    pub(crate) fn without_status(message: String) -> Self {
-        Self::new(None, message)
-    }
-
-    /// A 404 answer: the catalog has no loadable Iceberg table under this name.
-    pub(crate) fn is_not_found(&self) -> bool {
-        self.status == Some(reqwest::StatusCode::NOT_FOUND)
-    }
-
-    /// Prefixes the message with the table's dotted identifier, for every kind of failure.
-    pub(crate) fn named(self, identifier: &str) -> Self {
-        Self::new(
-            self.status,
-            format!("failed to load table '{identifier}': {}", self.message),
-        )
-    }
-}
-
-impl std::fmt::Display for CatalogGetError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl From<CatalogGetError> for UdfError {
-    fn from(error: CatalogGetError) -> Self {
-        UdfError::User(error.message)
-    }
-}
-
 pub(crate) async fn authed_get_json<T: serde::de::DeserializeOwned>(
     http: &CatalogHttp,
     url: &str,
     auth: &CatalogAuth,
     send_access_delegation: bool,
     creds: &ConnectionCreds,
-) -> Result<T, CatalogGetError> {
+) -> Result<T, CatalogRequestError> {
     let mut builder = http.get(url).header("accept", "application/json");
     if send_access_delegation {
         builder = builder.header("X-Iceberg-Access-Delegation", "vended-credentials");
     }
     let request = build_signed_request(builder, auth, creds)
-        .map_err(|e| CatalogGetError::without_status(e.to_string()))?;
-    let answer = http.send(request).await.map_err(|error| {
-        CatalogGetError::new(
-            error.status(),
-            format!(
-                "catalog request failed: {}",
-                error.render(|msg| redact_catalog_text(msg, auth, creds))
-            ),
-        )
-    })?;
-
-    if !answer.status.is_success() {
-        let body = String::from_utf8_lossy(&answer.body).into_owned();
-        return Err(CatalogGetError::new(
-            Some(answer.status),
-            format!(
-                "catalog returned HTTP {}: {}",
-                answer.status.as_u16(),
-                redact_catalog_text(&body, auth, creds)
-            ),
-        ));
-    }
-
-    serde_json::from_slice::<T>(&answer.body).map_err(|e| {
-        CatalogGetError::without_status(format!(
-            "failed to parse catalog response: {}",
-            redact_catalog_text(&e.to_string(), auth, creds)
-        ))
+        .map_err(|e| CatalogRequestError::without_status(e.to_string()))?;
+    http.send_json(request, "catalog request", |msg| {
+        redact_catalog_text(msg, auth, creds)
     })
+    .await
 }
 
 /// A non-2xx answer is a value, not an error, so the caller maps its status to its own failure.
@@ -197,21 +126,13 @@ pub(crate) async fn authed_post_json(
     }
 }
 
-/// `body` as an error may show it: redacted, then cut to [`MAX_QUOTED_BODY_BYTES`].
+/// `body` as an error may show it: redacted, then cut by [`quote_body`].
 pub(crate) fn quote_catalog_body(
     body: &str,
     auth: &CatalogAuth,
     creds: &ConnectionCreds,
 ) -> String {
-    let redacted = redact_catalog_text(body, auth, creds);
-    if redacted.len() <= MAX_QUOTED_BODY_BYTES {
-        return redacted;
-    }
-    let cut = redacted.floor_char_boundary(MAX_QUOTED_BODY_BYTES);
-    format!(
-        "{}... (truncated to {MAX_QUOTED_BODY_BYTES} bytes)",
-        &redacted[..cut]
-    )
+    quote_body(body.as_bytes(), |msg| redact_catalog_text(msg, auth, creds))
 }
 
 /// Reads the `metadata.json` a metastore points to (Iceberg § Metastore Tables) through `storage`.

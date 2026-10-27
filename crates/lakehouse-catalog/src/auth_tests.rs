@@ -65,7 +65,8 @@ async fn oauth2_grant_transport_failure_names_its_cause() {
     creds.client_id = Some("client-id-sentinel".into());
     creds.client_secret = Some(CLIENT_SECRET.into());
 
-    let err = oauth2_client_credentials_grant(&CatalogHttp::new(), CLOSED_PORT_URI, &creds)
+    let http = CatalogHttp::with_policy(SHORT_POLICY);
+    let err = oauth2_client_credentials_grant(&http, CLOSED_PORT_URI, &creds)
         .await
         .expect_err("a closed token endpoint must fail the grant");
 

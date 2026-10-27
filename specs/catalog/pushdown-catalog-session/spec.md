@@ -99,3 +99,12 @@ The adapter builds the catalog HTTP state once per pushdown request and reuses i
 * *WHEN* the adapter resolves the catalog session of a pushdown, `createVirtualSchema`, `REFRESH`, or `SET PROPERTIES` request
 * *THEN* the request SHALL fail with an error that names the warehouse and carries the catalog's answer
 * *AND* the adapter MUST NOT fall back to an empty prefix, because an unprefixed request reaches the catalog's default warehouse or answers every table with HTTP 404
+
+### Scenario: A failed loadTable names the table it loads
+
+* *GIVEN* a `loadTable` GET on a `CatalogSession` for the table `orders` in the namespace `sales.eu`, issued either by the enumeration of a `createVirtualSchema`, `REFRESH`, or `SET PROPERTIES` request or by a pushdown's table resolution
+* *WHEN* the GET fails with an HTTP status other than 404, with a transport error, with the 30-second bound of `catalog/catalog-http-resilience` running out, or with an answer that does not parse as a `loadTable` result
+* *THEN* the returned error SHALL name the table by its dotted catalog identifier `sales.eu.orders`, the form its identifier note records
+* *AND* the error SHALL carry the cause: the HTTP status and the redacted answer body, every cause the HTTP client reports, the statement of the 30-second bound, or the parse failure
+* *AND* a pushdown's `loadTable` that answers HTTP 404 SHALL fail with an error that names the table in the same way
+* *AND* naming the table MUST NOT change which enumeration loads are skipped, so an enumeration `loadTable` that answers HTTP 404 SHALL still skip the table with the `NotLoadableIcebergTable` reason

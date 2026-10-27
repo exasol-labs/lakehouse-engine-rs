@@ -156,32 +156,11 @@ impl UnityCatalogSession {
             }
             redact_error_text(msg, &secrets)
         };
-        let request = builder.build().map_err(|e| {
-            UdfError::User(format!(
-                "Unity Catalog {kind} request failed: {}",
-                redact(&error_chain(&e))
-            ))
-        })?;
-        let answer = self.http.send(request).await.map_err(|e| {
-            UdfError::User(format!(
-                "Unity Catalog {kind} request failed: {}",
-                e.render(redact)
-            ))
-        })?;
-        if !answer.status.is_success() {
-            let body = String::from_utf8_lossy(&answer.body);
-            return Err(UdfError::User(format!(
-                "Unity Catalog {kind} request failed with HTTP {}: {}",
-                answer.status.as_u16(),
-                redact(&body)
-            )));
-        }
-        serde_json::from_slice::<T>(&answer.body).map_err(|e| {
-            UdfError::User(format!(
-                "Unity Catalog {kind} request returned an unparseable response: {}",
-                redact(&e.to_string())
-            ))
-        })
+        let what = format!("Unity Catalog {kind} request");
+        let request = builder
+            .build()
+            .map_err(|e| UdfError::User(format!("{what} failed: {}", redact(&error_chain(&e)))))?;
+        Ok(self.http.send_json(request, &what, redact).await?)
     }
 }
 

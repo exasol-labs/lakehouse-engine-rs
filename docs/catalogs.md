@@ -766,7 +766,7 @@ The adapter retries these failures:
 
 - a connection attempt that reaches its 10 seconds
 - a connection that the catalog refuses, resets, or aborts
-- a TLS connection that the catalog closes without sending `close_notify`
+- an HTTP/1.1 or HTTP/2 connection that the catalog closes before its answer begins, with or without a TLS `close_notify`, as a proxy does when it reloads or ends an idle keep-alive connection
 - an answer with HTTP 408, 429, 502, 503, or 504
 
 A retry sends the same request again, with the same headers and body. A SigV4 signature and an OAuth2 token outlive the 30 seconds, so a retry is not signed again.
@@ -775,12 +775,11 @@ These failures are not retried. They fail the request at the first attempt:
 
 - a DNS failure, such as a host name that does not resolve
 - a TLS failure, such as an `https://` URL to a server that answers in plain HTTP
-- a connection that the catalog closes cleanly before its answer begins
 - an answer with any other HTTP status, such as 404 or 500
 
-`Retry-After` is read as a number of seconds or as an HTTP date in the IMF-fixdate form, such as `Sun, 06 Nov 1994 08:49:37 GMT`. The RFC 850 and asctime date forms are ignored, so the backoff wait applies. A `Retry-After` wait counts against the 30 seconds. A wait that would end after them is not taken, and the request fails at once with the answer it holds.
+`Retry-After` is read as a number of seconds or as an HTTP date in the IMF-fixdate form, such as `Sun, 06 Nov 1994 08:49:37 GMT`. The RFC 850 and asctime date forms are ignored, so the backoff wait applies. A wait counts against the 30 seconds. A retry needs at least 10 seconds of them left after its wait, the time one connection attempt may take. Otherwise the wait is not taken, and the request fails at once with the answer or error it holds.
 
-When the 30 seconds run out, the error states that the catalog sent no complete answer within 30 seconds, retries included. When the attempts run out first, the error is that of the last attempt, such as its HTTP status and answer.
+When the 30 seconds run out, the error states that the catalog sent no complete answer within 30 seconds, retries included. When the attempts run out first, the error is that of the last attempt, such as its HTTP status and answer. An error quotes at most the first 4096 bytes of an answer, so a proxy's HTML error page does not fill it.
 
 The 30 seconds include the transfer of the answer. A `loadTable` answer that takes longer to arrive fails the request. This matters most for queries, because a query's `loadTable` asks for the table's full snapshot history. A table with a long snapshot history behind a slow link can therefore fail at query time.
 

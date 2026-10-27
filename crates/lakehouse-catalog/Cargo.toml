@@ -30,6 +30,7 @@ aws-smithy-types       = { workspace = true }
 
 reqwest = { workspace = true }
 rustls  = { workspace = true }
+hyper   = { workspace = true }
 
 # AWS STS AssumeRole.
 aws-sdk-sts = { workspace = true }

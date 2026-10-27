@@ -4,8 +4,10 @@
 
 use crate::error_chain::{causes, error_chain};
 use aws_smithy_types::date_time::{DateTime, Format};
+use exasol_udf_sdk::error::UdfError;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::{IntoUrl, Request, RequestBuilder, Response, StatusCode};
+use serde::de::DeserializeOwned;
 use std::error::Error;
 use std::hash::{BuildHasher, RandomState};
 use std::io::ErrorKind;
@@ -33,11 +35,16 @@ const CATALOG_POLICY: RetryPolicy = RetryPolicy {
     backoff_base: Duration::from_millis(250),
 };
 
+/// The most of an answer body an error quotes. The quote is cut only after the whole read is
+/// redacted, so a secret that the cut splits was already replaced.
+pub(crate) const MAX_QUOTED_BODY_BYTES: usize = 4096;
+
 /// The HTTP client of one catalog session. Callers build a request with [`Self::get`] or
-/// [`Self::post`] and send it only through [`Self::send`] or [`Self::send_capped`], so every
-/// catalog request gets the same connect timeout, retries, and bound. A retry re-sends a clone of
-/// the request as the caller built and signed it: the bound ends long before a SigV4 signature or
-/// a cached OAuth token expires, so this type needs no knowledge of auth or signing.
+/// [`Self::post`] and send it only through [`Self::send_json`], [`Self::send`], or
+/// [`Self::send_capped`], so every catalog request gets the same connect timeout, retries, and
+/// bound. A retry re-sends a clone of the request as the caller built and signed it: the bound
+/// ends long before a SigV4 signature or a cached OAuth token expires, so this type needs no
+/// knowledge of auth or signing.
 #[derive(Clone)]
 pub(crate) struct CatalogHttp {
     client: reqwest::Client,
@@ -52,6 +59,15 @@ pub(crate) struct CatalogAnswer {
     pub(crate) body: Vec<u8>,
     /// The body exceeded the caller's byte cap, and `body` holds only its first bytes.
     pub(crate) cut: bool,
+}
+
+/// A failed catalog request, such as a [`CatalogHttp::send_json`], its message already redacted,
+/// with the HTTP status when the answer carried one, so a caller can tell a missing table from
+/// every other failure without parsing the message text.
+#[derive(Debug)]
+pub(crate) struct CatalogRequestError {
+    status: Option<StatusCode>,
+    message: String,
 }
 
 /// A catalog request that ended without a complete answer. [`Self::render`] gives its text.
@@ -97,20 +113,45 @@ impl CatalogHttp {
     /// transport failure or the spent bound is an error. A request whose body cannot be cloned is
     /// sent once.
     pub(crate) async fn send(&self, request: Request) -> Result<CatalogAnswer, CatalogHttpError> {
-        self.send_within_bound(request, usize::MAX).await
+        self.send_capped(request, usize::MAX).await
+    }
+
+    /// [`Self::send`], then parses a 2xx answer's body as JSON. Every failure is an error whose
+    /// message starts with `what`, shows each cause through `redact`, and quotes a non-2xx
+    /// answer's body as [`quote_body`] cuts it.
+    pub(crate) async fn send_json<T: DeserializeOwned>(
+        &self,
+        request: Request,
+        what: &str,
+        redact: impl Fn(&str) -> String,
+    ) -> Result<T, CatalogRequestError> {
+        let answer = self.send(request).await.map_err(|error| {
+            CatalogRequestError::new(
+                error.status(),
+                format!("{what} failed: {}", error.render(&redact)),
+            )
+        })?;
+        if !answer.status.is_success() {
+            return Err(CatalogRequestError::new(
+                Some(answer.status),
+                format!(
+                    "{what} failed with HTTP {}: {}",
+                    answer.status.as_u16(),
+                    quote_body(&answer.body, &redact)
+                ),
+            ));
+        }
+        serde_json::from_slice(&answer.body).map_err(|error| {
+            CatalogRequestError::without_status(format!(
+                "{what} returned an unparseable response: {}",
+                redact(&error.to_string())
+            ))
+        })
     }
 
     /// [`Self::send`], keeping at most `max_bytes` of the answer body; [`CatalogAnswer::cut`]
     /// reports a cut.
     pub(crate) async fn send_capped(
-        &self,
-        request: Request,
-        max_bytes: usize,
-    ) -> Result<CatalogAnswer, CatalogHttpError> {
-        self.send_within_bound(request, max_bytes).await
-    }
-
-    async fn send_within_bound(
         &self,
         mut request: Request,
         max_bytes: usize,
@@ -184,7 +225,43 @@ impl CatalogHttp {
             requested,
             backoff,
             deadline.saturating_duration_since(Instant::now()),
+            self.policy.connect_timeout,
         )
+    }
+}
+
+impl CatalogRequestError {
+    fn new(status: Option<StatusCode>, message: String) -> Self {
+        Self { status, message }
+    }
+
+    pub(crate) fn without_status(message: String) -> Self {
+        Self::new(None, message)
+    }
+
+    /// A 404 answer: the catalog has no loadable Iceberg table under this name.
+    pub(crate) fn is_not_found(&self) -> bool {
+        self.status == Some(StatusCode::NOT_FOUND)
+    }
+
+    /// Prefixes the message with the table's dotted identifier, for every kind of failure.
+    pub(crate) fn named(self, identifier: &str) -> Self {
+        Self::new(
+            self.status,
+            format!("failed to load table '{identifier}': {}", self.message),
+        )
+    }
+}
+
+impl std::fmt::Display for CatalogRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<CatalogRequestError> for UdfError {
+    fn from(error: CatalogRequestError) -> Self {
+        UdfError::User(error.message)
     }
 }
 
@@ -248,6 +325,20 @@ async fn read_body(
     Ok((body, false))
 }
 
+/// `body` as an error may show it: passed through `redact`, then cut to
+/// [`MAX_QUOTED_BODY_BYTES`].
+pub(crate) fn quote_body(body: &[u8], redact: impl Fn(&str) -> String) -> String {
+    let redacted = redact(&String::from_utf8_lossy(body));
+    if redacted.len() <= MAX_QUOTED_BODY_BYTES {
+        return redacted;
+    }
+    let cut = redacted.floor_char_boundary(MAX_QUOTED_BODY_BYTES);
+    format!(
+        "{}... (truncated to {MAX_QUOTED_BODY_BYTES} bytes)",
+        &redacted[..cut]
+    )
+}
+
 fn stated_wait(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get(RETRY_AFTER)?.to_str().ok()?;
     retry_after_wait(value, SystemTime::now())
@@ -288,14 +379,19 @@ fn backoff_wait(base: Duration, retry: u32, jitter: u32) -> Duration {
 }
 
 /// The catalog's own wait when it stated one, else `backoff`; `None` when that wait would leave
-/// no time for the next attempt.
+/// less than `attempt_room` for the next attempt, which then would only spend the bound and hide
+/// the failure at hand behind it.
 fn chosen_wait(
     requested: Option<Duration>,
     backoff: Duration,
     time_left: Duration,
+    attempt_room: Duration,
 ) -> Option<Duration> {
     let wait = requested.unwrap_or(backoff);
-    (wait < time_left).then_some(wait)
+    time_left
+        .checked_sub(wait)
+        .is_some_and(|rest| rest >= attempt_room)
+        .then_some(wait)
 }
 
 /// A connection that never opened in time or that the peer cut, with no TLS library error: a new
@@ -316,9 +412,15 @@ fn is_transient_cause_chain(error: &(dyn Error + 'static)) -> bool {
                 ErrorKind::ConnectionRefused
                     | ErrorKind::ConnectionReset
                     | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
                     | ErrorKind::UnexpectedEof
             )
         });
+        // A proxy that reloads or ends idle keep-alive closes cleanly (#538): h2 reports a
+        // `BrokenPipe`, matched above, and HTTP/1.1 an incomplete message.
+        cut_connection |= cause
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message);
     }
     cut_connection
 }

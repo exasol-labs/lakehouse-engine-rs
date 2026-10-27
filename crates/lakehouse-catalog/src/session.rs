@@ -1,6 +1,6 @@
 use crate::auth::{CatalogAuth, resolve_catalog_auth};
-use crate::catalog_http::CatalogHttp;
-use crate::iceberg_io::{CatalogGetError, authed_get_json};
+use crate::catalog_http::{CatalogHttp, CatalogRequestError};
+use crate::iceberg_io::authed_get_json;
 use crate::namespace::parse_table_ident;
 use crate::redaction::redact_credentials;
 use crate::{CatalogProps, ConnectionCreds};
@@ -157,7 +157,7 @@ pub(crate) async fn load_table_schema_metadata(
     namespace: &NamespaceIdent,
     table_name: &str,
     creds: &ConnectionCreds,
-) -> Result<TableMetadata, CatalogGetError> {
+) -> Result<TableMetadata, CatalogRequestError> {
     load_table(
         session,
         namespace,
@@ -179,7 +179,7 @@ async fn load_table(
     query: &str,
     send_access_delegation: bool,
     creds: &ConnectionCreds,
-) -> Result<LoadTableResult, CatalogGetError> {
+) -> Result<LoadTableResult, CatalogRequestError> {
     let url = build_load_table_url(
         &session.catalog_uri,
         &session.prefix,

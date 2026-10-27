@@ -12,7 +12,7 @@ use iceberg::{NamespaceIdent, TableIdent};
 use tokio::sync::OnceCell;
 
 use crate::ConnectionCreds;
-use crate::iceberg_io::CatalogGetError;
+use crate::catalog_http::CatalogRequestError;
 use crate::namespace::{CATALOG_REQUEST_CONCURRENCY, list_namespace_tables};
 use crate::session::{CatalogSession, load_table_schema_metadata};
 
@@ -264,9 +264,9 @@ impl IcebergRestCatalogClient {
         &self,
         session: &CatalogSession,
         ident: &CatalogTableIdent,
-    ) -> Result<CatalogTable, CatalogGetError> {
+    ) -> Result<CatalogTable, CatalogRequestError> {
         let namespace = NamespaceIdent::from_vec(ident.namespace.clone()).map_err(|e| {
-            CatalogGetError::without_status(format!(
+            CatalogRequestError::without_status(format!(
                 "invalid namespace in '{}': {e}",
                 catalog_identifier_string(ident)
             ))

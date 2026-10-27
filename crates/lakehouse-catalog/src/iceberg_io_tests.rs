@@ -1,4 +1,5 @@
 use super::*;
+use crate::catalog_http::MAX_QUOTED_BODY_BYTES;
 use crate::test_support::*;
 use std::sync::{Arc, Mutex};
 
@@ -130,7 +131,7 @@ async fn load_table_error_redacts_session_bearer_and_static_secrets() {
 
     let msg = err.to_string();
     assert!(
-        msg.starts_with("catalog returned HTTP 401: "),
+        msg.starts_with("catalog request failed with HTTP 401: "),
         "the redaction closure must have run against the real 401 body, got: {msg}"
     );
     assert!(
@@ -159,7 +160,10 @@ async fn a_persistent_503_fails_after_five_attempts_with_the_redacted_answer() {
 
     assert_eq!(requests.lock().unwrap().len(), 5);
     let msg = error.to_string();
-    assert!(msg.contains("catalog returned HTTP 503"), "{msg}");
+    assert!(
+        msg.contains("catalog request failed with HTTP 503"),
+        "{msg}"
+    );
     assert!(!msg.contains(BEARER_TOK), "{msg}");
 }
 
@@ -221,7 +225,7 @@ async fn a_post_to_a_closed_port_is_an_error() {
     let auth = CatalogAuth::None;
 
     let answer = authed_post_json(
-        &CatalogHttp::new(),
+        &CatalogHttp::with_policy(SHORT_POLICY),
         "http://127.0.0.1:1/check",
         &serde_json::json!({}),
         &auth,

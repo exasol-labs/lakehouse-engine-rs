@@ -3417,6 +3417,7 @@ dependencies = [
  "aws-smithy-types",
  "exasol-udf-sdk",
  "futures",
+ "hyper",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
