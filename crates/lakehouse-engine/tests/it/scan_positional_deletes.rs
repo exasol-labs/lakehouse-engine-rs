@@ -1,4 +1,5 @@
 use crate::scan_fixture;
+use crate::scan_fixture::concurrency_probe::ConcurrencyProbe;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -520,33 +521,6 @@ struct TrackingStore {
     concurrency: Option<ConcurrencyProbe>,
 }
 
-/// Peak-concurrency counter over probed reads, with a fixed delay forcing deterministic overlap.
-#[derive(Debug)]
-struct ConcurrencyProbe {
-    needles: Vec<String>,
-    in_flight: Arc<AtomicUsize>,
-    peak: Arc<AtomicUsize>,
-    delay: Duration,
-}
-
-impl ConcurrencyProbe {
-    fn is_probed_read(&self, location: &ObjectStorePath) -> bool {
-        let path = location.as_ref();
-        self.needles.iter().any(|n| path.contains(n.as_str()))
-    }
-}
-
-/// Decrements on drop so a cancelled read (fired timeout) never leaks an in-flight count.
-struct InFlightGuard {
-    in_flight: Arc<AtomicUsize>,
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 impl std::fmt::Display for TrackingStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "TrackingStore({})", self.inner)
@@ -587,12 +561,7 @@ impl ObjectStore for TrackingStore {
             && let Some(probe) = &self.concurrency
             && probe.is_probed_read(location)
         {
-            let now = probe.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            probe.peak.fetch_max(now, Ordering::SeqCst);
-            let _guard = InFlightGuard {
-                in_flight: Arc::clone(&probe.in_flight),
-            };
-            tokio::time::sleep(probe.delay).await;
+            let _in_flight = probe.enter().await;
             return self.inner.get_opts(location, options).await;
         }
         self.inner.get_opts(location, options).await
@@ -770,25 +739,20 @@ fn scan_reads_shared_delete_file_once_per_shard() {
     assert!(ids.contains(&200), "f1's other rows must survive: {ids:?}");
 }
 
-/// A current-thread runtime fires timers only once it parks, so every read admitted in one
-/// scheduling wave bumps the peak before any delay elapses.
-const DELETE_READ_DELAY: Duration = Duration::from_millis(50);
-
 /// A deadlocked limiter fails here rather than hanging CI.
 const DELETE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn tracking_store_with_probe(needles: Vec<String>) -> (Arc<TrackingStore>, Arc<AtomicUsize>) {
-    let peak = Arc::new(AtomicUsize::new(0));
+/// `expected_peak` is the peak the test asserts; probed reads wait until that many are in flight.
+fn tracking_store_with_probe(
+    needles: Vec<String>,
+    expected_peak: usize,
+) -> (Arc<TrackingStore>, Arc<AtomicUsize>) {
+    let (probe, peak) = ConcurrencyProbe::new(needles, expected_peak);
     let store = Arc::new(TrackingStore {
         inner: Arc::new(LocalFileSystem::new()),
         gets: Arc::new(std::sync::Mutex::new(Vec::new())),
         calls: Arc::new(AtomicUsize::new(0)),
-        concurrency: Some(ConcurrencyProbe {
-            needles,
-            in_flight: Arc::new(AtomicUsize::new(0)),
-            peak: Arc::clone(&peak),
-            delay: DELETE_READ_DELAY,
-        }),
+        concurrency: Some(probe),
     });
     (store, peak)
 }
@@ -815,7 +779,7 @@ fn scan_delete_reads_bounded_by_connection_budget() {
     let mut spec = scan_spec(vec![entry], None, None);
     spec.common.s3_max_connections = BUDGET;
 
-    let (store, peak) = tracking_store_with_probe(needles);
+    let (store, peak) = tracking_store_with_probe(needles, BUDGET);
     let rows = block_on(async {
         tokio::time::timeout(
             DELETE_READ_TIMEOUT,
@@ -858,7 +822,7 @@ fn scan_delete_reads_serial_when_budget_is_one() {
     let mut spec = scan_spec(vec![entry], None, None);
     spec.common.s3_max_connections = 1;
 
-    let (store, peak) = tracking_store_with_probe(needles);
+    let (store, peak) = tracking_store_with_probe(needles, 1);
     let rows = block_on(async {
         tokio::time::timeout(
             DELETE_READ_TIMEOUT,
@@ -982,7 +946,7 @@ fn scan_delete_reads_bounded_across_join_sides() {
         storage: ScanStorage::Inline(dummy_storage()),
     });
 
-    let (store, peak) = tracking_store_with_probe(needles);
+    let (store, peak) = tracking_store_with_probe(needles, BUDGET);
     let rows = block_on(async {
         let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
             TestContext::scalar(vec![]),
@@ -1443,7 +1407,7 @@ fn scan_footer_fetches_bounded_by_connection_budget() {
     let mut spec = scan_spec_with_logical_schema(entries, None, None);
     spec.common.s3_max_connections = BUDGET;
 
-    let (store, peak) = tracking_store_with_probe(needles.clone());
+    let (store, peak) = tracking_store_with_probe(needles.clone(), BUDGET);
 
     let plan = block_on(async {
         let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
@@ -1673,7 +1637,7 @@ fn scan_footer_fetches_bounded_across_join_sides() {
         storage: ScanStorage::Inline(dummy_storage()),
     });
 
-    let (store, peak) = tracking_store_with_probe(needles);
+    let (store, peak) = tracking_store_with_probe(needles, BUDGET);
 
     block_on(async {
         let mut config = session_config_for_spec(&spec);
