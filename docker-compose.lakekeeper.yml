@@ -4,7 +4,7 @@
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up openfga-migrate
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up lakekeeper-migrate
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
-#     seaweedfs exasol keycloak lakekeeper-db openfga-db openfga lakekeeper
+#     seaweedfs exasol keycloak lakekeeper-db openfga-db openfga lakekeeper proxy
 # Lakekeeper does not rebuild ownership or grants when its authz backend changes after
 # bootstrap, so a stack persisted from the earlier `allowall` overlay needs
 # `docker compose ... down -v` once.
@@ -134,9 +134,9 @@ services:
       - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
       - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
       - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
-      # Keycloak stamps `iss` from the request host, so accept both issuers.
+      # Keycloak stamps `iss` from the request host, so accept every host the tests use.
       - LAKEKEEPER__OPENID_PROVIDER_URI=http://keycloak:8080/realms/iceberg
-      - "LAKEKEEPER__OPENID_ADDITIONAL_ISSUERS=http://localhost:${LH_KEYCLOAK_PORT:-28080}/realms/iceberg"
+      - "LAKEKEEPER__OPENID_ADDITIONAL_ISSUERS=http://localhost:${LH_KEYCLOAK_PORT:-28080}/realms/iceberg,http://keycloak-via-proxy:8080/realms/iceberg"
       - LAKEKEEPER__OPENID_AUDIENCE=lakekeeper
       - LAKEKEEPER__AUTHZ_BACKEND=openfga
       - LAKEKEEPER__OPENFGA__ENDPOINT=http://openfga:8081
@@ -164,6 +164,11 @@ services:
     networks:
       lakehouse:
         ipv4_address: 10.84.0.32
+
+  proxy:
+    extra_hosts:
+      - "keycloak-via-proxy:10.84.0.30"
+      - "lakekeeper-via-proxy:10.84.0.32"
 
   # Re-declares the base /etc/hosts loop to add keycloak and lakekeeper.
   exasol:

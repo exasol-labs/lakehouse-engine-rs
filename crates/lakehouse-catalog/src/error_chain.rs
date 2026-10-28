@@ -1,5 +1,8 @@
 use std::error::Error;
 
+use http::Uri;
+use hyper_util::client::proxy::matcher::Matcher;
+
 /// HTTP client errors render only their outermost layer, such as `error sending request`; the DNS,
 /// TLS, or connect cause is further down `source()`. A cause the text already shows is skipped.
 pub fn error_chain(error: &(dyn Error + 'static)) -> String {
@@ -18,7 +21,31 @@ pub fn error_chain(error: &(dyn Error + 'static)) -> String {
             "; the server did not answer with TLS, so check whether the URL should use http://",
         );
     }
+    if let Some(proxy) =
+        failed_connect_url(error).and_then(|url| proxy_for(&Matcher::from_env(), &url))
+    {
+        text.push_str(&format!("; the connection went through the proxy {proxy}"));
+    }
     text
+}
+
+fn failed_connect_url(error: &(dyn Error + 'static)) -> Option<reqwest::Url> {
+    causes(error)
+        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .find(|request| request.is_connect())
+        .and_then(|request| request.url().cloned())
+}
+
+/// The proxy that `matcher` picks for `url`, without its credentials.
+fn proxy_for(matcher: &Matcher, url: &reqwest::Url) -> Option<String> {
+    let intercept = matcher.intercept(&url.as_str().parse::<Uri>().ok()?)?;
+    let proxy = intercept.uri();
+    let scheme = proxy.scheme_str().unwrap_or("http");
+    let host = proxy.host()?;
+    Some(match proxy.port_u16() {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    })
 }
 
 /// rustls reports a plain-HTTP answer as `InvalidContentType`.

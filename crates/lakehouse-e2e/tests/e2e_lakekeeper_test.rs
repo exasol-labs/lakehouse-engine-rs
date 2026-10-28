@@ -13,10 +13,10 @@ mod common;
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VsProps,
     assert_decimal_orders_numerically, assert_text_columns, create_schema_and_scripts,
-    create_virtual_schema_with_password, declared_type, enumerated_table_names, error_text,
-    exa_conn, expected_join_rows, explain_virtual_sql, fetch_join_rows, has_broadcast_join_block,
-    has_two_scan_wrapper, install_slc, join_query, parse_int, projection_rows, runtime, upload_so,
-    value_to_string,
+    create_schema_and_scripts_with_env, create_virtual_schema_with_password, declared_type,
+    enumerated_table_names, error_text, exa_conn, expected_join_rows, explain_virtual_sql,
+    fetch_join_rows, has_broadcast_join_block, has_two_scan_wrapper, install_slc, join_query,
+    parse_int, projection_rows, runtime, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
@@ -1495,4 +1495,77 @@ fn permission_check_lists_unreadable_tables_and_refuses_their_queries() {
     assert_events_listed_and_refused("after create");
     exa_conn().execute(&format!("ALTER VIRTUAL SCHEMA {VS_PERMISSION} REFRESH"));
     assert_events_listed_and_refused("after refresh");
+}
+
+const PROXY_ADAPTER_SCHEMA: &str = "LHVS_PROXY";
+const VS_PROXY: &str = "LAKEKEEPER_PROXY_VS";
+const VS_PROXY_VENDED: &str = "LAKEKEEPER_PROXY_VENDED_VS";
+
+/// Every CONNECTION address uses a `*-via-proxy` name that only the forward proxy resolves.
+fn password_via_proxy(warehouse: &str, vended: bool) -> CatalogConnectionPassword {
+    let password = lakekeeper_connection_password(warehouse, vended);
+    CatalogConnectionPassword {
+        endpoint: if vended {
+            password.endpoint.clone()
+        } else {
+            "http://seaweedfs-via-proxy:8333".to_string()
+        },
+        oauth2_server_uri: password
+            .oauth2_server_uri
+            .as_deref()
+            .map(|uri| uri.replace("//keycloak:", "//keycloak-via-proxy:")),
+        ..password
+    }
+}
+
+/// Scenario: Catalog, storage, and STS requests go through the proxy
+#[test]
+fn lakekeeper_oauth_batch_check_and_vended_reads_go_through_the_proxy() {
+    setup();
+    permission_setup();
+    stack::wait_for_proxy();
+    for host in [
+        "lakekeeper-via-proxy",
+        "keycloak-via-proxy",
+        "seaweedfs-via-proxy",
+    ] {
+        stack::assert_resolves_only_through_proxy(host);
+    }
+    let proxy = [("HTTP_PROXY", stack::PROXY_URL_INTERNAL)];
+    let mut sys = exa_conn();
+    create_schema_and_scripts_with_env(&mut sys, PROXY_ADAPTER_SCHEMA, &proxy, &proxy);
+    let catalog_uri =
+        LAKEKEEPER_CATALOG_URI_INTERNAL.replace("//lakekeeper:", "//lakekeeper-via-proxy:");
+
+    create_virtual_schema_with_password(
+        &mut sys,
+        &VsProps::new(VS_PROXY, E2E_NAMESPACE)
+            .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
+            .with_catalog_conn_name("LAKEKEEPER_PROXY_CREDS")
+            .with_property("PERMISSION_CHECK", "LAKEKEEPER")
+            .with_property("USER_MAPPING", PERMISSION_USER_MAPPING),
+        &catalog_uri,
+        &password_via_proxy(WAREHOUSE_AUTHZ, false),
+    );
+    sys.execute(&format!(
+        "GRANT SELECT ON SCHEMA {VS_PROXY} TO {}",
+        ALLOWED_USER.0
+    ));
+    assert_eq!(event_ids(ALLOWED_USER, VS_PROXY), all_event_ids());
+
+    create_virtual_schema_with_password(
+        &mut sys,
+        &VsProps::new(VS_PROXY_VENDED, E2E_NAMESPACE)
+            .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
+            .with_catalog_conn_name("LAKEKEEPER_PROXY_VENDED_CREDS"),
+        &catalog_uri,
+        &password_via_proxy(WAREHOUSE_VENDED, true),
+    );
+    assert_eq!(
+        sys.query_scalar_i64(&format!(
+            "SELECT COUNT(*) FROM {VS_PROXY_VENDED}.{}",
+            E2E_TABLE.to_uppercase()
+        )),
+        SEED_TOTAL_ROWS as i64
+    );
 }

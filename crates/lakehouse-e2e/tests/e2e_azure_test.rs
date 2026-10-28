@@ -11,8 +11,9 @@ use common::azure::{self, AzureContainer};
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SO_UDF_OBJECT_PATH, SYS_PASSWORD, VsProps,
     assert_decimal_orders_numerically, create_schema_and_scripts,
-    create_virtual_schema_with_password, declared_type, exa_conn, explain_virtual_sql, install_slc,
-    parse_int, projection_rows, runtime, upload_so, value_to_string,
+    create_schema_and_scripts_with_env, create_virtual_schema_with_password, declared_type,
+    exa_conn, explain_virtual_sql, install_slc, parse_int, projection_rows, runtime, upload_so,
+    value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
@@ -462,6 +463,44 @@ fn azure_static_and_vended_creds_end_to_end() {
     );
 
     direct_storage_over_adls_returns_correct_rows(&mut conn, &fixture);
+    adls_reads_tunnel_through_the_https_proxy(&mut conn, &fixture);
+}
+
+/// Scenario: HTTPS endpoints are reached through a CONNECT tunnel
+fn adls_reads_tunnel_through_the_https_proxy(conn: &mut ExaConn, fixture: &AzureFixture) {
+    const ADAPTER_SCHEMA: &str = "LHVS_PROXY";
+    const PROXY_VS: &str = "AZ_PROXY_VS";
+    stack::wait_for_proxy();
+    let since = stack::proxy_log_mark();
+    let proxy = [("HTTPS_PROXY", stack::PROXY_URL_INTERNAL)];
+    create_schema_and_scripts_with_env(conn, ADAPTER_SCHEMA, &proxy, &proxy);
+    create_virtual_schema_with_password(
+        conn,
+        &VsProps::new(PROXY_VS, "")
+            .with_adapter_schema(ADAPTER_SCHEMA)
+            .with_catalog_conn_name("AZ_PROXY_CREDS")
+            .with_catalog_kind("DIRECT_STORAGE"),
+        &format!(
+            "abfss://{}@{}.dfs.core.windows.net/direct",
+            fixture.container_name, fixture.account_name
+        ),
+        &CatalogConnectionPassword {
+            account_name: Some(fixture.account_name.clone()),
+            account_key: Some(azure::account_key()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        conn.query_row_count(&format!("SELECT EVENT_ID FROM {PROXY_VS}.EVENTS")),
+        4
+    );
+    let tunnel = format!("CONNECT {}.", fixture.account_name);
+    let log = stack::proxy_log_since(&since);
+    assert!(
+        log.lines()
+            .any(|line| line.contains(&tunnel) && line.contains(".core.windows.net:443")),
+        "no CONNECT tunnel to the ADLS account: {log}"
+    );
 }
 
 /// Runs inside [`azure_static_and_vended_creds_end_to_end`] to share its container guard.

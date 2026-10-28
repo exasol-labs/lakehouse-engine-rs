@@ -68,6 +68,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rustls  = { version = "0.23", default-features = false }
 # The HTTP stack under reqwest, for its typed incomplete-message error.
 hyper   = { version = "1", default-features = false }
+# reqwest's own proxy selection from HTTP_PROXY, HTTPS_PROXY, and NO_PROXY, to name the proxy in an error.
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
+http       = { version = "1" }
 
 # Official AWS STS client: owns the AssumeRole wire protocol, signing, and endpoint rules.
 aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }

@@ -7,10 +7,11 @@ use common::cloud_fixture::panic_message;
 use common::e2e_harness::{
     SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_binary_values_refused,
     assert_decimal_orders_numerically, assert_notes_well_formed, assert_text_columns,
-    assert_type_matrix, column_adapter_notes, create_schema_and_scripts, declared_types,
-    error_text, exa_conn, explain_virtual_sql, identifier_note, install_slc, int_column, note_of,
-    pairs, parse_int, partition_positions, query_error, reads, refuses, runtime, skipped_entries,
-    try_create_virtual_schema_with_password, upload_so, value_to_string,
+    assert_type_matrix, column_adapter_notes, create_schema_and_scripts,
+    create_schema_and_scripts_with_env, declared_types, error_text, exa_conn, explain_virtual_sql,
+    identifier_note, install_slc, int_column, note_of, pairs, parse_int, partition_positions,
+    query_error, reads, refuses, runtime, skipped_entries, try_create_virtual_schema_with_password,
+    upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::glue::{
@@ -29,8 +30,8 @@ use common::seed::{
     INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
 };
 use common::stack::{
-    CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
-    wait_for_exasol,
+    CatalogConnectionPassword, PROXY_URL_INTERNAL, build_create_connection_sql, exasol_host,
+    exasol_sql_port, proxy_log_mark, proxy_log_since, wait_for_exasol, wait_for_proxy,
 };
 use common::timestamp_precision::expected_timestamp_precision;
 
@@ -222,7 +223,7 @@ type FixtureCheck = fn(&GlueRun, &mut ExaConn);
 #[test]
 fn glue_checks_pass_against_one_provisioned_fixture() {
     let run = provision();
-    let checks: [(&str, FixtureCheck); 11] = [
+    let checks: [(&str, FixtureCheck); 12] = [
         (
             "listing",
             check_listing_includes_routed_tables_and_records_every_skip,
@@ -249,6 +250,7 @@ fn glue_checks_pass_against_one_provisioned_fixture() {
             "assume role",
             check_assume_role_connection_reads_through_the_role,
         ),
+        ("HTTPS proxy", check_https_proxy_tunnels_glue_sts_and_s3),
         (
             "Iceberg REST paging",
             check_iceberg_rest_listing_reaches_past_the_first_page,
@@ -867,6 +869,90 @@ fn check_iceberg_rest_listing_reaches_past_the_first_page(run: &GlueRun, conn: &
     let mut cleanup = redacting_conn();
     let _ = cleanup.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {REST_VS} CASCADE"));
     let _ = cleanup.try_execute(&format!("DROP CONNECTION IF EXISTS {REST_CONN}"));
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// Scenario: HTTPS endpoints are reached through a CONNECT tunnel
+fn check_https_proxy_tunnels_glue_sts_and_s3(run: &GlueRun, conn: &mut ExaConn) {
+    const ADAPTER_SCHEMA: &str = "LHVS_PROXY";
+    const PROXY_VS: &str = "GLUE_PROXY_ROLE";
+    const PROXY_CONN: &str = "GLUE_PROXY_ROLE_CREDS";
+    const PROXY_REST_VS: &str = "GLUE_PROXY_REST";
+    const PROXY_REST_CONN: &str = "GLUE_PROXY_REST_CREDS";
+    let env = run.env();
+    let catalog_id = env.expect(runtime().block_on(run.catalog_id()), "read the catalog id");
+    wait_for_proxy();
+    let since = proxy_log_mark();
+    let proxy = [("HTTPS_PROXY", PROXY_URL_INTERNAL)];
+    create_schema_and_scripts_with_env(conn, ADAPTER_SCHEMA, &proxy, &proxy);
+    let database = run.database();
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        for (vs, connection, uri, password, kind) in [
+            (
+                PROXY_VS,
+                PROXY_CONN,
+                env.glue_endpoint(),
+                glue_assume_role_connection_password(env),
+                Some("GLUE"),
+            ),
+            (
+                PROXY_REST_VS,
+                PROXY_REST_CONN,
+                env.iceberg_rest_endpoint(),
+                glue_iceberg_rest_connection_password(env, &catalog_id),
+                None,
+            ),
+        ] {
+            let mut props = VsProps::new(vs, &database)
+                .with_adapter_schema(ADAPTER_SCHEMA)
+                .with_catalog_conn_name(connection);
+            if let Some(kind) = kind {
+                props = props.with_catalog_kind(kind);
+            }
+            let response = try_create_virtual_schema_with_password(
+                &mut redacting_conn(),
+                &props,
+                &uri,
+                &password,
+            );
+            assert_eq!(
+                response["status"].as_str(),
+                Some("ok"),
+                "CREATE VIRTUAL SCHEMA {vs} failed: {}",
+                env.redact(&response["exception"].to_string())
+            );
+        }
+        assert_eq!(
+            conn.query_scalar_i64(&format!(
+                "SELECT COUNT(*) FROM {PROXY_VS}.{}",
+                ICEBERG_ORDERS.to_uppercase()
+            )),
+            ORDERS.len() as i64
+        );
+        let tunnels: Vec<String> = proxy_log_since(&since)
+            .lines()
+            .filter_map(|line| {
+                line.split_once("): CONNECT ")
+                    .map(|(_, rest)| rest.to_string())
+            })
+            .filter_map(|rest| rest.split_whitespace().next().map(str::to_string))
+            .collect();
+        for service in ["glue.", "sts.", "s3"] {
+            assert!(
+                tunnels
+                    .iter()
+                    .any(|host| host.contains(service) && host.ends_with(".amazonaws.com:443")),
+                "no CONNECT tunnel to a {service} host: {tunnels:?}"
+            );
+        }
+    }));
+    let mut cleanup = redacting_conn();
+    for (vs, connection) in [(PROXY_VS, PROXY_CONN), (PROXY_REST_VS, PROXY_REST_CONN)] {
+        let _ = cleanup.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs} CASCADE"));
+        let _ = cleanup.try_execute(&format!("DROP CONNECTION IF EXISTS {connection}"));
+    }
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }

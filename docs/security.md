@@ -183,6 +183,10 @@ The adapter evaluates no Lake Formation grant. It uses no Lake Formation credent
 
 A `warehouse` that names another account's `CatalogId` is untested (#TBD). To read another account's catalog, assume a role in that account.
 
+## Proxy credentials
+
+A proxy URL in a script's `%env` line may carry a user name and password. Error messages name the proxy without them. Anyone who can read the script source, such as through `EXA_ALL_SCRIPTS`, can read them. See [Proxy](install.md#proxy).
+
 ## Rotation
 
 Every query re-resolves the CONNECTION, with no cache and no restart. Rotate with `ALTER CONNECTION`, which keeps the grants. `CREATE OR REPLACE CONNECTION` drops them. A sealed envelope of an in-flight vended query fails the AEAD open, so rotate when no vended query is in flight.
