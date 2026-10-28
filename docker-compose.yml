@@ -77,6 +77,9 @@ services:
   # it fails on DNS. Overlays add their own services' names.
   proxy:
     image: kalaksi/tinyproxy:1.7
+    volumes:
+      - ./scripts/proxy/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
+      - ./scripts/proxy/filter:/etc/tinyproxy/filter:ro
     extra_hosts:
       - "seaweedfs-via-proxy:10.84.0.10"
       - "iceberg-rest-via-proxy:10.84.0.11"

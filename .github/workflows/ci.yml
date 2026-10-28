@@ -353,12 +353,18 @@ jobs:
         run: docker compose pull --quiet
 
       # `up --wait` fails on a one-shot container even after a clean exit, so
-      # one-shot jobs are `docker wait`-ed first.
+      # one-shot jobs are `docker wait`-ed.
       - name: Start stack (Exasol + SeaweedFS + Iceberg REST)
         run: |
-          docker compose up -d --wait exasol seaweedfs iceberg-rest proxy
-
+          docker compose up -d --wait seaweedfs iceberg-rest
           docker compose up -d spark-iceberg-fixtures
+          docker compose up -d --wait exasol proxy
+
+      - name: Build E2E suite
+        run: cargo test --workspace --features lakehouse-e2e/exasol-e2e --test e2e_local --no-run
+
+      - name: Wait for Spark fixtures
+        run: |
           SPARK_FIXTURES_EXIT=$(docker wait lakehouse-engine-rs-spark-iceberg-fixtures-1)
           if [ "$SPARK_FIXTURES_EXIT" != "0" ]; then
             echo "::error::spark-iceberg-fixtures exited $SPARK_FIXTURES_EXIT (Spark fixture authoring failed)"
