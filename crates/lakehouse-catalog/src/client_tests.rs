@@ -78,14 +78,6 @@ impl FixedCatalogClient {
 }
 
 impl CatalogClient for FixedCatalogClient {
-    fn list_tables(
-        &self,
-        namespace: &[String],
-    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
-        let listing = Self::listing(namespace.to_vec());
-        Box::pin(async move { Ok(listing) })
-    }
-
     fn list_table_idents(
         &self,
         namespace: &[String],
@@ -150,7 +142,7 @@ async fn boxed_client_lists_neutral_tables_and_skipped_entries_with_reasons() {
     let client = boxed_client();
 
     let listing = client
-        .list_tables(&["prod".to_string()])
+        .list_tables(&["prod".to_string()], &|_| true)
         .await
         .expect("listing failed");
 
@@ -191,7 +183,7 @@ async fn namespace_segments_reach_the_client_unjoined() {
     let client = boxed_client();
 
     let listing = client
-        .list_tables(&namespace)
+        .list_tables(&namespace, &|_| true)
         .await
         .expect("listing failed");
 
@@ -262,7 +254,7 @@ fn a_listing_collected_from_admissions_keeps_listing_order_within_each_set() {
 #[tokio::test]
 async fn an_iceberg_column_carries_its_iceberg_source_type() {
     let listing = boxed_client()
-        .list_tables(&["prod".to_string()])
+        .list_tables(&["prod".to_string()], &|_| true)
         .await
         .expect("listing failed");
 
@@ -412,7 +404,7 @@ async fn empty_namespace_builds_no_session_and_no_grant() {
     let client = IcebergRestCatalogClient::new("http://127.0.0.1:1".into(), oauth_creds());
 
     let listing = client
-        .resolve_listing(&[])
+        .load_listed_tables(&[])
         .await
         .expect("an empty ident batch must resolve with no session build and no grant");
 
@@ -429,7 +421,7 @@ async fn list_tables_over_empty_namespace_lists_nothing() {
     let client = IcebergRestCatalogClient::new(uri, oauth_creds());
 
     let listing = client
-        .list_tables(&["sales".to_string()])
+        .list_tables(&["sales".to_string()], &|_| true)
         .await
         .expect("an empty namespace must list nothing");
 
@@ -454,7 +446,7 @@ async fn enumeration_builds_exactly_one_session() {
     let client = IcebergRestCatalogClient::new(uri, creds);
 
     let listing = client
-        .list_tables(&["sales".to_string()])
+        .list_tables(&["sales".to_string()], &|_| true)
         .await
         .expect("list_tables failed");
 
@@ -495,7 +487,7 @@ async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
     let client = IcebergRestCatalogClient::new(uri, creds_no_auth());
 
     let listing = client
-        .list_tables(&["sales".to_string()])
+        .list_tables(&["sales".to_string()], &|_| true)
         .await
         .expect("list_tables failed");
     let loaded = client
@@ -531,7 +523,7 @@ async fn rest_listing_projects_the_loaded_metadata_into_the_neutral_table() {
     };
 
     let listing = client
-        .list_tables(&["sales".to_string()])
+        .list_tables(&["sales".to_string()], &|_| true)
         .await
         .expect("list_tables failed");
     let loaded = client.load_table(&ident).await.expect("load_table failed");
@@ -572,7 +564,7 @@ async fn unloadable_table_is_reported_skipped_not_failed() {
     let client = IcebergRestCatalogClient::new(uri, creds_no_auth());
 
     let listing = client
-        .list_tables(&["prod".to_string()])
+        .list_tables(&["prod".to_string()], &|_| true)
         .await
         .expect("a skipped non-Iceberg table must not fail the batch");
 
@@ -605,7 +597,7 @@ async fn non_404_load_failure_aborts_the_batch() {
         spawn_mock_catalog(&["prod"], &["orders", "hive_events"], &[], &["hive_events"]).await;
     let client = IcebergRestCatalogClient::new(uri, creds_no_auth());
 
-    let result = client.list_tables(&["prod".to_string()]).await;
+    let result = client.list_tables(&["prod".to_string()], &|_| true).await;
 
     let Err(error) = result else {
         panic!(

@@ -4,17 +4,16 @@
 
 use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
-use crate::common::raw_parquet::put_fixture_object;
 use crate::common::seed::{build_seed_catalog, rest_replace_current_schema};
 use crate::common::stack::{
-    CatalogConnectionPassword, build_create_connection_sql, iceberg_catalog_url,
-    iceberg_catalog_url_internal, local_stack_connection_password,
+    CatalogConnectionPassword, PROXY_URL_INTERNAL, build_create_connection_sql,
+    iceberg_catalog_url, iceberg_catalog_url_internal, local_stack_connection_password,
+    wait_for_proxy,
 };
 use crate::fixtures::{stack, vs_table};
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use bytes::Bytes;
 use iceberg::spec::{
     NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Type, UnboundPartitionSpec,
 };
@@ -52,7 +51,7 @@ fn create_virtual_schema(conn: &mut ExaConn, vs_name: &str, namespace: &str) {
     crate::common::e2e_harness::create_virtual_schema(conn, &refresh_props(vs_name, namespace));
 }
 
-fn seed_catalog(rt: &tokio::runtime::Runtime, label: &str) -> RestCatalog {
+pub(crate) fn seed_catalog(rt: &tokio::runtime::Runtime, label: &str) -> RestCatalog {
     rt.block_on(build_seed_catalog(
         &iceberg_catalog_url(),
         "s3://warehouse/",
@@ -100,7 +99,7 @@ fn id_val_batch(id: i64, val: f64) -> RecordBatch {
     .expect("id+val RecordBatch construction is infallible")
 }
 
-async fn ensure_id_val_table(
+pub(crate) async fn ensure_id_val_table(
     catalog: &impl Catalog,
     namespace: &str,
     table_name: &str,
@@ -119,7 +118,7 @@ async fn ensure_id_val_table(
 }
 
 /// Collision detection runs before any per-table resolution, so no data file is needed.
-async fn create_empty_table(
+pub(crate) async fn create_empty_table(
     catalog: &impl Catalog,
     ns: &NamespaceIdent,
     table_name: &str,
@@ -638,18 +637,19 @@ fn refresh_tables_heals_and_refreshes_only_the_requested_tables() {
         "a full REFRESH must declare TABLE_TWO's NEW_COL"
     );
 
-    // The local REST fixture answers `loadTable` of a table with unparseable metadata with
-    // HTTP 500, which fails the full listing but not a load that skips the table.
+    // `scripts/proxy/filter` answers TABLE_THREE's `loadTable` with 403.
     let three_declaration = declared_types(&mut conn, PARTIAL_VS, "TABLE_THREE");
-    let three_metadata = rt
-        .block_on(load(&catalog, NS_PARTIAL, "table_three"))
-        .metadata_location()
-        .expect("a REST-catalog table has a metadata location")
-        .to_string();
-    put_fixture_object(&three_metadata, Bytes::from_static(b"not a metadata file"));
-    query_error(
+    wait_for_proxy();
+    create_schema_and_scripts_with_env(
+        &mut conn,
+        PARTIAL_ADAPTER_SCHEMA,
+        &[("HTTP_PROXY", PROXY_URL_INTERNAL)],
+        &[],
+    );
+    assert_query_fails(
         &mut conn,
         &format!("ALTER VIRTUAL SCHEMA {PARTIAL_VS} REFRESH"),
+        &[&format!("{NS_PARTIAL}.table_three"), "403"],
     );
     conn.execute(&format!(
         "ALTER VIRTUAL SCHEMA {PARTIAL_VS} REFRESH TABLES TABLE_ONE"
@@ -778,11 +778,11 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
     );
 }
 
-fn long_field(id: i32, name: &str, required: bool) -> NestedFieldRef {
+pub(crate) fn long_field(id: i32, name: &str, required: bool) -> NestedFieldRef {
     NestedField::new(id, name, Type::Primitive(PrimitiveType::Long), required).into()
 }
 
-fn schema_of(schema_id: i32, fields: &[NestedFieldRef]) -> IcebergSchema {
+pub(crate) fn schema_of(schema_id: i32, fields: &[NestedFieldRef]) -> IcebergSchema {
     IcebergSchema::builder()
         .with_schema_id(schema_id)
         .with_fields(fields.to_vec())

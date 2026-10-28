@@ -434,7 +434,8 @@ fn glue_additions_are_reachable_through_neutral_types_only() {
         let _: Result<Vec<CatalogPartition>, UdfError> = session.partitions(&table).await;
     };
     let listing = async {
-        let _: Result<CatalogListing, UdfError> = session.list_tables(&ident.namespace).await;
+        let _: Result<CatalogListing, UdfError> =
+            session.list_tables(&ident.namespace, &|_| true).await;
     };
     drop((load, partitions, listing));
     let _: Box<dyn CatalogClient> = Box::new(session);

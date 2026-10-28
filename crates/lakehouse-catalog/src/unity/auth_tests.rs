@@ -19,7 +19,7 @@ async fn pat_is_applied_as_bearer_verbatim() {
     let session = UnityCatalogSession::new(&server.base_url, creds);
 
     session
-        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .list_tables(&["cat".to_string(), "sch".to_string()], &|_| true)
         .await
         .expect("list failed");
 
@@ -51,7 +51,7 @@ async fn oauth_m2m_mints_bearer_via_client_credentials() {
     let session = UnityCatalogSession::new(&server.base_url, creds);
 
     session
-        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .list_tables(&["cat".to_string(), "sch".to_string()], &|_| true)
         .await
         .expect("list failed");
 
@@ -211,7 +211,7 @@ async fn unauthenticated_mode_sends_no_authorization_header() {
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
     session
-        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .list_tables(&["cat".to_string(), "sch".to_string()], &|_| true)
         .await
         .expect("list failed");
 
@@ -247,7 +247,7 @@ async fn failed_oauth_grant_is_credential_safe_error() {
         let session = UnityCatalogSession::new(base_url, creds.clone());
 
         let err = session
-            .list_tables(&["cat".to_string(), "sch".to_string()])
+            .list_tables(&["cat".to_string(), "sch".to_string()], &|_| true)
             .await
             .expect_err("a failed grant must surface an error");
 
@@ -294,7 +294,7 @@ async fn an_oauth_grant_answered_503_once_is_resent_with_its_form_body() {
     let session = UnityCatalogSession::new(&server.base_url, creds);
 
     session
-        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .list_tables(&["cat".to_string(), "sch".to_string()], &|_| true)
         .await
         .expect("the list succeeds once the grant retry succeeds");
 

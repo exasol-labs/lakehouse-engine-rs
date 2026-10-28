@@ -5,7 +5,7 @@
 -- Spark's native Parquet writer lays the source out Hive-style (`region=eu/part-*.parquet`,
 -- the file holds no `region`) and `add_files` registers it unchanged. The paths use s3://
 -- because add_files records the writer's scheme and the scan UDF registers its object
--- store under s3://. Each fixture runs in its own spark-sql process, so no SET leaks.
+-- store under s3://.
 --
 -- Ground truth, in lockstep with crates/lakehouse-e2e/tests/common/identity_partition_fixtures.rs.
 --

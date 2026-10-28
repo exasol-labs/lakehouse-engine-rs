@@ -59,6 +59,7 @@ const BASE_COLLISION_MISSING: &str = "s3://warehouse/direct_hive_collision_missi
 const BASE_REFRESH: &str = "s3://warehouse/direct_refresh/";
 /// Its own base path: its name collision fails every full REFRESH of the base path it uses.
 const BASE_REFRESH_NAMES: &str = "s3://warehouse/direct_refresh_names/";
+const BASE_TABLE_FILTER: &str = "s3://warehouse/direct_table_filter/";
 
 const VS_DIRECT: &str = "DIRECT_LAKEHOUSE";
 const VS_DIRECT_NARROW: &str = "DIRECT_LAKEHOUSE_NARROW";
@@ -71,6 +72,7 @@ const VS_COLLISION_MISSING: &str = "DIRECT_HIVE_COLLISION_MISSING";
 const VS_COLLISION_MISSING_HIVE_OFF: &str = "DIRECT_HIVE_COLLISION_MISSING_OFF";
 const VS_REFRESH: &str = "DIRECT_REFRESH_VS";
 const VS_REFRESH_NAMES: &str = "DIRECT_REFRESH_NAMES_VS";
+const VS_TABLE_FILTER: &str = "DIRECT_TABLE_FILTER_VS";
 
 const CONN_DIRECT: &str = "DIRECT_STORAGE_CREDS";
 const CONN_INCOMPATIBLE: &str = "DIRECT_STORAGE_INCOMPATIBLE_CREDS";
@@ -78,6 +80,7 @@ const CONN_DISCOVERY: &str = "DIRECT_STORAGE_DISCOVERY_CREDS";
 const CONN_COLLISION_MISSING: &str = "DIRECT_STORAGE_COLLISION_MISSING_CREDS";
 const CONN_REFRESH: &str = "DIRECT_STORAGE_REFRESH_CREDS";
 const CONN_REFRESH_NAMES: &str = "DIRECT_STORAGE_REFRESH_NAMES_CREDS";
+const CONN_TABLE_FILTER: &str = "DIRECT_STORAGE_TABLE_FILTER_CREDS";
 
 /// No `warehouse`: the direct-storage kind rejects that field.
 fn direct_storage_password() -> CatalogConnectionPassword {
@@ -3566,4 +3569,81 @@ fn refresh_tables_resolves_a_requested_name_as_a_full_refresh_would() {
             "a full REFRESH keeps {table} on {directory}"
         );
     }
+}
+
+/// Scenario: A hidden table is never loaded and never recorded as skipped
+/// Scenario: A partial refresh treats a hidden table as one the source does not serve
+#[test]
+fn hidden_directories_are_never_read_or_recorded_as_skipped() {
+    stack();
+    let mut conn = exa_conn();
+    delete_fixture_prefix(BASE_TABLE_FILTER);
+    put_refresh_file(
+        BASE_TABLE_FILTER,
+        "good/file1.parquet",
+        vec![("ID", int64_column(&[1]))],
+    );
+    put_refresh_file(
+        BASE_TABLE_FILTER,
+        "conflict/file1.parquet",
+        vec![("X", int64_column(&[42]))],
+    );
+    put_refresh_file(
+        BASE_TABLE_FILTER,
+        "conflict/file2.parquet",
+        vec![("X", utf8_column(&["hello"]))],
+    );
+    put_fixture_object(
+        &refresh_key(BASE_TABLE_FILTER, "empty/_SUCCESS"),
+        Bytes::from_static(b"ok"),
+    );
+
+    let unfiltered = try_create_direct_vs(
+        &mut conn,
+        VS_TABLE_FILTER,
+        CONN_TABLE_FILTER,
+        BASE_TABLE_FILTER,
+    );
+    assert_mentions(
+        &error_text(&unfiltered, "CREATE without a filter"),
+        &["Parquet column 'X'", "Int64", "Utf8"],
+    );
+
+    create_virtual_schema_with_password(
+        &mut conn,
+        &direct_vs(VS_TABLE_FILTER, CONN_TABLE_FILTER)
+            .with_property("TABLE_EXCLUDE", "CONFLICT, EMPTY"),
+        BASE_TABLE_FILTER,
+        &direct_storage_password(),
+    );
+    assert_eq!(served_tables(&mut conn, VS_TABLE_FILTER), ["GOOD"]);
+    assert!(
+        skipped_entries(&mut conn, VS_TABLE_FILTER).is_empty(),
+        "a hidden directory is not recorded as skipped"
+    );
+
+    for statement in [
+        format!("ALTER VIRTUAL SCHEMA {VS_TABLE_FILTER} REFRESH"),
+        format!("ALTER VIRTUAL SCHEMA {VS_TABLE_FILTER} SET TABLE_EXCLUDE = 'CONFLICT, EMPTY'"),
+    ] {
+        conn.execute(&statement);
+        assert_eq!(
+            served_tables(&mut conn, VS_TABLE_FILTER),
+            ["GOOD"],
+            "{statement} must serve only the exposed table"
+        );
+        assert!(
+            skipped_entries(&mut conn, VS_TABLE_FILTER).is_empty(),
+            "{statement} must record no hidden directory as skipped"
+        );
+    }
+
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {VS_TABLE_FILTER} REFRESH TABLES GOOD CONFLICT"
+    ));
+    assert_eq!(
+        served_tables(&mut conn, VS_TABLE_FILTER),
+        ["GOOD"],
+        "REFRESH TABLES cannot add a hidden table back"
+    );
 }

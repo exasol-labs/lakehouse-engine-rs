@@ -81,19 +81,8 @@ impl DirectStorageCatalogClient {
 }
 
 impl CatalogClient for DirectStorageCatalogClient {
-    /// Each first-level directory under the base path is a table with an empty namespace;
-    /// `namespace` is unread since the base path already encodes `CATALOG_CONNECTION` + `NAMESPACE`.
-    fn list_tables(
-        &self,
-        _namespace: &[String],
-    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
-        Box::pin(async move {
-            let idents = self.list_table_idents(&[]).await?;
-            self.load_listed_tables(&idents).await
-        })
-    }
-
-    /// One delimiter listing of the base path, sorted by directory name; reads below no directory.
+    /// Each first-level directory under the base path, sorted by name, is a table with an empty
+    /// namespace; one delimiter listing reads below no directory, and `namespace` is unread.
     fn list_table_idents(
         &self,
         _namespace: &[String],
