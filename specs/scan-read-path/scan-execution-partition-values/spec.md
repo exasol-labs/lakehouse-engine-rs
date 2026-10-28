@@ -4,7 +4,7 @@ Produces a partition column that has no physical counterpart in a data file from
 
 ## Background
 
-* The shard-invariant common spec carries the table's ordered `partition_columns`. Each file entry carries a `partition_values` map with one entry per partition column, holding the serialized value or an explicit absent value for NULL: see `delta/delta-table-planning`. A `partition_values` key that `partition_columns` does not list is a per-file value for a column the data file may hold, which the Iceberg reader writes for an `identity` partition field: see `scan-read-path/scan-execution-field-id-projection-absent-fields`. The scan dispatches on whether these fields are populated and on whether `partition_columns` lists a key, never on the table format.
+* The shard-invariant common spec carries the table's ordered `partition_columns`. Each file entry carries a `partition_values` map with one entry per partition column, holding the serialized value or an explicit absent value for NULL: see `delta/delta-table-planning`. A declared `partition_values` key that `partition_columns` does not list is a partition column only for the files whose entries carry it, which the Iceberg reader writes for an `identity` partition field: see `scan-read-path/scan-execution-identity-partition-fill`. The scan groups the files by the keys they carry and scans each group with its own partition columns. It dispatches on whether these fields are populated, never on the table format.
 * The Delta protocol (`delta-io/delta`, `PROTOCOL.md`) makes the transaction log the authoritative source of a file's partition values. The directory layout is a writer convention. A writer may also materialize the partition column into the Parquet file, and the log stays authoritative then too.
 * The protocol stores partition values as strings: numbers as their string form, dates as `{year}-{month}-{day}`, booleans as `"true"` or `"false"`. An empty string means a null partition value.
 
@@ -54,9 +54,8 @@ Produces a partition column that has no physical counterpart in a data file from
 
 ### Scenario: The logged partition value wins over a physically present partition column
 
-* *GIVEN* a scan invocation whose assigned data file DOES carry a physical Parquet column bearing the
-  name of a column the common spec's `partition_columns` lists, the shape a writer produces under the
-  Delta IcebergCompat features
+* *GIVEN* a scan invocation whose assigned data file DOES carry a physical Parquet column bearing a
+  partition column's name, the shape a writer produces under the Delta IcebergCompat features
 * *WHEN* the scan UDF reads that file
 * *THEN* the UDF SHALL emit the value logged for that file in its partition values, and MUST NOT read
   the physical column, because the protocol makes the transaction log the authoritative source for a
@@ -76,9 +75,8 @@ Produces a partition column that has no physical counterpart in a data file from
 * *AND* the grouped aggregate SHALL group on the materialized values, so a partition column is a
   valid group key
 * *AND* a partition column the projection omits MUST NOT appear in the emitted rows
-* *AND* the UDF MAY use a file's partition values for the columns `partition_columns` lists to skip
-  that file entirely when the filter cannot be satisfied by them, and MUST NOT emit a row from a file
-  it skips on that basis
+* *AND* the UDF MAY use a file's partition values to skip that file entirely when the filter cannot be
+  satisfied by them, and MUST NOT emit a row from a file it skips on that basis
 
 ### Scenario: A scan with no partition columns is unchanged
 

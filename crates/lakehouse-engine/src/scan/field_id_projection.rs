@@ -4,7 +4,6 @@
 //! `schema.name-mapping.default` and then the physical name. Nested members declare the same
 //! choice, and [`resolve_nested_field`] recurses the one binding pass into them.
 
-use crate::scan::partition_values::IdentityFallbackExpr;
 use crate::scan::raw_scan::NESTED_JSON_RENDER_UDF_NAME;
 use crate::scan::render_nested_column_as_json;
 use crate::scan::spec::{NameMappingEntry, NestedField, NestedMembers};
@@ -22,7 +21,7 @@ use datafusion::physical_expr_adapter::{
     DefaultPhysicalExprAdapterFactory, PhysicalExprAdapter, PhysicalExprAdapterFactory,
 };
 use datafusion::scalar::ScalarValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Only field-id-bound logical fields are tagged with it.
@@ -495,18 +494,6 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
         );
         binding.ensure_unambiguous(&self.table_root)?;
 
-        let identified_logical_indices: HashSet<usize> = logical_file_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| {
-                binding
-                    .identified_logical_names
-                    .contains(field.name().as_str())
-            })
-            .map(|(index, _)| index)
-            .collect();
-
         // Per file: only logical columns no physical field claimed get their default, keyed by
         // the logical index an incoming `Column` carries.
         let absent_default_by_index: HashMap<usize, ScalarValue> = logical_file_schema
@@ -538,7 +525,6 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
         Ok(Arc::new(FieldIdExprAdapter {
             inner,
             physical_file_schema,
-            identified_logical_indices,
             absent_default_by_index,
             refused_by_index,
             table_root: self.table_root.clone(),
@@ -559,8 +545,6 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
 struct FieldIdExprAdapter {
     inner: Arc<dyn PhysicalExprAdapter>,
     physical_file_schema: arrow::datatypes::SchemaRef,
-    /// LOGICAL column indices of the fields this file holds by field id or declared physical name.
-    identified_logical_indices: HashSet<usize>,
     /// Keyed by LOGICAL column index; only absent fields with a reconstructed `initial-default`.
     absent_default_by_index: HashMap<usize, ScalarValue>,
     /// This file's bound columns whose type is not admitted, keyed by logical index.
@@ -592,23 +576,9 @@ impl PhysicalExprAdapter for FieldIdExprAdapter {
             })?;
         }
 
-        // Column-projection rule (1) precedes rules (2) and (3): an identity value fills a field
-        // whose id the file lacks, even one name mapping binds, and a file with no value leaves
-        // the field to the binding or the default below.
-        let reduced = expr
-            .transform_down(|node| match node.downcast_ref::<IdentityFallbackExpr>() {
-                Some(fallback) => fallback
-                    .reduce_for_file(|column| {
-                        self.identified_logical_indices.contains(&column.index())
-                    })
-                    .map(Transformed::yes),
-                None => Ok(Transformed::no(node)),
-            })
-            .data()?;
-
         // Substitute an absent field's `initial-default` (column-projection rule 3) BEFORE
         // delegating, since the default adapter NULL-fills or errors on absent fields.
-        let intercepted = reduced
+        let intercepted = expr
             .transform_down(|node| {
                 if let Some(column) = node.downcast_ref::<Column>()
                     && let Some(default) = self.absent_default_by_index.get(&column.index())
@@ -747,9 +717,6 @@ impl PhysicalExpr for NestedJsonRenderExpr {
 struct ColumnBinding {
     renamed_physical: arrow::datatypes::SchemaRef,
     bound_logical_names: std::collections::HashSet<String>,
-    /// The bound names claimed by an embedded field id or a declared physical name; name
-    /// mapping, a plain name, and a letter-case fold leave the field id absent from the file.
-    identified_logical_names: std::collections::HashSet<String>,
     /// Keyed by LOGICAL COLUMN NAME.
     nested: HashMap<String, NestedResolution>,
     /// Letter-case fold groups that bound nothing because more than one spelling competed.
@@ -1003,18 +970,6 @@ fn bind_columns(
             )
         })
         .collect();
-    let identified_logical_names: HashSet<String> = physical
-        .fields()
-        .iter()
-        .zip(&exact)
-        .filter_map(|(physical_field, claimed)| {
-            let keys = &keys[(*claimed)?];
-            let by_field_id =
-                keys.field_id.is_some() && keys.field_id == field_id_of(physical_field);
-            let by_physical_name = keys.physical_name == Some(physical_field.name().as_str());
-            (by_field_id || by_physical_name).then(|| keys.name.to_string())
-        })
-        .collect();
     let (claims, ambiguous_folds) = claim_by_case_fold(physical, &keys, &exact);
 
     let mut nested: HashMap<String, NestedResolution> = HashMap::new();
@@ -1058,7 +1013,6 @@ fn bind_columns(
             physical.metadata().clone(),
         )),
         bound_logical_names,
-        identified_logical_names,
         nested,
         ambiguous_folds,
     }

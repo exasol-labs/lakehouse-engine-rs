@@ -3,8 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch};
-use arrow::datatypes::{Field, Schema};
+use arrow::array::ArrayRef;
+use datafusion::logical_expr::ColumnarValue;
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
 use iceberg::spec::TableMetadata;
@@ -261,9 +261,13 @@ async fn plan_checked_table(
     // Delete paths are relativized later in `relativize_shards_to_root`, like data-file paths.
     let files = tasks
         .iter()
-        .map(|task| planned_file_entry(task, declared))
-        .collect::<Result<_, _>>()
-        .map_err(|refusal| refusal.into_error(&table_name))?;
+        .map(|task| {
+            let mut entry = planned_file_entry(task)
+                .map_err(|mechanism| unsupported_delete_error(mechanism, &table_name))?;
+            entry.partition_values = identity_partition_values(task, declared, &table_name)?;
+            Ok(entry)
+        })
+        .collect::<Result<_, UdfError>>()?;
 
     Ok(PlannedFiles {
         files,
@@ -360,38 +364,6 @@ fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &
         mechanism.describe(),
     );
     UdfError::User(redact_credentials(&msg))
-}
-
-/// Why a planned data file cannot enter the scan spec. Carries no path or secret.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PlannedFileRefusal {
-    Unsupported(UnsupportedDeleteMechanism),
-    /// Dropping the value would read the column as NULL from a file that lacks it.
-    UnreadableIdentityValue {
-        column: String,
-        cause: String,
-    },
-}
-
-impl From<UnsupportedDeleteMechanism> for PlannedFileRefusal {
-    fn from(mechanism: UnsupportedDeleteMechanism) -> Self {
-        Self::Unsupported(mechanism)
-    }
-}
-
-impl PlannedFileRefusal {
-    fn into_error(self, table_name: &str) -> UdfError {
-        match self {
-            Self::Unsupported(mechanism) => unsupported_delete_error(mechanism, table_name),
-            Self::UnreadableIdentityValue { column, cause } => {
-                UdfError::User(redact_credentials(&format!(
-                    "lakehouse pushdown declined for table '{table_name}': the identity partition \
-                     value of column '{column}' cannot be read at the column's declared type \
-                     ({cause})"
-                )))
-            }
-        }
-    }
 }
 
 /// Refuses a recorded `date` → `timestamp`/`timestamp_ns` promotion (#355).
@@ -509,8 +481,7 @@ async fn plan_file_tasks(
 
 fn planned_file_entry(
     task: &iceberg::scan::FileScanTask,
-    logical_fields: &[LogicalField],
-) -> Result<FileEntry, PlannedFileRefusal> {
+) -> Result<FileEntry, UnsupportedDeleteMechanism> {
     classify_planned_file(
         iceberg::spec::DataContentType::Data,
         task.data_file_format(),
@@ -522,13 +493,12 @@ fn planned_file_entry(
             classify_planned_file(d.file_type(), d.file_format())?;
             Ok(iceberg_delete_mechanism(d))
         })
-        .collect::<Result<_, UnsupportedDeleteMechanism>>()?;
-    Ok(FileEntry {
-        path: task.data_file_path().to_string(),
-        size: task.file_size_in_bytes(),
+        .collect::<Result<_, _>>()?;
+    Ok(FileEntry::with_deletes(
+        task.data_file_path().to_string(),
+        task.file_size_in_bytes(),
         deletes,
-        partition_values: identity_partition_values(task, logical_fields)?,
-    })
+    ))
 }
 
 /// Iceberg Column Projection rule (1) reads the partition struct of the spec the file was written
@@ -537,7 +507,8 @@ fn planned_file_entry(
 fn identity_partition_values(
     task: &iceberg::scan::FileScanTask,
     logical_fields: &[LogicalField],
-) -> Result<BTreeMap<String, Option<String>>, PlannedFileRefusal> {
+    table_name: &str,
+) -> Result<BTreeMap<String, Option<String>>, UdfError> {
     let (Some(spec), Some(partition)) = (task.partition_spec(), task.partition()) else {
         return Ok(BTreeMap::new());
     };
@@ -554,65 +525,44 @@ fn identity_partition_values(
                 .field_by_id(field.source_id)?
                 .field_type
                 .as_primitive_type()?;
-            Some(identity_entry(logical, source_type, value))
+            let rendered = value
+                .map(|value| render_identity_value(value, source_type, &logical.arrow_type))
+                .transpose()
+                .map_err(|cause| {
+                    // Dropping the value would read the file's column, or NULL, in its place.
+                    UdfError::User(redact_credentials(&format!(
+                        "lakehouse pushdown declined for table '{table_name}': the identity \
+                         partition value of column '{}' cannot be read at the column's declared \
+                         type ({cause})",
+                        logical.name
+                    )))
+                });
+            Some(rendered.map(|rendered| (logical.name.clone(), rendered)))
         })
         .collect()
 }
 
-fn identity_entry(
-    logical: &LogicalField,
-    source_type: &iceberg::spec::PrimitiveType,
-    value: Option<&iceberg::spec::Literal>,
-) -> Result<(String, Option<String>), PlannedFileRefusal> {
-    let unreadable = |cause: String| PlannedFileRefusal::UnreadableIdentityValue {
-        column: logical.name.clone(),
-        cause,
-    };
-    let rendered = match value {
-        None => None,
-        Some(iceberg::spec::Literal::Primitive(primitive)) => {
-            let declared = Field::new(
-                &logical.name,
-                crate::types::mapping::arrow_type_from_tag(&logical.arrow_type),
-                logical.nullable,
-            );
-            Some(render_identity_value(primitive, source_type, &declared).map_err(unreadable)?)
-        }
-        Some(_) => {
-            return Err(unreadable(format!(
-                "the partition struct holds a non-primitive value for a {source_type} column"
-            )));
-        }
-    };
-    Ok((logical.name.clone(), rendered))
-}
-
-/// Casts with the expression the scan's `DefaultPhysicalExprAdapter` inserts for a file column
-/// whose type differs from the declared one (DataFusion 55.2 `schema_rewriter.rs:619-623`), so a
-/// reconstructed value reads exactly as a stored one; the result is the string
+/// Casts as the scan's expression adapter casts a file column of another type than the declared
+/// one, so a reconstructed value reads exactly as a stored one. The result is the string
 /// `scan::partition_scalar` parses back at the declared type.
 fn render_identity_value(
-    value: &iceberg::spec::PrimitiveLiteral,
+    value: &iceberg::spec::Literal,
     source_type: &iceberg::spec::PrimitiveType,
-    declared: &Field,
+    arrow_type_tag: &str,
 ) -> Result<String, String> {
-    use datafusion::physical_expr::PhysicalExpr;
-    use datafusion::physical_expr::expressions::{CastExpr, Column};
-
+    let iceberg::spec::Literal::Primitive(value) = value else {
+        return Err(format!(
+            "the partition struct holds a non-primitive value for a {source_type} column"
+        ));
+    };
     let file_value = file_column_value(value, source_type).ok_or_else(|| {
         format!("the partition struct holds a value of another type than the {source_type} column")
     })?;
-    let file_field = Field::new(declared.name(), file_value.data_type().clone(), true);
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![file_field])), vec![file_value])
+    let declared = crate::types::mapping::arrow_type_from_tag(arrow_type_tag);
+    let read = ColumnarValue::Array(file_value)
+        .cast_to(&declared, None)
+        .and_then(|read| read.into_array(1))
         .map_err(|e| e.to_string())?;
-    let read = CastExpr::new_with_target_field(
-        Arc::new(Column::new(declared.name(), 0)),
-        Arc::new(declared.clone()),
-        None,
-    )
-    .evaluate(&batch)
-    .and_then(|read| read.into_array(1))
-    .map_err(|e| e.to_string())?;
     arrow::util::display::array_value_to_string(&read, 0).map_err(|e| e.to_string())
 }
 

@@ -1,6 +1,6 @@
 # Feature: DataFusion Scan Execution: Absent Fields and Initial Defaults
 
-Defines what the scan UDF emits for a logical field that is absent from a data file. A field that defines an Iceberg `initial-default` returns that value for the file's rows, a nullable field with no default returns NULL, and a required field with no default fails the scan with a clean error. A field that the file's own partition spec maps through an `identity` transform takes its partition value first, per `scan-read-path/scan-execution-identity-partition-fill`.
+Defines what the scan UDF emits for a logical field that is absent from a data file. A field that defines an Iceberg `initial-default` returns that value for the file's rows, a nullable field with no default returns NULL, and a required field with no default fails the scan with a clean error. A field whose `identity` partition value the file entry carries takes that value instead, per `scan-read-path/scan-execution-identity-partition-fill`.
 
 The VS reads each field's `initial-default` once per query and encodes a primitive default into the scan spec in a JSON-portable, credential-free form. It leaves the default absent for a non-primitive default and for a decimal outside Exasol's catalog-decimal domain.
 

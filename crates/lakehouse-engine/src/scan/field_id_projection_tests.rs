@@ -1,5 +1,4 @@
 use super::*;
-use crate::scan::partition_values::PartitionedScanSchema;
 use crate::scan::spec::{FileEntry, NameMappingEntry, ScanSpec};
 use crate::scan::test_support::{inline_resolved, local_file_size, minimal_spec};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -581,7 +580,6 @@ fn absent_field_with_initial_default_emits_default_literal() {
     );
 }
 
-/// Scenario: Added nullable column absent from a file with no initial-default is NULL-filled
 #[test]
 fn absent_nullable_without_default_is_null_filled() {
     let logical = Arc::new(Schema::new(vec![
@@ -611,7 +609,6 @@ fn absent_nullable_without_default_is_null_filled() {
     );
 }
 
-/// Scenario: Added required column absent from a file with no initial-default errors cleanly
 #[test]
 fn absent_required_without_default_errors_cleanly() {
     let logical = Arc::new(Schema::new(vec![
@@ -635,220 +632,6 @@ fn absent_required_without_default_errors_cleanly() {
     assert!(
         text.contains("mandatory") && text.contains("missing"),
         "error must name the missing required column: {text}"
-    );
-}
-
-/// `id` and a nullable `region`, bound by field-id, as the scan registers an Iceberg table.
-fn region_logical_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        field_with_id("id", DataType::Int64, false, 1),
-        field_with_id("region", DataType::Utf8, true, 2),
-    ]))
-}
-
-fn region_entry(path: &str, region: Option<Option<&str>>) -> FileEntry {
-    FileEntry::with_partition_values(
-        path,
-        1,
-        region
-            .map(|value| ("region".to_string(), value.map(str::to_string)))
-            .into_iter()
-            .collect(),
-    )
-}
-
-/// Every DataFusion substitution the Parquet opener makes for `file` before the adapter runs:
-/// each partition column, the hidden identity column included, becomes the file's literal.
-fn opened_for(
-    split: &PartitionedScanSchema,
-    file: &FileEntry,
-    expr: Arc<dyn PhysicalExpr>,
-) -> Arc<dyn PhysicalExpr> {
-    let literals: HashMap<String, ScalarValue> = split
-        .file_source_schema()
-        .table_partition_cols()
-        .iter()
-        .map(|field| field.name().clone())
-        .zip(split.partition_values_for(file).expect("a valid entry"))
-        .collect();
-    datafusion::physical_expr_adapter::replace_columns_with_literals(expr, &literals)
-        .expect("substitution never fails")
-}
-
-/// The scan's projection of `region` (declared index 1), as the file source receives it.
-fn region_projection(split: &PartitionedScanSchema) -> Arc<dyn PhysicalExpr> {
-    let projection = split
-        .projection_exprs(None)
-        .expect("an identity column always projects explicitly");
-    Arc::clone(&projection.as_ref()[1].expr)
-}
-
-fn region_equals_eu(split: &PartitionedScanSchema) -> Arc<dyn PhysicalExpr> {
-    Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
-        region_projection(split),
-        datafusion::logical_expr::Operator::Eq,
-        Arc::new(Literal::new(ScalarValue::Utf8(Some("eu".to_string())))),
-    ))
-}
-
-fn left_of(predicate: &Arc<dyn PhysicalExpr>) -> &Arc<dyn PhysicalExpr> {
-    predicate
-        .downcast_ref::<datafusion::physical_expr::expressions::BinaryExpr>()
-        .expect("the predicate stays a comparison")
-        .left()
-}
-
-/// Scenario: A column the data file holds under the field's id wins over the file's identity partition value
-/// Scenario: A materialized partition column is a first-class scan column
-#[test]
-fn bound_file_column_wins_over_identity_value() {
-    let files = [
-        region_entry("holds.parquet", Some(Some("eu"))),
-        region_entry("lacks.parquet", Some(Some("eu"))),
-    ];
-    let split = PartitionedScanSchema::split(region_logical_schema(), &[], &files)
-        .expect("region is declared");
-    let logical_file_schema = Arc::clone(split.file_source_schema().file_schema());
-    let by_field_id = Arc::new(Schema::new(vec![
-        field_with_id("id", DataType::Int64, false, 1),
-        field_with_id("region_src", DataType::Utf8, true, 2),
-    ]));
-    let adapter = factory(bare_resolution())
-        .create(Arc::clone(&logical_file_schema), by_field_id)
-        .expect("adapter creation");
-
-    let read = adapter
-        .rewrite(opened_for(&split, &files[0], region_projection(&split)))
-        .expect("rewrite ok");
-    let filter = adapter
-        .rewrite(opened_for(&split, &files[0], region_equals_eu(&split)))
-        .expect("rewrite ok");
-
-    assert_eq!(
-        bound_physical_index(&read),
-        Some(1),
-        "a file holding the field id reads its column, never its partition value: {read}"
-    );
-    assert_eq!(
-        bound_physical_index(left_of(&filter)),
-        Some(1),
-        "a pushed-down filter reads the file column too, so no file is skipped on the \
-         partition value: {filter}"
-    );
-
-    let lacking = Arc::new(Schema::new(vec![field_with_id(
-        "id",
-        DataType::Int64,
-        false,
-        1,
-    )]));
-    let adapter = factory(bare_resolution())
-        .create(logical_file_schema, lacking)
-        .expect("adapter creation");
-    let eu = Some(ScalarValue::Utf8(Some("eu".to_string())));
-    let read = adapter
-        .rewrite(opened_for(&split, &files[1], region_projection(&split)))
-        .expect("rewrite ok");
-    let filter = adapter
-        .rewrite(opened_for(&split, &files[1], region_equals_eu(&split)))
-        .expect("rewrite ok");
-    assert_eq!(
-        literal_value(&read),
-        eu,
-        "a file lacking the column reads its value"
-    );
-    assert_eq!(literal_value(left_of(&filter)), eu);
-}
-
-#[test]
-fn identity_value_wins_over_column_bound_without_field_id() {
-    let files = [region_entry("holds.parquet", Some(Some("eu")))];
-    let split = PartitionedScanSchema::split(region_logical_schema(), &[], &files)
-        .expect("region is declared");
-    let logical_file_schema = Arc::clone(split.file_source_schema().file_schema());
-    let by_name_mapping = Arc::new(Schema::new(vec![
-        field_with_id("id", DataType::Int64, false, 1),
-        field_no_id("region_src", DataType::Utf8, true),
-    ]));
-    let by_name = Arc::new(Schema::new(vec![
-        field_with_id("id", DataType::Int64, false, 1),
-        field_no_id("region", DataType::Utf8, true),
-    ]));
-    let eu = Some(ScalarValue::Utf8(Some("eu".to_string())));
-
-    for (physical, resolution) in [
-        (
-            by_name_mapping,
-            resolution_with_mapping(&[("region_src", 2)]),
-        ),
-        (by_name, bare_resolution()),
-    ] {
-        let adapter = factory(resolution)
-            .create(Arc::clone(&logical_file_schema), physical)
-            .expect("adapter creation");
-
-        let read = adapter
-            .rewrite(opened_for(&split, &files[0], region_projection(&split)))
-            .expect("rewrite ok");
-        let filter = adapter
-            .rewrite(opened_for(&split, &files[0], region_equals_eu(&split)))
-            .expect("rewrite ok");
-
-        assert_eq!(
-            literal_value(&read),
-            eu,
-            "rule (1) precedes name mapping, so a column without the field id reads the \
-             partition value: {read}"
-        );
-        assert_eq!(literal_value(left_of(&filter)), eu, "{filter}");
-    }
-}
-
-/// Scenario: An identity partition value precedes the initial-default, and a null partition value is present
-#[test]
-fn identity_value_precedes_initial_default_and_null_is_present() {
-    let files = [
-        region_entry("value.parquet", Some(Some("eu"))),
-        region_entry("null.parquet", Some(None)),
-        region_entry("none.parquet", None),
-    ];
-    let split = PartitionedScanSchema::split(region_logical_schema(), &[], &files)
-        .expect("region is declared");
-    let lacking = Arc::new(Schema::new(vec![field_with_id(
-        "id",
-        DataType::Int64,
-        false,
-        1,
-    )]));
-    let adapter = factory(resolution_with_defaults(&[(
-        "region",
-        ScalarValue::Utf8(Some("default".to_string())),
-    )]))
-    .create(
-        Arc::clone(split.file_source_schema().file_schema()),
-        lacking,
-    )
-    .expect("adapter creation");
-
-    let read: Vec<Option<ScalarValue>> = files
-        .iter()
-        .map(|file| {
-            let rewritten = adapter
-                .rewrite(opened_for(&split, file, region_projection(&split)))
-                .expect("rewrite ok");
-            literal_value(&rewritten)
-        })
-        .collect();
-
-    assert_eq!(
-        read,
-        [
-            Some(ScalarValue::Utf8(Some("eu".to_string()))),
-            Some(ScalarValue::Utf8(None)),
-            Some(ScalarValue::Utf8(Some("default".to_string()))),
-        ],
-        "rule (1) precedes rule (3), a null partition value is present, and a file whose spec \
-         has no identity field on the column takes its initial-default"
     );
 }
 

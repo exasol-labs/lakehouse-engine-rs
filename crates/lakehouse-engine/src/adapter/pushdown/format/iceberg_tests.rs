@@ -371,7 +371,7 @@ fn planned_file_entry_carries_parquet_positional_deletes_and_deletion_vectors() 
         ],
     );
 
-    let entry = planned_file_entry(&task, &[]).expect("Parquet data with supported deletes");
+    let entry = planned_file_entry(&task).expect("Parquet data with supported deletes");
 
     assert_eq!(
         (entry.path.as_str(), entry.size),
@@ -425,8 +425,8 @@ fn planned_file_entry_refuses_an_unsupported_data_or_applied_delete_file() {
 
     for (task, expected) in cases {
         assert_eq!(
-            planned_file_entry(&task, &[]).map(|_| ()),
-            Err(PlannedFileRefusal::from(expected)),
+            planned_file_entry(&task).map(|_| ()),
+            Err(expected),
             "{task:?}"
         );
     }
@@ -509,9 +509,8 @@ fn partitioned_scan_task(
 fn identity_values_of(
     task: &iceberg::scan::FileScanTask,
 ) -> std::collections::BTreeMap<String, Option<String>> {
-    planned_file_entry(task, &identity_partitioned_logical_fields())
+    identity_partition_values(task, &identity_partitioned_logical_fields(), "db.t")
         .expect("a readable data file")
-        .partition_values
 }
 
 /// Scenario: The VS carries each data file's identity partition values from the file's own partition spec
@@ -571,23 +570,10 @@ fn identity_values_come_from_each_files_own_spec() {
 /// scan's expression adapter inserts.
 fn read_at_declared_type(
     file_value: &arrow::array::ArrayRef,
-    declared: &arrow::datatypes::Field,
+    declared: &arrow::datatypes::DataType,
 ) -> datafusion::scalar::ScalarValue {
-    use datafusion::physical_expr::PhysicalExpr;
-    use datafusion::physical_expr::expressions::{CastExpr, Column};
-    let file_field = arrow::datatypes::Field::new("c", file_value.data_type().clone(), true);
-    let batch = arrow::array::RecordBatch::try_new(
-        std::sync::Arc::new(arrow::datatypes::Schema::new(vec![file_field])),
-        vec![std::sync::Arc::clone(file_value)],
-    )
-    .expect("a one-row file batch");
-    let cast = CastExpr::new_with_target_field(
-        std::sync::Arc::new(Column::new("c", 0)),
-        std::sync::Arc::new(declared.clone()),
-        None,
-    );
-    let read = cast
-        .evaluate(&batch)
+    let read = datafusion::logical_expr::ColumnarValue::Array(std::sync::Arc::clone(file_value))
+        .cast_to(declared, None)
         .and_then(|value| value.into_array(1))
         .expect("the file type reads at the declared type");
     datafusion::scalar::ScalarValue::try_from_array(&read, 0).expect("one value")
@@ -597,77 +583,16 @@ fn read_at_declared_type(
 #[test]
 fn identity_value_round_trips_at_declared_type_for_every_admitted_type() {
     use arrow::array::{
-        ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-        Int32Array, Int64Array, StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
-        TimestampNanosecondArray,
+        ArrayRef, Decimal128Array, Float32Array, Int32Array, Time64MicrosecondArray,
+        TimestampMicrosecondArray, TimestampNanosecondArray,
     };
     use iceberg::spec::{Literal, PrimitiveLiteral as L, PrimitiveType as T, Transform};
     use std::sync::Arc;
 
-    let decimal = |value: i128, precision: u8, scale: i8| -> ArrayRef {
-        Arc::new(
-            Decimal128Array::from(vec![value])
-                .with_precision_and_scale(precision, scale)
-                .expect("a valid decimal type"),
-        )
-    };
     let micros = 1_709_296_496_000_001_i64;
     let nanos = 1_709_296_496_000_000_123_i64;
+    // The E2E types fixture covers every type Spark writes; these are the ones it cannot.
     let cases: Vec<(L, T, &str, ArrayRef)> = vec![
-        (
-            L::Boolean(true),
-            T::Boolean,
-            "bool",
-            Arc::new(BooleanArray::from(vec![true])),
-        ),
-        (
-            L::Int(-7),
-            T::Int,
-            "int32",
-            Arc::new(Int32Array::from(vec![-7])),
-        ),
-        (
-            L::Long(9_007_199_254_740_993),
-            T::Long,
-            "int64",
-            Arc::new(Int64Array::from(vec![9_007_199_254_740_993])),
-        ),
-        (
-            L::Float(1.1_f32.into()),
-            T::Float,
-            "float32",
-            Arc::new(Float32Array::from(vec![1.1_f32])),
-        ),
-        (
-            L::Double(0.1_f64.into()),
-            T::Double,
-            "float64",
-            Arc::new(Float64Array::from(vec![0.1_f64])),
-        ),
-        (
-            L::Int128(-1234),
-            T::Decimal {
-                precision: 10,
-                scale: 2,
-            },
-            "decimal128(10,2)",
-            decimal(-1234, 10, 2),
-        ),
-        (
-            L::Int128(123_456_789_012),
-            T::Decimal {
-                precision: 38,
-                scale: 6,
-            },
-            "utf8",
-            decimal(123_456_789_012, 38, 6),
-        ),
-        (
-            L::Int(19_783),
-            T::Date,
-            "date32",
-            Arc::new(Date32Array::from(vec![19_783])),
-        ),
         (
             L::Long(45_296_000_001),
             T::Time,
@@ -699,12 +624,6 @@ fn identity_value_round_trips_at_declared_type_for_every_admitted_type() {
             Arc::new(TimestampNanosecondArray::from(vec![nanos]).with_timezone("UTC")),
         ),
         (
-            L::String("us-east-1".to_string()),
-            T::String,
-            "utf8",
-            Arc::new(StringArray::from(vec!["us-east-1"])),
-        ),
-        (
             L::Int(-7),
             T::Long,
             "int64",
@@ -723,19 +642,19 @@ fn identity_value_round_trips_at_declared_type_for_every_admitted_type() {
                 scale: 2,
             },
             "decimal128(18,2)",
-            decimal(1234, 9, 2),
+            Arc::new(
+                Decimal128Array::from(vec![1234])
+                    .with_precision_and_scale(9, 2)
+                    .expect("a valid decimal type"),
+            ),
         ),
     ];
 
     for (value, source_type, tag, file_value) in cases {
-        let declared = arrow::datatypes::Field::new(
-            "c",
-            crate::types::mapping::arrow_type_from_tag(tag),
-            true,
-        );
-        let rendered = render_identity_value(&value, &source_type, &declared)
+        let declared = crate::types::mapping::arrow_type_from_tag(tag);
+        let rendered = render_identity_value(&Literal::Primitive(value.clone()), &source_type, tag)
             .unwrap_or_else(|e| panic!("{source_type} {value:?} must render at {tag}: {e}"));
-        let converted = crate::scan::partition_scalar(&rendered, declared.data_type())
+        let converted = crate::scan::partition_scalar(&rendered, &declared)
             .unwrap_or_else(|e| panic!("'{rendered}' must convert back to {tag}: {e}"));
 
         assert_eq!(
@@ -747,8 +666,7 @@ fn identity_value_round_trips_at_declared_type_for_every_admitted_type() {
         );
     }
 
-    let utf8 = arrow::datatypes::Field::new("c", arrow::datatypes::DataType::Utf8, true);
-    let empty = render_identity_value(&L::String(String::new()), &T::String, &utf8)
+    let empty = render_identity_value(&Literal::string(""), &T::String, "utf8")
         .expect("an empty string renders");
     assert_eq!(
         crate::scan::non_null_partition_value(Some(&empty)),
@@ -767,47 +685,38 @@ fn identity_value_round_trips_at_declared_type_for_every_admitted_type() {
 }
 
 #[test]
-fn an_identity_value_its_declared_type_cannot_hold_fails_planning_naming_the_column() {
+fn an_unreadable_identity_value_fails_planning_naming_the_column() {
     use iceberg::spec::{Literal, Transform};
+    let spec = identity_partition_spec(0, &[("id", "id", Transform::Identity)]);
     let narrowed = LogicalField {
         arrow_type: "int32".to_string(),
         ..identity_partitioned_logical_fields()[0].clone()
     };
-    let task = partitioned_scan_task(
-        &identity_partition_spec(0, &[("id", "id", Transform::Identity)]),
-        vec![Some(Literal::long(i64::MAX))],
-    );
+    let cases = [
+        (Literal::long(i64::MAX), narrowed, "Int32"),
+        (
+            Literal::string("x"),
+            identity_partitioned_logical_fields()[0].clone(),
+            "long",
+        ),
+        (
+            Literal::Struct(iceberg::spec::Struct::from_iter([Some(Literal::long(1))])),
+            identity_partitioned_logical_fields()[0].clone(),
+            "non-primitive",
+        ),
+    ];
 
-    let refusal = planned_file_entry(&task, &[narrowed])
-        .expect_err("an out-of-range value must never be truncated into the scan spec");
-
-    let message = user_message(refusal.into_error("db.t"));
-    assert!(
-        message.contains("db.t") && message.contains("'id'"),
-        "{message}"
-    );
-}
-
-#[test]
-fn an_identity_literal_of_another_type_than_its_column_fails_planning_naming_the_column() {
-    use iceberg::spec::{Literal, Transform};
-    let spec = identity_partition_spec(0, &[("id", "id", Transform::Identity)]);
-    let refused_message = |literal| {
+    for (literal, field, cause) in cases {
         let task = partitioned_scan_task(&spec, vec![Some(literal)]);
-        let refusal = planned_file_entry(&task, &identity_partitioned_logical_fields())
-            .expect_err("a literal that is not its column's type must refuse planning");
-        user_message(refusal.into_error("db.t"))
-    };
-
-    let mismatched = refused_message(Literal::string("x"));
-    assert!(
-        mismatched.contains("db.t") && mismatched.contains("'id'") && mismatched.contains("long"),
-        "{mismatched}"
-    );
-    let nested = refused_message(Literal::Struct(iceberg::spec::Struct::from_iter([Some(
-        Literal::long(1),
-    )])));
-    assert!(nested.contains("non-primitive"), "{nested}");
+        let message = user_message(
+            identity_partition_values(&task, &[field], "db.t")
+                .expect_err("an unreadable value must never be dropped or truncated"),
+        );
+        assert!(
+            message.contains("db.t") && message.contains("'id'") && message.contains(cause),
+            "{message}"
+        );
+    }
 }
 
 #[test]
