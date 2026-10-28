@@ -175,7 +175,9 @@ fn user_message(error: UdfError) -> String {
 }
 
 async fn listing_error(session: &GlueCatalogSession) -> String {
-    let error = session.list_tables(&[DATABASE.to_string()]).await;
+    let error = session
+        .list_tables(&[DATABASE.to_string()], &|_| true)
+        .await;
     user_message(error.expect_err("the Glue call fails"))
 }
 
@@ -278,7 +280,7 @@ async fn the_listing_routes_each_table_by_its_table_type_before_its_input_format
     .await;
 
     let listing = session
-        .list_tables(&[DATABASE.to_string()])
+        .list_tables(&[DATABASE.to_string()], &|_| true)
         .await
         .expect("the listing succeeds");
 
@@ -311,7 +313,7 @@ async fn an_iceberg_table_lists_its_metadata_columns_and_plans_without_reading_t
     .await;
 
     let listed = session
-        .list_tables(&[DATABASE.to_string()])
+        .list_tables(&[DATABASE.to_string()], &|_| true)
         .await
         .expect("the listing reads the metadata file");
     let planned = session
@@ -410,7 +412,7 @@ async fn a_parquet_table_declares_storage_columns_then_partition_keys() {
     .await;
 
     let listing = session
-        .list_tables(&[DATABASE.to_string()])
+        .list_tables(&[DATABASE.to_string()], &|_| true)
         .await
         .expect("the listing succeeds");
     let planned = session
@@ -586,7 +588,7 @@ async fn a_listing_follows_a_non_empty_token_and_stops_on_an_empty_token_or_page
         .await;
 
     let listing = session
-        .list_tables(&[DATABASE.to_string()])
+        .list_tables(&[DATABASE.to_string()], &|_| true)
         .await
         .expect("the listing succeeds");
     let partitions = session
@@ -615,7 +617,7 @@ async fn a_namespace_naming_more_or_less_than_one_database_fails_before_any_glue
     ] {
         let message = user_message(
             session
-                .list_tables(&namespace)
+                .list_tables(&namespace, &|_| true)
                 .await
                 .expect_err("only one database segment is accepted"),
         );

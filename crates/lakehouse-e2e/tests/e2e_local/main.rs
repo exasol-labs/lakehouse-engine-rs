@@ -21,6 +21,7 @@ mod proxy;
 mod pruning;
 mod refresh;
 mod scan;
+mod table_filter;
 mod timestamp_precision;
 mod two_entry_points;
 mod type_relaxation;

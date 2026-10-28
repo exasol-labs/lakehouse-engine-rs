@@ -175,13 +175,29 @@ impl FromIterator<TableAdmission> for CatalogListing {
 /// `async-trait` dependency.
 pub trait CatalogClient: Send + Sync {
     /// Includes tables in descendant namespaces, except on Glue, whose namespaces are single-level.
-    fn list_tables(
-        &self,
+    ///
+    /// Only identifiers `exposes` accepts are admitted, skipped, or loaded, so a rejected table
+    /// can neither fail the call nor cost a load. An override applies `exposes` to each listed
+    /// identifier before it admits, skips, or loads a table.
+    fn list_tables<'a>(
+        &'a self,
         namespace: &[String],
-    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>>;
+        exposes: &'a (dyn Fn(&CatalogTableIdent) -> bool + Sync),
+    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + 'a>> {
+        let namespace = namespace.to_vec();
+        Box::pin(async move {
+            let idents: Vec<CatalogTableIdent> = self
+                .list_table_idents(&namespace)
+                .await?
+                .into_iter()
+                .filter(|ident| exposes(ident))
+                .collect();
+            self.load_listed_tables(&idents).await
+        })
+    }
 
-    /// Every identifier `list_tables` would return or skip, in listing order, without loading
-    /// any table's metadata, so a caller can pick tables by name before paying for their loads.
+    /// Every identifier the namespace listing names, in listing order, before any `exposes`
+    /// predicate applies. Loads no metadata, so a caller can pick tables before paying for loads.
     fn list_table_idents(
         &self,
         namespace: &[String],
@@ -225,25 +241,6 @@ impl IcebergRestCatalogClient {
             .await
     }
 
-    async fn resolve_listing(
-        &self,
-        idents: &[CatalogTableIdent],
-    ) -> Result<CatalogListing, UdfError> {
-        if idents.is_empty() {
-            return Ok(CatalogListing {
-                tables: Vec::new(),
-                skipped: Vec::new(),
-            });
-        }
-        let session = self.session().await?;
-        let admissions: Vec<TableAdmission> = stream::iter(idents.iter().cloned())
-            .map(|ident| async move { self.admit_on_session(session, &ident).await })
-            .buffered(CATALOG_REQUEST_CONCURRENCY)
-            .try_collect()
-            .await?;
-        Ok(admissions.into_iter().collect())
-    }
-
     async fn admit_on_session(
         &self,
         session: &CatalogSession,
@@ -278,17 +275,6 @@ impl IcebergRestCatalogClient {
 }
 
 impl CatalogClient for IcebergRestCatalogClient {
-    fn list_tables(
-        &self,
-        namespace: &[String],
-    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
-        let namespace = namespace.to_vec();
-        Box::pin(async move {
-            let idents = self.list_table_idents(&namespace).await?;
-            self.resolve_listing(&idents).await
-        })
-    }
-
     fn list_table_idents(
         &self,
         namespace: &[String],
@@ -306,7 +292,21 @@ impl CatalogClient for IcebergRestCatalogClient {
         idents: &[CatalogTableIdent],
     ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
         let idents = idents.to_vec();
-        Box::pin(async move { self.resolve_listing(&idents).await })
+        Box::pin(async move {
+            if idents.is_empty() {
+                return Ok(CatalogListing {
+                    tables: Vec::new(),
+                    skipped: Vec::new(),
+                });
+            }
+            let session = self.session().await?;
+            let admissions: Vec<TableAdmission> = stream::iter(idents)
+                .map(|ident| async move { self.admit_on_session(session, &ident).await })
+                .buffered(CATALOG_REQUEST_CONCURRENCY)
+                .try_collect()
+                .await?;
+            Ok(admissions.into_iter().collect())
+        })
     }
 
     fn load_table(

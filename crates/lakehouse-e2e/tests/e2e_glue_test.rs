@@ -217,13 +217,13 @@ fn glue_run_resources_are_removed_when_the_scope_ends_including_on_panic() {
 
 type FixtureCheck = fn(&GlueRun, &mut ExaConn);
 
-/// One provisioning serves every check. Each check but the last only reads the fixture, and the
-/// last breaks every later full REFRESH of it, so it runs after them. Each check runs even after
+/// One provisioning serves every check. Only the last two run after the broken table is
+/// registered, which fails every later unfiltered full REFRESH. Each check runs even after
 /// another failed, and the panic hook has already printed each failure.
 #[test]
 fn glue_checks_pass_against_one_provisioned_fixture() {
     let run = provision();
-    let checks: [(&str, FixtureCheck); 12] = [
+    let checks: [(&str, FixtureCheck); 13] = [
         (
             "listing",
             check_listing_includes_routed_tables_and_records_every_skip,
@@ -262,6 +262,10 @@ fn glue_checks_pass_against_one_provisioned_fixture() {
         (
             "broken table",
             check_a_broken_unrequested_table_fails_only_a_full_refresh,
+        ),
+        (
+            "hidden broken table",
+            check_a_hidden_broken_table_does_not_fail_the_listing,
         ),
     ];
     let failed: Vec<&str> = checks
@@ -465,6 +469,36 @@ fn check_a_broken_unrequested_table_fails_only_a_full_refresh(run: &GlueRun, con
         "SELECT ID FROM {VS}.{partitioned} WHERE P_STR = 'a b/c' ORDER BY ID"
     ));
     assert_eq!(int_column(&ids[0]), [5]);
+}
+
+/// Scenario: A hidden table is never loaded and never recorded as skipped
+fn check_a_hidden_broken_table_does_not_fail_the_listing(run: &GlueRun, conn: &mut ExaConn) {
+    let env = run.env();
+    for statement in [
+        format!(
+            "ALTER VIRTUAL SCHEMA {VS} SET TABLE_EXCLUDE = '{}'",
+            BROKEN_ICEBERG.to_uppercase()
+        ),
+        format!("ALTER VIRTUAL SCHEMA {VS} REFRESH"),
+    ] {
+        let response = conn.try_execute(&statement);
+        assert_eq!(
+            response["status"].as_str(),
+            Some("ok"),
+            "{statement} must not load the hidden {BROKEN_ICEBERG}: {}",
+            env.redact(&response["exception"].to_string())
+        );
+    }
+    let listed = conn.query_columns(&format!(
+        "SELECT TABLE_NAME FROM SYS.EXA_ALL_VIRTUAL_TABLES WHERE TABLE_SCHEMA = '{VS}' \
+         ORDER BY TABLE_NAME"
+    ));
+    let listed: Vec<String> = listed[0].iter().map(value_to_string).collect();
+    let routed: Vec<String> = ROUTED_TABLES.iter().map(|t| t.to_uppercase()).collect();
+    assert_eq!(
+        listed, routed,
+        "the filtered listing serves exactly the routed tables"
+    );
 }
 
 /// Scenario: Every declared column carries its source shape in its adapterNotes

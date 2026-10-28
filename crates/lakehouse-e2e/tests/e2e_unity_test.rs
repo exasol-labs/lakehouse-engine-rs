@@ -2363,6 +2363,31 @@ fn unity_column_mapping_property_reaches_create_and_scoped_refresh() {
     conn.execute(&format!("DROP VIRTUAL SCHEMA {VS} CASCADE"));
 }
 
+/// Scenario: Include and exclude patterns choose the exposed tables, and exclude wins
+#[test]
+fn unity_table_include_narrows_the_list_sweep() {
+    setup();
+    let mut conn = exa_conn();
+    const VS: &str = "UNITY_TABLE_FILTER_VS";
+    create_virtual_schema_with_password(
+        &mut conn,
+        &VsProps::new(VS, UNITY_NAMESPACE)
+            .with_catalog_kind("UNITY_CATALOG")
+            .with_catalog_conn_name("UNITY_TABLE_FILTER_CREDS")
+            .with_property("TABLE_INCLUDE", "CM_NAME_MODE"),
+        UNITY_CATALOG_URI_INTERNAL,
+        &local_stack_connection_password(),
+    );
+
+    assert_eq!(
+        enumerated_table_names(&mut conn, VS),
+        ["CM_NAME_MODE"],
+        "TABLE_INCLUDE must narrow the Unity Catalog list sweep to the one matching table"
+    );
+
+    conn.execute(&format!("DROP VIRTUAL SCHEMA {VS} CASCADE"));
+}
+
 /// Its own schema, so deleting its one table through the Unity REST API touches no shared fixture.
 const DELETED_TABLE_NAMESPACE: &str = "unity.e2e_deleted_table";
 const DELETED_TABLE_VS: &str = "UNITY_DELETED_TABLE_VS";

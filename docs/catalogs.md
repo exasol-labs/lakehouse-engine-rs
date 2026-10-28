@@ -709,6 +709,30 @@ Two cases break a query that worked before:
 - An Iceberg `binary` column that holds UTF-8 text is now refused.
 - A direct-storage column that a legacy writer such as Impala or Hive stored as an unannotated `BYTE_ARRAY` string is now refused. Rewrite the file with the Parquet `STRING` annotation to read it.
 
+## Choosing which tables to expose
+
+`TABLE_INCLUDE` and `TABLE_EXCLUDE` choose which source tables a virtual schema exposes. Both are optional, and a schema that sets neither exposes every table. Each holds a comma-separated list of patterns, for example `TABLE_EXCLUDE = 'AUDIT_LOG, TMP_*'`.
+
+A table is exposed when `TABLE_INCLUDE` is absent or one of its patterns matches the table, and no `TABLE_EXCLUDE` pattern matches it. A table that matches both lists stays hidden. With `TABLE_INCLUDE = 'ORDERS*'` and `TABLE_EXCLUDE = 'ORDERS_TMP'`, the schema exposes `ORDERS` and `ORDERS_2024` and hides `ORDERS_TMP`.
+
+**Pattern syntax:**
+
+- `*` matches any run of characters, including none. `?` matches exactly one character.
+- Every other character matches only itself. `[`, `]`, and `\` are not special.
+- A pattern matches the whole name, so `ORDERS` does not match `ORDERS_2024`.
+- The adapter removes the whitespace around each entry and uppercases it, so ` orders_?0* ` matches `ORDERS_2024`.
+- An empty entry, such as the one in `'ORDERS,,AUDIT_LOG'`, fails the statement with `expected a comma-separated list of non-empty table name patterns`.
+
+**What a pattern matches:** the Exasol virtual table name, not the catalog identifier. The name is the namespace segments below `NAMESPACE` plus the table name, joined with `__` and uppercased. The table `orders` in the child namespace `staging` is `STAGING__ORDERS`, so `TABLE_EXCLUDE = 'STAGING__*'` hides every table of that child namespace.
+
+**When the filter applies:**
+
+- `CREATE VIRTUAL SCHEMA` and a plain `REFRESH` declare only the exposed tables.
+- `ALTER VIRTUAL SCHEMA ... SET TABLE_INCLUDE = ...` or `SET TABLE_EXCLUDE = ...` re-lists the source. Exasol drops the virtual tables the new filter hides and creates the ones it exposes. `SET ... = null` removes the property.
+- `REFRESH TABLES` treats a hidden table as a table the source does not serve, so it cannot add a hidden table back.
+- The adapter never loads a hidden table. A hidden table that cannot be read, or that the listing would skip, therefore never fails the statement.
+- `SKIPPED_TABLES` holds no entry for a hidden table. See [Reading SKIPPED_TABLES](#reading-skipped_tables).
+
 ## Refreshing named tables
 
 `ALTER VIRTUAL SCHEMA <name> REFRESH TABLES <table> [<table> ...]` re-declares only the named tables, and every other virtual table keeps its declaration. Separate the names with spaces. The adapter lists only the source's table names, then loads the metadata of the named tables alone. A table that fails to load, or a name collision among tables, therefore fails the statement only when the statement names that table or that name. A named table resolves exactly as a plain `REFRESH` resolves it, including every catalog identifier that folds to the name.

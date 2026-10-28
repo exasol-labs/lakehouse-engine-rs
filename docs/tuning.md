@@ -14,7 +14,7 @@ This page lists every property and shows how to see what a scan does. Set these 
 |---|---|---|---|---|
 | `CATALOG_CONNECTION` | yes | none | Name of an Exasol CONNECTION | Holds the catalog URI and the credentials JSON. See [Install](install.md). |
 | `CATALOG_KIND` | no | absent (Iceberg REST) | `UNITY_CATALOG`, `GLUE`, `DIRECT_STORAGE`, or absent | Which catalog backend to resolve against. Leave it absent for an Iceberg REST catalog. Any other value, including the literal `'ICEBERG_REST'`, is rejected. See [Catalogs](catalogs.md). |
-| `NAMESPACE` | yes, except under `DIRECT_STORAGE` | none | Dot-delimited namespace, or `catalog.schema` under `UNITY_CATALOG`, or, under `DIRECT_STORAGE`, a path relative to the CONNECTION address with no URI scheme and no leading `/` | Catalog namespace. Every table in the namespace becomes a virtual table. See [Direct storage](catalogs.md#direct-storage-raw-parquet-no-catalog). |
+| `NAMESPACE` | yes, except under `DIRECT_STORAGE` | none | Dot-delimited namespace, or `catalog.schema` under `UNITY_CATALOG`, or, under `DIRECT_STORAGE`, a path relative to the CONNECTION address with no URI scheme and no leading `/` | Catalog namespace. Every table in the namespace becomes a virtual table, unless `TABLE_INCLUDE` or `TABLE_EXCLUDE` hides it. See [Direct storage](catalogs.md#direct-storage-raw-parquet-no-catalog). |
 | `ALLOW_HTTP` | no | `false` | `TRUE` or `FALSE`, any letter case | `TRUE` permits plain-HTTP catalog and S3 access (for example, local SeaweedFS). |
 | `PARALLELISM_FACTOR` | no | `1` | Whole number, 1 to 255 | Shards per node. `G = node_count × factor`, capped at 300. Exasol scans a node's shards one after another, so a higher factor adds per-shard startup, not concurrency. |
 | `DATAFUSION_THREADING_MODE` | no | `AUTO` | `AUTO` or `FIXED`, any letter case | `AUTO` uses the detected core count as threads and twice that as target partitions. `FIXED` uses the two properties below verbatim. |
@@ -29,6 +29,8 @@ This page lists every property and shows how to see what a scan does. Set these 
 | `HIVE_PARTITIONING` | no | `TRUE` | `TRUE` or `FALSE`, any letter case | Direct storage only: declares `key=value` directory segments as partition columns. Other catalog kinds accept and ignore it. See [Direct storage](catalogs.md#direct-storage-raw-parquet-no-catalog). |
 | `PERMISSION_CHECK` | no | absent (off) | `LAKEKEEPER`, any letter case | Turns on the Lakekeeper permission check. It needs the Iceberg REST catalog kind and `USER_MAPPING`. See [Lakekeeper permission check](security.md#lakekeeper-permission-check). |
 | `USER_MAPPING` | with `PERMISSION_CHECK` | absent | A Jinja template with one variable, `user` | Maps the querying Exasol user to a Lakekeeper principal. Ignored while `PERMISSION_CHECK` is off. See [USER_MAPPING](security.md#user_mapping). |
+| `TABLE_INCLUDE` | no | absent (every table) | Comma-separated patterns over the virtual table name. `*` matches any run, `?` matches one character, and an empty entry is rejected. | Exposes only the tables that match a pattern. See [Choosing which tables to expose](catalogs.md#choosing-which-tables-to-expose). |
+| `TABLE_EXCLUDE` | no | absent (no table hidden) | Same as `TABLE_INCLUDE` | Hides every table that matches a pattern, including a table that `TABLE_INCLUDE` matches. See [Choosing which tables to expose](catalogs.md#choosing-which-tables-to-expose). |
 
 Create these three scripts in the same schema as `LAKEHOUSE_ADAPTER`:
 

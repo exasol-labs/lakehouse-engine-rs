@@ -2,6 +2,7 @@
 //! rule of each tuning property.
 
 use super::nonempty_str;
+use super::table_filter::{TableFilter, parse_patterns};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,10 +31,12 @@ pub(super) const PROP_MERGE_SCHEMA: &str = "MERGE_SCHEMA";
 pub(super) const PROP_HIVE_PARTITIONING: &str = "HIVE_PARTITIONING";
 pub(super) const PERMISSION_CHECK: &str = "PERMISSION_CHECK";
 pub(super) const USER_MAPPING: &str = "USER_MAPPING";
+const PROP_TABLE_INCLUDE: &str = "TABLE_INCLUDE";
+const PROP_TABLE_EXCLUDE: &str = "TABLE_EXCLUDE";
 
 /// Every name a virtual schema may set; the value rules of the properties whose owning module
 /// checks the value stay in that module.
-const PROPERTY_NAMES: [&str; 17] = [
+const PROPERTY_NAMES: [&str; 19] = [
     PROP_CATALOG_KIND,
     PROP_CATALOG_CONNECTION,
     PROP_NAMESPACE,
@@ -51,6 +54,8 @@ const PROPERTY_NAMES: [&str; 17] = [
     PROP_HIVE_PARTITIONING,
     PERMISSION_CHECK,
     USER_MAPPING,
+    PROP_TABLE_INCLUDE,
+    PROP_TABLE_EXCLUDE,
 ];
 
 const ERROR_PREFIX: &str = "invalid virtual schema properties: ";
@@ -78,16 +83,22 @@ pub(super) struct TuningProperties {
     pub(super) s3_max_connections: Option<NonZeroU16>,
 }
 
-/// Rejects every unknown property name and every invalid tuning value in one error, so the
-/// create-time resolution can read the returned values without parsing a string again. Each value
-/// is checked on its own: no property's validity depends on another property.
-pub(super) fn check_properties(props: &Json) -> Result<TuningProperties, UdfError> {
+/// The checked values that the create-time resolution reads without parsing a string again.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct CheckedProperties {
+    pub(super) tuning: TuningProperties,
+    pub(super) table_filter: TableFilter,
+}
+
+/// Rejects every unknown property name and every invalid tuning or table pattern value in one
+/// error. Each value is checked on its own: no property's validity depends on another property.
+pub(super) fn check_properties(props: &Json) -> Result<CheckedProperties, UdfError> {
     let mut entries: Vec<String> = unknown_names(props)
         .into_iter()
         .map(unknown_entry)
         .collect();
-    match check_tuning(props) {
-        Ok(tuning) if entries.is_empty() => return Ok(tuning),
+    match check_values(props) {
+        Ok(checked) if entries.is_empty() => return Ok(checked),
         Ok(_) => {}
         Err(invalid) => entries.extend(invalid),
     }
@@ -152,11 +163,15 @@ fn edit_distance(a: &[char], b: &[char]) -> usize {
 }
 
 /// One entry per rejected value, in alphabetical order of the name.
-fn check_tuning(props: &Json) -> Result<TuningProperties, Vec<String>> {
+fn check_values(props: &Json) -> Result<CheckedProperties, Vec<String>> {
     let mut checker = TuningChecker::new(props);
     let tuning = checker.tuning();
+    let table_filter = checker.table_filter();
     if checker.invalid.is_empty() {
-        Ok(tuning)
+        Ok(CheckedProperties {
+            tuning,
+            table_filter,
+        })
     } else {
         Err(checker.invalid.into_values().collect())
     }
@@ -189,6 +204,13 @@ impl<'a> TuningChecker<'a> {
             join_broadcast_max_bytes: self.whole_number(PROP_JOIN_BROADCAST_MAX_BYTES),
             s3_max_connections: self.whole_number(PROP_S3_MAX_CONNECTIONS),
         }
+    }
+
+    fn table_filter(&mut self) -> TableFilter {
+        TableFilter::new(
+            self.value(PROP_TABLE_INCLUDE, parse_patterns),
+            self.value(PROP_TABLE_EXCLUDE, parse_patterns),
+        )
     }
 
     /// Applies `rule` to a present value; a rejection is recorded with the expectation the rule

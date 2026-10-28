@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 
-const ALL_NAMES: [&str; 17] = [
+const ALL_NAMES: [&str; 19] = [
     "CATALOG_KIND",
     "CATALOG_CONNECTION",
     "NAMESPACE",
@@ -19,6 +19,8 @@ const ALL_NAMES: [&str; 17] = [
     "HIVE_PARTITIONING",
     "PERMISSION_CHECK",
     "USER_MAPPING",
+    "TABLE_INCLUDE",
+    "TABLE_EXCLUDE",
 ];
 
 /// Name, minimum, and maximum of each whole-number tuning property.
@@ -76,13 +78,15 @@ fn every_known_name_passes() {
         ("HIVE_PARTITIONING", "not-checked-here"),
         ("PERMISSION_CHECK", "not-checked-here"),
         ("USER_MAPPING", "not-checked-here"),
+        ("TABLE_INCLUDE", "ORDERS*, ?_LOG"),
+        ("TABLE_EXCLUDE", "TMP_*"),
     ];
     let names: Vec<&str> = valid_values.iter().map(|(name, _)| *name).collect();
-    assert_eq!(names, ALL_NAMES, "the fixture must cover the 17 names");
+    assert_eq!(names, ALL_NAMES, "the fixture must cover the 19 names");
     assert_eq!(
         PROPERTY_NAMES.into_iter().collect::<BTreeSet<&str>>(),
         ALL_NAMES.into_iter().collect::<BTreeSet<&str>>(),
-        "the adapter must accept exactly the 17 names of vs-properties/property-name-validation"
+        "the adapter must accept exactly the 19 names of vs-properties/property-name-validation"
     );
 
     check_properties(&props(&valid_values)).expect("every known name with a valid value passes");
@@ -165,7 +169,8 @@ fn whole_number_tuning_values_return_their_typed_value() {
         ("DATAFUSION_THREADING_MODE", "fixed"),
         ("MEMORY_POOL_FRACTION", "1"),
     ]))
-    .expect("valid values pass");
+    .expect("valid values pass")
+    .tuning;
 
     assert_eq!(tuning.parallelism_factor.map(|n| n.get()), Some(255));
     assert_eq!(tuning.df_threads_per_udf.map(|n| n.get()), Some(65535));
@@ -183,9 +188,9 @@ fn whole_number_tuning_values_return_their_typed_value() {
 
 #[test]
 fn absent_tuning_properties_return_none() {
-    let tuning = check_properties(&props(&[("NAMESPACE", "sales")])).expect("passes");
+    let checked = check_properties(&props(&[("NAMESPACE", "sales")])).expect("passes");
 
-    assert_eq!(tuning, TuningProperties::default());
+    assert_eq!(checked, CheckedProperties::default());
 }
 
 #[test]
@@ -197,9 +202,9 @@ fn an_empty_or_null_value_counts_as_absent() {
         "DATAFUSION_BATCH_SIZE": null,
     });
 
-    let tuning = check_properties(&props).expect("an empty or null value is never checked");
+    let checked = check_properties(&props).expect("an empty or null value is never checked");
 
-    assert_eq!(tuning, TuningProperties::default());
+    assert_eq!(checked, CheckedProperties::default());
 }
 
 #[test]

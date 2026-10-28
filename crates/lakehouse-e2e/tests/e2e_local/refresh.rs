@@ -51,7 +51,7 @@ fn create_virtual_schema(conn: &mut ExaConn, vs_name: &str, namespace: &str) {
     crate::common::e2e_harness::create_virtual_schema(conn, &refresh_props(vs_name, namespace));
 }
 
-fn seed_catalog(rt: &tokio::runtime::Runtime, label: &str) -> RestCatalog {
+pub(crate) fn seed_catalog(rt: &tokio::runtime::Runtime, label: &str) -> RestCatalog {
     rt.block_on(build_seed_catalog(
         &iceberg_catalog_url(),
         "s3://warehouse/",
@@ -99,7 +99,7 @@ fn id_val_batch(id: i64, val: f64) -> RecordBatch {
     .expect("id+val RecordBatch construction is infallible")
 }
 
-async fn ensure_id_val_table(
+pub(crate) async fn ensure_id_val_table(
     catalog: &impl Catalog,
     namespace: &str,
     table_name: &str,
@@ -118,7 +118,7 @@ async fn ensure_id_val_table(
 }
 
 /// Collision detection runs before any per-table resolution, so no data file is needed.
-async fn create_empty_table(
+pub(crate) async fn create_empty_table(
     catalog: &impl Catalog,
     ns: &NamespaceIdent,
     table_name: &str,
@@ -778,11 +778,11 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
     );
 }
 
-fn long_field(id: i32, name: &str, required: bool) -> NestedFieldRef {
+pub(crate) fn long_field(id: i32, name: &str, required: bool) -> NestedFieldRef {
     NestedField::new(id, name, Type::Primitive(PrimitiveType::Long), required).into()
 }
 
-fn schema_of(schema_id: i32, fields: &[NestedFieldRef]) -> IcebergSchema {
+pub(crate) fn schema_of(schema_id: i32, fields: &[NestedFieldRef]) -> IcebergSchema {
     IcebergSchema::builder()
         .with_schema_id(schema_id)
         .with_fields(fields.to_vec())

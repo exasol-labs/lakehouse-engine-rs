@@ -64,7 +64,9 @@ fn schema_request(request_type: &str, properties: serde_json::Value) -> Json {
 }
 
 fn checked(props: serde_json::Value) -> TuningProperties {
-    check_properties(&props).unwrap_or_else(|e| panic!("{props} must pass the check: {e}"))
+    check_properties(&props)
+        .unwrap_or_else(|e| panic!("{props} must pass the check: {e}"))
+        .tuning
 }
 
 fn resolved_tuning(props: serde_json::Value, nr_of_cores: u32) -> TuningNotes {
