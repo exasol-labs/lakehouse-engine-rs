@@ -53,7 +53,7 @@ async fn lists_tables_in_catalog_schema() {
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
     let listing = session
-        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .list_tables(&["cat".to_string(), "sch".to_string()], &|_| true)
         .await
         .expect("list failed");
 
@@ -158,7 +158,7 @@ async fn includes_managed_and_external_delta_base_tables() {
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
     let listing = session
-        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .list_tables(&["cat".to_string(), "sch".to_string()], &|_| true)
         .await
         .expect("list failed");
 
@@ -192,7 +192,7 @@ async fn skips_view_unplannable_format_and_other_type_with_reason() {
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
     let listing = session
-        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .list_tables(&["cat".to_string(), "sch".to_string()], &|_| true)
         .await
         .expect("list failed");
 
@@ -311,7 +311,7 @@ async fn follows_pagination_across_pages() {
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
     let listing = session
-        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .list_tables(&["cat".to_string(), "sch".to_string()], &|_| true)
         .await
         .expect("list failed");
 
@@ -348,7 +348,7 @@ async fn request_failure_is_credential_safe_error() {
     let session = UnityCatalogSession::new(&server.base_url, creds);
 
     let err = session
-        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .list_tables(&["cat".to_string(), "sch".to_string()], &|_| true)
         .await
         .expect_err("a 500 must surface an error");
 
@@ -446,7 +446,7 @@ async fn every_unity_request_kind_succeeds_after_one_503() {
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
     session
-        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .list_tables(&["cat".to_string(), "sch".to_string()], &|_| true)
         .await
         .expect("table listing succeeds once the retry succeeds");
     session
@@ -486,11 +486,11 @@ async fn identical_request_shape_oss_and_databricks() {
     let databricks_session = UnityCatalogSession::new(&databricks.base_url, databricks_creds);
 
     oss_session
-        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .list_tables(&["cat".to_string(), "sch".to_string()], &|_| true)
         .await
         .expect("oss list failed");
     databricks_session
-        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .list_tables(&["cat".to_string(), "sch".to_string()], &|_| true)
         .await
         .expect("databricks list failed");
 
@@ -572,7 +572,7 @@ async fn list_tables_tags_each_admitted_table_by_its_own_format() {
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
     let listing = session
-        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .list_tables(&["cat".to_string(), "sch".to_string()], &|_| true)
         .await
         .expect("list failed");
 

@@ -215,6 +215,8 @@ fn create_accepts_every_known_property_name() {
             ("MERGE_SCHEMA", "false"),
             ("HIVE_PARTITIONING", "false"),
             ("USER_MAPPING", "{{ user }}"),
+            ("TABLE_INCLUDE", "*"),
+            ("TABLE_EXCLUDE", "NO_SUCH_TABLE"),
         ],
     );
 
@@ -237,6 +239,32 @@ fn create_accepts_every_known_property_name() {
         );
     }
     drop_vs(&mut conn, VS);
+}
+
+/// Scenario: An empty pattern entry fails the statement
+#[test]
+fn create_rejects_an_empty_table_pattern_entry() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+
+    let msg = create_error(
+        &mut conn,
+        "PV_EMPTY_PATTERN",
+        &[
+            ("CATALOG_CONNECTION", DEFAULT_CATALOG_CONN_NAME),
+            ("NAMESPACE", E2E_NAMESPACE),
+            ("TABLE_INCLUDE", "ORDERS,,AUDIT_LOG"),
+        ],
+    );
+
+    assert!(
+        msg.contains(&invalid_value(
+            "TABLE_INCLUDE",
+            "ORDERS,,AUDIT_LOG",
+            "a comma-separated list of non-empty table name patterns"
+        )),
+        "{msg}"
+    );
 }
 
 /// Scenario: Threading mode defaults to AUTO when the property is absent

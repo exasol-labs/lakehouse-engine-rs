@@ -165,10 +165,11 @@ impl UnityCatalogSession {
 }
 
 impl CatalogClient for UnityCatalogSession {
-    fn list_tables(
-        &self,
+    fn list_tables<'a>(
+        &'a self,
         namespace: &[String],
-    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
+        exposes: &'a (dyn Fn(&CatalogTableIdent) -> bool + Sync),
+    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + 'a>> {
         let namespace = namespace.to_vec();
         Box::pin(async move {
             let (catalog, schema) = unity_namespace(&namespace)?;
@@ -180,8 +181,10 @@ impl CatalogClient for UnityCatalogSession {
                         namespace: namespace.clone(),
                         name: info.name.clone(),
                     };
-                    admit(ident, info)
+                    (ident, info)
                 })
+                .filter(|(ident, _)| exposes(ident))
+                .map(|(ident, info)| admit(ident, info))
                 .collect())
         })
     }

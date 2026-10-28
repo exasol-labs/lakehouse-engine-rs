@@ -84,7 +84,10 @@ async fn first_level_directories_are_the_tables() {
     .await;
 
     let client = test_client(inner, "s3://bucket/lake", FOLD_NO_HIVE);
-    let listing = client.list_tables(&[]).await.expect("enumeration succeeds");
+    let listing = client
+        .list_tables(&[], &|_| true)
+        .await
+        .expect("enumeration succeeds");
 
     let mut names: Vec<&str> = listing
         .tables
@@ -139,7 +142,10 @@ async fn columns_carry_tag_and_declaration_from_one_fold() {
         "s3://bucket/lake",
         directory_options(MergeMode::FoldEveryFile, true),
     );
-    let listing = client.list_tables(&[]).await.expect("enumeration succeeds");
+    let listing = client
+        .list_tables(&[], &|_| true)
+        .await
+        .expect("enumeration succeeds");
 
     assert_eq!(listing.tables.len(), 1);
     let table = &listing.tables[0];
@@ -175,7 +181,7 @@ async fn directory_with_no_data_file_is_skipped_with_a_neutral_reason() {
 
     let client = test_client(inner, "s3://bucket/lake", FOLD_NO_HIVE);
     let listing = client
-        .list_tables(&[])
+        .list_tables(&[], &|_| true)
         .await
         .expect("createVirtualSchema completes with the remaining tables");
 
@@ -198,7 +204,10 @@ async fn one_admission_limited_store_serves_the_whole_call() {
         FOLD_NO_HIVE,
     );
 
-    let listing = client.list_tables(&[]).await.expect("enumeration succeeds");
+    let listing = client
+        .list_tables(&[], &|_| true)
+        .await
+        .expect("enumeration succeeds");
     assert_eq!(listing.tables.len(), 2);
 
     let prefixes = recording.listed_prefixes();
@@ -227,7 +236,10 @@ async fn new_derives_the_store_prefix_from_the_base_path() {
         FOLD_NO_HIVE,
     );
 
-    let listing = client.list_tables(&[]).await.expect("enumeration succeeds");
+    let listing = client
+        .list_tables(&[], &|_| true)
+        .await
+        .expect("enumeration succeeds");
 
     let names: Vec<&str> = listing
         .tables
@@ -265,7 +277,10 @@ async fn merge_schema_selects_footers_at_enumeration_only() {
             directory_options(merge_mode, false),
         );
 
-        let listing = client.list_tables(&[]).await.expect("enumeration succeeds");
+        let listing = client
+            .list_tables(&[], &|_| true)
+            .await
+            .expect("enumeration succeeds");
         assert_eq!(listing.tables.len(), 1, "{merge_mode:?}");
 
         assert_eq!(
@@ -303,7 +318,7 @@ async fn a_non_utc_timezone_column_is_declared_at_its_normalized_tag() {
     );
 
     let client = test_client(inner, "s3://bucket/lake", FOLD_NO_HIVE);
-    let listing = client.list_tables(&[]).await.expect(
+    let listing = client.list_tables(&[], &|_| true).await.expect(
         "a legal timezone-aware Parquet column must enumerate, not fail the whole virtual schema",
     );
 
@@ -326,7 +341,7 @@ async fn hive_partitioning_reaches_the_seam_on_enumeration() {
             "s3://bucket/lake",
             directory_options(MergeMode::FoldEveryFile, hive_partitioning),
         )
-        .list_tables(&[])
+        .list_tables(&[], &|_| true)
         .await
         .expect("enumeration succeeds");
         assert_eq!(

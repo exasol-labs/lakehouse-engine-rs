@@ -17,6 +17,7 @@ mod pushdown_surface_probe;
 pub mod scoped_refresh;
 pub mod sharding;
 pub mod skipped_tables;
+mod table_filter;
 pub mod table_identity;
 pub mod tables;
 
@@ -34,6 +35,7 @@ use crate::adapter::properties::{
 use crate::adapter::pushdown::{declare_columns, handle_pushdown};
 use crate::adapter::scoped_refresh::{RequestedTables, ScopedRefresh};
 use crate::adapter::skipped_tables::{SkippedTables, insert_skipped_tables, skip_kind_and_reason};
+use crate::adapter::table_filter::TableFilter;
 use crate::adapter::table_identity::{encode_identifier_note, read_identifier};
 use crate::adapter::tables::{
     catalog_identifier_string, flatten_table_name, reject_name_collisions,
@@ -48,8 +50,8 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;
 use lakehouse_catalog::{
-    CatalogClient, CatalogListing, GlueCatalogSession, IcebergRestCatalogClient, SkippedTable,
-    UnityCatalogSession, resolve_aws_identity,
+    CatalogClient, CatalogListing, CatalogTableIdent, GlueCatalogSession, IcebergRestCatalogClient,
+    SkippedTable, UnityCatalogSession, resolve_aws_identity,
 };
 use serde_json::{Value as Json, json};
 use std::num::NonZeroUsize;
@@ -208,7 +210,12 @@ fn handle_create_virtual_schema(
     )
     .map_err(|e| redact_error(&config.storage, e))?;
     let (listing, skipped_tables) = rt
-        .block_on(list_source(client.as_ref(), &configured_ns, request))
+        .block_on(list_source(
+            client.as_ref(),
+            &configured_ns,
+            &checked.table_filter,
+            request,
+        ))
         .map_err(|e| redact_error(&config.storage, e))?;
 
     let engine_timestamps = EngineTimestampSupport::from_database_version(&ctx.database_version());
@@ -220,7 +227,7 @@ fn handle_create_virtual_schema(
         udf_log!(ctx, warn, "{}", skip_warning(entry));
     }
 
-    let tuning = resolve_tuning_notes(&checked, resolve_nr_of_cores());
+    let tuning = resolve_tuning_notes(&checked.tuning, resolve_nr_of_cores());
     let adapter_notes = build_adapter_notes(request, &tuning, &skipped_tables);
 
     let schema_metadata = json!({
@@ -233,17 +240,23 @@ fn handle_create_virtual_schema(
 
 /// A partial refresh lists identifiers only and loads just the requested tables, so a broken
 /// unrequested table cannot fail it. It reads no identifier note: each name resolves afresh.
+/// A table the filter hides is never loaded or skipped: a partial refresh drops it from the
+/// listing, so a requested hidden name resolves like a name the source does not serve.
 async fn list_source(
     client: &dyn CatalogClient,
     configured_ns: &[String],
+    table_filter: &TableFilter,
     request: &Json,
 ) -> Result<(CatalogListing, SkippedTables), UdfError> {
+    let exposes =
+        |ident: &CatalogTableIdent| table_filter.exposes(&flatten_table_name(configured_ns, ident));
     let Some(requested) = RequestedTables::from_request(request)? else {
-        let listing = client.list_tables(configured_ns).await?;
+        let listing = client.list_tables(configured_ns, &exposes).await?;
         let skipped_tables = SkippedTables::listed(&listing.skipped);
         return Ok((listing, skipped_tables));
     };
-    let listed = client.list_table_idents(configured_ns).await?;
+    let mut listed = client.list_table_idents(configured_ns).await?;
+    listed.retain(|ident| exposes(ident));
     let scope = ScopedRefresh::new(&requested, configured_ns, &listed);
     let listing = client.load_listed_tables(&scope.selection()).await?;
     let persisted = SkippedTables::persisted(&parse_adapter_notes(request));

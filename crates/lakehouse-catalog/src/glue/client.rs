@@ -204,10 +204,11 @@ impl GlueCatalogSession {
 }
 
 impl CatalogClient for GlueCatalogSession {
-    fn list_tables(
-        &self,
+    fn list_tables<'a>(
+        &'a self,
         namespace: &[String],
-    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
+        exposes: &'a (dyn Fn(&CatalogTableIdent) -> bool + Sync),
+    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + 'a>> {
         let namespace = namespace.to_vec();
         Box::pin(async move {
             let database = glue_database(&namespace)?;
@@ -218,8 +219,10 @@ impl CatalogClient for GlueCatalogSession {
                         namespace: namespace.clone(),
                         name: table.name().to_string(),
                     };
-                    self.admit(ident, table)
+                    (ident, table)
                 })
+                .filter(|(ident, _)| futures::future::ready(exposes(ident)))
+                .map(|(ident, table)| self.admit(ident, table))
                 .buffered(METADATA_READ_CONCURRENCY)
                 .try_collect()
                 .await?;

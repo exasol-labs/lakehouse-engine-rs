@@ -109,7 +109,7 @@ pub(crate) async fn enumerated_notes(
         options,
     )
     .expect("the fixture base path is a valid storage URI")
-    .list_tables(&[])
+    .list_tables(&[], &|_| true)
     .await
     .expect("the fixture directory enumerates");
     listing
