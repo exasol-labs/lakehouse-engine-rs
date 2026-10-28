@@ -15,8 +15,12 @@ fn scan_table_over(files: Vec<FileEntry>) -> ParquetScanTable {
     };
     ParquetScanTable {
         object_store_url: ObjectStoreUrl::parse("memory://").unwrap(),
-        schema: PartitionedScanSchema::split(Arc::new(arrow::datatypes::Schema::empty()), &[])
-            .expect("an empty schema declares no partition column"),
+        schema: PartitionedScanSchema::split(
+            Arc::new(arrow::datatypes::Schema::empty()),
+            &[],
+            &files,
+        )
+        .expect("an empty schema declares no partition column"),
         use_field_id_adapter: false,
         format: Arc::new(scan_table_parquet_format(&field_id_resolution)),
         field_id_resolution,
@@ -34,7 +38,7 @@ fn scan_table_partitioned_by(
     partition_columns: &[String],
 ) -> ParquetScanTable {
     ParquetScanTable {
-        schema: PartitionedScanSchema::split(declared, partition_columns)
+        schema: PartitionedScanSchema::split(declared, partition_columns, &files)
             .expect("every partition column is declared"),
         ..scan_table_over(files)
     }
@@ -91,7 +95,17 @@ fn the_provider_reports_the_declared_schema_while_scanning_the_split_one() {
         "the partition column is not read from any data file"
     );
     assert_eq!(
-        table.schema.remap_projection(None),
+        table.schema.projection_exprs(None).map(|projection| {
+            projection
+                .iter()
+                .filter_map(|projected| {
+                    projected
+                        .expr
+                        .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+                        .map(|column| column.index())
+                })
+                .collect::<Vec<_>>()
+        }),
         Some(vec![0, 2, 1]),
         "declared order is restored by the projection alone"
     );

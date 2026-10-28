@@ -35,6 +35,8 @@ pub mod exasol_ws;
 #[cfg(feature = "glue-e2e")]
 pub mod glue;
 #[cfg(feature = "exasol-e2e")]
+pub mod identity_partition_fixtures;
+#[cfg(feature = "exasol-e2e")]
 pub mod int96_fixtures;
 #[cfg(any(feature = "lakekeeper-e2e", feature = "azure-e2e"))]
 pub mod lakekeeper;

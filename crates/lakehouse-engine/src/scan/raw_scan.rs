@@ -104,8 +104,9 @@ pub async fn register_files(
 /// A non-empty `logical_schema` installs the column-binding adapter (binding by field-id,
 /// declared physical name, or own name across schema evolution); otherwise the schema is
 /// inferred from the first file. `partition_columns` leave the file schema and are materialized
-/// per file (see [`PartitionedScanSchema`]). Each side of a join registers through this same
-/// provider, so both apply their own deletes.
+/// per file, while a `files` partition value for an unlisted column fills that column only in a
+/// file that lacks it (see [`PartitionedScanSchema`]). Each side of a join registers through this
+/// same provider, so both apply their own deletes and partition values.
 ///
 /// `delete_path_read_limiter` must be the SAME `Arc` for every call in one invocation, including
 /// both join sides, so the instance stays within one N-permit budget.
@@ -160,8 +161,7 @@ pub(super) async fn register_file_list(
     let field_id_resolution = FieldIdResolution::for_logical_schema(logical_schema, name_mapping)
         .map_err(UdfError::User)?;
 
-    // Partition columns have no physical counterpart in any data file.
-    let schema = PartitionedScanSchema::split(table_schema, partition_columns)
+    let schema = PartitionedScanSchema::split(table_schema, partition_columns, files)
         .map_err(|e| UdfError::User(format!("cannot register '{table_name}': {e}")))?;
 
     let table = crate::scan::scan_table::ParquetScanTable::new(

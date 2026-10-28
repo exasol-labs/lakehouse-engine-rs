@@ -4,6 +4,7 @@
 //! `schema.name-mapping.default` and then the physical name. Nested members declare the same
 //! choice, and [`resolve_nested_field`] recurses the one binding pass into them.
 
+use crate::scan::partition_values::IdentityFallbackExpr;
 use crate::scan::raw_scan::NESTED_JSON_RENDER_UDF_NAME;
 use crate::scan::render_nested_column_as_json;
 use crate::scan::spec::{NameMappingEntry, NestedField, NestedMembers};
@@ -21,7 +22,7 @@ use datafusion::physical_expr_adapter::{
     DefaultPhysicalExprAdapterFactory, PhysicalExprAdapter, PhysicalExprAdapterFactory,
 };
 use datafusion::scalar::ScalarValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Only field-id-bound logical fields are tagged with it.
@@ -494,6 +495,14 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
         );
         binding.ensure_unambiguous(&self.table_root)?;
 
+        let bound_logical_indices: HashSet<usize> = logical_file_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| binding.bound_logical_names.contains(field.name().as_str()))
+            .map(|(index, _)| index)
+            .collect();
+
         // Per file: only logical columns no physical field claimed get their default, keyed by
         // the logical index an incoming `Column` carries.
         let absent_default_by_index: HashMap<usize, ScalarValue> = logical_file_schema
@@ -525,6 +534,7 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
         Ok(Arc::new(FieldIdExprAdapter {
             inner,
             physical_file_schema,
+            bound_logical_indices,
             absent_default_by_index,
             refused_by_index,
             table_root: self.table_root.clone(),
@@ -545,6 +555,8 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
 struct FieldIdExprAdapter {
     inner: Arc<dyn PhysicalExprAdapter>,
     physical_file_schema: arrow::datatypes::SchemaRef,
+    /// LOGICAL column indices of the fields this file supplies.
+    bound_logical_indices: HashSet<usize>,
     /// Keyed by LOGICAL column index; only absent fields with a reconstructed `initial-default`.
     absent_default_by_index: HashMap<usize, ScalarValue>,
     /// This file's bound columns whose type is not admitted, keyed by logical index.
@@ -576,9 +588,20 @@ impl PhysicalExprAdapter for FieldIdExprAdapter {
             })?;
         }
 
+        // Column-projection rule (1) precedes rule (3): an identity value fills only a field this
+        // file does not bind, and a file with no value leaves the field to the default below.
+        let reduced = expr
+            .transform_down(|node| match node.downcast_ref::<IdentityFallbackExpr>() {
+                Some(fallback) => fallback
+                    .reduce_for_file(|column| self.bound_logical_indices.contains(&column.index()))
+                    .map(Transformed::yes),
+                None => Ok(Transformed::no(node)),
+            })
+            .data()?;
+
         // Substitute an absent field's `initial-default` (column-projection rule 3) BEFORE
         // delegating, since the default adapter NULL-fills or errors on absent fields.
-        let intercepted = expr
+        let intercepted = reduced
             .transform_down(|node| {
                 if let Some(column) = node.downcast_ref::<Column>()
                     && let Some(default) = self.absent_default_by_index.get(&column.index())

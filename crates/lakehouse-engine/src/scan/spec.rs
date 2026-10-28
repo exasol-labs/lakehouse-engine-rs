@@ -653,7 +653,9 @@ pub struct FileEntry {
     pub deletes: Vec<DeleteMechanism>,
     /// One entry per [`CommonScanSpec::partition_columns`] column, recorded outside the data
     /// file. A key with no value is a NULL partition value, whereas a missing key is a planning
-    /// defect the scan detects, hence the optional VALUE. `BTreeMap` keeps the wire byte-stable.
+    /// defect the scan detects, hence the optional VALUE. A key the partition columns do not list
+    /// is a value for a column the file may hold, read only where the file lacks it (an Iceberg
+    /// `identity` partition field). `BTreeMap` keeps the wire byte-stable.
     pub partition_values: BTreeMap<String, Option<String>>,
 }
 

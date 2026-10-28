@@ -255,6 +255,17 @@ impl TableProvider for ParquetScanTable {
         let file_source = self
             .format
             .file_source(self.schema.file_source_schema().clone());
+        let file_source = match self.schema.projection_exprs(projection) {
+            Some(projection) => file_source
+                .try_pushdown_projection(&projection)?
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Internal(format!(
+                        "FileSource {} does not support projection pushdown",
+                        file_source.file_type()
+                    ))
+                })?,
+            None => file_source,
+        };
 
         let expr_adapter = self.use_field_id_adapter.then(|| {
             Arc::new(FieldIdExprAdapterFactory {
@@ -267,7 +278,6 @@ impl TableProvider for ParquetScanTable {
         // range keeps its file's base access plan.
         let config = FileScanConfigBuilder::new(self.object_store_url.clone(), file_source)
             .with_file_group(FileGroup::new(files))
-            .with_projection_indices(self.schema.remap_projection(projection))?
             .with_limit(limit)
             .with_expr_adapter(expr_adapter)
             .build();

@@ -8,8 +8,8 @@ set -euo pipefail
 ICEBERG_VERSION="1.10.1"
 SPARK_PACKAGES="org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:${ICEBERG_VERSION},org.apache.iceberg:iceberg-aws-bundle:${ICEBERG_VERSION}"
 
-# hadoop-aws is needed only by the INT96 fixture's native Parquet write; pinned
-# to the image's bundled Hadoop (3.3.4).
+# hadoop-aws is needed only by the INT96 and identity-partition fixtures' native Parquet
+# writes; pinned to the image's bundled Hadoop (3.3.4).
 HADOOP_AWS_VERSION="3.3.4"
 
 SPARK_CONF=(
@@ -59,5 +59,13 @@ echo "=== spark-iceberg-fixtures: INT96 far-future-timestamp fixture ==="
   --packages "${SPARK_PACKAGES},org.apache.hadoop:hadoop-aws:${HADOOP_AWS_VERSION}" \
   --conf spark.hadoop.fs.s3.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
   -f /fixtures/create_int96_timestamp_fixture.sql
+
+# The identity-partition fixture (#99) imports Hive-style Parquet through `add_files`, so it
+# adds the same hadoop-aws package and fs.s3.impl alias as the INT96 fixture.
+echo "=== spark-iceberg-fixtures: identity-partition fixture ==="
+/opt/spark/bin/spark-sql "${SPARK_CONF[@]}" \
+  --packages "${SPARK_PACKAGES},org.apache.hadoop:hadoop-aws:${HADOOP_AWS_VERSION}" \
+  --conf spark.hadoop.fs.s3.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+  -f /fixtures/create_identity_partition_fixture.sql
 
 echo "=== spark-iceberg-fixtures: done ==="

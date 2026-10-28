@@ -2351,6 +2351,7 @@ fn mixed_layout_unions_partition_keys_and_nulls_the_missing_key() {
     );
 }
 
+/// Scenario: The logged partition value wins over a physically present partition column
 #[test]
 fn partition_key_colliding_with_a_parquet_column_overrides_it() {
     setup();
