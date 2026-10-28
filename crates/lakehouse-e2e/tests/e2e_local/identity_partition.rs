@@ -10,20 +10,27 @@ use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
 use crate::common::identity_partition_fixtures::{
     ABSENT_IMPORT_DIR, ABSENT_ROWS, ABSENT_SPEC_ID_COUNT, ABSENT_TABLE,
-    ABSENT_UNPARTITIONED_IMPORT_DIR, HIVE_DEFAULT_PARTITION, NAMESPACE, REGION_COLUMN,
-    REQUIRED_IMPORT_DIR, REQUIRED_ROWS, REQUIRED_TABLE, RegionRow, TYPES_COLUMNS, TYPES_ID_COLUMN,
-    TYPES_ID_DECLARED, TYPES_IMPORT_DIR, TYPES_ROW_IDS_TEXT, TYPES_TABLE,
+    ABSENT_UNPARTITIONED_IMPORT_DIR, HELD_IMPORT_DIR, HELD_ROWS, HELD_STORED_REGIONS, HELD_TABLE,
+    HIVE_DEFAULT_PARTITION, NAMESPACE, REGION_COLUMN, REQUIRED_IMPORT_DIR, REQUIRED_ROWS,
+    REQUIRED_TABLE, RegionRow, TYPES_COLUMNS, TYPES_ID_COLUMN, TYPES_ID_DECLARED, TYPES_IMPORT_DIR,
+    TYPES_ROW_IDS_TEXT, TYPES_TABLE,
 };
 use crate::common::raw_parquet::get_fixture_object;
 use crate::common::seed::{DIM_CUSTOMER_ROWS, E2E_DIM_TABLE, build_seed_catalog};
 use crate::common::stack::iceberg_catalog_url;
 use crate::fixtures::{LAKEHOUSE_VS, assert_pushed_to_scan_udf, lakehouse_vs, stack, vs_table};
 
+use arrow::array::AsArray;
+use arrow::datatypes::Int32Type;
 use futures::TryStreamExt;
 use iceberg::spec::{Literal, PrimitiveLiteral, Transform};
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// The Iceberg table property `add_files` sets so readers can bind id-less files.
+const NAME_MAPPING_PROPERTY: &str = "schema.name-mapping.default";
 
 /// One data file as iceberg-rust's scan planner resolves it, with what the guard compares.
 struct PlannedFile {
@@ -32,6 +39,7 @@ struct PlannedFile {
     /// `(source column name, rendered manifest value)` per `identity` field of the file's own spec.
     identity_values: Vec<(String, Option<String>)>,
     footer_columns: Vec<String>,
+    footer_has_field_ids: bool,
     region_required: bool,
 }
 
@@ -74,9 +82,8 @@ fn render_literal(literal: &Literal) -> String {
     }
 }
 
-/// Plans through iceberg-rust, not the adapter, so the guard holds whatever the engine does.
-fn plan_files(table: &str) -> Vec<PlannedFile> {
-    let tasks: Vec<_> = runtime().block_on(async {
+fn load_fixture_table(table: &str) -> iceberg::table::Table {
+    runtime().block_on(async {
         let catalog = build_seed_catalog(
             &iceberg_catalog_url(),
             "s3://warehouse/",
@@ -88,10 +95,17 @@ fn plan_files(table: &str) -> Vec<PlannedFile> {
             NamespaceIdent::new(NAMESPACE.to_string()),
             table.to_string(),
         );
-        let loaded = catalog
+        catalog
             .load_table(&ident)
             .await
-            .unwrap_or_else(|e| panic!("load {NAMESPACE}.{table}: {e}"));
+            .unwrap_or_else(|e| panic!("load {NAMESPACE}.{table}: {e}"))
+    })
+}
+
+/// Plans through iceberg-rust, not the adapter, so the guard holds whatever the engine does.
+fn plan_files(table: &str) -> Vec<PlannedFile> {
+    let loaded = load_fixture_table(table);
+    let tasks: Vec<_> = runtime().block_on(async {
         loaded
             .scan()
             .select_all()
@@ -133,14 +147,17 @@ fn plan_files(table: &str) -> Vec<PlannedFile> {
                 .collect();
             let reader = SerializedFileReader::new(get_fixture_object(&path))
                 .unwrap_or_else(|e| panic!("open committed Parquet file {path}: {e}"));
-            let footer_columns = reader
-                .metadata()
-                .file_metadata()
-                .schema_descr()
+            let schema = reader.metadata().file_metadata().schema_descr();
+            let footer_columns = schema
                 .columns()
                 .iter()
                 .map(|c| c.name().to_string())
                 .collect();
+            let footer_has_field_ids = schema
+                .root_schema()
+                .get_fields()
+                .iter()
+                .any(|field| field.get_basic_info().has_id());
             let region_required = task
                 .schema()
                 .field_by_name(REGION_COLUMN)
@@ -150,6 +167,7 @@ fn plan_files(table: &str) -> Vec<PlannedFile> {
                 spec_id: spec.spec_id(),
                 identity_values,
                 footer_columns,
+                footer_has_field_ids,
                 region_required,
             }
         })
@@ -351,6 +369,87 @@ fn identity_partition_fixture_imports_hold_no_source_column_and_carry_manifest_v
     }
 }
 
+/// `(id, region)` as the Parquet file itself stores them.
+fn stored_regions(path: &str) -> Vec<(i32, Option<String>)> {
+    let reader = ParquetRecordBatchReaderBuilder::try_new(get_fixture_object(path))
+        .and_then(|builder| builder.build())
+        .unwrap_or_else(|e| panic!("open committed Parquet file {path}: {e}"));
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let column = |name: &str| {
+            batch
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("{path} holds no '{name}' column"))
+        };
+        let ids = column("id").as_primitive::<Int32Type>();
+        let regions = column(REGION_COLUMN).as_string::<i32>();
+        rows.extend(
+            ids.iter()
+                .zip(regions.iter())
+                .map(|(id, region)| (id.expect("id is never null"), region.map(str::to_string))),
+        );
+    }
+    rows.sort();
+    rows
+}
+
+#[test]
+fn identity_partition_held_fixture_stores_other_values_without_field_ids() {
+    stack();
+
+    let held = plan_files(HELD_TABLE);
+    assert_eq!(
+        held.len(),
+        1,
+        "fixture guard: {HELD_TABLE} must hold one data file, got {:?}",
+        held.iter().map(|f| &f.path).collect::<Vec<_>>()
+    );
+    let file = &held[0];
+    assert!(
+        file.is_under(HELD_IMPORT_DIR) && file.holds_column(REGION_COLUMN),
+        "fixture guard: {} must be imported and hold '{REGION_COLUMN}', got {:?}",
+        file.path,
+        file.footer_columns
+    );
+    assert!(
+        !file.footer_has_field_ids,
+        "fixture guard: {} must carry no Iceberg field ids, so only name mapping binds \
+         '{REGION_COLUMN}'",
+        file.path
+    );
+    assert_eq!(
+        file.identity_value(REGION_COLUMN),
+        &region_in_path(file),
+        "fixture guard: the manifest partition value of {} must be the one its Hive directory \
+         names",
+        file.path
+    );
+
+    let expected_stored: Vec<(i32, Option<String>)> = HELD_STORED_REGIONS
+        .iter()
+        .map(|(id, region)| (*id, region.map(str::to_string)))
+        .collect();
+    assert_eq!(
+        stored_regions(&file.path),
+        expected_stored,
+        "fixture guard: {} must store region values that differ from its partition value",
+        file.path
+    );
+
+    let mapping = load_fixture_table(HELD_TABLE)
+        .metadata()
+        .properties()
+        .get(NAME_MAPPING_PROPERTY)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        mapping.contains(&format!("\"{REGION_COLUMN}\"")),
+        "fixture guard: {HELD_TABLE}'s {NAME_MAPPING_PROPERTY} must map '{REGION_COLUMN}', got \
+         {mapping:?}"
+    );
+}
+
 fn absent_table() -> String {
     vs_table(LAKEHOUSE_VS, ABSENT_TABLE)
 }
@@ -410,6 +509,30 @@ fn required_identity_column_reads_partition_value() {
         id_region_rows(&mut conn, &sql),
         expected_rows(&REQUIRED_ROWS),
         "each row must carry its file's partition value, with no required-absent error"
+    );
+}
+
+/// Scenario: An identity partition value wins over a column the data file holds without the field's id
+#[test]
+fn identity_value_wins_over_name_mapped_file_column() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, {REGION_COLUMN} FROM {} ORDER BY id",
+        vs_table(LAKEHOUSE_VS, HELD_TABLE)
+    );
+    assert_pushed_to_scan_udf(
+        &mut conn,
+        &sql,
+        "an id and region scan of a file holding region",
+    );
+
+    assert_eq!(
+        id_region_rows(&mut conn, &sql),
+        expected_rows(&HELD_ROWS),
+        "each row must carry the file's partition value, not the region it stores without a \
+         field id"
     );
 }
 

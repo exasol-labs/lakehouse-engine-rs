@@ -495,11 +495,15 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
         );
         binding.ensure_unambiguous(&self.table_root)?;
 
-        let bound_logical_indices: HashSet<usize> = logical_file_schema
+        let identified_logical_indices: HashSet<usize> = logical_file_schema
             .fields()
             .iter()
             .enumerate()
-            .filter(|(_, field)| binding.bound_logical_names.contains(field.name().as_str()))
+            .filter(|(_, field)| {
+                binding
+                    .identified_logical_names
+                    .contains(field.name().as_str())
+            })
             .map(|(index, _)| index)
             .collect();
 
@@ -534,7 +538,7 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
         Ok(Arc::new(FieldIdExprAdapter {
             inner,
             physical_file_schema,
-            bound_logical_indices,
+            identified_logical_indices,
             absent_default_by_index,
             refused_by_index,
             table_root: self.table_root.clone(),
@@ -555,8 +559,8 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
 struct FieldIdExprAdapter {
     inner: Arc<dyn PhysicalExprAdapter>,
     physical_file_schema: arrow::datatypes::SchemaRef,
-    /// LOGICAL column indices of the fields this file supplies.
-    bound_logical_indices: HashSet<usize>,
+    /// LOGICAL column indices of the fields this file holds by field id or declared physical name.
+    identified_logical_indices: HashSet<usize>,
     /// Keyed by LOGICAL column index; only absent fields with a reconstructed `initial-default`.
     absent_default_by_index: HashMap<usize, ScalarValue>,
     /// This file's bound columns whose type is not admitted, keyed by logical index.
@@ -588,12 +592,15 @@ impl PhysicalExprAdapter for FieldIdExprAdapter {
             })?;
         }
 
-        // Column-projection rule (1) precedes rule (3): an identity value fills only a field this
-        // file does not bind, and a file with no value leaves the field to the default below.
+        // Column-projection rule (1) precedes rules (2) and (3): an identity value fills a field
+        // whose id the file lacks, even one name mapping binds, and a file with no value leaves
+        // the field to the binding or the default below.
         let reduced = expr
             .transform_down(|node| match node.downcast_ref::<IdentityFallbackExpr>() {
                 Some(fallback) => fallback
-                    .reduce_for_file(|column| self.bound_logical_indices.contains(&column.index()))
+                    .reduce_for_file(|column| {
+                        self.identified_logical_indices.contains(&column.index())
+                    })
                     .map(Transformed::yes),
                 None => Ok(Transformed::no(node)),
             })
@@ -740,6 +747,9 @@ impl PhysicalExpr for NestedJsonRenderExpr {
 struct ColumnBinding {
     renamed_physical: arrow::datatypes::SchemaRef,
     bound_logical_names: std::collections::HashSet<String>,
+    /// The bound names claimed by an embedded field id or a declared physical name; name
+    /// mapping, a plain name, and a letter-case fold leave the field id absent from the file.
+    identified_logical_names: std::collections::HashSet<String>,
     /// Keyed by LOGICAL COLUMN NAME.
     nested: HashMap<String, NestedResolution>,
     /// Letter-case fold groups that bound nothing because more than one spelling competed.
@@ -993,6 +1003,18 @@ fn bind_columns(
             )
         })
         .collect();
+    let identified_logical_names: HashSet<String> = physical
+        .fields()
+        .iter()
+        .zip(&exact)
+        .filter_map(|(physical_field, claimed)| {
+            let keys = &keys[(*claimed)?];
+            let by_field_id =
+                keys.field_id.is_some() && keys.field_id == field_id_of(physical_field);
+            let by_physical_name = keys.physical_name == Some(physical_field.name().as_str());
+            (by_field_id || by_physical_name).then(|| keys.name.to_string())
+        })
+        .collect();
     let (claims, ambiguous_folds) = claim_by_case_fold(physical, &keys, &exact);
 
     let mut nested: HashMap<String, NestedResolution> = HashMap::new();
@@ -1036,6 +1058,7 @@ fn bind_columns(
             physical.metadata().clone(),
         )),
         bound_logical_names,
+        identified_logical_names,
         nested,
         ambiguous_folds,
     }

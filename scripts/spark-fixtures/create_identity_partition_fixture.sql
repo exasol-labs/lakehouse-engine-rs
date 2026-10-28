@@ -24,6 +24,11 @@
 --     id 1  imported, all partition values set
 --     id 2  native, the same values as id 1
 --     id 3  imported, every partition value NULL
+--   ident_part_held      (id INT, amount INT, region STRING), identity(region), one file
+--                        imported under region=eu that holds region without field ids;
+--                        add_files sets schema.name-mapping.default, which maps region
+--     id 1  stored us, reads eu
+--     id 2  stored NULL, reads eu
 
 CREATE NAMESPACE IF NOT EXISTS rest_catalog.e2e_lakehouse;
 
@@ -170,3 +175,24 @@ SELECT 2,
        CAST(1234567890123456789012345678.123456 AS DECIMAL(38,6)),
        CAST('2024-02-29' AS DATE),
        'north';
+
+-- ident_part_held
+-- The file under region=eu physically holds region with other values, so a reader that lets
+-- name mapping bind the column ahead of rule (1) returns them instead of eu.
+
+DROP TABLE IF EXISTS rest_catalog.e2e_lakehouse.ident_part_held;
+
+CREATE TABLE rest_catalog.e2e_lakehouse.ident_part_held (id INT, amount INT, region STRING)
+USING iceberg
+PARTITIONED BY (region)
+TBLPROPERTIES ('format-version' = '2');
+
+INSERT OVERWRITE DIRECTORY 's3://warehouse/e2e_lakehouse/ident_part_held_source/region=eu'
+USING parquet
+SELECT /*+ REPARTITION(1) */ id, amount, region
+FROM VALUES (1, 10, 'us'), (2, 20, CAST(NULL AS STRING)) AS t(id, amount, region);
+
+CALL rest_catalog.system.add_files(
+  table => 'e2e_lakehouse.ident_part_held',
+  source_table => '`parquet`.`s3://warehouse/e2e_lakehouse/ident_part_held_source`'
+);

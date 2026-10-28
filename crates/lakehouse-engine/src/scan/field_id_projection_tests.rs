@@ -698,7 +698,7 @@ fn left_of(predicate: &Arc<dyn PhysicalExpr>) -> &Arc<dyn PhysicalExpr> {
         .left()
 }
 
-/// Scenario: A column the data file holds wins over the file's identity partition value
+/// Scenario: A column the data file holds under the field's id wins over the file's identity partition value
 /// Scenario: A materialized partition column is a first-class scan column
 #[test]
 fn bound_file_column_wins_over_identity_value() {
@@ -713,41 +713,28 @@ fn bound_file_column_wins_over_identity_value() {
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("region_src", DataType::Utf8, true, 2),
     ]));
-    let by_name_mapping = Arc::new(Schema::new(vec![
-        field_with_id("id", DataType::Int64, false, 1),
-        field_no_id("region_src", DataType::Utf8, true),
-    ]));
+    let adapter = factory(bare_resolution())
+        .create(Arc::clone(&logical_file_schema), by_field_id)
+        .expect("adapter creation");
 
-    for (physical, resolution) in [
-        (by_field_id, bare_resolution()),
-        (
-            by_name_mapping,
-            resolution_with_mapping(&[("region_src", 2)]),
-        ),
-    ] {
-        let adapter = factory(resolution)
-            .create(Arc::clone(&logical_file_schema), physical)
-            .expect("adapter creation");
+    let read = adapter
+        .rewrite(opened_for(&split, &files[0], region_projection(&split)))
+        .expect("rewrite ok");
+    let filter = adapter
+        .rewrite(opened_for(&split, &files[0], region_equals_eu(&split)))
+        .expect("rewrite ok");
 
-        let read = adapter
-            .rewrite(opened_for(&split, &files[0], region_projection(&split)))
-            .expect("rewrite ok");
-        let filter = adapter
-            .rewrite(opened_for(&split, &files[0], region_equals_eu(&split)))
-            .expect("rewrite ok");
-
-        assert_eq!(
-            bound_physical_index(&read),
-            Some(1),
-            "a file holding the column reads it, never its partition value: {read}"
-        );
-        assert_eq!(
-            bound_physical_index(left_of(&filter)),
-            Some(1),
-            "a pushed-down filter reads the file column too, so no file is skipped on the \
-             partition value: {filter}"
-        );
-    }
+    assert_eq!(
+        bound_physical_index(&read),
+        Some(1),
+        "a file holding the field id reads its column, never its partition value: {read}"
+    );
+    assert_eq!(
+        bound_physical_index(left_of(&filter)),
+        Some(1),
+        "a pushed-down filter reads the file column too, so no file is skipped on the \
+         partition value: {filter}"
+    );
 
     let lacking = Arc::new(Schema::new(vec![field_with_id(
         "id",
@@ -771,6 +758,50 @@ fn bound_file_column_wins_over_identity_value() {
         "a file lacking the column reads its value"
     );
     assert_eq!(literal_value(left_of(&filter)), eu);
+}
+
+#[test]
+fn identity_value_wins_over_column_bound_without_field_id() {
+    let files = [region_entry("holds.parquet", Some(Some("eu")))];
+    let split = PartitionedScanSchema::split(region_logical_schema(), &[], &files)
+        .expect("region is declared");
+    let logical_file_schema = Arc::clone(split.file_source_schema().file_schema());
+    let by_name_mapping = Arc::new(Schema::new(vec![
+        field_with_id("id", DataType::Int64, false, 1),
+        field_no_id("region_src", DataType::Utf8, true),
+    ]));
+    let by_name = Arc::new(Schema::new(vec![
+        field_with_id("id", DataType::Int64, false, 1),
+        field_no_id("region", DataType::Utf8, true),
+    ]));
+    let eu = Some(ScalarValue::Utf8(Some("eu".to_string())));
+
+    for (physical, resolution) in [
+        (
+            by_name_mapping,
+            resolution_with_mapping(&[("region_src", 2)]),
+        ),
+        (by_name, bare_resolution()),
+    ] {
+        let adapter = factory(resolution)
+            .create(Arc::clone(&logical_file_schema), physical)
+            .expect("adapter creation");
+
+        let read = adapter
+            .rewrite(opened_for(&split, &files[0], region_projection(&split)))
+            .expect("rewrite ok");
+        let filter = adapter
+            .rewrite(opened_for(&split, &files[0], region_equals_eu(&split)))
+            .expect("rewrite ok");
+
+        assert_eq!(
+            literal_value(&read),
+            eu,
+            "rule (1) precedes name mapping, so a column without the field id reads the \
+             partition value: {read}"
+        );
+        assert_eq!(literal_value(left_of(&filter)), eu, "{filter}");
+    }
 }
 
 /// Scenario: An identity partition value precedes the initial-default, and a null partition value is present

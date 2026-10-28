@@ -13,11 +13,12 @@ The Iceberg table spec applies its "Column Projection" rule (1) to field ids "no
 
 ### Decision
 
-The scan resolves a field absent from a data file in the Iceberg "Column Projection" order: the `identity` partition value of the file's own spec, then the `initial-default`, then NULL for a nullable field or a clean error for a required one. A field the file holds always reads from the file. A null partition value is present and reads as NULL. `write-default` is never read.
+The scan resolves a field absent from a data file in the Iceberg "Column Projection" order: the `identity` partition value of the file's own spec, then the `initial-default`, then NULL for a nullable field or a clean error for a required one. A field the file holds under its field id always reads from the file. A column that only name mapping or its name binds has no field id in the file, so the identity partition value replaces it. A null partition value is present and reads as NULL. `write-default` is never read.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
 | Iceberg Java precedence, where the partition constant wins even when the file holds the column | Rejected: the spec text limits rule (1) to absent fields |
+| iceberg-rust precedence, where name mapping binds a column before rule (1) applies | Rejected: the spec lists rule (1) ahead of rule (2), and a name-mapped column carries no field id |
 | iceberg-rust null handling, where a null partition value falls through to the `initial-default` | Rejected: Iceberg Java treats a null partition value as present |

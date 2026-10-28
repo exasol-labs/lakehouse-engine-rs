@@ -180,3 +180,26 @@ pub const TYPES_COLUMNS: [TypesColumn; 9] = [
         manifest_value: "north",
     },
 ];
+
+/// One file imported under `region=eu` that physically holds `region`, without Iceberg field ids,
+/// so only `schema.name-mapping.default` binds it.
+pub const HELD_TABLE: &str = "ident_part_held";
+
+pub const HELD_IMPORT_DIR: &str = "ident_part_held_source";
+
+/// Every row reads the manifest's `eu`, not the value its file stores.
+pub const HELD_ROWS: [RegionRow; 2] = [
+    RegionRow {
+        id: 1,
+        amount: 10,
+        region: Some("eu"),
+    },
+    RegionRow {
+        id: 2,
+        amount: 20,
+        region: Some("eu"),
+    },
+];
+
+/// What the imported file physically stores for `region`, by row id.
+pub const HELD_STORED_REGIONS: [(i32, Option<&str>); 2] = [(1, Some("us")), (2, None)];

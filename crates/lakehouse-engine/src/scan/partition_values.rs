@@ -317,7 +317,7 @@ pub(crate) fn partition_scalar(
 const IDENTITY_VALUE_FIELD: &str = "value";
 
 /// Reads a column from the data file, or from the file's identity partition value where the file
-/// lacks the column (Iceberg Column Projection rule 1). Its hidden partition column carries one
+/// lacks the column's field id (Iceberg Column Projection rule 1, ahead of name mapping). Its hidden partition column carries one
 /// struct per file: a null struct is no value, a null child a null value, and a non-null child
 /// the value. DataFusion's opener substitutes that struct as a literal before the file adapter
 /// runs, so the adapter, which alone knows whether a file binds the column, reduces this
@@ -378,8 +378,8 @@ impl IdentityFallbackExpr {
             })
     }
 
-    /// The file column where `binds_field` says this file holds it, so a stored value always
-    /// wins; otherwise the per-file value as a literal of the declared type, or the file column
+    /// The file column where `binds_field` says this file holds its field id, so a value stored
+    /// under that id always wins; otherwise the per-file value as a literal of the declared type, or the file column
     /// again for a file with no value, which leaves the field to the absent-field chain.
     pub(crate) fn reduce_for_file(
         &self,
@@ -436,7 +436,7 @@ impl PhysicalExpr for IdentityFallbackExpr {
     }
 
     /// DataFusion skips the file adapter only for a file whose schema equals the logical file
-    /// schema (`opener/mod.rs:1015-1016`), and such a file binds the column.
+    /// schema (`opener/mod.rs:1015-1016`), and such a file binds the column by its field id.
     fn evaluate(&self, batch: &RecordBatch) -> datafusion::error::Result<ColumnarValue> {
         self.file_column.evaluate(batch)
     }
