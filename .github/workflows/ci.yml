@@ -356,15 +356,16 @@ jobs:
       # one-shot jobs are `docker wait`-ed.
       - name: Start stack (Exasol + SeaweedFS + Iceberg REST)
         run: |
+          docker compose up -d exasol proxy
           docker compose up -d --wait seaweedfs iceberg-rest
           docker compose up -d spark-iceberg-fixtures
-          docker compose up -d --wait exasol proxy
 
       - name: Build E2E suite
         run: cargo test --workspace --features lakehouse-e2e/exasol-e2e --test e2e_local --no-run
 
-      - name: Wait for Spark fixtures
+      - name: Wait for stack and Spark fixtures
         run: |
+          docker compose up -d --wait exasol proxy
           SPARK_FIXTURES_EXIT=$(docker wait lakehouse-engine-rs-spark-iceberg-fixtures-1)
           if [ "$SPARK_FIXTURES_EXIT" != "0" ]; then
             echo "::error::spark-iceberg-fixtures exited $SPARK_FIXTURES_EXIT (Spark fixture authoring failed)"
@@ -398,11 +399,12 @@ jobs:
       - name: Pull stack images
         run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml pull --quiet
 
-      # One-shot jobs are `docker wait`-ed first (see `e2e`).
+      # One-shot jobs are `docker wait`-ed (see `e2e`).
       - name: Start stack (Exasol + SeaweedFS + Keycloak + OpenFGA + Lakekeeper)
         run: |
           COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml"
 
+          $COMPOSE up -d exasol
           $COMPOSE up -d openfga-migrate
           OPENFGA_MIGRATE_EXIT=$(docker wait lakehouse-engine-rs-openfga-migrate-1)
           if [ "$OPENFGA_MIGRATE_EXIT" != "0" ]; then
@@ -419,7 +421,15 @@ jobs:
             exit 1
           fi
 
-          $COMPOSE up -d --wait exasol seaweedfs keycloak lakekeeper-db openfga-db openfga lakekeeper proxy
+          $COMPOSE up -d seaweedfs keycloak lakekeeper-db openfga-db openfga lakekeeper proxy
+
+      - name: Build Lakekeeper E2E suite
+        run: cargo test --workspace --features lakehouse-e2e/lakekeeper-e2e --test e2e_lakekeeper_test --no-run
+
+      - name: Wait for stack
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
+            up -d --wait exasol seaweedfs keycloak lakekeeper-db openfga-db openfga lakekeeper proxy
 
       - name: Run Lakekeeper E2E suite
         run: make test-e2e-lakekeeper
@@ -449,15 +459,21 @@ jobs:
       - name: Pull stack images
         run: docker compose -f docker-compose.yml -f docker-compose.unity.yml pull --quiet
 
-      # One-shot jobs are `docker wait`-ed first (see `e2e`).
       - name: Start stack (Exasol + SeaweedFS + Unity Catalog)
         run: |
           COMPOSE="docker compose -f docker-compose.yml -f docker-compose.unity.yml"
 
-          $COMPOSE up -d --wait seaweedfs exasol unitycatalog proxy
+          $COMPOSE up -d exasol
+          $COMPOSE up -d --wait seaweedfs unitycatalog proxy
 
       - name: Seed Unity Catalog fixtures
         run: ./scripts/unity/seed.sh
+
+      - name: Build Unity Catalog E2E suite
+        run: cargo test --workspace --features lakehouse-e2e/unity-e2e --test e2e_unity_test --no-run
+
+      - name: Wait for stack
+        run: docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait exasol
 
       # Flag-identical to the Makefile's `test-e2e-unity` (which would re-run
       # the bring-up); this step is the authority.
@@ -499,6 +515,7 @@ jobs:
         run: |
           COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml"
 
+          $COMPOSE up -d exasol
           $COMPOSE up -d openfga-migrate
           OPENFGA_MIGRATE_EXIT=$(docker wait lakehouse-engine-rs-openfga-migrate-1)
           if [ "$OPENFGA_MIGRATE_EXIT" != "0" ]; then
@@ -515,7 +532,15 @@ jobs:
             exit 1
           fi
 
-          $COMPOSE up -d --wait exasol keycloak lakekeeper-db openfga-db openfga lakekeeper proxy
+          $COMPOSE up -d keycloak lakekeeper-db openfga-db openfga lakekeeper proxy
+
+      - name: Build Azure E2E suite
+        run: cargo test --workspace --features lakehouse-e2e/azure-e2e --test e2e_azure_test --no-run
+
+      - name: Wait for stack
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml \
+            up -d --wait exasol keycloak lakekeeper-db openfga-db openfga lakekeeper proxy
 
       - name: Run Azure E2E suite
         env:
@@ -554,6 +579,12 @@ jobs:
         run: docker compose pull --quiet exasol proxy
 
       - name: Start stack (Exasol)
+        run: docker compose up -d exasol proxy
+
+      - name: Build Glue E2E suite
+        run: cargo test --workspace --features lakehouse-e2e/glue-e2e --test e2e_glue_test --no-run
+
+      - name: Wait for stack
         run: docker compose up -d --wait exasol proxy
 
       - name: Run Glue E2E suite
