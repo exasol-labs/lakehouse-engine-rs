@@ -35,7 +35,7 @@ fn declared_schema_is_split_into_file_fields_and_partition_fields() {
     let split = split_with_middle_partition();
 
     assert_eq!(
-        split.declared_schema().fields().len(),
+        split.declared.fields().len(),
         3,
         "the declared schema keeps every column"
     );
@@ -70,7 +70,7 @@ fn the_declared_schema_keeps_its_declared_column_order() {
     let split = PartitionedScanSchema::split(Arc::clone(&declared), &["p".to_string()])
         .expect("p is declared");
 
-    assert_eq!(split.declared_schema().as_ref(), declared.as_ref());
+    assert_eq!(split.declared.as_ref(), declared.as_ref());
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn a_remapped_projection_selects_the_declared_fields_in_the_requested_order() {
         .collect();
     let expected: Vec<&Field> = declared_projection
         .iter()
-        .map(|i| split.declared_schema().field(*i))
+        .map(|i| split.declared.field(*i))
         .collect();
     assert_eq!(selected, expected);
 }
@@ -361,4 +361,63 @@ fn partition_values_follow_partition_order_not_declared_order() {
         .map(|f| f.name().as_str())
         .collect();
     assert_eq!(partition_names, ["first", "second"]);
+}
+
+fn partition_names(split: &PartitionedScanSchema) -> Vec<&str> {
+    split
+        .file_source_schema()
+        .table_partition_cols()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect()
+}
+
+#[test]
+fn files_group_by_the_declared_partition_keys_they_carry() {
+    let declared = declared_schema(vec![
+        Field::new("p", DataType::Utf8, true),
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Int32, true),
+    ]);
+    let files = [
+        entry_with(&[("p", Some("x"))]),
+        entry_with(&[("p", Some("x")), ("b", Some("1"))]),
+        entry_with(&[("p", None), ("b", None), ("undeclared", Some("2"))]),
+        entry_with(&[("p", Some("y")), ("a", Some("3")), ("b", Some("4"))]),
+    ];
+
+    let split = PartitionedScanGroups::split(declared, &["p".to_string()], &files)
+        .expect("every key is declared or ignored");
+
+    let groups: Vec<Vec<&str>> = (0..files.len())
+        .map(|file| partition_names(&split.groups()[split.group_of(file)]))
+        .collect();
+    assert_eq!(
+        groups,
+        [
+            vec!["p"],
+            vec!["p", "b"],
+            vec!["p", "b"],
+            vec!["p", "a", "b"]
+        ],
+        "listed columns come first, then the file's declared unlisted keys in key order"
+    );
+    assert_eq!(
+        split.groups().len(),
+        3,
+        "files with one key set share a group"
+    );
+}
+
+#[test]
+fn an_empty_file_list_plans_one_group_of_the_listed_columns() {
+    let split = PartitionedScanGroups::split(
+        declared_schema(vec![Field::new("p", DataType::Utf8, true)]),
+        &["p".to_string()],
+        &[],
+    )
+    .expect("p is declared");
+
+    assert_eq!(split.groups().len(), 1);
+    assert_eq!(partition_names(&split.groups()[0]), ["p"]);
 }

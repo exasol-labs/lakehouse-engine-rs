@@ -56,6 +56,7 @@ async fn resolve_rest(
     resolve_from_notes(&reader, &involved_notes("T", &notes), filter_json).await
 }
 
+/// Scenario: The Iceberg format reader owns file resolution and binds columns by field-id
 #[tokio::test]
 async fn iceberg_reader_owns_resolution_and_keeps_its_encoding() {
     let storage = sample_storage();
@@ -247,7 +248,7 @@ async fn an_unreadable_manifest_list_fails_planning_naming_its_cause() {
         .build()
         .expect("table");
 
-    let error = plan_files_from_table(table, "db.t", None, &[])
+    let error = plan_file_tasks(table, "db.t", None, &[])
         .await
         .expect_err("an unreadable manifest list must fail planning");
 
@@ -427,6 +428,293 @@ fn planned_file_entry_refuses_an_unsupported_data_or_applied_delete_file() {
             planned_file_entry(&task).map(|_| ()),
             Err(expected),
             "{task:?}"
+        );
+    }
+}
+
+fn identity_partitioned_schema() -> std::sync::Arc<iceberg::spec::Schema> {
+    use iceberg::spec::{NestedField, PrimitiveType, StructType, Type};
+    let city = NestedField::optional(4, "city", Type::Primitive(PrimitiveType::String));
+    std::sync::Arc::new(
+        iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "region", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(
+                    3,
+                    "address",
+                    Type::Struct(StructType::new(vec![city.into()])),
+                )
+                .into(),
+                NestedField::optional(5, "token", Type::Primitive(PrimitiveType::Uuid)).into(),
+            ])
+            .build()
+            .expect("a partitioned schema"),
+    )
+}
+
+/// The logical fields a declaration of [`identity_partitioned_schema`] carries: the `uuid` column
+/// is refused at plan time, so no logical field stands for it.
+fn identity_partitioned_logical_fields() -> Vec<LogicalField> {
+    let field = |field_id, name: &str, arrow_type: &str, nullable| LogicalField {
+        field_id: Some(field_id),
+        name: name.to_string(),
+        arrow_type: arrow_type.to_string(),
+        nullable,
+        initial_default: None,
+        nested: None,
+        physical_name: None,
+    };
+    vec![
+        field(1, "id", "int64", false),
+        field(2, "region", "utf8", true),
+        field(3, "address", "utf8", true),
+    ]
+}
+
+fn identity_partition_spec(
+    spec_id: i32,
+    fields: &[(&str, &str, iceberg::spec::Transform)],
+) -> std::sync::Arc<iceberg::spec::PartitionSpec> {
+    let builder = fields.iter().fold(
+        iceberg::spec::PartitionSpec::builder(identity_partitioned_schema()).with_spec_id(spec_id),
+        |builder, (source, name, transform)| {
+            builder
+                .add_partition_field(*source, *name, *transform)
+                .expect("a valid partition field")
+        },
+    );
+    std::sync::Arc::new(builder.build().expect("a partition spec"))
+}
+
+fn partitioned_scan_task(
+    spec: &std::sync::Arc<iceberg::spec::PartitionSpec>,
+    partition: Vec<Option<iceberg::spec::Literal>>,
+) -> iceberg::scan::FileScanTask {
+    iceberg::scan::FileScanTask::builder()
+        .with_file_size_in_bytes(100)
+        .with_start(0)
+        .with_length(100)
+        .with_data_file_path("s3://bucket/t/data-0".to_string())
+        .with_data_file_format(DataFileFormat::Parquet)
+        .with_schema(identity_partitioned_schema())
+        .with_project_field_ids(vec![])
+        .with_case_sensitive(true)
+        .with_partition(Some(partition.into_iter().collect()))
+        .with_partition_spec(Some(std::sync::Arc::clone(spec)))
+        .build()
+        .expect("a partitioned scan task")
+}
+
+fn identity_values_of(
+    task: &iceberg::scan::FileScanTask,
+) -> std::collections::BTreeMap<String, Option<String>> {
+    identity_partition_values(task, &identity_partitioned_logical_fields(), "db.t")
+        .expect("a readable data file")
+}
+
+/// Scenario: The VS carries each data file's identity partition values from the file's own partition spec
+#[test]
+fn identity_values_come_from_each_files_own_spec() {
+    use iceberg::spec::{Literal, Transform};
+    let identity_spec = identity_partition_spec(
+        0,
+        &[
+            ("region", "region", Transform::Identity),
+            ("id", "id_bucket", Transform::Bucket(16)),
+            ("address.city", "city", Transform::Identity),
+        ],
+    );
+    let evolved_spec = identity_partition_spec(
+        1,
+        &[
+            ("region", "region_trunc", Transform::Truncate(2)),
+            ("id", "id_bucket", Transform::Bucket(16)),
+        ],
+    );
+
+    let imported = partitioned_scan_task(
+        &identity_spec,
+        vec![
+            Some(Literal::string("eu")),
+            Some(Literal::int(3)),
+            Some(Literal::string("paris")),
+        ],
+    );
+    let null_region =
+        partitioned_scan_task(&identity_spec, vec![None, Some(Literal::int(5)), None]);
+    let evolved = partitioned_scan_task(
+        &evolved_spec,
+        vec![Some(Literal::string("eu")), Some(Literal::int(7))],
+    );
+
+    assert_eq!(
+        identity_values_of(&imported),
+        std::collections::BTreeMap::from([("region".to_string(), Some("eu".to_string()))]),
+        "only the identity field on a top-level logical column carries a value: the bucket \
+         field does not reproduce `id`, and `city` is nested"
+    );
+    assert_eq!(
+        identity_values_of(&null_region),
+        std::collections::BTreeMap::from([("region".to_string(), None)]),
+        "a null in the partition struct is an explicit absent value"
+    );
+    assert!(
+        identity_values_of(&evolved).is_empty(),
+        "a file of the evolved spec carries no identity field on `region`, so it carries no \
+         value, although the other spec has one"
+    );
+}
+
+/// The value a Parquet column holding `file_value` reads as at `declared`, through the cast the
+/// scan's expression adapter inserts.
+fn read_at_declared_type(
+    file_value: &arrow::array::ArrayRef,
+    declared: &arrow::datatypes::DataType,
+) -> datafusion::scalar::ScalarValue {
+    let read = datafusion::logical_expr::ColumnarValue::Array(std::sync::Arc::clone(file_value))
+        .cast_to(declared, None)
+        .and_then(|value| value.into_array(1))
+        .expect("the file type reads at the declared type");
+    datafusion::scalar::ScalarValue::try_from_array(&read, 0).expect("one value")
+}
+
+/// Scenario: Every admitted identity value survives the scan-spec round trip at the column's declared type
+#[test]
+fn identity_value_round_trips_at_declared_type_for_every_admitted_type() {
+    use arrow::array::{
+        ArrayRef, Decimal128Array, Float32Array, Int32Array, Time64MicrosecondArray,
+        TimestampMicrosecondArray, TimestampNanosecondArray,
+    };
+    use iceberg::spec::{Literal, PrimitiveLiteral as L, PrimitiveType as T, Transform};
+    use std::sync::Arc;
+
+    let micros = 1_709_296_496_000_001_i64;
+    let nanos = 1_709_296_496_000_000_123_i64;
+    // The E2E types fixture covers every type Spark writes; these are the ones it cannot.
+    let cases: Vec<(L, T, &str, ArrayRef)> = vec![
+        (
+            L::Long(45_296_000_001),
+            T::Time,
+            "utf8",
+            Arc::new(Time64MicrosecondArray::from(vec![45_296_000_001])),
+        ),
+        (
+            L::Long(micros),
+            T::Timestamp,
+            "timestamp_us",
+            Arc::new(TimestampMicrosecondArray::from(vec![micros])),
+        ),
+        (
+            L::Long(nanos),
+            T::TimestampNs,
+            "timestamp_ns",
+            Arc::new(TimestampNanosecondArray::from(vec![nanos])),
+        ),
+        (
+            L::Long(micros),
+            T::Timestamptz,
+            "timestamptz_us",
+            Arc::new(TimestampMicrosecondArray::from(vec![micros]).with_timezone("UTC")),
+        ),
+        (
+            L::Long(nanos),
+            T::TimestamptzNs,
+            "timestamptz_ns",
+            Arc::new(TimestampNanosecondArray::from(vec![nanos]).with_timezone("UTC")),
+        ),
+        (
+            L::Int(-7),
+            T::Long,
+            "int64",
+            Arc::new(Int32Array::from(vec![-7])),
+        ),
+        (
+            L::Float(1.1_f32.into()),
+            T::Double,
+            "float64",
+            Arc::new(Float32Array::from(vec![1.1_f32])),
+        ),
+        (
+            L::Int128(1234),
+            T::Decimal {
+                precision: 18,
+                scale: 2,
+            },
+            "decimal128(18,2)",
+            Arc::new(
+                Decimal128Array::from(vec![1234])
+                    .with_precision_and_scale(9, 2)
+                    .expect("a valid decimal type"),
+            ),
+        ),
+    ];
+
+    for (value, source_type, tag, file_value) in cases {
+        let declared = crate::types::mapping::arrow_type_from_tag(tag);
+        let rendered = render_identity_value(&Literal::Primitive(value.clone()), &source_type, tag)
+            .unwrap_or_else(|e| panic!("{source_type} {value:?} must render at {tag}: {e}"));
+        let converted = crate::scan::partition_scalar(&rendered, &declared)
+            .unwrap_or_else(|e| panic!("'{rendered}' must convert back to {tag}: {e}"));
+
+        assert_eq!(
+            converted,
+            read_at_declared_type(&file_value, &declared),
+            "a {source_type} value {value:?} rendered as '{rendered}' must read as a physical \
+             {} column does at {tag}",
+            file_value.data_type()
+        );
+    }
+
+    let empty = render_identity_value(&Literal::string(""), &T::String, "utf8")
+        .expect("an empty string renders");
+    assert_eq!(
+        crate::scan::non_null_partition_value(Some(&empty)),
+        None,
+        "an empty string reads as NULL, as Exasol stores an empty VARCHAR"
+    );
+
+    let refused = partitioned_scan_task(
+        &identity_partition_spec(0, &[("token", "token", Transform::Identity)]),
+        vec![Some(Literal::Primitive(L::UInt128(7)))],
+    );
+    assert!(
+        identity_values_of(&refused).is_empty(),
+        "a uuid column is refused at plan time, so no logical field takes its value"
+    );
+}
+
+#[test]
+fn an_unreadable_identity_value_fails_planning_naming_the_column() {
+    use iceberg::spec::{Literal, Transform};
+    let spec = identity_partition_spec(0, &[("id", "id", Transform::Identity)]);
+    let narrowed = LogicalField {
+        arrow_type: "int32".to_string(),
+        ..identity_partitioned_logical_fields()[0].clone()
+    };
+    let cases = [
+        (Literal::long(i64::MAX), narrowed, "Int32"),
+        (
+            Literal::string("x"),
+            identity_partitioned_logical_fields()[0].clone(),
+            "long",
+        ),
+        (
+            Literal::Struct(iceberg::spec::Struct::from_iter([Some(Literal::long(1))])),
+            identity_partitioned_logical_fields()[0].clone(),
+            "non-primitive",
+        ),
+    ];
+
+    for (literal, field, cause) in cases {
+        let task = partitioned_scan_task(&spec, vec![Some(literal)]);
+        let message = user_message(
+            identity_partition_values(&task, &[field], "db.t")
+                .expect_err("an unreadable value must never be dropped or truncated"),
+        );
+        assert!(
+            message.contains("db.t") && message.contains("'id'") && message.contains(cause),
+            "{message}"
         );
     }
 }

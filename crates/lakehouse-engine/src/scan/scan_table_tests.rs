@@ -15,8 +15,12 @@ fn scan_table_over(files: Vec<FileEntry>) -> ParquetScanTable {
     };
     ParquetScanTable {
         object_store_url: ObjectStoreUrl::parse("memory://").unwrap(),
-        schema: PartitionedScanSchema::split(Arc::new(arrow::datatypes::Schema::empty()), &[])
-            .expect("an empty schema declares no partition column"),
+        schema: PartitionedScanGroups::split(
+            Arc::new(arrow::datatypes::Schema::empty()),
+            &[],
+            &files,
+        )
+        .expect("an empty schema declares no partition column"),
         use_field_id_adapter: false,
         format: Arc::new(scan_table_parquet_format(&field_id_resolution)),
         field_id_resolution,
@@ -34,7 +38,7 @@ fn scan_table_partitioned_by(
     partition_columns: &[String],
 ) -> ParquetScanTable {
     ParquetScanTable {
-        schema: PartitionedScanSchema::split(declared, partition_columns)
+        schema: PartitionedScanGroups::split(declared, partition_columns, &files)
             .expect("every partition column is declared"),
         ..scan_table_over(files)
     }
@@ -78,7 +82,8 @@ fn the_provider_reports_the_declared_schema_while_scanning_the_split_one() {
 
     assert_eq!(TableProvider::schema(&table).as_ref(), declared.as_ref());
 
-    let scan_schema = table.schema.file_source_schema();
+    let split = &table.schema.groups()[0];
+    let scan_schema = split.file_source_schema();
     let file_names: Vec<&str> = scan_schema
         .file_schema()
         .fields()
@@ -91,7 +96,7 @@ fn the_provider_reports_the_declared_schema_while_scanning_the_split_one() {
         "the partition column is not read from any data file"
     );
     assert_eq!(
-        table.schema.remap_projection(None),
+        split.remap_projection(None),
         Some(vec![0, 2, 1]),
         "declared order is restored by the projection alone"
     );
@@ -263,5 +268,184 @@ fn delete_state_beyond_the_memory_pool_fails_the_scan_cleanly() {
     assert!(
         error.to_string().contains("does not fit the memory pool"),
         "{error}"
+    );
+}
+
+fn with_field_id(field: arrow::datatypes::Field, id: i32) -> arrow::datatypes::Field {
+    field.with_metadata(HashMap::from([(
+        parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
+        id.to_string(),
+    )]))
+}
+
+/// One data file: its path, its `id` values, its `region` values if it holds the column, and
+/// its `region` partition value if its entry carries one.
+type IdentityFile<'a> = (
+    &'a str,
+    &'a [i64],
+    Option<&'a [Option<&'a str>]>,
+    Option<Option<&'a str>>,
+);
+
+/// A table over `files` that hold `id` and maybe `region` by field id, and a session whose memory
+/// store holds the files.
+fn identity_table(
+    region_nullable: bool,
+    files: &[IdentityFile],
+) -> (ParquetScanTable, datafusion::prelude::SessionContext) {
+    use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use object_store::{ObjectStoreExt, PutPayload};
+
+    let id = with_field_id(Field::new("id", DataType::Int64, false), 1);
+    let region = with_field_id(Field::new("region", DataType::Utf8, region_nullable), 2);
+    let store = object_store::memory::InMemory::new();
+    let mut entries = Vec::new();
+    for (path, ids, regions, value) in files {
+        let mut columns: Vec<(Field, Arc<dyn Array>)> =
+            vec![(id.clone(), Arc::new(Int64Array::from(ids.to_vec())))];
+        if let Some(regions) = regions {
+            columns.push((
+                region.clone().with_nullable(true),
+                Arc::new(StringArray::from(regions.to_vec())),
+            ));
+        }
+        let (fields, arrays): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
+        let data = parquet_bytes(
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap(),
+            None,
+        );
+        let size = data.len() as u64;
+        futures::executor::block_on(store.put(
+            &format!("db/t/{path}").as_str().into(),
+            PutPayload::from(data),
+        ))
+        .unwrap();
+        let values = value
+            .map(|value| ("region".to_string(), value.map(str::to_string)))
+            .into_iter()
+            .collect();
+        entries.push(FileEntry::with_partition_values(*path, size, values));
+    }
+
+    let mut table =
+        scan_table_partitioned_by(entries, Arc::new(Schema::new(vec![id, region])), &[]);
+    table.use_field_id_adapter = true;
+
+    let ctx = datafusion::prelude::SessionContext::new();
+    ctx.register_object_store(&url::Url::parse("memory://").unwrap(), Arc::new(store));
+    (table, ctx)
+}
+
+fn id_region_rows(
+    table: ParquetScanTable,
+    ctx: datafusion::prelude::SessionContext,
+) -> Vec<(i64, Option<String>)> {
+    use arrow::array::AsArray;
+    use arrow::datatypes::Int64Type;
+
+    ctx.register_table("t", Arc::new(table)).unwrap();
+    let batches = current_thread_runtime().block_on(async {
+        ctx.sql("SELECT id, region FROM t ORDER BY id")
+            .await?
+            .collect()
+            .await
+    });
+    let batches = batches.unwrap();
+    let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+    let ids = batch.column(0).as_primitive::<Int64Type>().values().iter();
+    let regions = batch.column(1).as_string::<i32>().iter();
+    ids.zip(regions)
+        .map(|(id, region)| (*id, region.map(str::to_string)))
+        .collect()
+}
+
+/// Scenario: An identity partition value wins over a column the data file holds
+#[test]
+fn a_files_identity_value_wins_over_the_column_it_holds() {
+    let (table, ctx) = identity_table(
+        true,
+        &[
+            (
+                "held.parquet",
+                &[1, 2],
+                Some(&[Some("us"), None]),
+                Some(Some("eu")),
+            ),
+            ("native.parquet", &[3], Some(&[Some("ap")]), None),
+        ],
+    );
+
+    assert_eq!(
+        id_region_rows(table, ctx),
+        [
+            (1, Some("eu".to_string())),
+            (2, Some("eu".to_string())),
+            (3, Some("ap".to_string())),
+        ],
+        "the file carrying a partition value reads it, the file without one reads its column"
+    );
+}
+
+/// Scenario: An identity partition value precedes the initial-default, and a null partition value is present
+#[test]
+fn an_identity_value_precedes_the_initial_default_and_a_null_value_is_present() {
+    let (mut table, ctx) = identity_table(
+        true,
+        &[
+            ("value.parquet", &[1], None, Some(Some("eu"))),
+            ("null.parquet", &[2], None, Some(None)),
+            ("none.parquet", &[3], None, None),
+        ],
+    );
+    table.field_id_resolution.defaults = HashMap::from([(
+        "region".to_string(),
+        datafusion::scalar::ScalarValue::Utf8(Some("default".to_string())),
+    )]);
+
+    assert_eq!(
+        id_region_rows(table, ctx),
+        [
+            (1, Some("eu".to_string())),
+            (2, None),
+            (3, Some("default".to_string())),
+        ]
+    );
+}
+
+/// Scenario: A required identity column without a physical counterpart reads its partition value
+#[test]
+fn a_required_identity_column_absent_from_its_files_reads_the_partition_value() {
+    let (table, ctx) = identity_table(
+        false,
+        &[
+            ("eu.parquet", &[1], None, Some(Some("eu"))),
+            ("us.parquet", &[2], None, Some(Some("us"))),
+        ],
+    );
+
+    assert_eq!(
+        id_region_rows(table, ctx),
+        [(1, Some("eu".to_string())), (2, Some("us".to_string()))],
+        "a carried value fills the column before the required-absent check sees it"
+    );
+}
+
+#[test]
+fn files_carrying_the_same_partition_keys_scan_as_one_plan() {
+    let (table, ctx) = identity_table(
+        true,
+        &[
+            ("a.parquet", &[1], None, Some(Some("eu"))),
+            ("b.parquet", &[2], None, Some(None)),
+        ],
+    );
+    let plan = current_thread_runtime()
+        .block_on(table.scan(&ctx.state(), None, &[], None))
+        .unwrap();
+
+    assert!(
+        plan.downcast_ref::<UnionExec>().is_none(),
+        "one key set plans one file group, as before identity values existed"
     );
 }

@@ -4,7 +4,7 @@
 
 use crate::scan::diagnostics;
 use crate::scan::parquet_reader::object_meta_for;
-use crate::scan::partition_values::PartitionedScanSchema;
+use crate::scan::partition_values::PartitionedScanGroups;
 use crate::scan::raw_scan::scan_table_parquet_format;
 use crate::scan::row_deletes::{
     ShardDeletes, access_plan_bytes, build_access_plan, join_spawned, redact, reserve,
@@ -24,6 +24,7 @@ use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::union::UnionExec;
 use exasol_udf_sdk::error::UdfError;
 use parquet::file::metadata::PageIndexPolicy;
 use roaring::RoaringTreemap;
@@ -31,8 +32,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
-/// All files go into ONE `FileGroup`, which DataFusion's file-scan repartitioning splits into
-/// byte ranges up to `target_partitions`. The plan is built
+/// Files with the same partition columns go into ONE `FileGroup`, which DataFusion's file-scan
+/// repartitioning splits into byte ranges up to `target_partitions`. Each plan is built
 /// through [`ParquetFormat::create_physical_plan`], which applies THIS provider's Parquet
 /// options (making row-filter pushdown per table) and a `CachedParquetFileReaderFactory` over
 /// the session [`FileMetadataCache`]. Access-plan construction reads through that same cache
@@ -44,7 +45,7 @@ use tokio::sync::Semaphore;
 #[derive(Debug)]
 pub(crate) struct ParquetScanTable {
     object_store_url: ObjectStoreUrl,
-    schema: PartitionedScanSchema,
+    schema: PartitionedScanGroups,
     use_field_id_adapter: bool,
     field_id_resolution: FieldIdResolution,
     files: Vec<FileEntry>,
@@ -65,7 +66,7 @@ impl ParquetScanTable {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         object_store_url: ObjectStoreUrl,
-        schema: PartitionedScanSchema,
+        schema: PartitionedScanGroups,
         use_field_id_adapter: bool,
         field_id_resolution: FieldIdResolution,
         files: Vec<FileEntry>,
@@ -112,7 +113,10 @@ impl ParquetScanTable {
         let partition_values = self
             .files
             .iter()
-            .map(|entry| self.schema.partition_values_for(entry))
+            .enumerate()
+            .map(|(index, entry)| {
+                self.schema.groups()[self.schema.group_of(index)].partition_values_for(entry)
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| UdfError::User(redact(e, &self.secrets)))?;
 
@@ -252,27 +256,33 @@ impl TableProvider for ParquetScanTable {
             .await
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
-        let file_source = self
-            .format
-            .file_source(self.schema.file_source_schema().clone());
+        let mut files_by_group = vec![Vec::new(); self.schema.groups().len()];
+        for (index, file) in files.into_iter().enumerate() {
+            files_by_group[self.schema.group_of(index)].push(file);
+        }
 
-        let expr_adapter = self.use_field_id_adapter.then(|| {
-            Arc::new(FieldIdExprAdapterFactory {
-                resolution: self.field_id_resolution.clone(),
-                table_root: self.table_root.clone(),
-            }) as Arc<_>
-        });
+        let mut plans = Vec::with_capacity(files_by_group.len());
+        for (schema, files) in self.schema.groups().iter().zip(files_by_group) {
+            let file_source = self.format.file_source(schema.file_source_schema().clone());
+            let expr_adapter = self.use_field_id_adapter.then(|| {
+                Arc::new(FieldIdExprAdapterFactory {
+                    resolution: self.field_id_resolution.clone(),
+                    table_root: self.table_root.clone(),
+                }) as Arc<_>
+            });
 
-        // DataFusion splits the one file group into `target_partitions` byte ranges, and each
-        // range keeps its file's base access plan.
-        let config = FileScanConfigBuilder::new(self.object_store_url.clone(), file_source)
-            .with_file_group(FileGroup::new(files))
-            .with_projection_indices(self.schema.remap_projection(projection))?
-            .with_limit(limit)
-            .with_expr_adapter(expr_adapter)
-            .build();
-
-        self.format.create_physical_plan(state, config).await
+            // DataFusion splits each file group into `target_partitions` byte ranges, and each
+            // range keeps its file's base access plan.
+            let config = FileScanConfigBuilder::new(self.object_store_url.clone(), file_source)
+                .with_file_group(FileGroup::new(files))
+                .with_projection_indices(schema.remap_projection(projection))?
+                .with_limit(limit)
+                .with_expr_adapter(expr_adapter)
+                .build();
+            plans.push(self.format.create_physical_plan(state, config).await?);
+        }
+        // A single group returns its own plan, so a scan without unlisted keys is unchanged.
+        UnionExec::try_new(plans)
     }
 
     fn supports_filters_pushdown(

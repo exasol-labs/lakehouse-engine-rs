@@ -1152,6 +1152,7 @@ fn unity_delta_column_mapped_tables_return_logical_column_values() {
 }
 
 /// Scenario: A partition column absent from the data file is materialized per file
+/// Scenario: A materialized partition column is a first-class scan column
 #[test]
 fn unity_delta_partitioned_table_returns_partition_values() {
     setup();

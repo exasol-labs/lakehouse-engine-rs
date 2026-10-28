@@ -1,6 +1,10 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
+use arrow::array::ArrayRef;
+use datafusion::logical_expr::ColumnarValue;
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
 use iceberg::spec::TableMetadata;
@@ -253,7 +257,17 @@ async fn plan_checked_table(
     let predicate = filter_json
         .zip(scanned)
         .and_then(|(filter, scanned)| to_iceberg_predicate(filter, declared, &scanned));
-    let files = plan_files_from_table(table, &table_name, predicate, &secrets).await?;
+    let tasks = plan_file_tasks(table, &table_name, predicate, &secrets).await?;
+    // Delete paths are relativized later in `relativize_shards_to_root`, like data-file paths.
+    let files = tasks
+        .iter()
+        .map(|task| {
+            let mut entry = planned_file_entry(task)
+                .map_err(|mechanism| unsupported_delete_error(mechanism, &table_name))?;
+            entry.partition_values = identity_partition_values(task, declared, &table_name)?;
+            Ok(entry)
+        })
+        .collect::<Result<_, UdfError>>()?;
 
     Ok(PlannedFiles {
         files,
@@ -432,13 +446,12 @@ fn iceberg_delete_mechanism(delete: &iceberg::scan::FileScanTaskDeleteFile) -> D
     }
 }
 
-/// Iceberg predicate pruning is best-effort; DataFusion remains the row-level backstop.
-async fn plan_files_from_table(
+async fn plan_file_tasks(
     table: iceberg::table::Table,
     table_name: &str,
     predicate: Option<iceberg::expr::Predicate>,
     secrets: &[&str],
-) -> Result<Vec<FileEntry>, UdfError> {
+) -> Result<Vec<iceberg::scan::FileScanTask>, UdfError> {
     let mut scan_builder = table.scan();
     if let Some(predicate) = predicate {
         scan_builder = scan_builder.with_filter(predicate);
@@ -458,19 +471,12 @@ async fn plan_files_from_table(
         ))
     })?;
 
-    let tasks: Vec<_> = task_stream.try_collect().await.map_err(|e| {
+    task_stream.try_collect().await.map_err(|e| {
         UdfError::User(format!(
             "failed to collect Iceberg file tasks: {}",
             redact_error_text(&error_chain(&e), secrets)
         ))
-    })?;
-
-    // Delete paths are relativized later in `relativize_shards_to_root`, like data-file paths.
-    tasks
-        .iter()
-        .map(planned_file_entry)
-        .collect::<Result<_, _>>()
-        .map_err(|mechanism| unsupported_delete_error(mechanism, table_name))
+    })
 }
 
 fn planned_file_entry(
@@ -493,6 +499,117 @@ fn planned_file_entry(
         task.file_size_in_bytes(),
         deletes,
     ))
+}
+
+/// Iceberg Column Projection rule (1) reads the partition struct of the spec the file was written
+/// with, so each file carries that spec's `identity` values for top-level logical fields, keyed by
+/// logical name; a null stays an explicit absent value. Every other transform loses the source value.
+fn identity_partition_values(
+    task: &iceberg::scan::FileScanTask,
+    logical_fields: &[LogicalField],
+    table_name: &str,
+) -> Result<BTreeMap<String, Option<String>>, UdfError> {
+    let (Some(spec), Some(partition)) = (task.partition_spec(), task.partition()) else {
+        return Ok(BTreeMap::new());
+    };
+    spec.fields()
+        .iter()
+        .zip(partition.iter())
+        .filter(|(field, _)| field.transform == iceberg::spec::Transform::Identity)
+        .filter_map(|(field, value)| {
+            let logical = logical_fields
+                .iter()
+                .find(|logical| logical.field_id == Some(field.source_id))?;
+            let source_type = task
+                .schema()
+                .field_by_id(field.source_id)?
+                .field_type
+                .as_primitive_type()?;
+            let rendered = value
+                .map(|value| render_identity_value(value, source_type, &logical.arrow_type))
+                .transpose()
+                .map_err(|cause| {
+                    // Dropping the value would read the file's column, or NULL, in its place.
+                    UdfError::User(redact_credentials(&format!(
+                        "lakehouse pushdown declined for table '{table_name}': the identity \
+                         partition value of column '{}' cannot be read at the column's declared \
+                         type ({cause})",
+                        logical.name
+                    )))
+                });
+            Some(rendered.map(|rendered| (logical.name.clone(), rendered)))
+        })
+        .collect()
+}
+
+/// Casts as the scan's expression adapter casts a file column of another type than the declared
+/// one, so a reconstructed value reads exactly as a stored one. The result is the string
+/// `scan::partition_scalar` parses back at the declared type.
+fn render_identity_value(
+    value: &iceberg::spec::Literal,
+    source_type: &iceberg::spec::PrimitiveType,
+    arrow_type_tag: &str,
+) -> Result<String, String> {
+    let iceberg::spec::Literal::Primitive(value) = value else {
+        return Err(format!(
+            "the partition struct holds a non-primitive value for a {source_type} column"
+        ));
+    };
+    let file_value = file_column_value(value, source_type).ok_or_else(|| {
+        format!("the partition struct holds a value of another type than the {source_type} column")
+    })?;
+    let declared = crate::types::mapping::arrow_type_from_tag(arrow_type_tag);
+    let read = ColumnarValue::Array(file_value)
+        .cast_to(&declared, None)
+        .and_then(|read| read.into_array(1))
+        .map_err(|e| e.to_string())?;
+    arrow::util::display::array_value_to_string(&read, 0).map_err(|e| e.to_string())
+}
+
+/// What a Parquet column of the file's own Iceberg type reads as. The literal's variant is that
+/// type, because a manifest decodes its partition structs with the schema it was written under, so
+/// an `int` value of a column promoted to `long` stays an `Int`.
+fn file_column_value(
+    value: &iceberg::spec::PrimitiveLiteral,
+    source_type: &iceberg::spec::PrimitiveType,
+) -> Option<ArrayRef> {
+    use arrow::array::{
+        BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
+        Int64Array, StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+        TimestampNanosecondArray,
+    };
+    use iceberg::spec::{PrimitiveLiteral as L, PrimitiveType as T};
+    // The zone the Parquet reader gives a column whose timestamp `isAdjustedToUTC`.
+    const ADJUSTED_TO_UTC: &str = "UTC";
+
+    let array: ArrayRef = match (value, source_type) {
+        (L::Boolean(v), T::Boolean) => Arc::new(BooleanArray::from(vec![*v])),
+        (L::Int(v), T::Int | T::Long) => Arc::new(Int32Array::from(vec![*v])),
+        (L::Int(v), T::Date) => Arc::new(Date32Array::from(vec![*v])),
+        (L::Long(v), T::Long) => Arc::new(Int64Array::from(vec![*v])),
+        (L::Long(v), T::Time) => Arc::new(Time64MicrosecondArray::from(vec![*v])),
+        (L::Long(v), T::Timestamp) => Arc::new(TimestampMicrosecondArray::from(vec![*v])),
+        (L::Long(v), T::Timestamptz) => {
+            Arc::new(TimestampMicrosecondArray::from(vec![*v]).with_timezone(ADJUSTED_TO_UTC))
+        }
+        (L::Long(v), T::TimestampNs) => Arc::new(TimestampNanosecondArray::from(vec![*v])),
+        (L::Long(v), T::TimestamptzNs) => {
+            Arc::new(TimestampNanosecondArray::from(vec![*v]).with_timezone(ADJUSTED_TO_UTC))
+        }
+        (L::Float(v), T::Float | T::Double) => Arc::new(Float32Array::from(vec![v.0])),
+        (L::Double(v), T::Double) => Arc::new(Float64Array::from(vec![v.0])),
+        (L::Int128(v), T::Decimal { precision, scale }) => Arc::new(
+            Decimal128Array::from(vec![*v])
+                .with_precision_and_scale(
+                    u8::try_from(*precision).ok()?,
+                    i8::try_from(*scale).ok()?,
+                )
+                .ok()?,
+        ),
+        (L::String(v), T::String) => Arc::new(StringArray::from(vec![v.as_str()])),
+        _ => return None,
+    };
+    Some(array)
 }
 
 fn first_refused_member(field_type: &iceberg::spec::Type, path: &str) -> Option<(String, String)> {

@@ -12,6 +12,7 @@ mod credential_exposure;
 mod direct_storage;
 mod emit_declaration;
 mod harness_row_cap;
+mod identity_partition;
 mod int96_timestamp;
 mod join;
 mod non_ascii_identifier;

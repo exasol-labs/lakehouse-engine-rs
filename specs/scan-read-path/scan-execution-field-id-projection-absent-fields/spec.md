@@ -1,20 +1,14 @@
 # Feature: DataFusion Scan Execution: Absent Fields and Initial Defaults
 
-Defines what the scan UDF emits for a logical field that is absent from a data file. A field that defines an Iceberg `initial-default` returns that value for the file's rows. A nullable field with no default returns NULL. A required field with no default fails the scan with a clean error.
+Defines what the scan UDF emits for a logical field that is absent from a data file. A field that defines an Iceberg `initial-default` returns that value for the file's rows, a nullable field with no default returns NULL, and a required field with no default fails the scan with a clean error. A field whose `identity` partition value the file entry carries takes that value instead, per `scan-read-path/scan-execution-identity-partition-fill`.
 
 The VS reads each field's `initial-default` once per query and encodes a primitive default into the scan spec in a JSON-portable, credential-free form. It leaves the default absent for a non-primitive default and for a decimal outside Exasol's catalog-decimal domain.
 
 ## Background
 
-* The Iceberg table spec's Column Projection process for a field-id absent from a data file is: (1) the Identity-Transform partition value, (2) the `schema.name-mapping.default` fallback, (3) the field's `initial-default`, (4) `null`. This engine implements rules (2), (3) and (4). Rule (3) reads only `initial-default`, never `write-default`, which governs writer-side backfill.
-* The adapter resolves a field-id absent from a file per file. A field with an `initial-default` emits that default, whether required or nullable. Otherwise a nullable field emits NULL, and a required field returns a clean error. A field that resolves to a physical column always binds to its real values. The `initial-default` fill intercepts the absent field before `DefaultPhysicalExprAdapter`, which would otherwise raise the required-absent error first.
-* Only primitive `initial-default` values apply. The logical schema's Arrow-type tag vocabulary is primitive-only, and `scan-types/type-mapping` owns it. A struct, list or map default is not represented, so such a column falls through to NULL or the required-absent error. Exasol has no struct, list or map types, and the Iceberg spec requires `unknown`, `variant`, `geometry` and `geography` columns to default to null.
-* An Iceberg `timestamptz` column is declared and emitted as plain Exasol `TIMESTAMP`: see `scan-types/type-mapping`.
-* Non-null `initial-default` values require table format-version 3. The read path reads `initial-default` from the current schema regardless of format version.
-* Iceberg rule (1), substituting an Identity-Transform partition value, is not implemented. When both a partition value and an `initial-default` could resolve an absent field-id, the engine returns the `initial-default`. For an added column read from older files this is the only available value. The engine also does not parse nested `fields` entries of `schema.name-mapping.default`.
-* `scan-types/type-mapping` owns the predicate `exasol_representable_catalog_decimal` (`1 ≤ p ≤ 36` and `s ≤ p`). It maps a decimal outside that domain to the `utf8` tag. The scan side reconstructs an encoded default against the tag alone, so a decimal default encoded as the raw unscaled `i128` mantissa would surface as that mantissa's digits in a string column, for example `"1234"` for an unscaled `1234` on a `decimal(5,10)` field. That is a fabricated value.
-* The VS leaves such a default absent, the same as a non-primitive default. The field then takes rule (4) where the Iceberg spec would take rule (3). This is a named Exasol target-type trade-off. It is reachable only with a `decimal(P,S)` where `P = 0` or `S > P`, a non-null `initial-default` on that field, and a format-version-3 table. The column stays queryable as a JSON-fallback `VARCHAR(2000000)`.
-* `scan-read-path/scan-execution-field-id-projection` specifies how logical fields bind to physical columns.
+* The Iceberg table spec (`format/spec.md`, "Column Projection") resolves a field id absent from a data file in this order: (1) "Return the value from partition metadata if an Identity Transform exists for the field and the partition value is present in the `partition` struct on `data_file` object in the manifest", (2) `schema.name-mapping.default`, (3) "Return the default value if it has a defined `initial-default`", (4) "Return `null` in all other cases". The engine implements all four. Rule (2) is a binding rule of `scan-read-path/scan-execution-field-id-projection`, and rule (3) never reads `write-default`, which governs writer-side backfill.
+* Only primitive `initial-default` values apply, because the Arrow-type tag vocabulary that `scan-types/type-mapping` owns is primitive-only. The read path reads `initial-default` from the current schema, and a non-null default requires format-version 3. An Iceberg `timestamptz` column is declared and emitted as plain Exasol `TIMESTAMP`. The engine does not parse nested `fields` entries of `schema.name-mapping.default`.
+* `scan-types/type-mapping` owns the predicate `exasol_representable_catalog_decimal` (`1 ≤ p ≤ 36` and `s ≤ p`) and maps a decimal outside it to the `utf8` tag. The scan reconstructs an encoded default against the tag alone, so the VS encodes no `initial-default` for such a field, and the field takes rule (4) where the Iceberg spec takes rule (3). This is a named Exasol target-type trade-off.
 
 ## Scenarios
 
@@ -38,7 +32,7 @@ The VS reads each field's `initial-default` once per query and encodes a primiti
 
 ### Scenario: Added nullable column absent from a file with no initial-default is NULL-filled
 
-* *GIVEN* a scan spec whose logical schema carries a NULLABLE column with a field-id that is absent from one of the assigned files and that defines NO `initial-default`
+* *GIVEN* a scan spec whose logical schema carries a NULLABLE column with a field-id that is absent from one of the assigned files and that defines NO `initial-default`, and that file's entry carries no identity partition value for the column
 * *AND* another assigned file that does carry that field-id
 * *WHEN* the scan UDF reads both files
 * *THEN* the UDF SHALL emit NULL for that column for rows from the file lacking the field-id
@@ -46,7 +40,7 @@ The VS reads each field's `initial-default` once per query and encodes a primiti
 
 ### Scenario: Absent field with a defined initial-default returns the default value per file
 
-* *GIVEN* a scan spec whose logical schema carries two columns that each define a primitive `initial-default`, one REQUIRED and one NULLABLE, each bound to a field-id that is absent from one assigned file (an older file written before the column was added) and present in another assigned file
+* *GIVEN* a scan spec whose logical schema carries two columns that each define a primitive `initial-default`, one REQUIRED and one NULLABLE, each bound to a field-id that is absent from one assigned file (an older file written before the column was added) and present in another assigned file, and no file entry carries an identity partition value for either column
 * *WHEN* the scan UDF reads both files
 * *THEN* the UDF SHALL emit each column's defined `initial-default` value for rows from the file that lacks the column's field-id, for both the required and the nullable column
 * *AND* the UDF SHALL emit the real physical values for those columns for rows from the file that carries the field-id, so the default fill is decided per file from that file's present field-ids
@@ -56,7 +50,7 @@ The VS reads each field's `initial-default` once per query and encodes a primiti
 
 ### Scenario: Added required column absent from a file with no initial-default errors cleanly
 
-* *GIVEN* a scan spec whose logical schema carries a non-nullable (required) column with a field-id that is absent from one of the assigned files and that defines NO `initial-default`
+* *GIVEN* a scan spec whose logical schema carries a non-nullable (required) column with a field-id that is absent from one of the assigned files and that defines NO `initial-default`, and that file's entry carries no identity partition value for the column
 * *WHEN* the scan UDF reads that file
 * *THEN* the UDF SHALL return a clean error identifying that the required column cannot be resolved from the file
 * *AND* the UDF MUST NOT emit wrong or fabricated data for that column

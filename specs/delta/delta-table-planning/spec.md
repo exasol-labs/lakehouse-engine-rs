@@ -9,7 +9,7 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 * Each `FormatReader` owns its whole resolution: catalog request, storage credential, and file discovery. The Iceberg path needs the catalog's `TableMetadata`. The Delta path needs a table-root URL and a credentialed object store.
 * Format dispatch is one exhaustive match over `ScanSource`, which pairs a live catalog session with the table it reads.
 * The log-replay step takes an injected object store, so tests run it over `file://` and over SeaweedFS. Building the store is the reader's job.
-* Delta never writes a partition column's value into the data file, so the scan spec must carry partition values. The Iceberg identity-transform rule (1) of the table spec's "Column Projection" stays an unimplemented, recorded trade-off in `scan-read-path/scan-execution-field-id-projection`. The Iceberg reader leaves `partition_columns` and `partition_values` empty.
+* Delta never writes a partition column's value into the data file, so the scan spec must carry partition values. The Iceberg reader leaves `partition_columns` empty and fills `partition_values` only with the `identity` partition values of each file's own spec: see `scan-read-path/scan-execution-identity-partition-fill`.
 * Neutral `ScanSpec` homes, one per concept: a data file's deletions in `FileEntry::deletes` as `DeleteMechanism` values, a data file's partition values in `FileEntry::partition_values`, the ordered partition-column names in `CommonScanSpec::partition_columns`, and each column's binding key on its `LogicalField`. The scan side dispatches on content, not on format. The column-mapping mode is not carried on the wire. It decides which binding key each column's note records at `createVirtualSchema`, and the pushdown reader checks the declaration against the log. `DeltaDeletionVectorStorage` is only the payload enum of the deletion-vector delete mechanism.
 * Pushdown under the Unity Catalog kind plans a Delta scan (`vs-adapter/catalog-kind-selection`). Deletion vectors, partition values, and column mapping apply at scan time (`scan-read-path/scan-execution-delta-deletion-vectors`, `scan-read-path/scan-execution-partition-values`).
 * The scan carries no per-file minimum or maximum. `delta_kernel` evaluates bounds during log replay and returns a selection vector, so pruning (`delta/delta-file-pruning`) needs no wire shape for statistics.
@@ -23,7 +23,6 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 * The reader-feature gate stays at pushdown. A table the gate refuses is listed at `createVirtualSchema` and fails at query time.
 * `delta_kernel` leaves `add.path` percent-encoded, and the engine's `ListingTableUrl::parse` path decodes it before any object-store request.
 * Every error is a `UdfError`, never a panic, and no error text carries a credential value.
-
 
 ## Scenarios
 
@@ -177,7 +176,7 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 * *WHEN* the Iceberg format reader resolves a table's scan through the trait
 * *THEN* the reader SHALL OWN that resolution logic outright, with no separately published file-resolution entry point, because `file-planning/pushdown-format-neutral-resolution` routes every caller through this seam
 * *AND* the reader SHALL construct each associated positional-delete reference as the Iceberg positional-delete variant of the format-neutral delete mechanism, serialized as `{"path":…,"size":…,"content_type":"position_deletes"}` inside the per-shard file list, and each Puffin deletion vector as the Iceberg deletion-vector variant
-* *AND* the returned scan SHALL carry EMPTY partition columns, and each of its file entries SHALL carry EMPTY partition values
+* *AND* the returned scan SHALL carry EMPTY partition columns, and each of its file entries SHALL carry only the `identity` partition values of that file's own partition spec, per `scan-read-path/scan-execution-identity-partition-fill`
 * *AND* every logical field the Iceberg reader emits SHALL carry its Iceberg field-id and NO physical name, so an Iceberg column is still bound by field-id and the physical-name and identity binding strategies are unreachable from the Iceberg path
 
 ### Scenario: The Delta reader is reached from production pushdown under the Unity Catalog kind

@@ -6,8 +6,8 @@
 set -euo pipefail
 
 ICEBERG_VERSION="1.10.1"
-# hadoop-aws, pinned to the image's bundled Hadoop, serves only the INT96
-# fixture's native Parquet write.
+# hadoop-aws, pinned to the image's bundled Hadoop, serves only the INT96 and
+# identity-partition fixtures' native Parquet writes.
 HADOOP_AWS_VERSION="3.3.4"
 SPARK_PACKAGES="org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:${ICEBERG_VERSION},org.apache.iceberg:iceberg-aws-bundle:${ICEBERG_VERSION},org.apache.hadoop:hadoop-aws:${HADOOP_AWS_VERSION}"
 
@@ -29,8 +29,8 @@ SPARK_CONF=(
   --conf spark.sql.catalog.rest_catalog.s3.access-key-id=lhadmin
   --conf spark.sql.catalog.rest_catalog.s3.secret-access-key=lhadminsecret123
   --conf spark.sql.defaultCatalog=rest_catalog
-  # INT96 (#143): aliases `s3` to S3AFileSystem so Spark's native write lands
-  # under the scheme the scan UDF registers.
+  # INT96 (#143) and identity-partition (#99): aliases `s3` to S3AFileSystem so
+  # Spark's native writes land under the scheme the scan UDF registers.
   --conf spark.hadoop.fs.s3.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
   --conf spark.hadoop.fs.s3a.endpoint=http://seaweedfs:8333
   --conf spark.hadoop.fs.s3a.access.key=lhadmin
@@ -45,6 +45,7 @@ FIXTURES=(
   create_deletion_vector_fixture.sql
   create_unsupported_format_fixture.sql
   create_iceberg_type_promotion_fixture.sql
+  create_identity_partition_fixture.sql
   create_int96_timestamp_fixture.sql
 )
 (cd /fixtures && cat "${FIXTURES[@]}") > /tmp/fixtures.sql

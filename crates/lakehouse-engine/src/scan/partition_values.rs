@@ -1,7 +1,7 @@
 //! Partition columns are recorded once per file in the table's log, not in the data file, so a
 //! Parquet-only read returns NULL for them. They become DataFusion `table_partition_cols`
 //! substituted as scan-time literals, so projection, filters, aggregation, and pruning all see
-//! the real value with no post-scan rewrite.
+//! the real value with no post-scan rewrite. A file's value always wins over the data file.
 
 use crate::scan::spec::FileEntry;
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
@@ -103,10 +103,6 @@ impl PartitionedScanSchema {
         })
     }
 
-    pub(crate) fn declared_schema(&self) -> &SchemaRef {
-        &self.declared
-    }
-
     pub(crate) fn file_source_schema(&self) -> &TableSchema {
         &self.file_source
     }
@@ -166,6 +162,77 @@ impl PartitionedScanSchema {
                 }
             })
             .collect()
+    }
+}
+
+/// Files grouped by the declared partition-value keys they carry, one [`PartitionedScanSchema`]
+/// per group. A key `partition_columns` does not list (an Iceberg `identity` field of the file's
+/// own spec) is a partition column only in the groups whose files carry it, so the other files
+/// still read that column from the data file.
+#[derive(Debug, Clone)]
+pub(crate) struct PartitionedScanGroups {
+    declared: SchemaRef,
+    groups: Vec<PartitionedScanSchema>,
+    group_by_file: Vec<usize>,
+}
+
+impl PartitionedScanGroups {
+    /// Unlisted keys follow the listed columns in key order. A key no declared field names has
+    /// no column to fill. Errors as [`PartitionedScanSchema::split`] does.
+    pub(crate) fn split(
+        declared: SchemaRef,
+        partition_columns: &[String],
+        files: &[FileEntry],
+    ) -> Result<Self, String> {
+        let mut groups = Vec::new();
+        let mut group_by_columns: HashMap<Vec<String>, usize> = HashMap::new();
+        let mut group_by_file = Vec::with_capacity(files.len());
+        for entry in files {
+            let columns: Vec<String> = partition_columns
+                .iter()
+                .chain(entry.partition_values.keys().filter(|key| {
+                    !partition_columns.contains(key) && declared.index_of(key).is_ok()
+                }))
+                .cloned()
+                .collect();
+            let group = match group_by_columns.get(&columns) {
+                Some(&group) => group,
+                None => {
+                    groups.push(PartitionedScanSchema::split(
+                        Arc::clone(&declared),
+                        &columns,
+                    )?);
+                    group_by_columns.insert(columns, groups.len() - 1);
+                    groups.len() - 1
+                }
+            };
+            group_by_file.push(group);
+        }
+        if groups.is_empty() {
+            groups.push(PartitionedScanSchema::split(
+                Arc::clone(&declared),
+                partition_columns,
+            )?);
+        }
+        Ok(Self {
+            declared,
+            groups,
+            group_by_file,
+        })
+    }
+
+    pub(crate) fn declared_schema(&self) -> &SchemaRef {
+        &self.declared
+    }
+
+    /// Never empty: a file list with no files still plans one group.
+    pub(crate) fn groups(&self) -> &[PartitionedScanSchema] {
+        &self.groups
+    }
+
+    /// The group of the `file_index`-th file of the list this was split over.
+    pub(crate) fn group_of(&self, file_index: usize) -> usize {
+        self.group_by_file[file_index]
     }
 }
 

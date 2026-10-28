@@ -4,7 +4,7 @@ Produces a partition column that has no physical counterpart in a data file from
 
 ## Background
 
-* The shard-invariant common spec carries the table's ordered `partition_columns`. Each file entry carries a `partition_values` map with one entry per partition column, holding the serialized value or an explicit absent value for NULL: see `delta/delta-table-planning`. The scan dispatches on whether these fields are populated, never on the table format.
+* The shard-invariant common spec carries the table's ordered `partition_columns`. Each file entry carries a `partition_values` map with one entry per partition column, holding the serialized value or an explicit absent value for NULL: see `delta/delta-table-planning`. A declared `partition_values` key that `partition_columns` does not list is a partition column only for the files whose entries carry it, which the Iceberg reader writes for an `identity` partition field: see `scan-read-path/scan-execution-identity-partition-fill`. The scan groups the files by the keys they carry and scans each group with its own partition columns. It dispatches on whether these fields are populated, never on the table format.
 * The Delta protocol (`delta-io/delta`, `PROTOCOL.md`) makes the transaction log the authoritative source of a file's partition values. The directory layout is a writer convention. A writer may also materialize the partition column into the Parquet file, and the log stays authoritative then too.
 * The protocol stores partition values as strings: numbers as their string form, dates as `{year}-{month}-{day}`, booleans as `"true"` or `"false"`. An empty string means a null partition value.
 
@@ -81,7 +81,8 @@ Produces a partition column that has no physical counterpart in a data file from
 ### Scenario: A scan with no partition columns is unchanged
 
 * *GIVEN* a scan invocation whose common spec names NO partition columns and whose file entries carry
-  EMPTY partition values, every Iceberg scan, and every unpartitioned Delta scan
+  EMPTY partition values: every unpartitioned Delta scan, and every Iceberg scan whose data files
+  carry no `identity` partition value
 * *WHEN* the scan UDF registers those files and runs the scan
 * *THEN* the registered table's schema, the generated scan-driving SQL, the physical plan shape, and
   the emitted rows SHALL all be identical to their pre-feature form for the same spec

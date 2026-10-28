@@ -23,7 +23,7 @@ use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
 
 use super::field_id_projection::{FieldIdResolution, build_logical_arrow_schema};
 use super::object_store::validate_uniform_object_store_files;
-use super::partition_values::PartitionedScanSchema;
+use super::partition_values::PartitionedScanGroups;
 use super::sql_support::{build_alias_items, quote_ident};
 
 /// Exposed so a host integration test can drive the production streaming + telemetry path
@@ -103,8 +103,9 @@ pub async fn register_files(
 
 /// A non-empty `logical_schema` installs the column-binding adapter (binding by field-id,
 /// declared physical name, or own name across schema evolution); otherwise the schema is
-/// inferred from the first file. `partition_columns` leave the file schema and are materialized
-/// per file (see [`PartitionedScanSchema`]). Each side of a join registers through this same
+/// inferred from the first file. `partition_columns`, and a `files` partition value for an unlisted
+/// column, leave the file schema of the files that carry them and are materialized per file (see
+/// [`PartitionedScanGroups`]). Each side of a join registers through this same
 /// provider, so both apply their own deletes.
 ///
 /// `delete_path_read_limiter` must be the SAME `Arc` for every call in one invocation, including
@@ -160,8 +161,8 @@ pub(super) async fn register_file_list(
     let field_id_resolution = FieldIdResolution::for_logical_schema(logical_schema, name_mapping)
         .map_err(UdfError::User)?;
 
-    // Partition columns have no physical counterpart in any data file.
-    let schema = PartitionedScanSchema::split(table_schema, partition_columns)
+    // A file's partition value wins over the data file, so its column leaves that file's schema.
+    let schema = PartitionedScanGroups::split(table_schema, partition_columns, files)
         .map_err(|e| UdfError::User(format!("cannot register '{table_name}': {e}")))?;
 
     let table = crate::scan::scan_table::ParquetScanTable::new(
