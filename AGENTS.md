@@ -14,6 +14,7 @@ Spec-driven development with mission in: @specs/mission.md
 Project specifics:
 
 - `make test-e2e` runs the E2E suite against the local container. Use `exapump` for all Exasol and BucketFS interaction.
+- `docs/` is the user reference, with `docs/index.md` as its map: installing (`install.md`, which documents `deploy/scripts/install.sh`), CONNECTION and VIRTUAL SCHEMA recipes per catalog (`catalogs.md`), and properties (`tuning.md`). Consult it before reconstructing an install or DDL from test code.
 - Reproduce a reported bug against the Docker Exasol container before fixing it. Do not trust an issue's repro, a capability list, or code inspection alone.
 - Verify any claim about SQL capabilities, syntax, or pushdown reachability against a live Exasol (`EXPLAIN VIRTUAL`, a pushed query, or an E2E test). `capabilities.rs` and documentation are not evidence.
 - All requirements about benchmarks live in `bench/requirements.md`. They never go into the `specs/` library.
@@ -29,6 +30,7 @@ Project specifics:
 - PR titles follow Conventional Commits, `<type>(<scope>): <description>`, with type one of `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `perf`. The title describes the final state of the change. A plan-only PR for a new feature is still `feat(...)`.
 - A plan that touches scanning, pushdown, or schema and type handling is checked against the governing Iceberg table spec or Delta Lake protocol. Quote the normative section. Fix each deviation in the same plan, or record it in the spec delta as a scoped exception. A deviation forced by an Exasol type limit (no struct, list, or map) is a named trade-off, not a gap.
 - A removed property, option, or note key leaves no trace. No spec step, test, or doc names it.
+- A change that adds, removes, or renames a CONNECTION field, a virtual schema property, a catalog kind, or an install step updates `docs/` in the same PR (`catalogs.md`, `tuning.md`, or `install.md`).
 - Planning never opens GitHub issues. Cite an existing issue as `(#83)`, otherwise mark `(#TBD)` and list it as an open question.
 
 ## Code style

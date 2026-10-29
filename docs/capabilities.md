@@ -4,7 +4,7 @@
 
 # Capability Support Overview
 
-Mental model: **DataFusion does the per-shard work inside the UDF. Exasol coordinates across shards and computes everything that is not pushed down.** These capabilities are the same for every table, in every [catalog backend](catalogs.md). The adapter advertises a capability only when it can translate that capability or decompose it into a correct partial/merge plan. The [Architecture](architecture.md) page describes the split between per-shard and parent-level work. The [docs index](index.md) lists the full guide set.
+Mental model: **DataFusion does the per-shard work inside the UDF. Exasol coordinates across shards and computes everything that is not pushed down.** These capabilities are the same for every table, in every [catalog backend](catalogs.md). The adapter advertises a capability only when it can translate that capability or decompose it into a correct partial/merge plan. The [Architecture](architecture.md) page describes the split between per-shard and parent-level work. The [Capability matrix](capability-matrix.md) lists every Exasol capability, including the ones the adapter does not advertise. The [docs index](index.md) lists the full guide set.
 
 ## Projection & expressions
 
