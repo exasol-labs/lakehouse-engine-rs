@@ -8,19 +8,13 @@ table format).
 ## Bring up + seed
 
 ```bash
-make unity-up        # compose up seaweedfs+exasol+unitycatalog (overlay) + seed
-# ...work...
+make unity-up        # compose up seaweedfs+exasol+unitycatalog+proxy (overlay) + seed
+make test-e2e-unity  # run the suite; it never starts the stack itself
 make unity-down      # tear down + wipe volumes
 ```
 
-`make unity-up` is equivalent to:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait \
-  seaweedfs exasol unitycatalog
-./scripts/unity/seed.sh                                     # upload fixtures, mint the
-                                                            # vended session, register in UC
-```
+`make unity-up` runs `./scripts/e2e-stack.sh unity up`, which starts the stack and runs
+`./scripts/unity/seed.sh` (upload fixtures, mint the vended session, register in UC).
 
 ## What the seed produces
 

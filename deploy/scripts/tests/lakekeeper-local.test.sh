@@ -2,16 +2,14 @@
 # Live integration test for lakekeeper-provision.sh against the local Docker stack; fails rather
 # than skips when the stack is down.
 #
-#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
-#     seaweedfs iceberg-rest keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper
-#   bash deploy/scripts/tests/lakekeeper-local.test.sh
+#   make lakekeeper-up test-lakekeeper-local
 #
 # Source tables live in the iceberg-rest fixture, not Lakekeeper: Lakekeeper rejects overlapping
 # warehouse key prefixes (400 CreateWarehouseStorageProfileOverlap), and on AWS the data exists
 # before any warehouse. Source tables are dropped (never purged) before registering, because
 # Lakekeeper 0.13.1 reports location and name conflicts with the same 409 body.
 #
-# Nothing is cleaned up; `docker compose ... down -v` clears it.
+# Nothing is cleaned up; `make lakekeeper-down` clears it.
 
 set -uo pipefail
 
@@ -83,7 +81,7 @@ require_endpoint() {
     2??) return 0 ;;
   esac
   fatal "$name is not answering at $url (HTTP $status). This test requires the local Docker stack and never skips. Start it with:
-  docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait seaweedfs iceberg-rest keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper"
+  make lakekeeper-up"
 }
 
 require_stack() {

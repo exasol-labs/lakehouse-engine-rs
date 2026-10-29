@@ -291,11 +291,14 @@ You can reach this local Exasol from your machine. Install to it with the
 
 `make test-e2e` builds the `.so`. It then runs the test suite against the bundled stack. Use it to
 check your build and environment before you point the engine at real data. The suite seeds Iceberg
-tables in-process and runs serially. If no Exasol is reachable, it **fails, never skips**:
+tables in-process and runs serially. `make e2e-up` starts the stack and waits until it is healthy,
+and `make e2e-down` removes it with its volumes. If no Exasol is reachable, the suite **fails,
+never skips**:
 
 ```sh
-docker compose up -d
+make e2e-up
 make test-e2e
+make e2e-down
 ```
 
 Port overrides (host side). The defaults match `docker-compose.yml`:

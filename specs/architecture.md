@@ -70,7 +70,7 @@
 - `LAKEHOUSE_VERSION()`: returns the `lakehouse-engine` crate version string
 - install.sh CLI: `install.sh --account-id <id> --database-id <id> --profile <p>` for SaaS, or `--dsn`, `--host`, `--target`, `--deployment`, `--bfs-*`, `--schema`, `--lakehouse-version`, `--slc-version`, `--arch`, `--skip-slc`
 - Release asset: `lakehouse-engine.tar.gz` on GitHub releases, installed to BucketFS at `udf/liblakehouse_engine.so`
-- Makefile: `cross-udf-build`, `test`, `test-e2e`, `test-e2e-lakekeeper`, `test-e2e-azure`, `test-e2e-glue`, `test-e2e-unity`, `install-slc`, `bench`
+- Makefile: `cross-udf-build`, `test`, `test-e2e`, `test-e2e-lakekeeper`, `test-e2e-azure`, `test-e2e-glue`, `test-e2e-unity`, `<stack>-start`, `<stack>-wait`, `<stack>-up`, and `<stack>-down` for the E2E stacks `e2e`, `lakekeeper`, `azure`, `unity`, and `glue`, `install-slc`, `bench`
 
 ## Constraints
 
