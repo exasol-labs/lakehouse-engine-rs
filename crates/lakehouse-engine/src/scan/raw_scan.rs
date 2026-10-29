@@ -1,5 +1,5 @@
 use arrow::datatypes::DataType;
-use datafusion::common::config::TableParquetOptions;
+use datafusion::common::config::{ConfigOptions, TableParquetOptions};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
 use datafusion::execution::context::SessionContext;
@@ -195,6 +195,11 @@ pub fn int96_coerced_parquet_format() -> ParquetFormat {
     let mut options = TableParquetOptions::default();
     options.global.coerce_int96 = Some(INT96_COERCE_TIME_UNIT.to_string());
     options.global.coerce_int96_tz = Some(INT96_COERCE_TZ.to_string());
+    // Statistics pruning ignores an IN-list longer than this (default 20), so it covers the
+    // largest key set the broadcast hash join pushes into the fact scan.
+    options.global.max_in_list_size = ConfigOptions::default()
+        .optimizer
+        .hash_join_inlist_pushdown_max_distinct_values;
     ParquetFormat::default().with_options(options)
 }
 

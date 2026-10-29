@@ -20,7 +20,7 @@ VS=TPCH
 require() {
   local v
   for v in "$@"; do
-    [ -n "${!v:-}" ] || { echo "ERROR: required env var '$v' is empty (set it in .env)"; exit 1; }
+    [[ -n "${!v:-}" ]] || { echo "ERROR: required env var '$v' is empty (set it in .env)"; exit 1; }
   done
 }
 
@@ -30,17 +30,17 @@ build_vs_extra_props() {  # allow_http(true|false) parallelism_factor
   local props
   props="$(printf "\n  PARALLELISM_FACTOR  = '%s'" \
     "${parallelism_factor}")"
-  [ "$allow_http" = "true" ] && \
+  [[ "$allow_http" = "true" ]] && \
     props="$(printf "\n  ALLOW_HTTP          = 'true'")${props}"
-  [ -n "${BENCH_DF_THREADING_MODE:-}" ] && \
+  [[ -n "${BENCH_DF_THREADING_MODE:-}" ]] && \
     props="${props}$(printf "\n  DATAFUSION_THREADING_MODE   = '%s'" "${BENCH_DF_THREADING_MODE}")"
-  [ -n "${BENCH_DF_THREADS_PER_UDF:-}" ] && \
+  [[ -n "${BENCH_DF_THREADS_PER_UDF:-}" ]] && \
     props="${props}$(printf "\n  DATAFUSION_THREADS_PER_UDF  = '%s'" "${BENCH_DF_THREADS_PER_UDF}")"
-  [ -n "${BENCH_DF_TARGET_PARTITIONS:-}" ] && \
+  [[ -n "${BENCH_DF_TARGET_PARTITIONS:-}" ]] && \
     props="${props}$(printf "\n  DATAFUSION_TARGET_PARTITIONS = '%s'" "${BENCH_DF_TARGET_PARTITIONS}")"
-  [ -n "${BENCH_DF_BATCH_SIZE:-}" ] && \
+  [[ -n "${BENCH_DF_BATCH_SIZE:-}" ]] && \
     props="${props}$(printf "\n  DATAFUSION_BATCH_SIZE       = '%s'" "${BENCH_DF_BATCH_SIZE}")"
-  [ -n "${BENCH_S3_MAX_CONNECTIONS:-}" ] && \
+  [[ -n "${BENCH_S3_MAX_CONNECTIONS:-}" ]] && \
     props="${props}$(printf "\n  S3_MAX_CONNECTIONS  = '%s'" "${BENCH_S3_MAX_CONNECTIONS}")"
   printf '%s' "${props}"
 }
@@ -49,7 +49,7 @@ build_vs_extra_props() {  # allow_http(true|false) parallelism_factor
 build_conn_password_cloud() {
   local token_field="" s3_endpoint
   s3_endpoint="${AWS_S3_ENDPOINT:-https://s3.${AWS_REGION}.amazonaws.com}"
-  [ -n "${AWS_SESSION_TOKEN:-}" ] && token_field=",\"session_token\":\"${AWS_SESSION_TOKEN}\""
+  [[ -n "${AWS_SESSION_TOKEN:-}" ]] && token_field=",\"session_token\":\"${AWS_SESSION_TOKEN}\""
   local json="{\"warehouse\":\"${GLUE_WAREHOUSE}\",\"endpoint\":\"${s3_endpoint}\",\"region\":\"${AWS_REGION}\",\"access_key\":\"${AWS_ACCESS_KEY_ID}\",\"secret_key\":\"${AWS_SECRET_ACCESS_KEY}\",\"path_style\":false,\"use_sigv4\":true,\"use_vended_credentials\":false${token_field}}"
   printf '%s' "${json//\'/\'\'}"  # SQL string-literal escaping: ' -> ''
 }
@@ -71,12 +71,12 @@ build_conn_password_local() {
 # Remote target only: the docker catalog is neither Glue nor Lakekeeper, so a field there would
 # mislabel the run.
 catalog_header_field() {  # target catalog_name -> "" | "catalog=<name>\n"
-  [ "$1" = "remote" ] && printf 'catalog=%s\n' "$2" || printf ''
+  [[ "$1" = "remote" ]] && printf 'catalog=%s\n' "$2" || printf ''
 }
 
 # Pure helpers stay above the selftest block so it can exercise them offline.
 delete_header_suffix() {  # with_deletes ns -> "" | "\ndeletes=on ns=<ns>"
-  [ "$1" = "1" ] && printf '\ndeletes=on ns=%s' "$2" || printf ''
+  [[ "$1" = "1" ]] && printf '\ndeletes=on ns=%s' "$2" || printf ''
 }
 
 # The deterministic 5% deletes give ~0.95; ~1.0 means deletes were ignored, < 0.90 over-applied.
@@ -86,14 +86,49 @@ delete_ratio_ok() {  # delete_count baseline_count -> 0 if ratio in [0.90,0.98]
 
 resolve_delete_ns() {  # target baseline_ns override -> the effective delete namespace
   local target="$1" baseline="$2" override="$3"
-  if [ -n "$override" ]; then printf '%s' "$override"; return; fi
+  if [[ -n "$override" ]]; then printf '%s' "$override"; return; fi
   case "$target" in
     docker) printf '%s_deletes' "$baseline";;
     *)      printf 'tpch_deletes';;
   esac
 }
 
-if [ "${1:-}" = "selftest" ]; then
+# A redirected log must show forward motion (#87): the .so build's last crate, the TPC-H
+# generation, and the Spark job each print nothing for minutes.
+HEARTBEAT_SECS=30
+HEARTBEAT_PID=""
+heartbeat_start() {  # label
+  local label="$1" t0=$SECONDS
+  # sleep writes to /dev/null so a killed ticker's orphan never holds a `| tee` pipe open.
+  ( while sleep "$HEARTBEAT_SECS" >/dev/null 2>&1 && kill -0 $$ 2>/dev/null; do
+      echo "   [$(date +%H:%M:%S)] still running: ${label} ($((SECONDS - t0))s)"
+    done ) </dev/null &
+  HEARTBEAT_PID=$!
+}
+heartbeat_stop() {
+  [[ -n "$HEARTBEAT_PID" ]] || return 0
+  kill "$HEARTBEAT_PID" 2>/dev/null || true
+  wait "$HEARTBEAT_PID" 2>/dev/null || true
+  HEARTBEAT_PID=""
+}
+# Wrap external commands only: the `||` below suspends set -e inside a shell function.
+run_phase() {  # label cmd... -> the command's exit status
+  local label="$1" t0=$SECONDS rc=0
+  shift
+  echo "== [$(date +%H:%M:%S)] ${label} =="
+  heartbeat_start "$label"
+  "$@" || rc=$?
+  heartbeat_stop
+  if [[ "$rc" -eq 0 ]]; then
+    echo "== [$(date +%H:%M:%S)] done in $((SECONDS - t0))s: ${label} =="
+  else
+    echo "== [$(date +%H:%M:%S)] FAILED (exit ${rc}) after $((SECONDS - t0))s: ${label} =="
+  fi
+  return "$rc"
+}
+trap heartbeat_stop EXIT
+
+if [[ "${1:-}" = "selftest" ]]; then
   GLUE_WAREHOUSE="s3://b/w/" AWS_REGION=r AWS_ACCESS_KEY_ID=k \
   AWS_SECRET_ACCESS_KEY="se'cret" AWS_SESSION_TOKEN="" \
     out="$(build_conn_password_cloud)"
@@ -218,18 +253,29 @@ PROBEEOF
   # leave the CONNECTION and virtual schema in place for the live demo, so every schema drop is
   # immediately followed by its recreate and the connection is never dropped.
   config_line="$(grep -n '^# ---- config ' "$SCRIPT_DIR/run.sh" | head -1 | cut -d: -f1)"
-  if [ -z "$config_line" ]; then
+  if [[ -z "$config_line" ]]; then
     echo "FAIL: vs_teardown_is_recreate_only: could not locate the config-section heading"; exit 1
   fi
   prod_src="$(tail -n "+$config_line" "$SCRIPT_DIR/run.sh")"
   drop_vs_count="$(printf '%s\n' "$prod_src" | grep -c 'DROP VIRTUAL SCHEMA')"
-  [ "$drop_vs_count" -eq 1 ] || \
+  [[ "$drop_vs_count" -eq 1 ]] || \
     { echo "FAIL: vs_teardown_is_recreate_only: expected exactly one DROP VIRTUAL SCHEMA, found $drop_vs_count"; exit 1; }
   drop_offset="$(printf '%s\n' "$prod_src" | grep -n 'DROP VIRTUAL SCHEMA' | head -1 | cut -d: -f1)"
   next_line="$(printf '%s\n' "$prod_src" | sed -n "$((drop_offset + 1))p")"
   case "$next_line" in *"CREATE VIRTUAL SCHEMA"*) ;; \
     *) echo "FAIL: vs_teardown_is_recreate_only: DROP VIRTUAL SCHEMA not immediately followed by CREATE VIRTUAL SCHEMA: $next_line"; exit 1;; esac
   case "$prod_src" in *"DROP CONNECTION"*) echo "FAIL: vs_teardown_is_recreate_only: DROP CONNECTION must not appear in bench/run.sh"; exit 1;; esac
+
+  # Command substitution waits for every writer of its pipe, so a leaked ticker would hang here.
+  out="$(HEARTBEAT_SECS=1 run_phase probe sleep 2.5)"
+  case "$out" in *"still running: probe ("*"s)"*) ;; \
+    *) echo "FAIL: run_phase_heartbeat: no still-running line: $out"; exit 1;; esac
+  case "$out" in *"done in "*"s: probe =="*) ;; \
+    *) echo "FAIL: run_phase_heartbeat: no elapsed end line: $out"; exit 1;; esac
+  rc=0; out="$(HEARTBEAT_SECS=1 run_phase failing sh -c 'exit 3')" || rc=$?
+  [[ "$rc" -eq 3 ]] || { echo "FAIL: run_phase_failure: exit status $rc, expected 3"; exit 1; }
+  case "$out" in *"FAILED (exit 3) after "*"s: failing =="*) ;; \
+    *) echo "FAIL: run_phase_failure: no failure end line: $out"; exit 1;; esac
 
   echo "selftest OK"; exit 0
 fi
@@ -239,10 +285,10 @@ fi
 # The file supplies defaults only: caller-exported BENCH_*/LAKEHOUSE_* values are re-applied after
 # sourcing so sweeps can override knobs the file also sets.
 BENCH_ENV_FILE="${BENCH_ENV_FILE:-$SCRIPT_DIR/.env}"
-if [ -f "$BENCH_ENV_FILE" ]; then
+if [[ -f "$BENCH_ENV_FILE" ]]; then
   _env_overrides="$(export -p | grep -E ' (BENCH_|LAKEHOUSE_)[A-Za-z0-9_]+=' || true)"
   set -a; . "$BENCH_ENV_FILE"; set +a
-  [ -n "$_env_overrides" ] && eval "$_env_overrides"
+  [[ -n "$_env_overrides" ]] && eval "$_env_overrides"
 fi
 
 TARGET="${BENCH_TARGET:-docker}"
@@ -252,7 +298,7 @@ TPCH_SCALE="${TPCH_SCALE:-0.3}"
 
 # Must match the workspace `exasol-udf-sdk` pin (.so fingerprint); the Makefile owns the derivation.
 SLC_VERSION="${BENCH_SLC_VERSION:-$(make -s print-slc-version)}"
-if [ -z "$SLC_VERSION" ]; then
+if [[ -z "$SLC_VERSION" ]]; then
   echo "bench/run.sh: could not read the exasol-udf-sdk version pin from Cargo.toml; set BENCH_SLC_VERSION explicitly" >&2
   exit 1
 fi
@@ -274,8 +320,7 @@ case "$TARGET" in
     CONN_PW="$(build_conn_password_local)"
     VS_EXTRA_PROPS="$(build_vs_extra_props true "${BENCH_PARALLELISM_FACTOR:-1}")"
     PROFILE_ON=0
-    echo "== docker: bringing up local stack (seaweedfs, iceberg-rest, exasol) =="
-    docker compose up -d
+    run_phase "docker: bringing up local stack (seaweedfs, iceberg-rest, exasol)" docker compose up -d
     ;;
   remote)
     # Explicit selection: bench/.env carries both catalogs' variables, so presence cannot decide.
@@ -311,7 +356,7 @@ esac
 
 # The NAMESPACE swap happens after data load so tpch_loader still populates BASELINE_NS.
 WITH_DELETES="${BENCH_WITH_DELETES:-0}"
-if [ "$WITH_DELETES" = "1" ]; then
+if [[ "$WITH_DELETES" = "1" ]]; then
   BASELINE_NS="$NAMESPACE"
   DELETE_NS="$(resolve_delete_ns "$TARGET" "$BASELINE_NS" "${BENCH_DELETE_NAMESPACE:-}")"
 fi
@@ -340,57 +385,58 @@ register_rust_alias() {
 
 wait_http() {  # url name
   local url="$1" name="$2" i
-  echo "== waiting for ${name} (${url}) =="
+  echo "== [$(date +%H:%M:%S)] waiting for ${name} (${url}) =="
+  heartbeat_start "waiting for ${name}"
   for i in $(seq 1 60); do
-    curl -fsS -o /dev/null "$url" 2>/dev/null && return 0
+    curl -fsS -o /dev/null "$url" 2>/dev/null && { heartbeat_stop; return 0; }
     sleep 1
   done
   echo "ERROR: ${name} not ready at ${url}"; exit 1
 }
 wait_exasol() {
-  echo "== waiting for Exasol ${HOST}:${EXA_PORT} =="
+  echo "== [$(date +%H:%M:%S)] waiting for Exasol ${HOST}:${EXA_PORT} =="
   local i
+  heartbeat_start "waiting for Exasol"
   for i in $(seq 1 180); do
-    if (exec 3<>"/dev/tcp/${HOST}/${EXA_PORT}") 2>/dev/null; then exec 3>&- 3<&-; return 0; fi
+    if (exec 3<>"/dev/tcp/${HOST}/${EXA_PORT}") 2>/dev/null; then exec 3>&- 3<&-; heartbeat_stop; return 0; fi
     sleep 1
   done
   echo "ERROR: Exasol not reachable at ${HOST}:${EXA_PORT}"; exit 1
 }
 
-echo "== building working-tree .so (no-op if fresh) =="
-make cross-udf-build
+run_phase "building working-tree .so (no-op if fresh)" make cross-udf-build
 
-if [ "$TARGET" = "docker" ]; then
+if [[ "$TARGET" = "docker" ]]; then
   wait_http "http://localhost:${LH_SEAWEEDFS_PORT:-19000}/status" "SeaweedFS"
   wait_http "http://localhost:${LH_REST_PORT:-18181}/v1/config" "Iceberg REST"
   wait_exasol
-  echo "== loading TPC-H (SF=${TPCH_SCALE}, big tables in ${TPCH_FILES:-4} files) into namespace '${NAMESPACE}' =="
-  TPCH_SCALE="$TPCH_SCALE" NAMESPACE="$NAMESPACE" TPCH_FILES="${TPCH_FILES:-4}" \
+  run_phase "loading TPC-H (SF=${TPCH_SCALE}, big tables in ${TPCH_FILES:-4} files) into namespace '${NAMESPACE}'" \
+    env TPCH_SCALE="$TPCH_SCALE" NAMESPACE="$NAMESPACE" TPCH_FILES="${TPCH_FILES:-4}" \
     cargo test --workspace --features lakehouse-e2e/exasol-e2e --test tpch_loader -- --nocapture
-  if [ "$WITH_DELETES" = "1" ]; then
-    echo "== authoring delete-bearing namespace '${DELETE_NS}' from baseline '${BASELINE_NS}' (docker, idempotent) =="
-    "$SCRIPT_DIR/make_deletes_docker.sh" "$BASELINE_NS" "$DELETE_NS"
+  if [[ "$WITH_DELETES" = "1" ]]; then
+    run_phase "authoring delete-bearing namespace '${DELETE_NS}' from baseline '${BASELINE_NS}' (docker, idempotent)" \
+      "$SCRIPT_DIR/make_deletes_docker.sh" "$BASELINE_NS" "$DELETE_NS"
   fi
 else
   wait_exasol
 fi
 
-if [ "$WITH_DELETES" = "1" ]; then
+if [[ "$WITH_DELETES" = "1" ]]; then
   NAMESPACE="$DELETE_NS"
 fi
 
-if [ "$SKIP_UPLOAD" = "1" ]; then
+if [[ "$SKIP_UPLOAD" = "1" ]]; then
   echo "== SKIP_UPLOAD=1: assuming SLC + .so already in BucketFS =="
   echo "   SLC dir: ${SLC_BUCKET_PATH}    .so: ${SO_UDF_OBJECT}"
   register_rust_alias
 else
-  echo "== installing SLC ${SLC_VERSION} + uploading .so =="
-  make install-slc bucketfs-upload-so \
+  run_phase "installing SLC ${SLC_VERSION} + uploading .so" \
+    make install-slc bucketfs-upload-so \
     EXASOL_HOST="$HOST" LH_EXASOL_PORT="$EXA_PORT" LH_BUCKETFS_PORT="$BFS_PORT" \
     SLC_VERSION="$SLC_VERSION" EXASOL_SYS_PASSWORD="$SYS_PASS"
 fi
 
-echo "== creating schema, scripts, connection, VS '${VS}' =="
+echo "== [$(date +%H:%M:%S)] creating schema, scripts, connection, VS '${VS}' =="
 sql "CREATE SCHEMA IF NOT EXISTS ${SCHEMA}"
 sql "CREATE OR REPLACE RUST ADAPTER SCRIPT ${SCHEMA}.${ADAPTER} AS
 %udf_object ${SO_UDF_OBJECT}
@@ -419,20 +465,20 @@ USING ${SCHEMA}.${ADAPTER} WITH
   NAMESPACE           = '$2'${VS_EXTRA_PROPS}"
 }
 build_vs "${VS}" "${NAMESPACE}"
-if [ "$WITH_DELETES" = "1" ]; then
+if [[ "$WITH_DELETES" = "1" ]]; then
   echo "== building baseline VS '${VS}_BASELINE' (ns '${BASELINE_NS}') for delete-count sanity =="
   build_vs "${VS}_BASELINE" "${BASELINE_NS}"
 fi
 
 # DDL only, for single-leg sessions under a SCRIPT_OUTPUT_ADDRESS redirect: multi-leg joins can
 # crash under debug tracing.
-if [ "${BENCH_DDL_ONLY:-0}" = "1" ]; then
+if [[ "${BENCH_DDL_ONLY:-0}" = "1" ]]; then
   echo "== BENCH_DDL_ONLY=1: scripts + VS '${VS}' created (debug_level=${UDF_DEBUG_LEVEL}); skipping queries =="
   exit 0
 fi
 
 # EXA_USER_PROFILE_LAST_DAY only covers statements run while PROFILE was on.
-if [ "$TARGET" = "remote" ] && [ "$PROFILE_ON" = "1" ]; then
+if [[ "$TARGET" = "remote" ]] && [[ "$PROFILE_ON" = "1" ]]; then
   sql "ALTER SYSTEM SET PROFILE = 'ON'" || true
 fi
 
@@ -446,9 +492,9 @@ fi
 sqlf "SELECT TABLE_NAME FROM SYS.EXA_ALL_VIRTUAL_TABLES WHERE TABLE_SCHEMA='${VS}' ORDER BY TABLE_NAME" | tee -a "$REPORT"
 
 # Remote mode never loads data, so the delete namespace must be pre-authored.
-if [ "$TARGET" = "remote" ] && [ "$WITH_DELETES" = "1" ]; then
+if [[ "$TARGET" = "remote" ]] && [[ "$WITH_DELETES" = "1" ]]; then
   ntab="$(query_scalar "SELECT COUNT(*) FROM SYS.EXA_ALL_VIRTUAL_TABLES WHERE TABLE_SCHEMA='${VS}'")"
-  if [ "${ntab:-0}" -gt 0 ] 2>/dev/null; then
+  if [[ "${ntab:-}" =~ ^[0-9]+$ && "$ntab" -gt 0 ]]; then
     echo "  OK    delete namespace '${NAMESPACE}' resolves ${ntab} table(s) via ${VS}" | tee -a "$REPORT"
   else
     echo "ERROR: BENCH_WITH_DELETES=1 but delete namespace '${NAMESPACE}' exposes no tables via ${VS}." | tee -a "$REPORT"
@@ -460,9 +506,9 @@ fi
 check_count() {  # table expected(optional, empty = just assert > 0)
   local t="$1" exp="${2:-}" n
   n="$(query_scalar "SELECT COUNT(*) FROM ${VS}.${t}")"
-  if [ -n "$exp" ]; then
-    if [ "$n" = "$exp" ]; then echo "  OK    ${t}: ${n}"; else echo "  FAIL  ${t}: got '${n}', expected ${exp}"; FAILED=1; fi
-  elif [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+  if [[ -n "$exp" ]]; then
+    if [[ "$n" = "$exp" ]]; then echo "  OK    ${t}: ${n}"; else echo "  FAIL  ${t}: got '${n}', expected ${exp}"; FAILED=1; fi
+  elif [[ "${n:-}" =~ ^[0-9]+$ && "$n" -gt 0 ]]; then
     echo "  OK    ${t}: ${n}"
   else
     echo "  FAIL  ${t}: got '${n:-<none>}', expected > 0"; FAILED=1
@@ -482,11 +528,11 @@ check_delete_ratio() {
     FAILED=1
   fi
 }
-if [ "$TARGET" = "docker" ]; then
+if [[ "$TARGET" = "docker" ]]; then
   { echo; echo "== row counts (REGION/NATION are scale-independent) =="; } | tee -a "$REPORT"
   # With deletes, key % 20 = 0 also removes rows from REGION and NATION.
   region_exp=5; nation_exp=25
-  if [ "$WITH_DELETES" = "1" ]; then region_exp=""; nation_exp=""; fi
+  if [[ "$WITH_DELETES" = "1" ]]; then region_exp=""; nation_exp=""; fi
   { check_count REGION "$region_exp"
     check_count NATION "$nation_exp"
     check_count SUPPLIER
@@ -498,7 +544,7 @@ if [ "$TARGET" = "docker" ]; then
   } | tee -a "$REPORT"
 fi
 
-if [ "$WITH_DELETES" = "1" ]; then
+if [[ "$WITH_DELETES" = "1" ]]; then
   check_delete_ratio
 fi
 
@@ -509,14 +555,18 @@ run_query() {
   local name="$1" q="$2" t0 t1
   { echo; echo "### ${name}"; } | tee -a "$REPORT"
   t0=$(date +%s.%N)
+  # Started outside the `| tee` pipeline, so still-running lines never reach the report.
+  heartbeat_start "$name"
   # `if !` keeps set -e from aborting the remaining queries on a failing one.
   if ! sqlf "$q" | tee -a "$REPORT"; then
+    heartbeat_stop
     t1=$(date +%s.%N)
     echo "  FAILED" | tee -a "$REPORT"
     printf 'elapsed: %ss (FAILED)\n' "$(awk "BEGIN{printf \"%.2f\", ${t1}-${t0}}")" | tee -a "$REPORT"
     FAILED=1
     return
   fi
+  heartbeat_stop
   t1=$(date +%s.%N)
   printf 'elapsed: %ss\n' "$(awk "BEGIN{printf \"%.2f\", ${t1}-${t0}}")" | tee -a "$REPORT"
 }
@@ -666,7 +716,7 @@ pushdown_check "NQ4 top-N (ORDER BY + LIMIT) pushdown" \
   "SELECT L_ORDERKEY, L_EXTENDEDPRICE FROM ${VS}.LINEITEM ORDER BY L_EXTENDEDPRICE DESC LIMIT 20" \
   "order_by" "LIMIT"
 
-if [ "$TARGET" = "remote" ] && [ "$PROFILE_ON" = "1" ]; then
+if [[ "$TARGET" = "remote" ]] && [[ "$PROFILE_ON" = "1" ]]; then
   echo | tee -a "$REPORT"
   echo "== PROFILE (most recent statements, best-effort) ==" | tee -a "$REPORT"
   sqlf "SELECT STMT_ID, PART_ID, PART_NAME, OBJECT_NAME, OBJECT_ROWS, DURATION, CPU
@@ -676,7 +726,7 @@ if [ "$TARGET" = "remote" ] && [ "$PROFILE_ON" = "1" ]; then
 fi
 
 echo
-if [ "$FAILED" -ne 0 ]; then
-  echo "BENCHMARK FAILED (see counts above). Report: ${REPORT}"; exit 1
+if [[ "$FAILED" -ne 0 ]]; then
+  echo "BENCHMARK FAILED (see counts above) after ${SECONDS}s. Report: ${REPORT}"; exit 1
 fi
-echo "Done. Full report: ${REPORT}"
+echo "Done in ${SECONDS}s. Full report: ${REPORT}"

@@ -24,9 +24,20 @@ This file is the source of truth for the benchmark harness, its remote target, a
 - That guarantee covers the harness, not the operator wrapper. `deploy/scripts/bench-remote.sh` runs `deploy/scripts/cluster-down.sh <env>` on every exit unless `KEEP_ALIVE=1` is exported, which destroys the cluster and with it the CONNECTION and the virtual schema. A live demo therefore never uses a default `bench-remote.sh` run.
 - `deploy/README.md` states the full ordered demo runbook in two forms, both with `BENCH_CATALOG=lakekeeper` set explicitly and both running `deploy/scripts/lakekeeper-up.sh <env>` before any `secrets.sh <env>`. Wrapper form: `lakekeeper-up.sh <env>`, then `BENCH_CATALOG=lakekeeper KEEP_ALIVE=1 ./bench-remote.sh <env>`. Unwrapped form: the `cluster-stack` `tofu apply`, then `lakekeeper-up.sh <env>`, `cluster-up.sh <env>`, `secrets.sh <env>`, and `BENCH_CATALOG=lakekeeper make bench`. The runbook ends with `cluster-down.sh <env>` and `lakekeeper-down.sh <env>`, because both forms leave a running, billing cluster.
 
+### Progress output
+
+- A log of a run redirected to a file shows where the run is or where it stopped.
+- The harness wraps each long step in a timestamped start line, a timestamped still-running line every 30 seconds with the elapsed time, and an end line with the outcome and the elapsed seconds. The long steps are the stack start, the `.so` build, the TPC-H load, the delete authoring, and the SLC install and upload.
+- The readiness waits for the docker stack and for Exasol print a timestamped start line and the same still-running lines.
+- Each benchmark query prints still-running lines on the same interval while it runs. Those lines never reach the report.
+- The heartbeat stops when its step ends or the harness exits. When a signal kills the harness, the heartbeat stops at its next tick at the latest.
+- The TPC-H loader prints a line before it generates a table and a line after each generated data file. Its per-table summary line carries the elapsed time.
+- The harness's final line carries the total elapsed seconds.
+
 ### Offline self-check
 
 - The offline self-check asserts the extra-properties block of each path and prints no client secret, access key, or secret key.
+- The offline self-check asserts that a wrapped step prints a still-running line and an elapsed end line, and that a failing step's exit status reaches the caller.
 
 ## AWS Lakekeeper benchmark catalog
 

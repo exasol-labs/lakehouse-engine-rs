@@ -670,7 +670,7 @@ fn local_size(file_url: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn sum_row_groups_pruned(plan: &dyn ExecutionPlan) -> usize {
+pub(crate) fn sum_row_groups_pruned(plan: &dyn ExecutionPlan) -> usize {
     let mut total = 0;
     if let Some(metrics) = plan.metrics() {
         for metric in metrics.iter() {
