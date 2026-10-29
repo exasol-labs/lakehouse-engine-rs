@@ -183,19 +183,21 @@ struct StructSlot {
 }
 
 /// Struct members are renamed to their claiming logical name, reordered, unclaimed ones dropped,
-/// and missing ones null-filled, using [`claim_logical`]. The name-mapping fallback is not
-/// reachable at depth: nested entries go unparsed (issue #28).
+/// and missing ones null-filled, using [`claim_logical`] with `mapping`, the name-mapping entries
+/// beneath this field.
 ///
-/// List elements and map keys/values are positional and resolve by recursion alone. A descriptor
-/// contradicting the file's own type resolves VERBATIM, leaving the file schema's adaptation to
-/// decide.
+/// List elements and map keys/values are positional and resolve by recursion alone, descending
+/// the mapping through Iceberg's `element`, `key`, and `value` entries whatever the file names
+/// them. A descriptor contradicting the file's own type resolves VERBATIM, leaving the file
+/// schema's adaptation to decide.
 pub(super) fn resolve_nested_field(
     physical: &FieldRef,
     members: &NestedMembers,
+    mapping: &[NameMappingEntry],
 ) -> NestedResolution {
     let resolved = match (physical.data_type(), members) {
         (DataType::Struct(children), NestedMembers::Struct { fields }) => {
-            let slots = claim_struct_slots(children, fields);
+            let slots = claim_struct_slots(children, fields, mapping);
             let resolved_fields: Fields = slots
                 .iter()
                 .map(|slot| Arc::clone(&slot.resolution.field))
@@ -206,21 +208,21 @@ pub(super) fn resolve_nested_field(
             ))
         }
         (DataType::List(element), NestedMembers::List { element: inner }) => {
-            let element = resolve_member(element, inner.as_deref());
+            let element = resolve_member(element, inner.as_deref(), mapped(mapping, "element"));
             Some((
                 DataType::List(Arc::clone(&element.field)),
                 ResolvedMembers::Element(Box::new(element)),
             ))
         }
         (DataType::LargeList(element), NestedMembers::List { element: inner }) => {
-            let element = resolve_member(element, inner.as_deref());
+            let element = resolve_member(element, inner.as_deref(), mapped(mapping, "element"));
             Some((
                 DataType::LargeList(Arc::clone(&element.field)),
                 ResolvedMembers::Element(Box::new(element)),
             ))
         }
         (DataType::FixedSizeList(element, size), NestedMembers::List { element: inner }) => {
-            let element = resolve_member(element, inner.as_deref());
+            let element = resolve_member(element, inner.as_deref(), mapped(mapping, "element"));
             Some((
                 DataType::FixedSizeList(Arc::clone(&element.field), *size),
                 ResolvedMembers::Element(Box::new(element)),
@@ -229,8 +231,9 @@ pub(super) fn resolve_nested_field(
         (DataType::Map(entries, sorted), NestedMembers::Map { key, value }) => {
             match entries.data_type() {
                 DataType::Struct(pair) if pair.len() == 2 => {
-                    let key = resolve_member(&pair[0], key.as_deref());
-                    let value = resolve_member(&pair[1], value.as_deref());
+                    let key = resolve_member(&pair[0], key.as_deref(), mapped(mapping, "key"));
+                    let value =
+                        resolve_member(&pair[1], value.as_deref(), mapped(mapping, "value"));
                     let resolved_entries: FieldRef =
                         Arc::new(entries.as_ref().clone().with_data_type(DataType::Struct(
                             Fields::from(vec![Arc::clone(&key.field), Arc::clone(&value.field)]),
@@ -265,17 +268,33 @@ fn verbatim(physical: &FieldRef) -> NestedResolution {
     }
 }
 
-fn resolve_member(physical: &FieldRef, members: Option<&NestedMembers>) -> NestedResolution {
+fn resolve_member(
+    physical: &FieldRef,
+    members: Option<&NestedMembers>,
+    mapping: &[NameMappingEntry],
+) -> NestedResolution {
     match members {
-        Some(members) => resolve_nested_field(physical, members),
+        Some(members) => resolve_nested_field(physical, members, mapping),
         None => verbatim(physical),
     }
+}
+
+fn mapping_entry<'a>(mapping: &'a [NameMappingEntry], name: &str) -> Option<&'a NameMappingEntry> {
+    mapping.iter().find(|entry| entry.name == name)
+}
+
+fn mapped<'a>(mapping: &'a [NameMappingEntry], name: &str) -> &'a [NameMappingEntry] {
+    mapping_entry(mapping, name).map_or(&[], |entry| &entry.fields)
 }
 
 /// A member claiming an already-claimed slot is left unclaimed, so a duplicate key cannot
 /// overwrite the first match. Unclaimed slots are typed [`DataType::Null`]: the descriptor
 /// carries no types, and a null array renders as explicit JSON `null`.
-fn claim_struct_slots(children: &Fields, logical: &[NestedField]) -> Vec<StructSlot> {
+fn claim_struct_slots(
+    children: &Fields,
+    logical: &[NestedField],
+    mapping: &[NameMappingEntry],
+) -> Vec<StructSlot> {
     let keys: Vec<BindingKeys<'_>> = logical
         .iter()
         .map(|field| BindingKeys {
@@ -291,7 +310,7 @@ fn claim_struct_slots(children: &Fields, logical: &[NestedField]) -> Vec<StructS
             PhysicalKeys {
                 name: child.name(),
                 embedded_id: field_id_of(child),
-                mapped_field_id: None,
+                mapped_field_id: mapping_entry(mapping, child.name()).map(|entry| entry.field_id),
             },
             &keys,
         ) && claimed[slot].is_none()
@@ -306,7 +325,11 @@ fn claim_struct_slots(children: &Fields, logical: &[NestedField]) -> Vec<StructS
         .map(|(field, source)| {
             let resolution = match source {
                 Some(index) => {
-                    let resolved = resolve_member(&children[index], field.nested.as_ref());
+                    let resolved = resolve_member(
+                        &children[index],
+                        field.nested.as_ref(),
+                        mapped(mapping, children[index].name()),
+                    );
                     NestedResolution {
                         field: Arc::new(resolved.field.as_ref().clone().with_name(&field.name)),
                         members: resolved.members,
@@ -949,10 +972,10 @@ fn bind_columns(
         })
         .collect();
 
-    let field_id_by_physical_name: HashMap<&str, i32> = resolution
+    let mapping_by_physical_name: HashMap<&str, &NameMappingEntry> = resolution
         .name_mapping
         .iter()
-        .map(|entry| (entry.name.as_str(), entry.field_id))
+        .map(|entry| (entry.name.as_str(), entry))
         .collect();
 
     let exact: Vec<Option<usize>> = physical
@@ -964,7 +987,9 @@ fn bind_columns(
                 PhysicalKeys {
                     name: physical_name,
                     embedded_id: field_id_of(physical_field),
-                    mapped_field_id: field_id_by_physical_name.get(physical_name).copied(),
+                    mapped_field_id: mapping_by_physical_name
+                        .get(physical_name)
+                        .map(|entry| entry.field_id),
                 },
                 &keys,
             )
@@ -985,7 +1010,13 @@ fn bind_columns(
             if let Some(members) = resolution.nested_members.get(logical_name) {
                 nested.insert(
                     logical_name.to_string(),
-                    resolve_nested_field(physical_field, members),
+                    resolve_nested_field(
+                        physical_field,
+                        members,
+                        mapping_by_physical_name
+                            .get(physical_name)
+                            .map_or(&[], |entry| &entry.fields),
+                    ),
                 );
             }
             match logical_name == physical_name {

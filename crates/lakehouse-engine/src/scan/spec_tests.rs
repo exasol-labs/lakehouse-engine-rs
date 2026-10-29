@@ -674,10 +674,12 @@ fn name_mapping_round_trips_and_defaults_to_empty() {
         NameMappingEntry {
             name: "id".to_string(),
             field_id: 1,
+            fields: Vec::new(),
         },
         NameMappingEntry {
             name: "rating".to_string(),
             field_id: 2,
+            fields: Vec::new(),
         },
     ];
     let json = spec.to_json();
@@ -694,6 +696,25 @@ fn name_mapping_round_trips_and_defaults_to_empty() {
     assert_eq!(entries[0].field_id, 1);
     assert_eq!(entries[1].name, "rating");
     assert_eq!(entries[1].field_id, 2);
+    assert!(
+        !json.contains("\"fields\""),
+        "a flat entry must serialize without `fields`: {json}"
+    );
+
+    let mut nested = sample_spec();
+    nested.common.name_mapping = vec![NameMappingEntry {
+        name: "addr".to_string(),
+        field_id: 3,
+        fields: back.common.name_mapping.clone(),
+    }];
+    assert_eq!(
+        ScanSpec::from_json(&nested.to_json())
+            .unwrap()
+            .common
+            .name_mapping,
+        nested.common.name_mapping,
+        "nested entries must round-trip"
+    );
 
     let row_spec = sample_spec();
     assert!(row_spec.common.name_mapping.is_empty());

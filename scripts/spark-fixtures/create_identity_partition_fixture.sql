@@ -25,6 +25,11 @@
 --     id 1  imported, all partition values set
 --     id 2  native, the same values as id 1
 --     id 3  imported, every partition value NULL
+--   nested_name_map      (id, label, addr struct, items list<struct>, attrs map<string, struct>),
+--                        unpartitioned, whose nested members are renamed after the imports
+--     id 1  imported without field ids under the first names, which only the name mapping binds
+--     id 2  native before the renames, so its embedded ids bind it
+--     id 3  native after the renames
 
 CREATE NAMESPACE IF NOT EXISTS rest_catalog.e2e_lakehouse;
 
@@ -160,3 +165,62 @@ SELECT 2,
        CAST(1234567890123456789012345678.123456 AS DECIMAL(38,6)),
        CAST('2024-02-29' AS DATE),
        'north';
+
+-- nested_name_map
+-- addr.zip_v1 is renamed before add_files creates the mapping, so the mapping never learns that
+-- name. addr.city is renamed to town and a new addr.city is added, so the mapping maps `city` to
+-- the new member while id 2's file embeds town's id under that name.
+
+DROP TABLE IF EXISTS rest_catalog.e2e_lakehouse.nested_name_map;
+
+CREATE TABLE rest_catalog.e2e_lakehouse.nested_name_map (
+  id INT,
+  label_v1 STRING,
+  addr STRUCT<street_v1: STRING, city: STRING, zip_v1: STRING, geo: STRUCT<lat_v1: DOUBLE>>,
+  items ARRAY<STRUCT<qty_v1: INT>>,
+  attrs MAP<STRING, STRUCT<amt_v1: INT>>
+)
+USING iceberg
+TBLPROPERTIES ('format-version' = '2');
+
+ALTER TABLE rest_catalog.e2e_lakehouse.nested_name_map RENAME COLUMN addr.zip_v1 TO zip;
+
+INSERT INTO rest_catalog.e2e_lakehouse.nested_name_map
+SELECT 2,
+       'two',
+       named_struct('street_v1', 'Elm St', 'city', 'Oslo', 'zip', '0150',
+                    'geo', named_struct('lat_v1', 59.9D)),
+       array(named_struct('qty_v1', 2)),
+       map('b', named_struct('amt_v1', 20));
+
+INSERT OVERWRITE DIRECTORY 's3://warehouse/e2e_lakehouse/nested_name_map_source'
+USING parquet
+SELECT /*+ REPARTITION(1) */
+       1 AS id,
+       'one' AS label_v1,
+       named_struct('street_v1', 'Main St', 'zip_v1', '10115',
+                    'geo', named_struct('lat_v1', 52.5D)) AS addr,
+       array(named_struct('qty_v1', 1), named_struct('qty_v1', 3)) AS items,
+       map('a', named_struct('amt_v1', 10)) AS attrs;
+
+CALL rest_catalog.system.add_files(
+  table => 'e2e_lakehouse.nested_name_map',
+  source_table => '`parquet`.`s3://warehouse/e2e_lakehouse/nested_name_map_source`'
+);
+
+ALTER TABLE rest_catalog.e2e_lakehouse.nested_name_map RENAME COLUMN label_v1 TO label;
+ALTER TABLE rest_catalog.e2e_lakehouse.nested_name_map RENAME COLUMN addr.street_v1 TO street_v2;
+ALTER TABLE rest_catalog.e2e_lakehouse.nested_name_map RENAME COLUMN addr.street_v2 TO street;
+ALTER TABLE rest_catalog.e2e_lakehouse.nested_name_map RENAME COLUMN addr.geo.lat_v1 TO lat;
+ALTER TABLE rest_catalog.e2e_lakehouse.nested_name_map RENAME COLUMN items.element.qty_v1 TO qty;
+ALTER TABLE rest_catalog.e2e_lakehouse.nested_name_map RENAME COLUMN attrs.value.amt_v1 TO amt;
+ALTER TABLE rest_catalog.e2e_lakehouse.nested_name_map RENAME COLUMN addr.city TO town;
+ALTER TABLE rest_catalog.e2e_lakehouse.nested_name_map ADD COLUMN addr.city STRING;
+
+INSERT INTO rest_catalog.e2e_lakehouse.nested_name_map
+SELECT 3,
+       'three',
+       named_struct('street', 'Oak St', 'town', 'Rome', 'zip', '00184',
+                    'geo', named_struct('lat', 41.9D), 'city', 'Roma'),
+       array(named_struct('qty', 4)),
+       map('c', named_struct('amt', 30));

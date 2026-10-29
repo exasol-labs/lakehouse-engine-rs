@@ -35,6 +35,7 @@ fn resolution_with_mapping(entries: &[(&str, i32)]) -> FieldIdResolution {
             .map(|(name, field_id)| NameMappingEntry {
                 name: (*name).to_string(),
                 field_id: *field_id,
+                fields: Vec::new(),
             })
             .collect(),
         ..bare_resolution()
@@ -668,6 +669,7 @@ fn present_field_binds_real_value_not_default() {
         name_mapping: vec![NameMappingEntry {
             name: "score".to_string(),
             field_id: 2,
+            fields: Vec::new(),
         }],
         ..resolution.clone()
     };
@@ -1308,6 +1310,116 @@ fn nested_fields_resolve_to_logical_names_across_binding_keys() {
         r#"[{"label":"x"},{"label":"y"}]"#
     );
     assert_eq!(rendered("attrs", &attrs_physical), r#"{"a":{"amount":5}}"#);
+}
+
+#[test]
+fn nested_members_without_field_ids_bind_through_the_mapping_scope() {
+    use crate::scan::render_nested_column_as_json;
+    use crate::scan::spec::NestedMembers;
+    use arrow::array::{ArrayRef, ListArray, StringArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+
+    let entry = |name: &str, field_id, fields| NameMappingEntry {
+        name: name.to_string(),
+        field_id,
+        fields,
+    };
+    let utf8 = |value: &str| Arc::new(StringArray::from(vec![value])) as ArrayRef;
+    let addr_physical: ArrayRef = Arc::new(StructArray::from(vec![
+        (
+            Arc::new(field_no_id("street_v2", DataType::Utf8, true)),
+            utf8("Main St"),
+        ),
+        (
+            Arc::new(field_with_id("town", DataType::Utf8, true, 12)),
+            utf8("Berlin"),
+        ),
+        (
+            Arc::new(field_no_id("note", DataType::Utf8, true)),
+            utf8("n"),
+        ),
+    ]));
+    let labels = Arc::new(StructArray::from(vec![(
+        Arc::new(field_no_id("lbl_old", DataType::Utf8, true)),
+        utf8("x"),
+    )])) as ArrayRef;
+    let tags_physical: ArrayRef = Arc::new(
+        ListArray::try_new(
+            Arc::new(Field::new("item", labels.data_type().clone(), true)),
+            OffsetBuffer::new(vec![0, 1].into()),
+            labels,
+            None,
+        )
+        .expect("list builds"),
+    );
+
+    let logical = Schema::new(vec![
+        field_with_id("addr", DataType::Utf8, true, 10),
+        field_with_id("tags", DataType::Utf8, true, 20),
+    ]);
+    let physical = Schema::new(vec![
+        field_no_id("addr_old", addr_physical.data_type().clone(), true),
+        field_no_id("tags", tags_physical.data_type().clone(), true),
+    ]);
+    let resolution = FieldIdResolution {
+        name_mapping: vec![
+            entry(
+                "addr_old",
+                10,
+                vec![entry("street_v2", 11, vec![]), entry("town", 13, vec![])],
+            ),
+            entry(
+                "tags",
+                20,
+                vec![entry("element", 22, vec![entry("lbl_old", 21, vec![])])],
+            ),
+        ],
+        nested_members: HashMap::from([
+            (
+                "addr".to_string(),
+                NestedMembers::Struct {
+                    fields: vec![
+                        nested_by_id(11, "street"),
+                        nested_by_id(12, "city"),
+                        nested_by_id(13, "zip"),
+                        nested_by_id(14, "note"),
+                    ],
+                },
+            ),
+            (
+                "tags".to_string(),
+                NestedMembers::List {
+                    element: Some(Box::new(NestedMembers::Struct {
+                        fields: vec![nested_by_id(21, "label")],
+                    })),
+                },
+            ),
+        ]),
+        ..bare_resolution()
+    };
+
+    let binding = bind_columns(&logical, &physical, &resolution);
+    let rendered = |column: &str, array: &ArrayRef| {
+        let resolved = binding.nested[column]
+            .apply(array)
+            .expect("the resolution applies to its own column");
+        render_nested_column_as_json(&resolved)
+            .expect("a resolved nested column renders")
+            .value(0)
+            .to_string()
+    };
+
+    assert_eq!(
+        rendered("addr", &addr_physical),
+        r#"{"street":"Main St","city":"Berlin","zip":null,"note":"n"}"#,
+        "a mapped member binds by its mapped id, an embedded id wins over the mapping, \
+         and an unmapped member binds by name"
+    );
+    assert_eq!(
+        rendered("tags", &tags_physical),
+        r#"[{"label":"x"}]"#,
+        "a list element descends the mapping through `element` whatever the file names it"
+    );
 }
 
 #[test]

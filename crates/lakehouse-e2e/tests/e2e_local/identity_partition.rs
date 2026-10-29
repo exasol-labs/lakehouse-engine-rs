@@ -1,6 +1,7 @@
 //! An Iceberg data file reads the manifest's `identity` partition value of its own spec for that
 //! column (#99), per the Iceberg spec's "Column Projection" rule (1), even where the file holds
-//! the column.
+//! the column. The same `add_files` fixture script imports a file without field ids whose nested
+//! members only `schema.name-mapping.default` binds (#83).
 //!
 //! The fixtures are authored once at stack bring-up by
 //! `scripts/spark-fixtures/create_identity_partition_fixture.sql`;
@@ -10,6 +11,7 @@ use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
 use crate::common::identity_partition_fixtures::{
     ABSENT_ROWS, ABSENT_TABLE, HELD_DIR, HELD_STORED_REGIONS, IMPORT_DIR_SUFFIX, NAMESPACE,
+    NESTED_IMPORT_DIR, NESTED_ROWS, NESTED_STREET_NAMES, NESTED_TABLE, NESTED_UNMAPPED_NAME,
     REGION_COLUMN, RegionRow, TYPES_COLUMNS, TYPES_ID_COLUMN, TYPES_ID_DECLARED,
     TYPES_ROW_IDS_TEXT, TYPES_TABLE,
 };
@@ -25,17 +27,23 @@ use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
-/// `(path, footer column names)` of every data file the table's current snapshot plans.
-fn planned_footers(table: &str) -> Vec<(String, Vec<String>)> {
-    let tasks: Vec<_> = runtime().block_on(async {
+fn load_table(table: &str) -> iceberg::table::Table {
+    runtime().block_on(async {
         let catalog = build_seed_catalog(&iceberg_catalog_url(), "s3://warehouse/", "identity")
             .await
             .unwrap_or_else(|e| panic!("connect to the Iceberg REST catalog for {table}: {e:#}"));
         let ident = TableIdent::new(NamespaceIdent::new(NAMESPACE.into()), table.into());
-        let loaded = catalog
+        catalog
             .load_table(&ident)
             .await
-            .unwrap_or_else(|e| panic!("load {NAMESPACE}.{table}: {e}"));
+            .unwrap_or_else(|e| panic!("load {NAMESPACE}.{table}: {e}"))
+    })
+}
+
+/// `(path, footer column names)` of every data file the table's current snapshot plans.
+fn planned_footers(table: &str) -> Vec<(String, Vec<String>)> {
+    let loaded = load_table(table);
+    let tasks: Vec<_> = runtime().block_on(async {
         let scan = loaded
             .scan()
             .select_all()
@@ -224,4 +232,121 @@ fn reconstructed_identity_values_equal_stored_values_for_every_type() {
         )
     }));
     assert_type_matrix(&mut conn, LAKEHOUSE_VS, TYPES_TABLE, &cases);
+}
+
+/// The nested row test is vacuous unless only the imported file lacks field ids and the mapping
+/// holds every street name, lacks `zip_v1`, and points `city` at another member than `town`.
+#[test]
+fn nested_name_map_fixture_holds_the_shapes_the_row_test_needs() {
+    stack();
+
+    for (path, _) in planned_footers(NESTED_TABLE) {
+        let reader = SerializedFileReader::new(get_fixture_object(&path))
+            .unwrap_or_else(|e| panic!("open committed Parquet file {path}: {e}"));
+        let carries_ids = reader
+            .metadata()
+            .file_metadata()
+            .schema_descr()
+            .root_schema()
+            .get_fields()
+            .iter()
+            .all(|field| field.get_basic_info().has_id());
+        assert_eq!(
+            carries_ids,
+            !path.contains(NESTED_IMPORT_DIR),
+            "fixture guard: only the imported file {path} may lack field ids"
+        );
+    }
+
+    let table = load_table(NESTED_TABLE);
+    let raw = table
+        .metadata()
+        .properties()
+        .get("schema.name-mapping.default")
+        .expect("fixture guard: add_files sets the name mapping");
+    let mapping: iceberg::spec::NameMapping =
+        serde_json::from_str(raw).expect("fixture guard: the name mapping parses");
+    let addr = mapping
+        .fields()
+        .iter()
+        .find(|field| field.names().iter().any(|name| name == "addr"))
+        .expect("fixture guard: the mapping maps addr");
+    let id_of = |name: &str| {
+        addr.fields()
+            .iter()
+            .find(|field| field.names().iter().any(|n| n == name))
+            .and_then(|field| field.field_id())
+    };
+    let schema_id = |path: &str| {
+        table
+            .metadata()
+            .current_schema()
+            .field_by_name(path)
+            .unwrap_or_else(|| panic!("fixture guard: {path} is in the schema"))
+            .id
+    };
+    for name in NESTED_STREET_NAMES {
+        assert_eq!(
+            id_of(name),
+            Some(schema_id("addr.street")),
+            "fixture guard: {name}"
+        );
+    }
+    assert_eq!(
+        id_of(NESTED_UNMAPPED_NAME),
+        None,
+        "fixture guard: zip_v1 is unmapped"
+    );
+    assert_eq!(
+        id_of("city"),
+        Some(schema_id("addr.city")),
+        "fixture guard: `city` maps to the added member, not to `town`"
+    );
+}
+
+/// Scenario: A nested member of a file without field ids binds through the name mapping
+/// Scenario: An embedded nested field id wins over the name mapping
+#[test]
+fn nested_members_without_field_ids_bind_through_the_name_mapping() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, label, addr, items, attrs FROM {} ORDER BY id",
+        vs_table(LAKEHOUSE_VS, NESTED_TABLE)
+    );
+    assert_pushed_to_scan_udf(&mut conn, &sql, "a nested-column scan");
+    let cols = conn.query_columns(&sql);
+    let json = |text: Option<String>| -> serde_json::Value {
+        serde_json::from_str(&text.expect("a nested cell is not NULL"))
+            .expect("a nested cell is valid JSON")
+    };
+    let actual: Vec<_> = int_column(&cols[0])
+        .into_iter()
+        .zip(text_column(&cols[1]))
+        .zip(text_column(&cols[2]))
+        .zip(text_column(&cols[3]))
+        .zip(text_column(&cols[4]))
+        .map(|((((id, label), addr), items), attrs)| {
+            (id, label, json(addr), json(items), json(attrs))
+        })
+        .collect();
+    let expected: Vec<_> = NESTED_ROWS
+        .iter()
+        .map(|(id, label, addr, items, attrs)| {
+            let parse = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+            (
+                *id,
+                Some(label.to_string()),
+                parse(addr),
+                parse(items),
+                parse(attrs),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "the imported row binds renamed members through the mapping at every depth, and the \
+         native row's embedded ids win over the mapping's `city`"
+    );
 }

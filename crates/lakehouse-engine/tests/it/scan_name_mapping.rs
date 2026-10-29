@@ -188,6 +188,7 @@ fn name_mapping_resolves_no_field_id_column() {
         vec![NameMappingEntry {
             name: "old_col".to_string(),
             field_id: 2,
+            fields: Vec::new(),
         }],
     );
 

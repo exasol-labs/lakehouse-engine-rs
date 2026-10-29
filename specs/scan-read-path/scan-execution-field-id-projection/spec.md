@@ -8,7 +8,8 @@ Binds each logical column of the scan spec's logical schema to a physical Parque
 * A logical field carries a field-id, a physical name, or neither. By field-id: Iceberg (always) and Delta `id` column mapping. By physical name: Delta `name` column mapping. By identity, matching the logical name itself: Delta `none` column mapping and every field of a direct-storage table. The Iceberg planning path populates a field-id on every logical field and never a physical name.
 * The adapter resolves each physical field in this order. (1) An embedded `PARQUET:field_id` matching a logical field's id is authoritative. A field carrying an id that no logical field declares keeps its physical name. (2) A logical field that declares this physical name claims it. (3) `schema.name-mapping.default` maps this physical name to a field-id present in the logical schema. (4) The physical name stays unchanged, which makes identity binding resolve. Steps (2) to (4) apply only to a field without an embedded field-id. Step (2) sits above the name-mapping because a per-column declaration from the table's own metadata is authoritative, while a name-mapping entry is a table-level fallback. A column whose value the file entry carries leaves that file's schema before binding, so no step binds it: see `scan-read-path/scan-execution-identity-partition-fill`.
 * All three strategies wrap the same `DefaultPhysicalExprAdapterFactory` for type-divergence casts, per-file NULL-fill, and the required-absent error. Before it delegates, the adapter substitutes an absent field's `initial-default`. The VS resolves `schema.name-mapping.default`, each field's `initial-default`, and each file's `identity` partition values once per query, and the scan UDF never re-reads Iceberg table metadata.
-* Out of scope: parsing nested `fields` entries of `schema.name-mapping.default` for struct, map and list children. `scan-read-path/scan-execution-field-id-projection-absent-fields` specifies absent-field resolution, including Iceberg Column Projection rule (1).
+* The Iceberg table spec (`format/spec.md`, "Column Projection") nests the mapping: "`fields`: An optional list of field mappings for child field of structs, maps, and lists." "List types should contain a mapping in `fields` for `element`." "Map types should contain mappings in `fields` for `key` and `value`." A nested member resolves in the same order, against the entries beneath the entry that matched its parent's physical name. The mapping keys current names, so a name that a later schema change gave another field binds that field.
+* `scan-read-path/scan-execution-field-id-projection-absent-fields` specifies absent-field resolution, including Iceberg Column Projection rule (1).
 
 ## Scenarios
 
@@ -39,12 +40,28 @@ Binds each logical column of the scan spec's logical schema to a physical Parque
 * *THEN* for each such unmapped physical field the UDF SHALL resolve the logical column to a physical column whose physical name equals the logical (current) name
 * *AND* this physical-name fallback SHALL remain unchanged from prior behavior for the no-name-mapping case and for any field the mapping does not cover
 
+### Scenario: A nested member of a file without field ids binds through the name mapping
+
+* *GIVEN* an Iceberg table with a metadata-only imported data file that embeds no field ids, whose struct members, list-element struct members, map-value struct members, and members of a struct inside a struct were renamed after the import, one of them twice
+* *AND* the table's `schema.name-mapping.default` lists every name of each renamed member beneath its parent's entry
+* *WHEN* the scan renders those nested columns from the imported file
+* *THEN* each renamed member SHALL bind to the field id of the mapping entry beneath its parent, and SHALL render its real values under its current name, never NULL
+* *AND* a list element SHALL descend through its parent's `element` entry, and a map key and value through the `key` and `value` entries, whatever names the file gives them
+* *AND* a member whose file name the mapping does not cover SHALL bind by its own name, and SHALL render NULL when no logical member carries that name
+
+### Scenario: An embedded nested field id wins over the name mapping
+
+* *GIVEN* an Iceberg table with the imported file above and a natively written file, whose struct member embeds the field id of a member that was later renamed, under a name the mapping now gives a different member
+* *WHEN* the scan renders that struct from both files
+* *THEN* the native file's member SHALL bind by its embedded field id, and MUST NOT bind through the mapping
+* *AND* the mapping SHALL apply only to members without an embedded field id
+
 ### Scenario: The VS resolves schema.name-mapping.default once per query into the scan spec
 
 * *GIVEN* a virtual schema query whose Iceberg table defines a `schema.name-mapping.default` property
 * *WHEN* the VS planning layer resolves the file list for that query
-* *THEN* the VS SHALL parse the property exactly once, into a flat list of `{name, field_id}` entries taken from the top-level mapping objects (each name in an entry's `names` mapped to that entry's `field-id`), and thread it into the shard-invariant scan spec alongside the logical schema
-* *AND* the VS SHALL skip any top-level mapping object that carries no `field-id`, and SHALL NOT recurse into nested `fields` child entries
+* *THEN* the VS SHALL parse the property exactly once, into a list of `{name, field_id, fields}` entries, one per name in a mapping object's `names`, whose `fields` holds the same entries for the object's nested `fields` at every depth, skipping any mapping object without a `field-id` together with its nested entries, and thread it into the shard-invariant scan spec alongside the logical schema
+* *AND* an entry without nested entries SHALL serialize without `fields`, so the encoding of a flat mapping is unchanged
 * *AND* when the table defines no `schema.name-mapping.default` property the threaded name-mapping SHALL be empty, so scan specs that carry no name-mapping deserialize unchanged (backward-compatible)
 * *AND* when the property is present but is not valid name-mapping JSON the VS SHALL fail the query with a clean plan-time error naming the malformed property, and MUST NOT leak credentials in that error
 

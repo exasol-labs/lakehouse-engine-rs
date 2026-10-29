@@ -94,10 +94,12 @@ async fn iceberg_reader_owns_resolution_and_keeps_its_encoding() {
             NameMappingEntry {
                 name: "id".to_string(),
                 field_id: 1,
+                fields: Vec::new(),
             },
             NameMappingEntry {
                 name: "label".to_string(),
                 field_id: 2,
+                fields: Vec::new(),
             },
         ],
         "the fixture's name-mapping property must flatten into the resolved scan"
@@ -720,7 +722,7 @@ fn an_unreadable_identity_value_fails_planning_naming_the_column() {
 }
 
 #[test]
-fn resolves_name_mapping_flat_entries_once() {
+fn resolves_name_mapping_entries_at_every_depth() {
     let raw = r#"
     [
         { "field-id": 1, "names": ["id", "record_id"] },
@@ -729,7 +731,7 @@ fn resolves_name_mapping_flat_entries_once() {
             "names": ["location"],
             "fields": [
                 { "field-id": 4, "names": ["latitude", "lat"] },
-                { "field-id": 5, "names": ["longitude", "long"] }
+                { "names": ["schema_only_child"], "fields": [{ "field-id": 9, "names": ["x"] }] }
             ]
         },
         { "names": ["schema_only_no_field_id"] }
@@ -738,25 +740,23 @@ fn resolves_name_mapping_flat_entries_once() {
 
     let entries = parse_name_mapping(Some(raw)).expect("valid name-mapping JSON must parse");
 
+    let leaf = |name: &str, field_id| NameMappingEntry {
+        name: name.to_string(),
+        field_id,
+        fields: Vec::new(),
+    };
     assert_eq!(
         entries,
         vec![
-            NameMappingEntry {
-                name: "id".to_string(),
-                field_id: 1,
-            },
-            NameMappingEntry {
-                name: "record_id".to_string(),
-                field_id: 1,
-            },
+            leaf("id", 1),
+            leaf("record_id", 1),
             NameMappingEntry {
                 name: "location".to_string(),
                 field_id: 3,
+                fields: vec![leaf("latitude", 4), leaf("lat", 4)],
             },
         ],
-        "multi-name entry expands per name; nested `fields` children (lat/lat, \
-         long/long) are excluded while the parent's own top-level name is kept; \
-         the id-less entry is fully excluded"
+        "every name gets an entry at every depth; an id-less entry drops with its children"
     );
 }
 
