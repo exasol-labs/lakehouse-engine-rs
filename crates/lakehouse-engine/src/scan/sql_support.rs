@@ -1,6 +1,14 @@
+use arrow::datatypes::DataType;
+use datafusion::common::DFSchema;
+
+use crate::scan::spec::ProjectionItem;
+use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
+
+use super::raw_scan::NESTED_JSON_RENDER_UDF_NAME;
+
 /// Uppercase aliases let identifiers resolved in uppercase match any Parquet field casing.
 /// Public so `tests/it/scan_agg_projection_pruning.rs` builds the same inner SELECT as production.
-pub fn build_alias_items(schema: &datafusion::common::DFSchema) -> Vec<String> {
+pub fn build_alias_items(schema: &DFSchema) -> Vec<String> {
     schema
         .fields()
         .iter()
@@ -15,6 +23,60 @@ pub fn build_alias_items(schema: &datafusion::common::DFSchema) -> Vec<String> {
         .collect()
 }
 
+/// All columns are aliased, since the filter may reference an unprojected one.
+pub(super) fn aliased_select(table_name: &str, schema: &DFSchema) -> String {
+    format!(
+        "SELECT {} FROM {table_name}",
+        build_alias_items(schema).join(", ")
+    )
+}
+
+pub(super) fn append_where(sql: &mut String, filter: Option<&str>) {
+    if let Some(filter) = filter
+        && !filter.is_empty()
+    {
+        sql.push_str(" WHERE ");
+        sql.push_str(filter);
+    }
+}
+
+/// A rendered expression is spliced verbatim and gets a unique positional alias: a bare column
+/// and a CAST of it derive equal names, which DataFusion rejects as duplicates (#136, #178).
+/// Exasol already de-duplicates bare column references. Emission is positional.
+pub(super) fn render_projection<'a>(
+    items: &[ProjectionItem],
+    column_type: impl Fn(&str) -> Option<&'a DataType>,
+) -> String {
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| match item {
+            ProjectionItem::Expr { expr } => {
+                format!("{expr} AS {}", quote_ident(&format!("_LH_PROJ_{i}")))
+            }
+            ProjectionItem::Column(name) => render_column(name, column_type(name)),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Nested columns call [`NESTED_JSON_RENDER_UDF_NAME`]; other incompatible columns get
+/// `CAST(col AS VARCHAR)` so they arrive as Utf8.
+pub(super) fn render_column(name: &str, data_type: Option<&DataType>) -> String {
+    let ident = quote_ident(&name.to_uppercase());
+    match data_type {
+        Some(dt) if needs_nested_json_rendering(dt) => {
+            format!("{NESTED_JSON_RENDER_UDF_NAME}({ident})")
+        }
+        Some(dt) if needs_json_fallback(dt) => format!("CAST({ident} AS VARCHAR)"),
+        _ => ident,
+    }
+}
+
 pub(super) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
+
+#[cfg(test)]
+#[path = "sql_support_tests.rs"]
+mod tests;

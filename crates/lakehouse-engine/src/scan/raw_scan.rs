@@ -1,11 +1,13 @@
 use arrow::datatypes::DataType;
 use datafusion::common::config::{ConfigOptions, TableParquetOptions};
+use datafusion::dataframe::DataFrame;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
+use datafusion::physical_plan::ExecutionPlan;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use std::sync::Arc;
@@ -19,12 +21,14 @@ use crate::scan::spec::{
 };
 use crate::scan::storage_ref::ResolvedScanStorage;
 use crate::scan::{diagnostics, emit_phase_telemetry};
-use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
 
 use super::field_id_projection::{FieldIdResolution, build_logical_arrow_schema};
 use super::object_store::validate_uniform_object_store_files;
 use super::partition_values::PartitionedScanGroups;
-use super::sql_support::{build_alias_items, quote_ident};
+use super::sql_support::{aliased_select, append_where, render_projection};
+
+const SCAN_TARGET: &str = "scan_target";
+const RAW_SQL_ERROR: &str = "DataFusion SQL error";
 
 /// Exposed so a host integration test can drive the production streaming + telemetry path
 /// against a local Parquet file.
@@ -35,8 +39,18 @@ pub async fn run_raw_scan_with_session(
     storage: &ResolvedScanStorage,
     timers: &mut diagnostics::PhaseTimers,
 ) -> Result<(), UdfError> {
-    let secrets = storage.all_secret_values();
     let df = build_dataframe(session_ctx, spec, storage).await?;
+    emit_dataframe(ctx, df, storage, timers).await
+}
+
+/// The streaming tail the raw and join paths share.
+pub(super) async fn emit_dataframe(
+    ctx: &mut dyn UdfContext,
+    df: DataFrame,
+    storage: &ResolvedScanStorage,
+    timers: &mut diagnostics::PhaseTimers,
+) -> Result<(), UdfError> {
+    let secrets = storage.all_secret_values();
     let stream = df
         .execute_stream()
         .await
@@ -45,6 +59,23 @@ pub async fn run_raw_scan_with_session(
     // Best-effort: a telemetry failure never fails an already-successful scan.
     emit_phase_telemetry(ctx, timers);
     Ok(())
+}
+
+/// `label` names the path whose SQL failed to plan.
+pub(super) async fn plan_sql(
+    ctx: &SessionContext,
+    sql: &str,
+    label: &str,
+) -> Result<DataFrame, UdfError> {
+    ctx.sql(sql)
+        .await
+        .map_err(|e| UdfError::User(format!("{label}: {e}")))
+}
+
+pub(super) async fn physical_plan(df: DataFrame) -> Result<Arc<dyn ExecutionPlan>, UdfError> {
+    df.create_physical_plan()
+        .await
+        .map_err(|e| UdfError::User(format!("physical plan error: {e}")))
 }
 
 /// Bounds every object-store read the delete path issues for one invocation (delete-file bodies
@@ -58,15 +89,10 @@ async fn build_dataframe(
     ctx: &SessionContext,
     spec: &ScanSpec,
     storage: &ResolvedScanStorage,
-) -> Result<datafusion::dataframe::DataFrame, UdfError> {
-    let table_name = "scan_target";
-    register_files(ctx, table_name, spec, storage).await?;
-
-    let sql = build_scan_sql(ctx, table_name, spec).await?;
-    let df = ctx
-        .sql(&sql)
-        .await
-        .map_err(|e| UdfError::User(format!("DataFusion SQL error: {e}")))?;
+) -> Result<DataFrame, UdfError> {
+    register_files(ctx, SCAN_TARGET, spec, storage).await?;
+    let sql = build_scan_sql(ctx, SCAN_TARGET, spec).await?;
+    let df = plan_sql(ctx, &sql, RAW_SQL_ERROR).await?;
     // COUNT(DISTINCT) fan-out: each shard streams its distinct projected values and the outer
     // wrapper counts the union. The fan-out spec carries no LIMIT/ORDER BY, so this is exact.
     if spec.common.distinct {
@@ -248,15 +274,9 @@ pub(super) fn scan_table_parquet_format(resolution: &FieldIdResolution) -> Parqu
 pub async fn build_raw_scan_physical_plan(
     ctx: &SessionContext,
     spec: &ScanSpec,
-) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>, UdfError> {
-    let sql = build_scan_sql(ctx, "scan_target", spec).await?;
-    let df = ctx
-        .sql(&sql)
-        .await
-        .map_err(|e| UdfError::User(format!("DataFusion SQL error: {e}")))?;
-    df.create_physical_plan()
-        .await
-        .map_err(|e| UdfError::User(format!("physical plan error: {e}")))
+) -> Result<Arc<dyn ExecutionPlan>, UdfError> {
+    let sql = build_scan_sql(ctx, SCAN_TARGET, spec).await?;
+    physical_plan(plan_sql(ctx, &sql, RAW_SQL_ERROR).await?).await
 }
 
 /// The legacy SQL paths build plain SQL text and cannot substitute a `PhysicalExpr` as
@@ -305,8 +325,6 @@ pub(super) fn register_nested_json_render_udf(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(NestedJsonRenderUdf::new()));
 }
 
-/// Nested columns call [`NESTED_JSON_RENDER_UDF_NAME`]; other incompatible columns get
-/// `CAST(col AS VARCHAR)` so they arrive as Utf8.
 pub(super) async fn build_scan_sql(
     ctx: &SessionContext,
     table_name: &str,
@@ -319,10 +337,8 @@ pub(super) async fn build_scan_sql(
     let schema = table.schema();
 
     // DataFusion matches quoted identifiers case-sensitively, while the adapter speaks Exasol's
-    // uppercase and Parquet keeps Iceberg casing. All columns are aliased, since the filter may
-    // reference an unprojected one.
-    let alias_items = build_alias_items(schema);
-    let inner = format!("SELECT {} FROM {table_name}", alias_items.join(", "));
+    // uppercase and Parquet keeps Iceberg casing.
+    let inner = aliased_select(table_name, schema);
 
     let proj_items: Vec<ProjectionItem> = if spec.common.projection.is_empty() {
         schema
@@ -334,49 +350,16 @@ pub(super) async fn build_scan_sql(
         spec.common.projection.clone()
     };
 
-    // A rendered expression is spliced verbatim; quoting it as an identifier would name a
-    // phantom column. Emission is positional, so only projection order reaches EMITS.
-    //
-    // Every `Expr` gets a unique positional alias: otherwise a bare column and a CAST of the
-    // same column can derive equal names (`ID` vs `CAST(ID AS Utf8View)`), which DataFusion
-    // rejects as duplicates (#136). Exasol already de-duplicates bare column references.
-    let select_items: Vec<String> = proj_items
-        .iter()
-        .enumerate()
-        .map(|(i, item)| match item {
-            ProjectionItem::Expr { expr } => {
-                format!("{expr} AS {}", quote_ident(&format!("_LH_PROJ_{i}")))
-            }
-            ProjectionItem::Column(col_name) => {
-                let col_lower = col_name.to_lowercase();
-                let data_type = schema
-                    .fields()
-                    .iter()
-                    .find(|f| f.name().to_lowercase() == col_lower)
-                    .map(|f| f.data_type().clone());
-                let upper = col_name.to_uppercase();
-                match data_type {
-                    Some(dt) if needs_nested_json_rendering(&dt) => {
-                        format!("{NESTED_JSON_RENDER_UDF_NAME}({})", quote_ident(&upper))
-                    }
-                    Some(dt) if needs_json_fallback(&dt) => {
-                        format!("CAST({} AS VARCHAR)", quote_ident(&upper))
-                    }
-                    _ => quote_ident(&upper),
-                }
-            }
-        })
-        .collect();
-
-    let select_clause = select_items.join(", ");
+    let select_clause = render_projection(&proj_items, |name| {
+        let lower = name.to_lowercase();
+        schema
+            .fields()
+            .iter()
+            .find(|f| f.name().to_lowercase() == lower)
+            .map(|f| f.data_type())
+    });
     let mut sql = format!("SELECT {select_clause} FROM ({inner})");
-
-    if let Some(filter) = &spec.common.filter
-        && !filter.is_empty()
-    {
-        sql.push_str(" WHERE ");
-        sql.push_str(filter);
-    }
+    append_where(&mut sql, spec.common.filter.as_deref());
 
     // Rendered by the SAME `render_order_by_clause` as the adapter's outer merge SQL, so shard
     // and merge sorts rank identically, including NULL placement. Before LIMIT so DataFusion

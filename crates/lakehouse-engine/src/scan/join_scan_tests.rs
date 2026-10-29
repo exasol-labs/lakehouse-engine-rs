@@ -11,33 +11,6 @@ use crate::scan::raw_scan::register_nested_json_render_udf;
 use crate::scan::spec::{JoinSpec, JoinType, SortKey};
 use crate::scan::test_support::minimal_spec;
 
-#[test]
-fn render_join_select_item_keeps_a_non_nested_incompatible_column_cast_unchanged() {
-    let combined = vec![("PAYLOAD".to_string(), arrow::datatypes::DataType::Binary)];
-    let item = ProjectionItem::Column("PAYLOAD".into());
-
-    let rendered = render_join_select_item(&item, &combined);
-
-    assert_eq!(rendered, "CAST(\"PAYLOAD\" AS VARCHAR)");
-}
-
-#[test]
-fn render_join_select_item_diverts_a_nested_column_to_the_json_render_function() {
-    let list_type = arrow::datatypes::DataType::List(std::sync::Arc::new(
-        arrow::datatypes::Field::new("item", arrow::datatypes::DataType::Utf8, true),
-    ));
-    let combined = vec![("TAGS".to_string(), list_type)];
-    let item = ProjectionItem::Column("TAGS".into());
-
-    let rendered = render_join_select_item(&item, &combined);
-
-    assert_eq!(
-        rendered,
-        format!("{NESTED_JSON_RENDER_UDF_NAME}(\"TAGS\")"),
-        "a nested column must be routed through the JSON render function, not CAST"
-    );
-}
-
 #[tokio::test]
 async fn build_join_sql_renders_a_nested_column_as_valid_json_end_to_end() {
     let mut tags_builder = ListBuilder::new(StringBuilder::new());

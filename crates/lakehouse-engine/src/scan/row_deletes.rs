@@ -57,8 +57,7 @@ type Read<T> = BoxFuture<'static, Result<T, UdfError>>;
 
 pub(super) fn redact(msg: String, secrets: &[String]) -> String {
     let borrowed: Vec<&str> = secrets.iter().map(String::as_str).collect();
-    let stripped = crate::scan::emit::redact_secret_values(&msg, &borrowed);
-    crate::scan::emit::redact_credentials(&stripped)
+    crate::scan::emit::redact_error_text(&msg, &borrowed)
 }
 
 /// Results keep input order. Dropping the set on the first failure aborts the remaining tasks.

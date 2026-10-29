@@ -108,3 +108,31 @@ fn run_on_runtime_tears_down_multi_thread_runtime_with_live_background_task() {
     );
     // Reaching here without a process abort is the core assertion.
 }
+
+/// Scenario: Every scan error is redacted at the scan boundary
+#[test]
+fn run_scan_one_redacts_a_secret_from_an_unredacted_inner_error() {
+    let secret = "BoundarySecret2026";
+    let storage = ResolvedScanStorage::from_backends(
+        spec::StorageBackend::S3(spec::StorageProps {
+            secret_key: secret.into(),
+            ..Default::default()
+        }),
+        None,
+    );
+    let mut ctx = exasol_udf_sdk::test_support::TestContext::scalar(vec![]);
+
+    let error = futures::executor::block_on(run_scan_one(
+        &mut ctx,
+        minimal_spec(),
+        &storage,
+        |_, _, _| {
+            Err(UdfError::User(format!(
+                "failed to register table: {secret}"
+            )))
+        },
+    ))
+    .expect_err("the injected session failure must fail the scan");
+
+    assert_eq!(error.to_string(), "failed to register table: [REDACTED]");
+}

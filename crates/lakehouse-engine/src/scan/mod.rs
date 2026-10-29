@@ -204,8 +204,12 @@ pub async fn run_scan_one(
     build_session: impl Fn(&ScanSpec, &ResolvedScanStorage, u64) -> Result<SessionContext, UdfError>,
 ) -> Result<(), UdfError> {
     let memory_limit_bytes = ctx.memory_limit();
-    let session_ctx = build_session(&spec, storage, memory_limit_bytes)?;
-    run_scan_dispatch(ctx, &session_ctx, &spec, storage).await?;
+    let secrets = storage.all_secret_values();
+    let redact = |e| emit::redact_scan_error(e, &secrets);
+    let session_ctx = build_session(&spec, storage, memory_limit_bytes).map_err(redact)?;
+    run_scan_dispatch(ctx, &session_ctx, &spec, storage)
+        .await
+        .map_err(redact)?;
     // No async resource may outlive run_on_runtime's future.
     drop(session_ctx);
     Ok(())

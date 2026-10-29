@@ -18,6 +18,7 @@ The scan UDF renders pushed select-list expressions in its DataFusion SELECT lis
 * *GIVEN* a scan spec whose projection carries rendered DataFusion SQL select-list expressions (e.g. `UPPER("NAME")`, `("PRICE" * "QTY")`, `date_part('YEAR', "ORDER_DATE")`) rather than bare column names
 * *WHEN* the scan UDF runs for that spec
 * *THEN* the UDF SHALL place each rendered select-list expression verbatim in its DataFusion SELECT list, in spec order
+* *AND* on the single-table and the broadcast-join path alike, each expression SHALL carry a positional-unique alias, because DataFusion names a `CAST` after its operand and rejects a select list where a bare column and its `CAST` share that name
 * *AND* the UDF SHALL emit one output row per scanned source row carrying the evaluated expression values in that order
 * *AND* the EMITS declaration in the scan-driving SQL MUST match the rendered select-list in order and result type, with types derived from the `selectListDataTypes` array in the pushdown request
 * *AND* no Arrow type SHALL cross the `.so` boundary
