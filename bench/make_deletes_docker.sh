@@ -33,7 +33,7 @@ if already_populated; then
   exit 0
 fi
 
-echo "== make_deletes_docker: authoring '${TARGET_NS}' from '${SOURCE_NS}' via Spark =="
+echo "== [$(date +%H:%M:%S)] make_deletes_docker: authoring '${TARGET_NS}' from '${SOURCE_NS}' via Spark =="
 
 ICEBERG_VERSION="1.10.1"
 SPARK_PACKAGES="org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:${ICEBERG_VERSION},org.apache.iceberg:iceberg-aws-bundle:${ICEBERG_VERSION}"
@@ -70,4 +70,4 @@ docker run --rm \
   -d "catalog=${CATALOG}" -d "source_ns=${SOURCE_NS}" -d "target_ns=${TARGET_NS}" \
   -f /fixtures/create_tpch_deletes.sql
 
-echo "== make_deletes_docker: done =="
+echo "== [$(date +%H:%M:%S)] make_deletes_docker: done in ${SECONDS}s =="
