@@ -307,9 +307,9 @@ Create the Virtual Schema exactly as in the static example above. Use the same `
 Set `CATALOG_KIND = 'UNITY_CATALOG'` to reach a **native** Unity Catalog — self-hosted OSS or
 Databricks-managed — instead of an Iceberg REST catalog. This is a genuinely different catalog
 client, not another Iceberg REST auth mode: it enumerates `catalog.schema` and returns one virtual
-table per **base table** (a `MANAGED`, `EXTERNAL`, `MANAGED_SHALLOW_CLONE`, or
-`EXTERNAL_SHALLOW_CLONE` table whose `data_source_format` is `DELTA` or `PARQUET`; views and tables
-in any other format are excluded and warned). `NAMESPACE` is the `catalog.schema` to
+table per **base table** (a `MANAGED` or `EXTERNAL` table, or a Databricks shallow clone, whose
+`data_source_format` is `DELTA` or `PARQUET`; views and tables in any other format are excluded
+and warned). `NAMESPACE` is the `catalog.schema` to
 expose, and `warehouse` is not required — a native Unity Catalog is addressed by
 `catalog.schema.table`, with no separate warehouse identifier. `TO` is the bare Unity Catalog REST
 address; the adapter derives the `/api/2.1/unity-catalog` path itself.
@@ -319,10 +319,9 @@ Catalog authentication reuses the generic REST fields above — `token` for a st
 rejects. Object storage can be static S3 credentials or `use_vended_credentials`, exactly as the
 other recipes.
 
-**Shallow clones.** A Databricks shallow clone is listed like any other Delta table, but Databricks
-vends no storage credential for it. Under `use_vended_credentials` a query on a clone fails with
-Databricks' refusal. To read one, use static storage credentials that also cover the source table's
-location, because the clone's Delta log points at the source table's data files.
+**Shallow clones.** Databricks vends no storage credential for a shallow clone, so a query on one
+fails under `use_vended_credentials`. Read clones with static storage credentials that also cover
+the source table's location, where the clone's data files live.
 
 **Parquet tables.** A `PARQUET` table is planned from its catalog entry. Its files supply only the
 file list and the partition values. Its storage is resolved exactly as for a Delta table, static or
@@ -417,7 +416,8 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 
 **Databricks-managed**, with a personal access token and Databricks-vended storage credentials
 (the common case — Databricks Unity Catalog vends short-lived credentials per table rather than
-handing out a static key pair):
+handing out a static key pair). A shallow clone needs static credentials instead (see **Shallow
+clones** above):
 
 ```sql
 CREATE CONNECTION UNITY_CATALOG_CREDS

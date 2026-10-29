@@ -1,6 +1,6 @@
 # Feature: Unity Catalog Native REST Client
 
-A thin client in `crates/lakehouse-catalog` for the native Unity Catalog REST API. It enumerates tables and loads one table's metadata through the shared `CatalogClient` trait, so the engine never sees a Unity Catalog wire type. Listing returns one neutral table per entry whose `table_type` is `MANAGED`, `EXTERNAL`, `MANAGED_SHALLOW_CLONE`, or `EXTERNAL_SHALLOW_CLONE` and whose `data_source_format` is `DELTA` or `PARQUET`, and routes every other entry into the skipped set with a neutral reason. One client serves OSS and Databricks-managed Unity Catalog through the standard API, never the Iceberg-REST compatibility endpoint or the `delta/v1` Delta Tables API.
+A thin client in `crates/lakehouse-catalog` for the native Unity Catalog REST API. It enumerates tables and loads one table's metadata through the shared `CatalogClient` trait, so the engine never sees a Unity Catalog wire type. Listing returns one neutral table per entry whose `table_type` is a base-table type and whose `data_source_format` is `DELTA` or `PARQUET`, and routes every other entry into the skipped set with a neutral reason. One client serves OSS and Databricks-managed Unity Catalog through the standard API, never the Iceberg-REST compatibility endpoint or the `delta/v1` Delta Tables API.
 
 ## Background
 
@@ -8,8 +8,7 @@ A thin client in `crates/lakehouse-catalog` for the native Unity Catalog REST AP
 * List endpoints paginate through `page_token` and `next_page_token`, and the client follows every page.
 * `GET /tables` returns a fully populated `TableInfo` per table: `storage_location`, `table_id`, and an inline `columns[]` array in declared order. Each column carries its name, its Spark `StructField` JSON as `type_json`, and its `partition_index`. The client does not read `type_name`, `type_precision`, or `type_scale`, because real Unity clients leave a decimal's precision and scale out of those fields. The single list sweep is the column source for the full createVirtualSchema listing, so the full listing does not set the `omit_columns` parameter. `GET /tables/{full_name}` loads one table, for the scan path and for the load of listed tables.
 * The identifier-only listing sets `omit_columns`, `omit_properties`, and `omit_username` to `true`. Databricks and OSS Unity Catalog honor all three and keep each entry's `name`.
-* Databricks reports a shallow clone as `MANAGED_SHALLOW_CLONE` or `EXTERNAL_SHALLOW_CLONE` with `data_source_format` `DELTA`, verified against a live workspace (#332). UC OSS has no clone type. A clone's Delta log addresses the source table's data files by absolute URI, which the scan path already reads.
-* Databricks vends no table credential for a shallow clone: its securable kind lacks `HAS_DIRECT_EXTERNAL_ENGINE_READ_SUPPORT`. A clone read under vended credentials therefore fails at query time with Databricks' refusal. Reading one needs static storage credentials that also cover the source table's location.
+* The base-table types are `MANAGED`, `EXTERNAL`, and Databricks' shallow-clone types `MANAGED_SHALLOW_CLONE` and `EXTERNAL_SHALLOW_CLONE` (#332).
 * A listed `VIEW` entry omits `storage_location` and carries a null `data_source_format`, so the wire type models both as optional.
 * The client deserializes `data_source_format` and makes the admission decision itself. The raw string stays crate-private, and a closed neutral format tag crosses the boundary because the engine's format dispatch reads it.
 * A skipped entry pairs its identifier with a neutral skip reason.
@@ -38,7 +37,7 @@ A thin client in `crates/lakehouse-catalog` for the native Unity Catalog REST AP
 
 * *GIVEN* a `UnityCatalogSession` and a configured Unity Catalog namespace of the form `catalog.schema`
 * *WHEN* the adapter enumerates the tables in that namespace through the shared trait
-* *THEN* the client SHALL issue `GET /tables?catalog_name={catalog}&schema_name={schema}` on the session and SHALL return one fully-populated neutral table per listed entry that is a PLANNABLE BASE TABLE (an entry whose `table_type` is `MANAGED`, `EXTERNAL`, `MANAGED_SHALLOW_CLONE`, or `EXTERNAL_SHALLOW_CLONE` AND whose `data_source_format` is `DELTA` or `PARQUET`), carrying its identifier, table type, storage location, neutral format tag, credential-vending key when the entry carries one, partition columns, and ordered columns, all from the single list response
+* *THEN* the client SHALL issue `GET /tables?catalog_name={catalog}&schema_name={schema}` on the session and SHALL return one fully-populated neutral table per listed entry that is a PLANNABLE BASE TABLE (an entry whose `table_type` is a base-table type AND whose `data_source_format` is `DELTA` or `PARQUET`), carrying its identifier, table type, storage location, neutral format tag, credential-vending key when the entry carries one, partition columns, and ordered columns, all from the single list response
 * *AND* each neutral table this operation returns SHALL carry the format tag its own `data_source_format` names, `DELTA` mapping to the Delta tag and `PARQUET` to the Parquet tag, so the tag restates the admission outcome rather than re-deciding it
 * *AND* the client SHALL place every other listed entry (a `VIEW`, a base table whose `data_source_format` is neither `DELTA` nor `PARQUET`, or an entry of any other `table_type`) into the returned skipped set rather than returning it as a neutral table, so no unplannable entry reaches the listing pipeline as a table
 
@@ -47,7 +46,7 @@ A thin client in `crates/lakehouse-catalog` for the native Unity Catalog REST AP
 * *GIVEN* a `UnityCatalogSession` and a `GET /tables` response listing a `MANAGED` entry, an `EXTERNAL` entry, a `MANAGED_SHALLOW_CLONE` entry, and an `EXTERNAL_SHALLOW_CLONE` entry, each with `data_source_format` `DELTA`
 * *WHEN* the adapter enumerates the namespace through the shared trait
 * *THEN* the client SHALL return one neutral table for each of the four entries, each carrying `CatalogTableType::Table`, its storage location, and its ordered columns
-* *AND* the client SHALL apply NO shallow-clone-specific handling beyond admitting the two clone `table_type` values, because a shallow clone is a Delta base table whose own log names every file it reads
+* *AND* the client SHALL apply NO other shallow-clone handling, because a clone's own Delta log names every file it reads
 * *AND* the returned skipped set SHALL be empty, because every listed entry is a Delta base table
 
 ### Scenario: The client retrieves a table's metadata including its columns

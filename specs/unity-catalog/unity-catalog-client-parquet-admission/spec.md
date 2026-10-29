@@ -25,11 +25,11 @@ Extends `unity-catalog/unity-catalog-client`'s listing and single-table load wit
 
 ### Scenario: The client routes a view, an unplannable format, and any other table type into the skipped set with a reason
 
-* *GIVEN* a `UnityCatalogSession` and a `GET /tables` response listing a `VIEW` entry with a null `data_source_format`, a `MANAGED` entry whose `data_source_format` is neither `DELTA` nor `PARQUET` (such as `ICEBERG` or `CSV`), a `MANAGED` entry whose `data_source_format` is the lowercase `parquet`, and an entry whose `table_type` is none of `MANAGED`, `EXTERNAL`, `MANAGED_SHALLOW_CLONE`, `EXTERNAL_SHALLOW_CLONE`, or `VIEW`
+* *GIVEN* a `UnityCatalogSession` and a `GET /tables` response listing a `VIEW` entry with a null `data_source_format`, a `MANAGED` entry whose `data_source_format` is neither `DELTA` nor `PARQUET` (such as `ICEBERG` or `CSV`), a `MANAGED` entry whose `data_source_format` is the lowercase `parquet`, and an entry of any other `table_type` (such as `MATERIALIZED_VIEW`)
 * *WHEN* the adapter enumerates the namespace through the shared trait
 * *THEN* the client SHALL return NO neutral table for any of the four entries and SHALL place each into the returned skipped set
 * *AND* each skipped entry SHALL pair the neutral `catalog.schema.table` identifier with a neutral reason naming the disqualifying cause: the entry's `table_type` for the view and the other-type entry, or its `data_source_format` verbatim for each unplannable base table
-* *AND* the client SHALL compare `table_type` and `data_source_format` against the uppercase Unity Catalog vocabulary (`MANAGED`, `EXTERNAL`, `MANAGED_SHALLOW_CLONE`, `EXTERNAL_SHALLOW_CLONE`, `VIEW`, `DELTA`, `PARQUET`), matching the case Unity Catalog emits on the wire
+* *AND* the client SHALL compare `table_type` and `data_source_format` against the uppercase Unity Catalog vocabulary (the base-table types of `unity-catalog/unity-catalog-client`, `VIEW`, `DELTA`, `PARQUET`), matching the case Unity Catalog emits on the wire
 * *AND* the reason MUST NOT contain the resolved bearer token, any OAuth client secret, or any other credential value
 
 ### Scenario: The single-table load serves only the scan path and applies no admission filter

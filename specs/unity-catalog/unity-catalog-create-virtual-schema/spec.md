@@ -1,6 +1,6 @@
 # Feature: Unity Catalog Create Virtual Schema
 
-Enumerates a Unity Catalog namespace during createVirtualSchema and returns one virtual table per plannable base table: a listed entry whose `table_type` is `MANAGED`, `EXTERNAL`, `MANAGED_SHALLOW_CLONE`, or `EXTERNAL_SHALLOW_CLONE` and whose `data_source_format` is `DELTA` or `PARQUET`. Every other entry (a view, another format, or any other `table_type`) is excluded and warned. Enumeration runs on the same kind-agnostic listing pipeline as the Iceberg REST kind and reads only Unity Catalog metadata, so it resolves no snapshot, no file list, and no Parquet footer.
+Enumerates a Unity Catalog namespace during createVirtualSchema and returns one virtual table per plannable base table: a listed entry whose `table_type` is a base-table type of `unity-catalog/unity-catalog-client` and whose `data_source_format` is `DELTA` or `PARQUET`. Every other entry (a view, another format, or any other `table_type`) is excluded and warned. Enumeration runs on the same kind-agnostic listing pipeline as the Iceberg REST kind and reads only Unity Catalog metadata, so it resolves no snapshot, no file list, and no Parquet footer.
 
 ## Background
 
@@ -12,7 +12,6 @@ Enumerates a Unity Catalog namespace during createVirtualSchema and returns one 
 * A Delta table and a Parquet table declare their columns identically from the Unity Catalog column types. Each column's note (`vs-adapter/column-source-notes`) records its `type_json`, and for a Delta table also the column-mapping mode read from the table's `properties`.
 * An unusable column-mapping annotation refuses its column, never the table or the statement. A Delta column whose `type_json` lacks the annotation its table's mode requires or carries it malformed, and every column of a table whose mode property holds a value outside `none`, `id`, and `name`, is listed with a note whose refusal states the problem (`delta/delta-type-mapping`).
 * This path does not read the Delta log's protocol, so a Delta table that the reader-feature gate refuses is listed like any other and fails at query time. The pushdown gate is the authority (`delta/delta-reader-feature-gating`).
-* Shallow clones are admitted by the base-table rule with no special handling. Databricks reports them as `MANAGED_SHALLOW_CLONE` or `EXTERNAL_SHALLOW_CLONE` with `data_source_format` `DELTA` (`unity-catalog/unity-catalog-client`).
 * The `DECIMAL` guard predicate and the timestamp declaration rule have one owner, `scan-types/type-mapping`, and `vs-adapter/create-virtual-schema` owns the single `ctx.database_version()` read. This feature consumes them and does not restate them.
 
 ## Scenarios
@@ -21,7 +20,7 @@ Enumerates a Unity Catalog namespace during createVirtualSchema and returns one 
 
 * *GIVEN* a Unity Catalog reachable through the CONNECTION named by `CATALOG_CONNECTION` and a createVirtualSchema request whose `CATALOG_KIND` is `UNITY_CATALOG` and whose `NAMESPACE` property names a `catalog.schema`
 * *WHEN* Exasol sends the createVirtualSchema request
-* *THEN* the adapter SHALL list every table in that schema by calling the shared `CatalogClient` list operation on the constructed Unity Catalog client, and SHALL return one virtual table per listed PLANNABLE BASE table: an entry whose `table_type` is `MANAGED`, `EXTERNAL`, `MANAGED_SHALLOW_CLONE`, or `EXTERNAL_SHALLOW_CLONE` AND whose `data_source_format` is `DELTA` or `PARQUET`
+* *THEN* the adapter SHALL list every table in that schema by calling the shared `CatalogClient` list operation on the constructed Unity Catalog client, and SHALL return one virtual table per listed PLANNABLE BASE table: an entry whose `table_type` is a base-table type AND whose `data_source_format` is `DELTA` or `PARQUET`
 * *AND* a `PARQUET` table SHALL declare every column Unity Catalog lists for it, its partition columns included, in the catalog's column order and mapped through the same type-mapping home as a Delta table's columns
 * *AND* the adapter SHALL exclude from the returned virtual tables every other listed entry (a view, a base table whose `data_source_format` is neither `DELTA` nor `PARQUET`, or an entry of any other `table_type`), so no identifier note is recorded for an excluded entry and no unplannable entry becomes a queryable virtual table
 
@@ -58,7 +57,7 @@ Enumerates a Unity Catalog namespace during createVirtualSchema and returns one 
 
 ### Scenario: Create virtual schema excludes every entry that is not a plannable base table and warns per exclusion
 
-* *GIVEN* a Unity Catalog namespace whose `GET /tables` list sweep returns three entries: a `VIEW` entry carrying columns, no `storage_location`, and a null `data_source_format`, a `MANAGED` entry whose `data_source_format` is neither `DELTA` nor `PARQUET` (such as `ICEBERG`, `CSV`, or `JSON`), and an entry whose `table_type` is none of `MANAGED`, `EXTERNAL`, `MANAGED_SHALLOW_CLONE`, `EXTERNAL_SHALLOW_CLONE`, or `VIEW`
+* *GIVEN* a Unity Catalog namespace whose `GET /tables` list sweep returns three entries: a `VIEW` entry carrying columns, no `storage_location`, and a null `data_source_format`, a `MANAGED` entry whose `data_source_format` is neither `DELTA` nor `PARQUET` (such as `ICEBERG`, `CSV`, or `JSON`), and an entry of any other `table_type` (such as `MATERIALIZED_VIEW`)
 * *WHEN* the adapter enumerates that namespace during createVirtualSchema
 * *THEN* the adapter SHALL exclude all three entries from the returned virtual tables, so no identifier note is recorded for them, and SHALL complete createVirtualSchema successfully with only the plannable base tables in the namespace
 * *AND* the adapter SHALL write one `udf_log!(ctx, warn, ...)` line per excluded entry naming the excluded `catalog.schema.table` identifier and the disqualifying reason: the entry's `table_type` for a view or other-type entry, or its `data_source_format` for an unplannable base table
