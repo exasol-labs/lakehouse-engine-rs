@@ -5,6 +5,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use arrow::array::{
@@ -419,6 +420,9 @@ async fn load_tpch() -> Result<()> {
     macro_rules! load_table {
         ($gen:ty, $build:path, $schema:path, $name:literal, $nfiles:expr) => {{
             let n: i32 = $nfiles;
+            let started = Instant::now();
+            // Per-file lines keep a redirected bench log moving while a big table generates (#87).
+            println!("  {:<9} generating {} file(s)", $name, n);
             let parts: Vec<Vec<RecordBatch>> = (1..=n)
                 .map(|part| {
                     let generator = <$gen>::new(scale, part, n);
@@ -431,6 +435,13 @@ async fn load_tpch() -> Result<()> {
                         }
                         batches.push($build(&rows));
                     }
+                    println!(
+                        "  {:<9} generated file {}/{} ({:.1?})",
+                        $name,
+                        part,
+                        n,
+                        started.elapsed()
+                    );
                     batches
                 })
                 .collect();
@@ -441,14 +452,15 @@ async fn load_tpch() -> Result<()> {
                     .await
                     .with_context(|| format!("load TPC-H table {}", $name))?;
             println!(
-                "  {:<9} {} ({} file(s))",
+                "  {:<9} {} ({} file(s), {:.1?})",
                 $name,
                 if wrote {
                     "loaded"
                 } else {
                     "skipped (already present)"
                 },
-                n
+                n,
+                started.elapsed()
             );
         }};
     }
