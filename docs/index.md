@@ -32,6 +32,7 @@ GROUP BY l_returnflag;
 | [Benchmark](benchmark.md) | The benchmark query set and how to run it yourself. |
 | [Architecture](architecture.md) | How cluster and DataFusion parallelism combine: file sharding, `GROUP BY shard_key` fan-out, and how pushdown meets parent-level Exasol execution. |
 | [Capabilities](capabilities.md) | Pushdown support matrix: what runs in DataFusion versus Exasol. |
+| [Capability matrix](capability-matrix.md) | Every Exasol Virtual Schema capability, and whether the adapter advertises it. |
 | [Tuning](tuning.md) | Configuration parameters reference and runtime telemetry. |
 | [Debugging pushdown](debugging-pushdown.md) | Use `EXPLAIN VIRTUAL` to inspect what the adapter pushes down for a query. |
 | [Semantic differences](semantic-differences.md) | Known cases where a pushed-down query returns a different result than native Exasol. |
