@@ -315,12 +315,12 @@ pub struct NestedField {
     pub nested: Option<NestedMembers>,
 }
 
-/// One name of an Iceberg `schema.name-mapping.default` entry, for files written without an
-/// embedded `PARQUET:field_id`. `fields` maps the struct members, list `element`, or map
-/// `key` and `value` beneath it.
+/// One Iceberg `schema.name-mapping.default` entry, for files written without an embedded
+/// `PARQUET:field_id`. `fields` maps the struct members, list `element`, or map `key` and
+/// `value` beneath it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NameMappingEntry {
-    pub name: String,
+    pub names: Vec<String>,
     pub field_id: i32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<NameMappingEntry>,

@@ -175,7 +175,7 @@ fn declared_physical_name_binds_the_renamed_physical_column() {
         },
     ];
     let name_mapping = vec![NameMappingEntry {
-        name: "col-abc".to_string(),
+        names: vec!["col-abc".to_string()],
         field_id: 7,
         fields: Vec::new(),
     }];

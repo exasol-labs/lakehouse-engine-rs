@@ -304,7 +304,9 @@ fn resolve_member(
 }
 
 fn mapping_entry<'a>(mapping: &'a [NameMappingEntry], name: &str) -> Option<&'a NameMappingEntry> {
-    mapping.iter().find(|entry| entry.name == name)
+    mapping
+        .iter()
+        .find(|entry| entry.names.iter().any(|candidate| candidate == name))
 }
 
 fn mapped<'a>(mapping: &'a [NameMappingEntry], name: &str) -> &'a [NameMappingEntry] {
@@ -1002,7 +1004,7 @@ fn bind_columns(
     };
     let mapping_by_physical_name: HashMap<&str, &NameMappingEntry> = mapping
         .iter()
-        .map(|entry| (entry.name.as_str(), entry))
+        .flat_map(|entry| entry.names.iter().map(move |name| (name.as_str(), entry)))
         .collect();
 
     let exact: Vec<Option<usize>> = physical

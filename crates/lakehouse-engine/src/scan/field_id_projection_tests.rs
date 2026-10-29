@@ -33,7 +33,7 @@ fn resolution_with_mapping(entries: &[(&str, i32)]) -> FieldIdResolution {
         name_mapping: entries
             .iter()
             .map(|(name, field_id)| NameMappingEntry {
-                name: (*name).to_string(),
+                names: vec![(*name).to_string()],
                 field_id: *field_id,
                 fields: Vec::new(),
             })
@@ -672,7 +672,7 @@ fn present_field_binds_real_value_not_default() {
     ]));
     let name_mapped = FieldIdResolution {
         name_mapping: vec![NameMappingEntry {
-            name: "score".to_string(),
+            names: vec!["score".to_string()],
             field_id: 2,
             fields: Vec::new(),
         }],
@@ -1318,7 +1318,7 @@ fn nested_members_without_field_ids_bind_through_the_mapping_scope() {
     use arrow::buffer::OffsetBuffer;
 
     let entry = |name: &str, field_id, fields| NameMappingEntry {
-        name: name.to_string(),
+        names: vec![name.to_string()],
         field_id,
         fields,
     };

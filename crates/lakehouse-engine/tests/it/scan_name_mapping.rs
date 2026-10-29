@@ -143,7 +143,7 @@ async fn run_scan(spec: &ScanSpec, register_url: &str) -> Result<Vec<RecordBatch
 
 fn mapping_entry(name: &str, field_id: i32) -> NameMappingEntry {
     NameMappingEntry {
-        name: name.to_string(),
+        names: vec![name.to_string()],
         field_id,
         fields: Vec::new(),
     }

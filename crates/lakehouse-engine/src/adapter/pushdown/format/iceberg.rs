@@ -277,7 +277,7 @@ async fn plan_checked_table(
     })
 }
 
-/// One entry per name at every depth; an entry without a `field-id` maps nothing and is skipped
+/// Keeps the mapping's own tree shape; an entry without a `field-id` maps nothing and is skipped
 /// with its children. A malformed property is a credential-free plan-time error (`serde_json`
 /// reports only a position).
 fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfError> {
@@ -290,21 +290,19 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
             iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING
         ))
     })?;
-    Ok(flatten_mapped_fields(mapping.fields()))
+    Ok(convert_mapped_fields(mapping.fields()))
 }
 
-fn flatten_mapped_fields<'a>(
+fn convert_mapped_fields<'a>(
     fields: impl IntoIterator<Item = &'a iceberg::spec::MappedField>,
 ) -> Vec<NameMappingEntry> {
     fields
         .into_iter()
-        .filter_map(|field| Some((field.field_id()?, field)))
-        .flat_map(|(field_id, field)| {
-            let children = flatten_mapped_fields(field.fields().iter().map(AsRef::as_ref));
-            field.names().iter().map(move |name| NameMappingEntry {
-                name: name.clone(),
-                field_id,
-                fields: children.clone(),
+        .filter_map(|field| {
+            Some(NameMappingEntry {
+                names: field.names().to_vec(),
+                field_id: field.field_id()?,
+                fields: convert_mapped_fields(field.fields().iter().map(AsRef::as_ref)),
             })
         })
         .collect()

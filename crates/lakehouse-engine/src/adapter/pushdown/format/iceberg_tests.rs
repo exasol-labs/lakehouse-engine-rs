@@ -92,17 +92,17 @@ async fn iceberg_reader_owns_resolution_and_keeps_its_encoding() {
         resolved.name_mapping,
         vec![
             NameMappingEntry {
-                name: "id".to_string(),
+                names: vec!["id".to_string()],
                 field_id: 1,
                 fields: Vec::new(),
             },
             NameMappingEntry {
-                name: "label".to_string(),
+                names: vec!["label".to_string()],
                 field_id: 2,
                 fields: Vec::new(),
             },
         ],
-        "the fixture's name-mapping property must flatten into the resolved scan"
+        "the fixture's name-mapping property must reach the resolved scan"
     );
     assert!(
         resolved.partition_columns.is_empty(),
@@ -740,23 +740,26 @@ fn resolves_name_mapping_entries_at_every_depth() {
 
     let entries = parse_name_mapping(Some(raw)).expect("valid name-mapping JSON must parse");
 
-    let leaf = |name: &str, field_id| NameMappingEntry {
-        name: name.to_string(),
-        field_id,
-        fields: Vec::new(),
-    };
+    let names = |names: &[&str]| names.iter().map(ToString::to_string).collect();
     assert_eq!(
         entries,
         vec![
-            leaf("id", 1),
-            leaf("record_id", 1),
             NameMappingEntry {
-                name: "location".to_string(),
+                names: names(&["id", "record_id"]),
+                field_id: 1,
+                fields: Vec::new(),
+            },
+            NameMappingEntry {
+                names: names(&["location"]),
                 field_id: 3,
-                fields: vec![leaf("latitude", 4), leaf("lat", 4)],
+                fields: vec![NameMappingEntry {
+                    names: names(&["latitude", "lat"]),
+                    field_id: 4,
+                    fields: Vec::new(),
+                }],
             },
         ],
-        "every name gets an entry at every depth; an id-less entry drops with its children"
+        "entries keep the mapping's shape at every depth; an id-less entry drops with its children"
     );
 }
 
