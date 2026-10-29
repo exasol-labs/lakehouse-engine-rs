@@ -737,7 +737,7 @@ fn join_build_side_is_dimension() {
     );
 }
 
-const CLUSTERED_ROW_GROUPS: i64 = 16;
+const CLUSTERED_ROW_GROUPS: i64 = 64;
 const CLUSTERED_ROWS_PER_GROUP: i64 = 64;
 
 /// Row group `g` holds only `o_custkey = g`, except the last, whose keys are all NULL.
@@ -810,37 +810,50 @@ fn selective_join_prunes_fact_row_groups_clustered_by_the_join_key() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     let orders = write_clustered_orders(dir);
-    let customer = write_keyed_customer(dir, "customer_selective", &[Some(3), Some(4), Some(5)]);
-    let spec = join_spec(
-        vec![orders],
-        vec![customer],
-        vec!["O_ORDERKEY", "C_NAME"],
-        None,
-        None,
-    );
+    // 30 keys exceed DataFusion's default 20-entry IN-list pruning limit, and the odd row groups
+    // between them sit inside the keys' min/max bounds, so only the key set can prune them.
+    let cases: [(&str, Vec<i64>); 2] = [
+        ("contiguous", vec![3, 4, 5]),
+        ("scattered", (0..30).map(|k| 2 * k).collect()),
+    ];
+    for (name, keys) in cases {
+        let dim_keys: Vec<Option<i64>> = keys.iter().copied().map(Some).collect();
+        let customer = write_keyed_customer(dir, &format!("customer_{name}"), &dim_keys);
+        let spec = join_spec(
+            vec![orders.clone()],
+            vec![customer],
+            vec!["O_ORDERKEY", "C_NAME"],
+            None,
+            None,
+        );
 
-    let (rows, pruned, rendered) = block_on(async {
-        let session = SessionContext::new_with_config(session_config_for_spec(&spec));
-        let plan =
-            build_join_physical_plan(&session, &spec, &scan_fixture::resolved_storage(&spec))
+        let (rows, pruned, rendered) = block_on(async {
+            let session = SessionContext::new_with_config(session_config_for_spec(&spec));
+            let plan =
+                build_join_physical_plan(&session, &spec, &scan_fixture::resolved_storage(&spec))
+                    .await
+                    .expect("physical plan must build");
+            let batches = collect(Arc::clone(&plan), session.task_ctx())
                 .await
-                .expect("physical plan must build");
-        let batches = collect(Arc::clone(&plan), session.task_ctx())
-            .await
-            .expect("join must execute");
-        (
-            total_rows(&batches),
-            sum_row_groups_pruned(plan.as_ref()),
-            displayable(plan.as_ref()).indent(true).to_string(),
-        )
-    });
+                .expect("join must execute");
+            (
+                total_rows(&batches),
+                sum_row_groups_pruned(plan.as_ref()),
+                displayable(plan.as_ref()).indent(true).to_string(),
+            )
+        });
 
-    assert_eq!(rows, 3 * CLUSTERED_ROWS_PER_GROUP as usize);
-    assert_eq!(
-        pruned,
-        CLUSTERED_ROW_GROUPS as usize - 3,
-        "every fact row group outside keys 3 to 5 must be pruned on statistics:\n{rendered}"
-    );
+        assert_eq!(
+            rows,
+            keys.len() * CLUSTERED_ROWS_PER_GROUP as usize,
+            "{name}"
+        );
+        assert_eq!(
+            pruned,
+            CLUSTERED_ROW_GROUPS as usize - keys.len(),
+            "{name}: every fact row group holding no dimension key must be pruned on statistics:\n{rendered}"
+        );
+    }
 }
 
 #[test]

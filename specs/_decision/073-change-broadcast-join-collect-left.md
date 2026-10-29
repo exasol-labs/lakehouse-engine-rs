@@ -24,3 +24,4 @@ The broadcast join scan collects the whole dimension side into one hash table (D
 
 - One thread builds the hash table. With a 272 MB dimension side the query still ran faster than with the partitioned build.
 - A fact table clustered by the join key gains the most: a selective join skipped 248 of 256 row groups and ran 6.5 times faster.
+- DataFusion pushes the key set only up to 150 distinct keys, and statistics pruning ignores an IN-list above 20 entries by default. Every scan table raises that pruning limit to 150, so a larger key set than 20 still prunes. Above 150 keys only the min/max bounds prune.

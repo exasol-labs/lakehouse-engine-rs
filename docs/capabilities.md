@@ -114,7 +114,7 @@ Exasol SQL combines these partial values into the final result.
 |---|---|---|
 | Inner equi-join | `JOIN`, `JOIN_TYPE_INNER`, `JOIN_CONDITION_EQUI` | `FROM a JOIN b ON a.id = b.id` |
 
-A two-table inner equi-join whose smaller side is at or below `JOIN_BROADCAST_MAX_BYTES` ([tuning](tuning.md)) is broadcast into every shard of the larger side, and DataFusion joins it there. The smaller side's join keys reach the larger side's scan, which skips every row group whose key range holds none of them. Broadcast also requires, among other conditions, no aggregation, sort keys that are projected columns, and a join condition and filter that DataFusion can render. Any other inner equi-join scans each table separately, and the adapter joins the scans in Exasol SQL.
+A two-table inner equi-join whose smaller side is at or below `JOIN_BROADCAST_MAX_BYTES` ([tuning](tuning.md)) is broadcast into every shard of the larger side, and DataFusion joins it there. The larger side's scan skips every row group whose key range lies outside the smaller side's join-key range. When the smaller side holds at most 150 distinct join keys, the scan also skips every row group that holds none of them. Broadcast also requires, among other conditions, no aggregation, sort keys that are projected columns, and a join condition and filter that DataFusion can render. Any other inner equi-join scans each table separately, and the adapter joins the scans in Exasol SQL.
 
 ## Handled by Exasol
 
