@@ -53,7 +53,8 @@ start() {
       compose up -d --wait seaweedfs iceberg-rest
       compose up -d spark-iceberg-fixtures
       ;;
-    lakekeeper) lakekeeper_start seaweedfs keycloak lakekeeper-db openfga-db openfga lakekeeper proxy ;;
+    # iceberg-rest holds the source tables of `make test-lakekeeper-local`.
+    lakekeeper) lakekeeper_start seaweedfs iceberg-rest keycloak lakekeeper-db openfga-db openfga lakekeeper proxy ;;
     azure) lakekeeper_start keycloak lakekeeper-db openfga-db openfga lakekeeper proxy ;;
     unity)
       compose up -d exasol
@@ -70,7 +71,7 @@ wait_healthy() {
       compose up -d --wait exasol proxy
       await_exit spark-iceberg-fixtures
       ;;
-    lakekeeper) compose up -d --wait exasol seaweedfs keycloak lakekeeper-db openfga-db openfga lakekeeper proxy ;;
+    lakekeeper) compose up -d --wait exasol seaweedfs iceberg-rest keycloak lakekeeper-db openfga-db openfga lakekeeper proxy ;;
     azure) compose up -d --wait exasol keycloak lakekeeper-db openfga-db openfga lakekeeper proxy ;;
     unity) compose up -d --wait exasol ;;
     glue) compose up -d --wait exasol proxy ;;

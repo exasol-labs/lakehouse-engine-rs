@@ -1,13 +1,10 @@
 # Overlay on docker-compose.yml. Lakekeeper enforces permissions through OpenFGA
 # (LAKEKEEPER__AUTHZ_BACKEND=openfga). One-shots run first and in this order, because
-# `lakekeeper migrate` writes the authorization model into OpenFGA:
-#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up openfga-migrate
-#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up lakekeeper-migrate
-#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
-#     seaweedfs exasol keycloak lakekeeper-db openfga-db openfga lakekeeper proxy
+# `lakekeeper migrate` writes the authorization model into OpenFGA. `make lakekeeper-up`
+# runs them in that order (scripts/e2e-stack.sh).
 # Lakekeeper does not rebuild ownership or grants when its authz backend changes after
 # bootstrap, so a stack persisted from the earlier `allowall` overlay needs
-# `docker compose ... down -v` once.
+# `make lakekeeper-down` once.
 
 services:
   keycloak:
