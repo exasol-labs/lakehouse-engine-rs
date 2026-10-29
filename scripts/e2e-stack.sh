@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Starts, waits for, or stops one E2E stack. `start` does not wait for Exasol,
-# so CI compiles the suite while Exasol boots and runs `wait` afterwards.
+# `start` does not wait for Exasol, so CI compiles the suite while Exasol boots
+# and runs `wait` afterwards.
 set -euo pipefail
 
 usage() {

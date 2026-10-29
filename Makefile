@@ -68,8 +68,8 @@ export LH_BUCKETFS_PORT
 export LH_SEAWEEDFS_PORT
 export LH_REST_PORT
 
-# `<stack>-up` is `<stack>-start` then `<stack>-wait`; CI runs the two apart to
-# compile the suite while Exasol boots. No test-e2e* target starts its stack.
+# No test-e2e* target starts its stack, so CI can compile the suite between
+# `<stack>-start` and `<stack>-wait` while Exasol boots.
 E2E_STACKS := e2e lakekeeper azure unity glue
 
 $(addsuffix -start,$(E2E_STACKS)): %-start:

@@ -33,7 +33,6 @@ runs:
         name: lakehouse-engine-so-x86_64
         path: target/release/
 
-    # A missing or stale .so then fails the job instead of rebuilding for ~15 min (#341).
     - name: Forbid make from rebuilding the .so
       shell: bash
       run: echo "REBUILD_SO=0" >> "$GITHUB_ENV"
