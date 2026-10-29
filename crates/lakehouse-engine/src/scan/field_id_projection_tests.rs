@@ -318,8 +318,9 @@ fn embedded_field_id_wins_over_name_mapping() {
     );
 }
 
+/// Scenario: A column is never bound by name to a field-id-bound logical field
 #[test]
-fn no_name_mapping_falls_back_to_physical_name() {
+fn a_file_without_field_ids_binds_only_what_the_mapping_covers() {
     let logical = Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("rating", DataType::Int64, true, 2),
@@ -329,42 +330,55 @@ fn no_name_mapping_falls_back_to_physical_name() {
         field_no_id("rating", DataType::Int64, true),
     ]);
 
+    for (resolution, case) in [
+        (bare_resolution(), "without a mapping"),
+        (resolution_with_mapping(&[("id", 1)]), "with a mapping"),
+    ] {
+        let binding = bind_columns(&logical, &physical, &resolution);
+        assert!(
+            binding.bound_logical_names.is_empty(),
+            "{case}, a same-named column without a field id must bind nothing"
+        );
+        assert_ne!(binding.renamed_physical.field(1).name(), "rating", "{case}");
+    }
+}
+
+/// Scenario: A column is never bound by name to a field-id-bound logical field
+#[test]
+fn a_reused_name_under_a_dropped_field_id_binds_nothing() {
+    let logical = Schema::new(vec![field_with_id("note", DataType::Utf8, true, 8)]);
+    let physical = Schema::new(vec![field_with_id("note", DataType::Utf8, true, 2)]);
+
     let binding = bind_columns(&logical, &physical, &bare_resolution());
 
-    assert_eq!(
-        binding.renamed_physical.field(0).name(),
-        "score",
-        "no mapping must keep the physical name"
-    );
-    assert_eq!(
-        binding.bound_logical_names,
-        std::iter::once("rating".to_string()).collect(),
-        "only the kept name matching a logical field binds"
+    assert!(
+        binding.bound_logical_names.is_empty(),
+        "the dropped field's column must not bind the re-added one"
     );
 }
 
+/// Scenario: A column is never bound by name to a field-id-bound logical field
 #[test]
-fn uncovered_name_mapping_falls_back_to_physical_name() {
+fn a_field_id_at_any_depth_disables_the_name_mapping() {
     let logical = Schema::new(vec![
-        field_with_id("id", DataType::Int64, false, 1),
         field_with_id("rating", DataType::Int64, true, 2),
+        field_with_id("info", DataType::Utf8, true, 3),
     ]);
-    let physical = Schema::new(vec![field_no_id("unknown", DataType::Int64, true)]);
+    let member = Fields::from(vec![field_with_id("code", DataType::Utf8, true, 4)]);
+    let physical = Schema::new(vec![
+        field_no_id("score", DataType::Int64, true),
+        field_no_id("info", DataType::Struct(member), true),
+    ]);
 
     let binding = bind_columns(
         &logical,
         &physical,
-        &resolution_with_mapping(&[("score", 2)]),
+        &resolution_with_mapping(&[("score", 2), ("info", 3)]),
     );
 
-    assert_eq!(
-        binding.renamed_physical.field(0).name(),
-        "unknown",
-        "uncovered field must keep the physical name"
-    );
     assert!(
         binding.bound_logical_names.is_empty(),
-        "a physical field matching no logical name binds nothing"
+        "a file carrying a nested field id is read by field id alone, as iceberg-java's hasIds"
     );
 }
 
@@ -466,7 +480,7 @@ fn identity_bound_fields_bind_by_their_own_name() {
 }
 
 #[test]
-fn field_id_adapter_falls_back_to_name_without_field_id() {
+fn field_id_adapter_null_fills_a_same_named_column_without_field_id() {
     let logical = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("rating", DataType::Int64, true, 2),
@@ -477,19 +491,10 @@ fn field_id_adapter_falls_back_to_name_without_field_id() {
     ]));
 
     let result = rewrite(logical, physical, Column::new("rating", 1)).expect("rewrite ok");
-    let bound_index = result
-        .downcast_ref::<Column>()
-        .map(Column::index)
-        .or_else(|| {
-            result
-                .downcast_ref::<CastExpr>()
-                .and_then(|c| c.expr().downcast_ref::<Column>())
-                .map(Column::index)
-        });
     assert_eq!(
-        bound_index,
-        Some(1),
-        "name fallback must bind to the `rating` slot"
+        literal_value(&result),
+        Some(ScalarValue::Int64(None)),
+        "a column bound by neither field id nor mapping reads NULL, never the same-named column"
     );
 }
 
@@ -662,7 +667,7 @@ fn present_field_binds_real_value_not_default() {
     assert_eq!(col.index(), 1, "must bind the physical field-id-2 slot");
 
     let physical = Arc::new(Schema::new(vec![
-        field_with_id("id", DataType::Int64, false, 1),
+        field_no_id("id", DataType::Int64, false),
         field_no_id("score", DataType::Int64, true),
     ]));
     let name_mapped = FieldIdResolution {
@@ -702,15 +707,11 @@ fn present_field_binds_real_value_not_default() {
     )
     .expect("rewrite ok");
     assert_eq!(
-        bound_physical_index(&result).expect(
-            "a column the file supplies under the logical name must bind its real \
-             value, never a default Literal"
-        ),
-        1,
-        "the physical-name fallback must bind the rating slot"
+        literal_value(&result),
+        Some(ScalarValue::Int64(Some(999))),
+        "a same-named column without the field id leaves the field absent"
     );
 
-    // An embedded id no logical field claims: the physical name still supplies the column.
     let physical = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("rating", DataType::Int64, true, 99),
@@ -719,12 +720,9 @@ fn present_field_binds_real_value_not_default() {
     let result =
         rewrite_with(logical, physical, resolution, Column::new("rating", 1)).expect("rewrite ok");
     assert_eq!(
-        bound_physical_index(&result).expect(
-            "a column the file supplies under an unknown embedded field-id must bind \
-             its real value, never a default Literal"
-        ),
-        1,
-        "an unknown embedded id must still bind the rating slot"
+        literal_value(&result),
+        Some(ScalarValue::Int64(Some(999))),
+        "a same-named column under an unknown field id leaves the field absent"
     );
 }
 
@@ -1331,7 +1329,7 @@ fn nested_members_without_field_ids_bind_through_the_mapping_scope() {
             utf8("Main St"),
         ),
         (
-            Arc::new(field_with_id("town", DataType::Utf8, true, 12)),
+            Arc::new(field_no_id("town", DataType::Utf8, true)),
             utf8("Berlin"),
         ),
         (
@@ -1366,7 +1364,7 @@ fn nested_members_without_field_ids_bind_through_the_mapping_scope() {
             entry(
                 "addr_old",
                 10,
-                vec![entry("street_v2", 11, vec![]), entry("town", 13, vec![])],
+                vec![entry("street_v2", 11, vec![]), entry("town", 12, vec![])],
             ),
             entry(
                 "tags",
@@ -1411,9 +1409,9 @@ fn nested_members_without_field_ids_bind_through_the_mapping_scope() {
 
     assert_eq!(
         rendered("addr", &addr_physical),
-        r#"{"street":"Main St","city":"Berlin","zip":null,"note":"n"}"#,
-        "a mapped member binds by its mapped id, an embedded id wins over the mapping, \
-         and an unmapped member binds by name"
+        r#"{"street":"Main St","city":"Berlin","zip":null,"note":null}"#,
+        "a mapped member binds by its mapped id, and an unmapped member binds nothing, not even \
+         the same-named logical member"
     );
     assert_eq!(
         rendered("tags", &tags_physical),

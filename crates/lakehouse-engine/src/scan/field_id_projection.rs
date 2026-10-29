@@ -54,6 +54,8 @@ struct PhysicalKeys<'a> {
     mapped_field_id: Option<i32>,
 }
 
+/// A field-id-bound logical field never binds by name: Iceberg "Column Projection" selects
+/// columns by field id, so a dropped column's reused name must not bind the re-added one.
 fn claim_logical(physical: PhysicalKeys<'_>, logical: &[BindingKeys<'_>]) -> Option<usize> {
     let with_field_id = |wanted: i32| {
         logical
@@ -68,11 +70,33 @@ fn claim_logical(physical: PhysicalKeys<'_>, logical: &[BindingKeys<'_>]) -> Opt
                 .iter()
                 .position(|keys| keys.physical_name == Some(physical.name))
         })
-        .or_else(|| match physical.embedded_id {
-            Some(_) => None,
-            None => physical.mapped_field_id.and_then(with_field_id),
+        .or_else(|| physical.mapped_field_id.and_then(with_field_id))
+        .or_else(|| {
+            logical
+                .iter()
+                .position(|keys| keys.binds_by_identity() && keys.name == physical.name)
         })
-        .or_else(|| logical.iter().position(|keys| keys.name == physical.name))
+}
+
+/// Moves an unclaimed field out of the logical names; no catalog declares a NUL-led name.
+const UNBOUND_PREFIX: &str = "\u{0}unbound:";
+
+/// Like iceberg-java's `ParquetSchemaUtil.hasIds`, one field id at any depth makes the whole
+/// file id-bound, so `schema.name-mapping.default` applies only to a file without any.
+fn carries_field_ids(fields: &Fields) -> bool {
+    fields.iter().any(|field| {
+        field_id_of(field).is_some()
+            || match field.data_type() {
+                DataType::Struct(children) => carries_field_ids(children),
+                DataType::List(element)
+                | DataType::LargeList(element)
+                | DataType::FixedSizeList(element, _)
+                | DataType::Map(element, _) => {
+                    carries_field_ids(&Fields::from(vec![Arc::clone(element)]))
+                }
+                _ => false,
+            }
+    })
 }
 
 /// Table and file columns equal only ignoring letter case, with no exact match to decide.
@@ -939,15 +963,15 @@ fn delegate_logical_schema(
     ))
 }
 
-/// Preserves field order, type, nullability, and metadata; an unclaimed field keeps its name
-/// and is never referenced, which is how a dropped column falls away. Claimed nested fields are
+/// Preserves field order, type, nullability, and metadata; an unclaimed field is never
+/// referenced, which is how a dropped column falls away. Claimed nested fields are
 /// also resolved by [`resolve_nested_field`].
 ///
 /// [`claim_by_case_fold`] then settles what only an identity field's letter case kept apart.
 ///
 /// Assumes post-rename logical names are unique among referenced fields and no two logical
-/// fields declare one physical name (guaranteed by Delta). A dropped column whose physical name
-/// was later reused is not disambiguated: name mapping keys CURRENT names.
+/// fields declare one physical name (guaranteed by Delta). In a file without field ids, a dropped
+/// column's reused name binds the current field, because name mapping keys CURRENT names.
 fn bind_columns(
     logical: &arrow::datatypes::Schema,
     physical: &arrow::datatypes::Schema,
@@ -972,8 +996,11 @@ fn bind_columns(
         })
         .collect();
 
-    let mapping_by_physical_name: HashMap<&str, &NameMappingEntry> = resolution
-        .name_mapping
+    let mapping: &[NameMappingEntry] = match carries_field_ids(physical.fields()) {
+        true => &[],
+        false => &resolution.name_mapping,
+    };
+    let mapping_by_physical_name: HashMap<&str, &NameMappingEntry> = mapping
         .iter()
         .map(|entry| (entry.name.as_str(), entry))
         .collect();
@@ -1005,7 +1032,16 @@ fn bind_columns(
         .map(|(physical_field, claimed)| {
             let physical_name = physical_field.name().as_str();
             let Some(logical_name) = claimed.map(|index| keys[index].name) else {
-                return Arc::clone(physical_field);
+                // The default adapter would otherwise bind an unclaimed field by its name.
+                return match keys.iter().any(|keys| keys.name == physical_name) {
+                    true => Arc::new(
+                        physical_field
+                            .as_ref()
+                            .clone()
+                            .with_name(format!("{UNBOUND_PREFIX}{physical_name}")),
+                    ),
+                    false => Arc::clone(physical_field),
+                };
             };
             if let Some(members) = resolution.nested_members.get(logical_name) {
                 nested.insert(

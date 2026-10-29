@@ -6,9 +6,10 @@ Binds each logical column of the scan spec's logical schema to a physical Parque
 
 * The logical schema is a list of `{field_id, name, arrow_type, nullable, initial_default}` tuples. The scan UDF registers its file-list table provider with that schema, tags each field with `PARQUET:field_id` metadata, and installs a `FieldIdExprAdapter`. The Parquet opener applies the adapter per file, so files with divergent physical layouts in one shard each bind correctly.
 * A logical field carries a field-id, a physical name, or neither. By field-id: Iceberg (always) and Delta `id` column mapping. By physical name: Delta `name` column mapping. By identity, matching the logical name itself: Delta `none` column mapping and every field of a direct-storage table. The Iceberg planning path populates a field-id on every logical field and never a physical name.
-* The adapter resolves each physical field in this order. (1) An embedded `PARQUET:field_id` matching a logical field's id is authoritative. A field carrying an id that no logical field declares keeps its physical name. (2) A logical field that declares this physical name claims it. (3) `schema.name-mapping.default` maps this physical name to a field-id present in the logical schema. (4) The physical name stays unchanged, which makes identity binding resolve. Steps (2) to (4) apply only to a field without an embedded field-id. Step (2) sits above the name-mapping because a per-column declaration from the table's own metadata is authoritative, while a name-mapping entry is a table-level fallback. A column whose value the file entry carries leaves that file's schema before binding, so no step binds it: see `scan-read-path/scan-execution-identity-partition-fill`.
+* The adapter resolves each physical field in this order. (1) An embedded `PARQUET:field_id` matching a logical field's id is authoritative. (2) A logical field that declares this physical name claims it. (3) `schema.name-mapping.default` maps this physical name to a field-id present in the logical schema. (4) A logical field carrying neither a field-id nor a physical name claims a physical field of its own name. A field-id-bound logical field binds only at steps (1) and (3), and a physical field that no step claims binds nothing. Step (2) sits above the name-mapping because a per-column declaration from the table's own metadata is authoritative, while a name-mapping entry is a table-level fallback. A column whose value the file entry carries leaves that file's schema before binding, so no step binds it: see `scan-read-path/scan-execution-identity-partition-fill`.
 * All three strategies wrap the same `DefaultPhysicalExprAdapterFactory` for type-divergence casts, per-file NULL-fill, and the required-absent error. Before it delegates, the adapter substitutes an absent field's `initial-default`. The VS resolves `schema.name-mapping.default`, each field's `initial-default`, and each file's `identity` partition values once per query, and the scan UDF never re-reads Iceberg table metadata.
-* The Iceberg table spec (`format/spec.md`, "Column Projection") nests the mapping: "`fields`: An optional list of field mappings for child field of structs, maps, and lists." "List types should contain a mapping in `fields` for `element`." "Map types should contain mappings in `fields` for `key` and `value`." A nested member resolves in the same order, against the entries beneath the entry that matched its parent's physical name. The mapping keys current names, so a name that a later schema change gave another field binds that field.
+* The Iceberg table spec (`format/spec.md`, "Column Projection") states "Columns in Iceberg data files are selected by field id", and the mapping provides "fallback field ids to be used when a data file does not contain field id information". As iceberg-java's `ParquetSchemaUtil.hasIds` decides, a file that embeds a field-id at any depth binds by field-id alone, and step (3) applies only to a file that embeds none. A file with neither field-ids nor a mapping reads every field-id-bound field as absent, per the rule "Return `null` in all other cases". iceberg-java instead assigns such a file positional ids, which the engine does not adopt.
+* The Iceberg table spec nests the mapping: "`fields`: An optional list of field mappings for child field of structs, maps, and lists." "List types should contain a mapping in `fields` for `element`." "Map types should contain mappings in `fields` for `key` and `value`." A nested member resolves in the same order, against the entries beneath the entry that matched its parent's physical name. The mapping keys current names, so a name that a later schema change gave another field binds that field.
 * `scan-read-path/scan-execution-field-id-projection-absent-fields` specifies absent-field resolution, including Iceberg Column Projection rule (1).
 
 ## Scenarios
@@ -29,16 +30,15 @@ Binds each logical column of the scan spec's logical schema to a physical Parque
 * *WHEN* the scan UDF reads that file
 * *THEN* the UDF SHALL resolve that logical column to the physical column named by the matching name-mapping entry, binding it to the field-id the mapping supplies
 * *AND* the emitted values for that column SHALL be the real physical values (never NULL) under the current logical name
-* *AND* an embedded `PARQUET:field_id` on a physical field SHALL take precedence over the name-mapping for that field (the name-mapping applies only to fields lacking an embedded field-id)
+* *AND* the name-mapping SHALL apply only to a file that embeds no `PARQUET:field_id` at any depth
 
-### Scenario: Field-id resolution falls back to physical name when no name-mapping resolves a file field without an embedded field-id
+### Scenario: A column is never bound by name to a field-id-bound logical field
 
-* *GIVEN* a scan spec whose logical schema carries field-ids
-* *AND* an assigned file whose physical fields carry no embedded `PARQUET:field_id`
-* *AND* either no `schema.name-mapping.default` is threaded into the spec, OR the threaded name-mapping does not map a given physical field's name to a field-id present in the logical schema
-* *WHEN* the scan UDF reads that file
-* *THEN* for each such unmapped physical field the UDF SHALL resolve the logical column to a physical column whose physical name equals the logical (current) name
-* *AND* this physical-name fallback SHALL remain unchanged from prior behavior for the no-name-mapping case and for any field the mapping does not cover
+* *GIVEN* an Iceberg table whose column and struct member were dropped and re-added under the same names after a native file was written, and whose `schema.name-mapping.default` omits a column and a struct member that a file without field ids holds under their current names
+* *WHEN* the scan reads both files
+* *THEN* the native file's dropped column and member SHALL bind nothing, and the re-added ones SHALL read NULL for its rows
+* *AND* the omitted column and member SHALL read NULL for the rows of the file without field ids
+* *AND* a file without field ids, read without a name-mapping, SHALL bind no field-id-bound column, so a required one fails with the required-absent error
 
 ### Scenario: A nested member of a file without field ids binds through the name mapping
 
@@ -47,14 +47,14 @@ Binds each logical column of the scan spec's logical schema to a physical Parque
 * *WHEN* the scan renders those nested columns from the imported file
 * *THEN* each renamed member SHALL bind to the field id of the mapping entry beneath its parent, and SHALL render its real values under its current name, never NULL
 * *AND* a list element SHALL descend through its parent's `element` entry, and a map key and value through the `key` and `value` entries, whatever names the file gives them
-* *AND* a member whose file name the mapping does not cover SHALL bind by its own name, and SHALL render NULL when no logical member carries that name
+* *AND* a member whose file name the mapping does not cover SHALL bind nothing
 
 ### Scenario: An embedded nested field id wins over the name mapping
 
 * *GIVEN* an Iceberg table with the imported file above and a natively written file, whose struct member embeds the field id of a member that was later renamed, under a name the mapping now gives a different member
 * *WHEN* the scan renders that struct from both files
 * *THEN* the native file's member SHALL bind by its embedded field id, and MUST NOT bind through the mapping
-* *AND* the mapping SHALL apply only to members without an embedded field id
+* *AND* the mapping SHALL apply only to files without any embedded field id
 
 ### Scenario: The VS resolves schema.name-mapping.default once per query into the scan spec
 

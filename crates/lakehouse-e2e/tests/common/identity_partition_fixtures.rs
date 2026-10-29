@@ -145,3 +145,35 @@ pub const NESTED_ROWS: [(i64, &str, &str, &str, &str); 3] = [
         r#"{"c":{"amt":30}}"#,
     ),
 ];
+
+/// Its hand-set mapping never maps `extra` or `info.memo`, and `note` and `info.tag` were dropped
+/// and re-added after id 1 was written.
+pub const PROJECTION_TABLE: &str = "projection_by_id";
+
+pub const PROJECTION_IMPORT_DIR: &str = "projection_by_id_source/";
+
+pub const PROJECTION_UNMAPPED: [&str; 2] = ["extra", "info.memo"];
+
+/// `(id, note, info, extra)`, `info` as the JSON a reader renders. Id 1 is native and holds the
+/// dropped `note` and `info.tag`. Id 2 is imported: the mapping binds its `note` and `tag` to the
+/// re-added fields, and nothing binds its `extra` and `memo`.
+pub const PROJECTION_ROWS: [(i64, Option<&str>, &str, Option<&str>); 3] = [
+    (
+        1,
+        None,
+        r#"{"code":"c1","memo":"m1","tag":null}"#,
+        Some("e1"),
+    ),
+    (
+        2,
+        Some("imported note"),
+        r#"{"code":"c2","memo":null,"tag":"t2"}"#,
+        None,
+    ),
+    (
+        3,
+        Some("n3"),
+        r#"{"code":"c3","memo":"m3","tag":"t3"}"#,
+        Some("e3"),
+    ),
+];

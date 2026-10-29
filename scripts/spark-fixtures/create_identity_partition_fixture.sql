@@ -30,6 +30,11 @@
 --     id 1  imported without field ids under the first names, which only the name mapping binds
 --     id 2  native before the renames, so its embedded ids bind it
 --     id 3  native after the renames
+--   projection_by_id     (id, note, info struct<code, tag, memo>, extra), unpartitioned, whose
+--                        hand-set name mapping omits extra and info.memo
+--     id 1  native, then note and info.tag are dropped and re-added, so both read NULL
+--     id 2  imported without field ids, so its unmapped extra and info.memo read NULL
+--     id 3  native after the drops
 
 CREATE NAMESPACE IF NOT EXISTS rest_catalog.e2e_lakehouse;
 
@@ -224,3 +229,46 @@ SELECT 3,
                     'geo', named_struct('lat', 41.9D), 'city', 'Roma'),
        array(named_struct('qty', 4)),
        map('c', named_struct('amt', 30));
+
+-- projection_by_id
+-- The mapping is set before add_files, which keeps an existing one, so it never maps `extra` or
+-- `info.memo`. `note` and `info.tag` are dropped and re-added after id 1 was written, so id 1's
+-- file holds both names under ids the current schema no longer has.
+
+DROP TABLE IF EXISTS rest_catalog.e2e_lakehouse.projection_by_id;
+
+CREATE TABLE rest_catalog.e2e_lakehouse.projection_by_id (
+  id INT,
+  note STRING,
+  info STRUCT<code: STRING, tag: STRING, memo: STRING>,
+  extra STRING
+)
+USING iceberg
+TBLPROPERTIES (
+  'format-version' = '2',
+  'schema.name-mapping.default' = '[{"field-id": 1, "names": ["id"]}, {"field-id": 2, "names": ["note"]}, {"field-id": 3, "names": ["info"], "fields": [{"field-id": 5, "names": ["code"]}, {"field-id": 6, "names": ["tag"]}]}]'
+);
+
+INSERT INTO rest_catalog.e2e_lakehouse.projection_by_id
+SELECT 1, 'old note', named_struct('code', 'c1', 'tag', 'old tag', 'memo', 'm1'), 'e1';
+
+INSERT OVERWRITE DIRECTORY 's3://warehouse/e2e_lakehouse/projection_by_id_source'
+USING parquet
+SELECT /*+ REPARTITION(1) */
+       2 AS id,
+       'imported note' AS note,
+       named_struct('code', 'c2', 'tag', 't2', 'memo', 'm2') AS info,
+       'e2' AS extra;
+
+CALL rest_catalog.system.add_files(
+  table => 'e2e_lakehouse.projection_by_id',
+  source_table => '`parquet`.`s3://warehouse/e2e_lakehouse/projection_by_id_source`'
+);
+
+ALTER TABLE rest_catalog.e2e_lakehouse.projection_by_id DROP COLUMN note;
+ALTER TABLE rest_catalog.e2e_lakehouse.projection_by_id ADD COLUMN note STRING;
+ALTER TABLE rest_catalog.e2e_lakehouse.projection_by_id DROP COLUMN info.tag;
+ALTER TABLE rest_catalog.e2e_lakehouse.projection_by_id ADD COLUMN info.tag STRING;
+
+INSERT INTO rest_catalog.e2e_lakehouse.projection_by_id
+SELECT 3, named_struct('code', 'c3', 'memo', 'm3', 'tag', 't3'), 'e3', 'n3';

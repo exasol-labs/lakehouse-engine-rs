@@ -33,7 +33,7 @@ Defines what the scan UDF emits for an Iceberg field that the file's own partiti
 * *GIVEN* an Iceberg table identity-partitioned on a nullable `region` column, whose `schema.name-mapping.default` maps `region`, with a data file that a metadata-only import registered under the partition value `eu`, holding a `region` column whose values are `us` and NULL
 * *AND* a natively written data file whose spec has no `identity` field on `region`, holding `region` under its field id
 * *WHEN* a query selects `id` and `region` through the virtual schema
-* *THEN* each row of the imported file SHALL carry `eu`, and MUST NOT carry the file's physical `region` values, whether the file binds `region` by field id, by name mapping, or by name
+* *THEN* each row of the imported file SHALL carry `eu`, and MUST NOT carry the file's physical `region` values, whether the file binds `region` by field id or by name mapping
 * *AND* each row of the natively written file SHALL carry the file's own `region` value, so the precedence is decided per file, from whether the file entry carries a value and never from the table format
 * *AND* a pushed-down filter on `region` SHALL compare the imported file's rows against `eu`, although plan-time pruning MAY skip that file by its `region` column metrics, which contradict its partition value, as Iceberg Java's metrics evaluator does
 

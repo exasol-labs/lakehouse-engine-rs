@@ -259,9 +259,11 @@ fn raw_spec_with_wide_logical_schema(
 }
 
 fn write_local_parquet(dir: &std::path::Path, relative: &str, rows: i64) -> String {
+    let field_id_meta =
+        |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
     let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, false),
+        Field::new("id", DataType::Int64, false).with_metadata(field_id_meta(1)),
+        Field::new("name", DataType::Utf8, false).with_metadata(field_id_meta(2)),
     ]));
     let path = dir.join(relative);
     if let Some(parent) = path.parent() {
@@ -303,10 +305,16 @@ fn write_wide_local_parquet(
         "the fixture's first two columns are id + name"
     );
     let fields: Vec<Field> = (0..columns)
-        .map(|i| match i {
-            0 => Field::new("id", DataType::Int64, false),
-            1 => Field::new("name", DataType::Utf8, false),
-            _ => Field::new(format!("c{i}"), DataType::Int64, false),
+        .map(|i| {
+            match i {
+                0 => Field::new("id", DataType::Int64, false),
+                1 => Field::new("name", DataType::Utf8, false),
+                _ => Field::new(format!("c{i}"), DataType::Int64, false),
+            }
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                (i + 1).to_string(),
+            )]))
         })
         .collect();
     let schema = Arc::new(Schema::new(fields));
