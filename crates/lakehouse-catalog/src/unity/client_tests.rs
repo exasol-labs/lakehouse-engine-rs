@@ -151,7 +151,8 @@ async fn includes_managed_and_external_delta_base_tables() {
     let body = r#"{"tables":[
         {"name":"orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://bucket/orders","columns":[]},
         {"name":"external_orders","table_type":"EXTERNAL","data_source_format":"DELTA","storage_location":"s3://bucket/external_orders","columns":[]},
-        {"name":"orders_clone","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://bucket/orders_clone","columns":[]}
+        {"name":"orders_clone","table_type":"MANAGED_SHALLOW_CLONE","data_source_format":"DELTA","storage_location":"s3://bucket/orders_clone","columns":[]},
+        {"name":"external_orders_clone","table_type":"EXTERNAL_SHALLOW_CLONE","data_source_format":"DELTA","storage_location":"s3://bucket/external_orders_clone","columns":[]}
     ]}"#
     .to_string();
     let server = spawn(move |_req| (200, body.clone())).await;
@@ -164,7 +165,7 @@ async fn includes_managed_and_external_delta_base_tables() {
 
     assert!(
         listing.skipped.is_empty(),
-        "every MANAGED/EXTERNAL DELTA entry admits as a Delta base table"
+        "every MANAGED/EXTERNAL DELTA entry, shallow clones included, admits as a Delta base table"
     );
     assert_eq!(
         listing
@@ -172,8 +173,13 @@ async fn includes_managed_and_external_delta_base_tables() {
             .iter()
             .map(|table| table.ident.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["orders", "external_orders", "orders_clone"],
-        "the MANAGED, EXTERNAL, and shallow-clone-shaped entries are all returned"
+        vec![
+            "orders",
+            "external_orders",
+            "orders_clone",
+            "external_orders_clone"
+        ],
+        "the MANAGED, EXTERNAL, MANAGED_SHALLOW_CLONE, and EXTERNAL_SHALLOW_CLONE entries are all returned"
     );
     for table in &listing.tables {
         assert_eq!(table.table_type, CatalogTableType::Table);
@@ -805,15 +811,19 @@ fn admission_admits_delta_and_parquet_base_tables_and_names_every_refusal() {
     let mut cases = vec![
         ("MANAGED", Some("DELTA"), Ok(TableFormat::Delta)),
         ("EXTERNAL", Some("PARQUET"), Ok(TableFormat::Parquet)),
+        (
+            "MANAGED_SHALLOW_CLONE",
+            Some("DELTA"),
+            Ok(TableFormat::Delta),
+        ),
+        (
+            "EXTERNAL_SHALLOW_CLONE",
+            Some("DELTA"),
+            Ok(TableFormat::Delta),
+        ),
         ("MANAGED", None, skip("data_source_format=absent")),
     ];
-    for raw in [
-        "VIEW",
-        "MATERIALIZED_VIEW",
-        "STREAMING_TABLE",
-        "FOREIGN",
-        "MANAGED_SHALLOW_CLONE",
-    ] {
+    for raw in ["VIEW", "MATERIALIZED_VIEW", "STREAMING_TABLE", "FOREIGN"] {
         cases.push((raw, Some("DELTA"), skip(&format!("table_type={raw}"))));
     }
     for format in ["ICEBERG", "CSV", "delta", "Delta", "parquet", "Parquet"] {

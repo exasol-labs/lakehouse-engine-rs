@@ -313,9 +313,13 @@ fn neutral_column(column: ColumnInfo) -> CatalogColumn {
     )
 }
 
+/// Databricks reports a shallow clone under its own `table_type`; it is a Delta base table whose
+/// log addresses the source's data files by absolute URI (#332).
 fn neutral_table_type(raw: &str) -> CatalogTableType {
     match raw {
-        "MANAGED" | "EXTERNAL" => CatalogTableType::Table,
+        "MANAGED" | "EXTERNAL" | "MANAGED_SHALLOW_CLONE" | "EXTERNAL_SHALLOW_CLONE" => {
+            CatalogTableType::Table
+        }
         "VIEW" => CatalogTableType::View,
         other => CatalogTableType::Other(other.to_string()),
     }

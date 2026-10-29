@@ -170,7 +170,6 @@ fn view_entry(name: &str, columns: Vec<Json>) -> Json {
     })
 }
 
-/// Also the wire shape of a shallow clone: Unity Catalog carries no clone marker.
 fn table_entry_typed(name: &str, table_type: &str, columns: Vec<Json>) -> Json {
     json!({
         "name": name,
@@ -348,7 +347,16 @@ fn lists_managed_external_shallow_clone_and_parquet_base_tables() {
         let entries = vec![
             table_entry_typed("orders", "MANAGED", vec![long_col("id")]),
             table_entry_typed("customers", "EXTERNAL", vec![long_col("id")]),
-            table_entry_typed("orders_clone", "MANAGED", vec![long_col("id")]),
+            table_entry_typed(
+                "orders_clone",
+                "MANAGED_SHALLOW_CLONE",
+                vec![long_col("id")],
+            ),
+            table_entry_typed(
+                "customers_clone",
+                "EXTERNAL_SHALLOW_CLONE",
+                vec![long_col("id")],
+            ),
             raw_events,
         ];
         (200, tables_page(entries, None))
@@ -362,12 +370,13 @@ fn lists_managed_external_shallow_clone_and_parquet_base_tables() {
         .collect();
     assert_eq!(
         names.len(),
-        4,
-        "MANAGED, EXTERNAL, shallow-clone-shaped Delta and PARQUET base tables are all listed"
+        5,
+        "MANAGED, EXTERNAL, both shallow-clone Delta and PARQUET base tables are all listed"
     );
     assert!(names.contains(&"ORDERS"));
     assert!(names.contains(&"CUSTOMERS"));
     assert!(names.contains(&"ORDERS_CLONE"));
+    assert!(names.contains(&"CUSTOMERS_CLONE"));
     assert_eq!(
         table_named(&response, "RAW_EVENTS")["columns"]
             .as_array()
