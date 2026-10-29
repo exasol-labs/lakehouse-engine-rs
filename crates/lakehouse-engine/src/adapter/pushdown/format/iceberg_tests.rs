@@ -92,15 +92,17 @@ async fn iceberg_reader_owns_resolution_and_keeps_its_encoding() {
         resolved.name_mapping,
         vec![
             NameMappingEntry {
-                name: "id".to_string(),
+                names: vec!["id".to_string()],
                 field_id: 1,
+                fields: Vec::new(),
             },
             NameMappingEntry {
-                name: "label".to_string(),
+                names: vec!["label".to_string()],
                 field_id: 2,
+                fields: Vec::new(),
             },
         ],
-        "the fixture's name-mapping property must flatten into the resolved scan"
+        "the fixture's name-mapping property must reach the resolved scan"
     );
     assert!(
         resolved.partition_columns.is_empty(),
@@ -720,7 +722,7 @@ fn an_unreadable_identity_value_fails_planning_naming_the_column() {
 }
 
 #[test]
-fn resolves_name_mapping_flat_entries_once() {
+fn resolves_name_mapping_entries_at_every_depth() {
     let raw = r#"
     [
         { "field-id": 1, "names": ["id", "record_id"] },
@@ -729,7 +731,7 @@ fn resolves_name_mapping_flat_entries_once() {
             "names": ["location"],
             "fields": [
                 { "field-id": 4, "names": ["latitude", "lat"] },
-                { "field-id": 5, "names": ["longitude", "long"] }
+                { "names": ["schema_only_child"], "fields": [{ "field-id": 9, "names": ["x"] }] }
             ]
         },
         { "names": ["schema_only_no_field_id"] }
@@ -738,25 +740,26 @@ fn resolves_name_mapping_flat_entries_once() {
 
     let entries = parse_name_mapping(Some(raw)).expect("valid name-mapping JSON must parse");
 
+    let names = |names: &[&str]| names.iter().map(ToString::to_string).collect();
     assert_eq!(
         entries,
         vec![
             NameMappingEntry {
-                name: "id".to_string(),
+                names: names(&["id", "record_id"]),
                 field_id: 1,
+                fields: Vec::new(),
             },
             NameMappingEntry {
-                name: "record_id".to_string(),
-                field_id: 1,
-            },
-            NameMappingEntry {
-                name: "location".to_string(),
+                names: names(&["location"]),
                 field_id: 3,
+                fields: vec![NameMappingEntry {
+                    names: names(&["latitude", "lat"]),
+                    field_id: 4,
+                    fields: Vec::new(),
+                }],
             },
         ],
-        "multi-name entry expands per name; nested `fields` children (lat/lat, \
-         long/long) are excluded while the parent's own top-level name is kept; \
-         the id-less entry is fully excluded"
+        "entries keep the mapping's shape at every depth; an id-less entry drops with its children"
     );
 }
 

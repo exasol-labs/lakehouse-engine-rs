@@ -315,12 +315,15 @@ pub struct NestedField {
     pub nested: Option<NestedMembers>,
 }
 
-/// One flattened top-level entry of Iceberg's `schema.name-mapping.default`, for files written
-/// without an embedded `PARQUET:field_id`. Nested entries are never parsed (issue #28).
+/// One Iceberg `schema.name-mapping.default` entry, for files written without an embedded
+/// `PARQUET:field_id`. `fields` maps the struct members, list `element`, or map `key` and
+/// `value` beneath it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NameMappingEntry {
-    pub name: String,
+    pub names: Vec<String>,
     pub field_id: i32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<NameMappingEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -808,7 +811,7 @@ pub struct CommonScanSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub logical_schema: Vec<LogicalField>,
 
-    /// Flattened `schema.name-mapping.default` entries.
+    /// `schema.name-mapping.default` entries, one per name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub name_mapping: Vec<NameMappingEntry>,
 

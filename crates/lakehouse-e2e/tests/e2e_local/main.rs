@@ -15,6 +15,7 @@ mod harness_row_cap;
 mod identity_partition;
 mod int96_timestamp;
 mod join;
+mod name_mapping;
 mod non_ascii_identifier;
 mod positional_deletes;
 mod property_validation;

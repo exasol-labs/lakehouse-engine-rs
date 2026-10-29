@@ -25,17 +25,23 @@ use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
-/// `(path, footer column names)` of every data file the table's current snapshot plans.
-fn planned_footers(table: &str) -> Vec<(String, Vec<String>)> {
-    let tasks: Vec<_> = runtime().block_on(async {
+pub(crate) fn load_table(table: &str) -> iceberg::table::Table {
+    runtime().block_on(async {
         let catalog = build_seed_catalog(&iceberg_catalog_url(), "s3://warehouse/", "identity")
             .await
             .unwrap_or_else(|e| panic!("connect to the Iceberg REST catalog for {table}: {e:#}"));
         let ident = TableIdent::new(NamespaceIdent::new(NAMESPACE.into()), table.into());
-        let loaded = catalog
+        catalog
             .load_table(&ident)
             .await
-            .unwrap_or_else(|e| panic!("load {NAMESPACE}.{table}: {e}"));
+            .unwrap_or_else(|e| panic!("load {NAMESPACE}.{table}: {e}"))
+    })
+}
+
+/// `(path, footer column names)` of every data file the table's current snapshot plans.
+pub(crate) fn planned_footers(table: &str) -> Vec<(String, Vec<String>)> {
+    let loaded = load_table(table);
+    let tasks: Vec<_> = runtime().block_on(async {
         let scan = loaded
             .scan()
             .select_all()

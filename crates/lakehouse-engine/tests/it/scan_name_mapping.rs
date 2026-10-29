@@ -116,7 +116,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-async fn run_scan(spec: &ScanSpec, register_url: &str) -> Vec<RecordBatch> {
+async fn run_scan(spec: &ScanSpec, register_url: &str) -> Result<Vec<RecordBatch>, String> {
     let session = datafusion::execution::context::SessionContext::new_with_config(
         session_config_for_spec(spec),
     );
@@ -137,8 +137,16 @@ async fn run_scan(spec: &ScanSpec, register_url: &str) -> Vec<RecordBatch> {
         &mut timers,
     )
     .await
-    .expect("raw scan must succeed");
-    ctx.into_batches()
+    .map_err(|e| e.to_string())?;
+    Ok(ctx.into_batches())
+}
+
+fn mapping_entry(name: &str, field_id: i32) -> NameMappingEntry {
+    NameMappingEntry {
+        names: vec![name.to_string()],
+        field_id,
+        fields: Vec::new(),
+    }
 }
 
 fn id_to_new_col(batches: &[RecordBatch]) -> HashMap<i64, Option<i64>> {
@@ -185,13 +193,10 @@ fn name_mapping_resolves_no_field_id_column() {
         file_url.clone(),
         file_size,
         logical_schema(),
-        vec![NameMappingEntry {
-            name: "old_col".to_string(),
-            field_id: 2,
-        }],
+        vec![mapping_entry("id", 1), mapping_entry("old_col", 2)],
     );
 
-    let batches = block_on(run_scan(&spec, &file_url));
+    let batches = block_on(run_scan(&spec, &file_url)).expect("raw scan must succeed");
     let by_id = id_to_new_col(&batches);
     assert_eq!(by_id.len(), rows as usize, "row count");
 
@@ -204,27 +209,46 @@ fn name_mapping_resolves_no_field_id_column() {
     }
 }
 
+/// Scenario: A column is never bound by name to a field-id-bound logical field
 #[test]
-fn empty_name_mapping_preserves_physical_name_binding() {
+fn a_same_named_column_the_mapping_omits_reads_null() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     let rows = 30;
-    let file_url = write_local_parquet_two_int_cols(dir, "identity.parquet", "id", "new_col", rows);
+    let file_url = write_local_parquet_two_int_cols(dir, "omitted.parquet", "id", "new_col", rows);
+    let file_size = std::fs::metadata(file_url.strip_prefix("file://").unwrap())
+        .expect("stat parquet")
+        .len();
+
+    let spec = name_mapping_spec(
+        file_url.clone(),
+        file_size,
+        logical_schema(),
+        vec![mapping_entry("id", 1)],
+    );
+
+    let batches = block_on(run_scan(&spec, &file_url)).expect("raw scan must succeed");
+    let by_id = id_to_new_col(&batches);
+    assert_eq!(by_id.len(), rows as usize, "row count");
+    assert!(
+        by_id.values().all(Option::is_none),
+        "NEW_COL must read NULL, never the file's same-named column the mapping omits"
+    );
+}
+
+/// Scenario: A column is never bound by name to a field-id-bound logical field
+#[test]
+fn a_file_without_field_ids_or_a_mapping_fails_a_required_column() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let file_url = write_local_parquet_two_int_cols(dir, "unmapped.parquet", "id", "new_col", 3);
     let file_size = std::fs::metadata(file_url.strip_prefix("file://").unwrap())
         .expect("stat parquet")
         .len();
 
     let spec = name_mapping_spec(file_url.clone(), file_size, logical_schema(), vec![]);
 
-    let batches = block_on(run_scan(&spec, &file_url));
-    let by_id = id_to_new_col(&batches);
-    assert_eq!(by_id.len(), rows as usize, "row count");
-
-    for (id, value) in &by_id {
-        assert_eq!(
-            *value,
-            Some(id * 10),
-            "row {id}: physical-name fallback must still bind NEW_COL correctly with an empty name_mapping"
-        );
-    }
+    let error = block_on(run_scan(&spec, &file_url))
+        .expect_err("the required `id` must not bind the file's same-named column");
+    assert!(error.contains("'id'"), "{error}");
 }

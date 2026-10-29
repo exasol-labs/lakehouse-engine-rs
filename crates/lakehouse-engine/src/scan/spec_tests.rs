@@ -672,12 +672,18 @@ fn name_mapping_round_trips_and_defaults_to_empty() {
     let mut spec = sample_spec();
     spec.common.name_mapping = vec![
         NameMappingEntry {
-            name: "id".to_string(),
+            names: vec!["id".to_string(), "record_id".to_string()],
             field_id: 1,
+            fields: Vec::new(),
         },
         NameMappingEntry {
-            name: "rating".to_string(),
-            field_id: 2,
+            names: vec!["addr".to_string()],
+            field_id: 3,
+            fields: vec![NameMappingEntry {
+                names: vec!["rating".to_string()],
+                field_id: 2,
+                fields: Vec::new(),
+            }],
         },
     ];
     let json = spec.to_json();
@@ -686,14 +692,11 @@ fn name_mapping_round_trips_and_defaults_to_empty() {
         json.contains("name_mapping"),
         "non-empty name_mapping must appear in JSON: {json}"
     );
-
-    let back = ScanSpec::from_json(&json).unwrap();
-    let entries = &back.common.name_mapping;
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].name, "id");
-    assert_eq!(entries[0].field_id, 1);
-    assert_eq!(entries[1].name, "rating");
-    assert_eq!(entries[1].field_id, 2);
+    assert_eq!(
+        ScanSpec::from_json(&json).unwrap().common.name_mapping,
+        spec.common.name_mapping,
+        "entries must round-trip with every name and nested member"
+    );
 
     let row_spec = sample_spec();
     assert!(row_spec.common.name_mapping.is_empty());

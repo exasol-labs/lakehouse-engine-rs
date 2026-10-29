@@ -43,6 +43,8 @@ pub mod lakekeeper;
 #[cfg(feature = "lakekeeper-e2e")]
 pub mod lakekeeper_authz;
 #[cfg(feature = "exasol-e2e")]
+pub mod name_mapping_fixtures;
+#[cfg(feature = "exasol-e2e")]
 pub mod pos_delete_fixtures;
 #[cfg(any(feature = "exasol-e2e", feature = "unity-e2e"))]
 pub mod pruning_cases;

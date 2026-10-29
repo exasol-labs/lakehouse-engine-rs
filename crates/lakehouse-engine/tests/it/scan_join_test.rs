@@ -23,7 +23,7 @@ use lakehouse_engine::scan::{
     build_join_physical_plan, run_join_scan_with_session, session_config_for_spec,
 };
 
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::file::properties::WriterProperties;
 
 use crate::scan_plan_shape::sum_row_groups_pruned;
@@ -55,10 +55,12 @@ fn sized(url: String) -> (String, u64) {
 
 /// Column names are disjoint from the dimension side (the VS disjoint-column guarantee).
 fn write_orders(dir: &std::path::Path) -> (String, u64) {
+    let field_id_meta =
+        |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
     let schema = Arc::new(Schema::new(vec![
-        Field::new("o_orderkey", DataType::Int64, false),
-        Field::new("o_custkey", DataType::Int64, false),
-        Field::new("o_totalprice", DataType::Float64, false),
+        Field::new("o_orderkey", DataType::Int64, false).with_metadata(field_id_meta(1)),
+        Field::new("o_custkey", DataType::Int64, false).with_metadata(field_id_meta(2)),
+        Field::new("o_totalprice", DataType::Float64, false).with_metadata(field_id_meta(3)),
     ]));
     let path = dir.join("orders.parquet");
     let file = std::fs::File::create(&path).expect("create orders parquet");
@@ -80,9 +82,11 @@ fn write_orders(dir: &std::path::Path) -> (String, u64) {
 }
 
 fn write_customer(dir: &std::path::Path) -> (String, u64) {
+    let field_id_meta =
+        |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
     let schema = Arc::new(Schema::new(vec![
-        Field::new("c_custkey", DataType::Int64, false),
-        Field::new("c_name", DataType::Utf8, false),
+        Field::new("c_custkey", DataType::Int64, false).with_metadata(field_id_meta(1)),
+        Field::new("c_name", DataType::Utf8, false).with_metadata(field_id_meta(2)),
     ]));
     let path = dir.join("customer.parquet");
     let file = std::fs::File::create(&path).expect("create customer parquet");

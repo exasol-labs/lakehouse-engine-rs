@@ -277,9 +277,9 @@ async fn plan_checked_table(
     })
 }
 
-/// Only top-level entries with a `field-id` are flattened; id-less entries exist only in
-/// the schema. Nested child mappings are not recursed (#83). A malformed property is a
-/// credential-free plan-time error (`serde_json` reports only a position).
+/// Keeps the mapping's own tree shape; an entry without a `field-id` maps nothing and is skipped
+/// with its children. A malformed property is a credential-free plan-time error (`serde_json`
+/// reports only a position).
 fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfError> {
     let Some(raw) = raw else {
         return Ok(Vec::new());
@@ -290,19 +290,22 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
             iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING
         ))
     })?;
-    let mut entries = Vec::new();
-    for field in mapping.fields() {
-        let Some(field_id) = field.field_id() else {
-            continue;
-        };
-        for name in field.names() {
-            entries.push(NameMappingEntry {
-                name: name.clone(),
-                field_id,
-            });
-        }
-    }
-    Ok(entries)
+    Ok(convert_mapped_fields(mapping.fields()))
+}
+
+fn convert_mapped_fields<'a>(
+    fields: impl IntoIterator<Item = &'a iceberg::spec::MappedField>,
+) -> Vec<NameMappingEntry> {
+    fields
+        .into_iter()
+        .filter_map(|field| {
+            Some(NameMappingEntry {
+                names: field.names().to_vec(),
+                field_id: field.field_id()?,
+                fields: convert_mapped_fields(field.fields().iter().map(AsRef::as_ref)),
+            })
+        })
+        .collect()
 }
 
 /// Only Parquet positional deletes and Puffin deletion vectors over Parquet data files are

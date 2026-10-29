@@ -187,9 +187,11 @@ fn raw_spec_with_logical_schema(table_root: String) -> ScanSpec {
 }
 
 fn write_local_parquet(dir: &std::path::Path, relative: &str, rows: i64) -> String {
+    let field_id_meta =
+        |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
     let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, false),
+        Field::new("id", DataType::Int64, false).with_metadata(field_id_meta(1)),
+        Field::new("name", DataType::Utf8, false).with_metadata(field_id_meta(2)),
     ]));
     let path = dir.join(relative);
     if let Some(parent) = path.parent() {
