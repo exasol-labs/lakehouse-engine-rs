@@ -4,13 +4,13 @@ use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow::array::{Float64Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
-use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::physical_plan::{ExecutionPlan, displayable};
+use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::test_support::{EmitPolicy, TestContext};
 use exasol_udf_sdk::value::{ExaType, Value};
@@ -24,6 +24,9 @@ use lakehouse_engine::scan::{
 };
 
 use parquet::arrow::ArrowWriter;
+use parquet::file::properties::WriterProperties;
+
+use crate::scan_plan_shape::sum_row_groups_pruned;
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -187,6 +190,8 @@ fn join_spec(
                 storage: ScanStorage::Inline(dim_storage()),
             }),
             storage: ScanStorage::Inline(storage()),
+            // Above one target partition DataFusion defaults joins to `Partitioned` mode.
+            df_target_partitions: 4,
             ..Default::default()
         },
         files: fact_files.into_iter().map(FileEntry::from).collect(),
@@ -719,6 +724,199 @@ fn join_build_side_is_dimension() {
             .iter()
             .any(|c| c == "O_ORDERKEY" || c == "O_TOTALPRICE"),
         "build side must NOT carry fact columns; got {build_side_cols:?}"
+    );
+    assert_eq!(
+        *hj.partition_mode(),
+        PartitionMode::CollectLeft,
+        "the dimension must be collected whole, not hash-repartitioned"
+    );
+    let probe = displayable(hj.right().as_ref()).indent(true).to_string();
+    assert!(
+        probe.contains("predicate=DynamicFilter"),
+        "the fact scan must carry the join's dynamic filter:\n{probe}"
+    );
+}
+
+const CLUSTERED_ROW_GROUPS: i64 = 64;
+const CLUSTERED_ROWS_PER_GROUP: i64 = 64;
+
+/// Row group `g` holds only `o_custkey = g`, except the last, whose keys are all NULL.
+fn write_clustered_orders(dir: &std::path::Path) -> (String, u64) {
+    let rows = CLUSTERED_ROW_GROUPS * CLUSTERED_ROWS_PER_GROUP;
+    let null_group = CLUSTERED_ROW_GROUPS - 1;
+    let keys: Int64Array = (0..rows)
+        .map(|i| Some(i / CLUSTERED_ROWS_PER_GROUP).filter(|g| *g != null_group))
+        .collect();
+    let batch = RecordBatch::try_from_iter([
+        (
+            "o_orderkey",
+            Arc::new(Int64Array::from_iter_values(0..rows)) as ArrayRef,
+        ),
+        ("o_custkey", Arc::new(keys) as ArrayRef),
+    ])
+    .expect("orders batch");
+    write_parquet(
+        &dir.join("orders_clustered.parquet"),
+        &batch,
+        Some(CLUSTERED_ROWS_PER_GROUP as usize),
+    )
+}
+
+/// Customer `k` is named `c{k}`; a NULL key is named `c_null`.
+fn write_keyed_customer(dir: &std::path::Path, name: &str, keys: &[Option<i64>]) -> (String, u64) {
+    let names: StringArray = keys
+        .iter()
+        .map(|k| Some(k.map_or("c_null".to_string(), |k| format!("c{k}"))))
+        .collect();
+    let batch = RecordBatch::try_from_iter([
+        (
+            "c_custkey",
+            Arc::new(Int64Array::from(keys.to_vec())) as ArrayRef,
+        ),
+        ("c_name", Arc::new(names) as ArrayRef),
+    ])
+    .expect("customer batch");
+    write_parquet(&dir.join(format!("{name}.parquet")), &batch, None)
+}
+
+fn write_parquet(
+    path: &std::path::Path,
+    batch: &RecordBatch,
+    max_row_group_rows: Option<usize>,
+) -> (String, u64) {
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(max_row_group_rows)
+        .build();
+    let file = std::fs::File::create(path).expect("create parquet");
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).expect("arrow writer");
+    writer.write(batch).expect("write parquet");
+    writer.close().expect("close parquet");
+    sized(file_url(path))
+}
+
+fn clustered_rows(groups: impl IntoIterator<Item = i64>) -> Vec<(i64, String)> {
+    groups
+        .into_iter()
+        .flat_map(|g| {
+            (g * CLUSTERED_ROWS_PER_GROUP..(g + 1) * CLUSTERED_ROWS_PER_GROUP)
+                .map(move |k| (k, format!("c{g}")))
+        })
+        .collect()
+}
+
+/// Scenario: The fact scan skips row groups that no dimension join key matches
+#[test]
+fn selective_join_prunes_fact_row_groups_clustered_by_the_join_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let orders = write_clustered_orders(dir);
+    // 30 keys exceed DataFusion's default 20-entry IN-list pruning limit, and the odd row groups
+    // between them sit inside the keys' min/max bounds, so only the key set can prune them.
+    let cases: [(&str, Vec<i64>); 2] = [
+        ("contiguous", vec![3, 4, 5]),
+        ("scattered", (0..30).map(|k| 2 * k).collect()),
+    ];
+    for (name, keys) in cases {
+        let dim_keys: Vec<Option<i64>> = keys.iter().copied().map(Some).collect();
+        let customer = write_keyed_customer(dir, &format!("customer_{name}"), &dim_keys);
+        let spec = join_spec(
+            vec![orders.clone()],
+            vec![customer],
+            vec!["O_ORDERKEY", "C_NAME"],
+            None,
+            None,
+        );
+
+        let (rows, pruned, rendered) = block_on(async {
+            let session = SessionContext::new_with_config(session_config_for_spec(&spec));
+            let plan =
+                build_join_physical_plan(&session, &spec, &scan_fixture::resolved_storage(&spec))
+                    .await
+                    .expect("physical plan must build");
+            let batches = collect(Arc::clone(&plan), session.task_ctx())
+                .await
+                .expect("join must execute");
+            (
+                total_rows(&batches),
+                sum_row_groups_pruned(plan.as_ref()),
+                displayable(plan.as_ref()).indent(true).to_string(),
+            )
+        });
+
+        assert_eq!(
+            rows,
+            keys.len() * CLUSTERED_ROWS_PER_GROUP as usize,
+            "{name}"
+        );
+        assert_eq!(
+            pruned,
+            CLUSTERED_ROW_GROUPS as usize - keys.len(),
+            "{name}: every fact row group holding no dimension key must be pruned on statistics:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn join_returns_exact_rows_whatever_the_dimension_side_keeps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let orders = write_clustered_orders(dir);
+    let emits = [ExaType::Int64, scan_fixture::varchar()];
+    let keyed_groups = 0..CLUSTERED_ROW_GROUPS - 1;
+    let all_keys: Vec<Option<i64>> = keyed_groups.clone().map(Some).collect();
+
+    let cases = [
+        ("selective", vec![Some(3)], None, clustered_rows([3])),
+        (
+            "non_selective",
+            all_keys.clone(),
+            None,
+            clustered_rows(keyed_groups),
+        ),
+        ("no_match", vec![Some(100), Some(200)], None, Vec::new()),
+        (
+            "empty_after_filter",
+            vec![Some(3)],
+            Some("\"C_NAME\" = 'nobody'"),
+            Vec::new(),
+        ),
+        ("null_keys", vec![None, Some(3)], None, clustered_rows([3])),
+        (
+            "join_key_filter",
+            all_keys,
+            Some("\"O_CUSTKEY\" BETWEEN 2 AND 3"),
+            clustered_rows([2, 3]),
+        ),
+    ];
+    for (name, keys, filter, expected) in cases {
+        let customer = write_keyed_customer(dir, &format!("customer_{name}"), &keys);
+        let spec = join_spec(
+            vec![orders.clone()],
+            vec![customer],
+            vec!["O_ORDERKEY", "C_NAME"],
+            filter,
+            None,
+        );
+        let mut got = orderkey_name_rows(&run_join(&spec, &emits));
+        got.sort();
+        assert_eq!(got, expected, "{name}");
+    }
+
+    let customer = write_keyed_customer(dir, "customer_top_n", &[Some(3), Some(7)]);
+    let spec = ordered_join_spec(
+        orders,
+        customer,
+        vec![sort_key("O_ORDERKEY", false, true)],
+        3,
+    );
+    assert_eq!(
+        orderkey_name_rows(&run_join(&spec, &emits)),
+        vec![
+            (511, "c7".to_string()),
+            (510, "c7".to_string()),
+            (509, "c7".to_string())
+        ],
+        "a post-join top-N must rank the joined rows of both kept keys"
     );
 }
 

@@ -1061,6 +1061,113 @@ pub async fn seed_blank_label_table(catalog_url: &str, warehouse: &str) -> Resul
     Ok(())
 }
 
+pub const CLUSTERED_JOIN_NAMESPACE: &str = "e2e_join_clustered";
+pub const CLUSTERED_FACT_TABLE: &str = "fact_clustered";
+pub const CLUSTERED_DIM_TABLE: &str = "dim_clustered";
+pub const CLUSTERED_KEYS: i64 = 16;
+pub const CLUSTERED_ROWS_PER_KEY: i64 = 64;
+/// The dimension rows whose `C_REGION` is `hot`.
+pub const CLUSTERED_HOT_KEYS: [i64; 3] = [3, 4, 5];
+
+/// One fact data file whose row group `k` holds only `O_CUSTKEY = k`, and one dimension row
+/// per key, named `c{k}`.
+pub async fn seed_clustered_join(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog =
+        build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-clustered-join").await?;
+    let long = || Type::Primitive(PrimitiveType::Long);
+    let string = || Type::Primitive(PrimitiveType::String);
+
+    let fact_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "O_ORDERKEY", long()).into(),
+            NestedField::required(2, "O_CUSTKEY", long()).into(),
+        ])
+        .build()
+        .context("build fact_clustered Iceberg schema")?;
+    if let Fixture::Fill(table) = empty_table_to_fill(
+        &catalog,
+        CLUSTERED_JOIN_NAMESPACE,
+        CLUSTERED_FACT_TABLE,
+        fact_schema,
+        unpartitioned(),
+        HashMap::new(),
+    )
+    .await?
+    {
+        let rows = CLUSTERED_KEYS * CLUSTERED_ROWS_PER_KEY;
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("O_ORDERKEY", DataType::Int64, false),
+                Field::new("O_CUSTKEY", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..rows)),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..rows).map(|i| i / CLUSTERED_ROWS_PER_KEY),
+                )),
+            ],
+        )
+        .expect("fact_clustered RecordBatch construction is infallible");
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(CLUSTERED_ROWS_PER_KEY as usize))
+            .build();
+        let data_files = write_data_files(
+            &table,
+            CLUSTERED_FACT_TABLE,
+            Struct::empty(),
+            properties,
+            [batch],
+        )
+        .await?;
+        commit_data_files(&catalog, &table, data_files)
+            .await
+            .context("commit fact_clustered")?;
+    }
+
+    let dim_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "C_CUSTKEY", long()).into(),
+            NestedField::required(2, "C_NAME", string()).into(),
+            NestedField::required(3, "C_REGION", string()).into(),
+        ])
+        .build()
+        .context("build dim_clustered Iceberg schema")?;
+    let keys = 0..CLUSTERED_KEYS;
+    let dim_batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("C_CUSTKEY", DataType::Int64, false),
+            Field::new("C_NAME", DataType::Utf8, false),
+            Field::new("C_REGION", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from_iter_values(keys.clone())),
+            Arc::new(StringArray::from_iter_values(
+                keys.clone().map(|k| format!("c{k}")),
+            )),
+            Arc::new(StringArray::from_iter_values(keys.map(|k| {
+                if CLUSTERED_HOT_KEYS.contains(&k) {
+                    "hot"
+                } else {
+                    "cold"
+                }
+            }))),
+        ],
+    )
+    .expect("dim_clustered RecordBatch construction is infallible");
+    create_and_append(
+        &catalog,
+        CLUSTERED_JOIN_NAMESPACE,
+        CLUSTERED_DIM_TABLE,
+        dim_schema,
+        [dim_batch],
+    )
+    .await
+    .context("seed dim_clustered")?;
+    Ok(())
+}
+
 fn make_supplier_batch(first_key: usize, last_key: usize) -> RecordBatch {
     let keys: Vec<i64> = (first_key as i64..=last_key as i64).collect();
     let names: Vec<String> = (first_key..=last_key)

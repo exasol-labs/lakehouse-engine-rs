@@ -195,10 +195,9 @@ async fn assume_role_failure_is_credential_safe_for_denial_refusal_and_timeout()
         "a non-XML body is never echoed: {failed}"
     );
 
-    let closed = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let refused_endpoint = format!("http://{}", closed.local_addr().expect("local_addr"));
-    drop(closed);
-    let refused = assume_error(role_creds(&refused_endpoint), STS_TIMEOUT).await;
+    // Not a dropped ephemeral listener: the SDK's retries could reach a parallel test's fake
+    // server that took the freed port.
+    let refused = assume_error(role_creds(CLOSED_PORT_URI), STS_TIMEOUT).await;
 
     let silent = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let silent_endpoint = format!("http://{}", silent.local_addr().expect("local_addr"));

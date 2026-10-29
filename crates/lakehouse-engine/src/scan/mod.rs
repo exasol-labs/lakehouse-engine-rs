@@ -156,7 +156,11 @@ pub fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
         // `HashJoinExec` builds from the left child, where the dimension sits. The scan provider
         // reports no statistics, so `JoinSelection` swaps would be non-deterministic; turning
         // reordering off pins the bounded dimension as the build side.
-        config.set_bool("datafusion.optimizer.join_reordering", false)
+        config
+            .set_bool("datafusion.optimizer.join_reordering", false)
+            // `CollectLeft` gives the fact scan a key-bounds dynamic filter that row-group
+            // statistics can prune on; `Partitioned` mode's per-partition `CASE` filter cannot.
+            .set_bool("datafusion.optimizer.repartition_joins", false)
     } else {
         config
     }
