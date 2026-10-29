@@ -93,6 +93,41 @@ resolve_delete_ns() {  # target baseline_ns override -> the effective delete nam
   esac
 }
 
+# A redirected log must show forward motion (#87): the .so build's last crate, the TPC-H
+# generation, and the Spark job each print nothing for minutes.
+HEARTBEAT_SECS=30
+HEARTBEAT_PID=""
+heartbeat_start() {  # label
+  local label="$1" t0=$SECONDS
+  # sleep writes to /dev/null so a killed ticker's orphan never holds a `| tee` pipe open.
+  ( while sleep "$HEARTBEAT_SECS" >/dev/null 2>&1 && kill -0 $$ 2>/dev/null; do
+      echo "   [$(date +%H:%M:%S)] still running: ${label} ($((SECONDS - t0))s)"
+    done ) </dev/null &
+  HEARTBEAT_PID=$!
+}
+heartbeat_stop() {
+  [ -n "$HEARTBEAT_PID" ] || return 0
+  kill "$HEARTBEAT_PID" 2>/dev/null || true
+  wait "$HEARTBEAT_PID" 2>/dev/null || true
+  HEARTBEAT_PID=""
+}
+# Wrap external commands only: the `||` below suspends set -e inside a shell function.
+run_phase() {  # label cmd... -> the command's exit status
+  local label="$1" t0=$SECONDS rc=0
+  shift
+  echo "== [$(date +%H:%M:%S)] ${label} =="
+  heartbeat_start "$label"
+  "$@" || rc=$?
+  heartbeat_stop
+  if [ "$rc" -eq 0 ]; then
+    echo "== [$(date +%H:%M:%S)] done in $((SECONDS - t0))s: ${label} =="
+  else
+    echo "== [$(date +%H:%M:%S)] FAILED (exit ${rc}) after $((SECONDS - t0))s: ${label} =="
+  fi
+  return "$rc"
+}
+trap heartbeat_stop EXIT
+
 if [ "${1:-}" = "selftest" ]; then
   GLUE_WAREHOUSE="s3://b/w/" AWS_REGION=r AWS_ACCESS_KEY_ID=k \
   AWS_SECRET_ACCESS_KEY="se'cret" AWS_SESSION_TOKEN="" \
@@ -231,6 +266,17 @@ PROBEEOF
     *) echo "FAIL: vs_teardown_is_recreate_only: DROP VIRTUAL SCHEMA not immediately followed by CREATE VIRTUAL SCHEMA: $next_line"; exit 1;; esac
   case "$prod_src" in *"DROP CONNECTION"*) echo "FAIL: vs_teardown_is_recreate_only: DROP CONNECTION must not appear in bench/run.sh"; exit 1;; esac
 
+  # Command substitution waits for every writer of its pipe, so a leaked ticker would hang here.
+  out="$(HEARTBEAT_SECS=1 run_phase probe sleep 2.5)"
+  case "$out" in *"still running: probe ("*"s)"*) ;; \
+    *) echo "FAIL: run_phase_heartbeat: no still-running line: $out"; exit 1;; esac
+  case "$out" in *"done in "*"s: probe =="*) ;; \
+    *) echo "FAIL: run_phase_heartbeat: no elapsed end line: $out"; exit 1;; esac
+  rc=0; out="$(HEARTBEAT_SECS=1 run_phase failing sh -c 'exit 3')" || rc=$?
+  [ "$rc" -eq 3 ] || { echo "FAIL: run_phase_failure: exit status $rc, expected 3"; exit 1; }
+  case "$out" in *"FAILED (exit 3) after "*"s: failing =="*) ;; \
+    *) echo "FAIL: run_phase_failure: no failure end line: $out"; exit 1;; esac
+
   echo "selftest OK"; exit 0
 fi
 
@@ -274,8 +320,7 @@ case "$TARGET" in
     CONN_PW="$(build_conn_password_local)"
     VS_EXTRA_PROPS="$(build_vs_extra_props true "${BENCH_PARALLELISM_FACTOR:-1}")"
     PROFILE_ON=0
-    echo "== docker: bringing up local stack (seaweedfs, iceberg-rest, exasol) =="
-    docker compose up -d
+    run_phase "docker: bringing up local stack (seaweedfs, iceberg-rest, exasol)" docker compose up -d
     ;;
   remote)
     # Explicit selection: bench/.env carries both catalogs' variables, so presence cannot decide.
@@ -340,36 +385,37 @@ register_rust_alias() {
 
 wait_http() {  # url name
   local url="$1" name="$2" i
-  echo "== waiting for ${name} (${url}) =="
+  echo "== [$(date +%H:%M:%S)] waiting for ${name} (${url}) =="
+  heartbeat_start "waiting for ${name}"
   for i in $(seq 1 60); do
-    curl -fsS -o /dev/null "$url" 2>/dev/null && return 0
+    curl -fsS -o /dev/null "$url" 2>/dev/null && { heartbeat_stop; return 0; }
     sleep 1
   done
   echo "ERROR: ${name} not ready at ${url}"; exit 1
 }
 wait_exasol() {
-  echo "== waiting for Exasol ${HOST}:${EXA_PORT} =="
+  echo "== [$(date +%H:%M:%S)] waiting for Exasol ${HOST}:${EXA_PORT} =="
   local i
+  heartbeat_start "waiting for Exasol"
   for i in $(seq 1 180); do
-    if (exec 3<>"/dev/tcp/${HOST}/${EXA_PORT}") 2>/dev/null; then exec 3>&- 3<&-; return 0; fi
+    if (exec 3<>"/dev/tcp/${HOST}/${EXA_PORT}") 2>/dev/null; then exec 3>&- 3<&-; heartbeat_stop; return 0; fi
     sleep 1
   done
   echo "ERROR: Exasol not reachable at ${HOST}:${EXA_PORT}"; exit 1
 }
 
-echo "== building working-tree .so (no-op if fresh) =="
-make cross-udf-build
+run_phase "building working-tree .so (no-op if fresh)" make cross-udf-build
 
 if [ "$TARGET" = "docker" ]; then
   wait_http "http://localhost:${LH_SEAWEEDFS_PORT:-19000}/status" "SeaweedFS"
   wait_http "http://localhost:${LH_REST_PORT:-18181}/v1/config" "Iceberg REST"
   wait_exasol
-  echo "== loading TPC-H (SF=${TPCH_SCALE}, big tables in ${TPCH_FILES:-4} files) into namespace '${NAMESPACE}' =="
-  TPCH_SCALE="$TPCH_SCALE" NAMESPACE="$NAMESPACE" TPCH_FILES="${TPCH_FILES:-4}" \
+  run_phase "loading TPC-H (SF=${TPCH_SCALE}, big tables in ${TPCH_FILES:-4} files) into namespace '${NAMESPACE}'" \
+    env TPCH_SCALE="$TPCH_SCALE" NAMESPACE="$NAMESPACE" TPCH_FILES="${TPCH_FILES:-4}" \
     cargo test --workspace --features lakehouse-e2e/exasol-e2e --test tpch_loader -- --nocapture
   if [ "$WITH_DELETES" = "1" ]; then
-    echo "== authoring delete-bearing namespace '${DELETE_NS}' from baseline '${BASELINE_NS}' (docker, idempotent) =="
-    "$SCRIPT_DIR/make_deletes_docker.sh" "$BASELINE_NS" "$DELETE_NS"
+    run_phase "authoring delete-bearing namespace '${DELETE_NS}' from baseline '${BASELINE_NS}' (docker, idempotent)" \
+      "$SCRIPT_DIR/make_deletes_docker.sh" "$BASELINE_NS" "$DELETE_NS"
   fi
 else
   wait_exasol
@@ -384,13 +430,13 @@ if [ "$SKIP_UPLOAD" = "1" ]; then
   echo "   SLC dir: ${SLC_BUCKET_PATH}    .so: ${SO_UDF_OBJECT}"
   register_rust_alias
 else
-  echo "== installing SLC ${SLC_VERSION} + uploading .so =="
-  make install-slc bucketfs-upload-so \
+  run_phase "installing SLC ${SLC_VERSION} + uploading .so" \
+    make install-slc bucketfs-upload-so \
     EXASOL_HOST="$HOST" LH_EXASOL_PORT="$EXA_PORT" LH_BUCKETFS_PORT="$BFS_PORT" \
     SLC_VERSION="$SLC_VERSION" EXASOL_SYS_PASSWORD="$SYS_PASS"
 fi
 
-echo "== creating schema, scripts, connection, VS '${VS}' =="
+echo "== [$(date +%H:%M:%S)] creating schema, scripts, connection, VS '${VS}' =="
 sql "CREATE SCHEMA IF NOT EXISTS ${SCHEMA}"
 sql "CREATE OR REPLACE RUST ADAPTER SCRIPT ${SCHEMA}.${ADAPTER} AS
 %udf_object ${SO_UDF_OBJECT}
@@ -509,14 +555,18 @@ run_query() {
   local name="$1" q="$2" t0 t1
   { echo; echo "### ${name}"; } | tee -a "$REPORT"
   t0=$(date +%s.%N)
+  # Started outside the `| tee` pipeline, so still-running lines never reach the report.
+  heartbeat_start "$name"
   # `if !` keeps set -e from aborting the remaining queries on a failing one.
   if ! sqlf "$q" | tee -a "$REPORT"; then
+    heartbeat_stop
     t1=$(date +%s.%N)
     echo "  FAILED" | tee -a "$REPORT"
     printf 'elapsed: %ss (FAILED)\n' "$(awk "BEGIN{printf \"%.2f\", ${t1}-${t0}}")" | tee -a "$REPORT"
     FAILED=1
     return
   fi
+  heartbeat_stop
   t1=$(date +%s.%N)
   printf 'elapsed: %ss\n' "$(awk "BEGIN{printf \"%.2f\", ${t1}-${t0}}")" | tee -a "$REPORT"
 }
@@ -677,6 +727,6 @@ fi
 
 echo
 if [ "$FAILED" -ne 0 ]; then
-  echo "BENCHMARK FAILED (see counts above). Report: ${REPORT}"; exit 1
+  echo "BENCHMARK FAILED (see counts above) after ${SECONDS}s. Report: ${REPORT}"; exit 1
 fi
-echo "Done. Full report: ${REPORT}"
+echo "Done in ${SECONDS}s. Full report: ${REPORT}"
