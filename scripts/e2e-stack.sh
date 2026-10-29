@@ -7,7 +7,7 @@ usage() {
   echo "usage: $0 <e2e|lakekeeper|azure|unity|glue> <start|wait|up|down>" >&2
   exit 2
 }
-[ $# -eq 2 ] || usage
+[[ $# -eq 2 ]] || usage
 stack=$1
 action=$2
 
@@ -30,7 +30,7 @@ compose() {
 await_exit() {
   local service=$1 code
   code=$(docker wait "$(compose ps -aq "$service")")
-  if [ "$code" != "0" ]; then
+  if [[ "$code" != "0" ]]; then
     echo "::error::$service exited $code" >&2
     compose logs "$service"
     exit 1
@@ -62,6 +62,7 @@ start() {
       ./scripts/unity/seed.sh
       ;;
     glue) compose up -d exasol proxy ;;
+    *) usage ;;
   esac
 }
 
@@ -75,6 +76,7 @@ wait_healthy() {
     azure) compose up -d --wait exasol keycloak lakekeeper-db openfga-db openfga lakekeeper proxy ;;
     unity) compose up -d --wait exasol ;;
     glue) compose up -d --wait exasol proxy ;;
+    *) usage ;;
   esac
 }
 
