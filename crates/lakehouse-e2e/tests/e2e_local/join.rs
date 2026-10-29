@@ -3,12 +3,18 @@
 
 use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
+use crate::common::pruning_cases::read_footer;
 use crate::common::seed::{
-    DIM_CUSTOMER_ROWS, E2E_BLANK_LABEL_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE,
-    E2E_SUPPLIER_TABLE, FACT_ORDERS_ROWS, LINEITEM_ROWS, O_TOTALPRICE_PS, order_custkey,
-    order_date_days, order_totalprice_unscaled,
+    CLUSTERED_DIM_TABLE, CLUSTERED_FACT_TABLE, CLUSTERED_HOT_KEYS, CLUSTERED_JOIN_NAMESPACE,
+    CLUSTERED_KEYS, CLUSTERED_ROWS_PER_KEY, DIM_CUSTOMER_ROWS, E2E_BLANK_LABEL_TABLE,
+    E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_SUPPLIER_TABLE, FACT_ORDERS_ROWS,
+    LINEITEM_ROWS, O_TOTALPRICE_PS, order_custkey, order_date_days, order_totalprice_unscaled,
+    seed_clustered_join,
 };
+use crate::common::stack::iceberg_catalog_url;
 use crate::fixtures::{events, stack, vs_table};
+
+use parquet::file::statistics::Statistics;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -1669,4 +1675,78 @@ fn e2e_scalar_over_aggregate_ungrouped_join_matches_native_oracle() {
         "ROUND(SUM(L_QUANTITY), 2) over the join must equal the native oracle \
          {want}, got {got}"
     );
+}
+
+const VS_CLUSTERED: &str = "MY_LAKEHOUSE_JOIN_CLUSTERED";
+
+fn setup_clustered() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        stack();
+        runtime()
+            .block_on(seed_clustered_join(
+                &iceberg_catalog_url(),
+                "s3://warehouse/",
+            ))
+            .expect("seed the clustered join fixture");
+        create_virtual_schema(
+            &mut exa_conn(),
+            &VsProps::new(VS_CLUSTERED, CLUSTERED_JOIN_NAMESPACE),
+        );
+    });
+}
+
+/// Scenario: The fact scan skips row groups that no dimension join key matches
+#[test]
+fn e2e_selective_broadcast_join_over_a_fact_clustered_by_the_join_key() {
+    setup_clustered();
+
+    let files = runtime().block_on(resolve_fixture_files(
+        CLUSTERED_JOIN_NAMESPACE,
+        CLUSTERED_FACT_TABLE,
+    ));
+    let [file] = &files[..] else {
+        panic!("the clustered fact must be one data file, got {files:?}");
+    };
+    let footer = read_footer(&file.path);
+    let group_keys: Vec<(Option<i64>, Option<i64>)> = footer
+        .row_groups()
+        .iter()
+        .map(|group| match group.column(1).statistics() {
+            Some(Statistics::Int64(stats)) => (stats.min_opt().copied(), stats.max_opt().copied()),
+            other => panic!("O_CUSTKEY row-group statistics missing: {other:?}"),
+        })
+        .collect();
+    let expected_keys: Vec<_> = (0..CLUSTERED_KEYS).map(|k| (Some(k), Some(k))).collect();
+    assert_eq!(
+        group_keys, expected_keys,
+        "each fact row group must hold one join key, or the fixture cannot prove row-group pruning"
+    );
+
+    let query = format!(
+        "SELECT o.O_ORDERKEY, c.C_NAME FROM {} o \
+         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY WHERE c.C_REGION = 'hot'",
+        vs_table(VS_CLUSTERED, CLUSTERED_FACT_TABLE),
+        vs_table(VS_CLUSTERED, CLUSTERED_DIM_TABLE)
+    );
+    let mut conn = exa_conn();
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_broadcast_join_block(&pushed),
+        "the selective join must stay on the broadcast route:\n{pushed}"
+    );
+
+    let mut actual: Vec<(i64, String)> = fetch_join_rows_in_query_order(&mut conn, &query)
+        .into_iter()
+        .map(|(key, name)| (key.parse().expect("O_ORDERKEY is an integer"), name))
+        .collect();
+    actual.sort();
+    let expected: Vec<(i64, String)> = CLUSTERED_HOT_KEYS
+        .iter()
+        .flat_map(|&k| {
+            (k * CLUSTERED_ROWS_PER_KEY..(k + 1) * CLUSTERED_ROWS_PER_KEY)
+                .map(move |order| (order, format!("c{k}")))
+        })
+        .collect();
+    assert_eq!(actual, expected);
 }
