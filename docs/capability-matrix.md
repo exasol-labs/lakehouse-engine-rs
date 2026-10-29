@@ -207,6 +207,46 @@ sends the query to the adapter.
 | `SOUNDEX` |  |  |
 | `SPACE` |  |  |
 | `SQRT` | ✓ |  |
+| `ST_AREA` |  | DataFusion has no geospatial functions. |
+| `ST_BOUNDARY` |  | DataFusion has no geospatial functions. |
+| `ST_BUFFER` |  | DataFusion has no geospatial functions. |
+| `ST_CENTROID` |  | DataFusion has no geospatial functions. |
+| `ST_CONTAINS` |  | DataFusion has no geospatial functions. |
+| `ST_CONVEXHULL` |  | DataFusion has no geospatial functions. |
+| `ST_CROSSES` |  | DataFusion has no geospatial functions. |
+| `ST_DIFFERENCE` |  | DataFusion has no geospatial functions. |
+| `ST_DIMENSION` |  | DataFusion has no geospatial functions. |
+| `ST_DISJOINT` |  | DataFusion has no geospatial functions. |
+| `ST_DISTANCE` |  | DataFusion has no geospatial functions. |
+| `ST_ENDPOINT` |  | DataFusion has no geospatial functions. |
+| `ST_ENVELOPE` |  | DataFusion has no geospatial functions. |
+| `ST_EQUALS` |  | DataFusion has no geospatial functions. |
+| `ST_EXTERIORRING` |  | DataFusion has no geospatial functions. |
+| `ST_FORCE2D` |  | DataFusion has no geospatial functions. |
+| `ST_GEOMETRYN` |  | DataFusion has no geospatial functions. |
+| `ST_GEOMETRYTYPE` |  | DataFusion has no geospatial functions. |
+| `ST_INTERIORRINGN` |  | DataFusion has no geospatial functions. |
+| `ST_INTERSECTION` |  | DataFusion has no geospatial functions. |
+| `ST_INTERSECTS` |  | DataFusion has no geospatial functions. |
+| `ST_ISCLOSED` |  | DataFusion has no geospatial functions. |
+| `ST_ISEMPTY` |  | DataFusion has no geospatial functions. |
+| `ST_ISRING` |  | DataFusion has no geospatial functions. |
+| `ST_ISSIMPLE` |  | DataFusion has no geospatial functions. |
+| `ST_LENGTH` |  | DataFusion has no geospatial functions. |
+| `ST_NUMGEOMETRIES` |  | DataFusion has no geospatial functions. |
+| `ST_NUMINTERIORRINGS` |  | DataFusion has no geospatial functions. |
+| `ST_NUMPOINTS` |  | DataFusion has no geospatial functions. |
+| `ST_OVERLAPS` |  | DataFusion has no geospatial functions. |
+| `ST_POINTN` |  | DataFusion has no geospatial functions. |
+| `ST_SETSRID` |  | DataFusion has no geospatial functions. |
+| `ST_STARTPOINT` |  | DataFusion has no geospatial functions. |
+| `ST_SYMDIFFERENCE` |  | DataFusion has no geospatial functions. |
+| `ST_TOUCHES` |  | DataFusion has no geospatial functions. |
+| `ST_TRANSFORM` |  | DataFusion has no geospatial functions. |
+| `ST_UNION` |  | DataFusion has no geospatial functions. |
+| `ST_WITHIN` |  | DataFusion has no geospatial functions. |
+| `ST_X` |  | DataFusion has no geospatial functions. |
+| `ST_Y` |  | DataFusion has no geospatial functions. |
 | `SUB` | ✓ |  |
 | `SUBSTR` | ✓ |  |
 | `SYSDATE` |  | The scan has no clock, time zone, or statement anchor. Exasol evaluates it once per statement. |
@@ -272,6 +312,8 @@ sends the query to the adapter.
 | `STDDEV_POP_DISTINCT` |  |  |
 | `STDDEV_SAMP` | ✓ | Computed in double precision. See [Semantic differences](semantic-differences.md). |
 | `STDDEV_SAMP_DISTINCT` |  |  |
+| `ST_INTERSECTION` |  | DataFusion has no geospatial functions. |
+| `ST_UNION` |  | DataFusion has no geospatial functions. |
 | `SUM` | ✓ |  |
 | `SUM_DISTINCT` |  |  |
 | `VARIANCE` | ✓ | Computed in double precision. See [Semantic differences](semantic-differences.md). |
@@ -280,8 +322,3 @@ sends the query to the adapter.
 | `VAR_POP_DISTINCT` |  |  |
 | `VAR_SAMP` | ✓ | Computed in double precision. See [Semantic differences](semantic-differences.md). |
 | `VAR_SAMP_DISTINCT` |  |  |
-
-## Geospatial functions
-
-The adapter advertises none of the 42 geospatial capabilities. Exasol evaluates them itself:
-`FN_AGG_ST_INTERSECTION`, `FN_AGG_ST_UNION`, `FN_ST_AREA`, `FN_ST_BOUNDARY`, `FN_ST_BUFFER`, `FN_ST_CENTROID`, `FN_ST_CONTAINS`, `FN_ST_CONVEXHULL`, `FN_ST_CROSSES`, `FN_ST_DIFFERENCE`, `FN_ST_DIMENSION`, `FN_ST_DISJOINT`, `FN_ST_DISTANCE`, `FN_ST_ENDPOINT`, `FN_ST_ENVELOPE`, `FN_ST_EQUALS`, `FN_ST_EXTERIORRING`, `FN_ST_FORCE2D`, `FN_ST_GEOMETRYN`, `FN_ST_GEOMETRYTYPE`, `FN_ST_INTERIORRINGN`, `FN_ST_INTERSECTION`, `FN_ST_INTERSECTS`, `FN_ST_ISCLOSED`, `FN_ST_ISEMPTY`, `FN_ST_ISRING`, `FN_ST_ISSIMPLE`, `FN_ST_LENGTH`, `FN_ST_NUMGEOMETRIES`, `FN_ST_NUMINTERIORRINGS`, `FN_ST_NUMPOINTS`, `FN_ST_OVERLAPS`, `FN_ST_POINTN`, `FN_ST_SETSRID`, `FN_ST_STARTPOINT`, `FN_ST_SYMDIFFERENCE`, `FN_ST_TOUCHES`, `FN_ST_TRANSFORM`, `FN_ST_UNION`, `FN_ST_WITHIN`, `FN_ST_X`, `FN_ST_Y`.
