@@ -229,3 +229,10 @@ fn redact_credentials_strips_unity_vended_and_oauth_secrets() {
         "non-secret context must be preserved: {safe}"
     );
 }
+
+#[test]
+fn redact_error_text_is_idempotent() {
+    let msg = "access_key=AKID sig=abc&se=2030 Bearer tok \"sas\":\"sv=1\" leaked SECRET_VALUE";
+    let once = redact_error_text(msg, &["SECRET_VALUE"]);
+    assert_eq!(redact_error_text(&once, &["SECRET_VALUE"]), once);
+}

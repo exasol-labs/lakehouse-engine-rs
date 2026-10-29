@@ -69,6 +69,13 @@ The scan UDF sizes its DataFusion memory pool from the per-instance memory limit
 * *AND* an error raised on the RAW-SCAN path and an error raised on the PARTIAL-AGGREGATE path SHALL each be asserted to carry no resolved credential value, because those two paths read the fact-side set directly
 * *AND* a spec whose storage block carries a reference MUST NOT yield an empty secret set once resolution has run, and a test SHALL assert the set is NON-empty for a resolved reference
 
+### Scenario: Every scan error is redacted at the scan boundary
+
+* *GIVEN* a scan whose session build or run path fails, including at a site that formats a raw DataFusion or table-registration error
+* *WHEN* the error leaves the scan invocation
+* *THEN* its message SHALL be redacted by value, then by credential label, against the union of every side's resolved secrets
+* *AND* an inner site MAY still redact the text it surfaces, because the redaction is idempotent
+
 ### Scenario: Row-position delete state is reserved in the memory pool
 
 * *GIVEN* a shard whose data files carry row-position deletes

@@ -242,7 +242,7 @@ pub fn classify_scan_error(e: DataFusionError, secrets: &[&str]) -> UdfError {
 /// Takes the raised message alone, never a wrapped error: a `.context()` string can carry a
 /// credential-bearing fragment.
 fn raised_failure_error(failure: &str, secrets: &[&str]) -> UdfError {
-    UdfError::User(redact_credentials(&redact_secret_values(failure, secrets)))
+    UdfError::User(redact_error_text(failure, secrets))
 }
 
 const CONCURRENT_FAILURE_PREAMBLE: &str = "the scan also surfaced:";
@@ -265,27 +265,42 @@ pub fn reframe_raised_failure(
     if !surfaced.contains(MEMORY_EXHAUSTED_LABEL) {
         return raised;
     }
-    let safe = redact_credentials(&redact_secret_values(&surfaced, secrets));
+    let safe = redact_error_text(&surfaced, secrets);
     UdfError::User(format!("{raised}; {CONCURRENT_FAILURE_PREAMBLE} {safe}"))
 }
 
 /// Only the innermost `msg` is surfaced: a wrapping `.context()` may carry credential-bearing
 /// fragments. Opens with [`MEMORY_EXHAUSTED_LABEL`] for [`reframe_raised_failure`].
 fn resources_exhausted_error(msg: &str, secrets: &[&str]) -> UdfError {
-    let safe = redact_credentials(&redact_secret_values(msg, secrets));
+    let safe = redact_error_text(msg, secrets);
     UdfError::User(format!("{MEMORY_EXHAUSTED_LABEL} {safe}"))
 }
 
 /// Strips literal `secrets` first, catching S3 XML/signature shapes that embed the raw key
 /// without a recognizable label, then applies the label-based heuristic.
 pub fn redact_storage_error(msg: String, secrets: &[&str]) -> UdfError {
-    let safe = redact_credentials(&redact_secret_values(&msg, secrets));
+    let safe = redact_error_text(&msg, secrets);
     UdfError::User(format!(
         "scan failed: assigned data could not be read: {safe}"
     ))
 }
 
-pub use lakehouse_catalog::{error_chain, redact_credentials, redact_secret_values};
+/// Every scan error passes here once, at the scan boundary, so a site that formats a raw
+/// error cannot leak a secret.
+pub(super) fn redact_scan_error(error: UdfError, secrets: &[&str]) -> UdfError {
+    let redact = |msg: String| redact_error_text(&msg, secrets);
+    match error {
+        UdfError::User(msg) => UdfError::User(redact(msg)),
+        UdfError::Unimplemented(msg) => UdfError::Unimplemented(redact(msg)),
+        UdfError::Type(msg) => UdfError::Type(redact(msg)),
+        UdfError::ConnectBack(msg) => UdfError::ConnectBack(redact(msg)),
+        UdfError::Connection(msg) => UdfError::Connection(redact(msg)),
+    }
+}
+
+pub use lakehouse_catalog::{
+    error_chain, redact_credentials, redact_error_text, redact_secret_values,
+};
 
 #[cfg(test)]
 #[path = "emit_tests.rs"]

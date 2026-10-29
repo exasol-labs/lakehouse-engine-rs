@@ -15,7 +15,7 @@ use crate::scan::spec::{AggregatePlan, PartialAggColumn, ScanSpec, partial_colum
 use crate::scan::storage_ref::ResolvedScanStorage;
 
 use super::raw_scan::register_files;
-use super::sql_support::{build_alias_items, quote_ident};
+use super::sql_support::{aliased_select, append_where, quote_ident};
 
 /// The returned string is spliced verbatim as the inner table, so its text is part of the emitted SQL.
 async fn register_aliased_scan_target(
@@ -30,11 +30,7 @@ async fn register_aliased_scan_target(
         .table(table_name)
         .await
         .map_err(|e| UdfError::User(format!("cannot resolve registered table: {e}")))?;
-    let alias_items = build_alias_items(table.schema());
-    Ok(format!(
-        "SELECT {} FROM {table_name}",
-        alias_items.join(", ")
-    ))
+    Ok(aliased_select(table_name, table.schema()))
 }
 
 /// Emits exactly one row per shard on the single-group path.
@@ -180,12 +176,7 @@ pub fn build_grouped_partial_agg_sql(
         aliased_table
     );
 
-    if let Some(f) = filter
-        && !f.is_empty()
-    {
-        sql.push_str(" WHERE ");
-        sql.push_str(f);
-    }
+    append_where(&mut sql, filter);
 
     sql.push_str(" GROUP BY ");
     sql.push_str(&group_keys.join(", "));
@@ -280,12 +271,7 @@ pub fn build_partial_agg_sql_filtered(
         aliased_table
     );
 
-    if let Some(f) = filter
-        && !f.is_empty()
-    {
-        sql.push_str(" WHERE ");
-        sql.push_str(f);
-    }
+    append_where(&mut sql, filter);
 
     sql
 }

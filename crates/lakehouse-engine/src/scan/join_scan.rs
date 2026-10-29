@@ -1,20 +1,20 @@
 use std::sync::Arc;
 
+use datafusion::dataframe::DataFrame;
 use datafusion::execution::context::SessionContext;
+use datafusion::physical_plan::ExecutionPlan;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 
-use crate::scan::emit::{classify_scan_error, emit_stream};
+use crate::scan::diagnostics;
 use crate::scan::spec::{ProjectionItem, ScanSpec};
 use crate::scan::storage_ref::ResolvedScanStorage;
-use crate::scan::{diagnostics, emit_phase_telemetry};
-use crate::types::mapping::{
-    ExaTypeClass, arrow_to_exasol_type, classify_exa_type, needs_json_fallback,
-    needs_nested_json_rendering,
-};
+use crate::types::mapping::{ExaTypeClass, arrow_to_exasol_type, classify_exa_type};
 
-use super::raw_scan::{NESTED_JSON_RENDER_UDF_NAME, delete_path_read_limiter, register_file_list};
-use super::sql_support::{build_alias_items, quote_ident};
+use super::raw_scan::{
+    delete_path_read_limiter, emit_dataframe, physical_plan, plan_sql, register_file_list,
+};
+use super::sql_support::{aliased_select, append_where, render_column, render_projection};
 
 const JOIN_FACT_TABLE: &str = "fact_scan";
 const JOIN_DIM_TABLE: &str = "dim_scan";
@@ -28,20 +28,18 @@ pub async fn run_join_scan_with_session(
     storage: &ResolvedScanStorage,
     timers: &mut diagnostics::PhaseTimers,
 ) -> Result<(), UdfError> {
-    let secrets = storage.all_secret_values();
-    register_join_tables(session_ctx, spec, storage).await?;
-    let sql = build_join_sql(session_ctx, JOIN_FACT_TABLE, JOIN_DIM_TABLE, spec).await?;
-    let df = session_ctx
-        .sql(&sql)
-        .await
-        .map_err(|e| UdfError::User(format!("join SQL error: {e}")))?;
-    let stream = df
-        .execute_stream()
-        .await
-        .map_err(|e| classify_scan_error(e, &secrets))?;
-    emit_stream(ctx, stream, &secrets, timers).await?;
-    emit_phase_telemetry(ctx, timers);
-    Ok(())
+    let df = build_join_dataframe(session_ctx, spec, storage).await?;
+    emit_dataframe(ctx, df, storage, timers).await
+}
+
+async fn build_join_dataframe(
+    ctx: &SessionContext,
+    spec: &ScanSpec,
+    storage: &ResolvedScanStorage,
+) -> Result<DataFrame, UdfError> {
+    register_join_tables(ctx, spec, storage).await?;
+    let sql = build_join_sql(ctx, JOIN_FACT_TABLE, JOIN_DIM_TABLE, spec).await?;
+    plan_sql(ctx, &sql, "join SQL error").await
 }
 
 async fn register_join_tables(
@@ -128,14 +126,8 @@ async fn build_join_sql(
     let fact_schema = fact.schema();
     let dim_schema = dim.schema();
 
-    let fact_aliased = format!(
-        "SELECT {} FROM {fact_table}",
-        build_alias_items(fact_schema).join(", ")
-    );
-    let dim_aliased = format!(
-        "SELECT {} FROM {dim_table}",
-        build_alias_items(dim_schema).join(", ")
-    );
+    let fact_aliased = aliased_select(fact_table, fact_schema);
+    let dim_aliased = aliased_select(dim_table, dim_schema);
 
     // Columns are disjoint across the two tables (VS guarantee), so a bare name resolves once.
     let combined = combined_upper_fields(dim_schema, fact_schema);
@@ -149,23 +141,12 @@ async fn build_join_sql(
         spec.common.projection.clone()
     };
 
-    let select_items: Vec<String> = proj_items
-        .iter()
-        .map(|item| render_join_select_item(item, &combined))
-        .collect();
-
+    let select_clause = render_projection(&proj_items, |name| combined_type(name, &combined));
     let mut sql = format!(
-        "SELECT {} FROM ({dim_aliased}) INNER JOIN ({fact_aliased}) ON {}",
-        select_items.join(", "),
+        "SELECT {select_clause} FROM ({dim_aliased}) INNER JOIN ({fact_aliased}) ON {}",
         join.condition
     );
-
-    if let Some(filter) = &spec.common.filter
-        && !filter.is_empty()
-    {
-        sql.push_str(" WHERE ");
-        sql.push_str(filter);
-    }
+    append_where(&mut sql, spec.common.filter.as_deref());
 
     if !join.post_join_order_by.is_empty() {
         let elements: Vec<String> = join
@@ -197,26 +178,6 @@ fn combined_upper_fields(
         .collect()
 }
 
-/// Same column rendering rule as the single-table `build_scan_sql`.
-fn render_join_select_item(
-    item: &ProjectionItem,
-    combined: &[(String, arrow::datatypes::DataType)],
-) -> String {
-    match item {
-        ProjectionItem::Expr { expr } => expr.clone(),
-        ProjectionItem::Column(col_name) => {
-            let ident = quote_ident(&col_name.to_uppercase());
-            match combined_type(col_name, combined) {
-                Some(dt) if needs_nested_json_rendering(dt) => {
-                    format!("{NESTED_JSON_RENDER_UDF_NAME}({ident})")
-                }
-                Some(dt) if needs_json_fallback(dt) => format!("CAST({ident} AS VARCHAR)"),
-                _ => ident,
-            }
-        }
-    }
-}
-
 /// Ranks by the value the shard emits, since that is what the Exasol-side wrapper merges and
 /// ranks; ranking anything else can cut a row the wrapper's global top-`n` needs. Exasol's
 /// VARCHAR has no empty string (`''` arrives as NULL), and `emit_batch` emits `NaN` as NULL (#246).
@@ -226,8 +187,9 @@ fn render_join_sort_target(
 ) -> String {
     use arrow::datatypes::DataType;
 
-    let emitted = render_join_select_item(&ProjectionItem::Column(column.to_string()), combined);
-    match combined_type(column, combined) {
+    let data_type = combined_type(column, combined);
+    let emitted = render_column(column, data_type);
+    match data_type {
         Some(DataType::Float32 | DataType::Float64) => {
             format!("CASE WHEN isnan({emitted}) THEN NULL ELSE {emitted} END")
         }
@@ -254,16 +216,8 @@ pub async fn build_join_physical_plan(
     ctx: &SessionContext,
     spec: &ScanSpec,
     storage: &ResolvedScanStorage,
-) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>, UdfError> {
-    register_join_tables(ctx, spec, storage).await?;
-    let sql = build_join_sql(ctx, JOIN_FACT_TABLE, JOIN_DIM_TABLE, spec).await?;
-    let df = ctx
-        .sql(&sql)
-        .await
-        .map_err(|e| UdfError::User(format!("join SQL error: {e}")))?;
-    df.create_physical_plan()
-        .await
-        .map_err(|e| UdfError::User(format!("physical plan error: {e}")))
+) -> Result<Arc<dyn ExecutionPlan>, UdfError> {
+    physical_plan(build_join_dataframe(ctx, spec, storage).await?).await
 }
 
 #[cfg(test)]

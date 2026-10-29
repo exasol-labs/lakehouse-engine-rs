@@ -3,7 +3,7 @@
 //! bytes itself, and [`DeltaDeletionVector::decode`] hands them to `delta_kernel` through an
 //! in-memory [`StorageHandler`] that performs no I/O.
 
-use crate::scan::emit::{redact_credentials, redact_secret_values};
+use crate::scan::emit::redact_error_text;
 use crate::scan::spec::DeltaDeletionVectorStorage;
 use bytes::Bytes;
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
@@ -263,9 +263,7 @@ fn refusal(format: &str, data_file_path: &str, reason: &str, secrets: &[String])
          apply: {reason}; refusing to emit rows for the affected data file"
     );
     let borrowed: Vec<&str> = secrets.iter().map(String::as_str).collect();
-    UdfError::User(redact_credentials(&redact_secret_values(
-        &message, &borrowed,
-    )))
+    UdfError::User(redact_error_text(&message, &borrowed))
 }
 
 /// Every operation other than reading an already-fetched body returns an error rather than

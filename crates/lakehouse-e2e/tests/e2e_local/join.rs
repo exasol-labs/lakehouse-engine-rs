@@ -1426,6 +1426,53 @@ fn e2e_join_decimal_stringification_matches_native_at_both_surfaces() {
     }
 }
 
+/// Scenario: Scan projects rendered select-list expressions
+#[test]
+fn e2e_join_select_list_with_a_column_and_its_cast_matches_seed() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let select = |vs_name: &str| {
+        format!(
+            "SELECT o.O_ORDERKEY, o.O_CUSTKEY, CAST(o.O_CUSTKEY AS DECIMAL(18,0)), \
+             c.C_NAME, CAST(c.C_NAME AS VARCHAR(20)) FROM {} o \
+             JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY",
+            vs_fact_table(vs_name),
+            vs_dim_table(vs_name)
+        )
+    };
+    let seed_row = |key: usize| {
+        let custkey = order_custkey(key);
+        let name = format!("customer-{custkey:02}");
+        vec![
+            key.to_string(),
+            custkey.to_string(),
+            custkey.to_string(),
+            name.clone(),
+            name,
+        ]
+    };
+
+    for (suffix, keys) in [
+        ("", (1..=FACT_ORDERS_ROWS).collect::<Vec<_>>()),
+        (" ORDER BY o.O_ORDERKEY DESC LIMIT 3", vec![10, 9, 8]),
+    ] {
+        for vs_name in [VS_NAME, VS_NAME_LOW] {
+            let query = format!("{}{suffix}", select(vs_name));
+            if vs_name == VS_NAME {
+                let pushed = explain_virtual_sql(&mut conn, &query);
+                assert!(
+                    has_broadcast_join_block(&pushed),
+                    "the join must drive the broadcast fan-out:\n{pushed}"
+                );
+            }
+            let mut expected: Vec<Vec<String>> = keys.iter().map(|&key| seed_row(key)).collect();
+            expected.sort();
+            let actual = fetch_rows_as_vecs(&conn.query_columns(&query));
+            assert_eq!(actual, expected, "{query}");
+        }
+    }
+}
+
 fn fetch_order_rows(conn: &mut ExaConn) -> Vec<(String, String)> {
     let cols = conn.query_columns(&format!(
         "SELECT O_ORDERKEY, O_CUSTKEY FROM {}",
