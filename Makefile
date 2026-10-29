@@ -25,10 +25,17 @@ VS_SRCS := $(shell find crates/lakehouse-engine/src crates/lakehouse-catalog/src
 
 UDF_CARGO_VOL ?= lakehouse-engine-rs-udf-cargo-registry
 
+# CI's E2E jobs download the .so and set REBUILD_SO=0, so a missing or stale .so
+# fails the job instead of hiding a ~15 min rebuild (#341).
+REBUILD_SO ?= 1
+
 # Runs as the host UID:GID so target/release/** is host-owned (root-owned
 # artifacts break a host `cargo clean`). The registry volume may hold root-owned
 # content, so it is chowned to the host user first.
 $(VS_SO): $(VS_SRCS)
+ifeq ($(REBUILD_SO),0)
+	@echo "ERROR: $@ is missing or older than its sources, and REBUILD_SO=0 forbids rebuilding it" >&2; exit 1
+else
 	docker run --rm -v $(UDF_CARGO_VOL):/usr/local/cargo/registry \
 	  $(UDF_BUILDER_IMAGE) chown -R $(shell id -u):$(shell id -g) /usr/local/cargo/registry
 	docker run --rm \
@@ -41,6 +48,7 @@ $(VS_SO): $(VS_SRCS)
 	  sh -c 'cargo build --release -p lakehouse-engine \
 	    && cargo install cargo-exasol-udf --version "=$(SLC_VERSION)" --locked --quiet --root target/udf-tools \
 	    && PATH="$$PWD/target/udf-tools/bin:$$PATH" cargo exasol-udf validate $@'
+endif
 
 cross-udf-build: $(VS_SO)
 
@@ -60,29 +68,37 @@ export LH_BUCKETFS_PORT
 export LH_SEAWEEDFS_PORT
 export LH_REST_PORT
 
+# `<stack>-up` is `<stack>-start` then `<stack>-wait`; CI runs the two apart to
+# compile the suite while Exasol boots. No test-e2e* target starts its stack.
+E2E_STACKS := e2e lakekeeper azure unity glue
+
+$(addsuffix -start,$(E2E_STACKS)): %-start:
+	./scripts/e2e-stack.sh $* start
+$(addsuffix -wait,$(E2E_STACKS)): %-wait:
+	./scripts/e2e-stack.sh $* wait
+$(addsuffix -up,$(E2E_STACKS)): %-up:
+	./scripts/e2e-stack.sh $* up
+$(addsuffix -down,$(E2E_STACKS)): %-down:
+	./scripts/e2e-stack.sh $* down
+
 # E2E suites FAIL (not skip) when their stack is unavailable, and run serially
 # because all tests share one VS. `--workspace` keeps dependency features identical to the
 # plain workspace build, so a suite compiles only lakehouse-e2e; `-p lakehouse-e2e` rebuilds deps.
+# Requires: make e2e-up
 test-e2e: cross-udf-build
 	cargo test --workspace --features lakehouse-e2e/exasol-e2e --test e2e_local -- --test-threads=1
 
-# Requires:
-#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
-#     seaweedfs exasol keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper proxy
+# Requires: make lakekeeper-up
 test-e2e-lakekeeper: cross-udf-build
 	cargo test --workspace --features lakehouse-e2e/lakekeeper-e2e --test e2e_lakekeeper_test -- --test-threads=1
 
-# Requires:
-#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
-#     -f docker-compose.lakekeeper.azure.yml up -d --wait \
-#     exasol keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper proxy
-# plus real Azure Blob Storage credentials from ./test.env or the environment.
+# Requires: make azure-up, plus real Azure Blob Storage credentials from ./test.env or the environment.
 # Sourcing and cargo MUST stay on one recipe line: each line runs in its own shell.
 test-e2e-azure: cross-udf-build
 	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --workspace --features lakehouse-e2e/azure-e2e --test e2e_azure_test -- --test-threads=1
 
-# Requires: docker compose up -d --wait exasol proxy
-# plus a real AWS Glue Data Catalog and S3 fixture bucket (GLUE_* in ./test.env or the environment).
+# Requires: make glue-up, plus a real AWS Glue Data Catalog and S3 fixture bucket
+# (GLUE_* in ./test.env or the environment).
 # Sourcing and cargo MUST stay on one recipe line: each line runs in its own shell.
 test-e2e-glue: cross-udf-build
 	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --workspace --features lakehouse-e2e/glue-e2e --test e2e_glue_test -- --test-threads=1
@@ -192,9 +208,7 @@ lint-install:
 test-lakekeeper-scripts:
 	bash deploy/scripts/tests/lakekeeper.test.sh
 
-# FAILS (not skips) when the stack is down. Requires:
-#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
-#     seaweedfs keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper
+# FAILS (not skips) when the stack is down. Requires: make lakekeeper-up
 test-lakekeeper-local:
 	bash deploy/scripts/tests/lakekeeper-local.test.sh
 
@@ -211,20 +225,9 @@ lint-lakekeeper-scripts:
 bench: cross-udf-build
 	./bench/run.sh
 
-# `exasol` is included so the UDF can reach the `unitycatalog` service name over
-# the docker network (extra_hosts in the overlay).
-unity-up:
-	docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait \
-	  seaweedfs exasol unitycatalog proxy
-	./scripts/unity/seed.sh
-
-unity-down:
-	docker compose -f docker-compose.yml -f docker-compose.unity.yml down -v
-
-# The cargo line MUST stay flag-identical to the `Run Unity Catalog E2E suite`
-# step in ci.yml's e2e-unity job, which is the authority.
+# Requires: make unity-up
 test-e2e-unity: cross-udf-build
-	$(MAKE) unity-up
 	cargo test --workspace --features lakehouse-e2e/unity-e2e --test e2e_unity_test -- --test-threads=1
 
-.PHONY: cross-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure test-e2e-glue install-slc print-slc-version bucketfs-upload-so fmt fmt-check lint coverage bench test-install lint-install unity-up unity-down test-e2e-unity test-lakekeeper-scripts test-lakekeeper-local lint-lakekeeper-scripts
+.PHONY: cross-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure test-e2e-glue install-slc print-slc-version bucketfs-upload-so fmt fmt-check lint coverage bench test-install lint-install test-e2e-unity test-lakekeeper-scripts test-lakekeeper-local lint-lakekeeper-scripts \
+	$(foreach s,$(E2E_STACKS),$(s)-start $(s)-wait $(s)-up $(s)-down)

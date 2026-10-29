@@ -26,12 +26,17 @@ runs:
         shared-key: workspace-rlib
         save-if: "false"
 
-    # Newer mtime than the sources, so make's test-e2e → cross-udf-build skips rebuilding.
+    # The download's mtime is newer than the sources, so make treats the .so as current.
     - name: Download liblakehouse_engine.so
       uses: actions/download-artifact@v8
       with:
         name: lakehouse-engine-so-x86_64
         path: target/release/
+
+    # A missing or stale .so then fails the job instead of rebuilding for ~15 min (#341).
+    - name: Forbid make from rebuilding the .so
+      shell: bash
+      run: echo "REBUILD_SO=0" >> "$GITHUB_ENV"
 
     # Without this every UDF fails with "VM crashed" (22002): Exasol's nschroot
     # sandbox needs CAP_SYS_ADMIN in an unprivileged user namespace, which Ubuntu
