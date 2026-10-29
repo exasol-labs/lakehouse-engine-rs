@@ -1,7 +1,4 @@
-# Overlay on docker-compose.yml:
-#   docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait \
-#     seaweedfs exasol unitycatalog proxy
-#   ./scripts/unity/seed.sh
+# Overlay on docker-compose.yml. `make unity-up` starts it and seeds the fixtures.
 # UC OSS 0.5.x has no S3 endpoint override (upstream #43), so the engine's
 # ObjectStore injects the SeaweedFS endpoint for vended credentials itself.
 

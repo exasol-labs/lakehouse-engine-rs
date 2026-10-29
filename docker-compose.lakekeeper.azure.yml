@@ -1,9 +1,5 @@
 # Azure E2E overlay — layered ON TOP of docker-compose.yml AND
-# docker-compose.lakekeeper.yml:
-#
-#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
-#     -f docker-compose.lakekeeper.azure.yml up -d --wait \
-#     exasol keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper proxy
+# docker-compose.lakekeeper.yml. Start it with `make azure-up`.
 #
 # Drops lakekeeper's seaweedfs dependency (storage is ADLS Gen2); `!override` is
 # required because Compose merges depends_on maps by key.

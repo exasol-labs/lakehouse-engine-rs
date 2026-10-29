@@ -13,7 +13,7 @@ Spec-driven development with mission in: @specs/mission.md
 
 Project specifics:
 
-- `make test-e2e` runs the E2E suite against the local container. Use `exapump` for all Exasol and BucketFS interaction.
+- `make e2e-up test-e2e` starts the local stack and runs the E2E suite against it. Each suite has its own `<stack>-up` target (`specs/testing.md` § E2E suites). Use `exapump` for all Exasol and BucketFS interaction.
 - `docs/` is the user reference, with `docs/index.md` as its map: installing (`install.md`, which documents `deploy/scripts/install.sh`), CONNECTION and VIRTUAL SCHEMA recipes per catalog (`catalogs.md`), properties (`tuning.md`), how each pushed-down capability executes (`capabilities.md`), and every Exasol capability with whether the adapter advertises it (`capability-matrix.md`). Consult it before reconstructing an install or DDL from test code.
 - Reproduce a reported bug against the Docker Exasol container before fixing it. Do not trust an issue's repro, a capability list, or code inspection alone.
 - Verify any claim about SQL capabilities, syntax, or pushdown reachability against a live Exasol (`EXPLAIN VIRTUAL`, a pushed query, or an E2E test). `capabilities.rs` and documentation are not evidence.
