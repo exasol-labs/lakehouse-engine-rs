@@ -7,6 +7,7 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
 
+use super::super::BinaryColumns;
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
     build_scan_driving_sql, classify_where_filter, collect_all_column_names, extract_limit,
@@ -66,7 +67,8 @@ pub(crate) fn render_broadcast_join(
     let col_types = join_col_types(request, join);
     let bare_pushdown_req = strip_table_alias(pushdown_req);
     let bare_filter_json = bare_pushdown_req.get("filter").filter(|f| !f.is_null());
-    let (filter, declined) = classify_where_filter(bare_filter_json, &col_types);
+    let (filter, declined) =
+        classify_where_filter(bare_filter_json, &col_types, &BinaryColumns::default());
     if declined.is_some() {
         return Ok(None);
     }

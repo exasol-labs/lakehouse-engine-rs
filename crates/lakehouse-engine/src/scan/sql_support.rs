@@ -2,23 +2,32 @@ use arrow::datatypes::DataType;
 use datafusion::common::DFSchema;
 
 use crate::scan::spec::ProjectionItem;
-use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
+use crate::types::mapping::{is_binary, needs_json_fallback, needs_nested_json_rendering};
 
+use super::binary_hex::{BINARY_HEX_UDF_NAME, raw_bytes_alias};
 use super::raw_scan::NESTED_JSON_RENDER_UDF_NAME;
 
 /// Uppercase aliases let identifiers resolved in uppercase match any Parquet field casing.
+/// A binary column is aliased to its hex text, so every expression over it sees what Exasol
+/// sees, and its raw bytes get a second alias for the comparisons the adapter translates.
 /// Public so `tests/it/scan_agg_projection_pruning.rs` builds the same inner SELECT as production.
 pub fn build_alias_items(schema: &DFSchema) -> Vec<String> {
     schema
         .fields()
         .iter()
         .map(|f| {
-            let arrow_name = f.name();
-            format!(
-                "{} AS {}",
-                quote_ident(arrow_name),
-                quote_ident(&arrow_name.to_uppercase())
-            )
+            let column = quote_ident(f.name());
+            let alias = f.name().to_uppercase();
+            if is_binary(f.data_type()) {
+                format!(
+                    "{BINARY_HEX_UDF_NAME}({column}, '{}') AS {}, {column} AS {}",
+                    alias.replace('\'', "''"),
+                    quote_ident(&alias),
+                    quote_ident(&raw_bytes_alias(&alias))
+                )
+            } else {
+                format!("{column} AS {}", quote_ident(&alias))
+            }
         })
         .collect()
 }
@@ -61,10 +70,11 @@ pub(super) fn render_projection<'a>(
 }
 
 /// Nested columns call [`NESTED_JSON_RENDER_UDF_NAME`]; other incompatible columns get
-/// `CAST(col AS VARCHAR)` so they arrive as Utf8.
+/// `CAST(col AS VARCHAR)` so they arrive as Utf8. A binary alias already holds its hex text.
 pub(super) fn render_column(name: &str, data_type: Option<&DataType>) -> String {
     let ident = quote_ident(&name.to_uppercase());
     match data_type {
+        Some(dt) if is_binary(dt) => ident,
         Some(dt) if needs_nested_json_rendering(dt) => {
             format!("{NESTED_JSON_RENDER_UDF_NAME}({ident})")
         }

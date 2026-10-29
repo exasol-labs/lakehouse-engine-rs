@@ -5,8 +5,36 @@ use super::*;
 #[test]
 fn render_column_keeps_a_non_nested_incompatible_column_cast_unchanged() {
     assert_eq!(
-        render_column("PAYLOAD", Some(&DataType::Binary)),
+        render_column(
+            "PAYLOAD",
+            Some(&DataType::Time64(arrow::datatypes::TimeUnit::Microsecond))
+        ),
         "CAST(\"PAYLOAD\" AS VARCHAR)"
+    );
+}
+
+#[test]
+fn a_binary_column_is_aliased_to_its_hex_text_and_exposes_its_raw_bytes() {
+    let schema = DFSchema::try_from(arrow::datatypes::Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("Digest", DataType::FixedSizeBinary(16), true),
+    ]))
+    .unwrap();
+
+    assert_eq!(
+        build_alias_items(&schema),
+        vec![
+            "\"id\" AS \"ID\"".to_string(),
+            format!(
+                "{BINARY_HEX_UDF_NAME}(\"Digest\", 'DIGEST') AS \"DIGEST\", \"Digest\" AS \
+                 \"_LH_BYTES_DIGEST\""
+            ),
+        ]
+    );
+    assert_eq!(
+        render_column("DIGEST", Some(&DataType::FixedSizeBinary(16))),
+        "\"DIGEST\"",
+        "the alias already holds the hex text, so the projection takes it as is"
     );
 }
 

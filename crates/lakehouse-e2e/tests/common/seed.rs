@@ -56,6 +56,7 @@ use iceberg_storage_opendal::{
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
 use parquet::file::properties::WriterProperties;
+use parquet::file::writer::SerializedRowGroupWriter;
 use reqsign_core::{Context as ReqsignContext, Result as ReqsignResult};
 use serde_json::json;
 
@@ -3152,14 +3153,32 @@ pub fn time64_values() -> ArrayRef {
     ]))
 }
 
-/// `LargeBinary` is what `iceberg-rust` maps an Iceberg `binary` to; every other source writes `Binary`.
+/// Bytes that are not UTF-8, then the empty value, then NULL. `LargeBinary` is what
+/// `iceberg-rust` maps an Iceberg `binary` to; every other source writes `Binary`.
 pub fn binary_values(data_type: &DataType) -> ArrayRef {
-    let values = vec![Some(b"ab".as_slice()), Some(b"".as_slice()), None];
+    let values = vec![
+        Some([0x00, 0xab, 0xff].as_slice()),
+        Some(b"".as_slice()),
+        None,
+    ];
     match data_type {
         DataType::LargeBinary => Arc::new(LargeBinaryArray::from_opt_vec(values)),
         _ => Arc::new(BinaryArray::from_opt_vec(values)),
     }
 }
+
+/// `binary_values` as Exasol reads it: lowercase hex, and NULL for the empty value.
+pub const BINARY_VALUES_TEXT: [Option<&str>; 3] = [Some("00abff"), None, None];
+
+/// `struct_binary_values` as Exasol reads it: a JSON member keeps the empty value.
+pub const STRUCT_BINARY_VALUES_TEXT: [Option<&str>; 3] =
+    [Some(r#"{"x":"00abff"}"#), Some(r#"{"x":""}"#), None];
+
+pub const FIXED_16_VALUES_TEXT: [Option<&str>; 3] = [
+    Some("55555555555555555555555555555555"),
+    Some("11111111111111111111111111111111"),
+    None,
+];
 
 pub fn fixed_16_values() -> ArrayRef {
     Arc::new(
@@ -3253,14 +3272,19 @@ pub fn string_int_map_values(keys: Vec<&str>, values: Vec<i32>, lengths: [usize;
     )
 }
 
+/// One byte over what a `VARCHAR(2000000)` hex rendering holds.
+pub const OVERSIZED_BINARY_BYTES: usize = 1_000_001;
+
 /// `binary_values`' data file: `message` declares `id` and one `BYTE_ARRAY` column `c_bytes`,
 /// which holds `NON_UTF8_BYTES`.
 pub fn non_utf8_parquet(message: &str) -> bytes::Bytes {
-    encode_parquet_message(message, |row_group| {
-        write_parquet_column::<_, Int64Type>(row_group, &ALL_TYPES_IDS, None);
-        let values = NON_UTF8_BYTES.map(|bytes| ByteArray::from(bytes.to_vec()));
-        write_parquet_column::<_, ByteArrayType>(row_group, &values, Some(&[1, 1, 0]));
-    })
+    encode_parquet_message(message, write_non_utf8_columns)
+}
+
+fn write_non_utf8_columns(row_group: &mut SerializedRowGroupWriter<'_, &mut Vec<u8>>) {
+    write_parquet_column::<_, Int64Type>(row_group, &ALL_TYPES_IDS, None);
+    let values = NON_UTF8_BYTES.map(|bytes| ByteArray::from(bytes.to_vec()));
+    write_parquet_column::<_, ByteArrayType>(row_group, &values, Some(&[1, 1, 0]));
 }
 
 /// Field ids follow the REST catalog's fresh assignment, every top-level field before the
@@ -3388,6 +3412,7 @@ async fn seed_binary_values(catalog: &impl Catalog) -> Result<()> {
         .with_fields(vec![
             NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
             NestedField::optional(2, "c_bytes", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::optional(3, "c_oversized", Type::Primitive(PrimitiveType::Binary)).into(),
         ])
         .build()
         .context("build binary_values Iceberg schema")?;
@@ -3404,11 +3429,17 @@ async fn seed_binary_values(catalog: &impl Catalog) -> Result<()> {
         return Ok(());
     };
 
-    let bytes = non_utf8_parquet(
+    let bytes = encode_parquet_message(
         "message binary_values {
             REQUIRED INT64 id = 1;
             OPTIONAL BYTE_ARRAY c_bytes (STRING) = 2;
+            OPTIONAL BYTE_ARRAY c_oversized = 3;
         }",
+        |row_group| {
+            write_non_utf8_columns(row_group);
+            let oversized = ByteArray::from(vec![0u8; OVERSIZED_BINARY_BYTES]);
+            write_parquet_column::<_, ByteArrayType>(row_group, &[oversized], Some(&[1, 0, 0]));
+        },
     );
     let path = format!(
         "{}/data/{E2E_BINARY_VALUES_TABLE}-{}.parquet",

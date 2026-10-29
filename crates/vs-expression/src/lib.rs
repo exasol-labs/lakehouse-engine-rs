@@ -483,6 +483,20 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             }));
         }
         "literal_date" => return Ok(Some(format!("DATE {}", quote_literal(value("value"))))),
+        // Synthesized by the adapter for a binary column, never sent by Exasol. A `width` types
+        // it `FixedSizeBinary`, so comparing it leaves a fixed-length column uncast.
+        "literal_binary" if dialect == Dialect::DataFusion => {
+            let hex = value("value").and_then(|v| v.as_str()).unwrap_or_default();
+            if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(UdfError::User(format!(
+                    "literal_binary value '{hex}' is not hexadecimal"
+                )));
+            }
+            return Ok(Some(match value("width").and_then(|w| w.as_u64()) {
+                Some(width) => format!("arrow_cast(X'{hex}', 'FixedSizeBinary({width})')"),
+                None => format!("X'{hex}'"),
+            }));
+        }
         "literal_timestamp" => {
             // Exasol has no `arrow_cast` (42000); re-emit the bare literal it sent.
             if dialect == Dialect::Exasol {

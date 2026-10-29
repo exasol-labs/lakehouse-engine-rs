@@ -220,8 +220,13 @@ fn handle_create_virtual_schema(
 
     let engine_timestamps = EngineTimestampSupport::from_database_version(&ctx.database_version());
 
-    let tables_json = build_listing_virtual_tables(&configured_ns, &listing, engine_timestamps)
-        .map_err(|e| redact_error(&config.storage, e))?;
+    let tables_json = build_listing_virtual_tables(
+        &configured_ns,
+        &listing,
+        engine_timestamps,
+        checked.binary_as_string,
+    )
+    .map_err(|e| redact_error(&config.storage, e))?;
 
     for entry in &listing.skipped {
         udf_log!(ctx, warn, "{}", skip_warning(entry));
@@ -459,6 +464,7 @@ fn build_listing_virtual_tables(
     configured_ns: &[String],
     listing: &CatalogListing,
     engine_timestamps: EngineTimestampSupport,
+    binary_as_string: bool,
 ) -> Result<Vec<Json>, UdfError> {
     reject_name_collisions(configured_ns, listing.tables.iter().map(|t| &t.ident))?;
     let mut tables_json: Vec<Json> = Vec::with_capacity(listing.tables.len());
@@ -468,7 +474,7 @@ fn build_listing_virtual_tables(
         let columns = table
             .columns
             .iter()
-            .zip(declare_columns(table))
+            .zip(declare_columns(table, binary_as_string))
             .map(|(col, note)| {
                 let column_name = col.name.to_uppercase();
                 let mut column = json!({

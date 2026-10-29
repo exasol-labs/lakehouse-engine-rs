@@ -18,6 +18,9 @@ use crate::scan::spec::{
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
+mod binary_filter;
+pub(crate) use binary_filter::BinaryColumns;
+
 mod support;
 pub use support::{AggregateMergeInputs, build_fan_out_inner, build_scan_driving_sql, shard_count};
 use support::{
@@ -158,10 +161,6 @@ pub async fn handle_pushdown(
         notes: col_notes,
     } = involved_columns(request, |tables| tables.first());
 
-    // `filter_json_raw` stays unmodified: format-level pruning must see the original
-    // predicate tree, whatever the adapter declines.
-    let (filter, declined_filter) = classify_where_filter(filter_json_raw, &col_types);
-
     let limit = extract_limit(&pushdown_req);
 
     // A limit is withheld from any ORDER BY request not matched as a bounded top-N, so
@@ -193,6 +192,13 @@ pub async fn handle_pushdown(
     } = resolver
         .resolve(&catalog.table, filter_json_raw, &col_notes)
         .await?;
+    // `filter_json_raw` stays unmodified: format-level pruning must see the original
+    // predicate tree, whatever the adapter declines.
+    let (filter, declined_filter) = classify_where_filter(
+        filter_json_raw,
+        &col_types,
+        &BinaryColumns::of(&logical_schema),
+    );
     let scan_storage = scan_storage_for(
         &conn.creds,
         &conn.connection_name,

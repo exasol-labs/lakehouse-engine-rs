@@ -45,24 +45,26 @@ mod tests;
 /// The one CREATE-time declaration dispatch: each column's note, `None` for a column no source
 /// declares. An engine-side client's slot already holds the encoded note. Never fails: a column
 /// whose metadata cannot be declared is recorded with its refusal.
-pub(crate) fn declare_columns(table: &CatalogTable) -> Vec<Option<String>> {
+pub(crate) fn declare_columns(table: &CatalogTable, binary_as_string: bool) -> Vec<Option<String>> {
     let catalog_declared = catalog_declaration::declare(table);
     table
         .columns
         .iter()
         .enumerate()
-        .map(
-            |(index, column)| match (&column.declaration, &column.source_type) {
-                (Some(note), _) => Some(note.clone()),
-                (None, ColumnSourceType::Iceberg(field)) => {
-                    Some(iceberg::declaration(field).encode())
-                }
+        .map(|(index, column)| {
+            let declaration = match (&column.declaration, &column.source_type) {
+                (Some(note), _) => match serde_json::from_str::<ColumnDeclaration>(note) {
+                    Ok(declaration) => Some(declaration),
+                    Err(_) => return Some(note.clone()),
+                },
+                (None, ColumnSourceType::Iceberg(field)) => Some(iceberg::declaration(field)),
                 (None, ColumnSourceType::Unity { .. } | ColumnSourceType::Glue { .. }) => {
-                    catalog_declared.get(index).map(ColumnDeclaration::encode)
+                    catalog_declared.get(index).cloned()
                 }
                 (None, ColumnSourceType::Parquet(_)) => None,
-            },
-        )
+            };
+            declaration.map(|declaration| declaration.binary_as_string(binary_as_string).encode())
+        })
         .collect()
 }
 

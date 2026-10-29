@@ -61,7 +61,7 @@ The Parquet directory seam answers three questions about a storage prefix: which
 
 * *GIVEN* an object store, a storage prefix, a merge mode, and a partitioning switch
 * *WHEN* table enumeration asks for that prefix's data files and schema
-* *THEN* exactly ONE function SHALL answer, returning every data file with its byte size and partition values, the declared partition columns, the folded Arrow schema, and the binary columns the fold found
+* *THEN* exactly ONE function SHALL answer, returning every data file with its byte size and partition values, the declared partition columns, the folded Arrow schema with every top-level `ENUM` column folded to text, and the geospatial and nested `ENUM` columns the fold refuses
 * *AND* that function SHALL name no catalog kind, no table format, no Exasol connection, and no virtual-schema property, so it takes two switch values rather than the properties that set them
 * *AND* that function SHALL take no file-keep predicate, because enumeration keeps every file and no pushdown calls it
 * *AND* no caller SHALL carry its own listing filter, its own footer reader, its own merge policy, or its own partition parser, because two policies over one property is the drift this seam exists to prevent

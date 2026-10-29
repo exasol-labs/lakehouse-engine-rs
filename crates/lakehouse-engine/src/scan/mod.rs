@@ -24,6 +24,9 @@ pub(crate) use field_id_projection::{
 mod json_render;
 pub(crate) use json_render::render_nested_column_as_json;
 
+mod binary_hex;
+pub(crate) use binary_hex::raw_bytes_alias;
+
 mod sql_support;
 pub use sql_support::build_alias_items;
 
@@ -132,6 +135,7 @@ pub(crate) fn scan_session_context(
     let ctx = SessionContext::new_with_state(state);
     numeric_typing.register_functions(&ctx);
     raw_scan::register_nested_json_render_udf(&ctx);
+    binary_hex::register_binary_hex_udf(&ctx);
     checked_div::register_checked_float_div_udf(&ctx, raised);
     ctx
 }

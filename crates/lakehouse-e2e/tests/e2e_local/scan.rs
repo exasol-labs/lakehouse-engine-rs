@@ -5,17 +5,18 @@
 use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
 use crate::common::seed::{
-    ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT,
-    DECIMAL_36_6_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT, DIM_CUSTOMER_ROWS, E2E_ALL_TYPES_TABLE,
-    E2E_BINARY_VALUES_TABLE, E2E_EVO_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2,
-    EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS,
-    EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FLOAT32_VALUES_TEXT, INT32_VALUES_TEXT,
-    LINEITEM_ROWS, LINES_PER_ORDER, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE,
+    ALL_TYPES_IDS_TEXT, BINARY_VALUES_TEXT, BOOLEAN_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT,
+    DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT,
+    DIM_CUSTOMER_ROWS, E2E_ALL_TYPES_TABLE, E2E_BINARY_VALUES_TABLE, E2E_EVO_TABLE, E2E_NAMESPACE,
+    E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2, EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS,
+    EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS,
+    FIXED_16_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT32_VALUES_TEXT, LINEITEM_ROWS, LINES_PER_ORDER,
+    OVERSIZED_BINARY_BYTES, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE,
     PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, PART_VALUES, SEED_LABELS_ROWS,
-    SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
-    TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, initdef_columns, seed_added_columns_initial_default,
-    seed_renamed_column, typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev,
-    typed_id_avg_stddev,
+    SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, STRUCT_BINARY_VALUES_TEXT, TIME64_VALUES_TEXT,
+    TIMESTAMP_VALUES_TEXT, TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, initdef_columns,
+    seed_added_columns_initial_default, seed_renamed_column, typed_decimal_a_avg_stddev,
+    typed_decimal_b_avg_stddev, typed_id_avg_stddev,
 };
 use crate::common::stack::{exasol_container, iceberg_catalog_url, iceberg_catalog_url_internal};
 use crate::common::timestamp_precision::{
@@ -186,7 +187,6 @@ fn create_vs_maps_iceberg_schema() {
 
 /// Scenario: A catalog-declared DECIMAL outside Exasol's DECIMAL domain falls back to VARCHAR
 /// Scenario: A nanosecond catalog timestamp column is declared TIMESTAMP(9) on Exasol 2025.x and later
-/// Scenario: The listing declares a binary column
 #[test]
 fn iceberg_all_types_declare_and_return_their_mapped_values() {
     lakehouse_vs();
@@ -213,14 +213,10 @@ fn iceberg_all_types_declare_and_return_their_mapped_values() {
             reads("C_TIME", VARCHAR_JSON, TIME64_VALUES_TEXT),
             reads("C_TIMESTAMPTZ", timestamp, TIMESTAMP_VALUES_TEXT),
             reads("C_TIMESTAMP_NS", timestamp_ns, TIMESTAMP_VALUES_TEXT),
-            refuses("C_BINARY", VARCHAR_JSON, &["type 'binary'", "#351"]),
-            refuses("C_FIXED", VARCHAR_JSON, &["type 'fixed(16)'", "#351"]),
-            refuses("C_UUID", VARCHAR_JSON, &["type 'uuid'", "#351"]),
-            refuses(
-                "C_STRUCT_BINARY",
-                VARCHAR_JSON,
-                &["member 'c_struct_binary.x'", "type 'binary'", "#351"],
-            ),
+            reads("C_BINARY", VARCHAR_JSON, BINARY_VALUES_TEXT),
+            reads("C_FIXED", "VARCHAR(32)", FIXED_16_VALUES_TEXT),
+            reads("C_UUID", "VARCHAR(32)", FIXED_16_VALUES_TEXT),
+            reads("C_STRUCT_BINARY", VARCHAR_JSON, STRUCT_BINARY_VALUES_TEXT),
         ],
     );
     assert_decimal_orders_numerically(
@@ -234,20 +230,41 @@ fn iceberg_all_types_declare_and_return_their_mapped_values() {
         LAKEHOUSE_VS,
         E2E_BINARY_VALUES_TABLE,
         "non UTF-8 data",
+        &[("C_OVERSIZED", VARCHAR_JSON)],
     );
 }
 
-/// Scenario: A refused column's note records its refusal and the column stays declared
+/// Scenario: A binary column reads as lowercase hex on every source
+/// Scenario: A filter on a binary column selects what native Exasol selects over the hex text
+/// Scenario: A binary value too long for its hex rendering fails the query
 #[test]
-fn iceberg_binary_column_note_records_the_refusal() {
+fn iceberg_binary_columns_read_and_filter_as_lowercase_hex() {
     lakehouse_vs();
     let mut conn = exa_conn();
-    assert_refused_column(
+    let all_types = format!("{LAKEHOUSE_VS}.{}", E2E_ALL_TYPES_TABLE.to_uppercase());
+
+    assert_binary_columns_match_native_copy(
         &mut conn,
-        LAKEHOUSE_VS,
-        &E2E_ALL_TYPES_TABLE.to_uppercase(),
-        "C_BINARY",
-        &["'c_binary'", "type 'binary'"],
+        &all_types,
+        &["C_BINARY"],
+        &["C_FIXED", "C_UUID"],
+    );
+    assert_hex_literal_compares_bytes(&mut conn, &all_types, "C_BINARY", "00abff");
+    assert_hex_literal_compares_bytes(&mut conn, &all_types, "C_UUID", &"11".repeat(16));
+
+    let binary_values = format!("{LAKEHOUSE_VS}.{}", E2E_BINARY_VALUES_TABLE.to_uppercase());
+    assert_query_fails(
+        &mut conn,
+        &format!("SELECT C_OVERSIZED FROM {binary_values}"),
+        &[
+            "column 'C_OVERSIZED'",
+            &format!("{OVERSIZED_BINARY_BYTES} bytes"),
+        ],
+    );
+    assert_text_columns(
+        &mut conn,
+        &format!("SELECT C_OVERSIZED FROM {binary_values} WHERE ID = 2"),
+        &[[None::<&str>]],
     );
 }
 

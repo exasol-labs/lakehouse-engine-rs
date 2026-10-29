@@ -1,5 +1,5 @@
 use super::super::super::test_support::{
-    BINARY_ICEBERG_LAST_COLUMN_ID, RecordingCatalog, binary_iceberg_fields, binary_refused,
+    BINARY_ICEBERG_LAST_COLUMN_ID, RecordingCatalog, binary_iceberg_fields,
     declared_logical_schema, glue_catalog_table, involved_notes, load_table_body,
     load_table_body_notes, load_table_body_with_columns, object_endpoint, resolve_from_notes,
     sample_storage, sigv4_creds, user_message,
@@ -1317,50 +1317,32 @@ async fn resolve_table_with_columns(
     resolve_rest(body, "db.t", &sigv4_creds(), &sample_storage(), None).await
 }
 
-/// Scenario: A binary column is refused on every catalog-declared format at every depth
 #[tokio::test]
-async fn iceberg_binary_fixed_and_uuid_columns_are_refused_and_an_all_binary_table_as_a_whole() {
+async fn iceberg_binary_fixed_and_uuid_columns_declare_their_byte_types_at_every_depth() {
     let resolved =
         resolve_table_with_columns(binary_iceberg_fields(), BINARY_ICEBERG_LAST_COLUMN_ID)
             .await
-            .expect("a table with a mappable column plans, refusing only its binary columns");
+            .expect("a table with binary columns plans");
 
     assert_eq!(
         resolved
             .logical_schema
             .iter()
-            .map(|field| (field.name.as_str(), field.field_id))
+            .map(|field| (field.name.as_str(), field.arrow_type.as_str()))
             .collect::<Vec<_>>(),
-        vec![("id", Some(1)), ("name", Some(13))],
-        "every refused column is dropped from the logical schema, and nothing else"
-    );
-    let refused = |column, member, declared| binary_refused("Iceberg", column, member, declared);
-    assert_eq!(
-        resolved.refused_columns,
         vec![
-            refused("b", None, "binary"),
-            refused("f", None, "fixed(16)"),
-            refused("u", None, "uuid"),
-            refused("s", Some("s.x"), "binary"),
-            refused("l", Some("l.element"), "fixed(4)"),
-            refused("m", Some("m.value"), "uuid"),
+            ("id", "int32"),
+            ("b", "binary"),
+            ("f", "fixed_size_binary(16)"),
+            ("u", "fixed_size_binary(16)"),
+            ("s", "utf8"),
+            ("l", "utf8"),
+            ("m", "utf8"),
+            ("name", "utf8"),
         ],
-        "each binary column is refused by name, naming its declared type, its member path, and \
-         issue #351"
+        "a top-level binary column keeps its byte type, and a nested one renders as JSON"
     );
-
-    let every_column_binary = serde_json::json!([
-        {"id": 1, "name": "b", "required": false, "type": "binary"},
-        {"id": 2, "name": "u", "required": false, "type": "uuid"}
-    ]);
-    let message = resolve_table_with_columns(every_column_binary, 2)
-        .await
-        .expect_err("a table with no mappable column cannot be scanned")
-        .to_string();
-    assert!(
-        message.contains("virtual table 'T' has no mappable column"),
-        "{message}"
-    );
+    assert!(resolved.refused_columns.is_empty());
 }
 
 #[test]
@@ -1528,13 +1510,13 @@ fn iceberg_v3_types_without_an_exasol_rendering_are_refused_at_declaration() {
         refusal(primitive(PrimitiveType::Geometry(
             GeometryType::new(None).unwrap()
         ))),
-        format!("Iceberg column 'c' {}", binary_cause("geometry"))
+        format!("Iceberg column 'c' {}", unread_type_cause("geometry"))
     );
     assert_eq!(
         refusal(primitive(
             PrimitiveType::Geography(GeographyType::default())
         )),
-        format!("Iceberg column 'c' {}", binary_cause("geography"))
+        format!("Iceberg column 'c' {}", unread_type_cause("geography"))
     );
     assert!(
         refusal(primitive(PrimitiveType::Unknown))

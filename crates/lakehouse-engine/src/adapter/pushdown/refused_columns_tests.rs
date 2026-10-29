@@ -1,10 +1,10 @@
 use serde_json::json;
 
 use super::*;
-use crate::adapter::pushdown::test_support::{binary_refused, user_message};
+use crate::adapter::pushdown::test_support::{unread_refused, user_message};
 
-fn binary_col() -> RefusedColumn {
-    binary_refused("Delta", "binary_col", None, "binary")
+fn shape_col() -> RefusedColumn {
+    unread_refused("Parquet", "shape_col", None, "geometry")
 }
 
 const VARIANT_REASON: &str = "Delta column 'variant_col' has type 'variant', whose on-disk form is \
@@ -22,7 +22,7 @@ fn involved_tables() -> Json {
         "name": "STATS_ALL_TYPES",
         "columns": [
             {"name": "INT_COL", "dataType": {"type": "decimal", "precision": 10, "scale": 0}},
-            {"name": "BINARY_COL", "dataType": {"type": "varchar", "size": 2000000}},
+            {"name": "SHAPE_COL", "dataType": {"type": "varchar", "size": 2000000}},
             {"name": "MAP_COL", "dataType": {"type": "varchar", "size": 2000000}},
             {"name": "NESTED_STRUCT", "dataType": {"type": "varchar", "size": 2000000}},
             {"name": "VARIANT_COL", "dataType": {"type": "varchar", "size": 2000000}},
@@ -47,11 +47,11 @@ fn a_request_touching_no_refused_column_is_admitted() {
     });
     let projection = [ProjectionItem::Column("INT_COL".to_string())];
 
-    let gated = ensure_no_refused_column_referenced(&request, Some(&projection), &[binary_col()]);
+    let gated = ensure_no_refused_column_referenced(&request, Some(&projection), &[shape_col()]);
 
     assert!(
         gated.is_ok(),
-        "a request that neither reads nor emits BINARY_COL must plan, even though the table \
+        "a request that neither reads nor emits SHAPE_COL must plan, even though the table \
          declares it, got: {:?}",
         gated.err()
     );
@@ -64,11 +64,11 @@ fn a_table_with_no_refused_column_admits_every_request() {
         "involvedTables": involved_tables(),
         "pushdownRequest": {
             "type": "select",
-            "selectList": [column_node("BINARY_COL"), column_node("MAP_COL")],
+            "selectList": [column_node("SHAPE_COL"), column_node("MAP_COL")],
         },
     });
     let projection = [
-        ProjectionItem::Column("BINARY_COL".to_string()),
+        ProjectionItem::Column("SHAPE_COL".to_string()),
         ProjectionItem::Column("MAP_COL".to_string()),
     ];
 
@@ -100,7 +100,7 @@ fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
                             "name": "UPPER",
                             "arguments": [{
                                 "type": "function_scalar_case",
-                                "arguments": [column_node("BINARY_COL")],
+                                "arguments": [column_node("SHAPE_COL")],
                             }],
                         },
                         "right": {"type": "literal_string", "value": "x"},
@@ -111,12 +111,12 @@ fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
     });
     let projection = [ProjectionItem::Column("INT_COL".to_string())];
 
-    let err = ensure_no_refused_column_referenced(&request, Some(&projection), &[binary_col()])
-        .expect_err("a filter reaching BINARY_COL at any depth must be refused");
+    let err = ensure_no_refused_column_referenced(&request, Some(&projection), &[shape_col()])
+        .expect_err("a filter reaching SHAPE_COL at any depth must be refused");
 
     let message = user_message(err);
     assert!(
-        message.contains(&binary_col().reason),
+        message.contains(&shape_col().reason),
         "refusal must carry the reader's own reason for the column, got: {message}"
     );
 }
@@ -133,16 +133,16 @@ fn a_full_row_projection_refuses_a_column_the_request_json_never_names() {
     });
     let projection = [
         ProjectionItem::Column("INT_COL".to_string()),
-        ProjectionItem::Column("BINARY_COL".to_string()),
+        ProjectionItem::Column("SHAPE_COL".to_string()),
         ProjectionItem::Column("MAP_COL".to_string()),
     ];
 
-    let err = ensure_no_refused_column_referenced(&request, Some(&projection), &[binary_col()])
-        .expect_err("a full-base-row projection emitting BINARY_COL must be refused");
+    let err = ensure_no_refused_column_referenced(&request, Some(&projection), &[shape_col()])
+        .expect_err("a full-base-row projection emitting SHAPE_COL must be refused");
 
     let message = user_message(err);
     assert!(
-        message.contains(&binary_col().reason),
+        message.contains(&shape_col().reason),
         "refusal must carry the reader's own reason for the emitted column, got: {message}"
     );
 }
@@ -160,7 +160,7 @@ fn a_widened_projection_from_an_aggregate_select_list_is_not_unioned_into_the_to
         },
     });
 
-    let gated = ensure_no_refused_column_referenced(&request, None, &[binary_col()]);
+    let gated = ensure_no_refused_column_referenced(&request, None, &[shape_col()]);
 
     assert!(
         gated.is_ok(),
@@ -180,17 +180,17 @@ fn a_widened_projection_is_still_refused_when_the_request_itself_names_a_refused
             "selectList": [{
                 "type": "function_aggregate",
                 "name": "MAX",
-                "arguments": [column_node("BINARY_COL")],
+                "arguments": [column_node("SHAPE_COL")],
                 "distinct": false,
             }],
         },
     });
 
-    let err = ensure_no_refused_column_referenced(&request, None, &[binary_col()])
+    let err = ensure_no_refused_column_referenced(&request, None, &[shape_col()])
         .expect_err("an aggregate whose argument names the refused column must be refused");
 
     assert!(
-        user_message(err).contains(&binary_col().reason),
+        user_message(err).contains(&shape_col().reason),
         "withholding the widened projection must not withhold the walk's own finding"
     );
 }
@@ -213,19 +213,19 @@ fn every_refused_column_a_request_touches_is_named_in_one_error() {
     });
     let projection = [
         ProjectionItem::Column("INT_COL".to_string()),
-        ProjectionItem::Column("BINARY_COL".to_string()),
+        ProjectionItem::Column("SHAPE_COL".to_string()),
     ];
 
     let err = ensure_no_refused_column_referenced(
         &request,
         Some(&projection),
-        &[binary_col(), refused_column("variant_col", VARIANT_REASON)],
+        &[shape_col(), refused_column("variant_col", VARIANT_REASON)],
     )
     .expect_err("a request reaching two refused columns must be refused");
 
     let message = user_message(err);
     let binary_position = message
-        .find(&binary_col().reason)
+        .find(&shape_col().reason)
         .expect("refusal must carry the emitted column's reason");
     let variant_position = message
         .find(VARIANT_REASON)
@@ -237,8 +237,8 @@ fn every_refused_column_a_request_touches_is_named_in_one_error() {
 }
 
 #[test]
-fn only_binary_col_refuses_requests_in_the_stats_all_types_shape() {
-    let refused = [binary_col()];
+fn only_shape_col_refuses_requests_in_the_stats_all_types_shape() {
+    let refused = [shape_col()];
     let nested_request = json!({
         "involvedTables": involved_tables(),
         "pushdownRequest": {
@@ -263,13 +263,13 @@ fn only_binary_col_refuses_requests_in_the_stats_all_types_shape() {
         "involvedTables": involved_tables(),
         "pushdownRequest": {
             "type": "select",
-            "selectList": [column_node("MAP_COL"), column_node("BINARY_COL")],
+            "selectList": [column_node("MAP_COL"), column_node("SHAPE_COL")],
         },
     });
 
     let err = ensure_no_refused_column_referenced(&binary_request, None, &refused)
-        .expect_err("a request naming BINARY_COL must still be refused");
-    assert!(user_message(err).contains(&binary_col().reason));
+        .expect_err("a request naming SHAPE_COL must still be refused");
+    assert!(user_message(err).contains(&shape_col().reason));
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it
@@ -280,17 +280,17 @@ fn a_lower_cased_column_reference_matches_a_refused_column() {
         "pushdownRequest": {
             "type": "select",
             "selectList": [json!({
-                "type": "column", "name": "binary_col", "tableName": "STATS_ALL_TYPES",
+                "type": "column", "name": "shape_col", "tableName": "STATS_ALL_TYPES",
             })],
         },
     });
     let projection = [ProjectionItem::Column("INT_COL".to_string())];
 
-    let err = ensure_no_refused_column_referenced(&request, Some(&projection), &[binary_col()])
+    let err = ensure_no_refused_column_referenced(&request, Some(&projection), &[shape_col()])
         .expect_err("the request's case must not decide whether the gate matches");
 
     assert!(
-        user_message(err).contains(&binary_col().reason),
+        user_message(err).contains(&shape_col().reason),
         "a lower-cased reference must match a refused column of the same name"
     );
 }

@@ -34,7 +34,7 @@ docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait \
   | `cm_name_mode` / `cm_id_mode` | column mapping (name / id) | #320 |
   | `basic_partitioned` | partition values / partition pruning | #319, #321 |
   | `multi_part_stats` | multi-file stats-based pruning | #321 |
-  | `stats_all_types` | broad types: `array` maps to text VARCHAR, `map`/`struct`/`binary` refused per column; `timestampNtz` maps to TIMESTAMP | #322, #350 |
+  | `stats_all_types` | broad types: `array` maps to text VARCHAR, `map`/`struct` refused per column, `binary` reads as hex; `timestampNtz` maps to TIMESTAMP | #322, #350 |
   | `unshredded_variant` | reader feature outside the plan-time gate's seven-feature allow-list (`variantType`, concretely) → fail-loud | #322 |
   | `type_widening` | type widening read across the boundary; 11 of 13 columns queryable at their widened types, `byte_decimal`/`short_decimal` refused per column (outside the Delta protocol's supported-pair list) | #349 |
 

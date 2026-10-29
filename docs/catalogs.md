@@ -324,8 +324,8 @@ vended.
 
 - The columns and their types are the catalog's own declaration, read from each column's
   `type_json`. A `struct`, `array`, or `map` column surfaces as JSON `VARCHAR(2000000)`. A `binary`
-  or `variant` column, or one with no readable `type_json`, is refused by name, as for a Delta table
-  (see [Binary columns](#binary-columns)).
+  column reads as hex (see [Binary columns](#binary-columns)). A `variant` column, or one with no
+  readable `type_json`, is refused by name, as for a Delta table.
   Every column is nullable, so a file that lacks a column reads NULL for it.
 - The partition columns are the columns the catalog declares with a `partition_index`, in that
   order. Each file's values come from the `key=value` directory segments of its own path, matched
@@ -499,9 +499,10 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 | `timestamp` | The catalog-declared timestamp type: `TIMESTAMP(6)` on Exasol 2025.x and later, bare `TIMESTAMP` on 8.x |
 | `decimal(p,s)`, or `decimal` for `decimal(10,0)` | `DECIMAL(p,s)`, or `VARCHAR(2000000)` when the precision or scale is outside Exasol's `DECIMAL` domain |
 | `array<...>`, `map<...>`, `struct<...>` | JSON `VARCHAR(2000000)` |
-| `binary`, an unrecognized type, or a malformed type string | Declared `VARCHAR(2000000)`, and refused when a query reads it |
+| `binary` | Lowercase hex `VARCHAR(2000000)` (see [Binary columns](#binary-columns)) |
+| An unrecognized type, or a malformed type string | Declared `VARCHAR(2000000)`, and refused when a query reads it |
 
-A refused column fails only the queries that read or emit it. The refusal reason quotes the Hive type string. A table whose every column is refused is refused as a whole. A `binary` column, or a nested type with a `binary` member, follows the rule in [Binary columns](#binary-columns).
+A refused column fails only the queries that read or emit it. The refusal reason quotes the Hive type string. A table whose every column is refused is refused as a whole.
 
 **Partition values.** The adapter takes each partition's values from `GetPartitions`, in the order of the table's partition keys. It never parses a value from the location path. The Hive literal `__HIVE_DEFAULT_PARTITION__` reads NULL. A partition whose value count differs from the partition-key count fails the query and names the partition's location. Every query reads the Glue metadata again. It issues one `GetTable`, the paginated `GetPartitions`, and one object listing per kept partition. The adapter caches nothing.
 
@@ -529,7 +530,6 @@ A refused column fails only the queries that read or emit it. The refusal reason
 **Scoped exceptions.** These Glue cases are deliberate limits:
 
 - A Hive table with partition projection is skipped, because Glue registers no partition for it.
-- Every binary type is refused (see [Binary columns](#binary-columns)).
 - An ORC, Delta (Athena), text, JSON, Avro, or symlink table is skipped.
 - A `warehouse` that names another account's `CatalogId` is untested (#TBD). To read another account's catalog, assume a role in that account and omit `warehouse`.
 - Lake Formation grants are not evaluated (see [Security](security.md#aws-glue-credentials-and-lake-formation)).
@@ -627,7 +627,7 @@ form, the name they are declared under, which gives three rules:
 Before this release a `key=value` directory was read as a plain directory; set
 `HIVE_PARTITIONING = 'FALSE'` to keep that behavior across the upgrade.
 
-**Parquet types.** The adapter reads each column's Parquet physical type and annotation, and declares the Exasol type below. Where Exasol has no matching type, the adapter declares the column `VARCHAR(2000000)`. The adapter refuses the columns in the last row, because it has no faithful rendering for binary (#351).
+**Parquet types.** The adapter reads each column's Parquet physical type and annotation, and declares the Exasol type below. Where Exasol has no matching type, the adapter declares the column `VARCHAR(2000000)`. The adapter refuses the columns in the last row.
 
 | Parquet type | Exasol type |
 |---|---|
@@ -637,12 +637,13 @@ Before this release a `key=value` directory was read as a plain directory; set
 | `INT32` annotated `INT(32, false)`, and `INT64` signed or unsigned | `DECIMAL(20,0)` |
 | `FLOAT`, `DOUBLE` | `DOUBLE PRECISION` |
 | `BYTE_ARRAY` annotated `STRING`, and a top-level `ENUM` | `VARCHAR(2000000)` |
+| Unannotated `BYTE_ARRAY` and `FIXED_LEN_BYTE_ARRAY`, `UUID`, `BSON` | Lowercase hex `VARCHAR` (see [Binary columns](#binary-columns)) |
 | `INT32` annotated `DATE` | `DATE` |
 | `DECIMAL(p,s)` | `DECIMAL(p,s)` when p is at most 36, else `VARCHAR(2000000)` holding the decimal text |
 | `INT64` annotated `TIMESTAMP` in `MILLIS`, `MICROS`, or `NANOS`, and `INT96` | `TIMESTAMP`, which Exasol stores as `TIMESTAMP(3)`. Digits below the millisecond are dropped ([#461](https://github.com/exasol-labs/lakehouse-engine-rs/issues/461)) |
 | `TIME`, `INTERVAL` | `VARCHAR(2000000)` holding text |
 | `LIST`, `MAP`, and a group (struct) | `VARCHAR(2000000)` holding JSON |
-| Unannotated `BYTE_ARRAY`, unannotated `FIXED_LEN_BYTE_ARRAY`, `UUID`, `BSON`, `GEOMETRY`, `GEOGRAPHY` | `VARCHAR(2000000)`, refused when a query reads the column (see [Binary columns](#binary-columns)) |
+| `GEOMETRY`, `GEOGRAPHY` | `VARCHAR(2000000)`, refused when a query reads the column |
 
 A null value reads as SQL NULL in every type.
 
@@ -692,22 +693,25 @@ query that reads the column.
 
 ## Binary columns
 
-Every binary type is refused on every source until issue #351 defines a faithful rendering for binary. The listing still declares the column as `VARCHAR(2000000)`, so the virtual table lists every column. A query that reads or emits a refused column fails at plan time. The error names the column, its declared type, and #351. A query that reads other columns still succeeds, and so does `SELECT COUNT(*)`. A table whose every column is refused is refused as a whole.
+Exasol has no binary type, so every source reads a binary column as lowercase hex text, the text format of Exasol's `HASHTYPE`.
 
-| Source | Refused types |
+| Source type | Exasol type |
 |---|---|
-| Iceberg REST and Glue Iceberg | `binary`, `fixed(L)`, and `uuid`, at any depth |
-| Delta, Unity Catalog, and Glue Parquet | `binary` |
-| Direct storage | An unannotated `BYTE_ARRAY` (`binary`), an unannotated `FIXED_LEN_BYTE_ARRAY` (`fixed(L)`), `UUID` (`uuid`), `BSON` (`bson`), `GEOMETRY` (`geometry`), and `GEOGRAPHY` (`geography`) |
+| Iceberg `fixed(L)`, Parquet `FIXED_LEN_BYTE_ARRAY(L)` | `VARCHAR(2L)` |
+| Iceberg `uuid`, Parquet `UUID` | `VARCHAR(32)` |
+| Iceberg, Delta, Unity Catalog, and Glue `binary`, Parquet unannotated `BYTE_ARRAY` and `BSON` | `VARCHAR(2000000)` |
 
-A catalog-declared source decides by the declared type. A Glue column declared `string` over a data file that stores a `BYTE_ARRAY` without the string annotation reads as text. A value that is not valid UTF-8 fails the query.
+- An empty value reads as NULL, as an empty `VARCHAR` does in Exasol.
+- A value longer than 1,000,000 bytes fails the query. The error names the column and the value's size.
+- A binary member of a nested column renders as a hex JSON string.
+- A filter, `ORDER BY`, `MIN`, or `MAX` on the column returns what native Exasol returns over the same hex text. Lowercase hex sorts in byte order.
+- A comparison with a lowercase hex literal of even length, such as `WHERE payload = '00abff'`, compares the raw bytes in the scan, so file statistics still prune. Any other literal compares the hex text, and `'00ABFF'` matches nothing.
 
-Direct storage declares no table type, so it decides by what each Parquet file declares. A top-level Parquet `ENUM` column reads as text. A nested `ENUM` member is refused (#TBD).
+`BINARY_AS_STRING = 'TRUE'` reads every variable-length binary column of the virtual schema as UTF-8 text, like Spark's `spark.sql.parquet.binaryAsString`. Use it for files that a legacy writer such as Impala or Hive stored as unannotated `BYTE_ARRAY` strings. A value that is not valid UTF-8 fails the query with Exasol's `Invalid bytestream` error, which does not name the column. Fixed-length binary and `uuid` stay hex. The property changes the declared type, so it takes effect at `CREATE VIRTUAL SCHEMA`, `REFRESH`, or `ALTER VIRTUAL SCHEMA ... SET`.
 
-Two cases break a query that worked before:
+A catalog-declared source reads a column by its declared type. A Glue column declared `string` over a data file that stores a `BYTE_ARRAY` without the string annotation reads as text. Direct storage reads a top-level Parquet `ENUM` column as text. A nested `ENUM` member is refused (#TBD).
 
-- An Iceberg `binary` column that holds UTF-8 text is now refused.
-- A direct-storage column that a legacy writer such as Impala or Hive stored as an unannotated `BYTE_ARRAY` string is now refused. Rewrite the file with the Parquet `STRING` annotation to read it.
+`GEOMETRY` and `GEOGRAPHY` columns are refused on every source. A query that reads a refused column fails at plan time and names the column and its type. A query on the other columns succeeds.
 
 ## Choosing which tables to expose
 

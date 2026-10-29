@@ -69,4 +69,4 @@ Defines what the scan UDF emits for an Iceberg field that the file's own partiti
 * *THEN* the converted value SHALL equal the value that a physical column of the file's own type reads as at the declared type, including a `float` widened to its exact `double` expansion and a `time` or out-of-domain `decimal` rendered as the text its `VARCHAR` column shows
 * *AND* the VS SHALL use the string form, and the scan the conversion and error rule, of `scan-read-path/scan-execution-partition-values`, so one conversion serves both kinds of partition value
 * *AND* an empty `string` value SHALL read as NULL, the value Exasol stores for an empty `VARCHAR`
-* *AND* the VS SHALL carry no value for a `binary`, `fixed(L)`, or `uuid` column, which `vs-adapter/binary-column-refusal` refuses at plan time
+* *AND* the VS SHALL carry no value for a `binary`, `fixed(L)`, or `uuid` column, because the string form cannot hold arbitrary bytes, so the scan reads the column from the data file

@@ -239,7 +239,7 @@ pub use lakehouse_catalog::{AdlsCred, CatalogProps, StorageBackend, StorageProps
 /// `arrow_type` is a compact tag (`types::mapping::arrow_type_to_tag` / `arrow_type_from_tag`):
 /// `"bool"`, `"int32"`, `"int64"`, `"float32"`, `"float64"`, `"utf8"`, `"date32"`,
 /// `"timestamp_us"`, `"timestamp_ns"`, `"timestamptz_us"`, `"timestamptz_ns"`,
-/// `"decimal128(p,s)"`.
+/// `"decimal128(p,s)"`, `"binary"`, `"fixed_size_binary(L)"`.
 ///
 /// # `initial_default`
 ///

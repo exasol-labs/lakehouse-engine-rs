@@ -15,6 +15,8 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
 
+use super::binary_filter::{BinaryColumns, compare_binary_bytes};
+
 pub(super) const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
 
 /// Passthrough distributor that groups per-shard file-list rows by `shard_key` so
@@ -768,11 +770,14 @@ pub(super) fn type_accepted_rewrite(expr: &Json, col_types: &[(String, String)])
 pub(super) fn classify_where_filter<'a>(
     filter_json_raw: Option<&'a Json>,
     col_types: &[(String, String)],
+    binary_columns: &BinaryColumns,
 ) -> (Option<String>, Option<&'a Json>) {
-    match (
-        filter_json_raw,
-        filter_json_raw.and_then(|f| type_accepted_rewrite(f, col_types)),
-    ) {
+    let accepted = |filter: &Json| {
+        apply_type_rewrites(filter, col_types)
+            .map(|tree| compare_binary_bytes(&tree, binary_columns))
+            .filter(datafusion_renderable)
+    };
+    match (filter_json_raw, filter_json_raw.and_then(accepted)) {
         (Some(raw), None) => (None, Some(raw)),
         (_, tree) => (tree.as_ref().and_then(render_df_filter_safe), None),
     }

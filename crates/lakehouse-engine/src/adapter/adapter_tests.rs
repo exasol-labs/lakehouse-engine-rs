@@ -500,6 +500,7 @@ fn refresh_writes_an_identifier_note_on_every_returned_table() {
         &["ns".to_string()],
         &listing,
         EngineTimestampSupport::MillisecondOnly,
+        false,
     )
     .unwrap();
 
@@ -936,9 +937,13 @@ fn the_identifier_note_records_the_bare_directory_name_and_round_trips() {
         ],
         skipped: Vec::new(),
     };
-    let tables =
-        build_listing_virtual_tables(&[], &listing, EngineTimestampSupport::MillisecondOnly)
-            .unwrap();
+    let tables = build_listing_virtual_tables(
+        &[],
+        &listing,
+        EngineTimestampSupport::MillisecondOnly,
+        false,
+    )
+    .unwrap();
 
     let request = json!({"type": "pushdown", "involvedTables": tables});
     assert_eq!(
@@ -978,6 +983,7 @@ fn create_vs_records_the_multi_level_identifier_in_the_table_note() {
         &["prod".to_string(), "finance".to_string()],
         &listing,
         EngineTimestampSupport::MillisecondOnly,
+        false,
     )
     .unwrap();
 
@@ -1015,6 +1021,7 @@ fn a_flatten_collision_among_listed_tables_fails_the_listing() {
         &["prod".to_string(), "finance".to_string()],
         &listing,
         EngineTimestampSupport::MillisecondOnly,
+        false,
     )
     .unwrap_err()
     .to_string();
@@ -1056,6 +1063,7 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
         &configured_ns,
         &listing,
         EngineTimestampSupport::MillisecondOnly,
+        false,
     )
     .unwrap();
 
@@ -1192,6 +1200,7 @@ fn an_all_skipped_namespace_creates_an_empty_schema_recording_every_skip() {
         &["sales".to_string()],
         &listing,
         EngineTimestampSupport::MillisecondOnly,
+        false,
     )
     .expect("an all-skipped namespace must not fail the listing");
     let parsed = parsed_notes(

@@ -1,3 +1,4 @@
+use super::super::BinaryColumns;
 use super::super::single_group_agg::{single_group_merge_select, single_group_plan_types};
 use super::super::support::{
     AggregateMergeInputs, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, build_scan_driving_sql,
@@ -23,6 +24,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let (filter, declined_filter) = classify_where_filter(
         pushdown_req.get("filter").filter(|f| !f.is_null()),
         &col_types,
+        &BinaryColumns::default(),
     );
     assert!(
         declined_filter.is_none(),

@@ -7,7 +7,7 @@ use crate::scan::spec::{LogicalField, NestedField, NestedMembers};
 use crate::types::mapping::exasol_representable_catalog_decimal;
 
 use super::RefusedColumn;
-use crate::adapter::column_notes::{binary_cause, variant_cause};
+use crate::adapter::column_notes::variant_cause;
 
 #[cfg(test)]
 #[path = "delta_schema_tests.rs"]
@@ -261,7 +261,7 @@ fn walk_type(
     mode: ColumnMappingMode,
 ) -> Result<Walked<MappedType>, Refusal> {
     match data_type {
-        DataType::Primitive(primitive) => Ok(walk_primitive(primitive, path)),
+        DataType::Primitive(primitive) => Ok(walk_primitive(primitive)),
         DataType::Variant(_) => Ok(refused_type(path, variant_cause())),
         DataType::Array(array) => {
             match walk_type(array.element_type(), &path.child(ELEMENT_SEGMENT), mode)? {
@@ -305,7 +305,7 @@ fn walk_type(
     }
 }
 
-fn walk_primitive(primitive: &PrimitiveType, path: &FieldPath) -> Walked<MappedType> {
+fn walk_primitive(primitive: &PrimitiveType) -> Walked<MappedType> {
     use PrimitiveType::*;
     match primitive {
         Boolean => tagged("bool"),
@@ -326,7 +326,7 @@ fn walk_primitive(primitive: &PrimitiveType, path: &FieldPath) -> Walked<MappedT
                 tagged("utf8")
             }
         }
-        Binary => refused_type(path, binary_cause("binary")),
+        Binary => tagged("binary"),
     }
 }
 

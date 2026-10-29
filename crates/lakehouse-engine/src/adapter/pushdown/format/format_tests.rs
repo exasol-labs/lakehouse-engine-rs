@@ -241,7 +241,7 @@ fn declare_columns_notes_each_catalog_parquet_column_with_its_partition_position
                 ("id", "bigint"),
                 ("region", "string"),
                 ("year", "int"),
-                ("blob", "binary"),
+                ("u", "uniontype<int>"),
             ],
         )
     };
@@ -265,7 +265,7 @@ fn declare_columns_notes_each_catalog_parquet_column_with_its_partition_position
             ("id", None, false),
             ("region", Some(1), false),
             ("year", Some(0), false),
-            ("blob", None, true),
+            ("u", None, true),
         ]
     );
     assert!(
