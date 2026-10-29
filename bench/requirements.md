@@ -26,7 +26,7 @@ This file is the source of truth for the benchmark harness, its remote target, a
 
 ### Progress output
 
-- A log of a run redirected to a file shows where the run is or where it stopped, with no step silent for more than 30 seconds.
+- A log of a run redirected to a file shows where the run is or where it stopped.
 - The harness wraps each long step in a timestamped start line, a timestamped still-running line every 30 seconds with the elapsed time, and an end line with the outcome and the elapsed seconds. The long steps are the stack start, the `.so` build, the TPC-H load, the delete authoring, and the SLC install and upload.
 - The readiness waits for the docker stack and for Exasol print a timestamped start line and the same still-running lines.
 - Each benchmark query prints still-running lines on the same interval while it runs. Those lines never reach the report.
