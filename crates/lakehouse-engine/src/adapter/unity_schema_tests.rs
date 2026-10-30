@@ -3,6 +3,7 @@
 
 use super::*;
 
+use crate::adapter::pushdown::test_support::UNREACHABLE_CATALOG;
 use exasol_udf_sdk::test_support::TestContext;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -511,15 +512,11 @@ fn records_identifier_notes_and_rejects_collision() {
 
 #[test]
 fn unreachable_unity_catalog_is_credential_safe_error() {
-    // A bound-then-dropped port refuses the connect rather than hanging.
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe socket");
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
-
+    // Not a dropped ephemeral listener: a parallel test's fake server could take the freed port.
     const SENTINEL: &str = "SENTINEL_SECRET_TOKEN";
     // PAT auth so a real bearer secret rides the request and must never surface.
     let mut ctx = unity_conn_ctx(
-        format!("http://127.0.0.1:{port}"),
+        UNREACHABLE_CATALOG,
         json!({ "token": SENTINEL }).to_string(),
     );
 

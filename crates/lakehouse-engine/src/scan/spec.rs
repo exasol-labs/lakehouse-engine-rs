@@ -644,9 +644,8 @@ impl From<DeleteMechanism> for DeleteMechanismWire {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "FileEntryWire", into = "FileEntryWire")]
 pub struct FileEntry {
-    /// Relative to [`CommonScanSpec::table_root`] when under it, otherwise absolute; stored
-    /// exactly as the catalog or log records it. Read as a URL-encoded reference (see
-    /// [`encode_file_path`]).
+    /// Relative to [`CommonScanSpec::table_root`] when under it, otherwise absolute. A URL
+    /// reference that decodes once to the raw key (see [`crate::scan::ObjectLocation`]).
     pub path: String,
     /// Builds the file's `ObjectMeta` without an object-store HEAD.
     pub size: u64,
@@ -1023,30 +1022,6 @@ pub(crate) fn reconstruct_abs_uri(entry_path: &str, table_root: &str) -> String 
     let root = table_root.strip_suffix('/').unwrap_or(table_root);
     let rel = entry_path.strip_prefix('/').unwrap_or(entry_path);
     format!("{root}/{rel}")
-}
-
-/// The characters `ListingTableUrl::parse` would decode or read as fragment/query.
-const URL_PARSE_UNSAFE: &percent_encoding::AsciiSet = &percent_encoding::AsciiSet::EMPTY
-    .add(b'%')
-    .add(b'#')
-    .add(b'?');
-
-/// Escapes what `ListingTableUrl::parse` would otherwise decode.
-pub(crate) fn encode_file_path<'p>(
-    parts: impl Iterator<Item = object_store::path::PathPart<'p>>,
-    len_hint: usize,
-) -> String {
-    let mut encoded = String::with_capacity(len_hint);
-    for (index, part) in parts.enumerate() {
-        if index > 0 {
-            encoded.push('/');
-        }
-        encoded.extend(percent_encoding::utf8_percent_encode(
-            part.as_ref(),
-            URL_PARSE_UNSAFE,
-        ));
-    }
-    encoded
 }
 
 #[cfg(test)]

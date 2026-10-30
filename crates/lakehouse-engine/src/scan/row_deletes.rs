@@ -13,12 +13,11 @@ use crate::scan::deletion_vectors::{
     DeltaDeletionVector, IcebergDeletionVector, LoggedDeletionVector, ManifestDeletionVector,
 };
 use crate::scan::parquet_reader::{SizedParquetReader, object_meta_for};
-use crate::scan::reconstruct_abs_uri;
 use crate::scan::spec::{DeleteMechanism, FileEntry};
+use crate::scan::{ObjectLocation, reconstruct_abs_uri};
 use arrow::array::{Array, Int64Array, LargeStringArray, StringArray};
 use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
-use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
 use datafusion::execution::memory_pool::MemoryReservation;
 use exasol_udf_sdk::error::UdfError;
@@ -35,8 +34,8 @@ use parquet::file::FOOTER_SIZE;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 use roaring::RoaringTreemap;
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use tokio::sync::{Semaphore, SemaphorePermit};
@@ -230,10 +229,10 @@ fn locate_delete_columns(schema: &SchemaRef) -> Result<(usize, usize), UdfError>
 /// Range-based: Parquet truncates string statistics (min down, max up), so `[min, max]` is a
 /// superset and a byte-wise range test never prunes a possible match. An equality shortcut would
 /// wrongly prune truncated bounds bracketing a longer path. Absent or partial stats never prune.
-fn delete_row_group_may_match(
+fn delete_row_group_may_match<'p>(
     row_group: &RowGroupMetaData,
     file_path_idx: usize,
-    assigned: &HashSet<String>,
+    assigned: impl IntoIterator<Item = &'p String>,
 ) -> bool {
     let Some(column) = row_group.columns().get(file_path_idx) else {
         return true;
@@ -244,7 +243,7 @@ fn delete_row_group_may_match(
     let (Some(min), Some(max)) = (stats.min_bytes_opt(), stats.max_bytes_opt()) else {
         return true;
     };
-    assigned.iter().any(|path| {
+    assigned.into_iter().any(|path| {
         let bytes = path.as_bytes();
         min <= bytes && bytes <= max
     })
@@ -500,8 +499,14 @@ impl ShardDeletes<'_> {
             assigned: self
                 .files
                 .iter()
-                .map(|entry| reconstruct_abs_uri(&entry.path, self.table_root))
-                .collect(),
+                .map(|entry| {
+                    let location = ObjectLocation::parse_entry(&entry.path, self.table_root)?;
+                    Ok((
+                        location.to_string(),
+                        reconstruct_abs_uri(&entry.path, self.table_root),
+                    ))
+                })
+                .collect::<Result<_, UdfError>>()?,
             secrets: Arc::clone(&self.secrets),
             limiter: Arc::clone(&self.limiter),
             reservation: Arc::clone(&self.reservation),
@@ -535,8 +540,9 @@ impl ShardDeletes<'_> {
 struct DeleteReadContext {
     store: Arc<dyn ObjectStore>,
     table_root: String,
-    /// The shard's data files, as absolute URIs.
-    assigned: HashSet<String>,
+    /// The shard's data files, by the unescaped location a positional-delete row names, to their
+    /// absolute URIs.
+    assigned: HashMap<String, String>,
     secrets: Arc<[String]>,
     limiter: Arc<Semaphore>,
     reservation: Arc<MemoryReservation>,
@@ -603,7 +609,7 @@ impl DeleteReadContext {
             .iter()
             .enumerate()
             .filter(|(_, row_group)| {
-                delete_row_group_may_match(row_group, file_path_idx, &self.assigned)
+                delete_row_group_may_match(row_group, file_path_idx, self.assigned.keys())
             })
             .map(|(idx, _)| idx)
             .partition(|&idx| {
@@ -704,7 +710,7 @@ impl DeleteReadContext {
                     if let Some((ended, Some(bucket))) = run.as_mut() {
                         add_positions(
                             &mut positions_by_data_file,
-                            ended,
+                            &self.assigned[ended],
                             bucket,
                             &self.reservation,
                             &self.secrets,
@@ -712,7 +718,7 @@ impl DeleteReadContext {
                     }
                     run = Some((
                         path.to_string(),
-                        self.assigned.contains(path).then(Vec::new),
+                        self.assigned.contains_key(path).then(Vec::new),
                     ));
                 }
                 let Some((_, Some(bucket))) = run.as_mut() else {
@@ -731,7 +737,7 @@ impl DeleteReadContext {
             if let Some((path, Some(bucket))) = run.as_mut() {
                 add_positions(
                     &mut positions_by_data_file,
-                    path,
+                    &self.assigned[path],
                     bucket,
                     &self.reservation,
                     &self.secrets,
@@ -810,9 +816,9 @@ impl DeleteReadContext {
         let _permit = acquire(&self.limiter)
             .await
             .map_err(|e| unreadable(e.to_string()))?;
-        let location = ListingTableUrl::parse(url)
+        let location = ObjectLocation::parse_wire(url)
             .map_err(|e| unreadable(format!("invalid deletion-vector URL: {e}")))?
-            .prefix()
+            .key()
             .clone();
         let body = match range {
             Some(range) => self.store.get_range(&location, range).await,

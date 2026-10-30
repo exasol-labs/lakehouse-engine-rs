@@ -12,12 +12,10 @@ use serde_json::Value as Json;
 use super::{ConnectionStorage, ResolvedScan, ScanSource, format_reader};
 use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::column_notes::TableNotes;
-use crate::adapter::direct_storage_properties::{
-    join_storage_path, resolve_direct_storage_properties,
-};
+use crate::adapter::direct_storage_properties::resolve_direct_storage_properties;
 use crate::adapter::permission::PermissionCheck;
 use crate::adapter::properties::resolve_binary_as_string;
-use crate::scan::{build_admission_limited_store, store_root_url};
+use crate::scan::{ObjectLocation, build_admission_limited_store, store_root_url};
 
 #[cfg(test)]
 #[path = "scan_resolution_tests.rs"]
@@ -193,8 +191,8 @@ impl<'a> TableScanResolver<'a> {
                 }
             }
             RequestSession::DirectStorage { store, base_path } => {
-                table_root =
-                    join_storage_path(base_path, Some(direct_storage_directory(table_identifier)?));
+                table_root = ObjectLocation::from_raw(base_path)?
+                    .child(direct_storage_directory(table_identifier)?)?;
                 ScanSource::DirectParquet {
                     store,
                     table_root: &table_root,

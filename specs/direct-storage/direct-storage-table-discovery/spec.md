@@ -6,6 +6,7 @@ The adapter turns a storage prefix holding directories of Parquet files into enu
 
 * The direct-storage client implements `CatalogClient` and is declared in `lakehouse-engine`, not in `lakehouse-catalog`. It needs the engine-side object-store builder, and the catalog crate does not depend on `object_store` (`architecture.md`). The engine still reaches every enumeration and table-load operation through the trait.
 * The client's base path is resolved at construction from the CONNECTION address and the `NAMESPACE` property (`direct-storage/direct-storage-properties`), inside the one construction site that may name a catalog kind.
+* The base path and each listed directory name are raw object keys (`file-planning/pushdown-planning-file-encoding`). `object_store` would escape a name again if it were joined as a new path part, so the client joins it as listed.
 * `direct-storage/parquet-directory-seam-file-listing` owns which objects under a table root count as data files and their order. This feature owns which directories are tables and how each is named.
 * `lakehouse-catalog`'s neutral skip reason has a variant for a directory holding no data file.
 * The neutral table identifier the client returns has an empty namespace, because a direct-storage table's identity is its directory name. The shared flatten and the shared recording of each virtual table's identifier note per `vs-adapter/create-virtual-schema` then produce the bare directory name without branching on catalog kind.
@@ -56,6 +57,13 @@ The adapter turns a storage prefix holding directories of Parquet files into enu
 * *AND* a base path holding NO first-level directory with a data file SHALL yield a successful, EMPTY virtual schema rather than an error, matching the behavior for a namespace that holds no Iceberg table
 * *AND* the skip reason SHALL name no catalog kind, no table format, and no engine symbol, so it stays a neutral value of the catalog crate
 * *AND* the absence of a data file SHALL be the ONLY reason to skip a directory: a directory whose enumeration fails for any other reason, such as a column pair no widening rule folds (`direct-storage/parquet-directory-seam`), SHALL fail the whole `CREATE VIRTUAL SCHEMA` or `REFRESH` statement, and the client MUST NOT skip that directory or return a partial table set
+
+### Scenario: A first-level directory whose name needs escaping is served and read
+
+* *GIVEN* a storage base path holding first-level directories whose names hold `%3D`, `#`, `?`, `*`, `~`, `[`, `]`, `{`, `}`, `^`, `|`, a space, `+`, `&`, or `€`, each holding a data file
+* *WHEN* the client enumerates the base path and a query reads each table
+* *THEN* the client SHALL serve each directory as a table, and MUST NOT skip it as holding no data file
+* *AND* each query SHALL read the rows of that directory's own data file
 
 ### Scenario: One admission-limited object store serves every table of one adapter call
 

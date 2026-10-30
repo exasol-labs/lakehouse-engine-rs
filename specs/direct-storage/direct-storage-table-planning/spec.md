@@ -31,7 +31,7 @@ The adapter resolves a directory of Parquet files into the engine's `ScanSpec` a
 * *THEN* the reader SHALL obtain the file list and each file's byte size and partition values from the listing answer of the ONE shared directory seam, filled against the partition columns the notes record, and MUST NOT list objects, parse a path, or read a footer itself
 * *AND* the returned logical schema, partition columns, and refused columns SHALL be the ones the column notes record, per `vs-adapter/column-source-notes`
 * *AND* each returned file entry SHALL carry its path, its byte size, an EMPTY delete-mechanism list, and the seam's partition values, so an unpartitioned table's entries keep the compact form an unpartitioned delete-free Iceberg scan already produces
-* *AND* each file entry's path SHALL be percent-encoded segment by segment, so a key segment carrying `%`, `#`, or `?` resolves at scan time to the object the listing returned
+* *AND* each file entry's path SHALL be in the wire form of `file-planning/pushdown-planning-file-encoding`, so a key segment carrying `%`, `#`, or `?` resolves at scan time to the object the listing returned
 * *AND* every logical field SHALL carry NEITHER a field-id NOR a declared physical name, so the scan binds it by its own name through the identity binding already shipped, and enumeration MUST NOT synthesize an ordinal field-id
 * *AND* the returned scan SHALL carry an EMPTY name-mapping list, because a raw directory declares no name mapping
 * *AND* the returned effective storage SHALL be the CONNECTION's static backend unchanged, because this kind reaches no credential-vending catalog

@@ -83,6 +83,10 @@ fn relativization_leaves_a_deletion_vectors_path_or_inline_dv_untouched() {
     );
 }
 
+fn relativize(path: &str, table_root: &str) -> String {
+    relativize_path_to_root(path, ObjectLocation::parse_wire(table_root).ok().as_ref())
+}
+
 /// Mirror of the scan UDF's `reconstruct_abs_uri` join rule, avoiding a cross-crate dependency.
 fn reconstruct_abs_uri_mirror(entry_path: &str, table_root: &str) -> String {
     if entry_path.contains("://") {
@@ -99,32 +103,32 @@ fn sibling_prefix_paths_are_not_relativized() {
 
     let under = format!("{root}/data/f.parquet");
     assert_eq!(
-        relativize_path_to_root(&under, root),
+        relativize(&under, root),
         "data/f.parquet",
         "under-root path must be relativized"
     );
 
     let archive = format!("{root}-archive/f.parquet");
     assert_eq!(
-        relativize_path_to_root(&archive, root),
+        relativize(&archive, root),
         archive,
         "sibling '-archive' path must stay absolute"
     );
     let sibling2 = format!("{root}2/data/f.parquet");
     assert_eq!(
-        relativize_path_to_root(&sibling2, root),
+        relativize(&sibling2, root),
         sibling2,
         "sibling '2' path must stay absolute"
     );
 
     assert_eq!(
-        relativize_path_to_root(root, root),
+        relativize(root, root),
         root,
         "path equal to the root must stay absolute, not become an empty entry"
     );
 
     for original in [&under, &archive, &sibling2, &root.to_string()] {
-        let emitted = relativize_path_to_root(original, root);
+        let emitted = relativize(original, root);
         assert_eq!(
             reconstruct_abs_uri_mirror(&emitted, root),
             *original,
@@ -138,7 +142,7 @@ fn abfss_paths_relativize_and_reconstruct_losslessly() {
     let root = "abfss://container@account.dfs.core.windows.net/db/table";
     let original = format!("{root}/data/part-0.parquet");
 
-    let relative = relativize_path_to_root(&original, root);
+    let relative = relativize(&original, root);
     assert_eq!(
         relative, "data/part-0.parquet",
         "abfss path under the root must relativize just like s3"
@@ -148,5 +152,26 @@ fn abfss_paths_relativize_and_reconstruct_losslessly() {
     assert_eq!(
         reconstructed, original,
         "reconstructed abfss URI must equal the original byte-for-byte"
+    );
+}
+
+#[test]
+fn a_root_holding_escaped_characters_still_relativizes_its_files() {
+    let raw_root = "s3://bucket/db/odd%3D#?€/t";
+    let root = ObjectLocation::from_raw(raw_root).unwrap().to_wire();
+    let wire = |raw: &str| ObjectLocation::from_raw(raw).unwrap().to_wire();
+    let entry = FileEntry::with_deletes(
+        wire(&format!("{raw_root}/data/f%3D.parquet")),
+        1000,
+        vec![pos_delete(&wire(&format!("{raw_root}/data/d.parquet")), 50)],
+    );
+
+    let shards = relativize_shards_to_root(vec![vec![entry]], &root);
+
+    assert_eq!(root, "s3://bucket/db/odd%253D%23%3F%E2%82%AC/t");
+    assert_eq!(shards[0][0].path, "data/f%253D.parquet");
+    assert_eq!(
+        shards[0][0].deletes[0].object_store_path(),
+        Some("data/d.parquet")
     );
 }

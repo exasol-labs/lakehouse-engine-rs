@@ -4,6 +4,7 @@ use super::super::test_support::{
     unauthenticated_creds,
 };
 use super::*;
+use crate::adapter::direct_storage_properties::join_storage_path;
 use crate::adapter::permission::PermissionCheck;
 use crate::scan::spec::{StorageBackend, StorageProps};
 

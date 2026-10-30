@@ -8,10 +8,10 @@ use crate::common::pos_delete_fixtures::{
     DELETION_VECTOR_CARDINALITIES, DELETION_VECTOR_FILE_ID_RANGES, DELETION_VECTOR_TABLE,
     FILE_GRANULARITY_DELETED_IDS, FILE_GRANULARITY_REMAINING_ROWS, FILE_GRANULARITY_TABLE,
     FILE_GRANULARITY_TOTAL_ROWS, NAMESPACE, ORC_FILE_IDS, PARQUET_FILE_IDS, PARTITION_COL,
-    PARTITION_EAST_DELETED_IDS, PARTITION_GRANULARITY_DELETED_IDS,
+    PARTITION_EAST, PARTITION_EAST_DELETED_IDS, PARTITION_GRANULARITY_DELETED_IDS,
     PARTITION_GRANULARITY_REMAINING_ROWS, PARTITION_GRANULARITY_TABLE,
-    PARTITION_GRANULARITY_TOTAL_ROWS, PARTITION_WEST_DELETED_IDS, UNSUPPORTED_FORMAT_TABLE,
-    deletion_vector_deleted, deletion_vector_remaining_ids,
+    PARTITION_GRANULARITY_TOTAL_ROWS, PARTITION_WEST, PARTITION_WEST_DELETED_IDS,
+    UNSUPPORTED_FORMAT_TABLE, deletion_vector_deleted, deletion_vector_remaining_ids,
 };
 use crate::common::seed::{E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS};
 
@@ -131,6 +131,11 @@ fn fixture_spark_partition_granularity_delete_table() {
             "partition granularity: delete file for {} must be a Parquet positional delete",
             entry.path
         );
+        assert!(
+            entry.path.contains('%') && entry.deletes[0].path().contains('%'),
+            "partition granularity: {} and its delete file must hold an escaped partition value",
+            entry.path
+        );
         *refs_per_delete_path
             .entry(entry.deletes[0].path().to_string())
             .or_insert(0) += 1;
@@ -217,6 +222,7 @@ fn e2e_partition_granularity_returns_post_delete_rows() {
     );
 }
 
+/// Scenario: An Iceberg file whose key holds `%`, `#`, or `?` is read from that key
 #[test]
 fn e2e_partition_delete_spans_multiple_partitions() {
     setup_e2e();
@@ -224,7 +230,8 @@ fn e2e_partition_delete_spans_multiple_partitions() {
 
     let table = vs_table(LAKEHOUSE_VS, PARTITION_GRANULARITY_TABLE);
 
-    let east_sql = format!("SELECT id FROM {table} WHERE {PARTITION_COL} = 'east' ORDER BY id");
+    let east_sql =
+        format!("SELECT id FROM {table} WHERE {PARTITION_COL} = '{PARTITION_EAST}' ORDER BY id");
     let east_ids = ids_column(&conn.query_columns(&east_sql));
     let east_deleted: HashSet<i64> = PARTITION_EAST_DELETED_IDS.iter().copied().collect();
     let expected_east: Vec<i64> = (1..=10i64)
@@ -241,7 +248,8 @@ fn e2e_partition_delete_spans_multiple_partitions() {
         );
     }
 
-    let west_sql = format!("SELECT id FROM {table} WHERE {PARTITION_COL} = 'west' ORDER BY id");
+    let west_sql =
+        format!("SELECT id FROM {table} WHERE {PARTITION_COL} = '{PARTITION_WEST}' ORDER BY id");
     let west_ids = ids_column(&conn.query_columns(&west_sql));
     let west_deleted: HashSet<i64> = PARTITION_WEST_DELETED_IDS.iter().copied().collect();
     let expected_west: Vec<i64> = (11..=20i64)
@@ -336,8 +344,9 @@ fn e2e_deletes_with_projection_filter_limit() {
     let mut conn = exa_conn();
 
     let table = vs_table(LAKEHOUSE_VS, PARTITION_GRANULARITY_TABLE);
-    let sql =
-        format!("SELECT id, val FROM {table} WHERE {PARTITION_COL} = 'west' ORDER BY id LIMIT 3");
+    let sql = format!(
+        "SELECT id, val FROM {table} WHERE {PARTITION_COL} = '{PARTITION_WEST}' ORDER BY id LIMIT 3"
+    );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, val): {cols:?}");
 
@@ -420,7 +429,7 @@ fn e2e_deletes_with_single_and_grouped_agg() {
         .collect();
     assert_eq!(
         regions,
-        vec!["east".to_string(), "west".to_string()],
+        vec![PARTITION_EAST.to_string(), PARTITION_WEST.to_string()],
         "expected groups [east,west] in order, got {regions:?}"
     );
 

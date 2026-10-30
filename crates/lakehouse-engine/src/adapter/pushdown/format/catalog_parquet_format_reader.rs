@@ -20,10 +20,9 @@ use super::{FormatReader, PlannedFiles, checked_storage_location, hex_binary_par
 use crate::adapter::column_notes::DeclaredSchema;
 use crate::adapter::parquet_directory::{
     FilePattern, PartitionKeepPredicate, list_location_files, list_parquet_files,
-    raw_location_prefix, store_prefix,
 };
-use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, FileEntry, LogicalField, encode_file_path};
-use crate::scan::{build_table_root_store, store_root_url};
+use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, FileEntry, LogicalField};
+use crate::scan::{ObjectLocation, build_table_root_store};
 use crate::types::mapping::arrow_type_from_tag;
 
 #[cfg(test)]
@@ -75,18 +74,14 @@ async fn plan_table_directory(
     keep: &PartitionKeepPredicate,
 ) -> Result<PlannedFiles, UdfError> {
     let (table_root, effective_storage) = storage.resolve().await?;
+    // A Unity storage location is a URL, as the Delta kernel reads it, so its path decodes once.
+    let root = ObjectLocation::from_url(table_root)?;
     let secrets = effective_storage.secret_values();
-    let files = list_table_directory(
-        table_root,
-        &effective_storage,
-        &secrets,
-        partition_columns,
-        keep,
-    )
-    .await
-    .map_err(|error| redacted(error, &secrets))?;
+    let files = list_table_directory(&root, &effective_storage, &secrets, partition_columns, keep)
+        .await
+        .map_err(|error| redacted(error, &secrets))?;
     Ok(PlannedFiles {
-        table_root: table_root.to_string(),
+        table_root: root.to_wire(),
         effective_storage,
         files,
         name_mapping: Vec::new(),
@@ -102,14 +97,16 @@ async fn plan_glue_table(
     let location = checked_storage_location(table, "Glue")?;
     let secrets = storage.secret_values();
     let planned = async {
-        let (store_root, table_prefix) = raw_location_prefix(location)?;
-        let table_root = scan_table_root(&store_root, &table_prefix);
+        let table_root = glue_location(location)?;
         let partitions = session.partitions(table).await?;
-        let store =
-            build_table_root_store(storage, &table_root, DEFAULT_S3_MAX_CONNECTIONS, &secrets)?;
-        let files =
-            plan_glue_partitions(&store, &store_root, &table_prefix, partitions, keep).await?;
-        Ok((table_root, files))
+        let store = build_table_root_store(
+            storage,
+            table_root.store_root().as_str(),
+            DEFAULT_S3_MAX_CONNECTIONS,
+            &secrets,
+        )?;
+        let files = plan_glue_partitions(&store, &table_root, partitions, keep).await?;
+        Ok((table_root.to_wire(), files))
     };
     let (table_root, files) = planned.await.map_err(|error| redacted(error, &secrets))?;
     Ok(PlannedFiles {
@@ -120,21 +117,26 @@ async fn plan_glue_table(
     })
 }
 
-/// The scan parses its table root as a URL, so the raw key's `%`, `#`, and `?` are escaped, and
-/// `s3a` reads as `s3` so every file of the table addresses one store.
-fn scan_table_root(store_root: &str, prefix: &StorePath) -> String {
-    format!(
-        "{store_root}/{}",
-        encode_file_path(prefix.parts(), prefix.as_ref().len())
-    )
+/// A Glue location names its key raw, and `s3a` reads as `s3` so every file of the table
+/// addresses one store.
+fn glue_location(location: &str) -> Result<ObjectLocation, UdfError> {
+    let (scheme, rest) = location.split_once("://").unwrap_or(("", location));
+    if rest.starts_with('/') {
+        return Err(UdfError::User(format!(
+            "invalid storage location '{location}': it names no bucket"
+        )));
+    }
+    if scheme.eq_ignore_ascii_case("s3a") {
+        return ObjectLocation::from_raw(&format!("s3://{rest}"));
+    }
+    ObjectLocation::from_raw(location)
 }
 
 /// Only direct children are listed, so a nested partition location is never read twice. Values
 /// are Glue's, never parsed from the path; a file outside `table_prefix` keeps an absolute path.
 async fn plan_glue_partitions(
     store: &Arc<dyn ObjectStore>,
-    store_root: &str,
-    table_prefix: &StorePath,
+    table_root: &ObjectLocation,
     partitions: Vec<CatalogPartition>,
     keep: &PartitionKeepPredicate,
 ) -> Result<Vec<FileEntry>, UdfError> {
@@ -143,7 +145,7 @@ async fn plan_glue_partitions(
         .filter(|partition| keep(&partition.values))
         .map(|partition| {
             Ok((
-                readable_partition_prefix(&partition, store_root)?,
+                readable_partition_prefix(&partition, table_root)?,
                 partition.values,
             ))
         })
@@ -158,7 +160,7 @@ async fn plan_glue_partitions(
                     .into_iter()
                     .zip(iter::repeat_n(values, count))
                     .map(|(file, values)| {
-                        file_entry(file.with_partition_values(values), table_prefix, store_root)
+                        file_entry(file.with_partition_values(values), table_root)
                     })
                     .collect::<Vec<_>>(),
             )
@@ -174,7 +176,7 @@ async fn plan_glue_partitions(
 /// wrong rows.
 fn readable_partition_prefix(
     partition: &CatalogPartition,
-    table_store_root: &str,
+    table_root: &ObjectLocation,
 ) -> Result<StorePath, UdfError> {
     let refused = |cause: String| {
         let values = partition
@@ -194,30 +196,37 @@ fn readable_partition_prefix(
             "its input format '{input_format}' is not Parquet"
         )));
     }
-    let (store_root, prefix) = raw_location_prefix(&partition.location)?;
-    if store_root != table_store_root {
+    let location = glue_location(&partition.location)?;
+    if location.store_root() != table_root.store_root() {
         return Err(refused(format!(
-            "its bucket '{store_root}' is not the table's bucket '{table_store_root}'"
+            "its bucket '{}' is not the table's bucket '{}'",
+            location.store_root(),
+            table_root.store_root()
         )));
     }
-    Ok(prefix)
+    Ok(location.key().clone())
 }
 
 async fn list_table_directory(
-    table_root: &str,
+    table_root: &ObjectLocation,
     storage: &StorageBackend,
     secrets: &[&str],
     partition_columns: &[String],
     keep: &PartitionKeepPredicate,
 ) -> Result<Vec<FileEntry>, UdfError> {
-    let store = build_table_root_store(storage, table_root, DEFAULT_S3_MAX_CONNECTIONS, secrets)?;
-    let prefix = store_prefix(table_root)?;
-    let store_root = store_root_url(table_root)?;
-    Ok(list_parquet_files(&store, &prefix, partition_columns, keep)
-        .await?
-        .into_iter()
-        .map(|file| file_entry(file, &prefix, store_root.as_str()))
-        .collect())
+    let store = build_table_root_store(
+        storage,
+        table_root.store_root().as_str(),
+        DEFAULT_S3_MAX_CONNECTIONS,
+        secrets,
+    )?;
+    Ok(
+        list_parquet_files(&store, table_root.key(), partition_columns, keep)
+            .await?
+            .into_iter()
+            .map(|file| file_entry(file, table_root))
+            .collect(),
+    )
 }
 
 impl FormatReader for CatalogParquetFormatReader<'_> {

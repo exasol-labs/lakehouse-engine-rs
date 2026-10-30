@@ -6,6 +6,7 @@ use crate::adapter::tests::parquet_fixture::{
 use crate::adapter::tests::recording_store::RecordingStore;
 use arrow::datatypes::{Field, Fields};
 use object_store::memory::InMemory;
+use object_store::path::Path as StorePath;
 
 const FOLD_NO_HIVE: DirectoryOptions = DirectoryOptions {
     merge_mode: MergeMode::FoldEveryFile,

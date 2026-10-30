@@ -752,9 +752,8 @@ async fn planned_keys(
     keep: &PartitionKeepPredicate,
 ) -> Result<Vec<String>, String> {
     let store: Arc<dyn ObjectStore> = store;
-    let (store_root, table_prefix) =
-        raw_location_prefix(GLUE_TABLE_ROOT).expect("the Glue table root names a raw key");
-    plan_glue_partitions(&store, &store_root, &table_prefix, partitions, keep)
+    let table_root = glue_location(GLUE_TABLE_ROOT).expect("the Glue table root names a raw key");
+    plan_glue_partitions(&store, &table_root, partitions, keep)
         .await
         .map(|files| {
             files
@@ -1029,4 +1028,28 @@ async fn a_catalog_string_column_over_unannotated_byte_array_reads_as_text() {
         invalid.is_err(),
         "bytes that are not valid UTF-8 fail the read, never an altered value: {invalid:?}"
     );
+}
+
+#[test]
+fn a_glue_location_reads_s3a_as_s3_and_names_a_bucket() {
+    for (location, store_root, key) in [
+        ("s3a://bucket/tbl/", "s3://bucket", "tbl"),
+        ("S3A://bucket/a#b", "s3://bucket", "a#b"),
+        ("s3://bucket/tbl", "s3://bucket", "tbl"),
+    ] {
+        let parsed = glue_location(location).unwrap_or_else(|e| panic!("{location}: {e}"));
+        assert_eq!(
+            (parsed.store_root().as_str(), parsed.key().as_ref()),
+            (store_root, key),
+            "{location}"
+        );
+    }
+    for (location, cause) in [
+        ("bucket/tbl", "no scheme"),
+        ("s3:///tbl", "no bucket"),
+        ("s3a:///tbl", "no bucket"),
+    ] {
+        let error = glue_location(location).expect_err(location).to_string();
+        assert_mentions(&error, &[location, cause]);
+    }
 }

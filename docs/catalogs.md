@@ -563,6 +563,10 @@ does not apply here) are all rejected under this kind. The address scheme must a
 credential shape: `s3`/`s3a` for S3 credentials, `abfss` only for Azure credentials — `abfs` (without
 the trailing `s`) is rejected, naming `abfss` as the accepted spelling.
 
+The address and every directory name below it are literal object keys. A `%`, `#`, `?`, or non-ASCII
+character is part of the key, never an escape, so `s3://warehouse/events%3D` names the key
+`events%3D`, and a directory `p%3D` or `données` is served as a table under that name.
+
 ```sql
 CREATE CONNECTION DIRECT_STORAGE_CREDS
   TO 's3://warehouse/events'

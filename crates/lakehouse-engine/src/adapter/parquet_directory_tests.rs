@@ -5,6 +5,7 @@ use crate::adapter::tests::parquet_fixture::{
     parquet_schema_footer_bytes, values,
 };
 use crate::adapter::tests::recording_store::RecordingStore;
+use crate::scan::ObjectLocation;
 use crate::types::mapping::arrow_to_exasol_type;
 use arrow::datatypes::{Fields, TimeUnit};
 use object_store::{ObjectStoreExt, PutPayload};
@@ -788,30 +789,6 @@ async fn a_prefix_holding_no_data_file_answers_an_empty_list_and_schema() {
     );
 }
 
-#[test]
-fn the_store_prefix_is_the_percent_decoded_path_below_the_store_root() {
-    for (uri, expected) in [
-        ("s3://warehouse/direct/events", "direct/events"),
-        ("s3://warehouse", ""),
-        ("s3://warehouse/", ""),
-        ("s3a://warehouse/direct/events/", "direct/events"),
-        ("s3://warehouse/direct/my%20events", "direct/my events"),
-        (
-            "abfss://container@account.dfs.core.windows.net/direct/events",
-            "direct/events",
-        ),
-    ] {
-        let prefix = store_prefix(uri).unwrap_or_else(|e| panic!("'{uri}' names a prefix: {e}"));
-        assert_eq!(prefix.as_ref(), expected, "for '{uri}'");
-    }
-
-    let err = store_prefix("warehouse/direct").expect_err("a schemeless value names no store");
-    assert!(
-        err.to_string().contains("warehouse/direct"),
-        "the refusal must name the value it rejected: {err}"
-    );
-}
-
 /// Scenario: The file pattern selects the listing depth and the file-name rule
 #[tokio::test]
 async fn file_pattern_selects_listing_depth_and_file_name_rule() {
@@ -877,15 +854,14 @@ async fn a_raw_key_location_is_listed_without_percent_decoding() {
     let store = in_memory_store(&[("tbl/p_str=a b%2Fc/f1", body), ("tbl/p_str=a b/c/f2", body)])
         .await as Arc<dyn ObjectStore>;
 
-    let (store_root, prefix) =
-        raw_location_prefix(location).expect("an S3 location names a store root and a key");
-    let files = list_location_files(&store, &prefix, FilePattern::AnyDirectChild)
+    let location = ObjectLocation::from_raw(location).expect("an S3 location names a raw key");
+    let files = list_location_files(&store, location.key(), FilePattern::AnyDirectChild)
         .await
         .expect("the raw key lists");
 
     assert_eq!(
-        (store_root.as_str(), prefix.as_ref()),
-        ("s3://bucket", "tbl/p_str=a b%2Fc"),
+        location.key().as_ref(),
+        "tbl/p_str=a b%2Fc",
         "the key is taken verbatim, with no percent-decoding"
     );
     assert_eq!(
@@ -896,42 +872,6 @@ async fn a_raw_key_location_is_listed_without_percent_decoding() {
         vec!["tbl/p_str=a b%2Fc/f1"],
         "the literal key lists, never the key its decoding would name"
     );
-    assert_eq!(
-        store_prefix(location)
-            .expect("the location also parses as a URL")
-            .as_ref(),
-        "tbl/p_str=a b/c",
-        "a direct-storage or Unity storage URI is still decoded as a URL"
-    );
-    for (other, expected_root, expected_key) in [
-        ("s3a://bucket/tbl/", "s3://bucket", "tbl"),
-        ("S3://bucket/tbl", "s3://bucket", "tbl"),
-        ("s3://bucket", "s3://bucket", ""),
-        ("s3://bucket/", "s3://bucket", ""),
-        ("s3://bucket/a#b/c?d", "s3://bucket", "a#b/c?d"),
-    ] {
-        let (root, key) =
-            raw_location_prefix(other).unwrap_or_else(|e| panic!("'{other}' names a key: {e}"));
-        assert_eq!(
-            (root.as_str(), key.as_ref()),
-            (expected_root, expected_key),
-            "for '{other}'"
-        );
-    }
-}
-
-#[test]
-fn a_location_naming_no_scheme_bucket_or_valid_key_is_refused_naming_it() {
-    for (location, cause) in [
-        ("bucket/tbl", "no scheme"),
-        ("://bucket/tbl", "no scheme"),
-        ("s3:///tbl", "no bucket"),
-        ("s3://bucket/tbl//part", "empty path segment"),
-    ] {
-        let error = raw_location_prefix(location)
-            .expect_err("a location that names no raw key must be refused");
-        assert_mentions(&error.to_string(), &[location, cause]);
-    }
 }
 
 /// Scenario: The listing answer serves a caller that declares its own partition columns

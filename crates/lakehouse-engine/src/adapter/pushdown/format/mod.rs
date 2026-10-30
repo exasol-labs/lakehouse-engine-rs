@@ -17,6 +17,7 @@ use crate::adapter::column_notes::{ColumnDeclaration, DeclaredSchema};
 use crate::adapter::pushdown::BinaryColumns;
 use crate::adapter::pushdown::binary_filter::with_binary_literals;
 use crate::adapter::tables::catalog_identifier_string;
+use crate::scan::ObjectLocation;
 use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry};
 use crate::types::mapping::arrow_type_from_tag;
 
@@ -189,7 +190,7 @@ pub enum ScanSource<'a> {
     },
     DirectParquet {
         store: &'a Arc<dyn ObjectStore>,
-        table_root: &'a str,
+        table_root: &'a ObjectLocation,
     },
 }
 

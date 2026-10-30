@@ -115,11 +115,12 @@ fn third_scan_source_selects_the_parquet_reader() {
     let creds = sigv4_creds();
     let storage = sample_storage();
     let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let table_root = ObjectLocation::from_raw("s3://warehouse/direct/events").unwrap();
 
     let selected = format_reader(
         ScanSource::DirectParquet {
             store: &store,
-            table_root: "s3://warehouse/direct/events",
+            table_root: &table_root,
         },
         &ConnectionStorage {
             storage: &storage,
