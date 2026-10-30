@@ -522,3 +522,65 @@ fn a_filter_column_the_declaration_does_not_carry_imposes_no_constraint() {
         None
     );
 }
+
+fn binary_schema() -> Schema {
+    let column = |id: i32, name: &str, ty: PrimitiveType| {
+        Arc::new(NestedField::optional(id, name, Type::Primitive(ty)))
+    };
+    Schema::builder()
+        .with_schema_id(1)
+        .with_fields(vec![
+            column(1, "b", PrimitiveType::Binary),
+            column(2, "f", PrimitiveType::Fixed(2)),
+            column(3, "u", PrimitiveType::Uuid),
+        ])
+        .build()
+        .unwrap()
+}
+
+fn equal_to_bytes(column: &str, hex: &str) -> Json {
+    json!({
+        "type": "predicate_equal",
+        "left": {"type": "column", "name": column},
+        "right": {"type": "literal_binary", "value": hex},
+    })
+}
+
+/// Scenario: A hex-literal filter on a binary column prunes files at plan time
+#[test]
+fn a_binary_literal_prunes_a_binary_or_fixed_column_by_its_bytes() {
+    let schema = binary_schema();
+    assert_eq!(
+        translate_as_created(&equal_to_bytes("B", "00abff"), &schema),
+        Some(Reference::new("b").equal_to(Datum::binary([0x00, 0xab, 0xff])))
+    );
+    assert_eq!(
+        translate_as_created(&equal_to_bytes("F", "0a0b"), &schema),
+        Some(Reference::new("f").equal_to(Datum::fixed([0x0a, 0x0b])))
+    );
+    assert_eq!(
+        translate_as_created(
+            &equal_to_bytes("U", "f79c3e09677c4bbda4793f349cb785e7"),
+            &schema
+        ),
+        None,
+        "a uuid literal constrains nothing, because stored uuid bounds follow no one order"
+    );
+    assert_eq!(
+        translate_as_created(&equal_to_bytes("F", "0a"), &schema),
+        None,
+        "a literal of another width than the fixed column's constrains nothing"
+    );
+    assert_eq!(
+        translate_as_created(
+            &json!({
+                "type": "predicate_equal",
+                "left": {"type": "column", "name": "B"},
+                "right": {"type": "literal_string", "value": "00abff"},
+            }),
+            &schema
+        ),
+        None,
+        "only the retyped literal names bytes"
+    );
+}

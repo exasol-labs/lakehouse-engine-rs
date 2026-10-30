@@ -24,11 +24,11 @@ Maps a Glue column's Hive type string to the engine's types. A parser turns the 
 * *THEN* the parser SHALL yield the Spark array, map, or struct type with every member typed recursively and declared nullable
 * *AND* the classifier SHALL give each column the string tag and the nested descriptor the JSON renderer reads, so the column returns one JSON document per row
 
-### Scenario: A binary, unrecognized, or malformed Hive type refuses only its column
+### Scenario: An unrecognized or malformed Hive type refuses only its column
 
-* *GIVEN* a Glue table with an `int` column and columns typed `binary`, `struct<b:binary>`, `uniontype<int,string>`, `interval_day_time`, `map<int>`, and an empty type string
+* *GIVEN* a Glue table with an `int` column and columns typed `binary`, `struct<x:binary>`, `uniontype<int,string>`, `interval_day_time`, `map<int>`, and an empty type string
 * *WHEN* the pushdown plans the table
-* *THEN* the `binary` and `struct<b:binary>` columns SHALL be refused per `vs-adapter/binary-column-refusal`
+* *THEN* the `binary` and `struct<x:binary>` columns SHALL read as hex per `vs-adapter/binary-column-rendering`
 * *AND* every unrecognized or malformed type SHALL refuse its column with a reason quoting the type string
 * *AND* a refused column SHALL fail only the queries that read or emit it, and a table whose every column is refused SHALL be refused as a whole, per `delta/delta-type-mapping`
 
@@ -38,4 +38,4 @@ Maps a Glue column's Hive type string to the engine's types. A parser turns the 
 * *WHEN* createVirtualSchema lists the table
 * *THEN* each column SHALL be declared with the Exasol type the Unity Catalog listing declares for the same Spark type, so `tinyint`, `smallint`, `int`, and `bigint` declare `DECIMAL(3,0)`, `DECIMAL(5,0)`, `DECIMAL(10,0)`, and `DECIMAL(20,0)`, `float` and `double` declare `DOUBLE PRECISION`, `date` declares `DATE`, and `decimal(10,2)` declares `DECIMAL(10,2)`
 * *AND* `timestamp` SHALL declare the catalog-declared timestamp type of `scan-types/type-mapping`
-* *AND* every string, nested, unrecognized, or malformed column SHALL declare `VARCHAR(2000000)`, as a binary column does per `vs-adapter/binary-column-refusal`, so a column type never fails the listing
+* *AND* every string, binary, nested, unrecognized, or malformed column SHALL declare `VARCHAR(2000000)`, so a column type never fails the listing

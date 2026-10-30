@@ -826,6 +826,7 @@ fn guard_dispatch_result(
         0.6,
         200,
         8,
+        false,
     )
 }
 
@@ -849,6 +850,7 @@ fn dispatch_sql_for_body(pushdown_req_body: Json) -> String {
     let (filter, declined_filter) = classify_where_filter(
         pushdown_req.get("filter").filter(|f| !f.is_null()),
         &col_types,
+        &BinaryColumns::default(),
     );
     let result = build_dispatch_sql(
         &request,
@@ -875,6 +877,7 @@ fn dispatch_sql_for_body(pushdown_req_body: Json) -> String {
         0.6,
         200,
         8,
+        false,
     )
     .expect("build_dispatch_sql must succeed for this fixture");
     result["sql"]
@@ -949,7 +952,11 @@ fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
 #[test]
 fn trivially_true_filter_omitted_without_wrapper() {
     let trivially_true = serde_json::json!({"type": "literal_bool", "value": true});
-    let (filter, declined) = classify_where_filter(Some(&trivially_true), &guard_col_types());
+    let (filter, declined) = classify_where_filter(
+        Some(&trivially_true),
+        &guard_col_types(),
+        &BinaryColumns::default(),
+    );
     assert!(
         filter.is_none() && declined.is_none(),
         "a trivially-true filter is neither pushed nor declined: {filter:?} {declined:?}"
@@ -1103,7 +1110,8 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
              assertion below can tell the original from the rewritten one"
     );
 
-    let (scan_filter, declined) = classify_where_filter(Some(&filter), &col_types);
+    let (scan_filter, declined) =
+        classify_where_filter(Some(&filter), &col_types, &BinaryColumns::default());
 
     assert!(
         scan_filter.is_none(),
@@ -1968,7 +1976,12 @@ fn refused_column_table_request_with_filter(select_list: Json, filter: Json) -> 
 }
 
 const REFUSED_COLUMN_TABLE_COLUMNS: &[(&str, &str)] =
-    &[("int_col", "integer"), ("binary_col", "binary")];
+    &[("int_col", "integer"), ("variant_col", "variant")];
+
+/// The log declares the refused column a string: a `variant` log needs the `variantType` feature,
+/// which the reader refuses as a whole table, while the notes alone decide the column's refusal.
+const REFUSED_COLUMN_TABLE_LOG_COLUMNS: &[(&str, &str)] =
+    &[("int_col", "integer"), ("variant_col", "string")];
 
 fn refused_column_table(pushdown_request: Json) -> Json {
     let request = serde_json::json!({
@@ -1976,7 +1989,7 @@ fn refused_column_table(pushdown_request: Json) -> Json {
             "name": "ORDERS",
             "columns": [
                 {"name": "INT_COL", "dataType": {"type": "decimal", "precision": 10, "scale": 0}},
-                {"name": "BINARY_COL", "dataType": {"type": "varchar", "size": 2000000}},
+                {"name": "VARIANT_COL", "dataType": {"type": "varchar", "size": 2000000}},
             ],
         }],
         "pushdownRequest": pushdown_request,
@@ -1987,7 +2000,7 @@ fn refused_column_table(pushdown_request: Json) -> Json {
 async fn refused_column_table_storage() -> crate::scan::spec::StorageBackend {
     delta_object_endpoint(vec![(
         delta_commit_zero_key("orders"),
-        fileless_delta_commit("orders", REFUSED_COLUMN_TABLE_COLUMNS),
+        fileless_delta_commit("orders", REFUSED_COLUMN_TABLE_LOG_COLUMNS),
     )])
     .await
 }
@@ -2020,7 +2033,7 @@ async fn a_refused_column_is_refused_before_the_zero_active_files_early_return()
     );
 
     let error = delta_pushdown(
-        &refused_column_table_request(serde_json::json!([column_item("BINARY_COL")])),
+        &refused_column_table_request(serde_json::json!([column_item("VARIANT_COL")])),
         &catalog.uri,
         storage,
         "cat.sch.orders",
@@ -2030,130 +2043,10 @@ async fn a_refused_column_is_refused_before_the_zero_active_files_early_return()
 
     let message = user_message(error);
     assert!(
-        message.contains("binary_col") && message.contains("#351"),
+        message.contains("variant_col") && message.contains("type 'variant'"),
         "the refusal must be the gate's own message, naming the column and its reason: \
          {message}"
     );
-}
-
-/// Each format's binary table `T`: the mappable `ID` and `B binary`, plus on Iceberg `F fixed(16)`,
-/// `U uuid`, and `S struct<x: binary>`.
-async fn binary_table_pushdown(iceberg: bool, pushdown_request: Json) -> Result<Json, UdfError> {
-    let names: &[&str] = if iceberg {
-        &["ID", "B", "F", "U", "S"]
-    } else {
-        &["ID", "B"]
-    };
-    let body = load_table_body_with_columns(binary_iceberg_fields(), BINARY_ICEBERG_LAST_COLUMN_ID);
-    let columns: Vec<Json> = names
-        .iter()
-        .map(|name| {
-            let data_type = match *name {
-                "ID" => serde_json::json!({"type": "decimal", "precision": 10, "scale": 0}),
-                _ => serde_json::json!({"type": "varchar", "size": 2000000}),
-            };
-            serde_json::json!({"name": name, "dataType": data_type})
-        })
-        .collect();
-    let request = serde_json::json!({
-        "involvedTables": [{"name": "T", "columns": columns}],
-        "pushdownRequest": pushdown_request,
-    });
-    if !iceberg {
-        let columns = [("id", "integer"), ("b", "binary")];
-        let request = with_delta_notes(request, "T", &columns, &[]);
-        let catalog = unity_delta_catalog().await;
-        let storage = delta_object_endpoint(vec![(
-            delta_commit_zero_key("t"),
-            fileless_delta_commit("t", &columns),
-        )])
-        .await;
-        return delta_pushdown(&request, &catalog.uri, storage, "cat.sch.t").await;
-    }
-    let request = with_notes(
-        request,
-        "T",
-        &load_table_body_notes(&serde_json::from_str(&body).expect("a JSON body")),
-    );
-    let catalog = RecordingCatalog::spawn(move |target| {
-        if target.starts_with("/v1/config") {
-            (200, "{}".to_string())
-        } else {
-            (200, body.clone())
-        }
-    })
-    .await;
-    seam_handle_pushdown(
-        &request,
-        &catalog.uri,
-        &CatalogProps {
-            warehouse: "wh".into(),
-            table: "db.t".into(),
-        },
-        CatalogKind::IcebergRest,
-        &unauthenticated_creds(),
-    )
-    .await
-}
-
-/// Scenario: A refused column refuses only the requests that read or emit it
-/// Scenario: A binary column is refused on every catalog-declared format at every depth
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_binary_column_refuses_only_the_requests_that_read_it_on_every_catalog_format() {
-    let column = |name: &str| serde_json::json!({"type": "column", "name": name, "tableName": "T"});
-    let select = |item: Json| serde_json::json!({"type": "select", "selectList": [item]});
-    let select_star = serde_json::json!({"type": "select"});
-    let count_star = serde_json::json!({
-        "type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false,
-    });
-    let filter_on_b = serde_json::json!({
-        "type": "select",
-        "selectList": [column("ID")],
-        "filter": {"type": "predicate_is_not_null", "expression": column("B")},
-    });
-    let binary_b = vec!["'b'", "type 'binary'", "#351"];
-
-    for iceberg in [false, true] {
-        for admitted in [select(column("ID")), select(count_star.clone())] {
-            binary_table_pushdown(iceberg, admitted.clone())
-                .await
-                .unwrap_or_else(|e| {
-                    panic!("{admitted}: a request reading no binary column plans: {e}")
-                });
-        }
-
-        let mut refused = vec![
-            (select(column("B")), binary_b.clone()),
-            (filter_on_b.clone(), binary_b.clone()),
-            (select_star.clone(), vec!["'b'", "#351"]),
-        ];
-        if iceberg {
-            refused.extend([
-                (select(column("F")), vec!["'f'", "type 'fixed(16)'", "#351"]),
-                (select(column("U")), vec!["'u'", "type 'uuid'", "#351"]),
-                (
-                    select(column("S")),
-                    vec!["'s'", "member 's.x'", "type 'binary'", "#351"],
-                ),
-                (select_star.clone(), vec!["'f'", "'u'", "'s'"]),
-            ]);
-        }
-        for (request, fragments) in refused {
-            let message = user_message(
-                binary_table_pushdown(iceberg, request.clone())
-                    .await
-                    .expect_err(&format!(
-                        "{request}: a request reading a binary column is refused"
-                    )),
-            );
-            for fragment in fragments {
-                assert!(
-                    message.contains(fragment),
-                    "{request}: '{fragment}' missing from: {message}"
-                );
-            }
-        }
-    }
 }
 
 async fn refused_protocol_table_storage() -> crate::scan::spec::StorageBackend {
@@ -2330,7 +2223,7 @@ async fn an_aggregate_over_a_refused_column_is_refused() {
         &refused_column_table_request(serde_json::json!([{
             "type": "function_aggregate",
             "name": "MAX",
-            "arguments": [column_item("BINARY_COL")],
+            "arguments": [column_item("VARIANT_COL")],
             "distinct": false,
         }])),
         &catalog.uri,
@@ -2340,7 +2233,7 @@ async fn an_aggregate_over_a_refused_column_is_refused() {
     .await
     .expect_err("an aggregate reading the refused column must be refused");
 
-    assert_refuses_binary_col(error);
+    assert_refuses_variant_col(error);
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it
@@ -2356,7 +2249,7 @@ async fn a_count_star_filtered_on_a_refused_column_is_refused() {
             ]),
             serde_json::json!({
                 "type": "predicate_is_not_null",
-                "expression": column_item("BINARY_COL"),
+                "expression": column_item("VARIANT_COL"),
             }),
         ),
         &catalog.uri,
@@ -2366,7 +2259,7 @@ async fn a_count_star_filtered_on_a_refused_column_is_refused() {
     .await
     .expect_err("a COUNT(*) filtered on the refused column reads it, so it must be refused");
 
-    assert_refuses_binary_col(error);
+    assert_refuses_variant_col(error);
 }
 
 /// Scenario: Resolved partition columns reach the scan spec for every side
@@ -2401,6 +2294,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         0.6,
         200,
         8,
+        false,
     )
     .expect("build_dispatch_sql must succeed for the EVENTS fixture");
     let sql = result["sql"]
@@ -2456,6 +2350,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         memory_pool_fraction: 0.6,
         instance_overhead_mb: 200,
         s3_max_connections: 8,
+        binary_as_string: false,
         connection: &super::test_support::TEST_CONNECTION,
     };
     let join_sql = super::joins::build_broadcast_join_sql(
@@ -2946,6 +2841,7 @@ fn dispatch_result_for_body(
     let (filter, declined_filter) = classify_where_filter(
         pushdown_req.get("filter").filter(|f| !f.is_null()),
         &col_types,
+        &BinaryColumns::default(),
     );
     let result = build_dispatch_sql(
         &request,
@@ -2972,6 +2868,7 @@ fn dispatch_result_for_body(
         0.6,
         200,
         8,
+        false,
     )?;
     Ok(result["sql"]
         .as_str()

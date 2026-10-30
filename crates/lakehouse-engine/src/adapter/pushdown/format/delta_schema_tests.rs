@@ -252,7 +252,8 @@ fn id_mode_column_without_a_physical_name_is_refused_naming_the_column() {
 #[test]
 fn a_refused_columns_binding_key_is_never_looked_up_even_when_it_would_itself_fail() {
     let mappable = mapped_field("id", 1, "col-id");
-    let refused_with_no_binding_annotation = StructField::nullable("bad_binary", DataType::BINARY);
+    let refused_with_no_binding_annotation =
+        StructField::nullable("bad_variant", DataType::unshredded_variant());
     let schema = StructType::try_new([mappable, refused_with_no_binding_annotation]).unwrap();
 
     let (logical_fields, refused_columns) = classify(&schema, ColumnMappingMode::Id);
@@ -268,8 +269,8 @@ fn a_refused_columns_binding_key_is_never_looked_up_even_when_it_would_itself_fa
     assert_eq!(logical_fields[0].field_id, Some(1));
 
     assert_eq!(refused_columns.len(), 1);
-    assert_eq!(refused_columns[0].column_name, "bad_binary");
-    assert!(refused_columns[0].reason.contains("binary"));
+    assert_eq!(refused_columns[0].column_name, "bad_variant");
+    assert!(refused_columns[0].reason.contains("variant"));
 }
 
 /// Scenario: Every Delta type Exasol represents natively maps to its own Arrow tag
@@ -460,52 +461,45 @@ fn containers_classify_recursively_by_renderability() {
 
 /// Scenario: A Delta type whose Arrow form cannot be rendered faithfully is refused by name
 #[test]
-fn refused_set_is_binary_variant_and_containers_of_them() {
-    let variant = DataType::unshredded_variant();
-    let binary_field = || StructField::nullable("b", DataType::BINARY);
+fn refused_set_is_variant_and_containers_of_it() {
+    let variant = DataType::unshredded_variant;
+    let variant_field = || StructField::nullable("v", variant());
 
     for (declared_type, member_path, refused_type) in [
-        (DataType::BINARY, None, "binary"),
-        (variant.clone(), None, "variant"),
-        (array_of(DataType::BINARY), Some("col.element"), "binary"),
+        (variant(), None, "variant"),
+        (array_of(variant()), Some("col.element"), "variant"),
         (
-            array_of(array_of(DataType::BINARY)),
+            array_of(array_of(variant())),
             Some("col.element.element"),
-            "binary",
+            "variant",
         ),
-        (struct_of([binary_field()]), Some("col.b"), "binary"),
         (
             struct_of([
                 StructField::nullable("ok", DataType::INTEGER),
-                StructField::nullable("v", variant.clone()),
+                variant_field(),
             ]),
             Some("col.v"),
             "variant",
         ),
         (
-            map_of(DataType::BINARY, DataType::STRING),
-            Some("col.key"),
-            "binary",
-        ),
-        (
-            map_of(DataType::STRING, DataType::BINARY),
+            map_of(DataType::STRING, variant()),
             Some("col.value"),
-            "binary",
+            "variant",
         ),
         (
-            array_of(struct_of([binary_field()])),
-            Some("col.element.b"),
-            "binary",
+            array_of(struct_of([variant_field()])),
+            Some("col.element.v"),
+            "variant",
         ),
         (
-            struct_of([StructField::nullable("inner", struct_of([binary_field()]))]),
-            Some("col.inner.b"),
-            "binary",
+            struct_of([StructField::nullable("inner", struct_of([variant_field()]))]),
+            Some("col.inner.v"),
+            "variant",
         ),
         (
-            map_of(DataType::STRING, array_of(struct_of([binary_field()]))),
-            Some("col.value.element.b"),
-            "binary",
+            map_of(DataType::STRING, array_of(struct_of([variant_field()]))),
+            Some("col.value.element.v"),
+            "variant",
         ),
     ] {
         let message = refusal_message("col", declared_type.clone());
@@ -532,30 +526,31 @@ fn refused_set_is_binary_variant_and_containers_of_them() {
                 "a column refused for its OWN type names no member: {message}"
             ),
         }
-        assert_eq!(
-            message.contains("#351"),
-            refused_type == "binary",
-            "binary's reason cites the issue that owns it, and variant's cites none: {message}"
-        );
         assert!(!message.contains("#350"), "message was: {message}");
         assert!(!message.contains("#322"), "message was: {message}");
     }
 }
 
 #[test]
-fn binary_cause_names_the_declared_type_and_issue_351() {
-    for declared in ["binary", "fixed(16)", "uuid", "bson", "enum"] {
-        assert_eq!(
-            binary_cause(declared),
-            format!(
-                "has type '{declared}', which this engine refuses: rendering binary data is \
-                 tracked as issue #351"
-            ),
-        );
-    }
-    assert!(
-        refusal_message("col", DataType::BINARY).ends_with(&binary_cause("binary")),
-        "a Delta binary column's reason is the one shared cause, naming 'binary'"
+fn a_binary_column_maps_to_the_binary_tag_and_a_nested_one_renders_as_json() {
+    let schema = StructType::try_new([
+        StructField::nullable("b", DataType::BINARY),
+        StructField::nullable(
+            "s",
+            struct_of([StructField::nullable("x", DataType::BINARY)]),
+        ),
+    ])
+    .unwrap();
+
+    let (logical_fields, refused_columns) = classify(&schema, ColumnMappingMode::None);
+
+    assert!(refused_columns.is_empty(), "{refused_columns:?}");
+    assert_eq!(
+        logical_fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.arrow_type.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("b", "binary"), ("s", "utf8")]
     );
 }
 
@@ -563,10 +558,10 @@ fn binary_cause_names_the_declared_type_and_issue_351() {
 fn a_refusal_names_its_column_under_the_classifying_sources_label() {
     let schema = StructType::try_new([
         StructField::nullable("id", DataType::LONG),
-        StructField::nullable("b", DataType::BINARY),
+        StructField::nullable("v", DataType::unshredded_variant()),
         StructField::nullable(
             "s",
-            struct_of([StructField::nullable("x", DataType::BINARY)]),
+            struct_of([StructField::nullable("x", DataType::unshredded_variant())]),
         ),
     ])
     .unwrap();
@@ -604,7 +599,7 @@ fn a_refused_containers_nested_binding_key_is_never_looked_up() {
             "keep",
             struct_of([
                 StructField::nullable("unannotated", DataType::INTEGER),
-                StructField::nullable("b", DataType::BINARY),
+                StructField::nullable("b", DataType::unshredded_variant()),
             ]),
         ),
         1,

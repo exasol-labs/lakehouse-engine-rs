@@ -1,7 +1,7 @@
-use crate::adapter::column_notes::{ColumnDeclaration, binary_refusal};
+use crate::adapter::column_notes::{ColumnDeclaration, column_refusal, unread_type_cause};
 use crate::adapter::direct_storage_properties::join_storage_path;
 use crate::adapter::parquet_directory::{
-    BinaryColumn, DirectoryOptions, ParquetDirectory, resolve_parquet_directory, store_prefix,
+    DirectoryOptions, ParquetDirectory, RefusedLeaf, resolve_parquet_directory, store_prefix,
 };
 use crate::scan::DIRECT_STORAGE_ADMISSION_LIMIT;
 use crate::scan::spec::{LogicalField, NestedField, NestedMembers, StorageBackend};
@@ -149,18 +149,20 @@ impl CatalogClient for DirectStorageCatalogClient {
 }
 
 /// The tag and the note come from the one folded schema, so they cannot disagree. Nested or
-/// unrepresentable columns tag as Utf8 (JSON text) instead of failing CREATE VIRTUAL SCHEMA.
+/// unrepresentable columns tag as Utf8 (JSON text) instead of failing CREATE VIRTUAL SCHEMA, and
+/// binary columns keep their type, which declares hex text.
 fn resolve_columns(directory: &ParquetDirectory) -> Vec<CatalogColumn> {
     directory
         .schema
         .fields()
         .iter()
         .map(|field| {
-            let declared = if needs_json_fallback(field.data_type()) {
-                DataType::Utf8
-            } else {
-                field.data_type().clone()
-            };
+            let declared =
+                if needs_json_fallback(field.data_type()) && !field.data_type().is_binary() {
+                    DataType::Utf8
+                } else {
+                    field.data_type().clone()
+                };
             let declaration = ColumnDeclaration {
                 source_type: logical_field(field),
                 partition: directory
@@ -168,10 +170,10 @@ fn resolve_columns(directory: &ParquetDirectory) -> Vec<CatalogColumn> {
                     .iter()
                     .position(|key| key == field.name()),
                 refused: directory
-                    .binary_columns
+                    .refused_leaves
                     .iter()
-                    .find(|binary| binary.column == *field.name())
-                    .map(binary_column_refusal),
+                    .find(|leaf| leaf.column == *field.name())
+                    .map(leaf_refusal),
             };
             CatalogColumn {
                 name: field.name().clone(),
@@ -182,14 +184,14 @@ fn resolve_columns(directory: &ParquetDirectory) -> Vec<CatalogColumn> {
         .collect()
 }
 
-fn binary_column_refusal(column: &BinaryColumn) -> String {
-    let mut reason = binary_refusal(
+fn leaf_refusal(leaf: &RefusedLeaf) -> String {
+    let mut reason = column_refusal(
         "Parquet",
-        &column.column,
-        column.member_path.as_deref(),
-        &column.declared,
+        &leaf.column,
+        leaf.member_path.as_deref(),
+        &unread_type_cause(&leaf.declared),
     );
-    if column.nested_enum {
+    if leaf.nested_enum {
         reason
             .push_str("; a Parquet ENUM is read as text only as a top-level, non-repeated column");
     }

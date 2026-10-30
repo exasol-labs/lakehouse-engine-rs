@@ -1007,8 +1007,8 @@ async fn listing_answer_fills_caller_declared_partition_columns_and_reads_no_foo
     );
 }
 
-fn binary_column(column: &str, member_path: Option<&str>, declared: &str) -> BinaryColumn {
-    BinaryColumn {
+fn refused_leaf(column: &str, member_path: Option<&str>, declared: &str) -> RefusedLeaf {
+    RefusedLeaf {
         column: column.to_string(),
         member_path: member_path.map(str::to_string),
         declared: declared.to_string(),
@@ -1016,7 +1016,7 @@ fn binary_column(column: &str, member_path: Option<&str>, declared: &str) -> Bin
     }
 }
 
-/// Scenario: A direct-storage unannotated BYTE_ARRAY column is refused
+/// Scenario: The listing declares a binary column
 #[tokio::test]
 async fn every_footer_leaf_is_classified_by_its_parquet_annotation() {
     let footer = parquet_footer_bytes(
@@ -1067,21 +1067,15 @@ async fn every_footer_leaf_is_classified_by_its_parquet_annotation() {
         .expect("every annotation of the fixture folds to an Arrow type");
 
     assert_eq!(
-        directory.binary_columns,
+        directory.refused_leaves,
         vec![
-            binary_column("legacy_name", None, "binary"),
-            binary_column("doc_bson", None, "bson"),
-            binary_column("shape", None, "geometry"),
-            binary_column("area", None, "geography"),
-            binary_column("uid", None, "uuid"),
-            binary_column("digest", None, "fixed(20)"),
-            binary_column("s", Some("s.k"), "enum"),
-            binary_column("l", Some("l.list.element"), "binary"),
-            binary_column("m", Some("m.key_value.value"), "fixed(4)"),
-            binary_column("tags", None, "enum"),
+            refused_leaf("shape", None, "geometry"),
+            refused_leaf("area", None, "geography"),
+            refused_leaf("s", Some("s.k"), "enum"),
+            refused_leaf("tags", None, "enum"),
         ],
-        "a STRING, JSON, top-level ENUM, DECIMAL, FLOAT16, or INTERVAL leaf is not binary; every \
-         other byte-array leaf is, named in the file's terms, with the column's first such member"
+        "only a geospatial leaf and an ENUM leaf below the top level or under a repeated one are \
+         refused, named in the file's terms; every other byte-array leaf renders as hex"
     );
     assert_eq!(
         directory.schema.fields().len(),
@@ -1144,18 +1138,15 @@ async fn a_converted_type_decides_a_leaf_that_carries_no_logical_type() {
         .expect("every converted type of the fixture folds to an Arrow type");
 
     assert_eq!(
-        directory.binary_columns,
-        vec![
-            binary_column("doc_bson", None, "bson"),
-            binary_column("s", Some("s.k"), "enum"),
-        ],
+        directory.refused_leaves,
+        vec![refused_leaf("s", Some("s.k"), "enum")],
         "a legacy writer's converted type classifies the leaf exactly as its logical type would"
     );
 }
 
-/// Scenario: A direct-storage unannotated BYTE_ARRAY column is refused
+/// Scenario: The listing declares a binary column
 #[tokio::test]
-async fn an_embedded_arrow_schema_binary_leaf_declares_binary() {
+async fn an_embedded_arrow_schema_binary_leaf_keeps_its_arrow_type() {
     let probe = store_holding(&[(
         "a.parquet",
         &parquet_bytes(
@@ -1184,30 +1175,27 @@ async fn an_embedded_arrow_schema_binary_leaf_declares_binary() {
         ],
         "the embedded Arrow schema still folds each column to its own Arrow type"
     );
-    assert_eq!(
-        directory.binary_columns,
-        vec![
-            binary_column("large", None, "binary"),
-            binary_column("view", None, "binary"),
-        ],
-        "the Parquet leaf under an Arrow LargeBinary or BinaryView is an unannotated BYTE_ARRAY"
+    assert!(
+        directory.refused_leaves.is_empty(),
+        "the Parquet leaf under an Arrow LargeBinary or BinaryView is an unannotated BYTE_ARRAY, \
+         which renders as hex"
     );
 }
 
-/// Scenario: A direct-storage unannotated BYTE_ARRAY column is refused
+/// Scenario: A geospatial column is refused
 #[tokio::test]
-async fn each_column_keeps_the_first_binary_leaf_any_read_footer_declares() {
+async fn each_column_keeps_the_first_refused_leaf_any_read_footer_declares() {
     let first = parquet_footer_bytes(
         "message first {
             OPTIONAL INT32 id;
-            OPTIONAL BYTE_ARRAY payload;
-            OPTIONAL BYTE_ARRAY region;
+            OPTIONAL BYTE_ARRAY payload (GEOMETRY);
+            OPTIONAL BYTE_ARRAY region (GEOMETRY);
         }",
     );
     let second = parquet_footer_bytes(
         "message second {
             OPTIONAL INT32 id;
-            OPTIONAL BYTE_ARRAY payload (BSON);
+            OPTIONAL BYTE_ARRAY payload (GEOGRAPHY);
             OPTIONAL BYTE_ARRAY extra (GEOMETRY);
         }",
     );
@@ -1225,17 +1213,17 @@ async fn each_column_keeps_the_first_binary_leaf_any_read_footer_declares() {
         .expect("the first footer folds");
 
     assert_eq!(
-        folded.binary_columns,
+        folded.refused_leaves,
         vec![
-            binary_column("payload", None, "binary"),
-            binary_column("extra", None, "geometry"),
+            refused_leaf("payload", None, "geometry"),
+            refused_leaf("extra", None, "geometry"),
         ],
         "the first listed file names a column's type, a later file adds its own columns, and a \
          stored column dropped for a partition key is never refused"
     );
     assert_eq!(
-        sampled.binary_columns,
-        vec![binary_column("payload", None, "binary")],
+        sampled.refused_leaves,
+        vec![refused_leaf("payload", None, "geometry")],
         "sampling one footer classifies that footer alone"
     );
 }

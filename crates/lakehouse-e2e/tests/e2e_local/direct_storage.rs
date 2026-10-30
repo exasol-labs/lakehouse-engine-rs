@@ -2,8 +2,10 @@
 //! queried with no catalog service. FAILS (never skips) when the stack is unreachable.
 
 use crate::common::e2e_harness::{
-    VARCHAR_JSON, VsProps, assert_decimal_orders_numerically, assert_notes_well_formed,
-    assert_query_fails, assert_refused_column, assert_type_matrix, column_adapter_notes,
+    VARCHAR_JSON, VsProps, assert_binary_columns_match_native_copy,
+    assert_decimal_orders_numerically, assert_filters_match_native_copy,
+    assert_hex_literal_compares_bytes, assert_notes_well_formed, assert_query_fails,
+    assert_refused_column, assert_text_columns, assert_type_matrix, column_adapter_notes,
     create_virtual_schema_with_password, declared_type, error_text, exa_conn, explain_virtual_sql,
     has_broadcast_join_block, identifier_note, note_of, nullable_text, parse_int, parse_numeric,
     partition_positions, reads, refuses, skip_reason, skipped_entries, text_column,
@@ -16,17 +18,15 @@ use crate::common::raw_parquet::{
 };
 use crate::common::seed::{
     ALL_TYPES_DATE_DAYS, ALL_TYPES_IDS, ALL_TYPES_IDS_TEXT, ALL_TYPES_TIME_MICROS,
-    DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT,
-    DECIMAL_38_10_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT8_VALUES_TEXT, INT16_VALUES_TEXT,
-    INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIME64_VALUES_TEXT, all_types_ids, binary_values,
-    decimal_18_0_values, decimal_36_6_values, decimal_38_10_values, fixed_16_values,
-    float32_values, int8_values, int16_values, int32_values, struct_binary_values, text_values,
-    time64_values,
+    BINARY_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT,
+    DECIMAL_36_6_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT, FIXED_16_VALUES_TEXT, FLOAT32_VALUES_TEXT,
+    INT8_VALUES_TEXT, INT16_VALUES_TEXT, INT32_VALUES_TEXT, STRUCT_BINARY_VALUES_TEXT,
+    TEXT_VALUES_TEXT, TIME64_VALUES_TEXT, all_types_ids, binary_values, decimal_18_0_values,
+    decimal_36_6_values, decimal_38_10_values, fixed_16_values, float32_values, int8_values,
+    int16_values, int32_values, struct_binary_values, text_values, time64_values,
 };
 use crate::common::stack::{CatalogConnectionPassword, seaweedfs_url_internal};
-use crate::common::timestamp_precision::{
-    assert_filters_match_native_copy, engine_honors_declared_precision,
-};
+use crate::common::timestamp_precision::engine_honors_declared_precision;
 use crate::fixtures::{stack, vs_table};
 
 use arrow::array::{
@@ -1258,7 +1258,6 @@ fn complex_directory_declares_varchar_and_returns_parseable_json() {
 /// Scenario: In-range Decimal128 maps to a precise Exasol DECIMAL
 /// Scenario: Out-of-range Decimal128 falls back to VARCHAR via JSON
 /// Scenario: A Parquet-sourced column maps through the Arrow-input direction
-/// Scenario: The listing declares a binary column
 /// Scenario: A direct-storage Parquet timestamp declares the precision of its unit
 /// Scenario: A timestamp filter compares at full precision
 #[test]
@@ -1266,7 +1265,6 @@ fn all_types_directories_declare_and_return_their_mapped_values() {
     setup();
     let mut conn = exa_conn();
 
-    let binary: &[&str] = &["type 'binary'", "#351"];
     let units = TimestampUnitExpectations::for_engine(&mut conn);
     assert_type_matrix(
         &mut conn,
@@ -1327,18 +1325,10 @@ fn all_types_directories_declare_and_return_their_mapped_values() {
                 VARCHAR_JSON,
                 [Some("1 days 2.000 secs"), Some("0 secs"), None],
             ),
-            refuses("C_BINARY", VARCHAR_JSON, binary),
-            refuses("C_LARGEBINARY", VARCHAR_JSON, binary),
-            refuses(
-                "C_FIXEDSIZEBINARY",
-                VARCHAR_JSON,
-                &["type 'fixed(16)'", "#351"],
-            ),
-            refuses(
-                "C_STRUCT_BINARY",
-                VARCHAR_JSON,
-                &["member 'c_struct_binary.x'", "type 'binary'", "#351"],
-            ),
+            reads("C_BINARY", VARCHAR_JSON, BINARY_VALUES_TEXT),
+            reads("C_LARGEBINARY", VARCHAR_JSON, BINARY_VALUES_TEXT),
+            reads("C_FIXEDSIZEBINARY", "VARCHAR(32)", FIXED_16_VALUES_TEXT),
+            reads("C_STRUCT_BINARY", VARCHAR_JSON, STRUCT_BINARY_VALUES_TEXT),
             reads("C_TS_MS", units.ms.0, units.ms.1),
             reads("C_TS_US", units.us.0, units.us.1),
             reads("C_TS_NS", units.ns.0, units.ns.1),
@@ -1355,8 +1345,8 @@ fn all_types_directories_declare_and_return_their_mapped_values() {
         &[
             reads("ID", "DECIMAL(20,0)", ALL_TYPES_IDS_TEXT),
             reads("C_ENUM", VARCHAR_JSON, [Some("red"), Some("green"), None]),
-            refuses("C_BSON", VARCHAR_JSON, &["type 'bson'", "#351"]),
-            refuses("C_UUID", VARCHAR_JSON, &["type 'uuid'", "#351"]),
+            reads("C_BSON", VARCHAR_JSON, BSON_VALUES_TEXT),
+            reads("C_UUID", "VARCHAR(32)", FIXED_16_VALUES_TEXT),
             reads(
                 "C_INT96",
                 units.us.0,
@@ -1366,11 +1356,11 @@ fn all_types_directories_declare_and_return_their_mapped_values() {
                     None,
                 ],
             ),
-            refuses("C_BYTE_ARRAY", VARCHAR_JSON, binary),
+            reads("C_BYTE_ARRAY", VARCHAR_JSON, LEGACY_TEXT_VALUES_HEX),
             refuses(
                 "C_STRUCT_ENUM",
                 VARCHAR_JSON,
-                &["member 'c_struct_enum.k'", "type 'enum'", "#351"],
+                &["member 'c_struct_enum.k'", "type 'enum'"],
             ),
         ],
     );
@@ -1391,6 +1381,87 @@ fn all_types_directories_declare_and_return_their_mapped_values() {
             assert_eq!(value_to_string(&column[0]), "2025-06-01 00:00:00.123456789");
         }
     }
+}
+
+const BSON_VALUES_TEXT: [Option<&str>; 3] = [Some("0500000000"), Some("0500000000"), None];
+
+/// `legacy-a` and `legacy-b`, which a legacy writer stored without the string annotation.
+const LEGACY_TEXT_VALUES_HEX: [Option<&str>; 3] =
+    [Some("6c65676163792d61"), Some("6c65676163792d62"), None];
+
+/// Scenario: A binary column reads as lowercase hex on every source
+/// Scenario: A filter on a binary column selects what native Exasol selects over the hex text
+#[test]
+fn direct_storage_binary_columns_read_and_filter_as_lowercase_hex() {
+    setup();
+    let mut conn = exa_conn();
+    let all_types = vs_table(VS_DIRECT, "ALL_TYPES");
+
+    assert_binary_columns_match_native_copy(
+        &mut conn,
+        &all_types,
+        &["C_BINARY", "C_LARGEBINARY"],
+        &["C_FIXEDSIZEBINARY"],
+    );
+    assert_hex_literal_compares_bytes(&mut conn, &all_types, "C_LARGEBINARY", "00abff");
+}
+
+/// Restores the shared schema's hex rendering, also when an assertion fails.
+struct BinaryAsStringReset;
+
+impl Drop for BinaryAsStringReset {
+    fn drop(&mut self) {
+        exa_conn().try_execute(&format!(
+            "ALTER VIRTUAL SCHEMA {VS_DIRECT} SET BINARY_AS_STRING = 'FALSE'"
+        ));
+    }
+}
+
+/// Scenario: BINARY_AS_STRING reads a variable-length binary column as UTF-8 text
+#[test]
+fn binary_as_string_reads_variable_length_binary_columns_as_text() {
+    setup();
+    let mut conn = exa_conn();
+    let annotated = vs_table(VS_DIRECT, "ANNOTATED_TYPES");
+    let all_types = vs_table(VS_DIRECT, "ALL_TYPES");
+
+    let _reset = BinaryAsStringReset;
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {VS_DIRECT} SET BINARY_AS_STRING = 'TRUE'"
+    ));
+    assert_text_columns(
+        &mut conn,
+        &format!("SELECT C_BYTE_ARRAY, C_UUID FROM {annotated} ORDER BY ID"),
+        &[
+            [Some("legacy-a"), Some("legacy-b"), None],
+            FIXED_16_VALUES_TEXT,
+        ],
+    );
+    assert_text_columns(
+        &mut conn,
+        &format!("SELECT ID FROM {annotated} WHERE C_BYTE_ARRAY = 'legacy-b'"),
+        &[[Some("2")]],
+    );
+    assert_text_columns(
+        &mut conn,
+        &format!("SELECT C_STRUCT_BINARY FROM {all_types} ORDER BY ID"),
+        &[STRUCT_BINARY_VALUES_TEXT],
+    );
+    for sql in [
+        format!("SELECT C_BINARY FROM {all_types}"),
+        format!("SELECT COUNT(*) FROM {all_types} WHERE C_BINARY LIKE 'a%'"),
+    ] {
+        assert_query_fails(&mut conn, &sql, &["column 'C_BINARY'", "not valid UTF-8"]);
+    }
+
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {VS_DIRECT} SET BINARY_AS_STRING = 'FALSE'"
+    ));
+    assert_text_columns(
+        &mut conn,
+        &format!("SELECT C_BYTE_ARRAY FROM {annotated} ORDER BY ID"),
+        &[LEGACY_TEXT_VALUES_HEX],
+    );
 }
 
 const TIMESTAMP_UNIT_FILTERS: &[&str] = &[
@@ -2707,20 +2778,20 @@ fn partition_column_notes_carry_their_position() {
 
 /// Scenario: A refused column's note records its refusal and the column stays declared
 #[test]
-fn direct_storage_binary_column_note_records_the_refusal() {
+fn direct_storage_refused_column_note_records_the_refusal() {
     setup();
     let mut conn = exa_conn();
 
-    for (table, refused) in [
-        ("ALL_TYPES", "C_BINARY"),
-        ("ALL_TYPES", "C_STRUCT_BINARY"),
-        ("ANNOTATED_TYPES", "C_BYTE_ARRAY"),
-    ] {
-        assert_refused_column(&mut conn, VS_DIRECT, table, refused, &["#351"]);
-    }
+    assert_refused_column(
+        &mut conn,
+        VS_DIRECT,
+        "ANNOTATED_TYPES",
+        "C_STRUCT_ENUM",
+        &["'c_struct_enum.k'", "type 'enum'"],
+    );
     let ids = conn.query_columns(&format!(
         "SELECT ID FROM {}",
-        vs_table(VS_DIRECT, "ALL_TYPES")
+        vs_table(VS_DIRECT, "ANNOTATED_TYPES")
     ));
     assert_eq!(ids[0].len(), ALL_TYPES_IDS.len(), "SELECT ID must succeed");
 }

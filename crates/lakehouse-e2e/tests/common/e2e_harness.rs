@@ -3,7 +3,10 @@
 
 use super::exasol_ws::ExaConn;
 pub use super::exasol_ws::error_text;
-use super::seed::{DECIMAL_18_0_VALUES_TEXT, E2E_DIM_TABLE, E2E_FACT_TABLE, build_seed_catalog};
+use super::seed::{
+    DECIMAL_18_0_VALUES_TEXT, E2E_DIM_TABLE, E2E_FACT_TABLE, FIXED_16_VALUES_TEXT,
+    build_seed_catalog,
+};
 use super::stack::{
     CatalogConnectionPassword, bucketfs_port, bucketfs_write_password, build_create_connection_sql,
     exasol_host, exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal,
@@ -991,6 +994,128 @@ pub fn assert_decimal_orders_numerically(
     }
 }
 
+const NATIVE_COPY: &str = "FILTER_ORACLE.NATIVE_COPY";
+
+/// A native copy holds the values Exasol reads, so each filter must select the same `ID`s from
+/// it as from the virtual `table`. A timestamp column holds only where the declaration keeps
+/// every source digit: on 8.x the copy holds millisecond-truncated values, not the source data.
+pub fn assert_filters_match_native_copy(
+    conn: &mut ExaConn,
+    table: &str,
+    columns: &str,
+    filters: &[&str],
+) {
+    conn.execute("CREATE SCHEMA IF NOT EXISTS FILTER_ORACLE");
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {NATIVE_COPY} AS SELECT ID, {columns} FROM {table}"
+    ));
+    let ids = |conn: &mut ExaConn, from: &str, filter: &str| -> Vec<String> {
+        let sql = format!("SELECT TO_CHAR(ID) FROM {from} WHERE {filter} ORDER BY ID");
+        conn.query_columns(&sql)
+            .first()
+            .map(|column| {
+                column
+                    .iter()
+                    .map(|id| id.as_str().unwrap_or_default().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for filter in filters {
+        assert_eq!(
+            ids(conn, table, filter),
+            ids(conn, NATIVE_COPY, filter),
+            "WHERE {filter} on {table} must select the rows native Exasol selects"
+        );
+    }
+}
+
+/// The engine's alias for a binary column's raw bytes, which a pushed hex-literal comparison names.
+const RAW_BYTES_ALIAS_PREFIX: &str = "_LH_BYTES_";
+
+/// Lowercase hex sorts as the bytes do, so every filter, aggregate, and ordering over a binary
+/// column must match native Exasol over a copy of its hex text. `variable` columns hold
+/// `binary_values` and `fixed` ones `fixed_16_values`.
+pub fn assert_binary_columns_match_native_copy(
+    conn: &mut ExaConn,
+    table: &str,
+    variable: &[&str],
+    fixed: &[&str],
+) {
+    let [Some(high), Some(low), _] = FIXED_16_VALUES_TEXT else {
+        unreachable!("the first two fixed values are non-NULL")
+    };
+    let variable_filters = [
+        "{c} = '00abff'",
+        "{c} <> '00abff'",
+        "{c} < 'ff'",
+        "{c} <= '00abff'",
+        "{c} > '00'",
+        "{c} >= '00abff'",
+        "{c} IN ('00abff', '01')",
+        "{c} BETWEEN '00' AND 'ff'",
+        "{c} IS NULL",
+        "{c} IS NOT NULL",
+        "{c} = '00ABFF'",
+        "{c} = '00abf'",
+        "{c} LIKE '00%'",
+        "NOT ({c} = '00abff')",
+        "{c} <> '00' OR ID = 2",
+        "LENGTH({c}) = 6",
+    ]
+    .map(String::from);
+    let fixed_filters = [
+        format!("{{c}} = '{low}'"),
+        format!("{{c}} < '{high}'"),
+        "{c} > '11'".to_string(),
+        format!("{{c}} IN ('{high}', '11')"),
+        format!("{{c}} <> '{high}'"),
+        "{c} IS NULL".to_string(),
+        "{c} LIKE '11%'".to_string(),
+    ];
+    let filters: Vec<String> = variable
+        .iter()
+        .flat_map(|c| variable_filters.iter().map(move |f| f.replace("{c}", c)))
+        .chain(
+            fixed
+                .iter()
+                .flat_map(|c| fixed_filters.iter().map(move |f| f.replace("{c}", c))),
+        )
+        .collect();
+    let columns: Vec<&str> = variable.iter().chain(fixed).copied().collect();
+    let filters: Vec<&str> = filters.iter().map(String::as_str).collect();
+    assert_filters_match_native_copy(conn, table, &columns.join(", "), &filters);
+
+    for column in columns {
+        for query in [
+            format!("SELECT MIN({column}), MAX({column}) FROM {{}}"),
+            format!("SELECT TO_CHAR(ID) FROM {{}} ORDER BY {column} NULLS FIRST, ID"),
+        ] {
+            assert_eq!(
+                conn.query_columns(&query.replace("{}", table)),
+                conn.query_columns(&query.replace("{}", NATIVE_COPY)),
+                "{query} on {table} must return what native Exasol returns"
+            );
+        }
+    }
+}
+
+/// A lowercase hex `literal` of the column's width compares `column`'s raw bytes, which Parquet
+/// statistics prune.
+pub fn assert_hex_literal_compares_bytes(
+    conn: &mut ExaConn,
+    table: &str,
+    column: &str,
+    literal: &str,
+) {
+    let filter = format!("{column} = '{literal}'");
+    let pushed = explain_virtual_sql(conn, &format!("SELECT ID FROM {table} WHERE {filter}"));
+    assert!(
+        pushed.contains(&format!("{RAW_BYTES_ALIAS_PREFIX}{column}")),
+        "{filter} must compare the raw bytes: {pushed}"
+    );
+}
+
 /// `binary_values` declares `C_BYTES` as text over bytes that are not valid UTF-8, so reading
 /// it fails naming `fragment`.
 pub fn assert_binary_values_refused(
@@ -998,11 +1123,14 @@ pub fn assert_binary_values_refused(
     vs_name: &str,
     table: &str,
     fragment: &str,
+    other_columns: &[(&str, &str)],
 ) {
-    assert_eq!(
-        declared_types(conn, vs_name, table),
-        pairs(&[("ID", "DECIMAL(20,0)"), ("C_BYTES", VARCHAR_JSON)])
-    );
+    let declared = [
+        &[("ID", "DECIMAL(20,0)"), ("C_BYTES", VARCHAR_JSON)],
+        other_columns,
+    ]
+    .concat();
+    assert_eq!(declared_types(conn, vs_name, table), pairs(&declared));
     assert_query_fails(
         conn,
         &format!("SELECT C_BYTES FROM {vs_name}.{}", table.to_uppercase()),

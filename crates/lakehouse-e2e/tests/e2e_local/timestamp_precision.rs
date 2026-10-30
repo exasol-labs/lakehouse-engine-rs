@@ -10,8 +10,8 @@ use crate::common::seed::{
 };
 use crate::common::stack::iceberg_catalog_url;
 use crate::common::timestamp_precision::{
-    ExpectedTimestampPrecision, assert_filters_match_native_copy, engine_honors_declared_precision,
-    expected_timestamp_precision, live_engine_version,
+    ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
+    live_engine_version,
 };
 use crate::fixtures::{assert_pushed_to_scan_udf, emits_clause, stack};
 use std::sync::OnceLock;

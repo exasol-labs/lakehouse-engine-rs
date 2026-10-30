@@ -893,12 +893,14 @@ impl RefusedColumn {
 
 /// Whether a file column stored as `physical` may be cast to its declared `logical` type:
 /// identity or a supported widening ([`widen`]), a timestamp whose instant the cast keeps,
-/// a text rendering of a type Exasol cannot represent, or an all-NULL column.
+/// a text rendering of a type Exasol cannot represent, any binary encoding under a variable
+/// binary declaration, or an all-NULL column.
 fn admits(physical: &DataType, logical: &DataType) -> bool {
     physical == &DataType::Null
         || widen(physical, logical).as_ref() == Some(logical)
         || admits_timestamp(physical, logical)
         || admits_as_text(physical, logical)
+        || (logical == &DataType::Binary && physical.is_binary())
         || matches!(physical, DataType::Dictionary(_, value) if admits(value, logical))
 }
 

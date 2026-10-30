@@ -7,6 +7,7 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
 
+use super::super::BinaryColumns;
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
     build_scan_driving_sql, classify_where_filter, collect_all_column_names, extract_limit,
@@ -49,6 +50,7 @@ pub(crate) fn render_broadcast_join(
     request: &Json,
     pushdown_req: &Json,
     join: &DetectedJoin,
+    binary_columns: &BinaryColumns,
 ) -> Result<Option<RenderedJoinPushdown>, UdfError> {
     let left_cols = involved_table_columns(request, &join.tables[0].table_name);
     let right_cols = involved_table_columns(request, &join.tables[1].table_name);
@@ -66,7 +68,7 @@ pub(crate) fn render_broadcast_join(
     let col_types = join_col_types(request, join);
     let bare_pushdown_req = strip_table_alias(pushdown_req);
     let bare_filter_json = bare_pushdown_req.get("filter").filter(|f| !f.is_null());
-    let (filter, declined) = classify_where_filter(bare_filter_json, &col_types);
+    let (filter, declined) = classify_where_filter(bare_filter_json, &col_types, binary_columns);
     if declined.is_some() {
         return Ok(None);
     }
@@ -344,7 +346,11 @@ pub(in super::super) fn build_n_scan_join_sql(
             .as_ref()
             .and_then(|f| leg_local_filter(f, &legs, i))
         {
-            Some(side_local) => type_screened_leg_filter(&side_local, &cols_per_side[i]),
+            Some(side_local) => type_screened_leg_filter(
+                &side_local,
+                &cols_per_side[i],
+                &BinaryColumns::of(&side.logical_schema, inputs.binary_as_string),
+            ),
             None => (None, None),
         };
         // Disjoint by attribution, so no conjunct is double-applied.
@@ -405,6 +411,7 @@ pub(in super::super) struct JoinScanRequestConfig<'a> {
     pub(in super::super) memory_pool_fraction: f64,
     pub(in super::super) instance_overhead_mb: u64,
     pub(in super::super) s3_max_connections: usize,
+    pub(in super::super) binary_as_string: bool,
     pub(in super::super) connection: &'a ResolvedConnectionConfig,
 }
 
@@ -446,6 +453,7 @@ fn join_fan_out_scan_spec(
             memory_pool_fraction: inputs.memory_pool_fraction,
             instance_overhead_mb: inputs.instance_overhead_mb,
             s3_max_connections: inputs.s3_max_connections,
+            binary_as_string: inputs.binary_as_string,
         },
         files: vec![],
     })

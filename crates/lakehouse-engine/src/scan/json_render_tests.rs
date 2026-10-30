@@ -1,11 +1,12 @@
 use super::*;
 use arrow::array::{Array, ArrayData};
 use arrow::array::{
-    ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, FixedSizeListArray, Int32Array,
-    LargeListArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray, FixedSizeListArray,
+    Int32Array, LargeListArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
+    UnionArray,
 };
 use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
-use arrow::datatypes::{DataType, Field, Fields};
+use arrow::datatypes::{DataType, Field, Fields, UnionFields};
 use std::sync::Arc;
 
 fn parsed(text: &str) -> serde_json::Value {
@@ -395,8 +396,18 @@ fn non_utf8_map_keys_stringify_into_object_names() {
 
 #[test]
 fn a_map_key_type_no_cast_reaches_utf8_is_refused_by_name() {
-    let keys = FixedSizeBinaryArray::try_from_iter([[0u8, 1u8]].into_iter())
-        .expect("the fixed-size-binary key child must build");
+    let member = StructArray::from(vec![(
+        Arc::new(Field::new("x", DataType::Int32, true)),
+        Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+    )]);
+    let keys = UnionArray::try_new(
+        UnionFields::try_new([0], [Field::new("a", member.data_type().clone(), false)])
+            .expect("the union fields must build"),
+        vec![0i8].into(),
+        None,
+        vec![Arc::new(member) as ArrayRef],
+    )
+    .expect("the union key child must build");
     let column = map_column(Arc::new(keys), utf8(&["v"]), &[0, 1], None);
 
     let error = render_nested_column_as_json(&column)
@@ -404,12 +415,36 @@ fn a_map_key_type_no_cast_reaches_utf8_is_refused_by_name() {
 
     let message = error.to_string();
     assert!(
-        message.contains("FixedSizeBinary"),
+        message.contains("Union"),
         "the refusal must name the key type: {message}"
     );
     assert!(
         message.contains("utf8") || message.contains("Utf8"),
         "the refusal must name the constraint it could not satisfy: {message}"
+    );
+}
+
+/// Scenario: A binary column reads as lowercase hex on every source
+#[test]
+fn a_binary_map_key_renders_as_lowercase_hex() {
+    let binary_keys = map_column(
+        Arc::new(BinaryArray::from(vec![&[0xffu8, 0x00][..], &[][..]])),
+        utf8(&["a", "b"]),
+        &[0, 2],
+        None,
+    );
+    assert_eq!(
+        rendered(binary_keys),
+        vec![Some(r#"{"ff00":"a","":"b"}"#.to_string())],
+        "a key renders as the hex a binary value renders as, an empty key as \"\""
+    );
+
+    let fixed_keys = FixedSizeBinaryArray::try_from_iter([[0xabu8, 0x01u8]].into_iter())
+        .expect("the fixed-size-binary key child must build");
+    let fixed_keyed = map_column(Arc::new(fixed_keys), utf8(&["v"]), &[0, 1], None);
+    assert_eq!(
+        rendered(fixed_keyed),
+        vec![Some(r#"{"ab01":"v"}"#.to_string())]
     );
 }
 

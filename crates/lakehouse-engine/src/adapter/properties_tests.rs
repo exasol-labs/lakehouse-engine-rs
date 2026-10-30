@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 
-const ALL_NAMES: [&str; 19] = [
+const ALL_NAMES: [&str; 20] = [
     "CATALOG_KIND",
     "CATALOG_CONNECTION",
     "NAMESPACE",
@@ -17,6 +17,7 @@ const ALL_NAMES: [&str; 19] = [
     "S3_MAX_CONNECTIONS",
     "MERGE_SCHEMA",
     "HIVE_PARTITIONING",
+    "BINARY_AS_STRING",
     "PERMISSION_CHECK",
     "USER_MAPPING",
     "TABLE_INCLUDE",
@@ -76,17 +77,18 @@ fn every_known_name_passes() {
         ("S3_MAX_CONNECTIONS", "16"),
         ("MERGE_SCHEMA", "not-checked-here"),
         ("HIVE_PARTITIONING", "not-checked-here"),
+        ("BINARY_AS_STRING", "true"),
         ("PERMISSION_CHECK", "not-checked-here"),
         ("USER_MAPPING", "not-checked-here"),
         ("TABLE_INCLUDE", "ORDERS*, ?_LOG"),
         ("TABLE_EXCLUDE", "TMP_*"),
     ];
     let names: Vec<&str> = valid_values.iter().map(|(name, _)| *name).collect();
-    assert_eq!(names, ALL_NAMES, "the fixture must cover the 19 names");
+    assert_eq!(names, ALL_NAMES, "the fixture must cover the 20 names");
     assert_eq!(
         PROPERTY_NAMES.into_iter().collect::<BTreeSet<&str>>(),
         ALL_NAMES.into_iter().collect::<BTreeSet<&str>>(),
-        "the adapter must accept exactly the 19 names of vs-properties/property-name-validation"
+        "the adapter must accept exactly the 20 names of vs-properties/property-name-validation"
     );
 
     check_properties(&props(&valid_values)).expect("every known name with a valid value passes");
@@ -274,19 +276,36 @@ fn threading_mode_accepts_auto_or_fixed_in_any_case() {
 }
 
 #[test]
-fn allow_http_accepts_true_or_false_in_any_case() {
-    for value in ["true", "FALSE", "True", "false"] {
-        check_properties(&props(&[("ALLOW_HTTP", value)]))
-            .unwrap_or_else(|e| panic!("{value} must pass: {e:?}"));
-    }
-    for value in ["yes", "1", "t"] {
-        let msg = message(&[("ALLOW_HTTP", value)]);
+fn boolean_properties_accept_true_or_false_in_any_case() {
+    for name in ["ALLOW_HTTP", "BINARY_AS_STRING"] {
+        for value in ["true", "FALSE", "True", "false"] {
+            check_properties(&props(&[(name, value)]))
+                .unwrap_or_else(|e| panic!("{name}={value} must pass: {e:?}"));
+        }
+        for value in ["yes", "1", "t"] {
+            let msg = message(&[(name, value)]);
 
+            assert!(
+                msg.contains(&invalid_entry(name, value, "TRUE or FALSE")),
+                "{name}={value}: {msg}"
+            );
+        }
+    }
+}
+
+#[test]
+fn binary_as_string_resolves_true_only_for_a_true_value() {
+    assert!(resolve_binary_as_string(&props(&[(
+        "BINARY_AS_STRING",
+        "True"
+    )])));
+    for value in ["false", "", "yes"] {
         assert!(
-            msg.contains(&invalid_entry("ALLOW_HTTP", value, "TRUE or FALSE")),
-            "{value}: {msg}"
+            !resolve_binary_as_string(&props(&[("BINARY_AS_STRING", value)])),
+            "{value}"
         );
     }
+    assert!(!resolve_binary_as_string(&props(&[])));
 }
 
 #[test]

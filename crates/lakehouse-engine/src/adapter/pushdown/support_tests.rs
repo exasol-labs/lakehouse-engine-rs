@@ -2561,7 +2561,8 @@ fn like_guard_nested_decimal_declines_whole_filter() {
 /// Asserts the fixture genuinely declines, since a quietly rendering fixture would
 /// assert nothing.
 fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, String)]) -> String {
-    let (scan_filter, declined) = classify_where_filter(Some(filter), col_types);
+    let (scan_filter, declined) =
+        classify_where_filter(Some(filter), col_types, &BinaryColumns::default());
     assert!(
         scan_filter.is_none(),
         "fixture precondition: a declining filter must never reach the scan spec: \

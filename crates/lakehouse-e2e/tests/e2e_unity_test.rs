@@ -5,8 +5,9 @@
 mod common;
 
 use common::e2e_harness::{
-    SCAN_SCRIPT_NAME, SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_decimal_orders_numerically,
-    assert_query_fails, assert_type_matrix, column_adapter_notes, create_schema_and_scripts,
+    SCAN_SCRIPT_NAME, SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_binary_columns_match_native_copy,
+    assert_decimal_orders_numerically, assert_hex_literal_compares_bytes, assert_query_fails,
+    assert_text_columns, assert_type_matrix, column_adapter_notes, create_schema_and_scripts,
     create_schema_and_scripts_with_env, create_virtual_schema_with_password, declared_types,
     enumerated_table_names, error_text, exa_conn, explain_virtual_sql, has_broadcast_join_block,
     has_two_scan_wrapper, identifier_note, install_slc, note_of, pairs, parse_int, parse_numeric,
@@ -26,11 +27,12 @@ use common::raw_parquet::{
     write_parquet_fixture,
 };
 use common::seed::{
-    ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DATE_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT,
-    DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT,
-    FLOAT32_VALUES_TEXT, INT_LIST_VALUES_TEXT, INT8_VALUES_TEXT, INT16_VALUES_TEXT,
-    INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIMESTAMP_VALUES_TEXT, all_types_ids, binary_values,
-    boolean_values, date_values, decimal_10_2_values, decimal_18_0_values, decimal_36_6_values,
+    ALL_TYPES_IDS_TEXT, BINARY_MAP_VALUES_TEXT, BINARY_VALUES_TEXT, BOOLEAN_VALUES_TEXT,
+    DATE_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT,
+    DECIMAL_38_10_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT_LIST_VALUES_TEXT, INT8_VALUES_TEXT,
+    INT16_VALUES_TEXT, INT32_VALUES_TEXT, STRUCT_BINARY_VALUES_TEXT, TEXT_VALUES_TEXT,
+    TIMESTAMP_VALUES_TEXT, all_types_ids, binary_keyed_map_values, binary_values, boolean_values,
+    date_values, decimal_10_2_values, decimal_18_0_values, decimal_36_6_values,
     decimal_38_10_values, float32_values, int_list_values, int_string_struct_values, int8_values,
     int16_values, int32_values, string_int_map_values, struct_binary_values, text_values,
     timestamp_values,
@@ -517,8 +519,8 @@ fn seed_all_types_parquet_table() {
     });
 }
 
-/// The Delta types `stats_all_types` lacks: the decimal matrix and a binary struct member, in
-/// one data file with no reader feature.
+/// The Delta types `stats_all_types` lacks: the decimal matrix, a binary column without column
+/// mapping, a binary struct member, and a binary map key, in one data file with no reader feature.
 fn seed_delta_extra_types_table() {
     let batch = RecordBatch::try_from_iter_with_nullable(vec![
         ("id", all_types_ids(), false),
@@ -526,7 +528,13 @@ fn seed_delta_extra_types_table() {
         ("c_decimal_18_0", decimal_18_0_values(), true),
         ("c_decimal_36_6", decimal_36_6_values(), true),
         ("c_decimal_38_10", decimal_38_10_values(), true),
+        ("c_binary", binary_values(&DataType::Binary), true),
         ("c_struct_binary", struct_binary_values(None), true),
+        (
+            "c_map_binary",
+            binary_keyed_map_values(binary_values, None),
+            true,
+        ),
     ])
     .expect("delta_extra_types batch");
 
@@ -536,7 +544,16 @@ fn seed_delta_extra_types_table() {
         ("c_decimal_18_0", json!("decimal(18,0)"), "DECIMAL"),
         ("c_decimal_36_6", json!("decimal(36,6)"), "DECIMAL"),
         ("c_decimal_38_10", json!("decimal(38,10)"), "DECIMAL"),
+        ("c_binary", json!("binary"), "BINARY"),
         ("c_struct_binary", struct_type(&[("x", "binary")]), "STRUCT"),
+        (
+            "c_map_binary",
+            json!({
+                "type": "map", "keyType": "binary", "valueType": "integer",
+                "valueContainsNull": true
+            }),
+            "MAP",
+        ),
     ];
     let table = UnityTable {
         namespace: UNITY_NAMESPACE,
@@ -1594,6 +1611,10 @@ fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
     }
 }
 
+/// `binary_col` of the vendored, column-mapped `stats_all_types`, ordered by `int_col`.
+const STATS_ALL_TYPES_BINARY_COL_TEXT: [Option<&str>; 4] =
+    [Some("010203"), Some("070809"), Some("040506"), None];
+
 const STATS_ALL_TYPES_MAPPABLE_COLUMNS: &str = "BYTE_COL, SHORT_COL, INT_COL, LONG_COL, FLOAT_COL, DOUBLE_COL, DATE_COL, \
      TIMESTAMP_COL, TIMESTAMP_NTZ_COL, STRING_COL, DECIMAL_COL, BOOLEAN_COL, ARRAY_COL, \
      MAP_COL, NESTED_STRUCT";
@@ -1747,6 +1768,7 @@ fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
 /// Scenario: A catalog-declared DECIMAL outside Exasol's DECIMAL domain falls back to VARCHAR
 /// Scenario: Unity Catalog Spark column types map to Exasol types sufficient for listing
 /// Scenario: An incompatible Unity Catalog column type is declared as VARCHAR rather than failing
+/// Scenario: A binary column reads as lowercase hex on every source
 #[test]
 fn unity_delta_extra_types_declare_and_return_their_mapped_values() {
     setup();
@@ -1761,72 +1783,38 @@ fn unity_delta_extra_types_declare_and_return_their_mapped_values() {
             reads("C_DECIMAL_18_0", "DECIMAL(18,0)", DECIMAL_18_0_VALUES_TEXT),
             reads("C_DECIMAL_36_6", "DECIMAL(36,6)", DECIMAL_36_6_VALUES_TEXT),
             reads("C_DECIMAL_38_10", VARCHAR_JSON, DECIMAL_38_10_VALUES_TEXT),
-            refuses("C_STRUCT_BINARY", VARCHAR_JSON, STRUCT_BINARY_REFUSAL),
+            reads("C_BINARY", VARCHAR_JSON, BINARY_VALUES_TEXT),
+            reads("C_STRUCT_BINARY", VARCHAR_JSON, STRUCT_BINARY_VALUES_TEXT),
+            reads("C_MAP_BINARY", VARCHAR_JSON, BINARY_MAP_VALUES_TEXT),
         ],
     );
     assert_decimal_orders_numerically(&mut conn, VS_NAME, "DELTA_EXTRA_TYPES", "C_DECIMAL_18_0");
 }
 
-const STRUCT_BINARY_REFUSAL: &[&str] = &[
-    "column 'c_struct_binary'",
-    "member 'c_struct_binary.x'",
-    "type 'binary'",
-    "#351",
-];
-
+/// Scenario: A binary column reads as lowercase hex on every source
+/// Scenario: A filter on a binary column selects what native Exasol selects over the hex text
 #[test]
-fn unity_delta_refused_column_refuses_only_the_queries_naming_it() {
+fn unity_delta_binary_columns_read_and_filter_as_lowercase_hex() {
     setup();
     let mut conn = exa_conn();
-    let table = table_ref("STATS_ALL_TYPES");
+    let extra_types = table_ref("DELTA_EXTRA_TYPES");
 
-    let sql = format!("SELECT BINARY_COL FROM {table}");
-    let msg = error_text(&conn.try_execute(&sql), &sql);
-    assert!(
-        msg.contains("binary_col") && msg.contains("#351") && !msg.contains("#350"),
-        "BINARY_COL's refusal must name its Delta column and cite issue #351, not #350: {msg}"
-    );
+    assert_binary_columns_match_native_copy(&mut conn, &extra_types, &["C_BINARY"], &[]);
+    assert_hex_literal_compares_bytes(&mut conn, &extra_types, "C_BINARY", "00abff");
 
-    let star_resp = conn.try_execute(&format!("SELECT * FROM {table}"));
-    assert_eq!(
-        star_resp["status"].as_str(),
-        Some("error"),
-        "SELECT * widens to the full base row, so a refused column anywhere in \
-         the table must refuse it too: {star_resp}"
+    let column_mapped = table_ref("STATS_ALL_TYPES");
+    assert_text_columns(
+        &mut conn,
+        &format!("SELECT BINARY_COL FROM {column_mapped} ORDER BY INT_COL"),
+        &[STATS_ALL_TYPES_BINARY_COL_TEXT],
     );
-
-    let where_resp = conn.try_execute(&format!(
-        "SELECT INT_COL FROM {table} WHERE BINARY_COL IS NOT NULL"
-    ));
-    assert_eq!(
-        where_resp["status"].as_str(),
-        Some("error"),
-        "a WHERE clause referencing a refused column must refuse it even though \
-         the select list names only a mappable column: {where_resp}"
-    );
-
-    let nested_resp = conn.query_columns(&format!("SELECT MAP_COL, NESTED_STRUCT FROM {table}"));
-    assert_eq!(
-        nested_resp.len(),
-        2,
-        "MAP_COL and NESTED_STRUCT must query successfully, not appear in any \
-         refusal: {nested_resp:?}"
-    );
-    assert_eq!(nested_resp[0].len(), 4, "expected 4 rows: {nested_resp:?}");
-
-    let mappable = conn.query_columns(&format!(
-        "SELECT {STATS_ALL_TYPES_MAPPABLE_COLUMNS} FROM {table}"
-    ));
-    assert_eq!(
-        mappable.len(),
-        15,
-        "the mappable 15-column projection must still succeed on the same \
-         connection, proving the refusal above was per-request: {mappable:?}"
-    );
-    assert_eq!(
-        mappable[0].len(),
-        4,
-        "expected 4 rows from the mappable projection: {mappable:?}"
+    assert_text_columns(
+        &mut conn,
+        &format!(
+            "SELECT BINARY_COL FROM {column_mapped} \
+             WHERE BINARY_COL = '010203' OR BINARY_COL > '040506' ORDER BY BINARY_COL"
+        ),
+        &[[Some("010203"), Some("070809")]],
     );
 }
 
@@ -2111,11 +2099,7 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
             reads("C_DATE", "DATE", DATE_VALUES_TEXT),
             reads("C_TIMESTAMP", timestamp, TIMESTAMP_VALUES_TEXT),
             reads("C_TIMESTAMP_NTZ", timestamp, TIMESTAMP_VALUES_TEXT),
-            refuses(
-                "C_BINARY",
-                VARCHAR_JSON,
-                &["column 'c_binary'", "type 'binary'", "#351"],
-            ),
+            reads("C_BINARY", VARCHAR_JSON, BINARY_VALUES_TEXT),
             reads("C_ARRAY", VARCHAR_JSON, INT_LIST_VALUES_TEXT),
             reads(
                 "C_MAP",
@@ -2131,7 +2115,7 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
                     None,
                 ],
             ),
-            refuses("C_STRUCT_BINARY", VARCHAR_JSON, STRUCT_BINARY_REFUSAL),
+            reads("C_STRUCT_BINARY", VARCHAR_JSON, STRUCT_BINARY_VALUES_TEXT),
             refuses(
                 "C_VARIANT",
                 VARCHAR_JSON,
@@ -2149,7 +2133,7 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
         .collect();
     assert_eq!(
         refused,
-        ["C_BINARY", "C_STRUCT_BINARY", "C_VARIANT"],
+        ["C_VARIANT"],
         "CREATE records each refusal in its column's note"
     );
 }

@@ -145,13 +145,9 @@ impl DeclaredSchema {
     }
 }
 
-/// Shared by every source, so each binary refusal reads alike
-/// (`vs-adapter/binary-column-refusal`).
-pub fn binary_cause(declared: &str) -> String {
-    format!(
-        "has type '{declared}', which this engine refuses: rendering binary data is tracked as \
-         issue #351"
-    )
+/// Shared by every source that can carry a type this engine does not read.
+pub fn unread_type_cause(declared: &str) -> String {
+    format!("has type '{declared}', which this engine does not read")
 }
 
 /// Shared by every source whose format can carry a `variant` column.
@@ -159,16 +155,6 @@ pub fn variant_cause() -> String {
     "has type 'variant', whose on-disk form is an opaque (metadata, value) binary pair this engine \
      cannot render as a meaningful value"
         .to_string()
-}
-
-/// `member_path` is `None` when the column's own type is the binary one.
-pub fn binary_refusal(
-    label: &str,
-    column: &str,
-    member_path: Option<&str>,
-    declared: &str,
-) -> String {
-    column_refusal(label, column, member_path, &binary_cause(declared))
 }
 
 /// `member_path` is `None` when the column's own type is the refused one.

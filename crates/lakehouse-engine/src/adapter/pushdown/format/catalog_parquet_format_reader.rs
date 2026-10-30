@@ -16,7 +16,7 @@ use serde_json::Value as Json;
 use super::parquet_format_reader::file_entry;
 use super::partition_predicate::PartitionPredicate;
 use super::unity_table_storage::{UnityTableStorage, redacted};
-use super::{FormatReader, PlannedFiles, checked_storage_location};
+use super::{FormatReader, PlannedFiles, checked_storage_location, hex_binary_partition_values};
 use crate::adapter::column_notes::DeclaredSchema;
 use crate::adapter::parquet_directory::{
     FilePattern, PartitionKeepPredicate, list_location_files, list_parquet_files,
@@ -235,7 +235,9 @@ impl FormatReader for CatalogParquetFormatReader<'_> {
                 &partition_column_types(&declared.logical_schema, partition_columns),
             );
             let keep = move |values: &_| predicate.keeps(values);
-            self.files.plan(partition_columns, &keep).await
+            let mut planned = self.files.plan(partition_columns, &keep).await?;
+            hex_binary_partition_values(&mut planned.files, &declared.logical_schema);
+            Ok(planned)
         })
     }
 }

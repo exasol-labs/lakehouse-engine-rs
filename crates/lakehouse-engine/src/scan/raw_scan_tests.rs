@@ -876,7 +876,7 @@ async fn build_scan_sql_diverts_a_nested_column_to_the_json_render_function() {
 
 #[tokio::test]
 async fn build_scan_sql_keeps_a_non_nested_incompatible_column_cast_unchanged() {
-    use arrow::array::BinaryArray;
+    use arrow::array::Time64MicrosecondArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
@@ -884,12 +884,12 @@ async fn build_scan_sql_keeps_a_non_nested_incompatible_column_cast_unchanged() 
 
     let schema = Arc::new(Schema::new(vec![Field::new(
         "payload",
-        DataType::Binary,
+        DataType::Time64(arrow::datatypes::TimeUnit::Microsecond),
         true,
     )]));
     let batch = RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(BinaryArray::from(vec![Some(b"hi".as_slice())]))],
+        vec![Arc::new(Time64MicrosecondArray::from(vec![Some(1)]))],
     )
     .unwrap();
     let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();

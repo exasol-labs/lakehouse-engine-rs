@@ -15,6 +15,8 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
 
+use super::binary_filter::{BinaryColumns, compare_binary_bytes};
+
 pub(super) const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
 
 /// Passthrough distributor that groups per-shard file-list rows by `shard_key` so
@@ -758,8 +760,14 @@ fn contains_aggregate_node(node: &Json) -> bool {
 /// The sole owner of "a tree the DataFusion scan may be handed". Renderability is
 /// checked on the rewritten tree, since that is what the scan carries; checking the
 /// raw tree would let an unrenderable tree be silently dropped, returning wrong rows.
-pub(super) fn type_accepted_rewrite(expr: &Json, col_types: &[(String, String)]) -> Option<Json> {
-    apply_type_rewrites(expr, col_types).filter(datafusion_renderable)
+pub(super) fn type_accepted_rewrite(
+    expr: &Json,
+    col_types: &[(String, String)],
+    binary_columns: &BinaryColumns,
+) -> Option<Json> {
+    apply_type_rewrites(expr, col_types)
+        .map(|tree| compare_binary_bytes(tree, binary_columns))
+        .filter(datafusion_renderable)
 }
 
 /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`).
@@ -768,11 +776,10 @@ pub(super) fn type_accepted_rewrite(expr: &Json, col_types: &[(String, String)])
 pub(super) fn classify_where_filter<'a>(
     filter_json_raw: Option<&'a Json>,
     col_types: &[(String, String)],
+    binary_columns: &BinaryColumns,
 ) -> (Option<String>, Option<&'a Json>) {
-    match (
-        filter_json_raw,
-        filter_json_raw.and_then(|f| type_accepted_rewrite(f, col_types)),
-    ) {
+    let accepted = |filter: &Json| type_accepted_rewrite(filter, col_types, binary_columns);
+    match (filter_json_raw, filter_json_raw.and_then(accepted)) {
         (Some(raw), None) => (None, Some(raw)),
         (_, tree) => (tree.as_ref().and_then(render_df_filter_safe), None),
     }

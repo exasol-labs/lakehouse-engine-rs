@@ -223,10 +223,10 @@ pub(crate) fn assert_mentions(message: &str, fragments: &[&str]) {
     }
 }
 
-pub(crate) fn assert_refuses_binary_col(error: UdfError) {
+pub(crate) fn assert_refuses_variant_col(error: UdfError) {
     let message = user_message(error);
     assert!(
-        message.contains("binary_col") && message.contains("#351"),
+        message.contains("variant_col") && message.contains("type 'variant'"),
         "the refusal must be the gate's own message, naming the column and its reason: \
          {message}"
     );
@@ -382,8 +382,8 @@ pub(crate) fn nullable_field(name: &str, arrow_type: &str) -> LogicalField {
     }
 }
 
-/// The refusal a `label` table records for the binary `column`, at `member_path` when nested.
-pub(crate) fn binary_refused(
+/// The refusal a `label` table records for the geospatial `column`, at `member_path` when nested.
+pub(crate) fn unread_refused(
     label: &str,
     column: &str,
     member_path: Option<&str>,
@@ -391,7 +391,12 @@ pub(crate) fn binary_refused(
 ) -> RefusedColumn {
     RefusedColumn {
         column_name: column.to_string(),
-        reason: crate::adapter::column_notes::binary_refusal(label, column, member_path, declared),
+        reason: crate::adapter::column_notes::column_refusal(
+            label,
+            column,
+            member_path,
+            &crate::adapter::column_notes::unread_type_cause(declared),
+        ),
     }
 }
 
@@ -413,7 +418,7 @@ pub(crate) async fn resolve_from_notes(
     notes: &TableNotes<'_>,
     filter_json: Option<&Json>,
 ) -> Result<ResolvedScan, UdfError> {
-    ResolvedScan::resolve(reader, notes.declared_schema()?, filter_json).await
+    ResolvedScan::resolve(reader, notes.declared_schema()?, filter_json, false).await
 }
 
 /// [`resolve_from_notes`] over the notes CREATE records for `table`, involved as `name`.

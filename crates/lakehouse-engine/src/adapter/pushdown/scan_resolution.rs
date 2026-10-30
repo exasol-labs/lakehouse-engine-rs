@@ -16,6 +16,7 @@ use crate::adapter::direct_storage_properties::{
     join_storage_path, resolve_direct_storage_properties,
 };
 use crate::adapter::permission::PermissionCheck;
+use crate::adapter::properties::resolve_binary_as_string;
 use crate::scan::{build_admission_limited_store, store_root_url};
 
 #[cfg(test)]
@@ -31,6 +32,7 @@ pub(super) struct TableScanResolver<'a> {
     session: RequestSession,
     connection: ConnectionStorage<'a>,
     admission: TableAdmission,
+    binary_as_string: bool,
 }
 
 /// Which identifiers [`TableScanResolver::resolve`] may load.
@@ -144,6 +146,7 @@ impl<'a> TableScanResolver<'a> {
             session,
             connection,
             admission,
+            binary_as_string: resolve_binary_as_string(props),
         })
     }
 
@@ -199,7 +202,13 @@ impl<'a> TableScanResolver<'a> {
             }
         };
         let reader = format_reader(source, &self.connection)?;
-        ResolvedScan::resolve(reader.as_ref(), declared, filter_json).await
+        ResolvedScan::resolve(
+            reader.as_ref(),
+            declared,
+            filter_json,
+            self.binary_as_string,
+        )
+        .await
     }
 }
 

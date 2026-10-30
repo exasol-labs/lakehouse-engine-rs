@@ -29,6 +29,8 @@ pub(super) const PROP_JOIN_BROADCAST_MAX_BYTES: &str = "JOIN_BROADCAST_MAX_BYTES
 pub(super) const PROP_S3_MAX_CONNECTIONS: &str = "S3_MAX_CONNECTIONS";
 pub(super) const PROP_MERGE_SCHEMA: &str = "MERGE_SCHEMA";
 pub(super) const PROP_HIVE_PARTITIONING: &str = "HIVE_PARTITIONING";
+// Like Spark's `spark.sql.parquet.binaryAsString`, for writers that store text as binary.
+const PROP_BINARY_AS_STRING: &str = "BINARY_AS_STRING";
 pub(super) const PERMISSION_CHECK: &str = "PERMISSION_CHECK";
 pub(super) const USER_MAPPING: &str = "USER_MAPPING";
 const PROP_TABLE_INCLUDE: &str = "TABLE_INCLUDE";
@@ -36,7 +38,7 @@ const PROP_TABLE_EXCLUDE: &str = "TABLE_EXCLUDE";
 
 /// Every name a virtual schema may set; the value rules of the properties whose owning module
 /// checks the value stay in that module.
-const PROPERTY_NAMES: [&str; 19] = [
+const PROPERTY_NAMES: [&str; 20] = [
     PROP_CATALOG_KIND,
     PROP_CATALOG_CONNECTION,
     PROP_NAMESPACE,
@@ -52,6 +54,7 @@ const PROPERTY_NAMES: [&str; 19] = [
     PROP_S3_MAX_CONNECTIONS,
     PROP_MERGE_SCHEMA,
     PROP_HIVE_PARTITIONING,
+    PROP_BINARY_AS_STRING,
     PERMISSION_CHECK,
     USER_MAPPING,
     PROP_TABLE_INCLUDE,
@@ -108,10 +111,19 @@ pub(super) fn check_properties(props: &Json) -> Result<CheckedProperties, UdfErr
     )))
 }
 
-/// Reads `ALLOW_HTTP` with the TRUE/FALSE rule that `check_properties` applies. A rejected value
-/// counts as `false`, which only a pushdown on a schema persisted before the check can reach.
 pub(super) fn resolve_allow_http(props: &Json) -> bool {
-    nonempty_str(props, PROP_ALLOW_HTTP)
+    resolve_boolean(props, PROP_ALLOW_HTTP)
+}
+
+/// Read at every pushdown, so a SET applies from the next query.
+pub(super) fn resolve_binary_as_string(props: &Json) -> bool {
+    resolve_boolean(props, PROP_BINARY_AS_STRING)
+}
+
+/// Applies the TRUE/FALSE rule that `check_properties` applies. A rejected value counts as
+/// `false`, which only a pushdown on a schema persisted before the check can reach.
+fn resolve_boolean(props: &Json, name: &str) -> bool {
+    nonempty_str(props, name)
         .and_then(parse_boolean)
         .unwrap_or(false)
 }
@@ -192,7 +204,8 @@ impl<'a> TuningChecker<'a> {
     }
 
     fn tuning(&mut self) -> TuningProperties {
-        self.value(PROP_ALLOW_HTTP, check_allow_http);
+        self.value(PROP_ALLOW_HTTP, check_boolean);
+        self.value(PROP_BINARY_AS_STRING, check_boolean);
         TuningProperties {
             parallelism_factor: self.whole_number(PROP_PARALLELISM_FACTOR),
             threading_mode: self.value(PROP_DF_THREADING_MODE, parse_threading_mode),
@@ -311,7 +324,7 @@ pub(super) fn parse_boolean(raw: &str) -> Option<bool> {
     }
 }
 
-fn check_allow_http(raw: &str) -> Result<bool, String> {
+fn check_boolean(raw: &str) -> Result<bool, String> {
     parse_boolean(raw).ok_or_else(|| "TRUE or FALSE".to_string())
 }
 

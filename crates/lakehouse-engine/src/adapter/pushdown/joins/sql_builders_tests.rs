@@ -103,8 +103,13 @@ fn join_outside_contract_declined_safely() {
             }));
     }
     let detected = detected_join(&request);
-    let rendered = render_broadcast_join(&request, &pd(&request), &detected)
-        .expect("guard failure is a decline, not an error");
+    let rendered = render_broadcast_join(
+        &request,
+        &pd(&request),
+        &detected,
+        &BinaryColumns::default(),
+    )
+    .expect("guard failure is a decline, not an error");
     assert!(
         rendered.is_none(),
         "overlapping column names must decline broadcast rendering (Ok(None))"
@@ -132,7 +137,7 @@ fn broadcast_join_declines_widened_projection() {
         extract_join_projection(&ok_req, &pd(&ok_req), &detected).expect("projection derives");
     assert!(!ok_widened, "the control fixture must NOT widen");
     assert!(
-        render_broadcast_join(&ok_req, &pd(&ok_req), &detected)
+        render_broadcast_join(&ok_req, &pd(&ok_req), &detected, &BinaryColumns::default())
             .expect("the control must not error")
             .is_some(),
         "the control must render a broadcast plan, so only the widening differs"
@@ -150,9 +155,14 @@ fn broadcast_join_declines_widened_projection() {
     );
 
     assert!(
-        render_broadcast_join(&request, &pushdown_req, &detected)
-            .expect("a widened projection is a clean decline, NOT an error")
-            .is_none(),
+        render_broadcast_join(
+            &request,
+            &pushdown_req,
+            &detected,
+            &BinaryColumns::default()
+        )
+        .expect("a widened projection is a clean decline, NOT an error")
+        .is_none(),
         "a widened projection must decline broadcast rendering (Ok(None)) so the \
          request falls through to the unified N-scan fallback"
     );
@@ -176,9 +186,14 @@ fn broadcast_declines_on_unrenderable_filter_stays_eligible_when_absent() {
     let detected = detected_join(&request);
 
     assert!(
-        render_broadcast_join(&request, &pd(&request), &detected)
-            .expect("a declined filter is a clean decline, not an error")
-            .is_none(),
+        render_broadcast_join(
+            &request,
+            &pd(&request),
+            &detected,
+            &BinaryColumns::default()
+        )
+        .expect("a declined filter is a clean decline, not an error")
+        .is_none(),
         "an unrenderable filter must decline the broadcast plan (Ok(None)) so the \
          request falls through to the N-scan fallback, which self-applies it"
     );
@@ -186,9 +201,14 @@ fn broadcast_declines_on_unrenderable_filter_stays_eligible_when_absent() {
     let absent_request = join_request(Json::Null, equi_condition());
     let absent_detected = detected_join(&absent_request);
     assert!(
-        render_broadcast_join(&absent_request, &pd(&absent_request), &absent_detected)
-            .expect("an absent filter must not error")
-            .is_some(),
+        render_broadcast_join(
+            &absent_request,
+            &pd(&absent_request),
+            &absent_detected,
+            &BinaryColumns::default()
+        )
+        .expect("an absent filter must not error")
+        .is_some(),
         "an absent filter must NOT decline broadcast eligibility"
     );
 }
@@ -203,8 +223,13 @@ fn broadcast_declines_like_over_decimal_side_column() {
     });
     let detected = detected_join(&request);
 
-    let outcome = render_broadcast_join(&request, &pd(&request), &detected)
-        .expect("a type-declined filter is a clean decline, not an error");
+    let outcome = render_broadcast_join(
+        &request,
+        &pd(&request),
+        &detected,
+        &BinaryColumns::default(),
+    )
+    .expect("a type-declined filter is a clean decline, not an error");
     assert!(
         outcome.is_none(),
         "LIKE over a DECIMAL side column must decline the broadcast plan \
@@ -223,9 +248,14 @@ fn broadcast_keeps_plan_and_casts_like_over_date_side_column() {
     });
     let detected = detected_join(&request);
 
-    let rendered = render_broadcast_join(&request, &pd(&request), &detected)
-        .expect("a DATE LIKE subject must not error")
-        .expect("a DATE LIKE subject must keep the broadcast plan, not decline");
+    let rendered = render_broadcast_join(
+        &request,
+        &pd(&request),
+        &detected,
+        &BinaryColumns::default(),
+    )
+    .expect("a DATE LIKE subject must not error")
+    .expect("a DATE LIKE subject must keep the broadcast plan, not decline");
     let filter = rendered
         .filter
         .expect("the rewritten LIKE must still render as a scan-spec filter");
@@ -254,8 +284,13 @@ fn broadcast_declines_instr_with_start_position_argument() {
     });
     let detected = detected_join(&request);
 
-    let outcome = render_broadcast_join(&request, &pd(&request), &detected)
-        .expect("a type-declined filter is a clean decline, not an error");
+    let outcome = render_broadcast_join(
+        &request,
+        &pd(&request),
+        &detected,
+        &BinaryColumns::default(),
+    )
+    .expect("a type-declined filter is a clean decline, not an error");
     assert!(
         outcome.is_none(),
         "INSTR with a start-position argument must decline the broadcast plan \
@@ -268,9 +303,14 @@ fn broadcast_declines_instr_with_start_position_argument() {
 fn broadcast_absent_and_trivially_true_filter_stay_eligible() {
     let absent_request = join_request(Json::Null, equi_condition());
     let absent_detected = detected_join(&absent_request);
-    let absent = render_broadcast_join(&absent_request, &pd(&absent_request), &absent_detected)
-        .expect("an absent filter must not error")
-        .expect("an absent filter must keep the broadcast plan");
+    let absent = render_broadcast_join(
+        &absent_request,
+        &pd(&absent_request),
+        &absent_detected,
+        &BinaryColumns::default(),
+    )
+    .expect("an absent filter must not error")
+    .expect("an absent filter must keep the broadcast plan");
     assert!(
         absent.filter.is_none(),
         "an absent filter must carry no scan-spec filter: {:?}",
@@ -281,9 +321,14 @@ fn broadcast_absent_and_trivially_true_filter_stay_eligible() {
     trivial_request["pushdownRequest"]["filter"] =
         serde_json::json!({"type": "literal_bool", "value": true});
     let trivial_detected = detected_join(&trivial_request);
-    let trivial = render_broadcast_join(&trivial_request, &pd(&trivial_request), &trivial_detected)
-        .expect("a trivially-true filter must not error")
-        .expect("a trivially-true filter must keep the broadcast plan");
+    let trivial = render_broadcast_join(
+        &trivial_request,
+        &pd(&trivial_request),
+        &trivial_detected,
+        &BinaryColumns::default(),
+    )
+    .expect("a trivially-true filter must not error")
+    .expect("a trivially-true filter must keep the broadcast plan");
     assert!(
         trivial.filter.is_none(),
         "a trivially-true filter must carry no scan-spec filter: {:?}",
@@ -406,9 +451,14 @@ fn colliding_columns_render_qualified_unified_wrapper_without_error() {
     assert!(!disjoint_schema_guard(&left, &right));
     let detected = detected_join(&request);
     assert!(
-        render_broadcast_join(&request, &pd(&request), &detected)
-            .unwrap()
-            .is_none()
+        render_broadcast_join(
+            &request,
+            &pd(&request),
+            &detected,
+            &BinaryColumns::default()
+        )
+        .unwrap()
+        .is_none()
     );
 
     let sides = vec![
@@ -1243,9 +1293,14 @@ fn join_like_over_varchar_side_column_pushes_down_unchanged() {
     let request = n_scan_request_with_filter(like_over("C_NAME", "CUSTOMER", "A%"));
     let detected = detected_join(&request);
 
-    let rendered = render_broadcast_join(&request, &pd(&request), &detected)
-        .expect("a VARCHAR LIKE subject must not error")
-        .expect("a VARCHAR LIKE subject must keep the broadcast plan");
+    let rendered = render_broadcast_join(
+        &request,
+        &pd(&request),
+        &detected,
+        &BinaryColumns::default(),
+    )
+    .expect("a VARCHAR LIKE subject must not error")
+    .expect("a VARCHAR LIKE subject must keep the broadcast plan");
     let filter = rendered
         .filter
         .expect("the LIKE conjunct must still render as a scan-spec filter");
@@ -1289,9 +1344,14 @@ fn join_decimal_stringification_renders_trimmed_at_both_join_sites() {
 
     let trim_wrapper = "regexp_replace(regexp_replace(CAST(";
 
-    let rendered = render_broadcast_join(&request, &pd(&request), &detected)
-        .expect("LENGTH(DECIMAL) > 3 must not error")
-        .expect("a renderable decimal-stringification rewrite must keep the broadcast plan");
+    let rendered = render_broadcast_join(
+        &request,
+        &pd(&request),
+        &detected,
+        &BinaryColumns::default(),
+    )
+    .expect("LENGTH(DECIMAL) > 3 must not error")
+    .expect("a renderable decimal-stringification rewrite must keep the broadcast plan");
     let filter = rendered
         .filter
         .expect("the rewritten filter must still render as a scan-spec filter");
@@ -1717,7 +1777,15 @@ fn aggregate_over_join_classifies_before_the_render_that_would_error() {
         classify_join_window(&pushdown_req),
         JoinWindowPlan::ExasolPostProcessed
     ));
-    assert!(render_broadcast_join(&request, &pushdown_req, &detected_join(&request)).is_err());
+    assert!(
+        render_broadcast_join(
+            &request,
+            &pushdown_req,
+            &detected_join(&request),
+            &BinaryColumns::default()
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -2627,9 +2695,14 @@ fn n_scan_join_untranslatable_select_item_is_hard_error() {
     let pushdown_req = pd(&request);
     let detected = detected_join(&request);
     assert!(
-        render_broadcast_join(&request, &pushdown_req, &detected)
-            .expect("the broadcast decline is never an error")
-            .is_none(),
+        render_broadcast_join(
+            &request,
+            &pushdown_req,
+            &detected,
+            &BinaryColumns::default()
+        )
+        .expect("the broadcast decline is never an error")
+        .is_none(),
         "the widened projection declines broadcast, so the request reaches the \
          N-scan fallback"
     );

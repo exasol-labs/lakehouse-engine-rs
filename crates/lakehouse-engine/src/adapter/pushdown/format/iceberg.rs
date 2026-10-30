@@ -18,7 +18,7 @@ use serde_json::Value as Json;
 
 use super::{ConnectionStorage, FormatReader, PlannedFiles};
 use crate::adapter::column_notes::{
-    ColumnDeclaration, DeclaredSchema, binary_cause, column_refusal, variant_cause,
+    ColumnDeclaration, DeclaredSchema, column_refusal, unread_type_cause, variant_cause,
 };
 use crate::adapter::iceberg_predicate::to_iceberg_predicate;
 use crate::adapter::tables::catalog_identifier_string;
@@ -545,6 +545,21 @@ fn identity_partition_values(
         .collect()
 }
 
+/// A partition value's string form cannot hold arbitrary bytes, so a binary value travels as the
+/// lowercase hex that `scan::partition_scalar` decodes.
+fn identity_hex(
+    value: &iceberg::spec::PrimitiveLiteral,
+    source_type: &iceberg::spec::PrimitiveType,
+) -> Option<String> {
+    use iceberg::spec::{PrimitiveLiteral as L, PrimitiveType as T};
+    match (value, source_type) {
+        (L::Binary(bytes), T::Binary | T::Fixed(_)) => Some(hex::encode(bytes)),
+        // iceberg-rust holds a uuid as the big-endian `u128` of its 16 bytes.
+        (L::UInt128(uuid), T::Uuid) => Some(hex::encode(uuid.to_be_bytes())),
+        _ => None,
+    }
+}
+
 /// Casts as the scan's expression adapter casts a file column of another type than the declared
 /// one, so a reconstructed value reads exactly as a stored one. The result is the string
 /// `scan::partition_scalar` parses back at the declared type.
@@ -558,6 +573,9 @@ fn render_identity_value(
             "the partition struct holds a non-primitive value for a {source_type} column"
         ));
     };
+    if let Some(hex) = identity_hex(value, source_type) {
+        return Ok(hex);
+    }
     let file_value = file_column_value(value, source_type).ok_or_else(|| {
         format!("the partition struct holds a value of another type than the {source_type} column")
     })?;
@@ -637,16 +655,12 @@ fn first_refused_member(field_type: &iceberg::spec::Type, path: &str) -> Option<
 }
 
 /// Exhaustive, so a new Iceberg primitive must be classified before the build passes.
-/// `geometry` and `geography` are WKB binary on disk, so they share the binary refusal.
 fn refused_primitive_cause(primitive: &iceberg::spec::PrimitiveType) -> Option<String> {
     use iceberg::spec::PrimitiveType::*;
 
     match primitive {
-        Binary => Some(binary_cause("binary")),
-        Fixed(length) => Some(binary_cause(&format!("fixed({length})"))),
-        Uuid => Some(binary_cause("uuid")),
-        Geometry(_) => Some(binary_cause("geometry")),
-        Geography(_) => Some(binary_cause("geography")),
+        Geometry(_) => Some(unread_type_cause("geometry")),
+        Geography(_) => Some(unread_type_cause("geography")),
         Unknown => Some(
             "has type 'unknown', which holds only nulls and has no Exasol column type".to_string(),
         ),
@@ -662,12 +676,15 @@ fn refused_primitive_cause(primitive: &iceberg::spec::PrimitiveType) -> Option<S
         | Timestamptz
         | TimestampNs
         | TimestamptzNs
-        | String => None,
+        | String
+        | Binary
+        | Fixed(_)
+        | Uuid => None,
     }
 }
 
-/// The Iceberg arm of [`super::declare_columns`]. Refuses every `binary`, `fixed(L)`, `uuid`,
-/// `geometry`, and `geography` column at any depth until #351, and every `variant` and `unknown`.
+/// The Iceberg arm of [`super::declare_columns`]. Refuses every `geometry`, `geography`,
+/// `variant`, and `unknown` column at any depth.
 pub(super) fn declaration(field: &iceberg::spec::NestedField) -> ColumnDeclaration {
     let refused = first_refused_member(&field.field_type, &field.name).map(|(path, cause)| {
         let member_path = (path != field.name).then_some(path.as_str());

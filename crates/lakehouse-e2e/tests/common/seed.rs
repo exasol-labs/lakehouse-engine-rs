@@ -22,7 +22,7 @@ use arrow::array::{
     TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer};
-use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
+use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema as ArrowSchema, TimeUnit};
 use arrow::json::ReaderBuilder;
 use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
@@ -31,8 +31,8 @@ use iceberg::io::{
     S3_REGION, S3_SECRET_ACCESS_KEY, StorageFactory,
 };
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, ListType, Literal,
-    MapType, NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Struct,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion, ListType,
+    Literal, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Struct,
     StructType, Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
@@ -54,8 +54,11 @@ use iceberg_storage_opendal::{
     AwsCredential, CustomAwsCredentialLoader, OpenDalStorageFactory, ProvideCredential,
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
+use parquet::data_type::{
+    ByteArray, ByteArrayType, FixedLenByteArray, FixedLenByteArrayType, Int64Type,
+};
 use parquet::file::properties::WriterProperties;
+use parquet::file::writer::SerializedRowGroupWriter;
 use reqsign_core::{Context as ReqsignContext, Result as ReqsignResult};
 use serde_json::json;
 
@@ -3006,6 +3009,15 @@ fn make_timestamp_precision_probe_batch() -> RecordBatch {
 pub const E2E_ALL_TYPES_TABLE: &str = "all_types";
 /// One `string` column whose data file holds bytes that are not valid UTF-8.
 pub const E2E_BINARY_VALUES_TABLE: &str = "binary_values";
+/// One data file whose `uuid` bounds are in signed order, as Iceberg Java merges row groups.
+pub const E2E_UUID_SIGNED_BOUNDS_TABLE: &str = "uuid_signed_bounds";
+/// `SELECT ID, U ... ORDER BY ID` of [`E2E_UUID_SIGNED_BOUNDS_TABLE`]: one value from each half
+/// of the byte range, so the signed lower bound `80…` sorts after the signed upper bound `40…`.
+pub const UUID_SIGNED_BOUNDS_ROWS: [(i64, &str); 3] = [
+    (1, "00000000000000000000000000000001"),
+    (2, "40000000000000000000000000000000"),
+    (3, "80000000000000000000000000000000"),
+];
 
 /// Every all-types fixture, on every source, holds these ids: two rows of values, then a row
 /// NULL in every other column. The value builders below are shared by those fixtures.
@@ -3152,14 +3164,32 @@ pub fn time64_values() -> ArrayRef {
     ]))
 }
 
-/// `LargeBinary` is what `iceberg-rust` maps an Iceberg `binary` to; every other source writes `Binary`.
+/// Bytes that are not UTF-8, then the empty value, then NULL. `LargeBinary` is what
+/// `iceberg-rust` maps an Iceberg `binary` to; every other source writes `Binary`.
 pub fn binary_values(data_type: &DataType) -> ArrayRef {
-    let values = vec![Some(b"ab".as_slice()), Some(b"".as_slice()), None];
+    let values = vec![
+        Some([0x00, 0xab, 0xff].as_slice()),
+        Some(b"".as_slice()),
+        None,
+    ];
     match data_type {
         DataType::LargeBinary => Arc::new(LargeBinaryArray::from_opt_vec(values)),
         _ => Arc::new(BinaryArray::from_opt_vec(values)),
     }
 }
+
+/// `binary_values` as Exasol reads it: lowercase hex, and NULL for the empty value.
+pub const BINARY_VALUES_TEXT: [Option<&str>; 3] = [Some("00abff"), None, None];
+
+/// `struct_binary_values` as Exasol reads it: a JSON member keeps the empty value.
+pub const STRUCT_BINARY_VALUES_TEXT: [Option<&str>; 3] =
+    [Some(r#"{"x":"00abff"}"#), Some(r#"{"x":""}"#), None];
+
+pub const FIXED_16_VALUES_TEXT: [Option<&str>; 3] = [
+    Some("55555555555555555555555555555555"),
+    Some("11111111111111111111111111111111"),
+    None,
+];
 
 pub fn fixed_16_values() -> ArrayRef {
     Arc::new(
@@ -3168,6 +3198,58 @@ pub fn fixed_16_values() -> ArrayRef {
             16,
         )
         .expect("FixedSizeBinary(16)"),
+    )
+}
+
+/// `binary_keyed_map_values(binary_values, _)` as Exasol reads it: a key renders as hex.
+pub const BINARY_MAP_VALUES_TEXT: [Option<&str>; 3] =
+    [Some(r#"{"00abff":1}"#), Some(r#"{"":2}"#), None];
+
+/// `binary_keyed_map_values` over `fixed_16_values` as Exasol reads it.
+pub const UUID_MAP_VALUES_TEXT: [Option<&str>; 3] = [
+    Some(r#"{"55555555555555555555555555555555":1}"#),
+    Some(r#"{"11111111111111111111111111111111":2}"#),
+    None,
+];
+
+/// `map<K, int>` whose first two rows hold one entry each, keyed by the first two values of
+/// `keys`, then a NULL map. `entries` carries an Iceberg table's field ids and key type when it
+/// has them; otherwise the key is `Binary` and the fields are named as Spark names them.
+pub fn binary_keyed_map_values(
+    keys: impl Fn(&DataType) -> ArrayRef,
+    entries: Option<&FieldRef>,
+) -> ArrayRef {
+    let entries = entries.cloned().unwrap_or_else(|| {
+        Arc::new(Field::new(
+            "key_value",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Binary, false),
+                Field::new("value", DataType::Int32, true),
+            ])),
+            false,
+        ))
+    });
+    let DataType::Struct(entry_fields) = entries.data_type() else {
+        panic!("a map's entries are a struct");
+    };
+    let entry_values = StructArray::try_new(
+        entry_fields.clone(),
+        vec![
+            keys(entry_fields[0].data_type()).slice(0, 2),
+            Arc::new(Int32Array::from(vec![1, 2])),
+        ],
+        None,
+    )
+    .expect("map entries");
+    Arc::new(
+        MapArray::try_new(
+            entries,
+            OffsetBuffer::from_lengths([1, 1, 0]),
+            entry_values,
+            all_types_validity(),
+            false,
+        )
+        .expect("map<binary, int>"),
     )
 }
 
@@ -3253,14 +3335,19 @@ pub fn string_int_map_values(keys: Vec<&str>, values: Vec<i32>, lengths: [usize;
     )
 }
 
+/// One byte over what a `VARCHAR(2000000)` hex rendering holds.
+pub const OVERSIZED_BINARY_BYTES: usize = 1_000_001;
+
 /// `binary_values`' data file: `message` declares `id` and one `BYTE_ARRAY` column `c_bytes`,
 /// which holds `NON_UTF8_BYTES`.
 pub fn non_utf8_parquet(message: &str) -> bytes::Bytes {
-    encode_parquet_message(message, |row_group| {
-        write_parquet_column::<_, Int64Type>(row_group, &ALL_TYPES_IDS, None);
-        let values = NON_UTF8_BYTES.map(|bytes| ByteArray::from(bytes.to_vec()));
-        write_parquet_column::<_, ByteArrayType>(row_group, &values, Some(&[1, 1, 0]));
-    })
+    encode_parquet_message(message, write_non_utf8_columns)
+}
+
+fn write_non_utf8_columns(row_group: &mut SerializedRowGroupWriter<'_, &mut Vec<u8>>) {
+    write_parquet_column::<_, Int64Type>(row_group, &ALL_TYPES_IDS, None);
+    let values = NON_UTF8_BYTES.map(|bytes| ByteArray::from(bytes.to_vec()));
+    write_parquet_column::<_, ByteArrayType>(row_group, &values, Some(&[1, 1, 0]));
 }
 
 /// Field ids follow the REST catalog's fresh assignment, every top-level field before the
@@ -3291,10 +3378,32 @@ fn all_types_iceberg_schema() -> Result<IcebergSchema> {
                 15,
                 "c_struct_binary",
                 Type::Struct(StructType::new(vec![column(
-                    16,
+                    18,
                     "x",
                     PrimitiveType::Binary,
                 )])),
+            )
+            .into(),
+            NestedField::optional(
+                16,
+                "c_map_binary",
+                Type::Map(MapType::optional(
+                    19,
+                    Type::Primitive(PrimitiveType::Binary),
+                    20,
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+            )
+            .into(),
+            NestedField::optional(
+                17,
+                "c_map_uuid",
+                Type::Map(MapType::optional(
+                    21,
+                    Type::Primitive(PrimitiveType::Uuid),
+                    22,
+                    Type::Primitive(PrimitiveType::Int),
+                )),
             )
             .into(),
         ])
@@ -3333,6 +3442,12 @@ fn all_types_batch(table: &Table) -> Result<RecordBatch> {
                 ("c_fixed" | "c_uuid", _) => fixed_16_values(),
                 ("c_struct_binary", DataType::Struct(members)) => {
                     struct_binary_values(Some(members))
+                }
+                ("c_map_binary", DataType::Map(entries, _)) => {
+                    binary_keyed_map_values(binary_values, Some(entries))
+                }
+                ("c_map_uuid", DataType::Map(entries, _)) => {
+                    binary_keyed_map_values(|_| fixed_16_values(), Some(entries))
                 }
                 (other, _) => anyhow::bail!("all_types has no values for column {other}"),
             })
@@ -3377,7 +3492,80 @@ pub async fn seed_all_types_with_auth(
         .await
         .context("append all_types")?;
     }
-    seed_binary_values(&catalog).await
+    seed_binary_values(&catalog).await?;
+    seed_uuid_signed_bounds(&catalog).await
+}
+
+/// iceberg-rust writes `uuid` bounds in byte order, so the data file is written with `parquet`
+/// directly and committed with the bounds stated by hand.
+async fn seed_uuid_signed_bounds(catalog: &impl Catalog) -> Result<()> {
+    let schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(2, "u", Type::Primitive(PrimitiveType::Uuid)).into(),
+        ])
+        .build()
+        .context("build uuid_signed_bounds Iceberg schema")?;
+    let Fixture::Fill(table) = empty_table_to_fill(
+        catalog,
+        E2E_NAMESPACE,
+        E2E_UUID_SIGNED_BOUNDS_TABLE,
+        schema,
+        unpartitioned(),
+        HashMap::new(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let bytes = encode_parquet_message(
+        "message uuid_signed_bounds {
+            REQUIRED INT64 id = 1;
+            OPTIONAL FIXED_LEN_BYTE_ARRAY (16) u (UUID) = 2;
+        }",
+        |row_group| {
+            let ids = UUID_SIGNED_BOUNDS_ROWS.map(|(id, _)| id);
+            write_parquet_column::<_, Int64Type>(row_group, &ids, None);
+            let uuids = UUID_SIGNED_BOUNDS_ROWS.map(|(_, hex)| {
+                let value = u128::from_str_radix(hex, 16).expect("a uuid row is hex");
+                FixedLenByteArray::from(value.to_be_bytes().to_vec())
+            });
+            write_parquet_column::<_, FixedLenByteArrayType>(row_group, &uuids, Some(&[1; 3]));
+        },
+    );
+    let path = format!(
+        "{}/data/{E2E_UUID_SIGNED_BOUNDS_TABLE}-{}.parquet",
+        table.metadata().location(),
+        uuid_suffix()
+    );
+    let file_size = bytes.len() as u64;
+    table
+        .file_io()
+        .new_output(&path)
+        .context("open uuid_signed_bounds data file")?
+        .write(bytes)
+        .await
+        .context("write uuid_signed_bounds data file")?;
+    let bound = |row: usize| {
+        Datum::uuid_from_str(UUID_SIGNED_BOUNDS_ROWS[row].1).expect("a uuid row parses")
+    };
+    let data_file = DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(path)
+        .file_format(DataFileFormat::Parquet)
+        .record_count(UUID_SIGNED_BOUNDS_ROWS.len() as u64)
+        .file_size_in_bytes(file_size)
+        .partition_spec_id(table.metadata().default_partition_spec_id())
+        .lower_bounds(HashMap::from([(2, bound(2))]))
+        .upper_bounds(HashMap::from([(2, bound(1))]))
+        .build()
+        .context("describe uuid_signed_bounds data file")?;
+    commit_data_files(catalog, &table, vec![data_file])
+        .await
+        .context("commit uuid_signed_bounds data file")?;
+    Ok(())
 }
 
 /// `iceberg-rust` refuses to write a `string` that is not valid UTF-8, so the data file is
@@ -3388,6 +3576,7 @@ async fn seed_binary_values(catalog: &impl Catalog) -> Result<()> {
         .with_fields(vec![
             NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
             NestedField::optional(2, "c_bytes", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::optional(3, "c_oversized", Type::Primitive(PrimitiveType::Binary)).into(),
         ])
         .build()
         .context("build binary_values Iceberg schema")?;
@@ -3404,11 +3593,17 @@ async fn seed_binary_values(catalog: &impl Catalog) -> Result<()> {
         return Ok(());
     };
 
-    let bytes = non_utf8_parquet(
+    let bytes = encode_parquet_message(
         "message binary_values {
             REQUIRED INT64 id = 1;
             OPTIONAL BYTE_ARRAY c_bytes (STRING) = 2;
+            OPTIONAL BYTE_ARRAY c_oversized = 3;
         }",
+        |row_group| {
+            write_non_utf8_columns(row_group);
+            let oversized = ByteArray::from(vec![0u8; OVERSIZED_BINARY_BYTES]);
+            write_parquet_column::<_, ByteArrayType>(row_group, &[oversized], Some(&[1, 0, 0]));
+        },
     );
     let path = format!(
         "{}/data/{E2E_BINARY_VALUES_TABLE}-{}.parquet",
@@ -3435,6 +3630,134 @@ async fn seed_binary_values(catalog: &impl Catalog) -> Result<()> {
     commit_data_files(catalog, &table, vec![data_file])
         .await
         .context("commit binary_values data file")?;
+    Ok(())
+}
+
+/// Identity-partitioned on `b binary` and `f fixed(16)`. Row 1's file holds only `id`, as a
+/// metadata-only import registers it, row 2's file holds the same values, and row 3's file holds
+/// only `id` under null partition values. Seeded here, not by the Spark fixture job: Spark has no
+/// `fixed`, and `add_files` records a binary value as Java's `byte[]` text. No `uuid` column,
+/// because iceberg-rust's manifest writer rejects a `uuid` partition value.
+pub const E2E_IDENT_PART_BYTES_TABLE: &str = "ident_part_bytes";
+
+/// `SELECT B, F ... ORDER BY ID` of [`E2E_IDENT_PART_BYTES_TABLE`].
+pub const IDENT_PART_BYTES_TEXT: [[Option<&str>; 3]; 2] = [
+    [BINARY_VALUES_TEXT[0], BINARY_VALUES_TEXT[0], None],
+    [FIXED_16_VALUES_TEXT[0], FIXED_16_VALUES_TEXT[0], None],
+];
+
+pub async fn seed_ident_part_bytes(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog = build_seed_catalog(
+        catalog_url,
+        warehouse,
+        "lakehouse-e2e-seed-ident-part-bytes",
+    )
+    .await?;
+    let column = |id: i32, name: &str, ty: PrimitiveType| -> NestedFieldRef {
+        NestedField::optional(id, name, Type::Primitive(ty)).into()
+    };
+    let schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            column(2, "b", PrimitiveType::Binary),
+            column(3, "f", PrimitiveType::Fixed(16)),
+        ])
+        .build()
+        .context("build ident_part_bytes Iceberg schema")?;
+    let fields = [(2, "b"), (3, "f")]
+        .into_iter()
+        .zip(1000..)
+        .map(|((source_id, name), field_id)| {
+            UnboundPartitionField::builder()
+                .source_ids(vec![source_id])
+                .field_id(field_id)
+                .name(name.to_string())
+                .transform(Transform::Identity)
+                .build()
+                .with_context(|| format!("build the {name} partition field"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let spec = UnboundPartitionSpec::builder()
+        .with_spec_id(1)
+        .add_partition_fields(fields)
+        .context("build the ident_part_bytes partition spec")?
+        .build();
+    let Fixture::Fill(table) = empty_table_to_fill(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_IDENT_PART_BYTES_TABLE,
+        schema,
+        spec,
+        HashMap::new(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let values = Struct::from_iter([
+        Some(Literal::binary(vec![0x00, 0xab, 0xff])),
+        Some(Literal::fixed(vec![0x55; 16])),
+    ]);
+    let arrow_schema = Arc::new(
+        schema_to_arrow_schema(table.metadata().current_schema())
+            .context("derive ident_part_bytes Arrow schema")?,
+    );
+    let native = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![2])),
+            Arc::new(LargeBinaryArray::from_vec(vec![&[0x00, 0xab, 0xff][..]])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter([[0x55; 16]].into_iter()).expect("fixed(16)"),
+            ),
+        ],
+    )
+    .context("build the ident_part_bytes native batch")?;
+    let mut data_files = write_data_files(
+        &table,
+        "ident_part_bytes-native",
+        values.clone(),
+        WriterProperties::default(),
+        [native],
+    )
+    .await?;
+    let spec_id = table.metadata().default_partition_spec_id();
+    for (id, partition) in [(1, values), (3, Struct::from_iter([None, None]))] {
+        let bytes =
+            encode_parquet_message("message imported { REQUIRED INT64 id = 1; }", |row_group| {
+                write_parquet_column::<_, Int64Type>(row_group, &[id], None)
+            });
+        let path = format!(
+            "{}/data/{E2E_IDENT_PART_BYTES_TABLE}-imported-{}.parquet",
+            table.metadata().location(),
+            uuid_suffix()
+        );
+        let file_size = bytes.len() as u64;
+        table
+            .file_io()
+            .new_output(&path)
+            .context("open an ident_part_bytes imported file")?
+            .write(bytes)
+            .await
+            .context("write an ident_part_bytes imported file")?;
+        data_files.push(
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(path)
+                .file_format(DataFileFormat::Parquet)
+                .record_count(1)
+                .file_size_in_bytes(file_size)
+                .partition_spec_id(spec_id)
+                .partition(partition)
+                .build()
+                .context("describe an ident_part_bytes imported file")?,
+        );
+    }
+    commit_data_files(&catalog, &table, data_files)
+        .await
+        .context("commit ident_part_bytes data files")?;
     Ok(())
 }
 

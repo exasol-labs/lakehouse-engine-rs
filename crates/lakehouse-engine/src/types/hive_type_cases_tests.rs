@@ -61,7 +61,7 @@ pub(crate) fn nested_hive_types() -> [(&'static str, DataType); 4] {
     ]
 }
 
-/// These parse; the classifier refuses them per `vs-adapter/binary-column-refusal`.
+/// These parse and read as lowercase hex per `vs-adapter/binary-column-rendering`.
 pub(crate) fn binary_hive_types() -> [(&'static str, DataType); 2] {
     [
         ("binary", DataType::BINARY),

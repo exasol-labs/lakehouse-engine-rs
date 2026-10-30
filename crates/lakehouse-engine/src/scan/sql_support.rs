@@ -4,30 +4,52 @@ use datafusion::common::DFSchema;
 use crate::scan::spec::ProjectionItem;
 use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
 
+use super::binary_hex::{BINARY_HEX_UDF_NAME, raw_bytes_alias};
+use super::binary_text::BINARY_TEXT_UDF_NAME;
 use super::raw_scan::NESTED_JSON_RENDER_UDF_NAME;
 
 /// Uppercase aliases let identifiers resolved in uppercase match any Parquet field casing.
+/// A binary column is aliased to its hex text, so every expression over it sees what Exasol
+/// sees, and its raw bytes get a second alias for the comparisons the adapter translates. Under
+/// `binary_as_string` a variable-length one is aliased to its validated UTF-8 text instead.
 /// Public so `tests/it/scan_agg_projection_pruning.rs` builds the same inner SELECT as production.
-pub fn build_alias_items(schema: &DFSchema) -> Vec<String> {
+pub fn build_alias_items(schema: &DFSchema, binary_as_string: bool) -> Vec<String> {
     schema
         .fields()
         .iter()
         .map(|f| {
-            let arrow_name = f.name();
-            format!(
-                "{} AS {}",
-                quote_ident(arrow_name),
-                quote_ident(&arrow_name.to_uppercase())
-            )
+            let column = quote_ident(f.name());
+            let alias = f.name().to_uppercase();
+            let label = alias.replace('\'', "''");
+            match f.data_type() {
+                DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+                    if binary_as_string =>
+                {
+                    format!(
+                        "{BINARY_TEXT_UDF_NAME}({column}, '{label}') AS {}",
+                        quote_ident(&alias)
+                    )
+                }
+                binary if binary.is_binary() => format!(
+                    "{BINARY_HEX_UDF_NAME}({column}, '{label}') AS {}, {column} AS {}",
+                    quote_ident(&alias),
+                    quote_ident(&raw_bytes_alias(&alias))
+                ),
+                _ => format!("{column} AS {}", quote_ident(&alias)),
+            }
         })
         .collect()
 }
 
 /// All columns are aliased, since the filter may reference an unprojected one.
-pub(super) fn aliased_select(table_name: &str, schema: &DFSchema) -> String {
+pub(super) fn aliased_select(
+    table_name: &str,
+    schema: &DFSchema,
+    binary_as_string: bool,
+) -> String {
     format!(
         "SELECT {} FROM {table_name}",
-        build_alias_items(schema).join(", ")
+        build_alias_items(schema, binary_as_string).join(", ")
     )
 }
 
@@ -61,10 +83,11 @@ pub(super) fn render_projection<'a>(
 }
 
 /// Nested columns call [`NESTED_JSON_RENDER_UDF_NAME`]; other incompatible columns get
-/// `CAST(col AS VARCHAR)` so they arrive as Utf8.
+/// `CAST(col AS VARCHAR)` so they arrive as Utf8. A binary alias already holds its hex text.
 pub(super) fn render_column(name: &str, data_type: Option<&DataType>) -> String {
     let ident = quote_ident(&name.to_uppercase());
     match data_type {
+        Some(dt) if dt.is_binary() => ident,
         Some(dt) if needs_nested_json_rendering(dt) => {
             format!("{NESTED_JSON_RENDER_UDF_NAME}({ident})")
         }

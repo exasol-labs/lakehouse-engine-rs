@@ -3427,3 +3427,17 @@ fn exasol_df_filter_suppresses_trivially_true() {
     let null_filter = json!({"type": "literal_null"});
     assert!(render_df_filter_exasol_safe(&null_filter).is_none());
 }
+
+#[test]
+fn a_binary_literal_renders_for_datafusion_only_and_only_as_hex() {
+    let variable = json!({"type": "literal_binary", "value": "0a1b"});
+    let fixed = json!({"type": "literal_binary", "value": "0a1b", "width": 2});
+
+    assert_eq!(render_expression(&variable).unwrap(), "X'0a1b'");
+    assert_eq!(
+        render_expression(&fixed).unwrap(),
+        "arrow_cast(X'0a1b', 'FixedSizeBinary(2)')"
+    );
+    assert!(render_expression_exasol(&variable).is_err());
+    assert!(render_expression(&json!({"type": "literal_binary", "value": "0a'"})).is_err());
+}

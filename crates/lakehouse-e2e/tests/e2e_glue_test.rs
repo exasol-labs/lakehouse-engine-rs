@@ -5,8 +5,9 @@ mod common;
 
 use common::cloud_fixture::panic_message;
 use common::e2e_harness::{
-    SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_binary_values_refused,
-    assert_decimal_orders_numerically, assert_notes_well_formed, assert_text_columns,
+    SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_binary_columns_match_native_copy,
+    assert_binary_values_refused, assert_decimal_orders_numerically,
+    assert_hex_literal_compares_bytes, assert_notes_well_formed, assert_text_columns,
     assert_type_matrix, column_adapter_notes, create_schema_and_scripts,
     create_schema_and_scripts_with_env, declared_types, error_text, exa_conn, explain_virtual_sql,
     identifier_note, install_slc, int_column, note_of, pairs, parse_int, partition_positions,
@@ -24,10 +25,11 @@ use common::glue::{
     register_probe_table,
 };
 use common::seed::{
-    ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DATE_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT,
-    DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT,
-    FLOAT32_VALUES_TEXT, INT_LIST_VALUES_TEXT, INT8_VALUES_TEXT, INT16_VALUES_TEXT,
-    INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
+    ALL_TYPES_IDS_TEXT, BINARY_VALUES_TEXT, BOOLEAN_VALUES_TEXT, DATE_VALUES_TEXT,
+    DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT,
+    DECIMAL_38_10_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT_LIST_VALUES_TEXT, INT8_VALUES_TEXT,
+    INT16_VALUES_TEXT, INT32_VALUES_TEXT, STRUCT_BINARY_VALUES_TEXT, TEXT_VALUES_TEXT,
+    TIMESTAMP_VALUES_TEXT,
 };
 use common::stack::{
     CatalogConnectionPassword, PROXY_URL_INTERNAL, build_create_connection_sql, exasol_host,
@@ -554,10 +556,8 @@ fn check_glue_columns_persist_source_notes(run: &GlueRun, conn: &mut ExaConn) {
     let all_types = column_adapter_notes(conn, VS, &ALL_TYPES.to_uppercase());
     let binary = note_of(&all_types, "H_BINARY");
     assert!(
-        binary["refused"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("#351")),
-        "a binary Hive column's refusal is recorded at CREATE: {binary}"
+        binary["refused"].is_null() && binary["sourceType"]["arrow_type"] == "binary",
+        "a binary Hive column is declared binary at CREATE: {binary}"
     );
 
     for notes in [&notes, &parquet] {
@@ -718,6 +718,8 @@ fn check_partition_predicate_reduces_the_scan_file_list(_run: &GlueRun, conn: &m
 }
 
 /// Scenario: The listing declares each Glue column through the Spark listing mapping
+/// Scenario: A binary column reads as lowercase hex on every source
+/// Scenario: A filter on a binary column selects what native Exasol selects over the hex text
 fn check_all_types_declare_and_return_their_mapped_values(_run: &GlueRun, conn: &mut ExaConn) {
     let timestamp = expected_timestamp_precision(conn).declared_column_type;
     assert_type_matrix(
@@ -765,7 +767,7 @@ fn check_all_types_declare_and_return_their_mapped_values(_run: &GlueRun, conn: 
             reads("H_DECIMAL_SPACED", VARCHAR_JSON, DECIMAL_38_10_VALUES_TEXT),
             reads("H_DATE", "DATE", DATE_VALUES_TEXT),
             reads("H_TIMESTAMP", timestamp, TIMESTAMP_VALUES_TEXT),
-            refuses("H_BINARY", VARCHAR_JSON, &["type 'binary'", "#351"]),
+            reads("H_BINARY", VARCHAR_JSON, BINARY_VALUES_TEXT),
             reads("H_ARRAY_INT", VARCHAR_JSON, INT_LIST_VALUES_TEXT),
             reads(
                 "H_ARRAY_STRUCT",
@@ -791,11 +793,7 @@ fn check_all_types_declare_and_return_their_mapped_values(_run: &GlueRun, conn: 
                     None,
                 ],
             ),
-            refuses(
-                "H_STRUCT_BINARY",
-                VARCHAR_JSON,
-                &["member 'h_struct_binary.b'", "type 'binary'", "#351"],
-            ),
+            reads("H_STRUCT_BINARY", VARCHAR_JSON, STRUCT_BINARY_VALUES_TEXT),
             refuses(
                 "H_UNIONTYPE",
                 VARCHAR_JSON,
@@ -811,7 +809,10 @@ fn check_all_types_declare_and_return_their_mapped_values(_run: &GlueRun, conn: 
         ],
     );
     assert_decimal_orders_numerically(conn, VS, ALL_TYPES, "H_DECIMAL_18_0");
-    assert_binary_values_refused(conn, VS, BINARY_VALUES, "Invalid bytestream");
+    assert_binary_values_refused(conn, VS, BINARY_VALUES, "Invalid bytestream", &[]);
+    let all_types = vs_table(ALL_TYPES);
+    assert_binary_columns_match_native_copy(conn, &all_types, &["H_BINARY"], &[]);
+    assert_hex_literal_compares_bytes(conn, &all_types, "H_BINARY", "00abff");
 }
 
 /// Scenario: Session credentials sign every native Glue request

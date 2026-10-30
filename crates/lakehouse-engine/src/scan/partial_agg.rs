@@ -30,7 +30,11 @@ async fn register_aliased_scan_target(
         .table(table_name)
         .await
         .map_err(|e| UdfError::User(format!("cannot resolve registered table: {e}")))?;
-    Ok(aliased_select(table_name, table.schema()))
+    Ok(aliased_select(
+        table_name,
+        table.schema(),
+        spec.common.binary_as_string,
+    ))
 }
 
 /// Emits exactly one row per shard on the single-group path.
