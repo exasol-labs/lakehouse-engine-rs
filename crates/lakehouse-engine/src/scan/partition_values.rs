@@ -242,12 +242,30 @@ pub(crate) fn non_null_partition_value(logged: Option<&str>) -> Option<&str> {
 }
 
 /// The planning-time partition predicate converts with this too, so it and the scan agree on
-/// every value (`file-planning/partition-predicate-declared-types`).
+/// every value (`file-planning/partition-predicate-declared-types`). Every source carries a binary
+/// value as lowercase hex, because a partition value is a string and the bytes need not be text.
 pub(crate) fn partition_scalar(
     value: &str,
     data_type: &DataType,
 ) -> Result<ScalarValue, DataFusionError> {
-    ScalarValue::try_from_string(value.to_string(), data_type)
+    if !data_type.is_binary() {
+        return ScalarValue::try_from_string(value.to_string(), data_type);
+    }
+    let bytes = hex::decode(value).map_err(|e| {
+        DataFusionError::Execution(format!("a binary partition value must be hex: {e}"))
+    })?;
+    match data_type {
+        DataType::FixedSizeBinary(width) if usize::try_from(*width).ok() != Some(bytes.len()) => {
+            Err(DataFusionError::Execution(format!(
+                "a fixed({width}) partition value must hold {width} bytes, not {}",
+                bytes.len()
+            )))
+        }
+        DataType::FixedSizeBinary(width) => Ok(ScalarValue::FixedSizeBinary(*width, Some(bytes))),
+        DataType::LargeBinary => Ok(ScalarValue::LargeBinary(Some(bytes))),
+        DataType::BinaryView => Ok(ScalarValue::BinaryView(Some(bytes))),
+        _ => Ok(ScalarValue::Binary(Some(bytes))),
+    }
 }
 
 #[cfg(test)]

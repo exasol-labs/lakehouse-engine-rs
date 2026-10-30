@@ -55,7 +55,7 @@ Defines what the scan UDF emits for an Iceberg field that the file's own partiti
 
 ### Scenario: A reconstructed identity value reads the same as a stored one for every admitted type
 
-* *GIVEN* an Iceberg table identity-partitioned on one column of each of these types: `boolean`, `int`, `long`, `float`, `double`, one `decimal` inside and one outside Exasol's catalog-decimal domain, `date`, and `string`
+* *GIVEN* an Iceberg table identity-partitioned on one column of each of these types: `boolean`, `int`, `long`, `float`, `double`, one `decimal` inside and one outside Exasol's catalog-decimal domain, `date`, and `string`, and a second table identity-partitioned on a `binary` and a `fixed(16)` column
 * *AND* the table holds one row in an imported file that holds none of those columns, one row with the same values in a natively written file that holds them, and one imported row whose partition values are all null
 * *WHEN* a query selects every column ordered by `id` through the virtual schema
 * *THEN* the row from the imported file SHALL equal the row from the native file in every column, so a reconstructed value cannot be told apart from a stored one
@@ -64,9 +64,9 @@ Defines what the scan UDF emits for an Iceberg field that the file's own partiti
 
 ### Scenario: Every admitted identity value survives the scan-spec round trip at the column's declared type
 
-* *GIVEN* identity partition values of every Iceberg primitive type the read path admits, `boolean`, `int`, `long`, `float`, `double`, `decimal` inside and outside Exasol's catalog-decimal domain, `date`, `time`, `timestamp`, `timestamp_ns`, `timestamptz`, `timestamptz_ns`, and `string`, plus values written before an `int` to `long`, a `float` to `double`, and a `decimal` precision promotion
+* *GIVEN* identity partition values of every Iceberg primitive type the read path admits, `boolean`, `int`, `long`, `float`, `double`, `decimal` inside and outside Exasol's catalog-decimal domain, `date`, `time`, `timestamp`, `timestamp_ns`, `timestamptz`, `timestamptz_ns`, `string`, `binary`, `fixed(L)`, and `uuid`, plus values written before an `int` to `long`, a `float` to `double`, and a `decimal` precision promotion
 * *WHEN* the VS serializes each value into a file entry and the scan UDF converts it to the column's declared Arrow type
 * *THEN* the converted value SHALL equal the value that a physical column of the file's own type reads as at the declared type, including a `float` widened to its exact `double` expansion and a `time` or out-of-domain `decimal` rendered as the text its `VARCHAR` column shows
 * *AND* the VS SHALL use the string form, and the scan the conversion and error rule, of `scan-read-path/scan-execution-partition-values`, so one conversion serves both kinds of partition value
 * *AND* an empty `string` value SHALL read as NULL, the value Exasol stores for an empty `VARCHAR`
-* *AND* the VS SHALL carry no value for a `binary`, `fixed(L)`, or `uuid` column, which `vs-adapter/binary-column-refusal` refuses at plan time
+* *AND* the VS SHALL carry a `binary`, `fixed(L)`, or `uuid` value as the lowercase hex of its bytes, which the scan decodes, as "A binary partition value travels as lowercase hex" in `scan-read-path/scan-execution-partition-values` states

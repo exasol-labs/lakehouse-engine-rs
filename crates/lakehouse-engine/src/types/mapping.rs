@@ -8,8 +8,11 @@ use super::hive_type::parse_hive_type;
 use serde_json::{Value as Json, json};
 
 /// Returns `"VARCHAR(2000000)"` for every incompatible Arrow type rather than erroring;
-/// the scan serializes those values to JSON strings.
+/// the scan serializes those values to JSON strings, and binary values to lowercase hex.
 pub fn arrow_to_exasol_type(dt: &DataType) -> String {
+    if let DataType::FixedSizeBinary(width) = dt {
+        return hex_varchar(u64::try_from(*width).unwrap_or(0));
+    }
     match compatible_exasol_type(dt) {
         Some(CompatibleExaType::Fixed(s)) => s.to_string(),
         Some(CompatibleExaType::Decimal(p, s)) => format!("DECIMAL({p},{s})"),
@@ -135,8 +138,21 @@ pub fn needs_json_fallback(dt: &DataType) -> bool {
     compatible_exasol_type(dt).is_none()
 }
 
-/// Narrower than `needs_json_fallback`: `Binary` and an out-of-range `Decimal128` keep the
-/// `CAST(col AS VARCHAR)` Arrow-display path instead of JSON document rendering.
+/// The largest binary value whose lowercase hex rendering fits `VARCHAR(2000000)`.
+pub const MAX_BINARY_BYTES: usize = 1_000_000;
+
+/// Two hex characters per byte, so a `fixed(L)` column declares `VARCHAR(2L)`.
+pub(crate) fn hex_varchar(width: u64) -> String {
+    let chars = width.saturating_mul(2);
+    if (1..=2 * MAX_BINARY_BYTES as u64).contains(&chars) {
+        format!("VARCHAR({chars})")
+    } else {
+        "VARCHAR(2000000)".to_string()
+    }
+}
+
+/// Narrower than `needs_json_fallback`: binary renders as hex and an out-of-range `Decimal128`
+/// keeps the `CAST(col AS VARCHAR)` Arrow-display path instead of JSON document rendering.
 pub fn needs_nested_json_rendering(dt: &DataType) -> bool {
     matches!(
         dt,
@@ -272,11 +288,11 @@ pub fn iceberg_primitive_to_exasol(
             .clamp(TimestampPrecision::Nanosecond)
             .declaration()
             .to_string(),
-        String => "VARCHAR(2000000)".to_string(),
+        String | Binary => "VARCHAR(2000000)".to_string(),
+        Fixed(width) => hex_varchar(*width),
+        Uuid => hex_varchar(UUID_BYTES),
         // Refused at declaration; the type only fills the column's declared slot.
-        Uuid | Fixed(_) | Binary | Geometry(_) | Geography(_) | Unknown => {
-            "VARCHAR(2000000)".to_string()
-        }
+        Geometry(_) | Geography(_) | Unknown => "VARCHAR(2000000)".to_string(),
     }
 }
 
@@ -306,9 +322,14 @@ pub fn iceberg_primitive_to_arrow(pt: &iceberg::spec::PrimitiveType) -> DataType
         Timestamptz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         TimestamptzNs => DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         String => DataType::Utf8,
-        Uuid | Fixed(_) | Binary | Geometry(_) | Geography(_) | Unknown => DataType::Utf8,
+        Binary => DataType::Binary,
+        Fixed(width) => DataType::FixedSizeBinary(i32::try_from(*width).unwrap_or(i32::MAX)),
+        Uuid => DataType::FixedSizeBinary(UUID_BYTES as i32),
+        Geometry(_) | Geography(_) | Unknown => DataType::Utf8,
     }
 }
+
+const UUID_BYTES: u64 = 16;
 
 pub fn iceberg_type_to_arrow(ty: &iceberg::spec::Type) -> DataType {
     use iceberg::spec::Type;
@@ -344,6 +365,8 @@ pub fn arrow_type_to_tag(dt: &DataType) -> String {
         DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => "timestamptz_us".to_string(),
         DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => "timestamptz_ns".to_string(),
         DataType::Decimal128(p, s) => format!("decimal128({p},{s})"),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "binary".to_string(),
+        DataType::FixedSizeBinary(width) => format!("fixed_size_binary({width})"),
         _ => "utf8".to_string(),
     }
 }
@@ -367,6 +390,7 @@ pub fn arrow_type_from_tag(tag: &str) -> DataType {
         "utf8" => DataType::Utf8,
         "large_utf8" => DataType::LargeUtf8,
         "date32" => DataType::Date32,
+        "binary" => DataType::Binary,
         "timestamp_s" => DataType::Timestamp(TimeUnit::Second, None),
         "timestamp_ms" => DataType::Timestamp(TimeUnit::Millisecond, None),
         "timestamp_us" => DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -376,6 +400,13 @@ pub fn arrow_type_from_tag(tag: &str) -> DataType {
         "timestamptz_us" => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         "timestamptz_ns" => DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         other => {
+            if let Some(width) = other
+                .strip_prefix("fixed_size_binary(")
+                .and_then(|s| s.strip_suffix(')'))
+                .and_then(|s| s.parse::<i32>().ok())
+            {
+                return DataType::FixedSizeBinary(width);
+            }
             if let Some(inner) = other
                 .strip_prefix("decimal128(")
                 .and_then(|s| s.strip_suffix(')'))

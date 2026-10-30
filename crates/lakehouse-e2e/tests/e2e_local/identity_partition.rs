@@ -14,7 +14,7 @@ use crate::common::identity_partition_fixtures::{
     TYPES_ROW_IDS_TEXT, TYPES_TABLE,
 };
 use crate::common::raw_parquet::get_fixture_object;
-use crate::common::seed::build_seed_catalog;
+use crate::common::seed::{E2E_IDENT_PART_BYTES_TABLE, IDENT_PART_BYTES_TEXT, build_seed_catalog};
 use crate::common::stack::iceberg_catalog_url;
 use crate::fixtures::{LAKEHOUSE_VS, assert_pushed_to_scan_udf, lakehouse_vs, stack, vs_table};
 
@@ -230,4 +230,17 @@ fn reconstructed_identity_values_equal_stored_values_for_every_type() {
         )
     }));
     assert_type_matrix(&mut conn, LAKEHOUSE_VS, TYPES_TABLE, &cases);
+
+    // Spark cannot author binary identity values, so a Rust-seeded table covers them.
+    let [binary, fixed] = IDENT_PART_BYTES_TEXT;
+    assert_type_matrix(
+        &mut conn,
+        LAKEHOUSE_VS,
+        E2E_IDENT_PART_BYTES_TABLE,
+        &[
+            reads("ID", "DECIMAL(20,0)", TYPES_ROW_IDS_TEXT.map(Some)),
+            reads("B", "VARCHAR(2000000)", binary),
+            reads("F", "VARCHAR(32)", fixed),
+        ],
+    );
 }

@@ -33,10 +33,10 @@ When a virtual schema is created, refreshed, or has its properties set, the adap
 
 ### Scenario: A refused column's note records its refusal and the column stays declared
 
-* *GIVEN* an Iceberg table with columns `id int` and `b binary`, and a direct-storage directory whose files carry an `id` column and an unannotated `BYTE_ARRAY` column `legacy_name`
-* *WHEN* `createVirtualSchema` completes and the pushdown plans `SELECT b`, `SELECT legacy_name`, and `SELECT id` on each table
-* *THEN* `B` and `LEGACY_NAME` SHALL be declared `VARCHAR(2000000)`, and each note SHALL carry `refused` holding the reason `vs-adapter/binary-column-refusal` specifies for that column
-* *AND* the requests that read `b` or `legacy_name` SHALL fail at plan time with that recorded reason, and `SELECT id` SHALL succeed
+* *GIVEN* a direct-storage directory whose files carry an `id` column and a struct column `s` whose member `k` is `ENUM`-annotated
+* *WHEN* `createVirtualSchema` completes and the pushdown plans `SELECT s` and `SELECT id`
+* *THEN* `S` SHALL be declared `VARCHAR(2000000)`, and its note SHALL carry `refused` holding the reason `vs-adapter/binary-column-rendering` specifies for it
+* *AND* the request that reads `s` SHALL fail at plan time with that recorded reason, and `SELECT id` SHALL succeed
 * *AND* the pushdown SHALL omit a refused column from the scan's logical schema, so a gate miss fails with an unresolved column rather than a silent NULL column
 
 ### Scenario: Pushdown takes the declared schema from the column notes for every kind

@@ -52,6 +52,14 @@ Produces a partition column that has no physical counterpart in a data file from
 * *AND* that error MUST be returned as an error value, never raised as a panic, and MUST NOT contain
   any storage access key, secret key, or session token
 
+### Scenario: A binary partition value travels as lowercase hex
+
+* *GIVEN* a partition column whose declared type is `binary`, `fixed(L)`, or `uuid`
+* *WHEN* the VS carries a file's value for it and the scan UDF materializes that value
+* *THEN* the VS SHALL carry the lowercase hex of the value's bytes: the bytes of an Iceberg manifest value, and the UTF-8 bytes of a Delta, Unity Catalog, or Glue partition string, because a partition value is a string and the bytes need not be text
+* *AND* the scan UDF SHALL decode the hex to the column's bytes at its declared type, deciding by the declared type and never by the table format
+* *AND* a value that is not lowercase hex of whole bytes, or whose length differs from a `fixed(L)` column's `L`, SHALL fail the scan as an unrepresentable value does
+
 ### Scenario: The logged partition value wins over a physically present partition column
 
 * *GIVEN* a scan invocation whose assigned data file DOES carry a physical Parquet column bearing a

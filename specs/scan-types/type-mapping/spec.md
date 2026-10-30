@@ -23,11 +23,11 @@ Defines the single mapping from DataFusion/Arrow column types to Exasol SQL type
   | Decimal128(p,s) where p≤36 and s≤36 | DECIMAL(p, s) | numeric |
   | Decimal128(p,s) where p>36 or s>36 | VARCHAR(2000000) via JSON | `Value::String` |
 
-* Incompatible Arrow types (List, LargeList, FixedSizeList, Struct, Map, Union, Binary, LargeBinary, FixedSizeBinary, Duration, Time32, Time64, Interval, Decimal256) have no Exasol equivalent and are declared `VARCHAR(2000000)`. List, LargeList, FixedSizeList, Struct, and Map are rendered as JSON by `scan-types/nested-json-rendering`. Every other member except the binary types is serialized in the scan UDF with `CAST(col AS VARCHAR)` / `arrow_cast` before conversion to `Value::String`. A binary column is refused at plan time per `vs-adapter/binary-column-refusal`.
+* Incompatible Arrow types (List, LargeList, FixedSizeList, Struct, Map, Union, Binary, LargeBinary, BinaryView, FixedSizeBinary, Duration, Time32, Time64, Interval, Decimal256) have no Exasol equivalent and are declared `VARCHAR(2000000)`, except `FixedSizeBinary(L)`, which is declared `VARCHAR(2L)`. List, LargeList, FixedSizeList, Struct, and Map are rendered as JSON by `scan-types/nested-json-rendering`. The binary types render as lowercase hex per `vs-adapter/binary-column-rendering`. Every other member is serialized in the scan UDF with `CAST(col AS VARCHAR)` / `arrow_cast` before conversion to `Value::String`.
 * An Arrow null maps to `Value::Null` regardless of column type.
 * `iceberg_type_to_arrow` is not recursive. A column's logical Arrow type stays `Utf8` for every list, struct, and map, so the JSON string is the column's type everywhere it is read: the registered DataFusion schema, the `ScanSpec::logical_schema` tag vocabulary, the pushdown planner's `needs_json_fallback` decisions, and the `VARCHAR(2000000)` declaration. A nested Arrow type would make the column a real nested type in DataFusion, which has no comparison, ordering, hashing, or aggregation operator for `Struct` or `Map`. The adapter would then have to decline every WHERE predicate, GROUP BY key, aggregate argument, and join condition on such a column at five decision sites, and resolve the logical schema before the filter decision.
 * The nested field tree reaches the scan on a separate field. A rendering keyed by a file's physical nested names would emit a column-mapped Delta table's `col-…` identifiers as JSON keys, so `LogicalField` carries an optional, format-neutral nested descriptor. It names each nested field's logical name and the one binding key the format's column mapping selects (`field_id`, `physical_name`, or identity), recursively. It is not a type, and the column's type remains `Utf8`.
-* `needs_json_fallback` is also true for `Binary` and an out-of-range `Decimal128`, so a separate predicate owns the five nested Arrow variants. The two answer different questions: whether a type needs serializing, and whether the JSON encoder renders it.
+* `needs_json_fallback` is also true for the binary types and an out-of-range `Decimal128`, so a separate predicate owns the five nested Arrow variants. The two answer different questions: whether a type needs serializing, and whether the JSON encoder renders it.
 
 ## Scenarios
 
@@ -57,10 +57,10 @@ Defines the single mapping from DataFusion/Arrow column types to Exasol SQL type
 
 * *GIVEN* a column of an incompatible Arrow type, either a NESTED type (`List`, `LargeList`, `FixedSizeList`, `Struct`, `Map`) or a NON-NESTED one (`Binary`, `LargeBinary`, `FixedSizeBinary`, `Union`, `Duration`, `Time32`, `Time64`, `Interval`, `Decimal256`, or an out-of-range `Decimal128`)
 * *WHEN* the type is resolved for the Exasol schema and a value of it is converted
-* *THEN* the resolver SHALL declare the column as `VARCHAR(2000000)` for EVERY member of both halves, unchanged by this delta
+* *THEN* the resolver SHALL declare the column as `VARCHAR(2000000)` for EVERY member of both halves, except a `FixedSizeBinary(L)` column, which SHALL be declared `VARCHAR(2L)`
 * *AND* a NESTED column's value SHALL be rendered as a valid JSON document per `scan-types/nested-json-rendering`, which owns that contract
 * *AND* a NON-NESTED column's value, other than a `Binary`, `LargeBinary`, or `FixedSizeBinary` one, SHALL keep its recorded `CAST(col AS VARCHAR)` Arrow-display rendering byte-identical, and this feature MUST NOT claim strict JSON conformance for it
-* *AND* every request that reads or emits a `Binary`, `LargeBinary`, or `FixedSizeBinary` column SHALL be refused at plan time per `vs-adapter/binary-column-refusal` until a rendering for binary is defined
+* *AND* a `Binary`, `LargeBinary`, `BinaryView`, or `FixedSizeBinary` column's value SHALL render as lowercase hex per `vs-adapter/binary-column-rendering`
 * *AND* the converter MUST NOT emit any array, list, struct, or map `Value` for either half
 * *AND* exactly ONE predicate in `crates/lakehouse-engine/src/types/mapping.rs` SHALL own the NESTED half's arm list, and every consumer SHALL read its answer from that predicate rather than re-matching on `DataType`, so no second copy can classify a type into the wrong half
 * *AND* that predicate MUST NOT be `needs_json_fallback`, and `needs_json_fallback` SHALL keep its recorded `fn(&DataType) -> bool` signature and its recorded answer for every input, so its four existing call sites are unchanged: an out-of-range `Decimal128` column SHALL stay in the CAST path that the nested predicate diverts columns away from
@@ -129,5 +129,12 @@ Defines the single mapping from DataFusion/Arrow column types to Exasol SQL type
 * *AND* that extension SHALL cover at least `Int8`, `Int16`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, `LargeUtf8`, and `Timestamp` at EVERY `TimeUnit` in both the timezone-naive and the timezone-aware form, because the classifier returns a non-VARCHAR Exasol type for each of them while the recorded vocabulary spells none of them
 * *AND* the renderer and the parser SHALL ROUND-TRIP every type in that domain, so an Arrow type rendered to a tag and parsed back SHALL equal the type it started as
 * *AND* the renderer MUST NOT fall back to the string tag for a type the classifier ADMITS, because that fallback declares the column `VARCHAR(2000000)` and registers it as a string with no error anywhere, which is what a Spark-written `INT64 TIMESTAMP(MILLIS)` column would otherwise receive
-* *AND* the string tag SHALL remain the answer for every type the classifier REFUSES, so a nested, binary, or otherwise unrepresentable type keeps its recorded JSON-VARCHAR path unchanged
+* *AND* the string tag SHALL remain the answer for every type the classifier REFUSES, so a nested or otherwise unrepresentable type keeps its recorded JSON-VARCHAR path unchanged, except the binary types: `Binary`, `LargeBinary`, and `BinaryView` SHALL render the tag `binary`, and `FixedSizeBinary(L)` the tag `fixed_size_binary(L)`, so the scan reads the bytes and never decodes them as text
 * *AND* every recorded tag spelling SHALL be UNCHANGED and every recorded parse answer SHALL stay byte-identical, so a scan spec written before this extension deserializes to the same Arrow types
+
+### Scenario: A geospatial column is refused
+
+* *GIVEN* an Iceberg `geometry` or `geography` column, or a direct-storage `GEOMETRY`- or `GEOGRAPHY`-annotated column, at any depth
+* *WHEN* the pushdown plans a request that reads or emits the column
+* *THEN* the request SHALL fail at plan time with a reason naming the column, the member when the column nests one, and the type
+* *AND* the listing SHALL still declare the column `VARCHAR(2000000)`

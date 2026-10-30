@@ -57,7 +57,7 @@ Reads a data file whose physical column type is narrower than the table's curren
 
 * *GIVEN* a scan spec carrying a logical schema, and assigned files whose physical columns bind to logical columns by field-id, by declared physical name, or by identity
 * *WHEN* the scan UDF opens each file
-* *THEN* the UDF SHALL hand a bound column to the cast only when its physical type is ADMITTED for the declared logical type, decided per file from that file's own footer schema: admitted when the supported-set owner (`widen`) resolves the pair to the logical type (an equal type or any supported-set row); admitted for two timestamp types when the physical unit equals the logical unit or is coarser, unless the physical type carries a time zone other than `UTC` or `+00:00` and the logical type carries none, because only that pair changes a stored instant; and admitted for a string-tagged logical field against every string encoding and every primitive type the JSON-fallback classifier routes to text (`scan-types/type-mapping`), binary, fixed-size binary, time, an out-of-domain decimal, because that text rendering IS the declared type, a deliberate Exasol trade-off since Exasol has no binary or time type; and admitted for a physical `Null` column under every logical type, because an all-NULL column's cast changes no value
+* *THEN* the UDF SHALL hand a bound column to the cast only when its physical type is ADMITTED for the declared logical type, decided per file from that file's own footer schema: admitted when the supported-set owner (`widen`) resolves the pair to the logical type (an equal type or any supported-set row); admitted for two timestamp types when the physical unit equals the logical unit or is coarser, unless the physical type carries a time zone other than `UTC` or `+00:00` and the logical type carries none, because only that pair changes a stored instant; and admitted for a string-tagged logical field against every string encoding and every primitive type the JSON-fallback classifier routes to text (`scan-types/type-mapping`), binary, fixed-size binary, time, an out-of-domain decimal, because that text rendering IS the declared type, a deliberate Exasol trade-off since Exasol has no binary or time type; and admitted for a variable-length `binary` logical field against every binary encoding, because the cast keeps every byte; and admitted for a physical `Null` column under every logical type, because an all-NULL column's cast changes no value
 * *AND* a dictionary-encoded physical column that no rule above admits SHALL be judged by its value type
 
 ### Scenario: A refused pair fails only a query that reads it, for every format, with no credential in the error
@@ -106,3 +106,10 @@ Reads a data file whose physical column type is narrower than the table's curren
 * *AND* it SHALL return the shared type unchanged for two EQUAL types, so an unevolved column costs no special case at the caller
 * *AND* it MUST NOT consult `arrow::compute::can_cast_types`, because that function also accepts narrowing casts no format permits, which is the recorded reason the supported set is decided at plan time
 * *AND* it MUST NOT add, remove, or parameterize a row of the supported-set table, so `long` → `double` stays absent and this scenario changes no scan-time answer
+
+### Scenario: A catalog string column over binary file data reads as text
+
+* *GIVEN* a Glue Parquet table whose catalog declares `name string`, and a data file that stores `name` as a Parquet `BYTE_ARRAY` without the string annotation
+* *WHEN* a query reads `name`
+* *THEN* the scan SHALL render it as text, because the catalog declares it a string
+* *AND* a value that is not valid UTF-8 SHALL fail the query and MUST NOT be returned altered

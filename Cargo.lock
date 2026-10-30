@@ -3468,7 +3468,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.57.3"
+version = "0.57.4"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -3482,6 +3482,7 @@ dependencies = [
  "exasol-udf-macros",
  "exasol-udf-sdk",
  "futures",
+ "hex",
  "hkdf",
  "iceberg",
  "lakehouse-catalog",

@@ -2,7 +2,10 @@ use crate::scan_fixture;
 
 use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array, ListBuilder, StringArray, StringBuilder, StringViewArray};
+use arrow::array::{
+    Array, BinaryArray, FixedSizeBinaryArray, Int64Array, ListBuilder, StringArray, StringBuilder,
+    StringViewArray,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
@@ -14,7 +17,7 @@ use lakehouse_engine::scan::spec::{
     StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
-    build_raw_scan_physical_plan, register_files, session_config_for_spec,
+    build_raw_scan_physical_plan, register_files, scan_session_context, session_config_for_spec,
 };
 use object_store::local::LocalFileSystem;
 use parquet::arrow::ArrowWriter;
@@ -438,4 +441,130 @@ async fn statistics_pruning_cannot_drop_a_row_group_holding_a_rendered_nested_ma
         "statistics pruning must stay ENABLED for a table carrying a nested column — \
          otherwise the zero-pruned assertions above prove nothing"
     );
+}
+
+/// Each row group holds 100 consecutive ids, and `b` and `f` hold each id's two big-endian bytes,
+/// so the byte statistics of the row groups do not overlap.
+fn write_binary_parquet(dir: &std::path::Path) -> String {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("b", DataType::Binary, true),
+        Field::new("f", DataType::FixedSizeBinary(2), true),
+    ]));
+    let path = dir.join("binary.parquet");
+    let file = std::fs::File::create(&path).expect("create parquet file");
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(100))
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
+    let ids: Vec<i64> = (0..400).collect();
+    let bytes: Vec<[u8; 2]> = ids
+        .iter()
+        .map(|id| u16::try_from(*id).expect("a small id").to_be_bytes())
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(BinaryArray::from_iter_values(bytes.iter())),
+            Arc::new(FixedSizeBinaryArray::try_from_iter(bytes.iter()).expect("fixed(2) values")),
+        ],
+    )
+    .expect("record batch");
+    writer.write(&batch).expect("write batch");
+    writer.close().expect("close writer");
+    url::Url::from_file_path(&path)
+        .expect("file path must be absolute")
+        .to_string()
+}
+
+fn binary_spec(file_url: &str, filter: &str) -> ScanSpec {
+    let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(file_url))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let field = |name: &str, arrow_type: &str| LogicalField {
+        field_id: None,
+        name: name.into(),
+        arrow_type: arrow_type.into(),
+        nullable: true,
+        initial_default: None,
+        nested: None,
+        physical_name: None,
+    };
+    ScanSpec {
+        common: CommonScanSpec {
+            projection: vec![ProjectionItem::Column("ID".into())],
+            filter: Some(filter.into()),
+            logical_schema: vec![
+                field("id", "int64"),
+                field("b", "binary"),
+                field("f", "fixed_size_binary(2)"),
+            ],
+            ..Default::default()
+        },
+        files: vec![FileEntry::new(file_url.to_string(), size)],
+    }
+}
+
+async fn run_binary_scan(spec: &ScanSpec) -> (Vec<i64>, Arc<dyn ExecutionPlan>) {
+    let ctx = scan_session_context(session_config_for_spec(spec), Arc::default());
+    ctx.runtime_env().register_object_store(
+        &url::Url::parse("file://").expect("file scheme"),
+        Arc::new(LocalFileSystem::new()),
+    );
+    register_files(
+        &ctx,
+        "scan_target",
+        spec,
+        &scan_fixture::resolved_storage(spec),
+    )
+    .await
+    .expect("register the binary table");
+    let plan = build_raw_scan_physical_plan(&ctx, spec)
+        .await
+        .expect("build physical plan");
+    let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect the binary scan");
+    let mut ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("col 0 Int64")
+                .values()
+                .to_vec()
+        })
+        .collect();
+    ids.sort_unstable();
+    (ids, plan)
+}
+
+/// The filters are the text the adapter renders for a lowercase hex literal on a binary column
+/// (`vs-adapter/binary-column-rendering`). DataFusion reads the variable-length column as
+/// `BinaryView` and the fixed-length one against a `FixedSizeBinary(L)` literal.
+/// Scenario: A filter on a binary column selects what native Exasol selects over the hex text
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hex_literal_comparison_on_a_binary_column_prunes_row_groups_by_statistics() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file_url = write_binary_parquet(tmp.path());
+
+    let cases = [
+        (r#""_LH_BYTES_B" = X'0105'"#, vec![261]),
+        (
+            r#""_LH_BYTES_F" >= arrow_cast(X'0188', 'FixedSizeBinary(2)')"#,
+            (392..400).collect(),
+        ),
+    ];
+    for (filter, expected) in cases {
+        let (ids, plan) = run_binary_scan(&binary_spec(&file_url, filter)).await;
+        assert_eq!(ids, expected, "{filter} must select exactly its rows");
+        assert_eq!(
+            sum_pruned(plan.as_ref(), "row_groups_pruned_statistics"),
+            Some(3),
+            "{filter} must prune the three row groups whose byte statistics exclude it"
+        );
+    }
 }

@@ -2,6 +2,7 @@
 //! identically either way. `arrow-cast` is not used: it has no `Struct`/`Map → Utf8` cast and its
 //! `List → Utf8` cast yields Arrow display text (`[hello, world]`), not JSON.
 
+use super::binary_hex::hex_map_keys;
 use crate::types::mapping::needs_nested_json_rendering;
 use arrow::array::cast::AsArray;
 use arrow::array::{
@@ -142,6 +143,8 @@ fn with_stringified_map_keys(array: &ArrayRef) -> Result<ArrayRef> {
 fn stringified_keys(keys: &ArrayRef) -> Result<ArrayRef> {
     match keys.data_type() {
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(Arc::clone(keys)),
+        // The cast to Utf8 would decode the bytes as text; a key renders as hex, as a value does.
+        binary if binary.is_binary() => hex_map_keys(keys),
         nested if needs_nested_json_rendering(nested) => {
             Ok(Arc::new(render_nested_column_as_json(keys)?))
         }

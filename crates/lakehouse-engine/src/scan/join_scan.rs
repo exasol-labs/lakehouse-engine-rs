@@ -126,8 +126,8 @@ async fn build_join_sql(
     let fact_schema = fact.schema();
     let dim_schema = dim.schema();
 
-    let fact_aliased = aliased_select(fact_table, fact_schema);
-    let dim_aliased = aliased_select(dim_table, dim_schema);
+    let fact_aliased = aliased_select(fact_table, fact_schema, spec.common.binary_as_string);
+    let dim_aliased = aliased_select(dim_table, dim_schema, spec.common.binary_as_string);
 
     // Columns are disjoint across the two tables (VS guarantee), so a bare name resolves once.
     let combined = combined_upper_fields(dim_schema, fact_schema);

@@ -10,6 +10,7 @@
 use crate::adapter::catalog_kind::CatalogKind;
 #[cfg(test)]
 use crate::adapter::connection::ConnectionCreds;
+use crate::adapter::properties::resolve_binary_as_string;
 use crate::adapter::{ResolvedConnectionConfig, get_properties};
 use crate::scan::spec::{
     CatalogProps, CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ProjectionItem,
@@ -17,6 +18,9 @@ use crate::scan::spec::{
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
+
+mod binary_filter;
+pub(crate) use binary_filter::{BinaryColumns, literal_binary_bytes};
 
 mod support;
 pub use support::{AggregateMergeInputs, build_fan_out_inner, build_scan_driving_sql, shard_count};
@@ -158,10 +162,6 @@ pub async fn handle_pushdown(
         notes: col_notes,
     } = involved_columns(request, |tables| tables.first());
 
-    // `filter_json_raw` stays unmodified: format-level pruning must see the original
-    // predicate tree, whatever the adapter declines.
-    let (filter, declined_filter) = classify_where_filter(filter_json_raw, &col_types);
-
     let limit = extract_limit(&pushdown_req);
 
     // A limit is withheld from any ORDER BY request not matched as a bounded top-N, so
@@ -193,6 +193,14 @@ pub async fn handle_pushdown(
     } = resolver
         .resolve(&catalog.table, filter_json_raw, &col_notes)
         .await?;
+    // `filter_json_raw` stays unmodified: format-level pruning must see the original
+    // predicate tree, whatever the adapter declines.
+    let binary_as_string = resolve_binary_as_string(&props);
+    let (filter, declined_filter) = classify_where_filter(
+        filter_json_raw,
+        &col_types,
+        &BinaryColumns::of(&logical_schema, binary_as_string),
+    );
     let scan_storage = scan_storage_for(
         &conn.creds,
         &conn.connection_name,
@@ -253,6 +261,7 @@ pub async fn handle_pushdown(
         memory_pool_fraction,
         instance_overhead_mb,
         s3_max_connections,
+        binary_as_string,
     )
 }
 
@@ -285,6 +294,7 @@ pub(crate) fn build_dispatch_sql(
     memory_pool_fraction: f64,
     instance_overhead_mb: u64,
     s3_max_connections: usize,
+    binary_as_string: bool,
 ) -> Result<Json, UdfError> {
     let base = CommonScanSpec {
         table_root: table_root.clone(),
@@ -306,6 +316,7 @@ pub(crate) fn build_dispatch_sql(
         memory_pool_fraction,
         instance_overhead_mb,
         s3_max_connections,
+        binary_as_string,
     };
 
     // Ahead of shape routing so it applies before aggregating, grouping, and

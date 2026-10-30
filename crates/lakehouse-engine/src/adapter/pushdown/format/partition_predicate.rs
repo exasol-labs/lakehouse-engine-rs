@@ -4,6 +4,7 @@ use serde_json::Value as Json;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use crate::adapter::pushdown::literal_binary_bytes;
 use crate::scan::{non_null_partition_value, partition_scalar};
 use crate::types::mapping::timestamp_literal_digits;
 
@@ -149,6 +150,11 @@ fn typed_ordering(value: &str, literal: &ScalarValue) -> Option<Ordering> {
     {
         return Some(value.cmp(literal.as_str()));
     }
+    // A catalog logs a binary value as a string, whose UTF-8 bytes the reader hex-encodes only
+    // after pruning (`hex_binary_partition_values`).
+    if let ScalarValue::Binary(Some(literal)) = literal {
+        return Some(value.as_bytes().cmp(literal.as_slice()));
+    }
     let value = partition_scalar(value, &literal.data_type()).ok()?;
     if value.is_null() {
         return None;
@@ -272,6 +278,9 @@ fn literal_under(literal: &Json, declared: &DataType) -> Option<ScalarValue> {
         ("literal_date", DataType::Date32 | DataType::Date64) => non_empty_str(value)?.to_string(),
         ("literal_timestamp", DataType::Timestamp(unit, _)) => exact_timestamp(value, *unit)?,
         ("literal_bool", DataType::Boolean) => value.as_bool()?.to_string(),
+        ("literal_binary", DataType::Binary) => {
+            return literal_binary_bytes(literal).map(|bytes| ScalarValue::Binary(Some(bytes)));
+        }
         _ => return None,
     };
     ScalarValue::try_from_string(text, declared)

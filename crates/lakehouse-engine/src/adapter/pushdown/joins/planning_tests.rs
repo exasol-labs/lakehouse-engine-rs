@@ -4,6 +4,7 @@ use super::super::tests::{
     self_join_request, three_table_join_request,
 };
 use super::*;
+use crate::adapter::pushdown::BinaryColumns;
 use crate::adapter::pushdown::test_support::*;
 
 #[test]
@@ -378,7 +379,7 @@ fn self_join_is_never_broadcast_eligible() {
         "a self-join's two occurrences declare the same columns, so the guard must decline it"
     );
 
-    let rendered = render_broadcast_join(&request, &pd(&request), &join)
+    let rendered = render_broadcast_join(&request, &pd(&request), &join, &BinaryColumns::default())
         .expect("no column-metadata error for a well-formed self-join request");
     assert!(
         rendered.is_none(),

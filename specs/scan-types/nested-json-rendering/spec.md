@@ -4,7 +4,7 @@ Renders every list, struct, and map column as one valid JSON document per value,
 
 ## Background
 
-* Binary values are not rendered. Every binary column, and every column with a binary member, is refused at plan time on every source (`vs-adapter/binary-column-refusal`).
+* A top-level binary column renders as hex text outside this encoder (`vs-adapter/binary-column-rendering`). A binary member renders inside the document.
 * The JSON shape is chosen for Exasol SQL ergonomics and deliberately differs from the Iceberg spec's Appendix D, § JSON single-value serialization:
 
   | Iceberg type | Appendix D JSON representation | Appendix D example |
@@ -59,6 +59,7 @@ Renders every list, struct, and map column as one valid JSON document per value,
 * *WHEN* the scan renders that column
 * *THEN* the renderer SHALL replace the key child array with a `Utf8` array of stringified keys BEFORE encoding, and the rendered object name SHALL be that string, `42` for the integer key `42`, `true` for the boolean key `true`, `2026-08-18` for that date key
 * *AND* a NESTED key type SHALL be stringified as its own JSON rendering, so a `Struct` key becomes the object name `{"a":1}`, one rule covering every type the spec permits, with no key type left unhandled
+* *AND* a `Binary`, `LargeBinary`, `BinaryView`, or `FixedSizeBinary` key SHALL be stringified as its lowercase hex per `vs-adapter/binary-column-rendering`, because the cast would decode the bytes as text
 * *AND* every other key type SHALL be stringified through the Arrow-to-`Utf8` cast, and a key type that cast rejects SHALL surface a clean error naming the key type, never a wrong value
 * *AND* the key strings SHALL be escaped as JSON object names by the same encoder that escapes string values, so a key containing `"` or `\` yields a valid document
 * *AND* an ARRAY-OF-PAIRS shape (`[{"key":42,"value":"v"}]`) MUST NOT be produced, because it would make the emitted VARCHAR unreadable by an Exasol JSON path expression, which is the whole reason the column is surfaced as JSON at all
@@ -92,7 +93,7 @@ Renders every list, struct, and map column as one valid JSON document per value,
 * *GIVEN* a scan spec carrying NO logical schema, where the registered DataFusion table schema is inferred from the first data file and therefore declares a nested column at its real nested Arrow type
 * *WHEN* the scan builds its SQL for the single-table path or the broadcast-join path
 * *THEN* the generated SELECT item for a JSON-RENDERED NESTED column SHALL invoke the JSON encoder and MUST NOT emit `CAST(col AS VARCHAR)`, which fails outright for `Struct` and `Map` and produces display text for `List`
-* *AND* the generated SELECT item for every NON-NESTED incompatible column SHALL keep emitting `CAST(col AS VARCHAR)` byte-identically, so an out-of-range `Decimal128` and a `Binary` column are unaffected
+* *AND* the generated SELECT item for every NON-NESTED incompatible column other than a binary one SHALL keep emitting `CAST(col AS VARCHAR)` byte-identically, so an out-of-range `Decimal128` column is unaffected
 * *AND* the single-table path and the broadcast-join path SHALL make that choice through the SAME predicate and the SAME rendering helper, so the two select-list builders cannot disagree about a column
 * *AND* the encoder itself SHALL have exactly ONE implementation, reached both as the expression the binding adapter substitutes and as the function the generated SQL invokes, so the rendered document for a given value is identical whichever path produced it
 

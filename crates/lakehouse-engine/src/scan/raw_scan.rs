@@ -338,7 +338,7 @@ pub(super) async fn build_scan_sql(
 
     // DataFusion matches quoted identifiers case-sensitively, while the adapter speaks Exasol's
     // uppercase and Parquet keeps Iceberg casing.
-    let inner = aliased_select(table_name, schema);
+    let inner = aliased_select(table_name, schema, spec.common.binary_as_string);
 
     let proj_items: Vec<ProjectionItem> = if spec.common.projection.is_empty() {
         schema

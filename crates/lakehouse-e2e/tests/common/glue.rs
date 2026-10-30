@@ -9,8 +9,8 @@ use super::seed::{
     all_types_ids, all_types_validity, binary_values, boolean_values, date_values,
     decimal_10_2_values, decimal_18_0_values, decimal_36_6_values, decimal_38_10_values,
     float32_values, int_list_values, int_string_struct_values, int8_values, int16_values,
-    int32_values, non_utf8_parquet, string_int_map_values, text_values, timestamp_values,
-    write_one_file_append,
+    int32_values, non_utf8_parquet, string_int_map_values, struct_binary_values, text_values,
+    timestamp_values, write_one_file_append,
 };
 use super::stack::CatalogConnectionPassword;
 
@@ -618,7 +618,11 @@ const HIVE_TYPE_COLUMNS: &[HiveTypeColumn] = &[
         "struct<x:int,y:string>",
         Some(|| int_string_struct_values("x", "y", "p")),
     ),
-    hive("h_struct_binary", "struct<b:binary>", None),
+    hive(
+        "h_struct_binary",
+        "struct<x:binary>",
+        Some(|| struct_binary_values(None)),
+    ),
     hive("h_uniontype", "uniontype<int,string>", None),
     hive("h_interval", "interval_day_time", None),
     hive("h_malformed_map", "map<int>", None),

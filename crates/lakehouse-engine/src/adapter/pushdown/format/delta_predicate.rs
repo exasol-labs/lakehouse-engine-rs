@@ -3,6 +3,7 @@ use delta_kernel::schema::{DataType, DecimalType, PrimitiveType, StructField};
 use delta_kernel::{Expression, Predicate};
 use serde_json::Value as Json;
 
+use crate::adapter::pushdown::literal_binary_bytes;
 use crate::types::mapping::timestamp_literal_digits;
 
 use super::filter_json::{
@@ -180,6 +181,8 @@ fn literal_to_scalar(lit: &Json, prim: &PrimitiveType) -> Option<Scalar> {
             // Delta timestamps hold microseconds; a truncated finer literal would prune matching files.
             (timestamp_literal_digits(text) <= 6).then(|| prim.parse_scalar(text).ok())?
         }
+
+        ("literal_binary", PrimitiveType::Binary) => literal_binary_bytes(lit).map(Scalar::Binary),
 
         _ => None,
     }

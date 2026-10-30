@@ -679,3 +679,34 @@ fn a_filter_column_is_emitted_under_its_paired_fields_current_name() {
         "a column no declared pair names constrains nothing"
     );
 }
+
+/// Scenario: A hex-literal filter on a binary column prunes files at plan time
+#[test]
+fn a_binary_literal_prunes_a_binary_column_by_its_bytes() {
+    let schema = StructType::try_new([StructField::nullable(
+        "b",
+        DataType::Primitive(PrimitiveType::Binary),
+    )])
+    .expect("schema with one binary field must build");
+    let equal_to =
+        |literal: Json| json!({"type": "predicate_equal", "left": col("B"), "right": literal});
+
+    assert_eq!(
+        to_delta_predicate(
+            &equal_to(json!({"type": "literal_binary", "value": "00abff"})),
+            &by_name(&schema)
+        ),
+        Some(Predicate::eq(
+            Expression::column(["b"]),
+            Expression::literal(Scalar::Binary(vec![0x00, 0xab, 0xff]))
+        ))
+    );
+    assert_eq!(
+        to_delta_predicate(
+            &equal_to(json!({"type": "literal_string", "value": "00abff"})),
+            &by_name(&schema)
+        ),
+        None,
+        "only the retyped literal names bytes"
+    );
+}

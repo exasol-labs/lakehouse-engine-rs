@@ -14,8 +14,11 @@ use object_store::ObjectStore;
 use serde_json::Value as Json;
 
 use crate::adapter::column_notes::{ColumnDeclaration, DeclaredSchema};
+use crate::adapter::pushdown::BinaryColumns;
+use crate::adapter::pushdown::binary_filter::with_binary_literals;
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry};
+use crate::types::mapping::arrow_type_from_tag;
 
 pub use crate::adapter::column_notes::RefusedColumn;
 
@@ -26,7 +29,7 @@ mod delta_predicate;
 mod delta_protocol;
 mod delta_replay;
 mod delta_schema;
-mod filter_json;
+pub(super) mod filter_json;
 mod iceberg;
 mod parquet_format_reader;
 mod partition_predicate;
@@ -82,6 +85,26 @@ fn checked_storage_location<'t>(
     }
 }
 
+/// A Delta or Hive partition value is a string, so a binary column's value travels as the lowercase
+/// hex of its UTF-8 bytes, the form the Iceberg reader writes and `scan::partition_scalar` decodes.
+fn hex_binary_partition_values(files: &mut [FileEntry], logical_schema: &[LogicalField]) {
+    let binary: Vec<&str> = logical_schema
+        .iter()
+        .filter(|field| arrow_type_from_tag(&field.arrow_type).is_binary())
+        .map(|field| field.name.as_str())
+        .collect();
+    if binary.is_empty() {
+        return;
+    }
+    for file in files {
+        for (column, value) in &mut file.partition_values {
+            if let Some(value) = value.as_mut().filter(|_| binary.contains(&column.as_str())) {
+                *value = hex::encode(value.as_bytes());
+            }
+        }
+    }
+}
+
 /// A table's planned files with its declared schema: the scan a pushdown renders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedScan {
@@ -95,13 +118,18 @@ pub struct ResolvedScan {
 }
 
 impl ResolvedScan {
-    /// Plans `reader`'s files against `declared`, the table's parsed column notes.
+    /// Plans `reader`'s files against `declared`, the table's parsed column notes. Every reader
+    /// receives the filter with its binary comparisons retyped, so each prunes on the raw bytes.
     pub async fn resolve(
         reader: &dyn FormatReader,
         declared: DeclaredSchema,
         filter_json: Option<&Json>,
+        binary_as_string: bool,
     ) -> Result<Self, UdfError> {
-        let planned = reader.resolve_scan(&declared, filter_json).await?;
+        let binary_columns = BinaryColumns::of(&declared.logical_schema, binary_as_string);
+        let filter_json =
+            filter_json.map(|filter| with_binary_literals(filter.clone(), &binary_columns));
+        let planned = reader.resolve_scan(&declared, filter_json.as_ref()).await?;
         Ok(Self::new(declared, planned))
     }
 

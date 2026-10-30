@@ -487,7 +487,7 @@ fn iceberg_type_to_arrow_maps_all_families() {
     );
     assert_eq!(
         iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Uuid)),
-        DataType::Utf8
+        DataType::FixedSizeBinary(16)
     );
 
     assert_eq!(
@@ -570,11 +570,11 @@ fn iceberg_type_to_arrow_maps_all_families() {
 
     assert_eq!(
         iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Binary)),
-        DataType::Utf8
+        DataType::Binary
     );
     assert_eq!(
         iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Fixed(16))),
-        DataType::Utf8
+        DataType::FixedSizeBinary(16)
     );
 
     assert_eq!(
@@ -948,15 +948,43 @@ fn every_admitted_arrow_type_round_trips_through_its_tag() {
 
 #[test]
 fn refused_arrow_types_fall_back_to_the_utf8_tag() {
+    let tag = arrow_type_to_tag(&DataType::Decimal256(10, 2));
+    assert_eq!(tag, "utf8");
+    assert_eq!(arrow_type_from_tag(&tag), DataType::Utf8);
+}
+
+#[test]
+fn every_variable_binary_encoding_tags_as_binary_and_a_fixed_one_keeps_its_width() {
     for dt in [
         DataType::Binary,
         DataType::LargeBinary,
-        DataType::Decimal256(10, 2),
+        DataType::BinaryView,
     ] {
-        let tag = arrow_type_to_tag(&dt);
-        assert_eq!(tag, "utf8");
-        assert_eq!(arrow_type_from_tag(&tag), DataType::Utf8);
+        assert_eq!(arrow_type_to_tag(&dt), "binary");
     }
+    assert_eq!(arrow_type_from_tag("binary"), DataType::Binary);
+    assert_eq!(
+        arrow_type_to_tag(&DataType::FixedSizeBinary(20)),
+        "fixed_size_binary(20)"
+    );
+    assert_eq!(
+        arrow_type_from_tag("fixed_size_binary(20)"),
+        DataType::FixedSizeBinary(20)
+    );
+}
+
+#[test]
+fn a_binary_column_declares_two_hex_characters_per_byte() {
+    assert_eq!(arrow_to_exasol_type(&DataType::Binary), "VARCHAR(2000000)");
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::FixedSizeBinary(16)),
+        "VARCHAR(32)"
+    );
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::FixedSizeBinary(1_000_001)),
+        "VARCHAR(2000000)",
+        "a width whose hex exceeds VARCHAR(2000000) declares the widest VARCHAR"
+    );
 }
 
 fn unity(spark_type: &str) -> ColumnSourceType {
@@ -1181,9 +1209,15 @@ fn expected_mapping(pt: &PrimitiveType) -> (&'static str, DataType) {
             DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         ),
         PrimitiveType::String => ("VARCHAR(2000000)", DataType::Utf8),
-        PrimitiveType::Uuid => ("VARCHAR(2000000)", DataType::Utf8),
-        PrimitiveType::Fixed(_) => ("VARCHAR(2000000)", DataType::Utf8),
-        PrimitiveType::Binary => ("VARCHAR(2000000)", DataType::Utf8),
+        PrimitiveType::Uuid => ("VARCHAR(32)", DataType::FixedSizeBinary(16)),
+        PrimitiveType::Fixed(width) => {
+            assert_eq!(
+                *width, 16,
+                "expected_mapping pins only the fixed width every_variant drives"
+            );
+            ("VARCHAR(32)", DataType::FixedSizeBinary(16))
+        }
+        PrimitiveType::Binary => ("VARCHAR(2000000)", DataType::Binary),
         PrimitiveType::Geometry(_) => ("VARCHAR(2000000)", DataType::Utf8),
         PrimitiveType::Geography(_) => ("VARCHAR(2000000)", DataType::Utf8),
         PrimitiveType::Unknown => ("VARCHAR(2000000)", DataType::Utf8),

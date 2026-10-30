@@ -189,6 +189,7 @@ async fn declaration_refuses_a_column_without_a_usable_type_json_and_forces_null
         scan.logical_schema,
         vec![
             nullable_field("id", "int64"),
+            nullable_field("payload", "binary"),
             nullable_field("CustomerId", "utf8")
         ]
     );
@@ -200,10 +201,7 @@ async fn declaration_refuses_a_column_without_a_usable_type_json_and_forces_null
             (refused.column_name.as_str(), undescribed)
         })
         .collect();
-    assert_eq!(
-        refused,
-        vec![("payload", false), ("note", true), ("broken", true)]
-    );
+    assert_eq!(refused, vec![("note", true), ("broken", true)]);
 
     let unschematic = sales_table(&[("id", "long"), ("ID", "long")], &[]);
     let notes = declared_notes(&unschematic);
@@ -384,21 +382,18 @@ fn delta_classification(columns: &[(String, DeltaType)]) -> Vec<LogicalField> {
 
 /// Scenario: Every Hive primitive type maps to its Spark type
 /// Scenario: Nested Hive types parse recursively and render as JSON text
-/// Scenario: A binary, unrecognized, or malformed Hive type refuses only its column
+/// Scenario: An unrecognized or malformed Hive type refuses only its column
 #[test]
 fn glue_columns_are_classified_by_the_spark_type_classifier_and_refused_only_by_their_type() {
     let typed: Vec<(String, &str, DeltaType)> = primitive_hive_types()
         .map(|(hive_type, spark, _)| (hive_type, spark))
         .into_iter()
         .chain(nested_hive_types())
+        .chain(binary_hive_types())
         .enumerate()
         .map(|(index, (hive_type, spark))| (format!("c{index}"), hive_type, spark))
         .collect();
-    let refused_types: Vec<&str> = binary_hive_types()
-        .map(|(hive_type, _)| hive_type)
-        .into_iter()
-        .chain(UNRECOGNIZED_HIVE_TYPES)
-        .collect();
+    let refused_types: Vec<&str> = UNRECOGNIZED_HIVE_TYPES.to_vec();
     let refused_names: Vec<String> = (0..refused_types.len()).map(|i| format!("r{i}")).collect();
     let columns: Vec<(&str, &str)> = typed
         .iter()
@@ -434,7 +429,12 @@ fn glue_columns_are_classified_by_the_spark_type_classifier_and_refused_only_by_
         "utf8",
         "precision 38 is outside Exasol's DECIMAL domain"
     );
-    for (hive_type, _) in nested_hive_types() {
+    assert_eq!(field_of("binary").arrow_type, "binary");
+    for hive_type in nested_hive_types()
+        .map(|(hive_type, _)| hive_type)
+        .into_iter()
+        .chain(["struct<b:binary>"])
+    {
         let field = field_of(hive_type);
         assert!(
             field.arrow_type == "utf8" && field.nested.is_some(),
@@ -442,13 +442,8 @@ fn glue_columns_are_classified_by_the_spark_type_classifier_and_refused_only_by_
         );
     }
 
-    let binary = ["has type 'binary'", "#351"].map(str::to_string);
-    let expected_fragments = [
-        binary.to_vec(),
-        [binary.to_vec(), vec!["whose member 'r1.b'".to_string()]].concat(),
-    ]
-    .into_iter()
-    .chain(UNRECOGNIZED_HIVE_TYPES.map(|hive_type| vec![format!(": Hive type '{hive_type}'")]));
+    let expected_fragments =
+        UNRECOGNIZED_HIVE_TYPES.map(|hive_type| vec![format!(": Hive type '{hive_type}'")]);
     assert_eq!(schema.refused_columns.len(), refused_types.len());
     for ((refused, name), fragments) in schema
         .refused_columns
@@ -467,7 +462,8 @@ fn glue_columns_are_classified_by_the_spark_type_classifier_and_refused_only_by_
         }
     }
 
-    let every_column_refused = glue_table(&[("b", "binary"), ("u", "uniontype<int>")], &[]);
+    let every_column_refused =
+        glue_table(&[("i", "interval_day_time"), ("u", "uniontype<int>")], &[]);
     let error = user_message(
         declared_schema(&every_column_refused)
             .expect_err("a table whose every column is refused must be refused as a whole"),
@@ -475,7 +471,7 @@ fn glue_columns_are_classified_by_the_spark_type_classifier_and_refused_only_by_
     assert!(
         error.starts_with(&format!(
             "virtual table '{GLUE_TABLE_NAME}' has no mappable column"
-        )) && error.contains("'b'"),
+        )) && error.contains("'i'"),
         "{error}"
     );
 }

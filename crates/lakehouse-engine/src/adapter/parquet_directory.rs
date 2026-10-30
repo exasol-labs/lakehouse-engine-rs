@@ -85,18 +85,18 @@ pub struct ParquetDirectory {
     /// The declared partition-key names, in the order appended to `schema`.
     pub partition_columns: Vec<String>,
     /// In `schema` order; the listing still declares these columns, only a read refuses them.
-    pub binary_columns: Vec<BinaryColumn>,
+    pub refused_leaves: Vec<RefusedLeaf>,
 }
 
 /// Read from the footer's annotations, not the folded Arrow type: `parquet` folds an unannotated
-/// `BYTE_ARRAY` and an `ENUM` one alike to `Binary` (`vs-adapter/binary-column-refusal`).
+/// `BYTE_ARRAY`, a geospatial one, and an `ENUM` one alike to `Binary`
+/// (`vs-adapter/binary-column-rendering`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BinaryColumn {
+pub struct RefusedLeaf {
     pub column: String,
-    /// The member's Parquet column path, `None` when the column's own leaf is binary.
+    /// The member's Parquet column path, `None` when the column's own leaf is refused.
     pub member_path: Option<String>,
-    /// In the file's own terms: `binary`, `fixed(L)`, `uuid`, `bson`, `geometry`, `geography`,
-    /// or `enum`.
+    /// In the file's own terms: `geometry`, `geography`, or `enum`.
     pub declared: String,
     /// An `ENUM` leaf below the top level or under a repeated one, which only a top-level
     /// cast reads as text.
@@ -164,7 +164,7 @@ pub async fn resolve_parquet_directory(
     while let Some((footer, source)) = footers.next().await {
         fold.add(source, &footer?)?;
     }
-    let (folded_fields, binary_columns) = fold.finish();
+    let (folded_fields, refused_leaves) = fold.finish();
     let files = raw_files
         .iter()
         .zip(partition_values)
@@ -178,7 +178,7 @@ pub async fn resolve_parquet_directory(
         files,
         schema: schema_with_partition_columns(folded_fields, &declared_keys),
         partition_columns: declared_keys,
-        binary_columns,
+        refused_leaves,
     })
 }
 
@@ -432,7 +432,9 @@ struct SchemaFold<'a> {
     columns: Vec<FoldedColumn>,
     by_uppercase: HashMap<String, usize>,
     /// The first listed file's leaf names a column's type.
-    first_binary_leaf: HashMap<String, BinaryColumn>,
+    first_refused_leaf: HashMap<String, RefusedLeaf>,
+    /// Top-level `ENUM` columns, which fold to `Binary` but hold text.
+    enum_columns: HashSet<String>,
 }
 
 impl<'a> SchemaFold<'a> {
@@ -441,7 +443,8 @@ impl<'a> SchemaFold<'a> {
             key_columns,
             columns: Vec::new(),
             by_uppercase: HashMap::new(),
-            first_binary_leaf: HashMap::new(),
+            first_refused_leaf: HashMap::new(),
+            enum_columns: HashSet::new(),
         }
     }
 
@@ -483,13 +486,16 @@ impl<'a> SchemaFold<'a> {
             let is_top_level_scalar = parts.len() == 1 && leaf.max_rep_level() == 0;
             let (declared, nested_enum) = match classify_leaf(leaf) {
                 LeafKind::Readable => continue,
-                LeafKind::Enum if is_top_level_scalar => continue,
+                LeafKind::Enum if is_top_level_scalar => {
+                    self.enum_columns.insert(parts[0].clone());
+                    continue;
+                }
                 LeafKind::Enum => ("enum".to_string(), true),
-                LeafKind::Binary(declared) => (declared, false),
+                LeafKind::Refused(declared) => (declared.to_string(), false),
             };
-            self.first_binary_leaf
+            self.first_refused_leaf
                 .entry(parts[0].clone())
-                .or_insert_with(|| BinaryColumn {
+                .or_insert_with(|| RefusedLeaf {
                     column: parts[0].clone(),
                     member_path: (parts.len() > 1).then(|| leaf.path().string()),
                     declared,
@@ -501,18 +507,24 @@ impl<'a> SchemaFold<'a> {
 
     /// Only folded columns are refused, so a stored column dropped for a partition key never is.
     /// Every folded column is nullable, because a file that lacks it reads NULL for its rows.
-    fn finish(mut self) -> (Vec<Field>, Vec<BinaryColumn>) {
-        let binary_columns = self
+    fn finish(mut self) -> (Vec<Field>, Vec<RefusedLeaf>) {
+        let refused_leaves = self
             .columns
             .iter()
-            .filter_map(|column| self.first_binary_leaf.remove(&column.name))
+            .filter_map(|column| self.first_refused_leaf.remove(&column.name))
             .collect();
         let fields = self
             .columns
             .into_iter()
-            .map(|column| Field::new(column.name, column.data_type, true))
+            .map(|column| {
+                let data_type = match column.data_type {
+                    DataType::Binary if self.enum_columns.contains(&column.name) => DataType::Utf8,
+                    data_type => data_type,
+                };
+                Field::new(column.name, data_type, true)
+            })
             .collect();
-        (fields, binary_columns)
+        (fields, refused_leaves)
     }
 }
 
@@ -521,50 +533,24 @@ enum LeafKind {
     /// Text per Parquet LogicalTypes § ENUM, but folded to Arrow `Binary`, so only the top-level
     /// cast reads it as text; the JSON renderer would print a member's bytes as hexadecimal.
     Enum,
-    Binary(String),
+    Refused(&'static str),
 }
 
-/// Mirrors `parquet` 58's `from_byte_array` and `from_fixed_len_byte_array`: the logical type
-/// decides, and the converted type only when a file carries no logical type.
+/// Mirrors `parquet`'s `from_byte_array`: the logical type decides, and the converted type only
+/// when a file carries no logical type. Every other byte leaf renders as hex.
 fn classify_leaf(leaf: &ColumnDescriptor) -> LeafKind {
-    let binary = |declared: &str| LeafKind::Binary(declared.to_string());
     match (
         leaf.physical_type(),
         leaf.logical_type_ref(),
         leaf.converted_type(),
     ) {
-        (_, Some(LogicalType::Unknown), _) => LeafKind::Readable,
-        (PhysicalType::BYTE_ARRAY, Some(logical), _) => match logical {
-            LogicalType::String | LogicalType::Json | LogicalType::Decimal { .. } => {
-                LeafKind::Readable
-            }
-            LogicalType::Enum => LeafKind::Enum,
-            LogicalType::Bson => binary("bson"),
-            LogicalType::Geometry { .. } => binary("geometry"),
-            LogicalType::Geography { .. } => binary("geography"),
-            _ => binary("binary"),
-        },
-        (PhysicalType::BYTE_ARRAY, None, converted) => match converted {
-            ConvertedType::UTF8 | ConvertedType::JSON | ConvertedType::DECIMAL => {
-                LeafKind::Readable
-            }
-            ConvertedType::ENUM => LeafKind::Enum,
-            ConvertedType::BSON => binary("bson"),
-            _ => binary("binary"),
-        },
-        (
-            PhysicalType::FIXED_LEN_BYTE_ARRAY,
-            Some(LogicalType::Decimal { .. } | LogicalType::Float16),
-            _,
-        )
-        | (
-            PhysicalType::FIXED_LEN_BYTE_ARRAY,
-            None,
-            ConvertedType::DECIMAL | ConvertedType::INTERVAL,
-        ) => LeafKind::Readable,
-        (PhysicalType::FIXED_LEN_BYTE_ARRAY, Some(LogicalType::Uuid), _) => binary("uuid"),
-        (PhysicalType::FIXED_LEN_BYTE_ARRAY, _, _) => {
-            LeafKind::Binary(format!("fixed({})", leaf.type_length()))
+        (PhysicalType::BYTE_ARRAY, Some(LogicalType::Enum), _)
+        | (PhysicalType::BYTE_ARRAY, None, ConvertedType::ENUM) => LeafKind::Enum,
+        (PhysicalType::BYTE_ARRAY, Some(LogicalType::Geometry { .. }), _) => {
+            LeafKind::Refused("geometry")
+        }
+        (PhysicalType::BYTE_ARRAY, Some(LogicalType::Geography { .. }), _) => {
+            LeafKind::Refused("geography")
         }
         _ => LeafKind::Readable,
     }

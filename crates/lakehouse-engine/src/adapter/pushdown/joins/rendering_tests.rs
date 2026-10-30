@@ -76,8 +76,13 @@ fn overlapping_column_name_fails_guard_and_declines_without_error() {
     );
 
     let detected = detected_join(&request);
-    let outcome = render_broadcast_join(&request, &pd(&request), &detected)
-        .expect("a guard failure is a decline, not an error");
+    let outcome = render_broadcast_join(
+        &request,
+        &pd(&request),
+        &detected,
+        &BinaryColumns::default(),
+    )
+    .expect("a guard failure is a decline, not an error");
     assert!(
         outcome.is_none(),
         "a column-name collision must decline to the unaccelerated path"
@@ -94,9 +99,14 @@ fn join_condition_renders_via_translator() {
 
     let request = join_request(Json::Null, equi_condition());
     let detected = detected_join(&request);
-    let rendered = render_broadcast_join(&request, &pd(&request), &detected)
-        .expect("disjoint, renderable join")
-        .expect("a disjoint join must render, not decline");
+    let rendered = render_broadcast_join(
+        &request,
+        &pd(&request),
+        &detected,
+        &BinaryColumns::default(),
+    )
+    .expect("disjoint, renderable join")
+    .expect("a disjoint join must render, not decline");
     assert_eq!(rendered.condition, r#"("C_CUSTKEY" = "O_CUSTKEY")"#);
 }
 
@@ -116,9 +126,14 @@ fn join_where_filter_spanning_both_sides_renders() {
     });
 
     let detected = detected_join(&request);
-    let rendered = render_broadcast_join(&request, &pd(&request), &detected)
-        .expect("disjoint, renderable join")
-        .expect("must render");
+    let rendered = render_broadcast_join(
+        &request,
+        &pd(&request),
+        &detected,
+        &BinaryColumns::default(),
+    )
+    .expect("disjoint, renderable join")
+    .expect("must render");
     let filter = rendered
         .filter
         .expect("a cross-side WHERE filter must render");
@@ -644,7 +659,8 @@ fn type_screened_leg_filter_pushes_whole_accepted_set_rewritten() {
         orders_local_rendering_conjunct(),
     ]);
 
-    let (leg, declined) = type_screened_leg_filter(&filter, &orders_col_types());
+    let (leg, declined) =
+        type_screened_leg_filter(&filter, &orders_col_types(), &BinaryColumns::default());
 
     assert!(
         declined.is_none(),
@@ -668,7 +684,8 @@ fn type_screened_leg_filter_declines_whole_set_when_no_conjunct_survives() {
     let decimal_like = like_over("O_CUSTKEY", "ORDERS", "1%");
     let filter = and_of(vec![decimal_like.clone(), orders_local_declined_conjunct()]);
 
-    let (leg, declined) = type_screened_leg_filter(&filter, &orders_col_types());
+    let (leg, declined) =
+        type_screened_leg_filter(&filter, &orders_col_types(), &BinaryColumns::default());
 
     assert!(
         leg.is_none(),
@@ -712,7 +729,8 @@ fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
 
     for (label, filter) in cases {
         let input = conjunct_count(Some(&filter));
-        let (leg, declined) = type_screened_leg_filter(&filter, &orders_col_types());
+        let (leg, declined) =
+            type_screened_leg_filter(&filter, &orders_col_types(), &BinaryColumns::default());
         assert_eq!(
             conjunct_count(leg.as_ref()) + conjunct_count(declined.as_ref()),
             input,
@@ -729,7 +747,8 @@ fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
         }
     }
 
-    let (leg, declined) = type_screened_leg_filter(&mixed, &orders_col_types());
+    let (leg, declined) =
+        type_screened_leg_filter(&mixed, &orders_col_types(), &BinaryColumns::default());
     let leg_sql = render_df_filter_safe(&leg.expect("the two accepted conjuncts form a leg"))
         .expect("the rewritten accepted set must render for DataFusion");
     assert!(
@@ -770,7 +789,7 @@ fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
         "precondition: the REWRITTEN tree still does not render for DataFusion"
     );
 
-    let (leg, declined) = type_screened_leg_filter(&filter, &col_types);
+    let (leg, declined) = type_screened_leg_filter(&filter, &col_types, &BinaryColumns::default());
 
     assert!(
         leg.is_none(),
@@ -797,8 +816,11 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
     });
     let filter = like_over("SHARED_KEY", "DATED", "1995%");
 
-    let (date_leg, date_declined) =
-        type_screened_leg_filter(&filter, &involved_table_columns(&request, "DATED"));
+    let (date_leg, date_declined) = type_screened_leg_filter(
+        &filter,
+        &involved_table_columns(&request, "DATED"),
+        &BinaryColumns::default(),
+    );
     let date_sql = render_df_filter_safe(
         &date_leg.expect("the DATE side accepts the LIKE through the CAST rewrite"),
     )
@@ -812,8 +834,11 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
         "the DATE side declines nothing: {date_declined:?}"
     );
 
-    let (numeric_leg, numeric_declined) =
-        type_screened_leg_filter(&filter, &involved_table_columns(&request, "NUMBERED"));
+    let (numeric_leg, numeric_declined) = type_screened_leg_filter(
+        &filter,
+        &involved_table_columns(&request, "NUMBERED"),
+        &BinaryColumns::default(),
+    );
     assert!(
         numeric_leg.is_none(),
         "the DECIMAL side has no safe rewrite, so nothing may reach its leg: \
@@ -1063,9 +1088,14 @@ fn render_broadcast_join_strips_native_table_alias_from_filter() {
         "right": {"type": "literal_string", "value": "1995-01-01"}
     });
     let detected = detected_join(&request);
-    let rendered = render_broadcast_join(&request, &pd(&request), &detected)
-        .expect("renders")
-        .expect("disjoint join renders");
+    let rendered = render_broadcast_join(
+        &request,
+        &pd(&request),
+        &detected,
+        &BinaryColumns::default(),
+    )
+    .expect("renders")
+    .expect("disjoint join renders");
     let filter = rendered.filter.expect("filter renders");
     assert!(
         filter.contains(r#""O_ORDERDATE""#),
@@ -1086,9 +1116,14 @@ fn render_broadcast_join_strips_native_table_alias_from_condition() {
     });
     let request = join_request(Json::Null, condition);
     let detected = detected_join(&request);
-    let rendered = render_broadcast_join(&request, &pd(&request), &detected)
-        .expect("disjoint, renderable join")
-        .expect("a disjoint join must render, not decline");
+    let rendered = render_broadcast_join(
+        &request,
+        &pd(&request),
+        &detected,
+        &BinaryColumns::default(),
+    )
+    .expect("disjoint, renderable join")
+    .expect("a disjoint join must render, not decline");
     assert_eq!(rendered.condition, r#"("C_CUSTKEY" = "O_CUSTKEY")"#);
 }
 
@@ -1102,9 +1137,14 @@ fn render_broadcast_join_strips_native_table_alias_from_projection() {
         ]}
     ]);
     let detected = detected_join(&request);
-    let rendered = render_broadcast_join(&request, &pd(&request), &detected)
-        .expect("renders")
-        .expect("disjoint join renders");
+    let rendered = render_broadcast_join(
+        &request,
+        &pd(&request),
+        &detected,
+        &BinaryColumns::default(),
+    )
+    .expect("renders")
+    .expect("disjoint join renders");
     assert_eq!(rendered.projection.len(), 1, "{:?}", rendered.projection);
     match &rendered.projection[0] {
         ProjectionItem::Expr { expr } => {
@@ -1194,5 +1234,39 @@ fn unified_join_prunes_and_narrows_each_leg() {
     assert!(
         sql.contains(r#"ON (("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY"))"#),
         "the equi-condition attaches to the join point's ON clause: {sql}"
+    );
+}
+
+/// Scenario: A filter on a binary column selects what native Exasol selects over the hex text
+#[test]
+fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
+    let c_name_is_binary = BinaryColumns::of(&[nullable_field("c_name", "binary")], false);
+    let filter = serde_json::json!({
+        "type": "predicate_equal",
+        "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+        "right": {"type": "literal_string", "value": "0a1b"},
+    });
+    let mut request = join_request(Json::Null, equi_condition());
+    request["pushdownRequest"]["filter"] = filter.clone();
+
+    let rendered = render_broadcast_join(
+        &request,
+        &pd(&request),
+        &detected_join(&request),
+        &c_name_is_binary,
+    )
+    .expect("disjoint, renderable join")
+    .expect("must render");
+    assert_eq!(
+        rendered.filter.as_deref(),
+        Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#)
+    );
+
+    let customer = involved_table_columns(&request, "CUSTOMER");
+    let (leg, declined) = type_screened_leg_filter(&filter, &customer, &c_name_is_binary);
+    assert!(declined.is_none(), "{declined:?}");
+    assert_eq!(
+        render_df_filter_safe(&leg.expect("the leg takes the comparison")).as_deref(),
+        Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#)
     );
 }

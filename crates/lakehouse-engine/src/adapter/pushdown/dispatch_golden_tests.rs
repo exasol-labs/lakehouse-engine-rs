@@ -288,6 +288,7 @@ fn dispatch_sql_widened(request: &Json) -> String {
         0.6,
         200,
         8,
+        false,
     )
     .expect("build_dispatch_sql must succeed for this fixture");
     result["sql"]
@@ -332,6 +333,7 @@ fn dispatch_sql_with_pushdown_req(
         0.6,
         200,
         8,
+        false,
     )
     .expect("build_dispatch_sql must succeed for this fixture");
     result["sql"]
@@ -875,6 +877,7 @@ fn join_scan_tuning() -> JoinScanRequestConfig<'static> {
         memory_pool_fraction: 0.6,
         instance_overhead_mb: 0,
         s3_max_connections: 1,
+        binary_as_string: false,
         connection: &super::test_support::TEST_CONNECTION,
     }
 }
@@ -891,7 +894,7 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     let request = two_table_join_request(None);
     let pushdown_req = pd(&request);
     let join = two_table_detected_join(&request);
-    let rendered = render_broadcast_join(&request, &pushdown_req, &join)
+    let rendered = render_broadcast_join(&request, &pushdown_req, &join, &BinaryColumns::default())
         .expect("render_broadcast_join must not error for a well-formed request")
         .expect("a disjoint-column, filterless equi-join must stay broadcast-eligible");
     let sides = JoinSides {
@@ -954,7 +957,7 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
     let request = two_table_join_request(Some(renderable_filter));
     let pushdown_req = pd(&request);
     let join = two_table_detected_join(&request);
-    let rendered = render_broadcast_join(&request, &pushdown_req, &join)
+    let rendered = render_broadcast_join(&request, &pushdown_req, &join, &BinaryColumns::default())
         .expect("render_broadcast_join must not error for a well-formed request")
         .expect("a disjoint-column equi-join with a rendering filter must stay broadcast-eligible");
     let sides = JoinSides {

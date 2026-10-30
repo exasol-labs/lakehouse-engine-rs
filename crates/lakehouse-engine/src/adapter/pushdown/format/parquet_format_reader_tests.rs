@@ -3,7 +3,7 @@ use super::*;
 use crate::adapter::column_notes::TableNotes;
 use crate::adapter::parquet_directory::MergeMode;
 use crate::adapter::pushdown::test_support::filter_json::{column, compare, equal, number};
-use crate::adapter::pushdown::test_support::{binary_refused, resolve_from_notes, sample_storage};
+use crate::adapter::pushdown::test_support::{resolve_from_notes, sample_storage, unread_refused};
 use crate::adapter::tests::parquet_fixture::{
     directory_options, enumerated_notes, in_memory_store, nullable, parquet_bytes,
     parquet_footer_bytes,
@@ -437,11 +437,8 @@ async fn resolve_footer(message: &str) -> Result<ResolvedScan, UdfError> {
     try_resolve(&store, &notes, None).await
 }
 
-/// Scenario: A direct-storage unannotated BYTE_ARRAY column is refused
-/// Scenario: A direct-storage ENUM column reads as text
-/// Scenario: A direct-storage UUID or unannotated fixed-length column is refused
 #[tokio::test]
-async fn each_binary_column_is_refused_by_name_and_an_enum_column_reads_as_text() {
+async fn binary_columns_declare_their_byte_types_and_only_geospatial_and_nested_enum_are_refused() {
     let scan = resolve_footer(
         "message events {
             OPTIONAL INT32 id;
@@ -456,29 +453,37 @@ async fn each_binary_column_is_refused_by_name_and_an_enum_column_reads_as_text(
             }
             OPTIONAL BYTE_ARRAY doc (BSON);
             OPTIONAL FIXED_LEN_BYTE_ARRAY (16) uid (UUID);
-            OPTIONAL FIXED_LEN_BYTE_ARRAY (16) digest;
+            OPTIONAL FIXED_LEN_BYTE_ARRAY (20) digest;
+            OPTIONAL BYTE_ARRAY shape (GEOMETRY);
         }",
     )
     .await
-    .expect("a directory with a mappable column plans, refusing only its binary columns");
+    .expect("a directory with binary columns plans");
 
     assert_eq!(
-        column_names(&scan),
-        vec!["id", "name", "kind"],
-        "a refused column stays declared in its note but is dropped from the logical schema"
-    );
-    assert_eq!(
-        scan.logical_schema[2].arrow_type, "utf8",
-        "a top-level ENUM is read as its UTF-8 text"
+        scan.logical_schema
+            .iter()
+            .map(|field| (field.name.as_str(), field.arrow_type.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("id", "int32"),
+            ("legacy_name", "binary"),
+            ("name", "utf8"),
+            ("kind", "utf8"),
+            ("s", "utf8"),
+            ("doc", "binary"),
+            ("uid", "fixed_size_binary(16)"),
+            ("digest", "fixed_size_binary(20)"),
+        ],
+        "a byte column keeps its byte type, a top-level ENUM reads as text, and a struct renders \
+         as JSON"
     );
     let refused =
-        |column, member_path, declared| binary_refused("Parquet", column, member_path, declared);
+        |column, member_path, declared| unread_refused("Parquet", column, member_path, declared);
     let nested_enum = refused("e", Some("e.k"), "enum");
     assert_eq!(
         scan.refused_columns,
         vec![
-            refused("legacy_name", None, "binary"),
-            refused("s", Some("s.raw"), "binary"),
             RefusedColumn {
                 reason: format!(
                     "{}; a Parquet ENUM is read as text only as a top-level, non-repeated column",
@@ -486,24 +491,7 @@ async fn each_binary_column_is_refused_by_name_and_an_enum_column_reads_as_text(
                 ),
                 ..nested_enum
             },
-            refused("doc", None, "bson"),
-            refused("uid", None, "uuid"),
-            refused("digest", None, "fixed(16)"),
+            refused("shape", None, "geometry"),
         ]
-    );
-
-    let error = resolve_footer(
-        "message events {
-            OPTIONAL BYTE_ARRAY payload;
-            OPTIONAL FIXED_LEN_BYTE_ARRAY (16) uid (UUID);
-        }",
-    )
-    .await
-    .expect_err("a directory with no mappable column cannot be scanned");
-    assert!(
-        error
-            .to_string()
-            .contains("virtual table 'EVENTS' has no mappable column"),
-        "{error}"
     );
 }

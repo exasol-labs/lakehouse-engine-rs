@@ -239,7 +239,7 @@ pub use lakehouse_catalog::{AdlsCred, CatalogProps, StorageBackend, StorageProps
 /// `arrow_type` is a compact tag (`types::mapping::arrow_type_to_tag` / `arrow_type_from_tag`):
 /// `"bool"`, `"int32"`, `"int64"`, `"float32"`, `"float64"`, `"utf8"`, `"date32"`,
 /// `"timestamp_us"`, `"timestamp_ns"`, `"timestamptz_us"`, `"timestamptz_ns"`,
-/// `"decimal128(p,s)"`.
+/// `"decimal128(p,s)"`, `"binary"`, `"fixed_size_binary(L)"`.
 ///
 /// # `initial_default`
 ///
@@ -846,6 +846,11 @@ pub struct CommonScanSpec {
     /// Concurrent connections held warm per host.
     #[serde(default = "default_s3_max_connections")]
     pub s3_max_connections: usize,
+
+    /// `BINARY_AS_STRING`: a top-level variable-length binary column reads as its UTF-8 text
+    /// instead of hex (`vs-adapter/binary-column-rendering`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub binary_as_string: bool,
 }
 
 impl CommonScanSpec {
@@ -891,6 +896,7 @@ impl Default for CommonScanSpec {
             memory_pool_fraction: default_memory_pool_fraction(),
             instance_overhead_mb: default_instance_overhead_mb(),
             s3_max_connections: 8,
+            binary_as_string: false,
         }
     }
 }

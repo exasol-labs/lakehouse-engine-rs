@@ -106,41 +106,50 @@ fn encoder_refuses_a_note_over_the_character_limit_naming_table_and_column() {
 }
 
 #[test]
-fn binary_refusal_names_the_label_column_member_and_declared_type() {
-    let whole = binary_refusal("Parquet", "blob", None, "binary");
-    assert!(whole.starts_with("Parquet column 'blob' has type 'binary'"));
-    assert!(whole.ends_with("tracked as issue #351"));
+fn an_unread_type_refusal_names_the_label_column_member_and_declared_type() {
+    let whole = column_refusal("Parquet", "shape", None, &unread_type_cause("geometry"));
+    assert_eq!(
+        whole,
+        "Parquet column 'shape' has type 'geometry', which this engine does not read"
+    );
 
-    let member = binary_refusal("Iceberg", "doc", Some("doc.raw"), "binary");
-    assert!(member.starts_with("Iceberg column 'doc', whose member 'doc.raw' has type 'binary'"));
+    let member = column_refusal(
+        "Iceberg",
+        "doc",
+        Some("doc.area"),
+        &unread_type_cause("geography"),
+    );
+    assert!(
+        member.starts_with("Iceberg column 'doc', whose member 'doc.area' has type 'geography'")
+    );
 }
 
 /// Scenario: A Delta table with no mappable column is refused as a whole
 #[test]
 fn a_table_is_refused_as_a_whole_only_when_every_column_is_refused() {
     let id = || ("ID", id_note());
-    let binary = || {
-        let reason = "binary is refused, see #351";
-        ("BINARY_COL", note("binary_col", None, Some(reason)))
+    let shape = || {
+        let reason = "geometry is not read";
+        ("SHAPE_COL", note("shape_col", None, Some(reason)))
     };
     let variant = (
         "VARIANT_COL",
         note("variant_col", None, Some("variant renders nothing")),
     );
 
-    declared_schema(vec![id(), binary()])
+    declared_schema(vec![id(), shape()])
         .expect("a table with a mappable column must not be refused as a whole");
     declared_schema(Vec::new())
         .expect("an empty schema with nothing refused must not be refused as a whole");
     let message = user_message(
-        declared_schema(vec![binary(), variant])
+        declared_schema(vec![shape(), variant])
             .expect_err("a table with zero mappable columns must be refused as a whole"),
     );
 
     assert_eq!(
         message,
-        "virtual table 'SALES' has no mappable column; every column is refused: 'binary_col': \
-         binary is refused, see #351; 'variant_col': variant renders nothing"
+        "virtual table 'SALES' has no mappable column; every column is refused: 'shape_col': \
+         geometry is not read; 'variant_col': variant renders nothing"
     );
 }
 

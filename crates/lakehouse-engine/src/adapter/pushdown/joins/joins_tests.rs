@@ -265,6 +265,7 @@ pub(super) fn two_scan_tuning() -> JoinScanRequestConfig<'static> {
         memory_pool_fraction: 0.6,
         instance_overhead_mb: 0,
         s3_max_connections: 1,
+        binary_as_string: false,
         connection: &crate::adapter::pushdown::test_support::TEST_CONNECTION,
     }
 }
@@ -296,7 +297,11 @@ fn golden_ineligible_decline_message_unchanged() {
 
 const CUSTOMER_COLUMNS: &[(&str, &str)] = &[("c_custkey", "long"), ("c_name", "string")];
 
-const ORDERS_COLUMNS: &[(&str, &str)] = &[("o_custkey", "long"), ("binary_col", "binary")];
+const ORDERS_COLUMNS: &[(&str, &str)] = &[("o_custkey", "long"), ("variant_col", "variant")];
+
+/// The log declares the refused column a string: a `variant` log needs the `variantType` feature,
+/// which the reader refuses as a whole table, while the notes alone decide the column's refusal.
+const ORDERS_LOG_COLUMNS: &[(&str, &str)] = &[("o_custkey", "long"), ("variant_col", "string")];
 
 fn delta_join_request(select_list: Json) -> Json {
     let request = delta_join_request_over(
@@ -306,7 +311,7 @@ fn delta_join_request(select_list: Json) -> Json {
         ]),
         serde_json::json!([
             {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-            {"name": "BINARY_COL", "dataType": {"type": "varchar", "size": 2000000}},
+            {"name": "VARIANT_COL", "dataType": {"type": "varchar", "size": 2000000}},
         ]),
         select_list,
     );
@@ -353,14 +358,14 @@ fn delta_join_request_over(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_delta_column_reached_through_a_join_leg_is_refused() {
     let catalog = unity_delta_catalog().await;
-    let storage = two_delta_legs_one_refusing_binary_col().await;
+    let storage = two_delta_legs_one_refusing_variant_col().await;
     let mappable = serde_json::json!([
         {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
         {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
     ]);
     let reaching_refused = serde_json::json!([
         {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-        {"type": "column", "name": "BINARY_COL", "tableName": "ORDERS"},
+        {"type": "column", "name": "VARIANT_COL", "tableName": "ORDERS"},
     ]);
 
     delta_pushdown(
@@ -381,7 +386,7 @@ async fn a_refused_delta_column_reached_through_a_join_leg_is_refused() {
     .await
     .expect_err("a join leg emitting the refused column must be refused, never answered empty");
 
-    assert_refuses_binary_col(error);
+    assert_refuses_variant_col(error);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -391,7 +396,7 @@ async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable
     let customer_columns = [
         ("c_custkey", "long"),
         ("c_name", "string"),
-        ("binary_col", "string"),
+        ("variant_col", "string"),
     ];
     let storage = delta_object_endpoint(vec![
         (
@@ -400,7 +405,7 @@ async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable
         ),
         (
             delta_commit_zero_key("orders"),
-            fileless_delta_commit("orders", ORDERS_COLUMNS),
+            fileless_delta_commit("orders", ORDERS_LOG_COLUMNS),
         ),
     ])
     .await;
@@ -408,14 +413,14 @@ async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable
         serde_json::json!([
             {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
             {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
-            {"name": "BINARY_COL", "dataType": {"type": "varchar", "size": 2000000}},
+            {"name": "VARIANT_COL", "dataType": {"type": "varchar", "size": 2000000}},
         ]),
         serde_json::json!([
             {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-            {"name": "BINARY_COL", "dataType": {"type": "varchar", "size": 2000000}},
+            {"name": "VARIANT_COL", "dataType": {"type": "varchar", "size": 2000000}},
         ]),
         serde_json::json!([
-            {"type": "column", "name": "BINARY_COL", "tableName": "CUSTOMER"},
+            {"type": "column", "name": "VARIANT_COL", "tableName": "CUSTOMER"},
         ]),
     );
     let request = with_delta_notes(request, "CUSTOMER", &customer_columns, &[]);
@@ -429,33 +434,33 @@ async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unqualified_column_reference_is_charged_to_every_join_side() {
     let catalog = unity_delta_catalog().await;
-    let storage = two_delta_legs_one_refusing_binary_col().await;
+    let storage = two_delta_legs_one_refusing_variant_col().await;
     let request = delta_join_request(serde_json::json!([
-        {"type": "column", "name": "BINARY_COL"},
+        {"type": "column", "name": "VARIANT_COL"},
     ]));
 
     let error = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
         .await
         .expect_err("a column reference naming no side must be charged to every side");
 
-    assert_refuses_binary_col(error);
+    assert_refuses_variant_col(error);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_select_star_join_is_refused_by_the_side_declaring_the_refused_column() {
     let catalog = unity_delta_catalog().await;
-    let storage = two_delta_legs_one_refusing_binary_col().await;
+    let storage = two_delta_legs_one_refusing_variant_col().await;
     let request = delta_join_request(Json::Null);
 
     let error = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
         .await
-        .expect_err("SELECT * emits ORDERS.BINARY_COL, which ORDERS refused");
+        .expect_err("SELECT * emits ORDERS.VARIANT_COL, which ORDERS refused");
 
-    assert_refuses_binary_col(error);
+    assert_refuses_variant_col(error);
 }
 
 /// Neither leg carries an active file.
-async fn two_delta_legs_one_refusing_binary_col() -> StorageBackend {
+async fn two_delta_legs_one_refusing_variant_col() -> StorageBackend {
     delta_object_endpoint(vec![
         (
             delta_commit_zero_key("customer"),
@@ -463,7 +468,7 @@ async fn two_delta_legs_one_refusing_binary_col() -> StorageBackend {
         ),
         (
             delta_commit_zero_key("orders"),
-            fileless_delta_commit("orders", ORDERS_COLUMNS),
+            fileless_delta_commit("orders", ORDERS_LOG_COLUMNS),
         ),
     ])
     .await

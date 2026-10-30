@@ -18,7 +18,7 @@
 * *THEN* the adapter SHALL fail the request for each rejected value with an error entry `invalid value '<value>' for '<name>': expected <accepted values>`
 * *AND* the entry SHALL echo at most the first 100 characters of the value, followed by `…` when the value is longer, and SHALL double each `'` in the echoed text, so a long value or a value with a quote keeps the error readable
 * *AND* the adapter SHALL reject a `MEMORY_POOL_FRACTION` value that is not a number greater than 0 and at most 1, expecting `a number greater than 0 and at most 1`, so `60` and `0` fail and `1` passes
-* *AND* the adapter SHALL reject a `DATAFUSION_THREADING_MODE` value other than `AUTO` or `FIXED`, expecting `AUTO or FIXED`, and an `ALLOW_HTTP` value other than `TRUE` or `FALSE`, expecting `TRUE or FALSE`, each compared without regard to case
+* *AND* the adapter SHALL reject a `DATAFUSION_THREADING_MODE` value other than `AUTO` or `FIXED`, expecting `AUTO or FIXED`, and an `ALLOW_HTTP` or `BINARY_AS_STRING` value other than `TRUE` or `FALSE`, expecting `TRUE or FALSE`, each compared without regard to case
 
 ### Scenario: A whole-number tuning value is checked against the range of its type
 
