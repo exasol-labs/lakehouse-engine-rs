@@ -418,7 +418,7 @@ pub(crate) async fn resolve_from_notes(
     notes: &TableNotes<'_>,
     filter_json: Option<&Json>,
 ) -> Result<ResolvedScan, UdfError> {
-    ResolvedScan::resolve(reader, notes.declared_schema()?, filter_json).await
+    ResolvedScan::resolve(reader, notes.declared_schema()?, filter_json, false).await
 }
 
 /// [`resolve_from_notes`] over the notes CREATE records for `table`, involved as `name`.

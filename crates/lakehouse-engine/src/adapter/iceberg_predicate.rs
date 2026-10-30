@@ -5,6 +5,7 @@ use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::{Datum, PrimitiveType, Schema};
 use serde_json::Value as Json;
 
+use crate::adapter::pushdown::literal_binary_bytes;
 use crate::scan::spec::LogicalField;
 use crate::types::mapping::timestamp_literal_digits;
 
@@ -83,6 +84,15 @@ fn literal_to_datum(lit: &Json, prim: &PrimitiveType) -> Option<Datum> {
         ("literal_timestamp_utc", PrimitiveType::Timestamptz | PrimitiveType::TimestamptzNs) => {
             let s = lit.get("value")?.as_str()?;
             (timestamp_literal_digits(s) <= 6).then(|| parse_timestamptz(s, prim))?
+        }
+
+        ("literal_binary", PrimitiveType::Binary) => literal_binary_bytes(lit).map(Datum::binary),
+        ("literal_binary", PrimitiveType::Fixed(width)) => literal_binary_bytes(lit)
+            .filter(|bytes| u64::try_from(bytes.len()).ok() == Some(*width))
+            .map(Datum::fixed),
+        // `uuid` parses the 32 hex digits the column renders.
+        ("literal_binary", PrimitiveType::Uuid) => {
+            Datum::uuid_from_str(lit.get("value")?.as_str()?).ok()
         }
 
         _ => None,

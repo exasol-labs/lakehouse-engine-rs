@@ -8,16 +8,16 @@ use crate::common::seed::{
     ALL_TYPES_IDS_TEXT, BINARY_MAP_VALUES_TEXT, BINARY_VALUES_TEXT, BOOLEAN_VALUES_TEXT,
     DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT,
     DECIMAL_38_10_VALUES_TEXT, DIM_CUSTOMER_ROWS, E2E_ALL_TYPES_TABLE, E2E_BINARY_VALUES_TABLE,
-    E2E_EVO_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2, EVO_INITDEF_POST_ADD_IDS,
-    EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL,
-    EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FIXED_16_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT32_VALUES_TEXT,
-    LINEITEM_ROWS, LINES_PER_ORDER, OVERSIZED_BINARY_BYTES, PART_CENTRAL_IDS, PART_COL,
-    PART_NORTH_IDS, PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH,
-    PART_VALUES, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS,
-    STRUCT_BINARY_VALUES_TEXT, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT, TYPED_COL_DECIMAL_A,
-    TYPED_COL_DECIMAL_B, UUID_MAP_VALUES_TEXT, initdef_columns, seed_added_columns_initial_default,
-    seed_renamed_column, typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev,
-    typed_id_avg_stddev,
+    E2E_EVO_TABLE, E2E_IDENT_PART_BYTES_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE,
+    E2E_TABLE_2, EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE,
+    EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FIXED_16_VALUES_TEXT,
+    FLOAT32_VALUES_TEXT, INT32_VALUES_TEXT, LINEITEM_ROWS, LINES_PER_ORDER, OVERSIZED_BINARY_BYTES,
+    PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE, PART_TOTAL_ROWS,
+    PART_VAL_CENTRAL, PART_VAL_NORTH, PART_VALUES, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15,
+    SEED_TOTAL_ROWS, STRUCT_BINARY_VALUES_TEXT, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
+    TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, UUID_MAP_VALUES_TEXT, initdef_columns,
+    seed_added_columns_initial_default, seed_renamed_column, typed_decimal_a_avg_stddev,
+    typed_decimal_b_avg_stddev, typed_id_avg_stddev,
 };
 use crate::common::stack::{exasol_container, iceberg_catalog_url, iceberg_catalog_url_internal};
 use crate::common::timestamp_precision::{
@@ -270,6 +270,98 @@ fn iceberg_binary_columns_read_and_filter_as_lowercase_hex() {
         &format!("SELECT C_OVERSIZED FROM {binary_values} WHERE ID = 2"),
         &[[None::<&str>]],
     );
+}
+
+/// The `ID`s `sql` returns, sorted.
+fn sorted_ids(conn: &mut ExaConn, sql: &str) -> Vec<Option<String>> {
+    let mut ids = text_column(&conn.query_columns(sql)[0]);
+    ids.sort();
+    ids
+}
+
+/// Scenario: A hex-literal filter on a binary column prunes files at plan time
+#[test]
+fn a_hex_literal_on_a_binary_partition_column_prunes_files_at_plan_time() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let table = format!(
+        "{LAKEHOUSE_VS}.{}",
+        E2E_IDENT_PART_BYTES_TABLE.to_uppercase()
+    );
+    let [Some(fixed), Some(other), _] = FIXED_16_VALUES_TEXT else {
+        unreachable!("the first two fixed values are non-NULL")
+    };
+
+    // Of the three files, two hold `B = '00abff'` and `F = <fixed>`, and one only NULLs.
+    for (filter, files, ids) in [
+        (
+            "ID > 0".to_string(),
+            3,
+            vec![Some("1"), Some("2"), Some("3")],
+        ),
+        (format!("F = '{fixed}'"), 2, vec![Some("1"), Some("2")]),
+        ("B = '00abff'".to_string(), 2, vec![Some("1"), Some("2")]),
+        (
+            format!("F IN ('{fixed}', '{other}')"),
+            2,
+            vec![Some("1"), Some("2")],
+        ),
+        (format!("F = '{other}'"), 0, vec![]),
+        ("B = '00ABFF'".to_string(), 3, vec![]),
+    ] {
+        let sql = format!("SELECT ID FROM {table} WHERE {filter}");
+        let pushed = explain_virtual_pushdown_sql(&mut conn, &sql);
+        assert_eq!(
+            pushed.matches(".parquet").count(),
+            files,
+            "WHERE {filter} must plan {files} files: {pushed}"
+        );
+        let ids: Vec<Option<String>> = ids.into_iter().map(|id| id.map(String::from)).collect();
+        assert_eq!(sorted_ids(&mut conn, &sql), ids, "WHERE {filter}");
+    }
+    assert_eq!(
+        sorted_ids(
+            &mut conn,
+            &format!("SELECT ID FROM {table} WHERE NOT (F = '{fixed}') OR B IS NULL")
+        ),
+        vec![Some("3".to_string())],
+        "a pruned NOT must keep the file whose rows it selects"
+    );
+}
+
+/// Scenario: A filter on a binary column selects what native Exasol selects over the hex text
+#[test]
+fn a_join_compares_a_binary_filter_on_the_raw_bytes_on_both_join_paths() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let parts = format!(
+        "{LAKEHOUSE_VS}.{}",
+        E2E_IDENT_PART_BYTES_TABLE.to_uppercase()
+    );
+    let all_types = format!("{LAKEHOUSE_VS}.{}", E2E_ALL_TYPES_TABLE.to_uppercase());
+    let [Some(fixed), ..] = FIXED_16_VALUES_TEXT else {
+        unreachable!("the first fixed value is non-NULL")
+    };
+    let expected = vec![Some("1".to_string()), Some("2".to_string())];
+
+    // Disjoint column names, so the join is broadcast.
+    let broadcast = format!(
+        "SELECT P.ID FROM {parts} P JOIN {} O ON P.ID = O.O_ORDERKEY WHERE P.F = '{fixed}'",
+        vs_fact_table()
+    );
+    let pushed = explain_virtual_sql(&mut conn, &broadcast);
+    assert!(has_broadcast_join_block(&pushed), "{pushed}");
+    assert!(pushed.contains("_LH_BYTES_F"), "{pushed}");
+    assert_eq!(sorted_ids(&mut conn, &broadcast), expected);
+
+    // Both tables carry `ID`, so the join falls back to one scan per table, joined on hex text.
+    let n_scan = format!(
+        "SELECT P.ID FROM {parts} P JOIN {all_types} A ON P.B = A.C_BINARY WHERE P.F = '{fixed}'"
+    );
+    let pushed = explain_virtual_sql(&mut conn, &n_scan);
+    assert!(has_n_scan_wrapper(&pushed, 2), "{pushed}");
+    assert!(pushed.contains("_LH_BYTES_F"), "{pushed}");
+    assert_eq!(sorted_ids(&mut conn, &n_scan), expected);
 }
 
 /// Scenario: Filter predicate restricts the emitted rows

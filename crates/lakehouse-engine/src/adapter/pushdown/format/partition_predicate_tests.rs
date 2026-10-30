@@ -541,3 +541,46 @@ fn an_empty_partition_value_is_null_as_the_scan_reads_it() {
         );
     }
 }
+
+/// Scenario: A hex-literal filter on a binary column prunes files at plan time
+#[test]
+fn a_binary_literal_compares_a_logged_value_by_its_utf8_bytes() {
+    let declared = [("PART".to_string(), DataType::Binary)];
+    let files = [
+        file_with("part", Some("AB")),
+        file_with("part", Some("ab")),
+        file_with("part", Some("")),
+        file_with("part", None),
+    ];
+    let bytes = |hex: &str| json!({"type": "literal_binary", "value": hex});
+
+    assert_eq!(
+        kept_under(
+            &compare("predicate_equal", column("PART"), bytes("4142")),
+            &declared,
+            &files
+        ),
+        [true, false, false, false],
+        "'AB' logs the bytes 41 42, and an empty value reads NULL"
+    );
+    assert_eq!(
+        kept_under(
+            &json!({
+                "type": "predicate_not",
+                "expression": compare("predicate_greater", column("PART"), bytes("4142")),
+            }),
+            &declared,
+            &files
+        ),
+        [true, false, false, false]
+    );
+    assert_eq!(
+        kept_under(
+            &compare("predicate_equal", column("PART"), string("4142")),
+            &declared,
+            &files
+        ),
+        [true; 4],
+        "only the retyped literal names bytes"
+    );
+}

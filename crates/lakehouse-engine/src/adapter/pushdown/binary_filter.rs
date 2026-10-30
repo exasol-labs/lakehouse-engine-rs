@@ -139,6 +139,67 @@ fn byte_literal(node: &Json, width: Option<i32>) -> Option<Json> {
     })
 }
 
+/// For format-level pruning: retypes each hex literal a binary column is compared with, at any
+/// depth. The raw bytes differ from the hex text only on an empty value, which the text reads as
+/// NULL, so the retyped tree is TRUE on every row the original is and never prunes a match.
+pub(crate) fn with_binary_literals(mut node: Json, columns: &BinaryColumns) -> Json {
+    retype_binary_literals(&mut node, columns);
+    node
+}
+
+fn retype_binary_literals(node: &mut Json, columns: &BinaryColumns) {
+    let operands: &[&str] = match node.get("type").and_then(Json::as_str) {
+        Some("predicate_and" | "predicate_or") => {
+            if let Some(Json::Array(children)) = node.get_mut("expressions") {
+                for child in children {
+                    retype_binary_literals(child, columns);
+                }
+            }
+            return;
+        }
+        Some("predicate_not") => {
+            if let Some(child) = node.get_mut("expression") {
+                retype_binary_literals(child, columns);
+            }
+            return;
+        }
+        Some("predicate_in_constlist") => &["expression", "arguments"],
+        Some("predicate_between") => &["expression", "left", "right"],
+        Some(kind) if Comparison::from_node_type(kind).is_some() => &["left", "right"],
+        _ => return,
+    };
+    let Some((_, width)) = operands
+        .iter()
+        .filter_map(|key| columns.resolve(node.get(*key)?))
+        .next()
+    else {
+        return;
+    };
+    for key in operands {
+        match node.get_mut(*key) {
+            Some(Json::Array(values)) => values
+                .iter_mut()
+                .for_each(|value| retype_literal(value, width)),
+            Some(operand) => retype_literal(operand, width),
+            None => {}
+        }
+    }
+}
+
+fn retype_literal(node: &mut Json, width: Option<i32>) {
+    if let Some(literal) = byte_literal(node, width) {
+        *node = literal;
+    }
+}
+
+/// The bytes of a `literal_binary` node that [`with_binary_literals`] wrote.
+pub(crate) fn literal_binary_bytes(node: &Json) -> Option<Vec<u8>> {
+    if node.get("type")?.as_str()? != "literal_binary" {
+        return None;
+    }
+    hex::decode(node.get("value")?.as_str()?).ok()
+}
+
 #[cfg(test)]
 #[path = "binary_filter_tests.rs"]
 mod tests;

@@ -20,7 +20,7 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 mod binary_filter;
-pub(crate) use binary_filter::BinaryColumns;
+pub(crate) use binary_filter::{BinaryColumns, literal_binary_bytes};
 
 mod support;
 pub use support::{AggregateMergeInputs, build_fan_out_inner, build_scan_driving_sql, shard_count};

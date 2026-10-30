@@ -59,6 +59,7 @@ Renders every list, struct, and map column as one valid JSON document per value,
 * *WHEN* the scan renders that column
 * *THEN* the renderer SHALL replace the key child array with a `Utf8` array of stringified keys BEFORE encoding, and the rendered object name SHALL be that string, `42` for the integer key `42`, `true` for the boolean key `true`, `2026-08-18` for that date key
 * *AND* a NESTED key type SHALL be stringified as its own JSON rendering, so a `Struct` key becomes the object name `{"a":1}`, one rule covering every type the spec permits, with no key type left unhandled
+* *AND* a `Binary`, `LargeBinary`, `BinaryView`, or `FixedSizeBinary` key SHALL be stringified as its lowercase hex per `vs-adapter/binary-column-rendering`, because the cast would decode the bytes as text
 * *AND* every other key type SHALL be stringified through the Arrow-to-`Utf8` cast, and a key type that cast rejects SHALL surface a clean error naming the key type, never a wrong value
 * *AND* the key strings SHALL be escaped as JSON object names by the same encoder that escapes string values, so a key containing `"` or `\` yields a valid document
 * *AND* an ARRAY-OF-PAIRS shape (`[{"key":42,"value":"v"}]`) MUST NOT be produced, because it would make the emitted VARCHAR unreadable by an Exasol JSON path expression, which is the whole reason the column is surfaced as JSON at all

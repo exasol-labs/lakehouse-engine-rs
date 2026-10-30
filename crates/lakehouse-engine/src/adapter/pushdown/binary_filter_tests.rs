@@ -138,3 +138,73 @@ fn binary_as_string_keeps_a_variable_length_filter_on_the_text() {
         "a fixed-length column keeps its hex rendering and its byte comparison"
     );
 }
+
+fn equal(column_name: &str, hex: &str) -> Json {
+    compare("predicate_equal", column(column_name), text(hex))
+}
+
+/// Scenario: A hex-literal filter on a binary column prunes files at plan time
+#[test]
+fn pruning_retypes_the_hex_literals_of_a_binary_column_at_any_depth() {
+    let filter = json!({
+        "type": "predicate_not",
+        "expression": {"type": "predicate_or", "expressions": [
+            equal("B", "0a1b"),
+            equal("U", "0a0b"),
+            {"type": "predicate_between", "expression": column("B"),
+             "left": text("00"), "right": text("ff")},
+            {"type": "predicate_in_constlist", "expression": column("B"),
+             "arguments": [text("0a"), text("0A")]},
+        ]},
+    });
+    assert_eq!(
+        with_binary_literals(filter, &columns()),
+        json!({
+            "type": "predicate_not",
+            "expression": {"type": "predicate_or", "expressions": [
+                compare("predicate_equal", column("B"), json!({"type": "literal_binary", "value": "0a1b"})),
+                compare("predicate_equal", column("U"),
+                    json!({"type": "literal_binary", "value": "0a0b", "width": 2})),
+                {"type": "predicate_between", "expression": column("B"),
+                 "left": {"type": "literal_binary", "value": "00"},
+                 "right": {"type": "literal_binary", "value": "ff"}},
+                {"type": "predicate_in_constlist", "expression": column("B"),
+                 "arguments": [{"type": "literal_binary", "value": "0a"}, text("0A")]},
+            ]},
+        }),
+        "the column keeps its name, and an uppercase literal stays text"
+    );
+}
+
+#[test]
+fn pruning_leaves_text_columns_and_mismatched_literals_alone() {
+    for (filter, under_binary_as_string) in [
+        (equal("S", "0a"), false),
+        (equal("U", "0a"), false),
+        (equal("B", "0a1"), false),
+        (equal("B", "0a"), true),
+    ] {
+        assert_eq!(
+            with_binary_literals(filter.clone(), &columns_under(under_binary_as_string)),
+            filter
+        );
+    }
+    assert_eq!(
+        with_binary_literals(equal("U", "0a0b"), &columns_under(true)),
+        compare(
+            "predicate_equal",
+            column("U"),
+            json!({"type": "literal_binary", "value": "0a0b", "width": 2})
+        ),
+        "BINARY_AS_STRING leaves a fixed column hex"
+    );
+}
+
+#[test]
+fn a_binary_literal_carries_its_bytes() {
+    assert_eq!(
+        literal_binary_bytes(&json!({"type": "literal_binary", "value": "00abff"})),
+        Some(vec![0x00, 0xab, 0xff])
+    );
+    assert_eq!(literal_binary_bytes(&text("00abff")), None);
+}

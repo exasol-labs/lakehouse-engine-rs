@@ -50,6 +50,7 @@ pub(crate) fn render_broadcast_join(
     request: &Json,
     pushdown_req: &Json,
     join: &DetectedJoin,
+    binary_columns: &BinaryColumns,
 ) -> Result<Option<RenderedJoinPushdown>, UdfError> {
     let left_cols = involved_table_columns(request, &join.tables[0].table_name);
     let right_cols = involved_table_columns(request, &join.tables[1].table_name);
@@ -67,8 +68,7 @@ pub(crate) fn render_broadcast_join(
     let col_types = join_col_types(request, join);
     let bare_pushdown_req = strip_table_alias(pushdown_req);
     let bare_filter_json = bare_pushdown_req.get("filter").filter(|f| !f.is_null());
-    let (filter, declined) =
-        classify_where_filter(bare_filter_json, &col_types, &BinaryColumns::default());
+    let (filter, declined) = classify_where_filter(bare_filter_json, &col_types, binary_columns);
     if declined.is_some() {
         return Ok(None);
     }
@@ -346,7 +346,11 @@ pub(in super::super) fn build_n_scan_join_sql(
             .as_ref()
             .and_then(|f| leg_local_filter(f, &legs, i))
         {
-            Some(side_local) => type_screened_leg_filter(&side_local, &cols_per_side[i]),
+            Some(side_local) => type_screened_leg_filter(
+                &side_local,
+                &cols_per_side[i],
+                &BinaryColumns::of(&side.logical_schema, inputs.binary_as_string),
+            ),
             None => (None, None),
         };
         // Disjoint by attribution, so no conjunct is double-applied.

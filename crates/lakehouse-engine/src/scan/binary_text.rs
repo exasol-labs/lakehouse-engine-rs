@@ -1,6 +1,5 @@
-//! Reads stored bytes as UTF-8 text, failing on the first invalid value. DataFusion's cast from a
-//! binary column to text does not validate, and arrow-rs validates only an annotated `STRING`
-//! column on read, so every bytes-to-text read of the scan goes through here.
+//! Reads a `BINARY_AS_STRING` column's bytes as UTF-8 text, failing on the first invalid value
+//! with an error naming the column. arrow-rs validates UTF-8 on read only for annotated `STRING`.
 
 use arrow::array::cast::AsArray;
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};

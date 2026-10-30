@@ -106,3 +106,10 @@ Reads a data file whose physical column type is narrower than the table's curren
 * *AND* it SHALL return the shared type unchanged for two EQUAL types, so an unevolved column costs no special case at the caller
 * *AND* it MUST NOT consult `arrow::compute::can_cast_types`, because that function also accepts narrowing casts no format permits, which is the recorded reason the supported set is decided at plan time
 * *AND* it MUST NOT add, remove, or parameterize a row of the supported-set table, so `long` → `double` stays absent and this scenario changes no scan-time answer
+
+### Scenario: A catalog string column over binary file data reads as text
+
+* *GIVEN* a Glue Parquet table whose catalog declares `name string`, and a data file that stores `name` as a Parquet `BYTE_ARRAY` without the string annotation
+* *WHEN* a query reads `name`
+* *THEN* the scan SHALL render it as text, because the catalog declares it a string
+* *AND* a value that is not valid UTF-8 SHALL fail the query and MUST NOT be returned altered

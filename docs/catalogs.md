@@ -702,11 +702,12 @@ Exasol has no binary type, so every source reads a binary column as lowercase he
 | Iceberg, Delta, Unity Catalog, and Glue `binary`, Parquet unannotated `BYTE_ARRAY` and `BSON` | `VARCHAR(2000000)` |
 
 - An empty value reads as NULL, as an empty `VARCHAR` does in Exasol.
+- A `uuid` reads as 32 hex digits, such as `f79c3e09677c4bbda4793f349cb785e7`, not as the hyphenated form that Spark and Trino display. `CAST(col AS HASHTYPE)` accepts it.
 - A value longer than 1,000,000 bytes fails the query. The error names the column and the value's size.
 - A binary member of a nested column, or a binary map key, renders as a hex JSON string.
 - A binary partition column reads its partition value as the same hex.
 - A filter, `ORDER BY`, `MIN`, or `MAX` on the column returns what native Exasol returns over the same hex text. Lowercase hex sorts in byte order.
-- A comparison with a lowercase hex literal of even length, such as `WHERE payload = '00abff'`, compares the raw bytes in the scan, so file statistics still prune. Any other literal compares the hex text, and `'00ABFF'` matches nothing.
+- A comparison with a lowercase hex literal of even length, such as `WHERE payload = '00abff'`, compares the raw bytes, so partition values, Iceberg partition transforms such as `bucket`, and file statistics still prune, also in a join. Any other literal compares the hex text, and `'00ABFF'` matches nothing.
 
 `BINARY_AS_STRING = 'TRUE'` reads every top-level variable-length binary column of the virtual schema as UTF-8 text, like Spark's `spark.sql.parquet.binaryAsString`. Use it for files that a legacy writer such as Impala or Hive stored as unannotated `BYTE_ARRAY` strings. A value that is not valid UTF-8 fails the query with an error that names the column. Fixed-length binary, `uuid`, and binary members of nested columns stay hex. Filters on a text column compare the text, so they no longer prune by file statistics. The property applies from the next query after `ALTER VIRTUAL SCHEMA ... SET`, without a `REFRESH`.
 

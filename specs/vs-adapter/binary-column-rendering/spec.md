@@ -6,8 +6,9 @@ A binary column reads as lowercase hexadecimal text on every source and at every
 
 * Iceberg declares three binary types: `binary`, `fixed(L)`, and `uuid` (Iceberg table spec, Primitive Types). Delta, Unity Catalog, and Glue declare one, `binary`.
 * A catalog-declared source decides by its declared type, never by a data file's physical type.
-* Direct storage declares no table type, so it decides by what each Parquet file declares. The locked `parquet` crate folds an unannotated `BYTE_ARRAY` and the `BSON`, `ENUM`, `GEOMETRY`, and `GEOGRAPHY` annotations to Arrow `Binary`, and a `UUID`-annotated or unannotated `FIXED_LEN_BYTE_ARRAY(L)` to `FixedSizeBinary(L)`.
+* Direct storage declares no table type, so it decides by each Parquet file's annotation: an unannotated `BYTE_ARRAY`, a `BSON`, a `UUID`, and an unannotated `FIXED_LEN_BYTE_ARRAY(L)` are binary. An `ENUM` is text (Parquet LogicalTypes § ENUM).
 * Exasol rejects `HASHTYPE` as a UDF output type, so the column is declared `VARCHAR`.
+* Named trade-off: the Iceberg spec's JSON single-value serialization (Appendix D) writes a `uuid` as its 36-character hyphenated string, and iceberg-java engines display it that way. The engine renders a `uuid` as 32 lowercase hex digits like every other binary value, so it casts to `HASHTYPE`.
 * Exasol stores an empty `VARCHAR` as NULL, so an empty binary value reads as NULL.
 * Lowercase hex sorts in the order of the bytes, so a range filter, `MIN`, `MAX`, and `ORDER BY` over the text match the bytes.
 * Exasol pushes a filter literal on a binary column as a plain string literal. Exasol compares strings case-sensitively, and only lowercase hex of whole bytes names a byte string.
@@ -35,12 +36,18 @@ A binary column reads as lowercase hexadecimal text on every source and at every
 ### Scenario: A filter on a binary column selects what native Exasol selects over the hex text
 
 * *GIVEN* a binary column and a native Exasol copy of its hex text
-* *WHEN* a query filters the column with `=`, `<>`, `<`, `<=`, `>`, `>=`, `IN`, `BETWEEN`, `IS NULL`, `IS NOT NULL`, `LIKE`, a string function, `NOT`, `OR`, an uppercase or odd-length literal, or orders or aggregates it with `ORDER BY`, `MIN`, or `MAX`
+* *WHEN* a query on the table alone or joined to another filters the column with `=`, `<>`, `<`, `<=`, `>`, `>=`, `IN`, `BETWEEN`, `IS NULL`, `IS NOT NULL`, `LIKE`, a string function, `NOT`, `OR`, an uppercase or odd-length literal, or orders or aggregates it with `ORDER BY`, `MIN`, or `MAX`
 * *THEN* the query SHALL return the rows the same query returns on the native copy
-* *AND* a comparison, `IN`, or `BETWEEN` against a lowercase hex literal of whole bytes, which the filter's root reaches through `AND` and `OR` only, SHALL compare the raw bytes with a binary literal, so Parquet statistics prune and row filtering stays on
-* *AND* such a comparison on a variable-length column whose operator admits the empty value (`<>`, `<`, `<=`) SHALL also require a non-empty value
-* *AND* a `fixed(L)` column SHALL compare the raw bytes only against a literal of `L` bytes
+* *AND* a comparison, `IN`, or `BETWEEN` against a lowercase hex literal of whole bytes, which the filter's root reaches through `AND` and `OR` only, SHALL compare the raw bytes, so Parquet statistics prune and row filtering stays on, for a broadcast join and for the one-scan-per-table join as for a single table
 * *AND* every other use SHALL operate on the hex text, with row filtering on and statistics pruning lost
+
+### Scenario: A hex-literal filter on a binary column prunes files at plan time
+
+* *GIVEN* an Iceberg table identity-partitioned on a `binary` and a `fixed(16)` column, a Delta table, and a Unity Catalog or Glue Parquet table each partitioned on a `binary` column
+* *WHEN* a query filters a binary column with `=`, `<`, `<=`, `>`, `>=`, `IN`, or `BETWEEN` against a lowercase hex literal of whole bytes, at any depth under `AND`, `OR`, and `NOT`
+* *THEN* the adapter SHALL plan only the files whose partition values, partition transforms, or column bounds can hold a matching value, comparing the raw bytes
+* *AND* the query SHALL return the rows native Exasol returns over the hex text, because the raw bytes differ from the hex text only on an empty value, which the text reads as NULL
+* *AND* an uppercase or odd-length literal, a `fixed(L)` literal of another length than `L`, and a variable-length column under `BINARY_AS_STRING` SHALL prune nothing
 
 ### Scenario: A binary value too long for its hex rendering fails the query
 
@@ -53,19 +60,11 @@ A binary column reads as lowercase hexadecimal text on every source and at every
 
 * *GIVEN* a virtual schema whose `BINARY_AS_STRING` property is `TRUE`
 * *WHEN* a query reads, filters, or aggregates a top-level variable-length binary column of any table and source
-* *THEN* the adapter SHALL pass the property to the scan as a flag, and the declared column type SHALL stay `VARCHAR(2000000)`
-* *AND* the scan SHALL keep the column's type binary and convert each value to text through a function that validates it, reusing the binary buffers without copying
+* *THEN* the column SHALL return each value as its UTF-8 text, and its declared type SHALL stay `VARCHAR(2000000)`
 * *AND* a value that is not valid UTF-8 SHALL fail the query with an error naming the column, also when the query filters or aggregates the column without returning it, and MUST NOT be returned altered or as NULL
-* *AND* the column's filters SHALL use plain string semantics, with row filtering on, and the adapter MUST NOT rewrite them into byte comparisons
+* *AND* the column's filters SHALL use plain string semantics
 * *AND* a `fixed(L)` or `uuid` column, and a binary member of a nested column, SHALL keep its hex rendering
 * *AND* a change of the property through `ALTER VIRTUAL SCHEMA ... SET` SHALL apply from the next query, with no `REFRESH`
-
-### Scenario: A catalog string column over binary file data reads as text
-
-* *GIVEN* a Glue Parquet table whose catalog declares `name string`, and a data file that stores `name` as a Parquet `BYTE_ARRAY` without the string annotation
-* *WHEN* a query reads `name`
-* *THEN* the scan SHALL render it as text (`scan-types/type-relaxation`), because the catalog declares it a string
-* *AND* a value that is not valid UTF-8 SHALL fail the query and MUST NOT be returned altered
 
 ### Scenario: A direct-storage ENUM column reads as text
 
@@ -73,10 +72,3 @@ A binary column reads as lowercase hexadecimal text on every source and at every
 * *WHEN* the pushdown plans `SELECT id, kind` and `SELECT s`
 * *THEN* `SELECT id, kind` SHALL succeed and return each `kind` value as its UTF-8 text
 * *AND* `SELECT s` SHALL fail at plan time with a reason naming `s`, the member `k`, and the type `enum`, because the JSON renderer would print the member's text as hex
-
-### Scenario: A geospatial column is refused
-
-* *GIVEN* an Iceberg `geometry` or `geography` column, or a direct-storage `GEOMETRY`- or `GEOGRAPHY`-annotated column, at any depth
-* *WHEN* the pushdown plans a request that reads or emits the column
-* *THEN* the request SHALL fail at plan time with a reason naming the column, the member when the column nests one, and the type
-* *AND* the listing SHALL still declare the column `VARCHAR(2000000)`

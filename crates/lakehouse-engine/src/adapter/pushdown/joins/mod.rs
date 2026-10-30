@@ -6,11 +6,11 @@ use exasol_udf_sdk::error::UdfError;
 use futures::future::try_join_all;
 use serde_json::Value as Json;
 
-use super::ConnectionStorage;
 use super::empty_result::empty_result_sql;
 use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
 use super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident};
+use super::{BinaryColumns, ConnectionStorage};
 
 mod attribution;
 mod planning;
@@ -211,8 +211,13 @@ pub(super) async fn plan_join(
     if join.tables.len() == 2 && is_equi && !matches!(window, JoinWindowPlan::ExasolPostProcessed) {
         let candidate =
             select_broadcast_sides(sides[0].clone(), sides[1].clone(), join_broadcast_max_bytes);
+        let binary_columns = BinaryColumns::of(
+            &[sides[0].logical_schema.as_slice(), &sides[1].logical_schema].concat(),
+            inputs.binary_as_string,
+        );
         if candidate.broadcast_eligible
-            && let Some(rendered) = render_broadcast_join(request, pushdown_req, join)?
+            && let Some(rendered) =
+                render_broadcast_join(request, pushdown_req, join, &binary_columns)?
             && let Some(sql) = build_broadcast_join_sql(
                 &candidate,
                 &rendered,

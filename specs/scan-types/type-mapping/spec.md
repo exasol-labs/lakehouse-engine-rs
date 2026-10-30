@@ -131,3 +131,10 @@ Defines the single mapping from DataFusion/Arrow column types to Exasol SQL type
 * *AND* the renderer MUST NOT fall back to the string tag for a type the classifier ADMITS, because that fallback declares the column `VARCHAR(2000000)` and registers it as a string with no error anywhere, which is what a Spark-written `INT64 TIMESTAMP(MILLIS)` column would otherwise receive
 * *AND* the string tag SHALL remain the answer for every type the classifier REFUSES, so a nested or otherwise unrepresentable type keeps its recorded JSON-VARCHAR path unchanged, except the binary types: `Binary`, `LargeBinary`, and `BinaryView` SHALL render the tag `binary`, and `FixedSizeBinary(L)` the tag `fixed_size_binary(L)`, so the scan reads the bytes and never decodes them as text
 * *AND* every recorded tag spelling SHALL be UNCHANGED and every recorded parse answer SHALL stay byte-identical, so a scan spec written before this extension deserializes to the same Arrow types
+
+### Scenario: A geospatial column is refused
+
+* *GIVEN* an Iceberg `geometry` or `geography` column, or a direct-storage `GEOMETRY`- or `GEOGRAPHY`-annotated column, at any depth
+* *WHEN* the pushdown plans a request that reads or emits the column
+* *THEN* the request SHALL fail at plan time with a reason naming the column, the member when the column nests one, and the type
+* *AND* the listing SHALL still declare the column `VARCHAR(2000000)`
