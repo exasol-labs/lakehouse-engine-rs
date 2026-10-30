@@ -10,27 +10,25 @@ use crate::sigv4::required_signing_region;
 use exasol_udf_sdk::error::UdfError;
 
 /// Strips the literal auth values too, so a value echoed without a recognizable
-/// label cannot leak.
-pub(crate) fn redact_catalog_auth_error(msg: &str, creds: &ConnectionCreds) -> String {
-    let mut secrets: Vec<String> = Vec::new();
-    if let Some(token) = non_empty(&creds.token) {
-        secrets.push(token.to_string());
-    }
-    if let Some(secret) = non_empty(&creds.client_secret) {
+/// label cannot leak. The bearer goes first, so a field value it contains cannot split it.
+pub(crate) fn redact_catalog_auth_error(
+    msg: &str,
+    creds: &ConnectionCreds,
+    bearer: Option<&str>,
+) -> String {
+    let secrets: Vec<&str> = [
+        bearer,
+        creds.token.as_deref(),
         // Stripping the bare secret also covers the joined `<id>:<secret>` credential.
-        secrets.push(secret.to_string());
-    }
-    if let Some(id) = non_empty(&creds.client_id) {
-        secrets.push(id.to_string());
-    }
-    if let Some(uri) = non_empty(&creds.oauth2_server_uri) {
-        secrets.push(uri.to_string());
-    }
-    if let Some(scope) = non_empty(&creds.scope) {
-        secrets.push(scope.to_string());
-    }
-    let secret_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
-    redact_error_text(msg, &secret_refs)
+        creds.client_secret.as_deref(),
+        creds.client_id.as_deref(),
+        creds.oauth2_server_uri.as_deref(),
+        creds.scope.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    redact_error_text(msg, &secrets)
 }
 
 /// Resolved once per query; authenticates every self-issued catalog request

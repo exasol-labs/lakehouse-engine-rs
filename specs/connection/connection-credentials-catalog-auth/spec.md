@@ -65,6 +65,15 @@ Carries the REST-catalog authentication credentials on the resolved CONNECTION. 
 * *AND* every combination the validation rules reject SHALL classify as the NO-AUTH mode, and the function's doc comment SHALL name those rules as its enforcer, so a credential set that reached a consumer without passing validation surfaces as the catalog's own authentication failure rather than as a silently chosen credential the operator never unambiguously supplied
 * *AND* no `token`, `client_secret`, or minted bearer value SHALL appear in any error message, returned SQL, or log line on any mode
 
+### Scenario: Both catalog kinds redact catalog request errors through one credential set
+
+* *GIVEN* a failed catalog request under `CatalogKind::IcebergRest` or `CatalogKind::UnityCatalogNative` whose error echoes a credential value
+* *WHEN* the client returns that error
+* *THEN* exactly ONE function SHALL redact the error against the catalog-credential redaction set: the values of `token`, `client_id`, `client_secret`, `oauth2_server_uri`, and `scope`, plus the static or minted bearer the request carried
+* *AND* the function SHALL strip the bearer before the field values, so a field value inside the bearer cannot leave part of the bearer in the message
+* *AND* both catalog kinds SHALL redact through that function, so neither kind keeps its own list
+* *AND* the error message MUST NOT contain any value of the set
+
 ### Scenario: The scan never receives the catalog login fields
 
 * *GIVEN* a CONNECTION whose JSON password carries a `token`, or `client_id` and `client_secret` with optional `oauth2_server_uri` and `scope`, beside its storage fields
