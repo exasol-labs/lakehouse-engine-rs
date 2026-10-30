@@ -31,8 +31,8 @@ use iceberg::io::{
     S3_REGION, S3_SECRET_ACCESS_KEY, StorageFactory,
 };
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, ListType, Literal,
-    MapType, NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Struct,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion, ListType,
+    Literal, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Struct,
     StructType, Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
@@ -54,7 +54,9 @@ use iceberg_storage_opendal::{
     AwsCredential, CustomAwsCredentialLoader, OpenDalStorageFactory, ProvideCredential,
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
+use parquet::data_type::{
+    ByteArray, ByteArrayType, FixedLenByteArray, FixedLenByteArrayType, Int64Type,
+};
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedRowGroupWriter;
 use reqsign_core::{Context as ReqsignContext, Result as ReqsignResult};
@@ -3007,6 +3009,15 @@ fn make_timestamp_precision_probe_batch() -> RecordBatch {
 pub const E2E_ALL_TYPES_TABLE: &str = "all_types";
 /// One `string` column whose data file holds bytes that are not valid UTF-8.
 pub const E2E_BINARY_VALUES_TABLE: &str = "binary_values";
+/// One data file whose `uuid` bounds are in signed order, as Iceberg Java merges row groups.
+pub const E2E_UUID_SIGNED_BOUNDS_TABLE: &str = "uuid_signed_bounds";
+/// `SELECT ID, U ... ORDER BY ID` of [`E2E_UUID_SIGNED_BOUNDS_TABLE`]: one value from each half
+/// of the byte range, so the signed lower bound `80…` sorts after the signed upper bound `40…`.
+pub const UUID_SIGNED_BOUNDS_ROWS: [(i64, &str); 3] = [
+    (1, "00000000000000000000000000000001"),
+    (2, "40000000000000000000000000000000"),
+    (3, "80000000000000000000000000000000"),
+];
 
 /// Every all-types fixture, on every source, holds these ids: two rows of values, then a row
 /// NULL in every other column. The value builders below are shared by those fixtures.
@@ -3481,7 +3492,80 @@ pub async fn seed_all_types_with_auth(
         .await
         .context("append all_types")?;
     }
-    seed_binary_values(&catalog).await
+    seed_binary_values(&catalog).await?;
+    seed_uuid_signed_bounds(&catalog).await
+}
+
+/// iceberg-rust writes `uuid` bounds in byte order, so the data file is written with `parquet`
+/// directly and committed with the bounds stated by hand.
+async fn seed_uuid_signed_bounds(catalog: &impl Catalog) -> Result<()> {
+    let schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(2, "u", Type::Primitive(PrimitiveType::Uuid)).into(),
+        ])
+        .build()
+        .context("build uuid_signed_bounds Iceberg schema")?;
+    let Fixture::Fill(table) = empty_table_to_fill(
+        catalog,
+        E2E_NAMESPACE,
+        E2E_UUID_SIGNED_BOUNDS_TABLE,
+        schema,
+        unpartitioned(),
+        HashMap::new(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let bytes = encode_parquet_message(
+        "message uuid_signed_bounds {
+            REQUIRED INT64 id = 1;
+            OPTIONAL FIXED_LEN_BYTE_ARRAY (16) u (UUID) = 2;
+        }",
+        |row_group| {
+            let ids = UUID_SIGNED_BOUNDS_ROWS.map(|(id, _)| id);
+            write_parquet_column::<_, Int64Type>(row_group, &ids, None);
+            let uuids = UUID_SIGNED_BOUNDS_ROWS.map(|(_, hex)| {
+                let value = u128::from_str_radix(hex, 16).expect("a uuid row is hex");
+                FixedLenByteArray::from(value.to_be_bytes().to_vec())
+            });
+            write_parquet_column::<_, FixedLenByteArrayType>(row_group, &uuids, Some(&[1; 3]));
+        },
+    );
+    let path = format!(
+        "{}/data/{E2E_UUID_SIGNED_BOUNDS_TABLE}-{}.parquet",
+        table.metadata().location(),
+        uuid_suffix()
+    );
+    let file_size = bytes.len() as u64;
+    table
+        .file_io()
+        .new_output(&path)
+        .context("open uuid_signed_bounds data file")?
+        .write(bytes)
+        .await
+        .context("write uuid_signed_bounds data file")?;
+    let bound = |row: usize| {
+        Datum::uuid_from_str(UUID_SIGNED_BOUNDS_ROWS[row].1).expect("a uuid row parses")
+    };
+    let data_file = DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(path)
+        .file_format(DataFileFormat::Parquet)
+        .record_count(UUID_SIGNED_BOUNDS_ROWS.len() as u64)
+        .file_size_in_bytes(file_size)
+        .partition_spec_id(table.metadata().default_partition_spec_id())
+        .lower_bounds(HashMap::from([(2, bound(2))]))
+        .upper_bounds(HashMap::from([(2, bound(1))]))
+        .build()
+        .context("describe uuid_signed_bounds data file")?;
+    commit_data_files(catalog, &table, vec![data_file])
+        .await
+        .context("commit uuid_signed_bounds data file")?;
+    Ok(())
 }
 
 /// `iceberg-rust` refuses to write a `string` that is not valid UTF-8, so the data file is

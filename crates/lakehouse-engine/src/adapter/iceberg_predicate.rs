@@ -90,11 +90,9 @@ fn literal_to_datum(lit: &Json, prim: &PrimitiveType) -> Option<Datum> {
         ("literal_binary", PrimitiveType::Fixed(width)) => literal_binary_bytes(lit)
             .filter(|bytes| u64::try_from(bytes.len()).ok() == Some(*width))
             .map(Datum::fixed),
-        // `uuid` parses the 32 hex digits the column renders.
-        ("literal_binary", PrimitiveType::Uuid) => {
-            Datum::uuid_from_str(lit.get("value")?.as_str()?).ok()
-        }
 
+        // No `uuid` arm: writers store `uuid` bounds in signed or unsigned order and iceberg-rust
+        // reads them unsigned, so pruning could drop matching files (apache/iceberg#14216).
         _ => None,
     }
 }

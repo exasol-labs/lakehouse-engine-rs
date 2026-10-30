@@ -27,4 +27,5 @@ The scan renders each binary column as lowercase hex `VARCHAR` in its select lis
 - Results match native Exasol over the hex text, including an empty value reading as NULL.
 - The rewrite stays out of `NOT`, because there the empty value's raw-byte result differs from the text's NULL.
 - Plan-time pruning also compares the raw bytes, under `NOT` too: pruning only needs every matching row kept, and the raw bytes are TRUE wherever the hex text is.
+- A `uuid` comparison never reaches Iceberg plan-time pruning. The Iceberg spec defines no `uuid` order (apache/iceberg#14216), and Iceberg Java writes bounds in signed order that iceberg-rust's unsigned evaluators read as excluding matching rows. Parquet orders `UUID` statistics as unsigned bytes, so scan-time row-group pruning stays.
 - `BINARY_AS_STRING` converts the bytes to text in the scan with a validating function, because arrow-rs validates UTF-8 only for an annotated `STRING` column.

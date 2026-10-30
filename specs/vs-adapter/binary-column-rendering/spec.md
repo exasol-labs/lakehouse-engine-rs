@@ -12,6 +12,7 @@ A binary column reads as lowercase hexadecimal text on every source and at every
 * Exasol stores an empty `VARCHAR` as NULL, so an empty binary value reads as NULL.
 * Lowercase hex sorts in the order of the bytes, so a range filter, `MIN`, `MAX`, and `ORDER BY` over the text match the bytes.
 * Exasol pushes a filter literal on a binary column as a plain string literal. Exasol compares strings case-sensitively, and only lowercase hex of whole bytes names a byte string.
+* The Iceberg table spec serializes a `uuid` bound as a "16-byte big-endian value" (Appendix B) but defines no order over `uuid` values (apache/iceberg#14216). Iceberg Java merges a data file's row-group bounds and builds a manifest's partition summary with signed 64-bit comparisons, and other writers compare unsigned bytes, so a reader cannot tell which order a stored `uuid` bound follows. Parquet orders `UUID` statistics as unsigned bytes (Parquet LogicalTypes § UUID).
 * `BINARY_AS_STRING` mirrors Spark's `spark.sql.parquet.binaryAsString` for writers that store text as binary, such as Impala, Hive, and early Spark.
 
 ## Scenarios
@@ -44,10 +45,19 @@ A binary column reads as lowercase hexadecimal text on every source and at every
 ### Scenario: A hex-literal filter on a binary column prunes files at plan time
 
 * *GIVEN* an Iceberg table identity-partitioned on a `binary` and a `fixed(16)` column, a Delta table, and a Unity Catalog or Glue Parquet table each partitioned on a `binary` column
-* *WHEN* a query filters a binary column with `=`, `<`, `<=`, `>`, `>=`, `IN`, or `BETWEEN` against a lowercase hex literal of whole bytes, at any depth under `AND`, `OR`, and `NOT`
+* *WHEN* a query filters a binary column other than a `uuid` with `=`, `<`, `<=`, `>`, `>=`, `IN`, or `BETWEEN` against a lowercase hex literal of whole bytes, at any depth under `AND`, `OR`, and `NOT`
 * *THEN* the adapter SHALL plan only the files whose partition values, partition transforms, or column bounds can hold a matching value, comparing the raw bytes
 * *AND* the query SHALL return the rows native Exasol returns over the hex text, because the raw bytes differ from the hex text only on an empty value, which the text reads as NULL
 * *AND* an uppercase or odd-length literal, a `fixed(L)` literal of another length than `L`, and a variable-length column under `BINARY_AS_STRING` SHALL prune nothing
+
+### Scenario: A filter on a uuid column prunes no file at plan time
+
+* *GIVEN* an Iceberg table whose one data file holds `uuid` values from both halves of the byte range and stores its `uuid` lower bound above its upper bound in byte order, as signed comparisons write them
+* *WHEN* a query filters the `uuid` column with `=`, `>=`, or `IN` against lowercase hex literals of values the file holds
+* *THEN* the adapter SHALL plan the file, because no `uuid` comparison reaches plan-time pruning of manifests, partition values, or column bounds
+* *AND* the query SHALL return every row that holds one of the values
+* *AND* the scan SHALL still compare the raw bytes, so Parquet statistics prune row groups
+* *AND* named trade-off: a `uuid` filter prunes no Iceberg manifest or data file, including by an Iceberg partition transform such as `bucket`
 
 ### Scenario: A binary value too long for its hex rendering fails the query
 

@@ -9,15 +9,16 @@ use crate::common::seed::{
     DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT,
     DECIMAL_38_10_VALUES_TEXT, DIM_CUSTOMER_ROWS, E2E_ALL_TYPES_TABLE, E2E_BINARY_VALUES_TABLE,
     E2E_EVO_TABLE, E2E_IDENT_PART_BYTES_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE,
-    E2E_TABLE_2, EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE,
-    EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FIXED_16_VALUES_TEXT,
-    FLOAT32_VALUES_TEXT, INT32_VALUES_TEXT, LINEITEM_ROWS, LINES_PER_ORDER, OVERSIZED_BINARY_BYTES,
-    PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE, PART_TOTAL_ROWS,
-    PART_VAL_CENTRAL, PART_VAL_NORTH, PART_VALUES, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15,
-    SEED_TOTAL_ROWS, STRUCT_BINARY_VALUES_TEXT, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
-    TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, UUID_MAP_VALUES_TEXT, initdef_columns,
-    seed_added_columns_initial_default, seed_renamed_column, typed_decimal_a_avg_stddev,
-    typed_decimal_b_avg_stddev, typed_id_avg_stddev,
+    E2E_TABLE_2, E2E_UUID_SIGNED_BOUNDS_TABLE, EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS,
+    EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS,
+    FIXED_16_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT32_VALUES_TEXT, LINEITEM_ROWS, LINES_PER_ORDER,
+    OVERSIZED_BINARY_BYTES, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE,
+    PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, PART_VALUES, SEED_LABELS_ROWS,
+    SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, STRUCT_BINARY_VALUES_TEXT, TIME64_VALUES_TEXT,
+    TIMESTAMP_VALUES_TEXT, TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, UUID_MAP_VALUES_TEXT,
+    UUID_SIGNED_BOUNDS_ROWS, initdef_columns, seed_added_columns_initial_default,
+    seed_renamed_column, typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev,
+    typed_id_avg_stddev,
 };
 use crate::common::stack::{exasol_container, iceberg_catalog_url, iceberg_catalog_url_internal};
 use crate::common::timestamp_precision::{
@@ -327,6 +328,37 @@ fn a_hex_literal_on_a_binary_partition_column_prunes_files_at_plan_time() {
         vec![Some("3".to_string())],
         "a pruned NOT must keep the file whose rows it selects"
     );
+}
+
+/// Scenario: A filter on a uuid column prunes no file at plan time
+#[test]
+fn a_uuid_filter_plans_the_file_whose_bounds_are_in_signed_order() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let table = format!(
+        "{LAKEHOUSE_VS}.{}",
+        E2E_UUID_SIGNED_BOUNDS_TABLE.to_uppercase()
+    );
+    let [(_, low), (_, middle), (_, high)] = UUID_SIGNED_BOUNDS_ROWS;
+
+    for (filter, ids) in [
+        (format!("U = '{low}'"), vec!["1"]),
+        (format!("U = '{middle}'"), vec!["2"]),
+        (format!("U = '{high}'"), vec!["3"]),
+        (format!("U >= '{middle}'"), vec!["2", "3"]),
+        (format!("U IN ('{low}', '{high}')"), vec!["1", "3"]),
+    ] {
+        let sql = format!("SELECT ID FROM {table} WHERE {filter}");
+        let pushed = explain_virtual_pushdown_sql(&mut conn, &sql);
+        assert_eq!(
+            pushed.matches(".parquet").count(),
+            1,
+            "WHERE {filter} must plan the file: {pushed}"
+        );
+        let ids: Vec<Option<String>> = ids.into_iter().map(|id| Some(id.to_string())).collect();
+        assert_eq!(sorted_ids(&mut conn, &sql), ids, "WHERE {filter}");
+    }
+    assert_hex_literal_compares_bytes(&mut conn, &table, "U", low);
 }
 
 /// Scenario: A filter on a binary column selects what native Exasol selects over the hex text

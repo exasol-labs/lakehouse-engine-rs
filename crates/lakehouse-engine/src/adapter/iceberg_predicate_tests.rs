@@ -548,9 +548,8 @@ fn equal_to_bytes(column: &str, hex: &str) -> Json {
 
 /// Scenario: A hex-literal filter on a binary column prunes files at plan time
 #[test]
-fn a_binary_literal_prunes_a_binary_fixed_or_uuid_column_by_its_bytes() {
+fn a_binary_literal_prunes_a_binary_or_fixed_column_by_its_bytes() {
     let schema = binary_schema();
-    let uuid = "f79c3e09677c4bbda4793f349cb785e7";
     assert_eq!(
         translate_as_created(&equal_to_bytes("B", "00abff"), &schema),
         Some(Reference::new("b").equal_to(Datum::binary([0x00, 0xab, 0xff])))
@@ -560,8 +559,12 @@ fn a_binary_literal_prunes_a_binary_fixed_or_uuid_column_by_its_bytes() {
         Some(Reference::new("f").equal_to(Datum::fixed([0x0a, 0x0b])))
     );
     assert_eq!(
-        translate_as_created(&equal_to_bytes("U", uuid), &schema),
-        Some(Reference::new("u").equal_to(Datum::uuid_from_str(uuid).unwrap()))
+        translate_as_created(
+            &equal_to_bytes("U", "f79c3e09677c4bbda4793f349cb785e7"),
+            &schema
+        ),
+        None,
+        "a uuid literal constrains nothing, because stored uuid bounds follow no one order"
     );
     assert_eq!(
         translate_as_created(&equal_to_bytes("F", "0a"), &schema),
