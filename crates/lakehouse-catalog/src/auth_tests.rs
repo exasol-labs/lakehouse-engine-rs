@@ -120,6 +120,7 @@ async fn oauth2_grant_errors_for_the_validation_rejected_shape() {
     );
 }
 
+/// Scenario: Both catalog kinds redact catalog request errors through one credential set
 #[test]
 fn redact_catalog_auth_error_strips_client_id_oauth_uri_scope() {
     const CLIENT_ID_SENTINEL: &str = "MY_CLIENT_ID_SENTINEL";
@@ -135,7 +136,7 @@ fn redact_catalog_auth_error_strips_client_id_oauth_uri_scope() {
         "catalog error: client_id={CLIENT_ID_SENTINEL} uri={OAUTH_URI_SENTINEL} scope={SCOPE_SENTINEL}"
     );
 
-    let redacted = redact_catalog_auth_error(&raw, &creds);
+    let redacted = redact_catalog_auth_error(&raw, &creds, None);
 
     assert!(
         !redacted.contains(CLIENT_ID_SENTINEL),
@@ -151,6 +152,19 @@ fn redact_catalog_auth_error_strips_client_id_oauth_uri_scope() {
     );
 }
 
+/// Scenario: Both catalog kinds redact catalog request errors through one credential set
+#[test]
+fn redact_catalog_auth_error_strips_a_bearer_that_contains_a_credential_field() {
+    const BEARER: &str = "head-all-apis-tail";
+
+    let mut creds = creds_no_auth();
+    creds.scope = Some("all-apis".into());
+
+    let redacted = redact_catalog_auth_error(&format!("rejected {BEARER}"), &creds, Some(BEARER));
+
+    assert_eq!(redacted, "rejected [REDACTED]");
+}
+
 #[test]
 fn auth_error_sites_apply_the_value_pass_first() {
     const SAS_SHAPED_TOKEN: &str = "sv=2023-11-03&sp=rwdlacx&sig=SIG_VALUE";
@@ -159,7 +173,7 @@ fn auth_error_sites_apply_the_value_pass_first() {
     creds.token = Some(SAS_SHAPED_TOKEN.into());
 
     let raw = format!("upstream error echoed {SAS_SHAPED_TOKEN}");
-    let redacted = redact_catalog_auth_error(&raw, &creds);
+    let redacted = redact_catalog_auth_error(&raw, &creds, None);
 
     assert!(
         !redacted.contains(SAS_SHAPED_TOKEN),

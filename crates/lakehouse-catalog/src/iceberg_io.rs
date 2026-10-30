@@ -3,7 +3,7 @@
 
 use crate::auth::{CatalogAuth, redact_catalog_auth_error};
 use crate::catalog_http::{CatalogHttp, CatalogRequestError, quote_body};
-use crate::redaction::{redact_error_text, redact_secret_values};
+use crate::redaction::redact_error_text;
 use crate::{ConnectionCreds, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::spec::TableMetadata;
@@ -13,11 +13,11 @@ pub(crate) const MAX_ANSWER_BYTES: usize = 64 * 1024;
 
 /// The OAuth2 grant-obtained bearer token is not in `creds`, so it is redacted explicitly.
 fn redact_catalog_text(msg: &str, auth: &CatalogAuth, creds: &ConnectionCreds) -> String {
-    let base = redact_catalog_auth_error(msg, creds);
-    match auth {
-        CatalogAuth::Bearer(token) => redact_secret_values(&base, &[token.as_str()]),
-        CatalogAuth::Sigv4 { .. } | CatalogAuth::None => base,
-    }
+    let bearer = match auth {
+        CatalogAuth::Bearer(token) => Some(token.as_str()),
+        CatalogAuth::Sigv4 { .. } | CatalogAuth::None => None,
+    };
+    redact_catalog_auth_error(msg, creds, bearer)
 }
 
 fn build_signed_request(

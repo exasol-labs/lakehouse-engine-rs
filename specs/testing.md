@@ -40,13 +40,13 @@ This file holds the rules for how this repository tests its behavior and how it 
 
 ### E2E suites
 
-| Suite | Cargo feature | Test binaries | Make target | CI job (check name) | Stack | In `release` needs |
+| Suite | Cargo feature | Test binaries | Make targets | CI job (check name) | Stack | In `release` needs |
 |-------|---------------|---------------|-------------|---------------------|-------|--------------------|
-| Local Docker | `exasol-e2e` | `e2e_local` | `make test-e2e` | `e2e` (`E2E`, `E2E (8.29.x)`) | Exasol, SeaweedFS, Iceberg REST catalog, forward proxy (`docker-compose.yml`) | yes |
-| Lakekeeper | `lakekeeper-e2e` | `e2e_lakekeeper_test` | `make test-e2e-lakekeeper` | `e2e-lakekeeper` (`E2E (Lakekeeper)`) | Local Docker stack plus Lakekeeper, its PostgreSQL database, Keycloak, OpenFGA | yes |
-| Unity Catalog | `unity-e2e` | `e2e_unity_test` | `make test-e2e-unity` | `e2e-unity` (`E2E (Unity)`) | SeaweedFS, Exasol, forward proxy, OSS Unity Catalog (`docker-compose.unity.yml`) | yes |
-| Azure | `azure-e2e` | `e2e_azure_test` | `make test-e2e-azure` | `e2e-azure` (`E2E (Azure)`) | Lakekeeper stack plus a real ADLS Gen2 account | no |
-| Glue | `glue-e2e` | `e2e_glue_test` | `make test-e2e-glue` | `e2e-glue` (`E2E (Glue)`) | Local Exasol and forward proxy plus a real AWS Glue Data Catalog and S3 bucket | no |
+| Local Docker | `exasol-e2e` | `e2e_local` | `make e2e-up test-e2e` | `e2e` (`E2E`, `E2E (8.29.x)`) | Exasol, SeaweedFS, Iceberg REST catalog, forward proxy (`docker-compose.yml`) | yes |
+| Lakekeeper | `lakekeeper-e2e` | `e2e_lakekeeper_test` | `make lakekeeper-up test-e2e-lakekeeper` | `e2e-lakekeeper` (`E2E (Lakekeeper)`) | Local Docker stack plus Lakekeeper, its PostgreSQL database, Keycloak, OpenFGA | yes |
+| Unity Catalog | `unity-e2e` | `e2e_unity_test` | `make unity-up test-e2e-unity` | `e2e-unity` (`E2E (Unity)`) | SeaweedFS, Exasol, forward proxy, OSS Unity Catalog (`docker-compose.unity.yml`) | yes |
+| Azure | `azure-e2e` | `e2e_azure_test` | `make azure-up test-e2e-azure` | `e2e-azure` (`E2E (Azure)`) | Lakekeeper stack plus a real ADLS Gen2 account | no |
+| Glue | `glue-e2e` | `e2e_glue_test` | `make glue-up test-e2e-glue` | `e2e-glue` (`E2E (Glue)`) | Local Exasol and forward proxy plus a real AWS Glue Data Catalog and S3 bucket | no |
 | Cloud (opt-in) | `cloud-e2e` | `cloud_e2e_test` | none | none | A real Exasol cluster plus the AWS Glue Iceberg REST catalog | no |
 
 - A new test module of the Local Docker suite is declared in `crates/lakehouse-e2e/tests/e2e_local/main.rs`. A module file the suite does not declare never compiles and never runs.
@@ -171,10 +171,12 @@ This file holds the rules for how this repository tests its behavior and how it 
 
 ### Make targets and CI
 
-- Every E2E Make target depends on `cross-udf-build`, so the suite never runs against a stale `.so`.
-- `make test-e2e-unity` runs `make unity-up` first. Its `cargo` line stays flag-identical to the `Run Unity Catalog E2E suite` step of the `e2e-unity` job in `.github/workflows/ci.yml`, which is the authority.
+- Every E2E Make target depends on `cross-udf-build`, so the suite never runs against a stale `.so`. With `REBUILD_SO=0`, a missing or stale `.so` fails the target instead of rebuilding it.
+- Each E2E stack has four Make targets: `<stack>-start`, `<stack>-wait`, `<stack>-up`, and `<stack>-down`, for the stacks `e2e`, `lakekeeper`, `azure`, `unity`, and `glue`. `<stack>-start` starts Exasol without waiting for it, `<stack>-wait` waits until the stack is healthy, `<stack>-up` runs both, and `<stack>-down` removes the stack and its volumes. `scripts/e2e-stack.sh` holds their commands.
+- No E2E test target starts its stack, so a local run is `make <stack>-up` followed by the suite's test target.
+- Every E2E CI job runs its suite through its Make test target, and starts, waits for, and stops its stack through its stack targets. The `e2e-setup` action sets `REBUILD_SO=0` after it downloads the `.so` from `build-so`, so a missing `.so` fails every E2E job the same way.
 - Every E2E CI job needs only `build-so`. A draft pull request skips them through that dependency.
-- Every E2E CI job starts Exasol without waiting for it, prepares the rest of its stack, and compiles its suite before it waits for the stack to become healthy. The build step's `cargo` line stays flag-identical to the suite's run. The `e2e` job starts `spark-iceberg-fixtures` once SeaweedFS and the Iceberg REST catalog are healthy and waits for it to exit after the build.
+- Every E2E CI job runs `<stack>-start`, compiles its suite, and then runs `<stack>-wait`, so the suite compiles while Exasol boots. The build step's `cargo` line stays flag-identical to the suite's Make test target. `e2e-start` starts `spark-iceberg-fixtures` once SeaweedFS and the Iceberg REST catalog are healthy, and `e2e-wait` waits for it to exit.
 - The `e2e` job runs the whole local Docker suite twice, as two legs of one matrix with identical steps: one leg on a 2025.x image with the check name `E2E`, and one on an 8.29.x image with the check name `E2E (8.29.x)`. Each leg passes its image through `EXASOL_IMAGE`, which both `docker-compose.yml` and the `Makefile` read. Each leg uploads its failure logs under its own artifact name (`exa-logs`, `exa-logs-8x`), because `upload-artifact` rejects a name another upload in the same run already used.
 - `E2E` is a required status check on `main`, so one leg keeps that exact name. Adding `E2E (8.29.x)` to the ruleset is an operator action.
 - The `release` job needs `e2e`, so it waits for both legs.

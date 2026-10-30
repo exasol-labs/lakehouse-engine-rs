@@ -9,6 +9,7 @@ Requests per-table, short-lived, scoped storage credentials from the Unity Catal
 * A vended secret never appears in an error message or log line, and never appears in plaintext in a returned SQL string. It reaches the scan UDF only inside the AES-GCM-sealed envelope of `storage-access/scan-spec-credential-reference`.
 * The selector reads a CONNECTION-configured store `endpoint` and `region` for addressing and never reads a CONNECTION credential. For `endpoint` and `region` independently, a non-empty CONNECTION value wins over the vended value. An empty address is legal and resolves to the AWS default chain, because Databricks AWS vends no endpoint and no region.
 * `abfs` names plaintext transport on the location, and an `http://` endpoint names it on the store. One shared gate, reached by both vended selectors, refuses either one unless the operator sets `ALLOW_HTTP`. Without the gate, an `abfs://` location would silently be read over HTTPS.
+* Databricks vends no credential for a shallow clone (#332), so reading one needs static storage credentials that also cover the source table's location, where the clone's Delta log points.
 
 ## Scenarios
 

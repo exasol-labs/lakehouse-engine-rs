@@ -151,7 +151,8 @@ async fn includes_managed_and_external_delta_base_tables() {
     let body = r#"{"tables":[
         {"name":"orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://bucket/orders","columns":[]},
         {"name":"external_orders","table_type":"EXTERNAL","data_source_format":"DELTA","storage_location":"s3://bucket/external_orders","columns":[]},
-        {"name":"orders_clone","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://bucket/orders_clone","columns":[]}
+        {"name":"orders_clone","table_type":"MANAGED_SHALLOW_CLONE","data_source_format":"DELTA","storage_location":"s3://bucket/orders_clone","columns":[]},
+        {"name":"external_orders_clone","table_type":"EXTERNAL_SHALLOW_CLONE","data_source_format":"DELTA","storage_location":"s3://bucket/external_orders_clone","columns":[]}
     ]}"#
     .to_string();
     let server = spawn(move |_req| (200, body.clone())).await;
@@ -164,7 +165,7 @@ async fn includes_managed_and_external_delta_base_tables() {
 
     assert!(
         listing.skipped.is_empty(),
-        "every MANAGED/EXTERNAL DELTA entry admits as a Delta base table"
+        "every MANAGED/EXTERNAL DELTA entry, shallow clones included, admits as a Delta base table"
     );
     assert_eq!(
         listing
@@ -172,8 +173,13 @@ async fn includes_managed_and_external_delta_base_tables() {
             .iter()
             .map(|table| table.ident.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["orders", "external_orders", "orders_clone"],
-        "the MANAGED, EXTERNAL, and shallow-clone-shaped entries are all returned"
+        vec![
+            "orders",
+            "external_orders",
+            "orders_clone",
+            "external_orders_clone"
+        ],
+        "the MANAGED, EXTERNAL, MANAGED_SHALLOW_CLONE, and EXTERNAL_SHALLOW_CLONE entries are all returned"
     );
     for table in &listing.tables {
         assert_eq!(table.table_type, CatalogTableType::Table);
@@ -369,43 +375,78 @@ async fn request_failure_is_credential_safe_error() {
 /// Scenario: The client surfaces a transport or HTTP-status failure as a clear, credential-safe error
 #[tokio::test]
 async fn a_failed_get_table_names_the_table() {
+    const MINTED_SENTINEL: &str = "MINTED_BEARER_SENTINEL_VALUE";
+    const CLIENT_ID_SENTINEL: &str = "CLIENT_ID_SENTINEL_VALUE";
+    const CLIENT_SECRET_SENTINEL: &str = "CLIENT_SECRET_SENTINEL_VALUE";
+    const SCOPE_SENTINEL: &str = "SCOPE_SENTINEL_VALUE";
+
     let server = spawn(|req| {
+        if req.target.ends_with("/oidc/v1/token") {
+            return (
+                200,
+                format!(
+                    r#"{{"access_token":"{MINTED_SENTINEL}","token_type":"Bearer","expires_in":3600}}"#
+                ),
+            );
+        }
         (
             500,
             format!(
-                "internal error saw {}",
+                "internal error saw {} client {CLIENT_ID_SENTINEL} secret {CLIENT_SECRET_SENTINEL} \
+                 scope {SCOPE_SENTINEL}",
                 req.authorization.clone().unwrap_or_default()
             ),
         )
     })
     .await;
-    let mut creds = base_creds();
-    creds.token = Some(PAT_SENTINEL.to_string());
-    let session = UnityCatalogSession::new(&server.base_url, creds);
+    let mut pat = base_creds();
+    pat.token = Some(PAT_SENTINEL.to_string());
+    let mut oauth = base_creds();
+    oauth.client_id = Some(CLIENT_ID_SENTINEL.to_string());
+    oauth.client_secret = Some(CLIENT_SECRET_SENTINEL.to_string());
+    oauth.scope = Some(SCOPE_SENTINEL.to_string());
     let ident = orders_ident();
 
-    let load_err = session
-        .load_table(&ident)
-        .await
-        .expect_err("a 500 must surface an error");
-    let load_listed_err = session
-        .load_listed_tables(std::slice::from_ref(&ident))
-        .await
-        .expect_err("a 500 must surface an error");
+    let modes = [
+        (pat, vec![PAT_SENTINEL]),
+        (
+            oauth,
+            vec![
+                MINTED_SENTINEL,
+                CLIENT_ID_SENTINEL,
+                CLIENT_SECRET_SENTINEL,
+                SCOPE_SENTINEL,
+            ],
+        ),
+    ];
 
-    for err in [load_err, load_listed_err] {
-        let UdfError::User(msg) = err else {
-            panic!("expected a UdfError::User variant");
-        };
-        assert!(
-            msg.contains("failed to load Unity Catalog table 'cat.sch.orders'"),
-            "error names the table: {msg}"
-        );
-        assert!(msg.contains("500"), "error carries the status: {msg}");
-        assert!(
-            !msg.contains(PAT_SENTINEL),
-            "the bearer token must be stripped from the error: {msg}"
-        );
+    for (creds, secrets) in modes {
+        let session = UnityCatalogSession::new(&server.base_url, creds);
+        let load_err = session
+            .load_table(&ident)
+            .await
+            .expect_err("a 500 must surface an error");
+        let load_listed_err = session
+            .load_listed_tables(std::slice::from_ref(&ident))
+            .await
+            .expect_err("a 500 must surface an error");
+
+        for err in [load_err, load_listed_err] {
+            let UdfError::User(msg) = err else {
+                panic!("expected a UdfError::User variant");
+            };
+            assert!(
+                msg.contains("failed to load Unity Catalog table 'cat.sch.orders'"),
+                "error names the table: {msg}"
+            );
+            assert!(msg.contains("500"), "error carries the status: {msg}");
+            for secret in &secrets {
+                assert!(
+                    !msg.contains(secret),
+                    "no credential value may appear in the error: {msg}"
+                );
+            }
+        }
     }
 }
 
@@ -805,15 +846,19 @@ fn admission_admits_delta_and_parquet_base_tables_and_names_every_refusal() {
     let mut cases = vec![
         ("MANAGED", Some("DELTA"), Ok(TableFormat::Delta)),
         ("EXTERNAL", Some("PARQUET"), Ok(TableFormat::Parquet)),
+        (
+            "MANAGED_SHALLOW_CLONE",
+            Some("DELTA"),
+            Ok(TableFormat::Delta),
+        ),
+        (
+            "EXTERNAL_SHALLOW_CLONE",
+            Some("DELTA"),
+            Ok(TableFormat::Delta),
+        ),
         ("MANAGED", None, skip("data_source_format=absent")),
     ];
-    for raw in [
-        "VIEW",
-        "MATERIALIZED_VIEW",
-        "STREAMING_TABLE",
-        "FOREIGN",
-        "MANAGED_SHALLOW_CLONE",
-    ] {
+    for raw in ["VIEW", "MATERIALIZED_VIEW", "STREAMING_TABLE", "FOREIGN"] {
         cases.push((raw, Some("DELTA"), skip(&format!("table_type={raw}"))));
     }
     for format in ["ICEBERG", "CSV", "delta", "Delta", "parquet", "Parquet"] {
