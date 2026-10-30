@@ -1442,11 +1442,17 @@ fn binary_as_string_reads_variable_length_binary_columns_as_text() {
         &format!("SELECT ID FROM {annotated} WHERE C_BYTE_ARRAY = 'legacy-b'"),
         &[[Some("2")]],
     );
-    assert_query_fails(
+    assert_text_columns(
         &mut conn,
-        &format!("SELECT C_BINARY FROM {all_types}"),
-        &["Invalid bytestream"],
+        &format!("SELECT C_STRUCT_BINARY FROM {all_types} ORDER BY ID"),
+        &[STRUCT_BINARY_VALUES_TEXT],
     );
+    for sql in [
+        format!("SELECT C_BINARY FROM {all_types}"),
+        format!("SELECT COUNT(*) FROM {all_types} WHERE C_BINARY LIKE 'a%'"),
+    ] {
+        assert_query_fails(&mut conn, &sql, &["column 'C_BINARY'", "not valid UTF-8"]);
+    }
 
     conn.execute(&format!(
         "ALTER VIRTUAL SCHEMA {VS_DIRECT} SET BINARY_AS_STRING = 'FALSE'"

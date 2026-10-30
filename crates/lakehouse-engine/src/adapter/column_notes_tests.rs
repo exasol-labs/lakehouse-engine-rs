@@ -124,26 +124,6 @@ fn an_unread_type_refusal_names_the_label_column_member_and_declared_type() {
     );
 }
 
-#[test]
-fn binary_as_string_reads_only_a_variable_length_binary_column_as_text() {
-    let declared = |arrow_type: &str| ColumnDeclaration {
-        source_type: nullable_field("payload", arrow_type),
-        partition: None,
-        refused: None,
-    };
-    let read = |arrow_type: &str, enabled: bool| {
-        declared(arrow_type)
-            .binary_as_string(enabled)
-            .source_type
-            .arrow_type
-    };
-
-    assert_eq!(read("binary", true), "utf8");
-    assert_eq!(read("binary", false), "binary");
-    assert_eq!(read("fixed_size_binary(16)", true), "fixed_size_binary(16)");
-    assert_eq!(read("int32", true), "int32");
-}
-
 /// Scenario: A Delta table with no mappable column is refused as a whole
 #[test]
 fn a_table_is_refused_as_a_whole_only_when_every_column_is_refused() {

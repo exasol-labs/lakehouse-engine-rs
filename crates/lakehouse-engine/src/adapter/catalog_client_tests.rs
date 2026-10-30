@@ -3,7 +3,7 @@ use crate::adapter::pushdown::test_support::{iceberg_column, named_table, unity_
 use lakehouse_catalog::{CatalogColumn, ColumnSourceType, TableFormat};
 
 type ListingPipeline =
-    fn(&[String], &CatalogListing, EngineTimestampSupport, bool) -> Result<Vec<Json>, UdfError>;
+    fn(&[String], &CatalogListing, EngineTimestampSupport) -> Result<Vec<Json>, UdfError>;
 
 type CatalogClientConstruction = fn(
     CatalogKind,
@@ -77,14 +77,12 @@ fn both_kinds_share_one_listing_pipeline() {
         &configured_ns,
         &iceberg_listing,
         EngineTimestampSupport::MillisecondOnly,
-        false,
     )
     .unwrap();
     let uc_tables = build_listing_virtual_tables(
         &configured_ns,
         &unity_listing,
         EngineTimestampSupport::MillisecondOnly,
-        false,
     )
     .unwrap();
 
@@ -134,7 +132,7 @@ fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
         ),
     ];
     for (engine, expected) in cases {
-        let tables = build_listing_virtual_tables(&configured_ns, &listing, engine, false).unwrap();
+        let tables = build_listing_virtual_tables(&configured_ns, &listing, engine).unwrap();
         let columns = tables[0]["columns"].as_array().unwrap();
         assert_eq!(columns[0]["dataType"], expected, "iceberg on {engine:?}");
         assert_eq!(columns[1]["dataType"], expected, "delta on {engine:?}");
@@ -171,7 +169,6 @@ fn listed_tables(listing: &CatalogListing) -> Result<Vec<Json>, UdfError> {
         &namespaces,
         listing,
         EngineTimestampSupport::MillisecondOnly,
-        false,
     )
 }
 

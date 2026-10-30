@@ -826,6 +826,7 @@ fn guard_dispatch_result(
         0.6,
         200,
         8,
+        false,
     )
 }
 
@@ -876,6 +877,7 @@ fn dispatch_sql_for_body(pushdown_req_body: Json) -> String {
         0.6,
         200,
         8,
+        false,
     )
     .expect("build_dispatch_sql must succeed for this fixture");
     result["sql"]
@@ -2292,6 +2294,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         0.6,
         200,
         8,
+        false,
     )
     .expect("build_dispatch_sql must succeed for the EVENTS fixture");
     let sql = result["sql"]
@@ -2347,6 +2350,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         memory_pool_fraction: 0.6,
         instance_overhead_mb: 200,
         s3_max_connections: 8,
+        binary_as_string: false,
         connection: &super::test_support::TEST_CONNECTION,
     };
     let join_sql = super::joins::build_broadcast_join_sql(
@@ -2864,6 +2868,7 @@ fn dispatch_result_for_body(
         0.6,
         200,
         8,
+        false,
     )?;
     Ok(result["sql"]
         .as_str()

@@ -288,6 +288,7 @@ fn dispatch_sql_widened(request: &Json) -> String {
         0.6,
         200,
         8,
+        false,
     )
     .expect("build_dispatch_sql must succeed for this fixture");
     result["sql"]
@@ -332,6 +333,7 @@ fn dispatch_sql_with_pushdown_req(
         0.6,
         200,
         8,
+        false,
     )
     .expect("build_dispatch_sql must succeed for this fixture");
     result["sql"]
@@ -875,6 +877,7 @@ fn join_scan_tuning() -> JoinScanRequestConfig<'static> {
         memory_pool_fraction: 0.6,
         instance_overhead_mb: 0,
         s3_max_connections: 1,
+        binary_as_string: false,
         connection: &super::test_support::TEST_CONNECTION,
     }
 }

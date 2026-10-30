@@ -16,13 +16,14 @@ use crate::types::mapping::arrow_type_from_tag;
 pub(crate) struct BinaryColumns(HashMap<String, Option<i32>>);
 
 impl BinaryColumns {
-    pub(crate) fn of(logical_schema: &[LogicalField]) -> Self {
+    /// Under `binary_as_string` a variable-length column reads as text, so its filters stay text.
+    pub(crate) fn of(logical_schema: &[LogicalField], binary_as_string: bool) -> Self {
         Self(
             logical_schema
                 .iter()
                 .filter_map(|field| {
                     let width = match arrow_type_from_tag(&field.arrow_type) {
-                        DataType::Binary => None,
+                        DataType::Binary if !binary_as_string => None,
                         DataType::FixedSizeBinary(width) => Some(width),
                         _ => return None,
                     };

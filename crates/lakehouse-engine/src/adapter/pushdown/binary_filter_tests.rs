@@ -3,6 +3,10 @@ use vs_expression::render_df_filter_safe;
 use super::*;
 
 fn columns() -> BinaryColumns {
+    columns_under(false)
+}
+
+fn columns_under(binary_as_string: bool) -> BinaryColumns {
     let field = |name: &str, arrow_type: &str| LogicalField {
         field_id: None,
         name: name.to_string(),
@@ -12,11 +16,14 @@ fn columns() -> BinaryColumns {
         nested: None,
         physical_name: None,
     };
-    BinaryColumns::of(&[
-        field("b", "binary"),
-        field("u", "fixed_size_binary(2)"),
-        field("s", "utf8"),
-    ])
+    BinaryColumns::of(
+        &[
+            field("b", "binary"),
+            field("u", "fixed_size_binary(2)"),
+            field("s", "utf8"),
+        ],
+        binary_as_string,
+    )
 }
 
 fn column(name: &str) -> Json {
@@ -125,5 +132,25 @@ fn only_a_comparison_reached_through_and_or_is_rewritten() {
     assert_eq!(
         rendered(&junction),
         "(((\"_LH_BYTES_B\" = X'0a') AND (NOT (\"B\" = '0a'))) OR (\"S\" = 'x'))"
+    );
+}
+
+/// Scenario: BINARY_AS_STRING reads a variable-length binary column as UTF-8 text
+#[test]
+fn binary_as_string_keeps_a_variable_length_filter_on_the_text() {
+    let filter = json!({"type": "predicate_and", "expressions": [
+        compare("predicate_equal", column("B"), text("00ff")),
+        compare("predicate_equal", column("U"), text("00ff")),
+    ]});
+
+    let rewritten = compare_binary_bytes(&filter, &columns_under(true));
+
+    assert_eq!(
+        rewritten["expressions"][0], filter["expressions"][0],
+        "a column read as text compares its text"
+    );
+    assert_ne!(
+        rewritten["expressions"][1], filter["expressions"][1],
+        "a fixed-length column keeps its hex rendering and its byte comparison"
     );
 }

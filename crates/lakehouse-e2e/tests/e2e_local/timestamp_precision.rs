@@ -2,7 +2,6 @@
 //! collapse pairwise at millisecond precision. The rendered fractional digit count is never
 //! asserted: a `TIMESTAMP` renders through `NLS_TIMESTAMP_FORMAT`, not its declared precision.
 
-use crate::common::e2e_harness::assert_filters_match_native_copy;
 use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
 use crate::common::seed::{

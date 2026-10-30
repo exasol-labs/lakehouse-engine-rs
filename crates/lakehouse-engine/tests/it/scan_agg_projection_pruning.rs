@@ -92,7 +92,7 @@ async fn build_agg_physical_plan(
         .table("scan_target")
         .await
         .expect("resolve registered table");
-    let alias_items = build_alias_items(table.schema());
+    let alias_items = build_alias_items(table.schema(), false);
     let aliased_table = format!("SELECT {} FROM scan_target", alias_items.join(", "));
 
     let sql = build_sql(&aliased_table);

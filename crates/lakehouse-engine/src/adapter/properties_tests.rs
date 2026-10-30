@@ -294,6 +294,21 @@ fn boolean_properties_accept_true_or_false_in_any_case() {
 }
 
 #[test]
+fn binary_as_string_resolves_true_only_for_a_true_value() {
+    assert!(resolve_binary_as_string(&props(&[(
+        "BINARY_AS_STRING",
+        "True"
+    )])));
+    for value in ["false", "", "yes"] {
+        assert!(
+            !resolve_binary_as_string(&props(&[("BINARY_AS_STRING", value)])),
+            "{value}"
+        );
+    }
+    assert!(!resolve_binary_as_string(&props(&[])));
+}
+
+#[test]
 fn resolve_allow_http_accepts_true_or_false_and_treats_a_rejected_value_as_false() {
     assert!(resolve_allow_http(&props(&[("ALLOW_HTTP", "True")])));
     assert!(!resolve_allow_http(&props(&[("ALLOW_HTTP", "false")])));

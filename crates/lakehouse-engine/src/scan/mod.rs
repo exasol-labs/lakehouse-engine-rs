@@ -25,7 +25,9 @@ mod json_render;
 pub(crate) use json_render::render_nested_column_as_json;
 
 mod binary_hex;
-pub(crate) use binary_hex::raw_bytes_alias;
+pub(crate) use binary_hex::{lowercase_hex, raw_bytes_alias};
+
+mod binary_text;
 
 mod sql_support;
 pub use sql_support::build_alias_items;
@@ -113,11 +115,9 @@ pub fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, Str
     }
 }
 
-/// Any planning that derives the scan's result types must use this session too.
-pub(crate) fn scan_session_context(
-    config: SessionConfig,
-    runtime: Arc<RuntimeEnv>,
-) -> SessionContext {
+/// Any planning that derives the scan's result types must use this session too. Public so
+/// `tests/it` plans with the production functions.
+pub fn scan_session_context(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> SessionContext {
     let raised = Arc::new(raised_failure::RaisedFailure::default());
     let numeric_typing = Arc::new(exasol_numeric::ExasolNumericTyping::new(raised.clone()));
     let mut rules = Analyzer::new().rules;
@@ -136,6 +136,7 @@ pub(crate) fn scan_session_context(
     numeric_typing.register_functions(&ctx);
     raw_scan::register_nested_json_render_udf(&ctx);
     binary_hex::register_binary_hex_udf(&ctx);
+    binary_text::register_binary_text_udf(&ctx);
     checked_div::register_checked_float_div_udf(&ctx, raised);
     ctx
 }

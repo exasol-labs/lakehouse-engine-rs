@@ -274,3 +274,41 @@ fn declare_columns_notes_each_catalog_parquet_column_with_its_partition_position
             .all(|declaration| declaration.source_type.nullable)
     );
 }
+
+/// Scenario: A binary partition value travels as lowercase hex
+#[test]
+fn a_delta_or_hive_binary_partition_value_travels_as_the_hex_of_its_utf8_bytes() {
+    let field = |name: &str, arrow_type: &str| LogicalField {
+        field_id: None,
+        name: name.to_string(),
+        arrow_type: arrow_type.to_string(),
+        nullable: true,
+        initial_default: None,
+        nested: None,
+        physical_name: None,
+    };
+    let logical_schema = [field("b", "binary"), field("s", "utf8")];
+    let mut files = vec![FileEntry::with_partition_values(
+        "part-0.parquet",
+        1,
+        [
+            ("b".to_string(), Some("\u{1}é".to_string())),
+            ("s".to_string(), Some("ab".to_string())),
+        ]
+        .into_iter()
+        .collect(),
+    )];
+    let mut null_file = files[0].clone();
+    null_file.partition_values.insert("b".to_string(), None);
+    files.push(null_file);
+
+    hex_binary_partition_values(&mut files, &logical_schema);
+
+    assert_eq!(files[0].partition_values["b"].as_deref(), Some("01c3a9"));
+    assert_eq!(
+        files[0].partition_values["s"].as_deref(),
+        Some("ab"),
+        "only a binary column's value is encoded"
+    );
+    assert_eq!(files[1].partition_values["b"], None);
+}

@@ -3,6 +3,7 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::{render_df_filter_exasol_safe, render_expression_exasol_safe};
 
+use super::super::BinaryColumns;
 use super::super::support::{
     datafusion_renderable, project_columns, quote_ident, type_accepted_rewrite, walk_column_nodes,
 };
@@ -135,11 +136,12 @@ pub(super) fn type_screened_leg_filter(
     side_local: &Json,
     col_types: &[(String, String)],
 ) -> (Option<Json>, Option<Json>) {
-    let accepts = |c: &Json| type_accepted_rewrite(c, col_types).is_some();
+    let binary_columns = BinaryColumns::default();
+    let accepts = |c: &Json| type_accepted_rewrite(c, col_types, &binary_columns).is_some();
     let declined = partition_conjuncts(side_local, |c| !accepts(c));
     match partition_conjuncts(side_local, accepts) {
         None => (None, declined),
-        Some(accepted) => match type_accepted_rewrite(&accepted, col_types) {
+        Some(accepted) => match type_accepted_rewrite(&accepted, col_types, &binary_columns) {
             Some(rewritten) => (Some(rewritten), declined),
             None => (None, Some(side_local.clone())),
         },

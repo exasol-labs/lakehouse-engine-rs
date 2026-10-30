@@ -455,8 +455,7 @@ fn identity_partitioned_schema() -> std::sync::Arc<iceberg::spec::Schema> {
     )
 }
 
-/// The logical fields a declaration of [`identity_partitioned_schema`] carries: the `uuid` column
-/// is refused at plan time, so no logical field stands for it.
+/// The logical fields a declaration of [`identity_partitioned_schema`] carries.
 fn identity_partitioned_logical_fields() -> Vec<LogicalField> {
     let field = |field_id, name: &str, arrow_type: &str, nullable| LogicalField {
         field_id: Some(field_id),
@@ -471,6 +470,7 @@ fn identity_partitioned_logical_fields() -> Vec<LogicalField> {
         field(1, "id", "int64", false),
         field(2, "region", "utf8", true),
         field(3, "address", "utf8", true),
+        field(5, "token", "fixed_size_binary(16)", true),
     ]
 }
 
@@ -585,8 +585,8 @@ fn read_at_declared_type(
 #[test]
 fn identity_value_round_trips_at_declared_type_for_every_admitted_type() {
     use arrow::array::{
-        ArrayRef, Decimal128Array, Float32Array, Int32Array, Time64MicrosecondArray,
-        TimestampMicrosecondArray, TimestampNanosecondArray,
+        ArrayRef, BinaryArray, Decimal128Array, FixedSizeBinaryArray, Float32Array, Int32Array,
+        Time64MicrosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
     };
     use iceberg::spec::{Literal, PrimitiveLiteral as L, PrimitiveType as T, Transform};
     use std::sync::Arc;
@@ -650,6 +650,32 @@ fn identity_value_round_trips_at_declared_type_for_every_admitted_type() {
                     .expect("a valid decimal type"),
             ),
         ),
+        (
+            L::Binary(vec![0x00, 0xff, 0x80]),
+            T::Binary,
+            "binary",
+            Arc::new(BinaryArray::from(vec![&[0x00, 0xff, 0x80][..]])),
+        ),
+        (
+            L::Binary(vec![0xab, 0x01]),
+            T::Fixed(2),
+            "fixed_size_binary(2)",
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter([[0xab, 0x01]].into_iter())
+                    .expect("a fixed(2) value"),
+            ),
+        ),
+        (
+            L::UInt128(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10),
+            T::Uuid,
+            "fixed_size_binary(16)",
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(
+                    [[1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]].into_iter(),
+                )
+                .expect("a uuid value"),
+            ),
+        ),
     ];
 
     for (value, source_type, tag, file_value) in cases {
@@ -676,13 +702,14 @@ fn identity_value_round_trips_at_declared_type_for_every_admitted_type() {
         "an empty string reads as NULL, as Exasol stores an empty VARCHAR"
     );
 
-    let refused = partitioned_scan_task(
+    let uuid = partitioned_scan_task(
         &identity_partition_spec(0, &[("token", "token", Transform::Identity)]),
         vec![Some(Literal::Primitive(L::UInt128(7)))],
     );
-    assert!(
-        identity_values_of(&refused).is_empty(),
-        "a uuid column is refused at plan time, so no logical field takes its value"
+    assert_eq!(
+        identity_values_of(&uuid).get("token"),
+        Some(&Some("00000000000000000000000000000007".to_string())),
+        "a uuid value travels as the lowercase hex of its big-endian bytes"
     );
 }
 

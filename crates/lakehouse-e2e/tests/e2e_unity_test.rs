@@ -27,14 +27,15 @@ use common::raw_parquet::{
     write_parquet_fixture,
 };
 use common::seed::{
-    ALL_TYPES_IDS_TEXT, BINARY_VALUES_TEXT, BOOLEAN_VALUES_TEXT, DATE_VALUES_TEXT,
-    DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT,
+    ALL_TYPES_IDS_TEXT, BINARY_MAP_VALUES_TEXT, BINARY_VALUES_TEXT, BOOLEAN_VALUES_TEXT,
+    DATE_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT,
     DECIMAL_38_10_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT_LIST_VALUES_TEXT, INT8_VALUES_TEXT,
     INT16_VALUES_TEXT, INT32_VALUES_TEXT, STRUCT_BINARY_VALUES_TEXT, TEXT_VALUES_TEXT,
-    TIMESTAMP_VALUES_TEXT, all_types_ids, binary_values, boolean_values, date_values,
-    decimal_10_2_values, decimal_18_0_values, decimal_36_6_values, decimal_38_10_values,
-    float32_values, int_list_values, int_string_struct_values, int8_values, int16_values,
-    int32_values, string_int_map_values, struct_binary_values, text_values, timestamp_values,
+    TIMESTAMP_VALUES_TEXT, all_types_ids, binary_keyed_map_values, binary_values, boolean_values,
+    date_values, decimal_10_2_values, decimal_18_0_values, decimal_36_6_values,
+    decimal_38_10_values, float32_values, int_list_values, int_string_struct_values, int8_values,
+    int16_values, int32_values, string_int_map_values, struct_binary_values, text_values,
+    timestamp_values,
 };
 use common::stack::{
     self, ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
@@ -519,7 +520,7 @@ fn seed_all_types_parquet_table() {
 }
 
 /// The Delta types `stats_all_types` lacks: the decimal matrix, a binary column without column
-/// mapping, and a binary struct member, in one data file with no reader feature.
+/// mapping, a binary struct member, and a binary map key, in one data file with no reader feature.
 fn seed_delta_extra_types_table() {
     let batch = RecordBatch::try_from_iter_with_nullable(vec![
         ("id", all_types_ids(), false),
@@ -529,6 +530,11 @@ fn seed_delta_extra_types_table() {
         ("c_decimal_38_10", decimal_38_10_values(), true),
         ("c_binary", binary_values(&DataType::Binary), true),
         ("c_struct_binary", struct_binary_values(None), true),
+        (
+            "c_map_binary",
+            binary_keyed_map_values(binary_values, None),
+            true,
+        ),
     ])
     .expect("delta_extra_types batch");
 
@@ -540,6 +546,14 @@ fn seed_delta_extra_types_table() {
         ("c_decimal_38_10", json!("decimal(38,10)"), "DECIMAL"),
         ("c_binary", json!("binary"), "BINARY"),
         ("c_struct_binary", struct_type(&[("x", "binary")]), "STRUCT"),
+        (
+            "c_map_binary",
+            json!({
+                "type": "map", "keyType": "binary", "valueType": "integer",
+                "valueContainsNull": true
+            }),
+            "MAP",
+        ),
     ];
     let table = UnityTable {
         namespace: UNITY_NAMESPACE,
@@ -1754,6 +1768,7 @@ fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
 /// Scenario: A catalog-declared DECIMAL outside Exasol's DECIMAL domain falls back to VARCHAR
 /// Scenario: Unity Catalog Spark column types map to Exasol types sufficient for listing
 /// Scenario: An incompatible Unity Catalog column type is declared as VARCHAR rather than failing
+/// Scenario: A binary column reads as lowercase hex on every source
 #[test]
 fn unity_delta_extra_types_declare_and_return_their_mapped_values() {
     setup();
@@ -1770,6 +1785,7 @@ fn unity_delta_extra_types_declare_and_return_their_mapped_values() {
             reads("C_DECIMAL_38_10", VARCHAR_JSON, DECIMAL_38_10_VALUES_TEXT),
             reads("C_BINARY", VARCHAR_JSON, BINARY_VALUES_TEXT),
             reads("C_STRUCT_BINARY", VARCHAR_JSON, STRUCT_BINARY_VALUES_TEXT),
+            reads("C_MAP_BINARY", VARCHAR_JSON, BINARY_MAP_VALUES_TEXT),
         ],
     );
     assert_decimal_orders_numerically(&mut conn, VS_NAME, "DELTA_EXTRA_TYPES", "C_DECIMAL_18_0");

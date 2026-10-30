@@ -407,6 +407,7 @@ pub(in super::super) struct JoinScanRequestConfig<'a> {
     pub(in super::super) memory_pool_fraction: f64,
     pub(in super::super) instance_overhead_mb: u64,
     pub(in super::super) s3_max_connections: usize,
+    pub(in super::super) binary_as_string: bool,
     pub(in super::super) connection: &'a ResolvedConnectionConfig,
 }
 
@@ -448,6 +449,7 @@ fn join_fan_out_scan_spec(
             memory_pool_fraction: inputs.memory_pool_fraction,
             instance_overhead_mb: inputs.instance_overhead_mb,
             s3_max_connections: inputs.s3_max_connections,
+            binary_as_string: inputs.binary_as_string,
         },
         files: vec![],
     })

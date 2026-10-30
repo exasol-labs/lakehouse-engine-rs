@@ -5,38 +5,51 @@ use crate::scan::spec::ProjectionItem;
 use crate::types::mapping::{is_binary, needs_json_fallback, needs_nested_json_rendering};
 
 use super::binary_hex::{BINARY_HEX_UDF_NAME, raw_bytes_alias};
+use super::binary_text::BINARY_TEXT_UDF_NAME;
 use super::raw_scan::NESTED_JSON_RENDER_UDF_NAME;
 
 /// Uppercase aliases let identifiers resolved in uppercase match any Parquet field casing.
 /// A binary column is aliased to its hex text, so every expression over it sees what Exasol
-/// sees, and its raw bytes get a second alias for the comparisons the adapter translates.
+/// sees, and its raw bytes get a second alias for the comparisons the adapter translates. Under
+/// `binary_as_string` a variable-length one is aliased to its validated UTF-8 text instead.
 /// Public so `tests/it/scan_agg_projection_pruning.rs` builds the same inner SELECT as production.
-pub fn build_alias_items(schema: &DFSchema) -> Vec<String> {
+pub fn build_alias_items(schema: &DFSchema, binary_as_string: bool) -> Vec<String> {
     schema
         .fields()
         .iter()
         .map(|f| {
             let column = quote_ident(f.name());
             let alias = f.name().to_uppercase();
-            if is_binary(f.data_type()) {
-                format!(
-                    "{BINARY_HEX_UDF_NAME}({column}, '{}') AS {}, {column} AS {}",
-                    alias.replace('\'', "''"),
+            let label = alias.replace('\'', "''");
+            match f.data_type() {
+                DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+                    if binary_as_string =>
+                {
+                    format!(
+                        "{BINARY_TEXT_UDF_NAME}({column}, '{label}') AS {}",
+                        quote_ident(&alias)
+                    )
+                }
+                binary if is_binary(binary) => format!(
+                    "{BINARY_HEX_UDF_NAME}({column}, '{label}') AS {}, {column} AS {}",
                     quote_ident(&alias),
                     quote_ident(&raw_bytes_alias(&alias))
-                )
-            } else {
-                format!("{column} AS {}", quote_ident(&alias))
+                ),
+                _ => format!("{column} AS {}", quote_ident(&alias)),
             }
         })
         .collect()
 }
 
 /// All columns are aliased, since the filter may reference an unprojected one.
-pub(super) fn aliased_select(table_name: &str, schema: &DFSchema) -> String {
+pub(super) fn aliased_select(
+    table_name: &str,
+    schema: &DFSchema,
+    binary_as_string: bool,
+) -> String {
     format!(
         "SELECT {} FROM {table_name}",
-        build_alias_items(schema).join(", ")
+        build_alias_items(schema, binary_as_string).join(", ")
     )
 }
 

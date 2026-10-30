@@ -10,7 +10,7 @@ use serde_json::Value as Json;
 use super::delta_predicate::to_delta_predicate;
 use super::delta_replay::DeltaSnapshot;
 use super::unity_table_storage::{UnityTableStorage, redacted};
-use super::{FormatReader, PlannedFiles};
+use super::{FormatReader, PlannedFiles, hex_binary_partition_values};
 use crate::adapter::column_notes::DeclaredSchema;
 use crate::scan::build_table_root_store;
 use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, FileEntry, LogicalField};
@@ -91,8 +91,8 @@ fn declared_files(
         })
         .collect();
 
-    let files = snapshot.active_files(prune)?;
-    Ok(files
+    let mut files: Vec<FileEntry> = snapshot
+        .active_files(prune)?
         .into_iter()
         .map(|mut file| {
             let mut logged = std::mem::take(&mut file.partition_values);
@@ -102,7 +102,9 @@ fn declared_files(
                 .collect();
             file
         })
-        .collect())
+        .collect();
+    hex_binary_partition_values(&mut files, &declared.logical_schema);
+    Ok(files)
 }
 
 /// Refuses rather than derives: a declaration binding by the wrong key would bind the scan to the

@@ -703,11 +703,12 @@ Exasol has no binary type, so every source reads a binary column as lowercase he
 
 - An empty value reads as NULL, as an empty `VARCHAR` does in Exasol.
 - A value longer than 1,000,000 bytes fails the query. The error names the column and the value's size.
-- A binary member of a nested column renders as a hex JSON string.
+- A binary member of a nested column, or a binary map key, renders as a hex JSON string.
+- A binary partition column reads its partition value as the same hex.
 - A filter, `ORDER BY`, `MIN`, or `MAX` on the column returns what native Exasol returns over the same hex text. Lowercase hex sorts in byte order.
 - A comparison with a lowercase hex literal of even length, such as `WHERE payload = '00abff'`, compares the raw bytes in the scan, so file statistics still prune. Any other literal compares the hex text, and `'00ABFF'` matches nothing.
 
-`BINARY_AS_STRING = 'TRUE'` reads every variable-length binary column of the virtual schema as UTF-8 text, like Spark's `spark.sql.parquet.binaryAsString`. Use it for files that a legacy writer such as Impala or Hive stored as unannotated `BYTE_ARRAY` strings. A value that is not valid UTF-8 fails the query with Exasol's `Invalid bytestream` error, which does not name the column. Fixed-length binary and `uuid` stay hex. The property changes the declared type, so it takes effect at `CREATE VIRTUAL SCHEMA`, `REFRESH`, or `ALTER VIRTUAL SCHEMA ... SET`.
+`BINARY_AS_STRING = 'TRUE'` reads every top-level variable-length binary column of the virtual schema as UTF-8 text, like Spark's `spark.sql.parquet.binaryAsString`. Use it for files that a legacy writer such as Impala or Hive stored as unannotated `BYTE_ARRAY` strings. A value that is not valid UTF-8 fails the query with an error that names the column. Fixed-length binary, `uuid`, and binary members of nested columns stay hex. Filters on a text column compare the text, so they no longer prune by file statistics. The property applies from the next query after `ALTER VIRTUAL SCHEMA ... SET`, without a `REFRESH`.
 
 A catalog-declared source reads a column by its declared type. A Glue column declared `string` over a data file that stores a `BYTE_ARRAY` without the string annotation reads as text. Direct storage reads a top-level Parquet `ENUM` column as text. A nested `ENUM` member is refused (#TBD).
 

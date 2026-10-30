@@ -760,8 +760,14 @@ fn contains_aggregate_node(node: &Json) -> bool {
 /// The sole owner of "a tree the DataFusion scan may be handed". Renderability is
 /// checked on the rewritten tree, since that is what the scan carries; checking the
 /// raw tree would let an unrenderable tree be silently dropped, returning wrong rows.
-pub(super) fn type_accepted_rewrite(expr: &Json, col_types: &[(String, String)]) -> Option<Json> {
-    apply_type_rewrites(expr, col_types).filter(datafusion_renderable)
+pub(super) fn type_accepted_rewrite(
+    expr: &Json,
+    col_types: &[(String, String)],
+    binary_columns: &BinaryColumns,
+) -> Option<Json> {
+    apply_type_rewrites(expr, col_types)
+        .map(|tree| compare_binary_bytes(&tree, binary_columns))
+        .filter(datafusion_renderable)
 }
 
 /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`).
@@ -772,11 +778,7 @@ pub(super) fn classify_where_filter<'a>(
     col_types: &[(String, String)],
     binary_columns: &BinaryColumns,
 ) -> (Option<String>, Option<&'a Json>) {
-    let accepted = |filter: &Json| {
-        apply_type_rewrites(filter, col_types)
-            .map(|tree| compare_binary_bytes(&tree, binary_columns))
-            .filter(datafusion_renderable)
-    };
+    let accepted = |filter: &Json| type_accepted_rewrite(filter, col_types, binary_columns);
     match (filter_json_raw, filter_json_raw.and_then(accepted)) {
         (Some(raw), None) => (None, Some(raw)),
         (_, tree) => (tree.as_ref().and_then(render_df_filter_safe), None),

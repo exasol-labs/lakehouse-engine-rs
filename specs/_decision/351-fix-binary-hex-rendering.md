@@ -26,4 +26,5 @@ The scan renders each binary column as lowercase hex `VARCHAR` in its select lis
 
 - Results match native Exasol over the hex text, including an empty value reading as NULL.
 - The rewrite stays out of `NOT`, because there the empty value's raw-byte result differs from the text's NULL.
-- `BINARY_AS_STRING` reads the bytes as text through DataFusion's file-schema coercion, so Exasol, not the scan, rejects invalid UTF-8, and its error does not name the column.
+- `BINARY_AS_STRING` keeps the column binary and converts it to text in the scan with a validating function, because arrow-rs validates UTF-8 only for an annotated `STRING` column. Invalid UTF-8 fails the query and names the column, also in a filter or aggregate that does not return the column. Filters on the text keep row filtering and lose statistics pruning, which matters little for the legacy files the property targets. #558 reuses the function for annotated `STRING` columns.
+- A binary partition value travels as lowercase hex from every format, so the scan decodes one form and decides by the declared type.

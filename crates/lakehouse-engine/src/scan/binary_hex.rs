@@ -27,20 +27,9 @@ const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 /// An empty value renders NULL, because Exasol stores an empty `VARCHAR` as NULL and a filter
 /// over the rendered text must agree with it.
 pub(super) fn render_hex(array: &ArrayRef, column: &str) -> Result<ArrayRef> {
-    let values: Box<dyn Iterator<Item = Option<&[u8]>>> = match array.data_type() {
-        DataType::Binary => Box::new(array.as_binary::<i32>().iter()),
-        DataType::LargeBinary => Box::new(array.as_binary::<i64>().iter()),
-        DataType::BinaryView => Box::new(array.as_binary_view().iter()),
-        DataType::FixedSizeBinary(_) => Box::new(array.as_fixed_size_binary().iter()),
-        other => {
-            return Err(DataFusionError::Internal(format!(
-                "{BINARY_HEX_UDF_NAME} renders binary values, not {other}"
-            )));
-        }
-    };
     let mut rendered = StringBuilder::with_capacity(array.len(), 0);
     let mut text = String::new();
-    for value in values {
+    for value in binary_values(array)? {
         match value {
             None | Some([]) => rendered.append_null(),
             Some(bytes) if bytes.len() > MAX_BINARY_BYTES => {
@@ -52,15 +41,69 @@ pub(super) fn render_hex(array: &ArrayRef, column: &str) -> Result<ArrayRef> {
             }
             Some(bytes) => {
                 text.clear();
-                for byte in bytes {
-                    text.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
-                    text.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
-                }
+                push_hex(&mut text, bytes);
                 rendered.append_value(&text);
             }
         }
     }
     Ok(Arc::new(rendered.finish()))
+}
+
+/// For a JSON object name, where an empty key stays `""` as an empty nested member does.
+pub(super) fn hex_map_keys(keys: &ArrayRef) -> Result<ArrayRef> {
+    let mut rendered = StringBuilder::with_capacity(keys.len(), 0);
+    let mut text = String::new();
+    for key in binary_values(keys)? {
+        match key {
+            None => rendered.append_null(),
+            Some(bytes) => {
+                text.clear();
+                push_hex(&mut text, bytes);
+                rendered.append_value(&text);
+            }
+        }
+    }
+    Ok(Arc::new(rendered.finish()))
+}
+
+fn binary_values(array: &ArrayRef) -> Result<Box<dyn Iterator<Item = Option<&[u8]>> + '_>> {
+    Ok(match array.data_type() {
+        DataType::Binary => Box::new(array.as_binary::<i32>().iter()),
+        DataType::LargeBinary => Box::new(array.as_binary::<i64>().iter()),
+        DataType::BinaryView => Box::new(array.as_binary_view().iter()),
+        DataType::FixedSizeBinary(_) => Box::new(array.as_fixed_size_binary().iter()),
+        other => {
+            return Err(DataFusionError::Internal(format!(
+                "{BINARY_HEX_UDF_NAME} renders binary values, not {other}"
+            )));
+        }
+    })
+}
+
+fn push_hex(text: &mut String, bytes: &[u8]) {
+    for byte in bytes {
+        text.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+        text.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+    }
+}
+
+/// The form every source carries a binary partition value in, so the scan decodes one form.
+pub(crate) fn lowercase_hex(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len() * 2);
+    push_hex(&mut text, bytes);
+    text
+}
+
+pub(crate) fn decode_lowercase_hex(text: &str) -> Option<Vec<u8>> {
+    let digit = |c: u8| HEX_DIGITS.iter().position(|&d| d == c).map(|v| v as u8);
+    let (pairs, rest) = text.as_bytes().as_chunks::<2>();
+    if !rest.is_empty() {
+        return None;
+    }
+    pairs
+        .iter()
+        .map(|[high, low]| Some(digit(*high)? << 4 | digit(*low)?))
+        .collect()
 }
 
 /// Called as `lakehouse_binary_hex(column, 'NAME')`; the name only labels the oversize error.

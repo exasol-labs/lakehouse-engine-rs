@@ -6,7 +6,7 @@ use crate::common::exasol_ws::ExaConn;
 use crate::common::seed::{
     E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_TABLE, E2E_TYPED_TABLE,
     seed_all_types, seed_complex_types_probe, seed_distinct_probe, seed_events,
-    seed_high_card_probe, seed_typed_distinct_probe,
+    seed_high_card_probe, seed_ident_part_bytes, seed_typed_distinct_probe,
 };
 use crate::common::stack::{
     iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
@@ -71,6 +71,7 @@ pub fn lakehouse_vs() {
         seed("all_types", seed_all_types(&url, WAREHOUSE));
         seed("distinct_probe", seed_distinct_probe(&url, WAREHOUSE));
         seed("high_card_probe", seed_high_card_probe(&url, WAREHOUSE));
+        seed("ident_part_bytes", seed_ident_part_bytes(&url, WAREHOUSE));
         create_virtual_schema(&mut exa_conn(), &VsProps::new(LAKEHOUSE_VS, E2E_NAMESPACE));
     });
 }

@@ -15,7 +15,9 @@ use serde_json::Value as Json;
 
 use crate::adapter::column_notes::{ColumnDeclaration, DeclaredSchema};
 use crate::adapter::tables::catalog_identifier_string;
+use crate::scan::lowercase_hex;
 use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry};
+use crate::types::mapping::{arrow_type_from_tag, is_binary};
 
 pub use crate::adapter::column_notes::RefusedColumn;
 
@@ -42,29 +44,24 @@ use unity_table_storage::UnityTableStorage;
 #[path = "format_tests.rs"]
 mod tests;
 
-/// The one CREATE-time declaration dispatch: each column's note, `None` for a column no source
-/// declares. An engine-side client's slot already holds the encoded note. Never fails: a column
-/// whose metadata cannot be declared is recorded with its refusal.
-pub(crate) fn declare_columns(table: &CatalogTable, binary_as_string: bool) -> Vec<Option<String>> {
+pub(crate) fn declare_columns(table: &CatalogTable) -> Vec<Option<String>> {
     let catalog_declared = catalog_declaration::declare(table);
     table
         .columns
         .iter()
         .enumerate()
-        .map(|(index, column)| {
-            let declaration = match (&column.declaration, &column.source_type) {
-                (Some(note), _) => match serde_json::from_str::<ColumnDeclaration>(note) {
-                    Ok(declaration) => Some(declaration),
-                    Err(_) => return Some(note.clone()),
-                },
-                (None, ColumnSourceType::Iceberg(field)) => Some(iceberg::declaration(field)),
+        .map(
+            |(index, column)| match (&column.declaration, &column.source_type) {
+                (Some(note), _) => Some(note.clone()),
+                (None, ColumnSourceType::Iceberg(field)) => {
+                    Some(iceberg::declaration(field).encode())
+                }
                 (None, ColumnSourceType::Unity { .. } | ColumnSourceType::Glue { .. }) => {
-                    catalog_declared.get(index).cloned()
+                    catalog_declared.get(index).map(ColumnDeclaration::encode)
                 }
                 (None, ColumnSourceType::Parquet(_)) => None,
-            };
-            declaration.map(|declaration| declaration.binary_as_string(binary_as_string).encode())
-        })
+            },
+        )
         .collect()
 }
 
@@ -81,6 +78,26 @@ fn checked_storage_location<'t>(
              URI and the CONNECTION endpoint name no table location and are not valid substitutes",
             catalog_identifier_string(&table.ident)
         ))),
+    }
+}
+
+/// A Delta or Hive partition value is a string, so a binary column's value travels as the lowercase
+/// hex of its UTF-8 bytes, the form the Iceberg reader writes and `scan::partition_scalar` decodes.
+fn hex_binary_partition_values(files: &mut [FileEntry], logical_schema: &[LogicalField]) {
+    let binary: Vec<&str> = logical_schema
+        .iter()
+        .filter(|field| is_binary(&arrow_type_from_tag(&field.arrow_type)))
+        .map(|field| field.name.as_str())
+        .collect();
+    if binary.is_empty() {
+        return;
+    }
+    for file in files {
+        for (column, value) in &mut file.partition_values {
+            if let Some(value) = value.as_mut().filter(|_| binary.contains(&column.as_str())) {
+                *value = lowercase_hex(value.as_bytes());
+            }
+        }
     }
 }
 

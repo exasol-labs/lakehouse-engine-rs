@@ -325,7 +325,7 @@ pub(crate) fn iceberg_notes(fields: &[iceberg::spec::NestedFieldRef]) -> Vec<(St
 /// What CREATE records for every column of `table`: its Exasol name and note, through the real
 /// `declare_columns`.
 pub(crate) fn declared_notes(table: &CatalogTable) -> Vec<(String, String)> {
-    let notes = declare_columns(table, false);
+    let notes = declare_columns(table);
     table
         .columns
         .iter()

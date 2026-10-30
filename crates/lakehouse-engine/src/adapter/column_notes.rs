@@ -6,8 +6,6 @@ use exasol_udf_sdk::error::UdfError;
 use serde::{Deserialize, Serialize};
 
 use crate::scan::spec::LogicalField;
-use crate::types::mapping::arrow_type_to_tag;
-use arrow::datatypes::DataType;
 
 /// Exasol persists at most this many characters of one column's `adapterNotes` and rejects the
 /// statement above it (sqlCode 04000). The limit counts characters, not bytes.
@@ -36,15 +34,6 @@ pub struct ColumnDeclaration {
 impl ColumnDeclaration {
     pub fn encode(&self) -> String {
         serde_json::to_string(self).expect("a column declaration always serializes")
-    }
-
-    /// `BINARY_AS_STRING` reads a variable-length binary column as UTF-8 text; a fixed-length one
-    /// keeps its hex rendering, as in Spark.
-    pub fn binary_as_string(mut self, enabled: bool) -> Self {
-        if enabled && self.source_type.arrow_type == arrow_type_to_tag(&DataType::Binary) {
-            self.source_type.arrow_type = arrow_type_to_tag(&DataType::Utf8);
-        }
-        self
     }
 }
 

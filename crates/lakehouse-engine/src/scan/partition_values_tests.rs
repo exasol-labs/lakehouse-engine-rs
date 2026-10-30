@@ -319,6 +319,42 @@ fn an_out_of_range_partition_value_is_refused_rather_than_truncated() {
     assert!(error.contains("2147483648"), "{error}");
 }
 
+/// Scenario: A binary partition value travels as lowercase hex
+#[test]
+fn a_binary_partition_value_decodes_from_lowercase_hex() {
+    let split = PartitionedScanSchema::split(
+        declared_schema(vec![
+            Field::new("b", DataType::Binary, true),
+            Field::new("f", DataType::FixedSizeBinary(2), true),
+        ]),
+        &["b".to_string(), "f".to_string()],
+    )
+    .expect("declared");
+
+    let values = split
+        .partition_values_for(&entry_with(&[("b", Some("00ff")), ("f", Some("abcd"))]))
+        .expect("lowercase hex of whole bytes decodes");
+    assert_eq!(
+        values,
+        vec![
+            ScalarValue::Binary(Some(vec![0x00, 0xff])),
+            ScalarValue::FixedSizeBinary(2, Some(vec![0xab, 0xcd])),
+        ]
+    );
+
+    for (b, f) in [
+        ("0", "abcd"),
+        ("ABCD", "abcd"),
+        ("zz", "abcd"),
+        ("00", "ab"),
+    ] {
+        let error = split
+            .partition_values_for(&entry_with(&[("b", Some(b)), ("f", Some(f))]))
+            .expect_err("a value that is not hex of the declared width must not be coerced");
+        assert!(error.contains("partition value"), "{error}");
+    }
+}
+
 #[test]
 fn a_partition_column_missing_from_a_file_entry_is_refused() {
     let split = split_with_middle_partition();

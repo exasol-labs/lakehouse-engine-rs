@@ -1,4 +1,5 @@
 use crate::adapter::ResolvedConnectionConfig;
+use crate::adapter::properties::resolve_binary_as_string;
 #[cfg(test)]
 use crate::scan::spec::StorageBackend;
 use exasol_udf_sdk::error::UdfError;
@@ -197,6 +198,7 @@ pub(super) async fn plan_join(
         memory_pool_fraction,
         instance_overhead_mb,
         s3_max_connections,
+        binary_as_string: resolve_binary_as_string(props),
         connection: conn,
     };
 

@@ -22,6 +22,7 @@ use crate::adapter::column_notes::{
 };
 use crate::adapter::iceberg_predicate::to_iceberg_predicate;
 use crate::adapter::tables::catalog_identifier_string;
+use crate::scan::lowercase_hex;
 use crate::scan::spec::{
     DeleteMechanism, FileEntry, LogicalField, NameMappingEntry, NestedField, NestedMembers,
 };
@@ -527,8 +528,7 @@ fn identity_partition_values(
                 .schema()
                 .field_by_id(field.source_id)?
                 .field_type
-                .as_primitive_type()
-                .filter(|source_type| !carries_bytes(source_type))?;
+                .as_primitive_type()?;
             let rendered = value
                 .map(|value| render_identity_value(value, source_type, &logical.arrow_type))
                 .transpose()
@@ -546,11 +546,19 @@ fn identity_partition_values(
         .collect()
 }
 
-/// The partition value's string form cannot carry arbitrary bytes, so such a column is read from
-/// the data file, which Iceberg writers keep it in.
-fn carries_bytes(source_type: &iceberg::spec::PrimitiveType) -> bool {
-    use iceberg::spec::PrimitiveType::{Binary, Fixed, Uuid};
-    matches!(source_type, Binary | Fixed(_) | Uuid)
+/// A partition value's string form cannot hold arbitrary bytes, so a binary value travels as the
+/// lowercase hex that `scan::partition_scalar` decodes.
+fn identity_bytes(
+    value: &iceberg::spec::PrimitiveLiteral,
+    source_type: &iceberg::spec::PrimitiveType,
+) -> Option<Vec<u8>> {
+    use iceberg::spec::{PrimitiveLiteral as L, PrimitiveType as T};
+    match (value, source_type) {
+        (L::Binary(bytes), T::Binary | T::Fixed(_)) => Some(bytes.clone()),
+        // iceberg-rust holds a uuid as the big-endian `u128` of its 16 bytes.
+        (L::UInt128(uuid), T::Uuid) => Some(uuid.to_be_bytes().to_vec()),
+        _ => None,
+    }
 }
 
 /// Casts as the scan's expression adapter casts a file column of another type than the declared
@@ -566,6 +574,9 @@ fn render_identity_value(
             "the partition struct holds a non-primitive value for a {source_type} column"
         ));
     };
+    if let Some(bytes) = identity_bytes(value, source_type) {
+        return Ok(lowercase_hex(&bytes));
+    }
     let file_value = file_column_value(value, source_type).ok_or_else(|| {
         format!("the partition struct holds a value of another type than the {source_type} column")
     })?;

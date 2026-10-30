@@ -17,12 +17,13 @@ A binary column reads as lowercase hexadecimal text on every source and at every
 
 ### Scenario: A binary column reads as lowercase hex on every source
 
-* *GIVEN* an Iceberg table with `binary`, `fixed(16)`, `uuid`, and `struct<x: binary>` columns, a Delta table with a `binary` column under no column mapping and under `name` column mapping and a `struct<x: binary>` column, a Unity Parquet and a Glue Parquet table each with a `binary` and a `struct<x: binary>` column, and a direct-storage directory with unannotated `BYTE_ARRAY`, `BSON`, `UUID`, and unannotated `FIXED_LEN_BYTE_ARRAY(16)` columns
+* *GIVEN* an Iceberg table with `binary`, `fixed(16)`, `uuid`, `struct<x: binary>`, `map<binary, int>`, and `map<uuid, int>` columns, a Delta table with a `binary` column under no column mapping and under `name` column mapping, a `struct<x: binary>` column, and a `map<binary, int>` column, a Unity Parquet and a Glue Parquet table each with a `binary` and a `struct<x: binary>` column, and a direct-storage directory with unannotated `BYTE_ARRAY`, `BSON`, `UUID`, and unannotated `FIXED_LEN_BYTE_ARRAY(16)` columns
 * *AND* the variable-length columns hold a value that is not valid UTF-8, an empty value, and NULL
 * *WHEN* a query selects each column
 * *THEN* the scan SHALL return each value as its lowercase hexadecimal text, with no byte altered
 * *AND* an empty value and NULL SHALL both read as NULL
 * *AND* a nested binary member SHALL render as a lowercase hexadecimal JSON string inside the column's JSON document, and an empty member as `""`
+* *AND* a binary, `fixed(L)`, or `uuid` map key SHALL render as its lowercase hexadecimal JSON object name, and an empty key as `""`
 
 ### Scenario: The listing declares a binary column
 
@@ -51,11 +52,13 @@ A binary column reads as lowercase hexadecimal text on every source and at every
 ### Scenario: BINARY_AS_STRING reads a variable-length binary column as UTF-8 text
 
 * *GIVEN* a virtual schema whose `BINARY_AS_STRING` property is `TRUE`
-* *WHEN* CREATE, REFRESH, or `ALTER VIRTUAL SCHEMA ... SET` declares the columns, and a query reads them
-* *THEN* every variable-length binary column of every table and source SHALL read as its UTF-8 text, and its filters SHALL use plain string semantics
-* *AND* a value that is not valid UTF-8 SHALL fail the query and MUST NOT be returned altered or as NULL
-* *AND* a `fixed(L)`, `uuid`, or nested binary column SHALL keep its hex rendering
-* *AND* setting the property to `FALSE`, its default, SHALL restore the hex rendering at the next declaration
+* *WHEN* a query reads, filters, or aggregates a top-level variable-length binary column of any table and source
+* *THEN* the adapter SHALL pass the property to the scan as a flag, and the declared column type SHALL stay `VARCHAR(2000000)`
+* *AND* the scan SHALL keep the column's type binary and convert each value to text through a function that validates it, reusing the binary buffers without copying
+* *AND* a value that is not valid UTF-8 SHALL fail the query with an error naming the column, also when the query filters or aggregates the column without returning it, and MUST NOT be returned altered or as NULL
+* *AND* the column's filters SHALL use plain string semantics, with row filtering on, and the adapter MUST NOT rewrite them into byte comparisons
+* *AND* a `fixed(L)` or `uuid` column, and a binary member of a nested column, SHALL keep its hex rendering
+* *AND* a change of the property through `ALTER VIRTUAL SCHEMA ... SET` SHALL apply from the next query, with no `REFRESH`
 
 ### Scenario: A catalog string column over binary file data reads as text
 

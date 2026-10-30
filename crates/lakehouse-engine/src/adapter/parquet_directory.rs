@@ -536,7 +536,7 @@ enum LeafKind {
     Refused(&'static str),
 }
 
-/// Mirrors `parquet` 58's `from_byte_array`: the logical type decides, and the converted type only
+/// Mirrors `parquet`'s `from_byte_array`: the logical type decides, and the converted type only
 /// when a file carries no logical type. Every other byte leaf renders as hex.
 fn classify_leaf(leaf: &ColumnDescriptor) -> LeafKind {
     match (

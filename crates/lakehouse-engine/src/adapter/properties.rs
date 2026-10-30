@@ -91,7 +91,6 @@ pub(super) struct TuningProperties {
 pub(super) struct CheckedProperties {
     pub(super) tuning: TuningProperties,
     pub(super) table_filter: TableFilter,
-    pub(super) binary_as_string: bool,
 }
 
 /// Rejects every unknown property name and every invalid tuning or table pattern value in one
@@ -116,6 +115,14 @@ pub(super) fn check_properties(props: &Json) -> Result<CheckedProperties, UdfErr
 /// counts as `false`, which only a pushdown on a schema persisted before the check can reach.
 pub(super) fn resolve_allow_http(props: &Json) -> bool {
     nonempty_str(props, PROP_ALLOW_HTTP)
+        .and_then(parse_boolean)
+        .unwrap_or(false)
+}
+
+/// Read at every pushdown, so a SET applies from the next query. A rejected value counts as
+/// `false`, as in [`resolve_allow_http`].
+pub(super) fn resolve_binary_as_string(props: &Json) -> bool {
+    nonempty_str(props, PROP_BINARY_AS_STRING)
         .and_then(parse_boolean)
         .unwrap_or(false)
 }
@@ -171,14 +178,10 @@ fn check_values(props: &Json) -> Result<CheckedProperties, Vec<String>> {
     let mut checker = TuningChecker::new(props);
     let tuning = checker.tuning();
     let table_filter = checker.table_filter();
-    let binary_as_string = checker
-        .value(PROP_BINARY_AS_STRING, check_boolean)
-        .unwrap_or(false);
     if checker.invalid.is_empty() {
         Ok(CheckedProperties {
             tuning,
             table_filter,
-            binary_as_string,
         })
     } else {
         Err(checker.invalid.into_values().collect())
@@ -201,6 +204,7 @@ impl<'a> TuningChecker<'a> {
 
     fn tuning(&mut self) -> TuningProperties {
         self.value(PROP_ALLOW_HTTP, check_boolean);
+        self.value(PROP_BINARY_AS_STRING, check_boolean);
         TuningProperties {
             parallelism_factor: self.whole_number(PROP_PARALLELISM_FACTOR),
             threading_mode: self.value(PROP_DF_THREADING_MODE, parse_threading_mode),
