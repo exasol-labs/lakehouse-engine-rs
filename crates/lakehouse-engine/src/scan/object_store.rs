@@ -20,6 +20,7 @@ use std::sync::Arc;
 use url::{Position, Url};
 
 use super::{scan_session_context, session_config_for_spec};
+use crate::scan::ObjectLocation;
 use crate::scan::runtime::{build_runtime_env, probe_tmp_spill};
 use crate::scan::spec::{AdlsCred, FileEntry, ScanSpec, StorageBackend, reconstruct_abs_uri};
 use crate::scan::storage_ref::ResolvedScanStorage;
@@ -284,10 +285,8 @@ fn index_file_sizes(
     table_root: &str,
 ) -> Result<(), UdfError> {
     for entry in files {
-        let abs = reconstruct_abs_uri(&entry.path, table_root);
-        let url = ListingTableUrl::parse(&abs)
-            .map_err(|e| UdfError::User(format!("invalid listing URL '{abs}': {e}")))?;
-        sizes.insert(url.prefix().clone(), entry.size);
+        let location = ObjectLocation::parse_entry(&entry.path, table_root)?;
+        sizes.insert(location.key().clone(), entry.size);
     }
     Ok(())
 }
@@ -394,7 +393,9 @@ fn side_store_url(files: &[FileEntry], table_root: &str) -> Result<Url, UdfError
     let first = files
         .first()
         .ok_or_else(|| UdfError::User("scan spec has no files".into()))?;
-    store_root_url(&reconstruct_abs_uri(&first.path, table_root))
+    Ok(ObjectLocation::parse_entry(&first.path, table_root)?
+        .store_root()
+        .clone())
 }
 
 /// The `scheme://userinfo@host:port` slice, as `ListingTableUrl::object_store()` takes it. Keeps

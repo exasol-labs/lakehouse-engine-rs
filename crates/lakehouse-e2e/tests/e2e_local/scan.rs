@@ -8,17 +8,17 @@ use crate::common::seed::{
     ALL_TYPES_IDS_TEXT, BINARY_MAP_VALUES_TEXT, BINARY_VALUES_TEXT, BOOLEAN_VALUES_TEXT,
     DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT,
     DECIMAL_38_10_VALUES_TEXT, DIM_CUSTOMER_ROWS, E2E_ALL_TYPES_TABLE, E2E_BINARY_VALUES_TABLE,
-    E2E_EVO_TABLE, E2E_IDENT_PART_BYTES_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE,
-    E2E_TABLE_2, E2E_UUID_SIGNED_BOUNDS_TABLE, EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS,
-    EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS,
-    FIXED_16_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT32_VALUES_TEXT, LINEITEM_ROWS, LINES_PER_ORDER,
-    OVERSIZED_BINARY_BYTES, PART_CENTRAL_IDS, PART_COL, PART_FILE_NAME_URL_CHARS, PART_NORTH_IDS,
-    PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, PART_VALUES,
-    SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, STRUCT_BINARY_VALUES_TEXT,
-    TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT, TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B,
-    UUID_MAP_VALUES_TEXT, UUID_SIGNED_BOUNDS_ROWS, initdef_columns,
-    seed_added_columns_initial_default, seed_renamed_column, typed_decimal_a_avg_stddev,
-    typed_decimal_b_avg_stddev, typed_id_avg_stddev,
+    E2E_EVO_TABLE, E2E_IDENT_PART_BYTES_TABLE, E2E_NAMESPACE, E2E_ODD_ROOT_TABLE, E2E_PART_TABLE,
+    E2E_TABLE, E2E_TABLE_2, E2E_UUID_SIGNED_BOUNDS_TABLE, EVO_INITDEF_POST_ADD_IDS,
+    EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL,
+    EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FIXED_16_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT32_VALUES_TEXT,
+    LINEITEM_ROWS, LINES_PER_ORDER, OVERSIZED_BINARY_BYTES, PART_CENTRAL_IDS, PART_COL,
+    PART_FILE_NAME_URL_CHARS, PART_NORTH_IDS, PART_ROWS_PER_FILE, PART_TOTAL_ROWS,
+    PART_VAL_CENTRAL, PART_VAL_NORTH, PART_VALUES, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15,
+    SEED_TOTAL_ROWS, STRUCT_BINARY_VALUES_TEXT, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
+    TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, UUID_MAP_VALUES_TEXT, UUID_SIGNED_BOUNDS_ROWS,
+    initdef_columns, seed_added_columns_initial_default, seed_renamed_column,
+    typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev, typed_id_avg_stddev,
 };
 use crate::common::stack::{exasol_container, iceberg_catalog_url, iceberg_catalog_url_internal};
 use crate::common::timestamp_precision::{
@@ -2771,6 +2771,36 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         let ids: Vec<i64> = conn.query_columns(&sql)[0].iter().map(parse_int).collect();
         assert_eq!(&ids, expected, "'{predicate}' rows");
     }
+}
+
+/// Scenario: A data-file path under a table root holding escaped characters is carried relative
+#[test]
+fn e2e_a_table_root_needing_escapes_reads_its_rows_through_relative_paths() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let sql = format!(
+        "SELECT id FROM {LAKEHOUSE_VS}.{} ORDER BY id",
+        E2E_ODD_ROOT_TABLE.to_uppercase()
+    );
+
+    let pushed = explain_virtual_pushdown_sql(&mut conn, &sql);
+    assert!(
+        pushed.contains("odd%253D%23%E2%82%AC/regions_odd_root"),
+        "the table root travels escaped like its files:\n{pushed}"
+    );
+    let relative = format!("\"data/{E2E_ODD_ROOT_TABLE}-");
+    let absolute = format!("/data/{E2E_ODD_ROOT_TABLE}-");
+    assert_eq!(
+        (
+            pushed.matches(&relative).count(),
+            pushed.contains(&absolute)
+        ),
+        (PART_VALUES.len(), false),
+        "every data file is carried relative to the root:\n{pushed}"
+    );
+
+    let ids: Vec<i64> = conn.query_columns(&sql)[0].iter().map(parse_int).collect();
+    assert_eq!(ids, (1..=PART_TOTAL_ROWS as i64).collect::<Vec<_>>());
 }
 
 #[test]

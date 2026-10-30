@@ -1,5 +1,6 @@
 use super::*;
-use crate::scan::spec::{DeltaDeletionVectorStorage, encode_location};
+use crate::scan::ObjectLocation;
+use crate::scan::spec::DeltaDeletionVectorStorage;
 use crate::scan::test_support::{current_thread_runtime, parquet_bytes};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -964,6 +965,10 @@ fn all_delete_mechanisms_converge_on_one_position_map() {
     );
 }
 
+fn wire(raw: &str) -> String {
+    ObjectLocation::from_raw(raw).unwrap().to_wire()
+}
+
 /// Scenario: A partition-granularity delete file is filtered to the data file being read
 #[test]
 fn positional_deletes_apply_to_a_data_file_whose_key_needs_escaping() {
@@ -972,9 +977,9 @@ fn positional_deletes_apply_to_a_data_file_whose_key_needs_escaping() {
     let delete_file_bytes =
         positional_delete_file_bytes(&[(RAW_DATA_FILE, 4), (RAW_SIBLING, 1)], None);
     let delete_file = entry_with(
-        &encode_location(RAW_DATA_FILE),
+        &wire(RAW_DATA_FILE),
         vec![DeleteMechanism::IcebergPositionalDelete {
-            path: encode_location("memory:///db/t/data/bin=a%3D#?/d.parquet"),
+            path: wire("memory:///db/t/data/bin=a%3D#?/d.parquet"),
             size: delete_file_bytes.len() as u64,
         }],
     );
@@ -993,7 +998,7 @@ fn positional_deletes_apply_to_a_data_file_whose_key_needs_escaping() {
             .into_iter()
             .map(|(path, set)| (path, set.iter().collect::<Vec<u64>>()))
             .collect::<Vec<_>>(),
-        [(encode_location(RAW_DATA_FILE), vec![4])],
+        [(wire(RAW_DATA_FILE), vec![4])],
         "keyed by the data file's escaped URI, with only its own positions"
     );
 }

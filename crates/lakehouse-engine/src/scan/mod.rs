@@ -44,7 +44,10 @@ pub(crate) use self::object_store::{
     store_root_url,
 };
 use object_store::build_session_context;
-pub(crate) use spec::{encode_file_path, reconstruct_abs_uri};
+pub(crate) use spec::reconstruct_abs_uri;
+
+mod object_location;
+pub(crate) use object_location::ObjectLocation;
 
 mod storage_ref;
 pub use storage_ref::ResolvedScanStorage;

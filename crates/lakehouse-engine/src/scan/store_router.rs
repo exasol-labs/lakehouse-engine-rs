@@ -23,7 +23,8 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::scan::spec::{FileEntry, StorageBackend, reconstruct_abs_uri};
+use crate::scan::ObjectLocation;
+use crate::scan::spec::{FileEntry, StorageBackend};
 
 const STORE_NAME: &str = "PrefixRoutingObjectStore";
 
@@ -72,7 +73,9 @@ impl RoutedSide {
 }
 
 fn store_path(entry_path: &str, table_root: &str) -> Result<ObjectStorePath, UdfError> {
-    listing_prefix(&reconstruct_abs_uri(entry_path, table_root))
+    Ok(ObjectLocation::parse_entry(entry_path, table_root)?
+        .key()
+        .clone())
 }
 
 fn listing_prefix(uri: &str) -> Result<ObjectStorePath, UdfError> {

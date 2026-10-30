@@ -85,6 +85,11 @@ pub const PART_VALUES: [&str; 3] = [PART_VAL_NORTH, PART_VAL_CENTRAL, PART_VAL_S
 /// In every `regions` data file name, because a URL parse decodes `%3D` and cuts at `#` or `?`.
 pub const PART_FILE_NAME_URL_CHARS: &str = "%3D#?";
 
+/// The `regions` rows again, under a table root a URL parse would decode (`%3D`), cut (`#`), and
+/// escape (`€`), so only a root escaped like its files keeps the file list relative.
+pub const E2E_ODD_ROOT_TABLE: &str = "regions_odd_root";
+pub const ODD_ROOT_LOCATION: &str = "s3://warehouse/e2e_lakehouse/odd%3D#€/regions_odd_root";
+
 pub const PART_NORTH_IDS: (usize, usize) = (1, 5);
 pub const PART_CENTRAL_IDS: (usize, usize) = (6, 10);
 pub const PART_SOUTH_IDS: (usize, usize) = (11, 15);
@@ -108,6 +113,7 @@ pub async fn seed_events(catalog_url: &str, warehouse: &str) -> Result<SeedHandl
     let events_handle = seed_events_table(catalog_url, warehouse).await?;
     seed_labels_table(catalog_url, warehouse).await?;
     seed_partitioned(catalog_url, warehouse).await?;
+    seed_odd_root(catalog_url, warehouse).await?;
     seed_star_schema(catalog_url, warehouse).await?;
     seed_multi_table_join_extension(catalog_url, warehouse).await?;
     seed_char_pad_table(catalog_url, warehouse).await?;
@@ -1261,6 +1267,56 @@ pub async fn seed_partitioned(catalog_url: &str, warehouse: &str) -> Result<()> 
         files,
     )
     .await?;
+    Ok(())
+}
+
+/// Not [`seed_table`]: its staleness check reads the schema alone, never the location.
+pub async fn seed_odd_root(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-odd-root").await?;
+    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
+    let ident = TableIdent::new(ns.clone(), E2E_ODD_ROOT_TABLE.to_string());
+    if catalog
+        .table_exists(&ident)
+        .await
+        .context("check table exists")?
+    {
+        let table = catalog.load_table(&ident).await.context("load table")?;
+        if table.metadata().location() == ODD_ROOT_LOCATION
+            && !collect_current_snapshot_paths(&table).await?.is_empty()
+        {
+            return Ok(());
+        }
+        catalog
+            .drop_table(&ident)
+            .await
+            .context("drop the stale odd-root table")?;
+    }
+    let creation = TableCreation::builder()
+        .name(E2E_ODD_ROOT_TABLE.to_string())
+        .schema(regions_iceberg_schema()?)
+        .partition_spec(unpartitioned())
+        .location(ODD_ROOT_LOCATION.to_string())
+        .properties(HashMap::new())
+        .build();
+    let mut table = catalog
+        .create_table(&ns, creation)
+        .await
+        .context("create the odd-root table")?;
+    for (region, (first_id, last_id)) in [
+        (PART_VAL_NORTH, PART_NORTH_IDS),
+        (PART_VAL_CENTRAL, PART_CENTRAL_IDS),
+        (PART_VAL_SOUTH, PART_SOUTH_IDS),
+    ] {
+        let data_files = write_data_files(
+            &table,
+            &format!("{E2E_ODD_ROOT_TABLE}-{region}-{PART_FILE_NAME_URL_CHARS}"),
+            Struct::empty(),
+            WriterProperties::default(),
+            [make_regions_batch(first_id, last_id, region)],
+        )
+        .await?;
+        table = commit_data_files(&catalog, &table, data_files).await?;
+    }
     Ok(())
 }
 

@@ -60,6 +60,7 @@ const BASE_REFRESH: &str = "s3://warehouse/direct_refresh/";
 /// Its own base path: its name collision fails every full REFRESH of the base path it uses.
 const BASE_REFRESH_NAMES: &str = "s3://warehouse/direct_refresh_names/";
 const BASE_TABLE_FILTER: &str = "s3://warehouse/direct_table_filter/";
+const BASE_AWKWARD: &str = "s3://warehouse/direct_awkward_names/";
 
 const VS_DIRECT: &str = "DIRECT_LAKEHOUSE";
 const VS_DIRECT_NARROW: &str = "DIRECT_LAKEHOUSE_NARROW";
@@ -73,6 +74,7 @@ const VS_COLLISION_MISSING_HIVE_OFF: &str = "DIRECT_HIVE_COLLISION_MISSING_OFF";
 const VS_REFRESH: &str = "DIRECT_REFRESH_VS";
 const VS_REFRESH_NAMES: &str = "DIRECT_REFRESH_NAMES_VS";
 const VS_TABLE_FILTER: &str = "DIRECT_TABLE_FILTER_VS";
+const VS_AWKWARD: &str = "DIRECT_AWKWARD_NAMES_VS";
 
 const CONN_DIRECT: &str = "DIRECT_STORAGE_CREDS";
 const CONN_INCOMPATIBLE: &str = "DIRECT_STORAGE_INCOMPATIBLE_CREDS";
@@ -81,6 +83,7 @@ const CONN_COLLISION_MISSING: &str = "DIRECT_STORAGE_COLLISION_MISSING_CREDS";
 const CONN_REFRESH: &str = "DIRECT_STORAGE_REFRESH_CREDS";
 const CONN_REFRESH_NAMES: &str = "DIRECT_STORAGE_REFRESH_NAMES_CREDS";
 const CONN_TABLE_FILTER: &str = "DIRECT_STORAGE_TABLE_FILTER_CREDS";
+const CONN_AWKWARD: &str = "DIRECT_STORAGE_AWKWARD_NAMES_CREDS";
 
 /// No `warehouse`: the direct-storage kind rejects that field.
 fn direct_storage_password() -> CatalogConnectionPassword {
@@ -3717,4 +3720,61 @@ fn hidden_directories_are_never_read_or_recorded_as_skipped() {
         ["GOOD"],
         "REFRESH TABLES cannot add a hidden table back"
     );
+}
+
+/// Each name holds a character `object_store`'s `PathPart::from` escapes, or a URL parse decodes
+/// or cuts at.
+const AWKWARD_DIRECTORIES: [&str; 14] = [
+    "tpct%3D",
+    "thash#",
+    "tquery?",
+    "tstar*",
+    "ttilde~",
+    "tbracket[x]",
+    "tbrace{x}",
+    "tcaret^",
+    "tpipe|",
+    "tspace x",
+    "tplus+",
+    "tamp&",
+    "teuro€",
+    "teq=x",
+];
+
+/// Scenario: A first-level directory whose name needs escaping is served and read
+#[test]
+fn directories_whose_names_need_escaping_are_served_and_read() {
+    stack();
+    let mut conn = exa_conn();
+    delete_fixture_prefix(BASE_AWKWARD);
+    for (id, directory) in AWKWARD_DIRECTORIES.iter().enumerate() {
+        put_refresh_file(
+            BASE_AWKWARD,
+            &format!("{directory}/f%3D#€.parquet"),
+            vec![("ID", int64_column(&[id as i64]))],
+        );
+    }
+
+    create_direct_vs(&mut conn, VS_AWKWARD, CONN_AWKWARD, BASE_AWKWARD);
+
+    let expected: BTreeSet<String> = AWKWARD_DIRECTORIES
+        .iter()
+        .map(|directory| directory.to_uppercase())
+        .collect();
+    assert_eq!(
+        served_tables(&mut conn, VS_AWKWARD)
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        expected,
+        "every directory is a table; skipped: {:?}",
+        skipped_entries(&mut conn, VS_AWKWARD)
+    );
+    for (id, directory) in AWKWARD_DIRECTORIES.iter().enumerate() {
+        let sql = format!(
+            "SELECT ID FROM \"{VS_AWKWARD}\".\"{}\"",
+            directory.to_uppercase()
+        );
+        let ids: Vec<i64> = conn.query_columns(&sql)[0].iter().map(parse_int).collect();
+        assert_eq!(ids, [id as i64], "{directory} reads its own file");
+    }
 }

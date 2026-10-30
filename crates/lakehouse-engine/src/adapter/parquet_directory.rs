@@ -103,37 +103,6 @@ pub struct RefusedLeaf {
     pub nested_enum: bool,
 }
 
-/// The store-relative prefix a storage URI names (pairs with [`crate::scan::store_root_url`]).
-/// Derived here once rather than per caller, so enumeration and planning can't disagree and list
-/// a table's files from two different prefixes.
-pub fn store_prefix(uri: &str) -> Result<StorePath, UdfError> {
-    let url = url::Url::parse(uri)
-        .map_err(|e| UdfError::User(format!("invalid storage URI '{uri}': {e}")))?;
-    StorePath::from_url_path(url.path())
-        .map_err(|e| UdfError::User(format!("invalid storage path in '{uri}': {e}")))
-}
-
-/// A Glue location names the literal object key, so unlike [`store_prefix`] the key is never
-/// percent-decoded; `s3a` reads as `s3`.
-pub fn raw_location_prefix(location: &str) -> Result<(String, StorePath), UdfError> {
-    let refused =
-        |cause: String| UdfError::User(format!("invalid storage location '{location}': {cause}"));
-    let (scheme, rest) = location
-        .split_once("://")
-        .filter(|(scheme, _)| !scheme.is_empty())
-        .ok_or_else(|| refused("it names no scheme".to_string()))?;
-    let (bucket, key) = rest.split_once('/').unwrap_or((rest, ""));
-    if bucket.is_empty() {
-        return Err(refused("it names no bucket".to_string()));
-    }
-    let scheme = match scheme.to_ascii_lowercase().as_str() {
-        "s3a" => "s3".to_string(),
-        other => other.to_string(),
-    };
-    let prefix = StorePath::parse(key).map_err(|error| refused(error.to_string()))?;
-    Ok((format!("{scheme}://{bucket}"), prefix))
-}
-
 /// A prefix holding no data file returns an empty file list and schema; whether that counts as a
 /// table is the caller's decision. Only CREATE, REFRESH, and SET call it: a pushdown plans from the
 /// column notes they record and lists through [`list_parquet_files`].

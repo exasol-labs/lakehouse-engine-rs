@@ -11,6 +11,7 @@ use crate::adapter::tests::parquet_fixture::{
 use crate::scan::spec::{NestedField, NestedMembers, reconstruct_abs_uri};
 use arrow::datatypes::{DataType, Field, Fields};
 use datafusion::datasource::listing::ListingTableUrl;
+use object_store::path::Path as StorePath;
 use std::collections::BTreeMap;
 
 const BASE_PATH: &str = "s3://warehouse/direct";
@@ -52,9 +53,10 @@ async fn try_resolve(
             .map(|(name, note)| (name.as_str(), note.as_deref()))
             .collect(),
     };
+    let table_root = ObjectLocation::from_raw(TABLE_ROOT).unwrap();
     let reader = ParquetFormatReader {
         store,
-        table_root: TABLE_ROOT,
+        table_root: &table_root,
         storage: &storage,
     };
     resolve_from_notes(&reader, &table_notes, filter_json).await

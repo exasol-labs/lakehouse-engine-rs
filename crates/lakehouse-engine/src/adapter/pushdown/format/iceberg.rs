@@ -22,9 +22,9 @@ use crate::adapter::column_notes::{
 };
 use crate::adapter::iceberg_predicate::to_iceberg_predicate;
 use crate::adapter::tables::catalog_identifier_string;
+use crate::scan::ObjectLocation;
 use crate::scan::spec::{
     DeleteMechanism, FileEntry, LogicalField, NameMappingEntry, NestedField, NestedMembers,
-    encode_location,
 };
 
 #[cfg(test)]
@@ -265,6 +265,7 @@ async fn plan_checked_table(
         .map(|task| {
             let mut entry = planned_file_entry(task)
                 .map_err(|mechanism| unsupported_delete_error(mechanism, &table_name))?;
+            wire_paths(&mut entry)?;
             entry.partition_values = identity_partition_values(task, declared, &table_name)?;
             Ok(entry)
         })
@@ -273,9 +274,22 @@ async fn plan_checked_table(
     Ok(PlannedFiles {
         files,
         effective_storage,
-        table_root,
+        table_root: ObjectLocation::from_raw(&table_root)?.to_wire(),
         name_mapping,
     })
+}
+
+/// A manifest path names its key raw, so a URL parse would decode `%3D` in Spark's
+/// `bin=bm9ydGg%3D` or cut at `#` and `?`.
+fn wire_paths(entry: &mut FileEntry) -> Result<(), UdfError> {
+    let wire = |raw: &str| ObjectLocation::from_raw(raw).map(|location| location.to_wire());
+    entry.path = wire(&entry.path)?;
+    for delete in &mut entry.deletes {
+        if let Some(path) = delete.object_store_path_mut() {
+            *path = wire(path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Keeps the mapping's own tree shape; an entry without a `field-id` maps nothing and is skipped
@@ -431,7 +445,7 @@ fn refuse_date_promotion(
 /// slips past. `Data` maps to the same non-positional sentinel.
 fn iceberg_delete_mechanism(delete: &iceberg::scan::FileScanTaskDeleteFile) -> DeleteMechanism {
     use iceberg::spec::DataContentType::{Data, EqualityDeletes, PositionDeletes};
-    let path = encode_location(delete.file_path());
+    let path = delete.file_path().to_string();
     let size = delete.file_size_in_bytes();
     match (delete.file_type(), delete.file_format()) {
         // iceberg-rust refuses to build a deletion-vector task missing these, so the defaults
@@ -499,7 +513,7 @@ fn planned_file_entry(
         })
         .collect::<Result<_, _>>()?;
     Ok(FileEntry::with_deletes(
-        encode_location(task.data_file_path()),
+        task.data_file_path().to_string(),
         task.file_size_in_bytes(),
         deletes,
     ))

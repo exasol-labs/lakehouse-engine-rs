@@ -13,12 +13,11 @@ use crate::scan::deletion_vectors::{
     DeltaDeletionVector, IcebergDeletionVector, LoggedDeletionVector, ManifestDeletionVector,
 };
 use crate::scan::parquet_reader::{SizedParquetReader, object_meta_for};
-use crate::scan::reconstruct_abs_uri;
 use crate::scan::spec::{DeleteMechanism, FileEntry};
+use crate::scan::{ObjectLocation, reconstruct_abs_uri};
 use arrow::array::{Array, Int64Array, LargeStringArray, StringArray};
 use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
-use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
 use datafusion::execution::memory_pool::MemoryReservation;
 use exasol_udf_sdk::error::UdfError;
@@ -34,7 +33,6 @@ use parquet::errors::ParquetError;
 use parquet::file::FOOTER_SIZE;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
-use percent_encoding::percent_decode_str;
 use roaring::RoaringTreemap;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -502,11 +500,13 @@ impl ShardDeletes<'_> {
                 .files
                 .iter()
                 .map(|entry| {
-                    let uri = reconstruct_abs_uri(&entry.path, self.table_root);
-                    let location = percent_decode_str(&uri).decode_utf8_lossy().into_owned();
-                    (location, uri)
+                    let location = ObjectLocation::parse_entry(&entry.path, self.table_root)?;
+                    Ok((
+                        location.to_string(),
+                        reconstruct_abs_uri(&entry.path, self.table_root),
+                    ))
                 })
-                .collect(),
+                .collect::<Result<_, UdfError>>()?,
             secrets: Arc::clone(&self.secrets),
             limiter: Arc::clone(&self.limiter),
             reservation: Arc::clone(&self.reservation),
@@ -816,9 +816,9 @@ impl DeleteReadContext {
         let _permit = acquire(&self.limiter)
             .await
             .map_err(|e| unreadable(e.to_string()))?;
-        let location = ListingTableUrl::parse(url)
+        let location = ObjectLocation::parse_wire(url)
             .map_err(|e| unreadable(format!("invalid deletion-vector URL: {e}")))?
-            .prefix()
+            .key()
             .clone();
         let body = match range {
             Some(range) => self.store.get_range(&location, range).await,

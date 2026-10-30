@@ -8,6 +8,8 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the per-shard file
 * A path is emitted relative only when the root is an actual prefix of it, because Iceberg data-file paths can live outside `metadata.location()` (`write.data.path`, `write.object-storage.enabled` hash injection, migrated or Databricks layouts).
 * Delete-file paths use the same relative or absolute encoding, and each delete-file entry also carries its delete content type.
 * The scan parses each path as a URL, which decodes `%` escapes and ends the path at `#` or `?`. Each entry's key is therefore escaped. An Iceberg manifest path is a raw key, and Spark writes a partition value such as `bm9ydGg=` as `bin=bm9ydGg%3D`. A Delta `add.path` arrives escaped already.
+* One location type, holding a store root and a raw key, is the only conversion between a source's path and the wire form. An Iceberg manifest path, a Glue location, the direct-storage CONNECTION address, and a listed object key or directory name are raw keys and are never decoded. A Delta `add.path` and a Unity storage location are URLs and decode exactly once. The scan reads every wire path through the same type.
+* The table root travels in the same wire form as its entries. A path is relative when its raw key lies below the root's raw key in the same store, so a root holding an escaped character still yields relative entries.
 
 ## Scenarios
 
@@ -40,8 +42,22 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the per-shard file
 
 * *GIVEN* an Iceberg table whose data file, positional-delete file, or Puffin deletion-vector file has a manifest path holding `%`, `#`, or `?` in its key
 * *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the adapter SHALL escape each `%`, `#`, and `?` of that path's key, and SHALL leave its scheme and authority unchanged
+* *THEN* the adapter SHALL escape each `%`, `#`, and `?` of that path's key, and every character a URL parse would otherwise rewrite, and SHALL leave its scheme and authority unchanged
 * *AND* the scan SHALL read the object stored under the manifest path's raw key
+
+### Scenario: Every source's key reaches the scan as the same raw key
+
+* *GIVEN* a key segment holding `%`, `%3D`, `%zz`, `%25`, `%2F`, `%2E%2E`, `#`, `?`, `*`, `~`, `[`, `]`, `{`, `}`, `^`, `|`, a space, `+`, `€`, or `&`
+* *WHEN* that key enters as a raw location, as a listed segment, or as a percent-encoded URL, and is written to the wire and parsed back by the scan
+* *THEN* the scan SHALL address the same raw key the source named
+
+### Scenario: A data-file path under a table root holding escaped characters is carried relative
+
+* *GIVEN* an Iceberg table whose root holds `%3D`, `#`, or a non-ASCII character, and whose data and delete files lie below that root
+* *WHEN* the adapter builds the scan-driving SQL
+* *THEN* the adapter SHALL carry the root in the wire form its entries use
+* *AND* each data-file and delete-file entry below the root SHALL be relative, so the file list grows by no more than for a plain root
+* *AND* the scan SHALL read every row of the table
 
 ### Scenario: Each delete-file entry carries its content type so the scan can reject unsupported deletes
 
