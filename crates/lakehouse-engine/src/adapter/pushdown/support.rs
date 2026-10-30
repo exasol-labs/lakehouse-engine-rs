@@ -766,7 +766,7 @@ pub(super) fn type_accepted_rewrite(
     binary_columns: &BinaryColumns,
 ) -> Option<Json> {
     apply_type_rewrites(expr, col_types)
-        .map(|tree| compare_binary_bytes(&tree, binary_columns))
+        .map(|tree| compare_binary_bytes(tree, binary_columns))
         .filter(datafusion_renderable)
 }
 

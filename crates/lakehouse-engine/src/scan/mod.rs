@@ -25,7 +25,7 @@ mod json_render;
 pub(crate) use json_render::render_nested_column_as_json;
 
 mod binary_hex;
-pub(crate) use binary_hex::{lowercase_hex, raw_bytes_alias};
+pub(crate) use binary_hex::raw_bytes_alias;
 
 mod binary_text;
 

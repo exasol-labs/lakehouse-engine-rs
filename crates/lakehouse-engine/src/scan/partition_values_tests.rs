@@ -342,12 +342,7 @@ fn a_binary_partition_value_decodes_from_lowercase_hex() {
         ]
     );
 
-    for (b, f) in [
-        ("0", "abcd"),
-        ("ABCD", "abcd"),
-        ("zz", "abcd"),
-        ("00", "ab"),
-    ] {
+    for (b, f) in [("0", "abcd"), ("zz", "abcd"), ("00", "ab")] {
         let error = split
             .partition_values_for(&entry_with(&[("b", Some(b)), ("f", Some(f))]))
             .expect_err("a value that is not hex of the declared width must not be coerced");

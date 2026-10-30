@@ -111,18 +111,19 @@ pub(super) fn check_properties(props: &Json) -> Result<CheckedProperties, UdfErr
     )))
 }
 
-/// Reads `ALLOW_HTTP` with the TRUE/FALSE rule that `check_properties` applies. A rejected value
-/// counts as `false`, which only a pushdown on a schema persisted before the check can reach.
 pub(super) fn resolve_allow_http(props: &Json) -> bool {
-    nonempty_str(props, PROP_ALLOW_HTTP)
-        .and_then(parse_boolean)
-        .unwrap_or(false)
+    resolve_boolean(props, PROP_ALLOW_HTTP)
 }
 
-/// Read at every pushdown, so a SET applies from the next query. A rejected value counts as
-/// `false`, as in [`resolve_allow_http`].
+/// Read at every pushdown, so a SET applies from the next query.
 pub(super) fn resolve_binary_as_string(props: &Json) -> bool {
-    nonempty_str(props, PROP_BINARY_AS_STRING)
+    resolve_boolean(props, PROP_BINARY_AS_STRING)
+}
+
+/// Applies the TRUE/FALSE rule that `check_properties` applies. A rejected value counts as
+/// `false`, which only a pushdown on a schema persisted before the check can reach.
+fn resolve_boolean(props: &Json, name: &str) -> bool {
+    nonempty_str(props, name)
         .and_then(parse_boolean)
         .unwrap_or(false)
 }

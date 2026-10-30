@@ -1,21 +1,14 @@
 use vs_expression::render_df_filter_safe;
 
 use super::*;
+use crate::adapter::pushdown::test_support::filter_json::{column, compare, string as text};
+use crate::adapter::pushdown::test_support::nullable_field as field;
 
 fn columns() -> BinaryColumns {
     columns_under(false)
 }
 
 fn columns_under(binary_as_string: bool) -> BinaryColumns {
-    let field = |name: &str, arrow_type: &str| LogicalField {
-        field_id: None,
-        name: name.to_string(),
-        arrow_type: arrow_type.to_string(),
-        nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
-    };
     BinaryColumns::of(
         &[
             field("b", "binary"),
@@ -26,20 +19,8 @@ fn columns_under(binary_as_string: bool) -> BinaryColumns {
     )
 }
 
-fn column(name: &str) -> Json {
-    json!({"type": "column", "name": name, "tableName": "T"})
-}
-
-fn text(value: &str) -> Json {
-    json!({"type": "literal_string", "value": value})
-}
-
-fn compare(op: &str, left: Json, right: Json) -> Json {
-    json!({"type": op, "left": left, "right": right})
-}
-
 fn rendered(filter: &Json) -> String {
-    render_df_filter_safe(&compare_binary_bytes(filter, &columns())).expect("renders")
+    render_df_filter_safe(&compare_binary_bytes(filter.clone(), &columns())).expect("renders")
 }
 
 #[test]
@@ -99,16 +80,19 @@ fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
     for literal in ["0A1B", "0a1", "", "zz"] {
         let filter = compare("predicate_equal", column("B"), text(literal));
         assert_eq!(
-            compare_binary_bytes(&filter, &columns()),
+            compare_binary_bytes(filter.clone(), &columns()),
             filter,
             "{literal}"
         );
     }
     let wrong_width = compare("predicate_equal", column("U"), text("0a"));
-    assert_eq!(compare_binary_bytes(&wrong_width, &columns()), wrong_width);
+    assert_eq!(
+        compare_binary_bytes(wrong_width.clone(), &columns()),
+        wrong_width
+    );
     let string_column = compare("predicate_equal", column("S"), text("0a"));
     assert_eq!(
-        compare_binary_bytes(&string_column, &columns()),
+        compare_binary_bytes(string_column.clone(), &columns()),
         string_column
     );
 }
@@ -118,7 +102,7 @@ fn only_a_comparison_reached_through_and_or_is_rewritten() {
     let equal = compare("predicate_equal", column("B"), text("0a"));
     let negated = json!({"type": "predicate_not", "expression": equal});
     assert_eq!(
-        compare_binary_bytes(&negated, &columns()),
+        compare_binary_bytes(negated.clone(), &columns()),
         negated,
         "NOT turns the empty value's false into true, where Exasol keeps NULL"
     );
@@ -143,7 +127,7 @@ fn binary_as_string_keeps_a_variable_length_filter_on_the_text() {
         compare("predicate_equal", column("U"), text("00ff")),
     ]});
 
-    let rewritten = compare_binary_bytes(&filter, &columns_under(true));
+    let rewritten = compare_binary_bytes(filter.clone(), &columns_under(true));
 
     assert_eq!(
         rewritten["expressions"][0], filter["expressions"][0],

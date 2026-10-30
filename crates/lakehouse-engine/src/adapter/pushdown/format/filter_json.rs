@@ -2,7 +2,7 @@ use serde_json::Value as Json;
 use std::cmp::Ordering;
 
 #[derive(Clone, Copy)]
-pub(super) enum Comparison {
+pub(in crate::adapter::pushdown) enum Comparison {
     Equal,
     NotEqual,
     Less,
@@ -12,7 +12,7 @@ pub(super) enum Comparison {
 }
 
 impl Comparison {
-    pub(super) fn from_node_type(kind: &str) -> Option<Self> {
+    pub(in crate::adapter::pushdown) fn from_node_type(kind: &str) -> Option<Self> {
         Some(match kind {
             "predicate_equal" => Self::Equal,
             "predicate_notequal" => Self::NotEqual,
@@ -24,7 +24,18 @@ impl Comparison {
         })
     }
 
-    pub(super) fn with_operands_swapped(self) -> Self {
+    pub(in crate::adapter::pushdown) fn node_type(self) -> &'static str {
+        match self {
+            Self::Equal => "predicate_equal",
+            Self::NotEqual => "predicate_notequal",
+            Self::Less => "predicate_less",
+            Self::LessEqual => "predicate_lessequal",
+            Self::Greater => "predicate_greater",
+            Self::GreaterEqual => "predicate_greaterequal",
+        }
+    }
+
+    pub(in crate::adapter::pushdown) fn with_operands_swapped(self) -> Self {
         match self {
             Self::Less => Self::Greater,
             Self::LessEqual => Self::GreaterEqual,
@@ -46,7 +57,7 @@ impl Comparison {
     }
 }
 
-pub(super) fn column_name(node: &Json) -> Option<&str> {
+pub(in crate::adapter::pushdown) fn column_name(node: &Json) -> Option<&str> {
     if node.get("type")?.as_str()? != "column" {
         return None;
     }

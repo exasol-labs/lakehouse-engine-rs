@@ -23,6 +23,7 @@ object_store = { workspace = true, features = ["azure"] }
 async-trait = "0.1"
 # object_store re-exports no alias for the Bytes in `ObjectStore::get_ranges`.
 bytes = "1"
+hex = "0.4"
 
 roaring = { workspace = true }
 

@@ -5,7 +5,7 @@ use crate::adapter::parquet_directory::{
 };
 use crate::scan::DIRECT_STORAGE_ADMISSION_LIMIT;
 use crate::scan::spec::{LogicalField, NestedField, NestedMembers, StorageBackend};
-use crate::types::mapping::{arrow_type_to_tag, is_binary, needs_json_fallback};
+use crate::types::mapping::{arrow_type_to_tag, needs_json_fallback};
 use arrow::datatypes::{DataType, Field, FieldRef};
 use exasol_udf_sdk::error::UdfError;
 use futures::{StreamExt, TryStreamExt, stream};
@@ -158,7 +158,7 @@ fn resolve_columns(directory: &ParquetDirectory) -> Vec<CatalogColumn> {
         .iter()
         .map(|field| {
             let declared =
-                if needs_json_fallback(field.data_type()) && !is_binary(field.data_type()) {
+                if needs_json_fallback(field.data_type()) && !field.data_type().is_binary() {
                     DataType::Utf8
                 } else {
                     field.data_type().clone()

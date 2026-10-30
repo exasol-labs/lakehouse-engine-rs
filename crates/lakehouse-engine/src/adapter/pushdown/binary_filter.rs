@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use arrow::datatypes::DataType;
 use serde_json::{Value as Json, json};
 
+use super::format::filter_json::{Comparison, column_name};
 use crate::scan::raw_bytes_alias;
 use crate::scan::spec::LogicalField;
 use crate::types::mapping::arrow_type_from_tag;
@@ -34,10 +35,7 @@ impl BinaryColumns {
     }
 
     fn resolve(&self, node: &Json) -> Option<(String, Option<i32>)> {
-        if node.get("type")?.as_str()? != "column" {
-            return None;
-        }
-        let name = node.get("name")?.as_str()?.to_uppercase();
+        let name = column_name(node)?.to_uppercase();
         let width = *self.0.get(&name)?;
         Some((name, width))
     }
@@ -46,18 +44,17 @@ impl BinaryColumns {
 /// Rewrites only the comparisons the root reaches through AND and OR, where a false result drops
 /// a row exactly as a NULL one does, so the bytes may stand in for the hex text whose empty value
 /// Exasol reads as NULL.
-pub(crate) fn compare_binary_bytes(node: &Json, columns: &BinaryColumns) -> Json {
+pub(crate) fn compare_binary_bytes(mut node: Json, columns: &BinaryColumns) -> Json {
     match node.get("type").and_then(Json::as_str) {
         Some("predicate_and" | "predicate_or") => {
-            let mut rewritten = node.clone();
-            if let Some(Json::Array(children)) = rewritten.get_mut("expressions") {
+            if let Some(Json::Array(children)) = node.get_mut("expressions") {
                 for child in children {
-                    *child = compare_binary_bytes(child, columns);
+                    *child = compare_binary_bytes(child.take(), columns);
                 }
             }
-            rewritten
+            node
         }
-        _ => byte_comparison(node, columns).unwrap_or_else(|| node.clone()),
+        _ => byte_comparison(&node, columns).unwrap_or(node),
     }
 }
 
@@ -86,19 +83,15 @@ fn byte_comparison(node: &Json, columns: &BinaryColumns) -> Option<Json> {
                 "right": byte_literal(node.get("right")?, width)?,
             }))
         }
-        op @ ("predicate_equal"
-        | "predicate_notequal"
-        | "predicate_less"
-        | "predicate_lessequal"
-        | "predicate_greater"
-        | "predicate_greaterequal") => {
+        kind => {
+            let op = Comparison::from_node_type(kind)?;
             let (left, right) = (node.get("left")?, node.get("right")?);
             let ((column, width), literal, op) = match columns.resolve(left) {
                 Some(column) => (column, right, op),
-                None => (columns.resolve(right)?, left, mirrored(op)),
+                None => (columns.resolve(right)?, left, op.with_operands_swapped()),
             };
             let comparison = json!({
-                "type": op,
+                "type": op.node_type(),
                 "left": raw_bytes(&column),
                 "right": byte_literal(literal, width)?,
             });
@@ -106,7 +99,7 @@ fn byte_comparison(node: &Json, columns: &BinaryColumns) -> Option<Json> {
             // reads as NULL; a fixed-length value is never empty.
             let admits_empty = matches!(
                 op,
-                "predicate_notequal" | "predicate_less" | "predicate_lessequal"
+                Comparison::NotEqual | Comparison::Less | Comparison::LessEqual
             );
             if width.is_none() && admits_empty {
                 let non_empty = json!({
@@ -121,17 +114,6 @@ fn byte_comparison(node: &Json, columns: &BinaryColumns) -> Option<Json> {
             }
             Some(comparison)
         }
-        _ => None,
-    }
-}
-
-fn mirrored(op: &str) -> &str {
-    match op {
-        "predicate_less" => "predicate_greater",
-        "predicate_lessequal" => "predicate_greaterequal",
-        "predicate_greater" => "predicate_less",
-        "predicate_greaterequal" => "predicate_lessequal",
-        symmetric => symmetric,
     }
 }
 
@@ -145,13 +127,15 @@ fn byte_literal(node: &Json, width: Option<i32>) -> Option<Json> {
     if node.get("type")?.as_str()? != "literal_string" {
         return None;
     }
-    let hex = node.get("value")?.as_str()?;
-    let whole_bytes = !hex.is_empty() && hex.len() % 2 == 0;
-    let lowercase = hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    let fits = width.is_none_or(|width| usize::try_from(width).ok() == Some(hex.len() / 2));
-    (whole_bytes && lowercase && fits).then(|| match width {
-        Some(width) => json!({"type": "literal_binary", "value": hex, "width": width}),
-        None => json!({"type": "literal_binary", "value": hex}),
+    let digits = node.get("value")?.as_str()?;
+    if digits.bytes().any(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    let bytes = hex::decode(digits).ok().filter(|bytes| !bytes.is_empty())?;
+    let fits = width.is_none_or(|width| usize::try_from(width).ok() == Some(bytes.len()));
+    fits.then(|| match width {
+        Some(width) => json!({"type": "literal_binary", "value": digits, "width": width}),
+        None => json!({"type": "literal_binary", "value": digits}),
     })
 }
 

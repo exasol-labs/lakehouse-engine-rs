@@ -145,7 +145,7 @@ impl DeclaredSchema {
     }
 }
 
-/// Shared by every source that can carry a geospatial column.
+/// Shared by every source that can carry a type this engine does not read.
 pub fn unread_type_cause(declared: &str) -> String {
     format!("has type '{declared}', which this engine does not read")
 }

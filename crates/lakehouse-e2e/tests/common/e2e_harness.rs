@@ -3,7 +3,10 @@
 
 use super::exasol_ws::ExaConn;
 pub use super::exasol_ws::error_text;
-use super::seed::{DECIMAL_18_0_VALUES_TEXT, E2E_DIM_TABLE, E2E_FACT_TABLE, build_seed_catalog};
+use super::seed::{
+    DECIMAL_18_0_VALUES_TEXT, E2E_DIM_TABLE, E2E_FACT_TABLE, FIXED_16_VALUES_TEXT,
+    build_seed_catalog,
+};
 use super::stack::{
     CatalogConnectionPassword, bucketfs_port, bucketfs_write_password, build_create_connection_sql,
     exasol_host, exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal,
@@ -1002,10 +1005,9 @@ pub fn assert_filters_match_native_copy(
     columns: &str,
     filters: &[&str],
 ) {
-    let native = NATIVE_COPY;
     conn.execute("CREATE SCHEMA IF NOT EXISTS FILTER_ORACLE");
     conn.execute(&format!(
-        "CREATE OR REPLACE TABLE {native} AS SELECT ID, {columns} FROM {table}"
+        "CREATE OR REPLACE TABLE {NATIVE_COPY} AS SELECT ID, {columns} FROM {table}"
     ));
     let ids = |conn: &mut ExaConn, from: &str, filter: &str| -> Vec<String> {
         let sql = format!("SELECT TO_CHAR(ID) FROM {from} WHERE {filter} ORDER BY ID");
@@ -1022,7 +1024,7 @@ pub fn assert_filters_match_native_copy(
     for filter in filters {
         assert_eq!(
             ids(conn, table, filter),
-            ids(conn, native, filter),
+            ids(conn, NATIVE_COPY, filter),
             "WHERE {filter} on {table} must select the rows native Exasol selects"
         );
     }
@@ -1040,7 +1042,9 @@ pub fn assert_binary_columns_match_native_copy(
     variable: &[&str],
     fixed: &[&str],
 ) {
-    let (high, low) = ("55".repeat(16), "11".repeat(16));
+    let [Some(high), Some(low), _] = FIXED_16_VALUES_TEXT else {
+        unreachable!("the first two fixed values are non-NULL")
+    };
     let variable_filters = [
         "{c} = '00abff'",
         "{c} <> '00abff'",

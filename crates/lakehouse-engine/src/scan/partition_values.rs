@@ -3,9 +3,7 @@
 //! substituted as scan-time literals, so projection, filters, aggregation, and pruning all see
 //! the real value with no post-scan rewrite. A file's value always wins over the data file.
 
-use crate::scan::binary_hex::decode_lowercase_hex;
 use crate::scan::spec::FileEntry;
-use crate::types::mapping::is_binary;
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::datasource::table_schema::TableSchema;
 use datafusion::error::DataFusionError;
@@ -250,11 +248,11 @@ pub(crate) fn partition_scalar(
     value: &str,
     data_type: &DataType,
 ) -> Result<ScalarValue, DataFusionError> {
-    if !is_binary(data_type) {
+    if !data_type.is_binary() {
         return ScalarValue::try_from_string(value.to_string(), data_type);
     }
-    let bytes = decode_lowercase_hex(value).ok_or_else(|| {
-        DataFusionError::Execution("a binary partition value must be lowercase hex".to_string())
+    let bytes = hex::decode(value).map_err(|e| {
+        DataFusionError::Execution(format!("a binary partition value must be hex: {e}"))
     })?;
     match data_type {
         DataType::FixedSizeBinary(width) if usize::try_from(*width).ok() != Some(bytes.len()) => {

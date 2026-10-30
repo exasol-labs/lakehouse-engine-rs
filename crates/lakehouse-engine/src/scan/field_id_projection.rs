@@ -7,7 +7,7 @@
 use crate::scan::raw_scan::NESTED_JSON_RENDER_UDF_NAME;
 use crate::scan::render_nested_column_as_json;
 use crate::scan::spec::{NameMappingEntry, NestedField, NestedMembers};
-use crate::types::mapping::{is_binary, needs_json_fallback, needs_nested_json_rendering};
+use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
 use crate::types::widening::widen;
 use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, MapArray, RecordBatch,
@@ -900,7 +900,7 @@ fn admits(physical: &DataType, logical: &DataType) -> bool {
         || widen(physical, logical).as_ref() == Some(logical)
         || admits_timestamp(physical, logical)
         || admits_as_text(physical, logical)
-        || (logical == &DataType::Binary && is_binary(physical))
+        || (logical == &DataType::Binary && physical.is_binary())
         || matches!(physical, DataType::Dictionary(_, value) if admits(value, logical))
 }
 

@@ -3558,7 +3558,7 @@ pub const E2E_IDENT_PART_BYTES_TABLE: &str = "ident_part_bytes";
 
 /// `SELECT B, F ... ORDER BY ID` of [`E2E_IDENT_PART_BYTES_TABLE`].
 pub const IDENT_PART_BYTES_TEXT: [[Option<&str>; 3]; 2] = [
-    [Some("00abff"), Some("00abff"), None],
+    [BINARY_VALUES_TEXT[0], BINARY_VALUES_TEXT[0], None],
     [FIXED_16_VALUES_TEXT[0], FIXED_16_VALUES_TEXT[0], None],
 ];
 

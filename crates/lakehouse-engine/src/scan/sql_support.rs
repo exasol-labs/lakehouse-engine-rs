@@ -2,7 +2,7 @@ use arrow::datatypes::DataType;
 use datafusion::common::DFSchema;
 
 use crate::scan::spec::ProjectionItem;
-use crate::types::mapping::{is_binary, needs_json_fallback, needs_nested_json_rendering};
+use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
 
 use super::binary_hex::{BINARY_HEX_UDF_NAME, raw_bytes_alias};
 use super::binary_text::BINARY_TEXT_UDF_NAME;
@@ -30,7 +30,7 @@ pub fn build_alias_items(schema: &DFSchema, binary_as_string: bool) -> Vec<Strin
                         quote_ident(&alias)
                     )
                 }
-                binary if is_binary(binary) => format!(
+                binary if binary.is_binary() => format!(
                     "{BINARY_HEX_UDF_NAME}({column}, '{label}') AS {}, {column} AS {}",
                     quote_ident(&alias),
                     quote_ident(&raw_bytes_alias(&alias))
@@ -87,7 +87,7 @@ pub(super) fn render_projection<'a>(
 pub(super) fn render_column(name: &str, data_type: Option<&DataType>) -> String {
     let ident = quote_ident(&name.to_uppercase());
     match data_type {
-        Some(dt) if is_binary(dt) => ident,
+        Some(dt) if dt.is_binary() => ident,
         Some(dt) if needs_nested_json_rendering(dt) => {
             format!("{NESTED_JSON_RENDER_UDF_NAME}({ident})")
         }

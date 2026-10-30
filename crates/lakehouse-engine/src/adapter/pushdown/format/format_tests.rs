@@ -1,6 +1,7 @@
 use super::super::test_support::{
     UNREACHABLE_CATALOG, catalog_table, declared_columns, declared_schema_of, glue_catalog_table,
-    load_table_body, no_notes, object_endpoint, sample_storage, sigv4_creds, user_message,
+    load_table_body, no_notes, nullable_field, object_endpoint, sample_storage, sigv4_creds,
+    user_message,
 };
 use super::*;
 use lakehouse_catalog::CatalogTableIdent;
@@ -278,16 +279,7 @@ fn declare_columns_notes_each_catalog_parquet_column_with_its_partition_position
 /// Scenario: A binary partition value travels as lowercase hex
 #[test]
 fn a_delta_or_hive_binary_partition_value_travels_as_the_hex_of_its_utf8_bytes() {
-    let field = |name: &str, arrow_type: &str| LogicalField {
-        field_id: None,
-        name: name.to_string(),
-        arrow_type: arrow_type.to_string(),
-        nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
-    };
-    let logical_schema = [field("b", "binary"), field("s", "utf8")];
+    let logical_schema = [nullable_field("b", "binary"), nullable_field("s", "utf8")];
     let mut files = vec![FileEntry::with_partition_values(
         "part-0.parquet",
         1,

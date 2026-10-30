@@ -5,13 +5,14 @@
 use arrow::array::cast::AsArray;
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use arrow::datatypes::DataType;
-use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use std::sync::Arc;
+
+use super::binary_hex::{binary_values, column_label};
 
 pub(super) const BINARY_TEXT_UDF_NAME: &str = "lakehouse_binary_text";
 
@@ -39,12 +40,9 @@ pub(crate) fn bytes_as_text(array: &ArrayRef, column: &str) -> Result<ArrayRef> 
 }
 
 fn invalid_utf8(array: &ArrayRef, column: &str) -> DataFusionError {
-    let values: Box<dyn Iterator<Item = Option<&[u8]>>> = match array.data_type() {
-        DataType::LargeBinary => Box::new(array.as_binary::<i64>().iter()),
-        DataType::BinaryView => Box::new(array.as_binary_view().iter()),
-        _ => Box::new(array.as_binary::<i32>().iter()),
-    };
-    let detail = values
+    let detail = binary_values(array)
+        .into_iter()
+        .flatten()
         .flatten()
         .find_map(|bytes| std::str::from_utf8(bytes).err())
         .map(|error| format!(": {error}"))
@@ -79,16 +77,9 @@ impl ScalarUDFImpl for BinaryTextUdf {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let column = match args.args.get(1) {
-            Some(ColumnarValue::Scalar(ScalarValue::Utf8(Some(column)))) => column.clone(),
-            _ => {
-                return Err(DataFusionError::Internal(format!(
-                    "{BINARY_TEXT_UDF_NAME} takes the column name as its second argument"
-                )));
-            }
-        };
+        let column = column_label(&args, BINARY_TEXT_UDF_NAME)?;
         let array = args.args[0].to_array(args.number_rows)?;
-        Ok(ColumnarValue::Array(bytes_as_text(&array, &column)?))
+        Ok(ColumnarValue::Array(bytes_as_text(&array, column)?))
     }
 }
 

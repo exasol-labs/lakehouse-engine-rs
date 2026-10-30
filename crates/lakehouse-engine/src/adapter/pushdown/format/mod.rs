@@ -15,9 +15,8 @@ use serde_json::Value as Json;
 
 use crate::adapter::column_notes::{ColumnDeclaration, DeclaredSchema};
 use crate::adapter::tables::catalog_identifier_string;
-use crate::scan::lowercase_hex;
 use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry};
-use crate::types::mapping::{arrow_type_from_tag, is_binary};
+use crate::types::mapping::arrow_type_from_tag;
 
 pub use crate::adapter::column_notes::RefusedColumn;
 
@@ -28,7 +27,7 @@ mod delta_predicate;
 mod delta_protocol;
 mod delta_replay;
 mod delta_schema;
-mod filter_json;
+pub(super) mod filter_json;
 mod iceberg;
 mod parquet_format_reader;
 mod partition_predicate;
@@ -86,7 +85,7 @@ fn checked_storage_location<'t>(
 fn hex_binary_partition_values(files: &mut [FileEntry], logical_schema: &[LogicalField]) {
     let binary: Vec<&str> = logical_schema
         .iter()
-        .filter(|field| is_binary(&arrow_type_from_tag(&field.arrow_type)))
+        .filter(|field| arrow_type_from_tag(&field.arrow_type).is_binary())
         .map(|field| field.name.as_str())
         .collect();
     if binary.is_empty() {
@@ -95,7 +94,7 @@ fn hex_binary_partition_values(files: &mut [FileEntry], logical_schema: &[Logica
     for file in files {
         for (column, value) in &mut file.partition_values {
             if let Some(value) = value.as_mut().filter(|_| binary.contains(&column.as_str())) {
-                *value = lowercase_hex(value.as_bytes());
+                *value = hex::encode(value.as_bytes());
             }
         }
     }

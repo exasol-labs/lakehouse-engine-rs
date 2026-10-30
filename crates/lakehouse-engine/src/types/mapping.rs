@@ -141,16 +141,6 @@ pub fn needs_json_fallback(dt: &DataType) -> bool {
 /// The largest binary value whose lowercase hex rendering fits `VARCHAR(2000000)`.
 pub const MAX_BINARY_BYTES: usize = 1_000_000;
 
-pub fn is_binary(dt: &DataType) -> bool {
-    matches!(
-        dt,
-        DataType::Binary
-            | DataType::LargeBinary
-            | DataType::BinaryView
-            | DataType::FixedSizeBinary(_)
-    )
-}
-
 /// Two hex characters per byte, so a `fixed(L)` column declares `VARCHAR(2L)`.
 pub(crate) fn hex_varchar(width: u64) -> String {
     let chars = width.saturating_mul(2);
