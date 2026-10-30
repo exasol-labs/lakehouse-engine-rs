@@ -8,7 +8,7 @@ use exasol_udf_sdk::error::UdfError;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use crate::redaction::redact_error_text;
+use crate::auth::redact_catalog_auth_error;
 use crate::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogTable, CatalogTableIdent,
     CatalogTableType, ColumnSourceType, ConnectionCreds, SkipReason, SkippedTable, TableAdmission,
@@ -140,22 +140,7 @@ impl UnityCatalogSession {
         kind: &str,
     ) -> Result<T, UdfError> {
         let (builder, bearer) = self.auth.apply(builder).await?;
-        let redact = |msg: &str| {
-            let mut secrets: Vec<&str> = Vec::new();
-            for candidate in [
-                bearer.as_deref(),
-                self.creds.client_secret.as_deref(),
-                self.creds.token.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if !candidate.is_empty() {
-                    secrets.push(candidate);
-                }
-            }
-            redact_error_text(msg, &secrets)
-        };
+        let redact = |msg: &str| redact_catalog_auth_error(msg, &self.creds, bearer.as_deref());
         let what = format!("Unity Catalog {kind} request");
         let request = builder
             .build()
