@@ -1,5 +1,5 @@
 use super::*;
-use crate::scan::spec::DeltaDeletionVectorStorage;
+use crate::scan::spec::{DeltaDeletionVectorStorage, encode_location};
 use crate::scan::test_support::{current_thread_runtime, parquet_bytes};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -11,6 +11,7 @@ use object_store::memory::InMemory;
 use object_store::path::Path as StorePath;
 use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
 use parquet::schema::types::{SchemaDescPtr, SchemaDescriptor};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -707,7 +708,10 @@ async fn read_positions(
     let ctx = Arc::new(DeleteReadContext {
         store,
         table_root: String::new(),
-        assigned: assigned.iter().map(|path| path.to_string()).collect(),
+        assigned: assigned
+            .iter()
+            .map(|path| (path.to_string(), path.to_string()))
+            .collect(),
         secrets: Arc::from([]),
         limiter: Arc::new(Semaphore::new(permits)),
         reservation: unbounded_reservation(),
@@ -957,6 +961,40 @@ fn all_delete_mechanisms_converge_on_one_position_map() {
     assert_eq!(
         puffin_reads, 1,
         "adjacent blobs of one Puffin file are fetched in one request"
+    );
+}
+
+/// Scenario: A partition-granularity delete file is filtered to the data file being read
+#[test]
+fn positional_deletes_apply_to_a_data_file_whose_key_needs_escaping() {
+    const RAW_DATA_FILE: &str = "memory:///db/t/data/bin=a%3D#?/f.parquet";
+    const RAW_SIBLING: &str = "memory:///db/t/data/bin=a%3D#?/g.parquet";
+    let delete_file_bytes =
+        positional_delete_file_bytes(&[(RAW_DATA_FILE, 4), (RAW_SIBLING, 1)], None);
+    let delete_file = entry_with(
+        &encode_location(RAW_DATA_FILE),
+        vec![DeleteMechanism::IcebergPositionalDelete {
+            path: encode_location("memory:///db/t/data/bin=a%3D#?/d.parquet"),
+            size: delete_file_bytes.len() as u64,
+        }],
+    );
+
+    let positions = current_thread_runtime().block_on(async move {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let raw_key = StorePath::parse("db/t/data/bin=a%3D#?/d.parquet").unwrap();
+        store.put(&raw_key, delete_file_bytes.into()).await.unwrap();
+        collect_positions(&[delete_file], "memory:///db/t", 1, &store)
+            .await
+            .unwrap()
+    });
+
+    assert_eq!(
+        positions
+            .into_iter()
+            .map(|(path, set)| (path, set.iter().collect::<Vec<u64>>()))
+            .collect::<Vec<_>>(),
+        [(encode_location(RAW_DATA_FILE), vec![4])],
+        "keyed by the data file's escaped URI, with only its own positions"
     );
 }
 

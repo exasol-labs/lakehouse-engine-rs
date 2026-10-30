@@ -19,7 +19,10 @@ pub const PARTITION_GRANULARITY_TABLE: &str = "mor_pos_partition";
 
 pub const PARTITION_COL: &str = "region";
 
-pub const PARTITION_VALUES: [&str; 2] = ["east", "west"];
+/// Iceberg escapes these in the partition path, so every data and delete file key holds `%`.
+pub const PARTITION_EAST: &str = "east=";
+
+pub const PARTITION_WEST: &str = "west#?";
 
 /// One data file per range, in commit order: east 1, east 2, west 1, west 2.
 pub const PARTITION_DATA_FILE_ID_RANGES: [(i64, i64); 4] = [(1, 5), (6, 10), (11, 15), (16, 20)];

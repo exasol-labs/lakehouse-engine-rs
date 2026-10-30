@@ -79,6 +79,9 @@ pub const PART_VAL_SOUTH: &str = "south";
 
 pub const PART_VALUES: [&str; 3] = [PART_VAL_NORTH, PART_VAL_CENTRAL, PART_VAL_SOUTH];
 
+/// In every `regions` data file name, because a URL parse decodes `%3D` and cuts at `#` or `?`.
+pub const PART_FILE_NAME_URL_CHARS: &str = "%3D#?";
+
 pub const PART_NORTH_IDS: (usize, usize) = (1, 5);
 pub const PART_CENTRAL_IDS: (usize, usize) = (6, 10);
 pub const PART_SOUTH_IDS: (usize, usize) = (11, 15);
@@ -1240,7 +1243,7 @@ pub async fn seed_partitioned(catalog_url: &str, warehouse: &str) -> Result<()> 
     ]
     .map(|(region, (first_id, last_id))| {
         (
-            format!("{E2E_PART_TABLE}-{region}"),
+            format!("{E2E_PART_TABLE}-{region}-{PART_FILE_NAME_URL_CHARS}"),
             Struct::from_iter([Some(Literal::string(region))]),
             [make_regions_batch(first_id, last_id, region)],
         )

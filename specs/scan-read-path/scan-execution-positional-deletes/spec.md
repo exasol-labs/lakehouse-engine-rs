@@ -6,6 +6,7 @@ Applies Iceberg merge-on-read positional deletes on read, so a query over a tabl
 
 * The scope is Parquet positional-delete files over Parquet data files, at `write.delete.granularity=file` and `write.delete.granularity=partition`. Equality deletes and ORC or Avro data or delete files fail loud. The primary gate is at plan time (`file-planning/pushdown-file-pruning`). It checks each planned data file and each delete file iceberg-rust applies to it, so it relies on iceberg-rust's delete matching.
 * A positional-delete file has the columns `file_path` (Utf8, field-id `2147483546`) and `pos` (Int64, field-id `2147483545`). The scan keeps the rows whose `file_path` equals the data file being read and accumulates their `pos` values into a per-data-file delete set. The `file_path` filter is required for `partition` granularity, where one delete file references many data files.
+* Iceberg spec, Position Delete Files: `file_path` "must match the `file_path` of the target data file in a manifest entry". The scan therefore matches it against the manifest path before the adapter's escaping (`file-planning/pushdown-planning-file-encoding`).
 * Several delete files can apply to one data file. The scan unions their positions.
 * The planning layer decides sequence-number applicability by associating each delete file with exactly the data files it applies to. The scan preserves that association and never re-derives it.
 * The adapter tags an Iceberg position delete stored in Puffin format as the Puffin deletion-vector variant, not as a positional delete, because the scan reads it by blob range.
@@ -27,6 +28,7 @@ Applies Iceberg merge-on-read positional deletes on read, so a query over a tabl
 * *GIVEN* a scan invocation whose assigned files include a Parquet positional-delete file (`write.delete.granularity=partition`) whose `file_path` column references several data files, including at least two files assigned to this shard
 * *WHEN* the scan UDF applies that delete file to each assigned data file
 * *THEN* for each data file the UDF SHALL retain only the delete-file rows whose `file_path` equals that data file's path, and SHALL apply those positions to that data file only
+* *AND* `file_path` SHALL be compared with the data file's unescaped manifest path, so a data file whose key holds `%`, `#`, or `?` keeps its deletes
 * *AND* the UDF MUST NOT delete a position of one data file using a delete-file row that references a different data file
 
 ### Scenario: Multiple delete files applying to one data file are unioned

@@ -34,9 +34,10 @@ use parquet::errors::ParquetError;
 use parquet::file::FOOTER_SIZE;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
+use percent_encoding::percent_decode_str;
 use roaring::RoaringTreemap;
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use tokio::sync::{Semaphore, SemaphorePermit};
@@ -230,10 +231,10 @@ fn locate_delete_columns(schema: &SchemaRef) -> Result<(usize, usize), UdfError>
 /// Range-based: Parquet truncates string statistics (min down, max up), so `[min, max]` is a
 /// superset and a byte-wise range test never prunes a possible match. An equality shortcut would
 /// wrongly prune truncated bounds bracketing a longer path. Absent or partial stats never prune.
-fn delete_row_group_may_match(
+fn delete_row_group_may_match<'p>(
     row_group: &RowGroupMetaData,
     file_path_idx: usize,
-    assigned: &HashSet<String>,
+    assigned: impl IntoIterator<Item = &'p String>,
 ) -> bool {
     let Some(column) = row_group.columns().get(file_path_idx) else {
         return true;
@@ -244,7 +245,7 @@ fn delete_row_group_may_match(
     let (Some(min), Some(max)) = (stats.min_bytes_opt(), stats.max_bytes_opt()) else {
         return true;
     };
-    assigned.iter().any(|path| {
+    assigned.into_iter().any(|path| {
         let bytes = path.as_bytes();
         min <= bytes && bytes <= max
     })
@@ -500,7 +501,11 @@ impl ShardDeletes<'_> {
             assigned: self
                 .files
                 .iter()
-                .map(|entry| reconstruct_abs_uri(&entry.path, self.table_root))
+                .map(|entry| {
+                    let uri = reconstruct_abs_uri(&entry.path, self.table_root);
+                    let location = percent_decode_str(&uri).decode_utf8_lossy().into_owned();
+                    (location, uri)
+                })
                 .collect(),
             secrets: Arc::clone(&self.secrets),
             limiter: Arc::clone(&self.limiter),
@@ -535,8 +540,9 @@ impl ShardDeletes<'_> {
 struct DeleteReadContext {
     store: Arc<dyn ObjectStore>,
     table_root: String,
-    /// The shard's data files, as absolute URIs.
-    assigned: HashSet<String>,
+    /// The shard's data files, by the unescaped location a positional-delete row names, to their
+    /// absolute URIs.
+    assigned: HashMap<String, String>,
     secrets: Arc<[String]>,
     limiter: Arc<Semaphore>,
     reservation: Arc<MemoryReservation>,
@@ -603,7 +609,7 @@ impl DeleteReadContext {
             .iter()
             .enumerate()
             .filter(|(_, row_group)| {
-                delete_row_group_may_match(row_group, file_path_idx, &self.assigned)
+                delete_row_group_may_match(row_group, file_path_idx, self.assigned.keys())
             })
             .map(|(idx, _)| idx)
             .partition(|&idx| {
@@ -704,7 +710,7 @@ impl DeleteReadContext {
                     if let Some((ended, Some(bucket))) = run.as_mut() {
                         add_positions(
                             &mut positions_by_data_file,
-                            ended,
+                            &self.assigned[ended],
                             bucket,
                             &self.reservation,
                             &self.secrets,
@@ -712,7 +718,7 @@ impl DeleteReadContext {
                     }
                     run = Some((
                         path.to_string(),
-                        self.assigned.contains(path).then(Vec::new),
+                        self.assigned.contains_key(path).then(Vec::new),
                     ));
                 }
                 let Some((_, Some(bucket))) = run.as_mut() else {
@@ -731,7 +737,7 @@ impl DeleteReadContext {
             if let Some((path, Some(bucket))) = run.as_mut() {
                 add_positions(
                     &mut positions_by_data_file,
-                    path,
+                    &self.assigned[path],
                     bucket,
                     &self.reservation,
                     &self.secrets,

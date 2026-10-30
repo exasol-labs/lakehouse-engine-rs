@@ -24,6 +24,7 @@ use crate::adapter::iceberg_predicate::to_iceberg_predicate;
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{
     DeleteMechanism, FileEntry, LogicalField, NameMappingEntry, NestedField, NestedMembers,
+    encode_location,
 };
 
 #[cfg(test)]
@@ -430,7 +431,7 @@ fn refuse_date_promotion(
 /// slips past. `Data` maps to the same non-positional sentinel.
 fn iceberg_delete_mechanism(delete: &iceberg::scan::FileScanTaskDeleteFile) -> DeleteMechanism {
     use iceberg::spec::DataContentType::{Data, EqualityDeletes, PositionDeletes};
-    let path = delete.file_path().to_string();
+    let path = encode_location(delete.file_path());
     let size = delete.file_size_in_bytes();
     match (delete.file_type(), delete.file_format()) {
         // iceberg-rust refuses to build a deletion-vector task missing these, so the defaults
@@ -498,7 +499,7 @@ fn planned_file_entry(
         })
         .collect::<Result<_, _>>()?;
     Ok(FileEntry::with_deletes(
-        task.data_file_path().to_string(),
+        encode_location(task.data_file_path()),
         task.file_size_in_bytes(),
         deletes,
     ))

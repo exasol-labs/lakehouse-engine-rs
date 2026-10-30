@@ -10,12 +10,12 @@ use crate::common::seed::{
     E2E_BINARY_VALUES_TABLE, E2E_EVO_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2,
     EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS,
     EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FLOAT32_VALUES_TEXT, INT32_VALUES_TEXT,
-    LINEITEM_ROWS, LINES_PER_ORDER, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE,
-    PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, PART_VALUES, SEED_LABELS_ROWS,
-    SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
-    TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, initdef_columns, seed_added_columns_initial_default,
-    seed_renamed_column, typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev,
-    typed_id_avg_stddev,
+    LINEITEM_ROWS, LINES_PER_ORDER, PART_CENTRAL_IDS, PART_COL, PART_FILE_NAME_URL_CHARS,
+    PART_NORTH_IDS, PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH,
+    PART_VALUES, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, TIME64_VALUES_TEXT,
+    TIMESTAMP_VALUES_TEXT, TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, initdef_columns,
+    seed_added_columns_initial_default, seed_renamed_column, typed_decimal_a_avg_stddev,
+    typed_decimal_b_avg_stddev, typed_id_avg_stddev,
 };
 use crate::common::stack::{exasol_container, iceberg_catalog_url, iceberg_catalog_url_internal};
 use crate::common::timestamp_precision::{
@@ -2584,10 +2584,18 @@ fn e2e_partition_filter_prunes_and_returns_correct_rows() {
     );
 }
 
+/// Scenario: An Iceberg file whose key holds `%`, `#`, or `?` is read from that key
 #[test]
 fn e2e_range_filter_prunes_by_file_bounds() {
     lakehouse_vs();
     let mut conn = exa_conn();
+    let files = runtime().block_on(resolve_fixture_files(E2E_NAMESPACE, E2E_PART_TABLE));
+    assert!(
+        files
+            .iter()
+            .all(|file| file.path.contains(PART_FILE_NAME_URL_CHARS)),
+        "every data file name must hold {PART_FILE_NAME_URL_CHARS}: {files:?}"
+    );
 
     let north_ids: Vec<i64> = (PART_NORTH_IDS.0 as i64..=PART_NORTH_IDS.1 as i64).collect();
     let all_ids: Vec<i64> = (1..=PART_TOTAL_ROWS as i64).collect();

@@ -36,6 +36,33 @@ fn reconstruct_relative_entry_normalizes_single_separator() {
     );
 }
 
+#[test]
+fn encoded_location_parses_back_to_its_raw_key() {
+    for (location, store_root, key) in [
+        (
+            "s3://bucket/t/data/bin=bm9ydGg%3D/f#1?.parquet",
+            "s3://bucket/",
+            "t/data/bin=bm9ydGg%3D/f#1?.parquet",
+        ),
+        (
+            "abfss://fs@account.dfs.core.windows.net/t/a%zz.parquet",
+            "abfss://fs@account.dfs.core.windows.net/",
+            "t/a%zz.parquet",
+        ),
+        (
+            "s3://bucket/t/plain.parquet",
+            "s3://bucket/",
+            "t/plain.parquet",
+        ),
+    ] {
+        let url =
+            datafusion::datasource::listing::ListingTableUrl::parse(encode_location(location))
+                .unwrap();
+        assert_eq!(url.prefix().as_ref(), key, "{location}");
+        assert_eq!(url.object_store().as_str(), store_root, "{location}");
+    }
+}
+
 fn sample_spec() -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {

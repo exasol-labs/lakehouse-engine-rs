@@ -1043,6 +1043,21 @@ pub(crate) fn encode_file_path<'p>(
     encoded
 }
 
+/// Escapes the key of an absolute `location`, keeping its scheme and authority.
+pub(crate) fn encode_location(location: &str) -> String {
+    let key_start = location.find("://").map_or(0, |scheme_end| {
+        let authority = scheme_end + 3;
+        location[authority..]
+            .find('/')
+            .map_or(location.len(), |slash| authority + slash)
+    });
+    let (root, key) = location.split_at(key_start);
+    format!(
+        "{root}{}",
+        percent_encoding::utf8_percent_encode(key, URL_PARSE_UNSAFE)
+    )
+}
+
 #[cfg(test)]
 #[path = "spec_tests.rs"]
 mod tests;

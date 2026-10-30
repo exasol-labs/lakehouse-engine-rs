@@ -7,6 +7,7 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the per-shard file
 * The table root is the value the format reader resolves for the table. For Iceberg it is `table.metadata().location()`.
 * A path is emitted relative only when the root is an actual prefix of it, because Iceberg data-file paths can live outside `metadata.location()` (`write.data.path`, `write.object-storage.enabled` hash injection, migrated or Databricks layouts).
 * Delete-file paths use the same relative or absolute encoding, and each delete-file entry also carries its delete content type.
+* The scan parses each path as a URL, which decodes `%` escapes and ends the path at `#` or `?`. Each entry's key is therefore escaped. An Iceberg manifest path is a raw key, and Spark writes a partition value such as `bm9ydGg=` as `bin=bm9ydGg%3D`. A Delta `add.path` arrives escaped already.
 
 ## Scenarios
 
@@ -16,7 +17,7 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the per-shard file
 * *WHEN* the adapter builds the scan-driving SQL
 * *THEN* the adapter SHALL carry the table root exactly once in the shard-invariant common spec argument
 * *AND* for each file whose URI begins with the table root, the adapter SHALL strip that root prefix and emit only the remaining relative path in the per-shard argument, so the repeated table-location prefix is shipped once rather than once per file
-* *AND* the reconstructed absolute path (table root joined with the relative entry) SHALL equal the original resolved data-file URI
+* *AND* the reconstructed absolute path (table root joined with the relative entry) SHALL address the object of the original resolved data-file URI
 
 ### Scenario: A data-file path not under the table root is carried as an absolute path
 
@@ -32,8 +33,15 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the per-shard file
 * *GIVEN* a resolved merge-on-read file list whose data files carry associated Parquet positional-delete files, some under the table root and (possibly) some not
 * *WHEN* the adapter builds the scan-driving SQL
 * *THEN* the adapter SHALL encode each delete-file path with the SAME rule it applies to data-file paths, relative (root-stripped) when the table root is an actual prefix, absolute unchanged otherwise
-* *AND* the reconstructed absolute delete-file path (table root joined with a relative entry, or an absolute entry passed through) SHALL equal the original resolved delete-file URI
+* *AND* the reconstructed absolute delete-file path (table root joined with a relative entry, or an absolute entry passed through) SHALL address the object of the original resolved delete-file URI
 * *AND* the adapter MUST NOT corrupt an absolute delete-file path by stripping a non-prefix match
+
+### Scenario: An Iceberg file whose key holds `%`, `#`, or `?` is read from that key
+
+* *GIVEN* an Iceberg table whose data file, positional-delete file, or Puffin deletion-vector file has a manifest path holding `%`, `#`, or `?` in its key
+* *WHEN* the adapter builds the scan-driving SQL
+* *THEN* the adapter SHALL escape each `%`, `#`, and `?` of that path's key, and SHALL leave its scheme and authority unchanged
+* *AND* the scan SHALL read the object stored under the manifest path's raw key
 
 ### Scenario: Each delete-file entry carries its content type so the scan can reject unsupported deletes
 
