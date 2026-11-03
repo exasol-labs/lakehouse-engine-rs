@@ -1,7 +1,8 @@
 use super::test_support::*;
 use super::*;
 use crate::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage, StorageProps,
+    ColumnRef, CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage,
+    StorageProps,
 };
 
 // The vended sentinels below repeat the literal values `lakehouse-catalog`'s own
@@ -186,7 +187,7 @@ fn where_filter_decimal_stringification_rewritten_to_trim() {
     });
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &col_types))
+        .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
         .and_then(|f| render_df_filter_safe(&f))
         .expect("LENGTH(decimal) > 5 must render to a DataFusion filter");
 
@@ -213,7 +214,7 @@ fn filter_decimal_comparison_not_rewritten() {
     });
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &col_types))
+        .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
         .and_then(|f| render_df_filter_safe(&f))
         .expect("c_decimal_a > 5 must render to a DataFusion filter");
 
@@ -241,7 +242,7 @@ fn where_filter_string_fn_under_comparison_predicate_coerced() {
     });
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &col_types))
+        .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
         .and_then(|f| render_df_filter_safe(&f))
         .expect("UPPER(decimal) = 'X' must render to a DataFusion filter");
 
@@ -266,7 +267,7 @@ fn where_filter_string_fn_over_double_declines() {
     });
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &col_types))
+        .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
         .and_then(|f| render_df_filter_safe(&f));
 
     assert!(
@@ -290,7 +291,7 @@ fn where_filter_upper_decimal_inside_like_subject_coerced() {
     });
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &col_types))
+        .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
         .and_then(|f| render_df_filter_safe(&f))
         .expect("UPPER(decimal) LIKE '1%' must render to a DataFusion filter");
 
@@ -326,7 +327,7 @@ fn where_filter_like_decimal_inside_case_declines_whole_filter() {
     });
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &col_types))
+        .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
         .and_then(|f| render_df_filter_safe(&f));
 
     assert!(
@@ -849,7 +850,7 @@ fn dispatch_sql_for_body(pushdown_req_body: Json) -> String {
         extract_projection(&request, &pushdown_req).expect("the fixture must project");
     let (filter, declined_filter) = classify_where_filter(
         pushdown_req.get("filter").filter(|f| !f.is_null()),
-        &col_types,
+        &ColumnTypes::unqualified(&col_types),
         &BinaryColumns::default(),
     );
     let result = build_dispatch_sql(
@@ -954,7 +955,7 @@ fn trivially_true_filter_omitted_without_wrapper() {
     let trivially_true = serde_json::json!({"type": "literal_bool", "value": true});
     let (filter, declined) = classify_where_filter(
         Some(&trivially_true),
-        &guard_col_types(),
+        &ColumnTypes::unqualified(&guard_col_types()),
         &BinaryColumns::default(),
     );
     assert!(
@@ -1104,14 +1105,17 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
         ("AMOUNT".to_string(), "DECIMAL(18,2)".to_string()),
     ];
     assert_ne!(
-        apply_type_rewrites(&filter, &col_types).as_ref(),
+        apply_type_rewrites(&filter, &ColumnTypes::unqualified(&col_types)).as_ref(),
         Some(&filter),
         "fixture precondition: the type rewrites must CHANGE this tree, so the \
              assertion below can tell the original from the rewritten one"
     );
 
-    let (scan_filter, declined) =
-        classify_where_filter(Some(&filter), &col_types, &BinaryColumns::default());
+    let (scan_filter, declined) = classify_where_filter(
+        Some(&filter),
+        &ColumnTypes::unqualified(&col_types),
+        &BinaryColumns::default(),
+    );
 
     assert!(
         scan_filter.is_none(),
@@ -1187,7 +1191,7 @@ fn declined_order_by_wrapper_selects_only_original_select_list() {
             "nullsLast": true
         }]
     }));
-    let proj_cols = vec![ProjectionItem::Column("NAME".to_string())];
+    let proj_cols = vec![ProjectionItem::from("NAME")];
     let proj_types = vec!["VARCHAR(2000000)".to_string()];
 
     let sql = guard_dispatch_sql(&request, proj_cols, proj_types, false, None, Vec::new());
@@ -1236,7 +1240,7 @@ fn declined_order_by_dedupes_repeated_and_projected_sort_keys() {
             sort_key("ID"),
         ]
     }));
-    let proj_cols = vec![ProjectionItem::Column("NAME".to_string())];
+    let proj_cols = vec![ProjectionItem::from("NAME")];
     let proj_types = vec!["VARCHAR(2000000)".to_string()];
 
     let sql = guard_dispatch_sql(&request, proj_cols, proj_types, false, None, Vec::new());
@@ -1277,7 +1281,7 @@ fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
         }],
         "limit": {"numElements": 5}
     }));
-    let proj_cols = vec![ProjectionItem::Column("NAME".to_string())];
+    let proj_cols = vec![ProjectionItem::from("NAME")];
     let proj_types = vec!["VARCHAR(2000000)".to_string()];
     let logical_schema = vec![LogicalField {
         field_id: Some(2),
@@ -1335,7 +1339,7 @@ fn nonzero_offset_nulls_the_effective_limit() {
         }],
         "limit": {"numElements": 5, "offset": 2}
     }));
-    let proj_cols = vec![ProjectionItem::Column("NAME".to_string())];
+    let proj_cols = vec![ProjectionItem::from("NAME")];
     let proj_types = vec!["VARCHAR(2000000)".to_string()];
     let logical_schema = vec![LogicalField {
         field_id: Some(2),
@@ -1477,7 +1481,7 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
         }));
         let err = guard_dispatch_result(
             &request,
-            vec![ProjectionItem::Column("NAME".to_string())],
+            vec![ProjectionItem::from("NAME")],
             vec!["VARCHAR(2000000)".to_string()],
             false,
             Some(7),
@@ -1510,7 +1514,7 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
     }));
     let sql = guard_dispatch_sql(
         &unordered,
-        vec![ProjectionItem::Column("NAME".to_string())],
+        vec![ProjectionItem::from("NAME")],
         vec!["VARCHAR(2000000)".to_string()],
         false,
         Some(7),
@@ -1602,7 +1606,7 @@ fn widening_arity_coincidence_request() -> Json {
 fn widening_arity_coincidence_projection() -> (Vec<ProjectionItem>, Vec<String>) {
     let cols = guard_col_types()
         .into_iter()
-        .map(|(name, ty)| (ProjectionItem::Column(name), ty))
+        .map(|(name, ty)| (ProjectionItem::from(name), ty))
         .collect::<Vec<_>>();
     (
         cols.iter().map(|(c, _)| c.clone()).collect(),
@@ -2166,7 +2170,7 @@ async fn a_non_pruning_delta_request_keeps_its_pre_change_field_set_and_carries_
         .expect("the common blob must round-trip through CommonScanSpec");
     let expected = CommonScanSpec {
         table_root: "s3://bucket/orders".to_string(),
-        projection: vec![ProjectionItem::Column("INT_COL".to_string())],
+        projection: vec![ProjectionItem::from("INT_COL")],
         logical_schema: vec![LogicalField {
             field_id: None,
             name: "int_col".to_string(),
@@ -2334,12 +2338,17 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         fact,
         dimension,
         broadcast_eligible: true,
+        dimension_leg: 1,
     };
     let rendered = super::joins::RenderedJoinPushdown {
-        condition: "\"ORDERS\".\"CUSTOMER_KEY\" = \"CUSTOMER\".\"CUSTOMER_KEY\"".to_string(),
+        condition: "\"LHS_T0\".\"CUSTOMER_KEY\" = \"LHS_T1\".\"CUSTOMER_KEY\"".to_string(),
         filter: None,
-        projection: vec![ProjectionItem::Column("CUSTOMER_KEY".to_string())],
+        projection: vec![ProjectionItem::Column(ColumnRef::qualified(
+            "LHS_T1",
+            "CUSTOMER_KEY",
+        ))],
         projection_types: vec!["DECIMAL(20,0)".to_string()],
+        window: super::joins::JoinWindowPlan::Unbounded,
     };
     let tuning = super::joins::JoinScanRequestConfig {
         cluster_nodes: 1,
@@ -2356,7 +2365,6 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
     let join_sql = super::joins::build_broadcast_join_sql(
         &sides,
         &rendered,
-        super::joins::JoinWindowPlan::Unbounded,
         &tuning,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -2420,7 +2428,7 @@ fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
 
     let sql = guard_dispatch_sql(
         &request,
-        vec![ProjectionItem::Column("NAME".to_string())],
+        vec![ProjectionItem::from("NAME")],
         vec!["VARCHAR(2000000)".to_string()],
         false,
         None,
@@ -2448,7 +2456,7 @@ fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
 
     let sql = guard_dispatch_sql(
         &request,
-        vec![ProjectionItem::Column("NAME".to_string())],
+        vec![ProjectionItem::from("NAME")],
         vec!["VARCHAR(2000000)".to_string()],
         false,
         None,
@@ -2477,7 +2485,7 @@ fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
 
     let sql = guard_dispatch_sql(
         &request,
-        vec![ProjectionItem::Column("NAME".to_string())],
+        vec![ProjectionItem::from("NAME")],
         vec!["VARCHAR(2000000)".to_string()],
         false,
         None,
@@ -2506,7 +2514,7 @@ fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
 
     let sql = guard_dispatch_sql(
         &request,
-        vec![ProjectionItem::Column("NAME".to_string())],
+        vec![ProjectionItem::from("NAME")],
         vec!["VARCHAR(2000000)".to_string()],
         false,
         None,
@@ -2538,7 +2546,7 @@ fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
 
     let sql = guard_dispatch_sql(
         &request,
-        vec![ProjectionItem::Column("REGION".to_string())],
+        vec![ProjectionItem::from("REGION")],
         vec!["VARCHAR(10)".to_string()],
         false,
         None,
@@ -2570,7 +2578,7 @@ fn order_by_on_a_char_declared_group_key_still_resolves_to_its_output_ordinal() 
 
     let sql = guard_dispatch_sql(
         &request,
-        vec![ProjectionItem::Column("NAME".to_string())],
+        vec![ProjectionItem::from("NAME")],
         vec!["VARCHAR(2000000)".to_string()],
         false,
         None,
@@ -2840,7 +2848,7 @@ fn dispatch_result_for_body(
         extract_projection(&request, &pushdown_req).expect("the fixture must project");
     let (filter, declined_filter) = classify_where_filter(
         pushdown_req.get("filter").filter(|f| !f.is_null()),
-        &col_types,
+        &ColumnTypes::unqualified(&col_types),
         &BinaryColumns::default(),
     );
     let result = build_dispatch_sql(

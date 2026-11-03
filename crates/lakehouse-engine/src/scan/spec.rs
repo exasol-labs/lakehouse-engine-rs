@@ -3,6 +3,7 @@
 //! no `files` field, so "files is the only per-shard field" is a type-level guarantee.
 //!
 //! Credentials MUST NEVER appear in any error message.
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -128,39 +129,137 @@ pub struct AggregatePlan {
     pub arg_expr: Option<String>,
 }
 
+/// The alias of the join relation at `leg`, the one format every producer and the scan share.
+///
+/// An alias is `LHS_T` followed by decimal digits only, so the first underscore after `LHS_T`
+/// ends the alias and two distinct (alias, column) pairs never share an output name:
+/// `relation_alias(1)` with `2X` and `relation_alias(12)` with `X` render different names.
+pub fn relation_alias(leg: usize) -> String {
+    format!("LHS_T{leg}")
+}
+
+/// A column of one relation, optionally qualified by that relation's alias in a join.
+///
+/// The pair (relation, name) is the identity. Compare it as a pair, never by the bare name, since
+/// two relations of a join may carry the same column name. Only [`Self::output_name`] joins the
+/// two into one identifier.
+///
+/// Wire form: an unqualified reference is the bare JSON string it always was, so single-table
+/// specs serialize unchanged. A qualified one is `{"relation": "LHS_T1", "name": "<COLUMN>"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(from = "ColumnRefWire", into = "ColumnRefWire")]
+pub struct ColumnRef {
+    pub relation: Option<String>,
+    pub name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum ColumnRefWire {
+    Bare(String),
+    Qualified { relation: String, name: String },
+}
+
+impl From<ColumnRefWire> for ColumnRef {
+    fn from(wire: ColumnRefWire) -> Self {
+        match wire {
+            ColumnRefWire::Bare(name) => ColumnRef {
+                relation: None,
+                name,
+            },
+            ColumnRefWire::Qualified { relation, name } => ColumnRef {
+                relation: Some(relation),
+                name,
+            },
+        }
+    }
+}
+
+impl From<ColumnRef> for ColumnRefWire {
+    fn from(column: ColumnRef) -> Self {
+        match column.relation {
+            None => ColumnRefWire::Bare(column.name),
+            Some(relation) => ColumnRefWire::Qualified {
+                relation,
+                name: column.name,
+            },
+        }
+    }
+}
+
+impl ColumnRef {
+    /// A column of the join relation named `relation`, which must come from [`relation_alias`]
+    /// so [`Self::output_name`] stays unambiguous.
+    pub fn qualified(relation: impl Into<String>, name: impl Into<String>) -> Self {
+        ColumnRef {
+            relation: Some(relation.into()),
+            name: name.into(),
+        }
+    }
+
+    /// `<alias>_<column>` when qualified, the column name when not. This is the name of the
+    /// column in the join's output, and the only place the alias and the column become one
+    /// identifier (see [`relation_alias`] for why that is unambiguous).
+    pub fn output_name(&self) -> String {
+        match &self.relation {
+            Some(relation) => format!("{relation}_{}", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+impl From<&str> for ColumnRef {
+    fn from(name: &str) -> Self {
+        ColumnRef {
+            relation: None,
+            name: name.to_string(),
+        }
+    }
+}
+
+impl From<String> for ColumnRef {
+    fn from(name: String) -> Self {
+        ColumnRef {
+            relation: None,
+            name,
+        }
+    }
+}
+
 /// A [`Column`](ProjectionItem::Column) is quoted as an identifier by the scan; an
 /// [`Expr`](ProjectionItem::Expr) is spliced verbatim, being valid DataFusion SQL already.
 ///
-/// Untagged serde: a `Column` is a bare JSON string and an `Expr` is `{"expr": "..."}`, so legacy
-/// plain-string projections still load as columns.
+/// Untagged serde: an unqualified `Column` is a bare JSON string, a qualified one is
+/// `{"relation": ..., "name": ...}`, and an `Expr` is `{"expr": "..."}`, so legacy plain-string
+/// projections still load as columns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ProjectionItem {
     /// E.g. `("SCORE" * 2)`.
     Expr { expr: String },
     /// E.g. `SCORE`.
-    Column(String),
+    Column(ColumnRef),
 }
 
 impl ProjectionItem {
     /// Only names the positional EMITS slot; for an `Expr` it is the fragment itself.
-    pub fn emit_name(&self) -> &str {
+    pub fn emit_name(&self) -> Cow<'_, str> {
         match self {
-            ProjectionItem::Column(name) => name,
-            ProjectionItem::Expr { expr } => expr,
+            ProjectionItem::Column(column) => Cow::Owned(column.output_name()),
+            ProjectionItem::Expr { expr } => Cow::Borrowed(expr),
         }
     }
 }
 
 impl From<&str> for ProjectionItem {
     fn from(name: &str) -> Self {
-        ProjectionItem::Column(name.to_string())
+        ProjectionItem::Column(name.into())
     }
 }
 
 impl From<String> for ProjectionItem {
     fn from(name: String) -> Self {
-        ProjectionItem::Column(name)
+        ProjectionItem::Column(name.into())
     }
 }
 
@@ -170,23 +269,26 @@ impl PartialEq<&str> for ProjectionItem {
     }
 }
 
-/// `column` is a bare uppercase identifier: top-N (`TopK`) eligibility is deliberately limited
-/// to bare columns, although Exasol may also send expression sort keys (#198), which never
-/// construct a `SortKey`.
+/// `column` is a bare uppercase identifier, or a relation-qualified one on a join's post-join
+/// ordering: top-N (`TopK`) eligibility is deliberately limited to plain columns, although
+/// Exasol may also send expression sort keys (#198), which never construct a `SortKey`.
 ///
 /// `ascending` and `nulls_last` map to Exasol's `orderBy[].isAscending` / `nullsLast` and must be
 /// rendered explicitly on both the shard and merge `ORDER BY` so the sorts rank identically.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SortKey {
-    pub column: String,
+    pub column: ColumnRef,
     pub ascending: bool,
     pub nulls_last: bool,
 }
 
 impl SortKey {
-    /// `"COLUMN" ASC|DESC NULLS FIRST|LAST`, valid in both DataFusion and Exasol SQL.
+    /// `"OUTPUT_NAME" ASC|DESC NULLS FIRST|LAST`, valid in both DataFusion and Exasol SQL.
     pub fn render_order_by_element(&self) -> String {
-        self.render_ordered(&format!("\"{}\"", self.column.replace('"', "\"\"")))
+        self.render_ordered(&format!(
+            "\"{}\"",
+            self.column.output_name().replace('"', "\"\"")
+        ))
     }
 
     /// `self.column` is deliberately unread: `expr` carries the ordering target.
@@ -372,6 +474,13 @@ pub struct JoinSpec {
     pub name_mapping: Vec<NameMappingEntry>,
 
     pub join_type: JoinType,
+
+    /// The fact relation's alias in `condition`, the filter, the projection, and the post-join
+    /// ordering. Required, so a join block never borrows an alias the scan would have to choose.
+    pub fact_alias: String,
+
+    /// The dimension relation's alias, on the same terms as [`Self::fact_alias`].
+    pub dimension_alias: String,
 
     pub condition: String,
 

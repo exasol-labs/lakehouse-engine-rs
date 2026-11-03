@@ -709,7 +709,7 @@ fn extract_projection_fallback_is_duplicate_free() {
 
     let (names, types, _widened) = extract_projection(&request, &pushdown_req).unwrap();
 
-    let unique: std::collections::HashSet<&str> = names.iter().map(|p| p.emit_name()).collect();
+    let unique: std::collections::HashSet<_> = names.iter().map(|p| p.emit_name()).collect();
     assert_eq!(
         unique.len(),
         names.len(),
@@ -2258,7 +2258,7 @@ fn like_guard_varchar_subject_unchanged() {
     });
     let col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
 
-    let result = like_subject_type_guard(&filter, &col_types);
+    let result = like_subject_type_guard(&filter, &ColumnTypes::unqualified(&col_types));
     assert_eq!(
         result,
         Some(filter),
@@ -2276,7 +2276,7 @@ fn like_guard_char_subject_unchanged() {
     });
     let col_types = vec![("CODE".to_string(), "CHAR(3) ASCII".to_string())];
 
-    let result = like_subject_type_guard(&filter, &col_types);
+    let result = like_subject_type_guard(&filter, &ColumnTypes::unqualified(&col_types));
     assert_eq!(
         result,
         Some(filter),
@@ -2295,7 +2295,7 @@ fn like_guard_date_subject_wraps_cast() {
     });
     let col_types = vec![("SIGNUP_DATE".to_string(), "DATE".to_string())];
 
-    let result = like_subject_type_guard(&filter, &col_types);
+    let result = like_subject_type_guard(&filter, &ColumnTypes::unqualified(&col_types));
     let expected = serde_json::json!({
         "type": "predicate_like",
         "expression": {
@@ -2323,7 +2323,7 @@ fn like_guard_decimal_subject_declines() {
     });
     let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
 
-    let result = like_subject_type_guard(&filter, &col_types);
+    let result = like_subject_type_guard(&filter, &ColumnTypes::unqualified(&col_types));
     assert_eq!(
         result, None,
         "DECIMAL subject must decline the whole filter"
@@ -2340,7 +2340,7 @@ fn type_rewrite_pipeline_runs_like_guard() {
     let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
 
     assert_eq!(
-        apply_type_rewrites(&filter, &col_types),
+        apply_type_rewrites(&filter, &ColumnTypes::unqualified(&col_types)),
         None,
         "the type-rewrite pipeline's LIKE-subject guard must decline a DECIMAL subject"
     );
@@ -2404,7 +2404,7 @@ fn overprecise_timestamp_literal_is_rewritten_to_the_column_precision() {
             timestamp_comparison(op, ts_column(), lit.clone())
         };
         assert_eq!(
-            apply_type_rewrites(&filter, &col_types),
+            apply_type_rewrites(&filter, &ColumnTypes::unqualified(&col_types)),
             Some(timestamp_comparison(want_op, ts_column(), want_right)),
             "{op} mirrored={mirrored}"
         );
@@ -2422,7 +2422,7 @@ fn timestamp_literal_within_the_column_precision_is_unchanged() {
         let col_types = vec![("TS".to_string(), declared.to_string())];
         let filter = timestamp_comparison("predicate_equal", ts_column(), ts_literal(value));
         assert_eq!(
-            apply_type_rewrites(&filter, &col_types),
+            apply_type_rewrites(&filter, &ColumnTypes::unqualified(&col_types)),
             Some(filter.clone()),
             "{declared} = {value}"
         );
@@ -2440,7 +2440,7 @@ fn between_and_in_with_an_overprecise_timestamp_expand_to_rewritten_comparisons(
         "type": "predicate_between", "expression": ts_column(), "left": fits(), "right": over()
     });
     assert_eq!(
-        apply_type_rewrites(&between, &col_types),
+        apply_type_rewrites(&between, &ColumnTypes::unqualified(&col_types)),
         Some(serde_json::json!({"type": "predicate_and", "expressions": [
             timestamp_comparison("predicate_greaterequal", ts_column(), fits()),
             timestamp_comparison("predicate_lessequal", ts_column(), floor()),
@@ -2451,7 +2451,7 @@ fn between_and_in_with_an_overprecise_timestamp_expand_to_rewritten_comparisons(
         "type": "predicate_in_constlist", "expression": ts_column(), "arguments": [over(), fits()]
     });
     assert_eq!(
-        apply_type_rewrites(&in_list, &col_types),
+        apply_type_rewrites(&in_list, &ColumnTypes::unqualified(&col_types)),
         Some(serde_json::json!({"type": "predicate_or", "expressions": [
             timestamp_comparison("predicate_notequal", ts_column(), ts_column()),
             timestamp_comparison("predicate_equal", ts_column(), fits()),
@@ -2462,7 +2462,7 @@ fn between_and_in_with_an_overprecise_timestamp_expand_to_rewritten_comparisons(
         "type": "predicate_in_constlist", "expression": ts_column(), "arguments": [fits()]
     });
     assert_eq!(
-        apply_type_rewrites(&fitting_in, &col_types),
+        apply_type_rewrites(&fitting_in, &ColumnTypes::unqualified(&col_types)),
         Some(fitting_in.clone())
     );
 }
@@ -2477,7 +2477,7 @@ fn like_guard_integer_subject_declines() {
     });
     let col_types = vec![("QUANTITY".to_string(), "DECIMAL(20,0)".to_string())];
 
-    let result = like_subject_type_guard(&filter, &col_types);
+    let result = like_subject_type_guard(&filter, &ColumnTypes::unqualified(&col_types));
     assert_eq!(
         result, None,
         "integer (DECIMAL(20,0)) subject must decline the whole filter"
@@ -2498,7 +2498,7 @@ fn like_guard_non_column_subject_untouched() {
     });
     let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
 
-    let result = like_subject_type_guard(&filter, &col_types);
+    let result = like_subject_type_guard(&filter, &ColumnTypes::unqualified(&col_types));
     assert_eq!(
         result,
         Some(filter),
@@ -2516,7 +2516,7 @@ fn like_guard_unresolvable_column_declines() {
     });
     let col_types = vec![("OTHER".to_string(), "VARCHAR(2000000)".to_string())];
 
-    let result = like_subject_type_guard(&filter, &col_types);
+    let result = like_subject_type_guard(&filter, &ColumnTypes::unqualified(&col_types));
     assert_eq!(
         result, None,
         "unresolvable column subject must decline the whole filter"
@@ -2551,7 +2551,7 @@ fn like_guard_nested_decimal_declines_whole_filter() {
         ("AMOUNT".to_string(), "DECIMAL(9,2)".to_string()),
     ];
 
-    let result = like_subject_type_guard(&filter, &col_types);
+    let result = like_subject_type_guard(&filter, &ColumnTypes::unqualified(&col_types));
     assert_eq!(
         result, None,
         "a nested non-string LIKE must decline the whole top-level filter"
@@ -2561,8 +2561,11 @@ fn like_guard_nested_decimal_declines_whole_filter() {
 /// Asserts the fixture genuinely declines, since a quietly rendering fixture would
 /// assert nothing.
 fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, String)]) -> String {
-    let (scan_filter, declined) =
-        classify_where_filter(Some(filter), col_types, &BinaryColumns::default());
+    let (scan_filter, declined) = classify_where_filter(
+        Some(filter),
+        &ColumnTypes::unqualified(col_types),
+        &BinaryColumns::default(),
+    );
     assert!(
         scan_filter.is_none(),
         "fixture precondition: a declining filter must never reach the scan spec: \
@@ -2576,7 +2579,7 @@ fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, String)]) ->
         common: CommonScanSpec {
             projection: col_types
                 .iter()
-                .map(|(name, _)| ProjectionItem::Column(name.clone()))
+                .map(|(name, _)| ProjectionItem::from(name.clone()))
                 .collect(),
             storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
@@ -2681,7 +2684,7 @@ fn like_guard_not_wrapped_decimal_declines() {
     });
     let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
 
-    let result = like_subject_type_guard(&filter, &col_types);
+    let result = like_subject_type_guard(&filter, &ColumnTypes::unqualified(&col_types));
     assert_eq!(
         result, None,
         "a DECIMAL LIKE inside predicate_not must decline the whole filter"
@@ -2707,7 +2710,7 @@ fn like_guard_decimal_inside_case_declines() {
     });
     let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
 
-    let result = like_subject_type_guard(&filter, &col_types);
+    let result = like_subject_type_guard(&filter, &ColumnTypes::unqualified(&col_types));
     assert_eq!(
         result, None,
         "a DECIMAL LIKE buried in a function_scalar_case's arguments must decline \
@@ -2734,7 +2737,7 @@ fn like_guard_date_inside_case_wraps_cast() {
     });
     let col_types = vec![("SIGNUP_DATE".to_string(), "DATE".to_string())];
 
-    let result = like_subject_type_guard(&filter, &col_types);
+    let result = like_subject_type_guard(&filter, &ColumnTypes::unqualified(&col_types));
     let expected = serde_json::json!({
         "type": "function_scalar_case",
         "name": "CASE",
@@ -2779,7 +2782,7 @@ fn like_guard_varchar_inside_case_unchanged() {
     });
     let col_types = vec![("NAME".to_string(), "VARCHAR(20)".to_string())];
 
-    let result = like_subject_type_guard(&filter, &col_types);
+    let result = like_subject_type_guard(&filter, &ColumnTypes::unqualified(&col_types));
     assert_eq!(
         result,
         Some(filter),
@@ -2929,7 +2932,7 @@ fn decimal_rewrite_passes_through_non_object_node() {
         serde_json::json!([1, 2]),
     ] {
         assert_eq!(
-            rewrite_decimal_stringifications(&node, &col_types),
+            rewrite_decimal_stringifications(&node, &ColumnTypes::unqualified(&col_types)),
             node.clone(),
             "a non-object node must be passed through: {node}"
         );
@@ -2939,7 +2942,10 @@ fn decimal_rewrite_passes_through_non_object_node() {
 #[test]
 fn rewrite_cast_decimal_to_varchar_replaces_whole_node() {
     let node = cast_to("VARCHAR", decimal_column());
-    let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+    let out = rewrite_decimal_stringifications(
+        &node,
+        &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+    );
 
     assert_eq!(
         out.get("type").and_then(|t| t.as_str()),
@@ -2962,7 +2968,10 @@ fn rewrite_cast_decimal_to_varchar_replaces_whole_node() {
 #[test]
 fn rewrite_cast_decimal_to_char_replaces_whole_node() {
     let node = cast_to("CHAR", decimal_column());
-    let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+    let out = rewrite_decimal_stringifications(
+        &node,
+        &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+    );
     assert_eq!(
         out.get("type").and_then(|t| t.as_str()),
         Some("decimal_to_varchar_exasol"),
@@ -2987,7 +2996,10 @@ fn rewrite_nested_concat_wraps_only_inner_decimal() {
             }
         ]
     });
-    let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+    let out = rewrite_decimal_stringifications(
+        &node,
+        &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+    );
 
     // ID is DECIMAL(20,0), so as a direct outer-CONCAT argument it is wrapped too.
     assert_eq!(out.get("name").and_then(|n| n.as_str()), Some("CONCAT"));
@@ -3029,7 +3041,10 @@ fn rewrite_concat_wraps_only_decimal_leaves_varchar() {
             {"type": "column", "name": "c_decimal_a"}
         ]
     });
-    let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+    let out = rewrite_decimal_stringifications(
+        &node,
+        &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+    );
     let args = out["arguments"].as_array().unwrap();
     assert_eq!(
         args[0].get("type").and_then(|t| t.as_str()),
@@ -3050,7 +3065,10 @@ fn rewrite_length_wraps_decimal_argument() {
         "name": "LENGTH",
         "arguments": [decimal_column()]
     });
-    let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+    let out = rewrite_decimal_stringifications(
+        &node,
+        &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+    );
     assert_eq!(out.get("name").and_then(|n| n.as_str()), Some("LENGTH"));
     assert_eq!(
         out["arguments"][0].get("type").and_then(|t| t.as_str()),
@@ -3068,7 +3086,7 @@ fn rewrite_non_decimal_argument_unchanged() {
         serde_json::json!({"type": "column", "name": "name"}),
     );
     assert_eq!(
-        rewrite_decimal_stringifications(&cast_varchar, &col_types),
+        rewrite_decimal_stringifications(&cast_varchar, &ColumnTypes::unqualified(&col_types)),
         cast_varchar,
         "CAST of a VARCHAR column must be unchanged"
     );
@@ -3079,7 +3097,7 @@ fn rewrite_non_decimal_argument_unchanged() {
         "arguments": [{"type": "column", "name": "d"}]
     });
     assert_eq!(
-        rewrite_decimal_stringifications(&length_date, &col_types),
+        rewrite_decimal_stringifications(&length_date, &ColumnTypes::unqualified(&col_types)),
         length_date,
         "LENGTH of a DATE column must be unchanged"
     );
@@ -3096,7 +3114,7 @@ fn rewrite_computed_expression_argument_unchanged() {
 
     let cast = cast_to("VARCHAR", computed.clone());
     assert_eq!(
-        rewrite_decimal_stringifications(&cast, &col_types),
+        rewrite_decimal_stringifications(&cast, &ColumnTypes::unqualified(&col_types)),
         cast,
         "CAST of a computed DECIMAL expression must be left unchanged: it is not a bare column"
     );
@@ -3107,7 +3125,7 @@ fn rewrite_computed_expression_argument_unchanged() {
         "arguments": [{"type": "column", "name": "name"}, computed]
     });
     assert_eq!(
-        rewrite_decimal_stringifications(&concat, &col_types),
+        rewrite_decimal_stringifications(&concat, &ColumnTypes::unqualified(&col_types)),
         concat,
         "a computed-expression CONCAT argument must be left unchanged"
     );
@@ -3123,14 +3141,14 @@ fn rewrite_non_stringifying_context_unchanged() {
         "right": {"type": "literal_exactnumeric", "value": 5}
     });
     assert_eq!(
-        rewrite_decimal_stringifications(&cmp, &col_types),
+        rewrite_decimal_stringifications(&cmp, &ColumnTypes::unqualified(&col_types)),
         cmp,
         "a DECIMAL column in a comparison must not be wrapped"
     );
 
     let cast_double = cast_to("DOUBLE", decimal_column());
     assert_eq!(
-        rewrite_decimal_stringifications(&cast_double, &col_types),
+        rewrite_decimal_stringifications(&cast_double, &ColumnTypes::unqualified(&col_types)),
         cast_double,
         "CAST(decimal AS DOUBLE) must not be wrapped"
     );
@@ -3159,7 +3177,10 @@ fn rewrite_reaches_decimal_inside_case_then_branch() {
             }
         ]
     });
-    let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+    let out = rewrite_decimal_stringifications(
+        &node,
+        &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+    );
 
     let then_concat = &out["results"][0];
     assert_eq!(
@@ -3182,8 +3203,11 @@ fn selectlist_decimal_cast_routed_not_full_row_fallback() {
         "selectList": [ cast_to("VARCHAR", decimal_column()) ],
         "selectListDataTypes": [ {"type": "VARCHAR", "size": 20} ],
     });
-    let (items, types, _widened) =
-        project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+    let (items, types, _widened) = project_columns(
+        &pushdown_req,
+        &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+    )
+    .expect("must project");
 
     assert_eq!(
         items.len(),
@@ -3225,8 +3249,11 @@ fn selectlist_nested_concat_decimal_arg_rewritten() {
         "selectList": [ item ],
         "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
     });
-    let (items, _types, _widened) =
-        project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+    let (items, _types, _widened) = project_columns(
+        &pushdown_req,
+        &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+    )
+    .expect("must project");
 
     assert_eq!(
         items.len(),
@@ -3253,8 +3280,11 @@ fn selectlist_length_decimal_arg_rewritten() {
         "selectList": [ item ],
         "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 0} ],
     });
-    let (items, _types, _widened) =
-        project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+    let (items, _types, _widened) = project_columns(
+        &pushdown_req,
+        &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+    )
+    .expect("must project");
 
     assert_eq!(
         items.len(),
@@ -3278,8 +3308,11 @@ fn stringify_nondecimal_column_unchanged() {
         "selectList": [ cast_to("VARCHAR", serde_json::json!({"type": "column", "name": "name"})) ],
         "selectListDataTypes": [ {"type": "VARCHAR", "size": 20} ],
     });
-    let (items, _types, _widened) =
-        project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+    let (items, _types, _widened) = project_columns(
+        &pushdown_req,
+        &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+    )
+    .expect("must project");
 
     assert_eq!(
         items.len(),
@@ -3306,8 +3339,11 @@ fn stringify_computed_decimal_arg_untouched() {
         "selectList": [ cast_to("VARCHAR", computed) ],
         "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
     });
-    let (items, _types, _widened) =
-        project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+    let (items, _types, _widened) = project_columns(
+        &pushdown_req,
+        &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+    )
+    .expect("must project");
 
     assert_eq!(
         items.len(),
@@ -3334,8 +3370,11 @@ fn selectlist_upper_decimal_arg_coerced_not_full_row() {
         "selectList": [ item ],
         "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
     });
-    let (items, types, _widened) =
-        project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+    let (items, types, _widened) = project_columns(
+        &pushdown_req,
+        &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+    )
+    .expect("must project");
 
     assert_eq!(
         items.len(),
@@ -3363,8 +3402,11 @@ fn selectlist_lower_date_arg_cast_to_varchar() {
         "selectList": [ item ],
         "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
     });
-    let (items, _types, _widened) =
-        project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+    let (items, _types, _widened) = project_columns(
+        &pushdown_req,
+        &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+    )
+    .expect("must project");
 
     assert_eq!(
         items.len(),
@@ -3380,6 +3422,7 @@ fn selectlist_lower_date_arg_cast_to_varchar() {
     );
 }
 
+/// Scenario: A non-coercible resolvable column type in a select-list string function falls back to the full base row
 #[test]
 fn selectlist_string_fn_over_double_falls_back_to_full_row() {
     let col_types = decimal_rewrite_col_types();
@@ -3389,7 +3432,8 @@ fn selectlist_string_fn_over_double_falls_back_to_full_row() {
         "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
     });
     let (items, types, _widened) =
-        project_columns(&pushdown_req, col_types.clone()).expect("must project");
+        project_columns(&pushdown_req, &ColumnTypes::unqualified(&col_types))
+            .expect("must project");
 
     assert_eq!(
         items.len(),
@@ -3398,7 +3442,7 @@ fn selectlist_string_fn_over_double_falls_back_to_full_row() {
     );
     let expected_names: Vec<ProjectionItem> = col_types
         .iter()
-        .map(|(n, _)| ProjectionItem::Column(n.clone()))
+        .map(|(n, _)| ProjectionItem::from(n.clone()))
         .collect();
     assert_eq!(
         items, expected_names,
@@ -3421,8 +3465,11 @@ fn selectlist_instr_decimal_arg_coerces_first_position_only() {
         "selectList": [ item ],
         "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 0} ],
     });
-    let (items, _types, _widened) =
-        project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+    let (items, _types, _widened) = project_columns(
+        &pushdown_req,
+        &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+    )
+    .expect("must project");
 
     assert_eq!(
         items.len(),
@@ -3458,7 +3505,8 @@ fn selectlist_instr_with_start_position_falls_back_to_full_row() {
         "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 0} ],
     });
     let (items, _types, _widened) =
-        project_columns(&pushdown_req, col_types.clone()).expect("must project");
+        project_columns(&pushdown_req, &ColumnTypes::unqualified(&col_types))
+            .expect("must project");
 
     assert_eq!(
         items.len(),
@@ -3467,7 +3515,7 @@ fn selectlist_instr_with_start_position_falls_back_to_full_row() {
     );
     let expected_names: Vec<ProjectionItem> = col_types
         .iter()
-        .map(|(n, _)| ProjectionItem::Column(n.clone()))
+        .map(|(n, _)| ProjectionItem::from(n.clone()))
         .collect();
     assert_eq!(
         items, expected_names,
@@ -3533,8 +3581,11 @@ fn selectlist_predicate_node_projects_as_expr() {
             "selectList": [ item ],
             "selectListDataTypes": [ {"type": "boolean"} ],
         });
-        let (items, types, _widened) = project_columns(&pushdown_req, decimal_rewrite_col_types())
-            .unwrap_or_else(|e| panic!("[{node_type}] must project: {e}"));
+        let (items, types, _widened) = project_columns(
+            &pushdown_req,
+            &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+        )
+        .unwrap_or_else(|e| panic!("[{node_type}] must project: {e}"));
 
         assert_eq!(
             items.len(),
@@ -3572,7 +3623,8 @@ fn selectlist_function_aggregate_still_widens_to_full_row() {
         "selectListDataTypes": [ {"type": "decimal", "precision": 20, "scale": 0} ],
     });
     let (items, types, widened) =
-        project_columns(&pushdown_req, col_types.clone()).expect("must project");
+        project_columns(&pushdown_req, &ColumnTypes::unqualified(&col_types))
+            .expect("must project");
 
     assert!(
         widened,
@@ -3586,7 +3638,7 @@ fn selectlist_function_aggregate_still_widens_to_full_row() {
     );
     let expected_names: Vec<ProjectionItem> = col_types
         .iter()
-        .map(|(n, _)| ProjectionItem::Column(n.clone()))
+        .map(|(n, _)| ProjectionItem::from(n.clone()))
         .collect();
     assert_eq!(
         items, expected_names,
@@ -3608,8 +3660,11 @@ fn selectlist_like_over_date_projects_cast_expr() {
         "selectList": [ item ],
         "selectListDataTypes": [ {"type": "boolean"} ],
     });
-    let (items, types, widened) =
-        project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+    let (items, types, widened) = project_columns(
+        &pushdown_req,
+        &ColumnTypes::unqualified(&decimal_rewrite_col_types()),
+    )
+    .expect("must project");
 
     assert!(
         !widened,
@@ -3690,8 +3745,9 @@ fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
             "selectList": [ item ],
             "selectListDataTypes": [ {"type": "boolean"} ],
         });
-        let (items, types, widened) = project_columns(&pushdown_req, col_types.clone())
-            .unwrap_or_else(|e| panic!("[{label}] must project (Ok), not error: {e}"));
+        let (items, types, widened) =
+            project_columns(&pushdown_req, &ColumnTypes::unqualified(&col_types))
+                .unwrap_or_else(|e| panic!("[{label}] must project (Ok), not error: {e}"));
 
         assert!(
             widened,
@@ -3704,7 +3760,7 @@ fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
         );
         let expected_names: Vec<ProjectionItem> = col_types
             .iter()
-            .map(|(n, _)| ProjectionItem::Column(n.clone()))
+            .map(|(n, _)| ProjectionItem::from(n.clone()))
             .collect();
         assert_eq!(
             items, expected_names,
@@ -3738,7 +3794,8 @@ fn selectlist_like_inside_case_over_decimal_falls_back_to_full_row() {
         "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
     });
     let (items, types, widened) =
-        project_columns(&pushdown_req, col_types.clone()).expect("must project (Ok)");
+        project_columns(&pushdown_req, &ColumnTypes::unqualified(&col_types))
+            .expect("must project (Ok)");
 
     assert!(
         widened,
@@ -3751,7 +3808,7 @@ fn selectlist_like_inside_case_over_decimal_falls_back_to_full_row() {
     );
     let expected_names: Vec<ProjectionItem> = col_types
         .iter()
-        .map(|(n, _)| ProjectionItem::Column(n.clone()))
+        .map(|(n, _)| ProjectionItem::from(n.clone()))
         .collect();
     assert_eq!(
         items, expected_names,
@@ -3963,7 +4020,7 @@ fn string_fn_guard_passes_through_non_object_node() {
         serde_json::json!([1, 2]),
     ] {
         assert_eq!(
-            string_function_arg_type_guard(&node, &col_types),
+            string_function_arg_type_guard(&node, &ColumnTypes::unqualified(&col_types)),
             Some(node.clone()),
             "a non-object node must be passed through: {node}"
         );
@@ -3977,7 +4034,7 @@ fn string_fn_guard_leaves_varchar_argument_unchanged() {
     for name in ["UPPER", "LOWER", "TRIM", "LTRIM", "CONCAT", "LENGTH"] {
         let node = string_fn(name, vec![column("name")]);
         assert_eq!(
-            string_function_arg_type_guard(&node, &col_types),
+            string_function_arg_type_guard(&node, &ColumnTypes::unqualified(&col_types)),
             Some(node.clone()),
             "{name} over a VARCHAR column must be unchanged"
         );
@@ -3985,7 +4042,7 @@ fn string_fn_guard_leaves_varchar_argument_unchanged() {
     let char_types = vec![("C_CHAR_A".to_string(), "CHAR(10)".to_string())];
     let node = string_fn("UPPER", vec![column("c_char_a")]);
     assert_eq!(
-        string_function_arg_type_guard(&node, &char_types),
+        string_function_arg_type_guard(&node, &ColumnTypes::unqualified(&char_types)),
         Some(node.clone()),
         "a CHAR column argument must be unchanged"
     );
@@ -3995,8 +4052,10 @@ fn string_fn_guard_leaves_varchar_argument_unchanged() {
 fn string_fn_guard_wraps_decimal_argument_in_trim() {
     let col_types = decimal_rewrite_col_types();
 
-    let out =
-        string_function_arg_type_guard(&string_fn("UPPER", vec![decimal_column()]), &col_types);
+    let out = string_function_arg_type_guard(
+        &string_fn("UPPER", vec![decimal_column()]),
+        &ColumnTypes::unqualified(&col_types),
+    );
     assert_eq!(
         out,
         Some(string_fn("UPPER", vec![trimmed_decimal("c_decimal_a")])),
@@ -4005,21 +4064,30 @@ fn string_fn_guard_wraps_decimal_argument_in_trim() {
 
     for name in ["TRIM", "LTRIM"] {
         assert_eq!(
-            string_function_arg_type_guard(&string_fn(name, vec![decimal_column()]), &col_types),
+            string_function_arg_type_guard(
+                &string_fn(name, vec![decimal_column()]),
+                &ColumnTypes::unqualified(&col_types)
+            ),
             Some(string_fn(name, vec![trimmed_decimal("c_decimal_a")])),
             "{name}'s DECIMAL argument must be wrapped"
         );
     }
 
     assert_eq!(
-        string_function_arg_type_guard(&string_fn("UPPER", vec![column("id")]), &col_types),
+        string_function_arg_type_guard(
+            &string_fn("UPPER", vec![column("id")]),
+            &ColumnTypes::unqualified(&col_types)
+        ),
         Some(string_fn("UPPER", vec![trimmed_decimal("id")])),
         "an integer DECIMAL(p,0) argument must be wrapped too"
     );
 
     let sql = render_expression_safe(
-        &string_function_arg_type_guard(&string_fn("UPPER", vec![decimal_column()]), &col_types)
-            .expect("must not decline"),
+        &string_function_arg_type_guard(
+            &string_fn("UPPER", vec![decimal_column()]),
+            &ColumnTypes::unqualified(&col_types),
+        )
+        .expect("must not decline"),
     )
     .expect("must render");
     assert_eq!(
@@ -4033,7 +4101,10 @@ fn string_fn_guard_wraps_decimal_argument_in_trim() {
 fn string_fn_guard_casts_date_argument_to_varchar() {
     let col_types = decimal_rewrite_col_types();
     assert_eq!(
-        string_function_arg_type_guard(&string_fn("LOWER", vec![column("d")]), &col_types),
+        string_function_arg_type_guard(
+            &string_fn("LOWER", vec![column("d")]),
+            &ColumnTypes::unqualified(&col_types)
+        ),
         Some(string_fn("LOWER", vec![cast_varchar("d")])),
         "LOWER's DATE argument must be wrapped in CAST(<col> AS VARCHAR)"
     );
@@ -4045,7 +4116,10 @@ fn string_fn_guard_declines_boolean_double_and_timestamp_arguments() {
     for col in ["c_bool_a", "c_double_a", "c_ts_a"] {
         for name in ["UPPER", "TRIM", "CONCAT", "LENGTH"] {
             assert_eq!(
-                string_function_arg_type_guard(&string_fn(name, vec![column(col)]), &col_types),
+                string_function_arg_type_guard(
+                    &string_fn(name, vec![column(col)]),
+                    &ColumnTypes::unqualified(&col_types)
+                ),
                 None,
                 "{name} over {col} must decline"
             );
@@ -4058,7 +4132,10 @@ fn string_fn_guard_declines_boolean_double_and_timestamp_arguments() {
 fn string_fn_guard_declines_unresolved_column_name() {
     let col_types = decimal_rewrite_col_types();
     assert_eq!(
-        string_function_arg_type_guard(&string_fn("UPPER", vec![column("mystery")]), &col_types),
+        string_function_arg_type_guard(
+            &string_fn("UPPER", vec![column("mystery")]),
+            &ColumnTypes::unqualified(&col_types)
+        ),
         None,
         "an unresolvable column argument must decline"
     );
@@ -4069,7 +4146,7 @@ fn string_fn_guard_declines_nameless_column_node() {
     let col_types = decimal_rewrite_col_types();
     let node = string_fn("UPPER", vec![serde_json::json!({"type": "column"})]);
     assert_eq!(
-        string_function_arg_type_guard(&node, &col_types),
+        string_function_arg_type_guard(&node, &ColumnTypes::unqualified(&col_types)),
         None,
         "a nameless column argument must decline"
     );
@@ -4083,7 +4160,7 @@ fn string_fn_guard_reaches_function_under_comparison_predicate() {
         serde_json::json!({"type": "literal_string", "value": "X"}),
     );
     assert_eq!(
-        string_function_arg_type_guard(&node, &col_types),
+        string_function_arg_type_guard(&node, &ColumnTypes::unqualified(&col_types)),
         Some(equals(
             string_fn("UPPER", vec![trimmed_decimal("c_decimal_a")]),
             serde_json::json!({"type": "literal_string", "value": "X"}),
@@ -4109,7 +4186,7 @@ fn string_fn_guard_nested_decline_propagates_to_root() {
         ]
     });
     assert_eq!(
-        string_function_arg_type_guard(&filter, &col_types),
+        string_function_arg_type_guard(&filter, &ColumnTypes::unqualified(&col_types)),
         None,
         "a nested non-coercible string function must decline the whole tree"
     );
@@ -4122,7 +4199,7 @@ fn string_fn_guard_leaves_numeric_position_arguments_untouched() {
     assert_eq!(
         string_function_arg_type_guard(
             &string_fn("SUBSTR", vec![decimal_column(), column("id"), column("id")]),
-            &col_types
+            &ColumnTypes::unqualified(&col_types)
         ),
         Some(string_fn(
             "SUBSTR",
@@ -4135,7 +4212,7 @@ fn string_fn_guard_leaves_numeric_position_arguments_untouched() {
         assert_eq!(
             string_function_arg_type_guard(
                 &string_fn(name, vec![decimal_column(), column("id")]),
-                &col_types
+                &ColumnTypes::unqualified(&col_types)
             ),
             Some(string_fn(
                 name,
@@ -4149,7 +4226,7 @@ fn string_fn_guard_leaves_numeric_position_arguments_untouched() {
     assert_eq!(
         string_function_arg_type_guard(
             &string_fn("LPAD", vec![decimal_column(), column("id"), column("d")]),
-            &col_types
+            &ColumnTypes::unqualified(&col_types)
         ),
         Some(string_fn(
             "LPAD",
@@ -4166,7 +4243,7 @@ fn string_fn_guard_leaves_numeric_position_arguments_untouched() {
     assert_eq!(
         string_function_arg_type_guard(
             &string_fn("LPAD", vec![decimal_column(), length_literal.clone()]),
-            &col_types
+            &ColumnTypes::unqualified(&col_types)
         ),
         Some(string_fn(
             "LPAD",
@@ -4183,7 +4260,7 @@ fn string_fn_guard_coerces_both_instr_and_locate_arguments() {
     assert_eq!(
         string_function_arg_type_guard(
             &string_fn("INSTR", vec![decimal_column(), column("d")]),
-            &col_types
+            &ColumnTypes::unqualified(&col_types)
         ),
         Some(string_fn(
             "INSTR",
@@ -4195,7 +4272,7 @@ fn string_fn_guard_coerces_both_instr_and_locate_arguments() {
     assert_eq!(
         string_function_arg_type_guard(
             &string_fn("LOCATE", vec![column("d"), decimal_column()]),
-            &col_types
+            &ColumnTypes::unqualified(&col_types)
         ),
         Some(string_fn(
             "LOCATE",
@@ -4213,7 +4290,7 @@ fn string_fn_guard_declines_instr_locate_beyond_two_args() {
     assert_eq!(
         string_function_arg_type_guard(
             &string_fn("INSTR", vec![column("name"), column("name"), start.clone()]),
-            &col_types
+            &ColumnTypes::unqualified(&col_types)
         ),
         None,
         "INSTR/3 over VARCHAR arguments must still decline"
@@ -4224,7 +4301,7 @@ fn string_fn_guard_declines_instr_locate_beyond_two_args() {
                 "INSTR",
                 vec![column("name"), column("name"), start.clone(), start.clone()]
             ),
-            &col_types
+            &ColumnTypes::unqualified(&col_types)
         ),
         None,
         "INSTR/4 over VARCHAR arguments must still decline"
@@ -4232,7 +4309,7 @@ fn string_fn_guard_declines_instr_locate_beyond_two_args() {
     assert_eq!(
         string_function_arg_type_guard(
             &string_fn("LOCATE", vec![column("name"), column("name"), start]),
-            &col_types
+            &ColumnTypes::unqualified(&col_types)
         ),
         None,
         "LOCATE/3 over VARCHAR arguments must still decline"
@@ -4246,7 +4323,7 @@ fn string_fn_guard_excludes_chr_and_unicodechr() {
         for arg in ["id", "c_double_a"] {
             let node = string_fn(name, vec![column(arg)]);
             assert_eq!(
-                string_function_arg_type_guard(&node, &col_types),
+                string_function_arg_type_guard(&node, &ColumnTypes::unqualified(&col_types)),
                 Some(node.clone()),
                 "{name}({arg}) must be left completely untouched"
             );
@@ -4255,7 +4332,7 @@ fn string_fn_guard_excludes_chr_and_unicodechr() {
 
     let nested = string_fn("CHR", vec![string_fn("LENGTH", vec![decimal_column()])]);
     assert_eq!(
-        string_function_arg_type_guard(&nested, &col_types),
+        string_function_arg_type_guard(&nested, &ColumnTypes::unqualified(&col_types)),
         Some(string_fn(
             "CHR",
             vec![string_fn("LENGTH", vec![trimmed_decimal("c_decimal_a")])]
@@ -4269,7 +4346,7 @@ fn string_fn_guard_resolves_case_mismatched_column_name() {
     let col_types = decimal_rewrite_col_types();
     let node = string_fn("UPPER", vec![column("C_DeCiMaL_a")]);
     assert_eq!(
-        string_function_arg_type_guard(&node, &col_types),
+        string_function_arg_type_guard(&node, &ColumnTypes::unqualified(&col_types)),
         Some(string_fn("UPPER", vec![trimmed_decimal("C_DeCiMaL_a")])),
         "a mixed-case column name must resolve against the uppercase map"
     );
@@ -4282,12 +4359,12 @@ fn column_exa_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
     let ascii_folded = [("STRAßE".to_string(), "VARCHAR(2000000)".to_string())];
 
     assert_eq!(
-        column_exa_type(&node, &unicode_folded),
+        column_exa_type(&node, &ColumnTypes::unqualified(&unicode_folded)),
         Some("VARCHAR(2000000)"),
         "`STRAßE`.to_uppercase() is `STRASSE`, the key `involved_columns` builds"
     );
     assert_eq!(
-        column_exa_type(&node, &ascii_folded),
+        column_exa_type(&node, &ColumnTypes::unqualified(&ascii_folded)),
         None,
         "`to_ascii_uppercase` leaves `STRAßE`, which the Unicode fold cannot match"
     );
@@ -4302,7 +4379,7 @@ fn string_fn_guard_leaves_computed_argument_unchanged() {
         vec![serde_json::json!({"type": "literal_string", "value": "x"})],
     );
     assert_eq!(
-        string_function_arg_type_guard(&literal, &col_types),
+        string_function_arg_type_guard(&literal, &ColumnTypes::unqualified(&col_types)),
         Some(literal.clone()),
         "a literal argument must be left unchanged without declining"
     );
@@ -4318,7 +4395,7 @@ fn string_fn_guard_leaves_computed_argument_unchanged() {
         )],
     );
     assert_eq!(
-        string_function_arg_type_guard(&computed, &col_types),
+        string_function_arg_type_guard(&computed, &ColumnTypes::unqualified(&col_types)),
         Some(computed.clone()),
         "a computed argument must be left unchanged without declining"
     );
@@ -4329,7 +4406,7 @@ fn string_fn_guard_coerces_inner_nested_string_function() {
     let col_types = decimal_rewrite_col_types();
     let node = string_fn("UPPER", vec![string_fn("TRIM", vec![decimal_column()])]);
     assert_eq!(
-        string_function_arg_type_guard(&node, &col_types),
+        string_function_arg_type_guard(&node, &ColumnTypes::unqualified(&col_types)),
         Some(string_fn(
             "UPPER",
             vec![string_fn("TRIM", vec![trimmed_decimal("c_decimal_a")])]
@@ -4359,12 +4436,13 @@ fn assert_widens_to_full_base_row(select_item: Json, declared_type: Json, why: &
     });
 
     let (items, types, widened) =
-        project_columns(&pushdown_req, col_types.clone()).expect("must project (Ok)");
+        project_columns(&pushdown_req, &ColumnTypes::unqualified(&col_types))
+            .expect("must project (Ok)");
 
     assert!(widened, "{why}: {items:?}");
     let expected_names: Vec<ProjectionItem> = col_types
         .iter()
-        .map(|(n, _)| ProjectionItem::Column(n.clone()))
+        .map(|(n, _)| ProjectionItem::from(n.clone()))
         .collect();
     assert_eq!(
         items, expected_names,
@@ -4491,7 +4569,8 @@ fn project_columns_does_not_widen_when_select_item_has_no_nested_aggregate() {
     });
 
     let (items, _types, widened) =
-        project_columns(&pushdown_req, col_types).expect("must project (Ok)");
+        project_columns(&pushdown_req, &ColumnTypes::unqualified(&col_types))
+            .expect("must project (Ok)");
 
     assert!(
         !widened,
@@ -4617,4 +4696,93 @@ fn a_role_storage_block_is_sealed_and_unseals_to_the_session_backend() {
         vended,
         "a vending role CONNECTION seals the vended backend, not the session"
     );
+}
+
+fn shared_name_universe() -> ColumnTypes {
+    ColumnTypes::per_relation(vec![
+        (
+            "LHS_T0".to_string(),
+            vec![("X".to_string(), "DECIMAL(18,0)".to_string())],
+        ),
+        (
+            "LHS_T1".to_string(),
+            vec![("X".to_string(), "VARCHAR(10) UTF8".to_string())],
+        ),
+    ])
+}
+
+fn like_over(subject: Json) -> Json {
+    serde_json::json!({
+        "type": "predicate_like",
+        "expression": subject,
+        "pattern": {"type": "literal_string", "value": "a%"},
+    })
+}
+
+#[test]
+fn qualified_universe_types_a_shared_column_name_by_its_own_relation() {
+    let universe = shared_name_universe();
+    let varchar_leg =
+        like_over(serde_json::json!({"type": "column", "name": "x", "tableAlias": "LHS_T1"}));
+    assert_eq!(
+        apply_type_rewrites(&varchar_leg, &universe),
+        Some(varchar_leg.clone()),
+        "LHS_T1's X is VARCHAR, so its LIKE passes even though LHS_T0's X, listed first, is DECIMAL"
+    );
+    let decimal_leg =
+        like_over(serde_json::json!({"type": "column", "name": "X", "tableAlias": "LHS_T0"}));
+    assert_eq!(
+        apply_type_rewrites(&decimal_leg, &universe),
+        None,
+        "LHS_T0's X is DECIMAL, so its LIKE declines"
+    );
+    let unqualified = like_over(serde_json::json!({"type": "column", "name": "X"}));
+    assert_eq!(
+        apply_type_rewrites(&unqualified, &universe),
+        None,
+        "a qualified entry never binds a node without its relation alias"
+    );
+}
+
+#[test]
+fn unqualified_universe_types_a_column_by_name_whatever_its_alias() {
+    let universe = ColumnTypes::unqualified(&[("X".to_string(), "VARCHAR(10) UTF8".to_string())]);
+    let aliased = like_over(serde_json::json!({"type": "column", "name": "x", "tableAlias": "O"}));
+    assert_eq!(
+        apply_type_rewrites(&aliased, &universe),
+        Some(aliased.clone())
+    );
+}
+
+#[test]
+fn qualified_universe_projects_each_column_with_its_relation_and_type() {
+    let universe = shared_name_universe();
+    let pushdown_req = serde_json::json!({
+        "selectList": [
+            {"type": "column", "name": "X", "tableAlias": "LHS_T1"},
+            {"type": "column", "name": "X", "tableAlias": "LHS_T0"},
+        ],
+    });
+    let (items, types, widened) = project_columns(&pushdown_req, &universe).expect("projects");
+    assert!(!widened);
+    assert_eq!(
+        items,
+        vec![
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "X")),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "X")),
+        ]
+    );
+    assert_eq!(types, vec!["VARCHAR(10) UTF8", "DECIMAL(18,0)"]);
+
+    let (full_row, full_types, _) =
+        project_columns(&serde_json::json!({"selectList": null}), &universe).expect("projects");
+    assert_eq!(
+        full_row,
+        vec![
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "X")),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "X")),
+        ],
+        "the full row lists the universe in leg order"
+    );
+    assert_eq!(full_types, vec!["DECIMAL(18,0)", "VARCHAR(10) UTF8"]);
 }

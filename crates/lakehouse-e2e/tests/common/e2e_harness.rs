@@ -602,8 +602,8 @@ pub fn has_broadcast_join_block(pushed_sql: &str) -> bool {
     pushed_sql.contains("\"join\":{")
 }
 
-/// The `LHS_T*` aliases appear only in the generated N-scan wrapper, never in a native
-/// retry or the broadcast path.
+/// Only the N-scan wrapper emits the subquery alias form `AS "LHS_T{i}"`. The broadcast
+/// path names `LHS_T*` relations inside its scan spec, never as a subquery alias.
 pub fn has_two_scan_wrapper(pushed_sql: &str) -> bool {
     has_n_scan_wrapper(pushed_sql, 2)
 }

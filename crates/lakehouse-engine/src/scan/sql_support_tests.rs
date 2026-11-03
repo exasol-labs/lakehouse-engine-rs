@@ -6,7 +6,7 @@ use super::*;
 fn render_column_keeps_a_non_nested_incompatible_column_cast_unchanged() {
     assert_eq!(
         render_column(
-            "PAYLOAD",
+            &"PAYLOAD".into(),
             Some(&DataType::Time64(arrow::datatypes::TimeUnit::Microsecond))
         ),
         "CAST(\"PAYLOAD\" AS VARCHAR)"
@@ -32,7 +32,7 @@ fn a_binary_column_is_aliased_to_its_hex_text_and_exposes_its_raw_bytes() {
         ]
     );
     assert_eq!(
-        render_column("DIGEST", Some(&DataType::FixedSizeBinary(16))),
+        render_column(&"DIGEST".into(), Some(&DataType::FixedSizeBinary(16))),
         "\"DIGEST\"",
         "the alias already holds the hex text, so the projection takes it as is"
     );
@@ -69,7 +69,7 @@ fn render_column_diverts_a_nested_column_to_the_json_render_function() {
     )));
 
     assert_eq!(
-        render_column("TAGS", Some(&list_type)),
+        render_column(&"TAGS".into(), Some(&list_type)),
         format!("{NESTED_JSON_RENDER_UDF_NAME}(\"TAGS\")"),
         "a nested column must be routed through the JSON render function, not CAST"
     );

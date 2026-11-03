@@ -81,10 +81,7 @@ fn raw_scan_spec(
 ) -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
-            projection: projection
-                .into_iter()
-                .map(|name| ProjectionItem::Column(name.to_string()))
-                .collect(),
+            projection: projection.into_iter().map(ProjectionItem::from).collect(),
             logical_schema,
             name_mapping,
             storage: ScanStorage::Inline(dummy_storage()),

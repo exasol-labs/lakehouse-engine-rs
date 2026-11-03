@@ -7,14 +7,16 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 
 use crate::scan::diagnostics;
-use crate::scan::spec::{ProjectionItem, ScanSpec};
+use crate::scan::spec::{ColumnRef, JoinSpec, ProjectionItem, ScanSpec};
 use crate::scan::storage_ref::ResolvedScanStorage;
 use crate::types::mapping::{ExaTypeClass, arrow_to_exasol_type, classify_exa_type};
 
 use super::raw_scan::{
     delete_path_read_limiter, emit_dataframe, physical_plan, plan_sql, register_file_list,
 };
-use super::sql_support::{aliased_select, append_where, render_column, render_projection};
+use super::sql_support::{
+    aliased_select, append_where, quote_ident, render_column, render_projection,
+};
 
 const JOIN_FACT_TABLE: &str = "fact_scan";
 const JOIN_DIM_TABLE: &str = "dim_scan";
@@ -98,8 +100,10 @@ async fn register_join_tables(
     Ok(())
 }
 
-/// Uppercase aliased sub-SELECTs make the pushed projection, `condition`, and filter resolve
-/// unambiguously against the combined schema. The dimension side is LEFT (the build side).
+/// Uppercase aliased sub-SELECTs, each wrapped as its own named relation, make the pushed
+/// projection, `condition`, and filter resolve unambiguously: every column is qualified by its
+/// relation alias, so a column name both sides carry stays two columns. The dimension side is
+/// LEFT (the build side).
 /// [`JoinSpec::post_join_order_by`](crate::scan::spec::JoinSpec::post_join_order_by) and
 /// [`JoinSpec::post_join_limit`](crate::scan::spec::JoinSpec::post_join_limit) are applied
 /// here, after the join and its `WHERE`, never to either side's scan.
@@ -114,6 +118,7 @@ async fn build_join_sql(
         .join
         .as_ref()
         .expect("build_join_sql called without a join block");
+    ensure_join_columns_are_qualified(spec, join)?;
 
     let fact = ctx
         .table(fact_table)
@@ -129,21 +134,18 @@ async fn build_join_sql(
     let fact_aliased = aliased_select(fact_table, fact_schema, spec.common.binary_as_string);
     let dim_aliased = aliased_select(dim_table, dim_schema, spec.common.binary_as_string);
 
-    // Columns are disjoint across the two tables (VS guarantee), so a bare name resolves once.
-    let combined = combined_upper_fields(dim_schema, fact_schema);
+    let combined = combined_upper_fields(
+        (&join.dimension_alias, dim_schema),
+        (&join.fact_alias, fact_schema),
+    );
 
-    let proj_items: Vec<ProjectionItem> = if spec.common.projection.is_empty() {
-        combined
-            .iter()
-            .map(|(name, _)| ProjectionItem::Column(name.clone()))
-            .collect()
-    } else {
-        spec.common.projection.clone()
-    };
-
-    let select_clause = render_projection(&proj_items, |name| combined_type(name, &combined));
+    let select_clause = render_projection(&spec.common.projection, |column| {
+        combined_type(column, &combined)
+    });
     let mut sql = format!(
-        "SELECT {select_clause} FROM ({dim_aliased}) INNER JOIN ({fact_aliased}) ON {}",
+        "SELECT {select_clause} FROM ({dim_aliased}) AS {} INNER JOIN ({fact_aliased}) AS {} ON {}",
+        quote_ident(&join.dimension_alias),
+        quote_ident(&join.fact_alias),
         join.condition
     );
     append_where(&mut sql, spec.common.filter.as_deref());
@@ -165,25 +167,59 @@ async fn build_join_sql(
     Ok(sql)
 }
 
-/// Dimension columns first, matching the left/build side.
+/// `project_columns` returns at least one item for every join select list, so an empty
+/// projection is a malformed spec, not a request for the full row. A column with no relation
+/// alias cannot be bound to one side, and a bare-name guess would pick the wrong relation of a
+/// shared column name.
+fn ensure_join_columns_are_qualified(spec: &ScanSpec, join: &JoinSpec) -> Result<(), UdfError> {
+    if spec.common.projection.is_empty() {
+        return Err(UdfError::User(
+            "join scan spec carries an empty projection; it must name at least one column".into(),
+        ));
+    }
+    let projected = spec.common.projection.iter().filter_map(|item| match item {
+        ProjectionItem::Column(column) => Some(column),
+        ProjectionItem::Expr { .. } => None,
+    });
+    let sort_keys = join.post_join_order_by.iter().map(|key| &key.column);
+    match projected.chain(sort_keys).find(|c| c.relation.is_none()) {
+        Some(column) => Err(UdfError::User(format!(
+            "join scan spec column {} carries no relation alias",
+            column.name
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Dimension columns first, matching the left/build side. Each is keyed by its (relation alias,
+/// uppercased column) pair.
 fn combined_upper_fields(
-    dim_schema: &datafusion::common::DFSchema,
-    fact_schema: &datafusion::common::DFSchema,
-) -> Vec<(String, arrow::datatypes::DataType)> {
-    dim_schema
-        .fields()
-        .iter()
-        .chain(fact_schema.fields().iter())
-        .map(|f| (f.name().to_uppercase(), f.data_type().clone()))
-        .collect()
+    (dim_alias, dim_schema): (&str, &datafusion::common::DFSchema),
+    (fact_alias, fact_schema): (&str, &datafusion::common::DFSchema),
+) -> Vec<(ColumnRef, arrow::datatypes::DataType)> {
+    let relation_fields = |alias: &str, schema: &datafusion::common::DFSchema| {
+        schema
+            .fields()
+            .iter()
+            .map(|f| {
+                (
+                    ColumnRef::qualified(alias, f.name().to_uppercase()),
+                    f.data_type().clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut fields = relation_fields(dim_alias, dim_schema);
+    fields.extend(relation_fields(fact_alias, fact_schema));
+    fields
 }
 
 /// Ranks by the value the shard emits, since that is what the Exasol-side wrapper merges and
 /// ranks; ranking anything else can cut a row the wrapper's global top-`n` needs. Exasol's
 /// VARCHAR has no empty string (`''` arrives as NULL), and `emit_batch` emits `NaN` as NULL (#246).
 fn render_join_sort_target(
-    column: &str,
-    combined: &[(String, arrow::datatypes::DataType)],
+    column: &ColumnRef,
+    combined: &[(ColumnRef, arrow::datatypes::DataType)],
 ) -> String {
     use arrow::datatypes::DataType;
 
@@ -201,13 +237,16 @@ fn render_join_sort_target(
 }
 
 fn combined_type<'a>(
-    column: &str,
-    combined: &'a [(String, arrow::datatypes::DataType)],
+    column: &ColumnRef,
+    combined: &'a [(ColumnRef, arrow::datatypes::DataType)],
 ) -> Option<&'a arrow::datatypes::DataType> {
-    let upper = column.to_uppercase();
+    let upper = ColumnRef {
+        relation: column.relation.clone(),
+        name: column.name.to_uppercase(),
+    };
     combined
         .iter()
-        .find(|(name, _)| *name == upper)
+        .find(|(key, _)| *key == upper)
         .map(|(_, dt)| dt)
 }
 

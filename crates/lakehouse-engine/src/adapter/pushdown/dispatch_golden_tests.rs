@@ -256,9 +256,11 @@ fn dispatch_sql(
 /// fixture itself widens.
 fn dispatch_sql_widened(request: &Json) -> String {
     let pushdown_req = pd(request);
-    let (proj_cols, proj_types, widened) =
-        super::support::project_columns(&pushdown_req, base_col_types())
-            .expect("the fixture must project");
+    let (proj_cols, proj_types, widened) = super::support::project_columns(
+        &pushdown_req,
+        &ColumnTypes::unqualified(&base_col_types()),
+    )
+    .expect("the fixture must project");
     assert!(
         widened,
         "this fixture must exercise the widening guard, not a per-item projection"
@@ -769,9 +771,7 @@ fn grouped_all_agg_kinds_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-use super::joins::{
-    JoinScanRequestConfig, JoinWindowPlan, build_broadcast_join_sql, build_n_scan_join_sql,
-};
+use super::joins::{JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql};
 
 fn two_table_join_request(filter: Option<Json>) -> Json {
     let mut pushdown_req = serde_json::json!({
@@ -896,16 +896,16 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     let join = two_table_detected_join(&request);
     let rendered = render_broadcast_join(&request, &pushdown_req, &join, &BinaryColumns::default())
         .expect("render_broadcast_join must not error for a well-formed request")
-        .expect("a disjoint-column, filterless equi-join must stay broadcast-eligible");
+        .expect("a filterless equi-join must stay broadcast-eligible");
     let sides = JoinSides {
         fact: resolved_orders_side(),
         dimension: resolved_customer_side(),
         broadcast_eligible: true,
+        dimension_leg: 0,
     };
     let broadcast_sql = build_broadcast_join_sql(
         &sides,
         &rendered,
-        JoinWindowPlan::Unbounded,
         &join_scan_tuning(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -959,16 +959,16 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
     let join = two_table_detected_join(&request);
     let rendered = render_broadcast_join(&request, &pushdown_req, &join, &BinaryColumns::default())
         .expect("render_broadcast_join must not error for a well-formed request")
-        .expect("a disjoint-column equi-join with a rendering filter must stay broadcast-eligible");
+        .expect("an equi-join with a rendering filter must stay broadcast-eligible");
     let sides = JoinSides {
         fact: resolved_orders_side(),
         dimension: resolved_customer_side(),
         broadcast_eligible: true,
+        dimension_leg: 0,
     };
     let broadcast_sql = build_broadcast_join_sql(
         &sides,
         &rendered,
-        JoinWindowPlan::Unbounded,
         &join_scan_tuning(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,

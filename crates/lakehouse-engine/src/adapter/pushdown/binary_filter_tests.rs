@@ -208,3 +208,31 @@ fn a_binary_literal_carries_its_bytes() {
     );
     assert_eq!(literal_binary_bytes(&text("00abff")), None);
 }
+
+#[test]
+fn per_relation_detection_resolves_a_shared_column_name_by_its_own_relation() {
+    let columns = BinaryColumns::per_relation(
+        [
+            ("LHS_T0".to_string(), &[field("x", "binary")][..]),
+            ("LHS_T1".to_string(), &[field("x", "utf8")][..]),
+        ],
+        false,
+    );
+    let on = |alias: &str| {
+        compare(
+            "predicate_equal",
+            json!({"type": "column", "name": "X", "tableAlias": alias}),
+            text("0a1b"),
+        )
+    };
+    assert_eq!(
+        render_df_filter_safe(&compare_binary_bytes(on("LHS_T0"), &columns)).expect("renders"),
+        "(\"LHS_T0\".\"_LH_BYTES_X\" = X'0a1b')",
+        "the binary leg compares its own relation's raw bytes"
+    );
+    assert_eq!(
+        compare_binary_bytes(on("LHS_T1"), &columns),
+        on("LHS_T1"),
+        "the text leg's same-named column stays a text comparison"
+    );
+}

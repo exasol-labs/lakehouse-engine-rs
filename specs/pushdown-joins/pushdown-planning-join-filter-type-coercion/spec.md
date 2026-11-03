@@ -6,7 +6,7 @@ Applies the pushdown type-rewrite pipeline to the broadcast join's combined filt
 
 * Both join sites run `apply_type_rewrites`, the ordered pipeline (`like_subject_type_guard`, `string_function_arg_type_guard`, `rewrite_decimal_stringifications`) owned by `pushdown-types/pushdown-planning-string-fn-type-coercion-composition`. Guard decisions are inherited from the single-table WHERE surface.
 * The two surfaces screen against different column-type universes:
-  * Broadcast: the union of both involved tables' columns, matched by bare column name, read after `disjoint_schema_guard` has passed. That guard makes a bare name resolve to one Exasol type.
+  * Broadcast: both legs' columns, keyed by the pair (relation alias, column) (`pushdown-joins/pushdown-planning-join`). A qualified column resolves to its own leg's Exasol type even when the two legs share a column name.
   * N-scan: each side's own columns, applied after conjunct attribution to a table. Two sides may declare the same column name with different Exasol types.
 * A type decline takes the outcome each surface already has for a syntactically unrenderable filter. Broadcast forfeits the broadcast plan to the N-scan fallback, because broadcast SQL has no outer `WHERE`. An N-scan side-local conjunct becomes a residual conjunct in the qualified outer `WHERE`. `pushdown/pushdown-declined-filter-self-apply` owns both outcomes.
 * The DATE CAST-to-VARCHAR arm carries the altered-session `NLS_DATE_FORMAT` tracked exception at both join surfaces, as on the single-table surface.
@@ -17,7 +17,7 @@ Applies the pushdown type-rewrite pipeline to the broadcast join's combined filt
 ### Scenario: A broadcast-join filter over a non-string LIKE subject declines the broadcast plan
 
 * *GIVEN* a broadcast-eligible inner equi-join `pushdown` request meeting every other broadcast condition, whose `filter` carries a `predicate_like` whose subject is a bare `column` node
-* *AND* the column's Exasol type in the union of the two involved tables' column metadata is a non-string, non-DATE type, `DECIMAL(p,s)` (including an Exasol integer, which the wire carries as `DECIMAL(p,0)`), `DOUBLE PRECISION`, `BOOLEAN`, or `TIMESTAMP`, or the column's name does not resolve in that union at all
+* *AND* the column's Exasol type in its own leg's column metadata is a non-string, non-DATE type, `DECIMAL(p,s)` (including an Exasol integer, which the wire carries as `DECIMAL(p,0)`), `DOUBLE PRECISION`, `BOOLEAN`, or `TIMESTAMP`, or the column's name does not resolve in that metadata at all
 * *WHEN* the adapter renders the broadcast join pushdown
 * *THEN* the type-rewrite pipeline SHALL decline the filter, and the adapter SHALL decline the WHOLE broadcast plan and fall through to the unified unaccelerated N-scan fallback, which self-applies the predicate in its own qualified outer `WHERE`
 * *AND* the decline SHALL be the SAME clean `Ok(None)`-shaped fall-through the syntactically-unrenderable-filter decline takes, NOT an error and NOT a new route, see `pushdown/pushdown-declined-filter-self-apply`
@@ -28,7 +28,7 @@ Applies the pushdown type-rewrite pipeline to the broadcast join's combined filt
 ### Scenario: A broadcast-join filter over a DATE LIKE subject keeps the broadcast plan
 
 * *GIVEN* a broadcast-eligible inner equi-join `pushdown` request whose `filter` carries a `predicate_like` whose subject is a bare `column` node
-* *AND* the column's Exasol type in the union of the two involved tables' column metadata is `DATE`
+* *AND* the column's Exasol type in its own leg's column metadata is `DATE`
 * *WHEN* the adapter renders the broadcast join pushdown
 * *THEN* the adapter SHALL rewrap the subject as an explicit CAST-to-VARCHAR node before rendering, exactly as the single-table WHERE surface does, and SHALL carry the REWRITTEN tree's rendered fragment in the common spec
 * *AND* the broadcast plan SHALL remain eligible, so a DATE-column LIKE SHALL NOT cost the broadcast optimization, the CAST arm is a rewrite, not a decline

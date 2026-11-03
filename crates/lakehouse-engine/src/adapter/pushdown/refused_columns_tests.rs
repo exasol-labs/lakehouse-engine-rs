@@ -45,7 +45,7 @@ fn a_request_touching_no_refused_column_is_admitted() {
             "filter": {"type": "predicate_is_not_null", "expression": column_node("INT_COL")},
         },
     });
-    let projection = [ProjectionItem::Column("INT_COL".to_string())];
+    let projection = [ProjectionItem::from("INT_COL")];
 
     let gated = ensure_no_refused_column_referenced(&request, Some(&projection), &[shape_col()]);
 
@@ -68,8 +68,8 @@ fn a_table_with_no_refused_column_admits_every_request() {
         },
     });
     let projection = [
-        ProjectionItem::Column("SHAPE_COL".to_string()),
-        ProjectionItem::Column("MAP_COL".to_string()),
+        ProjectionItem::from("SHAPE_COL"),
+        ProjectionItem::from("MAP_COL"),
     ];
 
     let gated = ensure_no_refused_column_referenced(&request, Some(&projection), &[]);
@@ -109,7 +109,7 @@ fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
             },
         },
     });
-    let projection = [ProjectionItem::Column("INT_COL".to_string())];
+    let projection = [ProjectionItem::from("INT_COL")];
 
     let err = ensure_no_refused_column_referenced(&request, Some(&projection), &[shape_col()])
         .expect_err("a filter reaching SHAPE_COL at any depth must be refused");
@@ -132,9 +132,9 @@ fn a_full_row_projection_refuses_a_column_the_request_json_never_names() {
         },
     });
     let projection = [
-        ProjectionItem::Column("INT_COL".to_string()),
-        ProjectionItem::Column("SHAPE_COL".to_string()),
-        ProjectionItem::Column("MAP_COL".to_string()),
+        ProjectionItem::from("INT_COL"),
+        ProjectionItem::from("SHAPE_COL"),
+        ProjectionItem::from("MAP_COL"),
     ];
 
     let err = ensure_no_refused_column_referenced(&request, Some(&projection), &[shape_col()])
@@ -212,8 +212,8 @@ fn every_refused_column_a_request_touches_is_named_in_one_error() {
         },
     });
     let projection = [
-        ProjectionItem::Column("INT_COL".to_string()),
-        ProjectionItem::Column("SHAPE_COL".to_string()),
+        ProjectionItem::from("INT_COL"),
+        ProjectionItem::from("SHAPE_COL"),
     ];
 
     let err = ensure_no_refused_column_referenced(
@@ -247,8 +247,8 @@ fn only_shape_col_refuses_requests_in_the_stats_all_types_shape() {
         },
     });
     let nested_projection = [
-        ProjectionItem::Column("MAP_COL".to_string()),
-        ProjectionItem::Column("NESTED_STRUCT".to_string()),
+        ProjectionItem::from("MAP_COL"),
+        ProjectionItem::from("NESTED_STRUCT"),
     ];
 
     let gated =
@@ -284,7 +284,7 @@ fn a_lower_cased_column_reference_matches_a_refused_column() {
             })],
         },
     });
-    let projection = [ProjectionItem::Column("INT_COL".to_string())];
+    let projection = [ProjectionItem::from("INT_COL")];
 
     let err = ensure_no_refused_column_referenced(&request, Some(&projection), &[shape_col()])
         .expect_err("the request's case must not decide whether the gate matches");

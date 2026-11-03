@@ -979,7 +979,7 @@ pub(crate) fn build_sql_for_fixture_n(
     let proj_items: Vec<ProjectionItem> = proj_cols
         .iter()
         .cloned()
-        .map(ProjectionItem::Column)
+        .map(ProjectionItem::from)
         .collect();
     let spec_template = ScanSpec {
         common: CommonScanSpec {
@@ -1098,7 +1098,7 @@ pub(crate) fn build_row_sql_with_root(
     let proj_items: Vec<ProjectionItem> = proj_cols
         .iter()
         .cloned()
-        .map(ProjectionItem::Column)
+        .map(ProjectionItem::from)
         .collect();
     let spec_template = ScanSpec {
         common: CommonScanSpec {

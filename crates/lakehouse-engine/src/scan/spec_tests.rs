@@ -480,12 +480,12 @@ fn order_by_round_trips_and_defaults_to_empty() {
     let mut spec = sample_spec();
     spec.common.order_by = vec![
         SortKey {
-            column: "L_EXTENDEDPRICE".to_string(),
+            column: "L_EXTENDEDPRICE".into(),
             ascending: false,
             nulls_last: true,
         },
         SortKey {
-            column: "L_ORDERKEY".to_string(),
+            column: "L_ORDERKEY".into(),
             ascending: true,
             nulls_last: false,
         },
@@ -499,10 +499,10 @@ fn order_by_round_trips_and_defaults_to_empty() {
     let back = ScanSpec::from_json(&json).unwrap();
     assert_eq!(back.common.order_by, spec.common.order_by);
     assert_eq!(back.common.order_by.len(), 2);
-    assert_eq!(back.common.order_by[0].column, "L_EXTENDEDPRICE");
+    assert_eq!(back.common.order_by[0].column, "L_EXTENDEDPRICE".into());
     assert!(!back.common.order_by[0].ascending);
     assert!(back.common.order_by[0].nulls_last);
-    assert_eq!(back.common.order_by[1].column, "L_ORDERKEY");
+    assert_eq!(back.common.order_by[1].column, "L_ORDERKEY".into());
     assert!(back.common.order_by[1].ascending);
     assert!(!back.common.order_by[1].nulls_last);
 
@@ -1154,7 +1154,9 @@ fn join_block_round_trips_through_split_and_merge() {
         }],
         name_mapping: Vec::new(),
         join_type: JoinType::Inner,
-        condition: "\"F_KEY\" = \"D_KEY\"".into(),
+        fact_alias: "LHS_T1".into(),
+        dimension_alias: "LHS_T0".into(),
+        condition: "\"LHS_T0\".\"D_KEY\" = \"LHS_T1\".\"F_KEY\"".into(),
         post_join_limit: None,
         post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
@@ -1203,7 +1205,7 @@ fn join_block_round_trips_through_split_and_merge() {
         ]
     );
     assert_eq!(jb.join_type, JoinType::Inner);
-    assert_eq!(jb.condition, "\"F_KEY\" = \"D_KEY\"");
+    assert_eq!(jb.condition, "\"LHS_T0\".\"D_KEY\" = \"LHS_T1\".\"F_KEY\"");
     assert_eq!(jb.logical_schema.len(), 1);
     assert_eq!(jb.logical_schema[0].name, "d_key");
 
@@ -1221,7 +1223,9 @@ fn sample_join_spec(storage: ScanStorage) -> JoinSpec {
         logical_schema: Vec::new(),
         name_mapping: Vec::new(),
         join_type: JoinType::Inner,
-        condition: "\"F_KEY\" = \"D_KEY\"".into(),
+        fact_alias: "LHS_T1".into(),
+        dimension_alias: "LHS_T0".into(),
+        condition: "\"LHS_T0\".\"D_KEY\" = \"LHS_T1\".\"F_KEY\"".into(),
         post_join_limit: None,
         post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
@@ -1307,7 +1311,9 @@ fn join_spec_partition_columns_defaults_to_empty_and_iceberg_json_is_byte_identi
         logical_schema: Vec::new(),
         name_mapping: Vec::new(),
         join_type: JoinType::Inner,
-        condition: "\"F_KEY\" = \"D_KEY\"".into(),
+        fact_alias: "LHS_T1".into(),
+        dimension_alias: "LHS_T0".into(),
+        condition: "\"LHS_T0\".\"D_KEY\" = \"LHS_T1\".\"F_KEY\"".into(),
         post_join_limit: None,
         post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
@@ -1317,7 +1323,7 @@ fn join_spec_partition_columns_defaults_to_empty_and_iceberg_json_is_byte_identi
     let json = serde_json::to_string(&join).unwrap();
     assert_eq!(
         json,
-        r#"{"table_root":"s3://warehouse/db/dim","files":[["data/dim-00000.parquet",512]],"join_type":"inner","condition":"\"F_KEY\" = \"D_KEY\"","storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"dimkey","secret_key":"dimsecret","allow_http":true,"path_style":true}}}}"#,
+        r#"{"table_root":"s3://warehouse/db/dim","files":[["data/dim-00000.parquet",512]],"join_type":"inner","fact_alias":"LHS_T1","dimension_alias":"LHS_T0","condition":"\"LHS_T0\".\"D_KEY\" = \"LHS_T1\".\"F_KEY\"","storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"dimkey","secret_key":"dimsecret","allow_http":true,"path_style":true}}}}"#,
         "an Iceberg join spec must serialize byte-identically with partition_columns defaulted and skipped"
     );
 
@@ -1327,13 +1333,13 @@ fn join_spec_partition_columns_defaults_to_empty_and_iceberg_json_is_byte_identi
 
 #[test]
 fn join_storage_is_a_required_key() {
-    let without_storage = r#"{"table_root":"s3://warehouse/db/dim","files":[["data/dim-00000.parquet",512]],"join_type":"inner","condition":"\"F_KEY\" = \"D_KEY\""}"#;
+    let without_storage = r#"{"table_root":"s3://warehouse/db/dim","files":[["data/dim-00000.parquet",512]],"join_type":"inner","fact_alias":"LHS_T1","dimension_alias":"LHS_T0","condition":"\"LHS_T0\".\"D_KEY\" = \"LHS_T1\".\"F_KEY\""}"#;
     assert!(
         serde_json::from_str::<JoinSpec>(without_storage).is_err(),
         "a join payload omitting storage must not deserialize"
     );
 
-    let with_storage = r#"{"table_root":"s3://warehouse/db/dim","files":[["data/dim-00000.parquet",512]],"join_type":"inner","condition":"\"F_KEY\" = \"D_KEY\"","storage":{"connection":{"name":"C","allow_http":false}}}"#;
+    let with_storage = r#"{"table_root":"s3://warehouse/db/dim","files":[["data/dim-00000.parquet",512]],"join_type":"inner","fact_alias":"LHS_T1","dimension_alias":"LHS_T0","condition":"\"LHS_T0\".\"D_KEY\" = \"LHS_T1\".\"F_KEY\"","storage":{"connection":{"name":"C","allow_http":false}}}"#;
     assert!(
         serde_json::from_str::<JoinSpec>(with_storage).is_ok(),
         "a join payload carrying storage must deserialize"
@@ -2101,4 +2107,65 @@ fn iceberg_blob_coordinates_are_refused_unless_the_entry_is_a_deletion_vector() 
             "the refusal identifies scan-files deserialization: {err}"
         );
     }
+}
+
+/// Two distinct (alias, column) pairs must never collapse into one output name, or two
+/// projected columns would share an identifier in the join's output.
+#[test]
+fn output_names_of_distinct_pairs_differ() {
+    let one_with_digit_prefixed_column = ColumnRef::qualified(relation_alias(1), "2X");
+    let twelve_with_plain_column = ColumnRef::qualified(relation_alias(12), "X");
+
+    assert_ne!(
+        one_with_digit_prefixed_column.output_name(),
+        twelve_with_plain_column.output_name()
+    );
+    assert_eq!(one_with_digit_prefixed_column.output_name(), "LHS_T1_2X");
+    assert_eq!(twelve_with_plain_column.output_name(), "LHS_T12_X");
+}
+
+#[test]
+fn an_unqualified_column_reference_keeps_its_bare_string_encoding() {
+    let item = ProjectionItem::from("ID");
+    let json = serde_json::to_string(&item).unwrap();
+    assert_eq!(json, r#""ID""#);
+    assert_eq!(serde_json::from_str::<ProjectionItem>(&json).unwrap(), item);
+    assert_eq!(item.emit_name(), "ID");
+}
+
+#[test]
+fn a_qualified_column_reference_round_trips_and_names_its_output_by_alias_and_column() {
+    let item = ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "ID"));
+    let json = serde_json::to_string(&item).unwrap();
+    assert_eq!(json, r#"{"relation":"LHS_T1","name":"ID"}"#);
+    assert_eq!(serde_json::from_str::<ProjectionItem>(&json).unwrap(), item);
+    assert_eq!(item.emit_name(), "LHS_T1_ID");
+}
+
+#[test]
+fn a_sort_key_over_a_qualified_column_round_trips() {
+    let key = SortKey {
+        column: ColumnRef::qualified("LHS_T0", "ID"),
+        ascending: false,
+        nulls_last: true,
+    };
+    let json = serde_json::to_string(&key).unwrap();
+    assert_eq!(
+        json,
+        r#"{"column":{"relation":"LHS_T0","name":"ID"},"ascending":false,"nulls_last":true}"#
+    );
+    assert_eq!(serde_json::from_str::<SortKey>(&json).unwrap(), key);
+    assert_eq!(
+        key.render_order_by_element(),
+        r#""LHS_T0_ID" DESC NULLS LAST"#
+    );
+}
+
+#[test]
+fn join_relation_aliases_are_required_keys() {
+    let without_aliases = r#"{"table_root":"s3://warehouse/db/dim","files":[["data/dim-00000.parquet",512]],"join_type":"inner","condition":"1 = 1","storage":{"connection":{"name":"C","allow_http":false}}}"#;
+    assert!(
+        serde_json::from_str::<JoinSpec>(without_aliases).is_err(),
+        "a join payload omitting the relation aliases must not deserialize"
+    );
 }
