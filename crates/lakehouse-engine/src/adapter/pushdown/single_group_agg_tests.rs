@@ -47,7 +47,7 @@ fn round_expr(inner: serde_json::Value, digits: i64) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar",
         "name": "ROUND",
-        "arguments": [inner, {"type": "literal_exactnumeric", "value": digits}],
+        "arguments": [inner, num_lit(digits)],
     })
 }
 

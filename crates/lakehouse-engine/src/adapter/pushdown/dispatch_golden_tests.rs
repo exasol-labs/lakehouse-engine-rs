@@ -6,7 +6,9 @@ use super::test_support::{
     agg_item, broadcast_sides, pd, sample_scan_storage, sample_storage, with_identifier_notes,
 };
 use super::*;
-use crate::adapter::pushdown::test_support::{aliased_col, col, customer_orders_join, table_col};
+use crate::adapter::pushdown::test_support::{
+    aliased_col, col, customer_orders_join, num_lit, predicate_equal, str_lit, table_col,
+};
 
 fn fixed_shards() -> Vec<Vec<FileEntry>> {
     vec![
@@ -61,7 +63,7 @@ fn unmergeable_having_request() -> Json {
     req["pushdownRequest"]["having"] = serde_json::json!({
         "type": "predicate_greater",
         "left": agg_item("COUNT", None, false),
-        "right": {"type": "literal_exactnumeric", "value": 0},
+        "right": num_lit(0),
     });
     req
 }
@@ -140,7 +142,7 @@ fn nested_aggregate_decline_request() -> Json {
             "name": "ROUND",
             "arguments": [
                 agg_item("SUM", Some("AMOUNT"), true),
-                {"type": "literal_exactnumeric", "value": 2}
+                num_lit(2)
             ]
         } ],
         "selectListDataTypes": [ {"type": "decimal", "precision": 36, "scale": 2} ],
@@ -154,7 +156,7 @@ fn single_group_scalar_over_aggregate_request() -> Json {
             "name": "ROUND",
             "arguments": [
                 agg_item("SUM", Some("AMOUNT"), false),
-                {"type": "literal_exactnumeric", "value": 2}
+                num_lit(2)
             ]
         } ],
         "selectListDataTypes": [ {"type": "decimal", "precision": 36, "scale": 2} ],
@@ -178,7 +180,7 @@ fn single_group_scalar_over_aggregate_dedup_request() -> Json {
                             agg_item("COUNT", None, false),
                         ]
                     },
-                    {"type": "literal_exactnumeric", "value": 2}
+                    num_lit(2)
                 ]
             }
         ],
@@ -205,7 +207,7 @@ fn single_group_scalar_over_aggregate_interleaved_request() -> Json {
                             agg_item("COUNT", None, false),
                         ]
                     },
-                    {"type": "literal_exactnumeric", "value": 2}
+                    num_lit(2)
                 ]
             },
             agg_item("COUNT", None, false),
@@ -225,7 +227,7 @@ fn single_group_scalar_over_variance_request() -> Json {
             "name": "ROUND",
             "arguments": [
                 agg_item("VARIANCE", Some("AMOUNT"), false),
-                {"type": "literal_exactnumeric", "value": 4}
+                num_lit(4)
             ]
         } ],
         "selectListDataTypes": [ {"type": "decimal", "precision": 36, "scale": 4} ],
@@ -935,11 +937,7 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
         include_str!("testdata/dispatch_golden/rendering_single_table.sql")
     );
 
-    let renderable_filter = serde_json::json!({
-        "type": "predicate_equal",
-        "left": table_col("CUSTOMER", "C_NAME"),
-        "right": {"type": "literal_string", "value": "ACME"},
-    });
+    let renderable_filter = predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME"));
     let request = two_table_join_request(Some(renderable_filter));
     let pushdown_req = pd(&request);
     let join = two_table_detected_join(&request);

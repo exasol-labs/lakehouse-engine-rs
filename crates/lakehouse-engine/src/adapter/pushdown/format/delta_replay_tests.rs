@@ -1,4 +1,4 @@
-use crate::adapter::pushdown::test_support::col;
+use crate::adapter::pushdown::test_support::{col, num_lit, str_lit};
 use crate::scan::test_support::WithFiles;
 use std::sync::Arc;
 
@@ -1199,8 +1199,8 @@ fn a_between_keeps_one_bound_when_the_other_fails_to_convert() {
     let node = json!({
         "type": "predicate_between",
         "expression": col("ID"),
-        "left": {"type": "literal_exactnumeric", "value": 4},
-        "right": {"type": "literal_string", "value": "ten"},
+        "left": num_lit(4),
+        "right": str_lit("ten"),
     });
     let predicate = to_delta_predicate(&node, &by_name(&schema))
         .expect("a BETWEEN must keep the bound it can translate");
@@ -1221,8 +1221,8 @@ fn a_between_keeps_one_bound_when_the_other_fails_to_convert() {
 fn an_or_with_an_untranslatable_branch_keeps_every_file() {
     let schema = open_fixture("multi-part-stats").schema();
     let node = json!({"type": "predicate_or", "expressions": [
-        {"type": "predicate_lessequal", "left": col("ID"), "right": {"type": "literal_exactnumeric", "value": 2}},
-        {"type": "predicate_notequal", "left": col("ID"), "right": {"type": "literal_exactnumeric", "value": 7}},
+        {"type": "predicate_lessequal", "left": col("ID"), "right": num_lit(2)},
+        {"type": "predicate_notequal", "left": col("ID"), "right": num_lit(7)},
     ]});
 
     assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);

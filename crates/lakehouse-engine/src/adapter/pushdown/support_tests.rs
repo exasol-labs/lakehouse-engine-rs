@@ -12,24 +12,23 @@ fn walk_column_nodes_visits_every_nested_column_node_once() {
         "name": "PLUS",
         "arguments": [
             table_col("T", "A"),
-            {"type": "literal_exactnumeric", "value": 1}
+            num_lit(1)
         ],
         "case": {
             "type": "case",
             "results": [
                 col("B"),
-                {"type": "literal_exactnumeric", "value": 2}
+                num_lit(2)
             ]
         },
-        "predicate": {
-            "type": "predicate_equal",
-            "left": col("C"),
-            "right": {
-                "type": "column",
-                "name": "D",
-                "nested": col("E")
-            }
-        }
+        "predicate": predicate_equal(
+            col("C"),
+            serde_json::json!({
+                    "type": "column",
+                    "name": "D",
+                    "nested": col("E")
+                }),
+        )
     });
 
     let mut visited = Vec::new();
@@ -73,7 +72,7 @@ fn strip_table_alias_removes_alias_preserves_table_name_and_name_recursively() {
         "tableAlias": "O",
         "arguments": [
             aliased_col("FACT_ORDERS", "O", "O_ORDERDATE"),
-            {"type": "literal_exactnumeric", "value": 1}
+            num_lit(1)
         ]
     });
 
@@ -86,7 +85,7 @@ fn strip_table_alias_removes_alias_preserves_table_name_and_name_recursively() {
             "name": "PLUS",
             "arguments": [
                 table_col("FACT_ORDERS", "O_ORDERDATE"),
-                {"type": "literal_exactnumeric", "value": 1}
+                num_lit(1)
             ]
         }),
         "every tableAlias key must be gone at every depth, while name/tableName survive"
@@ -98,7 +97,7 @@ fn datafusion_renderable_true_for_a_rendering_predicate() {
     let expr = serde_json::json!({
         "type": "predicate_greater",
         "left": col("AGE"),
-        "right": {"type": "literal_exactnumeric", "value": 18}
+        "right": num_lit(18)
     });
 
     assert!(datafusion_renderable(&expr));
@@ -111,7 +110,7 @@ fn datafusion_renderable_false_for_second_with_precision_arity_decline() {
         "name": "SECOND",
         "arguments": [
             col("TS"),
-            {"type": "literal_exactnumeric", "value": 3}
+            num_lit(3)
         ]
     });
 
@@ -120,7 +119,7 @@ fn datafusion_renderable_false_for_second_with_precision_arity_decline() {
 
 #[test]
 fn datafusion_renderable_true_for_trivially_true_literal() {
-    let expr = serde_json::json!({"type": "literal_bool", "value": true});
+    let expr = bool_lit(true);
 
     assert!(datafusion_renderable(&expr));
 }
@@ -133,7 +132,7 @@ fn datafusion_renderable_answer_unchanged_by_strip_table_alias() {
         "tableAlias": "O",
         "arguments": [
             aliased_col("T", "O", "TS"),
-            {"type": "literal_exactnumeric", "value": 3}
+            num_lit(3)
         ]
     });
     let stripped = strip_table_alias(&with_alias);
@@ -151,7 +150,7 @@ fn datafusion_renderable_answer_unchanged_by_strip_table_alias() {
     let renders_with_alias = serde_json::json!({
         "type": "predicate_greater",
         "left": aliased_col("T", "O", "TS"),
-        "right": {"type": "literal_exactnumeric", "value": 1}
+        "right": num_lit(1)
     });
     let renders_stripped = strip_table_alias(&renders_with_alias);
 
@@ -566,7 +565,7 @@ fn pushdown_translates_or_omits_predicate() {
     let translatable = serde_json::json!({
         "type": "predicate_greater",
         "left": col("age"),
-        "right": {"type": "literal_exactnumeric", "value": 18}
+        "right": num_lit(18)
     });
     let filter_rendered = render_df_filter_safe(&translatable);
     assert!(
@@ -1819,11 +1818,11 @@ fn selectlist_case_node_rendered_in_emits() {
         "arguments": [
             {"type": "predicate_less",
              "left": col("SCORE"),
-             "right": {"type": "literal_exactnumeric", "value": "50"}}
+             "right": num_lit("50")}
         ],
         "results": [
-            {"type": "literal_string", "value": "low"},
-            {"type": "literal_string", "value": "high"}
+            str_lit("low"),
+            str_lit("high")
         ]
     });
     let request = serde_json::json!({
@@ -1890,7 +1889,7 @@ fn selectlist_untranslatable_cast_falls_back_to_full_row() {
 
 #[test]
 fn selectlist_literal_rendered_as_positional_expr() {
-    let literal = serde_json::json!({"type": "literal_exactnumeric", "value": 1});
+    let literal = num_lit(1);
     let request = serde_json::json!({
         "involvedTables": [{
             "columns": [
@@ -1919,7 +1918,7 @@ fn selectlist_literal_rendered_as_positional_expr() {
 
 #[test]
 fn selectlist_duplicate_literals_keep_distinct_positions() {
-    let literal = serde_json::json!({"type": "literal_exactnumeric", "value": 1});
+    let literal = num_lit(1);
     let column = col("NAME");
     let request = serde_json::json!({
         "involvedTables": [{
@@ -1971,7 +1970,7 @@ fn selectlist_duplicate_literals_keep_distinct_positions() {
 
 #[test]
 fn selectlist_bare_literal_does_not_fall_back_to_full_row() {
-    let literal = serde_json::json!({"type": "literal_string", "value": "x"});
+    let literal = str_lit("x");
     let request = serde_json::json!({
         "involvedTables": [{
             "columns": [
@@ -1995,10 +1994,7 @@ fn selectlist_bare_literal_does_not_fall_back_to_full_row() {
 
 #[test]
 fn selectlist_tstz_literal_widens_via_emits_type_gate() {
-    let literal = serde_json::json!({
-        "type": "literal_timestamp_utc",
-        "value": "2024-03-01 10:00:00"
-    });
+    let literal = lit("literal_timestamp_utc", "2024-03-01 10:00:00");
     assert!(
         render_expression_safe(&literal).is_some(),
         "literal_timestamp_utc must render via render_expression_safe"
@@ -2035,10 +2031,7 @@ fn selectlist_tstz_literal_widens_via_emits_type_gate() {
 
 #[test]
 fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
-    let literal = serde_json::json!({
-        "type": "literal_timestamputc",
-        "value": "2024-03-01 10:00:00"
-    });
+    let literal = lit("literal_timestamputc", "2024-03-01 10:00:00");
     assert!(
         render_expression_safe(&literal).is_none(),
         "the DataFusion dialect must keep declining the real wire name (#242): \
@@ -2076,10 +2069,7 @@ fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
 
 #[test]
 fn selectlist_plain_timestamp_literal_rendered_as_expr() {
-    let literal = serde_json::json!({
-        "type": "literal_timestamp",
-        "value": "2024-03-01 10:00:00"
-    });
+    let literal = lit("literal_timestamp", "2024-03-01 10:00:00");
     let request = serde_json::json!({
         "involvedTables": [{
             "columns": [
@@ -2196,11 +2186,7 @@ fn filter_in_common_arg() {
         .build()
         .unwrap();
 
-    let filter_json = serde_json::json!({
-        "type": "predicate_equal",
-        "left": col("id"),
-        "right": {"type": "literal_exactnumeric", "value": 42}
-    });
+    let filter_json = predicate_equal(col("id"), num_lit(42));
 
     let df_filter = render_df_filter_safe(&filter_json);
     assert!(
@@ -2235,7 +2221,7 @@ fn like_guard_varchar_subject_unchanged() {
     let filter = serde_json::json!({
         "type": "predicate_like",
         "expression": col("name"),
-        "pattern": {"type": "literal_string", "value": "A%"}
+        "pattern": str_lit("A%")
     });
     let col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
 
@@ -2253,7 +2239,7 @@ fn like_guard_char_subject_unchanged() {
     let filter = serde_json::json!({
         "type": "predicate_like",
         "expression": col("code"),
-        "pattern": {"type": "literal_string", "value": "A%"}
+        "pattern": str_lit("A%")
     });
     let col_types = vec![("CODE".to_string(), "CHAR(3) ASCII".to_string())];
 
@@ -2272,7 +2258,7 @@ fn like_guard_date_subject_wraps_cast() {
     let filter = serde_json::json!({
         "type": "predicate_like",
         "expression": column.clone(),
-        "pattern": {"type": "literal_string", "value": "2024%"}
+        "pattern": str_lit("2024%")
     });
     let col_types = vec![("SIGNUP_DATE".to_string(), "DATE".to_string())];
 
@@ -2285,7 +2271,7 @@ fn like_guard_date_subject_wraps_cast() {
             "dataType": {"type": "VARCHAR"},
             "arguments": [column]
         },
-        "pattern": {"type": "literal_string", "value": "2024%"}
+        "pattern": str_lit("2024%")
     });
     assert_eq!(
         result,
@@ -2300,7 +2286,7 @@ fn like_guard_decimal_subject_declines() {
     let filter = serde_json::json!({
         "type": "predicate_like",
         "expression": col("amount"),
-        "pattern": {"type": "literal_string", "value": "9%"}
+        "pattern": str_lit("9%")
     });
     let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
 
@@ -2316,7 +2302,7 @@ fn type_rewrite_pipeline_runs_like_guard() {
     let filter = serde_json::json!({
         "type": "predicate_like",
         "expression": col("amount"),
-        "pattern": {"type": "literal_string", "value": "9%"}
+        "pattern": str_lit("9%")
     });
     let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
 
@@ -2454,7 +2440,7 @@ fn like_guard_integer_subject_declines() {
     let filter = serde_json::json!({
         "type": "predicate_like",
         "expression": col("quantity"),
-        "pattern": {"type": "literal_string", "value": "1%"}
+        "pattern": str_lit("1%")
     });
     let col_types = vec![("QUANTITY".to_string(), "DECIMAL(20,0)".to_string())];
 
@@ -2475,7 +2461,7 @@ fn like_guard_non_column_subject_untouched() {
             "name": "UPPER",
             "arguments": [col("amount")]
         },
-        "pattern": {"type": "literal_string", "value": "A%"}
+        "pattern": str_lit("A%")
     });
     let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
 
@@ -2493,7 +2479,7 @@ fn like_guard_unresolvable_column_declines() {
     let filter = serde_json::json!({
         "type": "predicate_like",
         "expression": col("mystery"),
-        "pattern": {"type": "literal_string", "value": "A%"}
+        "pattern": str_lit("A%")
     });
     let col_types = vec![("OTHER".to_string(), "VARCHAR(2000000)".to_string())];
 
@@ -2510,18 +2496,14 @@ fn like_guard_nested_decimal_declines_whole_filter() {
     let filter = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
-            {
-                "type": "predicate_equal",
-                "left": col("status"),
-                "right": {"type": "literal_string", "value": "OPEN"}
-            },
+            predicate_equal(col("status"), str_lit("OPEN")),
             {
                 "type": "predicate_and",
                 "expressions": [
                     {
                         "type": "predicate_like",
                         "expression": col("amount"),
-                        "pattern": {"type": "literal_string", "value": "9%"}
+                        "pattern": str_lit("9%")
                     }
                 ]
             }
@@ -2585,15 +2567,11 @@ fn nested_like_decline_routes_to_wrapper_where() {
     let filter = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
-            {
-                "type": "predicate_equal",
-                "left": table_col("T", "STATUS"),
-                "right": {"type": "literal_string", "value": "OPEN"},
-            },
+            predicate_equal(table_col("T", "STATUS"), str_lit("OPEN")),
             {
                 "type": "predicate_like",
                 "expression": table_col("T", "AMOUNT"),
-                "pattern": {"type": "literal_string", "value": "9%"},
+                "pattern": str_lit("9%"),
             },
         ],
     });
@@ -2620,7 +2598,7 @@ fn declined_like_on_integer_column_routes_to_wrapper_where() {
     let filter = serde_json::json!({
         "type": "predicate_like",
         "expression": table_col("T", "QUANTITY"),
-        "pattern": {"type": "literal_string", "value": "1%"},
+        "pattern": str_lit("1%"),
     });
     let col_types = vec![("QUANTITY".to_string(), "DECIMAL(20,0)".to_string())];
 
@@ -2638,7 +2616,7 @@ fn declined_like_on_unresolvable_column_routes_to_wrapper_where() {
     let filter = serde_json::json!({
         "type": "predicate_like",
         "expression": table_col("T", "MYSTERY"),
-        "pattern": {"type": "literal_string", "value": "A%"},
+        "pattern": str_lit("A%"),
     });
     let col_types = vec![("OTHER".to_string(), "VARCHAR(2000000)".to_string())];
 
@@ -2658,7 +2636,7 @@ fn like_guard_not_wrapped_decimal_declines() {
         "expression": {
             "type": "predicate_like",
             "expression": col("amount"),
-            "pattern": {"type": "literal_string", "value": "9%"}
+            "pattern": str_lit("9%")
         }
     });
     let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
@@ -2679,12 +2657,12 @@ fn like_guard_decimal_inside_case_declines() {
             {
                 "type": "predicate_like",
                 "expression": col("amount"),
-                "pattern": {"type": "literal_string", "value": "9%"}
+                "pattern": str_lit("9%")
             }
         ],
         "results": [
-            {"type": "literal_exactnumeric", "value": 1},
-            {"type": "literal_exactnumeric", "value": 0}
+            num_lit(1),
+            num_lit(0)
         ]
     });
     let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
@@ -2700,8 +2678,8 @@ fn like_guard_decimal_inside_case_declines() {
 #[test]
 fn like_guard_date_inside_case_wraps_cast() {
     let column = col("signup_date");
-    let then_branch = serde_json::json!({"type": "literal_exactnumeric", "value": 1});
-    let else_branch = serde_json::json!({"type": "literal_exactnumeric", "value": 0});
+    let then_branch = num_lit(1);
+    let else_branch = num_lit(0);
     let filter = serde_json::json!({
         "type": "function_scalar_case",
         "name": "CASE",
@@ -2709,7 +2687,7 @@ fn like_guard_date_inside_case_wraps_cast() {
             {
                 "type": "predicate_like",
                 "expression": column.clone(),
-                "pattern": {"type": "literal_string", "value": "2024%"}
+                "pattern": str_lit("2024%")
             }
         ],
         "results": [then_branch.clone(), else_branch.clone()]
@@ -2729,7 +2707,7 @@ fn like_guard_date_inside_case_wraps_cast() {
                     "dataType": {"type": "VARCHAR"},
                     "arguments": [column]
                 },
-                "pattern": {"type": "literal_string", "value": "2024%"}
+                "pattern": str_lit("2024%")
             }
         ],
         "results": [then_branch, else_branch]
@@ -2751,12 +2729,12 @@ fn like_guard_varchar_inside_case_unchanged() {
             {
                 "type": "predicate_like",
                 "expression": col("name"),
-                "pattern": {"type": "literal_string", "value": "A%"}
+                "pattern": str_lit("A%")
             }
         ],
         "results": [
-            {"type": "literal_exactnumeric", "value": 1},
-            {"type": "literal_exactnumeric", "value": 0}
+            num_lit(1),
+            num_lit(0)
         ]
     });
     let col_types = vec![("NAME".to_string(), "VARCHAR(20)".to_string())];
@@ -2969,7 +2947,7 @@ fn rewrite_nested_concat_wraps_only_inner_decimal() {
                 "type": "function_scalar",
                 "name": "CONCAT",
                 "arguments": [
-                    {"type": "literal_string", "value": "-"},
+                    str_lit("-"),
                     col("c_decimal_a")
                 ]
             }
@@ -3084,7 +3062,7 @@ fn rewrite_computed_expression_argument_unchanged() {
     let computed = serde_json::json!({
         "type": "function_scalar",
         "name": "MULT",
-        "arguments": [decimal_column(), {"type": "literal_exactnumeric", "value": 2}]
+        "arguments": [decimal_column(), num_lit(2)]
     });
     let col_types = decimal_rewrite_col_types();
 
@@ -3114,7 +3092,7 @@ fn rewrite_non_stringifying_context_unchanged() {
     let cmp = serde_json::json!({
         "type": "predicate_greater",
         "left": decimal_column(),
-        "right": {"type": "literal_exactnumeric", "value": 5}
+        "right": num_lit(5)
     });
     assert_eq!(
         rewrite_decimal_stringifications(&cmp, &ColumnTypes::unqualified(&col_types)),
@@ -3139,7 +3117,7 @@ fn rewrite_reaches_decimal_inside_case_then_branch() {
             {
                 "type": "predicate_greater",
                 "left": col("id"),
-                "right": {"type": "literal_exactnumeric", "value": 0}
+                "right": num_lit(0)
             }
         ],
         "results": [
@@ -3147,7 +3125,7 @@ fn rewrite_reaches_decimal_inside_case_then_branch() {
                 "type": "function_scalar",
                 "name": "CONCAT",
                 "arguments": [
-                    {"type": "literal_string", "value": "x"},
+                    str_lit("x"),
                     col("c_decimal_a")
                 ]
             }
@@ -3215,7 +3193,7 @@ fn selectlist_nested_concat_decimal_arg_rewritten() {
                 "type": "function_scalar",
                 "name": "CONCAT",
                 "arguments": [
-                    {"type": "literal_string", "value": "-"},
+                    str_lit("-"),
                     decimal_column()
                 ]
             }
@@ -3309,7 +3287,7 @@ fn stringify_computed_decimal_arg_untouched() {
     let computed = serde_json::json!({
         "type": "function_scalar",
         "name": "MULT",
-        "arguments": [decimal_column(), {"type": "literal_exactnumeric", "value": 2}]
+        "arguments": [decimal_column(), num_lit(2)]
     });
     let pushdown_req = serde_json::json!({
         "selectList": [ cast_to("VARCHAR", computed) ],
@@ -3430,13 +3408,7 @@ fn selectlist_string_fn_over_double_falls_back_to_full_row() {
 
 #[test]
 fn selectlist_instr_decimal_arg_coerces_first_position_only() {
-    let item = string_fn(
-        "INSTR",
-        vec![
-            decimal_column(),
-            serde_json::json!({"type": "literal_string", "value": "."}),
-        ],
-    );
+    let item = string_fn("INSTR", vec![decimal_column(), str_lit(".")]);
     let pushdown_req = serde_json::json!({
         "selectList": [ item ],
         "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 0} ],
@@ -3468,14 +3440,7 @@ fn selectlist_instr_decimal_arg_coerces_first_position_only() {
 #[test]
 fn selectlist_instr_with_start_position_falls_back_to_full_row() {
     let col_types = decimal_rewrite_col_types();
-    let item = string_fn(
-        "INSTR",
-        vec![
-            col("name"),
-            serde_json::json!({"type": "literal_string", "value": "b"}),
-            serde_json::json!({"type": "literal_exactnumeric", "value": 3}),
-        ],
-    );
+    let item = string_fn("INSTR", vec![col("name"), str_lit("b"), num_lit(3)]);
     let pushdown_req = serde_json::json!({
         "selectList": [ item ],
         "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 0} ],
@@ -3509,8 +3474,8 @@ fn selectlist_predicate_node_projects_as_expr() {
                 "type": "predicate_in_constlist",
                 "expression": col("name"),
                 "arguments": [
-                    {"type": "literal_string", "value": "a"},
-                    {"type": "literal_string", "value": "b"},
+                    str_lit("a"),
+                    str_lit("b"),
                 ]
             }),
             r#"("NAME" IN ('a', 'b'))"#,
@@ -3520,8 +3485,8 @@ fn selectlist_predicate_node_projects_as_expr() {
             serde_json::json!({
                 "type": "predicate_between",
                 "expression": col("id"),
-                "left": {"type": "literal_exactnumeric", "value": 1},
-                "right": {"type": "literal_exactnumeric", "value": 10},
+                "left": num_lit(1),
+                "right": num_lit(10),
             }),
             r#"("ID" BETWEEN 1 AND 10)"#,
         ),
@@ -3546,7 +3511,7 @@ fn selectlist_predicate_node_projects_as_expr() {
             serde_json::json!({
                 "type": "predicate_notequal",
                 "left": col("id"),
-                "right": {"type": "literal_exactnumeric", "value": 5},
+                "right": num_lit(5),
             }),
             r#"("ID" <> 5)"#,
         ),
@@ -3630,7 +3595,7 @@ fn selectlist_like_over_date_projects_cast_expr() {
     let item = serde_json::json!({
         "type": "predicate_like",
         "expression": col("d"),
-        "pattern": {"type": "literal_string", "value": "2024%"}
+        "pattern": str_lit("2024%")
     });
     let pushdown_req = serde_json::json!({
         "selectList": [ item ],
@@ -3671,7 +3636,7 @@ fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
             serde_json::json!({
                 "type": "predicate_like",
                 "expression": col("c_decimal_a"),
-                "pattern": {"type": "literal_string", "value": "1%"}
+                "pattern": str_lit("1%")
             }),
         ),
         (
@@ -3679,7 +3644,7 @@ fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
             serde_json::json!({
                 "type": "predicate_like",
                 "expression": col("id"),
-                "pattern": {"type": "literal_string", "value": "1%"}
+                "pattern": str_lit("1%")
             }),
         ),
         (
@@ -3687,7 +3652,7 @@ fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
             serde_json::json!({
                 "type": "predicate_like",
                 "expression": col("c_double_a"),
-                "pattern": {"type": "literal_string", "value": "1%"}
+                "pattern": str_lit("1%")
             }),
         ),
         (
@@ -3695,7 +3660,7 @@ fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
             serde_json::json!({
                 "type": "predicate_like",
                 "expression": col("c_bool_a"),
-                "pattern": {"type": "literal_string", "value": "1%"}
+                "pattern": str_lit("1%")
             }),
         ),
         (
@@ -3703,7 +3668,7 @@ fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
             serde_json::json!({
                 "type": "predicate_like",
                 "expression": col("c_ts_a"),
-                "pattern": {"type": "literal_string", "value": "1%"}
+                "pattern": str_lit("1%")
             }),
         ),
         (
@@ -3711,7 +3676,7 @@ fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
             serde_json::json!({
                 "type": "predicate_like",
                 "expression": col("not_a_column"),
-                "pattern": {"type": "literal_string", "value": "1%"}
+                "pattern": str_lit("1%")
             }),
         ),
     ];
@@ -3757,12 +3722,12 @@ fn selectlist_like_inside_case_over_decimal_falls_back_to_full_row() {
             {
                 "type": "predicate_like",
                 "expression": col("c_decimal_a"),
-                "pattern": {"type": "literal_string", "value": "1%"}
+                "pattern": str_lit("1%")
             }
         ],
         "results": [
-            {"type": "literal_string", "value": "yes"},
-            {"type": "literal_string", "value": "no"}
+            str_lit("yes"),
+            str_lit("no")
         ]
     });
     let pushdown_req = serde_json::json!({
@@ -3979,7 +3944,7 @@ fn cast_varchar(name: &str) -> Json {
 }
 
 fn equals(left: Json, right: Json) -> Json {
-    serde_json::json!({"type": "predicate_equal", "left": left, "right": right})
+    predicate_equal(left, right)
 }
 
 #[test]
@@ -4127,15 +4092,12 @@ fn string_fn_guard_declines_nameless_column_node() {
 #[test]
 fn string_fn_guard_reaches_function_under_comparison_predicate() {
     let col_types = decimal_rewrite_col_types();
-    let node = equals(
-        string_fn("UPPER", vec![decimal_column()]),
-        serde_json::json!({"type": "literal_string", "value": "X"}),
-    );
+    let node = equals(string_fn("UPPER", vec![decimal_column()]), str_lit("X"));
     assert_eq!(
         string_function_arg_type_guard(&node, &ColumnTypes::unqualified(&col_types)),
         Some(equals(
             string_fn("UPPER", vec![trimmed_decimal("c_decimal_a")]),
-            serde_json::json!({"type": "literal_string", "value": "X"}),
+            str_lit("X"),
         )),
         "a string function under `left` must be coerced"
     );
@@ -4147,12 +4109,12 @@ fn string_fn_guard_nested_decline_propagates_to_root() {
     let filter = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
-            equals(col("name"), serde_json::json!({"type": "literal_string", "value": "X"})),
+            equals(col("name"), str_lit("X")),
             {
                 "type": "predicate_not",
                 "expression": equals(
                     string_fn("UPPER", vec![col("c_double_a")]),
-                    serde_json::json!({"type": "literal_string", "value": "X"})
+                    str_lit("X")
                 )
             }
         ]
@@ -4207,7 +4169,7 @@ fn string_fn_guard_leaves_numeric_position_arguments_untouched() {
         "LPAD must coerce the subject and the pad string, never the length"
     );
 
-    let length_literal = serde_json::json!({"type": "literal_exactnumeric", "value": 10});
+    let length_literal = num_lit(10);
     assert_eq!(
         string_function_arg_type_guard(
             &string_fn("LPAD", vec![decimal_column(), length_literal.clone()]),
@@ -4253,7 +4215,7 @@ fn string_fn_guard_coerces_both_instr_and_locate_arguments() {
 #[test]
 fn string_fn_guard_declines_instr_locate_beyond_two_args() {
     let col_types = decimal_rewrite_col_types();
-    let start = serde_json::json!({"type": "literal_exactnumeric", "value": 3});
+    let start = num_lit(3);
 
     assert_eq!(
         string_function_arg_type_guard(
@@ -4342,10 +4304,7 @@ fn column_exa_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
 fn string_fn_guard_leaves_computed_argument_unchanged() {
     let col_types = decimal_rewrite_col_types();
 
-    let literal = string_fn(
-        "UPPER",
-        vec![serde_json::json!({"type": "literal_string", "value": "x"})],
-    );
+    let literal = string_fn("UPPER", vec![str_lit("x")]);
     assert_eq!(
         string_function_arg_type_guard(&literal, &ColumnTypes::unqualified(&col_types)),
         Some(literal.clone()),
@@ -4354,13 +4313,7 @@ fn string_fn_guard_leaves_computed_argument_unchanged() {
 
     let computed = string_fn(
         "UPPER",
-        vec![string_fn(
-            "MULT",
-            vec![
-                decimal_column(),
-                serde_json::json!({"type": "literal_exactnumeric", "value": 2}),
-            ],
-        )],
+        vec![string_fn("MULT", vec![decimal_column(), num_lit(2)])],
     );
     assert_eq!(
         string_function_arg_type_guard(&computed, &ColumnTypes::unqualified(&col_types)),
@@ -4427,7 +4380,7 @@ fn project_columns_widens_on_aggregate_nested_in_scalar_item() {
         "name": "ROUND",
         "arguments": [
             agg_item("SUM", Some("c_decimal_a"), false),
-            {"type": "literal_exactnumeric", "value": 2}
+            num_lit(2)
         ]
     });
     let declared_type = serde_json::json!({"type": "DECIMAL", "precision": 18, "scale": 2});
@@ -4473,11 +4426,11 @@ fn project_columns_widens_on_aggregate_nested_in_function_scalar_case_item() {
         "arguments": [ {
             "type": "predicate_less",
             "left": col("ID"),
-            "right": {"type": "literal_exactnumeric", "value": 10}
+            "right": num_lit(10)
         } ],
         "results": [
             agg_item("COUNT", None, false),
-            {"type": "literal_exactnumeric", "value": 0}
+            num_lit(0)
         ]
     });
     let declared_type = serde_json::json!({"type": "DECIMAL", "precision": 20, "scale": 0});
@@ -4495,7 +4448,7 @@ fn project_columns_widens_on_aggregate_nested_in_arithmetic_node() {
         "name": "ADD",
         "arguments": [
             agg_item("SUM", Some("c_decimal_a"), false),
-            {"type": "literal_exactnumeric", "value": 1}
+            num_lit(1)
         ]
     });
     let declared_type = serde_json::json!({"type": "DECIMAL", "precision": 18, "scale": 2});
@@ -4511,7 +4464,7 @@ fn project_columns_widens_on_aggregate_nested_in_predicate_node() {
     let select_item = serde_json::json!({
         "type": "predicate_less",
         "left": agg_item("SUM", Some("id"), false),
-        "right": {"type": "literal_exactnumeric", "value": 10}
+        "right": num_lit(10)
     });
     let declared_type = serde_json::json!({"type": "boolean"});
     assert_widens_to_full_base_row(
@@ -4530,7 +4483,7 @@ fn project_columns_does_not_widen_when_select_item_has_no_nested_aggregate() {
             "name": "ROUND",
             "arguments": [
                 col("C_DECIMAL_A"),
-                {"type": "literal_exactnumeric", "value": 2}
+                num_lit(2)
             ]
         } ],
         "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 2} ],
@@ -4683,7 +4636,7 @@ fn like_over(subject: Json) -> Json {
     serde_json::json!({
         "type": "predicate_like",
         "expression": subject,
-        "pattern": {"type": "literal_string", "value": "a%"},
+        "pattern": str_lit("a%"),
     })
 }
 

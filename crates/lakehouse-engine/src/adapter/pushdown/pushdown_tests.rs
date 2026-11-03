@@ -151,7 +151,7 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
     let filter_json = serde_json::json!({
         "type": "predicate_like",
         "expression": col("name"),
-        "pattern": {"type": "literal_string", "value": "A%"}
+        "pattern": str_lit("A%")
     });
 
     let df_filter = render_df_filter_safe(&filter_json);
@@ -178,7 +178,7 @@ fn where_filter_decimal_stringification_rewritten_to_trim() {
             "name": "LENGTH",
             "arguments": [col("c_decimal_a")]
         },
-        "right": {"type": "literal_exactnumeric", "value": 5}
+        "right": num_lit(5)
     });
 
     let rendered = Some(&filter_json)
@@ -205,7 +205,7 @@ fn filter_decimal_comparison_not_rewritten() {
     let filter_json = serde_json::json!({
         "type": "predicate_greater",
         "left": col("c_decimal_a"),
-        "right": {"type": "literal_exactnumeric", "value": 5}
+        "right": num_lit(5)
     });
 
     let rendered = Some(&filter_json)
@@ -226,15 +226,14 @@ fn filter_decimal_comparison_not_rewritten() {
 #[test]
 fn where_filter_string_fn_under_comparison_predicate_coerced() {
     let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
-    let filter_json = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {
+    let filter_json = predicate_equal(
+        serde_json::json!({
             "type": "function_scalar",
             "name": "UPPER",
             "arguments": [col("c_decimal_a")]
-        },
-        "right": {"type": "literal_string", "value": "X"}
-    });
+        }),
+        str_lit("X"),
+    );
 
     let rendered = Some(&filter_json)
         .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
@@ -251,15 +250,14 @@ fn where_filter_string_fn_under_comparison_predicate_coerced() {
 #[test]
 fn where_filter_string_fn_over_double_declines() {
     let col_types = vec![("C_DOUBLE_A".to_string(), "DOUBLE PRECISION".to_string())];
-    let filter_json = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {
+    let filter_json = predicate_equal(
+        serde_json::json!({
             "type": "function_scalar",
             "name": "UPPER",
             "arguments": [col("c_double_a")]
-        },
-        "right": {"type": "literal_string", "value": "X"}
-    });
+        }),
+        str_lit("X"),
+    );
 
     let rendered = Some(&filter_json)
         .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
@@ -282,7 +280,7 @@ fn where_filter_upper_decimal_inside_like_subject_coerced() {
             "name": "UPPER",
             "arguments": [col("c_decimal_a")]
         },
-        "pattern": {"type": "literal_string", "value": "1%"}
+        "pattern": str_lit("1%")
     });
 
     let rendered = Some(&filter_json)
@@ -301,25 +299,24 @@ fn where_filter_upper_decimal_inside_like_subject_coerced() {
 #[test]
 fn where_filter_like_decimal_inside_case_declines_whole_filter() {
     let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
-    let filter_json = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {
+    let filter_json = predicate_equal(
+        serde_json::json!({
             "type": "function_scalar_case",
             "name": "CASE",
             "arguments": [
                 {
                     "type": "predicate_like",
                     "expression": col("amount"),
-                    "pattern": {"type": "literal_string", "value": "9%"}
+                    "pattern": str_lit("9%")
                 }
             ],
             "results": [
-                {"type": "literal_exactnumeric", "value": 1},
-                {"type": "literal_exactnumeric", "value": 0}
+                num_lit(1),
+                num_lit(0)
             ]
-        },
-        "right": {"type": "literal_exactnumeric", "value": 1}
-    });
+        }),
+        num_lit(1),
+    );
 
     let rendered = Some(&filter_json)
         .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
@@ -825,7 +822,7 @@ fn declined_like_on_decimal() -> Json {
     serde_json::json!({
         "type": "predicate_like",
         "expression": table_col("EVENTS", "AMOUNT"),
-        "pattern": {"type": "literal_string", "value": "1%"},
+        "pattern": str_lit("1%"),
     })
 }
 
@@ -941,7 +938,7 @@ fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
 /// Scenario: A trivially-true filter is still omitted with no wrapper
 #[test]
 fn trivially_true_filter_omitted_without_wrapper() {
-    let trivially_true = serde_json::json!({"type": "literal_bool", "value": true});
+    let trivially_true = bool_lit(true);
     let (filter, declined) = classify_where_filter(
         Some(&trivially_true),
         &ColumnTypes::unqualified(&guard_col_types()),
@@ -1022,7 +1019,7 @@ fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
             "name": "ROUND",
             "arguments": [
                 agg_item("SUM", Some("AMOUNT"), false),
-                {"type": "literal_exactnumeric", "value": 2},
+                num_lit(2),
             ],
         }],
         "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 2}],
@@ -1069,22 +1066,22 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
             {
                 "type": "predicate_greater",
                 "left": col("id"),
-                "right": {"type": "literal_exactnumeric", "value": 5},
+                "right": num_lit(5),
             },
             {
                 "type": "predicate_greater",
                 "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
                     col("ts"),
-                    {"type": "literal_exactnumeric", "value": 3},
+                    num_lit(3),
                 ]},
-                "right": {"type": "literal_exactnumeric", "value": 1},
+                "right": num_lit(1),
             },
             {
                 "type": "predicate_greater",
                 "left": {"type": "function_scalar", "name": "LENGTH", "arguments": [
                     col("amount"),
                 ]},
-                "right": {"type": "literal_exactnumeric", "value": 5},
+                "right": num_lit(5),
             },
         ],
     });
@@ -1128,7 +1125,7 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
 #[test]
 fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
     let request = guard_events_request(serde_json::json!({
-        "selectList": [{"type": "literal_exactnumeric", "value": 1}],
+        "selectList": [num_lit(1)],
         "selectListDataTypes": [{"type": "decimal", "precision": 1, "scale": 0}],
         "orderBy": [{
             "type": "order_by_element",
@@ -1370,7 +1367,7 @@ fn nonzero_offset_nulls_the_effective_limit() {
 #[test]
 fn declined_order_by_extension_runs_after_topn_detection() {
     let request = guard_events_request(serde_json::json!({
-        "selectList": [{"type": "literal_exactnumeric", "value": 1}],
+        "selectList": [num_lit(1)],
         "selectListDataTypes": [{"type": "decimal", "precision": 1, "scale": 0}],
         "orderBy": [{
             "type": "order_by_element",
@@ -2621,11 +2618,7 @@ fn letter_partitioned_request(letter: &str) -> Json {
                 table_col("PRUNED_TO_EMPTY", "LETTER"),
                 table_col("PRUNED_TO_EMPTY", "NUMBER"),
             ],
-            "filter": {
-                "type": "predicate_equal",
-                "left": table_col("PRUNED_TO_EMPTY", "LETTER"),
-                "right": {"type": "literal_string", "value": letter},
-            },
+            "filter": predicate_equal(table_col("PRUNED_TO_EMPTY", "LETTER"), str_lit(letter)),
         },
     }))
 }

@@ -55,11 +55,10 @@ pub(super) fn join_request(from_extra: Json, condition: Json) -> Json {
 }
 
 pub(super) fn equi_condition() -> Json {
-    serde_json::json!({
-        "type": "predicate_equal",
-        "left": table_col("CUSTOMER", "C_CUSTKEY"),
-        "right": table_col("ORDERS", "O_CUSTKEY"),
-    })
+    predicate_equal(
+        table_col("CUSTOMER", "C_CUSTKEY"),
+        table_col("ORDERS", "O_CUSTKEY"),
+    )
 }
 
 /// `(CUSTOMER ⋈ ORDERS) ⋈ LINEITEM`.
@@ -569,16 +568,8 @@ async fn each_delta_join_leg_prunes_by_its_own_side_local_predicate() {
     request["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
-            {
-                "type": "predicate_equal",
-                "left": table_col("CUSTOMER", "C_REGION"),
-                "right": {"type": "literal_string", "value": "us"},
-            },
-            {
-                "type": "predicate_equal",
-                "left": table_col("ORDERS", "O_STATUS"),
-                "right": {"type": "literal_string", "value": "open"},
-            },
+            predicate_equal(table_col("CUSTOMER", "C_REGION"), str_lit("us")),
+            predicate_equal(table_col("ORDERS", "O_STATUS"), str_lit("open")),
         ],
     });
 

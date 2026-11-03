@@ -1,4 +1,4 @@
-use crate::adapter::pushdown::test_support::col;
+use crate::adapter::pushdown::test_support::{col, predicate_equal, str_lit};
 use delta_kernel::schema::DataType as DeltaType;
 
 use super::super::{ConnectionStorage, ResolvedScan};
@@ -238,11 +238,7 @@ async fn pruning_fixture_storage() -> StorageBackend {
 }
 
 fn letter_equals_a_filter() -> Json {
-    serde_json::json!({
-        "type": "predicate_equal",
-        "left": col("letter"),
-        "right": {"type": "literal_string", "value": "a"},
-    })
+    predicate_equal(col("letter"), str_lit("a"))
 }
 
 /// Scenario: Enabling the kernel's skipping surfaces no statistic to the engine or the wire

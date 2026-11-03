@@ -1,7 +1,8 @@
+use crate::adapter::pushdown::test_support::{compare, lit, str_lit};
 use vs_expression::render_df_filter_safe;
 
 use super::*;
-use crate::adapter::pushdown::test_support::filter_json::{column, compare, string as text};
+use crate::adapter::pushdown::test_support::filter_json::column;
 use crate::adapter::pushdown::test_support::nullable_field as field;
 
 fn columns() -> BinaryColumns {
@@ -26,11 +27,11 @@ fn rendered(filter: &Json) -> String {
 #[test]
 fn a_lowercase_hex_comparison_compares_the_raw_bytes() {
     assert_eq!(
-        rendered(&compare("predicate_equal", column("B"), text("0a1b"))),
+        rendered(&compare("predicate_equal", column("B"), str_lit("0a1b"))),
         "(\"_LH_BYTES_B\" = X'0a1b')"
     );
     assert_eq!(
-        rendered(&compare("predicate_less", text("0a1b"), column("U"))),
+        rendered(&compare("predicate_less", str_lit("0a1b"), column("U"))),
         "(\"_LH_BYTES_U\" > arrow_cast(X'0a1b', 'FixedSizeBinary(2)'))",
         "a literal on the left mirrors the operator, and a fixed column gets a fixed literal"
     );
@@ -43,15 +44,19 @@ fn an_operator_the_empty_value_satisfies_also_requires_a_non_empty_value() {
         "predicate_less",
         "predicate_lessequal",
     ] {
-        let sql = rendered(&compare(op, column("B"), text("0a")));
+        let sql = rendered(&compare(op, column("B"), str_lit("0a")));
         assert!(sql.contains("(\"_LH_BYTES_B\" <> X'')"), "{op}: {sql}");
-        let fixed = rendered(&compare(op, column("U"), text("0a0b")));
+        let fixed = rendered(&compare(op, column("U"), str_lit("0a0b")));
         assert!(
             !fixed.contains("X''"),
             "a fixed value is never empty: {fixed}"
         );
     }
-    let sql = rendered(&compare("predicate_greaterequal", column("B"), text("0a")));
+    let sql = rendered(&compare(
+        "predicate_greaterequal",
+        column("B"),
+        str_lit("0a"),
+    ));
     assert_eq!(sql, "(\"_LH_BYTES_B\" >= X'0a')");
 }
 
@@ -60,14 +65,14 @@ fn in_and_between_compare_the_raw_bytes_when_every_literal_is_hex() {
     let in_list = json!({
         "type": "predicate_in_constlist",
         "expression": column("B"),
-        "arguments": [text("00"), text("ff")],
+        "arguments": [str_lit("00"), str_lit("ff")],
     });
     assert_eq!(rendered(&in_list), "(\"_LH_BYTES_B\" IN (X'00', X'ff'))");
     let between = json!({
         "type": "predicate_between",
         "expression": column("B"),
-        "left": text("00"),
-        "right": text("0f"),
+        "left": str_lit("00"),
+        "right": str_lit("0f"),
     });
     assert_eq!(
         rendered(&between),
@@ -78,19 +83,19 @@ fn in_and_between_compare_the_raw_bytes_when_every_literal_is_hex() {
 #[test]
 fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
     for literal in ["0A1B", "0a1", "", "zz"] {
-        let filter = compare("predicate_equal", column("B"), text(literal));
+        let filter = compare("predicate_equal", column("B"), str_lit(literal));
         assert_eq!(
             compare_binary_bytes(filter.clone(), &columns()),
             filter,
             "{literal}"
         );
     }
-    let wrong_width = compare("predicate_equal", column("U"), text("0a"));
+    let wrong_width = compare("predicate_equal", column("U"), str_lit("0a"));
     assert_eq!(
         compare_binary_bytes(wrong_width.clone(), &columns()),
         wrong_width
     );
-    let string_column = compare("predicate_equal", column("S"), text("0a"));
+    let string_column = compare("predicate_equal", column("S"), str_lit("0a"));
     assert_eq!(
         compare_binary_bytes(string_column.clone(), &columns()),
         string_column
@@ -99,7 +104,7 @@ fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
 
 #[test]
 fn only_a_comparison_reached_through_and_or_is_rewritten() {
-    let equal = compare("predicate_equal", column("B"), text("0a"));
+    let equal = compare("predicate_equal", column("B"), str_lit("0a"));
     let negated = json!({"type": "predicate_not", "expression": equal});
     assert_eq!(
         compare_binary_bytes(negated.clone(), &columns()),
@@ -110,7 +115,7 @@ fn only_a_comparison_reached_through_and_or_is_rewritten() {
         "type": "predicate_or",
         "expressions": [
             {"type": "predicate_and", "expressions": [equal.clone(), negated.clone()]},
-            compare("predicate_equal", column("S"), text("x")),
+            compare("predicate_equal", column("S"), str_lit("x")),
         ],
     });
     assert_eq!(
@@ -123,8 +128,8 @@ fn only_a_comparison_reached_through_and_or_is_rewritten() {
 #[test]
 fn binary_as_string_keeps_a_variable_length_filter_on_the_text() {
     let filter = json!({"type": "predicate_and", "expressions": [
-        compare("predicate_equal", column("B"), text("00ff")),
-        compare("predicate_equal", column("U"), text("00ff")),
+        compare("predicate_equal", column("B"), str_lit("00ff")),
+        compare("predicate_equal", column("U"), str_lit("00ff")),
     ]});
 
     let rewritten = compare_binary_bytes(filter.clone(), &columns_under(true));
@@ -140,7 +145,7 @@ fn binary_as_string_keeps_a_variable_length_filter_on_the_text() {
 }
 
 fn equal(column_name: &str, hex: &str) -> Json {
-    compare("predicate_equal", column(column_name), text(hex))
+    compare("predicate_equal", column(column_name), str_lit(hex))
 }
 
 /// Scenario: A hex-literal filter on a binary column prunes files at plan time
@@ -152,9 +157,9 @@ fn pruning_retypes_the_hex_literals_of_a_binary_column_at_any_depth() {
             equal("B", "0a1b"),
             equal("U", "0a0b"),
             {"type": "predicate_between", "expression": column("B"),
-             "left": text("00"), "right": text("ff")},
+             "left": str_lit("00"), "right": str_lit("ff")},
             {"type": "predicate_in_constlist", "expression": column("B"),
-             "arguments": [text("0a"), text("0A")]},
+             "arguments": [str_lit("0a"), str_lit("0A")]},
         ]},
     });
     assert_eq!(
@@ -162,14 +167,14 @@ fn pruning_retypes_the_hex_literals_of_a_binary_column_at_any_depth() {
         json!({
             "type": "predicate_not",
             "expression": {"type": "predicate_or", "expressions": [
-                compare("predicate_equal", column("B"), json!({"type": "literal_binary", "value": "0a1b"})),
+                compare("predicate_equal", column("B"), lit("literal_binary", "0a1b")),
                 compare("predicate_equal", column("U"),
                     json!({"type": "literal_binary", "value": "0a0b", "width": 2})),
                 {"type": "predicate_between", "expression": column("B"),
-                 "left": {"type": "literal_binary", "value": "00"},
-                 "right": {"type": "literal_binary", "value": "ff"}},
+                 "left": lit("literal_binary", "00"),
+                 "right": lit("literal_binary", "ff")},
                 {"type": "predicate_in_constlist", "expression": column("B"),
-                 "arguments": [{"type": "literal_binary", "value": "0a"}, text("0A")]},
+                 "arguments": [lit("literal_binary", "0a"), str_lit("0A")]},
             ]},
         }),
         "the column keeps its name, and an uppercase literal stays text"
@@ -203,10 +208,10 @@ fn pruning_leaves_text_columns_and_mismatched_literals_alone() {
 #[test]
 fn a_binary_literal_carries_its_bytes() {
     assert_eq!(
-        literal_binary_bytes(&json!({"type": "literal_binary", "value": "00abff"})),
+        literal_binary_bytes(&lit("literal_binary", "00abff")),
         Some(vec![0x00, 0xab, 0xff])
     );
-    assert_eq!(literal_binary_bytes(&text("00abff")), None);
+    assert_eq!(literal_binary_bytes(&str_lit("00abff")), None);
 }
 
 #[test]
@@ -222,7 +227,7 @@ fn per_relation_detection_resolves_a_shared_column_name_by_its_own_relation() {
         compare(
             "predicate_equal",
             json!({"type": "column", "name": "X", "tableAlias": alias}),
-            text("0a1b"),
+            str_lit("0a1b"),
         )
     };
     assert_eq!(

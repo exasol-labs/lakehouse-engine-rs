@@ -160,10 +160,10 @@ fn broadcast_declines_on_unrenderable_filter_stays_eligible_when_absent() {
             "name": "SECOND",
             "arguments": [
                 table_col("ORDERS", "O_ORDERDATE"),
-                {"type": "literal_exactnumeric", "value": 3}
+                num_lit(3)
             ]
         },
-        "right": {"type": "literal_exactnumeric", "value": 1}
+        "right": num_lit(1)
     });
     let detected = detected_join(&request);
 
@@ -201,7 +201,7 @@ fn broadcast_declines_like_over_decimal_side_column() {
     request["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_like",
         "expression": table_col("CUSTOMER", "C_CUSTKEY"),
-        "pattern": {"type": "literal_string", "value": "1%"}
+        "pattern": str_lit("1%")
     });
     let detected = detected_join(&request);
 
@@ -226,7 +226,7 @@ fn broadcast_keeps_plan_and_casts_like_over_date_side_column() {
     request["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_like",
         "expression": table_col("ORDERS", "O_ORDERDATE"),
-        "pattern": {"type": "literal_string", "value": "1995%"}
+        "pattern": str_lit("1995%")
     });
     let detected = detected_join(&request);
 
@@ -258,11 +258,11 @@ fn broadcast_declines_instr_with_start_position_argument() {
             "name": "INSTR",
             "arguments": [
                 table_col("CUSTOMER", "C_NAME"),
-                {"type": "literal_string", "value": "b"},
-                {"type": "literal_exactnumeric", "value": 3}
+                str_lit("b"),
+                num_lit(3)
             ]
         },
-        "right": {"type": "literal_exactnumeric", "value": 0}
+        "right": num_lit(0)
     });
     let detected = detected_join(&request);
 
@@ -300,8 +300,7 @@ fn broadcast_absent_and_trivially_true_filter_stay_eligible() {
     );
 
     let mut trivial_request = join_request(Json::Null, equi_condition());
-    trivial_request["pushdownRequest"]["filter"] =
-        serde_json::json!({"type": "literal_bool", "value": true});
+    trivial_request["pushdownRequest"]["filter"] = bool_lit(true);
     let trivial_detected = detected_join(&trivial_request);
     let trivial = render_broadcast_join(
         &trivial_request,
@@ -324,7 +323,7 @@ fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
     request["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_greater",
         "left": table_col("ORDERS", "O_ORDERDATE"),
-        "right": {"type": "literal_string", "value": "1995-01-01"}
+        "right": str_lit("1995-01-01")
     });
     let detected = detected_join(&request);
     let sides = vec![
@@ -374,8 +373,7 @@ fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
 #[test]
 fn trivially_true_residual_emits_no_outer_where_and_does_not_error() {
     let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["filter"] =
-        serde_json::json!({"type": "literal_bool", "value": true});
+    request["pushdownRequest"]["filter"] = bool_lit(true);
     let detected = detected_join(&request);
     let sides = vec![
         resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
@@ -812,7 +810,7 @@ fn n_scan_wrapper_qualifies_every_clause_by_leg() {
     request["pushdownRequest"]["groupBy"] = serde_json::json!([custkey("A")]);
     request["pushdownRequest"]["having"] = serde_json::json!({
         "type": "predicate_greater", "left": sum_of("B"),
-        "right": {"type": "literal_exactnumeric", "value": 10},
+        "right": num_lit(10),
     });
     request["pushdownRequest"]["orderBy"] = serde_json::json!([
         {"expression": custkey("A"), "isAscending": true, "nullsLast": false},
@@ -861,9 +859,8 @@ fn conditions_attach_by_leg_set_and_leg_local_filters_partition_exactly() {
         "type": "predicate_and",
         "expressions": [
             {"type": "predicate_greater", "left": custkey("A"),
-             "right": {"type": "literal_exactnumeric", "value": 100}},
-            {"type": "predicate_equal", "left": custkey("B"),
-             "right": {"type": "literal_exactnumeric", "value": 7}},
+             "right": num_lit(100)},
+            predicate_equal(custkey("B"), num_lit(7)),
         ],
     });
     let sides = vec![
@@ -995,14 +992,8 @@ fn three_table_join_inner_join_on_chain() {
 
 #[test]
 fn join_conditions_greedy_attach_and_side_local_pushdown() {
-    let cond_n2_fact = serde_json::json!({
-        "type": "predicate_equal",
-        "left": table_col("N2", "N2_KEY"),
-        "right": table_col("FACT", "F_N2KEY")});
-    let cond_n1_fact = serde_json::json!({
-        "type": "predicate_equal",
-        "left": table_col("N1", "N1_KEY"),
-        "right": table_col("FACT", "F_N1KEY")});
+    let cond_n2_fact = predicate_equal(table_col("N2", "N2_KEY"), table_col("FACT", "F_N2KEY"));
+    let cond_n1_fact = predicate_equal(table_col("N1", "N1_KEY"), table_col("FACT", "F_N1KEY"));
     let request = with_identifier_notes(
         serde_json::json!({
             "involvedTables": [
@@ -1027,9 +1018,7 @@ fn join_conditions_greedy_attach_and_side_local_pushdown() {
                     table_col("N1", "N1_NAME"),
                     table_col("FACT", "F_VALUE")],
                 "filter": {"type": "predicate_and", "expressions": [
-                    {"type": "predicate_equal",
-                     "left": table_col("N1", "N1_NAME"),
-                     "right": {"type": "literal_string", "value": "ACME"}},
+                    predicate_equal(table_col("N1", "N1_NAME"), str_lit("ACME")),
                     {"type": "predicate_greater",
                      "left": table_col("FACT", "F_VALUE"),
                      "right": table_col("N1", "N1_KEY")}]},
@@ -1114,7 +1103,7 @@ fn like_over(column: &str, table: &str, pattern: &str) -> Json {
     serde_json::json!({
         "type": "predicate_like",
         "expression": table_col(table, column),
-        "pattern": {"type": "literal_string", "value": pattern}
+        "pattern": str_lit(pattern)
     })
 }
 
@@ -1190,16 +1179,14 @@ fn n_scan_leg_residual_partition_is_total_and_disjoint_with_type_screen() {
     let request = n_scan_request_with_filter(serde_json::json!({
         "type": "predicate_and",
         "expressions": [
-            {"type": "predicate_equal",
-             "left": table_col("CUSTOMER", "C_NAME"),
-             "right": {"type": "literal_string", "value": "ACME"}},
+            predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
             like_over("O_ORDERDATE", "ORDERS", "1995%"),
             like_over("C_CUSTKEY", "CUSTOMER", "1%"),
             {"type": "predicate_greater",
              "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
                  table_col("ORDERS", "O_ORDERDATE"),
-                 {"type": "literal_exactnumeric", "value": 3}]},
-             "right": {"type": "literal_exactnumeric", "value": 1}},
+                 num_lit(3)]},
+             "right": num_lit(1)},
             {"type": "predicate_greater",
              "left": table_col("CUSTOMER", "C_CUSTKEY"),
              "right": table_col("ORDERS", "O_CUSTKEY")},
@@ -1295,7 +1282,7 @@ fn join_decimal_stringification_renders_trimmed_at_both_join_sites() {
             "name": "LENGTH",
             "arguments": [table_col("ORDERS", "O_TOTALPRICE")]
         },
-        "right": {"type": "literal_exactnumeric", "value": 3}
+        "right": num_lit(3)
     });
     request["pushdownRequest"]["filter"] = filter;
     let detected = detected_join(&request);
@@ -1335,11 +1322,11 @@ fn join_instr_beyond_two_args_declines_at_both_join_sites() {
             "name": "INSTR",
             "arguments": [
                 table_col("CUSTOMER", "C_NAME"),
-                {"type": "literal_string", "value": "b"},
-                {"type": "literal_exactnumeric", "value": 3}
+                str_lit("b"),
+                num_lit(3)
             ]
         },
-        "right": {"type": "literal_exactnumeric", "value": 0}
+        "right": num_lit(0)
     });
     let request = n_scan_request_with_filter(filter);
 
@@ -1427,11 +1414,9 @@ fn render_expression_qualified_renders_scalar_over_aggregate() {
         "type": "function_aggregate", "name": "SUM", "distinct": false,
         "arguments": [{
             "type": "function_scalar", "name": "CASE", "arguments": [
-                {"type": "predicate_equal",
-                 "left": table_col("LINEITEM", "L_RETURNFLAG"),
-                 "right": {"type": "literal_string", "value": "R"}},
-                {"type": "literal_exactnumeric", "value": 1},
-                {"type": "literal_exactnumeric", "value": 0}]}]
+                predicate_equal(table_col("LINEITEM", "L_RETURNFLAG"), str_lit("R")),
+                num_lit(1),
+                num_lit(0)]}]
     });
     let count_star = serde_json::json!({
         "type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false
@@ -1440,10 +1425,10 @@ fn render_expression_qualified_renders_scalar_over_aggregate() {
         "type": "function_scalar", "name": "ROUND", "arguments": [
             {"type": "function_scalar", "name": "FLOAT_DIV", "arguments": [
                 {"type": "function_scalar", "name": "MULT", "arguments": [
-                    {"type": "literal_double", "value": 100.0},
+                    lit("literal_double", 100.0),
                     sum_case]},
                 count_star]},
-            {"type": "literal_exactnumeric", "value": 2}]
+            num_lit(2)]
     });
 
     let sql = render_expression_qualified(&item, &legs)
@@ -1538,8 +1523,7 @@ fn n_scan_join_select_list_renders_exasol_char_target() {
          "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}},
         table_col("ORDERS", "O_ORDERDATE"),
     ]);
-    request["pushdownRequest"]["having"] =
-        serde_json::json!({"type": "literal_bool", "value": true});
+    request["pushdownRequest"]["having"] = bool_lit(true);
 
     assert!(matches!(
         classify_join_window(&pd(&request)),
@@ -1711,8 +1695,7 @@ fn join_window_classification_covers_every_forcing_and_served_shape() {
     ));
 
     let mut having = join_request(Json::Null, equi_condition());
-    having["pushdownRequest"]["having"] =
-        serde_json::json!({"type": "literal_bool", "value": true});
+    having["pushdownRequest"]["having"] = bool_lit(true);
     assert!(matches!(
         classify_join_window(&pd(&having)),
         JoinWindowPlan::ExasolPostProcessed
@@ -2181,12 +2164,10 @@ fn golden_n_scan_join_sql_unchanged() {
     request["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
-            {"type": "predicate_equal",
-             "left": table_col("CUSTOMER", "C_NAME"),
-             "right": {"type": "literal_string", "value": "ACME"}},
+            predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
             {"type": "predicate_greater",
              "left": table_col("ORDERS", "O_ORDERDATE"),
-             "right": {"type": "literal_string", "value": "1995-01-01"}},
+             "right": str_lit("1995-01-01")},
             {"type": "predicate_greater",
              "left": table_col("CUSTOMER", "C_CUSTKEY"),
              "right": table_col("ORDERS", "O_CUSTKEY")},
@@ -2400,21 +2381,17 @@ fn fallback_projection_narrows_to_referenced_columns() {
             table_col("T", "GK"),
             {"type": "function_aggregate", "name": "SUM", "distinct": false, "arguments": [
                 {"type": "function_scalar", "name": "CASE", "arguments": [
-                    {"type": "predicate_equal",
-                     "left": table_col("T", "REGION"),
-                     "right": {"type": "literal_string", "value": "R"}},
-                    {"type": "literal_exactnumeric", "value": 1},
-                    {"type": "literal_exactnumeric", "value": 0}]}]}
+                    predicate_equal(table_col("T", "REGION"), str_lit("R")),
+                    num_lit(1),
+                    num_lit(0)]}]}
         ],
         "having": {"type": "predicate_greater",
             "left": {"type": "function_aggregate", "name": "SUM", "distinct": false,
                      "arguments": [table_col("T", "HCOL")]},
-            "right": {"type": "literal_exactnumeric", "value": 10}},
+            "right": num_lit(10)},
         "orderBy": [{"expression": table_col("T", "OCOL"),
                      "isAscending": true, "nullsLast": false}],
-        "filter": {"type": "predicate_equal",
-            "left": table_col("T", "FCOL"),
-            "right": {"type": "literal_exactnumeric", "value": 5}},
+        "filter": predicate_equal(table_col("T", "FCOL"), num_lit(5)),
     });
     let (proj, types) = referenced_column_projection(&rich_req, &all_cols);
     let names = proj_names(&proj);
@@ -2454,11 +2431,9 @@ fn fallback_projection_narrows_to_referenced_columns() {
             table_col("T", "GK"),
             {"type": "function_aggregate", "name": "SUM", "distinct": false, "arguments": [
                 {"type": "function_scalar", "name": "CASE", "arguments": [
-                    {"type": "predicate_equal",
-                     "left": table_col("T", "REGION"),
-                     "right": {"type": "literal_string", "value": "R"}},
-                    {"type": "literal_exactnumeric", "value": 1},
-                    {"type": "literal_exactnumeric", "value": 0}]}]}
+                    predicate_equal(table_col("T", "REGION"), str_lit("R")),
+                    num_lit(1),
+                    num_lit(0)]}]}
         ],
     });
     let (gproj, gtypes) = referenced_column_projection(&grouped_req, &grouped_all);
@@ -2544,11 +2519,7 @@ fn no_select_list_wire_forms_all_keep_the_full_base_row() {
         ("FCOL".to_string(), "DECIMAL(18,0)".to_string()),
         ("IRRELEVANT_COL".to_string(), "VARCHAR(10)".to_string()),
     ];
-    let filter = serde_json::json!({
-        "type": "predicate_equal",
-        "left": table_col("T", "FCOL"),
-        "right": {"type": "literal_exactnumeric", "value": 5},
-    });
+    let filter = predicate_equal(table_col("T", "FCOL"), num_lit(5));
     let full_row: Vec<ProjectionItem> = all_cols
         .iter()
         .map(|(name, _)| ProjectionItem::from(name.clone()))
@@ -2584,11 +2555,7 @@ fn referenced_column_projection_narrows_with_a_real_select_list() {
     ];
     let req = serde_json::json!({
         "selectList": [table_col("T", "GK")],
-        "filter": {
-            "type": "predicate_equal",
-            "left": table_col("T", "FCOL"),
-            "right": {"type": "literal_exactnumeric", "value": 5},
-        },
+        "filter": predicate_equal(table_col("T", "FCOL"), num_lit(5)),
     });
 
     let (proj, types) = referenced_column_projection(&req, &all_cols);
@@ -2610,7 +2577,7 @@ fn referenced_column_projection_falls_back_to_first_column() {
         ("B".to_string(), "VARCHAR(10)".to_string()),
     ];
     let req = serde_json::json!({
-        "selectList": [{"type": "literal_exactnumeric", "value": 1}],
+        "selectList": [num_lit(1)],
         "filter": null,
         "having": null,
     });
@@ -2715,7 +2682,7 @@ fn qualified_single_table_wrapper_projects_tstz_literal_converted_to_session_zon
     });
     let pushdown_req = serde_json::json!({
         "selectList": [
-            {"type": "literal_timestamputc", "value": "2024-03-01 09:00:00"},
+            lit("literal_timestamputc", "2024-03-01 09:00:00"),
         ],
         "selectListDataTypes": [
             {"type": "timestamp", "withLocalTimeZone": true},
@@ -2813,9 +2780,9 @@ fn second_arity_predicate() -> Json {
         "type": "predicate_greater",
         "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
             table_col("T", "C_TS"),
-            {"type": "literal_exactnumeric", "value": 3},
+            num_lit(3),
         ]},
-        "right": {"type": "literal_exactnumeric", "value": 1},
+        "right": num_lit(1),
     })
 }
 
@@ -2874,7 +2841,7 @@ fn declined_filter_self_apply_renders_tstz_literal_via_convert_tz() {
     let declined = serde_json::json!({
         "type": "predicate_greater",
         "left": table_col("T", "C_TS"),
-        "right": {"type": "literal_timestamputc", "value": "2024-03-01 09:00:00"},
+        "right": lit("literal_timestamputc", "2024-03-01 09:00:00"),
     });
     assert!(
         render_expression_exasol_safe(&declined).is_some(),
@@ -2899,7 +2866,7 @@ fn declined_filter_self_apply_renders_tstz_literal_via_convert_tz() {
 
 #[test]
 fn single_table_wrapper_trivially_true_declined_predicate_emits_no_where() {
-    let trivially_true = serde_json::json!({"type": "literal_bool", "value": true});
+    let trivially_true = bool_lit(true);
     let pushdown_req = serde_json::json!({
         "selectList": [table_col("T", "ID")],
     });
@@ -3009,7 +2976,7 @@ fn offset_carrying_seam_fixtures() -> Vec<(&'static str, Json, JoinLegs, &'stati
     let id = table_col("EVENTS", "ID");
     let mod_key = serde_json::json!({
         "type": "function_scalar", "name": "MOD",
-        "arguments": [id.clone(), {"type": "literal_exactnumeric", "value": 4}]
+        "arguments": [id.clone(), num_lit(4)]
     });
     let ascending = |expr: &Json| {
         serde_json::json!({
@@ -3251,7 +3218,7 @@ fn shared_column_name_with_different_types_declares_each_legs_type() {
     let like = |column: Json, pattern: &str| {
         shared_names_request(serde_json::json!({
             "filter": {"type": "predicate_like", "expression": column,
-                       "pattern": {"type": "literal_string", "value": pattern}},
+                       "pattern": str_lit(pattern)},
         }))
     };
     let varchar_leg = shared_names_broadcast_sql(
@@ -3285,8 +3252,7 @@ fn binary_detection_resolves_a_shared_column_name_per_leg() {
 
     let filter_on = |column: Json| {
         let request = shared_names_request(serde_json::json!({
-            "filter": {"type": "predicate_equal", "left": column,
-                       "right": {"type": "literal_string", "value": "0a1b"}},
+            "filter": predicate_equal(column, str_lit("0a1b")),
         }));
         shared_names_broadcast_sql(&request, &binary_columns).expect("renders")
     };
@@ -3356,11 +3322,8 @@ fn column_without_a_single_leg_fails_broadcast_with_the_fallback_error() {
     let mut no_table_name = join_request(Json::Null, equi_condition());
     no_table_name["pushdownRequest"]["selectList"] = serde_json::json!([col("C_NAME")]);
     let mut undeclared_table = join_request(Json::Null, equi_condition());
-    undeclared_table["pushdownRequest"]["filter"] = serde_json::json!({
-        "type": "predicate_equal",
-        "left": table_col("NOPE", "C_NAME"),
-        "right": {"type": "literal_string", "value": "ACME"},
-    });
+    undeclared_table["pushdownRequest"]["filter"] =
+        predicate_equal(table_col("NOPE", "C_NAME"), str_lit("ACME"));
     for (label, request) in [
         ("no tableName", no_table_name),
         ("an undeclared tableName", undeclared_table),

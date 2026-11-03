@@ -325,7 +325,7 @@ fn mod_item(column: &str, divisor: i64) -> serde_json::Value {
         "name": "MOD",
         "arguments": [
             col(column),
-            {"type": "literal_exactnumeric", "value": divisor},
+            num_lit(divisor),
         ],
     })
 }
@@ -478,11 +478,7 @@ fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
 #[test]
 fn detect_group_by_aggregates_expression_key() {
     let req = make_group_by_request(
-        serde_json::json!([{
-            "type": "predicate_equal",
-            "left": col("STATUS"),
-            "right": {"type": "literal_string", "value": "active"},
-        }]),
+        serde_json::json!([predicate_equal(col("STATUS"), str_lit("active"))]),
         serde_json::json!([agg_item("SUM", Some("AMOUNT"), false),]),
     );
     let result = detect_group_by_aggregates(&req);
@@ -532,7 +528,7 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
         "groupBy": [
             { "columnNr": 0, "name": "ID", "tableName": "EVENTS", "type": "column" }
         ],
-        "selectList": [ { "type": "literal_null" } ],
+        "selectList": [ null_lit() ],
         "selectListDataTypes": [ { "type": "BOOLEAN" } ],
         "type": "select"
     });
@@ -603,11 +599,7 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
 fn literal_bool_selectlist_item_classifies_as_constant_not_group_key() {
     let req = make_group_by_request_with_types(
         serde_json::json!([col("ID")]),
-        serde_json::json!([
-            col("ID"),
-            {"type": "literal_bool", "value": true},
-            agg_item("COUNT", None, false),
-        ]),
+        serde_json::json!([col("ID"), bool_lit(true), agg_item("COUNT", None, false),]),
         serde_json::json!([
             decimal_type(20, 0),
             serde_json::json!({"type": "boolean"}),
@@ -724,7 +716,7 @@ fn detect_group_by_aggregates_aggregate_first_with_having_preserves_order() {
         "having": {
             "type": "predicate_greater",
             "left": agg_item("SUM", Some("SCORE"), false),
-            "right": {"type": "literal_exactnumeric", "value": 100},
+            "right": num_lit(100),
         },
     });
     let result = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
@@ -1498,13 +1490,11 @@ fn case_flag_eq(column: &str, val: &str) -> serde_json::Value {
         "type": "function_scalar_case",
         "name": "CASE",
         "arguments": [
-            {"type": "predicate_equal",
-             "left": col(column),
-             "right": {"type": "literal_string", "value": val}}
+            predicate_equal(col(column), str_lit(val))
         ],
         "results": [
-            {"type": "literal_exactnumeric", "value": 1},
-            {"type": "literal_exactnumeric", "value": 0}
+            num_lit(1),
+            num_lit(0)
         ]
     })
 }
@@ -1516,12 +1506,12 @@ fn round_pct_over_aggregates() -> serde_json::Value {
         "arguments": [
             {"type": "function_scalar", "name": "FLOAT_DIV", "arguments": [
                 {"type": "function_scalar", "name": "MULT", "arguments": [
-                    {"type": "literal_double", "value": 100.0},
+                    lit("literal_double", 100.0),
                     agg_item_expr("SUM", case_flag_eq("L_RETURNFLAG", "R"), false)
                 ]},
                 agg_item("COUNT", None, false)
             ]},
-            {"type": "literal_exactnumeric", "value": 2}
+            num_lit(2)
         ]
     })
 }
@@ -1731,7 +1721,7 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
                     agg_item_expr("SUM", table_col("LINEITEM", "X"), false),
                     agg_item_expr("COUNT", table_col("LINEITEM", "Y"), true)
                 ]},
-                {"type": "literal_exactnumeric", "value": 2}
+                num_lit(2)
             ]}
         ],
         "selectListDataTypes": [
@@ -1802,7 +1792,7 @@ fn render_having_over_merge_rewrites_aggregate_to_partial() {
     let having = serde_json::json!({
         "type": "predicate_greater",
         "left": agg_item("SUM", Some("SCORE"), false),
-        "right": {"type": "literal_exactnumeric", "value": 250},
+        "right": num_lit(250),
     });
     let plans = vec![AggregatePlan {
         kind: AggKind::Sum,
@@ -1839,7 +1829,7 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
     let having_node = serde_json::json!({
         "type": "predicate_greater",
         "left": agg_item("SUM", Some("SCORE"), false),
-        "right": {"type": "literal_exactnumeric", "value": 250},
+        "right": num_lit(250),
     });
     let having = render_having_over_merge(&having_node, &detection.plans)
         .expect("HAVING must render over the merge decomposition");
@@ -1887,7 +1877,7 @@ fn render_having_over_merge_declines_unknown_aggregate() {
     let having = serde_json::json!({
         "type": "predicate_greater",
         "left": agg_item("COUNT", None, false),
-        "right": {"type": "literal_exactnumeric", "value": 10},
+        "right": num_lit(10),
     });
     let plans = vec![AggregatePlan {
         kind: AggKind::Sum,
@@ -1978,7 +1968,7 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
     let having_node = serde_json::json!({
         "type": "predicate_greater",
         "left": agg_item("SUM", Some("SCORE"), false),
-        "right": {"type": "literal_exactnumeric", "value": 100},
+        "right": num_lit(100),
     });
     let having = render_having_over_merge(&having_node, &detection.plans)
         .expect("HAVING must render over the merge decomposition");
@@ -2119,11 +2109,11 @@ fn group_key_exasol_types_resolves_char_case_key() {
         "arguments": [
             {"type": "predicate_less",
              "left": col("C_DECIMAL_A"),
-             "right": {"type": "literal_exactnumeric", "value": 0}}
+             "right": num_lit(0)}
         ],
         "results": [
-            {"type": "literal_string", "value": "NEG"},
-            {"type": "literal_string", "value": "POS"}
+            str_lit("NEG"),
+            str_lit("POS")
         ]
     });
     let req = make_group_by_request_with_types(
@@ -2239,10 +2229,7 @@ fn group_key_exasol_types_prefers_select_list_type_over_group_by_type() {
 fn constant_projection_casts_literal_to_char() {
     let req = make_group_by_request_with_types(
         serde_json::json!([col("REGION")]),
-        serde_json::json!([
-            {"type": "literal_string", "value": "X"},
-            agg_item("COUNT", None, false),
-        ]),
+        serde_json::json!([str_lit("X"), agg_item("COUNT", None, false),]),
         serde_json::json!([
             {"type": "CHAR", "size": 1, "characterSet": "ASCII"},
             decimal_type(18, 0),
@@ -2851,7 +2838,7 @@ fn having_over_stat_aggregate_with_expression_argument_declines() {
     let having = serde_json::json!({
         "type": "predicate_greater",
         "left": agg_item_expr("STDDEV", mod_item("SCORE", 4), false),
-        "right": {"type": "literal_double", "value": 5.0},
+        "right": lit("literal_double", 5.0),
     });
     let plans = vec![AggregatePlan {
         kind: AggKind::StddevSamp,

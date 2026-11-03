@@ -77,7 +77,7 @@ fn grouped_having_unmatched_aggregate_falls_through_to_wrapper() {
         "having": {
             "type": "predicate_greater",
             "left": agg_item("SUM", Some("AMOUNT"), false),
-            "right": {"type": "literal_exactnumeric", "value": 10},
+            "right": num_lit(10),
         },
     });
     let shape = classify_request_shape(&req, &col_types());
@@ -102,12 +102,12 @@ fn grouped_having_mixed_junction_falls_through_to_wrapper() {
                 {
                     "type": "predicate_greater",
                     "left": agg_item("COUNT", None, false),
-                    "right": {"type": "literal_exactnumeric", "value": 0},
+                    "right": num_lit(0),
                 },
                 {
                     "type": "predicate_greater",
                     "left": agg_item("SUM", Some("AMOUNT"), false),
-                    "right": {"type": "literal_exactnumeric", "value": 10},
+                    "right": num_lit(10),
                 },
             ],
         },
@@ -131,7 +131,7 @@ fn grouped_having_fully_matched_stays_grouped() {
         "having": {
             "type": "predicate_greater",
             "left": agg_item("SUM", Some("AMOUNT"), false),
-            "right": {"type": "literal_exactnumeric", "value": 10},
+            "right": num_lit(10),
         },
     });
     let shape = classify_request_shape(&req, &col_types());
@@ -164,7 +164,7 @@ fn grouped_having_distinct_aggregate_falls_through_to_wrapper() {
         "having": {
             "type": "predicate_greater",
             "left": agg_item("COUNT", Some("ID"), true),
-            "right": {"type": "literal_exactnumeric", "value": 1},
+            "right": num_lit(1),
         },
     });
     let shape = classify_request_shape(&req, &col_types());
@@ -313,7 +313,7 @@ fn count_greater_than(n: i64) -> Json {
     serde_json::json!({
         "type": "predicate_greater",
         "left": agg_item("COUNT", None, false),
-        "right": {"type": "literal_exactnumeric", "value": n},
+        "right": num_lit(n),
     })
 }
 
@@ -334,7 +334,7 @@ fn single_group_having_over_a_split_aggregate_renders_over_the_merge() {
 
 #[test]
 fn single_group_that_does_not_split_never_classifies_as_row_scan() {
-    let literal = serde_json::json!({"type": "literal_string", "value": "X"});
+    let literal = str_lit("X");
     for req in [
         single_group(
             serde_json::json!([agg_item("SUM", Some("NAME"), false)]),
@@ -350,16 +350,12 @@ fn single_group_that_does_not_split_never_classifies_as_row_scan() {
             Some(serde_json::json!({
                 "type": "predicate_greater",
                 "left": agg_item("MAX", Some("AMOUNT"), false),
-                "right": {"type": "literal_exactnumeric", "value": 0},
+                "right": num_lit(0),
             })),
         ),
         single_group(
             serde_json::json!([agg_item("COUNT", Some("ID"), true)]),
-            Some(serde_json::json!({
-                "type": "predicate_equal",
-                "left": {"type": "literal_exactnumeric", "value": 1},
-                "right": {"type": "literal_exactnumeric", "value": 1},
-            })),
+            Some(predicate_equal(num_lit(1), num_lit(1))),
         ),
     ] {
         let shape = classify_request_shape(&req, &col_types());

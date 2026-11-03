@@ -1,6 +1,7 @@
 use super::*;
-use crate::adapter::pushdown::test_support::by_name;
-use crate::adapter::pushdown::test_support::col;
+use crate::adapter::pushdown::test_support::{
+    by_name, col, lit, num_lit, predicate_equal, str_lit,
+};
 use delta_kernel::schema::{PrimitiveType, StructField, StructType};
 use serde_json::json;
 
@@ -15,10 +16,6 @@ fn test_schema() -> StructType {
 /// `node` translated against [`test_schema`].
 fn translate(node: &Json) -> Option<Predicate> {
     to_delta_predicate(node, &by_name(&test_schema()))
-}
-
-fn int_lit(v: i64) -> Json {
-    json!({"type": "literal_exactnumeric", "value": v})
 }
 
 #[test]
@@ -55,8 +52,8 @@ fn every_comparison_translates_and_flips_to_its_mirror_with_the_column_on_the_ri
     ];
 
     for (kind, column_left, column_right) in cases {
-        let left = json!({"type": kind, "left": col("ID"), "right": int_lit(5)});
-        let right = json!({"type": kind, "left": int_lit(5), "right": col("ID")});
+        let left = json!({"type": kind, "left": col("ID"), "right": num_lit(5)});
+        let right = json!({"type": kind, "left": num_lit(5), "right": col("ID")});
 
         assert_eq!(
             translate(&left),
@@ -73,7 +70,7 @@ fn every_comparison_translates_and_flips_to_its_mirror_with_the_column_on_the_ri
 
 #[test]
 fn notequal_returns_none() {
-    let node = json!({"type": "predicate_notequal", "left": col("ID"), "right": int_lit(5)});
+    let node = json!({"type": "predicate_notequal", "left": col("ID"), "right": num_lit(5)});
 
     assert_eq!(translate(&node), None);
 }
@@ -98,7 +95,7 @@ fn is_not_null_on_a_column_translates() {
 
 #[test]
 fn not_negates_its_translatable_child() {
-    let child = json!({"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)});
+    let child = predicate_equal(col("ID"), num_lit(5));
     let node = json!({"type": "predicate_not", "expression": child});
     let pred = translate(&node).expect("NOT over a translatable child must translate");
 
@@ -111,7 +108,7 @@ fn not_negates_its_translatable_child() {
 
 #[test]
 fn not_of_an_untranslatable_child_returns_none() {
-    let child = json!({"type": "predicate_notequal", "left": col("ID"), "right": int_lit(5)});
+    let child = json!({"type": "predicate_notequal", "left": col("ID"), "right": num_lit(5)});
     let node = json!({"type": "predicate_not", "expression": child});
 
     assert_eq!(translate(&node), None);
@@ -120,8 +117,8 @@ fn not_of_an_untranslatable_child_returns_none() {
 #[test]
 fn not_over_an_and_that_dropped_a_conjunct_returns_none() {
     let child = json!({"type": "predicate_and", "expressions": [
-        {"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)},
-        {"type": "predicate_notequal", "left": col("ID"), "right": int_lit(7)},
+        predicate_equal(col("ID"), num_lit(5)),
+        {"type": "predicate_notequal", "left": col("ID"), "right": num_lit(7)},
     ]});
     let node = json!({"type": "predicate_not", "expression": child});
 
@@ -133,7 +130,7 @@ fn not_over_a_between_that_dropped_a_bound_returns_none() {
     let child = json!({
         "type": "predicate_between",
         "expression": col("ID"),
-        "left": int_lit(1),
+        "left": num_lit(1),
         "right": lit("literal_string", json!("ten")),
     });
     let node = json!({"type": "predicate_not", "expression": child});
@@ -144,8 +141,8 @@ fn not_over_a_between_that_dropped_a_bound_returns_none() {
 #[test]
 fn not_over_a_fully_translatable_and_negates_the_whole_conjunction() {
     let child = json!({"type": "predicate_and", "expressions": [
-        {"type": "predicate_greaterequal", "left": col("ID"), "right": int_lit(1)},
-        {"type": "predicate_lessequal", "left": col("ID"), "right": int_lit(9)},
+        {"type": "predicate_greaterequal", "left": col("ID"), "right": num_lit(1)},
+        {"type": "predicate_lessequal", "left": col("ID"), "right": num_lit(9)},
     ]});
     let node = json!({"type": "predicate_not", "expression": child});
     let pred = translate(&node).expect("NOT over a fully translatable AND must translate");
@@ -195,10 +192,6 @@ fn resolve_column_returns_none_for_non_primitive_column() {
     let schema = schema_with_struct_field();
 
     assert_eq!(resolve_column("NESTED", &by_name(&schema)), None);
-}
-
-fn lit(kind: &str, value: Json) -> Json {
-    json!({"type": kind, "value": value})
 }
 
 fn decimal_type(precision: u8, scale: u8) -> DecimalType {
@@ -476,8 +469,8 @@ fn unknown_literal_kind_yields_no_scalar() {
 #[test]
 fn and_of_two_translatable_children_folds_a_conjunction() {
     let node = json!({"type": "predicate_and", "expressions": [
-        {"type": "predicate_greaterequal", "left": col("ID"), "right": int_lit(5)},
-        {"type": "predicate_less", "left": col("ID"), "right": int_lit(9)},
+        {"type": "predicate_greaterequal", "left": col("ID"), "right": num_lit(5)},
+        {"type": "predicate_less", "left": col("ID"), "right": num_lit(9)},
     ]});
     let pred = translate(&node).expect("an AND of two translatable conjuncts must translate");
 
@@ -491,8 +484,8 @@ fn and_of_two_translatable_children_folds_a_conjunction() {
 #[test]
 fn and_with_untranslatable_child_keeps_translatable_conjunct() {
     let node = json!({"type": "predicate_and", "expressions": [
-        {"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)},
-        {"type": "predicate_notequal", "left": col("ID"), "right": int_lit(7)},
+        predicate_equal(col("ID"), num_lit(5)),
+        {"type": "predicate_notequal", "left": col("ID"), "right": num_lit(7)},
     ]});
     let pred = translate(&node).expect("an AND must keep the conjuncts it can translate");
 
@@ -503,8 +496,8 @@ fn and_with_untranslatable_child_keeps_translatable_conjunct() {
 #[test]
 fn and_all_untranslatable_returns_none_not_a_true_predicate() {
     let node = json!({"type": "predicate_and", "expressions": [
-        {"type": "predicate_notequal", "left": col("ID"), "right": int_lit(5)},
-        {"type": "predicate_notequal", "left": col("ID"), "right": int_lit(7)},
+        {"type": "predicate_notequal", "left": col("ID"), "right": num_lit(5)},
+        {"type": "predicate_notequal", "left": col("ID"), "right": num_lit(7)},
     ]});
 
     assert_eq!(translate(&node), None);
@@ -520,8 +513,8 @@ fn and_over_an_empty_expression_list_returns_none() {
 #[test]
 fn or_of_two_translatable_children_folds_a_disjunction() {
     let node = json!({"type": "predicate_or", "expressions": [
-        {"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)},
-        {"type": "predicate_equal", "left": col("ID"), "right": int_lit(7)},
+        predicate_equal(col("ID"), num_lit(5)),
+        predicate_equal(col("ID"), num_lit(7)),
     ]});
     let pred = translate(&node).expect("an OR of two translatable disjuncts must translate");
 
@@ -535,8 +528,8 @@ fn or_of_two_translatable_children_folds_a_disjunction() {
 #[test]
 fn or_with_untranslatable_child_returns_none() {
     let node = json!({"type": "predicate_or", "expressions": [
-        {"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)},
-        {"type": "predicate_notequal", "left": col("ID"), "right": int_lit(7)},
+        predicate_equal(col("ID"), num_lit(5)),
+        {"type": "predicate_notequal", "left": col("ID"), "right": num_lit(7)},
     ]});
 
     assert_eq!(translate(&node), None);
@@ -578,7 +571,7 @@ fn in_list_translates_to_an_or_chain_of_equalities() {
     let node = json!({
         "type": "predicate_in_constlist",
         "expression": col("ID"),
-        "arguments": [int_lit(1), int_lit(2), int_lit(3)],
+        "arguments": [num_lit(1), num_lit(2), num_lit(3)],
     });
     let pred = translate(&node).expect("an IN list of translatable literals must translate");
 
@@ -606,7 +599,7 @@ fn in_with_type_mismatch_element_returns_none() {
     let node = json!({
         "type": "predicate_in_constlist",
         "expression": col("ID"),
-        "arguments": [int_lit(1), lit("literal_string", json!("two"))],
+        "arguments": [num_lit(1), lit("literal_string", json!("two"))],
     });
 
     assert_eq!(translate(&node), None);
@@ -617,8 +610,8 @@ fn between_translates_to_a_lower_and_upper_bound_conjunction() {
     let node = json!({
         "type": "predicate_between",
         "expression": col("ID"),
-        "left": int_lit(1),
-        "right": int_lit(10),
+        "left": num_lit(1),
+        "right": num_lit(10),
     });
     let pred = translate(&node).expect("a BETWEEN with two convertible bounds must translate");
 
@@ -634,7 +627,7 @@ fn between_keeps_the_convertible_bound_when_the_other_fails() {
     let node = json!({
         "type": "predicate_between",
         "expression": col("ID"),
-        "left": int_lit(1),
+        "left": num_lit(1),
         "right": lit("literal_string", json!("ten")),
     });
     let pred = translate(&node).expect("a BETWEEN must keep the bound it can translate");
@@ -659,8 +652,8 @@ fn between_with_both_bounds_unconvertible_returns_none() {
 fn a_filter_column_is_emitted_under_its_paired_fields_current_name() {
     let renamed = StructField::nullable("b", DataType::Primitive(PrimitiveType::Integer));
     let columns = [("a", &renamed)];
-    let on_a = json!({"type": "predicate_equal", "left": col("A"), "right": int_lit(7)});
-    let on_b = json!({"type": "predicate_equal", "left": col("B"), "right": int_lit(7)});
+    let on_a = predicate_equal(col("A"), num_lit(7));
+    let on_b = predicate_equal(col("B"), num_lit(7));
 
     assert_eq!(
         to_delta_predicate(&on_a, &columns),
@@ -685,12 +678,11 @@ fn a_binary_literal_prunes_a_binary_column_by_its_bytes() {
         DataType::Primitive(PrimitiveType::Binary),
     )])
     .expect("schema with one binary field must build");
-    let equal_to =
-        |literal: Json| json!({"type": "predicate_equal", "left": col("B"), "right": literal});
+    let equal_to = |literal: Json| predicate_equal(col("B"), literal);
 
     assert_eq!(
         to_delta_predicate(
-            &equal_to(json!({"type": "literal_binary", "value": "00abff"})),
+            &equal_to(lit("literal_binary", "00abff")),
             &by_name(&schema)
         ),
         Some(Predicate::eq(
@@ -699,10 +691,7 @@ fn a_binary_literal_prunes_a_binary_column_by_its_bytes() {
         ))
     );
     assert_eq!(
-        to_delta_predicate(
-            &equal_to(json!({"type": "literal_string", "value": "00abff"})),
-            &by_name(&schema)
-        ),
+        to_delta_predicate(&equal_to(str_lit("00abff")), &by_name(&schema)),
         None,
         "only the retyped literal names bytes"
     );

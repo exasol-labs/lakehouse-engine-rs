@@ -1,5 +1,5 @@
 use super::*;
-use crate::adapter::pushdown::test_support::col;
+use crate::adapter::pushdown::test_support::{col, num_lit};
 
 fn agg(name: &str, column: &str, distinct: bool) -> Json {
     serde_json::json!({
@@ -25,7 +25,7 @@ fn sum_over_count() -> Json {
 fn round_of(inner: Json, digits: i64) -> Json {
     serde_json::json!({
         "type": "function_scalar", "name": "ROUND",
-        "arguments": [inner, {"type": "literal_exactnumeric", "value": digits}]
+        "arguments": [inner, num_lit(digits)]
     })
 }
 

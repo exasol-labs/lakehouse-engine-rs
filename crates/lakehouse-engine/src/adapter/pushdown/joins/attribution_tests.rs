@@ -1,5 +1,7 @@
 use super::*;
-use crate::adapter::pushdown::test_support::{aliased_col, col, table_col};
+use crate::adapter::pushdown::test_support::{
+    aliased_col, col, num_lit, predicate_equal, table_col,
+};
 
 impl super::JoinLegs {
     fn resolve(&self, node: &Json) -> ColumnLeg {
@@ -15,12 +17,8 @@ fn leaf(table_name: &str, table_alias: Option<&str>) -> JoinLeaf {
     }
 }
 
-fn literal(value: i64) -> Json {
-    serde_json::json!({ "type": "literal_exactnumeric", "value": value.to_string() })
-}
-
 fn equal(left: Json, right: Json) -> Json {
-    serde_json::json!({ "type": "predicate_equal", "left": left, "right": right })
+    predicate_equal(left, right)
 }
 
 /// `FROM FACT_ORDERS a JOIN FACT_ORDERS b` (#361's shape).
@@ -189,7 +187,7 @@ fn legs_referenced_reports_every_leg_a_tree_touches() {
 #[test]
 fn legs_referenced_flags_an_unattributed_column() {
     let legs = self_join_legs();
-    let conjunct = equal(table_col("FACT_ORDERS", "O_ORDERKEY"), literal(7));
+    let conjunct = equal(table_col("FACT_ORDERS", "O_ORDERKEY"), num_lit("7"));
 
     let referenced = legs.legs_referenced(&conjunct);
 
@@ -202,7 +200,7 @@ fn legs_referenced_flags_an_unattributed_column() {
 fn legs_referenced_flags_a_column_free_expression() {
     let legs = self_join_legs();
 
-    let referenced = legs.legs_referenced(&equal(literal(1), literal(1)));
+    let referenced = legs.legs_referenced(&equal(num_lit("1"), num_lit("1")));
 
     assert!(!referenced.any_column);
     assert!(!referenced.has_unattributed);
@@ -227,7 +225,7 @@ fn attachment_leg_is_the_highest_leg_a_cross_leg_condition_references() {
 #[test]
 fn attachment_leg_is_the_only_leg_a_single_leg_condition_references() {
     let legs = self_join_legs();
-    let condition = equal(aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"), literal(7));
+    let condition = equal(aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"), num_lit("7"));
 
     assert_eq!(legs.attachment_leg(&condition), Some(1));
 }
@@ -236,7 +234,10 @@ fn attachment_leg_is_the_only_leg_a_single_leg_condition_references() {
 fn attachment_leg_is_none_for_a_column_free_condition() {
     let legs = self_join_legs();
 
-    assert_eq!(legs.attachment_leg(&equal(literal(1), literal(1))), None);
+    assert_eq!(
+        legs.attachment_leg(&equal(num_lit("1"), num_lit("1"))),
+        None
+    );
 }
 
 #[test]
@@ -253,7 +254,7 @@ fn attachment_leg_is_none_when_any_column_is_unattributed() {
 #[test]
 fn conjunct_leg_is_the_single_leg_every_column_resolves_to() {
     let legs = self_join_legs();
-    let conjunct = equal(aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"), literal(7));
+    let conjunct = equal(aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"), num_lit("7"));
 
     assert_eq!(legs.conjunct_leg(&conjunct), Some(1));
 }
@@ -265,13 +266,13 @@ fn conjunct_leg_is_none_for_a_cross_leg_unattributed_or_column_free_conjunct() {
         aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"),
         aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"),
     );
-    let unattributed = equal(table_col("FACT_ORDERS", "O_ORDERKEY"), literal(7));
-    let foreign = equal(aliased_col("DIM_CUSTOMER", "C", "C_CUSTKEY"), literal(7));
+    let unattributed = equal(table_col("FACT_ORDERS", "O_ORDERKEY"), num_lit("7"));
+    let foreign = equal(aliased_col("DIM_CUSTOMER", "C", "C_CUSTKEY"), num_lit("7"));
 
     assert_eq!(legs.conjunct_leg(&cross_leg), None);
     assert_eq!(legs.conjunct_leg(&unattributed), None);
     assert_eq!(legs.conjunct_leg(&foreign), None);
-    assert_eq!(legs.conjunct_leg(&equal(literal(1), literal(1))), None);
+    assert_eq!(legs.conjunct_leg(&equal(num_lit("1"), num_lit("1"))), None);
 }
 
 #[test]

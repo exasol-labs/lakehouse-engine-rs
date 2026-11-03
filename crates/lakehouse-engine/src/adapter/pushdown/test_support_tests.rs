@@ -264,8 +264,32 @@ pub(crate) fn inner_join(left: Json, right: Json, condition: Json) -> Json {
     })
 }
 
+pub(crate) fn compare(kind: &str, left: Json, right: Json) -> Json {
+    serde_json::json!({"type": kind, "left": left, "right": right})
+}
+
 pub(crate) fn predicate_equal(left: Json, right: Json) -> Json {
-    serde_json::json!({"type": "predicate_equal", "left": left, "right": right})
+    compare("predicate_equal", left, right)
+}
+
+pub(crate) fn lit(kind: &str, value: impl Into<Json>) -> Json {
+    serde_json::json!({"type": kind, "value": value.into()})
+}
+
+pub(crate) fn num_lit(value: impl Into<Json>) -> Json {
+    lit("literal_exactnumeric", value)
+}
+
+pub(crate) fn str_lit(value: &str) -> Json {
+    lit("literal_string", value)
+}
+
+pub(crate) fn bool_lit(value: bool) -> Json {
+    lit("literal_bool", value)
+}
+
+pub(crate) fn null_lit() -> Json {
+    serde_json::json!({"type": "literal_null"})
 }
 
 pub(crate) fn customer_orders_join() -> Json {
@@ -1223,26 +1247,15 @@ pub(crate) fn agg_item_expr(
 }
 
 pub(crate) mod filter_json {
+    use super::{predicate_equal, str_lit, table_col};
     use serde_json::{Value as Json, json};
 
     pub(crate) fn column(name: &str) -> Json {
-        json!({"type": "column", "name": name, "tableName": "SALES"})
-    }
-
-    pub(crate) fn string(value: &str) -> Json {
-        json!({"type": "literal_string", "value": value})
-    }
-
-    pub(crate) fn number(value: &str) -> Json {
-        json!({"type": "literal_exactnumeric", "value": value})
-    }
-
-    pub(crate) fn compare(kind: &str, left: Json, right: Json) -> Json {
-        json!({"type": kind, "left": left, "right": right})
+        table_col("SALES", name)
     }
 
     pub(crate) fn equal(name: &str, value: &str) -> Json {
-        compare("predicate_equal", column(name), string(value))
+        predicate_equal(column(name), str_lit(value))
     }
 
     pub(crate) fn not(expression: Json) -> Json {

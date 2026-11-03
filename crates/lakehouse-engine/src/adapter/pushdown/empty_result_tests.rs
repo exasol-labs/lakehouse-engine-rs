@@ -202,14 +202,10 @@ fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
     let request = serde_json::json!({
         "aggregationType": "single_group",
         "selectList": [
-            {"type": "literal_string", "value": "X"},
+            str_lit("X"),
             agg_item("COUNT", None, false),
         ],
-        "having": {
-            "type": "predicate_equal",
-            "left": agg_item("COUNT", None, false),
-            "right": {"type": "literal_exactnumeric", "value": 0},
-        },
+        "having": predicate_equal(agg_item("COUNT", None, false), num_lit(0)),
     });
     let sql = empty_result_sql(&request, &[], &[], false, &col_types, &relation(&col_types))
         .unwrap()["sql"]
