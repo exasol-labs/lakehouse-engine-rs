@@ -8,7 +8,6 @@ use super::super::support::{
 use super::super::test_support::*;
 use super::super::{detect_aggregates, ordinary_plans, validate_agg_col_types};
 use super::*;
-use crate::adapter::pushdown::test_support::{col, table_col};
 use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, ScanStorage};
 
 /// Mirrors `handle_pushdown`'s synchronous post-resolution row-scan path.

@@ -11,7 +11,6 @@ use super::super::tests::{
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
-use crate::adapter::pushdown::test_support::{aliased_col, table_col};
 use crate::scan::spec::{ColumnRef, SortKey, StorageBackend, StorageProps};
 use vs_expression::{render_expression_exasol_safe, render_expression_safe};
 
@@ -33,17 +32,21 @@ fn q1_join_request() -> Json {
             ],
             "pushdownRequest": {
                 "type": "select",
-                "from": {"type": "join", "join_type": "inner",
-                    "left": {"type": "join", "join_type": "inner",
-                        "left": {"name": "SUPPLIER", "type": "table"},
-                        "right": {"name": "NATION", "type": "table"},
-                        "condition": {"type": "predicate_equal",
-                            "left": table_col("SUPPLIER", "S_NATIONKEY"),
-                            "right": table_col("NATION", "N_NATIONKEY")}},
-                    "right": {"name": "REGION", "type": "table"},
-                    "condition": {"type": "predicate_equal",
-                        "left": table_col("NATION", "N_REGIONKEY"),
-                        "right": table_col("REGION", "R_REGIONKEY")}},
+                "from": inner_join(
+                    inner_join(
+                        table_ref("SUPPLIER"),
+                        table_ref("NATION"),
+                        predicate_equal(
+                            table_col("SUPPLIER", "S_NATIONKEY"),
+                            table_col("NATION", "N_NATIONKEY"),
+                        ),
+                    ),
+                    table_ref("REGION"),
+                    predicate_equal(
+                        table_col("NATION", "N_REGIONKEY"),
+                        table_col("REGION", "R_REGIONKEY"),
+                    ),
+                ),
                 "selectList": [
                     table_col("SUPPLIER", "S_NAME"),
                     table_col("REGION", "R_NAME")],
@@ -409,12 +412,11 @@ fn colliding_columns_render_qualified_unified_wrapper_without_error() {
             ],
             "pushdownRequest": {
                 "type": "select",
-                "from": {"type": "join", "join_type": "inner",
-                    "left": {"name": "EVENTS", "type": "table"},
-                    "right": {"name": "LABELS", "type": "table"},
-                    "condition": {"type": "predicate_equal",
-                        "left": table_col("EVENTS", "ID"),
-                        "right": table_col("LABELS", "ID")}},
+                "from": inner_join(
+                    table_ref("EVENTS"),
+                    table_ref("LABELS"),
+                    predicate_equal(table_col("EVENTS", "ID"), table_col("LABELS", "ID")),
+                ),
                 "selectList": [
                     table_col("EVENTS", "ID"),
                     table_col("LABELS", "LABEL")],
@@ -600,17 +602,15 @@ fn build_n_scan_join_sql_renders_qualified_when_three_tables_share_column_name()
             ],
             "pushdownRequest": {
                 "type": "select",
-                "from": {"type": "join", "join_type": "inner",
-                    "left": {"type": "join", "join_type": "inner",
-                        "left": {"name": "EVENTS", "type": "table"},
-                        "right": {"name": "LABELS", "type": "table"},
-                        "condition": {"type": "predicate_equal",
-                            "left": table_col("EVENTS", "ID"),
-                            "right": table_col("LABELS", "ID")}},
-                    "right": {"name": "TAGS", "type": "table"},
-                    "condition": {"type": "predicate_equal",
-                        "left": table_col("LABELS", "ID"),
-                        "right": table_col("TAGS", "ID")}},
+                "from": inner_join(
+                    inner_join(
+                        table_ref("EVENTS"),
+                        table_ref("LABELS"),
+                        predicate_equal(table_col("EVENTS", "ID"), table_col("LABELS", "ID")),
+                    ),
+                    table_ref("TAGS"),
+                    predicate_equal(table_col("LABELS", "ID"), table_col("TAGS", "ID")),
+                ),
                 "selectList": [
                     table_col("EVENTS", "ID"),
                     table_col("LABELS", "LABEL"),
@@ -1017,13 +1017,11 @@ fn join_conditions_greedy_attach_and_side_local_pushdown() {
             ],
             "pushdownRequest": {
                 "type": "select",
-                "from": {"type": "join", "join_type": "inner",
-                    "left": {"name": "N1", "type": "table"},
-                    "right": {"type": "join", "join_type": "inner",
-                        "left": {"name": "N2", "type": "table"},
-                        "right": {"name": "FACT", "type": "table"},
-                        "condition": cond_n2_fact},
-                    "condition": cond_n1_fact},
+                "from": inner_join(
+                    table_ref("N1"),
+                    inner_join(table_ref("N2"), table_ref("FACT"), cond_n2_fact),
+                    cond_n1_fact,
+                ),
                 "selectList": [
                     table_col("N1", "N1_NAME"),
                     table_col("FACT", "F_VALUE")],
@@ -3154,11 +3152,11 @@ fn labels_column(name: &str) -> Json {
 fn shared_names_request(pushdown_extra: Json) -> Json {
     let mut pushdown_req = serde_json::json!({
         "type": "select",
-        "from": {"type": "join", "join_type": "inner",
-            "left": {"name": "EVENTS", "type": "table", "alias": "E"},
-            "right": {"name": "LABELS", "type": "table", "alias": "L"},
-            "condition": {"type": "predicate_equal",
-                "left": events_column("ID"), "right": labels_column("ID")}},
+        "from": inner_join(
+            serde_json::json!({"name": "EVENTS", "type": "table", "alias": "E"}),
+            serde_json::json!({"name": "LABELS", "type": "table", "alias": "L"}),
+            predicate_equal(events_column("ID"), labels_column("ID")),
+        ),
         "selectList": [events_column("ID"), labels_column("ID")],
     });
     if let Json::Object(extra) = pushdown_extra {

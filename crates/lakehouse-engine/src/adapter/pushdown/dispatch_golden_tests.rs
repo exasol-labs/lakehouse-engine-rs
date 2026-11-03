@@ -6,7 +6,7 @@ use super::test_support::{
     agg_item, broadcast_sides, pd, sample_scan_storage, sample_storage, with_identifier_notes,
 };
 use super::*;
-use crate::adapter::pushdown::test_support::{aliased_col, col, table_col};
+use crate::adapter::pushdown::test_support::{aliased_col, col, customer_orders_join, table_col};
 
 fn fixed_shards() -> Vec<Vec<FileEntry>> {
     vec![
@@ -777,17 +777,7 @@ use super::joins::{JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan
 fn two_table_join_request(filter: Option<Json>) -> Json {
     let mut pushdown_req = serde_json::json!({
         "type": "select",
-        "from": {
-            "type": "join",
-            "join_type": "inner",
-            "left": {"name": "CUSTOMER", "type": "table"},
-            "right": {"name": "ORDERS", "type": "table"},
-            "condition": {
-                "type": "predicate_equal",
-                "left": table_col("CUSTOMER", "C_CUSTKEY"),
-                "right": table_col("ORDERS", "O_CUSTKEY"),
-            },
-        },
+        "from": customer_orders_join(),
         "selectList": [
             table_col("CUSTOMER", "C_NAME"),
             table_col("ORDERS", "O_ORDERDATE"),

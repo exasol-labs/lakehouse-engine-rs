@@ -253,6 +253,31 @@ pub(crate) fn aliased_col(table: &str, alias: &str, name: &str) -> Json {
     serde_json::json!({"type": "column", "name": name, "tableName": table, "tableAlias": alias})
 }
 
+pub(crate) fn table_ref(name: &str) -> Json {
+    serde_json::json!({"name": name, "type": "table"})
+}
+
+pub(crate) fn inner_join(left: Json, right: Json, condition: Json) -> Json {
+    serde_json::json!({
+        "type": "join", "join_type": "inner", "left": left, "right": right, "condition": condition
+    })
+}
+
+pub(crate) fn predicate_equal(left: Json, right: Json) -> Json {
+    serde_json::json!({"type": "predicate_equal", "left": left, "right": right})
+}
+
+pub(crate) fn customer_orders_join() -> Json {
+    inner_join(
+        table_ref("CUSTOMER"),
+        table_ref("ORDERS"),
+        predicate_equal(
+            table_col("CUSTOMER", "C_CUSTKEY"),
+            table_col("ORDERS", "O_CUSTKEY"),
+        ),
+    )
+}
+
 pub(crate) fn broadcast_sides(
     fact: joins::ResolvedJoinSide,
     dimension: joins::ResolvedJoinSide,

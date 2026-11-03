@@ -7,7 +7,6 @@ use super::super::support::{
 };
 use super::super::test_support::*;
 use super::*;
-use crate::adapter::pushdown::test_support::{col, table_col};
 use crate::scan::spec::{CommonScanSpec, ScanStorage};
 
 #[test]
@@ -530,7 +529,7 @@ fn detect_group_by_mixed_select_falls_back() {
 fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
     let req = serde_json::json!({
         "aggregationType": "group_by",
-        "from": { "name": "EVENTS", "type": "table" },
+        "from": table_ref("EVENTS"),
         "groupBy": [
             { "columnNr": 0, "name": "ID", "tableName": "EVENTS", "type": "column" }
         ],

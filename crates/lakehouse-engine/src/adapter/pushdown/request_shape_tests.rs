@@ -1,6 +1,5 @@
 use super::super::test_support::*;
 use super::*;
-use crate::adapter::pushdown::test_support::col;
 
 fn col_types() -> Vec<(String, String)> {
     vec![

@@ -3,7 +3,6 @@ use super::super::scalar_over_agg::cast_merge_items;
 use super::super::test_support::*;
 use super::super::validate_agg_col_types;
 use super::*;
-use crate::adapter::pushdown::test_support::col;
 use crate::scan::spec::AggKind;
 
 fn agg_of(item: &SingleGroupItem) -> &AggregatePlan {

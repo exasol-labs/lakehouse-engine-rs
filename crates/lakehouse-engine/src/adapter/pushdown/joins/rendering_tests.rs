@@ -11,7 +11,6 @@ use super::super::tests::{
 use super::*;
 use crate::adapter::pushdown::support::{ColumnTypes, apply_type_rewrites};
 use crate::adapter::pushdown::test_support::*;
-use crate::adapter::pushdown::test_support::{aliased_col, table_col};
 use crate::scan::spec::ColumnRef;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
 
@@ -1108,12 +1107,7 @@ fn unified_join_prunes_and_narrows_each_leg() {
             ],
             "pushdownRequest": {
                 "type": "select",
-                "from": {"type": "join", "join_type": "inner",
-                    "left": {"name": "CUSTOMER", "type": "table"},
-                    "right": {"name": "ORDERS", "type": "table"},
-                    "condition": {"type": "predicate_equal",
-                        "left": table_col("CUSTOMER", "C_CUSTKEY"),
-                        "right": table_col("ORDERS", "O_CUSTKEY")}},
+                "from": customer_orders_join(),
                 "selectList": [
                     table_col("CUSTOMER", "C_NAME"),
                     table_col("ORDERS", "O_ORDERDATE")],

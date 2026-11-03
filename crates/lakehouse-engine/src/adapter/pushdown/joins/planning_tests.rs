@@ -3,7 +3,6 @@ use super::super::tests::{
     self_join_request, three_table_join_request,
 };
 use super::*;
-use crate::adapter::pushdown::test_support::table_col;
 use crate::adapter::pushdown::test_support::*;
 
 #[test]
@@ -35,7 +34,7 @@ fn plain_single_table_request_is_not_a_join() {
 #[test]
 fn from_table_node_is_not_a_join() {
     let mut request = nq4_request();
-    request["pushdownRequest"]["from"] = serde_json::json!({"name": "LINEITEM", "type": "table"});
+    request["pushdownRequest"]["from"] = serde_json::json!(table_ref("LINEITEM"));
     let shape = detect_join(&request, &pd(&request)).expect("not a join");
     assert_eq!(shape, JoinShape::NotAJoin);
 }

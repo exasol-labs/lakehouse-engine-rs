@@ -1,7 +1,6 @@
 use super::super::support::quote_ident;
 use super::super::test_support::*;
 use super::*;
-use crate::adapter::pushdown::test_support::{col, table_col};
 
 fn relation(col_types: &[(String, String)]) -> EmptyRelation {
     EmptyRelation::single_scan(&serde_json::json!({}), col_types)

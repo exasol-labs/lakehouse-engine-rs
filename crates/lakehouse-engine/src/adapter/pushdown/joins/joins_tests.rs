@@ -4,7 +4,6 @@ use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::permission::PermissionCheck;
 use crate::adapter::pushdown::ResolvedScan;
 use crate::adapter::pushdown::test_support::*;
-use crate::adapter::pushdown::test_support::{col, table_col};
 use crate::scan::spec::CatalogProps;
 use crate::scan::spec::{FileEntry, LogicalField, ProjectionItem};
 
@@ -15,8 +14,8 @@ pub(super) fn join_request(from_extra: Json, condition: Json) -> Json {
     let mut from = serde_json::json!({
         "type": "join",
         "join_type": "inner",
-        "left": {"name": "CUSTOMER", "type": "table"},
-        "right": {"name": "ORDERS", "type": "table"},
+        "left": table_ref("CUSTOMER"),
+        "right": table_ref("ORDERS"),
     });
     if let Json::Object(extra) = from_extra {
         from.as_object_mut().unwrap().extend(extra);
@@ -80,17 +79,14 @@ pub(super) fn three_table_join_request() -> Json {
             ],
             "pushdownRequest": {
                 "type": "select",
-                "from": {"type": "join", "join_type": "inner",
-                    "left": {"type": "join", "join_type": "inner",
-                        "left": {"name": "CUSTOMER", "type": "table"},
-                        "right": {"name": "ORDERS", "type": "table"},
-                        "condition": {"type": "predicate_equal",
-                            "left": table_col("CUSTOMER", "C_CUSTKEY"),
-                            "right": table_col("ORDERS", "O_CUSTKEY")}},
-                    "right": {"name": "LINEITEM", "type": "table"},
-                    "condition": {"type": "predicate_equal",
-                        "left": table_col("ORDERS", "O_ORDERKEY"),
-                        "right": table_col("LINEITEM", "L_ORDERKEY")}},
+                "from": inner_join(
+                    customer_orders_join(),
+                    table_ref("LINEITEM"),
+                    predicate_equal(
+                        table_col("ORDERS", "O_ORDERKEY"),
+                        table_col("LINEITEM", "L_ORDERKEY"),
+                    ),
+                ),
                 "selectList": [
                     table_col("CUSTOMER", "C_NAME"),
                     table_col("LINEITEM", "L_QUANTITY")],
@@ -126,22 +122,28 @@ pub(super) fn nq3_join_request() -> Json {
             ],
             "pushdownRequest": {
                 "type": "select",
-                "from": {"type": "join", "join_type": "inner",
-                    "left": {"type": "join", "join_type": "inner",
-                        "left": {"type": "join", "join_type": "inner",
-                            "left": {"name": "PART", "type": "table"},
-                            "right": {"name": "PARTSUPP", "type": "table"},
-                            "condition": {"type": "predicate_equal",
-                                "left": table_col("PART", "P_PARTKEY"),
-                                "right": table_col("PARTSUPP", "PS_PARTKEY")}},
-                        "right": {"name": "SUPPLIER", "type": "table"},
-                        "condition": {"type": "predicate_equal",
-                            "left": table_col("PARTSUPP", "PS_SUPPKEY"),
-                            "right": table_col("SUPPLIER", "S_SUPPKEY")}},
-                    "right": {"name": "NATION", "type": "table"},
-                    "condition": {"type": "predicate_equal",
-                        "left": table_col("SUPPLIER", "S_NATIONKEY"),
-                        "right": table_col("NATION", "N_NATIONKEY")}},
+                "from": inner_join(
+                    inner_join(
+                        inner_join(
+                            table_ref("PART"),
+                            table_ref("PARTSUPP"),
+                            predicate_equal(
+                                table_col("PART", "P_PARTKEY"),
+                                table_col("PARTSUPP", "PS_PARTKEY"),
+                            ),
+                        ),
+                        table_ref("SUPPLIER"),
+                        predicate_equal(
+                            table_col("PARTSUPP", "PS_SUPPKEY"),
+                            table_col("SUPPLIER", "S_SUPPKEY"),
+                        ),
+                    ),
+                    table_ref("NATION"),
+                    predicate_equal(
+                        table_col("SUPPLIER", "S_NATIONKEY"),
+                        table_col("NATION", "N_NATIONKEY"),
+                    ),
+                ),
                 "selectList": [
                     table_col("PART", "P_NAME"),
                     table_col("PARTSUPP", "PS_AVAILQTY"),
@@ -162,7 +164,7 @@ pub(super) fn nq3_join_request() -> Json {
 /// unaliased occurrence (mirrors the live `EXPLAIN VIRTUAL` capture for #361).
 pub(super) fn self_join_request(leg_aliases: &[Option<&str>]) -> Json {
     fn leaf(alias: Option<&str>) -> Json {
-        let mut leaf = serde_json::json!({"name": "FACT_ORDERS", "type": "table"});
+        let mut leaf = serde_json::json!(table_ref("FACT_ORDERS"));
         if let Some(alias) = alias {
             leaf["alias"] = Json::String(alias.to_string());
         }
@@ -178,17 +180,11 @@ pub(super) fn self_join_request(leg_aliases: &[Option<&str>]) -> Json {
 
     let mut from = leaf(leg_aliases[0]);
     for (left_leg, right_leg) in leg_aliases.iter().zip(leg_aliases.iter().skip(1)) {
-        from = serde_json::json!({
-            "type": "join",
-            "join_type": "inner",
-            "left": from,
-            "right": leaf(*right_leg),
-            "condition": {
-                "type": "predicate_equal",
-                "left": order_key(*left_leg),
-                "right": order_key(*right_leg),
-            },
-        });
+        from = inner_join(
+            from,
+            leaf(*right_leg),
+            predicate_equal(order_key(*left_leg), order_key(*right_leg)),
+        );
     }
 
     with_identifier_notes(
@@ -347,17 +343,7 @@ fn delta_join_request_over(
             ],
             "pushdownRequest": {
                 "type": "select",
-                "from": {
-                    "type": "join",
-                    "join_type": "inner",
-                    "left": {"name": "CUSTOMER", "type": "table"},
-                    "right": {"name": "ORDERS", "type": "table"},
-                    "condition": {
-                        "type": "predicate_equal",
-                        "left": table_col("CUSTOMER", "C_CUSTKEY"),
-                        "right": table_col("ORDERS", "O_CUSTKEY"),
-                    },
-                },
+                "from": customer_orders_join(),
                 "selectList": select_list,
             },
             "schemaMetadataInfo": {"properties": {}},

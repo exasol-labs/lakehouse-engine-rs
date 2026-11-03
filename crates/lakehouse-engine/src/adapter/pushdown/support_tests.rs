@@ -1,7 +1,6 @@
 use super::super::scalar_over_agg::cast_merge_items;
 use super::super::test_support::*;
 use super::*;
-use crate::adapter::pushdown::test_support::{aliased_col, col, table_col};
 use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, SortKey, StorageProps};
 use vs_expression::render_df_filter_safe;
 

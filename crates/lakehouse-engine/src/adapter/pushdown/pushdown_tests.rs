@@ -1,6 +1,5 @@
 use super::test_support::*;
 use super::*;
-use crate::adapter::pushdown::test_support::{col, table_col};
 use crate::scan::spec::{
     ColumnRef, CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage,
     StorageProps,
@@ -1892,17 +1891,7 @@ async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
             ],
             "pushdownRequest": {
                 "type": "select",
-                "from": {
-                    "type": "join",
-                    "join_type": "inner",
-                    "left": {"name": "CUSTOMER", "type": "table"},
-                    "right": {"name": "ORDERS", "type": "table"},
-                    "condition": {
-                        "type": "predicate_equal",
-                        "left": table_col("CUSTOMER", "C_CUSTKEY"),
-                        "right": table_col("ORDERS", "O_CUSTKEY"),
-                    },
-                },
+                "from": customer_orders_join(),
                 "selectList": [
                     table_col("CUSTOMER", "C_CUSTKEY"),
                     table_col("ORDERS", "O_CUSTKEY"),
