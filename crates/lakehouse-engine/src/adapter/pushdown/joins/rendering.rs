@@ -1,10 +1,12 @@
 use crate::scan::spec::ProjectionItem;
 use serde_json::Value as Json;
-use vs_expression::{render_df_filter_exasol_safe, render_expression_exasol_safe};
+use vs_expression::{
+    render_df_filter_exasol_safe, render_expression_exasol_safe, walk_column_nodes,
+};
 
 use super::super::BinaryColumns;
 use super::super::support::{
-    ColumnTypes, datafusion_renderable, quote_ident, type_accepted_rewrite, walk_column_nodes,
+    ColumnTypes, datafusion_renderable, quote_ident, type_accepted_rewrite,
 };
 use super::attribution::{ColumnLeg, JoinLegs, UnattributableColumn};
 use super::planning::{DetectedJoin, ResolvedJoinSide, involved_table_columns};
@@ -187,11 +189,9 @@ fn collect_leg_column_names(
     leg: usize,
     out: &mut std::collections::HashSet<String>,
 ) {
-    walk_column_nodes(expr, &mut |map| {
-        if legs.resolve_column(map) == ColumnLeg::Leg(leg)
-            && let Some(name) = map.get("name").and_then(|n| n.as_str())
-        {
-            out.insert(name.to_ascii_uppercase());
+    walk_column_nodes(expr, &mut |column| {
+        if legs.resolve_column(column) == ColumnLeg::Leg(leg) {
+            out.insert(column.ascii_upper_name());
         }
     });
 }
@@ -204,15 +204,10 @@ pub(super) fn possible_side_column_names(
     table_name: &str,
 ) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
-    walk_column_nodes(expr, &mut |map| {
-        let Some(name) = map.get("name").and_then(|n| n.as_str()) else {
-            return;
-        };
-        match map.get("tableName").and_then(|t| t.as_str()) {
-            Some(tn) if !tn.eq_ignore_ascii_case(table_name) => {}
-            _ => {
-                names.insert(name.to_ascii_uppercase());
-            }
+    walk_column_nodes(expr, &mut |column| match column.table_name {
+        Some(tn) if !tn.eq_ignore_ascii_case(table_name) => {}
+        _ => {
+            names.insert(column.ascii_upper_name());
         }
     });
     names
@@ -226,7 +221,7 @@ pub(super) fn has_no_explicit_select_list(pushdown_req: &Json) -> bool {
 
 /// The single owner of which clauses can name a source column. The collector is a
 /// parameter because the callers must stay divergent: they fold case differently (see
-/// `walk_column_nodes`) and fall back differently.
+/// `ColumnNode::ascii_upper_name`) and fall back differently.
 /// [`referenced_leg_columns`]'s empty-`selectList` short-circuit must not move in here:
 /// `referenced_column_projection` must keep narrowing through the remaining clauses.
 pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMut(&Json)) {

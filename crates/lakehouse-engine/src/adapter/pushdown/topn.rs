@@ -15,11 +15,7 @@ use super::support::{
 /// qualification stamped; the single-table paths strip every alias first, so their keys stay
 /// bare.
 pub(super) fn parse_sort_key_element(element: &Json) -> Option<SortKey> {
-    let expr = element.get("expression")?;
-    if expr.get("type").and_then(|t| t.as_str()) != Some("column") {
-        return None;
-    }
-    let column = column_node_ref(expr)?;
+    let column = column_node_ref(element.get("expression")?)?;
     let ascending = element.get("isAscending").and_then(|b| b.as_bool())?;
     let nulls_last = element.get("nullsLast").and_then(|b| b.as_bool())?;
     Some(SortKey {
