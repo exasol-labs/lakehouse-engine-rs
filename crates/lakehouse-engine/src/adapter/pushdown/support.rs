@@ -911,7 +911,7 @@ fn is_valid_emits_output_type(ty: ExasolType) -> bool {
 /// `all_cols` is the column universe: the first involved table, or both legs of a broadcast
 /// join, each column qualified by its leg's alias.
 ///
-/// The third element is the widening signal: `true` means the projection is the full base row,
+/// The second element is the widening signal: `true` means the projection is the full base row,
 /// not one item per select-list item (#196). The widening flag is returned rather than re-derived downstream by comparing
 /// arities, which coincide when the table width equals the select-list arity
 /// (#196). A missing or empty select list is not a widening.

@@ -3,26 +3,11 @@ use super::*;
 use crate::types::exasol_type::ExasolType;
 
 fn col_types() -> ColumnTypes {
-    column_types(
-        &[
-            (
-                "AMOUNT",
-                ExasolType::Decimal {
-                    precision: 18,
-                    scale: 2,
-                },
-            ),
-            ("NAME", ExasolType::WIDEST_VARCHAR),
-            (
-                "ID",
-                ExasolType::Decimal {
-                    precision: 20,
-                    scale: 0,
-                },
-            ),
-        ],
-        &[],
-    )
+    column_types(&[
+        ("AMOUNT", ExasolType::decimal(18, 2)),
+        ("NAME", ExasolType::WIDEST_VARCHAR),
+        ("ID", ExasolType::decimal(20, 0)),
+    ])
 }
 
 #[test]

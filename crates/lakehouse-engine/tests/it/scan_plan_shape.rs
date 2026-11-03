@@ -370,10 +370,7 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
     let spec = aggregate_spec(plans);
     let shards = vec![vec![("lineitem/data/f0.parquet".to_string(), 4096u64)]];
     let merge_inputs = AggregateMergeInputs::new(
-        vec![ExasolType::Decimal {
-            precision: 36,
-            scale: 4,
-        }],
+        vec![ExasolType::decimal(36, 4)],
         vec![r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,4))"#.to_string()],
         None,
     )
@@ -416,10 +413,7 @@ fn row_scan_spec() -> ScanSpec {
 fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
     let projection = vec![ProjectedColumn {
         item: ProjectionItem::Column("L_ORDERKEY".into()),
-        exa_type: ExasolType::Decimal {
-            precision: 20,
-            scale: 0,
-        },
+        exa_type: ExasolType::decimal(20, 0),
     }];
     let spec = row_scan_spec();
 
@@ -464,10 +458,7 @@ fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
 fn topn_order_by_limit_attaches_to_outer_scalar_select() {
     let projection = vec![ProjectedColumn {
         item: ProjectionItem::Column("L_EXTENDEDPRICE".into()),
-        exa_type: ExasolType::Decimal {
-            precision: 18,
-            scale: 2,
-        },
+        exa_type: ExasolType::decimal(18, 2),
     }];
     let mut spec = row_scan_spec();
     spec.common.order_by = vec![SortKey {
@@ -553,13 +544,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         vec![("data/ord-0.parquet".to_string(), 8192u64)],
         vec![("data/ord-1.parquet".to_string(), 8192u64)],
     ];
-    let types = [
-        ExasolType::Varchar {
-            size: 100,
-            ascii: false,
-        },
-        ExasolType::Date,
-    ];
+    let types = [ExasolType::varchar(100), ExasolType::Date];
     let projection: Vec<ProjectedColumn> = spec
         .common
         .projection

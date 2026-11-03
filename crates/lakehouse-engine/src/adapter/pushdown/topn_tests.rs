@@ -24,7 +24,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     // Covers only the no-decline half; a declining fixture belongs on `build_dispatch_sql`.
     let (filter, declined_filter) = classify_where_filter(
         pushdown_req.get("filter").filter(|f| !f.is_null()),
-        &column_types(&col_types, &[]),
+        &column_types(&col_types),
     );
     assert!(
         declined_filter.is_none(),
@@ -32,7 +32,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     );
 
     let items = detect_aggregates(&pushdown_req)
-        .filter(|it| validate_agg_col_types(&ordinary_plans(it), &column_types(&col_types, &[])));
+        .filter(|it| validate_agg_col_types(&ordinary_plans(it), &column_types(&col_types)));
     let merge_inputs = items.as_deref().map(|it| {
         let plans = ordinary_plans(it);
         let plan_types = single_group_plan_types(&pushdown_req, it);
@@ -76,7 +76,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
         // Mirrors the dispatcher's guard (#198); a declining fixture belongs on `build_dispatch_sql`.
         ensure_every_sort_key_renders(&keys)
             .expect("plan_scan_sql mirrors only fixtures whose pushed ORDER BY renders in full");
-        extend_projection_with_sort_keys(&mut projection, &keys, &column_types(&col_types, &[]));
+        extend_projection_with_sort_keys(&mut projection, &keys, &column_types(&col_types));
         keys
     } else {
         Vec::new()
@@ -101,7 +101,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
         &shards,
         &projection,
         effective_limit,
-        &column_types(&col_types, &[]),
+        &column_types(&col_types),
         merge_inputs.as_ref(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,

@@ -223,8 +223,7 @@ pub(super) fn broadcast_projection(request: &Json) -> (Vec<ProjectionItem>, Vec<
             .enumerate()
             .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
     );
-    let (projection, widened) = project_columns(&qualified, &leg_types).expect("projectable");
-    let (items, types) = split_projection(&projection);
+    let (items, types, widened) = project_split(&qualified, &leg_types).expect("projectable");
     (items, types, widened)
 }
 

@@ -175,7 +175,7 @@ fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types(
             SingleGroupItem::ScalarOverAggregate {
                 declared_type,
                 node,
-            } if *declared_type == ExasolType::Decimal { precision: 9, scale: 4 } && node == &req["selectList"][1]
+            } if *declared_type == ExasolType::decimal(9, 4) && node == &req["selectList"][1]
         ),
         "item 1 must be a ScalarOverAggregate at ordinal 1 carrying its own \
          declared type and the verbatim node: {:?}",
@@ -396,13 +396,7 @@ fn bare_column_aggregates_unchanged_regression() {
     assert_eq!(agg_of(&plans[6]).kind, AggKind::Stddev);
 
     let col_types = vec![
-        (
-            "AMOUNT".to_string(),
-            ExasolType::Decimal {
-                precision: 20,
-                scale: 0,
-            },
-        ),
+        ("AMOUNT".to_string(), ExasolType::decimal(20, 0)),
         ("SCORE".to_string(), ExasolType::DoublePrecision),
         ("TS".to_string(), ExasolType::Timestamp { precision: None }),
     ];
@@ -413,7 +407,7 @@ fn bare_column_aggregates_unchanged_regression() {
     }];
     let emits = partial_emits_items(
         &sum_only,
-        &column_types(&col_types, &[]),
+        &column_types(&col_types),
         &[ExasolType::WIDEST_VARCHAR],
     );
     assert_eq!(emits, vec![r#""PARTIAL_sum_0" DECIMAL(36,0)"#.to_string()]);
@@ -446,16 +440,13 @@ fn expression_arg_partial_and_merge_types_from_declared_type() {
     }];
     let emits = partial_emits_items(
         &sum_expr,
-        &column_types(&col_types, &[]),
-        &[ExasolType::Decimal {
-            precision: 38,
-            scale: 4,
-        }],
+        &column_types(&col_types),
+        &[ExasolType::decimal(38, 4)],
     );
     assert_eq!(emits, vec![r#""PARTIAL_sum_0" DECIMAL(36,4)"#.to_string()]);
     let emits = partial_emits_items(
         &sum_expr,
-        &column_types(&col_types, &[]),
+        &column_types(&col_types),
         &[ExasolType::DoublePrecision],
     );
     assert_eq!(
@@ -468,11 +459,7 @@ fn expression_arg_partial_and_merge_types_from_declared_type() {
         column: None,
         arg_expr: Some(r#"("A" + "B")"#.into()),
     }];
-    let emits = partial_emits_items(
-        &min_expr,
-        &column_types(&col_types, &[]),
-        &[ExasolType::Date],
-    );
+    let emits = partial_emits_items(&min_expr, &column_types(&col_types), &[ExasolType::Date]);
     assert_eq!(emits, vec![r#""PARTIAL_min_0" DATE"#.to_string()]);
 
     let count_expr = vec![AggregatePlan {
@@ -482,11 +469,8 @@ fn expression_arg_partial_and_merge_types_from_declared_type() {
     }];
     let emits = partial_emits_items(
         &count_expr,
-        &column_types(&col_types, &[]),
-        &[ExasolType::Decimal {
-            precision: 18,
-            scale: 0,
-        }],
+        &column_types(&col_types),
+        &[ExasolType::decimal(18, 0)],
     );
     assert_eq!(
         emits,
@@ -494,7 +478,7 @@ fn expression_arg_partial_and_merge_types_from_declared_type() {
     );
 
     assert!(
-        validate_agg_col_types(&sum_expr, &column_types(&col_types, &[])),
+        validate_agg_col_types(&sum_expr, &column_types(&col_types)),
         "expression-argument SUM must pass validation, not force a row scan"
     );
 }
@@ -523,12 +507,9 @@ fn decimal_product_sum_partial_widens_to_decimal_36() {
 
     // No operand column in col_types: the declared type is authoritative.
     let col_types: Vec<(String, ExasolType)> = vec![];
-    let declared = [ExasolType::Decimal {
-        precision: 36,
-        scale: 4,
-    }];
+    let declared = [ExasolType::decimal(36, 4)];
 
-    let emits = partial_emits_items(&plans, &column_types(&col_types, &[]), &declared);
+    let emits = partial_emits_items(&plans, &column_types(&col_types), &declared);
     assert_eq!(
         emits,
         vec![r#""PARTIAL_sum_0" DECIMAL(36,4)"#.to_string()],
@@ -542,10 +523,7 @@ fn decimal_product_sum_partial_widens_to_decimal_36() {
         "merge must cast the summed partial to the declared DECIMAL(36,4)"
     );
 
-    assert!(validate_agg_col_types(
-        &plans,
-        &column_types(&col_types, &[])
-    ));
+    assert!(validate_agg_col_types(&plans, &column_types(&col_types)));
 }
 
 #[test]
@@ -766,18 +744,9 @@ fn single_group_plan_types_aligns_with_bare_aggregate_select_list() {
     assert_eq!(
         single_group_plan_types(&req, &items),
         vec![
-            ExasolType::Decimal {
-                precision: 36,
-                scale: 2
-            },
-            ExasolType::Decimal {
-                precision: 18,
-                scale: 0
-            },
-            ExasolType::Decimal {
-                precision: 9,
-                scale: 4
-            },
+            ExasolType::decimal(36, 2),
+            ExasolType::decimal(18, 0),
+            ExasolType::decimal(9, 4),
         ]
     );
 }
@@ -821,13 +790,7 @@ fn single_group_plan_types_prefers_top_level_declared_type_for_shared_slot() {
     let items = detect_aggregates(&req).expect("COUNT(*) + ROUND(SUM/COUNT) must decompose");
     assert_eq!(
         single_group_plan_types(&req, &items),
-        vec![
-            ExasolType::Decimal {
-                precision: 18,
-                scale: 0
-            },
-            ExasolType::DoublePrecision
-        ],
+        vec![ExasolType::decimal(18, 0), ExasolType::DoublePrecision],
         "slot 0 (COUNT) takes its bare declared type; slot 1 (SUM) has no top-level \
          occurrence and keeps the nested-only numeric default"
     );
@@ -852,16 +815,7 @@ fn single_group_plan_types_resolves_both_ends_of_an_interleaved_list() {
     let items = detect_aggregates(&req).expect("an interleaved list must decompose");
     assert_eq!(
         single_group_plan_types(&req, &items),
-        vec![
-            ExasolType::Decimal {
-                precision: 36,
-                scale: 2
-            },
-            ExasolType::Decimal {
-                precision: 18,
-                scale: 0
-            }
-        ],
+        vec![ExasolType::decimal(36, 2), ExasolType::decimal(18, 0)],
         "slot 0 (SUM) takes ordinal 0's type; slot 1 (COUNT) takes ordinal 2's type, \
          never ordinal 1's scalar-item type"
     );
@@ -879,10 +833,7 @@ fn single_group_plan_types_skips_distinct_items() {
     let items = detect_aggregates(&req).expect("SUM + COUNT(DISTINCT) must decompose");
     assert_eq!(
         single_group_plan_types(&req, &items),
-        vec![ExasolType::Decimal {
-            precision: 36,
-            scale: 2
-        }],
+        vec![ExasolType::decimal(36, 2)],
         "the COUNT(DISTINCT) item contributes no ordinary-aggregate slot"
     );
 }
@@ -1009,10 +960,7 @@ fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
     });
     let items = vec![SingleGroupItem::ScalarOverAggregate {
         node,
-        declared_type: ExasolType::Decimal {
-            precision: 18,
-            scale: 0,
-        },
+        declared_type: ExasolType::decimal(18, 0),
     }];
     let plans = ordinary_plans(&items);
     let plan_types = single_group_plan_types(&serde_json::json!({}), &items);

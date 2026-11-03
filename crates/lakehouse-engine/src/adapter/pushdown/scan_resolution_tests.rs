@@ -599,10 +599,7 @@ async fn the_resolver_returns_the_map_the_request_types_and_the_column_notes_bui
     .await
     .expect("a direct-storage store is built from the CONNECTION alone");
     let notes = delta_notes(&[("payload", "binary"), ("id", "long")], &[]);
-    let number = ExasolType::Decimal {
-        precision: 20,
-        scale: 0,
-    };
+    let number = ExasolType::decimal(20, 0);
     let involved = InvolvedColumns {
         types: vec![
             ("PAYLOAD".to_string(), ExasolType::WIDEST_VARCHAR),

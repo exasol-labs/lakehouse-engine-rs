@@ -675,9 +675,7 @@ fn exasol_type_from_json_caps_timestamp_precision_at_nine() {
         let ts = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": digits});
         assert_eq!(
             exasol_type_from_json(&ts),
-            ExasolType::Timestamp {
-                precision: Some(expected)
-            },
+            ExasolType::timestamp(expected),
             "fractionalSecondsPrecision {digits}"
         );
     }
@@ -1333,17 +1331,11 @@ fn exasol_type_to_json_renders_each_recorded_data_type_object() {
         (ExasolType::DoublePrecision, json!({"type": "double"})),
         (ExasolType::Date, json!({"type": "date"})),
         (
-            ExasolType::Decimal {
-                precision: 18,
-                scale: 4,
-            },
+            ExasolType::decimal(18, 4),
             json!({"type": "decimal", "precision": 18, "scale": 4}),
         ),
         (
-            ExasolType::Decimal {
-                precision: 10,
-                scale: -2,
-            },
+            ExasolType::decimal(10, -2),
             json!({"type": "decimal", "precision": 10, "scale": -2}),
         ),
         (
@@ -1351,11 +1343,11 @@ fn exasol_type_to_json_renders_each_recorded_data_type_object() {
             json!({"type": "timestamp"}),
         ),
         (
-            ExasolType::Timestamp { precision: Some(6) },
+            ExasolType::timestamp(6),
             json!({"type": "timestamp", "fractionalSecondsPrecision": 6}),
         ),
         (
-            ExasolType::Timestamp { precision: Some(0) },
+            ExasolType::timestamp(0),
             json!({"type": "timestamp", "fractionalSecondsPrecision": 0}),
         ),
         (
@@ -1373,13 +1365,7 @@ fn exasol_type_to_json_renders_each_recorded_data_type_object() {
             },
             json!({"type": "varchar", "size": 4, "characterSet": "ASCII"}),
         ),
-        (
-            ExasolType::Char {
-                size: 3,
-                ascii: false,
-            },
-            json!({"type": "char", "size": 3}),
-        ),
+        (ExasolType::char(3), json!({"type": "char", "size": 3})),
         (
             ExasolType::Char {
                 size: 3,

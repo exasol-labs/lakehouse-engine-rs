@@ -23,10 +23,10 @@ fn compatible_exasol_type(dt: &DataType) -> Option<ExasolType> {
     let exasol_type = match dt {
         DataType::Boolean => ExasolType::Boolean,
 
-        DataType::Int8 | DataType::UInt8 => decimal(3, 0),
-        DataType::Int16 | DataType::UInt16 => decimal(5, 0),
-        DataType::Int32 => decimal(10, 0),
-        DataType::Int64 | DataType::UInt32 | DataType::UInt64 => decimal(20, 0),
+        DataType::Int8 | DataType::UInt8 => ExasolType::decimal(3, 0),
+        DataType::Int16 | DataType::UInt16 => ExasolType::decimal(5, 0),
+        DataType::Int32 => ExasolType::decimal(10, 0),
+        DataType::Int64 | DataType::UInt32 | DataType::UInt64 => ExasolType::decimal(20, 0),
 
         DataType::Float32 | DataType::Float64 => ExasolType::DoublePrecision,
 
@@ -38,15 +38,11 @@ fn compatible_exasol_type(dt: &DataType) -> Option<ExasolType> {
         // value is a UTC instant, so plain TIMESTAMP emits it unchanged.
         DataType::Timestamp(_, _) => ExasolType::Timestamp { precision: None },
 
-        DataType::Decimal128(p, s) if *p <= 36 && *s <= 36 => decimal(*p, *s),
+        DataType::Decimal128(p, s) if *p <= 36 && *s <= 36 => ExasolType::decimal(*p, *s),
 
         _ => return None,
     };
     Some(exasol_type)
-}
-
-fn decimal(precision: u8, scale: i8) -> ExasolType {
-    ExasolType::Decimal { precision, scale }
 }
 
 const EXASOL_DECIMAL_MAX_PRECISION: u32 = 36;
@@ -93,7 +89,7 @@ pub(crate) fn exasol_representable_catalog_decimal(precision: u32, scale: u32) -
 
 fn catalog_decimal_to_exasol(precision: u32, scale: u32) -> ExasolType {
     if exasol_representable_catalog_decimal(precision, scale) {
-        decimal(precision as u8, scale as i8)
+        ExasolType::decimal(precision as u8, scale as i8)
     } else {
         ExasolType::WIDEST_VARCHAR
     }
@@ -190,8 +186,8 @@ pub fn iceberg_primitive_to_exasol(
     use iceberg::spec::PrimitiveType::*;
     match pt {
         Boolean => ExasolType::Boolean,
-        Int => decimal(10, 0),
-        Long => decimal(20, 0),
+        Int => ExasolType::decimal(10, 0),
+        Long => ExasolType::decimal(20, 0),
         Float | Double => ExasolType::DoublePrecision,
         Decimal { precision, scale } => catalog_decimal_to_exasol(*precision, *scale),
         Date => ExasolType::Date,
@@ -394,10 +390,10 @@ fn spark_primitive_to_exasol(
 ) -> ExasolType {
     match primitive {
         SparkPrimitive::Boolean => ExasolType::Boolean,
-        SparkPrimitive::Byte => decimal(3, 0),
-        SparkPrimitive::Short => decimal(5, 0),
-        SparkPrimitive::Integer => decimal(10, 0),
-        SparkPrimitive::Long => decimal(20, 0),
+        SparkPrimitive::Byte => ExasolType::decimal(3, 0),
+        SparkPrimitive::Short => ExasolType::decimal(5, 0),
+        SparkPrimitive::Integer => ExasolType::decimal(10, 0),
+        SparkPrimitive::Long => ExasolType::decimal(20, 0),
         SparkPrimitive::Float | SparkPrimitive::Double => ExasolType::DoublePrecision,
         SparkPrimitive::Date => ExasolType::Date,
         // The Delta protocol defines no nanosecond timestamp type.
@@ -459,7 +455,7 @@ pub(crate) fn exasol_type_from_json(dt: &Json) -> ExasolType {
             let p = dt.get("precision").and_then(|v| v.as_u64()).unwrap_or(18);
             let s = dt.get("scale").and_then(|v| v.as_u64()).unwrap_or(0);
             if p <= 36 && s <= 36 {
-                decimal(p as u8, s as i8)
+                ExasolType::decimal(p as u8, s as i8)
             } else {
                 ExasolType::WIDEST_VARCHAR
             }

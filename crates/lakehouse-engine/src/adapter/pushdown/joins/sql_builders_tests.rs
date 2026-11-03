@@ -1716,10 +1716,7 @@ fn golden_broadcast_join_sql_unchanged() {
             &[
                 ProjectedColumn {
                     item: lineitem_column("L_ORDERKEY"),
-                    exa_type: ExasolType::Decimal {
-                        precision: 20,
-                        scale: 0,
-                    },
+                    exa_type: ExasolType::decimal(20, 0),
                 },
                 ProjectedColumn {
                     item: orders_column("O_ORDERDATE"),
@@ -1763,10 +1760,7 @@ fn broadcast_carries_each_sides_own_storage() {
         r#"("LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY")"#,
         &[ProjectedColumn {
             item: lineitem_column("L_ORDERKEY"),
-            exa_type: ExasolType::Decimal {
-                precision: 20,
-                scale: 0,
-            },
+            exa_type: ExasolType::decimal(20, 0),
         }],
     );
     let sql = build_broadcast_join_sql(
@@ -1850,10 +1844,7 @@ fn broadcast_window_sql(window: JoinWindowPlan) -> Option<String> {
     broadcast_sql_projecting(
         &[ProjectedColumn {
             item: lineitem_column("L_ORDERKEY"),
-            exa_type: ExasolType::Decimal {
-                precision: 20,
-                scale: 0,
-            },
+            exa_type: ExasolType::decimal(20, 0),
         }],
         window,
     )
@@ -1975,10 +1966,7 @@ fn broadcast_ordered_bounds_shards_with_keys_from_either_side() {
         &[
             ProjectedColumn {
                 item: lineitem_column("L_ORDERKEY"),
-                exa_type: ExasolType::Decimal {
-                    precision: 20,
-                    scale: 0,
-                },
+                exa_type: ExasolType::decimal(20, 0),
             },
             ProjectedColumn {
                 item: orders_column("O_ORDERDATE"),
@@ -2223,21 +2211,9 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
         ..Default::default()
     }
     .with_files(vec![]);
-    let proj_types = vec![
-        ExasolType::Decimal {
-            precision: 20,
-            scale: 0,
-        },
-        ExasolType::Varchar {
-            size: 100,
-            ascii: false,
-        },
-    ];
+    let proj_types = vec![ExasolType::decimal(20, 0), ExasolType::varchar(100)];
     let fan_out_columns = projected_columns(&fan_out_spec.common.projection, &proj_types);
-    let col_types = column_types(
-        &[("C_CUSTKEY", proj_types[0]), ("C_NAME", proj_types[1])],
-        &[],
-    );
+    let col_types = column_types(&[("C_CUSTKEY", proj_types[0]), ("C_NAME", proj_types[1])]);
     let fan_out = FanOutProjection::new(&fan_out_spec, &fan_out_columns, &col_types)
         .expect("aligned fan-out");
     let actual = build_qualified_single_table_fallback_sql(
@@ -2384,48 +2360,12 @@ fn fallback_projection_narrows_to_referenced_columns() {
     let shards = [vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
 
     let all_cols = vec![
-        col(
-            "GK",
-            ExasolType::Varchar {
-                size: 10,
-                ascii: false,
-            },
-        ),
-        col(
-            "REGION",
-            ExasolType::Varchar {
-                size: 10,
-                ascii: false,
-            },
-        ),
-        col(
-            "HCOL",
-            ExasolType::Decimal {
-                precision: 18,
-                scale: 0,
-            },
-        ),
-        col(
-            "OCOL",
-            ExasolType::Decimal {
-                precision: 18,
-                scale: 0,
-            },
-        ),
-        col(
-            "FCOL",
-            ExasolType::Decimal {
-                precision: 18,
-                scale: 0,
-            },
-        ),
-        col(
-            "IRRELEVANT_COL",
-            ExasolType::Varchar {
-                size: 10,
-                ascii: false,
-            },
-        ),
+        col("GK", ExasolType::varchar(10)),
+        col("REGION", ExasolType::varchar(10)),
+        col("HCOL", ExasolType::decimal(18, 0)),
+        col("OCOL", ExasolType::decimal(18, 0)),
+        col("FCOL", ExasolType::decimal(18, 0)),
+        col("IRRELEVANT_COL", ExasolType::varchar(10)),
     ];
     let rich_req = serde_json::json!({
         "aggregationType": "group_by",
@@ -2448,7 +2388,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
     });
     let (proj, types) = split_projection(&referenced_column_projection(
         &rich_req,
-        &column_types(&all_cols, &[]),
+        &column_types(&all_cols),
     ));
     let names = proj_names(&proj);
     for expected in ["GK", "REGION", "HCOL", "OCOL", "FCOL"] {
@@ -2476,27 +2416,9 @@ fn fallback_projection_narrows_to_referenced_columns() {
     );
 
     let grouped_all = vec![
-        col(
-            "GK",
-            ExasolType::Varchar {
-                size: 10,
-                ascii: false,
-            },
-        ),
-        col(
-            "REGION",
-            ExasolType::Varchar {
-                size: 10,
-                ascii: false,
-            },
-        ),
-        col(
-            "IRRELEVANT_COL",
-            ExasolType::Varchar {
-                size: 10,
-                ascii: false,
-            },
-        ),
+        col("GK", ExasolType::varchar(10)),
+        col("REGION", ExasolType::varchar(10)),
+        col("IRRELEVANT_COL", ExasolType::varchar(10)),
     ];
     let grouped_req = serde_json::json!({
         "aggregationType": "group_by",
@@ -2510,7 +2432,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
                     num_lit(0)]}]}
         ],
     });
-    let grouped_col_types = column_types(&grouped_all, &[]);
+    let grouped_col_types = column_types(&grouped_all);
     let (gproj, gtypes) = split_projection(&referenced_column_projection(
         &grouped_req,
         &grouped_col_types,
@@ -2546,27 +2468,9 @@ fn fallback_projection_narrows_to_referenced_columns() {
     );
 
     let sg_all = vec![
-        col(
-            "A",
-            ExasolType::Varchar {
-                size: 10,
-                ascii: false,
-            },
-        ),
-        col(
-            "B",
-            ExasolType::Varchar {
-                size: 10,
-                ascii: false,
-            },
-        ),
-        col(
-            "IRRELEVANT_COL",
-            ExasolType::Varchar {
-                size: 10,
-                ascii: false,
-            },
-        ),
+        col("A", ExasolType::varchar(10)),
+        col("B", ExasolType::varchar(10)),
+        col("IRRELEVANT_COL", ExasolType::varchar(10)),
     ];
     let sg_req = serde_json::json!({
         "selectList": [
@@ -2576,7 +2480,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
              "arguments": [table_col("T", "B")]},
         ],
     });
-    let sg_col_types = column_types(&sg_all, &[]);
+    let sg_col_types = column_types(&sg_all);
     let (sproj, stypes) = split_projection(&referenced_column_projection(&sg_req, &sg_col_types));
     assert_eq!(
         proj_names(&sproj),
@@ -2616,27 +2520,9 @@ fn fallback_projection_narrows_to_referenced_columns() {
 #[test]
 fn no_select_list_wire_forms_all_keep_the_full_base_row() {
     let all_cols = vec![
-        (
-            "GK".to_string(),
-            ExasolType::Varchar {
-                size: 10,
-                ascii: false,
-            },
-        ),
-        (
-            "FCOL".to_string(),
-            ExasolType::Decimal {
-                precision: 18,
-                scale: 0,
-            },
-        ),
-        (
-            "IRRELEVANT_COL".to_string(),
-            ExasolType::Varchar {
-                size: 10,
-                ascii: false,
-            },
-        ),
+        ("GK".to_string(), ExasolType::varchar(10)),
+        ("FCOL".to_string(), ExasolType::decimal(18, 0)),
+        ("IRRELEVANT_COL".to_string(), ExasolType::varchar(10)),
     ];
     let filter = predicate_equal(table_col("T", "FCOL"), num_lit(5));
     let full_row: Vec<ProjectionItem> = all_cols
@@ -2653,7 +2539,7 @@ fn no_select_list_wire_forms_all_keep_the_full_base_row() {
     ] {
         let (proj, types) = split_projection(&referenced_column_projection(
             &req,
-            &column_types(&all_cols, &[]),
+            &column_types(&all_cols),
         ));
         assert_eq!(
             proj, full_row,
@@ -2671,27 +2557,9 @@ fn no_select_list_wire_forms_all_keep_the_full_base_row() {
 #[test]
 fn referenced_column_projection_narrows_with_a_real_select_list() {
     let all_cols = vec![
-        (
-            "GK".to_string(),
-            ExasolType::Varchar {
-                size: 10,
-                ascii: false,
-            },
-        ),
-        (
-            "FCOL".to_string(),
-            ExasolType::Decimal {
-                precision: 18,
-                scale: 0,
-            },
-        ),
-        (
-            "IRRELEVANT_COL".to_string(),
-            ExasolType::Varchar {
-                size: 10,
-                ascii: false,
-            },
-        ),
+        ("GK".to_string(), ExasolType::varchar(10)),
+        ("FCOL".to_string(), ExasolType::decimal(18, 0)),
+        ("IRRELEVANT_COL".to_string(), ExasolType::varchar(10)),
     ];
     let req = serde_json::json!({
         "selectList": [table_col("T", "GK")],
@@ -2700,7 +2568,7 @@ fn referenced_column_projection_narrows_with_a_real_select_list() {
 
     let (proj, types) = split_projection(&referenced_column_projection(
         &req,
-        &column_types(&all_cols, &[]),
+        &column_types(&all_cols),
     ));
     assert_eq!(
         proj,
@@ -2709,36 +2577,15 @@ fn referenced_column_projection_narrows_with_a_real_select_list() {
     );
     assert_eq!(
         types,
-        vec![
-            ExasolType::Varchar {
-                size: 10,
-                ascii: false
-            },
-            ExasolType::Decimal {
-                precision: 18,
-                scale: 0
-            }
-        ]
+        vec![ExasolType::varchar(10), ExasolType::decimal(18, 0)]
     );
 }
 
 #[test]
 fn referenced_column_projection_falls_back_to_first_column() {
     let all_cols = vec![
-        (
-            "A".to_string(),
-            ExasolType::Decimal {
-                precision: 18,
-                scale: 0,
-            },
-        ),
-        (
-            "B".to_string(),
-            ExasolType::Varchar {
-                size: 10,
-                ascii: false,
-            },
-        ),
+        ("A".to_string(), ExasolType::decimal(18, 0)),
+        ("B".to_string(), ExasolType::varchar(10)),
     ];
     let req = serde_json::json!({
         "selectList": [num_lit(1)],
@@ -2747,20 +2594,14 @@ fn referenced_column_projection_falls_back_to_first_column() {
     });
     let (proj, types) = split_projection(&referenced_column_projection(
         &req,
-        &column_types(&all_cols, &[]),
+        &column_types(&all_cols),
     ));
     assert_eq!(
         proj,
         vec![ProjectionItem::from("A")],
         "no referenced source column ⇒ exactly one column, the first of all_cols"
     );
-    assert_eq!(
-        types,
-        vec![ExasolType::Decimal {
-            precision: 18,
-            scale: 0
-        }]
-    );
+    assert_eq!(types, vec![ExasolType::decimal(18, 0)]);
 }
 
 #[test]
@@ -2820,13 +2661,7 @@ fn qualified_single_table_untranslatable_select_item_is_hard_error() {
             {"type": "no_such_node_type_in_either_dialect"},
         ],
     });
-    let col_types = vec![(
-        "ID".to_string(),
-        ExasolType::Decimal {
-            precision: 20,
-            scale: 0,
-        },
-    )];
+    let col_types = vec![("ID".to_string(), ExasolType::decimal(20, 0))];
     let base = CommonScanSpec {
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
@@ -2839,7 +2674,7 @@ fn qualified_single_table_untranslatable_select_item_is_hard_error() {
         &base,
         None,
         &shards,
-        &column_types(&col_types, &[]),
+        &column_types(&col_types),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         None,
@@ -2865,13 +2700,7 @@ fn qualified_single_table_wrapper_projects_tstz_literal_converted_to_session_zon
             {"type": "timestamp", "withLocalTimeZone": true},
         ],
     });
-    let col_types = vec![(
-        "ID".to_string(),
-        ExasolType::Decimal {
-            precision: 20,
-            scale: 0,
-        },
-    )];
+    let col_types = vec![("ID".to_string(), ExasolType::decimal(20, 0))];
     let base = CommonScanSpec {
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
@@ -2884,7 +2713,7 @@ fn qualified_single_table_wrapper_projects_tstz_literal_converted_to_session_zon
         &base,
         None,
         &shards,
-        &column_types(&col_types, &[]),
+        &column_types(&col_types),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         None,
@@ -2923,17 +2752,14 @@ fn declined_filter_fan_out_spec() -> ScanSpec {
 
 fn declined_filter_proj_types() -> Vec<ExasolType> {
     vec![
-        ExasolType::Decimal {
-            precision: 20,
-            scale: 0,
-        },
+        ExasolType::decimal(20, 0),
         ExasolType::Timestamp { precision: None },
     ]
 }
 
 fn declined_filter_column_types() -> ColumnTypes {
     let types = declined_filter_proj_types();
-    column_types(&[("ID", types[0]), ("C_TS", types[1])], &[])
+    column_types(&[("ID", types[0]), ("C_TS", types[1])])
 }
 
 fn declined_filter_wrapper_sql(
@@ -2961,10 +2787,7 @@ fn fan_out_projection_rejects_misaligned_proj_types() {
     let spec = declined_filter_fan_out_spec();
     let columns = vec![ProjectedColumn {
         item: ProjectionItem::from("ID"),
-        exa_type: ExasolType::Decimal {
-            precision: 20,
-            scale: 0,
-        },
+        exa_type: ExasolType::decimal(20, 0),
     }];
 
     let err = FanOutProjection::new(&spec, &columns, &declined_filter_column_types())
@@ -3131,25 +2954,10 @@ fn single_table_wrapper_errors_when_declined_predicate_renders_in_neither_dialec
 #[test]
 fn outer_wrapper_renders_qualified_expression_sort_key() {
     let legs = single_scan_legs("T");
-    let cols_per_leg = vec![column_types(
-        &[
-            (
-                "ID",
-                ExasolType::Decimal {
-                    precision: 20,
-                    scale: 0,
-                },
-            ),
-            (
-                "NAME",
-                ExasolType::Varchar {
-                    size: 100,
-                    ascii: false,
-                },
-            ),
-        ],
-        &[],
-    )];
+    let cols_per_leg = vec![column_types(&[
+        ("ID", ExasolType::decimal(20, 0)),
+        ("NAME", ExasolType::varchar(100)),
+    ])];
     let pushdown_req = serde_json::json!({
         "selectList": [table_col("T", "ID")],
         "groupBy": [table_col("T", "ID")],
@@ -3191,23 +2999,11 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
 
 fn seam_trailing(pushdown_req: &Json, legs: &JoinLegs) -> Result<String, UdfError> {
     let cols = vec![
-        (
-            "ID".to_string(),
-            ExasolType::Decimal {
-                precision: 20,
-                scale: 0,
-            },
-        ),
-        (
-            "NAME".to_string(),
-            ExasolType::Varchar {
-                size: 100,
-                ascii: false,
-            },
-        ),
+        ("ID".to_string(), ExasolType::decimal(20, 0)),
+        ("NAME".to_string(), ExasolType::varchar(100)),
         ("SCORE".to_string(), ExasolType::DoublePrecision),
     ];
-    let cols_per_leg = vec![column_types(&cols, &[]); legs.leg_count()];
+    let cols_per_leg = vec![column_types(&cols); legs.leg_count()];
     outer_wrapper_clauses(pushdown_req, legs, &cols_per_leg).map(|clauses| clauses.trailing)
 }
 

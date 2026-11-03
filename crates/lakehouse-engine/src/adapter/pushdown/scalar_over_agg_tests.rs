@@ -107,19 +107,13 @@ fn fold_declared_type_overwrites_a_slot_created_by_a_nested_occurrence() {
         &mut plans,
         &mut types,
         plan_of(&agg("SUM", "X", false)),
-        Some(ExasolType::Decimal {
-            precision: 18,
-            scale: 2,
-        }),
+        Some(ExasolType::decimal(18, 2)),
     );
 
     assert_eq!(slot, 0);
     assert_eq!(
         types,
-        vec![ExasolType::Decimal {
-            precision: 18,
-            scale: 2
-        }],
+        vec![ExasolType::decimal(18, 2)],
         "a top-level occurrence's declared type must win over the nested default"
     );
 }
@@ -133,10 +127,7 @@ fn fold_keeps_a_declared_type_when_a_nested_occurrence_follows_it() {
         &mut plans,
         &mut types,
         plan_of(&agg("SUM", "X", false)),
-        Some(ExasolType::Decimal {
-            precision: 18,
-            scale: 2,
-        }),
+        Some(ExasolType::decimal(18, 2)),
     );
     fold_aggregate_plan(
         &mut plans,
@@ -145,13 +136,7 @@ fn fold_keeps_a_declared_type_when_a_nested_occurrence_follows_it() {
         None,
     );
 
-    assert_eq!(
-        types,
-        vec![ExasolType::Decimal {
-            precision: 18,
-            scale: 2
-        }]
-    );
+    assert_eq!(types, vec![ExasolType::decimal(18, 2)]);
 }
 
 #[test]
@@ -301,10 +286,7 @@ fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
         .expect("ROUND(SUM(X) / COUNT(*), 2) must classify as scalar-over-aggregate");
 
     let mut grouped_plans = vec![plan_of(&agg("COUNT", "L_ORDERKEY", false))];
-    let mut grouped_types = vec![ExasolType::Decimal {
-        precision: 18,
-        scale: 0,
-    }];
+    let mut grouped_types = vec![ExasolType::decimal(18, 0)];
     for plan in &nested {
         fold_aggregate_plan(&mut grouped_plans, &mut grouped_types, plan.clone(), None);
     }

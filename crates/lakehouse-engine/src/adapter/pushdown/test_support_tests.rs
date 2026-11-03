@@ -257,9 +257,13 @@ pub(crate) fn aliased_col(table: &str, alias: &str, name: &str) -> Json {
     table_column(table, Some(alias), name)
 }
 
-/// The per-column type map the planner builds for one table: each `(name, type)` is an involved
-/// column, binary where its `declared` field is.
-pub(crate) fn column_types<N: AsRef<str>>(
+/// The per-column type map the planner builds for one table that declares no binary column.
+pub(crate) fn column_types<N: AsRef<str>>(columns: &[(N, ExasolType)]) -> ColumnTypes {
+    declared_column_types(columns, &[])
+}
+
+/// [`column_types`], binary where a column's `declared` field is.
+pub(crate) fn declared_column_types<N: AsRef<str>>(
     columns: &[(N, ExasolType)],
     declared: &[LogicalField],
 ) -> ColumnTypes {
@@ -285,10 +289,7 @@ pub(crate) fn column_types_under<N: AsRef<str>>(
 /// The map `handle_pushdown` builds for `request`'s first involved table, which declares no binary
 /// column.
 pub(crate) fn first_table_column_types(request: &Json) -> ColumnTypes {
-    column_types(
-        &support::involved_columns(request, |tables| tables.first()).types,
-        &[],
-    )
+    column_types(&support::involved_columns(request, |tables| tables.first()).types)
 }
 
 /// `sides` with each side's map built, as the resolver builds it, from the columns `request`
@@ -443,32 +444,41 @@ pub(crate) fn split_projection(
         .unzip()
 }
 
+/// `project_columns` split into its items, its types, and its widening flag.
+pub(crate) fn project_split(
+    pushdown_req: &Json,
+    all_cols: &ColumnTypes,
+) -> Result<(Vec<ProjectionItem>, Vec<ExasolType>, bool), UdfError> {
+    let (projection, widened) = support::project_columns(pushdown_req, all_cols)?;
+    let (items, types) = split_projection(&projection);
+    Ok((items, types, widened))
+}
+
+/// [`project_split`] over `request`'s first involved table, as `handle_pushdown` projects it.
+pub(crate) fn project_first_table(
+    request: &Json,
+    pushdown_req: &Json,
+) -> Result<(Vec<ProjectionItem>, Vec<ExasolType>, bool), UdfError> {
+    project_split(pushdown_req, &first_table_column_types(request))
+}
+
 /// One value per `ExasolType` variant and per spelling its SQL rendering takes, so a consumer's
 /// pin covers every type a column, `EMITS` item, or `CAST` target can carry.
 pub(crate) const EXASOL_TYPE_SPELLINGS: [ExasolType; 12] = [
     ExasolType::Boolean,
-    ExasolType::Decimal {
-        precision: 18,
-        scale: 2,
-    },
+    ExasolType::decimal(18, 2),
     ExasolType::DoublePrecision,
     ExasolType::Date,
     ExasolType::Timestamp { precision: None },
-    ExasolType::Timestamp { precision: Some(6) },
+    ExasolType::timestamp(6),
     ExasolType::TimestampWithLocalTimeZone,
-    ExasolType::Char {
-        size: 20,
-        ascii: false,
-    },
+    ExasolType::char(20),
     ExasolType::Char {
         size: 3,
         ascii: true,
     },
     ExasolType::WIDEST_VARCHAR,
-    ExasolType::Varchar {
-        size: 10,
-        ascii: false,
-    },
+    ExasolType::varchar(10),
     ExasolType::Varchar {
         size: 2_000_000,
         ascii: true,
@@ -1232,7 +1242,7 @@ pub(crate) fn build_sql_for_fixture_n(
         &shards,
         &projected_columns(&proj_items, &proj_types),
         limit,
-        &column_types(&col_types, &[]),
+        &column_types(&col_types),
         None,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -1347,7 +1357,7 @@ pub(crate) fn build_row_sql_with_root(
         &shards,
         &projected_columns(&proj_items, &proj_types),
         None,
-        &column_types(&col_types, &[]),
+        &column_types(&col_types),
         None,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,

@@ -45,10 +45,28 @@ pub enum ExasolType {
 impl ExasolType {
     /// `VARCHAR(2000000)`, the widest `VARCHAR`: the declaration of an unbounded string column,
     /// and of the JSON text the scan writes for every type Exasol cannot hold.
-    pub const WIDEST_VARCHAR: Self = Self::Varchar {
-        size: MAX_VARCHAR_SIZE,
-        ascii: false,
-    };
+    pub const WIDEST_VARCHAR: Self = Self::varchar(MAX_VARCHAR_SIZE);
+
+    pub const fn decimal(precision: u8, scale: i8) -> Self {
+        Self::Decimal { precision, scale }
+    }
+
+    /// `TIMESTAMP(precision)`. The bare 8.x `TIMESTAMP` is `Timestamp { precision: None }`.
+    pub const fn timestamp(precision: u8) -> Self {
+        Self::Timestamp {
+            precision: Some(precision),
+        }
+    }
+
+    /// A UTF8 `CHAR(size)`.
+    pub const fn char(size: u32) -> Self {
+        Self::Char { size, ascii: false }
+    }
+
+    /// A UTF8 `VARCHAR(size)`.
+    pub const fn varchar(size: u32) -> Self {
+        Self::Varchar { size, ascii: false }
+    }
 
     /// `CHAR` or `VARCHAR`.
     pub fn is_character(&self) -> bool {

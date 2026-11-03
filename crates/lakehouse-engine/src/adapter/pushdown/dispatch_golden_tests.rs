@@ -25,20 +25,8 @@ fn base_col_types() -> Vec<(String, ExasolType)> {
     vec![
         ("REGION".to_string(), ExasolType::WIDEST_VARCHAR),
         ("NAME".to_string(), ExasolType::WIDEST_VARCHAR),
-        (
-            "AMOUNT".to_string(),
-            ExasolType::Decimal {
-                precision: 18,
-                scale: 2,
-            },
-        ),
-        (
-            "ID".to_string(),
-            ExasolType::Decimal {
-                precision: 20,
-                scale: 0,
-            },
-        ),
+        ("AMOUNT".to_string(), ExasolType::decimal(18, 2)),
+        ("ID".to_string(), ExasolType::decimal(20, 0)),
     ]
 }
 
@@ -138,13 +126,7 @@ fn row_scan_projection() -> (Vec<ProjectionItem>, Vec<ExasolType>) {
             ProjectionItem::Column("REGION".into()),
             ProjectionItem::Column("AMOUNT".into()),
         ],
-        vec![
-            ExasolType::WIDEST_VARCHAR,
-            ExasolType::Decimal {
-                precision: 18,
-                scale: 2,
-            },
-        ],
+        vec![ExasolType::WIDEST_VARCHAR, ExasolType::decimal(18, 2)],
     )
 }
 
@@ -281,7 +263,7 @@ fn dispatch_sql(
 fn dispatch_sql_widened(request: &Json) -> String {
     let pushdown_req = pd(request);
     let (projection, widened) =
-        super::support::project_columns(&pushdown_req, &column_types(&base_col_types(), &[]))
+        super::support::project_columns(&pushdown_req, &column_types(&base_col_types()))
             .expect("the fixture must project");
     assert!(
         widened,
@@ -292,7 +274,7 @@ fn dispatch_sql_widened(request: &Json) -> String {
         &pushdown_req,
         projection,
         widened,
-        &column_types(&base_col_types(), &[]),
+        &column_types(&base_col_types()),
         None,
         None,
         None,
@@ -336,7 +318,7 @@ fn dispatch_sql_with_pushdown_req(
         pushdown_req,
         projected_columns(&proj_cols, &proj_types),
         false,
-        &column_types(&col_types, &[]),
+        &column_types(&col_types),
         filter,
         None,
         limit,
@@ -370,8 +352,8 @@ fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[ExasolT
         &pushdown_req,
         &projected_columns(proj_cols, proj_types),
         false,
-        &column_types(&base_col_types(), &[]),
-        &EmptyRelation::single_scan(request, &column_types(&base_col_types(), &[])),
+        &column_types(&base_col_types()),
+        &EmptyRelation::single_scan(request, &column_types(&base_col_types())),
     )
     .expect("empty_result_sql must succeed for this golden fixture");
     result["sql"]
@@ -529,7 +511,7 @@ fn empty_unmergeable_having_matches_group_by_wrapper_golden() {
     assert_eq!(actual, expected);
 
     let pushdown_req = pd(&request);
-    let shape = classify_request_shape(&pushdown_req, &column_types(&base_col_types(), &[]));
+    let shape = classify_request_shape(&pushdown_req, &column_types(&base_col_types()));
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
         "an unmergeable HAVING must route to GroupByWrapper, not stay classified as \
@@ -686,13 +668,7 @@ fn aliased_multi_count_distinct_fallback_qualifies_lhs_t0_regardless_of_alias_pr
 
 fn all_agg_kinds_col_types() -> Vec<(String, ExasolType)> {
     vec![
-        (
-            "ID".to_string(),
-            ExasolType::Decimal {
-                precision: 20,
-                scale: 0,
-            },
-        ),
+        ("ID".to_string(), ExasolType::decimal(20, 0)),
         ("SCORE".to_string(), ExasolType::DoublePrecision),
         ("TS".to_string(), ExasolType::Timestamp { precision: None }),
         ("REGION".to_string(), ExasolType::WIDEST_VARCHAR),

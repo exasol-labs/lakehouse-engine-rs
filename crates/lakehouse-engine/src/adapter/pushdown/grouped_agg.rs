@@ -412,10 +412,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     sql
 }
 
-const PARTIAL_COUNT_TYPE: ExasolType = ExasolType::Decimal {
-    precision: 20,
-    scale: 0,
-};
+const PARTIAL_COUNT_TYPE: ExasolType = ExasolType::decimal(20, 0);
 
 /// Counts are DECIMAL(20,0); SUM widens DECIMAL(p,s) to DECIMAL(36,s) against
 /// overflow; AVG and stat sums are DOUBLE PRECISION (reconstructed in floating
