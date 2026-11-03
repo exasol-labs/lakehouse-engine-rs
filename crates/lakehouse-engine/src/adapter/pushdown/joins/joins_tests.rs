@@ -163,18 +163,14 @@ pub(super) fn nq3_join_request() -> Json {
 /// unaliased occurrence (mirrors the live `EXPLAIN VIRTUAL` capture for #361).
 pub(super) fn self_join_request(leg_aliases: &[Option<&str>]) -> Json {
     fn leaf(alias: Option<&str>) -> Json {
-        let mut leaf = serde_json::json!(table_ref("FACT_ORDERS"));
+        let mut leaf = table_ref("FACT_ORDERS");
         if let Some(alias) = alias {
             leaf["alias"] = Json::String(alias.to_string());
         }
         leaf
     }
     fn order_key(alias: Option<&str>) -> Json {
-        let mut column = table_col("FACT_ORDERS", "O_ORDERKEY");
-        if let Some(alias) = alias {
-            column["tableAlias"] = Json::String(alias.to_string());
-        }
-        column
+        table_column("FACT_ORDERS", alias, "O_ORDERKEY")
     }
 
     let mut from = leaf(leg_aliases[0]);

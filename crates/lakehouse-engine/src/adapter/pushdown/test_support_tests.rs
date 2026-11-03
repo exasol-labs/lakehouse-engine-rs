@@ -10,6 +10,7 @@ use lakehouse_catalog::{
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use vs_expression::ColumnNode;
 
 type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
@@ -243,15 +244,24 @@ pub(crate) fn glue_column(name: &str, hive_type: &str) -> CatalogColumn {
 }
 
 pub(crate) fn col(name: &str) -> Json {
-    serde_json::json!({"type": "column", "name": name})
+    ColumnNode::named(name).to_json()
 }
 
 pub(crate) fn table_col(table: &str, name: &str) -> Json {
-    serde_json::json!({"type": "column", "name": name, "tableName": table})
+    table_column(table, None, name)
 }
 
 pub(crate) fn aliased_col(table: &str, alias: &str, name: &str) -> Json {
-    serde_json::json!({"type": "column", "name": name, "tableName": table, "tableAlias": alias})
+    table_column(table, Some(alias), name)
+}
+
+pub(crate) fn table_column(table: &str, alias: Option<&str>, name: &str) -> Json {
+    ColumnNode {
+        name,
+        table_name: Some(table),
+        table_alias: alias,
+    }
+    .to_json()
 }
 
 pub(crate) fn table_ref(name: &str) -> Json {

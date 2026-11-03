@@ -474,14 +474,12 @@ fn column_exa_type<'t>(node: &Json, col_types: &'t ColumnTypes) -> Option<&'t st
 }
 
 fn guard_like_subject(like_node: &Json, col_types: &ColumnTypes) -> Option<Json> {
-    let subject = like_node.get("expression");
-
-    let is_bare_column =
-        subject.and_then(|s| s.get("type")).and_then(|t| t.as_str()) == Some("column");
-    if !is_bare_column {
+    let Some(subject) = like_node
+        .get("expression")
+        .filter(|subject| ColumnNode::parse(subject).is_some())
+    else {
         return Some(like_node.clone());
-    }
-    let subject = subject.expect("is_bare_column implies expression is present");
+    };
 
     match column_exa_type(subject, col_types).map(classify_exa_type) {
         Some(ExaTypeClass::Character) => Some(like_node.clone()),

@@ -34,7 +34,7 @@ fn plain_single_table_request_is_not_a_join() {
 #[test]
 fn from_table_node_is_not_a_join() {
     let mut request = nq4_request();
-    request["pushdownRequest"]["from"] = serde_json::json!(table_ref("LINEITEM"));
+    request["pushdownRequest"]["from"] = table_ref("LINEITEM");
     let shape = detect_join(&request, &pd(&request)).expect("not a join");
     assert_eq!(shape, JoinShape::NotAJoin);
 }
