@@ -14,8 +14,8 @@ use lakehouse_engine::adapter::pushdown::{
     AggregateMergeInputs, build_scan_driving_sql, detect_aggregates, ordinary_plans,
 };
 use lakehouse_engine::scan::spec::{
-    AggKind, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, JoinType, ProjectionItem,
-    ScanSpec, ScanStorage, SortKey, StorageBackend, StorageProps,
+    AggKind, ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, JoinType,
+    ProjectionItem, ScanSpec, ScanStorage, SortKey, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, session_config_for_spec,
@@ -529,7 +529,9 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         logical_schema: Vec::new(),
         name_mapping: Vec::new(),
         join_type: JoinType::Inner,
-        condition: r#"("C_CUSTKEY" = "O_CUSTKEY")"#.to_string(),
+        fact_alias: "LHS_T1".to_string(),
+        dimension_alias: "LHS_T0".to_string(),
+        condition: r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#.to_string(),
         post_join_limit: None,
         post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
@@ -540,8 +542,8 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         common: CommonScanSpec {
             table_root: "s3://warehouse/lh/orders".to_string(),
             projection: vec![
-                ProjectionItem::Column("C_NAME".into()),
-                ProjectionItem::Column("O_ORDERDATE".into()),
+                ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "C_NAME")),
+                ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "O_ORDERDATE")),
             ],
             join: Some(join),
             storage: ScanStorage::Inline(test_storage()),
@@ -582,7 +584,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         "no materializing SELECT * wrapper over the broadcast fan-out:\n{sql}"
     );
     assert!(
-        sql.contains(r#"EMITS ("C_NAME" VARCHAR(100), "O_ORDERDATE" DATE)"#),
+        sql.contains(r#"EMITS ("LHS_T0_C_NAME" VARCHAR(100), "LHS_T1_O_ORDERDATE" DATE)"#),
         "the EMITS clause must span both tables in projection order:\n{sql}"
     );
     // The common blob is a single-quoted SQL literal, so JSON keys keep raw double quotes.
@@ -595,7 +597,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         "the dimension side's file list must ride in the common blob:\n{sql}"
     );
     assert!(
-        sql.contains(r#"(\"C_CUSTKEY\" = \"O_CUSTKEY\")"#),
+        sql.contains(r#"(\"LHS_T0\".\"C_CUSTKEY\" = \"LHS_T1\".\"O_CUSTKEY\")"#),
         "the rendered join condition must ride in the common blob:\n{sql}"
     );
     assert!(

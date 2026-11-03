@@ -4,6 +4,7 @@ use std::fmt;
 
 use super::super::support::walk_column_nodes;
 use super::planning::{DetectedJoin, JoinLeaf};
+use crate::scan::spec::relation_alias;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ColumnLeg {
@@ -134,7 +135,7 @@ impl JoinLegs {
     }
 
     pub(super) fn leg_alias(&self, leg: usize) -> String {
-        format!("LHS_T{leg}")
+        relation_alias(leg)
     }
 
     /// The sole answer to leg identity; no other module reads `tableName` for it.
@@ -201,9 +202,28 @@ impl JoinLegs {
         referenced.legs.into_iter().next()
     }
 
+    /// [`Self::qualify`] for a path that has no unqualified rendering to fall back on: a
+    /// [`ColumnLeg::NoLeg`] column fails like an [`ColumnLeg::Unattributable`] one, since
+    /// binding it to either leg could return the other leg's values. Like [`Self::qualify`], it
+    /// takes a raw request tree, never its own output.
+    pub(super) fn qualify_every_column(&self, expr: &Json) -> Result<Json, UnattributableColumn> {
+        let mut unplaced = None;
+        walk_column_nodes(expr, &mut |column| {
+            if unplaced.is_none() && self.resolve_column(column) == ColumnLeg::NoLeg {
+                unplaced = Some(UnattributableColumn::of(column));
+            }
+        });
+        match unplaced {
+            Some(column) => Err(column),
+            None => self.qualify(expr),
+        }
+    }
+
     /// Overwrites each `column`'s `tableAlias` with its leg's `LHS_T{leg}` alias, since a bare
     /// name is ambiguous once a table occurs on several legs. [`ColumnLeg::NoLeg`] columns are
-    /// left untouched.
+    /// left untouched. Apply it once, to a raw request tree: an `LHS_T{leg}` alias matches no
+    /// leaf alias, so re-qualifying a self-join's output fails as unattributable, or binds the
+    /// other leg when the query names its occurrences `LHS_T*`.
     pub(super) fn qualify(&self, expr: &Json) -> Result<Json, UnattributableColumn> {
         match expr {
             Json::Object(map) => {

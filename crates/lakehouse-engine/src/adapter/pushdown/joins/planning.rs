@@ -179,10 +179,10 @@ impl ResolvedJoinSide {
 /// Both sides stay fully resolved because the N-scan fallback scans both;
 /// `broadcast_eligible` only routes between the two builders and is never an error.
 ///
-/// A self-join ties, so the left side becomes the dimension; broadcasting a table against
-/// itself is a correct inner join, and the disjoint-column-name guard declines it anyway.
-/// An empty side has 0 bytes and is always the dimension; selection does not special-case
-/// it so role assignment stays total.
+/// Broadcasting a table against itself is a correct inner join: each occurrence is its own leg
+/// with its own relation alias. Each side's bytes are taken after its own leg-local pruning, so
+/// a self-join's occurrences can differ in size. An empty side has 0 bytes and is always the
+/// dimension; selection does not special-case it so role assignment stays total.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JoinSides {
     /// Larger side by bytes, sharded like the single-table scan.
@@ -190,24 +190,35 @@ pub(crate) struct JoinSides {
     /// Smaller side by bytes, the broadcast candidate.
     pub dimension: ResolvedJoinSide,
     pub broadcast_eligible: bool,
+    /// The dimension's leg in FROM-tree order, which names its relation alias.
+    pub dimension_leg: usize,
 }
 
-/// On an exact byte tie `a` becomes the dimension (arbitrary but deterministic).
+impl JoinSides {
+    /// Broadcast is two-leg only, so the fact is the leg the dimension is not.
+    pub(crate) fn fact_leg(&self) -> usize {
+        1 - self.dimension_leg
+    }
+}
+
+/// `a` is leg 0 and `b` leg 1. On an exact byte tie `a`, the first leg in FROM-tree order,
+/// becomes the dimension, so the choice of the sharded occurrence is deterministic.
 pub(super) fn select_broadcast_sides(
     a: ResolvedJoinSide,
     b: ResolvedJoinSide,
     join_broadcast_max_bytes: u64,
 ) -> JoinSides {
-    let (dimension, fact) = if a.total_bytes <= b.total_bytes {
-        (a, b)
+    let (dimension, fact, dimension_leg) = if a.total_bytes <= b.total_bytes {
+        (a, b, 0)
     } else {
-        (b, a)
+        (b, a, 1)
     };
     let broadcast_eligible = dimension.total_bytes <= join_broadcast_max_bytes;
     JoinSides {
         fact,
         dimension,
         broadcast_eligible,
+        dimension_leg,
     }
 }
 
@@ -250,15 +261,6 @@ pub(super) fn involved_table<'r>(request: &'r Json, table_name: &str) -> Involve
     })
 }
 
-/// `true` when no column name appears on both sides. The translator renders bare column
-/// references, which resolve unambiguously against the combined schema only then; a
-/// collision declines cleanly to the fallback. Both inputs are already uppercased.
-pub(super) fn disjoint_schema_guard(left: &[(String, String)], right: &[(String, String)]) -> bool {
-    let left_names: std::collections::HashSet<&str> =
-        left.iter().map(|(n, _)| n.as_str()).collect();
-    !right.iter().any(|(n, _)| left_names.contains(n.as_str()))
-}
-
 /// The broadcast in-UDF join renders only projection, filter, and join condition, so any
 /// aggregation must be executed by Exasol over the materialized join.
 fn carries_aggregation_clause(pushdown_req: &Json) -> bool {
@@ -283,7 +285,7 @@ fn carries_aggregation_clause(pushdown_req: &Json) -> bool {
 }
 
 /// [`Self::ExasolPostProcessed`] falls through to the fallback, never an error.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub(in super::super) enum JoinWindowPlan {
     Unbounded,
     /// The cap composes: each shard truncates at `n` and the merge truncates again.
@@ -325,7 +327,7 @@ pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
     let mut keys = Vec::with_capacity(order_by.len());
     for element in order_by {
         // The wrapper binds ORDER BY against emitted columns and appends no hidden ones, so
-        // only a flagged bare column is servable.
+        // only a flagged plain column, never an expression, is servable.
         let Some(key) = parse_sort_key_element(element) else {
             return JoinWindowPlan::ExasolPostProcessed;
         };

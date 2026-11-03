@@ -2,14 +2,17 @@ use super::super::super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME};
 use super::super::ineligible_join_decline;
 use super::super::planning::{
     IneligibleJoinReason, JoinLeaf, JoinShape, classify_join_window, detect_join,
+    select_broadcast_sides,
 };
+use super::super::rendering::leg_binary_columns;
 use super::super::tests::{
-    detected_join, equi_condition, join_request, legs_from_leaves, nq3_join_request, resolved_side,
-    self_join_request, three_table_join_request, two_scan_tuning,
+    broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves,
+    nq3_join_request, resolved_side, self_join_request, three_table_join_request, two_leg_aliases,
+    two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
-use crate::scan::spec::{SortKey, StorageBackend, StorageProps};
+use crate::scan::spec::{ColumnRef, SortKey, StorageBackend, StorageProps};
 use vs_expression::{render_expression_exasol_safe, render_expression_safe};
 
 /// Q1 shape: `(SUPPLIER ⋈ NATION) ⋈ REGION`.
@@ -91,29 +94,6 @@ fn join_outside_contract_declined_safely() {
         ),
         "an outer join must classify Ineligible so the decline path is taken"
     );
-
-    let mut request = join_request(Json::Null, equi_condition());
-    for table_idx in [0, 1] {
-        request["involvedTables"][table_idx]["columns"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!({
-                "name": "SHARED_COL",
-                "dataType": {"type": "varchar", "size": 10}
-            }));
-    }
-    let detected = detected_join(&request);
-    let rendered = render_broadcast_join(
-        &request,
-        &pd(&request),
-        &detected,
-        &BinaryColumns::default(),
-    )
-    .expect("guard failure is a decline, not an error");
-    assert!(
-        rendered.is_none(),
-        "overlapping column names must decline broadcast rendering (Ok(None))"
-    );
 }
 
 #[test]
@@ -133,8 +113,7 @@ fn broadcast_join_declines_widened_projection() {
     let mut ok_req = request.clone();
     ok_req["pushdownRequest"]["selectListDataTypes"] =
         serde_json::json!([{"type": "varchar", "size": 100}]);
-    let (_, _, ok_widened) =
-        extract_join_projection(&ok_req, &pd(&ok_req), &detected).expect("projection derives");
+    let (_, _, ok_widened) = broadcast_projection(&ok_req);
     assert!(!ok_widened, "the control fixture must NOT widen");
     assert!(
         render_broadcast_join(&ok_req, &pd(&ok_req), &detected, &BinaryColumns::default())
@@ -146,8 +125,7 @@ fn broadcast_join_declines_widened_projection() {
     request["pushdownRequest"]["selectListDataTypes"] =
         serde_json::json!([{"type": "timestamp", "withLocalTimeZone": true}]);
     let pushdown_req = pd(&request);
-    let (projection, _, widened) =
-        extract_join_projection(&request, &pushdown_req, &detected).expect("projection derives");
+    let (projection, _, widened) = broadcast_projection(&request);
     assert!(
         widened && projection.len() == 4,
         "precondition: the one-item select list must widen to the 4-column \
@@ -260,7 +238,7 @@ fn broadcast_keeps_plan_and_casts_like_over_date_side_column() {
         .filter
         .expect("the rewritten LIKE must still render as a scan-spec filter");
     assert!(
-        filter.contains(r#"CAST("O_ORDERDATE" AS VARCHAR)"#) && filter.contains("LIKE"),
+        filter.contains(r#"CAST("LHS_T1"."O_ORDERDATE" AS VARCHAR)"#) && filter.contains("LIKE"),
         "the DATE subject must be rewrapped in CAST-to-VARCHAR form before the \
          LIKE: {filter}"
     );
@@ -446,21 +424,7 @@ fn colliding_columns_render_qualified_unified_wrapper_without_error() {
         &[("EVENTS", "lh.events"), ("LABELS", "lh.labels")],
     );
 
-    let left = involved_table_columns(&request, "EVENTS");
-    let right = involved_table_columns(&request, "LABELS");
-    assert!(!disjoint_schema_guard(&left, &right));
     let detected = detected_join(&request);
-    assert!(
-        render_broadcast_join(
-            &request,
-            &pd(&request),
-            &detected,
-            &BinaryColumns::default()
-        )
-        .unwrap()
-        .is_none()
-    );
-
     let sides = vec![
         resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 100)]),
         resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
@@ -1305,7 +1269,7 @@ fn join_like_over_varchar_side_column_pushes_down_unchanged() {
         .filter
         .expect("the LIKE conjunct must still render as a scan-spec filter");
     assert!(
-        filter.contains(r#""C_NAME" LIKE"#) && !filter.contains("CAST("),
+        filter.contains(r#""LHS_T0"."C_NAME" LIKE"#) && !filter.contains("CAST("),
         "a VARCHAR LIKE subject must render unchanged, with no spurious CAST: {filter}"
     );
 
@@ -1356,9 +1320,9 @@ fn join_decimal_stringification_renders_trimmed_at_both_join_sites() {
         .filter
         .expect("the rewritten filter must still render as a scan-spec filter");
     assert!(
-        filter.contains(trim_wrapper),
+        filter.contains(&format!(r#"{trim_wrapper}"LHS_T1"."O_TOTALPRICE""#)),
         "the broadcast filter must carry the decimal_to_varchar_exasol trim \
-         form: {filter}"
+         form over the ORDERS leg's column: {filter}"
     );
 
     let (legs, _outer) = n_scan_legs_and_outer_where(&request);
@@ -1805,29 +1769,23 @@ fn golden_broadcast_join_sql_unchanged() {
         fact,
         dimension,
         broadcast_eligible: true,
+        dimension_leg: 1,
     };
     let rendered = RenderedJoinPushdown {
-        condition: r#"("L_ORDERKEY" = "O_ORDERKEY")"#.to_string(),
-        filter: Some(r#"("L_QUANTITY" > 5)"#.to_string()),
-        projection: vec![
-            ProjectionItem::Column("L_ORDERKEY".to_string()),
-            ProjectionItem::Column("O_ORDERDATE".to_string()),
-        ],
+        condition: r#"("LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY")"#.to_string(),
+        filter: Some(r#"("LHS_T0"."L_QUANTITY" > 5)"#.to_string()),
+        projection: vec![lineitem_column("L_ORDERKEY"), orders_column("O_ORDERDATE")],
         projection_types: vec!["DECIMAL(20,0)".to_string(), "DATE".to_string()],
+        relation_aliases: two_leg_aliases(),
+        window: JoinWindowPlan::Unbounded,
     };
-    let actual = build_broadcast_join_sql(
-        &sides,
-        &rendered,
-        JoinWindowPlan::Unbounded,
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("selecting the wire storage must succeed")
-    .expect("an unbounded broadcast join must build");
+    let actual =
+        build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE")
+            .expect("selecting the wire storage must succeed")
+            .expect("an unbounded broadcast join must build");
     assert_eq!(
         actual,
-        r#"SELECT SCAN('{"table_root":"s3://warehouse/lh/lineitem","projection":["L_ORDERKEY","O_ORDERDATE"],"filter":"(\"L_QUANTITY\" > 5)","logical_schema":[{"field_id":1,"name":"LINEITEM_KEY","arrow_type":"int64","nullable":false}],"join":{"table_root":"s3://warehouse/lh/orders","files":[["s3://w/o-0.parquet",10]],"logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"join_type":"inner","condition":"(\"L_ORDERKEY\" = \"O_ORDERKEY\")","storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}}},"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/l-0.parquet",1000]]') EMITS ("L_ORDERKEY" DECIMAL(20,0), "O_ORDERDATE" DATE)"#
+        r#"SELECT SCAN('{"table_root":"s3://warehouse/lh/lineitem","projection":[{"relation":"LHS_T0","name":"L_ORDERKEY"},{"relation":"LHS_T1","name":"O_ORDERDATE"}],"filter":"(\"LHS_T0\".\"L_QUANTITY\" > 5)","logical_schema":[{"field_id":1,"name":"LINEITEM_KEY","arrow_type":"int64","nullable":false}],"join":{"table_root":"s3://warehouse/lh/orders","files":[["s3://w/o-0.parquet",10]],"logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"join_type":"inner","fact_alias":"LHS_T0","dimension_alias":"LHS_T1","condition":"(\"LHS_T0\".\"L_ORDERKEY\" = \"LHS_T1\".\"O_ORDERKEY\")","storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}}},"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/l-0.parquet",1000]]') EMITS ("LHS_T0_L_ORDERKEY" DECIMAL(20,0), "LHS_T1_O_ORDERDATE" DATE)"#
     );
 }
 
@@ -1855,17 +1813,19 @@ fn broadcast_carries_each_sides_own_storage() {
         fact: fact.clone(),
         dimension: dimension.clone(),
         broadcast_eligible: true,
+        dimension_leg: 1,
     };
     let rendered = RenderedJoinPushdown {
-        condition: r#"("L_ORDERKEY" = "O_ORDERKEY")"#.to_string(),
+        condition: r#"("LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY")"#.to_string(),
         filter: None,
-        projection: vec![ProjectionItem::Column("L_ORDERKEY".to_string())],
+        projection: vec![lineitem_column("L_ORDERKEY")],
         projection_types: vec!["DECIMAL(20,0)".to_string()],
+        relation_aliases: two_leg_aliases(),
+        window: JoinWindowPlan::Unbounded,
     };
     let sql = build_broadcast_join_sql(
         &sides,
         &rendered,
-        JoinWindowPlan::Unbounded,
         &JoinScanRequestConfig {
             connection: &crate::adapter::pushdown::test_support::TEST_VENDED_CONNECTION,
             ..two_scan_tuning()
@@ -1909,48 +1869,53 @@ fn broadcast_carries_each_sides_own_storage() {
     );
 }
 
+/// LINEITEM is leg 0 and the fact, ORDERS leg 1 and the dimension, in every fixture below.
+fn lineitem_column(name: &str) -> ProjectionItem {
+    ProjectionItem::Column(ColumnRef::qualified("LHS_T0", name))
+}
+
+fn orders_column(name: &str) -> ProjectionItem {
+    ProjectionItem::Column(ColumnRef::qualified("LHS_T1", name))
+}
+
 /// A single fact file means a single shard, so any ` FROM (` in the result is the
 /// ordering wrapper's.
-fn broadcast_sql_projecting(projection: &[(&str, &str)], window: JoinWindowPlan) -> Option<String> {
+fn broadcast_sql_projecting(
+    projection: &[(ProjectionItem, &str)],
+    window: JoinWindowPlan,
+) -> Option<String> {
     let sides = JoinSides {
         fact: resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]),
         dimension: resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]),
         broadcast_eligible: true,
+        dimension_leg: 1,
     };
     let rendered = RenderedJoinPushdown {
-        condition: r#"("L_ORDERKEY" = "O_ORDERKEY")"#.to_string(),
+        condition: r#"("LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY")"#.to_string(),
         filter: None,
-        projection: projection
-            .iter()
-            .map(|(column, _)| ProjectionItem::Column((*column).to_string()))
-            .collect(),
+        projection: projection.iter().map(|(item, _)| item.clone()).collect(),
         projection_types: projection
             .iter()
             .map(|(_, exasol_type)| (*exasol_type).to_string())
             .collect(),
-    };
-    build_broadcast_join_sql(
-        &sides,
-        &rendered,
+        relation_aliases: two_leg_aliases(),
         window,
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("selecting the wire storage must succeed")
+    };
+    build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE")
+        .expect("selecting the wire storage must succeed")
 }
 
 fn broadcast_window_sql(window: JoinWindowPlan) -> Option<String> {
-    broadcast_sql_projecting(&[("L_ORDERKEY", "DECIMAL(20,0)")], window)
+    broadcast_sql_projecting(&[(lineitem_column("L_ORDERKEY"), "DECIMAL(20,0)")], window)
 }
 
 fn broadcast_common_blob(sql: &str) -> Json {
     serde_json::from_str(common_arg_literal(sql)).expect("common blob is valid JSON")
 }
 
-fn ascending_key(column: &str) -> ParsedSortKey {
+fn ascending_key(relation: &str, column: &str) -> ParsedSortKey {
     ParsedSortKey::Column(SortKey {
-        column: column.to_string(),
+        column: ColumnRef::qualified(relation, column),
         ascending: true,
         nulls_last: true,
     })
@@ -1999,7 +1964,7 @@ fn broadcast_bare_limit_caps_each_shard_and_the_merge() {
         "a bare-limit broadcast plan wraps nothing: {capped}"
     );
 
-    let condition = r#""condition":"(\"L_ORDERKEY\" = \"O_ORDERKEY\")""#;
+    let condition = r#""condition":"(\"LHS_T0\".\"L_ORDERKEY\" = \"LHS_T1\".\"O_ORDERKEY\")""#;
     assert_eq!(
         capped,
         format!(
@@ -2013,7 +1978,7 @@ fn broadcast_bare_limit_caps_each_shard_and_the_merge() {
 #[test]
 fn broadcast_ordered_zero_offset_limit_bounds_each_shard_to_its_top_n() {
     let sql = broadcast_window_sql(JoinWindowPlan::Ordered {
-        keys: vec![ascending_key("L_ORDERKEY")],
+        keys: vec![ascending_key("LHS_T0", "L_ORDERKEY")],
         limit: Some(5),
         offset: 0,
     })
@@ -2022,7 +1987,11 @@ fn broadcast_ordered_zero_offset_limit_bounds_each_shard_to_its_top_n() {
     let common = broadcast_common_blob(&sql);
     assert_eq!(
         common["join"]["post_join_order_by"],
-        serde_json::json!([{"column": "L_ORDERKEY", "ascending": true, "nulls_last": true}]),
+        serde_json::json!([{
+            "column": {"relation": "LHS_T0", "name": "L_ORDERKEY"},
+            "ascending": true,
+            "nulls_last": true,
+        }]),
         "the join block must carry the sort key with its flags: {common}"
     );
     assert_eq!(
@@ -2040,7 +2009,7 @@ fn broadcast_ordered_zero_offset_limit_bounds_each_shard_to_its_top_n() {
     );
 
     assert!(
-        sql.ends_with(r#") ORDER BY "L_ORDERKEY" ASC NULLS LAST LIMIT 5"#),
+        sql.ends_with(r#") ORDER BY "LHS_T0_L_ORDERKEY" ASC NULLS LAST LIMIT 5"#),
         "the wrapper must still carry the global ordering and window: {sql}"
     );
     assert_eq!(
@@ -2053,15 +2022,18 @@ fn broadcast_ordered_zero_offset_limit_bounds_each_shard_to_its_top_n() {
 #[test]
 fn broadcast_ordered_bounds_shards_with_keys_from_either_side() {
     let sql = broadcast_sql_projecting(
-        &[("L_ORDERKEY", "DECIMAL(20,0)"), ("O_ORDERDATE", "DATE")],
+        &[
+            (lineitem_column("L_ORDERKEY"), "DECIMAL(20,0)"),
+            (orders_column("O_ORDERDATE"), "DATE"),
+        ],
         JoinWindowPlan::Ordered {
             keys: vec![
                 ParsedSortKey::Column(SortKey {
-                    column: "O_ORDERDATE".to_string(),
+                    column: ColumnRef::qualified("LHS_T1", "O_ORDERDATE"),
                     ascending: false,
                     nulls_last: false,
                 }),
-                ascending_key("L_ORDERKEY"),
+                ascending_key("LHS_T0", "L_ORDERKEY"),
             ],
             limit: Some(5),
             offset: 0,
@@ -2073,8 +2045,8 @@ fn broadcast_ordered_bounds_shards_with_keys_from_either_side() {
     assert_eq!(
         common["join"]["post_join_order_by"],
         serde_json::json!([
-            {"column": "O_ORDERDATE", "ascending": false, "nulls_last": false},
-            {"column": "L_ORDERKEY", "ascending": true, "nulls_last": true},
+            {"column": {"relation": "LHS_T1", "name": "O_ORDERDATE"}, "ascending": false, "nulls_last": false},
+            {"column": {"relation": "LHS_T0", "name": "L_ORDERKEY"}, "ascending": true, "nulls_last": true},
         ]),
         "the join block must carry both keys, in pushed order, each with its own flags: {common}"
     );
@@ -2096,11 +2068,16 @@ fn broadcast_zero_offset_request_takes_the_bounded_path() {
     no_offset_key["pushdownRequest"]["limit"] = serde_json::json!({"numElements": 5});
 
     let build = |request: &Json| {
-        broadcast_sql_projecting(
-            &[("O_ORDERDATE", "DATE")],
-            classify_join_window(&pd(request)),
+        let rendered = render_broadcast_join(
+            request,
+            &pd(request),
+            &detected_join(request),
+            &BinaryColumns::default(),
         )
-        .expect("the ordered key is a member of the broadcast projection")
+        .expect("renders")
+        .expect("an ordered equi-join renders");
+        broadcast_sql_projecting(&[(orders_column("O_ORDERDATE"), "DATE")], rendered.window)
+            .expect("the ordered key is a member of the broadcast projection")
     };
 
     let sql_zero_offset = build(&zero_offset);
@@ -2121,14 +2098,14 @@ fn broadcast_zero_offset_request_takes_the_bounded_path() {
 #[test]
 fn broadcast_ordered_without_limit_wraps_fan_out_with_no_window() {
     let sql = broadcast_window_sql(JoinWindowPlan::Ordered {
-        keys: vec![ascending_key("L_ORDERKEY")],
+        keys: vec![ascending_key("LHS_T0", "L_ORDERKEY")],
         limit: None,
         offset: 0,
     })
     .expect("a projected bare-column ordering stays broadcast-eligible");
 
     assert!(
-        sql.ends_with(r#") ORDER BY "L_ORDERKEY" ASC NULLS LAST"#),
+        sql.ends_with(r#") ORDER BY "LHS_T0_L_ORDERKEY" ASC NULLS LAST"#),
         "an ORDER BY without a window must end at the ordering: {sql}"
     );
     assert_shards_carry_no_window(&sql);
@@ -2137,14 +2114,14 @@ fn broadcast_ordered_without_limit_wraps_fan_out_with_no_window() {
 #[test]
 fn broadcast_ordered_renders_limit_and_offset_on_the_wrapper_only() {
     let sql = broadcast_window_sql(JoinWindowPlan::Ordered {
-        keys: vec![ascending_key("L_ORDERKEY")],
+        keys: vec![ascending_key("LHS_T0", "L_ORDERKEY")],
         limit: Some(5),
         offset: 3,
     })
     .expect("a projected bare-column ordering stays broadcast-eligible");
 
     assert!(
-        sql.ends_with(r#") ORDER BY "L_ORDERKEY" ASC NULLS LAST LIMIT 5 OFFSET 3"#),
+        sql.ends_with(r#") ORDER BY "LHS_T0_L_ORDERKEY" ASC NULLS LAST LIMIT 5 OFFSET 3"#),
         "the window must render on the wrapper, after the ordering: {sql}"
     );
     assert_shards_carry_no_window(&sql);
@@ -2154,7 +2131,7 @@ fn broadcast_ordered_renders_limit_and_offset_on_the_wrapper_only() {
 fn broadcast_ordered_unprojected_key_downgrades_to_the_fallback() {
     assert!(
         broadcast_window_sql(JoinWindowPlan::Ordered {
-            keys: vec![ascending_key("O_ORDERDATE")],
+            keys: vec![ascending_key("LHS_T1", "O_ORDERDATE")],
             limit: Some(5),
             offset: 0,
         })
@@ -2280,8 +2257,8 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
     let fan_out_spec = ScanSpec {
         common: CommonScanSpec {
             projection: vec![
-                ProjectionItem::Column("C_CUSTKEY".to_string()),
-                ProjectionItem::Column("C_NAME".to_string()),
+                ProjectionItem::from("C_CUSTKEY"),
+                ProjectionItem::from("C_NAME"),
             ],
             storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
@@ -2428,7 +2405,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
     fn proj_names(proj: &[ProjectionItem]) -> Vec<String> {
         proj.iter()
             .map(|p| match p {
-                ProjectionItem::Column(n) => n.clone(),
+                ProjectionItem::Column(n) => n.output_name(),
                 ProjectionItem::Expr { .. } => panic!("narrowing must yield columns only"),
             })
             .collect()
@@ -2603,7 +2580,7 @@ fn no_select_list_wire_forms_all_keep_the_full_base_row() {
     });
     let full_row: Vec<ProjectionItem> = all_cols
         .iter()
-        .map(|(name, _)| ProjectionItem::Column(name.clone()))
+        .map(|(name, _)| ProjectionItem::from(name.clone()))
         .collect();
     let full_types: Vec<String> = all_cols.iter().map(|(_, ty)| ty.clone()).collect();
 
@@ -2646,10 +2623,7 @@ fn referenced_column_projection_narrows_with_a_real_select_list() {
     let (proj, types) = referenced_column_projection(&req, &all_cols);
     assert_eq!(
         proj,
-        vec![
-            ProjectionItem::Column("GK".to_string()),
-            ProjectionItem::Column("FCOL".to_string()),
-        ],
+        vec![ProjectionItem::from("GK"), ProjectionItem::from("FCOL"),],
         "select-list ∪ filter columns only — the unreferenced column stays out"
     );
     assert_eq!(
@@ -2672,7 +2646,7 @@ fn referenced_column_projection_falls_back_to_first_column() {
     let (proj, types) = referenced_column_projection(&req, &all_cols);
     assert_eq!(
         proj,
-        vec![ProjectionItem::Column("A".to_string())],
+        vec![ProjectionItem::from("A")],
         "no referenced source column ⇒ exactly one column, the first of all_cols"
     );
     assert_eq!(types, vec!["DECIMAL(18,0)".to_string()]);
@@ -2822,10 +2796,7 @@ fn declined_filter_request() -> Json {
 fn declined_filter_fan_out_spec() -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
-            projection: vec![
-                ProjectionItem::Column("ID".to_string()),
-                ProjectionItem::Column("C_TS".to_string()),
-            ],
+            projection: vec![ProjectionItem::from("ID"), ProjectionItem::from("C_TS")],
             storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
@@ -3193,4 +3164,335 @@ fn qualified_wrapper_zero_offset_renders_byte_identical_limit() {
     pushdown_req["limit"] = serde_json::json!({"numElements": 5, "offset": 0});
     let zero = seam_trailing(&pushdown_req, &legs).expect("an explicit zero offset must render");
     assert_eq!(zero, bare);
+}
+
+fn events_column(name: &str) -> Json {
+    serde_json::json!({"type": "column", "name": name, "tableName": "EVENTS", "tableAlias": "E"})
+}
+
+fn labels_column(name: &str) -> Json {
+    serde_json::json!({"type": "column", "name": name, "tableName": "LABELS", "tableAlias": "L"})
+}
+
+/// `EVENTS e JOIN LABELS l ON e.ID = l.ID`: the legs share ID, SCORE, and PAYLOAD. SCORE is
+/// DECIMAL on EVENTS (leg 0) and VARCHAR on LABELS (leg 1), so a bare-name lookup's first
+/// match types LABELS' SCORE as DECIMAL.
+fn shared_names_request(pushdown_extra: Json) -> Json {
+    let mut pushdown_req = serde_json::json!({
+        "type": "select",
+        "from": {"type": "join", "join_type": "inner",
+            "left": {"name": "EVENTS", "type": "table", "alias": "E"},
+            "right": {"name": "LABELS", "type": "table", "alias": "L"},
+            "condition": {"type": "predicate_equal",
+                "left": events_column("ID"), "right": labels_column("ID")}},
+        "selectList": [events_column("ID"), labels_column("ID")],
+    });
+    if let Json::Object(extra) = pushdown_extra {
+        pushdown_req.as_object_mut().unwrap().extend(extra);
+    }
+    with_identifier_notes(
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "EVENTS", "columns": [
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "SCORE", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "PAYLOAD", "dataType": {"type": "varchar", "size": 20}}]},
+                {"name": "LABELS", "columns": [
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "SCORE", "dataType": {"type": "varchar", "size": 10}},
+                    {"name": "PAYLOAD", "dataType": {"type": "varchar", "size": 20}}]},
+            ],
+            "pushdownRequest": pushdown_req,
+            "schemaMetadataInfo": {"properties": {}},
+        }),
+        &[("EVENTS", "lh.events"), ("LABELS", "lh.labels")],
+    )
+}
+
+/// EVENTS (leg 0) is the fact and LABELS (leg 1) the dimension; `None` is a decline.
+fn shared_names_broadcast_sql(request: &Json, binary_columns: &BinaryColumns) -> Option<String> {
+    let rendered = render_broadcast_join(
+        request,
+        &pd(request),
+        &detected_join(request),
+        binary_columns,
+    )
+    .expect("a well-formed request renders without error")?;
+    let sides = JoinSides {
+        fact: resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 1000)]),
+        dimension: resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
+        broadcast_eligible: true,
+        dimension_leg: 1,
+    };
+    build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE")
+        .expect("selecting the wire storage must succeed")
+}
+
+fn ordered_by(select_list: Json, key: Json) -> Json {
+    shared_names_request(serde_json::json!({
+        "selectList": select_list,
+        "orderBy": [{"type": "order_by_element", "expression": key,
+                     "isAscending": true, "nullsLast": true}],
+        "limit": {"numElements": 3},
+    }))
+}
+
+#[test]
+fn order_by_on_other_legs_same_named_column_declines_broadcast() {
+    let other_leg = ordered_by(
+        serde_json::json!([events_column("ID")]),
+        labels_column("ID"),
+    );
+    assert_eq!(
+        shared_names_broadcast_sql(&other_leg, &BinaryColumns::default()),
+        None,
+        "ORDER BY l.ID must not bind to the projected e.ID, which carries the other leg's values"
+    );
+
+    let own_leg = ordered_by(
+        serde_json::json!([events_column("ID"), labels_column("ID")]),
+        labels_column("ID"),
+    );
+    let sql = shared_names_broadcast_sql(&own_leg, &BinaryColumns::default())
+        .expect("l.ID is projected, so the key binds to it");
+    assert_eq!(
+        broadcast_common_blob(&sql)["join"]["post_join_order_by"],
+        serde_json::json!([{
+            "column": {"relation": "LHS_T1", "name": "ID"},
+            "ascending": true,
+            "nulls_last": true,
+        }]),
+        "the shard's ordering carries the key's own pair: {sql}"
+    );
+    assert!(
+        sql.ends_with(r#") ORDER BY "LHS_T1_ID" ASC NULLS LAST LIMIT 3"#),
+        "the wrapper orders by the key's own output column, not LHS_T0_ID: {sql}"
+    );
+}
+
+#[test]
+fn shared_column_name_with_different_types_declares_each_legs_type() {
+    let request = shared_names_request(serde_json::json!({
+        "selectList": [events_column("SCORE"), labels_column("SCORE")],
+    }));
+    let sql = shared_names_broadcast_sql(&request, &BinaryColumns::default())
+        .expect("a shared name is no reason to decline");
+    assert!(
+        sql.ends_with(r#"EMITS ("LHS_T0_SCORE" DECIMAL(18,0), "LHS_T1_SCORE" VARCHAR(10))"#),
+        "each output column declares its own leg's type: {sql}"
+    );
+
+    let like = |column: Json, pattern: &str| {
+        shared_names_request(serde_json::json!({
+            "filter": {"type": "predicate_like", "expression": column,
+                       "pattern": {"type": "literal_string", "value": pattern}},
+        }))
+    };
+    let varchar_leg = shared_names_broadcast_sql(
+        &like(labels_column("SCORE"), "a%"),
+        &BinaryColumns::default(),
+    )
+    .expect("LIKE on the VARCHAR leg's SCORE resolves its own leg's type and keeps the plan");
+    assert!(
+        varchar_leg.contains(r#""filter":"(\"LHS_T1\".\"SCORE\" LIKE ''a%'')""#),
+        "the filter reads LABELS' own SCORE: {varchar_leg}"
+    );
+    assert_eq!(
+        shared_names_broadcast_sql(
+            &like(events_column("SCORE"), "1%"),
+            &BinaryColumns::default()
+        ),
+        None,
+        "LIKE on the DECIMAL leg's SCORE still declines the broadcast plan"
+    );
+}
+
+#[test]
+fn binary_detection_resolves_a_shared_column_name_per_leg() {
+    let mut events = resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 1000)]);
+    events.logical_schema = vec![nullable_field("payload", "binary")];
+    let mut labels = resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]);
+    labels.logical_schema = vec![nullable_field("payload", "utf8")];
+    let request = shared_names_request(Json::Null);
+    let binary_columns =
+        leg_binary_columns(&[events, labels], &detected_join(&request).legs(), false);
+
+    let filter_on = |column: Json| {
+        let request = shared_names_request(serde_json::json!({
+            "filter": {"type": "predicate_equal", "left": column,
+                       "right": {"type": "literal_string", "value": "0a1b"}},
+        }));
+        shared_names_broadcast_sql(&request, &binary_columns).expect("renders")
+    };
+    let binary_leg = filter_on(events_column("PAYLOAD"));
+    assert!(
+        binary_leg.contains(r#""filter":"(\"LHS_T0\".\"_LH_BYTES_PAYLOAD\" = X''0a1b'')""#),
+        "the binary leg compares its own relation's raw bytes: {binary_leg}"
+    );
+    let text_leg = filter_on(labels_column("PAYLOAD"));
+    assert!(
+        text_leg.contains(r#""filter":"(\"LHS_T1\".\"PAYLOAD\" = ''0a1b'')""#),
+        "the VARCHAR leg's same-named column stays a text comparison: {text_leg}"
+    );
+}
+
+#[test]
+fn output_name_over_identifier_limit_declines_broadcast() {
+    let projecting = |name: &str| {
+        let mut request = join_request(Json::Null, equi_condition());
+        request["involvedTables"][0]["columns"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name": name, "dataType": {"type": "varchar", "size": 10}}));
+        request["pushdownRequest"]["selectList"] =
+            serde_json::json!([{"type": "column", "name": name, "tableName": "CUSTOMER"}]);
+        render_broadcast_join(
+            &request,
+            &pd(&request),
+            &detected_join(&request),
+            &BinaryColumns::default(),
+        )
+        .expect("an identifier-limit decline is not an error")
+    };
+    let at_limit = "C".repeat(121);
+    let rendered = projecting(&at_limit).expect("LHS_T0_ plus 121 characters is exactly 128");
+    assert_eq!(
+        rendered.projection,
+        vec![ProjectionItem::Column(ColumnRef::qualified(
+            "LHS_T0", at_limit
+        ))]
+    );
+    assert!(
+        projecting(&"Ä".repeat(121)).is_some(),
+        "the limit counts characters, not the 2-byte encoding of each"
+    );
+    assert!(
+        projecting(&"C".repeat(122)).is_none(),
+        "a 129-character output name exceeds Exasol's identifier limit"
+    );
+}
+
+#[test]
+fn column_without_a_single_leg_fails_broadcast_with_the_fallback_error() {
+    let attribution_error = |request: &Json| {
+        let err = render_broadcast_join(
+            request,
+            &pd(request),
+            &detected_join(request),
+            &BinaryColumns::default(),
+        )
+        .expect_err("a column no single leg owns has no correct qualified reference");
+        let UdfError::User(message) = err else {
+            panic!("the decline must be a client-facing User error, got {err:?}");
+        };
+        message
+    };
+
+    let mut no_table_name = join_request(Json::Null, equi_condition());
+    no_table_name["pushdownRequest"]["selectList"] =
+        serde_json::json!([{"type": "column", "name": "C_NAME"}]);
+    let mut undeclared_table = join_request(Json::Null, equi_condition());
+    undeclared_table["pushdownRequest"]["filter"] = serde_json::json!({
+        "type": "predicate_equal",
+        "left": {"type": "column", "name": "C_NAME", "tableName": "NOPE"},
+        "right": {"type": "literal_string", "value": "ACME"},
+    });
+    for (label, request) in [
+        ("no tableName", no_table_name),
+        ("an undeclared tableName", undeclared_table),
+    ] {
+        let message = attribution_error(&request);
+        assert!(
+            message.contains("could not be attributed to a join leg"),
+            "a NoLeg column ({label}) must fail like an unattributable one: {message}"
+        );
+    }
+
+    let mut unattributable = self_join_request(&[Some("A"), Some("B")]);
+    unattributable["pushdownRequest"]["orderBy"] = serde_json::json!([{
+        "type": "order_by_element",
+        "expression": {"type": "column", "name": "O_ORDERKEY", "tableName": "FACT_ORDERS",
+                       "tableAlias": "C"},
+        "isAscending": true,
+        "nullsLast": true,
+    }]);
+    let fallback_err = build_n_scan_join_sql(
+        &unattributable,
+        &pd(&unattributable),
+        &detected_join(&unattributable),
+        &[
+            resolved_side("FACT_ORDERS", vec![("s3://w/f-0.parquet", 10)]),
+            resolved_side("FACT_ORDERS", vec![("s3://w/f-0.parquet", 10)]),
+        ],
+        &two_scan_tuning(),
+        "SCAN",
+        "DISTRIBUTE",
+    )
+    .expect_err("the fallback refuses an unattributable column");
+    assert_eq!(
+        UdfError::User(attribution_error(&unattributable)).to_string(),
+        fallback_err.to_string(),
+        "the broadcast path raises the fallback's own error"
+    );
+}
+
+#[test]
+fn self_join_renders_each_occurrence_as_its_own_relation() {
+    for aliases in [[Some("A"), Some("B")], [Some("A"), None]] {
+        let request = self_join_request(&aliases);
+        let rendered = render_broadcast_join(
+            &request,
+            &pd(&request),
+            &detected_join(&request),
+            &BinaryColumns::default(),
+        )
+        .expect("renders")
+        .expect("a self-join is no reason to decline");
+        assert_eq!(
+            rendered.condition, r#"("LHS_T0"."O_ORDERKEY" = "LHS_T1"."O_ORDERKEY")"#,
+            "{aliases:?}: the condition compares the two occurrences, never a column with itself"
+        );
+        assert_eq!(
+            rendered.projection,
+            vec![ProjectionItem::Column(ColumnRef::qualified(
+                "LHS_T0",
+                "O_ORDERKEY"
+            ))]
+        );
+    }
+}
+
+#[test]
+fn join_block_names_the_dimension_legs_alias() {
+    let request = join_request(Json::Null, equi_condition());
+    let rendered = render_broadcast_join(
+        &request,
+        &pd(&request),
+        &detected_join(&request),
+        &BinaryColumns::default(),
+    )
+    .expect("renders")
+    .expect("an equi-join renders");
+    let aliases_with = |customer_bytes: u64, orders_bytes: u64| {
+        let sides = select_broadcast_sides(
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", customer_bytes)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", orders_bytes)]),
+            u64::MAX,
+        );
+        let sql = build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "S", "D")
+            .expect("selecting the wire storage must succeed")
+            .expect("an unbounded join builds");
+        let join = broadcast_common_blob(&sql)["join"].clone();
+        (join["fact_alias"].clone(), join["dimension_alias"].clone())
+    };
+    assert_eq!(
+        aliases_with(100, 10),
+        (serde_json::json!("LHS_T0"), serde_json::json!("LHS_T1")),
+        "the smaller second leg is the dimension"
+    );
+    assert_eq!(
+        aliases_with(10, 100),
+        (serde_json::json!("LHS_T1"), serde_json::json!("LHS_T0")),
+        "the smaller first leg is the dimension"
+    );
 }

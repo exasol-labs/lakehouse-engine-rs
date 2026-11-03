@@ -5,7 +5,7 @@ use crate::adapter::permission::PermissionCheck;
 use crate::adapter::pushdown::ResolvedScan;
 use crate::adapter::pushdown::test_support::*;
 use crate::scan::spec::CatalogProps;
-use crate::scan::spec::{FileEntry, LogicalField};
+use crate::scan::spec::{FileEntry, LogicalField, ProjectionItem};
 
 // Shared join fixtures, reached by each submodule's tests via `super::super::tests`.
 
@@ -215,6 +215,26 @@ pub(super) fn detected_join(request: &Json) -> DetectedJoin {
         JoinShape::Join(join) => join,
         other => panic!("expected Join, got {other:?}"),
     }
+}
+
+/// The select list projected as `render_broadcast_join` projects it: every column qualified
+/// through the leg binding and typed by its own leg's universe, widened row included.
+pub(super) fn broadcast_projection(request: &Json) -> (Vec<ProjectionItem>, Vec<String>, bool) {
+    let join = detected_join(request);
+    let legs = join.legs();
+    let qualified = legs
+        .qualify(&pd(request))
+        .expect("every fixture column belongs to one leg");
+    project_columns(
+        &qualified,
+        &rendering::leg_column_types(request, &join, &legs),
+    )
+    .expect("projectable")
+}
+
+/// Leg 0 then leg 1, the aliases `render_broadcast_join` records for a two-leg join.
+pub(super) fn two_leg_aliases() -> Vec<String> {
+    vec!["LHS_T0".to_string(), "LHS_T1".to_string()]
 }
 
 /// Derived through [`DetectedJoin::legs`], the only multi-leg constructor; conditions play

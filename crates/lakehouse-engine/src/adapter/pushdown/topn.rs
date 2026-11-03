@@ -1,4 +1,4 @@
-use crate::scan::spec::{LogicalField, ProjectionItem, SortKey, render_ordered};
+use crate::scan::spec::{ColumnRef, LogicalField, ProjectionItem, SortKey, render_ordered};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::render_expression_exasol_safe;
@@ -9,19 +9,27 @@ use super::support::{
 
 /// Bare `column` nodes only: per-shard bounded top-N is eligible for bare columns
 /// only. Expression sort keys use [`parse_sort_flags`] instead.
+///
+/// A node's `tableAlias` qualifies the key, so a broadcast join's key keeps the leg its
+/// qualification stamped; the single-table paths strip every alias first, so their keys stay
+/// bare.
 pub(super) fn parse_sort_key_element(element: &Json) -> Option<SortKey> {
     let expr = element.get("expression")?;
     if expr.get("type").and_then(|t| t.as_str()) != Some("column") {
         return None;
     }
-    let column = expr
+    let name = expr
         .get("name")
         .and_then(|n| n.as_str())
         .map(|s| s.to_uppercase())?;
+    let relation = expr
+        .get("tableAlias")
+        .and_then(|alias| alias.as_str())
+        .map(str::to_string);
     let ascending = element.get("isAscending").and_then(|b| b.as_bool())?;
     let nulls_last = element.get("nullsLast").and_then(|b| b.as_bool())?;
     Some(SortKey {
-        column,
+        column: ColumnRef { relation, name },
         ascending,
         nulls_last,
     })
@@ -35,7 +43,7 @@ pub(super) fn parse_sort_flags(element: &Json) -> Option<(bool, bool)> {
     Some((ascending, nulls_last))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) enum ParsedSortKey {
     Column(SortKey),
     /// Every referenced base column must be emitted, hidden, for the wrapper's
@@ -52,11 +60,11 @@ pub(super) enum ParsedSortKey {
 }
 
 impl ParsedSortKey {
-    fn referenced_columns(&self) -> &[String] {
+    fn referenced_columns(&self) -> Vec<&str> {
         match self {
-            Self::Column(key) => std::slice::from_ref(&key.column),
-            Self::Expression { columns, .. } => columns,
-            Self::Unrenderable => &[],
+            Self::Column(key) => vec![key.column.name.as_str()],
+            Self::Expression { columns, .. } => columns.iter().map(String::as_str).collect(),
+            Self::Unrenderable => Vec::new(),
         }
     }
 
@@ -196,7 +204,7 @@ pub(super) fn detect_topn(
         // See the JSON-fallback guard above; an unknown column declines defensively.
         let arrow_type = logical_schema
             .iter()
-            .find(|f| f.name.to_uppercase() == key.column)
+            .find(|f| f.name.to_uppercase() == key.column.name)
             .map(|f| crate::types::mapping::arrow_type_from_tag(&f.arrow_type))?;
         if crate::types::mapping::needs_json_fallback(&arrow_type) {
             return None;
@@ -220,16 +228,16 @@ pub(super) fn extend_projection_with_sort_keys(
     col_types: &[(String, String)],
 ) {
     for column in keys.iter().flat_map(ParsedSortKey::referenced_columns) {
-        let already_emitted = proj_cols
-            .iter()
-            .any(|p| matches!(p, ProjectionItem::Column(c) if c == column));
+        let already_emitted = proj_cols.iter().any(
+            |p| matches!(p, ProjectionItem::Column(c) if c.relation.is_none() && c.name == column),
+        );
         if already_emitted {
             continue;
         }
         let Some((name, exa_type)) = col_types.iter().find(|(name, _)| name == column) else {
             continue;
         };
-        proj_cols.push(ProjectionItem::Column(name.clone()));
+        proj_cols.push(ProjectionItem::from(name.clone()));
         proj_types.push(exa_type.clone());
     }
 }

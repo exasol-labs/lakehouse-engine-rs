@@ -1,15 +1,17 @@
 use super::super::super::support::collect_all_column_names;
-use super::super::planning::{JoinLeaf, JoinSides, JoinWindowPlan, disjoint_schema_guard};
+use super::super::planning::{JoinLeaf, JoinSides, JoinWindowPlan};
 use super::super::sql_builders::{
     JoinScanRequestConfig, RenderedJoinPushdown, build_broadcast_join_sql, build_n_scan_join_sql,
     build_side_fan_out_sql, render_broadcast_join,
 };
 use super::super::tests::{
-    detected_join, equi_condition, join_request, legs_from_leaves, resolved_side, two_scan_tuning,
+    broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves,
+    resolved_side, two_leg_aliases, two_scan_tuning,
 };
 use super::*;
-use crate::adapter::pushdown::support::apply_type_rewrites;
+use crate::adapter::pushdown::support::{ColumnTypes, apply_type_rewrites};
 use crate::adapter::pushdown::test_support::*;
+use crate::scan::spec::ColumnRef;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
 
 /// One unaliased leg per name, in FROM-tree order.
@@ -45,51 +47,6 @@ fn self_join_legs() -> JoinLegs {
 }
 
 #[test]
-fn disjoint_schema_guard_passes_for_disjoint_column_names() {
-    let request = join_request(Json::Null, equi_condition());
-    let left = involved_table_columns(&request, "CUSTOMER");
-    let right = involved_table_columns(&request, "ORDERS");
-    assert!(
-        disjoint_schema_guard(&left, &right),
-        "C_* and O_* column sets are disjoint and must pass the guard"
-    );
-}
-
-#[test]
-fn overlapping_column_name_fails_guard_and_declines_without_error() {
-    let mut request = join_request(Json::Null, equi_condition());
-    for table_idx in [0, 1] {
-        request["involvedTables"][table_idx]["columns"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!({
-                "name": "SHARED_KEY",
-                "dataType": {"type": "varchar", "size": 10}
-            }));
-    }
-
-    let left = involved_table_columns(&request, "CUSTOMER");
-    let right = involved_table_columns(&request, "ORDERS");
-    assert!(
-        !disjoint_schema_guard(&left, &right),
-        "a shared column name must fail the disjoint guard"
-    );
-
-    let detected = detected_join(&request);
-    let outcome = render_broadcast_join(
-        &request,
-        &pd(&request),
-        &detected,
-        &BinaryColumns::default(),
-    )
-    .expect("a guard failure is a decline, not an error");
-    assert!(
-        outcome.is_none(),
-        "a column-name collision must decline to the unaccelerated path"
-    );
-}
-
-#[test]
 fn join_condition_renders_via_translator() {
     assert_eq!(
         render_expression_safe(&equi_condition()).as_deref(),
@@ -105,9 +62,12 @@ fn join_condition_renders_via_translator() {
         &detected,
         &BinaryColumns::default(),
     )
-    .expect("disjoint, renderable join")
-    .expect("a disjoint join must render, not decline");
-    assert_eq!(rendered.condition, r#"("C_CUSTKEY" = "O_CUSTKEY")"#);
+    .expect("renderable join")
+    .expect("an equi-join must render, not decline");
+    assert_eq!(
+        rendered.condition, r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#,
+        "each operand is qualified by its own leg's alias"
+    );
 }
 
 #[test]
@@ -132,18 +92,18 @@ fn join_where_filter_spanning_both_sides_renders() {
         &detected,
         &BinaryColumns::default(),
     )
-    .expect("disjoint, renderable join")
+    .expect("renderable join")
     .expect("must render");
     let filter = rendered
         .filter
         .expect("a cross-side WHERE filter must render");
     assert!(
-        filter.contains(r#""C_NAME""#),
-        "the left-side column must appear in the rendered filter: {filter}"
+        filter.contains(r#""LHS_T0"."C_NAME""#),
+        "the left-side column must appear qualified by its leg in the rendered filter: {filter}"
     );
     assert!(
-        filter.contains(r#""O_ORDERDATE""#),
-        "the right-side column must appear in the rendered filter: {filter}"
+        filter.contains(r#""LHS_T1"."O_ORDERDATE""#),
+        "the right-side column must appear qualified by its leg in the rendered filter: {filter}"
     );
     assert!(
         filter.contains("AND"),
@@ -154,17 +114,15 @@ fn join_where_filter_spanning_both_sides_renders() {
 #[test]
 fn join_projection_emits_attribute_each_side_owning_type() {
     let request = join_request(Json::Null, equi_condition());
-    let detected = detected_join(&request);
-    let (projection, types, _widened) =
-        extract_join_projection(&request, &pd(&request), &detected).expect("projectable");
+    let (projection, types, _widened) = broadcast_projection(&request);
 
     assert_eq!(
         projection,
         vec![
-            ProjectionItem::Column("C_NAME".into()),
-            ProjectionItem::Column("O_ORDERDATE".into()),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "C_NAME")),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "O_ORDERDATE")),
         ],
-        "projection spans both tables in select-list order"
+        "projection spans both tables in select-list order, each column qualified by its leg"
     );
     assert_eq!(
         types,
@@ -185,9 +143,7 @@ fn join_projection_resolves_cast_node_to_expr_not_full_row_fallback() {
         }
     ]);
 
-    let detected = detected_join(&request);
-    let (projection, _types, _widened) =
-        extract_join_projection(&request, &pd(&request), &detected).expect("projectable");
+    let (projection, _types, _widened) = broadcast_projection(&request);
 
     assert_eq!(
         projection.len(),
@@ -205,7 +161,6 @@ fn join_projection_resolves_cast_node_to_expr_not_full_row_fallback() {
 #[test]
 fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
     let request = join_request(Json::Null, equi_condition());
-    let detected = detected_join(&request);
 
     let mut coerce_request = request.clone();
     coerce_request["pushdownRequest"]["selectList"] = serde_json::json!([
@@ -215,9 +170,7 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
             "arguments": [{"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}]
         }
     ]);
-    let (projection, _types, _widened) =
-        extract_join_projection(&coerce_request, &pd(&coerce_request), &detected)
-            .expect("projectable");
+    let (projection, _types, _widened) = broadcast_projection(&coerce_request);
     assert_eq!(
         projection.len(),
         1,
@@ -228,7 +181,9 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
         panic!("must be a rendered expression, not a bare column: {projection:?}");
     };
     assert!(
-        expr.contains(r#"upper(regexp_replace(regexp_replace(CAST("C_CUSTKEY" AS VARCHAR)"#),
+        expr.contains(
+            r#"upper(regexp_replace(regexp_replace(CAST("LHS_T0"."C_CUSTKEY" AS VARCHAR)"#
+        ),
         "UPPER's DECIMAL argument must render through the trimmed decimal-to-string \
          form: {expr}"
     );
@@ -245,9 +200,7 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
             ]
         }
     ]);
-    let (projection, _types, _widened) =
-        extract_join_projection(&decline_request, &pd(&decline_request), &detected)
-            .expect("projectable");
+    let (projection, _types, _widened) = broadcast_projection(&decline_request);
     let expected_full_row_len = involved_table_columns(&decline_request, "CUSTOMER").len()
         + involved_table_columns(&decline_request, "ORDERS").len();
     assert_eq!(
@@ -261,7 +214,6 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
 #[test]
 fn join_projection_like_guard_reaches_join_select_list() {
     let request = join_request(Json::Null, equi_condition());
-    let detected = detected_join(&request);
 
     let mut string_request = request.clone();
     string_request["pushdownRequest"]["selectList"] = serde_json::json!([
@@ -271,9 +223,7 @@ fn join_projection_like_guard_reaches_join_select_list() {
             "pattern": {"type": "literal_string", "value": "A%"}
         }
     ]);
-    let (projection, _types, widened) =
-        extract_join_projection(&string_request, &pd(&string_request), &detected)
-            .expect("projectable");
+    let (projection, _types, widened) = broadcast_projection(&string_request);
     assert!(
         !widened,
         "a VARCHAR subject must keep the broadcast projection, not widen to the \
@@ -289,7 +239,7 @@ fn join_projection_like_guard_reaches_join_select_list() {
         panic!("must be a rendered expression, not a bare column: {projection:?}");
     };
     assert!(
-        expr.contains("C_NAME") && expr.contains("LIKE"),
+        expr.contains(r#""LHS_T0"."C_NAME""#) && expr.contains("LIKE"),
         "the VARCHAR subject must render as a LIKE expression over C_NAME: {expr}"
     );
 
@@ -301,13 +251,11 @@ fn join_projection_like_guard_reaches_join_select_list() {
             "pattern": {"type": "literal_string", "value": "1%"}
         }
     ]);
-    let (projection, _types, widened) =
-        extract_join_projection(&decline_request, &pd(&decline_request), &detected)
-            .expect("projectable");
+    let (projection, _types, widened) = broadcast_projection(&decline_request);
     assert!(
         widened,
         "the widening flag is what declines the broadcast join to the N-scan \
-         fallback (joins/sql_builders.rs:85); a DECIMAL-subject LIKE must set it: \
+         fallback; a DECIMAL-subject LIKE must set it: \
          {projection:?}"
     );
     let expected_full_row_len = involved_table_columns(&decline_request, "CUSTOMER").len()
@@ -778,7 +726,7 @@ fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
         "right": {"type": "literal_exactnumeric", "value": 1}
     });
 
-    let rewritten = apply_type_rewrites(&filter, &col_types)
+    let rewritten = apply_type_rewrites(&filter, &ColumnTypes::unqualified(&col_types))
         .expect("precondition: the type pipeline ACCEPTS this tree");
     assert!(
         rewritten.to_string().contains("decimal_to_varchar_exasol"),
@@ -1042,28 +990,27 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         fact,
         dimension,
         broadcast_eligible: true,
+        dimension_leg: 1,
     };
     let rendered = RenderedJoinPushdown {
-        condition: r#""L_ORDERKEY" = "O_ORDERKEY""#.to_string(),
+        condition: r#""LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY""#.to_string(),
         filter: None,
-        projection: vec![ProjectionItem::Column("L_ORDERKEY".to_string())],
+        projection: vec![ProjectionItem::Column(ColumnRef::qualified(
+            "LHS_T0",
+            "L_ORDERKEY",
+        ))],
         projection_types: vec!["DECIMAL(20,0)".to_string()],
+        relation_aliases: two_leg_aliases(),
+        window: JoinWindowPlan::Unbounded,
     };
     let tuning = JoinScanRequestConfig {
         cluster_nodes: 2,
         parallelism_factor: 1,
         ..two_scan_tuning()
     };
-    let sql = build_broadcast_join_sql(
-        &sides,
-        &rendered,
-        JoinWindowPlan::Unbounded,
-        &tuning,
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("selecting the wire storage must succeed")
-    .expect("an unbounded broadcast join must build");
+    let sql = build_broadcast_join_sql(&sides, &rendered, &tuning, "SCAN", "DISTRIBUTE")
+        .expect("selecting the wire storage must succeed")
+        .expect("an unbounded broadcast join must build");
 
     assert!(
         !sql.contains("SELECT * FROM ("),
@@ -1080,7 +1027,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
 }
 
 #[test]
-fn render_broadcast_join_strips_native_table_alias_from_filter() {
+fn render_broadcast_join_replaces_native_table_alias_in_filter_with_leg_alias() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_greater",
@@ -1095,20 +1042,20 @@ fn render_broadcast_join_strips_native_table_alias_from_filter() {
         &BinaryColumns::default(),
     )
     .expect("renders")
-    .expect("disjoint join renders");
+    .expect("an equi-join renders");
     let filter = rendered.filter.expect("filter renders");
     assert!(
-        filter.contains(r#""O_ORDERDATE""#),
-        "the filter must still reference the column: {filter}"
+        filter.contains(r#""LHS_T1"."O_ORDERDATE""#),
+        "the filter must reference the column on its leg's relation: {filter}"
     );
     assert!(
         !filter.contains(r#""O"."O_ORDERDATE""#),
-        "broadcast rendering must strip Exasol's native tableAlias (bare, unqualified): {filter}"
+        "Exasol's native tableAlias names no relation of the scan's join: {filter}"
     );
 }
 
 #[test]
-fn render_broadcast_join_strips_native_table_alias_from_condition() {
+fn render_broadcast_join_replaces_native_table_alias_in_condition_with_leg_alias() {
     let condition = serde_json::json!({
         "type": "predicate_equal",
         "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER", "tableAlias": "C"},
@@ -1122,13 +1069,16 @@ fn render_broadcast_join_strips_native_table_alias_from_condition() {
         &detected,
         &BinaryColumns::default(),
     )
-    .expect("disjoint, renderable join")
-    .expect("a disjoint join must render, not decline");
-    assert_eq!(rendered.condition, r#"("C_CUSTKEY" = "O_CUSTKEY")"#);
+    .expect("renderable join")
+    .expect("an equi-join must render, not decline");
+    assert_eq!(
+        rendered.condition,
+        r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#
+    );
 }
 
 #[test]
-fn render_broadcast_join_strips_native_table_alias_from_projection() {
+fn render_broadcast_join_replaces_native_table_alias_in_projection_with_leg_alias() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["selectList"] = serde_json::json!([
         {"type": "function_scalar", "name": "MULT", "arguments": [
@@ -1144,11 +1094,11 @@ fn render_broadcast_join_strips_native_table_alias_from_projection() {
         &BinaryColumns::default(),
     )
     .expect("renders")
-    .expect("disjoint join renders");
+    .expect("an equi-join renders");
     assert_eq!(rendered.projection.len(), 1, "{:?}", rendered.projection);
     match &rendered.projection[0] {
         ProjectionItem::Expr { expr } => {
-            assert_eq!(expr, r#"("O_CUSTKEY" * 2)"#);
+            assert_eq!(expr, r#"("LHS_T1"."O_CUSTKEY" * 2)"#);
         }
         other => panic!("expected an Expr projection item, got {other:?}"),
     }
@@ -1240,7 +1190,15 @@ fn unified_join_prunes_and_narrows_each_leg() {
 /// Scenario: A filter on a binary column selects what native Exasol selects over the hex text
 #[test]
 fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
-    let c_name_is_binary = BinaryColumns::of(&[nullable_field("c_name", "binary")], false);
+    let c_name = [nullable_field("c_name", "binary")];
+    let c_name_is_binary = BinaryColumns::of(&c_name, false);
+    let legs_c_name_is_binary = BinaryColumns::per_relation(
+        [
+            ("LHS_T0".to_string(), &c_name[..]),
+            ("LHS_T1".to_string(), &[][..]),
+        ],
+        false,
+    );
     let filter = serde_json::json!({
         "type": "predicate_equal",
         "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
@@ -1253,13 +1211,13 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
         &request,
         &pd(&request),
         &detected_join(&request),
-        &c_name_is_binary,
+        &legs_c_name_is_binary,
     )
-    .expect("disjoint, renderable join")
+    .expect("renderable join")
     .expect("must render");
     assert_eq!(
         rendered.filter.as_deref(),
-        Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#)
+        Some(r#"("LHS_T0"."_LH_BYTES_C_NAME" = X'0a1b')"#)
     );
 
     let customer = involved_table_columns(&request, "CUSTOMER");

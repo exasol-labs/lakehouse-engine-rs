@@ -1,35 +1,55 @@
 use crate::scan::spec::ProjectionItem;
-use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::{render_df_filter_exasol_safe, render_expression_exasol_safe};
 
 use super::super::BinaryColumns;
 use super::super::support::{
-    datafusion_renderable, project_columns, quote_ident, type_accepted_rewrite, walk_column_nodes,
+    ColumnTypes, datafusion_renderable, quote_ident, type_accepted_rewrite, walk_column_nodes,
 };
 use super::attribution::{ColumnLeg, JoinLegs, UnattributableColumn};
-use super::planning::{DetectedJoin, involved_table_columns};
+use super::planning::{DetectedJoin, ResolvedJoinSide, involved_table_columns};
 
-/// The sole producer of a broadcast join's column-type union (broadcast is two-table only).
-/// Callers must have passed [`disjoint_schema_guard`](super::planning::disjoint_schema_guard)
-/// so each bare name maps to exactly one type.
-pub(super) fn join_col_types(request: &Json, join: &DetectedJoin) -> Vec<(String, String)> {
-    let mut combined = involved_table_columns(request, &join.tables[0].table_name);
-    combined.extend(involved_table_columns(request, &join.tables[1].table_name));
-    combined
+/// The sole producer of a broadcast join's column-type universe: each leg's involved-table
+/// columns, qualified with the alias `legs` stamps on that leg's `column` nodes, in leg order.
+/// A self-join's two occurrences list the same columns under two aliases.
+pub(super) fn leg_column_types(
+    request: &Json,
+    join: &DetectedJoin,
+    legs: &JoinLegs,
+) -> ColumnTypes {
+    ColumnTypes::per_relation(
+        join.tables
+            .iter()
+            .enumerate()
+            .map(|(leg, leaf)| {
+                (
+                    legs.leg_alias(leg),
+                    involved_table_columns(request, &leaf.table_name),
+                )
+            })
+            .collect(),
+    )
 }
 
-pub(super) fn extract_join_projection(
-    request: &Json,
-    pushdown_req: &Json,
-    join: &DetectedJoin,
-) -> Result<(Vec<ProjectionItem>, Vec<String>, bool), UdfError> {
-    project_columns(pushdown_req, join_col_types(request, join))
+/// [`leg_column_types`]' counterpart for binary detection, keyed by the same pairs, so a
+/// column name that is binary on one leg and text on the other compares each leg its own way.
+pub(super) fn leg_binary_columns(
+    sides: &[ResolvedJoinSide],
+    legs: &JoinLegs,
+    binary_as_string: bool,
+) -> BinaryColumns {
+    BinaryColumns::per_relation(
+        sides
+            .iter()
+            .enumerate()
+            .map(|(leg, side)| (legs.leg_alias(leg), side.logical_schema.as_slice())),
+        binary_as_string,
+    )
 }
 
 pub(super) fn projection_item_select_sql(item: &ProjectionItem) -> String {
     match item {
-        ProjectionItem::Column(name) => quote_ident(name),
+        ProjectionItem::Column(column) => quote_ident(&column.output_name()),
         ProjectionItem::Expr { expr } => expr.clone(),
     }
 }
@@ -126,10 +146,10 @@ pub(super) fn declined_only(filter: &Json) -> Option<Json> {
 /// rewritten for the leg, the second raw for the Exasol-dialect outer WHERE.
 ///
 /// Not [`classify_where_filter`](super::super::support::classify_where_filter), which
-/// classifies a whole filter against one type universe: the N-scan path has no
-/// disjoint-name guarantee, so the only valid universe is the owning leg's `col_types`,
-/// known only after attribution. Per conjunct, so one declined conjunct doesn't forfeit its
-/// siblings. Renderability is established on the rewritten tree via
+/// classifies a whole filter against one type universe: an N-scan leg's conjuncts name only
+/// that leg's columns, so the leg's own unqualified `col_types`, known only after
+/// attribution, binds each one by name. Per conjunct, so one declined conjunct doesn't
+/// forfeit its siblings. Renderability is established on the rewritten tree via
 /// [`type_accepted_rewrite`]; if the re-formed tree fails it, the whole side-local set
 /// becomes residual (fail closed: applied in the wrapper is slower, applied nowhere is wrong).
 pub(super) fn type_screened_leg_filter(
@@ -137,6 +157,7 @@ pub(super) fn type_screened_leg_filter(
     col_types: &[(String, String)],
     binary_columns: &BinaryColumns,
 ) -> (Option<Json>, Option<Json>) {
+    let col_types = &ColumnTypes::unqualified(col_types);
     let accepts = |c: &Json| type_accepted_rewrite(c, col_types, binary_columns).is_some();
     let declined = partition_conjuncts(side_local, |c| !accepts(c));
     match partition_conjuncts(side_local, accepts) {

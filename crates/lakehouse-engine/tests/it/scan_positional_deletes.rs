@@ -22,8 +22,8 @@ use exasol_udf_sdk::value::ExaType;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec,
-    ScanStorage, StorageBackend, StorageProps,
+    ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, JoinType, LogicalField,
+    ProjectionItem, ScanSpec, ScanStorage, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_join_physical_plan, build_raw_scan_physical_plan, register_files,
@@ -843,7 +843,6 @@ fn scan_delete_reads_serial_when_budget_is_one() {
     assert_eq!(ids_of(&rows), (4..10).collect::<Vec<_>>());
 }
 
-/// Join sides must use disjoint column names: the join path relies on the VS guarantee.
 fn write_keyed_parquet(
     dir: &Path,
     relative: &str,
@@ -931,7 +930,10 @@ fn scan_delete_reads_bounded_across_join_sides() {
     );
 
     let mut spec = scan_spec(vec![fact_entry], None, None);
-    spec.common.projection = vec!["O_KEY".into(), "C_DATA".into()];
+    spec.common.projection = vec![
+        ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "O_KEY")),
+        ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "C_DATA")),
+    ];
     spec.common.s3_max_connections = BUDGET;
     spec.common.join = Some(JoinSpec {
         table_root: String::new(),
@@ -939,7 +941,9 @@ fn scan_delete_reads_bounded_across_join_sides() {
         logical_schema: Vec::new(),
         name_mapping: Vec::new(),
         join_type: JoinType::Inner,
-        condition: "\"C_KEY\" = \"O_KEY\"".into(),
+        fact_alias: "LHS_T1".into(),
+        dimension_alias: "LHS_T0".into(),
+        condition: "\"LHS_T0\".\"C_KEY\" = \"LHS_T1\".\"O_KEY\"".into(),
         post_join_limit: None,
         post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
@@ -1621,7 +1625,10 @@ fn scan_footer_fetches_bounded_across_join_sides() {
     let register_url = first_data_url.expect("at least one data file per side");
 
     let mut spec = scan_spec_with_logical_schema(fact_entries, None, None);
-    spec.common.projection = vec!["O_KEY".into(), "C_DATA".into()];
+    spec.common.projection = vec![
+        ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "O_KEY")),
+        ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "C_DATA")),
+    ];
     spec.common.logical_schema = logical_fields(&[("o_key", "int64"), ("o_data", "utf8")]);
     spec.common.s3_max_connections = BUDGET;
     spec.common.join = Some(JoinSpec {
@@ -1630,7 +1637,9 @@ fn scan_footer_fetches_bounded_across_join_sides() {
         logical_schema: logical_fields(&[("c_key", "int64"), ("c_data", "utf8")]),
         name_mapping: Vec::new(),
         join_type: JoinType::Inner,
-        condition: "\"C_KEY\" = \"O_KEY\"".into(),
+        fact_alias: "LHS_T1".into(),
+        dimension_alias: "LHS_T0".into(),
+        condition: "\"LHS_T0\".\"C_KEY\" = \"LHS_T1\".\"O_KEY\"".into(),
         post_join_limit: None,
         post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),

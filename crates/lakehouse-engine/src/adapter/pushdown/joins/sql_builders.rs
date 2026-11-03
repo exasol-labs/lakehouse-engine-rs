@@ -11,22 +11,28 @@ use super::super::BinaryColumns;
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
     build_scan_driving_sql, classify_where_filter, collect_all_column_names, extract_limit,
-    extract_offset, quote_ident, render_limit_offset, scan_storage_for, shard_count,
-    strip_table_alias,
+    extract_offset, project_columns, quote_ident, render_limit_offset, scan_storage_for,
+    shard_count, strip_table_alias,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_flags, wrap_declined_order_by};
 use super::attribution::{JoinLegs, UnattributableColumn};
 use super::planning::{
-    DetectedJoin, JoinSides, JoinWindowPlan, ResolvedJoinSide, disjoint_schema_guard,
+    DetectedJoin, JoinSides, JoinWindowPlan, ResolvedJoinSide, classify_join_window,
     involved_table_columns,
 };
 use super::rendering::{
-    conjoin_filters, cross_leg_residual_filter, declined_only, extract_join_projection,
-    join_col_types, leg_local_filter, projection_item_select_sql, referenced_clause_values,
-    referenced_leg_columns, render_df_filter_qualified, render_expression_qualified,
-    renderable_only, type_screened_leg_filter,
+    conjoin_filters, cross_leg_residual_filter, declined_only, leg_column_types, leg_local_filter,
+    projection_item_select_sql, referenced_clause_values, referenced_leg_columns,
+    render_df_filter_qualified, render_expression_qualified, renderable_only,
+    type_screened_leg_filter,
 };
 
+/// Exasol rejects a longer identifier (`maximum length of identifier exceeded`, verified live
+/// with `SELECT 1 AS "<129 chars>"`); the limit counts characters, not bytes.
+const EXASOL_MAX_IDENTIFIER_CHARS: usize = 128;
+
+/// The request rendered against the leg binding: each column of the condition, filter,
+/// projection, and window is a (relation alias, column) pair.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RenderedJoinPushdown {
     pub condition: String,
@@ -35,49 +41,50 @@ pub(crate) struct RenderedJoinPushdown {
     pub projection: Vec<ProjectionItem>,
     /// Positionally aligned with `projection`.
     pub projection_types: Vec<String>,
+    /// Indexed by leg: the alias each leg's columns were qualified with, so the join block
+    /// names the relations the condition and filter reference.
+    pub relation_aliases: Vec<String>,
+    /// Classified from the qualified ORDER BY, so each key carries its own leg's pair.
+    pub(in super::super) window: JoinWindowPlan,
 }
 
-/// `Ok(None)` is a clean decline to the N-scan fallback when the sides share a column name,
-/// the condition won't render, the projection widened to the full row (#196), or the WHERE
-/// filter declines through [`classify_where_filter`]: broadcast has no outer WHERE to apply
-/// a declined predicate. `Err` only for a request with no column metadata at all.
+/// `Ok(None)` is a clean decline to the N-scan fallback when the condition won't render, the
+/// projection widened to the full row (#196), a projected output name exceeds Exasol's
+/// identifier limit, or the WHERE filter declines through [`classify_where_filter`]: broadcast
+/// has no outer WHERE to apply a declined predicate. `Err` for a request with no column
+/// metadata at all, or with a column no single leg owns.
 ///
-/// The disjoint-schema guard must run first: only then does the union built by
-/// [`join_col_types`] map each bare name to one type, and only then is stripping
-/// `tableAlias` safe. Stripping is required because `build_join_sql` wraps each side in an
-/// unaliased sub-SELECT (`No field named "O"."O_ORDERDATE"` otherwise).
+/// Every column of the condition, filter, select list, and ORDER BY is qualified through
+/// [`JoinLegs`] with its leg's alias before anything reads it, and the type universe and
+/// binary columns are keyed by the same pairs, so legs may share column names: the scan
+/// aliases each relation with the alias the join block carries for it.
 pub(crate) fn render_broadcast_join(
     request: &Json,
     pushdown_req: &Json,
     join: &DetectedJoin,
     binary_columns: &BinaryColumns,
 ) -> Result<Option<RenderedJoinPushdown>, UdfError> {
-    let left_cols = involved_table_columns(request, &join.tables[0].table_name);
-    let right_cols = involved_table_columns(request, &join.tables[1].table_name);
-    if !disjoint_schema_guard(&left_cols, &right_cols) {
-        return Ok(None);
-    }
-
-    let bare_condition = strip_table_alias(&join.conditions[0]);
+    let legs = join.legs();
+    let condition_tree = legs
+        .qualify_every_column(&join.conditions[0])
+        .map_err(unattributable_decline)?;
+    let qualified_req = qualify_broadcast_clauses(pushdown_req, &legs)?;
     // Not the filter renderer, which would suppress a trivially-true boolean.
-    let condition = match render_expression_safe(&bare_condition) {
-        Some(condition) => condition,
-        None => return Ok(None),
+    let Some(condition) = render_expression_safe(&condition_tree) else {
+        return Ok(None);
     };
 
-    let col_types = join_col_types(request, join);
-    let bare_pushdown_req = strip_table_alias(pushdown_req);
-    let bare_filter_json = bare_pushdown_req.get("filter").filter(|f| !f.is_null());
-    let (filter, declined) = classify_where_filter(bare_filter_json, &col_types, binary_columns);
+    let col_types = leg_column_types(request, join, &legs);
+    let filter_json = qualified_req.get("filter").filter(|f| !f.is_null());
+    let (filter, declined) = classify_where_filter(filter_json, &col_types, binary_columns);
     if declined.is_some() {
         return Ok(None);
     }
 
-    let (projection, projection_types, widened) =
-        extract_join_projection(request, &bare_pushdown_req, join)?;
+    let (projection, projection_types, widened) = project_columns(&qualified_req, &col_types)?;
     // A widened projection is the full two-table row, the wrong shape for a broadcast fan-out
     // (#196).
-    if widened {
+    if widened || projection.iter().any(exceeds_identifier_limit) {
         return Ok(None);
     }
 
@@ -86,7 +93,34 @@ pub(crate) fn render_broadcast_join(
         filter,
         projection,
         projection_types,
+        relation_aliases: (0..legs.leg_count())
+            .map(|leg| legs.leg_alias(leg))
+            .collect(),
+        window: classify_join_window(&qualified_req),
     }))
+}
+
+/// Only the clauses the broadcast plan renders; a column no single leg owns has no correct
+/// qualified reference, so it fails with the fallback's own error.
+fn qualify_broadcast_clauses(pushdown_req: &Json, legs: &JoinLegs) -> Result<Json, UdfError> {
+    let mut qualified = pushdown_req.clone();
+    for clause in ["selectList", "filter", "orderBy"] {
+        if let Some(value) = pushdown_req.get(clause) {
+            qualified[clause] = legs
+                .qualify_every_column(value)
+                .map_err(unattributable_decline)?;
+        }
+    }
+    Ok(qualified)
+}
+
+fn exceeds_identifier_limit(item: &ProjectionItem) -> bool {
+    match item {
+        ProjectionItem::Column(column) => {
+            column.output_name().chars().count() > EXASOL_MAX_IDENTIFIER_CHARS
+        }
+        ProjectionItem::Expr { .. } => false,
+    }
 }
 
 /// Each condition attaches greedily to the earliest join point with every referenced leg
@@ -486,7 +520,7 @@ pub(super) fn build_side_fan_out_sql(
 ) -> Result<String, UdfError> {
     let proj_cols: Vec<ProjectionItem> = columns
         .iter()
-        .map(|(name, _)| ProjectionItem::Column(name.clone()))
+        .map(|(name, _)| ProjectionItem::from(name.clone()))
         .collect();
     let proj_types: Vec<String> = columns.iter().map(|(_, ty)| ty.clone()).collect();
 
@@ -510,13 +544,15 @@ pub(super) fn build_side_fan_out_sql(
     ))
 }
 
+/// Binds by the (relation alias, column) pair: `ORDER BY b.ID` never binds to a projected
+/// `a.ID`, which carries the other leg's values.
 fn bound_sort_key(key: &ParsedSortKey, projection: &[ProjectionItem]) -> Option<SortKey> {
     let ParsedSortKey::Column(key) = key else {
         return None;
     };
     projection
         .iter()
-        .any(|item| matches!(item, ProjectionItem::Column(name) if *name == key.column))
+        .any(|item| matches!(item, ProjectionItem::Column(column) if *column == key.column))
         .then(|| key.clone())
 }
 
@@ -577,16 +613,18 @@ fn place_broadcast_window(
 /// The fact side is sharded; the dimension's full file list rides once in the common blob's
 /// [`JoinSpec`], so every shard joins node-locally with no exchange. Each side carries its
 /// own storage because a vended credential is scoped to its table. The window always applies
-/// after the join; [`place_broadcast_window`] decides where it lands.
+/// after the join; [`place_broadcast_window`] decides where it lands. The join block names each
+/// relation by the alias its leg was rendered with, so the scan binds every qualified column to
+/// the side that owns it.
 pub(in super::super) fn build_broadcast_join_sql(
     sides: &JoinSides,
     rendered: &RenderedJoinPushdown,
-    window: JoinWindowPlan,
     inputs: &JoinScanRequestConfig<'_>,
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> Result<Option<String>, UdfError> {
-    let Some(placement) = place_broadcast_window(window, &rendered.projection) else {
+    let Some(placement) = place_broadcast_window(rendered.window.clone(), &rendered.projection)
+    else {
         return Ok(None);
     };
 
@@ -601,6 +639,8 @@ pub(in super::super) fn build_broadcast_join_sql(
         logical_schema: dimension.logical_schema.clone(),
         name_mapping: dimension.name_mapping.clone(),
         join_type: JoinType::Inner,
+        fact_alias: rendered.relation_aliases[sides.fact_leg()].clone(),
+        dimension_alias: rendered.relation_aliases[sides.dimension_leg].clone(),
         condition: rendered.condition.clone(),
         post_join_limit: placement.shard_cap,
         post_join_order_by: placement.shard_order_by,
@@ -739,7 +779,7 @@ pub(in super::super) fn referenced_column_projection(
         return (
             all_cols
                 .iter()
-                .map(|(name, _)| ProjectionItem::Column(name.clone()))
+                .map(|(name, _)| ProjectionItem::from(name.clone()))
                 .collect(),
             all_cols.iter().map(|(_, ty)| ty.clone()).collect(),
         );
@@ -752,14 +792,14 @@ pub(in super::super) fn referenced_column_projection(
     let mut types = Vec::new();
     for (name, ty) in all_cols {
         if names.contains(name) {
-            cols.push(ProjectionItem::Column(name.clone()));
+            cols.push(ProjectionItem::from(name.clone()));
             types.push(ty.clone());
         }
     }
     if cols.is_empty()
         && let Some((name, ty)) = all_cols.first()
     {
-        cols.push(ProjectionItem::Column(name.clone()));
+        cols.push(ProjectionItem::from(name.clone()));
         types.push(ty.clone());
     }
     (cols, types)
@@ -819,7 +859,7 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
         .iter()
         .zip(proj_types.iter())
         .filter_map(|(item, ty)| match item {
-            ProjectionItem::Column(name) => Some((name.clone(), ty.clone())),
+            ProjectionItem::Column(column) => Some((column.output_name(), ty.clone())),
             ProjectionItem::Expr { .. } => None,
         })
         .collect();

@@ -8,8 +8,8 @@ use crate::common::seed::{
     CLUSTERED_DIM_TABLE, CLUSTERED_FACT_TABLE, CLUSTERED_HOT_KEYS, CLUSTERED_JOIN_NAMESPACE,
     CLUSTERED_KEYS, CLUSTERED_ROWS_PER_KEY, DIM_CUSTOMER_ROWS, E2E_BLANK_LABEL_TABLE,
     E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_SUPPLIER_TABLE, FACT_ORDERS_ROWS,
-    LINEITEM_ROWS, O_TOTALPRICE_PS, order_custkey, order_date_days, order_totalprice_unscaled,
-    seed_clustered_join,
+    LINEITEM_ROWS, O_TOTALPRICE_PS, SEED_LABELS_ROWS, labels_score, order_custkey, order_date_days,
+    order_totalprice_unscaled, seed_clustered_join,
 };
 use crate::common::stack::iceberg_catalog_url;
 use crate::fixtures::{events, stack, vs_table};
@@ -77,6 +77,7 @@ fn expected_join_rows_by_orderdate_desc(
     rows
 }
 
+/// Scenario: Broadcast-eligible inner equi-join is planned as a broadcast fan-out
 #[test]
 fn e2e_broadcast_join_pushdown_shape() {
     setup_e2e();
@@ -116,6 +117,7 @@ fn e2e_broadcast_join_result_correct() {
     );
 }
 
+/// Scenario: A bare LIMIT over a broadcast-eligible join is served by the broadcast path with a per-shard post-join cap
 #[test]
 fn e2e_broadcast_join_bare_limit_stays_broadcast_and_truncates() {
     setup_e2e();
@@ -455,6 +457,7 @@ fn e2e_join_offset_and_aggregate_shapes_still_use_two_scan_fallback() {
     );
 }
 
+/// Scenario: Small-side selection uses table-format metadata and the broadcast threshold
 #[test]
 fn e2e_above_threshold_unaccelerated_fallback_shape() {
     setup_e2e();
@@ -989,6 +992,7 @@ fn expected_full_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, St
     rows
 }
 
+/// Scenario: A broadcast-eligible join whose filter declines takes the N-scan fallback
 #[test]
 fn e2e_broadcast_declined_filter_falls_back_to_n_scan_and_filters() {
     setup_e2e();
@@ -1235,6 +1239,7 @@ fn e2e_broadcast_like_on_decimal_column_falls_back_and_filters() {
     );
 }
 
+/// Scenario: A broadcast-join filter over a DATE LIKE subject keeps the broadcast plan
 #[test]
 fn e2e_broadcast_like_on_date_column_stays_broadcast_and_filters() {
     setup_e2e();
@@ -1473,6 +1478,362 @@ fn e2e_join_select_list_with_a_column_and_its_cast_matches_seed() {
     }
 }
 
+/// Which join path the adapter must choose for a query on the default-threshold schema.
+#[derive(Clone, Copy, PartialEq)]
+enum JoinPath {
+    Broadcast,
+    NScan,
+}
+
+/// One shared-column-name join. `@VS@` in `template` is replaced by the virtual schema name.
+struct SharedNameJoin<'a> {
+    label: &'a str,
+    template: &'a str,
+    path_on_default_threshold: JoinPath,
+    /// Columns whose `LHS_T0`/`LHS_T1` pair the pushed join condition must compare.
+    condition_columns: &'a [&'a str],
+    /// Output names the EMITS list must declare, `"LHS_T0_ID"` with its quotes.
+    emits: &'a [&'a str],
+    /// Text the pushed SQL must contain, for the per-shard top-N.
+    pushed_contains: &'a [&'a str],
+    column_types: &'a [&'a str],
+    ordered: bool,
+    expected: Vec<Vec<String>>,
+}
+
+/// Compares numbers as `f64`, because Exasol renders a DOUBLE as `5` or `5.0`.
+fn normalized_cell(cell: &str) -> String {
+    cell.parse::<f64>()
+        .map(|number| number.to_string())
+        .unwrap_or_else(|_| cell.to_string())
+}
+
+fn normalized_rows(columns: &[Vec<serde_json::Value>], ordered: bool) -> Vec<Vec<String>> {
+    let row_count = columns.first().map_or(0, Vec::len);
+    let mut rows: Vec<Vec<String>> = (0..row_count)
+        .map(|row| {
+            columns
+                .iter()
+                .map(|column| normalized_cell(&value_to_string(&column[row])))
+                .collect()
+        })
+        .collect();
+    if !ordered {
+        rows.sort();
+    }
+    rows
+}
+
+fn expected_rows(rows: Vec<Vec<String>>, ordered: bool) -> Vec<Vec<String>> {
+    let mut rows: Vec<Vec<String>> = rows
+        .into_iter()
+        .map(|row| row.iter().map(|cell| normalized_cell(cell)).collect())
+        .collect();
+    if !ordered {
+        rows.sort();
+    }
+    rows
+}
+
+/// The `condition` value of the join block, still JSON-escaped.
+fn pushed_join_condition(pushed: &str) -> &str {
+    const KEY: &str = "\"condition\":\"";
+    let start = pushed
+        .find(KEY)
+        .unwrap_or_else(|| panic!("no join condition in the pushed SQL:\n{pushed}"))
+        + KEY.len();
+    let tail = &pushed[start..];
+    let mut escaped = false;
+    for (offset, byte) in tail.bytes().enumerate() {
+        match (escaped, byte) {
+            (true, _) => escaped = false,
+            (false, b'\\') => escaped = true,
+            (false, b'"') => return &tail[..offset],
+            _ => {}
+        }
+    }
+    panic!("unterminated join condition in the pushed SQL:\n{pushed}")
+}
+
+fn result_column_types(conn: &mut ExaConn, query_sql: &str) -> Vec<String> {
+    let resp = conn.execute(query_sql);
+    resp["responseData"]["results"][0]["resultSet"]["columns"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no result columns for {query_sql}: {resp:?}"))
+        .iter()
+        .map(|column| {
+            column["dataType"]["type"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no dataType.type in {column:?}"))
+                .to_string()
+        })
+        .collect()
+}
+
+fn assert_shared_name_join(conn: &mut ExaConn, case: &SharedNameJoin) {
+    let label = case.label;
+    let default_sql = case.template.replace("@VS@", VS_NAME);
+    let pushed = explain_virtual_sql(conn, &default_sql);
+
+    match case.path_on_default_threshold {
+        JoinPath::Broadcast => {
+            assert!(
+                has_broadcast_join_block(&pushed),
+                "{label}: a join over shared column names must take the broadcast path:\n{pushed}"
+            );
+            assert!(
+                !has_two_scan_wrapper(&pushed),
+                "{label}: the broadcast path names LHS_T* relations inside its scan spec, never \
+                 as a subquery alias:\n{pushed}"
+            );
+            let condition = pushed_join_condition(&pushed);
+            for column in case.condition_columns {
+                for alias in ["LHS_T0", "LHS_T1"] {
+                    let side = format!(r#"\"{alias}\".\"{column}\""#);
+                    assert!(
+                        condition.contains(&side),
+                        "{label}: the join condition must compare {side}, one per relation: \
+                         {condition}\n{pushed}"
+                    );
+                }
+            }
+            let emits = pushed
+                .split_once("EMITS (")
+                .unwrap_or_else(|| panic!("{label}: no EMITS list:\n{pushed}"))
+                .1;
+            for output in case.emits {
+                assert!(
+                    emits.contains(output),
+                    "{label}: the EMITS list must declare {output}, the relation alias joined to \
+                     the column name:\n{emits}"
+                );
+            }
+            for needle in case.pushed_contains {
+                assert!(
+                    pushed.contains(needle),
+                    "{label}: the pushed SQL must contain {needle}:\n{pushed}"
+                );
+            }
+        }
+        JoinPath::NScan => {
+            assert!(
+                has_n_scan_wrapper(&pushed, 2),
+                "{label}: this join must take the N-scan fallback:\n{pushed}"
+            );
+            assert!(
+                !has_broadcast_join_block(&pushed),
+                "{label}: the N-scan fallback must not carry a broadcast join block:\n{pushed}"
+            );
+        }
+    }
+
+    let expected = expected_rows(case.expected.clone(), case.ordered);
+    for vs_name in [VS_NAME, VS_NAME_LOW] {
+        let sql = case.template.replace("@VS@", vs_name);
+        if vs_name == VS_NAME_LOW {
+            let low_pushed = explain_virtual_sql(conn, &sql);
+            assert!(
+                has_n_scan_wrapper(&low_pushed, 2) && !has_broadcast_join_block(&low_pushed),
+                "{label}: a 1-byte broadcast threshold must force the N-scan fallback:\n{low_pushed}"
+            );
+        }
+        let actual = normalized_rows(&conn.query_columns(&sql), case.ordered);
+        assert_eq!(
+            actual, expected,
+            "{label} on {vs_name}: rows must equal the seed-derived rows.\nquery: {sql}"
+        );
+        if !case.column_types.is_empty() {
+            assert_eq!(
+                result_column_types(conn, &sql),
+                case.column_types,
+                "{label} on {vs_name}: each column keeps its own relation's declared type"
+            );
+        }
+    }
+}
+
+fn event_name(id: usize) -> String {
+    format!("event-{id:02}")
+}
+
+fn event_score(id: usize) -> String {
+    (5.0 * id as f64).to_string()
+}
+
+fn label_name(id: usize) -> String {
+    format!("label-{id:02}")
+}
+
+fn order_pairs_sharing_a_customer() -> Vec<(usize, usize)> {
+    let orders = 1..=FACT_ORDERS_ROWS;
+    orders
+        .clone()
+        .flat_map(|a| {
+            orders
+                .clone()
+                .filter(move |&b| order_custkey(b) == order_custkey(a))
+                .map(move |b| (a, b))
+        })
+        .collect()
+}
+
+fn pair_rows(pairs: impl IntoIterator<Item = (usize, usize)>) -> Vec<Vec<String>> {
+    pairs
+        .into_iter()
+        .map(|(a, b)| vec![a.to_string(), b.to_string()])
+        .collect()
+}
+
+/// Scenario: Legs that share column names are planned as a broadcast fan-out
+/// Scenario: Broadcast join projection and filter are rendered per involved table
+/// Scenario: Join condition is rendered via the vs-expression translator
+/// Scenario: Scan registers both tables and executes the inner equi-join
+#[test]
+fn e2e_broadcast_join_over_shared_column_names_matches_native() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let fact_join = "@VS@.FACT_ORDERS a JOIN @VS@.FACT_ORDERS b ON a.O_CUSTKEY = b.O_CUSTKEY";
+    let events_labels = "@VS@.EVENTS e JOIN @VS@.LABELS l ON e.ID = l.ID";
+    let ids = 1..=SEED_LABELS_ROWS;
+    let per_id = |row: fn(usize) -> Vec<String>, ids: Vec<usize>| -> Vec<Vec<String>> {
+        ids.into_iter().map(row).collect()
+    };
+    let top_pairs = {
+        let mut pairs = order_pairs_sharing_a_customer();
+        pairs.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
+        pairs.truncate(3);
+        pairs
+    };
+
+    let cases = [
+        SharedNameJoin {
+            label: "(a) shared join key and a filter on it",
+            template: &format!(
+                "SELECT e.ID, l.ID, e.NAME, l.LABEL FROM {events_labels} WHERE l.ID >= 8"
+            ),
+            path_on_default_threshold: JoinPath::Broadcast,
+            condition_columns: &["ID"],
+            emits: &[
+                r#""LHS_T0_ID""#,
+                r#""LHS_T1_ID""#,
+                r#""LHS_T0_NAME""#,
+                r#""LHS_T1_LABEL""#,
+            ],
+            pushed_contains: &[],
+            column_types: &[],
+            ordered: false,
+            expected: per_id(
+                |id| {
+                    vec![
+                        id.to_string(),
+                        id.to_string(),
+                        event_name(id),
+                        label_name(id),
+                    ]
+                },
+                (8..=SEED_LABELS_ROWS).collect(),
+            ),
+        },
+        SharedNameJoin {
+            label: "(b) self-join",
+            template: &format!("SELECT a.O_ORDERKEY, b.O_ORDERKEY FROM {fact_join}"),
+            path_on_default_threshold: JoinPath::Broadcast,
+            condition_columns: &["O_CUSTKEY"],
+            emits: &[r#""LHS_T0_O_ORDERKEY""#, r#""LHS_T1_O_ORDERKEY""#],
+            pushed_contains: &[],
+            column_types: &[],
+            ordered: false,
+            expected: pair_rows(order_pairs_sharing_a_customer()),
+        },
+        SharedNameJoin {
+            label: "(c) self-join top-N over the second occurrence",
+            template: &format!(
+                "SELECT a.O_ORDERKEY, b.O_ORDERKEY FROM {fact_join} \
+                 ORDER BY b.O_ORDERKEY DESC, a.O_ORDERKEY LIMIT 3"
+            ),
+            path_on_default_threshold: JoinPath::Broadcast,
+            condition_columns: &["O_CUSTKEY"],
+            emits: &[r#""LHS_T0_O_ORDERKEY""#, r#""LHS_T1_O_ORDERKEY""#],
+            pushed_contains: &[],
+            column_types: &[],
+            ordered: true,
+            expected: pair_rows(top_pairs),
+        },
+        SharedNameJoin {
+            label: "(d1) shared non-key column projected from both sides",
+            template: &format!("SELECT e.SCORE, l.SCORE FROM {events_labels}"),
+            path_on_default_threshold: JoinPath::Broadcast,
+            condition_columns: &["ID"],
+            emits: &[r#""LHS_T0_SCORE" DOUBLE"#, r#""LHS_T1_SCORE" VARCHAR("#],
+            pushed_contains: &[],
+            column_types: &["DOUBLE", "VARCHAR"],
+            ordered: false,
+            expected: per_id(
+                |id| vec![event_score(id), labels_score(id)],
+                ids.clone().collect(),
+            ),
+        },
+        SharedNameJoin {
+            label: "(d2) filter on the shared column of one side",
+            template: &format!(
+                "SELECT e.SCORE, l.SCORE FROM {events_labels} WHERE l.SCORE = 'score-07'"
+            ),
+            path_on_default_threshold: JoinPath::Broadcast,
+            condition_columns: &["ID"],
+            emits: &[r#""LHS_T0_SCORE""#, r#""LHS_T1_SCORE""#],
+            pushed_contains: &[],
+            column_types: &["DOUBLE", "VARCHAR"],
+            ordered: false,
+            expected: vec![vec![event_score(14), labels_score(14)]],
+        },
+        SharedNameJoin {
+            label: "(d3) shared column unread",
+            template: &format!("SELECT e.NAME, l.LABEL FROM {events_labels}"),
+            path_on_default_threshold: JoinPath::Broadcast,
+            condition_columns: &["ID"],
+            emits: &[r#""LHS_T0_NAME""#, r#""LHS_T1_LABEL""#],
+            pushed_contains: &[],
+            column_types: &[],
+            ordered: false,
+            expected: per_id(
+                |id| vec![event_name(id), label_name(id)],
+                ids.clone().collect(),
+            ),
+        },
+        SharedNameJoin {
+            label: "(d4) top-N ordered by the shared column of the second relation",
+            template: &format!(
+                "SELECT e.SCORE, l.SCORE FROM {events_labels} ORDER BY l.SCORE DESC LIMIT 3"
+            ),
+            path_on_default_threshold: JoinPath::Broadcast,
+            condition_columns: &["ID"],
+            emits: &[r#""LHS_T0_SCORE""#, r#""LHS_T1_SCORE""#],
+            pushed_contains: &["\"post_join_order_by\"", "\"post_join_limit\":3"],
+            column_types: &[],
+            ordered: true,
+            expected: per_id(|id| vec![event_score(id), labels_score(id)], vec![1, 2, 3]),
+        },
+        SharedNameJoin {
+            label: "(d5) sort key not projected",
+            template: &format!("SELECT e.SCORE FROM {events_labels} ORDER BY l.SCORE LIMIT 3"),
+            path_on_default_threshold: JoinPath::NScan,
+            condition_columns: &[],
+            emits: &[],
+            pushed_contains: &[],
+            column_types: &[],
+            ordered: true,
+            expected: per_id(
+                |id| vec![event_score(id)],
+                vec![SEED_LABELS_ROWS, SEED_LABELS_ROWS - 1, SEED_LABELS_ROWS - 2],
+            ),
+        },
+    ];
+
+    for case in &cases {
+        assert_shared_name_join(&mut conn, case);
+    }
+}
+
 fn fetch_order_rows(conn: &mut ExaConn) -> Vec<(String, String)> {
     let cols = conn.query_columns(&format!(
         "SELECT O_ORDERKEY, O_CUSTKEY FROM {}",
@@ -1491,70 +1852,64 @@ fn fetch_order_rows(conn: &mut ExaConn) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Scenario: A table joined to itself renders each occurrence as its own leg
 #[test]
 fn e2e_self_join_on_primitive_column_matches_single_node() {
     setup_e2e();
     let mut conn = exa_conn();
-    let fact = vs_fact_table(VS_NAME);
-
-    let query = format!(
-        "SELECT a.O_ORDERKEY, a.O_CUSTKEY FROM {fact} a JOIN {fact} b \
-         ON a.O_ORDERKEY = b.O_ORDERKEY"
-    );
-    let pushed = explain_virtual_sql(&mut conn, &query);
-    assert!(
-        has_n_scan_wrapper(&pushed, 2),
-        "a two-leg self-join must emit the N-scan wrapper with two distinct \
-         LHS_T* fan-out aliases:\n{pushed}"
-    );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "a self-join must NOT ride the broadcast in-UDF join (self-joins are \
-         never broadcast-eligible):\n{pushed}"
-    );
-    let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
 
     let mut expected = fetch_order_rows(&mut conn);
     expected.sort();
-
     assert_eq!(
-        actual.len(),
+        expected.len(),
         FACT_ORDERS_ROWS,
-        "expected {FACT_ORDERS_ROWS} self-matched rows (O_ORDERKEY is unique \
-         per row), not the pre-fix cross product of {}: {actual:?}",
-        FACT_ORDERS_ROWS * FACT_ORDERS_ROWS
+        "seed invariant: O_ORDERKEY is unique per row"
     );
-    assert_eq!(
-        actual, expected,
-        "self-join on the unique O_ORDERKEY must equal each row matched only \
-         with itself, computed independently by reading fact_orders \
-         un-joined.\nactual:   {actual:?}\nexpected: {expected:?}"
-    );
+
+    for vs_name in [VS_NAME, VS_NAME_LOW] {
+        let fact = vs_fact_table(vs_name);
+        let query = format!(
+            "SELECT a.O_ORDERKEY, a.O_CUSTKEY FROM {fact} a JOIN {fact} b \
+             ON a.O_ORDERKEY = b.O_ORDERKEY"
+        );
+        let pushed = explain_virtual_sql(&mut conn, &query);
+        assert_self_join_path(vs_name, &pushed);
+        let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
+
+        assert_eq!(
+            actual,
+            expected,
+            "{vs_name}: a self-join on the unique O_ORDERKEY must equal each row matched \
+             only with itself, computed independently by reading fact_orders un-joined, \
+             not the cross product of {}.\nactual:   {actual:?}\nexpected: {expected:?}",
+            FACT_ORDERS_ROWS * FACT_ORDERS_ROWS
+        );
+    }
 }
 
+/// Broadcast on the default-threshold schema, the N-scan wrapper on the low-threshold one.
+fn assert_self_join_path(vs_name: &str, pushed: &str) {
+    if vs_name == VS_NAME_LOW {
+        assert!(
+            has_n_scan_wrapper(pushed, 2) && !has_broadcast_join_block(pushed),
+            "{vs_name}: a two-leg self-join above the broadcast threshold must emit the \
+             N-scan wrapper with two distinct LHS_T* fan-out aliases:\n{pushed}"
+        );
+    } else {
+        assert!(
+            has_broadcast_join_block(pushed) && !has_two_scan_wrapper(pushed),
+            "{vs_name}: a two-leg self-join within the broadcast threshold must take the \
+             broadcast in-UDF join:\n{pushed}"
+        );
+    }
+}
+
+/// Scenario: A shared-column-name join on the fallback renders each column qualified by its leg
 #[test]
 fn e2e_self_join_with_one_unaliased_occurrence_matches_single_node() {
     setup_e2e();
     let mut conn = exa_conn();
-    let fact = vs_fact_table(VS_NAME);
     let bare = E2E_FACT_TABLE.to_uppercase();
-
-    let query = format!(
-        "SELECT {bare}.O_ORDERKEY, b.O_ORDERKEY FROM {fact} JOIN {fact} b \
-         ON {bare}.O_CUSTKEY = b.O_CUSTKEY"
-    );
-    let pushed = explain_virtual_sql(&mut conn, &query);
-    assert!(
-        has_n_scan_wrapper(&pushed, 2),
-        "a self-join with one unaliased occurrence must emit the N-scan \
-         wrapper with two distinct LHS_T* fan-out aliases:\n{pushed}"
-    );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "a self-join must NOT ride the broadcast in-UDF join (self-joins are \
-         never broadcast-eligible):\n{pushed}"
-    );
-    let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
 
     let orders = fetch_order_rows(&mut conn);
     let mut expected: Vec<(String, String)> = orders
@@ -1567,22 +1922,32 @@ fn e2e_self_join_with_one_unaliased_occurrence_matches_single_node() {
         })
         .collect();
     expected.sort();
-
     assert_eq!(
         expected.len(),
         FACT_ORDERS_ROWS * (FACT_ORDERS_ROWS / DIM_CUSTOMER_ROWS),
-        "seed invariant: {FACT_ORDERS_ROWS} orders over {DIM_CUSTOMER_ROWS} \
-         customers must form {DIM_CUSTOMER_ROWS} groups of 2, each \
-         contributing 4 self-matched pairs (20 total), not the pre-fix cross \
-         product of {}: {expected:?}",
+        "seed invariant: {FACT_ORDERS_ROWS} orders over {DIM_CUSTOMER_ROWS} customers form \
+         {DIM_CUSTOMER_ROWS} groups of 2, each contributing 4 self-matched pairs (20 total), \
+         not the cross product of {}: {expected:?}",
         FACT_ORDERS_ROWS * FACT_ORDERS_ROWS
     );
-    assert_eq!(
-        actual, expected,
-        "a self-join with one unaliased occurrence must equal the pairs \
-         sharing O_CUSTKEY, computed independently by reading fact_orders \
-         un-joined.\nactual:   {actual:?}\nexpected: {expected:?}"
-    );
+
+    for vs_name in [VS_NAME, VS_NAME_LOW] {
+        let fact = vs_fact_table(vs_name);
+        let query = format!(
+            "SELECT {bare}.O_ORDERKEY, b.O_ORDERKEY FROM {fact} JOIN {fact} b \
+             ON {bare}.O_CUSTKEY = b.O_CUSTKEY"
+        );
+        let pushed = explain_virtual_sql(&mut conn, &query);
+        assert_self_join_path(vs_name, &pushed);
+        let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
+
+        assert_eq!(
+            actual, expected,
+            "{vs_name}: a column with no tableAlias must bind to its own occurrence, so the \
+             result equals the pairs sharing O_CUSTKEY, computed independently by reading \
+             fact_orders un-joined.\nactual:   {actual:?}\nexpected: {expected:?}"
+        );
+    }
 }
 
 #[test]
@@ -1632,51 +1997,53 @@ fn e2e_three_leg_self_join_matches_single_node() {
 fn e2e_self_join_with_one_sided_filter_matches_single_node() {
     setup_e2e();
     let mut conn = exa_conn();
-    let fact = vs_fact_table(VS_NAME);
     let threshold = DIM_CUSTOMER_ROWS as i64;
-
-    let query = format!(
-        "SELECT a.O_ORDERKEY, b.O_ORDERKEY FROM {fact} a JOIN {fact} b \
-         ON a.O_CUSTKEY = b.O_CUSTKEY WHERE a.O_ORDERKEY <= {threshold}"
-    );
-    let pushed = explain_virtual_sql(&mut conn, &query);
-    assert!(
-        has_n_scan_wrapper(&pushed, 2),
-        "a self-join with a one-sided WHERE conjunct must emit the N-scan \
-         wrapper with two distinct LHS_T* fan-out aliases:\n{pushed}"
-    );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "a self-join must NOT ride the broadcast in-UDF join (self-joins are \
-         never broadcast-eligible):\n{pushed}"
-    );
-    let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
 
     let orders = fetch_order_rows(&mut conn);
     let mut expected: Vec<(String, String)> = orders
         .iter()
-        .filter(|(a_key, _)| a_key.parse::<i64>().expect("O_ORDERKEY is numeric") <= threshold)
         .flat_map(|(a_key, a_cust)| {
             orders
                 .iter()
+                .filter(|(b_key, _)| {
+                    b_key.parse::<i64>().expect("O_ORDERKEY is numeric") <= threshold
+                })
                 .filter(move |(_, b_cust)| b_cust == a_cust)
                 .map(move |(b_key, _)| (a_key.clone(), b_key.clone()))
         })
         .collect();
     expected.sort();
-
     assert!(
         !expected.is_empty(),
-        "the WHERE conjunct must leave a non-empty result, else this test \
-         proves nothing about leg-local filtering: {expected:?}"
+        "the WHERE conjunct must leave a non-empty result, else this test proves nothing \
+         about leg-local filtering: {expected:?}"
     );
-    assert_eq!(
-        actual, expected,
-        "a WHERE conjunct local to alias `a` must restrict only `a`'s rows, \
-         leaving `b` free to match any row sharing O_CUSTKEY — including \
-         rows the filter excludes for `a`.\nactual:   {actual:?}\n\
-         expected: {expected:?}"
-    );
+
+    for vs_name in [VS_NAME, VS_NAME_LOW] {
+        let fact = vs_fact_table(vs_name);
+        let query = format!(
+            "SELECT a.O_ORDERKEY, b.O_ORDERKEY FROM {fact} a JOIN {fact} b \
+             ON a.O_CUSTKEY = b.O_CUSTKEY WHERE b.O_ORDERKEY <= {threshold}"
+        );
+        let pushed = explain_virtual_sql(&mut conn, &query);
+        assert_self_join_path(vs_name, &pushed);
+        if vs_name == VS_NAME {
+            // The filter prunes fact_orders' second file from leg 1 only, so leg 1 has fewer
+            // bytes; the byte tie-break alone would pick leg 0.
+            assert!(
+                pushed.contains("\"dimension_alias\":\"LHS_T1\""),
+                "{vs_name}: the pruned second occurrence must be the dimension:\n{pushed}"
+            );
+        }
+        let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
+
+        assert_eq!(
+            actual, expected,
+            "{vs_name}: a WHERE conjunct local to alias `b` must restrict only `b`'s rows, \
+             leaving `a` free to match any row sharing O_CUSTKEY, including rows the filter \
+             excludes for `b`.\nactual:   {actual:?}\nexpected: {expected:?}"
+        );
+    }
 }
 
 #[test]
