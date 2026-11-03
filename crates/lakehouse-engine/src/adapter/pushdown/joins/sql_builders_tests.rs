@@ -7,8 +7,7 @@ use super::super::planning::{
 use super::super::rendering::leg_binary_columns;
 use super::super::tests::{
     broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves,
-    nq3_join_request, resolved_side, self_join_request, three_table_join_request, two_leg_aliases,
-    two_scan_tuning,
+    nq3_join_request, resolved_side, self_join_request, three_table_join_request, two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
@@ -1776,7 +1775,6 @@ fn golden_broadcast_join_sql_unchanged() {
         filter: Some(r#"("LHS_T0"."L_QUANTITY" > 5)"#.to_string()),
         projection: vec![lineitem_column("L_ORDERKEY"), orders_column("O_ORDERDATE")],
         projection_types: vec!["DECIMAL(20,0)".to_string(), "DATE".to_string()],
-        relation_aliases: two_leg_aliases(),
         window: JoinWindowPlan::Unbounded,
     };
     let actual =
@@ -1820,7 +1818,6 @@ fn broadcast_carries_each_sides_own_storage() {
         filter: None,
         projection: vec![lineitem_column("L_ORDERKEY")],
         projection_types: vec!["DECIMAL(20,0)".to_string()],
-        relation_aliases: two_leg_aliases(),
         window: JoinWindowPlan::Unbounded,
     };
     let sql = build_broadcast_join_sql(
@@ -1898,7 +1895,6 @@ fn broadcast_sql_projecting(
             .iter()
             .map(|(_, exasol_type)| (*exasol_type).to_string())
             .collect(),
-        relation_aliases: two_leg_aliases(),
         window,
     };
     build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE")

@@ -2348,7 +2348,6 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
             "CUSTOMER_KEY",
         ))],
         projection_types: vec!["DECIMAL(20,0)".to_string()],
-        relation_aliases: vec!["LHS_T0".to_string(), "LHS_T1".to_string()],
         window: super::joins::JoinWindowPlan::Unbounded,
     };
     let tuning = super::joins::JoinScanRequestConfig {

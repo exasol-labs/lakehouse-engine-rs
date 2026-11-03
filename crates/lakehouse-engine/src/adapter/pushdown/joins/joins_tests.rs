@@ -232,11 +232,6 @@ pub(super) fn broadcast_projection(request: &Json) -> (Vec<ProjectionItem>, Vec<
     .expect("projectable")
 }
 
-/// Leg 0 then leg 1, the aliases `render_broadcast_join` records for a two-leg join.
-pub(super) fn two_leg_aliases() -> Vec<String> {
-    vec!["LHS_T0".to_string(), "LHS_T1".to_string()]
-}
-
 /// Derived through [`DetectedJoin::legs`], the only multi-leg constructor; conditions play
 /// no part in leg identity.
 pub(super) fn legs_from_leaves(leaves: Vec<JoinLeaf>) -> JoinLegs {

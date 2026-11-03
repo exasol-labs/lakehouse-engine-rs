@@ -1,10 +1,11 @@
-use crate::scan::spec::{ColumnRef, LogicalField, ProjectionItem, SortKey, render_ordered};
+use crate::scan::spec::{LogicalField, ProjectionItem, SortKey, render_ordered};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::render_expression_exasol_safe;
 
 use super::support::{
-    collect_all_column_names, emits_ident, extract_limit, extract_offset, render_limit_offset,
+    collect_all_column_names, column_node_ref, emits_ident, extract_limit, extract_offset,
+    render_limit_offset,
 };
 
 /// Bare `column` nodes only: per-shard bounded top-N is eligible for bare columns
@@ -18,18 +19,11 @@ pub(super) fn parse_sort_key_element(element: &Json) -> Option<SortKey> {
     if expr.get("type").and_then(|t| t.as_str()) != Some("column") {
         return None;
     }
-    let name = expr
-        .get("name")
-        .and_then(|n| n.as_str())
-        .map(|s| s.to_uppercase())?;
-    let relation = expr
-        .get("tableAlias")
-        .and_then(|alias| alias.as_str())
-        .map(str::to_string);
+    let column = column_node_ref(expr)?;
     let ascending = element.get("isAscending").and_then(|b| b.as_bool())?;
     let nulls_last = element.get("nullsLast").and_then(|b| b.as_bool())?;
     Some(SortKey {
-        column: ColumnRef { relation, name },
+        column,
         ascending,
         nulls_last,
     })

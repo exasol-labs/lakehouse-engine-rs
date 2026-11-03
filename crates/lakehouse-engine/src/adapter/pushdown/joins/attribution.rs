@@ -207,16 +207,7 @@ impl JoinLegs {
     /// binding it to either leg could return the other leg's values. Like [`Self::qualify`], it
     /// takes a raw request tree, never its own output.
     pub(super) fn qualify_every_column(&self, expr: &Json) -> Result<Json, UnattributableColumn> {
-        let mut unplaced = None;
-        walk_column_nodes(expr, &mut |column| {
-            if unplaced.is_none() && self.resolve_column(column) == ColumnLeg::NoLeg {
-                unplaced = Some(UnattributableColumn::of(column));
-            }
-        });
-        match unplaced {
-            Some(column) => Err(column),
-            None => self.qualify(expr),
-        }
+        self.qualify_tree(expr, true)
     }
 
     /// Overwrites each `column`'s `tableAlias` with its leg's `LHS_T{leg}` alias, since a bare
@@ -225,26 +216,33 @@ impl JoinLegs {
     /// leaf alias, so re-qualifying a self-join's output fails as unattributable, or binds the
     /// other leg when the query names its occurrences `LHS_T*`.
     pub(super) fn qualify(&self, expr: &Json) -> Result<Json, UnattributableColumn> {
+        self.qualify_tree(expr, false)
+    }
+
+    /// `strict` turns a [`ColumnLeg::NoLeg`] column into an error instead of leaving it as is.
+    fn qualify_tree(&self, expr: &Json, strict: bool) -> Result<Json, UnattributableColumn> {
         match expr {
             Json::Object(map) => {
                 let mut out = serde_json::Map::with_capacity(map.len() + 1);
                 for (key, value) in map {
-                    out.insert(key.clone(), self.qualify(value)?);
+                    out.insert(key.clone(), self.qualify_tree(value, strict)?);
                 }
                 if map.get("type").and_then(|node| node.as_str()) == Some("column") {
                     match self.resolve_column(map) {
                         ColumnLeg::Leg(leg) => {
                             out.insert("tableAlias".to_string(), Json::String(self.leg_alias(leg)));
                         }
-                        ColumnLeg::NoLeg => {}
-                        ColumnLeg::Unattributable => return Err(UnattributableColumn::of(map)),
+                        ColumnLeg::NoLeg if !strict => {}
+                        ColumnLeg::NoLeg | ColumnLeg::Unattributable => {
+                            return Err(UnattributableColumn::of(map));
+                        }
                     }
                 }
                 Ok(Json::Object(out))
             }
             Json::Array(items) => items
                 .iter()
-                .map(|item| self.qualify(item))
+                .map(|item| self.qualify_tree(item, strict))
                 .collect::<Result<Vec<Json>, UnattributableColumn>>()
                 .map(Json::Array),
             other => Ok(other.clone()),

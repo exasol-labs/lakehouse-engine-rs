@@ -1,7 +1,7 @@
 use crate::adapter::ResolvedConnectionConfig;
 use crate::scan::spec::{
     CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec, ScanStorage, SortKey,
-    StorageBackend, render_ordered,
+    StorageBackend, relation_alias, render_ordered,
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
@@ -41,9 +41,6 @@ pub(crate) struct RenderedJoinPushdown {
     pub projection: Vec<ProjectionItem>,
     /// Positionally aligned with `projection`.
     pub projection_types: Vec<String>,
-    /// Indexed by leg: the alias each leg's columns were qualified with, so the join block
-    /// names the relations the condition and filter reference.
-    pub relation_aliases: Vec<String>,
     /// Classified from the qualified ORDER BY, so each key carries its own leg's pair.
     pub(in super::super) window: JoinWindowPlan,
 }
@@ -93,9 +90,6 @@ pub(crate) fn render_broadcast_join(
         filter,
         projection,
         projection_types,
-        relation_aliases: (0..legs.leg_count())
-            .map(|leg| legs.leg_alias(leg))
-            .collect(),
         window: classify_join_window(&qualified_req),
     }))
 }
@@ -639,8 +633,8 @@ pub(in super::super) fn build_broadcast_join_sql(
         logical_schema: dimension.logical_schema.clone(),
         name_mapping: dimension.name_mapping.clone(),
         join_type: JoinType::Inner,
-        fact_alias: rendered.relation_aliases[sides.fact_leg()].clone(),
-        dimension_alias: rendered.relation_aliases[sides.dimension_leg].clone(),
+        fact_alias: relation_alias(sides.fact_leg()),
+        dimension_alias: relation_alias(sides.dimension_leg),
         condition: rendered.condition.clone(),
         post_join_limit: placement.shard_cap,
         post_join_order_by: placement.shard_order_by,

@@ -6,7 +6,7 @@ use super::super::sql_builders::{
 };
 use super::super::tests::{
     broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves,
-    resolved_side, two_leg_aliases, two_scan_tuning,
+    resolved_side, two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::support::{ColumnTypes, apply_type_rewrites};
@@ -1000,7 +1000,6 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
             "L_ORDERKEY",
         ))],
         projection_types: vec!["DECIMAL(20,0)".to_string()],
-        relation_aliases: two_leg_aliases(),
         window: JoinWindowPlan::Unbounded,
     };
     let tuning = JoinScanRequestConfig {
