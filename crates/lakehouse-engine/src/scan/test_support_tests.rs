@@ -2,7 +2,8 @@ use crate::scan::field_id_projection::build_logical_arrow_schema;
 use crate::scan::raw_scan::{build_scan_sql, register_files};
 use crate::scan::session_config_for_spec;
 use crate::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, ScanSpec, ScanStorage, StorageBackend, StorageProps,
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec, ScanStorage,
+    StorageBackend, StorageProps,
 };
 use crate::scan::{FieldIdExprAdapterFactory, FieldIdResolution, ResolvedScanStorage};
 use arrow::array::ArrayRef;
@@ -108,6 +109,23 @@ pub(super) fn minimal_spec() -> ScanSpec {
             ..Default::default()
         },
         files: vec![FileEntry::new("s3://test-bucket/data/part-0.parquet", 1024)],
+    }
+}
+
+pub(super) fn join_spec(storage: ScanStorage) -> JoinSpec {
+    JoinSpec {
+        table_root: String::new(),
+        files: Vec::new(),
+        logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
+        join_type: JoinType::Inner,
+        fact_alias: "LHS_T1".into(),
+        dimension_alias: "LHS_T0".into(),
+        condition: r#""LHS_T0"."D_KEY" = "LHS_T1"."F_KEY""#.into(),
+        post_join_limit: None,
+        post_join_order_by: Vec::new(),
+        partition_columns: Vec::new(),
+        storage,
     }
 }
 

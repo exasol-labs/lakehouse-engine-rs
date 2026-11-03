@@ -3,7 +3,7 @@
 //! diff in one of them is always a regression, never an expected update.
 
 use super::test_support::{
-    agg_item, pd, sample_scan_storage, sample_storage, with_identifier_notes,
+    agg_item, broadcast_sides, pd, sample_scan_storage, sample_storage, with_identifier_notes,
 };
 use super::*;
 
@@ -897,12 +897,7 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     let rendered = render_broadcast_join(&request, &pushdown_req, &join, &BinaryColumns::default())
         .expect("render_broadcast_join must not error for a well-formed request")
         .expect("a filterless equi-join must stay broadcast-eligible");
-    let sides = JoinSides {
-        fact: resolved_orders_side(),
-        dimension: resolved_customer_side(),
-        broadcast_eligible: true,
-        dimension_leg: 0,
-    };
+    let sides = broadcast_sides(resolved_orders_side(), resolved_customer_side(), 0);
     let broadcast_sql = build_broadcast_join_sql(
         &sides,
         &rendered,
@@ -960,12 +955,7 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
     let rendered = render_broadcast_join(&request, &pushdown_req, &join, &BinaryColumns::default())
         .expect("render_broadcast_join must not error for a well-formed request")
         .expect("an equi-join with a rendering filter must stay broadcast-eligible");
-    let sides = JoinSides {
-        fact: resolved_orders_side(),
-        dimension: resolved_customer_side(),
-        broadcast_eligible: true,
-        dimension_leg: 0,
-    };
+    let sides = broadcast_sides(resolved_orders_side(), resolved_customer_side(), 0);
     let broadcast_sql = build_broadcast_join_sql(
         &sides,
         &rendered,

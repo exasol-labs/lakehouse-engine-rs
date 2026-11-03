@@ -9,8 +9,8 @@ use datafusion::datasource::MemTable;
 use super::*;
 use crate::scan::raw_scan::NESTED_JSON_RENDER_UDF_NAME;
 use crate::scan::raw_scan::register_nested_json_render_udf;
-use crate::scan::spec::{ColumnRef, JoinSpec, JoinType, ProjectionItem, SortKey};
-use crate::scan::test_support::minimal_spec;
+use crate::scan::spec::{ColumnRef, JoinSpec, ProjectionItem, SortKey};
+use crate::scan::test_support::{join_spec, minimal_spec};
 
 #[tokio::test]
 async fn build_join_sql_renders_a_nested_column_as_valid_json_end_to_end() {
@@ -88,18 +88,9 @@ fn post_join_spec(fact_column: &str, order_by: Vec<SortKey>, limit: Option<u64>)
         ProjectionItem::Column(ColumnRef::qualified(FACT_ALIAS, fact_column)),
     ];
     spec.common.join = Some(JoinSpec {
-        table_root: String::new(),
-        files: Vec::new(),
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join_type: JoinType::Inner,
-        fact_alias: FACT_ALIAS.into(),
-        dimension_alias: DIM_ALIAS.into(),
-        condition: "\"LHS_T0\".\"D_KEY\" = \"LHS_T1\".\"F_KEY\"".into(),
         post_join_limit: limit,
         post_join_order_by: order_by,
-        partition_columns: Vec::new(),
-        storage,
+        ..join_spec(storage)
     });
     spec
 }

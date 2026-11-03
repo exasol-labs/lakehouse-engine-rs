@@ -1764,18 +1764,16 @@ fn golden_broadcast_join_sql_unchanged() {
         allow_http: true,
         ..Default::default()
     });
-    let sides = JoinSides {
-        fact,
-        dimension,
-        broadcast_eligible: true,
-        dimension_leg: 1,
-    };
+    let sides = broadcast_sides(fact, dimension, 1);
     let rendered = RenderedJoinPushdown {
-        condition: r#"("LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY")"#.to_string(),
         filter: Some(r#"("LHS_T0"."L_QUANTITY" > 5)"#.to_string()),
-        projection: vec![lineitem_column("L_ORDERKEY"), orders_column("O_ORDERDATE")],
-        projection_types: vec!["DECIMAL(20,0)".to_string(), "DATE".to_string()],
-        window: JoinWindowPlan::Unbounded,
+        ..rendered_join(
+            r#"("LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY")"#,
+            &[
+                (lineitem_column("L_ORDERKEY"), "DECIMAL(20,0)"),
+                (orders_column("O_ORDERDATE"), "DATE"),
+            ],
+        )
     };
     let actual =
         build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE")
@@ -1807,19 +1805,11 @@ fn broadcast_carries_each_sides_own_storage() {
         allow_http: true,
         ..Default::default()
     });
-    let sides = JoinSides {
-        fact: fact.clone(),
-        dimension: dimension.clone(),
-        broadcast_eligible: true,
-        dimension_leg: 1,
-    };
-    let rendered = RenderedJoinPushdown {
-        condition: r#"("LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY")"#.to_string(),
-        filter: None,
-        projection: vec![lineitem_column("L_ORDERKEY")],
-        projection_types: vec!["DECIMAL(20,0)".to_string()],
-        window: JoinWindowPlan::Unbounded,
-    };
+    let sides = broadcast_sides(fact.clone(), dimension.clone(), 1);
+    let rendered = rendered_join(
+        r#"("LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY")"#,
+        &[(lineitem_column("L_ORDERKEY"), "DECIMAL(20,0)")],
+    );
     let sql = build_broadcast_join_sql(
         &sides,
         &rendered,
@@ -1881,21 +1871,17 @@ fn broadcast_sql_projecting(
     projection: &[(ProjectionItem, &str)],
     window: JoinWindowPlan,
 ) -> Option<String> {
-    let sides = JoinSides {
-        fact: resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]),
-        dimension: resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]),
-        broadcast_eligible: true,
-        dimension_leg: 1,
-    };
+    let sides = broadcast_sides(
+        resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]),
+        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]),
+        1,
+    );
     let rendered = RenderedJoinPushdown {
-        condition: r#"("LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY")"#.to_string(),
-        filter: None,
-        projection: projection.iter().map(|(item, _)| item.clone()).collect(),
-        projection_types: projection
-            .iter()
-            .map(|(_, exasol_type)| (*exasol_type).to_string())
-            .collect(),
         window,
+        ..rendered_join(
+            r#"("LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY")"#,
+            projection,
+        )
     };
     build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE")
         .expect("selecting the wire storage must succeed")
@@ -3214,12 +3200,11 @@ fn shared_names_broadcast_sql(request: &Json, binary_columns: &BinaryColumns) ->
         binary_columns,
     )
     .expect("a well-formed request renders without error")?;
-    let sides = JoinSides {
-        fact: resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 1000)]),
-        dimension: resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
-        broadcast_eligible: true,
-        dimension_leg: 1,
-    };
+    let sides = broadcast_sides(
+        resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 1000)]),
+        resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
+        1,
+    );
     build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE")
         .expect("selecting the wire storage must succeed")
 }

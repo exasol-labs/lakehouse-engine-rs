@@ -185,18 +185,10 @@ fn join_spec(
                 .collect(),
             filter: filter.map(Into::into),
             join: Some(JoinSpec {
-                table_root: String::new(),
                 files: dim_files.into_iter().map(FileEntry::from).collect(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join_type: JoinType::Inner,
-                fact_alias: FACT_ALIAS.into(),
-                dimension_alias: DIM_ALIAS.into(),
                 condition: JOIN_CONDITION.into(),
                 post_join_limit: limit,
-                post_join_order_by: Vec::new(),
-                partition_columns: Vec::new(),
-                storage: ScanStorage::Inline(dim_storage()),
+                ..scan_fixture::join_spec(ScanStorage::Inline(dim_storage()))
             }),
             storage: ScanStorage::Inline(storage()),
             // Above one target partition DataFusion defaults joins to `Partitioned` mode.
@@ -502,22 +494,15 @@ fn each_join_side_materializes_its_own_partition_columns() {
             ],
             partition_columns: vec!["o_region".to_string()],
             join: Some(JoinSpec {
-                table_root: String::new(),
                 files: vec![dim_file],
                 logical_schema: vec![
                     logical_field(1, "c_custkey", "int64"),
                     logical_field(2, "c_name", "utf8"),
                     logical_field(3, "c_country", "utf8"),
                 ],
-                name_mapping: Vec::new(),
-                join_type: JoinType::Inner,
-                fact_alias: FACT_ALIAS.into(),
-                dimension_alias: DIM_ALIAS.into(),
                 condition: JOIN_CONDITION.into(),
-                post_join_limit: None,
-                post_join_order_by: Vec::new(),
                 partition_columns: vec!["c_country".to_string()],
-                storage: ScanStorage::Inline(dim_storage()),
+                ..scan_fixture::join_spec(ScanStorage::Inline(dim_storage()))
             }),
             storage: ScanStorage::Inline(storage()),
             ..Default::default()
@@ -1094,15 +1079,11 @@ fn a_dimension_side_read_failure_redacts_the_dimension_sides_credential() {
                     logical_field(1, "c_custkey", "int64"),
                     logical_field(2, "c_name", "utf8"),
                 ],
-                name_mapping: Vec::new(),
-                join_type: JoinType::Inner,
-                fact_alias: FACT_ALIAS.into(),
-                dimension_alias: DIM_ALIAS.into(),
                 condition: JOIN_CONDITION.into(),
-                post_join_limit: None,
-                post_join_order_by: Vec::new(),
-                partition_columns: Vec::new(),
-                storage: ScanStorage::Inline(s3_backend(&dim_endpoint, "DIMSECRETVALUE")),
+                ..scan_fixture::join_spec(ScanStorage::Inline(s3_backend(
+                    &dim_endpoint,
+                    "DIMSECRETVALUE",
+                )))
             }),
             storage: ScanStorage::Inline(s3_backend(&fact_endpoint, "TOPSECRETVALUE")),
             ..Default::default()

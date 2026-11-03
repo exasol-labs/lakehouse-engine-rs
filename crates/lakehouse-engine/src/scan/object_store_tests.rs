@@ -1,9 +1,9 @@
 use super::*;
 use crate::scan::runtime::{DEFAULT_BUDGET_BYTES, MIN_POOL_FLOOR_BYTES};
 use crate::scan::spec::{
-    DeleteMechanism, DeltaDeletionVectorStorage, JoinSpec, JoinType, ScanStorage, StorageProps,
+    DeleteMechanism, DeltaDeletionVectorStorage, JoinSpec, ScanStorage, StorageProps,
 };
-use crate::scan::test_support::{inline_resolved, minimal_spec};
+use crate::scan::test_support::{inline_resolved, join_spec, minimal_spec};
 use ::object_store::ClientConfigKey;
 use arrow::datatypes::DataType;
 use datafusion::execution::FunctionRegistry;
@@ -43,16 +43,7 @@ fn spec_with_join(dim_root: &str, dim_files: Vec<FileEntry>) -> ScanSpec {
     spec.common.join = Some(JoinSpec {
         table_root: dim_root.into(),
         files: dim_files,
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join_type: JoinType::Inner,
-        fact_alias: "LHS_T1".into(),
-        dimension_alias: "LHS_T0".into(),
-        condition: "\"LHS_T0\".\"D_KEY\" = \"LHS_T1\".\"F_KEY\"".into(),
-        post_join_limit: None,
-        post_join_order_by: Vec::new(),
-        partition_columns: Vec::new(),
-        storage: spec.common.storage.clone(),
+        ..join_spec(spec.common.storage.clone())
     });
     spec
 }
@@ -345,16 +336,7 @@ fn adls_spec_with_join(fact_root: &str, dim_root: &str, cred: AdlsCred) -> ScanS
     spec.common.join = Some(JoinSpec {
         table_root: dim_root.into(),
         files: vec![FileEntry::new("data/dim-0.parquet", 64)],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join_type: JoinType::Inner,
-        fact_alias: "LHS_T1".into(),
-        dimension_alias: "LHS_T0".into(),
-        condition: "\"LHS_T0\".\"D_KEY\" = \"LHS_T1\".\"F_KEY\"".into(),
-        post_join_limit: None,
-        post_join_order_by: Vec::new(),
-        partition_columns: Vec::new(),
-        storage: spec.common.storage.clone(),
+        ..join_spec(spec.common.storage.clone())
     });
     spec
 }

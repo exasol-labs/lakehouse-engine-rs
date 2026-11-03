@@ -2334,22 +2334,14 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         total_bytes: 10,
         refused_columns: Vec::new(),
     };
-    let sides = JoinSides {
-        fact,
-        dimension,
-        broadcast_eligible: true,
-        dimension_leg: 1,
-    };
-    let rendered = super::joins::RenderedJoinPushdown {
-        condition: "\"LHS_T0\".\"CUSTOMER_KEY\" = \"LHS_T1\".\"CUSTOMER_KEY\"".to_string(),
-        filter: None,
-        projection: vec![ProjectionItem::Column(ColumnRef::qualified(
-            "LHS_T1",
-            "CUSTOMER_KEY",
-        ))],
-        projection_types: vec!["DECIMAL(20,0)".to_string()],
-        window: super::joins::JoinWindowPlan::Unbounded,
-    };
+    let sides = broadcast_sides(fact, dimension, 1);
+    let rendered = rendered_join(
+        "\"LHS_T0\".\"CUSTOMER_KEY\" = \"LHS_T1\".\"CUSTOMER_KEY\"",
+        &[(
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "CUSTOMER_KEY")),
+            "DECIMAL(20,0)",
+        )],
+    );
     let tuning = super::joins::JoinScanRequestConfig {
         cluster_nodes: 1,
         parallelism_factor: 1,

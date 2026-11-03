@@ -1,8 +1,8 @@
 use super::super::super::support::collect_all_column_names;
-use super::super::planning::{JoinLeaf, JoinSides, JoinWindowPlan};
+use super::super::planning::JoinLeaf;
 use super::super::sql_builders::{
-    JoinScanRequestConfig, RenderedJoinPushdown, build_broadcast_join_sql, build_n_scan_join_sql,
-    build_side_fan_out_sql, render_broadcast_join,
+    JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql, build_side_fan_out_sql,
+    render_broadcast_join,
 };
 use super::super::tests::{
     broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves,
@@ -986,22 +986,14 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         vec![("s3://w/l-0.parquet", 1000), ("s3://w/l-1.parquet", 1000)],
     );
     let dimension = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]);
-    let sides = JoinSides {
-        fact,
-        dimension,
-        broadcast_eligible: true,
-        dimension_leg: 1,
-    };
-    let rendered = RenderedJoinPushdown {
-        condition: r#""LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY""#.to_string(),
-        filter: None,
-        projection: vec![ProjectionItem::Column(ColumnRef::qualified(
-            "LHS_T0",
-            "L_ORDERKEY",
-        ))],
-        projection_types: vec!["DECIMAL(20,0)".to_string()],
-        window: JoinWindowPlan::Unbounded,
-    };
+    let sides = broadcast_sides(fact, dimension, 1);
+    let rendered = rendered_join(
+        r#""LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY""#,
+        &[(
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "L_ORDERKEY")),
+            "DECIMAL(20,0)",
+        )],
+    );
     let tuning = JoinScanRequestConfig {
         cluster_nodes: 2,
         parallelism_factor: 1,
