@@ -8,18 +8,20 @@
 
 ## Design Decisions
 
-### [1] LAKEHOUSE_EXPORT is a Rust entry point in the `.so`, not a Lua script
+### [1] LAKEHOUSE_EXPORT is one Rust entry point that answers the export call and runs as the writer
 
-- **Decision:** The export script is a fifth Rust entry point that answers Exasol's `generate_sql_for_export_spec` call through the SDK's export hook. It shares the `.so` with the writer.
-- **Rationale:** Option validation and SQL rendering are pure logic that Rust unit tests cover, and the writer count reuses the scan's 300-group cap from `sharding` instead of restating it. A spike `.so` built in the Makefile's `UDF_BUILDER_IMAGE` against the pinned SDK version with the `export` feature, and loaded on the SLC of the same version, answered `EXPORT ... INTO SCRIPT` on the local Exasol. `ctx.node_count()`, `ctx.script_schema()`, `ctx.current_user()`, and `ctx.connection()` worked inside the hook. The `export` module keeps the options grammar, the writer spec format, and the guard SQL behind two functions that `lib.rs` calls, and it depends only on `sharding`.
-- **Alternatives:** A Lua script, like `LAKEHOUSE_DISTRIBUTE_FILES`. Rejected: its validation would have no unit layer, and it would restate the 300-group cap.
+- **Decision:** `LAKEHOUSE_EXPORT` is the fourth Rust entry point in the `.so` and the only export script, a `RUST SET SCRIPT` that returns `DECIMAL(18,0)`. Its export hook answers Exasol's `generate_sql_for_export_spec` call, and its `run` function is the writer: the SELECT the hook returns calls `LAKEHOUSE_EXPORT` itself over the source rows.
+- **Rationale:** Exasol sends the export call to the hook and a SELECT call to `run`, so one script serves both roles. A spike `.so` built in the Makefile's `UDF_BUILDER_IMAGE` against the pinned SDK version with the `export` feature, and loaded on the SLC of the same version, showed this on the local Exasol: one SET RETURNS script answered `EXPORT ... INTO SCRIPT`, and the SELECT its hook returned called the same script as the writer. One script needs one `EXECUTE` and one script-scoped `ACCESS` grant. Option validation and SQL rendering are pure logic that Rust unit tests cover, and the writer count reuses the scan's 300-group cap from `sharding` instead of restating it. The `export` module keeps the options grammar, the writer spec format, and the guard SQL behind two functions that `lib.rs` calls, and it depends only on `sharding`.
+- **Alternatives:**
+  - A separate writer script, `LAKEHOUSE_EXPORT_WRITER`. Rejected: it adds a DDL statement, an `EXECUTE` grant, and an `ACCESS` grant, and adds no capability, because one SET script serves both roles.
+  - A Lua export script, like `LAKEHOUSE_DISTRIBUTE_FILES`. Rejected: its validation would have no unit layer, and it would restate the 300-group cap.
 - **Promotes to ADR:** no
 
 ### [2] The column type check is a per-row guard in the generated SELECT, keyed on `MOD(ROWNUM, G)`
 
 - **Decision:** For every source column, the generated SELECT carries a `WHERE` guard that raises an error naming the column and `TYPEOF(<column>)` when the type is GEOMETRY, HASHTYPE, INTERVAL, or TIMESTAMP WITH LOCAL TIME ZONE. The group key is `MOD(ROWNUM, G)` in every mode, and `SINGLE_COMMIT = 'true'` sets G to 1, where the key is always 0. Exasol has no error function, so the guard raises the error by casting a message string to `DECIMAL(1,0)`.
-- **Rationale:** Exasol passes no source column types to the export call. Without the guard, its own handling of these types varies between runs of the same statement: `Column type not supported: <type>`, `VM error: Unknown data type found`, or a silent export, and no message names the column. Exasol documents `ROWNUM` as "an incremental unique integer value ... beginning with 1", so a source of at least G rows yields every key from 0 to G - 1. Measured with the pinned SLC on Exasol 2025.1.16 and 8.29.13:
-  - The key ran exactly G writers at G = 1, 4, and 300, over tables of 1, 4, 300, 1,000, and 10,000 rows and a filtered query of exactly 300 rows. On 2025.1.16 it also ran 300 writers over a join query of exactly 300 rows, and 2 writers for a 2-row source at G = 3.
+- **Rationale:** Exasol passes no source column types to the export call. Without the guard, its own handling of these types varies between runs of the same statement: `Column type not supported: <type>`, `VM error: Unknown data type found`, or a silent export, and no message names the column. Exasol documents `ROWNUM` as "an incremental unique integer value ... beginning with 1", so a source of at least G rows yields every key from 0 to G - 1. Measured with the pinned SLC on Exasol 2025.1.16 and 8.29.13, with one script as the export target and the writer (decision [1]):
+  - The key ran exactly G writers at G = 1, 4, and 300, over tables of 1, 4, 300, 1,000, and 10,000 rows, a filtered query of 1,428 rows, and a join query of exactly 300 rows. It ran 2 writers for a 2-row source at G = 3.
   - With the guard, at G = 1, 4, and 300 and for all five types, the guard error came first in every run over one-row and 1,000-row sources (90 of 90 on 2025.1.16, 60 of 60 on 8.29.13). Empty sources exported 0 rows (45 of 45, 30 of 30).
   - At G = 1 the key keeps interview answer 3: one key value and no `IPROC()`.
 - **Alternatives:**
@@ -35,25 +37,25 @@
   - A source that returns no rows skips the check and exports 0 rows.
 - **Promotes to ADR:** no
 
-### [3] Exporting users get a dedicated role, the installer grants it under `--export-connection`, and both export scripts read the CONNECTION
+### [3] Exporting users get a dedicated role that the installer prints, and the export script reads the CONNECTION in the hook and in each writer
 
-- **Decision:** `LAKEHOUSE_EXPORT_ROLE_<schema>` holds the `EXPORT` privilege, the `CONNECTION` privilege, `EXECUTE` on both export scripts, and `GRANT ACCESS ON CONNECTION ... FOR SCRIPT` on both. With `--export-connection <name>`, `install.sh` creates the role when it does not exist and runs its grants when that CONNECTION exists. Without the flag, or when the CONNECTION does not exist, the next-step template prints the same statements. The operator grants the role to each exporting user. `LAKEHOUSE_EXPORT` reads the CONNECTION before it returns SQL, and each writer reads it when it starts. Neither script formats a CONNECTION value into any string.
-- **Rationale:** Exasol runs both scripts as the exporting session user. Measured: `AT <connection>` needs the user's `CONNECTION` privilege, and reading the CONNECTION in a script needs a script-scoped `ACCESS` grant for that script, through a role or directly. `CREATE OR REPLACE` drops script grants on every re-install, so the installer runs the grants on each run with the flag. Measured: a second `CREATE ROLE` fails ("role name ... conflicts with another user or role name"), and every repeated `GRANT` succeeds, so the installer checks `EXA_ALL_ROLES` before it creates the role. Reading the CONNECTION in both scripts makes a missing grant fail with a named error before the writers write data in a later issue.
+- **Decision:** `LAKEHOUSE_EXPORT_ROLE_<schema>` holds the `EXPORT` privilege, the `CONNECTION` privilege, `EXECUTE` on `LAKEHOUSE_EXPORT`, and `GRANT ACCESS ON CONNECTION ... FOR SCRIPT <schema>.LAKEHOUSE_EXPORT`. The installer prints these statements in its next-step template for the template's CONNECTION, as it prints the virtual schema grants, and runs none of them. The operator creates the CONNECTION, runs the statements, and grants the role to each exporting user. `LAKEHOUSE_EXPORT` reads the CONNECTION in its hook before it returns SQL, and in each writer when it starts. It formats no CONNECTION value into any string.
+- **Rationale:** Exasol runs the script as the exporting session user. Measured: `AT <connection>` needs the user's `CONNECTION` privilege, reading the CONNECTION in a script needs a script-scoped `ACCESS` grant, and one grant on `LAKEHOUSE_EXPORT` covers the hook and the writers. The installer runs before any CONNECTION exists, so it cannot grant access to one. One CONNECTION then serves both a virtual schema and an export.
 - **Alternatives:**
   - Add the export grants to `LAKEHOUSE_ENGINE_ROLE_<schema>`. Rejected: an exporting user would then also hold the scan script's CONNECTION grant, which ADR `plan-visibility-execution-privilege-split` keeps with the virtual schema owner.
-  - Print the grants and never run them. Rejected: #565 asks the installer to grant them (Review Findings).
-  - The writer reads no CONNECTION until it writes data. Rejected: the writer grant would have no observable effect, and no test could prove it.
+  - The installer runs the grants for a CONNECTION named by an `--export-connection` flag. Rejected: the CONNECTION does not exist at install time (Review Findings).
+  - The writer reads no CONNECTION until it writes data. Rejected: a direct `SELECT` call of `LAKEHOUSE_EXPORT` skips the hook, so the writer's read is the only CONNECTION check on that path.
 - **Consequences:**
-  - A holder of the export role can call `LAKEHOUSE_EXPORT_WRITER` directly with any writer spec and any rows, which skips every check `LAKEHOUSE_EXPORT` makes. The writer treats its writer spec as untrusted input, and `docs/security.md` states the bypass.
-  - The flag needs an installing user that may create roles and grant `EXPORT` and the CONNECTION, such as a DBA. A failed grant aborts the install naming the statement.
+  - A holder of the export role can call `LAKEHOUSE_EXPORT` directly in a `SELECT` with a forged writer spec and any rows. That call runs the writer and skips every check the hook makes. The writer treats its writer spec as untrusted input, and `docs/security.md` states the bypass.
+  - A re-install drops the role's `EXECUTE` and `ACCESS` grants on the replaced script, so the operator runs those two template lines again, as for the virtual schema grants.
 - **Promotes to ADR:** no
 
 ## Review Findings
 
-### [plan-review] The installer runs the export role grants under `--export-connection`
+### [plan-review] The installer prints the export grants as a template
 
-- **Finding:** Round 1 `[SCOPE_REDUCTION]` (HUMAN). #565's acceptance criterion reads "The installer creates both scripts and grants them access to the catalog CONNECTION." The plan had the installer only print the grants.
-- **Direction change:** The requester chose to have the installer run the grants. `install.sh --export-connection <name>` creates `LAKEHOUSE_EXPORT_ROLE_<schema>` and runs its grants when that CONNECTION exists. Without the flag, the template prints the same lines. Decision [3], task 2.2, and the installer scenarios carry the change.
+- **Finding:** Round 1 `[SCOPE_REDUCTION]` (HUMAN). #565's acceptance criterion reads "The installer creates both scripts and grants them access to the catalog CONNECTION." This entry supersedes the round-1 direction, in which the installer ran the grants under `--export-connection`.
+- **Direction change:** The requester withdrew the criterion: "That doesn't make sense, because the installer runs before any CONNECTION exists. Export should work like virtual schemas: install the scripts, then users create CONNECTIONs and grant access to them." The requester will reword #565. The installer creates the one export script (decision [1]), prints the export grants as a template, and runs none; `--export-connection` is removed. Decision [3], task 2.2, the installer scenario, and the § Context deviation bullet carry the change.
 - **Promotes to ADR:** no
 
 ### [plan-review] An empty source with an unsupported column type exports 0 rows
@@ -62,8 +64,8 @@
 - **Direction change:** The requester accepted this as a scoped exception to #565. The two empty-source scenarios and § Background of `export/export-into-script`, the empty-source part of `docs/export.md` (task 1.14), and the § Context deviation bullet state it.
 - **Promotes to ADR:** no
 
-### [plan-review] The installer's export role grants are proven on a live Exasol
+### [plan-review] The `install-script-e2e` job checks the installed export script
 
 - **Finding:** Round 3 `[SCOPE_REDUCTION]` (HUMAN). #565 requires E2E coverage of "The installer creates both scripts and grants them access to the catalog CONNECTION." The plan proved the installer only with the `exapump` stub and one manual run.
-- **Direction change:** The requester chose to extend the `install-script-e2e` CI job (task 2.6). The job runs `install.sh --export-connection` twice against a live Exasol and reads the role's six grants from the privilege views after the second run. The § Context deviation is removed.
+- **Direction change:** The installer no longer runs grants (entry above), so task 2.6 checks only what it installs. One step of the `install-script-e2e` job reads `EXA_ALL_SCRIPTS` on a live Exasol and fails unless `LHVS.LAKEHOUSE_EXPORT` is a RUST SET script that returns a value.
 - **Promotes to ADR:** no

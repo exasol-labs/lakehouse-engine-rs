@@ -1,13 +1,13 @@
 <!-- DELTA:CHANGED -->
-# Feature: Single Shared Object, Five Entry Points
+# Feature: Single Shared Object, Four Entry Points
 
-One Rust crate builds a single `.so` that exports the VS adapter, the DataFusion scan UDF, the version query UDF, the export script, and the export writer as named entry points. One artifact is uploaded to BucketFS and each Exasol script references it.
+One Rust crate builds a single `.so` that exports the VS adapter, the DataFusion scan UDF, the version query UDF, and the export script as named entry points. One artifact is uploaded to BucketFS and each Exasol script references it.
 <!-- /DELTA:CHANGED -->
 
 <!-- DELTA:CHANGED -->
 ## Background
 
-* The scan entry point is a SCALAR EMIT script. The version entry point is a SCALAR RETURNS script. The export entry point is a SCALAR script that Exasol calls for `EXPORT ... INTO SCRIPT`, and the export writer entry point is a SET RETURNS script.
+* The scan entry point is a SCALAR EMIT script. The version entry point is a SCALAR RETURNS script. The export entry point is a SET RETURNS script. Exasol calls it for `EXPORT ... INTO SCRIPT`, and the SELECT it returns calls the same script as the writer.
 * The `LAKEHOUSE_DISTRIBUTE_FILES` fan-out distributor is a separate LUA SET script created by its own DDL. It is not a Rust entry point and is not part of the `.so`.
 * Each `CREATE SCRIPT` statement references its entry point by registered name against the same `%udf_object`.
 * The `.so` is built only inside the `UDF_BUILDER_IMAGE` Rust builder image the Makefile names, never with host `cargo build --release`.
@@ -28,10 +28,10 @@ One Rust crate builds a single `.so` that exports the VS adapter, the DataFusion
 <!-- DELTA:NEW -->
 ### Scenario: One crate exports every Rust entry point
 
-* *GIVEN* the UDF crate source declaring the VS adapter, scan, version, export, and export writer entry points
+* *GIVEN* the UDF crate source declaring the VS adapter, scan, version, and export entry points
 * *WHEN* the crate is built in the builder image
 * *THEN* the build SHALL produce exactly one `.so` artifact
-* *AND* that `.so` SHALL export exactly five entry-point symbols: `__exa_udf_entry_LAKEHOUSE_ADAPTER`, `__exa_udf_entry_LAKEHOUSE_SCAN`, `__exa_udf_entry_LAKEHOUSE_VERSION`, `__exa_udf_entry_LAKEHOUSE_EXPORT`, and `__exa_udf_entry_LAKEHOUSE_EXPORT_WRITER`
+* *AND* that `.so` SHALL export exactly four entry-point symbols: `__exa_udf_entry_LAKEHOUSE_ADAPTER`, `__exa_udf_entry_LAKEHOUSE_SCAN`, `__exa_udf_entry_LAKEHOUSE_VERSION`, and `__exa_udf_entry_LAKEHOUSE_EXPORT`
 * *AND* the `LAKEHOUSE_DISTRIBUTE_FILES` fan-out distributor SHALL NOT be one of the crate's Rust entry points and SHALL NOT be exported from the `.so`
 <!-- /DELTA:NEW -->
 
@@ -39,9 +39,9 @@ One Rust crate builds a single `.so` that exports the VS adapter, the DataFusion
 ### Scenario: All scripts resolve from the same uploaded artifact
 
 * *GIVEN* the single `.so` has been uploaded to BucketFS
-* *AND* an ADAPTER SCRIPT, a scan SCALAR SCRIPT, a version SCALAR SCRIPT, an export SCALAR SCRIPT, and an export writer SET SCRIPT have each been created referencing that `.so`
+* *AND* an ADAPTER SCRIPT, a scan SCALAR SCRIPT, a version SCALAR SCRIPT, and an export SET SCRIPT have each been created referencing that `.so`
 * *WHEN* each script is invoked
 * *THEN* each invocation SHALL run the entry point registered under the script's name
-* *AND* an `EXPORT ... INTO SCRIPT` through the export script SHALL run the export entry point and then the export writer entry point
+* *AND* an `EXPORT ... INTO SCRIPT` through the export script SHALL run the export entry point both for the statement and for the writers
 * *AND* no invocation SHALL require a second uploaded artifact
 <!-- /DELTA:CHANGED -->
