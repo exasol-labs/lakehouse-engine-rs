@@ -113,6 +113,7 @@ This file holds the rules for how this repository tests its behavior and how it 
 - A committed golden SQL fixture (`dispatch_golden`) changes only with an intended change of the generated SQL. A diff in any other change is a regression, not an expected update.
 - A test whose assertion a change makes false is deleted together with its section banner and its test-only imports.
 - When code moves to another crate, its test module moves with it and keeps every test name and expected value. A test of a property of the code left behind stays with that code. A helper that several test modules share is declared once in the crate's `#[cfg(test)]` support module. No test is deleted, disabled, or weakened to fit a visibility change.
+- A test builds a `JoinSpec`, `JoinSides`, or `RenderedJoinPushdown` from its crate's shared builder, which gives every field a valid default, and sets only the fields its assertion depends on. The `tests/it` binary cannot see `#[cfg(test)]` items, so its builders live in `tests/scan_fixture`.
 - A test-only helper that unwraps a production type's private payload is declared in its crate's `#[cfg(test)]` support module and is never `pub`.
 - A structural contract that no runtime test can observe is pinned by a compile-time test that stays intact and unweakened. Examples are the contracts that the capability set takes no catalog-kind input, and that the Iceberg scan source carries a shared `CatalogSession`.
 

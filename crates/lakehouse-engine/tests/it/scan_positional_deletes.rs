@@ -22,8 +22,8 @@ use exasol_udf_sdk::value::ExaType;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, JoinType, LogicalField,
-    ProjectionItem, ScanSpec, ScanStorage, StorageBackend, StorageProps,
+    ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, LogicalField, ProjectionItem,
+    ScanSpec, ScanStorage, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_join_physical_plan, build_raw_scan_physical_plan, register_files,
@@ -936,18 +936,9 @@ fn scan_delete_reads_bounded_across_join_sides() {
     ];
     spec.common.s3_max_connections = BUDGET;
     spec.common.join = Some(JoinSpec {
-        table_root: String::new(),
         files: vec![dim_entry],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join_type: JoinType::Inner,
-        fact_alias: "LHS_T1".into(),
-        dimension_alias: "LHS_T0".into(),
         condition: "\"LHS_T0\".\"C_KEY\" = \"LHS_T1\".\"O_KEY\"".into(),
-        post_join_limit: None,
-        post_join_order_by: Vec::new(),
-        partition_columns: Vec::new(),
-        storage: ScanStorage::Inline(dummy_storage()),
+        ..scan_fixture::join_spec(ScanStorage::Inline(dummy_storage()))
     });
 
     let (store, peak) = tracking_store_with_probe(needles, BUDGET);
@@ -1632,18 +1623,10 @@ fn scan_footer_fetches_bounded_across_join_sides() {
     spec.common.logical_schema = logical_fields(&[("o_key", "int64"), ("o_data", "utf8")]);
     spec.common.s3_max_connections = BUDGET;
     spec.common.join = Some(JoinSpec {
-        table_root: String::new(),
         files: dim_entries,
         logical_schema: logical_fields(&[("c_key", "int64"), ("c_data", "utf8")]),
-        name_mapping: Vec::new(),
-        join_type: JoinType::Inner,
-        fact_alias: "LHS_T1".into(),
-        dimension_alias: "LHS_T0".into(),
         condition: "\"LHS_T0\".\"C_KEY\" = \"LHS_T1\".\"O_KEY\"".into(),
-        post_join_limit: None,
-        post_join_order_by: Vec::new(),
-        partition_columns: Vec::new(),
-        storage: ScanStorage::Inline(dummy_storage()),
+        ..scan_fixture::join_spec(ScanStorage::Inline(dummy_storage()))
     });
 
     let (store, peak) = tracking_store_with_probe(needles, BUDGET);

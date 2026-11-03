@@ -241,6 +241,35 @@ pub(crate) fn glue_column(name: &str, hive_type: &str) -> CatalogColumn {
     )
 }
 
+pub(crate) fn broadcast_sides(
+    fact: joins::ResolvedJoinSide,
+    dimension: joins::ResolvedJoinSide,
+    dimension_leg: usize,
+) -> joins::JoinSides {
+    joins::JoinSides {
+        fact,
+        dimension,
+        broadcast_eligible: true,
+        dimension_leg,
+    }
+}
+
+pub(crate) fn rendered_join(
+    condition: &str,
+    projection: &[(ProjectionItem, &str)],
+) -> joins::RenderedJoinPushdown {
+    joins::RenderedJoinPushdown {
+        condition: condition.to_string(),
+        filter: None,
+        projection: projection.iter().map(|(item, _)| item.clone()).collect(),
+        projection_types: projection
+            .iter()
+            .map(|(_, exasol_type)| (*exasol_type).to_string())
+            .collect(),
+        window: joins::JoinWindowPlan::Unbounded,
+    }
+}
+
 /// A base for `..` struct update: the unpartitioned, columnless table `db.t` at `location`.
 pub(crate) fn catalog_table(format: TableFormat, location: &str) -> CatalogTable {
     CatalogTable {

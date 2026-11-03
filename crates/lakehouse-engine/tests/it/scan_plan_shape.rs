@@ -14,8 +14,8 @@ use lakehouse_engine::adapter::pushdown::{
     AggregateMergeInputs, build_scan_driving_sql, detect_aggregates, ordinary_plans,
 };
 use lakehouse_engine::scan::spec::{
-    AggKind, ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, JoinType,
-    ProjectionItem, ScanSpec, ScanStorage, SortKey, StorageBackend, StorageProps,
+    AggKind, ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, ProjectionItem,
+    ScanSpec, ScanStorage, SortKey, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, session_config_for_spec,
@@ -526,16 +526,8 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
     let join = JoinSpec {
         table_root: "s3://warehouse/lh/customer".to_string(),
         files: vec![FileEntry::new("data/cust-0.parquet", 4096)],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join_type: JoinType::Inner,
-        fact_alias: "LHS_T1".to_string(),
-        dimension_alias: "LHS_T0".to_string(),
         condition: r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#.to_string(),
-        post_join_limit: None,
-        post_join_order_by: Vec::new(),
-        partition_columns: Vec::new(),
-        storage: ScanStorage::Inline(test_storage()),
+        ..scan_fixture::join_spec(ScanStorage::Inline(test_storage()))
     };
 
     let spec = ScanSpec {

@@ -64,7 +64,7 @@ fn a_nested_carrying_table_reads_without_row_filter_pushdown() {
 
 #[test]
 fn the_session_withholds_pushdown_only_for_a_scan_that_renders_nested_json() {
-    use crate::scan::spec::{JoinSpec, JoinType, LogicalField, NestedMembers};
+    use crate::scan::spec::{JoinSpec, LogicalField, NestedMembers};
 
     let field = |name: &str, nested: Option<NestedMembers>| LogicalField {
         field_id: None,
@@ -108,15 +108,7 @@ fn the_session_withholds_pushdown_only_for_a_scan_that_renders_nested_json() {
             512,
         )],
         logical_schema: vec![field("tags", Some(NestedMembers::List { element: None }))],
-        name_mapping: Vec::new(),
-        join_type: JoinType::Inner,
-        fact_alias: "LHS_T1".into(),
-        dimension_alias: "LHS_T0".into(),
-        condition: r#""LHS_T0"."D_KEY" = "LHS_T1"."F_KEY""#.into(),
-        post_join_limit: None,
-        post_join_order_by: Vec::new(),
-        partition_columns: Vec::new(),
-        storage: join_spec.common.storage.clone(),
+        ..crate::scan::test_support::join_spec(join_spec.common.storage.clone())
     });
     assert!(
         !pushdown_enabled(&join_spec),
