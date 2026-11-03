@@ -27,8 +27,8 @@ pub use support::{AggregateMergeInputs, build_fan_out_inner, build_scan_driving_
 use support::{
     ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, InvolvedColumns, SCAN_UDF_NAME, classify_where_filter,
     extract_limit, extract_projection, involved_columns, order_by_present, scan_storage_for,
-    strip_table_alias,
 };
+use vs_expression::strip_table_alias;
 
 mod empty_result;
 use empty_result::empty_result_sql;

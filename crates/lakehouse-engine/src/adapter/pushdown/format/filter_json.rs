@@ -1,5 +1,6 @@
 use serde_json::Value as Json;
 use std::cmp::Ordering;
+use vs_expression::ColumnNode;
 
 #[derive(Clone, Copy)]
 pub(in crate::adapter::pushdown) enum Comparison {
@@ -58,10 +59,7 @@ impl Comparison {
 }
 
 pub(in crate::adapter::pushdown) fn column_name(node: &Json) -> Option<&str> {
-    if node.get("type")?.as_str()? != "column" {
-        return None;
-    }
-    node.get("name")?.as_str()
+    ColumnNode::parse(node).map(|column| column.name)
 }
 
 /// Exasol reads `''` as NULL, so an empty string constrains nothing.

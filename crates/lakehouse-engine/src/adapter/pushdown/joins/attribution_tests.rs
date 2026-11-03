@@ -5,7 +5,7 @@ use crate::adapter::pushdown::test_support::{
 
 impl super::JoinLegs {
     fn resolve(&self, node: &Json) -> ColumnLeg {
-        self.resolve_column(node.as_object().expect("a column node is a JSON object"))
+        self.resolve_column(ColumnNode::parse(node).expect("a named column node"))
     }
 }
 

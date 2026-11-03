@@ -5,14 +5,14 @@ use crate::scan::spec::{
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-use vs_expression::{render_df_filter_safe, render_expression_safe};
+use vs_expression::{render_df_filter_safe, render_expression_safe, strip_table_alias};
 
 use super::super::BinaryColumns;
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
     build_scan_driving_sql, classify_where_filter, collect_all_column_names, extract_limit,
     extract_offset, project_columns, quote_ident, render_limit_offset, scan_storage_for,
-    shard_count, strip_table_alias,
+    shard_count,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_flags, wrap_declined_order_by};
 use super::attribution::{JoinLegs, UnattributableColumn};

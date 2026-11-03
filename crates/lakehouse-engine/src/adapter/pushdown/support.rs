@@ -13,7 +13,7 @@ use crate::types::mapping::{
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-use vs_expression::{render_df_filter_safe, render_expression_safe};
+use vs_expression::{ColumnNode, render_df_filter_safe, render_expression_safe, walk_column_nodes};
 
 use super::binary_filter::{BinaryColumns, compare_binary_bytes};
 
@@ -350,23 +350,6 @@ pub(super) fn involved_columns<'r>(
     }
 }
 
-/// Exasol stamps every column with the query's `tableAlias`, but a single-table scan and an
-/// N-scan leg each read one relation with bare column names, so an alias-qualified reference
-/// does not resolve. Must run after join attribution, which identifies legs by the
-/// (`tableName`, `tableAlias`) pair (#193).
-pub(super) fn strip_table_alias(expr: &Json) -> Json {
-    match expr {
-        Json::Object(map) => Json::Object(
-            map.iter()
-                .filter(|(key, _)| key.as_str() != "tableAlias")
-                .map(|(key, value)| (key.clone(), strip_table_alias(value)))
-                .collect(),
-        ),
-        Json::Array(items) => Json::Array(items.iter().map(strip_table_alias).collect()),
-        other => other.clone(),
-    }
-}
-
 /// `false` means the caller must self-apply the predicate in its own SQL, never
 /// omit it: Exasol has no fallback for a delegated capability.
 pub(super) fn datafusion_renderable(expr: &Json) -> bool {
@@ -426,15 +409,13 @@ fn like_subject_type_guard(filter: &Json, col_types: &ColumnTypes) -> Option<Jso
     )
 }
 
-/// The (relation alias, column) pair a `column` node names: its `tableAlias`, and its name
-/// folded with the same full-Unicode `to_uppercase` the column-list builders use.
+/// The (relation alias, column) pair a `column` node names.
 pub(super) fn column_node_ref(node: &Json) -> Option<ColumnRef> {
-    let name = node.get("name").and_then(|n| n.as_str())?.to_uppercase();
-    let relation = node
-        .get("tableAlias")
-        .and_then(|alias| alias.as_str())
-        .map(str::to_string);
-    Some(ColumnRef { relation, name })
+    let column = ColumnNode::parse(node)?;
+    Some(ColumnRef {
+        relation: column.table_alias.map(str::to_string),
+        name: column.upper_name(),
+    })
 }
 
 /// An entry with a relation alias binds only its own relation's column, so a column name two
@@ -983,39 +964,12 @@ pub(super) fn project_columns(
     Ok((proj_names, proj_types, needs_full_fallback))
 }
 
-/// Blind descent (every field) is safe because a collect rebuilds nothing; do not
-/// merge with the curated rewrite primitive, which must not enter `dataType`/`name`.
-///
-/// Case folding is left to callers on purpose: the join collectors fold ASCII-only
-/// while `collect_all_column_names` folds Unicode (`ß` → `SS`), pinned by
-/// `column_collectors_keep_divergent_case_folding`.
-pub(super) fn walk_column_nodes(expr: &Json, f: &mut impl FnMut(&serde_json::Map<String, Json>)) {
-    match expr {
-        Json::Object(map) => {
-            if map.get("type").and_then(|t| t.as_str()) == Some("column") {
-                f(map);
-            }
-            for v in map.values() {
-                walk_column_nodes(v, &mut *f);
-            }
-        }
-        Json::Array(items) => {
-            for item in items {
-                walk_column_nodes(item, &mut *f);
-            }
-        }
-        _ => {}
-    }
-}
-
 pub(super) fn collect_all_column_names(
     value: &Json,
     names: &mut std::collections::HashSet<String>,
 ) {
-    walk_column_nodes(value, &mut |map| {
-        if let Some(name) = map.get("name").and_then(|n| n.as_str()) {
-            names.insert(name.to_uppercase());
-        }
+    walk_column_nodes(value, &mut |column| {
+        names.insert(column.upper_name());
     });
 }
 
