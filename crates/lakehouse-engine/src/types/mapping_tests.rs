@@ -670,14 +670,17 @@ fn exasol_type_from_json_reads_timestamp_fractional_seconds_precision() {
 }
 
 #[test]
-fn exasol_type_from_json_saturates_an_out_of_range_timestamp_precision() {
-    let ts300 = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": 300});
-    assert_eq!(
-        exasol_type_from_json(&ts300),
-        ExasolType::Timestamp {
-            precision: Some(255)
-        }
-    );
+fn exasol_type_from_json_caps_timestamp_precision_at_nine() {
+    for (digits, expected) in [(9, 9), (10, 9), (300, 9)] {
+        let ts = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": digits});
+        assert_eq!(
+            exasol_type_from_json(&ts),
+            ExasolType::Timestamp {
+                precision: Some(expected)
+            },
+            "fractionalSecondsPrecision {digits}"
+        );
+    }
 }
 
 #[test]

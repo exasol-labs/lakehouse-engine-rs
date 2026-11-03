@@ -4,7 +4,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 use delta_kernel::schema::{DataType as SparkType, PrimitiveType as SparkPrimitive, StructField};
 use lakehouse_catalog::ColumnSourceType;
 
-use super::exasol_type::{ExasolType, MAX_CHAR_SIZE, MAX_VARCHAR_SIZE};
+use super::exasol_type::{ExasolType, MAX_CHAR_SIZE, MAX_TIMESTAMP_PRECISION, MAX_VARCHAR_SIZE};
 use super::hive_type::parse_hive_type;
 use serde_json::{Value as Json, json};
 
@@ -477,9 +477,7 @@ pub(crate) fn exasol_type_from_json(dt: &Json) -> ExasolType {
                 let precision = dt
                     .get("fractionalSecondsPrecision")
                     .and_then(|v| v.as_u64())
-                    // Saturates, so an out-of-range precision stays a declaration Exasol rejects
-                    // and never reads as bare TIMESTAMP.
-                    .map(|digits| u8::try_from(digits).unwrap_or(u8::MAX));
+                    .map(|digits| digits.min(MAX_TIMESTAMP_PRECISION.into()) as u8);
                 ExasolType::Timestamp { precision }
             }
         }

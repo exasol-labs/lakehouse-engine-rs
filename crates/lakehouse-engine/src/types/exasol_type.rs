@@ -8,6 +8,9 @@ pub const MAX_VARCHAR_SIZE: u32 = 2_000_000;
 /// Exasol rejects `CHAR(2001)` and wider.
 pub const MAX_CHAR_SIZE: u32 = 2000;
 
+/// Exasol rejects `TIMESTAMP(10)` and finer.
+pub const MAX_TIMESTAMP_PRECISION: u8 = 9;
+
 /// The Exasol types a catalog column, an `EMITS` column, or a `CAST` target can carry.
 ///
 /// `Display` renders the SQL spelling and is the only place that spelling is written.
