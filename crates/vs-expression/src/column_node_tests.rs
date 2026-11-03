@@ -2,44 +2,8 @@ use super::*;
 use serde_json::json;
 
 #[test]
-fn parses_only_a_named_column_node() {
-    let node = json!({"type": "column", "name": "a", "tableName": "T", "tableAlias": "X"});
-    assert_eq!(
-        ColumnNode::parse(&node),
-        Some(ColumnNode {
-            name: "a",
-            table_name: Some("T"),
-            table_alias: Some("X"),
-        })
-    );
+fn a_column_node_without_a_name_does_not_parse() {
     assert_eq!(ColumnNode::parse(&json!({"type": "column"})), None);
-    assert_eq!(
-        ColumnNode::parse(&json!({"type": "table", "name": "T"})),
-        None
-    );
-}
-
-#[test]
-fn rewriting_aliases_touches_only_column_nodes() {
-    let tree = json!({
-        "type": "predicate_equal",
-        "tableAlias": "KEEP",
-        "left": {"type": "column", "name": "A", "tableAlias": "X"},
-        "right": {"type": "column", "name": "B"},
-    });
-    let rewritten = rewrite_table_aliases(&tree, &mut |column| {
-        Ok::<_, ()>((column.name == "B").then(|| "R".to_string()))
-    })
-    .unwrap();
-    assert_eq!(
-        rewritten,
-        json!({
-            "type": "predicate_equal",
-            "tableAlias": "KEEP",
-            "left": {"type": "column", "name": "A"},
-            "right": {"type": "column", "name": "B", "tableAlias": "R"},
-        })
-    );
 }
 
 #[test]

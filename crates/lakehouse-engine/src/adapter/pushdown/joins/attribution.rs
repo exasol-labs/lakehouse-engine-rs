@@ -216,7 +216,7 @@ impl JoinLegs {
     fn qualify_tree(&self, expr: &Json, strict: bool) -> Result<Json, UnattributableColumn> {
         rewrite_table_aliases(expr, &mut |column| match self.resolve_column(column) {
             ColumnLeg::Leg(leg) => Ok(Some(self.leg_alias(leg))),
-            ColumnLeg::NoLeg if !strict => Ok(column.table_alias.map(str::to_string)),
+            ColumnLeg::NoLeg if !strict => Ok(None),
             ColumnLeg::NoLeg | ColumnLeg::Unattributable => Err(UnattributableColumn::of(column)),
         })
     }

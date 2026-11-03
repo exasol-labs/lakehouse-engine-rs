@@ -83,21 +83,22 @@ pub fn strip_table_alias(tree: &Json) -> Json {
     }
 }
 
-/// Copies `tree`, giving each `column` node the `tableAlias` that `f` returns, or none.
+/// Copies `tree`, setting each `column` node's `tableAlias` to `f`'s answer, if any.
 pub fn rewrite_table_aliases<E>(
     tree: &Json,
     f: &mut impl FnMut(ColumnNode<'_>) -> Result<Option<String>, E>,
 ) -> Result<Json, E> {
     match tree {
         Json::Object(map) => {
-            let alias = ColumnNode::from_map(map).map(&mut *f).transpose()?;
-            let mut out = Map::new();
-            for (key, value) in map {
-                if alias.is_none() || key != TABLE_ALIAS {
-                    out.insert(key.clone(), rewrite_table_aliases(value, f)?);
-                }
-            }
-            if let Some(Some(alias)) = alias {
+            let mut out = map
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), rewrite_table_aliases(value, f)?)))
+                .collect::<Result<Map<_, _>, E>>()?;
+            if let Some(alias) = ColumnNode::from_map(map)
+                .map(&mut *f)
+                .transpose()?
+                .flatten()
+            {
                 out.insert(TABLE_ALIAS.to_string(), Json::String(alias));
             }
             Ok(Json::Object(out))
