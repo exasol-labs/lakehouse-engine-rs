@@ -1,6 +1,7 @@
 //! `schema.name-mapping.default` field-id resolution for Parquet columns without field-ids.
 
 use crate::scan_fixture;
+use crate::scan_fixture::WithFiles;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -71,17 +72,15 @@ fn name_mapping_spec(
     logical_schema: Vec<LogicalField>,
     name_mapping: Vec<NameMappingEntry>,
 ) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into(), "NEW_COL".into()],
-            logical_schema,
-            name_mapping,
-            storage: ScanStorage::Inline(dummy_storage()),
-            df_batch_size: 64,
-            ..Default::default()
-        },
-        files: vec![FileEntry::new(file_url, file_size)],
+    CommonScanSpec {
+        projection: vec!["ID".into(), "NEW_COL".into()],
+        logical_schema,
+        name_mapping,
+        storage: ScanStorage::Inline(dummy_storage()),
+        df_batch_size: 64,
+        ..Default::default()
     }
+    .with_files(vec![FileEntry::new(file_url, file_size)])
 }
 
 /// `new_col` is nullable so an unresolved binding NULL-fills silently, making "never NULL" the proof.

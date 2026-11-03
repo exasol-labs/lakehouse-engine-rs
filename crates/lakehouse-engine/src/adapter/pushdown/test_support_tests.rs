@@ -3,6 +3,7 @@ use crate::adapter::column_notes::{DeclaredSchema, TableNotes};
 use crate::adapter::table_identity::encode_identifier_note;
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
+use crate::scan::test_support::WithFiles;
 use lakehouse_catalog::{
     CatalogColumn, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, TableFormat,
 };
@@ -1047,16 +1048,14 @@ pub(crate) fn build_sql_for_fixture_n(
         .cloned()
         .map(ProjectionItem::from)
         .collect();
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            projection: proj_items.clone(),
-            filter,
-            limit,
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        projection: proj_items.clone(),
+        filter,
+        limit,
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let files_with_sizes: Vec<FileEntry> =
         files.into_iter().map(|p| FileEntry::new(p, 1)).collect();
     let shards =
@@ -1166,15 +1165,13 @@ pub(crate) fn build_row_sql_with_root(
         .cloned()
         .map(ProjectionItem::from)
         .collect();
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            table_root: table_root.to_string(),
-            projection: proj_items.clone(),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        table_root: table_root.to_string(),
+        projection: proj_items.clone(),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let files: Vec<FileEntry> = files.into_iter().map(FileEntry::from).collect();
     let g = shard_count(cluster_nodes, 1, files.len());
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);

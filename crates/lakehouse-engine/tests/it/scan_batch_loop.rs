@@ -3,6 +3,7 @@
 //! calls covers every shard. This harness mirrors `run_scan` but does not call it.
 
 use crate::scan_fixture;
+use crate::scan_fixture::WithFiles;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -68,22 +69,20 @@ fn id_name_emits() -> Vec<ExaType> {
 
 fn spec_for_file(file_url: String) -> ScanSpec {
     let size = file_size(&file_url);
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into(), "NAME".into()],
-            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
-                endpoint: "http://localhost:9000".into(),
-                region: "us-east-1".into(),
-                access_key: "k".into(),
-                secret_key: "s".into(),
-                allow_http: true,
-                ..Default::default()
-            })),
-            df_batch_size: 64,
+    CommonScanSpec {
+        projection: vec!["ID".into(), "NAME".into()],
+        storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
+            endpoint: "http://localhost:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            allow_http: true,
             ..Default::default()
-        },
-        files: vec![FileEntry::new(file_url, size)],
+        })),
+        df_batch_size: 64,
+        ..Default::default()
     }
+    .with_files(vec![FileEntry::new(file_url, size)])
 }
 
 fn write_parquet_categories(dir: &std::path::Path, name: &str, values: &[&str]) -> String {
@@ -132,64 +131,60 @@ fn write_parquet_tags(dir: &std::path::Path, name: &str) -> String {
 
 fn nested_spec_for_file(file_url: String) -> ScanSpec {
     let size = file_size(&file_url);
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into(), "TAGS".into()],
-            logical_schema: vec![
-                LogicalField {
-                    field_id: None,
-                    name: "id".to_string(),
-                    arrow_type: "int64".to_string(),
-                    nullable: false,
-                    initial_default: None,
-                    nested: None,
-                    physical_name: None,
-                },
-                LogicalField {
-                    field_id: None,
-                    name: "tags".to_string(),
-                    arrow_type: "utf8".to_string(),
-                    nullable: true,
-                    initial_default: None,
-                    nested: Some(NestedMembers::List { element: None }),
-                    physical_name: None,
-                },
-            ],
-            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
-                endpoint: "http://localhost:9000".into(),
-                region: "us-east-1".into(),
-                access_key: "k".into(),
-                secret_key: "s".into(),
-                allow_http: true,
-                ..Default::default()
-            })),
-            df_batch_size: 64,
+    CommonScanSpec {
+        projection: vec!["ID".into(), "TAGS".into()],
+        logical_schema: vec![
+            LogicalField {
+                field_id: None,
+                name: "id".to_string(),
+                arrow_type: "int64".to_string(),
+                nullable: false,
+                initial_default: None,
+                nested: None,
+                physical_name: None,
+            },
+            LogicalField {
+                field_id: None,
+                name: "tags".to_string(),
+                arrow_type: "utf8".to_string(),
+                nullable: true,
+                initial_default: None,
+                nested: Some(NestedMembers::List { element: None }),
+                physical_name: None,
+            },
+        ],
+        storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
+            endpoint: "http://localhost:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            allow_http: true,
             ..Default::default()
-        },
-        files: vec![FileEntry::new(file_url, size)],
+        })),
+        df_batch_size: 64,
+        ..Default::default()
     }
+    .with_files(vec![FileEntry::new(file_url, size)])
 }
 
 /// The `COUNT(DISTINCT col)` fan-out shape, minus the NULL filter (the fixture has no NULLs).
 fn distinct_spec_for_file(file_url: String) -> ScanSpec {
     let size = file_size(&file_url);
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["CATEGORY".into()],
-            distinct: true,
-            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
-                endpoint: "http://localhost:9000".into(),
-                region: "us-east-1".into(),
-                access_key: "k".into(),
-                secret_key: "s".into(),
-                allow_http: true,
-                ..Default::default()
-            })),
-            df_batch_size: 64,
+    CommonScanSpec {
+        projection: vec!["CATEGORY".into()],
+        distinct: true,
+        storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
+            endpoint: "http://localhost:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            allow_http: true,
             ..Default::default()
-        },
-        files: vec![FileEntry::new(file_url, size)],
+        })),
+        df_batch_size: 64,
+        ..Default::default()
     }
+    .with_files(vec![FileEntry::new(file_url, size)])
 }
 
 fn row_for_spec(spec: &ScanSpec) -> Vec<Value> {

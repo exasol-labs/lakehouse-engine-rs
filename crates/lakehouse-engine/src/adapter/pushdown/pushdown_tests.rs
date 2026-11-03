@@ -4,6 +4,7 @@ use crate::scan::spec::{
     ColumnRef, CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage,
     StorageProps,
 };
+use crate::scan::test_support::WithFiles;
 
 // The vended sentinels below repeat the literal values `lakehouse-catalog`'s own
 // `test_support` uses, so both crates' assertions stay comparable.
@@ -36,17 +37,15 @@ fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
         ..Default::default()
     });
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into()],
-            storage: ScanStorage::Inline(vended_storage),
-            ..Default::default()
-        },
-        files: vec![FileEntry::new(
-            "s3://warehouse/db/events/part-00000.parquet",
-            1,
-        )],
-    };
+    let spec = CommonScanSpec {
+        projection: vec!["ID".into()],
+        storage: ScanStorage::Inline(vended_storage),
+        ..Default::default()
+    }
+    .with_files(vec![FileEntry::new(
+        "s3://warehouse/db/events/part-00000.parquet",
+        1,
+    )]);
 
     let json = spec.to_json();
 
@@ -80,24 +79,22 @@ fn catalog_auth_secrets_never_in_a_role_scan_spec() {
         ..unauthenticated_creds()
     };
     let session_storage = crate::adapter::connection::storage_block(&role_creds, true);
-    let role_spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into()],
-            storage: scan_storage_for(
-                &role_creds,
-                TEST_CONNECTION_NAME,
-                true,
-                &session_storage,
-                Some(&test_sealing_key()),
-            )
-            .expect("a role CONNECTION carries key material"),
-            ..Default::default()
-        },
-        files: vec![FileEntry::new(
-            "s3://warehouse/db/events/part-00000.parquet",
-            1,
-        )],
-    };
+    let role_spec = CommonScanSpec {
+        projection: vec!["ID".into()],
+        storage: scan_storage_for(
+            &role_creds,
+            TEST_CONNECTION_NAME,
+            true,
+            &session_storage,
+            Some(&test_sealing_key()),
+        )
+        .expect("a role CONNECTION carries key material"),
+        ..Default::default()
+    }
+    .with_files(vec![FileEntry::new(
+        "s3://warehouse/db/events/part-00000.parquet",
+        1,
+    )]);
     let role_json = role_spec.to_json();
     for field in CATALOG_AUTH_KEYS {
         assert!(!role_json.contains(field), "{field} in: {role_json}");
@@ -118,19 +115,17 @@ fn catalog_auth_secrets_never_in_a_role_scan_spec() {
 #[test]
 fn grouped_scan_spec_carries_group_keys() {
     let group_keys = vec!["\"REGION\"".to_string(), "YEAR(\"TS\")".to_string()];
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            aggregates: Some(vec![AggregatePlan {
-                kind: AggKind::Count,
-                column: None,
-                arg_expr: None,
-            }]),
-            group_keys: Some(group_keys.clone()),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![FileEntry::new("s3://w/f0.parquet", 1)],
-    };
+    let spec = CommonScanSpec {
+        aggregates: Some(vec![AggregatePlan {
+            kind: AggKind::Count,
+            column: None,
+            arg_expr: None,
+        }]),
+        group_keys: Some(group_keys.clone()),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![FileEntry::new("s3://w/f0.parquet", 1)]);
     let json = spec.to_json();
     let back = ScanSpec::from_json(&json).expect("must round-trip");
     let keys = back.common.group_keys.expect("group_keys must be present");
@@ -345,19 +340,17 @@ fn scan_spec_carries_no_catalog_block() {
     const OAUTH_URI_SENTINEL: &str = "https://oauth-uri-sentinel.example/token";
     const SCOPE_SENTINEL: &str = "SCOPE_SENTINEL_VALUE";
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into(), "NAME".into()],
-            filter: Some("(\"ID\" > 10)".into()),
-            limit: Some(100),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![FileEntry::new(
-            "s3://warehouse/db/events/part-00000.parquet",
-            1,
-        )],
-    };
+    let spec = CommonScanSpec {
+        projection: vec!["ID".into(), "NAME".into()],
+        filter: Some("(\"ID\" > 10)".into()),
+        limit: Some(100),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![FileEntry::new(
+        "s3://warehouse/db/events/part-00000.parquet",
+        1,
+    )]);
 
     let json = spec.to_json();
 
@@ -469,14 +462,12 @@ fn pushdown_carries_logical_schema_in_common_arg() {
     assert_eq!(logical[3].arrow_type, "decimal128(18,4)");
     assert!(logical[3].nullable);
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            logical_schema: logical.clone(),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec = CommonScanSpec {
+        logical_schema: logical.clone(),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let json = spec.to_json();
     let back = ScanSpec::from_json(&json).unwrap();
     assert_eq!(
@@ -723,14 +714,12 @@ fn iceberg_declaration_default_less_spec_round_trips_unchanged() {
         "a default-less schema must encode no defaults"
     );
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            logical_schema: logical.clone(),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec = CommonScanSpec {
+        logical_schema: logical.clone(),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let json = spec.to_json();
     assert!(
         !json.contains("initial_default"),

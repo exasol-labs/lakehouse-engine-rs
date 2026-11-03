@@ -1,5 +1,6 @@
 use super::*;
 use crate::scan::session_config_for_spec;
+use crate::scan::test_support::WithFiles;
 use crate::scan::test_support::{inline_resolved, local_file_size, minimal_spec};
 
 #[test]
@@ -1063,26 +1064,27 @@ async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
     const SENTINEL: &str = "RAWSCANSECRETVALUE";
 
     let endpoint = refusing_endpoint(&format!("{MARKER} {SENTINEL}"));
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec![ProjectionItem::Column("ID".into())],
-            logical_schema: vec![crate::scan::spec::LogicalField {
-                field_id: Some(1),
-                name: "id".into(),
-                arrow_type: "int64".into(),
-                nullable: false,
-                initial_default: None,
-                nested: None,
-                physical_name: None,
-            }],
-            storage: ScanStorage::Connection {
-                name: TEST_CONNECTION.into(),
-                allow_http: true,
-            },
-            ..Default::default()
+    let spec = CommonScanSpec {
+        projection: vec![ProjectionItem::Column("ID".into())],
+        logical_schema: vec![crate::scan::spec::LogicalField {
+            field_id: Some(1),
+            name: "id".into(),
+            arrow_type: "int64".into(),
+            nullable: false,
+            initial_default: None,
+            nested: None,
+            physical_name: None,
+        }],
+        storage: ScanStorage::Connection {
+            name: TEST_CONNECTION.into(),
+            allow_http: true,
         },
-        files: vec![FileEntry::new("s3://test-bucket/data/part-0.parquet", 4096)],
-    };
+        ..Default::default()
+    }
+    .with_files(vec![FileEntry::new(
+        "s3://test-bucket/data/part-0.parquet",
+        4096,
+    )]);
     let storage = ResolvedScanStorage::from_backends(refusing_backend(&endpoint, SENTINEL), None);
 
     let session = build_session_context(&spec, &storage, 0).expect("the session must build");

@@ -1,4 +1,5 @@
 use crate::scan_fixture;
+use crate::scan_fixture::WithFiles;
 
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
@@ -177,26 +178,24 @@ fn join_spec(
     filter: Option<&str>,
     limit: Option<u64>,
 ) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: projection
-                .into_iter()
-                .map(|name| ProjectionItem::Column(qualified(name)))
-                .collect(),
-            filter: filter.map(Into::into),
-            join: Some(JoinSpec {
-                files: dim_files.into_iter().map(FileEntry::from).collect(),
-                condition: JOIN_CONDITION.into(),
-                post_join_limit: limit,
-                ..scan_fixture::join_spec(ScanStorage::Inline(dim_storage()))
-            }),
-            storage: ScanStorage::Inline(storage()),
-            // Above one target partition DataFusion defaults joins to `Partitioned` mode.
-            df_target_partitions: 4,
-            ..Default::default()
-        },
-        files: fact_files.into_iter().map(FileEntry::from).collect(),
+    CommonScanSpec {
+        projection: projection
+            .into_iter()
+            .map(|name| ProjectionItem::Column(qualified(name)))
+            .collect(),
+        filter: filter.map(Into::into),
+        join: Some(JoinSpec {
+            files: dim_files.into_iter().map(FileEntry::from).collect(),
+            condition: JOIN_CONDITION.into(),
+            post_join_limit: limit,
+            ..scan_fixture::join_spec(ScanStorage::Inline(dim_storage()))
+        }),
+        storage: ScanStorage::Inline(storage()),
+        // Above one target partition DataFusion defaults joins to `Partitioned` mode.
+        df_target_partitions: 4,
+        ..Default::default()
     }
+    .with_files(fact_files.into_iter().map(FileEntry::from).collect())
 }
 
 fn run_join(spec: &ScanSpec, emits: &[ExaType]) -> Vec<RecordBatch> {
@@ -480,35 +479,33 @@ fn each_join_side_materializes_its_own_partition_columns() {
         BTreeMap::from([("c_country".to_string(), Some("CA".to_string()))]),
     );
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: ["O_ORDERKEY", "O_REGION", "C_NAME", "C_COUNTRY"]
-                .into_iter()
-                .map(|name| ProjectionItem::Column(qualified(name)))
-                .collect(),
+    let spec = CommonScanSpec {
+        projection: ["O_ORDERKEY", "O_REGION", "C_NAME", "C_COUNTRY"]
+            .into_iter()
+            .map(|name| ProjectionItem::Column(qualified(name)))
+            .collect(),
+        logical_schema: vec![
+            logical_field(1, "o_orderkey", "int64"),
+            logical_field(2, "o_custkey", "int64"),
+            logical_field(3, "o_totalprice", "float64"),
+            logical_field(4, "o_region", "utf8"),
+        ],
+        partition_columns: vec!["o_region".to_string()],
+        join: Some(JoinSpec {
+            files: vec![dim_file],
             logical_schema: vec![
-                logical_field(1, "o_orderkey", "int64"),
-                logical_field(2, "o_custkey", "int64"),
-                logical_field(3, "o_totalprice", "float64"),
-                logical_field(4, "o_region", "utf8"),
+                logical_field(1, "c_custkey", "int64"),
+                logical_field(2, "c_name", "utf8"),
+                logical_field(3, "c_country", "utf8"),
             ],
-            partition_columns: vec!["o_region".to_string()],
-            join: Some(JoinSpec {
-                files: vec![dim_file],
-                logical_schema: vec![
-                    logical_field(1, "c_custkey", "int64"),
-                    logical_field(2, "c_name", "utf8"),
-                    logical_field(3, "c_country", "utf8"),
-                ],
-                condition: JOIN_CONDITION.into(),
-                partition_columns: vec!["c_country".to_string()],
-                ..scan_fixture::join_spec(ScanStorage::Inline(dim_storage()))
-            }),
-            storage: ScanStorage::Inline(storage()),
-            ..Default::default()
-        },
-        files: vec![fact_file],
-    };
+            condition: JOIN_CONDITION.into(),
+            partition_columns: vec!["c_country".to_string()],
+            ..scan_fixture::join_spec(ScanStorage::Inline(dim_storage()))
+        }),
+        storage: ScanStorage::Inline(storage()),
+        ..Default::default()
+    }
+    .with_files(vec![fact_file]);
 
     let batches = run_join(
         &spec,
@@ -1062,34 +1059,35 @@ fn a_dimension_side_read_failure_redacts_the_dimension_sides_credential() {
     let fact_endpoint = refusing_endpoint(&format!("{FACT_MARKER} TOPSECRETVALUE"));
     let dim_endpoint = refusing_endpoint(&format!("{DIM_MARKER} DIMSECRETVALUE"));
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec![
-                ProjectionItem::Column(qualified("O_ORDERKEY")),
-                ProjectionItem::Column(qualified("C_NAME")),
-            ],
+    let spec = CommonScanSpec {
+        projection: vec![
+            ProjectionItem::Column(qualified("O_ORDERKEY")),
+            ProjectionItem::Column(qualified("C_NAME")),
+        ],
+        logical_schema: vec![
+            logical_field(1, "o_orderkey", "int64"),
+            logical_field(2, "o_custkey", "int64"),
+        ],
+        join: Some(JoinSpec {
+            table_root: "s3://test-bucket/db/dim".into(),
+            files: vec![FileEntry::new("data/dim-0.parquet", 4096)],
             logical_schema: vec![
-                logical_field(1, "o_orderkey", "int64"),
-                logical_field(2, "o_custkey", "int64"),
+                logical_field(1, "c_custkey", "int64"),
+                logical_field(2, "c_name", "utf8"),
             ],
-            join: Some(JoinSpec {
-                table_root: "s3://test-bucket/db/dim".into(),
-                files: vec![FileEntry::new("data/dim-0.parquet", 4096)],
-                logical_schema: vec![
-                    logical_field(1, "c_custkey", "int64"),
-                    logical_field(2, "c_name", "utf8"),
-                ],
-                condition: JOIN_CONDITION.into(),
-                ..scan_fixture::join_spec(ScanStorage::Inline(s3_backend(
-                    &dim_endpoint,
-                    "DIMSECRETVALUE",
-                )))
-            }),
-            storage: ScanStorage::Inline(s3_backend(&fact_endpoint, "TOPSECRETVALUE")),
-            ..Default::default()
-        },
-        files: vec![FileEntry::new("s3://test-bucket/data/part-0.parquet", 4096)],
-    };
+            condition: JOIN_CONDITION.into(),
+            ..scan_fixture::join_spec(ScanStorage::Inline(s3_backend(
+                &dim_endpoint,
+                "DIMSECRETVALUE",
+            )))
+        }),
+        storage: ScanStorage::Inline(s3_backend(&fact_endpoint, "TOPSECRETVALUE")),
+        ..Default::default()
+    }
+    .with_files(vec![FileEntry::new(
+        "s3://test-bucket/data/part-0.parquet",
+        4096,
+    )]);
 
     let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
         TestContext::scalar(vec![

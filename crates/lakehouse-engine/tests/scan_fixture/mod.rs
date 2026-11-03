@@ -3,7 +3,9 @@
 pub mod concurrency_probe;
 
 use lakehouse_engine::scan::ResolvedScanStorage;
-use lakehouse_engine::scan::spec::{JoinSpec, JoinType, ScanSpec, ScanStorage, StorageBackend};
+use lakehouse_engine::scan::spec::{
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, ScanSpec, ScanStorage, StorageBackend,
+};
 
 pub fn resolved_storage(spec: &ScanSpec) -> ResolvedScanStorage {
     ResolvedScanStorage::from_backends(
@@ -236,5 +238,18 @@ impl UdfContext for BatchCapturingCtx {
                 data,
             ))]);
         Ok(())
+    }
+}
+
+pub trait WithFiles {
+    fn with_files(self, files: Vec<FileEntry>) -> ScanSpec;
+}
+
+impl WithFiles for CommonScanSpec {
+    fn with_files(self, files: Vec<FileEntry>) -> ScanSpec {
+        ScanSpec {
+            common: self,
+            files,
+        }
     }
 }

@@ -1,4 +1,5 @@
 use crate::adapter::pushdown::test_support::col;
+use crate::scan::test_support::WithFiles;
 use std::sync::Arc;
 
 use delta_kernel::scan::{Scan, StatsOptions};
@@ -888,7 +889,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 #[test]
 fn a_void_column_reads_as_all_null_under_name_column_mapping() {
     use super::super::delta_schema::classify_spark_schema;
-    use crate::scan::spec::{CommonScanSpec, ScanSpec};
+    use crate::scan::spec::CommonScanSpec;
     use crate::scan::{build_raw_scan_physical_plan, register_files, session_config_for_spec};
     use datafusion::execution::context::SessionContext;
 
@@ -928,16 +929,14 @@ fn a_void_column_reads_as_all_null_under_name_column_mapping() {
         "the void column is tagged utf8 and binds by the physical name no data file carries"
     );
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            table_root,
-            projection: vec!["VALUE".into(), "VOID_COL".into()],
-            logical_schema,
-            partition_columns,
-            ..Default::default()
-        },
-        files,
-    };
+    let spec = CommonScanSpec {
+        table_root,
+        projection: vec!["VALUE".into(), "VOID_COL".into()],
+        logical_schema,
+        partition_columns,
+        ..Default::default()
+    }
+    .with_files(files);
 
     let batches = block_on(async {
         let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));

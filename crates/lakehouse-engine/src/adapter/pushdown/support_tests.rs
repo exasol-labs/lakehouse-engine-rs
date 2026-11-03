@@ -2,6 +2,7 @@ use super::super::scalar_over_agg::cast_merge_items;
 use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, SortKey, StorageProps};
+use crate::scan::test_support::WithFiles;
 use vs_expression::render_df_filter_safe;
 
 #[test]
@@ -166,15 +167,13 @@ fn datafusion_renderable_answer_unchanged_by_strip_table_alias() {
 }
 
 fn delete_spec_template() -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            table_root: "s3://warehouse/db/table".into(),
-            projection: vec![ProjectionItem::Column("ID".into())],
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
+    CommonScanSpec {
+        table_root: "s3://warehouse/db/table".into(),
+        projection: vec![ProjectionItem::Column("ID".into())],
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
     }
+    .with_files(vec![])
 }
 
 /// Scenario: Delete-file references are carried in the per-shard files argument
@@ -744,16 +743,14 @@ fn aggregate_query_builds_partial_agg_spec() {
     let merge_inputs =
         AggregateMergeInputs::new(Vec::new(), cast_merge_items(&agg_plans, &[]), None)
             .expect("a two-aggregate merge SELECT is never empty");
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["AMOUNT".into()],
-            filter: Some("(\"REGION\" = 'EU')".into()),
-            aggregates: Some(agg_plans),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        projection: vec!["AMOUNT".into()],
+        filter: Some("(\"REGION\" = 'EU')".into()),
+        aggregates: Some(agg_plans),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
 
     let shards = vec![vec![("s3://warehouse/f.parquet".to_string(), 1u64)]];
     let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
@@ -872,15 +869,13 @@ fn common_spec_carries_s3_max_connections_exactly_once() {
     ];
     // Distinct from the default (8) and every other numeric field in the spec.
     let distinctive_s3_max_connections = 37;
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into()],
-            storage: ScanStorage::Inline(sample_storage()),
-            s3_max_connections: distinctive_s3_max_connections,
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        projection: vec!["ID".into()],
+        storage: ScanStorage::Inline(sample_storage()),
+        s3_max_connections: distinctive_s3_max_connections,
+        ..Default::default()
+    }
+    .with_files(vec![]);
 
     let common = spec_template.to_common();
     assert_eq!(
@@ -921,14 +916,12 @@ fn build_agg_sql(
     cluster_nodes: usize,
 ) -> String {
     let merge_select = cast_merge_items(&agg_plans, &[]);
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            aggregates: Some(agg_plans),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        aggregates: Some(agg_plans),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let files_with_sizes: Vec<FileEntry> =
         files.into_iter().map(|p| FileEntry::new(p, 1)).collect();
     let shards =
@@ -956,14 +949,12 @@ fn aggregate_merge_renders_having_then_request_limit() {
         arg_expr: None,
     }];
     let merge_select = cast_merge_items(&plans, &[]);
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            aggregates: Some(plans),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        aggregates: Some(plans),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
     let merge_inputs = AggregateMergeInputs::new(Vec::new(), merge_select, Some(0))
         .expect("a bare-aggregate merge SELECT is never empty")
@@ -1131,14 +1122,12 @@ fn aggregate_merge_splices_caller_select_items_and_types_emits_per_plan() {
         column: None,
         arg_expr: Some(r#"("A" * "B")"#.to_string()),
     }];
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            aggregates: Some(plans),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        aggregates: Some(plans),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
     let merge_select = vec![r#"CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(30,4))"#.to_string()];
     let merge_inputs =
@@ -1250,13 +1239,11 @@ fn single_shard_aggregate_still_uses_merge_wrapper() {
 
 /// Matches the real `handle_pushdown` caller contract: only `files` varies per shard.
 fn count_distinct_base_spec() -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
+    CommonScanSpec {
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
     }
+    .with_files(vec![])
 }
 
 #[test]
@@ -1348,13 +1335,11 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
     ];
     let (proj, proj_types) = referenced_column_projection(&pushdown_req, &all_cols);
     let base = count_distinct_base_spec();
-    let fan_out_spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: proj,
-            ..base.common
-        },
-        files: base.files,
-    };
+    let fan_out_spec = CommonScanSpec {
+        projection: proj,
+        ..base.common
+    }
+    .with_files(base.files);
     let request = serde_json::json!({"involvedTables": [{"name": "T"}]});
     let fan_out = FanOutProjection::new(&fan_out_spec, &proj_types).expect("aligned fan-out");
     let sql = build_qualified_single_table_fallback_sql(
@@ -1644,14 +1629,12 @@ fn scan_driving_sql_groups_by_shard_key_not_iproc() {
         .map(|i| (format!("s3://warehouse/f{i}.parquet"), (i as u64 + 1) * 100))
         .collect();
     let g = shard_count(3, 1, files.len());
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into()],
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        projection: vec!["ID".into()],
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
     let sql = build_scan_driving_sql(
         &spec_template,
@@ -1682,14 +1665,12 @@ fn scan_driving_sql_groups_by_shard_key_not_iproc() {
 fn single_shard_collapses_to_single_invocation() {
     let files = vec![("s3://warehouse/f0.parquet".to_string(), 500u64)];
     let g = shard_count(1, 1, files.len());
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into()],
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        projection: vec!["ID".into()],
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
     let sql = build_scan_driving_sql(
         &spec_template,
@@ -2575,17 +2556,15 @@ fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, String)]) ->
         .expect("fixture precondition: a declining filter must be handed back for self-applying");
     let request = serde_json::json!({"involvedTables": [{"name": "T"}]});
     let pushdown_req = serde_json::json!({"filter": filter.clone()});
-    let fan_out_spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: col_types
-                .iter()
-                .map(|(name, _)| ProjectionItem::from(name.clone()))
-                .collect(),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let fan_out_spec = CommonScanSpec {
+        projection: col_types
+            .iter()
+            .map(|(name, _)| ProjectionItem::from(name.clone()))
+            .collect(),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let proj_types: Vec<String> = col_types.iter().map(|(_, ty)| ty.clone()).collect();
     let fan_out = super::super::joins::FanOutProjection::new(&fan_out_spec, &proj_types)
         .expect("aligned fan-out");

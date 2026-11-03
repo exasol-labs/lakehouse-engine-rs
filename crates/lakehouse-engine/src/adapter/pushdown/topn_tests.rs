@@ -8,7 +8,8 @@ use super::super::support::{
 use super::super::test_support::*;
 use super::super::{detect_aggregates, ordinary_plans, validate_agg_col_types};
 use super::*;
-use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, ScanStorage};
+use crate::scan::spec::{CommonScanSpec, FileEntry, ScanStorage};
+use crate::scan::test_support::WithFiles;
 
 /// Mirrors `handle_pushdown`'s synchronous post-resolution row-scan path.
 fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize) -> String {
@@ -78,18 +79,16 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
         Vec::new()
     };
 
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            projection: proj_cols.clone(),
-            filter,
-            limit: effective_limit,
-            order_by,
-            aggregates,
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        projection: proj_cols.clone(),
+        filter,
+        limit: effective_limit,
+        order_by,
+        aggregates,
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let files: Vec<FileEntry> = files.into_iter().map(FileEntry::from).collect();
     let g = shard_count(cluster_nodes, 1, files.len());
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);

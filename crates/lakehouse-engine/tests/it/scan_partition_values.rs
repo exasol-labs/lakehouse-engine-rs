@@ -3,6 +3,7 @@
 //! `__HIVE_DEFAULT_PARTITION__` file, whose commit logs `"letter": null`).
 
 use crate::scan_fixture;
+use crate::scan_fixture::WithFiles;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -144,19 +145,17 @@ fn basic_partitioned_spec(
     filter: Option<String>,
     limit: Option<u64>,
 ) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            table_root: table_root.to_string(),
-            logical_schema: basic_partitioned_logical_schema(),
-            partition_columns: vec!["letter".to_string()],
-            filter,
-            limit,
-            storage: ScanStorage::Inline(dummy_storage()),
-            df_batch_size: 64,
-            ..Default::default()
-        },
-        files,
+    CommonScanSpec {
+        table_root: table_root.to_string(),
+        logical_schema: basic_partitioned_logical_schema(),
+        partition_columns: vec!["letter".to_string()],
+        filter,
+        limit,
+        storage: ScanStorage::Inline(dummy_storage()),
+        df_batch_size: 64,
+        ..Default::default()
     }
+    .with_files(files)
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -314,17 +313,15 @@ fn logical_schema_with_flag() -> Vec<LogicalField> {
 }
 
 fn spec_with_flag(files: Vec<FileEntry>, table_root: &str) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            table_root: table_root.to_string(),
-            logical_schema: logical_schema_with_flag(),
-            partition_columns: vec!["letter".to_string(), "flag".to_string()],
-            storage: ScanStorage::Inline(dummy_storage()),
-            df_batch_size: 64,
-            ..Default::default()
-        },
-        files,
+    CommonScanSpec {
+        table_root: table_root.to_string(),
+        logical_schema: logical_schema_with_flag(),
+        partition_columns: vec!["letter".to_string(), "flag".to_string()],
+        storage: ScanStorage::Inline(dummy_storage()),
+        df_batch_size: 64,
+        ..Default::default()
     }
+    .with_files(files)
 }
 
 #[test]
@@ -454,17 +451,15 @@ fn logged_partition_value_wins_over_a_physical_partition_column() {
         size,
         BTreeMap::from([("letter".to_string(), Some("a_logged".to_string()))]),
     );
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            table_root: table_root.clone(),
-            logical_schema: one_off_logical_schema(),
-            partition_columns: vec!["letter".to_string()],
-            storage: ScanStorage::Inline(dummy_storage()),
-            df_batch_size: 64,
-            ..Default::default()
-        },
-        files: vec![entry],
-    };
+    let spec = CommonScanSpec {
+        table_root: table_root.clone(),
+        logical_schema: one_off_logical_schema(),
+        partition_columns: vec!["letter".to_string()],
+        storage: ScanStorage::Inline(dummy_storage()),
+        df_batch_size: 64,
+        ..Default::default()
+    }
+    .with_files(vec![entry]);
 
     let rows = run_scan(
         &spec,
@@ -621,16 +616,14 @@ fn scan_without_partition_columns_is_byte_identical() {
     let (rel, size) = copy_partition_file(dir, "letter=a", LETTER_A_FILE_1);
     let table_root = dir_url(dir);
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            table_root: table_root.clone(),
-            logical_schema: unpartitioned_logical_schema(),
-            storage: ScanStorage::Inline(dummy_storage()),
-            df_batch_size: 64,
-            ..Default::default()
-        },
-        files: vec![FileEntry::new(rel, size)],
-    };
+    let spec = CommonScanSpec {
+        table_root: table_root.clone(),
+        logical_schema: unpartitioned_logical_schema(),
+        storage: ScanStorage::Inline(dummy_storage()),
+        df_batch_size: 64,
+        ..Default::default()
+    }
+    .with_files(vec![FileEntry::new(rel, size)]);
     assert!(
         spec.common.partition_columns.is_empty(),
         "control case carries no partition columns"

@@ -1,4 +1,5 @@
 use crate::scan_fixture;
+use crate::scan_fixture::WithFiles;
 use crate::scan_fixture::concurrency_probe::ConcurrencyProbe;
 
 use std::collections::HashMap;
@@ -133,17 +134,15 @@ fn delete_ref(abs_url: &str) -> DeleteMechanism {
 }
 
 fn scan_spec(files: Vec<FileEntry>, filter: Option<String>, limit: Option<u64>) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into(), "NAME".into()],
-            filter,
-            limit,
-            storage: ScanStorage::Inline(dummy_storage()),
-            df_batch_size: 64,
-            ..Default::default()
-        },
-        files,
+    CommonScanSpec {
+        projection: vec!["ID".into(), "NAME".into()],
+        filter,
+        limit,
+        storage: ScanStorage::Inline(dummy_storage()),
+        df_batch_size: 64,
+        ..Default::default()
     }
+    .with_files(files)
 }
 
 /// Field-ids are assigned sequentially from 1.
@@ -170,18 +169,16 @@ fn scan_spec_with_logical_schema(
     filter: Option<String>,
     limit: Option<u64>,
 ) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into(), "NAME".into()],
-            filter,
-            limit,
-            storage: ScanStorage::Inline(dummy_storage()),
-            df_batch_size: 64,
-            logical_schema: logical_fields(&[("id", "int64"), ("name", "utf8")]),
-            ..Default::default()
-        },
-        files,
+    CommonScanSpec {
+        projection: vec!["ID".into(), "NAME".into()],
+        filter,
+        limit,
+        storage: ScanStorage::Inline(dummy_storage()),
+        df_batch_size: 64,
+        logical_schema: logical_fields(&[("id", "int64"), ("name", "utf8")]),
+        ..Default::default()
     }
+    .with_files(files)
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {

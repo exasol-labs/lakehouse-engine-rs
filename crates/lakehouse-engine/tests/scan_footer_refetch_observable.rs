@@ -4,6 +4,7 @@
 
 mod scan_fixture;
 
+use crate::scan_fixture::WithFiles;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -154,36 +155,34 @@ fn dummy_storage() -> StorageBackend {
 /// A non-empty logical schema avoids schema inference, which would fetch and cache the footer
 /// before Phase B and make the request counts vacuous.
 fn raw_spec_with_logical_schema(table_root: String) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            table_root,
-            projection: vec!["ID".into(), "NAME".into()],
-            storage: ScanStorage::Inline(dummy_storage()),
-            df_batch_size: 64,
-            logical_schema: vec![
-                LogicalField {
-                    field_id: Some(1),
-                    name: "id".to_string(),
-                    arrow_type: "int64".to_string(),
-                    nullable: false,
-                    initial_default: None,
-                    nested: None,
-                    physical_name: None,
-                },
-                LogicalField {
-                    field_id: Some(2),
-                    name: "name".to_string(),
-                    arrow_type: "utf8".to_string(),
-                    nullable: false,
-                    initial_default: None,
-                    nested: None,
-                    physical_name: None,
-                },
-            ],
-            ..Default::default()
-        },
-        files: Vec::new(),
+    CommonScanSpec {
+        table_root,
+        projection: vec!["ID".into(), "NAME".into()],
+        storage: ScanStorage::Inline(dummy_storage()),
+        df_batch_size: 64,
+        logical_schema: vec![
+            LogicalField {
+                field_id: Some(1),
+                name: "id".to_string(),
+                arrow_type: "int64".to_string(),
+                nullable: false,
+                initial_default: None,
+                nested: None,
+                physical_name: None,
+            },
+            LogicalField {
+                field_id: Some(2),
+                name: "name".to_string(),
+                arrow_type: "utf8".to_string(),
+                nullable: false,
+                initial_default: None,
+                nested: None,
+                physical_name: None,
+            },
+        ],
+        ..Default::default()
     }
+    .with_files(Vec::new())
 }
 
 fn write_local_parquet(dir: &std::path::Path, relative: &str, rows: i64) -> String {

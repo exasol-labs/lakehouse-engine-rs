@@ -1,4 +1,5 @@
 use crate::scan_fixture;
+use crate::scan_fixture::WithFiles;
 
 use std::sync::Arc;
 
@@ -60,22 +61,20 @@ fn pruning_spec(file_url: String) -> ScanSpec {
     let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
         .map(|m| m.len())
         .unwrap_or(0);
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into(), "NAME".into()],
-            filter: Some(r#""ID" >= 200 AND "ID" < 400"#.into()),
-            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
-                endpoint: "http://localhost:9000".into(),
-                region: "us-east-1".into(),
-                access_key: "k".into(),
-                secret_key: "s".into(),
-                allow_http: true,
-                ..Default::default()
-            })),
+    CommonScanSpec {
+        projection: vec!["ID".into(), "NAME".into()],
+        filter: Some(r#""ID" >= 200 AND "ID" < 400"#.into()),
+        storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
+            endpoint: "http://localhost:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            allow_http: true,
             ..Default::default()
-        },
-        files: vec![FileEntry::new(file_url, size)],
+        })),
+        ..Default::default()
     }
+    .with_files(vec![FileEntry::new(file_url, size)])
 }
 
 async fn collect_rows(
@@ -216,29 +215,27 @@ fn nested_spec(file_url: String, filter: &str) -> ScanSpec {
         nested,
         physical_name: None,
     };
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: vec![
-                ProjectionItem::Column("ID".into()),
-                ProjectionItem::Column("TAGS".into()),
-            ],
-            filter: Some(filter.into()),
-            logical_schema: vec![
-                field("id", "int64", None),
-                field("tags", "utf8", Some(NestedMembers::List { element: None })),
-            ],
-            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
-                endpoint: "http://localhost:9000".into(),
-                region: "us-east-1".into(),
-                access_key: "k".into(),
-                secret_key: "s".into(),
-                allow_http: true,
-                ..Default::default()
-            })),
+    CommonScanSpec {
+        projection: vec![
+            ProjectionItem::Column("ID".into()),
+            ProjectionItem::Column("TAGS".into()),
+        ],
+        filter: Some(filter.into()),
+        logical_schema: vec![
+            field("id", "int64", None),
+            field("tags", "utf8", Some(NestedMembers::List { element: None })),
+        ],
+        storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
+            endpoint: "http://localhost:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            allow_http: true,
             ..Default::default()
-        },
-        files: vec![FileEntry::new(file_url, size)],
+        })),
+        ..Default::default()
     }
+    .with_files(vec![FileEntry::new(file_url, size)])
 }
 
 async fn run_nested_scan(spec: &ScanSpec) -> (Vec<(i64, String)>, Arc<dyn ExecutionPlan>) {
@@ -491,19 +488,17 @@ fn binary_spec(file_url: &str, filter: &str) -> ScanSpec {
         nested: None,
         physical_name: None,
     };
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: vec![ProjectionItem::Column("ID".into())],
-            filter: Some(filter.into()),
-            logical_schema: vec![
-                field("id", "int64"),
-                field("b", "binary"),
-                field("f", "fixed_size_binary(2)"),
-            ],
-            ..Default::default()
-        },
-        files: vec![FileEntry::new(file_url.to_string(), size)],
+    CommonScanSpec {
+        projection: vec![ProjectionItem::Column("ID".into())],
+        filter: Some(filter.into()),
+        logical_schema: vec![
+            field("id", "int64"),
+            field("b", "binary"),
+            field("f", "fixed_size_binary(2)"),
+        ],
+        ..Default::default()
     }
+    .with_files(vec![FileEntry::new(file_url.to_string(), size)])
 }
 
 async fn run_binary_scan(spec: &ScanSpec) -> (Vec<i64>, Arc<dyn ExecutionPlan>) {

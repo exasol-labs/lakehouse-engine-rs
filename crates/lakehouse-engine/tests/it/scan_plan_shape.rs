@@ -1,4 +1,5 @@
 use crate::scan_fixture;
+use crate::scan_fixture::WithFiles;
 
 use std::sync::Arc;
 
@@ -54,22 +55,20 @@ fn single_partition_spec(file_url: String) -> ScanSpec {
     let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
         .map(|m| m.len())
         .unwrap_or(0);
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into(), "NAME".into()],
-            filter: Some(r#""ID" >= 10"#.into()),
-            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
-                endpoint: "http://localhost:9000".into(),
-                region: "us-east-1".into(),
-                access_key: "k".into(),
-                secret_key: "s".into(),
-                allow_http: true,
-                ..Default::default()
-            })),
+    CommonScanSpec {
+        projection: vec!["ID".into(), "NAME".into()],
+        filter: Some(r#""ID" >= 10"#.into()),
+        storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
+            endpoint: "http://localhost:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            allow_http: true,
             ..Default::default()
-        },
-        files: vec![FileEntry::new(file_url, size)],
+        })),
+        ..Default::default()
     }
+    .with_files(vec![FileEntry::new(file_url, size)])
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -316,24 +315,22 @@ async fn order_by_spec_emits_bounded_topk_not_global_sort() {
 }
 
 fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            filter: Some(
-                r#""L_SHIPDATE" >= DATE '1994-01-01' AND "L_SHIPDATE" < DATE '1995-01-01'"#.into(),
-            ),
-            aggregates: Some(aggregates),
-            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
-                endpoint: "http://localhost:9000".into(),
-                region: "us-east-1".into(),
-                access_key: "k".into(),
-                secret_key: "s".into(),
-                allow_http: true,
-                ..Default::default()
-            })),
+    CommonScanSpec {
+        filter: Some(
+            r#""L_SHIPDATE" >= DATE '1994-01-01' AND "L_SHIPDATE" < DATE '1995-01-01'"#.into(),
+        ),
+        aggregates: Some(aggregates),
+        storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
+            endpoint: "http://localhost:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            allow_http: true,
             ..Default::default()
-        },
-        files: Vec::new(),
+        })),
+        ..Default::default()
     }
+    .with_files(Vec::new())
 }
 
 #[test]
@@ -403,13 +400,11 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
 }
 
 fn row_scan_spec() -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            storage: ScanStorage::Inline(test_storage()),
-            ..Default::default()
-        },
-        files: Vec::new(),
+    CommonScanSpec {
+        storage: ScanStorage::Inline(test_storage()),
+        ..Default::default()
     }
+    .with_files(Vec::new())
 }
 
 /// Scenario: Scan-driving query fans out via a nested distributor over a scalar scan UDF
@@ -530,19 +525,17 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         ..scan_fixture::join_spec(ScanStorage::Inline(test_storage()))
     };
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            table_root: "s3://warehouse/lh/orders".to_string(),
-            projection: vec![
-                ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "C_NAME")),
-                ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "O_ORDERDATE")),
-            ],
-            join: Some(join),
-            storage: ScanStorage::Inline(test_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec = CommonScanSpec {
+        table_root: "s3://warehouse/lh/orders".to_string(),
+        projection: vec![
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "C_NAME")),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "O_ORDERDATE")),
+        ],
+        join: Some(join),
+        storage: ScanStorage::Inline(test_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
 
     let shards = vec![
         vec![("data/ord-0.parquet".to_string(), 8192u64)],

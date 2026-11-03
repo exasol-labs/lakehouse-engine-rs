@@ -12,6 +12,7 @@ use super::super::tests::{
 use super::*;
 use crate::adapter::pushdown::test_support::*;
 use crate::scan::spec::{ColumnRef, SortKey, StorageBackend, StorageProps};
+use crate::scan::test_support::WithFiles;
 use vs_expression::{render_expression_exasol_safe, render_expression_safe};
 
 /// Q1 shape: `(SUPPLIER ⋈ NATION) ⋈ REGION`.
@@ -2228,17 +2229,15 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
             agg_item("COUNT", None, false),
         ],
     });
-    let fan_out_spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec![
-                ProjectionItem::from("C_CUSTKEY"),
-                ProjectionItem::from("C_NAME"),
-            ],
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let fan_out_spec = CommonScanSpec {
+        projection: vec![
+            ProjectionItem::from("C_CUSTKEY"),
+            ProjectionItem::from("C_NAME"),
+        ],
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let proj_types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(100)".to_string()];
     let fan_out = FanOutProjection::new(&fan_out_spec, &proj_types).expect("aligned fan-out");
     let actual = build_qualified_single_table_fallback_sql(
@@ -2367,14 +2366,12 @@ fn fallback_projection_narrows_to_referenced_columns() {
         (name.to_string(), ty.to_string())
     }
     fn spec_with(projection: Vec<ProjectionItem>) -> ScanSpec {
-        ScanSpec {
-            common: CommonScanSpec {
-                projection,
-                storage: ScanStorage::Inline(sample_storage()),
-                ..Default::default()
-            },
-            files: vec![],
+        CommonScanSpec {
+            projection,
+            storage: ScanStorage::Inline(sample_storage()),
+            ..Default::default()
         }
+        .with_files(vec![])
     }
     fn proj_names(proj: &[ProjectionItem]) -> Vec<String> {
         proj.iter()
@@ -2766,14 +2763,12 @@ fn declined_filter_request() -> Json {
 /// `filter` stays `None`: on the decline route the predicate lives only in the
 /// wrapper's `WHERE`.
 fn declined_filter_fan_out_spec() -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: vec![ProjectionItem::from("ID"), ProjectionItem::from("C_TS")],
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
+    CommonScanSpec {
+        projection: vec![ProjectionItem::from("ID"), ProjectionItem::from("C_TS")],
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
     }
+    .with_files(vec![])
 }
 
 fn declined_filter_proj_types() -> Vec<String> {
