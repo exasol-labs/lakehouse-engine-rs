@@ -181,7 +181,7 @@ pub(super) fn has_no_explicit_select_list(pushdown_req: &Json) -> bool {
 /// parameter because the callers must stay divergent: they fold case differently (see
 /// `ColumnNode::ascii_upper_name`) and fall back differently.
 /// [`referenced_leg_columns`]'s empty-`selectList` short-circuit must not move in here:
-/// `referenced_column_projection` must keep narrowing through the remaining clauses.
+/// `referenced_columns` must keep narrowing through the remaining clauses.
 pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMut(&Json)) {
     if let Some(list) = pushdown_req.get("selectList") {
         visit(list);

@@ -117,8 +117,7 @@ pub struct ResolvedScan {
 }
 
 impl ResolvedScan {
-    /// Plans `reader`'s files against `declared`, the table's parsed column notes, pruning by
-    /// `filter_json`.
+    /// Plans `reader`'s files against `declared`, the table's parsed column notes.
     pub async fn resolve(
         reader: &dyn FormatReader,
         declared: DeclaredSchema,

@@ -153,10 +153,8 @@ impl<'a> TableScanResolver<'a> {
     /// note. `involved` is the table's columns as the request declares them; their raw column
     /// notes are parsed here once for every format before any table is loaded.
     ///
-    /// Returns the table's per-column type map beside the scan. The map is built here, the one
-    /// point that has both the request's Exasol types and the declared binary layouts, and every
-    /// reader receives `filter_json` with its binary comparisons retyped by it, so each prunes on
-    /// the raw bytes.
+    /// Returns the table's per-column type map beside the scan, built here because only this
+    /// point has both the request types and the binary layouts.
     pub(super) async fn resolve(
         &self,
         table_identifier: &str,
@@ -167,6 +165,7 @@ impl<'a> TableScanResolver<'a> {
         let declared = involved.notes.declared_schema()?;
         let column_types =
             ColumnTypes::of(involved, &declared.logical_schema, self.binary_as_string);
+        // Retyped so every reader prunes binary comparisons on the raw bytes.
         let filter_json =
             filter_json.map(|filter| with_binary_literals(filter.clone(), &column_types));
         // Each source borrows what its arm loads, so those values outlive the match.

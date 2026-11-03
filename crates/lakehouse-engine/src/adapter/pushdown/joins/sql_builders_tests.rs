@@ -2211,11 +2211,11 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
         ..Default::default()
     }
     .with_files(vec![]);
-    let proj_types = vec![ExasolType::decimal(20, 0), ExasolType::varchar(100)];
-    let fan_out_columns = projected_columns(&fan_out_spec.common.projection, &proj_types);
-    let col_types = column_types(&[("C_CUSTKEY", proj_types[0]), ("C_NAME", proj_types[1])]);
-    let fan_out = FanOutProjection::new(&fan_out_spec, &fan_out_columns, &col_types)
-        .expect("aligned fan-out");
+    let col_types = column_types(&[
+        ("C_CUSTKEY", ExasolType::decimal(20, 0)),
+        ("C_NAME", ExasolType::varchar(100)),
+    ]);
+    let fan_out = FanOutProjection::new(&fan_out_spec, &col_types).expect("aligned fan-out");
     let actual = build_qualified_single_table_fallback_sql(
         &request,
         &pushdown_req,
@@ -2386,10 +2386,8 @@ fn fallback_projection_narrows_to_referenced_columns() {
                      "isAscending": true, "nullsLast": false}],
         "filter": predicate_equal(table_col("T", "FCOL"), num_lit(5)),
     });
-    let (proj, types) = split_projection(&referenced_column_projection(
-        &rich_req,
-        &column_types(&all_cols),
-    ));
+    let (proj, types) =
+        split_projection(&referenced_columns(&rich_req, &column_types(&all_cols)).projection());
     let names = proj_names(&proj);
     for expected in ["GK", "REGION", "HCOL", "OCOL", "FCOL"] {
         assert!(
@@ -2432,11 +2430,8 @@ fn fallback_projection_narrows_to_referenced_columns() {
                     num_lit(0)]}]}
         ],
     });
-    let grouped_col_types = column_types(&grouped_all);
-    let (gproj, gtypes) = split_projection(&referenced_column_projection(
-        &grouped_req,
-        &grouped_col_types,
-    ));
+    let grouped = referenced_columns(&grouped_req, &column_types(&grouped_all));
+    let (gproj, _) = split_projection(&grouped.projection());
     assert_eq!(
         proj_names(&gproj),
         vec!["GK".to_string(), "REGION".to_string()],
@@ -2444,9 +2439,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
          never IRRELEVANT_COL"
     );
     let gspec = spec_with(gproj);
-    let gfan_out_columns = projected_columns(&gspec.common.projection, &gtypes);
-    let gfan_out = FanOutProjection::new(&gspec, &gfan_out_columns, &grouped_col_types)
-        .expect("aligned grouped fan-out");
+    let gfan_out = FanOutProjection::new(&gspec, &grouped).expect("aligned grouped fan-out");
     let gsql = build_qualified_single_table_fallback_sql(
         &request,
         &grouped_req,
@@ -2480,17 +2473,16 @@ fn fallback_projection_narrows_to_referenced_columns() {
              "arguments": [table_col("T", "B")]},
         ],
     });
-    let sg_col_types = column_types(&sg_all);
-    let (sproj, stypes) = split_projection(&referenced_column_projection(&sg_req, &sg_col_types));
+    let single_group = referenced_columns(&sg_req, &column_types(&sg_all));
+    let (sproj, _) = split_projection(&single_group.projection());
     assert_eq!(
         proj_names(&sproj),
         vec!["A".to_string(), "B".to_string()],
         "the single-group Case 2/3 inner scan narrows to A + B, never IRRELEVANT_COL"
     );
     let sspec = spec_with(sproj);
-    let sfan_out_columns = projected_columns(&sspec.common.projection, &stypes);
-    let sfan_out = FanOutProjection::new(&sspec, &sfan_out_columns, &sg_col_types)
-        .expect("aligned single-group fan-out");
+    let sfan_out =
+        FanOutProjection::new(&sspec, &single_group).expect("aligned single-group fan-out");
     let ssql = build_qualified_single_table_fallback_sql(
         &request,
         &sg_req,
@@ -2537,10 +2529,8 @@ fn no_select_list_wire_forms_all_keep_the_full_base_row() {
         serde_json::json!({"selectList": null, "filter": filter.clone()}),
         serde_json::json!({"selectList": "*", "filter": filter.clone()}),
     ] {
-        let (proj, types) = split_projection(&referenced_column_projection(
-            &req,
-            &column_types(&all_cols),
-        ));
+        let (proj, types) =
+            split_projection(&referenced_columns(&req, &column_types(&all_cols)).projection());
         assert_eq!(
             proj, full_row,
             "no select list ⇒ `SELECT *` ⇒ the full base row, so the wrapper's own \
@@ -2555,7 +2545,7 @@ fn no_select_list_wire_forms_all_keep_the_full_base_row() {
 }
 
 #[test]
-fn referenced_column_projection_narrows_with_a_real_select_list() {
+fn referenced_columns_narrows_with_a_real_select_list() {
     let all_cols = vec![
         ("GK".to_string(), ExasolType::varchar(10)),
         ("FCOL".to_string(), ExasolType::decimal(18, 0)),
@@ -2566,10 +2556,8 @@ fn referenced_column_projection_narrows_with_a_real_select_list() {
         "filter": predicate_equal(table_col("T", "FCOL"), num_lit(5)),
     });
 
-    let (proj, types) = split_projection(&referenced_column_projection(
-        &req,
-        &column_types(&all_cols),
-    ));
+    let (proj, types) =
+        split_projection(&referenced_columns(&req, &column_types(&all_cols)).projection());
     assert_eq!(
         proj,
         vec![ProjectionItem::from("GK"), ProjectionItem::from("FCOL"),],
@@ -2582,7 +2570,7 @@ fn referenced_column_projection_narrows_with_a_real_select_list() {
 }
 
 #[test]
-fn referenced_column_projection_falls_back_to_first_column() {
+fn referenced_columns_falls_back_to_first_column() {
     let all_cols = vec![
         ("A".to_string(), ExasolType::decimal(18, 0)),
         ("B".to_string(), ExasolType::varchar(10)),
@@ -2592,10 +2580,8 @@ fn referenced_column_projection_falls_back_to_first_column() {
         "filter": null,
         "having": null,
     });
-    let (proj, types) = split_projection(&referenced_column_projection(
-        &req,
-        &column_types(&all_cols),
-    ));
+    let (proj, types) =
+        split_projection(&referenced_columns(&req, &column_types(&all_cols)).projection());
     assert_eq!(
         proj,
         vec![ProjectionItem::from("A")],
@@ -2750,16 +2736,11 @@ fn declined_filter_fan_out_spec() -> ScanSpec {
     .with_files(vec![])
 }
 
-fn declined_filter_proj_types() -> Vec<ExasolType> {
-    vec![
-        ExasolType::decimal(20, 0),
-        ExasolType::Timestamp { precision: None },
-    ]
-}
-
 fn declined_filter_column_types() -> ColumnTypes {
-    let types = declined_filter_proj_types();
-    column_types(&[("ID", types[0]), ("C_TS", types[1])])
+    column_types(&[
+        ("ID", ExasolType::decimal(20, 0)),
+        ("C_TS", ExasolType::BARE_TIMESTAMP),
+    ])
 }
 
 fn declined_filter_wrapper_sql(
@@ -2767,10 +2748,8 @@ fn declined_filter_wrapper_sql(
     declined: Option<&Json>,
 ) -> Result<String, UdfError> {
     let spec = declined_filter_fan_out_spec();
-    let proj_types = declined_filter_proj_types();
-    let fan_out_columns = projected_columns(&spec.common.projection, &proj_types);
     let col_types = declined_filter_column_types();
-    let fan_out = FanOutProjection::new(&spec, &fan_out_columns, &col_types)?;
+    let fan_out = FanOutProjection::new(&spec, &col_types)?;
     build_qualified_single_table_fallback_sql(
         &declined_filter_request(),
         pushdown_req,
@@ -2785,43 +2764,14 @@ fn declined_filter_wrapper_sql(
 #[test]
 fn fan_out_projection_rejects_misaligned_proj_types() {
     let spec = declined_filter_fan_out_spec();
-    let columns = vec![ProjectedColumn {
-        item: ProjectionItem::from("ID"),
-        exa_type: ExasolType::decimal(20, 0),
-    }];
+    let columns = column_types(&[("ID", ExasolType::decimal(20, 0))]);
 
-    let err = FanOutProjection::new(&spec, &columns, &declined_filter_column_types())
+    let err = FanOutProjection::new(&spec, &columns)
         .expect_err("a proj_types list shorter than the projection must fail construction");
     let text = err.to_string();
     assert!(
         text.contains('2') && text.contains('1'),
         "the error must name both lengths: {text}"
-    );
-}
-
-#[test]
-fn fan_out_projection_refuses_a_projected_column_the_map_lacks() {
-    let spec = CommonScanSpec {
-        projection: vec![
-            ProjectionItem::from("ID"),
-            ProjectionItem::Column("Z".into()),
-        ],
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
-    let columns = projected_columns(
-        &spec.common.projection,
-        &[declined_filter_proj_types()[0], ExasolType::Boolean],
-    );
-    let col_types = declined_filter_column_types();
-
-    let err = FanOutProjection::new(&spec, &columns, &col_types)
-        .expect_err("a projected column the type map lacks must fail construction");
-    let text = err.to_string();
-    assert!(
-        text.contains(r#""Z""#),
-        "the error must name the column: {text}"
     );
 }
 
@@ -2954,10 +2904,10 @@ fn single_table_wrapper_errors_when_declined_predicate_renders_in_neither_dialec
 #[test]
 fn outer_wrapper_renders_qualified_expression_sort_key() {
     let legs = single_scan_legs("T");
-    let cols_per_leg = vec![column_types(&[
+    let leg = column_types(&[
         ("ID", ExasolType::decimal(20, 0)),
         ("NAME", ExasolType::varchar(100)),
-    ])];
+    ]);
     let pushdown_req = serde_json::json!({
         "selectList": [table_col("T", "ID")],
         "groupBy": [table_col("T", "ID")],
@@ -2971,7 +2921,7 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
         "limit": {"numElements": 4}
     });
 
-    let clauses = outer_wrapper_clauses(&pushdown_req, &legs, &cols_per_leg)
+    let clauses = outer_wrapper_clauses(&pushdown_req, &legs, &[&leg])
         .expect("a renderable expression sort key must render, not decline");
 
     assert!(
@@ -3004,7 +2954,8 @@ fn seam_trailing(pushdown_req: &Json, legs: &JoinLegs) -> Result<String, UdfErro
         ("SCORE".to_string(), ExasolType::DoublePrecision),
     ];
     let cols_per_leg = vec![column_types(&cols); legs.leg_count()];
-    outer_wrapper_clauses(pushdown_req, legs, &cols_per_leg).map(|clauses| clauses.trailing)
+    outer_wrapper_clauses(pushdown_req, legs, &cols_per_leg.iter().collect::<Vec<_>>())
+        .map(|clauses| clauses.trailing)
 }
 
 /// The four live-captured offset-carrying shapes reaching this seam (#191 capture rows

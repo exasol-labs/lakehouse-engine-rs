@@ -1206,7 +1206,7 @@ fn count_distinct_wrapper_uses_native_count_distinct() {
 #[test]
 fn multi_count_distinct_declines_to_qualified_wrapper() {
     use super::super::joins::{
-        FanOutProjection, build_qualified_single_table_fallback_sql, referenced_column_projection,
+        FanOutProjection, build_qualified_single_table_fallback_sql, referenced_columns,
     };
     use super::super::single_group_agg::{has_distinct, is_lone_count_distinct};
 
@@ -1242,9 +1242,8 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
         ("REGION".to_string(), ExasolType::varchar(25)),
         ("IRRELEVANT_COL".to_string(), ExasolType::decimal(20, 0)),
     ];
-    let col_types = column_types(&all_cols);
-    let (proj, proj_types) =
-        split_projection(&referenced_column_projection(&pushdown_req, &col_types));
+    let referenced = referenced_columns(&pushdown_req, &column_types(&all_cols));
+    let (proj, _) = split_projection(&referenced.projection());
     let base = count_distinct_base_spec();
     let fan_out_spec = CommonScanSpec {
         projection: proj,
@@ -1252,9 +1251,7 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
     }
     .with_files(base.files);
     let request = serde_json::json!({"involvedTables": [{"name": "T"}]});
-    let fan_out_columns = projected_columns(&fan_out_spec.common.projection, &proj_types);
-    let fan_out = FanOutProjection::new(&fan_out_spec, &fan_out_columns, &col_types)
-        .expect("aligned fan-out");
+    let fan_out = FanOutProjection::new(&fan_out_spec, &referenced).expect("aligned fan-out");
     let sql = build_qualified_single_table_fallback_sql(
         &request,
         &pushdown_req,
@@ -2473,12 +2470,9 @@ fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, ExasolType)]
         ..Default::default()
     }
     .with_files(vec![]);
-    let proj_types: Vec<ExasolType> = col_types.iter().map(|(_, ty)| *ty).collect();
-    let fan_out_columns = projected_columns(&fan_out_spec.common.projection, &proj_types);
     let type_map = column_types(col_types);
-    let fan_out =
-        super::super::joins::FanOutProjection::new(&fan_out_spec, &fan_out_columns, &type_map)
-            .expect("aligned fan-out");
+    let fan_out = super::super::joins::FanOutProjection::new(&fan_out_spec, &type_map)
+        .expect("aligned fan-out");
     super::super::joins::build_qualified_single_table_fallback_sql(
         &request,
         &pushdown_req,
@@ -4673,7 +4667,7 @@ fn only_a_plain_timestamp_declares_timestamp_digits() {
             ExasolType::Timestamp { precision: None } => Some(3),
             ExasolType::Timestamp {
                 precision: Some(digits),
-            } => Some(usize::from(digits)),
+            } => Some(digits),
             ExasolType::Boolean
             | ExasolType::Decimal { .. }
             | ExasolType::DoublePrecision
@@ -4682,7 +4676,7 @@ fn only_a_plain_timestamp_declares_timestamp_digits() {
             | ExasolType::Char { .. }
             | ExasolType::Varchar { .. } => None,
         };
-        assert_eq!(declared_timestamp_digits(exa_type), expected, "{exa_type}");
+        assert_eq!(exa_type.fractional_digits(), expected, "{exa_type}");
     }
 }
 
@@ -4797,26 +4791,10 @@ fn the_column_type_map_takes_the_first_declared_field_of_a_case_folded_name() {
 }
 
 #[test]
-fn a_selection_follows_the_given_order_and_a_concatenation_lists_each_map_in_turn() {
+fn a_concatenation_lists_each_map_in_turn() {
     let left = column_types(&[("A", ExasolType::Boolean), ("B", ExasolType::Date)]);
     let right = column_types(&[("C", ExasolType::DoublePrecision)]);
 
-    let selected = left.selected(
-        [
-            ColumnRef::from("B"),
-            ColumnRef::from("Z"),
-            ColumnRef::from("A"),
-        ]
-        .iter(),
-    );
-    assert_eq!(
-        layouts_of(&selected),
-        vec![
-            ("B", ExasolType::Date, None),
-            ("A", ExasolType::Boolean, None)
-        ],
-        "a column the map lacks is skipped"
-    );
     assert_eq!(
         layouts_of(&ColumnTypes::concat([&left, &right])),
         vec![

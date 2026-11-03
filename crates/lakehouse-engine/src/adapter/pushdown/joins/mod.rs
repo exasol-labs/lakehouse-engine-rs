@@ -28,7 +28,7 @@ pub(crate) use sql_builders::{RenderedJoinPushdown, render_broadcast_join};
 pub(super) use sql_builders::{EmptyRelation, qualified_single_table_fallback_pushdown};
 #[cfg(test)]
 pub(super) use sql_builders::{
-    FanOutProjection, build_qualified_single_table_fallback_sql, referenced_column_projection,
+    FanOutProjection, build_qualified_single_table_fallback_sql, referenced_columns,
 };
 
 pub(super) use planning::JoinWindowPlan;

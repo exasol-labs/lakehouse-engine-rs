@@ -4,7 +4,9 @@ use arrow::datatypes::{DataType, TimeUnit};
 use delta_kernel::schema::{DataType as SparkType, PrimitiveType as SparkPrimitive, StructField};
 use lakehouse_catalog::ColumnSourceType;
 
-use super::exasol_type::{ExasolType, MAX_CHAR_SIZE, MAX_TIMESTAMP_PRECISION, MAX_VARCHAR_SIZE};
+use super::exasol_type::{
+    ExasolType, MAX_CHAR_SIZE, MAX_DECIMAL_PRECISION, MAX_TIMESTAMP_PRECISION, MAX_VARCHAR_SIZE,
+};
 use super::hive_type::parse_hive_type;
 use serde_json::{Value as Json, json};
 
@@ -36,31 +38,31 @@ fn compatible_exasol_type(dt: &DataType) -> Option<ExasolType> {
 
         // Exasol rejects TIMESTAMP WITH LOCAL TIME ZONE as a UDF EMITS type; a tz-aware
         // value is a UTC instant, so plain TIMESTAMP emits it unchanged.
-        DataType::Timestamp(_, _) => ExasolType::Timestamp { precision: None },
+        DataType::Timestamp(_, _) => ExasolType::BARE_TIMESTAMP,
 
-        DataType::Decimal128(p, s) if *p <= 36 && *s <= 36 => ExasolType::decimal(*p, *s),
+        DataType::Decimal128(p, s)
+            if *p <= MAX_DECIMAL_PRECISION && *s <= MAX_DECIMAL_PRECISION as i8 =>
+        {
+            ExasolType::decimal(*p, *s)
+        }
 
         _ => return None,
     };
     Some(exasol_type)
 }
 
-const EXASOL_DECIMAL_MAX_PRECISION: u32 = 36;
-
 pub fn needs_json_fallback(dt: &DataType) -> bool {
     compatible_exasol_type(dt).is_none()
 }
 
 /// The largest binary value whose lowercase hex rendering fits `VARCHAR(2000000)`.
-pub const MAX_BINARY_BYTES: usize = 1_000_000;
+pub const MAX_BINARY_BYTES: usize = MAX_VARCHAR_SIZE as usize / 2;
 
 /// Two hex characters per byte, so a `fixed(L)` column declares `VARCHAR(2L)`.
 pub(crate) fn hex_varchar(width: u64) -> ExasolType {
     let chars = width.saturating_mul(2);
     match u32::try_from(chars) {
-        Ok(size) if (1..=MAX_VARCHAR_SIZE).contains(&size) => {
-            ExasolType::Varchar { size, ascii: false }
-        }
+        Ok(size) if (1..=MAX_VARCHAR_SIZE).contains(&size) => ExasolType::varchar(size),
         _ => ExasolType::WIDEST_VARCHAR,
     }
 }
@@ -84,7 +86,7 @@ pub fn needs_nested_json_rendering(dt: &DataType) -> bool {
 /// The Arrow-input guards don't: an Arrow scale may be negative, and `exasol_type_from_json`
 /// reads a type Exasol already accepted.
 pub(crate) fn exasol_representable_catalog_decimal(precision: u32, scale: u32) -> bool {
-    (1..=EXASOL_DECIMAL_MAX_PRECISION).contains(&precision) && scale <= precision
+    (1..=u32::from(MAX_DECIMAL_PRECISION)).contains(&precision) && scale <= precision
 }
 
 fn catalog_decimal_to_exasol(precision: u32, scale: u32) -> ExasolType {
@@ -454,7 +456,8 @@ pub(crate) fn exasol_type_from_json(dt: &Json) -> ExasolType {
         "decimal" => {
             let p = dt.get("precision").and_then(|v| v.as_u64()).unwrap_or(18);
             let s = dt.get("scale").and_then(|v| v.as_u64()).unwrap_or(0);
-            if p <= 36 && s <= 36 {
+            let max = u64::from(MAX_DECIMAL_PRECISION);
+            if p <= max && s <= max {
                 ExasolType::decimal(p as u8, s as i8)
             } else {
                 ExasolType::WIDEST_VARCHAR

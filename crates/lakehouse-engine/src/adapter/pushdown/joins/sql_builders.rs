@@ -165,7 +165,7 @@ fn build_n_scan_join_from(
 
 fn n_full_row_qualified_items(
     legs: &JoinLegs,
-    cols_per_leg: &[ColumnTypes],
+    cols_per_leg: &[&ColumnTypes],
 ) -> Vec<ProjectionItem> {
     cols_per_leg
         .iter()
@@ -231,7 +231,7 @@ fn render_self_applied_where(
 fn n_scan_join_select_items(
     pushdown_req: &Json,
     legs: &JoinLegs,
-    cols_per_leg: &[ColumnTypes],
+    cols_per_leg: &[&ColumnTypes],
 ) -> Result<Vec<ProjectionItem>, UdfError> {
     match pushdown_req.get("selectList") {
         Some(Json::Array(list)) if !list.is_empty() => {
@@ -263,7 +263,7 @@ struct OuterWrapperClauses {
 fn outer_wrapper_clauses(
     pushdown_req: &Json,
     legs: &JoinLegs,
-    cols_per_leg: &[ColumnTypes],
+    cols_per_leg: &[&ColumnTypes],
 ) -> Result<OuterWrapperClauses, UdfError> {
     let select_items = n_scan_join_select_items(pushdown_req, legs, cols_per_leg)?;
     let group_by = qualified_join_group_by(pushdown_req, legs)?;
@@ -326,8 +326,7 @@ pub(in super::super) fn build_n_scan_join_sql(
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> Result<String, UdfError> {
-    let cols_per_side: Vec<ColumnTypes> =
-        sides.iter().map(|side| side.column_types.clone()).collect();
+    let cols_per_side: Vec<&ColumnTypes> = sides.iter().map(|side| &side.column_types).collect();
     if cols_per_side.iter().any(|c| c.is_empty()) {
         return Err(join_render_decline(
             "an involved table carries no column metadata, so the unaccelerated N-scan \
@@ -369,12 +368,12 @@ pub(in super::super) fn build_n_scan_join_sql(
     let mut type_declined: Option<Json> = None;
     for (i, side) in sides.iter().enumerate() {
         let narrowed =
-            referenced_leg_columns(pushdown_req, &all_conditions, &legs, i, &cols_per_side[i]);
+            referenced_leg_columns(pushdown_req, &all_conditions, &legs, i, cols_per_side[i]);
         let (side_filter, side_declined) = match leg_eligible
             .as_ref()
             .and_then(|f| leg_local_filter(f, &legs, i))
         {
-            Some(side_local) => type_screened_leg_filter(&side_local, &cols_per_side[i]),
+            Some(side_local) => type_screened_leg_filter(&side_local, cols_per_side[i]),
             None => (None, None),
         };
         // Disjoint by attribution, so no conjunct is double-applied.
@@ -508,7 +507,7 @@ pub(super) fn build_side_fan_out_sql(
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> Result<String, UdfError> {
-    let projection = full_projection(columns);
+    let projection = columns.projection();
 
     let shards = shard_side(side, inputs);
 
@@ -633,10 +632,9 @@ pub(in super::super) fn build_broadcast_join_sql(
         storage: scan_storage_for_side(&dimension.effective_storage, inputs)?,
     };
 
-    let projection = projection_items(&rendered.projection);
     let spec = join_fan_out_scan_spec(
         fact,
-        projection.clone(),
+        projection_items(&rendered.projection),
         rendered.filter.clone(),
         Some(join),
         inputs,
@@ -658,8 +656,8 @@ pub(in super::super) fn build_broadcast_join_sql(
     };
     let wrapped = wrap_declined_order_by(
         &fan_out,
-        &projection,
-        projection.len(),
+        &spec.common.projection,
+        spec.common.projection.len(),
         &keys,
         limit,
         offset,
@@ -756,12 +754,12 @@ fn qualified_join_order_by(
 /// Otherwise walks every clause via [`referenced_clause_values`] with the Unicode fold.
 /// Falls back to the first column when nothing is referenced (an empty EMITS is invalid),
 /// unlike [`referenced_leg_columns`], which falls back to all columns.
-pub(in super::super) fn referenced_column_projection(
+pub(in super::super) fn referenced_columns(
     pushdown_req: &Json,
     all_cols: &ColumnTypes,
-) -> Vec<ProjectedColumn> {
+) -> ColumnTypes {
     if !matches!(pushdown_req.get("selectList"), Some(Json::Array(list)) if !list.is_empty()) {
-        return full_projection(all_cols);
+        return all_cols.clone();
     }
 
     let mut names = std::collections::HashSet::new();
@@ -769,39 +767,23 @@ pub(in super::super) fn referenced_column_projection(
 
     let referenced = all_cols.narrowed(|column| names.contains(&column.name));
     if referenced.is_empty() {
-        return full_projection(all_cols).into_iter().take(1).collect();
+        return all_cols.first_only();
     }
-    full_projection(&referenced)
+    referenced
 }
 
-/// Every column of `columns`, each projected under its own type.
-fn full_projection(columns: &ColumnTypes) -> Vec<ProjectedColumn> {
-    columns
-        .iter()
-        .map(|(column, column_type)| ProjectedColumn {
-            item: ProjectionItem::Column(column.clone()),
-            exa_type: column_type.exa_type,
-        })
-        .collect()
-}
-
-/// The spec and its projected columns are constructed together because their positional
-/// alignment is load-bearing: both feed the wrapper universe and the `EMITS (...)` clause, and a
-/// shorter list truncates both. The type map travels with them because the wrapper's full row
-/// selects each projected column from it: a column the map lacked would drop out of the wrapper
-/// but stay in the `EMITS (...)` clause.
+/// `columns` is the spec's projection, the `EMITS (...)` clause, and the wrapper's full row, so
+/// their positional alignment is load-bearing: a shorter list truncates all three.
 #[derive(Debug)]
 pub(in super::super) struct FanOutProjection<'a> {
     pub spec: &'a ScanSpec,
-    pub columns: &'a [ProjectedColumn],
-    pub col_types: &'a ColumnTypes,
+    pub columns: &'a ColumnTypes,
 }
 
 impl<'a> FanOutProjection<'a> {
     pub(in super::super) fn new(
         spec: &'a ScanSpec,
-        columns: &'a [ProjectedColumn],
-        col_types: &'a ColumnTypes,
+        columns: &'a ColumnTypes,
     ) -> Result<Self, UdfError> {
         if spec.common.projection.len() != columns.len() {
             return Err(UdfError::User(format!(
@@ -811,22 +793,7 @@ impl<'a> FanOutProjection<'a> {
                 columns.len()
             )));
         }
-        let unmapped = spec.common.projection.iter().find_map(|item| match item {
-            ProjectionItem::Column(column) if col_types.get(column).is_none() => Some(column),
-            _ => None,
-        });
-        if let Some(column) = unmapped {
-            return Err(UdfError::User(format!(
-                "the fan-out projects column \"{}\" but the column type map has no entry for it; \
-                 the wrapper's full row must select every projected column",
-                column.output_name()
-            )));
-        }
-        Ok(Self {
-            spec,
-            columns,
-            col_types,
-        })
+        Ok(Self { spec, columns })
     }
 }
 
@@ -852,23 +819,13 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
     let legs = JoinLegs::for_single_scan(request);
     let alias = legs.leg_alias(0);
 
-    let projected_columns = fan_out_spec
-        .common
-        .projection
-        .iter()
-        .filter_map(|item| match item {
-            ProjectionItem::Column(column) => Some(column),
-            ProjectionItem::Expr { .. } => None,
-        });
-    let cols_per_leg = vec![fan_out.col_types.selected(projected_columns)];
-
     let OuterWrapperClauses { select, trailing } =
-        outer_wrapper_clauses(pushdown_req, &legs, &cols_per_leg)?;
+        outer_wrapper_clauses(pushdown_req, &legs, &[fan_out.columns])?;
 
     let fan_out = build_scan_driving_sql(
         fan_out_spec,
         shards,
-        fan_out.columns,
+        &fan_out.columns.projection(),
         None,
         &ColumnTypes::default(),
         None,
@@ -907,10 +864,10 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
     distribute_udf_name: &str,
     declined_filter: Option<&Json>,
 ) -> Result<Json, UdfError> {
-    let fb_projection = referenced_column_projection(pushdown_req, col_types);
+    let referenced = referenced_columns(pushdown_req, col_types);
     let fan_out_spec = ScanSpec {
         common: CommonScanSpec {
-            projection: projection_items(&fb_projection),
+            projection: projection_items(&referenced.projection()),
             filter,
             limit: None,
             order_by: Vec::new(),
@@ -921,7 +878,7 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
         },
         files: vec![],
     };
-    let fan_out = FanOutProjection::new(&fan_out_spec, &fb_projection, col_types)?;
+    let fan_out = FanOutProjection::new(&fan_out_spec, &referenced)?;
     let sql = build_qualified_single_table_fallback_sql(
         request,
         pushdown_req,
@@ -955,8 +912,11 @@ impl EmptyRelation {
     }
 
     pub(in super::super) fn pushdown(&self, pushdown_req: &Json) -> Result<Json, UdfError> {
-        let OuterWrapperClauses { select, trailing } =
-            outer_wrapper_clauses(pushdown_req, &self.legs, &self.cols_per_leg)?;
+        let OuterWrapperClauses { select, trailing } = outer_wrapper_clauses(
+            pushdown_req,
+            &self.legs,
+            &self.cols_per_leg.iter().collect::<Vec<_>>(),
+        )?;
         let from = self
             .cols_per_leg
             .iter()

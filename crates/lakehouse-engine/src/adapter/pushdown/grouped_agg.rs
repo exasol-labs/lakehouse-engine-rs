@@ -2,7 +2,7 @@ use crate::scan::spec::{
     AggKind, AggregatePlan, ColumnRef, FileEntry, PartialAggColumn, ScanSpec, partial_column_name,
     render_ordered,
 };
-use crate::types::exasol_type::ExasolType;
+use crate::types::exasol_type::{ExasolType, MAX_DECIMAL_PRECISION};
 use crate::types::mapping::exasol_type_from_json;
 use serde_json::Value as Json;
 use vs_expression::render_expression;
@@ -479,10 +479,7 @@ pub(super) fn col_type_for(
 
 fn sum_emit_type(col_ty: ExasolType) -> ExasolType {
     match col_ty {
-        ExasolType::Decimal { scale, .. } => ExasolType::Decimal {
-            precision: 36,
-            scale,
-        },
+        ExasolType::Decimal { scale, .. } => ExasolType::decimal(MAX_DECIMAL_PRECISION, scale),
         _ => ExasolType::DoublePrecision,
     }
 }

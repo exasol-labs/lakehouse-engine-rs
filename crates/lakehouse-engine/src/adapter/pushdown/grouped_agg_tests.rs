@@ -1,6 +1,6 @@
 use super::super::detect_aggregates;
 use super::super::joins::{
-    FanOutProjection, build_qualified_single_table_fallback_sql, referenced_column_projection,
+    FanOutProjection, build_qualified_single_table_fallback_sql, referenced_columns,
 };
 use super::super::support::{
     DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, involved_columns, shard_count,
@@ -1697,18 +1697,15 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
         ]}]
     });
     let all_cols = involved_columns(&request, |tables| tables.first()).types;
-    let col_types = column_types(&all_cols);
-    let (proj_cols, proj_types) =
-        split_projection(&referenced_column_projection(&pushdown_req, &col_types));
+    let referenced = referenced_columns(&pushdown_req, &column_types(&all_cols));
+    let (proj_cols, _) = split_projection(&referenced.projection());
     let fan_out_spec = CommonScanSpec {
         projection: proj_cols,
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
     }
     .with_files(vec![]);
-    let fan_out_columns = projected_columns(&fan_out_spec.common.projection, &proj_types);
-    let fan_out = FanOutProjection::new(&fan_out_spec, &fan_out_columns, &col_types)
-        .expect("aligned fan-out");
+    let fan_out = FanOutProjection::new(&fan_out_spec, &referenced).expect("aligned fan-out");
     let sql = build_qualified_single_table_fallback_sql(
         &request,
         &pushdown_req,

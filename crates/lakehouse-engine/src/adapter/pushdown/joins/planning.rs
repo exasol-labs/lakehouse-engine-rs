@@ -141,7 +141,7 @@ pub(crate) struct ResolvedJoinSide {
     pub total_bytes: u64,
     /// Per side, not merged: a refusal belongs to the table that raised it.
     pub refused_columns: Vec<RefusedColumn>,
-    /// Unqualified, built once when the side was resolved.
+    /// Unqualified.
     pub column_types: ColumnTypes,
 }
 

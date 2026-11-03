@@ -11,6 +11,9 @@ pub const MAX_CHAR_SIZE: u32 = 2000;
 /// Exasol rejects `TIMESTAMP(10)` and finer.
 pub const MAX_TIMESTAMP_PRECISION: u8 = 9;
 
+/// Exasol rejects `DECIMAL(37,0)` and wider.
+pub const MAX_DECIMAL_PRECISION: u8 = 36;
+
 /// The Exasol types a catalog column, an `EMITS` column, or a `CAST` target can carry.
 ///
 /// `Display` renders the SQL spelling and is the only place that spelling is written.
@@ -47,6 +50,9 @@ impl ExasolType {
     /// and of the JSON text the scan writes for every type Exasol cannot hold.
     pub const WIDEST_VARCHAR: Self = Self::varchar(MAX_VARCHAR_SIZE);
 
+    /// The bare 8.x `TIMESTAMP`, which holds 3 fractional digits.
+    pub const BARE_TIMESTAMP: Self = Self::Timestamp { precision: None };
+
     pub const fn decimal(precision: u8, scale: i8) -> Self {
         Self::Decimal { precision, scale }
     }
@@ -68,14 +74,20 @@ impl ExasolType {
         Self::Varchar { size, ascii: false }
     }
 
-    /// `CHAR` or `VARCHAR`.
     pub fn is_character(&self) -> bool {
         matches!(self, Self::Char { .. } | Self::Varchar { .. })
     }
 
-    /// `DECIMAL` at any precision and scale.
     pub fn is_decimal(&self) -> bool {
         matches!(self, Self::Decimal { .. })
+    }
+
+    /// The fractional-second digits a `TIMESTAMP` holds; the bare `TIMESTAMP` holds 3.
+    pub fn fractional_digits(&self) -> Option<u8> {
+        match self {
+            Self::Timestamp { precision } => Some(precision.unwrap_or(3)),
+            _ => None,
+        }
     }
 }
 

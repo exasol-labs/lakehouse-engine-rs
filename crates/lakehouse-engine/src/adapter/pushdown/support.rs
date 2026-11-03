@@ -447,8 +447,7 @@ pub(super) struct ColumnType {
 }
 
 /// The per-column type map a request's `column` nodes resolve against, one entry per (relation
-/// alias, column) pair, matched through [`binds_column`]. Every type check, binary comparison, and
-/// projection of the pushdown reads it.
+/// alias, column) pair, matched through [`binds_column`].
 ///
 /// A broadcast join qualifies every entry with its leg's alias. A single-table scan and an
 /// N-scan leg each read one relation, so their entries stay unqualified and keep the bare-name
@@ -457,9 +456,7 @@ pub(super) struct ColumnType {
 pub struct ColumnTypes(Vec<(ColumnRef, ColumnType)>);
 
 impl ColumnTypes {
-    /// The one table's map, built once when the planner resolves the table: `involved`'s columns
-    /// in declaration order, binary where their `declared` field is. Under `binary_as_string` a
-    /// variable-length binary column reads as text, so its comparisons stay text.
+    /// `involved`'s columns in declaration order, binary where their `declared` field is.
     pub(super) fn of(
         involved: &InvolvedColumns<'_>,
         declared: &[LogicalField],
@@ -528,42 +525,45 @@ impl ColumnTypes {
         )
     }
 
-    /// The entries `columns` bind, in the order of `columns`.
-    pub(super) fn selected<'a>(&self, columns: impl IntoIterator<Item = &'a ColumnRef>) -> Self {
-        Self(
-            columns
-                .into_iter()
-                .filter_map(|column| {
-                    self.0
-                        .iter()
-                        .find(|(entry, _)| binds_column(entry, column))
-                        .cloned()
-                })
-                .collect(),
-        )
-    }
-
     pub(super) fn iter(&self) -> impl Iterator<Item = &(ColumnRef, ColumnType)> {
         self.0.iter()
+    }
+
+    /// The first entry alone, empty when the map is.
+    pub(super) fn first_only(&self) -> Self {
+        Self(self.0.iter().take(1).cloned().collect())
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
     }
 
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    /// The type of the column `column` binds.
-    pub(super) fn get(&self, column: &ColumnRef) -> Option<&ColumnType> {
+    /// Every entry, each projected as a column under its own type.
+    pub(super) fn projection(&self) -> Vec<ProjectedColumn> {
         self.0
             .iter()
-            .find(|(entry, _)| binds_column(entry, column))
-            .map(|(_, column_type)| column_type)
+            .map(|(column, column_type)| ProjectedColumn {
+                item: ProjectionItem::Column(column.clone()),
+                exa_type: column_type.exa_type,
+            })
+            .collect()
+    }
+
+    /// The type of the column `column` binds.
+    pub(super) fn get(&self, column: &ColumnRef) -> Option<&ColumnType> {
+        self.entry(column).map(|(_, column_type)| column_type)
     }
 
     pub(super) fn resolve(&self, node: &Json) -> Option<&(ColumnRef, ColumnType)> {
-        let column = column_node_ref(node)?;
-        self.0
-            .iter()
-            .find(|(entry, _)| binds_column(entry, &column))
+        self.entry(&column_node_ref(node)?)
+    }
+
+    fn entry(&self, column: &ColumnRef) -> Option<&(ColumnRef, ColumnType)> {
+        self.0.iter().find(|(entry, _)| binds_column(entry, column))
     }
 }
 
@@ -843,7 +843,7 @@ fn timestamp_literal_floor(column: &Json, literal: &Json, col_types: &ColumnType
     if !is(column, "column") || !is(literal, "literal_timestamp") {
         return None;
     }
-    let digits = declared_timestamp_digits(column_exa_type(column, col_types)?)?;
+    let digits = usize::from(column_exa_type(column, col_types)?.fractional_digits()?);
     let value = literal.get("value")?.as_str()?;
     if timestamp_literal_digits(value) <= digits {
         return None;
@@ -854,17 +854,6 @@ fn timestamp_literal_floor(column: &Json, literal: &Json, col_types: &ColumnType
         d => format!("{instant}.{}", &fraction[..d]),
     };
     Some(serde_json::json!({"type": "literal_timestamp", "value": floor}))
-}
-
-/// Exasol's bare `TIMESTAMP` is `TIMESTAMP(3)`.
-fn declared_timestamp_digits(exa_type: ExasolType) -> Option<usize> {
-    match exa_type {
-        ExasolType::Timestamp { precision: None } => Some(3),
-        ExasolType::Timestamp {
-            precision: Some(digits),
-        } => Some(usize::from(digits)),
-        _ => None,
-    }
 }
 
 /// Depth-insensitive: a nested aggregate is renderable SQL, so only this probe keeps
@@ -911,37 +900,18 @@ fn is_valid_emits_output_type(ty: ExasolType) -> bool {
 /// `all_cols` is the column universe: the first involved table, or both legs of a broadcast
 /// join, each column qualified by its leg's alias.
 ///
-/// The second element is the widening signal: `true` means the projection is the full base row,
-/// not one item per select-list item (#196). The widening flag is returned rather than re-derived downstream by comparing
-/// arities, which coincide when the table width equals the select-list arity
-/// (#196). A missing or empty select list is not a widening.
+/// `true` means the projection widened to the full base row (#196); returned because the arities
+/// can coincide. A missing or empty select list is not a widening.
 pub(super) fn project_columns(
     pushdown_req: &Json,
     all_cols: &ColumnTypes,
 ) -> Result<(Vec<ProjectedColumn>, bool), UdfError> {
-    let Some((
-        first_col,
-        ColumnType {
-            exa_type: first_type,
-            ..
-        },
-    )) = all_cols.0.first()
-    else {
+    let Some((first_col, first)) = all_cols.0.first() else {
         return Err(UdfError::User(
             "pushdown request has no column metadata".into(),
         ));
     };
-
-    let full_row = || -> Vec<ProjectedColumn> {
-        all_cols
-            .0
-            .iter()
-            .map(|(column, column_type)| ProjectedColumn {
-                item: ProjectionItem::Column(column.clone()),
-                exa_type: column_type.exa_type,
-            })
-            .collect()
-    };
+    let full_row = || all_cols.projection();
 
     // Repeating `first_col` for an unprojectable item would duplicate EMITS
     // names, so the whole projection widens to the full row instead.
@@ -949,10 +919,7 @@ pub(super) fn project_columns(
     let select_list = pushdown_req.get("selectList");
     let projection = match select_list {
         None | Some(Json::Null) => full_row(),
-        Some(Json::Array(list)) if list.is_empty() => vec![ProjectedColumn {
-            item: ProjectionItem::Column(first_col.clone()),
-            exa_type: *first_type,
-        }],
+        Some(Json::Array(list)) if list.is_empty() => full_row().into_iter().take(1).collect(),
         Some(Json::Array(list)) => {
             let mut projected = Vec::with_capacity(list.len());
             for (i, e) in list.iter().enumerate() {
@@ -979,7 +946,7 @@ pub(super) fn project_columns(
                             (None, Some(named)) => {
                                 (ColumnRef::from(named.name), ExasolType::WIDEST_VARCHAR)
                             }
-                            (None, None) => (first_col.clone(), *first_type),
+                            (None, None) => (first_col.clone(), first.exa_type),
                         };
                         projected.push(ProjectedColumn {
                             item: ProjectionItem::Column(column),
