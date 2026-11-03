@@ -3,12 +3,15 @@
 //! diff in one of them is always a regression, never an expected update.
 
 use super::test_support::{
-    agg_item, broadcast_sides, pd, sample_scan_storage, sample_storage, with_identifier_notes,
+    agg_item, broadcast_sides, column_types, pd, projected_columns, request_sides, request_typed,
+    sample_scan_storage, sample_storage, with_identifier_notes,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::{
     aliased_col, col, customer_orders_join, num_lit, predicate_equal, str_lit, table_col,
 };
+use crate::scan::spec::ProjectionItem;
+use crate::types::exasol_type::ExasolType;
 
 fn fixed_shards() -> Vec<Vec<FileEntry>> {
     vec![
@@ -18,12 +21,24 @@ fn fixed_shards() -> Vec<Vec<FileEntry>> {
     ]
 }
 
-fn base_col_types() -> Vec<(String, String)> {
+fn base_col_types() -> Vec<(String, ExasolType)> {
     vec![
-        ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
-        ("NAME".to_string(), "VARCHAR(2000000)".to_string()),
-        ("AMOUNT".to_string(), "DECIMAL(18,2)".to_string()),
-        ("ID".to_string(), "DECIMAL(20,0)".to_string()),
+        ("REGION".to_string(), ExasolType::WIDEST_VARCHAR),
+        ("NAME".to_string(), ExasolType::WIDEST_VARCHAR),
+        (
+            "AMOUNT".to_string(),
+            ExasolType::Decimal {
+                precision: 18,
+                scale: 2,
+            },
+        ),
+        (
+            "ID".to_string(),
+            ExasolType::Decimal {
+                precision: 20,
+                scale: 0,
+            },
+        ),
     ]
 }
 
@@ -117,13 +132,19 @@ pub(super) fn row_scan_request() -> Json {
     }))
 }
 
-fn row_scan_projection() -> (Vec<ProjectionItem>, Vec<String>) {
+fn row_scan_projection() -> (Vec<ProjectionItem>, Vec<ExasolType>) {
     (
         vec![
             ProjectionItem::Column("REGION".into()),
             ProjectionItem::Column("AMOUNT".into()),
         ],
-        vec!["VARCHAR(2000000)".into(), "DECIMAL(18,2)".into()],
+        vec![
+            ExasolType::WIDEST_VARCHAR,
+            ExasolType::Decimal {
+                precision: 18,
+                scale: 2,
+            },
+        ],
     )
 }
 
@@ -239,7 +260,7 @@ fn single_group_scalar_over_variance_request() -> Json {
 fn dispatch_sql(
     request: &Json,
     proj_cols: Vec<ProjectionItem>,
-    proj_types: Vec<String>,
+    proj_types: Vec<ExasolType>,
     filter: Option<String>,
     limit: Option<u64>,
 ) -> String {
@@ -259,11 +280,9 @@ fn dispatch_sql(
 /// fixture itself widens.
 fn dispatch_sql_widened(request: &Json) -> String {
     let pushdown_req = pd(request);
-    let (proj_cols, proj_types, widened) = super::support::project_columns(
-        &pushdown_req,
-        &ColumnTypes::unqualified(&base_col_types()),
-    )
-    .expect("the fixture must project");
+    let (projection, widened) =
+        super::support::project_columns(&pushdown_req, &column_types(&base_col_types(), &[]))
+            .expect("the fixture must project");
     assert!(
         widened,
         "this fixture must exercise the widening guard, not a per-item projection"
@@ -271,10 +290,9 @@ fn dispatch_sql_widened(request: &Json) -> String {
     let result = build_dispatch_sql(
         request,
         &pushdown_req,
-        proj_cols,
-        proj_types,
+        projection,
         widened,
-        base_col_types(),
+        &column_types(&base_col_types(), &[]),
         None,
         None,
         None,
@@ -308,18 +326,17 @@ fn dispatch_sql_with_pushdown_req(
     request: &Json,
     pushdown_req: &Json,
     proj_cols: Vec<ProjectionItem>,
-    proj_types: Vec<String>,
-    col_types: Vec<(String, String)>,
+    proj_types: Vec<ExasolType>,
+    col_types: Vec<(String, ExasolType)>,
     filter: Option<String>,
     limit: Option<u64>,
 ) -> String {
     let result = build_dispatch_sql(
         request,
         pushdown_req,
-        proj_cols,
-        proj_types,
+        projected_columns(&proj_cols, &proj_types),
         false,
-        col_types,
+        &column_types(&col_types, &[]),
         filter,
         None,
         limit,
@@ -347,15 +364,14 @@ fn dispatch_sql_with_pushdown_req(
         .to_string()
 }
 
-fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[String]) -> String {
+fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[ExasolType]) -> String {
     let pushdown_req = pd(request);
     let result = empty_result_sql(
         &pushdown_req,
-        proj_cols,
-        proj_types,
+        &projected_columns(proj_cols, proj_types),
         false,
-        &base_col_types(),
-        &EmptyRelation::single_scan(request, &base_col_types()),
+        &column_types(&base_col_types(), &[]),
+        &EmptyRelation::single_scan(request, &column_types(&base_col_types(), &[])),
     )
     .expect("empty_result_sql must succeed for this golden fixture");
     result["sql"]
@@ -513,7 +529,7 @@ fn empty_unmergeable_having_matches_group_by_wrapper_golden() {
     assert_eq!(actual, expected);
 
     let pushdown_req = pd(&request);
-    let shape = classify_request_shape(&pushdown_req, &base_col_types());
+    let shape = classify_request_shape(&pushdown_req, &column_types(&base_col_types(), &[]));
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
         "an unmergeable HAVING must route to GroupByWrapper, not stay classified as \
@@ -668,12 +684,18 @@ fn aliased_multi_count_distinct_fallback_qualifies_lhs_t0_regardless_of_alias_pr
 // Covers every `AggKind` and every partial-column arity (1, 2, 3) in one request,
 // over a dedicated column universe with a numeric SCORE and a MIN/MAX target TS.
 
-fn all_agg_kinds_col_types() -> Vec<(String, String)> {
+fn all_agg_kinds_col_types() -> Vec<(String, ExasolType)> {
     vec![
-        ("ID".to_string(), "DECIMAL(20,0)".to_string()),
-        ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
-        ("TS".to_string(), "TIMESTAMP".to_string()),
-        ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
+        (
+            "ID".to_string(),
+            ExasolType::Decimal {
+                precision: 20,
+                scale: 0,
+            },
+        ),
+        ("SCORE".to_string(), ExasolType::DoublePrecision),
+        ("TS".to_string(), ExasolType::Timestamp { precision: None }),
+        ("REGION".to_string(), ExasolType::WIDEST_VARCHAR),
     ]
 }
 
@@ -744,7 +766,7 @@ fn grouped_all_agg_kinds_request() -> Json {
     }))
 }
 
-fn dispatch_sql_with_col_types(request: &Json, col_types: Vec<(String, String)>) -> String {
+fn dispatch_sql_with_col_types(request: &Json, col_types: Vec<(String, ExasolType)>) -> String {
     dispatch_sql_with_pushdown_req(
         request,
         &pd(request),
@@ -834,6 +856,7 @@ fn resolved_customer_side() -> ResolvedJoinSide {
         partition_columns: Vec::new(),
         total_bytes: 10,
         refused_columns: Vec::new(),
+        column_types: ColumnTypes::default(),
     }
 }
 
@@ -857,6 +880,7 @@ fn resolved_orders_side() -> ResolvedJoinSide {
         partition_columns: Vec::new(),
         total_bytes: 100,
         refused_columns: Vec::new(),
+        column_types: ColumnTypes::default(),
     }
 }
 
@@ -887,7 +911,7 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     let request = two_table_join_request(None);
     let pushdown_req = pd(&request);
     let join = two_table_detected_join(&request);
-    let rendered = render_broadcast_join(&request, &pushdown_req, &join, &BinaryColumns::default())
+    let rendered = render_broadcast_join(&pushdown_req, &join, &request_sides(&request, &join))
         .expect("render_broadcast_join must not error for a well-formed request")
         .expect("a filterless equi-join must stay broadcast-eligible");
     let sides = broadcast_sides(resolved_orders_side(), resolved_customer_side(), 0);
@@ -907,10 +931,9 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
 
     let sides = vec![resolved_customer_side(), resolved_orders_side()];
     let n_scan_sql = build_n_scan_join_sql(
-        &request,
         &pushdown_req,
         &join,
-        &sides,
+        &request_typed(&request, &sides),
         &join_scan_tuning(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -941,7 +964,7 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
     let request = two_table_join_request(Some(renderable_filter));
     let pushdown_req = pd(&request);
     let join = two_table_detected_join(&request);
-    let rendered = render_broadcast_join(&request, &pushdown_req, &join, &BinaryColumns::default())
+    let rendered = render_broadcast_join(&pushdown_req, &join, &request_sides(&request, &join))
         .expect("render_broadcast_join must not error for a well-formed request")
         .expect("an equi-join with a rendering filter must stay broadcast-eligible");
     let sides = broadcast_sides(resolved_orders_side(), resolved_customer_side(), 0);
@@ -961,10 +984,9 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
 
     let sides = vec![resolved_customer_side(), resolved_orders_side()];
     let n_scan_sql = build_n_scan_join_sql(
-        &request,
         &pushdown_req,
         &join,
-        &sides,
+        &request_typed(&request, &sides),
         &join_scan_tuning(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,

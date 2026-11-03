@@ -10,6 +10,7 @@ use serde_json::Value as Json;
 
 use super::grouped_agg::{GroupedOrderBy, build_grouped_order_by_clause, render_having_over_merge};
 use super::single_group_agg::{SingleGroupItem, has_distinct};
+use super::support::ColumnTypes;
 use super::{
     GroupedAggregateDetection, detect_aggregates, detect_group_by_aggregates, ordinary_plans,
     validate_agg_col_types,
@@ -37,10 +38,7 @@ pub(super) enum RequestShape {
     RowScan,
 }
 
-pub(super) fn classify_request_shape(
-    pushdown_req: &Json,
-    col_types: &[(String, String)],
-) -> RequestShape {
+pub(super) fn classify_request_shape(pushdown_req: &Json, col_types: &ColumnTypes) -> RequestShape {
     if let Some(detection) = detect_group_by_aggregates(pushdown_req) {
         // A SUM over a non-numeric column would produce an opaque UDF error; demote.
         if validate_agg_col_types(&detection.plans, col_types) {

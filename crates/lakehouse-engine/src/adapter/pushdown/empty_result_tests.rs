@@ -1,16 +1,23 @@
 use super::super::support::quote_ident;
 use super::super::test_support::*;
 use super::*;
+use crate::scan::spec::ProjectionItem;
 
-fn relation(col_types: &[(String, String)]) -> EmptyRelation {
-    EmptyRelation::single_scan(&serde_json::json!({}), col_types)
+fn relation(col_types: &[(String, ExasolType)]) -> EmptyRelation {
+    EmptyRelation::single_scan(&serde_json::json!({}), &column_types(col_types, &[]))
 }
 
 #[test]
 fn empty_file_list_returns_empty_select() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
-    let types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(2000000)".to_string()];
-    let resp = empty_pushdown_sql(&proj, &types);
+    let types = vec![
+        ExasolType::Decimal {
+            precision: 20,
+            scale: 0,
+        },
+        ExasolType::WIDEST_VARCHAR,
+    ];
+    let resp = empty_pushdown_sql(&projected_columns(&proj, &types));
     let sql = resp["sql"].as_str().unwrap();
     assert!(sql.contains("WHERE 1=0"));
     assert!(sql.contains("CAST(NULL AS DECIMAL(20,0))"));
@@ -24,11 +31,17 @@ fn empty_pushdown_sql_repeated_literals_unique_aliases() {
         ProjectionItem::Expr { expr: "1".into() },
     ];
     let proj_types = vec![
-        "DECIMAL(18,0)".to_string(),
-        "VARCHAR(2000000)".to_string(),
-        "DECIMAL(18,0)".to_string(),
+        ExasolType::Decimal {
+            precision: 18,
+            scale: 0,
+        },
+        ExasolType::WIDEST_VARCHAR,
+        ExasolType::Decimal {
+            precision: 18,
+            scale: 0,
+        },
     ];
-    let resp = empty_pushdown_sql(&proj_cols, &proj_types);
+    let resp = empty_pushdown_sql(&projected_columns(&proj_cols, &proj_types));
     let sql = resp["sql"].as_str().unwrap();
 
     assert_eq!(
@@ -66,8 +79,14 @@ fn empty_grouped_sql_emits_zero_rows_in_grouped_shape() {
             select_index: 1,
         },
     ];
-    let group_key_types = vec!["DECIMAL(20,0)".to_string()];
-    let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
+    let group_key_types = vec![ExasolType::Decimal {
+        precision: 20,
+        scale: 0,
+    }];
+    let aggregate_types = vec![ExasolType::Decimal {
+        precision: 18,
+        scale: 0,
+    }];
     let resp = empty_grouped_sql(&group_key_types, &aggregate_types, &select_items);
     let sql = resp["sql"].as_str().unwrap();
     assert!(
@@ -109,8 +128,14 @@ fn empty_grouped_sql_includes_constant_projection_column() {
             select_index: 2,
         },
     ];
-    let group_key_types = vec!["DECIMAL(20,0)".to_string()];
-    let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
+    let group_key_types = vec![ExasolType::Decimal {
+        precision: 20,
+        scale: 0,
+    }];
+    let aggregate_types = vec![ExasolType::Decimal {
+        precision: 18,
+        scale: 0,
+    }];
     let resp = empty_grouped_sql(&group_key_types, &aggregate_types, &select_items);
     let sql = resp["sql"].as_str().unwrap();
     let select_clause = sql
@@ -132,8 +157,20 @@ fn empty_grouped_sql_includes_constant_projection_column() {
 #[test]
 fn empty_result_sql_dispatches_by_plan_shape() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
-    let proj_types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(2000000)".to_string()];
-    let col_types = vec![("AMOUNT".to_string(), "DECIMAL(18,2)".to_string())];
+    let proj_types = vec![
+        ExasolType::Decimal {
+            precision: 20,
+            scale: 0,
+        },
+        ExasolType::WIDEST_VARCHAR,
+    ];
+    let col_types = vec![(
+        "AMOUNT".to_string(),
+        ExasolType::Decimal {
+            precision: 18,
+            scale: 2,
+        },
+    )];
 
     let grouped = serde_json::json!({
         "aggregationType": "group_by",
@@ -149,10 +186,9 @@ fn empty_result_sql_dispatches_by_plan_shape() {
     });
     let grouped_sql = empty_result_sql(
         &grouped,
-        &proj,
-        &proj_types,
+        &projected_columns(&proj, &proj_types),
         false,
-        &col_types,
+        &column_types(&col_types, &[]),
         &relation(&col_types),
     )
     .unwrap()["sql"]
@@ -164,7 +200,7 @@ fn empty_result_sql_dispatches_by_plan_shape() {
         "grouped shape is zero rows: {grouped_sql}"
     );
 
-    let text_col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
+    let text_col_types = vec![("NAME".to_string(), ExasolType::WIDEST_VARCHAR)];
     for (column, ty, col_types) in [
         ("AMOUNT", "DECIMAL(18,2)", &col_types),
         ("NAME", "VARCHAR(2000000)", &text_col_types),
@@ -176,10 +212,9 @@ fn empty_result_sql_dispatches_by_plan_shape() {
         });
         let sql = empty_result_sql(
             &single,
-            &proj,
-            &proj_types,
+            &projected_columns(&proj, &proj_types),
             false,
-            col_types,
+            &column_types(col_types, &[]),
             &relation(col_types),
         )
         .unwrap()["sql"]
@@ -198,7 +233,13 @@ fn empty_result_sql_dispatches_by_plan_shape() {
 
 #[test]
 fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
-    let col_types = vec![("ID".to_string(), "DECIMAL(19,0)".to_string())];
+    let col_types = vec![(
+        "ID".to_string(),
+        ExasolType::Decimal {
+            precision: 19,
+            scale: 0,
+        },
+    )];
     let request = serde_json::json!({
         "aggregationType": "single_group",
         "selectList": [
@@ -207,8 +248,14 @@ fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
         ],
         "having": predicate_equal(agg_item("COUNT", None, false), num_lit(0)),
     });
-    let sql = empty_result_sql(&request, &[], &[], false, &col_types, &relation(&col_types))
-        .unwrap()["sql"]
+    let sql = empty_result_sql(
+        &request,
+        &projected_columns(&[], &[]),
+        false,
+        &column_types(&col_types, &[]),
+        &relation(&col_types),
+    )
+    .unwrap()["sql"]
         .as_str()
         .unwrap()
         .to_string();
@@ -222,8 +269,14 @@ fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
 #[test]
 fn empty_files_grouped_non_numeric_aggregate_uses_selectlist_shape() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
-    let proj_types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(2000000)".to_string()];
-    let col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
+    let proj_types = vec![
+        ExasolType::Decimal {
+            precision: 20,
+            scale: 0,
+        },
+        ExasolType::WIDEST_VARCHAR,
+    ];
+    let col_types = vec![("NAME".to_string(), ExasolType::WIDEST_VARCHAR)];
 
     let grouped_non_numeric = serde_json::json!({
         "aggregationType": "group_by",
@@ -240,10 +293,9 @@ fn empty_files_grouped_non_numeric_aggregate_uses_selectlist_shape() {
 
     let row_sql = empty_result_sql(
         &grouped_non_numeric,
-        &proj,
-        &proj_types,
+        &projected_columns(&proj, &proj_types),
         false,
-        &col_types,
+        &column_types(&col_types, &[]),
         &relation(&col_types),
     )
     .unwrap()["sql"]
@@ -261,8 +313,14 @@ fn empty_files_grouped_non_numeric_aggregate_uses_selectlist_shape() {
 #[test]
 fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
-    let proj_types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(2000000)".to_string()];
-    let col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
+    let proj_types = vec![
+        ExasolType::Decimal {
+            precision: 20,
+            scale: 0,
+        },
+        ExasolType::WIDEST_VARCHAR,
+    ];
+    let col_types = vec![("NAME".to_string(), ExasolType::WIDEST_VARCHAR)];
 
     let grouped_having = serde_json::json!({
         "aggregationType": "group_by",
@@ -280,10 +338,9 @@ fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
 
     let row_sql = empty_result_sql(
         &grouped_having,
-        &proj,
-        &proj_types,
+        &projected_columns(&proj, &proj_types),
         false,
-        &col_types,
+        &column_types(&col_types, &[]),
         &relation(&col_types),
     )
     .unwrap()["sql"]
@@ -308,27 +365,32 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
         "selectListDataTypes": [{"type": "decimal", "precision": 18, "scale": 0}],
     });
     let col_types = vec![
-        ("ID".to_string(), "DECIMAL(20,0)".to_string()),
-        ("NAME".to_string(), "VARCHAR(2000000)".to_string()),
-        ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
+        (
+            "ID".to_string(),
+            ExasolType::Decimal {
+                precision: 20,
+                scale: 0,
+            },
+        ),
+        ("NAME".to_string(), ExasolType::WIDEST_VARCHAR),
+        ("SCORE".to_string(), ExasolType::DoublePrecision),
     ];
     assert!(
         matches!(
-            classify_request_shape(&pushdown_req, &col_types),
+            classify_request_shape(&pushdown_req, &column_types(&col_types, &[])),
             RequestShape::RowScan
         ),
         "the fixture must classify as RowScan for this test to exercise its arm"
     );
 
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into(), "SCORE".into()];
-    let proj_types: Vec<String> = col_types.iter().map(|(_, t)| t.clone()).collect();
+    let proj_types: Vec<ExasolType> = col_types.iter().map(|(_, t)| *t).collect();
 
     let widened = empty_result_sql(
         &pushdown_req,
-        &proj,
-        &proj_types,
+        &projected_columns(&proj, &proj_types),
         true,
-        &col_types,
+        &column_types(&col_types, &[]),
         &relation(&col_types),
     )
     .expect("the widened empty row-scan result must build")["sql"]
@@ -343,10 +405,9 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
 
     let not_widened = empty_result_sql(
         &pushdown_req,
-        &proj,
-        &proj_types,
+        &projected_columns(&proj, &proj_types),
         false,
-        &col_types,
+        &column_types(&col_types, &[]),
         &relation(&col_types),
     )
     .expect("the non-widened empty row-scan result must build")["sql"]
@@ -355,7 +416,7 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
         .to_string();
     assert_eq!(
         not_widened,
-        empty_pushdown_sql(&proj, &proj_types)["sql"]
+        empty_pushdown_sql(&projected_columns(&proj, &proj_types))["sql"]
             .as_str()
             .unwrap(),
         "the non-widened path must stay byte-identical to the full-row empty \

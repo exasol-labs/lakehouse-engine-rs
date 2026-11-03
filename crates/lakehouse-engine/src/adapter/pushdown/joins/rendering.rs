@@ -4,50 +4,10 @@ use vs_expression::{
     render_df_filter_exasol_safe, render_expression_exasol_safe, walk_column_nodes,
 };
 
-use super::super::BinaryColumns;
 use super::super::support::{
     ColumnTypes, datafusion_renderable, quote_ident, type_accepted_rewrite,
 };
 use super::attribution::{ColumnLeg, JoinLegs, UnattributableColumn};
-use super::planning::{DetectedJoin, ResolvedJoinSide, involved_table_columns};
-
-/// The sole producer of a broadcast join's column-type universe: each leg's involved-table
-/// columns, qualified with the alias `legs` stamps on that leg's `column` nodes, in leg order.
-/// A self-join's two occurrences list the same columns under two aliases.
-pub(super) fn leg_column_types(
-    request: &Json,
-    join: &DetectedJoin,
-    legs: &JoinLegs,
-) -> ColumnTypes {
-    ColumnTypes::per_relation(
-        join.tables
-            .iter()
-            .enumerate()
-            .map(|(leg, leaf)| {
-                (
-                    legs.leg_alias(leg),
-                    involved_table_columns(request, &leaf.table_name),
-                )
-            })
-            .collect(),
-    )
-}
-
-/// [`leg_column_types`]' counterpart for binary detection, keyed by the same pairs, so a
-/// column name that is binary on one leg and text on the other compares each leg its own way.
-pub(super) fn leg_binary_columns(
-    sides: &[ResolvedJoinSide],
-    legs: &JoinLegs,
-    binary_as_string: bool,
-) -> BinaryColumns {
-    BinaryColumns::per_relation(
-        sides
-            .iter()
-            .enumerate()
-            .map(|(leg, side)| (legs.leg_alias(leg), side.logical_schema.as_slice())),
-        binary_as_string,
-    )
-}
 
 pub(super) fn projection_item_select_sql(item: &ProjectionItem) -> String {
     match item {
@@ -156,15 +116,13 @@ pub(super) fn declined_only(filter: &Json) -> Option<Json> {
 /// becomes residual (fail closed: applied in the wrapper is slower, applied nowhere is wrong).
 pub(super) fn type_screened_leg_filter(
     side_local: &Json,
-    col_types: &[(String, String)],
-    binary_columns: &BinaryColumns,
+    col_types: &ColumnTypes,
 ) -> (Option<Json>, Option<Json>) {
-    let col_types = &ColumnTypes::unqualified(col_types);
-    let accepts = |c: &Json| type_accepted_rewrite(c, col_types, binary_columns).is_some();
+    let accepts = |c: &Json| type_accepted_rewrite(c, col_types).is_some();
     let declined = partition_conjuncts(side_local, |c| !accepts(c));
     match partition_conjuncts(side_local, accepts) {
         None => (None, declined),
-        Some(accepted) => match type_accepted_rewrite(&accepted, col_types, binary_columns) {
+        Some(accepted) => match type_accepted_rewrite(&accepted, col_types) {
             Some(rewritten) => (Some(rewritten), declined),
             None => (None, Some(side_local.clone())),
         },
@@ -246,7 +204,7 @@ pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMu
 /// all of it), GROUP BY, HAVING, and ORDER BY. An empty select list (`SELECT *`) or an empty
 /// narrowing keeps `full_cols`.
 ///
-/// CROSS-FOLD match: `full_cols` is Unicode-uppercased by `support::column_types`, `names`
+/// CROSS-FOLD match: `full_cols` is Unicode-uppercased by `support::involved_columns`, `names`
 /// ASCII-uppercased. They agree only because `build_listing_virtual_tables` Unicode-uppercases
 /// every declared name (guarded by E2E `non_ascii_table_and_column_stay_queryable`); repair
 /// any divergence at that premise, never by unifying the folds. A partial mismatch would
@@ -256,23 +214,19 @@ pub(super) fn referenced_leg_columns(
     condition: &Json,
     legs: &JoinLegs,
     leg: usize,
-    full_cols: &[(String, String)],
-) -> Vec<(String, String)> {
+    full_cols: &ColumnTypes,
+) -> ColumnTypes {
     if has_no_explicit_select_list(pushdown_req) {
-        return full_cols.to_vec();
+        return full_cols.clone();
     }
     let mut names = std::collections::HashSet::new();
     collect_leg_column_names(condition, legs, leg, &mut names);
     referenced_clause_values(pushdown_req, |v| {
         collect_leg_column_names(v, legs, leg, &mut names)
     });
-    let narrowed: Vec<(String, String)> = full_cols
-        .iter()
-        .filter(|(name, _)| names.contains(name))
-        .cloned()
-        .collect();
+    let narrowed = full_cols.narrowed(|column| names.contains(&column.name));
     if narrowed.is_empty() {
-        full_cols.to_vec()
+        full_cols.clone()
     } else {
         narrowed
     }

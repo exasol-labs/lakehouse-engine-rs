@@ -9,9 +9,10 @@ use lakehouse_catalog::{
 use object_store::ObjectStore;
 use serde_json::Value as Json;
 
+use super::binary_filter::with_binary_literals;
+use super::support::{ColumnTypes, InvolvedColumns};
 use super::{ConnectionStorage, ResolvedScan, ScanSource, format_reader};
 use crate::adapter::catalog_kind::CatalogKind;
-use crate::adapter::column_notes::TableNotes;
 use crate::adapter::direct_storage_properties::resolve_direct_storage_properties;
 use crate::adapter::permission::PermissionCheck;
 use crate::adapter::properties::resolve_binary_as_string;
@@ -148,17 +149,26 @@ impl<'a> TableScanResolver<'a> {
         })
     }
 
-    /// `table_identifier` is the original-cased identifier from the involved table's identifier note. `filter_json`
-    /// is forwarded unchanged for format-side pruning. `notes` are the involved table's raw
-    /// column notes, parsed here once for every format before any table is loaded.
+    /// `table_identifier` is the original-cased identifier from the involved table's identifier
+    /// note. `involved` is the table's columns as the request declares them; their raw column
+    /// notes are parsed here once for every format before any table is loaded.
+    ///
+    /// Returns the table's per-column type map beside the scan. The map is built here, the one
+    /// point that has both the request's Exasol types and the declared binary layouts, and every
+    /// reader receives `filter_json` with its binary comparisons retyped by it, so each prunes on
+    /// the raw bytes.
     pub(super) async fn resolve(
         &self,
         table_identifier: &str,
         filter_json: Option<&Json>,
-        notes: &TableNotes<'_>,
-    ) -> Result<ResolvedScan, UdfError> {
+        involved: &InvolvedColumns<'_>,
+    ) -> Result<(ResolvedScan, ColumnTypes), UdfError> {
         self.admission.admit(table_identifier)?;
-        let declared = notes.declared_schema()?;
+        let declared = involved.notes.declared_schema()?;
+        let column_types =
+            ColumnTypes::of(involved, &declared.logical_schema, self.binary_as_string);
+        let filter_json =
+            filter_json.map(|filter| with_binary_literals(filter.clone(), &column_types));
         // Each source borrows what its arm loads, so those values outlive the match.
         let (catalog_props, table, table_root);
         let source = match &self.session {
@@ -200,13 +210,8 @@ impl<'a> TableScanResolver<'a> {
             }
         };
         let reader = format_reader(source, &self.connection)?;
-        ResolvedScan::resolve(
-            reader.as_ref(),
-            declared,
-            filter_json,
-            self.binary_as_string,
-        )
-        .await
+        let scan = ResolvedScan::resolve(reader.as_ref(), declared, filter_json.as_ref()).await?;
+        Ok((scan, column_types))
     }
 }
 

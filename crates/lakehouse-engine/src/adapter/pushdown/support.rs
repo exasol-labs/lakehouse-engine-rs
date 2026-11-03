@@ -5,17 +5,17 @@ use crate::adapter::column_notes::TableNotes;
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::sealed::{SealedStorageKey, seal_storage};
 use crate::scan::spec::{
-    AggregatePlan, ColumnRef, CommonScanSpec, FileEntry, ProjectionItem, ScanSpec, ScanStorage,
-    StorageBackend, render_order_by_clause,
+    AggregatePlan, ColumnRef, CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec,
+    ScanStorage, StorageBackend, render_order_by_clause,
 };
-use crate::types::mapping::{
-    ExaTypeClass, classify_exa_type, exasol_type_from_json, timestamp_literal_digits,
-};
+use crate::types::exasol_type::ExasolType;
+use crate::types::mapping::{exasol_type_from_json, timestamp_literal_digits};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
+use std::collections::HashMap;
 use vs_expression::{ColumnNode, render_df_filter_safe, render_expression_safe, walk_column_nodes};
 
-use super::binary_filter::{BinaryColumns, compare_binary_bytes};
+use super::binary_filter::{BinaryLayout, compare_binary_bytes};
 
 pub(super) const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
 
@@ -42,7 +42,7 @@ pub(super) fn shard_files_json<E: Clone + Into<FileEntry>>(files: &[E]) -> Strin
 /// `request_limit` is the raw request limit, rendered as a trailing `LIMIT n` on the
 /// one-row merge (a no-op for `n >= 1`, correct for `n = 0`).
 pub struct AggregateMergeInputs {
-    plan_types: Vec<String>,
+    plan_types: Vec<ExasolType>,
     merge_select: Vec<String>,
     having: Option<String>,
     request_limit: Option<u64>,
@@ -52,7 +52,7 @@ impl AggregateMergeInputs {
     /// `None` for an empty `merge_select`: a narrower select list would fail Exasol's
     /// positional validation, so the caller must use its fallback.
     pub fn new(
-        plan_types: Vec<String>,
+        plan_types: Vec<ExasolType>,
         merge_select: Vec<String>,
         request_limit: Option<u64>,
     ) -> Option<Self> {
@@ -79,10 +79,9 @@ impl AggregateMergeInputs {
 pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
     shards: &[Vec<E>],
-    proj_cols: &[ProjectionItem],
-    proj_types: &[String],
+    projection: &[ProjectedColumn],
     limit: Option<u64>,
-    col_types: &[(String, String)],
+    col_types: &ColumnTypes,
     merge_inputs: Option<&AggregateMergeInputs>,
     udf_name: &str,
     distribute_udf_name: &str,
@@ -108,13 +107,28 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
         build_row_scan_sql(
             spec_template,
             shards,
-            proj_cols,
-            proj_types,
+            projection,
             limit,
             udf_name,
             distribute_udf_name,
         )
     }
+}
+
+/// One projected item with the Exasol type its `EMITS` column declares, so the projection and its
+/// types cannot fall out of step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedColumn {
+    pub item: ProjectionItem,
+    pub exa_type: ExasolType,
+}
+
+/// The items a scan spec projects, in projection order.
+pub(super) fn projection_items(projection: &[ProjectedColumn]) -> Vec<ProjectionItem> {
+    projection
+        .iter()
+        .map(|column| column.item.clone())
+        .collect()
 }
 
 /// An `Expr` gets a positional synthetic name matching the scan side's aliasing,
@@ -132,17 +146,15 @@ pub(super) fn emits_ident(item: &ProjectionItem, index: usize) -> String {
 fn build_row_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
     shards: &[Vec<E>],
-    proj_cols: &[ProjectionItem],
-    proj_types: &[String],
+    projection: &[ProjectedColumn],
     limit: Option<u64>,
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> String {
-    let emits = proj_cols
+    let emits = projection
         .iter()
-        .zip(proj_types.iter())
         .enumerate()
-        .map(|(i, (item, ty))| format!("{} {}", emits_ident(item, i), ty))
+        .map(|(i, column)| format!("{} {}", emits_ident(&column.item, i), column.exa_type))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -167,7 +179,7 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
     shards: &[Vec<E>],
     aggregates: &[AggregatePlan],
-    col_types: &[(String, String)],
+    col_types: &ColumnTypes,
     inputs: &AggregateMergeInputs,
     udf_name: &str,
     distribute_udf_name: &str,
@@ -196,7 +208,7 @@ pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
     base_spec: &ScanSpec,
     shards: &[Vec<E>],
     items: &[SingleGroupItem],
-    col_types: &[(String, String)],
+    col_types: &ColumnTypes,
     limit: Option<u64>,
     udf_name: &str,
     distribute_udf_name: &str,
@@ -227,7 +239,7 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
     base_spec: &ScanSpec,
     shards: &[Vec<E>],
     dc: &DistinctCount,
-    col_types: &[(String, String)],
+    col_types: &ColumnTypes,
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> String {
@@ -309,9 +321,10 @@ pub fn build_fan_out_inner<E: Clone + Into<FileEntry>>(
 }
 
 /// One involved table's columns as the pushdown request declares them.
+#[derive(Default)]
 pub(super) struct InvolvedColumns<'r> {
     /// `(uppercased name, Exasol type)` in declaration order.
-    pub(super) types: Vec<(String, String)>,
+    pub(super) types: Vec<(String, ExasolType)>,
     /// The table's raw column notes, in the same order.
     pub(super) notes: TableNotes<'r>,
 }
@@ -424,40 +437,129 @@ pub(super) fn binds_column(entry: &ColumnRef, column: &ColumnRef) -> bool {
     entry.name == column.name && (entry.relation.is_none() || entry.relation == column.relation)
 }
 
-/// The column types a request's `column` nodes resolve against, one entry per (relation alias,
-/// column) pair, matched through [`binds_column`].
+/// One column's Exasol type and, for a binary column, the raw-byte layout the scan reads. A binary
+/// column declares the same Exasol type as a text column, so only the layout tells them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ColumnType {
+    pub(super) exa_type: ExasolType,
+    /// `None` for a column the scan reads as text.
+    pub(super) binary: Option<BinaryLayout>,
+}
+
+/// The per-column type map a request's `column` nodes resolve against, one entry per (relation
+/// alias, column) pair, matched through [`binds_column`]. Every type check, binary comparison, and
+/// projection of the pushdown reads it.
 ///
 /// A broadcast join qualifies every entry with its leg's alias. A single-table scan and an
 /// N-scan leg each read one relation, so their entries stay unqualified and keep the bare-name
 /// lookup.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ColumnTypes(Vec<(ColumnRef, String)>);
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColumnTypes(Vec<(ColumnRef, ColumnType)>);
 
 impl ColumnTypes {
-    pub(super) fn unqualified(columns: &[(String, String)]) -> Self {
+    /// The one table's map, built once when the planner resolves the table: `involved`'s columns
+    /// in declaration order, binary where their `declared` field is. Under `binary_as_string` a
+    /// variable-length binary column reads as text, so its comparisons stay text.
+    pub(super) fn of(
+        involved: &InvolvedColumns<'_>,
+        declared: &[LogicalField],
+        binary_as_string: bool,
+    ) -> Self {
+        let mut declared_by_name: HashMap<String, &LogicalField> = HashMap::new();
+        for field in declared {
+            declared_by_name
+                .entry(field.name.to_uppercase())
+                .or_insert(field);
+        }
         Self(
-            columns
+            involved
+                .types
                 .iter()
-                .map(|(name, exa_type)| (ColumnRef::from(name.as_str()), exa_type.clone()))
+                .map(|(name, exa_type)| {
+                    let binary = declared_by_name
+                        .get(name)
+                        .copied()
+                        .and_then(|field| BinaryLayout::of(field, binary_as_string));
+                    let column_type = ColumnType {
+                        exa_type: *exa_type,
+                        binary,
+                    };
+                    (ColumnRef::from(name.as_str()), column_type)
+                })
                 .collect(),
         )
     }
 
-    /// `relations` in leg order, so the full row lists each leg's columns in turn.
-    pub(super) fn per_relation(relations: Vec<(String, Vec<(String, String)>)>) -> Self {
+    /// `relations` in leg order, so the full row lists each leg's columns in turn. Each leg's map
+    /// is qualified with its alias, so a column name two legs share binds only its own leg.
+    pub(super) fn per_relation<'a>(
+        relations: impl IntoIterator<Item = (String, &'a ColumnTypes)>,
+    ) -> Self {
         Self(
             relations
                 .into_iter()
                 .flat_map(|(relation, columns)| {
-                    columns.into_iter().map(move |(name, exa_type)| {
-                        (ColumnRef::qualified(relation.clone(), name), exa_type)
+                    columns.0.iter().map(move |(column, column_type)| {
+                        let qualified = ColumnRef::qualified(relation.clone(), column.name.clone());
+                        (qualified, *column_type)
                     })
                 })
                 .collect(),
         )
     }
 
-    fn resolve(&self, node: &Json) -> Option<&(ColumnRef, String)> {
+    /// Every map's entries in turn, unqualified, as one relation lists them.
+    pub(super) fn concat<'a>(maps: impl IntoIterator<Item = &'a ColumnTypes>) -> Self {
+        Self(
+            maps.into_iter()
+                .flat_map(|map| map.0.iter().cloned())
+                .collect(),
+        )
+    }
+
+    /// The entries whose column `keep` accepts, in map order.
+    pub(super) fn narrowed(&self, keep: impl Fn(&ColumnRef) -> bool) -> Self {
+        Self(
+            self.0
+                .iter()
+                .filter(|(column, _)| keep(column))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// The entries `columns` bind, in the order of `columns`.
+    pub(super) fn selected<'a>(&self, columns: impl IntoIterator<Item = &'a ColumnRef>) -> Self {
+        Self(
+            columns
+                .into_iter()
+                .filter_map(|column| {
+                    self.0
+                        .iter()
+                        .find(|(entry, _)| binds_column(entry, column))
+                        .cloned()
+                })
+                .collect(),
+        )
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = &(ColumnRef, ColumnType)> {
+        self.0.iter()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The type of the column `column` binds.
+    pub(super) fn get(&self, column: &ColumnRef) -> Option<&ColumnType> {
+        self.0
+            .iter()
+            .find(|(entry, _)| binds_column(entry, column))
+            .map(|(_, column_type)| column_type)
+    }
+
+    pub(super) fn resolve(&self, node: &Json) -> Option<&(ColumnRef, ColumnType)> {
         let column = column_node_ref(node)?;
         self.0
             .iter()
@@ -467,10 +569,10 @@ impl ColumnTypes {
 
 /// Deliberately does not test the node's `type`: callers treat a non-column node as a
 /// pass-through but an unresolved type as a decline.
-fn column_exa_type<'t>(node: &Json, col_types: &'t ColumnTypes) -> Option<&'t str> {
+fn column_exa_type(node: &Json, col_types: &ColumnTypes) -> Option<ExasolType> {
     col_types
         .resolve(node)
-        .map(|(_, exa_type)| exa_type.as_str())
+        .map(|(_, column_type)| column_type.exa_type)
 }
 
 fn guard_like_subject(like_node: &Json, col_types: &ColumnTypes) -> Option<Json> {
@@ -481,17 +583,17 @@ fn guard_like_subject(like_node: &Json, col_types: &ColumnTypes) -> Option<Json>
         return Some(like_node.clone());
     };
 
-    match column_exa_type(subject, col_types).map(classify_exa_type) {
-        Some(ExaTypeClass::Character) => Some(like_node.clone()),
+    match column_exa_type(subject, col_types) {
+        Some(exa_type) if exa_type.is_character() => Some(like_node.clone()),
         // DataFusion's Date32→Utf8 cast is `YYYY-MM-DD`.
-        Some(ExaTypeClass::Date) => {
+        Some(ExasolType::Date) => {
             let mut out = like_node.clone();
             out["expression"] = wrap_cast_to_varchar(subject);
             Some(out)
         }
         // Other types' string forms diverge between engines, so decline rather than risk
         // a wrong or hard-failing cast (decision-log [2]).
-        Some(ExaTypeClass::Decimal | ExaTypeClass::Other) | None => None,
+        _ => None,
     }
 }
 
@@ -560,10 +662,7 @@ fn is_bare_decimal_column(node: &Json, col_types: &ColumnTypes) -> bool {
     if node.get("type").and_then(|t| t.as_str()) != Some("column") {
         return false;
     }
-    matches!(
-        column_exa_type(node, col_types).map(classify_exa_type),
-        Some(ExaTypeClass::Decimal)
-    )
+    column_exa_type(node, col_types).is_some_and(|exa_type| exa_type.is_decimal())
 }
 
 /// Never sent by Exasol; only this rewriter synthesizes it.
@@ -652,13 +751,13 @@ fn coerce_string_position_arg(arg: &Json, col_types: &ColumnTypes) -> Option<Jso
     if arg.get("type").and_then(|t| t.as_str()) != Some("column") {
         return Some(arg.clone());
     }
-    match column_exa_type(arg, col_types).map(classify_exa_type) {
-        Some(ExaTypeClass::Character) => Some(arg.clone()),
-        Some(ExaTypeClass::Date) => Some(wrap_cast_to_varchar(arg)),
-        Some(ExaTypeClass::Decimal) => Some(wrap_decimal_to_varchar(arg)),
+    match column_exa_type(arg, col_types) {
+        Some(exa_type) if exa_type.is_character() => Some(arg.clone()),
+        Some(ExasolType::Date) => Some(wrap_cast_to_varchar(arg)),
+        Some(ExasolType::Decimal { .. }) => Some(wrap_decimal_to_varchar(arg)),
         // Other types' text forms diverge between engines; a cast would turn a crash into
         // a wrong answer.
-        Some(ExaTypeClass::Other) | None => None,
+        _ => None,
     }
 }
 
@@ -758,17 +857,14 @@ fn timestamp_literal_floor(column: &Json, literal: &Json, col_types: &ColumnType
 }
 
 /// Exasol's bare `TIMESTAMP` is `TIMESTAMP(3)`.
-fn declared_timestamp_digits(exa_type: &str) -> Option<usize> {
-    let upper = exa_type.trim().to_uppercase();
-    if upper == "TIMESTAMP" {
-        return Some(3);
+fn declared_timestamp_digits(exa_type: ExasolType) -> Option<usize> {
+    match exa_type {
+        ExasolType::Timestamp { precision: None } => Some(3),
+        ExasolType::Timestamp {
+            precision: Some(digits),
+        } => Some(usize::from(digits)),
+        _ => None,
     }
-    upper
-        .strip_prefix("TIMESTAMP(")?
-        .strip_suffix(')')?
-        .trim()
-        .parse()
-        .ok()
 }
 
 /// Depth-insensitive: a nested aggregate is renderable SQL, so only this probe keeps
@@ -787,13 +883,9 @@ fn contains_aggregate_node(node: &Json) -> bool {
 /// The sole owner of "a tree the DataFusion scan may be handed". Renderability is
 /// checked on the rewritten tree, since that is what the scan carries; checking the
 /// raw tree would let an unrenderable tree be silently dropped, returning wrong rows.
-pub(super) fn type_accepted_rewrite(
-    expr: &Json,
-    col_types: &ColumnTypes,
-    binary_columns: &BinaryColumns,
-) -> Option<Json> {
+pub(super) fn type_accepted_rewrite(expr: &Json, col_types: &ColumnTypes) -> Option<Json> {
     apply_type_rewrites(expr, col_types)
-        .map(|tree| compare_binary_bytes(tree, binary_columns))
+        .map(|tree| compare_binary_bytes(tree, col_types))
         .filter(datafusion_renderable)
 }
 
@@ -803,69 +895,66 @@ pub(super) fn type_accepted_rewrite(
 pub(super) fn classify_where_filter<'a>(
     filter_json_raw: Option<&'a Json>,
     col_types: &ColumnTypes,
-    binary_columns: &BinaryColumns,
 ) -> (Option<String>, Option<&'a Json>) {
-    let accepted = |filter: &Json| type_accepted_rewrite(filter, col_types, binary_columns);
+    let accepted = |filter: &Json| type_accepted_rewrite(filter, col_types);
     match (filter_json_raw, filter_json_raw.and_then(accepted)) {
         (Some(raw), None) => (None, Some(raw)),
         (_, tree) => (tree.as_ref().and_then(render_df_filter_safe), None),
     }
 }
 
-/// The third element is the widening signal: `true` means the projection is the full
-/// base row, not one item per select-list item (#196).
-pub(super) fn extract_projection(
-    request: &Json,
-    pushdown_req: &Json,
-) -> Result<(Vec<ProjectionItem>, Vec<String>, bool), UdfError> {
-    project_columns(
-        pushdown_req,
-        &ColumnTypes::unqualified(&involved_columns(request, |tables| tables.first()).types),
-    )
-}
-
 /// Exasol rejects `TIMESTAMP WITH LOCAL TIME ZONE` as an EMITS output (sqlCode 22002).
-fn is_valid_emits_output_type(ty: &str) -> bool {
-    ty != "TIMESTAMP WITH LOCAL TIME ZONE"
+fn is_valid_emits_output_type(ty: ExasolType) -> bool {
+    ty != ExasolType::TimestampWithLocalTimeZone
 }
 
 /// `all_cols` is the column universe: the first involved table, or both legs of a broadcast
 /// join, each column qualified by its leg's alias.
 ///
-/// The widening flag is returned rather than re-derived downstream by comparing
+/// The third element is the widening signal: `true` means the projection is the full base row,
+/// not one item per select-list item (#196). The widening flag is returned rather than re-derived downstream by comparing
 /// arities, which coincide when the table width equals the select-list arity
 /// (#196). A missing or empty select list is not a widening.
 pub(super) fn project_columns(
     pushdown_req: &Json,
     all_cols: &ColumnTypes,
-) -> Result<(Vec<ProjectionItem>, Vec<String>, bool), UdfError> {
-    let Some((first_col, first_type)) = all_cols.0.first() else {
+) -> Result<(Vec<ProjectedColumn>, bool), UdfError> {
+    let Some((
+        first_col,
+        ColumnType {
+            exa_type: first_type,
+            ..
+        },
+    )) = all_cols.0.first()
+    else {
         return Err(UdfError::User(
             "pushdown request has no column metadata".into(),
         ));
     };
 
-    let full_row = || -> (Vec<ProjectionItem>, Vec<String>) {
+    let full_row = || -> Vec<ProjectedColumn> {
         all_cols
             .0
             .iter()
-            .map(|(column, exa_type)| (ProjectionItem::Column(column.clone()), exa_type.clone()))
-            .unzip()
+            .map(|(column, column_type)| ProjectedColumn {
+                item: ProjectionItem::Column(column.clone()),
+                exa_type: column_type.exa_type,
+            })
+            .collect()
     };
 
     // Repeating `first_col` for an unprojectable item would duplicate EMITS
     // names, so the whole projection widens to the full row instead.
     let mut needs_full_fallback = false;
     let select_list = pushdown_req.get("selectList");
-    let (proj_names, proj_types): (Vec<ProjectionItem>, Vec<String>) = match select_list {
+    let projection = match select_list {
         None | Some(Json::Null) => full_row(),
-        Some(Json::Array(list)) if list.is_empty() => (
-            vec![ProjectionItem::Column(first_col.clone())],
-            vec![first_type.clone()],
-        ),
+        Some(Json::Array(list)) if list.is_empty() => vec![ProjectedColumn {
+            item: ProjectionItem::Column(first_col.clone()),
+            exa_type: *first_type,
+        }],
         Some(Json::Array(list)) => {
-            let mut names = Vec::with_capacity(list.len());
-            let mut types = Vec::with_capacity(list.len());
+            let mut projected = Vec::with_capacity(list.len());
             for (i, e) in list.iter().enumerate() {
                 // The EMITS column type must equal Exasol's declared `selectListDataTypes` entry.
                 let declared_type = declared_select_type(pushdown_req, i);
@@ -883,29 +972,30 @@ pub(super) fn project_columns(
                 let item_type = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match item_type {
                     "column" => {
-                        let (column, ty) = match (all_cols.resolve(e), column_node_ref(e)) {
-                            (Some((column, exa_type)), _) => (column.clone(), exa_type.clone()),
-                            (None, Some(named)) => {
-                                (ColumnRef::from(named.name), "VARCHAR(2000000)".to_string())
+                        let (column, exa_type) = match (all_cols.resolve(e), column_node_ref(e)) {
+                            (Some((column, column_type)), _) => {
+                                (column.clone(), column_type.exa_type)
                             }
-                            (None, None) => (first_col.clone(), first_type.clone()),
+                            (None, Some(named)) => {
+                                (ColumnRef::from(named.name), ExasolType::WIDEST_VARCHAR)
+                            }
+                            (None, None) => (first_col.clone(), *first_type),
                         };
-                        names.push(ProjectionItem::Column(column));
-                        types.push(ty);
+                        projected.push(ProjectedColumn {
+                            item: ProjectionItem::Column(column),
+                            exa_type,
+                        });
                     }
                     t if is_literal_selectlist_item(t) => {
                         // Pushed positionally so the emitted arity equals the select-list arity (#190).
                         match render_expression_safe(e) {
-                            Some(sql_frag) => {
-                                let ty = declared_type.clone();
-                                if is_valid_emits_output_type(&ty) {
-                                    names.push(ProjectionItem::Expr { expr: sql_frag });
-                                    types.push(ty);
-                                } else {
-                                    needs_full_fallback = true;
-                                }
+                            Some(sql_frag) if is_valid_emits_output_type(declared_type) => {
+                                projected.push(ProjectedColumn {
+                                    item: ProjectionItem::Expr { expr: sql_frag },
+                                    exa_type: declared_type,
+                                });
                             }
-                            None => {
+                            _ => {
                                 needs_full_fallback = true;
                             }
                         }
@@ -931,16 +1021,13 @@ pub(super) fn project_columns(
                     | "predicate_is_not_null"
                     | "predicate_notequal" => {
                         match render_expression_safe(e) {
-                            Some(sql_frag) => {
-                                let ty = declared_type.clone();
-                                if is_valid_emits_output_type(&ty) {
-                                    names.push(ProjectionItem::Expr { expr: sql_frag });
-                                    types.push(ty);
-                                } else {
-                                    needs_full_fallback = true;
-                                }
+                            Some(sql_frag) if is_valid_emits_output_type(declared_type) => {
+                                projected.push(ProjectedColumn {
+                                    item: ProjectionItem::Expr { expr: sql_frag },
+                                    exa_type: declared_type,
+                                });
                             }
-                            None => {
+                            _ => {
                                 needs_full_fallback = true;
                             }
                         }
@@ -953,13 +1040,13 @@ pub(super) fn project_columns(
             if needs_full_fallback {
                 full_row()
             } else {
-                (names, types)
+                projected
             }
         }
         _ => full_row(),
     };
 
-    Ok((proj_names, proj_types, needs_full_fallback))
+    Ok((projection, needs_full_fallback))
 }
 
 pub(super) fn collect_all_column_names(
@@ -1016,20 +1103,20 @@ pub(super) fn sql_string_literal(s: &str) -> String {
 
 /// Its `VARCHAR(2000000)` fallback is the catch-all [`cast_to_declared_type`] reads as
 /// "no usable declared type", so the two must stay together.
-pub(super) fn declared_select_type(pushdown_req: &Json, select_index: usize) -> String {
+pub(super) fn declared_select_type(pushdown_req: &Json, select_index: usize) -> ExasolType {
     pushdown_req
         .get("selectListDataTypes")
         .and_then(|v| v.as_array())
         .and_then(|types| types.get(select_index))
         .map(exasol_type_from_json)
-        .unwrap_or_else(|| "VARCHAR(2000000)".to_string())
+        .unwrap_or(ExasolType::WIDEST_VARCHAR)
 }
 
 /// `VARCHAR(2000000)` is exempt: it is the mapping's catch-all for unmappable types,
 /// so casting to it would mislabel the value.
-pub(super) fn cast_to_declared_type(expr: &str, declared: Option<&str>) -> String {
+pub(super) fn cast_to_declared_type(expr: &str, declared: Option<ExasolType>) -> String {
     match declared {
-        Some(ty) if ty != "VARCHAR(2000000)" => format!("CAST({expr} AS {ty})"),
+        Some(ty) if ty != ExasolType::WIDEST_VARCHAR => format!("CAST({expr} AS {ty})"),
         _ => expr.to_string(),
     }
 }

@@ -7,21 +7,19 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::{render_df_filter_safe, render_expression_safe, strip_table_alias};
 
-use super::super::BinaryColumns;
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
-    build_scan_driving_sql, classify_where_filter, collect_all_column_names, extract_limit,
-    extract_offset, project_columns, quote_ident, render_limit_offset, scan_storage_for,
-    shard_count,
+    ColumnTypes, ProjectedColumn, build_scan_driving_sql, classify_where_filter,
+    collect_all_column_names, extract_limit, extract_offset, project_columns, projection_items,
+    quote_ident, render_limit_offset, scan_storage_for, shard_count,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_flags, wrap_declined_order_by};
 use super::attribution::{JoinLegs, UnattributableColumn};
 use super::planning::{
     DetectedJoin, JoinSides, JoinWindowPlan, ResolvedJoinSide, classify_join_window,
-    involved_table_columns,
 };
 use super::rendering::{
-    conjoin_filters, cross_leg_residual_filter, declined_only, leg_column_types, leg_local_filter,
+    conjoin_filters, cross_leg_residual_filter, declined_only, leg_local_filter,
     projection_item_select_sql, referenced_clause_values, referenced_leg_columns,
     render_df_filter_qualified, render_expression_qualified, renderable_only,
     type_screened_leg_filter,
@@ -38,9 +36,7 @@ pub(crate) struct RenderedJoinPushdown {
     pub condition: String,
     /// Never a declined filter: a decline forfeits the broadcast plan entirely.
     pub filter: Option<String>,
-    pub projection: Vec<ProjectionItem>,
-    /// Positionally aligned with `projection`.
-    pub projection_types: Vec<String>,
+    pub projection: Vec<ProjectedColumn>,
     /// Classified from the qualified ORDER BY, so each key carries its own leg's pair.
     pub(in super::super) window: JoinWindowPlan,
 }
@@ -52,14 +48,13 @@ pub(crate) struct RenderedJoinPushdown {
 /// metadata at all, or with a column no single leg owns.
 ///
 /// Every column of the condition, filter, select list, and ORDER BY is qualified through
-/// [`JoinLegs`] with its leg's alias before anything reads it, and the type universe and
-/// binary columns are keyed by the same pairs, so legs may share column names: the scan
+/// [`JoinLegs`] with its leg's alias before anything reads it, and the column-type map is the
+/// resolved `sides`' maps keyed by the same pairs, so legs may share column names: the scan
 /// aliases each relation with the alias the join block carries for it.
 pub(crate) fn render_broadcast_join(
-    request: &Json,
     pushdown_req: &Json,
     join: &DetectedJoin,
-    binary_columns: &BinaryColumns,
+    sides: &[ResolvedJoinSide],
 ) -> Result<Option<RenderedJoinPushdown>, UdfError> {
     let legs = join.legs();
     let condition_tree = legs
@@ -71,17 +66,26 @@ pub(crate) fn render_broadcast_join(
         return Ok(None);
     };
 
-    let col_types = leg_column_types(request, join, &legs);
+    let col_types = ColumnTypes::per_relation(
+        sides
+            .iter()
+            .enumerate()
+            .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
+    );
     let filter_json = qualified_req.get("filter").filter(|f| !f.is_null());
-    let (filter, declined) = classify_where_filter(filter_json, &col_types, binary_columns);
+    let (filter, declined) = classify_where_filter(filter_json, &col_types);
     if declined.is_some() {
         return Ok(None);
     }
 
-    let (projection, projection_types, widened) = project_columns(&qualified_req, &col_types)?;
+    let (projection, widened) = project_columns(&qualified_req, &col_types)?;
     // A widened projection is the full two-table row, the wrong shape for a broadcast fan-out
     // (#196).
-    if widened || projection.iter().any(exceeds_identifier_limit) {
+    if widened
+        || projection
+            .iter()
+            .any(|column| exceeds_identifier_limit(&column.item))
+    {
         return Ok(None);
     }
 
@@ -89,7 +93,6 @@ pub(crate) fn render_broadcast_join(
         condition,
         filter,
         projection,
-        projection_types,
         window: classify_join_window(&qualified_req),
     }))
 }
@@ -162,15 +165,15 @@ fn build_n_scan_join_from(
 
 fn n_full_row_qualified_items(
     legs: &JoinLegs,
-    cols_per_leg: &[Vec<(String, String)>],
+    cols_per_leg: &[ColumnTypes],
 ) -> Vec<ProjectionItem> {
     cols_per_leg
         .iter()
         .enumerate()
         .flat_map(|(leg, cols)| {
             let alias = quote_ident(&legs.leg_alias(leg));
-            cols.iter().map(move |(name, _)| ProjectionItem::Expr {
-                expr: format!("{alias}.{}", quote_ident(name)),
+            cols.iter().map(move |(column, _)| ProjectionItem::Expr {
+                expr: format!("{alias}.{}", quote_ident(&column.name)),
             })
         })
         .collect()
@@ -228,7 +231,7 @@ fn render_self_applied_where(
 fn n_scan_join_select_items(
     pushdown_req: &Json,
     legs: &JoinLegs,
-    cols_per_leg: &[Vec<(String, String)>],
+    cols_per_leg: &[ColumnTypes],
 ) -> Result<Vec<ProjectionItem>, UdfError> {
     match pushdown_req.get("selectList") {
         Some(Json::Array(list)) if !list.is_empty() => {
@@ -260,7 +263,7 @@ struct OuterWrapperClauses {
 fn outer_wrapper_clauses(
     pushdown_req: &Json,
     legs: &JoinLegs,
-    cols_per_leg: &[Vec<(String, String)>],
+    cols_per_leg: &[ColumnTypes],
 ) -> Result<OuterWrapperClauses, UdfError> {
     let select_items = n_scan_join_select_items(pushdown_req, legs, cols_per_leg)?;
     let group_by = qualified_join_group_by(pushdown_req, legs)?;
@@ -316,7 +319,6 @@ fn outer_wrapper_clauses(
 /// residual neither dialect renders: a predicate applicable nowhere must fail the query.
 #[allow(clippy::too_many_arguments)]
 pub(in super::super) fn build_n_scan_join_sql(
-    request: &Json,
     pushdown_req: &Json,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
@@ -324,10 +326,8 @@ pub(in super::super) fn build_n_scan_join_sql(
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> Result<String, UdfError> {
-    let cols_per_side: Vec<Vec<(String, String)>> = sides
-        .iter()
-        .map(|s| involved_table_columns(request, &s.table_name))
-        .collect();
+    let cols_per_side: Vec<ColumnTypes> =
+        sides.iter().map(|side| side.column_types.clone()).collect();
     if cols_per_side.iter().any(|c| c.is_empty()) {
         return Err(join_render_decline(
             "an involved table carries no column metadata, so the unaccelerated N-scan \
@@ -374,11 +374,7 @@ pub(in super::super) fn build_n_scan_join_sql(
             .as_ref()
             .and_then(|f| leg_local_filter(f, &legs, i))
         {
-            Some(side_local) => type_screened_leg_filter(
-                &side_local,
-                &cols_per_side[i],
-                &BinaryColumns::of(&side.logical_schema, inputs.binary_as_string),
-            ),
+            Some(side_local) => type_screened_leg_filter(&side_local, &cols_per_side[i]),
             None => (None, None),
         };
         // Disjoint by attribution, so no conjunct is double-applied.
@@ -506,17 +502,13 @@ fn scan_storage_for_side(
 /// nowhere. `columns` must expose every column any outer clause references.
 pub(super) fn build_side_fan_out_sql(
     side: &ResolvedJoinSide,
-    columns: &[(String, String)],
+    columns: &ColumnTypes,
     side_filter: Option<&Json>,
     inputs: &JoinScanRequestConfig<'_>,
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> Result<String, UdfError> {
-    let proj_cols: Vec<ProjectionItem> = columns
-        .iter()
-        .map(|(name, _)| ProjectionItem::from(name.clone()))
-        .collect();
-    let proj_types: Vec<String> = columns.iter().map(|(_, ty)| ty.clone()).collect();
+    let projection = full_projection(columns);
 
     let shards = shard_side(side, inputs);
 
@@ -524,14 +516,13 @@ pub(super) fn build_side_fan_out_sql(
     let filter = side_filter
         .map(strip_table_alias)
         .and_then(|f| render_df_filter_safe(&f));
-    let spec = join_fan_out_scan_spec(side, proj_cols.clone(), filter, None, inputs)?;
+    let spec = join_fan_out_scan_spec(side, projection_items(&projection), filter, None, inputs)?;
     Ok(build_scan_driving_sql(
         &spec,
         &shards,
-        &proj_cols,
-        &proj_types,
+        &projection,
         None,
-        &[],
+        &ColumnTypes::default(),
         None,
         udf_name,
         distribute_udf_name,
@@ -540,13 +531,13 @@ pub(super) fn build_side_fan_out_sql(
 
 /// Binds by the (relation alias, column) pair: `ORDER BY b.ID` never binds to a projected
 /// `a.ID`, which carries the other leg's values.
-fn bound_sort_key(key: &ParsedSortKey, projection: &[ProjectionItem]) -> Option<SortKey> {
+fn bound_sort_key(key: &ParsedSortKey, projection: &[ProjectedColumn]) -> Option<SortKey> {
     let ParsedSortKey::Column(key) = key else {
         return None;
     };
     projection
         .iter()
-        .any(|item| matches!(item, ProjectionItem::Column(column) if *column == key.column))
+        .any(|projected| matches!(&projected.item, ProjectionItem::Column(column) if *column == key.column))
         .then(|| key.clone())
 }
 
@@ -561,7 +552,7 @@ struct BroadcastWindowPlacement {
 /// `Ordered` key is absent from `projection`.
 fn place_broadcast_window(
     window: JoinWindowPlan,
-    projection: &[ProjectionItem],
+    projection: &[ProjectedColumn],
 ) -> Option<BroadcastWindowPlacement> {
     match window {
         JoinWindowPlan::Unbounded => Some(BroadcastWindowPlacement {
@@ -642,9 +633,10 @@ pub(in super::super) fn build_broadcast_join_sql(
         storage: scan_storage_for_side(&dimension.effective_storage, inputs)?,
     };
 
+    let projection = projection_items(&rendered.projection);
     let spec = join_fan_out_scan_spec(
         fact,
-        rendered.projection.clone(),
+        projection.clone(),
         rendered.filter.clone(),
         Some(join),
         inputs,
@@ -654,9 +646,8 @@ pub(in super::super) fn build_broadcast_join_sql(
         &spec,
         &shards,
         &rendered.projection,
-        &rendered.projection_types,
         placement.merge_cap,
-        &[],
+        &ColumnTypes::default(),
         None,
         udf_name,
         distribute_udf_name,
@@ -667,8 +658,8 @@ pub(in super::super) fn build_broadcast_join_sql(
     };
     let wrapped = wrap_declined_order_by(
         &fan_out,
-        &rendered.projection,
-        rendered.projection.len(),
+        &projection,
+        projection.len(),
         &keys,
         limit,
         offset,
@@ -767,60 +758,75 @@ fn qualified_join_order_by(
 /// unlike [`referenced_leg_columns`], which falls back to all columns.
 pub(in super::super) fn referenced_column_projection(
     pushdown_req: &Json,
-    all_cols: &[(String, String)],
-) -> (Vec<ProjectionItem>, Vec<String>) {
+    all_cols: &ColumnTypes,
+) -> Vec<ProjectedColumn> {
     if !matches!(pushdown_req.get("selectList"), Some(Json::Array(list)) if !list.is_empty()) {
-        return (
-            all_cols
-                .iter()
-                .map(|(name, _)| ProjectionItem::from(name.clone()))
-                .collect(),
-            all_cols.iter().map(|(_, ty)| ty.clone()).collect(),
-        );
+        return full_projection(all_cols);
     }
 
     let mut names = std::collections::HashSet::new();
     referenced_clause_values(pushdown_req, |v| collect_all_column_names(v, &mut names));
 
-    let mut cols = Vec::new();
-    let mut types = Vec::new();
-    for (name, ty) in all_cols {
-        if names.contains(name) {
-            cols.push(ProjectionItem::from(name.clone()));
-            types.push(ty.clone());
-        }
+    let referenced = all_cols.narrowed(|column| names.contains(&column.name));
+    if referenced.is_empty() {
+        return full_projection(all_cols).into_iter().take(1).collect();
     }
-    if cols.is_empty()
-        && let Some((name, ty)) = all_cols.first()
-    {
-        cols.push(ProjectionItem::from(name.clone()));
-        types.push(ty.clone());
-    }
-    (cols, types)
+    full_projection(&referenced)
 }
 
-/// The pair is constructed together because its positional alignment is load-bearing: both
-/// feed the wrapper universe and the `EMITS (...)` clause, and a shorter list truncates both.
+/// Every column of `columns`, each projected under its own type.
+fn full_projection(columns: &ColumnTypes) -> Vec<ProjectedColumn> {
+    columns
+        .iter()
+        .map(|(column, column_type)| ProjectedColumn {
+            item: ProjectionItem::Column(column.clone()),
+            exa_type: column_type.exa_type,
+        })
+        .collect()
+}
+
+/// The spec and its projected columns are constructed together because their positional
+/// alignment is load-bearing: both feed the wrapper universe and the `EMITS (...)` clause, and a
+/// shorter list truncates both. The type map travels with them because the wrapper's full row
+/// selects each projected column from it: a column the map lacked would drop out of the wrapper
+/// but stay in the `EMITS (...)` clause.
 #[derive(Debug)]
 pub(in super::super) struct FanOutProjection<'a> {
     pub spec: &'a ScanSpec,
-    pub proj_types: &'a [String],
+    pub columns: &'a [ProjectedColumn],
+    pub col_types: &'a ColumnTypes,
 }
 
 impl<'a> FanOutProjection<'a> {
     pub(in super::super) fn new(
         spec: &'a ScanSpec,
-        proj_types: &'a [String],
+        columns: &'a [ProjectedColumn],
+        col_types: &'a ColumnTypes,
     ) -> Result<Self, UdfError> {
-        if spec.common.projection.len() != proj_types.len() {
+        if spec.common.projection.len() != columns.len() {
             return Err(UdfError::User(format!(
                 "the fan-out projection carries {} item(s) but {} declared type(s); the two \
                  must stay positionally aligned",
                 spec.common.projection.len(),
-                proj_types.len()
+                columns.len()
             )));
         }
-        Ok(Self { spec, proj_types })
+        let unmapped = spec.common.projection.iter().find_map(|item| match item {
+            ProjectionItem::Column(column) if col_types.get(column).is_none() => Some(column),
+            _ => None,
+        });
+        if let Some(column) = unmapped {
+            return Err(UdfError::User(format!(
+                "the fan-out projects column \"{}\" but the column type map has no entry for it; \
+                 the wrapper's full row must select every projected column",
+                column.output_name()
+            )));
+        }
+        Ok(Self {
+            spec,
+            columns,
+            col_types,
+        })
     }
 }
 
@@ -842,34 +848,29 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
     declined_filter: Option<&Json>,
 ) -> Result<String, UdfError> {
     let fan_out_spec = fan_out.spec;
-    let proj_types = fan_out.proj_types;
 
     let legs = JoinLegs::for_single_scan(request);
     let alias = legs.leg_alias(0);
 
-    let all_cols: Vec<(String, String)> = fan_out_spec
+    let projected_columns = fan_out_spec
         .common
         .projection
         .iter()
-        .zip(proj_types.iter())
-        .filter_map(|(item, ty)| match item {
-            ProjectionItem::Column(column) => Some((column.output_name(), ty.clone())),
+        .filter_map(|item| match item {
+            ProjectionItem::Column(column) => Some(column),
             ProjectionItem::Expr { .. } => None,
-        })
-        .collect();
-    let cols_per_leg = vec![all_cols];
+        });
+    let cols_per_leg = vec![fan_out.col_types.selected(projected_columns)];
 
     let OuterWrapperClauses { select, trailing } =
         outer_wrapper_clauses(pushdown_req, &legs, &cols_per_leg)?;
 
-    let proj_cols = fan_out_spec.common.projection.clone();
     let fan_out = build_scan_driving_sql(
         fan_out_spec,
         shards,
-        &proj_cols,
-        proj_types,
+        fan_out.columns,
         None,
-        &[],
+        &ColumnTypes::default(),
         None,
         udf_name,
         distribute_udf_name,
@@ -901,15 +902,15 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
     base: &CommonScanSpec,
     filter: Option<String>,
     shards: &[Vec<FileEntry>],
-    col_types: &[(String, String)],
+    col_types: &ColumnTypes,
     udf_name: &str,
     distribute_udf_name: &str,
     declined_filter: Option<&Json>,
 ) -> Result<Json, UdfError> {
-    let (fb_proj_cols, fb_proj_types) = referenced_column_projection(pushdown_req, col_types);
+    let fb_projection = referenced_column_projection(pushdown_req, col_types);
     let fan_out_spec = ScanSpec {
         common: CommonScanSpec {
-            projection: fb_proj_cols,
+            projection: projection_items(&fb_projection),
             filter,
             limit: None,
             order_by: Vec::new(),
@@ -920,7 +921,7 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
         },
         files: vec![],
     };
-    let fan_out = FanOutProjection::new(&fan_out_spec, &fb_proj_types)?;
+    let fan_out = FanOutProjection::new(&fan_out_spec, &fb_projection, col_types)?;
     let sql = build_qualified_single_table_fallback_sql(
         request,
         pushdown_req,
@@ -935,18 +936,18 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
 
 pub(in super::super) struct EmptyRelation {
     legs: JoinLegs,
-    cols_per_leg: Vec<Vec<(String, String)>>,
+    cols_per_leg: Vec<ColumnTypes>,
 }
 
 impl EmptyRelation {
-    pub(in super::super) fn single_scan(request: &Json, col_types: &[(String, String)]) -> Self {
+    pub(in super::super) fn single_scan(request: &Json, col_types: &ColumnTypes) -> Self {
         Self {
             legs: JoinLegs::for_single_scan(request),
-            cols_per_leg: vec![col_types.to_vec()],
+            cols_per_leg: vec![col_types.clone()],
         }
     }
 
-    pub(super) fn join(join: &DetectedJoin, cols_per_leg: Vec<Vec<(String, String)>>) -> Self {
+    pub(super) fn join(join: &DetectedJoin, cols_per_leg: Vec<ColumnTypes>) -> Self {
         Self {
             legs: join.legs(),
             cols_per_leg,
@@ -963,7 +964,13 @@ impl EmptyRelation {
             .map(|(leg, cols)| {
                 let nulls = cols
                     .iter()
-                    .map(|(name, ty)| format!("CAST(NULL AS {ty}) AS {}", quote_ident(name)))
+                    .map(|(column, column_type)| {
+                        format!(
+                            "CAST(NULL AS {}) AS {}",
+                            column_type.exa_type,
+                            quote_ident(&column.name)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!(

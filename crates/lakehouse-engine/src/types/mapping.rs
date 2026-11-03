@@ -4,135 +4,52 @@ use arrow::datatypes::{DataType, TimeUnit};
 use delta_kernel::schema::{DataType as SparkType, PrimitiveType as SparkPrimitive, StructField};
 use lakehouse_catalog::ColumnSourceType;
 
+use super::exasol_type::{ExasolType, MAX_CHAR_SIZE, MAX_VARCHAR_SIZE};
 use super::hive_type::parse_hive_type;
 use serde_json::{Value as Json, json};
 
-/// Returns `"VARCHAR(2000000)"` for every incompatible Arrow type rather than erroring;
+/// Returns `VARCHAR(2000000)` for every incompatible Arrow type rather than erroring;
 /// the scan serializes those values to JSON strings, and binary values to lowercase hex.
-pub fn arrow_to_exasol_type(dt: &DataType) -> String {
+pub fn arrow_to_exasol_type(dt: &DataType) -> ExasolType {
     if let DataType::FixedSizeBinary(width) = dt {
         return hex_varchar(u64::try_from(*width).unwrap_or(0));
     }
-    match compatible_exasol_type(dt) {
-        Some(CompatibleExaType::Fixed(s)) => s.to_string(),
-        Some(CompatibleExaType::Decimal(p, s)) => format!("DECIMAL({p},{s})"),
-        None => "VARCHAR(2000000)".to_string(),
-    }
+    compatible_exasol_type(dt).unwrap_or(ExasolType::WIDEST_VARCHAR)
 }
 
-enum CompatibleExaType {
-    Fixed(&'static str),
-    Decimal(u8, i8),
-}
-
-/// `None` is the JSON-fallback flag: `Utf8` and an out-of-range `Decimal128` both render as
-/// `VARCHAR(2000000)`, so the rendered string cannot tell them apart.
-fn compatible_exasol_type(dt: &DataType) -> Option<CompatibleExaType> {
+/// `None` is the JSON-fallback flag: `Utf8` and an out-of-range `Decimal128` both map to
+/// `VARCHAR(2000000)`, so the type alone cannot tell them apart.
+fn compatible_exasol_type(dt: &DataType) -> Option<ExasolType> {
     let exasol_type = match dt {
-        DataType::Boolean => "BOOLEAN",
+        DataType::Boolean => ExasolType::Boolean,
 
-        DataType::Int8 | DataType::UInt8 => "DECIMAL(3,0)",
-        DataType::Int16 | DataType::UInt16 => "DECIMAL(5,0)",
-        DataType::Int32 => "DECIMAL(10,0)",
-        DataType::Int64 | DataType::UInt32 | DataType::UInt64 => "DECIMAL(20,0)",
+        DataType::Int8 | DataType::UInt8 => decimal(3, 0),
+        DataType::Int16 | DataType::UInt16 => decimal(5, 0),
+        DataType::Int32 => decimal(10, 0),
+        DataType::Int64 | DataType::UInt32 | DataType::UInt64 => decimal(20, 0),
 
-        DataType::Float32 | DataType::Float64 => "DOUBLE PRECISION",
+        DataType::Float32 | DataType::Float64 => ExasolType::DoublePrecision,
 
-        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR(2000000)",
+        DataType::Utf8 | DataType::LargeUtf8 => ExasolType::WIDEST_VARCHAR,
 
-        DataType::Date32 => "DATE",
+        DataType::Date32 => ExasolType::Date,
 
         // Exasol rejects TIMESTAMP WITH LOCAL TIME ZONE as a UDF EMITS type; a tz-aware
         // value is a UTC instant, so plain TIMESTAMP emits it unchanged.
-        DataType::Timestamp(_, _) => "TIMESTAMP",
+        DataType::Timestamp(_, _) => ExasolType::Timestamp { precision: None },
 
-        DataType::Decimal128(p, s) if *p <= 36 && *s <= 36 => {
-            return Some(CompatibleExaType::Decimal(*p, *s));
-        }
+        DataType::Decimal128(p, s) if *p <= 36 && *s <= 36 => decimal(*p, *s),
 
         _ => return None,
     };
-    Some(CompatibleExaType::Fixed(exasol_type))
+    Some(exasol_type)
 }
 
-/// The Arrow type `emit_batch`'s strict Arrow→ExaType validation accepts for a column
-/// declared with this EMITS type string (case-insensitive, whitespace-tolerant).
-///
-/// `None` for the string family: the right source coercion (JSON vs plain Utf8 cast)
-/// depends on the source column, not the target.
-///
-/// Exasol bins a scale-0 `DECIMAL(p,0)` by precision, and `emit_batch` rejects any other
-/// Arrow representation:
-/// - scale 0, p ≤ [`DECIMAL_INT32_MAX_PRECISION`] → `Int32`
-/// - scale 0, p ≤ [`DECIMAL_INT64_MAX_PRECISION`] → `Int64`
-/// - otherwise → `Decimal128(p,s)`
-pub fn exasol_type_to_arrow(exasol_type: &str) -> Option<DataType> {
-    let upper = exasol_type.trim().to_uppercase();
-
-    if upper == "BOOLEAN" {
-        return Some(DataType::Boolean);
-    }
-    if upper == "DOUBLE PRECISION" || upper == "DOUBLE" {
-        return Some(DataType::Float64);
-    }
-    if upper == "DATE" {
-        return Some(DataType::Date32);
-    }
-    // Exasol's bare `TIMESTAMP` is `TIMESTAMP(3)`.
-    let timestamp_digits = if upper == "TIMESTAMP" {
-        Some(3)
-    } else {
-        upper
-            .strip_prefix("TIMESTAMP(")
-            .and_then(|rest| rest.strip_suffix(')'))
-            .and_then(|digits| digits.trim().parse::<u32>().ok())
-    };
-    if let Some(digits) = timestamp_digits {
-        return Some(DataType::Timestamp(
-            TimestampPrecision::from_declared_digits(digits).arrow_unit(),
-            None,
-        ));
-    }
-    if upper == "TIMESTAMP WITH LOCAL TIME ZONE" {
-        return Some(DataType::Timestamp(
-            TimeUnit::Microsecond,
-            Some("UTC".into()),
-        ));
-    }
-    if let Some((p, s)) = parse_decimal_args(&upper) {
-        if s == 0 && p <= DECIMAL_INT32_MAX_PRECISION {
-            return Some(DataType::Int32);
-        }
-        if s == 0 && p <= DECIMAL_INT64_MAX_PRECISION {
-            return Some(DataType::Int64);
-        }
-        return Some(DataType::Decimal128(p, s));
-    }
-
-    None
+fn decimal(precision: u8, scale: i8) -> ExasolType {
+    ExasolType::Decimal { precision, scale }
 }
-
-pub const DECIMAL_INT32_MAX_PRECISION: u8 = 9;
-
-pub const DECIMAL_INT64_MAX_PRECISION: u8 = 18;
 
 const EXASOL_DECIMAL_MAX_PRECISION: u32 = 36;
-
-/// Accepts `DECIMAL(p,s)` and `DECIMAL(p)` (scale 0). Input must be upper-cased with no
-/// surrounding whitespace; whitespace around each argument is trimmed.
-pub(crate) fn parse_decimal_args(upper: &str) -> Option<(u8, i8)> {
-    let inner = upper.strip_prefix("DECIMAL(")?.strip_suffix(')')?;
-    let mut parts = inner.split(',');
-    let p: u8 = parts.next()?.trim().parse().ok()?;
-    let s: i8 = match parts.next() {
-        Some(s_str) => s_str.trim().parse().ok()?,
-        None => 0,
-    };
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((p, s))
-}
 
 pub fn needs_json_fallback(dt: &DataType) -> bool {
     compatible_exasol_type(dt).is_none()
@@ -142,12 +59,13 @@ pub fn needs_json_fallback(dt: &DataType) -> bool {
 pub const MAX_BINARY_BYTES: usize = 1_000_000;
 
 /// Two hex characters per byte, so a `fixed(L)` column declares `VARCHAR(2L)`.
-pub(crate) fn hex_varchar(width: u64) -> String {
+pub(crate) fn hex_varchar(width: u64) -> ExasolType {
     let chars = width.saturating_mul(2);
-    if (1..=2 * MAX_BINARY_BYTES as u64).contains(&chars) {
-        format!("VARCHAR({chars})")
-    } else {
-        "VARCHAR(2000000)".to_string()
+    match u32::try_from(chars) {
+        Ok(size) if (1..=MAX_VARCHAR_SIZE).contains(&size) => {
+            ExasolType::Varchar { size, ascii: false }
+        }
+        _ => ExasolType::WIDEST_VARCHAR,
     }
 }
 
@@ -173,11 +91,11 @@ pub(crate) fn exasol_representable_catalog_decimal(precision: u32, scale: u32) -
     (1..=EXASOL_DECIMAL_MAX_PRECISION).contains(&precision) && scale <= precision
 }
 
-fn catalog_decimal_to_exasol(precision: u32, scale: u32) -> String {
+fn catalog_decimal_to_exasol(precision: u32, scale: u32) -> ExasolType {
     if exasol_representable_catalog_decimal(precision, scale) {
-        format!("DECIMAL({precision},{scale})")
+        decimal(precision as u8, scale as i8)
     } else {
-        "VARCHAR(2000000)".to_string()
+        ExasolType::WIDEST_VARCHAR
     }
 }
 
@@ -198,12 +116,13 @@ pub fn timestamp_literal_digits(literal: &str) -> usize {
 }
 
 impl TimestampPrecision {
-    pub fn declaration(self) -> &'static str {
-        match self {
-            Self::Millisecond => "TIMESTAMP",
-            Self::Microsecond => "TIMESTAMP(6)",
-            Self::Nanosecond => "TIMESTAMP(9)",
-        }
+    pub fn declaration(self) -> ExasolType {
+        let precision = match self {
+            Self::Millisecond => None,
+            Self::Microsecond => Some(6),
+            Self::Nanosecond => Some(9),
+        };
+        ExasolType::Timestamp { precision }
     }
 
     pub fn arrow_unit(self) -> TimeUnit {
@@ -267,38 +186,31 @@ impl EngineTimestampSupport {
 pub fn iceberg_primitive_to_exasol(
     pt: &iceberg::spec::PrimitiveType,
     engine: EngineTimestampSupport,
-) -> String {
+) -> ExasolType {
     use iceberg::spec::PrimitiveType::*;
     match pt {
-        Boolean => "BOOLEAN".to_string(),
-        Int => "DECIMAL(10,0)".to_string(),
-        Long => "DECIMAL(20,0)".to_string(),
-        Float => "DOUBLE PRECISION".to_string(),
-        Double => "DOUBLE PRECISION".to_string(),
+        Boolean => ExasolType::Boolean,
+        Int => decimal(10, 0),
+        Long => decimal(20, 0),
+        Float | Double => ExasolType::DoublePrecision,
         Decimal { precision, scale } => catalog_decimal_to_exasol(*precision, *scale),
-        Date => "DATE".to_string(),
-        Time => "VARCHAR(2000000)".to_string(),
+        Date => ExasolType::Date,
+        Time => ExasolType::WIDEST_VARCHAR,
         // Exasol rejects TIMESTAMP WITH LOCAL TIME ZONE as a UDF EMITS type; timestamptz is
         // a UTC instant, so plain TIMESTAMP emits it unchanged.
-        Timestamp | Timestamptz => engine
-            .clamp(TimestampPrecision::Microsecond)
-            .declaration()
-            .to_string(),
-        TimestampNs | TimestamptzNs => engine
-            .clamp(TimestampPrecision::Nanosecond)
-            .declaration()
-            .to_string(),
-        String | Binary => "VARCHAR(2000000)".to_string(),
+        Timestamp | Timestamptz => engine.clamp(TimestampPrecision::Microsecond).declaration(),
+        TimestampNs | TimestamptzNs => engine.clamp(TimestampPrecision::Nanosecond).declaration(),
+        String | Binary => ExasolType::WIDEST_VARCHAR,
         Fixed(width) => hex_varchar(*width),
         Uuid => hex_varchar(UUID_BYTES),
         // Refused at declaration; the type only fills the column's declared slot.
-        Geometry(_) | Geography(_) | Unknown => "VARCHAR(2000000)".to_string(),
+        Geometry(_) | Geography(_) | Unknown => ExasolType::WIDEST_VARCHAR,
     }
 }
 
 /// Must stay in lockstep with [`iceberg_primitive_to_exasol`] on the decimal domain: a
-/// `Decimal128` tag for a column declared VARCHAR breaks [`exasol_type_to_arrow`], and
-/// arrow-rs rejects `precision == 0` and `scale > precision` outright.
+/// `Decimal128` tag for a column declared VARCHAR breaks `emit_batch`'s Arrow→ExaType
+/// validation, and arrow-rs rejects `precision == 0` and `scale > precision` outright.
 pub fn iceberg_primitive_to_arrow(pt: &iceberg::spec::PrimitiveType) -> DataType {
     use arrow::datatypes::TimeUnit;
     use iceberg::spec::PrimitiveType::*;
@@ -371,8 +283,8 @@ pub fn arrow_type_to_tag(dt: &DataType) -> String {
     }
 }
 
-/// Returns `DataType::Utf8` for any unrecognised tag. `decimal128(p,s)` deliberately does not
-/// use [`parse_decimal_args`]: the tag grammar requires both arguments.
+/// Returns `DataType::Utf8` for any unrecognised tag. The `decimal128(p,s)` tag requires both
+/// arguments.
 pub fn arrow_type_from_tag(tag: &str) -> DataType {
     use arrow::datatypes::TimeUnit;
     match tag {
@@ -423,18 +335,21 @@ pub fn arrow_type_from_tag(tag: &str) -> DataType {
     }
 }
 
-pub fn iceberg_type_to_exasol(ty: &iceberg::spec::Type, engine: EngineTimestampSupport) -> String {
+pub fn iceberg_type_to_exasol(
+    ty: &iceberg::spec::Type,
+    engine: EngineTimestampSupport,
+) -> ExasolType {
     use iceberg::spec::Type;
     match ty {
         Type::Primitive(pt) => iceberg_primitive_to_exasol(pt, engine),
-        _ => "VARCHAR(2000000)".to_string(),
+        _ => ExasolType::WIDEST_VARCHAR,
     }
 }
 
 pub(crate) fn column_source_type_to_exasol(
     source_type: &ColumnSourceType,
     engine: EngineTimestampSupport,
-) -> String {
+) -> ExasolType {
     match source_type {
         ColumnSourceType::Iceberg(field) => iceberg_type_to_exasol(&field.field_type, engine),
         ColumnSourceType::Unity { type_json } => spark_type_to_exasol(
@@ -444,8 +359,7 @@ pub(crate) fn column_source_type_to_exasol(
         ColumnSourceType::Parquet(tag) => match arrow_type_from_tag(tag) {
             DataType::Timestamp(unit, _) => engine
                 .clamp(TimestampPrecision::from_arrow_unit(unit))
-                .declaration()
-                .to_string(),
+                .declaration(),
             other => arrow_to_exasol_type(&other),
         },
         ColumnSourceType::Glue { hive_type } => {
@@ -467,27 +381,29 @@ pub(crate) fn unity_spark_field(type_json: Option<&str>) -> Result<StructField, 
 fn spark_type_to_exasol(
     spark_type: Result<SparkType, String>,
     engine: EngineTimestampSupport,
-) -> String {
+) -> ExasolType {
     match spark_type {
         Ok(SparkType::Primitive(primitive)) => spark_primitive_to_exasol(&primitive, engine),
-        _ => "VARCHAR(2000000)".to_string(),
+        _ => ExasolType::WIDEST_VARCHAR,
     }
 }
 
-fn spark_primitive_to_exasol(primitive: &SparkPrimitive, engine: EngineTimestampSupport) -> String {
+fn spark_primitive_to_exasol(
+    primitive: &SparkPrimitive,
+    engine: EngineTimestampSupport,
+) -> ExasolType {
     match primitive {
-        SparkPrimitive::Boolean => "BOOLEAN".to_string(),
-        SparkPrimitive::Byte => "DECIMAL(3,0)".to_string(),
-        SparkPrimitive::Short => "DECIMAL(5,0)".to_string(),
-        SparkPrimitive::Integer => "DECIMAL(10,0)".to_string(),
-        SparkPrimitive::Long => "DECIMAL(20,0)".to_string(),
-        SparkPrimitive::Float | SparkPrimitive::Double => "DOUBLE PRECISION".to_string(),
-        SparkPrimitive::Date => "DATE".to_string(),
+        SparkPrimitive::Boolean => ExasolType::Boolean,
+        SparkPrimitive::Byte => decimal(3, 0),
+        SparkPrimitive::Short => decimal(5, 0),
+        SparkPrimitive::Integer => decimal(10, 0),
+        SparkPrimitive::Long => decimal(20, 0),
+        SparkPrimitive::Float | SparkPrimitive::Double => ExasolType::DoublePrecision,
+        SparkPrimitive::Date => ExasolType::Date,
         // The Delta protocol defines no nanosecond timestamp type.
-        SparkPrimitive::Timestamp | SparkPrimitive::TimestampNtz => engine
-            .clamp(TimestampPrecision::Microsecond)
-            .declaration()
-            .to_string(),
+        SparkPrimitive::Timestamp | SparkPrimitive::TimestampNtz => {
+            engine.clamp(TimestampPrecision::Microsecond).declaration()
+        }
         SparkPrimitive::Decimal(decimal) => {
             catalog_decimal_to_exasol(decimal.precision().into(), decimal.scale().into())
         }
@@ -495,114 +411,76 @@ fn spark_primitive_to_exasol(primitive: &SparkPrimitive, engine: EngineTimestamp
         | SparkPrimitive::Binary
         | SparkPrimitive::Void
         | SparkPrimitive::IntervalYearMonth
-        | SparkPrimitive::IntervalDayTime => "VARCHAR(2000000)".to_string(),
+        | SparkPrimitive::IntervalDayTime => ExasolType::WIDEST_VARCHAR,
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExaTypeClass {
-    Character,
-    Date,
-    Decimal,
-    Other,
-}
-
-/// Matches the `"DECIMAL"` prefix, not `"DECIMAL("`, so a bare `DECIMAL` also classifies as
-/// Decimal.
-pub fn classify_exa_type(type_str: &str) -> ExaTypeClass {
-    if type_str.starts_with("VARCHAR") || type_str.starts_with("CHAR") {
-        ExaTypeClass::Character
-    } else if type_str.starts_with("DECIMAL") {
-        ExaTypeClass::Decimal
-    } else if type_str == "DATE" {
-        ExaTypeClass::Date
-    } else {
-        ExaTypeClass::Other
-    }
-}
-
-pub(crate) fn exasol_type_to_json(exasol_type: &str) -> Json {
-    let upper = exasol_type.to_uppercase();
-    if upper == "BOOLEAN" {
-        return json!({"type": "boolean"});
-    }
-    if upper == "DOUBLE PRECISION" {
-        return json!({"type": "double"});
-    }
-    if upper == "DATE" {
-        return json!({"type": "date"});
-    }
-    if upper == "TIMESTAMP" {
-        return json!({"type": "timestamp"});
-    }
-    if upper == "TIMESTAMP WITH LOCAL TIME ZONE" {
-        return json!({"type": "timestamp", "withLocalTimeZone": true});
-    }
-    if let Some(p) = upper
-        .strip_prefix("TIMESTAMP(")
-        .and_then(|rest| rest.strip_suffix(')'))
-        .and_then(|inner| inner.trim().parse::<u64>().ok())
-    {
-        return json!({"type": "timestamp", "fractionalSecondsPrecision": p});
-    }
-    if let Some((p, s)) = parse_decimal_args(&upper) {
+/// The inverse of [`exasol_type_from_json`] for every variant with a non-negative decimal scale.
+pub(crate) fn exasol_type_to_json(exasol_type: &ExasolType) -> Json {
+    match exasol_type {
+        ExasolType::Boolean => json!({"type": "boolean"}),
         // Signed on purpose: a negative Arrow scale must not wrap to a large unsigned value.
-        return json!({"type": "decimal", "precision": p, "scale": s});
+        ExasolType::Decimal { precision, scale } => {
+            json!({"type": "decimal", "precision": precision, "scale": scale})
+        }
+        ExasolType::DoublePrecision => json!({"type": "double"}),
+        ExasolType::Date => json!({"type": "date"}),
+        ExasolType::Timestamp { precision: None } => json!({"type": "timestamp"}),
+        ExasolType::Timestamp {
+            precision: Some(digits),
+        } => json!({"type": "timestamp", "fractionalSecondsPrecision": digits}),
+        ExasolType::TimestampWithLocalTimeZone => {
+            json!({"type": "timestamp", "withLocalTimeZone": true})
+        }
+        ExasolType::Char { size, ascii } => character_json("char", *size, *ascii),
+        ExasolType::Varchar { size, ascii } => character_json("varchar", *size, *ascii),
     }
-    let size = if let Some(inner) = upper
-        .strip_prefix("VARCHAR(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        inner.trim().parse::<u64>().unwrap_or(2000000)
-    } else {
-        2000000
-    };
-    json!({"type": "varchar", "size": size})
 }
 
-/// Exasol rejects `CHAR(2001)` and wider.
-const EXASOL_CHAR_MAX_SIZE: u64 = 2000;
+fn character_json(type_name: &str, size: u32, ascii: bool) -> Json {
+    let mut character = json!({"type": type_name, "size": size});
+    if ascii {
+        character["characterSet"] = json!("ASCII");
+    }
+    character
+}
 
-/// Exasol treats an unsuffixed character declaration as UTF8, so an `ASCII` column must carry
-/// the suffix back or its type check reports "Data type mismatch".
-fn character_set_suffix(dt: &Json) -> &'static str {
-    let is_ascii = dt
-        .get("characterSet")
+fn is_ascii_character_set(dt: &Json) -> bool {
+    dt.get("characterSet")
         .and_then(|v| v.as_str())
-        .is_some_and(|cs| cs.eq_ignore_ascii_case("ASCII"));
-    if is_ascii { " ASCII" } else { "" }
+        .is_some_and(|cs| cs.eq_ignore_ascii_case("ASCII"))
 }
 
-pub(crate) fn exasol_type_from_json(dt: &Json) -> String {
+pub(crate) fn exasol_type_from_json(dt: &Json) -> ExasolType {
     let type_name = dt.get("type").and_then(|t| t.as_str()).unwrap_or("varchar");
     match type_name.to_lowercase().as_str() {
-        "boolean" => "BOOLEAN".to_string(),
+        "boolean" => ExasolType::Boolean,
         "decimal" => {
             let p = dt.get("precision").and_then(|v| v.as_u64()).unwrap_or(18);
             let s = dt.get("scale").and_then(|v| v.as_u64()).unwrap_or(0);
             if p <= 36 && s <= 36 {
-                format!("DECIMAL({p},{s})")
+                decimal(p as u8, s as i8)
             } else {
-                "VARCHAR(2000000)".to_string()
+                ExasolType::WIDEST_VARCHAR
             }
         }
-        "double" => "DOUBLE PRECISION".to_string(),
-        "date" => "DATE".to_string(),
+        "double" => ExasolType::DoublePrecision,
+        "date" => ExasolType::Date,
         "timestamp" => {
             let with_local_time_zone = dt
                 .get("withLocalTimeZone")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if with_local_time_zone {
-                "TIMESTAMP WITH LOCAL TIME ZONE".to_string()
+                ExasolType::TimestampWithLocalTimeZone
             } else {
-                match dt
+                let precision = dt
                     .get("fractionalSecondsPrecision")
                     .and_then(|v| v.as_u64())
-                {
-                    Some(p) => format!("TIMESTAMP({p})"),
-                    None => "TIMESTAMP".to_string(),
-                }
+                    // Saturates, so an out-of-range precision stays a declaration Exasol rejects
+                    // and never reads as bare TIMESTAMP.
+                    .map(|digits| u8::try_from(digits).unwrap_or(u8::MAX));
+                ExasolType::Timestamp { precision }
             }
         }
         "char" => {
@@ -610,17 +488,22 @@ pub(crate) fn exasol_type_from_json(dt: &Json) -> String {
             // VARCHAR(n) is rejected (#192). A missing size must not default to CHAR(2000),
             // which would blank-pad every value.
             match dt.get("size").and_then(|v| v.as_u64()) {
-                Some(size) => {
-                    let capped = size.min(EXASOL_CHAR_MAX_SIZE);
-                    format!("CHAR({capped}){}", character_set_suffix(dt))
-                }
-                None => "VARCHAR(2000000)".to_string(),
+                Some(size) => ExasolType::Char {
+                    size: size.min(MAX_CHAR_SIZE.into()) as u32,
+                    ascii: is_ascii_character_set(dt),
+                },
+                None => ExasolType::WIDEST_VARCHAR,
             }
         }
         _ => {
-            let size = dt.get("size").and_then(|v| v.as_u64()).unwrap_or(2000000);
-            let capped = size.min(2000000);
-            format!("VARCHAR({capped}){}", character_set_suffix(dt))
+            let size = dt
+                .get("size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(MAX_VARCHAR_SIZE.into());
+            ExasolType::Varchar {
+                size: size.min(MAX_VARCHAR_SIZE.into()) as u32,
+                ascii: is_ascii_character_set(dt),
+            }
         }
     }
 }

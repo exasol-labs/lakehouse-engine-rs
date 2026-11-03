@@ -1,5 +1,5 @@
 use super::super::super::support::collect_all_column_names;
-use super::super::planning::JoinLeaf;
+use super::super::planning::{JoinLeaf, involved_table};
 use super::super::sql_builders::{
     JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql, build_side_fan_out_sql,
     render_broadcast_join,
@@ -9,9 +9,11 @@ use super::super::tests::{
     resolved_side, two_scan_tuning,
 };
 use super::*;
-use crate::adapter::pushdown::support::{ColumnTypes, apply_type_rewrites};
+use crate::adapter::pushdown::ProjectedColumn;
+use crate::adapter::pushdown::support::apply_type_rewrites;
 use crate::adapter::pushdown::test_support::*;
 use crate::scan::spec::ColumnRef;
+use crate::types::exasol_type::ExasolType;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
 
 /// One unaliased leg per name, in FROM-tree order.
@@ -57,10 +59,9 @@ fn join_condition_renders_via_translator() {
     let request = join_request(Json::Null, equi_condition());
     let detected = detected_join(&request);
     let rendered = render_broadcast_join(
-        &request,
         &pd(&request),
         &detected,
-        &BinaryColumns::default(),
+        &request_sides(&request, &detected),
     )
     .expect("renderable join")
     .expect("an equi-join must render, not decline");
@@ -85,10 +86,9 @@ fn join_where_filter_spanning_both_sides_renders() {
 
     let detected = detected_join(&request);
     let rendered = render_broadcast_join(
-        &request,
         &pd(&request),
         &detected,
-        &BinaryColumns::default(),
+        &request_sides(&request, &detected),
     )
     .expect("renderable join")
     .expect("must render");
@@ -124,7 +124,13 @@ fn join_projection_emits_attribute_each_side_owning_type() {
     );
     assert_eq!(
         types,
-        vec!["VARCHAR(100)".to_string(), "DATE".to_string()],
+        vec![
+            ExasolType::Varchar {
+                size: 100,
+                ascii: false
+            },
+            ExasolType::Date
+        ],
         "each column's EMITS type comes from the side that owns it"
     );
 }
@@ -199,8 +205,8 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
         }
     ]);
     let (projection, _types, _widened) = broadcast_projection(&decline_request);
-    let expected_full_row_len = involved_table_columns(&decline_request, "CUSTOMER").len()
-        + involved_table_columns(&decline_request, "ORDERS").len();
+    let expected_full_row_len = involved_table(&decline_request, "CUSTOMER").types.len()
+        + involved_table(&decline_request, "ORDERS").types.len();
     assert_eq!(
         projection.len(),
         expected_full_row_len,
@@ -256,8 +262,8 @@ fn join_projection_like_guard_reaches_join_select_list() {
          fallback; a DECIMAL-subject LIKE must set it: \
          {projection:?}"
     );
-    let expected_full_row_len = involved_table_columns(&decline_request, "CUSTOMER").len()
-        + involved_table_columns(&decline_request, "ORDERS").len();
+    let expected_full_row_len = involved_table(&decline_request, "CUSTOMER").types.len()
+        + involved_table(&decline_request, "ORDERS").types.len();
     assert_eq!(
         projection.len(),
         expected_full_row_len,
@@ -548,12 +554,12 @@ fn join_side_pruning_input_unchanged_when_df_render_declines() {
     );
 }
 
-fn customer_col_types() -> Vec<(String, String)> {
-    involved_table_columns(&join_request(Json::Null, equi_condition()), "CUSTOMER")
+fn customer_col_types() -> Vec<(String, ExasolType)> {
+    involved_table(&join_request(Json::Null, equi_condition()), "CUSTOMER").types
 }
 
-fn orders_col_types() -> Vec<(String, String)> {
-    involved_table_columns(&join_request(Json::Null, equi_condition()), "ORDERS")
+fn orders_col_types() -> Vec<(String, ExasolType)> {
+    involved_table(&join_request(Json::Null, equi_condition()), "ORDERS").types
 }
 
 fn like_over(column: &str, table: &str, pattern: &str) -> Json {
@@ -584,7 +590,7 @@ fn type_screened_leg_filter_pushes_whole_accepted_set_rewritten() {
     ]);
 
     let (leg, declined) =
-        type_screened_leg_filter(&filter, &orders_col_types(), &BinaryColumns::default());
+        type_screened_leg_filter(&filter, &column_types(&orders_col_types(), &[]));
 
     assert!(
         declined.is_none(),
@@ -609,7 +615,7 @@ fn type_screened_leg_filter_declines_whole_set_when_no_conjunct_survives() {
     let filter = and_of(vec![decimal_like.clone(), orders_local_declined_conjunct()]);
 
     let (leg, declined) =
-        type_screened_leg_filter(&filter, &orders_col_types(), &BinaryColumns::default());
+        type_screened_leg_filter(&filter, &column_types(&orders_col_types(), &[]));
 
     assert!(
         leg.is_none(),
@@ -654,7 +660,7 @@ fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
     for (label, filter) in cases {
         let input = conjunct_count(Some(&filter));
         let (leg, declined) =
-            type_screened_leg_filter(&filter, &orders_col_types(), &BinaryColumns::default());
+            type_screened_leg_filter(&filter, &column_types(&orders_col_types(), &[]));
         assert_eq!(
             conjunct_count(leg.as_ref()) + conjunct_count(declined.as_ref()),
             input,
@@ -671,8 +677,7 @@ fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
         }
     }
 
-    let (leg, declined) =
-        type_screened_leg_filter(&mixed, &orders_col_types(), &BinaryColumns::default());
+    let (leg, declined) = type_screened_leg_filter(&mixed, &column_types(&orders_col_types(), &[]));
     let leg_sql = render_df_filter_safe(&leg.expect("the two accepted conjuncts form a leg"))
         .expect("the rewritten accepted set must render for DataFusion");
     assert!(
@@ -702,7 +707,7 @@ fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
         "right": num_lit(1)
     });
 
-    let rewritten = apply_type_rewrites(&filter, &ColumnTypes::unqualified(&col_types))
+    let rewritten = apply_type_rewrites(&filter, &column_types(&col_types, &[]))
         .expect("precondition: the type pipeline ACCEPTS this tree");
     assert!(
         rewritten.to_string().contains("decimal_to_varchar_exasol"),
@@ -713,7 +718,7 @@ fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
         "precondition: the REWRITTEN tree still does not render for DataFusion"
     );
 
-    let (leg, declined) = type_screened_leg_filter(&filter, &col_types, &BinaryColumns::default());
+    let (leg, declined) = type_screened_leg_filter(&filter, &column_types(&col_types, &[]));
 
     assert!(
         leg.is_none(),
@@ -742,8 +747,7 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
 
     let (date_leg, date_declined) = type_screened_leg_filter(
         &filter,
-        &involved_table_columns(&request, "DATED"),
-        &BinaryColumns::default(),
+        &column_types(&involved_table(&request, "DATED").types, &[]),
     );
     let date_sql = render_df_filter_safe(
         &date_leg.expect("the DATE side accepts the LIKE through the CAST rewrite"),
@@ -760,8 +764,7 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
 
     let (numeric_leg, numeric_declined) = type_screened_leg_filter(
         &filter,
-        &involved_table_columns(&request, "NUMBERED"),
-        &BinaryColumns::default(),
+        &column_types(&involved_table(&request, "NUMBERED").types, &[]),
     );
     assert!(
         numeric_leg.is_none(),
@@ -786,22 +789,63 @@ fn referenced_leg_columns_narrows_to_used_columns() {
         table_col("ORDERS", "O_CUSTKEY"),
     );
     let full = vec![
-        ("C_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string()),
-        ("C_NAME".to_string(), "VARCHAR(100)".to_string()),
-        ("C_ADDRESS".to_string(), "VARCHAR(100)".to_string()),
-        ("C_PHONE".to_string(), "VARCHAR(20)".to_string()),
+        (
+            "C_CUSTKEY".to_string(),
+            ExasolType::Decimal {
+                precision: 20,
+                scale: 0,
+            },
+        ),
+        (
+            "C_NAME".to_string(),
+            ExasolType::Varchar {
+                size: 100,
+                ascii: false,
+            },
+        ),
+        (
+            "C_ADDRESS".to_string(),
+            ExasolType::Varchar {
+                size: 100,
+                ascii: false,
+            },
+        ),
+        (
+            "C_PHONE".to_string(),
+            ExasolType::Varchar {
+                size: 20,
+                ascii: false,
+            },
+        ),
     ];
-    let narrowed =
-        referenced_leg_columns(&pushdown_req, &condition, &customer_orders_legs(), 0, &full);
-    let names: Vec<&str> = narrowed.iter().map(|(n, _)| n.as_str()).collect();
+    let narrowed = referenced_leg_columns(
+        &pushdown_req,
+        &condition,
+        &customer_orders_legs(),
+        0,
+        &column_types(&full, &[]),
+    );
+    let names: Vec<&str> = narrowed
+        .iter()
+        .map(|(column, _)| column.name.as_str())
+        .collect();
     assert_eq!(
         names,
         vec!["C_CUSTKEY", "C_NAME", "C_ADDRESS"],
         "narrows to condition + select + filter columns, in full-column order, dropping C_PHONE"
     );
     assert_eq!(
-        narrowed[1],
-        ("C_NAME".to_string(), "VARCHAR(100)".to_string())
+        narrowed
+            .iter()
+            .nth(1)
+            .map(|(column, column_type)| (column.name.as_str(), column_type.exa_type)),
+        Some((
+            "C_NAME",
+            ExasolType::Varchar {
+                size: 100,
+                ascii: false
+            }
+        ))
     );
 }
 
@@ -812,18 +856,31 @@ fn referenced_leg_columns_keeps_all_when_select_list_absent() {
         table_col("ORDERS", "O_CUSTKEY"),
     );
     let full = vec![
-        ("C_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string()),
-        ("C_NAME".to_string(), "VARCHAR(100)".to_string()),
+        (
+            "C_CUSTKEY".to_string(),
+            ExasolType::Decimal {
+                precision: 20,
+                scale: 0,
+            },
+        ),
+        (
+            "C_NAME".to_string(),
+            ExasolType::Varchar {
+                size: 100,
+                ascii: false,
+            },
+        ),
     ];
     let narrowed = referenced_leg_columns(
         &serde_json::json!({}),
         &condition,
         &customer_orders_legs(),
         0,
-        &full,
+        &column_types(&full, &[]),
     );
     assert_eq!(
-        narrowed, full,
+        narrowed,
+        column_types(&full, &[]),
         "an absent select list ⇒ SELECT *, keep every column"
     );
 }
@@ -835,18 +892,31 @@ fn referenced_leg_columns_keeps_all_when_narrowing_empty() {
     });
     let condition = equi_condition();
     let full = vec![
-        ("L_ORDERKEY".to_string(), "DECIMAL(20,0)".to_string()),
-        ("L_QUANTITY".to_string(), "DECIMAL(18,2)".to_string()),
+        (
+            "L_ORDERKEY".to_string(),
+            ExasolType::Decimal {
+                precision: 20,
+                scale: 0,
+            },
+        ),
+        (
+            "L_QUANTITY".to_string(),
+            ExasolType::Decimal {
+                precision: 18,
+                scale: 2,
+            },
+        ),
     ];
     let narrowed = referenced_leg_columns(
         &pushdown_req,
         &condition,
         &legs_of(&["CUSTOMER", "ORDERS", "LINEITEM"]),
         2,
-        &full,
+        &column_types(&full, &[]),
     );
     assert_eq!(
-        narrowed, full,
+        narrowed,
+        column_types(&full, &[]),
         "no clause references a LINEITEM column ⇒ keep every column rather than \
          emit a zero-column leg"
     );
@@ -881,8 +951,14 @@ fn column_collectors_keep_divergent_case_folding() {
 fn side_fan_out_pushes_bare_side_local_filter_into_common_blob() {
     let side = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]);
     let cols = vec![
-        ("O_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string()),
-        ("O_ORDERDATE".to_string(), "DATE".to_string()),
+        (
+            "O_CUSTKEY".to_string(),
+            ExasolType::Decimal {
+                precision: 20,
+                scale: 0,
+            },
+        ),
+        ("O_ORDERDATE".to_string(), ExasolType::Date),
     ];
     let filter = serde_json::json!({
         "type": "predicate_greater",
@@ -892,7 +968,7 @@ fn side_fan_out_pushes_bare_side_local_filter_into_common_blob() {
 
     let sql_with = build_side_fan_out_sql(
         &side,
-        &cols,
+        &column_types(&cols, &[]),
         Some(&filter),
         &two_scan_tuning(),
         "SCAN",
@@ -909,9 +985,15 @@ fn side_fan_out_pushes_bare_side_local_filter_into_common_blob() {
         "the fan-out filter MUST be bare (alias stripped), never alias-qualified: {common}"
     );
 
-    let sql_without =
-        build_side_fan_out_sql(&side, &cols, None, &two_scan_tuning(), "SCAN", "DISTRIBUTE")
-            .expect("selecting the wire storage must succeed");
+    let sql_without = build_side_fan_out_sql(
+        &side,
+        &column_types(&cols, &[]),
+        None,
+        &two_scan_tuning(),
+        "SCAN",
+        "DISTRIBUTE",
+    )
+    .expect("selecting the wire storage must succeed");
     let common_none = common_arg_literal(&sql_without);
     assert!(
         !common_none.contains("\"filter\""),
@@ -925,14 +1007,27 @@ fn side_fan_out_routes_through_distributor_scalar_scan_no_wrapper() {
         "ORDERS",
         vec![("s3://w/o-0.parquet", 100), ("s3://w/o-1.parquet", 100)],
     );
-    let cols = vec![("O_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string())];
+    let cols = vec![(
+        "O_CUSTKEY".to_string(),
+        ExasolType::Decimal {
+            precision: 20,
+            scale: 0,
+        },
+    )];
     let tuning = JoinScanRequestConfig {
         cluster_nodes: 2,
         parallelism_factor: 1,
         ..two_scan_tuning()
     };
-    let sql = build_side_fan_out_sql(&side, &cols, None, &tuning, "SCAN", "DISTRIBUTE")
-        .expect("selecting the wire storage must succeed");
+    let sql = build_side_fan_out_sql(
+        &side,
+        &column_types(&cols, &[]),
+        None,
+        &tuning,
+        "SCAN",
+        "DISTRIBUTE",
+    )
+    .expect("selecting the wire storage must succeed");
 
     assert!(
         !sql.contains("SELECT * FROM ("),
@@ -959,10 +1054,13 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
     let sides = broadcast_sides(fact, dimension, 1);
     let rendered = rendered_join(
         r#""LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY""#,
-        &[(
-            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "L_ORDERKEY")),
-            "DECIMAL(20,0)",
-        )],
+        &[ProjectedColumn {
+            item: ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "L_ORDERKEY")),
+            exa_type: ExasolType::Decimal {
+                precision: 20,
+                scale: 0,
+            },
+        }],
     );
     let tuning = JoinScanRequestConfig {
         cluster_nodes: 2,
@@ -997,10 +1095,9 @@ fn render_broadcast_join_replaces_native_table_alias_in_filter_with_leg_alias() 
     });
     let detected = detected_join(&request);
     let rendered = render_broadcast_join(
-        &request,
         &pd(&request),
         &detected,
-        &BinaryColumns::default(),
+        &request_sides(&request, &detected),
     )
     .expect("renders")
     .expect("an equi-join renders");
@@ -1024,10 +1121,9 @@ fn render_broadcast_join_replaces_native_table_alias_in_condition_with_leg_alias
     let request = join_request(Json::Null, condition);
     let detected = detected_join(&request);
     let rendered = render_broadcast_join(
-        &request,
         &pd(&request),
         &detected,
-        &BinaryColumns::default(),
+        &request_sides(&request, &detected),
     )
     .expect("renderable join")
     .expect("an equi-join must render, not decline");
@@ -1048,15 +1144,14 @@ fn render_broadcast_join_replaces_native_table_alias_in_projection_with_leg_alia
     ]);
     let detected = detected_join(&request);
     let rendered = render_broadcast_join(
-        &request,
         &pd(&request),
         &detected,
-        &BinaryColumns::default(),
+        &request_sides(&request, &detected),
     )
     .expect("renders")
     .expect("an equi-join renders");
     assert_eq!(rendered.projection.len(), 1, "{:?}", rendered.projection);
-    match &rendered.projection[0] {
+    match &rendered.projection[0].item {
         ProjectionItem::Expr { expr } => {
             assert_eq!(expr, r#"("LHS_T1"."O_CUSTKEY" * 2)"#);
         }
@@ -1101,10 +1196,9 @@ fn unified_join_prunes_and_narrows_each_leg() {
         resolved_side("ORDERS", vec![("s3://w/o.parquet", 100)]),
     ];
     let sql = build_n_scan_join_sql(
-        &request,
         &pd(&request),
         &detected,
-        &sides,
+        &request_typed(&request, &sides),
         &two_scan_tuning(),
         "SCAN",
         "DISTRIBUTE",
@@ -1144,33 +1238,22 @@ fn unified_join_prunes_and_narrows_each_leg() {
 #[test]
 fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
     let c_name = [nullable_field("c_name", "binary")];
-    let c_name_is_binary = BinaryColumns::of(&c_name, false);
-    let legs_c_name_is_binary = BinaryColumns::per_relation(
-        [
-            ("LHS_T0".to_string(), &c_name[..]),
-            ("LHS_T1".to_string(), &[][..]),
-        ],
-        false,
-    );
     let filter = predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("0a1b"));
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = filter.clone();
+    let detected = detected_join(&request);
+    let mut sides = request_sides(&request, &detected);
+    sides[0].column_types = column_types(&involved_table(&request, "CUSTOMER").types, &c_name);
 
-    let rendered = render_broadcast_join(
-        &request,
-        &pd(&request),
-        &detected_join(&request),
-        &legs_c_name_is_binary,
-    )
-    .expect("renderable join")
-    .expect("must render");
+    let rendered = render_broadcast_join(&pd(&request), &detected, &sides)
+        .expect("renderable join")
+        .expect("must render");
     assert_eq!(
         rendered.filter.as_deref(),
         Some(r#"("LHS_T0"."_LH_BYTES_C_NAME" = X'0a1b')"#)
     );
 
-    let customer = involved_table_columns(&request, "CUSTOMER");
-    let (leg, declined) = type_screened_leg_filter(&filter, &customer, &c_name_is_binary);
+    let (leg, declined) = type_screened_leg_filter(&filter, &sides[0].column_types);
     assert!(declined.is_none(), "{declined:?}");
     assert_eq!(
         render_df_filter_safe(&leg.expect("the leg takes the comparison")).as_deref(),

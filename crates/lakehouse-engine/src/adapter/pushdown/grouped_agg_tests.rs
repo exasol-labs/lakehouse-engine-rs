@@ -11,52 +11,6 @@ use crate::scan::spec::{CommonScanSpec, ScanStorage};
 use crate::scan::test_support::WithFiles;
 
 #[test]
-fn sum_emit_type_absent_scale_widens_to_a_scale_zero_decimal() {
-    assert_eq!(sum_emit_type("DECIMAL(10)"), "DECIMAL(36,0)");
-}
-
-#[test]
-fn sum_emit_type_never_echoes_a_non_canonical_scale_text() {
-    // `None` = the parser rejects the text, so the answer is the numeric fallback.
-    let non_canonical: &[(&str, Option<&str>)] = &[
-        (" 2", Some("DECIMAL(36,2)")),
-        ("2 ", Some("DECIMAL(36,2)")),
-        ("+2", Some("DECIMAL(36,2)")),
-        ("02", Some("DECIMAL(36,2)")),
-        ("-02", Some("DECIMAL(36,-2)")),
-        ("X", None),
-        ("2,3", None),
-        ("200", None),
-        ("", None),
-    ];
-    for (raw_scale, canonical) in non_canonical {
-        let answer = sum_emit_type(&format!("DECIMAL(10,{raw_scale})"));
-        assert_ne!(
-            answer,
-            format!("DECIMAL(36,{raw_scale})"),
-            "a non-canonical scale text must never be echoed verbatim"
-        );
-        assert_eq!(
-            answer,
-            canonical.unwrap_or("DOUBLE PRECISION"),
-            "wrong answer for scale text {raw_scale:?}"
-        );
-    }
-}
-
-#[test]
-fn sum_emit_type_declines_every_precision_the_parser_rejects() {
-    for rejected_precision in ["300", "256", "-1", "X", "", " "] {
-        assert_eq!(
-            sum_emit_type(&format!("DECIMAL({rejected_precision},2)")),
-            "DOUBLE PRECISION",
-            "precision {rejected_precision:?} is rejected by the parser, so the \
-                 aggregate must fall back rather than borrow a DECIMAL(36,…) width"
-        );
-    }
-}
-
-#[test]
 fn scalar_over_merge_casts_to_exasol_char_target() {
     let sum_node = serde_json::json!({
         "type": "function_aggregate", "name": "SUM", "distinct": false,
@@ -151,10 +105,13 @@ fn partial_emits_min_max_preserve_date_timestamp_type() {
         },
     ];
     let col_types = vec![
-        ("EVENT_DATE".to_string(), "DATE".to_string()),
-        ("EVENT_TS".to_string(), "TIMESTAMP".to_string()),
+        ("EVENT_DATE".to_string(), ExasolType::Date),
+        (
+            "EVENT_TS".to_string(),
+            ExasolType::Timestamp { precision: None },
+        ),
     ];
-    let emits = partial_emits_items(&plans, &col_types, &[]);
+    let emits = partial_emits_items(&plans, &column_types(&col_types, &[]), &[]);
     assert!(
         emits[0].contains("DATE") && !emits[0].contains("DOUBLE"),
         "MIN over DATE must emit DATE, not DOUBLE: {:?}",
@@ -174,8 +131,14 @@ fn partial_emits_sum_integer_stays_decimal() {
         column: Some("AMOUNT".into()),
         arg_expr: None,
     }];
-    let col_types = vec![("AMOUNT".to_string(), "DECIMAL(20,0)".to_string())];
-    let emits = partial_emits_items(&plans, &col_types, &[]);
+    let col_types = vec![(
+        "AMOUNT".to_string(),
+        ExasolType::Decimal {
+            precision: 20,
+            scale: 0,
+        },
+    )];
+    let emits = partial_emits_items(&plans, &column_types(&col_types, &[]), &[]);
     assert!(
         emits[0].contains("DECIMAL") && !emits[0].contains("DOUBLE"),
         "SUM over DECIMAL integer must emit DECIMAL, not DOUBLE: {:?}",
@@ -195,8 +158,8 @@ fn partial_emits_sum_double_stays_double() {
         column: Some("SCORE".into()),
         arg_expr: None,
     }];
-    let col_types = vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
-    let emits = partial_emits_items(&plans, &col_types, &[]);
+    let col_types = vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
+    let emits = partial_emits_items(&plans, &column_types(&col_types, &[]), &[]);
     assert!(
         emits[0].contains("DOUBLE PRECISION"),
         "SUM over DOUBLE must emit DOUBLE PRECISION: {:?}",
@@ -206,25 +169,25 @@ fn partial_emits_sum_double_stays_double() {
 
 #[test]
 fn aggregate_falls_back_to_row_scan_for_sum_of_non_numeric() {
-    let col_types_varchar = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
+    let col_types_varchar = vec![("NAME".to_string(), ExasolType::WIDEST_VARCHAR)];
     let sum_varchar = vec![AggregatePlan {
         kind: AggKind::Sum,
         column: Some("NAME".into()),
         arg_expr: None,
     }];
     assert!(
-        !validate_agg_col_types(&sum_varchar, &col_types_varchar),
+        !validate_agg_col_types(&sum_varchar, &column_types(&col_types_varchar, &[])),
         "SUM over VARCHAR must fail validation (fall back to row scan)"
     );
 
-    let col_types_date = vec![("EVENT_DATE".to_string(), "DATE".to_string())];
+    let col_types_date = vec![("EVENT_DATE".to_string(), ExasolType::Date)];
     let sum_date = vec![AggregatePlan {
         kind: AggKind::Sum,
         column: Some("EVENT_DATE".into()),
         arg_expr: None,
     }];
     assert!(
-        !validate_agg_col_types(&sum_date, &col_types_date),
+        !validate_agg_col_types(&sum_date, &column_types(&col_types_date, &[])),
         "SUM over DATE must fail validation (fall back to row scan)"
     );
 }
@@ -248,29 +211,29 @@ fn grouped_aggregate_sum_over_varchar_falls_back_via_type_validation() {
     let agg_plans = detected.unwrap().plans;
 
     let col_types = vec![
-        ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
-        ("NAME".to_string(), "VARCHAR(2000000)".to_string()),
+        ("REGION".to_string(), ExasolType::WIDEST_VARCHAR),
+        ("NAME".to_string(), ExasolType::WIDEST_VARCHAR),
     ];
     assert!(
-        !validate_agg_col_types(&agg_plans, &col_types),
+        !validate_agg_col_types(&agg_plans, &column_types(&col_types, &[])),
         "validate_agg_col_types must fail for SUM over VARCHAR (fall back to row scan)"
     );
 
     let col_types_date = vec![
-        ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
-        ("NAME".to_string(), "DATE".to_string()),
+        ("REGION".to_string(), ExasolType::WIDEST_VARCHAR),
+        ("NAME".to_string(), ExasolType::Date),
     ];
     assert!(
-        !validate_agg_col_types(&agg_plans, &col_types_date),
+        !validate_agg_col_types(&agg_plans, &column_types(&col_types_date, &[])),
         "validate_agg_col_types must fail for SUM over DATE (fall back to row scan)"
     );
 
     let col_types_numeric = vec![
-        ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
-        ("NAME".to_string(), "DOUBLE PRECISION".to_string()),
+        ("REGION".to_string(), ExasolType::WIDEST_VARCHAR),
+        ("NAME".to_string(), ExasolType::DoublePrecision),
     ];
     assert!(
-        validate_agg_col_types(&agg_plans, &col_types_numeric),
+        validate_agg_col_types(&agg_plans, &column_types(&col_types_numeric, &[])),
         "validate_agg_col_types must pass for SUM over DOUBLE PRECISION"
     );
 }
@@ -408,7 +371,16 @@ fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
         &result.select_items,
         None,
         0,
-        &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
+        &column_types(
+            &[(
+                "ID",
+                ExasolType::Decimal {
+                    precision: 20,
+                    scale: 0,
+                },
+            )],
+            &[],
+        ),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         None,
@@ -575,7 +547,16 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
         &result.select_items,
         None,
         0,
-        &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
+        &column_types(
+            &[(
+                "ID",
+                ExasolType::Decimal {
+                    precision: 20,
+                    scale: 0,
+                },
+            )],
+            &[],
+        ),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         None,
@@ -780,9 +761,12 @@ fn detect_group_by_all_expression_multi_key() {
         result.select_items
     );
 
-    let col_types: Vec<(String, String)> = vec![];
-    let group_key_types = vec!["VARCHAR(2000000)".to_string(); 2];
-    let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
+    let col_types: Vec<(String, ExasolType)> = vec![];
+    let group_key_types = vec![ExasolType::WIDEST_VARCHAR; 2];
+    let aggregate_types = vec![ExasolType::Decimal {
+        precision: 18,
+        scale: 0,
+    }];
     let spec_template = CommonScanSpec {
         aggregates: Some(result.plans.clone()),
         group_keys: Some(result.group_keys.clone()),
@@ -801,7 +785,7 @@ fn detect_group_by_all_expression_multi_key() {
         &result.select_items,
         None,
         0,
-        &col_types,
+        &column_types(&col_types, &[]),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         None,
@@ -858,9 +842,9 @@ fn build_grouped_agg_sql(
     files: Vec<String>,
     g: usize,
 ) -> String {
-    let col_types: Vec<(String, String)> = vec![
-        ("AMOUNT".to_string(), "DOUBLE PRECISION".to_string()),
-        ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
+    let col_types: Vec<(String, ExasolType)> = vec![
+        ("AMOUNT".to_string(), ExasolType::DoublePrecision),
+        ("SCORE".to_string(), ExasolType::DoublePrecision),
     ];
     let spec_template = CommonScanSpec {
         aggregates: Some(agg_plans.clone()),
@@ -883,7 +867,7 @@ fn build_grouped_agg_sql(
         &select_items,
         None,
         0,
-        &col_types,
+        &column_types(&col_types, &[]),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         None,
@@ -1008,7 +992,7 @@ fn grouped_single_shard_short_circuits_distributor() {
 fn grouped_common_blob_has_no_limit() {
     let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
     let g = shard_count(1, 1, files.len());
-    let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
+    let col_types = vec![("AMOUNT".to_string(), ExasolType::DoublePrecision)];
     let spec_template = CommonScanSpec {
         limit: Some(100),
         aggregates: Some(vec![AggregatePlan {
@@ -1036,7 +1020,7 @@ fn grouped_common_blob_has_no_limit() {
         &keys_first_select_items(1, 1),
         Some(100),
         0,
-        &col_types,
+        &column_types(&col_types, &[]),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         None,
@@ -1057,7 +1041,7 @@ fn grouped_common_blob_has_no_limit() {
 fn grouped_merge_offset_never_reaches_per_shard_spec() {
     let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
     let g = shard_count(1, 1, files.len());
-    let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
+    let col_types = vec![("AMOUNT".to_string(), ExasolType::DoublePrecision)];
     let spec_template = CommonScanSpec {
         limit: Some(100),
         aggregates: Some(vec![AggregatePlan {
@@ -1085,7 +1069,7 @@ fn grouped_merge_offset_never_reaches_per_shard_spec() {
         &keys_first_select_items(1, 1),
         Some(100),
         3,
-        &col_types,
+        &column_types(&col_types, &[]),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         None,
@@ -1106,7 +1090,7 @@ fn grouped_merge_offset_never_reaches_per_shard_spec() {
 fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
     let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
     let g = shard_count(1, 1, files.len());
-    let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
+    let col_types = vec![("AMOUNT".to_string(), ExasolType::DoublePrecision)];
     let spec_template = CommonScanSpec {
         limit: Some(100),
         aggregates: Some(vec![AggregatePlan {
@@ -1134,7 +1118,7 @@ fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
         &keys_first_select_items(1, 1),
         Some(100),
         0,
-        &col_types,
+        &column_types(&col_types, &[]),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         None,
@@ -1176,7 +1160,16 @@ fn grouped_merge_renders_limit_offset_in_clause_order() {
         &result.select_items,
         Some(2),
         1,
-        &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
+        &column_types(
+            &[(
+                "ID",
+                ExasolType::Decimal {
+                    precision: 20,
+                    scale: 0,
+                },
+            )],
+            &[],
+        ),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         None,
@@ -1286,15 +1279,15 @@ fn outer_select_items(sql: &str) -> Vec<String> {
 
 fn build_grouped_agg_sql_with_select_items(
     group_keys: Vec<String>,
-    group_key_types: Vec<String>,
+    group_key_types: Vec<ExasolType>,
     agg_plans: Vec<AggregatePlan>,
-    aggregate_types: Vec<String>,
+    aggregate_types: Vec<ExasolType>,
     select_items: Vec<GroupedSelectItem>,
     having: Option<&str>,
 ) -> String {
-    let col_types: Vec<(String, String)> = vec![
-        ("AMOUNT".to_string(), "DOUBLE PRECISION".to_string()),
-        ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
+    let col_types: Vec<(String, ExasolType)> = vec![
+        ("AMOUNT".to_string(), ExasolType::DoublePrecision),
+        ("SCORE".to_string(), ExasolType::DoublePrecision),
     ];
     let spec_template = CommonScanSpec {
         aggregates: Some(agg_plans.clone()),
@@ -1314,7 +1307,7 @@ fn build_grouped_agg_sql_with_select_items(
         &select_items,
         None,
         0,
-        &col_types,
+        &column_types(&col_types, &[]),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         having,
@@ -1326,13 +1319,16 @@ fn build_grouped_agg_sql_with_select_items(
 fn grouped_wrapper_agg_before_key_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
         vec![r#"("ID" % 4)"#.to_string()],
-        vec!["DECIMAL(9,0)".to_string()],
+        vec![ExasolType::Decimal {
+            precision: 9,
+            scale: 0,
+        }],
         vec![AggregatePlan {
             kind: AggKind::Sum,
             column: Some("SCORE".into()),
             arg_expr: None,
         }],
-        vec!["DOUBLE PRECISION".to_string()],
+        vec![ExasolType::DoublePrecision],
         vec![
             GroupedSelectItem::Aggregate {
                 plan_slot: 0,
@@ -1365,13 +1361,22 @@ fn grouped_wrapper_agg_before_key_ordering() {
 fn grouped_wrapper_interleaved_multi_key_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
         vec![r#""REGION""#.to_string(), r#""YEAR""#.to_string()],
-        vec!["VARCHAR(100)".to_string(), "DECIMAL(4,0)".to_string()],
+        vec![
+            ExasolType::Varchar {
+                size: 100,
+                ascii: false,
+            },
+            ExasolType::Decimal {
+                precision: 4,
+                scale: 0,
+            },
+        ],
         vec![AggregatePlan {
             kind: AggKind::Sum,
             column: Some("SCORE".into()),
             arg_expr: None,
         }],
-        vec!["DOUBLE PRECISION".to_string()],
+        vec![ExasolType::DoublePrecision],
         vec![
             GroupedSelectItem::GroupKey {
                 group_key_slot: 0,
@@ -1412,13 +1417,19 @@ fn grouped_wrapper_interleaved_multi_key_ordering() {
 fn grouped_wrapper_expr_key_after_agg_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
         vec![r#"("ID" % 4)"#.to_string()],
-        vec!["DECIMAL(9,0)".to_string()],
+        vec![ExasolType::Decimal {
+            precision: 9,
+            scale: 0,
+        }],
         vec![AggregatePlan {
             kind: AggKind::Count,
             column: None,
             arg_expr: None,
         }],
-        vec!["DECIMAL(18,0)".to_string()],
+        vec![ExasolType::Decimal {
+            precision: 18,
+            scale: 0,
+        }],
         vec![
             GroupedSelectItem::Aggregate {
                 plan_slot: 0,
@@ -1447,13 +1458,16 @@ fn grouped_wrapper_expr_key_after_agg_ordering() {
 fn grouped_wrapper_agg_first_with_having_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
         vec![r#"("ID" % 4)"#.to_string()],
-        vec!["DECIMAL(9,0)".to_string()],
+        vec![ExasolType::Decimal {
+            precision: 9,
+            scale: 0,
+        }],
         vec![AggregatePlan {
             kind: AggKind::Sum,
             column: Some("SCORE".into()),
             arg_expr: None,
         }],
-        vec!["DOUBLE PRECISION".to_string()],
+        vec![ExasolType::DoublePrecision],
         vec![
             GroupedSelectItem::Aggregate {
                 plan_slot: 0,
@@ -1516,14 +1530,23 @@ fn round_pct_over_aggregates() -> serde_json::Value {
     })
 }
 
-fn soa_col_types() -> Vec<(String, String)> {
+fn soa_col_types() -> Vec<(String, ExasolType)> {
     vec![
-        ("L_RETURNFLAG".to_string(), "VARCHAR(1)".to_string()),
-        ("L_QUANTITY".to_string(), "DECIMAL(36,2)".to_string()),
         (
-            "L_EXTENDEDPRICE".to_string(),
-            "DOUBLE PRECISION".to_string(),
+            "L_RETURNFLAG".to_string(),
+            ExasolType::Varchar {
+                size: 1,
+                ascii: false,
+            },
         ),
+        (
+            "L_QUANTITY".to_string(),
+            ExasolType::Decimal {
+                precision: 36,
+                scale: 2,
+            },
+        ),
+        ("L_EXTENDEDPRICE".to_string(), ExasolType::DoublePrecision),
     ]
 }
 
@@ -1549,7 +1572,7 @@ fn build_grouped_from_detection(req: &serde_json::Value) -> String {
         &d.select_items,
         None,
         0,
-        &soa_col_types(),
+        &column_types(&soa_col_types(), &[]),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         None,
@@ -1585,7 +1608,7 @@ fn grouped_scalar_over_aggregate_detects_and_dedups_inner_aggregates() {
                 select_index: 3,
                 declared_type,
                 ..
-            } if declared_type == "DECIMAL(5,2)"
+            } if *declared_type == ExasolType::Decimal { precision: 5, scale: 2 }
         ),
         "item 3 must be a ScalarOverAggregate with its declared type: {:?}",
         d.select_items[3]
@@ -1743,14 +1766,18 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
         ]}]
     });
     let all_cols = involved_columns(&request, |tables| tables.first()).types;
-    let (proj_cols, proj_types) = referenced_column_projection(&pushdown_req, &all_cols);
+    let col_types = column_types(&all_cols, &[]);
+    let (proj_cols, proj_types) =
+        split_projection(&referenced_column_projection(&pushdown_req, &col_types));
     let fan_out_spec = CommonScanSpec {
         projection: proj_cols,
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
     }
     .with_files(vec![]);
-    let fan_out = FanOutProjection::new(&fan_out_spec, &proj_types).expect("aligned fan-out");
+    let fan_out_columns = projected_columns(&fan_out_spec.common.projection, &proj_types);
+    let fan_out = FanOutProjection::new(&fan_out_spec, &fan_out_columns, &col_types)
+        .expect("aligned fan-out");
     let sql = build_qualified_single_table_fallback_sql(
         &request,
         &pushdown_req,
@@ -1834,8 +1861,8 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
     let having = render_having_over_merge(&having_node, &detection.plans)
         .expect("HAVING must render over the merge decomposition");
 
-    let col_types: Vec<(String, String)> =
-        vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
+    let col_types: Vec<(String, ExasolType)> =
+        vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
     let spec_template = CommonScanSpec {
         aggregates: Some(detection.plans.clone()),
         group_keys: Some(detection.group_keys.clone()),
@@ -1854,7 +1881,7 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
         &detection.select_items,
         None,
         0,
-        &col_types,
+        &column_types(&col_types, &[]),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         Some(&having),
@@ -1905,8 +1932,8 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
         group_key_exasol_types(&req, &detection.group_keys, &detection.select_items);
     let aggregate_types = detection.plan_types.clone();
 
-    let col_types: Vec<(String, String)> =
-        vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
+    let col_types: Vec<(String, ExasolType)> =
+        vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
     let spec_template = CommonScanSpec {
         aggregates: Some(detection.plans.clone()),
         group_keys: Some(detection.group_keys.clone()),
@@ -1925,7 +1952,7 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
         &detection.select_items,
         None,
         0,
-        &col_types,
+        &column_types(&col_types, &[]),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         None,
@@ -1973,8 +2000,8 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
     let having = render_having_over_merge(&having_node, &detection.plans)
         .expect("HAVING must render over the merge decomposition");
 
-    let col_types: Vec<(String, String)> =
-        vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
+    let col_types: Vec<(String, ExasolType)> =
+        vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
     let spec_template = CommonScanSpec {
         aggregates: Some(detection.plans.clone()),
         group_keys: Some(detection.group_keys.clone()),
@@ -1996,7 +2023,7 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
         &detection.select_items,
         Some(2),
         0,
-        &col_types,
+        &column_types(&col_types, &[]),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         Some(&having),
@@ -2063,7 +2090,10 @@ fn group_key_type_resolved_by_index_not_string_match() {
 
     assert_eq!(
         types,
-        vec!["DECIMAL(9,0)".to_string()],
+        vec![ExasolType::Decimal {
+            precision: 9,
+            scale: 0
+        }],
         "type must resolve via select_index, not via string-matching the (drifted) \
              rendered group key: {types:?}"
     );
@@ -2091,11 +2121,19 @@ fn group_key_types_multi_key_mixed_types() {
 
     assert_eq!(types.len(), 2, "one declared type per group key");
     assert_eq!(
-        types[0], "VARCHAR(100)",
+        types[0],
+        ExasolType::Varchar {
+            size: 100,
+            ascii: false
+        },
         "the REGION key must resolve its own VARCHAR type, at its own select index: {types:?}"
     );
     assert_eq!(
-        types[1], "DECIMAL(9,0)",
+        types[1],
+        ExasolType::Decimal {
+            precision: 9,
+            scale: 0
+        },
         "the MOD(id,4) key must resolve its own DECIMAL type, not a shared/defaulted \
              VARCHAR: {types:?}"
     );
@@ -2132,7 +2170,10 @@ fn group_key_exasol_types_resolves_char_case_key() {
 
     assert_eq!(
         types,
-        vec!["CHAR(3) ASCII".to_string()],
+        vec![ExasolType::Char {
+            size: 3,
+            ascii: true
+        }],
         "an equal-length CASE group key must resolve to CHAR(3) ASCII, not \
              VARCHAR(3) ASCII: {types:?}"
     );
@@ -2154,7 +2195,10 @@ fn group_key_exasol_types_resolves_varchar_key_unchanged() {
 
     assert_eq!(
         types,
-        vec!["VARCHAR(10)".to_string()],
+        vec![ExasolType::Varchar {
+            size: 10,
+            ascii: false
+        }],
         "a VARCHAR-declared group key must be unaffected: {types:?}"
     );
 }
@@ -2181,7 +2225,10 @@ fn group_key_exasol_types_resolves_char_type_for_unprojected_group_key() {
 
     assert_eq!(
         types,
-        vec!["CHAR(20)".to_string()],
+        vec![ExasolType::Char {
+            size: 20,
+            ascii: false
+        }],
         "an unprojected group key must resolve CHAR(20) from its own groupBy dataType: \
              {types:?}"
     );
@@ -2201,7 +2248,10 @@ fn group_key_exasol_types_resolves_varchar_type_for_unprojected_group_key() {
 
     assert_eq!(
         types,
-        vec!["VARCHAR(10)".to_string()],
+        vec![ExasolType::Varchar {
+            size: 10,
+            ascii: false
+        }],
         "an unprojected VARCHAR-declared group key must resolve VARCHAR(10): {types:?}"
     );
 }
@@ -2219,7 +2269,10 @@ fn group_key_exasol_types_prefers_select_list_type_over_group_by_type() {
 
     assert_eq!(
         types,
-        vec!["VARCHAR(30)".to_string()],
+        vec![ExasolType::Varchar {
+            size: 30,
+            ascii: false
+        }],
         "the selectListDataTypes entry must win over the groupBy node's own dataType: \
              {types:?}"
     );
@@ -2273,12 +2326,19 @@ fn min_over_char_expression_declares_char_partial_and_merge_cast() {
     assert_eq!(detection.plans.len(), 1, "one aggregate plan (MIN)");
     assert_eq!(
         detection.plan_types,
-        vec!["CHAR(20)".to_string()],
+        vec![ExasolType::Char {
+            size: 20,
+            ascii: false
+        }],
         "the MIN plan's declared type must be CHAR(20), not VARCHAR(20): {:?}",
         detection.plan_types
     );
 
-    let partial_emits = partial_emits_items(&detection.plans, &[], &detection.plan_types);
+    let partial_emits = partial_emits_items(
+        &detection.plans,
+        &ColumnTypes::default(),
+        &detection.plan_types,
+    );
     assert_eq!(
         partial_emits,
         vec![r#""PARTIAL_min_0" CHAR(20)"#.to_string()],
@@ -2334,8 +2394,8 @@ fn stat_aggregate_emits_three_partial_columns() {
             column: Some("SCORE".into()),
             arg_expr: None,
         }];
-        let col_types = vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
-        let items = partial_emits_items(&plans, &col_types, &[]);
+        let col_types = vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
+        let items = partial_emits_items(&plans, &column_types(&col_types, &[]), &[]);
         assert_eq!(
             items.len(),
             3,
@@ -2385,7 +2445,7 @@ fn scan_select_list_and_emits_agree_per_agg_kind() {
         AggKind::StddevPop,
         AggKind::StddevSamp,
     ];
-    let col_types = vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
+    let col_types = vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
 
     let plan_for = |kind: &AggKind| AggregatePlan {
         kind: kind.clone(),
@@ -2399,8 +2459,9 @@ fn scan_select_list_and_emits_agree_per_agg_kind() {
     for kind in &all_kinds {
         let plans = vec![plan_for(kind)];
         let scan_names = partial_names_in(&crate::scan::build_partial_agg_sql(&plans, "aliased"));
-        let emits_names =
-            partial_names_in(&partial_emits_items(&plans, &col_types, &[]).join(", "));
+        let emits_names = partial_names_in(
+            &partial_emits_items(&plans, &column_types(&col_types, &[]), &[]).join(", "),
+        );
         assert_eq!(
             scan_names, emits_names,
             "{kind:?}: scan SELECT list and EMITS clause disagree"
@@ -2411,7 +2472,9 @@ fn scan_select_list_and_emits_agree_per_agg_kind() {
     let mixed: Vec<AggregatePlan> = all_kinds.iter().map(plan_for).collect();
     assert_eq!(
         partial_names_in(&crate::scan::build_partial_agg_sql(&mixed, "aliased")),
-        partial_names_in(&partial_emits_items(&mixed, &col_types, &[]).join(", ")),
+        partial_names_in(
+            &partial_emits_items(&mixed, &column_types(&col_types, &[]), &[]).join(", ")
+        ),
         "mixed-arity plan list: scan SELECT list and EMITS clause disagree"
     );
 }
@@ -2523,8 +2586,8 @@ fn having_clause_appears_in_outer_wrapper_only() {
     .with_files(vec![]);
     let shards = vec![vec![("s3://wh/f.parquet".to_string(), 1u64)]];
     let col_types = vec![
-        ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
-        ("AMOUNT".to_string(), "DOUBLE PRECISION".to_string()),
+        ("REGION".to_string(), ExasolType::WIDEST_VARCHAR),
+        ("AMOUNT".to_string(), ExasolType::DoublePrecision),
     ];
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
@@ -2540,7 +2603,7 @@ fn having_clause_appears_in_outer_wrapper_only() {
         &keys_first_select_items(1, 1),
         None,
         0,
-        &col_types,
+        &column_types(&col_types, &[]),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         having_filter.as_deref(),
@@ -2576,8 +2639,13 @@ fn expected_pad(fragment: &str, width: u32) -> String {
 fn char_declared_group_key_is_blank_padded_to_its_declared_width() {
     let fragment = r#"CAST("NAME" AS VARCHAR)"#.to_string();
 
-    let padded =
-        blank_pad_char_group_keys(std::slice::from_ref(&fragment), &["CHAR(20)".to_string()]);
+    let padded = blank_pad_char_group_keys(
+        std::slice::from_ref(&fragment),
+        &[ExasolType::Char {
+            size: 20,
+            ascii: false,
+        }],
+    );
 
     assert_eq!(
         padded,
@@ -2593,7 +2661,10 @@ fn ascii_suffixed_char_group_key_width_is_parsed_before_the_suffix() {
 
     let padded = blank_pad_char_group_keys(
         std::slice::from_ref(&fragment),
-        &["CHAR(3) ASCII".to_string()],
+        &[ExasolType::Char {
+            size: 3,
+            ascii: true,
+        }],
     );
 
     assert_eq!(
@@ -2608,10 +2679,15 @@ fn ascii_suffixed_char_group_key_width_is_parsed_before_the_suffix() {
 fn char_pad_leaves_an_over_length_value_unmodified() {
     let fragment = r#""NAME""#.to_string();
 
-    let padded =
-        blank_pad_char_group_keys(std::slice::from_ref(&fragment), &["CHAR(20)".to_string()])
-            .pop()
-            .expect("one padded group key");
+    let padded = blank_pad_char_group_keys(
+        std::slice::from_ref(&fragment),
+        &[ExasolType::Char {
+            size: 20,
+            ascii: false,
+        }],
+    )
+    .pop()
+    .expect("one padded group key");
 
     assert!(
         padded.starts_with(&format!("CASE WHEN character_length({fragment}) < 20 THEN")),
@@ -2638,7 +2714,13 @@ fn char_pad_leaves_an_over_length_value_unmodified() {
 fn varchar_declared_group_key_is_left_unpadded() {
     let keys = vec![r#""REGION""#.to_string()];
 
-    let padded = blank_pad_char_group_keys(&keys, &["VARCHAR(10)".to_string()]);
+    let padded = blank_pad_char_group_keys(
+        &keys,
+        &[ExasolType::Varchar {
+            size: 10,
+            ascii: false,
+        }],
+    );
 
     assert_eq!(
         padded, keys,
@@ -2655,7 +2737,16 @@ fn multi_key_pad_applies_only_to_the_char_slot() {
 
     let padded = blank_pad_char_group_keys(
         &keys,
-        &["VARCHAR(10)".to_string(), "CHAR(5) ASCII".to_string()],
+        &[
+            ExasolType::Varchar {
+                size: 10,
+                ascii: false,
+            },
+            ExasolType::Char {
+                size: 5,
+                ascii: true,
+            },
+        ],
     );
 
     assert_eq!(
@@ -2688,9 +2779,15 @@ async fn padded_group_key_merges_trailing_blank_variants_without_truncating() {
     ctx.register_batch("t", batch)
         .expect("fixture table registers");
 
-    let padded = blank_pad_char_group_keys(&[r#""V""#.to_string()], &["CHAR(20)".to_string()])
-        .pop()
-        .expect("one padded group key");
+    let padded = blank_pad_char_group_keys(
+        &[r#""V""#.to_string()],
+        &[ExasolType::Char {
+            size: 20,
+            ascii: false,
+        }],
+    )
+    .pop()
+    .expect("one padded group key");
     let sql = format!(r#"SELECT {padded}, COUNT(*) FROM (SELECT "V" FROM t) GROUP BY {padded}"#);
 
     let batches = ctx
@@ -2772,9 +2869,15 @@ async fn padded_case_fragment_plans_and_evaluates_in_datafusion() {
         .expect("fixture table registers");
 
     let case_fragment = r#"CASE WHEN "V" = 'ab' THEN 'NEG' ELSE 'POS' END"#.to_string();
-    let padded = blank_pad_char_group_keys(&[case_fragment], &["CHAR(3) ASCII".to_string()])
-        .pop()
-        .expect("one padded group key");
+    let padded = blank_pad_char_group_keys(
+        &[case_fragment],
+        &[ExasolType::Char {
+            size: 3,
+            ascii: true,
+        }],
+    )
+    .pop()
+    .expect("one padded group key");
     let sql = format!(r#"SELECT {padded}, COUNT(*) FROM (SELECT "V" FROM t) GROUP BY {padded}"#);
 
     let batches = ctx
@@ -2850,4 +2953,75 @@ fn having_over_stat_aggregate_with_expression_argument_declines() {
         "a HAVING over a stat aggregate with an expression argument must not \
              render over the merge wrapper"
     );
+}
+
+#[test]
+fn only_a_char_group_key_has_a_pad_width() {
+    for exa_type in EXASOL_TYPE_SPELLINGS {
+        let expected = match exa_type {
+            ExasolType::Char { size, .. } => Some(size),
+            ExasolType::Boolean
+            | ExasolType::Decimal { .. }
+            | ExasolType::DoublePrecision
+            | ExasolType::Date
+            | ExasolType::Timestamp { .. }
+            | ExasolType::TimestampWithLocalTimeZone
+            | ExasolType::Varchar { .. } => None,
+        };
+        assert_eq!(char_width(&exa_type), expected, "{exa_type}");
+    }
+}
+
+#[test]
+fn sum_widens_a_decimal_to_precision_36_and_every_other_variant_to_double() {
+    for exa_type in EXASOL_TYPE_SPELLINGS {
+        let expected = match exa_type {
+            ExasolType::Decimal { scale, .. } => ExasolType::Decimal {
+                precision: 36,
+                scale,
+            },
+            ExasolType::Boolean
+            | ExasolType::DoublePrecision
+            | ExasolType::Date
+            | ExasolType::Timestamp { .. }
+            | ExasolType::TimestampWithLocalTimeZone
+            | ExasolType::Char { .. }
+            | ExasolType::Varchar { .. } => ExasolType::DoublePrecision,
+        };
+        assert_eq!(sum_emit_type(exa_type), expected, "{exa_type}");
+    }
+}
+
+#[test]
+fn sum_and_stat_aggregates_accept_only_double_and_decimal_columns() {
+    let plans = |kind: AggKind| {
+        vec![AggregatePlan {
+            kind,
+            column: Some("X".to_string()),
+            arg_expr: None,
+        }]
+    };
+    for exa_type in EXASOL_TYPE_SPELLINGS {
+        let col_types = vec![("X".to_string(), exa_type)];
+        let expected = match exa_type {
+            ExasolType::DoublePrecision | ExasolType::Decimal { .. } => true,
+            ExasolType::Boolean
+            | ExasolType::Date
+            | ExasolType::Timestamp { .. }
+            | ExasolType::TimestampWithLocalTimeZone
+            | ExasolType::Char { .. }
+            | ExasolType::Varchar { .. } => false,
+        };
+        for kind in [AggKind::Sum, AggKind::Stddev] {
+            assert_eq!(
+                validate_agg_col_types(&plans(kind.clone()), &column_types(&col_types, &[])),
+                expected,
+                "{kind:?} over {exa_type}"
+            );
+        }
+        assert!(
+            validate_agg_col_types(&plans(AggKind::Min), &column_types(&col_types, &[])),
+            "MIN over {exa_type} needs no numeric type"
+        );
+    }
 }

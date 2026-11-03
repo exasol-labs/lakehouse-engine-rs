@@ -2,8 +2,10 @@ use super::*;
 use crate::adapter::column_notes::{DeclaredSchema, TableNotes};
 use crate::adapter::table_identity::encode_identifier_note;
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
+use crate::scan::spec::ProjectionItem;
 use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
 use crate::scan::test_support::WithFiles;
+use crate::types::exasol_type::ExasolType;
 use lakehouse_catalog::{
     CatalogColumn, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, TableFormat,
 };
@@ -255,6 +257,88 @@ pub(crate) fn aliased_col(table: &str, alias: &str, name: &str) -> Json {
     table_column(table, Some(alias), name)
 }
 
+/// The per-column type map the planner builds for one table: each `(name, type)` is an involved
+/// column, binary where its `declared` field is.
+pub(crate) fn column_types<N: AsRef<str>>(
+    columns: &[(N, ExasolType)],
+    declared: &[LogicalField],
+) -> ColumnTypes {
+    column_types_under(columns, declared, false)
+}
+
+/// [`column_types`] for a virtual schema that sets `BINARY_AS_STRING` as given.
+pub(crate) fn column_types_under<N: AsRef<str>>(
+    columns: &[(N, ExasolType)],
+    declared: &[LogicalField],
+    binary_as_string: bool,
+) -> ColumnTypes {
+    let involved = support::InvolvedColumns {
+        types: columns
+            .iter()
+            .map(|(name, exa_type)| (name.as_ref().to_string(), *exa_type))
+            .collect(),
+        notes: TableNotes::default(),
+    };
+    ColumnTypes::of(&involved, declared, binary_as_string)
+}
+
+/// The map `handle_pushdown` builds for `request`'s first involved table, which declares no binary
+/// column.
+pub(crate) fn first_table_column_types(request: &Json) -> ColumnTypes {
+    column_types(
+        &support::involved_columns(request, |tables| tables.first()).types,
+        &[],
+    )
+}
+
+/// `sides` with each side's map built, as the resolver builds it, from the columns `request`
+/// declares for the side's table and the side's declared schema.
+pub(crate) fn request_typed(
+    request: &Json,
+    sides: &[joins::ResolvedJoinSide],
+) -> Vec<joins::ResolvedJoinSide> {
+    sides
+        .iter()
+        .map(|side| {
+            let involved = support::involved_columns(request, |tables| {
+                tables
+                    .iter()
+                    .find(|table| table["name"].as_str() == Some(side.table_name.as_str()))
+            });
+            joins::ResolvedJoinSide {
+                column_types: ColumnTypes::of(&involved, &side.logical_schema, false),
+                ..side.clone()
+            }
+        })
+        .collect()
+}
+
+/// One fileless side per leg of `join`, typed by the columns `request` declares for its table: the
+/// only side state the broadcast render reads.
+pub(crate) fn request_sides(
+    request: &Json,
+    join: &joins::DetectedJoin,
+) -> Vec<joins::ResolvedJoinSide> {
+    let sides: Vec<_> = join
+        .tables
+        .iter()
+        .map(|leaf| joins::ResolvedJoinSide {
+            table_name: leaf.table_name.clone(),
+            table_identifier: leaf.table_identifier.clone(),
+            table_root: String::new(),
+            files: Vec::new(),
+            logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
+            effective_storage: sample_storage(),
+            partition_columns: Vec::new(),
+            total_bytes: 0,
+            refused_columns: Vec::new(),
+            column_types: ColumnTypes::default(),
+        })
+        .collect();
+    request_typed(request, &sides)
+}
+
 pub(crate) fn table_column(table: &str, alias: Option<&str>, name: &str) -> Json {
     ColumnNode::to_json(name, Some(table), alias)
 }
@@ -323,19 +407,73 @@ pub(crate) fn broadcast_sides(
 
 pub(crate) fn rendered_join(
     condition: &str,
-    projection: &[(ProjectionItem, &str)],
+    projection: &[ProjectedColumn],
 ) -> joins::RenderedJoinPushdown {
     joins::RenderedJoinPushdown {
         condition: condition.to_string(),
         filter: None,
-        projection: projection.iter().map(|(item, _)| item.clone()).collect(),
-        projection_types: projection
-            .iter()
-            .map(|(_, exasol_type)| (*exasol_type).to_string())
-            .collect(),
+        projection: projection.to_vec(),
         window: joins::JoinWindowPlan::Unbounded,
     }
 }
+
+/// Each item paired with the type at its position, for fixtures that list the two apart.
+pub(crate) fn projected_columns(
+    items: &[ProjectionItem],
+    types: &[ExasolType],
+) -> Vec<ProjectedColumn> {
+    assert_eq!(items.len(), types.len(), "one type per projected item");
+    items
+        .iter()
+        .zip(types)
+        .map(|(item, exa_type)| ProjectedColumn {
+            item: item.clone(),
+            exa_type: *exa_type,
+        })
+        .collect()
+}
+
+/// The items and the types of `projection`, for assertions on one of the two.
+pub(crate) fn split_projection(
+    projection: &[ProjectedColumn],
+) -> (Vec<ProjectionItem>, Vec<ExasolType>) {
+    projection
+        .iter()
+        .map(|column| (column.item.clone(), column.exa_type))
+        .unzip()
+}
+
+/// One value per `ExasolType` variant and per spelling its SQL rendering takes, so a consumer's
+/// pin covers every type a column, `EMITS` item, or `CAST` target can carry.
+pub(crate) const EXASOL_TYPE_SPELLINGS: [ExasolType; 12] = [
+    ExasolType::Boolean,
+    ExasolType::Decimal {
+        precision: 18,
+        scale: 2,
+    },
+    ExasolType::DoublePrecision,
+    ExasolType::Date,
+    ExasolType::Timestamp { precision: None },
+    ExasolType::Timestamp { precision: Some(6) },
+    ExasolType::TimestampWithLocalTimeZone,
+    ExasolType::Char {
+        size: 20,
+        ascii: false,
+    },
+    ExasolType::Char {
+        size: 3,
+        ascii: true,
+    },
+    ExasolType::WIDEST_VARCHAR,
+    ExasolType::Varchar {
+        size: 10,
+        ascii: false,
+    },
+    ExasolType::Varchar {
+        size: 2_000_000,
+        ascii: true,
+    },
+];
 
 /// A base for `..` struct update: the unpartitioned, columnless table `db.t` at `location`.
 pub(crate) fn catalog_table(format: TableFormat, location: &str) -> CatalogTable {
@@ -514,7 +652,7 @@ pub(crate) async fn resolve_from_notes(
     notes: &TableNotes<'_>,
     filter_json: Option<&Json>,
 ) -> Result<ResolvedScan, UdfError> {
-    ResolvedScan::resolve(reader, notes.declared_schema()?, filter_json, false).await
+    ResolvedScan::resolve(reader, notes.declared_schema()?, filter_json).await
 }
 
 /// [`resolve_from_notes`] over the notes CREATE records for `table`, involved as `name`.
@@ -1052,7 +1190,7 @@ pub(crate) fn closed_port_storage() -> StorageBackend {
 pub(crate) fn build_sql_for_fixture(
     files: Vec<String>,
     proj_cols: Vec<String>,
-    proj_types: Vec<String>,
+    proj_types: Vec<ExasolType>,
     filter: Option<String>,
     limit: Option<u64>,
 ) -> String {
@@ -1062,12 +1200,12 @@ pub(crate) fn build_sql_for_fixture(
 pub(crate) fn build_sql_for_fixture_n(
     files: Vec<String>,
     proj_cols: Vec<String>,
-    proj_types: Vec<String>,
+    proj_types: Vec<ExasolType>,
     filter: Option<String>,
     limit: Option<u64>,
     cluster_nodes: usize,
 ) -> String {
-    let col_types: Vec<(String, String)> = proj_cols
+    let col_types: Vec<(String, ExasolType)> = proj_cols
         .iter()
         .cloned()
         .zip(proj_types.iter().cloned())
@@ -1092,10 +1230,9 @@ pub(crate) fn build_sql_for_fixture_n(
     build_scan_driving_sql(
         &spec_template,
         &shards,
-        &proj_items,
-        &proj_types,
+        &projected_columns(&proj_items, &proj_types),
         limit,
-        &col_types,
+        &column_types(&col_types, &[]),
         None,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -1181,10 +1318,10 @@ pub(crate) fn build_row_sql_with_root(
     files: Vec<(String, u64)>,
     table_root: &str,
     proj_cols: Vec<String>,
-    proj_types: Vec<String>,
+    proj_types: Vec<ExasolType>,
     cluster_nodes: usize,
 ) -> String {
-    let col_types: Vec<(String, String)> = proj_cols
+    let col_types: Vec<(String, ExasolType)> = proj_cols
         .iter()
         .cloned()
         .zip(proj_types.iter().cloned())
@@ -1208,10 +1345,9 @@ pub(crate) fn build_row_sql_with_root(
     build_scan_driving_sql(
         &spec_template,
         &shards,
-        &proj_items,
-        &proj_types,
+        &projected_columns(&proj_items, &proj_types),
         None,
-        &col_types,
+        &column_types(&col_types, &[]),
         None,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,

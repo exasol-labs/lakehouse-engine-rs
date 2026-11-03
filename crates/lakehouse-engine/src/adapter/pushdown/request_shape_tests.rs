@@ -1,12 +1,28 @@
 use super::super::test_support::*;
 use super::*;
+use crate::types::exasol_type::ExasolType;
 
-fn col_types() -> Vec<(String, String)> {
-    vec![
-        ("AMOUNT".to_string(), "DECIMAL(18,2)".to_string()),
-        ("NAME".to_string(), "VARCHAR(2000000)".to_string()),
-        ("ID".to_string(), "DECIMAL(20,0)".to_string()),
-    ]
+fn col_types() -> ColumnTypes {
+    column_types(
+        &[
+            (
+                "AMOUNT",
+                ExasolType::Decimal {
+                    precision: 18,
+                    scale: 2,
+                },
+            ),
+            ("NAME", ExasolType::WIDEST_VARCHAR),
+            (
+                "ID",
+                ExasolType::Decimal {
+                    precision: 20,
+                    scale: 0,
+                },
+            ),
+        ],
+        &[],
+    )
 }
 
 #[test]

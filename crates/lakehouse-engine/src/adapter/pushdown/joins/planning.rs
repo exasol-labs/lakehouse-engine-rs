@@ -1,11 +1,12 @@
-use crate::adapter::column_notes::TableNotes;
 use crate::adapter::table_identity::read_identifier;
 use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 use super::super::scan_resolution::TableScanResolver;
-use super::super::support::{InvolvedColumns, extract_limit, extract_offset, involved_columns};
+use super::super::support::{
+    ColumnTypes, InvolvedColumns, extract_limit, extract_offset, involved_columns,
+};
 use super::super::topn::{ParsedSortKey, parse_sort_key_element};
 use super::super::{RefusedColumn, ResolvedScan};
 
@@ -140,6 +141,8 @@ pub(crate) struct ResolvedJoinSide {
     pub total_bytes: u64,
     /// Per side, not merged: a refusal belongs to the table that raised it.
     pub refused_columns: Vec<RefusedColumn>,
+    /// Unqualified, built once when the side was resolved.
+    pub column_types: ColumnTypes,
 }
 
 impl ResolvedJoinSide {
@@ -148,6 +151,7 @@ impl ResolvedJoinSide {
         table_name: String,
         table_identifier: String,
         resolved: ResolvedScan,
+        column_types: ColumnTypes,
     ) -> Self {
         let ResolvedScan {
             files,
@@ -172,6 +176,7 @@ impl ResolvedJoinSide {
             partition_columns,
             total_bytes,
             refused_columns,
+            column_types,
         }
     }
 }
@@ -230,26 +235,17 @@ pub(super) async fn resolve_one_join_side(
     table_identifier: &str,
     resolver: &TableScanResolver<'_>,
     filter_json: Option<&Json>,
-    notes: &TableNotes<'_>,
+    involved: &InvolvedColumns<'_>,
 ) -> Result<ResolvedJoinSide, UdfError> {
-    let resolved = resolver
-        .resolve(table_identifier, filter_json, notes)
+    let (resolved, column_types) = resolver
+        .resolve(table_identifier, filter_json, involved)
         .await?;
     Ok(ResolvedJoinSide::new(
         table_name.to_string(),
         table_identifier.to_string(),
         resolved,
+        column_types,
     ))
-}
-
-/// CROSS-FOLD SEAM: the result is string-matched in `referenced_leg_columns` against names
-/// folded with ASCII-only `to_ascii_uppercase`, while `involved_columns` folds differently. Do
-/// not reconcile the folds (see `ColumnNode::ascii_upper_name`). They agree by premise:
-/// `build_listing_virtual_tables` Unicode-uppercases every declared name, leaving no ASCII
-/// lowercase for either fold to touch. E2E `non_ascii_table_and_column_stay_queryable`
-/// guards that premise.
-pub(super) fn involved_table_columns(request: &Json, table_name: &str) -> Vec<(String, String)> {
-    involved_table(request, table_name).types
 }
 
 /// One leg's column types and notes from the same pass.
