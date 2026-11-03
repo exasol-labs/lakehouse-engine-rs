@@ -1,15 +1,16 @@
 <!-- DELTA:CHANGED -->
-# Feature: Single Shared Object for All Rust Entry Points
+# Feature: Single Shared Object, Five Entry Points
 
-Packages the VS adapter, the DataFusion scan UDF, the version query UDF, the export script, and the export writer as named entry points in one Rust crate that builds to a single `.so`. The scan entry point is a SCALAR EMIT script, and the version entry point is a SCALAR RETURNS script. The export entry point is a SCALAR script that Exasol calls for `EXPORT ... INTO SCRIPT`, and the export writer is a SET RETURNS script. The cluster fan-out distributor (`LAKEHOUSE_DISTRIBUTE_FILES`) is a separate LUA SET script created by its own DDL, not a Rust entry point in the `.so`. One artifact is uploaded to BucketFS and each Exasol script references it.
+One Rust crate builds a single `.so` that exports the VS adapter, the DataFusion scan UDF, the version query UDF, the export script, and the export writer as named entry points. One artifact is uploaded to BucketFS and each Exasol script references it.
 <!-- /DELTA:CHANGED -->
 
 <!-- DELTA:CHANGED -->
 ## Background
 
-* All five Rust entry points (adapter, scan, version, export, export writer) are exported from the single uploaded `.so`. The `LAKEHOUSE_DISTRIBUTE_FILES` fan-out distributor is a separate LUA SET script created by its own DDL and is not part of the `.so`.
-* The `.so` is built only inside the `rust:1.94-trixie` builder image. It is never built with host `cargo build --release`.
-* Each entry point is declared with the `exasol_udf` macro. Exasol's `CREATE SCRIPT` statements reference each by its registered name against the same `%udf_object`.
+* The scan entry point is a SCALAR EMIT script. The version entry point is a SCALAR RETURNS script. The export entry point is a SCALAR script that Exasol calls for `EXPORT ... INTO SCRIPT`, and the export writer entry point is a SET RETURNS script.
+* The `LAKEHOUSE_DISTRIBUTE_FILES` fan-out distributor is a separate LUA SET script created by its own DDL. It is not a Rust entry point and is not part of the `.so`.
+* Each `CREATE SCRIPT` statement references its entry point by registered name against the same `%udf_object`.
+* The `.so` is built only inside the `UDF_BUILDER_IMAGE` Rust builder image the Makefile names, never with host `cargo build --release`.
 <!-- /DELTA:CHANGED -->
 
 ## Scenarios

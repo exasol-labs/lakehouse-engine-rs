@@ -1,46 +1,20 @@
 # Feature: Version Query UDF
 
 A zero-argument `LAKEHOUSE_VERSION()` scalar script returns the engine crate version compiled into
-the `.so`. Needs no CONNECTION and no Virtual Schema. The install script creates this script and
+the `.so`. It needs no CONNECTION and no Virtual Schema. The install script creates this script and
 calls it as its install verification, comparing the returned value against the release it
 downloaded.
 
 ## Background
 
-* This delta ADDS FOUR scenarios and FOUR Background bullets, and it EXTENDS the summary paragraph
-  by one sentence. The four added bullets open "The install verification lives", "The install script
-  creates", "CI derives every release tag", and "Two install-script functions read". The two
-  recorded bullets, opening "`LAKEHOUSE_VERSION` is a third Rust entry point" and "The version value
-  has one owner", are carried into this delta verbatim. It AMENDS no recorded scenario. The recorded
-  scenario "The version entry point reports the compiled engine version" is carried into this delta
-  verbatim and unchanged.
-* This delta SUPERSEDES no recorded clause. The install script's previous verification called
-  `LAKEHOUSE_SCAN('x', 'y')` with placeholder arguments and classified the KIND of error it got
-  back. That behavior appears in no recorded spec, so this delta records the install verification
-  for the first time rather than replacing a recorded statement.
-* The install verification lives in this feature rather than in a new one, because the
-  reported-version-equals-release-version contract has one owner.
-  `packaging/architecture-aware-install` and `packaging/personal-deployment-install` state how the
-  script selects and pushes an artifact, not how it verifies the loaded artifact.
-  `packaging/single-so-two-entry-points` states which entry points the `.so` exports and already
-  assumes a created version script, without stating who creates it.
-* The install script creates the version script for every resolved release version, with no
-  engine-version floor. A resolved release older than v0.45.0 carries no version entry point in
-  its `.so`, and its install fails at verification time through the generic error path. That input
-  is accepted and unsupported by decision, not a tracked deviation.
 * `LAKEHOUSE_VERSION` is a third Rust entry point in the `.so`, driven by a `RUST SCALAR SCRIPT`
   with a `RETURNS` clause (not `EMITS`).
-* The version value has one owner: a crate-level constant fed by `env!("CARGO_PKG_VERSION")`.
 * CI derives every release tag from the engine crate manifest (`tag=v$VER`), and the install script
   strips the leading `v` from the resolved tag. The reported version and the resolved release
-  version are therefore the same bare `X.Y.Z` string, which is what makes an exact string
-  comparison the correct check.
-* Two install-script functions read a value out of exapump tabular output, one per query, each
-  keyed to its own column header (`extract_query_value` for `SYSTEM_VALUE`,
-  `extract_version_value` for `LAKEHOUSE_ENGINE_VERSION`). That duplication stays bounded at two
-  callers by decision: a version value begins with a digit, so `extract_query_value`'s digit-skip
-  arm (which drops the row-count footer) cannot be reused, and each extractor stays simple enough
-  that the duplication is cheaper than a parameterized abstraction.
+  version are the same bare `X.Y.Z` string, so an exact string comparison is the correct check.
+* The install script creates the version script for every resolved release version, with no
+  engine-version floor. A release older than v0.45.0 has no version entry point, and its install
+  fails at verification through the generic error path. That input is unsupported.
 
 ## Scenarios
 
