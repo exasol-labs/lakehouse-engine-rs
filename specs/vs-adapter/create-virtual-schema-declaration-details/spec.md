@@ -10,7 +10,7 @@ The `createVirtualSchema` declaration flattens multi-level namespaces into table
 * `cluster_nodes_from_context` is the precedent. It reads `ctx.node_count()` once at the adapter edge and passes a plain `usize` onward. `ctx.database_version()` follows the same shape, inline in `handle_create_virtual_schema` with no forwarding wrapper.
 * `handle_create_virtual_schema` already holds the `UdfContext`. It calls `build_listing_virtual_tables(configured_ns, listing)`, which takes one new plain precision parameter and passes it on to `column_source_type_to_exasol`.
 * The scan UDF entry point reads no version. Its `EMITS` types come from the pushdown request's own `dataType` JSON and `ScanSpec::emit_exa_types`.
-* `exasol_type_to_json` matches the string `TIMESTAMP` exactly and has no `TIMESTAMP(p)` arm, so a `TIMESTAMP(6)` string would fall through to the catch-all and declare `{"type": "varchar", "size": 2000000}`. The field name is `fractionalSecondsPrecision`. Exasol uses `precision` only for `DECIMAL` and `INTERVAL`.
+* The `dataType` field that carries a timestamp's precision is `fractionalSecondsPrecision`. Exasol uses `precision` only for `DECIMAL` and `INTERVAL`.
 * `exasol_type_from_json` already reads `fractionalSecondsPrecision`. Exasol echoes it in the pushdown request's `involvedTables` column `dataType`, so the `EMITS` clause and emit-boundary coercion follow without further change.
 
 ## Scenarios
@@ -47,11 +47,12 @@ The `createVirtualSchema` declaration flattens multi-level namespaces into table
 
 ### Scenario: A TIMESTAMP(p) column declaration serializes fractionalSecondsPrecision
 
-* *GIVEN* a resolved Exasol type string of the form `TIMESTAMP(p)` for an integer precision `p` in 0-9, the shape the version gate now produces for a catalog timestamp column
-* *WHEN* `exasol_type_to_json` converts that string into the response's column `dataType` object
+* *GIVEN* a resolved Exasol type `TIMESTAMP(p)` for an integer precision `p` in 0-9, the shape the version gate now produces for a catalog timestamp column
+* *WHEN* `exasol_type_to_json` converts that type into the response's column `dataType` object
 * *THEN* it SHALL return `{"type": "timestamp", "fractionalSecondsPrecision": p}`, reading the field name `fractionalSecondsPrecision`, the same name its inverse `exasol_type_from_json` reads, and MUST NOT emit a `precision` field, which Exasol uses only for `DECIMAL` and `INTERVAL`
-* *AND* it MUST NOT fall through to the catch-all VARCHAR arm for a `TIMESTAMP(p)` string, because that arm would declare a timestamp column as `{"type": "varchar", "size": 2000000}`, a silently wrong column type rather than a rejected request
-* *AND* a bare `TIMESTAMP` string SHALL keep returning `{"type": "timestamp"}` with NO `fractionalSecondsPrecision` field, so the 8.x arm's declaration is byte-identical to the one recorded today
-* *AND* `TIMESTAMP WITH LOCAL TIME ZONE` SHALL keep returning `{"type": "timestamp", "withLocalTimeZone": true}`, matched before any precision logic, so no precision-aware variant of that arm is introduced, its inverse short-circuits the same way
-* *AND* every other type string SHALL keep its recorded `dataType` object byte-identical, including `BOOLEAN`, `DOUBLE PRECISION`, `DATE`, every `DECIMAL(p,s)`, and every `VARCHAR(n)`/`CHAR(n)` form
+* *AND* it MUST NOT declare a `TIMESTAMP(p)` column as `{"type": "varchar", "size": 2000000}`, a silently wrong column type rather than a rejected request
+* *AND* a bare `TIMESTAMP` type SHALL keep returning `{"type": "timestamp"}` with NO `fractionalSecondsPrecision` field, so the 8.x arm's declaration is byte-identical to the one recorded today
+* *AND* `TIMESTAMP WITH LOCAL TIME ZONE` SHALL keep returning `{"type": "timestamp", "withLocalTimeZone": true}` with no precision field, and its inverse `exasol_type_from_json` SHALL read `withLocalTimeZone` before any precision field
+* *AND* every other type a catalog column declares SHALL keep its recorded `dataType` object byte-identical: `BOOLEAN`, `DOUBLE PRECISION`, `DATE`, every `DECIMAL(p,s)`, and every `VARCHAR(n)`
+* *AND* a `CHAR(n)` type or an `ASCII` character type, which no catalog column declares, SHALL serialize to the `dataType` object that `exasol_type_from_json` reads back as the same type
 * *AND* Exasol SHALL declare the resulting virtual column as `TIMESTAMP(6)` in `SYS.EXA_ALL_COLUMNS` and echo `fractionalSecondsPrecision` back on the pushdown request's `involvedTables` column `dataType`, both captured against a live Exasol 2025.x instance rather than asserted from documentation
