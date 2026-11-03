@@ -11,6 +11,7 @@ use super::super::tests::{
 use super::*;
 use crate::adapter::pushdown::support::{ColumnTypes, apply_type_rewrites};
 use crate::adapter::pushdown::test_support::*;
+use crate::adapter::pushdown::test_support::{aliased_col, table_col};
 use crate::scan::spec::ColumnRef;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
 
@@ -77,10 +78,10 @@ fn join_where_filter_spanning_both_sides_renders() {
         "type": "predicate_and",
         "expressions": [
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+             "left": table_col("CUSTOMER", "C_NAME"),
              "right": {"type": "literal_string", "value": "ACME"}},
             {"type": "predicate_greater",
-             "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+             "left": table_col("ORDERS", "O_ORDERDATE"),
              "right": {"type": "literal_string", "value": "1995-01-01"}},
         ],
     });
@@ -139,7 +140,7 @@ fn join_projection_resolves_cast_node_to_expr_not_full_row_fallback() {
             "type": "function_scalar_cast",
             "name": "CAST",
             "dataType": {"type": "varchar", "size": 2000000},
-            "arguments": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}]
+            "arguments": [table_col("CUSTOMER", "C_NAME")]
         }
     ]);
 
@@ -167,7 +168,7 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
         {
             "type": "function_scalar",
             "name": "UPPER",
-            "arguments": [{"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}]
+            "arguments": [table_col("CUSTOMER", "C_CUSTKEY")]
         }
     ]);
     let (projection, _types, _widened) = broadcast_projection(&coerce_request);
@@ -194,7 +195,7 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
             "type": "function_scalar",
             "name": "INSTR",
             "arguments": [
-                {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                table_col("CUSTOMER", "C_NAME"),
                 {"type": "literal_string", "value": "b"},
                 {"type": "literal_exactnumeric", "value": 3}
             ]
@@ -219,7 +220,7 @@ fn join_projection_like_guard_reaches_join_select_list() {
     string_request["pushdownRequest"]["selectList"] = serde_json::json!([
         {
             "type": "predicate_like",
-            "expression": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+            "expression": table_col("CUSTOMER", "C_NAME"),
             "pattern": {"type": "literal_string", "value": "A%"}
         }
     ]);
@@ -247,7 +248,7 @@ fn join_projection_like_guard_reaches_join_select_list() {
     decline_request["pushdownRequest"]["selectList"] = serde_json::json!([
         {
             "type": "predicate_like",
-            "expression": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+            "expression": table_col("CUSTOMER", "C_CUSTKEY"),
             "pattern": {"type": "literal_string", "value": "1%"}
         }
     ]);
@@ -281,10 +282,10 @@ fn leg_local_filter_attributes_conjuncts_to_owning_leg() {
         "type": "predicate_and",
         "expressions": [
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+             "left": table_col("CUSTOMER", "C_NAME"),
              "right": {"type": "literal_string", "value": "ACME"}},
             {"type": "predicate_greater",
-             "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+             "left": table_col("ORDERS", "O_ORDERDATE"),
              "right": {"type": "literal_string", "value": "1995-01-01"}},
         ],
     });
@@ -315,10 +316,10 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
         "type": "predicate_and",
         "expressions": [
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-             "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}},
+             "left": table_col("CUSTOMER", "C_CUSTKEY"),
+             "right": table_col("ORDERS", "O_CUSTKEY")},
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+             "left": table_col("CUSTOMER", "C_NAME"),
              "right": {"type": "literal_string", "value": "ACME"}},
         ],
     });
@@ -340,10 +341,10 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
         "type": "predicate_or",
         "expressions": [
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+             "left": table_col("CUSTOMER", "C_NAME"),
              "right": {"type": "literal_string", "value": "ACME"}},
             {"type": "predicate_greater",
-             "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+             "left": table_col("ORDERS", "O_ORDERDATE"),
              "right": {"type": "literal_string", "value": "1995-01-01"}},
         ],
     });
@@ -354,10 +355,10 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
         "type": "predicate_or",
         "expressions": [
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+             "left": table_col("CUSTOMER", "C_NAME"),
              "right": {"type": "literal_string", "value": "ACME"}},
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+             "left": table_col("CUSTOMER", "C_NAME"),
              "right": {"type": "literal_string", "value": "GLOBEX"}},
         ],
     });
@@ -372,7 +373,7 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
 fn leg_local_filter_handles_a_single_conjunct() {
     let single = serde_json::json!({
         "type": "predicate_equal",
-        "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+        "left": table_col("CUSTOMER", "C_NAME"),
         "right": {"type": "literal_string", "value": "ACME"}
     });
     let legs = customer_orders_legs();
@@ -386,10 +387,10 @@ fn leg_local_filter_attributes_shared_column_by_leg_not_name() {
         "type": "predicate_and",
         "expressions": [
             {"type": "predicate_greater",
-             "left": {"type": "column", "name": "ID", "tableName": "EVENTS"},
+             "left": table_col("EVENTS", "ID"),
              "right": {"type": "literal_exactnumeric", "value": 5}},
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "LABEL", "tableName": "LABELS"},
+             "left": table_col("LABELS", "LABEL"),
              "right": {"type": "literal_string", "value": "x"}},
         ],
     });
@@ -420,12 +421,10 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
         "type": "predicate_and",
         "expressions": [
             {"type": "predicate_greater",
-             "left": {"type": "column", "name": "O_ORDERKEY", "tableName": "FACT_ORDERS",
-                      "tableAlias": "A"},
+             "left": aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"),
              "right": {"type": "literal_exactnumeric", "value": 5}},
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "O_ORDERKEY", "tableName": "FACT_ORDERS",
-                      "tableAlias": "B"},
+             "left": aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"),
              "right": {"type": "literal_exactnumeric", "value": 7}},
         ],
     });
@@ -454,7 +453,7 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
 fn orders_local_rendering_conjunct() -> Json {
     serde_json::json!({
         "type": "predicate_greater",
-        "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+        "left": table_col("ORDERS", "O_ORDERDATE"),
         "right": {"type": "literal_string", "value": "1995-01-01"}
     })
 }
@@ -467,7 +466,7 @@ fn orders_local_declined_conjunct() -> Json {
             "type": "function_scalar",
             "name": "SECOND",
             "arguments": [
-                {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+                table_col("ORDERS", "O_ORDERDATE"),
                 {"type": "literal_exactnumeric", "value": 3}
             ]
         },
@@ -583,7 +582,7 @@ fn orders_col_types() -> Vec<(String, String)> {
 fn like_over(column: &str, table: &str, pattern: &str) -> Json {
     serde_json::json!({
         "type": "predicate_like",
-        "expression": {"type": "column", "name": column, "tableName": table},
+        "expression": table_col(table, column),
         "pattern": {"type": "literal_string", "value": pattern}
     })
 }
@@ -720,7 +719,7 @@ fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
             {"type": "function_scalar_cast", "name": "CAST",
              "dataType": {"type": "VARCHAR", "size": 40},
              "arguments": [
-                 {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}]},
+                 table_col("CUSTOMER", "C_CUSTKEY")]},
             {"type": "literal_exactnumeric", "value": 3}
         ]},
         "right": {"type": "literal_exactnumeric", "value": 1}
@@ -802,15 +801,15 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
 #[test]
 fn referenced_leg_columns_narrows_to_used_columns() {
     let pushdown_req = serde_json::json!({
-        "selectList": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}],
+        "selectList": [table_col("CUSTOMER", "C_NAME")],
         "filter": {"type": "predicate_equal",
-            "left": {"type": "column", "name": "C_ADDRESS", "tableName": "CUSTOMER"},
+            "left": table_col("CUSTOMER", "C_ADDRESS"),
             "right": {"type": "literal_string", "value": "z"}},
     });
     let condition = serde_json::json!({
         "type": "predicate_equal",
-        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}
+        "left": table_col("CUSTOMER", "C_CUSTKEY"),
+        "right": table_col("ORDERS", "O_CUSTKEY")
     });
     let full = vec![
         ("C_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string()),
@@ -836,8 +835,8 @@ fn referenced_leg_columns_narrows_to_used_columns() {
 fn referenced_leg_columns_keeps_all_when_select_list_absent() {
     let condition = serde_json::json!({
         "type": "predicate_equal",
-        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}
+        "left": table_col("CUSTOMER", "C_CUSTKEY"),
+        "right": table_col("ORDERS", "O_CUSTKEY")
     });
     let full = vec![
         ("C_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string()),
@@ -859,7 +858,7 @@ fn referenced_leg_columns_keeps_all_when_select_list_absent() {
 #[test]
 fn referenced_leg_columns_keeps_all_when_narrowing_empty() {
     let pushdown_req = serde_json::json!({
-        "selectList": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}],
+        "selectList": [table_col("CUSTOMER", "C_NAME")],
     });
     let condition = equi_condition();
     let full = vec![
@@ -882,9 +881,7 @@ fn referenced_leg_columns_keeps_all_when_narrowing_empty() {
 
 #[test]
 fn column_collectors_keep_divergent_case_folding() {
-    let expr = serde_json::json!({
-        "type": "column", "name": "straße", "tableName": "CUSTOMER",
-    });
+    let expr = table_col("CUSTOMER", "straße");
 
     let mut unicode_folded = std::collections::HashSet::new();
     collect_all_column_names(&expr, &mut unicode_folded);
@@ -916,7 +913,7 @@ fn side_fan_out_pushes_bare_side_local_filter_into_common_blob() {
     ];
     let filter = serde_json::json!({
         "type": "predicate_greater",
-        "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "FACT_ORDERS", "tableAlias": "O"},
+        "left": aliased_col("FACT_ORDERS", "O", "O_ORDERDATE"),
         "right": {"type": "literal_string", "value": "1995-01-01"}
     });
 
@@ -1022,7 +1019,7 @@ fn render_broadcast_join_replaces_native_table_alias_in_filter_with_leg_alias() 
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_greater",
-        "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS", "tableAlias": "O"},
+        "left": aliased_col("ORDERS", "O", "O_ORDERDATE"),
         "right": {"type": "literal_string", "value": "1995-01-01"}
     });
     let detected = detected_join(&request);
@@ -1049,8 +1046,8 @@ fn render_broadcast_join_replaces_native_table_alias_in_filter_with_leg_alias() 
 fn render_broadcast_join_replaces_native_table_alias_in_condition_with_leg_alias() {
     let condition = serde_json::json!({
         "type": "predicate_equal",
-        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER", "tableAlias": "C"},
-        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS", "tableAlias": "O"},
+        "left": aliased_col("CUSTOMER", "C", "C_CUSTKEY"),
+        "right": aliased_col("ORDERS", "O", "O_CUSTKEY"),
     });
     let request = join_request(Json::Null, condition);
     let detected = detected_join(&request);
@@ -1073,7 +1070,7 @@ fn render_broadcast_join_replaces_native_table_alias_in_projection_with_leg_alia
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["selectList"] = serde_json::json!([
         {"type": "function_scalar", "name": "MULT", "arguments": [
-            {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS", "tableAlias": "O"},
+            aliased_col("ORDERS", "O", "O_CUSTKEY"),
             {"type": "literal_exactnumeric", "value": 2}
         ]}
     ]);
@@ -1115,17 +1112,17 @@ fn unified_join_prunes_and_narrows_each_leg() {
                     "left": {"name": "CUSTOMER", "type": "table"},
                     "right": {"name": "ORDERS", "type": "table"},
                     "condition": {"type": "predicate_equal",
-                        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-                        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}}},
+                        "left": table_col("CUSTOMER", "C_CUSTKEY"),
+                        "right": table_col("ORDERS", "O_CUSTKEY")}},
                 "selectList": [
-                    {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-                    {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"}],
+                    table_col("CUSTOMER", "C_NAME"),
+                    table_col("ORDERS", "O_ORDERDATE")],
                 "filter": {"type": "predicate_and", "expressions": [
                     {"type": "predicate_equal",
-                     "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                     "left": table_col("CUSTOMER", "C_NAME"),
                      "right": {"type": "literal_string", "value": "ACME"}},
                     {"type": "predicate_greater",
-                     "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+                     "left": table_col("ORDERS", "O_ORDERDATE"),
                      "right": {"type": "literal_string", "value": "1995-01-01"}}]},
             },
             "schemaMetadataInfo": {"properties": {}},
@@ -1192,7 +1189,7 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
     );
     let filter = serde_json::json!({
         "type": "predicate_equal",
-        "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+        "left": table_col("CUSTOMER", "C_NAME"),
         "right": {"type": "literal_string", "value": "0a1b"},
     });
     let mut request = join_request(Json::Null, equi_condition());

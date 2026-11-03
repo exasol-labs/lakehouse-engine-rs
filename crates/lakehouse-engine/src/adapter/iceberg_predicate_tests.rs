@@ -1,4 +1,5 @@
 use super::*;
+use crate::adapter::pushdown::test_support::col;
 use crate::adapter::pushdown::test_support::nullable_field;
 use iceberg::spec::{NestedField, Schema, Type};
 use serde_json::json;
@@ -60,9 +61,6 @@ fn translate(filter: &Json) -> Option<Predicate> {
     translate_as_created(filter, &test_schema())
 }
 
-fn col(name: &str) -> Json {
-    json!({"type": "column", "name": name})
-}
 fn int_lit(v: i64) -> Json {
     json!({"type": "literal_exactnumeric", "value": v})
 }
@@ -541,7 +539,7 @@ fn binary_schema() -> Schema {
 fn equal_to_bytes(column: &str, hex: &str) -> Json {
     json!({
         "type": "predicate_equal",
-        "left": {"type": "column", "name": column},
+        "left": col(column),
         "right": {"type": "literal_binary", "value": hex},
     })
 }
@@ -575,7 +573,7 @@ fn a_binary_literal_prunes_a_binary_or_fixed_column_by_its_bytes() {
         translate_as_created(
             &json!({
                 "type": "predicate_equal",
-                "left": {"type": "column", "name": "B"},
+                "left": col("B"),
                 "right": {"type": "literal_string", "value": "00abff"},
             }),
             &schema

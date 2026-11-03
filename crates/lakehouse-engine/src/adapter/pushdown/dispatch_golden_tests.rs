@@ -6,6 +6,7 @@ use super::test_support::{
     agg_item, broadcast_sides, pd, sample_scan_storage, sample_storage, with_identifier_notes,
 };
 use super::*;
+use crate::adapter::pushdown::test_support::{aliased_col, col, table_col};
 
 fn fixed_shards() -> Vec<Vec<FileEntry>> {
     vec![
@@ -42,9 +43,9 @@ fn events_request(pushdown_req: Json) -> Json {
 pub(super) fn grouped_request() -> Json {
     events_request(serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
         "selectList": [
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             agg_item("SUM", Some("AMOUNT"), false),
         ],
         "selectListDataTypes": [
@@ -69,9 +70,9 @@ fn unmergeable_having_request() -> Json {
 fn group_by_fallback_request() -> Json {
     events_request(serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
         "selectList": [
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             agg_item("SUM", Some("NAME"), false),
         ],
         "selectListDataTypes": [
@@ -104,8 +105,8 @@ fn multi_count_distinct_decline_request() -> Json {
 pub(super) fn row_scan_request() -> Json {
     events_request(serde_json::json!({
         "selectList": [
-            {"type": "column", "name": "REGION"},
-            {"type": "column", "name": "AMOUNT"},
+            col("REGION"),
+            col("AMOUNT"),
         ],
         "selectListDataTypes": [
             {"type": "varchar", "size": 2000000},
@@ -543,7 +544,7 @@ fn empty_single_group_scalar_over_aggregate_matches_golden() {
 
 /// Every column node carries `tableAlias: "E"`, as for `FROM EVENTS e` (#193).
 fn aliased_grouped_request() -> Json {
-    let column = |name: &str| serde_json::json!({"type": "column", "name": name, "tableName": "EVENTS", "tableAlias": "E"});
+    let column = |name: &str| aliased_col("EVENTS", "E", name);
     events_request(serde_json::json!({
         "aggregationType": "group_by",
         "groupBy": [column("REGION")],
@@ -601,7 +602,7 @@ fn aliased_single_table_group_by_renders_bare_group_key_and_select_expr() {
 }
 
 fn aliased_multi_count_distinct_decline_request() -> Json {
-    let column = |name: &str| serde_json::json!({"type": "column", "name": name, "tableName": "EVENTS", "tableAlias": "E"});
+    let column = |name: &str| aliased_col("EVENTS", "E", name);
     events_request(serde_json::json!({
         "selectList": [
             {
@@ -729,13 +730,13 @@ fn single_group_all_agg_kinds_request() -> Json {
 /// The group key at ordinal 0 shifts the aggregates by one, exercising the
 /// plan-ordinal versus column-ordinal distinction.
 fn grouped_all_agg_kinds_request() -> Json {
-    let mut select_list = vec![serde_json::json!({"type": "column", "name": "REGION"})];
+    let mut select_list = vec![col("REGION")];
     select_list.extend(all_agg_kinds_select_list());
     let mut declared_types = vec![serde_json::json!({"type": "varchar", "size": 2000000})];
     declared_types.extend(all_agg_kinds_declared_types());
     all_agg_kinds_request(serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
         "selectList": select_list,
         "selectListDataTypes": declared_types,
     }))
@@ -783,13 +784,13 @@ fn two_table_join_request(filter: Option<Json>) -> Json {
             "right": {"name": "ORDERS", "type": "table"},
             "condition": {
                 "type": "predicate_equal",
-                "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-                "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+                "left": table_col("CUSTOMER", "C_CUSTKEY"),
+                "right": table_col("ORDERS", "O_CUSTKEY"),
             },
         },
         "selectList": [
-            {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-            {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+            table_col("CUSTOMER", "C_NAME"),
+            table_col("ORDERS", "O_ORDERDATE"),
         ],
     });
     if let Some(f) = filter {
@@ -946,7 +947,7 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
 
     let renderable_filter = serde_json::json!({
         "type": "predicate_equal",
-        "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+        "left": table_col("CUSTOMER", "C_NAME"),
         "right": {"type": "literal_string", "value": "ACME"},
     });
     let request = two_table_join_request(Some(renderable_filter));

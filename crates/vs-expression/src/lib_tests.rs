@@ -1,9 +1,13 @@
 use super::*;
 use serde_json::json;
 
+fn col(name: &str) -> Json {
+    json!({"type": "column", "name": name})
+}
+
 #[test]
 fn renders_column_as_quoted_uppercase_ident() {
-    let expr = json!({"type": "column", "name": "region"});
+    let expr = col("region");
     let sql = render_expression(&expr).unwrap();
     assert_eq!(sql, r#""REGION""#);
 }
@@ -106,7 +110,7 @@ fn timestamp_literal_with_sub_microsecond_digits_renders_nanoseconds() {
 fn renders_simple_equality() {
     let expr = json!({
         "type": "predicate_equal",
-        "left": {"type": "column", "name": "id"},
+        "left": col("id"),
         "right": {"type": "literal_exactnumeric", "value": 10}
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"("ID" = 10)"#);
@@ -117,8 +121,8 @@ fn renders_and_predicate() {
     let expr = json!({
         "type": "predicate_and",
         "expressions": [
-            {"type": "predicate_greater", "left": {"type": "column", "name": "age"}, "right": {"type": "literal_exactnumeric", "value": 18}},
-            {"type": "predicate_less", "left": {"type": "column", "name": "age"}, "right": {"type": "literal_exactnumeric", "value": 65}}
+            {"type": "predicate_greater", "left": col("age"), "right": {"type": "literal_exactnumeric", "value": 18}},
+            {"type": "predicate_less", "left": col("age"), "right": {"type": "literal_exactnumeric", "value": 65}}
         ]
     });
     let sql = render_expression(&expr).unwrap();
@@ -130,8 +134,8 @@ fn renders_or_predicate() {
     let expr = json!({
         "type": "predicate_or",
         "expressions": [
-            {"type": "predicate_equal", "left": {"type": "column", "name": "status"}, "right": {"type": "literal_string", "value": "A"}},
-            {"type": "predicate_equal", "left": {"type": "column", "name": "status"}, "right": {"type": "literal_string", "value": "B"}}
+            {"type": "predicate_equal", "left": col("status"), "right": {"type": "literal_string", "value": "A"}},
+            {"type": "predicate_equal", "left": col("status"), "right": {"type": "literal_string", "value": "B"}}
         ]
     });
     let sql = render_expression(&expr).unwrap();
@@ -142,7 +146,7 @@ fn renders_or_predicate() {
 fn renders_not_predicate() {
     let expr = json!({
         "type": "predicate_not",
-        "expression": {"type": "predicate_equal", "left": {"type": "column", "name": "active"}, "right": {"type": "literal_bool", "value": true}}
+        "expression": {"type": "predicate_equal", "left": col("active"), "right": {"type": "literal_bool", "value": true}}
     });
     let sql = render_expression(&expr).unwrap();
     assert!(sql.contains("NOT"), "NOT not found in: {sql}");
@@ -162,14 +166,13 @@ fn renders_empty_or_as_false() {
 
 #[test]
 fn renders_is_null() {
-    let expr = json!({"type": "predicate_is_null", "expression": {"type": "column", "name": "x"}});
+    let expr = json!({"type": "predicate_is_null", "expression": col("x")});
     assert_eq!(render_expression(&expr).unwrap(), r#"("X" IS NULL)"#);
 }
 
 #[test]
 fn renders_is_not_null() {
-    let expr =
-        json!({"type": "predicate_is_not_null", "expression": {"type": "column", "name": "x"}});
+    let expr = json!({"type": "predicate_is_not_null", "expression": col("x")});
     assert_eq!(render_expression(&expr).unwrap(), r#"("X" IS NOT NULL)"#);
 }
 
@@ -177,7 +180,7 @@ fn renders_is_not_null() {
 fn renders_in_constlist() {
     let expr = json!({
         "type": "predicate_in_constlist",
-        "expression": {"type": "column", "name": "status"},
+        "expression": col("status"),
         "arguments": [
             {"type": "literal_string", "value": "A"},
             {"type": "literal_string", "value": "B"}
@@ -193,7 +196,7 @@ fn renders_in_constlist() {
 fn renders_empty_in_as_false() {
     let expr = json!({
         "type": "predicate_in_constlist",
-        "expression": {"type": "column", "name": "x"},
+        "expression": col("x"),
         "arguments": []
     });
     assert_eq!(render_expression(&expr).unwrap(), "FALSE");
@@ -203,7 +206,7 @@ fn renders_empty_in_as_false() {
 fn renders_in_constlist_strips_null() {
     let expr = json!({
         "type": "predicate_in_constlist",
-        "expression": {"type": "column", "name": "status"},
+        "expression": col("status"),
         "arguments": [
             {"type": "literal_string", "value": "A"},
             {"type": "literal_null"},
@@ -219,7 +222,7 @@ fn renders_in_constlist_strips_null() {
 fn renders_all_null_in_as_false() {
     let expr = json!({
         "type": "predicate_in_constlist",
-        "expression": {"type": "column", "name": "x"},
+        "expression": col("x"),
         "arguments": [
             {"type": "literal_null"},
             {"type": "literal_date", "value": null}
@@ -234,7 +237,7 @@ fn renders_not_in_constlist_strips_null() {
         "type": "predicate_not",
         "expression": {
             "type": "predicate_in_constlist",
-            "expression": {"type": "column", "name": "status"},
+            "expression": col("status"),
             "arguments": [
                 {"type": "literal_string", "value": "A"},
                 {"type": "literal_null"},
@@ -250,7 +253,7 @@ fn renders_not_in_constlist_strips_null() {
 fn renders_between() {
     let expr = json!({
         "type": "predicate_between",
-        "expression": {"type": "column", "name": "age"},
+        "expression": col("age"),
         "left": {"type": "literal_exactnumeric", "value": 18},
         "right": {"type": "literal_exactnumeric", "value": 65}
     });
@@ -264,7 +267,7 @@ fn renders_between() {
 fn renders_like_without_escape() {
     let expr = json!({
         "type": "predicate_like",
-        "expression": {"type": "column", "name": "name"},
+        "expression": col("name"),
         "pattern": {"type": "literal_string", "value": "A%"}
     });
     let sql = render_expression(&expr).unwrap();
@@ -276,7 +279,7 @@ fn renders_like_without_escape() {
 fn renders_like_with_escape() {
     let expr = json!({
         "type": "predicate_like",
-        "expression": {"type": "column", "name": "name"},
+        "expression": col("name"),
         "pattern": {"type": "literal_string", "value": "A!%"},
         "escape_char": "!"
     });
@@ -292,7 +295,7 @@ fn renders_arithmetic_add() {
         "type": "function_scalar",
         "name": "ADD",
         "arguments": [
-            {"type": "column", "name": "a"},
+            col("a"),
             {"type": "literal_exactnumeric", "value": 1}
         ]
     });
@@ -305,7 +308,7 @@ fn renders_arithmetic_sub() {
         "type": "function_scalar",
         "name": "SUB",
         "arguments": [
-            {"type": "column", "name": "a"},
+            col("a"),
             {"type": "literal_exactnumeric", "value": 1}
         ]
     });
@@ -318,7 +321,7 @@ fn renders_arithmetic_mul() {
         "type": "function_scalar",
         "name": "MULT",
         "arguments": [
-            {"type": "column", "name": "a"},
+            col("a"),
             {"type": "literal_exactnumeric", "value": 2}
         ]
     });
@@ -331,8 +334,8 @@ fn legacy_mul_name_is_not_recognized() {
         "type": "function_scalar",
         "name": "MUL",
         "arguments": [
-            {"type": "column", "name": "a"},
-            {"type": "column", "name": "b"}
+            col("a"),
+            col("b")
         ]
     });
     assert!(
@@ -347,8 +350,8 @@ fn renders_two_column_arithmetic_product() {
         "type": "function_scalar",
         "name": "MULT",
         "arguments": [
-            {"type": "column", "name": "l_extendedprice"},
-            {"type": "column", "name": "l_discount"}
+            col("l_extendedprice"),
+            col("l_discount")
         ]
     });
     assert_eq!(
@@ -391,8 +394,8 @@ fn arithmetic_operator_set_matches_advertised_capabilities() {
             "type": "function_scalar",
             "name": node,
             "arguments": [
-                {"type": "column", "name": "l_extendedprice"},
-                {"type": "column", "name": "l_discount"}
+                col("l_extendedprice"),
+                col("l_discount")
             ]
         });
         assert_eq!(
@@ -409,7 +412,7 @@ fn float_div_calls_checked_division_for_column_left_operand_and_literal_right_op
         "type": "function_scalar",
         "name": "FLOAT_DIV",
         "arguments": [
-            {"type": "column", "name": "a"},
+            col("a"),
             {"type": "literal_exactnumeric", "value": 2}
         ]
     });
@@ -425,8 +428,8 @@ fn float_div_calls_checked_division_for_column_left_operand_and_column_right_ope
         "type": "function_scalar",
         "name": "FLOAT_DIV",
         "arguments": [
-            {"type": "column", "name": "a"},
-            {"type": "column", "name": "b"}
+            col("a"),
+            col("b")
         ]
     });
     assert_eq!(
@@ -442,7 +445,7 @@ fn float_div_calls_checked_division_for_literal_left_operand_and_column_right_op
         "name": "FLOAT_DIV",
         "arguments": [
             {"type": "literal_exactnumeric", "value": 10},
-            {"type": "column", "name": "b"}
+            col("b")
         ]
     });
     assert_eq!(
@@ -477,11 +480,11 @@ fn float_div_calls_checked_division_for_nested_expression_left_and_column_right(
                 "type": "function_scalar",
                 "name": "ADD",
                 "arguments": [
-                    {"type": "column", "name": "a"},
-                    {"type": "column", "name": "b"}
+                    col("a"),
+                    col("b")
                 ]
             },
-            {"type": "column", "name": "c"}
+            col("c")
         ]
     });
     assert_eq!(
@@ -500,8 +503,8 @@ fn float_div_calls_checked_division_for_nested_expression_left_and_literal_right
                 "type": "function_scalar",
                 "name": "ADD",
                 "arguments": [
-                    {"type": "column", "name": "a"},
-                    {"type": "column", "name": "b"}
+                    col("a"),
+                    col("b")
                 ]
             },
             {"type": "literal_exactnumeric", "value": 2}
@@ -522,10 +525,10 @@ fn float_div_calls_checked_division_for_aggregate_left_operand_and_column_right_
             {
                 "type": "function_aggregate",
                 "name": "SUM",
-                "arguments": [{"type": "column", "name": "amount"}],
+                "arguments": [col("amount")],
                 "distinct": false
             },
-            {"type": "column", "name": "c"}
+            col("c")
         ]
     });
     assert_eq!(
@@ -543,7 +546,7 @@ fn float_div_calls_checked_division_for_aggregate_left_operand_and_literal_right
             {
                 "type": "function_aggregate",
                 "name": "SUM",
-                "arguments": [{"type": "column", "name": "amount"}],
+                "arguments": [col("amount")],
                 "distinct": false
             },
             {"type": "literal_exactnumeric", "value": 2}
@@ -562,7 +565,7 @@ fn float_div_with_null_left_operand_passes_the_null_literal_to_checked_division(
         "name": "FLOAT_DIV",
         "arguments": [
             {"type": "literal_null"},
-            {"type": "column", "name": "b"}
+            col("b")
         ]
     });
     assert_eq!(
@@ -577,7 +580,7 @@ fn float_div_with_null_right_operand_passes_null_to_checked_division() {
         "type": "function_scalar",
         "name": "FLOAT_DIV",
         "arguments": [
-            {"type": "column", "name": "a"},
+            col("a"),
             {"type": "literal_null"}
         ]
     });
@@ -609,7 +612,7 @@ fn renders_arithmetic_neg() {
         "type": "function_scalar",
         "name": "NEG",
         "arguments": [
-            {"type": "column", "name": "a"}
+            col("a")
         ]
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"(-"A")"#);
@@ -623,7 +626,7 @@ fn neg_composes_with_aggregate_decomposition() {
         "arguments": [{
             "type": "function_scalar",
             "name": "NEG",
-            "arguments": [{"type": "column", "name": "col"}]
+            "arguments": [col("col")]
         }],
         "distinct": false
     });
@@ -635,7 +638,7 @@ fn renders_cast_varchar() {
     let expr = json!({
         "type": "function_scalar_cast",
         "name": "CAST",
-        "arguments": [{"type": "column", "name": "x"}],
+        "arguments": [col("x")],
         "dataType": {"type": "VARCHAR", "size": 100}
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
@@ -646,7 +649,7 @@ fn renders_cast_decimal() {
     let expr = json!({
         "type": "function_scalar_cast",
         "name": "CAST",
-        "arguments": [{"type": "column", "name": "x"}],
+        "arguments": [col("x")],
         "dataType": {"type": "DECIMAL", "precision": 10, "scale": 2}
     });
     assert_eq!(
@@ -660,7 +663,7 @@ fn renders_cast_double() {
     let expr = json!({
         "type": "function_scalar_cast",
         "name": "CAST",
-        "arguments": [{"type": "column", "name": "x"}],
+        "arguments": [col("x")],
         "dataType": {"type": "DOUBLE"}
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS DOUBLE)"#);
@@ -671,7 +674,7 @@ fn renders_cast_date() {
     let expr = json!({
         "type": "function_scalar_cast",
         "name": "CAST",
-        "arguments": [{"type": "column", "name": "x"}],
+        "arguments": [col("x")],
         "dataType": {"type": "DATE"}
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS DATE)"#);
@@ -682,7 +685,7 @@ fn renders_cast_char_as_datafusion_varchar() {
     let expr = json!({
         "type": "function_scalar_cast",
         "name": "CAST",
-        "arguments": [{"type": "column", "name": "x"}],
+        "arguments": [col("x")],
         "dataType": {"type": "CHAR", "size": 3, "characterSet": "ASCII"}
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
@@ -693,7 +696,7 @@ fn renders_cast_char_as_exasol_char() {
     let expr = json!({
         "type": "function_scalar_cast",
         "name": "CAST",
-        "arguments": [{"type": "column", "name": "x"}],
+        "arguments": [col("x")],
         "dataType": {"type": "CHAR", "size": 3, "characterSet": "ASCII"}
     });
     assert_eq!(
@@ -709,7 +712,7 @@ fn renders_cast_bool_to_varchar_as_exasol_case_uppercase() {
         "name": "CAST",
         "arguments": [{
             "type": "predicate_greater",
-            "left": {"type": "column", "name": "c_acctbal"},
+            "left": col("c_acctbal"),
             "right": {"type": "literal_exactnumeric", "value": 0}
         }],
         "dataType": {"type": "VARCHAR", "size": 10}
@@ -727,7 +730,7 @@ fn renders_cast_bool_to_varchar_uses_case_for_any_predicate_source() {
         "name": "CAST",
         "arguments": [{
             "type": "predicate_is_null",
-            "expression": {"type": "column", "name": "x"}
+            "expression": col("x")
         }],
         "dataType": {"type": "VARCHAR", "size": 10}
     });
@@ -742,7 +745,7 @@ fn renders_cast_boolean() {
     let expr = json!({
         "type": "function_scalar_cast",
         "name": "CAST",
-        "arguments": [{"type": "column", "name": "x"}],
+        "arguments": [col("x")],
         "dataType": {"type": "BOOLEAN"}
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS BOOLEAN)"#);
@@ -753,7 +756,7 @@ fn renders_cast_timestamp_without_local_time_zone() {
     let expr = json!({
         "type": "function_scalar_cast",
         "name": "CAST",
-        "arguments": [{"type": "column", "name": "x"}],
+        "arguments": [col("x")],
         "dataType": {"type": "TIMESTAMP", "withLocalTimeZone": false, "fractionalSecondsPrecision": 3}
     });
     assert_eq!(
@@ -768,7 +771,7 @@ fn renders_cast_timestamp_precision_per_dialect() {
         json!({
             "type": "function_scalar_cast",
             "name": "CAST",
-            "arguments": [{"type": "column", "name": "x"}],
+            "arguments": [col("x")],
             "dataType": data_type
         })
     }
@@ -840,7 +843,7 @@ fn cast_to_unsupported_target_declines() {
         let expr = json!({
             "type": "function_scalar_cast",
             "name": "CAST",
-            "arguments": [{"type": "column", "name": "x"}],
+            "arguments": [col("x")],
             "dataType": data_type.clone()
         });
         assert!(
@@ -859,7 +862,7 @@ fn renders_cast_nested_function_scalar_defensive() {
     let expr = json!({
         "type": "function_scalar",
         "name": "CAST",
-        "arguments": [{"type": "column", "name": "x"}],
+        "arguments": [col("x")],
         "dataType": {"type": "VARCHAR", "size": 100}
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
@@ -869,7 +872,7 @@ fn renders_cast_nested_function_scalar_defensive() {
 fn renders_decimal_to_varchar_exasol() {
     let expr = json!({
         "type": "decimal_to_varchar_exasol",
-        "arguments": [{"type": "column", "name": "c_decimal_a"}]
+        "arguments": [col("c_decimal_a")]
     });
     let expected = format_decimal_exasol_style(r#""C_DECIMAL_A""#);
     assert_eq!(render_expression(&expr).unwrap(), expected);
@@ -885,8 +888,8 @@ fn decimal_to_varchar_exasol_wrong_arity_errors() {
     let two_args = json!({
         "type": "decimal_to_varchar_exasol",
         "arguments": [
-            {"type": "column", "name": "c_decimal_a"},
-            {"type": "column", "name": "c_decimal_b"}
+            col("c_decimal_a"),
+            col("c_decimal_b")
         ]
     });
     for expr in [&no_args, &two_args] {
@@ -1087,7 +1090,7 @@ fn renders_math_scalar_functions() {
         let expr = json!({
             "type": "function_scalar",
             "name": exasol,
-            "arguments": [{"type": "column", "name": "x"}]
+            "arguments": [col("x")]
         });
         let sql = render_expression(&expr).unwrap();
         assert_eq!(sql, format!(r#"{df}("X")"#), "failed for {exasol}");
@@ -1097,7 +1100,7 @@ fn renders_math_scalar_functions() {
         "type": "function_scalar",
         "name": "POWER",
         "arguments": [
-            {"type": "column", "name": "x"},
+            col("x"),
             {"type": "literal_exactnumeric", "value": 2}
         ]
     });
@@ -1107,8 +1110,8 @@ fn renders_math_scalar_functions() {
         "type": "function_scalar",
         "name": "ATAN2",
         "arguments": [
-            {"type": "column", "name": "y"},
-            {"type": "column", "name": "x"}
+            col("y"),
+            col("x")
         ]
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"atan2("Y", "X")"#);
@@ -1116,14 +1119,14 @@ fn renders_math_scalar_functions() {
     let expr = json!({
         "type": "function_scalar",
         "name": "ROUND",
-        "arguments": [{"type": "column", "name": "v"}, {"type": "literal_exactnumeric", "value": 2}]
+        "arguments": [col("v"), {"type": "literal_exactnumeric", "value": 2}]
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"round("V", 2)"#);
 
     let expr = json!({
         "type": "function_scalar",
         "name": "TRUNC",
-        "arguments": [{"type": "column", "name": "v"}]
+        "arguments": [col("v")]
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"trunc("V")"#);
 
@@ -1131,8 +1134,8 @@ fn renders_math_scalar_functions() {
         "type": "function_scalar",
         "name": "ABS",
         "arguments": [
-            {"type": "column", "name": "x"},
-            {"type": "column", "name": "y"}
+            col("x"),
+            col("y")
         ]
     });
     assert!(render_expression_safe(&expr).is_none());
@@ -1144,7 +1147,7 @@ fn renders_mod_as_operator() {
         "type": "function_scalar",
         "name": "MOD",
         "arguments": [
-            {"type": "column", "name": "a"},
+            col("a"),
             {"type": "literal_exactnumeric", "value": 3}
         ]
     });
@@ -1157,7 +1160,7 @@ fn renders_mod_as_function_call_in_exasol_dialect() {
         "type": "function_scalar",
         "name": "MOD",
         "arguments": [
-            {"type": "column", "name": "a"},
+            col("a"),
             {"type": "literal_exactnumeric", "value": 3}
         ]
     });
@@ -1189,7 +1192,7 @@ fn renders_string_scalar_functions() {
         let expr = json!({
             "type": "function_scalar",
             "name": name,
-            "arguments": [{"type": "column", "name": "s"}]
+            "arguments": [col("s")]
         });
         let sql = render_expression(&expr).unwrap();
         assert_eq!(
@@ -1202,7 +1205,7 @@ fn renders_string_scalar_functions() {
     let expr = json!({
         "type": "function_scalar",
         "name": "LENGTH",
-        "arguments": [{"type": "column", "name": "s"}]
+        "arguments": [col("s")]
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
@@ -1212,21 +1215,21 @@ fn renders_string_scalar_functions() {
     let expr = json!({
         "type": "function_scalar",
         "name": "OCTET_LENGTH",
-        "arguments": [{"type": "column", "name": "s"}]
+        "arguments": [col("s")]
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"octet_length("S")"#);
 
     let expr = json!({
         "type": "function_scalar",
         "name": "UNICODE",
-        "arguments": [{"type": "column", "name": "s"}]
+        "arguments": [col("s")]
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"ascii("S")"#);
 
     let expr = json!({
         "type": "function_scalar",
         "name": "UNICODECHR",
-        "arguments": [{"type": "column", "name": "n"}]
+        "arguments": [col("n")]
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"chr("N")"#);
 
@@ -1234,7 +1237,7 @@ fn renders_string_scalar_functions() {
         "type": "function_scalar",
         "name": "SUBSTR",
         "arguments": [
-            {"type": "column", "name": "s"},
+            col("s"),
             {"type": "literal_exactnumeric", "value": 1},
             {"type": "literal_exactnumeric", "value": 3}
         ]
@@ -1268,7 +1271,7 @@ fn renders_concat_as_nullif_wrapped_concat_call() {
         "type": "function_scalar",
         "name": "CONCAT",
         "arguments": [
-            {"type": "column", "name": "s"},
+            col("s"),
             {"type": "literal_string", "value": ""}
         ]
     });
@@ -1281,9 +1284,9 @@ fn renders_concat_as_nullif_wrapped_concat_call() {
         "type": "function_scalar",
         "name": "CONCAT",
         "arguments": [
-            {"type": "column", "name": "a"},
-            {"type": "column", "name": "b"},
-            {"type": "column", "name": "c"}
+            col("a"),
+            col("b"),
+            col("c")
         ]
     });
     assert_eq!(
@@ -1299,7 +1302,7 @@ fn renders_concat_bool_operand_as_exasol_case() {
         "name": "CONCAT",
         "arguments": [
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "active"},
+             "left": col("active"),
              "right": {"type": "literal_bool", "value": true}},
             {"type": "literal_string", "value": ""}
         ]
@@ -1316,7 +1319,7 @@ fn renders_concat_as_chained_pipe_operator_in_exasol_dialect() {
         "type": "function_scalar",
         "name": "CONCAT",
         "arguments": [
-            {"type": "column", "name": "s"},
+            col("s"),
             {"type": "literal_string", "value": ""}
         ]
     });
@@ -1326,9 +1329,9 @@ fn renders_concat_as_chained_pipe_operator_in_exasol_dialect() {
         "type": "function_scalar",
         "name": "CONCAT",
         "arguments": [
-            {"type": "column", "name": "a"},
-            {"type": "column", "name": "b"},
-            {"type": "column", "name": "c"}
+            col("a"),
+            col("b"),
+            col("c")
         ]
     });
     assert_eq!(
@@ -1341,7 +1344,7 @@ fn renders_concat_as_chained_pipe_operator_in_exasol_dialect() {
         "name": "CONCAT",
         "arguments": [
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "active"},
+             "left": col("active"),
              "right": {"type": "literal_bool", "value": true}},
             {"type": "literal_string", "value": ""}
         ]
@@ -1361,10 +1364,10 @@ fn renders_nested_concat_wrapper_per_level() {
             {"type": "function_scalar",
              "name": "CONCAT",
              "arguments": [
-                 {"type": "column", "name": "a"},
-                 {"type": "column", "name": "b"}
+                 col("a"),
+                 col("b")
              ]},
-            {"type": "column", "name": "c"}
+            col("c")
         ]
     });
     assert_eq!(
@@ -1382,7 +1385,7 @@ fn renders_concat_single_argument() {
     let expr = json!({
         "type": "function_scalar",
         "name": "CONCAT",
-        "arguments": [{"type": "column", "name": "s"}]
+        "arguments": [col("s")]
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
@@ -1427,7 +1430,7 @@ fn concat_missing_arguments_or_null_argument_errors_in_both_dialects() {
         "type": "function_scalar",
         "name": "CONCAT",
         "arguments": [
-            {"type": "column", "name": "a"},
+            col("a"),
             null
         ]
     });
@@ -1448,7 +1451,7 @@ fn renders_case_when() {
         "name": "CASE",
         "arguments": [
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "status"},
+             "left": col("status"),
              "right": {"type": "literal_string", "value": "A"}},
             {"type": "literal_exactnumeric", "value": 1}
         ]
@@ -1461,11 +1464,11 @@ fn renders_case_when() {
         "name": "CASE",
         "arguments": [
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "x"},
+             "left": col("x"),
              "right": {"type": "literal_exactnumeric", "value": 1}},
             {"type": "literal_string", "value": "one"},
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "x"},
+             "left": col("x"),
              "right": {"type": "literal_exactnumeric", "value": 2}},
             {"type": "literal_string", "value": "two"},
             {"type": "literal_string", "value": "other"}
@@ -1491,9 +1494,9 @@ fn renders_greatest_least() {
         "type": "function_scalar",
         "name": "GREATEST",
         "arguments": [
-            {"type": "column", "name": "a"},
-            {"type": "column", "name": "b"},
-            {"type": "column", "name": "c"}
+            col("a"),
+            col("b"),
+            col("c")
         ]
     });
     assert_eq!(
@@ -1505,7 +1508,7 @@ fn renders_greatest_least() {
         "type": "function_scalar",
         "name": "LEAST",
         "arguments": [
-            {"type": "column", "name": "x"},
+            col("x"),
             {"type": "literal_exactnumeric", "value": 0}
         ]
     });
@@ -1520,7 +1523,7 @@ fn renders_greatest_least_single_argument_guard() {
     let greatest = json!({
         "type": "function_scalar",
         "name": "GREATEST",
-        "arguments": [{"type": "column", "name": "a"}]
+        "arguments": [col("a")]
     });
     assert_eq!(
         render_expression(&greatest).unwrap(),
@@ -1530,7 +1533,7 @@ fn renders_greatest_least_single_argument_guard() {
     let least = json!({
         "type": "function_scalar",
         "name": "LEAST",
-        "arguments": [{"type": "column", "name": "a"}]
+        "arguments": [col("a")]
     });
     assert_eq!(
         render_expression(&least).unwrap(),
@@ -1544,8 +1547,8 @@ fn renders_greatest_least_with_literal_null_argument() {
         "type": "function_scalar",
         "name": "LEAST",
         "arguments": [
-            {"type": "column", "name": "x"},
-            {"type": "column", "name": "y"},
+            col("x"),
+            col("y"),
             {"type": "literal_null"}
         ]
     });
@@ -1564,9 +1567,9 @@ fn renders_greatest_least_nested_argument_once_referenced_twice() {
             {
                 "type": "function_scalar",
                 "name": "ABS",
-                "arguments": [{"type": "column", "name": "y"}]
+                "arguments": [col("y")]
             },
-            {"type": "column", "name": "z"}
+            col("z")
         ]
     });
     assert_eq!(
@@ -1585,11 +1588,11 @@ fn renders_nested_greatest_guard_referencing_the_inner_case_twice() {
                 "type": "function_scalar",
                 "name": "GREATEST",
                 "arguments": [
-                    {"type": "column", "name": "a"},
-                    {"type": "column", "name": "b"}
+                    col("a"),
+                    col("b")
                 ]
             },
-            {"type": "column", "name": "c"}
+            col("c")
         ]
     });
     assert_eq!(
@@ -1642,14 +1645,14 @@ fn renders_nullifzero_zeroifnull() {
     let expr = json!({
         "type": "function_scalar",
         "name": "NULLIFZERO",
-        "arguments": [{"type": "column", "name": "v"}]
+        "arguments": [col("v")]
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"nullif("V", 0)"#);
 
     let expr2 = json!({
         "type": "function_scalar",
         "name": "ZEROIFNULL",
-        "arguments": [{"type": "column", "name": "v"}]
+        "arguments": [col("v")]
     });
     assert_eq!(render_expression(&expr2).unwrap(), r#"coalesce("V", 0)"#);
 }
@@ -1664,7 +1667,7 @@ fn renders_nullif_of_mod() {
                 "type": "function_scalar",
                 "name": "MOD",
                 "arguments": [
-                    {"type": "column", "name": "id"},
+                    col("id"),
                     {"type": "literal_exactnumeric", "value": "5"}
                 ]
             },
@@ -1683,7 +1686,7 @@ fn renders_simple_case_from_nullif_expansion() {
         "type": "function_scalar",
         "name": "MOD",
         "arguments": [
-            {"type": "column", "name": "ID"},
+            col("ID"),
             {"type": "literal_exactnumeric", "value": "5"}
         ]
     });
@@ -1710,7 +1713,7 @@ fn renders_searched_case_without_basis() {
         "name": "CASE",
         "arguments": [
             {"type": "predicate_less",
-             "left": {"type": "column", "name": "SCORE"},
+             "left": col("SCORE"),
              "right": {"type": "literal_exactnumeric", "value": "50"}}
         ],
         "results": [
@@ -1729,7 +1732,7 @@ fn renders_case_without_else() {
     let expr = json!({
         "type": "function_scalar_case",
         "name": "CASE",
-        "basis": {"type": "column", "name": "ID"},
+        "basis": col("ID"),
         "arguments": [{"type": "literal_exactnumeric", "value": "1"}],
         "results": [{"type": "literal_string", "value": "one"}]
     });
@@ -1745,7 +1748,7 @@ fn renders_extract() {
         "type": "function_scalar_extract",
         "name": "EXTRACT",
         "toExtract": "YEAR",
-        "arguments": [{"type": "column", "name": "ts"}]
+        "arguments": [col("ts")]
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
@@ -1756,7 +1759,7 @@ fn renders_extract() {
         "type": "function_scalar_extract",
         "name": "EXTRACT",
         "toExtract": "MONTH",
-        "arguments": [{"type": "column", "name": "ts"}]
+        "arguments": [col("ts")]
     });
     assert_eq!(
         render_expression(&expr2).unwrap(),
@@ -1770,7 +1773,7 @@ fn renders_extract_as_exasol_extract_from_in_exasol_dialect() {
         "type": "function_scalar_extract",
         "name": "EXTRACT",
         "toExtract": "DAY",
-        "arguments": [{"type": "column", "name": "ts"}]
+        "arguments": [col("ts")]
     });
     assert_eq!(
         render_expression_exasol(&expr).unwrap(),
@@ -1789,7 +1792,7 @@ fn renders_year_month_day_extract() {
         let expr = json!({
             "type": "function_scalar",
             "name": field,
-            "arguments": [{"type": "column", "name": "ts"}]
+            "arguments": [col("ts")]
         });
         let sql = render_expression(&expr).unwrap();
         assert_eq!(
@@ -1807,7 +1810,7 @@ fn renders_date_trunc() {
         "name": "DATE_TRUNC",
         "arguments": [
             {"type": "literal_string", "value": "month"},
-            {"type": "column", "name": "ts"}
+            col("ts")
         ]
     });
     assert_eq!(
@@ -1857,7 +1860,7 @@ fn renders_to_date_to_timestamp() {
     let expr = json!({
         "type": "function_scalar",
         "name": "TO_DATE",
-        "arguments": [{"type": "column", "name": "s"}]
+        "arguments": [col("s")]
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"to_date("S")"#);
 
@@ -1865,7 +1868,7 @@ fn renders_to_date_to_timestamp() {
         "type": "function_scalar",
         "name": "TO_DATE",
         "arguments": [
-            {"type": "column", "name": "s"},
+            col("s"),
             {"type": "literal_string", "value": "YYYY-MM-DD"}
         ]
     });
@@ -1877,7 +1880,7 @@ fn renders_to_date_to_timestamp() {
     let expr3 = json!({
         "type": "function_scalar",
         "name": "TO_TIMESTAMP",
-        "arguments": [{"type": "column", "name": "s"}]
+        "arguments": [col("s")]
     });
     assert_eq!(render_expression(&expr3).unwrap(), r#"to_timestamp("S")"#);
 
@@ -1885,7 +1888,7 @@ fn renders_to_date_to_timestamp() {
         "type": "function_scalar",
         "name": "TO_TIMESTAMP",
         "arguments": [
-            {"type": "column", "name": "s"},
+            col("s"),
             {"type": "literal_string", "value": "YYYY-MM-DD HH24:MI:SS"}
         ]
     });
@@ -1900,7 +1903,7 @@ fn renders_week_as_iso_date_part() {
     let expr = json!({
         "type": "function_scalar",
         "name": "WEEK",
-        "arguments": [{"type": "column", "name": "d"}]
+        "arguments": [col("d")]
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
@@ -1933,8 +1936,8 @@ fn week_with_wrong_arity_falls_back() {
         "type": "function_scalar",
         "name": "WEEK",
         "arguments": [
-            {"type": "column", "name": "d"},
-            {"type": "column", "name": "e"}
+            col("d"),
+            col("e")
         ]
     });
     assert!(render_expression(&expr).is_err());
@@ -1947,8 +1950,8 @@ fn renders_days_between_as_date_difference() {
         "type": "function_scalar",
         "name": "DAYS_BETWEEN",
         "arguments": [
-            {"type": "column", "name": "a"},
-            {"type": "column", "name": "b"}
+            col("a"),
+            col("b")
         ]
     });
     assert_eq!(
@@ -1963,8 +1966,8 @@ fn renders_time_between_as_epoch_difference() {
         "type": "function_scalar",
         "name": "HOURS_BETWEEN",
         "arguments": [
-            {"type": "column", "name": "a"},
-            {"type": "column", "name": "b"}
+            col("a"),
+            col("b")
         ]
     });
     assert_eq!(
@@ -1976,8 +1979,8 @@ fn renders_time_between_as_epoch_difference() {
         "type": "function_scalar",
         "name": "MINUTES_BETWEEN",
         "arguments": [
-            {"type": "column", "name": "a"},
-            {"type": "column", "name": "b"}
+            col("a"),
+            col("b")
         ]
     });
     assert_eq!(
@@ -1989,8 +1992,8 @@ fn renders_time_between_as_epoch_difference() {
         "type": "function_scalar",
         "name": "SECONDS_BETWEEN",
         "arguments": [
-            {"type": "column", "name": "a"},
-            {"type": "column", "name": "b"}
+            col("a"),
+            col("b")
         ]
     });
     assert_eq!(
@@ -2010,7 +2013,7 @@ fn between_fns_reject_wrong_arity() {
         let one_arg = json!({
             "type": "function_scalar",
             "name": name,
-            "arguments": [{"type": "column", "name": "a"}]
+            "arguments": [col("a")]
         });
         assert!(
             render_expression(&one_arg).is_err(),
@@ -2025,9 +2028,9 @@ fn between_fns_reject_wrong_arity() {
             "type": "function_scalar",
             "name": name,
             "arguments": [
-                {"type": "column", "name": "a"},
-                {"type": "column", "name": "b"},
-                {"type": "column", "name": "c"}
+                col("a"),
+                col("b"),
+                col("c")
             ]
         });
         assert!(
@@ -2047,7 +2050,7 @@ fn second_with_precision_declines_for_datafusion_renders_for_exasol() {
         "type": "function_scalar",
         "name": "SECOND",
         "arguments": [
-            {"type": "column", "name": "ts"},
+            col("ts"),
             {"type": "literal_exactnumeric", "value": 3}
         ]
     });
@@ -2070,8 +2073,8 @@ fn div_falls_through_as_unsupported() {
         "type": "function_scalar",
         "name": "DIV",
         "arguments": [
-            {"type": "column", "name": "a"},
-            {"type": "column", "name": "b"}
+            col("a"),
+            col("b")
         ]
     });
     let err = render_expression(&expr).unwrap_err();
@@ -2095,7 +2098,7 @@ fn to_char_and_to_number_fall_through_as_unsupported() {
             "type": "function_scalar",
             "name": name,
             "arguments": [
-                {"type": "column", "name": "a"},
+                col("a"),
                 {"type": "literal_string", "value": "999.99"}
             ]
         });
@@ -2128,7 +2131,7 @@ fn regexp_scalar_functions_decline_in_both_dialects() {
             "type": "function_scalar",
             "name": name,
             "arguments": [
-                {"type": "column", "name": "s"},
+                col("s"),
                 {"type": "literal_string", "value": "a+"}
             ]
         });
@@ -2158,7 +2161,7 @@ fn regexp_scalar_functions_decline_in_both_dialects() {
 fn regexp_like_predicate_declines_in_both_dialects() {
     let expr = json!({
         "type": "predicate_like_regexp",
-        "expression": {"type": "column", "name": "name"},
+        "expression": col("name"),
         "pattern": {"type": "literal_string", "value": "^A.*"}
     });
     let expected = "unsupported expression node type: predicate_like_regexp";
@@ -2194,8 +2197,8 @@ fn bitwise_operator_functions_fall_through() {
             "type": "function_scalar",
             "name": name,
             "arguments": [
-                {"type": "column", "name": "a"},
-                {"type": "column", "name": "b"}
+                col("a"),
+                col("b")
             ]
         });
         let err = render_expression(&expr).unwrap_err();
@@ -2220,7 +2223,7 @@ fn bitwise_operator_functions_fall_through() {
 fn undeclared_scalar_function_declines_in_both_dialects() {
     // Beyond SUBSTRING/SOUNDEX, the rows pin the gate's edges: case-insensitive lookup,
     // declaration checked before `arguments`, and a missing `name`.
-    let arg = json!([{"type": "column", "name": "a"}]);
+    let arg = json!([col("a")]);
     let cases = [
         (
             "SUBSTRING",
@@ -2286,7 +2289,7 @@ fn unsupported_date_functions_decline_in_both_dialects() {
         let expr = json!({
             "type": "function_scalar",
             "name": name,
-            "arguments": [{"type": "column", "name": "x"}]
+            "arguments": [col("x")]
         });
         let expected = format!("unsupported scalar function: {name}");
         assert_eq!(
@@ -2315,7 +2318,7 @@ fn render_expression_renders_aggregate_nodes() {
     let sum = json!({
         "type": "function_aggregate",
         "name": "SUM",
-        "arguments": [{"type": "column", "name": "col"}],
+        "arguments": [col("col")],
         "distinct": false
     });
     assert_eq!(render_expression(&sum).unwrap(), r#"SUM("COL")"#);
@@ -2331,7 +2334,7 @@ fn render_expression_renders_aggregate_nodes() {
     let count_distinct = json!({
         "type": "function_aggregate",
         "name": "COUNT",
-        "arguments": [{"type": "column", "name": "col"}],
+        "arguments": [col("col")],
         "distinct": true
     });
     assert_eq!(
@@ -2342,7 +2345,7 @@ fn render_expression_renders_aggregate_nodes() {
     let avg = json!({
         "type": "function_aggregate",
         "name": "AVG",
-        "arguments": [{"type": "column", "name": "col"}],
+        "arguments": [col("col")],
         "distinct": false
     });
     assert_eq!(render_expression(&avg).unwrap(), r#"AVG("COL")"#);
@@ -2369,7 +2372,7 @@ fn render_expression_renders_scalar_wrapping_aggregates() {
             "name": "CASE",
             "arguments": [
                 {"type": "predicate_equal",
-                 "left": {"type": "column", "name": "l_returnflag"},
+                 "left": col("l_returnflag"),
                  "right": {"type": "literal_string", "value": "R"}},
                 {"type": "literal_exactnumeric", "value": 1},
                 {"type": "literal_exactnumeric", "value": 0}
@@ -2431,7 +2434,7 @@ fn aggregate_with_unrenderable_argument_declines() {
 fn renders_cast_varchar_exasol_dialect_includes_length() {
     let expr = json!({
         "type": "function_scalar_cast", "name": "CAST",
-        "arguments": [{"type": "column", "name": "x"}],
+        "arguments": [col("x")],
         "dataType": {"type": "VARCHAR", "size": 100}
     });
     assert_eq!(
@@ -2444,7 +2447,7 @@ fn renders_cast_varchar_exasol_dialect_includes_length() {
 fn renders_cast_char_exasol_dialect_includes_length() {
     let expr = json!({
         "type": "function_scalar_cast", "name": "CAST",
-        "arguments": [{"type": "column", "name": "x"}],
+        "arguments": [col("x")],
         "dataType": {"type": "CHAR", "size": 3, "characterSet": "ASCII"}
     });
     assert_eq!(
@@ -2457,7 +2460,7 @@ fn renders_cast_char_exasol_dialect_includes_length() {
 fn cast_char_target_diverges_between_dialects() {
     let expr = json!({
         "type": "function_scalar_cast", "name": "CAST",
-        "arguments": [{"type": "column", "name": "c_varchar"}],
+        "arguments": [col("c_varchar")],
         "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}
     });
     assert_eq!(
@@ -2474,7 +2477,7 @@ fn cast_char_target_diverges_between_dialects() {
 fn renders_cast_varchar_exasol_dialect_without_size_falls_back() {
     let expr = json!({
         "type": "function_scalar_cast", "name": "CAST",
-        "arguments": [{"type": "column", "name": "x"}],
+        "arguments": [col("x")],
         "dataType": {"type": "VARCHAR"}
     });
     assert_eq!(
@@ -2487,7 +2490,7 @@ fn renders_cast_varchar_exasol_dialect_without_size_falls_back() {
 fn renders_cast_char_exasol_dialect_without_size_falls_back_to_varchar_default() {
     let expr = json!({
         "type": "function_scalar_cast", "name": "CAST",
-        "arguments": [{"type": "column", "name": "x"}],
+        "arguments": [col("x")],
         "dataType": {"type": "CHAR", "characterSet": "ASCII"}
     });
     assert_eq!(
@@ -2523,7 +2526,7 @@ fn renders_math_family_verbatim_in_exasol_dialect() {
         let expr = json!({
             "type": "function_scalar",
             "name": exasol_name,
-            "arguments": [{"type": "column", "name": "x"}]
+            "arguments": [col("x")]
         });
         assert_eq!(
             render_expression_exasol(&expr).unwrap(),
@@ -2549,7 +2552,7 @@ fn renders_math_family_verbatim_in_exasol_dialect() {
             "type": "function_scalar",
             "name": exasol_name,
             "arguments": [
-                {"type": "column", "name": "v"},
+                col("v"),
                 {"type": "literal_exactnumeric", "value": 2}
             ]
         });
@@ -2576,7 +2579,7 @@ fn renders_sign_as_native_sign_in_exasol_dialect() {
             "name": "SUB",
             "arguments": [
                 {"type": "function_aggregate", "name": "SUM",
-                 "arguments": [{"type": "column", "name": "l_discount"}]},
+                 "arguments": [col("l_discount")]},
                 {"type": "literal_double", "value": 0.5}
             ]
         }]
@@ -2621,7 +2624,7 @@ fn renders_string_family_verbatim_in_exasol_dialect() {
         let expr = json!({
             "type": "function_scalar",
             "name": exasol_name,
-            "arguments": [{"type": "column", "name": "s"}]
+            "arguments": [col("s")]
         });
         assert_eq!(
             render_expression_exasol(&expr).unwrap(),
@@ -2639,7 +2642,7 @@ fn renders_string_family_verbatim_in_exasol_dialect() {
         "type": "function_scalar",
         "name": "SUBSTR",
         "arguments": [
-            {"type": "column", "name": "s"},
+            col("s"),
             {"type": "literal_exactnumeric", "value": 1},
             {"type": "literal_exactnumeric", "value": 3}
         ]
@@ -2692,9 +2695,9 @@ fn renders_greatest_least_verbatim_in_exasol_dialect() {
         "type": "function_scalar",
         "name": "GREATEST",
         "arguments": [
-            {"type": "column", "name": "a"},
-            {"type": "column", "name": "b"},
-            {"type": "column", "name": "c"}
+            col("a"),
+            col("b"),
+            col("c")
         ]
     });
     assert_eq!(
@@ -2710,7 +2713,7 @@ fn renders_greatest_least_verbatim_in_exasol_dialect() {
         "type": "function_scalar",
         "name": "LEAST",
         "arguments": [
-            {"type": "column", "name": "x"},
+            col("x"),
             {"type": "literal_exactnumeric", "value": 0}
         ]
     });
@@ -2729,7 +2732,7 @@ fn renders_nullifzero_zeroifnull_verbatim_in_exasol_dialect() {
     let nullifzero = json!({
         "type": "function_scalar",
         "name": "NULLIFZERO",
-        "arguments": [{"type": "column", "name": "v"}]
+        "arguments": [col("v")]
     });
     assert_eq!(
         render_expression_exasol(&nullifzero).unwrap(),
@@ -2740,7 +2743,7 @@ fn renders_nullifzero_zeroifnull_verbatim_in_exasol_dialect() {
     let zeroifnull = json!({
         "type": "function_scalar",
         "name": "ZEROIFNULL",
-        "arguments": [{"type": "column", "name": "v"}]
+        "arguments": [col("v")]
     });
     assert_eq!(
         render_expression_exasol(&zeroifnull).unwrap(),
@@ -2764,7 +2767,7 @@ fn renders_nullif_verbatim_in_exasol_dialect() {
                 "type": "function_scalar",
                 "name": "MOD",
                 "arguments": [
-                    {"type": "column", "name": "id"},
+                    col("id"),
                     {"type": "literal_exactnumeric", "value": "5"}
                 ]
             },
@@ -2787,7 +2790,7 @@ fn renders_date_field_shortcuts_verbatim_in_exasol_dialect() {
         let expr = json!({
             "type": "function_scalar",
             "name": field,
-            "arguments": [{"type": "column", "name": "ts"}]
+            "arguments": [col("ts")]
         });
         assert_eq!(
             render_expression_exasol(&expr).unwrap(),
@@ -2807,7 +2810,7 @@ fn renders_week_as_native_week_in_exasol_dialect() {
     let expr = json!({
         "type": "function_scalar",
         "name": "WEEK",
-        "arguments": [{"type": "column", "name": "d"}]
+        "arguments": [col("d")]
     });
     assert_eq!(render_expression_exasol(&expr).unwrap(), r#"WEEK("D")"#);
     assert_eq!(
@@ -2823,7 +2826,7 @@ fn renders_date_trunc_verbatim_in_exasol_dialect() {
         "name": "DATE_TRUNC",
         "arguments": [
             {"type": "literal_string", "value": "month"},
-            {"type": "column", "name": "ts"}
+            col("ts")
         ]
     });
     assert_eq!(
@@ -2842,7 +2845,7 @@ fn renders_to_date_to_timestamp_verbatim_in_exasol_dialect() {
         let bare = json!({
             "type": "function_scalar",
             "name": exasol_name,
-            "arguments": [{"type": "column", "name": "s"}]
+            "arguments": [col("s")]
         });
         assert_eq!(
             render_expression_exasol(&bare).unwrap(),
@@ -2859,7 +2862,7 @@ fn renders_to_date_to_timestamp_verbatim_in_exasol_dialect() {
             "type": "function_scalar",
             "name": exasol_name,
             "arguments": [
-                {"type": "column", "name": "s"},
+                col("s"),
                 {"type": "literal_string", "value": "YYYY-MM-DD"}
             ]
         });
@@ -2880,26 +2883,16 @@ fn renders_to_date_to_timestamp_verbatim_in_exasol_dialect() {
 #[test]
 fn to_date_to_timestamp_decline_untranslatable_format() {
     let cases = [
-        (
-            "TO_DATE",
-            vec![
-                json!({"type": "column", "name": "s"}),
-                json!({"type": "column", "name": "f"}),
-            ],
-            r#"TO_DATE("S", "F")"#,
-        ),
+        ("TO_DATE", vec![col("s"), col("f")], r#"TO_DATE("S", "F")"#),
         (
             "TO_TIMESTAMP",
-            vec![
-                json!({"type": "column", "name": "s"}),
-                json!({"type": "literal_null"}),
-            ],
+            vec![col("s"), json!({"type": "literal_null"})],
             r#"TO_TIMESTAMP("S", NULL)"#,
         ),
         (
             "TO_DATE",
             vec![
-                json!({"type": "column", "name": "s"}),
+                col("s"),
                 json!({"type": "literal_string", "value": "DD-MON-YYYY"}),
             ],
             r#"TO_DATE("S", 'DD-MON-YYYY')"#,
@@ -2907,7 +2900,7 @@ fn to_date_to_timestamp_decline_untranslatable_format() {
         (
             "TO_DATE",
             vec![
-                json!({"type": "column", "name": "s"}),
+                col("s"),
                 json!({"type": "literal_string", "value": "YYYY-MM-DD HH24:MI"}),
             ],
             r#"TO_DATE("S", 'YYYY-MM-DD HH24:MI')"#,
@@ -2915,7 +2908,7 @@ fn to_date_to_timestamp_decline_untranslatable_format() {
         (
             "TO_TIMESTAMP",
             vec![
-                json!({"type": "column", "name": "s"}),
+                col("s"),
                 json!({"type": "literal_string", "value": "YYYY-MM-DD"}),
                 json!({"type": "literal_string", "value": "extra"}),
             ],
@@ -2940,8 +2933,8 @@ fn renders_days_between_verbatim_in_exasol_dialect() {
         "type": "function_scalar",
         "name": "DAYS_BETWEEN",
         "arguments": [
-            {"type": "column", "name": "a"},
-            {"type": "column", "name": "b"}
+            col("a"),
+            col("b")
         ]
     });
     assert_eq!(
@@ -2967,8 +2960,8 @@ fn renders_between_family_verbatim_in_exasol_dialect() {
             "type": "function_scalar",
             "name": name,
             "arguments": [
-                {"type": "column", "name": "a"},
-                {"type": "column", "name": "b"}
+                col("a"),
+                col("b")
             ]
         });
         assert_eq!(
@@ -2992,9 +2985,6 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
         shaped_exasol: Option<&'static str>,
     }
 
-    fn col(name: &str) -> Json {
-        json!({"type": "column", "name": name})
-    }
     fn num(value: i64) -> Json {
         json!({"type": "literal_exactnumeric", "value": value})
     }
@@ -3313,7 +3303,7 @@ fn arithmetic_operators_render_identically_in_both_dialects() {
             "type": "function_scalar",
             "name": name,
             "arguments": [
-                {"type": "column", "name": "a"},
+                col("a"),
                 {"type": "literal_exactnumeric", "value": 1}
             ]
         });
@@ -3333,7 +3323,7 @@ fn arithmetic_operators_render_identically_in_both_dialects() {
     let neg = json!({
         "type": "function_scalar",
         "name": "NEG",
-        "arguments": [{"type": "column", "name": "a"}]
+        "arguments": [col("a")]
     });
     let expected_neg = r#"(-"A")"#;
     assert_eq!(
@@ -3354,7 +3344,7 @@ fn float_div_renders_checked_division_call_only_in_the_datafusion_dialect() {
         "type": "function_scalar",
         "name": "FLOAT_DIV",
         "arguments": [
-            {"type": "column", "name": "a"},
+            col("a"),
             {"type": "literal_exactnumeric", "value": 1}
         ]
     });

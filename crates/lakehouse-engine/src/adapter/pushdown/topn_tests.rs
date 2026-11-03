@@ -8,6 +8,7 @@ use super::super::support::{
 use super::super::test_support::*;
 use super::super::{detect_aggregates, ordinary_plans, validate_agg_col_types};
 use super::*;
+use crate::adapter::pushdown::test_support::{col, table_col};
 use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, ScanStorage};
 
 /// Mirrors `handle_pushdown`'s synchronous post-resolution row-scan path.
@@ -147,7 +148,7 @@ fn parse_sort_flags_reads_direction_and_nulls_without_column_gate() {
     let expression_element = serde_json::json!({
         "type": "order_by_element",
         "expression": {"type": "function_scalar", "name": "ABS", "arguments": [
-            {"type": "column", "name": "L_EXTENDEDPRICE"}
+            col("L_EXTENDEDPRICE")
         ]},
         "isAscending": false,
         "nullsLast": true
@@ -164,7 +165,7 @@ fn parse_sort_flags_reads_direction_and_nulls_without_column_gate() {
 
     let column_element = serde_json::json!({
         "type": "order_by_element",
-        "expression": {"type": "column", "name": "L_ORDERKEY", "tableName": "LINEITEM"},
+        "expression": table_col("LINEITEM", "L_ORDERKEY"),
         "isAscending": true,
         "nullsLast": false
     });
@@ -306,7 +307,7 @@ fn order_by_present_without_topn_match_withholds_per_shard_limit() {
         "pushdownRequest": {
             "type": "select",
             "selectList": [
-                {"type": "column", "name": "L_ORDERKEY", "tableName": "LINEITEM"},
+                table_col("LINEITEM", "L_ORDERKEY"),
             ],
             "selectListDataTypes": [
                 {"type": "decimal", "precision": 20, "scale": 0},
@@ -380,7 +381,7 @@ fn lineitem_order_by_request(select_list: &[&str], order_by: Json, limit: Option
         "type": "select",
         "selectList": select_list
             .iter()
-            .map(|name| serde_json::json!({"type": "column", "name": name, "tableName": "LINEITEM"}))
+            .map(|name| table_col("LINEITEM", name))
             .collect::<Vec<_>>(),
         "selectListDataTypes": select_list.iter().map(|n| type_of(n)).collect::<Vec<_>>(),
         "orderBy": order_by,
@@ -411,7 +412,7 @@ fn order_by_element(expression: Json, ascending: bool, nulls_last: bool) -> Json
 
 fn abs_of(column: &str) -> Json {
     serde_json::json!({"type": "function_scalar", "name": "ABS", "arguments": [
-        {"type": "column", "name": column, "tableName": "LINEITEM"}
+        table_col("LINEITEM", column)
     ]})
 }
 
@@ -458,8 +459,8 @@ fn declined_order_by_expression_appends_referenced_columns_as_hidden() {
 #[test]
 fn declined_order_by_two_expression_keys_renders_both_and_leaks_none() {
     let sum_expr = serde_json::json!({"type": "function_scalar", "name": "ADD", "arguments": [
-        {"type": "column", "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
-        {"type": "column", "name": "L_ORDERKEY", "tableName": "LINEITEM"}
+        table_col("LINEITEM", "L_EXTENDEDPRICE"),
+        table_col("LINEITEM", "L_ORDERKEY")
     ]});
     let request = lineitem_order_by_request(
         &["L_ORDERKEY"],
@@ -577,8 +578,7 @@ fn unsupported_order_by_shape_declines_topn() {
 
     let mut grouped = nq4_request();
     grouped["pushdownRequest"]["aggregationType"] = serde_json::json!("group_by");
-    grouped["pushdownRequest"]["groupBy"] =
-        serde_json::json!([{"type": "column", "name": "L_ORDERKEY"}]);
+    grouped["pushdownRequest"]["groupBy"] = serde_json::json!([col("L_ORDERKEY")]);
     assert!(
         detect_topn(
             &grouped,
@@ -594,7 +594,7 @@ fn unsupported_order_by_shape_declines_topn() {
     expr_key["pushdownRequest"]["orderBy"] = serde_json::json!([{
         "type": "order_by_element",
         "expression": {"type": "function_scalar", "name": "ABS", "arguments": [
-            {"type": "column", "name": "L_EXTENDEDPRICE"}
+            col("L_EXTENDEDPRICE")
         ]},
         "isAscending": false,
         "nullsLast": true
@@ -730,8 +730,8 @@ fn row_scan_decline_order_by_no_limit_wraps_outer_order_by() {
         "pushdownRequest": {
             "type": "select",
             "selectList": [
-                {"type": "column", "name": "L_ORDERKEY", "tableName": "LINEITEM"},
-                {"type": "column", "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
+                table_col("LINEITEM", "L_ORDERKEY"),
+                table_col("LINEITEM", "L_EXTENDEDPRICE"),
             ],
             "selectListDataTypes": [
                 {"type": "decimal", "precision": 20, "scale": 0},

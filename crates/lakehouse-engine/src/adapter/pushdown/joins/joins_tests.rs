@@ -4,6 +4,7 @@ use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::permission::PermissionCheck;
 use crate::adapter::pushdown::ResolvedScan;
 use crate::adapter::pushdown::test_support::*;
+use crate::adapter::pushdown::test_support::{col, table_col};
 use crate::scan::spec::CatalogProps;
 use crate::scan::spec::{FileEntry, LogicalField, ProjectionItem};
 
@@ -44,8 +45,8 @@ pub(super) fn join_request(from_extra: Json, condition: Json) -> Json {
                 "type": "select",
                 "from": from,
                 "selectList": [
-                    {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-                    {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+                    table_col("CUSTOMER", "C_NAME"),
+                    table_col("ORDERS", "O_ORDERDATE"),
                 ],
             },
             "schemaMetadataInfo": {"properties": {}},
@@ -57,8 +58,8 @@ pub(super) fn join_request(from_extra: Json, condition: Json) -> Json {
 pub(super) fn equi_condition() -> Json {
     serde_json::json!({
         "type": "predicate_equal",
-        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+        "left": table_col("CUSTOMER", "C_CUSTKEY"),
+        "right": table_col("ORDERS", "O_CUSTKEY"),
     })
 }
 
@@ -84,15 +85,15 @@ pub(super) fn three_table_join_request() -> Json {
                         "left": {"name": "CUSTOMER", "type": "table"},
                         "right": {"name": "ORDERS", "type": "table"},
                         "condition": {"type": "predicate_equal",
-                            "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-                            "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}}},
+                            "left": table_col("CUSTOMER", "C_CUSTKEY"),
+                            "right": table_col("ORDERS", "O_CUSTKEY")}},
                     "right": {"name": "LINEITEM", "type": "table"},
                     "condition": {"type": "predicate_equal",
-                        "left": {"type": "column", "name": "O_ORDERKEY", "tableName": "ORDERS"},
-                        "right": {"type": "column", "name": "L_ORDERKEY", "tableName": "LINEITEM"}}},
+                        "left": table_col("ORDERS", "O_ORDERKEY"),
+                        "right": table_col("LINEITEM", "L_ORDERKEY")}},
                 "selectList": [
-                    {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-                    {"type": "column", "name": "L_QUANTITY", "tableName": "LINEITEM"}],
+                    table_col("CUSTOMER", "C_NAME"),
+                    table_col("LINEITEM", "L_QUANTITY")],
             },
             "schemaMetadataInfo": {"properties": {}},
         }),
@@ -131,20 +132,20 @@ pub(super) fn nq3_join_request() -> Json {
                             "left": {"name": "PART", "type": "table"},
                             "right": {"name": "PARTSUPP", "type": "table"},
                             "condition": {"type": "predicate_equal",
-                                "left": {"type": "column", "name": "P_PARTKEY", "tableName": "PART"},
-                                "right": {"type": "column", "name": "PS_PARTKEY", "tableName": "PARTSUPP"}}},
+                                "left": table_col("PART", "P_PARTKEY"),
+                                "right": table_col("PARTSUPP", "PS_PARTKEY")}},
                         "right": {"name": "SUPPLIER", "type": "table"},
                         "condition": {"type": "predicate_equal",
-                            "left": {"type": "column", "name": "PS_SUPPKEY", "tableName": "PARTSUPP"},
-                            "right": {"type": "column", "name": "S_SUPPKEY", "tableName": "SUPPLIER"}}},
+                            "left": table_col("PARTSUPP", "PS_SUPPKEY"),
+                            "right": table_col("SUPPLIER", "S_SUPPKEY")}},
                     "right": {"name": "NATION", "type": "table"},
                     "condition": {"type": "predicate_equal",
-                        "left": {"type": "column", "name": "S_NATIONKEY", "tableName": "SUPPLIER"},
-                        "right": {"type": "column", "name": "N_NATIONKEY", "tableName": "NATION"}}},
+                        "left": table_col("SUPPLIER", "S_NATIONKEY"),
+                        "right": table_col("NATION", "N_NATIONKEY")}},
                 "selectList": [
-                    {"type": "column", "name": "P_NAME", "tableName": "PART"},
-                    {"type": "column", "name": "PS_AVAILQTY", "tableName": "PARTSUPP"},
-                    {"type": "column", "name": "N_NAME", "tableName": "NATION"}],
+                    table_col("PART", "P_NAME"),
+                    table_col("PARTSUPP", "PS_AVAILQTY"),
+                    table_col("NATION", "N_NAME")],
             },
             "schemaMetadataInfo": {"properties": {}},
         }),
@@ -168,9 +169,7 @@ pub(super) fn self_join_request(leg_aliases: &[Option<&str>]) -> Json {
         leaf
     }
     fn order_key(alias: Option<&str>) -> Json {
-        let mut column = serde_json::json!({
-            "type": "column", "name": "O_ORDERKEY", "tableName": "FACT_ORDERS"
-        });
+        let mut column = table_col("FACT_ORDERS", "O_ORDERKEY");
         if let Some(alias) = alias {
             column["tableAlias"] = Json::String(alias.to_string());
         }
@@ -355,8 +354,8 @@ fn delta_join_request_over(
                     "right": {"name": "ORDERS", "type": "table"},
                     "condition": {
                         "type": "predicate_equal",
-                        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-                        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+                        "left": table_col("CUSTOMER", "C_CUSTKEY"),
+                        "right": table_col("ORDERS", "O_CUSTKEY"),
                     },
                 },
                 "selectList": select_list,
@@ -375,12 +374,12 @@ async fn a_refused_delta_column_reached_through_a_join_leg_is_refused() {
     let catalog = unity_delta_catalog().await;
     let storage = two_delta_legs_one_refusing_variant_col().await;
     let mappable = serde_json::json!([
-        {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-        {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+        table_col("CUSTOMER", "C_NAME"),
+        table_col("ORDERS", "O_CUSTKEY"),
     ]);
     let reaching_refused = serde_json::json!([
-        {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-        {"type": "column", "name": "VARIANT_COL", "tableName": "ORDERS"},
+        table_col("CUSTOMER", "C_NAME"),
+        table_col("ORDERS", "VARIANT_COL"),
     ]);
 
     delta_pushdown(
@@ -434,9 +433,7 @@ async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable
             {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
             {"name": "VARIANT_COL", "dataType": {"type": "varchar", "size": 2000000}},
         ]),
-        serde_json::json!([
-            {"type": "column", "name": "VARIANT_COL", "tableName": "CUSTOMER"},
-        ]),
+        serde_json::json!([table_col("CUSTOMER", "VARIANT_COL"),]),
     );
     let request = with_delta_notes(request, "CUSTOMER", &customer_columns, &[]);
     let request = with_delta_notes(request, "ORDERS", ORDERS_COLUMNS, &[]);
@@ -450,9 +447,7 @@ async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable
 async fn an_unqualified_column_reference_is_charged_to_every_join_side() {
     let catalog = unity_delta_catalog().await;
     let storage = two_delta_legs_one_refusing_variant_col().await;
-    let request = delta_join_request(serde_json::json!([
-        {"type": "column", "name": "VARIANT_COL"},
-    ]));
+    let request = delta_join_request(serde_json::json!([col("VARIANT_COL"),]));
 
     let error = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
         .await
@@ -572,8 +567,8 @@ fn partitioned_legs_request() -> Json {
             {"name": "O_STATUS", "dataType": {"type": "varchar", "size": 100}},
         ]),
         serde_json::json!([
-            {"type": "column", "name": "C_REGION", "tableName": "CUSTOMER"},
-            {"type": "column", "name": "O_STATUS", "tableName": "ORDERS"},
+            table_col("CUSTOMER", "C_REGION"),
+            table_col("ORDERS", "O_STATUS"),
         ]),
     );
     let request = with_delta_notes(request, "CUSTOMER", REGION_CUSTOMER_COLUMNS, &["c_region"]);
@@ -590,12 +585,12 @@ async fn each_delta_join_leg_prunes_by_its_own_side_local_predicate() {
         "expressions": [
             {
                 "type": "predicate_equal",
-                "left": {"type": "column", "name": "C_REGION", "tableName": "CUSTOMER"},
+                "left": table_col("CUSTOMER", "C_REGION"),
                 "right": {"type": "literal_string", "value": "us"},
             },
             {
                 "type": "predicate_equal",
-                "left": {"type": "column", "name": "O_STATUS", "tableName": "ORDERS"},
+                "left": table_col("ORDERS", "O_STATUS"),
                 "right": {"type": "literal_string", "value": "open"},
             },
         ],

@@ -1,3 +1,4 @@
+use crate::adapter::pushdown::test_support::col;
 use delta_kernel::schema::DataType as DeltaType;
 
 use super::super::{ConnectionStorage, ResolvedScan};
@@ -239,7 +240,7 @@ async fn pruning_fixture_storage() -> StorageBackend {
 fn letter_equals_a_filter() -> Json {
     serde_json::json!({
         "type": "predicate_equal",
-        "left": {"type": "column", "name": "letter"},
+        "left": col("letter"),
         "right": {"type": "literal_string", "value": "a"},
     })
 }

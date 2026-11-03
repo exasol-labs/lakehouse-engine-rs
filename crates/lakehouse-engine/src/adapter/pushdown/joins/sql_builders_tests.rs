@@ -11,6 +11,7 @@ use super::super::tests::{
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
+use crate::adapter::pushdown::test_support::{aliased_col, table_col};
 use crate::scan::spec::{ColumnRef, SortKey, StorageBackend, StorageProps};
 use vs_expression::{render_expression_exasol_safe, render_expression_safe};
 
@@ -37,15 +38,15 @@ fn q1_join_request() -> Json {
                         "left": {"name": "SUPPLIER", "type": "table"},
                         "right": {"name": "NATION", "type": "table"},
                         "condition": {"type": "predicate_equal",
-                            "left": {"type": "column", "name": "S_NATIONKEY", "tableName": "SUPPLIER"},
-                            "right": {"type": "column", "name": "N_NATIONKEY", "tableName": "NATION"}}},
+                            "left": table_col("SUPPLIER", "S_NATIONKEY"),
+                            "right": table_col("NATION", "N_NATIONKEY")}},
                     "right": {"name": "REGION", "type": "table"},
                     "condition": {"type": "predicate_equal",
-                        "left": {"type": "column", "name": "N_REGIONKEY", "tableName": "NATION"},
-                        "right": {"type": "column", "name": "R_REGIONKEY", "tableName": "REGION"}}},
+                        "left": table_col("NATION", "N_REGIONKEY"),
+                        "right": table_col("REGION", "R_REGIONKEY")}},
                 "selectList": [
-                    {"type": "column", "name": "S_NAME", "tableName": "SUPPLIER"},
-                    {"type": "column", "name": "R_NAME", "tableName": "REGION"}],
+                    table_col("SUPPLIER", "S_NAME"),
+                    table_col("REGION", "R_NAME")],
             },
             "schemaMetadataInfo": {"properties": {}},
         }),
@@ -100,7 +101,7 @@ fn broadcast_join_declines_widened_projection() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["selectList"] = serde_json::json!([
         {"type": "function_scalar", "name": "UPPER", "arguments": [
-            {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}]},
+            table_col("CUSTOMER", "C_NAME")]},
     ]);
     let pushdown_req = pd(&request);
     assert!(matches!(
@@ -154,7 +155,7 @@ fn broadcast_declines_on_unrenderable_filter_stays_eligible_when_absent() {
             "type": "function_scalar",
             "name": "SECOND",
             "arguments": [
-                {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+                table_col("ORDERS", "O_ORDERDATE"),
                 {"type": "literal_exactnumeric", "value": 3}
             ]
         },
@@ -195,7 +196,7 @@ fn broadcast_declines_like_over_decimal_side_column() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_like",
-        "expression": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+        "expression": table_col("CUSTOMER", "C_CUSTKEY"),
         "pattern": {"type": "literal_string", "value": "1%"}
     });
     let detected = detected_join(&request);
@@ -220,7 +221,7 @@ fn broadcast_keeps_plan_and_casts_like_over_date_side_column() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_like",
-        "expression": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+        "expression": table_col("ORDERS", "O_ORDERDATE"),
         "pattern": {"type": "literal_string", "value": "1995%"}
     });
     let detected = detected_join(&request);
@@ -252,7 +253,7 @@ fn broadcast_declines_instr_with_start_position_argument() {
             "type": "function_scalar",
             "name": "INSTR",
             "arguments": [
-                {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                table_col("CUSTOMER", "C_NAME"),
                 {"type": "literal_string", "value": "b"},
                 {"type": "literal_exactnumeric", "value": 3}
             ]
@@ -318,7 +319,7 @@ fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_greater",
-        "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+        "left": table_col("ORDERS", "O_ORDERDATE"),
         "right": {"type": "literal_string", "value": "1995-01-01"}
     });
     let detected = detected_join(&request);
@@ -412,11 +413,11 @@ fn colliding_columns_render_qualified_unified_wrapper_without_error() {
                     "left": {"name": "EVENTS", "type": "table"},
                     "right": {"name": "LABELS", "type": "table"},
                     "condition": {"type": "predicate_equal",
-                        "left": {"type": "column", "name": "ID", "tableName": "EVENTS"},
-                        "right": {"type": "column", "name": "ID", "tableName": "LABELS"}}},
+                        "left": table_col("EVENTS", "ID"),
+                        "right": table_col("LABELS", "ID")}},
                 "selectList": [
-                    {"type": "column", "name": "ID", "tableName": "EVENTS"},
-                    {"type": "column", "name": "LABEL", "tableName": "LABELS"}],
+                    table_col("EVENTS", "ID"),
+                    table_col("LABELS", "LABEL")],
             },
             "schemaMetadataInfo": {"properties": {}},
         }),
@@ -604,16 +605,16 @@ fn build_n_scan_join_sql_renders_qualified_when_three_tables_share_column_name()
                         "left": {"name": "EVENTS", "type": "table"},
                         "right": {"name": "LABELS", "type": "table"},
                         "condition": {"type": "predicate_equal",
-                            "left": {"type": "column", "name": "ID", "tableName": "EVENTS"},
-                            "right": {"type": "column", "name": "ID", "tableName": "LABELS"}}},
+                            "left": table_col("EVENTS", "ID"),
+                            "right": table_col("LABELS", "ID")}},
                     "right": {"name": "TAGS", "type": "table"},
                     "condition": {"type": "predicate_equal",
-                        "left": {"type": "column", "name": "ID", "tableName": "LABELS"},
-                        "right": {"type": "column", "name": "ID", "tableName": "TAGS"}}},
+                        "left": table_col("LABELS", "ID"),
+                        "right": table_col("TAGS", "ID")}},
                 "selectList": [
-                    {"type": "column", "name": "ID", "tableName": "EVENTS"},
-                    {"type": "column", "name": "LABEL", "tableName": "LABELS"},
-                    {"type": "column", "name": "TAG_NAME", "tableName": "TAGS"}],
+                    table_col("EVENTS", "ID"),
+                    table_col("LABELS", "LABEL"),
+                    table_col("TAGS", "TAG_NAME")],
             },
             "schemaMetadataInfo": {"properties": {}},
         }),
@@ -731,9 +732,8 @@ fn three_leg_self_join_attaches_each_condition_at_its_own_join_point() {
 #[test]
 fn unattributable_column_reference_is_a_hard_error_naming_the_column() {
     let mut request = self_join_request(&[Some("A"), Some("B")]);
-    request["pushdownRequest"]["selectList"] = serde_json::json!([
-        {"type": "column", "name": "O_ORDERKEY", "tableName": "FACT_ORDERS", "tableAlias": "Z"}
-    ]);
+    request["pushdownRequest"]["selectList"] =
+        serde_json::json!([aliased_col("FACT_ORDERS", "Z", "O_ORDERKEY")]);
     let sides = vec![
         resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
         resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
@@ -796,27 +796,25 @@ fn a_leg_count_disagreeing_with_the_resolved_sides_declines_naming_both_counts()
 
 #[test]
 fn n_scan_wrapper_qualifies_every_clause_by_leg() {
-    fn col(alias: &str) -> Json {
-        serde_json::json!({
-            "type": "column", "name": "O_CUSTKEY", "tableName": "FACT_ORDERS", "tableAlias": alias
-        })
+    fn custkey(alias: &str) -> Json {
+        aliased_col("FACT_ORDERS", alias, "O_CUSTKEY")
     }
     fn sum_of(alias: &str) -> Json {
         serde_json::json!({
             "type": "function_aggregate", "name": "SUM", "distinct": false,
-            "arguments": [col(alias)]
+            "arguments": [custkey(alias)]
         })
     }
     let mut request = self_join_request(&[Some("A"), Some("B")]);
     request["pushdownRequest"]["aggregationType"] = serde_json::json!("group_by");
-    request["pushdownRequest"]["selectList"] = serde_json::json!([col("A"), sum_of("B")]);
-    request["pushdownRequest"]["groupBy"] = serde_json::json!([col("A")]);
+    request["pushdownRequest"]["selectList"] = serde_json::json!([custkey("A"), sum_of("B")]);
+    request["pushdownRequest"]["groupBy"] = serde_json::json!([custkey("A")]);
     request["pushdownRequest"]["having"] = serde_json::json!({
         "type": "predicate_greater", "left": sum_of("B"),
         "right": {"type": "literal_exactnumeric", "value": 10},
     });
     request["pushdownRequest"]["orderBy"] = serde_json::json!([
-        {"expression": col("A"), "isAscending": true, "nullsLast": false},
+        {"expression": custkey("A"), "isAscending": true, "nullsLast": false},
     ]);
 
     let sides = vec![
@@ -854,18 +852,16 @@ fn n_scan_wrapper_qualifies_every_clause_by_leg() {
 
 #[test]
 fn conditions_attach_by_leg_set_and_leg_local_filters_partition_exactly() {
-    fn col(alias: &str) -> Json {
-        serde_json::json!({
-            "type": "column", "name": "O_CUSTKEY", "tableName": "FACT_ORDERS", "tableAlias": alias
-        })
+    fn custkey(alias: &str) -> Json {
+        aliased_col("FACT_ORDERS", alias, "O_CUSTKEY")
     }
     let mut request = self_join_request(&[Some("A"), Some("B")]);
     request["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
-            {"type": "predicate_greater", "left": col("A"),
+            {"type": "predicate_greater", "left": custkey("A"),
              "right": {"type": "literal_exactnumeric", "value": 100}},
-            {"type": "predicate_equal", "left": col("B"),
+            {"type": "predicate_equal", "left": custkey("B"),
              "right": {"type": "literal_exactnumeric", "value": 7}},
         ],
     });
@@ -1000,12 +996,12 @@ fn three_table_join_inner_join_on_chain() {
 fn join_conditions_greedy_attach_and_side_local_pushdown() {
     let cond_n2_fact = serde_json::json!({
         "type": "predicate_equal",
-        "left": {"type": "column", "name": "N2_KEY", "tableName": "N2"},
-        "right": {"type": "column", "name": "F_N2KEY", "tableName": "FACT"}});
+        "left": table_col("N2", "N2_KEY"),
+        "right": table_col("FACT", "F_N2KEY")});
     let cond_n1_fact = serde_json::json!({
         "type": "predicate_equal",
-        "left": {"type": "column", "name": "N1_KEY", "tableName": "N1"},
-        "right": {"type": "column", "name": "F_N1KEY", "tableName": "FACT"}});
+        "left": table_col("N1", "N1_KEY"),
+        "right": table_col("FACT", "F_N1KEY")});
     let request = with_identifier_notes(
         serde_json::json!({
             "involvedTables": [
@@ -1029,15 +1025,15 @@ fn join_conditions_greedy_attach_and_side_local_pushdown() {
                         "condition": cond_n2_fact},
                     "condition": cond_n1_fact},
                 "selectList": [
-                    {"type": "column", "name": "N1_NAME", "tableName": "N1"},
-                    {"type": "column", "name": "F_VALUE", "tableName": "FACT"}],
+                    table_col("N1", "N1_NAME"),
+                    table_col("FACT", "F_VALUE")],
                 "filter": {"type": "predicate_and", "expressions": [
                     {"type": "predicate_equal",
-                     "left": {"type": "column", "name": "N1_NAME", "tableName": "N1"},
+                     "left": table_col("N1", "N1_NAME"),
                      "right": {"type": "literal_string", "value": "ACME"}},
                     {"type": "predicate_greater",
-                     "left": {"type": "column", "name": "F_VALUE", "tableName": "FACT"},
-                     "right": {"type": "column", "name": "N1_KEY", "tableName": "N1"}}]},
+                     "left": table_col("FACT", "F_VALUE"),
+                     "right": table_col("N1", "N1_KEY")}]},
             },
             "schemaMetadataInfo": {"properties": {}},
         }),
@@ -1118,7 +1114,7 @@ fn n_scan_request_with_filter(filter: Json) -> Json {
 fn like_over(column: &str, table: &str, pattern: &str) -> Json {
     serde_json::json!({
         "type": "predicate_like",
-        "expression": {"type": "column", "name": column, "tableName": table},
+        "expression": table_col(table, column),
         "pattern": {"type": "literal_string", "value": pattern}
     })
 }
@@ -1196,18 +1192,18 @@ fn n_scan_leg_residual_partition_is_total_and_disjoint_with_type_screen() {
         "type": "predicate_and",
         "expressions": [
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+             "left": table_col("CUSTOMER", "C_NAME"),
              "right": {"type": "literal_string", "value": "ACME"}},
             like_over("O_ORDERDATE", "ORDERS", "1995%"),
             like_over("C_CUSTKEY", "CUSTOMER", "1%"),
             {"type": "predicate_greater",
              "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
-                 {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+                 table_col("ORDERS", "O_ORDERDATE"),
                  {"type": "literal_exactnumeric", "value": 3}]},
              "right": {"type": "literal_exactnumeric", "value": 1}},
             {"type": "predicate_greater",
-             "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-             "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}},
+             "left": table_col("CUSTOMER", "C_CUSTKEY"),
+             "right": table_col("ORDERS", "O_CUSTKEY")},
         ],
     }));
 
@@ -1298,7 +1294,7 @@ fn join_decimal_stringification_renders_trimmed_at_both_join_sites() {
         "left": {
             "type": "function_scalar",
             "name": "LENGTH",
-            "arguments": [{"type": "column", "name": "O_TOTALPRICE", "tableName": "ORDERS"}]
+            "arguments": [table_col("ORDERS", "O_TOTALPRICE")]
         },
         "right": {"type": "literal_exactnumeric", "value": 3}
     });
@@ -1339,7 +1335,7 @@ fn join_instr_beyond_two_args_declines_at_both_join_sites() {
             "type": "function_scalar",
             "name": "INSTR",
             "arguments": [
-                {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                table_col("CUSTOMER", "C_NAME"),
                 {"type": "literal_string", "value": "b"},
                 {"type": "literal_exactnumeric", "value": 3}
             ]
@@ -1368,7 +1364,7 @@ fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
     request["pushdownRequest"]["selectList"] = serde_json::json!([
         {"type": "function_aggregate", "name": "COUNT", "arguments": []},
         {"type": "function_aggregate", "name": "MIN", "arguments": [
-            {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"}]},
+            table_col("ORDERS", "O_ORDERDATE")]},
     ]);
 
     assert!(matches!(
@@ -1433,7 +1429,7 @@ fn render_expression_qualified_renders_scalar_over_aggregate() {
         "arguments": [{
             "type": "function_scalar", "name": "CASE", "arguments": [
                 {"type": "predicate_equal",
-                 "left": {"type": "column", "name": "L_RETURNFLAG", "tableName": "LINEITEM"},
+                 "left": table_col("LINEITEM", "L_RETURNFLAG"),
                  "right": {"type": "literal_string", "value": "R"}},
                 {"type": "literal_exactnumeric", "value": 1},
                 {"type": "literal_exactnumeric", "value": 0}]}]
@@ -1470,7 +1466,7 @@ fn render_expression_qualified_top_level_aggregate_byte_compatible() {
 
     let sum = serde_json::json!({
         "type": "function_aggregate", "name": "SUM", "distinct": false,
-        "arguments": [{"type": "column", "name": "O_TOTALPRICE", "tableName": "ORDERS"}]
+        "arguments": [table_col("ORDERS", "O_TOTALPRICE")]
     });
     assert_eq!(
         render_expression_qualified(&sum, &legs)
@@ -1491,7 +1487,7 @@ fn render_expression_qualified_top_level_aggregate_byte_compatible() {
 
     let count_distinct = serde_json::json!({
         "type": "function_aggregate", "name": "COUNT", "distinct": true,
-        "arguments": [{"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}]
+        "arguments": [table_col("CUSTOMER", "C_CUSTKEY")]
     });
     assert_eq!(
         render_expression_qualified(&count_distinct, &legs)
@@ -1508,7 +1504,7 @@ fn qualified_count_distinct_cast_char_renders_exasol_char_target() {
         "type": "function_aggregate", "name": "COUNT", "distinct": true,
         "arguments": [{
             "type": "function_scalar_cast", "name": "CAST",
-            "arguments": [{"type": "column", "name": "C_VARCHAR", "tableName": "CUSTOMER"}],
+            "arguments": [table_col("CUSTOMER", "C_VARCHAR")],
             "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}
         }]
     });
@@ -1539,9 +1535,9 @@ fn n_scan_join_select_list_renders_exasol_char_target() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["selectList"] = serde_json::json!([
         {"type": "function_scalar_cast", "name": "CAST",
-         "arguments": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}],
+         "arguments": [table_col("CUSTOMER", "C_NAME")],
          "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}},
-        {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+        table_col("ORDERS", "O_ORDERDATE"),
     ]);
     request["pushdownRequest"]["having"] =
         serde_json::json!({"type": "literal_bool", "value": true});
@@ -1580,11 +1576,10 @@ fn n_scan_join_select_list_renders_exasol_char_target() {
 #[test]
 fn order_by_over_join_renders_qualified_in_unified_wrapper() {
     let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["selectList"] = serde_json::json!([
-        {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-    ]);
+    request["pushdownRequest"]["selectList"] =
+        serde_json::json!([table_col("CUSTOMER", "C_NAME"),]);
     request["pushdownRequest"]["orderBy"] = serde_json::json!([
-        {"expression": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+        {"expression": table_col("ORDERS", "O_ORDERDATE"),
          "isAscending": true, "nullsLast": false},
     ]);
 
@@ -1619,7 +1614,7 @@ fn order_by_expression_renders_qualified_in_unified_wrapper() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["orderBy"] = serde_json::json!([
         {"expression": {"type": "function_scalar", "name": "UPPER", "arguments": [
-            {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"}]},
+            table_col("ORDERS", "O_ORDERDATE")]},
          "isAscending": false, "nullsLast": true},
     ]);
 
@@ -1675,7 +1670,7 @@ fn join_window_classification_covers_every_forcing_and_served_shape() {
 
     let mut ordered = join_request(Json::Null, equi_condition());
     ordered["pushdownRequest"]["orderBy"] = serde_json::json!([
-        {"expression": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+        {"expression": table_col("ORDERS", "O_ORDERDATE"),
          "isAscending": true, "nullsLast": false},
     ]);
     assert!(matches!(
@@ -1686,7 +1681,7 @@ fn join_window_classification_covers_every_forcing_and_served_shape() {
     let mut ordered_by_expression = join_request(Json::Null, equi_condition());
     ordered_by_expression["pushdownRequest"]["orderBy"] = serde_json::json!([
         {"expression": {"type": "function_scalar", "name": "UPPER", "arguments": [
-            {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"}]},
+            table_col("ORDERS", "O_ORDERDATE")]},
          "isAscending": false, "nullsLast": true},
     ]);
     assert!(matches!(
@@ -1703,8 +1698,7 @@ fn join_window_classification_covers_every_forcing_and_served_shape() {
     ));
 
     let mut grouped = join_request(Json::Null, equi_condition());
-    grouped["pushdownRequest"]["groupBy"] =
-        serde_json::json!([{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}]);
+    grouped["pushdownRequest"]["groupBy"] = serde_json::json!([table_col("CUSTOMER", "C_NAME")]);
     assert!(matches!(
         classify_join_window(&pd(&grouped)),
         JoinWindowPlan::ExasolPostProcessed
@@ -2037,7 +2031,7 @@ fn broadcast_ordered_bounds_shards_with_keys_from_either_side() {
 #[test]
 fn broadcast_zero_offset_request_takes_the_bounded_path() {
     let order_by = serde_json::json!([
-        {"expression": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+        {"expression": table_col("ORDERS", "O_ORDERDATE"),
          "isAscending": true, "nullsLast": false},
     ]);
 
@@ -2138,7 +2132,7 @@ fn fallback_leg_fan_out_spec_never_carries_a_limit_or_sort() {
     request["pushdownRequest"]["limit"] = serde_json::json!({"numElements": 10, "offset": 4});
     request["pushdownRequest"]["orderBy"] = serde_json::json!([{
         "type": "order_by_element",
-        "expression": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+        "expression": table_col("CUSTOMER", "C_NAME"),
         "isAscending": true,
         "nullsLast": false,
     }]);
@@ -2189,14 +2183,14 @@ fn golden_n_scan_join_sql_unchanged() {
         "type": "predicate_and",
         "expressions": [
             {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+             "left": table_col("CUSTOMER", "C_NAME"),
              "right": {"type": "literal_string", "value": "ACME"}},
             {"type": "predicate_greater",
-             "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+             "left": table_col("ORDERS", "O_ORDERDATE"),
              "right": {"type": "literal_string", "value": "1995-01-01"}},
             {"type": "predicate_greater",
-             "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-             "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}},
+             "left": table_col("CUSTOMER", "C_CUSTKEY"),
+             "right": table_col("ORDERS", "O_CUSTKEY")},
         ],
     });
     let detected = detected_join(&request);
@@ -2230,9 +2224,9 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
     });
     let pushdown_req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}],
+        "groupBy": [table_col("CUSTOMER", "C_NAME")],
         "selectList": [
-            {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+            table_col("CUSTOMER", "C_NAME"),
             agg_item("COUNT", None, false),
         ],
     });
@@ -2406,25 +2400,25 @@ fn fallback_projection_narrows_to_referenced_columns() {
     ];
     let rich_req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "GK", "tableName": "T"}],
+        "groupBy": [table_col("T", "GK")],
         "selectList": [
-            {"type": "column", "name": "GK", "tableName": "T"},
+            table_col("T", "GK"),
             {"type": "function_aggregate", "name": "SUM", "distinct": false, "arguments": [
                 {"type": "function_scalar", "name": "CASE", "arguments": [
                     {"type": "predicate_equal",
-                     "left": {"type": "column", "name": "REGION", "tableName": "T"},
+                     "left": table_col("T", "REGION"),
                      "right": {"type": "literal_string", "value": "R"}},
                     {"type": "literal_exactnumeric", "value": 1},
                     {"type": "literal_exactnumeric", "value": 0}]}]}
         ],
         "having": {"type": "predicate_greater",
             "left": {"type": "function_aggregate", "name": "SUM", "distinct": false,
-                     "arguments": [{"type": "column", "name": "HCOL", "tableName": "T"}]},
+                     "arguments": [table_col("T", "HCOL")]},
             "right": {"type": "literal_exactnumeric", "value": 10}},
-        "orderBy": [{"expression": {"type": "column", "name": "OCOL", "tableName": "T"},
+        "orderBy": [{"expression": table_col("T", "OCOL"),
                      "isAscending": true, "nullsLast": false}],
         "filter": {"type": "predicate_equal",
-            "left": {"type": "column", "name": "FCOL", "tableName": "T"},
+            "left": table_col("T", "FCOL"),
             "right": {"type": "literal_exactnumeric", "value": 5}},
     });
     let (proj, types) = referenced_column_projection(&rich_req, &all_cols);
@@ -2460,13 +2454,13 @@ fn fallback_projection_narrows_to_referenced_columns() {
     ];
     let grouped_req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "GK", "tableName": "T"}],
+        "groupBy": [table_col("T", "GK")],
         "selectList": [
-            {"type": "column", "name": "GK", "tableName": "T"},
+            table_col("T", "GK"),
             {"type": "function_aggregate", "name": "SUM", "distinct": false, "arguments": [
                 {"type": "function_scalar", "name": "CASE", "arguments": [
                     {"type": "predicate_equal",
-                     "left": {"type": "column", "name": "REGION", "tableName": "T"},
+                     "left": table_col("T", "REGION"),
                      "right": {"type": "literal_string", "value": "R"}},
                     {"type": "literal_exactnumeric", "value": 1},
                     {"type": "literal_exactnumeric", "value": 0}]}]}
@@ -2509,9 +2503,9 @@ fn fallback_projection_narrows_to_referenced_columns() {
     let sg_req = serde_json::json!({
         "selectList": [
             {"type": "function_aggregate", "name": "COUNT", "distinct": true,
-             "arguments": [{"type": "column", "name": "A", "tableName": "T"}]},
+             "arguments": [table_col("T", "A")]},
             {"type": "function_aggregate", "name": "COUNT", "distinct": true,
-             "arguments": [{"type": "column", "name": "B", "tableName": "T"}]},
+             "arguments": [table_col("T", "B")]},
         ],
     });
     let (sproj, stypes) = referenced_column_projection(&sg_req, &sg_all);
@@ -2557,7 +2551,7 @@ fn no_select_list_wire_forms_all_keep_the_full_base_row() {
     ];
     let filter = serde_json::json!({
         "type": "predicate_equal",
-        "left": {"type": "column", "name": "FCOL", "tableName": "T"},
+        "left": table_col("T", "FCOL"),
         "right": {"type": "literal_exactnumeric", "value": 5},
     });
     let full_row: Vec<ProjectionItem> = all_cols
@@ -2594,10 +2588,10 @@ fn referenced_column_projection_narrows_with_a_real_select_list() {
         ("IRRELEVANT_COL".to_string(), "VARCHAR(10)".to_string()),
     ];
     let req = serde_json::json!({
-        "selectList": [{"type": "column", "name": "GK", "tableName": "T"}],
+        "selectList": [table_col("T", "GK")],
         "filter": {
             "type": "predicate_equal",
-            "left": {"type": "column", "name": "FCOL", "tableName": "T"},
+            "left": table_col("T", "FCOL"),
             "right": {"type": "literal_exactnumeric", "value": 5},
         },
     });
@@ -2644,10 +2638,8 @@ fn n_scan_join_untranslatable_select_item_is_hard_error() {
     );
 
     let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["selectList"] = serde_json::json!([
-        {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-        unknown,
-    ]);
+    request["pushdownRequest"]["selectList"] =
+        serde_json::json!([table_col("CUSTOMER", "C_NAME"), unknown,]);
     let pushdown_req = pd(&request);
     let detected = detected_join(&request);
     assert!(
@@ -2691,7 +2683,7 @@ fn qualified_single_table_untranslatable_select_item_is_hard_error() {
     });
     let pushdown_req = serde_json::json!({
         "selectList": [
-            {"type": "column", "name": "ID", "tableName": "T"},
+            table_col("T", "ID"),
             {"type": "no_such_node_type_in_either_dialect"},
         ],
     });
@@ -2827,7 +2819,7 @@ fn second_arity_predicate() -> Json {
     serde_json::json!({
         "type": "predicate_greater",
         "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
-            {"type": "column", "name": "C_TS", "tableName": "T"},
+            table_col("T", "C_TS"),
             {"type": "literal_exactnumeric", "value": 3},
         ]},
         "right": {"type": "literal_exactnumeric", "value": 1},
@@ -2844,11 +2836,11 @@ fn single_table_wrapper_renders_declined_predicate_in_exasol_dialect() {
          render for Exasol"
     );
     let pushdown_req = serde_json::json!({
-        "selectList": [{"type": "column", "name": "ID", "tableName": "T"}],
+        "selectList": [table_col("T", "ID")],
         "filter": declined.clone(),
         "orderBy": [{
             "type": "order_by_element",
-            "expression": {"type": "column", "name": "ID", "tableName": "T"},
+            "expression": table_col("T", "ID"),
             "isAscending": true,
             "nullsLast": true,
         }],
@@ -2888,7 +2880,7 @@ fn single_table_wrapper_renders_declined_predicate_in_exasol_dialect() {
 fn declined_filter_self_apply_renders_tstz_literal_via_convert_tz() {
     let declined = serde_json::json!({
         "type": "predicate_greater",
-        "left": {"type": "column", "name": "C_TS", "tableName": "T"},
+        "left": table_col("T", "C_TS"),
         "right": {"type": "literal_timestamputc", "value": "2024-03-01 09:00:00"},
     });
     assert!(
@@ -2896,7 +2888,7 @@ fn declined_filter_self_apply_renders_tstz_literal_via_convert_tz() {
         "fixture precondition: the predicate must render for Exasol"
     );
     let pushdown_req = serde_json::json!({
-        "selectList": [{"type": "column", "name": "ID", "tableName": "T"}],
+        "selectList": [table_col("T", "ID")],
     });
 
     let sql = declined_filter_wrapper_sql(&pushdown_req, Some(&declined))
@@ -2916,7 +2908,7 @@ fn declined_filter_self_apply_renders_tstz_literal_via_convert_tz() {
 fn single_table_wrapper_trivially_true_declined_predicate_emits_no_where() {
     let trivially_true = serde_json::json!({"type": "literal_bool", "value": true});
     let pushdown_req = serde_json::json!({
-        "selectList": [{"type": "column", "name": "ID", "tableName": "T"}],
+        "selectList": [table_col("T", "ID")],
     });
 
     let sql = declined_filter_wrapper_sql(&pushdown_req, Some(&trivially_true))
@@ -2932,7 +2924,7 @@ fn single_table_wrapper_trivially_true_declined_predicate_emits_no_where() {
 fn single_table_wrapper_errors_when_declined_predicate_renders_in_neither_dialect() {
     let unrenderable = serde_json::json!({"type": "no_such_node_type_in_either_dialect"});
     let pushdown_req = serde_json::json!({
-        "selectList": [{"type": "column", "name": "ID", "tableName": "T"}],
+        "selectList": [table_col("T", "ID")],
     });
 
     let err = declined_filter_wrapper_sql(&pushdown_req, Some(&unrenderable))
@@ -2956,12 +2948,12 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
         ("NAME".to_string(), "VARCHAR(100)".to_string()),
     ]];
     let pushdown_req = serde_json::json!({
-        "selectList": [{"type": "column", "name": "ID", "tableName": "T"}],
-        "groupBy": [{"type": "column", "name": "ID", "tableName": "T"}],
+        "selectList": [table_col("T", "ID")],
+        "groupBy": [table_col("T", "ID")],
         "orderBy": [{
             "type": "order_by_element",
             "expression": {"type": "function_scalar", "name": "UPPER", "arguments": [
-                {"type": "column", "name": "NAME", "tableName": "T"}]},
+                table_col("T", "NAME")]},
             "isAscending": false,
             "nullsLast": true
         }],
@@ -3021,7 +3013,7 @@ fn offset_carrying_seam_fixtures() -> Vec<(&'static str, Json, JoinLegs, &'stati
         },
     ]);
 
-    let id = serde_json::json!({"type": "column", "name": "ID", "tableName": "EVENTS"});
+    let id = table_col("EVENTS", "ID");
     let mod_key = serde_json::json!({
         "type": "function_scalar", "name": "MOD",
         "arguments": [id.clone(), {"type": "literal_exactnumeric", "value": 4}]
@@ -3039,9 +3031,9 @@ fn offset_carrying_seam_fixtures() -> Vec<(&'static str, Json, JoinLegs, &'stati
     let count_star = serde_json::json!({
         "type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false
     });
-    let id_a = serde_json::json!({"type": "column", "name": "ID", "tableName": "EVENTS", "tableAlias": "A"});
-    let score_a = serde_json::json!({"type": "column", "name": "SCORE", "tableName": "EVENTS", "tableAlias": "A"});
-    let name_a = serde_json::json!({"type": "column", "name": "NAME", "tableName": "EVENTS", "tableAlias": "A"});
+    let id_a = aliased_col("EVENTS", "A", "ID");
+    let score_a = aliased_col("EVENTS", "A", "SCORE");
+    let name_a = aliased_col("EVENTS", "A", "NAME");
 
     vec![
         (
@@ -3112,7 +3104,7 @@ fn qualified_wrapper_never_renders_offset_without_order_by() {
     cases.push((
         "control: limit, no orderBy, no offset",
         serde_json::json!({
-            "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
+            "selectList": [table_col("EVENTS", "ID")],
             "limit": {"numElements": 5},
         }),
         single_scan_legs("EVENTS"),
@@ -3136,7 +3128,7 @@ fn qualified_wrapper_never_renders_offset_without_order_by() {
 fn qualified_wrapper_zero_offset_renders_byte_identical_limit() {
     let legs = single_scan_legs("EVENTS");
     let mut pushdown_req = serde_json::json!({
-        "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
+        "selectList": [table_col("EVENTS", "ID")],
         "limit": {"numElements": 5},
     });
     let bare = seam_trailing(&pushdown_req, &legs).expect("a plain limited request must render");
@@ -3149,11 +3141,11 @@ fn qualified_wrapper_zero_offset_renders_byte_identical_limit() {
 }
 
 fn events_column(name: &str) -> Json {
-    serde_json::json!({"type": "column", "name": name, "tableName": "EVENTS", "tableAlias": "E"})
+    aliased_col("EVENTS", "E", name)
 }
 
 fn labels_column(name: &str) -> Json {
-    serde_json::json!({"type": "column", "name": name, "tableName": "LABELS", "tableAlias": "L"})
+    aliased_col("LABELS", "L", name)
 }
 
 /// `EVENTS e JOIN LABELS l ON e.ID = l.ID`: the legs share ID, SCORE, and PAYLOAD. SCORE is
@@ -3325,8 +3317,7 @@ fn output_name_over_identifier_limit_declines_broadcast() {
             .as_array_mut()
             .unwrap()
             .push(serde_json::json!({"name": name, "dataType": {"type": "varchar", "size": 10}}));
-        request["pushdownRequest"]["selectList"] =
-            serde_json::json!([{"type": "column", "name": name, "tableName": "CUSTOMER"}]);
+        request["pushdownRequest"]["selectList"] = serde_json::json!([table_col("CUSTOMER", name)]);
         render_broadcast_join(
             &request,
             &pd(&request),
@@ -3370,12 +3361,11 @@ fn column_without_a_single_leg_fails_broadcast_with_the_fallback_error() {
     };
 
     let mut no_table_name = join_request(Json::Null, equi_condition());
-    no_table_name["pushdownRequest"]["selectList"] =
-        serde_json::json!([{"type": "column", "name": "C_NAME"}]);
+    no_table_name["pushdownRequest"]["selectList"] = serde_json::json!([col("C_NAME")]);
     let mut undeclared_table = join_request(Json::Null, equi_condition());
     undeclared_table["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_equal",
-        "left": {"type": "column", "name": "C_NAME", "tableName": "NOPE"},
+        "left": table_col("NOPE", "C_NAME"),
         "right": {"type": "literal_string", "value": "ACME"},
     });
     for (label, request) in [
@@ -3392,8 +3382,7 @@ fn column_without_a_single_leg_fails_broadcast_with_the_fallback_error() {
     let mut unattributable = self_join_request(&[Some("A"), Some("B")]);
     unattributable["pushdownRequest"]["orderBy"] = serde_json::json!([{
         "type": "order_by_element",
-        "expression": {"type": "column", "name": "O_ORDERKEY", "tableName": "FACT_ORDERS",
-                       "tableAlias": "C"},
+        "expression": aliased_col("FACT_ORDERS", "C", "O_ORDERKEY"),
         "isAscending": true,
         "nullsLast": true,
     }]);

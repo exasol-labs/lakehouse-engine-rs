@@ -1,5 +1,6 @@
 use super::*;
 use crate::adapter::pushdown::test_support::by_name;
+use crate::adapter::pushdown::test_support::col;
 use delta_kernel::schema::{PrimitiveType, StructField, StructType};
 use serde_json::json;
 
@@ -14,10 +15,6 @@ fn test_schema() -> StructType {
 /// `node` translated against [`test_schema`].
 fn translate(node: &Json) -> Option<Predicate> {
     to_delta_predicate(node, &by_name(&test_schema()))
-}
-
-fn col(name: &str) -> Json {
-    json!({"type": "column", "name": name})
 }
 
 fn int_lit(v: i64) -> Json {

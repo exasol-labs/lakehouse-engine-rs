@@ -241,6 +241,18 @@ pub(crate) fn glue_column(name: &str, hive_type: &str) -> CatalogColumn {
     )
 }
 
+pub(crate) fn col(name: &str) -> Json {
+    serde_json::json!({"type": "column", "name": name})
+}
+
+pub(crate) fn table_col(table: &str, name: &str) -> Json {
+    serde_json::json!({"type": "column", "name": name, "tableName": table})
+}
+
+pub(crate) fn aliased_col(table: &str, alias: &str, name: &str) -> Json {
+    serde_json::json!({"type": "column", "name": name, "tableName": table, "tableAlias": alias})
+}
+
 pub(crate) fn broadcast_sides(
     fact: joins::ResolvedJoinSide,
     dimension: joins::ResolvedJoinSide,
@@ -1088,8 +1100,8 @@ pub(crate) fn nq4_request() -> Json {
         "pushdownRequest": {
             "type": "select",
             "selectList": [
-                {"type": "column", "name": "L_ORDERKEY", "tableName": "LINEITEM"},
-                {"type": "column", "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
+                table_col("LINEITEM", "L_ORDERKEY"),
+                table_col("LINEITEM", "L_EXTENDEDPRICE"),
             ],
             "selectListDataTypes": [
                 {"type": "decimal", "precision": 20, "scale": 0},
@@ -1155,10 +1167,10 @@ pub(crate) fn build_row_sql_with_root(
     )
 }
 
-pub(crate) fn agg_item(name: &str, col: Option<&str>, distinct: bool) -> serde_json::Value {
+pub(crate) fn agg_item(name: &str, column: Option<&str>, distinct: bool) -> serde_json::Value {
     let mut args = serde_json::json!([]);
-    if let Some(c) = col {
-        args = serde_json::json!([{"type": "column", "name": c}]);
+    if let Some(c) = column {
+        args = serde_json::json!([col(c)]);
     }
     serde_json::json!({
         "type": "function_aggregate",

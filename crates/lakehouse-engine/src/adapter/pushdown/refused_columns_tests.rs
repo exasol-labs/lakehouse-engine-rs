@@ -1,3 +1,4 @@
+use crate::adapter::pushdown::test_support::table_col;
 use serde_json::json;
 
 use super::*;
@@ -31,7 +32,7 @@ fn involved_tables() -> Json {
 }
 
 fn column_node(name: &str) -> Json {
-    json!({"type": "column", "name": name, "tableName": "STATS_ALL_TYPES"})
+    table_col("STATS_ALL_TYPES", name)
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it
@@ -279,9 +280,7 @@ fn a_lower_cased_column_reference_matches_a_refused_column() {
         "involvedTables": involved_tables(),
         "pushdownRequest": {
             "type": "select",
-            "selectList": [json!({
-                "type": "column", "name": "shape_col", "tableName": "STATS_ALL_TYPES",
-            })],
+            "selectList": [table_col("STATS_ALL_TYPES", "shape_col")],
         },
     });
     let projection = [ProjectionItem::from("INT_COL")];

@@ -1,5 +1,6 @@
 use super::super::test_support::*;
 use super::*;
+use crate::adapter::pushdown::test_support::col;
 
 fn col_types() -> Vec<(String, String)> {
     vec![
@@ -13,9 +14,9 @@ fn col_types() -> Vec<(String, String)> {
 fn grouped_numeric_aggregate_classifies_as_grouped() {
     let req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
         "selectList": [
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             agg_item("SUM", Some("AMOUNT"), false),
         ],
         "selectListDataTypes": [
@@ -34,9 +35,9 @@ fn grouped_numeric_aggregate_classifies_as_grouped() {
 fn grouped_non_numeric_without_having_falls_through_to_wrapper() {
     let req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
         "selectList": [
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             agg_item("SUM", Some("NAME"), false),
         ],
     });
@@ -51,9 +52,9 @@ fn grouped_non_numeric_without_having_falls_through_to_wrapper() {
 fn grouped_non_numeric_with_having_falls_through_to_wrapper() {
     let req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
         "selectList": [
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             agg_item("SUM", Some("NAME"), false),
         ],
         "having": {"type": "predicate_greater"},
@@ -69,9 +70,9 @@ fn grouped_non_numeric_with_having_falls_through_to_wrapper() {
 fn grouped_having_unmatched_aggregate_falls_through_to_wrapper() {
     let req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
         "selectList": [
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             agg_item("COUNT", None, false),
         ],
         "having": {
@@ -91,9 +92,9 @@ fn grouped_having_unmatched_aggregate_falls_through_to_wrapper() {
 fn grouped_having_mixed_junction_falls_through_to_wrapper() {
     let req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
         "selectList": [
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             agg_item("COUNT", None, false),
         ],
         "having": {
@@ -123,9 +124,9 @@ fn grouped_having_mixed_junction_falls_through_to_wrapper() {
 fn grouped_having_fully_matched_stays_grouped() {
     let req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
         "selectList": [
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             agg_item("SUM", Some("AMOUNT"), false),
         ],
         "having": {
@@ -156,9 +157,9 @@ fn grouped_having_fully_matched_stays_grouped() {
 fn grouped_having_distinct_aggregate_falls_through_to_wrapper() {
     let req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
         "selectList": [
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             agg_item("COUNT", None, false),
         ],
         "having": {
@@ -178,8 +179,8 @@ fn grouped_having_distinct_aggregate_falls_through_to_wrapper() {
 fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only() {
     let req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "REGION"}],
-        "selectList": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
+        "selectList": [col("REGION")],
         "orderBy": [{
             "type": "order_by_element",
             "expression": agg_item("SUM", Some("AMOUNT"), false),
@@ -206,9 +207,9 @@ fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only
 fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper() {
     let req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
         "selectList": [
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             agg_item("COUNT", None, false),
         ],
         "orderBy": [{
@@ -237,14 +238,14 @@ fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper
 fn grouped_order_by_group_key_classifies_grouped_with_resolved_clause() {
     let req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
         "selectList": [
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             agg_item("SUM", Some("AMOUNT"), false),
         ],
         "orderBy": [{
             "type": "order_by_element",
-            "expression": {"type": "column", "name": "REGION"},
+            "expression": col("REGION"),
             "isAscending": true,
             "nullsLast": true,
         }],
@@ -290,8 +291,8 @@ fn single_group_count_distinct_classifies_as_single_group() {
 fn plain_projection_classifies_as_row_scan() {
     let req = serde_json::json!({
         "selectList": [
-            {"type": "column", "name": "REGION"},
-            {"type": "column", "name": "AMOUNT"},
+            col("REGION"),
+            col("AMOUNT"),
         ],
     });
     let shape = classify_request_shape(&req, &col_types());

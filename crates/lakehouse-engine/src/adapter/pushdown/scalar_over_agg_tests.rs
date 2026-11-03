@@ -1,9 +1,10 @@
 use super::*;
+use crate::adapter::pushdown::test_support::col;
 
-fn agg(name: &str, col: &str, distinct: bool) -> Json {
+fn agg(name: &str, column: &str, distinct: bool) -> Json {
     serde_json::json!({
         "type": "function_aggregate", "name": name, "distinct": distinct,
-        "arguments": [{"type": "column", "name": col}]
+        "arguments": [col(column)]
     })
 }
 
@@ -174,11 +175,7 @@ fn sentinelize_does_not_treat_a_column_inside_an_aggregate_as_residual() {
 
 #[test]
 fn sentinelize_flags_a_bare_column_outside_any_aggregate() {
-    let node = binary(
-        "ADD",
-        agg("SUM", "X", false),
-        serde_json::json!({"type": "column", "name": "Y"}),
-    );
+    let node = binary("ADD", agg("SUM", "X", false), col("Y"));
     let mut aggregates = Vec::new();
     let mut residual = false;
 
@@ -206,11 +203,7 @@ fn classify_returns_the_nested_plans_in_encounter_order() {
 #[test]
 fn classify_declines_a_node_with_no_nested_aggregate() {
     assert!(
-        classify_scalar_over_aggregate(&round_of(
-            serde_json::json!({"type": "column", "name": "X"}),
-            2
-        ))
-        .is_none(),
+        classify_scalar_over_aggregate(&round_of(col("X"), 2)).is_none(),
         "a plain scalar over a column is not a scalar-over-aggregate"
     );
 }
@@ -233,11 +226,7 @@ fn classify_declines_a_distinct_inner_aggregate() {
 
 #[test]
 fn classify_declines_a_residual_column_outside_the_aggregate() {
-    let node = binary(
-        "ADD",
-        agg("SUM", "X", false),
-        serde_json::json!({"type": "column", "name": "Y"}),
-    );
+    let node = binary("ADD", agg("SUM", "X", false), col("Y"));
 
     assert!(classify_scalar_over_aggregate(&node).is_none());
 }

@@ -1,6 +1,7 @@
 use super::super::support::quote_ident;
 use super::super::test_support::*;
 use super::*;
+use crate::adapter::pushdown::test_support::{col, table_col};
 
 fn relation(col_types: &[(String, String)]) -> EmptyRelation {
     EmptyRelation::single_scan(&serde_json::json!({}), col_types)
@@ -137,9 +138,9 @@ fn empty_result_sql_dispatches_by_plan_shape() {
 
     let grouped = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "K"}],
+        "groupBy": [col("K")],
         "selectList": [
-            {"type": "column", "name": "K"},
+            col("K"),
             agg_item("COUNT", None, false),
         ],
         "selectListDataTypes": [
@@ -231,9 +232,9 @@ fn empty_files_grouped_non_numeric_aggregate_uses_selectlist_shape() {
 
     let grouped_non_numeric = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "K"}],
+        "groupBy": [col("K")],
         "selectList": [
-            {"type": "column", "name": "K"},
+            col("K"),
             agg_item("SUM", Some("name"), false),
         ],
         "selectListDataTypes": [
@@ -270,9 +271,9 @@ fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
 
     let grouped_having = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "K"}],
+        "groupBy": [col("K")],
         "selectList": [
-            {"type": "column", "name": "K"},
+            col("K"),
             agg_item("SUM", Some("name"), false),
         ],
         "selectListDataTypes": [
@@ -307,7 +308,7 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
     let pushdown_req = serde_json::json!({
         "selectList": [
             {"type": "function_scalar", "name": "LENGTH", "arguments": [
-                {"type": "column", "name": "SCORE", "tableName": "T"}]},
+                table_col("T", "SCORE")]},
         ],
         "selectListDataTypes": [{"type": "decimal", "precision": 18, "scale": 0}],
     });
