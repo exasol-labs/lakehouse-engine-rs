@@ -7,7 +7,7 @@ A user exports an Exasol table, a query over virtual schema tables, or a query t
 * Statement: `EXPORT {<table> [(<columns>)] | (<query>)} INTO SCRIPT <schema>.LAKEHOUSE_EXPORT AT <connection> WITH TABLE_NAME = '<namespace>.<table>' [WRITERS_PER_NODE = '<n>'] [SINGLE_COMMIT = '<true|false>']`. `<connection>` names the CONNECTION object that the virtual schema uses.
 * `TABLE_NAME` is required. It is a namespace and a table name joined by `.`. The namespace may have several `.`-separated levels, and no part is empty.
 * `WRITERS_PER_NODE` is optional: an integer of at least 1, default 1. `SINGLE_COMMIT` is optional: `true` or `false` in any letter case, default `false`. The export refuses `WRITERS_PER_NODE` together with `SINGLE_COMMIT = 'true'`.
-* Writer count: with `SINGLE_COMMIT = 'true'`, one writer runs for the whole cluster. Otherwise the export assigns each row at random to one of G writers, where G is the node count × `WRITERS_PER_NODE`, capped at 300. A writer that receives no row does not run, so a source with few rows can run fewer than G writers.
+* Writer count: with `SINGLE_COMMIT = 'true'`, one writer runs for the whole cluster. Otherwise the export deals the source rows in turn to G writers, where G is the node count × `WRITERS_PER_NODE`, capped at 300. A source with at least G rows runs exactly G writers, and a source with fewer rows runs one writer per row.
 * An exporting user needs the `EXPORT` system privilege, `EXECUTE` on `LAKEHOUSE_EXPORT` and `LAKEHOUSE_EXPORT_WRITER`, the `CONNECTION` privilege on the CONNECTION (Exasol requires it for `AT <connection>`), and `GRANT ACCESS ON CONNECTION <connection> FOR SCRIPT` on each of the two scripts, granted directly or through a role. Both scripts read the CONNECTION.
 * The export refuses columns of type GEOMETRY, HASHTYPE, INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, and TIMESTAMP WITH LOCAL TIME ZONE, because Exasol does not pass them to a UDF reliably. The Iceberg table spec (§ Schemas and Data Types, Primitive Types) defines `timestamptz` ("Timestamp, microsecond precision, with timezone"; the counterpart of TIMESTAMP WITH LOCAL TIME ZONE), `uuid` ("Universally unique identifiers") and `fixed(L)` ("Fixed-length byte array of length L"), the Iceberg counterparts of HASHTYPE, and, in format v3, `geometry(C)`. It defines no interval type. Refusing GEOMETRY, HASHTYPE, and TIMESTAMP WITH LOCAL TIME ZONE is a trade-off that Exasol's UDF interface forces. A user casts such a column, for example to VARCHAR or TIMESTAMP, to export it.
 * The column type check runs on the rows the source returns, so an empty source with a column of one of these types exports 0 rows without an error.
@@ -53,16 +53,17 @@ A user exports an Exasol table, a query over virtual schema tables, or a query t
 
 ### Scenario: WRITERS_PER_NODE sets the writer count
 
-* *GIVEN* a cluster of N nodes and a source with at least 100 rows per planned writer
+* *GIVEN* a cluster of N nodes and a source with at least N × W rows
 * *WHEN* a user exports it with `WRITERS_PER_NODE = '<W>'`, where N × W is at most 300
-* *THEN* the export SHALL run N × W writers and report the source row count
-* *AND* an export with neither `WRITERS_PER_NODE` nor `SINGLE_COMMIT` SHALL run N writers
+* *THEN* the export SHALL run exactly N × W writers and report the source row count
+* *AND* an export with neither `WRITERS_PER_NODE` nor `SINGLE_COMMIT` SHALL run exactly N writers
+* *AND* a source with fewer than N × W rows SHALL run one writer per row
 
 ### Scenario: The writer count never exceeds 300
 
 * *GIVEN* a cluster whose node count × `WRITERS_PER_NODE` exceeds 300
-* *WHEN* a user exports a source with that `WRITERS_PER_NODE` value
-* *THEN* the export SHALL run at most 300 writers
+* *WHEN* a user exports a source of at least 300 rows with that `WRITERS_PER_NODE` value
+* *THEN* the export SHALL run exactly 300 writers and report the source row count
 
 ### Scenario: SINGLE_COMMIT runs one writer for the whole cluster
 
@@ -150,3 +151,10 @@ A user exports an Exasol table, a query over virtual schema tables, or a query t
 * *THEN* the install SHALL succeed and warn naming the CONNECTION
 * *AND* it SHALL NOT run the export role's statements
 * *AND* the printed template SHALL print the export role lines for that CONNECTION
+
+### Scenario: The installer accepts only a simple identifier as the export CONNECTION name
+
+* *GIVEN* an `--export-connection` value
+* *WHEN* the install script starts
+* *THEN* it SHALL accept a name of at most 128 characters that starts with a letter and holds only letters, digits, and `_`, and SHALL use it in upper case, as Exasol stores an unquoted name
+* *AND* for any other value it SHALL fail before it runs any SQL, naming the flag and the accepted form

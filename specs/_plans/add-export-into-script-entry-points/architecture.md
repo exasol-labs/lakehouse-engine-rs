@@ -17,7 +17,7 @@
 - sealed-storage (crates/lakehouse-engine/src/scan/sealed.rs): encrypts storage credentials into the scan spec with AES-GCM under a key derived by HKDF-SHA256 from the CONNECTION password, and decrypts them in the scan UDF | owns: sealed storage envelope format | depends on: none
 - datafusion-scan (crates/lakehouse-engine/src/scan/): runs one shard per invocation as a raw scan, a partial aggregate, or a broadcast join scan, applies Iceberg positional deletes and Iceberg and Delta deletion vectors, and emits results batch by batch | owns: per-invocation Tokio runtime, DataFusion session, memory pool | depends on: scan-spec, sealed-storage, scan-object-store, type-mapping, vs-expression
 - scan-object-store (crates/lakehouse-engine/src/scan/object_store.rs): builds S3 or ADLS Gen2 object stores with a connection budget and an admission limit, and routes the two join sides by path prefix | owns: per-invocation HTTP connection pool | depends on: lakehouse-catalog
-- export (crates/lakehouse-engine/src/export/): validates an `EXPORT ... INTO SCRIPT` statement, checks that the exporting user's scripts can read the CONNECTION, renders the writer SELECT with per-column type guards and a random group key, and counts the rows each writer receives | owns: export options, writer spec format | depends on: sharding
+- export (crates/lakehouse-engine/src/export/): validates an `EXPORT ... INTO SCRIPT` statement, checks that the exporting user's scripts can read the CONNECTION, renders the writer SELECT with per-column type guards and a row-number group key, and counts the rows each writer receives | owns: export options, writer spec format | depends on: sharding
 - type-mapping (crates/lakehouse-engine/src/types/): maps Arrow, Iceberg, Delta, and Hive types to Exasol types and applies type widening rules | owns: none | depends on: none
 - lakehouse-catalog (crates/lakehouse-catalog/): implements `CatalogClient` for Iceberg REST, Unity Catalog, and AWS Glue (a full listing that drops the identifiers a caller-supplied predicate rejects before it loads any table, an identifier-only listing, a load of listed tables that classifies each table as the full listing does, and the pushdown's single-table load), with OAuth2, bearer, and SigV4 auth, STS role assumption, vended-storage resolution, and credential redaction; its neutral table carries the catalog's table properties verbatim and its neutral column an opaque engine-encoded declaration slot, and it interprets neither | owns: per-request catalog sessions | depends on: none
 - vs-expression (crates/vs-expression/): translates VS expression JSON into DataFusion SQL and Exasol SQL fragments | owns: none | depends on: none
@@ -38,7 +38,7 @@
 - datafusion-scan -> Exasol: raw and join rows leave through the Arrow C Data Interface via `ctx.emit_batch`, partial aggregates leave as SDK `Value` rows via `ctx.emit`
 - Exasol -> result: the dispatch SQL wrapper merges partial aggregates and applies the final ORDER BY and LIMIT
 - user `EXPORT ... INTO SCRIPT LAKEHOUSE_EXPORT AT <connection>` -> Exasol -> export: one call with the export specification (options, source column names, CONNECTION name) before any source row is read; export answers one SELECT over `DUAL`, which Exasol binds to the export source
-- Exasol -> LAKEHOUSE_EXPORT_WRITER: the source rows pass the per-column type guards and are grouped by `MOD(FLOOR(RANDOM() * G), G)`; Exasol multiplexes the groups, one writer invocation each, onto each node's SET-script VM pool
+- Exasol -> LAKEHOUSE_EXPORT_WRITER: the source rows pass the per-column type guards and are grouped by `MOD(ROWNUM, G)`; Exasol multiplexes the groups, one writer invocation each, onto each node's SET-script VM pool
 - LAKEHOUSE_EXPORT_WRITER -> Exasol: one row count per writer; Exasol reports their sum as the EXPORT statement's row count
 <!-- /DELTA:CHANGED -->
 
@@ -80,7 +80,7 @@
 - The adapter resolves metadata once per query. The scan UDF never discovers files.
 - Each node scans only its assigned files, with no overlap between shards.
 - The shard count is G = node count × `PARALLELISM_FACTOR` (default 1), clamped to at least 1 and at most min(file count, 300).
-- The export writer count is G = node count × `WRITERS_PER_NODE` (default 1), clamped to at least 1 and at most 300, or 1 with `SINGLE_COMMIT = 'true'`. Each source row reaches exactly one writer.
+- The export writer count is G = node count × `WRITERS_PER_NODE` (default 1), clamped to at least 1 and at most 300, or 1 with `SINGLE_COMMIT = 'true'`. Each source row reaches exactly one writer, and a source with at least G rows runs exactly G writers.
 - The DataFusion memory pool is max((memory limit − 200 MB overhead) × 0.6, 256 MiB), or 1 GiB when the limit is unknown.
 - The scan spills to `/tmp` when `/tmp` is a writable non-tmpfs disk. Otherwise it returns a `ResourcesExhausted` error past the pool budget.
 - The scan streams one `RecordBatch` at a time and never collects the full result.
