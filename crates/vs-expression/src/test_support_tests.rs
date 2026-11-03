@@ -2,24 +2,15 @@ use crate::ColumnNode;
 use serde_json::{Value as Json, json};
 
 pub(crate) fn col(name: &str) -> Json {
-    ColumnNode::named(name).to_json()
+    ColumnNode::to_json(name, None, None)
 }
 
 pub(crate) fn table_col(table: &str, name: &str) -> Json {
-    ColumnNode {
-        table_name: Some(table),
-        ..ColumnNode::named(name)
-    }
-    .to_json()
+    ColumnNode::to_json(name, Some(table), None)
 }
 
 pub(crate) fn aliased_col(table: &str, alias: &str, name: &str) -> Json {
-    ColumnNode {
-        name,
-        table_name: Some(table),
-        table_alias: Some(alias),
-    }
-    .to_json()
+    ColumnNode::to_json(name, Some(table), Some(alias))
 }
 
 pub(crate) fn lit(kind: &str, value: impl Into<Json>) -> Json {

@@ -48,7 +48,7 @@ pub(super) fn agg_sentinel_token(i: usize) -> String {
 }
 
 pub(super) fn sentinel_column_node(i: usize) -> Json {
-    ColumnNode::named(&agg_sentinel_name(i)).to_json()
+    ColumnNode::to_json(&agg_sentinel_name(i), None, None)
 }
 
 /// Recursion stops at a `function_aggregate`, so a column inside an aggregate is

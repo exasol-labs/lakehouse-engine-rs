@@ -41,20 +41,12 @@ impl<'a> ColumnNode<'a> {
         self.name.to_ascii_uppercase()
     }
 
-    pub fn named(name: &'a str) -> Self {
-        Self {
-            name,
-            table_name: None,
-            table_alias: None,
-        }
-    }
-
-    pub fn to_json(&self) -> Json {
-        let mut node = serde_json::json!({"type": "column", "name": self.name});
-        if let Some(table) = self.table_name {
+    pub fn to_json(name: &str, table_name: Option<&str>, table_alias: Option<&str>) -> Json {
+        let mut node = serde_json::json!({"type": "column", "name": name});
+        if let Some(table) = table_name {
             node[TABLE_NAME] = Json::String(table.to_string());
         }
-        if let Some(alias) = self.table_alias {
+        if let Some(alias) = table_alias {
             node[TABLE_ALIAS] = Json::String(alias.to_string());
         }
         node

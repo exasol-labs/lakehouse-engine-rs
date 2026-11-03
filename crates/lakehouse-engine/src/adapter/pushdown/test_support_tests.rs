@@ -244,7 +244,7 @@ pub(crate) fn glue_column(name: &str, hive_type: &str) -> CatalogColumn {
 }
 
 pub(crate) fn col(name: &str) -> Json {
-    ColumnNode::named(name).to_json()
+    ColumnNode::to_json(name, None, None)
 }
 
 pub(crate) fn table_col(table: &str, name: &str) -> Json {
@@ -256,12 +256,7 @@ pub(crate) fn aliased_col(table: &str, alias: &str, name: &str) -> Json {
 }
 
 pub(crate) fn table_column(table: &str, alias: Option<&str>, name: &str) -> Json {
-    ColumnNode {
-        name,
-        table_name: Some(table),
-        table_alias: alias,
-    }
-    .to_json()
+    ColumnNode::to_json(name, Some(table), alias)
 }
 
 pub(crate) fn table_ref(name: &str) -> Json {
