@@ -1,6 +1,6 @@
 # Feature: Pushdown Planning, Unified Unaccelerated Join Fallback
 
-One renderer serves every inner equi-join outside the two-table broadcast contract. It scans each involved table through its own sharded fan-out subquery (a nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor over an ungrouped `LAKEHOUSE_SCAN` SCALAR EMIT UDF) and rebuilds the join in Exasol's core engine as a left-to-right `INNER JOIN ... ON` chain, with leg-local `WHERE` conjuncts pushed into each leg.
+One renderer serves every inner equi-join outside the two-leg broadcast contract. It scans each involved table through its own sharded fan-out subquery (a nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor over an ungrouped `LAKEHOUSE_SCAN` SCALAR EMIT UDF) and rebuilds the join in Exasol's core engine as a left-to-right `INNER JOIN ... ON` chain, with leg-local `WHERE` conjuncts pushed into each leg.
 
 ## Background
 
@@ -28,10 +28,10 @@ One renderer serves every inner equi-join outside the two-table broadcast contra
 ### Scenario: A join outside the broadcast contract is declined safely
 
 * *GIVEN* a `pushdown` request whose `from` clause is a join
-* *WHEN* the join is not a single broadcast-eligible two-table inner equi-join, it is above threshold, non-equi, spans more than two involved tables, has overlapping column names across tables, needs Exasol postprocessing, or carries a condition/filter/projection detail that keeps it off the broadcast path
+* *WHEN* the join is not a single broadcast-eligible two-leg inner equi-join, it is above threshold, non-equi, spans more than two legs, needs Exasol postprocessing, or carries a condition/filter/projection detail that keeps it off the broadcast path
 * *THEN* the adapter SHALL NOT emit a broadcast plan for that request
-* *AND* the adapter SHALL instead render the request through the SINGLE unified unaccelerated per-table-scan fallback (N ≥ 2 involved tables, the two-table case being N = 2), so Exasol's core engine produces the correct result
-* *AND* spanning more than two involved tables, or having overlapping column names, or needing Exasol postprocessing SHALL by itself NEVER be a reason to return an error, every such inner join is served by the unified fallback
+* *AND* the adapter SHALL instead render the request through the SINGLE unified unaccelerated per-table-scan fallback (N ≥ 2 legs, the two-leg case being N = 2), so Exasol's core engine produces the correct result
+* *AND* spanning more than two legs or needing Exasol postprocessing SHALL by itself NEVER be a reason to return an error, every such inner join is served by the unified fallback
 * *AND* the adapter SHALL return a HARD error, a client-facing `F-UDF-CL-RUST-9001`, NOT a request that Exasol retries natively (Exasol does not re-plan on an adapter error), ONLY when it genuinely cannot render what it advertised: a non-inner join node in the tree, an involved table carrying no readable identifier note or no column metadata, or a condition/clause the translator cannot render at all
 * *AND* the adapter MUST NOT emit any scan spec that would compute a different result than single-node evaluation
 

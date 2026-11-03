@@ -64,12 +64,12 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 
 ### Scenario: A broadcast-eligible join whose filter declines takes the N-scan fallback
 
-* *GIVEN* an inner equi-join `pushdown` request that meets every other broadcast condition, two involved tables, an equi-condition, disjoint column names, no Exasol postprocessing, a byte size at or below the broadcast threshold
-* *AND* the request carries a non-null `filter` whose DataFusion-bound render declines, either because a type-rewrite guard returned `None` when run against the union of the two involved tables' column metadata or because the DataFusion dialect cannot express a node in the tree
+* *GIVEN* an inner equi-join `pushdown` request that meets every other broadcast condition, two legs, an equi-condition, no Exasol postprocessing, a byte size at or below the broadcast threshold
+* *AND* the request carries a non-null `filter` whose DataFusion-bound render declines, either because a type-rewrite guard returned `None` when run against the two legs' column metadata keyed by (relation alias, column) or because the DataFusion dialect cannot express a node in the tree
 * *WHEN* the adapter renders the join pushdown
 * *THEN* the adapter SHALL decline the broadcast plan and fall through to the unified unaccelerated N-scan fallback, which applies the predicate itself, honouring the recorded broadcast contract that a filter the translator cannot render is served by the fallback
 * *AND* the adapter MUST NOT emit a broadcast plan whose scan spec carries no filter, because the broadcast SQL has no outer `WHERE` in which the predicate could be applied
-* *AND* the decline SHALL be a clean `Ok(None)`-shaped fall-through, NOT an error, matching the disjoint-schema, unrenderable-condition, and widened-projection declines already on that path
+* *AND* the decline SHALL be a clean `Ok(None)`-shaped fall-through, NOT an error, matching the unrenderable-condition and widened-projection declines already on that path
 * *AND* both trigger classes SHALL reach this ONE outcome, so the adapter SHALL NOT grow a second broadcast-decline route for a type decline, REPLACING the recorded "whose DataFusion-bound render declines", which named only the dialect trigger because the broadcast site ran no type screen
 * *AND* a filter the type-rewrite pipeline REWRITES rather than declines SHALL NOT trigger this decline, and SHALL keep the broadcast plan with the REWRITTEN tree carried in the common spec
 * *AND* the returned rows SHALL equal native Exasol evaluation of the same join

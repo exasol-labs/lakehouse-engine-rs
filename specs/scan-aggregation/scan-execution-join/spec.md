@@ -36,7 +36,12 @@ The scan UDF executes a node-local broadcast inner equi-join. It registers the f
 
 * *GIVEN* a reconstituted join scan spec
 * *WHEN* the scan UDF runs for that invocation
-* *THEN* the UDF SHALL register the fact side's assigned files and the dimension side's full file list as two separate tables in ONE DataFusion session, each with its declared logical schema and each exposing its columns under the Exasol-facing (uppercased) names the pushed condition and projection reference
+* *THEN* the UDF SHALL register the fact side's assigned files and the dimension side's full file list as two separate tables in ONE DataFusion session, each with its declared logical schema
+* *AND* the join block SHALL carry the fact relation's alias and the dimension relation's alias as REQUIRED fields with no deserialization default, and the join SQL SHALL alias each side's derived relation with its own alias from the join block, never with an alias the UDF chooses itself
+* *AND* each relation SHALL keep its columns under their own uppercased names, so the pushed condition, filter, projection, and post-join ordering reference a column as a pair qualified by its relation alias, `"<alias>"."<COLUMN>"`
+* *AND* a column name that both sides carry SHALL stay two distinct columns, one per relation
+* *AND* the UDF SHALL resolve each projected column and each post-join sort key by its (relation alias, column) pair, MUST NOT match a column by its bare name, and SHALL choose the column's rendering and its ranking from the type it has on that relation
+* *AND* the UDF SHALL emit each projected column that carries a relation alias under the output name `<alias>_<column>`, the only name in the join SQL that joins the alias and the column into one identifier, so two same-named projected columns stay distinct in the output
 * *AND* the UDF SHALL register each side's table against that side's OWN RESOLVED storage backend, and the redaction set guarding a read error SHALL be the UNION of both sides' resolved secret values, because the one per-invocation resolution defines the set before either store exists
 * *AND* the UDF SHALL execute an inner equi-join of the two registered tables on the rendered join condition
 * *AND* the UDF MUST NOT resolve or discover any file beyond the two file lists carried in the spec
