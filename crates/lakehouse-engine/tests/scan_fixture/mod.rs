@@ -3,7 +3,7 @@
 pub mod concurrency_probe;
 
 use lakehouse_engine::scan::ResolvedScanStorage;
-use lakehouse_engine::scan::spec::{ScanSpec, ScanStorage, StorageBackend};
+use lakehouse_engine::scan::spec::{JoinSpec, JoinType, ScanSpec, ScanStorage, StorageBackend};
 
 pub fn resolved_storage(spec: &ScanSpec) -> ResolvedScanStorage {
     ResolvedScanStorage::from_backends(
@@ -13,6 +13,23 @@ pub fn resolved_storage(spec: &ScanSpec) -> ResolvedScanStorage {
             .as_ref()
             .map(|join| inline_backend(&join.storage)),
     )
+}
+
+pub fn join_spec(storage: ScanStorage) -> JoinSpec {
+    JoinSpec {
+        table_root: String::new(),
+        files: Vec::new(),
+        logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
+        join_type: JoinType::Inner,
+        fact_alias: "LHS_T1".into(),
+        dimension_alias: "LHS_T0".into(),
+        condition: r#""LHS_T0"."D_KEY" = "LHS_T1"."F_KEY""#.into(),
+        post_join_limit: None,
+        post_join_order_by: Vec::new(),
+        partition_columns: Vec::new(),
+        storage,
+    }
 }
 
 fn inline_backend(storage: &ScanStorage) -> StorageBackend {

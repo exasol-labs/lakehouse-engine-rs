@@ -1,4 +1,5 @@
 use super::*;
+use crate::scan::test_support::join_spec;
 
 #[test]
 fn reconstruct_absolute_entry_passes_through() {
@@ -1152,15 +1153,7 @@ fn join_block_round_trips_through_split_and_merge() {
             nested: None,
             physical_name: None,
         }],
-        name_mapping: Vec::new(),
-        join_type: JoinType::Inner,
-        fact_alias: "LHS_T1".into(),
-        dimension_alias: "LHS_T0".into(),
-        condition: "\"LHS_T0\".\"D_KEY\" = \"LHS_T1\".\"F_KEY\"".into(),
-        post_join_limit: None,
-        post_join_order_by: Vec::new(),
-        partition_columns: Vec::new(),
-        storage: ScanStorage::Inline(dim_storage.clone()),
+        ..join_spec(ScanStorage::Inline(dim_storage.clone()))
     });
 
     let json = spec.to_json();
@@ -1220,16 +1213,7 @@ fn sample_join_spec(storage: ScanStorage) -> JoinSpec {
     JoinSpec {
         table_root: "s3://warehouse/db/dim".into(),
         files: vec![FileEntry::new("data/dim-00000.parquet", 512)],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join_type: JoinType::Inner,
-        fact_alias: "LHS_T1".into(),
-        dimension_alias: "LHS_T0".into(),
-        condition: "\"LHS_T0\".\"D_KEY\" = \"LHS_T1\".\"F_KEY\"".into(),
-        post_join_limit: None,
-        post_join_order_by: Vec::new(),
-        partition_columns: Vec::new(),
-        storage,
+        ..join_spec(storage)
     }
 }
 
@@ -1308,16 +1292,7 @@ fn join_spec_partition_columns_defaults_to_empty_and_iceberg_json_is_byte_identi
     let join = JoinSpec {
         table_root: "s3://warehouse/db/dim".into(),
         files: vec![FileEntry::new("data/dim-00000.parquet", 512)],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join_type: JoinType::Inner,
-        fact_alias: "LHS_T1".into(),
-        dimension_alias: "LHS_T0".into(),
-        condition: "\"LHS_T0\".\"D_KEY\" = \"LHS_T1\".\"F_KEY\"".into(),
-        post_join_limit: None,
-        post_join_order_by: Vec::new(),
-        partition_columns: Vec::new(),
-        storage: ScanStorage::Inline(storage),
+        ..join_spec(ScanStorage::Inline(storage))
     };
 
     let json = serde_json::to_string(&join).unwrap();
