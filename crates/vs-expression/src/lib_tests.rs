@@ -1,33 +1,6 @@
 use super::*;
+use crate::test_support::*;
 use serde_json::json;
-
-fn col(name: &str) -> Json {
-    json!({"type": "column", "name": name})
-}
-
-fn lit(kind: &str, value: impl Into<Json>) -> Json {
-    json!({"type": kind, "value": value.into()})
-}
-
-fn num_lit(value: impl Into<Json>) -> Json {
-    lit("literal_exactnumeric", value)
-}
-
-fn str_lit(value: &str) -> Json {
-    lit("literal_string", value)
-}
-
-fn bool_lit(value: bool) -> Json {
-    lit("literal_bool", value)
-}
-
-fn null_lit() -> Json {
-    json!({"type": "literal_null"})
-}
-
-fn predicate_equal(left: Json, right: Json) -> Json {
-    json!({"type": "predicate_equal", "left": left, "right": right})
-}
 
 #[test]
 fn renders_column_as_quoted_uppercase_ident() {
