@@ -2,9 +2,9 @@ use serde_json::Value as Json;
 use std::collections::BTreeSet;
 use std::fmt;
 
-use super::super::support::walk_column_nodes;
 use super::planning::{DetectedJoin, JoinLeaf};
 use crate::scan::spec::relation_alias;
+use vs_expression::{ColumnNode, rewrite_table_aliases, walk_column_nodes};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ColumnLeg {
@@ -31,28 +31,22 @@ struct LegReferences {
 pub(super) struct UnattributableColumn {
     table_name: String,
     table_alias: Option<String>,
-    column_name: Option<String>,
+    column_name: String,
 }
 
 impl UnattributableColumn {
-    fn of(column: &serde_json::Map<String, Json>) -> Self {
-        let text = |key: &str| {
-            column
-                .get(key)
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-        };
+    fn of(column: ColumnNode<'_>) -> Self {
         Self {
-            table_name: text("tableName").unwrap_or_default(),
-            table_alias: text("tableAlias"),
-            column_name: text("name"),
+            table_name: column.table_name.unwrap_or_default().to_string(),
+            table_alias: column.table_alias.map(str::to_string),
+            column_name: column.name.to_string(),
         }
     }
 }
 
 impl fmt::Display for UnattributableColumn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let column = self.column_name.as_deref().unwrap_or("<unnamed>");
+        let column = &self.column_name;
         match &self.table_alias {
             Some(alias) => write!(
                 f,
@@ -139,8 +133,8 @@ impl JoinLegs {
     }
 
     /// The sole answer to leg identity; no other module reads `tableName` for it.
-    pub(super) fn resolve_column(&self, column: &serde_json::Map<String, Json>) -> ColumnLeg {
-        let Some(table_name) = column.get("tableName").and_then(|name| name.as_str()) else {
+    pub(super) fn resolve_column(&self, column: ColumnNode<'_>) -> ColumnLeg {
+        let Some(table_name) = column.table_name else {
             return ColumnLeg::NoLeg;
         };
         let matching: Vec<&LegKey> = self
@@ -154,10 +148,9 @@ impl JoinLegs {
         if matching.iter().all(|key| key.leg == first.leg) {
             return ColumnLeg::Leg(first.leg);
         }
-        let alias = column.get("tableAlias").and_then(|alias| alias.as_str());
         match matching
             .iter()
-            .find(|key| key.table_alias.as_deref() == alias)
+            .find(|key| key.table_alias.as_deref() == column.table_alias)
         {
             Some(key) => ColumnLeg::Leg(key.leg),
             None => ColumnLeg::Unattributable,
@@ -221,32 +214,11 @@ impl JoinLegs {
 
     /// `strict` turns a [`ColumnLeg::NoLeg`] column into an error instead of leaving it as is.
     fn qualify_tree(&self, expr: &Json, strict: bool) -> Result<Json, UnattributableColumn> {
-        match expr {
-            Json::Object(map) => {
-                let mut out = serde_json::Map::with_capacity(map.len() + 1);
-                for (key, value) in map {
-                    out.insert(key.clone(), self.qualify_tree(value, strict)?);
-                }
-                if map.get("type").and_then(|node| node.as_str()) == Some("column") {
-                    match self.resolve_column(map) {
-                        ColumnLeg::Leg(leg) => {
-                            out.insert("tableAlias".to_string(), Json::String(self.leg_alias(leg)));
-                        }
-                        ColumnLeg::NoLeg if !strict => {}
-                        ColumnLeg::NoLeg | ColumnLeg::Unattributable => {
-                            return Err(UnattributableColumn::of(map));
-                        }
-                    }
-                }
-                Ok(Json::Object(out))
-            }
-            Json::Array(items) => items
-                .iter()
-                .map(|item| self.qualify_tree(item, strict))
-                .collect::<Result<Vec<Json>, UnattributableColumn>>()
-                .map(Json::Array),
-            other => Ok(other.clone()),
-        }
+        rewrite_table_aliases(expr, &mut |column| match self.resolve_column(column) {
+            ColumnLeg::Leg(leg) => Ok(Some(self.leg_alias(leg))),
+            ColumnLeg::NoLeg if !strict => Ok(column.table_alias.map(str::to_string)),
+            ColumnLeg::NoLeg | ColumnLeg::Unattributable => Err(UnattributableColumn::of(column)),
+        })
     }
 }
 

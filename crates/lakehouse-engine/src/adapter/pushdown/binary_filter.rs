@@ -4,6 +4,7 @@
 
 use arrow::datatypes::DataType;
 use serde_json::{Value as Json, json};
+use vs_expression::ColumnNode;
 
 use super::format::filter_json::Comparison;
 use super::support::{binds_column, column_node_ref};
@@ -57,9 +58,6 @@ impl BinaryColumns {
     /// The node's own (relation alias, column) pair, so the raw-bytes column it becomes stays
     /// on the node's relation.
     fn resolve(&self, node: &Json) -> Option<(ColumnRef, Option<i32>)> {
-        if node.get("type")?.as_str()? != "column" {
-            return None;
-        }
         let column = column_node_ref(node)?;
         let (_, width) = self
             .0
@@ -146,11 +144,7 @@ fn byte_comparison(node: &Json, columns: &BinaryColumns) -> Option<Json> {
 }
 
 fn raw_bytes(column: &ColumnRef) -> Json {
-    let mut node = json!({"type": "column", "name": raw_bytes_alias(&column.name)});
-    if let Some(relation) = &column.relation {
-        node["tableAlias"] = Json::String(relation.clone());
-    }
-    node
+    ColumnNode::to_json(&raw_bytes_alias(&column.name), column.relation.as_deref())
 }
 
 /// Only lowercase hex of whole bytes names a byte string: Exasol compares text case-sensitively,
