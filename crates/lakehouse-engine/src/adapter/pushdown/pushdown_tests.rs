@@ -4,6 +4,7 @@ use crate::scan::spec::{
     ColumnRef, CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage,
     StorageProps,
 };
+use crate::scan::test_support::WithFiles;
 
 // The vended sentinels below repeat the literal values `lakehouse-catalog`'s own
 // `test_support` uses, so both crates' assertions stay comparable.
@@ -36,17 +37,15 @@ fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
         ..Default::default()
     });
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into()],
-            storage: ScanStorage::Inline(vended_storage),
-            ..Default::default()
-        },
-        files: vec![FileEntry::new(
-            "s3://warehouse/db/events/part-00000.parquet",
-            1,
-        )],
-    };
+    let spec = CommonScanSpec {
+        projection: vec!["ID".into()],
+        storage: ScanStorage::Inline(vended_storage),
+        ..Default::default()
+    }
+    .with_files(vec![FileEntry::new(
+        "s3://warehouse/db/events/part-00000.parquet",
+        1,
+    )]);
 
     let json = spec.to_json();
 
@@ -80,24 +79,22 @@ fn catalog_auth_secrets_never_in_a_role_scan_spec() {
         ..unauthenticated_creds()
     };
     let session_storage = crate::adapter::connection::storage_block(&role_creds, true);
-    let role_spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into()],
-            storage: scan_storage_for(
-                &role_creds,
-                TEST_CONNECTION_NAME,
-                true,
-                &session_storage,
-                Some(&test_sealing_key()),
-            )
-            .expect("a role CONNECTION carries key material"),
-            ..Default::default()
-        },
-        files: vec![FileEntry::new(
-            "s3://warehouse/db/events/part-00000.parquet",
-            1,
-        )],
-    };
+    let role_spec = CommonScanSpec {
+        projection: vec!["ID".into()],
+        storage: scan_storage_for(
+            &role_creds,
+            TEST_CONNECTION_NAME,
+            true,
+            &session_storage,
+            Some(&test_sealing_key()),
+        )
+        .expect("a role CONNECTION carries key material"),
+        ..Default::default()
+    }
+    .with_files(vec![FileEntry::new(
+        "s3://warehouse/db/events/part-00000.parquet",
+        1,
+    )]);
     let role_json = role_spec.to_json();
     for field in CATALOG_AUTH_KEYS {
         assert!(!role_json.contains(field), "{field} in: {role_json}");
@@ -118,19 +115,17 @@ fn catalog_auth_secrets_never_in_a_role_scan_spec() {
 #[test]
 fn grouped_scan_spec_carries_group_keys() {
     let group_keys = vec!["\"REGION\"".to_string(), "YEAR(\"TS\")".to_string()];
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            aggregates: Some(vec![AggregatePlan {
-                kind: AggKind::Count,
-                column: None,
-                arg_expr: None,
-            }]),
-            group_keys: Some(group_keys.clone()),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![FileEntry::new("s3://w/f0.parquet", 1)],
-    };
+    let spec = CommonScanSpec {
+        aggregates: Some(vec![AggregatePlan {
+            kind: AggKind::Count,
+            column: None,
+            arg_expr: None,
+        }]),
+        group_keys: Some(group_keys.clone()),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![FileEntry::new("s3://w/f0.parquet", 1)]);
     let json = spec.to_json();
     let back = ScanSpec::from_json(&json).expect("must round-trip");
     let keys = back.common.group_keys.expect("group_keys must be present");
@@ -155,8 +150,8 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
 
     let filter_json = serde_json::json!({
         "type": "predicate_like",
-        "expression": {"type": "column", "name": "name"},
-        "pattern": {"type": "literal_string", "value": "A%"}
+        "expression": col("name"),
+        "pattern": str_lit("A%")
     });
 
     let df_filter = render_df_filter_safe(&filter_json);
@@ -181,9 +176,9 @@ fn where_filter_decimal_stringification_rewritten_to_trim() {
         "left": {
             "type": "function_scalar",
             "name": "LENGTH",
-            "arguments": [{"type": "column", "name": "c_decimal_a"}]
+            "arguments": [col("c_decimal_a")]
         },
-        "right": {"type": "literal_exactnumeric", "value": 5}
+        "right": num_lit(5)
     });
 
     let rendered = Some(&filter_json)
@@ -209,8 +204,8 @@ fn filter_decimal_comparison_not_rewritten() {
     let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
     let filter_json = serde_json::json!({
         "type": "predicate_greater",
-        "left": {"type": "column", "name": "c_decimal_a"},
-        "right": {"type": "literal_exactnumeric", "value": 5}
+        "left": col("c_decimal_a"),
+        "right": num_lit(5)
     });
 
     let rendered = Some(&filter_json)
@@ -231,15 +226,14 @@ fn filter_decimal_comparison_not_rewritten() {
 #[test]
 fn where_filter_string_fn_under_comparison_predicate_coerced() {
     let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
-    let filter_json = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {
+    let filter_json = predicate_equal(
+        serde_json::json!({
             "type": "function_scalar",
             "name": "UPPER",
-            "arguments": [{"type": "column", "name": "c_decimal_a"}]
-        },
-        "right": {"type": "literal_string", "value": "X"}
-    });
+            "arguments": [col("c_decimal_a")]
+        }),
+        str_lit("X"),
+    );
 
     let rendered = Some(&filter_json)
         .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
@@ -256,15 +250,14 @@ fn where_filter_string_fn_under_comparison_predicate_coerced() {
 #[test]
 fn where_filter_string_fn_over_double_declines() {
     let col_types = vec![("C_DOUBLE_A".to_string(), "DOUBLE PRECISION".to_string())];
-    let filter_json = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {
+    let filter_json = predicate_equal(
+        serde_json::json!({
             "type": "function_scalar",
             "name": "UPPER",
-            "arguments": [{"type": "column", "name": "c_double_a"}]
-        },
-        "right": {"type": "literal_string", "value": "X"}
-    });
+            "arguments": [col("c_double_a")]
+        }),
+        str_lit("X"),
+    );
 
     let rendered = Some(&filter_json)
         .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
@@ -285,9 +278,9 @@ fn where_filter_upper_decimal_inside_like_subject_coerced() {
         "expression": {
             "type": "function_scalar",
             "name": "UPPER",
-            "arguments": [{"type": "column", "name": "c_decimal_a"}]
+            "arguments": [col("c_decimal_a")]
         },
-        "pattern": {"type": "literal_string", "value": "1%"}
+        "pattern": str_lit("1%")
     });
 
     let rendered = Some(&filter_json)
@@ -306,25 +299,24 @@ fn where_filter_upper_decimal_inside_like_subject_coerced() {
 #[test]
 fn where_filter_like_decimal_inside_case_declines_whole_filter() {
     let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
-    let filter_json = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {
+    let filter_json = predicate_equal(
+        serde_json::json!({
             "type": "function_scalar_case",
             "name": "CASE",
             "arguments": [
                 {
                     "type": "predicate_like",
-                    "expression": {"type": "column", "name": "amount"},
-                    "pattern": {"type": "literal_string", "value": "9%"}
+                    "expression": col("amount"),
+                    "pattern": str_lit("9%")
                 }
             ],
             "results": [
-                {"type": "literal_exactnumeric", "value": 1},
-                {"type": "literal_exactnumeric", "value": 0}
+                num_lit(1),
+                num_lit(0)
             ]
-        },
-        "right": {"type": "literal_exactnumeric", "value": 1}
-    });
+        }),
+        num_lit(1),
+    );
 
     let rendered = Some(&filter_json)
         .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
@@ -345,19 +337,17 @@ fn scan_spec_carries_no_catalog_block() {
     const OAUTH_URI_SENTINEL: &str = "https://oauth-uri-sentinel.example/token";
     const SCOPE_SENTINEL: &str = "SCOPE_SENTINEL_VALUE";
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into(), "NAME".into()],
-            filter: Some("(\"ID\" > 10)".into()),
-            limit: Some(100),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![FileEntry::new(
-            "s3://warehouse/db/events/part-00000.parquet",
-            1,
-        )],
-    };
+    let spec = CommonScanSpec {
+        projection: vec!["ID".into(), "NAME".into()],
+        filter: Some("(\"ID\" > 10)".into()),
+        limit: Some(100),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![FileEntry::new(
+        "s3://warehouse/db/events/part-00000.parquet",
+        1,
+    )]);
 
     let json = spec.to_json();
 
@@ -469,14 +459,12 @@ fn pushdown_carries_logical_schema_in_common_arg() {
     assert_eq!(logical[3].arrow_type, "decimal128(18,4)");
     assert!(logical[3].nullable);
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            logical_schema: logical.clone(),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec = CommonScanSpec {
+        logical_schema: logical.clone(),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let json = spec.to_json();
     let back = ScanSpec::from_json(&json).unwrap();
     assert_eq!(
@@ -723,14 +711,12 @@ fn iceberg_declaration_default_less_spec_round_trips_unchanged() {
         "a default-less schema must encode no defaults"
     );
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            logical_schema: logical.clone(),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec = CommonScanSpec {
+        logical_schema: logical.clone(),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let json = spec.to_json();
     assert!(
         !json.contains("initial_default"),
@@ -835,8 +821,8 @@ fn guard_dispatch_result(
 fn declined_like_on_decimal() -> Json {
     serde_json::json!({
         "type": "predicate_like",
-        "expression": {"type": "column", "name": "AMOUNT", "tableName": "EVENTS"},
-        "pattern": {"type": "literal_string", "value": "1%"},
+        "expression": table_col("EVENTS", "AMOUNT"),
+        "pattern": str_lit("1%"),
     })
 }
 
@@ -890,8 +876,8 @@ fn dispatch_sql_for_body(pushdown_req_body: Json) -> String {
 #[test]
 fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
     let declined = declined_like_on_decimal();
-    let id_col = serde_json::json!({"type": "column", "name": "ID", "tableName": "EVENTS"});
-    let region_col = serde_json::json!({"type": "column", "name": "REGION", "tableName": "EVENTS"});
+    let id_col = table_col("EVENTS", "ID");
+    let region_col = table_col("EVENTS", "REGION");
     let shapes = [
         (
             "row scan",
@@ -952,7 +938,7 @@ fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
 /// Scenario: A trivially-true filter is still omitted with no wrapper
 #[test]
 fn trivially_true_filter_omitted_without_wrapper() {
-    let trivially_true = serde_json::json!({"type": "literal_bool", "value": true});
+    let trivially_true = bool_lit(true);
     let (filter, declined) = classify_where_filter(
         Some(&trivially_true),
         &ColumnTypes::unqualified(&guard_col_types()),
@@ -964,7 +950,7 @@ fn trivially_true_filter_omitted_without_wrapper() {
     );
 
     let sql = dispatch_sql_for_body(serde_json::json!({
-        "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
+        "selectList": [table_col("EVENTS", "ID")],
         "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
         "filter": trivially_true,
     }));
@@ -1001,7 +987,7 @@ fn declined_filter_with_absent_select_list_projects_full_row() {
 #[test]
 fn declined_filter_with_a_real_select_list_keeps_the_narrowing() {
     let sql = dispatch_sql_for_body(serde_json::json!({
-        "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
+        "selectList": [table_col("EVENTS", "ID")],
         "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
         "filter": declined_like_on_decimal(),
     }));
@@ -1033,7 +1019,7 @@ fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
             "name": "ROUND",
             "arguments": [
                 agg_item("SUM", Some("AMOUNT"), false),
-                {"type": "literal_exactnumeric", "value": 2},
+                num_lit(2),
             ],
         }],
         "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 2}],
@@ -1079,23 +1065,23 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
         "expressions": [
             {
                 "type": "predicate_greater",
-                "left": {"type": "column", "name": "id"},
-                "right": {"type": "literal_exactnumeric", "value": 5},
+                "left": col("id"),
+                "right": num_lit(5),
             },
             {
                 "type": "predicate_greater",
                 "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
-                    {"type": "column", "name": "ts"},
-                    {"type": "literal_exactnumeric", "value": 3},
+                    col("ts"),
+                    num_lit(3),
                 ]},
-                "right": {"type": "literal_exactnumeric", "value": 1},
+                "right": num_lit(1),
             },
             {
                 "type": "predicate_greater",
                 "left": {"type": "function_scalar", "name": "LENGTH", "arguments": [
-                    {"type": "column", "name": "amount"},
+                    col("amount"),
                 ]},
-                "right": {"type": "literal_exactnumeric", "value": 5},
+                "right": num_lit(5),
             },
         ],
     });
@@ -1139,11 +1125,11 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
 #[test]
 fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
     let request = guard_events_request(serde_json::json!({
-        "selectList": [{"type": "literal_exactnumeric", "value": 1}],
+        "selectList": [num_lit(1)],
         "selectListDataTypes": [{"type": "decimal", "precision": 1, "scale": 0}],
         "orderBy": [{
             "type": "order_by_element",
-            "expression": {"type": "column", "name": "NAME"},
+            "expression": col("NAME"),
             "isAscending": true,
             "nullsLast": true
         }],
@@ -1182,11 +1168,11 @@ fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
 #[test]
 fn declined_order_by_wrapper_selects_only_original_select_list() {
     let request = guard_events_request(serde_json::json!({
-        "selectList": [{"type": "column", "name": "NAME"}],
+        "selectList": [col("NAME")],
         "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
         "orderBy": [{
             "type": "order_by_element",
-            "expression": {"type": "column", "name": "ID"},
+            "expression": col("ID"),
             "isAscending": true,
             "nullsLast": true
         }]
@@ -1225,13 +1211,13 @@ fn declined_order_by_dedupes_repeated_and_projected_sort_keys() {
     let sort_key = |name: &str| {
         serde_json::json!({
             "type": "order_by_element",
-            "expression": {"type": "column", "name": name},
+            "expression": col(name),
             "isAscending": true,
             "nullsLast": true
         })
     };
     let request = guard_events_request(serde_json::json!({
-        "selectList": [{"type": "column", "name": "NAME"}],
+        "selectList": [col("NAME")],
         "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
         "orderBy": [
             sort_key("NAME"),
@@ -1271,11 +1257,11 @@ fn declined_order_by_dedupes_repeated_and_projected_sort_keys() {
 #[test]
 fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
     let request = guard_events_request(serde_json::json!({
-        "selectList": [{"type": "column", "name": "NAME"}],
+        "selectList": [col("NAME")],
         "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
         "orderBy": [{
             "type": "order_by_element",
-            "expression": {"type": "column", "name": "NAME"},
+            "expression": col("NAME"),
             "isAscending": true,
             "nullsLast": true
         }],
@@ -1329,11 +1315,11 @@ fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
 #[test]
 fn nonzero_offset_nulls_the_effective_limit() {
     let request = guard_events_request(serde_json::json!({
-        "selectList": [{"type": "column", "name": "NAME"}],
+        "selectList": [col("NAME")],
         "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
         "orderBy": [{
             "type": "order_by_element",
-            "expression": {"type": "column", "name": "NAME"},
+            "expression": col("NAME"),
             "isAscending": true,
             "nullsLast": true
         }],
@@ -1381,11 +1367,11 @@ fn nonzero_offset_nulls_the_effective_limit() {
 #[test]
 fn declined_order_by_extension_runs_after_topn_detection() {
     let request = guard_events_request(serde_json::json!({
-        "selectList": [{"type": "literal_exactnumeric", "value": 1}],
+        "selectList": [num_lit(1)],
         "selectListDataTypes": [{"type": "decimal", "precision": 1, "scale": 0}],
         "orderBy": [{
             "type": "order_by_element",
-            "expression": {"type": "column", "name": "NAME"},
+            "expression": col("NAME"),
             "isAscending": true,
             "nullsLast": true
         }],
@@ -1444,7 +1430,7 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
     });
     let column_missing_nulls_last = serde_json::json!({
         "type": "order_by_element",
-        "expression": {"type": "column", "name": "ID"},
+        "expression": col("ID"),
         "isAscending": true
     });
     let renderable_expression = serde_json::json!({
@@ -1452,7 +1438,7 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
         "expression": {
             "type": "function_scalar",
             "name": "ABS",
-            "arguments": [{"type": "column", "name": "AMOUNT", "tableName": "EVENTS"}]
+            "arguments": [table_col("EVENTS", "AMOUNT")]
         },
         "isAscending": false,
         "nullsLast": true
@@ -1474,7 +1460,7 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
 
     for (facet, order_by) in declining_shapes {
         let request = guard_events_request(serde_json::json!({
-            "selectList": [{"type": "column", "name": "NAME"}],
+            "selectList": [col("NAME")],
             "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
             "orderBy": order_by,
             "limit": {"numElements": 7}
@@ -1508,7 +1494,7 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
     }
 
     let unordered = guard_events_request(serde_json::json!({
-        "selectList": [{"type": "column", "name": "NAME"}],
+        "selectList": [col("NAME")],
         "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
         "limit": {"numElements": 7}
     }));
@@ -1541,7 +1527,7 @@ fn lone_count_distinct_with_order_by_still_renders_limit() {
         "selectListDataTypes": [{"type": "decimal", "precision": 18, "scale": 0}],
         "orderBy": [{
             "type": "order_by_element",
-            "expression": {"type": "column", "name": "ID", "tableName": "EVENTS"},
+            "expression": table_col("EVENTS", "ID"),
             "isAscending": true,
             "nullsLast": true
         }]
@@ -1583,10 +1569,10 @@ fn lone_count_distinct_with_order_by_still_renders_limit() {
 fn widening_arity_coincidence_request() -> Json {
     guard_events_request(serde_json::json!({
         "selectList": [
-            {"type": "column", "name": "REGION", "tableName": "EVENTS"},
-            {"type": "column", "name": "NAME", "tableName": "EVENTS"},
-            {"type": "column", "name": "AMOUNT", "tableName": "EVENTS"},
-            {"type": "column", "name": "ID", "tableName": "EVENTS"},
+            table_col("EVENTS", "REGION"),
+            table_col("EVENTS", "NAME"),
+            table_col("EVENTS", "AMOUNT"),
+            table_col("EVENTS", "ID"),
         ],
         "selectListDataTypes": [
             {"type": "varchar", "size": 2000000},
@@ -1596,7 +1582,7 @@ fn widening_arity_coincidence_request() -> Json {
         ],
         "orderBy": [{
             "type": "order_by_element",
-            "expression": {"type": "column", "name": "NAME", "tableName": "EVENTS"},
+            "expression": table_col("EVENTS", "NAME"),
             "isAscending": true,
             "nullsLast": true
         }]
@@ -1674,7 +1660,7 @@ fn timestamp_cast_select_request(precision: u64) -> Json {
             "type": "function_scalar_cast",
             "name": "CAST",
             "dataType": {"type": "TIMESTAMP", "fractionalSecondsPrecision": precision},
-            "arguments": [{"type": "column", "name": "NAME", "tableName": "EVENTS"}]
+            "arguments": [table_col("EVENTS", "NAME")]
         }],
         "selectListDataTypes": [
             {"type": "timestamp", "fractionalSecondsPrecision": precision}
@@ -1891,20 +1877,10 @@ async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
             ],
             "pushdownRequest": {
                 "type": "select",
-                "from": {
-                    "type": "join",
-                    "join_type": "inner",
-                    "left": {"name": "CUSTOMER", "type": "table"},
-                    "right": {"name": "ORDERS", "type": "table"},
-                    "condition": {
-                        "type": "predicate_equal",
-                        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-                        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
-                    },
-                },
+                "from": customer_orders_join(),
                 "selectList": [
-                    {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-                    {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+                    table_col("CUSTOMER", "C_CUSTKEY"),
+                    table_col("ORDERS", "O_CUSTKEY"),
                 ],
             },
             "schemaMetadataInfo": {"properties": {}},
@@ -2010,7 +1986,7 @@ async fn refused_column_table_storage() -> crate::scan::spec::StorageBackend {
 }
 
 fn column_item(name: &str) -> Json {
-    serde_json::json!({"type": "column", "name": name, "tableName": "ORDERS"})
+    table_col("ORDERS", name)
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it
@@ -2122,7 +2098,7 @@ async fn a_non_pruning_delta_request_keeps_its_pre_change_field_set_and_carries_
         }],
         "pushdownRequest": {
             "type": "select",
-            "selectList": [{"type": "column", "name": "INT_COL", "tableName": "ORDERS"}],
+            "selectList": [table_col("ORDERS", "INT_COL")],
         },
     });
     let request = with_delta_notes(request, "ORDERS", &[("int_col", "integer")], &[]);
@@ -2375,7 +2351,7 @@ fn char_cast_key(size: u64, character_set: &str) -> Json {
         "type": "function_scalar_cast",
         "name": "CAST",
         "dataType": {"type": "CHAR", "size": size, "characterSet": character_set},
-        "arguments": [{"type": "column", "name": "NAME"}]
+        "arguments": [col("NAME")]
     })
 }
 
@@ -2472,7 +2448,7 @@ fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
         "type": "function_scalar_cast",
         "name": "CAST",
         "dataType": {"type": "VARCHAR", "size": 10},
-        "arguments": [{"type": "column", "name": "NAME"}]
+        "arguments": [col("NAME")]
     }));
 
     let sql = guard_dispatch_sql(
@@ -2531,7 +2507,7 @@ fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
 #[test]
 fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     let request = char_grouped_request(
-        serde_json::json!({"type": "column", "name": "REGION"}),
+        col("REGION"),
         serde_json::json!({"type": "varchar", "size": 10}),
         None,
     );
@@ -2558,11 +2534,11 @@ fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
 #[test]
 fn order_by_on_a_char_declared_group_key_still_resolves_to_its_output_ordinal() {
     let request = char_grouped_request(
-        serde_json::json!({"type": "column", "name": "NAME"}),
+        col("NAME"),
         serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"}),
         Some(serde_json::json!([{
             "type": "order_by_element",
-            "expression": {"type": "column", "name": "NAME"},
+            "expression": col("NAME"),
             "isAscending": true,
             "nullsLast": true
         }])),
@@ -2639,14 +2615,10 @@ fn letter_partitioned_request(letter: &str) -> Json {
         "pushdownRequest": {
             "type": "select",
             "selectList": [
-                {"type": "column", "name": "LETTER", "tableName": "PRUNED_TO_EMPTY"},
-                {"type": "column", "name": "NUMBER", "tableName": "PRUNED_TO_EMPTY"},
+                table_col("PRUNED_TO_EMPTY", "LETTER"),
+                table_col("PRUNED_TO_EMPTY", "NUMBER"),
             ],
-            "filter": {
-                "type": "predicate_equal",
-                "left": {"type": "column", "name": "LETTER", "tableName": "PRUNED_TO_EMPTY"},
-                "right": {"type": "literal_string", "value": letter},
-            },
+            "filter": predicate_equal(table_col("PRUNED_TO_EMPTY", "LETTER"), str_lit(letter)),
         },
     }))
 }
@@ -2722,8 +2694,8 @@ fn letter_partitioned_select_request() -> Json {
         "pushdownRequest": {
             "type": "select",
             "selectList": [
-                {"type": "column", "name": "LETTER", "tableName": "PRUNED_TO_EMPTY"},
-                {"type": "column", "name": "NUMBER", "tableName": "PRUNED_TO_EMPTY"},
+                table_col("PRUNED_TO_EMPTY", "LETTER"),
+                table_col("PRUNED_TO_EMPTY", "NUMBER"),
             ],
         },
     }))
@@ -2879,8 +2851,8 @@ fn dispatch_result_for_body(
 fn row_scan_body() -> Json {
     serde_json::json!({
         "selectList": [
-            {"type": "column", "name": "REGION"},
-            {"type": "column", "name": "AMOUNT"},
+            col("REGION"),
+            col("AMOUNT"),
         ],
         "selectListDataTypes": [
             {"type": "varchar", "size": 2000000},

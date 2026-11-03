@@ -144,7 +144,8 @@ fn byte_comparison(node: &Json, columns: &BinaryColumns) -> Option<Json> {
 }
 
 fn raw_bytes(column: &ColumnRef) -> Json {
-    ColumnNode::to_json(&raw_bytes_alias(&column.name), column.relation.as_deref())
+    let name = raw_bytes_alias(&column.name);
+    ColumnNode::to_json(&name, None, column.relation.as_deref())
 }
 
 /// Only lowercase hex of whole bytes names a byte string: Exasol compares text case-sensitively,

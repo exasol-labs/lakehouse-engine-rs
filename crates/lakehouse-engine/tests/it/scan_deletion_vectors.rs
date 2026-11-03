@@ -3,6 +3,7 @@
 //! (verified against the real sidecar bytes via `delta_kernel`'s decoder).
 
 use crate::scan_fixture;
+use crate::scan_fixture::WithFiles;
 use crate::scan_fixture::concurrency_probe::ConcurrencyProbe;
 
 use std::collections::HashMap;
@@ -138,18 +139,16 @@ fn scan_spec(
     filter: Option<String>,
     limit: Option<u64>,
 ) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            table_root: table_root.to_string(),
-            projection: vec!["VALUE".into()],
-            filter,
-            limit,
-            storage: ScanStorage::Inline(dummy_storage()),
-            df_batch_size: 64,
-            ..Default::default()
-        },
-        files,
+    CommonScanSpec {
+        table_root: table_root.to_string(),
+        projection: vec!["VALUE".into()],
+        filter,
+        limit,
+        storage: ScanStorage::Inline(dummy_storage()),
+        df_batch_size: 64,
+        ..Default::default()
     }
+    .with_files(files)
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {

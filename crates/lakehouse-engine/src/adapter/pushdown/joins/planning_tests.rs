@@ -34,7 +34,7 @@ fn plain_single_table_request_is_not_a_join() {
 #[test]
 fn from_table_node_is_not_a_join() {
     let mut request = nq4_request();
-    request["pushdownRequest"]["from"] = serde_json::json!({"name": "LINEITEM", "type": "table"});
+    request["pushdownRequest"]["from"] = table_ref("LINEITEM");
     let shape = detect_join(&request, &pd(&request)).expect("not a join");
     assert_eq!(shape, JoinShape::NotAJoin);
 }
@@ -56,8 +56,8 @@ fn outer_join_is_ineligible() {
 fn non_equi_two_table_join_is_served_by_unified_fallback() {
     let condition = serde_json::json!({
         "type": "predicate_less",
-        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+        "left": table_col("CUSTOMER", "C_CUSTKEY"),
+        "right": table_col("ORDERS", "O_CUSTKEY"),
     });
     let request = join_request(Json::Null, condition.clone());
     match detect_join(&request, &pd(&request)).expect("served, not declined") {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::adapter::pushdown::test_support::col;
 
 fn has_disallowed_join_capability(cap_strs: &[&str]) -> bool {
     cap_strs.iter().any(|c| {
@@ -38,13 +39,13 @@ fn reports_group_by_capabilities() {
     let multi_key_group_by = serde_json::json!({
         "aggregationType": "group_by",
         "groupBy": [
-            {"type": "column", "name": "REGION"},
-            {"type": "column", "name": "YEAR"},
+            col("REGION"),
+            col("YEAR"),
         ],
         "selectList": [
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             {"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false},
-            {"type": "column", "name": "YEAR"},
+            col("YEAR"),
         ],
     });
     let detection = crate::adapter::pushdown::detect_group_by_aggregates(&multi_key_group_by)

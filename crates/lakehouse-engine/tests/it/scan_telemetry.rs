@@ -1,4 +1,5 @@
 use crate::scan_fixture;
+use crate::scan_fixture::WithFiles;
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -56,22 +57,20 @@ fn scan_spec(file_url: String) -> ScanSpec {
     let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
         .map(|m| m.len())
         .unwrap_or(0);
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into(), "NAME".into()],
-            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
-                endpoint: "http://localhost:9000".into(),
-                region: "us-east-1".into(),
-                access_key: "k".into(),
-                secret_key: "s".into(),
-                allow_http: true,
-                ..Default::default()
-            })),
-            df_batch_size: 64,
+    CommonScanSpec {
+        projection: vec!["ID".into(), "NAME".into()],
+        storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
+            endpoint: "http://localhost:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            allow_http: true,
             ..Default::default()
-        },
-        files: vec![FileEntry::new(file_url, size)],
+        })),
+        df_batch_size: 64,
+        ..Default::default()
     }
+    .with_files(vec![FileEntry::new(file_url, size)])
 }
 
 async fn run_scan(spec: &ScanSpec, level: tracing::Level) -> scan_fixture::BatchCapturingCtx {

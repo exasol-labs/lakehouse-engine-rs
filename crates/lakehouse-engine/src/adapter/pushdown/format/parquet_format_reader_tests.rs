@@ -2,8 +2,10 @@ use super::super::{RefusedColumn, ResolvedScan};
 use super::*;
 use crate::adapter::column_notes::TableNotes;
 use crate::adapter::parquet_directory::MergeMode;
-use crate::adapter::pushdown::test_support::filter_json::{column, compare, equal, number};
-use crate::adapter::pushdown::test_support::{resolve_from_notes, sample_storage, unread_refused};
+use crate::adapter::pushdown::test_support::filter_json::{column, equal};
+use crate::adapter::pushdown::test_support::{
+    compare, num_lit, resolve_from_notes, sample_storage, unread_refused,
+};
 use crate::adapter::tests::parquet_fixture::{
     directory_options, enumerated_notes, in_memory_store, nullable, parquet_bytes,
     parquet_footer_bytes,
@@ -287,7 +289,7 @@ async fn a_numeric_literal_prunes_no_direct_storage_file() {
     ])
     .await;
 
-    let numeric = compare("predicate_equal", column("YEAR"), number("2024"));
+    let numeric = compare("predicate_equal", column("YEAR"), num_lit("2024"));
     let unpruned = resolve(&store, MergeMode::FoldEveryFile, Some(&numeric)).await;
     let pruned = resolve(
         &store,

@@ -1,3 +1,4 @@
+use crate::adapter::pushdown::test_support::{predicate_equal, str_lit, table_col};
 use serde_json::json;
 
 use super::*;
@@ -31,7 +32,7 @@ fn involved_tables() -> Json {
 }
 
 fn column_node(name: &str) -> Json {
-    json!({"type": "column", "name": name, "tableName": "STATS_ALL_TYPES"})
+    table_col("STATS_ALL_TYPES", name)
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it
@@ -93,18 +94,17 @@ fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
                 "type": "predicate_and",
                 "expressions": [
                     {"type": "predicate_is_not_null", "expression": column_node("INT_COL")},
-                    {
-                        "type": "predicate_equal",
-                        "left": {
-                            "type": "function_scalar",
-                            "name": "UPPER",
-                            "arguments": [{
-                                "type": "function_scalar_case",
-                                "arguments": [column_node("SHAPE_COL")],
-                            }],
-                        },
-                        "right": {"type": "literal_string", "value": "x"},
-                    },
+                    predicate_equal(
+                        serde_json::json!({
+                                "type": "function_scalar",
+                                "name": "UPPER",
+                                "arguments": [{
+                                    "type": "function_scalar_case",
+                                    "arguments": [column_node("SHAPE_COL")],
+                                }],
+                            }),
+                        str_lit("x"),
+                    ),
                 ],
             },
         },
@@ -279,9 +279,7 @@ fn a_lower_cased_column_reference_matches_a_refused_column() {
         "involvedTables": involved_tables(),
         "pushdownRequest": {
             "type": "select",
-            "selectList": [json!({
-                "type": "column", "name": "shape_col", "tableName": "STATS_ALL_TYPES",
-            })],
+            "selectList": [table_col("STATS_ALL_TYPES", "shape_col")],
         },
     });
     let projection = [ProjectionItem::from("INT_COL")];

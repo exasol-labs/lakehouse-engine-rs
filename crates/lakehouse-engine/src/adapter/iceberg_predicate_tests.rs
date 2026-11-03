@@ -1,5 +1,6 @@
 use super::*;
 use crate::adapter::pushdown::test_support::nullable_field;
+use crate::adapter::pushdown::test_support::{col, lit, num_lit, predicate_equal, str_lit};
 use iceberg::spec::{NestedField, Schema, Type};
 use serde_json::json;
 use std::sync::Arc;
@@ -60,22 +61,9 @@ fn translate(filter: &Json) -> Option<Predicate> {
     translate_as_created(filter, &test_schema())
 }
 
-fn col(name: &str) -> Json {
-    json!({"type": "column", "name": name})
-}
-fn int_lit(v: i64) -> Json {
-    json!({"type": "literal_exactnumeric", "value": v})
-}
-fn str_lit(s: &str) -> Json {
-    json!({"type": "literal_string", "value": s})
-}
-fn date_lit(s: &str) -> Json {
-    json!({"type": "literal_date", "value": s})
-}
-
 #[test]
 fn leaf_equal_translates() {
-    let node = json!({"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)});
+    let node = predicate_equal(col("ID"), num_lit(5));
     let pred = translate(&node).expect("should translate equal");
     let s = format!("{pred}");
     assert!(
@@ -83,7 +71,7 @@ fn leaf_equal_translates() {
         "got: {s}"
     );
 
-    let node2 = json!({"type": "predicate_equal", "left": int_lit(5), "right": col("ID")});
+    let node2 = predicate_equal(num_lit(5), col("ID"));
     let pred2 = translate(&node2).expect("reversed operands should translate");
     let s2 = format!("{pred2}");
     assert!(
@@ -103,12 +91,12 @@ fn has_tz_offset_detects_explicit_zones() {
 
 #[test]
 fn leaf_less_than_translates() {
-    let node = json!({"type": "predicate_less", "left": col("AMOUNT"), "right": int_lit(100)});
+    let node = json!({"type": "predicate_less", "left": col("AMOUNT"), "right": num_lit(100)});
     let pred = translate(&node).unwrap();
     let s = format!("{pred}");
     assert!(s.contains("amount") && s.contains('<'), "got: {s}");
 
-    let node2 = json!({"type": "predicate_less", "left": int_lit(100), "right": col("AMOUNT")});
+    let node2 = json!({"type": "predicate_less", "left": num_lit(100), "right": col("AMOUNT")});
     let pred2 = translate(&node2).unwrap();
     let s2 = format!("{pred2}");
     assert!(s2.contains("amount") && s2.contains('>'), "got: {s2}");
@@ -116,7 +104,7 @@ fn leaf_less_than_translates() {
 
 #[test]
 fn leaf_lessequal_translates() {
-    let node = json!({"type": "predicate_lessequal", "left": col("AMOUNT"), "right": int_lit(50)});
+    let node = json!({"type": "predicate_lessequal", "left": col("AMOUNT"), "right": num_lit(50)});
     let pred = translate(&node).unwrap();
     let s = format!("{pred}");
     assert!(s.contains("amount") && s.contains("<="), "got: {s}");
@@ -149,7 +137,7 @@ fn leaf_in_translates() {
     let node = json!({
         "type": "predicate_in_constlist",
         "expression": col("ID"),
-        "arguments": [int_lit(1), int_lit(2), int_lit(3)]
+        "arguments": [num_lit(1), num_lit(2), num_lit(3)]
     });
     let pred = translate(&node).unwrap();
     let s = format!("{pred}");
@@ -179,8 +167,8 @@ fn between_desugars_to_range() {
     let node = json!({
         "type": "predicate_between",
         "expression": col("AMOUNT"),
-        "left": int_lit(10),
-        "right": int_lit(100)
+        "left": num_lit(10),
+        "right": num_lit(100)
     });
     let pred = translate(&node).unwrap();
     let s = format!("{pred}");
@@ -198,11 +186,7 @@ fn between_desugars_to_range() {
 
 #[test]
 fn leaf_date_translates() {
-    let node = json!({
-        "type": "predicate_equal",
-        "left": col("EVENT_DATE"),
-        "right": date_lit("2024-01-15")
-    });
+    let node = predicate_equal(col("EVENT_DATE"), lit("literal_date", "2024-01-15"));
     let pred = translate(&node).unwrap();
     let s = format!("{pred}");
     assert!(s.contains("event_date"), "got: {s}");
@@ -211,7 +195,7 @@ fn leaf_date_translates() {
 #[test]
 fn timestamp_literal_finer_than_microseconds_yields_no_datum() {
     for prim in [PrimitiveType::Timestamp, PrimitiveType::TimestampNs] {
-        let at = |value| json!({"type": "literal_timestamp", "value": value});
+        let at = |value| lit("literal_timestamp", value);
         assert_eq!(
             literal_to_datum(&at("2024-01-15 10:30:00.123456789"), &prim),
             None
@@ -222,15 +206,11 @@ fn timestamp_literal_finer_than_microseconds_yields_no_datum() {
 
 #[test]
 fn and_with_untranslatable_child_keeps_translatable_conjunct() {
-    let translatable = json!({
-        "type": "predicate_equal",
-        "left": col("ID"),
-        "right": int_lit(5)
-    });
+    let translatable = predicate_equal(col("ID"), num_lit(5));
     let untranslatable = json!({
         "type": "predicate_like",
         "expression": col("NAME"),
-        "pattern": {"type": "literal_string", "value": "A%"}
+        "pattern": str_lit("A%")
     });
     let node = json!({
         "type": "predicate_and",
@@ -262,11 +242,7 @@ fn and_all_untranslatable_returns_none() {
 
 #[test]
 fn or_with_untranslatable_child_returns_none() {
-    let translatable = json!({
-        "type": "predicate_equal",
-        "left": col("ID"),
-        "right": int_lit(5)
-    });
+    let translatable = predicate_equal(col("ID"), num_lit(5));
     let untranslatable = json!({
         "type": "predicate_like",
         "expression": col("NAME"),
@@ -288,8 +264,8 @@ fn or_all_translatable_returns_some() {
     let node = json!({
         "type": "predicate_or",
         "expressions": [
-            {"type": "predicate_equal", "left": col("ID"), "right": int_lit(1)},
-            {"type": "predicate_equal", "left": col("ID"), "right": int_lit(2)}
+            predicate_equal(col("ID"), num_lit(1)),
+            predicate_equal(col("ID"), num_lit(2))
         ]
     });
     let pred = translate(&node).expect("all-translatable OR must be Some");
@@ -313,7 +289,7 @@ fn not_of_untranslatable_returns_none() {
 fn not_of_translatable_negates() {
     let node = json!({
         "type": "predicate_not",
-        "expression": {"type": "predicate_less", "left": col("ID"), "right": int_lit(5)}
+        "expression": {"type": "predicate_less", "left": col("ID"), "right": num_lit(5)}
     });
     let pred = translate(&node).expect("NOT of translatable must be Some");
     let s = format!("{pred}");
@@ -322,21 +298,13 @@ fn not_of_translatable_negates() {
 
 #[test]
 fn unknown_column_returns_none() {
-    let node = json!({
-        "type": "predicate_equal",
-        "left": col("NONEXISTENT"),
-        "right": int_lit(1)
-    });
+    let node = predicate_equal(col("NONEXISTENT"), num_lit(1));
     assert!(translate(&node).is_none(), "unknown column must be None");
 }
 
 #[test]
 fn type_mismatch_returns_none() {
-    let node = json!({
-        "type": "predicate_equal",
-        "left": col("ID"),
-        "right": str_lit("not-a-number")
-    });
+    let node = predicate_equal(col("ID"), str_lit("not-a-number"));
     assert!(translate(&node).is_none(), "type mismatch must be None");
 }
 
@@ -345,7 +313,7 @@ fn notequal_returns_none() {
     let node = json!({
         "type": "predicate_notequal",
         "left": col("ID"),
-        "right": int_lit(5)
+        "right": num_lit(5)
     });
     assert!(
         translate(&node).is_none(),
@@ -358,7 +326,7 @@ fn in_with_type_mismatch_element_returns_none() {
     let node = json!({
         "type": "predicate_in_constlist",
         "expression": col("ID"),
-        "arguments": [int_lit(1), str_lit("bad")]
+        "arguments": [num_lit(1), str_lit("bad")]
     });
     assert!(
         translate(&node).is_none(),
@@ -373,7 +341,7 @@ fn between_with_one_failing_bound_keeps_other() {
         "type": "predicate_between",
         "expression": col("AMOUNT"),
         "left": str_lit("bad"),
-        "right": int_lit(100)
+        "right": num_lit(100)
     });
     let pred = translate(&node).expect("BETWEEN with one valid bound must return Some");
     let s = format!("{pred}");
@@ -381,7 +349,7 @@ fn between_with_one_failing_bound_keeps_other() {
 }
 
 fn amount_below(v: i64) -> Json {
-    json!({"type": "predicate_less", "left": col("AMOUNT"), "right": int_lit(v)})
+    json!({"type": "predicate_less", "left": col("AMOUNT"), "right": num_lit(v)})
 }
 
 fn name_like(pattern: &str) -> Json {
@@ -412,8 +380,8 @@ fn not_over_a_between_that_dropped_a_bound_returns_none() {
     let node = not(json!({
         "type": "predicate_between",
         "expression": col("AMOUNT"),
-        "left": int_lit(10),
-        "right": {"type": "literal_exactnumeric", "value": 20.5}
+        "left": num_lit(10),
+        "right": num_lit(20.5)
     }));
     assert_eq!(translate(&node), None);
 }
@@ -424,7 +392,7 @@ fn not_over_an_or_with_an_inexact_branch_returns_none() {
         "type": "predicate_or",
         "expressions": [
             and([amount_below(30), name_like("x%")]),
-            {"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)}
+            predicate_equal(col("ID"), num_lit(5))
         ]
     }));
     assert_eq!(translate(&node), None);
@@ -434,7 +402,7 @@ fn not_over_an_or_with_an_inexact_branch_returns_none() {
 fn not_over_a_fully_translated_and_negates_the_whole_conjunction() {
     let node = not(and([
         amount_below(30),
-        json!({"type": "predicate_equal", "left": col("NAME"), "right": str_lit("a")}),
+        predicate_equal(col("NAME"), str_lit("a")),
     ]));
     let expected = Reference::new("amount")
         .greater_than_or_equal_to(Datum::long(30))
@@ -447,8 +415,8 @@ fn not_over_a_fully_translated_between_negates_both_bounds() {
     let node = not(json!({
         "type": "predicate_between",
         "expression": col("AMOUNT"),
-        "left": int_lit(10),
-        "right": int_lit(20)
+        "left": num_lit(10),
+        "right": num_lit(20)
     }));
     let expected = Reference::new("amount")
         .less_than(Datum::long(10))
@@ -462,7 +430,7 @@ fn not_over_a_fully_translated_or_negates_every_branch() {
         "type": "predicate_or",
         "expressions": [
             amount_below(10),
-            {"type": "predicate_greater", "left": col("AMOUNT"), "right": int_lit(20)}
+            {"type": "predicate_greater", "left": col("AMOUNT"), "right": num_lit(20)}
         ]
     }));
     let expected = Reference::new("amount")
@@ -486,7 +454,7 @@ fn int_schema(fields: &[(i32, &str)]) -> Schema {
 }
 
 fn equal_to(column: &str, value: i64) -> Json {
-    json!({"type": "predicate_equal", "left": col(column), "right": int_lit(value)})
+    predicate_equal(col(column), num_lit(value))
 }
 
 #[test]
@@ -539,11 +507,7 @@ fn binary_schema() -> Schema {
 }
 
 fn equal_to_bytes(column: &str, hex: &str) -> Json {
-    json!({
-        "type": "predicate_equal",
-        "left": {"type": "column", "name": column},
-        "right": {"type": "literal_binary", "value": hex},
-    })
+    predicate_equal(col(column), lit("literal_binary", hex))
 }
 
 /// Scenario: A hex-literal filter on a binary column prunes files at plan time
@@ -572,14 +536,7 @@ fn a_binary_literal_prunes_a_binary_or_fixed_column_by_its_bytes() {
         "a literal of another width than the fixed column's constrains nothing"
     );
     assert_eq!(
-        translate_as_created(
-            &json!({
-                "type": "predicate_equal",
-                "left": {"type": "column", "name": "B"},
-                "right": {"type": "literal_string", "value": "00abff"},
-            }),
-            &schema
-        ),
+        translate_as_created(&predicate_equal(col("B"), str_lit("00abff")), &schema),
         None,
         "only the retyped literal names bytes"
     );

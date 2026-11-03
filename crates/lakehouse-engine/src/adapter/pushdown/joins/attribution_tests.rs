@@ -1,4 +1,7 @@
 use super::*;
+use crate::adapter::pushdown::test_support::{
+    aliased_col, col, num_lit, predicate_equal, table_col,
+};
 
 impl super::JoinLegs {
     fn resolve(&self, node: &Json) -> ColumnLeg {
@@ -14,24 +17,8 @@ fn leaf(table_name: &str, table_alias: Option<&str>) -> JoinLeaf {
     }
 }
 
-fn column(table_name: &str, table_alias: Option<&str>, name: &str) -> Json {
-    let mut node = serde_json::json!({
-        "type": "column",
-        "name": name,
-        "tableName": table_name,
-    });
-    if let Some(alias) = table_alias {
-        node["tableAlias"] = Json::String(alias.to_string());
-    }
-    node
-}
-
-fn literal(value: i64) -> Json {
-    serde_json::json!({ "type": "literal_exactnumeric", "value": value.to_string() })
-}
-
 fn equal(left: Json, right: Json) -> Json {
-    serde_json::json!({ "type": "predicate_equal", "left": left, "right": right })
+    predicate_equal(left, right)
 }
 
 /// `FROM FACT_ORDERS a JOIN FACT_ORDERS b` (#361's shape).
@@ -50,8 +37,8 @@ fn two_table_legs() -> JoinLegs {
 fn exact_table_name_and_alias_pair_selects_its_own_leg() {
     let legs = self_join_legs();
 
-    let first = legs.resolve(&column("FACT_ORDERS", Some("A"), "O_ORDERKEY"));
-    let second = legs.resolve(&column("FACT_ORDERS", Some("B"), "O_ORDERKEY"));
+    let first = legs.resolve(&aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"));
+    let second = legs.resolve(&aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"));
 
     assert_eq!(first, ColumnLeg::Leg(0));
     assert_eq!(second, ColumnLeg::Leg(1));
@@ -61,8 +48,8 @@ fn exact_table_name_and_alias_pair_selects_its_own_leg() {
 fn absent_alias_is_a_distinct_leg_key() {
     let legs = JoinLegs::from_leaves(&[leaf("FACT_ORDERS", None), leaf("FACT_ORDERS", Some("B"))]);
 
-    let unaliased = legs.resolve(&column("FACT_ORDERS", None, "O_ORDERKEY"));
-    let aliased = legs.resolve(&column("FACT_ORDERS", Some("B"), "O_ORDERKEY"));
+    let unaliased = legs.resolve(&table_col("FACT_ORDERS", "O_ORDERKEY"));
+    let aliased = legs.resolve(&aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"));
 
     assert_eq!(unaliased, ColumnLeg::Leg(0));
     assert_eq!(aliased, ColumnLeg::Leg(1));
@@ -72,8 +59,8 @@ fn absent_alias_is_a_distinct_leg_key() {
 fn single_leg_table_name_resolves_without_consulting_an_alias() {
     let legs = two_table_legs();
 
-    let no_alias = legs.resolve(&column("CUSTOMER", None, "C_CUSTKEY"));
-    let foreign_alias = legs.resolve(&column("ORDERS", Some("STALE"), "O_CUSTKEY"));
+    let no_alias = legs.resolve(&table_col("CUSTOMER", "C_CUSTKEY"));
+    let foreign_alias = legs.resolve(&aliased_col("ORDERS", "STALE", "O_CUSTKEY"));
 
     assert_eq!(no_alias, ColumnLeg::Leg(0));
     assert_eq!(foreign_alias, ColumnLeg::Leg(1));
@@ -86,8 +73,8 @@ fn alias_matching_is_verbatim_not_case_folded() {
         leaf("FACT_ORDERS", Some("B")),
     ]);
 
-    let verbatim = legs.resolve(&column("FACT_ORDERS", Some("myAlias"), "O_ORDERKEY"));
-    let folded = legs.resolve(&column("FACT_ORDERS", Some("MYALIAS"), "O_ORDERKEY"));
+    let verbatim = legs.resolve(&aliased_col("FACT_ORDERS", "myAlias", "O_ORDERKEY"));
+    let folded = legs.resolve(&aliased_col("FACT_ORDERS", "MYALIAS", "O_ORDERKEY"));
 
     assert_eq!(verbatim, ColumnLeg::Leg(0));
     assert_eq!(folded, ColumnLeg::Unattributable);
@@ -96,9 +83,9 @@ fn alias_matching_is_verbatim_not_case_folded() {
 #[test]
 fn column_of_a_table_no_leg_declares_is_left_unqualified() {
     let legs = self_join_legs();
-    let foreign = column("DIM_CUSTOMER", Some("C"), "C_CUSTKEY");
+    let foreign = aliased_col("DIM_CUSTOMER", "C", "C_CUSTKEY");
 
-    let untagged = legs.resolve(&serde_json::json!({ "type": "column", "name": "X" }));
+    let untagged = legs.resolve(&col("X"));
 
     assert_eq!(legs.resolve(&foreign), ColumnLeg::NoLeg);
     assert_eq!(untagged, ColumnLeg::NoLeg);
@@ -112,8 +99,8 @@ fn column_of_a_table_no_leg_declares_is_left_unqualified() {
 fn unattributable_column_is_reported_rather_than_resolved() {
     let legs = self_join_legs();
 
-    let no_alias = legs.resolve(&column("FACT_ORDERS", None, "O_ORDERKEY"));
-    let unknown_alias = legs.resolve(&column("FACT_ORDERS", Some("Z"), "O_ORDERKEY"));
+    let no_alias = legs.resolve(&table_col("FACT_ORDERS", "O_ORDERKEY"));
+    let unknown_alias = legs.resolve(&aliased_col("FACT_ORDERS", "Z", "O_ORDERKEY"));
 
     assert_eq!(no_alias, ColumnLeg::Unattributable);
     assert_eq!(unknown_alias, ColumnLeg::Unattributable);
@@ -123,8 +110,8 @@ fn unattributable_column_is_reported_rather_than_resolved() {
 fn qualify_tags_each_self_join_occurrence_with_its_own_leg_alias() {
     let legs = self_join_legs();
     let condition = equal(
-        column("FACT_ORDERS", Some("A"), "O_ORDERKEY"),
-        column("FACT_ORDERS", Some("B"), "O_ORDERKEY"),
+        aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"),
+        aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"),
     );
 
     let qualified = legs.qualify(&condition).expect("both occurrences resolve");
@@ -142,7 +129,7 @@ fn qualify_tags_each_self_join_occurrence_with_its_own_leg_alias() {
 #[test]
 fn qualify_overwrites_the_request_alias_and_leaves_the_input_untouched() {
     let legs = two_table_legs();
-    let expr = column("ORDERS", Some("O"), "O_CUSTKEY");
+    let expr = aliased_col("ORDERS", "O", "O_CUSTKEY");
 
     let qualified = legs.qualify(&expr).expect("resolves to its one leg");
 
@@ -156,7 +143,7 @@ fn qualify_reaches_columns_nested_in_arrays_and_function_nodes() {
     let expr = serde_json::json!({
         "type": "function_scalar",
         "name": "UPPER",
-        "arguments": [column("FACT_ORDERS", Some("B"), "O_COMMENT")],
+        "arguments": [aliased_col("FACT_ORDERS", "B", "O_COMMENT")],
     });
 
     let qualified = legs.qualify(&expr).expect("the nested occurrence resolves");
@@ -172,7 +159,7 @@ fn qualify_fails_on_an_unattributable_column_naming_it() {
     let legs = self_join_legs();
     let expr = serde_json::json!({
         "type": "predicate_not",
-        "expression": column("FACT_ORDERS", None, "O_ORDERKEY"),
+        "expression": table_col("FACT_ORDERS", "O_ORDERKEY"),
     });
 
     let err = legs.qualify(&expr).expect_err("no leg key matches");
@@ -186,8 +173,8 @@ fn qualify_fails_on_an_unattributable_column_naming_it() {
 fn legs_referenced_reports_every_leg_a_tree_touches() {
     let legs = self_join_legs();
     let condition = equal(
-        column("FACT_ORDERS", Some("A"), "O_ORDERKEY"),
-        column("FACT_ORDERS", Some("B"), "O_ORDERKEY"),
+        aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"),
+        aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"),
     );
 
     let referenced = legs.legs_referenced(&condition);
@@ -200,7 +187,7 @@ fn legs_referenced_reports_every_leg_a_tree_touches() {
 #[test]
 fn legs_referenced_flags_an_unattributed_column() {
     let legs = self_join_legs();
-    let conjunct = equal(column("FACT_ORDERS", None, "O_ORDERKEY"), literal(7));
+    let conjunct = equal(table_col("FACT_ORDERS", "O_ORDERKEY"), num_lit("7"));
 
     let referenced = legs.legs_referenced(&conjunct);
 
@@ -213,7 +200,7 @@ fn legs_referenced_flags_an_unattributed_column() {
 fn legs_referenced_flags_a_column_free_expression() {
     let legs = self_join_legs();
 
-    let referenced = legs.legs_referenced(&equal(literal(1), literal(1)));
+    let referenced = legs.legs_referenced(&equal(num_lit("1"), num_lit("1")));
 
     assert!(!referenced.any_column);
     assert!(!referenced.has_unattributed);
@@ -228,8 +215,8 @@ fn attachment_leg_is_the_highest_leg_a_cross_leg_condition_references() {
         leaf("FACT_ORDERS", Some("C")),
     ]);
     let condition = equal(
-        column("FACT_ORDERS", Some("A"), "O_ORDERKEY"),
-        column("FACT_ORDERS", Some("C"), "O_ORDERKEY"),
+        aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"),
+        aliased_col("FACT_ORDERS", "C", "O_ORDERKEY"),
     );
 
     assert_eq!(legs.attachment_leg(&condition), Some(2));
@@ -238,7 +225,7 @@ fn attachment_leg_is_the_highest_leg_a_cross_leg_condition_references() {
 #[test]
 fn attachment_leg_is_the_only_leg_a_single_leg_condition_references() {
     let legs = self_join_legs();
-    let condition = equal(column("FACT_ORDERS", Some("B"), "O_ORDERKEY"), literal(7));
+    let condition = equal(aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"), num_lit("7"));
 
     assert_eq!(legs.attachment_leg(&condition), Some(1));
 }
@@ -247,15 +234,18 @@ fn attachment_leg_is_the_only_leg_a_single_leg_condition_references() {
 fn attachment_leg_is_none_for_a_column_free_condition() {
     let legs = self_join_legs();
 
-    assert_eq!(legs.attachment_leg(&equal(literal(1), literal(1))), None);
+    assert_eq!(
+        legs.attachment_leg(&equal(num_lit("1"), num_lit("1"))),
+        None
+    );
 }
 
 #[test]
 fn attachment_leg_is_none_when_any_column_is_unattributed() {
     let legs = self_join_legs();
     let condition = equal(
-        column("FACT_ORDERS", Some("B"), "O_ORDERKEY"),
-        column("FACT_ORDERS", Some("Z"), "O_ORDERKEY"),
+        aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"),
+        aliased_col("FACT_ORDERS", "Z", "O_ORDERKEY"),
     );
 
     assert_eq!(legs.attachment_leg(&condition), None);
@@ -264,7 +254,7 @@ fn attachment_leg_is_none_when_any_column_is_unattributed() {
 #[test]
 fn conjunct_leg_is_the_single_leg_every_column_resolves_to() {
     let legs = self_join_legs();
-    let conjunct = equal(column("FACT_ORDERS", Some("B"), "O_ORDERKEY"), literal(7));
+    let conjunct = equal(aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"), num_lit("7"));
 
     assert_eq!(legs.conjunct_leg(&conjunct), Some(1));
 }
@@ -273,16 +263,16 @@ fn conjunct_leg_is_the_single_leg_every_column_resolves_to() {
 fn conjunct_leg_is_none_for_a_cross_leg_unattributed_or_column_free_conjunct() {
     let legs = self_join_legs();
     let cross_leg = equal(
-        column("FACT_ORDERS", Some("A"), "O_ORDERKEY"),
-        column("FACT_ORDERS", Some("B"), "O_ORDERKEY"),
+        aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"),
+        aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"),
     );
-    let unattributed = equal(column("FACT_ORDERS", None, "O_ORDERKEY"), literal(7));
-    let foreign = equal(column("DIM_CUSTOMER", Some("C"), "C_CUSTKEY"), literal(7));
+    let unattributed = equal(table_col("FACT_ORDERS", "O_ORDERKEY"), num_lit("7"));
+    let foreign = equal(aliased_col("DIM_CUSTOMER", "C", "C_CUSTKEY"), num_lit("7"));
 
     assert_eq!(legs.conjunct_leg(&cross_leg), None);
     assert_eq!(legs.conjunct_leg(&unattributed), None);
     assert_eq!(legs.conjunct_leg(&foreign), None);
-    assert_eq!(legs.conjunct_leg(&equal(literal(1), literal(1))), None);
+    assert_eq!(legs.conjunct_leg(&equal(num_lit("1"), num_lit("1"))), None);
 }
 
 #[test]
@@ -292,11 +282,11 @@ fn single_scan_binding_maps_every_involved_table_onto_leg_zero() {
     });
     let legs = JoinLegs::for_single_scan(&request);
 
-    let first = legs.resolve(&column("FACT_ORDERS", Some("A"), "O_ORDERKEY"));
-    let second = legs.resolve(&column("DIM_CUSTOMER", None, "C_CUSTKEY"));
-    let outsider = legs.resolve(&column("SOMETHING_ELSE", None, "X"));
+    let first = legs.resolve(&aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"));
+    let second = legs.resolve(&table_col("DIM_CUSTOMER", "C_CUSTKEY"));
+    let outsider = legs.resolve(&table_col("SOMETHING_ELSE", "X"));
     let qualified = legs
-        .qualify(&column("FACT_ORDERS", Some("A"), "O_ORDERKEY"))
+        .qualify(&aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"))
         .expect("the single scan can never be unattributable");
 
     assert_eq!(legs.leg_count(), 1);
@@ -313,7 +303,7 @@ fn repeated_involved_table_still_collapses_onto_leg_zero() {
     });
     let legs = JoinLegs::for_single_scan(&request);
 
-    let resolved = legs.resolve(&column("FACT_ORDERS", Some("A"), "O_ORDERKEY"));
+    let resolved = legs.resolve(&aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"));
 
     assert_eq!(resolved, ColumnLeg::Leg(0));
 }
@@ -321,7 +311,7 @@ fn repeated_involved_table_still_collapses_onto_leg_zero() {
 #[test]
 fn single_scan_binding_without_involved_tables_qualifies_nothing() {
     let legs = JoinLegs::for_single_scan(&serde_json::json!({}));
-    let expr = column("FACT_ORDERS", Some("A"), "O_ORDERKEY");
+    let expr = aliased_col("FACT_ORDERS", "A", "O_ORDERKEY");
 
     assert_eq!(legs.resolve(&expr), ColumnLeg::NoLeg);
     assert_eq!(legs.qualify(&expr).expect("no leg is not a failure"), expr);

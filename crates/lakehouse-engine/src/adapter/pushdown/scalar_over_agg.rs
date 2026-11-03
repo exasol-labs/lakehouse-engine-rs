@@ -48,7 +48,7 @@ pub(super) fn agg_sentinel_token(i: usize) -> String {
 }
 
 pub(super) fn sentinel_column_node(i: usize) -> Json {
-    ColumnNode::to_json(&agg_sentinel_name(i), None)
+    ColumnNode::to_json(&agg_sentinel_name(i), None, None)
 }
 
 /// Recursion stops at a `function_aggregate`, so a column inside an aggregate is
@@ -66,8 +66,8 @@ pub(super) fn sentinelize_aggregates(
                 aggregates.push(node.clone());
                 sentinel_column_node(i)
             }
-            kind => {
-                if kind == Some("column") {
+            _ => {
+                if ColumnNode::parse(node).is_some() {
                     *residual_column = true;
                 }
                 let mut out = serde_json::Map::with_capacity(map.len());

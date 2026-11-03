@@ -1,4 +1,5 @@
 use super::*;
+use crate::scan::test_support::WithFiles;
 use crate::scan::test_support::join_spec;
 
 #[test]
@@ -38,27 +39,25 @@ fn reconstruct_relative_entry_normalizes_single_separator() {
 }
 
 fn sample_spec() -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            table_root: "s3://warehouse/db/table".into(),
-            projection: vec!["id".into(), "name".into()],
-            filter: Some("(\"ID\" > 10)".into()),
-            limit: Some(100),
-            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
-                endpoint: "http://minio:9000".into(),
-                region: "us-east-1".into(),
-                access_key: "minioadmin".into(),
-                secret_key: "minioadmin".into(),
-                allow_http: true,
-                ..Default::default()
-            })),
+    CommonScanSpec {
+        table_root: "s3://warehouse/db/table".into(),
+        projection: vec!["id".into(), "name".into()],
+        filter: Some("(\"ID\" > 10)".into()),
+        limit: Some(100),
+        storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
+            endpoint: "http://minio:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "minioadmin".into(),
+            secret_key: "minioadmin".into(),
+            allow_http: true,
             ..Default::default()
-        },
-        files: vec![
-            FileEntry::new("data/part-00000.parquet", 1024),
-            FileEntry::new("data/part-00001.parquet", 2048),
-        ],
+        })),
+        ..Default::default()
     }
+    .with_files(vec![
+        FileEntry::new("data/part-00000.parquet", 1024),
+        FileEntry::new("data/part-00001.parquet", 2048),
+    ])
 }
 
 fn s3_props(storage: &ScanStorage) -> &StorageProps {

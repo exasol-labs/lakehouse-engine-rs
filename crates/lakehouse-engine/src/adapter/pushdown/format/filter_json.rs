@@ -58,7 +58,7 @@ impl Comparison {
     }
 }
 
-pub(in crate::adapter::pushdown) fn column_name(node: &Json) -> Option<&str> {
+fn column_name(node: &Json) -> Option<&str> {
     ColumnNode::parse(node).map(|column| column.name)
 }
 

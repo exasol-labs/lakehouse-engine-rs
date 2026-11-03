@@ -1,4 +1,5 @@
 use crate::scan_fixture;
+use crate::scan_fixture::WithFiles;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -172,52 +173,48 @@ fn dummy_storage() -> StorageBackend {
 }
 
 fn raw_spec(files: Vec<(String, u64)>, table_root: String) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            table_root,
-            projection: vec!["ID".into(), "NAME".into()],
-            storage: ScanStorage::Inline(dummy_storage()),
-            df_batch_size: 64,
-            ..Default::default()
-        },
-        files: files.into_iter().map(FileEntry::from).collect(),
+    CommonScanSpec {
+        table_root,
+        projection: vec!["ID".into(), "NAME".into()],
+        storage: ScanStorage::Inline(dummy_storage()),
+        df_batch_size: 64,
+        ..Default::default()
     }
+    .with_files(files.into_iter().map(FileEntry::from).collect())
 }
 
 /// Request-count assertions must use this, not [`raw_spec`]: an empty `logical_schema`
 /// triggers schema inference, which pre-caches the first file's footer and hides
 /// Phase B's real round-trips.
 fn raw_spec_with_logical_schema(files: Vec<(String, u64)>, table_root: String) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            table_root,
-            projection: vec!["ID".into(), "NAME".into()],
-            storage: ScanStorage::Inline(dummy_storage()),
-            df_batch_size: 64,
-            logical_schema: vec![
-                LogicalField {
-                    field_id: Some(1),
-                    name: "id".to_string(),
-                    arrow_type: "int64".to_string(),
-                    nullable: false,
-                    initial_default: None,
-                    nested: None,
-                    physical_name: None,
-                },
-                LogicalField {
-                    field_id: Some(2),
-                    name: "name".to_string(),
-                    arrow_type: "utf8".to_string(),
-                    nullable: false,
-                    initial_default: None,
-                    nested: None,
-                    physical_name: None,
-                },
-            ],
-            ..Default::default()
-        },
-        files: files.into_iter().map(FileEntry::from).collect(),
+    CommonScanSpec {
+        table_root,
+        projection: vec!["ID".into(), "NAME".into()],
+        storage: ScanStorage::Inline(dummy_storage()),
+        df_batch_size: 64,
+        logical_schema: vec![
+            LogicalField {
+                field_id: Some(1),
+                name: "id".to_string(),
+                arrow_type: "int64".to_string(),
+                nullable: false,
+                initial_default: None,
+                nested: None,
+                physical_name: None,
+            },
+            LogicalField {
+                field_id: Some(2),
+                name: "name".to_string(),
+                arrow_type: "utf8".to_string(),
+                nullable: false,
+                initial_default: None,
+                nested: None,
+                physical_name: None,
+            },
+        ],
+        ..Default::default()
     }
+    .with_files(files.into_iter().map(FileEntry::from).collect())
 }
 
 fn wide_logical_fields(columns: usize) -> Vec<LogicalField> {
@@ -245,17 +242,15 @@ fn raw_spec_with_wide_logical_schema(
     table_root: String,
     columns: usize,
 ) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            table_root,
-            projection: vec!["ID".into(), "NAME".into()],
-            storage: ScanStorage::Inline(dummy_storage()),
-            df_batch_size: 64,
-            logical_schema: wide_logical_fields(columns),
-            ..Default::default()
-        },
-        files: files.into_iter().map(FileEntry::from).collect(),
+    CommonScanSpec {
+        table_root,
+        projection: vec!["ID".into(), "NAME".into()],
+        storage: ScanStorage::Inline(dummy_storage()),
+        df_batch_size: 64,
+        logical_schema: wide_logical_fields(columns),
+        ..Default::default()
     }
+    .with_files(files.into_iter().map(FileEntry::from).collect())
 }
 
 fn write_local_parquet(dir: &std::path::Path, relative: &str, rows: i64) -> String {

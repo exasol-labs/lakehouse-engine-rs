@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::*;
 use serde_json::json;
 
 #[test]
@@ -12,25 +13,20 @@ fn walk_column_nodes_visits_every_nested_column_node_once() {
         "type": "function_scalar",
         "name": "PLUS",
         "arguments": [
-            {"type": "column", "name": "A", "tableName": "T"},
-            {"type": "literal_exactnumeric", "value": 1}
+            table_col("T", "A"),
+            num_lit(1)
         ],
         "case": {
             "type": "case",
             "results": [
-                {"type": "column", "name": "B"},
-                {"type": "literal_exactnumeric", "value": 2}
+                col("B"),
+                num_lit(2)
             ]
         },
-        "predicate": {
-            "type": "predicate_equal",
-            "left": {"type": "column", "name": "C"},
-            "right": {
-                "type": "column",
-                "name": "D",
-                "nested": {"type": "column", "name": "E"}
-            }
-        }
+        "predicate": predicate_equal(
+            col("C"),
+            json!({"type": "column", "name": "D", "nested": col("E")}),
+        )
     });
 
     let mut visited = Vec::new();
@@ -66,8 +62,8 @@ fn strip_table_alias_removes_alias_preserves_table_name_and_name_recursively() {
         "name": "PLUS",
         "tableAlias": "O",
         "arguments": [
-            {"type": "column", "name": "O_ORDERDATE", "tableName": "FACT_ORDERS", "tableAlias": "O"},
-            {"type": "literal_exactnumeric", "value": 1}
+            aliased_col("FACT_ORDERS", "O", "O_ORDERDATE"),
+            num_lit(1)
         ]
     });
 
@@ -79,8 +75,8 @@ fn strip_table_alias_removes_alias_preserves_table_name_and_name_recursively() {
             "type": "function_scalar",
             "name": "PLUS",
             "arguments": [
-                {"type": "column", "name": "O_ORDERDATE", "tableName": "FACT_ORDERS"},
-                {"type": "literal_exactnumeric", "value": 1}
+                table_col("FACT_ORDERS", "O_ORDERDATE"),
+                num_lit(1)
             ]
         }),
         "every tableAlias key must be gone at every depth, while name/tableName survive"

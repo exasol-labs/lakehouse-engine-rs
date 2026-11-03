@@ -3,12 +3,14 @@ use crate::adapter::column_notes::{DeclaredSchema, TableNotes};
 use crate::adapter::table_identity::encode_identifier_note;
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
+use crate::scan::test_support::WithFiles;
 use lakehouse_catalog::{
     CatalogColumn, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, TableFormat,
 };
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use vs_expression::ColumnNode;
 
 type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
@@ -238,6 +240,71 @@ pub(crate) fn glue_column(name: &str, hive_type: &str) -> CatalogColumn {
         ColumnSourceType::Glue {
             hive_type: hive_type.to_string(),
         },
+    )
+}
+
+pub(crate) fn col(name: &str) -> Json {
+    ColumnNode::to_json(name, None, None)
+}
+
+pub(crate) fn table_col(table: &str, name: &str) -> Json {
+    table_column(table, None, name)
+}
+
+pub(crate) fn aliased_col(table: &str, alias: &str, name: &str) -> Json {
+    table_column(table, Some(alias), name)
+}
+
+pub(crate) fn table_column(table: &str, alias: Option<&str>, name: &str) -> Json {
+    ColumnNode::to_json(name, Some(table), alias)
+}
+
+pub(crate) fn table_ref(name: &str) -> Json {
+    serde_json::json!({"name": name, "type": "table"})
+}
+
+pub(crate) fn inner_join(left: Json, right: Json, condition: Json) -> Json {
+    serde_json::json!({
+        "type": "join", "join_type": "inner", "left": left, "right": right, "condition": condition
+    })
+}
+
+pub(crate) fn compare(kind: &str, left: Json, right: Json) -> Json {
+    serde_json::json!({"type": kind, "left": left, "right": right})
+}
+
+pub(crate) fn predicate_equal(left: Json, right: Json) -> Json {
+    compare("predicate_equal", left, right)
+}
+
+pub(crate) fn lit(kind: &str, value: impl Into<Json>) -> Json {
+    serde_json::json!({"type": kind, "value": value.into()})
+}
+
+pub(crate) fn num_lit(value: impl Into<Json>) -> Json {
+    lit("literal_exactnumeric", value)
+}
+
+pub(crate) fn str_lit(value: &str) -> Json {
+    lit("literal_string", value)
+}
+
+pub(crate) fn bool_lit(value: bool) -> Json {
+    lit("literal_bool", value)
+}
+
+pub(crate) fn null_lit() -> Json {
+    serde_json::json!({"type": "literal_null"})
+}
+
+pub(crate) fn customer_orders_join() -> Json {
+    inner_join(
+        table_ref("CUSTOMER"),
+        table_ref("ORDERS"),
+        predicate_equal(
+            table_col("CUSTOMER", "C_CUSTKEY"),
+            table_col("ORDERS", "O_CUSTKEY"),
+        ),
     )
 }
 
@@ -1010,16 +1077,14 @@ pub(crate) fn build_sql_for_fixture_n(
         .cloned()
         .map(ProjectionItem::from)
         .collect();
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            projection: proj_items.clone(),
-            filter,
-            limit,
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        projection: proj_items.clone(),
+        filter,
+        limit,
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let files_with_sizes: Vec<FileEntry> =
         files.into_iter().map(|p| FileEntry::new(p, 1)).collect();
     let shards =
@@ -1088,8 +1153,8 @@ pub(crate) fn nq4_request() -> Json {
         "pushdownRequest": {
             "type": "select",
             "selectList": [
-                {"type": "column", "name": "L_ORDERKEY", "tableName": "LINEITEM"},
-                {"type": "column", "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
+                table_col("LINEITEM", "L_ORDERKEY"),
+                table_col("LINEITEM", "L_EXTENDEDPRICE"),
             ],
             "selectListDataTypes": [
                 {"type": "decimal", "precision": 20, "scale": 0},
@@ -1129,15 +1194,13 @@ pub(crate) fn build_row_sql_with_root(
         .cloned()
         .map(ProjectionItem::from)
         .collect();
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            table_root: table_root.to_string(),
-            projection: proj_items.clone(),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        table_root: table_root.to_string(),
+        projection: proj_items.clone(),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let files: Vec<FileEntry> = files.into_iter().map(FileEntry::from).collect();
     let g = shard_count(cluster_nodes, 1, files.len());
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
@@ -1155,10 +1218,10 @@ pub(crate) fn build_row_sql_with_root(
     )
 }
 
-pub(crate) fn agg_item(name: &str, col: Option<&str>, distinct: bool) -> serde_json::Value {
+pub(crate) fn agg_item(name: &str, column: Option<&str>, distinct: bool) -> serde_json::Value {
     let mut args = serde_json::json!([]);
-    if let Some(c) = col {
-        args = serde_json::json!([{"type": "column", "name": c}]);
+    if let Some(c) = column {
+        args = serde_json::json!([col(c)]);
     }
     serde_json::json!({
         "type": "function_aggregate",
@@ -1189,26 +1252,15 @@ pub(crate) fn agg_item_expr(
 }
 
 pub(crate) mod filter_json {
+    use super::{predicate_equal, str_lit, table_col};
     use serde_json::{Value as Json, json};
 
     pub(crate) fn column(name: &str) -> Json {
-        json!({"type": "column", "name": name, "tableName": "SALES"})
-    }
-
-    pub(crate) fn string(value: &str) -> Json {
-        json!({"type": "literal_string", "value": value})
-    }
-
-    pub(crate) fn number(value: &str) -> Json {
-        json!({"type": "literal_exactnumeric", "value": value})
-    }
-
-    pub(crate) fn compare(kind: &str, left: Json, right: Json) -> Json {
-        json!({"type": kind, "left": left, "right": right})
+        table_col("SALES", name)
     }
 
     pub(crate) fn equal(name: &str, value: &str) -> Json {
-        compare("predicate_equal", column(name), string(value))
+        predicate_equal(column(name), str_lit(value))
     }
 
     pub(crate) fn not(expression: Json) -> Json {

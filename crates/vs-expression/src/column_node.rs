@@ -1,5 +1,6 @@
 use serde_json::{Map, Value as Json};
 
+const TABLE_NAME: &str = "tableName";
 const TABLE_ALIAS: &str = "tableAlias";
 
 /// A pushdown request's `column` node: the sole reader and writer of its keys.
@@ -24,7 +25,7 @@ impl<'a> ColumnNode<'a> {
         let text = |key: &str| map.get(key).and_then(Json::as_str);
         Some(Self {
             name: text("name")?,
-            table_name: text("tableName"),
+            table_name: text(TABLE_NAME),
             table_alias: text(TABLE_ALIAS),
         })
     }
@@ -40,8 +41,11 @@ impl<'a> ColumnNode<'a> {
         self.name.to_ascii_uppercase()
     }
 
-    pub fn to_json(name: &str, table_alias: Option<&str>) -> Json {
+    pub fn to_json(name: &str, table_name: Option<&str>, table_alias: Option<&str>) -> Json {
         let mut node = serde_json::json!({"type": "column", "name": name});
+        if let Some(table) = table_name {
+            node[TABLE_NAME] = Json::String(table.to_string());
+        }
         if let Some(alias) = table_alias {
             node[TABLE_ALIAS] = Json::String(alias.to_string());
         }

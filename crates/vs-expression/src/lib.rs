@@ -1282,3 +1282,7 @@ pub fn render_df_filter_exasol_safe(filter_expr: &Json) -> Option<String> {
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "test_support_tests.rs"]
+mod test_support;
