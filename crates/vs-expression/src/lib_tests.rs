@@ -26,7 +26,7 @@ fn null_lit() -> Json {
 }
 
 fn predicate_equal(left: Json, right: Json) -> Json {
-    predicate_equal(left, right)
+    json!({"type": "predicate_equal", "left": left, "right": right})
 }
 
 #[test]
