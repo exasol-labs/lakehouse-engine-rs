@@ -1,3 +1,6 @@
+//! Catalog test inputs: CONNECTION credentials and payloads, fake catalog and STS servers for
+//! fault injection, and readers for the HTTP requests those servers receive.
+
 use crate::catalog_http::RetryPolicy;
 use crate::{ConnectionCreds, StorageBackend, StorageProps};
 use std::error::Error;

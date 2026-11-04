@@ -9,10 +9,10 @@ use common::e2e_harness::{
     assert_binary_values_refused, assert_decimal_orders_numerically,
     assert_hex_literal_compares_bytes, assert_notes_well_formed, assert_text_columns,
     assert_type_matrix, column_adapter_notes, create_schema_and_scripts,
-    create_schema_and_scripts_with_env, declared_types, error_text, exa_conn, explain_virtual_sql,
-    identifier_note, install_slc, int_column, note_of, pairs, parse_int, partition_positions,
-    query_error, reads, refuses, runtime, skipped_entries, try_create_virtual_schema_with_password,
-    upload_so, value_to_string,
+    create_schema_and_scripts_with_env, declared_types, error_text, exa_conn, exa_conn_redacting,
+    explain_virtual_sql, identifier_note, install_slc, int_column, note_of, pairs, parse_int,
+    partition_positions, query_error, reads, refuses, runtime, skipped_entries,
+    try_create_virtual_schema_with_password, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::glue::{
@@ -32,8 +32,8 @@ use common::seed::{
     TIMESTAMP_VALUES_TEXT,
 };
 use common::stack::{
-    CatalogConnectionPassword, PROXY_URL_INTERNAL, build_create_connection_sql, exasol_host,
-    exasol_sql_port, proxy_log_mark, proxy_log_since, wait_for_exasol, wait_for_proxy,
+    CatalogConnectionPassword, PROXY_URL_INTERNAL, build_create_connection_sql, proxy_log_mark,
+    proxy_log_since, wait_for_exasol, wait_for_proxy,
 };
 use common::timestamp_precision::expected_timestamp_precision;
 
@@ -97,12 +97,6 @@ fn glue_vs_props<'a>(vs_name: &'a str, conn_name: &'a str, namespace: &'a str) -
         .with_catalog_kind("GLUE")
 }
 
-/// A redacting connection, because the Exasol error for credential-bearing DDL may echo the
-/// statement.
-fn redacting_conn() -> ExaConn {
-    ExaConn::connect_redacting(&exasol_host(), exasol_sql_port(), "sys", SYS_PASSWORD)
-}
-
 fn try_create_glue_vs(
     env: &GlueEnv,
     vs_name: &str,
@@ -111,7 +105,7 @@ fn try_create_glue_vs(
     password: &CatalogConnectionPassword,
 ) -> Value {
     try_create_virtual_schema_with_password(
-        &mut redacting_conn(),
+        &mut exa_conn_redacting(),
         &glue_vs_props(vs_name, conn_name, namespace),
         &env.glue_endpoint(),
         password,
@@ -853,7 +847,7 @@ fn check_assume_role_connection_reads_through_the_role(run: &GlueRun, conn: &mut
         &database,
         &glue_base_identity_connection_password(env),
     );
-    let mut cleanup = redacting_conn();
+    let mut cleanup = exa_conn_redacting();
     for (vs, connection) in [(ROLE_VS, ROLE_CONN), (BASE_VS, BASE_CONN)] {
         let _ = cleanup.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs} CASCADE"));
         let _ = cleanup.try_execute(&format!("DROP CONNECTION IF EXISTS {connection}"));
@@ -877,7 +871,7 @@ fn check_iceberg_rest_listing_reaches_past_the_first_page(run: &GlueRun, conn: &
     let catalog_id = env.expect(runtime().block_on(run.catalog_id()), "read the catalog id");
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let response = try_create_virtual_schema_with_password(
-            &mut redacting_conn(),
+            &mut exa_conn_redacting(),
             &VsProps::new(REST_VS, &run.database()).with_catalog_conn_name(REST_CONN),
             &env.iceberg_rest_endpoint(),
             &glue_iceberg_rest_connection_password(env, &catalog_id),
@@ -901,7 +895,7 @@ fn check_iceberg_rest_listing_reaches_past_the_first_page(run: &GlueRun, conn: &
             page_padding_views().len()
         );
     }));
-    let mut cleanup = redacting_conn();
+    let mut cleanup = exa_conn_redacting();
     let _ = cleanup.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {REST_VS} CASCADE"));
     let _ = cleanup.try_execute(&format!("DROP CONNECTION IF EXISTS {REST_CONN}"));
     if let Err(panic) = outcome {
@@ -947,7 +941,7 @@ fn check_https_proxy_tunnels_glue_sts_and_s3(run: &GlueRun, conn: &mut ExaConn) 
                 props = props.with_catalog_kind(kind);
             }
             let response = try_create_virtual_schema_with_password(
-                &mut redacting_conn(),
+                &mut exa_conn_redacting(),
                 &props,
                 &uri,
                 &password,
@@ -983,7 +977,7 @@ fn check_https_proxy_tunnels_glue_sts_and_s3(run: &GlueRun, conn: &mut ExaConn) 
             );
         }
     }));
-    let mut cleanup = redacting_conn();
+    let mut cleanup = exa_conn_redacting();
     for (vs, connection) in [(PROXY_VS, PROXY_CONN), (PROXY_REST_VS, PROXY_REST_CONN)] {
         let _ = cleanup.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs} CASCADE"));
         let _ = cleanup.try_execute(&format!("DROP CONNECTION IF EXISTS {connection}"));
@@ -1019,7 +1013,7 @@ fn glue_credentials_never_appear_in_output() {
         other => std::env::var(other).ok(),
     });
     setup();
-    let mut conn = redacting_conn();
+    let mut conn = exa_conn_redacting();
     let connection_sql = build_create_connection_sql(
         PROBE_CONN,
         &sentinel_env.glue_endpoint(),
