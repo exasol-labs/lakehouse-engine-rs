@@ -560,7 +560,7 @@ mod sql {
     const WRITER_SPEC: &str = r#"{"connection":"C"}"#;
 
     fn select_for(columns: &[&str], writers: WriterLayout, node_count: usize) -> String {
-        let source_columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+        let source_columns: Vec<String> = columns.iter().map(ToString::to_string).collect();
         WriterSelect {
             script_schema: "LHVS",
             writer_spec: WRITER_SPEC,
