@@ -17,7 +17,6 @@ const TYPED_TABLE: &str = "EXPORT_E2E.TYPED";
 const TYPED_ROWS: i64 = 1_000;
 const LARGE_TABLE: &str = "EXPORT_E2E.ROWS_10K";
 const LARGE_ROWS: i64 = 10_000;
-const UNSUPPORTED_TABLE: &str = "EXPORT_E2E.UNSUPPORTED";
 const TAGS_TABLE: &str = "EXPORT_E2E.EVENT_TAGS";
 const MAX_WRITERS: i64 = 300;
 const EXPORTER_PASSWORD: &str = "ExportE2eUser2026x";
@@ -29,17 +28,6 @@ const NO_ACCESS_EXPORTER: &str = "EXPORT_E2E_NO_ACCESS";
 const FAILING_SOURCE: &str = "(SELECT 1 / (ID - ID) AS X FROM EXPORT_E2E.TYPED)";
 const SOURCE_READ_ERROR: &str = "division by zero";
 const INLINE_PASSWORD: &str = "ExportInlineSecret2026";
-const EXASOL_TYPE_ERROR: &str = "Column type not supported";
-
-/// Each column of `UNSUPPORTED_TABLE` but `ID`, with the start of the type its error names.
-const UNSUPPORTED_COLUMNS: [(&str, &str); 5] = [
-    ("C_GEOMETRY", "GEOMETRY"),
-    ("C_HASHTYPE", "HASHTYPE"),
-    ("C_INTERVAL_YM", "INTERVAL YEAR"),
-    ("C_INTERVAL_DS", "INTERVAL DAY"),
-    ("C_TSLTZ", "TIMESTAMP(3) WITH LOCAL TIME ZONE"),
-];
-
 fn setup() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
@@ -72,16 +60,6 @@ fn setup() {
              SELECT CAST(LEVEL AS DECIMAL(9,0)) AS ID FROM DUAL CONNECT BY LEVEL <= {LARGE_ROWS}"
         ));
         sys.execute(&format!(
-            "CREATE OR REPLACE TABLE {UNSUPPORTED_TABLE} AS SELECT \
-               CAST(1 AS DECIMAL(9,0)) AS ID, \
-               CAST('POINT(1 2)' AS GEOMETRY) AS C_GEOMETRY, \
-               CAST('550e8400-e29b-11d4-a716-446655440000' AS HASHTYPE) AS C_HASHTYPE, \
-               CAST('5-3' AS INTERVAL YEAR TO MONTH) AS C_INTERVAL_YM, \
-               CAST('2 12:50:10.123' AS INTERVAL DAY TO SECOND) AS C_INTERVAL_DS, \
-               CAST(TIMESTAMP '2024-01-01 12:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE) AS C_TSLTZ \
-             FROM DUAL"
-        ));
-        sys.execute(&format!(
             "CREATE OR REPLACE TABLE {TAGS_TABLE} AS \
              SELECT CAST(2 * LEVEL AS DECIMAL(18,0)) AS ID, 'tag' || LEVEL AS TAG \
              FROM DUAL CONNECT BY LEVEL <= 15"
@@ -108,11 +86,7 @@ fn exporters() {
         let script = format!("{SCHEMA_NAME}.{EXPORT_SCRIPT_NAME}");
         let conn = DEFAULT_CATALOG_CONN_NAME;
         // The role statements that `print_next_step_template` in deploy/scripts/install.sh prints.
-        let privileges = [
-            "EXPORT".to_string(),
-            format!("CONNECTION {conn}"),
-            format!("EXECUTE ON SCRIPT {script}"),
-        ];
+        let privileges = ["EXPORT".to_string(), format!("EXECUTE ON SCRIPT {script}")];
         let access_grant = format!("ACCESS ON CONNECTION {conn} FOR SCRIPT {script}");
         sys.execute(&format!("CREATE ROLE {role}"));
         for privilege in &privileges {
@@ -142,7 +116,9 @@ fn export_into(source: &str, tail: &str) -> String {
 fn export_sql(source: &str, options: &str) -> String {
     export_into(
         source,
-        &format!("AT {DEFAULT_CATALOG_CONN_NAME} WITH TABLE_NAME = 'ns.t' {options}"),
+        &format!(
+            "WITH CATALOG_CONNECTION = '{DEFAULT_CATALOG_CONN_NAME}' TABLE_NAME = 'ns.t' {options}"
+        ),
     )
 }
 
@@ -189,24 +165,6 @@ fn assert_refused_before_reading(
         "{label}: {sql} must fail before reading the source, naming {fragments:?}: {error}"
     );
     error
-}
-
-fn guard_message(column: &str, type_start: &str) -> String {
-    format!("{EXPORT_SCRIPT_NAME}: column \"{column}\" has type {type_start}")
-}
-
-/// Exasol's own UDF type check races the guard, so the refusal carries either message.
-#[track_caller]
-fn assert_type_refused(source: &str, columns: &[(&str, &str)]) {
-    let sql = export_sql(source, "");
-    let error = export_error(&mut exa_conn(), &sql);
-    assert!(
-        error.contains(EXASOL_TYPE_ERROR)
-            || columns
-                .iter()
-                .any(|(column, type_start)| error.contains(&guard_message(column, type_start))),
-        "{sql} must be refused with the guard error for one of {columns:?} or `{EXASOL_TYPE_ERROR}`: {error}"
-    );
 }
 
 /// Scenario: A whole-table export reports every source row
@@ -318,17 +276,22 @@ fn export_writer_layout_sets_writer_count() {
 
 /// Scenario: WRITERS_PER_NODE together with SINGLE_COMMIT is refused
 /// Scenario: An invalid option fails the export before any data is read
-/// Scenario: An export without a named CONNECTION fails before any data is read
+/// Scenario: An export without CATALOG_CONNECTION fails before any data is read
+/// Scenario: An AT clause is refused
 /// Scenario: TRUNCATE, REPLACE, and CREATED BY are refused
 #[test]
 fn export_refuses_invalid_statements_before_reading() {
     stack();
     setup();
-    let ask_for_connection =
-        "add AT <connection>, naming the CONNECTION object the virtual schema uses";
+    let use_option =
+        "name the CONNECTION with CATALOG_CONNECTION = '<connection>' in the WITH options";
+    let named_at = format!(
+        "AT {DEFAULT_CATALOG_CONN_NAME} WITH CATALOG_CONNECTION = '{DEFAULT_CATALOG_CONN_NAME}' \
+         TABLE_NAME = 'ns.t'"
+    );
     let inline = format!(
         "AT 'http://catalog:8181' USER 'exporter' IDENTIFIED BY '{INLINE_PASSWORD}' \
-         WITH TABLE_NAME = 'ns.t'"
+         WITH CATALOG_CONNECTION = '{DEFAULT_CATALOG_CONN_NAME}' TABLE_NAME = 'ns.t'"
     );
     let appends_only =
         |clause: &str| format!("{clause} is not supported, because the export only appends rows");
@@ -345,7 +308,7 @@ fn export_refuses_invalid_statements_before_reading() {
             "unknown option",
             export_sql(FAILING_SOURCE, "FILE_FORMAT = 'csv'"),
             vec![
-                "unknown option FILE_FORMAT; the accepted options are TABLE_NAME, WRITERS_PER_NODE, and SINGLE_COMMIT"
+                "unknown option FILE_FORMAT; the accepted options are CATALOG_CONNECTION, TABLE_NAME, WRITERS_PER_NODE, and SINGLE_COMMIT"
                     .to_string(),
             ],
         ),
@@ -358,20 +321,24 @@ fn export_refuses_invalid_statements_before_reading() {
             ],
         ),
         (
-            "no CONNECTION",
+            "no CATALOG_CONNECTION",
             export_into(FAILING_SOURCE, "WITH TABLE_NAME = 'ns.t'"),
+            vec!["option CATALOG_CONNECTION is required".to_string()],
+        ),
+        (
+            "named AT clause",
+            export_into(FAILING_SOURCE, &named_at),
             vec![
-                "the EXPORT statement names no CONNECTION".to_string(),
-                ask_for_connection.to_string(),
+                "the AT clause is not supported".to_string(),
+                use_option.to_string(),
             ],
         ),
         (
-            "inline CONNECTION",
+            "inline AT clause",
             export_into(FAILING_SOURCE, &inline),
             vec![
-                "an inline AT".to_string(),
-                "is not supported".to_string(),
-                ask_for_connection.to_string(),
+                "the AT clause is not supported".to_string(),
+                use_option.to_string(),
             ],
         ),
         (
@@ -403,23 +370,6 @@ fn export_refuses_invalid_statements_before_reading() {
     assert!(
         read_error.contains(SOURCE_READ_ERROR),
         "with valid options the export reads the failing source: {read_error}"
-    );
-}
-
-/// Scenario: A column of an unsupported type is refused
-#[test]
-fn export_refuses_unsupported_column_types() {
-    stack();
-    setup();
-
-    for (column, type_start) in UNSUPPORTED_COLUMNS {
-        let source = format!("{UNSUPPORTED_TABLE} (ID, {column})");
-        assert_type_refused(&source, &[(column, type_start)]);
-    }
-    assert_type_refused(UNSUPPORTED_TABLE, &UNSUPPORTED_COLUMNS);
-    assert_type_refused(
-        &format!("(SELECT C_GEOMETRY AS SHAPE FROM {UNSUPPORTED_TABLE})"),
-        &[("SHAPE", "GEOMETRY")],
     );
 }
 

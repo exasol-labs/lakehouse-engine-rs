@@ -118,12 +118,11 @@ curl -fsSL -H "Accept: application/vnd.github.raw" \
 3. It downloads the `lakehouse-engine.tar.gz` release, pinned or latest, and uploads the engine
    file. On a BucketFS target it uses `exapump bucketfs cp`. On a SaaS target it uses a
    presigned-URL exchange.
-4. It creates the schema (`LHVS` by default) and its five scripts: `LAKEHOUSE_ADAPTER`,
-   `LAKEHOUSE_SCAN`, `LAKEHOUSE_VERSION`, `LAKEHOUSE_EXPORT`, and `LAKEHOUSE_DISTRIBUTE_FILES`.
+4. It creates the schema (`LHVS` by default) and its four scripts: `LAKEHOUSE_ADAPTER`,
+   `LAKEHOUSE_SCAN`, `LAKEHOUSE_VERSION`, and `LAKEHOUSE_DISTRIBUTE_FILES`.
 5. It runs a version smoke test. The test calls `LAKEHOUSE_VERSION()` and checks that the
    returned value exactly matches the release it downloaded.
 6. It stops there and prints a `CONNECTION` and `CREATE VIRTUAL SCHEMA` template for you to edit.
-   The template also prints the export role statements, which the installer never runs.
    It creates no dataset-specific object itself.
 
 The command is idempotent. It uses `CREATE OR REPLACE`, `CREATE SCHEMA IF NOT EXISTS`, and an
@@ -158,6 +157,7 @@ from the virtual schema's notes instead.
 | `--lakehouse-version <v>` | Both targets. Pins the engine version. Default: latest release. |
 | `--slc-version <v>` | Both targets. Pins the SLC version. Default: the version the engine release pins through its `exasol-udf-sdk` dependency. |
 | `--skip-slc` | Both targets. Skips the SLC download and registration. Every other step still runs. |
+| `--with-export` | Both targets. Also creates `LAKEHOUSE_EXPORT` and prints the export grants. In development, not ready for use: no release contains export yet, so the script fails with a loader error unless the engine is built from source. |
 | `--arch <x86_64\|aarch64>` | Both targets. Default: `x86_64`, or the host's architecture for a local Exasol Personal deployment. Selects unsuffixed vs `-aarch64`-suffixed release assets. |
 | `--help` | Prints this reference. Needs no network access and no credentials. |
 
@@ -220,8 +220,9 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 - **AWS Glue, Lakekeeper, Unity Catalog (Delta tables), and the full credential-JSON reference** are in [Catalogs](catalogs.md).
 - **Tuning properties** (`PARALLELISM_FACTOR`, memory pool sizing, DataFusion partitions/threads,
   and more) are in [Tuning](tuning.md).
-- **Exporting rows** with `EXPORT ... INTO SCRIPT` needs the export role, whose statements the
-  installer prints and never runs. See [Export](export.md).
+- **Exporting rows** (**in development, not ready for use**; it counts rows and writes nothing to the lakehouse; opt-in): `--with-export` also creates `LAKEHOUSE_EXPORT` and
+  prints the export role statements, which the installer never runs. No release contains export
+  yet, so the script works only on an engine built from source. See [Export](export.md).
 - **Before granting other users access**, read [Security](security.md). A user who only queries
   the Virtual Schema needs `CREATE SESSION` and `SELECT` on it, and nothing else.
 
@@ -369,7 +370,7 @@ make bucketfs-upload-so        # → BucketFS udf/liblakehouse_engine.so
 
 The build runs inside `rust:1.98.1-trixie` (glibc 2.41, which matches the SLC). It rebuilds only
 when crate sources, manifests, or the lockfile change. One `.so` exports **all four** RUST entry
-points (VS adapter, scan SCALAR UDF, version query, and export SET UDF). This path needs Docker and
+points (VS adapter, scan SCALAR UDF, version query, and export SET UDF; the installer creates the export script only with `--with-export`). This path needs Docker and
 [`exapump`](https://github.com/exasol-labs/exapump). It also needs the Rust SLC already
 registered, because it uploads only the engine file, not the SLC. Before you use this path,
 register the SLC once. Run the [one-line command](#install-with-one-command) without `--skip-slc`,
@@ -468,9 +469,9 @@ The [one-line command](#install-with-one-command) already runs this step for you
 yourself only after [build from source](#appendix-build-from-source) or a
 [manual upload](#appendix-manual-install-on-a-restricted-network).
 
-One `.so` supplies all four RUST entry points. The SLC dispatches them by script name. A fifth
-script, a plain-LUA passthrough, fans the file lists out across nodes. Set `%udf_object` to the
-path where your `.so` landed in the upload step:
+The SLC dispatches the `.so`'s RUST entry points by script name. The adapter, scan, and version
+scripts use them. A fourth script, a plain-LUA passthrough, fans the file lists out across nodes.
+Set `%udf_object` to the path where your `.so` landed in the upload step:
 
 - [Build from source](#appendix-build-from-source) (`make bucketfs-upload-so` uploads the bare
   `.so`, no auto-extract): `buckets/bfsdefault/default/udf/liblakehouse_engine.so`
@@ -496,11 +497,6 @@ RETURNS VARCHAR(100) AS
 %udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
 /
 
-CREATE OR REPLACE RUST SET SCRIPT LHVS.LAKEHOUSE_EXPORT(...)
-RETURNS DECIMAL(18,0) AS
-%udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
-/
-
 CREATE OR REPLACE LUA SET SCRIPT LHVS.LAKEHOUSE_DISTRIBUTE_FILES(files VARCHAR(2000000))
 EMITS (files VARCHAR(2000000)) AS
 function run(ctx)
@@ -519,14 +515,23 @@ end
 `EMITS (...)` is a placeholder. The adapter supplies concrete output columns per query.
 `LAKEHOUSE_VERSION` takes no arguments and returns the compiled engine version as a plain
 `X.Y.Z` string. It reads no CONNECTION, no catalog, and no object storage, and it can be called
-standalone with no Virtual Schema. `LAKEHOUSE_EXPORT` answers `EXPORT ... INTO SCRIPT` and needs
-a CONNECTION and the export role; see [Export](export.md). `LAKEHOUSE_DISTRIBUTE_FILES` is a pure passthrough. It does
+standalone with no Virtual Schema. `LAKEHOUSE_DISTRIBUTE_FILES` is a pure passthrough. It does
 the cross-node `GROUP BY shard_key` fan-out before the scalar scan.
 
 The adapter, scan, and distributor scripts MUST be in the same schema as `LAKEHOUSE_ADAPTER`,
 here `LHVS`: the adapter calls them schema-qualified, using its own running-script schema, not a
 configured property. `LAKEHOUSE_VERSION` carries no such constraint — it needs no adapter and no
-Virtual Schema — but this installer still creates it alongside the other four for convenience.
+Virtual Schema — but this installer still creates it alongside the other three for convenience.
+
+Export is in development and not ready for use: it counts rows and writes nothing to the lakehouse. To create its script by hand, or with `--with-export`, run the statement
+below over an engine built from source. No release contains export yet. See [Export](export.md).
+
+```sql
+CREATE OR REPLACE RUST SET SCRIPT LHVS.LAKEHOUSE_EXPORT(...)
+RETURNS DECIMAL(18,0) AS
+%udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
+/
+```
 
 ## Appendix: version smoke test by hand
 

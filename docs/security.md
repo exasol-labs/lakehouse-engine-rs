@@ -77,19 +77,20 @@ Readers still need only the reader grants, not membership in the role. Every mem
 
 ### Export grants
 
-A user who runs `EXPORT ... INTO SCRIPT <schema>.LAKEHOUSE_EXPORT` (see [Export](export.md)) holds the export role, not the engine role. The installer prints the role's statements in its next-step template and runs none of them, because it runs before any CONNECTION exists. Create the CONNECTION, run the statements as a DBA, then grant the role to each exporting user:
+> **In development.** Export is not ready for use: it counts rows and writes nothing to the lakehouse. Permissions may change.
+
+A user who runs `EXPORT ... INTO SCRIPT <schema>.LAKEHOUSE_EXPORT` (see [Export](export.md)) holds the export role, not the engine role. The installer prints the role's statements in its next-step template only when you pass `--with-export`, and runs none of them, because it runs before any CONNECTION exists. Create the CONNECTION, run the statements as a DBA, then grant the role to each exporting user:
 
 ```sql
 CREATE ROLE LAKEHOUSE_EXPORT_ROLE_<schema>;
 GRANT EXPORT TO LAKEHOUSE_EXPORT_ROLE_<schema>;
-GRANT CONNECTION <conn> TO LAKEHOUSE_EXPORT_ROLE_<schema>;
 GRANT EXECUTE ON SCRIPT <schema>.LAKEHOUSE_EXPORT TO LAKEHOUSE_EXPORT_ROLE_<schema>;
 GRANT ACCESS ON CONNECTION <conn> FOR SCRIPT <schema>.LAKEHOUSE_EXPORT TO LAKEHOUSE_EXPORT_ROLE_<schema>;
 
 GRANT LAKEHOUSE_EXPORT_ROLE_<schema> TO <user>;
 ```
 
-The `CONNECTION` privilege lets the user name the CONNECTION in any `IMPORT` or `EXPORT` statement, not only in an export through `LAKEHOUSE_EXPORT`. Grant the role only to users who may use the CONNECTION's credentials.
+The export names the CONNECTION in a `WITH CATALOG_CONNECTION` option, never in an `AT` clause, so the role needs no `CONNECTION` privilege. The script-scoped `ACCESS` grant alone decides who exports through which CONNECTION. Grant the role only to users who may use the CONNECTION's credentials.
 
 ### Re-installing
 
@@ -125,7 +126,7 @@ The virtual schema's owner holds both, and so does every member of a role that o
 
 ### Who can bypass the export script
 
-A holder of the [export role](#export-grants) can call `LAKEHOUSE_EXPORT` directly in a `SELECT`, with a forged writer spec and any rows. That call runs the writer and skips every check the export call makes: the options, the type guards, the writer count, and `SINGLE_COMMIT`. The writer therefore treats its writer spec as untrusted input. Grant the export role only to users who may export any rows through the CONNECTION.
+A holder of the [export role](#export-grants) can call `LAKEHOUSE_EXPORT` directly in a `SELECT`, with a forged writer spec and any rows. That call runs the writer and skips every check the export call makes: the options, the writer count, and `SINGLE_COMMIT`. The writer therefore treats its writer spec as untrusted input. Grant the export role only to users who may export any rows through the CONNECTION.
 
 ## Lakekeeper permission check
 

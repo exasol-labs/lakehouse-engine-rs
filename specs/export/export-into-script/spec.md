@@ -4,7 +4,7 @@ A user exports an Exasol table, a query over virtual schema tables, or a query t
 
 ## Background
 
-* Statement: `EXPORT {<table> [(<columns>)] | (<query>)} INTO SCRIPT <schema>.LAKEHOUSE_EXPORT AT <connection> WITH TABLE_NAME = '<namespace>.<table>' [WRITERS_PER_NODE = '<n>'] [SINGLE_COMMIT = '<true|false>']`. `<connection>` names the CONNECTION object that the virtual schema uses.
+* Statement: `EXPORT {<table> [(<columns>)] | (<query>)} INTO SCRIPT <schema>.LAKEHOUSE_EXPORT WITH CATALOG_CONNECTION = '<connection>' TABLE_NAME = '<namespace>.<table>' [WRITERS_PER_NODE = '<n>'] [SINGLE_COMMIT = '<true|false>']`. `CATALOG_CONNECTION` names the CONNECTION object that the virtual schema uses.
 * Writer count: with `SINGLE_COMMIT = 'true'`, one writer runs for the whole cluster. Otherwise the export deals the source rows in turn to G writers, where G is the node count × `WRITERS_PER_NODE`, capped at 300. A source with at least G rows runs exactly G writers, and a source with fewer rows runs one writer per row.
 
 ## Scenarios
@@ -12,7 +12,7 @@ A user exports an Exasol table, a query over virtual schema tables, or a query t
 ### Scenario: A whole-table export reports every source row
 
 * *GIVEN* an Exasol table with 1,000 rows
-* *WHEN* a user runs `EXPORT <table> INTO SCRIPT <schema>.LAKEHOUSE_EXPORT AT <connection> WITH TABLE_NAME = 'ns.t'`
+* *WHEN* a user runs `EXPORT <table> INTO SCRIPT <schema>.LAKEHOUSE_EXPORT WITH CATALOG_CONNECTION = '<connection>' TABLE_NAME = 'ns.t'`
 * *THEN* the statement's row count SHALL be 1,000
 * *AND* every source row SHALL reach exactly one writer
 
@@ -36,6 +36,6 @@ A user exports an Exasol table, a query over virtual schema tables, or a query t
 
 ### Scenario: An empty source exports zero rows
 
-* *GIVEN* a query that returns no rows and whose columns all have types the export supports
+* *GIVEN* a query that returns no rows
 * *WHEN* a user exports it
 * *THEN* the statement SHALL succeed with a row count of 0

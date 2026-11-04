@@ -46,7 +46,10 @@ fn export_spec_json(connection: serde_json::Value, extra: serde_json::Value) -> 
         "has_truncate": false,
         "has_replace": false,
         "source_column_names": [r#""T"."A""#],
-        "parameters": [{"key": "TABLE_NAME", "value": "ns.t"}],
+        "parameters": [
+            {"key": "CATALOG_CONNECTION", "value": CONNECTION},
+            {"key": "TABLE_NAME", "value": "ns.t"},
+        ],
     });
     let fields = spec.as_object_mut().expect("the spec is an object");
     fields.extend(connection.as_object().cloned().unwrap_or_default());
@@ -54,8 +57,8 @@ fn export_spec_json(connection: serde_json::Value, extra: serde_json::Value) -> 
     spec.to_string()
 }
 
-fn named_connection() -> serde_json::Value {
-    serde_json::json!({"connection_name": CONNECTION})
+fn no_at_clause() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 fn no_extra() -> serde_json::Value {
@@ -83,16 +86,16 @@ fn assert_no_connection_value(text: &str, what: &str) {
 fn generated_sql_and_errors_carry_no_connection_value() {
     let sql = generate_export_sql(
         &mut granted(hook_context()),
-        &export_spec_json(named_connection(), no_extra()),
+        &export_spec_json(no_at_clause(), no_extra()),
     )
     .expect("a valid export yields SQL");
     assert!(
         sql.starts_with(&format!(
-            r#"SELECT "LHVS"."LAKEHOUSE_EXPORT"('{WRITER_SPEC}', "T"."A") FROM DUAL WHERE "#
+            r#"SELECT "LHVS"."LAKEHOUSE_EXPORT"('{WRITER_SPEC}', "T"."A") FROM DUAL GROUP BY "#
         )),
         "{sql}"
     );
-    assert!(sql.ends_with(" GROUP BY MOD(ROWNUM, 2)"), "{sql}");
+    assert!(sql.ends_with("GROUP BY MOD(ROWNUM, 2)"), "{sql}");
     assert_no_connection_value(&sql, "the generated SQL");
 
     let inline = serde_json::json!({"connection_information": {
@@ -113,17 +116,14 @@ fn generated_sql_and_errors_carry_no_connection_value() {
             "TRUNCATE",
             generate_export_sql(
                 &mut granted(hook_context()),
-                &export_spec_json(
-                    named_connection(),
-                    serde_json::json!({"has_truncate": true}),
-                ),
+                &export_spec_json(no_at_clause(), serde_json::json!({"has_truncate": true})),
             ),
         ),
         (
             "missing script grant in the hook",
             generate_export_sql(
                 &mut hook_context(),
-                &export_spec_json(named_connection(), no_extra()),
+                &export_spec_json(no_at_clause(), no_extra()),
             ),
         ),
     ];
@@ -152,7 +152,7 @@ fn generated_sql_and_errors_carry_no_connection_value() {
 fn hook_without_script_grant_names_connection_script_user_and_grant() {
     let message = error_text(generate_export_sql(
         &mut hook_context(),
-        &export_spec_json(named_connection(), no_extra()),
+        &export_spec_json(no_at_clause(), no_extra()),
     ));
 
     for fragment in [
@@ -169,8 +169,11 @@ fn hook_refuses_an_invalid_statement_naming_the_option() {
     let message = error_text(generate_export_sql(
         &mut granted(hook_context()),
         &export_spec_json(
-            named_connection(),
-            serde_json::json!({"parameters": [{"key": "TABLE_NAME", "value": "t"}]}),
+            no_at_clause(),
+            serde_json::json!({"parameters": [
+                {"key": "CATALOG_CONNECTION", "value": CONNECTION},
+                {"key": "TABLE_NAME", "value": "t"},
+            ]}),
         ),
     ));
 
@@ -190,8 +193,9 @@ fn hook_with_single_commit_renders_one_writer() {
     let sql = generate_export_sql(
         &mut granted(hook_context()),
         &export_spec_json(
-            named_connection(),
+            no_at_clause(),
             serde_json::json!({"parameters": [
+                {"key": "CATALOG_CONNECTION", "value": CONNECTION},
                 {"key": "TABLE_NAME", "value": "ns.t"},
                 {"key": "SINGLE_COMMIT", "value": "true"},
             ]}),
@@ -199,7 +203,7 @@ fn hook_with_single_commit_renders_one_writer() {
     )
     .expect("a valid export yields SQL");
 
-    assert!(sql.ends_with(" GROUP BY MOD(ROWNUM, 1)"), "{sql}");
+    assert!(sql.ends_with("GROUP BY MOD(ROWNUM, 1)"), "{sql}");
 }
 
 #[test]
@@ -280,14 +284,16 @@ mod options {
     const SENTINELS: [&str; 3] = ["sentinel-address", "sentinel-user", "sentinel-password"];
 
     fn spec_with(parameters: &[(&str, &str)]) -> ExportSpec {
+        let mut with = vec![("CATALOG_CONNECTION", CONNECTION)];
+        with.extend_from_slice(parameters);
         ExportSpec {
             has_truncate: false,
             has_replace: false,
             created_by: None,
             source_column_names: vec![r#""T"."A""#.to_string()],
             connection_information: None,
-            connection_name: Some(CONNECTION.to_string()),
-            parameters: parameters
+            connection_name: None,
+            parameters: with
                 .iter()
                 .map(|(key, value)| Parameter {
                     key: key.to_string(),
@@ -331,12 +337,11 @@ mod options {
             created_by: Some("CREATE TABLE ns.t (a INT)".to_string()),
             ..valid_spec()
         };
-        let no_connection = ExportSpec {
-            connection_name: None,
+        let named_at = ExportSpec {
+            connection_name: Some(CONNECTION.to_string()),
             ..valid_spec()
         };
         let inline = ExportSpec {
-            connection_name: None,
             connection_information: Some(inline_connection()),
             ..valid_spec()
         };
@@ -347,11 +352,43 @@ mod options {
             ("TRUNCATE", truncate, vec!["TRUNCATE", appends]),
             ("REPLACE", replace, vec!["REPLACE", appends]),
             ("CREATED BY", created_by, vec!["CREATED BY", appends]),
-            ("no AT clause", no_connection, vec!["AT <connection>"]),
+            (
+                "named AT clause",
+                named_at,
+                vec!["AT clause", "CATALOG_CONNECTION"],
+            ),
             (
                 "inline AT clause",
                 inline,
-                vec!["inline", "AT <connection>"],
+                vec!["AT clause", "CATALOG_CONNECTION"],
+            ),
+            (
+                "CATALOG_CONNECTION missing",
+                ExportSpec {
+                    parameters: vec![Parameter {
+                        key: "TABLE_NAME".to_string(),
+                        value: "ns.t".to_string(),
+                    }],
+                    ..valid_spec()
+                },
+                vec!["CATALOG_CONNECTION", "is required"],
+            ),
+            (
+                "CATALOG_CONNECTION empty",
+                ExportSpec {
+                    parameters: vec![
+                        Parameter {
+                            key: "CATALOG_CONNECTION".to_string(),
+                            value: String::new(),
+                        },
+                        Parameter {
+                            key: "TABLE_NAME".to_string(),
+                            value: "ns.t".to_string(),
+                        },
+                    ],
+                    ..valid_spec()
+                },
+                vec!["CATALOG_CONNECTION", "is required"],
             ),
             (
                 "TABLE_NAME missing",
@@ -388,7 +425,7 @@ mod options {
                 spec_with(&[("TABLE_NAME", "ns.t"), ("FORMAT", "csv")]),
                 vec![
                     "unknown option FORMAT",
-                    "TABLE_NAME, WRITERS_PER_NODE, and SINGLE_COMMIT",
+                    "CATALOG_CONNECTION, TABLE_NAME, WRITERS_PER_NODE, and SINGLE_COMMIT",
                 ],
             ),
             (
@@ -578,33 +615,19 @@ mod sql {
         &sql[at + 1..]
     }
 
-    fn guard(reference: &str, name: &str) -> String {
-        format!(
-            "(CASE WHEN TYPEOF({reference}) LIKE 'GEOMETRY%' OR TYPEOF({reference}) LIKE 'HASHTYPE%' \
-             OR TYPEOF({reference}) LIKE 'INTERVAL%' OR TYPEOF({reference}) LIKE '%WITH LOCAL TIME ZONE' \
-             THEN CAST('LAKEHOUSE_EXPORT: column \"{name}\" has type ' || TYPEOF({reference}) || \
-             ', which the export does not support; cast it to a supported type' AS DECIMAL(1,0)) \
-             ELSE 0 END) = 0"
-        )
-    }
-
     #[test]
-    fn one_column_renders_the_self_call_guard_and_row_number_key() {
+    fn one_column_renders_the_self_call_and_row_number_key() {
         let sql = select_for(&[r#""T"."A""#], WriterLayout::PerNode(1), 1);
 
         assert_eq!(
             sql,
             "SELECT \"LHVS\".\"LAKEHOUSE_EXPORT\"('{\"connection\":\"C\"}', \"T\".\"A\") FROM DUAL \
-             WHERE (CASE WHEN TYPEOF(\"T\".\"A\") LIKE 'GEOMETRY%' OR TYPEOF(\"T\".\"A\") LIKE 'HASHTYPE%' \
-             OR TYPEOF(\"T\".\"A\") LIKE 'INTERVAL%' OR TYPEOF(\"T\".\"A\") LIKE '%WITH LOCAL TIME ZONE' \
-             THEN CAST('LAKEHOUSE_EXPORT: column \"A\" has type ' || TYPEOF(\"T\".\"A\") || \
-             ', which the export does not support; cast it to a supported type' AS DECIMAL(1,0)) \
-             ELSE 0 END) = 0 GROUP BY MOD(ROWNUM, 1)"
+             GROUP BY MOD(ROWNUM, 1)"
         );
     }
 
     #[test]
-    fn several_columns_pass_in_source_order_with_one_guard_each() {
+    fn several_columns_pass_in_source_order() {
         let sql = select_for(
             &[r#""T"."ID""#, r#""T"."NAME""#, r#""T"."G""#],
             WriterLayout::PerNode(1),
@@ -613,10 +636,7 @@ mod sql {
 
         let expected = format!(
             "SELECT \"LHVS\".\"LAKEHOUSE_EXPORT\"('{WRITER_SPEC}', \"T\".\"ID\", \"T\".\"NAME\", \"T\".\"G\") \
-             FROM DUAL WHERE {} AND {} AND {} GROUP BY MOD(ROWNUM, 1)",
-            guard(r#""T"."ID""#, "ID"),
-            guard(r#""T"."NAME""#, "NAME"),
-            guard(r#""T"."G""#, "G"),
+             FROM DUAL GROUP BY MOD(ROWNUM, 1)"
         );
         assert_eq!(sql, expected);
     }
@@ -668,28 +688,19 @@ mod sql {
     }
 
     #[test]
-    fn column_names_are_referenced_verbatim_and_named_by_their_last_identifier() {
+    fn column_names_are_referenced_verbatim() {
         let cases = [
-            ("table column", r#""T"."A""#, "A"),
-            ("query alias", r#""X""#, "X"),
-            ("schema-qualified column", r#""S"."T"."A""#, "A"),
-            ("dot inside the identifier", r#""T"."a.b""#, "a.b"),
-            (
-                "quote and apostrophe",
-                r#""T"."it's ""q""""#,
-                r#"it''s "q""#,
-            ),
-            ("unquoted reference", "T.A", "T.A"),
+            ("table column", r#""T"."A""#),
+            ("query alias", r#""X""#),
+            ("schema-qualified column", r#""S"."T"."A""#),
+            ("dot inside the identifier", r#""T"."a.b""#),
+            ("quote and apostrophe", r#""T"."it's ""q""""#),
         ];
 
-        for (case, reference, message_name) in cases {
+        for (case, reference) in cases {
             let sql = select_for(&[reference], WriterLayout::PerNode(1), 1);
             assert!(
                 sql.contains(&format!("{WRITER_SPEC}', {reference}) FROM DUAL")),
-                "{case}: {sql}"
-            );
-            assert!(
-                sql.contains(&guard(reference, message_name)),
                 "{case}: {sql}"
             );
         }
@@ -709,7 +720,7 @@ mod sql {
 
         assert!(
             sql.starts_with(
-                r#"SELECT "my""schema"."LAKEHOUSE_EXPORT"('{"connection":"A''B\"C"}', "T"."A") FROM DUAL WHERE "#
+                r#"SELECT "my""schema"."LAKEHOUSE_EXPORT"('{"connection":"A''B\"C"}', "T"."A") FROM DUAL GROUP BY "#
             ),
             "{sql}"
         );

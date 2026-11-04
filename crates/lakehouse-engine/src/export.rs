@@ -89,6 +89,7 @@ fn refusal(message: impl std::fmt::Display) -> UdfError {
     UdfError::User(format!("{EXPORT_SCRIPT_NAME}: {message}"))
 }
 
+const CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
 const TABLE_NAME: &str = "TABLE_NAME";
 const WRITERS_PER_NODE: &str = "WRITERS_PER_NODE";
 const SINGLE_COMMIT: &str = "SINGLE_COMMIT";
@@ -102,8 +103,8 @@ enum WriterLayout {
     PerNode(usize),
 }
 
-/// An export statement the engine accepts: append-only, `AT` a named CONNECTION, with a
-/// valid `TABLE_NAME`. It keeps only what the writer SELECT needs.
+/// An export statement the engine accepts: append-only, with no `AT` clause, a
+/// `CATALOG_CONNECTION` option, and a valid `TABLE_NAME`. It keeps only what the writer SELECT needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExportOptions {
     connection_name: String,
@@ -115,8 +116,9 @@ impl ExportOptions {
     /// accepted form. It never echoes a value of an inline CONNECTION.
     fn from_spec(spec: &ExportSpec) -> Result<Self, UdfError> {
         refuse_rewrite_clauses(spec)?;
-        let connection_name = named_connection(spec)?;
+        refuse_at_clause(spec)?;
         let with_options = WithOptions::collect(&spec.parameters)?;
+        let connection_name = with_options.connection_name()?;
         check_table_name(with_options.table_name)?;
         let writers = with_options.writer_layout()?;
         Ok(Self {
@@ -140,21 +142,19 @@ fn refuse_rewrite_clauses(spec: &ExportSpec) -> Result<(), UdfError> {
     }
 }
 
-fn named_connection(spec: &ExportSpec) -> Result<String, UdfError> {
-    if let Some(name) = &spec.connection_name {
-        return Ok(name.clone());
+// `AT` makes Exasol check the CONNECTION privilege without handing the script the
+// credentials, so the connection travels as a WITH option instead.
+fn refuse_at_clause(spec: &ExportSpec) -> Result<(), UdfError> {
+    if spec.connection_name.is_none() && spec.connection_information.is_none() {
+        return Ok(());
     }
-    let problem = if spec.connection_information.is_some() {
-        "an inline AT '<address>' USER '<user>' IDENTIFIED BY '<password>' clause is not supported"
-    } else {
-        "the EXPORT statement names no CONNECTION"
-    };
     Err(refusal(format_args!(
-        "{problem}; add AT <connection>, naming the CONNECTION object the virtual schema uses"
+        "the AT clause is not supported; remove it and name the CONNECTION with {CATALOG_CONNECTION} = '<connection>' in the WITH options"
     )))
 }
 
 struct WithOptions<'a> {
+    catalog_connection: Option<&'a str>,
     table_name: Option<&'a str>,
     writers_per_node: Option<&'a str>,
     single_commit: Option<&'a str>,
@@ -163,24 +163,35 @@ struct WithOptions<'a> {
 impl<'a> WithOptions<'a> {
     fn collect(parameters: &'a [Parameter]) -> Result<Self, UdfError> {
         let mut options = Self {
+            catalog_connection: None,
             table_name: None,
             writers_per_node: None,
             single_commit: None,
         };
         for parameter in parameters {
             let slot = match parameter.key.as_str() {
+                CATALOG_CONNECTION => &mut options.catalog_connection,
                 TABLE_NAME => &mut options.table_name,
                 WRITERS_PER_NODE => &mut options.writers_per_node,
                 SINGLE_COMMIT => &mut options.single_commit,
                 unknown => {
                     return Err(refusal(format_args!(
-                        "unknown option {unknown}; the accepted options are {TABLE_NAME}, {WRITERS_PER_NODE}, and {SINGLE_COMMIT}"
+                        "unknown option {unknown}; the accepted options are {CATALOG_CONNECTION}, {TABLE_NAME}, {WRITERS_PER_NODE}, and {SINGLE_COMMIT}"
                     )));
                 }
             };
             *slot = Some(parameter.value.as_str());
         }
         Ok(options)
+    }
+
+    fn connection_name(&self) -> Result<String, UdfError> {
+        match self.catalog_connection {
+            Some(name) if !name.is_empty() => Ok(name.to_string()),
+            _ => Err(refusal(format_args!(
+                "option {CATALOG_CONNECTION} is required; set {CATALOG_CONNECTION} = '<connection>', naming the CONNECTION object the virtual schema uses"
+            ))),
+        }
     }
 
     fn writer_layout(&self) -> Result<WriterLayout, UdfError> {
@@ -241,14 +252,6 @@ fn parse_single_commit(value: &str) -> Result<bool, UdfError> {
 /// hash-partitioned (unbalanced).
 const MAX_WRITER_COUNT: usize = 300;
 
-/// `TYPEOF` patterns of the types Exasol does not pass to a UDF reliably.
-const UNSUPPORTED_TYPE_PATTERNS: [&str; 4] = [
-    "GEOMETRY%",
-    "HASHTYPE%",
-    "INTERVAL%",
-    "%WITH LOCAL TIME ZONE",
-];
-
 /// The SELECT the export hook answers with. It calls the export script itself as the
 /// writer, so `run` sees the writer spec first and then the source columns.
 struct WriterSelect<'a> {
@@ -261,22 +264,16 @@ struct WriterSelect<'a> {
 }
 
 impl WriterSelect<'_> {
-    /// Exasol binds `DUAL` to the export source. Every source row passes a type guard and
-    /// reaches exactly one of G writers through the `MOD(ROWNUM, G)` group key.
+    /// Exasol binds `DUAL` to the export source. Every source row reaches exactly one of
+    /// G writers through the `MOD(ROWNUM, G)` group key.
     fn render(&self) -> String {
         let arguments = std::iter::once(string_literal(self.writer_spec))
             .chain(self.source_columns.iter().cloned())
             .collect::<Vec<_>>()
             .join(", ");
-        let guards = self
-            .source_columns
-            .iter()
-            .map(|column| type_guard(column))
-            .collect::<Vec<_>>()
-            .join(" AND ");
         // The key stays top-level: an export SELECT over a subquery of DUAL fails.
         format!(
-            "SELECT {}.{}({arguments}) FROM DUAL WHERE {guards} GROUP BY MOD(ROWNUM, {})",
+            "SELECT {}.{}({arguments}) FROM DUAL GROUP BY MOD(ROWNUM, {})",
             quote_identifier(self.script_schema),
             quote_identifier(EXPORT_SCRIPT_NAME),
             self.group_count(),
@@ -295,52 +292,6 @@ fn writer_count(node_count: usize, per_node: usize) -> usize {
     node_count
         .saturating_mul(per_node)
         .clamp(1, MAX_WRITER_COUNT)
-}
-
-// Exasol has no error function, so the guard fails the cast of its message. The message
-// concatenates TYPEOF, because Exasol folds a constant CAST eagerly and fails every export.
-fn type_guard(column: &str) -> String {
-    let column_type = format!("TYPEOF({column})");
-    let unsupported = UNSUPPORTED_TYPE_PATTERNS
-        .iter()
-        .map(|pattern| format!("{column_type} LIKE {}", string_literal(pattern)))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let message_head = string_literal(&format!(
-        "{EXPORT_SCRIPT_NAME}: column \"{}\" has type ",
-        column_display_name(column)
-    ));
-    let message_tail =
-        string_literal(", which the export does not support; cast it to a supported type");
-    format!(
-        "(CASE WHEN {unsupported} THEN CAST({message_head} || {column_type} || {message_tail} \
-         AS DECIMAL(1,0)) ELSE 0 END) = 0"
-    )
-}
-
-/// The last quoted identifier of `reference`, unescaped; `reference` itself when it holds
-/// no quoted identifier.
-fn column_display_name(reference: &str) -> String {
-    let mut last = None;
-    let mut chars = reference.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '"' {
-            continue;
-        }
-        let mut identifier = String::new();
-        while let Some(c) = chars.next() {
-            match c {
-                '"' if chars.peek() == Some(&'"') => {
-                    chars.next();
-                    identifier.push('"');
-                }
-                '"' => break,
-                c => identifier.push(c),
-            }
-        }
-        last = Some(identifier);
-    }
-    last.unwrap_or_else(|| reference.to_string())
 }
 
 fn quote_identifier(name: &str) -> String {

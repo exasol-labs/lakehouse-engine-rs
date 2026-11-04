@@ -1211,7 +1211,7 @@ fn cloud_profiled_export(env: &CloudEnv, source: &str, options: &str) -> (i64, i
     );
     let sql = format!(
         "EXPORT {source} INTO SCRIPT {CLOUD_SCHEMA_NAME}.{CLOUD_EXPORT_SCRIPT} \
-         AT {CLOUD_CATALOG_CONN} WITH TABLE_NAME = 'ns.t' {options}"
+         WITH CATALOG_CONNECTION = '{CLOUD_CATALOG_CONN}' TABLE_NAME = 'ns.t' {options}"
     );
     profiled_export_counts(&mut conn, &sql)
 }

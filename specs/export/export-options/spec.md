@@ -1,15 +1,14 @@
 # Feature: EXPORT INTO SCRIPT Options and Writer Count
 
-The export script checks the statement, its options, and its source column types before any source row is read, and sets the number of writers from `WRITERS_PER_NODE` and `SINGLE_COMMIT`.
+The export script checks the statement, and its options before any source row is read, and sets the number of writers from `WRITERS_PER_NODE` and `SINGLE_COMMIT`.
 
 ## Background
 
-* Statement: `EXPORT {<table> [(<columns>)] | (<query>)} INTO SCRIPT <schema>.LAKEHOUSE_EXPORT AT <connection> WITH TABLE_NAME = '<namespace>.<table>' [WRITERS_PER_NODE = '<n>'] [SINGLE_COMMIT = '<true|false>']`. `<connection>` names the CONNECTION object that the virtual schema uses.
+* Statement: `EXPORT {<table> [(<columns>)] | (<query>)} INTO SCRIPT <schema>.LAKEHOUSE_EXPORT WITH CATALOG_CONNECTION = '<connection>' TABLE_NAME = '<namespace>.<table>' [WRITERS_PER_NODE = '<n>'] [SINGLE_COMMIT = '<true|false>']`. `CATALOG_CONNECTION` names the CONNECTION object that the virtual schema uses.
+* `CATALOG_CONNECTION` is required: the name of a CONNECTION object. The statement carries no `AT` clause, because with `AT` Exasol checks the `CONNECTION` privilege without passing the script the credentials.
 * `TABLE_NAME` is required. It is a namespace and a table name joined by `.`. The namespace may have several `.`-separated levels, and no part is empty.
 * `WRITERS_PER_NODE` is optional: an integer of at least 1, default 1. `SINGLE_COMMIT` is optional: `true` or `false` in any letter case, default `false`. The export refuses `WRITERS_PER_NODE` together with `SINGLE_COMMIT = 'true'`.
 * Writer count: with `SINGLE_COMMIT = 'true'`, one writer runs for the whole cluster. Otherwise the export deals the source rows in turn to G writers, where G is the node count × `WRITERS_PER_NODE`, capped at 300. A source with at least G rows runs exactly G writers, and a source with fewer rows runs one writer per row.
-* The export refuses columns of type GEOMETRY, HASHTYPE, INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, and TIMESTAMP WITH LOCAL TIME ZONE, because Exasol does not pass them to a UDF reliably. The Iceberg table spec (§ Schemas and Data Types, Primitive Types) defines `timestamptz` ("Timestamp, microsecond precision, with timezone"; the counterpart of TIMESTAMP WITH LOCAL TIME ZONE), `uuid` ("Universally unique identifiers") and `fixed(L)` ("Fixed-length byte array of length L"), the Iceberg counterparts of HASHTYPE, and, in format v3, `geometry(C)`. It defines no interval type. Refusing GEOMETRY, HASHTYPE, and TIMESTAMP WITH LOCAL TIME ZONE is a trade-off that Exasol's UDF interface forces. A user casts such a column, for example to VARCHAR or TIMESTAMP, to export it.
-* Exasol's own UDF type check races the export's check, so a refused column fails the export with one of two errors: the export's error, which names the column and its type, or Exasol's `[22002] Column type not supported: <type>`, which does not name the column. Which one a run returns is not deterministic. An empty source with such a column may be refused the same way or export 0 rows, so the export makes no promise about it.
 
 ## Scenarios
 
@@ -48,11 +47,17 @@ The export script checks the statement, its options, and its source column types
 * *THEN* the export SHALL fail before any source row is read
 * *AND* the error SHALL name the option and its accepted form, and for an unknown option SHALL list the accepted options
 
-### Scenario: An export without a named CONNECTION fails before any data is read
+### Scenario: An export without CATALOG_CONNECTION fails before any data is read
 
 * *GIVEN* a source whose rows raise an error when they are read
-* *WHEN* a user exports it with no `AT` clause, or with an inline `AT '<address>' USER '<user>' IDENTIFIED BY '<password>'`
-* *THEN* the export SHALL fail before any source row is read, with an error that asks for `AT <connection>`, where `<connection>` is the CONNECTION the virtual schema uses
+* *WHEN* a user exports it with no `CATALOG_CONNECTION` option, or with an empty one
+* *THEN* the export SHALL fail before any source row is read, with an error that asks for `CATALOG_CONNECTION = '<connection>'`
+
+### Scenario: An AT clause is refused
+
+* *GIVEN* a source whose rows raise an error when they are read
+* *WHEN* a user exports it with `AT <connection>`, or with an inline `AT '<address>' USER '<user>' IDENTIFIED BY '<password>'`
+* *THEN* the export SHALL fail before any source row is read, with an error that points to the `CATALOG_CONNECTION` option
 * *AND* the error MUST NOT contain the inline password
 
 ### Scenario: TRUNCATE, REPLACE, and CREATED BY are refused
@@ -61,10 +66,3 @@ The export script checks the statement, its options, and its source column types
 * *WHEN* the user adds `TRUNCATE`, `REPLACE`, or `CREATED BY '<sql>'`
 * *THEN* the export SHALL fail before any source row is read
 * *AND* the error SHALL name the refused clause and state that the export only appends rows
-
-### Scenario: A column of an unsupported type is refused
-
-* *GIVEN* a source that returns at least one row and has a column of type GEOMETRY, HASHTYPE, INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, or TIMESTAMP WITH LOCAL TIME ZONE
-* *WHEN* a user exports it
-* *THEN* the export SHALL fail
-* *AND* the error SHALL either name the column as the source names it (the table column, the column-list entry, or the query's column alias) and its Exasol type, or be Exasol's `Column type not supported: <type>`

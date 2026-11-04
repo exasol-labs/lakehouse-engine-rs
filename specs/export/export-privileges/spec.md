@@ -1,11 +1,11 @@
 # Feature: EXPORT INTO SCRIPT Privileges and Installation
 
-The export script needs a CONNECTION grant of its own, and the installer creates the script and prints the grants as a template. The script reads no CONNECTION value into any SQL or error text.
+The export script needs a script-scoped CONNECTION grant of its own. With `--with-export` the installer creates the script and prints the grants as a template. The script reads no CONNECTION value into any SQL or error text.
 
 ## Background
 
-* Statement: `EXPORT {<table> [(<columns>)] | (<query>)} INTO SCRIPT <schema>.LAKEHOUSE_EXPORT AT <connection> WITH TABLE_NAME = '<namespace>.<table>' [WRITERS_PER_NODE = '<n>'] [SINGLE_COMMIT = '<true|false>']`. `<connection>` names the CONNECTION object that the virtual schema uses.
-* An exporting user needs the `EXPORT` system privilege, `EXECUTE` on `LAKEHOUSE_EXPORT`, the `CONNECTION` privilege on the CONNECTION (Exasol requires it for `AT <connection>`), and `GRANT ACCESS ON CONNECTION <connection> FOR SCRIPT <schema>.LAKEHOUSE_EXPORT`, granted directly or through a role.
+* Statement: `EXPORT {<table> [(<columns>)] | (<query>)} INTO SCRIPT <schema>.LAKEHOUSE_EXPORT WITH CATALOG_CONNECTION = '<connection>' TABLE_NAME = '<namespace>.<table>' [WRITERS_PER_NODE = '<n>'] [SINGLE_COMMIT = '<true|false>']`. `CATALOG_CONNECTION` names the CONNECTION object that the virtual schema uses.
+* An exporting user needs the `EXPORT` system privilege, `EXECUTE` on `LAKEHOUSE_EXPORT`, and `GRANT ACCESS ON CONNECTION <connection> FOR SCRIPT <schema>.LAKEHOUSE_EXPORT`, granted directly or through a role.
 
 ## Scenarios
 
@@ -30,10 +30,12 @@ The export script needs a CONNECTION grant of its own, and the installer creates
 * *THEN* the SQL that `LAKEHOUSE_EXPORT` generates SHALL carry the CONNECTION name and no value of the CONNECTION
 * *AND* no error message SHALL contain the CONNECTION's password
 
-### Scenario: The installer creates the export script and prints the export grants
+### Scenario: The installer creates the export script and prints the export grants only on request
 
 * *GIVEN* the install script has uploaded the engine `.so`
-* *WHEN* it creates the deployment scripts in the target schema
+* *WHEN* it runs without `--with-export`
+* *THEN* it SHALL create no `LAKEHOUSE_EXPORT` script and print no export role lines
+* *WHEN* it runs with `--with-export`
 * *THEN* it SHALL create `LAKEHOUSE_EXPORT` as a RUST SET script with dynamic input that returns `DECIMAL(18,0)` and references the same `.so` as the other scripts
 * *AND* the printed next-step template SHALL create one export role, `LAKEHOUSE_EXPORT_ROLE_<schema>`, that holds the privileges § Background lists for the template's CONNECTION, and SHALL tell the operator to grant that role to each exporting user
 * *AND* the template SHALL print the export role lines for every installing user, including `SYS`

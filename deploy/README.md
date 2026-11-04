@@ -88,7 +88,7 @@ cargo test --workspace --features lakehouse-e2e/cloud-e2e --test cloud_e2e_test 
      LH_BUCKETFS_PORT=<bucketfs port> EXASOL_SYS_PASSWORD=<sys password> BUCKETFS_WRITE_PASS=<pass>
    ```
 
-2. Create the export script in the cloud schema over that `.so`. The statement is the `ddl_export` text of `deploy/scripts/install.sh`:
+2. Create the export script in the cloud schema over that `.so`. The statement is the `ddl_export` text of `deploy/scripts/install.sh`, which the installer runs only with `--with-export`:
 
    ```sql
    CREATE SCHEMA IF NOT EXISTS CLOUD_LHVS;
