@@ -8,7 +8,7 @@ This file states how tests prove the behavior that the feature specs (`specs/<do
 
 - Every scenario in a feature spec has at least one E2E test, with two exceptions. A unit test alone proves a scenario of pure computation with no I/O. A fault-injection test alone proves a failure scenario that no E2E test can produce, such as a timeout, a cut-off answer, a transient failure and its retries, or an unreachable host. A host test that reads fixture files or lists a store proves no scenario.
 - A test that implements a scenario carries one `/// Scenario: <title>` line per scenario (`AGENTS.md` § Code style). A unit test carries the line only when it is the scenario's one proof.
-- An E2E test proves what a user sees through Exasol SQL. A property that Exasol SQL cannot observe is proved by a unit test, and so is a state that no well-formed Exasol request can reach, over a synthesized request.
+- An E2E test proves what a user sees through Exasol SQL. A unit test proves a property that Exasol SQL cannot observe. A unit test over a synthesized request proves a state that no well-formed Exasol request can reach.
 - An E2E suite holds no requirement of its own. Behavior that an E2E test finds and no feature spec states goes into a feature spec.
 
 ### Test tiers
@@ -16,7 +16,7 @@ This file states how tests prove the behavior that the feature specs (`specs/<do
 - Unit tests run on the host and live in a sibling `_tests.rs` file (`AGENTS.md` § Code style).
 - Host tests are unit tests, fault-injection tests against a fake server, compile-time contract tests, and the scan UDF tests below. There is no other host integration tier. A host test that reads a catalog or a remote object store, or chains adapter modules to prove behavior, is an E2E test in the wrong place.
 - Scan UDF tests run `run()` on the host through `exasol_udf_sdk::test_support::TestContext` (`EmitPolicy`, `NextPolicy`).
-- A crate's host tests under `tests/` build into one binary, `tests/it/main.rs`, because each test binary statically links the whole engine. A new test file is a module declared there. A top-level `tests/*.rs` file is a deliberate separate target, such as `scan_footer_refetch_observable`, which needs its own process because it asserts on process-global state.
+- A crate's host tests under `tests/` build into one binary, `tests/it/main.rs`, because each test binary statically links the whole engine. A new test file is a module declared there. A top-level `tests/*.rs` file is a separate target for a test that needs its own process.
 - The `it` binary runs its tests as parallel threads of one process. A test writes files only under its own `tempfile::tempdir()`. A test that asserts on process-global state shares one lock with every test that mutates that state, or keeps its own binary.
 - E2E tests live in `crates/lakehouse-e2e`, which does not depend on the engine crates, so no E2E binary links or rebuilds the engine. Each suite is a `[[test]]` target whose `required-features` names its cargo feature, so a plain `cargo test` never builds a suite. A suite runs as `cargo test --workspace --features lakehouse-e2e/<feature> --test <binary>`.
 - Every host cargo run selects the whole workspace and narrows with `--lib`, `--test`, or a name filter, because `-p` or `--exclude` changes the enabled dependency features and compiles a second copy of the dependency graph. `make cross-udf-build` is the one exception: it builds with `-p lakehouse-engine`, so the shipped `.so` carries no feature that only a test crate enables.
@@ -25,7 +25,7 @@ This file states how tests prove the behavior that the feature specs (`specs/<do
 ### Testing strategy
 
 - There are two layers. E2E tests prove user-visible behavior against the real stack. Unit tests cover pure logic: parsing, mapping, validation, building requests, and reading answers. Each behavior is tested at one layer. A coverage gap is closed by a unit test of pure logic, never by a multi-module host test or a fake.
-- A fake server injects the faults an E2E test cannot produce, such as timeouts, cut-off answers, and unreachable hosts, and nothing else. There is at most one fake per external system. A fault-injection test proves how our code reacts to a fault. It never proves how the external system behaves, because a fake tests our idea of that system, not the system.
+- A fake server injects only the faults an E2E test cannot produce (§ Coverage rule). There is at most one fake per external system. A fault-injection test proves how the engine reacts to a fault. It never proves how the external system behaves, because a fake encodes an assumption about that system, not the system.
 - A unit test has one unit, plain inputs, and expected outputs. It does no I/O, writes no file, starts no server, asserts nothing on a fake's request log or call order, and reads no source file.
 - A unit test that pins a rule uses an input that fails under the wrong rule.
 - No test restates standard-library behavior.
@@ -42,15 +42,15 @@ Test code gets the same design care as production code. A test reads as the one 
 - Tests build request JSON, column nodes, Exasol types, file entries, scan specs, and join specs through the support builders, not as inline JSON or struct literals. A literal spells out every field, so a field added later edits every test instead of one builder.
 - A builder defaults every value that most tests share. A test sets only the values its behavior depends on.
 - The change that writes the second copy of a setup block, fixture, or assertion helper extracts it into a shared helper in the same change.
-- Variants of one scenario are rows of one case table, as in `crates/lakehouse-e2e/tests/common/pruning_cases.rs`, not copies of one test body.
-- A constructor on a production type serves tests only when production code calls it too, such as the `const` constructors of `ExasolType`. A constructor that only tests call is a test helper and lives in the support module.
+- Variants of one scenario are rows of one case table, not copies of one test body.
+- A constructor on a production type serves tests only when production code calls it too. A constructor that only tests call is a test helper and lives in the support module.
 - A test-only helper that unwraps a production type's private payload lives in its area's support module and is never `pub`.
 
 ### E2E suites
 
 | Suite | Cargo feature | Test binaries | Make targets | CI job (check name) | Stack | In `release` needs |
 |-------|---------------|---------------|-------------|---------------------|-------|--------------------|
-| Local Docker | `exasol-e2e` | `e2e_local` | `make e2e-up test-e2e` | `e2e` (`E2E`, `E2E (8.29.x)`) | Exasol, SeaweedFS, Iceberg REST catalog, forward proxy (`docker-compose.yml`) | yes |
+| Local Docker | `exasol-e2e` | `e2e_local` | `make e2e-up test-e2e` | `e2e` (`E2E`, plus one check per older Exasol version) | Exasol, SeaweedFS, Iceberg REST catalog, forward proxy (`docker-compose.yml`) | yes |
 | Lakekeeper | `lakekeeper-e2e` | `e2e_lakekeeper_test` | `make lakekeeper-up test-e2e-lakekeeper` | `e2e-lakekeeper` (`E2E (Lakekeeper)`) | Local Docker stack plus Lakekeeper, its PostgreSQL database, Keycloak, OpenFGA | yes |
 | Unity Catalog | `unity-e2e` | `e2e_unity_test` | `make unity-up test-e2e-unity` | `e2e-unity` (`E2E (Unity)`) | SeaweedFS, Exasol, forward proxy, OSS Unity Catalog (`docker-compose.unity.yml`) | yes |
 | Azure | `azure-e2e` | `e2e_azure_test` | `make azure-up test-e2e-azure` | `e2e-azure` (`E2E (Azure)`) | Lakekeeper stack plus a real ADLS Gen2 account | no |
@@ -67,7 +67,7 @@ Test code gets the same design care as production code. A test reads as the one 
 - The Lakekeeper suite fails when the stack reports an authorization backend other than OpenFGA.
 - A fork pull request receives no repository secrets, so the Azure and Glue jobs fail naming the missing variable.
 - `cloud-e2e` is the one opt-in suite. It skips, naming the absent variable, when its AWS or assume-role variables are unset or `GLUE_CATALOG_URI` is not a standard `https://glue.<AWS_REGION>.amazonaws.com/` endpoint, and then it makes no network call.
-- The cloud performance smoke test records its query duration for manual inspection. It asserts row counts and aggregate values, never a latency threshold.
+- No test asserts a latency threshold. The cloud performance smoke test records its query duration for manual inspection.
 
 ### Shared harness
 
@@ -76,11 +76,11 @@ Test code gets the same design care as production code. A test reads as the one 
 - The harness grants `ACCESS ON CONNECTION ... FOR SCRIPT` to `CURRENT_USER` after the last `CREATE OR REPLACE` of the CONNECTION or a script, because a replacement drops the grant. It skips the grant for `SYS`, which Exasol refuses and which holds every CONNECTION implicitly.
 - A binary passes its virtual schema names and properties as explicit parameters. A parameter it does not supply is omitted from `CREATE VIRTUAL SCHEMA`, never emitted empty.
 - Each binary runs one stack setup plus one lazy setup per fixture, so a name filter provisions only the fixtures it uses.
-- The shared virtual schema DDL sets `ALLOW_HTTP = 'true'`, and every connection string sets `validateservercertificate=0`.
+- The shared virtual schema DDL sets `ALLOW_HTTP = 'true'`.
 - A test reads a failing statement's error text only through `error_text`, which asserts the error status and names the statement or case.
 - Async fixture work runs on the harness's one shared Tokio runtime. Only a teardown that runs from `Drop` builds its own runtime, on its own thread.
 - Every seed writes through the one shared seed-catalog configuration, which selects the storage backend. No suite forks the table create, write, and commit logic.
-- No E2E code uses `lakehouse-engine`, `lakehouse-catalog`, or `vs-expression`, because the suites treat the deployed `.so` as a black box (#443). A name the engine emits into pushed SQL is a test-owned constant, so renaming it in the engine fails the test.
+- No E2E code uses `lakehouse-engine`, `lakehouse-catalog`, or `vs-expression`, because the suites treat the deployed `.so` as a black box. A name the engine emits into pushed SQL is a test-owned constant, so renaming it in the engine fails the test.
 - The harness resolves fixture file lists in the test process through iceberg-rust's scan planner (`resolve_fixture_files`) and returns harness-owned types.
 
 ### Exasol session client
@@ -102,23 +102,23 @@ Test code gets the same design care as production code. A test reads as the one 
 - A pushdown shape the adapter advertises is proved against a live Exasol, never inferred from the capability registry or from code.
 - Partial aggregation shows as the `group_keys` entry in the scan spec and the wrapper's merge of the `PARTIAL_*` columns, with no `IPROC()` and no raw row scan. A `GROUP BY shard_key` fan-out is no evidence, because it appears only when the files span several shards.
 - A regression test uses a discriminating fixture whose predicate matches a strict subset of the rows. A test that proves a predicate prunes nothing uses a multi-row-group file whose per-group statistics would falsely exclude a matching row.
-- When it is uncertain whether a fixture reproduces a defect, the suite establishes it by observation and fails saying so. The Lakekeeper suite does this for vended credential scope: it reads one table's data file with the other table's vended credential and fails when the read is allowed.
+- When it is uncertain whether a fixture reproduces a defect, the suite establishes it by observation and fails saying so.
 - A test that depends on shard placement forces it through the shard count or `PARALLELISM_FACTOR`.
 - A constant result is asserted by exact value. Only a moving clock value gets a tolerance. The expected value of a widened `float` column is the f32's exact double expansion, not the decimal literal that was written.
 - A declared timestamp type is asserted in full, with the precision read from the live engine version through one shared, test-owned helper. A rendered-timestamp oracle casts to the type that helper returns.
 - A type assertion that must hold on both Exasol versions matches by prefix. An exact assertion sits beside it and does not replace it.
 - A timestamp-precision test asserts the `TIMESTAMP(p)` literal in the generated `EMITS` clause, then the distinct value count the width admits. A wrong value under a query that raised no error marks an engine accept-and-clamp, not an SLC rejection.
 - A type-coverage test compares the declared types in `SYS.EXA_ALL_COLUMNS` with an exact list, compares one `SELECT ID, <columns> ... ORDER BY ID` over the readable columns with exact values, reads each refused column alone, and shares its column values with the other suites.
-- The Lakekeeper vended CONNECTION carries empty `access_key`, `secret_key`, `endpoint`, and `region`, and the test asserts that shape, because a CONNECTION endpoint would override the vended one.
+- A test that proves vended credentials rules out the static path. Its CONNECTION carries no storage endpoint or keys, and the test asserts that, because CONNECTION values override vended ones. Where the CONNECTION must carry static keys, the test asserts that the catalog's answer vended a key pair.
 
 ### Regression guards
 
-- A change that a feature spec declares behavior-preserving leaves every test assertion, golden-SQL string, and `dispatch_golden` fixture unchanged. The exceptions are the edits the change requires, such as import paths and call sites of a renamed item, and the one value the spec names as changing.
+- A change that a feature spec declares behavior-preserving leaves every test assertion unchanged. The exceptions are the edits the change requires, such as import paths and call sites of a renamed item, and the one value the spec names as changing.
 - No assertion is weakened, disabled, or deleted to make a test pass or to fit a visibility change. A dedicated test cleanup may delete a test when each scenario keeps its proof at one layer.
-- `dispatch_golden` changes only with an intended change of the generated SQL.
+- A golden-SQL fixture (`dispatch_golden`) changes only with an intended change of the generated SQL.
 - A test whose assertion a change makes false is deleted with its section banner and its test-only imports.
 - Code that moves to another crate takes its tests along, with every test name and expected value. Tests of the code left behind stay with that code.
-- A structural contract that no runtime test can observe is pinned by a compile-time test, such as the contract that the capability set takes no catalog-kind input.
+- A structural contract that no runtime test can observe is pinned by a compile-time test.
 
 ### Fixtures
 
@@ -128,13 +128,13 @@ Test code gets the same design care as production code. A test reads as the one 
 - Each standalone fixture has its own namespace and virtual schema, so no other suite's enumeration sees it. A fixture that a test mutates also has its own base path, which the test empties before it writes the initial state. It asserts no exact skipped-table list before its first mutation, because SeaweedFS keeps an emptied directory as a listed prefix.
 - A fixture whose test needs a failed enumeration sits under a base path that no passing test enumerates.
 - A fixture-shape test reads the written file's own Parquet footer and asserts its physical encoding, so a read test cannot pass against a normalized fixture. Every Spark fixture below has one.
-- Suites that compare two credential arms seed both from one deterministic 20-row shape (`id` 1 to 20, `score` = 5.0 × `id`). Equal rows prove both arms read correctly, not that they read the same bytes.
+- Suites that compare two credential arms seed both from one deterministic row shape. Equal rows prove both arms read correctly, not that they read the same bytes.
 - Type-coverage tables sit beside a suite's other fixtures and use the virtual schema the suite already creates. Each holds the ids 1 to 3, with row 3 NULL in every column but `id`, and timestamps exact to the millisecond, so they read the same at every precision.
 - Pruning fixture (`tests/common/pruning_fixture.rs`): the same rows in an Iceberg table, a Hive directory, a Delta table in Unity Catalog under `unity.e2e_pruning`, and a native oracle table with a `FILE_LABEL` column naming each row's data file. The writers produce several row groups per file and several pages per row group, with a page index, and fixture-shape tests assert that, including that the Delta log statistics match the footers. One case table runs on all three formats, and the oracle declares each column with the type the virtual schema maps it to.
 - Apache Spark writes the Iceberg fixtures that iceberg-rust cannot author, through the one-shot `spark-iceberg-fixtures` Compose job against the shared REST catalog. `run_fixtures.sh` lists each script explicitly, so a new script needs its own entry. All scripts run in one `spark-sql` session to save startup time, with the INT96 script last because it switches the session's Parquet writer. The step fails, and never skips, when a service it needs is down. Each fixture's ground truth lives in the Rust harness, in lockstep with its SQL script.
 - The Spark fixtures:
-  - Positional deletes: merge-on-read tables at `file` and `partition` granularity. The partition table's deletes reference data files in several partitions. Spark writes them because iceberg-rust 0.10 has no position-delete writer (apache/iceberg-rust #340).
-  - `mor_dv`: a format-version-2 table upgraded to version 3, with a kept positional delete, a delete merged into a deletion vector, a replaced vector, a vector over 199,000 rows that spans several roaring containers, and two vectors in one Puffin file.
+  - Positional deletes: merge-on-read tables at `file` and `partition` granularity. The partition table's deletes reference data files in several partitions. Spark writes them because iceberg-rust has no position-delete writer.
+  - `mor_dv`: a format-version-2 table upgraded to version 3, with a kept positional delete, a delete merged into a deletion vector, a replaced vector, a vector that spans several roaring containers, and two vectors in one Puffin file.
   - `unsupported_format`: a Parquet and an ORC data file over disjoint `id` ranges. No equality-delete fixture exists, because Spark writes none.
   - `int96_ts_far_future`: an INT96 `timestamp` holding `9999-12-31 23:59:59`, registered with `add_files`, the only route to INT96. The value lies outside the Arrow nanosecond range and inside both the Arrow microsecond range and Exasol's `TIMESTAMP` maximum.
   - `ident_part_absent` and `ident_part_types`: Hive-style files without the partition column, registered with `add_files` so only the manifest carries the value. They mix in native files, null partition values, a file whose stored values differ from its partition value, a partition-spec change, and an identity field on each primitive type.
@@ -142,9 +142,9 @@ Test code gets the same design care as production code. A test reads as the one 
   - `projection_by_id`: a hand-set name mapping that omits a column and a struct member the imported file holds, plus a column and a member dropped and re-added after a native file was written.
   - Type promotion: `int` to `long`, `float` to `double`, and `decimal(10,2)` to `decimal(20,2)`, with a data file from before the promotion and a later value outside the 32-bit range. No `date` to `timestamp` fixture exists, because Apache Iceberg Java does not implement that promotion.
 - Delta fixtures are vendored from delta-kernel-rs and never mutated (`scripts/unity/fixtures/PROVENANCE.md`). `make unity-up` seeds them under `unity.delta_e2e`. A test that needs a controlled Delta layout writes its own table in `e2e_unity_test.rs` under its own Unity Catalog schema. The Unity Catalog registration lists every column a test selects, because an unregistered column is not selectable from Exasol.
-- The Glue fixture set writes no data file for the cases the listing skips: the ORC partition, the partition-projection table, the view, the ORC table, and the Delta table.
+- The Glue fixture set writes no data file for a table or partition that the listing skips.
 - A forward-proxy test addresses local services by `*-via-proxy` names that only the proxy resolves, so a bypass fails on DNS, and it first asserts that the name does not resolve inside Exasol. Its scripts sit in their own adapter schema, `LHVS_PROXY`, so their `%env` lines reach no other test. Against real cloud hosts, the proof is the `CONNECT` line in the proxy's log.
-- The proxy's URL filter (`scripts/proxy/filter`) injects catalog faults by answering a matching request with HTTP 403. A test that needs one table's `loadTable` to fail routes only its own adapter schema through the proxy, instead of corrupting the metadata file, which the REST fixture retries for about 90 seconds.
+- The proxy's URL filter (`scripts/proxy/filter`) injects catalog faults by answering a matching request with HTTP 403. A test that needs one table's `loadTable` to fail routes only its own adapter schema through the proxy, instead of corrupting the metadata file, which the REST fixture keeps retrying before it answers.
 
 ### Per-run cloud resources
 
@@ -163,17 +163,16 @@ Test code gets the same design care as production code. A test reads as the one 
 - A failure in a credential-bearing helper names the endpoint and the HTTP status and never prints the response body.
 - Cloud credentials reach a suite as environment variables: locally from the gitignored `test.env`, which the Azure and Glue Make targets load, and in CI from repository secrets and variables. The committed `test.env.example` names every variable with a placeholder and says which ones reach the CONNECTION under test.
 - The Azure service principal drives the container lifecycle only. Scans and the seed writer see only the account name and key. The principal holds Storage Blob Data Contributor on a dedicated test-only account and nothing more.
-- The Azure suite never requests `loadTable` itself, because that would put a live SAS in the test process.
-- The cloud suite's CONNECTION carries static AWS keys, so a passing vended scan cannot prove that Glue vended a key pair. The suite asserts that the credential source in Glue's `loadTable` response carries a non-empty `s3.access-key-id` and `s3.secret-access-key`, and reports, without failing, whether it carries `client.region`, `s3.endpoint`, and `s3.session-token`.
+- A test requests a vended payload from the catalog itself only when it asserts on it, because each request puts a live credential in the test process.
 
 ### Make targets and CI
 
 - Every E2E Make target depends on `cross-udf-build`, so no suite runs against a stale `.so`. With `REBUILD_SO=0`, a missing or stale `.so` fails the target instead of rebuilding it.
-- Each stack (`e2e`, `lakekeeper`, `azure`, `unity`, `glue`) has `<stack>-start`, `<stack>-wait`, `<stack>-up` for both, and `<stack>-down`, which removes its volumes. `scripts/e2e-stack.sh` holds their commands. No test target starts its stack.
+- Each stack in § E2E suites has `<stack>-start`, `<stack>-wait`, `<stack>-up` for both, and `<stack>-down`, which removes its volumes. `scripts/e2e-stack.sh` holds their commands. No test target starts its stack.
 - Every E2E CI job needs only `build-so`, so a draft pull request skips it. It sets `REBUILD_SO=0` and runs its suite and stack through the Make targets. It compiles the suite between `<stack>-start` and `<stack>-wait`, with the same cargo flags as the Make test target, so compilation overlaps Exasol's boot.
-- The `e2e` job runs the local suite on a 2025.x image (`E2E`, a required check on `main`) and on an 8.29.x image (`E2E (8.29.x)`), selected through `EXASOL_IMAGE`. `release` needs both legs. The catalog suites run on one Exasol version, because catalog integrations do not vary with the engine version.
+- The `e2e` job runs the local suite once per supported Exasol major version, each leg selecting its image through `EXASOL_IMAGE`. The leg on the newest version carries the required check name `E2E`, and `release` needs every leg. The catalog suites run on one Exasol version, because catalog integrations do not vary with the engine version.
 - `E2E (Azure)` and `E2E (Glue)` are neither required nor in `release`'s needs, so a cloud outage or a rotated key blocks no merge and no release.
-- E2E tests run only on x86_64, because `exasol/docker-db` publishes amd64-only images. The `arm64` job runs only `cargo test --workspace`, with its own cache key.
+- E2E tests run only on x86_64, because `exasol/docker-db` publishes amd64-only images. The `arm64` job runs only `cargo test --workspace`.
 
 ## Ops
 
