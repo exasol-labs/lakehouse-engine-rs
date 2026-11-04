@@ -4,6 +4,7 @@
 
 use crate::scan_fixture;
 use crate::scan_fixture::WithFiles;
+use crate::scan_fixture::{block_on, dir_url, dummy_storage, total_rows};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ use exasol_udf_sdk::test_support::TestContext;
 use exasol_udf_sdk::value::ExaType;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, ScanSpec, ScanStorage, StorageBackend, StorageProps,
+    CommonScanSpec, FileEntry, LogicalField, ScanSpec, ScanStorage,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, run_raw_scan_with_session,
@@ -42,20 +43,6 @@ const HIVE_DEFAULT_FILE: &str =
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/unity/fixtures/basic_partitioned")
-}
-
-fn file_url(path: &Path) -> String {
-    Url::from_file_path(path)
-        .expect("absolute path")
-        .to_string()
-}
-
-fn dir_url(path: &Path) -> String {
-    let mut url = file_url(path);
-    if !url.ends_with('/') {
-        url.push('/');
-    }
-    url
 }
 
 fn file_size(path: &Path) -> u64 {
@@ -128,17 +115,6 @@ fn basic_partitioned_logical_schema() -> Vec<LogicalField> {
     ]
 }
 
-fn dummy_storage() -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: "http://localhost:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "k".into(),
-        secret_key: "SECRETKEY".into(),
-        allow_http: true,
-        ..Default::default()
-    })
-}
-
 fn basic_partitioned_spec(
     files: Vec<FileEntry>,
     table_root: &str,
@@ -156,14 +132,6 @@ fn basic_partitioned_spec(
         ..Default::default()
     }
     .with_files(files)
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
 }
 
 async fn try_run_scan_with_store(
@@ -201,10 +169,6 @@ fn run_scan(spec: &ScanSpec, register_url: &str, emits: &[ExaType]) -> Vec<Recor
 
 fn letter_number_float_emits() -> Vec<ExaType> {
     vec![scan_fixture::varchar(), ExaType::Int64, ExaType::Double]
-}
-
-fn total_rows(batches: &[RecordBatch]) -> usize {
-    batches.iter().map(|b| b.num_rows()).sum()
 }
 
 fn letter_number_rows(batches: &[RecordBatch]) -> Vec<(Option<String>, i64)> {

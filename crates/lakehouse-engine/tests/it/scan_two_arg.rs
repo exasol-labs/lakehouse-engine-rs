@@ -1,5 +1,6 @@
 use crate::scan_fixture;
 use crate::scan_fixture::WithFiles;
+use crate::scan_fixture::{block_on, total_rows};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -121,18 +122,6 @@ async fn run_two_arg(common_json: &str, files_json: &str, emits: &[ExaType]) -> 
     .await
     .expect("raw scan must succeed");
     ctx.into_batches()
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
-}
-
-fn total_rows(batches: &[RecordBatch]) -> usize {
-    batches.iter().map(|b| b.num_rows()).sum()
 }
 
 fn ids_of(batches: &[RecordBatch]) -> Vec<i64> {

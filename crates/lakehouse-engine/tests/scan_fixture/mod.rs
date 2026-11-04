@@ -1,13 +1,55 @@
-//! Fixtures shared by the engine's host test binaries: resolved scan storage, join specs, declared
-//! output columns, and a batch-capturing UDF context.
+//! Fixtures shared by the engine's host test binaries: a test runtime, file URLs, storage
+//! backends and their resolution, join specs, declared output columns, and a batch-capturing
+//! UDF context.
 #![allow(dead_code)]
 
 pub mod concurrency_probe;
 
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, JoinSpec, JoinType, ScanSpec, ScanStorage,
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, ScanSpec, ScanStorage, StorageBackend,
+    StorageProps,
 };
 use lakehouse_engine::scan::{ResolvedScanStorage, resolve_scan_storage};
+
+pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build test runtime")
+        .block_on(future)
+}
+
+pub fn total_rows(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(|b| b.num_rows()).sum()
+}
+
+/// An inline S3 backend whose secret is distinctive, so redacting it never rewrites the rest of
+/// an error's text.
+pub fn dummy_storage() -> StorageBackend {
+    StorageBackend::S3(StorageProps {
+        endpoint: "http://localhost:9000".into(),
+        region: "us-east-1".into(),
+        access_key: "k".into(),
+        secret_key: "SECRETKEY".into(),
+        allow_http: true,
+        ..Default::default()
+    })
+}
+
+pub fn file_url(path: &std::path::Path) -> String {
+    url::Url::from_file_path(path)
+        .expect("absolute path")
+        .to_string()
+}
+
+/// A directory URL with the trailing slash a table root needs.
+pub fn dir_url(path: &std::path::Path) -> String {
+    let mut url = file_url(path);
+    if !url.ends_with('/') {
+        url.push('/');
+    }
+    url
+}
 
 /// The production resolution of a spec whose storage values are all inline.
 pub fn resolved_storage(spec: &ScanSpec) -> ResolvedScanStorage {

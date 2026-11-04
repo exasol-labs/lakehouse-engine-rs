@@ -1,5 +1,6 @@
 use crate::scan_fixture;
 use crate::scan_fixture::WithFiles;
+use crate::scan_fixture::{block_on, dummy_storage};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,7 +20,6 @@ use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, DeleteMechanism, FileEntry, LogicalField, ScanSpec, ScanStorage,
-    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, run_raw_scan_with_session,
@@ -159,17 +159,6 @@ impl ObjectStore for CountingHeadStore {
     ) -> object_store::Result<()> {
         self.inner.copy_opts(from, to, options).await
     }
-}
-
-fn dummy_storage() -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: "http://localhost:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "k".into(),
-        secret_key: "s".into(),
-        allow_http: true,
-        ..Default::default()
-    })
 }
 
 fn raw_spec(files: Vec<(String, u64)>, table_root: String) -> ScanSpec {
@@ -478,14 +467,6 @@ impl ObjectStore for RequestLoggingStore {
     ) -> object_store::Result<()> {
         self.inner.copy_opts(from, to, options).await
     }
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
 }
 
 async fn run_scan_with_store(

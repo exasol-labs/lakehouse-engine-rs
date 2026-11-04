@@ -1,5 +1,6 @@
 use crate::scan_fixture;
 use crate::scan_fixture::WithFiles;
+use crate::scan_fixture::{block_on, file_url, total_rows};
 
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
@@ -28,24 +29,6 @@ use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::file::properties::WriterProperties;
 
 use crate::scan_plan_shape::sum_row_groups_pruned;
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
-}
-
-fn total_rows(batches: &[RecordBatch]) -> usize {
-    batches.iter().map(|b| b.num_rows()).sum()
-}
-
-fn file_url(path: &std::path::Path) -> String {
-    url::Url::from_file_path(path)
-        .expect("absolute path")
-        .to_string()
-}
 
 fn sized(url: String) -> (String, u64) {
     let len = std::fs::metadata(url.strip_prefix("file://").unwrap_or(&url))

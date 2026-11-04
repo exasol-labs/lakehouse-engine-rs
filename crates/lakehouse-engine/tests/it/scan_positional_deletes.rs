@@ -1,6 +1,7 @@
 use crate::scan_fixture;
 use crate::scan_fixture::WithFiles;
 use crate::scan_fixture::concurrency_probe::ConcurrencyProbe;
+use crate::scan_fixture::{block_on, dummy_storage, total_rows};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,7 +25,7 @@ use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, LogicalField, ProjectionItem,
-    ScanSpec, ScanStorage, StorageBackend, StorageProps,
+    ScanSpec, ScanStorage,
 };
 use lakehouse_engine::scan::{
     build_join_physical_plan, build_raw_scan_physical_plan, register_files,
@@ -44,17 +45,6 @@ use url::Url;
 /// Iceberg reserved field-ids; duplicated because the engine's constants are `pub(crate)`.
 const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2_147_483_546;
 const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
-
-fn dummy_storage() -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: "http://localhost:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "k".into(),
-        secret_key: "s".into(),
-        allow_http: true,
-        ..Default::default()
-    })
-}
 
 fn local_file_size(file_url: &str) -> u64 {
     let path = Url::parse(file_url)
@@ -181,14 +171,6 @@ fn scan_spec_with_logical_schema(
     .with_files(files)
 }
 
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
-}
-
 async fn try_run_scan_with_store(
     spec: &ScanSpec,
     register_url: &str,
@@ -240,10 +222,6 @@ fn ids_of(batches: &[RecordBatch]) -> Vec<i64> {
     }
     out.sort_unstable();
     out
-}
-
-fn total_rows(batches: &[RecordBatch]) -> usize {
-    batches.iter().map(|b| b.num_rows()).sum()
 }
 
 #[test]

@@ -5,6 +5,7 @@
 mod scan_fixture;
 
 use crate::scan_fixture::WithFiles;
+use crate::scan_fixture::{block_on, dummy_storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -24,7 +25,6 @@ use lakehouse_engine::scan::diagnostics::{
 };
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, DeleteMechanism, FileEntry, LogicalField, ScanSpec, ScanStorage,
-    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     ResolvedScanStorage, run_raw_scan_with_session, run_scan_one, session_config_for_spec,
@@ -141,17 +141,6 @@ impl ObjectStore for RequestLoggingStore {
     }
 }
 
-fn dummy_storage() -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: "http://localhost:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "k".into(),
-        secret_key: "s".into(),
-        allow_http: true,
-        ..Default::default()
-    })
-}
-
 /// A non-empty logical schema avoids schema inference, which would fetch and cache the footer
 /// before Phase B and make the request counts vacuous.
 fn raw_spec_with_logical_schema(table_root: String) -> ScanSpec {
@@ -253,14 +242,6 @@ fn data_key(abs_file_url: &str) -> ObjectStorePath {
         .expect("listing url")
         .prefix()
         .clone()
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
 }
 
 /// Counts bounded suffix GETs ending at `size` and wider than the 8-byte footer-length probe:

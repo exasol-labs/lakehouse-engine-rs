@@ -5,6 +5,7 @@
 use crate::scan_fixture;
 use crate::scan_fixture::WithFiles;
 use crate::scan_fixture::concurrency_probe::ConcurrencyProbe;
+use crate::scan_fixture::{block_on, dir_url, dummy_storage, file_url, total_rows};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,6 @@ use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, DeleteMechanism, DeltaDeletionVectorStorage, FileEntry, ScanSpec, ScanStorage,
-    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{register_files, run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
@@ -55,20 +55,6 @@ const INLINE_PAYLOAD: &str = "^Bg9^0rr910000000000iXQKl0rr91000315c8Xg000r9";
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../scripts/unity/fixtures/table-with-dv-small")
-}
-
-fn file_url(path: &Path) -> String {
-    Url::from_file_path(path)
-        .expect("absolute path")
-        .to_string()
-}
-
-fn dir_url(path: &Path) -> String {
-    let mut url = file_url(path);
-    if !url.ends_with('/') {
-        url.push('/');
-    }
-    url
 }
 
 fn file_size(path: &Path) -> u64 {
@@ -122,17 +108,6 @@ fn inline_deletion_vector() -> DeleteMechanism {
     }
 }
 
-fn dummy_storage() -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: "http://localhost:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "k".into(),
-        secret_key: "SECRETKEY".into(),
-        allow_http: true,
-        ..Default::default()
-    })
-}
-
 fn scan_spec(
     files: Vec<FileEntry>,
     table_root: &str,
@@ -149,14 +124,6 @@ fn scan_spec(
         ..Default::default()
     }
     .with_files(files)
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
 }
 
 async fn try_run_scan_with_store(
@@ -205,10 +172,6 @@ fn values_of(batches: &[RecordBatch]) -> Vec<i32> {
     }
     out.sort_unstable();
     out
-}
-
-fn total_rows(batches: &[RecordBatch]) -> usize {
-    batches.iter().map(|b| b.num_rows()).sum()
 }
 
 /// Scenario: A UUID-relative deletion vector removes exactly its flagged rows

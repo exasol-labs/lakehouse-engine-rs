@@ -2,6 +2,7 @@
 
 use crate::scan_fixture;
 use crate::scan_fixture::WithFiles;
+use crate::scan_fixture::{block_on, dummy_storage};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,22 +15,10 @@ use exasol_udf_sdk::value::ExaType;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ScanSpec, ScanStorage,
-    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
 use parquet::arrow::ArrowWriter;
-
-fn dummy_storage() -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: "http://localhost:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "k".into(),
-        secret_key: "s".into(),
-        allow_http: true,
-        ..Default::default()
-    })
-}
 
 /// Neither column carries `PARQUET:field_id`. `id` holds `0..rows`, the other `10 * id`.
 fn write_local_parquet_two_int_cols(
@@ -105,14 +94,6 @@ fn logical_schema() -> Vec<LogicalField> {
             physical_name: None,
         },
     ]
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
 }
 
 async fn run_scan(spec: &ScanSpec, register_url: &str) -> Result<Vec<RecordBatch>, String> {
