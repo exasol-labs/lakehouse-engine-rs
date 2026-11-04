@@ -9,7 +9,7 @@ use exasol_udf_sdk::error::UdfError;
 use crate::scan::diagnostics;
 use crate::scan::spec::{ColumnRef, JoinSpec, ProjectionItem, ScanSpec};
 use crate::scan::storage_ref::ResolvedScanStorage;
-use crate::types::mapping::{ExaTypeClass, arrow_to_exasol_type, classify_exa_type};
+use crate::types::mapping::arrow_to_exasol_type;
 
 use super::raw_scan::{
     delete_path_read_limiter, emit_dataframe, physical_plan, plan_sql, register_file_list,
@@ -229,7 +229,7 @@ fn render_join_sort_target(
         Some(DataType::Float32 | DataType::Float64) => {
             format!("CASE WHEN isnan({emitted}) THEN NULL ELSE {emitted} END")
         }
-        Some(dt) if classify_exa_type(&arrow_to_exasol_type(dt)) == ExaTypeClass::Character => {
+        Some(dt) if arrow_to_exasol_type(dt).is_character() => {
             format!("nullif({emitted}, '')")
         }
         _ => emitted,

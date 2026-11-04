@@ -1,9 +1,8 @@
-use super::super::BinaryColumns;
 use super::super::single_group_agg::{single_group_merge_select, single_group_plan_types};
+use super::super::support::projection_items;
 use super::super::support::{
-    AggregateMergeInputs, ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME,
-    build_scan_driving_sql, classify_where_filter, extract_projection, involved_columns,
-    order_by_present, shard_count,
+    AggregateMergeInputs, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, build_scan_driving_sql,
+    classify_where_filter, involved_columns, order_by_present, project_columns, shard_count,
 };
 use super::super::test_support::*;
 use super::super::{detect_aggregates, ordinary_plans, validate_agg_col_types};
@@ -17,16 +16,15 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
         .get("pushdownRequest")
         .cloned()
         .unwrap_or(Json::Null);
-    let (mut proj_cols, mut proj_types, widened) =
-        extract_projection(request, &pushdown_req).unwrap();
+    let (mut projection, widened) =
+        project_columns(&pushdown_req, &first_table_column_types(request)).unwrap();
     let limit = extract_limit(&pushdown_req);
     let has_order_by = order_by_present(&pushdown_req);
     let col_types = involved_columns(request, |tables| tables.first()).types;
     // Covers only the no-decline half; a declining fixture belongs on `build_dispatch_sql`.
     let (filter, declined_filter) = classify_where_filter(
         pushdown_req.get("filter").filter(|f| !f.is_null()),
-        &ColumnTypes::unqualified(&col_types),
-        &BinaryColumns::default(),
+        &column_types(&col_types),
     );
     assert!(
         declined_filter.is_none(),
@@ -34,7 +32,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     );
 
     let items = detect_aggregates(&pushdown_req)
-        .filter(|it| validate_agg_col_types(&ordinary_plans(it), &col_types));
+        .filter(|it| validate_agg_col_types(&ordinary_plans(it), &column_types(&col_types)));
     let merge_inputs = items.as_deref().map(|it| {
         let plans = ordinary_plans(it);
         let plan_types = single_group_plan_types(&pushdown_req, it);
@@ -52,7 +50,12 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     );
     let logical_schema = lineitem_logical_schema();
     let topn = if aggregates.is_none() {
-        detect_topn(request, &pushdown_req, &proj_cols, &logical_schema)
+        detect_topn(
+            request,
+            &pushdown_req,
+            &projection_items(&projection),
+            &logical_schema,
+        )
     } else {
         None
     };
@@ -66,19 +69,20 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     // Position is load-bearing, as in `build_dispatch_sql`: after `detect_topn` (which
     // must see the pre-extension projection), before `spec_template` (whose projection
     // must carry the hidden column).
-    let visible_count = proj_cols.len();
+    let visible_count = projection.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
         let keys = parse_order_by_keys(&pushdown_req);
         // Mirrors the dispatcher's guard (#198); a declining fixture belongs on `build_dispatch_sql`.
         ensure_every_sort_key_renders(&keys)
             .expect("plan_scan_sql mirrors only fixtures whose pushed ORDER BY renders in full");
-        extend_projection_with_sort_keys(&mut proj_cols, &mut proj_types, &keys, &col_types);
+        extend_projection_with_sort_keys(&mut projection, &keys, &column_types(&col_types));
         keys
     } else {
         Vec::new()
     };
 
+    let proj_cols = projection_items(&projection);
     let spec_template = CommonScanSpec {
         projection: proj_cols.clone(),
         filter,
@@ -95,10 +99,9 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let sql = build_scan_driving_sql(
         &spec_template,
         &shards,
-        &proj_cols,
-        &proj_types,
+        &projection,
         effective_limit,
-        &col_types,
+        &column_types(&col_types),
         merge_inputs.as_ref(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,

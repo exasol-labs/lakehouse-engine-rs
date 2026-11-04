@@ -5,6 +5,7 @@ use crate::scan::spec::{
     StorageProps,
 };
 use crate::scan::test_support::WithFiles;
+use crate::types::exasol_type::ExasolType;
 
 // The vended sentinels below repeat the literal values `lakehouse-catalog`'s own
 // `test_support` uses, so both crates' assertions stay comparable.
@@ -170,7 +171,7 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
 
 #[test]
 fn where_filter_decimal_stringification_rewritten_to_trim() {
-    let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
+    let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
     let filter_json = serde_json::json!({
         "type": "predicate_greater",
         "left": {
@@ -182,7 +183,7 @@ fn where_filter_decimal_stringification_rewritten_to_trim() {
     });
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
+        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
         .and_then(|f| render_df_filter_safe(&f))
         .expect("LENGTH(decimal) > 5 must render to a DataFusion filter");
 
@@ -201,7 +202,7 @@ fn where_filter_decimal_stringification_rewritten_to_trim() {
 
 #[test]
 fn filter_decimal_comparison_not_rewritten() {
-    let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
+    let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
     let filter_json = serde_json::json!({
         "type": "predicate_greater",
         "left": col("c_decimal_a"),
@@ -209,7 +210,7 @@ fn filter_decimal_comparison_not_rewritten() {
     });
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
+        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
         .and_then(|f| render_df_filter_safe(&f))
         .expect("c_decimal_a > 5 must render to a DataFusion filter");
 
@@ -225,7 +226,7 @@ fn filter_decimal_comparison_not_rewritten() {
 
 #[test]
 fn where_filter_string_fn_under_comparison_predicate_coerced() {
-    let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
+    let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
     let filter_json = predicate_equal(
         serde_json::json!({
             "type": "function_scalar",
@@ -236,7 +237,7 @@ fn where_filter_string_fn_under_comparison_predicate_coerced() {
     );
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
+        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
         .and_then(|f| render_df_filter_safe(&f))
         .expect("UPPER(decimal) = 'X' must render to a DataFusion filter");
 
@@ -249,7 +250,7 @@ fn where_filter_string_fn_under_comparison_predicate_coerced() {
 
 #[test]
 fn where_filter_string_fn_over_double_declines() {
-    let col_types = vec![("C_DOUBLE_A".to_string(), "DOUBLE PRECISION".to_string())];
+    let col_types = vec![("C_DOUBLE_A".to_string(), ExasolType::DoublePrecision)];
     let filter_json = predicate_equal(
         serde_json::json!({
             "type": "function_scalar",
@@ -260,7 +261,7 @@ fn where_filter_string_fn_over_double_declines() {
     );
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
+        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
         .and_then(|f| render_df_filter_safe(&f));
 
     assert!(
@@ -272,7 +273,7 @@ fn where_filter_string_fn_over_double_declines() {
 
 #[test]
 fn where_filter_upper_decimal_inside_like_subject_coerced() {
-    let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
+    let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
     let filter_json = serde_json::json!({
         "type": "predicate_like",
         "expression": {
@@ -284,7 +285,7 @@ fn where_filter_upper_decimal_inside_like_subject_coerced() {
     });
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
+        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
         .and_then(|f| render_df_filter_safe(&f))
         .expect("UPPER(decimal) LIKE '1%' must render to a DataFusion filter");
 
@@ -298,7 +299,7 @@ fn where_filter_upper_decimal_inside_like_subject_coerced() {
 
 #[test]
 fn where_filter_like_decimal_inside_case_declines_whole_filter() {
-    let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
+    let col_types = vec![("AMOUNT".to_string(), ExasolType::decimal(9, 2))];
     let filter_json = predicate_equal(
         serde_json::json!({
             "type": "function_scalar_case",
@@ -319,7 +320,7 @@ fn where_filter_like_decimal_inside_case_declines_whole_filter() {
     );
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &ColumnTypes::unqualified(&col_types)))
+        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
         .and_then(|f| render_df_filter_safe(&f));
 
     assert!(
@@ -729,12 +730,12 @@ fn iceberg_declaration_default_less_spec_round_trips_unchanged() {
     );
 }
 
-fn guard_col_types() -> Vec<(String, String)> {
+fn guard_col_types() -> Vec<(String, ExasolType)> {
     vec![
-        ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
-        ("NAME".to_string(), "VARCHAR(2000000)".to_string()),
-        ("AMOUNT".to_string(), "DECIMAL(18,2)".to_string()),
-        ("ID".to_string(), "DECIMAL(20,0)".to_string()),
+        ("REGION".to_string(), ExasolType::WIDEST_VARCHAR),
+        ("NAME".to_string(), ExasolType::WIDEST_VARCHAR),
+        ("AMOUNT".to_string(), ExasolType::decimal(18, 2)),
+        ("ID".to_string(), ExasolType::decimal(20, 0)),
     ]
 }
 
@@ -757,7 +758,7 @@ fn guard_events_request(pushdown_req: Json) -> Json {
 fn guard_dispatch_sql(
     request: &Json,
     proj_cols: Vec<ProjectionItem>,
-    proj_types: Vec<String>,
+    proj_types: Vec<ExasolType>,
     projection_widened: bool,
     limit: Option<u64>,
     logical_schema: Vec<LogicalField>,
@@ -781,7 +782,7 @@ fn guard_dispatch_sql(
 fn guard_dispatch_result(
     request: &Json,
     proj_cols: Vec<ProjectionItem>,
-    proj_types: Vec<String>,
+    proj_types: Vec<ExasolType>,
     projection_widened: bool,
     limit: Option<u64>,
     logical_schema: Vec<LogicalField>,
@@ -791,10 +792,9 @@ fn guard_dispatch_result(
     build_dispatch_sql(
         request,
         &pushdown_req,
-        proj_cols,
-        proj_types,
+        projected_columns(&proj_cols, &proj_types),
         projection_widened,
-        guard_col_types(),
+        &column_types(&guard_col_types()),
         None,
         None,
         limit,
@@ -833,19 +833,17 @@ fn dispatch_sql_for_body(pushdown_req_body: Json) -> String {
     let pushdown_req = pd(&request);
     let col_types = guard_col_types();
     let (proj_cols, proj_types, projection_widened) =
-        extract_projection(&request, &pushdown_req).expect("the fixture must project");
+        project_first_table(&request, &pushdown_req).expect("the fixture must project");
     let (filter, declined_filter) = classify_where_filter(
         pushdown_req.get("filter").filter(|f| !f.is_null()),
-        &ColumnTypes::unqualified(&col_types),
-        &BinaryColumns::default(),
+        &column_types(&col_types),
     );
     let result = build_dispatch_sql(
         &request,
         &pushdown_req,
-        proj_cols,
-        proj_types,
+        projected_columns(&proj_cols, &proj_types),
         projection_widened,
-        col_types,
+        &column_types(&col_types),
         filter,
         declined_filter,
         extract_limit(&pushdown_req),
@@ -939,11 +937,8 @@ fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
 #[test]
 fn trivially_true_filter_omitted_without_wrapper() {
     let trivially_true = bool_lit(true);
-    let (filter, declined) = classify_where_filter(
-        Some(&trivially_true),
-        &ColumnTypes::unqualified(&guard_col_types()),
-        &BinaryColumns::default(),
-    );
+    let (filter, declined) =
+        classify_where_filter(Some(&trivially_true), &column_types(&guard_col_types()));
     assert!(
         filter.is_none() && declined.is_none(),
         "a trivially-true filter is neither pushed nor declined: {filter:?} {declined:?}"
@@ -1086,22 +1081,18 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
         ],
     });
     let col_types = vec![
-        ("ID".to_string(), "DECIMAL(20,0)".to_string()),
-        ("TS".to_string(), "TIMESTAMP".to_string()),
-        ("AMOUNT".to_string(), "DECIMAL(18,2)".to_string()),
+        ("ID".to_string(), ExasolType::decimal(20, 0)),
+        ("TS".to_string(), ExasolType::Timestamp { precision: None }),
+        ("AMOUNT".to_string(), ExasolType::decimal(18, 2)),
     ];
     assert_ne!(
-        apply_type_rewrites(&filter, &ColumnTypes::unqualified(&col_types)).as_ref(),
+        apply_type_rewrites(&filter, &column_types(&col_types)).as_ref(),
         Some(&filter),
         "fixture precondition: the type rewrites must CHANGE this tree, so the \
              assertion below can tell the original from the rewritten one"
     );
 
-    let (scan_filter, declined) = classify_where_filter(
-        Some(&filter),
-        &ColumnTypes::unqualified(&col_types),
-        &BinaryColumns::default(),
-    );
+    let (scan_filter, declined) = classify_where_filter(Some(&filter), &column_types(&col_types));
 
     assert!(
         scan_filter.is_none(),
@@ -1138,7 +1129,7 @@ fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
     let proj_cols = vec![ProjectionItem::Expr {
         expr: "1".to_string(),
     }];
-    let proj_types = vec!["DECIMAL(1,0)".to_string()];
+    let proj_types = vec![ExasolType::decimal(1, 0)];
 
     let sql = guard_dispatch_sql(&request, proj_cols, proj_types, false, Some(10), Vec::new());
 
@@ -1178,7 +1169,7 @@ fn declined_order_by_wrapper_selects_only_original_select_list() {
         }]
     }));
     let proj_cols = vec![ProjectionItem::from("NAME")];
-    let proj_types = vec!["VARCHAR(2000000)".to_string()];
+    let proj_types = vec![ExasolType::WIDEST_VARCHAR];
 
     let sql = guard_dispatch_sql(&request, proj_cols, proj_types, false, None, Vec::new());
 
@@ -1227,7 +1218,7 @@ fn declined_order_by_dedupes_repeated_and_projected_sort_keys() {
         ]
     }));
     let proj_cols = vec![ProjectionItem::from("NAME")];
-    let proj_types = vec!["VARCHAR(2000000)".to_string()];
+    let proj_types = vec![ExasolType::WIDEST_VARCHAR];
 
     let sql = guard_dispatch_sql(&request, proj_cols, proj_types, false, None, Vec::new());
 
@@ -1268,7 +1259,7 @@ fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
         "limit": {"numElements": 5}
     }));
     let proj_cols = vec![ProjectionItem::from("NAME")];
-    let proj_types = vec!["VARCHAR(2000000)".to_string()];
+    let proj_types = vec![ExasolType::WIDEST_VARCHAR];
     let logical_schema = vec![LogicalField {
         field_id: Some(2),
         name: "NAME".to_string(),
@@ -1326,7 +1317,7 @@ fn nonzero_offset_nulls_the_effective_limit() {
         "limit": {"numElements": 5, "offset": 2}
     }));
     let proj_cols = vec![ProjectionItem::from("NAME")];
-    let proj_types = vec!["VARCHAR(2000000)".to_string()];
+    let proj_types = vec![ExasolType::WIDEST_VARCHAR];
     let logical_schema = vec![LogicalField {
         field_id: Some(2),
         name: "NAME".to_string(),
@@ -1380,7 +1371,7 @@ fn declined_order_by_extension_runs_after_topn_detection() {
     let proj_cols = vec![ProjectionItem::Expr {
         expr: "1".to_string(),
     }];
-    let proj_types = vec!["DECIMAL(1,0)".to_string()];
+    let proj_types = vec![ExasolType::decimal(1, 0)];
     // A non-JSON-fallback type, so that guard cannot be what declines the top-N.
     let logical_schema = vec![LogicalField {
         field_id: Some(2),
@@ -1468,7 +1459,7 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
         let err = guard_dispatch_result(
             &request,
             vec![ProjectionItem::from("NAME")],
-            vec!["VARCHAR(2000000)".to_string()],
+            vec![ExasolType::WIDEST_VARCHAR],
             false,
             Some(7),
             Vec::new(),
@@ -1501,7 +1492,7 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
     let sql = guard_dispatch_sql(
         &unordered,
         vec![ProjectionItem::from("NAME")],
-        vec!["VARCHAR(2000000)".to_string()],
+        vec![ExasolType::WIDEST_VARCHAR],
         false,
         Some(7),
         Vec::new(),
@@ -1589,14 +1580,14 @@ fn widening_arity_coincidence_request() -> Json {
     }))
 }
 
-fn widening_arity_coincidence_projection() -> (Vec<ProjectionItem>, Vec<String>) {
+fn widening_arity_coincidence_projection() -> (Vec<ProjectionItem>, Vec<ExasolType>) {
     let cols = guard_col_types()
         .into_iter()
         .map(|(name, ty)| (ProjectionItem::from(name), ty))
         .collect::<Vec<_>>();
     (
         cols.iter().map(|(c, _)| c.clone()).collect(),
-        cols.iter().map(|(_, t)| t.clone()).collect(),
+        cols.iter().map(|(_, t)| *t).collect(),
     )
 }
 
@@ -2248,14 +2239,13 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
     let request = guard_events_request(serde_json::json!({"type": "select"}));
     let pushdown_req = pd(&request);
     let (proj_cols, proj_types, widened) =
-        extract_projection(&request, &pushdown_req).expect("the EVENTS fixture must project");
+        project_first_table(&request, &pushdown_req).expect("the EVENTS fixture must project");
     let result = build_dispatch_sql(
         &request,
         &pushdown_req,
-        proj_cols,
-        proj_types,
+        projected_columns(&proj_cols, &proj_types),
         widened,
-        guard_col_types(),
+        &column_types(&guard_col_types()),
         None,
         None,
         None,
@@ -2297,6 +2287,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         partition_columns: Vec::new(),
         total_bytes: 100,
         refused_columns: Vec::new(),
+        column_types: ColumnTypes::default(),
     };
     let dimension = ResolvedJoinSide {
         table_name: "CUSTOMER".to_string(),
@@ -2309,14 +2300,15 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         partition_columns: vec!["REGION".to_string()],
         total_bytes: 10,
         refused_columns: Vec::new(),
+        column_types: ColumnTypes::default(),
     };
     let sides = broadcast_sides(fact, dimension, 1);
     let rendered = rendered_join(
         "\"LHS_T0\".\"CUSTOMER_KEY\" = \"LHS_T1\".\"CUSTOMER_KEY\"",
-        &[(
-            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "CUSTOMER_KEY")),
-            "DECIMAL(20,0)",
-        )],
+        &[ProjectedColumn {
+            item: ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "CUSTOMER_KEY")),
+            exa_type: ExasolType::decimal(20, 0),
+        }],
     );
     let tuning = super::joins::JoinScanRequestConfig {
         cluster_nodes: 1,
@@ -2397,7 +2389,7 @@ fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
     let sql = guard_dispatch_sql(
         &request,
         vec![ProjectionItem::from("NAME")],
-        vec!["VARCHAR(2000000)".to_string()],
+        vec![ExasolType::WIDEST_VARCHAR],
         false,
         None,
         Vec::new(),
@@ -2425,7 +2417,7 @@ fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
     let sql = guard_dispatch_sql(
         &request,
         vec![ProjectionItem::from("NAME")],
-        vec!["VARCHAR(2000000)".to_string()],
+        vec![ExasolType::WIDEST_VARCHAR],
         false,
         None,
         Vec::new(),
@@ -2454,7 +2446,7 @@ fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     let sql = guard_dispatch_sql(
         &request,
         vec![ProjectionItem::from("NAME")],
-        vec!["VARCHAR(2000000)".to_string()],
+        vec![ExasolType::WIDEST_VARCHAR],
         false,
         None,
         Vec::new(),
@@ -2483,7 +2475,7 @@ fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
     let sql = guard_dispatch_sql(
         &request,
         vec![ProjectionItem::from("NAME")],
-        vec!["VARCHAR(2000000)".to_string()],
+        vec![ExasolType::WIDEST_VARCHAR],
         false,
         None,
         Vec::new(),
@@ -2515,7 +2507,7 @@ fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     let sql = guard_dispatch_sql(
         &request,
         vec![ProjectionItem::from("REGION")],
-        vec!["VARCHAR(10)".to_string()],
+        vec![ExasolType::varchar(10)],
         false,
         None,
         Vec::new(),
@@ -2547,7 +2539,7 @@ fn order_by_on_a_char_declared_group_key_still_resolves_to_its_output_ordinal() 
     let sql = guard_dispatch_sql(
         &request,
         vec![ProjectionItem::from("NAME")],
-        vec!["VARCHAR(2000000)".to_string()],
+        vec![ExasolType::WIDEST_VARCHAR],
         false,
         None,
         Vec::new(),
@@ -2809,19 +2801,17 @@ fn dispatch_result_for_body(
     let pushdown_req = pd(&request);
     let col_types = guard_col_types();
     let (proj_cols, proj_types, projection_widened) =
-        extract_projection(&request, &pushdown_req).expect("the fixture must project");
+        project_first_table(&request, &pushdown_req).expect("the fixture must project");
     let (filter, declined_filter) = classify_where_filter(
         pushdown_req.get("filter").filter(|f| !f.is_null()),
-        &ColumnTypes::unqualified(&col_types),
-        &BinaryColumns::default(),
+        &column_types(&col_types),
     );
     let result = build_dispatch_sql(
         &request,
         &pushdown_req,
-        proj_cols,
-        proj_types,
+        projected_columns(&proj_cols, &proj_types),
         projection_widened,
-        col_types,
+        &column_types(&col_types),
         filter,
         declined_filter,
         extract_limit(&pushdown_req),

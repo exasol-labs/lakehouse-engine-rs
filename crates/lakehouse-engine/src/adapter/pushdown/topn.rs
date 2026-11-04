@@ -1,11 +1,11 @@
-use crate::scan::spec::{LogicalField, ProjectionItem, SortKey, render_ordered};
+use crate::scan::spec::{ColumnRef, LogicalField, ProjectionItem, SortKey, render_ordered};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::render_expression_exasol_safe;
 
 use super::support::{
-    collect_all_column_names, column_node_ref, emits_ident, extract_limit, extract_offset,
-    render_limit_offset,
+    ColumnTypes, ProjectedColumn, collect_all_column_names, column_node_ref, emits_ident,
+    extract_limit, extract_offset, render_limit_offset,
 };
 
 /// Bare `column` nodes only: per-shard bounded top-N is eligible for bare columns
@@ -210,25 +210,26 @@ pub(super) fn detect_topn(
 ///
 /// Append-only keeps every original index, so positional `_LH_PROJ_{i}` aliases
 /// stay aligned. Each column is appended at most once (a duplicate EMITS identifier
-/// is an error). `proj_cols` and `proj_types` stay in lockstep.
+/// is an error).
 pub(super) fn extend_projection_with_sort_keys(
-    proj_cols: &mut Vec<ProjectionItem>,
-    proj_types: &mut Vec<String>,
+    projection: &mut Vec<ProjectedColumn>,
     keys: &[ParsedSortKey],
-    col_types: &[(String, String)],
+    col_types: &ColumnTypes,
 ) {
     for column in keys.iter().flat_map(ParsedSortKey::referenced_columns) {
-        let already_emitted = proj_cols.iter().any(
-            |p| matches!(p, ProjectionItem::Column(c) if c.relation.is_none() && c.name == column),
-        );
+        let already_emitted = projection.iter().any(|projected| {
+            matches!(&projected.item, ProjectionItem::Column(c) if c.relation.is_none() && c.name == column)
+        });
         if already_emitted {
             continue;
         }
-        let Some((name, exa_type)) = col_types.iter().find(|(name, _)| name == column) else {
+        let Some(column_type) = col_types.get(&ColumnRef::from(column)) else {
             continue;
         };
-        proj_cols.push(ProjectionItem::from(name.clone()));
-        proj_types.push(exa_type.clone());
+        projection.push(ProjectedColumn {
+            item: ProjectionItem::from(column),
+            exa_type: column_type.exa_type,
+        });
     }
 }
 

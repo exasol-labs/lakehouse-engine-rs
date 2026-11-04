@@ -28,17 +28,14 @@ pub(crate) use sql_builders::{RenderedJoinPushdown, render_broadcast_join};
 pub(super) use sql_builders::{EmptyRelation, qualified_single_table_fallback_pushdown};
 #[cfg(test)]
 pub(super) use sql_builders::{
-    FanOutProjection, build_qualified_single_table_fallback_sql, referenced_column_projection,
+    FanOutProjection, build_qualified_single_table_fallback_sql, referenced_columns,
 };
 
 pub(super) use planning::JoinWindowPlan;
 use planning::{
-    classify_join_window, involved_table, involved_table_columns, resolve_one_join_side,
-    select_broadcast_sides,
+    classify_join_window, involved_table, resolve_one_join_side, select_broadcast_sides,
 };
-use rendering::{
-    has_no_explicit_select_list, leg_binary_columns, leg_local_filter, possible_side_column_names,
-};
+use rendering::{has_no_explicit_select_list, leg_local_filter, possible_side_column_names};
 // `pub(super)` so the `#[cfg(test)]` dispatch-golden sibling module can drive both builders.
 pub(super) use sql_builders::{
     JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql,
@@ -86,9 +83,9 @@ fn ensure_no_side_refuses_a_referenced_column(
         let mut touched = possible_side_column_names(request, &side.table_name);
         if emits_unnamed_row {
             touched.extend(
-                involved_table_columns(request, &side.table_name)
-                    .into_iter()
-                    .map(|(name, _)| name),
+                side.column_types
+                    .iter()
+                    .map(|(column, _)| column.name.clone()),
             );
         }
         ensure_no_touched_column_is_refused(&touched, &side.refused_columns)?;
@@ -156,24 +153,21 @@ pub(super) async fn plan_join(
     let side_filters: Vec<Option<Json>> = (0..join.tables.len())
         .map(|leg| filter.and_then(|f| leg_local_filter(f, &legs, leg)))
         .collect();
-    let (side_columns, side_notes): (Vec<Vec<(String, String)>>, Vec<_>) = join
+    let involved: Vec<_> = join
         .tables
         .iter()
-        .map(|leaf| {
-            let involved = involved_table(request, &leaf.table_name);
-            (involved.types, involved.notes)
-        })
-        .unzip();
+        .map(|leaf| involved_table(request, &leaf.table_name))
+        .collect();
     // `try_join_all` preserves leg order, which later steps index by.
     let sides: Vec<ResolvedJoinSide> =
-        try_join_all(join.tables.iter().zip(&side_filters).zip(&side_notes).map(
-            |((leaf, side_filter), notes)| {
+        try_join_all(join.tables.iter().zip(&side_filters).zip(&involved).map(
+            |((leaf, side_filter), involved)| {
                 resolve_one_join_side(
                     &leaf.table_name,
                     &leaf.table_identifier,
                     &resolver,
                     side_filter.as_ref(),
-                    notes,
+                    involved,
                 )
             },
         ))
@@ -182,16 +176,15 @@ pub(super) async fn plan_join(
     ensure_no_side_refuses_a_referenced_column(request, pushdown_req, &sides)?;
 
     if sides.iter().any(|s| s.files.is_empty()) {
-        let combined = side_columns.concat();
-        let (proj_cols, proj_types, widened) =
-            project_columns(pushdown_req, &ColumnTypes::unqualified(&combined))?;
+        let combined = ColumnTypes::concat(sides.iter().map(|side| &side.column_types));
+        let (projection, widened) = project_columns(pushdown_req, &combined)?;
+        let cols_per_leg = sides.iter().map(|side| side.column_types.clone()).collect();
         return empty_result_sql(
             pushdown_req,
-            &proj_cols,
-            &proj_types,
+            &projection,
             widened,
             &combined,
-            &EmptyRelation::join(join, side_columns),
+            &EmptyRelation::join(join, cols_per_leg),
         );
     }
 
@@ -220,10 +213,8 @@ pub(super) async fn plan_join(
     if join.tables.len() == 2 && is_equi && !matches!(window, JoinWindowPlan::ExasolPostProcessed) {
         let candidate =
             select_broadcast_sides(sides[0].clone(), sides[1].clone(), join_broadcast_max_bytes);
-        let binary_columns = leg_binary_columns(&sides, &legs, inputs.binary_as_string);
         if candidate.broadcast_eligible
-            && let Some(rendered) =
-                render_broadcast_join(request, pushdown_req, join, &binary_columns)?
+            && let Some(rendered) = render_broadcast_join(pushdown_req, join, &sides)?
             && let Some(sql) = build_broadcast_join_sql(
                 &candidate,
                 &rendered,
@@ -237,7 +228,6 @@ pub(super) async fn plan_join(
     }
 
     let sql = build_n_scan_join_sql(
-        request,
         pushdown_req,
         join,
         &sides,

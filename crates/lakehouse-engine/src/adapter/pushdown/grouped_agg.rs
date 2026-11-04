@@ -1,8 +1,9 @@
 use crate::scan::spec::{
-    AggKind, AggregatePlan, FileEntry, PartialAggColumn, ScanSpec, partial_column_name,
+    AggKind, AggregatePlan, ColumnRef, FileEntry, PartialAggColumn, ScanSpec, partial_column_name,
     render_ordered,
 };
-use crate::types::mapping::{exasol_type_from_json, parse_decimal_args};
+use crate::types::exasol_type::{ExasolType, MAX_DECIMAL_PRECISION};
+use crate::types::mapping::exasol_type_from_json;
 use serde_json::Value as Json;
 use vs_expression::render_expression;
 
@@ -11,7 +12,8 @@ use super::scalar_over_agg::{
     parse_agg_item, render_scalar_over_merge, with_stat_grand_means,
 };
 use super::support::{
-    build_fan_out_inner, cast_to_declared_type, declared_select_type, render_limit_offset,
+    ColumnTypes, build_fan_out_inner, cast_to_declared_type, declared_select_type,
+    render_limit_offset,
 };
 use super::topn::parse_sort_flags;
 
@@ -41,7 +43,7 @@ pub enum GroupedSelectItem {
     ScalarOverAggregate {
         select_index: usize,
         node: Json,
-        declared_type: String,
+        declared_type: ExasolType,
     },
 }
 
@@ -60,7 +62,7 @@ pub struct GroupedAggregateDetection {
     /// Deduplicated by `AggregatePlan` equality across top-level and nested occurrences.
     pub plans: Vec<AggregatePlan>,
     /// Aligned 1:1 with `plans`, not with the `selectList`.
-    pub plan_types: Vec<String>,
+    pub plan_types: Vec<ExasolType>,
     pub select_items: Vec<GroupedSelectItem>,
 }
 
@@ -70,10 +72,10 @@ fn constant_projection_sql(pushdown_req: &Json, select_index: usize, rendered: &
         .and_then(|v| v.as_array())
         .and_then(|d| d.get(select_index))
         .map(exasol_type_from_json);
-    cast_to_declared_type(rendered, declared.as_deref())
+    cast_to_declared_type(rendered, declared)
 }
 
-/// Shared by `detect_group_by_aggregates` and `extract_projection` so the two
+/// Shared by `detect_group_by_aggregates` and `project_columns` so the two
 /// lists cannot drift apart (#52).
 const LITERAL_SELECTLIST_TYPES: &[&str] = &[
     "literal_null",
@@ -188,11 +190,11 @@ pub(super) fn group_key_exasol_types(
     pushdown_req: &Json,
     group_keys: &[String],
     select_items: &[GroupedSelectItem],
-) -> Vec<String> {
+) -> Vec<ExasolType> {
     let declared_types = pushdown_req
         .get("selectListDataTypes")
         .and_then(|v| v.as_array());
-    let mut types: Vec<Option<String>> = vec![None; group_keys.len()];
+    let mut types: Vec<Option<ExasolType>> = vec![None; group_keys.len()];
     for item in select_items {
         if let GroupedSelectItem::GroupKey {
             group_key_slot,
@@ -217,7 +219,7 @@ pub(super) fn group_key_exasol_types(
     }
     types
         .into_iter()
-        .map(|ty| ty.unwrap_or_else(|| "VARCHAR(2000000)".to_string()))
+        .map(|ty| ty.unwrap_or(ExasolType::WIDEST_VARCHAR))
         .collect()
 }
 
@@ -234,13 +236,13 @@ pub(super) fn group_key_exasol_types(
 /// `vs-expression`; DataFusion-executing tests pin it.
 pub(super) fn blank_pad_char_group_keys(
     group_keys: &[String],
-    group_key_types: &[String],
+    group_key_types: &[ExasolType],
 ) -> Vec<String> {
     group_keys
         .iter()
         .enumerate()
         .map(
-            |(slot, fragment)| match group_key_types.get(slot).and_then(|ty| char_width(ty)) {
+            |(slot, fragment)| match group_key_types.get(slot).and_then(char_width) {
                 Some(width) => format!(
                     "CASE WHEN character_length({fragment}) < {width} \
                      THEN rpad({fragment}, {width}) ELSE {fragment} END"
@@ -251,15 +253,12 @@ pub(super) fn blank_pad_char_group_keys(
         .collect()
 }
 
-/// Reads the digits between the parentheses so `CHAR(3) ASCII` still yields a
-/// width; the anchored `CHAR(` prefix never matches `VARCHAR(n)`.
-fn char_width(declared_type: &str) -> Option<u32> {
-    declared_type
-        .strip_prefix("CHAR(")?
-        .split_once(')')?
-        .0
-        .parse()
-        .ok()
+/// `CHAR(3) ASCII` still yields a width; a `VARCHAR(n)` yields none.
+fn char_width(declared_type: &ExasolType) -> Option<u32> {
+    match declared_type {
+        ExasolType::Char { size, .. } => Some(*size),
+        _ => None,
+    }
 }
 
 /// Exasol does not re-sort a delegated `ORDER BY`, so the merge must sort itself.
@@ -324,20 +323,20 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
     shards: &[Vec<E>],
     group_keys: &[String],
-    group_key_types: &[String],
+    group_key_types: &[ExasolType],
     aggregates: &[AggregatePlan],
-    aggregate_types: &[String],
+    aggregate_types: &[ExasolType],
     select_items: &[GroupedSelectItem],
     limit: Option<u64>,
     offset: u64,
-    col_types: &[(String, String)],
+    col_types: &ColumnTypes,
     udf_name: &str,
     distribute_udf_name: &str,
     having: Option<&str>,
     order_by: Option<&str>,
 ) -> String {
     let gk_emits: Vec<String> = (0..group_keys.len())
-        .map(|i| format!(r#""GK_{i}" VARCHAR(2000000)"#))
+        .map(|i| format!(r#""GK_{i}" {}"#, ExasolType::WIDEST_VARCHAR))
         .collect();
     let partial_items = partial_emits_items(aggregates, col_types, aggregate_types);
     let all_emits: Vec<String> = gk_emits
@@ -349,12 +348,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
 
     // The scan stringifies group keys; cast back so result types match Exasol's.
     let gk_select: Vec<String> = (0..group_keys.len())
-        .map(|i| {
-            cast_to_declared_type(
-                &format!(r#""GK_{i}""#),
-                group_key_types.get(i).map(String::as_str),
-            )
-        })
+        .map(|i| cast_to_declared_type(&format!(r#""GK_{i}""#), group_key_types.get(i).copied()))
         .collect();
     let merge_items = cast_merge_items(aggregates, aggregate_types);
     let merged_partials = merge_select_items(aggregates);
@@ -376,7 +370,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
                 declared_type,
                 ..
             } => render_scalar_over_merge(node, aggregates, &merged_partials)
-                .map(|expr| cast_to_declared_type(&expr, Some(declared_type))),
+                .map(|expr| cast_to_declared_type(&expr, Some(*declared_type))),
         })
         .collect();
     let outer_select_str = outer_select.join(", ");
@@ -418,30 +412,32 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     sql
 }
 
+const PARTIAL_COUNT_TYPE: ExasolType = ExasolType::decimal(20, 0);
+
 /// Counts are DECIMAL(20,0); SUM widens DECIMAL(p,s) to DECIMAL(36,s) against
 /// overflow; AVG and stat sums are DOUBLE PRECISION (reconstructed in floating
 /// point); MIN/MAX use the argument's exact type.
 pub(super) fn partial_emits_items(
     aggregates: &[AggregatePlan],
-    col_types: &[(String, String)],
-    aggregate_types: &[String],
+    col_types: &ColumnTypes,
+    aggregate_types: &[ExasolType],
 ) -> Vec<String> {
     aggregates
         .iter()
         .enumerate()
         .flat_map(|(i, plan)| {
             // The sole type source for an expression-argument aggregate (no source column).
-            let declared = aggregate_types.get(i).map(String::as_str);
+            let declared = aggregate_types.get(i).copied();
             plan.kind.partial_columns().iter().map(move |col| {
                 let ty = match col {
                     PartialAggColumn::CountStar
                     | PartialAggColumn::CountArg
                     | PartialAggColumn::AvgCnt
-                    | PartialAggColumn::StatCnt => "DECIMAL(20,0)".to_string(),
+                    | PartialAggColumn::StatCnt => PARTIAL_COUNT_TYPE,
                     PartialAggColumn::AvgSum
                     | PartialAggColumn::StatMean
-                    | PartialAggColumn::StatM2 => "DOUBLE PRECISION".to_string(),
-                    PartialAggColumn::Sum => sum_emit_type(&col_type_for(
+                    | PartialAggColumn::StatM2 => ExasolType::DoublePrecision,
+                    PartialAggColumn::Sum => sum_emit_type(col_type_for(
                         plan.column.as_deref(),
                         plan.arg_expr.as_deref(),
                         col_types,
@@ -465,44 +461,32 @@ pub(super) fn partial_emits_items(
 pub(super) fn col_type_for(
     column: Option<&str>,
     arg_expr: Option<&str>,
-    col_types: &[(String, String)],
-    declared: Option<&str>,
-) -> String {
+    col_types: &ColumnTypes,
+    declared: Option<ExasolType>,
+) -> ExasolType {
     if column.is_none()
         && arg_expr.is_some()
         && let Some(ty) = declared
     {
-        return ty.to_string();
+        return ty;
     }
     column
-        .and_then(|col| {
-            col_types
-                .iter()
-                .find(|(n, _)| n == col)
-                .map(|(_, t)| t.clone())
+        .and_then(|col| col_types.get(&ColumnRef::from(col)))
+        .map_or(ExasolType::DoublePrecision, |column_type| {
+            column_type.exa_type
         })
-        .unwrap_or_else(|| "DOUBLE PRECISION".to_string())
 }
 
-/// Absent DECIMAL scale defaults to 0 per `parse_decimal_args`.
-fn sum_emit_type(col_ty: &str) -> String {
-    if col_ty == "DOUBLE PRECISION" {
-        return "DOUBLE PRECISION".to_string();
+fn sum_emit_type(col_ty: ExasolType) -> ExasolType {
+    match col_ty {
+        ExasolType::Decimal { scale, .. } => ExasolType::decimal(MAX_DECIMAL_PRECISION, scale),
+        _ => ExasolType::DoublePrecision,
     }
-    // No uppercasing: producers already emit uppercase, and adding one would change
-    // the answer for a lowercase input.
-    if let Some((_p, s)) = parse_decimal_args(col_ty) {
-        return format!("DECIMAL(36,{s})");
-    }
-    "DOUBLE PRECISION".to_string()
 }
 
 /// SUM and STDDEV/VARIANCE need a numeric target; `false` routes to a row scan. An
 /// expression-argument aggregate resolves to the numeric `DOUBLE PRECISION` default.
-pub fn validate_agg_col_types(
-    aggregates: &[AggregatePlan],
-    col_types: &[(String, String)],
-) -> bool {
+pub fn validate_agg_col_types(aggregates: &[AggregatePlan], col_types: &ColumnTypes) -> bool {
     for plan in aggregates {
         if plan.kind == AggKind::Sum || plan.kind.is_stat() {
             let ty = col_type_for(
@@ -511,16 +495,12 @@ pub fn validate_agg_col_types(
                 col_types,
                 None,
             );
-            if !is_numeric_exasol_type(&ty) {
+            if !matches!(ty, ExasolType::DoublePrecision | ExasolType::Decimal { .. }) {
                 return false;
             }
         }
     }
     true
-}
-
-fn is_numeric_exasol_type(ty: &str) -> bool {
-    ty == "DOUBLE PRECISION" || ty.starts_with("DECIMAL(")
 }
 
 /// The merge wrapper has only `GK_*`/`PARTIAL_*` columns, so each aggregate is

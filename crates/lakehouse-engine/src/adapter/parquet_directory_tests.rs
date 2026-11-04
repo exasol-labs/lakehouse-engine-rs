@@ -758,7 +758,7 @@ async fn nested_and_unrepresentable_types_fold_to_the_string_declaration() {
              {field:?}"
         );
         assert_eq!(
-            arrow_to_exasol_type(field.data_type()),
+            arrow_to_exasol_type(field.data_type()).to_string(),
             "VARCHAR(2000000)",
             "the engine's ONE existing Arrow classifier is what declares the column, so the \
              declared Exasol type and the logical Arrow tag stay in lockstep"

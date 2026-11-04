@@ -6,6 +6,7 @@ use crate::adapter::pushdown::ResolvedScan;
 use crate::adapter::pushdown::test_support::*;
 use crate::scan::spec::CatalogProps;
 use crate::scan::spec::{FileEntry, LogicalField, ProjectionItem};
+use crate::types::exasol_type::ExasolType;
 
 // Shared join fixtures, reached by each submodule's tests via `super::super::tests`.
 
@@ -209,17 +210,21 @@ pub(super) fn detected_join(request: &Json) -> DetectedJoin {
 
 /// The select list projected as `render_broadcast_join` projects it: every column qualified
 /// through the leg binding and typed by its own leg's universe, widened row included.
-pub(super) fn broadcast_projection(request: &Json) -> (Vec<ProjectionItem>, Vec<String>, bool) {
+pub(super) fn broadcast_projection(request: &Json) -> (Vec<ProjectionItem>, Vec<ExasolType>, bool) {
     let join = detected_join(request);
     let legs = join.legs();
     let qualified = legs
         .qualify(&pd(request))
         .expect("every fixture column belongs to one leg");
-    project_columns(
-        &qualified,
-        &rendering::leg_column_types(request, &join, &legs),
-    )
-    .expect("projectable")
+    let sides = request_sides(request, &join);
+    let leg_types = ColumnTypes::per_relation(
+        sides
+            .iter()
+            .enumerate()
+            .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
+    );
+    let (items, types, widened) = project_split(&qualified, &leg_types).expect("projectable");
+    (items, types, widened)
 }
 
 /// Derived through [`DetectedJoin::legs`], the only multi-leg constructor; conditions play
@@ -257,6 +262,7 @@ pub(super) fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> Resolv
             partition_columns: Vec::new(),
             refused_columns: Vec::new(),
         },
+        ColumnTypes::default(),
     )
 }
 

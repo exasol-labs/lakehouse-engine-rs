@@ -6,20 +6,21 @@ use serde_json::Value as Json;
 use vs_expression::{ColumnNode, render_expression, render_expression_exasol};
 
 use super::support::{cast_to_declared_type, quote_ident};
+use crate::types::exasol_type::ExasolType;
 
 /// Declared type of a plan slot reached only through a nested aggregate. Numeric,
 /// not `VARCHAR`, because the per-plan type also types the scan's `EMITS`: a
 /// character type would make an expression-argument MIN/MAX lexicographic.
-pub(super) const NESTED_AGGREGATE_PLAN_TYPE: &str = "DOUBLE PRECISION";
+pub(super) const NESTED_AGGREGATE_PLAN_TYPE: ExasolType = ExasolType::DoublePrecision;
 
 /// Deduplicates by `AggregatePlan` equality so an aggregate used bare and nested
 /// collapses to one `PARTIAL_*` column (decision-log [4]). A `Some` declared type
 /// always overwrites a slot a nested occurrence created with the default.
 pub(super) fn fold_aggregate_plan(
     plans: &mut Vec<AggregatePlan>,
-    plan_types: &mut Vec<String>,
+    plan_types: &mut Vec<ExasolType>,
     plan: AggregatePlan,
-    declared: Option<String>,
+    declared: Option<ExasolType>,
 ) -> usize {
     match plans.iter().position(|p| *p == plan) {
         Some(slot) => {
@@ -31,7 +32,7 @@ pub(super) fn fold_aggregate_plan(
         None => {
             let slot = plans.len();
             plans.push(plan);
-            plan_types.push(declared.unwrap_or_else(|| NESTED_AGGREGATE_PLAN_TYPE.to_string()));
+            plan_types.push(declared.unwrap_or(NESTED_AGGREGATE_PLAN_TYPE));
             slot
         }
     }
@@ -325,12 +326,12 @@ pub(super) fn merge_select_items(aggregates: &[AggregatePlan]) -> Vec<String> {
 /// is cast to its declared type (uncast when none or the `VARCHAR(2000000)` default).
 pub(super) fn cast_merge_items(
     aggregates: &[AggregatePlan],
-    aggregate_types: &[String],
+    aggregate_types: &[ExasolType],
 ) -> Vec<String> {
     merge_select_items(aggregates)
         .into_iter()
         .enumerate()
-        .map(|(i, expr)| cast_to_declared_type(&expr, aggregate_types.get(i).map(String::as_str)))
+        .map(|(i, expr)| cast_to_declared_type(&expr, aggregate_types.get(i).copied()))
         .collect()
 }
 
