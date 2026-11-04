@@ -36,6 +36,7 @@ fn vs_labels_table() -> String {
     format!("{LAKEHOUSE_VS}.{}", E2E_TABLE_2.to_uppercase())
 }
 
+/// Scenario: Single-table pushdown strips each column's table alias so the scan resolves bare names
 #[test]
 fn e2e_projection_filter_limit_returns_correct_rows() {
     lakehouse_vs();
@@ -190,6 +191,8 @@ fn create_vs_maps_iceberg_schema() {
 /// Scenario: A catalog-declared DECIMAL outside Exasol's DECIMAL domain falls back to VARCHAR
 /// Scenario: A nanosecond catalog timestamp column is declared TIMESTAMP(9) on Exasol 2025.x and later
 /// Scenario: A binary column reads as lowercase hex on every source
+/// Scenario: Iceberg timestamptz maps to plain Exasol TIMESTAMP
+/// Scenario: A mixed-column Parquet file round-trips through schema mapping and scan
 #[test]
 fn iceberg_all_types_declare_and_return_their_mapped_values() {
     lakehouse_vs();
@@ -423,6 +426,8 @@ fn scan_filter_restricts_rows() {
     );
 }
 
+/// Scenario: LIMIT caps the emitted rows
+/// Scenario: LIMIT is pushed into the scan spec
 #[test]
 fn scan_limit_caps_rows() {
     lakehouse_vs();
@@ -654,6 +659,8 @@ fn e2e_renamed_column_resolves_by_field_id() {
 }
 
 /// Scenario: Scan-driving UDF invocations are schema-qualified from the running adapter script's schema
+/// Scenario: The VS encodes each field's Iceberg initial-default once per query into the scan spec
+/// Scenario: Absent field with a defined initial-default returns the default value per file
 #[test]
 fn e2e_added_columns_initial_default_fill_all_types() {
     lakehouse_vs();
@@ -750,6 +757,7 @@ fn e2e_fails_when_stack_unavailable() {
     );
 }
 
+/// Scenario: Scan computes a node-local partial aggregate instead of raw rows
 #[test]
 fn scan_emits_partial_aggregate_row() {
     lakehouse_vs();
@@ -765,6 +773,9 @@ fn scan_emits_partial_aggregate_row() {
     assert_eq!(count, 20, "COUNT(*) should return 20 for the seeded table");
 }
 
+/// Scenario: Partial COUNT, SUM, MIN, and MAX are emitted in their merge-ready form
+/// Scenario: Bare-column aggregates continue to decompose unchanged
+/// Scenario: Aggregate wrapper SQL merges per-shard partial results
 #[test]
 fn partial_count_sum_min_max_merge_ready() {
     lakehouse_vs();
@@ -802,6 +813,8 @@ fn partial_count_sum_min_max_merge_ready() {
     assert_eq!(max, 100.0, "MAX(score) must be 100.0, got {max}");
 }
 
+/// Scenario: AVG is emitted as a partial sum and partial count pair
+/// Scenario: AVG is pushed down as a sum/count pair and divided in the wrapper
 #[test]
 fn partial_avg_emits_sum_count_pair() {
     lakehouse_vs();
@@ -833,6 +846,8 @@ fn partial_avg_emits_sum_count_pair() {
     );
 }
 
+/// Scenario: Scan emits sufficient statistics for a decomposable statistical aggregate
+/// Scenario: Every emitted partial-aggregate cell matches its declared output column
 #[test]
 fn partial_avg_stddev_over_non_double_columns() {
     lakehouse_vs();
@@ -879,6 +894,8 @@ fn assert_single_group_aggregate_pushed_down(conn: &mut ExaConn, query_sql: &str
     );
 }
 
+/// Scenario: Scan computes a node-local partial aggregate instead of raw rows
+/// Scenario: Single-group aggregate scan spec leaves the projection field empty
 #[test]
 fn single_group_aggregate_scan_spec_projection_is_empty() {
     lakehouse_vs();
@@ -904,6 +921,8 @@ fn single_group_aggregate_scan_spec_projection_is_empty() {
     }
 }
 
+/// Scenario: Partial aggregate over an expression argument is computed from the rendered expression
+/// Scenario: SUM over a scalar expression argument is pushed down
 #[test]
 fn sum_length_expression_argument_pushed_down() {
     lakehouse_vs();
@@ -925,6 +944,9 @@ fn sum_length_expression_argument_pushed_down() {
     );
 }
 
+/// Scenario: Partial aggregate over an expression argument is computed from the rendered expression
+/// Scenario: SUM over a two-column binary-arithmetic argument is pushed down
+/// Scenario: Arithmetic operator scalar-function capabilities are advertised so arithmetic expression trees are pushed down
 #[test]
 fn sum_two_column_product_pushes_down_matches_single_node() {
     lakehouse_vs();
@@ -968,6 +990,8 @@ fn sum_two_column_product_pushes_down_matches_single_node() {
     );
 }
 
+/// Scenario: Aggregate over an untranslatable argument falls back to row scanning
+/// Scenario: Bitwise operator function capabilities remain absent
 #[test]
 fn untranslatable_aggregate_argument_falls_back_to_row_scan() {
     lakehouse_vs();
@@ -995,6 +1019,7 @@ fn untranslatable_aggregate_argument_falls_back_to_row_scan() {
     );
 }
 
+/// Scenario: Ordered top-N over a projected column is pushed down as per-shard bounded sort plus Exasol merge
 #[test]
 fn ordered_topn_pushes_down_matches_single_node() {
     lakehouse_vs();
@@ -1053,6 +1078,7 @@ fn ordered_topn_pushes_down_matches_single_node() {
     }
 }
 
+/// Scenario: Unsupported ordered-query shapes decline the ordered-top-N path
 #[test]
 fn order_by_without_limit_falls_back_correctly() {
     lakehouse_vs();
@@ -1097,7 +1123,7 @@ fn order_by_without_limit_falls_back_correctly() {
 }
 
 /// Scenario: createVirtualSchema adapterNotes omit the cluster node count
-/// Scenario: Adapter derives the per-node core count from available_parallelism() on every request
+/// Scenario: Adapter reads the node's core count on every request and persists it nowhere
 #[test]
 fn create_vs_omits_cluster_nodes_from_adapter_notes() {
     const NOTES_VS: &str = "LHVS_NOTE_KEYS";
@@ -1291,6 +1317,7 @@ fn pushdown_shards_from_handshake_node_count_without_note() {
     );
 }
 
+/// Scenario: Single-table pushdown strips each column's table alias so the scan resolves bare names
 #[test]
 fn aggregate_count_col_returns_correct_value() {
     lakehouse_vs();
@@ -1445,6 +1472,7 @@ fn e2e_declined_outer_join_repushes_aliased_single_table_scan() {
     );
 }
 
+/// Scenario: Each scan call scans only its own shard, and no shard's rows are dropped
 #[test]
 fn multi_shard_row_query_matches_single_shard() {
     lakehouse_vs();
@@ -1477,6 +1505,7 @@ fn multi_shard_row_query_matches_single_shard() {
     }
 }
 
+/// Scenario: Scan registers only its assigned files and returns matching rows
 #[test]
 fn scan_registers_assigned_files_with_path_size_payload() {
     lakehouse_vs();
@@ -1563,6 +1592,7 @@ fn assert_group_by_pushed_down(conn: &mut ExaConn, query_sql: &str) {
     );
 }
 
+/// Scenario: Grouped aggregate scan spec leaves the projection field empty
 #[test]
 fn grouped_aggregate_scan_spec_projection_is_empty() {
     lakehouse_vs();
@@ -1584,6 +1614,7 @@ fn grouped_aggregate_scan_spec_projection_is_empty() {
     );
 }
 
+/// Scenario: Grouped aggregate wrapper SQL re-groups partial results per user group key
 #[test]
 fn test_group_by_sum_count() {
     lakehouse_vs();
@@ -1622,6 +1653,9 @@ fn test_group_by_sum_count() {
     );
 }
 
+/// Scenario: Grouped partial aggregate computes per-group partial results per shard
+/// Scenario: Multi-column GROUP BY is pushed down as partial aggregation rather than a raw row scan
+/// Scenario: Grouped aggregate query is detected and translated to a grouped scan spec
 #[test]
 fn test_group_by_multi_key_with_filter() {
     lakehouse_vs();
@@ -1773,6 +1807,7 @@ fn test_high_cardinality_group_by_spill() {
     }
 }
 
+/// Scenario: Grouped scan-driving SQL fans out via a nested shard_key distributor over G work units
 #[test]
 fn test_shard_key_fanout_explain() {
     lakehouse_vs();
@@ -1797,6 +1832,7 @@ fn test_shard_key_fanout_explain() {
     );
 }
 
+/// Scenario: NULL group keys are grouped together consistently
 #[test]
 fn test_group_by_null_key_grouping() {
     lakehouse_vs();
@@ -1892,6 +1928,8 @@ fn test_group_by_agg_before_key() {
     );
 }
 
+/// Scenario: Grouped partial row layout matches wrapper SQL column contract
+/// Scenario: Outer wrapper SELECT preserves user select-list order for interleaved keys and aggregates
 #[test]
 fn test_group_by_interleaved_multi_key() {
     lakehouse_vs();
@@ -1998,6 +2036,7 @@ fn test_group_by_expr_key_after_agg() {
     );
 }
 
+/// Scenario: A HAVING the adapter cannot render over the merge falls back instead of erroring
 #[test]
 fn test_group_by_agg_first_with_having() {
     lakehouse_vs();
@@ -2156,6 +2195,9 @@ fn test_group_by_agg_first_with_having() {
     );
 }
 
+/// Scenario: Group-key expressions are pushed into the DataFusion GROUP BY clause verbatim
+/// Scenario: Every element of a multi-key tuple may be an expression
+/// Scenario: Each group key in a multi-key tuple resolves its own declared result type
 #[test]
 fn test_group_by_expr_multi_key_tuple() {
     lakehouse_vs();
@@ -2245,6 +2287,8 @@ fn test_group_by_expr_multi_key_tuple() {
     );
 }
 
+/// Scenario: LIMIT is not applied inside the grouped partial scan
+/// Scenario: LIMIT is NOT pushed into per-shard scan for a grouped query
 #[test]
 fn test_group_by_multi_key_having_limit() {
     lakehouse_vs();
@@ -2386,6 +2430,9 @@ fn distinct_numeric_suffixes(haystack: &str, marker: &str) -> std::collections::
     indices
 }
 
+/// Scenario: Single-table grouped select item that is a scalar function wrapping aggregates is pushed down
+/// Scenario: Nested aggregates are rewritten to their merged partial expressions, never rendered over source columns
+/// Scenario: Scalar-over-aggregate items interleaved with keys and plain aggregates preserve select-list order
 #[test]
 fn test_group_by_scalar_over_aggregate_round() {
     lakehouse_vs();
@@ -2459,6 +2506,7 @@ fn test_group_by_scalar_over_aggregate_round() {
     }
 }
 
+/// Scenario: Inner aggregates shared across the grouped select list decompose into deduplicated partial columns
 #[test]
 fn test_group_by_shared_inner_aggregate_dedup() {
     lakehouse_vs();
@@ -2701,6 +2749,8 @@ fn e2e_partition_filter_prunes_and_returns_correct_rows() {
 }
 
 /// Scenario: An Iceberg file whose key holds `%`, `#`, or `?` is read from that key
+/// Scenario: Equality on a partition column prunes data files
+/// Scenario: Range predicate prunes files via per-file min/max bounds
 #[test]
 fn e2e_range_filter_prunes_by_file_bounds() {
     lakehouse_vs();
@@ -2745,6 +2795,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
 }
 
 /// Scenario: A data-file path under a table root holding escaped characters is carried relative
+/// Scenario: Table root is carried once and paths under it are emitted relative
 #[test]
 fn e2e_a_table_root_needing_escapes_reads_its_rows_through_relative_paths() {
     lakehouse_vs();
@@ -2822,6 +2873,7 @@ fn e2e_pushdown_resolves_files_once_multi_table() {
 // group_by request with a literal-only select list; the scan must keep the GROUP BY
 // so Exasol's outer COUNT(*) counts group rows.
 
+/// Scenario: Composed pushdown request never renders a scan spec that references a non-source column
 #[test]
 fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
     lakehouse_vs();
@@ -2869,6 +2921,9 @@ fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
 // `render_limit_offset`, plus canaries for the two shapes whose `debug_assert!` guards
 // compile out of the release `.so`.
 
+/// Scenario: LIMIT_WITH_OFFSET is advertised only together with offset rendering on every wrapper that renders a final window
+/// Scenario: Unsupported ordered-query shapes decline the ordered-top-N path
+/// Scenario: A declined ordered row scan renders the request's OFFSET on its own wrapper
 #[test]
 fn ordered_limit_offset_returns_shifted_window() {
     lakehouse_vs();
@@ -2907,6 +2962,9 @@ fn ordered_limit_offset_returns_shifted_window() {
     }
 }
 
+/// Scenario: LIMIT_WITH_OFFSET is advertised only together with offset rendering on every wrapper that renders a final window
+/// Scenario: Per-shard row limit is emitted only alongside the matching per-shard sort
+/// Scenario: A declined ordered row scan renders the request's OFFSET on its own wrapper
 #[test]
 fn ordered_limit_offset_unprojected_sort_key_returns_shifted_window() {
     lakehouse_vs();
@@ -2935,6 +2993,8 @@ fn ordered_limit_offset_unprojected_sort_key_returns_shifted_window() {
     );
 }
 
+/// Scenario: The grouped merge wrapper renders the request's OFFSET alongside its LIMIT
+/// Scenario: LIMIT_WITH_OFFSET is advertised only together with offset rendering on every wrapper that renders a final window
 #[test]
 fn grouped_order_by_limit_offset_returns_shifted_groups() {
     lakehouse_vs();
@@ -2981,6 +3041,10 @@ fn grouped_order_by_limit_offset_returns_shifted_groups() {
     );
 }
 
+/// Scenario: Adapter falls back for non-decomposable aggregates
+/// Scenario: Adapter falls back to a qualified single-table wrapper for an undecomposable grouped aggregate shape
+/// Scenario: LIMIT_WITH_OFFSET is advertised only together with offset rendering on every wrapper that renders a final window
+/// Scenario: The qualified wrapper renders the request's OFFSET on every entry point that reaches it
 #[test]
 fn qualified_wrapper_limit_offset_returns_shifted_window() {
     lakehouse_vs();
@@ -3029,6 +3093,8 @@ fn qualified_wrapper_limit_offset_returns_shifted_window() {
     );
 }
 
+/// Scenario: The single-row aggregate merge renders no OFFSET, because no offset can reach it
+/// Scenario: LIMIT_WITH_OFFSET is advertised only together with offset rendering on every wrapper that renders a final window
 #[test]
 fn offset_on_single_group_aggregate_is_rejected_by_exasol() {
     lakehouse_vs();
@@ -3056,6 +3122,8 @@ fn offset_on_single_group_aggregate_is_rejected_by_exasol() {
     );
 }
 
+/// Scenario: LIMIT_WITH_OFFSET is advertised only together with offset rendering on every wrapper that renders a final window
+/// Scenario: Per-shard row limit is emitted only alongside the matching per-shard sort
 #[test]
 fn unrenderable_ordering_with_offset_matches_single_node() {
     lakehouse_vs();
@@ -3165,6 +3233,7 @@ fn assert_single_group_matches_native_oracle(conn: &mut ExaConn, select_list: &s
     }
 }
 
+/// Scenario: Single-group select item that is a scalar function wrapping aggregates is decomposed into partial columns and one merged row
 #[test]
 fn e2e_single_group_scalar_over_aggregate_round_sum_matches_native_oracle() {
     lakehouse_vs();
@@ -3176,6 +3245,7 @@ fn e2e_single_group_scalar_over_aggregate_round_sum_matches_native_oracle() {
     assert_single_group_matches_native_oracle(&mut conn, select_list, "");
 }
 
+/// Scenario: A scalar-wrapped statistical aggregate matches native Exasol and sends no aggregate function name to the scan
 #[test]
 fn e2e_single_group_scalar_over_variance_matches_native_oracle() {
     lakehouse_vs();
@@ -3190,6 +3260,8 @@ fn e2e_single_group_scalar_over_variance_matches_native_oracle() {
     assert_single_group_matches_native_oracle(&mut conn, "ROUND(VAR_SAMP(L_EXTENDEDPRICE), 4)", "");
 }
 
+/// Scenario: Inner aggregates shared across the single-group select list collapse into one deduplicated partial column
+/// Scenario: Aggregate query is translated into a partial-aggregate scan spec
 #[test]
 fn e2e_single_group_scalar_over_aggregate_shared_count_matches_native_oracle() {
     lakehouse_vs();
@@ -3213,6 +3285,7 @@ fn e2e_single_group_scalar_over_aggregate_shared_count_matches_native_oracle() {
     assert_single_group_matches_native_oracle(&mut conn, select_list, "");
 }
 
+/// Scenario: Scalar-over-aggregate and plain aggregate items interleave in select-list order with per-item declared types
 #[test]
 fn e2e_single_group_scalar_over_aggregate_interleaved_matches_native_oracle() {
     lakehouse_vs();
@@ -3245,6 +3318,7 @@ fn e2e_single_group_scalar_over_aggregate_all_files_pruned_returns_one_row() {
     assert_single_group_matches_native_oracle(&mut conn, select_list, tail);
 }
 
+/// Scenario: Single-group aggregate scan spec leaves the projection field empty
 #[test]
 fn e2e_single_group_scalar_over_aggregate_explain_virtual_shows_empty_projection() {
     lakehouse_vs();
@@ -3273,6 +3347,8 @@ fn e2e_single_group_scalar_over_aggregate_explain_virtual_shows_empty_projection
     );
 }
 
+/// Scenario: The scan session registers the checked float-division function every pushed expression needs
+/// Scenario: FLOAT_DIV renders true float division in the DataFusion dialect
 #[test]
 fn e2e_float_div_int_over_int_matches_native_oracle() {
     lakehouse_vs();
@@ -3303,6 +3379,7 @@ fn e2e_float_div_int_over_int_matches_native_oracle() {
     );
 }
 
+/// Scenario: FLOAT_DIV renders true float division in the DataFusion dialect
 #[test]
 fn e2e_float_div_pushes_checked_division_call_projection() {
     lakehouse_vs();
@@ -3354,6 +3431,8 @@ fn division_by_zero_failure_sql_code(conn: &mut ExaConn, sql: &str) -> String {
 /// Exasol reports every UDF-raised error under this generic state, not native `22012`.
 const UDF_ERROR_SQL_CODE: &str = "22002";
 
+/// Scenario: A checked float division raises rather than producing a non-finite value
+/// Scenario: A pushed-down division by zero fails the query rather than returning a wrong value
 #[test]
 fn e2e_float_div_by_zero_projected_fails_with_division_by_zero() {
     lakehouse_vs();
@@ -3372,6 +3451,8 @@ fn e2e_float_div_by_zero_projected_fails_with_division_by_zero() {
     );
 }
 
+/// Scenario: A checked float division raises rather than producing a non-finite value
+/// Scenario: Zero divided by zero fails the query instead of reaching the NaN-at-emit gap
 #[test]
 fn e2e_zero_div_zero_projected_fails_with_division_by_zero() {
     lakehouse_vs();
@@ -3392,6 +3473,8 @@ fn e2e_zero_div_zero_projected_fails_with_division_by_zero() {
     );
 }
 
+/// Scenario: The scan session registers the checked float-division function every pushed expression needs
+/// Scenario: FLOAT_DIV renders true float division in the DataFusion dialect
 #[test]
 fn e2e_float_div_filter_row_count_matches_native_oracle() {
     lakehouse_vs();
@@ -3486,6 +3569,9 @@ fn assert_checked_division_reached_the_pushed_filter(pushed: &str) {
     );
 }
 
+/// Scenario: A checked float division raises rather than producing a non-finite value
+/// Scenario: A division by zero inside a filter predicate fails the query rather than changing the row count
+/// Scenario: Zero divided by zero fails the query instead of reaching the NaN-at-emit gap
 #[test]
 fn e2e_float_div_by_zero_in_filter_fails_like_native_exasol() {
     lakehouse_vs();
@@ -3514,6 +3600,8 @@ fn e2e_float_div_by_zero_in_filter_fails_like_native_exasol() {
     }
 }
 
+/// Scenario: A checked float division raises rather than producing a non-finite value
+/// Scenario: A division by zero inside a filter predicate fails the query rather than changing the row count
 #[test]
 fn e2e_float_div_null_divisor_in_filter_returns_no_rows() {
     lakehouse_vs();
@@ -3535,6 +3623,7 @@ fn e2e_float_div_null_divisor_in_filter_returns_no_rows() {
     );
 }
 
+/// Scenario: A division by zero inside a filter predicate fails the query rather than changing the row count
 #[test]
 fn e2e_float_div_guarded_by_a_non_zero_conjunct_matches_native_exasol() {
     lakehouse_vs();
@@ -3575,6 +3664,7 @@ fn e2e_float_div_guarded_by_a_non_zero_conjunct_matches_native_exasol() {
     }
 }
 
+/// Scenario: A checked float division raises rather than producing a non-finite value
 #[test]
 fn e2e_float_div_by_zero_in_aggregate_argument_fails() {
     lakehouse_vs();
@@ -3605,6 +3695,7 @@ fn e2e_float_div_by_zero_in_aggregate_argument_fails() {
     );
 }
 
+/// Scenario: A pushed-down GREATEST or LEAST over a NULL-producing argument returns NULL on the cluster
 #[test]
 fn test_greatest_least_propagate_null_argument() {
     lakehouse_vs();
@@ -3666,6 +3757,7 @@ fn test_greatest_least_propagate_null_argument() {
     );
 }
 
+/// Scenario: A pushed-down CONCAT over a NULL operand concatenates the non-NULL parts on the cluster
 #[test]
 fn test_concat_null_operand_concatenates_non_null_parts() {
     lakehouse_vs();

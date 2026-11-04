@@ -103,6 +103,8 @@ fn assert_emits_declares(conn: &mut ExaConn, query_sql: &str, expected: &str) ->
 }
 
 /// Scenario: A timestamp filter compares at full precision
+/// Scenario: A catalog timestamp column is declared TIMESTAMP(6) on Exasol 2025.x and later
+/// Scenario: Iceberg timestamptz maps to plain Exasol TIMESTAMP
 #[test]
 fn iceberg_microsecond_timestamps_round_trip_at_the_declared_precision() {
     setup();
@@ -191,6 +193,9 @@ fn rendered_nanos(nanos: i64) -> String {
         .to_string()
 }
 
+/// Scenario: A declared TIMESTAMP(p) EMITS column maps back to the Arrow unit of that precision
+/// Scenario: Projected CAST expression preserves the declared TIMESTAMP fractional-seconds precision in its EMITS type
+/// Scenario: CAST to TIMESTAMP renders the declared fractional-seconds precision per SQL dialect
 #[test]
 fn cast_to_timestamp9_emits_nanoseconds_and_keeps_every_seeded_digit() {
     setup();
@@ -242,6 +247,8 @@ fn cast_to_timestamp9_emits_nanoseconds_and_keeps_every_seeded_digit() {
     );
 }
 
+/// Scenario: A declared TIMESTAMP(p) EMITS column maps back to the Arrow unit of that precision
+/// Scenario: Projected CAST expression preserves the declared TIMESTAMP fractional-seconds precision in its EMITS type
 #[test]
 fn cast_to_timestamp3_emits_milliseconds_and_collapses_the_seeded_pairs() {
     setup();
@@ -296,6 +303,8 @@ fn cast_to_timestamp3_emits_milliseconds_and_collapses_the_seeded_pairs() {
     );
 }
 
+/// Scenario: Conversion and unary-negation capabilities are advertised so CAST and unary-minus expressions push down
+/// Scenario: CAST to TIMESTAMP renders the declared fractional-seconds precision per SQL dialect
 #[test]
 fn declined_cast_to_timestamp2_is_computed_natively_by_exasol_in_the_wrapper() {
     setup();
@@ -351,6 +360,7 @@ fn declined_cast_to_timestamp2_is_computed_natively_by_exasol_in_the_wrapper() {
     );
 }
 
+/// Scenario: A declared TIMESTAMP(p) EMITS column maps back to the Arrow unit of that precision
 #[test]
 fn iceberg_nanosecond_source_column_is_declared_and_retained_per_engine_arm() {
     setup();

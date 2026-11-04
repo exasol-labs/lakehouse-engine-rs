@@ -66,6 +66,7 @@ fn single_partition_spec(file_url: String) -> ScanSpec {
     .with_files(vec![FileEntry::new(file_url, size)])
 }
 
+/// Scenario: Raw-scan physical plan carries no needless repartition or coalesce-partitions stage
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_scan_plan_has_no_repartition_stage() {
     let tmp = tempfile::tempdir().unwrap();
@@ -660,6 +661,7 @@ pub(crate) fn sum_row_groups_pruned(plan: &dyn ExecutionPlan) -> usize {
     total
 }
 
+/// Scenario: Raw-scan physical plan carries no needless repartition or coalesce-partitions stage
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_plan_lean_and_prunes_with_access_plan() {
     // Uses `register_files`: `register_parquet` never attaches a base `ParquetAccessPlan`.

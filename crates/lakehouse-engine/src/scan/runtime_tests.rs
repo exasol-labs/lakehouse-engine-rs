@@ -1,6 +1,7 @@
 use super::*;
 use datafusion::execution::memory_pool::MemoryConsumer;
 
+/// Scenario: DataFusion memory pool is sized from the per-instance memory limit
 #[test]
 fn build_runtime_env_sizes_pool_from_net_budget() {
     let limit: u64 = 4096 * 1024 * 1024;
@@ -21,6 +22,7 @@ fn build_runtime_env_sizes_pool_from_net_budget() {
     );
 }
 
+/// Scenario: Scan clamps the memory pool to a minimum floor when overhead exceeds the limit
 #[test]
 fn build_runtime_env_clamps_to_floor_when_overhead_exceeds_limit() {
     let limit: u64 = 100 * 1024 * 1024;
@@ -40,6 +42,7 @@ fn build_runtime_env_clamps_to_floor_when_overhead_exceeds_limit() {
     );
 }
 
+/// Scenario: Default memory budget is used when the limit is unknown
 #[test]
 fn build_runtime_env_uses_default_budget_on_zero_limit() {
     let env = build_runtime_env(0, 0.6, 0, SpillMode::NoDisk).unwrap();
@@ -56,6 +59,7 @@ fn build_runtime_env_uses_default_budget_on_zero_limit() {
     );
 }
 
+/// Scenario: Spill to disk is enabled when /tmp is real disk with free space
 #[test]
 fn build_runtime_env_uses_fair_spill_pool_when_disk() {
     let tmp = std::env::temp_dir();
@@ -67,6 +71,7 @@ fn build_runtime_env_uses_fair_spill_pool_when_disk() {
     );
 }
 
+/// Scenario: An over-budget scan without spill disk fails with a clean resources-exhausted error
 #[test]
 fn build_runtime_env_uses_greedy_pool_when_no_disk() {
     let env = build_runtime_env(0, 0.6, 0, SpillMode::NoDisk).unwrap();

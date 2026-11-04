@@ -173,7 +173,6 @@ fn values_of(batches: &[RecordBatch]) -> Vec<i32> {
     out
 }
 
-/// Scenario: A UUID-relative deletion vector removes exactly its flagged rows
 #[test]
 fn uuid_relative_deletion_vector_removes_its_flagged_rows() {
     let tmp = tempfile::tempdir().unwrap();
@@ -196,6 +195,7 @@ fn uuid_relative_deletion_vector_removes_its_flagged_rows() {
     assert!(!values.contains(&9), "deleted value 9 must be absent");
 }
 
+/// Scenario: An inline deletion vector is decoded with no object-store access at all
 #[test]
 fn inline_deletion_vector_decodes_without_object_store_access() {
     let tmp = tempfile::tempdir().unwrap();
@@ -295,6 +295,7 @@ fn shared_deletion_vector_file_is_fetched_once_per_shard() {
 
 const DV_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Scenario: Concurrent deletion-vector reads stay within the connection budget
 #[test]
 fn deletion_vector_reads_stay_within_the_connection_budget() {
     const BUDGET: usize = 3;
@@ -546,6 +547,7 @@ fn mixed_iceberg_and_delta_shard_shares_one_position_map_and_limiter() {
     }
 }
 
+/// Scenario: A deletion vector the scan cannot trust fails loud before any row is emitted
 #[test]
 fn malformed_deletion_vector_containers_fail_the_scan_without_panicking() {
     let sidecar_bytes = std::fs::read(fixture_dir().join(FIXTURE_SIDECAR_NAME)).unwrap();

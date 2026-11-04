@@ -409,6 +409,7 @@ fn bare_column_aggregates_unchanged_regression() {
     assert_eq!(emits, vec![r#""PARTIAL_sum_0" DECIMAL(36,0)"#.to_string()]);
 }
 
+/// Scenario: Expression-argument partial and merge column types come from the declared aggregate type
 #[test]
 fn expression_arg_partial_and_merge_types_from_declared_type() {
     let req = serde_json::json!({
@@ -479,6 +480,7 @@ fn expression_arg_partial_and_merge_types_from_declared_type() {
     );
 }
 
+/// Scenario: A DECIMAL two-column product widens its partial column from the declared SUM result type
 #[test]
 fn decimal_product_sum_partial_widens_to_decimal_36() {
     let req = serde_json::json!({

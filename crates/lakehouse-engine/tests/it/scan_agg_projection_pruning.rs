@@ -128,6 +128,7 @@ fn leaf_scan_projected_columns(plan: &Arc<dyn ExecutionPlan>) -> BTreeSet<String
         .collect()
 }
 
+/// Scenario: Partial aggregate physically reads only the aggregate-referenced columns
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_group_agg_scan_prunes_to_referenced_columns() {
     let tmp = tempfile::tempdir().unwrap();
@@ -160,6 +161,7 @@ async fn single_group_agg_scan_prunes_to_referenced_columns() {
     );
 }
 
+/// Scenario: Grouped partial aggregate physically reads only the group-key and aggregate columns
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grouped_agg_scan_prunes_to_referenced_columns() {
     let tmp = tempfile::tempdir().unwrap();

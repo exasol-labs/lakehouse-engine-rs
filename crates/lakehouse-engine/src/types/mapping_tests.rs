@@ -77,7 +77,6 @@ fn compatible_types_map_to_exasol_type() {
     );
 }
 
-/// Scenario: In-range Decimal128 maps to a precise Exasol DECIMAL
 #[test]
 fn decimal128_in_range_maps_to_decimal() {
     assert_eq!(
@@ -94,7 +93,6 @@ fn decimal128_in_range_maps_to_decimal() {
     );
 }
 
-/// Scenario: Out-of-range Decimal128 falls back to VARCHAR via JSON
 #[test]
 fn decimal128_out_of_range_maps_to_varchar_json() {
     assert_eq!(
@@ -216,6 +214,7 @@ fn nested_and_non_nested_incompatible_halves_are_owned_by_one_predicate_each() {
     assert!(!needs_json_fallback(&DataType::Boolean));
 }
 
+/// Scenario: The castability claims behind the mapping are asserted, not assumed
 #[test]
 fn arrow_castability_to_utf8_pins_the_three_delta_type_sets() {
     use arrow::compute::can_cast_types;
@@ -276,6 +275,7 @@ fn arrow_castability_to_utf8_pins_the_three_delta_type_sets() {
 
 #[test]
 
+/// Scenario: The castability claims behind the mapping are asserted, not assumed
 fn list_to_utf8_cast_kernel_renders_display_text_not_json() {
     use arrow::array::{ListBuilder, StringArray, StringBuilder};
     use arrow::compute::cast;
@@ -426,6 +426,8 @@ fn iceberg_types_map_to_exasol_type() {
     );
 }
 
+/// Scenario: Iceberg logical schema maps to Arrow types for scan registration
+/// Scenario: The Iceberg-to-Arrow logical mapping reads the same catalog-decimal guard
 #[test]
 fn iceberg_type_to_arrow_maps_all_families() {
     use arrow::datatypes::TimeUnit;
@@ -693,12 +695,14 @@ fn exasol_type_from_json_propagates_ascii_character_set() {
     assert_eq!(exasol_type_from_json(&no_charset).to_string(), "VARCHAR(4)");
 }
 
+/// Scenario: A CHAR-declared ASCII type carries the ASCII suffix
 #[test]
 fn exasol_type_from_json_renders_char_type() {
     let ascii = serde_json::json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"});
     assert_eq!(exasol_type_from_json(&ascii).to_string(), "CHAR(3) ASCII");
 }
 
+/// Scenario: A CHAR-declared ASCII type carries the ASCII suffix
 #[test]
 fn exasol_type_from_json_propagates_char_ascii_character_set() {
     let utf8 = serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"});
@@ -708,6 +712,7 @@ fn exasol_type_from_json_propagates_char_ascii_character_set() {
     assert_eq!(exasol_type_from_json(&no_charset).to_string(), "CHAR(20)");
 }
 
+/// Scenario: A CHAR size above Exasol's maximum is capped at 2,000
 #[test]
 fn exasol_type_from_json_caps_char_size_at_exasol_maximum() {
     let oversized = serde_json::json!({"type": "CHAR", "size": 9999});
@@ -813,6 +818,7 @@ fn parquet_column_source_type_with_an_unparseable_tag_resolves_to_varchar_json()
     );
 }
 
+/// Scenario: The scan-spec tag vocabulary covers every Arrow type the compatible-type classifier admits
 #[test]
 fn every_admitted_arrow_type_round_trips_through_its_tag() {
     use arrow::datatypes::TimeUnit;
@@ -854,6 +860,7 @@ fn every_admitted_arrow_type_round_trips_through_its_tag() {
     }
 }
 
+/// Scenario: The scan-spec tag vocabulary covers every Arrow type the compatible-type classifier admits
 #[test]
 fn refused_arrow_types_fall_back_to_the_utf8_tag() {
     let tag = arrow_type_to_tag(&DataType::Decimal256(10, 2));
@@ -861,6 +868,7 @@ fn refused_arrow_types_fall_back_to_the_utf8_tag() {
     assert_eq!(arrow_type_from_tag(&tag), DataType::Utf8);
 }
 
+/// Scenario: The scan-spec tag vocabulary covers every Arrow type the compatible-type classifier admits
 #[test]
 fn every_variable_binary_encoding_tags_as_binary_and_a_fixed_one_keeps_its_width() {
     for dt in [
@@ -975,7 +983,6 @@ fn unity_types_exasol_cannot_hold_or_unreadable_type_json_declare_varchar() {
     );
 }
 
-/// Scenario: The listing declares each Glue column through the Spark listing mapping
 #[test]
 fn glue_columns_declare_the_spark_listing_type() {
     let primitives = primitive_hive_types().map(|(hive_type, _, declared)| (hive_type, declared));
@@ -1166,6 +1173,7 @@ fn database_version_leading_component_selects_the_declared_timestamp_precision()
     }
 }
 
+/// Scenario: An empty or unparseable database version declares the microsecond precision
 #[test]
 fn unreadable_database_version_declares_the_source_width_unclamped() {
     for version in ["", "v2025.2.1", "unknown", ".2.1", "8x.1.0", " "] {
@@ -1266,6 +1274,7 @@ fn declared_digits_resolve_to_the_arrow_unit_of_their_source_width() {
     }
 }
 
+/// Scenario: The Arrow-input type resolver stays outside the version gate
 #[test]
 fn arrow_input_resolver_stays_outside_the_timestamp_version_gate() {
     let _ungated: fn(&DataType) -> ExasolType = arrow_to_exasol_type;

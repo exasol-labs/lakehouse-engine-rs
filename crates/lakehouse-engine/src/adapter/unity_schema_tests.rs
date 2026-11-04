@@ -58,6 +58,8 @@ fn tables_page(entries: Vec<Json>, next_page_token: Option<&str>) -> String {
     page.to_string()
 }
 
+/// Scenario: The single-table load serves only the scan path and applies no admission filter
+/// Scenario: Create virtual schema lists the namespace with no per-table get-table call
 #[test]
 fn listing_issues_no_per_table_get_table_call() {
     let (catalog, _runtime) = serve_on_own_runtime(RecordingCatalog::spawn(|target| {
@@ -133,6 +135,7 @@ fn unity_names_differing_only_by_case_collide() {
     );
 }
 
+/// Scenario: Create virtual schema fails clearly when the Unity Catalog is unreachable
 #[test]
 fn unreachable_unity_catalog_is_credential_safe_error() {
     // Not a dropped ephemeral listener: a parallel test's fake server could take the freed port.

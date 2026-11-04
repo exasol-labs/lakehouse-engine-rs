@@ -371,7 +371,6 @@ fn oauth_creds() -> ConnectionCreds {
     creds
 }
 
-/// Scenario: A scoped refresh lists Iceberg identifiers and loads the requested tables on one session
 #[tokio::test]
 async fn empty_namespace_builds_no_session_and_no_grant() {
     let client = IcebergRestCatalogClient::new("http://127.0.0.1:1".into(), oauth_creds());
@@ -388,6 +387,7 @@ async fn empty_namespace_builds_no_session_and_no_grant() {
     assert!(listing.skipped.is_empty(), "an empty batch skips nothing");
 }
 
+/// Scenario: createVirtualSchema resolves every table's schema on one shared session
 #[tokio::test]
 async fn list_tables_over_empty_namespace_lists_nothing() {
     let (uri, log) = spawn_mock_catalog(&["sales"], &[], &[], &[]).await;
@@ -408,6 +408,7 @@ async fn list_tables_over_empty_namespace_lists_nothing() {
 }
 
 /// Scenario: A scoped refresh lists Iceberg identifiers and loads the requested tables on one session
+/// Scenario: createVirtualSchema resolves every table's schema on one shared session
 #[tokio::test]
 async fn enumeration_builds_exactly_one_session() {
     let (uri, log) =
@@ -529,7 +530,7 @@ async fn rest_listing_projects_the_loaded_metadata_into_the_neutral_table() {
     assert_eq!(loaded, expected);
 }
 
-/// Scenario: A failed loadTable names the table it loads
+/// Scenario: One non-Iceberg table in the namespace is skipped rather than aborting the schema
 #[tokio::test]
 async fn unloadable_table_is_reported_skipped_not_failed() {
     let (uri, _log) =

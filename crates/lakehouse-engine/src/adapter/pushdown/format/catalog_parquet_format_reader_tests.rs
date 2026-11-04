@@ -245,7 +245,6 @@ async fn file_columns_bind_under_the_case_fold_and_the_shared_cast_rules() {
     assert_mentions(&message, &["'amount'", TABLE_ROOT, "Float64", "Int32"]);
 }
 
-/// Scenario: Partition columns come from the catalog and partition values from the file paths
 #[tokio::test]
 async fn partition_columns_come_from_partition_index_and_values_from_paths() {
     let scan = resolve(
@@ -304,6 +303,7 @@ async fn a_partition_predicate_prunes_under_the_declared_type() {
     }
 }
 
+/// Scenario: Storage is resolved through the table's own catalog exactly as for a Delta table
 #[tokio::test]
 async fn storage_is_resolved_through_the_shared_unity_path() {
     let no_location = CatalogTable {
@@ -526,7 +526,6 @@ fn scanned_files(scan: &ResolvedScan) -> Vec<(String, BTreeMap<String, Option<St
         .collect()
 }
 
-/// Scenario: A Glue Parquet table is planned by the shared catalog-declared Parquet reader
 #[tokio::test]
 async fn glue_parquet_table_is_planned_by_the_shared_reader_with_nullable_catalog_columns() {
     let storage = served_storage(["glue/orders/part-0"]).await.storage;
@@ -603,7 +602,6 @@ async fn a_glue_location_reads_direct_children_of_any_name() {
     );
 }
 
-/// Scenario: Each kept partition's location is listed and its files carry the partition's Glue values
 /// Scenario: A catalog-registered location is listed by its raw object key
 #[tokio::test]
 async fn each_kept_partition_is_listed_and_carries_its_glue_values() {
@@ -759,7 +757,6 @@ async fn planned_keys(
         .map_err(|error| error.to_string())
 }
 
-/// Scenario: A kept partition the reader cannot read faithfully fails the query naming it
 #[tokio::test]
 async fn a_kept_orc_or_foreign_bucket_partition_fails_naming_it_and_a_pruned_one_does_not() {
     let parquet = partition(

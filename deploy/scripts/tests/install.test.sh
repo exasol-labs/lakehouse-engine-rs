@@ -1066,6 +1066,7 @@ test_saas_verify_listed_quoted_match() {
   assert_eq "exact match: still verifies a real upload" "yes" "$exact_match"
 }
 
+# Scenario: The install script creates the version script with the other deployment scripts
 test_four_scripts_ddl_saas_path_types() {
   echo "== test_four_scripts_ddl_saas_path_types =="
   local scan dist adapter version schema
@@ -1098,6 +1099,7 @@ test_four_scripts_ddl_saas_path_types() {
   assert_not_contains "next-step template: no CONNECTION grant for LAKEHOUSE_VERSION" "$LAST_OUT" "FOR SCRIPT LHVS.LAKEHOUSE_VERSION"
 }
 
+# Scenario: The install verification passes only on an exact version match
 test_version_smoke_pass_and_fail() {
   echo "== test_version_smoke_pass_and_fail =="
   reset_env
@@ -1153,6 +1155,7 @@ test_version_smoke_pass_and_fail() {
   assert_contains "smoke unclassifiable verdict: reports an internal error" "$out" "internal error"
 }
 
+# Scenario: The install verification queries the version script and reads its reported value
 test_version_smoke_query_and_extraction() {
   echo "== test_version_smoke_query_and_extraction =="
   local sql value
@@ -1186,6 +1189,7 @@ test_version_smoke_query_and_extraction() {
   assert_not_contains "version query: no scan script is called" "$log" "LAKEHOUSE_SCAN('"
 }
 
+# Scenario: The install documentation describes the version-based verification
 test_docs_describe_version_verification() {
   echo "== test_docs_describe_version_verification =="
   local doc ci
@@ -1879,6 +1883,7 @@ test_usage_is_mode_aware() {
   assert_eq "usage: --help makes no network/SQL call" "" "$(log_content)"
 }
 
+# Scenario: Default architecture is x86_64
 arch_default_is_x86_64() {
   echo "== arch_default_is_x86_64 =="
   local result
@@ -1908,6 +1913,7 @@ arch_explicit_flag_is_stored_and_marks_set() {
   assert_eq "arch: explicit --arch x86_64 is accepted and stored" "arch=x86_64 set=1" "$result"
 }
 
+# Scenario: --arch flag rejects invalid values
 arch_invalid_value_rejected() {
   echo "== arch_invalid_value_rejected =="
   local out rc
@@ -1936,6 +1942,8 @@ resolve_arch_suffix_returns_expected_values() {
   assert_eq "resolve_arch_suffix: aarch64 suffix is -aarch64" "-aarch64" "$suffix"
 }
 
+# Scenario: Default architecture is x86_64
+# Scenario: --arch aarch64 selects aarch64-suffixed assets
 arch_aarch64_selects_suffixed_assets() {
   echo "== arch_aarch64_selects_suffixed_assets =="
   local out
@@ -2021,6 +2029,7 @@ deployment_connection_resolves_from_fixture() {
     "host=descriptor.example:52164 user=dbadmin password=fixture-secret" "$out"
 }
 
+# Scenario: CLI flags override deployment descriptor values
 deployment_cli_overrides_descriptor() {
   echo "== deployment_cli_overrides_descriptor =="
   local dir out
@@ -2037,6 +2046,7 @@ deployment_cli_overrides_descriptor() {
     "host=override.example:52164 user=dbadmin password=override" "$out"
 }
 
+# Scenario: Missing deployment directory fails
 deployment_missing_dir_fails() {
   echo "== deployment_missing_dir_fails =="
   local nonexistent_root out rc
@@ -2056,6 +2066,7 @@ deployment_missing_dir_fails() {
     "$nonexistent_root/nonexistent"
 }
 
+# Scenario: --deployment requires jq
 deployment_requires_jq() {
   echo "== deployment_requires_jq =="
   local out rc
@@ -2113,6 +2124,7 @@ deployment_rejects_profile_and_dsn() {
   assert_contains "deployment rejects --dsn: error names --dsn" "$out" "--dsn"
 }
 
+# Scenario: --deployment cloud without --bfs-write-password fails
 deployment_cloud_requires_bfs_password() {
   echo "== deployment_cloud_requires_bfs_password =="
   local dir out rc
@@ -2136,6 +2148,7 @@ deployment_cloud_requires_bfs_password() {
     "$out" "cloud"
 }
 
+# Scenario: --deployment with cloud backend uses BucketFS HTTP upload
 deployment_cloud_bfs_transport() {
   echo "== deployment_cloud_bfs_transport =="
   local dir out
@@ -2158,6 +2171,7 @@ deployment_cloud_bfs_transport() {
   assert_contains "cloud deployment: the BucketFS host derives from the resolved connection host" "$out" "bfs_host=cloud.example"
 }
 
+# Scenario: --deployment local auto-detects architecture
 deployment_local_autodetects_arch() {
   echo "== deployment_local_autodetects_arch =="
   local dir out
@@ -2200,6 +2214,7 @@ deployment_local_unsupported_uname_fails_detection() {
   assert_contains "unsupported uname -m: error instructs --arch" "$out" "--arch"
 }
 
+# Scenario: Explicit --arch overrides auto-detection
 arch_override_beats_autodetect() {
   echo "== arch_override_beats_autodetect =="
   local dir out
@@ -2234,6 +2249,7 @@ slc_url_from_make_output() {
   printf '%s\n' "$1" | grep -o 'https://github.com/[^"]*lc-rust[^"]*\.tar\.gz' | head -1
 }
 
+# Scenario: Makefile install-slc computes architecture-aware SLC URL
 makefile_slc_url_arch_aware() {
   echo "== makefile_slc_url_arch_aware =="
   local default_url x86_url aarch64_url arm64_url
@@ -2270,7 +2286,7 @@ makefile_slc_url_arch_aware() {
     "$MAKE_OUT" "releases/download"
 }
 
-# Scenario: a local deployment selects the launcher transport and the standard BucketFS layout
+# Scenario: --deployment with local backend installs through the deployment directory
 deployment_local_selects_launcher() {
   echo "== deployment_local_selects_launcher =="
   local dir out
@@ -2376,7 +2392,7 @@ run_launcher_deployment() {
   return 0
 }
 
-# Scenario: a launcher install installs the plain SLC via exasol slc custom and writes the .so into BucketFS
+# Scenario: --deployment with local backend installs through the deployment directory
 deployment_launcher_installs_slc_and_engine() {
   echo "== deployment_launcher_installs_slc_and_engine =="
   reset_env

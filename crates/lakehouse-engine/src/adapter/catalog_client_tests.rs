@@ -45,6 +45,7 @@ fn construction_site_is_exhaustive_and_fallible_for_every_kind() {
     assert!(!err.contains("SECRET"), "{err}");
 }
 
+/// Scenario: Both catalog kinds enumerate through one shared listing pipeline
 #[test]
 fn both_kinds_share_one_listing_pipeline() {
     use iceberg::spec::{NestedField, PrimitiveType, Type};

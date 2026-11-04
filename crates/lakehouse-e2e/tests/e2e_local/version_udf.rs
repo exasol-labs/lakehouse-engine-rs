@@ -12,6 +12,7 @@ fn engine_crate_version() -> &'static str {
         .expect("crates/lakehouse-engine/Cargo.toml must declare `version = \"...\"`")
 }
 
+/// Scenario: The version entry point reports the compiled engine version
 #[test]
 fn version_udf_returns_the_compiled_crate_version() {
     stack();

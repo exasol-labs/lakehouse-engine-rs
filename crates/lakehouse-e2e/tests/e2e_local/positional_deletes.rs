@@ -151,6 +151,7 @@ fn fixture_spark_partition_granularity_delete_table() {
     }
 }
 
+/// Scenario: Positional deletes remove flagged rows (file granularity)
 #[test]
 fn e2e_file_granularity_returns_post_delete_rows() {
     setup_e2e();
@@ -269,6 +270,10 @@ fn e2e_partition_delete_spans_multiple_partitions() {
     );
 }
 
+/// Scenario: Recorded parallelism factor drives later work-unit sharding
+/// Scenario: A shared delete file is read once per shard regardless of referencing data-file count
+/// Scenario: File distributor is a passthrough LUA SET script that re-emits each shard's file list
+/// Scenario: Single shard short-circuits the distributor and calls the scalar scan directly
 #[test]
 fn e2e_partition_delete_invariant_across_fanout() {
     setup_e2e();
@@ -596,6 +601,7 @@ fn e2e_unsupported_data_file_format_fails_loud() {
     );
 }
 
+/// Scenario: A delete-free data file scans through the same provider unchanged
 #[test]
 fn e2e_delete_free_table_no_regression() {
     setup_e2e();

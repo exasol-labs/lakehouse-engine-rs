@@ -96,6 +96,7 @@ impl RecordingEndpoint {
     }
 }
 
+/// Scenario: Scan sizes its memory pool from the reported per-instance limit
 #[test]
 fn session_context_sizes_pool_from_ctx_limit() {
     let limit: u64 = 2 * 1024 * 1024 * 1024;
@@ -114,6 +115,7 @@ fn session_context_sizes_pool_from_ctx_limit() {
     }
 }
 
+/// Scenario: Scan falls back to the default budget when no memory limit is reported
 #[test]
 fn session_context_uses_default_budget_on_zero_limit() {
     let spec = minimal_spec();
@@ -151,6 +153,7 @@ fn memory_budget_round_trips_into_scan_spec() {
     );
 }
 
+/// Scenario: Scan configures its object store from the resolved connection budget
 #[test]
 fn client_options_carry_connection_budget() {
     let opts = client_options_for(32);
@@ -171,6 +174,7 @@ fn client_options_clamp_budget_to_at_least_one() {
     );
 }
 
+/// Scenario: Scan configures its object store from the resolved connection budget
 #[test]
 fn each_side_store_gets_the_full_connection_budget() {
     // Non-default: the shared fixture uses 8.
@@ -262,6 +266,7 @@ fn build_session_context_registers_the_checked_float_div_function() {
     );
 }
 
+/// Scenario: Two join sides in different buckets register two separate stores
 #[test]
 fn join_sides_in_two_buckets_register_two_stores() {
     let spec = spec_with_join(
@@ -327,6 +332,7 @@ fn adls_spec_with_join(fact_root: &str, dim_root: &str, cred: AdlsCred) -> ScanS
     spec
 }
 
+/// Scenario: The scan registers its object store without naming the backend
 #[test]
 fn an_azure_side_registers_under_a_container_qualified_url_the_registry_key_drops() {
     let spec = adls_spec(
@@ -418,6 +424,7 @@ fn azure_sides_in_different_accounts_register_two_stores() {
     }
 }
 
+/// Scenario: Two join sides in different buckets register two separate stores
 #[test]
 fn sides_on_different_backends_each_register_their_own_store() {
     const DIM_ROOT: &str = "abfss://dims@acct.dfs.core.windows.net/db/dim";
@@ -467,6 +474,7 @@ fn an_abfs_scheme_side_registers_a_store_under_its_own_key() {
     );
 }
 
+/// Scenario: The scan registers its object store without naming the backend
 #[test]
 fn an_unrecognised_azure_host_is_rejected_redacted() {
     let secret = "static-account-key";
@@ -860,6 +868,7 @@ fn side_store_url_returns_the_same_url_for_s3_as_the_deleted_bucket_derivation()
     );
 }
 
+/// Scenario: The scan registers its object store without naming the backend
 #[test]
 fn side_store_url_preserves_the_s3a_scheme_so_the_key_matches_the_lookup() {
     let files = vec![FileEntry::new("data/part-0.parquet", 1)];
@@ -882,6 +891,7 @@ fn side_store_url_preserves_the_s3a_scheme_so_the_key_matches_the_lookup() {
     );
 }
 
+/// Scenario: The scan registers its object store without naming the backend
 #[test]
 fn validate_sides_share_one_store_rejects_two_containers_in_one_account() {
     let colliding = abfss_spec(

@@ -822,6 +822,7 @@ async fn resolve_against_locationless_catalog(
     resolve_rest(body, "db.t", creds, &sample_storage(), None).await
 }
 
+/// Scenario: File resolution rejects a loadTable response that carries no table location
 #[tokio::test]
 async fn absent_table_location_errors_on_both_vended_and_static_paths() {
     let static_creds = sigv4_creds();
@@ -941,6 +942,7 @@ fn metadata_with_schema_history(
         .expect("synthetic Iceberg table metadata must deserialize")
 }
 
+/// Scenario: A date-to-timestamp promotion is refused at plan time by name
 #[test]
 fn date_to_timestamp_promotion_is_refused_naming_table_column_both_types_and_the_issue() {
     let metadata = metadata_with_schema_history(
@@ -1135,6 +1137,7 @@ fn assert_promotion_refusal_names_table_column_and_issue(err: UdfError) {
 }
 
 /// No snapshot, so reaching the refusal proves `resolve_scan` invokes it without a manifest read.
+/// Scenario: A date-to-timestamp promotion is refused at plan time by name
 #[tokio::test]
 async fn a_promoted_date_table_is_refused_filtered_or_not_and_from_either_metadata_source() {
     let body = load_table_body(serde_json::json!({
@@ -1212,7 +1215,6 @@ async fn resolve_metadata_file(
     resolve_from_notes(&reader, notes, None).await
 }
 
-/// Scenario: A Glue Iceberg table is planned from its metadata location by the one Iceberg planner
 #[tokio::test]
 async fn a_glue_iceberg_table_is_planned_from_its_metadata_file() {
     let body = name_mapped_load_table_body();
@@ -1372,6 +1374,7 @@ async fn iceberg_binary_fixed_and_uuid_columns_declare_their_byte_types_at_every
     assert!(resolved.refused_columns.is_empty());
 }
 
+/// Scenario: Iceberg logical schema maps to Arrow types for scan registration
 #[test]
 fn nested_iceberg_fields_stay_utf8_tagged_and_carry_a_nested_descriptor() {
     use iceberg::spec::{

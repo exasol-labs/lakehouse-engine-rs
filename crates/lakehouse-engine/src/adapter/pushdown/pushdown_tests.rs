@@ -168,6 +168,7 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
     );
 }
 
+/// Scenario: The guard composes with the LIKE type guard and the decimal-stringification rewriter without double coercion
 #[test]
 fn where_filter_decimal_stringification_rewritten_to_trim() {
     let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
@@ -199,6 +200,7 @@ fn where_filter_decimal_stringification_rewritten_to_trim() {
     );
 }
 
+/// Scenario: A DECIMAL column in a non-stringifying filter context is left unchanged
 #[test]
 fn filter_decimal_comparison_not_rewritten() {
     let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
@@ -270,6 +272,7 @@ fn where_filter_string_fn_over_double_declines() {
     );
 }
 
+/// Scenario: The guard composes with the LIKE type guard and the decimal-stringification rewriter without double coercion
 #[test]
 fn where_filter_upper_decimal_inside_like_subject_coerced() {
     let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
@@ -548,6 +551,7 @@ fn iceberg_declaration_omits_default_for_no_default_field() {
     );
 }
 
+/// Scenario: A decimal initial-default outside Exasol's catalog-decimal domain is not encoded as a numeric default
 #[test]
 fn iceberg_declaration_omits_default_for_decimal_outside_exasol_domain() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
@@ -1383,6 +1387,7 @@ fn declined_order_by_extension_runs_after_topn_detection() {
 }
 
 /// Scenario: An ORDER BY the adapter cannot bound as a top-N remains correctness-safe
+/// Scenario: An unrenderable expression sort key declines hard rather than silently dropping the ordering
 #[test]
 fn declined_order_by_renders_every_reachable_ordering_or_declines() {
     let unrenderable_expression = serde_json::json!({
@@ -2322,6 +2327,7 @@ fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     );
 }
 
+/// Scenario: The CHAR group-key pad preserves NULL, parses the declared width, and leaves the identity list unpadded
 #[test]
 fn order_by_on_a_char_declared_group_key_still_resolves_to_its_output_ordinal() {
     let request = char_grouped_request(

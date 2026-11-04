@@ -12,7 +12,6 @@ fn recorded(text: &str) -> Value {
     serde_json::from_str(&text).expect("a fixture is one JSON object")
 }
 
-/// Scenario: One batch-check per query decides every table before any table is read
 #[test]
 fn the_request_equals_the_one_recorded_from_lakekeeper() {
     let fixture = recorded(include_str!(
@@ -55,7 +54,6 @@ fn repeated_tables_are_checked_once_in_first_seen_order() {
     );
 }
 
-/// Scenario: A denied table refuses the whole query
 #[test]
 fn recorded_answers_read_as_allowed_or_denied() {
     for (text, allowed) in [

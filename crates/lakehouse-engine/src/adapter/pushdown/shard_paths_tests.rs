@@ -2,6 +2,7 @@ use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::{DeleteMechanism, DeltaDeletionVectorStorage};
 
+/// Scenario: Delete-file paths use the same relative/absolute encoding as data files
 #[test]
 fn delete_file_paths_use_relative_absolute_encoding() {
     let root = "s3://warehouse/db/table";
@@ -97,6 +98,7 @@ fn reconstruct_abs_uri_mirror(entry_path: &str, table_root: &str) -> String {
     format!("{root}/{rel}")
 }
 
+/// Scenario: A data-file path not under the table root is carried as an absolute path
 #[test]
 fn sibling_prefix_paths_are_not_relativized() {
     let root = "s3://w/db/events";

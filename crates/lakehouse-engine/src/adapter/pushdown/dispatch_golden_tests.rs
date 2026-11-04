@@ -519,6 +519,7 @@ fn empty_unmergeable_having_matches_group_by_wrapper_golden() {
     );
 }
 
+/// Scenario: An empty-result plan carries no storage block at all
 #[test]
 fn empty_single_group_agg_matches_golden() {
     let actual = empty_sql(&single_group_agg_request(), &[], &[]);
@@ -526,6 +527,7 @@ fn empty_single_group_agg_matches_golden() {
     assert_eq!(actual, expected);
 }
 
+/// Scenario: An empty-result plan carries no storage block at all
 #[test]
 fn empty_row_scan_matches_golden() {
     let (proj_cols, proj_types) = row_scan_projection();
@@ -564,6 +566,7 @@ fn aliased_grouped_request() -> Json {
     }))
 }
 
+/// Scenario: Single-table alias stripping leaves file pruning, the qualified fallback, and the no-alias path undisturbed
 #[test]
 fn aliased_single_table_group_by_renders_bare_group_key_and_select_expr() {
     let request = aliased_grouped_request();
@@ -625,6 +628,7 @@ fn aliased_multi_count_distinct_decline_request() -> Json {
     }))
 }
 
+/// Scenario: Single-table alias stripping leaves file pruning, the qualified fallback, and the no-alias path undisturbed
 #[test]
 fn aliased_multi_count_distinct_fallback_qualifies_lhs_t0_regardless_of_alias_presence() {
     let request = aliased_multi_count_distinct_decline_request();
@@ -865,6 +869,8 @@ fn join_scan_tuning() -> JoinScanRequestConfig<'static> {
     }
 }
 
+/// Scenario: A join filter with no type-rewrite trigger emits byte-identical SQL
+/// Scenario: An absent filter is distinguished from a declined filter at every site
 #[test]
 fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     let (proj_cols, proj_types) = row_scan_projection();
@@ -911,6 +917,8 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     );
 }
 
+/// Scenario: A join filter with no type-rewrite trigger emits byte-identical SQL
+/// Scenario: A filter that renders keeps the wrapper-free fast path unchanged
 #[test]
 fn rendering_filter_emits_unchanged_wrapper_free_scan() {
     let (proj_cols, proj_types) = row_scan_projection();

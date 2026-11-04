@@ -710,6 +710,7 @@ fn three_leg_self_join_attaches_each_condition_at_its_own_join_point() {
     );
 }
 
+/// Scenario: A column reference no leg key matches fails loudly
 #[test]
 fn unattributable_column_reference_is_a_hard_error_naming_the_column() {
     let mut request = self_join_request(&[Some("A"), Some("B")]);
@@ -1444,6 +1445,7 @@ fn render_expression_qualified_top_level_aggregate_byte_compatible() {
     );
 }
 
+/// Scenario: A CAST-to-CHAR item inside an Exasol-parsed wrapper declares a CHAR column
 #[test]
 fn qualified_count_distinct_cast_char_renders_exasol_char_target() {
     let legs = seam_legs();
@@ -1477,6 +1479,7 @@ fn qualified_count_distinct_cast_char_renders_exasol_char_target() {
     );
 }
 
+/// Scenario: A CAST-to-CHAR item inside an Exasol-parsed wrapper declares a CHAR column
 #[test]
 fn n_scan_join_select_list_renders_exasol_char_target() {
     let mut request = join_request(Json::Null, equi_condition());

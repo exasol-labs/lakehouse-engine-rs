@@ -117,6 +117,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
+/// Scenario: Phase telemetry is silent at the default debug level
 #[test]
 fn telemetry_silent_at_default_level() {
     let _g = lock();
@@ -173,6 +174,7 @@ fn telemetry_reports_three_phases_when_enabled() {
     );
 }
 
+/// Scenario: Telemetry attributes object-storage import time separately from emit time
 #[test]
 fn telemetry_attributes_import_separately_from_emit() {
     let _g = lock();
@@ -200,6 +202,7 @@ fn telemetry_attributes_import_separately_from_emit() {
     );
 }
 
+/// Scenario: A telemetry failure never fails the scan
 #[test]
 fn telemetry_failure_never_fails_scan() {
     let _g = lock();

@@ -58,6 +58,7 @@ fn assert_carries_no_sentinel(context: &str, text: &str) {
     }
 }
 
+/// Scenario: The scan UDF resolves the referenced CONNECTION
 #[test]
 fn sealed_storage_round_trips_and_rejects_a_tampered_payload() {
     let key = derive_sealed_storage_key(SEALING_PASSWORD);
@@ -88,6 +89,7 @@ fn sealed_storage_round_trips_and_rejects_a_tampered_payload() {
     }
 }
 
+/// Scenario: Own credentials travel by name and every other credential travels sealed
 #[test]
 fn key_material_is_present_only_for_a_non_empty_secret_bearing_field() {
     assert!(!connection_password_carries_key_material(

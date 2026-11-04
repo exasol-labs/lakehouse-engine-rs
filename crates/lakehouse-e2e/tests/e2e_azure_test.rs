@@ -326,6 +326,10 @@ fn write_azure_parquet_fixture(
 }
 
 /// Scenario: In-range Decimal128 maps to a precise Exasol DECIMAL
+/// Scenario: Scan reads data files with credentials referenced or carried in the scan spec
+/// Scenario: The storage backend under vending is selected from the table location's URI scheme
+/// Scenario: A vended Azure SAS is selected by host and carries a consistent account name
+/// Scenario: The CONNECTION selects the backend without vending and the table location selects it with vending
 #[test]
 fn azure_static_and_vended_creds_end_to_end() {
     // Vended-arm assertions run first so a static-arm regression cannot mask the

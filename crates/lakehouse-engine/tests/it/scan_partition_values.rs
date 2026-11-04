@@ -533,6 +533,7 @@ fn unpartitioned_logical_schema() -> Vec<LogicalField> {
     ]
 }
 
+/// Scenario: A scan with no partition columns is unchanged
 #[test]
 fn scan_without_partition_columns_is_byte_identical() {
     let tmp = tempfile::tempdir().unwrap();

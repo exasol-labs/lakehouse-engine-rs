@@ -268,7 +268,6 @@ fn shared_name_session() -> SessionContext {
     ctx
 }
 
-/// Scenario: Scan registers both tables and executes the inner equi-join
 #[tokio::test]
 async fn build_join_sql_resolves_a_shared_column_name_per_relation() {
     let ctx = shared_name_session();

@@ -115,6 +115,7 @@ async fn schema_answer_lists_every_file_and_folds_without_a_keep_predicate() {
     );
 }
 
+/// Scenario: Data files are listed recursively in a deterministic order
 #[tokio::test]
 async fn listing_is_recursive_filtered_and_deterministic() {
     let data = parquet_bytes(vec![nullable("id", DataType::Int32)], 1);

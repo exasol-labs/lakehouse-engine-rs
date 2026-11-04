@@ -1133,7 +1133,6 @@ fn unified_join_prunes_and_narrows_each_leg() {
     );
 }
 
-/// Scenario: A filter on a binary column selects what native Exasol selects over the hex text
 #[test]
 fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
     let c_name = [nullable_field("c_name", "binary")];

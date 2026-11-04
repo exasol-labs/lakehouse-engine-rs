@@ -301,6 +301,7 @@ fn refresh_reflects_added_table_and_column_change() {
     );
 }
 
+/// Scenario: Set properties overrides persisted properties and re-enumerates
 #[test]
 fn set_properties_retargets_namespace() {
     stack();
@@ -369,6 +370,7 @@ fn set_properties_retargets_namespace() {
     );
 }
 
+/// Scenario: Refresh and set properties redact credentials on catalog failure
 #[test]
 fn refresh_unreachable_catalog_redacts_credentials() {
     stack();
@@ -984,6 +986,8 @@ fn renamed_iceberg_column_reads_under_its_declared_name() {
 }
 
 /// Scenario: A column dropped at the source after the last REFRESH reads what older data files store
+/// Scenario: Added nullable column absent from a file with no initial-default is NULL-filled
+/// Scenario: Added required column absent from a file with no initial-default errors cleanly
 #[test]
 fn dropped_iceberg_column_reads_what_older_files_store() {
     stack();

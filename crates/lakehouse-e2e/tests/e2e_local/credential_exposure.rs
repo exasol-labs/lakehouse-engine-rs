@@ -293,6 +293,10 @@ fn setup_e2e() {
 }
 
 /// Scenario: The scan spec references the CONNECTION by name
+/// Scenario: Adapter reads catalog and storage credentials from a CONNECTION object
+/// Scenario: Generated SQL carries a credential reference, not a credential
+/// Scenario: Unsigned catalog path is unchanged when SigV4 and vending are both disabled
+/// Scenario: Static credentials are used for data files when vending is disabled
 #[test]
 fn the_readers_pushdown_plan_names_the_connection_and_carries_no_credential() {
     let _serial = serial();

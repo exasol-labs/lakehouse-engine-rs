@@ -19,6 +19,7 @@ fn unity_table(format: TableFormat) -> CatalogTable {
     }
 }
 
+/// Scenario: The format reader is selected at one site and refuses a mismatched pairing
 #[test]
 fn format_reader_refuses_an_iceberg_table_under_the_unity_source() {
     let creds = sigv4_creds();
@@ -51,6 +52,7 @@ fn format_reader_refuses_an_iceberg_table_under_the_unity_source() {
     );
 }
 
+/// Scenario: The format reader is selected at one site and refuses a mismatched pairing
 #[test]
 fn format_reader_selects_the_delta_reader_for_a_delta_table_without_contacting_the_catalog() {
     let creds = sigv4_creds();
@@ -153,7 +155,6 @@ fn offline_glue_session() -> GlueCatalogSession {
         .expect("the CONNECTION region signs the session without a request")
 }
 
-/// Scenario: A Glue Parquet table is planned by the shared catalog-declared Parquet reader
 #[tokio::test]
 async fn format_reader_selects_readers_for_a_glue_table_by_format_without_contacting_the_catalog() {
     let creds = sigv4_creds();

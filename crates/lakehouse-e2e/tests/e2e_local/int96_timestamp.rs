@@ -18,6 +18,7 @@ use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, stack, vs_table};
 
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
+/// Scenario: Out-of-range INT96 timestamp columns decode at microsecond resolution without overflow
 #[test]
 fn e2e_int96_fixture_present_and_int96_encoded() {
     stack();
@@ -65,6 +66,7 @@ fn e2e_int96_fixture_present_and_int96_encoded() {
     );
 }
 
+/// Scenario: Out-of-range INT96 timestamp columns decode at microsecond resolution without overflow
 #[test]
 fn e2e_int96_far_future_timestamp_scans_without_overflow() {
     lakehouse_vs();

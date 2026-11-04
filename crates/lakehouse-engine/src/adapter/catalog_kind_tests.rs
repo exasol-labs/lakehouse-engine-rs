@@ -11,6 +11,7 @@ fn absent_catalog_kind_resolves_iceberg_rest() {
     assert_eq!(kind, CatalogKind::IcebergRest);
 }
 
+/// Scenario: CATALOG_KIND naming Unity Catalog resolves the native Unity Catalog kind
 #[test]
 fn unity_catalog_value_resolves_native_kind() {
     for value in ["UNITY_CATALOG", "unity_catalog", "Unity_Catalog"] {
@@ -27,6 +28,7 @@ fn unity_catalog_value_resolves_native_kind() {
     }
 }
 
+/// Scenario: CATALOG_KIND naming direct storage resolves the direct-storage kind
 #[test]
 fn direct_storage_value_resolves_direct_storage_kind() {
     for value in ["DIRECT_STORAGE", "direct_storage", "Direct_Storage"] {
@@ -56,6 +58,7 @@ fn glue_catalog_kind_resolves_case_insensitively() {
     }
 }
 
+/// Scenario: An unrecognized CATALOG_KIND value is rejected with a clear error
 #[test]
 fn unrecognized_catalog_kind_is_rejected() {
     let props = json!({ "CATALOG_KIND": "SNOWFLAKE" });

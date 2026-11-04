@@ -18,7 +18,6 @@ fn the_encoded_note_round_trips_through_the_reader() {
     );
 }
 
-/// Scenario: Pushdown derives the scanned Iceberg table from the involved virtual table
 #[test]
 fn a_missing_or_unreadable_note_fails_naming_the_table_and_refresh() {
     let unreadable = [
@@ -41,7 +40,6 @@ fn a_missing_or_unreadable_note_fails_naming_the_table_and_refresh() {
     }
 }
 
-/// Scenario: Pushdown derives the scanned Iceberg table from the involved virtual table
 #[test]
 fn members_other_than_name_are_ignored() {
     let note = json!({"name": "lh.orders", "stamp": "1", "nested": {"name": "other"}});

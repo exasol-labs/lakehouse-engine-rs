@@ -320,7 +320,6 @@ fn join_spec_reconstitutes_two_file_lists() {
     );
 }
 
-/// Scenario: Scan registers both tables and executes the inner equi-join
 #[test]
 fn join_registers_each_side_against_its_own_backend() {
     let tmp = tempfile::tempdir().unwrap();
@@ -575,6 +574,7 @@ fn join_order_by_limit_emits_bounded_top_n_after_join() {
     );
 }
 
+/// Scenario: A post-join ordering and cap bound each join shard to its own top-N over the joined output
 #[test]
 fn join_order_by_limit_plans_as_topk_above_join() {
     let (_tmp, spec) = ordered_top_n_join_fixture();

@@ -38,7 +38,6 @@ fn a_binary_column_is_aliased_to_its_hex_text_and_exposes_its_raw_bytes() {
     );
 }
 
-/// Scenario: BINARY_AS_STRING reads a variable-length binary column as UTF-8 text
 #[test]
 fn binary_as_string_aliases_a_variable_length_column_to_its_validated_text() {
     let schema = DFSchema::try_from(arrow::datatypes::Schema::new(vec![

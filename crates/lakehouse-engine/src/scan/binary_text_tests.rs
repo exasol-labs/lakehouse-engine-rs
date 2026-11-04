@@ -30,7 +30,6 @@ fn every_variable_length_binary_encoding_reads_as_its_utf8_text() {
     );
 }
 
-/// Scenario: BINARY_AS_STRING reads a variable-length binary column as UTF-8 text
 #[test]
 fn a_value_that_is_not_valid_utf8_fails_naming_the_column() {
     let invalid = vec![Some("ok".as_bytes()), Some(&[0xff, 0xfe][..])];

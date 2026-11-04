@@ -278,7 +278,7 @@ async fn a_stalled_attempt_is_retried() {
     assert_eq!(accepted.load(Ordering::SeqCst), 2);
 }
 
-/// Scenario: An answer body is read while it keeps arriving
+/// Scenario: An answer body is read for as long as it keeps arriving
 #[tokio::test]
 async fn a_body_that_keeps_arriving_is_read_past_the_retry_window() {
     const PARTS: u32 = 10;
@@ -309,7 +309,7 @@ async fn a_body_that_keeps_arriving_is_read_past_the_retry_window() {
     assert_eq!(answer.body, b"x".repeat(PARTS as usize));
 }
 
-/// Scenario: An answer body is read while it keeps arriving
+/// Scenario: An answer body is read for as long as it keeps arriving
 #[tokio::test]
 async fn a_body_that_stalls_fails_at_the_read_timeout_without_a_retry() {
     let base_uri = spawn_header_stalling_server().await;

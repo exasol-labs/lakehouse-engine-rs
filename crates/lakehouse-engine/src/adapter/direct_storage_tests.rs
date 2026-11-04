@@ -45,6 +45,7 @@ fn client_is_reachable_as_a_boxed_catalog_client() {
     drop(client);
 }
 
+/// Scenario: The direct-storage client is a boxed catalog client declared in the engine crate
 #[tokio::test]
 async fn load_table_returns_a_clear_error_naming_the_direct_storage_kind() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

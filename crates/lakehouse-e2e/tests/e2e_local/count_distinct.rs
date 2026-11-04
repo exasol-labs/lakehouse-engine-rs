@@ -72,6 +72,9 @@ fn assert_count_distinct_fan_out_pushed_down(conn: &mut ExaConn, query_sql: &str
     );
 }
 
+/// Scenario: COUNT(DISTINCT) runs as a DISTINCT row-scan rather than a partial aggregate
+/// Scenario: Outer wrapper counts the unioned per-shard distinct rows with a native COUNT(DISTINCT)
+/// Scenario: Multi-shard COUNT(DISTINCT) dedups across the shard boundary, excludes NULLs, and returns zero for an empty result
 #[test]
 fn count_distinct_dedups_across_shards_excludes_nulls_empty() {
     lakehouse_vs();
@@ -115,6 +118,8 @@ fn count_distinct_dedups_across_shards_excludes_nulls_empty() {
     );
 }
 
+/// Scenario: COUNT(DISTINCT) runs as a DISTINCT row-scan rather than a partial aggregate
+/// Scenario: High-cardinality COUNT(DISTINCT) completes without a per-shard cap
 #[test]
 fn high_cardinality_count_distinct_completes() {
     lakehouse_vs();
@@ -168,6 +173,8 @@ fn harness_reads_high_cardinality_result_set_to_completion() {
     );
 }
 
+/// Scenario: Multiple distinct columns or a distinct mixed with ordinary aggregates decline the fan-out and route to a qualified single-table wrapper
+/// Scenario: Single-group COUNT(DISTINCT) detection fans out a lone distinct and declines multi-distinct or mixed shapes
 #[test]
 fn q9b_multi_count_distinct_matches_single_node() {
     lakehouse_vs();
@@ -295,6 +302,7 @@ fn count_distinct_expression_arg_combined_matches_single_node() {
     );
 }
 
+/// Scenario: Single-group COUNT(DISTINCT) is decomposed into a dedicated DISTINCT row-scan fan-out
 #[test]
 fn count_distinct_bare_column_type_matrix_matches_single_node() {
     // CHAR is absent: no Iceberg type maps to Exasol CHAR, so a bare CHAR column is
@@ -466,6 +474,7 @@ fn sum_all_files_pruned_returns_null() {
     );
 }
 
+/// Scenario: Grouped aggregate with all files pruned returns zero rows in grouped shape
 #[test]
 fn grouped_aggregate_all_files_pruned_returns_no_rows() {
     lakehouse_vs();
@@ -485,6 +494,7 @@ fn grouped_aggregate_all_files_pruned_returns_no_rows() {
 
 const GROUND_TRUTH_DISTINCT_TABLE: &str = "GT_DISTINCT_PROBE";
 
+/// Scenario: A nested aggregate the merge cannot decompose widens the projection instead of being evaluated per shard
 #[test]
 fn e2e_scalar_wrapped_count_distinct_routes_to_wrapper_and_matches_native_oracle() {
     lakehouse_vs();

@@ -259,6 +259,7 @@ fn single_shard_short_circuits_distributor_fromless() {
     );
 }
 
+/// Scenario: Shard count scales with the node count and is capped at the round-robin threshold
 #[test]
 fn shard_count_scales_with_nodes_and_caps_at_300() {
     assert_eq!(shard_count(10, 50, 500), 300, "must be capped at 300");
@@ -771,6 +772,7 @@ fn fan_out_serializes_common_once_files_per_shard() {
     );
 }
 
+/// Scenario: Connection budget travels once in the shard-invariant common spec
 #[test]
 fn common_spec_carries_s3_max_connections_exactly_once() {
     let files = vec![
@@ -1282,6 +1284,7 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
     );
 }
 
+/// Scenario: LIMIT, OFFSET, and ORDER BY are NOT pushed into the distinct fan-out sub-scan
 #[test]
 fn count_distinct_fan_out_omits_limit_offset_order_by() {
     // Real callers pass `limit: None, order_by: []`; the builder must strip them regardless.
@@ -2133,6 +2136,7 @@ fn like_guard_varchar_subject_unchanged() {
 }
 
 /// Scenario: LIKE on a VARCHAR or CHAR column pushes down unchanged
+/// Scenario: A CHAR-typed LIKE subject keeps pushing down unchanged
 #[test]
 fn like_guard_char_subject_unchanged() {
     let filter = serde_json::json!({
@@ -2543,6 +2547,7 @@ fn like_guard_not_wrapped_decimal_declines() {
     );
 }
 
+/// Scenario: A LIKE nested inside a CASE expression is type-guarded
 #[test]
 fn like_guard_decimal_inside_case_declines() {
     let filter = serde_json::json!({
@@ -2570,6 +2575,7 @@ fn like_guard_decimal_inside_case_declines() {
     );
 }
 
+/// Scenario: A LIKE nested inside a CASE expression is type-guarded
 #[test]
 fn like_guard_date_inside_case_wraps_cast() {
     let column = col("signup_date");
@@ -2917,6 +2923,7 @@ fn rewrite_length_wraps_decimal_argument() {
     );
 }
 
+/// Scenario: CAST, CONCAT, or LENGTH over a non-DECIMAL column is left unchanged
 #[test]
 fn rewrite_non_decimal_argument_unchanged() {
     let col_types = decimal_rewrite_col_types();
@@ -2940,6 +2947,7 @@ fn rewrite_non_decimal_argument_unchanged() {
     );
 }
 
+/// Scenario: A stringified computed expression is left unchanged as a tracked exception
 #[test]
 fn rewrite_computed_expression_argument_unchanged() {
     let computed = serde_json::json!({
@@ -2968,6 +2976,7 @@ fn rewrite_computed_expression_argument_unchanged() {
     );
 }
 
+/// Scenario: A DECIMAL column in a non-stringifying filter context is left unchanged
 #[test]
 fn rewrite_non_stringifying_context_unchanged() {
     let col_types = decimal_rewrite_col_types();
@@ -3130,6 +3139,7 @@ fn selectlist_length_decimal_arg_rewritten() {
     );
 }
 
+/// Scenario: CAST, CONCAT, or LENGTH over a non-DECIMAL column is left unchanged
 #[test]
 fn stringify_nondecimal_column_unchanged() {
     let pushdown_req = serde_json::json!({
@@ -3154,6 +3164,7 @@ fn stringify_nondecimal_column_unchanged() {
     );
 }
 
+/// Scenario: A stringified computed expression is left unchanged as a tracked exception
 #[test]
 fn stringify_computed_decimal_arg_untouched() {
     let computed = serde_json::json!({
@@ -3902,6 +3913,7 @@ fn string_fn_guard_casts_date_argument_to_varchar() {
     );
 }
 
+/// Scenario: A non-coercible resolvable column type in a WHERE-clause string function declines the whole filter
 #[test]
 fn string_fn_guard_declines_boolean_double_and_timestamp_arguments() {
     let col_types = decimal_rewrite_col_types();
@@ -3958,6 +3970,7 @@ fn string_fn_guard_reaches_function_under_comparison_predicate() {
     );
 }
 
+/// Scenario: A non-coercible resolvable column type in a WHERE-clause string function declines the whole filter
 #[test]
 fn string_fn_guard_nested_decline_propagates_to_root() {
     let col_types = decimal_rewrite_col_types();
@@ -3981,6 +3994,7 @@ fn string_fn_guard_nested_decline_propagates_to_root() {
     );
 }
 
+/// Scenario: Only string-position argument indices are coerced
 #[test]
 fn string_fn_guard_leaves_numeric_position_arguments_untouched() {
     let col_types = decimal_rewrite_col_types();
@@ -4101,6 +4115,7 @@ fn string_fn_guard_declines_instr_locate_beyond_two_args() {
     );
 }
 
+/// Scenario: CHR and UNICODECHR are excluded from the guard
 #[test]
 fn string_fn_guard_excludes_chr_and_unicodechr() {
     let col_types = decimal_rewrite_col_types();
@@ -4155,6 +4170,7 @@ fn column_exa_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
     );
 }
 
+/// Scenario: A non-bare-column string-position argument is left unchanged as a tracked exception
 #[test]
 fn string_fn_guard_leaves_computed_argument_unchanged() {
     let col_types = decimal_rewrite_col_types();
@@ -4177,6 +4193,7 @@ fn string_fn_guard_leaves_computed_argument_unchanged() {
     );
 }
 
+/// Scenario: A non-bare-column string-position argument is left unchanged as a tracked exception
 #[test]
 fn string_fn_guard_coerces_inner_nested_string_function() {
     let col_types = decimal_rewrite_col_types();
@@ -4396,6 +4413,7 @@ fn sealed_payload(selected: ScanStorage) -> String {
     }
 }
 
+/// Scenario: Own credentials travel by name and every other credential travels sealed
 #[test]
 fn scan_storage_variant_follows_vending_and_the_role() {
     for (names_role, vending) in [(false, false), (true, false), (false, true), (true, true)] {

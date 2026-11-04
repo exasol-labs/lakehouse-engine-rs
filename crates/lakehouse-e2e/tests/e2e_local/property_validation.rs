@@ -270,7 +270,7 @@ fn create_rejects_an_empty_table_pattern_entry() {
 /// Scenario: Threading mode defaults to AUTO when the property is absent
 /// Scenario: AUTO mode gives the node's single scan instance every core
 /// Scenario: AUTO derivation sizes the per-instance budget from the resolved thread count
-/// Scenario: Adapter derives the per-node core count from available_parallelism() on every request
+/// Scenario: Adapter reads the node's core count on every request and persists it nowhere
 #[test]
 fn create_without_tuning_properties_records_the_defaults() {
     const VS: &str = "PV_DEFAULTS";
@@ -490,6 +490,7 @@ fn misspelled_required_property_reports_the_misspelling() {
 }
 
 /// Scenario: An empty or null property value counts as absent
+/// Scenario: Set properties overrides persisted properties and re-enumerates
 #[test]
 fn empty_and_null_property_values_count_as_absent() {
     const VS: &str = "PV_EMPTY_NULL";

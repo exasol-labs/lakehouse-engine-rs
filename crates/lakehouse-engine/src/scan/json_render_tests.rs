@@ -70,7 +70,6 @@ fn utf8(values: &[&str]) -> ArrayRef {
     Arc::new(StringArray::from(values.to_vec()))
 }
 
-/// Scenario: A list, struct, or map value renders as one valid JSON document
 #[test]
 
 fn populated_nested_values_render_as_valid_json_documents() {
@@ -424,7 +423,6 @@ fn a_map_key_type_no_cast_reaches_utf8_is_refused_by_name() {
     );
 }
 
-/// Scenario: A binary column reads as lowercase hex on every source
 #[test]
 fn a_binary_map_key_renders_as_lowercase_hex() {
     let binary_keys = map_column(

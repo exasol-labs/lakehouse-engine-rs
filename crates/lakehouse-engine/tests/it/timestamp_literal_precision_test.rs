@@ -67,6 +67,7 @@ async fn assert_no_nanosecond_overflow(ctx: &SessionContext, sql: &str) -> usize
     }
 }
 
+/// Scenario: Far-future timestamp literals survive DataFusion optimization against a microsecond column
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn far_future_timestamp_literal_does_not_overflow_simplify_expressions() {
     let ctx = context_with_timestamp_columns();

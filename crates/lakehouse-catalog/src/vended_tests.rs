@@ -244,6 +244,7 @@ fn vended_storage_longest_matching_prefix_wins() {
     assert_eq!(merged.secret_key, "LONG_SK");
 }
 
+/// Scenario: One concept-level call resolves the effective scan storage from a loadTable response
 #[test]
 fn vended_storage_matches_a_prefix_across_a_case_variant_scheme() {
     let result = make_load_table_result(
@@ -403,6 +404,7 @@ fn vended_creds_are_the_sole_storage_source_in_spec() {
     );
 }
 
+/// Scenario: The vended selectors take a store address that cannot carry a credential
 #[test]
 fn empty_vended_key_pair_is_a_missing_credential_not_a_licence_to_read_static() {
     let result = make_load_table_result(
@@ -854,6 +856,7 @@ fn vended_explicit_path_style_false_wins_over_the_endpoint_coupled_default() {
     );
 }
 
+/// Scenario: One concept-level call resolves the effective scan storage from a loadTable response
 #[test]
 fn resolve_vended_storage_matched_entry_missing_key_does_not_fall_back_to_config() {
     let result = make_load_table_result(
@@ -933,6 +936,7 @@ fn resolve_vended_storage_allow_http_comes_from_the_threaded_parameter() {
     assert_names_no_credential_value(&message);
 }
 
+/// Scenario: One concept-level call resolves the effective scan storage from a loadTable response
 #[test]
 fn resolve_vended_storage_selects_credential_source_once_for_all_six_values() {
     let result = make_load_table_result(
@@ -1047,6 +1051,7 @@ fn vended_backend_variant_comes_from_the_anchor_scheme() {
     );
 }
 
+/// Scenario: The storage backend under vending is selected from the table location's URI scheme
 #[test]
 fn vended_backend_variant_comes_from_the_anchor_scheme_and_refuses_every_other() {
     let result = vended_result_flat_config();
@@ -1064,6 +1069,7 @@ fn vended_backend_variant_comes_from_the_anchor_scheme_and_refuses_every_other()
     }
 }
 
+/// Scenario: A vended-credentials request the catalog does not satisfy is a clear error
 #[test]
 fn unsatisfied_vended_request_errors_without_static_fallback() {
     let s3_anchor = "s3://bucket/db/t";
@@ -1157,6 +1163,7 @@ fn unsatisfied_vended_request_errors_without_static_fallback() {
     );
 }
 
+/// Scenario: A vended-credentials request the catalog does not satisfy is a clear error
 #[test]
 fn adls_missing_sas_refusal_names_the_host_after_redaction() {
     let result = adls_vended_result(&[(OTHER_ADLS_HOST, OTHER_HOST_SAS)]);
@@ -1319,6 +1326,7 @@ fn vended_adls_sas_case_variant_spellings_resolve_deterministically() {
     }
 }
 
+/// Scenario: The vended selector reaches the SAS state without widening the enum
 #[test]
 fn vended_adls_account_name_requires_a_labelled_host() {
     for (anchor, unlabelled_host) in [
@@ -1336,6 +1344,7 @@ fn vended_adls_account_name_requires_a_labelled_host() {
     }
 }
 
+/// Scenario: The vended selector reaches the SAS state without widening the enum
 #[test]
 fn vended_adls_backend_holds_the_sas_state_never_the_account_key_state() {
     let sas_key = format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{ADLS_HOST}");

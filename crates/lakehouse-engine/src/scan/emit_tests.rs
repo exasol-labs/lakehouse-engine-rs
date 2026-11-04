@@ -152,6 +152,7 @@ fn make_batch(values: &[i32]) -> RecordBatch {
     RecordBatch::try_new(schema, vec![arr]).unwrap()
 }
 
+/// Scenario: Arrow batches are emitted incrementally through the Arrow C Data Interface and never double-materialized
 #[tokio::test]
 async fn emits_batch_by_batch_without_materializing() {
     let input_batches = vec![
@@ -207,6 +208,8 @@ async fn emits_batch_by_batch_without_materializing() {
     }
 }
 
+/// Scenario: Scan surfaces a clean memory-exhaustion error instead of crashing the VM
+/// Scenario: An over-budget scan without spill disk fails with a clean resources-exhausted error
 #[tokio::test]
 async fn resources_exhausted_surfaces_as_memory_error_not_storage_error() {
     let secret = "AKIAIOSFODNN7EXAMPLE";

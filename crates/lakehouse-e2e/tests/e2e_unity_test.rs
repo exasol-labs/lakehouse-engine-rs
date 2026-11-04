@@ -744,6 +744,7 @@ fn assert_col_type(cols: &[(String, String)], column: &str, expected: &str) {
 /// Scenario: A scoped refresh lists Unity table names without columns and loads only the requested tables
 /// Scenario: Create virtual schema records each table's Unity Catalog identifier in its identifier note
 /// Scenario: A Unity Catalog table's identity survives the round trip from the involved table
+/// Scenario: Create virtual schema enumerates every table in the configured Unity Catalog namespace
 #[test]
 fn unity_create_virtual_schema_lists_fixture_tables_and_columns() {
     setup();
@@ -903,6 +904,7 @@ fn vended_and_static_rows_agree(conn: &mut ExaConn, table: &str) -> Vec<Vec<Stri
 }
 
 /// Scenario: Vended and static credentials resolve the same scan
+/// Scenario: Delta planning resolves its storage credential through the table's own catalog
 #[test]
 fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
     setup();
@@ -1010,6 +1012,8 @@ fn json_value_at(text: &str, start: usize) -> (serde_json::Value, usize) {
 }
 
 /// Scenario: A Delta data file carrying no deletion vector scans unchanged
+/// Scenario: A pushdown request under the Unity Catalog kind is planned as a Delta scan
+/// Scenario: A catalog that vends no storage endpoint or credential is read through the CONNECTION's storage fields
 #[test]
 fn unity_delta_delete_free_table_returns_its_rows() {
     setup();
@@ -1066,7 +1070,9 @@ fn unity_role_connection_reads_a_delta_table_through_the_session() {
     );
 }
 
+/// Scenario: A UUID-relative deletion vector removes exactly its flagged rows
 /// Scenario: Deletion vectors compose with projection, filter, LIMIT, and aggregation
+/// Scenario: A data file's deletion vector reference is carried verbatim exactly once
 #[test]
 fn unity_delta_deletion_vector_table_returns_only_live_rows() {
     setup();
@@ -1159,6 +1165,8 @@ fn unity_delta_column_mapped_tables_return_logical_column_values() {
 
 /// Scenario: A partition column absent from the data file is materialized per file
 /// Scenario: A materialized partition column is a first-class scan column
+/// Scenario: Partition values are carried per data file, including a NULL partition value
+/// Scenario: An absent partition value materializes NULL, never the partition-directory text
 #[test]
 fn unity_delta_partitioned_table_returns_partition_values() {
     setup();
@@ -1388,6 +1396,8 @@ const TYPE_WIDENING_SUPPORTED_COLUMNS: &str = "BYTE_LONG, INT_LONG, FLOAT_DOUBLE
      DATE_TIMESTAMP_NTZ";
 
 /// Scenario: A refused table fails the query with a SQL error and leaves the session usable
+/// Scenario: A pushdown request under the Unity Catalog kind is planned as a Delta scan
+/// Scenario: A table the reader cannot plan fails the query loud at plan time
 #[test]
 fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
     setup();
@@ -1426,6 +1436,7 @@ fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
 }
 
 /// Scenario: A narrow physical column binds to the current wider logical type and is cast per file
+/// Scenario: The cast resolution holds across every format and stops at the refusal boundary
 #[test]
 fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
     setup();
@@ -1611,6 +1622,7 @@ const STATS_ALL_TYPES_MAPPABLE_COLUMNS: &str = "BYTE_COL, SHORT_COL, INT_COL, LO
 
 /// Scenario: Every Delta type Exasol represents natively maps to its own Arrow tag
 /// Scenario: Unity Catalog Spark column types map to Exasol types sufficient for listing
+/// Scenario: Rendered field names are the table's logical names, not the file's physical ones
 #[test]
 fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
     setup();
@@ -1997,6 +2009,8 @@ fn unity_delta_pruned_pushdown_sql_carries_fewer_files_and_drives_the_scan_udf()
 
 /// Scenario: Partition columns come from the catalog and partition values from the file paths
 /// Scenario: A partition column's note carries its position among the partition columns
+/// Scenario: The client admits a Parquet base table and reports its partition columns
+/// Scenario: Create virtual schema enumerates every table in the configured Unity Catalog namespace
 #[test]
 fn unity_parquet_table_is_listed_and_returns_its_rows_and_partition_values() {
     setup();
@@ -2129,6 +2143,7 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
 }
 
 /// Scenario: Vended and static credentials resolve the same scan
+/// Scenario: Storage is resolved through the table's own catalog exactly as for a Delta table
 #[test]
 fn unity_parquet_planning_agrees_under_vended_and_static_credentials() {
     setup();
@@ -2602,6 +2617,7 @@ fn delta_pruning_keeps_every_file_with_a_matching_row() {
 /// Scenario: A single-group request that does not decompose routes to the qualified wrapper
 /// Scenario: Single-group HAVING is applied on every path
 /// Scenario: A fully-pruned file list yields one shape-correct empty row for a scalar-over-aggregate select list
+/// Scenario: Empty-result shape matches the plan the non-empty path would commit to
 #[test]
 fn delta_single_group_aggregates_match_the_oracle() {
     setup();

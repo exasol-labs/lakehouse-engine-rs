@@ -101,7 +101,6 @@ fn non_inner_node_in_join_tree_is_ineligible() {
     );
 }
 
-/// Scenario: Each join leg resolves its catalog identifier from its own identifier note
 #[test]
 fn each_leg_reads_its_identifier_from_its_own_involved_table() {
     let mut request = three_table_join_request();
@@ -132,7 +131,6 @@ fn each_leg_reads_its_identifier_from_its_own_involved_table() {
     );
 }
 
-/// Scenario: Each join leg resolves its catalog identifier from its own identifier note
 #[test]
 fn a_leg_without_an_identifier_note_is_err() {
     let mut request = three_table_join_request();

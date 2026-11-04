@@ -884,6 +884,7 @@ async fn field_id_adapter_reads_divergent_layouts_across_files() {
     );
 }
 
+/// Scenario: Every supported primitive initial-default survives the scan-spec serialization round-trip
 #[test]
 fn initial_default_round_trips_across_full_type_vocabulary() {
     use crate::scan::spec::LogicalField;

@@ -96,6 +96,7 @@ async fn refusal_as(
 /// A role CONNECTION that vends takes the same vended path as a static one; its
 /// session is only the effective static credential, so a missing vending key must
 /// refuse rather than fall back to it either.
+/// Scenario: Delta planning resolves its storage credential through the table's own catalog
 #[tokio::test]
 async fn vending_without_a_vending_key_errors_and_never_falls_back_to_static() {
     const SESSION_SECRET: &str = "SESSION_SECRET_SENTINEL";

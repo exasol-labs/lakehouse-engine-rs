@@ -4,6 +4,8 @@ use std::process::Command;
 
 use crate::common::stack::lakehouse_engine_so_path;
 
+/// Scenario: File distributor is a passthrough LUA SET script that re-emits each shard's file list
+/// Scenario: One crate exports the adapter, scan, and version entry points
 #[test]
 fn so_exports_three_entry_point_symbols() {
     let so = lakehouse_engine_so_path();

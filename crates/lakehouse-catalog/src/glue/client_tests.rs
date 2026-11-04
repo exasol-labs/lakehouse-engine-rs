@@ -182,7 +182,6 @@ fn assert_no_credential(text: &str) {
     }
 }
 
-/// Scenario: The client routes a table by its declared table type before its storage descriptor
 #[tokio::test]
 async fn the_listing_routes_each_table_by_its_table_type_before_its_input_format() {
     const SEQUENCE: &str = "org.apache.hadoop.mapred.SequenceFileInputFormat";

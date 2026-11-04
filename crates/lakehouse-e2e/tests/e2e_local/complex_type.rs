@@ -43,6 +43,9 @@ fn assert_rendered(cell: &serde_json::Value, expected: Option<serde_json::Value>
 }
 
 /// Scenario: A list, struct, or map value renders as one valid JSON document
+/// Scenario: A nested physical column is diverted around the physical-to-logical cast
+/// Scenario: The rendered column crosses the emit boundary as the declared VARCHAR
+/// Scenario: A mixed-column Parquet file round-trips through schema mapping and scan
 #[test]
 fn iceberg_nested_columns_return_valid_json_end_to_end() {
     setup();

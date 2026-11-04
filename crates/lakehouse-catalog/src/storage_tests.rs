@@ -141,6 +141,7 @@ fn secret_values_are_the_wrapped_props_secret_values() {
     );
 }
 
+/// Scenario: The scan-spec wire carries the backend as a tagged variant
 #[test]
 fn s3_serializes_under_a_lowercase_externally_tagged_variant_key() {
     assert_eq!(
@@ -170,6 +171,7 @@ fn s3_round_trips_through_its_tagged_encoding() {
     );
 }
 
+/// Scenario: The scan-spec wire carries the backend as a tagged variant
 #[test]
 fn only_matching_lowercase_variant_keys_decode() {
     for payload in [
@@ -188,6 +190,7 @@ fn only_matching_lowercase_variant_keys_decode() {
     }
 }
 
+/// Scenario: One enum names the storage backend and answers every backend-specific question
 #[test]
 fn adls_catalog_storage_props_emit_the_account_and_one_credential_key() {
     let account_key_backend = StorageBackend::Adls {
@@ -221,6 +224,7 @@ fn adls_catalog_storage_props_emit_the_account_and_one_credential_key() {
     );
 }
 
+/// Scenario: One enum names the storage backend and answers every backend-specific question
 #[test]
 fn adls_file_io_is_configured_from_exactly_the_catalog_storage_props() {
     let backend = StorageBackend::Adls {
@@ -234,6 +238,8 @@ fn adls_file_io_is_configured_from_exactly_the_catalog_storage_props() {
     );
 }
 
+/// Scenario: The vended selector reaches the SAS state without widening the enum
+/// Scenario: One enum names the storage backend and answers every backend-specific question
 #[test]
 fn adls_secret_values_are_the_one_credential_and_omit_an_empty_one() {
     let account_key_backend = StorageBackend::Adls {
@@ -264,6 +270,7 @@ fn adls_secret_values_are_the_one_credential_and_omit_an_empty_one() {
     );
 }
 
+/// Scenario: No diagnostic rendering of storage settings prints a credential value
 #[test]
 fn adls_cred_is_redacted_in_debug_output() {
     let account_key = AdlsCred::AccountKey("azure-static-key-secret".into());
@@ -293,6 +300,7 @@ fn adls_cred_is_redacted_in_debug_output() {
     );
 }
 
+/// Scenario: The scan-spec wire carries the backend as a tagged variant
 #[test]
 fn adls_serializes_under_a_lowercase_externally_tagged_variant_key() {
     let backend = StorageBackend::Adls {
@@ -311,6 +319,7 @@ fn adls_serializes_under_a_lowercase_externally_tagged_variant_key() {
     );
 }
 
+/// Scenario: The scan-spec wire carries the backend as a tagged variant
 #[test]
 fn adls_round_trips_through_its_tagged_encoding() {
     let backend = StorageBackend::Adls {
@@ -388,6 +397,7 @@ fn adls_account_name_errs_when_the_host_has_no_leading_label() {
 const ADLS_HOST: &str = "myacct.dfs.core.windows.net";
 const VENDED_SAS: &str = "sv=2024-11-04&sig=VENDED_SAS_SIGNATURE";
 
+/// Scenario: Plaintext transport needs the operator's consent on every vended path
 #[test]
 fn adls_backend_gates_abfs_on_allow_http_and_never_gates_abfss() {
     let plaintext = format!("abfs://mycontainer@{ADLS_HOST}/db/t");
@@ -469,6 +479,7 @@ fn vended_s3(endpoint: Option<&str>, region: Option<&str>, path_style: Option<bo
     }
 }
 
+/// Scenario: Plaintext transport needs the operator's consent on every vended path
 #[test]
 fn s3_backend_gates_a_plaintext_endpoint_the_connection_supplied() {
     let plaintext = "http://minio:9000";
@@ -525,6 +536,7 @@ fn s3_backend_gates_a_plaintext_endpoint_the_connection_supplied() {
     );
 }
 
+/// Scenario: The vended selectors take a store address that cannot carry a credential
 #[test]
 fn store_address_resolves_endpoint_and_region_independently_with_the_connection_winning() {
     let connection_endpoint = "https://connection.endpoint.invalid";
@@ -585,6 +597,7 @@ fn store_address_resolves_endpoint_and_region_independently_with_the_connection_
     }
 }
 
+/// Scenario: The vended selectors take a store address that cannot carry a credential
 #[test]
 fn a_both_empty_store_address_resolves_rather_than_refusing() {
     let props = s3_payload(
@@ -670,6 +683,7 @@ fn a_stated_connection_path_style_wins_over_the_vended_value() {
     );
 }
 
+/// Scenario: The vended selectors take a store address that cannot carry a credential
 #[test]
 fn path_style_resolves_the_connection_then_the_vended_value_then_the_endpoint_derivation() {
     let endpoint = "https://minio.invalid";

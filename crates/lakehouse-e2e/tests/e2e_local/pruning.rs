@@ -96,6 +96,7 @@ fn hive_partition_pruning_keeps_every_file_with_a_matching_row() {
 /// Scenario: A single-group request that does not decompose routes to the qualified wrapper
 /// Scenario: Single-group HAVING is applied on every path
 /// Scenario: A fully-pruned file list yields one shape-correct empty row for a scalar-over-aggregate select list
+/// Scenario: Empty-result shape matches the plan the non-empty path would commit to
 #[test]
 fn iceberg_single_group_aggregates_match_the_oracle() {
     setup();
@@ -106,6 +107,7 @@ fn iceberg_single_group_aggregates_match_the_oracle() {
 /// Scenario: A single-group request that does not decompose routes to the qualified wrapper
 /// Scenario: Single-group HAVING is applied on every path
 /// Scenario: A fully-pruned file list yields one shape-correct empty row for a scalar-over-aggregate select list
+/// Scenario: Empty-result shape matches the plan the non-empty path would commit to
 #[test]
 fn hive_single_group_aggregates_match_the_oracle() {
     setup();

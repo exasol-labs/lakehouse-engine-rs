@@ -47,6 +47,8 @@ fn empty_tables_body() -> String {
     r#"{"tables":[]}"#.to_string()
 }
 
+/// Scenario: The list request stays within the Unity Catalog wire contract
+/// Scenario: The client lists tables in a configured catalog and schema
 #[tokio::test]
 async fn lists_tables_in_catalog_schema() {
     let server = spawn_recording_server(|_req| (200, tables_page_body())).await;
@@ -146,6 +148,7 @@ fn identifier_listing_query_omits_columns_properties_and_username() {
     );
 }
 
+/// Scenario: The client returns managed and external Delta base tables including a shallow clone
 #[tokio::test]
 async fn includes_managed_and_external_delta_base_tables() {
     let body = r#"{"tables":[
@@ -186,6 +189,7 @@ async fn includes_managed_and_external_delta_base_tables() {
     }
 }
 
+/// Scenario: The client routes a view, an unplannable format, and any other table type into the skipped set with a reason
 #[tokio::test]
 async fn skips_view_unplannable_format_and_other_type_with_reason() {
     let body = r#"{"tables":[
@@ -240,6 +244,7 @@ async fn skips_view_unplannable_format_and_other_type_with_reason() {
     );
 }
 
+/// Scenario: The client retrieves a table's metadata including its columns
 #[tokio::test]
 async fn loads_table_metadata_with_columns() {
     let server = spawn_recording_server(|_req| (200, single_table_body())).await;
@@ -296,6 +301,7 @@ async fn loads_table_percent_encodes_reserved_full_name_segments() {
     );
 }
 
+/// Scenario: The client follows pagination across every result page
 #[tokio::test]
 async fn follows_pagination_across_pages() {
     let server = spawn_recording_server(|req| {
@@ -516,6 +522,7 @@ async fn every_unity_request_kind_succeeds_after_one_503() {
     );
 }
 
+/// Scenario: One session serves both OSS and Databricks-managed Unity Catalog
 #[tokio::test]
 async fn identical_request_shape_oss_and_databricks() {
     let oss = spawn_recording_server(|_req| (200, empty_tables_body())).await;
@@ -553,6 +560,7 @@ async fn identical_request_shape_oss_and_databricks() {
     );
 }
 
+/// Scenario: The client lists tables in a configured catalog and schema
 #[tokio::test]
 async fn list_tables_tags_each_admitted_table_by_its_own_format() {
     let body = r#"{"tables":[
@@ -630,6 +638,7 @@ async fn list_tables_tags_each_admitted_table_by_its_own_format() {
     );
 }
 
+/// Scenario: The client retrieves a table's metadata including its columns
 #[tokio::test]
 async fn load_table_returns_format_tag_vending_key_partition_columns_and_ordered_columns() {
     let server = spawn_recording_server(|_req| (200, single_table_body())).await;
@@ -658,6 +667,8 @@ async fn load_table_returns_format_tag_vending_key_partition_columns_and_ordered
     );
 }
 
+/// Scenario: The single-table load serves only the scan path and applies no admission filter
+/// Scenario: The single-table load refuses a data source format the crate cannot name
 #[tokio::test]
 async fn load_table_maps_the_uppercase_iceberg_and_parquet_formats_to_their_tags() {
     for (raw_format, expected) in [
@@ -677,6 +688,7 @@ async fn load_table_maps_the_uppercase_iceberg_and_parquet_formats_to_their_tags
     }
 }
 
+/// Scenario: The single-table load refuses a data source format the crate cannot name
 #[tokio::test]
 async fn load_table_refuses_an_absent_or_unrecognized_data_source_format() {
     for (raw_format_member, expected_value) in [
@@ -711,6 +723,7 @@ async fn load_table_refuses_an_absent_or_unrecognized_data_source_format() {
     }
 }
 
+/// Scenario: The single-table load's refusal is a returned error value that never carries a credential
 #[tokio::test]
 async fn load_table_format_refusal_carries_no_credential() {
     let body = table_body_with_raw_format(r#""data_source_format":"CSV","#);
@@ -750,6 +763,7 @@ async fn a_whitespace_only_table_id_projects_to_an_absent_vending_key() {
     );
 }
 
+/// Scenario: The single-table load serves only the scan path and applies no admission filter
 #[test]
 fn neutral_table_reports_an_absent_vending_key_rather_than_an_empty_one() {
     for raw_key_member in ["", r#""table_id":null,"#, r#""table_id":"","#] {
@@ -794,6 +808,7 @@ fn neutral_table_carries_the_wire_properties_verbatim_and_an_absent_map_as_empty
     }
 }
 
+/// Scenario: The client routes a view, an unplannable format, and any other table type into the skipped set with a reason
 #[test]
 fn admission_admits_delta_and_parquet_base_tables_and_names_every_refusal() {
     let skip = |detail: &str| {

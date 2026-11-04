@@ -2,6 +2,7 @@ use super::*;
 use crate::test_support::*;
 use serde_json::json;
 
+/// Scenario: Bare column reference translates to quoted identifier
 #[test]
 fn renders_column_as_quoted_uppercase_ident() {
     for (name, expected) in [("region", r#""REGION""#), (r#"my"col"#, r#""MY""COL""#)] {
@@ -13,6 +14,7 @@ fn renders_column_as_quoted_uppercase_ident() {
     }
 }
 
+/// Scenario: Bare column reference translates to quoted identifier
 #[test]
 fn renders_table_qualified_column_when_alias_present() {
     let expr = json!({"type": "column", "name": "id", "tableAlias": "LHS_FACT"});
@@ -62,12 +64,14 @@ fn timestamp_literal_with_sub_microsecond_digits_renders_nanoseconds() {
     }
 }
 
+/// Scenario: Comparison predicates translate to binary operator expressions
 #[test]
 fn renders_simple_equality() {
     let expr = predicate_equal(col("id"), num_lit(10));
     assert_eq!(render_expression(&expr).unwrap(), r#"("ID" = 10)"#);
 }
 
+/// Scenario: Logical connectives translate to AND/OR/NOT with parentheses
 #[test]
 fn renders_and_predicate() {
     let expr = json!({
@@ -81,6 +85,7 @@ fn renders_and_predicate() {
     assert!(sql.contains("AND"), "AND not found in: {sql}");
 }
 
+/// Scenario: Logical connectives translate to AND/OR/NOT with parentheses
 #[test]
 fn renders_or_predicate() {
     let expr = json!({
@@ -94,6 +99,7 @@ fn renders_or_predicate() {
     assert!(sql.contains("OR"), "OR not found in: {sql}");
 }
 
+/// Scenario: Logical connectives translate to AND/OR/NOT with parentheses
 #[test]
 fn renders_not_predicate() {
     let expr = json!({
@@ -104,6 +110,7 @@ fn renders_not_predicate() {
     assert!(sql.contains("NOT"), "NOT not found in: {sql}");
 }
 
+/// Scenario: Logical connectives translate to AND/OR/NOT with parentheses
 #[test]
 fn renders_empty_junction_as_its_identity() {
     for (expr, expected) in [(predicate_and([]), "TRUE"), (predicate_or([]), "FALSE")] {
@@ -111,18 +118,21 @@ fn renders_empty_junction_as_its_identity() {
     }
 }
 
+/// Scenario: IS NULL and IS NOT NULL predicates translate correctly
 #[test]
 fn renders_is_null() {
     let expr = json!({"type": "predicate_is_null", "expression": col("x")});
     assert_eq!(render_expression(&expr).unwrap(), r#"("X" IS NULL)"#);
 }
 
+/// Scenario: IS NULL and IS NOT NULL predicates translate correctly
 #[test]
 fn renders_is_not_null() {
     let expr = json!({"type": "predicate_is_not_null", "expression": col("x")});
     assert_eq!(render_expression(&expr).unwrap(), r#"("X" IS NOT NULL)"#);
 }
 
+/// Scenario: IN constant list translates to SQL IN expression
 #[test]
 fn renders_in_constlist() {
     let expr = json!({
@@ -139,12 +149,14 @@ fn renders_in_constlist() {
     assert!(sql.contains("'B'"), "'B' not found: {sql}");
 }
 
+/// Scenario: IN constant list translates to SQL IN expression
 #[test]
 fn renders_empty_in_as_false() {
     let expr = predicate_in(col("x"), []);
     assert_eq!(render_expression(&expr).unwrap(), "FALSE");
 }
 
+/// Scenario: IN constant list translates to SQL IN expression
 #[test]
 fn renders_in_constlist_strips_null() {
     let expr = predicate_in(
@@ -156,12 +168,14 @@ fn renders_in_constlist_strips_null() {
     assert!(!sql.contains("NULL"), "NULL should not survive: {sql}");
 }
 
+/// Scenario: IN constant list translates to SQL IN expression
 #[test]
 fn renders_all_null_in_as_false() {
     let expr = predicate_in(col("x"), [null_lit(), date_lit(Json::Null)]);
     assert_eq!(render_expression(&expr).unwrap(), "FALSE");
 }
 
+/// Scenario: IN constant list translates to SQL IN expression
 #[test]
 fn renders_not_in_constlist_strips_null() {
     let expr = predicate_not(predicate_in(
@@ -172,6 +186,7 @@ fn renders_not_in_constlist_strips_null() {
     assert_eq!(sql, r#"(NOT ("STATUS" IN ('A')))"#);
 }
 
+/// Scenario: BETWEEN predicate translates correctly
 #[test]
 fn renders_between() {
     let expr = json!({
@@ -186,6 +201,7 @@ fn renders_between() {
     assert!(sql.contains("65"), "high bound not found: {sql}");
 }
 
+/// Scenario: LIKE predicate translates with optional escape character
 #[test]
 fn renders_like_without_escape() {
     let expr = predicate_like(col("name"), str_lit("A%"));
@@ -194,6 +210,7 @@ fn renders_like_without_escape() {
     assert!(!sql.contains("ESCAPE"), "ESCAPE should be absent: {sql}");
 }
 
+/// Scenario: LIKE predicate translates with optional escape character
 #[test]
 fn renders_like_with_escape() {
     let expr = json!({
@@ -229,6 +246,7 @@ fn legacy_mul_name_is_not_recognized() {
     );
 }
 
+/// Scenario: Arithmetic operators translate to binary SQL expressions
 #[test]
 fn renders_two_column_arithmetic_product() {
     let expr = json!({
@@ -245,6 +263,7 @@ fn renders_two_column_arithmetic_product() {
     );
 }
 
+/// Scenario: Arithmetic operators translate to binary SQL expressions
 #[test]
 fn arithmetic_operator_set_matches_advertised_capabilities() {
     let arithmetic = [
@@ -336,6 +355,7 @@ fn renders_arithmetic_neg() {
     assert_eq!(render_expression(&expr).unwrap(), r#"(-"A")"#);
 }
 
+/// Scenario: Arithmetic operators translate to binary SQL expressions
 #[test]
 fn neg_composes_with_aggregate_decomposition() {
     let sum_neg = aggregate("SUM", [scalar_fn("NEG", [col("col")])]);
@@ -489,6 +509,7 @@ fn renders_cast_nested_function_scalar_defensive() {
     assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
 }
 
+/// Scenario: Decimal-to-VARCHAR node renders Exasol-trimmed string
 #[test]
 fn renders_decimal_to_varchar_exasol() {
     let expr = json!({
@@ -500,6 +521,7 @@ fn renders_decimal_to_varchar_exasol() {
     assert_eq!(render_expression_safe(&expr).unwrap(), expected);
 }
 
+/// Scenario: Decimal-to-VARCHAR node renders Exasol-trimmed string
 #[test]
 fn decimal_to_varchar_exasol_wrong_arity_errors() {
     let no_args = decimal_to_varchar([]);
@@ -524,6 +546,7 @@ fn format_decimal_exasol_style_renders_exact_regex_sql() {
     );
 }
 
+/// Scenario: An unsupported expression node fails a required translation with an error naming its type
 #[test]
 fn unsupported_node_returns_error() {
     let expr = json!({"type": "fn_sum", "operands": []});
@@ -534,12 +557,14 @@ fn unsupported_node_returns_error() {
     );
 }
 
+/// Scenario: An unsupported expression node declines translation without failing
 #[test]
 fn unsupported_node_returns_none_in_safe_mode() {
     let expr = json!({"type": "fn_sum", "operands": []});
     assert!(render_expression_safe(&expr).is_none());
 }
 
+/// Scenario: A trivially-true filter is omitted from the pushed-down scan
 #[test]
 fn trivially_true_filter_returns_none_in_safe_mode_in_both_dialects() {
     for filter in [bool_lit(true), null_lit()] {
@@ -558,6 +583,7 @@ fn renders_timestamp_utc_literal() {
     );
 }
 
+/// Scenario: Plain timestamp literals render as bare Exasol TIMESTAMP literals in the Exasol dialect
 #[test]
 fn renders_timestamp_literals_as_bare_timestamp_in_exasol_dialect() {
     let ts = timestamp_lit("2024-01-15 12:00:00");
@@ -631,6 +657,7 @@ fn renders_null_valued_tstz_literal_bare_in_exasol_dialect() {
     }
 }
 
+/// Scenario: Plain timestamp literals render as bare Exasol TIMESTAMP literals in the Exasol dialect
 #[test]
 fn renders_null_valued_timestamp_literal_per_dialect() {
     let cases = [
@@ -659,6 +686,7 @@ fn renders_null_valued_timestamp_literal_per_dialect() {
     }
 }
 
+/// Scenario: Math scalar functions translate to DataFusion math calls
 #[test]
 fn renders_math_scalar_functions() {
     let cases_1arg = [
@@ -715,6 +743,7 @@ fn renders_mod_as_operator() {
     assert_eq!(render_expression(&expr).unwrap(), r#"("A" % 3)"#);
 }
 
+/// Scenario: MOD translates to the modulo operator
 #[test]
 fn renders_mod_as_function_call_in_exasol_dialect() {
     let expr = scalar_fn("MOD", [col("a"), num_lit(3)]);
@@ -722,6 +751,7 @@ fn renders_mod_as_function_call_in_exasol_dialect() {
     assert_eq!(render_expression(&expr).unwrap(), r#"("A" % 3)"#);
 }
 
+/// Scenario: String scalar functions translate to DataFusion string calls
 #[test]
 fn renders_string_scalar_functions() {
     let cases_lower = [
@@ -776,6 +806,7 @@ fn renders_string_scalar_functions() {
     }
 }
 
+/// Scenario: CONCAT translates to a NULL-skipping DataFusion concat call
 #[test]
 fn renders_concat_as_nullif_wrapped_concat_call() {
     for (expr, expected) in [
@@ -792,6 +823,7 @@ fn renders_concat_as_nullif_wrapped_concat_call() {
     }
 }
 
+/// Scenario: CONCAT translates to a NULL-skipping DataFusion concat call
 #[test]
 fn renders_concat_bool_operand_as_exasol_case() {
     let expr = scalar_fn(
@@ -804,6 +836,7 @@ fn renders_concat_bool_operand_as_exasol_case() {
     );
 }
 
+/// Scenario: CONCAT translates to a NULL-skipping DataFusion concat call
 #[test]
 fn renders_concat_as_chained_pipe_operator_in_exasol_dialect() {
     for (expr, expected) in [
@@ -827,6 +860,7 @@ fn renders_concat_as_chained_pipe_operator_in_exasol_dialect() {
     }
 }
 
+/// Scenario: CONCAT translates to a NULL-skipping DataFusion concat call
 #[test]
 fn renders_nested_concat_wrapper_per_level() {
     let expr = scalar_fn(
@@ -843,6 +877,7 @@ fn renders_nested_concat_wrapper_per_level() {
     );
 }
 
+/// Scenario: CONCAT translates to a NULL-skipping DataFusion concat call
 #[test]
 fn renders_concat_single_argument() {
     let expr = scalar_fn("CONCAT", [col("s")]);
@@ -853,6 +888,7 @@ fn renders_concat_single_argument() {
     assert_eq!(render_expression_exasol(&expr).unwrap(), r#"("S")"#);
 }
 
+/// Scenario: CONCAT translates to a NULL-skipping DataFusion concat call
 #[test]
 fn concat_empty_argument_list_errors_in_both_dialects() {
     let expr = scalar_fn("CONCAT", []);
@@ -866,6 +902,7 @@ fn concat_empty_argument_list_errors_in_both_dialects() {
     assert!(render_expression_exasol_safe(&expr).is_none());
 }
 
+/// Scenario: CONCAT translates to a NULL-skipping DataFusion concat call
 #[test]
 fn concat_missing_arguments_or_null_argument_errors_in_both_dialects() {
     let expr = json!({
@@ -892,6 +929,7 @@ fn concat_missing_arguments_or_null_argument_errors_in_both_dialects() {
     assert!(render_expression_exasol_safe(&expr).is_none());
 }
 
+/// Scenario: CASE expression translates to SQL CASE WHEN
 #[test]
 fn renders_case_when() {
     for (expr, expected) in [
@@ -922,6 +960,7 @@ fn renders_case_when() {
     assert!(render_expression_safe(&scalar_fn("CASE", [])).is_none());
 }
 
+/// Scenario: GREATEST and LEAST translate to DataFusion greatest/least
 #[test]
 fn renders_greatest_least_behind_a_null_guard() {
     let cases = [
@@ -973,6 +1012,7 @@ fn renders_greatest_least_behind_a_null_guard() {
     }
 }
 
+/// Scenario: GREATEST and LEAST translate to DataFusion greatest/least
 #[test]
 fn renders_greatest_least_empty_argument_list_errors() {
     for name in ["GREATEST", "LEAST"] {
@@ -988,6 +1028,7 @@ fn renders_greatest_least_empty_argument_list_errors() {
     }
 }
 
+/// Scenario: GREATEST and LEAST translate to DataFusion greatest/least
 #[test]
 fn greatest_least_without_arguments_key_errors() {
     for name in ["GREATEST", "LEAST"] {
@@ -1008,6 +1049,7 @@ fn greatest_least_without_arguments_key_errors() {
     }
 }
 
+/// Scenario: NULLIFZERO and ZEROIFNULL translate to NULLIF and COALESCE
 #[test]
 fn renders_nullifzero_zeroifnull() {
     for (name, expected) in [
@@ -1019,6 +1061,7 @@ fn renders_nullifzero_zeroifnull() {
     }
 }
 
+/// Scenario: NULLIF translates to the DataFusion nullif call
 #[test]
 fn renders_nullif_of_mod() {
     let expr = scalar_fn(
@@ -1071,6 +1114,7 @@ fn renders_case_without_else() {
     );
 }
 
+/// Scenario: EXTRACT translates to the DataFusion date_part call
 #[test]
 fn renders_extract() {
     for (field, expected) in [
@@ -1082,6 +1126,7 @@ fn renders_extract() {
     }
 }
 
+/// Scenario: EXTRACT renders Exasol's EXTRACT FROM form in the Exasol dialect
 #[test]
 fn renders_extract_as_exasol_extract_from_in_exasol_dialect() {
     let expr = json!({
@@ -1100,6 +1145,7 @@ fn renders_extract_as_exasol_extract_from_in_exasol_dialect() {
     );
 }
 
+/// Scenario: Field-shortcut date functions translate to date_part of the matching field
 #[test]
 fn renders_year_month_day_extract() {
     let shortcuts = ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"];
@@ -1113,6 +1159,7 @@ fn renders_year_month_day_extract() {
     }
 }
 
+/// Scenario: DATE_TRUNC translates to the DataFusion date_trunc call
 #[test]
 fn renders_date_trunc() {
     let expr = scalar_fn("DATE_TRUNC", [str_lit("month"), col("ts")]);
@@ -1122,6 +1169,7 @@ fn renders_date_trunc() {
     );
 }
 
+/// Scenario: The now-family is not translated in either dialect
 #[test]
 fn now_family_falls_through() {
     // Pinned to the generic decline text: an arity-checking arm would also name the function.
@@ -1284,6 +1332,7 @@ fn second_with_precision_declines_for_datafusion_renders_for_exasol() {
     );
 }
 
+/// Scenario: Integer division DIV is deliberately not translated
 #[test]
 fn div_falls_through_as_unsupported() {
     // DataFusion has no `div`, and a TRUNC(m/n) emulation diverges from Exasol on DOUBLE
@@ -1300,6 +1349,7 @@ fn div_falls_through_as_unsupported() {
     );
 }
 
+/// Scenario: Conversion format functions TO_CHAR and TO_NUMBER are deliberately not translated
 #[test]
 fn to_char_and_to_number_fall_through_as_unsupported() {
     // DataFusion's `to_char` uses strftime masks, not Exasol format models, and it has no
@@ -1319,7 +1369,6 @@ fn to_char_and_to_number_fall_through_as_unsupported() {
     }
 }
 
-/// Scenario: Regexp scalar functions are deliberately not translated
 #[test]
 fn regexp_scalar_functions_decline_in_both_dialects() {
     // DataFusion's regexp_like matches anywhere in the value, Exasol's PCRE only
@@ -1374,6 +1423,7 @@ fn regexp_like_predicate_declines_in_both_dialects() {
     assert!(render_df_filter_exasol_safe(&expr).is_none());
 }
 
+/// Scenario: Bitwise operator functions are deliberately not translated
 #[test]
 fn bitwise_operator_functions_fall_through() {
     // Exasol's bit functions use an unsigned 64-bit domain: DataFusion's bitwise operators
@@ -1411,6 +1461,7 @@ fn bitwise_operator_functions_fall_through() {
     }
 }
 
+/// Scenario: An undeclared scalar function name is not translated in either dialect
 #[test]
 fn undeclared_scalar_function_declines_in_both_dialects() {
     // Beyond SUBSTRING/SOUNDEX, the rows pin the gate's edges: case-insensitive lookup,
@@ -1451,6 +1502,7 @@ fn undeclared_scalar_function_declines_in_both_dialects() {
     }
 }
 
+/// Scenario: Unsupported date functions fall through as unsupported nodes
 #[test]
 fn unsupported_date_functions_decline_in_both_dialects() {
     // Every name exists in Exasol, so the Exasol-dialect assertion guards against the
@@ -1494,6 +1546,7 @@ fn unsupported_date_functions_decline_in_both_dialects() {
     }
 }
 
+/// Scenario: Aggregate function nodes render with the aggregate name spliced verbatim
 #[test]
 fn render_expression_renders_aggregate_nodes() {
     let sum = json!({
@@ -1520,6 +1573,7 @@ fn render_expression_renders_aggregate_nodes() {
     }
 }
 
+/// Scenario: Aggregate function nodes render with the aggregate name spliced verbatim
 #[test]
 fn render_expression_renders_scalar_wrapping_aggregates() {
     let sum_case = aggregate(
@@ -1556,6 +1610,7 @@ fn render_expression_renders_scalar_wrapping_aggregates() {
     );
 }
 
+/// Scenario: Aggregate function nodes render with the aggregate name spliced verbatim
 #[test]
 fn aggregate_with_unrenderable_argument_declines() {
     let bad = aggregate("SUM", [json!({"type": "totally_unknown_node"})]);
@@ -1569,6 +1624,7 @@ fn aggregate_with_unrenderable_argument_declines() {
     );
 }
 
+/// Scenario: The Exasol dialect renders a CHAR CAST target as CHAR, not VARCHAR
 #[test]
 fn renders_cast_targets_in_the_exasol_dialect() {
     for (target, expected) in [
@@ -1589,6 +1645,7 @@ fn renders_cast_targets_in_the_exasol_dialect() {
     }
 }
 
+/// Scenario: The Exasol dialect renders a CHAR CAST target as CHAR, not VARCHAR
 #[test]
 fn cast_char_target_diverges_between_dialects() {
     let expr = cast(col("c_varchar"), char_type(20));
@@ -1602,6 +1659,7 @@ fn cast_char_target_diverges_between_dialects() {
     );
 }
 
+/// Scenario: Math scalar functions render verbatim in the Exasol dialect
 #[test]
 fn renders_math_family_verbatim_in_exasol_dialect() {
     let one_arg = [
@@ -1661,6 +1719,7 @@ fn renders_math_family_verbatim_in_exasol_dialect() {
     }
 }
 
+/// Scenario: Math scalar functions render verbatim in the Exasol dialect
 #[test]
 fn renders_sign_as_native_sign_in_exasol_dialect() {
     let expr = scalar_fn(
@@ -1682,6 +1741,7 @@ fn renders_sign_as_native_sign_in_exasol_dialect() {
     );
 }
 
+/// Scenario: String scalar functions render verbatim in the Exasol dialect
 #[test]
 fn renders_string_family_verbatim_in_exasol_dialect() {
     let one_arg = [
@@ -1728,6 +1788,7 @@ fn renders_string_family_verbatim_in_exasol_dialect() {
     assert_eq!(render_expression(&substr).unwrap(), r#"substr("S", 1, 3)"#);
 }
 
+/// Scenario: String scalar functions render verbatim in the Exasol dialect
 #[test]
 fn renders_instr_locate_verbatim_with_start_arg_in_exasol_dialect() {
     // The DataFusion dialect's strpos drops a third (start) argument, a known limitation of
@@ -1755,6 +1816,7 @@ fn renders_instr_locate_verbatim_with_start_arg_in_exasol_dialect() {
     }
 }
 
+/// Scenario: GREATEST and LEAST translate to DataFusion greatest/least
 #[test]
 fn renders_greatest_least_verbatim_in_exasol_dialect() {
     for (expr, expected_exasol, expected_datafusion) in [
@@ -1782,6 +1844,7 @@ fn renders_greatest_least_verbatim_in_exasol_dialect() {
     }
 }
 
+/// Scenario: NULLIFZERO and ZEROIFNULL translate to NULLIF and COALESCE
 #[test]
 fn renders_nullifzero_zeroifnull_verbatim_in_exasol_dialect() {
     for (name, expected_exasol, expected_datafusion) in [
@@ -1802,6 +1865,7 @@ fn renders_nullifzero_zeroifnull_verbatim_in_exasol_dialect() {
     }
 }
 
+/// Scenario: NULLIF translates to the DataFusion nullif call
 #[test]
 fn renders_nullif_verbatim_in_exasol_dialect() {
     // The verbatim gate renders arguments in its own dialect, so the nested MOD must stay
@@ -1820,6 +1884,7 @@ fn renders_nullif_verbatim_in_exasol_dialect() {
     );
 }
 
+/// Scenario: Field-shortcut date functions render verbatim in the Exasol dialect
 #[test]
 fn renders_date_field_shortcuts_verbatim_in_exasol_dialect() {
     for field in ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"] {
@@ -1847,6 +1912,7 @@ fn renders_week_as_native_week_in_exasol_dialect() {
     );
 }
 
+/// Scenario: DATE_TRUNC translates to the DataFusion date_trunc call
 #[test]
 fn renders_date_trunc_verbatim_in_exasol_dialect() {
     let expr = scalar_fn("DATE_TRUNC", [str_lit("month"), col("ts")]);
@@ -1940,6 +2006,7 @@ fn renders_days_between_verbatim_in_exasol_dialect() {
     );
 }
 
+/// Scenario: Date-difference functions render verbatim in the Exasol dialect
 #[test]
 fn renders_between_family_verbatim_in_exasol_dialect() {
     let df_epoch = r#"(date_part('epoch', "A") - date_part('epoch', "B"))"#;
@@ -1963,6 +2030,8 @@ fn renders_between_family_verbatim_in_exasol_dialect() {
     }
 }
 
+/// Scenario: FLOAT_DIV stays outside the verbatim rule in both dialects
+/// Scenario: The Exasol dialect never contains a DataFusion-only function name
 #[test]
 fn exasol_dialect_renders_declared_verbatim_surface() {
     struct ScalarFixture {
@@ -2261,6 +2330,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
     }
 }
 
+/// Scenario: Arithmetic operators translate to binary SQL expressions
 #[test]
 fn arithmetic_operators_render_identically_in_both_dialects() {
     for (node, expected) in [
@@ -2283,6 +2353,7 @@ fn arithmetic_operators_render_identically_in_both_dialects() {
     }
 }
 
+/// Scenario: The Exasol dialect keeps rendering FLOAT_DIV as a bare division operator
 #[test]
 fn float_div_renders_checked_division_call_only_in_the_datafusion_dialect() {
     let float_div = scalar_fn("FLOAT_DIV", [col("a"), num_lit(1)]);

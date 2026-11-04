@@ -68,6 +68,7 @@ fn every_comparison_translates_and_flips_to_its_mirror_with_the_column_on_the_ri
     }
 }
 
+/// Scenario: A literal is typed from the column's Delta type or its node is dropped
 #[test]
 fn notequal_returns_none() {
     let node = json!({"type": "predicate_notequal", "left": col("ID"), "right": num_lit(5)});
@@ -171,6 +172,7 @@ fn schema_with_struct_field() -> StructType {
     .expect("schema with a struct field must build")
 }
 
+/// Scenario: A literal is typed from the column's Delta type or its node is dropped
 #[test]
 fn resolve_column_matches_case_insensitively() {
     let schema = test_schema();
@@ -187,6 +189,7 @@ fn resolve_column_returns_none_for_unknown_column() {
     assert_eq!(resolve_column("MISSING", &by_name(&schema)), None);
 }
 
+/// Scenario: A literal is typed from the column's Delta type or its node is dropped
 #[test]
 fn resolve_column_returns_none_for_non_primitive_column() {
     let schema = schema_with_struct_field();
@@ -312,6 +315,7 @@ fn string_literal_becomes_string_scalar() {
     );
 }
 
+/// Scenario: A literal is typed from the column's Delta type or its node is dropped
 #[test]
 fn date_literal_becomes_days_since_the_epoch() {
     let node = lit("literal_date", json!("2024-01-15"));
@@ -322,6 +326,7 @@ fn date_literal_becomes_days_since_the_epoch() {
     );
 }
 
+/// Scenario: A literal is typed from the column's Delta type or its node is dropped
 #[test]
 fn timestamp_literal_becomes_microseconds_on_a_zoneless_column() {
     let node = lit("literal_timestamp", json!("2024-01-15 10:30:00"));
@@ -411,6 +416,7 @@ fn decimal_literal_exceeding_the_column_precision_yields_no_scalar() {
     assert_eq!(literal_to_scalar(&node, &prim), None);
 }
 
+/// Scenario: A literal is typed from the column's Delta type or its node is dropped
 #[test]
 fn empty_string_literal_yields_no_scalar() {
     assert_eq!(
@@ -430,6 +436,7 @@ fn empty_string_literal_yields_no_scalar() {
     );
 }
 
+/// Scenario: A literal is typed from the column's Delta type or its node is dropped
 #[test]
 fn literal_the_column_type_cannot_represent_yields_no_scalar() {
     assert_eq!(
@@ -670,7 +677,6 @@ fn a_filter_column_is_emitted_under_its_paired_fields_current_name() {
     );
 }
 
-/// Scenario: A hex-literal filter on a binary column prunes files at plan time
 #[test]
 fn a_binary_literal_prunes_a_binary_column_by_its_bytes() {
     let schema = StructType::try_new([StructField::nullable(

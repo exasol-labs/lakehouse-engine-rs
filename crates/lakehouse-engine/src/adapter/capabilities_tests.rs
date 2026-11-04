@@ -11,6 +11,7 @@ fn has_disallowed_join_capability(cap_strs: &[&str]) -> bool {
     })
 }
 
+/// Scenario: Capability advertisement stays blind to the catalog kind
 #[test]
 fn capabilities_are_assembled_without_the_catalog_kind() {
     let _capabilities: &[&str] = CAPABILITIES;
@@ -75,6 +76,7 @@ fn reports_group_by_capabilities() {
 }
 
 /// Scenario: Adapter reports its pushdown capabilities
+/// Scenario: ORDER_BY_COLUMN is advertised so ordered top-N queries can be pushed down
 #[test]
 fn reports_audited_capability_set() {
     let resp = get_capabilities_response();
@@ -347,6 +349,7 @@ fn reports_audited_capability_set() {
     }
 }
 
+/// Scenario: ORDER_BY_COLUMN is advertised so ordered top-N queries can be pushed down
 #[test]
 fn advertises_order_by_column_and_expression() {
     let resp = get_capabilities_response();

@@ -170,7 +170,6 @@ fn name_mapping_resolves_no_field_id_column() {
     }
 }
 
-/// Scenario: A column is never bound by name to a field-id-bound logical field
 #[test]
 fn a_same_named_column_the_mapping_omits_reads_null() {
     let tmp = tempfile::tempdir().unwrap();
@@ -197,7 +196,6 @@ fn a_same_named_column_the_mapping_omits_reads_null() {
     );
 }
 
-/// Scenario: A column is never bound by name to a field-id-bound logical field
 #[test]
 fn a_file_without_field_ids_or_a_mapping_fails_a_required_column() {
     let tmp = tempfile::tempdir().unwrap();

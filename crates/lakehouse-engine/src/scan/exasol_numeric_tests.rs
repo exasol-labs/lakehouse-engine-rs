@@ -53,7 +53,6 @@ async fn rows(ctx: &SessionContext, sql: &str) -> Vec<String> {
         .collect()
 }
 
-/// Scenario: Exact arithmetic and SUM do not wrap
 #[tokio::test]
 async fn exact_results_take_exasols_type_and_do_not_wrap() {
     let ctx = session();
@@ -95,7 +94,6 @@ async fn exact_results_take_exasols_type_and_do_not_wrap() {
     }
 }
 
-/// Scenario: DOUBLE combined with DECIMAL evaluates in DOUBLE
 #[tokio::test]
 async fn double_meets_decimal_in_double() {
     let ctx = session();
@@ -117,7 +115,6 @@ async fn double_meets_decimal_in_double() {
     }
 }
 
-/// Scenario: Wide exact operands compare exactly and combine in DOUBLE
 #[tokio::test]
 async fn wide_exact_operands_compare_exactly_and_combine_in_double() {
     let ctx = session();
@@ -159,7 +156,6 @@ async fn wide_exact_operands_compare_exactly_and_combine_in_double() {
     }
 }
 
-/// Scenario: Exact overflow raises Exasol's numeric value out of range
 #[tokio::test]
 async fn overflow_past_128_bits_raises_and_is_recorded_on_the_session() {
     let ctx = session();

@@ -35,6 +35,7 @@ fn single_col_batch(name: &str, col: Arc<dyn Array>) -> RecordBatch {
     RecordBatch::try_new(schema, vec![col]).unwrap()
 }
 
+/// Scenario: Each scanned value reads as its mapped Exasol value, and a null reads as NULL
 #[test]
 fn arrow_columns_map_to_value_variants() {
     let mut b = BooleanBuilder::new();
@@ -221,6 +222,7 @@ fn date32_guard_names_the_first_offender_and_passes_nulls_and_non_date_columns()
     assert!(check_date32_in_exasol_range(&not_a_date, "D").is_ok());
 }
 
+/// Scenario: Incompatible Arrow columns are emitted as JSON strings
 #[test]
 fn incompatible_columns_emit_json_strings() {
     let bin_arr = BinaryArray::from_vec(vec![b"abc".as_ref()]);

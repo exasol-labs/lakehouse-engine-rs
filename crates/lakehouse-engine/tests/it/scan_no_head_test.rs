@@ -488,6 +488,7 @@ fn rows_of(batches: &[RecordBatch]) -> Vec<(i64, String)> {
     out
 }
 
+/// Scenario: Scan builds file metadata from the spec and issues no per-file HEAD
 #[test]
 fn scan_uses_spec_size_and_issues_no_head() {
     let tmp = tempfile::tempdir().unwrap();
@@ -595,6 +596,7 @@ fn relative_and_absolute_entries_resolve_to_same_files() {
     );
 }
 
+/// Scenario: Delete files also carry their size and incur no per-file HEAD
 #[test]
 fn scan_issues_no_head_for_delete_files() {
     let tmp = tempfile::tempdir().unwrap();
@@ -645,6 +647,8 @@ fn scan_issues_no_head_for_delete_files() {
     );
 }
 
+/// Scenario: Data-file Parquet footer is read via a range GET, not a HEAD, and not twice
+/// Scenario: A shared Parquet metadata reader avoids a duplicate footer parse
 #[test]
 fn scan_reads_footer_via_range_get_once() {
     let tmp = tempfile::tempdir().unwrap();
@@ -728,6 +732,7 @@ fn scan_reads_footer_via_range_get_once() {
     );
 }
 
+/// Scenario: Data-file Parquet footer is read via a range GET, not a HEAD, and not twice
 #[test]
 fn scan_access_plan_footer_fetch_is_one_range_get() {
     // More than one request means Phase B lost the metadata size hint or `PageIndexPolicy::Skip`.
@@ -814,6 +819,7 @@ fn scan_access_plan_footer_fetch_is_one_range_get() {
     }
 }
 
+/// Scenario: A shared Parquet metadata reader avoids a duplicate footer parse
 #[test]
 fn scan_footer_reuse_holds_at_shard_scale() {
     // The fixture is calibrated (decision-log [6]) so 22 footers of 64 columns × 64 row groups

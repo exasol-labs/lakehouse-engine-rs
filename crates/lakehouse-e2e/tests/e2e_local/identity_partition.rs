@@ -183,6 +183,7 @@ fn identity_value_fills_absent_column_and_wins_over_held_column() {
 }
 
 /// Scenario: A reconstructed identity value reads the same as a stored one for every admitted type
+/// Scenario: A partition value is converted to its column's declared type
 #[test]
 fn reconstructed_identity_values_equal_stored_values_for_every_type() {
     lakehouse_vs();

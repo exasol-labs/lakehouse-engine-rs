@@ -690,6 +690,7 @@ async fn iceberg_pushdown(request: &Json, catalog_uri: &str) -> Result<Json, Udf
     .await
 }
 
+/// Scenario: A request's table resolutions run concurrently rather than one after another
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn join_legs_resolve_concurrently_in_leg_index_order() {
     let catalog = RendezvousCatalog::spawn(2).await;

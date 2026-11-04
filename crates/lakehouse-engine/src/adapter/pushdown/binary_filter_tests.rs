@@ -143,7 +143,6 @@ fn only_a_comparison_reached_through_and_or_is_rewritten() {
     );
 }
 
-/// Scenario: BINARY_AS_STRING reads a variable-length binary column as UTF-8 text
 #[test]
 fn binary_as_string_keeps_a_variable_length_filter_on_the_text() {
     let filter = json!({"type": "predicate_and", "expressions": [
@@ -170,7 +169,6 @@ fn equal(column_name: &str, hex: &str) -> Json {
     compare("predicate_equal", column(column_name), str_lit(hex))
 }
 
-/// Scenario: A hex-literal filter on a binary column prunes files at plan time
 #[test]
 fn pruning_retypes_the_hex_literals_of_a_binary_column_at_any_depth() {
     let filter = json!({

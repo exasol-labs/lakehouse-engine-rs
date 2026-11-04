@@ -568,6 +568,7 @@ impl ObjectStore for TrackingStore {
     }
 }
 
+/// Scenario: Delete payloads are read with the same resolved credentials
 #[test]
 fn scan_reads_delete_files_with_vended_credentials() {
     let tmp = tempfile::tempdir().unwrap();
@@ -649,6 +650,7 @@ fn run_scan_tracked(
     (rows, gets)
 }
 
+/// Scenario: A shared delete file is read once per shard regardless of referencing data-file count
 #[test]
 fn scan_reads_shared_delete_file_once_per_shard() {
     // One Parquet open issues several range GETs, so this compares against a one-referencer
@@ -727,6 +729,8 @@ fn tracking_store_with_probe(
     (store, peak)
 }
 
+/// Scenario: Concurrent delete-file reads stay within the connection budget
+/// Scenario: The connection budget also bounds the delete path's object-store reads
 #[test]
 fn scan_delete_reads_bounded_by_connection_budget() {
     const BUDGET: usize = 3;
@@ -847,6 +851,8 @@ fn write_keyed_parquet(
         .to_string()
 }
 
+/// Scenario: Concurrent delete-file reads stay within the connection budget
+/// Scenario: The connection budget also bounds the delete path's object-store reads
 #[test]
 fn scan_delete_reads_bounded_across_join_sides() {
     // N=3 with 2 delete files per side: a per-side semaphore would peak at 4. Delete positions
@@ -1109,6 +1115,7 @@ fn one_row_group_per_file_entries(files: [&str; 3], rows_per_file: usize) -> Vec
     entries
 }
 
+/// Scenario: Row groups that cannot contain an assigned data file's deletes are skipped
 #[test]
 fn scan_prunes_delete_row_groups_by_file_path() {
     // About 2 MB per row group, so row-group reads dwarf the footer GET, which fetches the file's
@@ -1206,6 +1213,7 @@ fn scan_prunes_delete_row_groups_by_file_path() {
     );
 }
 
+/// Scenario: Row groups that cannot contain an assigned data file's deletes are skipped
 #[test]
 fn scan_prunes_delete_row_groups_with_truncated_statistics() {
     const ROWS_PER_FILE: usize = 20;
@@ -1266,6 +1274,7 @@ fn scan_prunes_delete_row_groups_with_truncated_statistics() {
     );
 }
 
+/// Scenario: Row groups that cannot contain an assigned data file's deletes are skipped
 #[test]
 fn scan_decodes_all_row_groups_when_file_path_statistics_absent() {
     const ROWS_PER_FILE: usize = 100;
@@ -1343,6 +1352,8 @@ fn leaf_file_scan_config(
     file_scan_config.clone()
 }
 
+/// Scenario: Concurrent data-file footer fetches stay within the connection budget
+/// Scenario: The connection budget also bounds the delete path's object-store reads
 #[test]
 fn scan_footer_fetches_bounded_by_connection_budget() {
     // The plan is built but never executed: execute-time reads of the needled data files hold no
@@ -1426,6 +1437,8 @@ fn scan_footer_fetches_bounded_by_connection_budget() {
     }
 }
 
+/// Scenario: A delete-free data file still costs no footer fetch of its own
+/// Scenario: The connection budget also bounds the delete path's object-store reads
 #[test]
 fn scan_mixed_shard_fetches_footers_only_for_delete_carrying_files() {
     // The plan is never executed so execute-time reads do not contaminate the counts.
@@ -1531,6 +1544,8 @@ fn scan_mixed_shard_fetches_footers_only_for_delete_carrying_files() {
     }
 }
 
+/// Scenario: Concurrent data-file footer fetches stay within the connection budget
+/// Scenario: The connection budget also bounds the delete path's object-store reads
 #[test]
 fn scan_footer_fetches_bounded_across_join_sides() {
     // N=3 with 2 files per side: a per-side semaphore would peak at 4, sequential planning at 2.

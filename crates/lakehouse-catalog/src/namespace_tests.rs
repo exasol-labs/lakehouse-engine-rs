@@ -15,7 +15,7 @@ fn parse_table_ident_errors_on_no_dot() {
     assert!(err.to_string().contains("namespace.table"));
 }
 
-/// Scenario: Pushdown resolves multi-level namespace identifiers into the iceberg TableIdent
+/// Scenario: Pushdown loads a table whose identifier has a multi-level namespace
 #[test]
 fn parse_table_ident_handles_multilevel_namespace() {
     let (ns, tbl) = parse_table_ident("prod.finance.orders").unwrap();

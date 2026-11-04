@@ -823,6 +823,7 @@ async fn build_scan_sql_keeps_a_non_nested_incompatible_column_cast_unchanged() 
     );
 }
 
+/// Scenario: One encoder serves both the logical-schema path and the legacy inference path
 #[tokio::test]
 async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() {
     use crate::scan::spec::{LogicalField, NestedMembers};
@@ -953,6 +954,8 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
     );
 }
 
+/// Scenario: Every redaction secret set in the scan path is built from the resolved backends
+/// Scenario: Error redaction reads from resolved credentials, not the wire spec
 #[tokio::test]
 async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
     use crate::scan::ResolvedScanStorage;

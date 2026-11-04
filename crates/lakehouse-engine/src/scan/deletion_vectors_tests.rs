@@ -111,6 +111,7 @@ fn sidecar_path_is_resolved_once_for_each_storage_kind() {
     );
 }
 
+/// Scenario: The decoder is handed bytes and never a live storage client
 #[test]
 fn storage_shim_serves_prefetched_bytes_and_refuses_every_other_operation() {
     let served = Url::parse(SIDECAR_URL).unwrap();

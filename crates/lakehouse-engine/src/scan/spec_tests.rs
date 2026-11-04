@@ -3,6 +3,7 @@ use crate::scan::test_support::WithFiles;
 use crate::scan::test_support::join_spec;
 use crate::scan::test_support::logical_field;
 
+/// Scenario: Relative paths resolve against the table root and absolute paths pass through
 #[test]
 fn reconstruct_absolute_entry_passes_through() {
     assert_eq!(
@@ -18,6 +19,7 @@ fn reconstruct_absolute_entry_passes_through() {
     );
 }
 
+/// Scenario: Relative paths resolve against the table root and absolute paths pass through
 #[test]
 fn reconstruct_relative_entry_normalizes_single_separator() {
     let expected = "s3://bucket/db/table/data/f.parquet";
@@ -150,6 +152,7 @@ fn optional_fields_omitted_when_none() {
     );
 }
 
+/// Scenario: Consolidating the shard-invariant fields preserves the two-argument wire
 #[test]
 fn common_blob_carries_no_emit_type_key() {
     let row_spec = sample_spec();
@@ -309,6 +312,7 @@ fn arg_expr_round_trips_and_omitted_when_none() {
     );
 }
 
+/// Scenario: One descriptor owns every aggregate's partial column set
 #[test]
 fn partial_columns_arity_per_agg_kind() {
     assert_eq!(AggKind::Count.partial_columns().len(), 1);
@@ -381,6 +385,7 @@ fn is_counter_marks_the_four_count_columns() {
     }
 }
 
+/// Scenario: The partial column name has one owner across the scan and the adapter
 #[test]
 fn partial_column_name_renders_role_and_ordinal() {
     assert_eq!(
@@ -738,6 +743,7 @@ fn scan_spec_threading_fields_round_trip_and_default_to_one() {
     );
 }
 
+/// Scenario: Scan bounds the Parquet decode working set via a configured batch size
 #[test]
 fn df_batch_size_round_trips_and_defaults() {
     let mut spec = sample_spec();
@@ -766,6 +772,7 @@ fn df_batch_size_round_trips_and_defaults() {
     );
 }
 
+/// Scenario: Recorded memory budget controls round-trip into the scan spec
 #[test]
 fn scan_spec_memory_fields_round_trip_and_default() {
     let mut spec = sample_spec();
@@ -798,6 +805,7 @@ fn scan_spec_memory_fields_round_trip_and_default() {
     );
 }
 
+/// Scenario: Scan falls back to a built-in default budget when the field is absent
 #[test]
 fn s3_max_connections_round_trips_and_defaults() {
     let mut spec = sample_spec();
@@ -853,6 +861,7 @@ fn s3_max_connections_round_trips_and_defaults() {
     );
 }
 
+/// Scenario: A scan combines its shard's file list with the table settings shared by every shard
 #[test]
 fn from_parts_reconstitutes_files_tuples_and_table_root() {
     let original = sample_spec();
@@ -897,6 +906,7 @@ fn from_parts_reconstitutes_files_tuples_and_table_root() {
     assert_eq!(via_struct, original);
 }
 
+/// Scenario: A scan combines its shard's file list with the table settings shared by every shard
 #[test]
 fn malformed_common_or_files_json_does_not_leak_credentials() {
     let garbled_common =
@@ -925,6 +935,7 @@ fn malformed_common_or_files_json_does_not_leak_credentials() {
     assert!(!combined.contains("TOPSECRET"));
 }
 
+/// Scenario: A file-list entry without delete references reconstitutes as a delete-free data file
 #[test]
 fn legacy_empty_root_treats_paths_as_absolute() {
     let spec = sample_spec();
@@ -1033,6 +1044,7 @@ fn absent_join_block_round_trips_unchanged() {
     );
 }
 
+/// Scenario: A file-list entry without delete references reconstitutes as a delete-free data file
 #[test]
 fn legacy_file_entry_reconstitutes_empty_deletes() {
     let legacy_json = r#"{
@@ -1279,6 +1291,7 @@ fn join_spec_partition_columns_defaults_to_empty_and_iceberg_json_is_byte_identi
     assert_eq!(back, join);
 }
 
+/// Scenario: Consolidating the shard-invariant fields preserves the two-argument wire
 #[test]
 fn join_storage_is_a_required_key() {
     let without_storage = r#"{"table_root":"s3://warehouse/db/dim","files":[["data/dim-00000.parquet",512]],"join_type":"inner","fact_alias":"LHS_T1","dimension_alias":"LHS_T0","condition":"\"LHS_T0\".\"D_KEY\" = \"LHS_T1\".\"F_KEY\""}"#;
@@ -1300,6 +1313,7 @@ fn join_storage_is_a_required_key() {
     );
 }
 
+/// Scenario: Consolidating the shard-invariant fields preserves the two-argument wire
 #[test]
 fn common_blob_wire_is_byte_stable() {
     let spec = sample_spec();
@@ -1325,6 +1339,7 @@ fn wrapper_test_backend() -> StorageBackend {
     })
 }
 
+/// Scenario: Consolidating the shard-invariant fields preserves the two-argument wire
 #[test]
 fn scan_storage_is_externally_tagged_and_rejects_a_mismatched_payload() {
     let cases = [
@@ -1524,6 +1539,7 @@ fn partition_columns_round_trip_in_order_and_default_to_empty() {
     );
 }
 
+/// Scenario: Reconstitution carries neutral partition values and a neutral delete mechanism list
 #[test]
 fn neutral_fields_round_trip_losslessly_and_leave_iceberg_encodings_byte_identical() {
     // Re-serializing must reproduce the same bytes, so no field is dropped on the next pass.
@@ -1600,6 +1616,7 @@ fn neutral_fields_round_trip_losslessly_and_leave_iceberg_encodings_byte_identic
     );
 }
 
+/// Scenario: Reconstitution carries neutral partition values and a neutral delete mechanism list
 #[test]
 fn a_partitioned_file_entry_is_a_json_object_leaving_the_tuple_forms_untouched() {
     let mixed = r#"[
@@ -1643,6 +1660,7 @@ fn a_partitioned_file_entry_is_a_json_object_leaving_the_tuple_forms_untouched()
     );
 }
 
+/// Scenario: Reconstitution carries neutral partition values and a neutral delete mechanism list
 #[test]
 fn partition_values_distinguish_an_explicit_null_from_an_absent_column() {
     let json = r#"[{"path":"f.parquet","size":1,"partition_values":{"region":null}}]"#;
@@ -1697,6 +1715,7 @@ fn deletion_vector_storage_kind_outside_the_closed_set_is_refused() {
     );
 }
 
+/// Scenario: Reconstitution carries neutral partition values and a neutral delete mechanism list
 #[test]
 fn a_file_entry_mixing_a_delta_deletion_vector_with_an_iceberg_delete_reference_is_refused() {
     let json = r#"[

@@ -1,6 +1,7 @@
 use super::*;
 use std::collections::HashSet;
 
+/// Scenario: File list is partitioned into G byte-balanced disjoint shards covering every file
 #[test]
 fn partition_by_bytes_balances_cumulative_size() {
     let files: Vec<(String, u64)> = vec![
@@ -43,6 +44,7 @@ fn partition_by_bytes_balances_cumulative_size() {
     );
 }
 
+/// Scenario: File list is partitioned into G byte-balanced disjoint shards covering every file
 #[test]
 fn partition_by_bytes_disjoint_full_coverage() {
     let files: Vec<(String, u64)> = (0..10)
@@ -61,6 +63,7 @@ fn partition_by_bytes_disjoint_full_coverage() {
     );
 }
 
+/// Scenario: File list is partitioned into G byte-balanced disjoint shards covering every file
 #[test]
 fn partition_by_bytes_zero_size_treated_as_one_never_skipped() {
     let files: Vec<(String, u64)> = vec![
@@ -86,6 +89,7 @@ fn partition_by_bytes_zero_size_treated_as_one_never_skipped() {
     );
 }
 
+/// Scenario: File list is partitioned into G byte-balanced disjoint shards covering every file
 #[test]
 fn partition_by_bytes_one_file_per_shard_when_g_exceeds_count() {
     let files: Vec<(String, u64)> = vec![
@@ -105,6 +109,7 @@ fn partition_by_bytes_one_file_per_shard_when_g_exceeds_count() {
     }
 }
 
+/// Scenario: File list is partitioned into G byte-balanced disjoint shards covering every file
 #[test]
 fn partition_by_bytes_propagates_size_into_shards() {
     let files: Vec<(String, u64)> = vec![

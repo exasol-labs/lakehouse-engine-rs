@@ -113,6 +113,7 @@ async fn collect_rows(
     rows
 }
 
+/// Scenario: Scan enables Parquet row-group and page pruning so the reader skips non-matching data
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scan_enables_rowgroup_and_page_pruning() {
     let tmp = tempfile::tempdir().unwrap();

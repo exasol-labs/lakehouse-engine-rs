@@ -10,6 +10,7 @@ use super::*;
 use crate::scan::spec::CommonScanSpec;
 use crate::scan::test_support::WithFiles;
 
+/// Scenario: A CAST-to-CHAR item inside an Exasol-parsed wrapper declares a CHAR column
 #[test]
 fn scalar_over_merge_casts_to_exasol_char_target() {
     let sum_node = serde_json::json!({
@@ -39,6 +40,7 @@ fn scalar_over_merge_casts_to_exasol_char_target() {
     );
 }
 
+/// Scenario: A CAST-to-CHAR item inside an Exasol-parsed wrapper declares a CHAR column
 #[test]
 fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
     let sum_node = serde_json::json!({
@@ -2135,6 +2137,7 @@ fn constant_projection_casts_literal_to_char() {
     );
 }
 
+/// Scenario: A MIN or MAX over a CHAR-typed expression declares a CHAR partial column
 #[test]
 fn min_over_char_expression_declares_char_partial_and_merge_cast() {
     let cast_arg = serde_json::json!({
@@ -2242,6 +2245,7 @@ fn stat_aggregate_emits_three_partial_columns() {
     }
 }
 
+/// Scenario: One in-crate test pins the scan-to-adapter column alignment per aggregate kind
 #[test]
 fn scan_select_list_and_emits_agree_per_agg_kind() {
     /// Both sides terminate the name with a double quote.
@@ -2473,6 +2477,7 @@ fn char_declared_group_key_is_blank_padded_to_its_declared_width() {
     );
 }
 
+/// Scenario: The CHAR group-key pad preserves NULL, parses the declared width, and leaves the identity list unpadded
 #[test]
 fn ascii_suffixed_char_group_key_width_is_parsed_before_the_suffix() {
     let fragment = "CASE WHEN \"C_DECIMAL_A\" < 0 THEN 'NEG' ELSE 'POS' END".to_string();
@@ -2535,6 +2540,7 @@ fn varchar_declared_group_key_is_left_unpadded() {
     );
 }
 
+/// Scenario: The CHAR group-key pad preserves NULL, parses the declared width, and leaves the identity list unpadded
 #[test]
 fn multi_key_pad_applies_only_to_the_char_slot() {
     let keys = vec![
@@ -2560,6 +2566,7 @@ fn multi_key_pad_applies_only_to_the_char_slot() {
     );
 }
 
+/// Scenario: The CHAR group-key pad preserves NULL, parses the declared width, and leaves the identity list unpadded
 #[tokio::test]
 async fn padded_group_key_merges_trailing_blank_variants_without_truncating() {
     use arrow::array::{Array, Int64Array, StringArray};

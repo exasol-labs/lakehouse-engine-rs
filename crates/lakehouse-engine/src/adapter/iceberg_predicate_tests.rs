@@ -204,6 +204,7 @@ fn timestamp_literal_finer_than_microseconds_yields_no_datum() {
     }
 }
 
+/// Scenario: Untranslatable conjunct disables pruning for that conjunct only
 #[test]
 fn and_with_untranslatable_child_keeps_translatable_conjunct() {
     let translatable = predicate_equal(col("ID"), num_lit(5));
@@ -510,7 +511,6 @@ fn equal_to_bytes(column: &str, hex: &str) -> Json {
     predicate_equal(col(column), lit("literal_binary", hex))
 }
 
-/// Scenario: A hex-literal filter on a binary column prunes files at plan time
 #[test]
 fn a_binary_literal_prunes_a_binary_or_fixed_column_by_its_bytes() {
     let schema = binary_schema();

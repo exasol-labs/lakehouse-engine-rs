@@ -33,6 +33,7 @@ fn a_template_maps_the_user_to_a_principal() {
     );
 }
 
+/// Scenario: A user that USER_MAPPING cannot map is refused before any request
 #[test]
 fn a_user_without_a_valid_principal_is_refused() {
     let lookup = "{{ {'ALICE': 'oidc~a'}[user] }}";
@@ -46,6 +47,7 @@ fn a_user_without_a_valid_principal_is_refused() {
     }
 }
 
+/// Scenario: The adapter trusts the template author and evaluates no user name as template text
 #[test]
 fn a_user_name_is_data_and_never_template_text() {
     assert_eq!(
@@ -59,6 +61,7 @@ fn a_template_that_does_not_compile_is_rejected() {
     assert!(user_error(UserMapping::compile("{{ user ").map(drop)).contains("does not compile"));
 }
 
+/// Scenario: Absent PERMISSION_CHECK leaves every request unchanged and contacts no management API
 #[test]
 fn an_absent_permission_check_is_off_and_needs_no_user() {
     let settings = PermissionSettings::parse(&props(&[])).unwrap();
@@ -68,6 +71,7 @@ fn an_absent_permission_check_is_off_and_needs_no_user() {
     assert!(matches!(check, Ok(PermissionCheck::Off)));
 }
 
+/// Scenario: Invalid permission properties are rejected before the catalog is contacted
 #[test]
 fn invalid_permission_properties_are_rejected() {
     for properties in [
@@ -79,6 +83,7 @@ fn invalid_permission_properties_are_rejected() {
     }
 }
 
+/// Scenario: The check is accepted only for an Iceberg REST catalog URI that ends in /catalog
 #[test]
 fn the_check_needs_the_iceberg_rest_kind() {
     let settings = checked("{{ user }}");
@@ -95,6 +100,7 @@ fn the_check_needs_the_iceberg_rest_kind() {
     );
 }
 
+/// Scenario: The check is accepted only for an Iceberg REST catalog URI that ends in /catalog
 #[test]
 fn the_check_needs_a_catalog_uri_ending_in_catalog() {
     let settings = checked("{{ user }}");
@@ -111,7 +117,6 @@ fn an_absent_current_user_is_refused() {
     assert!(settings.check_for(|| Some(String::new())).is_err());
 }
 
-/// Scenario: A denied table refuses the whole query
 #[test]
 fn a_denial_names_the_user_the_principal_and_each_denied_table_once() {
     let Ok(PermissionCheck::Enforced(gate)) =

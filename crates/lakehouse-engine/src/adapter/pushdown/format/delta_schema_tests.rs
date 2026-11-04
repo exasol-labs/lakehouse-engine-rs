@@ -273,7 +273,6 @@ fn a_refused_columns_binding_key_is_never_looked_up_even_when_it_would_itself_fa
     assert!(refused_columns[0].reason.contains("variant"));
 }
 
-/// Scenario: Every Delta type Exasol represents natively maps to its own Arrow tag
 #[test]
 fn every_natively_representable_delta_type_maps_to_its_own_arrow_tag() {
     let schema = StructType::try_new([

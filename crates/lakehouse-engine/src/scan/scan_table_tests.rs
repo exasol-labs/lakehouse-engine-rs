@@ -360,7 +360,6 @@ fn id_region_rows(
         .collect()
 }
 
-/// Scenario: An identity partition value wins over a column the data file holds
 #[test]
 fn a_files_identity_value_wins_over_the_column_it_holds() {
     let (table, ctx) = identity_table(

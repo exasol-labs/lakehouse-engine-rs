@@ -535,7 +535,6 @@ fn an_empty_partition_value_is_null_as_the_scan_reads_it() {
     }
 }
 
-/// Scenario: A hex-literal filter on a binary column prunes files at plan time
 #[test]
 fn a_binary_literal_compares_a_logged_value_by_its_utf8_bytes() {
     let declared = [("PART".to_string(), DataType::Binary)];

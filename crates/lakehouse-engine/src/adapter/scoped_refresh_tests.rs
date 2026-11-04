@@ -33,7 +33,6 @@ fn no_data_file(namespace: &[&str], name: &str) -> SkippedTable {
     }
 }
 
-/// Scenario: A partial refresh loads the metadata of the requested tables only
 #[test]
 fn only_requested_identifiers_are_selected_for_loading() {
     let configured_ns = ["sales".to_string()];
@@ -61,7 +60,6 @@ fn an_empty_requested_tables_array_is_a_partial_refresh_that_selects_nothing() {
     assert!(selection.is_empty());
 }
 
-/// Scenario: A partial refresh resolves each requested name as a full refresh would
 #[test]
 fn every_identifier_that_flattens_to_a_requested_name_is_selected() {
     let configured_ns = ["sales".to_string()];
@@ -139,7 +137,6 @@ fn a_requested_name_matches_only_the_exact_exasol_name() {
     assert!(!requested.contains("MIXED"));
 }
 
-/// Scenario: A partial refresh merges SKIPPED_TABLES with the persisted list
 #[test]
 fn merge_keeps_unrequested_listed_entries_in_listing_order() {
     let listed = [
@@ -177,7 +174,6 @@ fn merge_keeps_unrequested_listed_entries_in_listing_order() {
     );
 }
 
-/// Scenario: A partial refresh merges SKIPPED_TABLES with the persisted list
 #[test]
 fn merge_drops_entries_the_source_no_longer_lists() {
     let configured_ns = ["sales".to_string()];
@@ -209,7 +205,6 @@ fn merge_drops_entries_the_source_no_longer_lists() {
     );
 }
 
-/// Scenario: A partial refresh merges SKIPPED_TABLES with the persisted list
 #[test]
 fn merge_carries_the_persisted_omitted_count() {
     let listed = [ident(&[], "unrequested"), ident(&[], "requested")];
@@ -238,7 +233,6 @@ fn merge_carries_the_persisted_omitted_count() {
     );
 }
 
-/// Scenario: A partial refresh merges SKIPPED_TABLES with the persisted list
 #[test]
 fn merge_writes_no_omitted_count_when_the_sum_is_zero() {
     let listed = [ident(&[], "unrequested"), ident(&[], "requested")];

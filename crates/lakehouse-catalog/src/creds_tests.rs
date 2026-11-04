@@ -28,6 +28,7 @@ fn default_equals_deserializing_a_props_with_every_optional_field_absent() {
     assert_eq!(StorageProps::default(), field_absent);
 }
 
+/// Scenario: No diagnostic rendering of storage settings prints a credential value
 #[test]
 fn debug_redacts_every_secret_bearing_field() {
     let creds = ConnectionCreds {
@@ -134,6 +135,7 @@ fn creds_with(
     }
 }
 
+/// Scenario: One classifier decides the catalog-auth mode and every consumer reads it
 #[test]
 fn supplied_catalog_auth_names_one_mode_per_field_shape() {
     let pair = creds_with(None, Some(CLIENT_ID), Some(CLIENT_SECRET));

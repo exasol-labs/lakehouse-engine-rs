@@ -21,6 +21,7 @@ fn vs_char_pad_table() -> String {
     format!("{LAKEHOUSE_VS}.{}", E2E_CHAR_PAD_TABLE.to_uppercase())
 }
 
+/// Scenario: Adapter advertises inner equi-join capabilities
 #[test]
 fn e2e_advertises_inner_equi_join_capability() {
     lakehouse_vs();
@@ -657,6 +658,7 @@ fn e2e_selectlist_between_at_matching_arity_projects_as_expr() {
     );
 }
 
+/// Scenario: A widened derived projection routes to a native wrapper on every path
 #[test]
 fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
     lakehouse_vs();
@@ -743,6 +745,8 @@ fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
     }
 }
 
+/// Scenario: Projected literal or constant select-list item is pushed down as a positional projection
+/// Scenario: Projected literal select-list item is pushed into the scan-driving query
 #[test]
 fn e2e_selectlist_literal_projection_pushdown() {
     lakehouse_vs();
@@ -811,6 +815,8 @@ fn e2e_selectlist_literal_projection_pushdown() {
     }
 }
 
+/// Scenario: Projected literal or constant select-list item is pushed down as a positional projection
+/// Scenario: Projected literal select-list item is pushed into the scan-driving query
 #[test]
 fn e2e_count_star_over_limited_subselect_pushdown() {
     lakehouse_vs();
@@ -849,6 +855,7 @@ fn e2e_count_star_over_limited_subselect_pushdown() {
     );
 }
 
+/// Scenario: Row-scan query with all files pruned returns a typed empty projection
 #[test]
 fn e2e_all_files_pruned_literal_projection_empty_shape() {
     lakehouse_vs();
@@ -894,6 +901,7 @@ fn session_utc_offset_seconds(conn: &mut ExaConn) -> f64 {
     )
 }
 
+/// Scenario: Routed session-dependent projection returns the value Exasol computes natively
 #[test]
 fn e2e_now_family_projection_matches_native_session_local_value() {
     lakehouse_vs();
@@ -926,6 +934,8 @@ fn e2e_now_family_projection_matches_native_session_local_value() {
     }
 }
 
+/// Scenario: Projected constant whose declared EMITS type Exasol rejects routes to the qualified wrapper
+/// Scenario: Routed session-dependent projection returns the value Exasol computes natively
 #[test]
 fn e2e_projected_tstz_literal_matches_native_and_pruned_scan_succeeds() {
     lakehouse_vs();
@@ -988,6 +998,7 @@ fn e2e_projected_tstz_literal_matches_native_and_pruned_scan_succeeds() {
     );
 }
 
+/// Scenario: HAVING predicate is pushed into the grouped scan plan
 #[test]
 fn e2e_having_clause_pushdown() {
     lakehouse_vs();
@@ -1023,6 +1034,7 @@ fn e2e_having_clause_pushdown() {
     );
 }
 
+/// Scenario: Scan emits sufficient statistics for a decomposable statistical aggregate
 #[test]
 fn e2e_stddev_variance_pushdown() {
     lakehouse_vs();
@@ -1076,6 +1088,7 @@ fn e2e_stddev_variance_pushdown() {
     );
 }
 
+/// Scenario: Statistical aggregate over an expression argument declines the partial/merge pushdown
 #[test]
 fn e2e_stddev_over_expression_falls_back_and_returns_correct_value() {
     lakehouse_vs();
@@ -1137,6 +1150,7 @@ fn sample_stddev(values: &[f64]) -> f64 {
     (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt()
 }
 
+/// Scenario: Statistical aggregate over an expression argument declines the partial/merge pushdown
 #[test]
 fn e2e_grouped_stddev_over_expression_falls_back_and_returns_correct_value() {
     const GROUP_MODULUS: i64 = 4;
@@ -1231,6 +1245,7 @@ fn assert_filter_pushed_down(conn: &mut ExaConn, query_sql: &str) {
     );
 }
 
+/// Scenario: Conversion and unary-negation capabilities are advertised so CAST and unary-minus expressions push down
 #[test]
 fn e2e_cast_in_filter() {
     lakehouse_vs();
@@ -1263,6 +1278,7 @@ fn e2e_cast_in_filter() {
     );
 }
 
+/// Scenario: Conversion and unary-negation capabilities are advertised so CAST and unary-minus expressions push down
 #[test]
 fn e2e_unary_minus_in_filter() {
     lakehouse_vs();
@@ -1300,6 +1316,8 @@ fn e2e_unary_minus_in_filter() {
     }
 }
 
+/// Scenario: ISO week capability is advertised so WEEK expressions push down
+/// Scenario: WEEK translates to the DataFusion date_part('week') ISO-8601 call
 #[test]
 fn e2e_week_in_filter() {
     lakehouse_vs();
@@ -1347,6 +1365,7 @@ fn assert_select_pushed_down(conn: &mut ExaConn, query_sql: &str, fragment: &str
     );
 }
 
+/// Scenario: DAYS_BETWEEN translates to a whole-day date difference
 #[test]
 fn e2e_days_between_matches_exasol() {
     lakehouse_vs();
@@ -1366,6 +1385,7 @@ fn e2e_days_between_matches_exasol() {
     );
 }
 
+/// Scenario: HOURS_BETWEEN, MINUTES_BETWEEN, and SECONDS_BETWEEN translate to epoch-second differences
 #[test]
 fn e2e_time_between_matches_exasol() {
     lakehouse_vs();
@@ -1453,6 +1473,8 @@ fn e2e_selectlist_cast_extract_case_pushdown() {
     }
 }
 
+/// Scenario: ORDER BY on a column outside the derived projection emits the sort key as a hidden scan column
+/// Scenario: Unsupported ordered-query shapes decline the ordered-top-N path
 #[test]
 fn e2e_order_by_unprojected_column_bare_projection() {
     lakehouse_vs();
@@ -1511,6 +1533,7 @@ fn e2e_order_by_unprojected_column_bare_projection() {
     }
 }
 
+/// Scenario: ORDER BY on a column outside the derived projection emits the sort key as a hidden scan column
 #[test]
 fn e2e_order_by_column_referenced_only_in_projected_expression() {
     lakehouse_vs();
@@ -1597,6 +1620,8 @@ fn exasol_trim_decimal_string_matches_documented_values() {
     assert_eq!(exasol_trim_decimal_string(6000, 2), "60");
 }
 
+/// Scenario: Explicit CAST of a DECIMAL column to VARCHAR renders the trimmed form
+/// Scenario: A DECIMAL converted to text reads in Exasol's shortest form
 #[test]
 fn e2e_decimal_cast_trims_trailing_zeros() {
     lakehouse_vs();
@@ -1659,6 +1684,7 @@ fn e2e_issue_189_shape_equivalent_local_verification() {
     }
 }
 
+/// Scenario: Implicit CONCAT over a DECIMAL column renders the trimmed form, including nested concatenation
 #[test]
 fn e2e_decimal_concat_trims_trailing_zeros() {
     lakehouse_vs();
@@ -1685,6 +1711,7 @@ fn e2e_decimal_concat_trims_trailing_zeros() {
     }
 }
 
+/// Scenario: Implicit LENGTH over a DECIMAL column renders the trimmed form
 #[test]
 fn e2e_decimal_length_reflects_trimmed_string() {
     lakehouse_vs();
@@ -1710,6 +1737,7 @@ fn e2e_decimal_length_reflects_trimmed_string() {
     }
 }
 
+/// Scenario: WHERE-clause stringification of a DECIMAL column renders the trimmed form
 #[test]
 fn e2e_decimal_length_where_count_matches_trimmed_semantics() {
     lakehouse_vs();
@@ -1816,6 +1844,7 @@ fn e2e_upper_varchar_pushdown() {
     );
 }
 
+/// Scenario: A string-position DECIMAL column argument renders through Exasol's trimmed decimal-to-string form
 #[test]
 fn e2e_upper_id_trims_to_plain_integer_string() {
     lakehouse_vs();
@@ -1835,6 +1864,7 @@ fn e2e_upper_id_trims_to_plain_integer_string() {
     );
 }
 
+/// Scenario: A string-position DECIMAL column argument renders through Exasol's trimmed decimal-to-string form
 #[test]
 fn e2e_ltrim_decimal_trims_trailing_zeros() {
     lakehouse_vs();
@@ -1874,6 +1904,7 @@ fn e2e_ltrim_decimal_trims_trailing_zeros() {
     }
 }
 
+/// Scenario: A string-position DATE column argument is wrapped in an explicit CAST to VARCHAR
 #[test]
 fn e2e_lower_date_formats_as_iso() {
     lakehouse_vs();
@@ -1893,6 +1924,7 @@ fn e2e_lower_date_formats_as_iso() {
     );
 }
 
+/// Scenario: INSTR and LOCATE coerce their first two arguments and decline beyond two
 #[test]
 fn e2e_instr_decimal_finds_dot_position_in_trimmed_text() {
     lakehouse_vs();
@@ -2028,6 +2060,7 @@ fn e2e_upper_boolean_declines_to_native_oracle() {
     );
 }
 
+/// Scenario: Advertised FN_SUBSTR and FN_LEFT return rows instead of failing the query
 #[test]
 fn e2e_substr_left_pushdown() {
     lakehouse_vs();
@@ -2078,6 +2111,7 @@ fn e2e_substr_left_pushdown() {
 // INSTR/LOCATE beyond 2 arguments always decline: the renderer drops extra arguments
 // (#228), which would silently return a wrong position.
 
+/// Scenario: INSTR and LOCATE coerce their first two arguments and decline beyond two
 #[test]
 fn e2e_instr_arity_decline_selectlist_matches_native_oracle() {
     lakehouse_vs();
@@ -2105,6 +2139,7 @@ fn e2e_instr_arity_decline_selectlist_matches_native_oracle() {
     );
 }
 
+/// Scenario: INSTR and LOCATE coerce their first two arguments and decline beyond two
 #[test]
 fn e2e_instr_arity_decline_where_matches_native_oracle() {
     lakehouse_vs();
@@ -2184,6 +2219,9 @@ fn int_set(values: &[serde_json::Value]) -> std::collections::HashSet<i64> {
     values.iter().map(parse_int).collect()
 }
 
+/// Scenario: A sort key absent from the select list adds no synthetic result column
+/// Scenario: Hidden sort-key columns are appended at most once and never invented
+/// Scenario: A declined ORDER BY on an expression emits the expression's referenced columns as hidden scan columns
 #[test]
 fn e2e_order_by_expression_not_selected_leaks_no_hidden_column() {
     lakehouse_vs();
@@ -2273,6 +2311,7 @@ fn e2e_order_by_expression_not_selected_leaks_no_hidden_column() {
     );
 }
 
+/// Scenario: A grouped ORDER BY the merge cannot express routes to the qualified single-table wrapper instead of erroring
 #[test]
 fn e2e_grouped_order_by_aggregate_not_selected_top_n_groups_limit_applies() {
     lakehouse_vs();
@@ -2312,6 +2351,8 @@ fn e2e_grouped_order_by_aggregate_not_selected_top_n_groups_limit_applies() {
     );
 }
 
+/// Scenario: A grouped ORDER BY over a select-list aggregate resolves to that aggregate's merged partial expression
+/// Scenario: A sort key absent from the select list adds no synthetic result column
 #[test]
 fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
     lakehouse_vs();
@@ -2385,6 +2426,7 @@ fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
     }
 }
 
+/// Scenario: A sort key absent from the select list adds no synthetic result column
 #[test]
 fn e2e_order_by_expression_also_selected_control() {
     lakehouse_vs();
@@ -2440,6 +2482,7 @@ fn e2e_order_by_expression_also_selected_control() {
     );
 }
 
+/// Scenario: The qualified wrapper renders a renderable expression sort key on every entry point that reaches it
 #[test]
 fn e2e_multi_count_distinct_order_by_expression_renders_on_wrapper() {
     lakehouse_vs();
@@ -2474,6 +2517,8 @@ fn e2e_multi_count_distinct_order_by_expression_renders_on_wrapper() {
     assert_eq!(parse_int(&cols[1][0]), 12, "COUNT(DISTINCT id) must be 12");
 }
 
+/// Scenario: The single-row aggregate merge renders no OFFSET, because no offset can reach it
+/// Scenario: A pushed ORDER BY over a single-row aggregate result keeps the request LIMIT
 #[test]
 fn e2e_order_by_aggregate_with_limit_zero_returns_no_rows() {
     lakehouse_vs();
@@ -2879,6 +2924,7 @@ fn e2e_count_distinct_timestamp_literal_matches_native_oracle() {
     );
 }
 
+/// Scenario: Now-family date/time capabilities are withdrawn so Exasol evaluates its own clock
 #[test]
 fn e2e_now_family_matches_native_oracle() {
     lakehouse_vs();
@@ -2951,6 +2997,9 @@ fn e2e_now_family_matches_native_oracle() {
 // Declined-filter self-apply (#279): a WHERE predicate the adapter cannot push into the
 // scan must be applied in its own Exasol-dialect SQL, since Exasol never re-applies it.
 
+/// Scenario: A declined single-table WHERE filter is applied in the adapter's own outer WHERE
+/// Scenario: A declined WHERE filter routes the single-table request to the qualified wrapper
+/// Scenario: A refused argument count declines for DataFusion and renders for Exasol
 #[test]
 fn e2e_declined_filter_second_arity_returns_filtered_rows() {
     lakehouse_vs();
@@ -2977,6 +3026,7 @@ fn e2e_declined_filter_second_arity_returns_filtered_rows() {
     );
 }
 
+/// Scenario: A declined single-table WHERE filter is applied in the adapter's own outer WHERE
 #[test]
 fn e2e_declined_filter_like_on_decimal_returns_filtered_rows() {
     lakehouse_vs();
@@ -3017,6 +3067,9 @@ fn e2e_declined_filter_instr_three_arg_returns_filtered_rows() {
     );
 }
 
+/// Scenario: A declined WHERE filter under an aggregate request is applied ahead of the aggregate
+/// Scenario: A declined filter is applied before aggregation, grouping, and truncation
+/// Scenario: A declined WHERE filter routes the single-table request to the qualified wrapper
 #[test]
 fn e2e_declined_filter_under_aggregate_filters_before_aggregating() {
     lakehouse_vs();
@@ -3033,6 +3086,7 @@ fn e2e_declined_filter_under_aggregate_filters_before_aggregating() {
     );
 }
 
+/// Scenario: A declined filter is applied before aggregation, grouping, and truncation
 #[test]
 fn e2e_declined_filter_under_order_by_limit_filters_before_truncating() {
     lakehouse_vs();
@@ -3053,6 +3107,8 @@ fn e2e_declined_filter_under_order_by_limit_filters_before_truncating() {
     );
 }
 
+/// Scenario: A declined filter does not widen the wrapper's projection
+/// Scenario: A declined WHERE filter routes the single-table request to the qualified wrapper
 #[test]
 fn e2e_declined_filter_select_star_returns_full_row_shape() {
     lakehouse_vs();
@@ -3080,6 +3136,8 @@ fn e2e_declined_filter_select_star_returns_full_row_shape() {
     );
 }
 
+/// Scenario: A predicate unrenderable under both dialects returns a clean error
+/// Scenario: CAST renders the mapped target type per dialect
 #[test]
 fn e2e_both_dialects_unrenderable_predicate_errors_without_rows() {
     lakehouse_vs();
@@ -3106,6 +3164,12 @@ fn e2e_both_dialects_unrenderable_predicate_errors_without_rows() {
 
 // #192: CHAR-declared pushdown shapes.
 
+/// Scenario: An explicit CAST-to-CHAR select-list item projects with a CHAR EMITS type
+/// Scenario: An equal-length CASE group key resolves to a CHAR group-key type
+/// Scenario: The CHAR declaration query shapes execute end to end through the Virtual Schema
+/// Scenario: A CHAR-declared type renders as CHAR
+/// Scenario: A bare string-literal group-key projection casts to CHAR
+/// Scenario: A VARCHAR-declared type is unaffected
 #[test]
 fn char_declared_pushdown_shapes_match_native() {
     lakehouse_vs();
@@ -3219,6 +3283,8 @@ fn char_declared_pushdown_shapes_match_native() {
     }
 }
 
+/// Scenario: A CHAR group key is blank-padded to its declared width before grouping
+/// Scenario: A CHAR group key over trailing-space data groups identically to native Exasol
 #[test]
 fn char_group_key_merges_trailing_space_variants_like_native() {
     lakehouse_vs();
@@ -3290,6 +3356,7 @@ fn char_group_key_merges_trailing_space_variants_like_native() {
     );
 }
 
+/// Scenario: An over-length CHAR group-key value raises Exasol's truncation error rather than merging a truncated group
 #[test]
 fn over_length_char_group_key_raises_truncation_error_like_native() {
     lakehouse_vs();
@@ -3322,6 +3389,7 @@ fn over_length_char_group_key_raises_truncation_error_like_native() {
     );
 }
 
+/// Scenario: An over-length CHAR projection value fails cleanly rather than truncating
 #[test]
 fn over_length_char_projection_fails_cleanly() {
     lakehouse_vs();
@@ -3354,6 +3422,7 @@ fn over_length_char_projection_fails_cleanly() {
     );
 }
 
+/// Scenario: FLOAT_DIV renders true float division in the DataFusion dialect
 #[test]
 fn e2e_float_div_decimal_over_int_matches_native_oracle() {
     lakehouse_vs();
@@ -3378,6 +3447,7 @@ fn e2e_float_div_decimal_over_int_matches_native_oracle() {
     );
 }
 
+/// Scenario: FLOAT_DIV renders true float division in the DataFusion dialect
 #[test]
 fn e2e_float_div_decimal_over_decimal_matches_native_oracle() {
     lakehouse_vs();
@@ -3542,6 +3612,7 @@ fn assert_evaluated_in_exasol(conn: &mut ExaConn, sql: &str) {
 }
 
 /// Scenario: A declined format returns the native result in the select list and in a filter
+/// Scenario: A declined single-table WHERE predicate is an Exasol-dialect wrapper position
 #[test]
 fn e2e_to_date_declined_format_matches_native() {
     lakehouse_vs();

@@ -111,6 +111,7 @@ fn password_connection(
     }
 }
 
+/// Scenario: Pushdown node count falls back to one when the handshake reports none
 #[test]
 fn cluster_nodes_from_context_defaults_to_one_when_node_count_zero() {
     assert_eq!(cluster_nodes_from_context(&DefaultsCtx), 1usize);
@@ -237,6 +238,7 @@ fn core_count_comes_from_available_parallelism() {
     );
 }
 
+/// Scenario: Adapter uses a core count of 1 when the node cannot report one
 #[test]
 fn core_count_defaults_to_one_when_detection_fails() {
     let detection_failed = Err(std::io::Error::other("platform reports no core count"));
@@ -530,7 +532,6 @@ fn pushdown_request_involving(involved: &str) -> Json {
     })
 }
 
-/// Scenario: Pushdown derives the scanned Iceberg table from the involved virtual table
 #[test]
 fn pushdown_without_an_identifier_note_fails_naming_refresh() {
     let request = pushdown_request_involving("UNKNOWN_TABLE");
@@ -558,7 +559,6 @@ fn pushdown_known_involved_table_resolves_identifier() {
     );
 }
 
-/// Scenario: Table naming and the identifier note round trip reuse the shared helpers
 #[test]
 fn the_identifier_note_records_the_bare_directory_name_and_round_trips() {
     let listing = CatalogListing {
@@ -720,7 +720,6 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
     );
 }
 
-/// Scenario: Every skipped table is recorded with its reason under every catalog kind
 #[test]
 fn skipped_tables_are_recorded_with_reasons_for_every_kind() {
     let skipped = vec![

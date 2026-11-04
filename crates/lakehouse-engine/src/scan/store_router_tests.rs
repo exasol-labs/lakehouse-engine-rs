@@ -314,6 +314,7 @@ async fn a_path_under_one_sides_root_that_neither_side_enumerates_routes_by_root
     assert_eq!(text_at(&router, UNDER_DIM_ROOT).await, DIM_LABEL);
 }
 
+/// Scenario: A requested path owned by no join side is a clear error
 #[tokio::test]
 async fn path_outside_every_side_errors_naming_path_and_roots() {
     const FOREIGN: &str = "elsewhere/x.parquet";
@@ -425,6 +426,7 @@ async fn listing_a_table_root_prefix_routes_to_that_roots_side() {
     );
 }
 
+/// Scenario: A requested path owned by no join side is a clear error
 #[tokio::test]
 async fn a_listing_carrying_no_prefix_is_unroutable() {
     let router = router_over_both_sides(&[FACT_FILE]).await;

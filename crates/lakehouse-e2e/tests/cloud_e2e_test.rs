@@ -459,6 +459,7 @@ fn cloud_test_skips_when_creds_absent() {
     println!("cloud_test_skips_when_creds_absent: skip path verified (no network call)");
 }
 
+/// Scenario: SigV4/Glue derives the catalogs/{account-id} REST prefix on every catalog request
 #[test]
 fn cloud_smoke_projection_filter_query() {
     let env = match CloudEnv::from_env() {
@@ -1089,6 +1090,7 @@ fn cloud_assume_role_reaches_glue_and_s3_through_the_role() {
 /// Cloud assume-role E2E (issue #139): the base identity alone — no role, no
 /// STS call — is denied by Glue. Shares the environment of
 /// `cloud_assume_role_reaches_glue_and_s3_through_the_role`.
+/// Scenario: A catalog denial of a CONNECTION that names no role is a credential-safe error
 #[test]
 fn cloud_assume_role_base_identity_alone_is_denied() {
     let env = match AssumeRoleCloudEnv::from_env() {

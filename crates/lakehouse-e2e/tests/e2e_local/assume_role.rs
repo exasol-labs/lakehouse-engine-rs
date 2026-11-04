@@ -134,6 +134,7 @@ fn setup() {
     });
 }
 
+/// Scenario: A storage read the object store denies fails the pushdown with the store's denial
 #[test]
 fn the_base_identity_alone_is_denied_the_warehouse_bucket() {
     setup();

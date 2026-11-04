@@ -163,6 +163,8 @@ async fn a_malformed_identifier_anywhere_in_the_request_is_refused_before_any_ca
 }
 
 /// Scenario: One catalog session per request serves every table the request resolves
+/// Scenario: Single-table pushdown builds one catalog session and reuses it
+/// Scenario: N-table join reuses one session across all legs
 #[tokio::test]
 async fn one_catalog_session_serves_every_table_the_resolver_resolves() {
     let catalog = iceberg_catalog().await;

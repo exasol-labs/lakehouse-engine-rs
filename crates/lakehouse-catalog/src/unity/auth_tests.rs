@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 const MINTED_TOKEN: &str = "MINTED-ACCESS-TOKEN";
 const OAUTH_SECRET_SENTINEL: &str = "OAUTH_CLIENT_SECRET_SENTINEL_VALUE";
 
+/// Scenario: A personal access token is applied as the bearer verbatim
 #[tokio::test]
 async fn pat_is_applied_as_bearer_verbatim() {
     let server = spawn_recording_server(|_req| (200, r#"{"tables":[]}"#.to_string())).await;
@@ -30,6 +31,7 @@ async fn pat_is_applied_as_bearer_verbatim() {
     );
 }
 
+/// Scenario: OAuth machine-to-machine mints a bearer token via the client-credentials grant
 #[tokio::test]
 async fn oauth_m2m_mints_bearer_via_client_credentials() {
     let server = spawn_recording_server(|req| {
@@ -91,6 +93,7 @@ async fn oauth_m2m_mints_bearer_via_client_credentials() {
     );
 }
 
+/// Scenario: A minted OAuth token is cached and refreshed before expiry rather than re-minted per request
 #[tokio::test]
 async fn oauth_token_is_cached_and_refreshed_before_expiry() {
     let grants = Arc::new(AtomicUsize::new(0));
@@ -205,6 +208,7 @@ async fn oauth_grant_zero_expires_in_is_a_clear_error() {
     );
 }
 
+/// Scenario: The unauthenticated mode sends no Authorization header
 #[tokio::test]
 async fn unauthenticated_mode_sends_no_authorization_header() {
     let server = spawn_recording_server(|_req| (200, r#"{"tables":[]}"#.to_string())).await;
@@ -222,6 +226,7 @@ async fn unauthenticated_mode_sends_no_authorization_header() {
     );
 }
 
+/// Scenario: A failed OAuth grant surfaces a clear, credential-safe error
 #[tokio::test]
 async fn failed_oauth_grant_is_credential_safe_error() {
     let server = spawn_recording_server(|req| {

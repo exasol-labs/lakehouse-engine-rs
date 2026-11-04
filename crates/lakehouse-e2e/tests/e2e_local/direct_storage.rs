@@ -1182,6 +1182,7 @@ fn events_directory_declares_and_returns_mixed_types_across_both_files() {
     assert_eq!(parse_int(&non_null_count[0][0]), 5);
 }
 
+/// Scenario: Data files are listed recursively in a deterministic order
 #[test]
 fn nested_directory_unions_subdirectory_files_with_zero_partition_columns() {
     setup();
@@ -1207,6 +1208,7 @@ fn nested_directory_unions_subdirectory_files_with_zero_partition_columns() {
     assert_eq!(value_to_string(&cols[1][1]), "from-b");
 }
 
+/// Scenario: A nested or unrepresentable Parquet type folds to the JSON string declaration
 #[test]
 fn complex_directory_declares_varchar_and_returns_parseable_json() {
     setup();
@@ -1523,6 +1525,7 @@ impl TimestampUnitExpectations {
     }
 }
 
+/// Scenario: A first-level directory under the base path is a table
 #[test]
 fn loose_file_and_empty_directory_serve_no_table() {
     setup();
@@ -1533,6 +1536,7 @@ fn loose_file_and_empty_directory_serve_no_table() {
     assert!(tables.contains(&"EVENTS".to_string()));
 }
 
+/// Scenario: The cast resolution holds across every format and stops at the refusal boundary
 #[test]
 fn widened_columns_declare_the_wider_type_and_every_row_reads_back() {
     setup();
@@ -1561,6 +1565,7 @@ fn widened_columns_declare_the_wider_type_and_every_row_reads_back() {
 }
 
 /// Scenario: Footers fold into one schema under the proven-castable widening pairs
+/// Scenario: The folded column set is the union of the files' column sets
 #[test]
 fn missing_column_declares_the_union_and_nulls_the_absent_column() {
     setup();
@@ -1666,6 +1671,7 @@ fn merge_schema_false_declares_the_narrow_sampled_type_and_refuses_a_wider_file_
     );
 }
 
+/// Scenario: An Iceberg or Delta table directory read as raw Parquet ignores its table format
 #[test]
 fn delta_directory_read_as_raw_parquet_returns_tombstoned_rows() {
     setup();
@@ -1684,6 +1690,8 @@ fn delta_directory_read_as_raw_parquet_returns_tombstoned_rows() {
     );
 }
 
+/// Scenario: NAMESPACE is optional under direct storage and scopes the table subtree
+/// Scenario: A first-level directory under the base path is a table
 #[test]
 fn discovery_scopes_to_first_level_directories_and_namespace_narrows_to_a_subtree() {
     setup();
@@ -1727,6 +1735,9 @@ fn discovery_scopes_to_first_level_directories_and_namespace_narrows_to_a_subtre
 }
 
 /// Scenario: An unparseable MERGE_SCHEMA or HIVE_PARTITIONING value is rejected, never defaulted
+/// Scenario: A direct-storage CONNECTION carries storage credentials and a storage base path
+/// Scenario: Catalog-authentication and vending fields are rejected, not ignored
+/// Scenario: The address scheme must agree with the credential shape
 #[test]
 fn malformed_connections_are_rejected_at_create_virtual_schema() {
     setup();
@@ -2429,6 +2440,7 @@ fn mixed_layout_unions_partition_keys_and_nulls_the_missing_key() {
 }
 
 /// Scenario: The logged partition value wins over a physically present partition column
+/// Scenario: A partition key that names a Parquet column overrides it
 #[test]
 fn partition_key_colliding_with_a_parquet_column_overrides_it() {
     setup();
@@ -2467,6 +2479,7 @@ fn partition_key_colliding_with_a_parquet_column_overrides_it() {
     );
 }
 
+/// Scenario: A file missing the colliding key's segment fails the refresh
 #[test]
 fn partition_key_collision_with_a_missing_segment_fails_the_refresh() {
     setup();
@@ -2517,6 +2530,7 @@ fn partition_key_collision_with_a_missing_segment_fails_the_refresh() {
     );
 }
 
+/// Scenario: HIVE_PARTITIONING = FALSE reads key=value segments as plain directories
 #[test]
 fn hive_partitioning_false_declares_no_partition_columns() {
     setup();
@@ -2813,6 +2827,8 @@ fn dimension_batch(id: i64) -> RecordBatch {
 
 /// Scenario: A direct-storage pushdown plans without reading a footer
 /// Scenario: Pushdown takes the declared schema from the column notes for every kind
+/// Scenario: The listing answer reads no footer and shares its file rules with the schema-resolving answer
+/// Scenario: Scan reports a clear error when an assigned file is unreadable
 #[test]
 fn pushdown_plans_from_column_notes_without_reading_a_footer() {
     setup();

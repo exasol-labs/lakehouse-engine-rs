@@ -47,6 +47,7 @@ fn namespace_is_treated_as_slash_delimited_and_never_split_on_dot() {
     assert_eq!(resolved.base_path, "s3://bucket/lake/finance.eu/subdir");
 }
 
+/// Scenario: A NAMESPACE carrying a scheme or a leading slash is rejected at create time
 #[test]
 fn namespace_carrying_a_uri_scheme_is_rejected() {
     let props = json!({ "NAMESPACE": "s3://other/finance" });
@@ -60,6 +61,7 @@ fn namespace_carrying_a_uri_scheme_is_rejected() {
     assert!(msg.to_lowercase().contains("relative"), "{msg}");
 }
 
+/// Scenario: A NAMESPACE carrying a scheme or a leading slash is rejected at create time
 #[test]
 fn namespace_beginning_with_a_leading_slash_is_rejected() {
     let props = json!({ "NAMESPACE": "/finance" });

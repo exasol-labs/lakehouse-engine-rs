@@ -394,6 +394,7 @@ fn grouped_partial_agg_sql_expression_key_verbatim() {
     );
 }
 
+/// Scenario: The statistical-aggregate partial argument routes through the shared argument renderer
 #[test]
 fn partial_agg_sql_stat_emits_cnt_mean_m2() {
     for kind in &[

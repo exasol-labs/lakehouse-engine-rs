@@ -247,6 +247,7 @@ fn lakekeeper_decimals_declare_their_precision_and_order_numerically() {
 
 // With no static credential or store address to fall back on, rows can only come
 // through the vended-credentials delegation.
+/// Scenario: Vended-credentials request advertises access delegation and resolves the store address with the CONNECTION winning when set
 #[test]
 fn lakekeeper_vended_creds_projection_filter() {
     setup();
@@ -367,6 +368,7 @@ fn lakekeeper_binary_uses_shared_harness_provisioning() {
     }
 }
 
+/// Scenario: OAuth2 client-credentials path resolves tables from a multi-warehouse catalog served under a base path
 #[test]
 fn lakekeeper_oauth_prefix_under_base_path_resolves() {
     setup();
@@ -573,6 +575,7 @@ async fn first_parquet_under(
 // An ALLOWED cross read means this fixture cannot reproduce #294 and a green join
 // test would prove only carriage. The own-credential control read rules out a
 // broken probe. No credential value may reach output.
+/// Scenario: Each join side reads its files through its own storage credential
 #[test]
 fn lakekeeper_vended_credentials_are_scoped_per_table() {
     setup();
@@ -641,6 +644,8 @@ fn lakekeeper_vended_credentials_are_scoped_per_table() {
     });
 }
 
+/// Scenario: Per-table loadTable GET is preserved so per-table vended credentials are returned
+/// Scenario: Each join side reads its files through its own storage credential
 #[test]
 fn lakekeeper_vended_broadcast_join_result_correct() {
     setup();
@@ -1203,6 +1208,7 @@ fn qualified(table: &str) -> String {
 }
 
 /// Scenario: Grants on the mapped principal decide a live Exasol user's query
+/// Scenario: USER_MAPPING maps the querying user to a principal
 #[test]
 fn permission_check_grants_decide_each_mapped_users_query() {
     permission_setup();

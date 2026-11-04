@@ -138,6 +138,8 @@ fn e2e_type_promotion_pre_promotion_data_file_is_physically_narrow() {
     );
 }
 
+/// Scenario: The cast resolution holds across every format and stops at the refusal boundary
+/// Scenario: A promotion this engine reads resolves through the shared relaxation cast
 #[test]
 fn iceberg_type_promotion_returns_both_layouts_at_the_promoted_types() {
     lakehouse_vs();

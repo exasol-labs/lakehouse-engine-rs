@@ -50,6 +50,7 @@ fn both_families() -> TemporaryTableCredentials {
     }
 }
 
+/// Scenario: An S3 vended response terminates in an S3 storage backend
 #[test]
 fn s3_vended_response_terminates_in_s3_backend() {
     let response = aws_response(
@@ -85,6 +86,7 @@ fn s3_vended_response_terminates_in_s3_backend() {
     }
 }
 
+/// Scenario: An ADLS vended response terminates in an ADLS storage backend
 #[test]
 fn adls_vended_response_terminates_in_adls_backend() {
     let response = azure_response(SAS_SENTINEL);
@@ -109,6 +111,7 @@ fn adls_vended_response_terminates_in_adls_backend() {
     }
 }
 
+/// Scenario: The storage-backend variant is selected from the location scheme alone
 #[test]
 fn variant_selected_from_location_scheme() {
     for scheme in ["s3", "s3a"] {
@@ -140,6 +143,7 @@ fn variant_selected_from_location_scheme() {
     }
 }
 
+/// Scenario: A location scheme with no supported backend is a clear error
 #[test]
 fn unsupported_scheme_is_error() {
     let response = TemporaryTableCredentials {
@@ -170,6 +174,7 @@ fn unsupported_scheme_is_error() {
     );
 }
 
+/// Scenario: A vended response missing the credential the location's backend needs is a clear error
 #[test]
 fn missing_matching_credential_is_error() {
     let s3_msg = user_message(
@@ -203,6 +208,8 @@ fn missing_matching_credential_is_error() {
     );
 }
 
+/// Scenario: A vended plaintext endpoint is honored only with operator consent
+/// Scenario: Plaintext transport needs the operator's consent on every vended path
 #[test]
 fn plaintext_endpoint_requires_allow_http() {
     let response = aws_response(
@@ -250,6 +257,8 @@ fn plaintext_endpoint_requires_allow_http() {
     }
 }
 
+/// Scenario: A plaintext abfs:// location is honored only with operator consent
+/// Scenario: Plaintext transport needs the operator's consent on every vended path
 #[test]
 fn abfs_location_requires_allow_http_on_the_unity_path() {
     let response = azure_response(SAS_SENTINEL);
@@ -278,6 +287,7 @@ fn abfs_location_requires_allow_http_on_the_unity_path() {
     );
 }
 
+/// Scenario: An S3 vended response terminates in an S3 storage backend
 #[test]
 fn s3_vended_response_with_no_store_address_resolves_successfully() {
     // Databricks AWS responses vend no endpoint or region; the AWS default chain

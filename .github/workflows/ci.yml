@@ -37,6 +37,7 @@ env:
 jobs:
   # Built inside rust:1.98.1-trixie, never on the runner: the SDK fingerprint
   # embeds the rustc hash, so a host-built .so is rejected by the SLC.
+  # Scenario: CI builds the .so for both x86_64 and aarch64 via a matrix
   build-so:
     name: Build release .so (Docker, ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -622,6 +623,7 @@ jobs:
 
       # Uploaded to BucketFS as-is by manual installs: the `udf/` layout and
       # mode 755 must survive extraction.
+      # Scenario: Release publishes architecture-distinguished tarballs
       - name: Package release tarballs
         if: steps.gate.outputs.release == 'true'
         run: |

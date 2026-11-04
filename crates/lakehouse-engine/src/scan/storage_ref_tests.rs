@@ -45,6 +45,7 @@ fn conn_obj(password: String) -> ConnectionObject {
     }
 }
 
+/// Scenario: The scan UDF resolves the referenced CONNECTION
 #[test]
 fn scan_storage_variants_resolve_or_fail_correctly() {
     let backend = s3_backend("INLINESECRET");
@@ -120,6 +121,7 @@ fn scan_storage_variants_resolve_or_fail_correctly() {
     );
 }
 
+/// Scenario: Error redaction reads from resolved credentials, not the wire spec
 #[test]
 fn join_spec_resolves_two_sides_independently() {
     let dim_conn = "LAKEHOUSE_DIM_CREDS";

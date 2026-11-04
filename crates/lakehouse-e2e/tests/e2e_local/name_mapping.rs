@@ -117,6 +117,10 @@ fn nested_name_map_fixture_holds_the_shapes_the_row_test_needs() {
 
 /// Scenario: A nested member of a file without field ids binds through the name mapping
 /// Scenario: An embedded nested field id wins over the name mapping
+/// Scenario: Field-id resolution honors schema.name-mapping.default for a file field without an embedded field-id
+/// Scenario: The VS resolves schema.name-mapping.default once per query into the scan spec
+/// Scenario: Rendered field names are the table's logical names, not the file's physical ones
+/// Scenario: A nested physical column is diverted around the physical-to-logical cast
 #[test]
 fn nested_members_without_field_ids_bind_through_the_name_mapping() {
     lakehouse_vs();
@@ -192,6 +196,7 @@ fn projection_by_id_fixture_holds_the_shapes_the_row_test_needs() {
 }
 
 /// Scenario: A column is never bound by name to a field-id-bound logical field
+/// Scenario: Field-id resolution honors schema.name-mapping.default for a file field without an embedded field-id
 #[test]
 fn columns_bind_by_field_id_or_the_name_mapping_and_never_by_name() {
     lakehouse_vs();

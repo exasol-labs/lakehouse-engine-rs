@@ -80,7 +80,6 @@ fn every_entry_point_round_trips_its_raw_key_through_the_wire() {
     }
 }
 
-/// Scenario: A data-file path under a table root holding escaped characters is carried relative
 #[test]
 fn a_root_holding_awkward_characters_yields_relative_entries_that_rebuild_the_raw_key() {
     let root = ObjectLocation::from_raw("s3://bucket/db/odd%3D#?€/t").expect("raw root");
