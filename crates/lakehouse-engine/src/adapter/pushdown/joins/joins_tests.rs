@@ -272,13 +272,8 @@ pub(super) fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> Resolv
                 .collect(),
             effective_storage: sample_storage(),
             logical_schema: vec![LogicalField {
-                field_id: Some(1),
-                name: format!("{table_name}_KEY"),
-                arrow_type: "int64".to_string(),
                 nullable: false,
-                initial_default: None,
-                nested: None,
-                physical_name: None,
+                ..bound_field(1, &format!("{table_name}_KEY"), "int64")
             }],
             table_root: format!("s3://warehouse/lh/{lower}"),
             name_mapping: Vec::new(),

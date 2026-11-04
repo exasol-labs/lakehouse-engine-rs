@@ -82,8 +82,7 @@ fn delete_spec_template() -> ScanSpec {
     CommonScanSpec {
         table_root: "s3://warehouse/db/table".into(),
         projection: vec![ProjectionItem::Column("ID".into())],
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![])
 }
@@ -661,8 +660,7 @@ fn aggregate_query_builds_partial_agg_spec() {
         projection: vec!["AMOUNT".into()],
         filter: Some("(\"REGION\" = 'EU')".into()),
         aggregates: Some(agg_plans),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
 
@@ -784,9 +782,8 @@ fn common_spec_carries_s3_max_connections_exactly_once() {
     let distinctive_s3_max_connections = 37;
     let spec_template = CommonScanSpec {
         projection: vec!["ID".into()],
-        storage: ScanStorage::Inline(sample_storage()),
         s3_max_connections: distinctive_s3_max_connections,
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
 
@@ -830,8 +827,7 @@ fn build_agg_sql(
     let merge_select = cast_merge_items(&agg_plans, &[]);
     let spec_template = CommonScanSpec {
         aggregates: Some(agg_plans),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let files_with_sizes: Vec<FileEntry> =
@@ -862,8 +858,7 @@ fn aggregate_merge_renders_having_then_request_limit() {
     let merge_select = cast_merge_items(&plans, &[]);
     let spec_template = CommonScanSpec {
         aggregates: Some(plans),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
@@ -1034,8 +1029,7 @@ fn aggregate_merge_splices_caller_select_items_and_types_emits_per_plan() {
     }];
     let spec_template = CommonScanSpec {
         aggregates: Some(plans),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
@@ -1148,11 +1142,7 @@ fn single_shard_aggregate_still_uses_merge_wrapper() {
 
 /// Matches the real `handle_pushdown` caller contract: only `files` varies per shard.
 fn count_distinct_base_spec() -> ScanSpec {
-    CommonScanSpec {
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![])
+    sample_common_spec().with_files(vec![])
 }
 
 #[test]
@@ -1534,8 +1524,7 @@ fn scan_driving_sql_groups_by_shard_key_not_iproc() {
     let g = shard_count(3, 1, files.len());
     let spec_template = CommonScanSpec {
         projection: vec!["ID".into()],
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
@@ -1569,8 +1558,7 @@ fn single_shard_collapses_to_single_invocation() {
     let g = shard_count(1, 1, files.len());
     let spec_template = CommonScanSpec {
         projection: vec!["ID".into()],
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
@@ -2454,10 +2442,7 @@ fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, ExasolType)]
         .expect("fixture precondition: a declining filter must be handed back for self-applying");
     let request = serde_json::json!({"involvedTables": [{"name": "T"}]});
     let pushdown_req = serde_json::json!({"filter": filter.clone()});
-    let fan_out_spec = CommonScanSpec {
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    };
+    let fan_out_spec = sample_common_spec();
     let type_map = column_types(col_types);
     let fan_out = super::super::joins::FanOutProjection::new(fan_out_spec, &type_map);
     super::super::joins::build_qualified_single_table_fallback_sql(

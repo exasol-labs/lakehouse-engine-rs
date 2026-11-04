@@ -646,6 +646,14 @@ pub(crate) fn nullable_field(name: &str, arrow_type: &str) -> LogicalField {
     }
 }
 
+/// A nullable field of the given Arrow tag, bound to the source field `field_id`.
+pub(crate) fn bound_field(field_id: i32, name: &str, arrow_type: &str) -> LogicalField {
+    LogicalField {
+        field_id: Some(field_id),
+        ..nullable_field(name, arrow_type)
+    }
+}
+
 /// The refusal a `label` table records for the geospatial `column`, at `member_path` when nested.
 pub(crate) fn unread_refused(
     label: &str,
@@ -1200,6 +1208,26 @@ pub(crate) fn sample_storage() -> StorageBackend {
     })
 }
 
+/// A scan spec reading from the inline [`sample_storage`], every other field defaulted, as the
+/// base a test's struct update sets its own fields over.
+pub(crate) fn sample_common_spec() -> CommonScanSpec {
+    CommonScanSpec {
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+}
+
+/// The fileless spec template a grouped aggregate renders from: `plans` partially aggregated per
+/// `group_keys`.
+pub(crate) fn grouped_spec_template(plans: &[AggregatePlan], group_keys: &[String]) -> ScanSpec {
+    CommonScanSpec {
+        aggregates: Some(plans.to_vec()),
+        group_keys: Some(group_keys.to_vec()),
+        ..sample_common_spec()
+    }
+    .with_files(vec![])
+}
+
 pub(crate) const SENTINEL_ACCESS_KEY: &str = "AKIA-SENTINEL-ACCESS-0001";
 pub(crate) const SENTINEL_SECRET_KEY: &str = "sentinel-secret-value-0002";
 
@@ -1249,8 +1277,7 @@ pub(crate) fn build_sql_for_fixture_n(
         projection: proj_items.clone(),
         filter,
         limit,
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let files_with_sizes: Vec<FileEntry> =
@@ -1364,8 +1391,7 @@ pub(crate) fn build_row_sql_with_root(
     let spec_template = CommonScanSpec {
         table_root: table_root.to_string(),
         projection: proj_items.clone(),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let files: Vec<FileEntry> = files.into_iter().map(FileEntry::from).collect();

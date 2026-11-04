@@ -128,21 +128,20 @@ fn cluster_nodes_from_context_passes_through_reported_node_count() {
     );
 }
 
+/// A pushdown request whose schema carries `notes` as its adapterNotes string.
+fn pushdown_with_notes(notes: &str) -> Json {
+    serde_json::json!({"type": "pushdown", "schemaMetadataInfo": {"adapterNotes": notes}})
+}
+
 #[test]
 fn adapter_note_absent_or_unparseable_yields_none() {
     let bare = serde_json::json!({"type": "pushdown"});
     assert!(adapter_note(&bare, NOTE_PARALLELISM_FACTOR).is_none());
 
-    let garbage = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": "not json" },
-    });
+    let garbage = pushdown_with_notes("not json");
     assert!(adapter_note(&garbage, NOTE_PARALLELISM_FACTOR).is_none());
 
-    let empty = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": "" },
-    });
+    let empty = pushdown_with_notes("");
     assert!(adapter_note(&empty, NOTE_PARALLELISM_FACTOR).is_none());
 }
 
@@ -221,10 +220,7 @@ fn adapter_notes_carry_parallelism_factor() {
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
-    let pushdown_req = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": notes_str },
-    });
+    let pushdown_req = pushdown_with_notes(notes_str);
     assert_eq!(
         adapter_note(&pushdown_req, NOTE_PARALLELISM_FACTOR).as_deref(),
         Some("12"),
@@ -309,10 +305,7 @@ fn df_batch_size_uses_supplied_value() {
     let notes = build_adapter_notes(&req, &tuning, &SkippedTables::default());
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
-    let pushdown_req = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": notes_str },
-    });
+    let pushdown_req = pushdown_with_notes(notes_str);
     assert_eq!(
         adapter_note(&pushdown_req, NOTE_DF_BATCH_SIZE).as_deref(),
         Some("4096"),
@@ -401,10 +394,7 @@ fn join_broadcast_max_bytes_round_trips_through_adapter_notes() {
         &SkippedTables::default(),
     );
 
-    let pushdown_req = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": notes.as_str().unwrap() },
-    });
+    let pushdown_req = pushdown_with_notes(notes.as_str().unwrap());
 
     assert_eq!(
         adapter_note(&pushdown_req, NOTE_JOIN_BROADCAST_MAX_BYTES).as_deref(),
@@ -427,10 +417,7 @@ fn memory_budget_params_round_trip_through_adapter_notes() {
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
-    let pushdown_req = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": notes_str },
-    });
+    let pushdown_req = pushdown_with_notes(notes_str);
     assert_eq!(
         adapter_note(&pushdown_req, NOTE_MEMORY_POOL_FRACTION).as_deref(),
         Some("0.5"),

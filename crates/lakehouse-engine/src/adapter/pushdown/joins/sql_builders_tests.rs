@@ -2193,10 +2193,7 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
             agg_item("COUNT", None, false),
         ],
     });
-    let fan_out_spec = CommonScanSpec {
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    };
+    let fan_out_spec = sample_common_spec();
     let col_types = column_types(&[
         ("C_CUSTKEY", ExasolType::decimal(20, 0)),
         ("C_NAME", ExasolType::varchar(100)),
@@ -2325,12 +2322,6 @@ fn fallback_projection_narrows_to_referenced_columns() {
     fn col(name: &str, ty: ExasolType) -> (String, ExasolType) {
         (name.to_string(), ty)
     }
-    fn fan_out_base() -> CommonScanSpec {
-        CommonScanSpec {
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        }
-    }
     fn proj_names(proj: &[ProjectionItem]) -> Vec<String> {
         proj.iter()
             .map(|p| match p {
@@ -2422,7 +2413,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         "the grouped inner scan narrows to GK + REGION (nested in SUM(CASE ...)), \
          never IRRELEVANT_COL"
     );
-    let gfan_out = FanOutProjection::new(fan_out_base(), &grouped);
+    let gfan_out = FanOutProjection::new(sample_common_spec(), &grouped);
     let gsql = build_qualified_single_table_fallback_sql(
         &request,
         &grouped_req,
@@ -2463,7 +2454,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         vec!["A".to_string(), "B".to_string()],
         "the single-group Case 2/3 inner scan narrows to A + B, never IRRELEVANT_COL"
     );
-    let sfan_out = FanOutProjection::new(fan_out_base(), &single_group);
+    let sfan_out = FanOutProjection::new(sample_common_spec(), &single_group);
     let ssql = build_qualified_single_table_fallback_sql(
         &request,
         &sg_req,
@@ -2629,10 +2620,7 @@ fn qualified_single_table_untranslatable_select_item_is_hard_error() {
         ],
     });
     let col_types = vec![("ID".to_string(), ExasolType::decimal(20, 0))];
-    let base = CommonScanSpec {
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    };
+    let base = sample_common_spec();
     let shards = vec![vec![FileEntry::new("s3://w/f-0.parquet", 10)]];
 
     let err = qualified_single_table_fallback_pushdown(
@@ -2668,10 +2656,7 @@ fn qualified_single_table_wrapper_projects_tstz_literal_converted_to_session_zon
         ],
     });
     let col_types = vec![("ID".to_string(), ExasolType::decimal(20, 0))];
-    let base = CommonScanSpec {
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    };
+    let base = sample_common_spec();
     let shards = vec![vec![FileEntry::new("s3://w/f-0.parquet", 10)]];
 
     let resp = qualified_single_table_fallback_pushdown(
@@ -2709,10 +2694,7 @@ fn declined_filter_request() -> Json {
 /// `filter` stays `None`: on the decline route the predicate lives only in the
 /// wrapper's `WHERE`.
 fn declined_filter_fan_out_spec() -> CommonScanSpec {
-    CommonScanSpec {
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
+    sample_common_spec()
 }
 
 fn declined_filter_column_types() -> ColumnTypes {

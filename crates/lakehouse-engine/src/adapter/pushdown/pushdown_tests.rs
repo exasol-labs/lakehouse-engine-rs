@@ -123,8 +123,7 @@ fn grouped_scan_spec_carries_group_keys() {
             arg_expr: None,
         }]),
         group_keys: Some(group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![FileEntry::new("s3://w/f0.parquet", 1)]);
     let json = spec.to_json();
@@ -342,8 +341,7 @@ fn scan_spec_carries_no_catalog_block() {
         projection: vec!["ID".into(), "NAME".into()],
         filter: Some("(\"ID\" > 10)".into()),
         limit: Some(100),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![FileEntry::new(
         "s3://warehouse/db/events/part-00000.parquet",
@@ -462,8 +460,7 @@ fn pushdown_carries_logical_schema_in_common_arg() {
 
     let spec = CommonScanSpec {
         logical_schema: logical.clone(),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let json = spec.to_json();
@@ -714,8 +711,7 @@ fn iceberg_declaration_default_less_spec_round_trips_unchanged() {
 
     let spec = CommonScanSpec {
         logical_schema: logical.clone(),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let json = spec.to_json();
@@ -1260,15 +1256,7 @@ fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
     }));
     let proj_cols = vec![ProjectionItem::from("NAME")];
     let proj_types = vec![ExasolType::WIDEST_VARCHAR];
-    let logical_schema = vec![LogicalField {
-        field_id: Some(2),
-        name: "NAME".to_string(),
-        arrow_type: "utf8".to_string(),
-        nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
-    }];
+    let logical_schema = vec![bound_field(2, "NAME", "utf8")];
 
     let sql = guard_dispatch_sql(
         &request,
@@ -1318,15 +1306,7 @@ fn nonzero_offset_nulls_the_effective_limit() {
     }));
     let proj_cols = vec![ProjectionItem::from("NAME")];
     let proj_types = vec![ExasolType::WIDEST_VARCHAR];
-    let logical_schema = vec![LogicalField {
-        field_id: Some(2),
-        name: "NAME".to_string(),
-        arrow_type: "utf8".to_string(),
-        nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
-    }];
+    let logical_schema = vec![bound_field(2, "NAME", "utf8")];
 
     let sql = guard_dispatch_sql(
         &request,
@@ -1373,15 +1353,7 @@ fn declined_order_by_extension_runs_after_topn_detection() {
     }];
     let proj_types = vec![ExasolType::decimal(1, 0)];
     // A non-JSON-fallback type, so that guard cannot be what declines the top-N.
-    let logical_schema = vec![LogicalField {
-        field_id: Some(2),
-        name: "NAME".to_string(),
-        arrow_type: "utf8".to_string(),
-        nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
-    }];
+    let logical_schema = vec![bound_field(2, "NAME", "utf8")];
 
     let sql = guard_dispatch_sql(
         &request,
