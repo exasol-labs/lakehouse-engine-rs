@@ -1,3 +1,5 @@
+//! Builders for the declared output columns (`ColumnInfo`) that Exasol passes to the scan UDF.
+
 use exasol_udf_sdk::value::{ColumnInfo, ExaType};
 
 /// `size`, `precision` and `scale` derive from `typ`'s payload so the fixture cannot

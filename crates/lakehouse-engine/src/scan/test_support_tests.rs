@@ -1,3 +1,6 @@
+//! Scan-side builders and runners: Parquet fixture files, minimal scan and join specs, inline
+//! and refusing storage backends, and a host runner that executes a scan into a sink context.
+
 use crate::scan::field_id_projection::build_logical_arrow_schema;
 use crate::scan::raw_scan::{build_scan_sql, register_files};
 use crate::scan::session_config_for_spec;

@@ -1,3 +1,5 @@
+//! Fixtures shared by the engine's host test binaries: resolved scan storage, join specs, declared
+//! output columns, and a batch-capturing UDF context.
 #![allow(dead_code)]
 
 pub mod concurrency_probe;

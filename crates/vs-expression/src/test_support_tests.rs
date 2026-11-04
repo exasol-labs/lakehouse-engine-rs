@@ -1,3 +1,5 @@
+//! Builders for Exasol pushdown-request JSON nodes: columns, literals, and predicates.
+
 use crate::ColumnNode;
 use serde_json::{Value as Json, json};
 

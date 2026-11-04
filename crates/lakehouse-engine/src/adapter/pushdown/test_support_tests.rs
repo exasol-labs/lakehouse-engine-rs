@@ -1,3 +1,6 @@
+//! Adapter pushdown fixtures: request JSON and column-type builders, Iceberg, Delta, and Glue
+//! catalog and AdapterNotes fixtures, fake catalog and object-store endpoints, test CONNECTIONs.
+
 use super::*;
 use crate::adapter::column_notes::{DeclaredSchema, TableNotes};
 use crate::adapter::table_identity::encode_identifier_note;

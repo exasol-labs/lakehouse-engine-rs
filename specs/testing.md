@@ -15,7 +15,7 @@ This file holds the rules for how this repository tests its behavior and how it 
 ### Test tiers
 
 - Unit tests run on the host with `cargo test`. They live in a sibling `_tests.rs` file (`AGENTS.md` § Code style).
-- There is no host integration tier. A host test that writes or lists files, reads an object store, or chains several modules to prove behavior is an E2E test in the wrong place. A test against a fake server is a fault-injection test.
+- Host tests are unit tests, compile-time contract tests, and the scan UDF tests below. There is no other host integration tier. A host test that reads a catalog or a remote object store, or chains adapter modules to prove behavior, is an E2E test in the wrong place. A test against a fake server is a fault-injection test.
 - Scan UDF tests run `run()` on the host through `exasol_udf_sdk::test_support::TestContext` (`EmitPolicy`, `NextPolicy`). A new scan test uses this pattern.
 - Host tests under a crate's `tests/` directory build into one binary per crate, `tests/it/main.rs`, because each test binary statically links the whole engine. A new test file is a module declared in `tests/it/main.rs`. A top-level `tests/*.rs` file is a deliberate `[[test]]` target, such as `scan_footer_refetch_observable`, which keeps its own process because every scan resets the process-global footer record it asserts on.
 - The `it` binary runs its tests as parallel threads of one process. A test that writes to the filesystem writes under its own `tempfile::tempdir()`, which is unique and removed even when the test panics, and a test that asserts on process-global state either shares one lock with every test that mutates that state or keeps its own binary.

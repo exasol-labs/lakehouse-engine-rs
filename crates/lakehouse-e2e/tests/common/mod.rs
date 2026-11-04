@@ -1,5 +1,5 @@
-//! Local-stack, Lakekeeper, Azure, and Glue helpers panic (never skip) when their stack or
-//! variables are unavailable; `cloud-e2e` helpers skip when their variables are absent.
+//! Shared E2E harness: stack provisioning, the Exasol client, fixture writers, and cloud setup.
+//! Helpers panic, never skip, on a missing stack or variable; `cloud-e2e` helpers skip instead.
 #![cfg(any(
     feature = "exasol-e2e",
     feature = "cloud-e2e",
