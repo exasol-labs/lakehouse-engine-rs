@@ -3,8 +3,6 @@
 //! `spark-iceberg-fixtures` job because iceberg-rust has no position-delete writer
 //! (#344). Must stay in lockstep with the `scripts/spark-fixtures/*.sql` scripts.
 
-pub const NAMESPACE: &str = "e2e_lakehouse";
-
 pub const FILE_GRANULARITY_TABLE: &str = "mor_pos_file";
 
 /// Two data files: ids 1..=10 and 11..=20.

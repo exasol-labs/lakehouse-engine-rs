@@ -1496,19 +1496,13 @@ fn permission_check_lists_unreadable_tables_and_refuses_their_queries() {
     assert_events_listed_and_refused("after refresh");
 }
 
-const PROXY_ADAPTER_SCHEMA: &str = "LHVS_PROXY";
 const VS_PROXY: &str = "LAKEKEEPER_PROXY_VS";
 const VS_PROXY_VENDED: &str = "LAKEKEEPER_PROXY_VENDED_VS";
 
 /// Every CONNECTION address uses a `*-via-proxy` name that only the forward proxy resolves.
-fn password_via_proxy(warehouse: &str, vended: bool) -> CatalogConnectionPassword {
-    let password = lakekeeper_connection_password(warehouse, vended);
+fn lakekeeper_password_via_proxy(warehouse: &str, vended: bool) -> CatalogConnectionPassword {
+    let password = stack::password_via_proxy(lakekeeper_connection_password(warehouse, vended));
     CatalogConnectionPassword {
-        endpoint: if vended {
-            password.endpoint.clone()
-        } else {
-            "http://seaweedfs-via-proxy:8333".to_string()
-        },
         oauth2_server_uri: password
             .oauth2_server_uri
             .as_deref()
@@ -1532,19 +1526,19 @@ fn lakekeeper_oauth_batch_check_and_vended_reads_go_through_the_proxy() {
     }
     let proxy = [("HTTP_PROXY", stack::PROXY_URL_INTERNAL)];
     let mut sys = exa_conn();
-    create_schema_and_scripts_with_env(&mut sys, PROXY_ADAPTER_SCHEMA, &proxy, &proxy);
+    create_schema_and_scripts_with_env(&mut sys, stack::PROXY_ADAPTER_SCHEMA, &proxy, &proxy);
     let catalog_uri =
         LAKEKEEPER_CATALOG_URI_INTERNAL.replace("//lakekeeper:", "//lakekeeper-via-proxy:");
 
     create_virtual_schema_with_password(
         &mut sys,
         &VsProps::new(VS_PROXY, E2E_NAMESPACE)
-            .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
+            .with_adapter_schema(stack::PROXY_ADAPTER_SCHEMA)
             .with_catalog_conn_name("LAKEKEEPER_PROXY_CREDS")
             .with_property("PERMISSION_CHECK", "LAKEKEEPER")
             .with_property("USER_MAPPING", PERMISSION_USER_MAPPING),
         &catalog_uri,
-        &password_via_proxy(WAREHOUSE_AUTHZ, false),
+        &lakekeeper_password_via_proxy(WAREHOUSE_AUTHZ, false),
     );
     sys.execute(&format!(
         "GRANT SELECT ON SCHEMA {VS_PROXY} TO {}",
@@ -1555,10 +1549,10 @@ fn lakekeeper_oauth_batch_check_and_vended_reads_go_through_the_proxy() {
     create_virtual_schema_with_password(
         &mut sys,
         &VsProps::new(VS_PROXY_VENDED, E2E_NAMESPACE)
-            .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
+            .with_adapter_schema(stack::PROXY_ADAPTER_SCHEMA)
             .with_catalog_conn_name("LAKEKEEPER_PROXY_VENDED_CREDS"),
         &catalog_uri,
-        &password_via_proxy(WAREHOUSE_VENDED, true),
+        &lakekeeper_password_via_proxy(WAREHOUSE_VENDED, true),
     );
     assert_eq!(
         sys.query_scalar_i64(&format!(

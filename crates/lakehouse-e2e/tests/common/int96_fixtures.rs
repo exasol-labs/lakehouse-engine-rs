@@ -4,8 +4,6 @@
 //! a genuine INT96 column. Must stay in lockstep with
 //! `scripts/spark-fixtures/create_int96_timestamp_fixture.sql`.
 
-pub const NAMESPACE: &str = "e2e_lakehouse";
-
 pub const INT96_TS_FAR_FUTURE_TABLE: &str = "int96_ts_far_future";
 
 pub const INT96_TS_FAR_FUTURE_COLUMN: &str = "ts";

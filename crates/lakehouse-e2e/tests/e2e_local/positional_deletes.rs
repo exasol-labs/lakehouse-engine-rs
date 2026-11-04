@@ -7,13 +7,13 @@ use crate::common::exasol_ws::ExaConn;
 use crate::common::pos_delete_fixtures::{
     DELETION_VECTOR_CARDINALITIES, DELETION_VECTOR_FILE_ID_RANGES, DELETION_VECTOR_TABLE,
     FILE_GRANULARITY_DELETED_IDS, FILE_GRANULARITY_REMAINING_ROWS, FILE_GRANULARITY_TABLE,
-    FILE_GRANULARITY_TOTAL_ROWS, NAMESPACE, ORC_FILE_IDS, PARQUET_FILE_IDS, PARTITION_COL,
-    PARTITION_EAST, PARTITION_EAST_DELETED_IDS, PARTITION_GRANULARITY_DELETED_IDS,
+    FILE_GRANULARITY_TOTAL_ROWS, ORC_FILE_IDS, PARQUET_FILE_IDS, PARTITION_COL, PARTITION_EAST,
+    PARTITION_EAST_DELETED_IDS, PARTITION_GRANULARITY_DELETED_IDS,
     PARTITION_GRANULARITY_REMAINING_ROWS, PARTITION_GRANULARITY_TABLE,
     PARTITION_GRANULARITY_TOTAL_ROWS, PARTITION_WEST, PARTITION_WEST_DELETED_IDS,
     UNSUPPORTED_FORMAT_TABLE, deletion_vector_deleted, deletion_vector_remaining_ids,
 };
-use crate::common::seed::{E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS};
+use crate::common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS};
 
 use crate::fixtures::{LAKEHOUSE_VS, explain_virtual_pushdown_sql, lakehouse_vs, vs_table};
 
@@ -33,11 +33,11 @@ fn setup_e2e() {
         let mut conn = exa_conn();
         create_virtual_schema(
             &mut conn,
-            &VsProps::new(SAMESHARD_VS_NAME, NAMESPACE).with_parallelism_factor(1),
+            &VsProps::new(SAMESHARD_VS_NAME, E2E_NAMESPACE).with_parallelism_factor(1),
         );
         create_virtual_schema(
             &mut conn,
-            &VsProps::new(SPLITSHARD_VS_NAME, NAMESPACE)
+            &VsProps::new(SPLITSHARD_VS_NAME, E2E_NAMESPACE)
                 .with_parallelism_factor(SPLIT_PARALLELISM_FACTOR),
         );
     });
@@ -52,7 +52,7 @@ fn fixture_spark_file_granularity_delete_table() {
     setup_e2e();
 
     let rt = runtime();
-    let files = rt.block_on(resolve_fixture_files(NAMESPACE, FILE_GRANULARITY_TABLE));
+    let files = rt.block_on(resolve_fixture_files(E2E_NAMESPACE, FILE_GRANULARITY_TABLE));
     assert_eq!(
         files.len(),
         2,
@@ -106,7 +106,7 @@ fn fixture_spark_partition_granularity_delete_table() {
 
     let rt = runtime();
     let files = rt.block_on(resolve_fixture_files(
-        NAMESPACE,
+        E2E_NAMESPACE,
         PARTITION_GRANULARITY_TABLE,
     ));
     assert_eq!(
@@ -450,7 +450,7 @@ fn e2e_deletes_with_single_and_grouped_agg() {
 fn fixture_spark_deletion_vector_table() {
     setup_e2e();
 
-    let files = runtime().block_on(resolve_fixture_files(NAMESPACE, DELETION_VECTOR_TABLE));
+    let files = runtime().block_on(resolve_fixture_files(E2E_NAMESPACE, DELETION_VECTOR_TABLE));
     assert_eq!(
         files.len(),
         4,

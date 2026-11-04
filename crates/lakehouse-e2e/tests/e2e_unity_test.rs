@@ -7,12 +7,12 @@ mod common;
 use common::e2e_harness::{
     SCAN_SCRIPT_NAME, VARCHAR_JSON, VsProps, assert_binary_columns_match_native_copy,
     assert_decimal_orders_numerically, assert_hex_literal_compares_bytes, assert_query_fails,
-    assert_text_columns, assert_type_matrix, column_adapter_notes, create_schema_and_scripts,
-    create_schema_and_scripts_with_env, create_virtual_schema_with_password, declared_types,
-    enumerated_table_names, error_text, exa_conn, exa_conn_redacting, explain_virtual_sql,
-    has_broadcast_join_block, has_two_scan_wrapper, identifier_note, install_slc, note_of, pairs,
-    parse_int, parse_numeric, partition_positions, query_error, reads, refuses, text_column,
-    upload_so, value_to_string,
+    assert_text_columns, assert_type_matrix, column_adapter_notes, count_statuses,
+    create_schema_and_scripts, create_schema_and_scripts_with_env,
+    create_virtual_schema_with_password, declared_types, enumerated_table_names, error_text,
+    exa_conn, exa_conn_redacting, explain_virtual_sql, has_broadcast_join_block,
+    has_two_scan_wrapper, identifier_note, install_slc, note_of, pairs, parse_int, parse_numeric,
+    partition_positions, query_error, reads, refuses, text_column, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
@@ -40,8 +40,9 @@ use common::seed::{
 };
 use common::stack::{
     self, ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
-    ASSUME_ROLE_EXTERNAL_ID, CatalogConnectionPassword, build_create_connection_sql,
-    local_stack_connection_password, wait_for_exasol, wait_for_seaweedfs, wait_for_url,
+    ASSUME_ROLE_EXTERNAL_ID, CatalogConnectionPassword, PROXY_ADAPTER_SCHEMA,
+    build_create_connection_sql, local_stack_connection_password, wait_for_exasol,
+    wait_for_seaweedfs, wait_for_url,
 };
 use common::timestamp_precision::expected_timestamp_precision;
 
@@ -781,7 +782,7 @@ fn unity_create_virtual_schema_lists_fixture_tables_and_columns() {
         .iter()
         .map(|table| declared_types(&mut conn, VS_NAME, table))
         .collect();
-    let other_answers = count_statuses(&mut conn, &others);
+    let other_answers = count_statuses(&mut conn, VS_NAME, &others);
     assert!(
         other_answers.iter().any(|(_, status)| status == "ok"),
         "the unrequested fixture tables must include a queryable one: {other_answers:?}"
@@ -808,21 +809,10 @@ fn unity_create_virtual_schema_lists_fixture_tables_and_columns() {
         );
     }
     assert_eq!(
-        count_statuses(&mut conn, &others),
+        count_statuses(&mut conn, VS_NAME, &others),
         other_answers,
         "every unrequested table answers a query as it did before REFRESH TABLES"
     );
-}
-
-/// Each table's `SELECT COUNT(*)` outcome: a fixture table that is refused at scan stays refused.
-fn count_statuses(conn: &mut ExaConn, tables: &[&str]) -> Vec<(String, String)> {
-    tables
-        .iter()
-        .map(|table| {
-            let response = conn.try_execute(&format!("SELECT COUNT(*) FROM {VS_NAME}.{table}"));
-            (table.to_string(), value_to_string(&response["status"]))
-        })
-        .collect()
 }
 
 #[test]
@@ -2620,7 +2610,6 @@ fn delta_single_group_aggregates_match_the_oracle() {
 /// Scenario: Catalog, storage, and STS requests go through the proxy
 #[test]
 fn unity_catalog_and_delta_log_reads_go_through_the_proxy() {
-    const ADAPTER_SCHEMA: &str = "LHVS_PROXY";
     const VS_PROXY: &str = "UNITY_PROXY_VS";
     setup();
     stack::wait_for_proxy();
@@ -2629,11 +2618,11 @@ fn unity_catalog_and_delta_log_reads_go_through_the_proxy() {
     }
     let proxy = [("HTTP_PROXY", stack::PROXY_URL_INTERNAL)];
     let mut conn = exa_conn();
-    create_schema_and_scripts_with_env(&mut conn, ADAPTER_SCHEMA, &proxy, &proxy);
+    create_schema_and_scripts_with_env(&mut conn, PROXY_ADAPTER_SCHEMA, &proxy, &proxy);
     create_virtual_schema_with_password(
         &mut conn,
         &VsProps::new(VS_PROXY, UNITY_NAMESPACE)
-            .with_adapter_schema(ADAPTER_SCHEMA)
+            .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
             .with_catalog_kind("UNITY_CATALOG")
             .with_catalog_conn_name("UNITY_PROXY_CREDS"),
         "http://unitycatalog-via-proxy:8080",

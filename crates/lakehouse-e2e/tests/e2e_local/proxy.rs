@@ -7,7 +7,7 @@ use crate::common::e2e_harness::{
 };
 use crate::common::exasol_ws::error_text;
 use crate::common::pos_delete_fixtures::{
-    DELETION_VECTOR_TABLE, FILE_GRANULARITY_REMAINING_ROWS, FILE_GRANULARITY_TABLE, NAMESPACE,
+    DELETION_VECTOR_TABLE, FILE_GRANULARITY_REMAINING_ROWS, FILE_GRANULARITY_TABLE,
     deletion_vector_remaining_ids,
 };
 use crate::common::raw_parquet::write_parquet_fixture;
@@ -15,7 +15,8 @@ use crate::common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_TOTAL_ROWS};
 use crate::common::stack::{
     ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
     ASSUME_ROLE_EXTERNAL_ID, CLOSED_PROXY_URL_INTERNAL, CatalogConnectionPassword,
-    PROXY_URL_INTERNAL, assert_resolves_only_through_proxy, local_stack_connection_password,
+    PROXY_ADAPTER_SCHEMA, PROXY_URL_INTERNAL, SEAWEEDFS_URL_VIA_PROXY,
+    assert_resolves_only_through_proxy, local_stack_connection_password, password_via_proxy,
     wait_for_proxy,
 };
 use crate::fixtures::{events, lakehouse_vs, vs_table};
@@ -25,9 +26,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
-const ADAPTER_SCHEMA: &str = "LHVS_PROXY";
 const CATALOG_VIA_PROXY: &str = "http://iceberg-rest-via-proxy:8181";
-const STORAGE_VIA_PROXY: &str = "http://seaweedfs-via-proxy:8333";
 const BASE_DIRECT: &str = "s3://warehouse/proxy_direct/";
 const PROXY_PASSWORD: &str = "pr0xy-s3cret";
 
@@ -37,19 +36,17 @@ fn setup(adapter_env: &[(&str, &str)], scan_env: &[(&str, &str)]) {
     wait_for_proxy();
     assert_resolves_only_through_proxy("iceberg-rest-via-proxy");
     assert_resolves_only_through_proxy("seaweedfs-via-proxy");
-    create_schema_and_scripts_with_env(&mut exa_conn(), ADAPTER_SCHEMA, adapter_env, scan_env);
-}
-
-fn password_via_proxy() -> CatalogConnectionPassword {
-    CatalogConnectionPassword {
-        endpoint: STORAGE_VIA_PROXY.to_string(),
-        ..local_stack_connection_password()
-    }
+    create_schema_and_scripts_with_env(
+        &mut exa_conn(),
+        PROXY_ADAPTER_SCHEMA,
+        adapter_env,
+        scan_env,
+    );
 }
 
 fn props<'a>(vs_name: &'a str, namespace: &'a str, conn_name: &'a str) -> VsProps<'a> {
     VsProps::new(vs_name, namespace)
-        .with_adapter_schema(ADAPTER_SCHEMA)
+        .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
         .with_catalog_conn_name(conn_name)
 }
 
@@ -78,9 +75,9 @@ fn every_request_of_the_adapter_and_the_scan_goes_through_the_proxy() {
 
     create_virtual_schema_with_password(
         &mut conn,
-        &props("PROXY_ICEBERG_VS", NAMESPACE, "PROXY_ICEBERG_CREDS"),
+        &props("PROXY_ICEBERG_VS", E2E_NAMESPACE, "PROXY_ICEBERG_CREDS"),
         CATALOG_VIA_PROXY,
-        &password_via_proxy(),
+        &password_via_proxy(local_stack_connection_password()),
     );
     refresh("PROXY_ICEBERG_VS");
     assert_eq!(
@@ -104,7 +101,7 @@ fn every_request_of_the_adapter_and_the_scan_goes_through_the_proxy() {
         BASE_DIRECT,
         &CatalogConnectionPassword {
             warehouse: String::new(),
-            ..password_via_proxy()
+            ..password_via_proxy(local_stack_connection_password())
         },
     );
     refresh("PROXY_DIRECT_VS");
@@ -119,8 +116,8 @@ fn every_request_of_the_adapter_and_the_scan_goes_through_the_proxy() {
             secret_key: ASSUME_ROLE_BASE_SECRET_KEY.to_string(),
             aws_assume_role_arn: Some(ASSUME_ROLE_ARN.to_string()),
             aws_external_id: Some(ASSUME_ROLE_EXTERNAL_ID.to_string()),
-            aws_sts_endpoint: Some(STORAGE_VIA_PROXY.to_string()),
-            ..password_via_proxy()
+            aws_sts_endpoint: Some(SEAWEEDFS_URL_VIA_PROXY.to_string()),
+            ..password_via_proxy(local_stack_connection_password())
         },
     );
     refresh("PROXY_ROLE_VS");
@@ -165,7 +162,7 @@ fn an_unreachable_proxy_fails_create_naming_the_proxy_without_its_password() {
         &mut exa_conn(),
         &props("PROXY_CLOSED_VS", E2E_NAMESPACE, "PROXY_CLOSED_CREDS"),
         CATALOG_VIA_PROXY,
-        &password_via_proxy(),
+        &password_via_proxy(local_stack_connection_password()),
     );
     let msg = error_text(&resp, "CREATE through an unreachable proxy");
     assert!(msg.contains("10.84.0.12:1"), "{msg}");

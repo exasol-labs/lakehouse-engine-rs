@@ -27,7 +27,8 @@ use common::seed::{
     decimal_18_0_values, seed_events_table_with_auth,
 };
 use common::stack::{
-    self, CatalogConnectionPassword, build_create_connection_sql, wait_for_exasol, wait_for_url,
+    self, CatalogConnectionPassword, PROXY_ADAPTER_SCHEMA, build_create_connection_sql,
+    wait_for_exasol, wait_for_url,
 };
 
 use arrow::array::{Float64Array, Int64Array, StringArray};
@@ -459,16 +460,15 @@ fn azure_static_and_vended_creds_end_to_end() {
 
 /// Scenario: HTTPS endpoints are reached through a CONNECT tunnel
 fn adls_reads_tunnel_through_the_https_proxy(conn: &mut ExaConn, fixture: &AzureFixture) {
-    const ADAPTER_SCHEMA: &str = "LHVS_PROXY";
     const PROXY_VS: &str = "AZ_PROXY_VS";
     stack::wait_for_proxy();
     let since = stack::proxy_log_mark();
     let proxy = [("HTTPS_PROXY", stack::PROXY_URL_INTERNAL)];
-    create_schema_and_scripts_with_env(conn, ADAPTER_SCHEMA, &proxy, &proxy);
+    create_schema_and_scripts_with_env(conn, PROXY_ADAPTER_SCHEMA, &proxy, &proxy);
     create_virtual_schema_with_password(
         conn,
         &VsProps::new(PROXY_VS, "")
-            .with_adapter_schema(ADAPTER_SCHEMA)
+            .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
             .with_catalog_conn_name("AZ_PROXY_CREDS")
             .with_catalog_kind("DIRECT_STORAGE"),
         &format!(

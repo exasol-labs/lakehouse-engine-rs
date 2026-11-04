@@ -4,8 +4,6 @@
 //! `add_files` registers a file that lacks the column of its own `identity` partition field. Must
 //! stay in lockstep with `scripts/spark-fixtures/create_identity_partition_fixture.sql`.
 
-pub const NAMESPACE: &str = "e2e_lakehouse";
-
 pub const ABSENT_TABLE: &str = "ident_part_absent";
 
 /// Every column but `id` carries an `identity` partition field. Row 1 is imported, row 2 is

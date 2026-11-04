@@ -6,8 +6,6 @@
 //! No `date` -> `timestamp` fixture: Iceberg Java never implements that promotion, so
 //! no conforming writer can author it; its refusal is unit-tested instead.
 
-pub const NAMESPACE: &str = "e2e_lakehouse";
-
 pub const ICEBERG_TYPE_PROMOTION_TABLE: &str = "iceberg_type_promotion";
 
 pub const ID_COLUMN: &str = "id";

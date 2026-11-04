@@ -5,11 +5,12 @@
 
 use crate::common::e2e_harness::*;
 use crate::common::raw_parquet::get_fixture_object;
+use crate::common::seed::E2E_NAMESPACE;
 use crate::common::type_promotion_fixtures::{
     DECIMAL_DECIMAL_COLUMN, DECIMAL_DECIMAL_PRE_PROMOTION_PHYSICAL_TYPE, FLOAT_DOUBLE_COLUMN,
     FLOAT_DOUBLE_PRE_PROMOTION_PHYSICAL_TYPE, ICEBERG_TYPE_PROMOTION_TABLE, ID_COLUMN,
-    INT_LONG_COLUMN, INT_LONG_PRE_PROMOTION_PHYSICAL_TYPE, NAMESPACE, POST_PROMOTION_ROWS,
-    PRE_PROMOTION_ROWS, TypePromotionRow,
+    INT_LONG_COLUMN, INT_LONG_PRE_PROMOTION_PHYSICAL_TYPE, POST_PROMOTION_ROWS, PRE_PROMOTION_ROWS,
+    TypePromotionRow,
 };
 use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, stack, vs_table};
 
@@ -36,7 +37,7 @@ fn e2e_type_promotion_pre_promotion_data_file_is_physically_narrow() {
     let rt = runtime();
 
     let files = rt.block_on(resolve_fixture_files(
-        NAMESPACE,
+        E2E_NAMESPACE,
         ICEBERG_TYPE_PROMOTION_TABLE,
     ));
     assert_eq!(

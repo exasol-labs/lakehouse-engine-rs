@@ -4,8 +4,6 @@
 //! `add_files` registers a file without field ids. Must stay in lockstep with
 //! `scripts/spark-fixtures/create_name_mapping_fixture.sql`.
 
-pub const NAMESPACE: &str = "e2e_lakehouse";
-
 /// Imported without field ids, then its nested members renamed, so only
 /// `schema.name-mapping.default` binds the imported row's members.
 pub const NESTED_TABLE: &str = "nested_name_map";

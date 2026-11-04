@@ -417,6 +417,22 @@ pub fn enumerated_table_names(conn: &mut ExaConn, vs_name: &str) -> Vec<String> 
         .unwrap_or_default()
 }
 
+/// Each table's `SELECT COUNT(*)` status, so a test compares queryability before and after.
+pub fn count_statuses(
+    conn: &mut ExaConn,
+    vs_name: &str,
+    tables: &[impl AsRef<str>],
+) -> Vec<(String, String)> {
+    tables
+        .iter()
+        .map(|table| {
+            let table = table.as_ref();
+            let response = conn.try_execute(&format!("SELECT COUNT(*) FROM {vs_name}.{table}"));
+            (table.to_string(), value_to_string(&response["status"]))
+        })
+        .collect()
+}
+
 pub fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
     let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
     let result_set = &resp["responseData"]["results"][0]["resultSet"];

@@ -9,12 +9,13 @@
 use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
 use crate::common::identity_partition_fixtures::{
-    ABSENT_ROWS, ABSENT_TABLE, HELD_DIR, HELD_STORED_REGIONS, IMPORT_DIR_SUFFIX, NAMESPACE,
-    REGION_COLUMN, RegionRow, TYPES_COLUMNS, TYPES_ID_COLUMN, TYPES_ID_DECLARED,
-    TYPES_ROW_IDS_TEXT, TYPES_TABLE,
+    ABSENT_ROWS, ABSENT_TABLE, HELD_DIR, HELD_STORED_REGIONS, IMPORT_DIR_SUFFIX, REGION_COLUMN,
+    RegionRow, TYPES_COLUMNS, TYPES_ID_COLUMN, TYPES_ID_DECLARED, TYPES_ROW_IDS_TEXT, TYPES_TABLE,
 };
 use crate::common::raw_parquet::get_fixture_object;
-use crate::common::seed::{E2E_IDENT_PART_BYTES_TABLE, IDENT_PART_BYTES_TEXT, build_seed_catalog};
+use crate::common::seed::{
+    E2E_IDENT_PART_BYTES_TABLE, E2E_NAMESPACE, IDENT_PART_BYTES_TEXT, build_seed_catalog,
+};
 use crate::common::stack::iceberg_catalog_url;
 use crate::fixtures::{LAKEHOUSE_VS, assert_pushed_to_scan_udf, lakehouse_vs, stack, vs_table};
 
@@ -29,18 +30,18 @@ pub(crate) fn load_table(table: &str) -> iceberg::table::Table {
         let catalog = build_seed_catalog(&iceberg_catalog_url(), "s3://warehouse/", "identity")
             .await
             .unwrap_or_else(|e| panic!("connect to the Iceberg REST catalog for {table}: {e:#}"));
-        let ident = TableIdent::new(NamespaceIdent::new(NAMESPACE.into()), table.into());
+        let ident = TableIdent::new(NamespaceIdent::new(E2E_NAMESPACE.into()), table.into());
         catalog
             .load_table(&ident)
             .await
-            .unwrap_or_else(|e| panic!("load {NAMESPACE}.{table}: {e}"))
+            .unwrap_or_else(|e| panic!("load {E2E_NAMESPACE}.{table}: {e}"))
     })
 }
 
 /// `(path, footer column names)` of every data file the table's current snapshot plans.
 pub(crate) fn planned_footers(table: &str) -> Vec<(String, Vec<String>)> {
     runtime()
-        .block_on(resolve_fixture_files(NAMESPACE, table))
+        .block_on(resolve_fixture_files(E2E_NAMESPACE, table))
         .into_iter()
         .map(|file| {
             let path = file.path;
