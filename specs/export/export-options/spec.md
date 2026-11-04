@@ -1,6 +1,6 @@
-# Feature: EXPORT INTO SCRIPT Entry Points
+# Feature: EXPORT INTO SCRIPT Options and Writer Count
 
-A user exports an Exasol table, a query over virtual schema tables, or a query that joins both, with `EXPORT ... INTO SCRIPT <schema>.LAKEHOUSE_EXPORT`. The script checks the statement before any source row is read. Exasol then runs the same script as the writer over the source rows, spread over several writer invocations. Each writer counts the rows it receives, and Exasol reports the sum of the counts as the statement's row count. No data reaches the lakehouse (#565).
+The export script checks the statement, its options, and its source column types before any source row is read, and sets the number of writers from `WRITERS_PER_NODE` and `SINGLE_COMMIT`.
 
 ## Background
 
@@ -8,42 +8,10 @@ A user exports an Exasol table, a query over virtual schema tables, or a query t
 * `TABLE_NAME` is required. It is a namespace and a table name joined by `.`. The namespace may have several `.`-separated levels, and no part is empty.
 * `WRITERS_PER_NODE` is optional: an integer of at least 1, default 1. `SINGLE_COMMIT` is optional: `true` or `false` in any letter case, default `false`. The export refuses `WRITERS_PER_NODE` together with `SINGLE_COMMIT = 'true'`.
 * Writer count: with `SINGLE_COMMIT = 'true'`, one writer runs for the whole cluster. Otherwise the export deals the source rows in turn to G writers, where G is the node count × `WRITERS_PER_NODE`, capped at 300. A source with at least G rows runs exactly G writers, and a source with fewer rows runs one writer per row.
-* An exporting user needs the `EXPORT` system privilege, `EXECUTE` on `LAKEHOUSE_EXPORT`, the `CONNECTION` privilege on the CONNECTION (Exasol requires it for `AT <connection>`), and `GRANT ACCESS ON CONNECTION <connection> FOR SCRIPT <schema>.LAKEHOUSE_EXPORT`, granted directly or through a role.
 * The export refuses columns of type GEOMETRY, HASHTYPE, INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, and TIMESTAMP WITH LOCAL TIME ZONE, because Exasol does not pass them to a UDF reliably. The Iceberg table spec (§ Schemas and Data Types, Primitive Types) defines `timestamptz` ("Timestamp, microsecond precision, with timezone"; the counterpart of TIMESTAMP WITH LOCAL TIME ZONE), `uuid` ("Universally unique identifiers") and `fixed(L)` ("Fixed-length byte array of length L"), the Iceberg counterparts of HASHTYPE, and, in format v3, `geometry(C)`. It defines no interval type. Refusing GEOMETRY, HASHTYPE, and TIMESTAMP WITH LOCAL TIME ZONE is a trade-off that Exasol's UDF interface forces. A user casts such a column, for example to VARCHAR or TIMESTAMP, to export it.
 * Exasol's own UDF type check races the export's check, so a refused column fails the export with one of two errors: the export's error, which names the column and its type, or Exasol's `[22002] Column type not supported: <type>`, which does not name the column. Which one a run returns is not deterministic. An empty source with such a column may be refused the same way or export 0 rows, so the export makes no promise about it.
 
 ## Scenarios
-
-### Scenario: A whole-table export reports every source row
-
-* *GIVEN* an Exasol table with 1,000 rows
-* *WHEN* a user runs `EXPORT <table> INTO SCRIPT <schema>.LAKEHOUSE_EXPORT AT <connection> WITH TABLE_NAME = 'ns.t'`
-* *THEN* the statement's row count SHALL be 1,000
-* *AND* every source row SHALL reach exactly one writer
-
-### Scenario: A filtered query exports only the rows it returns
-
-* *GIVEN* an Exasol table with 1,000 rows
-* *WHEN* a user exports a query over that table whose filter matches a strict subset of the rows
-* *THEN* the statement's row count SHALL equal the number of rows the query returns
-
-### Scenario: A column-list export reports every row of the table
-
-* *GIVEN* an Exasol table with several columns and 1,000 rows
-* *WHEN* a user exports `<table> (<a subset of its columns>)`
-* *THEN* the statement's row count SHALL be 1,000
-
-### Scenario: A join of a virtual schema table and an Exasol table exports the joined rows
-
-* *GIVEN* a virtual schema table and an Exasol table that share a join key
-* *WHEN* a user exports a query that joins the two tables
-* *THEN* the statement's row count SHALL equal the row count of the same query run as a `SELECT`
-
-### Scenario: An empty source exports zero rows
-
-* *GIVEN* a query that returns no rows and whose columns all have types the export supports
-* *WHEN* a user exports it
-* *THEN* the statement SHALL succeed with a row count of 0
 
 ### Scenario: WRITERS_PER_NODE sets the writer count
 
@@ -100,33 +68,3 @@ A user exports an Exasol table, a query over virtual schema tables, or a query t
 * *WHEN* a user exports it
 * *THEN* the export SHALL fail
 * *AND* the error SHALL either name the column as the source names it (the table column, the column-list entry, or the query's column alias) and its Exasol type, or be Exasol's `Column type not supported: <type>`
-
-### Scenario: A user who holds the export privileges exports rows
-
-* *GIVEN* a user who holds the privileges § Background lists through one role, and no other privilege on the CONNECTION
-* *WHEN* the user exports a table they may read
-* *THEN* the export SHALL succeed and report the table's row count
-
-### Scenario: A missing script-scoped CONNECTION grant fails with a named error
-
-* *GIVEN* a user who holds every export privilege except `GRANT ACCESS ON CONNECTION ... FOR SCRIPT <schema>.LAKEHOUSE_EXPORT`
-* *AND* a source whose rows raise an error when they are read
-* *WHEN* the user exports it
-* *THEN* the export SHALL fail before any source row is read
-* *AND* the error SHALL name the CONNECTION, `LAKEHOUSE_EXPORT`, and the user
-
-### Scenario: No CONNECTION value appears in the generated SQL or an error
-
-* *GIVEN* a CONNECTION whose address, user, and password are known
-* *WHEN* an export succeeds, or fails in any way this feature describes
-* *THEN* the SQL that `LAKEHOUSE_EXPORT` generates SHALL carry the CONNECTION name and no value of the CONNECTION
-* *AND* no error message SHALL contain the CONNECTION's password
-
-### Scenario: The installer creates the export script and prints the export grants
-
-* *GIVEN* the install script has uploaded the engine `.so`
-* *WHEN* it creates the deployment scripts in the target schema
-* *THEN* it SHALL create `LAKEHOUSE_EXPORT` as a RUST SET script with dynamic input that returns `DECIMAL(18,0)` and references the same `.so` as the other scripts
-* *AND* the printed next-step template SHALL create one export role, `LAKEHOUSE_EXPORT_ROLE_<schema>`, that holds the privileges § Background lists for the template's CONNECTION, and SHALL tell the operator to grant that role to each exporting user
-* *AND* the template SHALL print the export role lines for every installing user, including `SYS`
-* *AND* the install script SHALL NOT run any of the export role's statements

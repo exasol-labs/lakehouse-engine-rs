@@ -30,8 +30,9 @@ downloaded.
 
 * *GIVEN* the install script has uploaded the engine `.so` and resolved its `%udf_object` path
 * *WHEN* the script creates the deployment scripts in the target schema
-* *THEN* it SHALL issue four script statements in that schema: the RUST ADAPTER SCRIPT, the RUST
-  SCALAR scan script, the RUST SCALAR version script, and the LUA SET file distributor
+* *THEN* it SHALL issue five script statements in that schema: the RUST ADAPTER SCRIPT, the RUST
+  SCALAR scan script, the RUST SCALAR version script, the RUST SET export script, and the LUA SET
+  file distributor
 * *AND* the version script's DDL SHALL declare `RETURNS VARCHAR(100)`, MUST NOT declare an `EMITS`
   clause, and SHALL reference the same `%udf_object` path as the adapter script and the scan script
 * *AND* every statement SHALL stay idempotent, so a re-run over a prior install replaces the
@@ -77,11 +78,11 @@ downloaded.
 
 * *GIVEN* the install documentation
 * *WHEN* an operator reads it
-* *THEN* the command walkthrough SHALL name four created scripts, including the version script, and
+* *THEN* the command walkthrough SHALL name five created scripts, including the version script, and
   SHALL describe the verification as a comparison of the reported version against the downloaded
   release
 * *AND* the by-hand script appendix SHALL carry the version script's `RETURNS VARCHAR(100)` DDL, so
-  an operator who creates the scripts by hand creates all four
+  an operator who creates the scripts by hand creates all five
 * *AND* the verification appendix SHALL give `SELECT <schema>.LAKEHOUSE_VERSION();` as the by-hand
   check, and SHALL state that a returned value differing from the installed release means the wrong
   artifact reached the target
