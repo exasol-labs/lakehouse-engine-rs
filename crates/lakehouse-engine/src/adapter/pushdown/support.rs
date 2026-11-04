@@ -3,7 +3,6 @@ use super::scalar_over_agg::with_stat_grand_means;
 use super::single_group_agg::{DistinctCount, SingleGroupItem};
 use crate::adapter::column_notes::TableNotes;
 use crate::adapter::connection::ConnectionCreds;
-use crate::adapter::sharding::group_count;
 use crate::scan::sealed::{SealedStorageKey, seal_storage};
 use crate::scan::spec::{
     AggregatePlan, ColumnRef, CommonScanSpec, FileEntry, ProjectionItem, ScanSpec, ScanStorage,
@@ -24,9 +23,15 @@ pub(super) const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
 /// Exasol spreads the work units across nodes.
 pub(super) const DISTRIBUTE_FILES_UDF_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
 
+/// Exasol distributes groups round-robin up to this count; above it they are
+/// hash-partitioned (unbalanced).
+const MAX_SHARD_COUNT: usize = 300;
+
 /// Clamped to at least 1 and at most `min(file_count, 300)`, so no shard is empty.
 pub fn shard_count(node_count: usize, parallelism_factor: usize, file_count: usize) -> usize {
-    group_count(node_count, parallelism_factor).min(file_count.max(1))
+    let raw = node_count.saturating_mul(parallelism_factor);
+    let upper = file_count.clamp(1, MAX_SHARD_COUNT);
+    raw.clamp(1, upper)
 }
 
 pub(super) fn shard_files_json<E: Clone + Into<FileEntry>>(files: &[E]) -> String {

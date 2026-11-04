@@ -12,7 +12,7 @@ Task text lives in plan.md § Implementation Tasks. Numbers match.
 
 ## Phase 2: Implementation (Group A)
 - [x] 1.1 Add `export` feature to the `exasol-udf-sdk` workspace pin
-- [x] 1.2 Move the 300-group cap into `sharding::group_count`
+- [x] 1.2 Add a private `writer_count` to `export/sql.rs` with `writer_count_caps_at_300`
 - [x] 1.3 Add `export/options.rs` with option validation and `options_tests.rs`
 - [x] 1.4 Add `export/sql.rs` writer SELECT renderer with type guards [expert]
 - [x] 1.5 Add `export/mod.rs` with `generate_export_sql` and `run_writer`
@@ -32,7 +32,6 @@ Task text lives in plan.md § Implementation Tasks. Numbers match.
 - [x] 2.3 Update `install.test.sh`
 - [x] 2.4 Update `docs/install.md`
 - [x] 2.5 Update `docs/security.md`
-- [x] 2.6 Extend the `install-script-e2e` CI job
 
 ## Phase 3: Verification
 - [~] 3.1 Run the plan's Checklist (build, test, E2E, fmt-check lint done; `make test-install` blocked by missing `jq`; coverage not run)
@@ -46,3 +45,9 @@ Task text lives in plan.md § Implementation Tasks. Numbers match.
 - [x] 4.4 In `deploy/scripts/install.sh` `print_next_step_template`, change the export line to end `one role serves every exporting user. SYS needs no grant.`
 - [x] 4.5 In `e2e_local/export.rs` `exporters`, bind the ACCESS grant separately and grant the three-entry `privileges` array to both the role and `NO_ACCESS_EXPORTER`, without the `[..3]` slice
 - [x] 4.6 Move `parse_int` into `common/exasol_ws.rs`, add `profiled_export_counts` there, and reduce `profiled_export` and `cloud_profiled_export` to calls to it; delete `cloud_int`
+
+## Phase 5: Independent Review Fixes
+- [x] 5.1 In `cloud_export_writer_counts`, filter the second export's source to `per_node_two` rows and expect `per_node_two` rows, so it holds one row per writer when the writer count is capped
+- [x] 5.2 Remove `sharding::group_count` and its test, restore `support.rs` `MAX_SHARD_COUNT` and `shard_count`, and keep the writer-count calculation as a private `writer_count` in `export/sql.rs` with its own unit tests
+- [x] 5.3 Delete the `Export script shape` step from the `install-script-e2e` job and restore the job's leading comment
+- [x] 5.4 Re-check `verification-report.md` against the edits and remove its CI step mention

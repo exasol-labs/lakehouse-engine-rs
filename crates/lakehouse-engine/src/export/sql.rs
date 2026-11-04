@@ -1,6 +1,9 @@
 use super::EXPORT_SCRIPT_NAME;
 use super::options::WriterLayout;
-use crate::adapter::sharding::group_count;
+
+/// Exasol distributes groups round-robin up to this count; above it they are
+/// hash-partitioned (unbalanced).
+const MAX_WRITER_COUNT: usize = 300;
 
 /// `TYPEOF` patterns of the types Exasol does not pass to a UDF reliably.
 const UNSUPPORTED_TYPE_PATTERNS: [&str; 4] = [
@@ -47,9 +50,15 @@ impl WriterSelect<'_> {
     fn group_count(&self) -> usize {
         match self.writers {
             WriterLayout::SingleCommit => 1,
-            WriterLayout::PerNode(per_node) => group_count(self.node_count, per_node),
+            WriterLayout::PerNode(per_node) => writer_count(self.node_count, per_node),
         }
     }
+}
+
+fn writer_count(node_count: usize, per_node: usize) -> usize {
+    node_count
+        .saturating_mul(per_node)
+        .clamp(1, MAX_WRITER_COUNT)
 }
 
 // Exasol has no error function, so the guard fails the cast of its message. The message

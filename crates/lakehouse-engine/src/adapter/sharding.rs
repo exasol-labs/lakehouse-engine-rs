@@ -1,15 +1,3 @@
-/// Exasol distributes groups round-robin up to this count; above it they are
-/// hash-partitioned (unbalanced).
-const MAX_GROUP_COUNT: usize = 300;
-
-/// The UDF group count G for `node_count` nodes and `per_node` groups each, clamped to
-/// between 1 and 300. The scan shard count and the export writer count share this cap.
-pub fn group_count(node_count: usize, per_node: usize) -> usize {
-    node_count
-        .saturating_mul(per_node)
-        .clamp(1, MAX_GROUP_COUNT)
-}
-
 /// Positional-delete refs ride along with their data file; only `shard_bytes` drives balancing.
 pub trait ShardWeight {
     fn shard_bytes(&self) -> u64;

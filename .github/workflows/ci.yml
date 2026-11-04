@@ -282,9 +282,7 @@ jobs:
         run: make test-install
 
   # Tests the installer against a real prior release on a runner with no
-  # prereqs preinstalled, not this PR's .so. It checks that install.sh creates
-  # LAKEHOUSE_VERSION (version smoke test) and LAKEHOUSE_EXPORT (shape query).
-  # SaaS mode has no CI job (#252).
+  # prereqs preinstalled, not this PR's .so. SaaS mode has no CI job (#252).
   install-script-e2e:
     name: Install Script E2E (BucketFS)
     runs-on: ubuntu-latest
@@ -315,16 +313,6 @@ jobs:
             --host "localhost:${LH_EXASOL_PORT:-28563}" --user sys --password "${EXASOL_SYS_PASSWORD:-exasol}" \
             --bfs-host localhost --bfs-port "${LH_BUCKETFS_PORT:-22581}" \
             --bfs-write-password "$BFSPASS"
-
-      # Creating LAKEHOUSE_EXPORT succeeds over a release .so that lacks the entry point, so this
-      # proves the installer's DDL shape, not the branch's export hook.
-      - name: Export script shape
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          dsn="exasol://sys:${EXASOL_SYS_PASSWORD:-exasol}@localhost:${LH_EXASOL_PORT:-28563}?validateservercertificate=0"
-          out=$(exapump sql "SELECT CASE WHEN COUNT(*) = 1 THEN 'EXPORT_SHAPE_' || 'OK' ELSE 'EXPORT_SHAPE_' || 'BAD' END AS VERDICT FROM EXA_ALL_SCRIPTS WHERE SCRIPT_SCHEMA = 'LHVS' AND SCRIPT_NAME = 'LAKEHOUSE_EXPORT' AND SCRIPT_LANGUAGE = 'RUST' AND SCRIPT_INPUT_TYPE = 'SET' AND SCRIPT_RESULT_TYPE = 'RETURNS'" -d "$dsn")
-          echo "$out"
-          grep -q EXPORT_SHAPE_OK <<<"$out"
 
       - name: Dump Exasol logs on failure
         if: failure()

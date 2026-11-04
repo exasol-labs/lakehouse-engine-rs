@@ -54,10 +54,10 @@ The installer creates one script, `LAKEHOUSE_EXPORT`, that answers `EXPORT ... I
 ### 1. Export entry points and their proof
 
 - [ ] 1.1 Add `export` to the features of the root `[workspace.dependencies]` `exasol-udf-sdk` pin, next to `emit-arrow`, keeping the pinned version.
-- [ ] 1.2 Move the 300-group cap from `adapter/pushdown/support.rs` (`MAX_SHARD_COUNT`, `shard_count` at :28-35) into `adapter/sharding.rs` as `pub fn group_count(node_count: usize, per_node: usize) -> usize`, which multiplies with `saturating_mul` and clamps to between 1 and 300. Make `shard_count` delegate to it and keep its file-count clamp, with the existing `shard_count` tests in `support_tests.rs` unchanged. Add `group_count_caps_at_300` to `sharding_tests.rs`, covering `group_count(1, 1) == 1`, `group_count(2, 0) == 1`, `group_count(4, 100) == 300`, and `group_count(usize::MAX, usize::MAX) == 300`.
+- [ ] 1.2 In `export/sql.rs`, add a private `writer_count(node_count: usize, per_node: usize) -> usize` that multiplies with `saturating_mul` and clamps to between 1 and 300, and add `writer_count_caps_at_300` to `sql_tests.rs`, covering `writer_count(1, 1) == 1`, `writer_count(2, 0) == 1`, `writer_count(4, 100) == 300`, and `writer_count(usize::MAX, usize::MAX) == 300`. The scan's `shard_count` and `adapter/sharding.rs` stay unchanged.
 - [ ] 1.3 Add `crates/lakehouse-engine/src/export/options.rs`: turn an SDK `ExportSpec` into validated export options or a `UdfError::User` that names the option and its accepted form. Cover: TRUNCATE, REPLACE, and CREATED BY refused with an append-only message naming the clause; no CONNECTION name refused with a message asking for `AT <connection>`, and an inline CONNECTION refused without echoing `connection_information`; `TABLE_NAME` missing or with an empty part; an unknown option, with the accepted list; `WRITERS_PER_NODE` not an integer of at least 1 that fits a `usize`; `SINGLE_COMMIT` not `true` or `false` in any case; `WRITERS_PER_NODE` with `SINGLE_COMMIT = 'true'`, naming both. Option names arrive upper-cased from Exasol. One table-driven unit test file, `options_tests.rs`, holds every invalid and valid case, including `WRITERS_PER_NODE = '18446744073709551615'` (`usize::MAX`, accepted) and `'18446744073709551616'` (refused with the integer message).
 - [ ] 1.4 Add `export/sql.rs`, which renders the writer `SELECT` [expert]:
-  - Shape: `SELECT "<schema>"."LAKEHOUSE_EXPORT"('<writer spec>', <source columns>) FROM DUAL WHERE <guards> GROUP BY MOD(ROWNUM, <G>)`. The key stays in the top-level `GROUP BY`, because an export SELECT over a subquery of `DUAL` fails (decision [2]). The schema comes from `ctx.script_schema()`. G is 1 for `SINGLE_COMMIT = 'true'`, otherwise `group_count(ctx.node_count(), WRITERS_PER_NODE)`.
+  - Shape: `SELECT "<schema>"."LAKEHOUSE_EXPORT"('<writer spec>', <source columns>) FROM DUAL WHERE <guards> GROUP BY MOD(ROWNUM, <G>)`. The key stays in the top-level `GROUP BY`, because an export SELECT over a subquery of `DUAL` fails (decision [2]). The schema comes from `ctx.script_schema()`. G is 1 for `SINGLE_COMMIT = 'true'`, otherwise `writer_count(ctx.node_count(), WRITERS_PER_NODE)`.
   - The writer spec is a JSON object that carries only the CONNECTION name. The SELECT calls the export script itself, so `run` (task 1.6) is the writer.
   - One guard per source column: `(CASE WHEN TYPEOF(c) LIKE 'GEOMETRY%' OR TYPEOF(c) LIKE 'HASHTYPE%' OR TYPEOF(c) LIKE 'INTERVAL%' OR TYPEOF(c) LIKE '%WITH LOCAL TIME ZONE' THEN CAST('LAKEHOUSE_EXPORT: column "<name>" has type ' || TYPEOF(c) || ', which the export does not support; cast it to a supported type' AS DECIMAL(1,0)) ELSE 0 END) = 0`. The message must concatenate `TYPEOF(c)`: Exasol folds a constant `CAST` eagerly and fails every export.
   - `<name>` is the last quoted identifier of the `source_column_names` entry, with `""` unescaped. Every string literal doubles its `'`.
@@ -108,14 +108,13 @@ The installer creates one script, `LAKEHOUSE_EXPORT`, that answers `EXPORT ... I
   - Reconcile § Reader grants (:22) with the export role: the warning applies to `ACCESS` on the CONNECTION for `LAKEHOUSE_SCAN`, which the export role does not grant, and a reader that exports holds the export role.
   - Add "Who can bypass the export script" after § Who can bypass the adapter (:101-108): a holder of the export role can call `LAKEHOUSE_EXPORT` directly in a `SELECT` with a forged writer spec and any rows. That call runs the writer and skips every check the export call makes (options, type guards, writer count, SINGLE_COMMIT), so the writer treats its writer spec as untrusted input.
   - Extend § Re-installing (:78): the re-install also drops the export role's `EXECUTE` and `ACCESS` grants on `LAKEHOUSE_EXPORT`; run those two template lines again.
-- [ ] 2.6 Extend the `install-script-e2e` job in `.github/workflows/ci.yml` (:286-326). Its install step runs the branch's `install.sh` as `sys` into schema `LHVS` and installs `exapump` into `$HOME/.local/bin`. Add one step after it, `Export script shape`, that queries `EXA_ALL_SCRIPTS` with `exapump sql` and a DSN built from the install step's host, port, and `sys` password, with `validateservercertificate=0`. It fails unless `LHVS.LAKEHOUSE_EXPORT` is a `RUST` script with `SCRIPT_INPUT_TYPE = 'SET'` and `SCRIPT_RESULT_TYPE = 'RETURNS'`. Creating the script over a release `.so` that lacks the entry point succeeds (measured), so the job needs no branch-built `.so`. Update the job's leading comment.
 
 ## Parallelization
 
 | Group | Tasks | Depends on | Knowledge |
 |-------|-------|------------|-----------|
-| A: Export entry points | 1.1-1.14 | none | spec deltas `export/export-into-script` (all scenarios except the installer scenario), `packaging/single-so-two-entry-points`; `Cargo.toml`, `crates/lakehouse-engine/src/lib.rs`, `crates/lakehouse-engine/src/export/`, `crates/lakehouse-engine/src/adapter/sharding.rs`, `crates/lakehouse-engine/src/adapter/pushdown/support.rs`, `crates/lakehouse-e2e/tests/e2e_local/{main.rs,export.rs,two_entry_points.rs}`, `crates/lakehouse-e2e/tests/common/e2e_harness.rs`, `crates/lakehouse-e2e/tests/cloud_e2e_test.rs`, `specs/testing.md`, `deploy/README.md`, `docs/export.md`, `docs/index.md` |
-| B: Installer and security docs | 2.1-2.6 | none | spec delta `packaging/version-udf`, the installer scenario and § Background of `export/export-into-script`; `deploy/scripts/install.sh`, `deploy/scripts/tests/install.test.sh`, `.github/workflows/ci.yml` (`install-script-e2e` job), `docs/install.md`, `docs/security.md` |
+| A: Export entry points | 1.1-1.14 | none | spec deltas `export/export-into-script` (all scenarios except the installer scenario), `packaging/single-so-two-entry-points`; `Cargo.toml`, `crates/lakehouse-engine/src/lib.rs`, `crates/lakehouse-engine/src/export/`, `crates/lakehouse-e2e/tests/e2e_local/{main.rs,export.rs,two_entry_points.rs}`, `crates/lakehouse-e2e/tests/common/e2e_harness.rs`, `crates/lakehouse-e2e/tests/cloud_e2e_test.rs`, `specs/testing.md`, `deploy/README.md`, `docs/export.md`, `docs/index.md` |
+| B: Installer and security docs | 2.1-2.5 | none | spec delta `packaging/version-udf`, the installer scenario and § Background of `export/export-into-script`; `deploy/scripts/install.sh`, `deploy/scripts/tests/install.test.sh`, `docs/install.md`, `docs/security.md` |
 
 - Task 2.1 states the export DDL text once. Tasks 1.7 and 1.13 copy it from this plan, not from Group B's files, so the groups share no file.
 
@@ -125,7 +124,6 @@ The installer creates one script, `LAKEHOUSE_EXPORT`, that answers `EXPORT ... I
 |------|----------|--------|
 | Test | `crates/lakehouse-e2e/tests/e2e_local/two_entry_points.rs` `so_exports_three_entry_point_symbols` | Renamed to `so_exports_four_entry_point_symbols` with four symbols |
 | Test | `deploy/scripts/tests/install.test.sh` `test_four_scripts_ddl_saas_path_types` | Renamed to `test_five_scripts_ddl_saas_path_types` |
-| Constant | `crates/lakehouse-engine/src/adapter/pushdown/support.rs` `MAX_SHARD_COUNT` | Moved into `sharding::group_count` |
 
 ## Verification
 
@@ -141,7 +139,7 @@ The installer creates one script, `LAKEHOUSE_EXPORT`, that answers `EXPORT ... I
 | A join of a virtual schema table and an Exasol table exports the joined rows | Integration | `E/e2e_local/export.rs` | `export_vs_join_reports_joined_rows` |
 | An empty source exports zero rows | Integration | `E/e2e_local/export.rs` | `export_empty_source_reports_zero` |
 | WRITERS_PER_NODE sets the writer count | Integration | `E/e2e_local/export.rs`; `E/cloud_e2e_test.rs` | `export_writers_per_node_sets_writer_count`; `cloud_export_writer_counts` |
-| The writer count never exceeds 300 | Integration + Unit | `E/e2e_local/export.rs`; `crates/lakehouse-engine/src/adapter/sharding_tests.rs` | `export_writer_count_caps_at_300`; `group_count_caps_at_300` |
+| The writer count never exceeds 300 | Integration + Unit | `E/e2e_local/export.rs`; `crates/lakehouse-engine/src/export/sql_tests.rs` | `export_writer_count_caps_at_300`; `writer_count_caps_at_300` |
 | SINGLE_COMMIT runs one writer for the whole cluster | Integration | `E/e2e_local/export.rs`; `E/cloud_e2e_test.rs` | `export_single_commit_runs_one_writer`; `cloud_export_writer_counts` |
 | WRITERS_PER_NODE together with SINGLE_COMMIT is refused | Integration | `E/e2e_local/export.rs` | `export_refuses_writers_per_node_with_single_commit` |
 | An invalid option fails the export before any data is read | Integration | `E/e2e_local/export.rs` | `export_refuses_invalid_options_before_reading` |
@@ -151,7 +149,7 @@ The installer creates one script, `LAKEHOUSE_EXPORT`, that answers `EXPORT ... I
 | A user who holds the export privileges exports rows | Integration | `E/e2e_local/export.rs` | `export_role_user_exports_rows` |
 | A missing script-scoped CONNECTION grant fails with a named error | Integration | `E/e2e_local/export.rs` | `export_missing_script_grant_fails_named` |
 | No CONNECTION value appears in the generated SQL or an error | Unit + Integration | `crates/lakehouse-engine/src/export/export_tests.rs`; `E/e2e_local/export.rs` | `generated_sql_and_errors_carry_no_connection_value`; `export_errors_carry_no_connection_password` |
-| The installer creates the export script and prints the export grants | E2E (CI) + Unit (installer) | `.github/workflows/ci.yml` job `install-script-e2e`; `deploy/scripts/tests/install.test.sh` | step `Export script shape`; `test_five_scripts_ddl_saas_path_types`; `test_template_prints_export_role` |
+| The installer creates the export script and prints the export grants | Unit (installer) | `deploy/scripts/tests/install.test.sh` | `test_five_scripts_ddl_saas_path_types`; `test_template_prints_export_role` |
 | One crate exports every Rust entry point | Integration | `E/e2e_local/two_entry_points.rs` | `so_exports_four_entry_point_symbols` |
 | All scripts resolve from the same uploaded artifact | Integration | `E/e2e_local/version_udf.rs`; `E/e2e_local/export.rs` | `version_udf_returns_the_compiled_crate_version` and the existing scan tests; `export_whole_table_reports_every_row` |
 | The install script creates the version script with the other deployment scripts | Unit (installer) | `deploy/scripts/tests/install.test.sh` | `test_five_scripts_ddl_saas_path_types` |
@@ -159,8 +157,7 @@ The installer creates one script, `LAKEHOUSE_EXPORT`, that answers `EXPORT ... I
 
 - A unit test proves the SQL half of the credentials scenario, because Exasol SQL cannot observe the generated statement (`specs/testing.md` § Coverage rule). The architecture constraint that the export scripts emit no script output rests on code review.
 - The multi-node half of the SINGLE_COMMIT and WRITERS_PER_NODE scenarios runs only in the opt-in `cloud-e2e` suite, through task 1.13. The single-node E2E test proves one writer invocation for the whole statement.
-- The `install-script-e2e` CI job (task 2.6) proves on a live Exasol that `install.sh` creates `LAKEHOUSE_EXPORT` as a RUST SET RETURNS script. The template text runs against the `exapump` stub in `make test-install`.
-- The CI job installs the latest release `.so`, so it proves the installer, not the branch's entry point. `export_role_user_exports_rows` proves on the local stack that the template's role statements let a user export.
+- The installer unit tests in `make test-install` prove the export DDL and the template text against the `exapump` stub. `export_role_user_exports_rows` proves on the local stack that the template's role statements let a user export.
 
 ### Manual Testing
 
@@ -185,6 +182,5 @@ Run against the local container after `make e2e-up test-e2e`, which leaves schem
 | E2E | `make e2e-up test-e2e` | 0 failures, `e2e_local::export` included |
 | Cloud E2E | cloud suite command of `deploy/README.md:76`, filtered to `cloud_export_writer_counts` (task 1.13) | Passes on a multi-node cluster |
 | Installer | `make test-install` | 0 failures |
-| Installer E2E | CI job `install-script-e2e` on the PR (task 2.6) | Passes, including the `Export script shape` step |
 | Gate | `make fmt-check lint` | Exit 0, zero warnings |
 | Coverage | `cargo llvm-cov --workspace --lcov --output-path <scratchpad>/lcov.info` then `python3 .claude/skills/test-strategy-review/scripts/changed_line_coverage.py <scratchpad>/lcov.info` | Changed-line coverage at least 90% |

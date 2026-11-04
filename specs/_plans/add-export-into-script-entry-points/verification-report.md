@@ -32,7 +32,7 @@
 
 ## Scenario Coverage
 
-Every scenario of the plan's Scenario Coverage table has a passing test, except the multi-node half of the SINGLE_COMMIT and WRITERS_PER_NODE scenarios. `cloud_export_writer_counts` exists and passes its skip path only. The CI step `Export script shape` runs on the PR.
+Every scenario of the plan's Scenario Coverage table has a passing test, except the multi-node half of the SINGLE_COMMIT and WRITERS_PER_NODE scenarios. `cloud_export_writer_counts` exists and passes its skip path only.
 
 ## Notes
 

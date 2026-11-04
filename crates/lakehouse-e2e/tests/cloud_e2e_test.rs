@@ -1264,10 +1264,8 @@ fn cloud_export_writer_counts() {
 
     let nodes = conn.query_scalar_i64("SELECT NPROC() FROM DUAL");
     let per_node_two = (2 * nodes).min(CLOUD_EXPORT_MAX_WRITERS);
-    let two_per_node_rows = format!(
-        "(SELECT * FROM {CLOUD_EXPORT_SOURCE} WHERE ID <= {})",
-        2 * nodes
-    );
+    let one_row_per_writer =
+        format!("(SELECT * FROM {CLOUD_EXPORT_SOURCE} WHERE ID <= {per_node_two})");
 
     assert_eq!(
         cloud_profiled_export(&env, CLOUD_EXPORT_SOURCE, "SINGLE_COMMIT = 'true'"),
@@ -1286,10 +1284,9 @@ fn cloud_export_writer_counts() {
     );
     // Exactly one row per writer: a gap in the cross-node ROWNUM numbering would leave a writer empty.
     assert_eq!(
-        cloud_profiled_export(&env, &two_per_node_rows, "WRITERS_PER_NODE = '2'"),
-        (2 * nodes, per_node_two),
-        "WRITERS_PER_NODE = '2' over {} rows on {nodes} nodes",
-        2 * nodes
+        cloud_profiled_export(&env, &one_row_per_writer, "WRITERS_PER_NODE = '2'"),
+        (per_node_two, per_node_two),
+        "WRITERS_PER_NODE = '2' over {per_node_two} rows on {nodes} nodes"
     );
     println!("cloud_export_writer_counts: verified on {nodes} nodes");
 

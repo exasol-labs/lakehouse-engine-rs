@@ -11,10 +11,10 @@
 ### [1] LAKEHOUSE_EXPORT is one Rust entry point that answers the export call and runs as the writer
 
 - **Decision:** `LAKEHOUSE_EXPORT` is the fourth Rust entry point in the `.so` and the only export script, a `RUST SET SCRIPT` that returns `DECIMAL(18,0)`. Its export hook answers Exasol's `generate_sql_for_export_spec` call, and its `run` function is the writer: the SELECT the hook returns calls `LAKEHOUSE_EXPORT` itself over the source rows.
-- **Rationale:** Exasol sends the export call to the hook and a SELECT call to `run`, so one script serves both roles. A spike `.so` built in the Makefile's `UDF_BUILDER_IMAGE` against the pinned SDK version with the `export` feature, and loaded on the SLC of the same version, showed this on the local Exasol: one SET RETURNS script answered `EXPORT ... INTO SCRIPT`, and the SELECT its hook returned called the same script as the writer. One script needs one `EXECUTE` and one script-scoped `ACCESS` grant. Option validation and SQL rendering are pure logic that Rust unit tests cover, and the writer count reuses the scan's 300-group cap from `sharding` instead of restating it. The `export` module keeps the options grammar, the writer spec format, and the guard SQL behind two functions that `lib.rs` calls, and it depends only on `sharding`.
+- **Rationale:** Exasol sends the export call to the hook and a SELECT call to `run`, so one script serves both roles. A spike `.so` built in the Makefile's `UDF_BUILDER_IMAGE` against the pinned SDK version with the `export` feature, and loaded on the SLC of the same version, showed this on the local Exasol: one SET RETURNS script answered `EXPORT ... INTO SCRIPT`, and the SELECT its hook returned called the same script as the writer. One script needs one `EXECUTE` and one script-scoped `ACCESS` grant. Option validation and SQL rendering are pure logic that Rust unit tests cover, and the writer count is computed in the `export` module, so the scan's shard-count code stays untouched. The `export` module keeps the options grammar, the writer spec format, and the guard SQL behind two functions that `lib.rs` calls, and it depends on no other engine module.
 - **Alternatives:**
   - A separate writer script, `LAKEHOUSE_EXPORT_WRITER`. Rejected: it adds a DDL statement, an `EXECUTE` grant, and an `ACCESS` grant, and adds no capability, because one SET script serves both roles.
-  - A Lua export script, like `LAKEHOUSE_DISTRIBUTE_FILES`. Rejected: its validation would have no unit layer, and it would restate the 300-group cap.
+  - A Lua export script, like `LAKEHOUSE_DISTRIBUTE_FILES`. Rejected: its validation would have no unit layer.
 - **Promotes to ADR:** no
 
 ### [2] The column type check is a per-row guard in the generated SELECT, keyed on `MOD(ROWNUM, G)`
@@ -64,8 +64,8 @@
 - **Direction change:** The requester accepted either error as a scoped exception to #565 and rewords #565. § Background and the unsupported-type scenario of `export/export-into-script`, the empty-source part of `docs/export.md` (task 1.14), and the § Context deviation bullet state it. No scenario covers an empty source with an unsupported column type.
 - **Promotes to ADR:** no
 
-### [plan-review] The `install-script-e2e` job checks the installed export script
+### [plan-review] The installer unit tests cover the installed export script
 
 - **Finding:** Round 3 `[SCOPE_REDUCTION]` (HUMAN). #565 requires E2E coverage of "The installer creates both scripts and grants them access to the catalog CONNECTION." The plan proved the installer only with the `exapump` stub and one manual run.
-- **Direction change:** The installer no longer runs grants (entry above), so task 2.6 checks only what it installs. One step of the `install-script-e2e` job reads `EXA_ALL_SCRIPTS` on a live Exasol and fails unless `LHVS.LAKEHOUSE_EXPORT` is a RUST SET script that returns a value.
+- **Direction change:** The installer no longer runs grants (entry above), so the installer scenario rests on the installer unit tests, which check the export DDL and the printed role template. A live-Exasol CI step was dropped after the independent review: creating the script over a release `.so` succeeds, so such a step proved only the DDL shape that the unit tests already check.
 - **Promotes to ADR:** no
