@@ -958,9 +958,7 @@ async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
     use crate::scan::ResolvedScanStorage;
     use crate::scan::object_store::build_session_context;
     use crate::scan::spec::{CommonScanSpec, ProjectionItem, ScanStorage};
-    use crate::scan::test_support::{
-        SinkCtx, TEST_CONNECTION, refusing_backend, refusing_endpoint,
-    };
+    use crate::scan::test_support::{SinkCtx, TEST_CONNECTION, refusing_endpoint, s3_backend};
 
     const MARKER: &str = "raw-scan-refusal";
     const SENTINEL: &str = "RAWSCANSECRETVALUE";
@@ -982,7 +980,7 @@ async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
         "s3://test-bucket/data/part-0.parquet",
         4096,
     )]);
-    let storage = ResolvedScanStorage::from_backends(refusing_backend(&endpoint, SENTINEL), None);
+    let storage = ResolvedScanStorage::from_backends(s3_backend(&endpoint, SENTINEL), None);
 
     let session = build_session_context(&spec, &storage, 0).expect("the session must build");
     let mut ctx = SinkCtx;

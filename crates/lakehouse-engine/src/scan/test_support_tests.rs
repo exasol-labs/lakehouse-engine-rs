@@ -249,7 +249,8 @@ pub(super) fn refusing_endpoint(message: &str) -> String {
     url
 }
 
-pub(super) fn refusing_backend(endpoint: &str, secret: &str) -> StorageBackend {
+/// Path-style (the `StorageProps` default) is required: the S3 arm applies `endpoint` only then.
+pub(super) fn s3_backend(endpoint: &str, secret: &str) -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: endpoint.into(),
         region: "us-east-1".into(),
