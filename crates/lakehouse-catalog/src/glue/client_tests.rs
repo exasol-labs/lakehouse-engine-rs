@@ -5,13 +5,13 @@ use std::time::Duration;
 use aws_sdk_glue::config::timeout::TimeoutConfig;
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 use serde_json::{Value, json};
-use tokio::net::{TcpListener, TcpSocket};
+use tokio::net::TcpListener;
 
 use super::*;
 use crate::StorageProps;
 use crate::glue::routing::PARQUET_INPUT_FORMAT;
 use crate::test_support::{
-    ORC_INPUT_FORMAT, header_value, request_body, spawn_server, user_message,
+    ORC_INPUT_FORMAT, header_value, request_body, spawn_listener, spawn_server, user_message,
 };
 
 const ACCESS_KEY: &str = "AKIDGLUECONNECTION01";
@@ -693,11 +693,10 @@ async fn a_failed_glue_call_names_the_operation_the_subject_and_the_cause() {
     }
 
     let unanswered = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    // Bound but never listening: Linux refuses the connect, and no parallel test's fake server
-    // can take the port, as it could after a dropped listener.
-    let refused = TcpSocket::new_v4().expect("socket");
-    refused.bind("127.0.0.1:0".parse().unwrap()).expect("bind");
-    let refused_address = format!("http://{}", refused.local_addr().expect("local_addr"));
+    // Closes each connection unanswered. A bound socket that never listens is refused on Linux
+    // but left to time out on macOS, and a dropped listener's port can go to a parallel test.
+    let (closing, _) = spawn_listener(|stream, _| async move { drop(stream) }).await;
+    let refused_address = format!("http://{closing}");
     for (address, cause) in [
         (
             format!("http://{}", unanswered.local_addr().expect("local_addr")),

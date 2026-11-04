@@ -411,11 +411,11 @@ render_userdata() {
     -e "s|\${postgres_image}|$TPL_POSTGRES_IMAGE|g" \
     -e "s|\${keycloak_image}|$TPL_KEYCLOAK_IMAGE|g" \
     -e "s|\${lakekeeper_image}|$TPL_LAKEKEEPER_IMAGE|g" \
-    "$USERDATA_TPL" | sed -e 's/\$\${/${/g' > "$out"
-  sed -i \
+    "$USERDATA_TPL" | sed \
+    -e 's/\$\${/${/g' \
     -e "s|/var/log/lakekeeper-userdata.log|$SANDBOX/userdata.log|g" \
     -e "s|WORKDIR=/opt/lakekeeper|WORKDIR=$SANDBOX/lakekeeper-workdir|g" \
-    "$out"
+    > "$out"
   chmod +x "$out"
 }
 
