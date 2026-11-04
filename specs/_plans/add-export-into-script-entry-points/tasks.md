@@ -1,5 +1,13 @@
 # Tasks: add-export-into-script-entry-points
 
+## PR Lifecycle
+- [x] resolved
+- [x] implemented
+- [x] version-bumped
+- [x] tested-green
+- [ ] recorded
+- [ ] pr-ready
+
 Task text lives in plan.md § Implementation Tasks. Numbers match.
 
 ## Phase 2: Implementation (Group A)
