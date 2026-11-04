@@ -8,6 +8,9 @@ use crate::common::seed::{
     COMPLEX_ROW_POPULATED, E2E_COMPLEX_TABLE, E2E_NAMESPACE, E2E_TYPED_TABLE, TYPED_COL_BOOL,
     TYPED_COL_DATE, TYPED_COL_DECIMAL_A, TYPED_COL_DOUBLE, TYPED_COL_TS, TYPED_COL_VARCHAR,
 };
+use crate::common::timestamp_precision::{
+    engine_honors_declared_precision, expected_timestamp_precision,
+};
 use crate::fixtures::{
     complex_probe, emits_clause, explain_virtual_pushdown_sql, stack, typed_probe,
 };
@@ -33,6 +36,15 @@ fn typed_table() -> String {
 
 fn complex_table() -> String {
     format!("{VS_NAME}.{}", E2E_COMPLEX_TABLE.to_uppercase())
+}
+
+fn emits_items(pushed: &str) -> Vec<String> {
+    split_top_level(&emits_clause(pushed))
+}
+
+/// The declared type of one `"ALIAS" TYPE` EMITS item.
+fn emits_item_type(item: &str) -> &str {
+    item.rsplit_once('"').map_or(item, |(_, ty)| ty).trim()
 }
 
 fn split_top_level(s: &str) -> Vec<String> {
@@ -68,7 +80,7 @@ fn assert_emits_clause_declares(pushed: &str, expected_types: &[&str]) {
         !pushed.contains("emit_exa_types"),
         "the generated scan spec must carry no 'emit_exa_types' key, got:\n{pushed}"
     );
-    let items = split_top_level(&emits_clause(pushed));
+    let items = emits_items(pushed);
     assert_eq!(
         items.len(),
         expected_types.len(),
@@ -112,10 +124,21 @@ fn scan_returns_correct_values_across_type_mix_with_no_spec_carried_emit_types()
             "DOUBLE PRECISION",
             "VARCHAR(2000000)",
             "DATE",
-            "TIMESTAMP", // bare or TIMESTAMP(6)
+            "TIMESTAMP",
             "BOOLEAN",
             "DECIMAL(5,0)", // the only reachable Int32-bin probe
         ],
+    );
+    // An engine that drops the declared precision echoes the column as a bare TIMESTAMP.
+    let emitted_timestamp = if engine_honors_declared_precision(&mut conn) {
+        expected_timestamp_precision(&mut conn).declared_column_type
+    } else {
+        "TIMESTAMP"
+    };
+    assert_eq!(
+        emits_item_type(&emits_items(&pushed)[5]),
+        emitted_timestamp,
+        "the timestamp EMITS item must declare exactly {emitted_timestamp}, got:\n{pushed}"
     );
 
     let cols = conn.query_columns(&typed_sql);
