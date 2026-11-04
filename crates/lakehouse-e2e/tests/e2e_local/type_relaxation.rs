@@ -190,11 +190,10 @@ fn iceberg_type_promotion_returns_both_layouts_at_the_promoted_types() {
         );
 
         let float_double = parse_numeric(&cols[2][row_index]);
-        assert!(
-            (float_double - expected.float_double).abs() < 1e-9,
+        assert_eq!(
+            float_double, expected.float_double,
             "row {row_index} (id {}): expected {FLOAT_DOUBLE_COLUMN} = {}, got {float_double}",
-            expected.id,
-            expected.float_double
+            expected.id, expected.float_double
         );
 
         let decimal_decimal = value_to_string(&cols[3][row_index]);

@@ -1172,7 +1172,7 @@ fn events_directory_declares_and_returns_mixed_types_across_both_files() {
         assert_eq!(id, (row as i64) + 1);
         assert_eq!(value_to_string(&cols[1][row]), EVENT_NAMES[row]);
         assert_eq!(cols[2][row].as_bool(), Some(EVENT_ACTIVE[row]));
-        assert!((parse_numeric(&cols[3][row]) - EVENT_SCORES[row]).abs() < 1e-9);
+        assert_eq!(parse_numeric(&cols[3][row]), EVENT_SCORES[row]);
     }
 
     let non_null_count = conn.query_columns(&format!(
@@ -1556,7 +1556,7 @@ fn widened_columns_declare_the_wider_type_and_every_row_reads_back() {
     let expected_price = [1.5f64, 2.5, 3.5, 4.5];
     for row in 0..4 {
         assert_eq!(parse_int(&cols[1][row]), expected_qty[row]);
-        assert!((parse_numeric(&cols[2][row]) - expected_price[row]).abs() < 1e-6);
+        assert_eq!(parse_numeric(&cols[2][row]), expected_price[row]);
     }
 }
 

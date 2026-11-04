@@ -2082,8 +2082,8 @@ fn e2e_scalar_over_aggregate_ungrouped_join_matches_native_oracle() {
         "SELECT ROUND(SUM(L_QUANTITY), 2) FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE}"
     ));
     let (got, want) = (parse_numeric(&actual[0][0]), parse_numeric(&expected[0][0]));
-    assert!(
-        (got - want).abs() <= 1e-9 * want.abs().max(1.0),
+    assert_eq!(
+        got, want,
         "ROUND(SUM(L_QUANTITY), 2) over the join must equal the native oracle \
          {want}, got {got}"
     );

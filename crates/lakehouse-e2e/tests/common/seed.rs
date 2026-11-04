@@ -1652,7 +1652,7 @@ impl ExpectedValue {
             ExpectedValue::Num(n) => actual
                 .as_f64()
                 .or_else(|| actual.as_str().and_then(|s| s.parse::<f64>().ok()))
-                .map(|g| (g - n).abs() < 1e-6)
+                .map(|g| g == *n)
                 .unwrap_or(false),
             ExpectedValue::Text(t) => actual.as_str() == Some(*t),
             ExpectedValue::DatePrefix(p) => {

@@ -288,8 +288,8 @@ fn e2e_selectlist_expression_pushdown() {
     let expected_scores = [10.0f64, 20.0, 30.0];
     for (i, expected) in expected_scores.iter().enumerate() {
         let s = parse_numeric(&cols[1][i]);
-        assert!(
-            (s - expected).abs() < 0.001,
+        assert_eq!(
+            s, *expected,
             "row {i}: score*2.0 must be {expected}, got {s}"
         );
     }
@@ -530,8 +530,9 @@ fn assert_typed_probe_prefix(cols: &[Vec<serde_json::Value>], i: usize) {
         .unwrap_or_else(|| panic!("no TYPED_DECIMAL_A_UNSCALED entry for id={}", row.id))
         .1;
     match decimal_a {
-        Some(unscaled) => assert!(
-            (parse_numeric(&cols[1][i]) - unscaled as f64 / 100.0).abs() < 0.001,
+        Some(unscaled) => assert_eq!(
+            parse_numeric(&cols[1][i]),
+            unscaled as f64 / 100.0,
             "row {i}: c_decimal_a mismatch, got {:?}",
             cols[1][i]
         ),
@@ -542,8 +543,9 @@ fn assert_typed_probe_prefix(cols: &[Vec<serde_json::Value>], i: usize) {
         ),
     }
     match row.decimal_b {
-        Some(unscaled) => assert!(
-            (parse_numeric(&cols[2][i]) - unscaled as f64 / 10_000.0).abs() < 0.001,
+        Some(unscaled) => assert_eq!(
+            parse_numeric(&cols[2][i]),
+            unscaled as f64 / 10_000.0,
             "row {i}: c_decimal_b mismatch, got {:?}",
             cols[2][i]
         ),
@@ -554,8 +556,9 @@ fn assert_typed_probe_prefix(cols: &[Vec<serde_json::Value>], i: usize) {
         ),
     }
     match row.double {
-        Some(d) => assert!(
-            (parse_numeric(&cols[3][i]) - d).abs() < 0.001,
+        Some(d) => assert_eq!(
+            parse_numeric(&cols[3][i]),
+            d,
             "row {i}: c_double mismatch, got {:?}",
             cols[3][i]
         ),
@@ -603,8 +606,9 @@ fn assert_typed_probe_prefix(cols: &[Vec<serde_json::Value>], i: usize) {
         ),
     }
     match row.price {
-        Some(p) => assert!(
-            (parse_numeric(&cols[8][i]) - p).abs() < 0.001,
+        Some(p) => assert_eq!(
+            parse_numeric(&cols[8][i]),
+            p,
             "row {i}: c_price mismatch, got {:?}",
             cols[8][i]
         ),
@@ -752,10 +756,7 @@ fn e2e_selectlist_literal_projection_pushdown() {
         assert_eq!(cols[0].len(), 20, "expected 20 rows: {cols:?}");
         for (i, v) in cols[0].iter().enumerate() {
             let n = parse_numeric(v);
-            assert!(
-                (n - 1.0).abs() < f64::EPSILON,
-                "row {i}: literal column must be 1, got {n}"
-            );
+            assert_eq!(n, 1.0, "row {i}: literal column must be 1, got {n}");
         }
     }
 
@@ -771,10 +772,7 @@ fn e2e_selectlist_literal_projection_pushdown() {
         assert_eq!(cols[1].len(), 20, "expected 20 rows: {cols:?}");
         for (i, v) in cols[0].iter().enumerate() {
             let n = parse_numeric(v);
-            assert!(
-                (n - 1.0).abs() < f64::EPSILON,
-                "row {i}: literal column must be 1, got {n}"
-            );
+            assert_eq!(n, 1.0, "row {i}: literal column must be 1, got {n}");
         }
         for (i, v) in cols[1].iter().enumerate() {
             let name = v
@@ -801,12 +799,12 @@ fn e2e_selectlist_literal_projection_pushdown() {
         for (i, (a, b)) in cols[0].iter().zip(cols[2].iter()).enumerate() {
             let a = parse_numeric(a);
             let b = parse_numeric(b);
-            assert!(
-                (a - 1.0).abs() < f64::EPSILON,
+            assert_eq!(
+                a, 1.0,
                 "row {i}: column 0 (first duplicated literal) must be 1, got {a}"
             );
-            assert!(
-                (b - 1.0).abs() < f64::EPSILON,
+            assert_eq!(
+                b, 1.0,
                 "row {i}: column 2 (second duplicated literal) must be 1, got {b}"
             );
         }
@@ -1259,8 +1257,8 @@ fn e2e_cast_in_filter() {
     );
 
     let score = parse_numeric(&cols[1][0]);
-    assert!(
-        (score - 75.0).abs() < 0.001,
+    assert_eq!(
+        score, 75.0,
         "id=15 must have score=75.0 (5.0*15), got {score}"
     );
 }
@@ -1397,8 +1395,8 @@ fn e2e_time_between_matches_exasol() {
     let seconds_sql = format!("SELECT SECONDS_BETWEEN(event_ts, {anchor}) FROM {t} WHERE id = 6");
     assert_select_pushed_down(&mut conn, &seconds_sql, "date_part(''epoch''");
     let seconds = parse_numeric(&conn.query_columns(&seconds_sql)[0][0]);
-    assert!(
-        (seconds - 9000.0).abs() < 1e-9,
+    assert_eq!(
+        seconds, 9000.0,
         "SECONDS_BETWEEN over a 2.5h gap must be 9000, got {seconds}"
     );
 }
@@ -1483,10 +1481,7 @@ fn e2e_order_by_unprojected_column_bare_projection() {
     assert_eq!(cols.len(), 1, "expected exactly 1 column (score): {cols:?}");
     assert_eq!(cols[0].len(), 1, "expected exactly 1 row (id=1): {cols:?}");
     let score = parse_numeric(&cols[0][0]);
-    assert!(
-        (score - 5.0).abs() < 0.001,
-        "id=1 must have score=5.0 (5.0*1), got {score}"
-    );
+    assert_eq!(score, 5.0, "id=1 must have score=5.0 (5.0*1), got {score}");
 
     let sql_desc = format!(
         "SELECT name FROM {} WHERE id <= 5 ORDER BY id DESC",
@@ -2383,8 +2378,8 @@ fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
     );
     let sums: Vec<f64> = cols2[1].iter().map(parse_numeric).collect();
     for (got, want) in sums.iter().zip([25.0, 7.0, 4.0]) {
-        assert!(
-            (got - want).abs() < 1e-9,
+        assert_eq!(
+            *got, want,
             "SUM(c_price) per group must be 25 / 7 / 4, got {sums:?}"
         );
     }

@@ -153,13 +153,15 @@ fn scan_returns_correct_values_across_type_mix_with_no_spec_carried_emit_types()
         "id must be 1, got {:?}",
         cols[0][0]
     );
-    assert!(
-        (parse_numeric(&cols[1][0]) - 10.50).abs() < 0.001,
+    assert_eq!(
+        parse_numeric(&cols[1][0]),
+        10.50,
         "c_decimal_a must be 10.50, got {:?}",
         cols[1][0]
     );
-    assert!(
-        (parse_numeric(&cols[2][0]) - 0.5).abs() < 0.001,
+    assert_eq!(
+        parse_numeric(&cols[2][0]),
+        0.5,
         "c_double must be 0.5, got {:?}",
         cols[2][0]
     );

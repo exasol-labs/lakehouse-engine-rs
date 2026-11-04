@@ -1505,8 +1505,9 @@ fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
     );
 
     let pre_widening_float = parse_numeric(&rows[2][PRE]);
-    assert!(
-        (pre_widening_float - f64::from(3.4f32)).abs() < 1e-9,
+    assert_eq!(
+        pre_widening_float,
+        f64::from(3.4f32),
         "pre-widening FLOAT_DOUBLE must be the stored 32-bit float's exact double \
          expansion, not the decimal literal 3.4: {pre_widening_float}"
     );
@@ -1517,13 +1518,13 @@ fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
         (5, "INT_DOUBLE", 7.0),
     ] {
         let pre = parse_numeric(&rows[index][PRE]);
-        assert!(
-            (pre - expected_pre).abs() < 1e-9,
+        assert_eq!(
+            pre, expected_pre,
             "pre-widening {column} must be its real logged value, not NULL: {pre}"
         );
         let post = parse_numeric(&rows[index][POST]);
-        assert!(
-            (post - 1.234_567_890_123_f64).abs() < 1e-9,
+        assert_eq!(
+            post, 1.234_567_890_123_f64,
             "post-widening {column} must hold a fractional value no integral \
              width could represent: {post}"
         );

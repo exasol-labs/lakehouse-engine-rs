@@ -630,9 +630,9 @@ fn e2e_delete_free_table_no_regression() {
     // Seed: score = 5.0 * id.
     let n = SEED_TOTAL_ROWS as f64;
     let expected_total_score = 5.0 * (n * (n + 1.0) / 2.0);
-    assert!(
-        (total_score - expected_total_score).abs() < 1e-6,
-        "delete-free aggregate regression: expected SUM(score)≈{expected_total_score}, \
+    assert_eq!(
+        total_score, expected_total_score,
+        "delete-free aggregate regression: expected SUM(score) = {expected_total_score}, \
          got {total_score}"
     );
 }
