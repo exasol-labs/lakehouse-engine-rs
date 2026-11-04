@@ -4,10 +4,9 @@ Routes every pushdown request through the table-format reader seam. The reader t
 
 ## Background
 
-* A `FormatReader` returns a `ResolvedScan`. `format_reader` selects the reader by matching a `ScanSource` exhaustively, and both concrete readers are private to that module.
-* A request resolves its catalog session once and reuses it for every table it touches, so a two-leg join performs no more catalog authentication round-trips than a single-table scan.
-* Pushdown SQL shape (projection, filter, LIMIT, ORDER BY, aggregate decomposition, join eligibility) is decided from the request's SQL alone. Only file resolution differs per format.
-* The generated SQL and the serialized per-shard scan specs are byte-identical to the output before the format-reader seam, except for the `storage` value, which is the tagged wrapper of `storage-access/scan-spec-credential-reference`.
+* A table's file list comes from its format's own metadata: Iceberg metadata and manifests, the Delta log, a Glue partition list, or a Parquet directory listing. Pushdown SQL shape (projection, filter, LIMIT, ORDER BY, aggregate decomposition, join eligibility) is decided from the request's SQL alone, and only file resolution differs per format.
+* Exasol sends one pushdown request per pushed-down query block, so a UNION ALL branch, each reference to a CTE, and a subquery arrive as separate requests. One adapter VM serves every request of one statement on one virtual schema.
+* The `storage` value of the generated SQL and of each serialized per-shard scan spec is the tagged wrapper of `storage-access/scan-spec-credential-reference`.
 
 ## Scenarios
 
@@ -35,15 +34,6 @@ Routes every pushdown request through the table-format reader seam. The reader t
 * *AND* the SQL the adapter generates for each request SHALL be decided from the request alone, so the
   same request over an Iceberg table and over a Delta table with the same columns yields the same
   pushdown decisions
-
-### Scenario: One catalog session per request serves every table the request resolves
-
-* *GIVEN* a broadcast-join pushdown request whose two legs name two different tables in one virtual schema, under any catalog kind
-* *WHEN* the adapter resolves both legs
-* *THEN* the adapter SHALL build the request's catalog session EXACTLY ONCE and SHALL resolve both legs through it, so the request performs no more catalog authentication round-trips than a single-table request over the same virtual schema
-* *AND* the adapter MUST NOT build a second session per leg, per shape, or per format reader
-* *AND* the number of catalog round-trips an Iceberg request performs SHALL be unchanged from before this feature, except for the one batch-check request that `vs-adapter/pushdown-catalog-session` admits while `PERMISSION_CHECK = 'LAKEKEEPER'` is set
-* *AND* under a catalog kind whose session is an OBJECT STORE rather than a catalog client, the adapter SHALL build that store EXACTLY ONCE per request and SHALL share it across every leg, so a two-table join opens one store and its admission limiter bounds the whole request rather than each leg
 
 ### Scenario: A Unity Catalog table's identity survives the round trip from the involved table
 
@@ -118,14 +108,3 @@ Routes every pushdown request through the table-format reader seam. The reader t
 * *WHEN* Exasol requests the adapter's capabilities for each
 * *THEN* the adapter SHALL return the SAME capability set for all three, and MUST NOT read, branch on, or receive the catalog kind while assembling it
 * *AND* a capability the adapter advertises SHALL therefore be one it satisfies under EVERY kind, because Exasol re-applies nothing it delegated and a kind-conditional capability would return wrong rows rather than a deferred check
-
-### Scenario: A request's table resolutions run concurrently rather than one after another
-
-* *GIVEN* a broadcast-join pushdown request whose legs each resolve one table through the format-reader seam, resolved today by a loop that awaits each leg before starting the next
-* *WHEN* the adapter resolves the request's legs
-* *THEN* the adapter SHALL drive every leg's resolution CONCURRENTLY over the request's ONE shared session, so a two-leg join's plan-time latency approaches its slowest leg rather than the sum of its legs
-* *AND* the resolved sides SHALL be returned in LEG-INDEX order, unchanged, because a self-join's two occurrences share a table name and every later step indexes a side by its leg rather than by its name
-* *AND* the concurrency SHALL apply to EVERY catalog kind and EVERY table format, because the loop is shared code, so the Iceberg and Delta join paths gain the same reduction
-* *AND* the generated SQL and the serialized per-shard scan specs for every join request MUST be BYTE-IDENTICAL to their pre-change output, so the committed join golden strings pass unedited
-* *AND* the error a failing leg produces SHALL be the same error that leg produces today, and a request with more than one failing leg SHALL surface one of those errors rather than a combined or masked one
-* *AND* the per-request in-flight object-store bound SHALL be unchanged by the concurrency, because the request's ONE admission-limited store already bounds every read its legs issue

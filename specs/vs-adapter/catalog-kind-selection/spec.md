@@ -13,9 +13,9 @@ The adapter reads the `CATALOG_KIND` virtual-schema property to choose the catal
 
 * *GIVEN* a createVirtualSchema or pushdown request whose plain VS properties do not include `CATALOG_KIND`
 * *WHEN* the adapter resolves the catalog kind
-* *THEN* the adapter SHALL resolve `CatalogKind::IcebergRest` and construct the Iceberg REST catalog client, and MUST NOT read `CATALOG_KIND` from the CONNECTION password JSON
-* *AND* enumerating a namespace SHALL build exactly ONE `CatalogSession` for the listing and every load, so an empty namespace costs ONE OAuth2 grant under the client-credentials mode and ZERO under the no-auth and static-token modes (see `catalog/pushdown-catalog-session`). A virtual schema over an empty namespace whose credentials would fail a grant therefore succeeds ONLY in the no-auth and static-token modes
-* *AND* the Iceberg REST scan and pushdown path SHALL resolve files through the request's catalog session and the Iceberg-native table metadata, and SHALL NOT go through the `CatalogClient` trait
+* *THEN* the adapter SHALL select the Iceberg REST catalog kind and MUST NOT read `CATALOG_KIND` from the CONNECTION password JSON
+* *AND* enumerating a namespace SHALL cost ONE OAuth2 grant under the client-credentials mode and ZERO under the no-auth and static-token modes, even for an empty namespace (see `catalog/pushdown-catalog-session`). A virtual schema over an empty namespace whose credentials would fail a grant therefore succeeds ONLY in the no-auth and static-token modes
+* *AND* an Iceberg REST pushdown SHALL plan files from the Iceberg table metadata that the table's `loadTable` GET returns
 
 ### Scenario: CATALOG_KIND naming Unity Catalog resolves the native Unity Catalog kind
 
@@ -54,9 +54,9 @@ The adapter reads the `CATALOG_KIND` virtual-schema property to choose the catal
 
 * *GIVEN* a pushdown request whose virtual schema was created with `CATALOG_KIND` set to `UNITY_CATALOG`, over a seeded Delta table
 * *WHEN* the adapter handles the pushdown request
-* *THEN* the adapter SHALL resolve the request through the Unity Catalog scan source and the Delta format reader, and SHALL return a scan-driving SQL response, SUPERSEDING the recorded refusal that Unity Catalog scan execution is not yet supported
-* *AND* the adapter MUST NOT resolve the request through the Iceberg REST file-resolution path, because a Unity Catalog table is a Delta table the Iceberg path cannot read
-* *AND* a pushdown request whose Delta table cannot be planned SHALL fail with the reader's own plan-time error rather than a kind-level refusal, so an unreadable table and an unsupported catalog kind are distinguishable
+* *THEN* the adapter SHALL plan the table that Unity Catalog returns as a Delta scan, and SHALL return a scan-driving SQL response, SUPERSEDING the recorded refusal that Unity Catalog scan execution is not yet supported
+* *AND* the adapter MUST NOT send an Iceberg REST request for the table, because a Unity Catalog Delta table has no Iceberg metadata to plan from
+* *AND* a pushdown request whose Delta table cannot be planned SHALL fail with the plan-time error that names why the table cannot be planned, rather than a refusal of the catalog kind, so an unreadable table and an unsupported catalog kind are distinguishable
 * *AND* no error message on any of these paths SHALL contain a credential value
 
 ### Scenario: CATALOG_KIND naming direct storage resolves the direct-storage kind

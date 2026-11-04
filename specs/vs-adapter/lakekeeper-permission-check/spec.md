@@ -1,6 +1,6 @@
 # Feature: Lakekeeper Permission Check
 
-The adapter refuses a query over a table that the querying Exasol user holds no Lakekeeper grant to read. When a virtual schema sets `PERMISSION_CHECK = 'LAKEKEEPER'`, the adapter maps the querying user to a Lakekeeper principal with the `USER_MAPPING` template and asks Lakekeeper once per query whether that principal can read each table. Without that property the adapter contacts no management API.
+The adapter refuses a query over a table that the querying Exasol user holds no Lakekeeper grant to read. When a virtual schema sets `PERMISSION_CHECK = 'LAKEKEEPER'`, the adapter maps the querying user to a Lakekeeper principal with the `USER_MAPPING` template and asks Lakekeeper whether that principal can read each table before the statement first reads it. Each pushdown request sends at most one batch-check, for the tables that no earlier pushdown of the statement checked. Without that property the adapter contacts no management API.
 
 ## Background
 
@@ -70,14 +70,6 @@ The adapter refuses a query over a table that the querying Exasol user holds no 
 * *THEN* every check of both requests SHALL name the one principal `oidc~svc-reporting@corp.net`, because the adapter checks neither the uniqueness nor the ownership of a principal
 * *AND* under `oidc~{{ user }}@corp.net`, the delimited user `{{7*7}}` SHALL get the principal `oidc~{{7*7}}@corp.net`, and the delimited user `A"B\C` SHALL get the principal `oidc~A"B\C@corp.net` exactly, so no user name changes the template, the request, or another user's principal
 
-### Scenario: One batch-check per query decides every table before any table is read
-
-* *GIVEN* a virtual schema with the check on over a Lakekeeper catalog, and a pushdown request of any shape: row scan, single-group aggregate, grouped aggregate, COUNT(DISTINCT), top-N, a qualified fallback wrapper, or an inner join, a self-join included
-* *WHEN* Lakekeeper allows every table that the request reads
-* *THEN* the adapter SHALL send exactly one batch-check to the management API for the whole request, with one `read_data` check per distinct table, before it reads any table's metadata
-* *AND* the pushdown SQL SHALL be byte-identical to the SQL that the same request yields with the check off
-* *AND* the adapter SHALL NOT read any table that the batch-check did not cover, so a query shape added later cannot read an unchecked table
-
 ### Scenario: A denied table refuses the whole query
 
 * *GIVEN* a virtual schema with the check on and a pushdown request over one or more tables
@@ -107,3 +99,12 @@ The adapter refuses a query over a table that the querying Exasol user holds no 
 * *WHEN* the user reads the virtual schema's table and column listing and queries that table, once after the virtual schema is created and once after it is refreshed
 * *THEN* the listing SHALL show the user that table and its columns
 * *AND* the user's query SHALL receive the denial of "A denied table refuses the whole query"
+
+### Scenario: One batch-check per pushdown decides every table that no earlier pushdown of the statement checked
+
+* *GIVEN* a virtual schema with the check on over a Lakekeeper catalog, and a statement whose pushdown requests have any shape: row scan, single-group aggregate, grouped aggregate, COUNT(DISTINCT), top-N, a qualified fallback wrapper, or an inner join, a self-join included
+* *WHEN* Lakekeeper allows every table that the statement reads
+* *THEN* each pushdown request SHALL send at most one batch-check to the management API, with one `read_data` check per distinct table of the request that no earlier pushdown of the statement on the virtual schema checked, before it reads the metadata of any of those tables
+* *AND* a pushdown request whose tables earlier pushdowns of the statement all checked SHALL send no batch-check
+* *AND* the pushdown SQL SHALL be byte-identical to the SQL that the same request yields with the check off
+* *AND* the adapter SHALL NOT read any table that no batch-check of the statement covered, so a later pushdown of the statement that reads a further table checks it first
