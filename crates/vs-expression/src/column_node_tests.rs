@@ -9,7 +9,7 @@ fn a_column_node_without_a_name_does_not_parse() {
 
 #[test]
 fn walk_column_nodes_visits_every_nested_column_node_once() {
-    let expr = serde_json::json!({
+    let expr = json!({
         "type": "function_scalar",
         "name": "PLUS",
         "arguments": [
@@ -45,9 +45,9 @@ fn walk_column_nodes_never_invokes_callback_for_a_non_container_root() {
     let mut invocations: usize = 0;
 
     walk_column_nodes(&serde_json::Value::Null, &mut |_| invocations += 1);
-    walk_column_nodes(&serde_json::json!("REGION"), &mut |_| invocations += 1);
-    walk_column_nodes(&serde_json::json!(7), &mut |_| invocations += 1);
-    walk_column_nodes(&serde_json::json!({}), &mut |_| invocations += 1);
+    walk_column_nodes(&json!("REGION"), &mut |_| invocations += 1);
+    walk_column_nodes(&json!(7), &mut |_| invocations += 1);
+    walk_column_nodes(&json!({}), &mut |_| invocations += 1);
 
     assert_eq!(
         invocations, 0,
@@ -57,28 +57,20 @@ fn walk_column_nodes_never_invokes_callback_for_a_non_container_root() {
 
 #[test]
 fn strip_table_alias_removes_alias_preserves_table_name_and_name_recursively() {
-    let expr = serde_json::json!({
-        "type": "function_scalar",
-        "name": "PLUS",
-        "tableAlias": "O",
-        "arguments": [
-            aliased_col("FACT_ORDERS", "O", "O_ORDERDATE"),
-            num_lit(1)
-        ]
-    });
+    let mut expr = scalar_fn(
+        "PLUS",
+        [aliased_col("FACT_ORDERS", "O", "O_ORDERDATE"), num_lit(1)],
+    );
+    expr["tableAlias"] = json!("O");
 
     let stripped = strip_table_alias(&expr);
 
     assert_eq!(
         stripped,
-        serde_json::json!({
-            "type": "function_scalar",
-            "name": "PLUS",
-            "arguments": [
-                table_col("FACT_ORDERS", "O_ORDERDATE"),
-                num_lit(1)
-            ]
-        }),
+        scalar_fn(
+            "PLUS",
+            [table_col("FACT_ORDERS", "O_ORDERDATE"), num_lit(1)]
+        ),
         "every tableAlias key must be gone at every depth, while name/tableName survive"
     );
 }
