@@ -50,8 +50,7 @@ mod object_location;
 pub(crate) use object_location::ObjectLocation;
 
 mod storage_ref;
-pub use storage_ref::ResolvedScanStorage;
-use storage_ref::resolve_scan_storage;
+pub use storage_ref::{ResolvedScanStorage, resolve_scan_storage};
 
 mod store_router;
 

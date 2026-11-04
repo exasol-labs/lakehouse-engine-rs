@@ -31,9 +31,6 @@ pub fn debug_log_path() -> String {
 
 static DEBUG_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Lets a checkpoint carry the running row total from sites that do not know it.
-static DEBUG_ROWS: AtomicU64 = AtomicU64::new(0);
-
 fn debug_writer() -> &'static Mutex<Option<File>> {
     static WRITER: OnceLock<Mutex<Option<File>>> = OnceLock::new();
     WRITER.get_or_init(|| {
@@ -44,10 +41,6 @@ fn debug_writer() -> &'static Mutex<Option<File>> {
             .ok();
         Mutex::new(file)
     })
-}
-
-pub fn debug_set_rows(total: u64) {
-    DEBUG_ROWS.store(total, Ordering::Relaxed);
 }
 
 // Footer re-fetch observable (#165): data-file footers cached during access-plan construction
@@ -125,7 +118,6 @@ fn current_rss_bytes() -> u64 {
 /// abort and never tears. Mirrored to stderr for an SLC output redirect.
 pub fn debug_checkpoint(msg: &str) {
     let seq = DEBUG_SEQ.fetch_add(1, Ordering::Relaxed);
-    let rows = DEBUG_ROWS.load(Ordering::Relaxed);
     let rss_mb = current_rss_bytes() / (1024 * 1024);
     let pid = std::process::id();
     let epoch_ms = std::time::SystemTime::now()
@@ -138,7 +130,7 @@ pub fn debug_checkpoint(msg: &str) {
 
     let line = format!(
         "LHDBG seq={seq} epoch_ms={epoch_ms} pid={pid} thread={thread_name} \
-         thread_id={thread_id} rows={rows} rss_mb={rss_mb} :: {msg}\n"
+         thread_id={thread_id} rss_mb={rss_mb} :: {msg}\n"
     );
 
     let _ = write!(std::io::stderr(), "{line}");

@@ -15,9 +15,7 @@ use lakehouse_engine::scan::spec::{
     CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, NestedField, NestedMembers,
     ProjectionItem, ScanSpec, ScanStorage, StorageBackend, StorageProps,
 };
-use lakehouse_engine::scan::{
-    ResolvedScanStorage, run_raw_scan_with_session, session_config_for_spec,
-};
+use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
 use parquet::arrow::ArrowWriter;
 
@@ -113,7 +111,7 @@ async fn run_scan(
     );
     let mut ctx = scan_fixture::BatchCapturingCtx::declaring(TestContext::scalar(vec![]), emits);
     let mut timers = PhaseTimers::start();
-    let storage = ResolvedScanStorage::from_backends(dummy_storage(), None);
+    let storage = scan_fixture::resolved_storage(spec);
     run_raw_scan_with_session(&mut ctx, &session, spec, &storage, &mut timers).await?;
     Ok(ctx.into_batches())
 }

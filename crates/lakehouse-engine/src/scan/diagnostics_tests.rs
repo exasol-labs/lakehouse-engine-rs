@@ -118,37 +118,6 @@ mod debug_checkpoint_tests {
     }
 
     #[test]
-    fn checkpoint_line_contains_required_fields() {
-        debug_set_rows(12_345);
-        let seq = DEBUG_SEQ.fetch_add(1, Ordering::Relaxed);
-        let rows = DEBUG_ROWS.load(Ordering::Relaxed);
-        let pid = std::process::id();
-        let thread = std::thread::current();
-        let thread_name = thread.name().unwrap_or("<unnamed>").to_string();
-        let line = format!(
-            "LHDBG seq={seq} epoch_ms=0 pid={pid} thread={thread_name} \
-             thread_id=X rows={rows} rss_mb=0 :: ENTER run_scan"
-        );
-        assert!(line.starts_with("LHDBG "), "must carry the LHDBG grep tag");
-        assert!(
-            line.contains(&format!("pid={pid}")),
-            "must carry pid: {line}"
-        );
-        assert!(line.contains("seq="), "must carry sequence: {line}");
-        assert!(line.contains("thread="), "must carry thread: {line}");
-        assert!(
-            line.contains("rows=12345"),
-            "must carry the running row total: {line}"
-        );
-        assert!(line.contains("rss_mb="), "must carry rss_mb: {line}");
-        assert!(
-            line.contains(":: ENTER run_scan"),
-            "must carry the checkpoint message: {line}"
-        );
-        assert!(!line.contains('\n'), "must be one line");
-    }
-
-    #[test]
     fn sequence_counter_is_unique_under_concurrency() {
         use std::collections::HashSet;
         use std::sync::Arc;
@@ -186,17 +155,6 @@ mod panic_hook_tests {
     // Hook-swapping tests must hold this for the whole swap-act-restore window, or a concurrent
     // test's take_hook can capture the wrong hook and corrupt the chain.
     static HOOK_LOCK: Mutex<()> = Mutex::new(());
-
-    fn unique_path(tag: &str) -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "lakehouse_udf_panic_test_{}_{}.log",
-            tag,
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&p);
-        p
-    }
 
     #[test]
     fn format_record_contains_required_fields() {
@@ -237,7 +195,8 @@ mod panic_hook_tests {
 
     #[test]
     fn append_record_creates_and_appends() {
-        let path = unique_path("append");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("panic.log");
         let path_str = path.to_str().unwrap();
         append_record(path_str, "FIRST\n");
         append_record(path_str, "SECOND\n");
@@ -250,7 +209,6 @@ mod panic_hook_tests {
         let first_pos = contents.find("FIRST").unwrap();
         let second_pos = contents.find("SECOND").unwrap();
         assert!(first_pos < second_pos, "append must preserve order");
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -289,7 +247,8 @@ mod panic_hook_tests {
     #[test]
     fn hook_fires_on_spawned_worker_thread_panic() {
         let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let path = unique_path("worker");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("panic.log");
         let path_owned = path.to_str().unwrap().to_string();
 
         let prev = std::panic::take_hook();
@@ -323,6 +282,5 @@ mod panic_hook_tests {
             contents.contains("location="),
             "record must carry a location field: {contents}"
         );
-        let _ = std::fs::remove_file(&path);
     }
 }

@@ -4,19 +4,15 @@
 
 pub mod concurrency_probe;
 
-use lakehouse_engine::scan::ResolvedScanStorage;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, JoinSpec, JoinType, ScanSpec, ScanStorage, StorageBackend,
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, ScanSpec, ScanStorage,
 };
+use lakehouse_engine::scan::{ResolvedScanStorage, resolve_scan_storage};
 
+/// The production resolution of a spec whose storage values are all inline.
 pub fn resolved_storage(spec: &ScanSpec) -> ResolvedScanStorage {
-    ResolvedScanStorage::from_backends(
-        inline_backend(&spec.common.storage),
-        spec.common
-            .join
-            .as_ref()
-            .map(|join| inline_backend(&join.storage)),
-    )
+    resolve_scan_storage(&spec.common, &exasol_udf_sdk::test_support::DefaultsCtx)
+        .expect("inline storage resolves without a CONNECTION")
 }
 
 pub fn join_spec(storage: ScanStorage) -> JoinSpec {
@@ -33,13 +29,6 @@ pub fn join_spec(storage: ScanStorage) -> JoinSpec {
         post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
         storage,
-    }
-}
-
-fn inline_backend(storage: &ScanStorage) -> StorageBackend {
-    match storage {
-        ScanStorage::Inline(backend) => backend.clone(),
-        other => panic!("this fixture builds an inline storage value, not {other:?}"),
     }
 }
 

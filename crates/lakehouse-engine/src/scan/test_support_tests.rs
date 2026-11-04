@@ -8,7 +8,9 @@ use crate::scan::spec::{
     CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec, ScanStorage,
     StorageBackend, StorageProps,
 };
-use crate::scan::{FieldIdExprAdapterFactory, FieldIdResolution, ResolvedScanStorage};
+use crate::scan::{
+    FieldIdExprAdapterFactory, FieldIdResolution, ResolvedScanStorage, resolve_scan_storage,
+};
 use arrow::array::ArrayRef;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -146,20 +148,21 @@ pub(super) fn join_spec(storage: ScanStorage) -> JoinSpec {
     }
 }
 
+/// The production resolution of a spec whose storage values are all inline.
 pub(super) fn inline_resolved(spec: &ScanSpec) -> ResolvedScanStorage {
-    ResolvedScanStorage::from_backends(
-        inline_backend(&spec.common.storage),
-        spec.common
-            .join
-            .as_ref()
-            .map(|join| inline_backend(&join.storage)),
-    )
+    resolve_scan_storage(&spec.common, &exasol_udf_sdk::test_support::DefaultsCtx)
+        .expect("inline storage resolves without a CONNECTION")
 }
 
-fn inline_backend(storage: &ScanStorage) -> StorageBackend {
-    match storage {
-        ScanStorage::Inline(backend) => backend.clone(),
-        other => panic!("this fixture shortcut needs an inline storage value, not {other:?}"),
+impl ResolvedScanStorage {
+    /// The production resolution of `primary` and an optional dimension-side `join` backend.
+    pub(crate) fn from_backends(primary: StorageBackend, join: Option<StorageBackend>) -> Self {
+        let common = CommonScanSpec {
+            storage: ScanStorage::Inline(primary),
+            join: join.map(|backend| join_spec(ScanStorage::Inline(backend))),
+            ..Default::default()
+        };
+        inline_resolved(&common.with_files(Vec::new()))
     }
 }
 
