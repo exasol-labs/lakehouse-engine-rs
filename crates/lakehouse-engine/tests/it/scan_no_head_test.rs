@@ -1,5 +1,6 @@
 use crate::scan_fixture;
 use crate::scan_fixture::WithFiles;
+use crate::scan_fixture::{block_on, dummy_storage};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,7 +20,6 @@ use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, DeleteMechanism, FileEntry, LogicalField, ScanSpec, ScanStorage,
-    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, run_raw_scan_with_session,
@@ -31,7 +31,6 @@ use object_store::{
     CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
-use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
 use url::Url;
@@ -161,17 +160,6 @@ impl ObjectStore for CountingHeadStore {
     }
 }
 
-fn dummy_storage() -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: "http://localhost:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "k".into(),
-        secret_key: "s".into(),
-        allow_http: true,
-        ..Default::default()
-    })
-}
-
 fn raw_spec(files: Vec<(String, u64)>, table_root: String) -> ScanSpec {
     CommonScanSpec {
         table_root,
@@ -195,21 +183,11 @@ fn raw_spec_with_logical_schema(files: Vec<(String, u64)>, table_root: String) -
         logical_schema: vec![
             LogicalField {
                 field_id: Some(1),
-                name: "id".to_string(),
-                arrow_type: "int64".to_string(),
-                nullable: false,
-                initial_default: None,
-                nested: None,
-                physical_name: None,
+                ..scan_fixture::logical_field("id", "int64")
             },
             LogicalField {
                 field_id: Some(2),
-                name: "name".to_string(),
-                arrow_type: "utf8".to_string(),
-                nullable: false,
-                initial_default: None,
-                nested: None,
-                physical_name: None,
+                ..scan_fixture::logical_field("name", "utf8")
             },
         ],
         ..Default::default()
@@ -261,14 +239,9 @@ fn write_local_parquet(dir: &std::path::Path, relative: &str, rows: i64) -> Stri
         Field::new("name", DataType::Utf8, false).with_metadata(field_id_meta(2)),
     ]));
     let path = dir.join(relative);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create parent dir");
-    }
-    let file = std::fs::File::create(&path).expect("create parquet file");
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(64))
         .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
     let ids: Vec<i64> = (0..rows).collect();
     let names: Vec<String> = (0..rows).map(|i| format!("row-{i}")).collect();
     let batch = RecordBatch::try_new(
@@ -279,11 +252,7 @@ fn write_local_parquet(dir: &std::path::Path, relative: &str, rows: i64) -> Stri
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, Some(props))
 }
 
 /// `columns × row_groups` sets the cached footer's `memory_size()`, which the session
@@ -315,14 +284,9 @@ fn write_wide_local_parquet(
     let schema = Arc::new(Schema::new(fields));
 
     let path = dir.join(relative);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create parent dir");
-    }
-    let file = std::fs::File::create(&path).expect("create parquet file");
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(rows_per_row_group))
         .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
 
     let rows = (row_groups * rows_per_row_group) as i64;
     let ids: Vec<i64> = (0..rows).collect();
@@ -337,11 +301,7 @@ fn write_wide_local_parquet(
         )));
     }
     let batch = RecordBatch::try_new(schema, arrays).expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, Some(props))
 }
 
 /// Must match the key production `build_spec_size_index` uses.
@@ -362,11 +322,6 @@ fn write_delete_parquet(dir: &std::path::Path, relative: &str, entries: &[(&str,
             .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_POS)),
     ]));
     let path = dir.join(relative);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create parent dir");
-    }
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let paths: Vec<&str> = entries.iter().map(|(p, _)| *p).collect();
     let positions: Vec<i64> = entries.iter().map(|(_, pos)| *pos).collect();
     let batch = RecordBatch::try_new(
@@ -377,11 +332,7 @@ fn write_delete_parquet(dir: &std::path::Path, relative: &str, entries: &[(&str,
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 /// `(location, is_head, range)`.
@@ -478,14 +429,6 @@ impl ObjectStore for RequestLoggingStore {
     ) -> object_store::Result<()> {
         self.inner.copy_opts(from, to, options).await
     }
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
 }
 
 async fn run_scan_with_store(

@@ -5,6 +5,7 @@
 use crate::scan_fixture;
 use crate::scan_fixture::WithFiles;
 use crate::scan_fixture::concurrency_probe::ConcurrencyProbe;
+use crate::scan_fixture::{block_on, dir_url, dummy_storage, file_url, total_rows};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,6 @@ use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, DeleteMechanism, DeltaDeletionVectorStorage, FileEntry, ScanSpec, ScanStorage,
-    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{register_files, run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
@@ -33,7 +33,6 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
-use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use url::Url;
 
@@ -55,20 +54,6 @@ const INLINE_PAYLOAD: &str = "^Bg9^0rr910000000000iXQKl0rr91000315c8Xg000r9";
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../scripts/unity/fixtures/table-with-dv-small")
-}
-
-fn file_url(path: &Path) -> String {
-    Url::from_file_path(path)
-        .expect("absolute path")
-        .to_string()
-}
-
-fn dir_url(path: &Path) -> String {
-    let mut url = file_url(path);
-    if !url.ends_with('/') {
-        url.push('/');
-    }
-    url
 }
 
 fn file_size(path: &Path) -> u64 {
@@ -122,17 +107,6 @@ fn inline_deletion_vector() -> DeleteMechanism {
     }
 }
 
-fn dummy_storage() -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: "http://localhost:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "k".into(),
-        secret_key: "SECRETKEY".into(),
-        allow_http: true,
-        ..Default::default()
-    })
-}
-
 fn scan_spec(
     files: Vec<FileEntry>,
     table_root: &str,
@@ -149,14 +123,6 @@ fn scan_spec(
         ..Default::default()
     }
     .with_files(files)
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
 }
 
 async fn try_run_scan_with_store(
@@ -205,10 +171,6 @@ fn values_of(batches: &[RecordBatch]) -> Vec<i32> {
     }
     out.sort_unstable();
     out
-}
-
-fn total_rows(batches: &[RecordBatch]) -> usize {
-    batches.iter().map(|b| b.num_rows()).sum()
 }
 
 /// Scenario: A UUID-relative deletion vector removes exactly its flagged rows
@@ -390,7 +352,6 @@ fn deletion_vector_reads_stay_within_the_connection_budget() {
     );
 }
 
-/// Scenario: Deletion vectors compose with projection, filter, LIMIT, and aggregation
 #[test]
 fn deletion_vectors_compose_with_projection_filter_limit_and_aggregation() {
     let tmp = tempfile::tempdir().unwrap();
@@ -463,7 +424,6 @@ fn deletion_vectors_compose_with_projection_filter_limit_and_aggregation() {
     );
 }
 
-/// Scenario: A Delta data file carrying no deletion vector scans unchanged
 #[test]
 fn delta_file_without_a_deletion_vector_scans_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
@@ -492,8 +452,6 @@ fn write_iceberg_delete_parquet(dir: &Path, relative: &str, entries: &[(&str, i6
             .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_POS)),
     ]));
     let path = dir.join(relative);
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let paths: Vec<&str> = entries.iter().map(|(p, _)| *p).collect();
     let positions: Vec<i64> = entries.iter().map(|(_, pos)| *pos).collect();
     let batch = RecordBatch::try_new(
@@ -504,9 +462,7 @@ fn write_iceberg_delete_parquet(dir: &Path, relative: &str, entries: &[(&str, i6
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    file_url(&path)
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 fn write_iceberg_data_parquet(dir: &Path, relative: &str, values: &[i32]) -> String {
@@ -516,13 +472,9 @@ fn write_iceberg_data_parquet(dir: &Path, relative: &str, values: &[i32]) -> Str
         false,
     )]));
     let path = dir.join(relative);
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.to_vec()))])
         .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    file_url(&path)
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 #[test]

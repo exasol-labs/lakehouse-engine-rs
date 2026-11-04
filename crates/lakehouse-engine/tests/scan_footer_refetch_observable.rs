@@ -5,6 +5,7 @@
 mod scan_fixture;
 
 use crate::scan_fixture::WithFiles;
+use crate::scan_fixture::{block_on, dummy_storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -24,7 +25,6 @@ use lakehouse_engine::scan::diagnostics::{
 };
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, DeleteMechanism, FileEntry, LogicalField, ScanSpec, ScanStorage,
-    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     ResolvedScanStorage, run_raw_scan_with_session, run_scan_one, session_config_for_spec,
@@ -35,7 +35,6 @@ use object_store::{
     CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
-use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use url::Url;
 
@@ -141,17 +140,6 @@ impl ObjectStore for RequestLoggingStore {
     }
 }
 
-fn dummy_storage() -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: "http://localhost:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "k".into(),
-        secret_key: "s".into(),
-        allow_http: true,
-        ..Default::default()
-    })
-}
-
 /// A non-empty logical schema avoids schema inference, which would fetch and cache the footer
 /// before Phase B and make the request counts vacuous.
 fn raw_spec_with_logical_schema(table_root: String) -> ScanSpec {
@@ -163,21 +151,11 @@ fn raw_spec_with_logical_schema(table_root: String) -> ScanSpec {
         logical_schema: vec![
             LogicalField {
                 field_id: Some(1),
-                name: "id".to_string(),
-                arrow_type: "int64".to_string(),
-                nullable: false,
-                initial_default: None,
-                nested: None,
-                physical_name: None,
+                ..scan_fixture::logical_field("id", "int64")
             },
             LogicalField {
                 field_id: Some(2),
-                name: "name".to_string(),
-                arrow_type: "utf8".to_string(),
-                nullable: false,
-                initial_default: None,
-                nested: None,
-                physical_name: None,
+                ..scan_fixture::logical_field("name", "utf8")
             },
         ],
         ..Default::default()
@@ -193,11 +171,6 @@ fn write_local_parquet(dir: &std::path::Path, relative: &str, rows: i64) -> Stri
         Field::new("name", DataType::Utf8, false).with_metadata(field_id_meta(2)),
     ]));
     let path = dir.join(relative);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create parent dir");
-    }
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let ids: Vec<i64> = (0..rows).collect();
     let names: Vec<String> = (0..rows).map(|i| format!("row-{i}")).collect();
     let batch = RecordBatch::try_new(
@@ -208,11 +181,7 @@ fn write_local_parquet(dir: &std::path::Path, relative: &str, rows: i64) -> Stri
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 fn write_delete_parquet(dir: &std::path::Path, relative: &str, entries: &[(&str, i64)]) -> String {
@@ -225,11 +194,6 @@ fn write_delete_parquet(dir: &std::path::Path, relative: &str, entries: &[(&str,
             .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_POS)),
     ]));
     let path = dir.join(relative);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create parent dir");
-    }
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let paths: Vec<&str> = entries.iter().map(|(p, _)| *p).collect();
     let positions: Vec<i64> = entries.iter().map(|(_, pos)| *pos).collect();
     let batch = RecordBatch::try_new(
@@ -240,11 +204,7 @@ fn write_delete_parquet(dir: &std::path::Path, relative: &str, entries: &[(&str,
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 fn data_key(abs_file_url: &str) -> ObjectStorePath {
@@ -253,14 +213,6 @@ fn data_key(abs_file_url: &str) -> ObjectStorePath {
         .expect("listing url")
         .prefix()
         .clone()
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
 }
 
 /// Counts bounded suffix GETs ending at `size` and wider than the 8-byte footer-length probe:

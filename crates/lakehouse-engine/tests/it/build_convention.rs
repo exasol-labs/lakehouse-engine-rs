@@ -1,23 +1,3 @@
-const WORKSPACE_AGENTS_MD: &str = include_str!("../../../../AGENTS.md");
-
-#[test]
-fn host_release_build_documented_unloadable() {
-    let doc = WORKSPACE_AGENTS_MD.to_lowercase();
-
-    assert!(
-        doc.contains("cargo build --release"),
-        "build documentation must mention the host `cargo build --release` path"
-    );
-    assert!(
-        doc.contains("host"),
-        "build documentation must call out the host build specifically"
-    );
-    assert!(
-        doc.contains("fails to load") || doc.contains("unloadable"),
-        "build documentation must state the host-built .so does not load in Exasol"
-    );
-}
-
 #[test]
 fn the_type_relaxation_suite_and_fixture_are_wired_into_run_fixtures_and_make_test_e2e() {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

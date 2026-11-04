@@ -1,9 +1,7 @@
 use super::*;
 use crate::scan::runtime::{DEFAULT_BUDGET_BYTES, MIN_POOL_FLOOR_BYTES};
-use crate::scan::spec::{
-    DeleteMechanism, DeltaDeletionVectorStorage, JoinSpec, ScanStorage, StorageProps,
-};
-use crate::scan::test_support::{inline_resolved, join_spec, minimal_spec};
+use crate::scan::spec::{DeleteMechanism, DeltaDeletionVectorStorage, JoinSpec, ScanStorage};
+use crate::scan::test_support::{inline_resolved, join_spec, minimal_spec, s3_backend};
 use ::object_store::ClientConfigKey;
 use arrow::datatypes::DataType;
 use datafusion::execution::FunctionRegistry;
@@ -46,18 +44,6 @@ fn spec_with_join(dim_root: &str, dim_files: Vec<FileEntry>) -> ScanSpec {
         ..join_spec(spec.common.storage.clone())
     });
     spec
-}
-
-/// Path-style (the `StorageProps` default) is required: the S3 arm applies `endpoint` only then.
-fn s3_backend(endpoint: &str, secret: &str) -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: endpoint.into(),
-        region: "us-east-1".into(),
-        access_key: "testkey".into(),
-        secret_key: secret.into(),
-        allow_http: true,
-        ..Default::default()
-    })
 }
 
 /// Records which endpoint a read reached; every request is refused, as only the destination is tested.

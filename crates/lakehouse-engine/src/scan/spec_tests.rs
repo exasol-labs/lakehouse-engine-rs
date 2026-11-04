@@ -1,6 +1,7 @@
 use super::*;
 use crate::scan::test_support::WithFiles;
 use crate::scan::test_support::join_spec;
+use crate::scan::test_support::logical_field;
 
 #[test]
 fn reconstruct_absolute_entry_passes_through() {
@@ -580,48 +581,26 @@ fn logical_schema_round_trips_and_defaults_to_empty() {
     spec.common.logical_schema = vec![
         LogicalField {
             field_id: Some(1),
-            name: "id".to_string(),
-            arrow_type: "int32".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("id", "int32")
         },
         LogicalField {
             field_id: Some(2),
-            name: "rating".to_string(),
-            arrow_type: "float64".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("rating", "float64")
         },
         LogicalField {
             field_id: Some(3),
-            name: "label".to_string(),
-            arrow_type: "utf8".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("label", "utf8")
         },
         LogicalField {
             field_id: Some(4),
-            name: "ts".to_string(),
-            arrow_type: "timestamp_us".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("ts", "timestamp_us")
         },
         LogicalField {
             field_id: Some(5),
-            name: "amount".to_string(),
-            arrow_type: "decimal128(18,4)".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("amount", "decimal128(18,4)")
         },
     ];
     let json = spec.to_json();
@@ -1145,12 +1124,7 @@ fn join_block_round_trips_through_split_and_merge() {
         ],
         logical_schema: vec![LogicalField {
             field_id: Some(1),
-            name: "d_key".into(),
-            arrow_type: "int64".into(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("d_key", "int64")
         }],
         ..join_spec(ScanStorage::Inline(dim_storage.clone()))
     });
@@ -1938,12 +1912,8 @@ fn a_logical_field_authored_before_the_nested_descriptor_deserializes_unchanged(
         field,
         LogicalField {
             field_id: Some(7),
-            name: "REGION".to_string(),
-            arrow_type: "utf8".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("REGION", "utf8")
         },
         "an absent nested key must read as no descriptor, not as an error"
     );
@@ -1953,12 +1923,8 @@ fn a_logical_field_authored_before_the_nested_descriptor_deserializes_unchanged(
 fn a_primitive_logical_field_serializes_no_nested_key() {
     let primitive = LogicalField {
         field_id: Some(7),
-        name: "REGION".to_string(),
-        arrow_type: "utf8".to_string(),
         nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
+        ..logical_field("REGION", "utf8")
     };
 
     assert_eq!(
@@ -2046,12 +2012,9 @@ fn a_nested_descriptor_round_trips_every_container_kind_at_depth() {
     ] {
         let field = LogicalField {
             field_id: Some(2),
-            name: "ADDR".to_string(),
-            arrow_type: "utf8".to_string(),
             nullable: true,
-            initial_default: None,
             nested: Some(members),
-            physical_name: None,
+            ..logical_field("ADDR", "utf8")
         };
         let json = serde_json::to_string(&field).unwrap();
         assert!(

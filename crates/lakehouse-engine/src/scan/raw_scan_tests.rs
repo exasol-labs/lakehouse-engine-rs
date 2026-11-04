@@ -1,7 +1,8 @@
 use super::*;
 use crate::scan::session_config_for_spec;
 use crate::scan::test_support::WithFiles;
-use crate::scan::test_support::{inline_resolved, local_file_size, minimal_spec};
+use crate::scan::test_support::logical_field;
+use crate::scan::test_support::{MemoryParquet, inline_resolved, minimal_spec};
 
 #[test]
 fn both_parquet_format_sites_coerce_int96_us_utc() {
@@ -131,42 +132,30 @@ async fn register_files_falls_back_without_logical_schema() {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::execution::context::SessionContext;
-    use parquet::arrow::ArrowWriter;
     use std::sync::Arc;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
-    let path = dir.join("fallback.parquet");
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("val", DataType::Int64, true),
     ]));
-    {
-        let file = std::fs::File::create(&path).expect("create parquet file");
-        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int64Array::from(vec![1i64, 2, 3])),
-                Arc::new(Int64Array::from(vec![Some(10i64), Some(20), None])),
-            ],
-        )
-        .expect("record batch");
-        writer.write(&batch).expect("write batch");
-        writer.close().expect("close writer");
-    }
-    let file_url = url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+            Arc::new(Int64Array::from(vec![Some(10i64), Some(20), None])),
+        ],
+    )
+    .expect("record batch");
+    let files = MemoryParquet::default();
+    let entry = files.put("fallback.parquet", batch);
 
     // Absolute file:// entry with the real size, since the provider builds ObjectMeta from it.
     let mut spec = minimal_spec();
-    let file_size = local_file_size(&file_url);
-    spec.files = vec![FileEntry::new(file_url, file_size)];
+    spec.files = vec![entry];
     spec.common.logical_schema = Vec::new();
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+    files.register(&ctx);
     register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
         .await
         .expect("register_files must succeed on first-file inference path");
@@ -195,35 +184,23 @@ async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter(
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::execution::context::SessionContext;
-    use parquet::arrow::ArrowWriter;
 
     // No field-id metadata, as in a Delta `none` column-mapping table's files.
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
-    let path = dir.join("identity.parquet");
 
     let physical_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("val", DataType::Int64, true),
     ]));
-    {
-        let file = std::fs::File::create(&path).expect("create parquet file");
-        let mut writer =
-            ArrowWriter::try_new(file, physical_schema.clone(), None).expect("arrow writer");
-        let batch = RecordBatch::try_new(
-            physical_schema,
-            vec![
-                Arc::new(Int64Array::from(vec![1i64, 2, 3])),
-                Arc::new(Int64Array::from(vec![10i64, 20, 30])),
-            ],
-        )
-        .expect("record batch");
-        writer.write(&batch).expect("write batch");
-        writer.close().expect("close writer");
-    }
-    let file_url = url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string();
+    let batch = RecordBatch::try_new(
+        physical_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+            Arc::new(Int64Array::from(vec![10i64, 20, 30])),
+        ],
+    )
+    .expect("record batch");
+    let files = MemoryParquet::default();
+    let entry = files.put("identity.parquet", batch);
 
     let identity_field = |name: &str, nullable: bool| LogicalField {
         field_id: None,
@@ -235,8 +212,7 @@ async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter(
         physical_name: None,
     };
     let mut spec = minimal_spec();
-    let file_size = local_file_size(&file_url);
-    spec.files = vec![FileEntry::new(file_url, file_size)];
+    spec.files = vec![entry];
     spec.common.logical_schema = vec![
         identity_field("id", false),
         identity_field("val", true),
@@ -245,6 +221,7 @@ async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter(
     spec.common.projection = vec!["ID".into(), "VAL".into(), "ADDED".into()];
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+    files.register(&ctx);
     register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
         .await
         .expect("register_files must succeed for an all-identity logical schema");
@@ -305,49 +282,38 @@ async fn ordered_scan_sql_preserves_desc_and_null_placement() {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::execution::context::SessionContext;
-    use parquet::arrow::ArrowWriter;
 
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
-    let path = dir.join("topn.parquet");
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("price", DataType::Float64, true),
     ]));
-    {
-        let file = std::fs::File::create(&path).expect("create parquet file");
-        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
-                Arc::new(Float64Array::from(vec![
-                    Some(10.0),
-                    None,
-                    Some(30.0),
-                    Some(20.0),
-                    None,
-                ])),
-            ],
-        )
-        .expect("record batch");
-        writer.write(&batch).expect("write batch");
-        writer.close().expect("close writer");
-    }
-    let file_url = url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+            Arc::new(Float64Array::from(vec![
+                Some(10.0),
+                None,
+                Some(30.0),
+                Some(20.0),
+                None,
+            ])),
+        ],
+    )
+    .expect("record batch");
+    let files = MemoryParquet::default();
+    let entry = files.put("topn.parquet", batch);
 
     // Rows in plan order, with no test-side re-sort.
     async fn topn_rows(
-        file_url: &str,
+        files: &MemoryParquet,
+        entry: &FileEntry,
         ascending: bool,
         nulls_last: bool,
         limit: u64,
     ) -> Vec<(i64, Option<f64>)> {
         let mut spec = minimal_spec();
-        let file_size = local_file_size(file_url);
-        spec.files = vec![FileEntry::new(file_url, file_size)];
+        spec.files = vec![entry.clone()];
         spec.common.projection = vec!["ID".into(), "PRICE".into()];
         spec.common.order_by = vec![SortKey {
             column: "PRICE".into(),
@@ -357,6 +323,7 @@ async fn ordered_scan_sql_preserves_desc_and_null_placement() {
         spec.common.limit = Some(limit);
 
         let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+        files.register(&ctx);
         register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
             .await
             .expect("register local parquet");
@@ -389,7 +356,7 @@ async fn ordered_scan_sql_preserves_desc_and_null_placement() {
         rows
     }
 
-    let desc_nulls_first = topn_rows(&file_url, false, false, 3).await;
+    let desc_nulls_first = topn_rows(&files, &entry, false, false, 3).await;
     assert_eq!(
         desc_nulls_first.len(),
         3,
@@ -405,7 +372,7 @@ async fn ordered_scan_sql_preserves_desc_and_null_placement() {
         "after the NULLs the largest value comes next: {desc_nulls_first:?}"
     );
 
-    let desc_nulls_last = topn_rows(&file_url, false, true, 3).await;
+    let desc_nulls_last = topn_rows(&files, &entry, false, true, 3).await;
     assert_eq!(
         desc_nulls_last.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
         vec![Some(30.0), Some(20.0), Some(10.0)],
@@ -422,21 +389,12 @@ async fn build_scan_sql_aliases_over_logical_schema() {
     let logical = vec![
         LogicalField {
             field_id: Some(1),
-            name: "id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("id", "int64")
         },
         LogicalField {
             field_id: Some(2),
-            name: "rating".to_string(),
-            arrow_type: "float64".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("rating", "float64")
         },
     ];
     let logical_schema = build_logical_arrow_schema(&logical);
@@ -521,16 +479,13 @@ async fn a_list_column_tagged_utf8_is_json_rendered_by_the_field_id_expression_a
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::execution::context::SessionContext;
-    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use std::collections::HashMap;
 
     let field_id_meta =
         |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
 
     // An obfuscated Delta `id`-mapping physical name with a populated, a NULL, and an empty list.
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
-    let path = dir.join("list.parquet");
 
     let lists = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
         Some(vec![Some(1), Some(2), Some(3)]),
@@ -541,52 +496,36 @@ async fn a_list_column_tagged_utf8_is_json_rendered_by_the_field_id_expression_a
         Field::new("id", DataType::Int64, false).with_metadata(field_id_meta(1)),
         Field::new("col-8f0a", lists.data_type().clone(), true).with_metadata(field_id_meta(2)),
     ]));
-    {
-        let file = std::fs::File::create(&path).expect("create parquet file");
-        let mut writer =
-            ArrowWriter::try_new(file, physical_schema.clone(), None).expect("arrow writer");
-        let batch = RecordBatch::try_new(
-            physical_schema,
-            vec![
-                Arc::new(Int64Array::from(vec![1i64, 2, 3])),
-                Arc::new(lists),
-            ],
-        )
-        .expect("record batch");
-        writer.write(&batch).expect("write batch");
-        writer.close().expect("close writer");
-    }
-    let file_url = url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string();
+    let batch = RecordBatch::try_new(
+        physical_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+            Arc::new(lists),
+        ],
+    )
+    .expect("record batch");
+    let files = MemoryParquet::default();
+    let entry = files.put("list.parquet", batch);
 
     // Tagged `utf8`, as the Delta classifier emits for `array<integer>`.
     let mut spec = minimal_spec();
-    let file_size = local_file_size(&file_url);
-    spec.files = vec![FileEntry::new(file_url, file_size)];
+    spec.files = vec![entry];
     spec.common.logical_schema = vec![
         LogicalField {
             field_id: Some(1),
-            name: "id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("id", "int64")
         },
         LogicalField {
             field_id: Some(2),
-            name: "arr_col".to_string(),
-            arrow_type: "utf8".to_string(),
             nullable: true,
-            initial_default: None,
             nested: Some(crate::scan::spec::NestedMembers::List { element: None }),
-            physical_name: None,
+            ..logical_field("arr_col", "utf8")
         },
     ];
     spec.common.projection = vec!["ID".into(), "ARR_COL".into()];
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+    files.register(&ctx);
     register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
         .await
         .expect("register_files must succeed for a utf8-tagged list column");
@@ -646,7 +585,7 @@ async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::execution::context::SessionContext;
-    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use std::collections::HashMap;
 
     let field_id_meta =
@@ -672,33 +611,22 @@ async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
     attrs_builder.append(false).expect("null map row");
     let attrs = attrs_builder.finish();
 
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
-    let path = dir.join("nested.parquet");
     let physical_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false).with_metadata(field_id_meta(1)),
         Field::new("col-addr", addr.data_type().clone(), true).with_metadata(field_id_meta(2)),
         Field::new("col-attrs", attrs.data_type().clone(), true).with_metadata(field_id_meta(3)),
     ]));
-    {
-        let file = std::fs::File::create(&path).expect("create parquet file");
-        let mut writer =
-            ArrowWriter::try_new(file, physical_schema.clone(), None).expect("arrow writer");
-        let batch = RecordBatch::try_new(
-            physical_schema,
-            vec![
-                Arc::new(Int64Array::from(vec![1i64, 2])),
-                Arc::new(addr),
-                Arc::new(attrs),
-            ],
-        )
-        .expect("record batch");
-        writer.write(&batch).expect("write batch");
-        writer.close().expect("close writer");
-    }
-    let file_url = url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string();
+    let batch = RecordBatch::try_new(
+        physical_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 2])),
+            Arc::new(addr),
+            Arc::new(attrs),
+        ],
+    )
+    .expect("record batch");
+    let files = MemoryParquet::default();
+    let entry = files.put("nested.parquet", batch);
 
     let nested_field = |name: &str, physical_name: &str| NestedField {
         field_id: None,
@@ -706,30 +634,21 @@ async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
         physical_name: Some(physical_name.to_string()),
         nested: None,
     };
-    let logical_field = |field_id: i32, name: &str, nested: Option<NestedMembers>| LogicalField {
+    let utf8_field = |field_id: i32, name: &str, nested: Option<NestedMembers>| LogicalField {
         field_id: Some(field_id),
-        name: name.to_string(),
-        arrow_type: "utf8".to_string(),
         nullable: true,
-        initial_default: None,
         nested,
-        physical_name: None,
+        ..logical_field(name, "utf8")
     };
 
     let mut spec = minimal_spec();
-    let file_size = local_file_size(&file_url);
-    spec.files = vec![FileEntry::new(file_url, file_size)];
+    spec.files = vec![entry];
     spec.common.logical_schema = vec![
         LogicalField {
             field_id: Some(1),
-            name: "id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("id", "int64")
         },
-        logical_field(
+        utf8_field(
             2,
             "addr",
             Some(NestedMembers::Struct {
@@ -739,7 +658,7 @@ async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
                 ],
             }),
         ),
-        logical_field(
+        utf8_field(
             3,
             "attrs",
             Some(NestedMembers::Map {
@@ -751,6 +670,7 @@ async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
     spec.common.projection = vec!["ID".into(), "ADDR".into(), "ATTRS".into()];
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+    files.register(&ctx);
     register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
         .await
         .expect("register_files must succeed for utf8-tagged struct and map columns");
@@ -910,7 +830,7 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::execution::context::SessionContext;
-    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use std::collections::HashMap;
 
     let field_id_meta =
@@ -922,29 +842,17 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
     tags_builder.append(true);
     let tags = tags_builder.finish();
 
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
-    let path = dir.join("shared.parquet");
     let physical_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false).with_metadata(field_id_meta(1)),
         Field::new("tags", tags.data_type().clone(), true).with_metadata(field_id_meta(2)),
     ]));
-    {
-        let file = std::fs::File::create(&path).expect("create parquet file");
-        let mut writer =
-            ArrowWriter::try_new(file, physical_schema.clone(), None).expect("arrow writer");
-        let batch = RecordBatch::try_new(
-            physical_schema,
-            vec![Arc::new(Int64Array::from(vec![1i64])), Arc::new(tags)],
-        )
-        .expect("record batch");
-        writer.write(&batch).expect("write batch");
-        writer.close().expect("close writer");
-    }
-    let file_url = url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string();
-    let file_size = local_file_size(&file_url);
+    let batch = RecordBatch::try_new(
+        physical_schema,
+        vec![Arc::new(Int64Array::from(vec![1i64])), Arc::new(tags)],
+    )
+    .expect("record batch");
+    let files = MemoryParquet::default();
+    let entry = files.put("shared.parquet", batch);
 
     async fn rendered_tags(ctx: &SessionContext, sql: &str) -> Option<String> {
         let df = ctx.sql(sql).await.expect("plan scan SQL");
@@ -972,30 +880,23 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
 
     // Logical-schema path: the adapter substitutes the render expression at plan level.
     let mut logical_spec = minimal_spec();
-    logical_spec.files = vec![FileEntry::new(file_url.clone(), file_size)];
+    logical_spec.files = vec![entry.clone()];
     logical_spec.common.logical_schema = vec![
         LogicalField {
             field_id: Some(1),
-            name: "id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("id", "int64")
         },
         LogicalField {
             field_id: Some(2),
-            name: "tags".to_string(),
-            arrow_type: "utf8".to_string(),
             nullable: true,
-            initial_default: None,
             nested: Some(NestedMembers::List { element: None }),
-            physical_name: None,
+            ..logical_field("tags", "utf8")
         },
     ];
     logical_spec.common.projection = vec!["ID".into(), "TAGS".into()];
 
     let logical_ctx = SessionContext::new_with_config(session_config_for_spec(&logical_spec));
+    files.register(&logical_ctx);
     register_files(
         &logical_ctx,
         "scan_target",
@@ -1016,11 +917,12 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
 
     // Legacy path: `build_scan_sql` routes the physical List type through the SQL-level call.
     let mut legacy_spec = minimal_spec();
-    legacy_spec.files = vec![FileEntry::new(file_url, file_size)];
+    legacy_spec.files = vec![entry];
     legacy_spec.common.logical_schema = Vec::new();
     legacy_spec.common.projection = vec!["ID".into(), "TAGS".into()];
 
     let legacy_ctx = SessionContext::new_with_config(session_config_for_spec(&legacy_spec));
+    files.register(&legacy_ctx);
     register_files(
         &legacy_ctx,
         "scan_target",
@@ -1056,9 +958,7 @@ async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
     use crate::scan::ResolvedScanStorage;
     use crate::scan::object_store::build_session_context;
     use crate::scan::spec::{CommonScanSpec, ProjectionItem, ScanStorage};
-    use crate::scan::test_support::{
-        SinkCtx, TEST_CONNECTION, refusing_backend, refusing_endpoint,
-    };
+    use crate::scan::test_support::{SinkCtx, TEST_CONNECTION, refusing_endpoint, s3_backend};
 
     const MARKER: &str = "raw-scan-refusal";
     const SENTINEL: &str = "RAWSCANSECRETVALUE";
@@ -1068,12 +968,7 @@ async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
         projection: vec![ProjectionItem::Column("ID".into())],
         logical_schema: vec![crate::scan::spec::LogicalField {
             field_id: Some(1),
-            name: "id".into(),
-            arrow_type: "int64".into(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("id", "int64")
         }],
         storage: ScanStorage::Connection {
             name: TEST_CONNECTION.into(),
@@ -1085,7 +980,7 @@ async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
         "s3://test-bucket/data/part-0.parquet",
         4096,
     )]);
-    let storage = ResolvedScanStorage::from_backends(refusing_backend(&endpoint, SENTINEL), None);
+    let storage = ResolvedScanStorage::from_backends(s3_backend(&endpoint, SENTINEL), None);
 
     let session = build_session_context(&spec, &storage, 0).expect("the session must build");
     let mut ctx = SinkCtx;

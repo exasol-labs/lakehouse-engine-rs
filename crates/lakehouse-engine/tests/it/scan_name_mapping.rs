@@ -2,6 +2,7 @@
 
 use crate::scan_fixture;
 use crate::scan_fixture::WithFiles;
+use crate::scan_fixture::{block_on, dummy_storage};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,22 +15,9 @@ use exasol_udf_sdk::value::ExaType;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ScanSpec, ScanStorage,
-    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
-use parquet::arrow::ArrowWriter;
-
-fn dummy_storage() -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: "http://localhost:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "k".into(),
-        secret_key: "s".into(),
-        allow_http: true,
-        ..Default::default()
-    })
-}
 
 /// Neither column carries `PARQUET:field_id`. `id` holds `0..rows`, the other `10 * id`.
 fn write_local_parquet_two_int_cols(
@@ -44,11 +32,6 @@ fn write_local_parquet_two_int_cols(
         Field::new(other_col_name, DataType::Int64, true),
     ]));
     let path = dir.join(relative);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create parent dir");
-    }
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let ids: Vec<i64> = (0..rows).collect();
     let others: Vec<i64> = (0..rows).map(|i| i * 10).collect();
     let batch = RecordBatch::try_new(
@@ -59,11 +42,7 @@ fn write_local_parquet_two_int_cols(
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 fn name_mapping_spec(
@@ -88,31 +67,14 @@ fn logical_schema() -> Vec<LogicalField> {
     vec![
         LogicalField {
             field_id: Some(1),
-            name: "id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("id", "int64")
         },
         LogicalField {
             field_id: Some(2),
-            name: "new_col".to_string(),
-            arrow_type: "int64".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("new_col", "int64")
         },
     ]
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
 }
 
 async fn run_scan(spec: &ScanSpec, register_url: &str) -> Result<Vec<RecordBatch>, String> {

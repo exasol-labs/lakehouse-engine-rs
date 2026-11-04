@@ -2,6 +2,7 @@
 //! `physical_name` -> `name_mapping` -> identity.
 
 use crate::scan_fixture::WithFiles;
+use crate::scan_fixture::{block_on, dummy_storage};
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array};
@@ -13,26 +14,13 @@ use exasol_udf_sdk::value::ExaType;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, NestedField, NestedMembers,
-    ProjectionItem, ScanSpec, ScanStorage, StorageBackend, StorageProps,
+    ProjectionItem, ScanSpec, ScanStorage,
 };
-use lakehouse_engine::scan::{
-    ResolvedScanStorage, run_raw_scan_with_session, session_config_for_spec,
-};
+use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
 use parquet::arrow::ArrowWriter;
 
 use crate::scan_fixture;
-
-fn dummy_storage() -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: "http://localhost:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "k".into(),
-        secret_key: "s".into(),
-        allow_http: true,
-        ..Default::default()
-    })
-}
 
 /// No column carries `PARQUET:field_id`. The first column holds `0..rows`, the rest `10 * id`.
 fn write_local_parquet(
@@ -47,11 +35,6 @@ fn write_local_parquet(
         .collect();
     let schema = Arc::new(Schema::new(fields));
     let path = dir.join(relative);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create parent dir");
-    }
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let ids: Vec<i64> = (0..rows).collect();
     let arrays: Vec<Arc<dyn Array>> = columns
         .iter()
@@ -66,11 +49,7 @@ fn write_local_parquet(
         })
         .collect();
     let batch = RecordBatch::try_new(schema, arrays).expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 fn raw_scan_spec(
@@ -91,14 +70,6 @@ fn raw_scan_spec(
     .with_files(vec![FileEntry::new(file_url, file_size)])
 }
 
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
-}
-
 async fn run_scan(
     spec: &ScanSpec,
     register_url: &str,
@@ -113,7 +84,7 @@ async fn run_scan(
     );
     let mut ctx = scan_fixture::BatchCapturingCtx::declaring(TestContext::scalar(vec![]), emits);
     let mut timers = PhaseTimers::start();
-    let storage = ResolvedScanStorage::from_backends(dummy_storage(), None);
+    let storage = scan_fixture::resolved_storage(spec);
     run_raw_scan_with_session(&mut ctx, &session, spec, &storage, &mut timers).await?;
     Ok(ctx.into_batches())
 }
@@ -142,32 +113,16 @@ fn declared_physical_name_binds_the_renamed_physical_column() {
         .len();
 
     let logical_schema = vec![
+        scan_fixture::logical_field("id", "int64"),
         LogicalField {
-            field_id: None,
-            name: "id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
-        },
-        LogicalField {
-            field_id: None,
-            name: "amount".to_string(),
-            arrow_type: "int64".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
             physical_name: Some("col-abc".to_string()),
+            ..scan_fixture::logical_field("amount", "int64")
         },
         LogicalField {
             field_id: Some(7),
-            name: "other".to_string(),
-            arrow_type: "int64".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("other", "int64")
         },
     ];
     let name_mapping = vec![NameMappingEntry {
@@ -221,35 +176,18 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
         .expect("stat parquet")
         .len();
 
-    let id_field = || LogicalField {
-        field_id: None,
-        name: "id".to_string(),
-        arrow_type: "int64".to_string(),
-        nullable: false,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
-    };
+    let id_field = || scan_fixture::logical_field("id", "int64");
 
     let logical_schema = vec![
         id_field(),
         LogicalField {
-            field_id: None,
-            name: "extra_nullable".to_string(),
-            arrow_type: "int64".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("extra_nullable", "int64")
         },
         LogicalField {
-            field_id: None,
-            name: "extra_default".to_string(),
-            arrow_type: "int64".to_string(),
             nullable: true,
             initial_default: Some("42".to_string()),
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("extra_default", "int64")
         },
     ];
     let spec = raw_scan_spec(
@@ -288,15 +226,7 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
 
     let required_missing_schema = vec![
         id_field(),
-        LogicalField {
-            field_id: None,
-            name: "mandatory".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
-        },
+        scan_fixture::logical_field("mandatory", "int64"),
     ];
     let error_spec = raw_scan_spec(
         file_url.clone(),

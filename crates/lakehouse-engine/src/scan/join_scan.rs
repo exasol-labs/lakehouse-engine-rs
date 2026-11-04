@@ -7,13 +7,12 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 
 use crate::scan::diagnostics;
+use crate::scan::emit::classify_scan_error;
 use crate::scan::spec::{ColumnRef, JoinSpec, ProjectionItem, ScanSpec};
 use crate::scan::storage_ref::ResolvedScanStorage;
 use crate::types::mapping::arrow_to_exasol_type;
 
-use super::raw_scan::{
-    delete_path_read_limiter, emit_dataframe, physical_plan, plan_sql, register_file_list,
-};
+use super::raw_scan::{delete_path_read_limiter, emit_plan, plan_sql, register_file_list};
 use super::sql_support::{
     aliased_select, append_where, quote_ident, render_column, render_projection,
 };
@@ -30,8 +29,8 @@ pub async fn run_join_scan_with_session(
     storage: &ResolvedScanStorage,
     timers: &mut diagnostics::PhaseTimers,
 ) -> Result<(), UdfError> {
-    let df = build_join_dataframe(session_ctx, spec, storage).await?;
-    emit_dataframe(ctx, df, storage, timers).await
+    let plan = build_join_physical_plan(session_ctx, spec, storage).await?;
+    emit_plan(ctx, plan, session_ctx.task_ctx(), storage, timers).await
 }
 
 async fn build_join_dataframe(
@@ -250,13 +249,18 @@ fn combined_type<'a>(
         .map(|(_, dt)| dt)
 }
 
-/// Exposed so a host test can assert the dimension side is the hash-join build side.
+/// Planning reads data-file footers for the delete access plans, so its errors are classified
+/// and redacted like a stream error.
 pub async fn build_join_physical_plan(
     ctx: &SessionContext,
     spec: &ScanSpec,
     storage: &ResolvedScanStorage,
 ) -> Result<Arc<dyn ExecutionPlan>, UdfError> {
-    physical_plan(build_join_dataframe(ctx, spec, storage).await?).await
+    build_join_dataframe(ctx, spec, storage)
+        .await?
+        .create_physical_plan()
+        .await
+        .map_err(|e| classify_scan_error(e, &storage.all_secret_values()))
 }
 
 #[cfg(test)]

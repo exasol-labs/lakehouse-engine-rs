@@ -3,6 +3,7 @@ use datafusion::common::config::{ConfigOptions, TableParquetOptions};
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
+use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
@@ -40,20 +41,24 @@ pub async fn run_raw_scan_with_session(
     timers: &mut diagnostics::PhaseTimers,
 ) -> Result<(), UdfError> {
     let df = build_dataframe(session_ctx, spec, storage).await?;
-    emit_dataframe(ctx, df, storage, timers).await
+    let task_ctx = Arc::new(df.task_ctx());
+    let plan = df
+        .create_physical_plan()
+        .await
+        .map_err(|e| classify_scan_error(e, &storage.all_secret_values()))?;
+    emit_plan(ctx, plan, task_ctx, storage, timers).await
 }
 
 /// The streaming tail the raw and join paths share.
-pub(super) async fn emit_dataframe(
+pub(super) async fn emit_plan(
     ctx: &mut dyn UdfContext,
-    df: DataFrame,
+    plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
     storage: &ResolvedScanStorage,
     timers: &mut diagnostics::PhaseTimers,
 ) -> Result<(), UdfError> {
     let secrets = storage.all_secret_values();
-    let stream = df
-        .execute_stream()
-        .await
+    let stream = datafusion::physical_plan::execute_stream(plan, task_ctx)
         .map_err(|e| classify_scan_error(e, &secrets))?;
     emit_stream(ctx, stream, &secrets, timers).await?;
     // Best-effort: a telemetry failure never fails an already-successful scan.

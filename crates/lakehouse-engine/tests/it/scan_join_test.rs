@@ -1,5 +1,6 @@
 use crate::scan_fixture;
 use crate::scan_fixture::WithFiles;
+use crate::scan_fixture::{block_on, file_url, total_rows};
 
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
@@ -29,24 +30,6 @@ use parquet::file::properties::WriterProperties;
 
 use crate::scan_plan_shape::sum_row_groups_pruned;
 
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
-}
-
-fn total_rows(batches: &[RecordBatch]) -> usize {
-    batches.iter().map(|b| b.num_rows()).sum()
-}
-
-fn file_url(path: &std::path::Path) -> String {
-    url::Url::from_file_path(path)
-        .expect("absolute path")
-        .to_string()
-}
-
 fn sized(url: String) -> (String, u64) {
     let len = std::fs::metadata(url.strip_prefix("file://").unwrap_or(&url))
         .map(|m| m.len())
@@ -64,8 +47,6 @@ fn write_orders(dir: &std::path::Path) -> (String, u64) {
         Field::new("o_totalprice", DataType::Float64, false).with_metadata(field_id_meta(3)),
     ]));
     let path = dir.join("orders.parquet");
-    let file = std::fs::File::create(&path).expect("create orders parquet");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let batch = RecordBatch::try_new(
         schema,
         vec![
@@ -77,9 +58,7 @@ fn write_orders(dir: &std::path::Path) -> (String, u64) {
         ],
     )
     .expect("orders batch");
-    writer.write(&batch).expect("write orders");
-    writer.close().expect("close orders");
-    sized(file_url(&path))
+    sized(scan_fixture::write_parquet(&path, &batch, None))
 }
 
 fn write_customer(dir: &std::path::Path) -> (String, u64) {
@@ -90,8 +69,6 @@ fn write_customer(dir: &std::path::Path) -> (String, u64) {
         Field::new("c_name", DataType::Utf8, false).with_metadata(field_id_meta(2)),
     ]));
     let path = dir.join("customer.parquet");
-    let file = std::fs::File::create(&path).expect("create customer parquet");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let batch = RecordBatch::try_new(
         schema,
         vec![
@@ -100,9 +77,7 @@ fn write_customer(dir: &std::path::Path) -> (String, u64) {
         ],
     )
     .expect("customer batch");
-    writer.write(&batch).expect("write customer");
-    writer.close().expect("close customer");
-    sized(file_url(&path))
+    sized(scan_fixture::write_parquet(&path, &batch, None))
 }
 
 /// Custkey 10's empty name is emitted as `""`, which Exasol receives as NULL.
@@ -112,8 +87,6 @@ fn write_customer_with_blank_names(dir: &std::path::Path) -> (String, u64) {
         Field::new("c_name", DataType::Utf8, false),
     ]));
     let path = dir.join("customer_blank_names.parquet");
-    let file = std::fs::File::create(&path).expect("create customer parquet");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let batch = RecordBatch::try_new(
         schema,
         vec![
@@ -122,9 +95,7 @@ fn write_customer_with_blank_names(dir: &std::path::Path) -> (String, u64) {
         ],
     )
     .expect("customer batch");
-    writer.write(&batch).expect("write customer");
-    writer.close().expect("close customer");
-    sized(file_url(&path))
+    sized(scan_fixture::write_parquet(&path, &batch, None))
 }
 
 /// The first two rows match no dimension row, so a pre-join `LIMIT 2` would emit zero rows.
@@ -135,8 +106,6 @@ fn write_orders_leading_unmatched(dir: &std::path::Path) -> (String, u64) {
         Field::new("o_totalprice", DataType::Float64, false),
     ]));
     let path = dir.join("orders_leading_unmatched.parquet");
-    let file = std::fs::File::create(&path).expect("create orders parquet");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let batch = RecordBatch::try_new(
         schema,
         vec![
@@ -146,9 +115,7 @@ fn write_orders_leading_unmatched(dir: &std::path::Path) -> (String, u64) {
         ],
     )
     .expect("orders batch");
-    writer.write(&batch).expect("write orders");
-    writer.close().expect("close orders");
-    sized(file_url(&path))
+    sized(scan_fixture::write_parquet(&path, &batch, None))
 }
 
 fn s3_backend(endpoint: &str, secret: &str) -> StorageBackend {
@@ -1039,12 +1006,7 @@ fn refusing_endpoint(message: &str) -> String {
 fn logical_field(field_id: i32, name: &str, arrow_type: &str) -> LogicalField {
     LogicalField {
         field_id: Some(field_id),
-        name: name.into(),
-        arrow_type: arrow_type.into(),
-        nullable: false,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
+        ..scan_fixture::logical_field(name, arrow_type)
     }
 }
 

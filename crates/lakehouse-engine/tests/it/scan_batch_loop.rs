@@ -4,6 +4,7 @@
 
 use crate::scan_fixture;
 use crate::scan_fixture::WithFiles;
+use crate::scan_fixture::{block_on, total_rows};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,7 +27,6 @@ use lakehouse_engine::scan::{
     ResolvedScanStorage, build_scan_runtime, read_scan_spec, run_raw_scan_with_session,
     run_scan_one, session_config_for_spec,
 };
-use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
 fn write_parquet_ids(dir: &std::path::Path, name: &str, start: i64, count: i64) -> String {
@@ -35,11 +35,9 @@ fn write_parquet_ids(dir: &std::path::Path, name: &str, start: i64, count: i64) 
         Field::new("name", DataType::Utf8, false),
     ]));
     let path = dir.join(name);
-    let file = std::fs::File::create(&path).expect("create parquet file");
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(8))
         .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
     let ids: Vec<i64> = (start..start + count).collect();
     let names: Vec<String> = ids.iter().map(|i| format!("row-{i}")).collect();
     let batch = RecordBatch::try_new(
@@ -50,11 +48,7 @@ fn write_parquet_ids(dir: &std::path::Path, name: &str, start: i64, count: i64) 
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, Some(props))
 }
 
 fn file_size(file_url: &str) -> u64 {
@@ -92,15 +86,9 @@ fn write_parquet_categories(dir: &std::path::Path, name: &str, values: &[&str]) 
         false,
     )]));
     let path = dir.join(name);
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values.to_vec()))])
         .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 fn write_parquet_tags(dir: &std::path::Path, name: &str) -> String {
@@ -115,18 +103,12 @@ fn write_parquet_tags(dir: &std::path::Path, name: &str) -> String {
         Field::new("tags", tags.data_type().clone(), true),
     ]));
     let path = dir.join(name);
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let batch = RecordBatch::try_new(
         schema,
         vec![Arc::new(Int64Array::from(vec![0i64])), Arc::new(tags)],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 fn nested_spec_for_file(file_url: String) -> ScanSpec {
@@ -134,23 +116,11 @@ fn nested_spec_for_file(file_url: String) -> ScanSpec {
     CommonScanSpec {
         projection: vec!["ID".into(), "TAGS".into()],
         logical_schema: vec![
+            scan_fixture::logical_field("id", "int64"),
             LogicalField {
-                field_id: None,
-                name: "id".to_string(),
-                arrow_type: "int64".to_string(),
-                nullable: false,
-                initial_default: None,
-                nested: None,
-                physical_name: None,
-            },
-            LogicalField {
-                field_id: None,
-                name: "tags".to_string(),
-                arrow_type: "utf8".to_string(),
                 nullable: true,
-                initial_default: None,
                 nested: Some(NestedMembers::List { element: None }),
-                physical_name: None,
+                ..scan_fixture::logical_field("tags", "utf8")
             },
         ],
         storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
@@ -202,18 +172,6 @@ fn local_session(
     Ok(SessionContext::new_with_config(session_config_for_spec(
         spec,
     )))
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
-}
-
-fn total_rows(batches: &[RecordBatch]) -> usize {
-    batches.iter().map(|b| b.num_rows()).sum()
 }
 
 fn ids_of(batches: &[RecordBatch]) -> Vec<i64> {

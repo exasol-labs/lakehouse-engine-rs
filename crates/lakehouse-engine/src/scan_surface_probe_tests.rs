@@ -8,9 +8,10 @@ use crate::scan::{
     reconstruct_abs_uri, register_files, run_join_scan_with_session, run_raw_scan_with_session,
 };
 
-const _FROM_BACKENDS: fn(
-    crate::scan::spec::StorageBackend,
-    Option<crate::scan::spec::StorageBackend>,
-) -> ResolvedScanStorage = ResolvedScanStorage::from_backends;
+const _RESOLVE_SCAN_STORAGE: fn(
+    &CommonScanSpec,
+    &dyn exasol_udf_sdk::context::UdfContext,
+) -> Result<ResolvedScanStorage, exasol_udf_sdk::error::UdfError> =
+    crate::scan::resolve_scan_storage;
 
 use crate::scan::build_partial_agg_sql;

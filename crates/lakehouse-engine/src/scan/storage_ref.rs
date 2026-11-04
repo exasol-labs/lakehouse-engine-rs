@@ -12,10 +12,6 @@ pub struct ResolvedScanStorage {
 }
 
 impl ResolvedScanStorage {
-    pub fn from_backends(primary: StorageBackend, join: Option<StorageBackend>) -> Self {
-        Self { primary, join }
-    }
-
     pub(crate) fn primary(&self) -> &StorageBackend {
         &self.primary
     }
@@ -33,7 +29,7 @@ impl ResolvedScanStorage {
     }
 }
 
-pub(crate) fn resolve_scan_storage(
+pub fn resolve_scan_storage(
     common: &CommonScanSpec,
     ctx: &dyn UdfContext,
 ) -> Result<ResolvedScanStorage, UdfError> {

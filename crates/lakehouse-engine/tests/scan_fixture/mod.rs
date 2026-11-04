@@ -1,22 +1,91 @@
-//! Fixtures shared by the engine's host test binaries: resolved scan storage, join specs, declared
-//! output columns, and a batch-capturing UDF context.
+//! Fixtures shared by the engine's host test binaries: a test runtime, file URLs, storage
+//! backends and their resolution, logical fields, join specs, declared output columns, and a
+//! batch-capturing UDF context.
 #![allow(dead_code)]
 
 pub mod concurrency_probe;
 
-use lakehouse_engine::scan::ResolvedScanStorage;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, JoinSpec, JoinType, ScanSpec, ScanStorage, StorageBackend,
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec, ScanStorage,
+    StorageBackend, StorageProps,
 };
+use lakehouse_engine::scan::{ResolvedScanStorage, resolve_scan_storage};
 
+pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build test runtime")
+        .block_on(future)
+}
+
+pub fn total_rows(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(|b| b.num_rows()).sum()
+}
+
+/// An inline S3 backend whose secret is distinctive, so redacting it never rewrites the rest of
+/// an error's text.
+pub fn dummy_storage() -> StorageBackend {
+    StorageBackend::S3(StorageProps {
+        endpoint: "http://localhost:9000".into(),
+        region: "us-east-1".into(),
+        access_key: "k".into(),
+        secret_key: "SECRETKEY".into(),
+        allow_http: true,
+        ..Default::default()
+    })
+}
+
+/// Writes `batch` as the Parquet file `path`, creating its parent directories, and returns its
+/// file URL.
+pub fn write_parquet(
+    path: &std::path::Path,
+    batch: &RecordBatch,
+    props: Option<parquet::file::properties::WriterProperties>,
+) -> String {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create parent dir");
+    }
+    let file = std::fs::File::create(path).expect("create parquet file");
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(file, batch.schema(), props).expect("arrow writer");
+    writer.write(batch).expect("write batch");
+    writer.close().expect("close writer");
+    file_url(path)
+}
+
+pub fn file_url(path: &std::path::Path) -> String {
+    url::Url::from_file_path(path)
+        .expect("absolute path")
+        .to_string()
+}
+
+/// A directory URL with the trailing slash a table root needs.
+pub fn dir_url(path: &std::path::Path) -> String {
+    let mut url = file_url(path);
+    if !url.ends_with('/') {
+        url.push('/');
+    }
+    url
+}
+
+/// The production resolution of a spec whose storage values are all inline.
 pub fn resolved_storage(spec: &ScanSpec) -> ResolvedScanStorage {
-    ResolvedScanStorage::from_backends(
-        inline_backend(&spec.common.storage),
-        spec.common
-            .join
-            .as_ref()
-            .map(|join| inline_backend(&join.storage)),
-    )
+    resolve_scan_storage(&spec.common, &exasol_udf_sdk::test_support::DefaultsCtx)
+        .expect("inline storage resolves without a CONNECTION")
+}
+
+/// A non-nullable logical field bound by its own name.
+pub fn logical_field(name: &str, arrow_type: &str) -> LogicalField {
+    LogicalField {
+        field_id: None,
+        name: name.to_string(),
+        arrow_type: arrow_type.to_string(),
+        nullable: false,
+        initial_default: None,
+        nested: None,
+        physical_name: None,
+    }
 }
 
 pub fn join_spec(storage: ScanStorage) -> JoinSpec {
@@ -33,13 +102,6 @@ pub fn join_spec(storage: ScanStorage) -> JoinSpec {
         post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
         storage,
-    }
-}
-
-fn inline_backend(storage: &ScanStorage) -> StorageBackend {
-    match storage {
-        ScanStorage::Inline(backend) => backend.clone(),
-        other => panic!("this fixture builds an inline storage value, not {other:?}"),
     }
 }
 

@@ -4,6 +4,7 @@
 
 use crate::scan_fixture;
 use crate::scan_fixture::WithFiles;
+use crate::scan_fixture::{block_on, dir_url, dummy_storage, total_rows};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ use exasol_udf_sdk::test_support::TestContext;
 use exasol_udf_sdk::value::ExaType;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, ScanSpec, ScanStorage, StorageBackend, StorageProps,
+    CommonScanSpec, FileEntry, LogicalField, ScanSpec, ScanStorage,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, run_raw_scan_with_session,
@@ -42,20 +43,6 @@ const HIVE_DEFAULT_FILE: &str =
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/unity/fixtures/basic_partitioned")
-}
-
-fn file_url(path: &Path) -> String {
-    Url::from_file_path(path)
-        .expect("absolute path")
-        .to_string()
-}
-
-fn dir_url(path: &Path) -> String {
-    let mut url = file_url(path);
-    if !url.ends_with('/') {
-        url.push('/');
-    }
-    url
 }
 
 fn file_size(path: &Path) -> u64 {
@@ -99,44 +86,18 @@ fn all_six_entries(dir: &Path) -> Vec<FileEntry> {
 fn basic_partitioned_logical_schema() -> Vec<LogicalField> {
     vec![
         LogicalField {
-            field_id: None,
-            name: "letter".into(),
-            arrow_type: "utf8".into(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("letter", "utf8")
         },
         LogicalField {
-            field_id: None,
-            name: "number".into(),
-            arrow_type: "int64".into(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("number", "int64")
         },
         LogicalField {
-            field_id: None,
-            name: "a_float".into(),
-            arrow_type: "float64".into(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("a_float", "float64")
         },
     ]
-}
-
-fn dummy_storage() -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: "http://localhost:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "k".into(),
-        secret_key: "SECRETKEY".into(),
-        allow_http: true,
-        ..Default::default()
-    })
 }
 
 fn basic_partitioned_spec(
@@ -156,14 +117,6 @@ fn basic_partitioned_spec(
         ..Default::default()
     }
     .with_files(files)
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build test runtime")
-        .block_on(future)
 }
 
 async fn try_run_scan_with_store(
@@ -201,10 +154,6 @@ fn run_scan(spec: &ScanSpec, register_url: &str, emits: &[ExaType]) -> Vec<Recor
 
 fn letter_number_float_emits() -> Vec<ExaType> {
     vec![scan_fixture::varchar(), ExaType::Int64, ExaType::Double]
-}
-
-fn total_rows(batches: &[RecordBatch]) -> usize {
-    batches.iter().map(|b| b.num_rows()).sum()
 }
 
 fn letter_number_rows(batches: &[RecordBatch]) -> Vec<(Option<String>, i64)> {
@@ -301,13 +250,8 @@ fn absent_and_empty_partition_values_materialize_null() {
 fn logical_schema_with_flag() -> Vec<LogicalField> {
     let mut fields = basic_partitioned_logical_schema();
     fields.push(LogicalField {
-        field_id: None,
-        name: "flag".into(),
-        arrow_type: "int32".into(),
         nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
+        ..scan_fixture::logical_field("flag", "int32")
     });
     fields
 }
@@ -418,22 +362,12 @@ fn write_parquet_with_physical_letter(
 fn one_off_logical_schema() -> Vec<LogicalField> {
     vec![
         LogicalField {
-            field_id: None,
-            name: "letter".into(),
-            arrow_type: "utf8".into(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("letter", "utf8")
         },
         LogicalField {
-            field_id: None,
-            name: "number".into(),
-            arrow_type: "int64".into(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("number", "int64")
         },
     ]
 }
@@ -589,22 +523,12 @@ fn leaf_file_scan_config(
 fn unpartitioned_logical_schema() -> Vec<LogicalField> {
     vec![
         LogicalField {
-            field_id: None,
-            name: "number".into(),
-            arrow_type: "int64".into(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("number", "int64")
         },
         LogicalField {
-            field_id: None,
-            name: "a_float".into(),
-            arrow_type: "float64".into(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("a_float", "float64")
         },
     ]
 }
