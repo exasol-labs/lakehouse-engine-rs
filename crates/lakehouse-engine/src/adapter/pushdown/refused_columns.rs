@@ -28,7 +28,7 @@ pub(super) fn ensure_no_refused_column_referenced(
     collect_all_column_names(request, &mut touched);
     if let Some(projection) = emitted_projection {
         touched.extend(projection.iter().filter_map(|item| match item {
-            ProjectionItem::Column(name) => Some(name.to_uppercase()),
+            ProjectionItem::Column(column) => Some(column.name.to_uppercase()),
             ProjectionItem::Expr { .. } => None,
         }));
     }

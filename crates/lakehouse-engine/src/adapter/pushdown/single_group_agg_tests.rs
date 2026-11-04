@@ -23,11 +23,11 @@ fn distinct_of(item: &SingleGroupItem) -> &DistinctCount {
     }
 }
 
-fn length_expr(col: &str) -> serde_json::Value {
+fn length_expr(column: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar",
         "name": "LENGTH",
-        "arguments": [{"type": "column", "name": col}],
+        "arguments": [col(column)],
     })
 }
 
@@ -37,8 +37,8 @@ fn mult_expr(a: &str, b: &str) -> serde_json::Value {
         "type": "function_scalar",
         "name": "MULT",
         "arguments": [
-            {"type": "column", "name": a},
-            {"type": "column", "name": b},
+            col(a),
+            col(b),
         ],
     })
 }
@@ -47,7 +47,7 @@ fn round_expr(inner: serde_json::Value, digits: i64) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar",
         "name": "ROUND",
-        "arguments": [inner, {"type": "literal_exactnumeric", "value": digits}],
+        "arguments": [inner, num_lit(digits)],
     })
 }
 
@@ -129,7 +129,7 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
             "name": "MULT",
             "arguments": [
                 agg_item("SUM", Some("L_QUANTITY"), false),
-                {"type": "column", "name": "L_QUANTITY"},
+                col("L_QUANTITY"),
             ],
         })],
         "selectListDataTypes": [decimal_type(36, 2)],
@@ -315,7 +315,7 @@ fn detect_sum_min_max_avg_produce_correct_plans() {
 fn detect_aggregates_falls_back_on_group_by() {
     let req = serde_json::json!({
         "selectList": [agg_item("SUM", Some("amount"), false)],
-        "groupBy": [{"type": "column", "name": "region"}],
+        "groupBy": [col("region")],
     });
     assert!(
         detect_aggregates(&req).is_none(),
@@ -352,7 +352,7 @@ fn detect_aggregates_falls_back_on_unsupported_function() {
 fn detect_aggregates_falls_back_on_column_select() {
     let req = serde_json::json!({
         "selectList": [
-            {"type": "column", "name": "region"},
+            col("region"),
         ]
     });
     assert!(
@@ -514,7 +514,7 @@ fn unrenderable_agg_arg_falls_back_to_row_scan() {
     let unknown = serde_json::json!({
         "type": "function_scalar",
         "name": "TOTALLY_UNKNOWN_FN",
-        "arguments": [{"type": "column", "name": "id"}],
+        "arguments": [col("id")],
     });
     for name in &["SUM", "MIN", "MAX", "AVG", "COUNT"] {
         let req = serde_json::json!({

@@ -2,42 +2,68 @@
 //! against a lowercase hex literal can therefore compare the raw bytes with a binary literal,
 //! which Parquet statistics prune and which returns the same rows.
 
-use std::collections::HashMap;
-
 use arrow::datatypes::DataType;
 use serde_json::{Value as Json, json};
+use vs_expression::ColumnNode;
 
-use super::format::filter_json::{Comparison, column_name};
+use super::format::filter_json::Comparison;
+use super::support::{binds_column, column_node_ref};
 use crate::scan::raw_bytes_alias;
-use crate::scan::spec::LogicalField;
+use crate::scan::spec::{ColumnRef, LogicalField};
 use crate::types::mapping::arrow_type_from_tag;
 
-/// Keyed by uppercase column name; a fixed-length column carries its byte width.
+/// Keyed by (relation alias, uppercase column), bound like the column-type universe; a
+/// fixed-length column carries its byte width.
 #[derive(Debug, Default)]
-pub(crate) struct BinaryColumns(HashMap<String, Option<i32>>);
+pub(crate) struct BinaryColumns(Vec<(ColumnRef, Option<i32>)>);
 
 impl BinaryColumns {
     /// Under `binary_as_string` a variable-length column reads as text, so its filters stay text.
     pub(crate) fn of(logical_schema: &[LogicalField], binary_as_string: bool) -> Self {
+        Self(Self::widths(logical_schema, binary_as_string).collect())
+    }
+
+    /// `relations` in leg order, each keyed by its own alias, so a column name two join legs
+    /// share is binary only on the leg whose schema makes it so.
+    pub(crate) fn per_relation<'a>(
+        relations: impl IntoIterator<Item = (String, &'a [LogicalField])>,
+        binary_as_string: bool,
+    ) -> Self {
         Self(
-            logical_schema
-                .iter()
-                .filter_map(|field| {
-                    let width = match arrow_type_from_tag(&field.arrow_type) {
-                        DataType::Binary if !binary_as_string => None,
-                        DataType::FixedSizeBinary(width) => Some(width),
-                        _ => return None,
-                    };
-                    Some((field.name.to_uppercase(), width))
+            relations
+                .into_iter()
+                .flat_map(|(relation, schema)| {
+                    Self::widths(schema, binary_as_string).map(move |(column, width)| {
+                        (ColumnRef::qualified(relation.clone(), column.name), width)
+                    })
                 })
                 .collect(),
         )
     }
 
-    fn resolve(&self, node: &Json) -> Option<(String, Option<i32>)> {
-        let name = column_name(node)?.to_uppercase();
-        let width = *self.0.get(&name)?;
-        Some((name, width))
+    fn widths(
+        logical_schema: &[LogicalField],
+        binary_as_string: bool,
+    ) -> impl Iterator<Item = (ColumnRef, Option<i32>)> + '_ {
+        logical_schema.iter().filter_map(move |field| {
+            let width = match arrow_type_from_tag(&field.arrow_type) {
+                DataType::Binary if !binary_as_string => None,
+                DataType::FixedSizeBinary(width) => Some(width),
+                _ => return None,
+            };
+            Some((ColumnRef::from(field.name.to_uppercase()), width))
+        })
+    }
+
+    /// The node's own (relation alias, column) pair, so the raw-bytes column it becomes stays
+    /// on the node's relation.
+    fn resolve(&self, node: &Json) -> Option<(ColumnRef, Option<i32>)> {
+        let column = column_node_ref(node)?;
+        let (_, width) = self
+            .0
+            .iter()
+            .find(|(entry, _)| binds_column(entry, &column))?;
+        Some((column, *width))
     }
 }
 
@@ -117,8 +143,9 @@ fn byte_comparison(node: &Json, columns: &BinaryColumns) -> Option<Json> {
     }
 }
 
-fn raw_bytes(column: &str) -> Json {
-    json!({"type": "column", "name": raw_bytes_alias(column)})
+fn raw_bytes(column: &ColumnRef) -> Json {
+    let name = raw_bytes_alias(&column.name);
+    ColumnNode::to_json(&name, None, column.relation.as_deref())
 }
 
 /// Only lowercase hex of whole bytes names a byte string: Exasol compares text case-sensitively,

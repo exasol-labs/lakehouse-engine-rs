@@ -7,8 +7,7 @@ Extends the unified unaccelerated join fallback (`pushdown-joins/pushdown-planni
 * A `column` node carries the per-occurrence alias under `tableAlias`, and a FROM-tree leaf carries it under `alias`. The adapter matches (`tableName`, `tableAlias`) against the leaves' (`name`, `alias`) pairs, comparing the alias verbatim.
 * The pair identifies exactly one leg. SQL forbids two occurrences of a table with the same alias and allows at most one occurrence without an alias. An absent alias is part of the key.
 * A `tableName` that names exactly one leg resolves by name alone, because Exasol stamps no `tableAlias` on an unaliased FROM clause.
-* One binding, derived from the detected join's leaves, is the only resolver of column-to-leg attribution. Expression rendering, leg-local WHERE attribution, join-condition attachment, and per-leg projection narrowing all use it.
-* A leg that no clause references is still scanned.
+* One binding, derived from the detected join's leaves, is the only resolver of column-to-leg attribution. Expression rendering, leg-local WHERE attribution, join-condition attachment, per-leg projection narrowing, and the broadcast join's per-occurrence relation aliases (`pushdown-joins/pushdown-planning-join`) all use it.
 * A column reference that matches no leg key is a hard client error, because rendering it against an arbitrary leg returns wrong rows.
 
 ## Scenarios
@@ -25,7 +24,7 @@ Extends the unified unaccelerated join fallback (`pushdown-joins/pushdown-planni
 * *AND* leg resolution SHALL come from ONE binding derived from the detected join's leaves and consulted by EVERY attribution decision, expression rendering, leg-local WHERE attribution, join-condition attachment, and per-leg projection narrowing alike, so no two decisions can disagree about which leg a column belongs to, and no call site SHALL re-derive leg identity from `tableName`
 * *AND* the (`tableName`, `alias`) pair SHALL be treated as identifying exactly one leg, which SQL guarantees: two occurrences of one table cannot share an alias, and at most one occurrence can carry no alias
 * *AND* a leg no clause of the request references SHALL still be scanned, so a self-join written with a condition over one occurrence only stays the cross product SQL means rather than becoming an error
-* *AND* the request MUST NOT reach the broadcast path, because a table joined to itself declares an identical column set on both sides and the disjoint-column-name guard already declines it here
+* *AND* a two-leg self-join SHALL reach this fallback only when it fails the broadcast contract, for example when the table is above the broadcast threshold, because the broadcast path serves a self-join that meets it (`pushdown-joins/pushdown-planning-join`)
 * *AND* the returned result SHALL equal, as an order-independent multiset, the result of the same self-join evaluated on a single node, for a primitive column and for a nested column rendered as JSON alike
 
 ### Scenario: One occurrence of a self-joined table carries no alias
@@ -68,12 +67,9 @@ Extends the unified unaccelerated join fallback (`pushdown-joins/pushdown-planni
 * *AND* this state SHALL be UNREACHABLE for a well-formed request, because a table joined to itself is only legal SQL with distinct occurrences, and Exasol stamps each occurrence's alias on every `column` node of an aliased FROM clause, including columns written unqualified
 * *AND* a `column` node whose `tableName` names EXACTLY ONE leg SHALL resolve by name alone and SHALL NOT consult its alias, because Exasol stamps no `tableAlias` at all on an unaliased FROM clause, so a request in which no table occurs twice needs no alias to resolve
 
-### Scenario: Shared-column-name join uses qualified rendering, not bare-name broadcast rendering
+### Scenario: A shared-column-name join on the fallback renders each column qualified by its leg
 
-* *GIVEN* an inner equi-join `pushdown` request over two legs that share a column name, two different tables that both carry an `id` column, or the SAME table joined to itself, which shares every column name
+* *GIVEN* an inner join `pushdown` request that the unified unaccelerated fallback serves, over legs that share a column name: two different tables that both carry an `id` column, or the SAME table joined to itself
 * *WHEN* the adapter builds the unified unaccelerated fallback SQL
 * *THEN* the adapter SHALL render the join condition, WHERE filter, select list, GROUP BY, HAVING, and ORDER BY with table-qualified references resolved to each `column` node's own LEG, never against a combined bare-name schema
-* *AND* the disjoint-column-name guard SHALL gate broadcast eligibility only, NOT the unified fallback's rendering path
-* *AND* a disjoint-guard failure SHALL be treated as a plain reason the broadcast path is unavailable, not as an error, so the request falls through to the qualified unified fallback SQL instead of a hard `Err`
-* *AND* a table joined to itself SHALL therefore always take the unified fallback, because its legs declare an identical column set and the guard cannot pass, and NO separate same-table broadcast guard SHALL be added, so that decision keeps its one owner
-* *AND* the returned result SHALL equal the result of the same inner equi-join evaluated on a single node
+* *AND* the returned result SHALL equal the result of the same inner join evaluated on a single node

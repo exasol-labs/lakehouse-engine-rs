@@ -6,7 +6,7 @@ use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::sharding::group_count;
 use crate::scan::sealed::{SealedStorageKey, seal_storage};
 use crate::scan::spec::{
-    AggregatePlan, CommonScanSpec, FileEntry, ProjectionItem, ScanSpec, ScanStorage,
+    AggregatePlan, ColumnRef, CommonScanSpec, FileEntry, ProjectionItem, ScanSpec, ScanStorage,
     StorageBackend, render_order_by_clause,
 };
 use crate::types::mapping::{
@@ -14,7 +14,7 @@ use crate::types::mapping::{
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-use vs_expression::{render_df_filter_safe, render_expression_safe};
+use vs_expression::{ColumnNode, render_df_filter_safe, render_expression_safe, walk_column_nodes};
 
 use super::binary_filter::{BinaryColumns, compare_binary_bytes};
 
@@ -116,7 +116,7 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
 /// never its rendered SQL, so repeated literals cannot collide.
 pub(super) fn emits_ident(item: &ProjectionItem, index: usize) -> String {
     match item {
-        ProjectionItem::Column(name) => quote_ident(name),
+        ProjectionItem::Column(column) => quote_ident(&column.output_name()),
         ProjectionItem::Expr { .. } => quote_ident(&format!("_LH_PROJ_{index}")),
     }
 }
@@ -234,7 +234,7 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
         )
     };
     let value_type = col_type_for(Some(col), None, col_types, None);
-    let proj_item = ProjectionItem::Column(col.to_string());
+    let proj_item = ProjectionItem::from(col);
     let arg_sql = quote_ident(col);
     let null_pred = format!("({arg_sql} IS NOT NULL)");
     let filter = match base_spec.common.filter.as_deref() {
@@ -345,23 +345,6 @@ pub(super) fn involved_columns<'r>(
     }
 }
 
-/// Exasol stamps every column with the query's `tableAlias`, but every scan is a
-/// single relation with bare column names, so an alias-qualified reference does not
-/// resolve. Must run after join attribution, which identifies legs by the
-/// (`tableName`, `tableAlias`) pair (#193).
-pub(super) fn strip_table_alias(expr: &Json) -> Json {
-    match expr {
-        Json::Object(map) => Json::Object(
-            map.iter()
-                .filter(|(key, _)| key.as_str() != "tableAlias")
-                .map(|(key, value)| (key.clone(), strip_table_alias(value)))
-                .collect(),
-        ),
-        Json::Array(items) => Json::Array(items.iter().map(strip_table_alias).collect()),
-        other => other.clone(),
-    }
-}
-
 /// `false` means the caller must self-apply the predicate in its own SQL, never
 /// omit it: Exasol has no fallback for a delegated capability.
 pub(super) fn datafusion_renderable(expr: &Json) -> bool {
@@ -411,7 +394,7 @@ fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Option<Json>) -> Option<
 ///
 /// The DATE cast matches Exasol only under the default `NLS_DATE_FORMAT`; an altered
 /// session format is a tracked exception (#216, decision-log [8]).
-fn like_subject_type_guard(filter: &Json, col_types: &[(String, String)]) -> Option<Json> {
+fn like_subject_type_guard(filter: &Json, col_types: &ColumnTypes) -> Option<Json> {
     rewrite_expr_tree(
         filter,
         &|out: &Json| match out.get("type").and_then(|t| t.as_str()) {
@@ -421,26 +404,77 @@ fn like_subject_type_guard(filter: &Json, col_types: &[(String, String)]) -> Opt
     )
 }
 
-/// Folds with the same full-Unicode `to_uppercase` the `col_types` builders use.
-/// Deliberately does not test the node's `type`: callers treat a non-column node as
-/// a pass-through but an unresolved type as a decline.
-fn column_exa_type<'t>(node: &Json, col_types: &'t [(String, String)]) -> Option<&'t str> {
-    let name = node.get("name").and_then(|n| n.as_str())?.to_uppercase();
-    col_types
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, t)| t.as_str())
+/// The (relation alias, column) pair a `column` node names.
+pub(super) fn column_node_ref(node: &Json) -> Option<ColumnRef> {
+    let column = ColumnNode::parse(node)?;
+    Some(ColumnRef {
+        relation: column.table_alias.map(str::to_string),
+        name: column.upper_name(),
+    })
 }
 
-fn guard_like_subject(like_node: &Json, col_types: &[(String, String)]) -> Option<Json> {
-    let subject = like_node.get("expression");
+/// An entry with a relation alias binds only its own relation's column, so a column name two
+/// join legs share never binds the other leg's column. One without binds by name alone.
+pub(super) fn binds_column(entry: &ColumnRef, column: &ColumnRef) -> bool {
+    entry.name == column.name && (entry.relation.is_none() || entry.relation == column.relation)
+}
 
-    let is_bare_column =
-        subject.and_then(|s| s.get("type")).and_then(|t| t.as_str()) == Some("column");
-    if !is_bare_column {
-        return Some(like_node.clone());
+/// The column types a request's `column` nodes resolve against, one entry per (relation alias,
+/// column) pair, matched through [`binds_column`].
+///
+/// A broadcast join qualifies every entry with its leg's alias. A single-table scan and an
+/// N-scan leg each read one relation, so their entries stay unqualified and keep the bare-name
+/// lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ColumnTypes(Vec<(ColumnRef, String)>);
+
+impl ColumnTypes {
+    pub(super) fn unqualified(columns: &[(String, String)]) -> Self {
+        Self(
+            columns
+                .iter()
+                .map(|(name, exa_type)| (ColumnRef::from(name.as_str()), exa_type.clone()))
+                .collect(),
+        )
     }
-    let subject = subject.expect("is_bare_column implies expression is present");
+
+    /// `relations` in leg order, so the full row lists each leg's columns in turn.
+    pub(super) fn per_relation(relations: Vec<(String, Vec<(String, String)>)>) -> Self {
+        Self(
+            relations
+                .into_iter()
+                .flat_map(|(relation, columns)| {
+                    columns.into_iter().map(move |(name, exa_type)| {
+                        (ColumnRef::qualified(relation.clone(), name), exa_type)
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn resolve(&self, node: &Json) -> Option<&(ColumnRef, String)> {
+        let column = column_node_ref(node)?;
+        self.0
+            .iter()
+            .find(|(entry, _)| binds_column(entry, &column))
+    }
+}
+
+/// Deliberately does not test the node's `type`: callers treat a non-column node as a
+/// pass-through but an unresolved type as a decline.
+fn column_exa_type<'t>(node: &Json, col_types: &'t ColumnTypes) -> Option<&'t str> {
+    col_types
+        .resolve(node)
+        .map(|(_, exa_type)| exa_type.as_str())
+}
+
+fn guard_like_subject(like_node: &Json, col_types: &ColumnTypes) -> Option<Json> {
+    let Some(subject) = like_node
+        .get("expression")
+        .filter(|subject| ColumnNode::parse(subject).is_some())
+    else {
+        return Some(like_node.clone());
+    };
 
     match column_exa_type(subject, col_types).map(classify_exa_type) {
         Some(ExaTypeClass::Character) => Some(like_node.clone()),
@@ -465,7 +499,7 @@ fn guard_like_subject(like_node: &Json, col_types: &[(String, String)]) -> Optio
 /// exception in the spec).
 ///
 /// The closure never declines, so the `unwrap_or_else` fallback is unreachable.
-fn rewrite_decimal_stringifications(node: &Json, col_types: &[(String, String)]) -> Json {
+fn rewrite_decimal_stringifications(node: &Json, col_types: &ColumnTypes) -> Json {
     rewrite_expr_tree(node, &|out: &Json| {
         let node_type = out.get("type").and_then(|t| t.as_str()).unwrap_or("");
         Some(match node_type {
@@ -517,7 +551,7 @@ fn rewrite_decimal_stringifications(node: &Json, col_types: &[(String, String)])
 }
 
 /// Integer columns arrive as `DECIMAL(p,0)`; the trim is a no-op on them.
-fn is_bare_decimal_column(node: &Json, col_types: &[(String, String)]) -> bool {
+fn is_bare_decimal_column(node: &Json, col_types: &ColumnTypes) -> bool {
     if node.get("type").and_then(|t| t.as_str()) != Some("column") {
         return false;
     }
@@ -581,7 +615,7 @@ fn string_position_args(fn_name: &str, arg_count: usize) -> StringPositionArgs {
 /// DataFusion fails at plan time (#210). A decline propagates to the whole tree and
 /// must be self-applied by the caller. Must run before
 /// [`rewrite_decimal_stringifications`] so a coerced argument is not double-wrapped.
-fn string_function_arg_type_guard(node: &Json, col_types: &[(String, String)]) -> Option<Json> {
+fn string_function_arg_type_guard(node: &Json, col_types: &ColumnTypes) -> Option<Json> {
     rewrite_expr_tree(node, &|out: &Json| {
         if out.get("type").and_then(|t| t.as_str()) != Some("function_scalar") {
             return Some(out.clone());
@@ -609,7 +643,7 @@ fn string_function_arg_type_guard(node: &Json, col_types: &[(String, String)]) -
 
 /// A non-`column` argument is returned unchanged: its type is unresolvable, a tracked
 /// exception (#223) that must not decline.
-fn coerce_string_position_arg(arg: &Json, col_types: &[(String, String)]) -> Option<Json> {
+fn coerce_string_position_arg(arg: &Json, col_types: &ColumnTypes) -> Option<Json> {
     if arg.get("type").and_then(|t| t.as_str()) != Some("column") {
         return Some(arg.clone());
     }
@@ -625,7 +659,7 @@ fn coerce_string_position_arg(arg: &Json, col_types: &[(String, String)]) -> Opt
 
 /// Order matters: the string-function guard must precede the decimal rewrite so a
 /// coerced argument is not double-wrapped. `None` means a guard declined.
-pub(super) fn apply_type_rewrites(expr: &Json, col_types: &[(String, String)]) -> Option<Json> {
+pub(super) fn apply_type_rewrites(expr: &Json, col_types: &ColumnTypes) -> Option<Json> {
     let expr = like_subject_type_guard(expr, col_types)?;
     let expr = string_function_arg_type_guard(&expr, col_types)?;
     let expr = rewrite_overprecise_timestamp_comparisons(&expr, col_types)?;
@@ -634,17 +668,14 @@ pub(super) fn apply_type_rewrites(expr: &Json, col_types: &[(String, String)]) -
 
 /// DataFusion truncates a timestamp literal to its column's unit, while Exasol compares at full
 /// precision (#461). Workaround for apache/datafusion#22142, fixed by apache/datafusion#22906.
-fn rewrite_overprecise_timestamp_comparisons(
-    node: &Json,
-    col_types: &[(String, String)],
-) -> Option<Json> {
+fn rewrite_overprecise_timestamp_comparisons(node: &Json, col_types: &ColumnTypes) -> Option<Json> {
     rewrite_expr_tree(node, &|out: &Json| {
         Some(rewrite_timestamp_comparison(out, col_types).unwrap_or_else(|| out.clone()))
     })
 }
 
 /// `None` leaves the node unchanged.
-fn rewrite_timestamp_comparison(node: &Json, col_types: &[(String, String)]) -> Option<Json> {
+fn rewrite_timestamp_comparison(node: &Json, col_types: &ColumnTypes) -> Option<Json> {
     let compare = |op: &str, column: &Json, literal: &Json| {
         let node = serde_json::json!({"type": op, "left": column, "right": literal});
         rewrite_timestamp_comparison(&node, col_types).unwrap_or(node)
@@ -703,11 +734,7 @@ fn rewrite_timestamp_comparison(node: &Json, col_types: &[(String, String)]) -> 
 }
 
 /// `None` when the literal fits the column's declared precision.
-fn timestamp_literal_floor(
-    column: &Json,
-    literal: &Json,
-    col_types: &[(String, String)],
-) -> Option<Json> {
+fn timestamp_literal_floor(column: &Json, literal: &Json, col_types: &ColumnTypes) -> Option<Json> {
     let is = |node: &Json, kind: &str| node.get("type").and_then(|t| t.as_str()) == Some(kind);
     if !is(column, "column") || !is(literal, "literal_timestamp") {
         return None;
@@ -757,7 +784,7 @@ fn contains_aggregate_node(node: &Json) -> bool {
 /// raw tree would let an unrenderable tree be silently dropped, returning wrong rows.
 pub(super) fn type_accepted_rewrite(
     expr: &Json,
-    col_types: &[(String, String)],
+    col_types: &ColumnTypes,
     binary_columns: &BinaryColumns,
 ) -> Option<Json> {
     apply_type_rewrites(expr, col_types)
@@ -770,7 +797,7 @@ pub(super) fn type_accepted_rewrite(
 /// DataFusion dialect only.
 pub(super) fn classify_where_filter<'a>(
     filter_json_raw: Option<&'a Json>,
-    col_types: &[(String, String)],
+    col_types: &ColumnTypes,
     binary_columns: &BinaryColumns,
 ) -> (Option<String>, Option<&'a Json>) {
     let accepted = |filter: &Json| type_accepted_rewrite(filter, col_types, binary_columns);
@@ -788,7 +815,7 @@ pub(super) fn extract_projection(
 ) -> Result<(Vec<ProjectionItem>, Vec<String>, bool), UdfError> {
     project_columns(
         pushdown_req,
-        involved_columns(request, |tables| tables.first()).types,
+        &ColumnTypes::unqualified(&involved_columns(request, |tables| tables.first()).types),
     )
 }
 
@@ -797,52 +824,40 @@ fn is_valid_emits_output_type(ty: &str) -> bool {
     ty != "TIMESTAMP WITH LOCAL TIME ZONE"
 }
 
-/// `all_cols` is the column universe: the first involved table, or the union of both
-/// tables for a broadcast join.
+/// `all_cols` is the column universe: the first involved table, or both legs of a broadcast
+/// join, each column qualified by its leg's alias.
 ///
 /// The widening flag is returned rather than re-derived downstream by comparing
 /// arities, which coincide when the table width equals the select-list arity
 /// (#196). A missing or empty select list is not a widening.
 pub(super) fn project_columns(
     pushdown_req: &Json,
-    all_cols: Vec<(String, String)>,
+    all_cols: &ColumnTypes,
 ) -> Result<(Vec<ProjectionItem>, Vec<String>, bool), UdfError> {
-    if all_cols.is_empty() {
+    let Some((first_col, first_type)) = all_cols.0.first() else {
         return Err(UdfError::User(
             "pushdown request has no column metadata".into(),
         ));
-    }
-
-    let type_by_upper = |name: &str| -> String {
-        all_cols
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, t)| t.clone())
-            .unwrap_or_else(|| "VARCHAR(2000000)".to_string())
     };
-
-    let first_col_name = all_cols.first().map(|(n, _)| n.clone()).unwrap_or_default();
 
     let full_row = || -> (Vec<ProjectionItem>, Vec<String>) {
-        let names = all_cols
+        all_cols
+            .0
             .iter()
-            .map(|(n, _)| ProjectionItem::Column(n.clone()))
-            .collect();
-        let types = all_cols.iter().map(|(_, t)| t.clone()).collect();
-        (names, types)
+            .map(|(column, exa_type)| (ProjectionItem::Column(column.clone()), exa_type.clone()))
+            .unzip()
     };
 
-    // Repeating `first_col_name` for an unprojectable item would duplicate EMITS
+    // Repeating `first_col` for an unprojectable item would duplicate EMITS
     // names, so the whole projection widens to the full row instead.
     let mut needs_full_fallback = false;
     let select_list = pushdown_req.get("selectList");
     let (proj_names, proj_types): (Vec<ProjectionItem>, Vec<String>) = match select_list {
         None | Some(Json::Null) => full_row(),
-        Some(Json::Array(list)) if list.is_empty() => {
-            let name = first_col_name;
-            let ty = type_by_upper(&name);
-            (vec![ProjectionItem::Column(name)], vec![ty])
-        }
+        Some(Json::Array(list)) if list.is_empty() => (
+            vec![ProjectionItem::Column(first_col.clone())],
+            vec![first_type.clone()],
+        ),
         Some(Json::Array(list)) => {
             let mut names = Vec::with_capacity(list.len());
             let mut types = Vec::with_capacity(list.len());
@@ -855,7 +870,7 @@ pub(super) fn project_columns(
                     needs_full_fallback = true;
                     continue;
                 }
-                let Some(e) = apply_type_rewrites(e, &all_cols) else {
+                let Some(e) = apply_type_rewrites(e, all_cols) else {
                     needs_full_fallback = true;
                     continue;
                 };
@@ -863,13 +878,14 @@ pub(super) fn project_columns(
                 let item_type = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match item_type {
                     "column" => {
-                        let name = e
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .map(|s| s.to_uppercase())
-                            .unwrap_or_else(|| first_col_name.clone());
-                        let ty = type_by_upper(&name);
-                        names.push(ProjectionItem::Column(name));
+                        let (column, ty) = match (all_cols.resolve(e), column_node_ref(e)) {
+                            (Some((column, exa_type)), _) => (column.clone(), exa_type.clone()),
+                            (None, Some(named)) => {
+                                (ColumnRef::from(named.name), "VARCHAR(2000000)".to_string())
+                            }
+                            (None, None) => (first_col.clone(), first_type.clone()),
+                        };
+                        names.push(ProjectionItem::Column(column));
                         types.push(ty);
                     }
                     t if is_literal_selectlist_item(t) => {
@@ -941,39 +957,12 @@ pub(super) fn project_columns(
     Ok((proj_names, proj_types, needs_full_fallback))
 }
 
-/// Blind descent (every field) is safe because a collect rebuilds nothing; do not
-/// merge with the curated rewrite primitive, which must not enter `dataType`/`name`.
-///
-/// Case folding is left to callers on purpose: the join collectors fold ASCII-only
-/// while `collect_all_column_names` folds Unicode (`ß` → `SS`), pinned by
-/// `column_collectors_keep_divergent_case_folding`.
-pub(super) fn walk_column_nodes(expr: &Json, f: &mut impl FnMut(&serde_json::Map<String, Json>)) {
-    match expr {
-        Json::Object(map) => {
-            if map.get("type").and_then(|t| t.as_str()) == Some("column") {
-                f(map);
-            }
-            for v in map.values() {
-                walk_column_nodes(v, &mut *f);
-            }
-        }
-        Json::Array(items) => {
-            for item in items {
-                walk_column_nodes(item, &mut *f);
-            }
-        }
-        _ => {}
-    }
-}
-
 pub(super) fn collect_all_column_names(
     value: &Json,
     names: &mut std::collections::HashSet<String>,
 ) {
-    walk_column_nodes(value, &mut |map| {
-        if let Some(name) = map.get("name").and_then(|n| n.as_str()) {
-            names.insert(name.to_uppercase());
-        }
+    walk_column_nodes(value, &mut |column| {
+        names.insert(column.upper_name());
     });
 }
 

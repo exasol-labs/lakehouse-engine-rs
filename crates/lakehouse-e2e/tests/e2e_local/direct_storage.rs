@@ -849,7 +849,7 @@ fn stats_batch(file: i64) -> RecordBatch {
     .expect("stats batch construction is infallible")
 }
 
-/// Broadcast-join dimension for `STATS`, its column names disjoint from the fact table's.
+/// Broadcast-join dimension for `STATS`: one small file, so it is the broadcast side.
 fn stats_dim_batch() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("DK", DataType::Int64, false),

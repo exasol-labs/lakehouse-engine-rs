@@ -344,14 +344,14 @@ pub(super) async fn build_scan_sql(
         schema
             .fields()
             .iter()
-            .map(|f| ProjectionItem::Column(f.name().to_uppercase()))
+            .map(|f| ProjectionItem::from(f.name().to_uppercase()))
             .collect()
     } else {
         spec.common.projection.clone()
     };
 
-    let select_clause = render_projection(&proj_items, |name| {
-        let lower = name.to_lowercase();
+    let select_clause = render_projection(&proj_items, |column| {
+        let lower = column.name.to_lowercase();
         schema
             .fields()
             .iter()

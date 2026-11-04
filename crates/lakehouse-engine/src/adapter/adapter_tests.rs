@@ -4,6 +4,7 @@ use crate::adapter::properties::{
     PROP_INSTANCE_OVERHEAD_MB, PROP_JOIN_BROADCAST_MAX_BYTES, PROP_MEMORY_POOL_FRACTION,
     PROP_PARALLELISM_FACTOR, PROP_S3_MAX_CONNECTIONS,
 };
+use crate::adapter::pushdown::test_support::{customer_orders_join, table_col};
 use crate::adapter::pushdown::test_support::{named_table, with_identifier_notes};
 use exasol_udf_sdk::test_support::{DefaultsCtx, TestContext};
 use lakehouse_catalog::{CatalogTableIdent, SkipReason, TableFormat};
@@ -1454,20 +1455,10 @@ fn role_join_pushdown_request() -> Json {
         ],
         "pushdownRequest": {
             "type": "select",
-            "from": {
-                "type": "join",
-                "join_type": "inner",
-                "left": {"name": "CUSTOMER", "type": "table"},
-                "right": {"name": "ORDERS", "type": "table"},
-                "condition": {
-                    "type": "predicate_equal",
-                    "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-                    "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
-                },
-            },
+            "from": customer_orders_join(),
             "selectList": [
-                {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-                {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+                table_col("CUSTOMER", "C_CUSTKEY"),
+                table_col("ORDERS", "O_CUSTKEY"),
             ],
         },
         }),

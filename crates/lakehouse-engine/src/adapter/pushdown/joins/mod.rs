@@ -6,11 +6,13 @@ use exasol_udf_sdk::error::UdfError;
 use futures::future::try_join_all;
 use serde_json::Value as Json;
 
+use super::ConnectionStorage;
 use super::empty_result::empty_result_sql;
 use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
-use super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident};
-use super::{BinaryColumns, ConnectionStorage};
+use super::support::{
+    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident,
+};
 
 mod attribution;
 mod planning;
@@ -34,7 +36,9 @@ use planning::{
     classify_join_window, involved_table, involved_table_columns, resolve_one_join_side,
     select_broadcast_sides,
 };
-use rendering::{has_no_explicit_select_list, leg_local_filter, possible_side_column_names};
+use rendering::{
+    has_no_explicit_select_list, leg_binary_columns, leg_local_filter, possible_side_column_names,
+};
 // `pub(super)` so the `#[cfg(test)]` dispatch-golden sibling module can drive both builders.
 pub(super) use sql_builders::{
     JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql,
@@ -98,8 +102,11 @@ fn ensure_no_side_refuses_a_referenced_column(
 ///
 /// Broadcast is an optimization inside this one path: taken only for an N = 2 equi-join
 /// whose smaller side fits `join_broadcast_max_bytes`, whose window the broadcast path can
-/// serve, and whose bare-name render succeeds. Everything else takes the sole fallback,
+/// serve, and whose leg-qualified render succeeds. The legs may share column names or be one
+/// table joined to itself. Everything else takes the sole fallback,
 /// [`build_n_scan_join_sql`], which scans each table via its own fan-out and joins in Exasol.
+/// A column no single leg owns fails the request through `unattributable_decline`, the
+/// fallback's own error, on both paths.
 ///
 /// No plan-time check compares the sides' storage backends: each side reads through its own
 /// store. The one unservable collapse (two sides on one DataFusion registry key needing
@@ -176,7 +183,8 @@ pub(super) async fn plan_join(
 
     if sides.iter().any(|s| s.files.is_empty()) {
         let combined = side_columns.concat();
-        let (proj_cols, proj_types, widened) = project_columns(pushdown_req, combined.clone())?;
+        let (proj_cols, proj_types, widened) =
+            project_columns(pushdown_req, &ColumnTypes::unqualified(&combined))?;
         return empty_result_sql(
             pushdown_req,
             &proj_cols,
@@ -203,25 +211,22 @@ pub(super) async fn plan_join(
     };
 
     // The window is classified before sizing and rendering, so a request Exasol must
-    // post-process never reaches `render_broadcast_join`, keeping its `Err` arm unreachable.
-    // Any miss falls through to the N-scan fallback, never an error.
+    // post-process never reaches `render_broadcast_join`, keeping its no-column-metadata `Err`
+    // arm unreachable. A decline falls through to the N-scan fallback; a column no single leg owns fails with
+    // the fallback's own error.
     let is_equi =
         join.conditions[0].get("type").and_then(|t| t.as_str()) == Some("predicate_equal");
     let window = classify_join_window(pushdown_req);
     if join.tables.len() == 2 && is_equi && !matches!(window, JoinWindowPlan::ExasolPostProcessed) {
         let candidate =
             select_broadcast_sides(sides[0].clone(), sides[1].clone(), join_broadcast_max_bytes);
-        let binary_columns = BinaryColumns::of(
-            &[sides[0].logical_schema.as_slice(), &sides[1].logical_schema].concat(),
-            inputs.binary_as_string,
-        );
+        let binary_columns = leg_binary_columns(&sides, &legs, inputs.binary_as_string);
         if candidate.broadcast_eligible
             && let Some(rendered) =
                 render_broadcast_join(request, pushdown_req, join, &binary_columns)?
             && let Some(sql) = build_broadcast_join_sql(
                 &candidate,
                 &rendered,
-                window,
                 &inputs,
                 &udf_name,
                 &distribute_udf_name,

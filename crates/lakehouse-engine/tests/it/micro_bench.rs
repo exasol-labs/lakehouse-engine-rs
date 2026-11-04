@@ -2,6 +2,7 @@
 //! `MT_EMIT` round-trip, which only exists inside the UDF runtime) and local scan+decode.
 //! Full numbers: `cargo test --workspace --test it micro_bench -- --ignored --nocapture`.
 
+use crate::scan_fixture::WithFiles;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -263,20 +264,18 @@ fn scan_spec(file_url: String) -> ScanSpec {
     let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
         .map(|m| m.len())
         .unwrap_or(0);
-    ScanSpec {
-        common: CommonScanSpec {
-            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
-                endpoint: "http://localhost:9000".into(),
-                region: "us-east-1".into(),
-                access_key: "k".into(),
-                secret_key: "s".into(),
-                allow_http: true,
-                ..Default::default()
-            })),
+    CommonScanSpec {
+        storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
+            endpoint: "http://localhost:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            allow_http: true,
             ..Default::default()
-        },
-        files: vec![FileEntry::new(file_url, size)],
+        })),
+        ..Default::default()
     }
+    .with_files(vec![FileEntry::new(file_url, size)])
 }
 
 async fn drain_scan(file_url: &str) -> (u64, u64) {

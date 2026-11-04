@@ -1,8 +1,7 @@
 use super::*;
 use crate::scan::sealed::seal_storage;
-use crate::scan::spec::{
-    CommonScanSpec, JoinSpec, JoinType, ScanStorage, StorageBackend, StorageProps,
-};
+use crate::scan::spec::{CommonScanSpec, JoinSpec, ScanStorage, StorageBackend, StorageProps};
+use crate::scan::test_support::join_spec;
 use exasol_udf_sdk::ConnectionObject;
 use exasol_udf_sdk::test_support::TestContext;
 
@@ -132,19 +131,12 @@ fn join_spec_resolves_two_sides_independently() {
         allow_http: false,
     });
     common.join = Some(JoinSpec {
-        storage: ScanStorage::Connection {
+        table_root: "s3://dim/db/dim".into(),
+        condition: "\"LHS_T0\".\"D\" = \"LHS_T1\".\"F\"".into(),
+        ..join_spec(ScanStorage::Connection {
             name: dim_conn.into(),
             allow_http: false,
-        },
-        table_root: "s3://dim/db/dim".into(),
-        condition: "\"F\" = \"D\"".into(),
-        join_type: JoinType::Inner,
-        files: Vec::new(),
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        post_join_limit: None,
-        post_join_order_by: Vec::new(),
-        partition_columns: Vec::new(),
+        })
     });
 
     let resolved = resolve_scan_storage(&common, &ctx).expect("both resolve");

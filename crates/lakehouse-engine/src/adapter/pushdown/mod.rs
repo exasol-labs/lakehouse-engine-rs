@@ -25,10 +25,10 @@ pub(crate) use binary_filter::{BinaryColumns, literal_binary_bytes};
 mod support;
 pub use support::{AggregateMergeInputs, build_fan_out_inner, build_scan_driving_sql, shard_count};
 use support::{
-    DISTRIBUTE_FILES_UDF_NAME, InvolvedColumns, SCAN_UDF_NAME, classify_where_filter,
+    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, InvolvedColumns, SCAN_UDF_NAME, classify_where_filter,
     extract_limit, extract_projection, involved_columns, order_by_present, scan_storage_for,
-    strip_table_alias,
 };
+use vs_expression::strip_table_alias;
 
 mod empty_result;
 use empty_result::empty_result_sql;
@@ -198,7 +198,7 @@ pub async fn handle_pushdown(
     let binary_as_string = resolve_binary_as_string(&props);
     let (filter, declined_filter) = classify_where_filter(
         filter_json_raw,
-        &col_types,
+        &ColumnTypes::unqualified(&col_types),
         &BinaryColumns::of(&logical_schema, binary_as_string),
     );
     let scan_storage = scan_storage_for(

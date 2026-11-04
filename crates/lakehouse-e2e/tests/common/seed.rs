@@ -753,6 +753,7 @@ fn labels_iceberg_schema() -> Result<IcebergSchema> {
         .with_fields(vec![
             NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
             NestedField::required(2, "label", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(3, "score", Type::Primitive(PrimitiveType::String)).into(),
         ])
         .build()
         .context("build labels Iceberg schema")
@@ -763,10 +764,12 @@ fn make_labels_batch(first_id: usize, last_id: usize) -> RecordBatch {
     let labels: Vec<String> = (first_id..=last_id)
         .map(|i| format!("label-{i:02}"))
         .collect();
+    let scores: Vec<String> = (first_id..=last_id).map(labels_score).collect();
 
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("label", DataType::Utf8, false),
+        Field::new("score", DataType::Utf8, false),
     ]));
 
     RecordBatch::try_new(
@@ -774,15 +777,23 @@ fn make_labels_batch(first_id: usize, last_id: usize) -> RecordBatch {
         vec![
             Arc::new(Int64Array::from(ids)),
             Arc::new(StringArray::from(labels)),
+            Arc::new(StringArray::from(scores)),
         ],
     )
     .expect("labels RecordBatch construction is infallible")
 }
 
-// Star schema for join pushdown. Disjoint column prefixes (C_* vs O_*) let the
-// adapter's disjoint-column guard render a broadcast join; the shared `id` on
-// events/labels would trip it. fact_orders spans two files so the fact-side fan-out
-// is observable; dim_customer's single smaller file makes it the broadcast side.
+/// `LABELS.score` shares its name with the DOUBLE `EVENTS.score` (`5.0 * id`) but differs
+/// in type, value and sort order (it falls as `id` rises), so a join that reads one
+/// relation's column for the other is visible in values, type and `ORDER BY`.
+pub fn labels_score(id: usize) -> String {
+    format!("score-{:02}", SEED_LABELS_ROWS + 1 - id)
+}
+
+// Star schema for join pushdown. The C_* and O_* column prefixes keep each column's
+// relation obvious in a failure; events/labels share `id` and `score` to cover shared
+// column names. fact_orders spans two files so the fact-side fan-out is observable;
+// dim_customer's single smaller file makes it the broadcast side.
 
 pub const E2E_DIM_TABLE: &str = "dim_customer";
 pub const E2E_FACT_TABLE: &str = "fact_orders";

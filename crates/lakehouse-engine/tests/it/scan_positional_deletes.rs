@@ -1,4 +1,5 @@
 use crate::scan_fixture;
+use crate::scan_fixture::WithFiles;
 use crate::scan_fixture::concurrency_probe::ConcurrencyProbe;
 
 use std::collections::HashMap;
@@ -22,8 +23,8 @@ use exasol_udf_sdk::value::ExaType;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec,
-    ScanStorage, StorageBackend, StorageProps,
+    ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, LogicalField, ProjectionItem,
+    ScanSpec, ScanStorage, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_join_physical_plan, build_raw_scan_physical_plan, register_files,
@@ -133,17 +134,15 @@ fn delete_ref(abs_url: &str) -> DeleteMechanism {
 }
 
 fn scan_spec(files: Vec<FileEntry>, filter: Option<String>, limit: Option<u64>) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into(), "NAME".into()],
-            filter,
-            limit,
-            storage: ScanStorage::Inline(dummy_storage()),
-            df_batch_size: 64,
-            ..Default::default()
-        },
-        files,
+    CommonScanSpec {
+        projection: vec!["ID".into(), "NAME".into()],
+        filter,
+        limit,
+        storage: ScanStorage::Inline(dummy_storage()),
+        df_batch_size: 64,
+        ..Default::default()
     }
+    .with_files(files)
 }
 
 /// Field-ids are assigned sequentially from 1.
@@ -170,18 +169,16 @@ fn scan_spec_with_logical_schema(
     filter: Option<String>,
     limit: Option<u64>,
 ) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into(), "NAME".into()],
-            filter,
-            limit,
-            storage: ScanStorage::Inline(dummy_storage()),
-            df_batch_size: 64,
-            logical_schema: logical_fields(&[("id", "int64"), ("name", "utf8")]),
-            ..Default::default()
-        },
-        files,
+    CommonScanSpec {
+        projection: vec!["ID".into(), "NAME".into()],
+        filter,
+        limit,
+        storage: ScanStorage::Inline(dummy_storage()),
+        df_batch_size: 64,
+        logical_schema: logical_fields(&[("id", "int64"), ("name", "utf8")]),
+        ..Default::default()
     }
+    .with_files(files)
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -843,7 +840,6 @@ fn scan_delete_reads_serial_when_budget_is_one() {
     assert_eq!(ids_of(&rows), (4..10).collect::<Vec<_>>());
 }
 
-/// Join sides must use disjoint column names: the join path relies on the VS guarantee.
 fn write_keyed_parquet(
     dir: &Path,
     relative: &str,
@@ -931,19 +927,15 @@ fn scan_delete_reads_bounded_across_join_sides() {
     );
 
     let mut spec = scan_spec(vec![fact_entry], None, None);
-    spec.common.projection = vec!["O_KEY".into(), "C_DATA".into()];
+    spec.common.projection = vec![
+        ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "O_KEY")),
+        ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "C_DATA")),
+    ];
     spec.common.s3_max_connections = BUDGET;
     spec.common.join = Some(JoinSpec {
-        table_root: String::new(),
         files: vec![dim_entry],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join_type: JoinType::Inner,
-        condition: "\"C_KEY\" = \"O_KEY\"".into(),
-        post_join_limit: None,
-        post_join_order_by: Vec::new(),
-        partition_columns: Vec::new(),
-        storage: ScanStorage::Inline(dummy_storage()),
+        condition: "\"LHS_T0\".\"C_KEY\" = \"LHS_T1\".\"O_KEY\"".into(),
+        ..scan_fixture::join_spec(ScanStorage::Inline(dummy_storage()))
     });
 
     let (store, peak) = tracking_store_with_probe(needles, BUDGET);
@@ -1621,20 +1613,17 @@ fn scan_footer_fetches_bounded_across_join_sides() {
     let register_url = first_data_url.expect("at least one data file per side");
 
     let mut spec = scan_spec_with_logical_schema(fact_entries, None, None);
-    spec.common.projection = vec!["O_KEY".into(), "C_DATA".into()];
+    spec.common.projection = vec![
+        ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "O_KEY")),
+        ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "C_DATA")),
+    ];
     spec.common.logical_schema = logical_fields(&[("o_key", "int64"), ("o_data", "utf8")]);
     spec.common.s3_max_connections = BUDGET;
     spec.common.join = Some(JoinSpec {
-        table_root: String::new(),
         files: dim_entries,
         logical_schema: logical_fields(&[("c_key", "int64"), ("c_data", "utf8")]),
-        name_mapping: Vec::new(),
-        join_type: JoinType::Inner,
-        condition: "\"C_KEY\" = \"O_KEY\"".into(),
-        post_join_limit: None,
-        post_join_order_by: Vec::new(),
-        partition_columns: Vec::new(),
-        storage: ScanStorage::Inline(dummy_storage()),
+        condition: "\"LHS_T0\".\"C_KEY\" = \"LHS_T1\".\"O_KEY\"".into(),
+        ..scan_fixture::join_spec(ScanStorage::Inline(dummy_storage()))
     });
 
     let (store, peak) = tracking_store_with_probe(needles, BUDGET);

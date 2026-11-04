@@ -1,7 +1,7 @@
 use arrow::datatypes::DataType;
 use datafusion::common::DFSchema;
 
-use crate::scan::spec::ProjectionItem;
+use crate::scan::spec::{ColumnRef, ProjectionItem};
 use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
 
 use super::binary_hex::{BINARY_HEX_UDF_NAME, raw_bytes_alias};
@@ -64,10 +64,11 @@ pub(super) fn append_where(sql: &mut String, filter: Option<&str>) {
 
 /// A rendered expression is spliced verbatim and gets a unique positional alias: a bare column
 /// and a CAST of it derive equal names, which DataFusion rejects as duplicates (#136, #178).
-/// Exasol already de-duplicates bare column references. Emission is positional.
+/// Exasol already de-duplicates bare column references. A relation-qualified column is named
+/// `<alias>_<column>`, so two same-named columns of a join stay distinct. Emission is positional.
 pub(super) fn render_projection<'a>(
     items: &[ProjectionItem],
-    column_type: impl Fn(&str) -> Option<&'a DataType>,
+    column_type: impl Fn(&ColumnRef) -> Option<&'a DataType>,
 ) -> String {
     items
         .iter()
@@ -76,7 +77,13 @@ pub(super) fn render_projection<'a>(
             ProjectionItem::Expr { expr } => {
                 format!("{expr} AS {}", quote_ident(&format!("_LH_PROJ_{i}")))
             }
-            ProjectionItem::Column(name) => render_column(name, column_type(name)),
+            ProjectionItem::Column(column) => {
+                let rendered = render_column(column, column_type(column));
+                match column.relation {
+                    Some(_) => format!("{rendered} AS {}", quote_ident(&column.output_name())),
+                    None => rendered,
+                }
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -84,8 +91,12 @@ pub(super) fn render_projection<'a>(
 
 /// Nested columns call [`NESTED_JSON_RENDER_UDF_NAME`]; other incompatible columns get
 /// `CAST(col AS VARCHAR)` so they arrive as Utf8. A binary alias already holds its hex text.
-pub(super) fn render_column(name: &str, data_type: Option<&DataType>) -> String {
-    let ident = quote_ident(&name.to_uppercase());
+pub(super) fn render_column(column: &ColumnRef, data_type: Option<&DataType>) -> String {
+    let name = quote_ident(&column.name.to_uppercase());
+    let ident = match &column.relation {
+        Some(relation) => format!("{}.{name}", quote_ident(relation)),
+        None => name,
+    };
     match data_type {
         Some(dt) if dt.is_binary() => ident,
         Some(dt) if needs_nested_json_rendering(dt) => {
