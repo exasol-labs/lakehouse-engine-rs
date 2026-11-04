@@ -15,15 +15,80 @@ use super::*;
 use crate::adapter::pushdown::test_support::by_name;
 use crate::scan::spec::{DeleteMechanism, DeltaDeletionVectorStorage};
 
-fn local_store() -> Arc<dyn ObjectStore> {
-    Arc::new(LocalFileSystem::new())
+/// Compiled in, so a replay reads memory and never the checkout's fixture directory.
+macro_rules! fixture_logs {
+    ($($path:literal),* $(,)?) => {
+        &[$((
+            $path,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../scripts/unity/fixtures/",
+                $path
+            )) as &[u8],
+        )),*]
+    };
+}
+
+/// The `_delta_log` of every vendored fixture table, keyed by its path under the fixture root.
+const FIXTURE_LOGS: &[(&str, &[u8])] = fixture_logs!(
+    "basic_partitioned/_delta_log/00000000000000000000.json",
+    "basic_partitioned/_delta_log/00000000000000000001.json",
+    "cdf-column-mapping-id-mode/_delta_log/00000000000000000000.json",
+    "cdf-column-mapping-id-mode/_delta_log/00000000000000000001.json",
+    "cdf-column-mapping-id-mode/_delta_log/00000000000000000002.json",
+    "cdf-column-mapping-id-mode/_delta_log/00000000000000000003.json",
+    "cdf-column-mapping-id-mode/_delta_log/00000000000000000004.json",
+    "cdf-column-mapping-name-mode/_delta_log/00000000000000000000.json",
+    "cdf-column-mapping-name-mode/_delta_log/00000000000000000001.json",
+    "cdf-column-mapping-name-mode/_delta_log/00000000000000000002.json",
+    "cdf-column-mapping-name-mode/_delta_log/00000000000000000003.json",
+    "cdf-column-mapping-name-mode/_delta_log/00000000000000000004.json",
+    "multi-part-stats/_delta_log/00000000000000000000.json",
+    "multi-part-stats/_delta_log/00000000000000000001.json",
+    "multi-part-stats/_delta_log/00000000000000000002.json",
+    "multi-part-stats/_delta_log/00000000000000000003.json",
+    "multi-part-stats/_delta_log/00000000000000000004.json",
+    "multi-part-stats/_delta_log/00000000000000000005.checkpoint.0000000001.0000000003.parquet",
+    "multi-part-stats/_delta_log/00000000000000000005.checkpoint.0000000002.0000000003.parquet",
+    "multi-part-stats/_delta_log/00000000000000000005.checkpoint.0000000003.0000000003.parquet",
+    "multi-part-stats/_delta_log/00000000000000000005.json",
+    "multi-part-stats/_delta_log/_last_checkpoint",
+    "stats-all-types/_delta_log/00000000000000000000.json",
+    "stats-all-types/_delta_log/00000000000000000001.json",
+    "table-with-dv-small/_delta_log/00000000000000000000.json",
+    "table-with-dv-small/_delta_log/00000000000000000001.json",
+    "type-widening/_delta_log/00000000000000000000.json",
+    "type-widening/_delta_log/00000000000000000001.json",
+    "type-widening/_delta_log/00000000000000000002.json",
+    "unshredded-variant/_delta_log/00000000000000000000.json",
+    "unshredded-variant/_delta_log/00000000000000000001.json",
+    "unshredded-variant/_delta_log/00000000000000000002.checkpoint.parquet",
+    "unshredded-variant/_delta_log/00000000000000000002.json",
+    "unshredded-variant/_delta_log/_last_checkpoint",
+);
+
+/// An in-memory store holding `table`'s vendored log under [`fixture_root`].
+fn fixture_store(table: &str) -> Arc<dyn ObjectStore> {
+    let store = InMemory::new();
+    let prefix = format!("{table}/");
+    let logs: Vec<_> = FIXTURE_LOGS
+        .iter()
+        .filter(|(log, _)| log.starts_with(&prefix))
+        .collect();
+    assert!(!logs.is_empty(), "{table} is a vendored fixture table");
+    futures::executor::block_on(async {
+        for (log, bytes) in logs {
+            store
+                .put(&StorePath::from(*log), PutPayload::from_static(bytes))
+                .await
+                .expect("the fixture log is stored");
+        }
+    });
+    Arc::new(store)
 }
 
 fn fixture_root(table: &str) -> String {
-    format!(
-        "{}/../../scripts/unity/fixtures/{table}",
-        env!("CARGO_MANIFEST_DIR")
-    )
+    format!("memory:///{table}")
 }
 
 fn replay_fixture(table: &str) -> Vec<FileEntry> {
@@ -39,7 +104,7 @@ fn replay_fixture_pruned(table: &str, predicate: Predicate) -> Vec<FileEntry> {
 }
 
 fn open_fixture(table: &str) -> DeltaSnapshot {
-    DeltaSnapshot::open(local_store(), &fixture_root(table)).expect("fixture table opens")
+    DeltaSnapshot::open(fixture_store(table), &fixture_root(table)).expect("fixture table opens")
 }
 
 impl super::DeltaSnapshot {
@@ -201,8 +266,11 @@ async fn partition_columns_are_reported_in_the_order_the_metadata_declares_them(
 
 #[test]
 fn a_table_declaring_no_partition_column_reports_an_empty_partition_list() {
-    let snapshot = DeltaSnapshot::open(local_store(), &fixture_root("table-with-dv-small"))
-        .expect("fixture table opens");
+    let snapshot = DeltaSnapshot::open(
+        fixture_store("table-with-dv-small"),
+        &fixture_root("table-with-dv-small"),
+    )
+    .expect("fixture table opens");
 
     assert!(
         snapshot.partition_columns().is_empty(),
@@ -217,8 +285,8 @@ fn column_mapping_mode_is_reported_from_the_tables_metadata() {
         ("cdf-column-mapping-id-mode", ColumnMappingMode::Id),
         ("basic_partitioned", ColumnMappingMode::None),
     ] {
-        let snapshot =
-            DeltaSnapshot::open(local_store(), &fixture_root(table)).expect("fixture table opens");
+        let snapshot = DeltaSnapshot::open(fixture_store(table), &fixture_root(table))
+            .expect("fixture table opens");
 
         assert_eq!(
             snapshot.column_mapping_mode(),
@@ -230,8 +298,11 @@ fn column_mapping_mode_is_reported_from_the_tables_metadata() {
 
 #[test]
 fn a_legacy_reader_version_table_passes_the_gate_and_keeps_its_column_mapping_mode() {
-    let snapshot = DeltaSnapshot::open(local_store(), &fixture_root("cdf-column-mapping-id-mode"))
-        .expect("minReaderVersion 2 with no readerFeatures list is readable");
+    let snapshot = DeltaSnapshot::open(
+        fixture_store("cdf-column-mapping-id-mode"),
+        &fixture_root("cdf-column-mapping-id-mode"),
+    )
+    .expect("minReaderVersion 2 with no readerFeatures list is readable");
 
     assert_eq!(snapshot.column_mapping_mode(), ColumnMappingMode::Id);
 }
@@ -502,12 +573,12 @@ async fn a_table_whose_every_file_was_removed_replays_to_no_file() {
 
 #[test]
 fn a_table_root_holding_no_delta_log_is_refused() {
-    let error = DeltaSnapshot::open(local_store(), &fixture_root("PROVENANCE.md"))
+    let error = DeltaSnapshot::open(Arc::new(InMemory::new()), &fixture_root("not_a_table"))
         .err()
         .expect("a path that is no Delta table root must fail, never panic");
 
     assert!(
-        error.to_string().contains("PROVENANCE.md"),
+        error.to_string().contains("not_a_table"),
         "the refusal names the table root it was given: {error}"
     );
 }
@@ -691,7 +762,7 @@ fn every_shipped_fixture_whose_reader_features_are_allow_listed_still_resolves()
         "cdf-column-mapping-name-mode",
         "type-widening",
     ] {
-        let snapshot = DeltaSnapshot::open(local_store(), &fixture_root(table))
+        let snapshot = DeltaSnapshot::open(fixture_store(table), &fixture_root(table))
             .unwrap_or_else(|error| panic!("{table} has only allow-listed features: {error}"));
 
         snapshot
@@ -700,7 +771,6 @@ fn every_shipped_fixture_whose_reader_features_are_allow_listed_still_resolves()
     }
 }
 
-/// Scenario: Every recorded Delta type change is validated, and an unsupported one refuses its column
 #[test]
 fn an_unsupported_recorded_type_change_refuses_only_its_own_column() {
     const QUERYABLE_COLUMNS: [&str; 11] = [
@@ -721,8 +791,11 @@ fn an_unsupported_recorded_type_change_refuses_only_its_own_column() {
         ("short_decimal", "short", "decimal(6,1)"),
     ];
 
-    let snapshot = DeltaSnapshot::open(local_store(), &fixture_root("type-widening"))
-        .expect("the type-widening fixture declares only allow-listed reader features");
+    let snapshot = DeltaSnapshot::open(
+        fixture_store("type-widening"),
+        &fixture_root("type-widening"),
+    )
+    .expect("the type-widening fixture declares only allow-listed reader features");
 
     let (logical_fields, refused_columns) = super::super::delta_schema::classify_spark_schema(
         &snapshot.schema(),
@@ -772,7 +845,7 @@ fn a_vendored_fixture_declaring_a_reader_feature_outside_the_allow_list_is_refus
     let table = "unshredded-variant";
     let unsupported_feature = "variantType-preview";
     let root = fixture_root(table);
-    let error = DeltaSnapshot::open(local_store(), &root)
+    let error = DeltaSnapshot::open(fixture_store(table), &root)
         .err()
         .unwrap_or_else(|| panic!("{table} declares a reader feature outside the allow-list"));
 
@@ -897,7 +970,7 @@ fn a_void_column_reads_as_all_null_under_name_column_mapping() {
     let dir = tmp.path();
     let table_root = write_void_column_table(dir);
 
-    let snapshot = DeltaSnapshot::open(local_store(), &table_root)
+    let snapshot = DeltaSnapshot::open(Arc::new(LocalFileSystem::new()), &table_root)
         .expect("the void table opens past the gate");
     assert_eq!(
         snapshot.column_mapping_mode(),

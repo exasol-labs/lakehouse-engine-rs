@@ -106,31 +106,15 @@ fn prefix_from_config_empty_when_absent() {
 
 #[tokio::test]
 async fn sigv4_resolve_prefix_derives_catalogs_segment() {
-    use std::net::SocketAddr;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-    let addr: SocketAddr = listener.local_addr().expect("local_addr");
-    let port = addr.port();
-
     let server_prefix = "server-returned-prefix-SHOULD-NOT-BE-USED";
+    let (catalog_uri, _) = spawn_server("application/json", move |_| {
+        (
+            200,
+            format!(r#"{{"overrides":{{"prefix":"{server_prefix}"}}}}"#),
+        )
+    })
+    .await;
 
-    tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let mut buf = vec![0u8; 4096];
-            let _n = stream.read(&mut buf).await.unwrap_or(0);
-            let body = format!(r#"{{"overrides":{{"prefix":"{server_prefix}"}}}}"#);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
-    });
-
-    let catalog_uri = format!("http://127.0.0.1:{port}");
     let warehouse = "123456789012";
 
     let mut creds = base_creds();
@@ -158,31 +142,15 @@ async fn sigv4_resolve_prefix_derives_catalogs_segment() {
 
 #[tokio::test]
 async fn non_sigv4_config_prefix_resolution_uses_config_endpoint() {
-    use std::net::SocketAddr;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-    let addr: SocketAddr = listener.local_addr().expect("local_addr");
-    let port = addr.port();
-
     let resolved_prefix = "resolved-prefix-from-config";
+    let (catalog_uri, _) = spawn_server("application/json", move |_| {
+        (
+            200,
+            format!(r#"{{"overrides":{{"prefix":"{resolved_prefix}"}}}}"#),
+        )
+    })
+    .await;
 
-    tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.expect("accept");
-        let mut buf = vec![0u8; 4096];
-        let _n = stream.read(&mut buf).await.expect("read");
-
-        let body = format!(r#"{{"overrides":{{"prefix":"{resolved_prefix}"}}}}"#);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes()).await.expect("write");
-    });
-
-    let catalog_uri = format!("http://127.0.0.1:{port}");
     let creds = creds_no_auth();
     let auth = CatalogAuth::None;
 
@@ -200,29 +168,11 @@ async fn non_sigv4_config_prefix_resolution_uses_config_endpoint() {
 
 #[tokio::test]
 async fn non_sigv4_no_config_prefix_yields_empty_not_warehouse() {
-    use std::net::SocketAddr;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    let (catalog_uri, _) = spawn_server("application/json", |_| {
+        (200, r#"{"overrides":{}}"#.to_string())
+    })
+    .await;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-    let addr: SocketAddr = listener.local_addr().expect("local_addr");
-    let port = addr.port();
-
-    tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.expect("accept");
-        let mut buf = vec![0u8; 4096];
-        let _n = stream.read(&mut buf).await.expect("read");
-
-        let body = r#"{"overrides":{}}"#;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes()).await.expect("write");
-    });
-
-    let catalog_uri = format!("http://127.0.0.1:{port}");
     let warehouse = "s3://warehouse";
     let creds = creds_no_auth();
     let auth = CatalogAuth::None;

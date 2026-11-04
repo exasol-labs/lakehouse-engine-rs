@@ -5,48 +5,19 @@ use crate::test_support::*;
 /// Scenario: OAuth2 client credentials drive the catalog client-credentials grant
 #[tokio::test]
 async fn oauth2_grant_built_from_client_credentials() {
-    use std::net::SocketAddr;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-    let addr: SocketAddr = listener.local_addr().expect("local_addr");
-    let port = addr.port();
-
-    let catalog_uri = format!("http://127.0.0.1:{port}");
+    let (catalog_uri, requests) = spawn_server("application/json", |_| {
+        (
+            200,
+            format!(
+                r#"{{"access_token":"{OAUTH_ACCESS_TOKEN}","token_type":"Bearer","expires_in":3600}}"#
+            ),
+        )
+    })
+    .await;
     let mut creds = creds_no_auth();
     creds.client_id = Some("my-client-id".into());
     creds.client_secret = Some(CLIENT_SECRET.into());
     creds.scope = Some("catalog-read".into());
-
-    tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.expect("accept");
-        let mut buf = vec![0u8; 4096];
-        let n = stream.read(&mut buf).await.expect("read");
-        let request = String::from_utf8_lossy(&buf[..n]).to_string();
-
-        assert!(
-            request.contains("grant_type=client_credentials"),
-            "grant_type must be client_credentials"
-        );
-        assert!(
-            request.contains("client_id=my-client-id"),
-            "client_id must be present"
-        );
-        let has_secret = request.contains(CLIENT_SECRET);
-        let has_scope = request.contains("scope=catalog-read");
-        let body = format!(
-            r#"{{"access_token":"{OAUTH_ACCESS_TOKEN}","token_type":"Bearer","expires_in":3600}}"#
-        );
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes()).await.expect("write");
-        assert!(has_secret, "client_secret must be in POST body");
-        assert!(has_scope, "scope must be in POST body when supplied");
-    });
 
     let http = CatalogHttp::new();
     let token = oauth2_client_credentials_grant(&http, &catalog_uri, &creds)
@@ -56,6 +27,26 @@ async fn oauth2_grant_built_from_client_credentials() {
     assert_eq!(
         token, OAUTH_ACCESS_TOKEN,
         "returned access_token must match server response"
+    );
+    let requests = requests.lock().unwrap();
+    let [request] = requests.as_slice() else {
+        panic!("exactly one grant request, got {}", requests.len());
+    };
+    assert!(
+        request.contains("grant_type=client_credentials"),
+        "grant_type must be client_credentials"
+    );
+    assert!(
+        request.contains("client_id=my-client-id"),
+        "client_id must be present"
+    );
+    assert!(
+        request.contains(CLIENT_SECRET),
+        "client_secret must be in POST body"
+    );
+    assert!(
+        request.contains("scope=catalog-read"),
+        "scope must be in POST body when supplied"
     );
 }
 

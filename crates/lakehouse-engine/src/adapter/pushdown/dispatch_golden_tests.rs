@@ -3,8 +3,8 @@
 //! diff in one of them is always a regression, never an expected update.
 
 use super::test_support::{
-    agg_item, broadcast_sides, column_types, pd, projected_columns, request_sides, request_typed,
-    sample_scan_storage, sample_storage, with_identifier_notes,
+    agg_item, bound_field, broadcast_sides, column_types, pd, projected_columns, request_sides,
+    request_typed, sample_scan_storage, sample_storage, with_identifier_notes,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::{
@@ -819,13 +819,8 @@ fn resolved_customer_side() -> ResolvedJoinSide {
         table_root: "s3://warehouse/lh/customer".to_string(),
         files: vec![FileEntry::new("s3://w/c-0.parquet", 10)],
         logical_schema: vec![LogicalField {
-            field_id: Some(1),
-            name: "CUSTOMER_KEY".to_string(),
-            arrow_type: "int64".to_string(),
             nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..bound_field(1, "CUSTOMER_KEY", "int64")
         }],
         name_mapping: Vec::new(),
         effective_storage: sample_storage(),
@@ -843,13 +838,8 @@ fn resolved_orders_side() -> ResolvedJoinSide {
         table_root: "s3://warehouse/lh/orders".to_string(),
         files: vec![FileEntry::new("s3://w/o-0.parquet", 100)],
         logical_schema: vec![LogicalField {
-            field_id: Some(1),
-            name: "ORDERS_KEY".to_string(),
-            arrow_type: "int64".to_string(),
             nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..bound_field(1, "ORDERS_KEY", "int64")
         }],
         name_mapping: Vec::new(),
         effective_storage: sample_storage(),

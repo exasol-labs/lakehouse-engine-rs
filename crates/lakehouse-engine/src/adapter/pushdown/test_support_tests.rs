@@ -17,12 +17,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use vs_expression::ColumnNode;
 
-type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+/// Each request's head and body, in arrival order.
+pub(crate) type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
+/// The crate's one loopback fake server, which every catalog, STS, and object-store fake wraps.
+///
 /// Every response closes its connection, so one accept loop serves a pooled client's sequential
 /// requests in arrival order. `responder` maps a request head to a status, content type, and body;
 /// the validators make a body readable as an object.
-async fn spawn_fake_http_server<F>(responder: F) -> (String, RecordedRequests)
+pub(crate) async fn spawn_fake_http_server<F>(responder: F) -> (String, RecordedRequests)
 where
     F: Fn(&str) -> (u16, &'static str, String) + Send + Sync + 'static,
 {
@@ -60,18 +63,32 @@ where
     (address, requests)
 }
 
+/// Starts `server` on a runtime of its own, which must outlive it, for a caller such as `dispatch`
+/// that blocks on its own current-thread runtime, which a `#[tokio::test]` would nest.
+pub(crate) fn serve_on_own_runtime<T>(
+    server: impl std::future::Future<Output = T>,
+) -> (T, tokio::runtime::Runtime) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("build the fake server's runtime");
+    let served = runtime.block_on(server);
+    (served, runtime)
+}
+
 fn request_target(head: &str) -> &str {
     head.split_whitespace().nth(1).unwrap_or("")
 }
 
 pub(crate) struct RecordingCatalog {
-    pub(super) uri: String,
+    pub(crate) uri: String,
     requests: RecordedRequests,
 }
 
 impl RecordingCatalog {
     /// `responder` maps a request target to a status and body.
-    pub(super) async fn spawn<F>(responder: F) -> Self
+    pub(crate) async fn spawn<F>(responder: F) -> Self
     where
         F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
     {
@@ -83,7 +100,7 @@ impl RecordingCatalog {
         Self { uri, requests }
     }
 
-    pub(super) fn targets(&self) -> Vec<String> {
+    pub(crate) fn targets(&self) -> Vec<String> {
         self.requests
             .lock()
             .expect("recorded requests")
@@ -629,6 +646,14 @@ pub(crate) fn nullable_field(name: &str, arrow_type: &str) -> LogicalField {
     }
 }
 
+/// A nullable field of the given Arrow tag, bound to the source field `field_id`.
+pub(crate) fn bound_field(field_id: i32, name: &str, arrow_type: &str) -> LogicalField {
+    LogicalField {
+        field_id: Some(field_id),
+        ..nullable_field(name, arrow_type)
+    }
+}
+
 /// The refusal a `label` table records for the geospatial `column`, at `member_path` when nested.
 pub(crate) fn unread_refused(
     label: &str,
@@ -974,7 +999,7 @@ pub(crate) struct GlueEndpoint {
 
 impl GlueEndpoint {
     /// `responder` maps a Glue operation name, such as `GetTable`, to a status and JSON body.
-    pub(super) async fn spawn<F>(responder: F) -> Self
+    pub(crate) async fn spawn<F>(responder: F) -> Self
     where
         F: Fn(&str) -> (u16, serde_json::Value) + Send + Sync + 'static,
     {
@@ -1183,6 +1208,26 @@ pub(crate) fn sample_storage() -> StorageBackend {
     })
 }
 
+/// A scan spec reading from the inline [`sample_storage`], every other field defaulted, as the
+/// base a test's struct update sets its own fields over.
+pub(crate) fn sample_common_spec() -> CommonScanSpec {
+    CommonScanSpec {
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+}
+
+/// The fileless spec template a grouped aggregate renders from: `plans` partially aggregated per
+/// `group_keys`.
+pub(crate) fn grouped_spec_template(plans: &[AggregatePlan], group_keys: &[String]) -> ScanSpec {
+    CommonScanSpec {
+        aggregates: Some(plans.to_vec()),
+        group_keys: Some(group_keys.to_vec()),
+        ..sample_common_spec()
+    }
+    .with_files(vec![])
+}
+
 pub(crate) const SENTINEL_ACCESS_KEY: &str = "AKIA-SENTINEL-ACCESS-0001";
 pub(crate) const SENTINEL_SECRET_KEY: &str = "sentinel-secret-value-0002";
 
@@ -1232,8 +1277,7 @@ pub(crate) fn build_sql_for_fixture_n(
         projection: proj_items.clone(),
         filter,
         limit,
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let files_with_sizes: Vec<FileEntry> =
@@ -1347,8 +1391,7 @@ pub(crate) fn build_row_sql_with_root(
     let spec_template = CommonScanSpec {
         table_root: table_root.to_string(),
         projection: proj_items.clone(),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let files: Vec<FileEntry> = files.into_iter().map(FileEntry::from).collect();
@@ -1439,4 +1482,23 @@ pub(crate) mod filter_json {
     pub(crate) fn between(name: &str, low: Json, high: Json) -> Json {
         json!({"type": "predicate_between", "expression": column(name), "left": low, "right": high})
     }
+}
+
+/// Its own `dataType` is the only place the key's type appears when the key is not
+/// also in the select list.
+pub(crate) fn char_cast_key(size: u64, character_set: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function_scalar_cast",
+        "name": "CAST",
+        "dataType": {"type": "CHAR", "size": size, "characterSet": character_set},
+        "arguments": [col("NAME")],
+    })
+}
+
+pub(crate) fn decimal_type(precision: u32, scale: u32) -> serde_json::Value {
+    serde_json::json!({"type": "decimal", "precision": precision, "scale": scale})
+}
+
+pub(crate) fn file_paths(scan: &ResolvedScan) -> Vec<&str> {
+    scan.files.iter().map(|file| file.path.as_str()).collect()
 }

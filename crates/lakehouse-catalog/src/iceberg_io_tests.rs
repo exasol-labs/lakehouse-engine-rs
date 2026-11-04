@@ -97,30 +97,16 @@ async fn sigv4_request_is_signed_for_the_carried_region() {
 
 #[tokio::test]
 async fn load_table_error_redacts_session_bearer_and_static_secrets() {
-    use std::net::SocketAddr;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-    let addr: SocketAddr = listener.local_addr().expect("local_addr");
-    let port = addr.port();
-
-    let body = format!("error: secret={CLIENT_SECRET} bearer={OAUTH_ACCESS_TOKEN}");
-
-    tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.expect("accept");
-        let mut buf = vec![0u8; 4096];
-        let _ = stream.read(&mut buf).await.expect("read");
-        let response = format!(
-            "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes()).await.expect("write");
-    });
+    let (catalog_uri, _) = spawn_server("text/plain", |_| {
+        (
+            401,
+            format!("error: secret={CLIENT_SECRET} bearer={OAUTH_ACCESS_TOKEN}"),
+        )
+    })
+    .await;
 
     let http = CatalogHttp::new();
-    let url = format!("http://127.0.0.1:{port}/v1/namespaces/db/tables/t");
+    let url = format!("{catalog_uri}/v1/namespaces/db/tables/t");
     let mut creds = creds_no_auth();
     creds.client_secret = Some(CLIENT_SECRET.into());
     let auth = CatalogAuth::Bearer(OAUTH_ACCESS_TOKEN.to_string());

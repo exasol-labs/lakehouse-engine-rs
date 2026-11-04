@@ -4,64 +4,26 @@ use crate::adapter::properties::{
     PROP_INSTANCE_OVERHEAD_MB, PROP_JOIN_BROADCAST_MAX_BYTES, PROP_MEMORY_POOL_FRACTION,
     PROP_PARALLELISM_FACTOR, PROP_S3_MAX_CONNECTIONS,
 };
-use crate::adapter::pushdown::test_support::{customer_orders_join, table_col};
-use crate::adapter::pushdown::test_support::{named_table, with_identifier_notes};
+use crate::adapter::pushdown::test_support::{
+    RecordedRequests, customer_orders_join, named_table, serve_on_own_runtime,
+    spawn_fake_http_server, table_col, with_identifier_notes,
+};
+use crate::adapter::tests::test_support::skipped_entry;
 use exasol_udf_sdk::test_support::{DefaultsCtx, TestContext};
 use lakehouse_catalog::{CatalogTableIdent, SkipReason, TableFormat};
-use std::sync::{Arc, Mutex};
 
 #[path = "parquet_fixture_tests.rs"]
 pub(super) mod parquet_fixture;
 #[path = "recording_store_tests.rs"]
 pub(super) mod recording_store;
-
-#[test]
-fn dispatch_get_capabilities() {
-    let req = serde_json::json!({"type": "getCapabilities"});
-    let resp = dispatch(&mut DefaultsCtx, &req).unwrap();
-    assert_eq!(resp["type"].as_str().unwrap(), "getCapabilities");
-    let caps = resp["capabilities"].as_array().unwrap();
-    assert!(!caps.is_empty());
-}
-
-#[test]
-fn dispatch_drop_returns_correct_type() {
-    let req = serde_json::json!({"type": "dropVirtualSchema"});
-    let resp = dispatch(&mut DefaultsCtx, &req).unwrap();
-    assert_eq!(resp["type"].as_str().unwrap(), "dropVirtualSchema");
-}
+#[path = "test_support_tests.rs"]
+pub(super) mod test_support;
 
 #[test]
 fn dispatch_unknown_type_errors() {
     let req = serde_json::json!({"type": "unsupported"});
     let err = dispatch(&mut DefaultsCtx, &req).unwrap_err();
     assert!(err.to_string().contains("unsupported"));
-}
-
-#[test]
-fn refresh_and_set_properties_dispatched_not_unsupported() {
-    for req_type in ["refresh", "setProperties"] {
-        let req = serde_json::json!({
-            "type": req_type,
-            "properties": { PROP_CATALOG_CONNECTION: "no_such_conn" },
-        });
-        let err = dispatch(&mut DefaultsCtx, &req)
-            .expect_err("no live catalog is available in a unit test");
-        assert!(
-            !err.to_string().contains("unsupported"),
-            "{req_type} must not be rejected as an unsupported request type, got: {err}"
-        );
-    }
-}
-
-fn schema_request(request_type: &str, properties: serde_json::Value) -> Json {
-    match request_type {
-        "setProperties" => serde_json::json!({ "type": request_type, "properties": properties }),
-        _ => serde_json::json!({
-            "type": request_type,
-            "schemaMetadataInfo": { "properties": properties },
-        }),
-    }
 }
 
 fn checked(props: serde_json::Value) -> TuningProperties {
@@ -72,123 +34,6 @@ fn checked(props: serde_json::Value) -> TuningProperties {
 
 fn resolved_tuning(props: serde_json::Value, nr_of_cores: u32) -> TuningNotes {
     resolve_tuning_notes(&checked(props), nr_of_cores)
-}
-
-#[test]
-fn an_unknown_property_name_fails_every_schema_request_before_the_connection_is_read() {
-    for request_type in ["createVirtualSchema", "refresh", "setProperties"] {
-        let request = schema_request(
-            request_type,
-            serde_json::json!({
-                PROP_CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
-                "NAMESPCE": "sales",
-            }),
-        );
-
-        let err = dispatch(&mut TestContext::scalar(vec![]), &request)
-            .expect_err("an unknown property name must fail the request");
-
-        let message = err.to_string();
-        assert!(
-            message.contains("unknown property 'NAMESPCE' (did you mean 'NAMESPACE'?)"),
-            "{request_type}: {message}"
-        );
-        assert!(
-            !message.contains("NO_SUCH_CONNECTION"),
-            "{request_type} must fail before it reads the CONNECTION: {message}"
-        );
-    }
-}
-
-#[test]
-fn a_misspelled_required_property_is_reported_instead_of_the_missing_one() {
-    let request = schema_request(
-        "createVirtualSchema",
-        serde_json::json!({ "CATALOG_CONECTION": "MY_CONN", PROP_NAMESPACE: "sales" }),
-    );
-
-    let message = dispatch(&mut TestContext::scalar(vec![]), &request)
-        .expect_err("a misspelled CATALOG_CONNECTION must fail")
-        .to_string();
-
-    assert!(
-        message
-            .contains("unknown property 'CATALOG_CONECTION' (did you mean 'CATALOG_CONNECTION'?)"),
-        "{message}"
-    );
-    assert!(
-        !message.contains("CATALOG_CONNECTION is required"),
-        "the name check precedes the required-property check: {message}"
-    );
-}
-
-#[test]
-fn an_invalid_tuning_value_fails_every_schema_request_before_the_connection_is_read() {
-    for request_type in ["createVirtualSchema", "refresh", "setProperties"] {
-        let request = schema_request(
-            request_type,
-            serde_json::json!({
-                PROP_CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
-                PROP_DF_BATCH_SIZE: "0",
-            }),
-        );
-
-        let message = dispatch(&mut TestContext::scalar(vec![]), &request)
-            .expect_err("an invalid tuning value must fail the request")
-            .to_string();
-
-        assert!(
-            message.contains(
-                "invalid value '0' for 'DATAFUSION_BATCH_SIZE': expected a whole number from 1 to 4294967295"
-            ),
-            "{request_type}: {message}"
-        );
-    }
-}
-
-#[test]
-fn a_set_properties_null_unsets_an_invalid_value_before_the_check() {
-    let request = serde_json::json!({
-        "type": "setProperties",
-        "properties": { PROP_DF_BATCH_SIZE: null },
-        "schemaMetadataInfo": { "properties": { PROP_DF_BATCH_SIZE: "0", "PV_MADE_UP": "x" } },
-    });
-
-    let message = dispatch(&mut TestContext::scalar(vec![]), &request)
-        .expect_err("the stray name is still unknown")
-        .to_string();
-
-    assert!(
-        message.contains("unknown property 'PV_MADE_UP'"),
-        "{message}"
-    );
-    assert!(
-        !message.contains("DATAFUSION_BATCH_SIZE"),
-        "a null removes the invalid value from the effective properties: {message}"
-    );
-}
-
-#[test]
-fn a_pushdown_never_runs_the_property_check() {
-    let request = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": {
-            "properties": {
-                PROP_CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
-                "NAMESPCE": "sales",
-                PROP_DF_BATCH_SIZE: "0",
-            },
-        },
-    });
-
-    let message = dispatch(&mut TestContext::scalar(vec![]), &request)
-        .expect_err("the CONNECTION does not exist")
-        .to_string();
-
-    assert!(
-        !message.contains("invalid virtual schema properties"),
-        "a pushdown reads the properties it needs and checks no other: {message}"
-    );
 }
 
 #[test]
@@ -266,147 +111,6 @@ fn password_connection(
     }
 }
 
-fn s3_style_password() -> String {
-    serde_json::json!({
-        "warehouse": "wh",
-        "endpoint": "http://s3.example.com",
-        "region": "us-east-1",
-        "access_key": "AKID",
-        "secret_key": "SECRET",
-        "path_style": true,
-    })
-    .to_string()
-}
-
-#[test]
-fn set_properties_null_unset_required_property_errors_not_panic() {
-    let req = serde_json::json!({
-        "type": "setProperties",
-        "properties": {
-            "NAMESPACE": null,
-        },
-        "schemaMetadataInfo": {
-            "properties": {
-                "NAMESPACE": "old_ns",
-                "CATALOG_CONNECTION": "MY_CONN",
-            }
-        },
-    });
-
-    let err = dispatch(
-        &mut TestContext::scalar(vec![]).with_connection(
-            "MY_CONN",
-            password_connection("http://catalog.example.com", s3_style_password()),
-        ),
-        &req,
-    )
-    .expect_err("null-unsetting a required property must error, not succeed");
-
-    let expected = format!("property '{PROP_NAMESPACE}' is required");
-    assert!(
-        err.to_string().contains(&expected),
-        "expected the required-property error '{expected}', got: {err}"
-    );
-}
-
-#[test]
-fn namespace_is_required_for_catalog_kinds_only() {
-    let catalog_req = serde_json::json!({
-        "type": "createVirtualSchema",
-        "properties": { "CATALOG_CONNECTION": "MY_CONN" },
-    });
-    let catalog_err = dispatch(
-        &mut TestContext::scalar(vec![]).with_connection(
-            "MY_CONN",
-            password_connection("http://catalog.example.com", s3_style_password()),
-        ),
-        &catalog_req,
-    )
-    .expect_err("ICEBERG_REST still requires NAMESPACE");
-    let expected = format!("property '{PROP_NAMESPACE}' is required");
-    assert!(
-        catalog_err.to_string().contains(&expected),
-        "expected the required-property error '{expected}', got: {catalog_err}"
-    );
-
-    let direct_password = serde_json::json!({
-        "access_key": "AKID",
-        "secret_key": "SECRET",
-        "region": "us-east-1",
-        "endpoint": CLOSED_PORT_ADDRESS,
-        "path_style": true,
-    })
-    .to_string();
-    let direct_req = serde_json::json!({
-        "type": "createVirtualSchema",
-        "properties": {
-            "CATALOG_CONNECTION": "MY_CONN",
-            "CATALOG_KIND": "DIRECT_STORAGE",
-        },
-    });
-    let direct_err = dispatch(
-        &mut TestContext::scalar(vec![]).with_connection(
-            "MY_CONN",
-            password_connection("s3://bucket/lake", direct_password),
-        ),
-        &direct_req,
-    )
-    .expect_err("no live object store is reachable in a unit test");
-    assert!(
-        !direct_err.to_string().contains(&expected),
-        "DIRECT_STORAGE must not require NAMESPACE, got: {direct_err}"
-    );
-}
-
-// A closed local port: connection refused, no DNS, no hang, so resolution fails fast.
-const CLOSED_PORT_ADDRESS: &str = "http://127.0.0.1:1";
-
-#[test]
-
-fn unity_kind_pushdown_routes_to_the_unity_catalog_loader() {
-    let req = with_identifier_notes(
-        serde_json::json!({
-            "type": "pushdown",
-            "properties": {
-                "CATALOG_KIND": "UNITY_CATALOG",
-                "CATALOG_CONNECTION": "MY_CONN",
-            },
-            "involvedTables": [{
-                "name": "ORDERS",
-                "columns": [{
-                    "name": "ID",
-                    "dataType": {"type": "decimal", "precision": 20, "scale": 0},
-                    "adapterNotes": r#"{"sourceType":{"name":"id","arrow_type":"int64","nullable":true}}"#,
-                }],
-            }],
-        }),
-        &[("ORDERS", "cat.sch.orders")],
-    );
-
-    let err = dispatch(
-        &mut TestContext::scalar(vec![]).with_connection(
-            "MY_CONN",
-            password_connection(CLOSED_PORT_ADDRESS, s3_style_password()),
-        ),
-        &req,
-    )
-    .expect_err("no live Unity Catalog is reachable in a unit test");
-
-    let message = err.to_string();
-    assert!(
-        message.contains("Unity Catalog load table request failed"),
-        "must reach the Unity Catalog load-table call, got: {message}"
-    );
-    assert!(
-        message.contains("unity-catalog/tables"),
-        "must name the Unity Catalog load-table endpoint: {message}"
-    );
-    assert!(
-        !message.contains("not yet supported"),
-        "the removed pushdown-path refusal must not resurface: {message}"
-    );
-}
-
 #[test]
 fn cluster_nodes_from_context_defaults_to_one_when_node_count_zero() {
     assert_eq!(cluster_nodes_from_context(&DefaultsCtx), 1usize);
@@ -424,21 +128,20 @@ fn cluster_nodes_from_context_passes_through_reported_node_count() {
     );
 }
 
+/// A pushdown request whose schema carries `notes` as its adapterNotes string.
+fn pushdown_with_notes(notes: &str) -> Json {
+    serde_json::json!({"type": "pushdown", "schemaMetadataInfo": {"adapterNotes": notes}})
+}
+
 #[test]
 fn adapter_note_absent_or_unparseable_yields_none() {
     let bare = serde_json::json!({"type": "pushdown"});
     assert!(adapter_note(&bare, NOTE_PARALLELISM_FACTOR).is_none());
 
-    let garbage = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": "not json" },
-    });
+    let garbage = pushdown_with_notes("not json");
     assert!(adapter_note(&garbage, NOTE_PARALLELISM_FACTOR).is_none());
 
-    let empty = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": "" },
-    });
+    let empty = pushdown_with_notes("");
     assert!(adapter_note(&empty, NOTE_PARALLELISM_FACTOR).is_none());
 }
 
@@ -481,66 +184,6 @@ fn build_adapter_notes_merges_existing() {
     );
 }
 
-/// Scenario: Refresh rebuilds every identifier note and preserves other adapter notes
-#[test]
-fn refresh_writes_an_identifier_note_on_every_returned_table() {
-    let request = serde_json::json!({
-        "type": "refresh",
-        "schemaMetadataInfo": {
-            "adapterNotes": serde_json::json!({"OTHER_KEY": "keep-me"}).to_string(),
-        },
-    });
-    let listing = CatalogListing {
-        tables: vec![
-            named_table(&["ns"], "orders", TableFormat::Iceberg, Vec::new()),
-            named_table(&["ns", "eu"], "Events", TableFormat::Iceberg, Vec::new()),
-        ],
-        skipped: Vec::new(),
-    };
-    let tables = build_listing_virtual_tables(
-        &["ns".to_string()],
-        &listing,
-        EngineTimestampSupport::MillisecondOnly,
-    )
-    .unwrap();
-
-    let response = build_schema_response(
-        &request,
-        json!({
-            "tables": tables,
-            "adapterNotes": build_adapter_notes(
-                &request,
-                &TuningNotes::default(),
-                &SkippedTables::listed(&listing.skipped),
-            ),
-        }),
-    );
-
-    let returned = response["schemaMetadata"]["tables"].as_array().unwrap();
-    let notes: Vec<(&str, Json)> = returned
-        .iter()
-        .map(|table| {
-            let note = table["adapterNotes"]
-                .as_str()
-                .expect("a note on every table");
-            (
-                table["name"].as_str().unwrap(),
-                serde_json::from_str(note).unwrap(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        notes,
-        vec![
-            ("ORDERS", json!({"name": "ns.orders"})),
-            ("EU__EVENTS", json!({"name": "ns.eu.Events"})),
-        ]
-    );
-    let schema_notes: Json =
-        serde_json::from_str(response["schemaMetadata"]["adapterNotes"].as_str().unwrap()).unwrap();
-    assert_eq!(schema_notes["OTHER_KEY"], "keep-me");
-}
-
 #[test]
 fn create_vs_records_parallelism_factor() {
     let tuning = resolved_tuning(serde_json::json!({ PROP_PARALLELISM_FACTOR: "4" }), 1);
@@ -577,10 +220,7 @@ fn adapter_notes_carry_parallelism_factor() {
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
-    let pushdown_req = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": notes_str },
-    });
+    let pushdown_req = pushdown_with_notes(notes_str);
     assert_eq!(
         adapter_note(&pushdown_req, NOTE_PARALLELISM_FACTOR).as_deref(),
         Some("12"),
@@ -665,10 +305,7 @@ fn df_batch_size_uses_supplied_value() {
     let notes = build_adapter_notes(&req, &tuning, &SkippedTables::default());
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
-    let pushdown_req = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": notes_str },
-    });
+    let pushdown_req = pushdown_with_notes(notes_str);
     assert_eq!(
         adapter_note(&pushdown_req, NOTE_DF_BATCH_SIZE).as_deref(),
         Some("4096"),
@@ -757,10 +394,7 @@ fn join_broadcast_max_bytes_round_trips_through_adapter_notes() {
         &SkippedTables::default(),
     );
 
-    let pushdown_req = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": notes.as_str().unwrap() },
-    });
+    let pushdown_req = pushdown_with_notes(notes.as_str().unwrap());
 
     assert_eq!(
         adapter_note(&pushdown_req, NOTE_JOIN_BROADCAST_MAX_BYTES).as_deref(),
@@ -783,10 +417,7 @@ fn memory_budget_params_round_trip_through_adapter_notes() {
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
-    let pushdown_req = serde_json::json!({
-        "type": "pushdown",
-        "schemaMetadataInfo": { "adapterNotes": notes_str },
-    });
+    let pushdown_req = pushdown_with_notes(notes_str);
     assert_eq!(
         adapter_note(&pushdown_req, NOTE_MEMORY_POOL_FRACTION).as_deref(),
         Some("0.5"),
@@ -1089,13 +720,6 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
     );
 }
 
-fn skipped_entry(table: &str, reason: SkipReason) -> SkippedTable {
-    SkippedTable {
-        ident: cat_ident(&["sales"], table),
-        reason,
-    }
-}
-
 /// Scenario: Every skipped table is recorded with its reason under every catalog kind
 #[test]
 fn skipped_tables_are_recorded_with_reasons_for_every_kind() {
@@ -1303,67 +927,35 @@ const ACCESS_DENIED_RESPONSE: &str = r#"<ErrorResponse xmlns="https://sts.amazon
 /// An empty namespace enumeration page, so a create lists zero tables and succeeds.
 const EMPTY_LISTING: &str = r#"{"identifiers":[],"namespaces":[]}"#;
 
-/// A loopback server standing in for both AWS STS and the catalog: an
-/// STS-signed request is answered with `sts`, every other request with
-/// `catalog`, and each request head is recorded in arrival order.
-///
-/// It runs on a runtime of its own because `dispatch` blocks on its own
-/// current-thread runtime, which a `#[tokio::test]` would nest.
+/// The shared fake standing in for both AWS STS and the catalog: an STS-signed request is
+/// answered with `sts`, every other request with `catalog`, each recorded in arrival order.
 struct StsAndCatalog {
     uri: String,
-    heads: Arc<Mutex<Vec<String>>>,
+    requests: RecordedRequests,
     _runtime: tokio::runtime::Runtime,
 }
 
 impl StsAndCatalog {
     fn start(sts: (u16, &'static str), catalog: (u16, &'static str)) -> Self {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("build the stub runtime");
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .expect("bind a loopback port");
-        let uri = format!("http://{}", listener.local_addr().expect("local_addr"));
-        let heads = Arc::new(Mutex::new(Vec::new()));
-        let recorded = heads.clone();
-        runtime.spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let mut head = Vec::new();
-                let mut chunk = [0u8; 1024];
-                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-                    let read = stream.read(&mut chunk).await.unwrap_or(0);
-                    if read == 0 {
-                        break;
-                    }
-                    head.extend_from_slice(&chunk[..read]);
-                }
-                let head = String::from_utf8_lossy(&head).into_owned();
-                let (status, body) = if is_assume_role(&head) {
-                    sts
+        let ((uri, requests), runtime) =
+            serve_on_own_runtime(spawn_fake_http_server(move |head| {
+                let ((status, body), content_type) = if is_assume_role(head) {
+                    (sts, "text/xml")
                 } else {
-                    catalog
+                    (catalog, "application/json")
                 };
-                recorded.lock().unwrap().push(head);
-                let response = format!(
-                    "HTTP/1.1 {status} Stub\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        });
+                (status, content_type, body.to_string())
+            }));
         Self {
             uri,
-            heads,
+            requests,
             _runtime: runtime,
         }
     }
 
     fn heads(&self) -> Vec<String> {
-        self.heads.lock().unwrap().clone()
+        let requests = self.requests.lock().unwrap();
+        requests.iter().map(|(head, _)| head.clone()).collect()
     }
 
     fn sts_requests(&self) -> usize {

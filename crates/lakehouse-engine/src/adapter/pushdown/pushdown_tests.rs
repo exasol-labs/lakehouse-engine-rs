@@ -123,8 +123,7 @@ fn grouped_scan_spec_carries_group_keys() {
             arg_expr: None,
         }]),
         group_keys: Some(group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![FileEntry::new("s3://w/f0.parquet", 1)]);
     let json = spec.to_json();
@@ -342,8 +341,7 @@ fn scan_spec_carries_no_catalog_block() {
         projection: vec!["ID".into(), "NAME".into()],
         filter: Some("(\"ID\" > 10)".into()),
         limit: Some(100),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![FileEntry::new(
         "s3://warehouse/db/events/part-00000.parquet",
@@ -462,8 +460,7 @@ fn pushdown_carries_logical_schema_in_common_arg() {
 
     let spec = CommonScanSpec {
         logical_schema: logical.clone(),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let json = spec.to_json();
@@ -714,8 +711,7 @@ fn iceberg_declaration_default_less_spec_round_trips_unchanged() {
 
     let spec = CommonScanSpec {
         logical_schema: logical.clone(),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let json = spec.to_json();
@@ -1260,15 +1256,7 @@ fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
     }));
     let proj_cols = vec![ProjectionItem::from("NAME")];
     let proj_types = vec![ExasolType::WIDEST_VARCHAR];
-    let logical_schema = vec![LogicalField {
-        field_id: Some(2),
-        name: "NAME".to_string(),
-        arrow_type: "utf8".to_string(),
-        nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
-    }];
+    let logical_schema = vec![bound_field(2, "NAME", "utf8")];
 
     let sql = guard_dispatch_sql(
         &request,
@@ -1318,15 +1306,7 @@ fn nonzero_offset_nulls_the_effective_limit() {
     }));
     let proj_cols = vec![ProjectionItem::from("NAME")];
     let proj_types = vec![ExasolType::WIDEST_VARCHAR];
-    let logical_schema = vec![LogicalField {
-        field_id: Some(2),
-        name: "NAME".to_string(),
-        arrow_type: "utf8".to_string(),
-        nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
-    }];
+    let logical_schema = vec![bound_field(2, "NAME", "utf8")];
 
     let sql = guard_dispatch_sql(
         &request,
@@ -1373,15 +1353,7 @@ fn declined_order_by_extension_runs_after_topn_detection() {
     }];
     let proj_types = vec![ExasolType::decimal(1, 0)];
     // A non-JSON-fallback type, so that guard cannot be what declines the top-N.
-    let logical_schema = vec![LogicalField {
-        field_id: Some(2),
-        name: "NAME".to_string(),
-        arrow_type: "utf8".to_string(),
-        nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
-    }];
+    let logical_schema = vec![bound_field(2, "NAME", "utf8")];
 
     let sql = guard_dispatch_sql(
         &request,
@@ -1695,156 +1667,20 @@ fn accepted_timestamp_precision_cast_takes_scan_path() {
     );
 }
 
+/// Scenario: One catalog session per request serves every table the request resolves
 #[tokio::test]
-
-async fn malformed_table_ident_fails_before_any_catalog_contact() {
-    let creds = ConnectionCreds {
-        warehouse: "warehouse".into(),
-        endpoint: "http://minio:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "minioadmin".into(),
-        secret_key: "minioadmin".into(),
-        session_token: None,
-        path_style: Some(true),
-        use_sigv4: false,
-        use_vended_credentials: false,
-        token: None,
-        client_id: Some("oauth-client-id-sentinel".into()),
-        client_secret: Some("oauth-client-secret-sentinel".into()),
-        oauth2_server_uri: None,
-        scope: None,
-        account_name: None,
-        account_key: None,
-        sas_token: None,
-        ..Default::default()
-    };
-
-    let catalog = CatalogProps {
-        warehouse: "warehouse".into(),
-        table: "malformed_identifier_with_no_namespace_separator".into(),
-    };
-
-    // An empty `columns` array would fail in `project_columns` first, masking the ordering.
-    let request = nq4_request();
-
+async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
+    let iceberg = iceberg_catalog().await;
     let conn = ResolvedConnectionConfig {
-        catalog_uri: "http://127.0.0.1:1".to_string(),
+        catalog_uri: iceberg.uri.clone(),
         storage: sample_storage(),
-        creds,
-        allow_http: false,
+        creds: unauthenticated_creds(),
+        allow_http: true,
         catalog_kind: CatalogKind::IcebergRest,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
         permission_check: crate::adapter::permission::PermissionCheck::Off,
     };
-    let result = handle_pushdown(
-        &request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
-    )
-    .await;
-
-    let err = result.expect_err("a malformed table identifier must fail");
-    let message = err.to_string();
-    assert!(
-        message.contains("namespace.table"),
-        "error must be parse_table_ident's own error, got: {message}"
-    );
-    assert!(
-        !message.contains("OAuth2"),
-        "error must not be the OAuth2 token request/transport error \
-             (would mean the session was built before the identifier was \
-             validated): {message}"
-    );
-}
-
-async fn seam_handle_pushdown(
-    request: &Json,
-    catalog_uri: &str,
-    catalog: &CatalogProps,
-    catalog_kind: CatalogKind,
-    creds: &ConnectionCreds,
-) -> Result<Json, UdfError> {
-    let conn = ResolvedConnectionConfig {
-        catalog_uri: catalog_uri.to_string(),
-        storage: sample_storage(),
-        creds: creds.clone(),
-        allow_http: true,
-        catalog_kind,
-        connection_name: TEST_CONNECTION_NAME.to_string(),
-        sealed_storage_key: Some(test_sealing_key()),
-        permission_check: crate::adapter::permission::PermissionCheck::Off,
-    };
-    handle_pushdown(
-        request, &conn, catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
-    )
-    .await
-}
-
-/// Scenario: Every pushdown request shape resolves through the one format-reader seam
-#[tokio::test]
-async fn every_request_shape_resolves_through_the_format_reader_seam() {
-    let iceberg = iceberg_catalog().await;
-    let creds = unauthenticated_creds();
-    let iceberg_catalog_props = CatalogProps {
-        warehouse: "wh".into(),
-        table: "db.t".into(),
-    };
-    let result = seam_handle_pushdown(
-        &with_iceberg_notes(nq4_request()),
-        &iceberg.uri,
-        &iceberg_catalog_props,
-        CatalogKind::IcebergRest,
-        &creds,
-    )
-    .await
-    .expect("a snapshotless Iceberg table resolves an empty pushdown result");
-    assert_eq!(result["type"], "pushdown");
-    assert_eq!(
-        iceberg.targets(),
-        vec![
-            ICEBERG_CONFIG_TARGET.to_string(),
-            ICEBERG_LOAD_TABLE_TARGET.to_string()
-        ],
-        "the Iceberg reader must be reached through the resolver"
-    );
-
-    let unity = RecordingCatalog::spawn(|target| {
-        if target == UNITY_TABLE_TARGET {
-            (200, locationless_delta_table_body())
-        } else {
-            (404, r#"{"message":"no such table"}"#.to_string())
-        }
-    })
-    .await;
-    let unity_catalog_props = CatalogProps {
-        warehouse: "wh".into(),
-        table: "cat.sch.orders".into(),
-    };
-    let lineitem = [("l_orderkey", "long"), ("l_extendedprice", "decimal(18,2)")];
-    let err = seam_handle_pushdown(
-        &with_delta_notes(nq4_request(), "LINEITEM", &lineitem, &[]),
-        &unity.uri,
-        &unity_catalog_props,
-        CatalogKind::UnityCatalogNative,
-        &creds,
-    )
-    .await
-    .expect_err("a Delta table carrying no storage location cannot be planned");
-    assert_eq!(
-        unity.targets(),
-        vec![UNITY_TABLE_TARGET.to_string()],
-        "the Delta reader must be reached through the SAME resolver, not a routed-around path"
-    );
-    assert!(
-        err.to_string().contains("cat.sch.orders"),
-        "the Delta reader's own plan-time error must name the table: {err}"
-    );
-}
-
-/// Scenario: One catalog session per request serves every table the request resolves
-#[tokio::test]
-async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
-    let iceberg = iceberg_catalog().await;
-    let creds = unauthenticated_creds();
     let catalog_props = CatalogProps {
         warehouse: "wh".into(),
         table: "unused-on-the-join-path".into(),
@@ -1879,12 +1715,20 @@ async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
         &[("CUSTOMER", "db.customer"), ("ORDERS", "db.orders")],
     ));
 
-    seam_handle_pushdown(
+    handle_pushdown(
         &request,
-        &iceberg.uri,
+        &conn,
         &catalog_props,
-        CatalogKind::IcebergRest,
-        &creds,
+        None,
+        1,
+        1,
+        1,
+        1024,
+        1,
+        0.6,
+        200,
+        4,
+        1024,
     )
     .await
     .expect("a two-leg join over snapshotless Iceberg tables resolves");
@@ -1897,42 +1741,6 @@ async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
             "/v1/namespaces/db/tables/orders?snapshots=refs".to_string(),
         ],
         "one /v1/config for the whole request, then exactly one loadTable per leg"
-    );
-}
-
-/// Scenario: A Unity Catalog table's identity survives the round trip from the involved table
-#[tokio::test]
-async fn a_malformed_unity_identifier_is_refused_in_unity_terms_before_any_catalog_contact() {
-    let unity = RecordingCatalog::spawn(|_| (200, locationless_delta_table_body())).await;
-    let creds = unauthenticated_creds();
-    let catalog = CatalogProps {
-        warehouse: "wh".into(),
-        table: "orders".into(),
-    };
-
-    let err = seam_handle_pushdown(
-        &nq4_request(),
-        &unity.uri,
-        &catalog,
-        CatalogKind::UnityCatalogNative,
-        &creds,
-    )
-    .await
-    .expect_err("an identifier that addresses no Unity Catalog table must be refused");
-
-    let message = err.to_string();
-    assert!(
-        message.contains("catalog.schema.table"),
-        "the refusal must state the Unity Catalog address form: {message}"
-    );
-    assert!(
-        !message.contains("namespace.table"),
-        "Iceberg's identifier rule must not judge a Unity Catalog identifier: {message}"
-    );
-    assert!(
-        unity.targets().is_empty(),
-        "a malformed identifier must cost no catalog request: {:?}",
-        unity.targets()
     );
 }
 
@@ -2336,15 +2144,6 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         "the dimension side's OWN partition columns must reach JoinSpec, independent of \
          the fact side's: {join_sql}"
     );
-}
-
-fn char_cast_key(size: u64, character_set: &str) -> Json {
-    serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": {"type": "CHAR", "size": size, "characterSet": character_set},
-        "arguments": [col("NAME")]
-    })
 }
 
 fn char_grouped_request(key: Json, key_type: Json, order_by: Option<Json>) -> Json {

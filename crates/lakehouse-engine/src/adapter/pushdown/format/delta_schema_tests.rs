@@ -882,7 +882,6 @@ fn an_entry_carrying_a_field_path_is_validated_by_its_pair_alone() {
     assert!(!is_supported_type_change(&unsupported));
 }
 
-/// Scenario: Every recorded Delta type change is validated, and an unsupported one refuses its column
 #[test]
 fn a_field_carrying_an_unsupported_recorded_type_change_is_refused_naming_both_types() {
     let field = StructField::nullable("value", DataType::DOUBLE).with_metadata([(

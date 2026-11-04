@@ -1,4 +1,5 @@
 use super::*;
+use crate::adapter::tests::test_support::props;
 use serde_json::json;
 
 const ALL_NAMES: [&str; 20] = [
@@ -34,15 +35,6 @@ const WHOLE_NUMBER_RANGES: [(&str, &str, &str); 7] = [
     ("DATAFUSION_BATCH_SIZE", "1", "4294967295"),
     ("JOIN_BROADCAST_MAX_BYTES", "1", "18446744073709551615"),
 ];
-
-fn props(pairs: &[(&str, &str)]) -> Json {
-    Json::Object(
-        pairs
-            .iter()
-            .map(|(name, value)| (name.to_string(), json!(value)))
-            .collect(),
-    )
-}
 
 fn message(pairs: &[(&str, &str)]) -> String {
     match check_properties(&props(pairs)) {

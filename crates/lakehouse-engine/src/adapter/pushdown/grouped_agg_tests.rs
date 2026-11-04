@@ -7,7 +7,7 @@ use super::super::support::{
 };
 use super::super::test_support::*;
 use super::*;
-use crate::scan::spec::{CommonScanSpec, ScanStorage};
+use crate::scan::spec::CommonScanSpec;
 use crate::scan::test_support::WithFiles;
 
 #[test]
@@ -256,17 +256,6 @@ fn make_group_by_request_with_types(
     })
 }
 
-/// Its own `dataType` is the only place the key's type appears when the key is not
-/// also in the select list.
-fn char_cast_key(size: u64, character_set: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": {"type": "CHAR", "size": size, "characterSet": character_set},
-        "arguments": [col("NAME")],
-    })
-}
-
 fn varchar_cast_key(size: u64) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar_cast",
@@ -297,10 +286,6 @@ fn upper_item(column: &str) -> serde_json::Value {
     })
 }
 
-fn decimal_type(precision: u64, scale: u64) -> serde_json::Value {
-    serde_json::json!({"type": "decimal", "precision": precision, "scale": scale})
-}
-
 #[test]
 fn detect_group_by_aggregates_column_key() {
     let req = make_group_by_request(
@@ -324,13 +309,7 @@ fn detect_group_by_aggregates_column_key() {
 }
 
 fn grouped_spec(result: &GroupedAggregateDetection) -> ScanSpec {
-    CommonScanSpec {
-        aggregates: Some(result.plans.clone()),
-        group_keys: Some(result.group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![])
+    grouped_spec_template(&result.plans, &result.group_keys)
 }
 
 #[test]
@@ -517,13 +496,7 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
     // A row-scan fallback would return one row per source row, not per group.
     let group_key_types = group_key_exasol_types(&req, &result.group_keys, &result.select_items);
     let sql = build_grouped_aggregate_scan_sql(
-        &CommonScanSpec {
-            aggregates: Some(result.plans.clone()),
-            group_keys: Some(result.group_keys.clone()),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        }
-        .with_files(vec![]),
+        &grouped_spec_template(&result.plans, &result.group_keys),
         &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
         &result.group_keys,
         &group_key_types,
@@ -740,13 +713,7 @@ fn detect_group_by_all_expression_multi_key() {
     let col_types: Vec<(String, ExasolType)> = vec![];
     let group_key_types = vec![ExasolType::WIDEST_VARCHAR; 2];
     let aggregate_types = vec![ExasolType::decimal(18, 0)];
-    let spec_template = CommonScanSpec {
-        aggregates: Some(result.plans.clone()),
-        group_keys: Some(result.group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
+    let spec_template = grouped_spec_template(&result.plans, &result.group_keys);
     let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
@@ -819,13 +786,7 @@ fn build_grouped_agg_sql(
         ("AMOUNT".to_string(), ExasolType::DoublePrecision),
         ("SCORE".to_string(), ExasolType::DoublePrecision),
     ];
-    let spec_template = CommonScanSpec {
-        aggregates: Some(agg_plans.clone()),
-        group_keys: Some(group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
+    let spec_template = grouped_spec_template(&agg_plans, &group_keys);
     let files_with_sizes: Vec<FileEntry> =
         files.into_iter().map(|p| FileEntry::new(p, 1)).collect();
     let shards = crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, g);
@@ -974,8 +935,7 @@ fn grouped_common_blob_has_no_limit() {
             arg_expr: None,
         }]),
         group_keys: Some(vec!["\"REGION\"".into()]),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
@@ -1023,8 +983,7 @@ fn grouped_merge_offset_never_reaches_per_shard_spec() {
             arg_expr: None,
         }]),
         group_keys: Some(vec!["\"REGION\"".into()]),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
@@ -1072,8 +1031,7 @@ fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
             arg_expr: None,
         }]),
         group_keys: Some(vec!["\"REGION\"".into()]),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
@@ -1253,13 +1211,7 @@ fn build_grouped_agg_sql_with_select_items(
         ("AMOUNT".to_string(), ExasolType::DoublePrecision),
         ("SCORE".to_string(), ExasolType::DoublePrecision),
     ];
-    let spec_template = CommonScanSpec {
-        aggregates: Some(agg_plans.clone()),
-        group_keys: Some(group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
+    let spec_template = grouped_spec_template(&agg_plans, &group_keys);
     let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
     build_grouped_aggregate_scan_sql(
         &spec_template,
@@ -1486,13 +1438,7 @@ fn build_grouped_from_detection(req: &serde_json::Value) -> String {
     let d = detect_group_by_aggregates(req)
         .expect("must detect the grouped scalar-over-aggregate pushdown");
     let group_key_types = group_key_exasol_types(req, &d.group_keys, &d.select_items);
-    let spec_template = CommonScanSpec {
-        aggregates: Some(d.plans.clone()),
-        group_keys: Some(d.group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
+    let spec_template = grouped_spec_template(&d.plans, &d.group_keys);
     build_grouped_aggregate_scan_sql(
         &spec_template,
         &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
@@ -1698,10 +1644,7 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
     });
     let all_cols = involved_columns(&request, |tables| tables.first()).types;
     let referenced = referenced_columns(&pushdown_req, &column_types(&all_cols));
-    let fan_out_spec = CommonScanSpec {
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    };
+    let fan_out_spec = sample_common_spec();
     let fan_out = FanOutProjection::new(fan_out_spec, &referenced);
     let sql = build_qualified_single_table_fallback_sql(
         &request,
@@ -1788,13 +1731,7 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
 
     let col_types: Vec<(String, ExasolType)> =
         vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
-    let spec_template = CommonScanSpec {
-        aggregates: Some(detection.plans.clone()),
-        group_keys: Some(detection.group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
+    let spec_template = grouped_spec_template(&detection.plans, &detection.group_keys);
     let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
@@ -1859,13 +1796,7 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
 
     let col_types: Vec<(String, ExasolType)> =
         vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
-    let spec_template = CommonScanSpec {
-        aggregates: Some(detection.plans.clone()),
-        group_keys: Some(detection.group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
+    let spec_template = grouped_spec_template(&detection.plans, &detection.group_keys);
     let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
@@ -1927,13 +1858,7 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
 
     let col_types: Vec<(String, ExasolType)> =
         vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
-    let spec_template = CommonScanSpec {
-        aggregates: Some(detection.plans.clone()),
-        group_keys: Some(detection.group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
+    let spec_template = grouped_spec_template(&detection.plans, &detection.group_keys);
     let shards = vec![
         vec![("s3://wh/f0.parquet".to_string(), 1u64)],
         vec![("s3://wh/f1.parquet".to_string(), 1u64)],
@@ -2479,8 +2404,7 @@ fn having_clause_appears_in_outer_wrapper_only() {
             arg_expr: None,
         }]),
         group_keys: Some(vec![r#""REGION""#.to_string()]),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let shards = vec![vec![("s3://wh/f.parquet".to_string(), 1u64)]];

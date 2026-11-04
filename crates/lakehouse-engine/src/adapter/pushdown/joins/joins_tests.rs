@@ -237,6 +237,29 @@ pub(super) fn legs_from_leaves(leaves: Vec<JoinLeaf>) -> JoinLegs {
     .legs()
 }
 
+pub(super) fn self_join_legs() -> JoinLegs {
+    legs_from_leaves(vec![
+        JoinLeaf {
+            table_name: "FACT_ORDERS".to_string(),
+            table_alias: Some("A".to_string()),
+            table_identifier: "lh.fact_orders".to_string(),
+        },
+        JoinLeaf {
+            table_name: "FACT_ORDERS".to_string(),
+            table_alias: Some("B".to_string()),
+            table_identifier: "lh.fact_orders".to_string(),
+        },
+    ])
+}
+
+pub(super) fn like_over(column: &str, table: &str, pattern: &str) -> Json {
+    serde_json::json!({
+        "type": "predicate_like",
+        "expression": table_col(table, column),
+        "pattern": str_lit(pattern)
+    })
+}
+
 pub(super) fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> ResolvedJoinSide {
     let lower = table_name.to_lowercase();
     ResolvedJoinSide::new(
@@ -249,13 +272,8 @@ pub(super) fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> Resolv
                 .collect(),
             effective_storage: sample_storage(),
             logical_schema: vec![LogicalField {
-                field_id: Some(1),
-                name: format!("{table_name}_KEY"),
-                arrow_type: "int64".to_string(),
                 nullable: false,
-                initial_default: None,
-                nested: None,
-                physical_name: None,
+                ..bound_field(1, &format!("{table_name}_KEY"), "int64")
             }],
             table_root: format!("s3://warehouse/lh/{lower}"),
             name_mapping: Vec::new(),
@@ -672,33 +690,6 @@ async fn iceberg_pushdown(request: &Json, catalog_uri: &str) -> Result<Json, Udf
     .await
 }
 
-/// A zero broadcast threshold forces the N-scan fallback, which indexes sides by leg.
-async fn delta_n_scan_pushdown(
-    request: &Json,
-    catalog_uri: &str,
-    storage: StorageBackend,
-    table: &str,
-) -> Result<Json, UdfError> {
-    let conn = ResolvedConnectionConfig {
-        catalog_uri: catalog_uri.to_string(),
-        storage,
-        creds: unauthenticated_creds(),
-        allow_http: true,
-        catalog_kind: CatalogKind::UnityCatalogNative,
-        connection_name: TEST_CONNECTION_NAME.to_string(),
-        sealed_storage_key: Some(test_sealing_key()),
-        permission_check: PermissionCheck::Off,
-    };
-    let catalog = CatalogProps {
-        warehouse: "wh".into(),
-        table: table.into(),
-    };
-    crate::adapter::pushdown::handle_pushdown(
-        request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 0,
-    )
-    .await
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn join_legs_resolve_concurrently_in_leg_index_order() {
     let catalog = RendezvousCatalog::spawn(2).await;
@@ -718,30 +709,5 @@ async fn join_legs_resolve_concurrently_in_leg_index_order() {
     assert_eq!(
         planned["type"], "pushdown",
         "the concurrency change must leave the planned response shape untouched: {planned:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn resolved_join_sides_stay_in_leg_index_order() {
-    let catalog = unity_delta_catalog().await;
-    let storage = two_delta_legs_each_pruned_by_its_own_local_filter().await;
-    let request = partitioned_legs_request();
-
-    let result = delta_n_scan_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
-        .await
-        .expect("two non-empty Delta legs plan the N-scan fallback");
-    let sql = result["sql"]
-        .as_str()
-        .expect("a planned pushdown carries sql");
-
-    let customer = sql
-        .find("c_region=")
-        .expect("the left leg's own files must be rendered");
-    let orders = sql
-        .find("o_status=")
-        .expect("the right leg's own files must be rendered");
-    assert!(
-        customer < orders,
-        "the resolved sides must stay in leg-index order, left leaf first: {sql}"
     );
 }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::base_creds;
-use crate::unity::mock_server::spawn;
+use crate::test_support::spawn_recording_server;
 use crate::{CatalogClient, CatalogTableIdent, CatalogTableType, ColumnSourceType, TableFormat};
 use exasol_udf_sdk::error::UdfError;
 use std::sync::Arc;
@@ -49,7 +49,7 @@ fn empty_tables_body() -> String {
 
 #[tokio::test]
 async fn lists_tables_in_catalog_schema() {
-    let server = spawn(|_req| (200, tables_page_body())).await;
+    let server = spawn_recording_server(|_req| (200, tables_page_body())).await;
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
     let listing = session
@@ -155,7 +155,7 @@ async fn includes_managed_and_external_delta_base_tables() {
         {"name":"external_orders_clone","table_type":"EXTERNAL_SHALLOW_CLONE","data_source_format":"DELTA","storage_location":"s3://bucket/external_orders_clone","columns":[]}
     ]}"#
     .to_string();
-    let server = spawn(move |_req| (200, body.clone())).await;
+    let server = spawn_recording_server(move |_req| (200, body.clone())).await;
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
     let listing = session
@@ -194,7 +194,7 @@ async fn skips_view_unplannable_format_and_other_type_with_reason() {
         {"name":"streaming_orders","table_type":"STREAMING_TABLE","data_source_format":"DELTA","columns":[]}
     ]}"#
     .to_string();
-    let server = spawn(move |_req| (200, body.clone())).await;
+    let server = spawn_recording_server(move |_req| (200, body.clone())).await;
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
     let listing = session
@@ -242,7 +242,7 @@ async fn skips_view_unplannable_format_and_other_type_with_reason() {
 
 #[tokio::test]
 async fn loads_table_metadata_with_columns() {
-    let server = spawn(|_req| (200, single_table_body())).await;
+    let server = spawn_recording_server(|_req| (200, single_table_body())).await;
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
     let ident = CatalogTableIdent {
         namespace: vec!["cat".to_string(), "sch".to_string()],
@@ -280,7 +280,7 @@ async fn loads_table_metadata_with_columns() {
 
 #[tokio::test]
 async fn loads_table_percent_encodes_reserved_full_name_segments() {
-    let server = spawn(|_req| (200, single_table_body())).await;
+    let server = spawn_recording_server(|_req| (200, single_table_body())).await;
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
     let ident = CatalogTableIdent {
         namespace: vec!["cat".to_string(), "sch".to_string()],
@@ -298,7 +298,7 @@ async fn loads_table_percent_encodes_reserved_full_name_segments() {
 
 #[tokio::test]
 async fn follows_pagination_across_pages() {
-    let server = spawn(|req| {
+    let server = spawn_recording_server(|req| {
         if req.target.contains("page_token=") {
             (
                 200,
@@ -339,7 +339,7 @@ async fn follows_pagination_across_pages() {
 #[tokio::test]
 async fn request_failure_is_credential_safe_error() {
     // The mock echoes the received bearer into its error body.
-    let server = spawn(|req| {
+    let server = spawn_recording_server(|req| {
         (
             500,
             format!(
@@ -380,7 +380,7 @@ async fn a_failed_get_table_names_the_table() {
     const CLIENT_SECRET_SENTINEL: &str = "CLIENT_SECRET_SENTINEL_VALUE";
     const SCOPE_SENTINEL: &str = "SCOPE_SENTINEL_VALUE";
 
-    let server = spawn(|req| {
+    let server = spawn_recording_server(|req| {
         if req.target.ends_with("/oidc/v1/token") {
             return (
                 200,
@@ -461,7 +461,7 @@ async fn every_unity_request_kind_succeeds_after_one_503() {
         get_attempts.clone(),
         creds_attempts.clone(),
     );
-    let server = spawn(move |req| {
+    let server = spawn_recording_server(move |req| {
         if req.target.starts_with("/api/2.1/unity-catalog/tables/") {
             match get_counter.fetch_add(1, Ordering::SeqCst) {
                 0 => (503, String::new()),
@@ -518,8 +518,8 @@ async fn every_unity_request_kind_succeeds_after_one_503() {
 
 #[tokio::test]
 async fn identical_request_shape_oss_and_databricks() {
-    let oss = spawn(|_req| (200, empty_tables_body())).await;
-    let databricks = spawn(|_req| (200, empty_tables_body())).await;
+    let oss = spawn_recording_server(|_req| (200, empty_tables_body())).await;
+    let databricks = spawn_recording_server(|_req| (200, empty_tables_body())).await;
 
     let oss_session = UnityCatalogSession::new(&oss.base_url, base_creds());
     let mut databricks_creds = base_creds();
@@ -554,48 +554,6 @@ async fn identical_request_shape_oss_and_databricks() {
 }
 
 #[tokio::test]
-async fn posts_temporary_table_credentials() {
-    let server = spawn(|_req| {
-        (
-            200,
-            r#"{"aws_temp_credentials":{"access_key_id":"AK","secret_access_key":"SK","session_token":"ST"}}"#
-                .to_string(),
-        )
-    })
-    .await;
-    let session = UnityCatalogSession::new(&server.base_url, base_creds());
-
-    let vended = session
-        .temporary_table_credentials("table-uuid-1", "READ")
-        .await
-        .expect("post failed");
-
-    assert_eq!(
-        vended
-            .aws_temp_credentials
-            .expect("aws credentials")
-            .access_key_id,
-        "AK"
-    );
-    let requests = server.requests();
-    assert_eq!(requests[0].method, "POST");
-    assert_eq!(
-        requests[0].target,
-        "/api/2.1/unity-catalog/temporary-table-credentials"
-    );
-    assert!(
-        requests[0].body.contains("table-uuid-1"),
-        "body carries the table_id: {}",
-        requests[0].body
-    );
-    assert!(
-        requests[0].body.contains("READ"),
-        "body carries the operation: {}",
-        requests[0].body
-    );
-}
-
-#[tokio::test]
 async fn list_tables_tags_each_admitted_table_by_its_own_format() {
     let body = r#"{"tables":[
         {"name":"orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://b/orders","table_id":"uuid-managed","columns":[]},
@@ -609,7 +567,7 @@ async fn list_tables_tags_each_admitted_table_by_its_own_format() {
         {"name":"legacy_orders","table_type":"MANAGED","data_source_format":"ICEBERG","table_id":"uuid-iceberg","columns":[]}
     ]}"#
     .to_string();
-    let server = spawn(move |_req| (200, body.clone())).await;
+    let server = spawn_recording_server(move |_req| (200, body.clone())).await;
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
     let listing = session
@@ -674,7 +632,7 @@ async fn list_tables_tags_each_admitted_table_by_its_own_format() {
 
 #[tokio::test]
 async fn load_table_returns_format_tag_vending_key_partition_columns_and_ordered_columns() {
-    let server = spawn(|_req| (200, single_table_body())).await;
+    let server = spawn_recording_server(|_req| (200, single_table_body())).await;
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
     let table = session
@@ -707,7 +665,7 @@ async fn load_table_maps_the_uppercase_iceberg_and_parquet_formats_to_their_tags
         ("PARQUET", TableFormat::Parquet),
     ] {
         let body = table_body_with_raw_format(&format!(r#""data_source_format":"{raw_format}","#));
-        let server = spawn(move |_req| (200, body.clone())).await;
+        let server = spawn_recording_server(move |_req| (200, body.clone())).await;
         let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
         let table = session
@@ -731,7 +689,7 @@ async fn load_table_refuses_an_absent_or_unrecognized_data_source_format() {
         ("", ABSENT_DATA_SOURCE_FORMAT),
     ] {
         let body = table_body_with_raw_format(raw_format_member);
-        let server = spawn(move |_req| (200, body.clone())).await;
+        let server = spawn_recording_server(move |_req| (200, body.clone())).await;
         let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
         let err = session
@@ -756,7 +714,7 @@ async fn load_table_refuses_an_absent_or_unrecognized_data_source_format() {
 #[tokio::test]
 async fn load_table_format_refusal_carries_no_credential() {
     let body = table_body_with_raw_format(r#""data_source_format":"CSV","#);
-    let server = spawn(move |_req| (200, body.clone())).await;
+    let server = spawn_recording_server(move |_req| (200, body.clone())).await;
     let mut creds = base_creds();
     creds.token = Some(PAT_SENTINEL.to_string());
     let session = UnityCatalogSession::new(&server.base_url, creds);
@@ -778,7 +736,7 @@ async fn load_table_format_refusal_carries_no_credential() {
 #[tokio::test]
 async fn a_whitespace_only_table_id_projects_to_an_absent_vending_key() {
     let body = r#"{"name":"orders","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://bucket/orders","table_id":"   ","columns":[]}"#.to_string();
-    let server = spawn(move |_req| (200, body.clone())).await;
+    let server = spawn_recording_server(move |_req| (200, body.clone())).await;
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
     let table = session

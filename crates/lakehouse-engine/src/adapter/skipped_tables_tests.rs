@@ -1,15 +1,5 @@
 use super::*;
-use lakehouse_catalog::CatalogTableIdent;
-
-fn skipped_entry(table: &str, reason: SkipReason) -> SkippedTable {
-    SkippedTable {
-        ident: CatalogTableIdent {
-            namespace: vec!["sales".to_string()],
-            name: table.to_string(),
-        },
-        reason,
-    }
-}
+use crate::adapter::tests::test_support::skipped_entry;
 
 fn notes_of(value: Json) -> Map<String, Json> {
     match value {

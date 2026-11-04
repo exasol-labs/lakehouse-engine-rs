@@ -1,3 +1,4 @@
+use super::super::tests::self_join_legs;
 use super::*;
 use crate::adapter::pushdown::test_support::{
     aliased_col, col, num_lit, predicate_equal, table_col,
@@ -19,14 +20,6 @@ fn leaf(table_name: &str, table_alias: Option<&str>) -> JoinLeaf {
 
 fn equal(left: Json, right: Json) -> Json {
     predicate_equal(left, right)
-}
-
-/// `FROM FACT_ORDERS a JOIN FACT_ORDERS b` (#361's shape).
-fn self_join_legs() -> JoinLegs {
-    JoinLegs::from_leaves(&[
-        leaf("FACT_ORDERS", Some("A")),
-        leaf("FACT_ORDERS", Some("B")),
-    ])
 }
 
 fn two_table_legs() -> JoinLegs {

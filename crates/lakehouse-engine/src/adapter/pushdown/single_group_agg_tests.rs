@@ -60,10 +60,6 @@ fn float_div(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
     })
 }
 
-fn decimal_type(precision: u32, scale: u32) -> serde_json::Value {
-    serde_json::json!({"type": "decimal", "precision": precision, "scale": scale})
-}
-
 #[test]
 fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecomposable() {
     let req = serde_json::json!({

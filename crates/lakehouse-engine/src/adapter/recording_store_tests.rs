@@ -1,3 +1,5 @@
+//! An object store that wraps another and records every read and listing it serves.
+
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
 use object_store::path::Path as StorePath;
 use object_store::{ObjectMeta, ObjectStore, PutPayload};

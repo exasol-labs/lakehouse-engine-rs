@@ -1,6 +1,6 @@
 use super::*;
+use crate::test_support::user_message;
 use crate::{AdlsCred, ConnectionCreds, StaticStoreAddress, StorageBackend};
-use exasol_udf_sdk::error::UdfError;
 
 const SECRET_KEY_SENTINEL: &str = "SECRET_ACCESS_KEY_SENTINEL_VALUE";
 const SESSION_TOKEN_SENTINEL: &str = "SESSION_TOKEN_SENTINEL_VALUE";
@@ -47,13 +47,6 @@ fn both_families() -> TemporaryTableCredentials {
             sas_token: "sas".to_string(),
         }),
         gcp_oauth_token: None,
-    }
-}
-
-fn user_message(err: UdfError) -> String {
-    match err {
-        UdfError::User(msg) => msg,
-        _ => panic!("expected a UdfError::User variant"),
     }
 }
 

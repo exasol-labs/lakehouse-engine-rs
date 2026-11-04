@@ -7,7 +7,7 @@ use super::super::support::{
 use super::super::test_support::*;
 use super::super::{detect_aggregates, ordinary_plans, validate_agg_col_types};
 use super::*;
-use crate::scan::spec::{CommonScanSpec, FileEntry, ScanStorage};
+use crate::scan::spec::{CommonScanSpec, FileEntry};
 use crate::scan::test_support::WithFiles;
 
 /// Mirrors `handle_pushdown`'s synchronous post-resolution row-scan path.
@@ -89,8 +89,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
         limit: effective_limit,
         order_by,
         aggregates,
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+        ..sample_common_spec()
     }
     .with_files(vec![]);
     let files: Vec<FileEntry> = files.into_iter().map(FileEntry::from).collect();
@@ -123,24 +122,8 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
 /// Both sort-eligible columns are in-range DECIMALs, so neither needs the JSON fallback.
 fn lineitem_logical_schema() -> Vec<LogicalField> {
     vec![
-        LogicalField {
-            field_id: Some(1),
-            name: "L_ORDERKEY".into(),
-            arrow_type: "decimal128(20,0)".into(),
-            nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
-        },
-        LogicalField {
-            field_id: Some(2),
-            name: "L_EXTENDEDPRICE".into(),
-            arrow_type: "decimal128(18,2)".into(),
-            nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
-        },
+        bound_field(1, "L_ORDERKEY", "decimal128(20,0)"),
+        bound_field(2, "L_EXTENDEDPRICE", "decimal128(18,2)"),
     ]
 }
 
@@ -649,24 +632,8 @@ fn json_fallback_typed_sort_key_declines_topn() {
 
     // The reachable JSON-fallback tag (List/Struct/Binary all collapse to `utf8`).
     let fallback_schema = vec![
-        LogicalField {
-            field_id: Some(1),
-            name: "L_ORDERKEY".into(),
-            arrow_type: "decimal128(20,0)".into(),
-            nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
-        },
-        LogicalField {
-            field_id: Some(2),
-            name: "L_EXTENDEDPRICE".into(),
-            arrow_type: "decimal128(40,6)".into(),
-            nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
-        },
+        bound_field(1, "L_ORDERKEY", "decimal128(20,0)"),
+        bound_field(2, "L_EXTENDEDPRICE", "decimal128(40,6)"),
     ];
     assert!(
         crate::types::mapping::needs_json_fallback(&crate::types::mapping::arrow_type_from_tag(
@@ -679,15 +646,7 @@ fn json_fallback_typed_sort_key_declines_topn() {
         "a JSON-fallback-typed sort key must decline the top-N path"
     );
 
-    let missing_schema = vec![LogicalField {
-        field_id: Some(1),
-        name: "L_ORDERKEY".into(),
-        arrow_type: "decimal128(20,0)".into(),
-        nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
-    }];
+    let missing_schema = vec![bound_field(1, "L_ORDERKEY", "decimal128(20,0)")];
     assert!(
         detect_topn(&request, &pd(&request), &projected, &missing_schema).is_none(),
         "a sort key absent from the logical schema must decline defensively"
