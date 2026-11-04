@@ -204,7 +204,11 @@ async fn close_after_request(mut stream: TcpStream) {
 /// The returned values hold the queue full and must outlive the test's requests. The SYN drop
 /// holds on Linux but not on macOS, so this helper and its callers are Linux-only.
 #[cfg(target_os = "linux")]
-async fn spawn_full_backlog_listener() -> (SocketAddr, TcpListener, Vec<TcpStream>) {
+async fn spawn_full_backlog_listener() -> (
+    std::net::SocketAddr,
+    tokio::net::TcpListener,
+    Vec<TcpStream>,
+) {
     let socket = tokio::net::TcpSocket::new_v4().expect("a TCP socket");
     socket
         .bind("127.0.0.1:0".parse().unwrap())
