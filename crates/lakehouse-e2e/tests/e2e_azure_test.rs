@@ -21,7 +21,7 @@ use common::lakekeeper::{
     lakekeeper_connection_password, lakekeeper_create_adls_warehouse,
     lakekeeper_warehouse_storage_profile,
 };
-use common::raw_parquet::encode_parquet;
+use common::raw_parquet::{encode_parquet, put_object};
 use common::seed::{
     E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, SeedCatalogAuth, SeedStorage,
     decimal_18_0_values, seed_events_table_with_auth,
@@ -35,8 +35,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use futures::FutureExt;
 use object_store::azure::MicrosoftAzureBuilder;
-use object_store::path::Path as ObjectStorePath;
-use object_store::{ObjectStoreExt, PutPayload};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -321,15 +319,9 @@ fn write_azure_parquet_fixture(
         .with_access_key(key)
         .build()
         .unwrap_or_else(|e| panic!("configure Azure object store for {path}: {e}"));
-    runtime().block_on(async {
-        store
-            .put(
-                &ObjectStorePath::from(path),
-                PutPayload::from(encode_parquet(&batch)),
-            )
-            .await
-            .unwrap_or_else(|e| panic!("PUT Azure raw-Parquet fixture at {path}: {e}"));
-    });
+    runtime()
+        .block_on(put_object(&store, path, encode_parquet(&batch)))
+        .unwrap_or_else(|e| panic!("PUT Azure raw-Parquet fixture at {path}: {e:#}"));
 }
 
 /// Scenario: In-range Decimal128 maps to a precise Exasol DECIMAL
