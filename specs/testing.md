@@ -38,6 +38,20 @@ This file holds the rules for how this repository tests its behavior and how it 
 - A unit test that pins a rule uses an input that fails under the wrong rule. A feature-specific rule of this kind lives in that feature's spec.
 - No test restates standard-library behavior, such as asserting that two callers of one `str::to_uppercase` fold agree.
 
+### Test code
+
+Test code gets the same design care as production code. A test reads as the one behavior it proves: its body holds only the inputs and expectations that set it apart from its neighbors, and the setup it shares with them lives in a support module.
+
+- Each area keeps its shared test helpers in one support module: `crates/vs-expression/src/test_support_tests.rs`, `crates/lakehouse-catalog/src/test_support_tests.rs`, `crates/lakehouse-engine/src/scan/test_support_tests.rs`, `crates/lakehouse-engine/src/adapter/pushdown/test_support_tests.rs`, `crates/lakehouse-engine/tests/scan_fixture/` for the engine's host test binaries, and `crates/lakehouse-e2e/tests/common/` for the E2E suites. A new test starts from the helpers there.
+- A helper that a second test file needs moves into its area's support module. A helper that one file uses stays in that file.
+- A support module opens with a one- or two-line doc comment that says what it builds, so a reader can pick the right module without reading it whole.
+- Tests build request JSON, column nodes, Exasol types, file entries, scan specs, and join specs through the support builders, not as inline JSON or struct literals. A literal spells out every field, so a field added later edits every test instead of one builder.
+- A builder defaults every value that most tests share. A test sets only the values its behavior depends on.
+- The change that writes the second copy of a setup block, fixture, or assertion helper extracts it into a shared helper in the same change.
+- Variants of one scenario are rows of one case table, as in `crates/lakehouse-e2e/tests/common/pruning_cases.rs`, not copies of one test body.
+- A constructor on a production type serves tests only when production code calls it too, such as the `const` constructors of `ExasolType`. A constructor that only tests call is a test helper and lives in the support module (§ Testing strategy).
+- A test-only helper that unwraps a production type's private payload lives in its area's support module and is never `pub`.
+
 ### E2E suites
 
 | Suite | Cargo feature | Test binaries | Make targets | CI job (check name) | Stack | In `release` needs |
@@ -98,7 +112,7 @@ This file holds the rules for how this repository tests its behavior and how it 
 - A test that asserts a declared Exasol timestamp type reads the expected precision from the live session's engine version, through one shared test helper. The helper is a test-owned table and does not call the production version rule. The assertion matches the declared type in full, not by prefix. An oracle that compares rendered timestamp strings casts to the declared type the same helper returns.
 - The expected value of a widened `float` column is the f32's exact double expansion, never the decimal literal that was written.
 - The Lakekeeper suite's vended CONNECTION carries empty `access_key`, `secret_key`, `endpoint`, and `region` values, and the test asserts that shape. A non-empty CONNECTION `endpoint` would win over the vended one, so the scan would then prove nothing about vended addressing.
-- Prefix-tolerant type assertions stay in place where they hold on both Exasol versions. An exact assertion is added beside them, never in place of them.
+- A type assertion that must hold on both Exasol versions matches by prefix. An exact assertion sits beside it and does not replace it.
 - When a fixture's ability to reproduce a defect is uncertain, the suite establishes it by observation and fails with a message that says the fixture cannot reproduce the defect. The Lakekeeper suite does this for vended credential scope: it requests `loadTable` from Lakekeeper itself with the access-delegation header, records the `prefix` of the `storage_credentials` entry selected for each table, reads one data file of the other table with the first table's vended credential, and fails when that read is allowed.
 - A scenario about a pushdown shape the adapter advertises is proved against a live Exasol with `EXPLAIN VIRTUAL` and the executed query, never inferred from the capability registry or from code inspection.
 - A type-coverage test compares the declared types read from `SYS.EXA_ALL_COLUMNS` with an exact expected list, compares one `SELECT ID, <columns> ... ORDER BY ID` over the readable columns with exact expected values, reads each refused column alone, and shares the column values its fixtures write with the other suites.
@@ -112,8 +126,7 @@ This file holds the rules for how this repository tests its behavior and how it 
 - A change that a feature spec declares behavior-preserving keeps every existing unit and E2E test assertion, golden-SQL string, and `dispatch_golden` fixture unchanged. The only exceptions are the edits the change itself requires, such as import paths and call sites of a renamed or demoted item, and the one value the spec names as changing. No assertion is weakened, disabled, or deleted to make a test pass. A dedicated test cleanup may delete a test, provided the coverage stays the same and each scenario is still proved at one layer.
 - A committed golden SQL fixture (`dispatch_golden`) changes only with an intended change of the generated SQL. A diff in any other change is a regression, not an expected update.
 - A test whose assertion a change makes false is deleted together with its section banner and its test-only imports.
-- When code moves to another crate, its test module moves with it and keeps every test name and expected value. A test of a property of the code left behind stays with that code. A helper that several test modules share is declared once in the crate's `#[cfg(test)]` support module. No test is deleted, disabled, or weakened to fit a visibility change.
-- A test-only helper that unwraps a production type's private payload is declared in its crate's `#[cfg(test)]` support module and is never `pub`.
+- When code moves to another crate, its test module moves with it and keeps every test name and expected value. A test of a property of the code left behind stays with that code. No test is deleted, disabled, or weakened to fit a visibility change.
 - A structural contract that no runtime test can observe is pinned by a compile-time test that stays intact and unweakened. Examples are the contracts that the capability set takes no catalog-kind input, and that the Iceberg scan source carries a shared `CatalogSession`.
 
 ### Fixtures
