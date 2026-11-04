@@ -17,6 +17,7 @@ use aws_smithy_runtime_api::client::identity::Identity;
 use common::exasol_ws::{ExaConn, error_text};
 use common::stack::{CatalogConnectionPassword, build_create_connection_sql};
 use iceberg_catalog_rest::LoadTableResult;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -377,26 +378,51 @@ fn glue_namespace(glue_table: &str) -> &str {
 struct CloudVsTarget<'a> {
     conn_name: &'a str,
     vs_name: &'a str,
-    password: CatalogConnectionPassword,
+    namespace: &'a str,
 }
 
-fn setup_cloud_vs(conn: &mut ExaConn, env: &CloudEnv, target: &CloudVsTarget) {
+/// Creates the schema and CONNECTION, drops `vs_name`, and returns the `CREATE VIRTUAL SCHEMA`
+/// response, so a test can assert on a refused CREATE.
+fn try_setup_cloud_vs(conn: &mut ExaConn, create_conn_sql: &str, target: &CloudVsTarget) -> Value {
     conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
+    conn.execute(create_conn_sql);
 
-    let create_conn_sql =
-        build_create_connection_sql(target.conn_name, &env.glue_catalog_uri, &target.password);
-    conn.execute(&create_conn_sql);
-
-    let vs_name = target.vs_name;
+    let CloudVsTarget {
+        conn_name,
+        vs_name,
+        namespace,
+    } = target;
     let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs_name} CASCADE"));
-    conn.execute(&format!(
+    conn.try_execute(&format!(
         r#"CREATE VIRTUAL SCHEMA {vs_name}
 USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
-  CATALOG_CONNECTION = '{}'
-  NAMESPACE  = '{}'"#,
-        target.conn_name,
-        glue_namespace(&env.glue_table)
-    ));
+  CATALOG_CONNECTION = '{conn_name}'
+  NAMESPACE  = '{namespace}'"#
+    ))
+}
+
+fn setup_cloud_vs(conn: &mut ExaConn, create_conn_sql: &str, target: &CloudVsTarget) {
+    let resp = try_setup_cloud_vs(conn, create_conn_sql, target);
+    conn.assert_ok(&resp, &format!("CREATE VIRTUAL SCHEMA {}", target.vs_name));
+}
+
+/// The Glue-backed virtual schema `vs_name` over a CONNECTION built from `password`.
+fn setup_glue_cloud_vs(
+    conn: &mut ExaConn,
+    env: &CloudEnv,
+    conn_name: &str,
+    vs_name: &str,
+    password: &CatalogConnectionPassword,
+) {
+    setup_cloud_vs(
+        conn,
+        &build_create_connection_sql(conn_name, &env.glue_catalog_uri, password),
+        &CloudVsTarget {
+            conn_name,
+            vs_name,
+            namespace: glue_namespace(&env.glue_table),
+        },
+    );
 }
 
 #[test]
@@ -450,14 +476,12 @@ fn cloud_smoke_projection_filter_query() {
         &env.exasol_password,
     );
 
-    setup_cloud_vs(
+    setup_glue_cloud_vs(
         &mut conn,
         &env,
-        &CloudVsTarget {
-            conn_name: CLOUD_CATALOG_CONN,
-            vs_name: CLOUD_VS_NAME,
-            password: env.catalog_connection_password(),
-        },
+        CLOUD_CATALOG_CONN,
+        CLOUD_VS_NAME,
+        &env.catalog_connection_password(),
     );
 
     let table = vs_table(&env.glue_table);
@@ -518,14 +542,12 @@ fn cloud_sigv4_region_derived_from_glue_endpoint_lists_table() {
 
     let vs_name = format!("{CLOUD_VS_NAME}_NO_REGION");
 
-    setup_cloud_vs(
+    setup_glue_cloud_vs(
         &mut conn,
         &env,
-        &CloudVsTarget {
-            conn_name: CLOUD_CATALOG_CONN_NO_REGION,
-            vs_name: &vs_name,
-            password: env.catalog_connection_password_without_region(),
-        },
+        CLOUD_CATALOG_CONN_NO_REGION,
+        &vs_name,
+        &env.catalog_connection_password_without_region(),
     );
 
     let table_names = conn.query_columns(&format!(
@@ -571,14 +593,12 @@ fn cloud_perf_grouped_aggregate_smoke() {
         &env.exasol_password,
     );
 
-    setup_cloud_vs(
+    setup_glue_cloud_vs(
         &mut conn,
         &env,
-        &CloudVsTarget {
-            conn_name: CLOUD_CATALOG_CONN,
-            vs_name: CLOUD_VS_NAME,
-            password: env.catalog_connection_password(),
-        },
+        CLOUD_CATALOG_CONN,
+        CLOUD_VS_NAME,
+        &env.catalog_connection_password(),
     );
 
     let table = vs_table(&env.glue_table);
@@ -650,14 +670,12 @@ fn cloud_scan_reads_with_vended_credentials() {
         &env.exasol_password,
     );
 
-    setup_cloud_vs(
+    setup_glue_cloud_vs(
         &mut conn,
         &env,
-        &CloudVsTarget {
-            conn_name: CLOUD_CATALOG_CONN_VENDED,
-            vs_name: &format!("{CLOUD_VS_NAME}_VENDED"),
-            password: env.catalog_connection_password_vended(),
-        },
+        CLOUD_CATALOG_CONN_VENDED,
+        &format!("{CLOUD_VS_NAME}_VENDED"),
+        &env.catalog_connection_password_vended(),
     );
 
     let vended_table = format!("{CLOUD_VS_NAME}_VENDED.{}", vs_table_name(&env.glue_table));
@@ -880,35 +898,18 @@ fn catalog_token_oauth_auth_resolves_files_e2e() {
         &env.exasol_password,
     );
 
-    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
-
-    let create_conn_sql = env.build_create_connection_sql();
-    conn.execute(&create_conn_sql);
-
     let auth_vs_name = format!("{CLOUD_VS_NAME}_AUTH");
-    let _ = conn.try_execute(&format!(
-        "DROP VIRTUAL SCHEMA IF EXISTS {auth_vs_name} CASCADE"
-    ));
+    setup_cloud_vs(
+        &mut conn,
+        &env.build_create_connection_sql(),
+        &CloudVsTarget {
+            conn_name: CLOUD_CATALOG_CONN_AUTH,
+            vs_name: &auth_vs_name,
+            namespace: glue_namespace(&env.catalog_table),
+        },
+    );
 
-    let namespace = env
-        .catalog_table
-        .rsplit_once('.')
-        .map_or(env.catalog_table.as_str(), |(ns, _)| ns);
-
-    conn.execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA {auth_vs_name}
-USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
-  CATALOG_CONNECTION = '{CLOUD_CATALOG_CONN_AUTH}'
-  NAMESPACE  = '{namespace}'"#
-    ));
-
-    let table_part = env
-        .catalog_table
-        .split('.')
-        .next_back()
-        .unwrap_or(&env.catalog_table)
-        .to_uppercase();
-    let vs_table = format!("{auth_vs_name}.{table_part}");
+    let vs_table = format!("{auth_vs_name}.{}", vs_table_name(&env.catalog_table));
 
     let cols = conn.query_columns(&format!("SELECT * FROM {vs_table} LIMIT 5"));
     assert!(
@@ -1039,24 +1040,20 @@ fn cloud_assume_role_reaches_glue_and_s3_through_the_role() {
         &env.exasol_password,
     );
 
-    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
-
-    let create_conn_sql = build_create_connection_sql(
-        CLOUD_CATALOG_CONN_ASSUME_ROLE,
-        &env.glue_catalog_uri,
-        &env.catalog_connection_password_role(),
-    );
-    conn.execute(&create_conn_sql);
-
     let vs_name = format!("{CLOUD_VS_NAME}_ASSUME_ROLE");
-    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs_name} CASCADE"));
-    conn.execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA {vs_name}
-USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
-  CATALOG_CONNECTION = '{CLOUD_CATALOG_CONN_ASSUME_ROLE}'
-  NAMESPACE  = '{}'"#,
-        glue_namespace(&env.glue_table)
-    ));
+    setup_cloud_vs(
+        &mut conn,
+        &build_create_connection_sql(
+            CLOUD_CATALOG_CONN_ASSUME_ROLE,
+            &env.glue_catalog_uri,
+            &env.catalog_connection_password_role(),
+        ),
+        &CloudVsTarget {
+            conn_name: CLOUD_CATALOG_CONN_ASSUME_ROLE,
+            vs_name: &vs_name,
+            namespace: glue_namespace(&env.glue_table),
+        },
+    );
 
     let table = format!("{vs_name}.{}", vs_table_name(&env.glue_table));
 
@@ -1109,24 +1106,20 @@ fn cloud_assume_role_base_identity_alone_is_denied() {
         &env.exasol_password,
     );
 
-    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
-
-    let create_conn_sql = build_create_connection_sql(
-        CLOUD_CATALOG_CONN_ASSUME_ROLE_BASE_ONLY,
-        &env.glue_catalog_uri,
-        &env.catalog_connection_password_base_only(),
-    );
-    conn.execute(&create_conn_sql);
-
     let vs_name = format!("{CLOUD_VS_NAME}_ASSUME_ROLE_BASE_ONLY");
-    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs_name} CASCADE"));
-    let result = conn.try_execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA {vs_name}
-USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
-  CATALOG_CONNECTION = '{CLOUD_CATALOG_CONN_ASSUME_ROLE_BASE_ONLY}'
-  NAMESPACE  = '{}'"#,
-        glue_namespace(&env.glue_table)
-    ));
+    let result = try_setup_cloud_vs(
+        &mut conn,
+        &build_create_connection_sql(
+            CLOUD_CATALOG_CONN_ASSUME_ROLE_BASE_ONLY,
+            &env.glue_catalog_uri,
+            &env.catalog_connection_password_base_only(),
+        ),
+        &CloudVsTarget {
+            conn_name: CLOUD_CATALOG_CONN_ASSUME_ROLE_BASE_ONLY,
+            vs_name: &vs_name,
+            namespace: glue_namespace(&env.glue_table),
+        },
+    );
 
     let msg = error_text(&result, "CREATE as the base identity alone");
     assert!(
@@ -1163,28 +1156,21 @@ fn cloud_assume_role_wrong_external_id_is_denied() {
         &env.exasol_user,
         &env.exasol_password,
     );
-    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
-
     let conn_name = "GLUE_CATALOG_CREDS_ASSUME_ROLE_BAD_EXTERNAL_ID";
     let password = CatalogConnectionPassword {
         aws_external_id: Some(WRONG_EXTERNAL_ID.to_string()),
         ..env.catalog_connection_password_role()
     };
-    conn.execute(&build_create_connection_sql(
-        conn_name,
-        &env.glue_catalog_uri,
-        &password,
-    ));
-
     let vs_name = format!("{CLOUD_VS_NAME}_ASSUME_ROLE_BAD_EXTERNAL_ID");
-    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs_name} CASCADE"));
-    let result = conn.try_execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA {vs_name}
-USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
-  CATALOG_CONNECTION = '{conn_name}'
-  NAMESPACE  = '{}'"#,
-        glue_namespace(&env.glue_table)
-    ));
+    let result = try_setup_cloud_vs(
+        &mut conn,
+        &build_create_connection_sql(conn_name, &env.glue_catalog_uri, &password),
+        &CloudVsTarget {
+            conn_name,
+            vs_name: &vs_name,
+            namespace: glue_namespace(&env.glue_table),
+        },
+    );
 
     let msg = error_text(&result, "CREATE with a wrong external id");
     assert!(msg.contains("AccessDenied"), "{msg}");
