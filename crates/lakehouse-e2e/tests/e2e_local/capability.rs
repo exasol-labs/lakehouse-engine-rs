@@ -2175,9 +2175,7 @@ fn assert_no_hidden_columns(names: &[String], sql: &str) {
 /// `explain_virtual_sql`'s flattened blob is too coarse for asserting Exasol's wire
 /// payload: `contains("limit")` would also match the adapter's own scan-spec keys.
 fn explain_virtual_pushdown_request(conn: &mut ExaConn, sql: &str) -> serde_json::Value {
-    let resp = conn.execute(&format!("EXPLAIN VIRTUAL {sql}"));
-    let result_set = resp["responseData"]["results"][0]["resultSet"].clone();
-    conn.fetch_result_columns(&result_set)
+    explain_virtual_columns(conn, sql)
         .iter()
         .flat_map(|col| col.iter())
         .filter_map(|v| v.as_str())

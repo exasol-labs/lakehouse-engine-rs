@@ -25,8 +25,8 @@ use crate::common::timestamp_precision::{
     ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
 };
 use crate::fixtures::{
-    LAKEHOUSE_VS, events_table, explain_virtual_pushdown_sql, lakehouse_vs, typed_table,
-    vs_dim_table, vs_fact_table, vs_lineitem_table,
+    LAKEHOUSE_VS, create_lineitem_ground_truth_table, events_table, explain_virtual_pushdown_sql,
+    lakehouse_vs, typed_table, vs_dim_table, vs_fact_table, vs_lineitem_table,
 };
 
 /// Its recorded `DF_THREADS_PER_UDF` reads back the core count the adapter VM detected.
@@ -876,17 +876,7 @@ fn partial_avg_stddev_over_non_double_columns() {
 /// `aggregates`, not `group_keys`, is the discriminating field: single-group partial
 /// aggregation also emits `PARTIAL_` columns but never `group_keys`.
 fn assert_single_group_aggregate_pushed_down(conn: &mut ExaConn, query_sql: &str) {
-    let explain_sql = format!("EXPLAIN VIRTUAL {query_sql}");
-    let resp = conn.execute(&explain_sql);
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let cols = conn.fetch_result_columns(result_set);
-
-    let pushed_sql: String = cols
-        .iter()
-        .flat_map(|col| col.iter())
-        .filter_map(|v| v.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let pushed_sql = explain_virtual_sql(conn, query_sql);
 
     assert!(
         pushed_sql.contains("aggregates"),
@@ -1560,17 +1550,7 @@ fn scan_registers_assigned_files_with_path_size_payload() {
 /// Checks `group_keys` and the `PARTIAL_` prefix, not `GROUP BY shard_key`: a filter
 /// pruning to a single shard still pushes grouped aggregation but has no shard fan-out.
 fn assert_group_by_pushed_down(conn: &mut ExaConn, query_sql: &str) {
-    let explain_sql = format!("EXPLAIN VIRTUAL {query_sql}");
-    let resp = conn.execute(&explain_sql);
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let cols = conn.fetch_result_columns(result_set);
-
-    let pushed_sql: String = cols
-        .iter()
-        .flat_map(|col| col.iter())
-        .filter_map(|v| v.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let pushed_sql = explain_virtual_sql(conn, query_sql);
 
     assert!(
         pushed_sql.contains("group_keys"),
@@ -1808,20 +1788,10 @@ fn test_shard_key_fanout_explain() {
     lakehouse_vs();
     let mut conn = exa_conn();
 
-    let sql = format!(
-        "EXPLAIN VIRTUAL SELECT id, COUNT(*) FROM {} GROUP BY id",
-        events_table()
+    let pushed_sql = explain_virtual_sql(
+        &mut conn,
+        &format!("SELECT id, COUNT(*) FROM {} GROUP BY id", events_table()),
     );
-    let resp = conn.execute(&sql);
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let cols = conn.fetch_result_columns(result_set);
-
-    let pushed_sql: String = cols
-        .iter()
-        .flat_map(|col| col.iter())
-        .filter_map(|v| v.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
 
     assert!(
         pushed_sql.contains("shard_key"),
@@ -2400,11 +2370,11 @@ fn test_high_cardinality_multi_key_group_by_spill() {
 const GROUND_TRUTH_LINEITEM_SCAN_TABLE: &str = "GROUND_TRUTH_LINEITEM_SCAN";
 
 fn ensure_ground_truth_lineitem_table(conn: &mut ExaConn) {
-    conn.execute(&format!(
-        "CREATE OR REPLACE TABLE {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_SCAN_TABLE} AS \
-         SELECT L_RETURNFLAG, L_QUANTITY, L_EXTENDEDPRICE FROM {}",
-        vs_lineitem_table()
-    ));
+    create_lineitem_ground_truth_table(
+        conn,
+        GROUND_TRUTH_LINEITEM_SCAN_TABLE,
+        &vs_lineitem_table(),
+    );
 }
 
 fn scalar_over_aggregate_round_select_list() -> &'static str {

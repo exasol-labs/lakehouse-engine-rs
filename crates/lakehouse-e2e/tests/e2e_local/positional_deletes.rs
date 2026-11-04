@@ -43,10 +43,6 @@ fn setup_e2e() {
     });
 }
 
-fn ids_column(cols: &[Vec<serde_json::Value>]) -> Vec<i64> {
-    cols[0].iter().map(parse_int).collect()
-}
-
 #[test]
 fn fixture_spark_file_granularity_delete_table() {
     setup_e2e();
@@ -165,7 +161,7 @@ fn e2e_file_granularity_returns_post_delete_rows() {
         vs_table(LAKEHOUSE_VS, FILE_GRANULARITY_TABLE)
     );
     let cols = conn.query_columns(&sql);
-    let ids = ids_column(&cols);
+    let ids = int_column(&cols[0]);
 
     assert_eq!(
         ids.len(),
@@ -202,7 +198,7 @@ fn e2e_partition_granularity_returns_post_delete_rows() {
         vs_table(LAKEHOUSE_VS, PARTITION_GRANULARITY_TABLE)
     );
     let cols = conn.query_columns(&sql);
-    let ids = ids_column(&cols);
+    let ids = int_column(&cols[0]);
 
     assert_eq!(
         ids.len(),
@@ -232,7 +228,7 @@ fn e2e_partition_delete_spans_multiple_partitions() {
 
     let east_sql =
         format!("SELECT id FROM {table} WHERE {PARTITION_COL} = '{PARTITION_EAST}' ORDER BY id");
-    let east_ids = ids_column(&conn.query_columns(&east_sql));
+    let east_ids = int_column(&conn.query_columns(&east_sql)[0]);
     let east_deleted: HashSet<i64> = PARTITION_EAST_DELETED_IDS.iter().copied().collect();
     let expected_east: Vec<i64> = (1..=10i64)
         .filter(|id| !east_deleted.contains(id))
@@ -250,7 +246,7 @@ fn e2e_partition_delete_spans_multiple_partitions() {
 
     let west_sql =
         format!("SELECT id FROM {table} WHERE {PARTITION_COL} = '{PARTITION_WEST}' ORDER BY id");
-    let west_ids = ids_column(&conn.query_columns(&west_sql));
+    let west_ids = int_column(&conn.query_columns(&west_sql)[0]);
     let west_deleted: HashSet<i64> = PARTITION_WEST_DELETED_IDS.iter().copied().collect();
     let expected_west: Vec<i64> = (11..=20i64)
         .filter(|id| !west_deleted.contains(id))
@@ -312,7 +308,7 @@ fn e2e_partition_delete_invariant_across_fanout() {
         "SELECT id FROM {} ORDER BY id",
         vs_table(SAMESHARD_VS_NAME, PARTITION_GRANULARITY_TABLE)
     );
-    let same_ids = ids_column(&conn.query_columns(&same_rows_sql));
+    let same_ids = int_column(&conn.query_columns(&same_rows_sql)[0]);
     assert_eq!(
         same_ids, expected,
         "same-shard placement (PARALLELISM_FACTOR=1) must return the exact \
@@ -323,7 +319,7 @@ fn e2e_partition_delete_invariant_across_fanout() {
         "SELECT id FROM {} ORDER BY id",
         vs_table(SPLITSHARD_VS_NAME, PARTITION_GRANULARITY_TABLE)
     );
-    let split_ids = ids_column(&conn.query_columns(&split_rows_sql));
+    let split_ids = int_column(&conn.query_columns(&split_rows_sql)[0]);
     assert_eq!(
         split_ids, expected,
         "split-shard placement (PARALLELISM_FACTOR={SPLIT_PARALLELISM_FACTOR}) must \
@@ -350,7 +346,7 @@ fn e2e_deletes_with_projection_filter_limit() {
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, val): {cols:?}");
 
-    let ids = ids_column(&cols);
+    let ids = int_column(&cols[0]);
     assert_eq!(
         ids,
         vec![11, 12, 15],
@@ -515,9 +511,11 @@ fn e2e_deletion_vectors_return_post_delete_rows() {
     for vs in [LAKEHOUSE_VS, SAMESHARD_VS_NAME, SPLITSHARD_VS_NAME] {
         let table = vs_table(vs, DELETION_VECTOR_TABLE);
 
-        let small = ids_column(&conn.query_columns(&format!(
-            "SELECT id FROM {table} WHERE id < 1000 ORDER BY id"
-        )));
+        let small = int_column(
+            &conn.query_columns(&format!(
+                "SELECT id FROM {table} WHERE id < 1000 ORDER BY id"
+            ))[0],
+        );
         assert_eq!(small, small_expected, "{vs}: post-delete ids below 1000");
 
         let agg = conn.query_columns(&format!("SELECT COUNT(*), SUM(id) FROM {table}"));
@@ -530,7 +528,7 @@ fn e2e_deletion_vectors_return_post_delete_rows() {
         let cols = conn.query_columns(&format!(
             "SELECT id, val FROM {table} WHERE id >= 149990 ORDER BY id LIMIT 5"
         ));
-        assert_eq!(ids_column(&cols), top, "{vs}: TopN skips deleted rows");
+        assert_eq!(int_column(&cols[0]), top, "{vs}: TopN skips deleted rows");
         let vals: Vec<&str> = cols[1].iter().map(|v| v.as_str().unwrap()).collect();
         let expected_vals: Vec<String> = top.iter().map(|id| format!("row-{id:02}")).collect();
         assert_eq!(

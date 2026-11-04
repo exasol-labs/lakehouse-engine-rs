@@ -13,7 +13,7 @@ use crate::common::timestamp_precision::{
     ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
     live_engine_version,
 };
-use crate::fixtures::{assert_pushed_to_scan_udf, emits_clause, stack};
+use crate::fixtures::{assert_pushed_to_scan_udf, emits_clause, exasol_table_name, stack};
 use std::sync::OnceLock;
 
 const VS_NAME: &str = "TS_PRECISION_VS";
@@ -36,10 +36,6 @@ fn setup() {
             &VsProps::new(VS_NAME, E2E_TSPRECISION_NAMESPACE),
         );
     });
-}
-
-fn served_table() -> String {
-    E2E_TSPRECISION_TABLE.to_uppercase()
 }
 
 /// Clamped at six: the seeded values carry no finer digit.
@@ -111,7 +107,7 @@ fn assert_emits_declares(conn: &mut ExaConn, query_sql: &str, expected: &str) ->
 fn iceberg_microsecond_timestamps_round_trip_at_the_declared_precision() {
     setup();
     let mut conn = exa_conn();
-    let table = served_table();
+    let table = exasol_table_name(E2E_TSPRECISION_TABLE);
     let qualified = format!("{VS_NAME}.{table}");
 
     let expected = expected_timestamp_precision(&mut conn);
@@ -179,7 +175,7 @@ fn iceberg_microsecond_timestamps_round_trip_at_the_declared_precision() {
 }
 
 fn qualified_probe() -> String {
-    format!("{VS_NAME}.{}", served_table())
+    format!("{VS_NAME}.{}", exasol_table_name(E2E_TSPRECISION_TABLE))
 }
 
 fn cast_projection_sql(column: &str, target: &str) -> String {
@@ -359,7 +355,7 @@ fn declined_cast_to_timestamp2_is_computed_natively_by_exasol_in_the_wrapper() {
 fn iceberg_nanosecond_source_column_is_declared_and_retained_per_engine_arm() {
     setup();
     let mut conn = exa_conn();
-    let table = served_table();
+    let table = exasol_table_name(E2E_TSPRECISION_TABLE);
     let ts_ns_column = TSPRECISION_COL_TS_NS.to_uppercase();
 
     let (expected, expected_distinct) = if engine_honors_declared_precision(&mut conn) {

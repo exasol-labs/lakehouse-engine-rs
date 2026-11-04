@@ -433,10 +433,14 @@ pub fn count_statuses(
         .collect()
 }
 
-pub fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
+/// Every column of `EXPLAIN VIRTUAL <query_sql>`, fetched in full.
+pub fn explain_virtual_columns(conn: &mut ExaConn, query_sql: &str) -> Vec<Vec<serde_json::Value>> {
     let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    conn.fetch_result_columns(result_set)
+    conn.fetch_result_columns(&resp["responseData"]["results"][0]["resultSet"])
+}
+
+pub fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
+    explain_virtual_columns(conn, query_sql)
         .iter()
         .flat_map(|col| col.iter())
         .filter_map(|v| v.as_str())
@@ -448,9 +452,7 @@ pub fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
 /// `explain_virtual_sql`'s joined blob.
 pub fn isolated_pushdown_statement(conn: &mut ExaConn, query_sql: &str) -> String {
     const PUSHDOWN_SQL_COLUMN: usize = 1;
-    let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let cols = conn.fetch_result_columns(result_set);
+    let cols = explain_virtual_columns(conn, query_sql);
     if cols.len() != 4 || cols[0].len() != 1 {
         panic!(
             "EXPLAIN VIRTUAL returned an unexpected layout ({} cols, {} rows) for:\n{query_sql}",
