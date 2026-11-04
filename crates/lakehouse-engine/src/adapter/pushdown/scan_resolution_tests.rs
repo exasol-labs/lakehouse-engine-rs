@@ -1,12 +1,14 @@
+use super::super::binary_filter::BinaryLayout;
 use super::super::test_support::{
     GlueEndpoint, ICEBERG_CONFIG_TARGET, ICEBERG_LOAD_TABLE_TARGET, RecordingCatalog,
-    UNITY_TABLE_TARGET, iceberg_catalog, locationless_delta_table_body, sample_storage,
-    unauthenticated_creds,
+    UNITY_TABLE_TARGET, delta_notes, iceberg_catalog, involved_notes,
+    locationless_delta_table_body, sample_storage, unauthenticated_creds,
 };
 use super::*;
 use crate::adapter::direct_storage_properties::join_storage_path;
 use crate::adapter::permission::PermissionCheck;
 use crate::scan::spec::{StorageBackend, StorageProps};
+use crate::types::exasol_type::ExasolType;
 
 /// Scenario: A Unity Catalog table's identity survives the round trip from the involved table
 #[tokio::test]
@@ -37,7 +39,7 @@ async fn unity_table_identity_round_trips_through_the_recorded_identifier() {
     .expect("a Unity Catalog session is built without contacting the catalog");
 
     let err = resolver
-        .resolve("cat.sch.orders", None, &TableNotes::default())
+        .resolve("cat.sch.orders", None, &InvolvedColumns::default())
         .await
         .expect_err("a Delta table carrying no storage location cannot be planned");
 
@@ -81,7 +83,7 @@ async fn glue_table_identity_round_trips_through_the_recorded_identifier() {
     assert!(glue.operations().is_empty());
 
     let err = resolver
-        .resolve("sales.orders", None, &TableNotes::default())
+        .resolve("sales.orders", None, &InvolvedColumns::default())
         .await
         .expect_err("a dropped Glue table cannot be planned");
 
@@ -204,8 +206,8 @@ async fn an_iceberg_identifier_resolves_through_the_iceberg_reader_with_no_parti
     .await
     .expect("an Iceberg session resolves against a reachable catalog");
 
-    let resolved = resolver
-        .resolve("db.t", None, &TableNotes::default())
+    let (resolved, _) = resolver
+        .resolve("db.t", None, &InvolvedColumns::default())
         .await
         .expect("a snapshotless Iceberg table resolves an empty scan");
 
@@ -245,11 +247,11 @@ async fn one_catalog_session_serves_every_table_the_resolver_resolves() {
     .expect("an Iceberg session resolves against a reachable catalog");
 
     resolver
-        .resolve("db.t", None, &TableNotes::default())
+        .resolve("db.t", None, &InvolvedColumns::default())
         .await
         .expect("first table");
     resolver
-        .resolve("db.u", None, &TableNotes::default())
+        .resolve("db.u", None, &InvolvedColumns::default())
         .await
         .expect("second table");
 
@@ -294,11 +296,11 @@ async fn one_unity_catalog_session_serves_every_table_the_resolver_resolves() {
     .expect("a Unity Catalog session is built without contacting the catalog");
 
     let err1 = resolver
-        .resolve("cat.sch.orders", None, &TableNotes::default())
+        .resolve("cat.sch.orders", None, &InvolvedColumns::default())
         .await
         .expect_err("a Delta table carrying no storage location cannot be planned");
     let err2 = resolver
-        .resolve("cat.sch.customers", None, &TableNotes::default())
+        .resolve("cat.sch.customers", None, &InvolvedColumns::default())
         .await
         .expect_err("a Delta table carrying no storage location cannot be planned");
     assert!(err1.to_string().contains("cat.sch.orders"));
@@ -368,11 +370,11 @@ async fn one_session_or_store_per_request_serves_every_leg() {
     );
 
     resolver
-        .resolve("events", None, &TableNotes::default())
+        .resolve("events", None, &InvolvedColumns::default())
         .await
         .expect("a directory with no data file resolves an empty scan");
     resolver
-        .resolve("event_labels", None, &TableNotes::default())
+        .resolve("event_labels", None, &InvolvedColumns::default())
         .await
         .expect("a directory with no data file resolves an empty scan");
 
@@ -454,8 +456,8 @@ async fn the_pushdown_table_root_equals_the_discovery_composed_storage_location(
     .await
     .expect("a direct-storage store is built from the CONNECTION alone");
 
-    let scan = resolver
-        .resolve("events", None, &TableNotes::default())
+    let (scan, _) = resolver
+        .resolve("events", None, &InvolvedColumns::default())
         .await
         .expect("a directory with no data file resolves an empty scan");
 
@@ -575,4 +577,62 @@ async fn an_enforced_check_admits_an_allowed_table_and_refuses_a_denied_one() {
 
         assert_eq!(resolver.is_ok(), allowed);
     }
+}
+
+#[tokio::test]
+async fn the_resolver_returns_the_map_the_request_types_and_the_column_notes_build() {
+    let endpoint = empty_s3_endpoint().await;
+    let creds = unauthenticated_creds();
+    let storage = direct_storage_backend(&endpoint.uri);
+    let resolver = TableScanResolver::for_request(
+        CatalogKind::DirectStorage,
+        DIRECT_STORAGE_ADDRESS,
+        ConnectionStorage {
+            storage: &storage,
+            creds: &creds,
+            allow_http: true,
+        },
+        &["events"],
+        &Json::Null,
+        &PermissionCheck::Off,
+    )
+    .await
+    .expect("a direct-storage store is built from the CONNECTION alone");
+    let notes = delta_notes(&[("payload", "binary"), ("id", "long")], &[]);
+    let number = ExasolType::decimal(20, 0);
+    let involved = InvolvedColumns {
+        types: vec![
+            ("PAYLOAD".to_string(), ExasolType::WIDEST_VARCHAR),
+            ("ID".to_string(), number),
+        ],
+        notes: involved_notes("EVENTS", &notes),
+    };
+
+    let (_, column_types) = resolver
+        .resolve("events", None, &involved)
+        .await
+        .expect("a directory with no data file resolves an empty scan");
+
+    let layouts: Vec<_> = column_types
+        .iter()
+        .map(|(column, column_type)| {
+            (
+                column.name.as_str(),
+                column_type.exa_type,
+                column_type.binary,
+            )
+        })
+        .collect();
+    assert_eq!(
+        layouts,
+        vec![
+            (
+                "PAYLOAD",
+                ExasolType::WIDEST_VARCHAR,
+                Some(BinaryLayout::Variable)
+            ),
+            ("ID", number, None),
+        ],
+        "the request's Exasol types, with the byte layout only the column notes carry"
+    );
 }

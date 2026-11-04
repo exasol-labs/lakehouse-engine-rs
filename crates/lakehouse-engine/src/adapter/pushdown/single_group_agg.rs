@@ -7,6 +7,7 @@ use super::scalar_over_agg::{
     render_scalar_over_merge,
 };
 use super::support::{cast_to_declared_type, declared_select_type};
+use crate::types::exasol_type::ExasolType;
 
 /// A `COUNT(DISTINCT ...)` is not an aggregate partial: it is its own DISTINCT
 /// row-scan fan-out counted by an outer Exasol-native `COUNT(DISTINCT "V")`.
@@ -18,7 +19,7 @@ pub enum SingleGroupItem {
     /// each nested aggregate's merged expression.
     ScalarOverAggregate {
         node: Json,
-        declared_type: String,
+        declared_type: ExasolType,
     },
 }
 
@@ -96,9 +97,9 @@ pub fn ordinary_plans(items: &[SingleGroupItem]) -> Vec<AggregatePlan> {
 /// Aligned 1:1 with `ordinary_plans(items)`. This list also types the scan's
 /// `EMITS`, so a slot reached only through a nested aggregate takes
 /// [`NESTED_AGGREGATE_PLAN_TYPE`] rather than the `VARCHAR(2000000)` default.
-pub fn single_group_plan_types(pushdown_req: &Json, items: &[SingleGroupItem]) -> Vec<String> {
+pub fn single_group_plan_types(pushdown_req: &Json, items: &[SingleGroupItem]) -> Vec<ExasolType> {
     let plans = ordinary_plans(items);
-    let mut plan_types = vec![NESTED_AGGREGATE_PLAN_TYPE.to_string(); plans.len()];
+    let mut plan_types = vec![NESTED_AGGREGATE_PLAN_TYPE; plans.len()];
 
     for (select_index, item) in items.iter().enumerate() {
         if let SingleGroupItem::Aggregate(plan) = item {
@@ -119,7 +120,7 @@ pub fn single_group_plan_types(pushdown_req: &Json, items: &[SingleGroupItem]) -
 pub(super) fn single_group_merge_select(
     items: &[SingleGroupItem],
     plans: &[AggregatePlan],
-    plan_types: &[String],
+    plan_types: &[ExasolType],
 ) -> Option<Vec<String>> {
     let merged = merge_select_items(plans);
     let cast_merged = cast_merge_items(plans, plan_types);
@@ -136,7 +137,7 @@ pub(super) fn single_group_merge_select(
                 declared_type,
                 ..
             } => render_scalar_over_merge(node, plans, &merged)
-                .map(|expr| cast_to_declared_type(&expr, Some(declared_type))),
+                .map(|expr| cast_to_declared_type(&expr, Some(*declared_type))),
         })
         .collect()
 }

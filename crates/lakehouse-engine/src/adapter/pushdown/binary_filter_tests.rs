@@ -1,27 +1,34 @@
-use crate::adapter::pushdown::test_support::{compare, lit, str_lit};
+use crate::adapter::pushdown::test_support::{
+    column_types_under, compare, declared_column_types, lit, str_lit,
+};
 use vs_expression::render_df_filter_safe;
 
 use super::*;
 use crate::adapter::pushdown::test_support::filter_json::column;
 use crate::adapter::pushdown::test_support::nullable_field as field;
+use crate::types::exasol_type::ExasolType;
 
-fn columns() -> BinaryColumns {
-    columns_under(false)
-}
+/// The involved columns of a table whose `B` and `U` read as hex text and `S` as text.
+const HEX_COLUMNS: [(&str, ExasolType); 3] = [
+    ("B", ExasolType::WIDEST_VARCHAR),
+    ("U", ExasolType::varchar(4)),
+    ("S", ExasolType::WIDEST_VARCHAR),
+];
 
-fn columns_under(binary_as_string: bool) -> BinaryColumns {
-    BinaryColumns::of(
-        &[
-            field("b", "binary"),
-            field("u", "fixed_size_binary(2)"),
-            field("s", "utf8"),
-        ],
-        binary_as_string,
-    )
+fn binary_fields() -> [LogicalField; 3] {
+    [
+        field("b", "binary"),
+        field("u", "fixed_size_binary(2)"),
+        field("s", "utf8"),
+    ]
 }
 
 fn rendered(filter: &Json) -> String {
-    render_df_filter_safe(&compare_binary_bytes(filter.clone(), &columns())).expect("renders")
+    render_df_filter_safe(&compare_binary_bytes(
+        filter.clone(),
+        &declared_column_types(&HEX_COLUMNS, &binary_fields()),
+    ))
+    .expect("renders")
 }
 
 #[test]
@@ -85,19 +92,28 @@ fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
     for literal in ["0A1B", "0a1", "", "zz"] {
         let filter = compare("predicate_equal", column("B"), str_lit(literal));
         assert_eq!(
-            compare_binary_bytes(filter.clone(), &columns()),
+            compare_binary_bytes(
+                filter.clone(),
+                &declared_column_types(&HEX_COLUMNS, &binary_fields())
+            ),
             filter,
             "{literal}"
         );
     }
     let wrong_width = compare("predicate_equal", column("U"), str_lit("0a"));
     assert_eq!(
-        compare_binary_bytes(wrong_width.clone(), &columns()),
+        compare_binary_bytes(
+            wrong_width.clone(),
+            &declared_column_types(&HEX_COLUMNS, &binary_fields())
+        ),
         wrong_width
     );
     let string_column = compare("predicate_equal", column("S"), str_lit("0a"));
     assert_eq!(
-        compare_binary_bytes(string_column.clone(), &columns()),
+        compare_binary_bytes(
+            string_column.clone(),
+            &declared_column_types(&HEX_COLUMNS, &binary_fields())
+        ),
         string_column
     );
 }
@@ -107,7 +123,10 @@ fn only_a_comparison_reached_through_and_or_is_rewritten() {
     let equal = compare("predicate_equal", column("B"), str_lit("0a"));
     let negated = json!({"type": "predicate_not", "expression": equal});
     assert_eq!(
-        compare_binary_bytes(negated.clone(), &columns()),
+        compare_binary_bytes(
+            negated.clone(),
+            &declared_column_types(&HEX_COLUMNS, &binary_fields())
+        ),
         negated,
         "NOT turns the empty value's false into true, where Exasol keeps NULL"
     );
@@ -132,7 +151,10 @@ fn binary_as_string_keeps_a_variable_length_filter_on_the_text() {
         compare("predicate_equal", column("U"), str_lit("00ff")),
     ]});
 
-    let rewritten = compare_binary_bytes(filter.clone(), &columns_under(true));
+    let rewritten = compare_binary_bytes(
+        filter.clone(),
+        &column_types_under(&HEX_COLUMNS, &binary_fields(), true),
+    );
 
     assert_eq!(
         rewritten["expressions"][0], filter["expressions"][0],
@@ -163,7 +185,10 @@ fn pruning_retypes_the_hex_literals_of_a_binary_column_at_any_depth() {
         ]},
     });
     assert_eq!(
-        with_binary_literals(filter, &columns()),
+        with_binary_literals(
+            filter,
+            &declared_column_types(&HEX_COLUMNS, &binary_fields())
+        ),
         json!({
             "type": "predicate_not",
             "expression": {"type": "predicate_or", "expressions": [
@@ -190,12 +215,18 @@ fn pruning_leaves_text_columns_and_mismatched_literals_alone() {
         (equal("B", "0a"), true),
     ] {
         assert_eq!(
-            with_binary_literals(filter.clone(), &columns_under(under_binary_as_string)),
+            with_binary_literals(
+                filter.clone(),
+                &column_types_under(&HEX_COLUMNS, &binary_fields(), under_binary_as_string)
+            ),
             filter
         );
     }
     assert_eq!(
-        with_binary_literals(equal("U", "0a0b"), &columns_under(true)),
+        with_binary_literals(
+            equal("U", "0a0b"),
+            &column_types_under(&HEX_COLUMNS, &binary_fields(), true)
+        ),
         compare(
             "predicate_equal",
             column("U"),
@@ -216,13 +247,17 @@ fn a_binary_literal_carries_its_bytes() {
 
 #[test]
 fn per_relation_detection_resolves_a_shared_column_name_by_its_own_relation() {
-    let columns = BinaryColumns::per_relation(
-        [
-            ("LHS_T0".to_string(), &[field("x", "binary")][..]),
-            ("LHS_T1".to_string(), &[field("x", "utf8")][..]),
-        ],
-        false,
-    );
+    let hex_x = [("X", ExasolType::WIDEST_VARCHAR)];
+    let columns = ColumnTypes::per_relation([
+        (
+            "LHS_T0".to_string(),
+            &declared_column_types(&hex_x, &[field("x", "binary")]),
+        ),
+        (
+            "LHS_T1".to_string(),
+            &declared_column_types(&hex_x, &[field("x", "utf8")]),
+        ),
+    ]);
     let on = |alias: &str| {
         compare(
             "predicate_equal",

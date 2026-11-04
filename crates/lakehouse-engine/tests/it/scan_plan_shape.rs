@@ -12,7 +12,8 @@ use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionConfig;
 use lakehouse_engine::adapter::pushdown::{
-    AggregateMergeInputs, build_scan_driving_sql, detect_aggregates, ordinary_plans,
+    AggregateMergeInputs, ColumnTypes, ProjectedColumn, build_scan_driving_sql, detect_aggregates,
+    ordinary_plans,
 };
 use lakehouse_engine::scan::spec::{
     AggKind, ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, ProjectionItem,
@@ -21,6 +22,7 @@ use lakehouse_engine::scan::spec::{
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, session_config_for_spec,
 };
+use lakehouse_engine::types::exasol_type::ExasolType;
 
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -368,7 +370,7 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
     let spec = aggregate_spec(plans);
     let shards = vec![vec![("lineitem/data/f0.parquet".to_string(), 4096u64)]];
     let merge_inputs = AggregateMergeInputs::new(
-        vec!["DECIMAL(36,4)".to_string()],
+        vec![ExasolType::decimal(36, 4)],
         vec![r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,4))"#.to_string()],
         None,
     )
@@ -377,9 +379,8 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
         &spec,
         &shards,
         &[],
-        &[],
         None,
-        &[],
+        &ColumnTypes::default(),
         Some(&merge_inputs),
         "LAKEHOUSE_SCAN",
         "LAKEHOUSE_DISTRIBUTE_FILES",
@@ -410,8 +411,10 @@ fn row_scan_spec() -> ScanSpec {
 /// Scenario: Scan-driving query fans out via a nested distributor over a scalar scan UDF
 #[test]
 fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
-    let proj = vec![ProjectionItem::Column("L_ORDERKEY".into())];
-    let types = vec!["DECIMAL(20,0)".to_string()];
+    let projection = vec![ProjectedColumn {
+        item: ProjectionItem::Column("L_ORDERKEY".into()),
+        exa_type: ExasolType::decimal(20, 0),
+    }];
     let spec = row_scan_spec();
 
     let shards = vec![
@@ -421,10 +424,9 @@ fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
     let sql = build_scan_driving_sql(
         &spec,
         &shards,
-        &proj,
-        &types,
+        &projection,
         None,
-        &[],
+        &ColumnTypes::default(),
         None,
         "LAKEHOUSE_SCAN",
         "LAKEHOUSE_DISTRIBUTE_FILES",
@@ -454,8 +456,10 @@ fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
 
 #[test]
 fn topn_order_by_limit_attaches_to_outer_scalar_select() {
-    let proj = vec![ProjectionItem::Column("L_EXTENDEDPRICE".into())];
-    let types = vec!["DECIMAL(18,2)".to_string()];
+    let projection = vec![ProjectedColumn {
+        item: ProjectionItem::Column("L_EXTENDEDPRICE".into()),
+        exa_type: ExasolType::decimal(18, 2),
+    }];
     let mut spec = row_scan_spec();
     spec.common.order_by = vec![SortKey {
         column: "L_EXTENDEDPRICE".into(),
@@ -471,10 +475,9 @@ fn topn_order_by_limit_attaches_to_outer_scalar_select() {
     let sql = build_scan_driving_sql(
         &spec,
         &shards,
-        &proj,
-        &types,
+        &projection,
         Some(20),
-        &[],
+        &ColumnTypes::default(),
         None,
         "LAKEHOUSE_SCAN",
         "LAKEHOUSE_DISTRIBUTE_FILES",
@@ -541,15 +544,21 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         vec![("data/ord-0.parquet".to_string(), 8192u64)],
         vec![("data/ord-1.parquet".to_string(), 8192u64)],
     ];
-    let proj = spec.common.projection.clone();
-    let types = vec!["VARCHAR(100)".to_string(), "DATE".to_string()];
+    let types = [ExasolType::varchar(100), ExasolType::Date];
+    let projection: Vec<ProjectedColumn> = spec
+        .common
+        .projection
+        .iter()
+        .cloned()
+        .zip(types)
+        .map(|(item, exa_type)| ProjectedColumn { item, exa_type })
+        .collect();
     let sql = build_scan_driving_sql(
         &spec,
         &shards,
-        &proj,
-        &types,
+        &projection,
         None,
-        &[],
+        &ColumnTypes::default(),
         None,
         "LAKEHOUSE_SCAN",
         "LAKEHOUSE_DISTRIBUTE_FILES",

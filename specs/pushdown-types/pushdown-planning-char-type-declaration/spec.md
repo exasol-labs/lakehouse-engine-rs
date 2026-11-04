@@ -4,7 +4,7 @@ The adapter declares a pushed-down result column as Exasol `CHAR(n)` when Exasol
 
 ## Background
 
-* `exasol_type_from_json` maps an Exasol `dataType` JSON object to the type string used in the pushdown response, both in the query-side `EMITS` clause and in outer-wrapper `CAST` targets.
+* `exasol_type_from_json` reads an Exasol `dataType` JSON object into the Exasol type the pushdown response renders, both in the query-side `EMITS` clause and in outer-wrapper `CAST` targets.
 * No Iceberg or Arrow source type maps to `CHAR`, since Iceberg `string` maps to `VARCHAR`. A `CHAR` type reaches the adapter only as an Exasol-computed expression result in `selectListDataTypes`, never as an `involvedTables[].columns` base-column type.
 * Exasol declares a string-literal expression `CHAR` when every branch has the same length, and `VARCHAR` otherwise.
 * Exasol's `CHAR` maximum length is 2,000 characters. `CAST('a' AS CHAR(2001))` fails with `specified length too long for char type - maximum is 2000`.

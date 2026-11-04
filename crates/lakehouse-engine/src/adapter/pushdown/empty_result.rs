@@ -1,4 +1,4 @@
-use crate::scan::spec::ProjectionItem;
+use crate::types::exasol_type::ExasolType;
 use crate::types::mapping::exasol_type_from_json;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
@@ -7,19 +7,18 @@ use super::GroupedSelectItem;
 use super::grouped_agg::{group_key_exasol_types, select_item_index};
 use super::joins::EmptyRelation;
 use super::request_shape::{RequestShape, classify_request_shape};
-use super::support::{cast_to_declared_type, emits_ident};
+use super::support::{ColumnTypes, ProjectedColumn, cast_to_declared_type, emits_ident};
 
 /// Routes through the same [`classify_request_shape`] as the non-empty dispatcher,
 /// so empty and non-empty positional column shapes cannot diverge.
 ///
-/// `projection_widened` means `proj_cols`/`proj_types` are the full base row rather
+/// `projection_widened` means `projection` is the full base row rather
 /// than one item per select-list item (#196).
 pub(super) fn empty_result_sql(
     pushdown_req: &Json,
-    proj_cols: &[ProjectionItem],
-    proj_types: &[String],
+    projection: &[ProjectedColumn],
     projection_widened: bool,
-    col_types: &[(String, String)],
+    col_types: &ColumnTypes,
     relation: &EmptyRelation,
 ) -> Result<Json, UdfError> {
     match classify_request_shape(pushdown_req, col_types) {
@@ -38,16 +37,16 @@ pub(super) fn empty_result_sql(
         // Mirrors the non-empty wrapper's `selectList`-shaped output; a full-row shape
         // would trip Exasol's positional `04000` check.
         RequestShape::GroupByWrapper => Ok(empty_select_list_typed_sql(pushdown_req)
-            .unwrap_or_else(|| empty_pushdown_sql(proj_cols, proj_types))),
+            .unwrap_or_else(|| empty_pushdown_sql(projection))),
         RequestShape::SingleGroupAgg { .. } | RequestShape::SingleGroupWrapper => {
             relation.pushdown(pushdown_req)
         }
         // Widened projection: same reasoning as the `GroupByWrapper` arm (#196).
         RequestShape::RowScan if projection_widened => {
             Ok(empty_select_list_typed_sql(pushdown_req)
-                .unwrap_or_else(|| empty_pushdown_sql(proj_cols, proj_types)))
+                .unwrap_or_else(|| empty_pushdown_sql(projection)))
         }
-        RequestShape::RowScan => Ok(empty_pushdown_sql(proj_cols, proj_types)),
+        RequestShape::RowScan => Ok(empty_pushdown_sql(projection)),
     }
 }
 
@@ -65,8 +64,8 @@ fn empty_select_list_typed_sql(pushdown_req: &Json) -> Option<Json> {
 }
 
 fn empty_grouped_sql(
-    group_key_types: &[String],
-    aggregate_types: &[String],
+    group_key_types: &[ExasolType],
+    aggregate_types: &[ExasolType],
     select_items: &[GroupedSelectItem],
 ) -> Json {
     let mut ordered = select_items.to_vec();
@@ -82,7 +81,7 @@ fn empty_grouped_sql(
                 .map(|ty| format!("CAST(NULL AS {ty})")),
             GroupedSelectItem::Constant { projection, .. } => Some(projection.clone()),
             GroupedSelectItem::ScalarOverAggregate { declared_type, .. } => {
-                Some(cast_to_declared_type("NULL", Some(declared_type)))
+                Some(cast_to_declared_type("NULL", Some(*declared_type)))
             }
         })
         .collect();
@@ -90,12 +89,17 @@ fn empty_grouped_sql(
     serde_json::json!({"type": "pushdown", "sql": sql})
 }
 
-fn empty_pushdown_sql(proj_cols: &[ProjectionItem], proj_types: &[String]) -> Json {
-    let items: Vec<String> = proj_cols
+fn empty_pushdown_sql(projection: &[ProjectedColumn]) -> Json {
+    let items: Vec<String> = projection
         .iter()
-        .zip(proj_types.iter())
         .enumerate()
-        .map(|(i, (item, ty))| format!("CAST(NULL AS {ty}) AS {}", emits_ident(item, i)))
+        .map(|(i, column)| {
+            format!(
+                "CAST(NULL AS {}) AS {}",
+                column.exa_type,
+                emits_ident(&column.item, i)
+            )
+        })
         .collect();
     let sql = format!("SELECT {} FROM DUAL WHERE 1=0", items.join(", "));
     serde_json::json!({"type": "pushdown", "sql": sql})

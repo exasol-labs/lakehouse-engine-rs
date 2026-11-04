@@ -14,8 +14,6 @@ use object_store::ObjectStore;
 use serde_json::Value as Json;
 
 use crate::adapter::column_notes::{ColumnDeclaration, DeclaredSchema};
-use crate::adapter::pushdown::BinaryColumns;
-use crate::adapter::pushdown::binary_filter::with_binary_literals;
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::ObjectLocation;
 use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry};
@@ -119,18 +117,13 @@ pub struct ResolvedScan {
 }
 
 impl ResolvedScan {
-    /// Plans `reader`'s files against `declared`, the table's parsed column notes. Every reader
-    /// receives the filter with its binary comparisons retyped, so each prunes on the raw bytes.
+    /// Plans `reader`'s files against `declared`, the table's parsed column notes.
     pub async fn resolve(
         reader: &dyn FormatReader,
         declared: DeclaredSchema,
         filter_json: Option<&Json>,
-        binary_as_string: bool,
     ) -> Result<Self, UdfError> {
-        let binary_columns = BinaryColumns::of(&declared.logical_schema, binary_as_string);
-        let filter_json =
-            filter_json.map(|filter| with_binary_literals(filter.clone(), &binary_columns));
-        let planned = reader.resolve_scan(&declared, filter_json.as_ref()).await?;
+        let planned = reader.resolve_scan(&declared, filter_json).await?;
         Ok(Self::new(declared, planned))
     }
 

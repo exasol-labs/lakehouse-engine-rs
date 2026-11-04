@@ -10,32 +10,69 @@ use lakehouse_catalog::ColumnSourceType;
 /// Scenario: Compatible Arrow types map to their Exasol type
 #[test]
 fn compatible_types_map_to_exasol_type() {
-    assert_eq!(arrow_to_exasol_type(&DataType::Boolean), "BOOLEAN");
-    assert_eq!(arrow_to_exasol_type(&DataType::Int8), "DECIMAL(3,0)");
-    assert_eq!(arrow_to_exasol_type(&DataType::Int16), "DECIMAL(5,0)");
-    assert_eq!(arrow_to_exasol_type(&DataType::Int32), "DECIMAL(10,0)");
-    assert_eq!(arrow_to_exasol_type(&DataType::Int64), "DECIMAL(20,0)");
-    assert_eq!(arrow_to_exasol_type(&DataType::UInt8), "DECIMAL(3,0)");
-    assert_eq!(arrow_to_exasol_type(&DataType::UInt16), "DECIMAL(5,0)");
-    assert_eq!(arrow_to_exasol_type(&DataType::UInt32), "DECIMAL(20,0)");
-    assert_eq!(arrow_to_exasol_type(&DataType::UInt64), "DECIMAL(20,0)");
-    assert_eq!(arrow_to_exasol_type(&DataType::Float32), "DOUBLE PRECISION");
-    assert_eq!(arrow_to_exasol_type(&DataType::Float64), "DOUBLE PRECISION");
-    assert_eq!(arrow_to_exasol_type(&DataType::Utf8), "VARCHAR(2000000)");
     assert_eq!(
-        arrow_to_exasol_type(&DataType::LargeUtf8),
+        arrow_to_exasol_type(&DataType::Boolean).to_string(),
+        "BOOLEAN"
+    );
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::Int8).to_string(),
+        "DECIMAL(3,0)"
+    );
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::Int16).to_string(),
+        "DECIMAL(5,0)"
+    );
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::Int32).to_string(),
+        "DECIMAL(10,0)"
+    );
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::Int64).to_string(),
+        "DECIMAL(20,0)"
+    );
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::UInt8).to_string(),
+        "DECIMAL(3,0)"
+    );
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::UInt16).to_string(),
+        "DECIMAL(5,0)"
+    );
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::UInt32).to_string(),
+        "DECIMAL(20,0)"
+    );
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::UInt64).to_string(),
+        "DECIMAL(20,0)"
+    );
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::Float32).to_string(),
+        "DOUBLE PRECISION"
+    );
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::Float64).to_string(),
+        "DOUBLE PRECISION"
+    );
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::Utf8).to_string(),
         "VARCHAR(2000000)"
     );
-    assert_eq!(arrow_to_exasol_type(&DataType::Date32), "DATE");
     assert_eq!(
-        arrow_to_exasol_type(&DataType::Timestamp(TimeUnit::Microsecond, None)),
+        arrow_to_exasol_type(&DataType::LargeUtf8).to_string(),
+        "VARCHAR(2000000)"
+    );
+    assert_eq!(arrow_to_exasol_type(&DataType::Date32).to_string(), "DATE");
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::Timestamp(TimeUnit::Microsecond, None)).to_string(),
         "TIMESTAMP"
     );
     assert_eq!(
         arrow_to_exasol_type(&DataType::Timestamp(
             TimeUnit::Microsecond,
             Some("UTC".into())
-        )),
+        ))
+        .to_string(),
         "TIMESTAMP"
     );
 }
@@ -44,15 +81,15 @@ fn compatible_types_map_to_exasol_type() {
 #[test]
 fn decimal128_in_range_maps_to_decimal() {
     assert_eq!(
-        arrow_to_exasol_type(&DataType::Decimal128(18, 6)),
+        arrow_to_exasol_type(&DataType::Decimal128(18, 6)).to_string(),
         "DECIMAL(18,6)"
     );
     assert_eq!(
-        arrow_to_exasol_type(&DataType::Decimal128(36, 36)),
+        arrow_to_exasol_type(&DataType::Decimal128(36, 36)).to_string(),
         "DECIMAL(36,36)"
     );
     assert_eq!(
-        arrow_to_exasol_type(&DataType::Decimal128(36, 0)),
+        arrow_to_exasol_type(&DataType::Decimal128(36, 0)).to_string(),
         "DECIMAL(36,0)"
     );
 }
@@ -61,15 +98,15 @@ fn decimal128_in_range_maps_to_decimal() {
 #[test]
 fn decimal128_out_of_range_maps_to_varchar_json() {
     assert_eq!(
-        arrow_to_exasol_type(&DataType::Decimal128(38, 10)),
+        arrow_to_exasol_type(&DataType::Decimal128(38, 10)).to_string(),
         "VARCHAR(2000000)"
     );
     assert_eq!(
-        arrow_to_exasol_type(&DataType::Decimal128(18, 37)),
+        arrow_to_exasol_type(&DataType::Decimal128(18, 37)).to_string(),
         "VARCHAR(2000000)"
     );
     assert_eq!(
-        arrow_to_exasol_type(&DataType::Decimal128(38, 38)),
+        arrow_to_exasol_type(&DataType::Decimal128(38, 38)).to_string(),
         "VARCHAR(2000000)"
     );
     assert!(needs_json_fallback(&DataType::Decimal128(38, 6)));
@@ -81,24 +118,30 @@ fn incompatible_types_map_to_varchar_json() {
     assert_eq!(
         arrow_to_exasol_type(&DataType::List(std::sync::Arc::new(
             arrow::datatypes::Field::new("item", DataType::Int32, true)
-        ))),
+        )))
+        .to_string(),
         "VARCHAR(2000000)"
     );
     assert_eq!(
         arrow_to_exasol_type(&DataType::LargeList(std::sync::Arc::new(
             arrow::datatypes::Field::new("item", DataType::Int32, true)
-        ))),
+        )))
+        .to_string(),
         "VARCHAR(2000000)"
     );
     assert_eq!(
         arrow_to_exasol_type(&DataType::Struct(arrow::datatypes::Fields::from(vec![
             arrow::datatypes::Field::new("a", DataType::Int32, true)
-        ]))),
+        ])))
+        .to_string(),
         "VARCHAR(2000000)"
     );
-    assert_eq!(arrow_to_exasol_type(&DataType::Binary), "VARCHAR(2000000)");
     assert_eq!(
-        arrow_to_exasol_type(&DataType::LargeBinary),
+        arrow_to_exasol_type(&DataType::Binary).to_string(),
+        "VARCHAR(2000000)"
+    );
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::LargeBinary).to_string(),
         "VARCHAR(2000000)"
     );
     assert!(needs_json_fallback(&DataType::Binary));
@@ -267,10 +310,13 @@ fn varchar_type_string_alone_does_not_decide_the_json_fallback() {
     let out_of_range_decimal = DataType::Decimal128(38, 10);
 
     for string_type in [DataType::Utf8, DataType::LargeUtf8] {
-        assert_eq!(arrow_to_exasol_type(&string_type), "VARCHAR(2000000)");
         assert_eq!(
-            arrow_to_exasol_type(&string_type),
-            arrow_to_exasol_type(&out_of_range_decimal),
+            arrow_to_exasol_type(&string_type).to_string(),
+            "VARCHAR(2000000)"
+        );
+        assert_eq!(
+            arrow_to_exasol_type(&string_type).to_string(),
+            arrow_to_exasol_type(&out_of_range_decimal).to_string(),
             "{string_type:?} and an out-of-range Decimal128 must declare the same Exasol type"
         );
         assert!(
@@ -289,39 +335,41 @@ fn varchar_type_string_alone_does_not_decide_the_json_fallback() {
 fn iceberg_types_map_to_exasol_type() {
     let ts_precision = EngineTimestampSupport::MillisecondOnly;
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Boolean), ts_precision),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Boolean), ts_precision).to_string(),
         "BOOLEAN"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Int), ts_precision),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Int), ts_precision).to_string(),
         "DECIMAL(10,0)"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Long), ts_precision),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Long), ts_precision).to_string(),
         "DECIMAL(20,0)"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Float), ts_precision),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Float), ts_precision).to_string(),
         "DOUBLE PRECISION"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Double), ts_precision),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Double), ts_precision).to_string(),
         "DOUBLE PRECISION"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::String), ts_precision),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::String), ts_precision).to_string(),
         "VARCHAR(2000000)"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Date), ts_precision),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Date), ts_precision).to_string(),
         "DATE"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Timestamp), ts_precision),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Timestamp), ts_precision)
+            .to_string(),
         "TIMESTAMP"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Timestamptz), ts_precision),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Timestamptz), ts_precision)
+            .to_string(),
         "TIMESTAMP"
     );
     assert_eq!(
@@ -331,7 +379,8 @@ fn iceberg_types_map_to_exasol_type() {
                 scale: 4,
             }),
             ts_precision
-        ),
+        )
+        .to_string(),
         "DECIMAL(18,4)"
     );
     assert_eq!(
@@ -341,7 +390,8 @@ fn iceberg_types_map_to_exasol_type() {
                 scale: 10,
             }),
             ts_precision
-        ),
+        )
+        .to_string(),
         "VARCHAR(2000000)"
     );
     assert_eq!(
@@ -351,7 +401,8 @@ fn iceberg_types_map_to_exasol_type() {
                 scale: 0,
             }),
             ts_precision
-        ),
+        )
+        .to_string(),
         "VARCHAR(2000000)"
     );
     assert_eq!(
@@ -361,97 +412,18 @@ fn iceberg_types_map_to_exasol_type() {
                 scale: 10,
             }),
             ts_precision
-        ),
+        )
+        .to_string(),
         "VARCHAR(2000000)"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Binary), ts_precision),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Binary), ts_precision).to_string(),
         "VARCHAR(2000000)"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Time), ts_precision),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Time), ts_precision).to_string(),
         "VARCHAR(2000000)"
     );
-}
-
-#[test]
-fn exasol_type_to_arrow_reproduces_decimal_precision_binning() {
-    let cases: &[(&str, DataType)] = &[
-        ("BOOLEAN", DataType::Boolean),
-        ("DOUBLE PRECISION", DataType::Float64),
-        ("DATE", DataType::Date32),
-        // Exasol's bare TIMESTAMP is TIMESTAMP(3).
-        (
-            "TIMESTAMP",
-            DataType::Timestamp(TimeUnit::Millisecond, None),
-        ),
-        (
-            "TIMESTAMP WITH LOCAL TIME ZONE",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        ),
-        ("DECIMAL(1,0)", DataType::Int32),
-        ("DECIMAL(3,0)", DataType::Int32),
-        ("DECIMAL(9,0)", DataType::Int32),
-        ("DECIMAL(10,0)", DataType::Int64),
-        ("DECIMAL(18,0)", DataType::Int64),
-        ("DECIMAL(20,0)", DataType::Decimal128(20, 0)),
-        ("DECIMAL(19,0)", DataType::Decimal128(19, 0)),
-        ("DECIMAL(36,0)", DataType::Decimal128(36, 0)),
-        ("DECIMAL(9,2)", DataType::Decimal128(9, 2)),
-        ("DECIMAL(18,4)", DataType::Decimal128(18, 4)),
-        ("DECIMAL(36,36)", DataType::Decimal128(36, 36)),
-    ];
-    for (declared, expected_arrow) in cases {
-        let arrow = exasol_type_to_arrow(declared)
-            .unwrap_or_else(|| panic!("{declared} must map to a concrete Arrow type"));
-        assert_eq!(&arrow, expected_arrow, "wrong Arrow target for {declared}");
-    }
-}
-
-#[test]
-fn exasol_type_to_arrow_parses_timestamp_precision() {
-    let cases = [
-        ("TIMESTAMP(0)", TimeUnit::Millisecond),
-        ("TIMESTAMP(6)", TimeUnit::Microsecond),
-        ("TIMESTAMP(9)", TimeUnit::Nanosecond),
-        ("TIMESTAMP", TimeUnit::Millisecond),
-    ];
-    for (declared, expected_unit) in cases {
-        assert_eq!(
-            exasol_type_to_arrow(declared),
-            Some(DataType::Timestamp(expected_unit, None)),
-            "declared={declared}"
-        );
-    }
-}
-
-#[test]
-fn exasol_type_to_arrow_count_star_decimal_is_int64() {
-    assert_eq!(exasol_type_to_arrow("DECIMAL(10,0)"), Some(DataType::Int64));
-    assert_eq!(exasol_type_to_arrow("DECIMAL(18,0)"), Some(DataType::Int64));
-    assert_eq!(exasol_type_to_arrow("DECIMAL(9,0)"), Some(DataType::Int32));
-}
-
-#[test]
-fn exasol_type_to_arrow_returns_none_for_string_family() {
-    assert_eq!(exasol_type_to_arrow("VARCHAR(2000000)"), None);
-    assert_eq!(exasol_type_to_arrow("VARCHAR(100)"), None);
-    assert_eq!(exasol_type_to_arrow("CHAR(10)"), None);
-    assert_eq!(exasol_type_to_arrow("GEOMETRY"), None);
-    assert_eq!(exasol_type_to_arrow("HASHTYPE"), None);
-}
-
-#[test]
-fn exasol_type_to_arrow_is_case_and_whitespace_insensitive() {
-    assert_eq!(
-        exasol_type_to_arrow("  decimal(20,0) "),
-        Some(DataType::Decimal128(20, 0))
-    );
-    assert_eq!(
-        exasol_type_to_arrow("double precision"),
-        Some(DataType::Float64)
-    );
-    assert_eq!(exasol_type_to_arrow("DECIMAL(9)"), Some(DataType::Int32));
 }
 
 #[test]
@@ -618,7 +590,7 @@ fn numeric_family_types_and_fallback_flags() {
     ];
     for (dt, expected_type, expected_json) in cases {
         assert_eq!(
-            arrow_to_exasol_type(dt),
+            arrow_to_exasol_type(dt).to_string(),
             *expected_type,
             "type mismatch for {dt:?}"
         );
@@ -633,7 +605,7 @@ fn numeric_family_types_and_fallback_flags() {
 #[test]
 fn float_family_types_and_fallback_flags() {
     for dt in [DataType::Float32, DataType::Float64] {
-        assert_eq!(arrow_to_exasol_type(&dt), "DOUBLE PRECISION");
+        assert_eq!(arrow_to_exasol_type(&dt).to_string(), "DOUBLE PRECISION");
         assert!(!needs_json_fallback(&dt));
     }
 }
@@ -641,122 +613,50 @@ fn float_family_types_and_fallback_flags() {
 #[test]
 fn string_family_types_and_fallback_flags() {
     for dt in [DataType::Utf8, DataType::LargeUtf8] {
-        assert_eq!(arrow_to_exasol_type(&dt), "VARCHAR(2000000)");
+        assert_eq!(arrow_to_exasol_type(&dt).to_string(), "VARCHAR(2000000)");
         assert!(!needs_json_fallback(&dt));
     }
 }
 
 #[test]
 fn date_time_family_types_and_fallback_flags() {
-    assert_eq!(arrow_to_exasol_type(&DataType::Date32), "DATE");
+    assert_eq!(arrow_to_exasol_type(&DataType::Date32).to_string(), "DATE");
     assert!(!needs_json_fallback(&DataType::Date32));
 
     let ts_no_tz = DataType::Timestamp(TimeUnit::Microsecond, None);
-    assert_eq!(arrow_to_exasol_type(&ts_no_tz), "TIMESTAMP");
+    assert_eq!(arrow_to_exasol_type(&ts_no_tz).to_string(), "TIMESTAMP");
     assert!(!needs_json_fallback(&ts_no_tz));
 
     let ts_tz = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
-    assert_eq!(arrow_to_exasol_type(&ts_tz), "TIMESTAMP");
+    assert_eq!(arrow_to_exasol_type(&ts_tz).to_string(), "TIMESTAMP");
     assert!(!needs_json_fallback(&ts_tz));
-}
-
-#[test]
-fn exasol_type_to_json_roundtrip() {
-    let cases = [
-        ("BOOLEAN", "boolean"),
-        ("DOUBLE PRECISION", "double"),
-        ("DATE", "date"),
-        ("TIMESTAMP", "timestamp"),
-    ];
-    for (ty, expected_type) in cases {
-        let j = exasol_type_to_json(ty);
-        assert_eq!(
-            j["type"].as_str().unwrap().to_lowercase(),
-            expected_type,
-            "type mismatch for {ty}"
-        );
-    }
-    let dec = exasol_type_to_json("DECIMAL(18,4)");
-    assert_eq!(dec["precision"].as_u64().unwrap(), 18);
-    assert_eq!(dec["scale"].as_u64().unwrap(), 4);
-}
-
-#[test]
-fn exasol_type_to_json_absent_decimal_scale_becomes_scale_zero_decimal() {
-    assert_eq!(
-        exasol_type_to_json("DECIMAL(10)"),
-        json!({"type": "decimal", "precision": 10, "scale": 0})
-    );
-}
-
-#[test]
-fn exasol_type_to_json_out_of_range_decimal_args_become_varchar() {
-    assert_eq!(
-        exasol_type_to_json("DECIMAL(300,2)"),
-        json!({"type": "varchar", "size": 2000000})
-    );
-    assert_eq!(
-        exasol_type_to_json("DECIMAL(10,200)"),
-        json!({"type": "varchar", "size": 2000000})
-    );
-}
-
-#[test]
-fn exasol_type_to_json_negative_decimal_scale_stays_signed() {
-    assert_eq!(
-        exasol_type_to_json("DECIMAL(10,-2)"),
-        json!({"type": "decimal", "precision": 10, "scale": -2})
-    );
-}
-
-#[test]
-fn exasol_type_to_json_malformed_decimal_arg_lists_stay_varchar() {
-    for malformed in ["DECIMAL(10,2,3)", "DECIMAL()"] {
-        assert_eq!(
-            exasol_type_to_json(malformed),
-            json!({"type": "varchar", "size": 2000000}),
-            "{malformed} must stay a VARCHAR object"
-        );
-    }
-}
-
-#[test]
-fn exasol_type_to_json_timestamp_with_local_time_zone() {
-    let tstz = exasol_type_to_json("TIMESTAMP WITH LOCAL TIME ZONE");
-    assert_eq!(
-        tstz,
-        serde_json::json!({"type": "timestamp", "withLocalTimeZone": true})
-    );
-
-    let ts = exasol_type_to_json("TIMESTAMP");
-    assert_eq!(ts, serde_json::json!({"type": "timestamp"}));
 }
 
 #[test]
 fn exasol_type_from_json_reads_with_local_time_zone_flag() {
     let tstz = serde_json::json!({"type": "timestamp", "withLocalTimeZone": true});
     assert_eq!(
-        exasol_type_from_json(&tstz),
+        exasol_type_from_json(&tstz).to_string(),
         "TIMESTAMP WITH LOCAL TIME ZONE"
     );
 
     let ts = serde_json::json!({"type": "timestamp"});
-    assert_eq!(exasol_type_from_json(&ts), "TIMESTAMP");
+    assert_eq!(exasol_type_from_json(&ts).to_string(), "TIMESTAMP");
 }
 
 #[test]
 fn exasol_type_from_json_reads_timestamp_fractional_seconds_precision() {
     let ts0 = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": 0});
-    assert_eq!(exasol_type_from_json(&ts0), "TIMESTAMP(0)");
+    assert_eq!(exasol_type_from_json(&ts0).to_string(), "TIMESTAMP(0)");
 
     let ts6 = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": 6});
-    assert_eq!(exasol_type_from_json(&ts6), "TIMESTAMP(6)");
+    assert_eq!(exasol_type_from_json(&ts6).to_string(), "TIMESTAMP(6)");
 
     let ts9 = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": 9});
-    assert_eq!(exasol_type_from_json(&ts9), "TIMESTAMP(9)");
+    assert_eq!(exasol_type_from_json(&ts9).to_string(), "TIMESTAMP(9)");
 
     let ts_absent = serde_json::json!({"type": "timestamp"});
-    assert_eq!(exasol_type_from_json(&ts_absent), "TIMESTAMP");
+    assert_eq!(exasol_type_from_json(&ts_absent).to_string(), "TIMESTAMP");
 
     let tstz_with_precision = serde_json::json!({
         "type": "timestamp",
@@ -764,62 +664,63 @@ fn exasol_type_from_json_reads_timestamp_fractional_seconds_precision() {
         "fractionalSecondsPrecision": 7
     });
     assert_eq!(
-        exasol_type_from_json(&tstz_with_precision),
+        exasol_type_from_json(&tstz_with_precision).to_string(),
         "TIMESTAMP WITH LOCAL TIME ZONE"
     );
 }
 
 #[test]
+fn exasol_type_from_json_caps_timestamp_precision_at_nine() {
+    for (digits, expected) in [(9, 9), (10, 9), (300, 9)] {
+        let ts = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": digits});
+        assert_eq!(
+            exasol_type_from_json(&ts),
+            ExasolType::timestamp(expected),
+            "fractionalSecondsPrecision {digits}"
+        );
+    }
+}
+
+#[test]
 fn exasol_type_from_json_propagates_ascii_character_set() {
     let ascii = serde_json::json!({"type": "VARCHAR", "size": 4, "characterSet": "ASCII"});
-    assert_eq!(exasol_type_from_json(&ascii), "VARCHAR(4) ASCII");
+    assert_eq!(
+        exasol_type_from_json(&ascii).to_string(),
+        "VARCHAR(4) ASCII"
+    );
 
     let no_charset = serde_json::json!({"type": "VARCHAR", "size": 4});
-    assert_eq!(exasol_type_from_json(&no_charset), "VARCHAR(4)");
+    assert_eq!(exasol_type_from_json(&no_charset).to_string(), "VARCHAR(4)");
 }
 
 #[test]
 fn exasol_type_from_json_renders_char_type() {
     let ascii = serde_json::json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"});
-    assert_eq!(exasol_type_from_json(&ascii), "CHAR(3) ASCII");
+    assert_eq!(exasol_type_from_json(&ascii).to_string(), "CHAR(3) ASCII");
 }
 
 #[test]
 fn exasol_type_from_json_propagates_char_ascii_character_set() {
     let utf8 = serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"});
-    assert_eq!(exasol_type_from_json(&utf8), "CHAR(20)");
+    assert_eq!(exasol_type_from_json(&utf8).to_string(), "CHAR(20)");
 
     let no_charset = serde_json::json!({"type": "CHAR", "size": 20});
-    assert_eq!(exasol_type_from_json(&no_charset), "CHAR(20)");
+    assert_eq!(exasol_type_from_json(&no_charset).to_string(), "CHAR(20)");
 }
 
 #[test]
 fn exasol_type_from_json_caps_char_size_at_exasol_maximum() {
     let oversized = serde_json::json!({"type": "CHAR", "size": 9999});
-    assert_eq!(exasol_type_from_json(&oversized), "CHAR(2000)");
+    assert_eq!(exasol_type_from_json(&oversized).to_string(), "CHAR(2000)");
 }
 
 #[test]
 fn exasol_type_from_json_char_without_size_falls_back_to_unknown_width() {
     let no_size = serde_json::json!({"type": "CHAR"});
-    assert_eq!(exasol_type_from_json(&no_size), "VARCHAR(2000000)");
-}
-
-#[test]
-fn classify_exa_type_matches_pushdown_guard_predicates() {
     assert_eq!(
-        classify_exa_type("VARCHAR(4) ASCII"),
-        ExaTypeClass::Character
+        exasol_type_from_json(&no_size).to_string(),
+        "VARCHAR(2000000)"
     );
-    assert_eq!(classify_exa_type("CHAR(2)"), ExaTypeClass::Character);
-
-    assert_eq!(classify_exa_type("DECIMAL(20,0)"), ExaTypeClass::Decimal);
-    assert_eq!(classify_exa_type("DECIMAL"), ExaTypeClass::Decimal);
-
-    assert_eq!(classify_exa_type("DATE"), ExaTypeClass::Date);
-
-    assert_eq!(classify_exa_type("TIMESTAMP"), ExaTypeClass::Other);
-    assert_eq!(classify_exa_type("DOUBLE PRECISION"), ExaTypeClass::Other);
 }
 
 #[test]
@@ -828,11 +729,13 @@ fn column_source_type_maps_to_exasol_in_one_home() {
         column_source_type_to_exasol(
             &iceberg_source(PrimitiveType::Long),
             EngineTimestampSupport::MillisecondOnly,
-        ),
+        )
+        .to_string(),
         "DECIMAL(20,0)"
     );
     assert_eq!(
-        column_source_type_to_exasol(&unity("long"), EngineTimestampSupport::MillisecondOnly,),
+        column_source_type_to_exasol(&unity("long"), EngineTimestampSupport::MillisecondOnly,)
+            .to_string(),
         "DECIMAL(20,0)"
     );
 }
@@ -853,7 +756,8 @@ fn parquet_column_source_type_reads_its_tag_in_lockstep_with_arrow_to_exasol_typ
             column_source_type_to_exasol(
                 &ColumnSourceType::Parquet(tag.to_string()),
                 EngineTimestampSupport::MillisecondOnly,
-            ),
+            )
+            .to_string(),
             expected,
             "tag `{tag}` must declare `{expected}`"
         );
@@ -861,8 +765,9 @@ fn parquet_column_source_type_reads_its_tag_in_lockstep_with_arrow_to_exasol_typ
             column_source_type_to_exasol(
                 &ColumnSourceType::Parquet(tag.to_string()),
                 EngineTimestampSupport::MillisecondOnly,
-            ),
-            arrow_to_exasol_type(&arrow_type_from_tag(tag)),
+            )
+            .to_string(),
+            arrow_to_exasol_type(&arrow_type_from_tag(tag)).to_string(),
             "tag `{tag}` must resolve through the same parser both routes share"
         );
     }
@@ -882,12 +787,14 @@ fn parquet_timestamp_tag_declares_its_unit_through_the_engine_clamp() {
     ] {
         let source = ColumnSourceType::Parquet(tag.to_string());
         assert_eq!(
-            column_source_type_to_exasol(&source, EngineTimestampSupport::DeclaredPrecision),
+            column_source_type_to_exasol(&source, EngineTimestampSupport::DeclaredPrecision)
+                .to_string(),
             declared,
             "tag `{tag}` on an engine honoring the declared precision"
         );
         assert_eq!(
-            column_source_type_to_exasol(&source, EngineTimestampSupport::MillisecondOnly),
+            column_source_type_to_exasol(&source, EngineTimestampSupport::MillisecondOnly)
+                .to_string(),
             "TIMESTAMP",
             "tag `{tag}` on a millisecond-only engine"
         );
@@ -900,7 +807,8 @@ fn parquet_column_source_type_with_an_unparseable_tag_resolves_to_varchar_json()
         column_source_type_to_exasol(
             &ColumnSourceType::Parquet("not-a-real-tag".to_string()),
             EngineTimestampSupport::MillisecondOnly,
-        ),
+        )
+        .to_string(),
         "VARCHAR(2000000)"
     );
 }
@@ -975,13 +883,16 @@ fn every_variable_binary_encoding_tags_as_binary_and_a_fixed_one_keeps_its_width
 
 #[test]
 fn a_binary_column_declares_two_hex_characters_per_byte() {
-    assert_eq!(arrow_to_exasol_type(&DataType::Binary), "VARCHAR(2000000)");
     assert_eq!(
-        arrow_to_exasol_type(&DataType::FixedSizeBinary(16)),
+        arrow_to_exasol_type(&DataType::Binary).to_string(),
+        "VARCHAR(2000000)"
+    );
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::FixedSizeBinary(16)).to_string(),
         "VARCHAR(32)"
     );
     assert_eq!(
-        arrow_to_exasol_type(&DataType::FixedSizeBinary(1_000_001)),
+        arrow_to_exasol_type(&DataType::FixedSizeBinary(1_000_001)).to_string(),
         "VARCHAR(2000000)",
         "a width whose hex exceeds VARCHAR(2000000) declares the widest VARCHAR"
     );
@@ -1018,7 +929,8 @@ fn unity_columns_declare_their_type_json() {
             column_source_type_to_exasol(
                 &unity(spark_type),
                 EngineTimestampSupport::MillisecondOnly
-            ),
+            )
+            .to_string(),
             expected,
             "type_json {spark_type}"
         );
@@ -1045,7 +957,8 @@ fn unity_types_exasol_cannot_hold_or_unreadable_type_json_declare_varchar() {
     ];
     for source in unreadable.into_iter().chain(spark_types.map(unity)) {
         assert_eq!(
-            column_source_type_to_exasol(&source, EngineTimestampSupport::MillisecondOnly),
+            column_source_type_to_exasol(&source, EngineTimestampSupport::MillisecondOnly)
+                .to_string(),
             "VARCHAR(2000000)",
             "{source:?}"
         );
@@ -1057,7 +970,7 @@ fn unity_types_exasol_cannot_hold_or_unreadable_type_json_declare_varchar() {
         ),
     };
     assert_eq!(
-        column_source_type_to_exasol(&array, EngineTimestampSupport::MillisecondOnly),
+        column_source_type_to_exasol(&array, EngineTimestampSupport::MillisecondOnly).to_string(),
         "VARCHAR(2000000)"
     );
 }
@@ -1080,7 +993,8 @@ fn glue_columns_declare_the_spark_listing_type() {
         let declared = column_source_type_to_exasol(
             &glue(hive_type),
             EngineTimestampSupport::DeclaredPrecision,
-        );
+        )
+        .to_string();
         assert_eq!(declared, expected, "hive type {hive_type:?}");
     }
     let unity_timestamp = unity("timestamp_ntz");
@@ -1089,8 +1003,8 @@ fn glue_columns_declare_the_spark_listing_type() {
         EngineTimestampSupport::DeclaredPrecision,
     ] {
         assert_eq!(
-            column_source_type_to_exasol(&glue("timestamp"), engine),
-            column_source_type_to_exasol(&unity_timestamp, engine),
+            column_source_type_to_exasol(&glue("timestamp"), engine).to_string(),
+            column_source_type_to_exasol(&unity_timestamp, engine).to_string(),
             "a Glue timestamp declares the engine's timestamp type as Unity does: {engine:?}"
         );
     }
@@ -1114,11 +1028,13 @@ fn catalog_decimal_guard_is_shared_by_both_source_kinds() {
         let iceberg_result = column_source_type_to_exasol(
             &iceberg_source(PrimitiveType::Decimal { precision, scale }),
             EngineTimestampSupport::MillisecondOnly,
-        );
+        )
+        .to_string();
         let unity_result = column_source_type_to_exasol(
             &unity(&format!("decimal({precision},{scale})")),
             EngineTimestampSupport::MillisecondOnly,
-        );
+        )
+        .to_string();
         assert_eq!(
             iceberg_result, expected,
             "iceberg precision={precision} scale={scale}"
@@ -1164,7 +1080,8 @@ fn iceberg_primitive_mappings_are_exhaustive_so_a_new_variant_breaks_the_build()
     for variant in &every_variant {
         let (expected_exasol, expected_arrow) = expected_mapping(variant);
         assert_eq!(
-            iceberg_primitive_to_exasol(variant, EngineTimestampSupport::MillisecondOnly),
+            iceberg_primitive_to_exasol(variant, EngineTimestampSupport::MillisecondOnly)
+                .to_string(),
             expected_exasol,
             "iceberg_primitive_to_exasol mapped {variant:?} to an unexpected Exasol type"
         );
@@ -1241,7 +1158,8 @@ fn database_version_leading_component_selects_the_declared_timestamp_precision()
         assert_eq!(
             resolved
                 .clamp(TimestampPrecision::Microsecond)
-                .declaration(),
+                .declaration()
+                .to_string(),
             expected_declaration,
             "version={version}"
         );
@@ -1260,12 +1178,16 @@ fn unreadable_database_version_declares_the_source_width_unclamped() {
         assert_eq!(
             resolved
                 .clamp(TimestampPrecision::Microsecond)
-                .declaration(),
+                .declaration()
+                .to_string(),
             "TIMESTAMP(6)",
             "version={version:?}"
         );
         assert_eq!(
-            resolved.clamp(TimestampPrecision::Nanosecond).declaration(),
+            resolved
+                .clamp(TimestampPrecision::Nanosecond)
+                .declaration()
+                .to_string(),
             "TIMESTAMP(9)",
             "version={version:?}"
         );
@@ -1280,17 +1202,17 @@ fn timestamp_declaration_is_version_gated_for_both_catalog_kinds() {
     ];
     for (engine, expected) in cases {
         assert_eq!(
-            iceberg_primitive_to_exasol(&PrimitiveType::Timestamp, engine),
+            iceberg_primitive_to_exasol(&PrimitiveType::Timestamp, engine).to_string(),
             expected,
             "iceberg timestamp on {engine:?}"
         );
         assert_eq!(
-            column_source_type_to_exasol(&unity("timestamp"), engine,),
+            column_source_type_to_exasol(&unity("timestamp"), engine,).to_string(),
             expected,
             "delta TIMESTAMP on {engine:?}"
         );
         assert_eq!(
-            column_source_type_to_exasol(&unity("timestamp_ntz"), engine,),
+            column_source_type_to_exasol(&unity("timestamp_ntz"), engine,).to_string(),
             expected,
             "delta TIMESTAMP_NTZ on {engine:?}"
         );
@@ -1307,12 +1229,14 @@ fn every_iceberg_timestamp_variant_declares_its_own_source_width() {
     ];
     for (variant, unclamped_declaration) in &cases {
         assert_eq!(
-            iceberg_primitive_to_exasol(variant, EngineTimestampSupport::DeclaredPrecision),
+            iceberg_primitive_to_exasol(variant, EngineTimestampSupport::DeclaredPrecision)
+                .to_string(),
             *unclamped_declaration,
             "{variant:?} on an engine that honors the declared precision"
         );
         assert_eq!(
-            iceberg_primitive_to_exasol(variant, EngineTimestampSupport::MillisecondOnly),
+            iceberg_primitive_to_exasol(variant, EngineTimestampSupport::MillisecondOnly)
+                .to_string(),
             "TIMESTAMP",
             "{variant:?} on an engine that emits milliseconds only"
         );
@@ -1344,62 +1268,144 @@ fn declared_digits_resolve_to_the_arrow_unit_of_their_source_width() {
 
 #[test]
 fn arrow_input_resolver_stays_outside_the_timestamp_version_gate() {
-    let _ungated: fn(&DataType) -> String = arrow_to_exasol_type;
+    let _ungated: fn(&DataType) -> ExasolType = arrow_to_exasol_type;
 
     assert_eq!(
-        arrow_to_exasol_type(&DataType::Timestamp(TimeUnit::Microsecond, None)),
+        arrow_to_exasol_type(&DataType::Timestamp(TimeUnit::Microsecond, None)).to_string(),
         "TIMESTAMP"
     );
     assert_eq!(
         arrow_to_exasol_type(&DataType::Timestamp(
             TimeUnit::Microsecond,
             Some("UTC".into())
-        )),
+        ))
+        .to_string(),
         "TIMESTAMP"
     );
 }
 
+fn every_variant() -> Vec<ExasolType> {
+    let mut variants = vec![
+        ExasolType::Boolean,
+        ExasolType::DoublePrecision,
+        ExasolType::Date,
+        ExasolType::TimestampWithLocalTimeZone,
+        ExasolType::Timestamp { precision: None },
+        ExasolType::WIDEST_VARCHAR,
+    ];
+    variants.extend([0, 3, 6, 9].map(|digits| ExasolType::Timestamp {
+        precision: Some(digits),
+    }));
+    variants.extend(
+        [(1, 0), (10, 0), (18, 6), (36, 36)]
+            .map(|(precision, scale)| ExasolType::Decimal { precision, scale }),
+    );
+    for ascii in [false, true] {
+        variants.push(ExasolType::Char { size: 1, ascii });
+        variants.push(ExasolType::Char { size: 2000, ascii });
+        variants.push(ExasolType::Varchar { size: 1, ascii });
+        variants.push(ExasolType::Varchar {
+            size: 2_000_000,
+            ascii,
+        });
+    }
+    variants
+}
+
+/// Scenario: A TIMESTAMP(p) column declaration serializes fractionalSecondsPrecision
 #[test]
-fn exasol_type_to_json_renders_timestamp_fractional_seconds_precision() {
-    assert_eq!(
-        exasol_type_to_json("TIMESTAMP(6)"),
-        json!({"type": "timestamp", "fractionalSecondsPrecision": 6})
-    );
-    assert_eq!(
-        exasol_type_to_json("TIMESTAMP(9)"),
-        json!({"type": "timestamp", "fractionalSecondsPrecision": 9})
-    );
-    assert_eq!(
-        exasol_type_to_json("TIMESTAMP(0)"),
-        json!({"type": "timestamp", "fractionalSecondsPrecision": 0})
-    );
-
-    assert_eq!(
-        exasol_type_to_json("TIMESTAMP"),
-        json!({"type": "timestamp"})
-    );
-    assert_eq!(
-        exasol_type_to_json("TIMESTAMP WITH LOCAL TIME ZONE"),
-        json!({"type": "timestamp", "withLocalTimeZone": true})
-    );
-
-    for malformed in ["TIMESTAMP()", "TIMESTAMP(abc)", "TIMESTAMP(-1)"] {
+fn exasol_type_to_json_round_trips_every_variant() {
+    for exasol_type in every_variant() {
         assert_eq!(
-            exasol_type_to_json(malformed),
-            json!({"type": "varchar", "size": 2_000_000}),
-            "malformed={malformed}"
+            exasol_type_from_json(&exasol_type_to_json(&exasol_type)),
+            exasol_type,
+            "{exasol_type} must read back as itself"
         );
     }
+}
 
-    for declared in [
-        "TIMESTAMP",
-        "TIMESTAMP(6)",
-        "TIMESTAMP WITH LOCAL TIME ZONE",
+#[test]
+fn exasol_type_to_json_renders_each_recorded_data_type_object() {
+    let cases = [
+        (ExasolType::Boolean, json!({"type": "boolean"})),
+        (ExasolType::DoublePrecision, json!({"type": "double"})),
+        (ExasolType::Date, json!({"type": "date"})),
+        (
+            ExasolType::decimal(18, 4),
+            json!({"type": "decimal", "precision": 18, "scale": 4}),
+        ),
+        (
+            ExasolType::decimal(10, -2),
+            json!({"type": "decimal", "precision": 10, "scale": -2}),
+        ),
+        (
+            ExasolType::Timestamp { precision: None },
+            json!({"type": "timestamp"}),
+        ),
+        (
+            ExasolType::timestamp(6),
+            json!({"type": "timestamp", "fractionalSecondsPrecision": 6}),
+        ),
+        (
+            ExasolType::timestamp(0),
+            json!({"type": "timestamp", "fractionalSecondsPrecision": 0}),
+        ),
+        (
+            ExasolType::TimestampWithLocalTimeZone,
+            json!({"type": "timestamp", "withLocalTimeZone": true}),
+        ),
+        (
+            ExasolType::WIDEST_VARCHAR,
+            json!({"type": "varchar", "size": 2_000_000}),
+        ),
+        (
+            ExasolType::Varchar {
+                size: 4,
+                ascii: true,
+            },
+            json!({"type": "varchar", "size": 4, "characterSet": "ASCII"}),
+        ),
+        (ExasolType::char(3), json!({"type": "char", "size": 3})),
+        (
+            ExasolType::Char {
+                size: 3,
+                ascii: true,
+            },
+            json!({"type": "char", "size": 3, "characterSet": "ASCII"}),
+        ),
+    ];
+    for (exasol_type, expected) in cases {
+        assert_eq!(exasol_type_to_json(&exasol_type), expected, "{exasol_type}");
+    }
+}
+
+#[test]
+fn exasol_type_from_json_defaults_and_caps_a_decimal_and_a_varchar() {
+    assert_eq!(
+        exasol_type_from_json(&json!({"type": "decimal"})).to_string(),
+        "DECIMAL(18,0)"
+    );
+    assert_eq!(
+        exasol_type_from_json(&json!({"type": "decimal", "precision": 10})).to_string(),
+        "DECIMAL(10,0)"
+    );
+    for out_of_range in [
+        json!({"type": "decimal", "precision": 300, "scale": 2}),
+        json!({"type": "decimal", "precision": 10, "scale": 200}),
+        json!({"type": "decimal", "precision": 37, "scale": 0}),
     ] {
         assert_eq!(
-            exasol_type_from_json(&exasol_type_to_json(declared)),
-            declared,
-            "declared={declared}"
+            exasol_type_from_json(&out_of_range),
+            ExasolType::WIDEST_VARCHAR,
+            "{out_of_range}"
         );
     }
+    assert_eq!(
+        exasol_type_from_json(&json!({"type": "varchar"})).to_string(),
+        "VARCHAR(2000000)"
+    );
+    assert_eq!(
+        exasol_type_from_json(&json!({"type": "varchar", "size": 9_999_999})).to_string(),
+        "VARCHAR(2000000)"
+    );
 }

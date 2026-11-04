@@ -13,20 +13,22 @@ use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::properties::resolve_binary_as_string;
 use crate::adapter::{ResolvedConnectionConfig, get_properties};
 use crate::scan::spec::{
-    CatalogProps, CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ProjectionItem,
-    ScanSpec, ScanStorage,
+    CatalogProps, CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ScanSpec, ScanStorage,
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 mod binary_filter;
-pub(crate) use binary_filter::{BinaryColumns, literal_binary_bytes};
+pub(crate) use binary_filter::literal_binary_bytes;
 
 mod support;
-pub use support::{AggregateMergeInputs, build_fan_out_inner, build_scan_driving_sql, shard_count};
+pub use support::{
+    AggregateMergeInputs, ColumnTypes, ProjectedColumn, build_fan_out_inner,
+    build_scan_driving_sql, shard_count,
+};
 use support::{
-    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, InvolvedColumns, SCAN_UDF_NAME, classify_where_filter,
-    extract_limit, extract_projection, involved_columns, order_by_present, scan_storage_for,
+    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, classify_where_filter, extract_limit,
+    involved_columns, order_by_present, project_columns, projection_items, scan_storage_for,
 };
 use vs_expression::strip_table_alias;
 
@@ -153,14 +155,9 @@ pub async fn handle_pushdown(
     // Strip every `tableAlias` after the join gate and before any read (#193).
     let pushdown_req = strip_table_alias(&pushdown_req);
 
-    let (proj_cols, proj_types, projection_widened) = extract_projection(request, &pushdown_req)?;
-
     let filter_json_raw = pushdown_req.get("filter").filter(|f| !f.is_null());
 
-    let InvolvedColumns {
-        types: col_types,
-        notes: col_notes,
-    } = involved_columns(request, |tables| tables.first());
+    let involved = involved_columns(request, |tables| tables.first());
 
     let limit = extract_limit(&pushdown_req);
 
@@ -182,25 +179,25 @@ pub async fn handle_pushdown(
         &conn.permission_check,
     )
     .await?;
-    let ResolvedScan {
-        files,
-        effective_storage,
-        logical_schema,
-        table_root,
-        name_mapping,
-        partition_columns,
-        refused_columns,
-    } = resolver
-        .resolve(&catalog.table, filter_json_raw, &col_notes)
+    let (
+        ResolvedScan {
+            files,
+            effective_storage,
+            logical_schema,
+            table_root,
+            name_mapping,
+            partition_columns,
+            refused_columns,
+        },
+        col_types,
+    ) = resolver
+        .resolve(&catalog.table, filter_json_raw, &involved)
         .await?;
+    let (projection, projection_widened) = project_columns(&pushdown_req, &col_types)?;
     // `filter_json_raw` stays unmodified: format-level pruning must see the original
     // predicate tree, whatever the adapter declines.
     let binary_as_string = resolve_binary_as_string(&props);
-    let (filter, declined_filter) = classify_where_filter(
-        filter_json_raw,
-        &ColumnTypes::unqualified(&col_types),
-        &BinaryColumns::of(&logical_schema, binary_as_string),
-    );
+    let (filter, declined_filter) = classify_where_filter(filter_json_raw, &col_types);
     let scan_storage = scan_storage_for(
         &conn.creds,
         &conn.connection_name,
@@ -213,15 +210,16 @@ pub async fn handle_pushdown(
     // empty result.
     ensure_no_refused_column_referenced(
         request,
-        (!projection_widened).then_some(proj_cols.as_slice()),
+        (!projection_widened)
+            .then(|| projection_items(&projection))
+            .as_deref(),
         &refused_columns,
     )?;
 
     if files.is_empty() {
         return empty_result_sql(
             &pushdown_req,
-            &proj_cols,
-            &proj_types,
+            &projection,
             projection_widened,
             &col_types,
             &EmptyRelation::single_scan(request, &col_types),
@@ -239,10 +237,9 @@ pub async fn handle_pushdown(
     build_dispatch_sql(
         request,
         &pushdown_req,
-        proj_cols,
-        proj_types,
+        projection,
         projection_widened,
-        col_types,
+        &col_types,
         filter,
         declined_filter,
         limit,
@@ -265,17 +262,16 @@ pub async fn handle_pushdown(
     )
 }
 
-/// `projection_widened` means `proj_cols`/`proj_types` are the full base row rather
+/// `projection_widened` means `projection` is the full base row rather
 /// than one item per select-list item (#196). `filter` and `declined_filter` are
 /// never both `Some`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_dispatch_sql(
     request: &Json,
     pushdown_req: &Json,
-    mut proj_cols: Vec<ProjectionItem>,
-    mut proj_types: Vec<String>,
+    mut projection: Vec<ProjectedColumn>,
     projection_widened: bool,
-    col_types: Vec<(String, String)>,
+    col_types: &ColumnTypes,
     filter: Option<String>,
     declined_filter: Option<&Json>,
     limit: Option<u64>,
@@ -328,14 +324,14 @@ pub(crate) fn build_dispatch_sql(
             &base,
             None,
             shards,
-            &col_types,
+            col_types,
             udf_name,
             distribute_udf_name,
             Some(declined),
         );
     }
 
-    let single_group_merge = match classify_request_shape(pushdown_req, &col_types) {
+    let single_group_merge = match classify_request_shape(pushdown_req, col_types) {
         RequestShape::Grouped {
             detection,
             having,
@@ -377,7 +373,7 @@ pub(crate) fn build_dispatch_sql(
                 &select_items,
                 grouped_limit,
                 support::extract_offset(pushdown_req),
-                &col_types,
+                col_types,
                 udf_name,
                 distribute_udf_name,
                 having.as_deref(),
@@ -396,7 +392,7 @@ pub(crate) fn build_dispatch_sql(
                 &base,
                 filter.clone(),
                 shards,
-                &col_types,
+                col_types,
                 udf_name,
                 distribute_udf_name,
                 None,
@@ -425,7 +421,7 @@ pub(crate) fn build_dispatch_sql(
                     &base_spec,
                     shards,
                     &items,
-                    &col_types,
+                    col_types,
                     limit,
                     udf_name,
                     distribute_udf_name,
@@ -443,7 +439,7 @@ pub(crate) fn build_dispatch_sql(
                     &base,
                     filter.clone(),
                     shards,
-                    &col_types,
+                    col_types,
                     udf_name,
                     distribute_udf_name,
                     None,
@@ -465,7 +461,7 @@ pub(crate) fn build_dispatch_sql(
                     &base,
                     filter.clone(),
                     shards,
-                    &col_types,
+                    col_types,
                     udf_name,
                     distribute_udf_name,
                     None,
@@ -485,7 +481,7 @@ pub(crate) fn build_dispatch_sql(
                     &base,
                     filter.clone(),
                     shards,
-                    &col_types,
+                    col_types,
                     udf_name,
                     distribute_udf_name,
                     None,
@@ -504,7 +500,12 @@ pub(crate) fn build_dispatch_sql(
     // column could otherwise make a shape match top-N, whose output has no wrapping
     // SELECT to drop it (#225).
     let topn = if aggregates.is_none() {
-        detect_topn(request, pushdown_req, &proj_cols, &logical_schema)
+        detect_topn(
+            request,
+            pushdown_req,
+            &projection_items(&projection),
+            &logical_schema,
+        )
     } else {
         None
     };
@@ -527,20 +528,21 @@ pub(crate) fn build_dispatch_sql(
     // Declined ORDER BY: missing sort-key columns are appended as hidden columns, and
     // the wrapper below drops them again (#225). Must run after `detect_topn` and
     // before `spec_template`, so EMITS and the scan projection stay in sync.
-    let visible_count = proj_cols.len();
+    let visible_count = projection.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
         let keys = parse_order_by_keys(pushdown_req);
         // Exasol does not re-sort a delegated ordering, so an unrenderable key must
         // decline before any SQL is built (#198).
         topn::ensure_every_sort_key_renders(&keys)?;
-        topn::extend_projection_with_sort_keys(&mut proj_cols, &mut proj_types, &keys, &col_types);
+        topn::extend_projection_with_sort_keys(&mut projection, &keys, col_types);
         keys
     } else {
         Vec::new()
     };
 
     let has_aggregates = aggregates.is_some();
+    let proj_items = projection_items(&projection);
 
     let spec_template = ScanSpec {
         common: CommonScanSpec {
@@ -549,7 +551,7 @@ pub(crate) fn build_dispatch_sql(
             projection: if has_aggregates {
                 Vec::new()
             } else {
-                proj_cols.clone()
+                proj_items.clone()
             },
             filter,
             limit: effective_limit,
@@ -569,10 +571,9 @@ pub(crate) fn build_dispatch_sql(
     let sql = build_scan_driving_sql(
         &spec_template,
         shards,
-        &proj_cols,
-        &proj_types,
+        &projection,
         effective_limit,
-        &col_types,
+        col_types,
         merge_inputs.as_ref(),
         udf_name,
         distribute_udf_name,
@@ -584,7 +585,7 @@ pub(crate) fn build_dispatch_sql(
     let sql = if declined_order_by {
         topn::wrap_declined_order_by(
             &sql,
-            &proj_cols,
+            &proj_items,
             visible_count,
             &declined_sort_keys,
             limit,
