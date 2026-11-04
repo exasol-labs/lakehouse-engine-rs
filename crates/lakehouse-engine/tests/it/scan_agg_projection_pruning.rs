@@ -21,8 +21,6 @@ use lakehouse_engine::scan::{
     register_files, session_config_for_spec,
 };
 
-use parquet::arrow::ArrowWriter;
-
 const TABLE_COLUMNS: [&str; 3] = ["region", "score", "category"];
 
 fn write_local_parquet(dir: &std::path::Path) -> String {
@@ -33,8 +31,6 @@ fn write_local_parquet(dir: &std::path::Path) -> String {
     ]));
 
     let path = dir.join("agg_pruning_data.parquet");
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
 
     let regions = vec!["north", "south", "north", "east", "south", "west"];
     let scores: Vec<i64> = vec![10, 20, 30, 40, 50, 60];
@@ -48,12 +44,7 @@ fn write_local_parquet(dir: &std::path::Path) -> String {
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-
-    url::Url::from_file_path(&path)
-        .expect("file path must be absolute")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 /// `projection` stays empty: proving it plays no part in the physical read is the point.

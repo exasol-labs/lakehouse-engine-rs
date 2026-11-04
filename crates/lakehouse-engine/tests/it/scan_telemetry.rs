@@ -15,7 +15,6 @@ use lakehouse_engine::scan::session_config_for_spec;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, FileEntry, ScanSpec, ScanStorage, StorageBackend, StorageProps,
 };
-use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
 /// The telemetry file is keyed by PID, so it is shared by every test in this binary.
@@ -31,11 +30,9 @@ fn write_local_parquet(dir: &std::path::Path, rows: i64, row_group: usize) -> St
         Field::new("name", DataType::Utf8, false),
     ]));
     let path = dir.join("telemetry_data.parquet");
-    let file = std::fs::File::create(&path).expect("create parquet file");
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(row_group))
         .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
     let ids: Vec<i64> = (0..rows).collect();
     let names: Vec<String> = (0..rows).map(|i| format!("row-{i}")).collect();
     let batch = RecordBatch::try_new(
@@ -46,11 +43,7 @@ fn write_local_parquet(dir: &std::path::Path, rows: i64, row_group: usize) -> St
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, Some(props))
 }
 
 fn scan_spec(file_url: String) -> ScanSpec {

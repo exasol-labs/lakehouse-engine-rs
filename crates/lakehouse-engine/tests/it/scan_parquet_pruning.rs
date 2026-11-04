@@ -21,7 +21,6 @@ use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, scan_session_context, session_config_for_spec,
 };
 use object_store::local::LocalFileSystem;
-use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
 fn write_local_parquet(dir: &std::path::Path) -> String {
@@ -31,12 +30,10 @@ fn write_local_parquet(dir: &std::path::Path) -> String {
     ]));
 
     let path = dir.join("pruning_data.parquet");
-    let file = std::fs::File::create(&path).expect("create parquet file");
 
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(100))
         .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
 
     let total = 1_000i64;
     let ids: Vec<i64> = (0..total).collect();
@@ -49,12 +46,7 @@ fn write_local_parquet(dir: &std::path::Path) -> String {
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-
-    url::Url::from_file_path(&path)
-        .expect("file path must be absolute")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, Some(props))
 }
 
 fn pruning_spec(file_url: String) -> ScanSpec {
@@ -171,13 +163,11 @@ fn write_nested_parquet(dir: &std::path::Path, rows_per_group: usize) -> String 
     ]));
 
     let path = dir.join(format!("nested_{rows_per_group}.parquet"));
-    let file = std::fs::File::create(&path).expect("create parquet file");
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(rows_per_group))
         .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Page)
         .set_bloom_filter_enabled(true)
         .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
 
     let mut tags = ListBuilder::new(StringBuilder::new());
     for row in [vec!["hello", "world"], vec!["zzz"]] {
@@ -194,12 +184,7 @@ fn write_nested_parquet(dir: &std::path::Path, rows_per_group: usize) -> String 
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-
-    url::Url::from_file_path(&path)
-        .expect("file path must be absolute")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, Some(props))
 }
 
 fn nested_spec(file_url: String, filter: &str) -> ScanSpec {
@@ -445,11 +430,9 @@ fn write_binary_parquet(dir: &std::path::Path) -> String {
         Field::new("f", DataType::FixedSizeBinary(2), true),
     ]));
     let path = dir.join("binary.parquet");
-    let file = std::fs::File::create(&path).expect("create parquet file");
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(100))
         .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
     let ids: Vec<i64> = (0..400).collect();
     let bytes: Vec<[u8; 2]> = ids
         .iter()
@@ -464,11 +447,7 @@ fn write_binary_parquet(dir: &std::path::Path) -> String {
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("file path must be absolute")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, Some(props))
 }
 
 fn binary_spec(file_url: &str, filter: &str) -> ScanSpec {

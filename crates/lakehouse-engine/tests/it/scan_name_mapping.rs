@@ -18,7 +18,6 @@ use lakehouse_engine::scan::spec::{
 };
 use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
-use parquet::arrow::ArrowWriter;
 
 /// Neither column carries `PARQUET:field_id`. `id` holds `0..rows`, the other `10 * id`.
 fn write_local_parquet_two_int_cols(
@@ -33,11 +32,6 @@ fn write_local_parquet_two_int_cols(
         Field::new(other_col_name, DataType::Int64, true),
     ]));
     let path = dir.join(relative);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create parent dir");
-    }
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let ids: Vec<i64> = (0..rows).collect();
     let others: Vec<i64> = (0..rows).map(|i| i * 10).collect();
     let batch = RecordBatch::try_new(
@@ -48,11 +42,7 @@ fn write_local_parquet_two_int_cols(
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 fn name_mapping_spec(

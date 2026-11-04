@@ -35,11 +35,6 @@ fn write_local_parquet(
         .collect();
     let schema = Arc::new(Schema::new(fields));
     let path = dir.join(relative);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create parent dir");
-    }
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let ids: Vec<i64> = (0..rows).collect();
     let arrays: Vec<Arc<dyn Array>> = columns
         .iter()
@@ -54,11 +49,7 @@ fn write_local_parquet(
         })
         .collect();
     let batch = RecordBatch::try_new(schema, arrays).expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 fn raw_scan_spec(

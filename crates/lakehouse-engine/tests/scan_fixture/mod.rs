@@ -36,6 +36,24 @@ pub fn dummy_storage() -> StorageBackend {
     })
 }
 
+/// Writes `batch` as the Parquet file `path`, creating its parent directories, and returns its
+/// file URL.
+pub fn write_parquet(
+    path: &std::path::Path,
+    batch: &RecordBatch,
+    props: Option<parquet::file::properties::WriterProperties>,
+) -> String {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create parent dir");
+    }
+    let file = std::fs::File::create(path).expect("create parquet file");
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(file, batch.schema(), props).expect("arrow writer");
+    writer.write(batch).expect("write batch");
+    writer.close().expect("close writer");
+    file_url(path)
+}
+
 pub fn file_url(path: &std::path::Path) -> String {
     url::Url::from_file_path(path)
         .expect("absolute path")

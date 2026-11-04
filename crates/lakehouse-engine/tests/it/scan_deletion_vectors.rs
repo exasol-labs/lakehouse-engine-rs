@@ -33,7 +33,6 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
-use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use url::Url;
 
@@ -453,8 +452,6 @@ fn write_iceberg_delete_parquet(dir: &Path, relative: &str, entries: &[(&str, i6
             .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_POS)),
     ]));
     let path = dir.join(relative);
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let paths: Vec<&str> = entries.iter().map(|(p, _)| *p).collect();
     let positions: Vec<i64> = entries.iter().map(|(_, pos)| *pos).collect();
     let batch = RecordBatch::try_new(
@@ -465,9 +462,7 @@ fn write_iceberg_delete_parquet(dir: &Path, relative: &str, entries: &[(&str, i6
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    file_url(&path)
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 fn write_iceberg_data_parquet(dir: &Path, relative: &str, values: &[i32]) -> String {
@@ -477,13 +472,9 @@ fn write_iceberg_data_parquet(dir: &Path, relative: &str, values: &[i32]) -> Str
         false,
     )]));
     let path = dir.join(relative);
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.to_vec()))])
         .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    file_url(&path)
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 #[test]

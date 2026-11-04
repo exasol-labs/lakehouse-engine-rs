@@ -17,7 +17,6 @@ use lakehouse_engine::scan::spec::{
     CommonScanSpec, DeleteMechanism, FileEntry, ScanSpec, ScanStorage, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{read_scan_spec, run_raw_scan_with_session, session_config_for_spec};
-use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
 
@@ -31,11 +30,9 @@ fn write_local_parquet(dir: &std::path::Path, rows: i64, row_group: usize) -> St
         Field::new("name", DataType::Utf8, false),
     ]));
     let path = dir.join("two_arg_data.parquet");
-    let file = std::fs::File::create(&path).expect("create parquet file");
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(row_group))
         .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
     let ids: Vec<i64> = (0..rows).collect();
     let names: Vec<String> = (0..rows).map(|i| format!("row-{i}")).collect();
     let batch = RecordBatch::try_new(
@@ -46,11 +43,7 @@ fn write_local_parquet(dir: &std::path::Path, rows: i64, row_group: usize) -> St
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, Some(props))
 }
 
 fn id_name_as_decimal() -> Vec<ExaType> {
@@ -156,11 +149,6 @@ fn write_delete_parquet(dir: &std::path::Path, relative: &str, entries: &[(&str,
             .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_POS)),
     ]));
     let path = dir.join(relative);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create parent dir");
-    }
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let paths: Vec<&str> = entries.iter().map(|(p, _)| *p).collect();
     let positions: Vec<i64> = entries.iter().map(|(_, pos)| *pos).collect();
     let batch = RecordBatch::try_new(
@@ -171,11 +159,7 @@ fn write_delete_parquet(dir: &std::path::Path, relative: &str, entries: &[(&str,
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 fn spec_for_files(files: Vec<FileEntry>) -> ScanSpec {

@@ -47,8 +47,6 @@ fn write_orders(dir: &std::path::Path) -> (String, u64) {
         Field::new("o_totalprice", DataType::Float64, false).with_metadata(field_id_meta(3)),
     ]));
     let path = dir.join("orders.parquet");
-    let file = std::fs::File::create(&path).expect("create orders parquet");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let batch = RecordBatch::try_new(
         schema,
         vec![
@@ -60,9 +58,7 @@ fn write_orders(dir: &std::path::Path) -> (String, u64) {
         ],
     )
     .expect("orders batch");
-    writer.write(&batch).expect("write orders");
-    writer.close().expect("close orders");
-    sized(file_url(&path))
+    sized(scan_fixture::write_parquet(&path, &batch, None))
 }
 
 fn write_customer(dir: &std::path::Path) -> (String, u64) {
@@ -73,8 +69,6 @@ fn write_customer(dir: &std::path::Path) -> (String, u64) {
         Field::new("c_name", DataType::Utf8, false).with_metadata(field_id_meta(2)),
     ]));
     let path = dir.join("customer.parquet");
-    let file = std::fs::File::create(&path).expect("create customer parquet");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let batch = RecordBatch::try_new(
         schema,
         vec![
@@ -83,9 +77,7 @@ fn write_customer(dir: &std::path::Path) -> (String, u64) {
         ],
     )
     .expect("customer batch");
-    writer.write(&batch).expect("write customer");
-    writer.close().expect("close customer");
-    sized(file_url(&path))
+    sized(scan_fixture::write_parquet(&path, &batch, None))
 }
 
 /// Custkey 10's empty name is emitted as `""`, which Exasol receives as NULL.
@@ -95,8 +87,6 @@ fn write_customer_with_blank_names(dir: &std::path::Path) -> (String, u64) {
         Field::new("c_name", DataType::Utf8, false),
     ]));
     let path = dir.join("customer_blank_names.parquet");
-    let file = std::fs::File::create(&path).expect("create customer parquet");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let batch = RecordBatch::try_new(
         schema,
         vec![
@@ -105,9 +95,7 @@ fn write_customer_with_blank_names(dir: &std::path::Path) -> (String, u64) {
         ],
     )
     .expect("customer batch");
-    writer.write(&batch).expect("write customer");
-    writer.close().expect("close customer");
-    sized(file_url(&path))
+    sized(scan_fixture::write_parquet(&path, &batch, None))
 }
 
 /// The first two rows match no dimension row, so a pre-join `LIMIT 2` would emit zero rows.
@@ -118,8 +106,6 @@ fn write_orders_leading_unmatched(dir: &std::path::Path) -> (String, u64) {
         Field::new("o_totalprice", DataType::Float64, false),
     ]));
     let path = dir.join("orders_leading_unmatched.parquet");
-    let file = std::fs::File::create(&path).expect("create orders parquet");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let batch = RecordBatch::try_new(
         schema,
         vec![
@@ -129,9 +115,7 @@ fn write_orders_leading_unmatched(dir: &std::path::Path) -> (String, u64) {
         ],
     )
     .expect("orders batch");
-    writer.write(&batch).expect("write orders");
-    writer.close().expect("close orders");
-    sized(file_url(&path))
+    sized(scan_fixture::write_parquet(&path, &batch, None))
 }
 
 fn s3_backend(endpoint: &str, secret: &str) -> StorageBackend {

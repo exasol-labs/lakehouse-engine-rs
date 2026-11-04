@@ -24,7 +24,6 @@ use lakehouse_engine::scan::{
 };
 use lakehouse_engine::types::exasol_type::ExasolType;
 
-use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
 
@@ -34,8 +33,6 @@ fn write_local_parquet(dir: &std::path::Path) -> String {
         Field::new("name", DataType::Utf8, false),
     ]));
     let path = dir.join("plan_shape.parquet");
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let ids: Vec<i64> = (0..100).collect();
     let names: Vec<String> = (0..100).map(|i| format!("row-{i}")).collect();
     let batch = RecordBatch::try_new(
@@ -46,11 +43,7 @@ fn write_local_parquet(dir: &std::path::Path) -> String {
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 fn single_partition_spec(file_url: String) -> ScanSpec {
@@ -148,8 +141,6 @@ fn write_local_parquet_with_score(dir: &std::path::Path) -> String {
         Field::new("name", DataType::Utf8, false),
     ]));
     let path = dir.join("mixed_projection.parquet");
-    let file = std::fs::File::create(&path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let ids: Vec<i64> = (1..=3).collect();
     let scores: Vec<f64> = vec![5.0, 10.0, 15.0];
     let names: Vec<String> = (1..=3).map(|i| format!("event-{i:02}")).collect();
@@ -162,11 +153,7 @@ fn write_local_parquet_with_score(dir: &std::path::Path) -> String {
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -609,11 +596,9 @@ fn write_multi_row_group_parquet(dir: &std::path::Path) -> String {
         Field::new("name", DataType::Utf8, false),
     ]));
     let path = dir.join("access_plan_pruning.parquet");
-    let file = std::fs::File::create(&path).expect("create parquet file");
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(100))
         .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
     let total = 1_000i64;
     let ids: Vec<i64> = (0..total).collect();
     let names: Vec<String> = (0..total).map(|i| format!("row-{i:04}")).collect();
@@ -625,11 +610,7 @@ fn write_multi_row_group_parquet(dir: &std::path::Path) -> String {
         ],
     )
     .expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, Some(props))
 }
 
 /// Deletes `pos = 250`, inside a row group the pruning predicate keeps.
@@ -642,8 +623,6 @@ fn write_positional_delete_parquet(dir: &std::path::Path, data_file_url: &str) -
         Field::new("pos", DataType::Int64, false).with_metadata(field_id_meta(2_147_483_545)),
     ]));
     let path = dir.join("access_plan_pruning-delete.parquet");
-    let file = std::fs::File::create(&path).expect("create delete parquet file");
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
     let batch = RecordBatch::try_new(
         schema,
         vec![
@@ -652,11 +631,7 @@ fn write_positional_delete_parquet(dir: &std::path::Path, data_file_url: &str) -
         ],
     )
     .expect("delete record batch");
-    writer.write(&batch).expect("write delete batch");
-    writer.close().expect("close delete writer");
-    url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string()
+    scan_fixture::write_parquet(&path, &batch, None)
 }
 
 fn local_size(file_url: &str) -> u64 {
