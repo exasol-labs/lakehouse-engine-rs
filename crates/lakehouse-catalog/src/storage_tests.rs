@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::s3_payload;
+use crate::test_support::{s3_payload, user_message};
 
 const ENDPOINT: &str = "http://minio.local:9000";
 const REGION: &str = "us-east-1";
@@ -387,13 +387,6 @@ fn adls_account_name_errs_when_the_host_has_no_leading_label() {
 
 const ADLS_HOST: &str = "myacct.dfs.core.windows.net";
 const VENDED_SAS: &str = "sv=2024-11-04&sig=VENDED_SAS_SIGNATURE";
-
-fn user_message(error: UdfError) -> String {
-    match error {
-        UdfError::User(message) => message,
-        other => panic!("expected UdfError::User, got {other:?}"),
-    }
-}
 
 #[test]
 fn adls_backend_gates_abfs_on_allow_http_and_never_gates_abfss() {

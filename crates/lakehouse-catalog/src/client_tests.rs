@@ -273,83 +273,56 @@ struct RequestLog {
     load_requests: Vec<String>,
 }
 
-/// Responses close the connection so a single-threaded accept loop serves the
-/// pooled `reqwest` client's sequential requests in order.
 async fn spawn_mock_catalog(
     namespace: &[&str],
     tables: &[&str],
     not_loadable: &[&str],
     server_error: &[&str],
 ) -> (String, Arc<Mutex<RequestLog>>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-    let uri = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let log = Arc::new(Mutex::new(RequestLog::default()));
     let not_loadable: Vec<String> = not_loadable.iter().map(|s| s.to_string()).collect();
     let server_error: Vec<String> = server_error.iter().map(|s| s.to_string()).collect();
     let list_tables_body = list_tables_response(namespace, tables);
 
     let server_log = log.clone();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                break;
-            };
-            let mut buf = vec![0u8; 8192];
-            let n = stream.read(&mut buf).await.unwrap_or(0);
-            if n == 0 {
-                continue;
-            }
-            let request = String::from_utf8_lossy(&buf[..n]);
-            let request_line = request.lines().next().unwrap_or("");
-            let mut fields = request_line.split_whitespace();
-            let method = fields.next().unwrap_or("");
-            let path = fields.next().unwrap_or("");
-            let path_no_query = path.split(['?', '#']).next().unwrap_or("");
+    let (uri, _) = spawn_server("application/json", move |request| {
+        let mut fields = request.lines().next().unwrap_or("").split_whitespace();
+        let method = fields.next().unwrap_or("");
+        let path = fields.next().unwrap_or("");
+        let path_no_query = path.split(['?', '#']).next().unwrap_or("");
 
-            let (status, body) = if method == "POST" {
-                server_log.lock().unwrap().oauth_grants += 1;
-                (
-                    "200 OK",
-                    r#"{"access_token":"mock-access-token","token_type":"bearer","expires_in":3600}"#
-                        .to_string(),
-                )
-            } else if path_no_query.ends_with("/v1/config") {
-                ("200 OK", r#"{"overrides":{},"defaults":{}}"#.to_string())
-            } else if path_no_query.ends_with("/namespaces") {
-                ("200 OK", r#"{"namespaces":[]}"#.to_string())
-            } else if path_no_query.ends_with("/tables") {
-                ("200 OK", list_tables_body.clone())
-            } else if let Some(offset) = path_no_query.find("/tables/") {
-                let table = &path_no_query[offset + "/tables/".len()..];
-                server_log
-                    .lock()
-                    .unwrap()
-                    .load_requests
-                    .push(request.to_string());
-                if server_error.iter().any(|t| t == table) {
-                    ("500 Internal Server Error", String::new())
-                } else if not_loadable.iter().any(|t| t == table) {
-                    (
-                        "404 Not Found",
-                        r#"{"error":"not an iceberg table"}"#.to_string(),
-                    )
-                } else {
-                    ("200 OK", load_table_body(table))
-                }
+        if method == "POST" {
+            server_log.lock().unwrap().oauth_grants += 1;
+            (
+                200,
+                r#"{"access_token":"mock-access-token","token_type":"bearer","expires_in":3600}"#
+                    .to_string(),
+            )
+        } else if path_no_query.ends_with("/v1/config") {
+            (200, r#"{"overrides":{},"defaults":{}}"#.to_string())
+        } else if path_no_query.ends_with("/namespaces") {
+            (200, r#"{"namespaces":[]}"#.to_string())
+        } else if path_no_query.ends_with("/tables") {
+            (200, list_tables_body.clone())
+        } else if let Some(offset) = path_no_query.find("/tables/") {
+            let table = &path_no_query[offset + "/tables/".len()..];
+            server_log
+                .lock()
+                .unwrap()
+                .load_requests
+                .push(request.to_string());
+            if server_error.iter().any(|t| t == table) {
+                (500, String::new())
+            } else if not_loadable.iter().any(|t| t == table) {
+                (404, r#"{"error":"not an iceberg table"}"#.to_string())
             } else {
-                ("500 Internal Server Error", String::new())
-            };
-
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
+                (200, load_table_body(table))
+            }
+        } else {
+            (500, String::new())
         }
-    });
+    })
+    .await;
 
     (uri, log)
 }

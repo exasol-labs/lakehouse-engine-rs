@@ -1,13 +1,10 @@
 use super::*;
 use crate::test_support::*;
-use std::future::Future;
 use std::io::{Error as IoError, ErrorKind};
-use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 /// rustls 0.23's text for a TLS peer that closes without `close_notify` (`src/conn.rs`).
 const UNEXPECTED_EOF_MESSAGE: &str = "peer closed connection without sending TLS close_notify: \
@@ -169,32 +166,6 @@ fn the_catalog_policy_is_five_attempts_ten_second_timeouts_thirty_second_window(
             backoff_base: ms(250),
         }
     );
-}
-
-/// A loopback listener that hands each accepted connection and its 0-based index to `serve`.
-async fn spawn_listener<F, Fut>(serve: F) -> (SocketAddr, Arc<AtomicUsize>)
-where
-    F: Fn(TcpStream, usize) -> Fut + Send + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
-{
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind a loopback port");
-    let address = listener.local_addr().expect("local_addr");
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let counter = accepted.clone();
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let index = counter.fetch_add(1, Ordering::SeqCst);
-            tokio::spawn(serve(stream, index));
-        }
-    });
-    (address, accepted)
-}
-
-async fn hold_open(stream: TcpStream) {
-    std::future::pending::<()>().await;
-    drop(stream);
 }
 
 /// Reads the request, then closes with a TCP reset instead of an orderly close.

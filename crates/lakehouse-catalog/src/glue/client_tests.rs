@@ -10,7 +10,9 @@ use tokio::net::{TcpListener, TcpSocket};
 use super::*;
 use crate::StorageProps;
 use crate::glue::routing::PARQUET_INPUT_FORMAT;
-use crate::test_support::{ORC_INPUT_FORMAT, header_value, request_body, spawn_server};
+use crate::test_support::{
+    ORC_INPUT_FORMAT, header_value, request_body, spawn_server, user_message,
+};
 
 const ACCESS_KEY: &str = "AKIDGLUECONNECTION01";
 const SECRET_KEY: &str = "GLUE_SECRET_KEY_SENTINEL";
@@ -164,13 +166,6 @@ fn parquet_table(partition_columns: &[&str]) -> CatalogTable {
         columns: Vec::new(),
         metadata_location: None,
         properties: Default::default(),
-    }
-}
-
-fn user_message(error: UdfError) -> String {
-    match error {
-        UdfError::User(message) => message,
-        other => panic!("expected a user error, got {other:?}"),
     }
 }
 

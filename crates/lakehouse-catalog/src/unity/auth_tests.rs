@@ -1,7 +1,7 @@
 use super::*;
 use crate::catalog_http::CatalogHttp;
+use crate::test_support::spawn_recording_server;
 use crate::test_support::{CLOSED_PORT_CAUSE, CLOSED_PORT_URI, base_creds};
-use crate::unity::mock_server::spawn;
 use crate::{CatalogClient, UnityCatalogSession};
 use exasol_udf_sdk::error::UdfError;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,7 +13,7 @@ const OAUTH_SECRET_SENTINEL: &str = "OAUTH_CLIENT_SECRET_SENTINEL_VALUE";
 
 #[tokio::test]
 async fn pat_is_applied_as_bearer_verbatim() {
-    let server = spawn(|_req| (200, r#"{"tables":[]}"#.to_string())).await;
+    let server = spawn_recording_server(|_req| (200, r#"{"tables":[]}"#.to_string())).await;
     let mut creds = base_creds();
     creds.token = Some("pat-verbatim-123".to_string());
     let session = UnityCatalogSession::new(&server.base_url, creds);
@@ -32,7 +32,7 @@ async fn pat_is_applied_as_bearer_verbatim() {
 
 #[tokio::test]
 async fn oauth_m2m_mints_bearer_via_client_credentials() {
-    let server = spawn(|req| {
+    let server = spawn_recording_server(|req| {
         if req.target.ends_with("/oidc/v1/token") {
             (
                 200,
@@ -95,7 +95,7 @@ async fn oauth_m2m_mints_bearer_via_client_credentials() {
 async fn oauth_token_is_cached_and_refreshed_before_expiry() {
     let grants = Arc::new(AtomicUsize::new(0));
     let server_grants = grants.clone();
-    let server = spawn(move |_req| {
+    let server = spawn_recording_server(move |_req| {
         let mint = server_grants.fetch_add(1, Ordering::SeqCst) + 1;
         (
             200,
@@ -141,7 +141,7 @@ async fn oauth_token_is_cached_and_refreshed_before_expiry() {
 
 #[tokio::test]
 async fn oauth_grant_missing_expires_in_is_a_clear_error() {
-    let server = spawn(|_req| {
+    let server = spawn_recording_server(|_req| {
         (
             200,
             format!(r#"{{"access_token":"{MINTED_TOKEN}","token_type":"Bearer"}}"#),
@@ -174,7 +174,7 @@ async fn oauth_grant_missing_expires_in_is_a_clear_error() {
 
 #[tokio::test]
 async fn oauth_grant_zero_expires_in_is_a_clear_error() {
-    let server = spawn(|_req| {
+    let server = spawn_recording_server(|_req| {
         (
             200,
             format!(r#"{{"access_token":"{MINTED_TOKEN}","token_type":"Bearer","expires_in":0}}"#),
@@ -207,7 +207,7 @@ async fn oauth_grant_zero_expires_in_is_a_clear_error() {
 
 #[tokio::test]
 async fn unauthenticated_mode_sends_no_authorization_header() {
-    let server = spawn(|_req| (200, r#"{"tables":[]}"#.to_string())).await;
+    let server = spawn_recording_server(|_req| (200, r#"{"tables":[]}"#.to_string())).await;
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
     session
@@ -224,7 +224,7 @@ async fn unauthenticated_mode_sends_no_authorization_header() {
 
 #[tokio::test]
 async fn failed_oauth_grant_is_credential_safe_error() {
-    let server = spawn(|req| {
+    let server = spawn_recording_server(|req| {
         if req.target.ends_with("/oidc/v1/token") {
             // The 401 body echoes the client secret, proving it is stripped.
             (
@@ -271,7 +271,7 @@ async fn an_oauth_grant_answered_503_once_is_resent_with_its_form_body() {
     let grant_attempts = Arc::new(AtomicUsize::new(0));
     let grant_bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let (attempts, bodies) = (grant_attempts.clone(), grant_bodies.clone());
-    let server = spawn(move |req| {
+    let server = spawn_recording_server(move |req| {
         if req.target.ends_with("/oidc/v1/token") {
             bodies.lock().unwrap().push(req.body.clone());
             match attempts.fetch_add(1, Ordering::SeqCst) {
