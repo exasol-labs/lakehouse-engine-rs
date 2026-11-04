@@ -518,7 +518,6 @@ fn test_storage() -> StorageBackend {
     })
 }
 
-/// Scenario: Broadcast-eligible inner equi-join is planned as a broadcast fan-out
 #[test]
 fn broadcast_fact_side_uses_distributor_scalar_scan() {
     let join = JoinSpec {

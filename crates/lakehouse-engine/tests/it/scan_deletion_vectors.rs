@@ -390,7 +390,6 @@ fn deletion_vector_reads_stay_within_the_connection_budget() {
     );
 }
 
-/// Scenario: Deletion vectors compose with projection, filter, LIMIT, and aggregation
 #[test]
 fn deletion_vectors_compose_with_projection_filter_limit_and_aggregation() {
     let tmp = tempfile::tempdir().unwrap();
@@ -463,7 +462,6 @@ fn deletion_vectors_compose_with_projection_filter_limit_and_aggregation() {
     );
 }
 
-/// Scenario: A Delta data file carrying no deletion vector scans unchanged
 #[test]
 fn delta_file_without_a_deletion_vector_scans_unchanged() {
     let tmp = tempfile::tempdir().unwrap();

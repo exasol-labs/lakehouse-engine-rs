@@ -540,7 +540,6 @@ async fn run_binary_scan(spec: &ScanSpec) -> (Vec<i64>, Arc<dyn ExecutionPlan>) 
 /// The filters are the text the adapter renders for a lowercase hex literal on a binary column
 /// (`vs-adapter/binary-column-rendering`). DataFusion reads the variable-length column as
 /// `BinaryView` and the fixed-length one against a `FixedSizeBinary(L)` literal.
-/// Scenario: A filter on a binary column selects what native Exasol selects over the hex text
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hex_literal_comparison_on_a_binary_column_prunes_row_groups_by_statistics() {
     let tmp = tempfile::tempdir().unwrap();

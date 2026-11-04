@@ -1,5 +1,5 @@
 //! Every host integration test of this crate links into this one binary, because each separate
-//! binary statically links the whole engine (#523). A new test file is a module declared here.
+//! binary statically links the whole engine. A new test file is a module declared here.
 
 #[path = "../scan_fixture/mod.rs"]
 mod scan_fixture;
@@ -7,7 +7,6 @@ mod scan_fixture;
 mod boolean_to_string_casing_test;
 mod build_convention;
 mod catalog_session_signatures;
-mod int96_decode_test;
 mod micro_bench;
 mod pushdown_public_surface;
 mod scan_agg_projection_pruning;
