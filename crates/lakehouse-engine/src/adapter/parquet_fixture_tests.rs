@@ -1,3 +1,6 @@
+//! Parquet fixtures for directory and catalog-declared readers: in-memory Parquet files and footers,
+//! in-memory stores holding them, directory options, and the column notes CREATE records over them.
+
 use crate::adapter::parquet_directory::{DirectoryOptions, MergeMode};
 use arrow::array::{ArrayRef, new_empty_array, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema};

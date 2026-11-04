@@ -4,7 +4,7 @@ use crate::adapter::column_notes::TableNotes;
 use crate::adapter::parquet_directory::MergeMode;
 use crate::adapter::pushdown::test_support::filter_json::{column, equal};
 use crate::adapter::pushdown::test_support::{
-    compare, num_lit, resolve_from_notes, sample_storage, unread_refused,
+    compare, file_paths, num_lit, resolve_from_notes, sample_storage, unread_refused,
 };
 use crate::adapter::tests::parquet_fixture::{
     directory_options, enumerated_notes, in_memory_store, nullable, parquet_bytes,
@@ -81,10 +81,6 @@ fn column_names(scan: &ResolvedScan) -> Vec<&str> {
         .iter()
         .map(|field| field.name.as_str())
         .collect()
-}
-
-fn file_paths(scan: &ResolvedScan) -> Vec<&str> {
-    scan.files.iter().map(|file| file.path.as_str()).collect()
 }
 
 /// Plus two objects the listing must skip: a hidden segment and a sibling table's directory.

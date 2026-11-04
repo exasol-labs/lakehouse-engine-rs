@@ -237,6 +237,29 @@ pub(super) fn legs_from_leaves(leaves: Vec<JoinLeaf>) -> JoinLegs {
     .legs()
 }
 
+pub(super) fn self_join_legs() -> JoinLegs {
+    legs_from_leaves(vec![
+        JoinLeaf {
+            table_name: "FACT_ORDERS".to_string(),
+            table_alias: Some("A".to_string()),
+            table_identifier: "lh.fact_orders".to_string(),
+        },
+        JoinLeaf {
+            table_name: "FACT_ORDERS".to_string(),
+            table_alias: Some("B".to_string()),
+            table_identifier: "lh.fact_orders".to_string(),
+        },
+    ])
+}
+
+pub(super) fn like_over(column: &str, table: &str, pattern: &str) -> Json {
+    serde_json::json!({
+        "type": "predicate_like",
+        "expression": table_col(table, column),
+        "pattern": str_lit(pattern)
+    })
+}
+
 pub(super) fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> ResolvedJoinSide {
     let lower = table_name.to_lowercase();
     ResolvedJoinSide::new(

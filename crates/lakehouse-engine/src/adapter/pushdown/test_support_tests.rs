@@ -1457,3 +1457,22 @@ pub(crate) mod filter_json {
         json!({"type": "predicate_between", "expression": column(name), "left": low, "right": high})
     }
 }
+
+/// Its own `dataType` is the only place the key's type appears when the key is not
+/// also in the select list.
+pub(crate) fn char_cast_key(size: u64, character_set: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function_scalar_cast",
+        "name": "CAST",
+        "dataType": {"type": "CHAR", "size": size, "characterSet": character_set},
+        "arguments": [col("NAME")],
+    })
+}
+
+pub(crate) fn decimal_type(precision: u32, scale: u32) -> serde_json::Value {
+    serde_json::json!({"type": "decimal", "precision": precision, "scale": scale})
+}
+
+pub(crate) fn file_paths(scan: &ResolvedScan) -> Vec<&str> {
+    scan.files.iter().map(|file| file.path.as_str()).collect()
+}

@@ -8,6 +8,7 @@ use crate::adapter::pushdown::test_support::{
     RecordedRequests, customer_orders_join, named_table, serve_on_own_runtime,
     spawn_fake_http_server, table_col, with_identifier_notes,
 };
+use crate::adapter::tests::test_support::skipped_entry;
 use exasol_udf_sdk::test_support::{DefaultsCtx, TestContext};
 use lakehouse_catalog::{CatalogTableIdent, SkipReason, TableFormat};
 
@@ -15,6 +16,8 @@ use lakehouse_catalog::{CatalogTableIdent, SkipReason, TableFormat};
 pub(super) mod parquet_fixture;
 #[path = "recording_store_tests.rs"]
 pub(super) mod recording_store;
+#[path = "test_support_tests.rs"]
+pub(super) mod test_support;
 
 #[test]
 fn dispatch_unknown_type_errors() {
@@ -728,13 +731,6 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
             reason: SkipReason::NotLoadableIcebergTable,
         }]
     );
-}
-
-fn skipped_entry(table: &str, reason: SkipReason) -> SkippedTable {
-    SkippedTable {
-        ident: cat_ident(&["sales"], table),
-        reason,
-    }
 }
 
 /// Scenario: Every skipped table is recorded with its reason under every catalog kind

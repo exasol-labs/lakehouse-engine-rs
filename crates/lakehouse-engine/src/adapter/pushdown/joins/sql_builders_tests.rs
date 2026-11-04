@@ -5,7 +5,7 @@ use super::super::planning::{
     select_broadcast_sides,
 };
 use super::super::tests::{
-    broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves,
+    broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves, like_over,
     nq3_join_request, resolved_side, self_join_request, three_table_join_request, two_scan_tuning,
 };
 use super::*;
@@ -1071,14 +1071,6 @@ fn n_scan_request_with_filter(filter: Json) -> Json {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = filter;
     request
-}
-
-fn like_over(column: &str, table: &str, pattern: &str) -> Json {
-    serde_json::json!({
-        "type": "predicate_like",
-        "expression": table_col(table, column),
-        "pattern": str_lit(pattern)
-    })
 }
 
 #[test]

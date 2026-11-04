@@ -2174,15 +2174,6 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
     );
 }
 
-fn char_cast_key(size: u64, character_set: &str) -> Json {
-    serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": {"type": "CHAR", "size": size, "characterSet": character_set},
-        "arguments": [col("NAME")]
-    })
-}
-
 fn char_grouped_request(key: Json, key_type: Json, order_by: Option<Json>) -> Json {
     let mut body = serde_json::json!({
         "aggregationType": "group_by",

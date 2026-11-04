@@ -1,13 +1,5 @@
 use super::*;
-
-fn props(pairs: &[(&str, &str)]) -> Json {
-    Json::Object(
-        pairs
-            .iter()
-            .map(|(key, value)| (key.to_string(), Json::from(*value)))
-            .collect(),
-    )
-}
+use crate::adapter::tests::test_support::props;
 
 fn user_error<T>(result: Result<T, UdfError>) -> String {
     match result {

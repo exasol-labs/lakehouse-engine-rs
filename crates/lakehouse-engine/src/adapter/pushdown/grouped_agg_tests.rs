@@ -256,17 +256,6 @@ fn make_group_by_request_with_types(
     })
 }
 
-/// Its own `dataType` is the only place the key's type appears when the key is not
-/// also in the select list.
-fn char_cast_key(size: u64, character_set: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": {"type": "CHAR", "size": size, "characterSet": character_set},
-        "arguments": [col("NAME")],
-    })
-}
-
 fn varchar_cast_key(size: u64) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar_cast",
@@ -295,10 +284,6 @@ fn upper_item(column: &str) -> serde_json::Value {
             col(column),
         ],
     })
-}
-
-fn decimal_type(precision: u64, scale: u64) -> serde_json::Value {
-    serde_json::json!({"type": "decimal", "precision": precision, "scale": scale})
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use crate::adapter::pushdown::test_support::{
     GlueEndpoint, ObjectEndpoint, SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, SIGV4_SECRET_KEY,
     UNREACHABLE_CATALOG, assert_mentions, catalog_table, closed_port_storage, compare,
-    declared_notes, glue_catalog_table, involved_notes, lit, nullable_field, num_lit,
+    declared_notes, file_paths, glue_catalog_table, involved_notes, lit, nullable_field, num_lit,
     object_endpoint, resolve_declared, sample_storage, sigv4_creds, unauthenticated_creds,
     unity_column, user_message,
 };
@@ -133,10 +133,6 @@ async fn refusal(table: &CatalogTable, storage: StorageBackend, vended: bool) ->
     resolve_with(table, &storage, vended, None)
         .await
         .expect_err("resolution must fail, never answer a scan")
-}
-
-fn file_paths(scan: &ResolvedScan) -> Vec<&str> {
-    scan.files.iter().map(|file| file.path.as_str()).collect()
 }
 
 /// Scenario: A Unity Parquet table lists its files through the shared directory seam and reads no footer

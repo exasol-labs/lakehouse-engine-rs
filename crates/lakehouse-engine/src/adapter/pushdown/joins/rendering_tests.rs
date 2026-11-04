@@ -5,8 +5,8 @@ use super::super::sql_builders::{
     render_broadcast_join,
 };
 use super::super::tests::{
-    broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves,
-    resolved_side, two_scan_tuning,
+    broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves, like_over,
+    resolved_side, self_join_legs, two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::ProjectedColumn;
@@ -31,21 +31,6 @@ fn legs_of(names: &[&str]) -> JoinLegs {
 
 fn customer_orders_legs() -> JoinLegs {
     legs_of(&["CUSTOMER", "ORDERS"])
-}
-
-fn self_join_legs() -> JoinLegs {
-    legs_from_leaves(vec![
-        JoinLeaf {
-            table_name: "FACT_ORDERS".to_string(),
-            table_alias: Some("A".to_string()),
-            table_identifier: "lh.fact_orders".to_string(),
-        },
-        JoinLeaf {
-            table_name: "FACT_ORDERS".to_string(),
-            table_alias: Some("B".to_string()),
-            table_identifier: "lh.fact_orders".to_string(),
-        },
-    ])
 }
 
 #[test]
@@ -554,14 +539,6 @@ fn customer_col_types() -> Vec<(String, ExasolType)> {
 
 fn orders_col_types() -> Vec<(String, ExasolType)> {
     involved_table(&join_request(Json::Null, equi_condition()), "ORDERS").types
-}
-
-fn like_over(column: &str, table: &str, pattern: &str) -> Json {
-    serde_json::json!({
-        "type": "predicate_like",
-        "expression": table_col(table, column),
-        "pattern": str_lit(pattern)
-    })
 }
 
 fn and_of(conjuncts: Vec<Json>) -> Json {
