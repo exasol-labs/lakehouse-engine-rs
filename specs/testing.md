@@ -36,7 +36,7 @@ This file states how tests prove the behavior that the feature specs (`specs/<do
 
 Test code gets the same design care as production code. A test reads as the one behavior it proves: its body holds only the inputs and expectations that set it apart from its neighbors, and the setup it shares with them lives in a support module.
 
-- Each area keeps its shared test helpers in one support module: `crates/vs-expression/src/test_support_tests.rs`, `crates/lakehouse-catalog/src/test_support_tests.rs`, `crates/lakehouse-engine/src/scan/test_support_tests.rs`, `crates/lakehouse-engine/src/adapter/pushdown/test_support_tests.rs`, `crates/lakehouse-engine/tests/scan_fixture/` for the engine's host test binaries, and `crates/lakehouse-e2e/tests/common/` for the E2E suites. A new test starts from the helpers there.
+- An area keeps its shared test helpers in a `#[cfg(test)]` support module, in a file ending in `test_support_tests.rs` in the area's directory. A crate's `tests/` binaries share theirs in a module directory under `tests/`. A new test starts from the helpers there.
 - A helper that a second test file needs moves into its area's support module. A helper that one file uses stays in that file.
 - A support module opens with a one- or two-line doc comment that says what it builds, so a reader can pick the right module without reading it whole.
 - Tests build request JSON, column nodes, Exasol types, file entries, scan specs, and join specs through the support builders, not as inline JSON or struct literals. A literal spells out every field, so a field added later edits every test instead of one builder.
