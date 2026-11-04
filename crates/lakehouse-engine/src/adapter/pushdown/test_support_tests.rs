@@ -17,12 +17,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use vs_expression::ColumnNode;
 
-type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+/// Each request's head and body, in arrival order.
+pub(crate) type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
+/// The crate's one loopback fake server, which every catalog, STS, and object-store fake wraps.
+///
 /// Every response closes its connection, so one accept loop serves a pooled client's sequential
 /// requests in arrival order. `responder` maps a request head to a status, content type, and body;
 /// the validators make a body readable as an object.
-async fn spawn_fake_http_server<F>(responder: F) -> (String, RecordedRequests)
+pub(crate) async fn spawn_fake_http_server<F>(responder: F) -> (String, RecordedRequests)
 where
     F: Fn(&str) -> (u16, &'static str, String) + Send + Sync + 'static,
 {
@@ -60,18 +63,32 @@ where
     (address, requests)
 }
 
+/// Starts `server` on a runtime of its own, which must outlive it, for a caller such as `dispatch`
+/// that blocks on its own current-thread runtime, which a `#[tokio::test]` would nest.
+pub(crate) fn serve_on_own_runtime<T>(
+    server: impl std::future::Future<Output = T>,
+) -> (T, tokio::runtime::Runtime) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("build the fake server's runtime");
+    let served = runtime.block_on(server);
+    (served, runtime)
+}
+
 fn request_target(head: &str) -> &str {
     head.split_whitespace().nth(1).unwrap_or("")
 }
 
 pub(crate) struct RecordingCatalog {
-    pub(super) uri: String,
+    pub(crate) uri: String,
     requests: RecordedRequests,
 }
 
 impl RecordingCatalog {
     /// `responder` maps a request target to a status and body.
-    pub(super) async fn spawn<F>(responder: F) -> Self
+    pub(crate) async fn spawn<F>(responder: F) -> Self
     where
         F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
     {
@@ -83,7 +100,7 @@ impl RecordingCatalog {
         Self { uri, requests }
     }
 
-    pub(super) fn targets(&self) -> Vec<String> {
+    pub(crate) fn targets(&self) -> Vec<String> {
         self.requests
             .lock()
             .expect("recorded requests")
@@ -974,7 +991,7 @@ pub(crate) struct GlueEndpoint {
 
 impl GlueEndpoint {
     /// `responder` maps a Glue operation name, such as `GetTable`, to a status and JSON body.
-    pub(super) async fn spawn<F>(responder: F) -> Self
+    pub(crate) async fn spawn<F>(responder: F) -> Self
     where
         F: Fn(&str) -> (u16, serde_json::Value) + Send + Sync + 'static,
     {

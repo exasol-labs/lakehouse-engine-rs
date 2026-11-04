@@ -1,125 +1,17 @@
 //! Plain `#[test]`s: `handle_create_virtual_schema` `block_on`s its own current-thread runtime,
-//! so a `#[tokio::test]` would panic; the mock serves HTTP from a separate multi-thread runtime.
+//! so a `#[tokio::test]` would panic; the fake serves HTTP from a runtime of its own.
 
 use super::*;
 
-use crate::adapter::pushdown::test_support::UNREACHABLE_CATALOG;
+use crate::adapter::pushdown::test_support::{
+    RecordingCatalog, UNREACHABLE_CATALOG, named_table, serve_on_own_runtime,
+};
 use exasol_udf_sdk::test_support::TestContext;
-use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use lakehouse_catalog::TableFormat;
 
 const NAMESPACE: &str = "sales_catalog.public";
 
-struct RecordedRequest {
-    method: String,
-    target: String,
-}
-
-impl RecordedRequest {
-    fn path(&self) -> &str {
-        self.target.split('?').next().unwrap_or(&self.target)
-    }
-
-    /// A path segment after `tables` distinguishes a single-table load from the list sweep.
-    fn is_get_table_call(&self) -> bool {
-        self.path().contains("/tables/")
-    }
-
-    fn is_list_tables_call(&self) -> bool {
-        self.method == "GET" && self.path().ends_with("/tables")
-    }
-}
-
-/// Closes the connection per request so the pooled `reqwest` client reconnects and a single
-/// accept loop serves the sequential stream in order.
-struct MockUnityCatalog {
-    base_url: String,
-    requests: Arc<Mutex<Vec<RecordedRequest>>>,
-    // Kept alive for the server's lifetime: dropping it shuts the mock down.
-    _runtime: tokio::runtime::Runtime,
-}
-
-impl MockUnityCatalog {
-    fn start<F>(responder: F) -> Self
-    where
-        F: Fn(&RecordedRequest) -> (u16, String) + Send + Sync + 'static,
-    {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("build mock runtime");
-        let listener = runtime
-            .block_on(async { TcpListener::bind("127.0.0.1:0").await })
-            .expect("bind mock listener");
-        let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
-        let responder = Arc::new(responder);
-
-        let server_requests = requests.clone();
-        runtime.spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let mut buf = vec![0u8; 16384];
-                let n = stream.read(&mut buf).await.unwrap_or(0);
-                if n == 0 {
-                    continue;
-                }
-                let raw = String::from_utf8_lossy(&buf[..n]).to_string();
-                let recorded = parse_request(&raw);
-                let (status, body) = responder(&recorded);
-                // Record before writing the response, so every served request is
-                // visible under the Mutex once the client (and thus dispatch) returns.
-                server_requests.lock().unwrap().push(recorded);
-                let reason = if (200..300).contains(&status) {
-                    "OK"
-                } else {
-                    "ERROR"
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        });
-
-        Self {
-            base_url,
-            requests,
-            _runtime: runtime,
-        }
-    }
-
-    fn get_table_call_count(&self) -> usize {
-        self.requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| r.is_get_table_call())
-            .count()
-    }
-
-    fn request_count(&self) -> usize {
-        self.requests.lock().unwrap().len()
-    }
-
-    fn all_requests_are_list_sweeps(&self) -> bool {
-        let requests = self.requests.lock().unwrap();
-        !requests.is_empty() && requests.iter().all(RecordedRequest::is_list_tables_call)
-    }
-}
-
-fn parse_request(raw: &str) -> RecordedRequest {
-    let mut fields = raw.lines().next().unwrap_or("").split_whitespace();
-    RecordedRequest {
-        method: fields.next().unwrap_or("").to_string(),
-        target: fields.next().unwrap_or("").to_string(),
-    }
-}
+const LIST_TABLES_PATH: &str = "/api/2.1/unity-catalog/tables";
 
 fn unity_conn_ctx(address: impl Into<String>, password: impl Into<String>) -> TestContext {
     TestContext::scalar(vec![]).with_connection(
@@ -144,57 +36,16 @@ fn create_vs_request() -> Json {
     })
 }
 
-fn create_vs_over(mock: &MockUnityCatalog) -> Result<Json, UdfError> {
-    let mut ctx = unity_conn_ctx(mock.base_url.clone(), "{}");
-    dispatch(&mut ctx, &create_vs_request())
-}
-
 fn long_col(name: &str) -> Json {
     json!({ "name": name, "type_name": "LONG", "type_json": r#"{"name":"c","type":"long","nullable":true,"metadata":{}}"# })
 }
 
-fn string_col(name: &str) -> Json {
-    json!({ "name": name, "type_name": "STRING", "type_json": r#"{"name":"c","type":"string","nullable":true,"metadata":{}}"# })
-}
-
 fn table_entry(name: &str, columns: Vec<Json>) -> Json {
-    table_entry_typed(name, "MANAGED", columns)
-}
-
-/// The sweep returns a view with no `storage_location` and a null `data_source_format`.
-fn view_entry(name: &str, columns: Vec<Json>) -> Json {
-    json!({
-        "name": name,
-        "table_type": "VIEW",
-        "data_source_format": Json::Null,
-        "columns": columns,
-    })
-}
-
-fn table_entry_typed(name: &str, table_type: &str, columns: Vec<Json>) -> Json {
-    json!({
-        "name": name,
-        "table_type": table_type,
-        "storage_location": format!("s3://warehouse/{name}"),
-        "data_source_format": "DELTA",
-        "columns": columns,
-    })
-}
-
-fn non_delta_table_entry(name: &str, columns: Vec<Json>) -> Json {
     json!({
         "name": name,
         "table_type": "MANAGED",
         "storage_location": format!("s3://warehouse/{name}"),
-        "data_source_format": "ICEBERG",
-        "columns": columns,
-    })
-}
-
-fn other_type_entry(name: &str, columns: Vec<Json>) -> Json {
-    json!({
-        "name": name,
-        "table_type": "STREAMING_TABLE",
+        "data_source_format": "DELTA",
         "columns": columns,
     })
 }
@@ -207,96 +58,16 @@ fn tables_page(entries: Vec<Json>, next_page_token: Option<&str>) -> String {
     page.to_string()
 }
 
-/// The listing path must source columns from the list sweep alone.
-fn unexpected_get_table() -> (u16, String) {
-    (
-        500,
-        json!({ "error": "unexpected per-table get-table call" }).to_string(),
-    )
-}
-
-fn response_tables(response: &Json) -> &Vec<Json> {
-    response["schemaMetadata"]["tables"]
-        .as_array()
-        .expect("createVirtualSchema response must carry schemaMetadata.tables")
-}
-
-fn table_named<'a>(response: &'a Json, name: &str) -> &'a Json {
-    response_tables(response)
-        .iter()
-        .find(|t| t["name"] == name)
-        .unwrap_or_else(|| panic!("expected a virtual table named {name}"))
-}
-
-fn long_data_type() -> Json {
-    json!({ "type": "decimal", "precision": 20, "scale": 0 })
-}
-
-fn string_data_type() -> Json {
-    json!({ "type": "varchar", "size": 2000000 })
-}
-
-fn identifier_notes(response: &Json) -> serde_json::Map<String, Json> {
-    response_tables(response)
-        .iter()
-        .map(|table| {
-            let note = table["adapterNotes"]
-                .as_str()
-                .expect("every table carries an identifier note");
-            let note: Json = serde_json::from_str(note).expect("the note is valid JSON");
-            (
-                table["name"].as_str().unwrap().to_string(),
-                note["name"].clone(),
-            )
-        })
-        .collect()
-}
-
-#[test]
-fn enumerates_unity_namespace_tables() {
-    let mock = MockUnityCatalog::start(|req| {
-        if req.is_get_table_call() {
-            return unexpected_get_table();
-        }
-        let entries = vec![
-            table_entry(
-                "orders",
-                vec![long_col("order_id"), string_col("customer_name")],
-            ),
-            table_entry("customers", vec![long_col("id")]),
-            table_entry("shipments", vec![long_col("shipment_id")]),
-        ];
-        (200, tables_page(entries, None))
-    });
-
-    let response = create_vs_over(&mock).expect("Unity createVirtualSchema must succeed");
-
-    let names: Vec<&str> = response_tables(&response)
-        .iter()
-        .map(|t| t["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(names.len(), 3, "one virtual table per listed Unity table");
-    assert!(names.contains(&"ORDERS"));
-    assert!(names.contains(&"CUSTOMERS"));
-    assert!(names.contains(&"SHIPMENTS"));
-
-    let orders = table_named(&response, "ORDERS");
-    let columns = orders["columns"].as_array().unwrap();
-    assert_eq!(columns[0]["name"], "ORDER_ID");
-    assert_eq!(columns[0]["dataType"], long_data_type());
-    assert_eq!(columns[1]["name"], "CUSTOMER_NAME");
-    assert_eq!(columns[1]["dataType"], string_data_type());
-
-    assert_eq!(mock.get_table_call_count(), 0);
-}
-
 #[test]
 fn listing_issues_no_per_table_get_table_call() {
-    let mock = MockUnityCatalog::start(|req| {
-        if req.is_get_table_call() {
-            return unexpected_get_table();
+    let (catalog, _runtime) = serve_on_own_runtime(RecordingCatalog::spawn(|target| {
+        if target.split('?').next() != Some(LIST_TABLES_PATH) {
+            return (
+                500,
+                json!({ "error": "unexpected per-table get-table call" }).to_string(),
+            );
         }
-        if req.target.contains("page_token=") {
+        if target.contains("page_token=") {
             let entries = vec![
                 table_entry("shipments", vec![long_col("id")]),
                 table_entry("returns", vec![long_col("id")]),
@@ -309,201 +80,53 @@ fn listing_issues_no_per_table_get_table_call() {
             ];
             (200, tables_page(entries, Some("PAGE2")))
         }
-    });
+    }));
 
-    let response = create_vs_over(&mock).expect("Unity createVirtualSchema must succeed");
+    let mut ctx = unity_conn_ctx(catalog.uri.clone(), "{}");
+    let response =
+        dispatch(&mut ctx, &create_vs_request()).expect("Unity createVirtualSchema must succeed");
 
     assert_eq!(
-        response_tables(&response).len(),
+        response["schemaMetadata"]["tables"]
+            .as_array()
+            .expect("createVirtualSchema response must carry schemaMetadata.tables")
+            .len(),
         4,
         "every table across both pages"
     );
-    assert_eq!(
-        mock.get_table_call_count(),
-        0,
-        "the list sweep carries columns inline; no per-table get-table is issued"
+    let targets = catalog.targets();
+    assert!(
+        targets.len() >= 2,
+        "the sweep actually paginated across pages: {targets:?}"
     );
     assert!(
-        mock.all_requests_are_list_sweeps(),
-        "only paginated GET /tables requests are issued"
-    );
-    assert!(
-        mock.request_count() >= 2,
-        "the sweep actually paginated across pages"
+        targets
+            .iter()
+            .all(|target| target.split('?').next() == Some(LIST_TABLES_PATH)),
+        "the list sweep carries columns inline, so only paginated GET /tables requests are \
+         issued and no per-table get-table: {targets:?}"
     );
 }
 
 #[test]
-fn lists_managed_external_shallow_clone_and_parquet_base_tables() {
-    let mock = MockUnityCatalog::start(|req| {
-        if req.is_get_table_call() {
-            return unexpected_get_table();
-        }
-        let mut raw_events = table_entry_typed(
-            "raw_events",
-            "EXTERNAL",
-            vec![long_col("id"), string_col("region")],
-        );
-        raw_events["data_source_format"] = json!("PARQUET");
-        let entries = vec![
-            table_entry_typed("orders", "MANAGED", vec![long_col("id")]),
-            table_entry_typed("customers", "EXTERNAL", vec![long_col("id")]),
-            table_entry_typed(
-                "orders_clone",
-                "MANAGED_SHALLOW_CLONE",
-                vec![long_col("id")],
-            ),
-            table_entry_typed(
-                "customers_clone",
-                "EXTERNAL_SHALLOW_CLONE",
-                vec![long_col("id")],
-            ),
-            raw_events,
-        ];
-        (200, tables_page(entries, None))
-    });
+fn unity_names_differing_only_by_case_collide() {
+    let namespace = ["sales_catalog", "public"];
+    let listing = CatalogListing {
+        tables: vec![
+            named_table(&namespace, "sales", TableFormat::Delta, Vec::new()),
+            named_table(&namespace, "Sales", TableFormat::Delta, Vec::new()),
+        ],
+        skipped: Vec::new(),
+    };
 
-    let response = create_vs_over(&mock).expect("Unity createVirtualSchema must succeed");
+    let message = build_listing_virtual_tables(
+        &namespace.map(str::to_string),
+        &listing,
+        EngineTimestampSupport::MillisecondOnly,
+    )
+    .expect_err("a flatten collision must be an error")
+    .to_string();
 
-    let names: Vec<&str> = response_tables(&response)
-        .iter()
-        .map(|t| t["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        names.len(),
-        5,
-        "MANAGED, EXTERNAL, both shallow-clone Delta and PARQUET base tables are all listed"
-    );
-    assert!(names.contains(&"ORDERS"));
-    assert!(names.contains(&"CUSTOMERS"));
-    assert!(names.contains(&"ORDERS_CLONE"));
-    assert!(names.contains(&"CUSTOMERS_CLONE"));
-    assert_eq!(
-        table_named(&response, "RAW_EVENTS")["columns"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-
-    let map = identifier_notes(&response);
-    assert!(map.contains_key("ORDERS"));
-    assert!(map.contains_key("CUSTOMERS"));
-    assert!(map.contains_key("ORDERS_CLONE"));
-    assert!(map.contains_key("RAW_EVENTS"));
-
-    assert_eq!(mock.get_table_call_count(), 0);
-}
-
-#[test]
-fn excludes_view_non_delta_and_other_type_entries() {
-    let mock = MockUnityCatalog::start(|req| {
-        if req.is_get_table_call() {
-            return unexpected_get_table();
-        }
-        let entries = vec![
-            table_entry("orders", vec![long_col("order_id")]),
-            view_entry(
-                "orders_summary",
-                vec![long_col("order_id"), string_col("region")],
-            ),
-            non_delta_table_entry("orders_raw", vec![long_col("order_id")]),
-            other_type_entry("orders_stream", vec![long_col("order_id")]),
-        ];
-        (200, tables_page(entries, None))
-    });
-
-    let response = create_vs_over(&mock).expect("exclusions must not fail enumeration");
-
-    let names: Vec<&str> = response_tables(&response)
-        .iter()
-        .map(|t| t["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(names.len(), 1, "only the Delta base table is listed");
-    assert!(names.contains(&"ORDERS"));
-
-    let map = identifier_notes(&response);
-    assert!(map.contains_key("ORDERS"));
-    assert!(
-        !map.contains_key("ORDERS_SUMMARY"),
-        "the view carries no identifier note"
-    );
-    assert!(
-        !map.contains_key("ORDERS_RAW"),
-        "the non-Delta-format table carries no identifier note"
-    );
-    assert!(
-        !map.contains_key("ORDERS_STREAM"),
-        "the other-table_type entry carries no identifier note"
-    );
-
-    assert_eq!(mock.get_table_call_count(), 0);
-}
-
-#[test]
-fn excluding_every_entry_yields_an_empty_but_successful_schema() {
-    let mock = MockUnityCatalog::start(|req| {
-        if req.is_get_table_call() {
-            return unexpected_get_table();
-        }
-        let entries = vec![
-            view_entry("orders_summary", vec![long_col("order_id")]),
-            non_delta_table_entry("orders_raw", vec![long_col("order_id")]),
-        ];
-        (200, tables_page(entries, None))
-    });
-
-    let response =
-        create_vs_over(&mock).expect("an all-excluded namespace must not fail enumeration");
-
-    assert!(
-        response_tables(&response).is_empty(),
-        "no entry survives the Delta-base filter"
-    );
-    assert_eq!(mock.get_table_call_count(), 0);
-}
-
-/// Scenario: Create virtual schema records each table's Unity Catalog identifier in its identifier note
-#[test]
-fn records_identifier_notes_and_rejects_collision() {
-    let happy = MockUnityCatalog::start(|req| {
-        if req.is_get_table_call() {
-            return unexpected_get_table();
-        }
-        let entries = vec![
-            table_entry("orders", vec![long_col("id")]),
-            table_entry("customers", vec![long_col("id")]),
-        ];
-        (200, tables_page(entries, None))
-    });
-
-    let response = create_vs_over(&happy).expect("Unity createVirtualSchema must succeed");
-    let map = identifier_notes(&response);
-    assert_eq!(
-        map.get("ORDERS").and_then(|v| v.as_str()),
-        Some("sales_catalog.public.orders"),
-        "the note records the original-cased identifier"
-    );
-    assert_eq!(
-        map.get("CUSTOMERS").and_then(|v| v.as_str()),
-        Some("sales_catalog.public.customers")
-    );
-
-    // The Unity client stamps every ident with the configured namespace, so two
-    // wire names differing only by case both flatten+fold to `SALES`.
-    let collision = MockUnityCatalog::start(|req| {
-        if req.is_get_table_call() {
-            return unexpected_get_table();
-        }
-        let entries = vec![
-            table_entry("sales", vec![long_col("id")]),
-            table_entry("Sales", vec![long_col("id")]),
-        ];
-        (200, tables_page(entries, None))
-    });
-
-    let error = create_vs_over(&collision).expect_err("a flatten collision must be an error");
-    let message = error.to_string();
     assert!(
         message.contains("collision") && message.contains("SALES"),
         "the error must name the colliding Exasol table name, got: {message}"

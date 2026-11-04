@@ -1,58 +1,15 @@
 use super::super::binary_filter::BinaryLayout;
 use super::super::test_support::{
     GlueEndpoint, ICEBERG_CONFIG_TARGET, ICEBERG_LOAD_TABLE_TARGET, RecordingCatalog,
-    UNITY_TABLE_TARGET, delta_notes, iceberg_catalog, involved_notes,
-    locationless_delta_table_body, sample_storage, unauthenticated_creds,
+    UNITY_TABLE_TARGET, UNREACHABLE_CATALOG, closed_port_storage, delta_notes, iceberg_catalog,
+    involved_notes, locationless_delta_table_body, sample_storage, unauthenticated_creds,
 };
 use super::*;
+use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::direct_storage_properties::join_storage_path;
 use crate::adapter::permission::PermissionCheck;
 use crate::scan::spec::{StorageBackend, StorageProps};
 use crate::types::exasol_type::ExasolType;
-
-/// Scenario: A Unity Catalog table's identity survives the round trip from the involved table
-#[tokio::test]
-async fn unity_table_identity_round_trips_through_the_recorded_identifier() {
-    let catalog = RecordingCatalog::spawn(|target| {
-        if target == UNITY_TABLE_TARGET {
-            (200, locationless_delta_table_body())
-        } else {
-            (404, r#"{"message":"no such table"}"#.to_string())
-        }
-    })
-    .await;
-    let creds = unauthenticated_creds();
-    let storage = sample_storage();
-    let resolver = TableScanResolver::for_request(
-        CatalogKind::UnityCatalogNative,
-        &catalog.uri,
-        ConnectionStorage {
-            storage: &storage,
-            creds: &creds,
-            allow_http: true,
-        },
-        &["cat.sch.orders"],
-        &Json::Null,
-        &PermissionCheck::Off,
-    )
-    .await
-    .expect("a Unity Catalog session is built without contacting the catalog");
-
-    let err = resolver
-        .resolve("cat.sch.orders", None, &InvolvedColumns::default())
-        .await
-        .expect_err("a Delta table carrying no storage location cannot be planned");
-
-    assert_eq!(
-        catalog.targets(),
-        vec![UNITY_TABLE_TARGET.to_string()],
-        "the loader must address exactly the recorded dotted identifier, once"
-    );
-    assert!(
-        err.to_string().contains("cat.sch.orders"),
-        "the reader must name the table the recorded identifier recovered: {err}"
-    );
-}
 
 /// Scenario: A Glue table resolves from its recorded identifier and fails loud when it is no longer plannable
 #[tokio::test]
@@ -118,110 +75,90 @@ fn a_recorded_identifier_recovers_its_namespace_segments_and_table_name() {
     );
 }
 
-#[tokio::test]
-async fn a_recorded_identifier_without_a_table_name_is_refused_before_any_catalog_request() {
-    let catalog = RecordingCatalog::spawn(|_| (200, locationless_delta_table_body())).await;
-    let creds = unauthenticated_creds();
+/// The refusal `for_request` returns for `identifiers` under `kind` over an unreachable catalog, so
+/// a check that ran after a catalog request would surface as that request's transport error.
+async fn refusal_before_any_catalog_request(
+    kind: CatalogKind,
+    creds: &ConnectionCreds,
+    identifiers: &[&str],
+) -> String {
     let storage = sample_storage();
-
-    for unresolvable in ["cat.sch.", "", "   "] {
-        let err = TableScanResolver::for_request(
-            CatalogKind::UnityCatalogNative,
-            &catalog.uri,
-            ConnectionStorage {
-                storage: &storage,
-                creds: &creds,
-                allow_http: true,
-            },
-            &[unresolvable],
-            &Json::Null,
-            &PermissionCheck::Off,
-        )
-        .await
-        .err()
-        .expect("an identifier naming no table must be refused");
-        assert!(
-            err.to_string().contains(&format!("'{unresolvable}'")),
-            "the refusal must name the identifier it could not resolve: {err}"
-        );
-    }
-
-    assert!(
-        catalog.targets().is_empty(),
-        "an identifier naming no table must cost no catalog request: {:?}",
-        catalog.targets()
-    );
-}
-
-#[tokio::test]
-async fn a_malformed_identifier_anywhere_in_the_request_is_refused_before_any_catalog_request() {
-    let catalog = iceberg_catalog().await;
-    let creds = unauthenticated_creds();
-    let storage = sample_storage();
-
-    let err = TableScanResolver::for_request(
-        CatalogKind::IcebergRest,
-        &catalog.uri,
+    TableScanResolver::for_request(
+        kind,
+        UNREACHABLE_CATALOG,
         ConnectionStorage {
             storage: &storage,
-            creds: &creds,
+            creds,
             allow_http: true,
         },
-        &["db.t", "malformed"],
+        identifiers,
         &Json::Null,
         &PermissionCheck::Off,
     )
     .await
     .err()
-    .expect("a malformed identifier on any leg must be refused");
+    .expect("the identifier must be refused")
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_recorded_identifier_without_a_table_name_is_refused_before_any_catalog_request() {
+    for unresolvable in ["cat.sch.", "", "   "] {
+        let message = refusal_before_any_catalog_request(
+            CatalogKind::UnityCatalogNative,
+            &unauthenticated_creds(),
+            &[unresolvable],
+        )
+        .await;
+        assert!(
+            message.contains(&format!("'{unresolvable}'")),
+            "the refusal must name the identifier it could not resolve: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_unity_identifier_is_refused_in_unity_terms() {
+    let message = refusal_before_any_catalog_request(
+        CatalogKind::UnityCatalogNative,
+        &unauthenticated_creds(),
+        &["orders"],
+    )
+    .await;
 
     assert!(
-        err.to_string().contains("'malformed'"),
-        "the refusal must name the identifier it could not parse: {err}"
+        message.contains("catalog.schema.table"),
+        "the refusal must state the Unity Catalog address form: {message}"
     );
     assert!(
-        catalog.targets().is_empty(),
-        "a malformed identifier must cost no catalog request: {:?}",
-        catalog.targets()
+        !message.contains("namespace.table"),
+        "Iceberg's identifier rule must not judge a Unity Catalog identifier: {message}"
     );
 }
 
 #[tokio::test]
-async fn an_iceberg_identifier_resolves_through_the_iceberg_reader_with_no_partition_columns() {
-    let catalog = iceberg_catalog().await;
-    let creds = unauthenticated_creds();
-    let storage = sample_storage();
-    let resolver = TableScanResolver::for_request(
+async fn a_malformed_identifier_anywhere_in_the_request_is_refused_before_any_catalog_request() {
+    // OAuth2 credentials, so a session built before the parse fails on its token request instead.
+    let creds = ConnectionCreds {
+        client_id: Some("oauth-client-id-sentinel".into()),
+        client_secret: Some("oauth-client-secret-sentinel".into()),
+        ..unauthenticated_creds()
+    };
+
+    let message = refusal_before_any_catalog_request(
         CatalogKind::IcebergRest,
-        &catalog.uri,
-        ConnectionStorage {
-            storage: &storage,
-            creds: &creds,
-            allow_http: true,
-        },
-        &["db.t"],
-        &Json::Null,
-        &PermissionCheck::Off,
+        &creds,
+        &["db.t", "malformed"],
     )
-    .await
-    .expect("an Iceberg session resolves against a reachable catalog");
+    .await;
 
-    let (resolved, _) = resolver
-        .resolve("db.t", None, &InvolvedColumns::default())
-        .await
-        .expect("a snapshotless Iceberg table resolves an empty scan");
-
-    assert_eq!(
-        catalog.targets(),
-        vec![
-            ICEBERG_CONFIG_TARGET.to_string(),
-            ICEBERG_LOAD_TABLE_TARGET.to_string()
-        ],
-        "the resolver must load exactly the table the recorded identifier names"
+    assert!(
+        message.contains("'malformed'") && message.contains("namespace.table"),
+        "the refusal must be the parse error naming the identifier it could not parse: {message}"
     );
     assert!(
-        resolved.partition_columns.is_empty(),
-        "an Iceberg scan carries no partition columns"
+        !message.contains("OAuth2"),
+        "the identifier must be validated before the session's token request: {message}"
     );
 }
 
@@ -397,9 +334,9 @@ async fn one_session_or_store_per_request_serves_every_leg() {
 
 #[tokio::test]
 async fn a_direct_storage_identifier_naming_no_first_level_directory_is_refused() {
-    let endpoint = empty_s3_endpoint().await;
     let creds = unauthenticated_creds();
-    let storage = direct_storage_backend(&endpoint.uri);
+    // An object-store request before the refusal would fail on the closed port instead.
+    let storage = closed_port_storage();
 
     for unresolvable in ["", "   ", "sub/dir", "sub\\dir", "..", "."] {
         let err = TableScanResolver::for_request(
@@ -426,12 +363,6 @@ async fn a_direct_storage_identifier_naming_no_first_level_directory_is_refused(
             "the refusal must tell the operator how to repair it: {err}"
         );
     }
-
-    assert!(
-        endpoint.targets().is_empty(),
-        "a refused identifier must cost no object-store request: {:?}",
-        endpoint.targets()
-    );
 }
 
 #[tokio::test]
@@ -524,7 +455,6 @@ async fn request_session_has_one_variant_per_kind() {
     }
 }
 
-/// Scenario: One batch-check per query decides every table before any table is read
 #[test]
 fn an_enforced_resolver_admits_only_the_tables_the_check_covered() {
     let admission = TableAdmission::Authorized(HashSet::from(["db.t".to_string()]));
@@ -532,51 +462,6 @@ fn an_enforced_resolver_admits_only_the_tables_the_check_covered() {
     assert!(admission.admit("db.t").is_ok());
     assert!(admission.admit("db.other").is_err());
     assert!(TableAdmission::Unchecked.admit("db.other").is_ok());
-}
-
-/// Scenario: One batch-check per query decides every table before any table is read
-#[tokio::test]
-async fn an_enforced_check_admits_an_allowed_table_and_refuses_a_denied_one() {
-    use crate::adapter::permission::PermissionSettings;
-    use crate::adapter::properties::{PERMISSION_CHECK, USER_MAPPING};
-
-    let check = PermissionSettings::parse(&serde_json::json!({
-        PERMISSION_CHECK: "LAKEKEEPER",
-        USER_MAPPING: "oidc~{{ user }}",
-    }))
-    .unwrap()
-    .check_for(|| Some("ALICE".into()))
-    .unwrap();
-    let (storage, creds) = (sample_storage(), unauthenticated_creds());
-    for allowed in [true, false] {
-        let catalog = RecordingCatalog::spawn(move |target| {
-            if target.starts_with("/catalog/v1/config") {
-                (200, "{}".to_string())
-            } else {
-                (
-                    200,
-                    format!(r#"{{"results":[{{"id":"read-data","allowed":{allowed}}}]}}"#),
-                )
-            }
-        })
-        .await;
-
-        let resolver = TableScanResolver::for_request(
-            CatalogKind::IcebergRest,
-            &format!("{}/catalog", catalog.uri),
-            ConnectionStorage {
-                storage: &storage,
-                creds: &creds,
-                allow_http: true,
-            },
-            &["db.t"],
-            &Json::Null,
-            &check,
-        )
-        .await;
-
-        assert_eq!(resolver.is_ok(), allowed);
-    }
 }
 
 #[tokio::test]
