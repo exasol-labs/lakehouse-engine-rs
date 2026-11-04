@@ -142,10 +142,11 @@ fn create_vs_sql(vs: &str, script_schema: &str, conn: &str) -> String {
 }
 
 fn create_vs_sql_with_factor(vs: &str, script_schema: &str, conn: &str, factor: usize) -> String {
-    format!(
-        "CREATE VIRTUAL SCHEMA {vs} USING {script_schema}.{ADAPTER_SCRIPT_NAME} WITH \
-         CATALOG_CONNECTION = '{conn}' NAMESPACE = '{E2E_NAMESPACE}' ALLOW_HTTP = 'true' \
-         PARALLELISM_FACTOR = '{factor}'"
+    virtual_schema_ddl(
+        &VsProps::new(vs, E2E_NAMESPACE)
+            .with_adapter_schema(script_schema)
+            .with_catalog_conn_name(conn)
+            .with_parallelism_factor(factor),
     )
 }
 

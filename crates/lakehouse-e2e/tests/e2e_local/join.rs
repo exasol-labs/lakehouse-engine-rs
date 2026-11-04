@@ -12,7 +12,7 @@ use crate::common::seed::{
     order_totalprice_unscaled, seed_clustered_join,
 };
 use crate::common::stack::iceberg_catalog_url;
-use crate::fixtures::{events, stack, vs_table};
+use crate::fixtures::{create_lineitem_ground_truth_table, events, stack, vs_table};
 
 use parquet::file::statistics::Statistics;
 
@@ -839,14 +839,12 @@ fn scalar_over_aggregate_n_table_join_query(vs_name: &str) -> String {
 
 const GROUND_TRUTH_LINEITEM_TABLE: &str = "GROUND_TRUTH_LINEITEM";
 
-/// Materialized natively so Exasol computes the ground truth independently of the
-/// pushdown path, formatted identically to the wrapper's Exasol-side aggregation.
 fn ensure_ground_truth_lineitem_table(conn: &mut ExaConn) {
-    conn.execute(&format!(
-        "CREATE OR REPLACE TABLE {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE} AS \
-         SELECT L_RETURNFLAG, L_QUANTITY, L_EXTENDEDPRICE FROM {}",
-        vs_table(VS_NAME, E2E_LINEITEM_TABLE)
-    ));
+    create_lineitem_ground_truth_table(
+        conn,
+        GROUND_TRUTH_LINEITEM_TABLE,
+        &vs_table(VS_NAME, E2E_LINEITEM_TABLE),
+    );
 }
 
 fn scalar_over_aggregate_ground_truth_query() -> String {
@@ -2084,8 +2082,8 @@ fn e2e_scalar_over_aggregate_ungrouped_join_matches_native_oracle() {
         "SELECT ROUND(SUM(L_QUANTITY), 2) FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE}"
     ));
     let (got, want) = (parse_numeric(&actual[0][0]), parse_numeric(&expected[0][0]));
-    assert!(
-        (got - want).abs() <= 1e-9 * want.abs().max(1.0),
+    assert_eq!(
+        got, want,
         "ROUND(SUM(L_QUANTITY), 2) over the join must equal the native oracle \
          {want}, got {got}"
     );

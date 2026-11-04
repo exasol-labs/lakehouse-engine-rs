@@ -316,13 +316,18 @@ pub fn try_create_virtual_schema_with_password(
         build_create_connection_sql(props.catalog_conn_name, catalog_uri, password);
     conn.execute(&create_conn_sql);
 
-    grant_connection_access_to_vs_owner(conn, props.catalog_conn_name);
+    grant_connection_access_to_vs_owner(conn, props.catalog_conn_name, props.adapter_schema);
 
     let _ = conn.try_execute(&format!(
         "DROP VIRTUAL SCHEMA IF EXISTS {} CASCADE",
         props.vs_name
     ));
+    conn.try_execute(&virtual_schema_ddl(props))
+}
 
+/// The `CREATE VIRTUAL SCHEMA` statement alone, for a test that owns the CONNECTION and its
+/// grants, which [`try_create_virtual_schema`] would replace.
+pub fn virtual_schema_ddl(props: &VsProps) -> String {
     let parallelism_clause = optional_clause("PARALLELISM_FACTOR ", props.parallelism_factor);
     let join_clause = optional_clause("JOIN_BROADCAST_MAX_BYTES", props.join_broadcast_max_bytes);
     let catalog_kind_clause = optional_clause("CATALOG_KIND", props.catalog_kind);
@@ -340,7 +345,7 @@ pub fn try_create_virtual_schema_with_password(
         format!("\n  NAMESPACE   = '{}'", props.namespace)
     };
 
-    conn.try_execute(&format!(
+    format!(
         r#"CREATE VIRTUAL SCHEMA {vs_name}
 USING {adapter_schema}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = '{catalog_conn_name}'
@@ -348,7 +353,7 @@ USING {adapter_schema}.{ADAPTER_SCRIPT_NAME} WITH
         vs_name = props.vs_name,
         adapter_schema = props.adapter_schema,
         catalog_conn_name = props.catalog_conn_name,
-    ))
+    )
 }
 
 pub fn current_user(conn: &mut ExaConn) -> String {
@@ -360,14 +365,18 @@ pub fn current_user(conn: &mut ExaConn) -> String {
         .unwrap_or_else(|| panic!("SELECT CURRENT_USER returned no value: {cols:?}"))
 }
 
-pub fn grant_connection_access_to_vs_owner(conn: &mut ExaConn, conn_name: &str) {
+pub fn grant_connection_access_to_vs_owner(
+    conn: &mut ExaConn,
+    conn_name: &str,
+    script_schema: &str,
+) {
     let owner = current_user(conn);
     if owner.eq_ignore_ascii_case("SYS") {
         return;
     }
     for script in [ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME] {
         conn.execute(&format!(
-            "GRANT ACCESS ON CONNECTION {conn_name} FOR SCRIPT {SCHEMA_NAME}.{script} TO {owner}"
+            "GRANT ACCESS ON CONNECTION {conn_name} FOR SCRIPT {script_schema}.{script} TO {owner}"
         ));
     }
 }
@@ -408,10 +417,30 @@ pub fn enumerated_table_names(conn: &mut ExaConn, vs_name: &str) -> Vec<String> 
         .unwrap_or_default()
 }
 
-pub fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
+/// Each table's `SELECT COUNT(*)` status, so a test compares queryability before and after.
+pub fn count_statuses(
+    conn: &mut ExaConn,
+    vs_name: &str,
+    tables: &[impl AsRef<str>],
+) -> Vec<(String, String)> {
+    tables
+        .iter()
+        .map(|table| {
+            let table = table.as_ref();
+            let response = conn.try_execute(&format!("SELECT COUNT(*) FROM {vs_name}.{table}"));
+            (table.to_string(), value_to_string(&response["status"]))
+        })
+        .collect()
+}
+
+/// Every column of `EXPLAIN VIRTUAL <query_sql>`, fetched in full.
+pub fn explain_virtual_columns(conn: &mut ExaConn, query_sql: &str) -> Vec<Vec<serde_json::Value>> {
     let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    conn.fetch_result_columns(result_set)
+    conn.fetch_result_columns(&resp["responseData"]["results"][0]["resultSet"])
+}
+
+pub fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
+    explain_virtual_columns(conn, query_sql)
         .iter()
         .flat_map(|col| col.iter())
         .filter_map(|v| v.as_str())
@@ -423,9 +452,7 @@ pub fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
 /// `explain_virtual_sql`'s joined blob.
 pub fn isolated_pushdown_statement(conn: &mut ExaConn, query_sql: &str) -> String {
     const PUSHDOWN_SQL_COLUMN: usize = 1;
-    let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let cols = conn.fetch_result_columns(result_set);
+    let cols = explain_virtual_columns(conn, query_sql);
     if cols.len() != 4 || cols[0].len() != 1 {
         panic!(
             "EXPLAIN VIRTUAL returned an unexpected layout ({} cols, {} rows) for:\n{query_sql}",

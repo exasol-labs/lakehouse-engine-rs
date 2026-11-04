@@ -1,6 +1,9 @@
+//! Local-suite support: stack and fixture setup, virtual-table names, ground-truth tables,
+//! and EXPLAIN readers that the `e2e_local` modules share.
+
 use crate::common::e2e_harness::{
-    SCAN_SCRIPT_NAME, VsProps, create_schema_and_scripts, create_virtual_schema, exa_conn,
-    explain_virtual_sql, install_slc, runtime, upload_so,
+    SCAN_SCRIPT_NAME, SCHEMA_NAME, VsProps, create_schema_and_scripts, create_virtual_schema,
+    exa_conn, explain_virtual_columns, explain_virtual_sql, install_slc, runtime, upload_so,
 };
 use crate::common::exasol_ws::ExaConn;
 use crate::common::seed::{
@@ -76,8 +79,22 @@ pub fn lakehouse_vs() {
     });
 }
 
+/// The name under which the virtual schema exposes a catalog table.
+pub fn exasol_table_name(catalog_table: &str) -> String {
+    catalog_table.to_uppercase()
+}
+
 pub fn vs_table(vs_name: &str, table: &str) -> String {
-    format!("{vs_name}.{}", table.to_uppercase())
+    format!("{vs_name}.{}", exasol_table_name(table))
+}
+
+/// Materializes the lineitem columns the scalar-over-aggregate oracle reads, so Exasol
+/// computes the ground truth without the pushdown path.
+pub fn create_lineitem_ground_truth_table(conn: &mut ExaConn, native_table: &str, source: &str) {
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {SCHEMA_NAME}.{native_table} AS \
+         SELECT L_RETURNFLAG, L_QUANTITY, L_EXTENDEDPRICE FROM {source}"
+    ));
 }
 
 pub fn events_table() -> String {
@@ -103,10 +120,7 @@ pub fn vs_lineitem_table() -> String {
 /// `PUSHDOWN_SQL` only: the echoed request JSON repeats the user's select list
 /// and would satisfy a naive substring probe.
 pub fn explain_virtual_pushdown_sql(conn: &mut ExaConn, query_sql: &str) -> String {
-    let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let cols = conn.fetch_result_columns(result_set);
-    cols[1]
+    explain_virtual_columns(conn, query_sql)[1]
         .iter()
         .filter_map(|v| v.as_str())
         .collect::<Vec<_>>()

@@ -179,6 +179,25 @@ pub fn wait_for_iceberg_catalog() {
 }
 
 pub const PROXY_URL_INTERNAL: &str = "http://10.84.0.12:8888";
+
+/// Holds the scripts whose `%env` lines route through the proxy, so no other test sees them.
+pub const PROXY_ADAPTER_SCHEMA: &str = "LHVS_PROXY";
+
+/// SeaweedFS under a name that only the forward proxy resolves.
+pub const SEAWEEDFS_URL_VIA_PROXY: &str = "http://seaweedfs-via-proxy:8333";
+
+/// `password` with the storage endpoint it names, if any, reached only through the proxy.
+pub fn password_via_proxy(password: CatalogConnectionPassword) -> CatalogConnectionPassword {
+    let endpoint = if password.endpoint.is_empty() {
+        String::new()
+    } else {
+        SEAWEEDFS_URL_VIA_PROXY.to_string()
+    };
+    CatalogConnectionPassword {
+        endpoint,
+        ..password
+    }
+}
 pub const CLOSED_PROXY_URL_INTERNAL: &str = "http://10.84.0.12:1";
 
 /// Probes from the Exasol container, because only the UDFs there reach the proxy.

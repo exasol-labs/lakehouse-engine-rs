@@ -8,7 +8,7 @@ use crate::common::seed::{
     seed_complex_types_join_probe,
 };
 use crate::common::stack::iceberg_catalog_url;
-use crate::fixtures::{assert_pushed_to_scan_udf, complex_probe, stack};
+use crate::fixtures::{assert_pushed_to_scan_udf, complex_probe, exasol_table_name, stack};
 use serde_json::json;
 use std::sync::OnceLock;
 
@@ -30,10 +30,6 @@ fn setup() {
     });
 }
 
-fn served_table() -> String {
-    E2E_COMPLEX_TABLE.to_uppercase()
-}
-
 fn assert_rendered(cell: &serde_json::Value, expected: Option<serde_json::Value>, context: &str) {
     match (cell, expected) {
         (serde_json::Value::Null, None) => {}
@@ -51,7 +47,7 @@ fn assert_rendered(cell: &serde_json::Value, expected: Option<serde_json::Value>
 fn iceberg_nested_columns_return_valid_json_end_to_end() {
     setup();
     let mut conn = exa_conn();
-    let table = served_table();
+    let table = exasol_table_name(E2E_COMPLEX_TABLE);
     let qualified = format!("{VS_NAME}.{table}");
 
     for column in ["TAGS", "NUMS", "ADDR", "ATTRS", "INT_MAP", "ITEMS"] {
@@ -200,7 +196,7 @@ fn iceberg_nested_columns_return_valid_json_end_to_end() {
 fn nested_columns_push_down_as_the_declared_varchar_in_every_shape() {
     setup();
     let mut conn = exa_conn();
-    let table = served_table();
+    let table = exasol_table_name(E2E_COMPLEX_TABLE);
     let qualified = format!("{VS_NAME}.{table}");
     let join_partner = format!("{VS_NAME}.{}", E2E_COMPLEX_JOIN_TABLE.to_uppercase());
 
@@ -304,7 +300,7 @@ fn nested_columns_push_down_as_the_declared_varchar_in_every_shape() {
 fn e2e_self_join_on_nested_json_column_matches_single_node() {
     setup();
     let mut conn = exa_conn();
-    let table = served_table();
+    let table = exasol_table_name(E2E_COMPLEX_TABLE);
     let qualified = format!("{VS_NAME}.{table}");
 
     let join_sql = format!(

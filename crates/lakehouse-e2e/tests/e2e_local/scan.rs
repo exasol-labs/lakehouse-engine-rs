@@ -25,8 +25,8 @@ use crate::common::timestamp_precision::{
     ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
 };
 use crate::fixtures::{
-    LAKEHOUSE_VS, events_table, explain_virtual_pushdown_sql, lakehouse_vs, typed_table,
-    vs_dim_table, vs_fact_table, vs_lineitem_table,
+    LAKEHOUSE_VS, create_lineitem_ground_truth_table, events_table, explain_virtual_pushdown_sql,
+    lakehouse_vs, typed_table, vs_dim_table, vs_fact_table, vs_lineitem_table,
 };
 
 /// Its recorded `DF_THREADS_PER_UDF` reads back the core count the adapter VM detected.
@@ -494,12 +494,9 @@ fn mixed_column_parquet_round_trips() {
         "name should be 'event-01', got: {name_val:?}"
     );
     let score_val = &cols[2][0];
-    assert!(
-        score_val
-            .as_f64()
-            .map(|v| (v - 5.0).abs() < 0.001)
-            .unwrap_or(false)
-            || score_val.as_str().map(|s| s.contains('5')).unwrap_or(false),
+    assert_eq!(
+        parse_numeric(score_val),
+        5.0,
         "score should be 5.0, got: {score_val:?}"
     );
     assert!(!cols[3][0].is_null(), "event_date must not be null");
@@ -647,8 +644,9 @@ fn e2e_renamed_column_resolves_by_field_id() {
         let rating = r
             .as_f64()
             .expect("rating must not be NULL after field-id projection");
-        assert!(
-            (rating - 10.0 * id as f64).abs() < 1e-6,
+        assert_eq!(
+            rating,
+            10.0 * id as f64,
             "row {i}: expected rating = 10 * {id} = {}, got {rating}",
             10 * id
         );
@@ -789,28 +787,19 @@ fn partial_count_sum_min_max_merge_ready() {
         .as_f64()
         .or_else(|| cols[1][0].as_str().and_then(|s| s.parse().ok()))
         .expect("SUM must be numeric");
-    assert!(
-        (sum - 1050.0).abs() < 0.001,
-        "SUM(score) must be 1050, got {sum}"
-    );
+    assert_eq!(sum, 1050.0, "SUM(score) must be 1050, got {sum}");
 
     let min = cols[2][0]
         .as_f64()
         .or_else(|| cols[2][0].as_str().and_then(|s| s.parse().ok()))
         .expect("MIN must be numeric");
-    assert!(
-        (min - 5.0).abs() < 0.001,
-        "MIN(score) must be 5.0, got {min}"
-    );
+    assert_eq!(min, 5.0, "MIN(score) must be 5.0, got {min}");
 
     let max = cols[3][0]
         .as_f64()
         .or_else(|| cols[3][0].as_str().and_then(|s| s.parse().ok()))
         .expect("MAX must be numeric");
-    assert!(
-        (max - 100.0).abs() < 0.001,
-        "MAX(score) must be 100.0, got {max}"
-    );
+    assert_eq!(max, 100.0, "MAX(score) must be 100.0, got {max}");
 }
 
 #[test]
@@ -876,17 +865,7 @@ fn partial_avg_stddev_over_non_double_columns() {
 /// `aggregates`, not `group_keys`, is the discriminating field: single-group partial
 /// aggregation also emits `PARTIAL_` columns but never `group_keys`.
 fn assert_single_group_aggregate_pushed_down(conn: &mut ExaConn, query_sql: &str) {
-    let explain_sql = format!("EXPLAIN VIRTUAL {query_sql}");
-    let resp = conn.execute(&explain_sql);
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let cols = conn.fetch_result_columns(result_set);
-
-    let pushed_sql: String = cols
-        .iter()
-        .flat_map(|col| col.iter())
-        .filter_map(|v| v.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let pushed_sql = explain_virtual_sql(conn, query_sql);
 
     assert!(
         pushed_sql.contains("aggregates"),
@@ -939,8 +918,8 @@ fn sum_length_expression_argument_pushed_down() {
 
     let total = parse_numeric(&cols[0][0]);
     let expected = 8.0 * SEED_TOTAL_ROWS as f64;
-    assert!(
-        (total - expected).abs() < 0.001,
+    assert_eq!(
+        total, expected,
         "SUM(LENGTH(name)) must be {expected} (name is always 8 chars, \
          {SEED_TOTAL_ROWS} rows), got {total}"
     );
@@ -982,8 +961,8 @@ fn sum_two_column_product_pushes_down_matches_single_node() {
 
     let revenue = parse_numeric(&cols[0][0]);
     let expected = 2975.0;
-    assert!(
-        (revenue - expected).abs() < 0.001,
+    assert_eq!(
+        revenue, expected,
         "SUM(id * score) over ids 6..=12 must be {expected} (matching a \
          single, undecomposed full-scan evaluation), got {revenue}"
     );
@@ -1066,8 +1045,8 @@ fn ordered_topn_pushes_down_matches_single_node() {
     );
     for (i, &id) in ids.iter().enumerate() {
         let expected_score = 5.0 * id as f64;
-        assert!(
-            (scores[i] - expected_score).abs() < 1e-9,
+        assert_eq!(
+            scores[i], expected_score,
             "row {i}: score for id {id} must be {expected_score}, got {}",
             scores[i]
         );
@@ -1537,8 +1516,9 @@ fn scan_registers_assigned_files_with_path_size_payload() {
         let score = cols[2][pos]
             .as_f64()
             .unwrap_or_else(|| panic!("score not f64: {:?}", cols[2][pos]));
-        assert!(
-            (score - 5.0 * expected as f64).abs() < 1e-9,
+        assert_eq!(
+            score,
+            5.0 * expected as f64,
             "score for id {expected} must be {}, got {score}",
             5.0 * expected as f64
         );
@@ -1560,17 +1540,7 @@ fn scan_registers_assigned_files_with_path_size_payload() {
 /// Checks `group_keys` and the `PARTIAL_` prefix, not `GROUP BY shard_key`: a filter
 /// pruning to a single shard still pushes grouped aggregation but has no shard fan-out.
 fn assert_group_by_pushed_down(conn: &mut ExaConn, query_sql: &str) {
-    let explain_sql = format!("EXPLAIN VIRTUAL {query_sql}");
-    let resp = conn.execute(&explain_sql);
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let cols = conn.fetch_result_columns(result_set);
-
-    let pushed_sql: String = cols
-        .iter()
-        .flat_map(|col| col.iter())
-        .filter_map(|v| v.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let pushed_sql = explain_virtual_sql(conn, query_sql);
 
     assert!(
         pushed_sql.contains("group_keys"),
@@ -1638,8 +1608,8 @@ fn test_group_by_sum_count() {
             expected_counts[i]
         );
         let sum = parse_numeric(&cols[2][i]);
-        assert!(
-            (sum - expected_sums[i]).abs() < 0.01,
+        assert_eq!(
+            sum, expected_sums[i],
             "group {i}: SUM(score) must be {}, got {sum}",
             expected_sums[i]
         );
@@ -1808,20 +1778,10 @@ fn test_shard_key_fanout_explain() {
     lakehouse_vs();
     let mut conn = exa_conn();
 
-    let sql = format!(
-        "EXPLAIN VIRTUAL SELECT id, COUNT(*) FROM {} GROUP BY id",
-        events_table()
+    let pushed_sql = explain_virtual_sql(
+        &mut conn,
+        &format!("SELECT id, COUNT(*) FROM {} GROUP BY id", events_table()),
     );
-    let resp = conn.execute(&sql);
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let cols = conn.fetch_result_columns(result_set);
-
-    let pushed_sql: String = cols
-        .iter()
-        .flat_map(|col| col.iter())
-        .filter_map(|v| v.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
 
     assert!(
         pushed_sql.contains("shard_key"),
@@ -1919,15 +1879,15 @@ fn test_group_by_agg_before_key() {
             key, i as i64,
             "group at position {i}: key must be {i}, got {key}"
         );
-        assert!(
-            (sum - expected).abs() < 0.01,
+        assert_eq!(
+            sum, *expected,
             "group key {key}: SUM(score) must be {expected}, got {sum}"
         );
     }
 
     let total: f64 = pairs.iter().map(|(_, s)| *s).sum();
-    assert!(
-        (total - 1050.0).abs() < 0.01,
+    assert_eq!(
+        total, 1050.0,
         "total SUM(score) across groups must be 1050.0, got {total}"
     );
 }
@@ -1972,8 +1932,8 @@ fn test_group_by_interleaved_multi_key() {
             k1, *exp_k1,
             "group at position {i}: MOD(id,4) key must be {exp_k1}, got {k1}"
         );
-        assert!(
-            (sum - exp_sum).abs() < 0.01,
+        assert_eq!(
+            sum, *exp_sum,
             "group key {k1}: SUM(score) must be {exp_sum}, got {sum}"
         );
         assert_eq!(
@@ -1983,8 +1943,8 @@ fn test_group_by_interleaved_multi_key() {
     }
 
     let total: f64 = rows.iter().map(|(_, s, _)| *s).sum();
-    assert!(
-        (total - 1050.0).abs() < 0.01,
+    assert_eq!(
+        total, 1050.0,
         "total SUM(score) across groups must be 1050.0, got {total}"
     );
 }
@@ -2069,8 +2029,8 @@ fn test_group_by_agg_first_with_having() {
             key, *exp_key,
             "group at position {i}: key must be {exp_key}, got {key}"
         );
-        assert!(
-            (sum - exp_sum).abs() < 0.01,
+        assert_eq!(
+            sum, *exp_sum,
             "group key {key}: SUM(score) must be {exp_sum}, got {sum}"
         );
         assert!(
@@ -2334,8 +2294,8 @@ fn test_group_by_multi_key_having_limit() {
             .unwrap_or_else(|| {
                 panic!("row {i}: key ({k1}, {k2}) is not one of the known qualifying groups")
             });
-        assert!(
-            (sum - expected_sum).abs() < 0.01,
+        assert_eq!(
+            sum, expected_sum,
             "row {i}: key ({k1}, {k2}) must have SUM(score) = {expected_sum}, got {sum}"
         );
     }
@@ -2400,11 +2360,11 @@ fn test_high_cardinality_multi_key_group_by_spill() {
 const GROUND_TRUTH_LINEITEM_SCAN_TABLE: &str = "GROUND_TRUTH_LINEITEM_SCAN";
 
 fn ensure_ground_truth_lineitem_table(conn: &mut ExaConn) {
-    conn.execute(&format!(
-        "CREATE OR REPLACE TABLE {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_SCAN_TABLE} AS \
-         SELECT L_RETURNFLAG, L_QUANTITY, L_EXTENDEDPRICE FROM {}",
-        vs_lineitem_table()
-    ));
+    create_lineitem_ground_truth_table(
+        conn,
+        GROUND_TRUTH_LINEITEM_SCAN_TABLE,
+        &vs_lineitem_table(),
+    );
 }
 
 fn scalar_over_aggregate_round_select_list() -> &'static str {
@@ -2478,8 +2438,8 @@ fn test_group_by_scalar_over_aggregate_round() {
 
         let actual_sum_qty = parse_numeric(&actual[1][i]);
         let expected_sum_qty = parse_numeric(&expected[1][i]);
-        assert!(
-            (actual_sum_qty - expected_sum_qty).abs() < 0.001,
+        assert_eq!(
+            actual_sum_qty, expected_sum_qty,
             "row {i} ({actual_flag}): SUM(L_QUANTITY) must be {expected_sum_qty}, got {actual_sum_qty}"
         );
 
@@ -2939,8 +2899,8 @@ fn ordered_limit_offset_returns_shifted_window() {
     let scores: Vec<f64> = cols[1].iter().map(parse_numeric).collect();
     for (i, &id) in ids.iter().enumerate() {
         let expected_score = 5.0 * id as f64;
-        assert!(
-            (scores[i] - expected_score).abs() < 1e-9,
+        assert_eq!(
+            scores[i], expected_score,
             "row {i}: score for id {id} must be {expected_score}, got {}",
             scores[i]
         );

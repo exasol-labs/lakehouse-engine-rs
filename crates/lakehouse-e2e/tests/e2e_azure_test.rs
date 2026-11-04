@@ -21,13 +21,14 @@ use common::lakekeeper::{
     lakekeeper_connection_password, lakekeeper_create_adls_warehouse,
     lakekeeper_warehouse_storage_profile,
 };
-use common::raw_parquet::encode_parquet;
+use common::raw_parquet::{encode_parquet, put_object};
 use common::seed::{
     E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, SeedCatalogAuth, SeedStorage,
     decimal_18_0_values, seed_events_table_with_auth,
 };
 use common::stack::{
-    self, CatalogConnectionPassword, build_create_connection_sql, wait_for_exasol, wait_for_url,
+    self, CatalogConnectionPassword, PROXY_ADAPTER_SCHEMA, build_create_connection_sql,
+    wait_for_exasol, wait_for_url,
 };
 
 use arrow::array::{Float64Array, Int64Array, StringArray};
@@ -35,8 +36,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use futures::FutureExt;
 use object_store::azure::MicrosoftAzureBuilder;
-use object_store::path::Path as ObjectStorePath;
-use object_store::{ObjectStoreExt, PutPayload};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -321,15 +320,9 @@ fn write_azure_parquet_fixture(
         .with_access_key(key)
         .build()
         .unwrap_or_else(|e| panic!("configure Azure object store for {path}: {e}"));
-    runtime().block_on(async {
-        store
-            .put(
-                &ObjectStorePath::from(path),
-                PutPayload::from(encode_parquet(&batch)),
-            )
-            .await
-            .unwrap_or_else(|e| panic!("PUT Azure raw-Parquet fixture at {path}: {e}"));
-    });
+    runtime()
+        .block_on(put_object(&store, path, encode_parquet(&batch)))
+        .unwrap_or_else(|e| panic!("PUT Azure raw-Parquet fixture at {path}: {e:#}"));
 }
 
 /// Scenario: In-range Decimal128 maps to a precise Exasol DECIMAL
@@ -467,16 +460,15 @@ fn azure_static_and_vended_creds_end_to_end() {
 
 /// Scenario: HTTPS endpoints are reached through a CONNECT tunnel
 fn adls_reads_tunnel_through_the_https_proxy(conn: &mut ExaConn, fixture: &AzureFixture) {
-    const ADAPTER_SCHEMA: &str = "LHVS_PROXY";
     const PROXY_VS: &str = "AZ_PROXY_VS";
     stack::wait_for_proxy();
     let since = stack::proxy_log_mark();
     let proxy = [("HTTPS_PROXY", stack::PROXY_URL_INTERNAL)];
-    create_schema_and_scripts_with_env(conn, ADAPTER_SCHEMA, &proxy, &proxy);
+    create_schema_and_scripts_with_env(conn, PROXY_ADAPTER_SCHEMA, &proxy, &proxy);
     create_virtual_schema_with_password(
         conn,
         &VsProps::new(PROXY_VS, "")
-            .with_adapter_schema(ADAPTER_SCHEMA)
+            .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
             .with_catalog_conn_name("AZ_PROXY_CREDS")
             .with_catalog_kind("DIRECT_STORAGE"),
         &format!(

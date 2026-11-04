@@ -11,9 +11,9 @@
 use crate::common::e2e_harness::*;
 use crate::common::int96_fixtures::{
     INT96_TS_FAR_FUTURE_COLUMN, INT96_TS_FAR_FUTURE_EXPECTED_VALUE, INT96_TS_FAR_FUTURE_TABLE,
-    NAMESPACE,
 };
 use crate::common::raw_parquet::get_fixture_object;
+use crate::common::seed::E2E_NAMESPACE;
 use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, stack, vs_table};
 
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -24,7 +24,10 @@ fn e2e_int96_fixture_present_and_int96_encoded() {
 
     let rt = runtime();
 
-    let files = rt.block_on(resolve_fixture_files(NAMESPACE, INT96_TS_FAR_FUTURE_TABLE));
+    let files = rt.block_on(resolve_fixture_files(
+        E2E_NAMESPACE,
+        INT96_TS_FAR_FUTURE_TABLE,
+    ));
     // REPARTITION(1) in the fixture SQL forces a single data file.
     assert_eq!(
         files.len(),

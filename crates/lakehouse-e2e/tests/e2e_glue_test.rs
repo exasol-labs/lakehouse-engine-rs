@@ -8,7 +8,7 @@ use common::e2e_harness::{
     SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_binary_columns_match_native_copy,
     assert_binary_values_refused, assert_decimal_orders_numerically,
     assert_hex_literal_compares_bytes, assert_notes_well_formed, assert_text_columns,
-    assert_type_matrix, column_adapter_notes, create_schema_and_scripts,
+    assert_type_matrix, column_adapter_notes, count_statuses, create_schema_and_scripts,
     create_schema_and_scripts_with_env, declared_types, error_text, exa_conn, exa_conn_redacting,
     explain_virtual_sql, identifier_note, install_slc, int_column, note_of, pairs, parse_int,
     partition_positions, query_error, reads, refuses, runtime, skipped_entries,
@@ -32,8 +32,8 @@ use common::seed::{
     TIMESTAMP_VALUES_TEXT,
 };
 use common::stack::{
-    CatalogConnectionPassword, PROXY_URL_INTERNAL, build_create_connection_sql, proxy_log_mark,
-    proxy_log_since, wait_for_exasol, wait_for_proxy,
+    CatalogConnectionPassword, PROXY_ADAPTER_SCHEMA, PROXY_URL_INTERNAL,
+    build_create_connection_sql, proxy_log_mark, proxy_log_since, wait_for_exasol, wait_for_proxy,
 };
 use common::timestamp_precision::expected_timestamp_precision;
 
@@ -348,7 +348,7 @@ fn check_refresh_tables_redeclares_only_the_named_tables(run: &GlueRun, conn: &m
         .iter()
         .map(|table| declared_types(conn, VS, table))
         .collect();
-    let other_answers = count_statuses(conn, &others);
+    let other_answers = count_statuses(conn, VS, &others);
     assert!(
         other_answers.iter().any(|(_, status)| status == "ok"),
         "the unrequested routed tables must include a queryable one: {other_answers:?}"
@@ -375,7 +375,7 @@ fn check_refresh_tables_redeclares_only_the_named_tables(run: &GlueRun, conn: &m
         );
     }
     assert_eq!(
-        count_statuses(conn, &others),
+        count_statuses(conn, VS, &others),
         other_answers,
         "every unrequested table answers a query as it did before REFRESH TABLES"
     );
@@ -391,17 +391,6 @@ fn check_refresh_tables_redeclares_only_the_named_tables(run: &GlueRun, conn: &m
         "the requested, skipped {ORC_TABLE} stays undeclared"
     );
     assert_records_every_skip(conn, &database);
-}
-
-/// Each table's `SELECT COUNT(*)` outcome, so a check compares queryability before and after.
-fn count_statuses(conn: &mut ExaConn, tables: &[String]) -> Vec<(String, String)> {
-    tables
-        .iter()
-        .map(|table| {
-            let response = conn.try_execute(&format!("SELECT COUNT(*) FROM {VS}.{table}"));
-            (table.clone(), value_to_string(&response["status"]))
-        })
-        .collect()
 }
 
 /// `SKIPPED_TABLES` records exactly the fixture's skips, each stating its reason.
@@ -905,7 +894,6 @@ fn check_iceberg_rest_listing_reaches_past_the_first_page(run: &GlueRun, conn: &
 
 /// Scenario: HTTPS endpoints are reached through a CONNECT tunnel
 fn check_https_proxy_tunnels_glue_sts_and_s3(run: &GlueRun, conn: &mut ExaConn) {
-    const ADAPTER_SCHEMA: &str = "LHVS_PROXY";
     const PROXY_VS: &str = "GLUE_PROXY_ROLE";
     const PROXY_CONN: &str = "GLUE_PROXY_ROLE_CREDS";
     const PROXY_REST_VS: &str = "GLUE_PROXY_REST";
@@ -915,7 +903,7 @@ fn check_https_proxy_tunnels_glue_sts_and_s3(run: &GlueRun, conn: &mut ExaConn) 
     wait_for_proxy();
     let since = proxy_log_mark();
     let proxy = [("HTTPS_PROXY", PROXY_URL_INTERNAL)];
-    create_schema_and_scripts_with_env(conn, ADAPTER_SCHEMA, &proxy, &proxy);
+    create_schema_and_scripts_with_env(conn, PROXY_ADAPTER_SCHEMA, &proxy, &proxy);
     let database = run.database();
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
         for (vs, connection, uri, password, kind) in [
@@ -935,7 +923,7 @@ fn check_https_proxy_tunnels_glue_sts_and_s3(run: &GlueRun, conn: &mut ExaConn) 
             ),
         ] {
             let mut props = VsProps::new(vs, &database)
-                .with_adapter_schema(ADAPTER_SCHEMA)
+                .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
                 .with_catalog_conn_name(connection);
             if let Some(kind) = kind {
                 props = props.with_catalog_kind(kind);

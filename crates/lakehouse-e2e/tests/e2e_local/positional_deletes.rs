@@ -7,13 +7,13 @@ use crate::common::exasol_ws::ExaConn;
 use crate::common::pos_delete_fixtures::{
     DELETION_VECTOR_CARDINALITIES, DELETION_VECTOR_FILE_ID_RANGES, DELETION_VECTOR_TABLE,
     FILE_GRANULARITY_DELETED_IDS, FILE_GRANULARITY_REMAINING_ROWS, FILE_GRANULARITY_TABLE,
-    FILE_GRANULARITY_TOTAL_ROWS, NAMESPACE, ORC_FILE_IDS, PARQUET_FILE_IDS, PARTITION_COL,
-    PARTITION_EAST, PARTITION_EAST_DELETED_IDS, PARTITION_GRANULARITY_DELETED_IDS,
+    FILE_GRANULARITY_TOTAL_ROWS, ORC_FILE_IDS, PARQUET_FILE_IDS, PARTITION_COL, PARTITION_EAST,
+    PARTITION_EAST_DELETED_IDS, PARTITION_GRANULARITY_DELETED_IDS,
     PARTITION_GRANULARITY_REMAINING_ROWS, PARTITION_GRANULARITY_TABLE,
     PARTITION_GRANULARITY_TOTAL_ROWS, PARTITION_WEST, PARTITION_WEST_DELETED_IDS,
     UNSUPPORTED_FORMAT_TABLE, deletion_vector_deleted, deletion_vector_remaining_ids,
 };
-use crate::common::seed::{E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS};
+use crate::common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS};
 
 use crate::fixtures::{LAKEHOUSE_VS, explain_virtual_pushdown_sql, lakehouse_vs, vs_table};
 
@@ -33,18 +33,14 @@ fn setup_e2e() {
         let mut conn = exa_conn();
         create_virtual_schema(
             &mut conn,
-            &VsProps::new(SAMESHARD_VS_NAME, NAMESPACE).with_parallelism_factor(1),
+            &VsProps::new(SAMESHARD_VS_NAME, E2E_NAMESPACE).with_parallelism_factor(1),
         );
         create_virtual_schema(
             &mut conn,
-            &VsProps::new(SPLITSHARD_VS_NAME, NAMESPACE)
+            &VsProps::new(SPLITSHARD_VS_NAME, E2E_NAMESPACE)
                 .with_parallelism_factor(SPLIT_PARALLELISM_FACTOR),
         );
     });
-}
-
-fn ids_column(cols: &[Vec<serde_json::Value>]) -> Vec<i64> {
-    cols[0].iter().map(parse_int).collect()
 }
 
 #[test]
@@ -52,7 +48,7 @@ fn fixture_spark_file_granularity_delete_table() {
     setup_e2e();
 
     let rt = runtime();
-    let files = rt.block_on(resolve_fixture_files(NAMESPACE, FILE_GRANULARITY_TABLE));
+    let files = rt.block_on(resolve_fixture_files(E2E_NAMESPACE, FILE_GRANULARITY_TABLE));
     assert_eq!(
         files.len(),
         2,
@@ -106,7 +102,7 @@ fn fixture_spark_partition_granularity_delete_table() {
 
     let rt = runtime();
     let files = rt.block_on(resolve_fixture_files(
-        NAMESPACE,
+        E2E_NAMESPACE,
         PARTITION_GRANULARITY_TABLE,
     ));
     assert_eq!(
@@ -165,7 +161,7 @@ fn e2e_file_granularity_returns_post_delete_rows() {
         vs_table(LAKEHOUSE_VS, FILE_GRANULARITY_TABLE)
     );
     let cols = conn.query_columns(&sql);
-    let ids = ids_column(&cols);
+    let ids = int_column(&cols[0]);
 
     assert_eq!(
         ids.len(),
@@ -202,7 +198,7 @@ fn e2e_partition_granularity_returns_post_delete_rows() {
         vs_table(LAKEHOUSE_VS, PARTITION_GRANULARITY_TABLE)
     );
     let cols = conn.query_columns(&sql);
-    let ids = ids_column(&cols);
+    let ids = int_column(&cols[0]);
 
     assert_eq!(
         ids.len(),
@@ -232,7 +228,7 @@ fn e2e_partition_delete_spans_multiple_partitions() {
 
     let east_sql =
         format!("SELECT id FROM {table} WHERE {PARTITION_COL} = '{PARTITION_EAST}' ORDER BY id");
-    let east_ids = ids_column(&conn.query_columns(&east_sql));
+    let east_ids = int_column(&conn.query_columns(&east_sql)[0]);
     let east_deleted: HashSet<i64> = PARTITION_EAST_DELETED_IDS.iter().copied().collect();
     let expected_east: Vec<i64> = (1..=10i64)
         .filter(|id| !east_deleted.contains(id))
@@ -250,7 +246,7 @@ fn e2e_partition_delete_spans_multiple_partitions() {
 
     let west_sql =
         format!("SELECT id FROM {table} WHERE {PARTITION_COL} = '{PARTITION_WEST}' ORDER BY id");
-    let west_ids = ids_column(&conn.query_columns(&west_sql));
+    let west_ids = int_column(&conn.query_columns(&west_sql)[0]);
     let west_deleted: HashSet<i64> = PARTITION_WEST_DELETED_IDS.iter().copied().collect();
     let expected_west: Vec<i64> = (11..=20i64)
         .filter(|id| !west_deleted.contains(id))
@@ -312,7 +308,7 @@ fn e2e_partition_delete_invariant_across_fanout() {
         "SELECT id FROM {} ORDER BY id",
         vs_table(SAMESHARD_VS_NAME, PARTITION_GRANULARITY_TABLE)
     );
-    let same_ids = ids_column(&conn.query_columns(&same_rows_sql));
+    let same_ids = int_column(&conn.query_columns(&same_rows_sql)[0]);
     assert_eq!(
         same_ids, expected,
         "same-shard placement (PARALLELISM_FACTOR=1) must return the exact \
@@ -323,7 +319,7 @@ fn e2e_partition_delete_invariant_across_fanout() {
         "SELECT id FROM {} ORDER BY id",
         vs_table(SPLITSHARD_VS_NAME, PARTITION_GRANULARITY_TABLE)
     );
-    let split_ids = ids_column(&conn.query_columns(&split_rows_sql));
+    let split_ids = int_column(&conn.query_columns(&split_rows_sql)[0]);
     assert_eq!(
         split_ids, expected,
         "split-shard placement (PARALLELISM_FACTOR={SPLIT_PARALLELISM_FACTOR}) must \
@@ -350,7 +346,7 @@ fn e2e_deletes_with_projection_filter_limit() {
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, val): {cols:?}");
 
-    let ids = ids_column(&cols);
+    let ids = int_column(&cols[0]);
     assert_eq!(
         ids,
         vec![11, 12, 15],
@@ -450,7 +446,7 @@ fn e2e_deletes_with_single_and_grouped_agg() {
 fn fixture_spark_deletion_vector_table() {
     setup_e2e();
 
-    let files = runtime().block_on(resolve_fixture_files(NAMESPACE, DELETION_VECTOR_TABLE));
+    let files = runtime().block_on(resolve_fixture_files(E2E_NAMESPACE, DELETION_VECTOR_TABLE));
     assert_eq!(
         files.len(),
         4,
@@ -515,9 +511,11 @@ fn e2e_deletion_vectors_return_post_delete_rows() {
     for vs in [LAKEHOUSE_VS, SAMESHARD_VS_NAME, SPLITSHARD_VS_NAME] {
         let table = vs_table(vs, DELETION_VECTOR_TABLE);
 
-        let small = ids_column(&conn.query_columns(&format!(
-            "SELECT id FROM {table} WHERE id < 1000 ORDER BY id"
-        )));
+        let small = int_column(
+            &conn.query_columns(&format!(
+                "SELECT id FROM {table} WHERE id < 1000 ORDER BY id"
+            ))[0],
+        );
         assert_eq!(small, small_expected, "{vs}: post-delete ids below 1000");
 
         let agg = conn.query_columns(&format!("SELECT COUNT(*), SUM(id) FROM {table}"));
@@ -530,7 +528,7 @@ fn e2e_deletion_vectors_return_post_delete_rows() {
         let cols = conn.query_columns(&format!(
             "SELECT id, val FROM {table} WHERE id >= 149990 ORDER BY id LIMIT 5"
         ));
-        assert_eq!(ids_column(&cols), top, "{vs}: TopN skips deleted rows");
+        assert_eq!(int_column(&cols[0]), top, "{vs}: TopN skips deleted rows");
         let vals: Vec<&str> = cols[1].iter().map(|v| v.as_str().unwrap()).collect();
         let expected_vals: Vec<String> = top.iter().map(|id| format!("row-{id:02}")).collect();
         assert_eq!(
@@ -632,9 +630,9 @@ fn e2e_delete_free_table_no_regression() {
     // Seed: score = 5.0 * id.
     let n = SEED_TOTAL_ROWS as f64;
     let expected_total_score = 5.0 * (n * (n + 1.0) / 2.0);
-    assert!(
-        (total_score - expected_total_score).abs() < 1e-6,
-        "delete-free aggregate regression: expected SUM(score)≈{expected_total_score}, \
+    assert_eq!(
+        total_score, expected_total_score,
+        "delete-free aggregate regression: expected SUM(score) = {expected_total_score}, \
          got {total_score}"
     );
 }
