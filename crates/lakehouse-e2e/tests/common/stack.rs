@@ -262,6 +262,20 @@ pub fn proxy_log_since(since: &str) -> String {
     )
 }
 
+/// Runs `statement` and counts, for each `requests` entry, the proxy-log lines after it that
+/// contain it. It first waits past one second, because the log's `since` has second
+/// granularity and an earlier statement's lines must fall before the mark.
+pub fn count_proxy_requests<const N: usize>(
+    requests: [&str; N],
+    statement: impl FnOnce(),
+) -> [usize; N] {
+    std::thread::sleep(Duration::from_millis(1100));
+    let mark = proxy_log_mark();
+    statement();
+    let log = proxy_log_since(&mark);
+    requests.map(|request| log.lines().filter(|line| line.contains(request)).count())
+}
+
 /// The file surfaces inside the DB at `/buckets/bfsdefault/default/<name>`.
 pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
     assert!(

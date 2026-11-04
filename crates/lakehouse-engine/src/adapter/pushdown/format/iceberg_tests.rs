@@ -42,18 +42,17 @@ async fn resolve_rest(
         warehouse: creds.warehouse.clone(),
         table: table.into(),
     };
-    let reader = IcebergFormatReader {
-        metadata: IcebergMetadataSource::RestLoadTable {
-            session: &session,
-            catalog_props: &catalog_props,
-        },
-        connection: ConnectionStorage {
-            storage,
-            creds,
-            allow_http: true,
-        },
+    let connection = ConnectionStorage {
+        storage,
+        creds,
+        allow_http: true,
     };
-    resolve_from_notes(&reader, &involved_notes("T", &notes), filter_json).await
+    resolve_from_notes(
+        IcebergTable::from_rest(&session, &catalog_props, &connection),
+        &involved_notes("T", &notes),
+        filter_json,
+    )
+    .await
 }
 
 /// Scenario: The Iceberg format reader owns file resolution and binds columns by field-id
@@ -1134,7 +1133,7 @@ fn assert_promotion_refusal_names_table_column_and_issue(err: UdfError) {
     }
 }
 
-/// No snapshot, so reaching the refusal proves `resolve_scan` invokes it without a manifest read.
+/// No snapshot, so reaching the refusal proves the load invokes it without a manifest read.
 #[tokio::test]
 async fn a_promoted_date_table_is_refused_filtered_or_not_and_from_either_metadata_source() {
     let body = load_table_body(serde_json::json!({
@@ -1201,15 +1200,12 @@ async fn resolve_metadata_file(
     notes: &TableNotes<'_>,
     storage: &StorageBackend,
 ) -> Result<ResolvedScan, UdfError> {
-    let reader = IcebergFormatReader {
-        metadata: IcebergMetadataSource::MetadataFile { table },
-        connection: ConnectionStorage {
-            storage,
-            creds: &sigv4_creds(),
-            allow_http: true,
-        },
-    };
-    resolve_from_notes(&reader, notes, None).await
+    resolve_from_notes(
+        IcebergTable::from_metadata_file(table, storage),
+        notes,
+        None,
+    )
+    .await
 }
 
 /// Scenario: A Glue Iceberg table is planned from its metadata location by the one Iceberg planner

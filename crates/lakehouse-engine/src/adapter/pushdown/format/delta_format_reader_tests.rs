@@ -56,7 +56,7 @@ fn delta_table(
     }
 }
 
-/// The Delta reader of `table`, planned from `notes`.
+/// The Delta table `table`, loaded and then pruned for `notes`.
 async fn resolve_noted(
     table: &CatalogTable,
     notes: &[(String, String)],
@@ -70,10 +70,8 @@ async fn resolve_noted(
         creds,
         allow_http: true,
     };
-    let reader = DeltaFormatReader {
-        storage: UnityTableStorage::new(&session, table, &connection),
-    };
-    resolve_from_notes(&reader, &involved_notes(TABLE_NAME, notes), filter).await
+    let load = DeltaTable::open(UnityTableStorage::new(&session, table, &connection));
+    resolve_from_notes(load, &involved_notes(TABLE_NAME, notes), filter).await
 }
 
 async fn refusal(table: &CatalogTable, use_vended_credentials: bool) -> String {

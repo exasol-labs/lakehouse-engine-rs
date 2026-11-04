@@ -209,15 +209,10 @@ pub trait CatalogClient: Send + Sync {
         &self,
         idents: &[CatalogTableIdent],
     ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>>;
-
-    fn load_table(
-        &self,
-        ident: &CatalogTableIdent,
-    ) -> Pin<Box<dyn Future<Output = Result<CatalogTable, UdfError>> + Send + '_>>;
 }
 
-/// One [`CatalogSession`], resolved on first use, serves the listing and every load, so a request
-/// runs one OAuth2 grant and one `/v1/config` lookup.
+/// One [`CatalogSession`], resolved on first use, serves the listing and every load, so all the
+/// requests the client serves share one OAuth2 grant and one `/v1/config` lookup.
 pub struct IcebergRestCatalogClient {
     catalog_uri: String,
     creds: ConnectionCreds,
@@ -233,7 +228,9 @@ impl IcebergRestCatalogClient {
         }
     }
 
-    async fn session(&self) -> Result<&CatalogSession, UdfError> {
+    /// The client's one session, resolved by the first call, so every later request reuses its
+    /// OAuth2 grant and `/v1/config` prefix.
+    pub async fn session(&self) -> Result<&CatalogSession, UdfError> {
         self.session
             .get_or_try_init(|| {
                 CatalogSession::resolve(&self.catalog_uri, &self.creds.warehouse, &self.creds)
@@ -306,18 +303,6 @@ impl CatalogClient for IcebergRestCatalogClient {
                 .try_collect()
                 .await?;
             Ok(admissions.into_iter().collect())
-        })
-    }
-
-    fn load_table(
-        &self,
-        ident: &CatalogTableIdent,
-    ) -> Pin<Box<dyn Future<Output = Result<CatalogTable, UdfError>> + Send + '_>> {
-        let ident = ident.clone();
-        Box::pin(async move {
-            self.load_on_session(self.session().await?, &ident)
-                .await
-                .map_err(UdfError::from)
         })
     }
 }

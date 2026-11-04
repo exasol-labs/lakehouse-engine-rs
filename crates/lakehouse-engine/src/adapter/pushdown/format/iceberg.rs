@@ -16,7 +16,7 @@ use lakehouse_catalog::{
 };
 use serde_json::Value as Json;
 
-use super::{ConnectionStorage, FormatReader, PlannedFiles};
+use super::{ConnectionStorage, LoadedTable, PlannedFiles};
 use crate::adapter::column_notes::{
     ColumnDeclaration, DeclaredSchema, column_refusal, unread_type_cause, variant_cause,
 };
@@ -31,23 +31,18 @@ use crate::scan::spec::{
 #[path = "iceberg_tests.rs"]
 mod tests;
 
-/// Current metadata serves only snapshot, files, mapping, and the checks of the declaration.
-pub(super) struct IcebergFormatReader<'a> {
-    pub(super) metadata: IcebergMetadataSource<'a>,
-    pub(super) connection: ConnectionStorage<'a>,
-}
-
-/// Where an Iceberg table's current metadata comes from. Every source's metadata passes the same
-/// checks and the same planner, so every Iceberg reader rule applies to every source.
-pub(super) enum IcebergMetadataSource<'a> {
-    /// An Iceberg REST `loadTable`, whose response may also vend the table's credential.
-    RestLoadTable {
-        session: &'a CatalogSession,
-        catalog_props: &'a CatalogProps,
-    },
-    /// A metastore's pointer to the current `metadata.json` (Iceberg § Metastore Tables), read
-    /// once through the CONNECTION's static storage.
-    MetadataFile { table: &'a CatalogTable },
+/// An Iceberg table at the snapshot that was current when it was loaded. Every source's metadata
+/// passes the same checks and the same planner, so every Iceberg reader rule applies to every
+/// source. Current metadata serves only snapshot, files, mapping, and the checks of the
+/// declaration.
+pub(in crate::adapter::pushdown) struct IcebergTable {
+    table_name: String,
+    /// Bound to the Tokio runtime it was loaded on, which must outlive it. Each prune plans a
+    /// clone, and the clones share the table's manifest cache.
+    table: iceberg::table::Table,
+    table_root: String,
+    effective_storage: StorageBackend,
+    name_mapping: Vec<NameMappingEntry>,
 }
 
 /// A table's identity and its metadata once it passed the pre-storage checks, with the storage
@@ -61,25 +56,118 @@ struct CheckedMetadata {
     effective_storage: StorageBackend,
 }
 
-impl FormatReader for IcebergFormatReader<'_> {
-    fn resolve_scan<'a>(
+impl IcebergTable {
+    /// Loads through an Iceberg REST `loadTable`, whose response may also vend the table's
+    /// credential.
+    pub(in crate::adapter::pushdown) async fn from_rest(
+        session: &CatalogSession,
+        catalog_props: &CatalogProps,
+        connection: &ConnectionStorage<'_>,
+    ) -> Result<Self, UdfError> {
+        Self::open(rest_metadata(session, catalog_props, connection).await?)
+    }
+
+    /// Loads from a metastore's pointer to the current `metadata.json` (Iceberg § Metastore
+    /// Tables), read once through the CONNECTION's static storage.
+    pub(in crate::adapter::pushdown) async fn from_metadata_file(
+        table: &CatalogTable,
+        storage: &StorageBackend,
+    ) -> Result<Self, UdfError> {
+        Self::open(file_metadata(table, storage).await?)
+    }
+
+    /// Errors are redacted against the effective storage's secrets, since its `file_io` is what
+    /// talks to object storage.
+    fn open(checked: CheckedMetadata) -> Result<Self, UdfError> {
+        let CheckedMetadata {
+            table_name,
+            table_ident,
+            metadata,
+            metadata_location,
+            table_root,
+            effective_storage,
+        } = checked;
+        let secrets = effective_storage.secret_values();
+        let build_error = |e: iceberg::Error| {
+            UdfError::User(format!(
+                "failed to build Iceberg table: {}",
+                redact_error_text(&e.to_string(), &secrets)
+            ))
+        };
+        let table_builder = iceberg::table::Table::builder()
+            .identifier(table_ident)
+            .file_io(effective_storage.file_io())
+            .runtime(iceberg::Runtime::try_current().map_err(build_error)?)
+            .metadata(metadata);
+        let table = match metadata_location {
+            Some(location) => table_builder.metadata_location(location).build(),
+            None => table_builder.build(),
+        }
+        .map_err(build_error)?;
+        // Absent ⇒ empty; malformed ⇒ plan-time error.
+        let name_mapping = parse_name_mapping(
+            table
+                .metadata()
+                .properties()
+                .get(iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING)
+                .map(String::as_str),
+        )?;
+        Ok(Self {
+            table_name,
+            table,
+            table_root,
+            effective_storage,
+            name_mapping,
+        })
+    }
+
+    async fn plan(
+        &self,
+        declared: &[LogicalField],
+        filter_json: Option<&Json>,
+    ) -> Result<PlannedFiles, UdfError> {
+        let table_name = &self.table_name;
+        let secrets = self.effective_storage.secret_values();
+        // A scan without a pinned snapshot binds its filter by name against the current schema,
+        // so each declared field id is named as that schema names it.
+        let metadata = self.table.metadata();
+        let scanned = metadata
+            .current_snapshot()
+            .map(|_| metadata.current_schema().clone());
+        let predicate = filter_json
+            .zip(scanned)
+            .and_then(|(filter, scanned)| to_iceberg_predicate(filter, declared, &scanned));
+        let tasks = plan_file_tasks(self.table.clone(), table_name, predicate, &secrets).await?;
+        // Delete paths are relativized later in `relativize_shards_to_root`, like data-file paths.
+        let files = tasks
+            .iter()
+            .map(|task| {
+                let mut entry = planned_file_entry(task)
+                    .map_err(|mechanism| unsupported_delete_error(mechanism, table_name))?;
+                wire_paths(&mut entry)?;
+                entry.partition_values = identity_partition_values(task, declared, table_name)?;
+                Ok(entry)
+            })
+            .collect::<Result<_, UdfError>>()?;
+
+        Ok(PlannedFiles {
+            files,
+            effective_storage: self.effective_storage.clone(),
+            table_root: ObjectLocation::from_raw(&self.table_root)?.to_wire(),
+            name_mapping: self.name_mapping.clone(),
+        })
+    }
+}
+
+impl LoadedTable for IcebergTable {
+    fn prune<'a>(
         &'a self,
         declared: &'a DeclaredSchema,
         filter_json: Option<&'a Json>,
     ) -> Pin<Box<dyn Future<Output = Result<PlannedFiles, UdfError>> + Send + 'a>> {
         Box::pin(async move {
-            let checked = match self.metadata {
-                IcebergMetadataSource::RestLoadTable {
-                    session,
-                    catalog_props,
-                } => rest_metadata(session, catalog_props, &self.connection).await?,
-                IcebergMetadataSource::MetadataFile { table } => {
-                    file_metadata(table, self.connection.storage).await?
-                }
-            };
-            let current = checked.metadata.current_schema();
-            refuse_relaxed_nullability(current, declared)?;
-            plan_checked_table(checked, &declared.logical_schema, filter_json).await
+            refuse_relaxed_nullability(self.table.metadata().current_schema(), declared)?;
+            self.plan(&declared.logical_schema, filter_json).await
         })
     }
 }
@@ -197,86 +285,6 @@ fn refuse_relaxed_nullability(
         field.name.to_uppercase(),
         declared.table
     )))
-}
-
-/// The one Iceberg planner. Errors are redacted against the effective storage's secrets, since
-/// its `file_io` is what talks to object storage.
-async fn plan_checked_table(
-    checked: CheckedMetadata,
-    declared: &[LogicalField],
-    filter_json: Option<&Json>,
-) -> Result<PlannedFiles, UdfError> {
-    let CheckedMetadata {
-        table_name,
-        table_ident,
-        metadata,
-        metadata_location,
-        table_root,
-        effective_storage,
-    } = checked;
-    let secrets = effective_storage.secret_values();
-
-    let file_io = effective_storage.file_io();
-    let runtime = iceberg::Runtime::try_current().map_err(|e| {
-        UdfError::User(format!(
-            "failed to build Iceberg table: {}",
-            redact_error_text(&e.to_string(), &secrets)
-        ))
-    })?;
-    let table_builder = iceberg::table::Table::builder()
-        .identifier(table_ident)
-        .file_io(file_io)
-        .runtime(runtime)
-        .metadata(metadata);
-    let table = if let Some(loc) = metadata_location {
-        table_builder.metadata_location(loc).build()
-    } else {
-        table_builder.build()
-    }
-    .map_err(|e| {
-        UdfError::User(format!(
-            "failed to build Iceberg table: {}",
-            redact_error_text(&e.to_string(), &secrets)
-        ))
-    })?;
-
-    // Absent ⇒ empty; malformed ⇒ plan-time error.
-    let name_mapping = parse_name_mapping(
-        table
-            .metadata()
-            .properties()
-            .get(iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING)
-            .map(String::as_str),
-    )?;
-
-    // A scan without a pinned snapshot binds its filter by name against the current schema,
-    // so each declared field id is named as that schema names it.
-    let metadata = table.metadata();
-    let scanned = metadata
-        .current_snapshot()
-        .map(|_| metadata.current_schema().clone());
-    let predicate = filter_json
-        .zip(scanned)
-        .and_then(|(filter, scanned)| to_iceberg_predicate(filter, declared, &scanned));
-    let tasks = plan_file_tasks(table, &table_name, predicate, &secrets).await?;
-    // Delete paths are relativized later in `relativize_shards_to_root`, like data-file paths.
-    let files = tasks
-        .iter()
-        .map(|task| {
-            let mut entry = planned_file_entry(task)
-                .map_err(|mechanism| unsupported_delete_error(mechanism, &table_name))?;
-            wire_paths(&mut entry)?;
-            entry.partition_values = identity_partition_values(task, declared, &table_name)?;
-            Ok(entry)
-        })
-        .collect::<Result<_, UdfError>>()?;
-
-    Ok(PlannedFiles {
-        files,
-        effective_storage,
-        table_root: ObjectLocation::from_raw(&table_root)?.to_wire(),
-        name_mapping,
-    })
 }
 
 /// A manifest path names its key raw, so a URL parse would decode `%3D` in Spark's

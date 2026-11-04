@@ -16,7 +16,7 @@ const READ_OPERATION: &str = "READ";
 
 /// One Unity table's checked root and read backend: the single owner of the no-fallback
 /// vending rule across every Unity-hosted format.
-pub(super) struct UnityTableStorage<'a> {
+pub(in crate::adapter::pushdown) struct UnityTableStorage<'a> {
     session: &'a UnityCatalogSession,
     table: &'a CatalogTable,
     storage: &'a StorageBackend,
@@ -25,7 +25,7 @@ pub(super) struct UnityTableStorage<'a> {
 }
 
 impl<'a> UnityTableStorage<'a> {
-    pub(super) fn new(
+    pub(in crate::adapter::pushdown) fn new(
         session: &'a UnityCatalogSession,
         table: &'a CatalogTable,
         connection: &ConnectionStorage<'a>,

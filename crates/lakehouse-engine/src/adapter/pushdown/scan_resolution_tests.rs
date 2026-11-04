@@ -1,14 +1,38 @@
 use super::super::binary_filter::BinaryLayout;
 use super::super::test_support::{
     GlueEndpoint, ICEBERG_CONFIG_TARGET, ICEBERG_LOAD_TABLE_TARGET, RecordingCatalog,
-    UNITY_TABLE_TARGET, delta_notes, iceberg_catalog, involved_notes,
-    locationless_delta_table_body, sample_storage, unauthenticated_creds,
+    UNITY_TABLE_TARGET, UNREACHABLE_CATALOG, delta_notes, endpoint_storage, iceberg_catalog,
+    involved_notes, locationless_delta_table_body, resolved_connection, sample_storage,
+    statement_catalog, unauthenticated_creds,
 };
 use super::*;
+use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::direct_storage_properties::join_storage_path;
-use crate::adapter::permission::PermissionCheck;
-use crate::scan::spec::{StorageBackend, StorageProps};
+use crate::adapter::permission::PermissionSettings;
+use crate::adapter::properties::{PERMISSION_CHECK, USER_MAPPING};
+use crate::scan::spec::StorageBackend;
 use crate::types::exasol_type::ExasolType;
+
+/// The state of a statement's first pushdown over `catalog_uri`, with an unauthenticated
+/// CONNECTION and no properties.
+fn statement_over(
+    kind: CatalogKind,
+    catalog_uri: &str,
+    storage: StorageBackend,
+) -> StatementCatalog {
+    let connection = resolved_connection(kind, catalog_uri, storage, unauthenticated_creds());
+    statement_catalog(connection, &Json::Null).expect("the catalog client issues no request")
+}
+
+fn lakekeeper_check() -> PermissionCheck {
+    PermissionSettings::parse(&serde_json::json!({
+        PERMISSION_CHECK: "LAKEKEEPER",
+        USER_MAPPING: "oidc~{{ user }}",
+    }))
+    .unwrap()
+    .check_for(|| Some("ALICE".into()))
+    .unwrap()
+}
 
 /// Scenario: A Unity Catalog table's identity survives the round trip from the involved table
 #[tokio::test]
@@ -21,19 +45,16 @@ async fn unity_table_identity_round_trips_through_the_recorded_identifier() {
         }
     })
     .await;
-    let creds = unauthenticated_creds();
-    let storage = sample_storage();
-    let resolver = TableScanResolver::for_request(
+    let statement = statement_over(
         CatalogKind::UnityCatalogNative,
         &catalog.uri,
-        ConnectionStorage {
-            storage: &storage,
-            creds: &creds,
-            allow_http: true,
-        },
+        sample_storage(),
+    );
+    let resolver = TableScanResolver::for_request(
+        &statement,
+        &PermissionCheck::Off,
         &["cat.sch.orders"],
         &Json::Null,
-        &PermissionCheck::Off,
     )
     .await
     .expect("a Unity Catalog session is built without contacting the catalog");
@@ -64,19 +85,12 @@ async fn glue_table_identity_round_trips_through_the_recorded_identifier() {
         )
     })
     .await;
-    let creds = unauthenticated_creds();
-    let storage = sample_storage();
+    let statement = statement_over(CatalogKind::Glue, &glue.address, sample_storage());
     let resolver = TableScanResolver::for_request(
-        CatalogKind::Glue,
-        &glue.address,
-        ConnectionStorage {
-            storage: &storage,
-            creds: &creds,
-            allow_http: true,
-        },
+        &statement,
+        &PermissionCheck::Off,
         &["sales.orders"],
         &Json::Null,
-        &PermissionCheck::Off,
     )
     .await
     .expect("a Glue session is built without contacting the catalog");
@@ -97,79 +111,16 @@ async fn glue_table_identity_round_trips_through_the_recorded_identifier() {
     );
 }
 
-#[test]
-fn a_recorded_identifier_recovers_its_namespace_segments_and_table_name() {
-    let three_level = unity_table_ident("cat.sch.orders").expect("a three-level identifier");
-    assert_eq!(
-        three_level.namespace,
-        vec!["cat".to_string(), "sch".to_string()]
-    );
-    assert_eq!(three_level.name, "orders");
-
-    let bare = unity_table_ident("orders")
-        .expect_err("a separator-free identifier addresses no Unity Catalog table");
-    assert!(
-        bare.to_string().contains("'orders'"),
-        "the refusal must name the identifier it rejected: {bare}"
-    );
-    assert!(
-        bare.to_string().contains("catalog.schema.table"),
-        "the refusal must state the Unity Catalog address form: {bare}"
-    );
-}
-
-#[tokio::test]
-async fn a_recorded_identifier_without_a_table_name_is_refused_before_any_catalog_request() {
-    let catalog = RecordingCatalog::spawn(|_| (200, locationless_delta_table_body())).await;
-    let creds = unauthenticated_creds();
-    let storage = sample_storage();
-
-    for unresolvable in ["cat.sch.", "", "   "] {
-        let err = TableScanResolver::for_request(
-            CatalogKind::UnityCatalogNative,
-            &catalog.uri,
-            ConnectionStorage {
-                storage: &storage,
-                creds: &creds,
-                allow_http: true,
-            },
-            &[unresolvable],
-            &Json::Null,
-            &PermissionCheck::Off,
-        )
-        .await
-        .err()
-        .expect("an identifier naming no table must be refused");
-        assert!(
-            err.to_string().contains(&format!("'{unresolvable}'")),
-            "the refusal must name the identifier it could not resolve: {err}"
-        );
-    }
-
-    assert!(
-        catalog.targets().is_empty(),
-        "an identifier naming no table must cost no catalog request: {:?}",
-        catalog.targets()
-    );
-}
-
 #[tokio::test]
 async fn a_malformed_identifier_anywhere_in_the_request_is_refused_before_any_catalog_request() {
     let catalog = iceberg_catalog().await;
-    let creds = unauthenticated_creds();
-    let storage = sample_storage();
+    let statement = statement_over(CatalogKind::IcebergRest, &catalog.uri, sample_storage());
 
     let err = TableScanResolver::for_request(
-        CatalogKind::IcebergRest,
-        &catalog.uri,
-        ConnectionStorage {
-            storage: &storage,
-            creds: &creds,
-            allow_http: true,
-        },
+        &statement,
+        &PermissionCheck::Off,
         &["db.t", "malformed"],
         &Json::Null,
-        &PermissionCheck::Off,
     )
     .await
     .err()
@@ -189,22 +140,11 @@ async fn a_malformed_identifier_anywhere_in_the_request_is_refused_before_any_ca
 #[tokio::test]
 async fn an_iceberg_identifier_resolves_through_the_iceberg_reader_with_no_partition_columns() {
     let catalog = iceberg_catalog().await;
-    let creds = unauthenticated_creds();
-    let storage = sample_storage();
-    let resolver = TableScanResolver::for_request(
-        CatalogKind::IcebergRest,
-        &catalog.uri,
-        ConnectionStorage {
-            storage: &storage,
-            creds: &creds,
-            allow_http: true,
-        },
-        &["db.t"],
-        &Json::Null,
-        &PermissionCheck::Off,
-    )
-    .await
-    .expect("an Iceberg session resolves against a reachable catalog");
+    let statement = statement_over(CatalogKind::IcebergRest, &catalog.uri, sample_storage());
+    let resolver =
+        TableScanResolver::for_request(&statement, &PermissionCheck::Off, &["db.t"], &Json::Null)
+            .await
+            .expect("an Iceberg session resolves against a reachable catalog");
 
     let (resolved, _) = resolver
         .resolve("db.t", None, &InvolvedColumns::default())
@@ -225,98 +165,6 @@ async fn an_iceberg_identifier_resolves_through_the_iceberg_reader_with_no_parti
     );
 }
 
-/// Scenario: One catalog session per request serves every table the request resolves
-#[tokio::test]
-async fn one_catalog_session_serves_every_table_the_resolver_resolves() {
-    let catalog = iceberg_catalog().await;
-    let creds = unauthenticated_creds();
-    let storage = sample_storage();
-    let resolver = TableScanResolver::for_request(
-        CatalogKind::IcebergRest,
-        &catalog.uri,
-        ConnectionStorage {
-            storage: &storage,
-            creds: &creds,
-            allow_http: true,
-        },
-        &["db.t", "db.u"],
-        &Json::Null,
-        &PermissionCheck::Off,
-    )
-    .await
-    .expect("an Iceberg session resolves against a reachable catalog");
-
-    resolver
-        .resolve("db.t", None, &InvolvedColumns::default())
-        .await
-        .expect("first table");
-    resolver
-        .resolve("db.u", None, &InvolvedColumns::default())
-        .await
-        .expect("second table");
-
-    assert_eq!(
-        catalog.targets(),
-        vec![
-            ICEBERG_CONFIG_TARGET.to_string(),
-            ICEBERG_LOAD_TABLE_TARGET.to_string(),
-            "/v1/namespaces/db/tables/u?snapshots=refs".to_string()
-        ],
-        "the second table must be loaded on the session the first one used"
-    );
-}
-
-/// Scenario: One catalog session per request serves every table the request resolves
-#[tokio::test]
-async fn one_unity_catalog_session_serves_every_table_the_resolver_resolves() {
-    const SECOND_TABLE_TARGET: &str = "/api/2.1/unity-catalog/tables/cat.sch.customers";
-    let catalog = RecordingCatalog::spawn(|target| {
-        if target == UNITY_TABLE_TARGET || target == SECOND_TABLE_TARGET {
-            (200, locationless_delta_table_body())
-        } else {
-            (404, r#"{"message":"no such table"}"#.to_string())
-        }
-    })
-    .await;
-    let creds = unauthenticated_creds();
-    let storage = sample_storage();
-    let resolver = TableScanResolver::for_request(
-        CatalogKind::UnityCatalogNative,
-        &catalog.uri,
-        ConnectionStorage {
-            storage: &storage,
-            creds: &creds,
-            allow_http: true,
-        },
-        &["cat.sch.orders", "cat.sch.customers"],
-        &Json::Null,
-        &PermissionCheck::Off,
-    )
-    .await
-    .expect("a Unity Catalog session is built without contacting the catalog");
-
-    let err1 = resolver
-        .resolve("cat.sch.orders", None, &InvolvedColumns::default())
-        .await
-        .expect_err("a Delta table carrying no storage location cannot be planned");
-    let err2 = resolver
-        .resolve("cat.sch.customers", None, &InvolvedColumns::default())
-        .await
-        .expect_err("a Delta table carrying no storage location cannot be planned");
-    assert!(err1.to_string().contains("cat.sch.orders"));
-    assert!(err2.to_string().contains("cat.sch.customers"));
-
-    assert_eq!(
-        catalog.targets(),
-        vec![
-            UNITY_TABLE_TARGET.to_string(),
-            SECOND_TABLE_TARGET.to_string()
-        ],
-        "the second table must be loaded on the SAME session the first one used, \
-         with no repeated auth target"
-    );
-}
-
 const EMPTY_LIST_BUCKET_RESULT: &str = concat!(
     r#"<?xml version="1.0" encoding="UTF-8"?>"#,
     r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
@@ -330,131 +178,20 @@ async fn empty_s3_endpoint() -> RecordingCatalog {
     RecordingCatalog::spawn(|_| (200, EMPTY_LIST_BUCKET_RESULT.to_string())).await
 }
 
-fn direct_storage_backend(endpoint: &str) -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: endpoint.to_string(),
-        region: "us-east-1".into(),
-        access_key: "minioadmin".into(),
-        secret_key: "minioadmin".into(),
-        allow_http: true,
-        path_style: true,
-        ..Default::default()
-    })
-}
-
-#[tokio::test]
-async fn one_session_or_store_per_request_serves_every_leg() {
-    let endpoint = empty_s3_endpoint().await;
-    let creds = unauthenticated_creds();
-    let storage = direct_storage_backend(&endpoint.uri);
-    let props = serde_json::json!({"NAMESPACE": "direct"});
-    let resolver = TableScanResolver::for_request(
-        CatalogKind::DirectStorage,
-        DIRECT_STORAGE_ADDRESS,
-        ConnectionStorage {
-            storage: &storage,
-            creds: &creds,
-            allow_http: true,
-        },
-        &["events", "event_labels"],
-        &props,
-        &PermissionCheck::Off,
-    )
-    .await
-    .expect("a direct-storage store is built from the CONNECTION alone");
-
-    assert!(
-        endpoint.targets().is_empty(),
-        "building the request's one store must cost no object-store request: {:?}",
-        endpoint.targets()
-    );
-
-    resolver
-        .resolve("events", None, &InvolvedColumns::default())
-        .await
-        .expect("a directory with no data file resolves an empty scan");
-    resolver
-        .resolve("event_labels", None, &InvolvedColumns::default())
-        .await
-        .expect("a directory with no data file resolves an empty scan");
-
-    let targets = endpoint.targets();
-    assert_eq!(
-        targets.len(),
-        2,
-        "each leg costs exactly one listing and no session setup of its own: {targets:?}"
-    );
-    assert!(
-        targets[0].contains("direct%2Fevents%2F") || targets[0].contains("direct/events/"),
-        "the first leg lists its own table root under the composed base path: {targets:?}"
-    );
-    assert!(
-        targets[1].contains("direct%2Fevent_labels%2F")
-            || targets[1].contains("direct/event_labels/"),
-        "the second leg lists its own table root, not the first leg's: {targets:?}"
-    );
-}
-
-#[tokio::test]
-async fn a_direct_storage_identifier_naming_no_first_level_directory_is_refused() {
-    let endpoint = empty_s3_endpoint().await;
-    let creds = unauthenticated_creds();
-    let storage = direct_storage_backend(&endpoint.uri);
-
-    for unresolvable in ["", "   ", "sub/dir", "sub\\dir", "..", "."] {
-        let err = TableScanResolver::for_request(
-            CatalogKind::DirectStorage,
-            DIRECT_STORAGE_ADDRESS,
-            ConnectionStorage {
-                storage: &storage,
-                creds: &creds,
-                allow_http: true,
-            },
-            &["events", unresolvable],
-            &Json::Null,
-            &PermissionCheck::Off,
-        )
-        .await
-        .err()
-        .expect("an identifier naming no first-level directory must be refused");
-        assert!(
-            err.to_string().contains(&format!("'{unresolvable}'")),
-            "the refusal must name the identifier it rejected: {err}"
-        );
-        assert!(
-            err.to_string().contains("recreate the virtual schema"),
-            "the refusal must tell the operator how to repair it: {err}"
-        );
-    }
-
-    assert!(
-        endpoint.targets().is_empty(),
-        "a refused identifier must cost no object-store request: {:?}",
-        endpoint.targets()
-    );
-}
-
 #[tokio::test]
 async fn the_pushdown_table_root_equals_the_discovery_composed_storage_location() {
     let endpoint = empty_s3_endpoint().await;
-    let creds = unauthenticated_creds();
-    let storage = direct_storage_backend(&endpoint.uri);
     let address = "s3://warehouse/direct//";
-
-    let resolver = TableScanResolver::for_request(
+    let statement = statement_over(
         CatalogKind::DirectStorage,
         address,
-        ConnectionStorage {
-            storage: &storage,
-            creds: &creds,
-            allow_http: true,
-        },
-        &["events"],
-        &Json::Null,
-        &PermissionCheck::Off,
-    )
-    .await
-    .expect("a direct-storage store is built from the CONNECTION alone");
+        endpoint_storage(&endpoint.uri),
+    );
+
+    let resolver =
+        TableScanResolver::for_request(&statement, &PermissionCheck::Off, &["events"], &Json::Null)
+            .await
+            .expect("a direct-storage store is built from the CONNECTION alone");
 
     let (scan, _) = resolver
         .resolve("events", None, &InvolvedColumns::default())
@@ -474,80 +211,31 @@ async fn the_pushdown_table_root_equals_the_discovery_composed_storage_location(
 }
 
 #[tokio::test]
-async fn request_session_has_one_variant_per_kind() {
-    let iceberg = iceberg_catalog().await;
-    let endpoint = empty_s3_endpoint().await;
-    let creds = unauthenticated_creds();
-    let storage = sample_storage();
-    let direct_storage = direct_storage_backend(&endpoint.uri);
-
-    for (kind, uri, backend, identifier) in [
-        (
-            CatalogKind::IcebergRest,
-            iceberg.uri.as_str(),
-            &storage,
-            "db.t",
-        ),
-        (
-            CatalogKind::UnityCatalogNative,
-            iceberg.uri.as_str(),
-            &storage,
-            "cat.sch.orders",
-        ),
-        (
-            CatalogKind::Glue,
-            iceberg.uri.as_str(),
-            &storage,
-            "sales.orders",
-        ),
-        (
-            CatalogKind::DirectStorage,
-            DIRECT_STORAGE_ADDRESS,
-            &direct_storage,
-            "events",
-        ),
-    ] {
-        TableScanResolver::for_request(
-            kind,
-            uri,
-            ConnectionStorage {
-                storage: backend,
-                creds: &creds,
-                allow_http: true,
-            },
-            &[identifier],
-            &Json::Null,
-            &PermissionCheck::Off,
-        )
+async fn an_enforced_check_reads_no_table_that_no_check_admitted() {
+    let statement = statement_over(
+        CatalogKind::DirectStorage,
+        DIRECT_STORAGE_ADDRESS,
+        endpoint_storage(UNREACHABLE_CATALOG),
+    );
+    let check = lakekeeper_check();
+    let resolver = TableScanResolver::for_request(&statement, &check, &["events"], &Json::Null)
         .await
-        .unwrap_or_else(|e| panic!("{kind:?} must resolve a session of its own: {e}"));
-    }
+        .expect("a kind that runs no check admits nothing and fails nothing");
+
+    let err = resolver
+        .resolve("events", None, &InvolvedColumns::default())
+        .await
+        .expect_err("a table no check admitted must not be read");
+
+    assert!(
+        err.to_string().contains("did not cover table 'events'"),
+        "{err}"
+    );
 }
 
-/// Scenario: One batch-check per query decides every table before any table is read
-#[test]
-fn an_enforced_resolver_admits_only_the_tables_the_check_covered() {
-    let admission = TableAdmission::Authorized(HashSet::from(["db.t".to_string()]));
-
-    assert!(admission.admit("db.t").is_ok());
-    assert!(admission.admit("db.other").is_err());
-    assert!(TableAdmission::Unchecked.admit("db.other").is_ok());
-}
-
-/// Scenario: One batch-check per query decides every table before any table is read
 #[tokio::test]
 async fn an_enforced_check_admits_an_allowed_table_and_refuses_a_denied_one() {
-    use crate::adapter::permission::PermissionSettings;
-    use crate::adapter::properties::{PERMISSION_CHECK, USER_MAPPING};
-
-    let check = PermissionSettings::parse(&serde_json::json!({
-        PERMISSION_CHECK: "LAKEKEEPER",
-        USER_MAPPING: "oidc~{{ user }}",
-    }))
-    .unwrap()
-    .check_for(|| Some("ALICE".into()))
-    .unwrap();
-    let (storage, creds) = (sample_storage(), unauthenticated_creds());
+    let check = lakekeeper_check();
     for allowed in [true, false] {
         let catalog = RecordingCatalog::spawn(move |target| {
             if target.starts_with("/catalog/v1/config") {
@@ -560,44 +248,43 @@ async fn an_enforced_check_admits_an_allowed_table_and_refuses_a_denied_one() {
             }
         })
         .await;
-
-        let resolver = TableScanResolver::for_request(
+        let statement = statement_over(
             CatalogKind::IcebergRest,
             &format!("{}/catalog", catalog.uri),
-            ConnectionStorage {
-                storage: &storage,
-                creds: &creds,
-                allow_http: true,
-            },
-            &["db.t"],
-            &Json::Null,
-            &check,
-        )
-        .await;
+            sample_storage(),
+        );
+
+        let resolver =
+            TableScanResolver::for_request(&statement, &check, &["db.t"], &Json::Null).await;
 
         assert_eq!(resolver.is_ok(), allowed);
     }
 }
 
+#[test]
+fn only_unchecked_identifiers_are_batch_checked() {
+    let admitted = HashSet::from(["db.checked".to_string(), "db.also_checked".to_string()]);
+
+    let unchecked = unchecked_identifiers(
+        &["db.new", "db.checked", "db.other_new", "db.also_checked"],
+        &admitted,
+    );
+
+    assert_eq!(unchecked, ["db.new", "db.other_new"]);
+}
+
 #[tokio::test]
 async fn the_resolver_returns_the_map_the_request_types_and_the_column_notes_build() {
     let endpoint = empty_s3_endpoint().await;
-    let creds = unauthenticated_creds();
-    let storage = direct_storage_backend(&endpoint.uri);
-    let resolver = TableScanResolver::for_request(
+    let statement = statement_over(
         CatalogKind::DirectStorage,
         DIRECT_STORAGE_ADDRESS,
-        ConnectionStorage {
-            storage: &storage,
-            creds: &creds,
-            allow_http: true,
-        },
-        &["events"],
-        &Json::Null,
-        &PermissionCheck::Off,
-    )
-    .await
-    .expect("a direct-storage store is built from the CONNECTION alone");
+        endpoint_storage(&endpoint.uri),
+    );
+    let resolver =
+        TableScanResolver::for_request(&statement, &PermissionCheck::Off, &["events"], &Json::Null)
+            .await
+            .expect("a direct-storage store is built from the CONNECTION alone");
     let notes = delta_notes(&[("payload", "binary"), ("id", "long")], &[]);
     let number = ExasolType::decimal(20, 0);
     let involved = InvolvedColumns {

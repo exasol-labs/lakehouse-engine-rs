@@ -10,8 +10,9 @@ direct storage, and include Databricks-managed tables. It runs the
 [DataFusion](https://datafusion.apache.org/) engine in place, inside Rust UDFs on the
 Exasol nodes. Scans therefore run where the cluster already is. The VS layer stays
 thin: it does query translation, pushdown analysis, parallelization planning, and schema
-mapping. All execution happens in disposable, node-local DataFusion runtimes. Every query
-is stateless: no caching, no materialization, no data copied out.
+mapping. All execution happens in disposable, node-local DataFusion runtimes. The adapter
+reuses a table's metadata within one statement and keeps nothing across statements. It
+does no materialization and copies no data out.
 
 After you deploy it, you query lakehouse tables like any other Exasol schema:
 

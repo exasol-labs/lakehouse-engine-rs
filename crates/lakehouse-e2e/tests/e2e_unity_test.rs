@@ -2617,33 +2617,84 @@ fn delta_single_group_aggregates_match_the_oracle() {
     assert_single_group_aggregates_match_oracle(&mut exa_conn(), Format::Delta);
 }
 
+const PROXY_ADAPTER_SCHEMA: &str = "LHVS_PROXY";
+const VS_PROXY: &str = "UNITY_PROXY_VS";
+const UNITY_VIA_PROXY: &str = "http://unitycatalog-via-proxy:8080";
+const STORAGE_VIA_PROXY: &str = "http://seaweedfs-via-proxy:8333";
+
+/// Creates, once, the Unity virtual schema whose catalog and storage requests only the forward
+/// proxy resolves.
+fn create_proxy_virtual_schema() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        setup();
+        stack::wait_for_proxy();
+        for host in ["unitycatalog-via-proxy", "seaweedfs-via-proxy"] {
+            stack::assert_resolves_only_through_proxy(host);
+        }
+        let proxy = [("HTTP_PROXY", stack::PROXY_URL_INTERNAL)];
+        let mut conn = exa_conn();
+        create_schema_and_scripts_with_env(&mut conn, PROXY_ADAPTER_SCHEMA, &proxy, &proxy);
+        create_virtual_schema_with_password(
+            &mut conn,
+            &VsProps::new(VS_PROXY, UNITY_NAMESPACE)
+                .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
+                .with_catalog_kind("UNITY_CATALOG")
+                .with_catalog_conn_name("UNITY_PROXY_CREDS"),
+            UNITY_VIA_PROXY,
+            &CatalogConnectionPassword {
+                endpoint: STORAGE_VIA_PROXY.to_string(),
+                ..local_stack_connection_password()
+            },
+        );
+    });
+}
+
 /// Scenario: Catalog, storage, and STS requests go through the proxy
 #[test]
 fn unity_catalog_and_delta_log_reads_go_through_the_proxy() {
-    const ADAPTER_SCHEMA: &str = "LHVS_PROXY";
-    const VS_PROXY: &str = "UNITY_PROXY_VS";
-    setup();
-    stack::wait_for_proxy();
-    for host in ["unitycatalog-via-proxy", "seaweedfs-via-proxy"] {
-        stack::assert_resolves_only_through_proxy(host);
-    }
-    let proxy = [("HTTP_PROXY", stack::PROXY_URL_INTERNAL)];
-    let mut conn = exa_conn();
-    create_schema_and_scripts_with_env(&mut conn, ADAPTER_SCHEMA, &proxy, &proxy);
-    create_virtual_schema_with_password(
-        &mut conn,
-        &VsProps::new(VS_PROXY, UNITY_NAMESPACE)
-            .with_adapter_schema(ADAPTER_SCHEMA)
-            .with_catalog_kind("UNITY_CATALOG")
-            .with_catalog_conn_name("UNITY_PROXY_CREDS"),
-        "http://unitycatalog-via-proxy:8080",
-        &CatalogConnectionPassword {
-            endpoint: "http://seaweedfs-via-proxy:8333".to_string(),
-            ..local_stack_connection_password()
-        },
-    );
+    create_proxy_virtual_schema();
     assert_eq!(
-        conn.query_scalar_i64(&format!("SELECT COUNT(*) FROM {VS_PROXY}.TABLE_WITH_DV")),
+        exa_conn().query_scalar_i64(&format!("SELECT COUNT(*) FROM {VS_PROXY}.TABLE_WITH_DV")),
         8
     );
+}
+
+/// Scenario: Every reference to one table in a statement loads the table once and prunes it with its own filter
+#[test]
+fn unity_delta_self_join_loads_the_table_once() {
+    create_proxy_virtual_schema();
+    let mut conn = exa_conn();
+    let ids: Vec<i64> = conn
+        .query_columns(&format!("SELECT ID FROM {}", table_ref("MULTI_PART_STATS")))[0]
+        .iter()
+        .map(parse_int)
+        .collect();
+    let (lower, upper) = (2, 4);
+    let expected = ids
+        .iter()
+        .flat_map(|a| ids.iter().map(move |b| (*a, *b)))
+        .filter(|(a, b)| a == b && *a <= upper && *b >= lower)
+        .count() as i64;
+    assert!(
+        expected > 0,
+        "the filters must keep rows of the oracle: {ids:?}"
+    );
+    let sql = format!(
+        "SELECT COUNT(*) FROM {t} a JOIN {t} b ON a.ID = b.ID WHERE a.ID <= {upper} AND b.ID >= {lower}",
+        t = format!("{VS_PROXY}.MULTI_PART_STATS"),
+    );
+    let mut rows = 0;
+
+    let [table_gets, log_lists] = stack::count_proxy_requests(
+        [
+            format!("GET {UNITY_VIA_PROXY}/api/2.1/unity-catalog/tables/unity.delta_e2e.multi_part_stats ").as_str(),
+            format!("GET {STORAGE_VIA_PROXY}/warehouse?list-type=2&prefix=delta%2Fmulti-part-stats%2F_delta_log%2F").as_str(),
+        ],
+        || rows = conn.query_scalar_i64(&sql),
+    );
+
+    assert_eq!(rows, expected, "the self-join returns the oracle's rows");
+    assert_eq!(table_gets, 1, "one Unity table GET");
+    assert_eq!(log_lists, 1, "one _delta_log LIST");
 }

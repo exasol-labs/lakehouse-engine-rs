@@ -4,21 +4,23 @@
 
 use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
-use crate::common::seed::{build_seed_catalog, rest_replace_current_schema};
+use crate::common::seed::rest_replace_current_schema;
 use crate::common::stack::{
     CatalogConnectionPassword, PROXY_URL_INTERNAL, build_create_connection_sql,
     iceberg_catalog_url, iceberg_catalog_url_internal, local_stack_connection_password,
     wait_for_proxy,
 };
-use crate::fixtures::{stack, vs_table};
+use crate::fixtures::{
+    append_file, drop_table_if_exists, ensure_id_val_table, id_val_schema, load, seed_catalog,
+    stack, vs_table,
+};
 
-use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
+use arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use iceberg::spec::{
     NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Type, UnboundPartitionSpec,
 };
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
-use iceberg_catalog_rest::RestCatalog;
 use serde_json::Value as Json;
 
 use std::collections::HashMap;
@@ -51,26 +53,6 @@ fn create_virtual_schema(conn: &mut ExaConn, vs_name: &str, namespace: &str) {
     crate::common::e2e_harness::create_virtual_schema(conn, &refresh_props(vs_name, namespace));
 }
 
-pub(crate) fn seed_catalog(rt: &tokio::runtime::Runtime, label: &str) -> RestCatalog {
-    rt.block_on(build_seed_catalog(
-        &iceberg_catalog_url(),
-        "s3://warehouse/",
-        label,
-    ))
-    .expect("build seed catalog")
-}
-
-fn id_val_schema(schema_id: i32) -> IcebergSchema {
-    IcebergSchema::builder()
-        .with_schema_id(schema_id)
-        .with_fields(vec![
-            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-            NestedField::required(2, "val", Type::Primitive(PrimitiveType::Double)).into(),
-        ])
-        .build()
-        .expect("build id+val Iceberg schema")
-}
-
 /// Existing rows project `new_col` as NULL: no `initial-default` is set.
 fn id_val_schema_with_new_col(schema_id: i32) -> IcebergSchema {
     IcebergSchema::builder()
@@ -82,39 +64,6 @@ fn id_val_schema_with_new_col(schema_id: i32) -> IcebergSchema {
         ])
         .build()
         .expect("build id+val+new_col Iceberg schema")
-}
-
-fn id_val_batch(id: i64, val: f64) -> RecordBatch {
-    let schema = Arc::new(ArrowSchema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("val", DataType::Float64, false),
-    ]));
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int64Array::from(vec![id])),
-            Arc::new(Float64Array::from(vec![val])),
-        ],
-    )
-    .expect("id+val RecordBatch construction is infallible")
-}
-
-pub(crate) async fn ensure_id_val_table(
-    catalog: &impl Catalog,
-    namespace: &str,
-    table_name: &str,
-    id: i64,
-    val: f64,
-) {
-    crate::common::seed::create_and_append(
-        catalog,
-        namespace,
-        table_name,
-        id_val_schema(0),
-        std::iter::once(id_val_batch(id, val)),
-    )
-    .await
-    .unwrap_or_else(|e| panic!("seed {namespace}.{table_name}: {e}"));
 }
 
 /// Collision detection runs before any per-table resolution, so no data file is needed.
@@ -146,21 +95,6 @@ pub(crate) async fn create_empty_table(
         .properties(HashMap::new())
         .build();
     let _ = catalog.create_table(ns, creation).await;
-}
-
-/// The Docker warehouse persists across `make test-e2e` runs, so a prior run's tables can leak in.
-async fn drop_table_if_exists(catalog: &impl Catalog, ns: &NamespaceIdent, table_name: &str) {
-    let ident = TableIdent::new(ns.clone(), table_name.to_string());
-    if catalog
-        .table_exists(&ident)
-        .await
-        .unwrap_or_else(|e| panic!("check table {}.{table_name}: {e}", ns.join(".")))
-    {
-        catalog
-            .drop_table(&ident)
-            .await
-            .unwrap_or_else(|e| panic!("drop stale table {}.{table_name}: {e}", ns.join(".")));
-    }
 }
 
 /// A table an earlier run left corrupt fails the existence check, so a reset drops without asking.
@@ -805,17 +739,6 @@ fn long_batch(fields: &[NestedFieldRef], columns: &[&[Option<i64>]]) -> RecordBa
     RecordBatch::try_new(Arc::new(schema), arrays).expect("a valid long RecordBatch")
 }
 
-async fn load(catalog: &impl Catalog, namespace: &str, table: &str) -> iceberg::table::Table {
-    let ident = TableIdent::new(
-        NamespaceIdent::new(namespace.to_string()),
-        table.to_string(),
-    );
-    catalog
-        .load_table(&ident)
-        .await
-        .unwrap_or_else(|e| panic!("load {namespace}.{table}: {e}"))
-}
-
 /// Drops a prior run's table, then creates it with `fields` and one data file per batch.
 async fn fresh_table(
     catalog: &impl Catalog,
@@ -856,14 +779,6 @@ async fn evolve_schema(
     )
     .await
     .unwrap_or_else(|e| panic!("evolve {namespace}.{table}: {e}"));
-}
-
-/// Writes one data file under the table's current schema.
-async fn append_file(catalog: &impl Catalog, namespace: &str, table: &str, batch: RecordBatch) {
-    let loaded = load(catalog, namespace, table).await;
-    crate::common::seed::write_one_file_append(catalog, &loaded, table, [batch])
-        .await
-        .unwrap_or_else(|e| panic!("append to {namespace}.{table}: {e}"));
 }
 
 fn source_type(notes: &[(String, Json)], column: &str) -> Json {

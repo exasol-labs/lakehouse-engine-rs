@@ -1,21 +1,15 @@
-//! Table-format selection: the one site pairing a resolved catalog session with its table
-//! and answering the reader that plans the scan.
+//! Table formats: each format's loaded table, which every reference to the table prunes with its
+//! own filter and declaration, and the checks the formats share.
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 
 use exasol_udf_sdk::error::UdfError;
-use lakehouse_catalog::{
-    CatalogProps, CatalogSession, CatalogTable, ColumnSourceType, ConnectionCreds,
-    GlueCatalogSession, StorageBackend, TableFormat, UnityCatalogSession,
-};
-use object_store::ObjectStore;
+use lakehouse_catalog::{CatalogTable, ColumnSourceType, ConnectionCreds, StorageBackend};
 use serde_json::Value as Json;
 
 use crate::adapter::column_notes::{ColumnDeclaration, DeclaredSchema};
 use crate::adapter::tables::catalog_identifier_string;
-use crate::scan::ObjectLocation;
 use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry};
 use crate::types::mapping::arrow_type_from_tag;
 
@@ -34,11 +28,11 @@ mod parquet_format_reader;
 mod partition_predicate;
 mod unity_table_storage;
 
-use catalog_parquet_format_reader::{CatalogParquetFormatReader, ParquetFileSource};
-use delta_format_reader::DeltaFormatReader;
-use iceberg::{IcebergFormatReader, IcebergMetadataSource};
-use parquet_format_reader::ParquetFormatReader;
-use unity_table_storage::UnityTableStorage;
+pub(super) use catalog_parquet_format_reader::CatalogParquetTable;
+pub(super) use delta_format_reader::DeltaTable;
+pub(super) use iceberg::IcebergTable;
+pub(super) use parquet_format_reader::ParquetDirectoryTable;
+pub(super) use unity_table_storage::UnityTableStorage;
 
 #[cfg(test)]
 #[path = "format_tests.rs"]
@@ -117,17 +111,17 @@ pub struct ResolvedScan {
 }
 
 impl ResolvedScan {
-    /// Plans `reader`'s files against `declared`, the table's parsed column notes.
+    /// Prunes `table`'s files against `declared`, the reference's parsed column notes.
     pub async fn resolve(
-        reader: &dyn FormatReader,
+        table: &dyn LoadedTable,
         declared: DeclaredSchema,
         filter_json: Option<&Json>,
     ) -> Result<Self, UdfError> {
-        let planned = reader.resolve_scan(&declared, filter_json).await?;
+        let planned = table.prune(&declared, filter_json).await?;
         Ok(Self::new(declared, planned))
     }
 
-    /// The schema half comes from the column notes alone, so no reader can substitute its own.
+    /// The schema half comes from the column notes alone, so no table can substitute its own.
     fn new(declared: DeclaredSchema, planned: PlannedFiles) -> Self {
         Self {
             files: planned.files,
@@ -141,7 +135,7 @@ impl ResolvedScan {
     }
 }
 
-/// What a format reader resolves per query.
+/// What one reference's prune resolves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedFiles {
     pub files: Vec<FileEntry>,
@@ -153,38 +147,17 @@ pub struct PlannedFiles {
     pub name_mapping: Vec<NameMappingEntry>,
 }
 
-/// Each implementation owns its whole file resolution (catalog request, credential, file
-/// discovery) because formats need different inputs to reach their file list; the schema is
-/// the declaration every reader receives. Returns a boxed future because `async fn` in a trait
-/// is not dyn-compatible.
-pub trait FormatReader: Send + Sync {
-    /// `None` disables format-level pruning.
-    fn resolve_scan<'a>(
+/// A table's filter-independent state (catalog answer, credential, metadata, log, or listing),
+/// opened once so that every reference to the table prunes the same state with its own filter
+/// and declaration. Owned, so it outlives the session that opened it. Returns a boxed future
+/// because `async fn` in a trait is not dyn-compatible.
+pub trait LoadedTable: Send + Sync {
+    /// `None` disables format-level pruning. Fails a declaration that disagrees with the table.
+    fn prune<'a>(
         &'a self,
         declared: &'a DeclaredSchema,
         filter_json: Option<&'a Json>,
     ) -> Pin<Box<dyn Future<Output = Result<PlannedFiles, UdfError>> + Send + 'a>>;
-}
-
-/// Deliberately not the catalog kind: it carries an already-resolved session (and, for
-/// Unity and Glue, the loaded table), so format selection needs no second kind match site.
-pub enum ScanSource<'a> {
-    Iceberg {
-        session: &'a CatalogSession,
-        catalog_props: &'a CatalogProps,
-    },
-    Unity {
-        session: &'a UnityCatalogSession,
-        table: &'a CatalogTable,
-    },
-    Glue {
-        session: &'a GlueCatalogSession,
-        table: &'a CatalogTable,
-    },
-    DirectParquet {
-        store: &'a Arc<dyn ObjectStore>,
-        table_root: &'a ObjectLocation,
-    },
 }
 
 /// Under vending, `allow_http` is still the operator's consent gate for plaintext transport.
@@ -193,64 +166,4 @@ pub struct ConnectionStorage<'a> {
     pub storage: &'a StorageBackend,
     pub creds: &'a ConnectionCreds,
     pub allow_http: bool,
-}
-
-/// The one site matching a [`ScanSource`], so a new format or catalog kind is a compile
-/// error here. A catalog's format tag is checked here because the single-table load applies
-/// no listing filter.
-pub fn format_reader<'a>(
-    source: ScanSource<'a>,
-    connection: &ConnectionStorage<'a>,
-) -> Result<Box<dyn FormatReader + 'a>, UdfError> {
-    match source {
-        ScanSource::Iceberg {
-            session,
-            catalog_props,
-        } => Ok(Box::new(IcebergFormatReader {
-            metadata: IcebergMetadataSource::RestLoadTable {
-                session,
-                catalog_props,
-            },
-            connection: *connection,
-        })),
-        ScanSource::Unity { session, table } => match table.format {
-            TableFormat::Delta => Ok(Box::new(DeltaFormatReader {
-                storage: UnityTableStorage::new(session, table, connection),
-            })),
-            TableFormat::Parquet => Ok(Box::new(CatalogParquetFormatReader {
-                files: ParquetFileSource::TableDirectory(UnityTableStorage::new(
-                    session, table, connection,
-                )),
-            })),
-            TableFormat::Iceberg => Err(UdfError::User(format!(
-                "Unity Catalog table {} reports the {:?} table format, which no Unity Catalog \
-                 reader plans",
-                catalog_identifier_string(&table.ident),
-                table.format
-            ))),
-        },
-        ScanSource::Glue { session, table } => match table.format {
-            TableFormat::Iceberg => Ok(Box::new(IcebergFormatReader {
-                metadata: IcebergMetadataSource::MetadataFile { table },
-                connection: *connection,
-            })),
-            TableFormat::Parquet => Ok(Box::new(CatalogParquetFormatReader {
-                files: ParquetFileSource::GluePartitions {
-                    session,
-                    storage: connection.storage,
-                    table,
-                },
-            })),
-            TableFormat::Delta => Err(UdfError::User(format!(
-                "Glue table {} reports the {:?} table format, which no Glue reader plans",
-                catalog_identifier_string(&table.ident),
-                table.format
-            ))),
-        },
-        ScanSource::DirectParquet { store, table_root } => Ok(Box::new(ParquetFormatReader {
-            store,
-            table_root,
-            storage: connection.storage,
-        })),
-    }
 }

@@ -1,5 +1,6 @@
 use super::test_support::*;
 use super::*;
+use crate::adapter::ResolvedConnectionConfig;
 use crate::scan::spec::{
     ColumnRef, CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage,
     StorageProps,
@@ -1727,20 +1728,16 @@ async fn malformed_table_ident_fails_before_any_catalog_contact() {
     // An empty `columns` array would fail in `project_columns` first, masking the ordering.
     let request = nq4_request();
 
-    let conn = ResolvedConnectionConfig {
-        catalog_uri: "http://127.0.0.1:1".to_string(),
-        storage: sample_storage(),
-        creds,
+    let connection = ResolvedConnectionConfig {
         allow_http: false,
-        catalog_kind: CatalogKind::IcebergRest,
-        connection_name: TEST_CONNECTION_NAME.to_string(),
-        sealed_storage_key: Some(test_sealing_key()),
-        permission_check: crate::adapter::permission::PermissionCheck::Off,
+        ..resolved_connection(
+            CatalogKind::IcebergRest,
+            "http://127.0.0.1:1",
+            sample_storage(),
+            creds,
+        )
     };
-    let result = handle_pushdown(
-        &request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
-    )
-    .await;
+    let result = plan_pushdown(&request, connection, &catalog.table, 1024).await;
 
     let err = result.expect_err("a malformed table identifier must fail");
     let message = err.to_string();
@@ -1763,20 +1760,9 @@ async fn seam_handle_pushdown(
     catalog_kind: CatalogKind,
     creds: &ConnectionCreds,
 ) -> Result<Json, UdfError> {
-    let conn = ResolvedConnectionConfig {
-        catalog_uri: catalog_uri.to_string(),
-        storage: sample_storage(),
-        creds: creds.clone(),
-        allow_http: true,
-        catalog_kind,
-        connection_name: TEST_CONNECTION_NAME.to_string(),
-        sealed_storage_key: Some(test_sealing_key()),
-        permission_check: crate::adapter::permission::PermissionCheck::Off,
-    };
-    handle_pushdown(
-        request, &conn, catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
-    )
-    .await
+    let connection =
+        resolved_connection(catalog_kind, catalog_uri, sample_storage(), creds.clone());
+    plan_pushdown(request, connection, &catalog.table, 1024).await
 }
 
 /// Scenario: Every pushdown request shape resolves through the one format-reader seam
@@ -1837,66 +1823,6 @@ async fn every_request_shape_resolves_through_the_format_reader_seam() {
     assert!(
         err.to_string().contains("cat.sch.orders"),
         "the Delta reader's own plan-time error must name the table: {err}"
-    );
-}
-
-/// Scenario: One catalog session per request serves every table the request resolves
-#[tokio::test]
-async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
-    let iceberg = iceberg_catalog().await;
-    let creds = unauthenticated_creds();
-    let catalog_props = CatalogProps {
-        warehouse: "wh".into(),
-        table: "unused-on-the-join-path".into(),
-    };
-
-    let request = with_iceberg_notes(with_identifier_notes(
-        serde_json::json!({
-            "involvedTables": [
-                {
-                    "name": "CUSTOMER",
-                    "columns": [
-                        {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                    ],
-                },
-                {
-                    "name": "ORDERS",
-                    "columns": [
-                        {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                    ],
-                },
-            ],
-            "pushdownRequest": {
-                "type": "select",
-                "from": customer_orders_join(),
-                "selectList": [
-                    table_col("CUSTOMER", "C_CUSTKEY"),
-                    table_col("ORDERS", "O_CUSTKEY"),
-                ],
-            },
-            "schemaMetadataInfo": {"properties": {}},
-        }),
-        &[("CUSTOMER", "db.customer"), ("ORDERS", "db.orders")],
-    ));
-
-    seam_handle_pushdown(
-        &request,
-        &iceberg.uri,
-        &catalog_props,
-        CatalogKind::IcebergRest,
-        &creds,
-    )
-    .await
-    .expect("a two-leg join over snapshotless Iceberg tables resolves");
-
-    assert_eq!(
-        iceberg.targets(),
-        vec![
-            ICEBERG_CONFIG_TARGET.to_string(),
-            "/v1/namespaces/db/tables/customer?snapshots=refs".to_string(),
-            "/v1/namespaces/db/tables/orders?snapshots=refs".to_string(),
-        ],
-        "one /v1/config for the whole request, then exactly one loadTable per leg"
     );
 }
 

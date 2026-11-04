@@ -3,10 +3,8 @@
 
 use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
-use crate::fixtures::{stack, vs_table};
-use crate::refresh::{
-    create_empty_table, ensure_id_val_table, long_field, schema_of, seed_catalog,
-};
+use crate::fixtures::{ensure_id_val_table, seed_catalog, stack, vs_table};
+use crate::refresh::{create_empty_table, long_field, schema_of};
 
 use iceberg_catalog_rest::RestCatalog;
 

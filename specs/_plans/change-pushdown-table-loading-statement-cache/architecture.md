@@ -1,0 +1,98 @@
+# Architecture Delta: change-pushdown-table-loading-statement-cache
+<!-- BASE: 3b2bd4cc2cd6b2fdfcfbc7a7c18d67c3b89887b8 -->
+
+<!-- DELTA:CHANGED -->
+## Overview
+
+```
+                      Exasol cluster (one .so in the Rust SLC)
+ ┌──────────────┐   pushdown JSON   ┌────────────────────────────────────────────┐
+ │ Exasol SQL   │──────────────────▶│ vs-adapter                                 │
+ │ (user query) │◀──────────────────│  pushdown-planner ─▶ format-readers        │
+ └──────┬───────┘   dispatch SQL    │  sharding           lakehouse-catalog ─────┼──▶ Iceberg REST / Unity / Glue / STS
+        │                           │  vs-expression                             │
+        │ runs dispatch SQL         └────────────────────────────────────────────┘
+        ▼
+ ┌────────────────────────────┐  GROUP BY shard_key   ┌──────────────────────────────────┐
+ │ LAKEHOUSE_DISTRIBUTE_FILES │──────────────────────▶│ LAKEHOUSE_SCAN x G shards        │
+ │ (Lua SET passthrough)      │                       │  datafusion-scan ─▶ object store ─┼──▶ S3 / ADLS Gen2 Parquet
+ └────────────────────────────┘                       └───────────────┬──────────────────┘
+                                                                      │ Arrow C Data or Value rows
+                                                                      ▼
+                                                      Exasol merge (final agg, ORDER BY, LIMIT) ─▶ result
+```
+
+- Layered and stateless across statements, with two levels of parallelism: the Exasol cluster spreads G file shards across nodes, and DataFusion executes each shard inside one UDF invocation.
+- The VS adapter loads each table's metadata once per statement and prunes the file list per table reference. Each scan UDF invocation receives an explicit file list and discovers no files itself.
+- No state survives statement completion. Exasol runs one adapter VM per statement and virtual schema, and the adapter keeps a virtual schema's catalog client and loaded tables in process-static state for that VM's pushdown requests. The scan UDF builds its Tokio runtime and DataFusion session per invocation and never caches them.
+<!-- /DELTA:CHANGED -->
+
+<!-- DELTA:CHANGED -->
+## Components
+
+- udf-entry-points (crates/lakehouse-engine/src/lib.rs): exports the three UDF entry points of the single `.so` (VS adapter, `LAKEHOUSE_SCAN`, `LAKEHOUSE_VERSION`) | owns: engine version string | depends on: vs-adapter, datafusion-scan
+- vs-adapter (crates/lakehouse-engine/src/adapter/): answers Exasol Virtual Schema requests, reads the CATALOG_CONNECTION, builds every request's catalog client at one catalog-kind match and loads each pushdown table through that client, lists the catalog tables the table filter exposes into virtual tables with one identifier note per table and one source note per column, answers a `REFRESH TABLES` by listing catalog identifiers and loading only the requested tables the table filter exposes, keeps one statement state per virtual schema name for the pushdown requests of one statement, and routes pushdown requests | owns: schema-level adapterNotes and their format (SKIPPED_TABLES, tuning values), written and read in adapter/mod.rs; the statement state (Tokio runtime, resolved CONNECTION, catalog client, permission-checked tables, and each table's loaded state); the engine-side scan load that each catalog kind's client implements | depends on: vs-properties, table-filter, lakehouse-catalog, pushdown-planner, table-identity, column-notes, type-mapping, sealed-storage
+- vs-properties (crates/lakehouse-engine/src/adapter/properties.rs): declares every virtual schema property name and the value rule of each tuning property, applies the table-filter value rule to `TABLE_INCLUDE` and `TABLE_EXCLUDE`, rejects unknown names and invalid values in one error for createVirtualSchema, refresh, and setProperties, and parses each tuning value into a fixed-width typed value and the two pattern lists into one table filter; it parses properties only, never adapterNotes | owns: VS property catalog (names and tuning value rules) | depends on: table-filter
+- table-filter (crates/lakehouse-engine/src/adapter/table_filter.rs): parses the `TABLE_INCLUDE` and `TABLE_EXCLUDE` glob pattern lists and decides whether a virtual table name is exposed, with exclude winning over include | owns: table pattern syntax and the exposure rule | depends on: none
+- pushdown-planner (crates/lakehouse-engine/src/adapter/pushdown/): classifies the pushdown request shape (row scan, top-N, single-group aggregate, grouped aggregate, COUNT DISTINCT, join, fallback wrapper), reads each involved table's catalog identifier from its identifier note and its declared schema from its column notes, and renders the dispatch SQL that carries one scan spec per shard; it builds one per-column type map per involved table when it resolves the table, and every type check, binary comparison, and projection reads that map | owns: dispatch SQL, per-shard scan specs, the per-column type map (each column's Exasol type and raw-byte layout, keyed by relation alias and column) | depends on: format-readers, table-identity, column-notes, sharding, type-mapping, vs-expression, scan-spec, sealed-storage, lakehouse-catalog
+- format-readers (crates/lakehouse-engine/src/adapter/pushdown/format/): declares each catalog-listed table's columns at createVirtualSchema from the neutral table metadata the catalog client returned, and at pushdown opens one table's filter-independent state (Iceberg metadata, Delta snapshot, Glue partition list, or Parquet directory listing) for Iceberg, Delta, catalog Parquet, and direct-storage Parquet tables when a catalog client loads the table, then prunes its file list per reference with the reference's filter against the declared schema, failing a query whose declaration disagrees with the table's current schema or log | owns: none | depends on: column-notes, lakehouse-catalog, type-mapping
+- table-identity (crates/lakehouse-engine/src/adapter/table_identity.rs): encodes each virtual table's identifier note, a table-level adapterNotes JSON object whose `name` member holds the catalog identifier, and reads the identifier back from an involved table at pushdown | owns: table identifier note format | depends on: lakehouse-catalog
+- column-notes (crates/lakehouse-engine/src/adapter/column_notes.rs): encodes, size-checks, and parses the per-column declaration notes, and holds the refused-column type and the refusal helpers the declaration builders share | owns: column note format | depends on: scan-spec
+- sharding (crates/lakehouse-engine/src/adapter/sharding.rs): computes the shard count G and partitions the file list into G byte-balanced shards | owns: none | depends on: scan-spec
+- scan-spec (crates/lakehouse-engine/src/scan/spec.rs): defines the format-neutral JSON wire format between the adapter and the scan UDF (`CommonScanSpec`, `FileEntry`, `LogicalField`, `ScanStorage`) | owns: scan spec wire format | depends on: lakehouse-catalog
+- sealed-storage (crates/lakehouse-engine/src/scan/sealed.rs): encrypts storage credentials into the scan spec with AES-GCM under a key derived by HKDF-SHA256 from the CONNECTION password, and decrypts them in the scan UDF | owns: sealed storage envelope format | depends on: none
+- datafusion-scan (crates/lakehouse-engine/src/scan/): runs one shard per invocation as a raw scan, a partial aggregate, or a broadcast join scan, applies Iceberg positional deletes and Iceberg and Delta deletion vectors, and emits results batch by batch | owns: per-invocation Tokio runtime, DataFusion session, memory pool | depends on: scan-spec, sealed-storage, scan-object-store, type-mapping, vs-expression
+- scan-object-store (crates/lakehouse-engine/src/scan/object_store.rs): builds S3 or ADLS Gen2 object stores with a connection budget and an admission limit, and routes the two join sides by path prefix | owns: per-invocation HTTP connection pool | depends on: lakehouse-catalog
+- type-mapping (crates/lakehouse-engine/src/types/): defines the Exasol SQL type, renders it as SQL text and as VS `dataType` JSON, reads it from VS `dataType` JSON, maps Arrow, Iceberg, Delta, and Hive types to it, and applies type widening rules | owns: the Exasol SQL type and its SQL and `dataType` JSON renderings | depends on: none
+- lakehouse-catalog (crates/lakehouse-catalog/): implements `CatalogClient` for Iceberg REST, Unity Catalog, and AWS Glue (a full listing that drops the identifiers a caller-supplied predicate rejects before it loads any table, an identifier-only listing, and a load of listed tables that classifies each table as the full listing does), gives the Unity Catalog and Glue sessions a single-table load outside that trait, with OAuth2, bearer, and SigV4 auth, STS role assumption, vended-storage resolution, and credential redaction; its neutral table carries the catalog's table properties verbatim and its neutral column an opaque engine-encoded declaration slot, and it interprets neither | owns: catalog sessions, whose lifetime the adapter decides | depends on: none
+- vs-expression (crates/vs-expression/): translates VS expression JSON into DataFusion SQL and Exasol SQL fragments, and parses and rewrites the `column` nodes of a pushdown request | owns: none | depends on: none
+- distribute-files (deploy/scripts/install.sh): defines the Lua SET script `LAKEHOUSE_DISTRIBUTE_FILES`, which re-emits per-shard file-list rows so `GROUP BY shard_key` spreads them across nodes | owns: none | depends on: none
+- installer (deploy/scripts/install.sh): downloads the engine and SLC release assets, uploads them to BucketFS with exapump, creates the scripts, and runs a version and fingerprint smoke test | owns: none | depends on: distribute-files
+<!-- /DELTA:CHANGED -->
+
+<!-- DELTA:CHANGED -->
+## Data Flow
+
+- CREATE or REFRESH VIRTUAL SCHEMA -> vs-adapter -> lakehouse-catalog -> catalog service: table listing returns as virtual table definitions, one identifier note per table holding its catalog identifier, and one column note per column holding the declared source shape
+- REFRESH TABLES -> vs-adapter -> lakehouse-catalog -> catalog service: the namespace's catalog identifiers are listed without loading any table, only the identifiers whose Exasol name is requested are loaded and collision-checked, the response carries only the requested tables, and Exasol keeps every other virtual table with its notes
+- user query -> Exasol -> vs-adapter: one pushdown request JSON per pushed-down query block, with projection, filter, aggregates, ORDER BY, LIMIT, join tree, and each involved table's identifier note and column notes; every request of one statement on one virtual schema reaches the same adapter VM
+- vs-adapter -> catalog client -> format-readers -> lakehouse-catalog and object storage: the virtual schema's catalog client loads a table once per statement and opens its snapshot or file listing, and each table reference prunes the file list with its own filter against the declared schema the column notes carry; no reader derives a schema
+- format-readers -> sharding -> pushdown-planner: the file list becomes G byte-balanced shards, each serialized as `common` and `files` JSON strings in the dispatch SQL
+- dispatch SQL -> LAKEHOUSE_DISTRIBUTE_FILES -> GROUP BY shard_key -> LAKEHOUSE_SCAN: Exasol runs one scan VM per node, which scans that node's shard rows one after another
+- LAKEHOUSE_SCAN -> datafusion-scan -> scan-object-store -> object storage: Parquet byte ranges stream into one DataFusion plan per invocation
+- datafusion-scan -> Exasol: raw and join rows leave through the Arrow C Data Interface via `ctx.emit_batch`, partial aggregates leave as SDK `Value` rows via `ctx.emit`
+- Exasol -> result: the dispatch SQL wrapper merges partial aggregates and applies the final ORDER BY and LIMIT
+<!-- /DELTA:CHANGED -->
+
+<!-- DELTA:CHANGED -->
+## Constraints
+
+- The toolchain is pinned in `rust-toolchain.toml`, with edition 2024. Every dependency version is pinned in the workspace manifest, not in the specs.
+- The release `.so` builds only in the Makefile's `UDF_BUILDER_IMAGE`, whose rustc and glibc match the SLC, because the SLC rejects a `.so` whose SDK fingerprint (`exasol-udf-sdk` version and rustc hash) differs from its own.
+- `exasol-udf-sdk` and `exasol-udf-macros` are pinned in the workspace manifest to the SLC's own version.
+- `arrow` and `parquet` stay on the Arrow major that `datafusion` and the SDK depend on, not on the major of the `datafusion` or SDK package itself.
+- Arrow types never cross the `.so` boundary. Only SDK `Value`s or the Arrow C Data Interface structs from `ctx.emit_batch` cross it.
+- In `lakehouse-engine`, an Exasol SQL type travels as type-mapping's Exasol type, never as a string. Each input edge (VS `dataType` JSON, Iceberg, Delta, Hive, and Arrow types) reads it once, and only SQL text generation and the VS `dataType` JSON output render it. `vs-expression` renders the target of a translated `CAST` expression from its `dataType` JSON on its own.
+- `lakehouse-catalog` never depends on `lakehouse-engine`. Its manifest declares no `arrow`, `parquet`, `datafusion`, or `object_store` dependency, and it names no scan-spec type (`FileEntry`, `LogicalField`, `DeleteMechanism`, `CommonScanSpec`). A neutral catalog column carries an Arrow type only as the engine's type-tag string.
+- The engine reads and writes a `column` node's `name`, `tableName`, and `tableAlias` only through `vs-expression`'s column node type.
+- `lakehouse-catalog` declares the shared credential types (`ConnectionCreds`, `StorageProps`, `CatalogProps`, `StorageBackend`) and the credential redaction functions once. The engine re-exports them and declares no copy. Reading and parsing the Exasol CONNECTION object stays in the engine.
+- The engine enumerates and declares catalog tables through the `CatalogClient` trait and its neutral table and column types. `CatalogClient` has no single-table load. Each catalog kind's client loads a table for pushdown through its one scan load, declared by an engine-side extension of that trait, so `lakehouse-catalog` gains no file-planning type. The vs-adapter's one catalog-kind match is the only site that names the kind to build a client or load a table, and a scan load matches only the loaded table's format tag. In `lakehouse-catalog`, auth strategies, HTTP and signing helpers, and vended-resolution steps stay crate-private, and no AWS SDK type crosses the crate boundary.
+- Each catalog kind's identifier-only listing returns every identifier its full listing would return or skip, in listing order, without loading table metadata. Its load of listed tables admits or skips each given table exactly as the full listing does and loads no other table.
+- The Makefile's `VS_SRCS` lists every crate's sources and manifest, so a change in `lakehouse-catalog` or `vs-expression` rebuilds the `.so` before an E2E run.
+- The scan UDF keeps no cross-call state and builds its Tokio runtime per call. The adapter keeps cross-call state only for the pushdown requests of one statement, keyed by the virtual schema name: the Tokio runtime, the resolved CONNECTION, the catalog client, the permission-checked tables, and each table's loaded, unpruned state. It never keeps a pruned file list, a result, or an error.
+- The engine owns no persisted metadata. Exasol stores the schema-level adapterNotes values (`SKIPPED_TABLES`, tuning values), the table identifier notes, and the column notes between CREATE and pushdown.
+- A table's declared schema is decided at CREATE, REFRESH, or SET and read from its column notes at pushdown. No format reader derives a logical schema, a partition column, or a refusal at pushdown.
+- The adapter loads each table's metadata once per statement and prunes the file list per table reference. The scan UDF never discovers files.
+- Each node scans only its assigned files, with no overlap between shards.
+- The shard count is G = node count × `PARALLELISM_FACTOR` (default 1), clamped to at least 1 and at most min(file count, 300).
+- The DataFusion memory pool is max((memory limit − 200 MB overhead) × 0.6, 256 MiB), or 1 GiB when the limit is unknown.
+- The scan spills to `/tmp` when `/tmp` is a writable non-tmpfs disk. Otherwise it returns a `ResourcesExhausted` error past the pool budget.
+- The scan streams one `RecordBatch` at a time and never collects the full result.
+- Errors never contain credentials. Storage credentials reach the scan UDF only as a CONNECTION name or a sealed envelope.
+- STS AssumeRole and Glue operations time out after 30 seconds.
+- Every Iceberg REST, Lakekeeper, Unity Catalog, and OAuth2 token request goes through the one crate-private catalog HTTP client of `lakehouse-catalog`. It ends an attempt that stays silent for 10 seconds, retries only a transient failure, up to 5 attempts, and starts no retry that could wait for its answer past 30 seconds after the first attempt. It reads an answer body for as long as the body keeps arriving.
+- Every outbound HTTP client of the adapter and the scan UDF honors `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY` from the process environment, which a script's `%env` lines set. A client that ignores them is a defect.
+- Exasol's own dispatcher throttles concurrent UDF VMs at 80% of the per-process memory limit.
+- DSNs in the Makefile, bench scripts, and installer include `validateservercertificate=0`.
+- The engine must be faster than single-node DataFusion, scale with added Exasol nodes, keep duplicate scanning minimal, and keep metadata overhead acceptable.
+<!-- /DELTA:CHANGED -->

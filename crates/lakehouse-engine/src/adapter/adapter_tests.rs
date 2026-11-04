@@ -4,7 +4,7 @@ use crate::adapter::properties::{
     PROP_INSTANCE_OVERHEAD_MB, PROP_JOIN_BROADCAST_MAX_BYTES, PROP_MEMORY_POOL_FRACTION,
     PROP_PARALLELISM_FACTOR, PROP_S3_MAX_CONNECTIONS,
 };
-use crate::adapter::pushdown::test_support::{customer_orders_join, table_col};
+use crate::adapter::pushdown::test_support::{customer_orders_join, statement_states, table_col};
 use crate::adapter::pushdown::test_support::{named_table, with_identifier_notes};
 use exasol_udf_sdk::test_support::{DefaultsCtx, TestContext};
 use lakehouse_catalog::{CatalogTableIdent, SkipReason, TableFormat};
@@ -18,7 +18,7 @@ pub(super) mod recording_store;
 #[test]
 fn dispatch_get_capabilities() {
     let req = serde_json::json!({"type": "getCapabilities"});
-    let resp = dispatch(&mut DefaultsCtx, &req).unwrap();
+    let resp = dispatch(&mut DefaultsCtx, &req, &statement_states()).unwrap();
     assert_eq!(resp["type"].as_str().unwrap(), "getCapabilities");
     let caps = resp["capabilities"].as_array().unwrap();
     assert!(!caps.is_empty());
@@ -27,15 +27,33 @@ fn dispatch_get_capabilities() {
 #[test]
 fn dispatch_drop_returns_correct_type() {
     let req = serde_json::json!({"type": "dropVirtualSchema"});
-    let resp = dispatch(&mut DefaultsCtx, &req).unwrap();
+    let resp = dispatch(&mut DefaultsCtx, &req, &statement_states()).unwrap();
     assert_eq!(resp["type"].as_str().unwrap(), "dropVirtualSchema");
 }
 
 #[test]
 fn dispatch_unknown_type_errors() {
     let req = serde_json::json!({"type": "unsupported"});
-    let err = dispatch(&mut DefaultsCtx, &req).unwrap_err();
+    let err = dispatch(&mut DefaultsCtx, &req, &statement_states()).unwrap_err();
     assert!(err.to_string().contains("unsupported"));
+}
+
+#[test]
+fn only_a_nonempty_virtual_schema_name_keys_the_statement_state() {
+    for (request, expected) in [
+        (
+            serde_json::json!({"schemaMetadataInfo": {"name": "VS"}}),
+            Some("VS"),
+        ),
+        (
+            serde_json::json!({"schemaMetadataInfo": {"name": ""}}),
+            None,
+        ),
+        (serde_json::json!({"schemaMetadataInfo": {}}), None),
+        (serde_json::json!({}), None),
+    ] {
+        assert_eq!(virtual_schema_name(&request), expected, "{request}");
+    }
 }
 
 #[test]
@@ -45,7 +63,7 @@ fn refresh_and_set_properties_dispatched_not_unsupported() {
             "type": req_type,
             "properties": { PROP_CATALOG_CONNECTION: "no_such_conn" },
         });
-        let err = dispatch(&mut DefaultsCtx, &req)
+        let err = dispatch(&mut DefaultsCtx, &req, &statement_states())
             .expect_err("no live catalog is available in a unit test");
         assert!(
             !err.to_string().contains("unsupported"),
@@ -85,8 +103,12 @@ fn an_unknown_property_name_fails_every_schema_request_before_the_connection_is_
             }),
         );
 
-        let err = dispatch(&mut TestContext::scalar(vec![]), &request)
-            .expect_err("an unknown property name must fail the request");
+        let err = dispatch(
+            &mut TestContext::scalar(vec![]),
+            &request,
+            &statement_states(),
+        )
+        .expect_err("an unknown property name must fail the request");
 
         let message = err.to_string();
         assert!(
@@ -107,9 +129,13 @@ fn a_misspelled_required_property_is_reported_instead_of_the_missing_one() {
         serde_json::json!({ "CATALOG_CONECTION": "MY_CONN", PROP_NAMESPACE: "sales" }),
     );
 
-    let message = dispatch(&mut TestContext::scalar(vec![]), &request)
-        .expect_err("a misspelled CATALOG_CONNECTION must fail")
-        .to_string();
+    let message = dispatch(
+        &mut TestContext::scalar(vec![]),
+        &request,
+        &statement_states(),
+    )
+    .expect_err("a misspelled CATALOG_CONNECTION must fail")
+    .to_string();
 
     assert!(
         message
@@ -133,9 +159,13 @@ fn an_invalid_tuning_value_fails_every_schema_request_before_the_connection_is_r
             }),
         );
 
-        let message = dispatch(&mut TestContext::scalar(vec![]), &request)
-            .expect_err("an invalid tuning value must fail the request")
-            .to_string();
+        let message = dispatch(
+            &mut TestContext::scalar(vec![]),
+            &request,
+            &statement_states(),
+        )
+        .expect_err("an invalid tuning value must fail the request")
+        .to_string();
 
         assert!(
             message.contains(
@@ -154,9 +184,13 @@ fn a_set_properties_null_unsets_an_invalid_value_before_the_check() {
         "schemaMetadataInfo": { "properties": { PROP_DF_BATCH_SIZE: "0", "PV_MADE_UP": "x" } },
     });
 
-    let message = dispatch(&mut TestContext::scalar(vec![]), &request)
-        .expect_err("the stray name is still unknown")
-        .to_string();
+    let message = dispatch(
+        &mut TestContext::scalar(vec![]),
+        &request,
+        &statement_states(),
+    )
+    .expect_err("the stray name is still unknown")
+    .to_string();
 
     assert!(
         message.contains("unknown property 'PV_MADE_UP'"),
@@ -181,9 +215,13 @@ fn a_pushdown_never_runs_the_property_check() {
         },
     });
 
-    let message = dispatch(&mut TestContext::scalar(vec![]), &request)
-        .expect_err("the CONNECTION does not exist")
-        .to_string();
+    let message = dispatch(
+        &mut TestContext::scalar(vec![]),
+        &request,
+        &statement_states(),
+    )
+    .expect_err("the CONNECTION does not exist")
+    .to_string();
 
     assert!(
         !message.contains("invalid virtual schema properties"),
@@ -299,6 +337,7 @@ fn set_properties_null_unset_required_property_errors_not_panic() {
             password_connection("http://catalog.example.com", s3_style_password()),
         ),
         &req,
+        &statement_states(),
     )
     .expect_err("null-unsetting a required property must error, not succeed");
 
@@ -321,6 +360,7 @@ fn namespace_is_required_for_catalog_kinds_only() {
             password_connection("http://catalog.example.com", s3_style_password()),
         ),
         &catalog_req,
+        &statement_states(),
     )
     .expect_err("ICEBERG_REST still requires NAMESPACE");
     let expected = format!("property '{PROP_NAMESPACE}' is required");
@@ -350,6 +390,7 @@ fn namespace_is_required_for_catalog_kinds_only() {
             password_connection("s3://bucket/lake", direct_password),
         ),
         &direct_req,
+        &statement_states(),
     )
     .expect_err("no live object store is reachable in a unit test");
     assert!(
@@ -389,6 +430,7 @@ fn unity_kind_pushdown_routes_to_the_unity_catalog_loader() {
             password_connection(CLOSED_PORT_ADDRESS, s3_style_password()),
         ),
         &req,
+        &statement_states(),
     )
     .expect_err("no live Unity Catalog is reachable in a unit test");
 
@@ -1255,13 +1297,7 @@ fn resolve_config_over(
         .enable_all()
         .build()
         .expect("build the request runtime");
-    resolve_connection_config(
-        &ctx,
-        props,
-        &PermissionSettings::Off,
-        PermissionCheck::Off,
-        &rt,
-    )
+    resolve_connection_config(&ctx, props, &PermissionSettings::Off, &rt)
 }
 
 #[test]
@@ -1509,12 +1545,15 @@ fn assert_no_credential_value(message: &str) {
     }
 }
 
-/// Scenario: The adapter assumes the role once per request and substitutes the session
 #[test]
 fn assume_role_sends_one_sts_request_per_create_and_per_join_pushdown() {
     let create = StsAndCatalog::start((200, ASSUME_ROLE_RESPONSE), (200, EMPTY_LISTING));
-    dispatch(&mut sigv4_role_connection(&create), &role_create_request())
-        .expect("a create over an empty namespace succeeds through the session");
+    dispatch(
+        &mut sigv4_role_connection(&create),
+        &role_create_request(),
+        &statement_states(),
+    )
+    .expect("a create over an empty namespace succeeds through the session");
     assert_eq!(create.sts_requests(), 1, "{:?}", create.heads());
     assert!(
         is_assume_role(&create.heads()[0]),
@@ -1526,6 +1565,7 @@ fn assume_role_sends_one_sts_request_per_create_and_per_join_pushdown() {
     let err = dispatch(
         &mut sigv4_role_connection(&join),
         &role_join_pushdown_request(),
+        &statement_states(),
     )
     .expect_err("an unavailable catalog fails the join pushdown");
     assert_eq!(
@@ -1545,14 +1585,19 @@ fn assume_role_sends_one_sts_request_per_create_and_per_join_pushdown() {
 #[test]
 fn a_connection_without_a_role_sends_no_sts_request() {
     let create_stub = StsAndCatalog::start((200, ASSUME_ROLE_RESPONSE), (200, EMPTY_LISTING));
-    dispatch(&mut sigv4_connection(&create_stub), &role_create_request())
-        .expect("a no-role create over an empty namespace succeeds");
+    dispatch(
+        &mut sigv4_connection(&create_stub),
+        &role_create_request(),
+        &statement_states(),
+    )
+    .expect("a no-role create over an empty namespace succeeds");
     assert_signed_by_the_stated_key_pair(&create_stub);
 
     let join_stub = StsAndCatalog::start((200, ASSUME_ROLE_RESPONSE), (503, "{}"));
     dispatch(
         &mut sigv4_connection(&join_stub),
         &role_join_pushdown_request(),
+        &statement_states(),
     )
     .expect_err("an unavailable catalog fails the join pushdown");
     assert_signed_by_the_stated_key_pair(&join_stub);
@@ -1563,8 +1608,12 @@ fn a_connection_without_a_role_sends_no_sts_request() {
 fn an_sts_denial_fails_the_request_before_any_catalog_request() {
     for request in [role_create_request(), role_join_pushdown_request()] {
         let stub = StsAndCatalog::start((403, ACCESS_DENIED_RESPONSE), (200, EMPTY_LISTING));
-        let err = dispatch(&mut sigv4_role_connection(&stub), &request)
-            .expect_err("an STS denial must fail the request");
+        let err = dispatch(
+            &mut sigv4_role_connection(&stub),
+            &request,
+            &statement_states(),
+        )
+        .expect_err("an STS denial must fail the request");
 
         let UdfError::User(message) = &err else {
             panic!("an STS denial must be a user error, got {err:?}");

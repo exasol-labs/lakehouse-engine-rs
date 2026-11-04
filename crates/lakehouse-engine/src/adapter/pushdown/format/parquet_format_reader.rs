@@ -8,9 +8,9 @@ use object_store::ObjectStore;
 use serde_json::Value as Json;
 
 use super::partition_predicate::PartitionPredicate;
-use super::{FormatReader, PlannedFiles};
+use super::{LoadedTable, PlannedFiles};
 use crate::adapter::column_notes::DeclaredSchema;
-use crate::adapter::parquet_directory::{ParquetFile, list_parquet_files};
+use crate::adapter::parquet_directory::{ParquetFile, ParquetListing};
 use crate::scan::ObjectLocation;
 use crate::scan::spec::FileEntry;
 
@@ -18,19 +18,34 @@ use crate::scan::spec::FileEntry;
 #[path = "parquet_format_reader_tests.rs"]
 mod tests;
 
-/// Lists files against the declared partition columns and reads no footer.
-pub(super) struct ParquetFormatReader<'a> {
-    /// Shared across every leg of the request (one admission limiter).
-    pub(super) store: &'a Arc<dyn ObjectStore>,
-    pub(super) table_root: &'a ObjectLocation,
+/// A directory's full listing, against which each reference declares its partition columns; no
+/// footer is read.
+pub(in crate::adapter::pushdown) struct ParquetDirectoryTable {
+    listing: ParquetListing,
+    table_root: ObjectLocation,
     /// The CONNECTION's static backend; no credential-vending catalog overrides it.
-    pub(super) storage: &'a StorageBackend,
+    storage: StorageBackend,
 }
 
-impl FormatReader for ParquetFormatReader<'_> {
+impl ParquetDirectoryTable {
+    /// `store` is shared by every load of the virtual schema's statement (one admission limiter).
+    pub(in crate::adapter::pushdown) async fn open(
+        store: &Arc<dyn ObjectStore>,
+        table_root: &ObjectLocation,
+        storage: &StorageBackend,
+    ) -> Result<Self, UdfError> {
+        Ok(Self {
+            listing: ParquetListing::list(store, table_root.key()).await?,
+            table_root: table_root.clone(),
+            storage: storage.clone(),
+        })
+    }
+}
+
+impl LoadedTable for ParquetDirectoryTable {
     /// Prunes files by partition-column predicates; other predicates never prune (no file
     /// statistics).
-    fn resolve_scan<'a>(
+    fn prune<'a>(
         &'a self,
         declared: &'a DeclaredSchema,
         filter_json: Option<&'a Json>,
@@ -38,13 +53,13 @@ impl FormatReader for ParquetFormatReader<'_> {
         Box::pin(async move {
             let predicate = PartitionPredicate::from_filter(filter_json, &[]);
             let keep = move |values: &_| predicate.keeps(values);
-            let root = self.table_root;
-            let files =
-                list_parquet_files(self.store, root.key(), &declared.partition_columns, &keep)
-                    .await?
-                    .into_iter()
-                    .map(|file| file_entry(file, root))
-                    .collect();
+            let root = &self.table_root;
+            let files = self
+                .listing
+                .kept_files(&declared.partition_columns, &keep)?
+                .into_iter()
+                .map(|file| file_entry(file, root))
+                .collect();
             Ok(PlannedFiles {
                 files,
                 effective_storage: self.storage.clone(),

@@ -1,12 +1,13 @@
 use super::attribution::JoinLegs;
 use super::*;
 use crate::adapter::catalog_kind::CatalogKind;
-use crate::adapter::permission::PermissionCheck;
 use crate::adapter::pushdown::ResolvedScan;
 use crate::adapter::pushdown::test_support::*;
-use crate::scan::spec::CatalogProps;
 use crate::scan::spec::{FileEntry, LogicalField, ProjectionItem};
 use crate::types::exasol_type::ExasolType;
+use futures::FutureExt;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 // Shared join fixtures, reached by each submodule's tests via `super::super::tests`.
 
@@ -518,7 +519,11 @@ const REGION_CUSTOMER_COLUMNS: &[(&str, &str)] = &[("c_custkey", "long"), ("c_re
 const STATUS_ORDERS_COLUMNS: &[(&str, &str)] = &[("o_custkey", "long"), ("o_status", "string")];
 
 async fn two_delta_legs_each_pruned_by_its_own_local_filter() -> StorageBackend {
-    delta_object_endpoint(vec![
+    delta_object_endpoint(partitioned_delta_logs()).await
+}
+
+fn partitioned_delta_logs() -> Vec<(String, String)> {
+    vec![
         (
             delta_commit_zero_key("customer"),
             two_file_delta_commit(
@@ -537,8 +542,7 @@ async fn two_delta_legs_each_pruned_by_its_own_local_filter() -> StorageBackend 
                 ["open", "closed"],
             ),
         ),
-    ])
-    .await
+    ]
 }
 
 /// A join selecting `C_REGION` and `O_STATUS` over the two partitioned legs, each leg's columns
@@ -609,67 +613,35 @@ struct RendezvousCatalog {
 
 impl RendezvousCatalog {
     async fn spawn(parties: usize) -> Self {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-        let uri = format!(
-            "http://127.0.0.1:{}",
-            listener.local_addr().expect("local_addr").port()
-        );
-        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(parties));
-
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let barrier = std::sync::Arc::clone(&barrier);
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 8192];
-                    let read = stream.read(&mut buf).await.unwrap_or(0);
-                    if read == 0 {
-                        return;
-                    }
-                    let raw = String::from_utf8_lossy(&buf[..read]).to_string();
-                    let target = raw.split_whitespace().nth(1).unwrap_or("").to_string();
-                    let body = if target.starts_with("/v1/config") {
-                        "{}".to_string()
-                    } else {
-                        let table = target.rsplit('/').next().unwrap_or("t").to_string();
-                        barrier.wait().await;
-                        snapshotless_load_table_body(&format!("s3://bucket/{table}"))
-                    };
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                });
+        let barrier = Arc::new(tokio::sync::Barrier::new(parties));
+        let uri = spawn_async_fake_http_server(move |target| {
+            let barrier = Arc::clone(&barrier);
+            async move {
+                let body = if target.starts_with("/v1/config") {
+                    "{}".to_string()
+                } else {
+                    let table = target.rsplit('/').next().unwrap_or("t").to_string();
+                    barrier.wait().await;
+                    snapshotless_load_table_body(&format!("s3://bucket/{table}"))
+                };
+                (200, "application/json", body)
             }
-        });
+            .boxed()
+        })
+        .await;
 
         Self { uri }
     }
 }
 
 async fn iceberg_pushdown(request: &Json, catalog_uri: &str) -> Result<Json, UdfError> {
-    let conn = ResolvedConnectionConfig {
-        catalog_uri: catalog_uri.to_string(),
-        storage: sample_storage(),
-        creds: unauthenticated_creds(),
-        allow_http: true,
-        catalog_kind: CatalogKind::IcebergRest,
-        connection_name: TEST_CONNECTION_NAME.to_string(),
-        sealed_storage_key: Some(test_sealing_key()),
-        permission_check: PermissionCheck::Off,
-    };
-    let catalog = CatalogProps {
-        warehouse: "wh".into(),
-        table: "lh.customer".into(),
-    };
-    crate::adapter::pushdown::handle_pushdown(
-        request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
-    )
-    .await
+    let connection = resolved_connection(
+        CatalogKind::IcebergRest,
+        catalog_uri,
+        sample_storage(),
+        unauthenticated_creds(),
+    );
+    plan_pushdown(request, connection, "lh.customer", 1024).await
 }
 
 /// A zero broadcast threshold forces the N-scan fallback, which indexes sides by leg.
@@ -679,26 +651,16 @@ async fn delta_n_scan_pushdown(
     storage: StorageBackend,
     table: &str,
 ) -> Result<Json, UdfError> {
-    let conn = ResolvedConnectionConfig {
-        catalog_uri: catalog_uri.to_string(),
+    let connection = resolved_connection(
+        CatalogKind::UnityCatalogNative,
+        catalog_uri,
         storage,
-        creds: unauthenticated_creds(),
-        allow_http: true,
-        catalog_kind: CatalogKind::UnityCatalogNative,
-        connection_name: TEST_CONNECTION_NAME.to_string(),
-        sealed_storage_key: Some(test_sealing_key()),
-        permission_check: PermissionCheck::Off,
-    };
-    let catalog = CatalogProps {
-        warehouse: "wh".into(),
-        table: table.into(),
-    };
-    crate::adapter::pushdown::handle_pushdown(
-        request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 0,
-    )
-    .await
+        unauthenticated_creds(),
+    );
+    plan_pushdown(request, connection, table, 0).await
 }
 
+/// Scenario: A request's table resolutions run concurrently rather than one after another
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn join_legs_resolve_concurrently_in_leg_index_order() {
     let catalog = RendezvousCatalog::spawn(2).await;
@@ -718,6 +680,66 @@ async fn join_legs_resolve_concurrently_in_leg_index_order() {
     assert_eq!(
         planned["type"], "pushdown",
         "the concurrency change must leave the planned response shape untouched: {planned:?}"
+    );
+}
+
+/// Serves `objects` as `delta_object_endpoint` does, but holds each table's first `_delta_log`
+/// read until both legs' first reads are in flight, so legs whose log replays run one after the
+/// other never get an answer.
+async fn delta_log_rendezvous(objects: Vec<(String, String)>) -> StorageBackend {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let first_reads = Arc::new(Mutex::new(HashSet::new()));
+    let objects = Arc::new(objects);
+    let endpoint = spawn_async_fake_http_server(move |target| {
+        let (barrier, first_reads, objects) = (
+            Arc::clone(&barrier),
+            Arc::clone(&first_reads),
+            Arc::clone(&objects),
+        );
+        async move {
+            let first_read = delta_log_table(&target)
+                .is_some_and(|table| first_reads.lock().expect("first reads").insert(table));
+            if first_read {
+                barrier.wait().await;
+            }
+            object_response("bucket", &target, &objects)
+        }
+        .boxed()
+    })
+    .await;
+
+    endpoint_storage(&endpoint)
+}
+
+/// The table whose `_delta_log` a GET or a listing of `target` reads.
+fn delta_log_table(target: &str) -> Option<String> {
+    let decoded = percent_encoding::percent_decode_str(target).decode_utf8_lossy();
+    let (before, _) = decoded.split_once("/_delta_log")?;
+    before.rsplit(['/', '=']).next().map(str::to_string)
+}
+
+/// Scenario: A request's table resolutions run concurrently rather than one after another
+#[tokio::test(flavor = "current_thread")]
+async fn delta_join_legs_replay_concurrently_on_a_current_thread_runtime() {
+    let catalog = unity_delta_catalog().await;
+    let storage = delta_log_rendezvous(partitioned_delta_logs()).await;
+    let request = partitioned_legs_request();
+
+    let planned = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders"),
+    )
+    .await
+    .expect(
+        "both legs' Delta log replays must be in flight at once; a replay that holds the \
+         runtime thread, or a leg that starts after the other ends, never releases the store's \
+         rendezvous",
+    )
+    .expect("two partitioned Delta legs plan");
+
+    assert_eq!(
+        planned["type"], "pushdown",
+        "the overlap must leave the planned response shape untouched: {planned:?}"
     );
 }
 

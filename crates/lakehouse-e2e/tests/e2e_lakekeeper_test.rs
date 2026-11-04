@@ -1316,6 +1316,7 @@ fn permission_check_sees_the_user_who_queries_a_view_not_its_owner() {
     assert_refused(VIEW_READER_USER, &query, &[&qualified(E2E_TABLE)], &[]);
 }
 
+/// Scenario: One batch-check per pushdown decides every table that no earlier pushdown of the statement checked
 /// Scenario: A denied table refuses the whole query
 #[test]
 fn permission_check_refuses_the_same_query_once_a_grant_is_revoked() {
@@ -1389,7 +1390,7 @@ fn sorted_rows(conn: &mut ExaConn, sql: &str) -> Vec<Vec<String>> {
     rows
 }
 
-/// Scenario: One batch-check per query decides every table before any table is read
+/// Scenario: One batch-check per pushdown decides every table that no earlier pushdown of the statement checked
 /// Scenario: A denied table refuses the whole query
 #[test]
 fn permission_check_decides_every_single_table_shape() {
@@ -1496,6 +1497,69 @@ fn permission_check_lists_unreadable_tables_and_refuses_their_queries() {
     assert_events_listed_and_refused("after refresh");
 }
 
+/// Scenario: One batch-check per pushdown decides every table that no earlier pushdown of the statement checked
+#[test]
+fn a_union_statement_checks_every_table_its_pushdowns_read() {
+    permission_setup();
+    grant_only(ALLOWED_USER, &[select_table(E2E_TABLE)]);
+    grant_only(DENIED_USER, &[select_table(E2E_TABLE)]);
+    let events = format!("{VS_PERMISSION}.{}", E2E_TABLE.to_uppercase());
+    let other = format!("{VS_PERMISSION}.{}", E2E_DIM_TABLE.to_uppercase());
+    let union_all = |left: &str, right: &str| {
+        format!("SELECT COUNT(*) FROM (SELECT 1 FROM {left} UNION ALL SELECT 1 FROM {right})")
+    };
+
+    assert_eq!(
+        connect_as(ALLOWED_USER).query_scalar_i64(&union_all(&events, &events)),
+        2 * SEED_TOTAL_ROWS as i64,
+        "a user granted the table reads both branches"
+    );
+    for (left, right) in [(&events, &other), (&other, &events)] {
+        assert_refused(
+            DENIED_USER,
+            &union_all(left, right),
+            &[&qualified(E2E_DIM_TABLE)],
+            &[&qualified(E2E_TABLE)],
+        );
+    }
+}
+
+/// Scenario: One batch-check per pushdown decides every table that no earlier pushdown of the statement checked
+/// Scenario: The Lakekeeper permission check reuses the request's one catalog session
+/// Scenario: The pushdowns of one statement share one catalog session per virtual schema
+#[test]
+fn a_statement_sends_one_token_request_and_one_batch_check() {
+    create_proxy_virtual_schema();
+    grant_only(ALLOWED_USER, &[select_table(E2E_TABLE)]);
+    let token = format!(
+        "POST {}",
+        password_via_proxy(WAREHOUSE_AUTHZ, false)
+            .oauth2_server_uri
+            .expect("the OAuth2 client-credentials CONNECTION names a token endpoint")
+    );
+    let events = format!("{VS_PROXY}.{}", E2E_TABLE.to_uppercase());
+    let sql =
+        format!("SELECT COUNT(*) FROM (SELECT id FROM {events} UNION ALL SELECT id FROM {events})");
+    let mut rows = 0;
+
+    let [tokens, configs, batch_checks, loads] = stack::count_proxy_requests(
+        [
+            token.as_str(),
+            &format!("GET {}/v1/config", proxy_catalog_uri()),
+            "POST http://lakekeeper-via-proxy:8181/management/v1/action/batch-check",
+            &format!("/namespaces/{E2E_NAMESPACE}/tables/{E2E_TABLE}?"),
+        ],
+        || rows = connect_as(ALLOWED_USER).query_scalar_i64(&sql),
+    );
+
+    assert_eq!(rows, 2 * SEED_TOTAL_ROWS as i64);
+    assert_eq!(
+        [tokens, configs, batch_checks, loads],
+        [1, 1, 1, 1],
+        "one token POST, one /v1/config GET, one batch-check POST, and one loadTable GET"
+    );
+}
+
 const PROXY_ADAPTER_SCHEMA: &str = "LHVS_PROXY";
 const VS_PROXY: &str = "LAKEKEEPER_PROXY_VS";
 const VS_PROXY_VENDED: &str = "LAKEKEEPER_PROXY_VENDED_VS";
@@ -1517,39 +1581,51 @@ fn password_via_proxy(warehouse: &str, vended: bool) -> CatalogConnectionPasswor
     }
 }
 
+/// Creates, once, the permission-checked virtual schema that reaches Lakekeeper, Keycloak, and
+/// SeaweedFS only through the forward proxy, and lets `ALLOWED_USER` read it.
+fn create_proxy_virtual_schema() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        setup();
+        permission_setup();
+        stack::wait_for_proxy();
+        for host in [
+            "lakekeeper-via-proxy",
+            "keycloak-via-proxy",
+            "seaweedfs-via-proxy",
+        ] {
+            stack::assert_resolves_only_through_proxy(host);
+        }
+        let proxy = [("HTTP_PROXY", stack::PROXY_URL_INTERNAL)];
+        let mut sys = exa_conn();
+        create_schema_and_scripts_with_env(&mut sys, PROXY_ADAPTER_SCHEMA, &proxy, &proxy);
+
+        create_virtual_schema_with_password(
+            &mut sys,
+            &VsProps::new(VS_PROXY, E2E_NAMESPACE)
+                .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
+                .with_catalog_conn_name("LAKEKEEPER_PROXY_CREDS")
+                .with_property("PERMISSION_CHECK", "LAKEKEEPER")
+                .with_property("USER_MAPPING", PERMISSION_USER_MAPPING),
+            &proxy_catalog_uri(),
+            &password_via_proxy(WAREHOUSE_AUTHZ, false),
+        );
+        sys.execute(&format!(
+            "GRANT SELECT ON SCHEMA {VS_PROXY} TO {}",
+            ALLOWED_USER.0
+        ));
+    });
+}
+
+fn proxy_catalog_uri() -> String {
+    LAKEKEEPER_CATALOG_URI_INTERNAL.replace("//lakekeeper:", "//lakekeeper-via-proxy:")
+}
+
 /// Scenario: Catalog, storage, and STS requests go through the proxy
 #[test]
 fn lakekeeper_oauth_batch_check_and_vended_reads_go_through_the_proxy() {
-    setup();
-    permission_setup();
-    stack::wait_for_proxy();
-    for host in [
-        "lakekeeper-via-proxy",
-        "keycloak-via-proxy",
-        "seaweedfs-via-proxy",
-    ] {
-        stack::assert_resolves_only_through_proxy(host);
-    }
-    let proxy = [("HTTP_PROXY", stack::PROXY_URL_INTERNAL)];
+    create_proxy_virtual_schema();
     let mut sys = exa_conn();
-    create_schema_and_scripts_with_env(&mut sys, PROXY_ADAPTER_SCHEMA, &proxy, &proxy);
-    let catalog_uri =
-        LAKEKEEPER_CATALOG_URI_INTERNAL.replace("//lakekeeper:", "//lakekeeper-via-proxy:");
-
-    create_virtual_schema_with_password(
-        &mut sys,
-        &VsProps::new(VS_PROXY, E2E_NAMESPACE)
-            .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
-            .with_catalog_conn_name("LAKEKEEPER_PROXY_CREDS")
-            .with_property("PERMISSION_CHECK", "LAKEKEEPER")
-            .with_property("USER_MAPPING", PERMISSION_USER_MAPPING),
-        &catalog_uri,
-        &password_via_proxy(WAREHOUSE_AUTHZ, false),
-    );
-    sys.execute(&format!(
-        "GRANT SELECT ON SCHEMA {VS_PROXY} TO {}",
-        ALLOWED_USER.0
-    ));
     assert_eq!(event_ids(ALLOWED_USER, VS_PROXY), all_event_ids());
 
     create_virtual_schema_with_password(
@@ -1557,7 +1633,7 @@ fn lakekeeper_oauth_batch_check_and_vended_reads_go_through_the_proxy() {
         &VsProps::new(VS_PROXY_VENDED, E2E_NAMESPACE)
             .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
             .with_catalog_conn_name("LAKEKEEPER_PROXY_VENDED_CREDS"),
-        &catalog_uri,
+        &proxy_catalog_uri(),
         &password_via_proxy(WAREHOUSE_VENDED, true),
     );
     assert_eq!(
