@@ -316,7 +316,7 @@ pub fn try_create_virtual_schema_with_password(
         build_create_connection_sql(props.catalog_conn_name, catalog_uri, password);
     conn.execute(&create_conn_sql);
 
-    grant_connection_access_to_vs_owner(conn, props.catalog_conn_name);
+    grant_connection_access_to_vs_owner(conn, props.catalog_conn_name, props.adapter_schema);
 
     let _ = conn.try_execute(&format!(
         "DROP VIRTUAL SCHEMA IF EXISTS {} CASCADE",
@@ -360,14 +360,18 @@ pub fn current_user(conn: &mut ExaConn) -> String {
         .unwrap_or_else(|| panic!("SELECT CURRENT_USER returned no value: {cols:?}"))
 }
 
-pub fn grant_connection_access_to_vs_owner(conn: &mut ExaConn, conn_name: &str) {
+pub fn grant_connection_access_to_vs_owner(
+    conn: &mut ExaConn,
+    conn_name: &str,
+    script_schema: &str,
+) {
     let owner = current_user(conn);
     if owner.eq_ignore_ascii_case("SYS") {
         return;
     }
     for script in [ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME] {
         conn.execute(&format!(
-            "GRANT ACCESS ON CONNECTION {conn_name} FOR SCRIPT {SCHEMA_NAME}.{script} TO {owner}"
+            "GRANT ACCESS ON CONNECTION {conn_name} FOR SCRIPT {script_schema}.{script} TO {owner}"
         ));
     }
 }

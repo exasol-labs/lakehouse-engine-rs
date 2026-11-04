@@ -158,10 +158,17 @@ fn seed_storage_config() -> (String, String, String, String, bool) {
 
 /// Always returns the static admin credentials, regardless of per-table vended ones;
 /// see [`build_seed_catalog_with_auth`].
-#[derive(Debug)]
 struct StaticS3CredentialProvider {
     access_key_id: String,
     secret_access_key: String,
+}
+
+// `ProvideCredential` requires `Debug`, and a derived one would print the keys.
+impl std::fmt::Debug for StaticS3CredentialProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaticS3CredentialProvider")
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProvideCredential for StaticS3CredentialProvider {
