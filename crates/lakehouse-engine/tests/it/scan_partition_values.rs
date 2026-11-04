@@ -86,31 +86,16 @@ fn all_six_entries(dir: &Path) -> Vec<FileEntry> {
 fn basic_partitioned_logical_schema() -> Vec<LogicalField> {
     vec![
         LogicalField {
-            field_id: None,
-            name: "letter".into(),
-            arrow_type: "utf8".into(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("letter", "utf8")
         },
         LogicalField {
-            field_id: None,
-            name: "number".into(),
-            arrow_type: "int64".into(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("number", "int64")
         },
         LogicalField {
-            field_id: None,
-            name: "a_float".into(),
-            arrow_type: "float64".into(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("a_float", "float64")
         },
     ]
 }
@@ -265,13 +250,8 @@ fn absent_and_empty_partition_values_materialize_null() {
 fn logical_schema_with_flag() -> Vec<LogicalField> {
     let mut fields = basic_partitioned_logical_schema();
     fields.push(LogicalField {
-        field_id: None,
-        name: "flag".into(),
-        arrow_type: "int32".into(),
         nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
+        ..scan_fixture::logical_field("flag", "int32")
     });
     fields
 }
@@ -382,22 +362,12 @@ fn write_parquet_with_physical_letter(
 fn one_off_logical_schema() -> Vec<LogicalField> {
     vec![
         LogicalField {
-            field_id: None,
-            name: "letter".into(),
-            arrow_type: "utf8".into(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("letter", "utf8")
         },
         LogicalField {
-            field_id: None,
-            name: "number".into(),
-            arrow_type: "int64".into(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("number", "int64")
         },
     ]
 }
@@ -553,22 +523,12 @@ fn leaf_file_scan_config(
 fn unpartitioned_logical_schema() -> Vec<LogicalField> {
     vec![
         LogicalField {
-            field_id: None,
-            name: "number".into(),
-            arrow_type: "int64".into(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("number", "int64")
         },
         LogicalField {
-            field_id: None,
-            name: "a_float".into(),
-            arrow_type: "float64".into(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("a_float", "float64")
         },
     ]
 }

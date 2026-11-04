@@ -135,23 +135,11 @@ fn nested_spec_for_file(file_url: String) -> ScanSpec {
     CommonScanSpec {
         projection: vec!["ID".into(), "TAGS".into()],
         logical_schema: vec![
+            scan_fixture::logical_field("id", "int64"),
             LogicalField {
-                field_id: None,
-                name: "id".to_string(),
-                arrow_type: "int64".to_string(),
-                nullable: false,
-                initial_default: None,
-                nested: None,
-                physical_name: None,
-            },
-            LogicalField {
-                field_id: None,
-                name: "tags".to_string(),
-                arrow_type: "utf8".to_string(),
                 nullable: true,
-                initial_default: None,
                 nested: Some(NestedMembers::List { element: None }),
-                physical_name: None,
+                ..scan_fixture::logical_field("tags", "utf8")
             },
         ],
         storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {

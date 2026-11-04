@@ -77,21 +77,12 @@ fn logical_schema() -> Vec<LogicalField> {
     vec![
         LogicalField {
             field_id: Some(1),
-            name: "id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("id", "int64")
         },
         LogicalField {
             field_id: Some(2),
-            name: "new_col".to_string(),
-            arrow_type: "int64".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("new_col", "int64")
         },
     ]
 }

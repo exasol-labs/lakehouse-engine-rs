@@ -1,5 +1,6 @@
 use super::*;
 use crate::scan::spec::{NameMappingEntry, ScanSpec};
+use crate::scan::test_support::logical_field;
 use crate::scan::test_support::minimal_spec;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_expr::PhysicalExpr;
@@ -179,21 +180,12 @@ fn builds_logical_arrow_schema_with_field_ids() {
     let logical = vec![
         LogicalField {
             field_id: Some(1),
-            name: "id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("id", "int64")
         },
         LogicalField {
             field_id: Some(2),
-            name: "rating".to_string(),
-            arrow_type: "float64".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("rating", "float64")
         },
     ];
 
@@ -222,30 +214,16 @@ fn identity_bound_logical_field_carries_no_parquet_field_id_metadata() {
     let logical = vec![
         LogicalField {
             field_id: Some(1),
-            name: "by_id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("by_id", "int64")
         },
         LogicalField {
-            field_id: None,
-            name: "by_identity".to_string(),
-            arrow_type: "utf8".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("by_identity", "utf8")
         },
         LogicalField {
-            field_id: None,
-            name: "by_physical_name".to_string(),
-            arrow_type: "utf8".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
             physical_name: Some("col-abc".to_string()),
+            ..logical_field("by_physical_name", "utf8")
         },
     ];
 

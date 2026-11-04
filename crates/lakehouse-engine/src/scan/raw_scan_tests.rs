@@ -1,6 +1,7 @@
 use super::*;
 use crate::scan::session_config_for_spec;
 use crate::scan::test_support::WithFiles;
+use crate::scan::test_support::logical_field;
 use crate::scan::test_support::{MemoryParquet, inline_resolved, minimal_spec};
 
 #[test]
@@ -154,7 +155,6 @@ async fn register_files_falls_back_without_logical_schema() {
     spec.common.logical_schema = Vec::new();
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-
     files.register(&ctx);
     register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
         .await
@@ -221,7 +221,6 @@ async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter(
     spec.common.projection = vec!["ID".into(), "VAL".into(), "ADDED".into()];
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-
     files.register(&ctx);
     register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
         .await
@@ -324,7 +323,6 @@ async fn ordered_scan_sql_preserves_desc_and_null_placement() {
         spec.common.limit = Some(limit);
 
         let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-
         files.register(&ctx);
         register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
             .await
@@ -391,21 +389,12 @@ async fn build_scan_sql_aliases_over_logical_schema() {
     let logical = vec![
         LogicalField {
             field_id: Some(1),
-            name: "id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("id", "int64")
         },
         LogicalField {
             field_id: Some(2),
-            name: "rating".to_string(),
-            arrow_type: "float64".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("rating", "float64")
         },
     ];
     let logical_schema = build_logical_arrow_schema(&logical);
@@ -524,27 +513,18 @@ async fn a_list_column_tagged_utf8_is_json_rendered_by_the_field_id_expression_a
     spec.common.logical_schema = vec![
         LogicalField {
             field_id: Some(1),
-            name: "id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("id", "int64")
         },
         LogicalField {
             field_id: Some(2),
-            name: "arr_col".to_string(),
-            arrow_type: "utf8".to_string(),
             nullable: true,
-            initial_default: None,
             nested: Some(crate::scan::spec::NestedMembers::List { element: None }),
-            physical_name: None,
+            ..logical_field("arr_col", "utf8")
         },
     ];
     spec.common.projection = vec!["ID".into(), "ARR_COL".into()];
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-
     files.register(&ctx);
     register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
         .await
@@ -654,14 +634,11 @@ async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
         physical_name: Some(physical_name.to_string()),
         nested: None,
     };
-    let logical_field = |field_id: i32, name: &str, nested: Option<NestedMembers>| LogicalField {
+    let utf8_field = |field_id: i32, name: &str, nested: Option<NestedMembers>| LogicalField {
         field_id: Some(field_id),
-        name: name.to_string(),
-        arrow_type: "utf8".to_string(),
         nullable: true,
-        initial_default: None,
         nested,
-        physical_name: None,
+        ..logical_field(name, "utf8")
     };
 
     let mut spec = minimal_spec();
@@ -669,14 +646,9 @@ async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
     spec.common.logical_schema = vec![
         LogicalField {
             field_id: Some(1),
-            name: "id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("id", "int64")
         },
-        logical_field(
+        utf8_field(
             2,
             "addr",
             Some(NestedMembers::Struct {
@@ -686,7 +658,7 @@ async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
                 ],
             }),
         ),
-        logical_field(
+        utf8_field(
             3,
             "attrs",
             Some(NestedMembers::Map {
@@ -698,7 +670,6 @@ async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
     spec.common.projection = vec!["ID".into(), "ADDR".into(), "ATTRS".into()];
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-
     files.register(&ctx);
     register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
         .await
@@ -913,27 +884,18 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
     logical_spec.common.logical_schema = vec![
         LogicalField {
             field_id: Some(1),
-            name: "id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("id", "int64")
         },
         LogicalField {
             field_id: Some(2),
-            name: "tags".to_string(),
-            arrow_type: "utf8".to_string(),
             nullable: true,
-            initial_default: None,
             nested: Some(NestedMembers::List { element: None }),
-            physical_name: None,
+            ..logical_field("tags", "utf8")
         },
     ];
     logical_spec.common.projection = vec!["ID".into(), "TAGS".into()];
 
     let logical_ctx = SessionContext::new_with_config(session_config_for_spec(&logical_spec));
-
     files.register(&logical_ctx);
     register_files(
         &logical_ctx,
@@ -960,7 +922,6 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
     legacy_spec.common.projection = vec!["ID".into(), "TAGS".into()];
 
     let legacy_ctx = SessionContext::new_with_config(session_config_for_spec(&legacy_spec));
-
     files.register(&legacy_ctx);
     register_files(
         &legacy_ctx,
@@ -1009,12 +970,7 @@ async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
         projection: vec![ProjectionItem::Column("ID".into())],
         logical_schema: vec![crate::scan::spec::LogicalField {
             field_id: Some(1),
-            name: "id".into(),
-            arrow_type: "int64".into(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("id", "int64")
         }],
         storage: ScanStorage::Connection {
             name: TEST_CONNECTION.into(),

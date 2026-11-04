@@ -1,13 +1,13 @@
 //! Fixtures shared by the engine's host test binaries: a test runtime, file URLs, storage
-//! backends and their resolution, join specs, declared output columns, and a batch-capturing
-//! UDF context.
+//! backends and their resolution, logical fields, join specs, declared output columns, and a
+//! batch-capturing UDF context.
 #![allow(dead_code)]
 
 pub mod concurrency_probe;
 
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, JoinSpec, JoinType, ScanSpec, ScanStorage, StorageBackend,
-    StorageProps,
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec, ScanStorage,
+    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{ResolvedScanStorage, resolve_scan_storage};
 
@@ -55,6 +55,19 @@ pub fn dir_url(path: &std::path::Path) -> String {
 pub fn resolved_storage(spec: &ScanSpec) -> ResolvedScanStorage {
     resolve_scan_storage(&spec.common, &exasol_udf_sdk::test_support::DefaultsCtx)
         .expect("inline storage resolves without a CONNECTION")
+}
+
+/// A non-nullable logical field bound by its own name.
+pub fn logical_field(name: &str, arrow_type: &str) -> LogicalField {
+    LogicalField {
+        field_id: None,
+        name: name.to_string(),
+        arrow_type: arrow_type.to_string(),
+        nullable: false,
+        initial_default: None,
+        nested: None,
+        physical_name: None,
+    }
 }
 
 pub fn join_spec(storage: ScanStorage) -> JoinSpec {

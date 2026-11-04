@@ -184,21 +184,11 @@ fn raw_spec_with_logical_schema(files: Vec<(String, u64)>, table_root: String) -
         logical_schema: vec![
             LogicalField {
                 field_id: Some(1),
-                name: "id".to_string(),
-                arrow_type: "int64".to_string(),
-                nullable: false,
-                initial_default: None,
-                nested: None,
-                physical_name: None,
+                ..scan_fixture::logical_field("id", "int64")
             },
             LogicalField {
                 field_id: Some(2),
-                name: "name".to_string(),
-                arrow_type: "utf8".to_string(),
-                nullable: false,
-                initial_default: None,
-                nested: None,
-                physical_name: None,
+                ..scan_fixture::logical_field("name", "utf8")
             },
         ],
         ..Default::default()

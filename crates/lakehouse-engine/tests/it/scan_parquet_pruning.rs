@@ -207,13 +207,9 @@ fn nested_spec(file_url: String, filter: &str) -> ScanSpec {
         .map(|m| m.len())
         .unwrap_or(0);
     let field = |name: &str, arrow_type: &str, nested: Option<NestedMembers>| LogicalField {
-        field_id: None,
-        name: name.into(),
-        arrow_type: arrow_type.into(),
         nullable: true,
-        initial_default: None,
         nested,
-        physical_name: None,
+        ..scan_fixture::logical_field(name, arrow_type)
     };
     CommonScanSpec {
         projection: vec![
@@ -480,13 +476,8 @@ fn binary_spec(file_url: &str, filter: &str) -> ScanSpec {
         .map(|m| m.len())
         .unwrap_or(0);
     let field = |name: &str, arrow_type: &str| LogicalField {
-        field_id: None,
-        name: name.into(),
-        arrow_type: arrow_type.into(),
         nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
+        ..scan_fixture::logical_field(name, arrow_type)
     };
     CommonScanSpec {
         projection: vec![ProjectionItem::Column("ID".into())],

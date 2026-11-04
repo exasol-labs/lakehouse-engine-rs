@@ -122,32 +122,16 @@ fn declared_physical_name_binds_the_renamed_physical_column() {
         .len();
 
     let logical_schema = vec![
+        scan_fixture::logical_field("id", "int64"),
         LogicalField {
-            field_id: None,
-            name: "id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
-        },
-        LogicalField {
-            field_id: None,
-            name: "amount".to_string(),
-            arrow_type: "int64".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
             physical_name: Some("col-abc".to_string()),
+            ..scan_fixture::logical_field("amount", "int64")
         },
         LogicalField {
             field_id: Some(7),
-            name: "other".to_string(),
-            arrow_type: "int64".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("other", "int64")
         },
     ];
     let name_mapping = vec![NameMappingEntry {
@@ -201,35 +185,18 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
         .expect("stat parquet")
         .len();
 
-    let id_field = || LogicalField {
-        field_id: None,
-        name: "id".to_string(),
-        arrow_type: "int64".to_string(),
-        nullable: false,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
-    };
+    let id_field = || scan_fixture::logical_field("id", "int64");
 
     let logical_schema = vec![
         id_field(),
         LogicalField {
-            field_id: None,
-            name: "extra_nullable".to_string(),
-            arrow_type: "int64".to_string(),
             nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("extra_nullable", "int64")
         },
         LogicalField {
-            field_id: None,
-            name: "extra_default".to_string(),
-            arrow_type: "int64".to_string(),
             nullable: true,
             initial_default: Some("42".to_string()),
-            nested: None,
-            physical_name: None,
+            ..scan_fixture::logical_field("extra_default", "int64")
         },
     ];
     let spec = raw_scan_spec(
@@ -268,15 +235,7 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
 
     let required_missing_schema = vec![
         id_field(),
-        LogicalField {
-            field_id: None,
-            name: "mandatory".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
-        },
+        scan_fixture::logical_field("mandatory", "int64"),
     ];
     let error_spec = raw_scan_spec(
         file_url.clone(),
