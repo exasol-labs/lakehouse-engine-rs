@@ -11,11 +11,11 @@
 |-------|--------|
 | Build | ✓ (`make cross-udf-build`; the `.so` exports four entry-point symbols) |
 | Tests | ✓ (`cargo test --workspace`, exit 0) |
-| E2E (local) | ✓ (358 passed, 0 failed, includes `e2e_local::export`) |
+| E2E (local) | ✓ (350 passed, 0 failed, includes `e2e_local::export`) |
 | Installer tests | ✓ (`make test-install`: 537 passed, 0 failed) |
 | Lint | ✓ |
 | Format | ✓ |
-| Coverage gate | ✓ (216 of 220 changed lines, 98.2%, threshold 90%) |
+| Coverage gate | ✓ (215 of 219 changed lines, 98.2%, threshold 90%) |
 | Scenario Coverage | ✓ for every local scenario |
 | Cloud E2E (task 1.13) | not run: no multi-node cluster |
 | Manual Tests | not run by hand: `exapump` is not installed on the host; the same behaviors are asserted by passing E2E tests |
@@ -25,7 +25,7 @@
 | Type | Run | Passed | Ignored |
 |------|-----|--------|---------|
 | Unit (`cargo test --workspace`) | exit 0 | 0 failures | 0 |
-| Integration (`make e2e-up test-e2e`) | 358 | 358 | 0 |
+| Integration (`make e2e-up test-e2e`) | 350 | 350 | 0 |
 | Installer (`make test-install`) | 537 | 537 | 0 |
 
 `export_refuses_unsupported_column_types` passed in 12 of 12 separate runs. The only uncovered changed lines are the four `#[exasol_udf]` declaration lines in `lib.rs`, which the SDK macro expands and the E2E suite exercises through the `.so`.
