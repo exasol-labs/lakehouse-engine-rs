@@ -938,12 +938,9 @@ fn initial_default_round_trips_across_full_type_vocabulary() {
         .enumerate()
         .map(|(i, (tag, encoded, _))| LogicalField {
             field_id: Some(i as i32 + 1),
-            name: format!("c{i}"),
-            arrow_type: (*tag).to_string(),
             nullable: true,
             initial_default: Some((*encoded).to_string()),
-            nested: None,
-            physical_name: None,
+            ..logical_field(&format!("c{i}"), tag)
         })
         .collect();
 
