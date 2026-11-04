@@ -4,6 +4,7 @@
 use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::{Datum, PrimitiveType, Schema};
 use serde_json::Value as Json;
+use vs_expression::ColumnNode;
 
 use crate::adapter::pushdown::literal_binary_bytes;
 use crate::scan::spec::LogicalField;
@@ -18,10 +19,7 @@ struct FilterColumns<'a> {
 
 impl<'a> FilterColumns<'a> {
     fn resolve(&self, node: &Json) -> Option<(&'a str, &'a PrimitiveType)> {
-        if node.get("type")?.as_str()? != "column" {
-            return None;
-        }
-        let column = node.get("name")?.as_str()?.to_uppercase();
+        let column = ColumnNode::parse(node)?.upper_name();
         let is_column = |field: &&LogicalField| field.name.to_uppercase() == column;
         let field_id = self.declared.iter().find(is_column)?.field_id?;
         let name = self.scanned.name_by_field_id(field_id)?;

@@ -1,15 +1,17 @@
 use super::super::super::support::collect_all_column_names;
-use super::super::planning::{JoinLeaf, JoinSides, JoinWindowPlan, disjoint_schema_guard};
+use super::super::planning::JoinLeaf;
 use super::super::sql_builders::{
-    JoinScanRequestConfig, RenderedJoinPushdown, build_broadcast_join_sql, build_n_scan_join_sql,
-    build_side_fan_out_sql, render_broadcast_join,
+    JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql, build_side_fan_out_sql,
+    render_broadcast_join,
 };
 use super::super::tests::{
-    detected_join, equi_condition, join_request, legs_from_leaves, resolved_side, two_scan_tuning,
+    broadcast_projection, detected_join, equi_condition, join_request, legs_from_leaves,
+    resolved_side, two_scan_tuning,
 };
 use super::*;
-use crate::adapter::pushdown::support::apply_type_rewrites;
+use crate::adapter::pushdown::support::{ColumnTypes, apply_type_rewrites};
 use crate::adapter::pushdown::test_support::*;
+use crate::scan::spec::ColumnRef;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
 
 /// One unaliased leg per name, in FROM-tree order.
@@ -45,51 +47,6 @@ fn self_join_legs() -> JoinLegs {
 }
 
 #[test]
-fn disjoint_schema_guard_passes_for_disjoint_column_names() {
-    let request = join_request(Json::Null, equi_condition());
-    let left = involved_table_columns(&request, "CUSTOMER");
-    let right = involved_table_columns(&request, "ORDERS");
-    assert!(
-        disjoint_schema_guard(&left, &right),
-        "C_* and O_* column sets are disjoint and must pass the guard"
-    );
-}
-
-#[test]
-fn overlapping_column_name_fails_guard_and_declines_without_error() {
-    let mut request = join_request(Json::Null, equi_condition());
-    for table_idx in [0, 1] {
-        request["involvedTables"][table_idx]["columns"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!({
-                "name": "SHARED_KEY",
-                "dataType": {"type": "varchar", "size": 10}
-            }));
-    }
-
-    let left = involved_table_columns(&request, "CUSTOMER");
-    let right = involved_table_columns(&request, "ORDERS");
-    assert!(
-        !disjoint_schema_guard(&left, &right),
-        "a shared column name must fail the disjoint guard"
-    );
-
-    let detected = detected_join(&request);
-    let outcome = render_broadcast_join(
-        &request,
-        &pd(&request),
-        &detected,
-        &BinaryColumns::default(),
-    )
-    .expect("a guard failure is a decline, not an error");
-    assert!(
-        outcome.is_none(),
-        "a column-name collision must decline to the unaccelerated path"
-    );
-}
-
-#[test]
 fn join_condition_renders_via_translator() {
     assert_eq!(
         render_expression_safe(&equi_condition()).as_deref(),
@@ -105,9 +62,12 @@ fn join_condition_renders_via_translator() {
         &detected,
         &BinaryColumns::default(),
     )
-    .expect("disjoint, renderable join")
-    .expect("a disjoint join must render, not decline");
-    assert_eq!(rendered.condition, r#"("C_CUSTKEY" = "O_CUSTKEY")"#);
+    .expect("renderable join")
+    .expect("an equi-join must render, not decline");
+    assert_eq!(
+        rendered.condition, r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#,
+        "each operand is qualified by its own leg's alias"
+    );
 }
 
 #[test]
@@ -116,12 +76,10 @@ fn join_where_filter_spanning_both_sides_renders() {
     request["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
-            {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-             "right": {"type": "literal_string", "value": "ACME"}},
+            predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
             {"type": "predicate_greater",
-             "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
-             "right": {"type": "literal_string", "value": "1995-01-01"}},
+             "left": table_col("ORDERS", "O_ORDERDATE"),
+             "right": str_lit("1995-01-01")},
         ],
     });
 
@@ -132,18 +90,18 @@ fn join_where_filter_spanning_both_sides_renders() {
         &detected,
         &BinaryColumns::default(),
     )
-    .expect("disjoint, renderable join")
+    .expect("renderable join")
     .expect("must render");
     let filter = rendered
         .filter
         .expect("a cross-side WHERE filter must render");
     assert!(
-        filter.contains(r#""C_NAME""#),
-        "the left-side column must appear in the rendered filter: {filter}"
+        filter.contains(r#""LHS_T0"."C_NAME""#),
+        "the left-side column must appear qualified by its leg in the rendered filter: {filter}"
     );
     assert!(
-        filter.contains(r#""O_ORDERDATE""#),
-        "the right-side column must appear in the rendered filter: {filter}"
+        filter.contains(r#""LHS_T1"."O_ORDERDATE""#),
+        "the right-side column must appear qualified by its leg in the rendered filter: {filter}"
     );
     assert!(
         filter.contains("AND"),
@@ -154,17 +112,15 @@ fn join_where_filter_spanning_both_sides_renders() {
 #[test]
 fn join_projection_emits_attribute_each_side_owning_type() {
     let request = join_request(Json::Null, equi_condition());
-    let detected = detected_join(&request);
-    let (projection, types, _widened) =
-        extract_join_projection(&request, &pd(&request), &detected).expect("projectable");
+    let (projection, types, _widened) = broadcast_projection(&request);
 
     assert_eq!(
         projection,
         vec![
-            ProjectionItem::Column("C_NAME".into()),
-            ProjectionItem::Column("O_ORDERDATE".into()),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "C_NAME")),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "O_ORDERDATE")),
         ],
-        "projection spans both tables in select-list order"
+        "projection spans both tables in select-list order, each column qualified by its leg"
     );
     assert_eq!(
         types,
@@ -181,13 +137,11 @@ fn join_projection_resolves_cast_node_to_expr_not_full_row_fallback() {
             "type": "function_scalar_cast",
             "name": "CAST",
             "dataType": {"type": "varchar", "size": 2000000},
-            "arguments": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}]
+            "arguments": [table_col("CUSTOMER", "C_NAME")]
         }
     ]);
 
-    let detected = detected_join(&request);
-    let (projection, _types, _widened) =
-        extract_join_projection(&request, &pd(&request), &detected).expect("projectable");
+    let (projection, _types, _widened) = broadcast_projection(&request);
 
     assert_eq!(
         projection.len(),
@@ -205,19 +159,16 @@ fn join_projection_resolves_cast_node_to_expr_not_full_row_fallback() {
 #[test]
 fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
     let request = join_request(Json::Null, equi_condition());
-    let detected = detected_join(&request);
 
     let mut coerce_request = request.clone();
     coerce_request["pushdownRequest"]["selectList"] = serde_json::json!([
         {
             "type": "function_scalar",
             "name": "UPPER",
-            "arguments": [{"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}]
+            "arguments": [table_col("CUSTOMER", "C_CUSTKEY")]
         }
     ]);
-    let (projection, _types, _widened) =
-        extract_join_projection(&coerce_request, &pd(&coerce_request), &detected)
-            .expect("projectable");
+    let (projection, _types, _widened) = broadcast_projection(&coerce_request);
     assert_eq!(
         projection.len(),
         1,
@@ -228,7 +179,9 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
         panic!("must be a rendered expression, not a bare column: {projection:?}");
     };
     assert!(
-        expr.contains(r#"upper(regexp_replace(regexp_replace(CAST("C_CUSTKEY" AS VARCHAR)"#),
+        expr.contains(
+            r#"upper(regexp_replace(regexp_replace(CAST("LHS_T0"."C_CUSTKEY" AS VARCHAR)"#
+        ),
         "UPPER's DECIMAL argument must render through the trimmed decimal-to-string \
          form: {expr}"
     );
@@ -239,15 +192,13 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
             "type": "function_scalar",
             "name": "INSTR",
             "arguments": [
-                {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-                {"type": "literal_string", "value": "b"},
-                {"type": "literal_exactnumeric", "value": 3}
+                table_col("CUSTOMER", "C_NAME"),
+                str_lit("b"),
+                num_lit(3)
             ]
         }
     ]);
-    let (projection, _types, _widened) =
-        extract_join_projection(&decline_request, &pd(&decline_request), &detected)
-            .expect("projectable");
+    let (projection, _types, _widened) = broadcast_projection(&decline_request);
     let expected_full_row_len = involved_table_columns(&decline_request, "CUSTOMER").len()
         + involved_table_columns(&decline_request, "ORDERS").len();
     assert_eq!(
@@ -261,19 +212,16 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
 #[test]
 fn join_projection_like_guard_reaches_join_select_list() {
     let request = join_request(Json::Null, equi_condition());
-    let detected = detected_join(&request);
 
     let mut string_request = request.clone();
     string_request["pushdownRequest"]["selectList"] = serde_json::json!([
         {
             "type": "predicate_like",
-            "expression": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-            "pattern": {"type": "literal_string", "value": "A%"}
+            "expression": table_col("CUSTOMER", "C_NAME"),
+            "pattern": str_lit("A%")
         }
     ]);
-    let (projection, _types, widened) =
-        extract_join_projection(&string_request, &pd(&string_request), &detected)
-            .expect("projectable");
+    let (projection, _types, widened) = broadcast_projection(&string_request);
     assert!(
         !widened,
         "a VARCHAR subject must keep the broadcast projection, not widen to the \
@@ -289,7 +237,7 @@ fn join_projection_like_guard_reaches_join_select_list() {
         panic!("must be a rendered expression, not a bare column: {projection:?}");
     };
     assert!(
-        expr.contains("C_NAME") && expr.contains("LIKE"),
+        expr.contains(r#""LHS_T0"."C_NAME""#) && expr.contains("LIKE"),
         "the VARCHAR subject must render as a LIKE expression over C_NAME: {expr}"
     );
 
@@ -297,17 +245,15 @@ fn join_projection_like_guard_reaches_join_select_list() {
     decline_request["pushdownRequest"]["selectList"] = serde_json::json!([
         {
             "type": "predicate_like",
-            "expression": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-            "pattern": {"type": "literal_string", "value": "1%"}
+            "expression": table_col("CUSTOMER", "C_CUSTKEY"),
+            "pattern": str_lit("1%")
         }
     ]);
-    let (projection, _types, widened) =
-        extract_join_projection(&decline_request, &pd(&decline_request), &detected)
-            .expect("projectable");
+    let (projection, _types, widened) = broadcast_projection(&decline_request);
     assert!(
         widened,
         "the widening flag is what declines the broadcast join to the N-scan \
-         fallback (joins/sql_builders.rs:85); a DECIMAL-subject LIKE must set it: \
+         fallback; a DECIMAL-subject LIKE must set it: \
          {projection:?}"
     );
     let expected_full_row_len = involved_table_columns(&decline_request, "CUSTOMER").len()
@@ -332,12 +278,10 @@ fn leg_local_filter_attributes_conjuncts_to_owning_leg() {
     let filter = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
-            {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-             "right": {"type": "literal_string", "value": "ACME"}},
+            predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
             {"type": "predicate_greater",
-             "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
-             "right": {"type": "literal_string", "value": "1995-01-01"}},
+             "left": table_col("ORDERS", "O_ORDERDATE"),
+             "right": str_lit("1995-01-01")},
         ],
     });
 
@@ -366,12 +310,8 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
     let filter = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
-            {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-             "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}},
-            {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-             "right": {"type": "literal_string", "value": "ACME"}},
+            predicate_equal(table_col("CUSTOMER", "C_CUSTKEY"), table_col("ORDERS", "O_CUSTKEY")),
+            predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
         ],
     });
     let legs = customer_orders_legs();
@@ -391,12 +331,10 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
     let or_filter = serde_json::json!({
         "type": "predicate_or",
         "expressions": [
-            {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-             "right": {"type": "literal_string", "value": "ACME"}},
+            predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
             {"type": "predicate_greater",
-             "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
-             "right": {"type": "literal_string", "value": "1995-01-01"}},
+             "left": table_col("ORDERS", "O_ORDERDATE"),
+             "right": str_lit("1995-01-01")},
         ],
     });
     assert!(leg_local_filter(&or_filter, &legs, 0).is_none());
@@ -405,12 +343,8 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
     let one_side_or = serde_json::json!({
         "type": "predicate_or",
         "expressions": [
-            {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-             "right": {"type": "literal_string", "value": "ACME"}},
-            {"type": "predicate_equal",
-             "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-             "right": {"type": "literal_string", "value": "GLOBEX"}},
+            predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
+            predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("GLOBEX")),
         ],
     });
     assert!(
@@ -422,11 +356,7 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
 
 #[test]
 fn leg_local_filter_handles_a_single_conjunct() {
-    let single = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-        "right": {"type": "literal_string", "value": "ACME"}
-    });
+    let single = predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME"));
     let legs = customer_orders_legs();
     assert!(leg_local_filter(&single, &legs, 0).is_some());
     assert!(leg_local_filter(&single, &legs, 1).is_none());
@@ -438,11 +368,9 @@ fn leg_local_filter_attributes_shared_column_by_leg_not_name() {
         "type": "predicate_and",
         "expressions": [
             {"type": "predicate_greater",
-             "left": {"type": "column", "name": "ID", "tableName": "EVENTS"},
-             "right": {"type": "literal_exactnumeric", "value": 5}},
-            {"type": "predicate_equal",
-             "left": {"type": "column", "name": "LABEL", "tableName": "LABELS"},
-             "right": {"type": "literal_string", "value": "x"}},
+             "left": table_col("EVENTS", "ID"),
+             "right": num_lit(5)},
+            predicate_equal(table_col("LABELS", "LABEL"), str_lit("x")),
         ],
     });
 
@@ -472,13 +400,9 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
         "type": "predicate_and",
         "expressions": [
             {"type": "predicate_greater",
-             "left": {"type": "column", "name": "O_ORDERKEY", "tableName": "FACT_ORDERS",
-                      "tableAlias": "A"},
-             "right": {"type": "literal_exactnumeric", "value": 5}},
-            {"type": "predicate_equal",
-             "left": {"type": "column", "name": "O_ORDERKEY", "tableName": "FACT_ORDERS",
-                      "tableAlias": "B"},
-             "right": {"type": "literal_exactnumeric", "value": 7}},
+             "left": aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"),
+             "right": num_lit(5)},
+            predicate_equal(aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"), num_lit(7)),
         ],
     });
     let legs = self_join_legs();
@@ -506,8 +430,8 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
 fn orders_local_rendering_conjunct() -> Json {
     serde_json::json!({
         "type": "predicate_greater",
-        "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
-        "right": {"type": "literal_string", "value": "1995-01-01"}
+        "left": table_col("ORDERS", "O_ORDERDATE"),
+        "right": str_lit("1995-01-01")
     })
 }
 
@@ -519,11 +443,11 @@ fn orders_local_declined_conjunct() -> Json {
             "type": "function_scalar",
             "name": "SECOND",
             "arguments": [
-                {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
-                {"type": "literal_exactnumeric", "value": 3}
+                table_col("ORDERS", "O_ORDERDATE"),
+                num_lit(3)
             ]
         },
-        "right": {"type": "literal_exactnumeric", "value": 1}
+        "right": num_lit(1)
     })
 }
 
@@ -635,8 +559,8 @@ fn orders_col_types() -> Vec<(String, String)> {
 fn like_over(column: &str, table: &str, pattern: &str) -> Json {
     serde_json::json!({
         "type": "predicate_like",
-        "expression": {"type": "column", "name": column, "tableName": table},
-        "pattern": {"type": "literal_string", "value": pattern}
+        "expression": table_col(table, column),
+        "pattern": str_lit(pattern)
     })
 }
 
@@ -772,13 +696,13 @@ fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
             {"type": "function_scalar_cast", "name": "CAST",
              "dataType": {"type": "VARCHAR", "size": 40},
              "arguments": [
-                 {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}]},
-            {"type": "literal_exactnumeric", "value": 3}
+                 table_col("CUSTOMER", "C_CUSTKEY")]},
+            num_lit(3)
         ]},
-        "right": {"type": "literal_exactnumeric", "value": 1}
+        "right": num_lit(1)
     });
 
-    let rewritten = apply_type_rewrites(&filter, &col_types)
+    let rewritten = apply_type_rewrites(&filter, &ColumnTypes::unqualified(&col_types))
         .expect("precondition: the type pipeline ACCEPTS this tree");
     assert!(
         rewritten.to_string().contains("decimal_to_varchar_exasol"),
@@ -854,16 +778,13 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
 #[test]
 fn referenced_leg_columns_narrows_to_used_columns() {
     let pushdown_req = serde_json::json!({
-        "selectList": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}],
-        "filter": {"type": "predicate_equal",
-            "left": {"type": "column", "name": "C_ADDRESS", "tableName": "CUSTOMER"},
-            "right": {"type": "literal_string", "value": "z"}},
+        "selectList": [table_col("CUSTOMER", "C_NAME")],
+        "filter": predicate_equal(table_col("CUSTOMER", "C_ADDRESS"), str_lit("z")),
     });
-    let condition = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}
-    });
+    let condition = predicate_equal(
+        table_col("CUSTOMER", "C_CUSTKEY"),
+        table_col("ORDERS", "O_CUSTKEY"),
+    );
     let full = vec![
         ("C_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string()),
         ("C_NAME".to_string(), "VARCHAR(100)".to_string()),
@@ -886,11 +807,10 @@ fn referenced_leg_columns_narrows_to_used_columns() {
 
 #[test]
 fn referenced_leg_columns_keeps_all_when_select_list_absent() {
-    let condition = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}
-    });
+    let condition = predicate_equal(
+        table_col("CUSTOMER", "C_CUSTKEY"),
+        table_col("ORDERS", "O_CUSTKEY"),
+    );
     let full = vec![
         ("C_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string()),
         ("C_NAME".to_string(), "VARCHAR(100)".to_string()),
@@ -911,7 +831,7 @@ fn referenced_leg_columns_keeps_all_when_select_list_absent() {
 #[test]
 fn referenced_leg_columns_keeps_all_when_narrowing_empty() {
     let pushdown_req = serde_json::json!({
-        "selectList": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}],
+        "selectList": [table_col("CUSTOMER", "C_NAME")],
     });
     let condition = equi_condition();
     let full = vec![
@@ -934,9 +854,7 @@ fn referenced_leg_columns_keeps_all_when_narrowing_empty() {
 
 #[test]
 fn column_collectors_keep_divergent_case_folding() {
-    let expr = serde_json::json!({
-        "type": "column", "name": "straße", "tableName": "CUSTOMER",
-    });
+    let expr = table_col("CUSTOMER", "straße");
 
     let mut unicode_folded = std::collections::HashSet::new();
     collect_all_column_names(&expr, &mut unicode_folded);
@@ -968,8 +886,8 @@ fn side_fan_out_pushes_bare_side_local_filter_into_common_blob() {
     ];
     let filter = serde_json::json!({
         "type": "predicate_greater",
-        "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "FACT_ORDERS", "tableAlias": "O"},
-        "right": {"type": "literal_string", "value": "1995-01-01"}
+        "left": aliased_col("FACT_ORDERS", "O", "O_ORDERDATE"),
+        "right": str_lit("1995-01-01")
     });
 
     let sql_with = build_side_fan_out_sql(
@@ -1038,32 +956,22 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         vec![("s3://w/l-0.parquet", 1000), ("s3://w/l-1.parquet", 1000)],
     );
     let dimension = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]);
-    let sides = JoinSides {
-        fact,
-        dimension,
-        broadcast_eligible: true,
-    };
-    let rendered = RenderedJoinPushdown {
-        condition: r#""L_ORDERKEY" = "O_ORDERKEY""#.to_string(),
-        filter: None,
-        projection: vec![ProjectionItem::Column("L_ORDERKEY".to_string())],
-        projection_types: vec!["DECIMAL(20,0)".to_string()],
-    };
+    let sides = broadcast_sides(fact, dimension, 1);
+    let rendered = rendered_join(
+        r#""LHS_T0"."L_ORDERKEY" = "LHS_T1"."O_ORDERKEY""#,
+        &[(
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "L_ORDERKEY")),
+            "DECIMAL(20,0)",
+        )],
+    );
     let tuning = JoinScanRequestConfig {
         cluster_nodes: 2,
         parallelism_factor: 1,
         ..two_scan_tuning()
     };
-    let sql = build_broadcast_join_sql(
-        &sides,
-        &rendered,
-        JoinWindowPlan::Unbounded,
-        &tuning,
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("selecting the wire storage must succeed")
-    .expect("an unbounded broadcast join must build");
+    let sql = build_broadcast_join_sql(&sides, &rendered, &tuning, "SCAN", "DISTRIBUTE")
+        .expect("selecting the wire storage must succeed")
+        .expect("an unbounded broadcast join must build");
 
     assert!(
         !sql.contains("SELECT * FROM ("),
@@ -1080,12 +988,12 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
 }
 
 #[test]
-fn render_broadcast_join_strips_native_table_alias_from_filter() {
+fn render_broadcast_join_replaces_native_table_alias_in_filter_with_leg_alias() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_greater",
-        "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS", "tableAlias": "O"},
-        "right": {"type": "literal_string", "value": "1995-01-01"}
+        "left": aliased_col("ORDERS", "O", "O_ORDERDATE"),
+        "right": str_lit("1995-01-01")
     });
     let detected = detected_join(&request);
     let rendered = render_broadcast_join(
@@ -1095,25 +1003,24 @@ fn render_broadcast_join_strips_native_table_alias_from_filter() {
         &BinaryColumns::default(),
     )
     .expect("renders")
-    .expect("disjoint join renders");
+    .expect("an equi-join renders");
     let filter = rendered.filter.expect("filter renders");
     assert!(
-        filter.contains(r#""O_ORDERDATE""#),
-        "the filter must still reference the column: {filter}"
+        filter.contains(r#""LHS_T1"."O_ORDERDATE""#),
+        "the filter must reference the column on its leg's relation: {filter}"
     );
     assert!(
         !filter.contains(r#""O"."O_ORDERDATE""#),
-        "broadcast rendering must strip Exasol's native tableAlias (bare, unqualified): {filter}"
+        "Exasol's native tableAlias names no relation of the scan's join: {filter}"
     );
 }
 
 #[test]
-fn render_broadcast_join_strips_native_table_alias_from_condition() {
-    let condition = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER", "tableAlias": "C"},
-        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS", "tableAlias": "O"},
-    });
+fn render_broadcast_join_replaces_native_table_alias_in_condition_with_leg_alias() {
+    let condition = predicate_equal(
+        aliased_col("CUSTOMER", "C", "C_CUSTKEY"),
+        aliased_col("ORDERS", "O", "O_CUSTKEY"),
+    );
     let request = join_request(Json::Null, condition);
     let detected = detected_join(&request);
     let rendered = render_broadcast_join(
@@ -1122,18 +1029,21 @@ fn render_broadcast_join_strips_native_table_alias_from_condition() {
         &detected,
         &BinaryColumns::default(),
     )
-    .expect("disjoint, renderable join")
-    .expect("a disjoint join must render, not decline");
-    assert_eq!(rendered.condition, r#"("C_CUSTKEY" = "O_CUSTKEY")"#);
+    .expect("renderable join")
+    .expect("an equi-join must render, not decline");
+    assert_eq!(
+        rendered.condition,
+        r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#
+    );
 }
 
 #[test]
-fn render_broadcast_join_strips_native_table_alias_from_projection() {
+fn render_broadcast_join_replaces_native_table_alias_in_projection_with_leg_alias() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["selectList"] = serde_json::json!([
         {"type": "function_scalar", "name": "MULT", "arguments": [
-            {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS", "tableAlias": "O"},
-            {"type": "literal_exactnumeric", "value": 2}
+            aliased_col("ORDERS", "O", "O_CUSTKEY"),
+            num_lit(2)
         ]}
     ]);
     let detected = detected_join(&request);
@@ -1144,11 +1054,11 @@ fn render_broadcast_join_strips_native_table_alias_from_projection() {
         &BinaryColumns::default(),
     )
     .expect("renders")
-    .expect("disjoint join renders");
+    .expect("an equi-join renders");
     assert_eq!(rendered.projection.len(), 1, "{:?}", rendered.projection);
     match &rendered.projection[0] {
         ProjectionItem::Expr { expr } => {
-            assert_eq!(expr, r#"("O_CUSTKEY" * 2)"#);
+            assert_eq!(expr, r#"("LHS_T1"."O_CUSTKEY" * 2)"#);
         }
         other => panic!("expected an Expr projection item, got {other:?}"),
     }
@@ -1170,22 +1080,15 @@ fn unified_join_prunes_and_narrows_each_leg() {
             ],
             "pushdownRequest": {
                 "type": "select",
-                "from": {"type": "join", "join_type": "inner",
-                    "left": {"name": "CUSTOMER", "type": "table"},
-                    "right": {"name": "ORDERS", "type": "table"},
-                    "condition": {"type": "predicate_equal",
-                        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-                        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}}},
+                "from": customer_orders_join(),
                 "selectList": [
-                    {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-                    {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"}],
+                    table_col("CUSTOMER", "C_NAME"),
+                    table_col("ORDERS", "O_ORDERDATE")],
                 "filter": {"type": "predicate_and", "expressions": [
-                    {"type": "predicate_equal",
-                     "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-                     "right": {"type": "literal_string", "value": "ACME"}},
+                    predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
                     {"type": "predicate_greater",
-                     "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
-                     "right": {"type": "literal_string", "value": "1995-01-01"}}]},
+                     "left": table_col("ORDERS", "O_ORDERDATE"),
+                     "right": str_lit("1995-01-01")}]},
             },
             "schemaMetadataInfo": {"properties": {}},
         }),
@@ -1240,12 +1143,16 @@ fn unified_join_prunes_and_narrows_each_leg() {
 /// Scenario: A filter on a binary column selects what native Exasol selects over the hex text
 #[test]
 fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
-    let c_name_is_binary = BinaryColumns::of(&[nullable_field("c_name", "binary")], false);
-    let filter = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
-        "right": {"type": "literal_string", "value": "0a1b"},
-    });
+    let c_name = [nullable_field("c_name", "binary")];
+    let c_name_is_binary = BinaryColumns::of(&c_name, false);
+    let legs_c_name_is_binary = BinaryColumns::per_relation(
+        [
+            ("LHS_T0".to_string(), &c_name[..]),
+            ("LHS_T1".to_string(), &[][..]),
+        ],
+        false,
+    );
+    let filter = predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("0a1b"));
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = filter.clone();
 
@@ -1253,13 +1160,13 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
         &request,
         &pd(&request),
         &detected_join(&request),
-        &c_name_is_binary,
+        &legs_c_name_is_binary,
     )
-    .expect("disjoint, renderable join")
+    .expect("renderable join")
     .expect("must render");
     assert_eq!(
         rendered.filter.as_deref(),
-        Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#)
+        Some(r#"("LHS_T0"."_LH_BYTES_C_NAME" = X'0a1b')"#)
     );
 
     let customer = involved_table_columns(&request, "CUSTOMER");

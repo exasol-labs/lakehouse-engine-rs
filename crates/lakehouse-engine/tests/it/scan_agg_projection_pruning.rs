@@ -2,6 +2,7 @@
 //! group-key SQL, not by `ScanSpec.projection` (#145).
 
 use crate::scan_fixture;
+use crate::scan_fixture::WithFiles;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -61,20 +62,18 @@ fn agg_spec(file_url: String) -> ScanSpec {
     let size = std::fs::metadata(path)
         .unwrap_or_else(|e| panic!("stat test parquet file {path}: {e}"))
         .len();
-    ScanSpec {
-        common: CommonScanSpec {
-            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
-                endpoint: "http://localhost:9000".into(),
-                region: "us-east-1".into(),
-                access_key: "k".into(),
-                secret_key: "s".into(),
-                allow_http: true,
-                ..Default::default()
-            })),
+    CommonScanSpec {
+        storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
+            endpoint: "http://localhost:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            allow_http: true,
             ..Default::default()
-        },
-        files: vec![FileEntry::new(file_url, size)],
+        })),
+        ..Default::default()
     }
+    .with_files(vec![FileEntry::new(file_url, size)])
 }
 
 async fn build_agg_physical_plan(

@@ -1,4 +1,5 @@
 use crate::scan_fixture;
+use crate::scan_fixture::WithFiles;
 
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
@@ -16,8 +17,8 @@ use exasol_udf_sdk::test_support::{EmitPolicy, TestContext};
 use exasol_udf_sdk::value::{ExaType, Value};
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec, ScanStorage, SortKey,
-    StorageBackend, StorageProps,
+    ColumnRef, CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ProjectionItem,
+    ScanSpec, ScanStorage, SortKey, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_join_physical_plan, run_join_scan_with_session, session_config_for_spec,
@@ -53,7 +54,7 @@ fn sized(url: String) -> (String, u64) {
     (url, len)
 }
 
-/// Column names are disjoint from the dimension side (the VS disjoint-column guarantee).
+/// The orders fact relation: [`qualified`] binds every column without the `C_` prefix to it.
 fn write_orders(dir: &std::path::Path) -> (String, u64) {
     let field_id_meta =
         |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
@@ -177,29 +178,24 @@ fn join_spec(
     filter: Option<&str>,
     limit: Option<u64>,
 ) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: projection.into_iter().map(Into::into).collect(),
-            filter: filter.map(Into::into),
-            join: Some(JoinSpec {
-                table_root: String::new(),
-                files: dim_files.into_iter().map(FileEntry::from).collect(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join_type: JoinType::Inner,
-                condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
-                post_join_limit: limit,
-                post_join_order_by: Vec::new(),
-                partition_columns: Vec::new(),
-                storage: ScanStorage::Inline(dim_storage()),
-            }),
-            storage: ScanStorage::Inline(storage()),
-            // Above one target partition DataFusion defaults joins to `Partitioned` mode.
-            df_target_partitions: 4,
-            ..Default::default()
-        },
-        files: fact_files.into_iter().map(FileEntry::from).collect(),
+    CommonScanSpec {
+        projection: projection
+            .into_iter()
+            .map(|name| ProjectionItem::Column(qualified(name)))
+            .collect(),
+        filter: filter.map(Into::into),
+        join: Some(JoinSpec {
+            files: dim_files.into_iter().map(FileEntry::from).collect(),
+            condition: JOIN_CONDITION.into(),
+            post_join_limit: limit,
+            ..scan_fixture::join_spec(ScanStorage::Inline(dim_storage()))
+        }),
+        storage: ScanStorage::Inline(storage()),
+        // Above one target partition DataFusion defaults joins to `Partitioned` mode.
+        df_target_partitions: 4,
+        ..Default::default()
     }
+    .with_files(fact_files.into_iter().map(FileEntry::from).collect())
 }
 
 fn run_join(spec: &ScanSpec, emits: &[ExaType]) -> Vec<RecordBatch> {
@@ -261,13 +257,31 @@ fn ordered_top_n_join_fixture() -> (tempfile::TempDir, ScanSpec) {
         ],
         2,
     );
-    spec.common.order_by = vec![sort_key("O_ORDERKEY", true, true)];
+    spec.common.order_by = vec![SortKey {
+        column: "O_ORDERKEY".into(),
+        ascending: true,
+        nulls_last: true,
+    }];
     (tmp, spec)
+}
+
+const DIM_ALIAS: &str = "LHS_T0";
+const FACT_ALIAS: &str = "LHS_T1";
+const JOIN_CONDITION: &str = "\"LHS_T0\".\"C_CUSTKEY\" = \"LHS_T1\".\"O_CUSTKEY\"";
+
+/// The TPC-H prefix names the relation: `C_` is the customer dimension, `O_` the orders fact.
+fn qualified(column: &str) -> ColumnRef {
+    let relation = if column.starts_with("C_") {
+        DIM_ALIAS
+    } else {
+        FACT_ALIAS
+    };
+    ColumnRef::qualified(relation, column)
 }
 
 fn sort_key(column: &str, ascending: bool, nulls_last: bool) -> SortKey {
     SortKey {
-        column: column.into(),
+        column: qualified(column),
         ascending,
         nulls_last,
     }
@@ -331,7 +345,7 @@ fn join_spec_reconstitutes_two_file_lists() {
         "dimension file list must round-trip"
     );
     assert_eq!(join.join_type, JoinType::Inner);
-    assert_eq!(join.condition, "\"C_CUSTKEY\" = \"O_CUSTKEY\"");
+    assert_eq!(join.condition, JOIN_CONDITION);
 
     assert_ne!(
         reconstituted.files, join.files,
@@ -408,7 +422,7 @@ fn join_projection_filter_limit_streamed() {
         vec![orders],
         vec![customer],
         vec!["O_ORDERKEY", "O_TOTALPRICE", "C_NAME"],
-        Some("\"O_CUSTKEY\" = 10"),
+        Some("\"LHS_T1\".\"O_CUSTKEY\" = 10"),
         Some(1),
     );
     let batches = run_join(
@@ -465,42 +479,33 @@ fn each_join_side_materializes_its_own_partition_columns() {
         BTreeMap::from([("c_country".to_string(), Some("CA".to_string()))]),
     );
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec![
-                "O_ORDERKEY".into(),
-                "O_REGION".into(),
-                "C_NAME".into(),
-                "C_COUNTRY".into(),
-            ],
+    let spec = CommonScanSpec {
+        projection: ["O_ORDERKEY", "O_REGION", "C_NAME", "C_COUNTRY"]
+            .into_iter()
+            .map(|name| ProjectionItem::Column(qualified(name)))
+            .collect(),
+        logical_schema: vec![
+            logical_field(1, "o_orderkey", "int64"),
+            logical_field(2, "o_custkey", "int64"),
+            logical_field(3, "o_totalprice", "float64"),
+            logical_field(4, "o_region", "utf8"),
+        ],
+        partition_columns: vec!["o_region".to_string()],
+        join: Some(JoinSpec {
+            files: vec![dim_file],
             logical_schema: vec![
-                logical_field(1, "o_orderkey", "int64"),
-                logical_field(2, "o_custkey", "int64"),
-                logical_field(3, "o_totalprice", "float64"),
-                logical_field(4, "o_region", "utf8"),
+                logical_field(1, "c_custkey", "int64"),
+                logical_field(2, "c_name", "utf8"),
+                logical_field(3, "c_country", "utf8"),
             ],
-            partition_columns: vec!["o_region".to_string()],
-            join: Some(JoinSpec {
-                table_root: String::new(),
-                files: vec![dim_file],
-                logical_schema: vec![
-                    logical_field(1, "c_custkey", "int64"),
-                    logical_field(2, "c_name", "utf8"),
-                    logical_field(3, "c_country", "utf8"),
-                ],
-                name_mapping: Vec::new(),
-                join_type: JoinType::Inner,
-                condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
-                post_join_limit: None,
-                post_join_order_by: Vec::new(),
-                partition_columns: vec!["c_country".to_string()],
-                storage: ScanStorage::Inline(dim_storage()),
-            }),
-            storage: ScanStorage::Inline(storage()),
-            ..Default::default()
-        },
-        files: vec![fact_file],
-    };
+            condition: JOIN_CONDITION.into(),
+            partition_columns: vec!["c_country".to_string()],
+            ..scan_fixture::join_spec(ScanStorage::Inline(dim_storage()))
+        }),
+        storage: ScanStorage::Inline(storage()),
+        ..Default::default()
+    }
+    .with_files(vec![fact_file]);
 
     let batches = run_join(
         &spec,
@@ -881,14 +886,14 @@ fn join_returns_exact_rows_whatever_the_dimension_side_keeps() {
         (
             "empty_after_filter",
             vec![Some(3)],
-            Some("\"C_NAME\" = 'nobody'"),
+            Some("\"LHS_T0\".\"C_NAME\" = 'nobody'"),
             Vec::new(),
         ),
         ("null_keys", vec![None, Some(3)], None, clustered_rows([3])),
         (
             "join_key_filter",
             all_keys,
-            Some("\"O_CUSTKEY\" BETWEEN 2 AND 3"),
+            Some("\"LHS_T1\".\"O_CUSTKEY\" BETWEEN 2 AND 3"),
             clustered_rows([2, 3]),
         ),
     ];
@@ -1054,33 +1059,35 @@ fn a_dimension_side_read_failure_redacts_the_dimension_sides_credential() {
     let fact_endpoint = refusing_endpoint(&format!("{FACT_MARKER} TOPSECRETVALUE"));
     let dim_endpoint = refusing_endpoint(&format!("{DIM_MARKER} DIMSECRETVALUE"));
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["O_ORDERKEY".into(), "C_NAME".into()],
+    let spec = CommonScanSpec {
+        projection: vec![
+            ProjectionItem::Column(qualified("O_ORDERKEY")),
+            ProjectionItem::Column(qualified("C_NAME")),
+        ],
+        logical_schema: vec![
+            logical_field(1, "o_orderkey", "int64"),
+            logical_field(2, "o_custkey", "int64"),
+        ],
+        join: Some(JoinSpec {
+            table_root: "s3://test-bucket/db/dim".into(),
+            files: vec![FileEntry::new("data/dim-0.parquet", 4096)],
             logical_schema: vec![
-                logical_field(1, "o_orderkey", "int64"),
-                logical_field(2, "o_custkey", "int64"),
+                logical_field(1, "c_custkey", "int64"),
+                logical_field(2, "c_name", "utf8"),
             ],
-            join: Some(JoinSpec {
-                table_root: "s3://test-bucket/db/dim".into(),
-                files: vec![FileEntry::new("data/dim-0.parquet", 4096)],
-                logical_schema: vec![
-                    logical_field(1, "c_custkey", "int64"),
-                    logical_field(2, "c_name", "utf8"),
-                ],
-                name_mapping: Vec::new(),
-                join_type: JoinType::Inner,
-                condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
-                post_join_limit: None,
-                post_join_order_by: Vec::new(),
-                partition_columns: Vec::new(),
-                storage: ScanStorage::Inline(s3_backend(&dim_endpoint, "DIMSECRETVALUE")),
-            }),
-            storage: ScanStorage::Inline(s3_backend(&fact_endpoint, "TOPSECRETVALUE")),
-            ..Default::default()
-        },
-        files: vec![FileEntry::new("s3://test-bucket/data/part-0.parquet", 4096)],
-    };
+            condition: JOIN_CONDITION.into(),
+            ..scan_fixture::join_spec(ScanStorage::Inline(s3_backend(
+                &dim_endpoint,
+                "DIMSECRETVALUE",
+            )))
+        }),
+        storage: ScanStorage::Inline(s3_backend(&fact_endpoint, "TOPSECRETVALUE")),
+        ..Default::default()
+    }
+    .with_files(vec![FileEntry::new(
+        "s3://test-bucket/data/part-0.parquet",
+        4096,
+    )]);
 
     let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
         TestContext::scalar(vec![

@@ -1,3 +1,5 @@
+use crate::adapter::pushdown::test_support::{col, num_lit, str_lit};
+use crate::scan::test_support::WithFiles;
 use std::sync::Arc;
 
 use delta_kernel::scan::{Scan, StatsOptions};
@@ -887,7 +889,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 #[test]
 fn a_void_column_reads_as_all_null_under_name_column_mapping() {
     use super::super::delta_schema::classify_spark_schema;
-    use crate::scan::spec::{CommonScanSpec, ScanSpec};
+    use crate::scan::spec::CommonScanSpec;
     use crate::scan::{build_raw_scan_physical_plan, register_files, session_config_for_spec};
     use datafusion::execution::context::SessionContext;
 
@@ -927,16 +929,14 @@ fn a_void_column_reads_as_all_null_under_name_column_mapping() {
         "the void column is tagged utf8 and binds by the physical name no data file carries"
     );
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            table_root,
-            projection: vec!["VALUE".into(), "VOID_COL".into()],
-            logical_schema,
-            partition_columns,
-            ..Default::default()
-        },
-        files,
-    };
+    let spec = CommonScanSpec {
+        table_root,
+        projection: vec!["VALUE".into(), "VOID_COL".into()],
+        logical_schema,
+        partition_columns,
+        ..Default::default()
+    }
+    .with_files(files);
 
     let batches = block_on(async {
         let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
@@ -1198,9 +1198,9 @@ fn a_between_keeps_one_bound_when_the_other_fails_to_convert() {
     let schema = open_fixture("multi-part-stats").schema();
     let node = json!({
         "type": "predicate_between",
-        "expression": {"type": "column", "name": "ID"},
-        "left": {"type": "literal_exactnumeric", "value": 4},
-        "right": {"type": "literal_string", "value": "ten"},
+        "expression": col("ID"),
+        "left": num_lit(4),
+        "right": str_lit("ten"),
     });
     let predicate = to_delta_predicate(&node, &by_name(&schema))
         .expect("a BETWEEN must keep the bound it can translate");
@@ -1221,8 +1221,8 @@ fn a_between_keeps_one_bound_when_the_other_fails_to_convert() {
 fn an_or_with_an_untranslatable_branch_keeps_every_file() {
     let schema = open_fixture("multi-part-stats").schema();
     let node = json!({"type": "predicate_or", "expressions": [
-        {"type": "predicate_lessequal", "left": {"type": "column", "name": "ID"}, "right": {"type": "literal_exactnumeric", "value": 2}},
-        {"type": "predicate_notequal", "left": {"type": "column", "name": "ID"}, "right": {"type": "literal_exactnumeric", "value": 7}},
+        {"type": "predicate_lessequal", "left": col("ID"), "right": num_lit(2)},
+        {"type": "predicate_notequal", "left": col("ID"), "right": num_lit(7)},
     ]});
 
     assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);

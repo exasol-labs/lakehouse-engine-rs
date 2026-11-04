@@ -361,6 +361,8 @@ fn a_uuid_filter_plans_the_file_whose_bounds_are_in_signed_order() {
     assert_hex_literal_compares_bytes(&mut conn, &table, "U", low);
 }
 
+const LOW_BROADCAST_VS: &str = "LAKEHOUSE_VS_LOW_BROADCAST";
+
 /// Scenario: A filter on a binary column selects what native Exasol selects over the hex text
 #[test]
 fn a_join_compares_a_binary_filter_on_the_raw_bytes_on_both_join_paths() {
@@ -370,13 +372,12 @@ fn a_join_compares_a_binary_filter_on_the_raw_bytes_on_both_join_paths() {
         "{LAKEHOUSE_VS}.{}",
         E2E_IDENT_PART_BYTES_TABLE.to_uppercase()
     );
-    let all_types = format!("{LAKEHOUSE_VS}.{}", E2E_ALL_TYPES_TABLE.to_uppercase());
     let [Some(fixed), ..] = FIXED_16_VALUES_TEXT else {
         unreachable!("the first fixed value is non-NULL")
     };
     let expected = vec![Some("1".to_string()), Some("2".to_string())];
 
-    // Disjoint column names, so the join is broadcast.
+    // The dimension is within the default broadcast threshold, so the join is broadcast.
     let broadcast = format!(
         "SELECT P.ID FROM {parts} P JOIN {} O ON P.ID = O.O_ORDERKEY WHERE P.F = '{fixed}'",
         vs_fact_table()
@@ -386,7 +387,17 @@ fn a_join_compares_a_binary_filter_on_the_raw_bytes_on_both_join_paths() {
     assert!(pushed.contains("_LH_BYTES_F"), "{pushed}");
     assert_eq!(sorted_ids(&mut conn, &broadcast), expected);
 
-    // Both tables carry `ID`, so the join falls back to one scan per table, joined on hex text.
+    // Every table exceeds a 1-byte broadcast threshold, so the join falls back to one scan
+    // per table, joined on hex text.
+    create_virtual_schema(
+        &mut conn,
+        &VsProps::new(LOW_BROADCAST_VS, E2E_NAMESPACE).with_join_broadcast_max_bytes("1"),
+    );
+    let parts = format!(
+        "{LOW_BROADCAST_VS}.{}",
+        E2E_IDENT_PART_BYTES_TABLE.to_uppercase()
+    );
+    let all_types = format!("{LOW_BROADCAST_VS}.{}", E2E_ALL_TYPES_TABLE.to_uppercase());
     let n_scan = format!(
         "SELECT P.ID FROM {parts} P JOIN {all_types} A ON P.B = A.C_BINARY WHERE P.F = '{fixed}'"
     );

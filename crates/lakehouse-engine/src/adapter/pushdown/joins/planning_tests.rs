@@ -1,10 +1,8 @@
-use super::super::render_broadcast_join;
 use super::super::tests::{
     detected_join, equi_condition, join_request, nq3_join_request, resolved_side,
     self_join_request, three_table_join_request,
 };
 use super::*;
-use crate::adapter::pushdown::BinaryColumns;
 use crate::adapter::pushdown::test_support::*;
 
 #[test]
@@ -36,7 +34,7 @@ fn plain_single_table_request_is_not_a_join() {
 #[test]
 fn from_table_node_is_not_a_join() {
     let mut request = nq4_request();
-    request["pushdownRequest"]["from"] = serde_json::json!({"name": "LINEITEM", "type": "table"});
+    request["pushdownRequest"]["from"] = table_ref("LINEITEM");
     let shape = detect_join(&request, &pd(&request)).expect("not a join");
     assert_eq!(shape, JoinShape::NotAJoin);
 }
@@ -58,8 +56,8 @@ fn outer_join_is_ineligible() {
 fn non_equi_two_table_join_is_served_by_unified_fallback() {
     let condition = serde_json::json!({
         "type": "predicate_less",
-        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
-        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+        "left": table_col("CUSTOMER", "C_CUSTKEY"),
+        "right": table_col("ORDERS", "O_CUSTKEY"),
     });
     let request = join_request(Json::Null, condition.clone());
     match detect_join(&request, &pd(&request)).expect("served, not declined") {
@@ -278,6 +276,7 @@ fn dimension_is_left_when_left_side_is_smaller() {
 
     assert_eq!(sides.dimension.table_name, "CUSTOMER");
     assert_eq!(sides.fact.table_name, "ORDERS");
+    assert_eq!((sides.dimension_leg, sides.fact_leg()), (0, 1));
     assert_eq!(sides.dimension.total_bytes, 1_000);
     assert_eq!(sides.fact.total_bytes, 100_000);
     assert!(
@@ -300,6 +299,11 @@ fn dimension_is_right_when_right_side_is_smaller() {
 
     assert_eq!(sides.dimension.table_name, "CUSTOMER");
     assert_eq!(sides.fact.table_name, "ORDERS");
+    assert_eq!(
+        (sides.dimension_leg, sides.fact_leg()),
+        (1, 0),
+        "the dimension's leg is recorded, so the join block names its own relation alias"
+    );
     assert_eq!(sides.dimension.total_bytes, 1_000);
     assert!(sides.broadcast_eligible);
 }
@@ -363,26 +367,10 @@ fn equal_size_tie_breaks_to_first_argument() {
     let sides = select_broadcast_sides(a, b, BROADCAST_MAX);
 
     assert_eq!(sides.dimension.table_name, "SELF_A");
+    assert_eq!(
+        sides.dimension_leg, 0,
+        "a tie makes the first leg the dimension"
+    );
     assert_eq!(sides.fact.table_name, "SELF_B");
     assert_eq!(sides.dimension.total_bytes, sides.fact.total_bytes);
-}
-
-#[test]
-fn self_join_is_never_broadcast_eligible() {
-    let request = self_join_request(&[Some("A"), Some("B")]);
-    let join = detected_join(&request);
-
-    let left = involved_table_columns(&request, &join.tables[0].table_name);
-    let right = involved_table_columns(&request, &join.tables[1].table_name);
-    assert!(
-        !disjoint_schema_guard(&left, &right),
-        "a self-join's two occurrences declare the same columns, so the guard must decline it"
-    );
-
-    let rendered = render_broadcast_join(&request, &pd(&request), &join, &BinaryColumns::default())
-        .expect("no column-metadata error for a well-formed self-join request");
-    assert!(
-        rendered.is_none(),
-        "a self-join must never reach the broadcast path, only the clean N-scan fall-through"
-    );
 }

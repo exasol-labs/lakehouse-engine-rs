@@ -1,6 +1,7 @@
 //! Column-binding order in `bind_columns`: embedded `PARQUET:field_id` -> declared
 //! `physical_name` -> `name_mapping` -> identity.
 
+use crate::scan_fixture::WithFiles;
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array};
@@ -79,20 +80,15 @@ fn raw_scan_spec(
     logical_schema: Vec<LogicalField>,
     name_mapping: Vec<NameMappingEntry>,
 ) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: projection
-                .into_iter()
-                .map(|name| ProjectionItem::Column(name.to_string()))
-                .collect(),
-            logical_schema,
-            name_mapping,
-            storage: ScanStorage::Inline(dummy_storage()),
-            df_batch_size: 64,
-            ..Default::default()
-        },
-        files: vec![FileEntry::new(file_url, file_size)],
+    CommonScanSpec {
+        projection: projection.into_iter().map(ProjectionItem::from).collect(),
+        logical_schema,
+        name_mapping,
+        storage: ScanStorage::Inline(dummy_storage()),
+        df_batch_size: 64,
+        ..Default::default()
     }
+    .with_files(vec![FileEntry::new(file_url, file_size)])
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {

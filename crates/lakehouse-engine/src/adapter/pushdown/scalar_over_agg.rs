@@ -3,7 +3,7 @@
 
 use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column_name};
 use serde_json::Value as Json;
-use vs_expression::{render_expression, render_expression_exasol};
+use vs_expression::{ColumnNode, render_expression, render_expression_exasol};
 
 use super::support::{cast_to_declared_type, quote_ident};
 
@@ -48,7 +48,7 @@ pub(super) fn agg_sentinel_token(i: usize) -> String {
 }
 
 pub(super) fn sentinel_column_node(i: usize) -> Json {
-    serde_json::json!({ "type": "column", "name": agg_sentinel_name(i) })
+    ColumnNode::to_json(&agg_sentinel_name(i), None, None)
 }
 
 /// Recursion stops at a `function_aggregate`, so a column inside an aggregate is
@@ -66,8 +66,8 @@ pub(super) fn sentinelize_aggregates(
                 aggregates.push(node.clone());
                 sentinel_column_node(i)
             }
-            kind => {
-                if kind == Some("column") {
+            _ => {
+                if ColumnNode::parse(node).is_some() {
                     *residual_column = true;
                 }
                 let mut out = serde_json::Map::with_capacity(map.len());
@@ -140,15 +140,7 @@ const STAT_AGG_KINDS: &[(&str, AggKind)] = &[
 ];
 
 fn column_from_first_arg(args: Option<&Vec<Json>>) -> Option<String> {
-    args.and_then(|a| a.first()).and_then(|arg| {
-        if arg.get("type").and_then(|t| t.as_str()) == Some("column") {
-            arg.get("name")
-                .and_then(|n| n.as_str())
-                .map(|s| s.to_uppercase())
-        } else {
-            None
-        }
-    })
+    ColumnNode::parse(args?.first()?).map(|column| column.upper_name())
 }
 
 /// `None` when there is no argument or it cannot be rendered.
@@ -156,11 +148,8 @@ pub(super) fn arg_column_or_expr(
     args: Option<&Vec<Json>>,
 ) -> Option<(Option<String>, Option<String>)> {
     let arg = args.and_then(|a| a.first())?;
-    if arg.get("type").and_then(|t| t.as_str()) == Some("column") {
-        return arg
-            .get("name")
-            .and_then(|n| n.as_str())
-            .map(|s| (Some(s.to_uppercase()), None));
+    if let Some(column) = ColumnNode::parse(arg) {
+        return Some((Some(column.upper_name()), None));
     }
     render_expression(arg).ok().map(|sql| (None, Some(sql)))
 }

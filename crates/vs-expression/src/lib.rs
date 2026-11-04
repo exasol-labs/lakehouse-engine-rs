@@ -1,7 +1,9 @@
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
+mod column_node;
 mod datetime_format;
+pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
 use datetime_format::{FormatTarget, strftime_pattern};
 
 /// Which parser consumes the rendered fragment: DataFusion inside the scan UDF
@@ -538,22 +540,15 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             return Ok(None);
         }
         "column" => {
-            let name = value("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or("")
-                .to_uppercase();
-            let quoted = quote_ident(&name);
+            let column = ColumnNode::parse(expr)
+                .ok_or_else(|| UdfError::User("column node without a name".to_string()))?;
+            let quoted = quote_ident(&column.upper_name());
             // `tableAlias` is set only for multi-table renders (join wrapper), to
             // disambiguate a name shared by two joined subqueries.
-            return Ok(Some(
-                match value("tableAlias")
-                    .and_then(|a| a.as_str())
-                    .filter(|a| !a.is_empty())
-                {
-                    Some(alias) => format!("{}.{}", quote_ident(alias), quoted),
-                    None => quoted,
-                },
-            ));
+            return Ok(Some(match column.table_alias.filter(|a| !a.is_empty()) {
+                Some(alias) => format!("{}.{}", quote_ident(alias), quoted),
+                None => quoted,
+            }));
         }
         _ => {}
     }
@@ -1287,3 +1282,7 @@ pub fn render_df_filter_exasol_safe(filter_expr: &Json) -> Option<String> {
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "test_support_tests.rs"]
+mod test_support;

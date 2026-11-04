@@ -8,6 +8,7 @@ use super::super::support::{
 use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::{CommonScanSpec, ScanStorage};
+use crate::scan::test_support::WithFiles;
 
 #[test]
 fn sum_emit_type_absent_scale_widens_to_a_scale_zero_decimal() {
@@ -59,7 +60,7 @@ fn sum_emit_type_declines_every_precision_the_parser_rejects() {
 fn scalar_over_merge_casts_to_exasol_char_target() {
     let sum_node = serde_json::json!({
         "type": "function_aggregate", "name": "SUM", "distinct": false,
-        "arguments": [{"type": "column", "name": "x"}]
+        "arguments": [col("x")]
     });
     let plans = vec![parse_agg_item(&sum_node).expect("SUM(x) must parse to a plan")];
     let node = serde_json::json!({
@@ -88,7 +89,7 @@ fn scalar_over_merge_casts_to_exasol_char_target() {
 fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
     let sum_node = serde_json::json!({
         "type": "function_aggregate", "name": "SUM", "distinct": false,
-        "arguments": [{"type": "column", "name": "x"}]
+        "arguments": [col("x")]
     });
     let plans = vec![parse_agg_item(&sum_node).expect("SUM(x) must parse to a plan")];
     let char_type = serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "ASCII"});
@@ -119,9 +120,9 @@ fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
 fn grouped_count_distinct_falls_back_to_row_scan() {
     let req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
         "selectList": [
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             agg_item("COUNT", Some("L_SHIPMODE"), true),
         ],
     });
@@ -232,9 +233,9 @@ fn aggregate_falls_back_to_row_scan_for_sum_of_non_numeric() {
 fn grouped_aggregate_sum_over_varchar_falls_back_via_type_validation() {
     let req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
         "selectList": [
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             agg_item("SUM", Some("NAME"), false), // NAME is VARCHAR — invalid for SUM
         ],
     });
@@ -305,7 +306,7 @@ fn char_cast_key(size: u64, character_set: &str) -> serde_json::Value {
         "type": "function_scalar_cast",
         "name": "CAST",
         "dataType": {"type": "CHAR", "size": size, "characterSet": character_set},
-        "arguments": [{"type": "column", "name": "NAME"}],
+        "arguments": [col("NAME")],
     })
 }
 
@@ -314,27 +315,27 @@ fn varchar_cast_key(size: u64) -> serde_json::Value {
         "type": "function_scalar_cast",
         "name": "CAST",
         "dataType": {"type": "VARCHAR", "size": size},
-        "arguments": [{"type": "column", "name": "NAME"}],
+        "arguments": [col("NAME")],
     })
 }
 
-fn mod_item(col: &str, divisor: i64) -> serde_json::Value {
+fn mod_item(column: &str, divisor: i64) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar",
         "name": "MOD",
         "arguments": [
-            {"type": "column", "name": col},
-            {"type": "literal_exactnumeric", "value": divisor},
+            col(column),
+            num_lit(divisor),
         ],
     })
 }
 
-fn upper_item(col: &str) -> serde_json::Value {
+fn upper_item(column: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar",
         "name": "UPPER",
         "arguments": [
-            {"type": "column", "name": col},
+            col(column),
         ],
     })
 }
@@ -346,11 +347,8 @@ fn decimal_type(precision: u64, scale: u64) -> serde_json::Value {
 #[test]
 fn detect_group_by_aggregates_column_key() {
     let req = make_group_by_request(
-        serde_json::json!([{"type": "column", "name": "REGION"}]),
-        serde_json::json!([
-            {"type": "column", "name": "REGION"},
-            agg_item("COUNT", None, false),
-        ]),
+        serde_json::json!([col("REGION")]),
+        serde_json::json!([col("REGION"), agg_item("COUNT", None, false),]),
     );
     let result = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
     let GroupedAggregateDetection {
@@ -369,30 +367,25 @@ fn detect_group_by_aggregates_column_key() {
 }
 
 fn grouped_spec(result: &GroupedAggregateDetection) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            aggregates: Some(result.plans.clone()),
-            group_keys: Some(result.group_keys.clone()),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
+    CommonScanSpec {
+        aggregates: Some(result.plans.clone()),
+        group_keys: Some(result.group_keys.clone()),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
     }
+    .with_files(vec![])
 }
 
 #[test]
 fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
     let mut req = make_group_by_request_with_types(
-        serde_json::json!([{"type": "column", "name": "ID"}]),
-        serde_json::json!([
-            {"type": "column", "name": "ID"},
-            agg_item("COUNT", None, false),
-        ]),
+        serde_json::json!([col("ID")]),
+        serde_json::json!([col("ID"), agg_item("COUNT", None, false),]),
         serde_json::json!([decimal_type(20, 0), decimal_type(20, 0)]),
     );
     req["orderBy"] = serde_json::json!([{
         "type": "order_by_element",
-        "expression": {"type": "column", "name": "ID"},
+        "expression": col("ID"),
         "isAscending": true,
         "nullsLast": true,
     }]);
@@ -431,11 +424,8 @@ fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
 #[test]
 fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
     let mut req = make_group_by_request_with_types(
-        serde_json::json!([{"type": "column", "name": "ID"}]),
-        serde_json::json!([
-            {"type": "column", "name": "ID"},
-            agg_item("SUM", Some("AMOUNT"), false),
-        ]),
+        serde_json::json!([col("ID")]),
+        serde_json::json!([col("ID"), agg_item("SUM", Some("AMOUNT"), false),]),
         serde_json::json!([decimal_type(20, 0), decimal_type(36, 2)]),
     );
     req["orderBy"] = serde_json::json!([
@@ -447,7 +437,7 @@ fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
         },
         {
             "type": "order_by_element",
-            "expression": {"type": "column", "name": "ID"},
+            "expression": col("ID"),
             "isAscending": true,
             "nullsLast": false,
         },
@@ -466,11 +456,8 @@ fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
 #[test]
 fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
     let mut req = make_group_by_request_with_types(
-        serde_json::json!([{"type": "column", "name": "ID"}]),
-        serde_json::json!([
-            {"type": "column", "name": "ID"},
-            agg_item("COUNT", None, false),
-        ]),
+        serde_json::json!([col("ID")]),
+        serde_json::json!([col("ID"), agg_item("COUNT", None, false),]),
         serde_json::json!([decimal_type(20, 0), decimal_type(20, 0)]),
     );
     req["orderBy"] = serde_json::json!([{
@@ -491,11 +478,7 @@ fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
 #[test]
 fn detect_group_by_aggregates_expression_key() {
     let req = make_group_by_request(
-        serde_json::json!([{
-            "type": "predicate_equal",
-            "left": {"type": "column", "name": "STATUS"},
-            "right": {"type": "literal_string", "value": "active"},
-        }]),
+        serde_json::json!([predicate_equal(col("STATUS"), str_lit("active"))]),
         serde_json::json!([agg_item("SUM", Some("AMOUNT"), false),]),
     );
     let result = detect_group_by_aggregates(&req);
@@ -525,9 +508,9 @@ fn detect_group_by_unsupported_expression_falls_back() {
 #[test]
 fn detect_group_by_mixed_select_falls_back() {
     let req = make_group_by_request(
-        serde_json::json!([{"type": "column", "name": "REGION"}]),
+        serde_json::json!([col("REGION")]),
         serde_json::json!([
-            {"type": "function_scalar", "name": "YEAR", "arguments": [{"type": "column", "name": "TS"}]},
+            {"type": "function_scalar", "name": "YEAR", "arguments": [col("TS")]},
             agg_item("COUNT", None, false),
         ]),
     );
@@ -541,11 +524,11 @@ fn detect_group_by_mixed_select_falls_back() {
 fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
     let req = serde_json::json!({
         "aggregationType": "group_by",
-        "from": { "name": "EVENTS", "type": "table" },
+        "from": table_ref("EVENTS"),
         "groupBy": [
             { "columnNr": 0, "name": "ID", "tableName": "EVENTS", "type": "column" }
         ],
-        "selectList": [ { "type": "literal_null" } ],
+        "selectList": [ null_lit() ],
         "selectListDataTypes": [ { "type": "BOOLEAN" } ],
         "type": "select"
     });
@@ -577,15 +560,13 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
     // A row-scan fallback would return one row per source row, not per group.
     let group_key_types = group_key_exasol_types(&req, &result.group_keys, &result.select_items);
     let sql = build_grouped_aggregate_scan_sql(
-        &ScanSpec {
-            common: CommonScanSpec {
-                aggregates: Some(result.plans.clone()),
-                group_keys: Some(result.group_keys.clone()),
-                storage: ScanStorage::Inline(sample_storage()),
-                ..Default::default()
-            },
-            files: vec![],
-        },
+        &CommonScanSpec {
+            aggregates: Some(result.plans.clone()),
+            group_keys: Some(result.group_keys.clone()),
+            storage: ScanStorage::Inline(sample_storage()),
+            ..Default::default()
+        }
+        .with_files(vec![]),
         &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
         &result.group_keys,
         &group_key_types,
@@ -617,12 +598,8 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
 #[test]
 fn literal_bool_selectlist_item_classifies_as_constant_not_group_key() {
     let req = make_group_by_request_with_types(
-        serde_json::json!([{"type": "column", "name": "ID"}]),
-        serde_json::json!([
-            {"type": "column", "name": "ID"},
-            {"type": "literal_bool", "value": true},
-            agg_item("COUNT", None, false),
-        ]),
+        serde_json::json!([col("ID")]),
+        serde_json::json!([col("ID"), bool_lit(true), agg_item("COUNT", None, false),]),
         serde_json::json!([
             decimal_type(20, 0),
             serde_json::json!({"type": "boolean"}),
@@ -675,14 +652,11 @@ fn detect_group_by_aggregates_preserves_select_list_order() {
 #[test]
 fn detect_group_by_aggregates_interleaved_multi_key_preserves_order() {
     let req = make_group_by_request(
+        serde_json::json!([col("REGION"), col("YEAR"),]),
         serde_json::json!([
-            {"type": "column", "name": "REGION"},
-            {"type": "column", "name": "YEAR"},
-        ]),
-        serde_json::json!([
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             agg_item("SUM", Some("SCORE"), false),
-            {"type": "column", "name": "YEAR"},
+            col("YEAR"),
         ]),
     );
     let result = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
@@ -742,7 +716,7 @@ fn detect_group_by_aggregates_aggregate_first_with_having_preserves_order() {
         "having": {
             "type": "predicate_greater",
             "left": agg_item("SUM", Some("SCORE"), false),
-            "right": {"type": "literal_exactnumeric", "value": 100},
+            "right": num_lit(100),
         },
     });
     let result = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
@@ -809,15 +783,13 @@ fn detect_group_by_all_expression_multi_key() {
     let col_types: Vec<(String, String)> = vec![];
     let group_key_types = vec!["VARCHAR(2000000)".to_string(); 2];
     let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            aggregates: Some(result.plans.clone()),
-            group_keys: Some(result.group_keys.clone()),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        aggregates: Some(result.plans.clone()),
+        group_keys: Some(result.group_keys.clone()),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
@@ -890,15 +862,13 @@ fn build_grouped_agg_sql(
         ("AMOUNT".to_string(), "DOUBLE PRECISION".to_string()),
         ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
     ];
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            aggregates: Some(agg_plans.clone()),
-            group_keys: Some(group_keys.clone()),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        aggregates: Some(agg_plans.clone()),
+        group_keys: Some(group_keys.clone()),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let files_with_sizes: Vec<FileEntry> =
         files.into_iter().map(|p| FileEntry::new(p, 1)).collect();
     let shards = crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, g);
@@ -1039,20 +1009,18 @@ fn grouped_common_blob_has_no_limit() {
     let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
     let g = shard_count(1, 1, files.len());
     let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            limit: Some(100),
-            aggregates: Some(vec![AggregatePlan {
-                kind: AggKind::Count,
-                column: None,
-                arg_expr: None,
-            }]),
-            group_keys: Some(vec!["\"REGION\"".into()]),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        limit: Some(100),
+        aggregates: Some(vec![AggregatePlan {
+            kind: AggKind::Count,
+            column: None,
+            arg_expr: None,
+        }]),
+        group_keys: Some(vec!["\"REGION\"".into()]),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
@@ -1090,20 +1058,18 @@ fn grouped_merge_offset_never_reaches_per_shard_spec() {
     let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
     let g = shard_count(1, 1, files.len());
     let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            limit: Some(100),
-            aggregates: Some(vec![AggregatePlan {
-                kind: AggKind::Count,
-                column: None,
-                arg_expr: None,
-            }]),
-            group_keys: Some(vec!["\"REGION\"".into()]),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        limit: Some(100),
+        aggregates: Some(vec![AggregatePlan {
+            kind: AggKind::Count,
+            column: None,
+            arg_expr: None,
+        }]),
+        group_keys: Some(vec!["\"REGION\"".into()]),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
@@ -1141,20 +1107,18 @@ fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
     let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
     let g = shard_count(1, 1, files.len());
     let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            limit: Some(100),
-            aggregates: Some(vec![AggregatePlan {
-                kind: AggKind::Count,
-                column: None,
-                arg_expr: None,
-            }]),
-            group_keys: Some(vec!["\"REGION\"".into()]),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        limit: Some(100),
+        aggregates: Some(vec![AggregatePlan {
+            kind: AggKind::Count,
+            column: None,
+            arg_expr: None,
+        }]),
+        group_keys: Some(vec!["\"REGION\"".into()]),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
@@ -1189,16 +1153,13 @@ fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
 #[test]
 fn grouped_merge_renders_limit_offset_in_clause_order() {
     let mut req = make_group_by_request_with_types(
-        serde_json::json!([{"type": "column", "name": "ID"}]),
-        serde_json::json!([
-            {"type": "column", "name": "ID"},
-            agg_item("COUNT", None, false),
-        ]),
+        serde_json::json!([col("ID")]),
+        serde_json::json!([col("ID"), agg_item("COUNT", None, false),]),
         serde_json::json!([decimal_type(20, 0), decimal_type(20, 0)]),
     );
     req["orderBy"] = serde_json::json!([{
         "type": "order_by_element",
-        "expression": {"type": "column", "name": "ID"},
+        "expression": col("ID"),
         "isAscending": true,
         "nullsLast": true,
     }]);
@@ -1335,15 +1296,13 @@ fn build_grouped_agg_sql_with_select_items(
         ("AMOUNT".to_string(), "DOUBLE PRECISION".to_string()),
         ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
     ];
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            aggregates: Some(agg_plans.clone()),
-            group_keys: Some(group_keys.clone()),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        aggregates: Some(agg_plans.clone()),
+        group_keys: Some(group_keys.clone()),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
     build_grouped_aggregate_scan_sql(
         &spec_template,
@@ -1526,18 +1485,16 @@ fn grouped_wrapper_agg_first_with_having_ordering() {
     );
 }
 
-fn case_flag_eq(col: &str, val: &str) -> serde_json::Value {
+fn case_flag_eq(column: &str, val: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar_case",
         "name": "CASE",
         "arguments": [
-            {"type": "predicate_equal",
-             "left": {"type": "column", "name": col},
-             "right": {"type": "literal_string", "value": val}}
+            predicate_equal(col(column), str_lit(val))
         ],
         "results": [
-            {"type": "literal_exactnumeric", "value": 1},
-            {"type": "literal_exactnumeric", "value": 0}
+            num_lit(1),
+            num_lit(0)
         ]
     })
 }
@@ -1549,12 +1506,12 @@ fn round_pct_over_aggregates() -> serde_json::Value {
         "arguments": [
             {"type": "function_scalar", "name": "FLOAT_DIV", "arguments": [
                 {"type": "function_scalar", "name": "MULT", "arguments": [
-                    {"type": "literal_double", "value": 100.0},
+                    lit("literal_double", 100.0),
                     agg_item_expr("SUM", case_flag_eq("L_RETURNFLAG", "R"), false)
                 ]},
                 agg_item("COUNT", None, false)
             ]},
-            {"type": "literal_exactnumeric", "value": 2}
+            num_lit(2)
         ]
     })
 }
@@ -1575,15 +1532,13 @@ fn build_grouped_from_detection(req: &serde_json::Value) -> String {
     let d = detect_group_by_aggregates(req)
         .expect("must detect the grouped scalar-over-aggregate pushdown");
     let group_key_types = group_key_exasol_types(req, &d.group_keys, &d.select_items);
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            aggregates: Some(d.plans.clone()),
-            group_keys: Some(d.group_keys.clone()),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        aggregates: Some(d.plans.clone()),
+        group_keys: Some(d.group_keys.clone()),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     build_grouped_aggregate_scan_sql(
         &spec_template,
         &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
@@ -1605,9 +1560,9 @@ fn build_grouped_from_detection(req: &serde_json::Value) -> String {
 #[test]
 fn grouped_scalar_over_aggregate_detects_and_dedups_inner_aggregates() {
     let req = make_group_by_request_with_types(
-        serde_json::json!([{"type": "column", "name": "L_RETURNFLAG"}]),
+        serde_json::json!([col("L_RETURNFLAG")]),
         serde_json::json!([
-            {"type": "column", "name": "L_RETURNFLAG"},
+            col("L_RETURNFLAG"),
             agg_item("SUM", Some("L_QUANTITY"), false),
             agg_item("AVG", Some("L_EXTENDEDPRICE"), false),
             round_pct_over_aggregates(),
@@ -1671,9 +1626,9 @@ fn grouped_scalar_over_aggregate_detects_and_dedups_inner_aggregates() {
 #[test]
 fn grouped_scalar_over_aggregate_renders_merged_partials() {
     let req = make_group_by_request_with_types(
-        serde_json::json!([{"type": "column", "name": "L_RETURNFLAG"}]),
+        serde_json::json!([col("L_RETURNFLAG")]),
         serde_json::json!([
-            {"type": "column", "name": "L_RETURNFLAG"},
+            col("L_RETURNFLAG"),
             agg_item("SUM", Some("L_QUANTITY"), false),
             agg_item("AVG", Some("L_EXTENDEDPRICE"), false),
             round_pct_over_aggregates(),
@@ -1719,10 +1674,10 @@ fn grouped_scalar_over_aggregate_renders_merged_partials() {
 #[test]
 fn grouped_scalar_over_aggregate_preserves_selectlist_order() {
     let req = make_group_by_request_with_types(
-        serde_json::json!([{"type": "column", "name": "L_RETURNFLAG"}]),
+        serde_json::json!([col("L_RETURNFLAG")]),
         serde_json::json!([
             round_pct_over_aggregates(),
-            {"type": "column", "name": "L_RETURNFLAG"},
+            col("L_RETURNFLAG"),
             agg_item("SUM", Some("L_QUANTITY"), false),
         ]),
         serde_json::json!([
@@ -1758,15 +1713,15 @@ fn grouped_scalar_over_aggregate_preserves_selectlist_order() {
 fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
     let pushdown_req = serde_json::json!({
         "aggregationType": "group_by",
-        "groupBy": [{"type": "column", "name": "L_RETURNFLAG", "tableName": "LINEITEM"}],
+        "groupBy": [table_col("LINEITEM", "L_RETURNFLAG")],
         "selectList": [
-            {"type": "column", "name": "L_RETURNFLAG", "tableName": "LINEITEM"},
+            table_col("LINEITEM", "L_RETURNFLAG"),
             {"type": "function_scalar", "name": "ROUND", "arguments": [
                 {"type": "function_scalar", "name": "FLOAT_DIV", "arguments": [
-                    agg_item_expr("SUM", serde_json::json!({"type": "column", "name": "X", "tableName": "LINEITEM"}), false),
-                    agg_item_expr("COUNT", serde_json::json!({"type": "column", "name": "Y", "tableName": "LINEITEM"}), true)
+                    agg_item_expr("SUM", table_col("LINEITEM", "X"), false),
+                    agg_item_expr("COUNT", table_col("LINEITEM", "Y"), true)
                 ]},
-                {"type": "literal_exactnumeric", "value": 2}
+                num_lit(2)
             ]}
         ],
         "selectListDataTypes": [
@@ -1789,14 +1744,12 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
     });
     let all_cols = involved_columns(&request, |tables| tables.first()).types;
     let (proj_cols, proj_types) = referenced_column_projection(&pushdown_req, &all_cols);
-    let fan_out_spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: proj_cols,
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let fan_out_spec = CommonScanSpec {
+        projection: proj_cols,
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let fan_out = FanOutProjection::new(&fan_out_spec, &proj_types).expect("aligned fan-out");
     let sql = build_qualified_single_table_fallback_sql(
         &request,
@@ -1839,7 +1792,7 @@ fn render_having_over_merge_rewrites_aggregate_to_partial() {
     let having = serde_json::json!({
         "type": "predicate_greater",
         "left": agg_item("SUM", Some("SCORE"), false),
-        "right": {"type": "literal_exactnumeric", "value": 250},
+        "right": num_lit(250),
     });
     let plans = vec![AggregatePlan {
         kind: AggKind::Sum,
@@ -1876,22 +1829,20 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
     let having_node = serde_json::json!({
         "type": "predicate_greater",
         "left": agg_item("SUM", Some("SCORE"), false),
-        "right": {"type": "literal_exactnumeric", "value": 250},
+        "right": num_lit(250),
     });
     let having = render_having_over_merge(&having_node, &detection.plans)
         .expect("HAVING must render over the merge decomposition");
 
     let col_types: Vec<(String, String)> =
         vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            aggregates: Some(detection.plans.clone()),
-            group_keys: Some(detection.group_keys.clone()),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        aggregates: Some(detection.plans.clone()),
+        group_keys: Some(detection.group_keys.clone()),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
@@ -1926,7 +1877,7 @@ fn render_having_over_merge_declines_unknown_aggregate() {
     let having = serde_json::json!({
         "type": "predicate_greater",
         "left": agg_item("COUNT", None, false),
-        "right": {"type": "literal_exactnumeric", "value": 10},
+        "right": num_lit(10),
     });
     let plans = vec![AggregatePlan {
         kind: AggKind::Sum,
@@ -1956,15 +1907,13 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
 
     let col_types: Vec<(String, String)> =
         vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            aggregates: Some(detection.plans.clone()),
-            group_keys: Some(detection.group_keys.clone()),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        aggregates: Some(detection.plans.clone()),
+        group_keys: Some(detection.group_keys.clone()),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
@@ -1998,12 +1947,9 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
 #[test]
 fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
     let req = make_group_by_request_with_types(
+        serde_json::json!([col("REGION"), mod_item("ID", 4),]),
         serde_json::json!([
-            {"type": "column", "name": "REGION"},
-            mod_item("ID", 4),
-        ]),
-        serde_json::json!([
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             agg_item("SUM", Some("SCORE"), false),
             mod_item("ID", 4),
         ]),
@@ -2022,22 +1968,20 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
     let having_node = serde_json::json!({
         "type": "predicate_greater",
         "left": agg_item("SUM", Some("SCORE"), false),
-        "right": {"type": "literal_exactnumeric", "value": 100},
+        "right": num_lit(100),
     });
     let having = render_having_over_merge(&having_node, &detection.plans)
         .expect("HAVING must render over the merge decomposition");
 
     let col_types: Vec<(String, String)> =
         vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            aggregates: Some(detection.plans.clone()),
-            group_keys: Some(detection.group_keys.clone()),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        aggregates: Some(detection.plans.clone()),
+        group_keys: Some(detection.group_keys.clone()),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let shards = vec![
         vec![("s3://wh/f0.parquet".to_string(), 1u64)],
         vec![("s3://wh/f1.parquet".to_string(), 1u64)],
@@ -2128,12 +2072,9 @@ fn group_key_type_resolved_by_index_not_string_match() {
 #[test]
 fn group_key_types_multi_key_mixed_types() {
     let req = make_group_by_request_with_types(
+        serde_json::json!([col("REGION"), mod_item("ID", 4),]),
         serde_json::json!([
-            {"type": "column", "name": "REGION"},
-            mod_item("ID", 4),
-        ]),
-        serde_json::json!([
-            {"type": "column", "name": "REGION"},
+            col("REGION"),
             mod_item("ID", 4),
             agg_item("COUNT", None, false),
         ]),
@@ -2167,12 +2108,12 @@ fn group_key_exasol_types_resolves_char_case_key() {
         "name": "CASE",
         "arguments": [
             {"type": "predicate_less",
-             "left": {"type": "column", "name": "C_DECIMAL_A"},
-             "right": {"type": "literal_exactnumeric", "value": 0}}
+             "left": col("C_DECIMAL_A"),
+             "right": num_lit(0)}
         ],
         "results": [
-            {"type": "literal_string", "value": "NEG"},
-            {"type": "literal_string", "value": "POS"}
+            str_lit("NEG"),
+            str_lit("POS")
         ]
     });
     let req = make_group_by_request_with_types(
@@ -2200,11 +2141,8 @@ fn group_key_exasol_types_resolves_char_case_key() {
 #[test]
 fn group_key_exasol_types_resolves_varchar_key_unchanged() {
     let req = make_group_by_request_with_types(
-        serde_json::json!([{"type": "column", "name": "REGION"}]),
-        serde_json::json!([
-            {"type": "column", "name": "REGION"},
-            agg_item("COUNT", None, false),
-        ]),
+        serde_json::json!([col("REGION")]),
+        serde_json::json!([col("REGION"), agg_item("COUNT", None, false),]),
         serde_json::json!([
             {"type": "varchar", "size": 10},
             decimal_type(18, 0),
@@ -2290,11 +2228,8 @@ fn group_key_exasol_types_prefers_select_list_type_over_group_by_type() {
 #[test]
 fn constant_projection_casts_literal_to_char() {
     let req = make_group_by_request_with_types(
-        serde_json::json!([{"type": "column", "name": "REGION"}]),
-        serde_json::json!([
-            {"type": "literal_string", "value": "X"},
-            agg_item("COUNT", None, false),
-        ]),
+        serde_json::json!([col("REGION")]),
+        serde_json::json!([str_lit("X"), agg_item("COUNT", None, false),]),
         serde_json::json!([
             {"type": "CHAR", "size": 1, "characterSet": "ASCII"},
             decimal_type(18, 0),
@@ -2323,15 +2258,12 @@ fn min_over_char_expression_declares_char_partial_and_merge_cast() {
     let cast_arg = serde_json::json!({
         "type": "function_scalar_cast",
         "name": "CAST",
-        "arguments": [{"type": "column", "name": "C_VARCHAR"}],
+        "arguments": [col("C_VARCHAR")],
         "dataType": {"type": "CHAR", "size": 20, "characterSet": "UTF8"}
     });
     let req = make_group_by_request_with_types(
-        serde_json::json!([{"type": "column", "name": "REGION"}]),
-        serde_json::json!([
-            {"type": "column", "name": "REGION"},
-            agg_item_expr("MIN", cast_arg, false),
-        ]),
+        serde_json::json!([col("REGION")]),
+        serde_json::json!([col("REGION"), agg_item_expr("MIN", cast_arg, false),]),
         serde_json::json!([
             {"type": "varchar", "size": 100},
             {"type": "CHAR", "size": 20, "characterSet": "UTF8"},
@@ -2365,7 +2297,7 @@ fn min_over_char_expression_declares_char_partial_and_merge_cast() {
 #[test]
 fn detect_group_by_aggregates_no_group_by_type_returns_none() {
     let req1 = serde_json::json!({
-        "groupBy": [{"type": "column", "name": "REGION"}],
+        "groupBy": [col("REGION")],
         "selectList": [agg_item("COUNT", None, false)],
     });
     assert!(detect_group_by_aggregates(&req1).is_none());
@@ -2577,20 +2509,18 @@ fn variance_and_stddev_merge_return_zero_for_one_value() {
 #[test]
 fn having_clause_appears_in_outer_wrapper_only() {
     let having_filter = Some(r#"(SUM("AMOUNT") > 100)"#.to_string());
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["REGION".into(), "AMOUNT".into()],
-            aggregates: Some(vec![AggregatePlan {
-                kind: AggKind::Sum,
-                column: Some("AMOUNT".into()),
-                arg_expr: None,
-            }]),
-            group_keys: Some(vec![r#""REGION""#.to_string()]),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec_template = CommonScanSpec {
+        projection: vec!["REGION".into(), "AMOUNT".into()],
+        aggregates: Some(vec![AggregatePlan {
+            kind: AggKind::Sum,
+            column: Some("AMOUNT".into()),
+            arg_expr: None,
+        }]),
+        group_keys: Some(vec![r#""REGION""#.to_string()]),
+        storage: ScanStorage::Inline(sample_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
     let shards = vec![vec![("s3://wh/f.parquet".to_string(), 1u64)]];
     let col_types = vec![
         ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
@@ -2908,7 +2838,7 @@ fn having_over_stat_aggregate_with_expression_argument_declines() {
     let having = serde_json::json!({
         "type": "predicate_greater",
         "left": agg_item_expr("STDDEV", mod_item("SCORE", 4), false),
-        "right": {"type": "literal_double", "value": 5.0},
+        "right": lit("literal_double", 5.0),
     });
     let plans = vec![AggregatePlan {
         kind: AggKind::StddevSamp,

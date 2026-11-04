@@ -1,4 +1,5 @@
 use crate::scan_fixture;
+use crate::scan_fixture::WithFiles;
 
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use lakehouse_engine::adapter::pushdown::{
     AggregateMergeInputs, build_scan_driving_sql, detect_aggregates, ordinary_plans,
 };
 use lakehouse_engine::scan::spec::{
-    AggKind, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, JoinType, ProjectionItem,
+    AggKind, ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, ProjectionItem,
     ScanSpec, ScanStorage, SortKey, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
@@ -54,22 +55,20 @@ fn single_partition_spec(file_url: String) -> ScanSpec {
     let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
         .map(|m| m.len())
         .unwrap_or(0);
-    ScanSpec {
-        common: CommonScanSpec {
-            projection: vec!["ID".into(), "NAME".into()],
-            filter: Some(r#""ID" >= 10"#.into()),
-            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
-                endpoint: "http://localhost:9000".into(),
-                region: "us-east-1".into(),
-                access_key: "k".into(),
-                secret_key: "s".into(),
-                allow_http: true,
-                ..Default::default()
-            })),
+    CommonScanSpec {
+        projection: vec!["ID".into(), "NAME".into()],
+        filter: Some(r#""ID" >= 10"#.into()),
+        storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
+            endpoint: "http://localhost:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            allow_http: true,
             ..Default::default()
-        },
-        files: vec![FileEntry::new(file_url, size)],
+        })),
+        ..Default::default()
     }
+    .with_files(vec![FileEntry::new(file_url, size)])
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -316,24 +315,22 @@ async fn order_by_spec_emits_bounded_topk_not_global_sort() {
 }
 
 fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            filter: Some(
-                r#""L_SHIPDATE" >= DATE '1994-01-01' AND "L_SHIPDATE" < DATE '1995-01-01'"#.into(),
-            ),
-            aggregates: Some(aggregates),
-            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
-                endpoint: "http://localhost:9000".into(),
-                region: "us-east-1".into(),
-                access_key: "k".into(),
-                secret_key: "s".into(),
-                allow_http: true,
-                ..Default::default()
-            })),
+    CommonScanSpec {
+        filter: Some(
+            r#""L_SHIPDATE" >= DATE '1994-01-01' AND "L_SHIPDATE" < DATE '1995-01-01'"#.into(),
+        ),
+        aggregates: Some(aggregates),
+        storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
+            endpoint: "http://localhost:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            allow_http: true,
             ..Default::default()
-        },
-        files: Vec::new(),
+        })),
+        ..Default::default()
     }
+    .with_files(Vec::new())
 }
 
 #[test]
@@ -403,13 +400,11 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
 }
 
 fn row_scan_spec() -> ScanSpec {
-    ScanSpec {
-        common: CommonScanSpec {
-            storage: ScanStorage::Inline(test_storage()),
-            ..Default::default()
-        },
-        files: Vec::new(),
+    CommonScanSpec {
+        storage: ScanStorage::Inline(test_storage()),
+        ..Default::default()
     }
+    .with_files(Vec::new())
 }
 
 /// Scenario: Scan-driving query fans out via a nested distributor over a scalar scan UDF
@@ -526,29 +521,21 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
     let join = JoinSpec {
         table_root: "s3://warehouse/lh/customer".to_string(),
         files: vec![FileEntry::new("data/cust-0.parquet", 4096)],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join_type: JoinType::Inner,
-        condition: r#"("C_CUSTKEY" = "O_CUSTKEY")"#.to_string(),
-        post_join_limit: None,
-        post_join_order_by: Vec::new(),
-        partition_columns: Vec::new(),
-        storage: ScanStorage::Inline(test_storage()),
+        condition: r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#.to_string(),
+        ..scan_fixture::join_spec(ScanStorage::Inline(test_storage()))
     };
 
-    let spec = ScanSpec {
-        common: CommonScanSpec {
-            table_root: "s3://warehouse/lh/orders".to_string(),
-            projection: vec![
-                ProjectionItem::Column("C_NAME".into()),
-                ProjectionItem::Column("O_ORDERDATE".into()),
-            ],
-            join: Some(join),
-            storage: ScanStorage::Inline(test_storage()),
-            ..Default::default()
-        },
-        files: vec![],
-    };
+    let spec = CommonScanSpec {
+        table_root: "s3://warehouse/lh/orders".to_string(),
+        projection: vec![
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T0", "C_NAME")),
+            ProjectionItem::Column(ColumnRef::qualified("LHS_T1", "O_ORDERDATE")),
+        ],
+        join: Some(join),
+        storage: ScanStorage::Inline(test_storage()),
+        ..Default::default()
+    }
+    .with_files(vec![]);
 
     let shards = vec![
         vec![("data/ord-0.parquet".to_string(), 8192u64)],
@@ -582,7 +569,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         "no materializing SELECT * wrapper over the broadcast fan-out:\n{sql}"
     );
     assert!(
-        sql.contains(r#"EMITS ("C_NAME" VARCHAR(100), "O_ORDERDATE" DATE)"#),
+        sql.contains(r#"EMITS ("LHS_T0_C_NAME" VARCHAR(100), "LHS_T1_O_ORDERDATE" DATE)"#),
         "the EMITS clause must span both tables in projection order:\n{sql}"
     );
     // The common blob is a single-quoted SQL literal, so JSON keys keep raw double quotes.
@@ -595,7 +582,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         "the dimension side's file list must ride in the common blob:\n{sql}"
     );
     assert!(
-        sql.contains(r#"(\"C_CUSTKEY\" = \"O_CUSTKEY\")"#),
+        sql.contains(r#"(\"LHS_T0\".\"C_CUSTKEY\" = \"LHS_T1\".\"O_CUSTKEY\")"#),
         "the rendered join condition must ride in the common blob:\n{sql}"
     );
     assert!(
