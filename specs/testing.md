@@ -6,7 +6,7 @@ This file states how tests prove the behavior that the feature specs (`specs/<do
 
 ### Coverage rule
 
-- Every scenario in a feature spec has at least one E2E test, with three exceptions. A unit test alone proves a scenario of pure computation with no I/O. A fault-injection test alone proves a failure scenario that no E2E test can produce, such as a timeout, a cut-off answer, a transient failure and its retries, or an unreachable host. A scan-plan test alone proves a scan property that no SQL result shows. Any other host test that reads files or lists a store proves no scenario.
+- Every scenario in a feature spec has at least one E2E test, with four exceptions. A unit test alone proves a scenario of pure computation with no I/O. A fault-injection test alone proves a failure scenario that no E2E test can produce, such as a timeout, a cut-off answer, a transient failure and its retries, or an unreachable host. A scan-plan test alone proves a scan property that no SQL result shows. A request-property test against a fake server alone proves a request property that no SQL result shows (§ Testing strategy). Any other host test that reads files or lists a store proves no scenario.
 - A scenario states behavior a user or an operator can see. It never names an internal function or type.
 - A test that implements a scenario carries one `/// Scenario: <title>` line per scenario (`AGENTS.md` § Code style). A unit test carries the line only when it is the scenario's one proof.
 - An E2E test proves what a user sees through Exasol SQL. A unit test proves a property that Exasol SQL cannot observe. A unit test over a synthesized request proves a state that no well-formed Exasol request can reach.
