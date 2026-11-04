@@ -1,6 +1,6 @@
 use super::*;
-use crate::scan::spec::{FileEntry, NameMappingEntry, ScanSpec};
-use crate::scan::test_support::{inline_resolved, local_file_size, minimal_spec};
+use crate::scan::spec::{NameMappingEntry, ScanSpec};
+use crate::scan::test_support::minimal_spec;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{CastExpr, Column, Literal};
@@ -318,7 +318,6 @@ fn embedded_field_id_wins_over_name_mapping() {
     );
 }
 
-/// Scenario: A column is never bound by name to a field-id-bound logical field
 #[test]
 fn a_file_without_field_ids_binds_only_what_the_mapping_covers() {
     let logical = Schema::new(vec![
@@ -343,7 +342,6 @@ fn a_file_without_field_ids_binds_only_what_the_mapping_covers() {
     }
 }
 
-/// Scenario: A column is never bound by name to a field-id-bound logical field
 #[test]
 fn a_reused_name_under_a_dropped_field_id_binds_nothing() {
     let logical = Schema::new(vec![field_with_id("note", DataType::Utf8, true, 8)]);
@@ -357,7 +355,6 @@ fn a_reused_name_under_a_dropped_field_id_binds_nothing() {
     );
 }
 
-/// Scenario: A column is never bound by name to a field-id-bound logical field
 #[test]
 fn a_field_id_at_any_depth_disables_the_name_mapping() {
     let logical = Schema::new(vec![
@@ -774,88 +771,43 @@ fn default_fill_decision_is_per_file() {
 /// Scenario: Column projection binds by Iceberg field-id across physical layouts
 #[tokio::test]
 async fn field_id_adapter_reads_renamed_column_rows() {
-    use super::super::raw_scan::{build_scan_sql, register_files};
-    use crate::scan::session_config_for_spec;
     use crate::scan::spec::LogicalField;
+    use crate::scan::test_support::{MemoryParquet, logical_field, run_scan};
     use arrow::array::{Array, Float64Array, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use datafusion::execution::context::SessionContext;
-    use parquet::arrow::ArrowWriter;
-    use std::collections::HashMap;
 
     // Pre-rename layout: id (field-id 1), score (field-id 2) = 10 * id.
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
-    let path = dir.join("renamed.parquet");
-
     let physical_schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
-            PARQUET_FIELD_ID_META_KEY.to_string(),
-            "1".to_string(),
-        )])),
-        Field::new("score", DataType::Float64, false).with_metadata(HashMap::from([(
-            PARQUET_FIELD_ID_META_KEY.to_string(),
-            "2".to_string(),
-        )])),
+        field_with_id("id", DataType::Int64, false, 1),
+        field_with_id("score", DataType::Float64, false, 2),
     ]));
     let ids: Vec<i64> = (1..=5).collect();
     let scores: Vec<f64> = ids.iter().map(|i| 10.0 * *i as f64).collect();
-    {
-        let file = std::fs::File::create(&path).expect("create parquet file");
-        let mut writer =
-            ArrowWriter::try_new(file, physical_schema.clone(), None).expect("arrow writer");
-        let batch = RecordBatch::try_new(
-            physical_schema,
-            vec![
-                Arc::new(Int64Array::from(ids.clone())),
-                Arc::new(Float64Array::from(scores.clone())),
-            ],
-        )
-        .expect("record batch");
-        writer.write(&batch).expect("write batch");
-        writer.close().expect("close writer");
-    }
-    let file_url = url::Url::from_file_path(&path)
-        .expect("absolute path")
-        .to_string();
+    let batch = RecordBatch::try_new(
+        physical_schema,
+        vec![
+            Arc::new(Int64Array::from(ids.clone())),
+            Arc::new(Float64Array::from(scores)),
+        ],
+    )
+    .expect("record batch");
+    let files = MemoryParquet::default();
 
-    let logical = vec![
+    let mut spec = minimal_spec();
+    spec.files = vec![files.put("renamed.parquet", batch)];
+    spec.common.logical_schema = vec![
         LogicalField {
             field_id: Some(1),
-            name: "id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("id", "int64")
         },
         LogicalField {
             field_id: Some(2),
-            name: "rating".to_string(),
-            arrow_type: "float64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("rating", "float64")
         },
     ];
-
-    let mut spec = minimal_spec();
-    let file_size = local_file_size(&file_url);
-    spec.files = vec![FileEntry::new(file_url, file_size)];
-    spec.common.logical_schema = logical;
     spec.common.projection = vec!["ID".into(), "RATING".into()];
 
-    let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-    register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
-        .await
-        .expect("register_files must succeed with logical schema");
-    let sql = build_scan_sql(&ctx, "scan_target", &spec)
-        .await
-        .expect("build_scan_sql");
-    let df = ctx.sql(&sql).await.expect("plan scan SQL");
-    let batches = df.collect().await.expect("scan must read renamed column");
+    let batches = run_scan(&spec, &files).await;
 
     let mut got: Vec<(i64, f64)> = Vec::new();
     for batch in &batches {
@@ -885,39 +837,19 @@ async fn field_id_adapter_reads_renamed_column_rows() {
 
 #[tokio::test]
 async fn field_id_adapter_reads_divergent_layouts_across_files() {
-    use super::super::raw_scan::{build_scan_sql, register_files};
-    use crate::scan::session_config_for_spec;
     use crate::scan::spec::LogicalField;
+    use crate::scan::test_support::{MemoryParquet, logical_field, run_scan};
     use arrow::array::{Array, Float64Array, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use datafusion::execution::context::SessionContext;
-    use parquet::arrow::ArrowWriter;
-    use std::collections::HashMap;
 
-    fn id_field() -> Field {
-        Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
-            PARQUET_FIELD_ID_META_KEY.to_string(),
-            "1".to_string(),
-        )]))
-    }
-    fn score_field(physical_name: &str) -> Field {
-        Field::new(physical_name, DataType::Float64, false).with_metadata(HashMap::from([(
-            PARQUET_FIELD_ID_META_KEY.to_string(),
-            "2".to_string(),
-        )]))
-    }
-
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
-
+    let files = MemoryParquet::default();
     // ids 1..=3 as old `score`, 4..=6 as new `rating`; value = 10 * id.
-    let write_file = |name: &str, physical_col: &str, ids: &[i64]| -> String {
-        let schema = Arc::new(Schema::new(vec![id_field(), score_field(physical_col)]));
+    let put = |name: &str, physical_col: &str, ids: &[i64]| {
+        let schema = Arc::new(Schema::new(vec![
+            field_with_id("id", DataType::Int64, false, 1),
+            field_with_id(physical_col, DataType::Float64, false, 2),
+        ]));
         let scores: Vec<f64> = ids.iter().map(|i| 10.0 * *i as f64).collect();
-        let path = dir.join(name);
-        let file = std::fs::File::create(&path).expect("create parquet file");
-        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
         let batch = RecordBatch::try_new(
             schema,
             vec![
@@ -926,58 +858,27 @@ async fn field_id_adapter_reads_divergent_layouts_across_files() {
             ],
         )
         .expect("record batch");
-        writer.write(&batch).expect("write batch");
-        writer.close().expect("close writer");
-        url::Url::from_file_path(&path)
-            .expect("absolute path")
-            .to_string()
+        files.put(name, batch)
     };
-    let file_old = write_file("old_score.parquet", "score", &[1, 2, 3]);
-    let file_new = write_file("new_rating.parquet", "rating", &[4, 5, 6]);
 
-    let logical = vec![
+    let mut spec = minimal_spec();
+    spec.files = vec![
+        put("old_score.parquet", "score", &[1, 2, 3]),
+        put("new_rating.parquet", "rating", &[4, 5, 6]),
+    ];
+    spec.common.logical_schema = vec![
         LogicalField {
             field_id: Some(1),
-            name: "id".to_string(),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("id", "int64")
         },
         LogicalField {
             field_id: Some(2),
-            name: "rating".to_string(),
-            arrow_type: "float64".to_string(),
-            nullable: false,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+            ..logical_field("rating", "float64")
         },
     ];
-
-    let mut spec = minimal_spec();
-    let old_size = local_file_size(&file_old);
-    let new_size = local_file_size(&file_new);
-    spec.files = vec![
-        FileEntry::new(file_old, old_size),
-        FileEntry::new(file_new, new_size),
-    ];
-    spec.common.logical_schema = logical;
     spec.common.projection = vec!["ID".into(), "RATING".into()];
 
-    let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-    register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
-        .await
-        .expect("register_files must succeed");
-    let sql = build_scan_sql(&ctx, "scan_target", &spec)
-        .await
-        .expect("build_scan_sql");
-    let df = ctx.sql(&sql).await.expect("plan scan SQL");
-    let batches = df
-        .collect()
-        .await
-        .expect("scan must read both physical layouts");
+    let batches = run_scan(&spec, &files).await;
 
     let mut got: Vec<(i64, f64)> = Vec::new();
     for batch in &batches {
@@ -1713,18 +1614,14 @@ fn int64_schema(names: &[&str]) -> SchemaRef {
 #[tokio::test]
 async fn identity_bound_field_reads_a_case_folded_file_column_rows() {
     use crate::scan::spec::LogicalField;
-    use crate::scan::test_support::{run_scan, write_parquet};
+    use crate::scan::test_support::{MemoryParquet, logical_field, run_scan};
     use arrow::array::{ArrayRef, Int64Array};
 
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
+    let files = MemoryParquet::default();
     let int64s = |values: &[i64]| Arc::new(Int64Array::from(values.to_vec())) as ArrayRef;
-    let folded = write_parquet(
-        &dir.join("folded.parquet"),
-        vec![("customerid", int64s(&[1, 2]))],
-    );
-    let exact = write_parquet(
-        &dir.join("exact.parquet"),
+    let folded = files.put_columns("folded.parquet", vec![("customerid", int64s(&[1, 2]))]);
+    let exact = files.put_columns(
+        "exact.parquet",
         vec![
             ("CUSTOMERID", int64s(&[-3, -4])),
             ("CustomerId", int64s(&[3, 4])),
@@ -1732,22 +1629,14 @@ async fn identity_bound_field_reads_a_case_folded_file_column_rows() {
     );
 
     let mut spec = minimal_spec();
-    spec.files = [folded, exact]
-        .into_iter()
-        .map(|url| FileEntry::new(url.clone(), local_file_size(&url)))
-        .collect();
+    spec.files = vec![folded, exact];
     spec.common.logical_schema = vec![LogicalField {
-        field_id: None,
-        name: "CustomerId".to_string(),
-        arrow_type: "int64".to_string(),
         nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
+        ..logical_field("CustomerId", "int64")
     }];
     spec.common.projection = vec!["CUSTOMERID".into()];
 
-    let batches = run_scan(&spec).await;
+    let batches = run_scan(&spec, &files).await;
     let mut got: Vec<i64> = batches
         .iter()
         .flat_map(|batch| {

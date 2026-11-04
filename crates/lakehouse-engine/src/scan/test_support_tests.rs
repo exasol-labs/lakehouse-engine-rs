@@ -1,5 +1,5 @@
-//! Scan-side builders and runners: Parquet fixture files, minimal scan and join specs, inline
-//! and refusing storage backends, and a host runner that executes a scan into a sink context.
+//! Scan-side builders and runners: in-memory Parquet objects, logical fields, minimal scan and
+//! join specs, inline and refusing storage backends, and a host runner that scans into a sink.
 
 use crate::scan::field_id_projection::build_logical_arrow_schema;
 use crate::scan::raw_scan::{build_scan_sql, register_files};
@@ -11,31 +11,16 @@ use crate::scan::spec::{
 use crate::scan::{
     FieldIdExprAdapterFactory, FieldIdResolution, ResolvedScanStorage, resolve_scan_storage,
 };
+use ::object_store::ObjectStoreExt;
+use ::object_store::memory::InMemory;
+use ::object_store::path::Path as ObjectPath;
 use arrow::array::ArrayRef;
-use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use parquet::arrow::ArrowWriter;
-use std::path::Path;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::sync::Arc;
-
-pub(super) fn write_parquet(path: &Path, columns: Vec<(&str, ArrayRef)>) -> String {
-    let schema = Arc::new(Schema::new(
-        columns
-            .iter()
-            .map(|(name, array)| Field::new(*name, array.data_type().clone(), false))
-            .collect::<Vec<_>>(),
-    ));
-    let arrays: Vec<ArrayRef> = columns.into_iter().map(|(_, array)| array).collect();
-    let file = std::fs::File::create(path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("arrow writer");
-    let batch = RecordBatch::try_new(schema, arrays).expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(path)
-        .expect("absolute path")
-        .to_string()
-}
 
 /// `batch` as Parquet bytes, cut into row groups of `rows_per_row_group` rows when given.
 pub(super) fn parquet_bytes(batch: RecordBatch, rows_per_row_group: Option<usize>) -> Vec<u8> {
@@ -58,14 +43,86 @@ pub(super) fn current_thread_runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-pub(super) async fn run_scan(spec: &ScanSpec) -> Vec<RecordBatch> {
-    try_run_scan(spec)
+/// The bucket [`minimal_spec`]'s storage names, served from [`MemoryParquet`].
+const MEMORY_BUCKET: &str = "s3://test-bucket";
+
+/// Parquet objects held in memory under [`minimal_spec`]'s bucket, so a scan decodes real
+/// Parquet without writing a file.
+#[derive(Default)]
+pub(super) struct MemoryParquet {
+    store: Arc<InMemory>,
+}
+
+impl MemoryParquet {
+    /// The directory URL the objects sit under, usable as a spec's table root.
+    pub(super) fn root(&self) -> String {
+        format!("{MEMORY_BUCKET}/")
+    }
+
+    /// Stores `batch` as the Parquet object `name` and returns its file entry.
+    pub(super) fn put(&self, name: &str, batch: RecordBatch) -> FileEntry {
+        let bytes = parquet_bytes(batch, None);
+        let size = bytes.len() as u64;
+        futures::executor::block_on(self.store.put(&ObjectPath::from(name), bytes.into()))
+            .expect("an in-memory put succeeds");
+        FileEntry::new(format!("{MEMORY_BUCKET}/{name}"), size)
+    }
+
+    /// [`Self::put`] of one batch whose `columns` are all non-nullable.
+    pub(super) fn put_columns(&self, name: &str, columns: Vec<(&str, ArrayRef)>) -> FileEntry {
+        let schema = Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|(name, array)| Field::new(*name, array.data_type().clone(), false))
+                .collect::<Vec<_>>(),
+        ));
+        let arrays = columns.into_iter().map(|(_, array)| array).collect();
+        self.put(
+            name,
+            RecordBatch::try_new(schema, arrays).expect("record batch"),
+        )
+    }
+
+    /// The Arrow types the footer of the object behind `entry` declares.
+    pub(super) fn column_types(&self, entry: &FileEntry) -> Vec<DataType> {
+        let name = entry
+            .path
+            .strip_prefix(&self.root())
+            .expect("the entry names an object of this store");
+        let bytes = futures::executor::block_on(async {
+            self.store.get(&ObjectPath::from(name)).await?.bytes().await
+        })
+        .expect("the stored object reads back");
+        ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("parquet footer")
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect()
+    }
+
+    /// Serves the objects to `ctx` under the bucket URL.
+    pub(super) fn register(&self, ctx: &SessionContext) {
+        ctx.runtime_env().register_object_store(
+            &url::Url::parse(MEMORY_BUCKET).expect("bucket url"),
+            Arc::clone(&self.store) as Arc<dyn ::object_store::ObjectStore>,
+        );
+    }
+}
+
+pub(super) async fn run_scan(spec: &ScanSpec, files: &MemoryParquet) -> Vec<RecordBatch> {
+    try_run_scan(spec, files)
         .await
         .expect("scan must read the assigned files")
 }
 
-pub(super) async fn try_run_scan(spec: &ScanSpec) -> datafusion::error::Result<Vec<RecordBatch>> {
+pub(super) async fn try_run_scan(
+    spec: &ScanSpec,
+    files: &MemoryParquet,
+) -> datafusion::error::Result<Vec<RecordBatch>> {
     let ctx = SessionContext::new_with_config(session_config_for_spec(spec));
+    files.register(&ctx);
     register_files(&ctx, "scan_target", spec, &inline_resolved(spec))
         .await
         .expect("register_files must succeed with a logical schema");
@@ -76,12 +133,17 @@ pub(super) async fn try_run_scan(spec: &ScanSpec) -> datafusion::error::Result<V
     df.collect().await
 }
 
-pub(super) fn local_file_size(file_url: &str) -> u64 {
-    let path = url::Url::parse(file_url)
-        .expect("valid file URL")
-        .to_file_path()
-        .expect("file:// URL");
-    std::fs::metadata(path).expect("stat local parquet").len()
+/// A non-nullable logical field bound by its own name.
+pub(crate) fn logical_field(name: &str, arrow_type: &str) -> LogicalField {
+    LogicalField {
+        field_id: None,
+        name: name.to_string(),
+        arrow_type: arrow_type.to_string(),
+        nullable: false,
+        initial_default: None,
+        nested: None,
+        physical_name: None,
+    }
 }
 
 /// What the raw scan installs for an unpartitioned table with no name mapping.

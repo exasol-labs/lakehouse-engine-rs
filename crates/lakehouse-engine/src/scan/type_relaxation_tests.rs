@@ -1,6 +1,5 @@
-use crate::scan::spec::{FileEntry, LogicalField};
 use crate::scan::test_support::{
-    local_file_size, minimal_spec, run_scan, try_run_scan, write_parquet,
+    MemoryParquet, logical_field, minimal_spec, run_scan, try_run_scan,
 };
 use crate::types::mapping::arrow_type_from_tag;
 use arrow::array::{
@@ -9,7 +8,6 @@ use arrow::array::{
 };
 use arrow::compute::can_cast_types;
 use arrow::datatypes::{DataType, TimeUnit};
-use std::path::Path;
 use std::sync::Arc;
 
 /// One entry per supported-set table row (rows 9 and 10 contribute three each). `can_cast_types`
@@ -237,38 +235,10 @@ fn supported_relaxation_reads() -> Vec<RelaxationRead> {
     ]
 }
 
-fn logical_field(name: &str, arrow_type: &str) -> LogicalField {
-    LogicalField {
-        field_id: None,
-        name: name.to_string(),
-        arrow_type: arrow_type.to_string(),
-        nullable: false,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
-    }
-}
-
-/// A Parquet round-trip that silently widened the narrow column would make the read assertions vacuous.
-fn parquet_column_types(path: &Path) -> Vec<DataType> {
-    let file = std::fs::File::open(path).expect("open parquet file");
-    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-        .expect("parquet reader");
-    builder
-        .schema()
-        .fields()
-        .iter()
-        .map(|field| field.data_type().clone())
-        .collect()
-}
-
 #[tokio::test]
 async fn a_physical_type_outside_identity_and_the_supported_set_is_refused_before_any_cast() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
-    let table_root = url::Url::from_directory_path(dir)
-        .expect("absolute directory")
-        .to_string();
+    let files = MemoryParquet::default();
+    let table_root = files.root();
     let cases: Vec<(ArrayRef, &str)> = vec![
         (Arc::new(Float64Array::from(vec![1.7])), "int32"),
         (
@@ -282,16 +252,15 @@ async fn a_physical_type_outside_identity_and_the_supported_set_is_refused_befor
     ];
 
     for (index, (physical, logical_tag)) in cases.into_iter().enumerate() {
-        let path = dir.join(format!("refused_{index}.parquet"));
-        let file_url = write_parquet(&path, vec![("val", physical)]);
+        let entry = files.put_columns(&format!("refused_{index}.parquet"), vec![("val", physical)]);
+        let physical_type = files.column_types(&entry)[0].to_string();
         let mut spec = minimal_spec();
         spec.common.table_root = table_root.clone();
-        spec.files = vec![FileEntry::new(file_url.clone(), local_file_size(&file_url))];
+        spec.files = vec![entry];
         spec.common.logical_schema = vec![logical_field("val", logical_tag)];
         spec.common.projection = vec!["VAL".into()];
 
-        let physical_type = parquet_column_types(&path)[0].to_string();
-        let message = try_run_scan(&spec)
+        let message = try_run_scan(&spec, &files)
             .await
             .expect_err("the scan must refuse the pair rather than cast it")
             .to_string();
@@ -330,14 +299,16 @@ async fn every_supported_relaxation_pair_reads_its_real_values_from_a_narrow_par
          added without a real read fails here rather than shipping unread"
     );
 
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
+    let files = MemoryParquet::default();
 
     for (index, case) in cases.into_iter().enumerate() {
-        let path = dir.join(format!("pair_{index}.parquet"));
-        let file_url = write_parquet(&path, vec![("val", Arc::clone(&case.physical))]);
+        let entry = files.put_columns(
+            &format!("pair_{index}.parquet"),
+            vec![("val", Arc::clone(&case.physical))],
+        );
+        // A Parquet round-trip that silently widened the column would make the read vacuous.
         assert_eq!(
-            parquet_column_types(&path),
+            files.column_types(&entry),
             vec![case.physical.data_type().clone()],
             "row {}: the fixture file must round-trip at the NARROW physical type, or the read \
              below is an identity read that proves nothing about relaxation",
@@ -345,12 +316,11 @@ async fn every_supported_relaxation_pair_reads_its_real_values_from_a_narrow_par
         );
 
         let mut spec = minimal_spec();
-        let file_size = local_file_size(&file_url);
-        spec.files = vec![FileEntry::new(file_url, file_size)];
+        spec.files = vec![entry];
         spec.common.logical_schema = vec![logical_field("val", case.logical_tag)];
         spec.common.projection = vec!["VAL".into()];
 
-        let batches = run_scan(&spec).await;
+        let batches = run_scan(&spec, &files).await;
         let columns: Vec<ArrayRef> = batches
             .iter()
             .map(|batch| Arc::clone(batch.column(0)))
@@ -375,15 +345,11 @@ async fn every_supported_relaxation_pair_reads_its_real_values_from_a_narrow_par
     }
 }
 
-/// Scenario: A narrow physical column binds to the current wider logical type and is cast per file
 #[tokio::test]
 async fn a_narrow_physical_column_is_cast_to_the_current_logical_type_per_file() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
-
-    let pre_widening_path = dir.join("pre_widening_int32.parquet");
-    let pre_widening = write_parquet(
-        &pre_widening_path,
+    let files = MemoryParquet::default();
+    let pre_widening = files.put_columns(
+        "pre_widening_int32.parquet",
         vec![
             (
                 "id",
@@ -395,8 +361,8 @@ async fn a_narrow_physical_column_is_cast_to_the_current_logical_type_per_file()
             ),
         ],
     );
-    let post_widening = write_parquet(
-        &dir.join("post_widening_int64.parquet"),
+    let post_widening = files.put_columns(
+        "post_widening_int64.parquet",
         vec![
             (
                 "id",
@@ -414,23 +380,18 @@ async fn a_narrow_physical_column_is_cast_to_the_current_logical_type_per_file()
     );
 
     assert_eq!(
-        parquet_column_types(&pre_widening_path),
+        files.column_types(&pre_widening),
         vec![DataType::Int64, DataType::Int32],
         "the pre-widening file must carry the NARROW int32 column, or the two-file read below \
          straddles no widening at all"
     );
 
     let mut spec = minimal_spec();
-    let pre_size = local_file_size(&pre_widening);
-    let post_size = local_file_size(&post_widening);
-    spec.files = vec![
-        FileEntry::new(pre_widening, pre_size),
-        FileEntry::new(post_widening, post_size),
-    ];
+    spec.files = vec![pre_widening, post_widening];
     spec.common.logical_schema = vec![logical_field("id", "int64"), logical_field("val", "int64")];
     spec.common.projection = vec!["ID".into(), "VAL".into()];
 
-    let batches = run_scan(&spec).await;
+    let batches = run_scan(&spec, &files).await;
 
     let mut got: Vec<(i64, i64)> = Vec::new();
     for batch in &batches {
