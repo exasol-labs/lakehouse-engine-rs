@@ -6,7 +6,7 @@ This file states how tests prove the behavior that the feature specs (`specs/<do
 
 ### Coverage rule
 
-- Every scenario in a feature spec has at least one E2E test. A unit test alone is enough only for pure computation with no I/O. A host test that reads fixture files, lists a store, or talks to a fake server proves no scenario.
+- Every scenario in a feature spec has at least one E2E test, with two exceptions. A unit test alone proves a scenario of pure computation with no I/O. A fault-injection test alone proves a failure scenario that no E2E test can produce, such as a timeout, a cut-off answer, a transient failure and its retries, or an unreachable host. A host test that reads fixture files or lists a store proves no scenario.
 - A test that implements a scenario carries one `/// Scenario: <title>` line per scenario (`AGENTS.md` § Code style). A unit test carries the line only when it is the scenario's one proof.
 - An E2E test proves what a user sees through Exasol SQL. A property that Exasol SQL cannot observe is proved by a unit test, and so is a state that no well-formed Exasol request can reach, over a synthesized request.
 - An E2E suite holds no requirement of its own. Behavior that an E2E test finds and no feature spec states goes into a feature spec.
@@ -14,7 +14,7 @@ This file states how tests prove the behavior that the feature specs (`specs/<do
 ### Test tiers
 
 - Unit tests run on the host and live in a sibling `_tests.rs` file (`AGENTS.md` § Code style).
-- Host tests are unit tests, compile-time contract tests, and the scan UDF tests below. There is no other host integration tier. A host test that reads a catalog or a remote object store, or chains adapter modules to prove behavior, is an E2E test in the wrong place.
+- Host tests are unit tests, fault-injection tests against a fake server, compile-time contract tests, and the scan UDF tests below. There is no other host integration tier. A host test that reads a catalog or a remote object store, or chains adapter modules to prove behavior, is an E2E test in the wrong place.
 - Scan UDF tests run `run()` on the host through `exasol_udf_sdk::test_support::TestContext` (`EmitPolicy`, `NextPolicy`).
 - A crate's host tests under `tests/` build into one binary, `tests/it/main.rs`, because each test binary statically links the whole engine. A new test file is a module declared there. A top-level `tests/*.rs` file is a deliberate separate target, such as `scan_footer_refetch_observable`, which needs its own process because it asserts on process-global state.
 - The `it` binary runs its tests as parallel threads of one process. A test writes files only under its own `tempfile::tempdir()`. A test that asserts on process-global state shares one lock with every test that mutates that state, or keeps its own binary.
@@ -25,7 +25,7 @@ This file states how tests prove the behavior that the feature specs (`specs/<do
 ### Testing strategy
 
 - There are two layers. E2E tests prove user-visible behavior against the real stack. Unit tests cover pure logic: parsing, mapping, validation, building requests, and reading answers. Each behavior is tested at one layer. A coverage gap is closed by a unit test of pure logic, never by a multi-module host test or a fake.
-- A fake server injects the faults an E2E test cannot produce, such as timeouts, cut-off answers, and unreachable hosts, and nothing else. There is at most one fake per external system. A fake never proves behavior, because it tests our idea of the external system, not the system.
+- A fake server injects the faults an E2E test cannot produce, such as timeouts, cut-off answers, and unreachable hosts, and nothing else. There is at most one fake per external system. A fault-injection test proves how our code reacts to a fault. It never proves how the external system behaves, because a fake tests our idea of that system, not the system.
 - A unit test has one unit, plain inputs, and expected outputs. It does no I/O, writes no file, starts no server, asserts nothing on a fake's request log or call order, and reads no source file.
 - A unit test that pins a rule uses an input that fails under the wrong rule.
 - No test restates standard-library behavior.
