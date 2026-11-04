@@ -20,7 +20,7 @@ The `createVirtualSchema` response's schema-level `adapterNotes` records the res
 * *AND* a `refresh` or `setProperties` response SHALL carry the same entries and keep every other entry of the persisted `adapterNotes`, per `vs-adapter/refresh-and-set-properties`, so an inherited node-count entry stays unread
 * *AND* the adapter MUST NOT write an entry for the cluster node count or the per-node core count, because every pushdown reads the node count from its own UDF handshake and derives the core count itself
 
-### Scenario: Adapter derives the per-node core count from available_parallelism() on every request
+### Scenario: Adapter reads the node's core count on every request and persists it nowhere
 
 * *GIVEN* an Exasol session that has installed the VS adapter script and supplies the catalog and storage connection properties
 * *WHEN* Exasol sends a `createVirtualSchema` request naming an Iceberg table
@@ -28,7 +28,7 @@ The `createVirtualSchema` response's schema-level `adapterNotes` records the res
 * *AND* the adapter SHALL read that core count EXACTLY ONCE per request, at one call site, and pass the resolved value as a plain argument into the parallelism-factor, DataFusion-threading, and connection-concurrency derivations
 * *AND* the adapter MUST NOT write the resolved core count into the response `adapterNotes`, and MUST NOT persist it anywhere else
 
-### Scenario: Adapter uses a core count of 1 when available_parallelism() cannot report one
+### Scenario: Adapter uses a core count of 1 when the node cannot report one
 
 * *GIVEN* an executing node whose platform cannot report a core count, so `std::thread::available_parallelism()` returns an error
 * *WHEN* the adapter resolves the per-node core count for a `createVirtualSchema` request

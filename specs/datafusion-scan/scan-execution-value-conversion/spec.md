@@ -14,7 +14,7 @@ The scan UDF converts each output Arrow column to the SDK `Value` variant, or th
 
 ## Scenarios
 
-### Scenario: Arrow types map to the correct SDK Value variants
+### Scenario: Each scanned value reads as its mapped Exasol value, and a null reads as NULL
 
 * *GIVEN* a table with integer, floating-point, string, boolean, date, and timestamp columns
 * *WHEN* the scan UDF converts a batch of those columns
@@ -31,7 +31,7 @@ The scan UDF converts each output Arrow column to the SDK `Value` variant, or th
 * *AND* the UDF MUST NOT emit any array, list, struct, or map `Value`
 * *AND* `arrow_value_at`'s wildcard display-string fallback arm SHALL be left byte-identical, gaining no nested arm, because a nested column can no longer reach it: the JSON rendering happens upstream, and the only columns the partial-aggregate path carries are group keys and aggregate results
 
-### Scenario: Output columns are coerced to the Arrow type the declared EMITS ExaType requires before emit_batch
+### Scenario: Each output column is emitted as the type its EMITS declaration states
 
 * *GIVEN* a scan call whose generated `EMITS (...)` clause declares one Exasol type per output column
 * *AND* a result Arrow batch whose column types diverge from those declarations, for example an `Int32` column declared `DECIMAL(20,0)`, a `Float32` column declared `DOUBLE PRECISION`, or a `Utf8View` column declared `VARCHAR(2000000)`

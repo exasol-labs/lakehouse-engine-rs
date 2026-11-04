@@ -35,7 +35,7 @@ The scan UDF sizes a bounded DataFusion memory pool from the per-instance memory
 * *THEN* the UDF SHALL configure a `FairSpillPool` together with a `DiskManager` rooted at `/tmp`
 * *AND* a memory-intensive grouped or sorted scan SHALL complete by spilling to disk rather than failing, at any group cardinality
 
-### Scenario: Clean ResourcesExhausted error when no spill disk is available
+### Scenario: An over-budget scan without spill disk fails with a clean resources-exhausted error
 
 * *GIVEN* a scan UDF invocation whose `/tmp` probe reports tmpfs or insufficient free space
 * *WHEN* a scan exceeds the bounded memory pool

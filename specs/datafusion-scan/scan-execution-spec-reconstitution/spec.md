@@ -16,7 +16,7 @@ The scan UDF takes two arguments, a shard-invariant common-spec JSON blob (arg 0
 
 ## Scenarios
 
-### Scenario: Scan reconstitutes the ScanSpec from the common and per-shard arguments
+### Scenario: A scan combines its shard's file list with the table settings shared by every shard
 
 * *GIVEN* a scan invocation whose first argument is a common-spec JSON blob carrying every shard-invariant field (including the table root) and whose second argument is a JSON array of `[path, size]` 2-tuples
 * *WHEN* the scan UDF parses its two input arguments

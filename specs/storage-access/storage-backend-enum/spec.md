@@ -70,7 +70,7 @@ A `StorageBackend` enum names the storage backend, so other modules ask the enum
 * *AND* the wrapper MUST NOT expose any method returning secret values or a credential payload, so a scan-side site left reading the unresolved wire value fails to compile rather than yielding an empty secret set
 * *AND* a scan-spec deserialization failure MUST NOT contain any credential value, no storage access key, secret key, session token, Azure account key, or SAS token, while the connection NAME MAY appear, because it is not a secret and the resolution error specified by `storage-access/scan-spec-credential-reference` names it; a sealed payload that fails base64 decoding or AEAD authentication SHALL likewise produce an error naming the connection and the failed operation, carrying neither the payload nor any plaintext
 
-### Scenario: No storage credential type prints its payload through Debug
+### Scenario: No diagnostic rendering of storage settings prints a credential value
 
 * *GIVEN* the storage types that hold a credential value, `StorageProps`, `StorageBackend`, `AdlsCred`, and `ConnectionCreds`
 * *WHEN* any of them is formatted with the `Debug` formatter

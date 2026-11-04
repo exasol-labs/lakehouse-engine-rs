@@ -67,7 +67,7 @@ The adapter builds the catalog HTTP state once per pushdown request and reuses i
 * *AND* an OAuth2 grant failure SHALL surface once, before the namespace listing
 * *AND* the enumerated tables, each table's resolved column list, and its Exasol type mapping MUST NOT depend on how many sessions the enumeration builds
 
-### Scenario: CatalogSession is public and every file-resolution entry point takes one
+### Scenario: Every file resolution of a request uses the request's one catalog session
 
 * *GIVEN* `CatalogSession` declared `pub` in the `lakehouse-catalog` crate
 * *WHEN* any caller, whether the single-table pushdown path, a join leg, or an external integration test, resolves a file list

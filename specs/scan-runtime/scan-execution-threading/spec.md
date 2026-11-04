@@ -69,7 +69,7 @@ The adapter sets how many DataFusion partitions and Tokio worker threads each sc
 * *AND* the adapter SHALL record the `adapterNotes` entry `DF_THREADING_MODE` with the value `AUTO` in the `createVirtualSchema` response
 * *AND* a value that is neither `AUTO` nor `FIXED`, compared without regard to case, SHALL fail the request per `vs-properties/property-value-validation` instead of selecting `AUTO`
 
-### Scenario: Scan constructs the Tokio runtime per scalar run() call and never caches it across calls
+### Scenario: Each scan call sizes its threads from its own query's settings, also in a reused VM
 
 * *GIVEN* a scan spec whose `df_threads_per_udf` value arrives as a per-call UDF input parameter, carried in the `ScanSpec` reconstituted from that `run()` call's two VARCHAR arguments
 * *WHEN* the scan UDF builds the Tokio runtime that drives one `run()` call's DataFusion scan

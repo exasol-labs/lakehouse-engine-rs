@@ -17,7 +17,7 @@ A disposable Rust SCALAR EMIT UDF. For one call it builds a DataFusion session, 
 
 ## Scenarios
 
-### Scenario: Scan handles one input row per scalar run() call and never iterates with ctx.next()
+### Scenario: Each scan call scans only its own shard, and no shard's rows are dropped
 
 * *GIVEN* the SDK invokes the SCALAR EMIT scan `run()` ONCE per input row, each call carrying that row's shard-invariant common spec argument (column 0) and its own per-shard files argument (column 1)
 * *WHEN* the scan UDF runs for one such call
@@ -78,5 +78,5 @@ A disposable Rust SCALAR EMIT UDF. For one call it builds a DataFusion session, 
 * *WHEN* the scan UDF constructs its `ParquetFormat`s, registers the file, and scans it
 * *THEN* the UDF SHALL configure every `ParquetFormat` it constructs, both the decode-path provider and any legacy first-file schema inference, to coerce INT96 columns to microsecond resolution (`coerce_int96 = "us"`) with a UTC time zone (`coerce_int96_tz = "UTC"`)
 * *AND* the scan SHALL decode the out-of-range timestamp WITHOUT an i64 nanosecond-overflow error, and on the legacy inference path the inferred schema and the decoded batch SHALL agree on the timestamp column's Arrow type
-* *AND* on the field-id (production) path, where the logical schema maps the Iceberg `timestamp` column to `Timestamp(Microsecond, None)`, the decoded `Timestamp(Microsecond, "UTC")` batch SHALL be coerced to the Arrow type the declared EMITS ExaType requires before `emit_batch`, per `datafusion-scan/scan-execution-value-conversion / Output columns are coerced to the Arrow type the declared EMITS ExaType requires before emit_batch`, so the None-vs-UTC difference between logical schema and decoded batch is reconciled at emit
+* *AND* on the field-id (production) path, where the logical schema maps the Iceberg `timestamp` column to `Timestamp(Microsecond, None)`, the decoded `Timestamp(Microsecond, "UTC")` batch SHALL be coerced to the Arrow type the declared EMITS ExaType requires before `emit_batch`, per `datafusion-scan/scan-execution-value-conversion / Each output column is emitted as the type its EMITS declaration states`, so the None-vs-UTC difference between logical schema and decoded batch is reconciled at emit
 * *AND* the emitted timestamp SHALL equal the source instant at microsecond resolution, INT96's sub-microsecond digits are deliberately truncated, consistent with Iceberg's microsecond `timestamp` model, per the existing Arrow-`Timestamp`-to-Exasol-`TIMESTAMP` mapping

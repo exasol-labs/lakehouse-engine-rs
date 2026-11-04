@@ -25,7 +25,7 @@ The adapter decomposes an ungrouped select item that is a scalar function wrappi
 * *AND* the query SHALL return EXACTLY ONE row whose value equals the same expression evaluated over all rows on a single node, `SELECT ROUND(SUM(l_quantity), 2) FROM LINEITEM` returning `25304.00` against the seeded TPC-H fixture, never one partial row per shard
 * *AND* an `EXPLAIN VIRTUAL` of that query SHALL show a non-empty `"aggregates"` list and an empty `"projection"` in the emitted `LAKEHOUSE_SCAN` common spec, matching the shape a bare `SUM(l_quantity)` already emits
 
-### Scenario: A scalar-wrapped statistical aggregate resolves through the shared AggKind tables, so no aggregate function name reaches DataFusion
+### Scenario: A scalar-wrapped statistical aggregate matches native Exasol and sends no aggregate function name to the scan
 
 * *GIVEN* an ungrouped `pushdown` request whose select list is a scalar function wrapping a statistical aggregate under an Exasol-only alias, `ROUND(VARIANCE(C_ACCTBAL), 4)`, and likewise `ABS(VARIANCE(C_ACCTBAL))`, `VARIANCE(C_ACCTBAL) + 1`, and `ROUND(STDDEV(C_ACCTBAL), 4)`
 * *WHEN* Exasol sends the `pushdown` request

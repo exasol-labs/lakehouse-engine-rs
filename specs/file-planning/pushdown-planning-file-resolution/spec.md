@@ -39,7 +39,7 @@ Resolves a table's identity and current file state once per pushdown, before any
 * *AND* the adapter MUST NOT require the scan UDF to discover files itself, and MUST NOT require the scan UDF to re-fetch any file's size
 * *AND* the resolve-once orchestration this scenario describes, identifier-note read, one resolve, one `ScanSpec` build, SHALL be reached identically by every table format, with the format reader supplying the file list, byte sizes, and table root, and the column notes supplying the logical schema (`file-planning/pushdown-format-neutral-resolution`); only the reader behind the seam is format-specific
 
-### Scenario: Pushdown resolves multi-level namespace identifiers into the iceberg TableIdent
+### Scenario: Pushdown loads a table whose identifier has a multi-level namespace
 
 * *GIVEN* an identifier note whose `name` member is a multi-level Iceberg identifier such as `prod.finance.orders`
 * *WHEN* the adapter resolves that identifier to load the table from the catalog

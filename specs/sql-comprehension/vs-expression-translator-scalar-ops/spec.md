@@ -22,21 +22,21 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *AND* the set of arithmetic `name` strings the translator matches SHALL correspond exactly to the arithmetic operator capabilities the adapter advertises (`pushdown-capabilities/pushdown-planning-capability-extensions`), `FN_ADD`, `FN_SUB`, `FN_MULT`, `FN_FLOAT_DIV`, and `FN_NEG`, so no advertised operator is left unrenderable and no rendered operator is left unadvertised
 * *AND* Exasol integer division (`DIV`) SHALL NOT be matched here and `FN_DIV` SHALL NOT be advertised
 
-### Scenario: Unsupported node type returns error in raising mode
+### Scenario: An unsupported expression node fails a required translation with an error naming its type
 
 * *GIVEN* a VS expression node with a `type` value not handled by the translator
 * *WHEN* `render_expression` is called (raising mode)
 * *THEN* the function SHALL return an error containing the unrecognised node type name
 * *AND* the error MUST NOT contain any credential or secret-looking string from the node payload
 
-### Scenario: Safe variant returns None for unsupported nodes
+### Scenario: An unsupported expression node declines translation without failing
 
 * *GIVEN* a VS expression node with a `type` value not handled by the translator
 * *WHEN* `render_expression_safe` is called
 * *THEN* the function SHALL return `None`
 * *AND* the function MUST NOT panic
 
-### Scenario: Trivially-true filter suppressed in safe variant
+### Scenario: A trivially-true filter is omitted from the pushed-down scan
 
 * *GIVEN* a call to `render_df_filter_safe` with an expression that renders to `TRUE` or `NULL`
 * *WHEN* the safe entry-point evaluates the result
@@ -76,7 +76,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *AND* a `decimal_to_varchar_exasol` node whose argument count is not exactly one SHALL return an error in raising mode and `None` in the safe variants
 * *AND* the translator SHALL apply neither column-type inspection nor any type decision of its own for this node, the caller has already confirmed the wrapped argument is DECIMAL-typed, keeping `vs-expression` a pure, stateless translator
 
-### Scenario: format_decimal_exasol_style reproduces Exasol shortest-form decimal formatting
+### Scenario: A DECIMAL converted to text reads in Exasol's shortest form
 
 * *GIVEN* the crate-visible pure helper `format_decimal_exasol_style(expr_sql: &str) -> String`, which takes an already-rendered SQL fragment for a confirmed-DECIMAL-typed expression and carries no type information of its own
 * *WHEN* the helper is called with a rendered fragment `<f>`
