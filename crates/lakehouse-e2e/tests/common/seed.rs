@@ -405,8 +405,27 @@ enum Fixture {
     Seeded(Vec<String>),
 }
 
-/// Creates the table when absent or stale. Returns it while it holds no data, else the
-/// paths of its current data files.
+/// Creates an empty unpartitioned table, also in a nested namespace, for a test that needs
+/// only the catalog entry.
+pub async fn create_empty_table(
+    catalog: &impl Catalog,
+    ns: &NamespaceIdent,
+    table_name: &str,
+    iceberg_schema: IcebergSchema,
+) -> Result<()> {
+    empty_table_to_fill_in(
+        catalog,
+        ns,
+        table_name,
+        iceberg_schema,
+        unpartitioned(),
+        HashMap::new(),
+    )
+    .await
+    .with_context(|| format!("create empty table {}.{table_name}", ns.join(".")))?;
+    Ok(())
+}
+
 async fn empty_table_to_fill(
     catalog: &impl Catalog,
     namespace: &str,
@@ -415,7 +434,27 @@ async fn empty_table_to_fill(
     partition_spec: UnboundPartitionSpec,
     properties: HashMap<String, String>,
 ) -> Result<Fixture> {
-    let ns = NamespaceIdent::new(namespace.to_string());
+    empty_table_to_fill_in(
+        catalog,
+        &NamespaceIdent::new(namespace.to_string()),
+        table_name,
+        iceberg_schema,
+        partition_spec,
+        properties,
+    )
+    .await
+}
+
+/// Creates the table when absent or stale. Returns it while it holds no data, else the
+/// paths of its current data files.
+async fn empty_table_to_fill_in(
+    catalog: &impl Catalog,
+    ns: &NamespaceIdent,
+    table_name: &str,
+    iceberg_schema: IcebergSchema,
+    partition_spec: UnboundPartitionSpec,
+    properties: HashMap<String, String>,
+) -> Result<Fixture> {
     let ident = TableIdent::new(ns.clone(), table_name.to_string());
 
     // The Docker warehouse outlives test runs, so a populated table with a stale schema
@@ -439,11 +478,11 @@ async fn empty_table_to_fill(
     }
 
     if !catalog
-        .namespace_exists(&ns)
+        .namespace_exists(ns)
         .await
         .context("check namespace")?
     {
-        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+        let _ = catalog.create_namespace(ns, HashMap::new()).await;
     }
 
     let creation = TableCreation::builder()
@@ -452,7 +491,7 @@ async fn empty_table_to_fill(
         .partition_spec(partition_spec)
         .properties(properties)
         .build();
-    let table = match catalog.create_table(&ns, creation).await {
+    let table = match catalog.create_table(ns, creation).await {
         Ok(t) => t,
         Err(create_error) => catalog.load_table(&ident).await.with_context(|| {
             format!("create table failed ({create_error}); loading it instead also failed")

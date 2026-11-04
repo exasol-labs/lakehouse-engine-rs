@@ -20,7 +20,6 @@ use crate::fixtures::{LAKEHOUSE_VS, assert_pushed_to_scan_udf, lakehouse_vs, sta
 
 use arrow::array::AsArray;
 use arrow::datatypes::Int32Type;
-use futures::TryStreamExt;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -40,24 +39,11 @@ pub(crate) fn load_table(table: &str) -> iceberg::table::Table {
 
 /// `(path, footer column names)` of every data file the table's current snapshot plans.
 pub(crate) fn planned_footers(table: &str) -> Vec<(String, Vec<String>)> {
-    let loaded = load_table(table);
-    let tasks: Vec<_> = runtime().block_on(async {
-        let scan = loaded
-            .scan()
-            .select_all()
-            .build()
-            .unwrap_or_else(|e| panic!("build a scan of {table}: {e}"));
-        scan.plan_files()
-            .await
-            .unwrap_or_else(|e| panic!("plan the files of {table}: {e}"))
-            .try_collect()
-            .await
-            .unwrap_or_else(|e| panic!("collect the file tasks of {table}: {e}"))
-    });
-    tasks
-        .iter()
-        .map(|task| {
-            let path = task.data_file_path().to_string();
+    runtime()
+        .block_on(resolve_fixture_files(NAMESPACE, table))
+        .into_iter()
+        .map(|file| {
+            let path = file.path;
             let reader = SerializedFileReader::new(get_fixture_object(&path))
                 .unwrap_or_else(|e| panic!("open committed Parquet file {path}: {e}"));
             let columns = reader

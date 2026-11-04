@@ -322,7 +322,12 @@ pub fn try_create_virtual_schema_with_password(
         "DROP VIRTUAL SCHEMA IF EXISTS {} CASCADE",
         props.vs_name
     ));
+    conn.try_execute(&virtual_schema_ddl(props))
+}
 
+/// The `CREATE VIRTUAL SCHEMA` statement alone, for a test that owns the CONNECTION and its
+/// grants, which [`try_create_virtual_schema`] would replace.
+pub fn virtual_schema_ddl(props: &VsProps) -> String {
     let parallelism_clause = optional_clause("PARALLELISM_FACTOR ", props.parallelism_factor);
     let join_clause = optional_clause("JOIN_BROADCAST_MAX_BYTES", props.join_broadcast_max_bytes);
     let catalog_kind_clause = optional_clause("CATALOG_KIND", props.catalog_kind);
@@ -340,7 +345,7 @@ pub fn try_create_virtual_schema_with_password(
         format!("\n  NAMESPACE   = '{}'", props.namespace)
     };
 
-    conn.try_execute(&format!(
+    format!(
         r#"CREATE VIRTUAL SCHEMA {vs_name}
 USING {adapter_schema}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = '{catalog_conn_name}'
@@ -348,7 +353,7 @@ USING {adapter_schema}.{ADAPTER_SCRIPT_NAME} WITH
         vs_name = props.vs_name,
         adapter_schema = props.adapter_schema,
         catalog_conn_name = props.catalog_conn_name,
-    ))
+    )
 }
 
 pub fn current_user(conn: &mut ExaConn) -> String {

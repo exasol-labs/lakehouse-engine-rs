@@ -3,10 +3,9 @@
 
 use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
+use crate::common::seed::create_empty_table;
 use crate::fixtures::{stack, vs_table};
-use crate::refresh::{
-    create_empty_table, ensure_id_val_table, long_field, schema_of, seed_catalog,
-};
+use crate::refresh::{ensure_id_val_table, long_field, schema_of, seed_catalog};
 
 use iceberg_catalog_rest::RestCatalog;
 
@@ -35,7 +34,8 @@ fn seed_tables() {
         &staging,
         "orders",
         schema_of(0, &[long_field(1, "id", false)]),
-    ));
+    ))
+    .expect("create empty table");
 }
 
 fn props<'a>(vs_name: &'a str) -> VsProps<'a> {

@@ -4,7 +4,7 @@
 
 use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
-use crate::common::seed::{build_seed_catalog, rest_replace_current_schema};
+use crate::common::seed::{build_seed_catalog, create_empty_table, rest_replace_current_schema};
 use crate::common::stack::{
     CatalogConnectionPassword, PROXY_URL_INTERNAL, build_create_connection_sql,
     iceberg_catalog_url, iceberg_catalog_url_internal, local_stack_connection_password,
@@ -14,14 +14,11 @@ use crate::fixtures::{stack, vs_table};
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use iceberg::spec::{
-    NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Type, UnboundPartitionSpec,
-};
-use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+use iceberg::spec::{NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Type};
+use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use iceberg_catalog_rest::RestCatalog;
 use serde_json::Value as Json;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Distinct from other modules' connection so the unreachable-catalog test's
@@ -117,37 +114,6 @@ pub(crate) async fn ensure_id_val_table(
     .unwrap_or_else(|e| panic!("seed {namespace}.{table_name}: {e}"));
 }
 
-/// Collision detection runs before any per-table resolution, so no data file is needed.
-pub(crate) async fn create_empty_table(
-    catalog: &impl Catalog,
-    ns: &NamespaceIdent,
-    table_name: &str,
-    schema: IcebergSchema,
-) {
-    if !catalog
-        .namespace_exists(ns)
-        .await
-        .unwrap_or_else(|e| panic!("check namespace {}: {e}", ns.join(".")))
-    {
-        let _ = catalog.create_namespace(ns, HashMap::new()).await;
-    }
-    let ident = TableIdent::new(ns.clone(), table_name.to_string());
-    if catalog
-        .table_exists(&ident)
-        .await
-        .unwrap_or_else(|e| panic!("check table {}.{}: {e}", ns.join("."), table_name))
-    {
-        return;
-    }
-    let creation = TableCreation::builder()
-        .name(table_name.to_string())
-        .schema(schema)
-        .partition_spec(UnboundPartitionSpec::builder().with_spec_id(0).build())
-        .properties(HashMap::new())
-        .build();
-    let _ = catalog.create_table(ns, creation).await;
-}
-
 /// The Docker warehouse persists across `make test-e2e` runs, so a prior run's tables can leak in.
 async fn drop_table_if_exists(catalog: &impl Catalog, ns: &NamespaceIdent, table_name: &str) {
     let ident = TableIdent::new(ns.clone(), table_name.to_string());
@@ -214,7 +180,8 @@ fn refresh_reenumerates_namespace() {
             &ns,
             table,
             schema_of(0, &[long_field(1, &column, false)]),
-        ));
+        ))
+        .expect("create empty table");
     }
 
     let mut conn = exa_conn();
@@ -706,13 +673,15 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
         &top_ns,
         "baseline",
         id_val_schema(0),
-    ));
+    ))
+    .expect("create empty table");
     rt.block_on(create_empty_table(
         &catalog,
         &eu_ns,
         "orders",
         id_val_schema(0),
-    ));
+    ))
+    .expect("create empty table");
 
     let mut conn = exa_conn();
     create_virtual_schema(&mut conn, "REFRESH_COLLISION_VS", NS_COLLISION);
@@ -738,7 +707,8 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
         &top_ns,
         "eu__orders",
         id_val_schema(0),
-    ));
+    ))
+    .expect("create empty table");
 
     let refresh_msg = query_error(
         &mut conn,
