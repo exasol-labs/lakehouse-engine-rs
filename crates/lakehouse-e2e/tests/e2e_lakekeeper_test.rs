@@ -11,12 +11,12 @@
 mod common;
 
 use common::e2e_harness::{
-    ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VsProps,
-    assert_decimal_orders_numerically, assert_text_columns, create_schema_and_scripts,
-    create_schema_and_scripts_with_env, create_virtual_schema_with_password, declared_type,
-    enumerated_table_names, error_text, exa_conn, expected_join_rows, explain_virtual_sql,
-    fetch_join_rows, has_broadcast_join_block, has_two_scan_wrapper, install_slc, join_query,
-    parse_int, projection_rows, runtime, upload_so, value_to_string,
+    ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, VsProps, assert_decimal_orders_numerically,
+    assert_text_columns, create_schema_and_scripts, create_schema_and_scripts_with_env,
+    create_virtual_schema_with_password, declared_type, enumerated_table_names, error_text,
+    exa_conn, exa_conn_redacting, expected_join_rows, explain_virtual_sql, fetch_join_rows,
+    has_broadcast_join_block, has_two_scan_wrapper, install_slc, join_query, parse_int,
+    projection_rows, runtime, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
@@ -406,8 +406,7 @@ fn lakekeeper_credentials_never_appear_in_output() {
     const SENTINEL_SECRET_KEY: &str = "LK_DUMMY_SECRET_KEY_SENTINEL";
 
     wait_for_exasol();
-    let mut conn =
-        ExaConn::connect_redacting(&exasol_host(), exasol_sql_port(), "sys", SYS_PASSWORD);
+    let mut conn = exa_conn_redacting();
 
     let sentinel_password = CatalogConnectionPassword {
         warehouse: WAREHOUSE_STATIC.to_string(),

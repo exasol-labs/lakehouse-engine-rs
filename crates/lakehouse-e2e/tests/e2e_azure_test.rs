@@ -9,11 +9,11 @@ mod common;
 
 use common::azure::{self, AzureContainer};
 use common::e2e_harness::{
-    ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SO_UDF_OBJECT_PATH, SYS_PASSWORD, VsProps,
+    ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SO_UDF_OBJECT_PATH, VsProps,
     assert_decimal_orders_numerically, create_schema_and_scripts,
     create_schema_and_scripts_with_env, create_virtual_schema_with_password, declared_type,
-    exa_conn, explain_virtual_sql, install_slc, parse_int, projection_rows, runtime, upload_so,
-    value_to_string,
+    exa_conn, exa_conn_redacting, explain_virtual_sql, install_slc, parse_int, projection_rows,
+    runtime, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
@@ -27,8 +27,7 @@ use common::seed::{
     decimal_18_0_values, seed_events_table_with_auth,
 };
 use common::stack::{
-    self, CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
-    wait_for_exasol, wait_for_url,
+    self, CatalogConnectionPassword, build_create_connection_sql, wait_for_exasol, wait_for_url,
 };
 
 use arrow::array::{Float64Array, Int64Array, StringArray};
@@ -137,7 +136,7 @@ impl AzureFixture {
             &account_key,
         ));
         let vended_paths = seed_arm(&vended_warehouse);
-        let mut conn = exa_conn();
+        let mut conn = exa_conn_redacting();
         let vended_password = lakekeeper_connection_password(&vended_warehouse, true);
         create_virtual_schema_with_password(
             &mut conn,
@@ -339,7 +338,7 @@ fn azure_static_and_vended_creds_end_to_end() {
     // Vended-arm assertions run first so a static-arm regression cannot mask the
     // vended proof (its CONNECTION carries no account name/key).
     let fixture = AzureFixture::provision();
-    let mut conn = exa_conn();
+    let mut conn = exa_conn_redacting();
 
     assert!(
         fixture.vended_password.use_vended_credentials,
@@ -634,8 +633,7 @@ fn azure_credentials_never_appear_in_output() {
     const SENTINEL_ACCOUNT_KEY: &str = "AZ_DUMMY_ACCOUNT_KEY_SENTINEL";
 
     wait_for_exasol();
-    let mut conn =
-        ExaConn::connect_redacting(&exasol_host(), exasol_sql_port(), "sys", SYS_PASSWORD);
+    let mut conn = exa_conn_redacting();
 
     let sentinel_password = CatalogConnectionPassword {
         warehouse: "az_redaction_probe".to_string(),

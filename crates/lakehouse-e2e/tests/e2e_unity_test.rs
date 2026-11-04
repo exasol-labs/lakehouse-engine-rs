@@ -5,13 +5,14 @@
 mod common;
 
 use common::e2e_harness::{
-    SCAN_SCRIPT_NAME, SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_binary_columns_match_native_copy,
+    SCAN_SCRIPT_NAME, VARCHAR_JSON, VsProps, assert_binary_columns_match_native_copy,
     assert_decimal_orders_numerically, assert_hex_literal_compares_bytes, assert_query_fails,
     assert_text_columns, assert_type_matrix, column_adapter_notes, create_schema_and_scripts,
     create_schema_and_scripts_with_env, create_virtual_schema_with_password, declared_types,
-    enumerated_table_names, error_text, exa_conn, explain_virtual_sql, has_broadcast_join_block,
-    has_two_scan_wrapper, identifier_note, install_slc, note_of, pairs, parse_int, parse_numeric,
-    partition_positions, query_error, reads, refuses, text_column, upload_so, value_to_string,
+    enumerated_table_names, error_text, exa_conn, exa_conn_redacting, explain_virtual_sql,
+    has_broadcast_join_block, has_two_scan_wrapper, identifier_note, install_slc, note_of, pairs,
+    parse_int, parse_numeric, partition_positions, query_error, reads, refuses, text_column,
+    upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
@@ -39,9 +40,8 @@ use common::seed::{
 };
 use common::stack::{
     self, ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
-    ASSUME_ROLE_EXTERNAL_ID, CatalogConnectionPassword, build_create_connection_sql, exasol_host,
-    exasol_sql_port, local_stack_connection_password, wait_for_exasol, wait_for_seaweedfs,
-    wait_for_url,
+    ASSUME_ROLE_EXTERNAL_ID, CatalogConnectionPassword, build_create_connection_sql,
+    local_stack_connection_password, wait_for_exasol, wait_for_seaweedfs, wait_for_url,
 };
 use common::timestamp_precision::expected_timestamp_precision;
 
@@ -845,8 +845,7 @@ fn unity_credentials_never_appear_in_output() {
     const SENTINEL_TOKEN: &str = "UC_DUMMY_BEARER_TOKEN_SENTINEL";
 
     wait_for_exasol();
-    let mut conn =
-        ExaConn::connect_redacting(&exasol_host(), exasol_sql_port(), "sys", SYS_PASSWORD);
+    let mut conn = exa_conn_redacting();
 
     let sentinel_password = CatalogConnectionPassword {
         token: Some(SENTINEL_TOKEN.to_string()),
