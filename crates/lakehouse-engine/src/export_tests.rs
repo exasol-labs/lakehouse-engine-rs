@@ -621,6 +621,7 @@ mod sql {
         assert_eq!(sql, expected);
     }
 
+    /// Scenario: The writer count never exceeds 300
     #[test]
     fn group_count_follows_the_writer_layout_and_caps_at_300() {
         let cases = [
@@ -664,19 +665,6 @@ mod sql {
                 "{case}"
             );
         }
-    }
-
-    /// Scenario: The writer count never exceeds 300
-    #[test]
-    fn writer_count_caps_at_300() {
-        assert_eq!(writer_count(1, 1), 1, "one node, one per node");
-        assert_eq!(writer_count(2, 0), 1, "a zero product clamps to 1");
-        assert_eq!(writer_count(4, 100), 300, "400 caps at 300");
-        assert_eq!(
-            writer_count(usize::MAX, usize::MAX),
-            300,
-            "an overflowing product saturates and caps at 300"
-        );
     }
 
     #[test]
