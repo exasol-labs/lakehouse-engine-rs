@@ -131,6 +131,11 @@ pub fn exa_conn() -> ExaConn {
     ExaConn::connect(&exasol_host(), exasol_sql_port(), "sys", SYS_PASSWORD)
 }
 
+/// For credential-bearing DDL: an Exasol error may echo the statement, so failures omit the SQL.
+pub fn exa_conn_redacting() -> ExaConn {
+    ExaConn::connect_redacting(&exasol_host(), exasol_sql_port(), "sys", SYS_PASSWORD)
+}
+
 /// All `CREATE OR REPLACE`, so concurrent recreation across binaries is harmless.
 pub fn create_schema_and_scripts(conn: &mut ExaConn) {
     create_schema_and_scripts_in(conn, SCHEMA_NAME);
