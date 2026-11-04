@@ -1698,14 +1698,11 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
     });
     let all_cols = involved_columns(&request, |tables| tables.first()).types;
     let referenced = referenced_columns(&pushdown_req, &column_types(&all_cols));
-    let (proj_cols, _) = split_projection(&referenced.projection());
     let fan_out_spec = CommonScanSpec {
-        projection: proj_cols,
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
-    }
-    .with_files(vec![]);
-    let fan_out = FanOutProjection::new(&fan_out_spec, &referenced).expect("aligned fan-out");
+    };
+    let fan_out = FanOutProjection::new(fan_out_spec, &referenced);
     let sql = build_qualified_single_table_fallback_sql(
         &request,
         &pushdown_req,

@@ -11,7 +11,6 @@ use super::super::tests::{
 use super::*;
 use crate::adapter::pushdown::test_support::*;
 use crate::scan::spec::{ColumnRef, SortKey, StorageBackend, StorageProps};
-use crate::scan::test_support::WithFiles;
 use crate::types::exasol_type::ExasolType;
 use vs_expression::{render_expression_exasol_safe, render_expression_safe};
 
@@ -2203,19 +2202,14 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
         ],
     });
     let fan_out_spec = CommonScanSpec {
-        projection: vec![
-            ProjectionItem::from("C_CUSTKEY"),
-            ProjectionItem::from("C_NAME"),
-        ],
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
-    }
-    .with_files(vec![]);
+    };
     let col_types = column_types(&[
         ("C_CUSTKEY", ExasolType::decimal(20, 0)),
         ("C_NAME", ExasolType::varchar(100)),
     ]);
-    let fan_out = FanOutProjection::new(&fan_out_spec, &col_types).expect("aligned fan-out");
+    let fan_out = FanOutProjection::new(fan_out_spec, &col_types);
     let actual = build_qualified_single_table_fallback_sql(
         &request,
         &pushdown_req,
@@ -2339,13 +2333,11 @@ fn fallback_projection_narrows_to_referenced_columns() {
     fn col(name: &str, ty: ExasolType) -> (String, ExasolType) {
         (name.to_string(), ty)
     }
-    fn spec_with(projection: Vec<ProjectionItem>) -> ScanSpec {
+    fn fan_out_base() -> CommonScanSpec {
         CommonScanSpec {
-            projection,
             storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         }
-        .with_files(vec![])
     }
     fn proj_names(proj: &[ProjectionItem]) -> Vec<String> {
         proj.iter()
@@ -2438,8 +2430,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         "the grouped inner scan narrows to GK + REGION (nested in SUM(CASE ...)), \
          never IRRELEVANT_COL"
     );
-    let gspec = spec_with(gproj);
-    let gfan_out = FanOutProjection::new(&gspec, &grouped).expect("aligned grouped fan-out");
+    let gfan_out = FanOutProjection::new(fan_out_base(), &grouped);
     let gsql = build_qualified_single_table_fallback_sql(
         &request,
         &grouped_req,
@@ -2480,9 +2471,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         vec!["A".to_string(), "B".to_string()],
         "the single-group Case 2/3 inner scan narrows to A + B, never IRRELEVANT_COL"
     );
-    let sspec = spec_with(sproj);
-    let sfan_out =
-        FanOutProjection::new(&sspec, &single_group).expect("aligned single-group fan-out");
+    let sfan_out = FanOutProjection::new(fan_out_base(), &single_group);
     let ssql = build_qualified_single_table_fallback_sql(
         &request,
         &sg_req,
@@ -2727,13 +2716,11 @@ fn declined_filter_request() -> Json {
 
 /// `filter` stays `None`: on the decline route the predicate lives only in the
 /// wrapper's `WHERE`.
-fn declined_filter_fan_out_spec() -> ScanSpec {
+fn declined_filter_fan_out_spec() -> CommonScanSpec {
     CommonScanSpec {
-        projection: vec![ProjectionItem::from("ID"), ProjectionItem::from("C_TS")],
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
     }
-    .with_files(vec![])
 }
 
 fn declined_filter_column_types() -> ColumnTypes {
@@ -2747,9 +2734,8 @@ fn declined_filter_wrapper_sql(
     pushdown_req: &Json,
     declined: Option<&Json>,
 ) -> Result<String, UdfError> {
-    let spec = declined_filter_fan_out_spec();
     let col_types = declined_filter_column_types();
-    let fan_out = FanOutProjection::new(&spec, &col_types)?;
+    let fan_out = FanOutProjection::new(declined_filter_fan_out_spec(), &col_types);
     build_qualified_single_table_fallback_sql(
         &declined_filter_request(),
         pushdown_req,
@@ -2759,20 +2745,6 @@ fn declined_filter_wrapper_sql(
         DISTRIBUTE_FILES_UDF_NAME,
         declined,
     )
-}
-
-#[test]
-fn fan_out_projection_rejects_misaligned_proj_types() {
-    let spec = declined_filter_fan_out_spec();
-    let columns = column_types(&[("ID", ExasolType::decimal(20, 0))]);
-
-    let err = FanOutProjection::new(&spec, &columns)
-        .expect_err("a proj_types list shorter than the projection must fail construction");
-    let text = err.to_string();
-    assert!(
-        text.contains('2') && text.contains('1'),
-        "the error must name both lengths: {text}"
-    );
 }
 
 /// DataFusion declines this on arity while Exasol renders it (live-verified).

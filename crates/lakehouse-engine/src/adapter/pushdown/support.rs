@@ -534,10 +534,6 @@ impl ColumnTypes {
         Self(self.0.iter().take(1).cloned().collect())
     }
 
-    pub(super) fn len(&self) -> usize {
-        self.0.len()
-    }
-
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

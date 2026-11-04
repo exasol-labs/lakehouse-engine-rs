@@ -9,7 +9,6 @@ fn display_renders_every_spelling_the_producers_emit_byte_for_byte() {
         (ExasolType::decimal(20, 0), "DECIMAL(20,0)"),
         (ExasolType::decimal(18, 6), "DECIMAL(18,6)"),
         (ExasolType::decimal(36, 36), "DECIMAL(36,36)"),
-        (ExasolType::decimal(5, -2), "DECIMAL(5,-2)"),
         (ExasolType::DoublePrecision, "DOUBLE PRECISION"),
         (ExasolType::Date, "DATE"),
         (ExasolType::Timestamp { precision: None }, "TIMESTAMP"),

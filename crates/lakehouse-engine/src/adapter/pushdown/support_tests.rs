@@ -1243,15 +1243,8 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
         ("IRRELEVANT_COL".to_string(), ExasolType::decimal(20, 0)),
     ];
     let referenced = referenced_columns(&pushdown_req, &column_types(&all_cols));
-    let (proj, _) = split_projection(&referenced.projection());
-    let base = count_distinct_base_spec();
-    let fan_out_spec = CommonScanSpec {
-        projection: proj,
-        ..base.common
-    }
-    .with_files(base.files);
     let request = serde_json::json!({"involvedTables": [{"name": "T"}]});
-    let fan_out = FanOutProjection::new(&fan_out_spec, &referenced).expect("aligned fan-out");
+    let fan_out = FanOutProjection::new(count_distinct_base_spec().common, &referenced);
     let sql = build_qualified_single_table_fallback_sql(
         &request,
         &pushdown_req,
@@ -2462,17 +2455,11 @@ fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, ExasolType)]
     let request = serde_json::json!({"involvedTables": [{"name": "T"}]});
     let pushdown_req = serde_json::json!({"filter": filter.clone()});
     let fan_out_spec = CommonScanSpec {
-        projection: col_types
-            .iter()
-            .map(|(name, _)| ProjectionItem::from(name.clone()))
-            .collect(),
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
-    }
-    .with_files(vec![]);
+    };
     let type_map = column_types(col_types);
-    let fan_out = super::super::joins::FanOutProjection::new(&fan_out_spec, &type_map)
-        .expect("aligned fan-out");
+    let fan_out = super::super::joins::FanOutProjection::new(fan_out_spec, &type_map);
     super::super::joins::build_qualified_single_table_fallback_sql(
         &request,
         &pushdown_req,

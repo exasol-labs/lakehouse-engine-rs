@@ -772,28 +772,25 @@ pub(in super::super) fn referenced_columns(
     referenced
 }
 
-/// `columns` is the spec's projection, the `EMITS (...)` clause, and the wrapper's full row, so
-/// their positional alignment is load-bearing: a shorter list truncates all three.
+/// `columns` is the spec's projection, the `EMITS (...)` clause, and the wrapper's full row.
+/// The constructor derives the projection from it, so the three stay aligned by construction.
 #[derive(Debug)]
 pub(in super::super) struct FanOutProjection<'a> {
-    pub spec: &'a ScanSpec,
-    pub columns: &'a ColumnTypes,
+    spec: ScanSpec,
+    columns: &'a ColumnTypes,
 }
 
 impl<'a> FanOutProjection<'a> {
-    pub(in super::super) fn new(
-        spec: &'a ScanSpec,
-        columns: &'a ColumnTypes,
-    ) -> Result<Self, UdfError> {
-        if spec.common.projection.len() != columns.len() {
-            return Err(UdfError::User(format!(
-                "the fan-out projection carries {} item(s) but {} declared type(s); the two \
-                 must stay positionally aligned",
-                spec.common.projection.len(),
-                columns.len()
-            )));
-        }
-        Ok(Self { spec, columns })
+    /// `common`'s own projection is replaced.
+    pub(in super::super) fn new(common: CommonScanSpec, columns: &'a ColumnTypes) -> Self {
+        let spec = ScanSpec {
+            common: CommonScanSpec {
+                projection: projection_items(&columns.projection()),
+                ..common
+            },
+            files: vec![],
+        };
+        Self { spec, columns }
     }
 }
 
@@ -814,7 +811,7 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
     distribute_udf_name: &str,
     declined_filter: Option<&Json>,
 ) -> Result<String, UdfError> {
-    let fan_out_spec = fan_out.spec;
+    let fan_out_spec = &fan_out.spec;
 
     let legs = JoinLegs::for_single_scan(request);
     let alias = legs.leg_alias(0);
@@ -865,9 +862,8 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
     declined_filter: Option<&Json>,
 ) -> Result<Json, UdfError> {
     let referenced = referenced_columns(pushdown_req, col_types);
-    let fan_out_spec = ScanSpec {
-        common: CommonScanSpec {
-            projection: projection_items(&referenced.projection()),
+    let fan_out = FanOutProjection::new(
+        CommonScanSpec {
             filter,
             limit: None,
             order_by: Vec::new(),
@@ -876,9 +872,8 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
             distinct: false,
             ..base.clone()
         },
-        files: vec![],
-    };
-    let fan_out = FanOutProjection::new(&fan_out_spec, &referenced)?;
+        &referenced,
+    );
     let sql = build_qualified_single_table_fallback_sql(
         request,
         pushdown_req,
