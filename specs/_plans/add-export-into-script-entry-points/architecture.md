@@ -1,5 +1,5 @@
 # Architecture Delta: add-export-into-script-entry-points
-<!-- BASE: fd936f3b39e69379607d16e357d7e3024bd62462 -->
+<!-- BASE: ef12dbbdccdb9d448fa1b250c242f22ad44b19c5 -->
 
 <!-- DELTA:CHANGED -->
 ## Components
@@ -17,10 +17,10 @@
 - sealed-storage (crates/lakehouse-engine/src/scan/sealed.rs): encrypts storage credentials into the scan spec with AES-GCM under a key derived by HKDF-SHA256 from the CONNECTION password, and decrypts them in the scan UDF | owns: sealed storage envelope format | depends on: none
 - datafusion-scan (crates/lakehouse-engine/src/scan/): runs one shard per invocation as a raw scan, a partial aggregate, or a broadcast join scan, applies Iceberg positional deletes and Iceberg and Delta deletion vectors, and emits results batch by batch | owns: per-invocation Tokio runtime, DataFusion session, memory pool | depends on: scan-spec, sealed-storage, scan-object-store, type-mapping, vs-expression
 - scan-object-store (crates/lakehouse-engine/src/scan/object_store.rs): builds S3 or ADLS Gen2 object stores with a connection budget and an admission limit, and routes the two join sides by path prefix | owns: per-invocation HTTP connection pool | depends on: lakehouse-catalog
-- export (crates/lakehouse-engine/src/export/): validates an `EXPORT ... INTO SCRIPT` statement, checks that the export script can read the CONNECTION, renders the writer SELECT that calls the same script with per-column type guards and a row-number group key, and, as the writer, counts the rows each invocation receives | owns: export options, writer spec format | depends on: none
+- export (crates/lakehouse-engine/src/export.rs): validates an `EXPORT ... INTO SCRIPT` statement, checks that the export script can read the CONNECTION, renders the writer SELECT that calls the same script with per-column type guards and a row-number group key, and, as the writer, counts the rows each invocation receives | owns: export options, writer spec format | depends on: none
 - type-mapping (crates/lakehouse-engine/src/types/): maps Arrow, Iceberg, Delta, and Hive types to Exasol types and applies type widening rules | owns: none | depends on: none
 - lakehouse-catalog (crates/lakehouse-catalog/): implements `CatalogClient` for Iceberg REST, Unity Catalog, and AWS Glue (a full listing that drops the identifiers a caller-supplied predicate rejects before it loads any table, an identifier-only listing, a load of listed tables that classifies each table as the full listing does, and the pushdown's single-table load), with OAuth2, bearer, and SigV4 auth, STS role assumption, vended-storage resolution, and credential redaction; its neutral table carries the catalog's table properties verbatim and its neutral column an opaque engine-encoded declaration slot, and it interprets neither | owns: per-request catalog sessions | depends on: none
-- vs-expression (crates/vs-expression/): translates VS expression JSON into DataFusion SQL and Exasol SQL fragments | owns: none | depends on: none
+- vs-expression (crates/vs-expression/): translates VS expression JSON into DataFusion SQL and Exasol SQL fragments, and parses and rewrites the `column` nodes of a pushdown request | owns: none | depends on: none
 - distribute-files (deploy/scripts/install.sh): defines the Lua SET script `LAKEHOUSE_DISTRIBUTE_FILES`, which re-emits per-shard file-list rows so `GROUP BY shard_key` spreads them across nodes | owns: none | depends on: none
 - installer (deploy/scripts/install.sh): downloads the engine and SLC release assets, uploads them to BucketFS with exapump, creates the scripts, and runs a version and fingerprint smoke test | owns: none | depends on: distribute-files
 <!-- /DELTA:CHANGED -->
@@ -69,6 +69,7 @@
 - `arrow` and `parquet` stay on the Arrow major that `datafusion` and the SDK depend on, not on the major of the `datafusion` or SDK package itself.
 - Arrow types never cross the `.so` boundary. Only SDK `Value`s or the Arrow C Data Interface structs from `ctx.emit_batch` cross it.
 - `lakehouse-catalog` never depends on `lakehouse-engine`. Its manifest declares no `arrow`, `parquet`, `datafusion`, or `object_store` dependency, and it names no scan-spec type (`FileEntry`, `LogicalField`, `DeleteMechanism`, `CommonScanSpec`). A neutral catalog column carries an Arrow type only as the engine's type-tag string.
+- The engine reads and writes a `column` node's `name`, `tableName`, and `tableAlias` only through `vs-expression`'s column node type.
 - `lakehouse-catalog` declares the shared credential types (`ConnectionCreds`, `StorageProps`, `CatalogProps`, `StorageBackend`) and the credential redaction functions once. The engine re-exports them and declares no copy. Reading and parsing the Exasol CONNECTION object stays in the engine.
 - The engine enumerates and declares catalog tables through the `CatalogClient` trait and its neutral table and column types. In `lakehouse-catalog`, auth strategies, HTTP and signing helpers, and vended-resolution steps stay crate-private, and no AWS SDK type crosses the crate boundary.
 - Each catalog kind's identifier-only listing returns every identifier its full listing would return or skip, in listing order, without loading table metadata. Its load of listed tables admits or skips each given table exactly as the full listing does and loads no other table.

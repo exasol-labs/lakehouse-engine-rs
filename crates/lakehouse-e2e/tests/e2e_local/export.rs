@@ -28,6 +28,7 @@ const NO_ACCESS_EXPORTER: &str = "EXPORT_E2E_NO_ACCESS";
 /// failed before reading the source.
 const FAILING_SOURCE: &str = "(SELECT 1 / (ID - ID) AS X FROM EXPORT_E2E.TYPED)";
 const SOURCE_READ_ERROR: &str = "division by zero";
+const INLINE_PASSWORD: &str = "ExportInlineSecret2026";
 const EXASOL_TYPE_ERROR: &str = "Column type not supported";
 
 /// Each column of `UNSUPPORTED_TABLE` but `ID`, with the start of the type its error names.
@@ -175,12 +176,17 @@ fn export_error(conn: &mut ExaConn, sql: &str) -> String {
 }
 
 #[track_caller]
-fn assert_refused_before_reading(conn: &mut ExaConn, sql: &str, fragments: &[&str]) -> String {
+fn assert_refused_before_reading(
+    label: &str,
+    conn: &mut ExaConn,
+    sql: &str,
+    fragments: &[&str],
+) -> String {
     let error = export_error(conn, sql);
     assert!(
         fragments.iter().all(|fragment| error.contains(fragment))
             && !error.contains(SOURCE_READ_ERROR),
-        "{sql} must fail before reading the source, naming {fragments:?}: {error}"
+        "{label}: {sql} must fail before reading the source, naming {fragments:?}: {error}"
     );
     error
 }
@@ -204,223 +210,200 @@ fn assert_type_refused(source: &str, columns: &[(&str, &str)]) {
 }
 
 /// Scenario: A whole-table export reports every source row
+/// Scenario: A filtered query exports only the rows it returns
+/// Scenario: A column-list export reports every row of the table
+/// Scenario: A join of a virtual schema table and an Exasol table exports the joined rows
+/// Scenario: An empty source exports zero rows
 /// Scenario: All scripts resolve from the same uploaded artifact
 #[test]
-fn export_whole_table_reports_every_row() {
-    stack();
-    setup();
-
-    assert_eq!(
-        exported_rows(&mut exa_conn(), &export_sql(TYPED_TABLE, "")),
-        TYPED_ROWS
-    );
-}
-
-/// Scenario: A filtered query exports only the rows it returns
-#[test]
-fn export_filtered_query_reports_returned_rows() {
-    stack();
-    setup();
-    let source = format!("(SELECT * FROM {TYPED_TABLE} WHERE MOD(ID, 4) = 0)");
-
-    assert_eq!(
-        exported_rows(&mut exa_conn(), &export_sql(&source, "")),
-        TYPED_ROWS / 4
-    );
-}
-
-/// Scenario: A column-list export reports every row of the table
-#[test]
-fn export_column_list_reports_every_row() {
-    stack();
-    setup();
-    let source = format!("{TYPED_TABLE} (ID, C_VARCHAR)");
-
-    assert_eq!(
-        exported_rows(&mut exa_conn(), &export_sql(&source, "")),
-        TYPED_ROWS
-    );
-}
-
-/// Scenario: A join of a virtual schema table and an Exasol table exports the joined rows
-#[test]
-fn export_vs_join_reports_joined_rows() {
+fn export_reports_every_source_row() {
     stack();
     setup();
     let mut sys = exa_conn();
-    let query = format!(
+    let join = format!(
         "SELECT e.ID, e.NAME, t.TAG FROM {} e JOIN {TAGS_TABLE} t ON e.ID = t.ID",
         vs_table(LAKEHOUSE_VS, E2E_TABLE)
     );
-    let selected = sys.query_row_count(&query);
+    // The even IDs of the 20 events join one tag each.
+    assert_eq!(sys.query_row_count(&join), 10, "the join selects 10 rows");
+    let cases = [
+        ("whole table", TYPED_TABLE.to_string(), TYPED_ROWS),
+        (
+            "filtered query",
+            format!("(SELECT * FROM {TYPED_TABLE} WHERE MOD(ID, 4) = 0)"),
+            TYPED_ROWS / 4,
+        ),
+        (
+            "column list",
+            format!("{TYPED_TABLE} (ID, C_VARCHAR)"),
+            TYPED_ROWS,
+        ),
+        ("virtual schema join", format!("({join})"), 10),
+        (
+            "empty source",
+            format!("(SELECT * FROM {TYPED_TABLE} WHERE ID < 0)"),
+            0,
+        ),
+    ];
 
-    let exported = exported_rows(&mut sys, &export_sql(&format!("({query})"), ""));
-
-    assert_eq!(
-        selected, 10,
-        "the even IDs of the 20 events join one tag each"
-    );
-    assert_eq!(exported, selected);
-}
-
-/// Scenario: An empty source exports zero rows
-#[test]
-fn export_empty_source_reports_zero() {
-    stack();
-    setup();
-    let source = format!("(SELECT * FROM {TYPED_TABLE} WHERE ID < 0)");
-
-    assert_eq!(exported_rows(&mut exa_conn(), &export_sql(&source, "")), 0);
+    for (case, source, expected) in cases {
+        assert_eq!(
+            exported_rows(&mut sys, &export_sql(&source, "")),
+            expected,
+            "{case}"
+        );
+    }
 }
 
 /// Scenario: WRITERS_PER_NODE sets the writer count
-#[test]
-fn export_writers_per_node_sets_writer_count() {
-    stack();
-    setup();
-    let first_rows = |n: i64| format!("(SELECT * FROM {TYPED_TABLE} WHERE ID <= {n})");
-
-    assert_eq!(
-        profiled_export(TYPED_TABLE, "WRITERS_PER_NODE = '3'"),
-        (TYPED_ROWS, 3)
-    );
-    assert_eq!(
-        profiled_export(&first_rows(3), "WRITERS_PER_NODE = '3'"),
-        (3, 3)
-    );
-    assert_eq!(
-        profiled_export(&first_rows(2), "WRITERS_PER_NODE = '3'"),
-        (2, 2)
-    );
-    assert_eq!(profiled_export(TYPED_TABLE, ""), (TYPED_ROWS, 1));
-}
-
 /// Scenario: The writer count never exceeds 300
-#[test]
-fn export_writer_count_caps_at_300() {
-    stack();
-    setup();
-    let first_300 = format!("(SELECT * FROM {LARGE_TABLE} WHERE ID <= {MAX_WRITERS})");
-
-    assert_eq!(
-        profiled_export(LARGE_TABLE, "WRITERS_PER_NODE = '500'"),
-        (LARGE_ROWS, MAX_WRITERS)
-    );
-    assert_eq!(
-        profiled_export(&first_300, "WRITERS_PER_NODE = '500'"),
-        (MAX_WRITERS, MAX_WRITERS)
-    );
-}
-
 /// Scenario: SINGLE_COMMIT runs one writer for the whole cluster
 #[test]
-fn export_single_commit_runs_one_writer() {
+fn export_writer_layout_sets_writer_count() {
     stack();
     setup();
+    let typed_first = |n: i64| format!("(SELECT * FROM {TYPED_TABLE} WHERE ID <= {n})");
+    let large_first = |n: i64| format!("(SELECT * FROM {LARGE_TABLE} WHERE ID <= {n})");
+    let per_node_3 = "WRITERS_PER_NODE = '3'";
+    let per_node_500 = "WRITERS_PER_NODE = '500'";
+    let cases = [
+        (
+            "3 writers per node over the table",
+            TYPED_TABLE.to_string(),
+            per_node_3,
+            (TYPED_ROWS, 3),
+        ),
+        (
+            "3 writers per node over exactly 3 rows",
+            typed_first(3),
+            per_node_3,
+            (3, 3),
+        ),
+        (
+            "3 writers per node over 2 rows",
+            typed_first(2),
+            per_node_3,
+            (2, 2),
+        ),
+        (
+            "default is 1 writer",
+            TYPED_TABLE.to_string(),
+            "",
+            (TYPED_ROWS, 1),
+        ),
+        (
+            "500 writers per node cap at 300 over the table",
+            LARGE_TABLE.to_string(),
+            per_node_500,
+            (LARGE_ROWS, MAX_WRITERS),
+        ),
+        (
+            "500 writers per node cap at 300 over exactly 300 rows",
+            large_first(MAX_WRITERS),
+            per_node_500,
+            (MAX_WRITERS, MAX_WRITERS),
+        ),
+        (
+            "SINGLE_COMMIT runs 1 writer",
+            TYPED_TABLE.to_string(),
+            "SINGLE_COMMIT = 'true'",
+            (TYPED_ROWS, 1),
+        ),
+    ];
 
-    assert_eq!(
-        profiled_export(TYPED_TABLE, "SINGLE_COMMIT = 'true'"),
-        (TYPED_ROWS, 1)
-    );
+    for (case, source, options, expected) in cases {
+        assert_eq!(profiled_export(&source, options), expected, "{case}");
+    }
 }
 
 /// Scenario: WRITERS_PER_NODE together with SINGLE_COMMIT is refused
-#[test]
-fn export_refuses_writers_per_node_with_single_commit() {
-    stack();
-    setup();
-
-    assert_refused_before_reading(
-        &mut exa_conn(),
-        &export_sql(
-            FAILING_SOURCE,
-            "WRITERS_PER_NODE = '2' SINGLE_COMMIT = 'true'",
-        ),
-        &["WRITERS_PER_NODE cannot be combined with SINGLE_COMMIT = 'true'"],
-    );
-}
-
 /// Scenario: An invalid option fails the export before any data is read
+/// Scenario: An export without a named CONNECTION fails before any data is read
+/// Scenario: TRUNCATE, REPLACE, and CREATED BY are refused
 #[test]
-fn export_refuses_invalid_options_before_reading() {
+fn export_refuses_invalid_statements_before_reading() {
     stack();
     setup();
+    let ask_for_connection =
+        "add AT <connection>, naming the CONNECTION object the virtual schema uses";
+    let inline = format!(
+        "AT 'http://catalog:8181' USER 'exporter' IDENTIFIED BY '{INLINE_PASSWORD}' \
+         WITH TABLE_NAME = 'ns.t'"
+    );
+    let appends_only =
+        |clause: &str| format!("{clause} is not supported, because the export only appends rows");
+    let cases = [
+        (
+            "WRITERS_PER_NODE with SINGLE_COMMIT",
+            export_sql(
+                FAILING_SOURCE,
+                "WRITERS_PER_NODE = '2' SINGLE_COMMIT = 'true'",
+            ),
+            vec!["WRITERS_PER_NODE cannot be combined with SINGLE_COMMIT = 'true'".to_string()],
+        ),
+        (
+            "unknown option",
+            export_sql(FAILING_SOURCE, "FILE_FORMAT = 'csv'"),
+            vec![
+                "unknown option FILE_FORMAT; the accepted options are TABLE_NAME, WRITERS_PER_NODE, and SINGLE_COMMIT"
+                    .to_string(),
+            ],
+        ),
+        (
+            "WRITERS_PER_NODE of 0",
+            export_sql(FAILING_SOURCE, "WRITERS_PER_NODE = '0'"),
+            vec![
+                "WRITERS_PER_NODE = '0' is not an integer of at least 1".to_string(),
+                "WRITERS_PER_NODE = '4'".to_string(),
+            ],
+        ),
+        (
+            "no CONNECTION",
+            export_into(FAILING_SOURCE, "WITH TABLE_NAME = 'ns.t'"),
+            vec![
+                "the EXPORT statement names no CONNECTION".to_string(),
+                ask_for_connection.to_string(),
+            ],
+        ),
+        (
+            "inline CONNECTION",
+            export_into(FAILING_SOURCE, &inline),
+            vec![
+                "an inline AT".to_string(),
+                "is not supported".to_string(),
+                ask_for_connection.to_string(),
+            ],
+        ),
+        (
+            "TRUNCATE",
+            export_sql(FAILING_SOURCE, "TRUNCATE"),
+            vec![appends_only("TRUNCATE")],
+        ),
+        (
+            "REPLACE",
+            export_sql(FAILING_SOURCE, "REPLACE"),
+            vec![appends_only("REPLACE")],
+        ),
+        (
+            "CREATED BY",
+            export_sql(FAILING_SOURCE, "CREATED BY 'CREATE TABLE ns.t (x INT)'"),
+            vec![appends_only("CREATED BY")],
+        ),
+    ];
 
-    assert_refused_before_reading(
-        &mut exa_conn(),
-        &export_sql(FAILING_SOURCE, "FILE_FORMAT = 'csv'"),
-        &[
-            "unknown option FILE_FORMAT; the accepted options are TABLE_NAME, WRITERS_PER_NODE, and SINGLE_COMMIT",
-        ],
-    );
-    assert_refused_before_reading(
-        &mut exa_conn(),
-        &export_sql(FAILING_SOURCE, "WRITERS_PER_NODE = '0'"),
-        &[
-            "WRITERS_PER_NODE = '0' is not an integer of at least 1",
-            "WRITERS_PER_NODE = '4'",
-        ],
-    );
+    for (case, sql, fragments) in cases {
+        let fragments: Vec<&str> = fragments.iter().map(String::as_str).collect();
+        let error = assert_refused_before_reading(case, &mut exa_conn(), &sql, &fragments);
+        assert!(
+            !error.contains(INLINE_PASSWORD),
+            "{case}: the inline password leaked: {error}"
+        );
+    }
     let read_error = export_error(&mut exa_conn(), &export_sql(FAILING_SOURCE, ""));
     assert!(
         read_error.contains(SOURCE_READ_ERROR),
         "with valid options the export reads the failing source: {read_error}"
     );
-}
-
-/// Scenario: An export without a named CONNECTION fails before any data is read
-#[test]
-fn export_refuses_missing_or_inline_connection() {
-    stack();
-    setup();
-    let inline_password = "ExportInlineSecret2026";
-    let ask_for_connection =
-        "add AT <connection>, naming the CONNECTION object the virtual schema uses";
-
-    assert_refused_before_reading(
-        &mut exa_conn(),
-        &export_into(FAILING_SOURCE, "WITH TABLE_NAME = 'ns.t'"),
-        &[
-            "the EXPORT statement names no CONNECTION",
-            ask_for_connection,
-        ],
-    );
-    let inline = assert_refused_before_reading(
-        &mut exa_conn(),
-        &export_into(
-            FAILING_SOURCE,
-            &format!(
-                "AT 'http://catalog:8181' USER 'exporter' IDENTIFIED BY '{inline_password}' \
-                 WITH TABLE_NAME = 'ns.t'"
-            ),
-        ),
-        &["an inline AT", "is not supported", ask_for_connection],
-    );
-    assert!(
-        !inline.contains(inline_password),
-        "the inline password leaked: {inline}"
-    );
-}
-
-/// Scenario: TRUNCATE, REPLACE, and CREATED BY are refused
-#[test]
-fn export_refuses_truncate_replace_created_by() {
-    stack();
-    setup();
-
-    for (clause, name) in [
-        ("TRUNCATE", "TRUNCATE"),
-        ("REPLACE", "REPLACE"),
-        ("CREATED BY 'CREATE TABLE ns.t (x INT)'", "CREATED BY"),
-    ] {
-        assert_refused_before_reading(
-            &mut exa_conn(),
-            &export_sql(FAILING_SOURCE, clause),
-            &[&format!(
-                "{name} is not supported, because the export only appends rows"
-            )],
-        );
-    }
 }
 
 /// Scenario: A column of an unsupported type is refused
@@ -464,6 +447,7 @@ fn export_missing_script_grant_fails_named() {
     exporters();
 
     assert_refused_before_reading(
+        "no script grant",
         &mut exporter_conn(NO_ACCESS_EXPORTER),
         &export_sql(FAILING_SOURCE, ""),
         &[&missing_grant_error(NO_ACCESS_EXPORTER)],
