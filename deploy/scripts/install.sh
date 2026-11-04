@@ -1195,6 +1195,10 @@ ddl_version() {
   printf 'CREATE OR REPLACE RUST SCALAR SCRIPT %s.LAKEHOUSE_VERSION()\nRETURNS VARCHAR(100) AS\n%%udf_object %s' "$1" "$2"
 }
 
+ddl_export() {
+  printf 'CREATE OR REPLACE RUST SET SCRIPT %s.LAKEHOUSE_EXPORT(...)\nRETURNS DECIMAL(18,0) AS\n%%udf_object %s' "$1" "$2"
+}
+
 ddl_distribute_files() {
   printf 'CREATE OR REPLACE LUA SET SCRIPT %s.LAKEHOUSE_DISTRIBUTE_FILES(files VARCHAR(2000000))\nEMITS (files VARCHAR(2000000)) AS\nfunction run(ctx)\n    repeat\n        ctx.emit(ctx.files)\n    until not ctx.next()\nend' "$1"
 }
@@ -1269,6 +1273,7 @@ create_engine_scripts() {
     "$(ddl_adapter "$schema" "$so")"
     "$(ddl_scan "$schema" "$so")"
     "$(ddl_version "$schema" "$so")"
+    "$(ddl_export "$schema" "$so")"
     "$(ddl_distribute_files "$schema")"
   )
   for stmt in "${statements[@]}"; do
@@ -1346,6 +1351,7 @@ run_smoke_test() {
 print_next_step_template() {
   local schema="$1"
   local role="LAKEHOUSE_ENGINE_ROLE_${schema}"
+  local export_role="LAKEHOUSE_EXPORT_ROLE_${schema}"
   local installing_user="${ARG_USER:-<installing-user>}"
   emit ""
   emit "=== Next step: create the catalog CONNECTION and VIRTUAL SCHEMA (NOT created by this installer) ==="
@@ -1399,6 +1405,16 @@ print_next_step_template() {
   emit "  ALLOW_HTTP         = 'false';"
   emit ""
   emit "-- Readers need only: GRANT CREATE SESSION TO <user>; GRANT SELECT ON SCHEMA <MY_LAKEHOUSE> TO <user>;"
+  emit ""
+  emit "-- Export (EXPORT ... INTO SCRIPT $schema.LAKEHOUSE_EXPORT): one role serves every exporting user. SYS needs no grant."
+  emit "-- Run as a DBA after the CONNECTION exists. After a re-install, run the GRANT EXECUTE and GRANT ACCESS lines again."
+  emit "-- Grant the role only to users who may use the CONNECTION's credentials."
+  emit "CREATE ROLE $export_role;"
+  emit "GRANT EXPORT TO $export_role;"
+  emit "GRANT CONNECTION LAKEHOUSE_CATALOG_CREDS TO $export_role;"
+  emit "GRANT EXECUTE ON SCRIPT $schema.LAKEHOUSE_EXPORT TO $export_role;"
+  emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_EXPORT TO $export_role;"
+  emit "-- Exporters: GRANT $export_role TO <user>;"
 }
 
 main() {

@@ -2477,6 +2477,8 @@ checksum = "d3611dd2507196ad52a8eea90817c011294fd905bbc85a0aa5292ab0ba3d5ea8"
 dependencies = [
  "arrow",
  "chrono",
+ "serde",
+ "serde_json",
  "thiserror",
  "tracing",
 ]
@@ -3468,7 +3470,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.57.4"
+version = "0.58.0"
 dependencies = [
  "aes-gcm",
  "arrow",

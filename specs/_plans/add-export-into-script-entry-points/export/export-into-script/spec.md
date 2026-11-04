@@ -10,7 +10,7 @@ A user exports an Exasol table, a query over virtual schema tables, or a query t
 * Writer count: with `SINGLE_COMMIT = 'true'`, one writer runs for the whole cluster. Otherwise the export deals the source rows in turn to G writers, where G is the node count × `WRITERS_PER_NODE`, capped at 300. A source with at least G rows runs exactly G writers, and a source with fewer rows runs one writer per row.
 * An exporting user needs the `EXPORT` system privilege, `EXECUTE` on `LAKEHOUSE_EXPORT`, the `CONNECTION` privilege on the CONNECTION (Exasol requires it for `AT <connection>`), and `GRANT ACCESS ON CONNECTION <connection> FOR SCRIPT <schema>.LAKEHOUSE_EXPORT`, granted directly or through a role.
 * The export refuses columns of type GEOMETRY, HASHTYPE, INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, and TIMESTAMP WITH LOCAL TIME ZONE, because Exasol does not pass them to a UDF reliably. The Iceberg table spec (§ Schemas and Data Types, Primitive Types) defines `timestamptz` ("Timestamp, microsecond precision, with timezone"; the counterpart of TIMESTAMP WITH LOCAL TIME ZONE), `uuid` ("Universally unique identifiers") and `fixed(L)` ("Fixed-length byte array of length L"), the Iceberg counterparts of HASHTYPE, and, in format v3, `geometry(C)`. It defines no interval type. Refusing GEOMETRY, HASHTYPE, and TIMESTAMP WITH LOCAL TIME ZONE is a trade-off that Exasol's UDF interface forces. A user casts such a column, for example to VARCHAR or TIMESTAMP, to export it.
-* The column type check runs on the rows the source returns, so an empty source with a column of one of these types exports 0 rows without an error.
+* Exasol's own UDF type check races the export's check, so a refused column fails the export with one of two errors: the export's error, which names the column and its type, or Exasol's `[22002] Column type not supported: <type>`, which does not name the column. Which one a run returns is not deterministic. An empty source with such a column may be refused the same way or export 0 rows, so the export makes no promise about it.
 
 ## Scenarios
 
@@ -42,12 +42,6 @@ A user exports an Exasol table, a query over virtual schema tables, or a query t
 ### Scenario: An empty source exports zero rows
 
 * *GIVEN* a query that returns no rows and whose columns all have types the export supports
-* *WHEN* a user exports it
-* *THEN* the statement SHALL succeed with a row count of 0
-
-### Scenario: An empty source with an unsupported column type exports zero rows
-
-* *GIVEN* a query that returns no rows and has one column of each type § Background lists as refused
 * *WHEN* a user exports it
 * *THEN* the statement SHALL succeed with a row count of 0
 
@@ -100,12 +94,12 @@ A user exports an Exasol table, a query over virtual schema tables, or a query t
 * *THEN* the export SHALL fail before any source row is read
 * *AND* the error SHALL name the refused clause and state that the export only appends rows
 
-### Scenario: A column of an unsupported type fails the export naming the column and its type
+### Scenario: A column of an unsupported type is refused
 
 * *GIVEN* a source that returns at least one row and has a column of type GEOMETRY, HASHTYPE, INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, or TIMESTAMP WITH LOCAL TIME ZONE
 * *WHEN* a user exports it
-* *THEN* the export SHALL fail with an error that names the column and its Exasol type
-* *AND* the error SHALL name the column as the source names it: the table column, the column-list entry, or the query's column alias
+* *THEN* the export SHALL fail
+* *AND* the error SHALL either name the column as the source names it (the table column, the column-list entry, or the query's column alias) and its Exasol type, or be Exasol's `Column type not supported: <type>`
 
 ### Scenario: A user who holds the export privileges exports rows
 

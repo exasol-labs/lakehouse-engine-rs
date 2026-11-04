@@ -35,6 +35,32 @@ pub fn error_text(response: &Value, context: &str) -> String {
 
 /// The first cell of an execute response. A `DECIMAL` result comes back as a JSON string,
 /// so a string is parsed too.
+pub fn parse_int(v: &Value) -> i64 {
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| panic!("expected integer value, got: {v:?}"))
+}
+
+/// The exported row count and the writer count of one export run in a fresh session.
+#[track_caller]
+pub fn profiled_export_counts(conn: &mut ExaConn, export_sql: &str) -> (i64, i64) {
+    conn.execute("ALTER SESSION SET PROFILE = 'ON'");
+    let resp = conn.execute(export_sql);
+    let rows = resp["responseData"]["results"][0]["rowCount"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("expected a rowCount from:\n{export_sql}\n\nResponse: {resp}"));
+    conn.execute("ALTER SESSION SET PROFILE = 'OFF'");
+    conn.execute("FLUSH STATISTICS");
+    let parts = conn.query_columns(
+        "SELECT OUT_ROWS FROM EXA_USER_PROFILE_LAST_DAY \
+         WHERE SESSION_ID = CURRENT_SESSION AND COMMAND_NAME = 'EXPORT' AND PART_NAME = 'GROUP BY'",
+    );
+    let [writers] = parts[0].as_slice() else {
+        panic!("the export {export_sql} must have one GROUP BY profile part: {parts:?}");
+    };
+    (rows, parse_int(writers))
+}
+
 pub fn scalar_i64(resp: &Value) -> Option<i64> {
     let value = &resp["responseData"]["results"][0]["resultSet"]["data"][0][0];
     value

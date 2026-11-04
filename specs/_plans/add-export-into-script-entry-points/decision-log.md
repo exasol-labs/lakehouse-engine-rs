@@ -19,22 +19,22 @@
 
 ### [2] The column type check is a per-row guard in the generated SELECT, keyed on `MOD(ROWNUM, G)`
 
-- **Decision:** For every source column, the generated SELECT carries a `WHERE` guard that raises an error naming the column and `TYPEOF(<column>)` when the type is GEOMETRY, HASHTYPE, INTERVAL, or TIMESTAMP WITH LOCAL TIME ZONE. The group key is `MOD(ROWNUM, G)` in every mode, and `SINGLE_COMMIT = 'true'` sets G to 1, where the key is always 0. Exasol has no error function, so the guard raises the error by casting a message string to `DECIMAL(1,0)`.
+- **Decision:** For every source column, the generated SELECT carries a `WHERE` guard that raises an error naming the column and `TYPEOF(<column>)` when the type is GEOMETRY, HASHTYPE, INTERVAL, or TIMESTAMP WITH LOCAL TIME ZONE. The group key is `MOD(ROWNUM, G)` in every mode, and `SINGLE_COMMIT = 'true'` sets G to 1, where the key is always 0. Exasol has no error function, so the guard raises the error by casting a message string to `DECIMAL(1,0)`. The guard races Exasol's own UDF type check, so a refused export carries either the guard error or `Column type not supported: <type>`.
 - **Rationale:** Exasol passes no source column types to the export call. Without the guard, its own handling of these types varies between runs of the same statement: `Column type not supported: <type>`, `VM error: Unknown data type found`, or a silent export, and no message names the column. Exasol documents `ROWNUM` as "an incremental unique integer value ... beginning with 1", so a source of at least G rows yields every key from 0 to G - 1. Measured with the pinned SLC on Exasol 2025.1.16 and 8.29.13, with one script as the export target and the writer (decision [1]):
   - The key ran exactly G writers at G = 1, 4, and 300, over tables of 1, 4, 300, 1,000, and 10,000 rows, a filtered query of 1,428 rows, and a join query of exactly 300 rows. It ran 2 writers for a 2-row source at G = 3.
-  - With the guard, at G = 1, 4, and 300 and for all five types, the guard error came first in every run over one-row and 1,000-row sources (90 of 90 on 2025.1.16, 60 of 60 on 8.29.13). Empty sources exported 0 rows (45 of 45, 30 of 30).
+  - With the guard, the guard error came first in some runs and Exasol's `Column type not supported: <type>` in others. A one-row table with five unsupported columns gave the guard error in 6 of 10 runs and Exasol's in 4 of 10 on 2025.1.16, and a single GEOMETRY column gave the guard error in 10 of 10. An empty source with such a column errored in 3 to 9 of 10 runs and exported 0 rows otherwise.
   - At G = 1 the key keeps interview answer 3: one key value and no `IPROC()`.
 - **Alternatives:**
   - The writer checks its input metadata. Rejected: Exasol can refuse the column before writer code runs.
   - The export script checks types. Rejected: it receives no types.
-  - A literal key for SINGLE_COMMIT. Rejected: with a literal key, whether the guard error or Exasol's type error comes first depends on the SLC version. With a per-row key, the guard error came first on every measured version.
+  - A literal key for SINGLE_COMMIT. Rejected: it gives no better ordering of the guard error and Exasol's type error than the per-row key.
   - `MOD(FLOOR(RANDOM() * G), G)`. Rejected: a writer receives no row with a small probability, so the writer count is not exact.
   - `ROW_NUMBER() OVER ()`. Rejected: Exasol allows analytic functions only in the select list ("Analytic functions may only be used as select list elements"), and an export SELECT over a subquery of `DUAL` fails with `object X.C0 not found`.
 - **Consequences:**
   - The error text carries Exasol's cast-error prefix (`[22018] ... invalid character value for cast; Value: '...'`). The user documentation quotes it.
   - The guard costs a `TYPEOF` and four `LIKE` tests per column per row, and the cost of `ROWNUM` numbering on a multi-node cluster is unmeasured. A follow-up issue (#TBD, plan.md § Open Questions) measures both in the export performance work.
   - Gap-free `ROWNUM` numbering across nodes is proven only by the `cloud-e2e` test over exactly 2 × node count rows (task 1.12).
-  - A source that returns no rows skips the check and exports 0 rows.
+  - A source that returns no rows may skip the check and export 0 rows, or be refused by Exasol's type check. The export makes no promise about it.
 - **Promotes to ADR:** no
 
 ### [3] Exporting users get a dedicated role that the installer prints, and the export script reads the CONNECTION in the hook and in each writer
@@ -58,10 +58,10 @@
 - **Direction change:** The requester withdrew the criterion: "That doesn't make sense, because the installer runs before any CONNECTION exists. Export should work like virtual schemas: install the scripts, then users create CONNECTIONs and grant access to them." The requester will reword #565. The installer creates the one export script (decision [1]), prints the export grants as a template, and runs none; `--export-connection` is removed. Decision [3], task 2.2, the installer scenario, and the § Context deviation bullet carry the change.
 - **Promotes to ADR:** no
 
-### [plan-review] An empty source with an unsupported column type exports 0 rows
+### [plan-review] An unsupported column type is refused with either error
 
-- **Finding:** Round 3 `[SCOPE_REDUCTION]` (HUMAN). #565's criterion reads "A column of an unsupported type ... fails the export with an error that names the column and its type". The type check runs on source rows, so an empty source with such a column exports 0 rows without an error.
-- **Direction change:** The requester accepted this as a scoped exception to #565. The two empty-source scenarios and § Background of `export/export-into-script`, the empty-source part of `docs/export.md` (task 1.14), and the § Context deviation bullet state it.
+- **Finding:** Round 3 `[SCOPE_REDUCTION]` (HUMAN). #565's criterion reads "A column of an unsupported type ... fails the export with an error that names the column and its type". Exasol's own UDF type check races the guard, so the refusal carries the guard error or `Column type not supported: <type>`, and an empty source with such a column may be refused or export 0 rows.
+- **Direction change:** The requester accepted either error as a scoped exception to #565 and rewords #565. § Background and the unsupported-type scenario of `export/export-into-script`, the empty-source part of `docs/export.md` (task 1.14), and the § Context deviation bullet state it. No scenario covers an empty source with an unsupported column type.
 - **Promotes to ADR:** no
 
 ### [plan-review] The `install-script-e2e` job checks the installed export script

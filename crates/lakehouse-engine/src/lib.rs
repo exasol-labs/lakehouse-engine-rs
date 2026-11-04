@@ -1,4 +1,4 @@
-//! One `.so`, three entry points: VS adapter, DataFusion scan UDF, version UDF.
+//! One `.so`, four entry points: VS adapter, DataFusion scan UDF, version UDF, export script.
 //!
 //! Invariants: only SDK `Value` types (or Arrow C Data Interface structs) cross the `.so`
 //! boundary, never Arrow types; the scan UDF discovers no files itself; credentials never appear in errors.
@@ -10,6 +10,7 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 
 pub mod adapter;
+pub mod export;
 pub mod scan;
 #[cfg(test)]
 #[path = "scan_surface_probe_tests.rs"]
@@ -34,4 +35,9 @@ const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[exasol_udf(name = "LAKEHOUSE_VERSION")]
 fn lakehouse_version(_ctx: &mut dyn UdfContext) -> Result<Option<String>, UdfError> {
     Ok(Some(ENGINE_VERSION.to_string()))
+}
+
+#[exasol_udf(name = "LAKEHOUSE_EXPORT", export_spec(export::generate_export_sql))]
+fn lakehouse_export(ctx: &mut dyn UdfContext) -> Result<Option<i64>, UdfError> {
+    export::run_writer(ctx).map(Some)
 }
