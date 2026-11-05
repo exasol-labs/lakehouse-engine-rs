@@ -1,6 +1,6 @@
 //! Credential values never appear in an error message produced by this module.
 
-use crate::exasol::{CATALOG_CONNECTION, catalog_connection_name};
+use crate::exasol::catalog_connection_name;
 use crate::scan::sealed::{
     SealedStorageKey, connection_password_carries_key_material, derive_sealed_storage_key,
 };
@@ -30,7 +30,7 @@ pub fn read_connection(
     kind: CatalogKind,
 ) -> Result<Resolved, UdfError> {
     let name = catalog_connection_name(name)
-        .ok_or_else(|| UdfError::User(format!("{CATALOG_CONNECTION} is required")))?;
+        .ok_or_else(|| UdfError::User("CATALOG_CONNECTION is required".into()))?;
 
     let conn = ctx.connection(name).map_err(|cause| {
         UdfError::User(format!(

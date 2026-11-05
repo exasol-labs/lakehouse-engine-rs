@@ -260,16 +260,6 @@ fn single_shard_short_circuits_distributor_fromless() {
     );
 }
 
-/// Scenario: Fewer files than G produces one shard per file with no empty shards
-#[test]
-fn shard_count_clamped_to_file_count_no_empty_shards() {
-    assert_eq!(shard_count(10, 8, 3), 3, "must clamp to file_count=3");
-    assert_eq!(shard_count(4, 8, 5), 5, "must clamp to file_count=5");
-    assert_eq!(shard_count(1, 1, 1), 1, "single file single shard");
-    assert_eq!(shard_count(0, 8, 100), 1, "zero product must clamp to 1");
-    assert_eq!(shard_count(5, 0, 100), 1, "zero factor must clamp to 1");
-}
-
 #[test]
 fn pushdown_carries_table_root_and_sizes_in_common_and_shards() {
     let root = "s3://warehouse/db/events";

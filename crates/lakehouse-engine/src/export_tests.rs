@@ -646,35 +646,13 @@ mod sql {
     fn group_count_follows_the_writer_layout_and_caps_at_300() {
         let cases = [
             (
-                "single commit on one node",
-                WriterLayout::SingleCommit,
-                1,
-                1,
-            ),
-            (
-                "single commit on four nodes",
-                WriterLayout::SingleCommit,
-                4,
-                1,
-            ),
-            ("default on one node", WriterLayout::PerNode(1), 1, 1),
-            ("default on four nodes", WriterLayout::PerNode(1), 4, 4),
-            (
-                "three per node on two nodes",
+                "nodes times writers per node",
                 WriterLayout::PerNode(3),
                 2,
                 6,
             ),
-            ("unknown node count", WriterLayout::PerNode(2), 0, 1),
-            ("exactly at the cap", WriterLayout::PerNode(300), 1, 300),
-            ("one past the cap", WriterLayout::PerNode(301), 1, 300),
-            ("far past the cap", WriterLayout::PerNode(500), 4, 300),
-            (
-                "overflowing product",
-                WriterLayout::PerNode(usize::MAX),
-                4,
-                300,
-            ),
+            ("single commit", WriterLayout::SingleCommit, 4, 1),
+            ("capped at 300", WriterLayout::PerNode(500), 4, 300),
         ];
 
         for (case, writers, node_count, expected) in cases {

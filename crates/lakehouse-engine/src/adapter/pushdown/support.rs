@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use vs_expression::{ColumnNode, render_df_filter_safe, render_expression_safe, walk_column_nodes};
 
 use super::binary_filter::{BinaryLayout, compare_binary_bytes};
-use crate::exasol::{group_count, quote_ident, sql_string_literal};
 
 pub(super) const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
 
@@ -25,9 +24,8 @@ pub(super) const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
 pub(super) const DISTRIBUTE_FILES_UDF_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
 
 /// Clamped to at least 1 and at most `min(file_count, 300)`, so no shard is empty.
-pub fn shard_count(node_count: usize, parallelism_factor: usize, file_count: usize) -> usize {
-    group_count(node_count, parallelism_factor, file_count)
-}
+pub use crate::exasol::group_count as shard_count;
+pub(super) use crate::exasol::{quote_ident, sql_string_literal};
 
 pub(super) fn shard_files_json<E: Clone + Into<FileEntry>>(files: &[E]) -> String {
     let entries: Vec<FileEntry> = files.iter().cloned().map(Into::into).collect();

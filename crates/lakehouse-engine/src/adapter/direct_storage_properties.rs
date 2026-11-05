@@ -1,6 +1,7 @@
 use crate::adapter::parquet_directory::{DirectoryOptions, MergeMode};
-use crate::adapter::properties::{PROP_HIVE_PARTITIONING, PROP_MERGE_SCHEMA, PROP_NAMESPACE};
-use crate::exasol::parse_boolean;
+use crate::adapter::properties::{
+    PROP_HIVE_PARTITIONING, PROP_MERGE_SCHEMA, PROP_NAMESPACE, parse_boolean,
+};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 

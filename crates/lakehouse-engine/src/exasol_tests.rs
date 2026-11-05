@@ -9,6 +9,16 @@ fn group_count_scales_with_nodes_and_caps_at_300() {
     assert_eq!(group_count(usize::MAX, 2, usize::MAX), 300);
 }
 
+/// Scenario: Fewer files than G produces one shard per file with no empty shards
+#[test]
+fn group_count_clamps_to_the_upper_bound_and_to_at_least_one() {
+    assert_eq!(group_count(10, 8, 3), 3);
+    assert_eq!(group_count(4, 8, 5), 5);
+    assert_eq!(group_count(0, 4, 10), 1);
+    assert_eq!(group_count(4, 0, 10), 1);
+    assert_eq!(group_count(4, 4, 0), 1);
+}
+
 #[test]
 fn quoting_doubles_the_embedded_quote() {
     assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");

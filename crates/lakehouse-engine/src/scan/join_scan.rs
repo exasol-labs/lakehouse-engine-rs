@@ -14,8 +14,9 @@ use crate::types::mapping::arrow_to_exasol_type;
 use super::raw_scan::{
     delete_path_read_limiter, emit_dataframe, physical_plan, plan_sql, register_file_list,
 };
-use super::sql_support::{aliased_select, append_where, render_column, render_projection};
-use crate::exasol::quote_ident;
+use super::sql_support::{
+    aliased_select, append_where, quote_ident, render_column, render_projection,
+};
 
 const JOIN_FACT_TABLE: &str = "fact_scan";
 const JOIN_DIM_TABLE: &str = "dim_scan";

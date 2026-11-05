@@ -29,7 +29,8 @@ use crate::adapter::connection::{catalog_block, read_connection, storage_block};
 use crate::adapter::direct_storage::DirectStorageCatalogClient;
 use crate::adapter::permission::{PermissionCheck, PermissionSettings};
 use crate::adapter::properties::{
-    PROP_NAMESPACE, ThreadingMode, TuningProperties, check_properties, resolve_allow_http,
+    PROP_CATALOG_CONNECTION, PROP_NAMESPACE, ThreadingMode, TuningProperties, check_properties,
+    resolve_allow_http,
 };
 use crate::adapter::pushdown::{declare_columns, handle_pushdown};
 use crate::adapter::scoped_refresh::{RequestedTables, ScopedRefresh};
@@ -39,7 +40,6 @@ use crate::adapter::table_identity::{encode_identifier_note, read_identifier};
 use crate::adapter::tables::{
     catalog_identifier_string, flatten_table_name, reject_name_collisions,
 };
-use crate::exasol::CATALOG_CONNECTION;
 use crate::scan::sealed::SealedStorageKey;
 use crate::scan::spec::DEFAULT_S3_MAX_CONNECTIONS;
 use crate::scan::spec::StorageBackend;
@@ -151,8 +151,8 @@ fn resolve_connection_config(
 ) -> Result<ResolvedConnectionConfig, UdfError> {
     let kind = catalog_kind::resolve_catalog_kind(props)?;
     permission.require_supported_kind(kind)?;
-    let connection_name = nonempty_str(props, CATALOG_CONNECTION)
-        .ok_or_else(|| UdfError::User(format!("{CATALOG_CONNECTION} is required")))?;
+    let connection_name = nonempty_str(props, PROP_CATALOG_CONNECTION)
+        .ok_or_else(|| UdfError::User("CATALOG_CONNECTION is required".into()))?;
     let resolved = read_connection(ctx, Some(connection_name), kind)?;
     permission.require_management_url(&resolved.uri)?;
     let allow_http = resolve_allow_http(props);

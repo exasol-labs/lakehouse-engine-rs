@@ -3,7 +3,8 @@
 
 use super::nonempty_str;
 use super::table_filter::{TableFilter, parse_patterns};
-use crate::exasol::{CATALOG_CONNECTION, WholeNumber, parse_boolean, parse_whole_number};
+pub(super) use crate::exasol::parse_boolean;
+use crate::exasol::{WholeNumber, parse_whole_number};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,6 +12,8 @@ use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 
 // Read from plain VS properties, never the CONNECTION password JSON. Absent means Iceberg REST.
 pub(super) const PROP_CATALOG_KIND: &str = "CATALOG_KIND";
+// CONNECTION whose address is the catalog URI and whose password is the credential JSON.
+pub(super) use crate::exasol::CATALOG_CONNECTION as PROP_CATALOG_CONNECTION;
 pub(super) const PROP_NAMESPACE: &str = "NAMESPACE";
 pub(super) const PROP_ALLOW_HTTP: &str = "ALLOW_HTTP";
 pub(super) const PROP_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
@@ -38,7 +41,7 @@ const PROP_TABLE_EXCLUDE: &str = "TABLE_EXCLUDE";
 /// checks the value stay in that module.
 const PROPERTY_NAMES: [&str; 20] = [
     PROP_CATALOG_KIND,
-    CATALOG_CONNECTION,
+    PROP_CATALOG_CONNECTION,
     PROP_NAMESPACE,
     PROP_ALLOW_HTTP,
     PROP_PARALLELISM_FACTOR,

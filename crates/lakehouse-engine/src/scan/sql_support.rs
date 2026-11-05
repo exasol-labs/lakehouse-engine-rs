@@ -1,7 +1,7 @@
 use arrow::datatypes::DataType;
 use datafusion::common::DFSchema;
 
-use crate::exasol::quote_ident;
+pub(super) use crate::exasol::quote_ident;
 use crate::scan::spec::{ColumnRef, ProjectionItem};
 use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
 

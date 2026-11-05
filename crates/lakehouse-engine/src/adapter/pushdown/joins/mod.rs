@@ -1,6 +1,5 @@
 use crate::adapter::ResolvedConnectionConfig;
 use crate::adapter::properties::resolve_binary_as_string;
-use crate::exasol::quote_ident;
 #[cfg(test)]
 use crate::scan::spec::StorageBackend;
 use exasol_udf_sdk::error::UdfError;
@@ -11,7 +10,9 @@ use super::ConnectionStorage;
 use super::empty_result::empty_result_sql;
 use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
-use super::support::{ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns};
+use super::support::{
+    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident,
+};
 
 mod attribution;
 mod planning;

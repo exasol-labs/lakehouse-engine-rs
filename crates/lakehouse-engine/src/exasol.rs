@@ -12,7 +12,7 @@ pub(crate) const CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
 const MAX_GROUP_COUNT: usize = 300;
 
 /// `node_count × per_node`, clamped to at least 1 and at most `min(upper_bound, 300)`.
-pub(crate) fn group_count(node_count: usize, per_node: usize, upper_bound: usize) -> usize {
+pub fn group_count(node_count: usize, per_node: usize, upper_bound: usize) -> usize {
     let upper = upper_bound.clamp(1, MAX_GROUP_COUNT);
     node_count.saturating_mul(per_node).clamp(1, upper)
 }

@@ -1,11 +1,12 @@
-use crate::exasol::quote_ident;
 use crate::scan::spec::ProjectionItem;
 use serde_json::Value as Json;
 use vs_expression::{
     render_df_filter_exasol_safe, render_expression_exasol_safe, walk_column_nodes,
 };
 
-use super::super::support::{ColumnTypes, datafusion_renderable, type_accepted_rewrite};
+use super::super::support::{
+    ColumnTypes, datafusion_renderable, quote_ident, type_accepted_rewrite,
+};
 use super::attribution::{ColumnLeg, JoinLegs, UnattributableColumn};
 
 pub(super) fn projection_item_select_sql(item: &ProjectionItem) -> String {

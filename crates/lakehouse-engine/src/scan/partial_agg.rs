@@ -15,8 +15,7 @@ use crate::scan::spec::{AggregatePlan, PartialAggColumn, ScanSpec, partial_colum
 use crate::scan::storage_ref::ResolvedScanStorage;
 
 use super::raw_scan::register_files;
-use super::sql_support::{aliased_select, append_where};
-use crate::exasol::quote_ident;
+use super::sql_support::{aliased_select, append_where, quote_ident};
 
 /// The returned string is spliced verbatim as the inner table, so its text is part of the emitted SQL.
 async fn register_aliased_scan_target(
