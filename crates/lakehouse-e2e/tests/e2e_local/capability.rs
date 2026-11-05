@@ -8,11 +8,11 @@ use crate::common::exasol_ws::ExaConn;
 use crate::common::seed::{
     CHAR_PAD_COL, CHAR_PAD_OTHER, CHAR_PAD_OVER_LENGTH, CHAR_PAD_SHORT,
     CHAR_PAD_SHORT_TRAILING_SPACE, CHAR_PAD_TOTAL_ROWS, E2E_CHAR_PAD_TABLE, ExpectedValue,
+    TYPED_TABLE_TOTAL_ROWS,
 };
 use crate::common::timestamp_precision::expected_timestamp_precision;
 use crate::fixtures::{
-    LAKEHOUSE_VS, assert_pushed_to_scan_udf, events_table, lakehouse_vs, typed_table, vs_dim_table,
-    vs_fact_table,
+    LAKEHOUSE_VS, events_table, lakehouse_vs, typed_table, vs_dim_table, vs_fact_table,
 };
 
 /// The fix's measured worst-case divergence from native Exasol is ~1 ULP (3.17e-16).
@@ -3095,6 +3095,24 @@ const INVALID_HASH_ERROR_PREFIX: &str = "data exception - Invalid hash format: "
 const TYPED_COLUMNS: &str =
     "C_DECIMAL_A, C_DECIMAL_B, C_DOUBLE, C_VARCHAR, C_DATE, C_TS, C_BOOL, C_PRICE, C_QTY";
 
+/// Exasol computes the query in the qualified single-table wrapper over the sharded scan.
+fn assert_single_table_wrapper(conn: &mut ExaConn, sql: &str) {
+    let pushed = explain_virtual_sql(conn, sql);
+    assert!(
+        pushed.contains(SCAN_SCRIPT_NAME) && has_n_scan_wrapper(&pushed, 1),
+        "{sql} must run in the qualified single-table wrapper over the scan: {pushed}"
+    );
+}
+
+/// Exasol computes the join in the N-scan wrapper, not in a broadcast scan.
+fn assert_two_scan_join_wrapper(conn: &mut ExaConn, sql: &str) {
+    let pushed = explain_virtual_sql(conn, sql);
+    assert!(
+        has_two_scan_wrapper(&pushed) && !has_broadcast_join_block(&pushed),
+        "{sql} must take the N-scan join wrapper, not the broadcast join: {pushed}"
+    );
+}
+
 /// Scenario: CAST renders the mapped target type per dialect
 #[test]
 fn cast_to_a_non_emittable_target_matches_native() {
@@ -3104,16 +3122,15 @@ fn cast_to_a_non_emittable_target_matches_native() {
 
     // A cast of `C_VARCHAR` itself raises on this fixture, so each filter casts a value that
     // converts, or a difference of timestamps.
-    assert_filters_match_native_copy(
-        &mut conn,
-        &table,
-        "C_VARCHAR, C_TS",
-        &[
-            "CAST(CASE WHEN C_VARCHAR = 'aa' THEN 'POINT (1 2)' END AS GEOMETRY) IS NULL",
-            "CAST(CASE WHEN C_VARCHAR = 'aa' THEN '00000000000000000000000000000000' END AS HASHTYPE) IS NULL",
-            "CAST(C_TS - C_TS AS INTERVAL DAY(2) TO SECOND(3)) IS NOT NULL",
-        ],
-    );
+    let filters = [
+        "CAST(CASE WHEN C_VARCHAR = 'aa' THEN 'POINT (1 2)' END AS GEOMETRY) IS NULL",
+        "CAST(CASE WHEN C_VARCHAR = 'aa' THEN '00000000000000000000000000000000' END AS HASHTYPE) IS NULL",
+        "CAST(C_TS - C_TS AS INTERVAL DAY(2) TO SECOND(3)) IS NOT NULL",
+    ];
+    assert_filters_match_native_copy(&mut conn, &table, "C_VARCHAR, C_TS", &filters);
+    for filter in filters {
+        assert_single_table_wrapper(&mut conn, &format!("SELECT ID FROM {table} WHERE {filter}"));
+    }
 
     // The error names the first offending value and the wrapper's alias of the cast column,
     // and the first value depends on row order, so only the leading text is compared.
@@ -3144,11 +3161,13 @@ fn non_emittable_select_items_match_native() {
     let mut conn = exa_conn();
     let table = typed_table();
 
-    let scanned = [
+    let single_table = [
         "SELECT ID, C_TS - C_TS FROM {} ORDER BY ID",
-        "SELECT C_TS - C_TS, COUNT(*) FROM {} GROUP BY C_TS - C_TS",
+        "SELECT C_TS - C_TS, COUNT(*) FROM {} GROUP BY C_TS - C_TS ORDER BY 1",
         "SELECT MIN(C_TS - C_TS) FROM {}",
         "SELECT MIN(CAST(C_TS AS TIMESTAMP WITH LOCAL TIME ZONE)) FROM {}",
+        "SELECT CAST(C_TS AS TIMESTAMP WITH LOCAL TIME ZONE), COUNT(*) FROM {} \
+         GROUP BY CAST(C_TS AS TIMESTAMP WITH LOCAL TIME ZONE) ORDER BY 1",
         // The INTERVAL item routes both ASCII casts into the Exasol-dialect wrapper.
         "SELECT ID, C_TS - C_TS, CAST(C_VARCHAR AS VARCHAR(10) ASCII), \
          CAST(C_VARCHAR AS CHAR(5) ASCII) FROM {} ORDER BY ID",
@@ -3156,17 +3175,18 @@ fn non_emittable_select_items_match_native() {
          FROM {} ORDER BY ID",
         "SELECT ID, CAST(CASE WHEN C_VARCHAR = 'aa' THEN '00000000000000000000000000000000' \
          END AS HASHTYPE) FROM {} ORDER BY ID",
-        // The pairs of `cc` rows hold different timestamps, so the interval is not always zero.
-        "SELECT a.ID, b.ID, a.C_TS - b.C_TS FROM {} a JOIN {} b ON a.C_VARCHAR = b.C_VARCHAR \
-         ORDER BY a.ID, b.ID",
     ];
+    // The pairs of `cc` rows hold different timestamps, so the interval is not always zero.
+    let join = "SELECT a.ID, b.ID, a.C_TS - b.C_TS FROM {} a JOIN {} b ON a.C_VARCHAR = b.C_VARCHAR \
+                ORDER BY a.ID, b.ID";
     let pruned = "SELECT C_TS - C_TS, COUNT(*) FROM {} WHERE ID < 0 GROUP BY C_TS - C_TS";
-    let queries: Vec<&str> = scanned.iter().copied().chain([pruned]).collect();
+    let queries: Vec<&str> = single_table.iter().copied().chain([join, pruned]).collect();
     assert_queries_match_native_copy(&mut conn, &table, TYPED_COLUMNS, &queries);
 
-    for query in scanned {
-        assert_pushed_to_scan_udf(&mut conn, &query.replace("{}", &table), query);
+    for query in single_table {
+        assert_single_table_wrapper(&mut conn, &query.replace("{}", &table));
     }
+    assert_two_scan_join_wrapper(&mut conn, &join.replace("{}", &table));
     let pruned_sql = pruned.replace("{}", &table);
     assert_eq!(
         conn.query_row_count(&pruned_sql),
@@ -3185,27 +3205,35 @@ fn typed_null_select_item_keeps_its_declared_type() {
     lakehouse_vs();
     let mut conn = exa_conn();
 
-    let sql = format!(
-        "SELECT ID, CAST(NULL AS GEOMETRY) FROM {} ORDER BY ID",
-        typed_table()
+    let table = typed_table();
+
+    let single_table = format!("SELECT ID, CAST(NULL AS GEOMETRY) FROM {table} ORDER BY ID");
+    let join = format!(
+        "SELECT a.ID, CAST(NULL AS GEOMETRY) FROM {table} a JOIN {table} b ON a.ID = b.ID \
+         ORDER BY a.ID"
     );
-    let resp = conn.execute(&sql);
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    assert_eq!(
-        result_set["columns"][1]["dataType"]["type"].as_str(),
-        Some("GEOMETRY"),
-        "the NULL item must keep the GEOMETRY type Exasol declared for it: {resp}"
-    );
-    let columns = conn.fetch_result_columns(result_set);
-    assert_eq!(
-        columns[1].len(),
-        12,
-        "one row per seeded row expected: {columns:?}"
-    );
-    assert!(
-        columns[1].iter().all(serde_json::Value::is_null),
-        "every row of CAST(NULL AS GEOMETRY) must be NULL: {columns:?}"
-    );
+    assert_single_table_wrapper(&mut conn, &single_table);
+    assert_two_scan_join_wrapper(&mut conn, &join);
+
+    for sql in [single_table, join] {
+        let resp = conn.execute(&sql);
+        let result_set = &resp["responseData"]["results"][0]["resultSet"];
+        assert_eq!(
+            result_set["columns"][1]["dataType"]["type"].as_str(),
+            Some("GEOMETRY"),
+            "the NULL item of {sql} must keep the GEOMETRY type Exasol declared for it: {resp}"
+        );
+        let columns = conn.fetch_result_columns(result_set);
+        assert_eq!(
+            columns[1].len(),
+            TYPED_TABLE_TOTAL_ROWS,
+            "{sql} must return one row per seeded row: {columns:?}"
+        );
+        assert!(
+            columns[1].iter().all(serde_json::Value::is_null),
+            "every row of the NULL item of {sql} must be NULL: {columns:?}"
+        );
+    }
 }
 
 /// Scenario: Every request of a supported Exasol version passes the strict type check
@@ -3230,7 +3258,6 @@ fn strict_type_check_accepts_every_request_shape() {
 
     // Exasol sends an empty `selectList` for `RANDOM()`, and its values differ per run.
     let random = "SELECT RANDOM() FROM {}";
-    create_native_copy(&mut conn, &table, TYPED_COLUMNS);
     assert_eq!(
         conn.query_row_count(&random.replace("{}", &table)),
         conn.query_row_count(&random.replace("{}", NATIVE_COPY)),

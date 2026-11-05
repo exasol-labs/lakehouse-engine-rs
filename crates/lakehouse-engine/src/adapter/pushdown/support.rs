@@ -1055,7 +1055,7 @@ pub(super) fn order_by_present(pushdown_req: &Json) -> bool {
 
 /// A `pushdownRequest` paired with the type Exasol declares for each of its select-list items.
 /// [`PushdownRequest::parse`] is the only constructor, so every holder has passed the strict type
-/// and count check, and no consumer reads `selectListDataTypes` on its own (decision-log [3]).
+/// and count check, and no consumer re-reads `selectListDataTypes` to turn an error into no type.
 #[derive(Debug, Clone)]
 pub struct PushdownRequest {
     json: Json,

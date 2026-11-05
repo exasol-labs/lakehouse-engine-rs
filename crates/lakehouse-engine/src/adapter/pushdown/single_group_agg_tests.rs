@@ -175,7 +175,7 @@ fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types(
             ),
             ExasolType::decimal(9, 4),
         )
-        .item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+        .count_star()
         .build_pushdown();
     let items = detect_aggregates(&req).expect("an interleaved list must decompose");
     assert_eq!(items.len(), 3);
@@ -200,7 +200,7 @@ fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types(
 #[test]
 fn single_group_scalar_over_aggregate_dedups_shared_inner_aggregates() {
     let req = pushdown_request("T", NO_COLUMNS)
-        .item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+        .count_star()
         .item(
             round_expr(
                 float_div(
@@ -260,7 +260,7 @@ fn ordinary_plans_unchanged_for_bare_aggregate_select_lists() {
             agg_item("SUM", Some("AMOUNT"), false),
             ExasolType::WIDEST_VARCHAR,
         )
-        .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+        .count_star()
         .item(
             agg_item("MIN", Some("TS"), false),
             ExasolType::WIDEST_VARCHAR,
@@ -277,7 +277,7 @@ fn ordinary_plans_unchanged_for_bare_aggregate_select_lists() {
 #[test]
 fn detect_count_star_produces_count_no_column() {
     let req = pushdown_request("T", NO_COLUMNS)
-        .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+        .count_star()
         .build_pushdown();
     let plans = detect_aggregates(&req).expect("should detect COUNT(*)");
     assert_eq!(plans.len(), 1);
@@ -398,7 +398,7 @@ fn detect_aggregates_returns_none_for_empty_select_list() {
 #[test]
 fn bare_column_aggregates_unchanged_regression() {
     let req = pushdown_request("T", NO_COLUMNS)
-        .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+        .count_star()
         .item(
             agg_item("COUNT", Some("id"), false),
             ExasolType::WIDEST_VARCHAR,
@@ -820,7 +820,7 @@ fn single_group_plan_types_aligns_with_bare_aggregate_select_list() {
             agg_item("SUM", Some("AMOUNT"), false),
             ExasolType::decimal(36, 2),
         )
-        .item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+        .count_star()
         .item(
             agg_item("MIN", Some("TS"), false),
             ExasolType::decimal(9, 4),
@@ -863,7 +863,7 @@ fn single_group_plan_types_defaults_when_reached_only_through_scalar_wrapper() {
 #[test]
 fn single_group_plan_types_prefers_top_level_declared_type_for_shared_slot() {
     let req = pushdown_request("T", NO_COLUMNS)
-        .item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+        .count_star()
         .item(
             round_expr(
                 float_div(
@@ -901,7 +901,7 @@ fn single_group_plan_types_resolves_both_ends_of_an_interleaved_list() {
             ),
             ExasolType::decimal(9, 4),
         )
-        .item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+        .count_star()
         .build_pushdown();
     let items = detect_aggregates(&req).expect("an interleaved list must decompose");
     assert_eq!(
@@ -994,7 +994,7 @@ fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
             ),
             ExasolType::decimal(9, 4),
         )
-        .item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+        .count_star()
         .build_pushdown();
     let items = detect_aggregates(&req).expect("an interleaved list must decompose");
     let plans = ordinary_plans(&items);
@@ -1079,17 +1079,4 @@ fn merge_select_emits_one_item_per_selectlist_item_for_duplicate_aggregates() {
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2))"#.to_string(),
         ])
     );
-}
-
-#[test]
-fn an_aggregate_whose_declared_type_the_scan_cannot_emit_declines() {
-    let elapsed = difference(col("SHIPPED"), col("ORDERED"));
-    for (declared, declines) in emittability_rows() {
-        let req = pushdown_request("T", NO_COLUMNS)
-            .item(agg_item_expr("MIN", elapsed.clone(), false), declared)
-            .item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
-            .build_pushdown();
-
-        assert_eq!(detect_aggregates(&req).is_none(), declines, "{declared}");
-    }
 }

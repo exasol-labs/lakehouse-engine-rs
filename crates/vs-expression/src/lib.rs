@@ -323,12 +323,8 @@ fn datafusion_cast_target(target: ExasolType) -> Result<String, UdfError> {
         // datafusion-sql rejects a length-qualified VARCHAR (`support_varchar_with_length` is
         // not enabled), and Arrow has no fixed-width CHAR type.
         ExasolType::Char { .. } | ExasolType::Varchar { .. } => "VARCHAR".to_string(),
-        ExasolType::Decimal(decimal) => {
-            format!("DECIMAL({},{})", decimal.precision(), decimal.scale())
-        }
+        ExasolType::Decimal(_) | ExasolType::Boolean | ExasolType::Date => target.to_string(),
         ExasolType::DoublePrecision => "DOUBLE".to_string(),
-        ExasolType::Boolean => "BOOLEAN".to_string(),
-        ExasolType::Date => "DATE".to_string(),
         // DataFusion parses only these four and reads a bare TIMESTAMP as nanoseconds, so the
         // rest decline rather than approximate.
         ExasolType::Timestamp {

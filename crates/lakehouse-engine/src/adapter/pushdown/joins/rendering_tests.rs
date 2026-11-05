@@ -135,12 +135,7 @@ fn join_projection_resolves_cast_node_to_expr_not_full_row_fallback() {
     request = selecting(
         request,
         &[(
-            serde_json::json!({
-                "type": "function_scalar_cast",
-                "name": "CAST",
-                "dataType": {"type": "varchar", "size": 2000000},
-                "arguments": [table_col("CUSTOMER", "C_NAME")]
-            }),
+            cast_to(ExasolType::WIDEST_VARCHAR, table_col("CUSTOMER", "C_NAME")),
             ExasolType::WIDEST_VARCHAR,
         )],
     );

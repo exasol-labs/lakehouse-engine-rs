@@ -1,5 +1,4 @@
 use super::*;
-use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Scenario: A VARCHAR-declared type is unaffected
 #[test]
@@ -214,6 +213,14 @@ fn exasol_type_from_json_refuses_an_incomplete_or_out_of_range_type() {
             None,
         ),
         (
+            json!({"type": "interval", "fromTo": "DAY TO SECONDS", "precision": 0, "fraction": 3}),
+            None,
+        ),
+        (
+            json!({"type": "interval", "fromTo": "DAY TO SECONDS", "precision": 10, "fraction": 3}),
+            None,
+        ),
+        (
             json!({"type": "hashtype", "bytesize": 1}),
             Some(ExasolType::Hashtype { bytes: 1 }),
         ),
@@ -246,32 +253,6 @@ fn exasol_type_from_json_refuses_an_incomplete_or_out_of_range_type() {
             ),
             (outcome, expected) => panic!("{data_type}: got {outcome:?}, expected {expected:?}"),
         }
-    }
-}
-
-/// Scenario: A pushdown request with a missing or invalid Exasol type fails the query
-#[test]
-fn exasol_type_from_json_reads_an_absent_character_set_as_utf8() {
-    let cases = [
-        (json!({"type": "char", "size": 20}), ExasolType::char(20)),
-        (
-            json!({"type": "char", "size": 20, "characterSet": "UTF8"}),
-            ExasolType::char(20),
-        ),
-        (
-            json!({"type": "varchar", "size": 4}),
-            ExasolType::varchar(4),
-        ),
-        (
-            json!({"type": "varchar", "size": 4, "characterSet": "ASCII"}),
-            ExasolType::Varchar {
-                size: 4,
-                ascii: true,
-            },
-        ),
-    ];
-    for (data_type, expected) in cases {
-        assert_eq!(valid(&data_type), expected, "{data_type}");
     }
 }
 
@@ -350,16 +331,8 @@ fn timestamp_without_precision_equals_timestamp_3() {
         ),
     ];
     for (absent, explicit) in pairs {
-        let (absent, explicit) = (valid(&absent), valid(&explicit));
-        assert_eq!(absent, explicit);
-        assert_eq!(hash_of(&absent), hash_of(&explicit), "{absent}");
+        assert_eq!(valid(&absent), valid(&explicit), "{absent}");
     }
-}
-
-fn hash_of(exasol_type: &ExasolType) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    exasol_type.hash(&mut hasher);
-    hasher.finish()
 }
 
 #[test]
@@ -431,9 +404,28 @@ fn only_the_types_a_scan_can_emit_are_udf_emittable() {
         (ExasolType::Date, true),
         (ExasolType::timestamp(6), true),
         (ExasolType::char(20), true),
+        (
+            ExasolType::Char {
+                size: 3,
+                ascii: true,
+            },
+            true,
+        ),
+        (ExasolType::varchar(10), true),
         (ExasolType::WIDEST_VARCHAR, true),
         (
+            ExasolType::Varchar {
+                size: 2_000_000,
+                ascii: true,
+            },
+            true,
+        ),
+        (
             ExasolType::TimestampWithLocalTimeZone { precision: 3 },
+            false,
+        ),
+        (
+            ExasolType::TimestampWithLocalTimeZone { precision: 6 },
             false,
         ),
         (ExasolType::IntervalYearToMonth { precision: 2 }, false),
@@ -484,7 +476,6 @@ fn every_variant() -> Vec<ExasolType> {
     variants
 }
 
-/// Scenario: A TIMESTAMP(p) column declaration serializes fractionalSecondsPrecision
 #[test]
 fn exasol_type_to_json_round_trips_every_variant() {
     for exasol_type in every_variant() {

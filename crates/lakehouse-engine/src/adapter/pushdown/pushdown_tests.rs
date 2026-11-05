@@ -878,7 +878,7 @@ fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
             guard_events()
                 .group_by(vec![region_col.clone()])
                 .column(region_col)
-                .item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+                .count_star()
                 .filter(declined.clone()),
         ),
         (
@@ -1101,7 +1101,7 @@ fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
             "isAscending": true,
             "nullsLast": true
         }]))
-        .field("limit", serde_json::json!({"numElements": 10}))
+        .limit(10)
         .item(num_lit(1), ExasolType::decimal(1, 0))
         .build()
         .0;
@@ -1233,7 +1233,7 @@ fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
             "isAscending": true,
             "nullsLast": true
         }]))
-        .field("limit", serde_json::json!({"numElements": 5}))
+        .limit(5)
         .column(col("NAME"))
         .build()
         .0;
@@ -1343,7 +1343,7 @@ fn declined_order_by_extension_runs_after_topn_detection() {
             "isAscending": true,
             "nullsLast": true
         }]))
-        .field("limit", serde_json::json!({"numElements": 5}))
+        .limit(5)
         .item(num_lit(1), ExasolType::decimal(1, 0))
         .build()
         .0;
@@ -1431,7 +1431,7 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
     for (facet, order_by) in declining_shapes {
         let request = guard_events()
             .order_by(order_by)
-            .field("limit", serde_json::json!({"numElements": 7}))
+            .limit(7)
             .column(col("NAME"))
             .build()
             .0;
@@ -1463,11 +1463,7 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
         }
     }
 
-    let unordered = guard_events()
-        .field("limit", serde_json::json!({"numElements": 7}))
-        .column(col("NAME"))
-        .build()
-        .0;
+    let unordered = guard_events().limit(7).column(col("NAME")).build().0;
     let sql = guard_dispatch_sql(
         &unordered,
         vec![ProjectionItem::from("NAME")],
@@ -2081,7 +2077,7 @@ fn char_grouped_request(key: Json, key_type: ExasolType, order_by: Option<Json>)
     } else {
         request.item(key, key_type)
     }
-    .item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0));
+    .count_star();
     if let Some(elements) = order_by {
         request = request.order_by(elements);
     }
@@ -2089,11 +2085,7 @@ fn char_grouped_request(key: Json, key_type: ExasolType, order_by: Option<Json>)
 }
 
 fn unprojected_char_grouped_request(key: Json) -> Json {
-    guard_events()
-        .group_by(vec![key])
-        .item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
-        .build()
-        .0
+    guard_events().group_by(vec![key]).count_star().build().0
 }
 
 /// JSON-encoded into the spec blob, then wrapped in a SQL string literal.

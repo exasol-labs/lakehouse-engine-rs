@@ -104,5 +104,4 @@ The adapter advertises the supported aggregate capabilities, translates an ungro
 * *THEN* the adapter SHALL cast each merged `SUM`, `COUNT`, `AVG`, and statistic, and each scalar expression over merged aggregates, to the type `selectListDataTypes` declares at that item's ordinal, because the merge can return a type other than the declared one
 * *AND* the adapter SHALL leave a merged `MIN` or `MAX` uncast when its partial column is emitted in the declared type, for example `MIN("PARTIAL_min_3")` for a `MIN` over a TIMESTAMP column, because `MIN` and `MAX` return the type of their argument
 * *AND* the adapter SHALL cast a group key whose emitted type differs from its declared type, and SHALL leave it uncast when the two types are equal, for example a key declared `VARCHAR(2000000)`
-* *AND* a cast to a declared `VARCHAR(2000000)` SHALL be rendered like a cast to any other type, for example `CAST(SUM("PARTIAL_sum_0") AS VARCHAR(2000000))`
 * *AND* the merged result SHALL equal the same select list evaluated over all rows on a single node, and the pushdown SQL SHALL pass Exasol's positional type check

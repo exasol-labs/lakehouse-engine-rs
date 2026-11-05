@@ -5,7 +5,7 @@ The adapter declares a pushed-down result column as Exasol `CHAR(n)` when Exasol
 ## Background
 
 * Exasol declares a string-literal expression `CHAR` when every branch has the same length, and `VARCHAR` otherwise. No Iceberg or Arrow source type maps to `CHAR`, so a `CHAR` type reaches the adapter only in `selectListDataTypes`, never as a base-column type.
-* Exasol's `CHAR` maximum length is 2,000 characters. `CAST('a' AS CHAR(2001))` fails with `specified length too long for char type - maximum is 2000`.
+* Exasol's `CHAR` maximum length is 2,000 characters (`CAST('a' AS CHAR(2001))` fails with `specified length too long for char type - maximum is 2000`), so a `CHAR` `dataType` above it fails the query (`pushdown/pushdown-planning`).
 * The adapter renders a `CHAR` type, in a scan `EMITS` clause or in a wrapper `CAST` target, as `CHAR(n)`, and appends ` ASCII` when the `dataType`'s `characterSet` equals `ASCII` case-insensitively. A `UTF8` or absent `characterSet` adds no suffix.
 * Three Exasol-parsed wrapper paths render their `CAST` targets in the Exasol dialect: the N-scan unaccelerated join wrapper, the qualified single-table aggregate fallback, and the grouped-merge scalar-over-aggregate wrapper. In these wrappers Exasol groups and evaluates DISTINCT natively over the padded `CHAR` value.
 * An aggregate over an expression argument can carry a `CHAR` declared type, and only SUM and the STDDEV/VARIANCE family require a numeric argument type. `pushdown-types/pushdown-planning-char-type-declaration-padding` covers `CHAR` projection and group-key values.

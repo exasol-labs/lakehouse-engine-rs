@@ -1,5 +1,5 @@
 use super::*;
-use crate::adapter::pushdown::test_support::{agg_item, col, pushdown_request};
+use crate::adapter::pushdown::test_support::{col, pushdown_request};
 use crate::types::exasol_type::ExasolType;
 
 fn has_disallowed_join_capability(cap_strs: &[&str]) -> bool {
@@ -46,7 +46,7 @@ fn reports_group_by_capabilities() {
     )
     .group_by(vec![col("REGION"), col("YEAR")])
     .column(col("REGION"))
-    .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+    .count_star()
     .column(col("YEAR"))
     .build_pushdown();
     let detection = crate::adapter::pushdown::detect_group_by_aggregates(&multi_key_group_by)

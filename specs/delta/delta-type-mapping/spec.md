@@ -68,7 +68,6 @@ The adapter maps each type a Delta table schema can declare onto an Arrow tag or
 * *AND* the container rule SHALL be RECURSIVE on every member type, an `array`'s element, a `struct`'s every field, and a `map`'s key AND value, and the recursion SHALL be based on whether each member is JSON-RENDERABLE, not on whether Arrow can cast it to text, so `array<struct<…>>`, `map<string, array<integer>>`, and `array<binary>` are mappable while `struct<v: variant>` is not
 * *AND* an `array`, `struct`, or `map` column SHALL be surfaced as STRICT JSON per `scan-types/nested-json-rendering`, so an `array` of integers returns a JSON array of bare numbers rather than `[1, 2]` display text
 * *AND* a `void` column SHALL read as all-NULL rather than as an error or an empty string, and a `void` field NESTED inside a container SHALL render as an explicit JSON `null`, because the protocol requires writers to omit it from every data file and readers to *"reconstruct them as all-`null` columns"*
-* *AND* a Delta `decimal(p,s)` SHALL map to `DECIMAL(p,s)` exactly when `1 ≤ p ≤ 36` and `0 ≤ s ≤ p`, the domain `scan-types/type-mapping` states for every decimal, and to the `VARCHAR` rendering otherwise
 * *AND* an out-of-domain `decimal` NESTED inside a container SHALL keep the container mappable, because the JSON renderer renders a decimal as a bare JSON number at any depth with no Exasol DECIMAL domain to satisfy
 
 ### Scenario: A Delta type whose Arrow form cannot be rendered faithfully is refused by name

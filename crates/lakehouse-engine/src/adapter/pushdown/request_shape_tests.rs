@@ -76,7 +76,7 @@ fn grouped_having_unmatched_aggregate_falls_through_to_wrapper() {
             }),
         )
         .column(col("REGION"))
-        .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+        .count_star()
         .build_pushdown();
     let shape = classify_request_shape(&req, &col_types());
     assert!(
@@ -108,7 +108,7 @@ fn grouped_having_mixed_junction_falls_through_to_wrapper() {
             }),
         )
         .column(col("REGION"))
-        .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+        .count_star()
         .build_pushdown();
     let shape = classify_request_shape(&req, &col_types());
     assert!(
@@ -166,7 +166,7 @@ fn grouped_having_distinct_aggregate_falls_through_to_wrapper() {
             }),
         )
         .column(col("REGION"))
-        .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+        .count_star()
         .build_pushdown();
     let shape = classify_request_shape(&req, &col_types());
     assert!(
@@ -213,7 +213,7 @@ fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper
             "nullsLast": true,
         }]))
         .column(col("REGION"))
-        .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+        .count_star()
         .build_pushdown();
     assert_eq!(
         detect_group_by_aggregates(&req)
@@ -316,7 +316,7 @@ fn single_group(select_list: Json, having: Option<Json>) -> PushdownRequest {
         .fold(pushdown_request("T", NO_COLUMNS), |request, item| {
             request.item(item, ExasolType::WIDEST_VARCHAR)
         })
-        .field("aggregationType", "single_group");
+        .single_group();
     let request = match having {
         Some(having) => request.field("having", having),
         None => request,

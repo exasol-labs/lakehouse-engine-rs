@@ -107,6 +107,7 @@ fn assert_emits_declares(conn: &mut ExaConn, query_sql: &str, expected: &str) ->
 }
 
 /// Scenario: A timestamp filter compares at full precision
+/// Scenario: A TIMESTAMP(p) column declaration serializes fractionalSecondsPrecision
 #[test]
 fn iceberg_microsecond_timestamps_round_trip_at_the_declared_precision() {
     setup();
@@ -346,10 +347,15 @@ fn cast_to_timestamp_with_local_time_zone_matches_native() {
 
     let projection_sql = query.replace("{}", &table);
     assert_pushed_to_scan_udf(&mut conn, &projection_sql, "the TSLTZ cast projection");
-    let emits = emits_clause(&isolated_pushdown_statement(&mut conn, &projection_sql));
+    let pushed = isolated_pushdown_statement(&mut conn, &projection_sql);
+    let emits = emits_clause(&pushed);
     assert!(
         !emits.contains("LOCAL TIME ZONE"),
         "the scan cannot emit a TIMESTAMP WITH LOCAL TIME ZONE column: {emits}"
+    );
+    assert!(
+        pushed.contains(&format!("AS {target})")),
+        "the wrapper must cast to {target}: {pushed}"
     );
 }
 

@@ -396,6 +396,16 @@ pub(crate) fn null_lit() -> Json {
     serde_json::json!({"type": "literal_null"})
 }
 
+/// Exasol's `CAST(arg AS target)` node.
+pub(crate) fn cast_to(target: ExasolType, arg: Json) -> Json {
+    serde_json::json!({
+        "type": "function_scalar_cast",
+        "name": "CAST",
+        "dataType": exasol_type_to_json(&target),
+        "arguments": [arg],
+    })
+}
+
 pub(crate) fn customer_orders_join() -> Json {
     inner_join(
         table_ref("CUSTOMER"),
@@ -1402,32 +1412,6 @@ pub(crate) fn selecting(mut request: Json, items: &[(Json, ExasolType)]) -> Json
 /// The columns of a table whose select list projects no bare column.
 pub(crate) const NO_COLUMNS: &[(&str, ExasolType)] = &[];
 
-/// One value of each type a scan UDF cannot declare in `EMITS`.
-pub(crate) const NON_EMITTABLE_TYPES: [ExasolType; 5] = [
-    ExasolType::TimestampWithLocalTimeZone { precision: 3 },
-    ExasolType::IntervalYearToMonth { precision: 2 },
-    ExasolType::IntervalDayToSecond {
-        precision: 2,
-        fraction: 3,
-    },
-    ExasolType::Geometry { srid: 0 },
-    ExasolType::Hashtype { bytes: 16 },
-];
-
-/// Each type of [`NON_EMITTABLE_TYPES`] beside `true`, then an emittable control type beside
-/// `false`: the rows of a case table on whether a declared type routes away from the scan.
-pub(crate) fn emittability_rows() -> impl Iterator<Item = (ExasolType, bool)> {
-    NON_EMITTABLE_TYPES
-        .map(|declared| (declared, true))
-        .into_iter()
-        .chain([(ExasolType::DoublePrecision, false)])
-}
-
-/// Exasol's `SUB` node, `left - right`, which yields an INTERVAL over two TIMESTAMPs.
-pub(crate) fn difference(left: Json, right: Json) -> Json {
-    serde_json::json!({"type": "function_scalar", "name": "SUB", "arguments": [left, right]})
-}
-
 /// A request over `table` and its `columns` with no select list yet, as for `SELECT *`.
 pub(crate) fn pushdown_request<N: AsRef<str>>(
     table: &str,
@@ -1471,6 +1455,11 @@ impl PushdownRequestBuilder {
         self.item_typed(node, exa_type)
     }
 
+    /// A `COUNT(*)` select-list item, typed `DECIMAL(18,0)` as Exasol declares it.
+    pub(crate) fn count_star(self) -> Self {
+        self.item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+    }
+
     /// An empty `selectList`, as Exasol sends for `SELECT RANDOM() FROM <table>`.
     pub(crate) fn empty_select_list(mut self) -> Self {
         self.select_list = Some(Vec::new());
@@ -1485,6 +1474,11 @@ impl PushdownRequestBuilder {
     pub(crate) fn group_by(self, keys: Vec<Json>) -> Self {
         self.field("aggregationType", "group_by")
             .field("groupBy", keys)
+    }
+
+    /// `aggregationType` `single_group`, as Exasol sends for an aggregate with no GROUP BY.
+    pub(crate) fn single_group(self) -> Self {
+        self.field("aggregationType", "single_group")
     }
 
     pub(crate) fn order_by(self, elements: Json) -> Self {
@@ -1558,9 +1552,7 @@ impl PushdownRequestBuilder {
 
     /// [`build`](Self::build)'s `pushdownRequest`, parsed as `handle_pushdown` parses it.
     pub(crate) fn build_pushdown(self) -> PushdownRequest {
-        let (request, _) = self.build();
-        PushdownRequest::parse(pd(&request))
-            .unwrap_or_else(|err| panic!("the builder declares a valid selectListDataTypes: {err}"))
+        parsed_pushdown(&self.build().0)
     }
 
     fn item_typed(mut self, node: Json, exa_type: ExasolType) -> Self {

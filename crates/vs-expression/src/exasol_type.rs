@@ -8,7 +8,7 @@ use std::fmt;
 pub const MAX_VARCHAR_SIZE: u32 = 2_000_000;
 
 /// Exasol rejects `CHAR(2001)` and wider.
-pub const MAX_CHAR_SIZE: u32 = 2000;
+const MAX_CHAR_SIZE: u32 = 2000;
 
 /// Exasol rejects `DECIMAL(37,0)` and wider.
 pub const MAX_DECIMAL_PRECISION: u8 = 36;

@@ -749,14 +749,14 @@ fn aggregate_merge_renders_request_limit_zero_through_plan_composition() {
         ],
     )
     .field("type", serde_json::json!("select"))
-    .field("aggregationType", serde_json::json!("single_group"))
+    .single_group()
     .order_by(serde_json::json!([{
         "type": "order_by_element",
         "expression": agg_item("COUNT", None, false),
         "isAscending": false,
         "nullsLast": true
     }]))
-    .field("limit", serde_json::json!({"numElements": 0}))
+    .limit(0)
     .item(agg_item("COUNT", None, false), ExasolType::decimal(20, 0))
     .build();
     let files = vec![

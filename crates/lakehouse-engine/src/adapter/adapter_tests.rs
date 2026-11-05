@@ -7,7 +7,9 @@ use crate::adapter::properties::{
 use crate::adapter::pushdown::test_support::{
     NO_COLUMNS, customer_orders_join, pushdown_request, table_col,
 };
-use crate::adapter::pushdown::test_support::{named_table, with_identifier_notes, with_notes};
+use crate::adapter::pushdown::test_support::{
+    named_table, with_delta_notes, with_iceberg_notes, with_identifier_notes,
+};
 use crate::types::exasol_type::ExasolType;
 use exasol_udf_sdk::test_support::{DefaultsCtx, TestContext};
 use lakehouse_catalog::{CatalogTableIdent, SkipReason, TableFormat};
@@ -379,14 +381,7 @@ fn unity_kind_pushdown_routes_to_the_unity_catalog_loader() {
             serde_json::json!({"CATALOG_KIND": "UNITY_CATALOG", "CATALOG_CONNECTION": "MY_CONN"}),
         )
         .build();
-    let req = with_notes(
-        req,
-        "ORDERS",
-        &[(
-            "ID".to_string(),
-            r#"{"sourceType":{"name":"id","arrow_type":"int64","nullable":true}}"#.to_string(),
-        )],
-    );
+    let req = with_delta_notes(req, "ORDERS", &[("id", "long")], &[]);
     let req = with_identifier_notes(req, &[("ORDERS", "cat.sch.orders")]);
 
     let err = dispatch(
@@ -1456,26 +1451,8 @@ fn role_join_pushdown_request(virtual_schema: &str) -> Json {
             serde_json::json!({ "CATALOG_CONNECTION": "MY_CONN", "ALLOW_HTTP": "true" }),
         )
         .build();
-    let request = with_notes(
-        request,
-        "CUSTOMER",
-        &[(
-            "C_CUSTKEY".to_string(),
-            r#"{"sourceType":{"field_id":1,"name":"c_custkey","arrow_type":"int64","nullable":true}}"#
-                .to_string(),
-        )],
-    );
-    let request = with_notes(
-        request,
-        "ORDERS",
-        &[(
-            "O_CUSTKEY".to_string(),
-            r#"{"sourceType":{"field_id":1,"name":"o_custkey","arrow_type":"int64","nullable":true}}"#
-                .to_string(),
-        )],
-    );
     with_identifier_notes(
-        request,
+        with_iceberg_notes(request),
         &[("CUSTOMER", "db.customer"), ("ORDERS", "db.orders")],
     )
 }

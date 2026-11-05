@@ -14,6 +14,34 @@ use crate::scan::spec::{ColumnRef, SortKey, StorageBackend, StorageProps};
 use crate::types::exasol_type::ExasolType;
 use vs_expression::{render_expression_exasol_safe, render_expression_safe};
 
+/// The N-scan wrapper over the two-table `request`, its CUSTOMER and ORDERS sides one file each.
+fn n_scan_sql(request: &Json) -> Result<String, UdfError> {
+    let sides = vec![
+        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+    ];
+    build_n_scan_join_sql(
+        &parsed_pushdown(request),
+        &detected_join(request),
+        &request_typed(request, &sides),
+        &two_scan_tuning(),
+        "SCAN",
+        "DISTRIBUTE",
+    )
+}
+
+/// Asserts `err` refuses the `no_such_node_type_in_either_dialect` predicate by name.
+fn assert_refuses_the_unrenderable_predicate(err: &UdfError) {
+    assert!(
+        matches!(err, UdfError::User(msg) if msg.contains("neither dialect")),
+        "the refusal must name the both-dialects decline: {err}"
+    );
+    assert!(
+        matches!(err, UdfError::User(msg) if msg.contains("no_such_node_type_in_either_dialect")),
+        "the refusal must name the offending predicate tree: {err}"
+    );
+}
+
 /// Q1 shape: `(SUPPLIER ⋈ NATION) ⋈ REGION`.
 fn q1_join_request() -> Json {
     with_identifier_notes(
@@ -333,20 +361,7 @@ fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
         "left": table_col("ORDERS", "O_ORDERDATE"),
         "right": str_lit("1995-01-01")
     });
-    let detected = detected_join(&request);
-    let sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
-    let sql = build_n_scan_join_sql(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_typed(&request, &sides),
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("the two-table unified fallback must build");
+    let sql = n_scan_sql(&request).expect("the two-table unified fallback must build");
 
     for alias in ["LHS_T0", "LHS_T1"] {
         assert!(
@@ -381,21 +396,8 @@ fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
 fn trivially_true_residual_emits_no_outer_where_and_does_not_error() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = bool_lit(true);
-    let detected = detected_join(&request);
-    let sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
-
-    let sql = build_n_scan_join_sql(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_typed(&request, &sides),
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("a trivially-true residual is a correct no-op, never a hard error");
+    let sql = n_scan_sql(&request)
+        .expect("a trivially-true residual is a correct no-op, never a hard error");
 
     assert!(
         !sql.contains(" WHERE "),
@@ -938,20 +940,7 @@ fn conditions_attach_by_leg_set_and_leg_local_filters_partition_exactly() {
 #[test]
 fn above_threshold_join_falls_back_inner_join_on() {
     let request = join_request(Json::Null, equi_condition());
-    let detected = detected_join(&request);
-    let sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
-    let sql = build_n_scan_join_sql(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_typed(&request, &sides),
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("the above-threshold two-table fallback must build");
+    let sql = n_scan_sql(&request).expect("the above-threshold two-table fallback must build");
 
     assert!(
         sql.contains("INNER JOIN"),
@@ -1096,20 +1085,7 @@ fn join_conditions_greedy_attach_and_side_local_pushdown() {
 }
 
 fn n_scan_legs_and_outer_where(request: &Json) -> (String, String) {
-    let detected = detected_join(request);
-    let sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
-    let sql = build_n_scan_join_sql(
-        &parsed_pushdown(request),
-        &detected,
-        &request_typed(request, &sides),
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("the two-table unified fallback must build");
+    let sql = n_scan_sql(request).expect("the two-table unified fallback must build");
     match sql.find(" WHERE ") {
         Some(at) => (sql[..at].to_string(), sql[at..].to_string()),
         None => (sql, String::new()),
@@ -1388,20 +1364,7 @@ fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
         JoinWindowPlan::ExasolPostProcessed
     ));
 
-    let detected = detected_join(&request);
-    let sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
-    let sql = build_n_scan_join_sql(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_typed(&request, &sides),
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("aggregate-over-join must build the unified wrapper");
+    let sql = n_scan_sql(&request).expect("aggregate-over-join must build the unified wrapper");
 
     assert!(sql.contains("COUNT(*)"), "COUNT(*) must be rendered: {sql}");
     assert!(
@@ -1515,11 +1478,13 @@ fn qualified_count_distinct_cast_char_renders_exasol_char_target() {
     let legs = seam_legs();
     let item = serde_json::json!({
         "type": "function_aggregate", "name": "COUNT", "distinct": true,
-        "arguments": [{
-            "type": "function_scalar_cast", "name": "CAST",
-            "arguments": [table_col("CUSTOMER", "C_VARCHAR")],
-            "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}
-        }]
+        "arguments": [cast_to(
+            ExasolType::Char {
+                size: 20,
+                ascii: true,
+            },
+            table_col("CUSTOMER", "C_VARCHAR"),
+        )]
     });
     let sql = render_expression_qualified(&item, &legs)
         .expect("every reference names exactly one leg")
@@ -1550,9 +1515,13 @@ fn n_scan_join_select_list_renders_exasol_char_target() {
         request,
         &[
             (
-                serde_json::json!({"type": "function_scalar_cast", "name": "CAST",
-         "arguments": [table_col("CUSTOMER", "C_NAME")],
-         "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}}),
+                cast_to(
+                    ExasolType::Char {
+                        size: 20,
+                        ascii: true,
+                    },
+                    table_col("CUSTOMER", "C_NAME"),
+                ),
                 ExasolType::Char {
                     size: 20,
                     ascii: true,
@@ -1568,20 +1537,8 @@ fn n_scan_join_select_list_renders_exasol_char_target() {
         JoinWindowPlan::ExasolPostProcessed
     ));
 
-    let detected = detected_join(&request);
-    let sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
-    let sql = build_n_scan_join_sql(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_typed(&request, &sides),
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("a CAST-to-CHAR select item must build the unified wrapper");
+    let sql =
+        n_scan_sql(&request).expect("a CAST-to-CHAR select item must build the unified wrapper");
 
     assert!(
         sql.contains(r#"CAST("LHS_T0"."C_NAME" AS CHAR(20) ASCII)"#),
@@ -1610,20 +1567,7 @@ fn order_by_over_join_renders_qualified_in_unified_wrapper() {
         JoinWindowPlan::Ordered { .. }
     ));
 
-    let detected = detected_join(&request);
-    let sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
-    let sql = build_n_scan_join_sql(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_typed(&request, &sides),
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("ordered unified wrapper must build");
+    let sql = n_scan_sql(&request).expect("ordered unified wrapper must build");
     assert!(
         sql.contains(r#"ORDER BY "LHS_T1"."O_ORDERDATE" ASC NULLS FIRST"#),
         "ORDER BY must be table-qualified with explicit direction/nulls: {sql}"
@@ -1644,20 +1588,8 @@ fn order_by_expression_renders_qualified_in_unified_wrapper() {
         JoinWindowPlan::ExasolPostProcessed
     ));
 
-    let detected = detected_join(&request);
-    let sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
-    let sql = build_n_scan_join_sql(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_typed(&request, &sides),
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("ordered unified wrapper must build for a renderable expression sort key");
+    let sql = n_scan_sql(&request)
+        .expect("ordered unified wrapper must build for a renderable expression sort key");
     assert!(
         sql.contains(r#"ORDER BY UPPER("LHS_T1"."O_ORDERDATE") DESC NULLS LAST"#),
         "the expression ORDER BY key must be table-qualified with explicit \
@@ -2190,19 +2122,7 @@ fn fallback_leg_fan_out_spec_never_carries_a_limit_or_sort() {
         "isAscending": true,
         "nullsLast": false,
     }]);
-    let sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
-    let sql = build_n_scan_join_sql(
-        &parsed_pushdown(&request),
-        &detected_join(&request),
-        &request_typed(&request, &sides),
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("the two-table unified fallback must build");
+    let sql = n_scan_sql(&request).expect("the two-table unified fallback must build");
 
     let legs: Vec<Json> = sql
         .split('\'')
@@ -2244,20 +2164,7 @@ fn golden_n_scan_join_sql_unchanged() {
              "right": table_col("ORDERS", "O_CUSTKEY")},
         ],
     });
-    let detected = detected_join(&request);
-    let sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
-    let actual = build_n_scan_join_sql(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_typed(&request, &sides),
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("the two-table unified fallback must build");
+    let actual = n_scan_sql(&request).expect("the two-table unified fallback must build");
     assert_eq!(
         actual,
         r#"SELECT "LHS_T0"."C_NAME", "LHS_T1"."O_ORDERDATE" FROM (SELECT SCAN('{"table_root":"s3://warehouse/lh/customer","projection":["C_CUSTKEY","C_NAME"],"filter":"(\"C_NAME\" = ''ACME'')","logical_schema":[{"field_id":1,"name":"CUSTOMER_KEY","arrow_type":"int64","nullable":false}],"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" INNER JOIN (SELECT SCAN('{"table_root":"s3://warehouse/lh/orders","projection":["O_CUSTKEY","O_ORDERDATE"],"filter":"(\"O_ORDERDATE\" > ''1995-01-01'')","logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/o-0.parquet",100]]') EMITS ("O_CUSTKEY" DECIMAL(20,0), "O_ORDERDATE" DATE)) AS "LHS_T1" ON (("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")) WHERE (("LHS_T0"."C_CUSTKEY" > "LHS_T1"."O_CUSTKEY"))"#
@@ -2275,7 +2182,7 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
     let pushdown_req = pushdown_request("CUSTOMER", &[("C_NAME", ExasolType::WIDEST_VARCHAR)])
         .group_by(vec![table_col("CUSTOMER", "C_NAME")])
         .column(table_col("CUSTOMER", "C_NAME"))
-        .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+        .count_star()
         .build_pushdown();
     let fan_out_spec = CommonScanSpec {
         storage: ScanStorage::Inline(sample_storage()),
@@ -2322,20 +2229,9 @@ fn golden_n_scan_render_decline_messages_unchanged() {
 
     let mut no_columns_request = join_request(Json::Null, equi_condition());
     no_columns_request["involvedTables"][1]["columns"] = serde_json::json!([]);
-    let no_columns_sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
     let msg = user_message(
-        build_n_scan_join_sql(
-            &parsed_pushdown(&no_columns_request),
-            &detected_join(&no_columns_request),
-            &request_typed(&no_columns_request, &no_columns_sides),
-            &two_scan_tuning(),
-            "SCAN",
-            "DISTRIBUTE",
-        )
-        .expect_err("an involved table with no column metadata must decline"),
+        n_scan_sql(&no_columns_request)
+            .expect_err("an involved table with no column metadata must decline"),
     );
     assert_eq!(
         msg,
@@ -2345,20 +2241,9 @@ fn golden_n_scan_render_decline_messages_unchanged() {
     );
 
     let bad_condition_request = join_request(Json::Null, unrenderable());
-    let bad_condition_sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
     let msg = user_message(
-        build_n_scan_join_sql(
-            &parsed_pushdown(&bad_condition_request),
-            &detected_join(&bad_condition_request),
-            &request_typed(&bad_condition_request, &bad_condition_sides),
-            &two_scan_tuning(),
-            "SCAN",
-            "DISTRIBUTE",
-        )
-        .expect_err("an unrenderable join condition must decline"),
+        n_scan_sql(&bad_condition_request)
+            .expect_err("an unrenderable join condition must decline"),
     );
     assert_eq!(
         msg,
@@ -2690,19 +2575,8 @@ fn n_scan_join_untranslatable_select_item_is_hard_error() {
          N-scan fallback"
     );
 
-    let sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
-    let err = build_n_scan_join_sql(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_typed(&request, &sides),
-        &two_scan_tuning(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-    )
-    .expect_err("an untranslatable select-list item must be a hard error");
+    let err =
+        n_scan_sql(&request).expect_err("an untranslatable select-list item must be a hard error");
     assert!(
         matches!(&err, UdfError::User(msg) if msg.contains("select-list item could not be rendered")),
         "the refusal must come from the select-list render site: {err}"
@@ -2860,7 +2734,7 @@ fn single_table_wrapper_renders_declined_predicate_in_exasol_dialect() {
             "isAscending": true,
             "nullsLast": true,
         }]))
-        .field("limit", serde_json::json!({"numElements": 5}))
+        .limit(5)
         .column(table_col("T", "ID"))
         .build_pushdown();
 
@@ -2948,14 +2822,7 @@ fn single_table_wrapper_errors_when_declined_predicate_renders_in_neither_dialec
     let err = declined_filter_wrapper_sql(&pushdown_req, Some(&unrenderable))
         .expect_err("a predicate applicable nowhere must fail the query");
 
-    assert!(
-        matches!(&err, UdfError::User(msg) if msg.contains("neither dialect")),
-        "the refusal must name the both-dialects decline: {err}"
-    );
-    assert!(
-        matches!(&err, UdfError::User(msg) if msg.contains("no_such_node_type_in_either_dialect")),
-        "the refusal must name the offending predicate tree: {err}"
-    );
+    assert_refuses_the_unrenderable_predicate(&err);
 }
 
 #[test]
@@ -2974,7 +2841,7 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
             "isAscending": false,
             "nullsLast": true
         }]))
-        .field("limit", serde_json::json!({"numElements": 4}))
+        .limit(4)
         .column(table_col("T", "ID"))
         .build_pushdown();
 
@@ -3124,7 +2991,7 @@ fn qualified_wrapper_never_renders_offset_without_order_by() {
     cases.push((
         "control: limit, no orderBy, no offset",
         pushdown_request("EVENTS", &[("ID", ExasolType::WIDEST_VARCHAR)])
-            .field("limit", serde_json::json!({"numElements": 5}))
+            .limit(5)
             .column(table_col("EVENTS", "ID"))
             .build_pushdown(),
         single_scan_legs("EVENTS"),
@@ -3506,78 +3373,7 @@ fn join_block_names_the_dimension_legs_alias() {
 fn n_scan_wrapper_errors_when_declined_predicate_renders_in_neither_dialect() {
     let unrenderable = serde_json::json!({"type": "no_such_node_type_in_either_dialect"});
     let request = n_scan_request_with_filter(unrenderable);
-    let detected = detected_join(&request);
-    let sides = vec![
-        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-    ];
+    let err = n_scan_sql(&request).expect_err("a predicate applicable nowhere must fail the query");
 
-    let err = build_n_scan_join_sql(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_typed(&request, &sides),
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect_err("a predicate applicable nowhere must fail the query");
-
-    assert!(
-        matches!(&err, UdfError::User(msg) if msg.contains("neither dialect")),
-        "the refusal must name the both-dialects decline: {err}"
-    );
-    assert!(
-        matches!(&err, UdfError::User(msg) if msg.contains("no_such_node_type_in_either_dialect")),
-        "the refusal must name the offending predicate tree: {err}"
-    );
-}
-
-#[test]
-fn wrapper_casts_a_null_literal_to_its_declared_type() {
-    for declared in [
-        ExasolType::Geometry { srid: 0 },
-        ExasolType::WIDEST_VARCHAR,
-        ExasolType::decimal(18, 2),
-    ] {
-        let cast_null = format!("CAST(NULL AS {declared})");
-        let pushdown_req = pushdown_request("T", &[("ID", ExasolType::decimal(20, 0))])
-            .column(table_col("T", "ID"))
-            .item(null_lit(), declared)
-            .build_pushdown();
-
-        let single_table = declined_filter_wrapper_sql(&pushdown_req, None)
-            .expect("the single-table wrapper must build");
-
-        assert!(
-            single_table.starts_with(&format!(r#"SELECT "LHS_T0"."ID", {cast_null} FROM "#)),
-            "the single-table wrapper must cast the NULL item: {single_table}"
-        );
-
-        let request = selecting(
-            join_request(Json::Null, equi_condition()),
-            &[
-                (table_col("CUSTOMER", "C_NAME"), ExasolType::varchar(100)),
-                (null_lit(), declared),
-            ],
-        );
-        let detected = detected_join(&request);
-        let sides = vec![
-            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-        ];
-        let n_scan = build_n_scan_join_sql(
-            &parsed_pushdown(&request),
-            &detected,
-            &request_typed(&request, &sides),
-            &two_scan_tuning(),
-            "SCAN",
-            "DISTRIBUTE",
-        )
-        .expect("the N-scan wrapper must build");
-
-        assert!(
-            n_scan.starts_with(&format!(r#"SELECT "LHS_T0"."C_NAME", {cast_null} FROM "#)),
-            "the N-scan wrapper must cast the NULL item: {n_scan}"
-        );
-    }
+    assert_refuses_the_unrenderable_predicate(&err);
 }

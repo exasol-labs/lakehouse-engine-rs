@@ -569,7 +569,7 @@ fn render_limit_offset_covers_absent_zero_and_nonzero_offset() {
 
 #[test]
 fn project_columns_fallback_is_duplicate_free() {
-    let (request, _) = pushdown_request(
+    let (names, types, _widened) = projected(pushdown_request(
         "EVENTS",
         &[
             ("id", ExasolType::decimal(20, 0)),
@@ -585,11 +585,7 @@ fn project_columns_fallback_is_duplicate_free() {
     .item(
         serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false}),
         ExasolType::decimal(20, 0),
-    )
-    .build();
-    let pushdown_req = pd(&request);
-
-    let (names, types, _widened) = project_first_table(&request, &pushdown_req).unwrap();
+    ));
 
     let unique: std::collections::HashSet<_> = names.iter().map(|p| p.emit_name()).collect();
     assert_eq!(
@@ -1585,6 +1581,23 @@ fn single_shard_collapses_to_single_invocation() {
     );
 }
 
+/// A request over `T(ID DECIMAL(10,0), NAME VARCHAR(100))` with no select list yet.
+fn id_name_request() -> PushdownRequestBuilder {
+    pushdown_request(
+        "T",
+        &[
+            ("ID", ExasolType::decimal(10, 0)),
+            ("NAME", ExasolType::varchar(100)),
+        ],
+    )
+}
+
+/// [`project_first_table`] over the built `request`.
+fn projected(request: PushdownRequestBuilder) -> (Vec<ProjectionItem>, Vec<ExasolType>, bool) {
+    let (request, _) = request.build();
+    project_first_table(&request, &pd(&request)).unwrap()
+}
+
 #[test]
 fn selectlist_scalar_expression_rendered_in_emits() {
     let upper_expr = serde_json::json!({
@@ -1592,17 +1605,8 @@ fn selectlist_scalar_expression_rendered_in_emits() {
         "name": "UPPER",
         "arguments": [col("NAME")]
     });
-    let (request, _) = pushdown_request(
-        "T",
-        &[
-            ("ID", ExasolType::decimal(10, 0)),
-            ("NAME", ExasolType::varchar(100)),
-        ],
-    )
-    .item(upper_expr, ExasolType::WIDEST_VARCHAR)
-    .build();
-    let pushdown_req = request["pushdownRequest"].clone();
-    let (proj_cols, proj_types, _widened) = project_first_table(&request, &pushdown_req).unwrap();
+    let (proj_cols, proj_types, _widened) =
+        projected(id_name_request().item(upper_expr, ExasolType::WIDEST_VARCHAR));
     // An `Expr`, not a `Column`, so the scan splices it instead of quoting a phantom identifier.
     assert_eq!(proj_cols.len(), 1);
     assert!(
@@ -1619,23 +1623,9 @@ fn selectlist_scalar_expression_rendered_in_emits() {
 
 #[test]
 fn selectlist_cast_node_rendered_in_emits() {
-    let cast_expr = serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "arguments": [col("ID")],
-        "dataType": {"type": "VARCHAR", "size": 100}
-    });
-    let (request, _) = pushdown_request(
-        "T",
-        &[
-            ("ID", ExasolType::decimal(10, 0)),
-            ("NAME", ExasolType::varchar(100)),
-        ],
-    )
-    .item(cast_expr, ExasolType::WIDEST_VARCHAR)
-    .build();
-    let pushdown_req = request["pushdownRequest"].clone();
-    let (proj_cols, _proj_types, _widened) = project_first_table(&request, &pushdown_req).unwrap();
+    let cast_expr = cast_to(ExasolType::varchar(100), col("ID"));
+    let (proj_cols, _proj_types, _widened) =
+        projected(id_name_request().item(cast_expr, ExasolType::WIDEST_VARCHAR));
     assert_eq!(
         proj_cols.len(),
         1,
@@ -1661,17 +1651,16 @@ fn selectlist_extract_node_rendered_in_emits() {
         "toExtract": "YEAR",
         "arguments": [col("EVENT_DATE")]
     });
-    let (request, _) = pushdown_request(
-        "T",
-        &[
-            ("ID", ExasolType::decimal(10, 0)),
-            ("EVENT_DATE", ExasolType::Date),
-        ],
-    )
-    .item(extract_expr, ExasolType::WIDEST_VARCHAR)
-    .build();
-    let pushdown_req = request["pushdownRequest"].clone();
-    let (proj_cols, _proj_types, _widened) = project_first_table(&request, &pushdown_req).unwrap();
+    let (proj_cols, _proj_types, _widened) = projected(
+        pushdown_request(
+            "T",
+            &[
+                ("ID", ExasolType::decimal(10, 0)),
+                ("EVENT_DATE", ExasolType::Date),
+            ],
+        )
+        .item(extract_expr, ExasolType::WIDEST_VARCHAR),
+    );
     assert_eq!(
         proj_cols.len(),
         1,
@@ -1704,17 +1693,16 @@ fn selectlist_case_node_rendered_in_emits() {
             str_lit("high")
         ]
     });
-    let (request, _) = pushdown_request(
-        "T",
-        &[
-            ("ID", ExasolType::decimal(10, 0)),
-            ("SCORE", ExasolType::decimal(10, 0)),
-        ],
-    )
-    .item(case_expr, ExasolType::WIDEST_VARCHAR)
-    .build();
-    let pushdown_req = request["pushdownRequest"].clone();
-    let (proj_cols, _proj_types, _widened) = project_first_table(&request, &pushdown_req).unwrap();
+    let (proj_cols, _proj_types, _widened) = projected(
+        pushdown_request(
+            "T",
+            &[
+                ("ID", ExasolType::decimal(10, 0)),
+                ("SCORE", ExasolType::decimal(10, 0)),
+            ],
+        )
+        .item(case_expr, ExasolType::WIDEST_VARCHAR),
+    );
     assert_eq!(
         proj_cols.len(),
         1,
@@ -1734,23 +1722,12 @@ fn selectlist_case_node_rendered_in_emits() {
 
 #[test]
 fn selectlist_untranslatable_cast_falls_back_to_full_row() {
-    let cast_expr = serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "arguments": [col("ID")],
-        "dataType": {"type": "TIMESTAMP", "withLocalTimeZone": true}
-    });
-    let (request, _) = pushdown_request(
-        "T",
-        &[
-            ("ID", ExasolType::decimal(10, 0)),
-            ("NAME", ExasolType::varchar(100)),
-        ],
-    )
-    .item(cast_expr, ExasolType::WIDEST_VARCHAR)
-    .build();
-    let pushdown_req = request["pushdownRequest"].clone();
-    let (proj_cols, proj_types, _widened) = project_first_table(&request, &pushdown_req).unwrap();
+    let cast_expr = cast_to(
+        ExasolType::TimestampWithLocalTimeZone { precision: 3 },
+        col("ID"),
+    );
+    let (proj_cols, proj_types, _widened) =
+        projected(id_name_request().item(cast_expr, ExasolType::WIDEST_VARCHAR));
     assert_eq!(
         proj_cols,
         vec![
@@ -1768,11 +1745,10 @@ fn selectlist_untranslatable_cast_falls_back_to_full_row() {
 #[test]
 fn selectlist_literal_rendered_as_positional_expr() {
     let literal = num_lit(1);
-    let (request, _) = pushdown_request("T", &[("ID", ExasolType::decimal(10, 0))])
-        .item(literal, ExasolType::decimal(18, 0))
-        .build();
-    let pushdown_req = request["pushdownRequest"].clone();
-    let (proj_cols, proj_types, _widened) = project_first_table(&request, &pushdown_req).unwrap();
+    let (proj_cols, proj_types, _widened) = projected(
+        pushdown_request("T", &[("ID", ExasolType::decimal(10, 0))])
+            .item(literal, ExasolType::decimal(18, 0)),
+    );
     assert_eq!(
         proj_cols.len(),
         1,
@@ -1790,19 +1766,12 @@ fn selectlist_literal_rendered_as_positional_expr() {
 fn selectlist_duplicate_literals_keep_distinct_positions() {
     let literal = num_lit(1);
     let column = col("NAME");
-    let (request, _) = pushdown_request(
-        "T",
-        &[
-            ("ID", ExasolType::decimal(10, 0)),
-            ("NAME", ExasolType::varchar(100)),
-        ],
-    )
-    .item(literal.clone(), ExasolType::decimal(18, 0))
-    .column(column)
-    .item(literal, ExasolType::decimal(18, 0))
-    .build();
-    let pushdown_req = request["pushdownRequest"].clone();
-    let (proj_cols, _proj_types, _widened) = project_first_table(&request, &pushdown_req).unwrap();
+    let (proj_cols, _proj_types, _widened) = projected(
+        id_name_request()
+            .item(literal.clone(), ExasolType::decimal(18, 0))
+            .column(column)
+            .item(literal, ExasolType::decimal(18, 0)),
+    );
 
     assert_eq!(
         proj_cols.len(),
@@ -1836,17 +1805,8 @@ fn selectlist_duplicate_literals_keep_distinct_positions() {
 #[test]
 fn selectlist_bare_literal_does_not_fall_back_to_full_row() {
     let literal = str_lit("x");
-    let (request, _) = pushdown_request(
-        "T",
-        &[
-            ("ID", ExasolType::decimal(10, 0)),
-            ("NAME", ExasolType::varchar(100)),
-        ],
-    )
-    .item(literal, ExasolType::varchar(100))
-    .build();
-    let pushdown_req = request["pushdownRequest"].clone();
-    let (proj_cols, _proj_types, _widened) = project_first_table(&request, &pushdown_req).unwrap();
+    let (proj_cols, _proj_types, _widened) =
+        projected(id_name_request().item(literal, ExasolType::varchar(100)));
     assert_eq!(
         proj_cols.len(),
         1,
@@ -1861,20 +1821,10 @@ fn selectlist_tstz_literal_widens_via_emits_type_gate() {
         render_expression_safe(&literal).is_some(),
         "literal_timestamp_utc must render via render_expression_safe"
     );
-    let (request, _) = pushdown_request(
-        "T",
-        &[
-            ("ID", ExasolType::decimal(10, 0)),
-            ("NAME", ExasolType::varchar(100)),
-        ],
-    )
-    .item(
+    let (proj_cols, proj_types, widened) = projected(id_name_request().item(
         literal,
         ExasolType::TimestampWithLocalTimeZone { precision: 3 },
-    )
-    .build();
-    let pushdown_req = request["pushdownRequest"].clone();
-    let (proj_cols, proj_types, widened) = project_first_table(&request, &pushdown_req).unwrap();
+    ));
     assert!(
         widened,
         "a TIMESTAMP WITH LOCAL TIME ZONE literal must widen the projection \
@@ -1903,20 +1853,10 @@ fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
          a render here would silently start pushing TSTZ predicates into the \
          scan filter"
     );
-    let (request, _) = pushdown_request(
-        "T",
-        &[
-            ("ID", ExasolType::decimal(10, 0)),
-            ("NAME", ExasolType::varchar(100)),
-        ],
-    )
-    .item(
+    let (proj_cols, proj_types, widened) = projected(id_name_request().item(
         literal,
         ExasolType::TimestampWithLocalTimeZone { precision: 3 },
-    )
-    .build();
-    let pushdown_req = request["pushdownRequest"].clone();
-    let (proj_cols, proj_types, widened) = project_first_table(&request, &pushdown_req).unwrap();
+    ));
     assert!(
         widened,
         "the real-wire-name TSTZ literal must widen the projection so the \
@@ -1938,11 +1878,10 @@ fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
 #[test]
 fn selectlist_plain_timestamp_literal_rendered_as_expr() {
     let literal = lit("literal_timestamp", "2024-03-01 10:00:00");
-    let (request, _) = pushdown_request("T", &[("ID", ExasolType::decimal(10, 0))])
-        .item(literal, ExasolType::BARE_TIMESTAMP)
-        .build();
-    let pushdown_req = request["pushdownRequest"].clone();
-    let (proj_cols, proj_types, _widened) = project_first_table(&request, &pushdown_req).unwrap();
+    let (proj_cols, proj_types, _widened) = projected(
+        pushdown_request("T", &[("ID", ExasolType::decimal(10, 0))])
+            .item(literal, ExasolType::BARE_TIMESTAMP),
+    );
     assert_eq!(
         proj_cols.len(),
         1,
@@ -1957,24 +1896,18 @@ fn selectlist_plain_timestamp_literal_rendered_as_expr() {
 
 #[test]
 fn project_columns_emits_char_type_for_cast_to_char_item() {
-    let cast_item = serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": {"type": "CHAR", "size": 20, "characterSet": "UTF8"},
-        "arguments": [col("c_varchar")]
-    });
-    let (request, _) = pushdown_request(
-        "T",
-        &[
-            ("id", ExasolType::decimal(20, 0)),
-            ("c_varchar", ExasolType::WIDEST_VARCHAR),
-        ],
-    )
-    .column(col("id"))
-    .item(cast_item, ExasolType::char(20))
-    .build();
-    let pushdown_req = request["pushdownRequest"].clone();
-    let (proj_cols, proj_types, widened) = project_first_table(&request, &pushdown_req).unwrap();
+    let cast_item = cast_to(ExasolType::char(20), col("c_varchar"));
+    let (proj_cols, proj_types, widened) = projected(
+        pushdown_request(
+            "T",
+            &[
+                ("id", ExasolType::decimal(20, 0)),
+                ("c_varchar", ExasolType::WIDEST_VARCHAR),
+            ],
+        )
+        .column(col("id"))
+        .item(cast_item, ExasolType::char(20)),
+    );
 
     assert!(
         !widened,
@@ -2004,11 +1937,10 @@ fn selectlist_untranslatable_item_falls_back_to_column() {
         "name": "SUM",
         "arguments": [col("AMOUNT")]
     });
-    let (request, _) = pushdown_request("T", &[("AMOUNT", ExasolType::decimal(18, 2))])
-        .item(bad_expr, ExasolType::WIDEST_VARCHAR)
-        .build();
-    let pushdown_req = request["pushdownRequest"].clone();
-    let (proj_cols, proj_types, _widened) = project_first_table(&request, &pushdown_req).unwrap();
+    let (proj_cols, proj_types, _widened) = projected(
+        pushdown_request("T", &[("AMOUNT", ExasolType::decimal(18, 2))])
+            .item(bad_expr, ExasolType::WIDEST_VARCHAR),
+    );
     assert_eq!(proj_cols.len(), 1);
     assert_eq!(proj_cols[0], "AMOUNT");
     assert_eq!(proj_types[0], ExasolType::decimal(18, 2));
@@ -2116,12 +2048,7 @@ fn like_guard_date_subject_wraps_cast() {
     let result = like_subject_type_guard(&filter, &column_types(&col_types));
     let expected = serde_json::json!({
         "type": "predicate_like",
-        "expression": {
-            "type": "function_scalar_cast",
-            "name": "CAST",
-            "dataType": exasol_type_to_json(&ExasolType::WIDEST_VARCHAR),
-            "arguments": [column]
-        },
+        "expression": cast_to(ExasolType::WIDEST_VARCHAR, column),
         "pattern": str_lit("2024%")
     });
     assert_eq!(
@@ -2545,12 +2472,7 @@ fn like_guard_date_inside_case_wraps_cast() {
         "arguments": [
             {
                 "type": "predicate_like",
-                "expression": {
-                    "type": "function_scalar_cast",
-                    "name": "CAST",
-                    "dataType": exasol_type_to_json(&ExasolType::WIDEST_VARCHAR),
-                    "arguments": [column]
-                },
+                "expression": cast_to(ExasolType::WIDEST_VARCHAR, column),
                 "pattern": str_lit("2024%")
             }
         ],
@@ -2712,15 +2634,6 @@ fn decimal_rewrite_col_types() -> Vec<(String, ExasolType)> {
 
 fn decimal_column() -> Json {
     serde_json::json!({"type": "column", "name": "c_decimal_a"})
-}
-
-fn cast_to(target: ExasolType, arg: Json) -> Json {
-    serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": exasol_type_to_json(&target),
-        "arguments": [arg],
-    })
 }
 
 #[test]
@@ -3729,15 +3642,6 @@ fn trimmed_decimal(name: &str) -> Json {
     })
 }
 
-fn cast_varchar(name: &str) -> Json {
-    serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": exasol_type_to_json(&ExasolType::WIDEST_VARCHAR),
-        "arguments": [col(name)],
-    })
-}
-
 fn equals(left: Json, right: Json) -> Json {
     predicate_equal(left, right)
 }
@@ -3838,7 +3742,10 @@ fn string_fn_guard_casts_date_argument_to_varchar() {
             &string_fn("LOWER", vec![col("d")]),
             &column_types(&col_types)
         ),
-        Some(string_fn("LOWER", vec![cast_varchar("d")])),
+        Some(string_fn(
+            "LOWER",
+            vec![cast_to(ExasolType::WIDEST_VARCHAR, col("d"))]
+        )),
         "LOWER's DATE argument must be wrapped in CAST(<col> AS VARCHAR)"
     );
 }
@@ -3960,7 +3867,11 @@ fn string_fn_guard_leaves_numeric_position_arguments_untouched() {
         ),
         Some(string_fn(
             "LPAD",
-            vec![trimmed_decimal("c_decimal_a"), col("id"), cast_varchar("d")]
+            vec![
+                trimmed_decimal("c_decimal_a"),
+                col("id"),
+                cast_to(ExasolType::WIDEST_VARCHAR, col("d"))
+            ]
         )),
         "LPAD must coerce the subject and the pad string, never the length"
     );
@@ -3990,7 +3901,10 @@ fn string_fn_guard_coerces_both_instr_and_locate_arguments() {
         ),
         Some(string_fn(
             "INSTR",
-            vec![trimmed_decimal("c_decimal_a"), cast_varchar("d")]
+            vec![
+                trimmed_decimal("c_decimal_a"),
+                cast_to(ExasolType::WIDEST_VARCHAR, col("d"))
+            ]
         )),
         "INSTR must coerce both of its arguments"
     );
@@ -4002,7 +3916,10 @@ fn string_fn_guard_coerces_both_instr_and_locate_arguments() {
         ),
         Some(string_fn(
             "LOCATE",
-            vec![cast_varchar("d"), trimmed_decimal("c_decimal_a")]
+            vec![
+                cast_to(ExasolType::WIDEST_VARCHAR, col("d")),
+                trimmed_decimal("c_decimal_a")
+            ]
         )),
         "LOCATE must coerce both of its arguments"
     );
@@ -4185,12 +4102,7 @@ fn project_columns_top_level_aggregate_widening_is_unchanged_by_the_subtree_prob
 
 #[test]
 fn project_columns_widens_on_aggregate_nested_in_function_scalar_cast_item() {
-    let select_item = serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "arguments": [ agg_item("SUM", Some("id"), false) ],
-        "dataType": {"type": "VARCHAR", "size": 100}
-    });
+    let select_item = cast_to(ExasolType::varchar(100), agg_item("SUM", Some("id"), false));
     let declared_type = ExasolType::varchar(100);
     assert_widens_to_full_base_row(
         select_item,
@@ -4597,10 +4509,6 @@ fn only_a_plain_timestamp_declares_timestamp_digits() {
 
 #[test]
 fn cast_to_declared_type_casts_a_genuine_varchar_2000000() {
-    assert_eq!(
-        cast_to_declared_type(r#"SUM("PARTIAL_sum_0")"#, ExasolType::WIDEST_VARCHAR),
-        r#"CAST(SUM("PARTIAL_sum_0") AS VARCHAR(2000000))"#
-    );
     for exa_type in EXASOL_TYPE_SPELLINGS {
         assert_eq!(
             cast_to_declared_type("x", exa_type),
@@ -4790,26 +4698,5 @@ fn involved_column_with_an_unparsable_type_fails() {
             Some(UdfError::User(message)) => assert!(message.contains(&named), "{message}"),
             other => panic!("the column must fail with {named}, got {other:?}"),
         }
-    }
-}
-
-#[test]
-fn a_select_item_the_scan_cannot_emit_widens_the_projection() {
-    let columns = [
-        ("ID", ExasolType::decimal(10, 0)),
-        ("SHIPPED", ExasolType::timestamp(3)),
-        ("ORDERED", ExasolType::timestamp(3)),
-    ];
-    let elapsed = difference(col("SHIPPED"), col("ORDERED"));
-    for (declared, widens) in emittability_rows() {
-        let pushdown_req = pushdown_request("T", &columns)
-            .column(col("ID"))
-            .item(elapsed.clone(), declared)
-            .build_pushdown();
-
-        let (items, _, widened) = project_split(&pushdown_req, &column_types(&columns)).unwrap();
-
-        assert_eq!(widened, widens, "{declared}");
-        assert_eq!(items.len(), if widens { 3 } else { 2 }, "{declared}");
     }
 }

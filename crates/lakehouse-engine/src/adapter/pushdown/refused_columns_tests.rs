@@ -2,7 +2,7 @@ use crate::adapter::pushdown::test_support::{predicate_equal, str_lit, table_col
 
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    PushdownRequestBuilder, agg_item, pushdown_request, unread_refused, user_message,
+    PushdownRequestBuilder, pushdown_request, unread_refused, user_message,
 };
 use crate::types::exasol_type::ExasolType;
 
@@ -151,7 +151,7 @@ fn a_full_row_projection_refuses_a_column_the_request_json_never_names() {
 fn a_widened_projection_from_an_aggregate_select_list_is_not_unioned_into_the_touched_set() {
     let request = stats_all_types()
         .field("type", "select")
-        .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+        .count_star()
         .build()
         .0;
 

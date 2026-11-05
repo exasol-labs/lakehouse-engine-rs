@@ -139,7 +139,7 @@ fn empty_result_sql_dispatches_by_plan_shape() {
     let grouped = pushdown_request("T", &[("K", ExasolType::decimal(20, 0))])
         .group_by(vec![col("K")])
         .column(col("K"))
-        .item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+        .count_star()
         .build_pushdown();
     let grouped_sql = empty_result_sql(
         &grouped,
@@ -163,7 +163,7 @@ fn empty_result_sql_dispatches_by_plan_shape() {
         ("NAME", "VARCHAR(2000000)", &text_col_types),
     ] {
         let single = pushdown_request("T", NO_COLUMNS)
-            .field("aggregationType", serde_json::json!("single_group"))
+            .single_group()
             .item(
                 agg_item("SUM", Some(column), false),
                 ExasolType::decimal(36, 2),
@@ -194,13 +194,13 @@ fn empty_result_sql_dispatches_by_plan_shape() {
 fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
     let col_types = vec![("ID".to_string(), ExasolType::decimal(19, 0))];
     let request = pushdown_request("T", NO_COLUMNS)
-        .field("aggregationType", serde_json::json!("single_group"))
+        .single_group()
         .field(
             "having",
             predicate_equal(agg_item("COUNT", None, false), num_lit(0)),
         )
         .item(str_lit("X"), ExasolType::WIDEST_VARCHAR)
-        .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+        .count_star()
         .build_pushdown();
     let sql = empty_result_sql(
         &request,

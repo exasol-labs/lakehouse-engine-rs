@@ -94,12 +94,12 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 * *AND* Exasol's limits are DECIMAL precision 1 to 36 with scale 0 to the precision, CHAR size 1 to 2,000, VARCHAR size 1 to 2,000,000, TIMESTAMP precision 0 to 9, INTERVAL leading precision 1 to 9 and fraction 0 to 9, and HASHTYPE size 1 to 1,024 bytes
 * *WHEN* the adapter plans the pushdown
 * *THEN* the adapter SHALL fail the query with an error that names the missing `selectListDataTypes` or the offending `dataType` object
-* *AND* the adapter MUST NOT substitute a default other than the three that "Every request of a supported Exasol version passes the strict type check" names, cap or clamp a value, or declare `VARCHAR(2000000)` in place of the type
+* *AND* the adapter MUST NOT substitute a default for an absent field, except precision 3 for an absent TIMESTAMP `fractionalSecondsPrecision`, `false` for an absent `withLocalTimeZone`, and UTF8 for an absent `characterSet`, and MUST NOT cap or clamp a value or declare `VARCHAR(2000000)` in place of the type
 * *AND* a request whose `selectList` holds one or more items SHALL fail the query when `selectListDataTypes` holds a different number of entries
 
 ### Scenario: Every request of a supported Exasol version passes the strict type check
 
-* *GIVEN* Exasol 8.29.x or later, as verified on 8.29.13 and 2025.1.16
+* *GIVEN* Exasol 8.29.x or later
 * *WHEN* a query over a virtual table sends the adapter a `pushdown` request
 * *THEN* the request SHALL carry `selectListDataTypes` with one complete `dataType` per select-list item, and the adapter SHALL plan it without a type error
 * *AND* a TIMESTAMP `dataType` without `fractionalSecondsPrecision` SHALL be valid and mean precision 3, because Exasol 8.x omits the field, and an absent `withLocalTimeZone` SHALL mean `false`

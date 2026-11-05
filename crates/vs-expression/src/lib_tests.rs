@@ -2,6 +2,16 @@ use super::*;
 use crate::test_support::*;
 use serde_json::json;
 
+/// Exasol's `CAST("X" AS data_type)` node.
+fn cast(data_type: Json) -> Json {
+    json!({
+        "type": "function_scalar_cast",
+        "name": "CAST",
+        "arguments": [col("x")],
+        "dataType": data_type
+    })
+}
+
 #[test]
 fn renders_column_as_quoted_uppercase_ident() {
     let expr = col("region");
@@ -628,23 +638,13 @@ fn neg_composes_with_aggregate_decomposition() {
 
 #[test]
 fn renders_cast_varchar() {
-    let expr = json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "arguments": [col("x")],
-        "dataType": {"type": "VARCHAR", "size": 100}
-    });
+    let expr = cast(json!({"type": "VARCHAR", "size": 100}));
     assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
 }
 
 #[test]
 fn renders_cast_decimal() {
-    let expr = json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "arguments": [col("x")],
-        "dataType": {"type": "DECIMAL", "precision": 10, "scale": 2}
-    });
+    let expr = cast(json!({"type": "DECIMAL", "precision": 10, "scale": 2}));
     assert_eq!(
         render_expression(&expr).unwrap(),
         r#"CAST("X" AS DECIMAL(10,2))"#
@@ -653,45 +653,25 @@ fn renders_cast_decimal() {
 
 #[test]
 fn renders_cast_double() {
-    let expr = json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "arguments": [col("x")],
-        "dataType": {"type": "DOUBLE"}
-    });
+    let expr = cast(json!({"type": "DOUBLE"}));
     assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS DOUBLE)"#);
 }
 
 #[test]
 fn renders_cast_date() {
-    let expr = json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "arguments": [col("x")],
-        "dataType": {"type": "DATE"}
-    });
+    let expr = cast(json!({"type": "DATE"}));
     assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS DATE)"#);
 }
 
 #[test]
 fn renders_cast_char_as_datafusion_varchar() {
-    let expr = json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "arguments": [col("x")],
-        "dataType": {"type": "CHAR", "size": 3, "characterSet": "ASCII"}
-    });
+    let expr = cast(json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"}));
     assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
 }
 
 #[test]
 fn renders_cast_char_as_exasol_char() {
-    let expr = json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "arguments": [col("x")],
-        "dataType": {"type": "CHAR", "size": 3, "characterSet": "ASCII"}
-    });
+    let expr = cast(json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"}));
     assert_eq!(
         render_expression_exasol(&expr).unwrap(),
         r#"CAST("X" AS CHAR(3) ASCII)"#
@@ -735,23 +715,15 @@ fn renders_cast_bool_to_varchar_uses_case_for_any_predicate_source() {
 
 #[test]
 fn renders_cast_boolean() {
-    let expr = json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "arguments": [col("x")],
-        "dataType": {"type": "BOOLEAN"}
-    });
+    let expr = cast(json!({"type": "BOOLEAN"}));
     assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS BOOLEAN)"#);
 }
 
 #[test]
 fn renders_cast_timestamp_without_local_time_zone() {
-    let expr = json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "arguments": [col("x")],
-        "dataType": {"type": "TIMESTAMP", "withLocalTimeZone": false, "fractionalSecondsPrecision": 3}
-    });
+    let expr = cast(
+        json!({"type": "TIMESTAMP", "withLocalTimeZone": false, "fractionalSecondsPrecision": 3}),
+    );
     assert_eq!(
         render_expression(&expr).unwrap(),
         r#"CAST("X" AS TIMESTAMP(3))"#
@@ -760,15 +732,6 @@ fn renders_cast_timestamp_without_local_time_zone() {
 
 #[test]
 fn renders_cast_timestamp_precision_per_dialect() {
-    fn cast(data_type: Json) -> Json {
-        json!({
-            "type": "function_scalar_cast",
-            "name": "CAST",
-            "arguments": [col("x")],
-            "dataType": data_type
-        })
-    }
-
     for p in 0u64..=9 {
         let expr = cast(json!({"type": "TIMESTAMP", "fractionalSecondsPrecision": p}));
         let expected = if p == 3 {
@@ -858,12 +821,7 @@ fn cast_to_unsupported_target_declines() {
         ),
     ];
     for (data_type, exasol_target) in unsupported {
-        let expr = json!({
-            "type": "function_scalar_cast",
-            "name": "CAST",
-            "arguments": [col("x")],
-            "dataType": data_type.clone()
-        });
+        let expr = cast(data_type.clone());
         assert!(
             render_expression(&expr).is_err(),
             "CAST to {data_type} must raise in the DataFusion dialect's raising mode"
@@ -882,12 +840,7 @@ fn cast_to_unsupported_target_declines() {
 
 #[test]
 fn exasol_dialect_renders_a_varchar_ascii_target() {
-    let expr = json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "arguments": [col("x")],
-        "dataType": {"type": "VARCHAR", "size": 10, "characterSet": "ASCII"}
-    });
+    let expr = cast(json!({"type": "VARCHAR", "size": 10, "characterSet": "ASCII"}));
     assert_eq!(
         render_expression_exasol(&expr).unwrap(),
         r#"CAST("X" AS VARCHAR(10) ASCII)"#
@@ -2454,11 +2407,7 @@ fn aggregate_with_unrenderable_argument_declines() {
 
 #[test]
 fn renders_cast_varchar_exasol_dialect_includes_length() {
-    let expr = json!({
-        "type": "function_scalar_cast", "name": "CAST",
-        "arguments": [col("x")],
-        "dataType": {"type": "VARCHAR", "size": 100}
-    });
+    let expr = cast(json!({"type": "VARCHAR", "size": 100}));
     assert_eq!(
         render_expression_exasol(&expr).unwrap(),
         r#"CAST("X" AS VARCHAR(100))"#
@@ -2467,11 +2416,7 @@ fn renders_cast_varchar_exasol_dialect_includes_length() {
 
 #[test]
 fn renders_cast_char_exasol_dialect_includes_length() {
-    let expr = json!({
-        "type": "function_scalar_cast", "name": "CAST",
-        "arguments": [col("x")],
-        "dataType": {"type": "CHAR", "size": 3, "characterSet": "ASCII"}
-    });
+    let expr = cast(json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"}));
     assert_eq!(
         render_expression_exasol(&expr).unwrap(),
         r#"CAST("X" AS CHAR(3) ASCII)"#
@@ -2498,30 +2443,19 @@ fn cast_char_target_diverges_between_dialects() {
 /// Scenario: A pushdown request with a missing or invalid Exasol type fails the query
 #[test]
 fn cast_to_an_incomplete_target_is_refused_in_both_dialects() {
-    let invalid_targets = [
-        json!({"type": "VARCHAR"}),
-        json!({"type": "CHAR", "characterSet": "ASCII"}),
-        json!({"type": "DECIMAL", "precision": 37, "scale": 0}),
-        json!({"type": "TIMESTAMP", "fractionalSecondsPrecision": 10}),
-        json!({"type": "UNSUPPORTED_TARGET"}),
-    ];
-    for data_type in invalid_targets {
-        let expr = json!({
-            "type": "function_scalar_cast", "name": "CAST",
-            "arguments": [col("x")],
-            "dataType": data_type.clone()
-        });
-        for (dialect, rendered) in [
-            ("DataFusion", render_expression(&expr)),
-            ("Exasol", render_expression_exasol(&expr)),
-        ] {
-            match rendered {
-                Err(UdfError::User(message)) => assert!(
-                    message.contains(&data_type.to_string()),
-                    "the {dialect} refusal must name {data_type}: {message}"
-                ),
-                other => panic!("the {dialect} dialect must refuse CAST to {data_type}: {other:?}"),
-            }
+    // exasol_type_tests pins which targets the parser refuses; this pins that CAST reaches it.
+    let data_type = json!({"type": "VARCHAR"});
+    let expr = cast(data_type.clone());
+    for (dialect, rendered) in [
+        ("DataFusion", render_expression(&expr)),
+        ("Exasol", render_expression_exasol(&expr)),
+    ] {
+        match rendered {
+            Err(UdfError::User(message)) => assert!(
+                message.contains(&data_type.to_string()),
+                "the {dialect} refusal must name {data_type}: {message}"
+            ),
+            other => panic!("the {dialect} dialect must refuse CAST to {data_type}: {other:?}"),
         }
     }
 }
