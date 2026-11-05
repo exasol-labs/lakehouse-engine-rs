@@ -106,15 +106,11 @@ The scan also accepts some strings Exasol rejects, such as a sign before the yea
 
 ## CAST to text
 
-A cast to text that the scan computes can return a value or a row where native Exasol returns
-another value or raises an error. The fix is planned (#587). The differences come from two rules:
+A cast to text that the scan computes differs from native Exasol in two ways:
 
-- The scan applies no length check, no blank padding, and no ASCII check for a `CHAR(n)` target,
-  for a `VARCHAR(n)` target shorter than 2,000,000, or for an ASCII target. This holds for a cast
-  in a filter and for a cast in a select-list item.
-- The scan writes a DATE, TIMESTAMP, BOOLEAN, DOUBLE, or DECIMAL with a scale above 0 in
-  DataFusion's fixed text form, whatever the session's NLS settings say: ISO dates, a `T` between
-  date and time, a `.` as decimal point, and lowercase booleans.
+- It skips the target type's length check, blank padding, and ASCII check.
+- It formats DATE, TIMESTAMP, BOOLEAN, DOUBLE, and DECIMAL values with a scale above 0 in a fixed
+  form that ignores the session's NLS settings.
 
 | Expression | Session setting | Virtual schema | Native Exasol |
 |---|---|---|---|
@@ -124,8 +120,7 @@ another value or raises an error. The fix is planned (#587). The differences com
 | `WHERE CAST(flag AS VARCHAR(2000000)) = 'TRUE'` | default | returns no rows | returns rows |
 | `CAST(d AS VARCHAR(10))` | `NLS_DATE_FORMAT='DD.MM.YYYY'` | `2024-01-01` | `01.01.2024` |
 
-**Workaround:** filter a date with a date range instead of a text comparison. The range pushes
-down and prunes files:
+**Workaround:** filter a date with a date range instead of a text comparison:
 
 ```sql
 WHERE d >= DATE '2024-01-01' AND d < DATE '2025-01-01'
