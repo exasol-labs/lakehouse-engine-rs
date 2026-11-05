@@ -32,6 +32,7 @@ downloaded.
 * *WHEN* the script creates the deployment scripts in the target schema
 * *THEN* it SHALL issue four script statements in that schema: the RUST ADAPTER SCRIPT, the RUST
   SCALAR scan script, the RUST SCALAR version script, and the LUA SET file distributor
+* *AND* it SHALL issue a fifth, the RUST SET export script, only when run with `--with-export`
 * *AND* the version script's DDL SHALL declare `RETURNS VARCHAR(100)`, MUST NOT declare an `EMITS`
   clause, and SHALL reference the same `%udf_object` path as the adapter script and the scan script
 * *AND* every statement SHALL stay idempotent, so a re-run over a prior install replaces the

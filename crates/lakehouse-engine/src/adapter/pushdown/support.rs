@@ -23,16 +23,9 @@ pub(super) const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
 /// Exasol spreads the work units across nodes.
 pub(super) const DISTRIBUTE_FILES_UDF_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
 
-/// Exasol distributes groups round-robin up to this count; above it they are
-/// hash-partitioned (unbalanced).
-const MAX_SHARD_COUNT: usize = 300;
-
 /// Clamped to at least 1 and at most `min(file_count, 300)`, so no shard is empty.
-pub fn shard_count(node_count: usize, parallelism_factor: usize, file_count: usize) -> usize {
-    let raw = node_count.saturating_mul(parallelism_factor);
-    let upper = file_count.clamp(1, MAX_SHARD_COUNT);
-    raw.clamp(1, upper)
-}
+pub use crate::exasol::group_count as shard_count;
+pub(super) use crate::exasol::{quote_ident, sql_string_literal};
 
 pub(super) fn shard_files_json<E: Clone + Into<FileEntry>>(files: &[E]) -> String {
     let entries: Vec<FileEntry> = files.iter().cloned().map(Into::into).collect();
@@ -1054,14 +1047,6 @@ pub(super) fn order_by_present(pushdown_req: &Json) -> bool {
         .get("orderBy")
         .and_then(|v| v.as_array())
         .is_some_and(|a| !a.is_empty())
-}
-
-pub(super) fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-pub(super) fn sql_string_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// Its `VARCHAR(2000000)` fallback is the catch-all [`cast_to_declared_type`] reads as

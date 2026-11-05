@@ -4,8 +4,9 @@ use std::process::Command;
 
 use crate::common::stack::lakehouse_engine_so_path;
 
+/// Scenario: One crate exports every Rust entry point
 #[test]
-fn so_exports_three_entry_point_symbols() {
+fn so_exports_four_entry_point_symbols() {
     let so = lakehouse_engine_so_path();
     assert!(
         so.exists(),
@@ -38,15 +39,19 @@ fn so_exports_three_entry_point_symbols() {
         symbols.contains("__exa_udf_entry_LAKEHOUSE_VERSION"),
         "the .so must export the version entry symbol __exa_udf_entry_LAKEHOUSE_VERSION"
     );
+    assert!(
+        symbols.contains("__exa_udf_entry_LAKEHOUSE_EXPORT"),
+        "the .so must export the export entry symbol __exa_udf_entry_LAKEHOUSE_EXPORT"
+    );
     let entry_symbols: Vec<&str> = symbols
         .lines()
         .filter(|line| line.contains("__exa_udf_entry_"))
         .collect();
     assert_eq!(
         entry_symbols.len(),
-        3,
-        "the .so must export EXACTLY three UDF entry-point symbols (adapter, scan, \
-         version), found: {entry_symbols:?}"
+        4,
+        "the .so must export EXACTLY four UDF entry-point symbols (adapter, scan, \
+         version, export), found: {entry_symbols:?}"
     );
     assert!(
         !symbols.contains("__exa_udf_entry_LAKEHOUSE_DISTRIBUTE_FILES"),
