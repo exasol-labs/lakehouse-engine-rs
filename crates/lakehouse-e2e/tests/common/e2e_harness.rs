@@ -10,9 +10,9 @@ use super::seed::{
 };
 use super::stack::{
     CatalogConnectionPassword, PROXY_ADAPTER_SCHEMA, assert_resolves_only_through_proxy,
-    bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
-    exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal, lakehouse_engine_so_path,
-    local_stack_connection_password, seaweedfs_url, upload_to_bucketfs, url_host, wait_for_proxy,
+    build_create_connection_sql, exasol_host, exasol_sql_port, iceberg_catalog_url,
+    iceberg_catalog_url_internal, lakehouse_engine_so_path, local_stack_connection_password,
+    put_to_bucketfs, seaweedfs_url, upload_to_bucketfs, url_host, wait_for_proxy,
 };
 
 use futures::TryStreamExt;
@@ -22,7 +22,6 @@ use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 pub const SYS_PASSWORD: &str = "exasol";
 pub const SCHEMA_NAME: &str = "LHVS";
@@ -76,29 +75,7 @@ pub fn install_slc() {
         "SLC tarball is empty — download failed"
     );
 
-    let password = bucketfs_write_password();
-    let bfs_url = format!(
-        "https://{}:{}{}",
-        exasol_host(),
-        bucketfs_port(),
-        SLC_BUCKETFS_PUT_PATH
-    );
-    let client = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(120))
-        .build()
-        .expect("BucketFS client");
-    let resp = client
-        .put(&bfs_url)
-        .basic_auth("w", Some(&password))
-        .body(tarball_bytes.to_vec())
-        .send()
-        .unwrap_or_else(|e| panic!("BucketFS PUT SLC to {bfs_url}: {e}"));
-    assert!(
-        resp.status().is_success(),
-        "BucketFS PUT SLC returned {} — expected 2xx",
-        resp.status()
-    );
+    put_to_bucketfs(tarball_bytes.to_vec(), SLC_BUCKETFS_PUT_PATH);
 
     let mut conn = exa_conn();
     let rust_def = format!(
