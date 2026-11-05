@@ -112,7 +112,7 @@ sends the query to the adapter.
 | `BIT_TO_NUM` |  | DataFusion has no equivalent (#108). |
 | `BIT_XOR` |  | Exasol bit functions are unsigned 64-bit, DataFusion's are signed (#108). |
 | `CASE` | ✓ |  |
-| `CAST` | ✓ | A cast to INTERVAL, GEOMETRY, HASHTYPE, or TIMESTAMP WITH LOCAL TIME ZONE fails the query. |
+| `CAST` | ✓ | Exasol SQL applies a cast to INTERVAL, GEOMETRY, HASHTYPE, or TIMESTAMP WITH LOCAL TIME ZONE over the scan output. |
 | `CEIL` | ✓ |  |
 | `CHR` | ✓ |  |
 | `COLOGNE_PHONETIC` |  |  |

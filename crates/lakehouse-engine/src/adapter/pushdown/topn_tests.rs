@@ -9,18 +9,19 @@ use super::super::{detect_aggregates, ordinary_plans, validate_agg_col_types};
 use super::*;
 use crate::scan::spec::{CommonScanSpec, FileEntry, ScanStorage};
 use crate::scan::test_support::WithFiles;
+use crate::types::exasol_type::ExasolType;
 
 /// Mirrors `handle_pushdown`'s synchronous post-resolution row-scan path.
 fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize) -> String {
-    let pushdown_req = request
-        .get("pushdownRequest")
-        .cloned()
-        .unwrap_or(Json::Null);
+    let pushdown = parsed_pushdown(request);
+    let pushdown_req = pushdown.json();
     let (mut projection, widened) =
-        project_columns(&pushdown_req, &first_table_column_types(request)).unwrap();
-    let limit = extract_limit(&pushdown_req);
-    let has_order_by = order_by_present(&pushdown_req);
-    let col_types = involved_columns(request, |tables| tables.first()).types;
+        project_columns(&pushdown, &first_table_column_types(request)).unwrap();
+    let limit = extract_limit(pushdown_req);
+    let has_order_by = order_by_present(pushdown_req);
+    let col_types = involved_columns(request, |tables| tables.first())
+        .unwrap()
+        .types;
     // Covers only the no-decline half; a declining fixture belongs on `build_dispatch_sql`.
     let (filter, declined_filter) = classify_where_filter(
         pushdown_req.get("filter").filter(|f| !f.is_null()),
@@ -31,13 +32,14 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
         "plan_scan_sql mirrors only the no-decline dispatch path; a declined-filter fixture needs build_dispatch_sql, not this helper"
     );
 
-    let items = detect_aggregates(&pushdown_req)
+    let items = detect_aggregates(&pushdown)
         .filter(|it| validate_agg_col_types(&ordinary_plans(it), &column_types(&col_types)));
     let merge_inputs = items.as_deref().map(|it| {
         let plans = ordinary_plans(it);
-        let plan_types = single_group_plan_types(&pushdown_req, it);
-        let merge_select = single_group_merge_select(it, &plans, &plan_types)
-            .expect("plan_scan_sql mirrors only fixtures whose merge SELECT assembles in full");
+        let plan_types = single_group_plan_types(pushdown.select_types(), it);
+        let merge_select =
+            single_group_merge_select(it, &plans, &plan_types, &column_types(&col_types))
+                .expect("plan_scan_sql mirrors only fixtures whose merge SELECT assembles in full");
         AggregateMergeInputs::new(plan_types, merge_select, limit)
             .expect("one merge item per select-list item is never empty")
     });
@@ -52,7 +54,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let topn = if aggregates.is_none() {
         detect_topn(
             request,
-            &pushdown_req,
+            pushdown_req,
             &projection_items(&projection),
             &logical_schema,
         )
@@ -72,7 +74,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let visible_count = projection.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
-        let keys = parse_order_by_keys(&pushdown_req);
+        let keys = parse_order_by_keys(pushdown_req);
         // Mirrors the dispatcher's guard (#198); a declining fixture belongs on `build_dispatch_sql`.
         ensure_every_sort_key_renders(&keys)
             .expect("plan_scan_sql mirrors only fixtures whose pushed ORDER BY renders in full");
@@ -113,7 +115,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
             visible_count,
             &declined_sort_keys,
             limit,
-            extract_offset(&pushdown_req),
+            extract_offset(pushdown_req),
         )
     } else {
         sql
@@ -297,31 +299,24 @@ fn zero_offset_still_matches_bounded_topn_byte_identically() {
 
 #[test]
 fn order_by_present_without_topn_match_withholds_per_shard_limit() {
-    let request = serde_json::json!({
-        "involvedTables": [{
-            "name": "LINEITEM",
-            "columns": [
-                {"name": "L_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "L_EXTENDEDPRICE", "dataType": {"type": "decimal", "precision": 18, "scale": 2}},
-            ],
-        }],
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [
-                table_col("LINEITEM", "L_ORDERKEY"),
-            ],
-            "selectListDataTypes": [
-                {"type": "decimal", "precision": 20, "scale": 0},
-            ],
-            "orderBy": [{
-                "type": "order_by_element",
-                "expression": {"type": "column", "columnNr": 1, "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
-                "isAscending": false,
-                "nullsLast": true
-            }],
-            "limit": {"numElements": 20}
-        }
-    });
+    let order_by = serde_json::json!([{
+        "type": "order_by_element",
+        "expression": {"type": "column", "columnNr": 1, "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
+        "isAscending": false,
+        "nullsLast": true
+    }]);
+    let (request, _) = pushdown_request(
+        "LINEITEM",
+        &[
+            ("L_ORDERKEY", ExasolType::decimal(20, 0)),
+            ("L_EXTENDEDPRICE", ExasolType::decimal(18, 2)),
+        ],
+    )
+    .field("type", "select")
+    .order_by(order_by)
+    .limit(20)
+    .column(table_col("LINEITEM", "L_ORDERKEY"))
+    .build();
     assert!(
         detect_topn(
             &request,
@@ -368,38 +363,23 @@ fn order_by_present_without_topn_match_withholds_per_shard_limit() {
     );
 }
 
-/// Any column an `orderBy` expression references but `select_list` omits must reach
-/// the scan as a hidden column.
 fn lineitem_order_by_request(select_list: &[&str], order_by: Json, limit: Option<u64>) -> Json {
-    let type_of = |name: &str| {
-        if name == "L_ORDERKEY" {
-            serde_json::json!({"type": "decimal", "precision": 20, "scale": 0})
-        } else {
-            serde_json::json!({"type": "decimal", "precision": 18, "scale": 2})
-        }
-    };
-    let mut pushdown_req = serde_json::json!({
-        "type": "select",
-        "selectList": select_list
-            .iter()
-            .map(|name| table_col("LINEITEM", name))
-            .collect::<Vec<_>>(),
-        "selectListDataTypes": select_list.iter().map(|n| type_of(n)).collect::<Vec<_>>(),
-        "orderBy": order_by,
-    });
-    if let Some(n) = limit {
-        pushdown_req["limit"] = serde_json::json!({"numElements": n});
+    let mut request = pushdown_request(
+        "LINEITEM",
+        &[
+            ("L_ORDERKEY", ExasolType::decimal(20, 0)),
+            ("L_EXTENDEDPRICE", ExasolType::decimal(18, 2)),
+        ],
+    )
+    .field("type", "select")
+    .order_by(order_by);
+    for name in select_list {
+        request = request.column(table_col("LINEITEM", name));
     }
-    serde_json::json!({
-        "involvedTables": [{
-            "name": "LINEITEM",
-            "columns": [
-                {"name": "L_ORDERKEY", "dataType": type_of("L_ORDERKEY")},
-                {"name": "L_EXTENDEDPRICE", "dataType": type_of("L_EXTENDEDPRICE")},
-            ],
-        }],
-        "pushdownRequest": pushdown_req,
-    })
+    if let Some(n) = limit {
+        request = request.limit(n);
+    }
+    request.build().0
 }
 
 fn order_by_element(expression: Json, ascending: bool, nulls_last: bool) -> Json {
@@ -720,32 +700,24 @@ fn unbounded_order_by_falls_back_correctness_safe() {
 
 #[test]
 fn row_scan_decline_order_by_no_limit_wraps_outer_order_by() {
-    let request = serde_json::json!({
-        "involvedTables": [{
-            "name": "LINEITEM",
-            "columns": [
-                {"name": "L_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "L_EXTENDEDPRICE", "dataType": {"type": "decimal", "precision": 18, "scale": 2}},
-            ],
-        }],
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [
-                table_col("LINEITEM", "L_ORDERKEY"),
-                table_col("LINEITEM", "L_EXTENDEDPRICE"),
-            ],
-            "selectListDataTypes": [
-                {"type": "decimal", "precision": 20, "scale": 0},
-                {"type": "decimal", "precision": 18, "scale": 2},
-            ],
-            "orderBy": [{
-                "type": "order_by_element",
-                "expression": {"type": "column", "columnNr": 1, "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
-                "isAscending": false,
-                "nullsLast": true
-            }]
-        }
-    });
+    let order_by = serde_json::json!([{
+        "type": "order_by_element",
+        "expression": {"type": "column", "columnNr": 1, "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
+        "isAscending": false,
+        "nullsLast": true
+    }]);
+    let (request, _) = pushdown_request(
+        "LINEITEM",
+        &[
+            ("L_ORDERKEY", ExasolType::decimal(20, 0)),
+            ("L_EXTENDEDPRICE", ExasolType::decimal(18, 2)),
+        ],
+    )
+    .field("type", "select")
+    .order_by(order_by)
+    .column(table_col("LINEITEM", "L_ORDERKEY"))
+    .column(table_col("LINEITEM", "L_EXTENDEDPRICE"))
+    .build();
     let files = vec![
         ("s3://w/part-0.parquet".to_string(), 1000u64),
         ("s3://w/part-1.parquet".to_string(), 1000u64),
@@ -769,28 +741,24 @@ fn row_scan_decline_order_by_no_limit_wraps_outer_order_by() {
 
 #[test]
 fn aggregate_merge_renders_request_limit_zero_through_plan_composition() {
-    let request = serde_json::json!({
-        "involvedTables": [{
-            "name": "LINEITEM",
-            "columns": [
-                {"name": "L_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "L_EXTENDEDPRICE", "dataType": {"type": "decimal", "precision": 18, "scale": 2}},
-            ],
-        }],
-        "pushdownRequest": {
-            "type": "select",
-            "aggregationType": "single_group",
-            "selectList": [agg_item("COUNT", None, false)],
-            "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
-            "orderBy": [{
-                "type": "order_by_element",
-                "expression": agg_item("COUNT", None, false),
-                "isAscending": false,
-                "nullsLast": true
-            }],
-            "limit": {"numElements": 0}
-        }
-    });
+    let (request, _) = pushdown_request(
+        "LINEITEM",
+        &[
+            ("L_ORDERKEY", ExasolType::decimal(20, 0)),
+            ("L_EXTENDEDPRICE", ExasolType::decimal(18, 2)),
+        ],
+    )
+    .field("type", serde_json::json!("select"))
+    .field("aggregationType", serde_json::json!("single_group"))
+    .order_by(serde_json::json!([{
+        "type": "order_by_element",
+        "expression": agg_item("COUNT", None, false),
+        "isAscending": false,
+        "nullsLast": true
+    }]))
+    .field("limit", serde_json::json!({"numElements": 0}))
+    .item(agg_item("COUNT", None, false), ExasolType::decimal(20, 0))
+    .build();
     let files = vec![
         ("s3://w/part-0.parquet".to_string(), 1000u64),
         ("s3://w/part-1.parquet".to_string(), 1000u64),

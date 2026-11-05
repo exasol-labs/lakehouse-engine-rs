@@ -1,5 +1,5 @@
-use super::grouped_agg::{col_type_for, is_literal_selectlist_item, partial_emits_items};
-use super::scalar_over_agg::with_stat_grand_means;
+use super::grouped_agg::{is_literal_selectlist_item, partial_emits_items};
+use super::scalar_over_agg::{col_type_for, with_stat_grand_means};
 use super::single_group_agg::{DistinctCount, SingleGroupItem};
 use crate::adapter::column_notes::TableNotes;
 use crate::adapter::connection::ConnectionCreds;
@@ -8,8 +8,8 @@ use crate::scan::spec::{
     AggregatePlan, ColumnRef, CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec,
     ScanStorage, StorageBackend, render_order_by_clause,
 };
-use crate::types::exasol_type::ExasolType;
-use crate::types::mapping::{exasol_type_from_json, timestamp_literal_digits};
+use crate::types::exasol_type::{ExasolType, exasol_type_from_json, exasol_type_to_json};
+use crate::types::mapping::timestamp_literal_digits;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::HashMap;
@@ -322,12 +322,13 @@ pub(super) struct InvolvedColumns<'r> {
     pub(super) notes: TableNotes<'r>,
 }
 
-/// Reads each column's name, Exasol type, and note in one pass. A column missing `name` or
-/// `dataType` is skipped.
+/// Reads each column's name, Exasol type, and note in one pass. A column missing `name` is
+/// skipped. A missing or invalid `dataType` fails the request: the adapter declared every column
+/// itself, so no defaulted type may stand in for it.
 pub(super) fn involved_columns<'r>(
     request: &'r Json,
     select_table: impl FnOnce(&'r [Json]) -> Option<&'r Json>,
-) -> InvolvedColumns<'r> {
+) -> Result<InvolvedColumns<'r>, UdfError> {
     let table = request
         .get("involvedTables")
         .and_then(|v| v.as_array())
@@ -337,14 +338,21 @@ pub(super) fn involved_columns<'r>(
         .and_then(|c| c.as_array())
         .into_iter()
         .flatten()
-        .filter_map(|column| {
-            let name = column.get("name")?.as_str()?;
-            let data_type = exasol_type_from_json(column.get("dataType")?);
+        .filter_map(|column| Some((column.get("name")?.as_str()?, column)))
+        .map(|(name, column)| {
+            let data_type = column
+                .get("dataType")
+                .ok_or_else(|| {
+                    UdfError::User(format!("involved column {name} declares no dataType"))
+                })
+                .and_then(exasol_type_from_json)?;
             let note = column.get("adapterNotes").and_then(|note| note.as_str());
-            Some(((name.to_uppercase(), data_type), (name, note)))
+            Ok(((name.to_uppercase(), data_type), (name, note)))
         })
+        .collect::<Result<Vec<_>, UdfError>>()?
+        .into_iter()
         .unzip();
-    InvolvedColumns {
+    Ok(InvolvedColumns {
         types,
         notes: TableNotes {
             table: table
@@ -353,7 +361,7 @@ pub(super) fn involved_columns<'r>(
                 .unwrap_or_default(),
             columns,
         },
-    }
+    })
 }
 
 /// `false` means the caller must self-apply the predicate in its own SQL, never
@@ -600,12 +608,11 @@ fn rewrite_decimal_stringifications(node: &Json, col_types: &ColumnTypes) -> Jso
         let node_type = out.get("type").and_then(|t| t.as_str()).unwrap_or("");
         Some(match node_type {
             "function_scalar_cast" => {
+                // An invalid target stays in the tree for `render_cast_target` to refuse.
                 let target_is_string = out
                     .get("dataType")
-                    .and_then(|d| d.get("type"))
-                    .and_then(|t| t.as_str())
-                    .map(|t| t.to_uppercase())
-                    .is_some_and(|t| t == "VARCHAR" || t == "CHAR");
+                    .map(exasol_type_from_json)
+                    .is_some_and(|target| target.is_ok_and(|t| t.is_character()));
                 if target_is_string
                     && let Some(Json::Array(args)) = out.get("arguments")
                     && let [arg] = args.as_slice()
@@ -667,7 +674,7 @@ fn wrap_cast_to_varchar(node: &Json) -> Json {
     serde_json::json!({
         "type": "function_scalar_cast",
         "name": "CAST",
-        "dataType": {"type": "VARCHAR"},
+        "dataType": exasol_type_to_json(&ExasolType::WIDEST_VARCHAR),
         "arguments": [node.clone()],
     })
 }
@@ -743,7 +750,7 @@ fn coerce_string_position_arg(arg: &Json, col_types: &ColumnTypes) -> Option<Jso
     match column_exa_type(arg, col_types) {
         Some(exa_type) if exa_type.is_character() => Some(arg.clone()),
         Some(ExasolType::Date) => Some(wrap_cast_to_varchar(arg)),
-        Some(ExasolType::Decimal { .. }) => Some(wrap_decimal_to_varchar(arg)),
+        Some(ExasolType::Decimal(_)) => Some(wrap_decimal_to_varchar(arg)),
         // Other types' text forms diverge between engines; a cast would turn a crash into
         // a wrong answer.
         _ => None,
@@ -881,18 +888,13 @@ pub(super) fn classify_where_filter<'a>(
     }
 }
 
-/// Exasol rejects `TIMESTAMP WITH LOCAL TIME ZONE` as an EMITS output (sqlCode 22002).
-fn is_valid_emits_output_type(ty: ExasolType) -> bool {
-    ty != ExasolType::TimestampWithLocalTimeZone
-}
-
 /// `all_cols` is the column universe: the first involved table, or both legs of a broadcast
 /// join, each column qualified by its leg's alias.
 ///
 /// `true` means the projection widened to the full base row (#196); returned because the arities
 /// can coincide. A missing or empty select list is not a widening.
 pub(super) fn project_columns(
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     all_cols: &ColumnTypes,
 ) -> Result<(Vec<ProjectedColumn>, bool), UdfError> {
     let Some((first_col, first)) = all_cols.0.first() else {
@@ -905,7 +907,7 @@ pub(super) fn project_columns(
     // Repeating `first_col` for an unprojectable item would duplicate EMITS
     // names, so the whole projection widens to the full row instead.
     let mut needs_full_fallback = false;
-    let select_list = pushdown_req.get("selectList");
+    let select_list = pushdown.json().get("selectList");
     let projection = match select_list {
         None | Some(Json::Null) => full_row(),
         Some(Json::Array(list)) if list.is_empty() => full_row().into_iter().take(1).collect(),
@@ -913,7 +915,7 @@ pub(super) fn project_columns(
             let mut projected = Vec::with_capacity(list.len());
             for (i, e) in list.iter().enumerate() {
                 // The EMITS column type must equal Exasol's declared `selectListDataTypes` entry.
-                let declared_type = declared_select_type(pushdown_req, i);
+                let declared_type = pushdown.select_type(i);
                 // An aggregate at any depth must never be evaluated per shard: its value would be
                 // an unmerged partial (#194).
                 if contains_aggregate_node(e) {
@@ -944,11 +946,12 @@ pub(super) fn project_columns(
                     }
                     t if is_literal_selectlist_item(t) => {
                         // Pushed positionally so the emitted arity equals the select-list arity (#190).
-                        match render_expression_safe(e) {
-                            Some(sql_frag) if is_valid_emits_output_type(declared_type) => {
+                        match (render_expression_safe(e), declared_type) {
+                            (Some(sql_frag), Some(exa_type)) if exa_type.is_udf_emittable() =>
+                            {
                                 projected.push(ProjectedColumn {
                                     item: ProjectionItem::Expr { expr: sql_frag },
-                                    exa_type: declared_type,
+                                    exa_type,
                                 });
                             }
                             _ => {
@@ -976,11 +979,12 @@ pub(super) fn project_columns(
                     | "predicate_is_null"
                     | "predicate_is_not_null"
                     | "predicate_notequal" => {
-                        match render_expression_safe(e) {
-                            Some(sql_frag) if is_valid_emits_output_type(declared_type) => {
+                        match (render_expression_safe(e), declared_type) {
+                            (Some(sql_frag), Some(exa_type)) if exa_type.is_udf_emittable() =>
+                            {
                                 projected.push(ProjectedColumn {
                                     item: ProjectionItem::Expr { expr: sql_frag },
-                                    exa_type: declared_type,
+                                    exa_type,
                                 });
                             }
                             _ => {
@@ -1049,24 +1053,77 @@ pub(super) fn order_by_present(pushdown_req: &Json) -> bool {
         .is_some_and(|a| !a.is_empty())
 }
 
-/// Its `VARCHAR(2000000)` fallback is the catch-all [`cast_to_declared_type`] reads as
-/// "no usable declared type", so the two must stay together.
-pub(super) fn declared_select_type(pushdown_req: &Json, select_index: usize) -> ExasolType {
-    pushdown_req
-        .get("selectListDataTypes")
-        .and_then(|v| v.as_array())
-        .and_then(|types| types.get(select_index))
-        .map(exasol_type_from_json)
-        .unwrap_or(ExasolType::WIDEST_VARCHAR)
+/// A `pushdownRequest` paired with the type Exasol declares for each of its select-list items.
+/// [`PushdownRequest::parse`] is the only constructor, so every holder has passed the strict type
+/// and count check, and no consumer reads `selectListDataTypes` on its own (decision-log [3]).
+#[derive(Debug, Clone)]
+pub struct PushdownRequest {
+    json: Json,
+    select_types: Vec<ExasolType>,
 }
 
-/// `VARCHAR(2000000)` is exempt: it is the mapping's catch-all for unmappable types,
-/// so casting to it would mislabel the value.
-pub(super) fn cast_to_declared_type(expr: &str, declared: Option<ExasolType>) -> String {
-    match declared {
-        Some(ty) if ty != ExasolType::WIDEST_VARCHAR => format!("CAST({expr} AS {ty})"),
-        _ => expr.to_string(),
+impl PushdownRequest {
+    /// Fails when the list is absent, holds an invalid entry, or holds another number of entries
+    /// than a `selectList` with items. An absent or JSON-null `selectList` is Exasol's `SELECT *`,
+    /// whose list holds one entry per table column, so it skips the count check.
+    pub fn parse(json: Json) -> Result<Self, UdfError> {
+        let entries = json
+            .get("selectListDataTypes")
+            .and_then(Json::as_array)
+            .ok_or_else(|| {
+                UdfError::User(
+                    "the pushdown request carries no selectListDataTypes array; the adapter \
+                     needs Exasol 8.29 or later"
+                        .into(),
+                )
+            })?;
+        let select_types = entries
+            .iter()
+            .map(exasol_type_from_json)
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(items) = json.get("selectList").and_then(Json::as_array)
+            && !items.is_empty()
+            && items.len() != select_types.len()
+        {
+            return Err(UdfError::User(format!(
+                "the pushdown request declares {} selectListDataTypes entries for {} selectList items",
+                select_types.len(),
+                items.len()
+            )));
+        }
+        Ok(Self { json, select_types })
     }
+
+    /// The `pushdownRequest` object as Exasol sent it, or as a rewrite kept it.
+    pub fn json(&self) -> &Json {
+        &self.json
+    }
+
+    /// One type per select-list item, or per table column for `SELECT *`.
+    pub fn select_types(&self) -> &[ExasolType] {
+        &self.select_types
+    }
+
+    /// `None` only for an index past the list, which the count check rules out for every
+    /// select-list item; the consumer then declines rather than guess a type.
+    pub fn select_type(&self, select_index: usize) -> Option<ExasolType> {
+        self.select_types.get(select_index).copied()
+    }
+
+    /// A rewrite of this request's JSON that keeps its select list, such as the table-qualified
+    /// copy a broadcast join projects from, beside the types already checked for it.
+    pub fn with_json(&self, json: Json) -> Self {
+        Self {
+            json,
+            select_types: self.select_types.clone(),
+        }
+    }
+}
+
+/// Exasol type-checks each pushdown output column against its declared type, so a value
+/// computed in Exasol SQL whose type can differ is cast to the declared type.
+pub(super) fn cast_to_declared_type(expr: &str, declared: ExasolType) -> String {
+    format!("CAST({expr} AS {declared})")
 }
 
 /// The scan-spec storage block: a CONNECTION reference only when the scan UDF can

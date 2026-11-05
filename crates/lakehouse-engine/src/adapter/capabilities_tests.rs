@@ -1,5 +1,6 @@
 use super::*;
-use crate::adapter::pushdown::test_support::col;
+use crate::adapter::pushdown::test_support::{agg_item, col, pushdown_request};
+use crate::types::exasol_type::ExasolType;
 
 fn has_disallowed_join_capability(cap_strs: &[&str]) -> bool {
     cap_strs.iter().any(|c| {
@@ -36,18 +37,18 @@ fn reports_group_by_capabilities() {
         "AGGREGATE_GROUP_BY_TUPLE must be advertised: {cap_strs:?}"
     );
 
-    let multi_key_group_by = serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [
-            col("REGION"),
-            col("YEAR"),
+    let multi_key_group_by = pushdown_request(
+        "T",
+        &[
+            ("REGION", ExasolType::WIDEST_VARCHAR),
+            ("YEAR", ExasolType::WIDEST_VARCHAR),
         ],
-        "selectList": [
-            col("REGION"),
-            {"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false},
-            col("YEAR"),
-        ],
-    });
+    )
+    .group_by(vec![col("REGION"), col("YEAR")])
+    .column(col("REGION"))
+    .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+    .column(col("YEAR"))
+    .build_pushdown();
     let detection = crate::adapter::pushdown::detect_group_by_aggregates(&multi_key_group_by)
         .expect("multi-key GROUP BY must be detected by the backing pushdown path");
     assert_eq!(

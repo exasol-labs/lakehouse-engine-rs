@@ -1,8 +1,10 @@
 use crate::adapter::pushdown::test_support::{predicate_equal, str_lit, table_col};
-use serde_json::json;
 
 use super::*;
-use crate::adapter::pushdown::test_support::{unread_refused, user_message};
+use crate::adapter::pushdown::test_support::{
+    PushdownRequestBuilder, agg_item, pushdown_request, unread_refused, user_message,
+};
+use crate::types::exasol_type::ExasolType;
 
 fn shape_col() -> RefusedColumn {
     unread_refused("Parquet", "shape_col", None, "geometry")
@@ -18,17 +20,17 @@ fn refused_column(column_name: &str, reason: &str) -> RefusedColumn {
     }
 }
 
-fn involved_tables() -> Json {
-    json!([{
-        "name": "STATS_ALL_TYPES",
-        "columns": [
-            {"name": "INT_COL", "dataType": {"type": "decimal", "precision": 10, "scale": 0}},
-            {"name": "SHAPE_COL", "dataType": {"type": "varchar", "size": 2000000}},
-            {"name": "MAP_COL", "dataType": {"type": "varchar", "size": 2000000}},
-            {"name": "NESTED_STRUCT", "dataType": {"type": "varchar", "size": 2000000}},
-            {"name": "VARIANT_COL", "dataType": {"type": "varchar", "size": 2000000}},
+fn stats_all_types() -> PushdownRequestBuilder {
+    pushdown_request(
+        "STATS_ALL_TYPES",
+        &[
+            ("INT_COL", ExasolType::decimal(10, 0)),
+            ("SHAPE_COL", ExasolType::WIDEST_VARCHAR),
+            ("MAP_COL", ExasolType::WIDEST_VARCHAR),
+            ("NESTED_STRUCT", ExasolType::WIDEST_VARCHAR),
+            ("VARIANT_COL", ExasolType::WIDEST_VARCHAR),
         ],
-    }])
+    )
 }
 
 fn column_node(name: &str) -> Json {
@@ -38,14 +40,14 @@ fn column_node(name: &str) -> Json {
 /// Scenario: A refused column refuses only the requests that read or emit it
 #[test]
 fn a_request_touching_no_refused_column_is_admitted() {
-    let request = json!({
-        "involvedTables": involved_tables(),
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [column_node("INT_COL")],
-            "filter": {"type": "predicate_is_not_null", "expression": column_node("INT_COL")},
-        },
-    });
+    let int_col_present =
+        serde_json::json!({"type": "predicate_is_not_null", "expression": column_node("INT_COL")});
+    let request = stats_all_types()
+        .field("type", "select")
+        .filter(int_col_present)
+        .column(column_node("INT_COL"))
+        .build()
+        .0;
     let projection = [ProjectionItem::from("INT_COL")];
 
     let gated = ensure_no_refused_column_referenced(&request, Some(&projection), &[shape_col()]);
@@ -61,13 +63,12 @@ fn a_request_touching_no_refused_column_is_admitted() {
 /// Scenario: A refused column refuses only the requests that read or emit it
 #[test]
 fn a_table_with_no_refused_column_admits_every_request() {
-    let request = json!({
-        "involvedTables": involved_tables(),
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [column_node("SHAPE_COL"), column_node("MAP_COL")],
-        },
-    });
+    let request = stats_all_types()
+        .field("type", serde_json::json!("select"))
+        .column(column_node("SHAPE_COL"))
+        .column(column_node("MAP_COL"))
+        .build()
+        .0;
     let projection = [
         ProjectionItem::from("SHAPE_COL"),
         ProjectionItem::from("MAP_COL"),
@@ -85,30 +86,28 @@ fn a_table_with_no_refused_column_admits_every_request() {
 /// Scenario: A refused column refuses only the requests that read or emit it
 #[test]
 fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
-    let request = json!({
-        "involvedTables": involved_tables(),
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [column_node("INT_COL")],
-            "filter": {
-                "type": "predicate_and",
-                "expressions": [
-                    {"type": "predicate_is_not_null", "expression": column_node("INT_COL")},
-                    predicate_equal(
-                        serde_json::json!({
-                                "type": "function_scalar",
-                                "name": "UPPER",
-                                "arguments": [{
-                                    "type": "function_scalar_case",
-                                    "arguments": [column_node("SHAPE_COL")],
-                                }],
-                            }),
-                        str_lit("x"),
-                    ),
-                ],
-            },
-        },
-    });
+    let request = stats_all_types()
+        .field("type", serde_json::json!("select"))
+        .filter(serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [
+                {"type": "predicate_is_not_null", "expression": column_node("INT_COL")},
+                predicate_equal(
+                    serde_json::json!({
+                            "type": "function_scalar",
+                            "name": "UPPER",
+                            "arguments": [{
+                                "type": "function_scalar_case",
+                                "arguments": [column_node("SHAPE_COL")],
+                            }],
+                        }),
+                    str_lit("x"),
+                ),
+            ],
+        }))
+        .column(column_node("INT_COL"))
+        .build()
+        .0;
     let projection = [ProjectionItem::from("INT_COL")];
 
     let err = ensure_no_refused_column_referenced(&request, Some(&projection), &[shape_col()])
@@ -124,13 +123,13 @@ fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
 /// Scenario: A refused column refuses only the requests that read or emit it
 #[test]
 fn a_full_row_projection_refuses_a_column_the_request_json_never_names() {
-    let request = json!({
-        "involvedTables": involved_tables(),
-        "pushdownRequest": {
-            "type": "select",
-            "filter": {"type": "predicate_is_not_null", "expression": column_node("INT_COL")},
-        },
-    });
+    let int_col_present =
+        serde_json::json!({"type": "predicate_is_not_null", "expression": column_node("INT_COL")});
+    let request = stats_all_types()
+        .field("type", "select")
+        .filter(int_col_present)
+        .build()
+        .0;
     let projection = [
         ProjectionItem::from("INT_COL"),
         ProjectionItem::from("SHAPE_COL"),
@@ -150,15 +149,11 @@ fn a_full_row_projection_refuses_a_column_the_request_json_never_names() {
 /// Scenario: A refused column refuses only the requests that read or emit it
 #[test]
 fn a_widened_projection_from_an_aggregate_select_list_is_not_unioned_into_the_touched_set() {
-    let request = json!({
-        "involvedTables": involved_tables(),
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [
-                {"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false},
-            ],
-        },
-    });
+    let request = stats_all_types()
+        .field("type", "select")
+        .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+        .build()
+        .0;
 
     let gated = ensure_no_refused_column_referenced(&request, None, &[shape_col()]);
 
@@ -173,18 +168,19 @@ fn a_widened_projection_from_an_aggregate_select_list_is_not_unioned_into_the_to
 /// Scenario: A refused column refuses only the requests that read or emit it
 #[test]
 fn a_widened_projection_is_still_refused_when_the_request_itself_names_a_refused_column() {
-    let request = json!({
-        "involvedTables": involved_tables(),
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [{
+    let request = stats_all_types()
+        .field("type", serde_json::json!("select"))
+        .item(
+            serde_json::json!({
                 "type": "function_aggregate",
                 "name": "MAX",
                 "arguments": [column_node("SHAPE_COL")],
                 "distinct": false,
-            }],
-        },
-    });
+            }),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build()
+        .0;
 
     let err = ensure_no_refused_column_referenced(&request, None, &[shape_col()])
         .expect_err("an aggregate whose argument names the refused column must be refused");
@@ -198,19 +194,17 @@ fn a_widened_projection_is_still_refused_when_the_request_itself_names_a_refused
 /// Scenario: A refused column refuses only the requests that read or emit it
 #[test]
 fn every_refused_column_a_request_touches_is_named_in_one_error() {
-    let request = json!({
-        "involvedTables": involved_tables(),
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [column_node("INT_COL")],
-            "orderBy": [{
-                "type": "order_by_element",
-                "expression": column_node("VARIANT_COL"),
-                "isAscending": true,
-                "nullsLast": true,
-            }],
-        },
-    });
+    let request = stats_all_types()
+        .field("type", serde_json::json!("select"))
+        .order_by(serde_json::json!([{
+            "type": "order_by_element",
+            "expression": column_node("VARIANT_COL"),
+            "isAscending": true,
+            "nullsLast": true,
+        }]))
+        .column(column_node("INT_COL"))
+        .build()
+        .0;
     let projection = [
         ProjectionItem::from("INT_COL"),
         ProjectionItem::from("SHAPE_COL"),
@@ -239,13 +233,12 @@ fn every_refused_column_a_request_touches_is_named_in_one_error() {
 #[test]
 fn only_shape_col_refuses_requests_in_the_stats_all_types_shape() {
     let refused = [shape_col()];
-    let nested_request = json!({
-        "involvedTables": involved_tables(),
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [column_node("MAP_COL"), column_node("NESTED_STRUCT")],
-        },
-    });
+    let nested_request = stats_all_types()
+        .field("type", serde_json::json!("select"))
+        .column(column_node("MAP_COL"))
+        .column(column_node("NESTED_STRUCT"))
+        .build()
+        .0;
     let nested_projection = [
         ProjectionItem::from("MAP_COL"),
         ProjectionItem::from("NESTED_STRUCT"),
@@ -259,13 +252,12 @@ fn only_shape_col_refuses_requests_in_the_stats_all_types_shape() {
         gated.err()
     );
 
-    let binary_request = json!({
-        "involvedTables": involved_tables(),
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [column_node("MAP_COL"), column_node("SHAPE_COL")],
-        },
-    });
+    let binary_request = stats_all_types()
+        .field("type", serde_json::json!("select"))
+        .column(column_node("MAP_COL"))
+        .column(column_node("SHAPE_COL"))
+        .build()
+        .0;
 
     let err = ensure_no_refused_column_referenced(&binary_request, None, &refused)
         .expect_err("a request naming SHAPE_COL must still be refused");
@@ -275,13 +267,11 @@ fn only_shape_col_refuses_requests_in_the_stats_all_types_shape() {
 /// Scenario: A refused column refuses only the requests that read or emit it
 #[test]
 fn a_lower_cased_column_reference_matches_a_refused_column() {
-    let request = json!({
-        "involvedTables": involved_tables(),
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [table_col("STATS_ALL_TYPES", "shape_col")],
-        },
-    });
+    let request = stats_all_types()
+        .field("type", serde_json::json!("select"))
+        .column(table_col("STATS_ALL_TYPES", "shape_col"))
+        .build()
+        .0;
     let projection = [ProjectionItem::from("INT_COL")];
 
     let err = ensure_no_refused_column_referenced(&request, Some(&projection), &[shape_col()])

@@ -103,3 +103,30 @@ For a few input strings the scan and native Exasol parse differently:
 | `TO_TIMESTAMP('1600-01-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')` | error | `1600-01-01 00:00:00` |
 
 The scan also accepts some strings Exasol rejects, such as a sign before the year, seconds 60, or a tab inside the value. Those queries return a result where Exasol raises an error.
+
+## CAST to text
+
+A cast to text that the scan computes can return a value or a row where native Exasol returns
+another value or raises an error. The fix is planned (#587). The differences come from two rules:
+
+- The scan applies no length check, no blank padding, and no ASCII check for a `CHAR(n)` target,
+  for a `VARCHAR(n)` target shorter than 2,000,000, or for an ASCII target. This holds for a cast
+  in a filter and for a cast in a select-list item.
+- The scan writes a DATE, TIMESTAMP, BOOLEAN, DOUBLE, or DECIMAL with a scale above 0 in
+  DataFusion's fixed text form, whatever the session's NLS settings say: ISO dates, a `T` between
+  date and time, a `.` as decimal point, and lowercase booleans.
+
+| Expression | Session setting | Virtual schema | Native Exasol |
+|---|---|---|---|
+| `WHERE CAST(name \|\| 'abcdefghijkl' AS VARCHAR(5)) IS NOT NULL` | default | returns rows | right-truncation error |
+| `WHERE CAST(name \|\| 'é' AS VARCHAR(10) ASCII) IS NOT NULL` | default | returns rows | error |
+| `CAST(ts AS VARCHAR(40))` | default | `2024-01-01T00:00:00.100` | `2024-01-01 00:00:00.100000` |
+| `WHERE CAST(flag AS VARCHAR(2000000)) = 'TRUE'` | default | returns no rows | returns rows |
+| `CAST(d AS VARCHAR(10))` | `NLS_DATE_FORMAT='DD.MM.YYYY'` | `2024-01-01` | `01.01.2024` |
+
+**Workaround:** filter a date with a date range instead of a text comparison. The range pushes
+down and prunes files:
+
+```sql
+WHERE d >= DATE '2024-01-01' AND d < DATE '2025-01-01'
+```

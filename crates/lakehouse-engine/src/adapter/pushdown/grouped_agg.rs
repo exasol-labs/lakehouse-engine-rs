@@ -1,19 +1,18 @@
 use crate::scan::spec::{
-    AggKind, AggregatePlan, ColumnRef, FileEntry, PartialAggColumn, ScanSpec, partial_column_name,
-    render_ordered,
+    AggKind, AggregatePlan, FileEntry, ScanSpec, partial_column_name, render_ordered,
 };
-use crate::types::exasol_type::{ExasolType, MAX_DECIMAL_PRECISION};
-use crate::types::mapping::exasol_type_from_json;
+use crate::types::exasol_type::{ExasolType, exasol_type_from_json};
+use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::render_expression;
 
 use super::scalar_over_agg::{
-    cast_merge_items, classify_scalar_over_aggregate, fold_aggregate_plan, merge_select_items,
-    parse_agg_item, render_scalar_over_merge, with_stat_grand_means,
+    cast_merge_items, classify_scalar_over_aggregate, col_type_for, fold_aggregate_plan,
+    merge_select_items, parse_agg_item, partial_column_type, render_scalar_over_merge,
+    with_stat_grand_means,
 };
 use super::support::{
-    ColumnTypes, build_fan_out_inner, cast_to_declared_type, declared_select_type,
-    render_limit_offset,
+    ColumnTypes, PushdownRequest, build_fan_out_inner, cast_to_declared_type, render_limit_offset,
 };
 use super::topn::parse_sort_flags;
 
@@ -66,13 +65,13 @@ pub struct GroupedAggregateDetection {
     pub select_items: Vec<GroupedSelectItem>,
 }
 
-fn constant_projection_sql(pushdown_req: &Json, select_index: usize, rendered: &str) -> String {
-    let declared = pushdown_req
-        .get("selectListDataTypes")
-        .and_then(|v| v.as_array())
-        .and_then(|d| d.get(select_index))
-        .map(exasol_type_from_json);
-    cast_to_declared_type(rendered, declared)
+fn constant_projection_sql(
+    select_types: &[ExasolType],
+    select_index: usize,
+    rendered: &str,
+) -> Option<String> {
+    let declared = select_types.get(select_index).copied()?;
+    Some(cast_to_declared_type(rendered, declared))
 }
 
 /// Shared by `detect_group_by_aggregates` and `project_columns` so the two
@@ -95,7 +94,8 @@ pub(super) fn is_literal_selectlist_item(item_type: &str) -> bool {
 
 /// `None` on any unsupported shape; the caller falls back to single-group detection
 /// or a row scan.
-pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregateDetection> {
+pub fn detect_group_by_aggregates(pushdown: &PushdownRequest) -> Option<GroupedAggregateDetection> {
+    let pushdown_req = pushdown.json();
     if pushdown_req.get("aggregationType").and_then(|v| v.as_str()) != Some("group_by") {
         return None;
     }
@@ -127,12 +127,12 @@ pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregat
         match item_type {
             "function_aggregate" => {
                 let plan = parse_agg_item(item)?;
-                let plan_slot = fold_aggregate_plan(
-                    &mut plans,
-                    &mut plan_types,
-                    plan,
-                    Some(declared_select_type(pushdown_req, select_index)),
-                );
+                // The scan has no value of a type it cannot emit, so Exasol computes the item.
+                let declared = pushdown
+                    .select_type(select_index)
+                    .filter(ExasolType::is_udf_emittable)?;
+                let plan_slot =
+                    fold_aggregate_plan(&mut plans, &mut plan_types, plan, Some(declared));
                 select_items.push(GroupedSelectItem::Aggregate {
                     plan_slot,
                     select_index,
@@ -140,7 +140,8 @@ pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregat
             }
             t if is_literal_selectlist_item(t) => {
                 let rendered = render_expression(item).ok()?;
-                let projection = constant_projection_sql(pushdown_req, select_index, &rendered);
+                let projection =
+                    constant_projection_sql(pushdown.select_types(), select_index, &rendered)?;
                 select_items.push(GroupedSelectItem::Constant {
                     select_index,
                     projection,
@@ -152,6 +153,9 @@ pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregat
                     .ok()
                     .and_then(|sql| group_keys.iter().position(|gk| *gk == sql))
                 {
+                    if !pushdown.select_type(select_index)?.is_udf_emittable() {
+                        return None;
+                    }
                     select_items.push(GroupedSelectItem::GroupKey {
                         group_key_slot,
                         select_index,
@@ -167,7 +171,7 @@ pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregat
                 select_items.push(GroupedSelectItem::ScalarOverAggregate {
                     select_index,
                     node: item.clone(),
-                    declared_type: declared_select_type(pushdown_req, select_index),
+                    declared_type: pushdown.select_type(select_index)?,
                 });
             }
         }
@@ -185,41 +189,36 @@ pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregat
 /// and authoritative since Exasol type-checks it). An unprojected key takes its
 /// `groupBy` node's own `dataType` when present (e.g. a CAST): without it a
 /// `CHAR(n)` key reached DataFusion unpadded and trailing-blank variants stayed
-/// separate groups (#192). Falls back to `VARCHAR(2000000)`.
+/// separate groups (#192). A key with neither keeps [`GROUP_KEY_EMIT_TYPE`], the type the
+/// scan emits every key in. An invalid `groupBy` `dataType` fails the request.
 pub(super) fn group_key_exasol_types(
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     group_keys: &[String],
     select_items: &[GroupedSelectItem],
-) -> Vec<ExasolType> {
-    let declared_types = pushdown_req
-        .get("selectListDataTypes")
-        .and_then(|v| v.as_array());
+) -> Result<Vec<ExasolType>, UdfError> {
     let mut types: Vec<Option<ExasolType>> = vec![None; group_keys.len()];
     for item in select_items {
         if let GroupedSelectItem::GroupKey {
             group_key_slot,
             select_index,
         } = item
-            && let Some(ty) = declared_types
-                .and_then(|d| d.get(*select_index))
-                .map(exasol_type_from_json)
+            && let Some(ty) = pushdown.select_type(*select_index)
             && let Some(slot) = types.get_mut(*group_key_slot)
         {
             *slot = Some(ty);
         }
     }
-    let group_by = pushdown_req.get("groupBy").and_then(|v| v.as_array());
-    for (slot, resolved) in types.iter_mut().enumerate() {
-        if resolved.is_none() {
-            *resolved = group_by
-                .and_then(|nodes| nodes.get(slot))
-                .and_then(|node| node.get("dataType"))
-                .map(exasol_type_from_json);
-        }
-    }
+    let group_by = pushdown.json().get("groupBy").and_then(|v| v.as_array());
     types
         .into_iter()
-        .map(|ty| ty.unwrap_or(ExasolType::WIDEST_VARCHAR))
+        .enumerate()
+        .map(|(slot, projected)| match projected {
+            Some(ty) => Ok(ty),
+            None => group_by
+                .and_then(|nodes| nodes.get(slot))
+                .and_then(|node| node.get("dataType"))
+                .map_or(Ok(GROUP_KEY_EMIT_TYPE), exasol_type_from_json),
+        })
         .collect()
 }
 
@@ -336,7 +335,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     order_by: Option<&str>,
 ) -> String {
     let gk_emits: Vec<String> = (0..group_keys.len())
-        .map(|i| format!(r#""GK_{i}" {}"#, ExasolType::WIDEST_VARCHAR))
+        .map(|i| format!(r#""GK_{i}" {GROUP_KEY_EMIT_TYPE}"#))
         .collect();
     let partial_items = partial_emits_items(aggregates, col_types, aggregate_types);
     let all_emits: Vec<String> = gk_emits
@@ -346,11 +345,18 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
         .collect();
     let emits = all_emits.join(", ");
 
-    // The scan stringifies group keys; cast back so result types match Exasol's.
     let gk_select: Vec<String> = (0..group_keys.len())
-        .map(|i| cast_to_declared_type(&format!(r#""GK_{i}""#), group_key_types.get(i).copied()))
+        .map(|i| {
+            let key = format!(r#""GK_{i}""#);
+            match group_key_types.get(i) {
+                Some(&declared) if declared != GROUP_KEY_EMIT_TYPE => {
+                    cast_to_declared_type(&key, declared)
+                }
+                _ => key,
+            }
+        })
         .collect();
-    let merge_items = cast_merge_items(aggregates, aggregate_types);
+    let merge_items = cast_merge_items(aggregates, aggregate_types, col_types);
     let merged_partials = merge_select_items(aggregates);
 
     // Exasol validates this SELECT positionally, so it follows `selectList` order,
@@ -370,7 +376,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
                 declared_type,
                 ..
             } => render_scalar_over_merge(node, aggregates, &merged_partials)
-                .map(|expr| cast_to_declared_type(&expr, Some(*declared_type))),
+                .map(|expr| cast_to_declared_type(&expr, *declared_type)),
         })
         .collect();
     let outer_select_str = outer_select.join(", ");
@@ -412,11 +418,9 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     sql
 }
 
-const PARTIAL_COUNT_TYPE: ExasolType = ExasolType::decimal(20, 0);
+/// The scan emits every group key as text, which the merge casts back to the key's declared type.
+const GROUP_KEY_EMIT_TYPE: ExasolType = ExasolType::WIDEST_VARCHAR;
 
-/// Counts are DECIMAL(20,0); SUM widens DECIMAL(p,s) to DECIMAL(36,s) against
-/// overflow; AVG and stat sums are DOUBLE PRECISION (reconstructed in floating
-/// point); MIN/MAX use the argument's exact type.
 pub(super) fn partial_emits_items(
     aggregates: &[AggregatePlan],
     col_types: &ColumnTypes,
@@ -426,62 +430,14 @@ pub(super) fn partial_emits_items(
         .iter()
         .enumerate()
         .flat_map(|(i, plan)| {
-            // The sole type source for an expression-argument aggregate (no source column).
             let declared = aggregate_types.get(i).copied();
             plan.kind.partial_columns().iter().map(move |col| {
-                let ty = match col {
-                    PartialAggColumn::CountStar
-                    | PartialAggColumn::CountArg
-                    | PartialAggColumn::AvgCnt
-                    | PartialAggColumn::StatCnt => PARTIAL_COUNT_TYPE,
-                    PartialAggColumn::AvgSum
-                    | PartialAggColumn::StatMean
-                    | PartialAggColumn::StatM2 => ExasolType::DoublePrecision,
-                    PartialAggColumn::Sum => sum_emit_type(col_type_for(
-                        plan.column.as_deref(),
-                        plan.arg_expr.as_deref(),
-                        col_types,
-                        declared,
-                    )),
-                    PartialAggColumn::Min | PartialAggColumn::Max => col_type_for(
-                        plan.column.as_deref(),
-                        plan.arg_expr.as_deref(),
-                        col_types,
-                        declared,
-                    ),
-                };
+                let ty = partial_column_type(plan, *col, col_types, declared);
                 let name = partial_column_name(*col, i);
                 format!(r#""{name}" {ty}"#)
             })
         })
         .collect()
-}
-
-/// An expression-argument aggregate has no source column, so it takes `declared`.
-pub(super) fn col_type_for(
-    column: Option<&str>,
-    arg_expr: Option<&str>,
-    col_types: &ColumnTypes,
-    declared: Option<ExasolType>,
-) -> ExasolType {
-    if column.is_none()
-        && arg_expr.is_some()
-        && let Some(ty) = declared
-    {
-        return ty;
-    }
-    column
-        .and_then(|col| col_types.get(&ColumnRef::from(col)))
-        .map_or(ExasolType::DoublePrecision, |column_type| {
-            column_type.exa_type
-        })
-}
-
-fn sum_emit_type(col_ty: ExasolType) -> ExasolType {
-    match col_ty {
-        ExasolType::Decimal { scale, .. } => ExasolType::decimal(MAX_DECIMAL_PRECISION, scale),
-        _ => ExasolType::DoublePrecision,
-    }
 }
 
 /// SUM and STDDEV/VARIANCE need a numeric target; `false` routes to a row scan. An
@@ -495,7 +451,7 @@ pub fn validate_agg_col_types(aggregates: &[AggregatePlan], col_types: &ColumnTy
                 col_types,
                 None,
             );
-            if !matches!(ty, ExasolType::DoublePrecision | ExasolType::Decimal { .. }) {
+            if !matches!(ty, ExasolType::DoublePrecision | ExasolType::Decimal(_)) {
                 return false;
             }
         }

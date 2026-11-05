@@ -6,7 +6,7 @@ use super::scalar_over_agg::{
     classify_scalar_over_aggregate, fold_aggregate_plan, merge_select_items, parse_agg_item,
     render_scalar_over_merge,
 };
-use super::support::{cast_to_declared_type, declared_select_type};
+use super::support::{ColumnTypes, PushdownRequest, cast_to_declared_type};
 use crate::types::exasol_type::ExasolType;
 
 /// A `COUNT(DISTINCT ...)` is not an aggregate partial: it is its own DISTINCT
@@ -32,7 +32,8 @@ pub struct DistinctCount {
 
 /// `None` (row-scan fallback) when any item declines; one declining item declines
 /// the whole detection.
-pub fn detect_aggregates(pushdown_req: &Json) -> Option<Vec<SingleGroupItem>> {
+pub fn detect_aggregates(pushdown: &PushdownRequest) -> Option<Vec<SingleGroupItem>> {
+    let pushdown_req = pushdown.json();
     if pushdown_req
         .get("groupBy")
         .and_then(|v| v.as_array())
@@ -50,6 +51,10 @@ pub fn detect_aggregates(pushdown_req: &Json) -> Option<Vec<SingleGroupItem>> {
     let mut items = Vec::with_capacity(list.len());
     for (select_index, item) in list.iter().enumerate() {
         let resolved = if item.get("type").and_then(|t| t.as_str()) == Some("function_aggregate") {
+            // The scan has no value of a type it cannot emit, so Exasol computes the item.
+            if !pushdown.select_type(select_index)?.is_udf_emittable() {
+                return None;
+            }
             match parse_count_distinct(item) {
                 Some(distinct) => SingleGroupItem::Distinct(distinct),
                 None => SingleGroupItem::Aggregate(parse_agg_item(item)?),
@@ -59,7 +64,7 @@ pub fn detect_aggregates(pushdown_req: &Json) -> Option<Vec<SingleGroupItem>> {
             classify_scalar_over_aggregate(item)?;
             SingleGroupItem::ScalarOverAggregate {
                 node: item.clone(),
-                declared_type: declared_select_type(pushdown_req, select_index),
+                declared_type: pushdown.select_type(select_index)?,
             }
         };
         items.push(resolved);
@@ -97,7 +102,10 @@ pub fn ordinary_plans(items: &[SingleGroupItem]) -> Vec<AggregatePlan> {
 /// Aligned 1:1 with `ordinary_plans(items)`. This list also types the scan's
 /// `EMITS`, so a slot reached only through a nested aggregate takes
 /// [`NESTED_AGGREGATE_PLAN_TYPE`] rather than the `VARCHAR(2000000)` default.
-pub fn single_group_plan_types(pushdown_req: &Json, items: &[SingleGroupItem]) -> Vec<ExasolType> {
+pub fn single_group_plan_types(
+    select_types: &[ExasolType],
+    items: &[SingleGroupItem],
+) -> Vec<ExasolType> {
     let plans = ordinary_plans(items);
     let mut plan_types = vec![NESTED_AGGREGATE_PLAN_TYPE; plans.len()];
 
@@ -107,7 +115,9 @@ pub fn single_group_plan_types(pushdown_req: &Json, items: &[SingleGroupItem]) -
                 .iter()
                 .position(|p| p == plan)
                 .expect("ordinary_plans folds every top-level Aggregate item's plan in");
-            plan_types[slot] = declared_select_type(pushdown_req, select_index);
+            if let Some(&declared) = select_types.get(select_index) {
+                plan_types[slot] = declared;
+            }
         }
     }
 
@@ -121,9 +131,10 @@ pub(super) fn single_group_merge_select(
     items: &[SingleGroupItem],
     plans: &[AggregatePlan],
     plan_types: &[ExasolType],
+    col_types: &ColumnTypes,
 ) -> Option<Vec<String>> {
     let merged = merge_select_items(plans);
-    let cast_merged = cast_merge_items(plans, plan_types);
+    let cast_merged = cast_merge_items(plans, plan_types, col_types);
     items
         .iter()
         .map(|item| match item {
@@ -137,7 +148,7 @@ pub(super) fn single_group_merge_select(
                 declared_type,
                 ..
             } => render_scalar_over_merge(node, plans, &merged)
-                .map(|expr| cast_to_declared_type(&expr, Some(*declared_type))),
+                .map(|expr| cast_to_declared_type(&expr, *declared_type)),
         })
         .collect()
 }

@@ -771,10 +771,15 @@ fn renders_cast_timestamp_precision_per_dialect() {
 
     for p in 0u64..=9 {
         let expr = cast(json!({"type": "TIMESTAMP", "fractionalSecondsPrecision": p}));
+        let expected = if p == 3 {
+            r#"CAST("X" AS TIMESTAMP)"#.to_string()
+        } else {
+            format!(r#"CAST("X" AS TIMESTAMP({p}))"#)
+        };
         assert_eq!(
             render_expression_exasol(&expr).unwrap(),
-            format!(r#"CAST("X" AS TIMESTAMP({p}))"#),
-            "Exasol dialect must render TIMESTAMP({p}) verbatim"
+            expected,
+            "Exasol dialect must render precision {p} as bare TIMESTAMP at 3, TIMESTAMP({p}) otherwise"
         );
     }
 
@@ -812,8 +817,8 @@ fn renders_cast_timestamp_precision_per_dialect() {
         let expr = cast(data_type.clone());
         assert_eq!(
             render_expression(&expr).unwrap(),
-            r#"CAST("X" AS TIMESTAMP)"#,
-            "DataFusion dialect: absent precision must render bare TIMESTAMP for {data_type}"
+            r#"CAST("X" AS TIMESTAMP(3))"#,
+            "DataFusion dialect: absent precision must render millisecond TIMESTAMP(3) for {data_type}"
         );
         assert_eq!(
             render_expression_exasol(&expr).unwrap(),
@@ -826,13 +831,33 @@ fn renders_cast_timestamp_precision_per_dialect() {
 #[test]
 fn cast_to_unsupported_target_declines() {
     let unsupported = [
-        json!({"type": "INTERVAL", "fromTo": "YEAR TO MONTH", "precision": 2}),
-        json!({"type": "INTERVAL", "fromTo": "DAY TO SECONDS", "precision": 2, "fraction": 2}),
-        json!({"type": "GEOMETRY", "srid": 4326}),
-        json!({"type": "HASHTYPE", "bytesize": 16}),
-        json!({"type": "TIMESTAMP", "withLocalTimeZone": true, "fractionalSecondsPrecision": 9}),
+        (
+            json!({"type": "INTERVAL", "fromTo": "YEAR TO MONTH", "precision": 2}),
+            "INTERVAL YEAR(2) TO MONTH",
+        ),
+        (
+            json!({"type": "INTERVAL", "fromTo": "DAY TO SECONDS", "precision": 2, "fraction": 2}),
+            "INTERVAL DAY(2) TO SECOND(2)",
+        ),
+        (json!({"type": "GEOMETRY", "srid": 4326}), "GEOMETRY(4326)"),
+        (
+            json!({"type": "HASHTYPE", "bytesize": 16}),
+            "HASHTYPE(16 BYTE)",
+        ),
+        (
+            json!({"type": "HASHTYPE", "bytesize": 1}),
+            "HASHTYPE(1 BYTE)",
+        ),
+        (
+            json!({"type": "TIMESTAMP", "withLocalTimeZone": true, "fractionalSecondsPrecision": 9}),
+            "TIMESTAMP(9) WITH LOCAL TIME ZONE",
+        ),
+        (
+            json!({"type": "TIMESTAMP", "withLocalTimeZone": true}),
+            "TIMESTAMP WITH LOCAL TIME ZONE",
+        ),
     ];
-    for data_type in unsupported {
+    for (data_type, exasol_target) in unsupported {
         let expr = json!({
             "type": "function_scalar_cast",
             "name": "CAST",
@@ -841,13 +866,32 @@ fn cast_to_unsupported_target_declines() {
         });
         assert!(
             render_expression(&expr).is_err(),
-            "CAST to {data_type} must raise in raising mode"
+            "CAST to {data_type} must raise in the DataFusion dialect's raising mode"
         );
         assert!(
             render_expression_safe(&expr).is_none(),
-            "CAST to {data_type} must be None in safe mode"
+            "CAST to {data_type} must be None in the DataFusion dialect's safe mode"
+        );
+        assert_eq!(
+            render_expression_exasol(&expr).unwrap(),
+            format!(r#"CAST("X" AS {exasol_target})"#),
+            "the Exasol dialect must render CAST to {data_type}"
         );
     }
+}
+
+#[test]
+fn exasol_dialect_renders_a_varchar_ascii_target() {
+    let expr = json!({
+        "type": "function_scalar_cast",
+        "name": "CAST",
+        "arguments": [col("x")],
+        "dataType": {"type": "VARCHAR", "size": 10, "characterSet": "ASCII"}
+    });
+    assert_eq!(
+        render_expression_exasol(&expr).unwrap(),
+        r#"CAST("X" AS VARCHAR(10) ASCII)"#
+    );
 }
 
 #[test]
@@ -2451,30 +2495,35 @@ fn cast_char_target_diverges_between_dialects() {
     );
 }
 
+/// Scenario: A pushdown request with a missing or invalid Exasol type fails the query
 #[test]
-fn renders_cast_varchar_exasol_dialect_without_size_falls_back() {
-    let expr = json!({
-        "type": "function_scalar_cast", "name": "CAST",
-        "arguments": [col("x")],
-        "dataType": {"type": "VARCHAR"}
-    });
-    assert_eq!(
-        render_expression_exasol(&expr).unwrap(),
-        r#"CAST("X" AS VARCHAR(2000000))"#
-    );
-}
-
-#[test]
-fn renders_cast_char_exasol_dialect_without_size_falls_back_to_varchar_default() {
-    let expr = json!({
-        "type": "function_scalar_cast", "name": "CAST",
-        "arguments": [col("x")],
-        "dataType": {"type": "CHAR", "characterSet": "ASCII"}
-    });
-    assert_eq!(
-        render_expression_exasol(&expr).unwrap(),
-        r#"CAST("X" AS VARCHAR(2000000))"#
-    );
+fn cast_to_an_incomplete_target_is_refused_in_both_dialects() {
+    let invalid_targets = [
+        json!({"type": "VARCHAR"}),
+        json!({"type": "CHAR", "characterSet": "ASCII"}),
+        json!({"type": "DECIMAL", "precision": 37, "scale": 0}),
+        json!({"type": "TIMESTAMP", "fractionalSecondsPrecision": 10}),
+        json!({"type": "UNSUPPORTED_TARGET"}),
+    ];
+    for data_type in invalid_targets {
+        let expr = json!({
+            "type": "function_scalar_cast", "name": "CAST",
+            "arguments": [col("x")],
+            "dataType": data_type.clone()
+        });
+        for (dialect, rendered) in [
+            ("DataFusion", render_expression(&expr)),
+            ("Exasol", render_expression_exasol(&expr)),
+        ] {
+            match rendered {
+                Err(UdfError::User(message)) => assert!(
+                    message.contains(&data_type.to_string()),
+                    "the {dialect} refusal must name {data_type}: {message}"
+                ),
+                other => panic!("the {dialect} dialect must refuse CAST to {data_type}: {other:?}"),
+            }
+        }
+    }
 }
 
 #[test]

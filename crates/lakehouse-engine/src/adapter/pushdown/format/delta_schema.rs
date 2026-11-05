@@ -1,10 +1,10 @@
+use crate::types::exasol_type::Decimal as ExasolDecimal;
 use delta_kernel::schema::{
     ColumnMetadataKey, DataType, DecimalType, MetadataValue, PrimitiveType, StructField, StructType,
 };
 use delta_kernel::table_features::ColumnMappingMode;
 
 use crate::scan::spec::{LogicalField, NestedField, NestedMembers};
-use crate::types::mapping::exasol_representable_catalog_decimal;
 
 use super::RefusedColumn;
 use crate::adapter::column_notes::variant_cause;
@@ -318,14 +318,14 @@ fn walk_primitive(primitive: &PrimitiveType) -> Walked<MappedType> {
         Timestamp => tagged("timestamptz_us"),
         TimestampNtz => tagged("timestamp_us"),
         Void | IntervalYearMonth | IntervalDayTime => tagged("utf8"),
-        Decimal(decimal) => {
-            let (precision, scale) = (u32::from(decimal.precision()), u32::from(decimal.scale()));
-            if exasol_representable_catalog_decimal(precision, scale) {
-                tagged(&format!("decimal128({precision},{scale})"))
-            } else {
-                tagged("utf8")
-            }
-        }
+        Decimal(decimal) => match ExasolDecimal::new(decimal.precision(), decimal.scale()) {
+            Some(decimal) => tagged(&format!(
+                "decimal128({},{})",
+                decimal.precision(),
+                decimal.scale()
+            )),
+            None => tagged("utf8"),
+        },
         Binary => tagged("binary"),
     }
 }

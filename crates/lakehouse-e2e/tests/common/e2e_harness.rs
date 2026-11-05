@@ -1001,7 +1001,16 @@ pub fn assert_decimal_orders_numerically(
     }
 }
 
-const NATIVE_COPY: &str = "FILTER_ORACLE.NATIVE_COPY";
+pub const NATIVE_COPY: &str = "FILTER_ORACLE.NATIVE_COPY";
+
+/// Copies `table` natively, so a query over the copy is the oracle for the same query over the
+/// virtual table.
+pub fn create_native_copy(conn: &mut ExaConn, table: &str, columns: &str) {
+    conn.execute("CREATE SCHEMA IF NOT EXISTS FILTER_ORACLE");
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {NATIVE_COPY} AS SELECT ID, {columns} FROM {table}"
+    ));
+}
 
 /// A native copy holds the values Exasol reads, so each filter must select the same `ID`s from
 /// it as from the virtual `table`. A timestamp column holds only where the declaration keeps
@@ -1012,10 +1021,7 @@ pub fn assert_filters_match_native_copy(
     columns: &str,
     filters: &[&str],
 ) {
-    conn.execute("CREATE SCHEMA IF NOT EXISTS FILTER_ORACLE");
-    conn.execute(&format!(
-        "CREATE OR REPLACE TABLE {NATIVE_COPY} AS SELECT ID, {columns} FROM {table}"
-    ));
+    create_native_copy(conn, table, columns);
     let ids = |conn: &mut ExaConn, from: &str, filter: &str| -> Vec<String> {
         let sql = format!("SELECT TO_CHAR(ID) FROM {from} WHERE {filter} ORDER BY ID");
         conn.query_columns(&sql)
@@ -1033,6 +1039,25 @@ pub fn assert_filters_match_native_copy(
             ids(conn, table, filter),
             ids(conn, NATIVE_COPY, filter),
             "WHERE {filter} on {table} must select the rows native Exasol selects"
+        );
+    }
+}
+
+/// Each query names its table as `{}`. It must return the same columns, in the same order, over
+/// the virtual `table` as over a native copy of `columns`, so a query that needs a row order
+/// carries its own `ORDER BY`.
+pub fn assert_queries_match_native_copy(
+    conn: &mut ExaConn,
+    table: &str,
+    columns: &str,
+    queries: &[&str],
+) {
+    create_native_copy(conn, table, columns);
+    for query in queries {
+        assert_eq!(
+            conn.query_columns(&query.replace("{}", table)),
+            conn.query_columns(&query.replace("{}", NATIVE_COPY)),
+            "{query} on {table} must return what native Exasol returns"
         );
     }
 }

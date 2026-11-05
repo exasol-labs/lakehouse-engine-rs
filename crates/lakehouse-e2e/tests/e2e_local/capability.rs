@@ -11,7 +11,8 @@ use crate::common::seed::{
 };
 use crate::common::timestamp_precision::expected_timestamp_precision;
 use crate::fixtures::{
-    LAKEHOUSE_VS, events_table, lakehouse_vs, typed_table, vs_dim_table, vs_fact_table,
+    LAKEHOUSE_VS, assert_pushed_to_scan_udf, events_table, lakehouse_vs, typed_table, vs_dim_table,
+    vs_fact_table,
 };
 
 /// The fix's measured worst-case divergence from native Exasol is ~1 ULP (3.17e-16).
@@ -3087,27 +3088,153 @@ fn e2e_declined_filter_select_star_returns_full_row_shape() {
     );
 }
 
+/// Native Exasol raises this for a value that is no hash, and the virtual table must raise it too.
+const INVALID_HASH_ERROR_PREFIX: &str = "data exception - Invalid hash format: ";
+
+/// Every column of `TYPED_DISTINCT_PROBE` after `ID`, in declared order.
+const TYPED_COLUMNS: &str =
+    "C_DECIMAL_A, C_DECIMAL_B, C_DOUBLE, C_VARCHAR, C_DATE, C_TS, C_BOOL, C_PRICE, C_QTY";
+
+/// Scenario: CAST renders the mapped target type per dialect
 #[test]
-fn e2e_both_dialects_unrenderable_predicate_errors_without_rows() {
+fn cast_to_a_non_emittable_target_matches_native() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let table = typed_table();
+
+    // A cast of `C_VARCHAR` itself raises on this fixture, so each filter casts a value that
+    // converts, or a difference of timestamps.
+    assert_filters_match_native_copy(
+        &mut conn,
+        &table,
+        "C_VARCHAR, C_TS",
+        &[
+            "CAST(CASE WHEN C_VARCHAR = 'aa' THEN 'POINT (1 2)' END AS GEOMETRY) IS NULL",
+            "CAST(CASE WHEN C_VARCHAR = 'aa' THEN '00000000000000000000000000000000' END AS HASHTYPE) IS NULL",
+            "CAST(C_TS - C_TS AS INTERVAL DAY(2) TO SECOND(3)) IS NOT NULL",
+        ],
+    );
+
+    // The error names the first offending value and the wrapper's alias of the cast column,
+    // and the first value depends on row order, so only the leading text is compared.
+    let query = "SELECT ID, CAST(C_VARCHAR AS HASHTYPE) FROM {}";
+    let virtual_error = error_text(
+        &conn.try_execute(&query.replace("{}", &table)),
+        &format!("{query} over the virtual table"),
+    );
+    create_native_copy(&mut conn, &table, "C_VARCHAR");
+    let native_error = error_text(
+        &conn.try_execute(&query.replace("{}", NATIVE_COPY)),
+        &format!("{query} over the native copy"),
+    );
+    for (path, text) in [("virtual", virtual_error), ("native", native_error)] {
+        assert!(
+            text.starts_with(INVALID_HASH_ERROR_PREFIX),
+            "the {path} error must start with {INVALID_HASH_ERROR_PREFIX:?}, got: {text}"
+        );
+    }
+}
+
+/// Scenario: An INTERVAL, GEOMETRY, or HASHTYPE select-list item, or a TIMESTAMP WITH LOCAL TIME ZONE aggregate or GROUP BY key, is computed by Exasol over the sharded scan
+/// Scenario: The Exasol dialect renders a CHAR CAST target as CHAR, not VARCHAR
+/// Scenario: Empty-result shape matches the plan the non-empty path would commit to
+#[test]
+fn non_emittable_select_items_match_native() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let table = typed_table();
+
+    let scanned = [
+        "SELECT ID, C_TS - C_TS FROM {} ORDER BY ID",
+        "SELECT C_TS - C_TS, COUNT(*) FROM {} GROUP BY C_TS - C_TS",
+        "SELECT MIN(C_TS - C_TS) FROM {}",
+        "SELECT MIN(CAST(C_TS AS TIMESTAMP WITH LOCAL TIME ZONE)) FROM {}",
+        // The INTERVAL item routes both ASCII casts into the Exasol-dialect wrapper.
+        "SELECT ID, C_TS - C_TS, CAST(C_VARCHAR AS VARCHAR(10) ASCII), \
+         CAST(C_VARCHAR AS CHAR(5) ASCII) FROM {} ORDER BY ID",
+        "SELECT ID, CAST(CASE WHEN C_VARCHAR = 'aa' THEN 'POINT (1 2)' END AS GEOMETRY) \
+         FROM {} ORDER BY ID",
+        "SELECT ID, CAST(CASE WHEN C_VARCHAR = 'aa' THEN '00000000000000000000000000000000' \
+         END AS HASHTYPE) FROM {} ORDER BY ID",
+        // The pairs of `cc` rows hold different timestamps, so the interval is not always zero.
+        "SELECT a.ID, b.ID, a.C_TS - b.C_TS FROM {} a JOIN {} b ON a.C_VARCHAR = b.C_VARCHAR \
+         ORDER BY a.ID, b.ID",
+    ];
+    let pruned = "SELECT C_TS - C_TS, COUNT(*) FROM {} WHERE ID < 0 GROUP BY C_TS - C_TS";
+    let queries: Vec<&str> = scanned.iter().copied().chain([pruned]).collect();
+    assert_queries_match_native_copy(&mut conn, &table, TYPED_COLUMNS, &queries);
+
+    for query in scanned {
+        assert_pushed_to_scan_udf(&mut conn, &query.replace("{}", &table), query);
+    }
+    let pruned_sql = pruned.replace("{}", &table);
+    assert_eq!(
+        conn.query_row_count(&pruned_sql),
+        0,
+        "{pruned_sql} must return no rows"
+    );
+    assert!(
+        !explain_virtual_sql(&mut conn, &pruned_sql).contains(SCAN_SCRIPT_NAME),
+        "{pruned_sql} prunes every file, so its pushdown must not name {SCAN_SCRIPT_NAME}"
+    );
+}
+
+/// Scenario: A NULL select item in an Exasol-rendered wrapper keeps its declared type
+#[test]
+fn typed_null_select_item_keeps_its_declared_type() {
     lakehouse_vs();
     let mut conn = exa_conn();
 
     let sql = format!(
-        "SELECT ID FROM {} WHERE CAST(C_VARCHAR AS HASHTYPE) = \
-         CAST('00000000000000000000000000000000' AS HASHTYPE)",
+        "SELECT ID, CAST(NULL AS GEOMETRY) FROM {} ORDER BY ID",
         typed_table()
     );
-    let msg = error_text(
-        &conn.try_execute(&sql),
-        &format!("a WHERE predicate unrenderable under both dialects ({sql})"),
+    let resp = conn.execute(&sql);
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    assert_eq!(
+        result_set["columns"][1]["dataType"]["type"].as_str(),
+        Some("GEOMETRY"),
+        "the NULL item must keep the GEOMETRY type Exasol declared for it: {resp}"
+    );
+    let columns = conn.fetch_result_columns(result_set);
+    assert_eq!(
+        columns[1].len(),
+        12,
+        "one row per seeded row expected: {columns:?}"
     );
     assert!(
-        !msg.contains("lhadminsecret123"),
-        "adapter error message must not leak storage credentials: {msg}"
+        columns[1].iter().all(serde_json::Value::is_null),
+        "every row of CAST(NULL AS GEOMETRY) must be NULL: {columns:?}"
     );
-    assert!(
-        msg.to_ascii_lowercase().contains("neither dialect"),
-        "adapter error must name the both-dialects-declined reason, got: {msg}"
+}
+
+/// Scenario: Every request of a supported Exasol version passes the strict type check
+#[test]
+fn strict_type_check_accepts_every_request_shape() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let table = typed_table();
+
+    // `SELECT *` sends no `selectList`, a bare TIMESTAMP cast arrives on 8.x without a
+    // precision, and a UTF8 VARCHAR arrives without a `characterSet`.
+    assert_queries_match_native_copy(
+        &mut conn,
+        &table,
+        TYPED_COLUMNS,
+        &[
+            "SELECT * FROM {} ORDER BY ID",
+            "SELECT ID, CAST(C_TS AS TIMESTAMP) FROM {} ORDER BY ID",
+            "SELECT ID, CAST(C_VARCHAR AS VARCHAR(2000000)) FROM {} ORDER BY ID",
+        ],
+    );
+
+    // Exasol sends an empty `selectList` for `RANDOM()`, and its values differ per run.
+    let random = "SELECT RANDOM() FROM {}";
+    create_native_copy(&mut conn, &table, TYPED_COLUMNS);
+    assert_eq!(
+        conn.query_row_count(&random.replace("{}", &table)),
+        conn.query_row_count(&random.replace("{}", NATIVE_COPY)),
+        "{random} must return as many rows as native Exasol"
     );
 }
 

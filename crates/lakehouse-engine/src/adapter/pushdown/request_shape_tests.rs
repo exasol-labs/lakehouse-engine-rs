@@ -1,6 +1,7 @@
 use super::super::test_support::*;
 use super::*;
 use crate::types::exasol_type::ExasolType;
+use serde_json::Value as Json;
 
 fn col_types() -> ColumnTypes {
     column_types(&[
@@ -12,18 +13,14 @@ fn col_types() -> ColumnTypes {
 
 #[test]
 fn grouped_numeric_aggregate_classifies_as_grouped() {
-    let req = serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [col("REGION")],
-        "selectList": [
-            col("REGION"),
+    let req = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
+        .group_by(vec![col("REGION")])
+        .column(col("REGION"))
+        .item(
             agg_item("SUM", Some("AMOUNT"), false),
-        ],
-        "selectListDataTypes": [
-            {"type": "varchar", "size": 2000000},
-            {"type": "decimal", "precision": 36, "scale": 2},
-        ],
-    });
+            ExasolType::decimal(36, 2),
+        )
+        .build_pushdown();
     let shape = classify_request_shape(&req, &col_types());
     assert!(
         matches!(shape, RequestShape::Grouped { having: None, .. }),
@@ -33,14 +30,14 @@ fn grouped_numeric_aggregate_classifies_as_grouped() {
 
 #[test]
 fn grouped_non_numeric_without_having_falls_through_to_wrapper() {
-    let req = serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [col("REGION")],
-        "selectList": [
-            col("REGION"),
+    let req = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
+        .group_by(vec![col("REGION")])
+        .column(col("REGION"))
+        .item(
             agg_item("SUM", Some("NAME"), false),
-        ],
-    });
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let shape = classify_request_shape(&req, &col_types());
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
@@ -50,15 +47,15 @@ fn grouped_non_numeric_without_having_falls_through_to_wrapper() {
 
 #[test]
 fn grouped_non_numeric_with_having_falls_through_to_wrapper() {
-    let req = serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [col("REGION")],
-        "selectList": [
-            col("REGION"),
+    let req = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
+        .group_by(vec![col("REGION")])
+        .field("having", serde_json::json!({"type": "predicate_greater"}))
+        .column(col("REGION"))
+        .item(
             agg_item("SUM", Some("NAME"), false),
-        ],
-        "having": {"type": "predicate_greater"},
-    });
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let shape = classify_request_shape(&req, &col_types());
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
@@ -68,19 +65,19 @@ fn grouped_non_numeric_with_having_falls_through_to_wrapper() {
 
 #[test]
 fn grouped_having_unmatched_aggregate_falls_through_to_wrapper() {
-    let req = serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [col("REGION")],
-        "selectList": [
-            col("REGION"),
-            agg_item("COUNT", None, false),
-        ],
-        "having": {
-            "type": "predicate_greater",
-            "left": agg_item("SUM", Some("AMOUNT"), false),
-            "right": num_lit(10),
-        },
-    });
+    let req = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
+        .group_by(vec![col("REGION")])
+        .field(
+            "having",
+            serde_json::json!({
+                "type": "predicate_greater",
+                "left": agg_item("SUM", Some("AMOUNT"), false),
+                "right": num_lit(10),
+            }),
+        )
+        .column(col("REGION"))
+        .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+        .build_pushdown();
     let shape = classify_request_shape(&req, &col_types());
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
@@ -90,29 +87,29 @@ fn grouped_having_unmatched_aggregate_falls_through_to_wrapper() {
 
 #[test]
 fn grouped_having_mixed_junction_falls_through_to_wrapper() {
-    let req = serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [col("REGION")],
-        "selectList": [
-            col("REGION"),
-            agg_item("COUNT", None, false),
-        ],
-        "having": {
-            "type": "predicate_and",
-            "expressions": [
-                {
-                    "type": "predicate_greater",
-                    "left": agg_item("COUNT", None, false),
-                    "right": num_lit(0),
-                },
-                {
-                    "type": "predicate_greater",
-                    "left": agg_item("SUM", Some("AMOUNT"), false),
-                    "right": num_lit(10),
-                },
-            ],
-        },
-    });
+    let req = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
+        .group_by(vec![col("REGION")])
+        .field(
+            "having",
+            serde_json::json!({
+                "type": "predicate_and",
+                "expressions": [
+                    {
+                        "type": "predicate_greater",
+                        "left": agg_item("COUNT", None, false),
+                        "right": num_lit(0),
+                    },
+                    {
+                        "type": "predicate_greater",
+                        "left": agg_item("SUM", Some("AMOUNT"), false),
+                        "right": num_lit(10),
+                    },
+                ],
+            }),
+        )
+        .column(col("REGION"))
+        .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+        .build_pushdown();
     let shape = classify_request_shape(&req, &col_types());
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
@@ -122,19 +119,22 @@ fn grouped_having_mixed_junction_falls_through_to_wrapper() {
 
 #[test]
 fn grouped_having_fully_matched_stays_grouped() {
-    let req = serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [col("REGION")],
-        "selectList": [
-            col("REGION"),
+    let req = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
+        .group_by(vec![col("REGION")])
+        .field(
+            "having",
+            serde_json::json!({
+                "type": "predicate_greater",
+                "left": agg_item("SUM", Some("AMOUNT"), false),
+                "right": num_lit(10),
+            }),
+        )
+        .column(col("REGION"))
+        .item(
             agg_item("SUM", Some("AMOUNT"), false),
-        ],
-        "having": {
-            "type": "predicate_greater",
-            "left": agg_item("SUM", Some("AMOUNT"), false),
-            "right": num_lit(10),
-        },
-    });
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let shape = classify_request_shape(&req, &col_types());
     match shape {
         RequestShape::Grouped {
@@ -155,19 +155,19 @@ fn grouped_having_fully_matched_stays_grouped() {
 
 #[test]
 fn grouped_having_distinct_aggregate_falls_through_to_wrapper() {
-    let req = serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [col("REGION")],
-        "selectList": [
-            col("REGION"),
-            agg_item("COUNT", None, false),
-        ],
-        "having": {
-            "type": "predicate_greater",
-            "left": agg_item("COUNT", Some("ID"), true),
-            "right": num_lit(1),
-        },
-    });
+    let req = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
+        .group_by(vec![col("REGION")])
+        .field(
+            "having",
+            serde_json::json!({
+                "type": "predicate_greater",
+                "left": agg_item("COUNT", Some("ID"), true),
+                "right": num_lit(1),
+            }),
+        )
+        .column(col("REGION"))
+        .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+        .build_pushdown();
     let shape = classify_request_shape(&req, &col_types());
     assert!(
         matches!(shape, RequestShape::GroupByWrapper),
@@ -177,18 +177,17 @@ fn grouped_having_distinct_aggregate_falls_through_to_wrapper() {
 
 #[test]
 fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only() {
-    let req = serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [col("REGION")],
-        "selectList": [col("REGION")],
-        "orderBy": [{
+    let req = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
+        .group_by(vec![col("REGION")])
+        .order_by(serde_json::json!([{
             "type": "order_by_element",
             "expression": agg_item("SUM", Some("AMOUNT"), false),
             "isAscending": false,
             "nullsLast": true,
-        }],
-        "limit": 5,
-    });
+        }]))
+        .field("limit", serde_json::json!(5))
+        .column(col("REGION"))
+        .build_pushdown();
     assert!(
         detect_group_by_aggregates(&req)
             .expect("a group-key-only select list still detects as grouped")
@@ -205,20 +204,17 @@ fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only
 
 #[test]
 fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper() {
-    let req = serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [col("REGION")],
-        "selectList": [
-            col("REGION"),
-            agg_item("COUNT", None, false),
-        ],
-        "orderBy": [{
+    let req = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
+        .group_by(vec![col("REGION")])
+        .order_by(serde_json::json!([{
             "type": "order_by_element",
             "expression": agg_item("SUM", Some("AMOUNT"), false),
             "isAscending": false,
             "nullsLast": true,
-        }],
-    });
+        }]))
+        .column(col("REGION"))
+        .item(agg_item("COUNT", None, false), ExasolType::WIDEST_VARCHAR)
+        .build_pushdown();
     assert_eq!(
         detect_group_by_aggregates(&req)
             .expect("grouped aggregate")
@@ -236,20 +232,20 @@ fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper
 
 #[test]
 fn grouped_order_by_group_key_classifies_grouped_with_resolved_clause() {
-    let req = serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [col("REGION")],
-        "selectList": [
-            col("REGION"),
-            agg_item("SUM", Some("AMOUNT"), false),
-        ],
-        "orderBy": [{
+    let req = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
+        .group_by(vec![col("REGION")])
+        .order_by(serde_json::json!([{
             "type": "order_by_element",
             "expression": col("REGION"),
             "isAscending": true,
             "nullsLast": true,
-        }],
-    });
+        }]))
+        .column(col("REGION"))
+        .item(
+            agg_item("SUM", Some("AMOUNT"), false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     match classify_request_shape(&req, &col_types()) {
         RequestShape::Grouped { order_by, .. } => assert_eq!(
             order_by.as_deref(),
@@ -262,9 +258,12 @@ fn grouped_order_by_group_key_classifies_grouped_with_resolved_clause() {
 
 #[test]
 fn single_group_numeric_aggregate_classifies_as_single_group() {
-    let req = serde_json::json!({
-        "selectList": [agg_item("SUM", Some("AMOUNT"), false)],
-    });
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            agg_item("SUM", Some("AMOUNT"), false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let shape = classify_request_shape(&req, &col_types());
     match shape {
         RequestShape::SingleGroupAgg {
@@ -277,9 +276,12 @@ fn single_group_numeric_aggregate_classifies_as_single_group() {
 
 #[test]
 fn single_group_count_distinct_classifies_as_single_group() {
-    let req = serde_json::json!({
-        "selectList": [agg_item("COUNT", Some("ID"), true)],
-    });
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            agg_item("COUNT", Some("ID"), true),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let shape = classify_request_shape(&req, &col_types());
     assert!(
         matches!(shape, RequestShape::SingleGroupAgg { .. }),
@@ -289,12 +291,16 @@ fn single_group_count_distinct_classifies_as_single_group() {
 
 #[test]
 fn plain_projection_classifies_as_row_scan() {
-    let req = serde_json::json!({
-        "selectList": [
-            col("REGION"),
-            col("AMOUNT"),
+    let req = pushdown_request(
+        "T",
+        &[
+            ("REGION", ExasolType::WIDEST_VARCHAR),
+            ("AMOUNT", ExasolType::WIDEST_VARCHAR),
         ],
-    });
+    )
+    .column(col("REGION"))
+    .column(col("AMOUNT"))
+    .build_pushdown();
     let shape = classify_request_shape(&req, &col_types());
     assert!(
         matches!(shape, RequestShape::RowScan),
@@ -302,12 +308,20 @@ fn plain_projection_classifies_as_row_scan() {
     );
 }
 
-fn single_group(select_list: Json, having: Option<Json>) -> Json {
-    serde_json::json!({
-        "aggregationType": "single_group",
-        "selectList": select_list,
-        "having": having,
-    })
+/// Every item declared `VARCHAR(2000000)`: the classification reads no item type.
+fn single_group(select_list: Json, having: Option<Json>) -> PushdownRequest {
+    let items = select_list.as_array().expect("a select-list array").clone();
+    let request = items
+        .into_iter()
+        .fold(pushdown_request("T", NO_COLUMNS), |request, item| {
+            request.item(item, ExasolType::WIDEST_VARCHAR)
+        })
+        .field("aggregationType", "single_group");
+    let request = match having {
+        Some(having) => request.field("having", having),
+        None => request,
+    };
+    request.build_pushdown()
 }
 
 fn count_greater_than(n: i64) -> Json {
@@ -362,7 +376,8 @@ fn single_group_that_does_not_split_never_classifies_as_row_scan() {
         let shape = classify_request_shape(&req, &col_types());
         assert!(
             matches!(shape, RequestShape::SingleGroupWrapper),
-            "{req}: {shape:?}"
+            "{}: {shape:?}",
+            req.json()
         );
     }
 }

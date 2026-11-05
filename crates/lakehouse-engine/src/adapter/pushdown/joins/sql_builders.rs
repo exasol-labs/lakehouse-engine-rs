@@ -9,9 +9,10 @@ use vs_expression::{render_df_filter_safe, render_expression_safe, strip_table_a
 
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
-    ColumnTypes, ProjectedColumn, build_scan_driving_sql, classify_where_filter,
-    collect_all_column_names, extract_limit, extract_offset, project_columns, projection_items,
-    quote_ident, render_limit_offset, scan_storage_for, shard_count,
+    ColumnTypes, ProjectedColumn, PushdownRequest, build_scan_driving_sql, cast_to_declared_type,
+    classify_where_filter, collect_all_column_names, extract_limit, extract_offset,
+    project_columns, projection_items, quote_ident, render_limit_offset, scan_storage_for,
+    shard_count,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_flags, wrap_declined_order_by};
 use super::attribution::{JoinLegs, UnattributableColumn};
@@ -52,7 +53,7 @@ pub(crate) struct RenderedJoinPushdown {
 /// resolved `sides`' maps keyed by the same pairs, so legs may share column names: the scan
 /// aliases each relation with the alias the join block carries for it.
 pub(crate) fn render_broadcast_join(
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
 ) -> Result<Option<RenderedJoinPushdown>, UdfError> {
@@ -60,7 +61,7 @@ pub(crate) fn render_broadcast_join(
     let condition_tree = legs
         .qualify_every_column(&join.conditions[0])
         .map_err(unattributable_decline)?;
-    let qualified_req = qualify_broadcast_clauses(pushdown_req, &legs)?;
+    let qualified = pushdown.with_json(qualify_broadcast_clauses(pushdown.json(), &legs)?);
     // Not the filter renderer, which would suppress a trivially-true boolean.
     let Some(condition) = render_expression_safe(&condition_tree) else {
         return Ok(None);
@@ -72,13 +73,13 @@ pub(crate) fn render_broadcast_join(
             .enumerate()
             .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
     );
-    let filter_json = qualified_req.get("filter").filter(|f| !f.is_null());
+    let filter_json = qualified.json().get("filter").filter(|f| !f.is_null());
     let (filter, declined) = classify_where_filter(filter_json, &col_types);
     if declined.is_some() {
         return Ok(None);
     }
 
-    let (projection, widened) = project_columns(&qualified_req, &col_types)?;
+    let (projection, widened) = project_columns(&qualified, &col_types)?;
     // A widened projection is the full two-table row, the wrong shape for a broadcast fan-out
     // (#196).
     if widened
@@ -93,7 +94,7 @@ pub(crate) fn render_broadcast_join(
         condition,
         filter,
         projection,
-        window: classify_join_window(&qualified_req),
+        window: classify_join_window(qualified.json()),
     }))
 }
 
@@ -227,23 +228,33 @@ fn render_self_applied_where(
     )))
 }
 
-/// An absent/empty select list projects every column of every leg.
+/// An absent/empty select list projects every column of every leg. Exasol sends
+/// `CAST(NULL AS <type>)` as a bare NULL item and checks its column against `<type>`, so that
+/// item renders cast to its declared type: a bare NULL would take a type Exasol infers itself.
 fn n_scan_join_select_items(
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     legs: &JoinLegs,
     cols_per_leg: &[&ColumnTypes],
 ) -> Result<Vec<ProjectionItem>, UdfError> {
-    match pushdown_req.get("selectList") {
+    match pushdown.json().get("selectList") {
         Some(Json::Array(list)) if !list.is_empty() => {
             let mut items = Vec::with_capacity(list.len());
-            for item in list {
-                let sql = render_expression_qualified(item, legs)
-                    .map_err(unattributable_decline)?
-                    .ok_or_else(|| {
-                        join_render_decline(
-                            "a select-list item could not be rendered for the qualified N-scan join",
-                        )
+            for (select_index, item) in list.iter().enumerate() {
+                let sql = if item.get("type").and_then(Json::as_str) == Some("literal_null") {
+                    let declared = pushdown.select_type(select_index).ok_or_else(|| {
+                        join_render_decline("a NULL select-list item has no declared type")
                     })?;
+                    cast_to_declared_type("NULL", declared)
+                } else {
+                    render_expression_qualified(item, legs)
+                        .map_err(unattributable_decline)?
+                        .ok_or_else(|| {
+                            join_render_decline(
+                                "a select-list item could not be rendered for the qualified \
+                                 N-scan join",
+                            )
+                        })?
+                };
                 items.push(ProjectionItem::Expr { expr: sql });
             }
             Ok(items)
@@ -261,11 +272,12 @@ struct OuterWrapperClauses {
 }
 
 fn outer_wrapper_clauses(
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     legs: &JoinLegs,
     cols_per_leg: &[&ColumnTypes],
 ) -> Result<OuterWrapperClauses, UdfError> {
-    let select_items = n_scan_join_select_items(pushdown_req, legs, cols_per_leg)?;
+    let pushdown_req = pushdown.json();
+    let select_items = n_scan_join_select_items(pushdown, legs, cols_per_leg)?;
     let group_by = qualified_join_group_by(pushdown_req, legs)?;
     let having = qualified_join_having(pushdown_req, legs)?;
     let order_by = qualified_join_order_by(pushdown_req, legs)?;
@@ -319,7 +331,7 @@ fn outer_wrapper_clauses(
 /// residual neither dialect renders: a predicate applicable nowhere must fail the query.
 #[allow(clippy::too_many_arguments)]
 pub(in super::super) fn build_n_scan_join_sql(
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
     inputs: &JoinScanRequestConfig<'_>,
@@ -358,6 +370,7 @@ pub(in super::super) fn build_n_scan_join_sql(
         conditions.push(rendered);
     }
 
+    let pushdown_req = pushdown.json();
     let where_filter = pushdown_req.get("filter").filter(|f| !f.is_null());
     let leg_eligible = where_filter.and_then(renderable_only);
 
@@ -404,7 +417,7 @@ pub(in super::super) fn build_n_scan_join_sql(
     };
 
     let OuterWrapperClauses { select, trailing } =
-        outer_wrapper_clauses(pushdown_req, &legs, &cols_per_side)?;
+        outer_wrapper_clauses(pushdown, &legs, &cols_per_side)?;
 
     let (from, residual_conditions) =
         build_n_scan_join_from(&fan_outs, &legs, &join.conditions, &conditions);
@@ -804,7 +817,7 @@ impl<'a> FanOutProjection<'a> {
 /// `None` alongside it so it applies exactly once.
 pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Into<FileEntry>>(
     request: &Json,
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     fan_out: &FanOutProjection<'_>,
     shards: &[Vec<E>],
     udf_name: &str,
@@ -817,7 +830,7 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
     let alias = legs.leg_alias(0);
 
     let OuterWrapperClauses { select, trailing } =
-        outer_wrapper_clauses(pushdown_req, &legs, &[fan_out.columns])?;
+        outer_wrapper_clauses(pushdown, &legs, &[fan_out.columns])?;
 
     let fan_out = build_scan_driving_sql(
         fan_out_spec,
@@ -852,7 +865,7 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
 #[allow(clippy::too_many_arguments)]
 pub(in super::super) fn qualified_single_table_fallback_pushdown(
     request: &Json,
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     base: &CommonScanSpec,
     filter: Option<String>,
     shards: &[Vec<FileEntry>],
@@ -861,7 +874,7 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
     distribute_udf_name: &str,
     declined_filter: Option<&Json>,
 ) -> Result<Json, UdfError> {
-    let referenced = referenced_columns(pushdown_req, col_types);
+    let referenced = referenced_columns(pushdown.json(), col_types);
     let fan_out = FanOutProjection::new(
         CommonScanSpec {
             filter,
@@ -876,7 +889,7 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
     );
     let sql = build_qualified_single_table_fallback_sql(
         request,
-        pushdown_req,
+        pushdown,
         &fan_out,
         shards,
         udf_name,
@@ -906,9 +919,9 @@ impl EmptyRelation {
         }
     }
 
-    pub(in super::super) fn pushdown(&self, pushdown_req: &Json) -> Result<Json, UdfError> {
+    pub(in super::super) fn pushdown(&self, pushdown: &PushdownRequest) -> Result<Json, UdfError> {
         let OuterWrapperClauses { select, trailing } = outer_wrapper_clauses(
-            pushdown_req,
+            pushdown,
             &self.legs,
             &self.cols_per_leg.iter().collect::<Vec<_>>(),
         )?;
