@@ -62,7 +62,7 @@ Each table format resolves a pushdown table in two steps. The load depends on ne
 
 ### Context
 
-Exasol runs one adapter VM per statement and virtual schema, so state kept in the VM lives for one statement. Several references to one table in a statement can then share their loads.
+Exasol runs one adapter VM per statement, so state kept in the VM lives for one statement. Several references to one table in a statement can then share their loads.
 
 ### Decision
 

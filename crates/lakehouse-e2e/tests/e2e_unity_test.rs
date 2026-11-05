@@ -2575,7 +2575,6 @@ fn delta_single_group_aggregates_match_the_oracle() {
     assert_single_group_aggregates_match_oracle(&mut exa_conn(), Format::Delta);
 }
 
-const PROXY_ADAPTER_SCHEMA: &str = "LHVS_PROXY";
 const VS_PROXY: &str = "UNITY_PROXY_VS";
 
 /// Creates, once, the Unity virtual schema whose catalog and storage requests only the forward
@@ -2588,7 +2587,7 @@ fn create_proxy_virtual_schema() {
         let mut conn = exa_conn();
         create_proxied_schema_and_scripts(
             &mut conn,
-            PROXY_ADAPTER_SCHEMA,
+            stack::PROXY_ADAPTER_SCHEMA,
             &proxy,
             &proxy,
             &[stack::UNITY_CATALOG_VIA_PROXY, stack::SEAWEEDFS_VIA_PROXY],
@@ -2596,7 +2595,7 @@ fn create_proxy_virtual_schema() {
         create_virtual_schema_with_password(
             &mut conn,
             &VsProps::new(VS_PROXY, UNITY_NAMESPACE)
-                .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
+                .with_adapter_schema(stack::PROXY_ADAPTER_SCHEMA)
                 .with_catalog_kind("UNITY_CATALOG")
                 .with_catalog_conn_name("UNITY_PROXY_CREDS"),
             stack::UNITY_CATALOG_VIA_PROXY,

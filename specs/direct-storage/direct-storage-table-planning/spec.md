@@ -71,4 +71,3 @@ The adapter resolves a directory of Parquet files into the engine's `ScanSpec` a
 * *GIVEN* a virtual schema with `CATALOG_KIND = 'DIRECT_STORAGE'` and a pushdown request over one of its tables
 * *WHEN* the adapter loads the table
 * *THEN* the adapter SHALL compose the table root from the CONNECTION address, the `NAMESPACE` property, and the directory name that the table's identifier note records, and SHALL list the files under that root
-* *AND* the error text that refuses a table with no mappable column or with a refused partition column SHALL name the virtual table instead of a format label

@@ -55,9 +55,9 @@ async fn resolve_rest(
     .await
 }
 
-/// Scenario: The Iceberg format reader owns file resolution and binds columns by field-id
+/// Scenario: An Iceberg scan carries its delete references and binds columns by field-id
 #[tokio::test]
-async fn iceberg_reader_owns_resolution_and_keeps_its_encoding() {
+async fn an_iceberg_scan_keeps_its_field_id_encoding() {
     let storage = sample_storage();
     let body = name_mapped_load_table_body().to_string();
     let resolved = resolve_rest(body, "db.t", &sigv4_creds(), &storage, None)

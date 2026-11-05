@@ -12,8 +12,7 @@ use super::delta_replay::DeltaSnapshot;
 use super::unity_table_storage::{UnityTableStorage, redacted};
 use super::{LoadedTable, PlannedFiles, hex_binary_partition_values};
 use crate::adapter::column_notes::DeclaredSchema;
-use crate::scan::build_table_root_store;
-use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, FileEntry, LogicalField};
+use crate::scan::spec::{FileEntry, LogicalField};
 use lakehouse_catalog::StorageBackend;
 
 #[cfg(test)]
@@ -34,22 +33,14 @@ impl DeltaTable {
     pub(in crate::adapter::pushdown) async fn open(
         storage: UnityTableStorage<'_>,
     ) -> Result<Self, UdfError> {
-        let (table_root, effective_storage) = storage.resolve().await?;
+        let (table_root, effective_storage, store) = storage.open_store().await?;
         // This layer made the credential decision, so it knows which secrets an object-store
         // error could echo; replay and schema know none.
         let secrets = effective_storage.secret_values();
-        let redact = |error: UdfError| redacted(error, &secrets);
-        let store = build_table_root_store(
-            &effective_storage,
-            table_root,
-            DEFAULT_S3_MAX_CONNECTIONS,
-            &secrets,
-        )
-        .map_err(redact)?;
         let root = table_root.to_string();
         let snapshot = off_the_runtime(move || DeltaSnapshot::open(store, &root))
             .await
-            .map_err(redact)?;
+            .map_err(|error| redacted(error, &secrets))?;
         Ok(Self {
             snapshot: Arc::new(snapshot),
             table_root: table_root.to_string(),

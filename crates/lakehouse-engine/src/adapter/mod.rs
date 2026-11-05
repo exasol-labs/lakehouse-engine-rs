@@ -222,8 +222,7 @@ fn handle_create_virtual_schema(
         }
     };
 
-    let client =
-        construct_catalog_client(&config, &props).map_err(|e| redact_error(&config.storage, e))?;
+    let client = construct_catalog_client(&config, &props)?;
     let (listing, skipped_tables) = rt
         .block_on(list_source(
             client.as_ref(),
@@ -438,8 +437,16 @@ fn adapter_note(request: &Json, key: &str) -> Option<String> {
 }
 
 /// The only site that matches a [`CatalogKind`] to build a client or load a table; the listing
-/// pipeline and the pushdown scan load after it never re-match the kind. Issues no request.
+/// pipeline and the pushdown scan load after it never re-match the kind. Issues no request, and
+/// redacts a construction error against the CONNECTION's storage secrets.
 fn construct_catalog_client(
+    config: &ResolvedConnectionConfig,
+    props: &Json,
+) -> Result<Box<dyn ScanCatalog>, UdfError> {
+    client_of_kind(config, props).map_err(|e| redact_error(&config.storage, e))
+}
+
+fn client_of_kind(
     config: &ResolvedConnectionConfig,
     props: &Json,
 ) -> Result<Box<dyn ScanCatalog>, UdfError> {

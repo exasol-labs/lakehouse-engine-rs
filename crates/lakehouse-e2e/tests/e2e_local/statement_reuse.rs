@@ -8,7 +8,8 @@ use crate::common::e2e_harness::{
 use crate::common::pos_delete_fixtures::NAMESPACE;
 use crate::common::seed::{E2E_TABLE, SEED_TOTAL_ROWS};
 use crate::common::stack::{
-    ICEBERG_REST_VIA_PROXY, SEAWEEDFS_VIA_PROXY, count_proxy_requests, iceberg_catalog_url_internal,
+    ICEBERG_REST_VIA_PROXY, PROXY_ADAPTER_SCHEMA, SEAWEEDFS_VIA_PROXY, count_proxy_requests,
+    iceberg_catalog_url_internal,
 };
 use crate::fixtures::{
     PROXY_DIRECT_VS, PROXY_ICEBERG_VS, PROXY_ROLE_VS, append_file, count, drop_table_if_exists,
@@ -18,7 +19,6 @@ use crate::fixtures::{
 
 use iceberg::NamespaceIdent;
 
-const ADAPTER_SCHEMA: &str = "LHVS_PROXY";
 const LATER_NAMESPACE: &str = "e2e_statement_reuse_later";
 const LATER_TABLE: &str = "later";
 const LATER_VS: &str = "REUSE_LATER_VS";
@@ -48,7 +48,7 @@ fn events_of(vs_name: &str) -> String {
 fn a_script_reloads_the_table_for_each_of_its_statements() {
     proxy_virtual_schemas();
     let events = events_of(PROXY_ICEBERG_VS);
-    let script = format!("{ADAPTER_SCHEMA}.RELOAD_PER_STATEMENT");
+    let script = format!("{PROXY_ADAPTER_SCHEMA}.RELOAD_PER_STATEMENT");
     let mut conn = exa_conn();
     conn.execute(&format!(
         "CREATE OR REPLACE LUA SCRIPT {script}() AS\n\
@@ -68,6 +68,7 @@ fn a_script_reloads_the_table_for_each_of_its_statements() {
 }
 
 /// Scenario: The pushdowns of one statement share one catalog session per virtual schema
+/// Scenario: Single-table pushdown builds one catalog session and reuses it
 #[test]
 fn each_union_branch_pushes_the_sql_it_pushes_alone() {
     proxy_virtual_schemas();

@@ -30,7 +30,6 @@ The adapter authenticates to an Iceberg REST catalog and looks up its `/v1/confi
 * *WHEN* the adapter resolves every leg's file list
 * *THEN* the OAuth2 client-credentials grant and the `/v1/config` prefix lookup SHALL run at most once for the whole request, not once per leg
 * *AND* the adapter SHALL issue at most one `loadTable` GET per distinct table of the request, so a two-leg self-join issues one, and SHALL issue none for a table that an earlier pushdown of the statement loaded
-* *AND* the generated broadcast or N-scan join SQL MUST NOT depend on how many legs share a table, EXCEPT for each leg's `storage` VALUE, which `storage-access/scan-spec-credential-reference` encodes per side
 
 ### Scenario: Per-table loadTable GET is preserved so per-table vended credentials are returned
 

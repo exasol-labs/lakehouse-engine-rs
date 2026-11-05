@@ -1537,6 +1537,12 @@ fn a_statement_sends_one_token_request_and_one_batch_check() {
             .oauth2_server_uri
             .expect("the OAuth2 client-credentials CONNECTION names a token endpoint")
     );
+    let batch_check = format!(
+        "POST {}/management/v1/action/batch-check",
+        proxy_catalog_uri()
+            .strip_suffix("/catalog")
+            .expect("the catalog URI ends in /catalog")
+    );
     let events = format!("{VS_PROXY}.{}", E2E_TABLE.to_uppercase());
     let sql =
         format!("SELECT COUNT(*) FROM (SELECT id FROM {events} UNION ALL SELECT id FROM {events})");
@@ -1546,7 +1552,7 @@ fn a_statement_sends_one_token_request_and_one_batch_check() {
         [
             token.as_str(),
             &format!("GET {}/v1/config", proxy_catalog_uri()),
-            "POST http://lakekeeper-via-proxy:8181/management/v1/action/batch-check",
+            batch_check.as_str(),
             &format!("/namespaces/{E2E_NAMESPACE}/tables/{E2E_TABLE}?"),
         ],
         || rows = connect_as(ALLOWED_USER).query_scalar_i64(&sql),
@@ -1560,7 +1566,6 @@ fn a_statement_sends_one_token_request_and_one_batch_check() {
     );
 }
 
-const PROXY_ADAPTER_SCHEMA: &str = "LHVS_PROXY";
 const VS_PROXY: &str = "LAKEKEEPER_PROXY_VS";
 const VS_PROXY_VENDED: &str = "LAKEKEEPER_PROXY_VENDED_VS";
 
@@ -1594,7 +1599,7 @@ fn create_proxy_virtual_schema() {
         let mut sys = exa_conn();
         create_proxied_schema_and_scripts(
             &mut sys,
-            PROXY_ADAPTER_SCHEMA,
+            stack::PROXY_ADAPTER_SCHEMA,
             &proxy,
             &proxy,
             &[&proxy_catalog_uri(), &token_uri, &password.endpoint],
@@ -1603,7 +1608,7 @@ fn create_proxy_virtual_schema() {
         create_virtual_schema_with_password(
             &mut sys,
             &VsProps::new(VS_PROXY, E2E_NAMESPACE)
-                .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
+                .with_adapter_schema(stack::PROXY_ADAPTER_SCHEMA)
                 .with_catalog_conn_name("LAKEKEEPER_PROXY_CREDS")
                 .with_property("PERMISSION_CHECK", "LAKEKEEPER")
                 .with_property("USER_MAPPING", PERMISSION_USER_MAPPING),
@@ -1631,7 +1636,7 @@ fn lakekeeper_oauth_batch_check_and_vended_reads_go_through_the_proxy() {
     create_virtual_schema_with_password(
         &mut sys,
         &VsProps::new(VS_PROXY_VENDED, E2E_NAMESPACE)
-            .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
+            .with_adapter_schema(stack::PROXY_ADAPTER_SCHEMA)
             .with_catalog_conn_name("LAKEKEEPER_PROXY_VENDED_CREDS"),
         &proxy_catalog_uri(),
         &password_via_proxy(WAREHOUSE_VENDED, true),

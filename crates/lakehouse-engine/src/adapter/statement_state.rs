@@ -11,18 +11,18 @@ use tokio::runtime::Runtime;
 use tokio::sync::OnceCell;
 
 use crate::adapter::pushdown::{ConnectionStorage, LoadedTable, ScanCatalog};
-use crate::adapter::{ResolvedConnectionConfig, construct_catalog_client, redact_error};
+use crate::adapter::{ResolvedConnectionConfig, construct_catalog_client};
 
 #[cfg(test)]
 #[path = "statement_state_tests.rs"]
 mod tests;
 
-/// Lives as long as the adapter VM. Exasol runs one adapter VM per statement and virtual schema
-/// (#583), so no entry outlives its statement.
+/// Lives as long as the adapter VM. Exasol runs one adapter VM per statement (#583), so no entry
+/// outlives its statement.
 pub(crate) static STATEMENT_STATES: StatementStates<VirtualSchemaState> = StatementStates::new();
 
-/// States keyed by virtual schema name, so two virtual schemas never read each other's state, even
-/// when one VM serves both.
+/// States keyed by virtual schema name, because nothing establishes that one VM never serves two
+/// virtual schemas of a statement, and each must use its own CONNECTION.
 pub(crate) struct StatementStates<T> {
     states: Mutex<BTreeMap<String, Arc<T>>>,
 }
@@ -35,9 +35,10 @@ impl<T> StatementStates<T> {
     }
 
     /// The state kept under `name`, built on a miss. A failed build keeps nothing. Exasol names
-    /// the virtual schema in every pushdown, so a nameless request is malformed and gets a state
-    /// that the map does not keep. The build runs outside the lock, because it may wait on the
-    /// network.
+    /// the virtual schema in every pushdown, so only a synthesized request, such as a host test's
+    /// `dispatch` call, arrives nameless; it gets a state that the map does not keep, so it never
+    /// shares the process-wide map with another such request. The build runs outside the lock,
+    /// because it may wait on the network.
     pub(crate) fn get_or_build<E>(
         &self,
         name: Option<&str>,
@@ -102,8 +103,7 @@ impl StatementCatalog {
         connection: ResolvedConnectionConfig,
         props: &Json,
     ) -> Result<Self, UdfError> {
-        let client = construct_catalog_client(&connection, props)
-            .map_err(|e| redact_error(&connection.storage, e))?;
+        let client = construct_catalog_client(&connection, props)?;
         Ok(Self {
             connection,
             client,

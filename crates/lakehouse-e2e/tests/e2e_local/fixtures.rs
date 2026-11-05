@@ -13,9 +13,9 @@ use crate::common::seed::{
 };
 use crate::common::stack::{
     ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
-    ASSUME_ROLE_EXTERNAL_ID, CatalogConnectionPassword, ICEBERG_REST_VIA_PROXY, PROXY_URL_INTERNAL,
-    SEAWEEDFS_VIA_PROXY, iceberg_catalog_url, local_stack_connection_password, wait_for_exasol,
-    wait_for_iceberg_catalog, wait_for_seaweedfs,
+    ASSUME_ROLE_EXTERNAL_ID, CatalogConnectionPassword, ICEBERG_REST_VIA_PROXY,
+    PROXY_ADAPTER_SCHEMA, PROXY_URL_INTERNAL, SEAWEEDFS_VIA_PROXY, iceberg_catalog_url,
+    local_stack_connection_password, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
 };
 use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -157,7 +157,6 @@ pub fn emits_clause(pushed_sql: &str) -> String {
     pushed_sql[start..end].to_string()
 }
 
-const PROXY_ADAPTER_SCHEMA: &str = "LHVS_PROXY";
 pub const BASE_DIRECT: &str = "s3://warehouse/proxy_direct/";
 pub const PROXY_ICEBERG_VS: &str = "PROXY_ICEBERG_VS";
 pub const PROXY_DIRECT_VS: &str = "PROXY_DIRECT_VS";

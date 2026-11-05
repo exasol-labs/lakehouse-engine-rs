@@ -56,17 +56,9 @@ impl CatalogParquetTable {
     pub(in crate::adapter::pushdown) async fn from_unity(
         storage: UnityTableStorage<'_>,
     ) -> Result<Self, UdfError> {
-        let (table_root, effective_storage) = storage.resolve().await?;
+        let (table_root, effective_storage, store) = storage.open_store().await?;
         // A Unity storage location is a URL, as the Delta kernel reads it, so its path decodes once.
         let table_root = ObjectLocation::from_url(table_root)?;
-        let secrets = effective_storage.secret_values();
-        let store = build_table_root_store(
-            &effective_storage,
-            table_root.store_root().as_str(),
-            DEFAULT_S3_MAX_CONNECTIONS,
-            &secrets,
-        )
-        .map_err(|error| redacted(error, &secrets))?;
         let directory =
             ParquetDirectoryTable::open(&store, &table_root, &effective_storage).await?;
         Ok(Self {

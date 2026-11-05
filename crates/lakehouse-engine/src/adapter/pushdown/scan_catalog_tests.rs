@@ -2,6 +2,7 @@ use super::super::test_support::{
     UNREACHABLE_CATALOG, catalog_table, sample_storage, sigv4_creds, user_message,
 };
 use super::*;
+use crate::adapter::direct_storage_properties::join_storage_path;
 use lakehouse_catalog::CatalogTableIdent;
 
 const UNITY_TABLE_NAME: &str = "cat.sch.orders";
@@ -17,6 +18,7 @@ fn unity_table(format: TableFormat) -> CatalogTable {
     }
 }
 
+/// Scenario: A Unity Catalog table whose pushdown lookup reports the Iceberg format is refused
 #[tokio::test]
 async fn a_unity_catalog_load_refuses_an_iceberg_table() {
     let creds = sigv4_creds();
@@ -49,8 +51,8 @@ async fn a_unity_catalog_load_refuses_an_iceberg_table() {
 }
 
 #[test]
-fn a_direct_storage_load_composes_its_root_from_the_identifier() {
-    for (root, directory, expected) in [
+fn a_direct_storage_load_composes_the_table_root_that_enumeration_composes() {
+    for (address, directory, expected) in [
         (
             "s3://warehouse/direct",
             "events",
@@ -61,46 +63,53 @@ fn a_direct_storage_load_composes_its_root_from_the_identifier() {
             "event_labels",
             "s3://warehouse/lake/direct/event_labels",
         ),
+        (
+            "s3://warehouse/direct//",
+            "events",
+            "s3://warehouse/direct/events",
+        ),
     ] {
-        let root = ObjectLocation::from_raw(root).expect("a CONNECTION address names a root");
+        let root = ObjectLocation::from_raw(&join_storage_path(address, None))
+            .expect("a CONNECTION address names a root");
 
         let table_root = direct_storage_table_root(&root, directory)
             .expect("a first-level directory composes a table root");
 
-        assert_eq!(table_root.to_string(), expected, "{root} + {directory}");
+        assert_eq!(table_root.to_wire(), expected, "{address} + {directory}");
+        assert_eq!(
+            join_storage_path(address, Some(directory)),
+            expected,
+            "enumeration composes the same root for {address} + {directory}"
+        );
     }
 }
 
 #[test]
 fn a_recorded_identifier_recovers_its_namespace_segments_and_table_name() {
     let three_level = unity_table_ident("cat.sch.orders").expect("a three-level identifier");
+
     assert_eq!(
         three_level.namespace,
         vec!["cat".to_string(), "sch".to_string()]
     );
     assert_eq!(three_level.name, "orders");
-
-    let bare = unity_table_ident("orders")
-        .expect_err("a separator-free identifier addresses no Unity Catalog table");
-    assert!(
-        bare.to_string().contains("'orders'"),
-        "the refusal must name the identifier it rejected: {bare}"
-    );
-    assert!(
-        bare.to_string().contains("catalog.schema.table"),
-        "the refusal must state the Unity Catalog address form: {bare}"
-    );
 }
 
 #[test]
-fn a_recorded_identifier_without_a_table_name_is_refused() {
-    for unresolvable in ["cat.sch.", "", "   "] {
+fn a_recorded_identifier_naming_no_unity_table_is_refused() {
+    for (unresolvable, cause) in [
+        ("orders", "catalog.schema.table"),
+        ("cat.sch.", "last dot-separated segment is empty"),
+        ("", "catalog.schema.table"),
+        ("   ", "catalog.schema.table"),
+    ] {
         let err = unity_table_ident(unresolvable)
             .expect_err("an identifier naming no table must be refused");
         assert!(
             err.to_string().contains(&format!("'{unresolvable}'")),
             "the refusal must name the identifier it could not resolve: {err}"
         );
+        assert!(err.to_string().contains(cause), "{unresolvable:?}: {err}");
     }
 }
 

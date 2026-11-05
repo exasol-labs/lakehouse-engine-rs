@@ -32,8 +32,8 @@ use common::seed::{
     TIMESTAMP_VALUES_TEXT,
 };
 use common::stack::{
-    CatalogConnectionPassword, PROXY_URL_INTERNAL, build_create_connection_sql, proxy_log_mark,
-    proxy_log_since, wait_for_exasol,
+    CatalogConnectionPassword, PROXY_ADAPTER_SCHEMA, PROXY_URL_INTERNAL,
+    build_create_connection_sql, proxy_log_mark, proxy_log_since, wait_for_exasol,
 };
 use common::timestamp_precision::expected_timestamp_precision;
 
@@ -942,7 +942,6 @@ fn check_iceberg_rest_listing_reaches_past_the_first_page(run: &GlueRun, conn: &
 
 /// Scenario: HTTPS endpoints are reached through a CONNECT tunnel
 fn check_https_proxy_tunnels_glue_sts_and_s3(run: &GlueRun, conn: &mut ExaConn) {
-    const ADAPTER_SCHEMA: &str = "LHVS_PROXY";
     const PROXY_VS: &str = "GLUE_PROXY_ROLE";
     const PROXY_CONN: &str = "GLUE_PROXY_ROLE_CREDS";
     const PROXY_REST_VS: &str = "GLUE_PROXY_REST";
@@ -950,7 +949,7 @@ fn check_https_proxy_tunnels_glue_sts_and_s3(run: &GlueRun, conn: &mut ExaConn) 
     let env = run.env();
     let catalog_id = env.expect(runtime().block_on(run.catalog_id()), "read the catalog id");
     let proxy = [("HTTPS_PROXY", PROXY_URL_INTERNAL)];
-    create_proxied_schema_and_scripts(conn, ADAPTER_SCHEMA, &proxy, &proxy, &[]);
+    create_proxied_schema_and_scripts(conn, PROXY_ADAPTER_SCHEMA, &proxy, &proxy, &[]);
     let since = proxy_log_mark();
     let database = run.database();
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -971,7 +970,7 @@ fn check_https_proxy_tunnels_glue_sts_and_s3(run: &GlueRun, conn: &mut ExaConn) 
             ),
         ] {
             let mut props = VsProps::new(vs, &database)
-                .with_adapter_schema(ADAPTER_SCHEMA)
+                .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
                 .with_catalog_conn_name(connection);
             if let Some(kind) = kind {
                 props = props.with_catalog_kind(kind);

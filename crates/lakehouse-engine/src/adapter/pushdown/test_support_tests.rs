@@ -10,7 +10,8 @@ use crate::scan::spec::ProjectionItem;
 use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
 use crate::scan::test_support::WithFiles;
 use crate::types::exasol_type::ExasolType;
-use futures::future::BoxFuture;
+use futures::FutureExt;
+use futures::future::{self, BoxFuture};
 use lakehouse_catalog::{
     CatalogColumn, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, TableFormat,
 };
@@ -21,64 +22,51 @@ use vs_expression::ColumnNode;
 
 type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
-async fn spawn_fake_http_server<F>(responder: F) -> (String, RecordedRequests)
+/// The one fake HTTP server: it records each request's head and body, then answers with what
+/// `responder` maps the head to: a status, a content type, and a body. Each connection runs on its
+/// own task, so a responder may hold one request until others arrive.
+pub(super) async fn spawn_fake_http_server<F>(responder: F) -> (String, RecordedRequests)
 where
-    F: Fn(&str) -> (u16, &'static str, String) + Send + Sync + 'static,
+    F: Fn(String) -> BoxFuture<'static, (u16, &'static str, String)> + Send + Sync + 'static,
 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
     let address = format!("http://{}", listener.local_addr().expect("local_addr"));
     let requests: RecordedRequests = Arc::default();
+    let responder = Arc::new(responder);
 
     let recorded = requests.clone();
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
-            let Some((head, body)) = read_http_request(&mut stream).await else {
-                continue;
-            };
-            let (status, content_type, response_body) = responder(&head);
-            recorded
-                .lock()
-                .expect("recorded requests")
-                .push((head, body));
-            let response = http_response(status, content_type, &response_body);
-            let _ = stream.write_all(response.as_bytes()).await;
+            let (responder, recorded) = (Arc::clone(&responder), Arc::clone(&recorded));
+            tokio::spawn(async move {
+                let Some((head, body)) = read_http_request(&mut stream).await else {
+                    return;
+                };
+                recorded
+                    .lock()
+                    .expect("recorded requests")
+                    .push((head.clone(), body));
+                let (status, content_type, response_body) = responder(head).await;
+                let response = http_response(status, content_type, &response_body);
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
         }
     });
 
     (address, requests)
 }
 
-/// Answers each connection on its own task, so a responder may hold one request until others
-/// arrive. `responder` maps a request target to a status, a content type, and a body.
-pub(super) async fn spawn_async_fake_http_server<F>(responder: F) -> String
+/// [`spawn_fake_http_server`] with a responder that answers at once.
+async fn spawn_answering_http_server<F>(responder: F) -> (String, RecordedRequests)
 where
-    F: Fn(String) -> BoxFuture<'static, (u16, &'static str, String)> + Send + Sync + 'static,
+    F: Fn(&str) -> (u16, &'static str, String) + Send + Sync + 'static,
 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-    let address = format!("http://{}", listener.local_addr().expect("local_addr"));
-    let responder = Arc::new(responder);
-
-    tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            let responder = Arc::clone(&responder);
-            tokio::spawn(async move {
-                let Some((head, _)) = read_http_request(&mut stream).await else {
-                    return;
-                };
-                let (status, content_type, body) =
-                    responder(request_target(&head).to_string()).await;
-                let response = http_response(status, content_type, &body);
-                let _ = stream.write_all(response.as_bytes()).await;
-            });
-        }
-    });
-
-    address
+    spawn_fake_http_server(move |head| future::ready(responder(&head)).boxed()).await
 }
 
 /// A whole response that closes its connection, with the validators that make a body readable
 /// as an object.
-pub(super) fn http_response(status: u16, content_type: &str, body: &str) -> String {
+fn http_response(status: u16, content_type: &str, body: &str) -> String {
     let reason = if (200..300).contains(&status) {
         "OK"
     } else {
@@ -108,7 +96,7 @@ impl RecordingCatalog {
     where
         F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
     {
-        let (uri, requests) = spawn_fake_http_server(move |head| {
+        let (uri, requests) = spawn_answering_http_server(move |head| {
             let (status, body) = responder(request_target(head));
             (status, "application/json", body)
         })
@@ -927,7 +915,7 @@ pub(crate) struct ObjectEndpoint {
 impl ObjectEndpoint {
     pub(super) async fn spawn(bucket: &str, objects: Vec<(String, String)>) -> Self {
         let bucket = bucket.to_string();
-        let (endpoint, requests) = spawn_fake_http_server(move |head| {
+        let (endpoint, requests) = spawn_answering_http_server(move |head| {
             object_response(&bucket, request_target(head), &objects)
         })
         .await;
@@ -1013,7 +1001,7 @@ impl GlueEndpoint {
     where
         F: Fn(&str) -> (u16, serde_json::Value) + Send + Sync + 'static,
     {
-        let (address, requests) = spawn_fake_http_server(move |head| {
+        let (address, requests) = spawn_answering_http_server(move |head| {
             let (status, body) = match glue_operation(head) {
                 Some(operation) => responder(operation),
                 None => (400, serde_json::Value::Null),
@@ -1022,15 +1010,6 @@ impl GlueEndpoint {
         })
         .await;
         Self { address, requests }
-    }
-
-    pub(super) fn operations(&self) -> Vec<String> {
-        self.requests
-            .lock()
-            .expect("recorded requests")
-            .iter()
-            .filter_map(|(head, _)| glue_operation(head).map(str::to_string))
-            .collect()
     }
 
     pub(super) fn bodies_of(&self, operation: &str) -> Vec<serde_json::Value> {

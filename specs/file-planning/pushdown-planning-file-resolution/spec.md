@@ -1,6 +1,6 @@
 # Feature: Pushdown File Resolution
 
-Resolves a table's identity and current file state before any SQL is built. The adapter recovers the target table's catalog identifier from the involved table's identifier note (`vs-adapter/create-virtual-schema`) and loads the table once per statement (`file-planning/pushdown-format-neutral-resolution`). Each table reference then resolves the data-file list, each file's byte size, the table root, and each file's delete references, so the scan UDF never discovers files, delete files, or sizes itself.
+Resolves a table's identity and current file state before any SQL is built. The adapter recovers the target table's catalog identifier from the involved table's identifier note (`vs-adapter/create-virtual-schema`) and loads the table once per statement (`file-planning/pushdown-statement-state`). Each table reference then resolves the data-file list, each file's byte size, the table root, and each file's delete references, so the scan UDF never discovers files, delete files, or sizes itself.
 
 ## Background
 

@@ -53,8 +53,7 @@ impl ParquetDirectoryTable {
     ) -> Result<PlannedFiles, UdfError> {
         let files = self
             .listing
-            .kept_files(partition_columns, keep)
-            .map_err(|error| redacted(error, &self.storage.secret_values()))?
+            .kept_files(partition_columns, keep)?
             .into_iter()
             .map(|file| file_entry(file, &self.table_root))
             .collect();

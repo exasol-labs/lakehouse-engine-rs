@@ -184,6 +184,9 @@ pub const CLOSED_PROXY_URL_INTERNAL: &str = "http://10.84.0.12:1";
 pub const ICEBERG_REST_VIA_PROXY: &str = "http://iceberg-rest-via-proxy:8181";
 pub const SEAWEEDFS_VIA_PROXY: &str = "http://seaweedfs-via-proxy:8333";
 pub const UNITY_CATALOG_VIA_PROXY: &str = "http://unitycatalog-via-proxy:8080";
+/// The adapter schema of a suite's proxy-only scripts, so their `%env` lines reach no other
+/// virtual schema.
+pub const PROXY_ADAPTER_SCHEMA: &str = "LHVS_PROXY";
 
 /// `url` with its host renamed to the host's `-via-proxy` name.
 pub fn via_proxy(url: &str) -> String {

@@ -159,14 +159,13 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 * *AND* the reader MUST NOT request vended credentials, build an object store, or read one log file,
   so a malformed catalog response costs zero object-storage access
 
-### Scenario: The Iceberg format reader owns file resolution and binds columns by field-id
+### Scenario: An Iceberg scan carries its delete references and binds columns by field-id
 
-* *GIVEN* the Iceberg file-resolution logic, reached by the single-table pushdown path and every join leg
-* *WHEN* the Iceberg format reader resolves a table's scan through the trait
-* *THEN* the reader SHALL OWN that resolution logic outright, with no separately published file-resolution entry point, because `file-planning/pushdown-format-neutral-resolution` routes every caller through this seam
-* *AND* the reader SHALL construct each associated positional-delete reference as the Iceberg positional-delete variant of the format-neutral delete mechanism, serialized as `{"path":…,"size":…,"content_type":"position_deletes"}` inside the per-shard file list, and each Puffin deletion vector as the Iceberg deletion-vector variant
+* *GIVEN* an Iceberg table that a pushdown loaded, reached by the single-table pushdown path and every join leg
+* *WHEN* the adapter prunes the table's file list for one table reference
+* *THEN* the adapter SHALL construct each associated positional-delete reference as the Iceberg positional-delete variant of the format-neutral delete mechanism, serialized as `{"path":…,"size":…,"content_type":"position_deletes"}` inside the per-shard file list, and each Puffin deletion vector as the Iceberg deletion-vector variant
 * *AND* the returned scan SHALL carry EMPTY partition columns, and each of its file entries SHALL carry only the `identity` partition values of that file's own partition spec, per `scan-read-path/scan-execution-identity-partition-fill`
-* *AND* every logical field the Iceberg reader emits SHALL carry its Iceberg field-id and NO physical name, so an Iceberg column is still bound by field-id and the physical-name and identity binding strategies are unreachable from the Iceberg path
+* *AND* every logical field of the Iceberg scan SHALL carry its Iceberg field-id and NO physical name, so an Iceberg column is still bound by field-id and the physical-name and identity binding strategies are unreachable from the Iceberg path
 
 ### Scenario: The Delta reader is reached from production pushdown under the Unity Catalog kind
 
@@ -191,4 +190,10 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 * *GIVEN* a pushdown request over a table of a Unity Catalog or Glue virtual schema
 * *WHEN* the adapter loads the table
 * *THEN* the format that the catalog's table answer reports SHALL select the plan: under Unity Catalog, the Delta tag plans a Delta scan and the Parquet tag plans the Unity Parquet scan of `unity-catalog/unity-parquet-table-planning`; under Glue, the Iceberg tag plans an Iceberg scan from the table's metadata file and the Parquet tag plans the Hive Parquet scan of `glue/glue-table-planning`
-* *AND* a Unity Catalog table that reports the Iceberg format SHALL fail as `file-planning/pushdown-format-neutral-resolution` states in "A table the reader cannot plan fails the query loud at plan time", by the format that the pushdown's own table lookup reports, even when `createVirtualSchema` listed the table under a format the kind plans
+
+### Scenario: A Unity Catalog table whose pushdown lookup reports the Iceberg format is refused
+
+* *GIVEN* a pushdown request over a table of a Unity Catalog virtual schema whose table answer reports the Iceberg format, even when `createVirtualSchema` listed the table under a format the kind plans
+* *WHEN* the adapter loads the table
+* *THEN* the adapter SHALL fail the request with an error naming the table and the reported format, before it requests a vended credential or reads any storage object
+* *AND* the adapter MUST NOT plan the table as Delta or Parquet, because a table planned as another format surfaces a missing log or a wrong schema instead of the format refusal

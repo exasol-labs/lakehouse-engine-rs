@@ -49,31 +49,6 @@ Routes every pushdown request through the table-format reader seam. The reader t
   unresolvable identifier, and MUST NOT resolve a different table
 * *AND* a pushdown request whose involved table carries no readable identifier note SHALL fail with the error `file-planning/pushdown-planning-file-resolution` specifies for a missing note, under every catalog kind
 
-### Scenario: Iceberg requests planned through the format-reader seam keep their golden SQL, scan specs, and file pruning
-
-* *GIVEN* the shipped Iceberg pushdown suites, the golden dispatch fixtures, the scan-spec encodings,
-  the generated scan-driving SQL for raw, TopN, single-group aggregate, grouped aggregate, and
-  broadcast-join requests, and the Iceberg E2E suites
-* *WHEN* those requests are planned through the format-reader seam instead of the direct file resolver
-* *THEN* the generated SQL and the serialized per-shard scan specs MUST be byte-identical to their
-  pre-feature output for every request EXCEPT for the `storage` value, which carries the tagged
-  wrapper of `storage-access/scan-spec-credential-reference`
-* *AND* the Iceberg-level file pruning the resolver applies from the request's filter SHALL still be
-  applied, because the filter is forwarded to the reader unchanged
-
-### Scenario: The Iceberg file resolver is collapsed into its reader and leaves the façade
-
-* *GIVEN* the Iceberg format reader, whose whole body forwards its arguments to the separately
-  published Iceberg file-resolution function, kept in that shape only until this feature removed its
-  direct callers
-* *WHEN* production pushdown and every test call site route through the format-reader seam
-* *THEN* the file resolver's body SHALL move INTO the Iceberg reader and the separately published
-  function SHALL be DELETED, so exactly one path resolves an Iceberg file list
-* *AND* no production or test call site SHALL name that function afterwards; every caller SHALL reach
-  the same resolution through the format-reader seam
-* *AND* the Iceberg reader SHALL still return EMPTY partition columns, EMPTY partition values on every
-  file entry, and a field-id on every logical field, so the Iceberg wire encoding is unchanged
-
 ### Scenario: Resolved partition columns reach the scan spec for every side
 
 * *GIVEN* a pushdown request over a partitioned table whose resolved scan carries ordered partition
@@ -91,12 +66,11 @@ Routes every pushdown request through the table-format reader seam. The reader t
 ### Scenario: A table the reader cannot plan fails the query loud at plan time
 
 * *GIVEN* a pushdown request under the Unity Catalog kind naming a table whose Delta schema declares a
-  type this engine does not map, and a second request naming a table the catalog reports in a format
-  no Unity Catalog reader plans, such as `ICEBERG`
-* *WHEN* the adapter plans each request
+  type this engine does not map
+* *WHEN* the adapter plans the request
 * *THEN* the adapter SHALL return the reader's own clean plan-time error, naming the column and its
-  Delta type or naming the table and its reported format, and MUST NOT return a scan-driving SQL
-  response
+  Delta type, and MUST NOT return a scan-driving SQL response. `delta/delta-table-planning` states
+  the refusal of a table whose catalog reports a format the kind does not plan
 * *AND* the adapter MUST NOT fall back to the Iceberg resolution path, emit a partial file list, or
   return rows, because a table that cannot be planned has no correct partial answer
 * *AND* the error MUST be returned as an error value, never raised as a panic
@@ -117,4 +91,4 @@ Routes every pushdown request through the table-format reader seam. The reader t
 * *AND* the concurrency SHALL apply to EVERY catalog kind and EVERY table format, so the Delta log reads of two Delta legs overlap in time instead of the second leg's reads starting after the first leg's end
 * *AND* the generated SQL and the serialized per-shard scan specs MUST NOT depend on the order in which the legs finish
 * *AND* the error a failing leg produces SHALL be the same error that the leg produces alone, and a request with more than one failing leg SHALL surface one of those errors rather than a combined or masked one
-* *AND* the per-request in-flight object-store bound SHALL be unchanged by the concurrency
+* *AND* the legs SHALL read through the same object stores, with the same in-flight bounds, as legs that resolve one after another, so the legs of a direct-storage join share their virtual schema's one admission-limited store

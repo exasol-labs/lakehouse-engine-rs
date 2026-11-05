@@ -614,8 +614,9 @@ struct RendezvousCatalog {
 impl RendezvousCatalog {
     async fn spawn(parties: usize) -> Self {
         let barrier = Arc::new(tokio::sync::Barrier::new(parties));
-        let uri = spawn_async_fake_http_server(move |target| {
+        let (uri, _) = spawn_fake_http_server(move |head| {
             let barrier = Arc::clone(&barrier);
+            let target = request_target(&head).to_string();
             async move {
                 let body = if target.starts_with("/v1/config") {
                     "{}".to_string()
@@ -690,12 +691,13 @@ async fn delta_log_rendezvous(objects: Vec<(String, String)>) -> StorageBackend 
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let first_reads = Arc::new(Mutex::new(HashSet::new()));
     let objects = Arc::new(objects);
-    let endpoint = spawn_async_fake_http_server(move |target| {
+    let (endpoint, _) = spawn_fake_http_server(move |head| {
         let (barrier, first_reads, objects) = (
             Arc::clone(&barrier),
             Arc::clone(&first_reads),
             Arc::clone(&objects),
         );
+        let target = request_target(&head).to_string();
         async move {
             let first_read = delta_log_table(&target)
                 .is_some_and(|table| first_reads.lock().expect("first reads").insert(table));

@@ -1,6 +1,6 @@
 # Feature: Pushdown Statement State
 
-Governs what the pushdown requests of one statement share on one virtual schema: the catalog session and the loaded tables. `file-planning/pushdown-format-neutral-resolution` states how each request resolves through the format-reader seam.
+Governs what the pushdown requests of one statement share on one virtual schema: the catalog session and the loaded tables. `file-planning/pushdown-format-neutral-resolution` states how each request plans a table by its format.
 
 ## Background
 
@@ -13,8 +13,7 @@ Governs what the pushdown requests of one statement share on one virtual schema:
 
 * *GIVEN* a statement that Exasol plans as several pushdown requests on one virtual schema, such as `SELECT * FROM vs.t1 UNION ALL SELECT * FROM vs.t1 UNION ALL SELECT * FROM vs.t2`, under any catalog kind
 * *WHEN* the adapter plans every request of the statement
-* *THEN* the adapter SHALL authenticate to the catalog at most once for the statement: at most one `/v1/config` lookup for an Iceberg REST catalog, and at most one OAuth2 token request for an Iceberg REST catalog under OAuth2 client credentials
-* *AND* a later request of the statement SHALL send no `/v1/config` lookup and no Iceberg REST token request of its own
+* *THEN* every request of the statement SHALL use the catalog client that the statement's first request built, so the statement authenticates to the catalog at most once. `catalog/pushdown-catalog-session` states which Iceberg REST requests that one authentication costs
 * *AND* each request's pushdown SQL SHALL be byte-identical to the SQL that the request yields as the only request of its statement, except for the `storage` value
 * *AND* the statement SHALL return the rows that its branches return when each runs as a statement of its own
 
