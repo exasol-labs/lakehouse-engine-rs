@@ -551,7 +551,7 @@ fn iceberg_declaration_omits_default_for_no_default_field() {
     );
 }
 
-/// Scenario: A decimal initial-default outside Exasol's catalog-decimal domain is not encoded as a numeric default
+/// Scenario: A decimal initial-default outside Exasol's DECIMAL domain is not encoded as a numeric default
 #[test]
 fn iceberg_declaration_omits_default_for_decimal_outside_exasol_domain() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};

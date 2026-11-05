@@ -2,7 +2,7 @@
 
 Defines what the scan UDF emits for a logical field that is absent from a data file. A field that defines an Iceberg `initial-default` returns that value for the file's rows, a nullable field with no default returns NULL, and a required field with no default fails the scan with a clean error. A field whose `identity` partition value the file entry carries takes that value instead, per `scan-read-path/scan-execution-identity-partition-fill`.
 
-The VS reads each field's `initial-default` once per query and encodes a primitive default into the scan spec in a JSON-portable, credential-free form. It leaves the default absent for a non-primitive default and for a decimal outside Exasol's catalog-decimal domain.
+The VS reads each field's `initial-default` once per query and encodes a primitive default into the scan spec in a JSON-portable, credential-free form. It leaves the default absent for a non-primitive default and for a decimal outside Exasol's DECIMAL domain.
 
 ## Background
 
@@ -56,7 +56,7 @@ The VS reads each field's `initial-default` once per query and encodes a primiti
 * *AND* the UDF MUST NOT emit wrong or fabricated data for that column
 * *AND* the UDF MUST NOT substitute NULL for the required column
 
-### Scenario: A decimal initial-default outside Exasol's catalog-decimal domain is not encoded as a numeric default
+### Scenario: A decimal initial-default outside Exasol's DECIMAL domain is not encoded as a numeric default
 
 * *GIVEN* a virtual schema query whose Iceberg current schema defines a field of type `decimal(P,S)` outside `1 ≤ P ≤ 36`, `0 ≤ S ≤ P`, for example `decimal(38,10)` or `decimal(5,10)`, and which declares a non-null primitive `initial-default`
 * *AND* that field's Arrow-type tag is therefore `utf8` rather than `decimal128(P,S)`, per `scan-types/type-mapping`

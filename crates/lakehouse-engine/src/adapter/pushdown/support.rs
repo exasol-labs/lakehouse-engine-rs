@@ -914,8 +914,6 @@ pub(super) fn project_columns(
         Some(Json::Array(list)) => {
             let mut projected = Vec::with_capacity(list.len());
             for (i, e) in list.iter().enumerate() {
-                // The EMITS column type must equal Exasol's declared `selectListDataTypes` entry.
-                let declared_type = pushdown.select_type(i);
                 // An aggregate at any depth must never be evaluated per shard: its value would be
                 // an unmerged partial (#194).
                 if contains_aggregate_node(e) {
@@ -944,44 +942,12 @@ pub(super) fn project_columns(
                             exa_type,
                         });
                     }
-                    t if is_literal_selectlist_item(t) => {
-                        // Pushed positionally so the emitted arity equals the select-list arity (#190).
-                        match (render_expression_safe(e), declared_type) {
-                            (Some(sql_frag), Some(exa_type)) if exa_type.is_udf_emittable() =>
-                            {
-                                projected.push(ProjectedColumn {
-                                    item: ProjectionItem::Expr { expr: sql_frag },
-                                    exa_type,
-                                });
-                            }
-                            _ => {
-                                needs_full_fallback = true;
-                            }
-                        }
-                    }
-                    // Every remaining node type `render_expression_safe` renders, except
-                    // `predicate_greater[equal]`: Exasol normalises `a > b` to `b < a`.
-                    "function_scalar"
-                    | "function_scalar_cast"
-                    // Synthesized from a DECIMAL-to-string cast by the rewrite above (#211).
-                    | "decimal_to_varchar_exasol"
-                    | "function_scalar_extract"
-                    | "function_scalar_case"
-                    | "predicate_equal"
-                    | "predicate_less"
-                    | "predicate_lessequal"
-                    | "predicate_like"
-                    | "predicate_and"
-                    | "predicate_or"
-                    | "predicate_not"
-                    | "predicate_in_constlist"
-                    | "predicate_between"
-                    | "predicate_is_null"
-                    | "predicate_is_not_null"
-                    | "predicate_notequal" => {
-                        match (render_expression_safe(e), declared_type) {
-                            (Some(sql_frag), Some(exa_type)) if exa_type.is_udf_emittable() =>
-                            {
+                    // A literal is pushed positionally so the emitted arity equals the
+                    // select-list arity (#190).
+                    t if is_literal_selectlist_item(t) || is_pushable_expression_node(t) => {
+                        // The EMITS column type must equal Exasol's declared type.
+                        match (render_expression_safe(e), pushdown.emittable_select_type(i)) {
+                            (Some(sql_frag), Some(exa_type)) => {
                                 projected.push(ProjectedColumn {
                                     item: ProjectionItem::Expr { expr: sql_frag },
                                     exa_type,
@@ -1110,6 +1076,13 @@ impl PushdownRequest {
         self.select_types.get(select_index).copied()
     }
 
+    /// [`Self::select_type`] when a scan UDF can emit it. `None` means the scan has no value of
+    /// the item's type, so Exasol must compute the item over the scan output.
+    pub fn emittable_select_type(&self, select_index: usize) -> Option<ExasolType> {
+        self.select_type(select_index)
+            .filter(ExasolType::is_udf_emittable)
+    }
+
     /// A rewrite of this request's JSON that keeps its select list, such as the table-qualified
     /// copy a broadcast join projects from, beside the types already checked for it.
     pub fn with_json(&self, json: Json) -> Self {
@@ -1118,6 +1091,32 @@ impl PushdownRequest {
             select_types: self.select_types.clone(),
         }
     }
+}
+
+/// Every non-literal node type `render_expression_safe` renders, except `predicate_greater[equal]`:
+/// Exasol normalises `a > b` to `b < a`.
+fn is_pushable_expression_node(node_type: &str) -> bool {
+    matches!(
+        node_type,
+        "function_scalar"
+            | "function_scalar_cast"
+            // Synthesized from a DECIMAL-to-string cast by the type rewrites (#211).
+            | "decimal_to_varchar_exasol"
+            | "function_scalar_extract"
+            | "function_scalar_case"
+            | "predicate_equal"
+            | "predicate_less"
+            | "predicate_lessequal"
+            | "predicate_like"
+            | "predicate_and"
+            | "predicate_or"
+            | "predicate_not"
+            | "predicate_in_constlist"
+            | "predicate_between"
+            | "predicate_is_null"
+            | "predicate_is_not_null"
+            | "predicate_notequal"
+    )
 }
 
 /// Exasol type-checks each pushdown output column against its declared type, so a value

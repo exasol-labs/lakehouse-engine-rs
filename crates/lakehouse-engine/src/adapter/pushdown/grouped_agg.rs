@@ -127,10 +127,7 @@ pub fn detect_group_by_aggregates(pushdown: &PushdownRequest) -> Option<GroupedA
         match item_type {
             "function_aggregate" => {
                 let plan = parse_agg_item(item)?;
-                // The scan has no value of a type it cannot emit, so Exasol computes the item.
-                let declared = pushdown
-                    .select_type(select_index)
-                    .filter(ExasolType::is_udf_emittable)?;
+                let declared = pushdown.emittable_select_type(select_index)?;
                 let plan_slot =
                     fold_aggregate_plan(&mut plans, &mut plan_types, plan, Some(declared));
                 select_items.push(GroupedSelectItem::Aggregate {
@@ -153,9 +150,7 @@ pub fn detect_group_by_aggregates(pushdown: &PushdownRequest) -> Option<GroupedA
                     .ok()
                     .and_then(|sql| group_keys.iter().position(|gk| *gk == sql))
                 {
-                    if !pushdown.select_type(select_index)?.is_udf_emittable() {
-                        return None;
-                    }
+                    pushdown.emittable_select_type(select_index)?;
                     select_items.push(GroupedSelectItem::GroupKey {
                         group_key_slot,
                         select_index,

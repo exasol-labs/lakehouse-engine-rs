@@ -75,7 +75,6 @@ Defines the single mapping from DataFusion/Arrow column types to Exasol SQL type
 * *AND* a column whose source type tag the adapter cannot read SHALL be declared `VARCHAR(2000000)` rather than fail the statement
 * *AND* the column's declared Exasol type and its logical Arrow type in the scan SHALL agree: a column declared `VARCHAR(2000000)` SHALL be read as a string-family Arrow type, not as its footer type
 * *AND* a nested Parquet struct, list, or map column SHALL render as JSON per `scan-types/nested-json-rendering`
-* *AND* a Parquet decimal, whose scale lies between zero and the precision, SHALL map by the in-range and out-of-range `Decimal128` scenarios
 
 ### Scenario: The scan-spec tag vocabulary covers every Arrow type the compatible-type classifier admits
 

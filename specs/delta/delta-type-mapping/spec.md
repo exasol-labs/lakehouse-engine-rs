@@ -54,8 +54,6 @@ The adapter maps each type a Delta table schema can declare onto an Arrow tag or
 * *AND* `byte` and `short` SHALL both carry the `int32` tag, and the Delta reader MUST NOT
   tag either column `int8` or `int16`, because the Parquet reader produces physical `Int8` and
   `Int16` and the scan widens each to logical `Int32` losslessly
-* *AND* `byte`, `short`, and `integer` SHALL be declared `DECIMAL(3,0)`, `DECIMAL(5,0)`, and `DECIMAL(10,0)`, exactly as the table above declares
-* *AND* a Delta `decimal(p,s)` SHALL map to `DECIMAL(p,s)` exactly when `1 ≤ p ≤ 36` and `0 ≤ s ≤ p`, the domain `scan-types/type-mapping` states for every decimal, and to the `VARCHAR` rendering otherwise
 * *AND* a Delta timestamp SHALL be declared at the precision `scan-types/type-mapping` gives an Iceberg timestamp on the same Exasol version
 * *AND* only the fractional-second precision of the two timestamp rows SHALL depend on the Exasol version, and it SHALL differ on the 2025.x arm only
 

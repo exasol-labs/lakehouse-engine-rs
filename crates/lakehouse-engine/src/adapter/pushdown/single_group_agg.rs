@@ -51,10 +51,7 @@ pub fn detect_aggregates(pushdown: &PushdownRequest) -> Option<Vec<SingleGroupIt
     let mut items = Vec::with_capacity(list.len());
     for (select_index, item) in list.iter().enumerate() {
         let resolved = if item.get("type").and_then(|t| t.as_str()) == Some("function_aggregate") {
-            // The scan has no value of a type it cannot emit, so Exasol computes the item.
-            if !pushdown.select_type(select_index)?.is_udf_emittable() {
-                return None;
-            }
+            pushdown.emittable_select_type(select_index)?;
             match parse_count_distinct(item) {
                 Some(distinct) => SingleGroupItem::Distinct(distinct),
                 None => SingleGroupItem::Aggregate(parse_agg_item(item)?),
