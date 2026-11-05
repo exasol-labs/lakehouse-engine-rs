@@ -1,17 +1,28 @@
 use crate::common::e2e_harness::{
-    SCAN_SCRIPT_NAME, VsProps, create_schema_and_scripts, create_virtual_schema, exa_conn,
-    explain_virtual_sql, install_slc, runtime, upload_so,
+    SCAN_SCRIPT_NAME, VsProps, create_proxied_schema_and_scripts, create_schema_and_scripts,
+    create_virtual_schema, create_virtual_schema_with_password, exa_conn, explain_virtual_sql,
+    install_slc, runtime, upload_so,
 };
 use crate::common::exasol_ws::ExaConn;
+use crate::common::raw_parquet::write_parquet_fixture;
 use crate::common::seed::{
     E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_TABLE, E2E_TYPED_TABLE,
-    seed_all_types, seed_complex_types_probe, seed_distinct_probe, seed_events,
+    build_seed_catalog, seed_all_types, seed_complex_types_probe, seed_distinct_probe, seed_events,
     seed_high_card_probe, seed_ident_part_bytes, seed_typed_distinct_probe,
 };
 use crate::common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
+    ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
+    ASSUME_ROLE_EXTERNAL_ID, CatalogConnectionPassword, ICEBERG_REST_VIA_PROXY,
+    PROXY_ADAPTER_SCHEMA, PROXY_URL_INTERNAL, SEAWEEDFS_VIA_PROXY, iceberg_catalog_url,
+    local_stack_connection_password, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
 };
-use std::sync::OnceLock;
+use arrow::array::{Float64Array, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use arrow::record_batch::RecordBatch;
+use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+use iceberg::{Catalog, NamespaceIdent, TableIdent};
+use iceberg_catalog_rest::RestCatalog;
+use std::sync::{Arc, OnceLock};
 
 pub const LAKEHOUSE_VS: &str = "MY_LAKEHOUSE";
 
@@ -143,4 +154,180 @@ pub fn emits_clause(pushed_sql: &str) -> String {
         }
     }
     pushed_sql[start..end].to_string()
+}
+
+pub const BASE_DIRECT: &str = "s3://warehouse/proxy_direct/";
+pub const PROXY_ICEBERG_VS: &str = "PROXY_ICEBERG_VS";
+pub const PROXY_DIRECT_VS: &str = "PROXY_DIRECT_VS";
+pub const PROXY_ROLE_VS: &str = "PROXY_ROLE_VS";
+
+pub fn setup_proxy(adapter_schema: &str, adapter_env: &[(&str, &str)], scan_env: &[(&str, &str)]) {
+    lakehouse_vs();
+    events();
+    create_proxied_schema_and_scripts(
+        &mut exa_conn(),
+        adapter_schema,
+        adapter_env,
+        scan_env,
+        &[ICEBERG_REST_VIA_PROXY, SEAWEEDFS_VIA_PROXY],
+    );
+}
+
+/// A CONNECTION that names a role whose STS endpoint only the proxy resolves.
+pub fn role_password_via_proxy() -> CatalogConnectionPassword {
+    CatalogConnectionPassword {
+        access_key: ASSUME_ROLE_BASE_ACCESS_KEY.to_string(),
+        secret_key: ASSUME_ROLE_BASE_SECRET_KEY.to_string(),
+        aws_assume_role_arn: Some(ASSUME_ROLE_ARN.to_string()),
+        aws_external_id: Some(ASSUME_ROLE_EXTERNAL_ID.to_string()),
+        aws_sts_endpoint: Some(SEAWEEDFS_VIA_PROXY.to_string()),
+        ..local_stack_connection_password().via_proxy()
+    }
+}
+
+pub fn count(sql: &str) -> i64 {
+    exa_conn().query_scalar_i64(sql)
+}
+
+pub fn refresh(vs_name: &str) {
+    exa_conn().execute(&format!("ALTER VIRTUAL SCHEMA {vs_name} REFRESH"));
+}
+
+/// Installs the proxy-only scripts once, then creates the Iceberg REST, direct-storage, and
+/// assume-role virtual schemas that reach their catalog and storage only through the proxy.
+pub fn proxy_virtual_schemas() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        let proxy = [("HTTP_PROXY", PROXY_URL_INTERNAL)];
+        setup_proxy(PROXY_ADAPTER_SCHEMA, &proxy, &proxy);
+        write_parquet_fixture(
+            &format!("{BASE_DIRECT}rows/file1.parquet"),
+            RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![Field::new(
+                    "id",
+                    DataType::Int64,
+                    false,
+                )])),
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+            )
+            .expect("build direct-storage fixture batch"),
+        );
+        let mut conn = exa_conn();
+
+        create_virtual_schema_with_password(
+            &mut conn,
+            &VsProps::new(PROXY_ICEBERG_VS, E2E_NAMESPACE).proxied("PROXY_ICEBERG_CREDS"),
+            ICEBERG_REST_VIA_PROXY,
+            &local_stack_connection_password().via_proxy(),
+        );
+        refresh(PROXY_ICEBERG_VS);
+
+        create_virtual_schema_with_password(
+            &mut conn,
+            &VsProps::new(PROXY_DIRECT_VS, "")
+                .proxied("PROXY_DIRECT_CREDS")
+                .with_catalog_kind("DIRECT_STORAGE"),
+            BASE_DIRECT,
+            &CatalogConnectionPassword {
+                warehouse: String::new(),
+                ..local_stack_connection_password().via_proxy()
+            },
+        );
+        refresh(PROXY_DIRECT_VS);
+
+        create_virtual_schema_with_password(
+            &mut conn,
+            &VsProps::new(PROXY_ROLE_VS, E2E_NAMESPACE).proxied("PROXY_ROLE_CREDS"),
+            ICEBERG_REST_VIA_PROXY,
+            &role_password_via_proxy(),
+        );
+        refresh(PROXY_ROLE_VS);
+    });
+}
+
+pub fn seed_catalog(rt: &tokio::runtime::Runtime, label: &str) -> RestCatalog {
+    rt.block_on(build_seed_catalog(
+        &iceberg_catalog_url(),
+        "s3://warehouse/",
+        label,
+    ))
+    .expect("build seed catalog")
+}
+
+pub fn id_val_schema(schema_id: i32) -> IcebergSchema {
+    IcebergSchema::builder()
+        .with_schema_id(schema_id)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "val", Type::Primitive(PrimitiveType::Double)).into(),
+        ])
+        .build()
+        .expect("build id+val Iceberg schema")
+}
+
+pub fn id_val_batch(id: i64, val: f64) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("val", DataType::Float64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![id])),
+            Arc::new(Float64Array::from(vec![val])),
+        ],
+    )
+    .expect("id+val RecordBatch construction is infallible")
+}
+
+pub async fn ensure_id_val_table(
+    catalog: &impl Catalog,
+    namespace: &str,
+    table_name: &str,
+    id: i64,
+    val: f64,
+) {
+    crate::common::seed::create_and_append(
+        catalog,
+        namespace,
+        table_name,
+        id_val_schema(0),
+        std::iter::once(id_val_batch(id, val)),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("seed {namespace}.{table_name}: {e}"));
+}
+
+/// The Docker warehouse persists across `make test-e2e` runs, so a prior run's tables can leak in.
+pub async fn drop_table_if_exists(catalog: &impl Catalog, ns: &NamespaceIdent, table_name: &str) {
+    let ident = TableIdent::new(ns.clone(), table_name.to_string());
+    if catalog
+        .table_exists(&ident)
+        .await
+        .unwrap_or_else(|e| panic!("check table {}.{table_name}: {e}", ns.join(".")))
+    {
+        catalog
+            .drop_table(&ident)
+            .await
+            .unwrap_or_else(|e| panic!("drop stale table {}.{table_name}: {e}", ns.join(".")));
+    }
+}
+
+pub async fn load(catalog: &impl Catalog, namespace: &str, table: &str) -> iceberg::table::Table {
+    let ident = TableIdent::new(
+        NamespaceIdent::new(namespace.to_string()),
+        table.to_string(),
+    );
+    catalog
+        .load_table(&ident)
+        .await
+        .unwrap_or_else(|e| panic!("load {namespace}.{table}: {e}"))
+}
+
+/// Writes one data file under the table's current schema.
+pub async fn append_file(catalog: &impl Catalog, namespace: &str, table: &str, batch: RecordBatch) {
+    let loaded = load(catalog, namespace, table).await;
+    crate::common::seed::write_one_file_append(catalog, &loaded, table, [batch])
+        .await
+        .unwrap_or_else(|e| panic!("append to {namespace}.{table}: {e}"));
 }

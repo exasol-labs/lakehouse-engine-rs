@@ -17,6 +17,7 @@ mod pushdown_surface_probe;
 pub mod scoped_refresh;
 pub mod sharding;
 pub mod skipped_tables;
+mod statement_state;
 mod table_filter;
 pub mod table_identity;
 pub mod tables;
@@ -32,9 +33,10 @@ use crate::adapter::properties::{
     PROP_CATALOG_CONNECTION, PROP_NAMESPACE, ThreadingMode, TuningProperties, check_properties,
     resolve_allow_http,
 };
-use crate::adapter::pushdown::{declare_columns, handle_pushdown};
+use crate::adapter::pushdown::{ConnectionStorage, ScanCatalog, declare_columns, handle_pushdown};
 use crate::adapter::scoped_refresh::{RequestedTables, ScopedRefresh};
 use crate::adapter::skipped_tables::{SkippedTables, insert_skipped_tables, skip_kind_and_reason};
+use crate::adapter::statement_state::{STATEMENT_STATES, StatementCatalog, VirtualSchemaState};
 use crate::adapter::table_filter::TableFilter;
 use crate::adapter::table_identity::{encode_identifier_note, read_identifier};
 use crate::adapter::tables::{
@@ -102,14 +104,14 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
             // The user is mapped before the CONNECTION is read, so a refused user costs no request.
             let permission = PermissionSettings::parse(&props)?;
             let check = permission.check_for(|| ctx.current_user())?;
-            // Built before `resolve_connection_config`, which blocks on it to assume the role.
-            let rt = build_runtime()?;
-            let config = resolve_connection_config(ctx, &props, &permission, check, &rt)?;
+            let state = STATEMENT_STATES.get_or_build(virtual_schema_name(request)?, || {
+                build_virtual_schema_state(&*ctx, &props, &permission)
+            })?;
             let script_schema = ctx.script_schema();
             let cluster_nodes = cluster_nodes_from_context(ctx);
 
-            rt.block_on(async {
-                handle_pushdown_request(request, &config, &script_schema, cluster_nodes).await
+            state.block_on(|statement| {
+                handle_pushdown_request(request, statement, &check, &script_schema, cluster_nodes)
             })
         }
         other => Err(UdfError::User(format!(
@@ -117,6 +119,28 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
             other.unwrap_or("(none)")
         ))),
     }
+}
+
+/// `schemaMetadataInfo.name`, the key of the virtual schema's statement state. Exasol sends it
+/// with every pushdown.
+fn virtual_schema_name(request: &Json) -> Result<&str, UdfError> {
+    request
+        .pointer("/schemaMetadataInfo/name")
+        .and_then(Json::as_str)
+        .ok_or_else(|| UdfError::User("pushdown: the request names no virtual schema".to_string()))
+}
+
+/// The first pushdown of a statement on a virtual schema builds what its later pushdowns reuse.
+fn build_virtual_schema_state(
+    ctx: &dyn UdfContext,
+    props: &Json,
+    permission: &PermissionSettings,
+) -> Result<VirtualSchemaState, UdfError> {
+    // Built before `resolve_connection_config`, which blocks on it to assume the role.
+    let rt = build_runtime()?;
+    let config = resolve_connection_config(ctx, props, permission, &rt)?;
+    let catalog = StatementCatalog::open(config, props)?;
+    Ok(VirtualSchemaState::new(rt, catalog))
 }
 
 /// `creds` and `storage` carry the AWS identity the request acts as — a named
@@ -129,7 +153,16 @@ pub struct ResolvedConnectionConfig {
     pub(crate) catalog_kind: CatalogKind,
     pub(crate) connection_name: String,
     pub(crate) sealed_storage_key: Option<SealedStorageKey>,
-    pub(crate) permission_check: PermissionCheck,
+}
+
+impl ResolvedConnectionConfig {
+    pub(crate) fn connection_storage(&self) -> ConnectionStorage<'_> {
+        ConnectionStorage {
+            storage: &self.storage,
+            creds: &self.creds,
+            allow_http: self.allow_http,
+        }
+    }
 }
 
 fn build_runtime() -> Result<tokio::runtime::Runtime, UdfError> {
@@ -140,12 +173,11 @@ fn build_runtime() -> Result<tokio::runtime::Runtime, UdfError> {
 }
 
 /// Both entry points call this, so neither reaches the catalog or storage before
-/// a named role is assumed; `rt` then assumes the role once per request.
+/// a named role is assumed; `rt` then assumes the role once per call.
 fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &Json,
     permission: &PermissionSettings,
-    check: PermissionCheck,
     rt: &tokio::runtime::Runtime,
 ) -> Result<ResolvedConnectionConfig, UdfError> {
     let kind = catalog_kind::resolve_catalog_kind(props)?;
@@ -169,7 +201,6 @@ fn resolve_connection_config(
         catalog_kind: kind,
         connection_name: connection_name.to_string(),
         sealed_storage_key: resolved.sealed_storage_key,
-        permission_check: check,
     })
 }
 
@@ -187,7 +218,7 @@ fn handle_create_virtual_schema(
     // Validated only: listing runs as the CONNECTION's identity, with no permission check.
     let permission = PermissionSettings::parse(&props)?;
     let rt = build_runtime()?;
-    let config = resolve_connection_config(ctx, &props, &permission, PermissionCheck::Off, &rt)?;
+    let config = resolve_connection_config(ctx, &props, &permission, &rt)?;
 
     // Optional under direct storage: the CONNECTION address alone denotes the storage subtree.
     let configured_ns: Vec<String> = match config.catalog_kind {
@@ -200,14 +231,7 @@ fn handle_create_virtual_schema(
         }
     };
 
-    let client = construct_catalog_client(
-        config.catalog_kind,
-        config.catalog_uri,
-        config.storage.clone(),
-        config.creds,
-        &props,
-    )
-    .map_err(|e| redact_error(&config.storage, e))?;
+    let client = construct_catalog_client(&config, &props)?;
     let (listing, skipped_tables) = rt
         .block_on(list_source(
             client.as_ref(),
@@ -291,10 +315,12 @@ fn build_schema_response(request: &Json, schema_metadata: Json) -> Json {
 
 async fn handle_pushdown_request(
     request: &Json,
-    config: &ResolvedConnectionConfig,
+    statement: &StatementCatalog,
+    permission: &PermissionCheck,
     script_schema: &str,
     cluster_nodes: usize,
 ) -> Result<Json, UdfError> {
+    let config = statement.connection();
     // Tuning values come from adapterNotes, which Exasol persists; properties are dropped.
     let parallelism_factor = adapter_note(request, NOTE_PARALLELISM_FACTOR)
         .and_then(|s| s.parse::<usize>().ok())
@@ -334,7 +360,8 @@ async fn handle_pushdown_request(
 
     handle_pushdown(
         request,
-        config,
+        statement,
+        permission,
         &catalog,
         Some(script_schema),
         cluster_nodes,
@@ -418,26 +445,36 @@ fn adapter_note(request: &Json, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// The only site that matches a [`CatalogKind`]; the listing pipeline after it never re-matches
-/// the kind.
+/// The only site that matches a [`CatalogKind`] to build a client or load a table; the listing
+/// pipeline and the pushdown scan load after it never re-match the kind. Issues no request, and
+/// redacts a construction error against the CONNECTION's storage secrets.
 fn construct_catalog_client(
-    kind: CatalogKind,
-    catalog_uri: String,
-    storage: StorageBackend,
-    creds: ConnectionCreds,
+    config: &ResolvedConnectionConfig,
     props: &Json,
-) -> Result<Box<dyn CatalogClient>, UdfError> {
-    match kind {
-        CatalogKind::IcebergRest => Ok(Box::new(IcebergRestCatalogClient::new(catalog_uri, creds))),
-        CatalogKind::UnityCatalogNative => {
-            Ok(Box::new(UnityCatalogSession::new(&catalog_uri, creds)))
-        }
+) -> Result<Box<dyn ScanCatalog>, UdfError> {
+    client_of_kind(config, props).map_err(|e| redact_error(&config.storage, e))
+}
+
+fn client_of_kind(
+    config: &ResolvedConnectionConfig,
+    props: &Json,
+) -> Result<Box<dyn ScanCatalog>, UdfError> {
+    let (catalog_uri, storage, creds) = (&config.catalog_uri, &config.storage, &config.creds);
+    match config.catalog_kind {
+        CatalogKind::IcebergRest => Ok(Box::new(IcebergRestCatalogClient::new(
+            catalog_uri.clone(),
+            creds.clone(),
+        ))),
+        CatalogKind::UnityCatalogNative => Ok(Box::new(UnityCatalogSession::new(
+            catalog_uri,
+            creds.clone(),
+        ))),
         CatalogKind::DirectStorage => {
             let resolved =
-                direct_storage_properties::resolve_direct_storage_properties(props, &catalog_uri)?;
+                direct_storage_properties::resolve_direct_storage_properties(props, catalog_uri)?;
             let secrets = storage.secret_values();
             let client = DirectStorageCatalogClient::new(
-                &storage,
+                storage,
                 &resolved.base_path,
                 resolved.directory_options(),
                 &secrets,
@@ -445,9 +482,9 @@ fn construct_catalog_client(
             Ok(Box::new(client))
         }
         CatalogKind::Glue => Ok(Box::new(GlueCatalogSession::new(
-            &catalog_uri,
-            storage,
-            creds,
+            catalog_uri,
+            storage.clone(),
+            creds.clone(),
         )?)),
     }
 }

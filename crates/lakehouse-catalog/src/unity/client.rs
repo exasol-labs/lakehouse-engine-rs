@@ -59,6 +59,15 @@ impl UnityCatalogSession {
             .await
     }
 
+    /// One table as a pushdown plans it, tagged with the format its `GET /tables/{full_name}`
+    /// answer reports. Fails a format that names no table format this engine plans.
+    pub async fn load_table(&self, ident: &CatalogTableIdent) -> Result<CatalogTable, UdfError> {
+        let full_name = full_name(ident);
+        let info = self.get_table_info(&full_name).await?;
+        let format = neutral_table_format(info.data_source_format.as_deref(), &full_name)?;
+        Ok(neutral_table(ident.clone(), info, format))
+    }
+
     async fn list_table_infos(
         &self,
         catalog: &str,
@@ -204,19 +213,6 @@ impl CatalogClient for UnityCatalogSession {
                 admissions.push(admit(ident, info));
             }
             Ok(admissions.into_iter().collect())
-        })
-    }
-
-    fn load_table(
-        &self,
-        ident: &CatalogTableIdent,
-    ) -> Pin<Box<dyn Future<Output = Result<CatalogTable, UdfError>> + Send + '_>> {
-        let ident = ident.clone();
-        Box::pin(async move {
-            let full_name = full_name(&ident);
-            let info = self.get_table_info(&full_name).await?;
-            let format = neutral_table_format(info.data_source_format.as_deref(), &full_name)?;
-            Ok(neutral_table(ident, info, format))
         })
     }
 }

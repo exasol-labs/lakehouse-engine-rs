@@ -10,8 +10,10 @@
 use crate::adapter::catalog_kind::CatalogKind;
 #[cfg(test)]
 use crate::adapter::connection::ConnectionCreds;
+use crate::adapter::get_properties;
+use crate::adapter::permission::PermissionCheck;
 use crate::adapter::properties::resolve_binary_as_string;
-use crate::adapter::{ResolvedConnectionConfig, get_properties};
+use crate::adapter::statement_state::StatementCatalog;
 use crate::scan::spec::{
     CatalogProps, CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ScanSpec, ScanStorage,
 };
@@ -40,9 +42,10 @@ use shard_paths::relativize_shards_to_root;
 
 mod format;
 pub(crate) use format::declare_columns;
-pub use format::{
-    ConnectionStorage, FormatReader, RefusedColumn, ResolvedScan, ScanSource, format_reader,
-};
+pub use format::{ConnectionStorage, LoadedTable, RefusedColumn, ResolvedScan};
+
+mod scan_catalog;
+pub(crate) use scan_catalog::ScanCatalog;
 
 mod scan_resolution;
 use scan_resolution::TableScanResolver;
@@ -102,9 +105,10 @@ mod dispatch_golden;
 /// `join_broadcast_max_bytes`: a two-table inner equi-join broadcasts its smaller
 /// side when that side's manifest byte size is at or below this threshold.
 #[allow(clippy::too_many_arguments)]
-pub async fn handle_pushdown(
+pub(crate) async fn handle_pushdown(
     request: &Json,
-    conn: &ResolvedConnectionConfig,
+    statement: &StatementCatalog,
+    permission: &PermissionCheck,
     catalog: &CatalogProps,
     scan_schema: Option<&str>,
     cluster_nodes: usize,
@@ -137,7 +141,8 @@ pub async fn handle_pushdown(
                 request,
                 &pushdown,
                 &join,
-                conn,
+                statement,
+                permission,
                 &props,
                 scan_schema,
                 cluster_nodes,
@@ -168,20 +173,9 @@ pub async fn handle_pushdown(
     // a bare LIMIT never precedes an ordering the adapter did not render (decision [4]).
     let has_order_by = order_by_present(pushdown_req);
 
-    let connection = ConnectionStorage {
-        storage: &conn.storage,
-        creds: &conn.creds,
-        allow_http: conn.allow_http,
-    };
-    let resolver = TableScanResolver::for_request(
-        conn.catalog_kind,
-        &conn.catalog_uri,
-        connection,
-        &[catalog.table.as_str()],
-        &props,
-        &conn.permission_check,
-    )
-    .await?;
+    let resolver =
+        TableScanResolver::for_request(statement, permission, &[catalog.table.as_str()], &props)
+            .await?;
     let (
         ResolvedScan {
             files,
@@ -201,6 +195,7 @@ pub async fn handle_pushdown(
     // predicate tree, whatever the adapter declines.
     let binary_as_string = resolve_binary_as_string(&props);
     let (filter, declined_filter) = classify_where_filter(filter_json_raw, &col_types);
+    let conn = statement.connection();
     let scan_storage = scan_storage_for(
         &conn.creds,
         &conn.connection_name,

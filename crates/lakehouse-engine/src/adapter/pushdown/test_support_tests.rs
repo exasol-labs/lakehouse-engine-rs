@@ -2,13 +2,16 @@
 //! catalog and AdapterNotes fixtures, fake catalog and object-store endpoints, test CONNECTIONs.
 
 use super::*;
-use crate::adapter::column_notes::{DeclaredSchema, TableNotes};
+use crate::adapter::ResolvedConnectionConfig;
+use crate::adapter::column_notes::TableNotes;
 use crate::adapter::table_identity::encode_identifier_note;
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::ProjectionItem;
 use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
 use crate::scan::test_support::WithFiles;
 use crate::types::exasol_type::{ExasolType, exasol_type_to_json};
+use futures::FutureExt;
+use futures::future::{self, BoxFuture};
 use lakehouse_catalog::{
     CatalogColumn, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, TableFormat,
 };
@@ -19,77 +22,86 @@ use vs_expression::ColumnNode;
 
 type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
-/// Every response closes its connection, so one accept loop serves a pooled client's sequential
-/// requests in arrival order. `responder` maps a request head to a status, content type, and body;
-/// the validators make a body readable as an object.
-async fn spawn_fake_http_server<F>(responder: F) -> (String, RecordedRequests)
+/// The one fake HTTP server: it records each request's head and body, then answers with what
+/// `responder` maps the head to: a status, a content type, and a body. Each connection runs on its
+/// own task, so a responder may hold one request until others arrive.
+pub(super) async fn spawn_fake_http_server<F>(responder: F) -> (String, RecordedRequests)
 where
-    F: Fn(&str) -> (u16, &'static str, String) + Send + Sync + 'static,
+    F: Fn(String) -> BoxFuture<'static, (u16, &'static str, String)> + Send + Sync + 'static,
 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
     let address = format!("http://{}", listener.local_addr().expect("local_addr"));
     let requests: RecordedRequests = Arc::default();
+    let responder = Arc::new(responder);
 
     let recorded = requests.clone();
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
-            let Some((head, body)) = read_http_request(&mut stream).await else {
-                continue;
-            };
-            let (status, content_type, response_body) = responder(&head);
-            recorded
-                .lock()
-                .expect("recorded requests")
-                .push((head, body));
-            let reason = if (200..300).contains(&status) {
-                "OK"
-            } else {
-                "ERROR"
-            };
-            let length = response_body.len();
-            let response = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
-                 Content-Length: {length}\r\nETag: \"e{length}\"\r\n\
-                 Last-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\nAccept-Ranges: bytes\r\n\
-                 Connection: close\r\n\r\n{response_body}"
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
+            let (responder, recorded) = (Arc::clone(&responder), Arc::clone(&recorded));
+            tokio::spawn(async move {
+                let Some((head, body)) = read_http_request(&mut stream).await else {
+                    return;
+                };
+                recorded
+                    .lock()
+                    .expect("recorded requests")
+                    .push((head.clone(), body));
+                let (status, content_type, response_body) = responder(head).await;
+                let response = http_response(status, content_type, &response_body);
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
         }
     });
 
     (address, requests)
 }
 
-fn request_target(head: &str) -> &str {
+/// [`spawn_fake_http_server`] with a responder that answers at once.
+async fn spawn_answering_http_server<F>(responder: F) -> (String, RecordedRequests)
+where
+    F: Fn(&str) -> (u16, &'static str, String) + Send + Sync + 'static,
+{
+    spawn_fake_http_server(move |head| future::ready(responder(&head)).boxed()).await
+}
+
+/// A whole response that closes its connection, with the validators that make a body readable
+/// as an object.
+fn http_response(status: u16, content_type: &str, body: &str) -> String {
+    let reason = if (200..300).contains(&status) {
+        "OK"
+    } else {
+        "ERROR"
+    };
+    let length = body.len();
+    format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
+         Content-Length: {length}\r\nETag: \"e{length}\"\r\n\
+         Last-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\nAccept-Ranges: bytes\r\n\
+         Connection: close\r\n\r\n{body}"
+    )
+}
+
+pub(super) fn request_target(head: &str) -> &str {
     head.split_whitespace().nth(1).unwrap_or("")
 }
 
-pub(crate) struct RecordingCatalog {
+/// A fake catalog that answers JSON.
+pub(crate) struct FakeCatalog {
     pub(super) uri: String,
-    requests: RecordedRequests,
 }
 
-impl RecordingCatalog {
+impl FakeCatalog {
     /// `responder` maps a request target to a status and body.
     pub(super) async fn spawn<F>(responder: F) -> Self
     where
         F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
     {
-        let (uri, requests) = spawn_fake_http_server(move |head| {
+        let (uri, _) = spawn_answering_http_server(move |head| {
             let (status, body) = responder(request_target(head));
             (status, "application/json", body)
         })
         .await;
-        Self { uri, requests }
-    }
-
-    pub(super) fn targets(&self) -> Vec<String> {
-        self.requests
-            .lock()
-            .expect("recorded requests")
-            .iter()
-            .map(|(head, _)| request_target(head).to_string())
-            .collect()
+        Self { uri }
     }
 }
 /// No catalog auth, so a session issues no token-grant request.
@@ -115,12 +127,6 @@ pub(crate) fn unauthenticated_creds() -> ConnectionCreds {
         ..Default::default()
     }
 }
-
-pub(crate) const ICEBERG_CONFIG_TARGET: &str = "/v1/config?warehouse=wh";
-
-pub(crate) const ICEBERG_LOAD_TABLE_TARGET: &str = "/v1/namespaces/db/tables/t?snapshots=refs";
-
-pub(crate) const UNITY_TABLE_TARGET: &str = "/api/2.1/unity-catalog/tables/cat.sch.orders";
 
 /// SigV4 mode lets `CatalogSession::resolve` build a session without contacting the catalog, so
 /// `loadTable` is a loopback catalog's only request.
@@ -680,40 +686,27 @@ pub(crate) fn involved_notes<'a>(table: &'a str, notes: &'a [(String, String)]) 
     }
 }
 
-/// What the resolver answers for `reader` over the table `notes` declare: the one parse, the
-/// reader's files for that declaration, and the one assembly.
-pub(crate) async fn resolve_from_notes(
-    reader: &dyn FormatReader,
+/// What the resolver answers over the table `notes` declare, in the resolver's order: the one
+/// parse, then `load`, then the loaded table's files pruned for that declaration, then the one
+/// assembly.
+pub(crate) async fn resolve_from_notes<L: LoadedTable>(
+    load: impl Future<Output = Result<L, UdfError>>,
     notes: &TableNotes<'_>,
     filter_json: Option<&Json>,
 ) -> Result<ResolvedScan, UdfError> {
-    ResolvedScan::resolve(reader, notes.declared_schema()?, filter_json).await
+    let declared = notes.declared_schema()?;
+    ResolvedScan::resolve(&load.await?, declared, filter_json).await
 }
 
 /// [`resolve_from_notes`] over the notes CREATE records for `table`, involved as `name`.
-pub(crate) async fn resolve_declared(
-    reader: &dyn FormatReader,
+pub(crate) async fn resolve_declared<L: LoadedTable>(
+    load: impl Future<Output = Result<L, UdfError>>,
     name: &str,
     table: &CatalogTable,
     filter_json: Option<&Json>,
 ) -> Result<ResolvedScan, UdfError> {
     let notes = declared_notes(table);
-    resolve_from_notes(reader, &involved_notes(name, &notes), filter_json).await
-}
-
-/// The declaration the pushdown parses from the notes CREATE records for `table`.
-pub(crate) fn declared_schema_of(table: &CatalogTable) -> DeclaredSchema {
-    let notes = declared_notes(table);
-    involved_notes(&table.ident.name.to_uppercase(), &notes)
-        .declared_schema()
-        .expect("CREATE's notes parse")
-}
-
-/// The declaration of a table whose involved columns carry no note.
-pub(crate) fn no_notes() -> DeclaredSchema {
-    TableNotes::default()
-        .declared_schema()
-        .expect("an empty declaration parses")
+    resolve_from_notes(load, &involved_notes(name, &notes), filter_json).await
 }
 
 /// `request` with the note CREATE writes on every involved column for an optional Iceberg `long`
@@ -837,20 +830,8 @@ pub(crate) fn with_identifier_notes(mut request: Json, identifiers: &[(&str, &st
     request
 }
 
-/// No storage location, so the Delta reader refuses before reaching any object store.
-pub(crate) fn locationless_delta_table_body() -> String {
-    serde_json::json!({
-        "name": "orders",
-        "table_type": "MANAGED",
-        "data_source_format": "DELTA",
-        "table_id": "table-1",
-        "columns": []
-    })
-    .to_string()
-}
-
-pub(crate) async fn unity_delta_catalog() -> RecordingCatalog {
-    RecordingCatalog::spawn(|target| match target.rsplit_once('.') {
+pub(crate) async fn unity_delta_catalog() -> FakeCatalog {
+    FakeCatalog::spawn(|target| match target.rsplit_once('.') {
         Some((_, name)) if !name.is_empty() => (
             200,
             serde_json::json!({
@@ -929,38 +910,14 @@ pub(crate) struct ObjectEndpoint {
 impl ObjectEndpoint {
     pub(super) async fn spawn(bucket: &str, objects: Vec<(String, String)>) -> Self {
         let bucket = bucket.to_string();
-        let (endpoint, requests) = spawn_fake_http_server(move |head| {
-            let target = request_target(head);
-            let (path, query) = target.split_once('?').unwrap_or((target, ""));
-            if query.contains("list-type=2") {
-                let listing = list_bucket_result(&bucket, query, &objects);
-                return (200, "application/xml", listing);
-            }
-            let key = path
-                .strip_prefix(&format!("/{bucket}/"))
-                .map(|key| percent_encoding::percent_decode_str(key).decode_utf8_lossy());
-            match objects
-                .iter()
-                .find(|(served, _)| key.as_deref() == Some(served.as_str()))
-            {
-                Some((_, body)) => (200, "application/octet-stream", body.clone()),
-                None => {
-                    let error = r#"<?xml version="1.0"?><Error><Code>NoSuchKey</Code></Error>"#;
-                    (404, "application/xml", error.to_string())
-                }
-            }
+        let (endpoint, requests) = spawn_answering_http_server(move |head| {
+            object_response(&bucket, request_target(head), &objects)
         })
         .await;
-        let storage = StorageBackend::S3(StorageProps {
-            endpoint,
-            region: "us-east-1".into(),
-            access_key: "minioadmin".into(),
-            secret_key: "minioadmin".into(),
-            allow_http: true,
-            path_style: true,
-            ..Default::default()
-        });
-        Self { storage, requests }
+        Self {
+            storage: endpoint_storage(&endpoint),
+            requests,
+        }
     }
 
     /// The prefix of every listing request, sorted.
@@ -982,6 +939,45 @@ impl ObjectEndpoint {
     }
 }
 
+/// The answer of a path-style S3 endpoint serving `objects` of `bucket` to a request for `target`.
+pub(super) fn object_response(
+    bucket: &str,
+    target: &str,
+    objects: &[(String, String)],
+) -> (u16, &'static str, String) {
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    if query.contains("list-type=2") {
+        let listing = list_bucket_result(bucket, query, objects);
+        return (200, "application/xml", listing);
+    }
+    let key = path
+        .strip_prefix(&format!("/{bucket}/"))
+        .map(|key| percent_encoding::percent_decode_str(key).decode_utf8_lossy());
+    match objects
+        .iter()
+        .find(|(served, _)| key.as_deref() == Some(served.as_str()))
+    {
+        Some((_, body)) => (200, "application/octet-stream", body.clone()),
+        None => {
+            let error = r#"<?xml version="1.0"?><Error><Code>NoSuchKey</Code></Error>"#;
+            (404, "application/xml", error.to_string())
+        }
+    }
+}
+
+/// Path-style S3 storage at a fake object endpoint.
+pub(crate) fn endpoint_storage(endpoint: &str) -> StorageBackend {
+    StorageBackend::S3(StorageProps {
+        endpoint: endpoint.to_string(),
+        region: "us-east-1".into(),
+        access_key: "minioadmin".into(),
+        secret_key: "minioadmin".into(),
+        allow_http: true,
+        path_style: true,
+        ..Default::default()
+    })
+}
+
 fn query_param(query: &str, key: &str) -> String {
     url::form_urlencoded::parse(query.as_bytes())
         .find(|(name, _)| name == key)
@@ -1000,7 +996,7 @@ impl GlueEndpoint {
     where
         F: Fn(&str) -> (u16, serde_json::Value) + Send + Sync + 'static,
     {
-        let (address, requests) = spawn_fake_http_server(move |head| {
+        let (address, requests) = spawn_answering_http_server(move |head| {
             let (status, body) = match glue_operation(head) {
                 Some(operation) => responder(operation),
                 None => (400, serde_json::Value::Null),
@@ -1009,15 +1005,6 @@ impl GlueEndpoint {
         })
         .await;
         Self { address, requests }
-    }
-
-    pub(super) fn operations(&self) -> Vec<String> {
-        self.requests
-            .lock()
-            .expect("recorded requests")
-            .iter()
-            .filter_map(|(head, _)| glue_operation(head).map(str::to_string))
-            .collect()
     }
 
     pub(super) fn bodies_of(&self, operation: &str) -> Vec<serde_json::Value> {
@@ -1037,7 +1024,9 @@ fn glue_operation(head: &str) -> Option<&str> {
 
 /// The request head and its whole body: closing a socket with unread bytes resets it before the
 /// client reads the response.
-async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Option<(String, Vec<u8>)> {
+pub(super) async fn read_http_request(
+    stream: &mut tokio::net::TcpStream,
+) -> Option<(String, Vec<u8>)> {
     let mut raw = Vec::new();
     let mut chunk = [0u8; 4096];
     let head_end = loop {
@@ -1118,40 +1107,73 @@ pub(crate) async fn delta_pushdown(
     storage: StorageBackend,
     table: &str,
 ) -> Result<Json, UdfError> {
-    let conn = ResolvedConnectionConfig {
-        catalog_uri: catalog_uri.to_string(),
+    pushdown_over(
+        request,
+        CatalogKind::UnityCatalogNative,
+        catalog_uri,
         storage,
-        creds: unauthenticated_creds(),
-        allow_http: true,
-        catalog_kind: CatalogKind::UnityCatalogNative,
-        connection_name: TEST_CONNECTION_NAME.to_string(),
-        sealed_storage_key: Some(test_sealing_key()),
-        permission_check: crate::adapter::permission::PermissionCheck::Off,
-    };
+        table,
+        1024,
+    )
+    .await
+}
+
+/// Plans `request` as the first pushdown of its statement, over an unauthenticated `kind`
+/// CONNECTION at `catalog_uri`, and over `table` when it is no join.
+pub(crate) async fn pushdown_over(
+    request: &Json,
+    kind: CatalogKind,
+    catalog_uri: &str,
+    storage: StorageBackend,
+    table: &str,
+    join_broadcast_max_bytes: u64,
+) -> Result<Json, UdfError> {
+    let connection = resolved_connection(kind, catalog_uri, storage, unauthenticated_creds());
+    let statement = StatementCatalog::open(connection, &get_properties(request))?;
     let catalog = CatalogProps {
         warehouse: "wh".into(),
         table: table.into(),
     };
     handle_pushdown(
-        request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
+        request,
+        &statement,
+        &PermissionCheck::Off,
+        &catalog,
+        None,
+        1,
+        1,
+        1,
+        1024,
+        1,
+        0.6,
+        200,
+        4,
+        join_broadcast_max_bytes,
     )
     .await
 }
 
-pub(crate) async fn iceberg_catalog() -> RecordingCatalog {
-    RecordingCatalog::spawn(|target| {
-        if target.starts_with("/v1/config") {
-            return (200, "{}".to_string());
-        }
-        match target.rsplit_once('/') {
-            Some((_, table)) => (
-                200,
-                snapshotless_load_table_body(&format!("s3://bucket/{table}")),
-            ),
-            None => (404, r#"{"message":"no such table"}"#.to_string()),
-        }
-    })
-    .await
+/// The state of a statement's first pushdown over `catalog_uri`, with an unauthenticated
+/// CONNECTION and no properties.
+pub(crate) fn statement_over(
+    kind: CatalogKind,
+    catalog_uri: &str,
+    storage: StorageBackend,
+) -> StatementCatalog {
+    let connection = resolved_connection(kind, catalog_uri, storage, unauthenticated_creds());
+    StatementCatalog::open(connection, &Json::Null).expect("the catalog client issues no request")
+}
+
+/// A CONNECTION's storage view that allows HTTP.
+pub(crate) fn connection_storage<'a>(
+    storage: &'a StorageBackend,
+    creds: &'a ConnectionCreds,
+) -> ConnectionStorage<'a> {
+    ConnectionStorage {
+        storage,
+        creds,
+        allow_http: true,
+    }
 }
 
 pub(crate) const TEST_CONNECTION_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
@@ -1164,15 +1186,29 @@ pub(crate) fn test_sealing_key() -> SealedStorageKey {
 }
 
 fn test_connection(creds: ConnectionCreds) -> ResolvedConnectionConfig {
+    resolved_connection(
+        CatalogKind::IcebergRest,
+        "http://catalog.example.com",
+        sample_storage(),
+        creds,
+    )
+}
+
+/// A CONNECTION of `kind` at `catalog_uri` that allows HTTP and seals under the test key.
+pub(crate) fn resolved_connection(
+    kind: CatalogKind,
+    catalog_uri: &str,
+    storage: StorageBackend,
+    creds: ConnectionCreds,
+) -> ResolvedConnectionConfig {
     ResolvedConnectionConfig {
-        catalog_uri: "http://catalog.example.com".to_string(),
-        storage: sample_storage(),
+        catalog_uri: catalog_uri.to_string(),
+        storage,
         creds,
         allow_http: true,
-        catalog_kind: CatalogKind::IcebergRest,
+        catalog_kind: kind,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
-        permission_check: crate::adapter::permission::PermissionCheck::Off,
     }
 }
 

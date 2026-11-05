@@ -20,7 +20,7 @@ Total ≈ *nodes × instances/node × threads/instance*.
 ```
 User Query
   → Virtual Schema (translate, pushdown analysis, parallelization plan, schema mapping)
-  → resolve the table's file list ONCE per query (format reader)
+  → load each table ONCE per statement, then prune its file list per table reference
   → partition files into G byte-balanced work-unit shards
   → GROUP BY shard_key fan-out  →  one DataFusion runtime per shard invocation
   → Parquet data files on object storage
@@ -29,7 +29,7 @@ User Query
   → Result
 ```
 
-The VS layer resolves metadata **once per query**, never once per node. The format reader resolves the file list from an Iceberg snapshot, a Delta log, a catalog's Parquet locations, or a directory listing, depending on the virtual schema's `CATALOG_KIND` property (see [Catalogs](catalogs.md)). The scan reads Parquet data files on object storage. Each UDF invocation gets an explicit file list. This file list is a scan spec that carries the projection and the predicates. A node never discovers files itself. A node never scans the files of another node.
+The VS layer loads each table's metadata **once per statement**, never once per node. Exasol sends a UNION ALL branch, each CTE reference, and a subquery as separate pushdown requests, and they all share that one load. Each table reference then prunes the file list with its own filter. The file list comes from an Iceberg snapshot, a Delta log, a catalog's Parquet locations, or a directory listing, depending on the virtual schema's `CATALOG_KIND` property (see [Catalogs](catalogs.md)). The next statement loads the table again, so it reads the table's state at that point. The scan reads Parquet data files on object storage. Each UDF invocation gets an explicit file list. This file list is a scan spec that carries the projection and the predicates. A node never discovers files itself. A node never scans the files of another node.
 
 ## Sharding rules
 

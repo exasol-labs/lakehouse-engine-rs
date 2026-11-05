@@ -7,12 +7,13 @@ mod common;
 use common::e2e_harness::{
     SCAN_SCRIPT_NAME, VARCHAR_JSON, VsProps, assert_binary_columns_match_native_copy,
     assert_decimal_orders_numerically, assert_hex_literal_compares_bytes, assert_query_fails,
-    assert_text_columns, assert_type_matrix, column_adapter_notes, create_schema_and_scripts,
-    create_schema_and_scripts_with_env, create_virtual_schema_with_password, declared_types,
-    enumerated_table_names, error_text, exa_conn, exa_conn_redacting, explain_virtual_sql,
-    has_broadcast_join_block, has_two_scan_wrapper, identifier_note, install_slc, note_of, pairs,
-    parse_int, parse_numeric, partition_positions, query_error, reads, refuses, text_column,
-    upload_so, value_to_string,
+    assert_text_columns, assert_type_matrix, column_adapter_notes,
+    create_proxied_schema_and_scripts, create_schema_and_scripts,
+    create_virtual_schema_with_password, declared_types, enumerated_table_names, error_text,
+    exa_conn, exa_conn_redacting, explain_virtual_sql, has_broadcast_join_block,
+    has_two_scan_wrapper, identifier_note, install_slc, int_column, isolated_pushdown_statement,
+    note_of, pairs, parse_int, parse_numeric, partition_positions, pushdown_statements,
+    query_error, reads, refuses, text_column, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
@@ -75,6 +76,9 @@ const EXPECTED_TABLES: &[&str] = &[
     "ALL_TYPES_PARQUET",
     "DELTA_EXTRA_TYPES",
 ];
+
+/// `multi-part-stats` commits these IDs in this order, one row and one data file each.
+const MULTI_PART_STATS_IDS: [i64; 5] = [1, 2, 3, 4, 5];
 
 /// Outside the Delta fixtures' `s3://warehouse/delta/` prefix, so they never collide.
 const SALES_PARQUET_LOCATION: &str = "s3://warehouse/unity_parquet/sales_parquet";
@@ -1246,51 +1250,28 @@ fn unity_delta_partitioned_table_returns_partition_values() {
     );
 }
 
-/// Scenario: Every pushdown request shape resolves through the one format-reader seam
+/// Scenario: Every pushdown request shape plans each table from its file list and its column notes
+/// Scenario: A Unity Catalog or Glue table is planned by the format its catalog reports
 #[test]
 fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
     setup();
     let mut conn = exa_conn();
 
-    let raw_ids: Vec<i64> = conn
-        .query_columns(&format!("SELECT ID FROM {}", table_ref("MULTI_PART_STATS")))[0]
-        .iter()
-        .map(parse_int)
-        .collect();
-    assert_eq!(
-        raw_ids.len(),
-        5,
-        "multi_part_stats holds 5 rows: {raw_ids:?}"
-    );
-
     let grouped = conn.query_columns(&format!(
-        "SELECT ID, COUNT(*) FROM {} GROUP BY ID",
+        "SELECT ID, COUNT(*) FROM {} GROUP BY ID ORDER BY ID",
         table_ref("MULTI_PART_STATS")
     ));
-    let mut expected_group_counts: std::collections::HashMap<i64, i64> =
-        std::collections::HashMap::new();
-    for id in &raw_ids {
-        *expected_group_counts.entry(*id).or_insert(0) += 1;
-    }
-    for (id, count) in grouped[0].iter().zip(grouped[1].iter()) {
-        let key = parse_int(id);
-        let actual_count = parse_int(count);
-        let expected_count = expected_group_counts
-            .remove(&key)
-            .unwrap_or_else(|| panic!("unexpected group key {key}: {grouped:?}"));
-        assert_eq!(
-            actual_count, expected_count,
-            "group {key}: COUNT(*) mismatch"
-        );
-    }
-    assert!(
-        expected_group_counts.is_empty(),
-        "GROUP BY ID must cover every id the ground-truth scan saw: missing {expected_group_counts:?}"
+    let groups: Vec<(i64, i64)> = grouped[0]
+        .iter()
+        .zip(grouped[1].iter())
+        .map(|(id, count)| (parse_int(id), parse_int(count)))
+        .collect();
+    assert_eq!(
+        groups,
+        MULTI_PART_STATS_IDS.map(|id| (id, 1)),
+        "GROUP BY ID over multi_part_stats' five one-row files"
     );
 
-    let mut expected_top3 = raw_ids.clone();
-    expected_top3.sort_unstable_by(|a, b| b.cmp(a));
-    expected_top3.truncate(3);
     let top3: Vec<i64> = conn.query_columns(&format!(
         "SELECT ID FROM {} ORDER BY ID DESC LIMIT 3",
         table_ref("MULTI_PART_STATS")
@@ -1298,10 +1279,7 @@ fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
         .iter()
         .map(parse_int)
         .collect();
-    assert_eq!(
-        top3, expected_top3,
-        "ORDER BY ID DESC LIMIT 3 must match a full sort + truncate"
-    );
+    assert_eq!(top3, [5, 4, 3], "ORDER BY ID DESC LIMIT 3");
 
     // Broadcast goes to the smaller side by active-file bytes; cm_id_mode (5253) outweighs
     // basic_partitioned (4505), keeping the partitioned table on the broadcast side.
@@ -1347,30 +1325,6 @@ fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
          basic_partitioned's table root, the PARTITIONED table: {pushed}"
     );
 
-    let cm_ids: Vec<i64> = conn
-        .query_columns(&format!("SELECT ID FROM {}", table_ref("CM_ID_MODE")))[0]
-        .iter()
-        .map(parse_int)
-        .collect();
-    let distinct_cm_ids: std::collections::HashSet<i64> = cm_ids.iter().copied().collect();
-    assert_eq!(
-        distinct_cm_ids.len(),
-        cm_ids.len(),
-        "cm_id_mode's ID values must be distinct for the semi-join ground truth \
-         (membership via cm_ids.contains) to equal a real join: {cm_ids:?}"
-    );
-    let base_cols = conn.query_columns(&format!(
-        "SELECT LETTER, \"NUMBER\" FROM {}",
-        table_ref("BASIC_PARTITIONED")
-    ));
-    let mut expected_join: Vec<(Option<String>, i64)> = base_cols[0]
-        .iter()
-        .zip(base_cols[1].iter())
-        .map(|(letter, number)| (letter.as_str().map(str::to_string), parse_int(number)))
-        .filter(|(_, number)| cm_ids.contains(number))
-        .collect();
-    expected_join.sort_by_key(|a| a.1);
-
     let join_cols = conn.query_columns(&join_sql);
     let mut actual_join: Vec<(Option<String>, i64)> = join_cols[0]
         .iter()
@@ -1379,16 +1333,16 @@ fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
         .collect();
     actual_join.sort_by_key(|a| a.1);
 
-    assert!(
-        !actual_join.is_empty(),
-        "the join must return at least one matching row to prove more than an \
-         empty-result coincidence: basic_partitioned NUMBER and cm_id_mode ID \
-         must overlap"
-    );
+    // basic_partitioned holds (a,1) (b,2) (c,3) (a,4) (e,5) (NULL,6), and cm_id_mode the IDs 1,
+    // 2, and 4, each in its own file of the vendored Delta logs.
     assert_eq!(
-        actual_join, expected_join,
-        "the broadcast join result must match an in-process join over the two \
-         tables' full contents, carrying basic_partitioned's LETTER value"
+        actual_join,
+        [
+            (Some("a".into()), 1),
+            (Some("b".into()), 2),
+            (Some("a".into()), 4)
+        ],
+        "the broadcast join carries basic_partitioned's LETTER for each matching cm_id_mode ID"
     );
 }
 
@@ -1398,6 +1352,7 @@ const TYPE_WIDENING_SUPPORTED_COLUMNS: &str = "BYTE_LONG, INT_LONG, FLOAT_DOUBLE
      DATE_TIMESTAMP_NTZ";
 
 /// Scenario: A refused table fails the query with a SQL error and leaves the session usable
+/// Scenario: A pushdown request under the Unity Catalog kind is planned as a Delta scan
 #[test]
 fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
     setup();
@@ -1970,6 +1925,7 @@ fn unity_delta_pruned_queries_return_unchanged_rows() {
 }
 
 /// Scenario: Pruning reaches every request shape and changes no result end to end
+/// Scenario: A pushdown request under the Unity Catalog kind is planned as a Delta scan
 #[test]
 fn unity_delta_pruned_pushdown_sql_carries_fewer_files_and_drives_the_scan_udf() {
     setup();
@@ -2006,6 +1962,7 @@ fn unity_delta_pruned_pushdown_sql_carries_fewer_files_and_drives_the_scan_udf()
 
 /// Scenario: Partition columns come from the catalog and partition values from the file paths
 /// Scenario: A partition column's note carries its position among the partition columns
+/// Scenario: A Unity Catalog or Glue table is planned by the format its catalog reports
 #[test]
 fn unity_parquet_table_is_listed_and_returns_its_rows_and_partition_values() {
     setup();
@@ -2473,6 +2430,7 @@ fn unity_delta_non_nullable_declaration_of_a_nullable_column_fails() {
 }
 
 /// Scenario: Every recorded Delta type change is validated, and an unsupported one refuses its column
+/// Scenario: A table the reader cannot plan fails the query loud at plan time
 #[test]
 fn unity_unsupported_type_change_in_type_json_refuses_its_column() {
     setup();
@@ -2617,33 +2575,101 @@ fn delta_single_group_aggregates_match_the_oracle() {
     assert_single_group_aggregates_match_oracle(&mut exa_conn(), Format::Delta);
 }
 
+const VS_PROXY: &str = "UNITY_PROXY_VS";
+
+/// Creates, once, the Unity virtual schema whose catalog and storage requests only the forward
+/// proxy resolves.
+fn create_proxy_virtual_schema() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        setup();
+        let proxy = [("HTTP_PROXY", stack::PROXY_URL_INTERNAL)];
+        let mut conn = exa_conn();
+        create_proxied_schema_and_scripts(
+            &mut conn,
+            stack::PROXY_ADAPTER_SCHEMA,
+            &proxy,
+            &proxy,
+            &[stack::UNITY_CATALOG_VIA_PROXY, stack::SEAWEEDFS_VIA_PROXY],
+        );
+        create_virtual_schema_with_password(
+            &mut conn,
+            &VsProps::new(VS_PROXY, UNITY_NAMESPACE)
+                .proxied("UNITY_PROXY_CREDS")
+                .with_catalog_kind("UNITY_CATALOG"),
+            stack::UNITY_CATALOG_VIA_PROXY,
+            &local_stack_connection_password().via_proxy(),
+        );
+    });
+}
+
 /// Scenario: Catalog, storage, and STS requests go through the proxy
 #[test]
 fn unity_catalog_and_delta_log_reads_go_through_the_proxy() {
-    const ADAPTER_SCHEMA: &str = "LHVS_PROXY";
-    const VS_PROXY: &str = "UNITY_PROXY_VS";
-    setup();
-    stack::wait_for_proxy();
-    for host in ["unitycatalog-via-proxy", "seaweedfs-via-proxy"] {
-        stack::assert_resolves_only_through_proxy(host);
-    }
-    let proxy = [("HTTP_PROXY", stack::PROXY_URL_INTERNAL)];
-    let mut conn = exa_conn();
-    create_schema_and_scripts_with_env(&mut conn, ADAPTER_SCHEMA, &proxy, &proxy);
-    create_virtual_schema_with_password(
-        &mut conn,
-        &VsProps::new(VS_PROXY, UNITY_NAMESPACE)
-            .with_adapter_schema(ADAPTER_SCHEMA)
-            .with_catalog_kind("UNITY_CATALOG")
-            .with_catalog_conn_name("UNITY_PROXY_CREDS"),
-        "http://unitycatalog-via-proxy:8080",
-        &CatalogConnectionPassword {
-            endpoint: "http://seaweedfs-via-proxy:8333".to_string(),
-            ..local_stack_connection_password()
-        },
-    );
+    create_proxy_virtual_schema();
     assert_eq!(
-        conn.query_scalar_i64(&format!("SELECT COUNT(*) FROM {VS_PROXY}.TABLE_WITH_DV")),
+        exa_conn().query_scalar_i64(&format!("SELECT COUNT(*) FROM {VS_PROXY}.TABLE_WITH_DV")),
         8
     );
+}
+
+/// Scenario: Every reference to one table in a statement loads the table once and prunes it with its own filter
+#[test]
+fn unity_delta_references_load_the_table_once_and_prune_their_own_files() {
+    create_proxy_virtual_schema();
+    let mut conn = exa_conn();
+    let table = format!("{VS_PROXY}.MULTI_PART_STATS");
+    let branches = [
+        format!("SELECT ID FROM {table} WHERE ID <= 2"),
+        format!("SELECT ID FROM {table} WHERE ID >= 4"),
+    ];
+    let union = branches.join(" UNION ALL ");
+    let self_join = format!(
+        "SELECT a.ID FROM {table} a JOIN {table} b ON a.ID = b.ID WHERE a.ID <= 4 AND b.ID >= 2"
+    );
+
+    let alone: Vec<String> = branches
+        .iter()
+        .map(|branch| isolated_pushdown_statement(&mut conn, branch))
+        .collect();
+    assert_eq!(
+        pushdown_statements(&mut conn, &union),
+        alone,
+        "each UNION ALL branch pushes the SQL it pushes as a statement of its own"
+    );
+
+    for (shape, sql, expected_ids, join) in [
+        ("UNION ALL", &union, vec![1, 2, 4, 5], false),
+        ("self-join", &self_join, vec![2, 3, 4], true),
+    ] {
+        let sql = format!("SELECT ID FROM ({sql}) ORDER BY ID");
+        if join {
+            // A fallback to one pushdown per occurrence would also load the table once.
+            let pushed = pushdown_statements(&mut conn, &sql);
+            assert!(
+                pushed.len() == 1 && has_broadcast_join_block(&pushed[0]),
+                "{shape}: one broadcast pushdown: {pushed:?}"
+            );
+        }
+        let mut ids = Vec::new();
+        let [table_gets, log_lists] = stack::count_proxy_requests(
+            [
+                format!(
+                    "GET {}/api/2.1/unity-catalog/tables/unity.delta_e2e.multi_part_stats ",
+                    stack::UNITY_CATALOG_VIA_PROXY
+                )
+                .as_str(),
+                format!(
+                    "GET {}/warehouse?list-type=2&prefix=delta%2Fmulti-part-stats%2F_delta_log%2F",
+                    stack::SEAWEEDFS_VIA_PROXY
+                )
+                .as_str(),
+            ],
+            || ids = int_column(&conn.query_columns(&sql)[0]),
+        );
+
+        assert_eq!(ids, expected_ids, "{shape}: the IDs both filters keep");
+        assert_eq!(table_gets, 1, "{shape}: one Unity table GET");
+        assert_eq!(log_lists, 1, "{shape}: one _delta_log LIST");
+    }
 }

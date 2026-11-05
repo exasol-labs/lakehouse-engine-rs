@@ -152,22 +152,41 @@ pub async fn resolve_parquet_directory(
 }
 
 /// [`resolve_parquet_directory`]'s file selection for a caller declaring its own schema and
-/// partition columns, with no footer read. `keep` runs only after every file's spellings passed
-/// the check, so a predicate never hides a conflict.
-pub async fn list_parquet_files(
-    store: &Arc<dyn ObjectStore>,
-    prefix: &StorePath,
-    partition_columns: &[String],
-    keep: &PartitionKeepPredicate,
-) -> Result<Vec<ParquetFile>, UdfError> {
-    let raw_files = list_data_files(store, prefix, true).await?;
-    let partition_values = fill_partition_values(&raw_files, partition_columns)?;
-    Ok(raw_files
-        .into_iter()
-        .zip(partition_values)
-        .filter(|(_, values)| keep(values))
-        .map(|(raw, values)| raw.with_partition_values(values))
-        .collect())
+/// partition columns, with no footer read. The listing declares no partition column and keeps
+/// every file, so one listing serves every reference to the table, each with its own filter.
+pub struct ParquetListing {
+    files: Vec<ListedFile>,
+}
+
+impl ParquetListing {
+    /// Lists every data file below `prefix` once, with no partition column declared and no footer
+    /// read.
+    pub async fn list(store: &Arc<dyn ObjectStore>, prefix: &StorePath) -> Result<Self, UdfError> {
+        Ok(Self {
+            files: list_data_files(store, prefix, true).await?,
+        })
+    }
+
+    /// The listed files whose `partition_columns` values `keep` admits. `keep` runs only after
+    /// every file's spellings passed the check, so a predicate never hides a conflict.
+    pub fn kept_files(
+        &self,
+        partition_columns: &[String],
+        keep: &PartitionKeepPredicate,
+    ) -> Result<Vec<ParquetFile>, UdfError> {
+        let partition_values = fill_partition_values(&self.files, partition_columns)?;
+        Ok(self
+            .files
+            .iter()
+            .zip(partition_values)
+            .filter(|(_, values)| keep(values))
+            .map(|(listed, partition_values)| ParquetFile {
+                path: listed.path.clone(),
+                size: listed.size,
+                partition_values,
+            })
+            .collect())
+    }
 }
 
 fn segment_keys(raw: &ListedFile) -> impl Iterator<Item = &str> {

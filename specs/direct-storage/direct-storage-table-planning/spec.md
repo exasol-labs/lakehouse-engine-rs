@@ -4,25 +4,14 @@ The adapter resolves a directory of Parquet files into the engine's `ScanSpec` a
 
 ## Background
 
-* There is no snapshot, transaction log, or manifest. The reader turns a table root and the table's column notes into the resolved scan every other reader returns.
-* Format dispatch is one exhaustive match over the scan source, which pairs a resolved session with the table it reads. A further variant is a compile error at that site (`delta/delta-table-planning`).
-* The reader does no listing and no partition parsing of its own. Both come from the listing answer of `direct-storage/parquet-directory-seam-file-listing`, which table enumeration also reads. The reader parses no footer. Its logical schema, partition columns, and refused columns come from the column notes that enumeration recorded (`vs-adapter/column-source-notes`).
-* A logical field with neither a field-id nor a declared physical name binds by its own name, the same binding as Delta's `none` column-mapping mode (`scan-read-path/scan-execution-field-id-projection`).
-* The reader has no catalog statistics to prune from. Its plan-time file list is every file under the table root that `direct-storage/direct-storage-hive-partitioning` keeps. Footer-statistics pruning is not available, because planning reads no footer.
+* A direct-storage table has no snapshot, transaction log, or manifest. A pushdown plans it from its table root and the table's column notes, and sends no catalog request.
+* A pushdown lists the table root by the rules of `direct-storage/parquet-directory-seam-file-listing`, the same rules table enumeration applies, and reads no Parquet footer. The table's logical schema, partition columns, and refused columns come from the column notes that enumeration recorded (`vs-adapter/column-source-notes`).
+* A column whose note records neither a field-id nor a physical name reads the Parquet column of its own name, as Delta's `none` column-mapping mode does (`scan-read-path/scan-execution-field-id-projection`).
+* A direct-storage table has no catalog statistics to prune from. Its plan-time file list is every file under the table root that `direct-storage/direct-storage-hive-partitioning` keeps, and no footer statistics prune it, because planning reads no footer.
 * Nothing bounds a table's file count. Enumeration reads the footers the merge mode selects, so its cost is unbounded on a directory holding hundreds of thousands of files.
-* The reader implements neither the Iceberg nor the Delta format. Reading a directory that holds an Iceberg or Delta table as raw Parquet is a different read, selected through `CATALOG_KIND`, not a deviation from either specification.
-
+* Direct storage implements neither the Iceberg nor the Delta format. Reading a directory that holds an Iceberg or Delta table as raw Parquet is a different read, selected through `CATALOG_KIND`, not a deviation from either specification.
 
 ## Scenarios
-
-### Scenario: The format reader is selected at one exhaustive site for a direct-storage source
-
-* *GIVEN* the scan source whose variant pairs one resolved session with the table it reads, matched exhaustively at exactly ONE site returning a boxed format reader
-* *WHEN* the adapter selects the reader for a direct-storage table
-* *THEN* the scan source SHALL have a direct-storage variant carrying the request's object store and the table root, and the selection site SHALL match every variant EXHAUSTIVELY, so a new source is a compile error there rather than a silent fall-through
-* *AND* that variant MUST NOT carry the directory options or a declared-column list, because the table's declaration reaches every reader from the column notes, and the directory options take effect only at enumeration
-* *AND* the direct-storage variant SHALL carry NO catalog table metadata, because this kind loads no table: its root is composed from the CONNECTION address, the namespace property, and the directory name recorded in the column notes
-* *AND* the error text of the two refusals that run before the format is known, a table with no mappable column and a refused partition column, SHALL name the virtual table instead of a format label
 
 ### Scenario: A direct-storage table resolves its files and schema through the shared seam
 

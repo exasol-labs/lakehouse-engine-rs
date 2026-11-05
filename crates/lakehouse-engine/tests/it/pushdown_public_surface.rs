@@ -1,12 +1,11 @@
 //! External-crate reachability probe: only genuinely `pub` items of `pushdown` compile here
-//! (19 items, a subset of the in-crate probe's 29). The count is stated because the compiler
+//! (16 items, a subset of the in-crate probe's 27). The count is stated because the compiler
 //! catches narrowing, not deletion.
 #![allow(unused_imports)]
 
 use lakehouse_engine::adapter::pushdown::{
-    AggregateMergeInputs, ColumnTypes, ConnectionStorage, FormatReader, GroupedAggregateDetection,
-    GroupedSelectItem, ProjectedColumn, RefusedColumn, ResolvedScan, ScanSource,
+    AggregateMergeInputs, ColumnTypes, ConnectionStorage, GroupedAggregateDetection,
+    GroupedSelectItem, LoadedTable, ProjectedColumn, RefusedColumn, ResolvedScan,
     build_fan_out_inner, build_grouped_aggregate_scan_sql, build_scan_driving_sql,
-    detect_aggregates, detect_group_by_aggregates, format_reader, handle_pushdown, shard_count,
-    validate_agg_col_types,
+    detect_aggregates, detect_group_by_aggregates, shard_count, validate_agg_col_types,
 };

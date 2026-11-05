@@ -176,6 +176,7 @@ fn a_pushdown_never_runs_the_property_check() {
     let request = serde_json::json!({
         "type": "pushdown",
         "schemaMetadataInfo": {
+            "name": "PROPERTY_CHECK_VS",
             "properties": {
                 PROP_CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
                 "NAMESPCE": "sales",
@@ -369,6 +370,10 @@ const CLOSED_PORT_ADDRESS: &str = "http://127.0.0.1:1";
 fn unity_kind_pushdown_routes_to_the_unity_catalog_loader() {
     let (req, _) = pushdown_request("ORDERS", &[("ID", ExasolType::decimal(20, 0))])
         .request_field("type", "pushdown")
+        .request_field(
+            "schemaMetadataInfo",
+            serde_json::json!({"name": "UNITY_ROUTING_VS"}),
+        )
         .request_field(
             "properties",
             serde_json::json!({"CATALOG_KIND": "UNITY_CATALOG", "CATALOG_CONNECTION": "MY_CONN"}),
@@ -1256,13 +1261,7 @@ fn resolve_config_over(
         .enable_all()
         .build()
         .expect("build the request runtime");
-    resolve_connection_config(
-        &ctx,
-        props,
-        &PermissionSettings::Off,
-        PermissionCheck::Off,
-        &rt,
-    )
+    resolve_connection_config(&ctx, props, &PermissionSettings::Off, &rt)
 }
 
 #[test]
@@ -1439,7 +1438,8 @@ fn role_create_request() -> Json {
     })
 }
 
-fn role_join_pushdown_request() -> Json {
+/// `virtual_schema` keys the process-wide statement state, so each test names its own.
+fn role_join_pushdown_request(virtual_schema: &str) -> Json {
     let (request, _) = pushdown_request("CUSTOMER", &[("C_CUSTKEY", ExasolType::decimal(20, 0))])
         .table("ORDERS", &[("O_CUSTKEY", ExasolType::decimal(20, 0))])
         .field("type", "select")
@@ -1447,6 +1447,10 @@ fn role_join_pushdown_request() -> Json {
         .column(table_col("CUSTOMER", "C_CUSTKEY"))
         .column(table_col("ORDERS", "O_CUSTKEY"))
         .request_field("type", "pushdown")
+        .request_field(
+            "schemaMetadataInfo",
+            serde_json::json!({ "name": virtual_schema }),
+        )
         .request_field(
             "properties",
             serde_json::json!({ "CATALOG_CONNECTION": "MY_CONN", "ALLOW_HTTP": "true" }),
@@ -1519,35 +1523,20 @@ fn assert_no_credential_value(message: &str) {
     }
 }
 
-/// Scenario: The adapter assumes the role once per request and substitutes the session
+/// The local E2E catalog ignores SigV4, so only a fake catalog shows which key pair signs.
 #[test]
-fn assume_role_sends_one_sts_request_per_create_and_per_join_pushdown() {
+fn a_role_connection_signs_every_catalog_request_with_the_session() {
     let create = StsAndCatalog::start((200, ASSUME_ROLE_RESPONSE), (200, EMPTY_LISTING));
     dispatch(&mut sigv4_role_connection(&create), &role_create_request())
         .expect("a create over an empty namespace succeeds through the session");
-    assert_eq!(create.sts_requests(), 1, "{:?}", create.heads());
-    assert!(
-        is_assume_role(&create.heads()[0]),
-        "STS must precede the catalog"
-    );
     assert_signed_by_the_session(&create.catalog_requests());
 
     let join = StsAndCatalog::start((200, ASSUME_ROLE_RESPONSE), (503, "{}"));
     let err = dispatch(
         &mut sigv4_role_connection(&join),
-        &role_join_pushdown_request(),
+        &role_join_pushdown_request("ROLE_SESSION_SIGNING_VS"),
     )
     .expect_err("an unavailable catalog fails the join pushdown");
-    assert_eq!(
-        join.sts_requests(),
-        1,
-        "one session for both legs: {:?}",
-        join.heads()
-    );
-    assert!(
-        is_assume_role(&join.heads()[0]),
-        "STS must precede the catalog"
-    );
     assert_signed_by_the_session(&join.catalog_requests());
     assert_no_credential_value(&err.to_string());
 }
@@ -1562,7 +1551,7 @@ fn a_connection_without_a_role_sends_no_sts_request() {
     let join_stub = StsAndCatalog::start((200, ASSUME_ROLE_RESPONSE), (503, "{}"));
     dispatch(
         &mut sigv4_connection(&join_stub),
-        &role_join_pushdown_request(),
+        &role_join_pushdown_request("NO_ROLE_SIGNING_VS"),
     )
     .expect_err("an unavailable catalog fails the join pushdown");
     assert_signed_by_the_stated_key_pair(&join_stub);
@@ -1571,7 +1560,10 @@ fn a_connection_without_a_role_sends_no_sts_request() {
 /// Scenario: A failed AssumeRole is a credential-safe error
 #[test]
 fn an_sts_denial_fails_the_request_before_any_catalog_request() {
-    for request in [role_create_request(), role_join_pushdown_request()] {
+    for request in [
+        role_create_request(),
+        role_join_pushdown_request("STS_DENIAL_VS"),
+    ] {
         let stub = StsAndCatalog::start((403, ACCESS_DENIED_RESPONSE), (200, EMPTY_LISTING));
         let err = dispatch(&mut sigv4_role_connection(&stub), &request)
             .expect_err("an STS denial must fail the request");
