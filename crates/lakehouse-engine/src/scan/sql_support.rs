@@ -1,6 +1,7 @@
 use arrow::datatypes::DataType;
 use datafusion::common::DFSchema;
 
+use crate::exasol::quote_ident;
 use crate::scan::spec::{ColumnRef, ProjectionItem};
 use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
 
@@ -105,10 +106,6 @@ pub(super) fn render_column(column: &ColumnRef, data_type: Option<&DataType>) ->
         Some(dt) if needs_json_fallback(dt) => format!("CAST({ident} AS VARCHAR)"),
         _ => ident,
     }
-}
-
-pub(super) fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 #[cfg(test)]

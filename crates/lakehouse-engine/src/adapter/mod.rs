@@ -40,6 +40,7 @@ use crate::adapter::table_identity::{encode_identifier_note, read_identifier};
 use crate::adapter::tables::{
     catalog_identifier_string, flatten_table_name, reject_name_collisions,
 };
+use crate::exasol::CATALOG_CONNECTION;
 use crate::scan::sealed::SealedStorageKey;
 use crate::scan::spec::DEFAULT_S3_MAX_CONNECTIONS;
 use crate::scan::spec::StorageBackend;
@@ -152,7 +153,7 @@ fn resolve_connection_config(
     let kind = catalog_kind::resolve_catalog_kind(props)?;
     permission.require_supported_kind(kind)?;
     let connection_name = nonempty_str(props, PROP_CATALOG_CONNECTION)
-        .ok_or_else(|| UdfError::User("CATALOG_CONNECTION is required".into()))?;
+        .ok_or_else(|| UdfError::User(format!("{CATALOG_CONNECTION} is required")))?;
     let resolved = read_connection(ctx, Some(connection_name), kind)?;
     permission.require_management_url(&resolved.uri)?;
     let allow_http = resolve_allow_http(props);

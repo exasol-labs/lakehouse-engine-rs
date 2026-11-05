@@ -1,10 +1,15 @@
 //! `EXPORT ... INTO SCRIPT` through one SET script: its export hook answers a SELECT that
 //! calls the same script as the writer. No log event, script output, or CONNECTION value.
 
+use crate::exasol::{
+    CATALOG_CONNECTION, catalog_connection_name, group_count, parse_boolean, parse_whole_number,
+    quote_ident, sql_string_literal,
+};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::spec::{ExportSpec, Parameter};
 use serde::Deserialize;
+use std::num::NonZeroUsize;
 
 /// The script name the installer creates and the writer SELECT calls.
 pub const EXPORT_SCRIPT_NAME: &str = "LAKEHOUSE_EXPORT";
@@ -89,7 +94,6 @@ fn refusal(message: impl std::fmt::Display) -> UdfError {
     UdfError::User(format!("{EXPORT_SCRIPT_NAME}: {message}"))
 }
 
-const CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
 const TABLE_NAME: &str = "TABLE_NAME";
 const WRITERS_PER_NODE: &str = "WRITERS_PER_NODE";
 const SINGLE_COMMIT: &str = "SINGLE_COMMIT";
@@ -186,12 +190,13 @@ impl<'a> WithOptions<'a> {
     }
 
     fn connection_name(&self) -> Result<String, UdfError> {
-        match self.catalog_connection {
-            Some(name) if !name.is_empty() => Ok(name.to_string()),
-            _ => Err(refusal(format_args!(
-                "option {CATALOG_CONNECTION} is required; set {CATALOG_CONNECTION} = '<connection>', naming the CONNECTION object the virtual schema uses"
-            ))),
-        }
+        catalog_connection_name(self.catalog_connection)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                refusal(format_args!(
+                    "option {CATALOG_CONNECTION} is required; set {CATALOG_CONNECTION} = '<connection>', naming the CONNECTION object the virtual schema uses"
+                ))
+            })
     }
 
     fn writer_layout(&self) -> Result<WriterLayout, UdfError> {
@@ -227,30 +232,22 @@ fn check_table_name(value: Option<&str>) -> Result<(), UdfError> {
 }
 
 fn parse_writers_per_node(value: &str) -> Result<usize, UdfError> {
-    let all_digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
-    match value.parse::<usize>() {
-        Ok(writers) if all_digits && writers >= 1 => Ok(writers),
-        _ => Err(refusal(format_args!(
-            "{WRITERS_PER_NODE} = '{value}' is not an integer of at least 1 that fits in 64 bits, for example {WRITERS_PER_NODE} = '4'"
-        ))),
-    }
+    parse_whole_number::<NonZeroUsize>(value)
+        .map(NonZeroUsize::get)
+        .map_err(|expected| {
+            refusal(format_args!(
+                "{WRITERS_PER_NODE} = '{value}' is not {expected}, for example {WRITERS_PER_NODE} = '4'"
+            ))
+        })
 }
 
 fn parse_single_commit(value: &str) -> Result<bool, UdfError> {
-    if value.eq_ignore_ascii_case("true") {
-        Ok(true)
-    } else if value.eq_ignore_ascii_case("false") {
-        Ok(false)
-    } else {
-        Err(refusal(format_args!(
+    parse_boolean(value).ok_or_else(|| {
+        refusal(format_args!(
             "{SINGLE_COMMIT} = '{value}' is not 'true' or 'false'"
-        )))
-    }
+        ))
+    })
 }
-
-/// Exasol distributes groups round-robin up to this count; above it they are
-/// hash-partitioned (unbalanced).
-const MAX_WRITER_COUNT: usize = 300;
 
 /// The SELECT the export hook answers with. It calls the export script itself as the
 /// writer, so `run` sees the writer spec first and then the source columns.
@@ -267,15 +264,15 @@ impl WriterSelect<'_> {
     /// Exasol binds `DUAL` to the export source. Every source row reaches exactly one of
     /// G writers through the `MOD(ROWNUM, G)` group key.
     fn render(&self) -> String {
-        let arguments = std::iter::once(string_literal(self.writer_spec))
+        let arguments = std::iter::once(sql_string_literal(self.writer_spec))
             .chain(self.source_columns.iter().cloned())
             .collect::<Vec<_>>()
             .join(", ");
         // The key stays top-level: an export SELECT over a subquery of DUAL fails.
         format!(
             "SELECT {}.{}({arguments}) FROM DUAL GROUP BY MOD(ROWNUM, {})",
-            quote_identifier(self.script_schema),
-            quote_identifier(EXPORT_SCRIPT_NAME),
+            quote_ident(self.script_schema),
+            quote_ident(EXPORT_SCRIPT_NAME),
             self.group_count(),
         )
     }
@@ -283,23 +280,9 @@ impl WriterSelect<'_> {
     fn group_count(&self) -> usize {
         match self.writers {
             WriterLayout::SingleCommit => 1,
-            WriterLayout::PerNode(per_node) => writer_count(self.node_count, per_node),
+            WriterLayout::PerNode(per_node) => group_count(self.node_count, per_node, usize::MAX),
         }
     }
-}
-
-fn writer_count(node_count: usize, per_node: usize) -> usize {
-    node_count
-        .saturating_mul(per_node)
-        .clamp(1, MAX_WRITER_COUNT)
-}
-
-fn quote_identifier(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-fn string_literal(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
 }
 
 #[cfg(test)]

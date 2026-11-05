@@ -5,7 +5,8 @@ use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column
 use serde_json::Value as Json;
 use vs_expression::{ColumnNode, render_expression, render_expression_exasol};
 
-use super::support::{cast_to_declared_type, quote_ident};
+use super::support::cast_to_declared_type;
+use crate::exasol::quote_ident;
 use crate::types::exasol_type::ExasolType;
 
 /// Declared type of a plan slot reached only through a nested aggregate. Numeric,

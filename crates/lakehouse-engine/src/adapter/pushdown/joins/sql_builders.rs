@@ -11,7 +11,7 @@ use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
     ColumnTypes, ProjectedColumn, build_scan_driving_sql, classify_where_filter,
     collect_all_column_names, extract_limit, extract_offset, project_columns, projection_items,
-    quote_ident, render_limit_offset, scan_storage_for, shard_count,
+    render_limit_offset, scan_storage_for, shard_count,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_flags, wrap_declined_order_by};
 use super::attribution::{JoinLegs, UnattributableColumn};
@@ -24,6 +24,7 @@ use super::rendering::{
     render_df_filter_qualified, render_expression_qualified, renderable_only,
     type_screened_leg_filter,
 };
+use crate::exasol::quote_ident;
 
 /// Exasol rejects a longer identifier (`maximum length of identifier exceeded`, verified live
 /// with `SELECT 1 AS "<129 chars>"`); the limit counts characters, not bytes.

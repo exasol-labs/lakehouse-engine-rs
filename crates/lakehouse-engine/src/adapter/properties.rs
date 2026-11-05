@@ -3,16 +3,16 @@
 
 use super::nonempty_str;
 use super::table_filter::{TableFilter, parse_patterns};
+use crate::exasol::{CATALOG_CONNECTION, WholeNumber, parse_boolean, parse_whole_number};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
-use std::str::FromStr;
 
 // Read from plain VS properties, never the CONNECTION password JSON. Absent means Iceberg REST.
 pub(super) const PROP_CATALOG_KIND: &str = "CATALOG_KIND";
 // CONNECTION whose address is the catalog URI and whose password is the credential JSON.
-pub(super) const PROP_CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
+pub(super) const PROP_CATALOG_CONNECTION: &str = CATALOG_CONNECTION;
 pub(super) const PROP_NAMESPACE: &str = "NAMESPACE";
 pub(super) const PROP_ALLOW_HTTP: &str = "ALLOW_HTTP";
 pub(super) const PROP_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
@@ -268,34 +268,6 @@ fn echo(raw: &str) -> String {
     echoed
 }
 
-/// A whole-number property type; its range is the range the property accepts, so the check and
-/// its message share one definition.
-trait WholeNumber: FromStr {
-    const MIN: u128;
-    const MAX: u128;
-}
-
-macro_rules! whole_number {
-    ($ty:ty, $min:expr, $max:expr) => {
-        impl WholeNumber for $ty {
-            const MIN: u128 = $min as u128;
-            const MAX: u128 = $max as u128;
-        }
-    };
-}
-
-whole_number!(NonZeroU8, NonZeroU8::MIN.get(), NonZeroU8::MAX.get());
-whole_number!(NonZeroU16, NonZeroU16::MIN.get(), NonZeroU16::MAX.get());
-whole_number!(NonZeroU32, NonZeroU32::MIN.get(), NonZeroU32::MAX.get());
-whole_number!(NonZeroU64, NonZeroU64::MIN.get(), NonZeroU64::MAX.get());
-whole_number!(u16, u16::MIN, u16::MAX);
-
-/// Every parse error, overflow included, maps to the range expectation.
-fn parse_whole_number<T: WholeNumber>(raw: &str) -> Result<T, String> {
-    raw.parse()
-        .map_err(|_| format!("a whole number from {} to {}", T::MIN, T::MAX))
-}
-
 fn parse_fraction(raw: &str) -> Result<f64, String> {
     raw.parse::<f64>()
         .ok()
@@ -310,17 +282,6 @@ fn parse_threading_mode(raw: &str) -> Result<ThreadingMode, String> {
         Ok(ThreadingMode::Fixed)
     } else {
         Err("AUTO or FIXED".to_string())
-    }
-}
-
-/// The one spelling rule of every boolean property: `TRUE` or `FALSE` in any letter case.
-pub(super) fn parse_boolean(raw: &str) -> Option<bool> {
-    if raw.eq_ignore_ascii_case("TRUE") {
-        Some(true)
-    } else if raw.eq_ignore_ascii_case("FALSE") {
-        Some(false)
-    } else {
-        None
     }
 }
 

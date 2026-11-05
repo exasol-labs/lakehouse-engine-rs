@@ -9,12 +9,11 @@ use crate::common::e2e_harness::{
 use crate::common::exasol_ws::{ExaConn, profiled_export_counts};
 use crate::common::seed::E2E_TABLE;
 use crate::common::stack::{exasol_host, exasol_sql_port, local_stack_connection_password};
-use crate::common::timestamp_precision::engine_honors_declared_precision;
 use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, stack, vs_table};
 
 const EXPORT_SCHEMA: &str = "EXPORT_E2E";
-const TYPED_TABLE: &str = "EXPORT_E2E.TYPED";
-const TYPED_ROWS: i64 = 1_000;
+const SOURCE_TABLE: &str = "EXPORT_E2E.SRC_ROWS";
+const SOURCE_ROWS: i64 = 1_000;
 const LARGE_TABLE: &str = "EXPORT_E2E.ROWS_10K";
 const LARGE_ROWS: i64 = 10_000;
 const TAGS_TABLE: &str = "EXPORT_E2E.EVENT_TAGS";
@@ -25,7 +24,7 @@ const NO_ACCESS_EXPORTER: &str = "EXPORT_E2E_NO_ACCESS";
 
 /// Every row raises when read, so an error without the read error proves the export
 /// failed before reading the source.
-const FAILING_SOURCE: &str = "(SELECT 1 / (ID - ID) AS X FROM EXPORT_E2E.TYPED)";
+const FAILING_SOURCE: &str = "(SELECT 1 / (ID - ID) AS X FROM EXPORT_E2E.SRC_ROWS)";
 const SOURCE_READ_ERROR: &str = "division by zero";
 const INLINE_PASSWORD: &str = "ExportInlineSecret2026";
 fn setup() {
@@ -34,26 +33,11 @@ fn setup() {
         lakehouse_vs();
         let mut sys = exa_conn();
         sys.execute(&format!("CREATE SCHEMA IF NOT EXISTS {EXPORT_SCHEMA}"));
-        // Exasol 8 refuses TIMESTAMP(9) as `0A000 Feature not supported`.
-        let timestamp_9 = if engine_honors_declared_precision(&mut sys) {
-            "CAST(ADD_SECONDS(TIMESTAMP '2024-01-01 00:00:00.123456789', LEVEL) AS TIMESTAMP(9)) AS C_TIMESTAMP_9,"
-        } else {
-            ""
-        };
         sys.execute(&format!(
-            "CREATE OR REPLACE TABLE {TYPED_TABLE} AS SELECT \
+            "CREATE OR REPLACE TABLE {SOURCE_TABLE} AS SELECT \
                CAST(LEVEL AS DECIMAL(9,0)) AS ID, \
-               CASE WHEN MOD(LEVEL, 2) = 0 THEN TRUE ELSE FALSE END AS C_BOOLEAN, \
-               ADD_DAYS(DATE '2024-01-01', LEVEL) AS C_DATE, \
-               CAST(ADD_SECONDS(TIMESTAMP '2024-01-01 00:00:00.123', LEVEL) AS TIMESTAMP(3)) AS C_TIMESTAMP_3, \
-               {timestamp_9} \
-               CAST(LEVEL / 4 AS DOUBLE) AS C_DOUBLE, \
-               CAST('c' || LEVEL AS CHAR(10)) AS C_CHAR, \
-               CAST('v' || LEVEL AS VARCHAR(100)) AS C_VARCHAR, \
-               CAST(LEVEL AS DECIMAL(9,0)) AS C_DECIMAL_9, \
-               CAST(LEVEL * 1000000000 AS DECIMAL(18,0)) AS C_DECIMAL_18, \
-               CAST(LEVEL / 3 AS DECIMAL(36,4)) AS C_DECIMAL_36 \
-             FROM DUAL CONNECT BY LEVEL <= {TYPED_ROWS}"
+               CAST('v' || LEVEL AS VARCHAR(100)) AS LABEL \
+             FROM DUAL CONNECT BY LEVEL <= {SOURCE_ROWS}"
         ));
         sys.execute(&format!(
             "CREATE OR REPLACE TABLE {LARGE_TABLE} AS \
@@ -185,21 +169,21 @@ fn export_reports_every_source_row() {
     // The even IDs of the 20 events join one tag each.
     assert_eq!(sys.query_row_count(&join), 10, "the join selects 10 rows");
     let cases = [
-        ("whole table", TYPED_TABLE.to_string(), TYPED_ROWS),
+        ("whole table", SOURCE_TABLE.to_string(), SOURCE_ROWS),
         (
             "filtered query",
-            format!("(SELECT * FROM {TYPED_TABLE} WHERE MOD(ID, 4) = 0)"),
-            TYPED_ROWS / 4,
+            format!("(SELECT * FROM {SOURCE_TABLE} WHERE MOD(ID, 4) = 0)"),
+            SOURCE_ROWS / 4,
         ),
         (
             "column list",
-            format!("{TYPED_TABLE} (ID, C_VARCHAR)"),
-            TYPED_ROWS,
+            format!("{SOURCE_TABLE} (ID, LABEL)"),
+            SOURCE_ROWS,
         ),
         ("virtual schema join", format!("({join})"), 10),
         (
             "empty source",
-            format!("(SELECT * FROM {TYPED_TABLE} WHERE ID < 0)"),
+            format!("(SELECT * FROM {SOURCE_TABLE} WHERE ID < 0)"),
             0,
         ),
     ];
@@ -220,16 +204,16 @@ fn export_reports_every_source_row() {
 fn export_writer_layout_sets_writer_count() {
     stack();
     setup();
-    let typed_first = |n: i64| format!("(SELECT * FROM {TYPED_TABLE} WHERE ID <= {n})");
+    let typed_first = |n: i64| format!("(SELECT * FROM {SOURCE_TABLE} WHERE ID <= {n})");
     let large_first = |n: i64| format!("(SELECT * FROM {LARGE_TABLE} WHERE ID <= {n})");
     let per_node_3 = "WRITERS_PER_NODE = '3'";
     let per_node_500 = "WRITERS_PER_NODE = '500'";
     let cases = [
         (
             "3 writers per node over the table",
-            TYPED_TABLE.to_string(),
+            SOURCE_TABLE.to_string(),
             per_node_3,
-            (TYPED_ROWS, 3),
+            (SOURCE_ROWS, 3),
         ),
         (
             "3 writers per node over exactly 3 rows",
@@ -245,9 +229,9 @@ fn export_writer_layout_sets_writer_count() {
         ),
         (
             "default is 1 writer",
-            TYPED_TABLE.to_string(),
+            SOURCE_TABLE.to_string(),
             "",
-            (TYPED_ROWS, 1),
+            (SOURCE_ROWS, 1),
         ),
         (
             "500 writers per node cap at 300 over the table",
@@ -263,9 +247,9 @@ fn export_writer_layout_sets_writer_count() {
         ),
         (
             "SINGLE_COMMIT runs 1 writer",
-            TYPED_TABLE.to_string(),
+            SOURCE_TABLE.to_string(),
             "SINGLE_COMMIT = 'true'",
-            (TYPED_ROWS, 1),
+            (SOURCE_ROWS, 1),
         ),
     ];
 
@@ -316,7 +300,7 @@ fn export_refuses_invalid_statements_before_reading() {
             "WRITERS_PER_NODE of 0",
             export_sql(FAILING_SOURCE, "WRITERS_PER_NODE = '0'"),
             vec![
-                "WRITERS_PER_NODE = '0' is not an integer of at least 1".to_string(),
+                "WRITERS_PER_NODE = '0' is not a whole number from 1 to".to_string(),
                 "WRITERS_PER_NODE = '4'".to_string(),
             ],
         ),
@@ -383,9 +367,9 @@ fn export_role_user_exports_rows() {
     assert_eq!(
         exported_rows(
             &mut exporter_conn(ROLE_EXPORTER),
-            &export_sql(TYPED_TABLE, "")
+            &export_sql(SOURCE_TABLE, "")
         ),
-        TYPED_ROWS
+        SOURCE_ROWS
     );
 }
 

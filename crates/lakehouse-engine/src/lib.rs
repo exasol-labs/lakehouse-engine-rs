@@ -10,6 +10,7 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 
 pub mod adapter;
+mod exasol;
 pub mod export;
 pub mod scan;
 #[cfg(test)]

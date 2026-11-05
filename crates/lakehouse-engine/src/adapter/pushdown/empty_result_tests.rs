@@ -1,6 +1,6 @@
-use super::super::support::quote_ident;
 use super::super::test_support::*;
 use super::*;
+use crate::exasol::quote_ident;
 use crate::scan::spec::ProjectionItem;
 
 fn relation(col_types: &[(String, ExasolType)]) -> EmptyRelation {

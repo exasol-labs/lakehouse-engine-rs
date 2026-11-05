@@ -347,7 +347,7 @@ mod options {
         };
         let appends = "only appends rows";
         let table_form = "'<namespace>.<table>'";
-        let integer_form = "an integer of at least 1";
+        let integer_form = "a whole number from 1 to";
         let cases: Vec<(&str, ExportSpec, Vec<&str>)> = vec![
             ("TRUNCATE", truncate, vec!["TRUNCATE", appends]),
             ("REPLACE", replace, vec!["REPLACE", appends]),
