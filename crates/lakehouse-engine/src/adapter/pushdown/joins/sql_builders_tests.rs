@@ -2583,38 +2583,39 @@ fn n_scan_join_untranslatable_select_item_is_hard_error() {
     );
 }
 
-#[test]
-fn qualified_single_table_untranslatable_select_item_is_hard_error() {
-    let request = serde_json::json!({
-        "involvedTables": [{"name": "T", "columns": [
-            {"name": "ID", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]}],
-    });
-    let pushdown_req = pushdown_request("T", &[("ID", ExasolType::WIDEST_VARCHAR)])
-        .column(table_col("T", "ID"))
-        .item(
-            serde_json::json!({"type": "no_such_node_type_in_either_dialect"}),
-            ExasolType::WIDEST_VARCHAR,
-        )
-        .build_pushdown();
-    let col_types = vec![("ID".to_string(), ExasolType::decimal(20, 0))];
+/// The qualified single-table wrapper over one shard of `request`'s first table.
+fn qualified_fallback_for(request: PushdownRequestBuilder) -> Result<Json, UdfError> {
+    let (request, _) = request.build();
     let base = CommonScanSpec {
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
     };
-    let shards = vec![vec![FileEntry::new("s3://w/f-0.parquet", 10)]];
-
-    let err = qualified_single_table_fallback_pushdown(
+    qualified_single_table_fallback_pushdown(
         &request,
-        &pushdown_req,
+        &parsed_pushdown(&request),
         &base,
         None,
-        &shards,
-        &column_types(&col_types),
+        &[vec![FileEntry::new("s3://w/f-0.parquet", 10)]],
+        &first_table_column_types(&request),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         None,
     )
-    .expect_err("an untranslatable select-list item must be a hard error");
+}
+
+fn table_t_with_id() -> PushdownRequestBuilder {
+    pushdown_request("T", &[("ID", ExasolType::decimal(20, 0))])
+}
+
+#[test]
+fn qualified_single_table_untranslatable_select_item_is_hard_error() {
+    let request = table_t_with_id().column(table_col("T", "ID")).item(
+        serde_json::json!({"type": "no_such_node_type_in_either_dialect"}),
+        ExasolType::WIDEST_VARCHAR,
+    );
+
+    let err = qualified_fallback_for(request)
+        .expect_err("an untranslatable select-list item must be a hard error");
     assert!(
         matches!(&err, UdfError::User(msg) if msg.contains("select-list item could not be rendered")),
         "the refusal must come from the shared select-list render site: {err}"
@@ -2623,35 +2624,13 @@ fn qualified_single_table_untranslatable_select_item_is_hard_error() {
 
 #[test]
 fn qualified_single_table_wrapper_projects_tstz_literal_converted_to_session_zone() {
-    let request = serde_json::json!({
-        "involvedTables": [{"name": "T", "columns": [
-            {"name": "ID", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]}],
-    });
-    let pushdown_req = pushdown_request("T", NO_COLUMNS)
-        .item(
-            lit("literal_timestamputc", "2024-03-01 09:00:00"),
-            ExasolType::TimestampWithLocalTimeZone { precision: 3 },
-        )
-        .build_pushdown();
-    let col_types = vec![("ID".to_string(), ExasolType::decimal(20, 0))];
-    let base = CommonScanSpec {
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    };
-    let shards = vec![vec![FileEntry::new("s3://w/f-0.parquet", 10)]];
+    let request = table_t_with_id().item(
+        lit("literal_timestamputc", "2024-03-01 09:00:00"),
+        ExasolType::TimestampWithLocalTimeZone { precision: 3 },
+    );
 
-    let resp = qualified_single_table_fallback_pushdown(
-        &request,
-        &pushdown_req,
-        &base,
-        None,
-        &shards,
-        &column_types(&col_types),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        None,
-    )
-    .expect("a TSTZ-declared literal must render via the qualified wrapper");
+    let resp = qualified_fallback_for(request)
+        .expect("a TSTZ-declared literal must render via the qualified wrapper");
     let sql = resp["sql"].as_str().expect("sql field");
     assert!(
         sql.contains(

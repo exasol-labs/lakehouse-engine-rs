@@ -56,7 +56,7 @@ The adapter declares a pushed-down result column as Exasol `CHAR(n)` when Exasol
 * *AND* the outer merge item SHALL be the uncast `MIN("PARTIAL_min_0")`, because the partial column already carries the declared `CHAR(20)` (`pushdown-aggregates/pushdown-planning-single-group-agg`)
 * *AND* the pushdown MUST NOT be declined for this shape, because `CHAR(n)` is both a valid `EMITS` output type and a valid `CAST` target
 
-### Scenario: A VARCHAR-declared type is unaffected
+### Scenario: A VARCHAR dataType renders as VARCHAR(n) and its group key is not padded
 
 * *GIVEN* a `dataType` JSON object `{"type":"VARCHAR","size":10}`, the shape Exasol sends for a GROUP BY on a genuine VARCHAR base column
 * *WHEN* the adapter derives that ordinal's Exasol type string

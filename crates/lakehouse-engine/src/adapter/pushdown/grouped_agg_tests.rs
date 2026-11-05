@@ -17,11 +17,13 @@ fn scalar_over_merge_casts_to_exasol_char_target() {
         "arguments": [col("x")]
     });
     let plans = vec![parse_agg_item(&sum_node).expect("SUM(x) must parse to a plan")];
-    let node = serde_json::json!({
-        "type": "function_scalar_cast", "name": "CAST",
-        "arguments": [sum_node],
-        "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}
-    });
+    let node = cast_to(
+        ExasolType::Char {
+            size: 20,
+            ascii: true,
+        },
+        sum_node,
+    );
     let sql = render_scalar_over_merge(&node, &plans, &merge_select_items(&plans))
         .expect("CAST over a mergeable aggregate must render");
     assert!(
@@ -46,17 +48,11 @@ fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
         "arguments": [col("x")]
     });
     let plans = vec![parse_agg_item(&sum_node).expect("SUM(x) must parse to a plan")];
-    let char_type = serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "ASCII"});
-    let inner = serde_json::json!({
-        "type": "function_scalar_cast", "name": "CAST",
-        "arguments": [sum_node],
-        "dataType": char_type,
-    });
-    let node = serde_json::json!({
-        "type": "function_scalar_cast", "name": "CAST",
-        "arguments": [inner],
-        "dataType": char_type,
-    });
+    let char_type = ExasolType::Char {
+        size: 20,
+        ascii: true,
+    };
+    let node = cast_to(char_type, cast_to(char_type, sum_node));
     let sql = render_scalar_over_merge(&node, &plans, &merge_select_items(&plans))
         .expect("a nested CAST over a mergeable aggregate must render");
     assert_eq!(
@@ -237,26 +233,6 @@ fn grouped_request(
     group_by: Vec<serde_json::Value>,
 ) -> PushdownRequestBuilder {
     pushdown_request("T", columns).group_by(group_by)
-}
-
-/// Its own `dataType` is the only place the key's type appears when the key is not
-/// also in the select list.
-fn char_cast_key(size: u64, character_set: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": {"type": "CHAR", "size": size, "characterSet": character_set},
-        "arguments": [col("NAME")],
-    })
-}
-
-fn varchar_cast_key(size: u64) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": {"type": "VARCHAR", "size": size},
-        "arguments": [col("NAME")],
-    })
 }
 
 fn mod_item(column: &str, divisor: i64) -> serde_json::Value {
@@ -2083,7 +2059,7 @@ fn group_key_exasol_types_resolves_char_case_key() {
     );
 }
 
-/// Scenario: A VARCHAR-declared type is unaffected
+/// Scenario: A VARCHAR dataType renders as VARCHAR(n) and its group key is not padded
 #[test]
 fn group_key_exasol_types_resolves_varchar_key_unchanged() {
     let req = grouped_request(&[("REGION", ExasolType::varchar(10))], vec![col("REGION")])
@@ -2104,7 +2080,7 @@ fn group_key_exasol_types_resolves_varchar_key_unchanged() {
 
 #[test]
 fn group_key_exasol_types_resolves_char_type_for_unprojected_group_key() {
-    let req = grouped_request(NO_COLUMNS, vec![char_cast_key(20, "UTF8")])
+    let req = grouped_request(NO_COLUMNS, vec![cast_to(ExasolType::char(20), col("NAME"))])
         .count_star()
         .build_pushdown();
     let detection = detect_group_by_aggregates(&req)
@@ -2131,9 +2107,12 @@ fn group_key_exasol_types_resolves_char_type_for_unprojected_group_key() {
 
 #[test]
 fn group_key_exasol_types_resolves_varchar_type_for_unprojected_group_key() {
-    let req = grouped_request(NO_COLUMNS, vec![varchar_cast_key(10)])
-        .count_star()
-        .build_pushdown();
+    let req = grouped_request(
+        NO_COLUMNS,
+        vec![cast_to(ExasolType::varchar(10), col("NAME"))],
+    )
+    .count_star()
+    .build_pushdown();
     let detection = detect_group_by_aggregates(&req)
         .expect("an unprojected group key must still detect as a grouped aggregate");
 
@@ -2149,8 +2128,11 @@ fn group_key_exasol_types_resolves_varchar_type_for_unprojected_group_key() {
 
 #[test]
 fn group_key_exasol_types_prefers_select_list_type_over_group_by_type() {
-    let req = grouped_request(NO_COLUMNS, vec![char_cast_key(20, "UTF8")])
-        .item(char_cast_key(20, "UTF8"), ExasolType::varchar(30))
+    let req = grouped_request(NO_COLUMNS, vec![cast_to(ExasolType::char(20), col("NAME"))])
+        .item(
+            cast_to(ExasolType::char(20), col("NAME")),
+            ExasolType::varchar(30),
+        )
         .count_star()
         .build_pushdown();
     let detection = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
@@ -2198,12 +2180,7 @@ fn constant_projection_casts_literal_to_char() {
 
 #[test]
 fn min_over_char_expression_declares_char_partial_and_an_uncast_merge() {
-    let cast_arg = serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "arguments": [col("C_VARCHAR")],
-        "dataType": {"type": "CHAR", "size": 20, "characterSet": "UTF8"}
-    });
+    let cast_arg = cast_to(ExasolType::char(20), col("C_VARCHAR"));
     let req = grouped_request(&[("REGION", ExasolType::varchar(100))], vec![col("REGION")])
         .column(col("REGION"))
         .item(agg_item_expr("MIN", cast_arg, false), ExasolType::char(20))
@@ -2588,7 +2565,7 @@ fn char_pad_leaves_an_over_length_value_unmodified() {
     }
 }
 
-/// Scenario: A VARCHAR-declared type is unaffected
+/// Scenario: A VARCHAR dataType renders as VARCHAR(n) and its group key is not padded
 #[test]
 fn varchar_declared_group_key_is_left_unpadded() {
     let keys = vec![r#""REGION""#.to_string()];

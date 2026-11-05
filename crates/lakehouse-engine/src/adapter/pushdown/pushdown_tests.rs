@@ -1617,15 +1617,8 @@ fn dispatch_non_widened_projection_at_matching_arity_takes_scan_path() {
 }
 
 fn timestamp_cast_select_request(precision: u8) -> PushdownRequestBuilder {
-    guard_events().item(
-        serde_json::json!({
-            "type": "function_scalar_cast",
-            "name": "CAST",
-            "dataType": {"type": "TIMESTAMP", "fractionalSecondsPrecision": precision},
-            "arguments": [table_col("EVENTS", "NAME")]
-        }),
-        ExasolType::timestamp(precision),
-    )
+    let target = ExasolType::timestamp(precision);
+    guard_events().item(cast_to(target, table_col("EVENTS", "NAME")), target)
 }
 
 #[test]
@@ -2052,15 +2045,6 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
     );
 }
 
-fn char_cast_key(size: u64, character_set: &str) -> Json {
-    serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": {"type": "CHAR", "size": size, "characterSet": character_set},
-        "arguments": [col("NAME")]
-    })
-}
-
 /// A bare column `key` is declared in `key_type` by the table itself, as Exasol declares it.
 fn char_grouped_request(key: Json, key_type: ExasolType, order_by: Option<Json>) -> Json {
     let key_column = key["type"] == "column";
@@ -2099,7 +2083,11 @@ fn embedded_group_keys(fragments: &[String]) -> String {
 
 #[test]
 fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
-    let request = char_grouped_request(char_cast_key(20, "UTF8"), ExasolType::char(20), None);
+    let request = char_grouped_request(
+        cast_to(ExasolType::char(20), col("NAME")),
+        ExasolType::char(20),
+        None,
+    );
 
     let sql = guard_dispatch_sql(
         &request,
@@ -2127,7 +2115,7 @@ fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
 
 #[test]
 fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
-    let request = unprojected_char_grouped_request(char_cast_key(20, "UTF8"));
+    let request = unprojected_char_grouped_request(cast_to(ExasolType::char(20), col("NAME")));
 
     let sql = guard_dispatch_sql(
         &request,
@@ -2151,12 +2139,7 @@ fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
 
 #[test]
 fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
-    let request = unprojected_char_grouped_request(serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": {"type": "VARCHAR", "size": 10},
-        "arguments": [col("NAME")]
-    }));
+    let request = unprojected_char_grouped_request(cast_to(ExasolType::varchar(10), col("NAME")));
 
     let sql = guard_dispatch_sql(
         &request,
@@ -2182,7 +2165,13 @@ fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
 #[test]
 fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
     let request = char_grouped_request(
-        char_cast_key(3, "ASCII"),
+        cast_to(
+            ExasolType::Char {
+                size: 3,
+                ascii: true,
+            },
+            col("NAME"),
+        ),
         ExasolType::Char {
             size: 3,
             ascii: true,

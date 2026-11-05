@@ -2415,15 +2415,6 @@ fn renders_cast_varchar_exasol_dialect_includes_length() {
 }
 
 #[test]
-fn renders_cast_char_exasol_dialect_includes_length() {
-    let expr = cast(json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"}));
-    assert_eq!(
-        render_expression_exasol(&expr).unwrap(),
-        r#"CAST("X" AS CHAR(3) ASCII)"#
-    );
-}
-
-#[test]
 fn cast_char_target_diverges_between_dialects() {
     let expr = json!({
         "type": "function_scalar_cast", "name": "CAST",

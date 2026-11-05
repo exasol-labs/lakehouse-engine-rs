@@ -608,7 +608,7 @@ fn rewrite_decimal_stringifications(node: &Json, col_types: &ColumnTypes) -> Jso
         let node_type = out.get("type").and_then(|t| t.as_str()).unwrap_or("");
         Some(match node_type {
             "function_scalar_cast" => {
-                // An invalid target stays in the tree for `render_cast_target` to refuse.
+                // An invalid target stays in the tree for `render_cast` to refuse.
                 let target_is_string = out
                     .get("dataType")
                     .map(exasol_type_from_json)

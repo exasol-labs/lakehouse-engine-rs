@@ -94,7 +94,7 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 * *AND* Exasol's limits are DECIMAL precision 1 to 36 with scale 0 to the precision, CHAR size 1 to 2,000, VARCHAR size 1 to 2,000,000, TIMESTAMP precision 0 to 9, INTERVAL leading precision 1 to 9 and fraction 0 to 9, and HASHTYPE size 1 to 1,024 bytes
 * *WHEN* the adapter plans the pushdown
 * *THEN* the adapter SHALL fail the query with an error that names the missing `selectListDataTypes` or the offending `dataType` object
-* *AND* the adapter MUST NOT substitute a default for an absent field, except precision 3 for an absent TIMESTAMP `fractionalSecondsPrecision`, `false` for an absent `withLocalTimeZone`, and UTF8 for an absent `characterSet`, and MUST NOT cap or clamp a value or declare `VARCHAR(2000000)` in place of the type
+* *AND* the adapter MUST NOT substitute a default for an absent field, except precision 3 for an absent TIMESTAMP `fractionalSecondsPrecision`, which Exasol 8.x omits, `false` for an absent `withLocalTimeZone`, and UTF8 for an absent `characterSet`, which Exasol sends only for ASCII, and MUST NOT cap or clamp a value or declare `VARCHAR(2000000)` in place of the type
 * *AND* a request whose `selectList` holds one or more items SHALL fail the query when `selectListDataTypes` holds a different number of entries
 
 ### Scenario: Every request of a supported Exasol version passes the strict type check
@@ -102,8 +102,7 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 * *GIVEN* Exasol 8.29.x or later
 * *WHEN* a query over a virtual table sends the adapter a `pushdown` request
 * *THEN* the request SHALL carry `selectListDataTypes` with one complete `dataType` per select-list item, and the adapter SHALL plan it without a type error
-* *AND* a TIMESTAMP `dataType` without `fractionalSecondsPrecision` SHALL be valid and mean precision 3, because Exasol 8.x omits the field, and an absent `withLocalTimeZone` SHALL mean `false`
-* *AND* a CHAR or VARCHAR `dataType` without `characterSet` SHALL be valid and mean UTF8, because Exasol sends the field only for ASCII
+* *AND* a `dataType` that omits only the fields the scenario "A pushdown request with a missing or invalid Exasol type fails the query" defaults SHALL be valid
 * *AND* an absent or JSON-null `selectList`, which Exasol sends for `SELECT *` with one `selectListDataTypes` entry per table column, SHALL skip the count check
 * *AND* an empty `selectList` with an empty `selectListDataTypes`, which Exasol sends for `SELECT RANDOM() FROM <vs>.<table>`, SHALL pass the count check
 * *AND* the query SHALL return as many rows as native Exasol returns for it

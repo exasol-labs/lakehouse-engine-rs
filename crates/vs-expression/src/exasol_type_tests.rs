@@ -1,6 +1,6 @@
 use super::*;
 
-/// Scenario: A VARCHAR-declared type is unaffected
+/// Scenario: A VARCHAR dataType renders as VARCHAR(n) and its group key is not padded
 #[test]
 fn display_renders_every_spelling_the_producers_emit_byte_for_byte() {
     let spellings = [
@@ -285,59 +285,35 @@ fn valid(data_type: &Json) -> ExasolType {
 }
 
 #[test]
-fn exasol_type_from_json_reads_with_local_time_zone_flag() {
-    let tstz = json!({"type": "timestamp", "withLocalTimeZone": true});
-    assert_eq!(valid(&tstz).to_string(), "TIMESTAMP WITH LOCAL TIME ZONE");
-
-    let ts = json!({"type": "timestamp"});
-    assert_eq!(valid(&ts).to_string(), "TIMESTAMP");
-}
-
-#[test]
-fn exasol_type_from_json_reads_timestamp_fractional_seconds_precision() {
-    let ts0 = json!({"type": "timestamp", "fractionalSecondsPrecision": 0});
-    assert_eq!(valid(&ts0).to_string(), "TIMESTAMP(0)");
-
-    let ts6 = json!({"type": "timestamp", "fractionalSecondsPrecision": 6});
-    assert_eq!(valid(&ts6).to_string(), "TIMESTAMP(6)");
-
-    let ts9 = json!({"type": "timestamp", "fractionalSecondsPrecision": 9});
-    assert_eq!(valid(&ts9).to_string(), "TIMESTAMP(9)");
-
-    let ts_absent = json!({"type": "timestamp"});
-    assert_eq!(valid(&ts_absent).to_string(), "TIMESTAMP");
-
-    let tstz_with_precision = json!({
-        "type": "timestamp",
-        "withLocalTimeZone": true,
-        "fractionalSecondsPrecision": 7
-    });
-    assert_eq!(
-        valid(&tstz_with_precision).to_string(),
-        "TIMESTAMP(7) WITH LOCAL TIME ZONE"
-    );
-}
-
-#[test]
-fn timestamp_without_precision_equals_timestamp_3() {
-    let pairs = [
+fn exasol_type_from_json_reads_each_wire_form() {
+    let tsltz = |precision| ExasolType::TimestampWithLocalTimeZone { precision };
+    let cases = [
+        // Exasol 8.x omits `fractionalSecondsPrecision` for its only precision, 3.
+        (json!({"type": "timestamp"}), ExasolType::BARE_TIMESTAMP),
         (
-            json!({"type": "timestamp"}),
             json!({"type": "timestamp", "fractionalSecondsPrecision": 3}),
+            ExasolType::BARE_TIMESTAMP,
+        ),
+        (
+            json!({"type": "timestamp", "fractionalSecondsPrecision": 6}),
+            ExasolType::timestamp(6),
+        ),
+        (
+            json!({"type": "TIMESTAMP", "withLocalTimeZone": false, "fractionalSecondsPrecision": 6}),
+            ExasolType::timestamp(6),
         ),
         (
             json!({"type": "timestamp", "withLocalTimeZone": true}),
-            json!({"type": "timestamp", "withLocalTimeZone": true, "fractionalSecondsPrecision": 3}),
+            tsltz(3),
         ),
-    ];
-    for (absent, explicit) in pairs {
-        assert_eq!(valid(&absent), valid(&explicit), "{absent}");
-    }
-}
-
-#[test]
-fn exasol_type_from_json_reads_the_non_emittable_wire_forms() {
-    let cases = [
+        (
+            json!({"type": "timestamp", "withLocalTimeZone": true, "fractionalSecondsPrecision": 3}),
+            tsltz(3),
+        ),
+        (
+            json!({"type": "TIMESTAMP", "withLocalTimeZone": true, "fractionalSecondsPrecision": 7}),
+            tsltz(7),
+        ),
         (
             json!({"type": "INTERVAL", "fromTo": "YEAR TO MONTH", "precision": 2}),
             ExasolType::IntervalYearToMonth { precision: 2 },
@@ -353,46 +329,39 @@ fn exasol_type_from_json_reads_the_non_emittable_wire_forms() {
             json!({"type": "GEOMETRY", "srid": 4326}),
             ExasolType::Geometry { srid: 4326 },
         ),
-        (
-            json!({"type": "HASHTYPE", "bytesize": 16}),
-            ExasolType::Hashtype { bytes: 16 },
-        ),
+        // `HASHTYPE(8 BIT)` arrives as one byte.
         (
             json!({"type": "HASHTYPE", "bytesize": 1}),
             ExasolType::Hashtype { bytes: 1 },
         ),
+        // Exasol sends `characterSet` only for ASCII; UTF8 and an absent set are the default.
         (
-            json!({"type": "TIMESTAMP", "withLocalTimeZone": true, "fractionalSecondsPrecision": 6}),
-            ExasolType::TimestampWithLocalTimeZone { precision: 6 },
+            json!({"type": "VARCHAR", "size": 4, "characterSet": "ASCII"}),
+            ExasolType::Varchar {
+                size: 4,
+                ascii: true,
+            },
         ),
+        (
+            json!({"type": "VARCHAR", "size": 4}),
+            ExasolType::varchar(4),
+        ),
+        (
+            json!({"type": "CHAR", "size": 3, "characterSet": "ascii"}),
+            ExasolType::Char {
+                size: 3,
+                ascii: true,
+            },
+        ),
+        (
+            json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"}),
+            ExasolType::char(20),
+        ),
+        (json!({"type": "CHAR", "size": 20}), ExasolType::char(20)),
     ];
     for (data_type, expected) in cases {
         assert_eq!(valid(&data_type), expected, "{data_type}");
     }
-}
-
-#[test]
-fn exasol_type_from_json_propagates_ascii_character_set() {
-    let ascii = json!({"type": "VARCHAR", "size": 4, "characterSet": "ASCII"});
-    assert_eq!(valid(&ascii).to_string(), "VARCHAR(4) ASCII");
-
-    let no_charset = json!({"type": "VARCHAR", "size": 4});
-    assert_eq!(valid(&no_charset).to_string(), "VARCHAR(4)");
-}
-
-#[test]
-fn exasol_type_from_json_renders_char_type() {
-    let ascii = json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"});
-    assert_eq!(valid(&ascii).to_string(), "CHAR(3) ASCII");
-}
-
-#[test]
-fn exasol_type_from_json_propagates_char_ascii_character_set() {
-    let utf8 = json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"});
-    assert_eq!(valid(&utf8).to_string(), "CHAR(20)");
-
-    let no_charset = json!({"type": "CHAR", "size": 20});
-    assert_eq!(valid(&no_charset).to_string(), "CHAR(20)");
 }
 
 #[test]
