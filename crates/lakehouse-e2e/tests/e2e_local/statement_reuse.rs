@@ -102,9 +102,10 @@ struct Reference {
     loads: Vec<String>,
     /// `/v1/config` lookups, counted only for a kind that opens an Iceberg REST session.
     configs: Option<usize>,
-    /// A join must reach the adapter as one broadcast pushdown, because a fallback to one
+    /// The pushdowns the statement reaches the adapter as, so a merged statement cannot pass the
+    /// counts vacuously. A single one must be a broadcast join, because a fallback to one
     /// pushdown per table would also load each table once.
-    join: bool,
+    pushdowns: usize,
 }
 
 /// Scenario: Every reference to one table in a statement loads the table once and prunes it with its own filter
@@ -126,7 +127,7 @@ fn every_reference_to_a_table_loads_it_once() {
             rows: 10,
             loads: vec![loads_events.clone()],
             configs: Some(1),
-            join: false,
+            pushdowns: 2,
         },
         Reference {
             shape: "CTE referenced twice with a filter per reference",
@@ -137,7 +138,7 @@ fn every_reference_to_a_table_loads_it_once() {
             rows: 10,
             loads: vec![loads_events.clone()],
             configs: Some(1),
-            join: false,
+            pushdowns: 2,
         },
         Reference {
             shape: "self-join with a filter per side",
@@ -148,7 +149,7 @@ fn every_reference_to_a_table_loads_it_once() {
             rows: 5,
             loads: vec![loads_events],
             configs: Some(1),
-            join: true,
+            pushdowns: 1,
         },
         Reference {
             shape: "join of two tables",
@@ -159,7 +160,7 @@ fn every_reference_to_a_table_loads_it_once() {
                 load_table_get(ICEBERG_REST_VIA_PROXY, E2E_DIM_TABLE),
             ],
             configs: Some(1),
-            join: true,
+            pushdowns: 1,
         },
         Reference {
             shape: "direct-storage UNION ALL",
@@ -167,16 +168,17 @@ fn every_reference_to_a_table_loads_it_once() {
             rows: 6,
             loads: vec![directory_list("proxy_direct")],
             configs: None,
-            join: false,
+            pushdowns: 2,
         },
     ];
     let mut conn = exa_conn();
 
     for case in cases {
-        if case.join {
-            let pushed = pushdown_statements(&mut conn, &case.sql);
+        let pushed = pushdown_statements(&mut conn, &case.sql);
+        assert_eq!(pushed.len(), case.pushdowns, "{}: pushdowns", case.shape);
+        if case.pushdowns == 1 {
             assert!(
-                pushed.len() == 1 && has_broadcast_join_block(&pushed[0]),
+                has_broadcast_join_block(&pushed[0]),
                 "{}: one broadcast pushdown: {pushed:?}",
                 case.shape
             );
@@ -312,14 +314,14 @@ fn a_role_create_assumes_the_role_once() {
 fn a_role_session_serves_every_pushdown_of_a_statement() {
     proxy_virtual_schemas();
     let events = events_of(PROXY_ROLE_VS);
+    let sql =
+        format!("SELECT COUNT(*) FROM (SELECT ID FROM {events} UNION ALL SELECT ID FROM {events})");
     let mut rows = 0;
 
-    let [assumptions] = count_proxy_requests([assume_role_post().as_str()], || {
-        rows = count(&format!(
-            "SELECT COUNT(*) FROM (SELECT ID FROM {events} UNION ALL SELECT ID FROM {events})"
-        ));
-    });
+    let pushdowns = pushdown_statements(&mut exa_conn(), &sql).len();
+    let [assumptions] = count_proxy_requests([assume_role_post().as_str()], || rows = count(&sql));
 
+    assert_eq!(pushdowns, 2, "each branch is a pushdown of its own");
     assert_eq!(rows, 2 * SEED_TOTAL_ROWS as i64);
     assert_eq!(
         assumptions, 1,

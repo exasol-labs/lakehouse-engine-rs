@@ -11,9 +11,9 @@ use common::e2e_harness::{
     create_proxied_schema_and_scripts, create_schema_and_scripts,
     create_virtual_schema_with_password, declared_types, enumerated_table_names, error_text,
     exa_conn, exa_conn_redacting, explain_virtual_sql, has_broadcast_join_block,
-    has_two_scan_wrapper, identifier_note, install_slc, int_column, note_of, pairs, parse_int,
-    parse_numeric, partition_positions, pushdown_statements, query_error, reads, refuses,
-    text_column, upload_so, value_to_string,
+    has_two_scan_wrapper, identifier_note, install_slc, int_column, isolated_pushdown_statement,
+    note_of, pairs, parse_int, parse_numeric, partition_positions, pushdown_statements,
+    query_error, reads, refuses, text_column, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
@@ -2613,85 +2613,29 @@ fn unity_catalog_and_delta_log_reads_go_through_the_proxy() {
     );
 }
 
-/// The UUID in each `MULTI_PART_STATS_IDS` entry's data file name, read from the vendored log, so
-/// a re-vendored fixture fails here rather than as a pruning error. The pushed file list carries
-/// the UUID whether or not it decodes the name's `%25`.
-fn multi_part_stats_file_ids() -> Vec<String> {
-    let log = format!(
-        "{}/../../scripts/unity/fixtures/multi-part-stats/_delta_log",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let mut file_of_id = std::collections::BTreeMap::new();
-    for entry in std::fs::read_dir(&log).unwrap_or_else(|e| panic!("read {log}: {e}")) {
-        let commit = entry.expect("list the vendored _delta_log").path();
-        if commit
-            .extension()
-            .is_none_or(|extension| extension != "json")
-        {
-            continue;
-        }
-        let text = std::fs::read_to_string(&commit).expect("read a vendored commit");
-        for action in text.lines().map(|line| {
-            serde_json::from_str::<Json>(line).expect("a commit line is one JSON action")
-        }) {
-            assert!(
-                action.get("remove").is_none(),
-                "the multi-part-stats fixture changed: {commit:?} removes a file"
-            );
-            let Some(add) = action.get("add") else {
-                continue;
-            };
-            let stats: Json = serde_json::from_str(add["stats"].as_str().unwrap_or("{}"))
-                .expect("an add action's stats are JSON");
-            let id = stats["minValues"]["id"].as_i64();
-            assert!(
-                id.is_some() && id == stats["maxValues"]["id"].as_i64(),
-                "the multi-part-stats fixture changed: {commit:?} adds a file not of one ID"
-            );
-            let uuid = add["path"]
-                .as_str()
-                .and_then(|path| path.split("-part-00000-").nth(1))
-                .and_then(|rest| rest.strip_suffix("-c000.snappy.parquet"))
-                .unwrap_or_else(|| panic!("the multi-part-stats fixture changed: {add}"));
-            file_of_id.insert(id, uuid.to_string());
-        }
-    }
-    assert_eq!(
-        file_of_id.keys().copied().collect::<Vec<_>>(),
-        MULTI_PART_STATS_IDS.map(Some),
-        "the multi-part-stats fixture changed: it no longer adds one file per ID"
-    );
-    file_of_id.into_values().collect()
-}
-
 /// Scenario: Every reference to one table in a statement loads the table once and prunes it with its own filter
 #[test]
 fn unity_delta_references_load_the_table_once_and_prune_their_own_files() {
     create_proxy_virtual_schema();
     let mut conn = exa_conn();
     let table = format!("{VS_PROXY}.MULTI_PART_STATS");
-    let union = format!(
-        "SELECT ID FROM {table} WHERE ID <= 2 UNION ALL SELECT ID FROM {table} WHERE ID >= 4"
-    );
+    let branches = [
+        format!("SELECT ID FROM {table} WHERE ID <= 2"),
+        format!("SELECT ID FROM {table} WHERE ID >= 4"),
+    ];
+    let union = branches.join(" UNION ALL ");
     let self_join = format!(
         "SELECT a.ID FROM {table} a JOIN {table} b ON a.ID = b.ID WHERE a.ID <= 4 AND b.ID >= 2"
     );
-    let file_ids = multi_part_stats_file_ids();
 
-    // One file per ID, so a branch's file list shows which files its own filter kept.
-    let branch_files: Vec<Vec<usize>> = pushdown_statements(&mut conn, &union)
+    let alone: Vec<String> = branches
         .iter()
-        .map(|pushed| {
-            file_ids
-                .iter()
-                .map(|id| pushed.matches(id.as_str()).count())
-                .collect()
-        })
+        .map(|branch| isolated_pushdown_statement(&mut conn, branch))
         .collect();
     assert_eq!(
-        branch_files,
-        [[1, 1, 0, 0, 0], [0, 0, 0, 1, 1]],
-        "each UNION ALL branch lists only the files of the IDs its filter keeps"
+        pushdown_statements(&mut conn, &union),
+        alone,
+        "each UNION ALL branch pushes the SQL it pushes as a statement of its own"
     );
 
     for (shape, sql, expected_ids, join) in [
