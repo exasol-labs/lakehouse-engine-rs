@@ -9,8 +9,8 @@ use serde_json::Value as Json;
 
 use super::delta_predicate::to_delta_predicate;
 use super::delta_replay::DeltaSnapshot;
-use super::unity_table_storage::{UnityTableStorage, redacted};
-use super::{LoadedTable, PlannedFiles, hex_binary_partition_values};
+use super::unity_table_storage::UnityTableStorage;
+use super::{LoadedTable, PlannedFiles, hex_binary_partition_values, redacted};
 use crate::adapter::column_notes::DeclaredSchema;
 use crate::scan::spec::{FileEntry, LogicalField};
 use lakehouse_catalog::StorageBackend;

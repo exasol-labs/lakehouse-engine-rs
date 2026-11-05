@@ -1096,7 +1096,8 @@ pub(crate) async fn delta_pushdown(
     .await
 }
 
-/// [`plan_pushdown`] over an unauthenticated `kind` CONNECTION at `catalog_uri`.
+/// Plans `request` as the first pushdown of its statement, over an unauthenticated `kind`
+/// CONNECTION at `catalog_uri`, and over `table` when it is no join.
 pub(crate) async fn pushdown_over(
     request: &Json,
     kind: CatalogKind,
@@ -1106,16 +1107,6 @@ pub(crate) async fn pushdown_over(
     join_broadcast_max_bytes: u64,
 ) -> Result<Json, UdfError> {
     let connection = resolved_connection(kind, catalog_uri, storage, unauthenticated_creds());
-    plan_pushdown(request, connection, table, join_broadcast_max_bytes).await
-}
-
-/// Plans `request` as the first pushdown of its statement, over `table` when it is no join.
-pub(crate) async fn plan_pushdown(
-    request: &Json,
-    connection: ResolvedConnectionConfig,
-    table: &str,
-    join_broadcast_max_bytes: u64,
-) -> Result<Json, UdfError> {
     let statement = StatementCatalog::open(connection, &get_properties(request))?;
     let catalog = CatalogProps {
         warehouse: "wh".into(),

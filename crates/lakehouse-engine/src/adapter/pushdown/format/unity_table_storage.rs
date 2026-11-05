@@ -3,18 +3,14 @@ use std::sync::Arc;
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{
     CatalogTable, ConnectionCreds, StaticStoreAddress, StorageBackend, UnityCatalogSession,
-    redact_error_text, resolve_uc_vended_storage,
+    resolve_uc_vended_storage,
 };
 use object_store::ObjectStore;
 
-use super::{ConnectionStorage, checked_storage_location};
+use super::{ConnectionStorage, checked_storage_location, redacted};
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::build_table_root_store;
 use crate::scan::spec::DEFAULT_S3_MAX_CONNECTIONS;
-
-#[cfg(test)]
-#[path = "unity_table_storage_tests.rs"]
-mod tests;
 
 /// Planning never writes, so it asks for a read-scoped credential.
 const READ_OPERATION: &str = "READ";
@@ -99,10 +95,4 @@ impl<'a> UnityTableStorage<'a> {
     fn table_name(&self) -> String {
         catalog_identifier_string(&self.table.ident)
     }
-}
-
-/// Collapses to [`UdfError::User`] via `Display`, so the variant prefix survives while no
-/// future variant payload can carry a secret unmasked.
-pub(super) fn redacted(error: UdfError, secrets: &[&str]) -> UdfError {
-    UdfError::User(redact_error_text(&error.to_string(), secrets))
 }

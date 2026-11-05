@@ -8,8 +8,7 @@ use object_store::ObjectStore;
 use serde_json::Value as Json;
 
 use super::partition_predicate::PartitionPredicate;
-use super::unity_table_storage::redacted;
-use super::{LoadedTable, PlannedFiles};
+use super::{LoadedTable, PlannedFiles, redacted};
 use crate::adapter::column_notes::DeclaredSchema;
 use crate::adapter::parquet_directory::{ParquetFile, ParquetListing, PartitionKeepPredicate};
 use crate::scan::ObjectLocation;

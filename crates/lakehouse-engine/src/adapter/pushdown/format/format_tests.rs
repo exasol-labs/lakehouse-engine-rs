@@ -1,4 +1,7 @@
-use super::super::test_support::{declared_columns, glue_catalog_table, nullable_field};
+use super::super::test_support::{
+    SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, declared_columns, glue_catalog_table, nullable_field,
+    user_message,
+};
 use super::*;
 use lakehouse_catalog::TableFormat;
 
@@ -76,4 +79,24 @@ fn a_delta_or_hive_binary_partition_value_travels_as_the_hex_of_its_utf8_bytes()
         "only a binary column's value is encoded"
     );
     assert_eq!(files[1].partition_values["b"], None);
+}
+
+#[test]
+fn redacted_masks_every_effective_storage_secret_in_a_raised_error() {
+    let readable = "failed to resolve the current Delta version for table root \
+                    's3://bucket/cat/sch/orders': signature mismatch for ";
+    let raised = UdfError::User(format!(
+        "{readable}{SENTINEL_ACCESS_KEY} signed with {SENTINEL_SECRET_KEY}"
+    ));
+
+    let message = user_message(redacted(
+        raised,
+        &[SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY],
+    ));
+
+    assert!(message.starts_with(readable), "{message}");
+    assert!(
+        !message.contains(SENTINEL_ACCESS_KEY) && !message.contains(SENTINEL_SECRET_KEY),
+        "{message}"
+    );
 }

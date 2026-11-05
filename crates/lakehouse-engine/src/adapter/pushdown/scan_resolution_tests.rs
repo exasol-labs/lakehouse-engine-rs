@@ -1,6 +1,4 @@
-use super::super::test_support::{
-    UNREACHABLE_CATALOG, endpoint_storage, sample_storage, statement_over,
-};
+use super::super::test_support::{UNREACHABLE_CATALOG, endpoint_storage, statement_over};
 use super::*;
 use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::permission::PermissionSettings;
@@ -17,29 +15,59 @@ fn lakekeeper_check() -> PermissionCheck {
 }
 
 #[tokio::test]
-async fn a_malformed_identifier_anywhere_in_the_request_is_refused_before_any_catalog_request() {
-    // An enforced check sends a batch-check to the unreachable catalog, which fails with a
-    // transport error, so a refusal naming the identifier was decided before any request.
-    let statement = statement_over(
-        CatalogKind::IcebergRest,
-        UNREACHABLE_CATALOG,
-        sample_storage(),
-    );
+async fn a_malformed_identifier_anywhere_in_the_request_is_refused_by_its_kinds_rule_first() {
+    // Under Iceberg REST, an enforced check sends a batch-check to the unreachable catalog, which
+    // fails with a transport error, so a refusal naming the identifier was decided before it.
+    let rules = [
+        "namespace.table",
+        "catalog.schema.table",
+        "first-level directory",
+    ];
+    for (kind, address, identifiers, rule) in [
+        (
+            CatalogKind::IcebergRest,
+            UNREACHABLE_CATALOG,
+            ["db.t", "malformed"],
+            rules[0],
+        ),
+        (
+            CatalogKind::UnityCatalogNative,
+            UNREACHABLE_CATALOG,
+            ["cat.sch.t", "orders"],
+            rules[1],
+        ),
+        (
+            CatalogKind::DirectStorage,
+            "s3://warehouse",
+            ["events", "sub/dir"],
+            rules[2],
+        ),
+    ] {
+        let statement = statement_over(kind, address, endpoint_storage(UNREACHABLE_CATALOG));
 
-    let err = TableScanResolver::for_request(
-        &statement,
-        &lakekeeper_check(),
-        &["db.t", "malformed"],
-        &Json::Null,
-    )
-    .await
-    .err()
-    .expect("a malformed identifier on any leg must be refused");
+        let err = TableScanResolver::for_request(
+            &statement,
+            &lakekeeper_check(),
+            &identifiers,
+            &Json::Null,
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("{kind:?}: a malformed identifier on any leg must be refused"));
 
-    assert!(
-        err.to_string().contains("'malformed'"),
-        "the refusal must name the identifier it could not parse: {err}"
-    );
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("'{}'", identifiers[1])),
+            "{kind:?}: the refusal must name the identifier it could not resolve: {message}"
+        );
+        for other in rules {
+            assert_eq!(
+                message.contains(other),
+                other == rule,
+                "{kind:?}: only the kind's own identifier rule judges it: {message}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

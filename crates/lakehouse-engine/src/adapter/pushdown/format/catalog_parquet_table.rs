@@ -15,10 +15,10 @@ use serde_json::Value as Json;
 
 use super::parquet_directory_table::file_entry;
 use super::partition_predicate::PartitionPredicate;
-use super::unity_table_storage::{UnityTableStorage, redacted};
+use super::unity_table_storage::UnityTableStorage;
 use super::{
     LoadedTable, ParquetDirectoryTable, PlannedFiles, checked_storage_location,
-    hex_binary_partition_values,
+    hex_binary_partition_values, redacted,
 };
 use crate::adapter::column_notes::DeclaredSchema;
 use crate::adapter::parquet_directory::{FilePattern, PartitionKeepPredicate, list_location_files};

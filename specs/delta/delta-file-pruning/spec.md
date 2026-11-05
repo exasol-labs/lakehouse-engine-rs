@@ -96,7 +96,7 @@ The adapter translates the soundly translatable nodes of the Exasol WHERE predic
 * *THEN* the reader SHALL NOT set the stats option that disables all stats work, so the scan builder keeps its own default, because that option disables internal data skipping even when a predicate is set, which would leave both partition and stats pruning inert
 * *AND* the resolved scan MUST NOT carry any per-file minimum, maximum, null count, or record count, and the scan spec's file entries, common spec, and logical fields SHALL gain NO field, so a request that prunes nothing serializes the same scan spec as before
 * *AND* the reader MUST NOT request the kernel's parsed-statistics output column, because it compares no bound itself and paying for a stats projection it never reads would cost metadata bandwidth for nothing
-* *AND* the reader SHALL still replay the log ONCE per query and SHALL still return one entry per active path, so deletion-vector carriage, partition-value carriage, path verbatimness, and the size field are unchanged
+* *AND* the reader SHALL still replay the log once per table reference (`file-planning/pushdown-statement-state`) and SHALL still return one entry per active path, so deletion-vector carriage, partition-value carriage, path verbatimness, and the size field are unchanged
 * *AND* every scenario of `delta/delta-table-planning`, `delta/delta-reader-feature-gating`, and `delta/delta-type-mapping` MUST still hold
 
 ### Scenario: A predicate the kernel cannot evaluate keeps every file

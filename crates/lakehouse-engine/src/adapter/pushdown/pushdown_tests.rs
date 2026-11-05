@@ -1,6 +1,5 @@
 use super::test_support::*;
 use super::*;
-use crate::adapter::ResolvedConnectionConfig;
 use crate::scan::spec::{
     ColumnRef, CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage,
     StorageProps,
@@ -1693,90 +1692,6 @@ fn accepted_timestamp_precision_cast_takes_scan_path() {
     assert!(
         sql.contains("TIMESTAMP(6)"),
         "the accepted CAST must reach the scan at its declared precision: {sql}"
-    );
-}
-
-#[tokio::test]
-
-async fn malformed_table_ident_fails_before_any_catalog_contact() {
-    let creds = ConnectionCreds {
-        warehouse: "warehouse".into(),
-        endpoint: "http://minio:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "minioadmin".into(),
-        secret_key: "minioadmin".into(),
-        session_token: None,
-        path_style: Some(true),
-        use_sigv4: false,
-        use_vended_credentials: false,
-        token: None,
-        client_id: Some("oauth-client-id-sentinel".into()),
-        client_secret: Some("oauth-client-secret-sentinel".into()),
-        oauth2_server_uri: None,
-        scope: None,
-        account_name: None,
-        account_key: None,
-        sas_token: None,
-        ..Default::default()
-    };
-
-    let catalog = CatalogProps {
-        warehouse: "warehouse".into(),
-        table: "malformed_identifier_with_no_namespace_separator".into(),
-    };
-
-    // An empty `columns` array would fail in `project_columns` first, masking the ordering.
-    let request = nq4_request();
-
-    let connection = ResolvedConnectionConfig {
-        allow_http: false,
-        ..resolved_connection(
-            CatalogKind::IcebergRest,
-            "http://127.0.0.1:1",
-            sample_storage(),
-            creds,
-        )
-    };
-    let result = plan_pushdown(&request, connection, &catalog.table, 1024).await;
-
-    let err = result.expect_err("a malformed table identifier must fail");
-    let message = err.to_string();
-    assert!(
-        message.contains("namespace.table"),
-        "error must be parse_table_ident's own error, got: {message}"
-    );
-    assert!(
-        !message.contains("OAuth2"),
-        "error must not be the OAuth2 token request/transport error \
-             (would mean the session was built before the identifier was \
-             validated): {message}"
-    );
-}
-
-/// Scenario: A Unity Catalog table's identity survives the round trip from the involved table
-#[tokio::test]
-async fn a_malformed_unity_identifier_is_refused_in_unity_terms_before_any_catalog_contact() {
-    // An unreachable catalog fails any request with a transport error, so a refusal in Unity
-    // terms was decided before a request.
-    let err = pushdown_over(
-        &nq4_request(),
-        CatalogKind::UnityCatalogNative,
-        UNREACHABLE_CATALOG,
-        sample_storage(),
-        "orders",
-        1024,
-    )
-    .await
-    .expect_err("an identifier that addresses no Unity Catalog table must be refused");
-
-    let message = err.to_string();
-    assert!(
-        message.contains("catalog.schema.table"),
-        "the refusal must state the Unity Catalog address form: {message}"
-    );
-    assert!(
-        !message.contains("namespace.table"),
-        "Iceberg's identifier rule must not judge a Unity Catalog identifier: {message}"
     );
 }
 

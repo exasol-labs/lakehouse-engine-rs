@@ -5,7 +5,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 use exasol_udf_sdk::error::UdfError;
-use lakehouse_catalog::{CatalogTable, ColumnSourceType, ConnectionCreds, StorageBackend};
+use lakehouse_catalog::{
+    CatalogTable, ColumnSourceType, ConnectionCreds, StorageBackend, redact_error_text,
+};
 use serde_json::Value as Json;
 
 use crate::adapter::column_notes::{ColumnDeclaration, DeclaredSchema};
@@ -76,6 +78,12 @@ fn checked_storage_location<'t>(
             catalog_identifier_string(&table.ident)
         ))),
     }
+}
+
+/// Collapses to [`UdfError::User`] via `Display`, so the variant prefix survives while no
+/// future variant payload can carry a secret unmasked.
+pub(super) fn redacted(error: UdfError, secrets: &[&str]) -> UdfError {
+    UdfError::User(redact_error_text(&error.to_string(), secrets))
 }
 
 /// A Delta or Hive partition value is a string, so a binary column's value travels as the lowercase
