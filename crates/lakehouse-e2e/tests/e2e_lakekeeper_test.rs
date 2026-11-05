@@ -1525,7 +1525,7 @@ fn a_union_statement_checks_every_table_its_pushdowns_read() {
 }
 
 /// Scenario: One batch-check per pushdown decides every table that no earlier pushdown of the statement checked
-/// Scenario: The Lakekeeper permission check reuses the request's one catalog session
+/// Scenario: The Lakekeeper permission check reuses the statement's one catalog session
 /// Scenario: The pushdowns of one statement share one catalog session per virtual schema
 #[test]
 fn a_statement_sends_one_token_request_and_one_batch_check() {

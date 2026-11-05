@@ -86,3 +86,16 @@ The adapter reads the `CATALOG_KIND` virtual-schema property to choose the catal
 * *AND* the SigV4 required-fields rule of `connection/connection-credentials-sigv4` SHALL apply, so the error names the missing `secret_key`, and a standard `https://glue.<region>.amazonaws.com` address supplies the signing region
 * *AND* `region`, `access_key`, `secret_key`, `session_token`, `endpoint`, and `path_style` SHALL keep their meaning, so the same keys sign the Glue and the S3 requests, unless the CONNECTION names a role, in which case the role's session replaces those keys for both, per `connection/connection-credentials-assume-role-session-use`
 * *AND* no error message SHALL contain a credential value
+
+### Scenario: A Unity Catalog or Glue table is planned by the format its catalog reports
+
+* *GIVEN* a pushdown request over a table of a Unity Catalog or Glue virtual schema
+* *WHEN* the adapter loads the table
+* *THEN* the format that the catalog's table answer reports SHALL select the plan: under Unity Catalog, the Delta tag plans a Delta scan and the Parquet tag plans the Unity Parquet scan of `unity-catalog/unity-parquet-table-planning`; under Glue, the Iceberg tag plans an Iceberg scan from the table's metadata file and the Parquet tag plans the Hive Parquet scan of `glue/glue-table-planning`
+
+### Scenario: A Unity Catalog table whose pushdown lookup reports the Iceberg format is refused
+
+* *GIVEN* a pushdown request over a table of a Unity Catalog virtual schema whose table answer reports the Iceberg format, even when `createVirtualSchema` listed the table under a format the kind plans
+* *WHEN* the adapter loads the table
+* *THEN* the adapter SHALL fail the request with an error naming the table and the reported format, before it requests a vended credential or reads any storage object
+* *AND* the adapter MUST NOT plan the table as Delta or Parquet, because a table planned as another format surfaces a missing log or a wrong schema instead of the format refusal

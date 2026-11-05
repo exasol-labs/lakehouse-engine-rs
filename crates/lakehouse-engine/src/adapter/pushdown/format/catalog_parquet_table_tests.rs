@@ -1,3 +1,4 @@
+use crate::adapter::pushdown::test_support::connection_storage;
 use crate::adapter::pushdown::test_support::{
     GlueEndpoint, ObjectEndpoint, SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, SIGV4_SECRET_KEY,
     UNREACHABLE_CATALOG, assert_mentions, catalog_table, closed_port_storage, compare,
@@ -7,8 +8,8 @@ use crate::adapter::pushdown::test_support::{
 };
 use std::collections::BTreeMap;
 
+use super::super::ResolvedScan;
 use super::super::delta_schema::classify_spark_schema;
-use super::super::{ConnectionStorage, ResolvedScan};
 use super::*;
 use crate::adapter::pushdown::test_support::filter_json::{and, column, equal, or};
 use crate::adapter::tests::parquet_fixture::{in_memory_store, values};
@@ -99,11 +100,7 @@ async fn resolve_with(
         ..unauthenticated_creds()
     };
     let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
-    let connection = ConnectionStorage {
-        storage,
-        creds: &creds,
-        allow_http: true,
-    };
+    let connection = connection_storage(storage, &creds);
     let load =
         CatalogParquetTable::from_unity(UnityTableStorage::new(&session, table, &connection));
     user_outcome(resolve_declared(load, TABLE_NAME, table, filter).await)

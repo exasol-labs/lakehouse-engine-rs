@@ -100,3 +100,11 @@ Resolves a table's identity and current file state before any SQL is built. The 
 * *THEN* each query SHALL fail before any file is planned with an error naming the virtual table and the column `QTY`, stating that the declaration marks it non-nullable while the current schema allows NULL, and naming `ALTER VIRTUAL SCHEMA ... REFRESH` as the fix
 * *AND* the reader SHALL find the column in the current schema by its declared field id, not by its name
 * *AND* after `REFRESH` the first query SHALL return the row whose `qty` is NULL
+
+### Scenario: An Iceberg scan carries its delete references and binds columns by field-id
+
+* *GIVEN* an Iceberg table that a pushdown loaded, reached by the single-table pushdown path and every join leg
+* *WHEN* the adapter prunes the table's file list for one table reference
+* *THEN* the adapter SHALL construct each associated positional-delete reference as the Iceberg positional-delete variant of the format-neutral delete mechanism, serialized as `{"path":…,"size":…,"content_type":"position_deletes"}` inside the per-shard file list, and each Puffin deletion vector as the Iceberg deletion-vector variant
+* *AND* the returned scan SHALL carry EMPTY partition columns, and each of its file entries SHALL carry only the `identity` partition values of that file's own partition spec, per `scan-read-path/scan-execution-identity-partition-fill`
+* *AND* every logical field of the Iceberg scan SHALL carry its Iceberg field-id and NO physical name, so an Iceberg column is still bound by field-id and the physical-name and identity binding strategies are unreachable from the Iceberg path

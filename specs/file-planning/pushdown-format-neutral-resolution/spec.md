@@ -1,6 +1,6 @@
 # Feature: Format-Neutral Pushdown Resolution
 
-Routes every pushdown request through the table-format reader seam. The reader that owns a table's format produces its active file list, logical schema, partition columns, table root, and storage, and the rest of the pipeline names no format. A single-table scan, each leg of a broadcast join, and every aggregate shape therefore reach a Delta table by the same route as an Iceberg table.
+Plans every pushdown request shape the same way for every table format. A table's format supplies its active file list, table root, name mapping, and storage, its column notes supply its logical schema, partition columns, and refused columns, and the rest of the pipeline names no format. A single-table scan, each leg of a broadcast join, and every aggregate shape therefore reach a Delta table by the same route as an Iceberg table.
 
 ## Background
 
@@ -10,20 +10,14 @@ Routes every pushdown request through the table-format reader seam. The reader t
 
 ## Scenarios
 
-### Scenario: Every pushdown request shape resolves through the one format-reader seam
+### Scenario: Every pushdown request shape plans each table from its file list and its column notes
 
 * *GIVEN* four pushdown requests over the SAME virtual schema, a single-table projection scan, a
   single-table aggregate, a grouped aggregate, and a broadcast inner equi-join with two legs
 * *WHEN* the adapter plans each request
-* *THEN* the adapter SHALL obtain each table's file list, table root, name mapping, and effective
-  storage from the format-reader seam, and each table's logical schema, partition columns, and
-  refused columns from that table's column notes (`vs-adapter/column-source-notes`), assembled into
-  one `ResolvedScan`, and MUST NOT call any format-specific file resolver directly
-* *AND* the adapter SHALL parse a table's column notes at ONE site in the per-request resolver and
-  SHALL pass the parsed declaration to the format reader, so every reader receives the same
-  declaration and no reader parses notes itself
-* *AND* every parameter the resolver and the reader take SHALL be read by every format arm, so no
-  signature carries a value only one format consumes
+* *THEN* the adapter SHALL take each table's file list, table root, name mapping, and effective
+  storage from the table's format, and each table's logical schema, partition columns, and refused
+  columns from that table's column notes (`vs-adapter/column-source-notes`), for every table format
 * *AND* the adapter SHALL apply that rule to EVERY leg of the join, so a join leg and a single-table
   scan resolve identically
 * *AND* the adapter MUST NOT gate any request shape on the table format or the catalog kind, so
@@ -69,7 +63,7 @@ Routes every pushdown request through the table-format reader seam. The reader t
   type this engine does not map
 * *WHEN* the adapter plans the request
 * *THEN* the adapter SHALL return the reader's own clean plan-time error, naming the column and its
-  Delta type, and MUST NOT return a scan-driving SQL response. `delta/delta-table-planning` states
+  Delta type, and MUST NOT return a scan-driving SQL response. `vs-adapter/catalog-kind-selection` states
   the refusal of a table whose catalog reports a format the kind does not plan
 * *AND* the adapter MUST NOT fall back to the Iceberg resolution path, emit a partial file list, or
   return rows, because a table that cannot be planned has no correct partial answer

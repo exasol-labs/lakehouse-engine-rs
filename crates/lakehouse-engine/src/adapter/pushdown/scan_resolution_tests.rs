@@ -18,8 +18,8 @@ fn lakekeeper_check() -> PermissionCheck {
 
 #[tokio::test]
 async fn a_malformed_identifier_anywhere_in_the_request_is_refused_before_any_catalog_request() {
-    // An unreachable catalog fails any request with a transport error, so a refusal naming the
-    // identifier was decided before a request.
+    // An enforced check sends a batch-check to the unreachable catalog, which fails with a
+    // transport error, so a refusal naming the identifier was decided before any request.
     let statement = statement_over(
         CatalogKind::IcebergRest,
         UNREACHABLE_CATALOG,
@@ -28,7 +28,7 @@ async fn a_malformed_identifier_anywhere_in_the_request_is_refused_before_any_ca
 
     let err = TableScanResolver::for_request(
         &statement,
-        &PermissionCheck::Off,
+        &lakekeeper_check(),
         &["db.t", "malformed"],
         &Json::Null,
     )

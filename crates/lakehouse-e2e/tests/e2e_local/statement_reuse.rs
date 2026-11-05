@@ -5,8 +5,7 @@ use crate::common::e2e_harness::{
     VsProps, create_virtual_schema, create_virtual_schema_with_password, exa_conn, int_column,
     isolated_pushdown_statement, pushdown_statements, runtime, text_column,
 };
-use crate::common::pos_delete_fixtures::NAMESPACE;
-use crate::common::seed::{E2E_TABLE, SEED_TOTAL_ROWS};
+use crate::common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_TOTAL_ROWS};
 use crate::common::stack::{
     ICEBERG_REST_VIA_PROXY, PROXY_ADAPTER_SCHEMA, SEAWEEDFS_VIA_PROXY, count_proxy_requests,
     iceberg_catalog_url_internal,
@@ -14,7 +13,7 @@ use crate::common::stack::{
 use crate::fixtures::{
     PROXY_DIRECT_VS, PROXY_ICEBERG_VS, PROXY_ROLE_VS, append_file, count, drop_table_if_exists,
     ensure_id_val_table, id_val_batch, lakehouse_vs, password_via_proxy, proxy_props,
-    proxy_virtual_schemas, seed_catalog, vs_table,
+    proxy_virtual_schemas, role_password_via_proxy, seed_catalog, vs_table,
 };
 
 use iceberg::NamespaceIdent;
@@ -28,7 +27,7 @@ fn config_get() -> String {
 }
 
 fn load_table_get(catalog: &str, table: &str) -> String {
-    format!("GET {catalog}/v1/namespaces/{NAMESPACE}/tables/{table}?")
+    format!("GET {catalog}/v1/namespaces/{E2E_NAMESPACE}/tables/{table}?")
 }
 
 fn assume_role_post() -> String {
@@ -176,11 +175,14 @@ fn a_later_statement_reads_a_file_added_after_the_first() {
         drop_table_if_exists(&catalog, &namespace, LATER_TABLE).await;
         ensure_id_val_table(&catalog, LATER_NAMESPACE, LATER_TABLE, 1, 1.0).await;
     });
-    create_virtual_schema(&mut exa_conn(), &VsProps::new(LATER_VS, LATER_NAMESPACE));
+    let mut conn = exa_conn();
+    create_virtual_schema(&mut conn, &VsProps::new(LATER_VS, LATER_NAMESPACE));
     let later = vs_table(LATER_VS, LATER_TABLE);
     let ids = format!("SELECT ID FROM {later} ORDER BY ID");
+    // One session for both statements, so an adapter VM that outlived its statement would
+    // serve the second statement the first one's file list.
     assert_eq!(
-        int_column(&exa_conn().query_columns(&ids)[0]),
+        int_column(&conn.query_columns(&ids)[0]),
         vec![1],
         "the first statement reads the initial file"
     );
@@ -193,7 +195,7 @@ fn a_later_statement_reads_a_file_added_after_the_first() {
     ));
 
     assert_eq!(
-        int_column(&exa_conn().query_columns(&ids)[0]),
+        int_column(&conn.query_columns(&ids)[0]),
         vec![1, 2],
         "a later statement loads the table again, so it reads the added file"
     );
@@ -213,7 +215,7 @@ fn two_virtual_schemas_in_one_statement_load_the_table_once_each() {
     ] {
         create_virtual_schema_with_password(
             &mut conn,
-            &proxy_props(vs, NAMESPACE, creds),
+            &proxy_props(vs, E2E_NAMESPACE, creds),
             catalog,
             &password_via_proxy(),
         );
@@ -250,6 +252,28 @@ fn two_virtual_schemas_in_one_statement_load_the_table_once_each() {
         [1, 1],
         "each virtual schema loads the table once, at its own CONNECTION's address"
     );
+}
+
+/// Scenario: The adapter assumes the role once per statement and virtual schema and substitutes the session
+#[test]
+fn a_role_create_assumes_the_role_once() {
+    proxy_virtual_schemas();
+    let mut conn = exa_conn();
+
+    let [assumptions] = count_proxy_requests([assume_role_post().as_str()], || {
+        create_virtual_schema_with_password(
+            &mut conn,
+            &proxy_props(
+                "REUSE_ROLE_CREATE_VS",
+                E2E_NAMESPACE,
+                "REUSE_ROLE_CREATE_CREDS",
+            ),
+            ICEBERG_REST_VIA_PROXY,
+            &role_password_via_proxy(),
+        );
+    });
+
+    assert_eq!(assumptions, 1, "one AssumeRole call for the create");
 }
 
 /// Scenario: The adapter assumes the role once per statement and virtual schema and substitutes the session

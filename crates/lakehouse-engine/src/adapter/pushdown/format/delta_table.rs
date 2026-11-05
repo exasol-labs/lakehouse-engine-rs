@@ -37,13 +37,15 @@ impl DeltaTable {
         // This layer made the credential decision, so it knows which secrets an object-store
         // error could echo; replay and schema know none.
         let secrets = effective_storage.secret_values();
-        let root = table_root.to_string();
-        let snapshot = off_the_runtime(move || DeltaSnapshot::open(store, &root))
-            .await
-            .map_err(|error| redacted(error, &secrets))?;
+        let table_root = table_root.to_string();
+        let (snapshot, table_root) = off_the_runtime(move || {
+            DeltaSnapshot::open(store, &table_root).map(|snapshot| (snapshot, table_root))
+        })
+        .await
+        .map_err(|error| redacted(error, &secrets))?;
         Ok(Self {
             snapshot: Arc::new(snapshot),
-            table_root: table_root.to_string(),
+            table_root,
             effective_storage,
         })
     }

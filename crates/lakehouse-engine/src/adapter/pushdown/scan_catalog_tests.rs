@@ -3,6 +3,7 @@ use super::super::test_support::{
 };
 use super::*;
 use crate::adapter::direct_storage_properties::join_storage_path;
+use crate::adapter::pushdown::test_support::connection_storage;
 use lakehouse_catalog::CatalogTableIdent;
 
 const UNITY_TABLE_NAME: &str = "cat.sch.orders";
@@ -26,18 +27,10 @@ async fn a_unity_catalog_load_refuses_an_iceberg_table() {
     let table = unity_table(TableFormat::Iceberg);
     let storage = sample_storage();
 
-    let err = open_unity_table(
-        &session,
-        &table,
-        &ConnectionStorage {
-            storage: &storage,
-            creds: &creds,
-            allow_http: true,
-        },
-    )
-    .await
-    .err()
-    .expect("a Unity Catalog table reporting a non-Delta format must be refused");
+    let err = open_unity_table(&session, &table, &connection_storage(&storage, &creds))
+        .await
+        .err()
+        .expect("a Unity Catalog table reporting the Iceberg format must be refused");
 
     let message = user_message(err);
     assert!(

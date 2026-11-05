@@ -120,43 +120,6 @@ impl IcebergTable {
             name_mapping,
         })
     }
-
-    async fn plan(
-        &self,
-        declared: &[LogicalField],
-        filter_json: Option<&Json>,
-    ) -> Result<PlannedFiles, UdfError> {
-        let table_name = &self.table_name;
-        let secrets = self.effective_storage.secret_values();
-        // A scan without a pinned snapshot binds its filter by name against the current schema,
-        // so each declared field id is named as that schema names it.
-        let metadata = self.table.metadata();
-        let scanned = metadata
-            .current_snapshot()
-            .map(|_| metadata.current_schema().clone());
-        let predicate = filter_json
-            .zip(scanned)
-            .and_then(|(filter, scanned)| to_iceberg_predicate(filter, declared, &scanned));
-        let tasks = plan_file_tasks(self.table.clone(), table_name, predicate, &secrets).await?;
-        // Delete paths are relativized later in `relativize_shards_to_root`, like data-file paths.
-        let files = tasks
-            .iter()
-            .map(|task| {
-                let mut entry = planned_file_entry(task)
-                    .map_err(|mechanism| unsupported_delete_error(mechanism, table_name))?;
-                wire_paths(&mut entry)?;
-                entry.partition_values = identity_partition_values(task, declared, table_name)?;
-                Ok(entry)
-            })
-            .collect::<Result<_, UdfError>>()?;
-
-        Ok(PlannedFiles {
-            files,
-            effective_storage: self.effective_storage.clone(),
-            table_root: ObjectLocation::from_raw(&self.table_root)?.to_wire(),
-            name_mapping: self.name_mapping.clone(),
-        })
-    }
 }
 
 impl LoadedTable for IcebergTable {
@@ -166,8 +129,40 @@ impl LoadedTable for IcebergTable {
         filter_json: Option<&'a Json>,
     ) -> Pin<Box<dyn Future<Output = Result<PlannedFiles, UdfError>> + Send + 'a>> {
         Box::pin(async move {
-            refuse_relaxed_nullability(self.table.metadata().current_schema(), declared)?;
-            self.plan(&declared.logical_schema, filter_json).await
+            let metadata = self.table.metadata();
+            refuse_relaxed_nullability(metadata.current_schema(), declared)?;
+            let declared = &declared.logical_schema;
+            let table_name = &self.table_name;
+            let secrets = self.effective_storage.secret_values();
+            // A scan without a pinned snapshot binds its filter by name against the current
+            // schema, so each declared field id is named as that schema names it.
+            let scanned = metadata
+                .current_snapshot()
+                .map(|_| metadata.current_schema().clone());
+            let predicate = filter_json
+                .zip(scanned)
+                .and_then(|(filter, scanned)| to_iceberg_predicate(filter, declared, &scanned));
+            let tasks =
+                plan_file_tasks(self.table.clone(), table_name, predicate, &secrets).await?;
+            // Delete paths are relativized later in `relativize_shards_to_root`, like data-file
+            // paths.
+            let files = tasks
+                .iter()
+                .map(|task| {
+                    let mut entry = planned_file_entry(task)
+                        .map_err(|mechanism| unsupported_delete_error(mechanism, table_name))?;
+                    wire_paths(&mut entry)?;
+                    entry.partition_values = identity_partition_values(task, declared, table_name)?;
+                    Ok(entry)
+                })
+                .collect::<Result<_, UdfError>>()?;
+
+            Ok(PlannedFiles {
+                files,
+                effective_storage: self.effective_storage.clone(),
+                table_root: ObjectLocation::from_raw(&self.table_root)?.to_wire(),
+                name_mapping: self.name_mapping.clone(),
+            })
         })
     }
 }

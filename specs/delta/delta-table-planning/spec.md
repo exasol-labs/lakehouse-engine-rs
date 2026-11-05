@@ -6,7 +6,7 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 
 * The adapter plans a Delta table at pushdown by replaying its Delta log from object storage.
 * `file-planning/pushdown-statement-state` states how often a statement loads a Delta table and how each reference prunes it.
-* The format that the catalog reports for a table decides how a pushdown plans it.
+* The format that the catalog reports for a table decides how a pushdown plans it (`vs-adapter/catalog-kind-selection`).
 * Delta never writes a partition column's value into the data file, so the adapter passes each file's partition values to the scan (`scan-read-path/scan-execution-partition-values`).
 * Pushdown under the Unity Catalog kind plans a Delta scan (`vs-adapter/catalog-kind-selection`). Deletion vectors, partition values, and column mapping apply at scan time (`scan-read-path/scan-execution-delta-deletion-vectors`, `scan-read-path/scan-execution-partition-values`).
 * File pruning on Delta log statistics runs at plan time (`delta/delta-file-pruning`), and the pushdown SQL carries no per-file statistics.
@@ -159,14 +159,6 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 * *AND* the reader MUST NOT request vended credentials, build an object store, or read one log file,
   so a malformed catalog response costs zero object-storage access
 
-### Scenario: An Iceberg scan carries its delete references and binds columns by field-id
-
-* *GIVEN* an Iceberg table that a pushdown loaded, reached by the single-table pushdown path and every join leg
-* *WHEN* the adapter prunes the table's file list for one table reference
-* *THEN* the adapter SHALL construct each associated positional-delete reference as the Iceberg positional-delete variant of the format-neutral delete mechanism, serialized as `{"path":…,"size":…,"content_type":"position_deletes"}` inside the per-shard file list, and each Puffin deletion vector as the Iceberg deletion-vector variant
-* *AND* the returned scan SHALL carry EMPTY partition columns, and each of its file entries SHALL carry only the `identity` partition values of that file's own partition spec, per `scan-read-path/scan-execution-identity-partition-fill`
-* *AND* every logical field of the Iceberg scan SHALL carry its Iceberg field-id and NO physical name, so an Iceberg column is still bound by field-id and the physical-name and identity binding strategies are unreachable from the Iceberg path
-
 ### Scenario: The Delta reader is reached from production pushdown under the Unity Catalog kind
 
 * *GIVEN* a virtual schema created with `CATALOG_KIND` set to `UNITY_CATALOG`, and a query against one
@@ -184,16 +176,3 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
   other columns
 * *AND* every error on this path MUST be returned as an error value, never raised
   as a panic, and MUST NOT contain any vended or static credential value
-
-### Scenario: A Unity Catalog or Glue table is planned by the format its catalog reports
-
-* *GIVEN* a pushdown request over a table of a Unity Catalog or Glue virtual schema
-* *WHEN* the adapter loads the table
-* *THEN* the format that the catalog's table answer reports SHALL select the plan: under Unity Catalog, the Delta tag plans a Delta scan and the Parquet tag plans the Unity Parquet scan of `unity-catalog/unity-parquet-table-planning`; under Glue, the Iceberg tag plans an Iceberg scan from the table's metadata file and the Parquet tag plans the Hive Parquet scan of `glue/glue-table-planning`
-
-### Scenario: A Unity Catalog table whose pushdown lookup reports the Iceberg format is refused
-
-* *GIVEN* a pushdown request over a table of a Unity Catalog virtual schema whose table answer reports the Iceberg format, even when `createVirtualSchema` listed the table under a format the kind plans
-* *WHEN* the adapter loads the table
-* *THEN* the adapter SHALL fail the request with an error naming the table and the reported format, before it requests a vended credential or reads any storage object
-* *AND* the adapter MUST NOT plan the table as Delta or Parquet, because a table planned as another format surfaces a missing log or a wrong schema instead of the format refusal

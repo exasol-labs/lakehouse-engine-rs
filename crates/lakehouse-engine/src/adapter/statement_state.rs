@@ -10,7 +10,7 @@ use serde_json::Value as Json;
 use tokio::runtime::Runtime;
 use tokio::sync::OnceCell;
 
-use crate::adapter::pushdown::{ConnectionStorage, LoadedTable, ScanCatalog};
+use crate::adapter::pushdown::{LoadedTable, ScanCatalog};
 use crate::adapter::{ResolvedConnectionConfig, construct_catalog_client};
 
 #[cfg(test)]
@@ -34,11 +34,9 @@ impl<T> StatementStates<T> {
         }
     }
 
-    /// The state kept under `name`, built on a miss. A failed build keeps nothing. Exasol names
-    /// the virtual schema in every pushdown, so only a synthesized request, such as a host test's
-    /// `dispatch` call, arrives nameless; it gets a state that the map does not keep, so it never
-    /// shares the process-wide map with another such request. The build runs outside the lock,
-    /// because it may wait on the network.
+    /// The state kept under `name`, built on a miss. A failed build keeps nothing, and a request
+    /// without a schema name gets a state that the map does not keep. The build runs outside the
+    /// lock, because it may wait on the network.
     pub(crate) fn get_or_build<E>(
         &self,
         name: Option<&str>,
@@ -155,11 +153,7 @@ impl StatementCatalog {
                 .entry(table_identifier.to_string())
                 .or_default(),
         );
-        let connection = ConnectionStorage {
-            storage: &self.connection.storage,
-            creds: &self.connection.creds,
-            allow_http: self.connection.allow_http,
-        };
+        let connection = self.connection.connection_storage();
         cell.get_or_try_init(|| self.client.load_for_scan(table_identifier, connection))
             .await
             .map(Arc::clone)

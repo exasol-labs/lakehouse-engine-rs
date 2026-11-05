@@ -635,32 +635,6 @@ impl RendezvousCatalog {
     }
 }
 
-async fn iceberg_pushdown(request: &Json, catalog_uri: &str) -> Result<Json, UdfError> {
-    let connection = resolved_connection(
-        CatalogKind::IcebergRest,
-        catalog_uri,
-        sample_storage(),
-        unauthenticated_creds(),
-    );
-    plan_pushdown(request, connection, "lh.customer", 1024).await
-}
-
-/// A zero broadcast threshold forces the N-scan fallback, which indexes sides by leg.
-async fn delta_n_scan_pushdown(
-    request: &Json,
-    catalog_uri: &str,
-    storage: StorageBackend,
-    table: &str,
-) -> Result<Json, UdfError> {
-    let connection = resolved_connection(
-        CatalogKind::UnityCatalogNative,
-        catalog_uri,
-        storage,
-        unauthenticated_creds(),
-    );
-    plan_pushdown(request, connection, table, 0).await
-}
-
 /// Scenario: A request's table resolutions run concurrently rather than one after another
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn join_legs_resolve_concurrently_in_leg_index_order() {
@@ -669,7 +643,14 @@ async fn join_legs_resolve_concurrently_in_leg_index_order() {
 
     let planned = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        iceberg_pushdown(&request, &catalog.uri),
+        pushdown_over(
+            &request,
+            CatalogKind::IcebergRest,
+            &catalog.uri,
+            sample_storage(),
+            "lh.customer",
+            1024,
+        ),
     )
     .await
     .expect(
@@ -751,9 +732,17 @@ async fn resolved_join_sides_stay_in_leg_index_order() {
     let storage = two_delta_legs_each_pruned_by_its_own_local_filter().await;
     let request = partitioned_legs_request();
 
-    let result = delta_n_scan_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
-        .await
-        .expect("two non-empty Delta legs plan the N-scan fallback");
+    // A zero broadcast threshold forces the N-scan fallback, which indexes sides by leg.
+    let result = pushdown_over(
+        &request,
+        CatalogKind::UnityCatalogNative,
+        &catalog.uri,
+        storage,
+        "cat.sch.orders",
+        0,
+    )
+    .await
+    .expect("two non-empty Delta legs plan the N-scan fallback");
     let sql = result["sql"]
         .as_str()
         .expect("a planned pushdown carries sql");

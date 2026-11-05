@@ -1253,7 +1253,7 @@ fn unity_delta_partitioned_table_returns_partition_values() {
     );
 }
 
-/// Scenario: Every pushdown request shape resolves through the one format-reader seam
+/// Scenario: Every pushdown request shape plans each table from its file list and its column notes
 /// Scenario: A Unity Catalog or Glue table is planned by the format its catalog reports
 #[test]
 fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
@@ -1355,6 +1355,7 @@ const TYPE_WIDENING_SUPPORTED_COLUMNS: &str = "BYTE_LONG, INT_LONG, FLOAT_DOUBLE
      DATE_TIMESTAMP_NTZ";
 
 /// Scenario: A refused table fails the query with a SQL error and leaves the session usable
+/// Scenario: A pushdown request under the Unity Catalog kind is planned as a Delta scan
 #[test]
 fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
     setup();
@@ -1927,6 +1928,7 @@ fn unity_delta_pruned_queries_return_unchanged_rows() {
 }
 
 /// Scenario: Pruning reaches every request shape and changes no result end to end
+/// Scenario: A pushdown request under the Unity Catalog kind is planned as a Delta scan
 #[test]
 fn unity_delta_pruned_pushdown_sql_carries_fewer_files_and_drives_the_scan_udf() {
     setup();
@@ -2431,6 +2433,7 @@ fn unity_delta_non_nullable_declaration_of_a_nullable_column_fails() {
 }
 
 /// Scenario: Every recorded Delta type change is validated, and an unsupported one refuses its column
+/// Scenario: A table the reader cannot plan fails the query loud at plan time
 #[test]
 fn unity_unsupported_type_change_in_type_json_refuses_its_column() {
     setup();

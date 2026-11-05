@@ -33,7 +33,7 @@ use crate::adapter::properties::{
     PROP_CATALOG_CONNECTION, PROP_NAMESPACE, ThreadingMode, TuningProperties, check_properties,
     resolve_allow_http,
 };
-use crate::adapter::pushdown::{ScanCatalog, declare_columns, handle_pushdown};
+use crate::adapter::pushdown::{ConnectionStorage, ScanCatalog, declare_columns, handle_pushdown};
 use crate::adapter::scoped_refresh::{RequestedTables, ScopedRefresh};
 use crate::adapter::skipped_tables::{SkippedTables, insert_skipped_tables, skip_kind_and_reason};
 use crate::adapter::statement_state::{STATEMENT_STATES, StatementCatalog, VirtualSchemaState};
@@ -154,6 +154,16 @@ pub struct ResolvedConnectionConfig {
     pub(crate) catalog_kind: CatalogKind,
     pub(crate) connection_name: String,
     pub(crate) sealed_storage_key: Option<SealedStorageKey>,
+}
+
+impl ResolvedConnectionConfig {
+    pub(crate) fn connection_storage(&self) -> ConnectionStorage<'_> {
+        ConnectionStorage {
+            storage: &self.storage,
+            creds: &self.creds,
+            allow_http: self.allow_http,
+        }
+    }
 }
 
 fn build_runtime() -> Result<tokio::runtime::Runtime, UdfError> {

@@ -1,12 +1,13 @@
 use super::super::super::test_support::{
-    BINARY_ICEBERG_LAST_COLUMN_ID, RecordingCatalog, binary_iceberg_fields,
-    declared_logical_schema, glue_catalog_table, involved_notes, load_table_body,
-    load_table_body_notes, load_table_body_with_columns, object_endpoint, resolve_from_notes,
-    sample_storage, sigv4_creds, user_message,
+    BINARY_ICEBERG_LAST_COLUMN_ID, FakeCatalog, binary_iceberg_fields, declared_logical_schema,
+    glue_catalog_table, involved_notes, load_table_body, load_table_body_notes,
+    load_table_body_with_columns, object_endpoint, resolve_from_notes, sample_storage, sigv4_creds,
+    user_message,
 };
 use super::super::ResolvedScan;
 use super::*;
 use crate::adapter::column_notes::TableNotes;
+use crate::adapter::pushdown::test_support::connection_storage;
 use iceberg::spec::{DataContentType, DataFileFormat};
 use lakehouse_catalog::{ConnectionCreds, StorageBackend, TableFormat};
 
@@ -34,7 +35,7 @@ async fn resolve_rest(
     filter_json: Option<&Json>,
 ) -> Result<ResolvedScan, UdfError> {
     let notes = load_table_body_notes(&serde_json::from_str(&body).expect("a JSON body"));
-    let catalog = RecordingCatalog::spawn(move |_target| (200, body.clone())).await;
+    let catalog = FakeCatalog::spawn(move |_target| (200, body.clone())).await;
     let session = CatalogSession::resolve(&catalog.uri, &creds.warehouse, creds)
         .await
         .expect("the SigV4 path resolves a session without contacting the catalog");
@@ -42,11 +43,7 @@ async fn resolve_rest(
         warehouse: creds.warehouse.clone(),
         table: table.into(),
     };
-    let connection = ConnectionStorage {
-        storage,
-        creds,
-        allow_http: true,
-    };
+    let connection = connection_storage(storage, creds);
     resolve_from_notes(
         IcebergTable::from_rest(&session, &catalog_props, &connection),
         &involved_notes("T", &notes),

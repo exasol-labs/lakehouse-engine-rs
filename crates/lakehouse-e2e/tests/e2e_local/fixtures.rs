@@ -4,7 +4,6 @@ use crate::common::e2e_harness::{
     install_slc, runtime, upload_so,
 };
 use crate::common::exasol_ws::ExaConn;
-use crate::common::pos_delete_fixtures::NAMESPACE;
 use crate::common::raw_parquet::write_parquet_fixture;
 use crate::common::seed::{
     E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_TABLE, E2E_TYPED_TABLE,
@@ -181,6 +180,18 @@ pub fn password_via_proxy() -> CatalogConnectionPassword {
     }
 }
 
+/// A CONNECTION that names a role whose STS endpoint only the proxy resolves.
+pub fn role_password_via_proxy() -> CatalogConnectionPassword {
+    CatalogConnectionPassword {
+        access_key: ASSUME_ROLE_BASE_ACCESS_KEY.to_string(),
+        secret_key: ASSUME_ROLE_BASE_SECRET_KEY.to_string(),
+        aws_assume_role_arn: Some(ASSUME_ROLE_ARN.to_string()),
+        aws_external_id: Some(ASSUME_ROLE_EXTERNAL_ID.to_string()),
+        aws_sts_endpoint: Some(SEAWEEDFS_VIA_PROXY.to_string()),
+        ..password_via_proxy()
+    }
+}
+
 pub fn proxy_props<'a>(vs_name: &'a str, namespace: &'a str, conn_name: &'a str) -> VsProps<'a> {
     VsProps::new(vs_name, namespace)
         .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
@@ -218,7 +229,7 @@ pub fn proxy_virtual_schemas() {
 
         create_virtual_schema_with_password(
             &mut conn,
-            &proxy_props(PROXY_ICEBERG_VS, NAMESPACE, "PROXY_ICEBERG_CREDS"),
+            &proxy_props(PROXY_ICEBERG_VS, E2E_NAMESPACE, "PROXY_ICEBERG_CREDS"),
             ICEBERG_REST_VIA_PROXY,
             &password_via_proxy(),
         );
@@ -240,14 +251,7 @@ pub fn proxy_virtual_schemas() {
             &mut conn,
             &proxy_props(PROXY_ROLE_VS, E2E_NAMESPACE, "PROXY_ROLE_CREDS"),
             ICEBERG_REST_VIA_PROXY,
-            &CatalogConnectionPassword {
-                access_key: ASSUME_ROLE_BASE_ACCESS_KEY.to_string(),
-                secret_key: ASSUME_ROLE_BASE_SECRET_KEY.to_string(),
-                aws_assume_role_arn: Some(ASSUME_ROLE_ARN.to_string()),
-                aws_external_id: Some(ASSUME_ROLE_EXTERNAL_ID.to_string()),
-                aws_sts_endpoint: Some(SEAWEEDFS_VIA_PROXY.to_string()),
-                ..password_via_proxy()
-            },
+            &role_password_via_proxy(),
         );
         refresh(PROXY_ROLE_VS);
     });

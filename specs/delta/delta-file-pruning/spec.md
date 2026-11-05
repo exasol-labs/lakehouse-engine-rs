@@ -115,7 +115,7 @@ The adapter translates the soundly translatable nodes of the Exasol WHERE predic
 * *WHEN* the suite issues a partition-column equality against the first, a stats-excluded range predicate against the second, and the same predicates again as a single-table scan, as an aggregate, and as one leg of a broadcast join
 * *THEN* the generated pushdown SQL SHALL carry FEWER data files than the table's active file count for each pruning predicate, and the dropped files SHALL be exactly those the predicate provably excludes
 * *AND* the rows each query returns SHALL be identical to the rows the same query returns with pruning inert, so pruning is observable in the plan and invisible in the result
-* *AND* every request shape SHALL prune through the SAME seam, because the format-reader seam forwards the request's filter to the reader for a single-table scan and for each join leg alike (`file-planning/pushdown-format-neutral-resolution`), so no shape is left unpruned and none is gated on the table format
+* *AND* every request shape SHALL prune the same way, because the adapter prunes each table reference with that reference's own filter for a single-table scan and for each join leg alike (`file-planning/pushdown-format-neutral-resolution`), so no shape is left unpruned and none is gated on the table format
 * *AND* a join SHALL prune each side by that side's OWN side-local predicate, and MUST NOT apply one side's predicate to the other's file list
 
 ### Scenario: A filter column resolves through its declared binding key

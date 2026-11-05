@@ -1753,95 +1753,18 @@ async fn malformed_table_ident_fails_before_any_catalog_contact() {
     );
 }
 
-async fn seam_handle_pushdown(
-    request: &Json,
-    catalog_uri: &str,
-    catalog: &CatalogProps,
-    catalog_kind: CatalogKind,
-    creds: &ConnectionCreds,
-) -> Result<Json, UdfError> {
-    let connection =
-        resolved_connection(catalog_kind, catalog_uri, sample_storage(), creds.clone());
-    plan_pushdown(request, connection, &catalog.table, 1024).await
-}
-
-/// Scenario: Every pushdown request shape resolves through the one format-reader seam
-#[tokio::test]
-async fn every_request_shape_resolves_through_the_format_reader_seam() {
-    let iceberg = iceberg_catalog().await;
-    let creds = unauthenticated_creds();
-    let iceberg_catalog_props = CatalogProps {
-        warehouse: "wh".into(),
-        table: "db.t".into(),
-    };
-    let result = seam_handle_pushdown(
-        &with_iceberg_notes(nq4_request()),
-        &iceberg.uri,
-        &iceberg_catalog_props,
-        CatalogKind::IcebergRest,
-        &creds,
-    )
-    .await
-    .expect("a snapshotless Iceberg table resolves an empty pushdown result");
-    assert_eq!(result["type"], "pushdown");
-    assert_eq!(
-        iceberg.targets(),
-        vec![
-            ICEBERG_CONFIG_TARGET.to_string(),
-            ICEBERG_LOAD_TABLE_TARGET.to_string()
-        ],
-        "the Iceberg reader must be reached through the resolver"
-    );
-
-    let unity = RecordingCatalog::spawn(|target| {
-        if target == UNITY_TABLE_TARGET {
-            (200, locationless_delta_table_body())
-        } else {
-            (404, r#"{"message":"no such table"}"#.to_string())
-        }
-    })
-    .await;
-    let unity_catalog_props = CatalogProps {
-        warehouse: "wh".into(),
-        table: "cat.sch.orders".into(),
-    };
-    let lineitem = [("l_orderkey", "long"), ("l_extendedprice", "decimal(18,2)")];
-    let err = seam_handle_pushdown(
-        &with_delta_notes(nq4_request(), "LINEITEM", &lineitem, &[]),
-        &unity.uri,
-        &unity_catalog_props,
-        CatalogKind::UnityCatalogNative,
-        &creds,
-    )
-    .await
-    .expect_err("a Delta table carrying no storage location cannot be planned");
-    assert_eq!(
-        unity.targets(),
-        vec![UNITY_TABLE_TARGET.to_string()],
-        "the Delta reader must be reached through the SAME resolver, not a routed-around path"
-    );
-    assert!(
-        err.to_string().contains("cat.sch.orders"),
-        "the Delta reader's own plan-time error must name the table: {err}"
-    );
-}
-
 /// Scenario: A Unity Catalog table's identity survives the round trip from the involved table
 #[tokio::test]
 async fn a_malformed_unity_identifier_is_refused_in_unity_terms_before_any_catalog_contact() {
-    let unity = RecordingCatalog::spawn(|_| (200, locationless_delta_table_body())).await;
-    let creds = unauthenticated_creds();
-    let catalog = CatalogProps {
-        warehouse: "wh".into(),
-        table: "orders".into(),
-    };
-
-    let err = seam_handle_pushdown(
+    // An unreachable catalog fails any request with a transport error, so a refusal in Unity
+    // terms was decided before a request.
+    let err = pushdown_over(
         &nq4_request(),
-        &unity.uri,
-        &catalog,
         CatalogKind::UnityCatalogNative,
-        &creds,
+        UNREACHABLE_CATALOG,
+        sample_storage(),
+        "orders",
+        1024,
     )
     .await
     .expect_err("an identifier that addresses no Unity Catalog table must be refused");
@@ -1854,11 +1777,6 @@ async fn a_malformed_unity_identifier_is_refused_in_unity_terms_before_any_catal
     assert!(
         !message.contains("namespace.table"),
         "Iceberg's identifier rule must not judge a Unity Catalog identifier: {message}"
-    );
-    assert!(
-        unity.targets().is_empty(),
-        "a malformed identifier must cost no catalog request: {:?}",
-        unity.targets()
     );
 }
 

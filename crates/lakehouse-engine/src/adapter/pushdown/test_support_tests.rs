@@ -85,32 +85,23 @@ pub(super) fn request_target(head: &str) -> &str {
     head.split_whitespace().nth(1).unwrap_or("")
 }
 
-pub(crate) struct RecordingCatalog {
+/// A fake catalog that answers JSON.
+pub(crate) struct FakeCatalog {
     pub(super) uri: String,
-    requests: RecordedRequests,
 }
 
-impl RecordingCatalog {
+impl FakeCatalog {
     /// `responder` maps a request target to a status and body.
     pub(super) async fn spawn<F>(responder: F) -> Self
     where
         F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
     {
-        let (uri, requests) = spawn_answering_http_server(move |head| {
+        let (uri, _) = spawn_answering_http_server(move |head| {
             let (status, body) = responder(request_target(head));
             (status, "application/json", body)
         })
         .await;
-        Self { uri, requests }
-    }
-
-    pub(super) fn targets(&self) -> Vec<String> {
-        self.requests
-            .lock()
-            .expect("recorded requests")
-            .iter()
-            .map(|(head, _)| request_target(head).to_string())
-            .collect()
+        Self { uri }
     }
 }
 /// No catalog auth, so a session issues no token-grant request.
@@ -136,12 +127,6 @@ pub(crate) fn unauthenticated_creds() -> ConnectionCreds {
         ..Default::default()
     }
 }
-
-pub(crate) const ICEBERG_CONFIG_TARGET: &str = "/v1/config?warehouse=wh";
-
-pub(crate) const ICEBERG_LOAD_TABLE_TARGET: &str = "/v1/namespaces/db/tables/t?snapshots=refs";
-
-pub(crate) const UNITY_TABLE_TARGET: &str = "/api/2.1/unity-catalog/tables/cat.sch.orders";
 
 /// SigV4 mode lets `CatalogSession::resolve` build a session without contacting the catalog, so
 /// `loadTable` is a loopback catalog's only request.
@@ -823,20 +808,8 @@ pub(crate) fn with_identifier_notes(mut request: Json, identifiers: &[(&str, &st
     request
 }
 
-/// No storage location, so the Delta reader refuses before reaching any object store.
-pub(crate) fn locationless_delta_table_body() -> String {
-    serde_json::json!({
-        "name": "orders",
-        "table_type": "MANAGED",
-        "data_source_format": "DELTA",
-        "table_id": "table-1",
-        "columns": []
-    })
-    .to_string()
-}
-
-pub(crate) async fn unity_delta_catalog() -> RecordingCatalog {
-    RecordingCatalog::spawn(|target| match target.rsplit_once('.') {
+pub(crate) async fn unity_delta_catalog() -> FakeCatalog {
+    FakeCatalog::spawn(|target| match target.rsplit_once('.') {
         Some((_, name)) if !name.is_empty() => (
             200,
             serde_json::json!({
@@ -1112,13 +1085,28 @@ pub(crate) async fn delta_pushdown(
     storage: StorageBackend,
     table: &str,
 ) -> Result<Json, UdfError> {
-    let connection = resolved_connection(
+    pushdown_over(
+        request,
         CatalogKind::UnityCatalogNative,
         catalog_uri,
         storage,
-        unauthenticated_creds(),
-    );
-    plan_pushdown(request, connection, table, 1024).await
+        table,
+        1024,
+    )
+    .await
+}
+
+/// [`plan_pushdown`] over an unauthenticated `kind` CONNECTION at `catalog_uri`.
+pub(crate) async fn pushdown_over(
+    request: &Json,
+    kind: CatalogKind,
+    catalog_uri: &str,
+    storage: StorageBackend,
+    table: &str,
+    join_broadcast_max_bytes: u64,
+) -> Result<Json, UdfError> {
+    let connection = resolved_connection(kind, catalog_uri, storage, unauthenticated_creds());
+    plan_pushdown(request, connection, table, join_broadcast_max_bytes).await
 }
 
 /// Plans `request` as the first pushdown of its statement, over `table` when it is no join.
@@ -1163,20 +1151,16 @@ pub(crate) fn statement_over(
     StatementCatalog::open(connection, &Json::Null).expect("the catalog client issues no request")
 }
 
-pub(crate) async fn iceberg_catalog() -> RecordingCatalog {
-    RecordingCatalog::spawn(|target| {
-        if target.starts_with("/v1/config") {
-            return (200, "{}".to_string());
-        }
-        match target.rsplit_once('/') {
-            Some((_, table)) => (
-                200,
-                snapshotless_load_table_body(&format!("s3://bucket/{table}")),
-            ),
-            None => (404, r#"{"message":"no such table"}"#.to_string()),
-        }
-    })
-    .await
+/// A CONNECTION's storage view that allows HTTP.
+pub(crate) fn connection_storage<'a>(
+    storage: &'a StorageBackend,
+    creds: &'a ConnectionCreds,
+) -> ConnectionStorage<'a> {
+    ConnectionStorage {
+        storage,
+        creds,
+        allow_http: true,
+    }
 }
 
 pub(crate) const TEST_CONNECTION_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
