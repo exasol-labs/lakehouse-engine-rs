@@ -10,8 +10,9 @@ direct storage, and include Databricks-managed tables. It runs the
 [DataFusion](https://datafusion.apache.org/) engine in place, inside Rust UDFs on the
 Exasol nodes. Scans therefore run where the cluster already is. The VS layer stays
 thin: it does query translation, pushdown analysis, parallelization planning, and schema
-mapping. All execution happens in disposable, node-local DataFusion runtimes. Every query
-is stateless: no caching, no materialization, no data copied out.
+mapping. All execution happens in disposable, node-local DataFusion runtimes. The adapter
+reuses a table's metadata within one statement and keeps nothing across statements. It
+does no materialization and copies no data out.
 
 After you deploy it, you query lakehouse tables like any other Exasol schema:
 
@@ -29,6 +30,7 @@ GROUP BY l_returnflag;
 | [Install](install.md) | One command installs the engine on any Exasol deployment: SaaS, Exasol AsApp, Docker, or on-premise. It uploads the `.so`, registers the Rust SLC, and creates the scripts. Build-from-source and fully manual paths are covered too, as appendices. |
 | [Catalogs](catalogs.md) | Connect to Iceberg REST (including Lakekeeper), Unity Catalog, AWS Glue, and direct storage: CONNECTION objects, credentials, and object-storage access. |
 | [Security](security.md) | Who needs which grant: a reader needs only `SELECT`, and the Virtual Schema's owner holds the script and CONNECTION grants. Also what a re-install drops, the error each missing grant gives, who can bypass the adapter, the Lakekeeper per-user permission check, the sealed vended-credential envelope, and rotation. |
+| [Export](export.md) | **In development, not ready for use.** `EXPORT ... INTO SCRIPT` over an Exasol table or a query on virtual tables: the statement and its options, the export role, how many writers run, and that this release writes no data to the lakehouse. |
 | [Benchmark](benchmark.md) | The benchmark query set and how to run it yourself. |
 | [Architecture](architecture.md) | How cluster and DataFusion parallelism combine: file sharding, `GROUP BY shard_key` fan-out, and how pushdown meets parent-level Exasol execution. |
 | [Capabilities](capabilities.md) | Pushdown support matrix: what runs in DataFusion versus Exasol. |

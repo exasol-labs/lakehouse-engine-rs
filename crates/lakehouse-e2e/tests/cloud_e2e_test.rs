@@ -14,7 +14,7 @@ use aws_sigv4::http_request::{
 };
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
-use common::exasol_ws::{ExaConn, error_text};
+use common::exasol_ws::{ExaConn, error_text, profiled_export_counts};
 use common::stack::{CatalogConnectionPassword, build_create_connection_sql};
 use iceberg_catalog_rest::LoadTableResult;
 use serde_json::Value;
@@ -1180,4 +1180,103 @@ fn cloud_assume_role_wrong_external_id_is_denied() {
         !msg.contains(WRONG_EXTERNAL_ID) && !msg.contains(&env.base_secret_access_key),
         "credential or external id leaked: {msg}"
     );
+}
+
+const CLOUD_EXPORT_SCRIPT: &str = "LAKEHOUSE_EXPORT";
+const CLOUD_EXPORT_SOURCE: &str = "CLOUD_LHVS.EXPORT_ROWS_10K";
+const CLOUD_EXPORT_ROWS: i64 = 10_000;
+const CLOUD_EXPORT_MAX_WRITERS: i64 = 300;
+
+/// The exported row count and the writer count of one export, read as in the local suite: a
+/// fresh session holds only this export, whose writer count is the `OUT_ROWS` of its one
+/// `GROUP BY` profile part.
+fn cloud_profiled_export(env: &CloudEnv, source: &str, options: &str) -> (i64, i64) {
+    let mut conn = ExaConn::connect(
+        &env.exasol_host,
+        env.exasol_port,
+        &env.exasol_user,
+        &env.exasol_password,
+    );
+    let sql = format!(
+        "EXPORT {source} INTO SCRIPT {CLOUD_SCHEMA_NAME}.{CLOUD_EXPORT_SCRIPT} \
+         WITH CATALOG_CONNECTION = '{CLOUD_CATALOG_CONN}' TABLE_NAME = 'ns.t' {options}"
+    );
+    profiled_export_counts(&mut conn, &sql)
+}
+
+/// Scenario: WRITERS_PER_NODE sets the writer count
+/// Scenario: SINGLE_COMMIT runs one writer for the whole cluster
+#[test]
+fn cloud_export_writer_counts() {
+    let env = match CloudEnv::from_env() {
+        Some(e) => e,
+        None => {
+            println!("SKIPPED: cloud_export_writer_counts — env vars absent");
+            return;
+        }
+    };
+
+    let mut conn = ExaConn::connect_redacting(
+        &env.exasol_host,
+        env.exasol_port,
+        &env.exasol_user,
+        &env.exasol_password,
+    );
+    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
+    let export_scripts = conn.query_scalar_i64(&format!(
+        "SELECT COUNT(*) FROM EXA_ALL_SCRIPTS \
+         WHERE SCRIPT_SCHEMA = '{CLOUD_SCHEMA_NAME}' AND SCRIPT_NAME = '{CLOUD_EXPORT_SCRIPT}'"
+    ));
+    assert_eq!(
+        export_scripts, 1,
+        "{CLOUD_SCHEMA_NAME}.{CLOUD_EXPORT_SCRIPT} is missing: create it with the DDL of \
+         `ddl_export` in deploy/scripts/install.sh over the uploaded .so (see deploy/README.md)"
+    );
+
+    conn.execute(&build_create_connection_sql(
+        CLOUD_CATALOG_CONN,
+        &env.glue_catalog_uri,
+        &env.catalog_connection_password(),
+    ));
+    if !env.exasol_user.eq_ignore_ascii_case("SYS") {
+        conn.execute(&format!(
+            "GRANT ACCESS ON CONNECTION {CLOUD_CATALOG_CONN} \
+             FOR SCRIPT {CLOUD_SCHEMA_NAME}.{CLOUD_EXPORT_SCRIPT} TO {}",
+            env.exasol_user
+        ));
+    }
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {CLOUD_EXPORT_SOURCE} AS \
+         SELECT CAST(LEVEL AS DECIMAL(9,0)) AS ID FROM DUAL CONNECT BY LEVEL <= {CLOUD_EXPORT_ROWS}"
+    ));
+
+    let nodes = conn.query_scalar_i64("SELECT NPROC() FROM DUAL");
+    let per_node_two = (2 * nodes).min(CLOUD_EXPORT_MAX_WRITERS);
+    let one_row_per_writer =
+        format!("(SELECT * FROM {CLOUD_EXPORT_SOURCE} WHERE ID <= {per_node_two})");
+
+    assert_eq!(
+        cloud_profiled_export(&env, CLOUD_EXPORT_SOURCE, "SINGLE_COMMIT = 'true'"),
+        (CLOUD_EXPORT_ROWS, 1),
+        "SINGLE_COMMIT on {nodes} nodes"
+    );
+    assert_eq!(
+        cloud_profiled_export(&env, CLOUD_EXPORT_SOURCE, ""),
+        (CLOUD_EXPORT_ROWS, nodes.min(CLOUD_EXPORT_MAX_WRITERS)),
+        "default writers on {nodes} nodes"
+    );
+    assert_eq!(
+        cloud_profiled_export(&env, CLOUD_EXPORT_SOURCE, "WRITERS_PER_NODE = '2'"),
+        (CLOUD_EXPORT_ROWS, per_node_two),
+        "WRITERS_PER_NODE = '2' on {nodes} nodes"
+    );
+    // Exactly one row per writer: a gap in the cross-node ROWNUM numbering would leave a writer empty.
+    assert_eq!(
+        cloud_profiled_export(&env, &one_row_per_writer, "WRITERS_PER_NODE = '2'"),
+        (per_node_two, per_node_two),
+        "WRITERS_PER_NODE = '2' over {per_node_two} rows on {nodes} nodes"
+    );
+    println!("cloud_export_writer_counts: verified on {nodes} nodes");
+
+    let _ = conn.try_execute(&format!("DROP TABLE IF EXISTS {CLOUD_EXPORT_SOURCE}"));
 }

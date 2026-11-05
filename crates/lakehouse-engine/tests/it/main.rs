@@ -6,7 +6,6 @@ mod scan_fixture;
 
 mod boolean_to_string_casing_test;
 mod build_convention;
-mod catalog_session_signatures;
 mod micro_bench;
 mod pushdown_public_surface;
 mod scan_agg_projection_pruning;

@@ -1,7 +1,8 @@
+use crate::adapter::pushdown::test_support::connection_storage;
 use crate::adapter::pushdown::test_support::{col, predicate_equal, str_lit};
 use delta_kernel::schema::DataType as DeltaType;
 
-use super::super::{ConnectionStorage, ResolvedScan};
+use super::super::ResolvedScan;
 use super::*;
 use crate::adapter::pushdown::test_support::{
     SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, UNREACHABLE_CATALOG, catalog_table,
@@ -56,7 +57,7 @@ fn delta_table(
     }
 }
 
-/// The Delta reader of `table`, planned from `notes`.
+/// The Delta table `table`, loaded and then pruned for `notes`.
 async fn resolve_noted(
     table: &CatalogTable,
     notes: &[(String, String)],
@@ -65,15 +66,9 @@ async fn resolve_noted(
     filter: Option<&Json>,
 ) -> Result<ResolvedScan, UdfError> {
     let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
-    let connection = ConnectionStorage {
-        storage,
-        creds,
-        allow_http: true,
-    };
-    let reader = DeltaFormatReader {
-        storage: UnityTableStorage::new(&session, table, &connection),
-    };
-    resolve_from_notes(&reader, &involved_notes(TABLE_NAME, notes), filter).await
+    let connection = connection_storage(storage, creds);
+    let load = DeltaTable::open(UnityTableStorage::new(&session, table, connection));
+    resolve_from_notes(load, &involved_notes(TABLE_NAME, notes), filter).await
 }
 
 async fn refusal(table: &CatalogTable, use_vended_credentials: bool) -> String {

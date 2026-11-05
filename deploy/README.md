@@ -76,6 +76,33 @@ The assume-role tests in `crates/lakehouse-e2e/tests/cloud_e2e_test.rs` read the
 cargo test --workspace --features lakehouse-e2e/cloud-e2e --test cloud_e2e_test cloud_assume_role -- --test-threads=1
 ```
 
+### Cloud export E2E (opt-in)
+
+`cloud_export_writer_counts` exports a 10,000-row table through `CLOUD_LHVS.LAKEHOUSE_EXPORT` and reads the writer count of each export from the session profile. It needs a multi-node cluster, so it runs against a cluster from section 2, with the same Glue variables as the other cloud tests. Without them it skips.
+
+1. Upload the branch-built `.so` and the SLC of the pinned version (the path `bench/run.sh` uses):
+
+   ```bash
+   make cross-udf-build
+   make install-slc bucketfs-upload-so EXASOL_HOST=<cluster> LH_EXASOL_PORT=<sql port> \
+     LH_BUCKETFS_PORT=<bucketfs port> EXASOL_SYS_PASSWORD=<sys password> BUCKETFS_WRITE_PASS=<pass>
+   ```
+
+2. Create the export script in the cloud schema over that `.so`. The statement is the `ddl_export` text of `deploy/scripts/install.sh`, which the installer runs only with `--with-export`:
+
+   ```sql
+   CREATE SCHEMA IF NOT EXISTS CLOUD_LHVS;
+   CREATE OR REPLACE RUST SET SCRIPT CLOUD_LHVS.LAKEHOUSE_EXPORT(...) RETURNS DECIMAL(18,0) AS
+   %udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
+   /
+   ```
+
+3. Run the test. When `LH_EXASOL_USER` is not `SYS`, the test grants that user `ACCESS` on the `GLUE_CATALOG_CREDS` CONNECTION for the export script:
+
+   ```bash
+   cargo test --workspace --features lakehouse-e2e/cloud-e2e --test cloud_e2e_test cloud_export_writer_counts -- --test-threads=1
+   ```
+
 ## 2. Test cluster (ephemeral — per benchmark)
 
 ```bash

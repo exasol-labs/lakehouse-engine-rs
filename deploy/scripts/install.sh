@@ -61,6 +61,7 @@ ARG_BFS_BUCKET="$DEFAULT_BFS_BUCKET"
 ARG_BFS_BUCKET_SET=0
 ARG_BFS_WRITE_PASSWORD=""
 ARG_SKIP_SLC=0
+ARG_WITH_EXPORT=0
 ARG_ARCH="x86_64"
 ARG_ARCH_SET=0
 ARG_DEPLOYMENT=""
@@ -410,6 +411,10 @@ Both modes:
                             language-container-rs's own latest release)
   --skip-slc                do not download, upload or register the Rust SLC; install the engine
                             against the SLC already registered on the database
+  --with-export             also create the LAKEHOUSE_EXPORT script and print the export grants.
+                            In development, not ready for use: export counts rows and writes
+                            nothing to the lakehouse. No release contains it yet, so the script
+                            fails with a loader error unless the engine is built from source
   --arch <x86_64|aarch64>   target CPU architecture (default: x86_64, or the host's for a local
                             --deployment); selects unsuffixed vs -aarch64-suffixed release assets
   --deployment <name>       target an Exasol Personal deployment by name, resolving connection and
@@ -455,6 +460,7 @@ parse_args() {
   ARG_BFS_BUCKET_SET=0
   ARG_BFS_WRITE_PASSWORD=""
   ARG_SKIP_SLC=0
+  ARG_WITH_EXPORT=0
   ARG_ARCH="x86_64"
   ARG_ARCH_SET=0
   ARG_DEPLOYMENT=""
@@ -465,6 +471,7 @@ parse_args() {
     case "$flag" in
       --staging)  ARG_STAGING=1; shift; continue ;;
       --skip-slc) ARG_SKIP_SLC=1; shift; continue ;;
+      --with-export) ARG_WITH_EXPORT=1; shift; continue ;;
       --help|-h)  ARG_HELP=1; shift; continue ;;
       --account-id|--database-id|--profile|--dsn|--host|--user|--password|--schema|--lakehouse-version|--slc-version) ;;
       --target|--bfs-host|--bfs-port|--bfs-bucket|--bfs-write-password|--arch|--deployment) ;;
@@ -1195,6 +1202,10 @@ ddl_version() {
   printf 'CREATE OR REPLACE RUST SCALAR SCRIPT %s.LAKEHOUSE_VERSION()\nRETURNS VARCHAR(100) AS\n%%udf_object %s' "$1" "$2"
 }
 
+ddl_export() {
+  printf 'CREATE OR REPLACE RUST SET SCRIPT %s.LAKEHOUSE_EXPORT(...)\nRETURNS DECIMAL(18,0) AS\n%%udf_object %s' "$1" "$2"
+}
+
 ddl_distribute_files() {
   printf 'CREATE OR REPLACE LUA SET SCRIPT %s.LAKEHOUSE_DISTRIBUTE_FILES(files VARCHAR(2000000))\nEMITS (files VARCHAR(2000000)) AS\nfunction run(ctx)\n    repeat\n        ctx.emit(ctx.files)\n    until not ctx.next()\nend' "$1"
 }
@@ -1271,6 +1282,9 @@ create_engine_scripts() {
     "$(ddl_version "$schema" "$so")"
     "$(ddl_distribute_files "$schema")"
   )
+  if [[ "$ARG_WITH_EXPORT" -eq 1 ]]; then
+    statements+=("$(ddl_export "$schema" "$so")")
+  fi
   for stmt in "${statements[@]}"; do
     if ! run_sql "$stmt" >/dev/null 2>&1; then
       err "failed to create a deployment script in schema $schema (statement starting: ${stmt%%$'\n'*})."
@@ -1346,6 +1360,7 @@ run_smoke_test() {
 print_next_step_template() {
   local schema="$1"
   local role="LAKEHOUSE_ENGINE_ROLE_${schema}"
+  local export_role="LAKEHOUSE_EXPORT_ROLE_${schema}"
   local installing_user="${ARG_USER:-<installing-user>}"
   emit ""
   emit "=== Next step: create the catalog CONNECTION and VIRTUAL SCHEMA (NOT created by this installer) ==="
@@ -1399,6 +1414,17 @@ print_next_step_template() {
   emit "  ALLOW_HTTP         = 'false';"
   emit ""
   emit "-- Readers need only: GRANT CREATE SESSION TO <user>; GRANT SELECT ON SCHEMA <MY_LAKEHOUSE> TO <user>;"
+  if [[ "$ARG_WITH_EXPORT" -eq 1 ]]; then
+    emit ""
+    emit "-- Export (EXPORT ... INTO SCRIPT $schema.LAKEHOUSE_EXPORT WITH CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS' ...): one role serves every exporting user. SYS needs no grant."
+    emit "-- Run as a DBA after the CONNECTION exists. After a re-install, run the GRANT EXECUTE and GRANT ACCESS lines again."
+    emit "-- Grant the role only to users who may use the CONNECTION's credentials."
+    emit "CREATE ROLE $export_role;"
+    emit "GRANT EXPORT TO $export_role;"
+    emit "GRANT EXECUTE ON SCRIPT $schema.LAKEHOUSE_EXPORT TO $export_role;"
+    emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_EXPORT TO $export_role;"
+    emit "-- Exporters: GRANT $export_role TO <user>;"
+  fi
 }
 
 main() {

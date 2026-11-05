@@ -19,7 +19,7 @@ GRANT CREATE SESSION TO <reader>;
 GRANT SELECT ON SCHEMA <vs> TO <reader>;
 ```
 
-A reader needs no `EXECUTE` on a script, no grant on the CONNECTION, and no role membership. A CONNECTION grant to a reader has no effect on its queries, because only the owner's grants count. Do not grant one: it is half of what a user needs to [bypass the adapter](#who-can-bypass-the-adapter).
+A reader needs no `EXECUTE` on a script, no grant on the CONNECTION, and no role membership. A CONNECTION grant to a reader has no effect on its queries, because only the owner's grants count. Do not grant `ACCESS` on the CONNECTION for `LAKEHOUSE_SCAN`: it is half of what a user needs to [bypass the adapter](#who-can-bypass-the-adapter). The [export role](#export-grants) grants no access for `LAKEHOUSE_SCAN`, so a reader that also exports holds that role in addition to the reader grants.
 
 ### Owner grants
 
@@ -75,9 +75,26 @@ ALTER VIRTUAL SCHEMA <vs> CHANGE OWNER <role>;
 
 Readers still need only the reader grants, not membership in the role. Every member of the role acts as the owner, so it can [bypass the adapter](#who-can-bypass-the-adapter) and turn off the [Lakekeeper permission check](#lakekeeper-permission-check). Grant the role only to administrators.
 
+### Export grants
+
+> **In development.** Export is not ready for use: it counts rows and writes nothing to the lakehouse. Permissions may change.
+
+A user who runs `EXPORT ... INTO SCRIPT <schema>.LAKEHOUSE_EXPORT` (see [Export](export.md)) holds the export role, not the engine role. The installer prints the role's statements in its next-step template only when you pass `--with-export`, and runs none of them, because it runs before any CONNECTION exists. Create the CONNECTION, run the statements as a DBA, then grant the role to each exporting user:
+
+```sql
+CREATE ROLE LAKEHOUSE_EXPORT_ROLE_<schema>;
+GRANT EXPORT TO LAKEHOUSE_EXPORT_ROLE_<schema>;
+GRANT EXECUTE ON SCRIPT <schema>.LAKEHOUSE_EXPORT TO LAKEHOUSE_EXPORT_ROLE_<schema>;
+GRANT ACCESS ON CONNECTION <conn> FOR SCRIPT <schema>.LAKEHOUSE_EXPORT TO LAKEHOUSE_EXPORT_ROLE_<schema>;
+
+GRANT LAKEHOUSE_EXPORT_ROLE_<schema> TO <user>;
+```
+
+The export names the CONNECTION in a `WITH CATALOG_CONNECTION` option, never in an `AT` clause, so the role needs no `CONNECTION` privilege. The script-scoped `ACCESS` grant alone decides who exports through which CONNECTION. Grant the role only to users who may use the CONNECTION's credentials.
+
 ### Re-installing
 
-Re-running the installer replaces the scripts with `CREATE OR REPLACE SCRIPT`. That drops every per-script grant on them, `EXECUTE` and `ACCESS` alike, including those of the install script's role, so queries fail until you issue the grants again. Per-schema grants and unscoped CONNECTION access survive.
+Re-running the installer replaces the scripts with `CREATE OR REPLACE SCRIPT`. That drops every per-script grant on them, `EXECUTE` and `ACCESS` alike, including those of the install script's role, so queries fail until you issue the grants again. This includes the export role's `EXECUTE` and `ACCESS` grants on `LAKEHOUSE_EXPORT`: run those two statements again. Per-schema grants and unscoped CONNECTION access survive.
 
 ### Missing grants
 
@@ -106,6 +123,10 @@ A user who submits a scan plan directly, instead of querying the virtual schema,
 - `ACCESS` on the CONNECTION for `LAKEHOUSE_SCAN`.
 
 The virtual schema's owner holds both, and so does every member of a role that owns it. A reader with only the [reader grants](#reader-grants) holds neither, and Exasol refuses its plan with `insufficient privileges for calling script`. Grant these privileges only to users who may read every table the CONNECTION can read.
+
+### Who can bypass the export script
+
+A holder of the [export role](#export-grants) can call `LAKEHOUSE_EXPORT` directly in a `SELECT`, with a forged writer spec and any rows. That call runs the writer and skips every check the export call makes: the options, the writer count, and `SINGLE_COMMIT`. The writer therefore treats its writer spec as untrusted input. Grant the export role only to users who may export any rows through the CONNECTION.
 
 ## Lakekeeper permission check
 
@@ -150,7 +171,7 @@ The adapter refuses a query when the request names no user, when the template fa
 
 A user can query a table only if Lakekeeper allows the mapped principal to read it. This holds for every query shape, including aggregates, filters, and joins. Each table in a join counts separately, so a join succeeds only when the user may read both tables.
 
-The adapter asks Lakekeeper once per query, before any data is read. If the user may not read one or more tables, the whole query is refused, and the error names each table the user may not read and no other. Lakekeeper reports a missing table as denied, so the error cannot tell a missing table from a forbidden one. Example error for a join without grants:
+The adapter asks Lakekeeper before the statement first reads a table. Exasol sends each UNION ALL branch, CTE reference, and subquery as its own pushdown request, and each request checks, in one batch, the tables that no earlier request of the statement checked. If the user may not read one or more of those tables, the whole query is refused, and the error names each table of that request the user may not read and no other. A statement whose branches read different forbidden tables is refused at the first such branch that Exasol plans, so its error names only that branch's tables. Lakekeeper reports a missing table as denied, so the error cannot tell a missing table from a forbidden one. Example error for a join without grants:
 
 ```text
 the Lakekeeper permission check refuses the query: Exasol user 'LK_PERM_JOINONE', mapped by 'USER_MAPPING' to the Lakekeeper principal 'oidc~lk.joinone@lakehouse.test', may not read e2e_lakehouse.fact_orders, e2e_lakehouse.dim_customer. Lakekeeper denies read_data on each, or the table does not exist. Only a Lakekeeper grant that names the principal 'oidc~lk.joinone@lakehouse.test' lets this user read a table

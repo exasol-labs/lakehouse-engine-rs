@@ -261,28 +261,6 @@ fn single_shard_short_circuits_distributor_fromless() {
 
 /// Scenario: Shard count scales with the node count and is capped at the round-robin threshold
 #[test]
-fn shard_count_scales_with_nodes_and_caps_at_300() {
-    assert_eq!(shard_count(10, 50, 500), 300, "must be capped at 300");
-    assert_eq!(
-        shard_count(10, 50, 350),
-        300,
-        "must be capped at min(files,300)=300"
-    );
-    assert_eq!(shard_count(1, 300, 1000), 300, "exactly 300 must stay 300");
-    assert_eq!(shard_count(1, 301, 1000), 300, "301 must be capped at 300");
-}
-
-/// Scenario: Fewer files than G produces one shard per file with no empty shards
-#[test]
-fn shard_count_clamped_to_file_count_no_empty_shards() {
-    assert_eq!(shard_count(10, 8, 3), 3, "must clamp to file_count=3");
-    assert_eq!(shard_count(4, 8, 5), 5, "must clamp to file_count=5");
-    assert_eq!(shard_count(1, 1, 1), 1, "single file single shard");
-    assert_eq!(shard_count(0, 8, 100), 1, "zero product must clamp to 1");
-    assert_eq!(shard_count(5, 0, 100), 1, "zero factor must clamp to 1");
-}
-
-#[test]
 fn pushdown_carries_table_root_and_sizes_in_common_and_shards() {
     let root = "s3://warehouse/db/events";
     let files = vec![
@@ -587,13 +565,6 @@ fn render_limit_offset_covers_absent_zero_and_nonzero_offset() {
 
     assert_eq!(render_limit_offset(Some(12), 3), " LIMIT 12 OFFSET 3");
     assert_eq!(render_limit_offset(Some(0), 3), " LIMIT 0 OFFSET 3");
-}
-
-#[test]
-fn sql_string_literal_escapes_quotes() {
-    let s = "it's a test";
-    let lit = sql_string_literal(s);
-    assert_eq!(lit, "'it''s a test'");
 }
 
 #[test]

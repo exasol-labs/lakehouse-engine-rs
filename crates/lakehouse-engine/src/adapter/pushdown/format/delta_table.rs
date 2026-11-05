@@ -1,5 +1,3 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use delta_kernel::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
@@ -9,56 +7,83 @@ use serde_json::Value as Json;
 
 use super::delta_predicate::to_delta_predicate;
 use super::delta_replay::DeltaSnapshot;
-use super::unity_table_storage::{UnityTableStorage, redacted};
-use super::{FormatReader, PlannedFiles, hex_binary_partition_values};
+use super::unity_table_storage::UnityTableStorage;
+use super::{LoadedTable, PlannedFiles, UdfFuture, hex_binary_partition_values, redacted};
 use crate::adapter::column_notes::DeclaredSchema;
-use crate::scan::build_table_root_store;
-use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, FileEntry, LogicalField};
+use crate::scan::spec::{FileEntry, LogicalField};
+use lakehouse_catalog::StorageBackend;
 
 #[cfg(test)]
-#[path = "delta_format_reader_tests.rs"]
+#[path = "delta_table_tests.rs"]
 mod tests;
 
-/// Plans the declaration it receives; the log supplies only the gate, the active files, and their
-/// deletion vectors and partition values. The effective backend leaves with the planned files:
-/// the scan must read files through the same backend the log was read through.
-pub(super) struct DeltaFormatReader<'a> {
-    pub(super) storage: UnityTableStorage<'a>,
+/// A Delta table at the version that was current when its log was opened. Each prune plans the
+/// declaration it receives; the log supplies only the gate, the active files, and their deletion
+/// vectors and partition values. The effective backend leaves with the planned files: the scan
+/// must read files through the same backend the log was read through.
+pub(in crate::adapter::pushdown) struct DeltaTable {
+    snapshot: Arc<DeltaSnapshot>,
+    table_root: String,
+    effective_storage: StorageBackend,
 }
 
-impl FormatReader for DeltaFormatReader<'_> {
+impl DeltaTable {
+    pub(in crate::adapter::pushdown) async fn open(
+        storage: UnityTableStorage<'_>,
+    ) -> Result<Self, UdfError> {
+        let (table_root, effective_storage, store) = storage.open_store().await?;
+        // This layer made the credential decision, so it knows which secrets an object-store
+        // error could echo; replay and schema know none.
+        let secrets = effective_storage.secret_values();
+        let table_root = table_root.to_string();
+        let (snapshot, table_root) = off_the_runtime(move || {
+            DeltaSnapshot::open(store, &table_root).map(|snapshot| (snapshot, table_root))
+        })
+        .await
+        .map_err(|error| redacted(error, &secrets))?;
+        Ok(Self {
+            snapshot: Arc::new(snapshot),
+            table_root,
+            effective_storage,
+        })
+    }
+}
+
+impl LoadedTable for DeltaTable {
     /// `name_mapping` is always empty: a physical-name binding lives on its own
     /// [`LogicalField`], which the scan side consults before any table-level mapping, so a
     /// mapping here would be unreachable and a second home for the same decision.
-    fn resolve_scan<'a>(
+    fn prune<'a>(
         &'a self,
         declared: &'a DeclaredSchema,
         filter_json: Option<&'a Json>,
-    ) -> Pin<Box<dyn Future<Output = Result<PlannedFiles, UdfError>> + Send + 'a>> {
+    ) -> UdfFuture<'a, PlannedFiles> {
         Box::pin(async move {
-            let (table_root, effective_storage) = self.storage.resolve().await?;
-            // This layer made the credential decision, so it knows which secrets an object-store
-            // error could echo; replay and schema know none.
-            let secrets = effective_storage.secret_values();
-            let redact = |error: UdfError| redacted(error, &secrets);
-            let store = build_table_root_store(
-                &effective_storage,
-                table_root,
-                DEFAULT_S3_MAX_CONNECTIONS,
-                &secrets,
-            )
-            .map_err(redact)?;
-            // Blocks: `delta_kernel`'s read path is synchronous and drives its own runtime.
-            let snapshot = DeltaSnapshot::open(store, table_root).map_err(redact)?;
-            let files = declared_files(&snapshot, declared, filter_json).map_err(redact)?;
+            let snapshot = Arc::clone(&self.snapshot);
+            let declared = declared.clone();
+            let filter_json = filter_json.cloned();
+            let files =
+                off_the_runtime(move || declared_files(&snapshot, &declared, filter_json.as_ref()))
+                    .await
+                    .map_err(|error| redacted(error, &self.effective_storage.secret_values()))?;
             Ok(PlannedFiles {
                 files,
-                effective_storage,
-                table_root: table_root.to_string(),
+                effective_storage: self.effective_storage.clone(),
+                table_root: self.table_root.clone(),
                 name_mapping: Vec::new(),
             })
         })
     }
+}
+
+/// `delta_kernel`'s read path is synchronous and blocks on its own executor, so it runs on the
+/// blocking pool: a current-thread runtime then keeps driving a request's other legs meanwhile.
+async fn off_the_runtime<T: Send + 'static>(
+    read: impl FnOnce() -> Result<T, UdfError> + Send + 'static,
+) -> Result<T, UdfError> {
+    tokio::task::spawn_blocking(read).await.map_err(|joined| {
+        UdfError::User(format!("the Delta log read did not complete: {joined}"))
+    })?
 }
 
 /// Filter columns and partition values resolve through each column's recorded binding key, as

@@ -120,7 +120,6 @@ fn both_clients_are_catalog_client_trait_objects() {
     assert_eq!(clients.len(), 2);
 }
 
-/// Scenario: The Unity Catalog session is reached only through the shared catalog-client trait
 #[test]
 fn catalog_client_trait_and_neutral_types_are_reachable() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Type};

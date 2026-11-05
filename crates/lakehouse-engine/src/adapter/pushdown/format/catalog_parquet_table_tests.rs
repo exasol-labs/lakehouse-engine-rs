@@ -1,3 +1,4 @@
+use crate::adapter::pushdown::test_support::connection_storage;
 use crate::adapter::pushdown::test_support::{
     GlueEndpoint, ObjectEndpoint, SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, SIGV4_SECRET_KEY,
     UNREACHABLE_CATALOG, assert_mentions, catalog_table, closed_port_storage, compare,
@@ -7,8 +8,8 @@ use crate::adapter::pushdown::test_support::{
 };
 use std::collections::BTreeMap;
 
+use super::super::ResolvedScan;
 use super::super::delta_schema::classify_spark_schema;
-use super::super::{ConnectionStorage, ResolvedScan};
 use super::*;
 use crate::adapter::pushdown::test_support::filter_json::{and, column, equal, or};
 use crate::adapter::tests::parquet_fixture::{in_memory_store, values};
@@ -99,19 +100,9 @@ async fn resolve_with(
         ..unauthenticated_creds()
     };
     let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
-    let connection = ConnectionStorage {
-        storage,
-        creds: &creds,
-        allow_http: true,
-    };
-    let reader = CatalogParquetFormatReader {
-        files: ParquetFileSource::TableDirectory(UnityTableStorage::new(
-            &session,
-            table,
-            &connection,
-        )),
-    };
-    user_outcome(resolve_declared(&reader, TABLE_NAME, table, filter).await)
+    let connection = connection_storage(storage, &creds);
+    let load = CatalogParquetTable::from_unity(UnityTableStorage::new(&session, table, connection));
+    user_outcome(resolve_declared(load, TABLE_NAME, table, filter).await)
 }
 
 fn user_outcome(outcome: Result<ResolvedScan, UdfError>) -> Result<ResolvedScan, String> {
@@ -496,14 +487,8 @@ async fn resolve_glue(
 ) -> Result<ResolvedScan, String> {
     let session = GlueCatalogSession::new(glue_address, storage.clone(), sigv4_creds())
         .expect("the CONNECTION region signs the session");
-    let reader = CatalogParquetFormatReader {
-        files: ParquetFileSource::GluePartitions {
-            session: &session,
-            storage,
-            table,
-        },
-    };
-    user_outcome(resolve_declared(&reader, GLUE_TABLE_NAME, table, filter).await)
+    let load = CatalogParquetTable::from_glue(&session, table, storage);
+    user_outcome(resolve_declared(load, GLUE_TABLE_NAME, table, filter).await)
 }
 
 fn scanned_key(entry: &FileEntry, table_root: &str) -> String {
@@ -746,7 +731,7 @@ async fn planned_keys(
 ) -> Result<Vec<String>, String> {
     let store: Arc<dyn ObjectStore> = store;
     let table_root = glue_location(GLUE_TABLE_ROOT).expect("the Glue table root names a raw key");
-    plan_glue_partitions(&store, &table_root, partitions, keep)
+    plan_glue_partitions(&store, &table_root, &partitions, keep)
         .await
         .map(|files| {
             files

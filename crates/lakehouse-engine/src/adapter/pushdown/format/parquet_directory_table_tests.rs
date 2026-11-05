@@ -56,12 +56,8 @@ async fn try_resolve(
             .collect(),
     };
     let table_root = ObjectLocation::from_raw(TABLE_ROOT).unwrap();
-    let reader = ParquetFormatReader {
-        store,
-        table_root: &table_root,
-        storage: &storage,
-    };
-    resolve_from_notes(&reader, &table_notes, filter_json).await
+    let load = ParquetDirectoryTable::open(store, &table_root, &storage);
+    resolve_from_notes(load, &table_notes, filter_json).await
 }
 
 /// Enumerates, then plans against the notes that enumeration recorded.

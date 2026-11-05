@@ -8,7 +8,7 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-exasol-udf-sdk    = { workspace = true }
+exasol-udf-sdk    = { workspace = true, features = ["export"] }
 exasol-udf-macros = { workspace = true }
 
 vs-expression     = { path = "../vs-expression" }

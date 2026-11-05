@@ -4,7 +4,7 @@
 use super::*;
 
 use crate::adapter::pushdown::test_support::{
-    RecordingCatalog, UNREACHABLE_CATALOG, named_table, serve_on_own_runtime,
+    FakeCatalog, UNREACHABLE_CATALOG, named_table, serve_on_own_runtime,
 };
 use exasol_udf_sdk::test_support::TestContext;
 use lakehouse_catalog::TableFormat;
@@ -62,7 +62,7 @@ fn tables_page(entries: Vec<Json>, next_page_token: Option<&str>) -> String {
 /// Scenario: Create virtual schema lists the namespace with no per-table get-table call
 #[test]
 fn listing_issues_no_per_table_get_table_call() {
-    let (catalog, _runtime) = serve_on_own_runtime(RecordingCatalog::spawn(|target| {
+    let (catalog, _runtime) = serve_on_own_runtime(FakeCatalog::spawn(|target| {
         if target.split('?').next() != Some(LIST_TABLES_PATH) {
             return (
                 500,

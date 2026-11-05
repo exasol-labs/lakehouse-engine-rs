@@ -689,6 +689,7 @@ async fn load_table_maps_the_uppercase_iceberg_and_parquet_formats_to_their_tags
 }
 
 /// Scenario: The single-table load refuses a data source format the crate cannot name
+/// Scenario: The catalog-client trait keeps Unity Catalog's type mapping, format tag, and vending key opaque to the engine
 #[tokio::test]
 async fn load_table_refuses_an_absent_or_unrecognized_data_source_format() {
     for (raw_format_member, expected_value) in [

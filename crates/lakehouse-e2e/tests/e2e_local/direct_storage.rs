@@ -1692,6 +1692,7 @@ fn delta_directory_read_as_raw_parquet_returns_tombstoned_rows() {
 
 /// Scenario: NAMESPACE is optional under direct storage and scopes the table subtree
 /// Scenario: A first-level directory under the base path is a table
+/// Scenario: Table naming and the identifier note round trip reuse the shared helpers
 #[test]
 fn discovery_scopes_to_first_level_directories_and_namespace_narrows_to_a_subtree() {
     setup();

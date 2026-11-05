@@ -436,8 +436,9 @@ async fn listing_answer_keep_predicate_narrows_files_without_a_footer_read() {
     .await;
     let store = Arc::clone(&probe) as Arc<dyn ObjectStore>;
 
-    let files = list_parquet_files(&store, &root(), &["year".to_string()], &keep_year_2026)
+    let files = ParquetListing::list(&store, &root())
         .await
+        .and_then(|listing| listing.kept_files(&["year".to_string()], &keep_year_2026))
         .expect("the listing resolves");
 
     assert_eq!(
@@ -893,8 +894,11 @@ async fn listing_answer_fills_caller_declared_partition_columns_and_reads_no_foo
     let store = Arc::clone(&probe) as Arc<dyn ObjectStore>;
     let declared = ["year".to_string(), "region".to_string()];
 
-    let files = list_parquet_files(&store, &root(), &declared, &|_| true)
+    let listing = ParquetListing::list(&store, &root())
         .await
+        .expect("a listing that reads no footer succeeds over unreadable bodies");
+    let files = listing
+        .kept_files(&declared, &|_| true)
         .expect("a listing that reads no footer succeeds over unreadable bodies");
 
     let listed: Vec<_> = files
@@ -934,11 +938,11 @@ async fn listing_answer_fills_caller_declared_partition_columns_and_reads_no_foo
         probe.reads()
     );
 
-    let kept = list_parquet_files(&store, &root(), &declared, &|values| {
-        values.get("region").and_then(|value| value.as_deref()) == Some("eu")
-    })
-    .await
-    .expect("a narrowing keep predicate resolves");
+    let kept = listing
+        .kept_files(&declared, &|values| {
+            values.get("region").and_then(|value| value.as_deref()) == Some("eu")
+        })
+        .expect("a narrowing keep predicate resolves");
     assert_eq!(
         kept.iter()
             .map(|file| file.path.as_ref().to_string())

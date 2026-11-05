@@ -119,18 +119,6 @@ impl CatalogClient for FixedCatalogClient {
                 .collect())
         })
     }
-
-    fn load_table(
-        &self,
-        ident: &CatalogTableIdent,
-    ) -> Pin<Box<dyn Future<Output = Result<CatalogTable, UdfError>> + Send + '_>> {
-        let ident = ident.clone();
-        Box::pin(async move {
-            let mut table = Self::iceberg_table(ident.namespace);
-            table.ident.name = ident.name;
-            Ok(table)
-        })
-    }
 }
 
 fn boxed_client() -> Box<dyn CatalogClient> {
@@ -190,23 +178,6 @@ async fn namespace_segments_reach_the_client_unjoined() {
     for table in &listing.tables {
         assert_eq!(table.ident.namespace, namespace);
     }
-}
-
-#[tokio::test]
-async fn boxed_client_loads_one_table_by_segmented_identifier() {
-    let ident = CatalogTableIdent {
-        namespace: vec!["prod".to_string(), "finance".to_string()],
-        name: "orders".to_string(),
-    };
-    let client = boxed_client();
-
-    let table = client.load_table(&ident).await.expect("load failed");
-
-    assert_eq!(table.ident, ident);
-    assert_eq!(
-        table.storage_location.as_deref(),
-        Some("s3://warehouse/orders")
-    );
 }
 
 #[test]
@@ -465,14 +436,14 @@ async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
         .await
         .expect("list_tables failed");
     let loaded = client
-        .load_table(&CatalogTableIdent {
+        .load_listed_tables(&[CatalogTableIdent {
             namespace: vec!["sales".to_string()],
             name: "orders".to_string(),
-        })
+        }])
         .await
-        .expect("load_table failed");
+        .expect("load_listed_tables failed");
 
-    for table in listing.tables.iter().chain(std::iter::once(&loaded)) {
+    for table in listing.tables.iter().chain(&loaded.tables) {
         assert_eq!(
             table.format,
             TableFormat::Iceberg,
@@ -500,7 +471,10 @@ async fn rest_listing_projects_the_loaded_metadata_into_the_neutral_table() {
         .list_tables(&["sales".to_string()], &|_| true)
         .await
         .expect("list_tables failed");
-    let loaded = client.load_table(&ident).await.expect("load_table failed");
+    let loaded = client
+        .load_listed_tables(std::slice::from_ref(&ident))
+        .await
+        .expect("load_listed_tables failed");
 
     let expected = CatalogTable {
         ident,
@@ -527,7 +501,7 @@ async fn rest_listing_projects_the_loaded_metadata_into_the_neutral_table() {
         properties: Default::default(),
     };
     assert_eq!(listing.tables, vec![expected.clone()]);
-    assert_eq!(loaded, expected);
+    assert_eq!(loaded.tables, vec![expected]);
 }
 
 /// Scenario: One non-Iceberg table in the namespace is skipped rather than aborting the schema

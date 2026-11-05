@@ -1,12 +1,12 @@
-use crate::adapter::ResolvedConnectionConfig;
+use crate::adapter::permission::PermissionCheck;
 use crate::adapter::properties::resolve_binary_as_string;
+use crate::adapter::statement_state::StatementCatalog;
 #[cfg(test)]
 use crate::scan::spec::StorageBackend;
 use exasol_udf_sdk::error::UdfError;
 use futures::future::try_join_all;
 use serde_json::Value as Json;
 
-use super::ConnectionStorage;
 use super::empty_result::empty_result_sql;
 use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
@@ -113,7 +113,8 @@ pub(super) async fn plan_join(
     request: &Json,
     pushdown_req: &Json,
     join: &DetectedJoin,
-    conn: &ResolvedConnectionConfig,
+    statement: &StatementCatalog,
+    permission: &PermissionCheck,
     props: &Json,
     scan_schema: Option<&str>,
     cluster_nodes: usize,
@@ -127,27 +128,15 @@ pub(super) async fn plan_join(
     join_broadcast_max_bytes: u64,
 ) -> Result<Json, UdfError> {
     let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
-    let connection = ConnectionStorage {
-        storage: &conn.storage,
-        creds: &conn.creds,
-        allow_http: conn.allow_http,
-    };
-    // Built once and shared by every leg, so identifiers are validated before any catalog
-    // HTTP and a per-leg rebuild is inexpressible.
+    // Built once for every leg, so every leg's identifier passes its rule before any catalog
+    // request.
     let identifiers: Vec<&str> = join
         .tables
         .iter()
         .map(|leaf| leaf.table_identifier.as_str())
         .collect();
-    let resolver = TableScanResolver::for_request(
-        conn.catalog_kind,
-        &conn.catalog_uri,
-        connection,
-        &identifiers,
-        props,
-        &conn.permission_check,
-    )
-    .await?;
+    let resolver =
+        TableScanResolver::for_request(statement, permission, &identifiers, props).await?;
     // Legs are indexed positionally, not by tableName, which a self-join's occurrences share.
     let legs = join.legs();
     let side_filters: Vec<Option<Json>> = (0..join.tables.len())
@@ -200,7 +189,7 @@ pub(super) async fn plan_join(
         instance_overhead_mb,
         s3_max_connections,
         binary_as_string: resolve_binary_as_string(props),
-        connection: conn,
+        connection: statement.connection(),
     };
 
     // The window is classified before sizing and rendering, so a request Exasol must

@@ -3,14 +3,16 @@
 
 use super::exasol_ws::ExaConn;
 pub use super::exasol_ws::error_text;
+pub use super::exasol_ws::parse_int;
 use super::seed::{
     DECIMAL_18_0_VALUES_TEXT, E2E_DIM_TABLE, E2E_FACT_TABLE, FIXED_16_VALUES_TEXT,
     build_seed_catalog,
 };
 use super::stack::{
-    CatalogConnectionPassword, bucketfs_port, bucketfs_write_password, build_create_connection_sql,
-    exasol_host, exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal,
-    lakehouse_engine_so_path, local_stack_connection_password, seaweedfs_url, upload_to_bucketfs,
+    CatalogConnectionPassword, PROXY_ADAPTER_SCHEMA, assert_resolves_only_through_proxy,
+    bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
+    exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal, lakehouse_engine_so_path,
+    local_stack_connection_password, seaweedfs_url, upload_to_bucketfs, url_host, wait_for_proxy,
 };
 
 use futures::TryStreamExt;
@@ -30,6 +32,7 @@ pub const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
 pub const DISTRIBUTOR_SCRIPT_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
 
 pub const VERSION_SCRIPT_NAME: &str = "LAKEHOUSE_VERSION";
+pub const EXPORT_SCRIPT_NAME: &str = "LAKEHOUSE_EXPORT";
 pub const SO_BUCKETFS_PUT_PATH: &str = "/default/udf/liblakehouse_engine.so";
 /// No leading `/`, as `%udf_object` requires.
 pub const SO_UDF_OBJECT_PATH: &str = "buckets/bfsdefault/default/udf/liblakehouse_engine.so";
@@ -145,6 +148,24 @@ pub fn create_schema_and_scripts_in(conn: &mut ExaConn, schema: &str) {
     create_schema_and_scripts_with_env(conn, schema, &[], &[]);
 }
 
+/// Installs the scripts once the forward proxy answers, after asserting that the host of each
+/// `proxied_urls` entry resolves only through the proxy, so a request that bypasses it fails.
+/// A second proxy setting needs its own `schema`, because replacing a schema's scripts changes
+/// the proxy of every virtual schema built on them.
+pub fn create_proxied_schema_and_scripts(
+    conn: &mut ExaConn,
+    schema: &str,
+    adapter_env: &[(&str, &str)],
+    scan_env: &[(&str, &str)],
+    proxied_urls: &[&str],
+) {
+    wait_for_proxy();
+    for url in proxied_urls {
+        assert_resolves_only_through_proxy(url_host(url));
+    }
+    create_schema_and_scripts_with_env(conn, schema, adapter_env, scan_env);
+}
+
 /// Each `(name, value)` pair becomes one `%env` line of the adapter or the scan script.
 pub fn create_schema_and_scripts_with_env(
     conn: &mut ExaConn,
@@ -174,6 +195,12 @@ EMITS (...) AS
     conn.execute(&format!(
         r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {schema}.{VERSION_SCRIPT_NAME}()
 RETURNS VARCHAR(100) AS
+%udf_object {SO_UDF_OBJECT_PATH}
+/"#
+    ));
+    conn.execute(&format!(
+        r#"CREATE OR REPLACE {LANG_ALIAS} SET SCRIPT {schema}.{EXPORT_SCRIPT_NAME}(...)
+RETURNS DECIMAL(18,0) AS
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));
@@ -246,6 +273,13 @@ impl<'a> VsProps<'a> {
     pub fn with_catalog_conn_name(mut self, name: &'a str) -> Self {
         self.catalog_conn_name = name;
         self
+    }
+
+    /// Served by the proxy-only scripts, through a CONNECTION of its own that names the
+    /// `-via-proxy` addresses.
+    pub fn proxied(self, conn_name: &'a str) -> Self {
+        self.with_adapter_schema(PROXY_ADAPTER_SCHEMA)
+            .with_catalog_conn_name(conn_name)
     }
 
     pub fn with_catalog_kind(mut self, kind: &'a str) -> Self {
@@ -451,36 +485,46 @@ pub fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
 /// The complete, directly submittable adapter-generated statement, unlike
 /// `explain_virtual_sql`'s joined blob.
 pub fn isolated_pushdown_statement(conn: &mut ExaConn, query_sql: &str) -> String {
-    const PUSHDOWN_SQL_COLUMN: usize = 1;
-    let cols = explain_virtual_columns(conn, query_sql);
-    if cols.len() != 4 || cols[0].len() != 1 {
+    let mut statements = pushdown_statements(conn, query_sql);
+    if statements.len() != 1 {
         panic!(
-            "EXPLAIN VIRTUAL returned an unexpected layout ({} cols, {} rows) for:\n{query_sql}",
-            cols.len(),
-            cols.first().map(Vec::len).unwrap_or(0)
+            "EXPLAIN VIRTUAL returned {} pushdowns, not one, for:\n{query_sql}",
+            statements.len()
         );
     }
-    cols[PUSHDOWN_SQL_COLUMN][0]
-        .as_str()
-        .unwrap_or_else(|| {
-            panic!(
-                "EXPLAIN VIRTUAL PUSHDOWN_SQL cell was not a string for:\n{query_sql}\ngot: {:?}",
-                cols[PUSHDOWN_SQL_COLUMN][0]
-            )
+    statements.remove(0)
+}
+
+/// One adapter-generated statement per pushdown request of `query_sql`, in `EXPLAIN VIRTUAL`
+/// row order.
+pub fn pushdown_statements(conn: &mut ExaConn, query_sql: &str) -> Vec<String> {
+    const PUSHDOWN_SQL_COLUMN: usize = 1;
+    let cols = explain_virtual_columns(conn, query_sql);
+    if cols.len() != 4 {
+        panic!(
+            "EXPLAIN VIRTUAL returned {} columns, not 4, for:\n{query_sql}",
+            cols.len()
+        );
+    }
+    cols[PUSHDOWN_SQL_COLUMN]
+        .iter()
+        .map(|cell| {
+            cell.as_str()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "EXPLAIN VIRTUAL PUSHDOWN_SQL cell was not a string for:\n{query_sql}\n\
+                         got: {cell:?}"
+                    )
+                })
+                .to_string()
         })
-        .to_string()
+        .collect()
 }
 
 pub fn parse_numeric(v: &serde_json::Value) -> f64 {
     v.as_f64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         .unwrap_or_else(|| panic!("expected numeric value, got: {v:?}"))
-}
-
-pub fn parse_int(v: &serde_json::Value) -> i64 {
-    v.as_i64()
-        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        .unwrap_or_else(|| panic!("expected integer value, got: {v:?}"))
 }
 
 pub fn split_s3_bucket_and_key(uri: &str) -> (&str, &str) {

@@ -8,11 +8,11 @@ use common::e2e_harness::{
     SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_binary_columns_match_native_copy,
     assert_binary_values_refused, assert_decimal_orders_numerically,
     assert_hex_literal_compares_bytes, assert_notes_well_formed, assert_text_columns,
-    assert_type_matrix, column_adapter_notes, count_statuses, create_schema_and_scripts,
-    create_schema_and_scripts_with_env, declared_types, error_text, exa_conn, exa_conn_redacting,
+    assert_type_matrix, column_adapter_notes, count_statuses, create_proxied_schema_and_scripts,
+    create_schema_and_scripts, declared_types, error_text, exa_conn, exa_conn_redacting,
     explain_virtual_sql, identifier_note, install_slc, int_column, note_of, pairs, parse_int,
-    partition_positions, query_error, reads, refuses, runtime, skipped_entries,
-    try_create_virtual_schema_with_password, upload_so, value_to_string,
+    partition_positions, pushdown_statements, query_error, reads, refuses, runtime,
+    skipped_entries, try_create_virtual_schema_with_password, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::glue::{
@@ -33,7 +33,7 @@ use common::seed::{
 };
 use common::stack::{
     CatalogConnectionPassword, PROXY_ADAPTER_SCHEMA, PROXY_URL_INTERNAL,
-    build_create_connection_sql, proxy_log_mark, proxy_log_since, wait_for_exasol, wait_for_proxy,
+    build_create_connection_sql, proxy_log_mark, proxy_log_since, wait_for_exasol,
 };
 use common::timestamp_precision::expected_timestamp_precision;
 
@@ -219,7 +219,7 @@ type FixtureCheck = fn(&GlueRun, &mut ExaConn);
 #[test]
 fn glue_checks_pass_against_one_provisioned_fixture() {
     let run = provision();
-    let checks: [(&str, FixtureCheck); 13] = [
+    let checks: [(&str, FixtureCheck); 14] = [
         (
             "listing",
             check_listing_includes_routed_tables_and_records_every_skip,
@@ -237,6 +237,10 @@ fn glue_checks_pass_against_one_provisioned_fixture() {
         (
             "partition pruning",
             check_partition_predicate_reduces_the_scan_file_list,
+        ),
+        (
+            "partition pruning per reference",
+            check_each_reference_lists_the_partitions_its_filter_keeps,
         ),
         (
             "all types",
@@ -549,6 +553,7 @@ fn check_glue_columns_persist_source_notes(run: &GlueRun, conn: &mut ExaConn) {
 }
 
 /// Scenario: Each kept partition's location is listed and its files carry the partition's Glue values
+/// Scenario: A Unity Catalog or Glue table is planned by the format its catalog reports
 fn check_queries_return_expected_rows_through_pushdown(_run: &GlueRun, conn: &mut ExaConn) {
     let orders = vs_table(ICEBERG_ORDERS);
 
@@ -666,6 +671,7 @@ fn check_orc_partition_fails_loud(run: &GlueRun, conn: &mut ExaConn) {
 }
 
 /// Scenario: A partition predicate prunes partitions before their locations are listed
+/// Scenario: A Unity Catalog or Glue table is planned by the format its catalog reports
 fn check_partition_predicate_reduces_the_scan_file_list(_run: &GlueRun, conn: &mut ExaConn) {
     let partitioned = vs_table(PARTITIONED);
     let pushed = explain_virtual_sql(
@@ -698,6 +704,37 @@ fn check_partition_predicate_reduces_the_scan_file_list(_run: &GlueRun, conn: &m
         "SELECT ID FROM {partitioned} WHERE P_INT = 2 LIMIT 1"
     ));
     assert_eq!(int_column(&limited[0]), [5]);
+}
+
+/// Scenario: Every reference to one table in a statement loads the table once and prunes it with its own filter
+fn check_each_reference_lists_the_partitions_its_filter_keeps(_run: &GlueRun, conn: &mut ExaConn) {
+    let partitioned = vs_table(PARTITIONED);
+    let branch = |p_int: &str| format!("SELECT ID FROM {partitioned} WHERE P_INT = {p_int}");
+    let union = format!("{} UNION ALL {}", branch("1"), branch("2"));
+
+    let pushed = pushdown_statements(conn, &union);
+
+    assert_eq!(
+        pushed.len(),
+        2,
+        "one pushdown per UNION ALL branch: {pushed:?}"
+    );
+    for (branch_sql, p_int) in pushed.iter().zip(["1", "2"]) {
+        assert_scan_names_only(
+            branch_sql,
+            &partition_files(Some(p_int)),
+            &format!("the UNION ALL branch on P_INT = {p_int}"),
+        );
+    }
+    let count = |conn: &mut ExaConn, sql: &str| {
+        conn.query_scalar_i64(&format!("SELECT COUNT(*) FROM ({sql})"))
+    };
+    let alone = count(conn, &branch("1")) + count(conn, &branch("2"));
+    assert_eq!(
+        count(conn, &union),
+        alone,
+        "the union returns the rows its branches return as statements of their own"
+    );
 }
 
 /// Scenario: The listing declares each Glue column through the Spark listing mapping
@@ -900,10 +937,9 @@ fn check_https_proxy_tunnels_glue_sts_and_s3(run: &GlueRun, conn: &mut ExaConn) 
     const PROXY_REST_CONN: &str = "GLUE_PROXY_REST_CREDS";
     let env = run.env();
     let catalog_id = env.expect(runtime().block_on(run.catalog_id()), "read the catalog id");
-    wait_for_proxy();
-    let since = proxy_log_mark();
     let proxy = [("HTTPS_PROXY", PROXY_URL_INTERNAL)];
-    create_schema_and_scripts_with_env(conn, PROXY_ADAPTER_SCHEMA, &proxy, &proxy);
+    create_proxied_schema_and_scripts(conn, PROXY_ADAPTER_SCHEMA, &proxy, &proxy, &[]);
+    let since = proxy_log_mark();
     let database = run.database();
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
         for (vs, connection, uri, password, kind) in [
@@ -922,9 +958,7 @@ fn check_https_proxy_tunnels_glue_sts_and_s3(run: &GlueRun, conn: &mut ExaConn) 
                 None,
             ),
         ] {
-            let mut props = VsProps::new(vs, &database)
-                .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
-                .with_catalog_conn_name(connection);
+            let mut props = VsProps::new(vs, &database).proxied(connection);
             if let Some(kind) = kind {
                 props = props.with_catalog_kind(kind);
             }

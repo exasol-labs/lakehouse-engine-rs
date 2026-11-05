@@ -103,6 +103,14 @@ impl GlueCatalogSession {
         }
     }
 
+    /// The table as a pushdown plans it, from `GetTable` alone: an Iceberg table carries its
+    /// metadata location and no column, because the Iceberg planner reads the metadata file.
+    pub async fn load_table(&self, ident: &CatalogTableIdent) -> Result<CatalogTable, UdfError> {
+        let table = self.get_table(ident).await?;
+        let route = route_of(&table);
+        planned_table(ident.clone(), &table, route)
+    }
+
     async fn tables(
         &self,
         database: &str,
@@ -265,20 +273,6 @@ impl CatalogClient for GlueCatalogSession {
                 .try_collect()
                 .await?;
             Ok(admissions.into_iter().collect())
-        })
-    }
-
-    /// The table as a pushdown plans it, from `GetTable` alone: an Iceberg table carries its
-    /// metadata location and no column, because the Iceberg planner reads the metadata file.
-    fn load_table(
-        &self,
-        ident: &CatalogTableIdent,
-    ) -> Pin<Box<dyn Future<Output = Result<CatalogTable, UdfError>> + Send + '_>> {
-        let ident = ident.clone();
-        Box::pin(async move {
-            let table = self.get_table(&ident).await?;
-            let route = route_of(&table);
-            planned_table(ident, &table, route)
         })
     }
 }

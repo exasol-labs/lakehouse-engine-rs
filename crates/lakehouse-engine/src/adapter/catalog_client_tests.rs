@@ -1,17 +1,14 @@
 use super::*;
-use crate::adapter::pushdown::test_support::{iceberg_column, named_table, unity_column};
+use crate::adapter::pushdown::test_support::{
+    iceberg_column, named_table, resolved_connection, unity_column,
+};
 use lakehouse_catalog::{CatalogColumn, ColumnSourceType, TableFormat};
 
 type ListingPipeline =
     fn(&[String], &CatalogListing, EngineTimestampSupport) -> Result<Vec<Json>, UdfError>;
 
-type CatalogClientConstruction = fn(
-    CatalogKind,
-    String,
-    StorageBackend,
-    ConnectionCreds,
-    &Json,
-) -> Result<Box<dyn CatalogClient>, UdfError>;
+type CatalogClientConstruction =
+    fn(&ResolvedConnectionConfig, &Json) -> Result<Box<dyn ScanCatalog>, UdfError>;
 
 #[test]
 fn construction_site_is_exhaustive_and_fallible_for_every_kind() {
@@ -28,10 +25,7 @@ fn construction_site_is_exhaustive_and_fallible_for_every_kind() {
     let construct = |address: &str, creds: ConnectionCreds| {
         let storage = connection::storage_block(&creds, false);
         construct_catalog_client(
-            CatalogKind::Glue,
-            address.to_string(),
-            storage,
-            creds,
+            &resolved_connection(CatalogKind::Glue, address, storage, creds),
             &json!({}),
         )
     };

@@ -98,7 +98,8 @@ Test code gets the same design care as production code. A test reads as the one 
 
 ### Correctness oracles
 
-- An E2E test asserts only on what Exasol shows: the pushdown SQL from `EXPLAIN VIRTUAL`, the returned rows, the column metadata in the `SYS` views, and the error text of a failing statement. A fixture guard is the one exception.
+- An E2E test asserts only on what Exasol shows: the pushdown SQL from `EXPLAIN VIRTUAL`, the returned rows, the column metadata in the `SYS` views, and the error text of a failing statement. Two cases are exceptions: a fixture guard, and a proxy-log count.
+- A scenario about how many catalog, storage, or STS requests the adapter sends is proved by counting request lines in the local forward proxy's log after a mark. `count_proxy_requests` in `crates/lakehouse-e2e/tests/common/stack.rs` does this. Exasol shows no request counts, so the proxy is the oracle.
 - No E2E assertion uses engine code to compute or judge its expected value. A credential check compares against the secrets the test supplied, not against the engine's redaction logic.
 - Tests do not re-verify iceberg-rust, DataFusion, Arrow, or Parquet. The row oracles guard their integration with the engine.
 - A fixture guard proves only that a fixture has the shape its row test needs, so the row test cannot pass vacuously. It reads the fixture through the library that wrote or plans it, or asks the catalog server over its own REST API.
