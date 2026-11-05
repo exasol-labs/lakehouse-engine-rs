@@ -29,8 +29,7 @@ use crate::adapter::connection::{catalog_block, read_connection, storage_block};
 use crate::adapter::direct_storage::DirectStorageCatalogClient;
 use crate::adapter::permission::{PermissionCheck, PermissionSettings};
 use crate::adapter::properties::{
-    PROP_CATALOG_CONNECTION, PROP_NAMESPACE, ThreadingMode, TuningProperties, check_properties,
-    resolve_allow_http,
+    PROP_NAMESPACE, ThreadingMode, TuningProperties, check_properties, resolve_allow_http,
 };
 use crate::adapter::pushdown::{declare_columns, handle_pushdown};
 use crate::adapter::scoped_refresh::{RequestedTables, ScopedRefresh};
@@ -152,7 +151,7 @@ fn resolve_connection_config(
 ) -> Result<ResolvedConnectionConfig, UdfError> {
     let kind = catalog_kind::resolve_catalog_kind(props)?;
     permission.require_supported_kind(kind)?;
-    let connection_name = nonempty_str(props, PROP_CATALOG_CONNECTION)
+    let connection_name = nonempty_str(props, CATALOG_CONNECTION)
         .ok_or_else(|| UdfError::User(format!("{CATALOG_CONNECTION} is required")))?;
     let resolved = read_connection(ctx, Some(connection_name), kind)?;
     permission.require_management_url(&resolved.uri)?;

@@ -43,7 +43,7 @@ fn refresh_and_set_properties_dispatched_not_unsupported() {
     for req_type in ["refresh", "setProperties"] {
         let req = serde_json::json!({
             "type": req_type,
-            "properties": { PROP_CATALOG_CONNECTION: "no_such_conn" },
+            "properties": { CATALOG_CONNECTION: "no_such_conn" },
         });
         let err = dispatch(&mut DefaultsCtx, &req)
             .expect_err("no live catalog is available in a unit test");
@@ -80,7 +80,7 @@ fn an_unknown_property_name_fails_every_schema_request_before_the_connection_is_
         let request = schema_request(
             request_type,
             serde_json::json!({
-                PROP_CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
+                CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
                 "NAMESPCE": "sales",
             }),
         );
@@ -128,7 +128,7 @@ fn an_invalid_tuning_value_fails_every_schema_request_before_the_connection_is_r
         let request = schema_request(
             request_type,
             serde_json::json!({
-                PROP_CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
+                CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
                 PROP_DF_BATCH_SIZE: "0",
             }),
         );
@@ -174,7 +174,7 @@ fn a_pushdown_never_runs_the_property_check() {
         "type": "pushdown",
         "schemaMetadataInfo": {
             "properties": {
-                PROP_CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
+                CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
                 "NAMESPCE": "sales",
                 PROP_DF_BATCH_SIZE: "0",
             },

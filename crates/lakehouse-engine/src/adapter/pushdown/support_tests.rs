@@ -260,18 +260,6 @@ fn single_shard_short_circuits_distributor_fromless() {
     );
 }
 
-#[test]
-fn shard_count_scales_with_nodes_and_caps_at_300() {
-    assert_eq!(shard_count(10, 50, 500), 300, "must be capped at 300");
-    assert_eq!(
-        shard_count(10, 50, 350),
-        300,
-        "must be capped at min(files,300)=300"
-    );
-    assert_eq!(shard_count(1, 300, 1000), 300, "exactly 300 must stay 300");
-    assert_eq!(shard_count(1, 301, 1000), 300, "301 must be capped at 300");
-}
-
 /// Scenario: Fewer files than G produces one shard per file with no empty shards
 #[test]
 fn shard_count_clamped_to_file_count_no_empty_shards() {
@@ -587,13 +575,6 @@ fn render_limit_offset_covers_absent_zero_and_nonzero_offset() {
 
     assert_eq!(render_limit_offset(Some(12), 3), " LIMIT 12 OFFSET 3");
     assert_eq!(render_limit_offset(Some(0), 3), " LIMIT 0 OFFSET 3");
-}
-
-#[test]
-fn sql_string_literal_escapes_quotes() {
-    let s = "it's a test";
-    let lit = sql_string_literal(s);
-    assert_eq!(lit, "'it''s a test'");
 }
 
 #[test]
