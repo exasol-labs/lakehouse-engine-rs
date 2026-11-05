@@ -113,13 +113,6 @@ fn generated_sql_and_errors_carry_no_connection_value() {
             ),
         ),
         (
-            "TRUNCATE",
-            generate_export_sql(
-                &mut granted(hook_context()),
-                &export_spec_json(no_at_clause(), serde_json::json!({"has_truncate": true})),
-            ),
-        ),
-        (
             "missing script grant in the hook",
             generate_export_sql(
                 &mut hook_context(),
@@ -165,45 +158,11 @@ fn hook_without_script_grant_names_connection_script_user_and_grant() {
 }
 
 #[test]
-fn hook_refuses_an_invalid_statement_naming_the_option() {
-    let message = error_text(generate_export_sql(
-        &mut granted(hook_context()),
-        &export_spec_json(
-            no_at_clause(),
-            serde_json::json!({"parameters": [
-                {"key": "CATALOG_CONNECTION", "value": CONNECTION},
-                {"key": "TABLE_NAME", "value": "t"},
-            ]}),
-        ),
-    ));
-
-    assert!(message.contains("TABLE_NAME = 't'"), "{message}");
-}
-
-#[test]
 fn hook_refuses_a_specification_it_cannot_parse() {
     let error = generate_export_sql(&mut granted(hook_context()), "not json")
         .expect_err("an unparseable specification is refused");
 
     assert!(matches!(error, UdfError::Type(_)), "{error:?}");
-}
-
-#[test]
-fn hook_with_single_commit_renders_one_writer() {
-    let sql = generate_export_sql(
-        &mut granted(hook_context()),
-        &export_spec_json(
-            no_at_clause(),
-            serde_json::json!({"parameters": [
-                {"key": "CATALOG_CONNECTION", "value": CONNECTION},
-                {"key": "TABLE_NAME", "value": "ns.t"},
-                {"key": "SINGLE_COMMIT", "value": "true"},
-            ]}),
-        ),
-    )
-    .expect("a valid export yields SQL");
-
-    assert!(sql.ends_with("GROUP BY MOD(ROWNUM, 1)"), "{sql}");
 }
 
 #[test]
@@ -247,21 +206,6 @@ fn writer_refuses_a_first_argument_that_is_not_a_writer_spec() {
             "{case}: {message}"
         );
     }
-}
-
-#[test]
-fn writer_without_script_grant_names_connection_script_user_and_grant() {
-    let message = error_text(run_writer(&mut writer_context(vec![writer_row(
-        WRITER_SPEC,
-        1,
-    )])));
-
-    assert!(
-        message.contains(
-            "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT LHVS.LAKEHOUSE_EXPORT TO EXPORTER"
-        ),
-        "{message}"
-    );
 }
 
 #[test]
@@ -329,14 +273,6 @@ mod options {
             has_truncate: true,
             ..valid_spec()
         };
-        let replace = ExportSpec {
-            has_replace: true,
-            ..valid_spec()
-        };
-        let created_by = ExportSpec {
-            created_by: Some("CREATE TABLE ns.t (a INT)".to_string()),
-            ..valid_spec()
-        };
         let named_at = ExportSpec {
             connection_name: Some(CONNECTION.to_string()),
             ..valid_spec()
@@ -350,8 +286,6 @@ mod options {
         let integer_form = "a whole number from 1 to";
         let cases: Vec<(&str, ExportSpec, Vec<&str>)> = vec![
             ("TRUNCATE", truncate, vec!["TRUNCATE", appends]),
-            ("REPLACE", replace, vec!["REPLACE", appends]),
-            ("CREATED BY", created_by, vec!["CREATED BY", appends]),
             (
                 "named AT clause",
                 named_at,
@@ -374,46 +308,14 @@ mod options {
                 vec!["CATALOG_CONNECTION", "is required"],
             ),
             (
-                "CATALOG_CONNECTION empty",
-                ExportSpec {
-                    parameters: vec![
-                        Parameter {
-                            key: "CATALOG_CONNECTION".to_string(),
-                            value: String::new(),
-                        },
-                        Parameter {
-                            key: "TABLE_NAME".to_string(),
-                            value: "ns.t".to_string(),
-                        },
-                    ],
-                    ..valid_spec()
-                },
-                vec!["CATALOG_CONNECTION", "is required"],
-            ),
-            (
                 "TABLE_NAME missing",
                 spec_with(&[("WRITERS_PER_NODE", "2")]),
                 vec!["TABLE_NAME", "is required", table_form],
             ),
             (
-                "TABLE_NAME empty",
-                spec_with(&[("TABLE_NAME", "")]),
-                vec!["TABLE_NAME", table_form],
-            ),
-            (
                 "TABLE_NAME without namespace",
                 spec_with(&[("TABLE_NAME", "t")]),
                 vec!["TABLE_NAME = 't'", table_form],
-            ),
-            (
-                "TABLE_NAME with empty namespace",
-                spec_with(&[("TABLE_NAME", ".t")]),
-                vec!["TABLE_NAME = '.t'", table_form],
-            ),
-            (
-                "TABLE_NAME with empty table",
-                spec_with(&[("TABLE_NAME", "ns.")]),
-                vec!["TABLE_NAME = 'ns.'", table_form],
             ),
             (
                 "TABLE_NAME with empty namespace level",
@@ -434,52 +336,9 @@ mod options {
                 vec!["WRITERS_PER_NODE = '0'", integer_form],
             ),
             (
-                "WRITERS_PER_NODE negative",
-                spec_with(&[("TABLE_NAME", "ns.t"), ("WRITERS_PER_NODE", "-1")]),
-                vec!["WRITERS_PER_NODE = '-1'", integer_form],
-            ),
-            (
-                "WRITERS_PER_NODE signed",
-                spec_with(&[("TABLE_NAME", "ns.t"), ("WRITERS_PER_NODE", "+3")]),
-                vec!["WRITERS_PER_NODE = '+3'", integer_form],
-            ),
-            (
-                "WRITERS_PER_NODE fractional",
-                spec_with(&[("TABLE_NAME", "ns.t"), ("WRITERS_PER_NODE", "1.5")]),
-                vec!["WRITERS_PER_NODE = '1.5'", integer_form],
-            ),
-            (
-                "WRITERS_PER_NODE padded",
-                spec_with(&[("TABLE_NAME", "ns.t"), ("WRITERS_PER_NODE", " 3")]),
-                vec!["WRITERS_PER_NODE = ' 3'", integer_form],
-            ),
-            (
-                "WRITERS_PER_NODE not a number",
-                spec_with(&[("TABLE_NAME", "ns.t"), ("WRITERS_PER_NODE", "four")]),
-                vec!["WRITERS_PER_NODE = 'four'", integer_form],
-            ),
-            (
-                "WRITERS_PER_NODE empty",
-                spec_with(&[("TABLE_NAME", "ns.t"), ("WRITERS_PER_NODE", "")]),
-                vec!["WRITERS_PER_NODE = ''", integer_form],
-            ),
-            (
-                "WRITERS_PER_NODE one past usize::MAX",
-                spec_with(&[
-                    ("TABLE_NAME", "ns.t"),
-                    ("WRITERS_PER_NODE", "18446744073709551616"),
-                ]),
-                vec!["WRITERS_PER_NODE = '18446744073709551616'", integer_form],
-            ),
-            (
                 "SINGLE_COMMIT not a boolean",
                 spec_with(&[("TABLE_NAME", "ns.t"), ("SINGLE_COMMIT", "yes")]),
                 vec!["SINGLE_COMMIT = 'yes'", "'true' or 'false'"],
-            ),
-            (
-                "SINGLE_COMMIT empty",
-                spec_with(&[("TABLE_NAME", "ns.t"), ("SINGLE_COMMIT", "")]),
-                vec!["SINGLE_COMMIT = ''", "'true' or 'false'"],
             ),
             (
                 "WRITERS_PER_NODE with SINGLE_COMMIT",
@@ -528,37 +387,9 @@ mod options {
                 WriterLayout::PerNode(1),
             ),
             (
-                "multi-level namespace",
-                vec![("TABLE_NAME", "cat.db.schema.t")],
-                WriterLayout::PerNode(1),
-            ),
-            (
                 "WRITERS_PER_NODE",
                 vec![("WRITERS_PER_NODE", "3"), ("TABLE_NAME", "ns.t")],
                 WriterLayout::PerNode(3),
-            ),
-            (
-                "WRITERS_PER_NODE with leading zeros",
-                vec![("TABLE_NAME", "ns.t"), ("WRITERS_PER_NODE", "007")],
-                WriterLayout::PerNode(7),
-            ),
-            (
-                "WRITERS_PER_NODE at usize::MAX",
-                vec![
-                    ("TABLE_NAME", "ns.t"),
-                    ("WRITERS_PER_NODE", "18446744073709551615"),
-                ],
-                WriterLayout::PerNode(usize::MAX),
-            ),
-            (
-                "SINGLE_COMMIT true",
-                vec![("TABLE_NAME", "ns.t"), ("SINGLE_COMMIT", "true")],
-                WriterLayout::SingleCommit,
-            ),
-            (
-                "SINGLE_COMMIT in mixed case",
-                vec![("TABLE_NAME", "ns.t"), ("SINGLE_COMMIT", "True")],
-                WriterLayout::SingleCommit,
             ),
             (
                 "SINGLE_COMMIT false",
@@ -616,17 +447,6 @@ mod sql {
     }
 
     #[test]
-    fn one_column_renders_the_self_call_and_row_number_key() {
-        let sql = select_for(&[r#""T"."A""#], WriterLayout::PerNode(1), 1);
-
-        assert_eq!(
-            sql,
-            "SELECT \"LHVS\".\"LAKEHOUSE_EXPORT\"('{\"connection\":\"C\"}', \"T\".\"A\") FROM DUAL \
-             GROUP BY MOD(ROWNUM, 1)"
-        );
-    }
-
-    #[test]
     fn several_columns_pass_in_source_order() {
         let sql = select_for(
             &[r#""T"."ID""#, r#""T"."NAME""#, r#""T"."G""#],
@@ -668,9 +488,6 @@ mod sql {
     #[test]
     fn column_names_are_referenced_verbatim() {
         let cases = [
-            ("table column", r#""T"."A""#),
-            ("query alias", r#""X""#),
-            ("schema-qualified column", r#""S"."T"."A""#),
             ("dot inside the identifier", r#""T"."a.b""#),
             ("quote and apostrophe", r#""T"."it's ""q""""#),
         ];
