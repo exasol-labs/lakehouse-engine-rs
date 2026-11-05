@@ -91,7 +91,7 @@ pub const TYPES_COLUMNS: [TypesColumn; 9] = [
         declared: "DECIMAL(10,2)",
         read_value: "12345678.9",
     },
-    // Outside Exasol's catalog-decimal domain, so it reads as `VARCHAR` text.
+    // Outside Exasol's DECIMAL domain, so it reads as `VARCHAR` text.
     TypesColumn {
         name: "dec_large",
         declared: "VARCHAR(2000000)",

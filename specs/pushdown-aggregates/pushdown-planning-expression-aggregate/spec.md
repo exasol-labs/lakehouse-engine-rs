@@ -25,7 +25,7 @@ The adapter pushes an aggregate whose argument is a scalar expression over table
 * *WHEN* the adapter builds the partial EMITS clause and the outer merge SELECT
 * *THEN* the adapter SHALL derive each partial column's Exasol type from the aggregate item's declared type in `selectListDataTypes` at that select-list ordinal, rather than from a source column's type
 * *AND* a `SUM(expr)` whose declared result type is a DECIMAL SHALL widen its partial column to `DECIMAL(36,s)` to avoid mid-merge overflow, and a `SUM(expr)` over a floating result SHALL use `DOUBLE PRECISION`, matching the bare-column SUM discipline
-* *AND* the outer merge expression SHALL be wrapped in `CAST(<expr> AS <declared_type>)` so the pushdown output column type matches Exasol's positional `selectListDataTypes` validation
+* *AND* the outer merge SHALL cast a merged `SUM`, `AVG`, or `COUNT` to the declared type and leave a merged `MIN` or `MAX` uncast, because its partial column already carries the declared type (`pushdown-aggregates/pushdown-planning-single-group-agg`)
 
 ### Scenario: Aggregate over an untranslatable argument falls back to row scanning
 

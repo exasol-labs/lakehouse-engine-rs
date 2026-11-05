@@ -60,16 +60,14 @@ fn float_div(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
     })
 }
 
-fn decimal_type(precision: u32, scale: u32) -> serde_json::Value {
-    serde_json::json!({"type": "decimal", "precision": precision, "scale": scale})
-}
-
 #[test]
 fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecomposable() {
-    let req = serde_json::json!({
-        "selectList": [round_expr(agg_item("SUM", Some("L_QUANTITY"), false), 2)],
-        "selectListDataTypes": [decimal_type(36, 2)],
-    });
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            round_expr(agg_item("SUM", Some("L_QUANTITY"), false), 2),
+            ExasolType::decimal(36, 2),
+        )
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("ROUND(SUM(col), 2) must decompose");
     assert_eq!(items.len(), 1, "one select item, one resolved item");
     assert!(
@@ -77,18 +75,23 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
         "a scalar-over-aggregate is not a distinct fan-out"
     );
 
-    let variance_req = serde_json::json!({
-        "selectList": [round_expr(agg_item("VARIANCE", Some("C_ACCTBAL"), false), 4)],
-        "selectListDataTypes": [decimal_type(36, 4)],
-    });
+    let variance_req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            round_expr(agg_item("VARIANCE", Some("C_ACCTBAL"), false), 4),
+            ExasolType::decimal(36, 4),
+        )
+        .build_pushdown();
     assert!(
         detect_aggregates(&variance_req).is_some(),
         "ROUND(VARIANCE(col), 4) must decompose rather than reach DataFusion by name"
     );
 
-    let interleaved = serde_json::json!({
-        "selectList": [
+    let interleaved = pushdown_request("T", NO_COLUMNS)
+        .item(
             agg_item("SUM", Some("L_QUANTITY"), false),
+            ExasolType::decimal(36, 2),
+        )
+        .item(
             round_expr(
                 float_div(
                     agg_item("SUM", Some("L_QUANTITY"), false),
@@ -96,9 +99,9 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
                 ),
                 2,
             ),
-        ],
-        "selectListDataTypes": [decimal_type(36, 2), decimal_type(36, 4)],
-    });
+            ExasolType::decimal(36, 4),
+        )
+        .build_pushdown();
     assert_eq!(
         detect_aggregates(&interleaved)
             .expect("an interleaved list must decompose")
@@ -106,44 +109,49 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
         2
     );
 
-    let distinct_req = serde_json::json!({
-        "selectList": [round_expr(agg_item("COUNT", Some("L_ORDERKEY"), true), 2)],
-        "selectListDataTypes": [decimal_type(18, 0)],
-    });
+    let distinct_req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            round_expr(agg_item("COUNT", Some("L_ORDERKEY"), true), 2),
+            ExasolType::decimal(18, 0),
+        )
+        .build_pushdown();
     assert!(
         detect_aggregates(&distinct_req).is_none(),
         "ROUND(COUNT(DISTINCT col), 2) must decline the whole detection"
     );
 
-    let median_req = serde_json::json!({
-        "selectList": [round_expr(agg_item("MEDIAN", Some("L_QUANTITY"), false), 2)],
-        "selectListDataTypes": [decimal_type(36, 2)],
-    });
+    let median_req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            round_expr(agg_item("MEDIAN", Some("L_QUANTITY"), false), 2),
+            ExasolType::decimal(36, 2),
+        )
+        .build_pushdown();
     assert!(
         detect_aggregates(&median_req).is_none(),
         "ROUND(MEDIAN(col), 2) must decline the whole detection"
     );
 
-    let residual_req = serde_json::json!({
-        "selectList": [serde_json::json!({
-            "type": "function_scalar",
-            "name": "MULT",
-            "arguments": [
-                agg_item("SUM", Some("L_QUANTITY"), false),
-                col("L_QUANTITY"),
-            ],
-        })],
-        "selectListDataTypes": [decimal_type(36, 2)],
-    });
+    let residual_req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            serde_json::json!({
+                "type": "function_scalar",
+                "name": "MULT",
+                "arguments": [
+                    agg_item("SUM", Some("L_QUANTITY"), false),
+                    col("L_QUANTITY"),
+                ],
+            }),
+            ExasolType::decimal(36, 2),
+        )
+        .build_pushdown();
     assert!(
         detect_aggregates(&residual_req).is_none(),
         "a residual bare column must decline the whole detection"
     );
 
-    let scalar_only = serde_json::json!({
-        "selectList": [length_expr("L_COMMENT")],
-        "selectListDataTypes": [decimal_type(18, 0)],
-    });
+    let scalar_only = pushdown_request("T", NO_COLUMNS)
+        .item(length_expr("L_COMMENT"), ExasolType::decimal(18, 0))
+        .build_pushdown();
     assert!(
         detect_aggregates(&scalar_only).is_none(),
         "a scalar item with no nested aggregate must still decline"
@@ -152,9 +160,12 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
 
 #[test]
 fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types() {
-    let req = serde_json::json!({
-        "selectList": [
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
             agg_item("SUM", Some("L_QUANTITY"), false),
+            ExasolType::decimal(36, 2),
+        )
+        .item(
             round_expr(
                 float_div(
                     agg_item("SUM", Some("L_QUANTITY"), false),
@@ -162,10 +173,10 @@ fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types(
                 ),
                 2,
             ),
-            agg_item("COUNT", None, false),
-        ],
-        "selectListDataTypes": [decimal_type(36, 2), decimal_type(9, 4), decimal_type(18, 0)],
-    });
+            ExasolType::decimal(9, 4),
+        )
+        .count_star()
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("an interleaved list must decompose");
     assert_eq!(items.len(), 3);
     assert_eq!(agg_of(&items[0]).kind, AggKind::Sum);
@@ -175,7 +186,7 @@ fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types(
             SingleGroupItem::ScalarOverAggregate {
                 declared_type,
                 node,
-            } if *declared_type == ExasolType::decimal(9, 4) && node == &req["selectList"][1]
+            } if *declared_type == ExasolType::decimal(9, 4) && node == &req.json()["selectList"][1]
         ),
         "item 1 must be a ScalarOverAggregate at ordinal 1 carrying its own \
          declared type and the verbatim node: {:?}",
@@ -187,23 +198,10 @@ fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types(
 }
 
 #[test]
-fn single_group_scalar_over_aggregate_defaults_declared_type_when_absent() {
-    let req = serde_json::json!({
-        "selectList": [round_expr(agg_item("SUM", Some("L_QUANTITY"), false), 2)],
-    });
-    let items = detect_aggregates(&req).expect("must decompose without declared types");
-    assert!(matches!(
-        &items[0],
-        SingleGroupItem::ScalarOverAggregate { declared_type, .. }
-            if *declared_type == ExasolType::WIDEST_VARCHAR
-    ));
-}
-
-#[test]
 fn single_group_scalar_over_aggregate_dedups_shared_inner_aggregates() {
-    let req = serde_json::json!({
-        "selectList": [
-            agg_item("COUNT", None, false),
+    let req = pushdown_request("T", NO_COLUMNS)
+        .count_star()
+        .item(
             round_expr(
                 float_div(
                     agg_item("SUM", Some("L_QUANTITY"), false),
@@ -211,9 +209,9 @@ fn single_group_scalar_over_aggregate_dedups_shared_inner_aggregates() {
                 ),
                 2,
             ),
-        ],
-        "selectListDataTypes": [decimal_type(18, 0), decimal_type(36, 2)],
-    });
+            ExasolType::decimal(36, 2),
+        )
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("COUNT(*) + ROUND(SUM/COUNT) must decompose");
     let plans = ordinary_plans(&items);
     assert_eq!(
@@ -236,16 +234,18 @@ fn single_group_scalar_over_aggregate_dedups_shared_inner_aggregates() {
 
 #[test]
 fn single_group_scalar_over_aggregate_folds_nested_plans_in_encounter_order() {
-    let req = serde_json::json!({
-        "selectList": [round_expr(
-            float_div(
-                agg_item("SUM", Some("L_QUANTITY"), false),
-                agg_item("COUNT", None, false),
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            round_expr(
+                float_div(
+                    agg_item("SUM", Some("L_QUANTITY"), false),
+                    agg_item("COUNT", None, false),
+                ),
+                2,
             ),
-            2,
-        )],
-        "selectListDataTypes": [decimal_type(36, 2)],
-    });
+            ExasolType::decimal(36, 2),
+        )
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("ROUND(SUM/COUNT) must decompose");
     let plans = ordinary_plans(&items);
     assert_eq!(plans.len(), 2, "{plans:?}");
@@ -255,13 +255,17 @@ fn single_group_scalar_over_aggregate_folds_nested_plans_in_encounter_order() {
 
 #[test]
 fn ordinary_plans_unchanged_for_bare_aggregate_select_lists() {
-    let req = serde_json::json!({
-        "selectList": [
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
             agg_item("SUM", Some("AMOUNT"), false),
-            agg_item("COUNT", None, false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .count_star()
+        .item(
             agg_item("MIN", Some("TS"), false),
-        ]
-    });
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("a bare aggregate list must decompose");
     let plans = ordinary_plans(&items);
     assert_eq!(plans.len(), 3);
@@ -272,9 +276,9 @@ fn ordinary_plans_unchanged_for_bare_aggregate_select_lists() {
 
 #[test]
 fn detect_count_star_produces_count_no_column() {
-    let req = serde_json::json!({
-        "selectList": [agg_item("COUNT", None, false)]
-    });
+    let req = pushdown_request("T", NO_COLUMNS)
+        .count_star()
+        .build_pushdown();
     let plans = detect_aggregates(&req).expect("should detect COUNT(*)");
     assert_eq!(plans.len(), 1);
     assert_eq!(agg_of(&plans[0]).kind, AggKind::Count);
@@ -283,9 +287,12 @@ fn detect_count_star_produces_count_no_column() {
 
 #[test]
 fn detect_count_col_produces_count_col() {
-    let req = serde_json::json!({
-        "selectList": [agg_item("COUNT", Some("amount"), false)]
-    });
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            agg_item("COUNT", Some("amount"), false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let plans = detect_aggregates(&req).expect("should detect COUNT(col)");
     assert_eq!(agg_of(&plans[0]).kind, AggKind::CountCol);
     assert_eq!(agg_of(&plans[0]).column.as_deref(), Some("AMOUNT"));
@@ -293,14 +300,24 @@ fn detect_count_col_produces_count_col() {
 
 #[test]
 fn detect_sum_min_max_avg_produce_correct_plans() {
-    let req = serde_json::json!({
-        "selectList": [
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
             agg_item("SUM", Some("amount"), false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .item(
             agg_item("MIN", Some("ts"), false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .item(
             agg_item("MAX", Some("ts"), false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .item(
             agg_item("AVG", Some("score"), false),
-        ]
-    });
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let plans = detect_aggregates(&req).expect("should detect all four");
     assert_eq!(agg_of(&plans[0]).kind, AggKind::Sum);
     assert_eq!(agg_of(&plans[0]).column.as_deref(), Some("AMOUNT"));
@@ -314,10 +331,13 @@ fn detect_sum_min_max_avg_produce_correct_plans() {
 
 #[test]
 fn detect_aggregates_falls_back_on_group_by() {
-    let req = serde_json::json!({
-        "selectList": [agg_item("SUM", Some("amount"), false)],
-        "groupBy": [col("region")],
-    });
+    let req = pushdown_request("T", NO_COLUMNS)
+        .field("groupBy", serde_json::json!([col("region")]))
+        .item(
+            agg_item("SUM", Some("amount"), false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     assert!(
         detect_aggregates(&req).is_none(),
         "must fall back when GROUP BY is present"
@@ -326,9 +346,12 @@ fn detect_aggregates_falls_back_on_group_by() {
 
 #[test]
 fn detect_aggregates_falls_back_on_distinct() {
-    let req = serde_json::json!({
-        "selectList": [agg_item("SUM", Some("amount"), true)]
-    });
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            agg_item("SUM", Some("amount"), true),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     assert!(
         detect_aggregates(&req).is_none(),
         "must fall back when a non-COUNT DISTINCT is present"
@@ -337,12 +360,16 @@ fn detect_aggregates_falls_back_on_distinct() {
 
 #[test]
 fn detect_aggregates_falls_back_on_unsupported_function() {
-    let req = serde_json::json!({
-        "selectList": [
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
             agg_item("SUM", Some("amount"), false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .item(
             agg_item("MEDIAN", Some("amount"), false),
-        ]
-    });
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     assert!(
         detect_aggregates(&req).is_none(),
         "must fall back when any item is unsupported"
@@ -351,11 +378,9 @@ fn detect_aggregates_falls_back_on_unsupported_function() {
 
 #[test]
 fn detect_aggregates_falls_back_on_column_select() {
-    let req = serde_json::json!({
-        "selectList": [
-            col("region"),
-        ]
-    });
+    let req = pushdown_request("T", &[("region", ExasolType::WIDEST_VARCHAR)])
+        .column(col("region"))
+        .build_pushdown();
     assert!(
         detect_aggregates(&req).is_none(),
         "must fall back when select list contains non-aggregate"
@@ -364,23 +389,41 @@ fn detect_aggregates_falls_back_on_column_select() {
 
 #[test]
 fn detect_aggregates_returns_none_for_empty_select_list() {
-    let req = serde_json::json!({ "selectList": [] });
+    let req = pushdown_request("T", NO_COLUMNS)
+        .empty_select_list()
+        .build_pushdown();
     assert!(detect_aggregates(&req).is_none());
 }
 
 #[test]
 fn bare_column_aggregates_unchanged_regression() {
-    let req = serde_json::json!({
-        "selectList": [
-            agg_item("COUNT", None, false),
+    let req = pushdown_request("T", NO_COLUMNS)
+        .count_star()
+        .item(
             agg_item("COUNT", Some("id"), false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .item(
             agg_item("SUM", Some("amount"), false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .item(
             agg_item("MIN", Some("ts"), false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .item(
             agg_item("MAX", Some("ts"), false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .item(
             agg_item("AVG", Some("score"), false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .item(
             agg_item("STDDEV", Some("score"), false),
-        ]
-    });
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let plans = detect_aggregates(&req).expect("bare-column aggregates must decompose");
     assert!(
         plans.iter().all(|p| agg_of(p).arg_expr.is_none()),
@@ -398,7 +441,7 @@ fn bare_column_aggregates_unchanged_regression() {
     let col_types = vec![
         ("AMOUNT".to_string(), ExasolType::decimal(20, 0)),
         ("SCORE".to_string(), ExasolType::DoublePrecision),
-        ("TS".to_string(), ExasolType::Timestamp { precision: None }),
+        ("TS".to_string(), ExasolType::BARE_TIMESTAMP),
     ];
     let sum_only = vec![AggregatePlan {
         kind: AggKind::Sum,
@@ -415,9 +458,12 @@ fn bare_column_aggregates_unchanged_regression() {
 
 #[test]
 fn expression_arg_partial_and_merge_types_from_declared_type() {
-    let req = serde_json::json!({
-        "selectList": [agg_item_expr("SUM", length_expr("L_COMMENT"), false)]
-    });
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            agg_item_expr("SUM", length_expr("L_COMMENT"), false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let plans = detect_aggregates(&req).expect("expression-argument SUM must decompose");
     assert_eq!(agg_of(&plans[0]).kind, AggKind::Sum);
     assert!(
@@ -441,7 +487,7 @@ fn expression_arg_partial_and_merge_types_from_declared_type() {
     let emits = partial_emits_items(
         &sum_expr,
         &column_types(&col_types),
-        &[ExasolType::decimal(38, 4)],
+        &[ExasolType::decimal(36, 4)],
     );
     assert_eq!(emits, vec![r#""PARTIAL_sum_0" DECIMAL(36,4)"#.to_string()]);
     let emits = partial_emits_items(
@@ -485,11 +531,12 @@ fn expression_arg_partial_and_merge_types_from_declared_type() {
 
 #[test]
 fn decimal_product_sum_partial_widens_to_decimal_36() {
-    let req = serde_json::json!({
-        "selectList": [
-            agg_item_expr("SUM", mult_expr("L_EXTENDEDPRICE", "L_DISCOUNT"), false)
-        ]
-    });
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            agg_item_expr("SUM", mult_expr("L_EXTENDEDPRICE", "L_DISCOUNT"), false),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let items =
         detect_aggregates(&req).expect("SUM(col * col) must decompose, not fall back to scan");
     assert_eq!(items.len(), 1);
@@ -516,7 +563,7 @@ fn decimal_product_sum_partial_widens_to_decimal_36() {
         "partial SUM column must widen to the declared DECIMAL(36,4)"
     );
 
-    let merge = cast_merge_items(&plans, &declared);
+    let merge = cast_merge_items(&plans, &declared, &ColumnTypes::default());
     assert_eq!(
         merge,
         vec![r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,4))"#.to_string()],
@@ -534,17 +581,23 @@ fn unrenderable_agg_arg_falls_back_to_row_scan() {
         "arguments": [col("id")],
     });
     for name in &["SUM", "MIN", "MAX", "AVG", "COUNT"] {
-        let req = serde_json::json!({
-            "selectList": [agg_item_expr(name, unknown.clone(), false)]
-        });
+        let req = pushdown_request("T", NO_COLUMNS)
+            .item(
+                agg_item_expr(name, unknown.clone(), false),
+                ExasolType::WIDEST_VARCHAR,
+            )
+            .build_pushdown();
         assert!(
             detect_aggregates(&req).is_none(),
             "{name} over an unrenderable argument must fall back to row scan"
         );
     }
-    let req = serde_json::json!({
-        "selectList": [agg_item_expr("COUNT", unknown.clone(), true)]
-    });
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            agg_item_expr("COUNT", unknown.clone(), true),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     assert!(
         detect_aggregates(&req).is_none(),
         "COUNT(DISTINCT unrenderable) must fall back to row scan"
@@ -553,9 +606,12 @@ fn unrenderable_agg_arg_falls_back_to_row_scan() {
 
 #[test]
 fn count_distinct_builds_distinct_row_scan_spec() {
-    let req = serde_json::json!({
-        "selectList": [agg_item("COUNT", Some("L_SHIPMODE"), true)]
-    });
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            agg_item("COUNT", Some("L_SHIPMODE"), true),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("single-group COUNT(DISTINCT) must decompose");
     assert_eq!(items.len(), 1);
     assert!(has_distinct(&items), "the item must be a distinct fan-out");
@@ -567,9 +623,12 @@ fn count_distinct_builds_distinct_row_scan_spec() {
         "a COUNT(DISTINCT) item must not appear among the ordinary aggregate plans"
     );
 
-    let req_expr = serde_json::json!({
-        "selectList": [agg_item_expr("COUNT", length_expr("L_COMMENT"), true)]
-    });
+    let req_expr = pushdown_request("T", NO_COLUMNS)
+        .item(
+            agg_item_expr("COUNT", length_expr("L_COMMENT"), true),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let items_expr = detect_aggregates(&req_expr).expect("COUNT(DISTINCT expr) must decompose");
     let dc_expr = distinct_of(&items_expr[0]);
     assert!(dc_expr.column.is_none());
@@ -581,33 +640,44 @@ fn count_distinct_builds_distinct_row_scan_spec() {
 
 #[test]
 fn multi_count_distinct_declines_to_qualified_wrapper() {
-    let lone = serde_json::json!({
-        "selectList": [agg_item("COUNT", Some("CATEGORY"), true)],
-    });
+    let lone = pushdown_request("T", NO_COLUMNS)
+        .item(
+            agg_item("COUNT", Some("CATEGORY"), true),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let items = detect_aggregates(&lone).expect("a lone COUNT(DISTINCT) decomposes");
     assert!(
         has_distinct(&items) && is_lone_count_distinct(&items),
         "a lone COUNT(DISTINCT) is the only shape that fans out (Case 1)"
     );
 
-    let multi = serde_json::json!({
-        "selectList": [
+    let multi = pushdown_request("T", NO_COLUMNS)
+        .item(
             agg_item("COUNT", Some("CATEGORY"), true),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .item(
             agg_item("COUNT", Some("REGION"), true),
-        ],
-    });
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let items = detect_aggregates(&multi).expect("multiple distinct items still detect");
     assert!(
         has_distinct(&items) && !is_lone_count_distinct(&items),
         "more than one COUNT(DISTINCT) must decline the fan-out (Case 2)"
     );
 
-    let mixed = serde_json::json!({
-        "selectList": [
+    let mixed = pushdown_request("T", NO_COLUMNS)
+        .item(
             agg_item("COUNT", Some("CATEGORY"), true),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .item(
             agg_item("SUM", Some("AMOUNT"), false),
-        ],
-    });
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let items = detect_aggregates(&mixed).expect("distinct-plus-ordinary still detects");
     assert!(
         has_distinct(&items) && !is_lone_count_distinct(&items),
@@ -617,9 +687,12 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
 
 #[test]
 fn lone_expression_count_distinct_declines_fan_out_to_wrapper() {
-    let expr = serde_json::json!({
-        "selectList": [agg_item_expr("COUNT", length_expr("NAME"), true)],
-    });
+    let expr = pushdown_request("T", NO_COLUMNS)
+        .item(
+            agg_item_expr("COUNT", length_expr("NAME"), true),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let items = detect_aggregates(&expr)
         .expect("a lone COUNT(DISTINCT expr) still decomposes to a distinct item");
     assert_eq!(items.len(), 1);
@@ -641,9 +714,12 @@ fn lone_expression_count_distinct_declines_fan_out_to_wrapper() {
          VARCHAR-typed \"V\")"
     );
 
-    let bare = serde_json::json!({
-        "selectList": [agg_item("COUNT", Some("NAME"), true)],
-    });
+    let bare = pushdown_request("T", NO_COLUMNS)
+        .item(
+            agg_item("COUNT", Some("NAME"), true),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     let bare_items =
         detect_aggregates(&bare).expect("a lone bare-column COUNT(DISTINCT) decomposes");
     assert!(
@@ -660,17 +736,23 @@ fn non_decomposable_aggregate_falls_back_to_row_scan() {
         "LISTAGG",
         "GROUP_CONCAT",
     ] {
-        let req = serde_json::json!({
-            "selectList": [agg_item(name, Some("AMOUNT"), false)],
-        });
+        let req = pushdown_request("T", NO_COLUMNS)
+            .item(
+                agg_item(name, Some("AMOUNT"), false),
+                ExasolType::WIDEST_VARCHAR,
+            )
+            .build_pushdown();
         assert!(
             detect_aggregates(&req).is_none(),
             "{name} must fall back to row scan"
         );
     }
-    let req_distinct = serde_json::json!({
-        "selectList": [agg_item("SUM", Some("AMOUNT"), true)],
-    });
+    let req_distinct = pushdown_request("T", NO_COLUMNS)
+        .item(
+            agg_item("SUM", Some("AMOUNT"), true),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
     assert!(
         detect_aggregates(&req_distinct).is_none(),
         "SUM(DISTINCT) must fall back to row scan"
@@ -707,7 +789,9 @@ fn stat_aggregate_over_expression_argument_declines() {
             parse_agg_item(&item).is_none(),
             "STDDEV over a non-column argument must decline: {arg}"
         );
-        let req = serde_json::json!({"selectList": [item]});
+        let req = pushdown_request("T", NO_COLUMNS)
+            .item(item, ExasolType::WIDEST_VARCHAR)
+            .build_pushdown();
         assert!(
             detect_aggregates(&req).is_none(),
             "one declining stat aggregate must decline the whole select list: {arg}"
@@ -726,23 +810,25 @@ fn stat_aggregate_over_bare_column_still_parses() {
 
 #[test]
 fn single_group_plan_types_returns_empty_vec_for_no_items() {
-    let req = serde_json::json!({});
-    assert_eq!(single_group_plan_types(&req, &[]), Vec::<ExasolType>::new());
+    assert_eq!(single_group_plan_types(&[], &[]), Vec::<ExasolType>::new());
 }
 
 #[test]
 fn single_group_plan_types_aligns_with_bare_aggregate_select_list() {
-    let req = serde_json::json!({
-        "selectList": [
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
             agg_item("SUM", Some("AMOUNT"), false),
-            agg_item("COUNT", None, false),
+            ExasolType::decimal(36, 2),
+        )
+        .count_star()
+        .item(
             agg_item("MIN", Some("TS"), false),
-        ],
-        "selectListDataTypes": [decimal_type(36, 2), decimal_type(18, 0), decimal_type(9, 4)],
-    });
+            ExasolType::decimal(9, 4),
+        )
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("a bare aggregate list must decompose");
     assert_eq!(
-        single_group_plan_types(&req, &items),
+        single_group_plan_types(req.select_types(), &items),
         vec![
             ExasolType::decimal(36, 2),
             ExasolType::decimal(18, 0),
@@ -753,19 +839,21 @@ fn single_group_plan_types_aligns_with_bare_aggregate_select_list() {
 
 #[test]
 fn single_group_plan_types_defaults_when_reached_only_through_scalar_wrapper() {
-    let req = serde_json::json!({
-        "selectList": [round_expr(
-            float_div(
-                agg_item("SUM", Some("L_QUANTITY"), false),
-                agg_item("COUNT", None, false),
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            round_expr(
+                float_div(
+                    agg_item("SUM", Some("L_QUANTITY"), false),
+                    agg_item("COUNT", None, false),
+                ),
+                2,
             ),
-            2,
-        )],
-        "selectListDataTypes": [decimal_type(36, 2)],
-    });
+            ExasolType::decimal(36, 2),
+        )
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("ROUND(SUM/COUNT) must decompose");
     assert_eq!(
-        single_group_plan_types(&req, &items),
+        single_group_plan_types(req.select_types(), &items),
         vec![ExasolType::DoublePrecision, ExasolType::DoublePrecision],
         "neither nested aggregate has a top-level select-list entry of its own, so \
          both slots take the nested-only numeric default"
@@ -774,9 +862,9 @@ fn single_group_plan_types_defaults_when_reached_only_through_scalar_wrapper() {
 
 #[test]
 fn single_group_plan_types_prefers_top_level_declared_type_for_shared_slot() {
-    let req = serde_json::json!({
-        "selectList": [
-            agg_item("COUNT", None, false),
+    let req = pushdown_request("T", NO_COLUMNS)
+        .count_star()
+        .item(
             round_expr(
                 float_div(
                     agg_item("SUM", Some("L_QUANTITY"), false),
@@ -784,12 +872,12 @@ fn single_group_plan_types_prefers_top_level_declared_type_for_shared_slot() {
                 ),
                 2,
             ),
-        ],
-        "selectListDataTypes": [decimal_type(18, 0), decimal_type(36, 2)],
-    });
+            ExasolType::decimal(36, 2),
+        )
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("COUNT(*) + ROUND(SUM/COUNT) must decompose");
     assert_eq!(
-        single_group_plan_types(&req, &items),
+        single_group_plan_types(req.select_types(), &items),
         vec![ExasolType::decimal(18, 0), ExasolType::DoublePrecision],
         "slot 0 (COUNT) takes its bare declared type; slot 1 (SUM) has no top-level \
          occurrence and keeps the nested-only numeric default"
@@ -798,9 +886,12 @@ fn single_group_plan_types_prefers_top_level_declared_type_for_shared_slot() {
 
 #[test]
 fn single_group_plan_types_resolves_both_ends_of_an_interleaved_list() {
-    let req = serde_json::json!({
-        "selectList": [
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
             agg_item("SUM", Some("L_QUANTITY"), false),
+            ExasolType::decimal(36, 2),
+        )
+        .item(
             round_expr(
                 float_div(
                     agg_item("SUM", Some("L_QUANTITY"), false),
@@ -808,13 +899,13 @@ fn single_group_plan_types_resolves_both_ends_of_an_interleaved_list() {
                 ),
                 2,
             ),
-            agg_item("COUNT", None, false),
-        ],
-        "selectListDataTypes": [decimal_type(36, 2), decimal_type(9, 4), decimal_type(18, 0)],
-    });
+            ExasolType::decimal(9, 4),
+        )
+        .count_star()
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("an interleaved list must decompose");
     assert_eq!(
-        single_group_plan_types(&req, &items),
+        single_group_plan_types(req.select_types(), &items),
         vec![ExasolType::decimal(36, 2), ExasolType::decimal(18, 0)],
         "slot 0 (SUM) takes ordinal 0's type; slot 1 (COUNT) takes ordinal 2's type, \
          never ordinal 1's scalar-item type"
@@ -823,16 +914,19 @@ fn single_group_plan_types_resolves_both_ends_of_an_interleaved_list() {
 
 #[test]
 fn single_group_plan_types_skips_distinct_items() {
-    let req = serde_json::json!({
-        "selectList": [
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
             agg_item("SUM", Some("AMOUNT"), false),
+            ExasolType::decimal(36, 2),
+        )
+        .item(
             agg_item("COUNT", Some("L_SHIPMODE"), true),
-        ],
-        "selectListDataTypes": [decimal_type(36, 2), decimal_type(18, 0)],
-    });
+            ExasolType::decimal(18, 0),
+        )
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("SUM + COUNT(DISTINCT) must decompose");
     assert_eq!(
-        single_group_plan_types(&req, &items),
+        single_group_plan_types(req.select_types(), &items),
         vec![ExasolType::decimal(36, 2)],
         "the COUNT(DISTINCT) item contributes no ordinary-aggregate slot"
     );
@@ -840,20 +934,22 @@ fn single_group_plan_types_skips_distinct_items() {
 
 #[test]
 fn nested_only_expression_argument_min_emits_a_numeric_partial_column() {
-    let req = serde_json::json!({
-        "selectList": [round_expr(
-            serde_json::json!({
-                "type": "function_aggregate",
-                "name": "MIN",
-                "arguments": [mult_expr("A", "B")],
-            }),
-            2,
-        )],
-        "selectListDataTypes": [decimal_type(36, 2)],
-    });
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            round_expr(
+                serde_json::json!({
+                    "type": "function_aggregate",
+                    "name": "MIN",
+                    "arguments": [mult_expr("A", "B")],
+                }),
+                2,
+            ),
+            ExasolType::decimal(36, 2),
+        )
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("ROUND(MIN(A * B), 2) must decompose");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(req.select_types(), &items);
     assert_eq!(
         partial_emits_items(&plans, &ColumnTypes::default(), &plan_types),
         vec![r#""PARTIAL_min_0" DOUBLE PRECISION"#.to_string()],
@@ -863,16 +959,18 @@ fn nested_only_expression_argument_min_emits_a_numeric_partial_column() {
 
 #[test]
 fn merge_select_wraps_scalar_structure_around_the_merged_partial() {
-    let req = serde_json::json!({
-        "selectList": [round_expr(agg_item("SUM", Some("L_QUANTITY"), false), 2)],
-        "selectListDataTypes": [decimal_type(36, 2)],
-    });
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            round_expr(agg_item("SUM", Some("L_QUANTITY"), false), 2),
+            ExasolType::decimal(36, 2),
+        )
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("ROUND(SUM(col), 2) must decompose");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(req.select_types(), &items);
 
     assert_eq!(
-        single_group_merge_select(&items, &plans, &plan_types),
+        single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
         Some(vec![
             r#"CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(36,2))"#.to_string()
         ])
@@ -881,9 +979,12 @@ fn merge_select_wraps_scalar_structure_around_the_merged_partial() {
 
 #[test]
 fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
-    let req = serde_json::json!({
-        "selectList": [
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
             agg_item("SUM", Some("L_QUANTITY"), false),
+            ExasolType::decimal(36, 2),
+        )
+        .item(
             round_expr(
                 float_div(
                     agg_item("SUM", Some("L_QUANTITY"), false),
@@ -891,16 +992,16 @@ fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
                 ),
                 2,
             ),
-            agg_item("COUNT", None, false),
-        ],
-        "selectListDataTypes": [decimal_type(36, 2), decimal_type(9, 4), decimal_type(18, 0)],
-    });
+            ExasolType::decimal(9, 4),
+        )
+        .count_star()
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("an interleaved list must decompose");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(req.select_types(), &items);
 
     assert_eq!(
-        single_group_merge_select(&items, &plans, &plan_types),
+        single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
         Some(vec![
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2))"#.to_string(),
             r#"CAST(ROUND((SUM("PARTIAL_sum_0") / SUM("PARTIAL_count_1")), 2) AS DECIMAL(9,4))"#
@@ -911,41 +1012,23 @@ fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
 }
 
 #[test]
-fn merge_select_leaves_items_uncast_without_a_declared_type() {
-    let req = serde_json::json!({
-        "selectList": [
-            agg_item("COUNT", None, false),
-            round_expr(agg_item("SUM", Some("L_QUANTITY"), false), 2),
-        ],
-    });
-    let items = detect_aggregates(&req).expect("must decompose without declared types");
-    let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
-
-    assert_eq!(
-        single_group_merge_select(&items, &plans, &plan_types),
-        Some(vec![
-            r#"SUM("PARTIAL_count_0")"#.to_string(),
-            r#"ROUND(SUM("PARTIAL_sum_1"), 2)"#.to_string(),
-        ])
-    );
-}
-
-#[test]
 fn merge_select_declines_a_list_holding_a_distinct_item() {
-    let req = serde_json::json!({
-        "selectList": [
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
             agg_item("SUM", Some("AMOUNT"), false),
+            ExasolType::decimal(36, 2),
+        )
+        .item(
             agg_item("COUNT", Some("L_SHIPMODE"), true),
-        ],
-        "selectListDataTypes": [decimal_type(36, 2), decimal_type(18, 0)],
-    });
+            ExasolType::decimal(18, 0),
+        )
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("SUM + COUNT(DISTINCT) must decompose");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(req.select_types(), &items);
 
     assert_eq!(
-        single_group_merge_select(&items, &plans, &plan_types),
+        single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
         None,
         "a distinct item carries no merge expression, so the whole assembly declines"
     );
@@ -955,18 +1038,17 @@ fn merge_select_declines_a_list_holding_a_distinct_item() {
 fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
     let node = serde_json::json!({
         "type": "function_scalar_cast", "name": "CAST",
-        "arguments": [agg_item("COUNT", None, false)],
-        "dataType": {"type": "UNSUPPORTED_TARGET"}
+        "arguments": [agg_item("COUNT", None, false)]
     });
     let items = vec![SingleGroupItem::ScalarOverAggregate {
         node,
         declared_type: ExasolType::decimal(18, 0),
     }];
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&serde_json::json!({}), &items);
+    let plan_types = single_group_plan_types(&[], &items);
 
     assert_eq!(
-        single_group_merge_select(&items, &plans, &plan_types),
+        single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
         None,
         "an unrenderable scalar structure carries no merge expression, so the \
          whole assembly declines"
@@ -975,20 +1057,23 @@ fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
 
 #[test]
 fn merge_select_emits_one_item_per_selectlist_item_for_duplicate_aggregates() {
-    let req = serde_json::json!({
-        "selectList": [
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
             agg_item("SUM", Some("AMOUNT"), false),
+            ExasolType::decimal(36, 2),
+        )
+        .item(
             agg_item("SUM", Some("AMOUNT"), false),
-        ],
-        "selectListDataTypes": [decimal_type(36, 2), decimal_type(36, 2)],
-    });
+            ExasolType::decimal(36, 2),
+        )
+        .build_pushdown();
     let items = detect_aggregates(&req).expect("a duplicated aggregate must decompose");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(req.select_types(), &items);
     assert_eq!(plans.len(), 1, "one partial column for both occurrences");
 
     assert_eq!(
-        single_group_merge_select(&items, &plans, &plan_types),
+        single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
         Some(vec![
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2))"#.to_string(),
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2))"#.to_string(),

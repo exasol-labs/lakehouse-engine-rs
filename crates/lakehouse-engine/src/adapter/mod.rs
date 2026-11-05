@@ -45,9 +45,8 @@ use crate::adapter::tables::{
 use crate::scan::sealed::SealedStorageKey;
 use crate::scan::spec::DEFAULT_S3_MAX_CONNECTIONS;
 use crate::scan::spec::StorageBackend;
-use crate::types::mapping::{
-    EngineTimestampSupport, column_source_type_to_exasol, exasol_type_to_json,
-};
+use crate::types::exasol_type::exasol_type_to_json;
+use crate::types::mapping::{EngineTimestampSupport, column_source_type_to_exasol};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;

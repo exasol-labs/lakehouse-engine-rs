@@ -1,5 +1,4 @@
 use crate::types::exasol_type::ExasolType;
-use crate::types::mapping::exasol_type_from_json;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
@@ -7,7 +6,9 @@ use super::GroupedSelectItem;
 use super::grouped_agg::{group_key_exasol_types, select_item_index};
 use super::joins::EmptyRelation;
 use super::request_shape::{RequestShape, classify_request_shape};
-use super::support::{ColumnTypes, ProjectedColumn, cast_to_declared_type, emits_ident};
+use super::support::{
+    ColumnTypes, ProjectedColumn, PushdownRequest, cast_to_declared_type, emits_ident,
+};
 
 /// Routes through the same [`classify_request_shape`] as the non-empty dispatcher,
 /// so empty and non-empty positional column shapes cannot diverge.
@@ -15,19 +16,16 @@ use super::support::{ColumnTypes, ProjectedColumn, cast_to_declared_type, emits_
 /// `projection_widened` means `projection` is the full base row rather
 /// than one item per select-list item (#196).
 pub(super) fn empty_result_sql(
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     projection: &[ProjectedColumn],
     projection_widened: bool,
     col_types: &ColumnTypes,
     relation: &EmptyRelation,
 ) -> Result<Json, UdfError> {
-    match classify_request_shape(pushdown_req, col_types) {
+    match classify_request_shape(pushdown, col_types) {
         RequestShape::Grouped { detection, .. } => {
-            let group_key_types = group_key_exasol_types(
-                pushdown_req,
-                &detection.group_keys,
-                &detection.select_items,
-            );
+            let group_key_types =
+                group_key_exasol_types(pushdown, &detection.group_keys, &detection.select_items)?;
             Ok(empty_grouped_sql(
                 &group_key_types,
                 &detection.plan_types,
@@ -35,32 +33,27 @@ pub(super) fn empty_result_sql(
             ))
         }
         // Mirrors the non-empty wrapper's `selectList`-shaped output; a full-row shape
-        // would trip Exasol's positional `04000` check.
-        RequestShape::GroupByWrapper => Ok(empty_select_list_typed_sql(pushdown_req)
-            .unwrap_or_else(|| empty_pushdown_sql(projection))),
+        // would trip Exasol's positional `04000` check. Both arms carry a non-empty
+        // `selectList`, so `select_types()` holds one type per item.
+        RequestShape::GroupByWrapper => Ok(empty_select_list_typed_sql(pushdown.select_types())),
         RequestShape::SingleGroupAgg { .. } | RequestShape::SingleGroupWrapper => {
-            relation.pushdown(pushdown_req)
+            relation.pushdown(pushdown)
         }
-        // Widened projection: same reasoning as the `GroupByWrapper` arm (#196).
+        // Widened projection (#196).
         RequestShape::RowScan if projection_widened => {
-            Ok(empty_select_list_typed_sql(pushdown_req)
-                .unwrap_or_else(|| empty_pushdown_sql(projection)))
+            Ok(empty_select_list_typed_sql(pushdown.select_types()))
         }
         RequestShape::RowScan => Ok(empty_pushdown_sql(projection)),
     }
 }
 
-fn empty_select_list_typed_sql(pushdown_req: &Json) -> Option<Json> {
-    let types = pushdown_req
-        .get("selectListDataTypes")
-        .and_then(|v| v.as_array())
-        .filter(|a| !a.is_empty())?;
-    let items: Vec<String> = types
+fn empty_select_list_typed_sql(select_types: &[ExasolType]) -> Json {
+    let items: Vec<String> = select_types
         .iter()
-        .map(|dt| format!("CAST(NULL AS {})", exasol_type_from_json(dt)))
+        .map(|ty| format!("CAST(NULL AS {ty})"))
         .collect();
     let sql = format!("SELECT {} FROM DUAL WHERE 1=0", items.join(", "));
-    Some(serde_json::json!({"type": "pushdown", "sql": sql}))
+    serde_json::json!({"type": "pushdown", "sql": sql})
 }
 
 fn empty_grouped_sql(
@@ -81,7 +74,7 @@ fn empty_grouped_sql(
                 .map(|ty| format!("CAST(NULL AS {ty})")),
             GroupedSelectItem::Constant { projection, .. } => Some(projection.clone()),
             GroupedSelectItem::ScalarOverAggregate { declared_type, .. } => {
-                Some(cast_to_declared_type("NULL", Some(*declared_type)))
+                Some(cast_to_declared_type("NULL", *declared_type))
             }
         })
         .collect();

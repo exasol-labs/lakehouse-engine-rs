@@ -315,6 +315,11 @@ pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
         "file not found at {local_path:?} — ensure it was built first"
     );
     let bytes = std::fs::read(local_path).unwrap_or_else(|e| panic!("read {local_path:?}: {e}"));
+    put_to_bucketfs(bytes, bucketfs_path);
+}
+
+/// The bytes surface inside the DB at `/buckets/bfsdefault/default/<name>`.
+pub fn put_to_bucketfs(bytes: Vec<u8>, bucketfs_path: &str) {
     let password = bucketfs_write_password();
     let url = format!(
         "https://{}:{}{}",
@@ -322,13 +327,15 @@ pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
         bucketfs_port(),
         bucketfs_path
     );
+    // A healthy PUT answers in about a second. bucketfsd holds the response until it unpacks an
+    // archive, and its unpacker can stall on a half-written one until a re-PUT touches the file.
     let client = reqwest::blocking::Client::builder()
         .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(30))
         .build()
         .expect("build BucketFS HTTPS client");
-    // BucketFS can transiently refuse connections after the SQL port is already up, so
-    // connection-level send errors are retried; a non-2xx response is not.
+    // Send errors, including that timeout and BucketFS refusing connections after the SQL
+    // port is up, are retried; a non-2xx response is not.
     const MAX_ATTEMPTS: u32 = 5;
     let mut last_err = None;
     let mut resp = None;
@@ -353,7 +360,7 @@ pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
     }
     let resp = resp.unwrap_or_else(|| {
         panic!(
-            "BucketFS PUT to {url} failed after {MAX_ATTEMPTS} attempts: {}",
+            "BucketFS PUT to {url} failed after {MAX_ATTEMPTS} attempts: {:?}",
             last_err.expect("at least one attempt recorded an error")
         )
     });

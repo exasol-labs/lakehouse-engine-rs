@@ -9,7 +9,7 @@ use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::ProjectionItem;
 use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
 use crate::scan::test_support::WithFiles;
-use crate::types::exasol_type::ExasolType;
+use crate::types::exasol_type::{ExasolType, exasol_type_to_json};
 use futures::FutureExt;
 use futures::future::{self, BoxFuture};
 use lakehouse_catalog::{
@@ -298,7 +298,11 @@ pub(crate) fn column_types_under<N: AsRef<str>>(
 /// The map `handle_pushdown` builds for `request`'s first involved table, which declares no binary
 /// column.
 pub(crate) fn first_table_column_types(request: &Json) -> ColumnTypes {
-    column_types(&support::involved_columns(request, |tables| tables.first()).types)
+    column_types(
+        &support::involved_columns(request, |tables| tables.first())
+            .unwrap()
+            .types,
+    )
 }
 
 /// `sides` with each side's map built, as the resolver builds it, from the columns `request`
@@ -314,7 +318,8 @@ pub(crate) fn request_typed(
                 tables
                     .iter()
                     .find(|table| table["name"].as_str() == Some(side.table_name.as_str()))
-            });
+            })
+            .unwrap();
             joins::ResolvedJoinSide {
                 column_types: ColumnTypes::of(&involved, &side.logical_schema, false),
                 ..side.clone()
@@ -391,6 +396,16 @@ pub(crate) fn null_lit() -> Json {
     serde_json::json!({"type": "literal_null"})
 }
 
+/// Exasol's `CAST(arg AS target)` node.
+pub(crate) fn cast_to(target: ExasolType, arg: Json) -> Json {
+    serde_json::json!({
+        "type": "function_scalar_cast",
+        "name": "CAST",
+        "dataType": exasol_type_to_json(&target),
+        "arguments": [arg],
+    })
+}
+
 pub(crate) fn customer_orders_join() -> Json {
     inner_join(
         table_ref("CUSTOMER"),
@@ -455,12 +470,18 @@ pub(crate) fn split_projection(
 
 /// `project_columns` split into its items, its types, and its widening flag.
 pub(crate) fn project_split(
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     all_cols: &ColumnTypes,
 ) -> Result<(Vec<ProjectionItem>, Vec<ExasolType>, bool), UdfError> {
-    let (projection, widened) = support::project_columns(pushdown_req, all_cols)?;
+    let (projection, widened) = support::project_columns(pushdown, all_cols)?;
     let (items, types) = split_projection(&projection);
     Ok((items, types, widened))
+}
+
+/// `request`'s `pushdownRequest`, parsed as `handle_pushdown` parses it, for a fixture that
+/// returns only its JSON or whose select list a test replaced in place.
+pub(crate) fn parsed_pushdown(request: &Json) -> PushdownRequest {
+    PushdownRequest::parse(pd(request)).expect("the fixture declares a valid selectListDataTypes")
 }
 
 /// [`project_split`] over `request`'s first involved table, as `handle_pushdown` projects it.
@@ -468,19 +489,23 @@ pub(crate) fn project_first_table(
     request: &Json,
     pushdown_req: &Json,
 ) -> Result<(Vec<ProjectionItem>, Vec<ExasolType>, bool), UdfError> {
-    project_split(pushdown_req, &first_table_column_types(request))
+    project_split(
+        &PushdownRequest::parse(pushdown_req.clone())?,
+        &first_table_column_types(request),
+    )
 }
 
 /// One value per `ExasolType` variant and per spelling its SQL rendering takes, so a consumer's
 /// pin covers every type a column, `EMITS` item, or `CAST` target can carry.
-pub(crate) const EXASOL_TYPE_SPELLINGS: [ExasolType; 12] = [
+pub(crate) const EXASOL_TYPE_SPELLINGS: [ExasolType; 17] = [
     ExasolType::Boolean,
     ExasolType::decimal(18, 2),
     ExasolType::DoublePrecision,
     ExasolType::Date,
-    ExasolType::Timestamp { precision: None },
+    ExasolType::BARE_TIMESTAMP,
     ExasolType::timestamp(6),
-    ExasolType::TimestampWithLocalTimeZone,
+    ExasolType::TimestampWithLocalTimeZone { precision: 3 },
+    ExasolType::TimestampWithLocalTimeZone { precision: 6 },
     ExasolType::char(20),
     ExasolType::Char {
         size: 3,
@@ -492,6 +517,13 @@ pub(crate) const EXASOL_TYPE_SPELLINGS: [ExasolType; 12] = [
         size: 2_000_000,
         ascii: true,
     },
+    ExasolType::IntervalYearToMonth { precision: 2 },
+    ExasolType::IntervalDayToSecond {
+        precision: 2,
+        fraction: 3,
+    },
+    ExasolType::Geometry { srid: 0 },
+    ExasolType::Hashtype { bytes: 16 },
 ];
 
 /// A base for `..` struct update: the unpartitioned, columnless table `db.t` at `location`.
@@ -1328,37 +1360,223 @@ pub(crate) fn outer_select_list(sql: &str) -> &str {
 }
 
 pub(crate) fn nq4_request() -> Json {
-    serde_json::json!({
-        "involvedTables": [{
-            "name": "LINEITEM",
-            "columns": [
-                {"name": "L_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                {"name": "L_EXTENDEDPRICE", "dataType": {"type": "decimal", "precision": 18, "scale": 2}},
-            ],
-        }],
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [
-                table_col("LINEITEM", "L_ORDERKEY"),
-                table_col("LINEITEM", "L_EXTENDEDPRICE"),
-            ],
-            "selectListDataTypes": [
-                {"type": "decimal", "precision": 20, "scale": 0},
-                {"type": "decimal", "precision": 18, "scale": 2},
-            ],
-            "orderBy": [{
-                "type": "order_by_element",
-                "expression": {"type": "column", "columnNr": 1, "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
-                "isAscending": false,
-                "nullsLast": true
-            }],
-            "limit": {"numElements": 20}
-        }
-    })
+    pushdown_request(
+        "LINEITEM",
+        &[
+            ("L_ORDERKEY", ExasolType::decimal(20, 0)),
+            ("L_EXTENDEDPRICE", ExasolType::decimal(18, 2)),
+        ],
+    )
+    .field("type", "select")
+    .column(table_col("LINEITEM", "L_ORDERKEY"))
+    .column(table_col("LINEITEM", "L_EXTENDEDPRICE"))
+    .order_by(serde_json::json!([{
+        "type": "order_by_element",
+        "expression": {"type": "column", "columnNr": 1, "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
+        "isAscending": false,
+        "nullsLast": true
+    }]))
+    .limit(20)
+    .build()
+    .0
 }
 
 pub(crate) fn pd(request: &Json) -> Json {
     request.get("pushdownRequest").cloned().unwrap()
+}
+
+/// A pushdown request as Exasol sends it, started by [`pushdown_request`]: each involved table with
+/// its typed columns, and one `selectListDataTypes` entry per select-list item, written through
+/// `exasol_type_to_json` from the types [`build`](Self::build) also returns.
+#[derive(Debug, Clone)]
+pub(crate) struct PushdownRequestBuilder {
+    tables: Vec<(String, Vec<(String, ExasolType)>)>,
+    select_list: Option<Vec<(Json, ExasolType)>>,
+    fields: serde_json::Map<String, Json>,
+    request_fields: serde_json::Map<String, Json>,
+    raw_select_list_data_types: Option<Option<Json>>,
+}
+
+/// `request` selecting `items` instead, each beside the type Exasol declares for it, for a test
+/// that varies one fixture's select list.
+pub(crate) fn selecting(mut request: Json, items: &[(Json, ExasolType)]) -> Json {
+    let (nodes, data_types): (Vec<Json>, Vec<Json>) = items
+        .iter()
+        .map(|(node, exa_type)| (node.clone(), exasol_type_to_json(exa_type)))
+        .unzip();
+    request["pushdownRequest"]["selectList"] = Json::Array(nodes);
+    request["pushdownRequest"]["selectListDataTypes"] = Json::Array(data_types);
+    request
+}
+
+/// The columns of a table whose select list projects no bare column.
+pub(crate) const NO_COLUMNS: &[(&str, ExasolType)] = &[];
+
+/// A request over `table` and its `columns` with no select list yet, as for `SELECT *`.
+pub(crate) fn pushdown_request<N: AsRef<str>>(
+    table: &str,
+    columns: &[(N, ExasolType)],
+) -> PushdownRequestBuilder {
+    PushdownRequestBuilder {
+        tables: Vec::new(),
+        select_list: None,
+        fields: serde_json::Map::new(),
+        request_fields: serde_json::Map::new(),
+        raw_select_list_data_types: None,
+    }
+    .table(table, columns)
+}
+
+impl PushdownRequestBuilder {
+    /// Another involved table, as a join involves.
+    pub(crate) fn table<N: AsRef<str>>(mut self, name: &str, columns: &[(N, ExasolType)]) -> Self {
+        let columns = columns
+            .iter()
+            .map(|(column, exa_type)| (column.as_ref().to_string(), *exa_type))
+            .collect();
+        self.tables.push((name.to_string(), columns));
+        self
+    }
+
+    /// A bare `column` select-list item, typed as its involved table declares the column.
+    pub(crate) fn column(self, node: Json) -> Self {
+        let exa_type = self.declared_column_type(&node).unwrap_or_else(|| {
+            panic!("a bare column item must name a column of an involved table: {node}")
+        });
+        self.item_typed(node, exa_type)
+    }
+
+    /// A select-list item that is no bare column of an involved table, typed as Exasol declares it.
+    pub(crate) fn item(self, node: Json, exa_type: ExasolType) -> Self {
+        assert!(
+            self.declared_column_type(&node).is_none(),
+            "a bare column item takes its column's type through `column`: {node}"
+        );
+        self.item_typed(node, exa_type)
+    }
+
+    /// A `COUNT(*)` select-list item, typed `DECIMAL(18,0)` as Exasol declares it.
+    pub(crate) fn count_star(self) -> Self {
+        self.item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+    }
+
+    /// An empty `selectList`, as Exasol sends for `SELECT RANDOM() FROM <table>`.
+    pub(crate) fn empty_select_list(mut self) -> Self {
+        self.select_list = Some(Vec::new());
+        self
+    }
+
+    pub(crate) fn filter(self, filter: Json) -> Self {
+        self.field("filter", filter)
+    }
+
+    /// `aggregationType` `group_by` with these `groupBy` keys.
+    pub(crate) fn group_by(self, keys: Vec<Json>) -> Self {
+        self.field("aggregationType", "group_by")
+            .field("groupBy", keys)
+    }
+
+    /// `aggregationType` `single_group`, as Exasol sends for an aggregate with no GROUP BY.
+    pub(crate) fn single_group(self) -> Self {
+        self.field("aggregationType", "single_group")
+    }
+
+    pub(crate) fn order_by(self, elements: Json) -> Self {
+        self.field("orderBy", elements)
+    }
+
+    pub(crate) fn limit(self, num_elements: u64) -> Self {
+        self.field("limit", serde_json::json!({"numElements": num_elements}))
+    }
+
+    /// `selectListDataTypes` as `raw` spells it, or absent for `None`, in place of the list the
+    /// item types derive: for a test that pins an absent, invalid, or miscounted list.
+    pub(crate) fn select_list_data_types(mut self, raw: Option<Json>) -> Self {
+        self.raw_select_list_data_types = Some(raw);
+        self
+    }
+
+    /// Any other `pushdownRequest` key, such as `having`, `from`, or `type`.
+    pub(crate) fn field(mut self, key: &str, value: impl Into<Json>) -> Self {
+        self.fields.insert(key.to_string(), value.into());
+        self
+    }
+
+    /// A top-level request key beside `involvedTables` and `pushdownRequest`, such as
+    /// `schemaMetadataInfo`.
+    pub(crate) fn request_field(mut self, key: &str, value: impl Into<Json>) -> Self {
+        self.request_fields.insert(key.to_string(), value.into());
+        self
+    }
+
+    /// The request JSON and the type of each select-list item, or of each column of every
+    /// involved table when the request carries no select list.
+    pub(crate) fn build(self) -> (Json, Vec<ExasolType>) {
+        let item_types: Vec<ExasolType> = match &self.select_list {
+            Some(items) => items.iter().map(|(_, exa_type)| *exa_type).collect(),
+            None => self
+                .tables
+                .iter()
+                .flat_map(|(_, columns)| columns.iter().map(|(_, exa_type)| *exa_type))
+                .collect(),
+        };
+        let mut pushdown = self.fields;
+        if let Some(items) = self.select_list {
+            let nodes: Vec<Json> = items.into_iter().map(|(node, _)| node).collect();
+            pushdown.insert("selectList".into(), Json::Array(nodes));
+        }
+        let data_types = self
+            .raw_select_list_data_types
+            .unwrap_or_else(|| Some(item_types.iter().map(exasol_type_to_json).collect()));
+        if let Some(data_types) = data_types {
+            pushdown.insert("selectListDataTypes".into(), data_types);
+        }
+        let involved_tables: Vec<Json> = self
+            .tables
+            .iter()
+            .map(|(name, columns)| {
+                let columns: Vec<Json> = columns
+                    .iter()
+                    .map(|(column, exa_type)| {
+                        serde_json::json!({"name": column, "dataType": exasol_type_to_json(exa_type)})
+                    })
+                    .collect();
+                serde_json::json!({"name": name, "columns": columns})
+            })
+            .collect();
+        let mut request = self.request_fields;
+        request.insert("involvedTables".into(), Json::Array(involved_tables));
+        request.insert("pushdownRequest".into(), Json::Object(pushdown));
+        (Json::Object(request), item_types)
+    }
+
+    /// [`build`](Self::build)'s `pushdownRequest`, parsed as `handle_pushdown` parses it.
+    pub(crate) fn build_pushdown(self) -> PushdownRequest {
+        parsed_pushdown(&self.build().0)
+    }
+
+    fn item_typed(mut self, node: Json, exa_type: ExasolType) -> Self {
+        self.select_list
+            .get_or_insert_with(Vec::new)
+            .push((node, exa_type));
+        self
+    }
+
+    fn declared_column_type(&self, node: &Json) -> Option<ExasolType> {
+        if node.get("type").and_then(Json::as_str) != Some("column") {
+            return None;
+        }
+        let name = node.get("name").and_then(Json::as_str)?;
+        let table = ["tableName", "tableAlias"]
+            .iter()
+            .find_map(|key| node.get(*key).and_then(Json::as_str));
+        self.tables
+            .iter()
+            .filter(|(table_name, _)| table.is_none_or(|t| t.eq_ignore_ascii_case(table_name)))
+            .flat_map(|(_, columns)| columns)
+            .find(|(column, _)| column.eq_ignore_ascii_case(name))
+            .map(|(_, exa_type)| *exa_type)
+    }
 }
 
 /// Runs the same `relativize_shards_to_root` stripping as `handle_pushdown`, so

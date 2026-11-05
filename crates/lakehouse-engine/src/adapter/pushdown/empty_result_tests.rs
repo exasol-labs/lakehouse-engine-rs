@@ -136,18 +136,11 @@ fn empty_result_sql_dispatches_by_plan_shape() {
     let proj_types = vec![ExasolType::decimal(20, 0), ExasolType::WIDEST_VARCHAR];
     let col_types = vec![("AMOUNT".to_string(), ExasolType::decimal(18, 2))];
 
-    let grouped = serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [col("K")],
-        "selectList": [
-            col("K"),
-            agg_item("COUNT", None, false),
-        ],
-        "selectListDataTypes": [
-            {"type": "decimal", "precision": 20, "scale": 0},
-            {"type": "decimal", "precision": 18, "scale": 0},
-        ],
-    });
+    let grouped = pushdown_request("T", &[("K", ExasolType::decimal(20, 0))])
+        .group_by(vec![col("K")])
+        .column(col("K"))
+        .count_star()
+        .build_pushdown();
     let grouped_sql = empty_result_sql(
         &grouped,
         &projected_columns(&proj, &proj_types),
@@ -169,11 +162,13 @@ fn empty_result_sql_dispatches_by_plan_shape() {
         ("AMOUNT", "DECIMAL(18,2)", &col_types),
         ("NAME", "VARCHAR(2000000)", &text_col_types),
     ] {
-        let single = serde_json::json!({
-            "aggregationType": "single_group",
-            "selectList": [agg_item("SUM", Some(column), false)],
-            "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 2}],
-        });
+        let single = pushdown_request("T", NO_COLUMNS)
+            .single_group()
+            .item(
+                agg_item("SUM", Some(column), false),
+                ExasolType::decimal(36, 2),
+            )
+            .build_pushdown();
         let sql = empty_result_sql(
             &single,
             &projected_columns(&proj, &proj_types),
@@ -198,14 +193,15 @@ fn empty_result_sql_dispatches_by_plan_shape() {
 #[test]
 fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
     let col_types = vec![("ID".to_string(), ExasolType::decimal(19, 0))];
-    let request = serde_json::json!({
-        "aggregationType": "single_group",
-        "selectList": [
-            str_lit("X"),
-            agg_item("COUNT", None, false),
-        ],
-        "having": predicate_equal(agg_item("COUNT", None, false), num_lit(0)),
-    });
+    let request = pushdown_request("T", NO_COLUMNS)
+        .single_group()
+        .field(
+            "having",
+            predicate_equal(agg_item("COUNT", None, false), num_lit(0)),
+        )
+        .item(str_lit("X"), ExasolType::WIDEST_VARCHAR)
+        .count_star()
+        .build_pushdown();
     let sql = empty_result_sql(
         &request,
         &projected_columns(&[], &[]),
@@ -230,18 +226,14 @@ fn empty_files_grouped_non_numeric_aggregate_uses_selectlist_shape() {
     let proj_types = vec![ExasolType::decimal(20, 0), ExasolType::WIDEST_VARCHAR];
     let col_types = vec![("NAME".to_string(), ExasolType::WIDEST_VARCHAR)];
 
-    let grouped_non_numeric = serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [col("K")],
-        "selectList": [
-            col("K"),
+    let grouped_non_numeric = pushdown_request("T", &[("K", ExasolType::decimal(20, 0))])
+        .group_by(vec![col("K")])
+        .column(col("K"))
+        .item(
             agg_item("SUM", Some("name"), false),
-        ],
-        "selectListDataTypes": [
-            {"type": "decimal", "precision": 20, "scale": 0},
-            {"type": "decimal", "precision": 36, "scale": 2},
-        ],
-    });
+            ExasolType::decimal(36, 2),
+        )
+        .build_pushdown();
 
     let row_sql = empty_result_sql(
         &grouped_non_numeric,
@@ -268,19 +260,15 @@ fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
     let proj_types = vec![ExasolType::decimal(20, 0), ExasolType::WIDEST_VARCHAR];
     let col_types = vec![("NAME".to_string(), ExasolType::WIDEST_VARCHAR)];
 
-    let grouped_having = serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [col("K")],
-        "selectList": [
-            col("K"),
+    let grouped_having = pushdown_request("T", &[("K", ExasolType::decimal(20, 0))])
+        .group_by(vec![col("K")])
+        .field("having", serde_json::json!({"type": "predicate_greater"}))
+        .column(col("K"))
+        .item(
             agg_item("SUM", Some("name"), false),
-        ],
-        "selectListDataTypes": [
-            {"type": "decimal", "precision": 20, "scale": 0},
-            {"type": "decimal", "precision": 36, "scale": 2},
-        ],
-        "having": {"type": "predicate_greater"},
-    });
+            ExasolType::decimal(36, 2),
+        )
+        .build_pushdown();
 
     let row_sql = empty_result_sql(
         &grouped_having,
@@ -303,13 +291,13 @@ fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
 
 #[test]
 fn empty_result_sql_widened_row_scan_uses_select_list_types() {
-    let pushdown_req = serde_json::json!({
-        "selectList": [
-            {"type": "function_scalar", "name": "LENGTH", "arguments": [
-                table_col("T", "SCORE")]},
-        ],
-        "selectListDataTypes": [{"type": "decimal", "precision": 18, "scale": 0}],
-    });
+    let pushdown_req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            serde_json::json!({"type": "function_scalar", "name": "LENGTH", "arguments": [
+                table_col("T", "SCORE")]}),
+            ExasolType::decimal(18, 0),
+        )
+        .build_pushdown();
     let col_types = vec![
         ("ID".to_string(), ExasolType::decimal(20, 0)),
         ("NAME".to_string(), ExasolType::WIDEST_VARCHAR),

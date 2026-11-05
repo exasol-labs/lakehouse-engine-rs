@@ -3,8 +3,10 @@ use serde_json::Value as Json;
 
 mod column_node;
 mod datetime_format;
+pub mod exasol_type;
 pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
 use datetime_format::{FormatTarget, strftime_pattern};
+use exasol_type::{ExasolType, exasol_type_from_json};
 
 /// Which parser consumes the rendered fragment: DataFusion inside the scan UDF
 /// (`ScanSpec` filter/projection/group keys) or Exasol for the outer wrapper SQL.
@@ -36,17 +38,17 @@ const TRANSLATED_SCALAR_FNS: &[(&str, ExasolForm)] = &[
     ("FLOAT_DIV", ExasolForm::Shaped),
     ("NEG", ExasolForm::Shaped),
     ("CAST", ExasolForm::Shaped),
-    // MOD: Exasol requires `MOD(a, b)`, DataFusion the `%` operator (#197).
+    // MOD: Exasol requires `MOD(a, b)`, DataFusion the `%` operator.
     ("MOD", ExasolForm::Shaped),
     // CONCAT: Exasol's `||` treats NULL as '' and yields NULL only when all-empty;
-    // DataFusion reproduces that as `nullif(concat(...), '')` (#374).
+    // DataFusion reproduces that as `nullif(concat(...), '')`.
     ("CONCAT", ExasolForm::Shaped),
     ("CASE", ExasolForm::Shaped),
     // VerbatimCall: applied to every remaining name uniformly, not only where the
     // DataFusion rendering fails on Exasol.
     //
     // DataFusion's `signum` does not exist in Exasol. The gate must precede the whole
-    // name match, because the math arm matches SIGN (#209).
+    // name match, because the math arm matches SIGN.
     ("ABS", ExasolForm::VerbatimCall),
     ("FLOOR", ExasolForm::VerbatimCall),
     ("CEIL", ExasolForm::VerbatimCall),
@@ -71,7 +73,7 @@ const TRANSLATED_SCALAR_FNS: &[(&str, ExasolForm)] = &[
     ("LOG", ExasolForm::VerbatimCall),
     ("POWER", ExasolForm::VerbatimCall),
     ("ATAN2", ExasolForm::VerbatimCall),
-    // Exasol's INSTR/LOCATE accept the optional start argument natively (#210).
+    // Exasol's INSTR/LOCATE accept the optional start argument natively.
     ("LOWER", ExasolForm::VerbatimCall),
     ("UPPER", ExasolForm::VerbatimCall),
     ("SUBSTR", ExasolForm::VerbatimCall),
@@ -100,7 +102,7 @@ const TRANSLATED_SCALAR_FNS: &[(&str, ExasolForm)] = &[
     ("NULLIF", ExasolForm::VerbatimCall),
     ("NULLIFZERO", ExasolForm::VerbatimCall),
     ("ZEROIFNULL", ExasolForm::VerbatimCall),
-    // DataFusion renders these as `date_part`, which Exasol lacks (#209).
+    // DataFusion renders these as `date_part`, which Exasol lacks.
     ("YEAR", ExasolForm::VerbatimCall),
     ("MONTH", ExasolForm::VerbatimCall),
     ("DAY", ExasolForm::VerbatimCall),
@@ -153,7 +155,7 @@ fn is_empty_opt(value: Option<&str>) -> bool {
 }
 
 /// Detects a boolean operand converted to string (CAST or `||`), which must render
-/// Exasol's `TRUE`/`FALSE` casing rather than DataFusion's lowercase cast (#200).
+/// Exasol's `TRUE`/`FALSE` casing rather than DataFusion's lowercase cast.
 fn is_boolean_producing(kind: &str) -> bool {
     matches!(
         kind,
@@ -175,8 +177,8 @@ fn is_boolean_producing(kind: &str) -> bool {
     )
 }
 
-/// Exasol's `TRUE`/`FALSE` casing instead of DataFusion's lowercase; NULL stays NULL
-/// rather than becoming `'NULL'` or `'FALSE'` (#200).
+/// DataFusion dialect only: Exasol's `TRUE`/`FALSE` casing instead of DataFusion's lowercase;
+/// NULL stays NULL rather than becoming `'NULL'` or `'FALSE'`.
 fn render_bool_to_string_case(bool_expr: &str) -> String {
     format!("(CASE {bool_expr} WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)")
 }
@@ -209,7 +211,7 @@ fn timestamp_literal_unit(value: Option<&Json>) -> &'static str {
 
 /// Converting the UTC-normalized wire value into `SESSIONTIMEZONE` reproduces
 /// Exasol's own TSTZ-vs-TIMESTAMP coercion, which reads the naive side as
-/// session-local (verified live, #218).
+/// session-local (verified live).
 fn render_exasol_tstz_literal(value: Option<&Json>) -> String {
     match value {
         None | Some(Json::Null) => "NULL".to_string(),
@@ -231,7 +233,7 @@ fn json_scalar_to_string(value: &Json) -> String {
 }
 
 /// Exasol's `IN`/`NOT IN` ignores NULL list entries, while DataFusion's
-/// three-valued logic would empty the result (#206).
+/// three-valued logic would empty the result.
 fn is_null_literal(arg: &Json) -> bool {
     match arg.get("type").and_then(|t| t.as_str()) {
         Some("literal_null") => true,
@@ -307,85 +309,40 @@ fn render_conversion_source(
         .ok_or_else(|| UdfError::User(format!("{function} source rendered to null")))
 }
 
-const DOUBLE_TYPE: &str = "DOUBLE";
-
-fn render_cast_target(data_type: &Json, dialect: Dialect) -> Result<String, UdfError> {
-    let type_name = data_type.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-    match type_name.to_uppercase().as_str() {
-        "VARCHAR" => match dialect {
-            // datafusion-sql rejects a length-qualified VARCHAR
-            // (`support_varchar_with_length` is not enabled).
-            Dialect::DataFusion => Ok("VARCHAR".to_string()),
-            // Exasol requires a length: echo the size Exasol sent, never clamped.
-            Dialect::Exasol => Ok(match data_type.get("size").and_then(|v| v.as_u64()) {
-                Some(size) => format!("VARCHAR({size})"),
-                None => "VARCHAR(2000000)".to_string(),
-            }),
-        },
-        "CHAR" => match dialect {
-            // Arrow has no fixed-width CHAR type.
-            Dialect::DataFusion => Ok("VARCHAR".to_string()),
-            // Exasol validates column types positionally against the declared
-            // `CHAR(n)`: `VARCHAR(n)` is a type mismatch and drops CHAR padding
-            // (#192), and a missing ` ASCII` is a charset mismatch. The width is
-            // echoed, never clamped.
-            Dialect::Exasol => {
-                let is_ascii = data_type
-                    .get("characterSet")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|cs| cs.eq_ignore_ascii_case("ASCII"));
-                Ok(match data_type.get("size").and_then(|v| v.as_u64()) {
-                    Some(size) if is_ascii => format!("CHAR({size}) ASCII"),
-                    Some(size) => format!("CHAR({size})"),
-                    None => "VARCHAR(2000000)".to_string(),
-                })
-            }
-        },
-        "DECIMAL" => {
-            let p = data_type
-                .get("precision")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(18);
-            let s = data_type.get("scale").and_then(|v| v.as_u64()).unwrap_or(0);
-            Ok(format!("DECIMAL({p},{s})"))
-        }
-        "DOUBLE" | "DOUBLE PRECISION" => Ok(DOUBLE_TYPE.to_string()),
-        "BOOLEAN" => Ok("BOOLEAN".to_string()),
-        "DATE" => Ok("DATE".to_string()),
-        "TIMESTAMP" => {
-            // WLTZ (`withLocalTimeZone: true`) carries session-timezone semantics
-            // DataFusion's TIMESTAMP cannot reproduce; decline so Exasol evaluates it.
-            if data_type.get("withLocalTimeZone").and_then(|v| v.as_bool()) == Some(true) {
-                return Err(UdfError::User(
-                    "unsupported CAST target type: TIMESTAMP WITH LOCAL TIME ZONE".into(),
-                ));
-            }
-            // `fractionalSecondsPrecision`, not `precision` (DECIMAL/INTERVAL only).
-            // Absent means Exasol's default TIMESTAMP(3).
-            match data_type
-                .get("fractionalSecondsPrecision")
-                .and_then(|v| v.as_u64())
-            {
-                None => Ok("TIMESTAMP".to_string()),
-                // Exasol's own parser accepts any precision 0-9 verbatim.
-                Some(p) => match dialect {
-                    Dialect::Exasol => Ok(format!("TIMESTAMP({p})")),
-                    // DataFusion parses only p in {0,3,6,9}; decline the rest
-                    // rather than approximate.
-                    Dialect::DataFusion => match p {
-                        0 | 3 | 6 | 9 => Ok(format!("TIMESTAMP({p})")),
-                        _ => Err(UdfError::User(format!(
-                            "unsupported CAST target type: TIMESTAMP({p})"
-                        ))),
-                    },
-                },
-            }
-        }
-        other => Err(UdfError::User(format!(
-            "unsupported CAST target type: {other}"
-        ))),
+/// The Exasol dialect renders the target's `Display`. The DataFusion dialect declines a target it
+/// cannot represent, and renders CHAR or VARCHAR as unsized VARCHAR without Exasol's checks (#587).
+fn render_cast_target(target: ExasolType, dialect: Dialect) -> Result<String, UdfError> {
+    match dialect {
+        Dialect::Exasol => Ok(target.to_string()),
+        Dialect::DataFusion => datafusion_cast_target(target),
     }
+}
+
+fn datafusion_cast_target(target: ExasolType) -> Result<String, UdfError> {
+    Ok(match target {
+        // datafusion-sql rejects a length-qualified VARCHAR (`support_varchar_with_length` is
+        // not enabled), and Arrow has no fixed-width CHAR type.
+        ExasolType::Char { .. } | ExasolType::Varchar { .. } => "VARCHAR".to_string(),
+        ExasolType::Decimal(_) | ExasolType::Boolean | ExasolType::Date => target.to_string(),
+        ExasolType::DoublePrecision => "DOUBLE".to_string(),
+        // DataFusion parses only these four and reads a bare TIMESTAMP as nanoseconds, so the
+        // rest decline rather than approximate.
+        ExasolType::Timestamp {
+            precision: precision @ (0 | 3 | 6 | 9),
+        } => format!("TIMESTAMP({precision})"),
+        // WLTZ carries session-time-zone semantics DataFusion's TIMESTAMP cannot reproduce, and
+        // Arrow has no INTERVAL DAY(p) TO SECOND(f), GEOMETRY, or HASHTYPE equivalent.
+        ExasolType::Timestamp { .. }
+        | ExasolType::TimestampWithLocalTimeZone { .. }
+        | ExasolType::IntervalYearToMonth { .. }
+        | ExasolType::IntervalDayToSecond { .. }
+        | ExasolType::Geometry { .. }
+        | ExasolType::Hashtype { .. } => {
+            return Err(UdfError::User(format!(
+                "unsupported CAST target type: {target}"
+            )));
+        }
+    })
 }
 
 /// Reproduces Exasol's shortest-form DECIMAL->string conversion. The caller MUST
@@ -396,7 +353,7 @@ fn format_decimal_exasol_style(expr_sql: &str) -> String {
     )
 }
 
-/// The scalar UDF the DataFusion dialect renders `FLOAT_DIV` as (#370), registered
+/// The scalar UDF the DataFusion dialect renders `FLOAT_DIV` as, registered
 /// by `lakehouse-engine`. It MUST take two arguments coerced to `Float64` (Exasol's
 /// `FN_FLOAT_DIV` is always float division), return `Float64`, propagate `NULL`, and
 /// error on any other non-finite result, so division by zero fails in a filter
@@ -415,21 +372,14 @@ fn render_cast(
     let inner = render_expression_inner(&args[0], dialect)?
         .ok_or_else(|| UdfError::User("CAST expression is null".into()))?;
     let data_type = data_type.ok_or_else(|| UdfError::User("CAST missing 'dataType'".into()))?;
-    let target_type = render_cast_target(data_type, dialect)?;
+    let target = exasol_type_from_json(data_type)?;
+    let target_type = render_cast_target(target, dialect)?;
 
-    let target_is_string = matches!(
-        data_type
-            .get("type")
-            .and_then(|t| t.as_str())
-            .map(str::to_uppercase)
-            .as_deref(),
-        Some("VARCHAR") | Some("CHAR")
-    );
     let source_is_boolean = args[0]
         .get("type")
         .and_then(|t| t.as_str())
         .is_some_and(is_boolean_producing);
-    if target_is_string && source_is_boolean {
+    if dialect == Dialect::DataFusion && target.is_character() && source_is_boolean {
         return Ok(Some(render_bool_to_string_case(&inner)));
     }
 
@@ -506,8 +456,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             }
             // Explicit precision: DataFusion types a bare `TIMESTAMP` literal as
             // nanoseconds, which overflows on far-future values when unified with
-            // microsecond columns (#155), so only sub-microsecond digits get
-            // nanoseconds (#461). A NULL value renders `arrow_cast(NULL, ...)`,
+            // microsecond columns, so only sub-microsecond digits get
+            // nanoseconds. A NULL value renders `arrow_cast(NULL, ...)`,
             // deliberately unlike `literal_timestamp_utc`.
             return Ok(Some(format!(
                 "arrow_cast({}, 'Timestamp({}, None)')",
@@ -531,7 +481,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             )));
         }
         "literal_timestamputc" => {
-            // Exasol's real wire name for a TSTZ literal (#242). DataFusion keeps
+            // Exasol's real wire name for a TSTZ literal. DataFusion keeps
             // declining it: TSTZ coercion against a naive `timestamp_us` column is
             // unverified (#242).
             if dialect == Dialect::Exasol {
@@ -724,7 +674,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             let args = value("arguments").and_then(|a| a.as_array());
             render_cast(args, value("dataType"), dialect)
         }
-        // Adapter-synthesized, never sent by Exasol (#211): the adapter has confirmed
+        // Adapter-synthesized, never sent by Exasol: the adapter has confirmed
         // the argument is a DECIMAL column being stringified.
         "decimal_to_varchar_exasol" => {
             let args = value("arguments")
@@ -884,7 +834,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     }))
                 }
                 // DataFusion's `concat` never collapses an all-empty result to NULL
-                // as Exasol's `||` does (#374); boolean operands need Exasol casing (#200).
+                // as Exasol's `||` does; boolean operands need Exasol casing.
                 "CONCAT" => {
                     let args = args.ok_or_else(|| {
                         UdfError::User("function_scalar CONCAT missing 'arguments'".into())
@@ -900,10 +850,11 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                             let r = render_expression_inner(arg, dialect)?.ok_or_else(|| {
                                 UdfError::User("CONCAT argument rendered to null".into())
                             })?;
-                            let is_bool = arg
-                                .get("type")
-                                .and_then(|t| t.as_str())
-                                .is_some_and(is_boolean_producing);
+                            let is_bool = dialect == Dialect::DataFusion
+                                && arg
+                                    .get("type")
+                                    .and_then(|t| t.as_str())
+                                    .is_some_and(is_boolean_producing);
                             Ok(if is_bool {
                                 render_bool_to_string_case(&r)
                             } else {

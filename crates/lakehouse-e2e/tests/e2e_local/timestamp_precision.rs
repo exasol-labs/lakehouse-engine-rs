@@ -107,6 +107,7 @@ fn assert_emits_declares(conn: &mut ExaConn, query_sql: &str, expected: &str) ->
 }
 
 /// Scenario: A timestamp filter compares at full precision
+/// Scenario: A TIMESTAMP(p) column declaration serializes fractionalSecondsPrecision
 #[test]
 fn iceberg_microsecond_timestamps_round_trip_at_the_declared_precision() {
     setup();
@@ -195,6 +196,7 @@ fn rendered_nanos(nanos: i64) -> String {
         .to_string()
 }
 
+/// Scenario: Projected CAST expression preserves the declared TIMESTAMP fractional-seconds precision in its EMITS type
 #[test]
 fn cast_to_timestamp9_emits_nanoseconds_and_keeps_every_seeded_digit() {
     setup();
@@ -246,6 +248,7 @@ fn cast_to_timestamp9_emits_nanoseconds_and_keeps_every_seeded_digit() {
     );
 }
 
+/// Scenario: CAST to TIMESTAMP renders the declared fractional-seconds precision per SQL dialect
 #[test]
 fn cast_to_timestamp3_emits_milliseconds_and_collapses_the_seeded_pairs() {
     setup();
@@ -254,20 +257,14 @@ fn cast_to_timestamp3_emits_milliseconds_and_collapses_the_seeded_pairs() {
     let target = expected.declared_column_type;
     let projection_sql = cast_projection_sql(&TSPRECISION_COL_TS.to_uppercase(), target);
 
-    let honors_declared_precision = engine_honors_declared_precision(&mut conn);
-    let echoed_declaration = if honors_declared_precision {
-        target
-    } else {
-        "TIMESTAMP"
-    };
-    let pushdown_sql = assert_emits_declares(&mut conn, &projection_sql, echoed_declaration);
-    if !honors_declared_precision {
-        let emits = emits_clause(&pushdown_sql);
-        assert!(
-            !emits.contains("TIMESTAMP("),
-            "the clamped arm must declare a bare TIMESTAMP, not a parameterized one: {emits}"
-        );
-    }
+    // Exasol treats bare `TIMESTAMP` and `TIMESTAMP(3)` as one type, and the adapter spells
+    // precision 3 the first way on every version.
+    let pushdown_sql = assert_emits_declares(&mut conn, &projection_sql, "TIMESTAMP");
+    let emits = emits_clause(&pushdown_sql);
+    assert!(
+        !emits.contains("TIMESTAMP("),
+        "precision 3 must declare a bare TIMESTAMP, not a parameterized one: {emits}"
+    );
 
     let projected = conn.query_columns(&projection_sql);
     let actual = without_trailing_fraction_zeros(rendered_column(&projected[1], target));
@@ -297,6 +294,68 @@ fn cast_to_timestamp3_emits_milliseconds_and_collapses_the_seeded_pairs() {
         expected.distinct_count,
         "COUNT(DISTINCT) must be {} at {target} — the two seeded pairs share a millisecond prefix",
         expected.distinct_count
+    );
+}
+
+/// Scenario: A CAST to TIMESTAMP without a precision compares at three fractional digits
+#[test]
+fn cast_to_bare_timestamp_filters_at_milliseconds_like_native() {
+    setup();
+    let mut conn = exa_conn();
+    let table = qualified_probe();
+
+    // The seeded pairs share a millisecond prefix: `.000001` and `.000002` truncate to `.000`,
+    // `.123456` and `.123457` to `.123`.
+    let filters = [
+        "CAST(TS AS TIMESTAMP) = TIMESTAMP '2024-01-01 00:00:00.000'",
+        "CAST(TS AS TIMESTAMP) = TIMESTAMP '2024-01-01 00:00:00.123'",
+        "CAST(TS AS TIMESTAMP) > TIMESTAMP '2024-01-01 00:00:00.000'",
+    ];
+    assert_filters_match_native_copy(&mut conn, &table, "TS", &filters);
+    /// Each filter matches one seeded pair of rows.
+    const SEEDED_PAIR_ROWS: i64 = 2;
+    for filter in &filters {
+        let count_sql = format!("SELECT COUNT(*) FROM {table} WHERE {filter}");
+        assert_eq!(
+            conn.query_scalar_i64(&count_sql),
+            SEEDED_PAIR_ROWS,
+            "{count_sql} must count one seeded pair"
+        );
+        let pushed = isolated_pushdown_statement(&mut conn, &count_sql);
+        assert!(
+            pushed.contains(SCAN_SCRIPT_NAME) && pushed.contains("AS TIMESTAMP(3))"),
+            "{filter} must stay in the scan's WHERE clause at three fractional digits: {pushed}"
+        );
+    }
+}
+
+/// Scenario: A CAST to TIMESTAMP WITH LOCAL TIME ZONE keeps its declared precision
+/// Scenario: Projected CAST expression preserves the declared TIMESTAMP fractional-seconds precision in its EMITS type
+#[test]
+fn cast_to_timestamp_with_local_time_zone_matches_native() {
+    setup();
+    let mut conn = exa_conn();
+    let target = if engine_honors_declared_precision(&mut conn) {
+        "TIMESTAMP(6) WITH LOCAL TIME ZONE"
+    } else {
+        "TIMESTAMP WITH LOCAL TIME ZONE"
+    };
+    let query = format!("SELECT ID, CAST(TS AS {target}) FROM {{}} ORDER BY ID");
+    let table = qualified_probe();
+
+    assert_queries_match_native_copy(&mut conn, &table, "TS", &[query.as_str()]);
+
+    let projection_sql = query.replace("{}", &table);
+    assert_pushed_to_scan_udf(&mut conn, &projection_sql, "the TSLTZ cast projection");
+    let pushed = isolated_pushdown_statement(&mut conn, &projection_sql);
+    let emits = emits_clause(&pushed);
+    assert!(
+        !emits.contains("LOCAL TIME ZONE"),
+        "the scan cannot emit a TIMESTAMP WITH LOCAL TIME ZONE column: {emits}"
+    );
+    assert!(
+        pushed.contains(&format!("AS {target})")),
+        "the wrapper must cast to {target}: {pushed}"
     );
 }
 

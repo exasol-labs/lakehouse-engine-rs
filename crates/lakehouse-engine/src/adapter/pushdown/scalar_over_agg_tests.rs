@@ -1,5 +1,5 @@
 use super::*;
-use crate::adapter::pushdown::test_support::{col, num_lit};
+use crate::adapter::pushdown::test_support::{EXASOL_TYPE_SPELLINGS, col, num_lit};
 
 fn agg(name: &str, column: &str, distinct: bool) -> Json {
     serde_json::json!({
@@ -337,4 +337,25 @@ fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
          the same merged expression for its own matched slot, must render byte-identical \
          SQL regardless of which planner drives it"
     );
+}
+
+#[test]
+fn sum_widens_a_decimal_to_precision_36_and_every_other_variant_to_double() {
+    for exa_type in EXASOL_TYPE_SPELLINGS {
+        let expected = match exa_type {
+            ExasolType::Decimal(decimal) => ExasolType::decimal(36, decimal.scale()),
+            ExasolType::Boolean
+            | ExasolType::DoublePrecision
+            | ExasolType::Date
+            | ExasolType::Timestamp { .. }
+            | ExasolType::TimestampWithLocalTimeZone { .. }
+            | ExasolType::IntervalYearToMonth { .. }
+            | ExasolType::IntervalDayToSecond { .. }
+            | ExasolType::Geometry { .. }
+            | ExasolType::Hashtype { .. }
+            | ExasolType::Char { .. }
+            | ExasolType::Varchar { .. } => ExasolType::DoublePrecision,
+        };
+        assert_eq!(sum_emit_type(exa_type), expected, "{exa_type}");
+    }
 }

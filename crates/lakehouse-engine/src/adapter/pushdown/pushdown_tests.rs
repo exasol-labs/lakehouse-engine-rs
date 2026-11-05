@@ -551,6 +551,7 @@ fn iceberg_declaration_omits_default_for_no_default_field() {
     );
 }
 
+/// Scenario: A decimal initial-default outside Exasol's DECIMAL domain is not encoded as a numeric default
 #[test]
 fn iceberg_declaration_omits_default_for_decimal_outside_exasol_domain() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
@@ -739,19 +740,8 @@ fn guard_col_types() -> Vec<(String, ExasolType)> {
     ]
 }
 
-fn guard_events_request(pushdown_req: Json) -> Json {
-    serde_json::json!({
-        "involvedTables": [{
-            "name": "EVENTS",
-            "columns": [
-                {"name": "REGION", "dataType": {"type": "varchar", "size": 2000000}},
-                {"name": "NAME", "dataType": {"type": "varchar", "size": 2000000}},
-                {"name": "AMOUNT", "dataType": {"type": "decimal", "precision": 18, "scale": 2}},
-                {"name": "ID", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-            ],
-        }],
-        "pushdownRequest": pushdown_req,
-    })
+fn guard_events() -> PushdownRequestBuilder {
+    pushdown_request("EVENTS", &guard_col_types())
 }
 
 /// `projection_widened` is the dispatcher's routing flag (#196).
@@ -791,7 +781,7 @@ fn guard_dispatch_result(
     let has_order_by = order_by_present(&pushdown_req);
     build_dispatch_sql(
         request,
-        &pushdown_req,
+        &PushdownRequest::parse(pushdown_req.clone())?,
         projected_columns(&proj_cols, &proj_types),
         projection_widened,
         &column_types(&guard_col_types()),
@@ -828,8 +818,8 @@ fn declined_like_on_decimal() -> Json {
 
 /// The empty logical schema declines the bounded top-N unconditionally, so the
 /// decline route must win on its own.
-fn dispatch_sql_for_body(pushdown_req_body: Json) -> String {
-    let request = guard_events_request(pushdown_req_body);
+fn dispatch_sql_for_body(request: PushdownRequestBuilder) -> String {
+    let (request, _) = request.build();
     let pushdown_req = pd(&request);
     let col_types = guard_col_types();
     let (proj_cols, proj_types, projection_widened) =
@@ -840,7 +830,7 @@ fn dispatch_sql_for_body(pushdown_req_body: Json) -> String {
     );
     let result = build_dispatch_sql(
         &request,
-        &pushdown_req,
+        &parsed_pushdown(&request),
         projected_columns(&proj_cols, &proj_types),
         projection_widened,
         &column_types(&col_types),
@@ -879,39 +869,30 @@ fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
     let shapes = [
         (
             "row scan",
-            serde_json::json!({
-                "selectList": [id_col.clone()],
-                "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
-                "filter": declined.clone(),
-            }),
+            guard_events()
+                .column(id_col.clone())
+                .filter(declined.clone()),
         ),
         (
             "grouped aggregate",
-            serde_json::json!({
-                "aggregationType": "group_by",
-                "groupBy": [region_col.clone()],
-                "selectList": [region_col, agg_item("COUNT", None, false)],
-                "selectListDataTypes": [
-                    {"type": "varchar", "size": 2000000},
-                    {"type": "decimal", "precision": 18, "scale": 0},
-                ],
-                "filter": declined.clone(),
-            }),
+            guard_events()
+                .group_by(vec![region_col.clone()])
+                .column(region_col)
+                .count_star()
+                .filter(declined.clone()),
         ),
         (
             "ordered top-N",
-            serde_json::json!({
-                "selectList": [id_col.clone()],
-                "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
-                "orderBy": [{
+            guard_events()
+                .column(id_col.clone())
+                .order_by(serde_json::json!([{
                     "type": "order_by_element",
                     "expression": id_col,
                     "isAscending": true,
                     "nullsLast": true,
-                }],
-                "limit": {"numElements": 5},
-                "filter": declined.clone(),
-            }),
+                }]))
+                .limit(5)
+                .filter(declined.clone()),
         ),
     ];
 
@@ -944,11 +925,11 @@ fn trivially_true_filter_omitted_without_wrapper() {
         "a trivially-true filter is neither pushed nor declined: {filter:?} {declined:?}"
     );
 
-    let sql = dispatch_sql_for_body(serde_json::json!({
-        "selectList": [table_col("EVENTS", "ID")],
-        "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
-        "filter": trivially_true,
-    }));
+    let sql = dispatch_sql_for_body(
+        guard_events()
+            .filter(trivially_true)
+            .column(table_col("EVENTS", "ID")),
+    );
 
     assert!(
         !sql.contains("LHS_T0"),
@@ -962,9 +943,7 @@ fn trivially_true_filter_omitted_without_wrapper() {
 
 #[test]
 fn declined_filter_with_absent_select_list_projects_full_row() {
-    let sql = dispatch_sql_for_body(serde_json::json!({
-        "filter": declined_like_on_decimal(),
-    }));
+    let sql = dispatch_sql_for_body(guard_events().filter(declined_like_on_decimal()));
 
     assert!(
         sql.contains(r#""projection":["REGION","NAME","AMOUNT","ID"]"#),
@@ -981,11 +960,11 @@ fn declined_filter_with_absent_select_list_projects_full_row() {
 
 #[test]
 fn declined_filter_with_a_real_select_list_keeps_the_narrowing() {
-    let sql = dispatch_sql_for_body(serde_json::json!({
-        "selectList": [table_col("EVENTS", "ID")],
-        "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
-        "filter": declined_like_on_decimal(),
-    }));
+    let sql = dispatch_sql_for_body(
+        guard_events()
+            .filter(declined_like_on_decimal())
+            .column(table_col("EVENTS", "ID")),
+    );
 
     assert!(
         sql.contains(r#""projection":["AMOUNT","ID"]"#),
@@ -1008,17 +987,17 @@ fn declined_filter_with_a_real_select_list_keeps_the_narrowing() {
 
 #[test]
 fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
-    let sql = dispatch_sql_for_body(serde_json::json!({
-        "selectList": [{
+    let sql = dispatch_sql_for_body(guard_events().item(
+        serde_json::json!({
             "type": "function_scalar",
             "name": "ROUND",
             "arguments": [
                 agg_item("SUM", Some("AMOUNT"), false),
                 num_lit(2),
             ],
-        }],
-        "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 2}],
-    }));
+        }),
+        ExasolType::decimal(36, 2),
+    ));
 
     assert!(
         sql.starts_with(r#"SELECT CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(36,2)) FROM ("#),
@@ -1082,7 +1061,7 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
     });
     let col_types = vec![
         ("ID".to_string(), ExasolType::decimal(20, 0)),
-        ("TS".to_string(), ExasolType::Timestamp { precision: None }),
+        ("TS".to_string(), ExasolType::BARE_TIMESTAMP),
         ("AMOUNT".to_string(), ExasolType::decimal(18, 2)),
     ];
     assert_ne!(
@@ -1115,17 +1094,17 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
 
 #[test]
 fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
-    let request = guard_events_request(serde_json::json!({
-        "selectList": [num_lit(1)],
-        "selectListDataTypes": [{"type": "decimal", "precision": 1, "scale": 0}],
-        "orderBy": [{
+    let request = guard_events()
+        .order_by(serde_json::json!([{
             "type": "order_by_element",
             "expression": col("NAME"),
             "isAscending": true,
             "nullsLast": true
-        }],
-        "limit": {"numElements": 10}
-    }));
+        }]))
+        .limit(10)
+        .item(num_lit(1), ExasolType::decimal(1, 0))
+        .build()
+        .0;
     let proj_cols = vec![ProjectionItem::Expr {
         expr: "1".to_string(),
     }];
@@ -1158,16 +1137,16 @@ fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
 
 #[test]
 fn declined_order_by_wrapper_selects_only_original_select_list() {
-    let request = guard_events_request(serde_json::json!({
-        "selectList": [col("NAME")],
-        "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
-        "orderBy": [{
+    let request = guard_events()
+        .order_by(serde_json::json!([{
             "type": "order_by_element",
             "expression": col("ID"),
             "isAscending": true,
             "nullsLast": true
-        }]
-    }));
+        }]))
+        .column(col("NAME"))
+        .build()
+        .0;
     let proj_cols = vec![ProjectionItem::from("NAME")];
     let proj_types = vec![ExasolType::WIDEST_VARCHAR];
 
@@ -1207,16 +1186,16 @@ fn declined_order_by_dedupes_repeated_and_projected_sort_keys() {
             "nullsLast": true
         })
     };
-    let request = guard_events_request(serde_json::json!({
-        "selectList": [col("NAME")],
-        "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
-        "orderBy": [
+    let request = guard_events()
+        .order_by(serde_json::json!([
             sort_key("NAME"),
             sort_key("ID"),
             sort_key("NAME"),
             sort_key("ID"),
-        ]
-    }));
+        ]))
+        .column(col("NAME"))
+        .build()
+        .0;
     let proj_cols = vec![ProjectionItem::from("NAME")];
     let proj_types = vec![ExasolType::WIDEST_VARCHAR];
 
@@ -1247,17 +1226,17 @@ fn declined_order_by_dedupes_repeated_and_projected_sort_keys() {
 
 #[test]
 fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
-    let request = guard_events_request(serde_json::json!({
-        "selectList": [col("NAME")],
-        "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
-        "orderBy": [{
+    let request = guard_events()
+        .order_by(serde_json::json!([{
             "type": "order_by_element",
             "expression": col("NAME"),
             "isAscending": true,
             "nullsLast": true
-        }],
-        "limit": {"numElements": 5}
-    }));
+        }]))
+        .limit(5)
+        .column(col("NAME"))
+        .build()
+        .0;
     let proj_cols = vec![ProjectionItem::from("NAME")];
     let proj_types = vec![ExasolType::WIDEST_VARCHAR];
     let logical_schema = vec![LogicalField {
@@ -1305,17 +1284,17 @@ fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
 
 #[test]
 fn nonzero_offset_nulls_the_effective_limit() {
-    let request = guard_events_request(serde_json::json!({
-        "selectList": [col("NAME")],
-        "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
-        "orderBy": [{
+    let request = guard_events()
+        .order_by(serde_json::json!([{
             "type": "order_by_element",
             "expression": col("NAME"),
             "isAscending": true,
             "nullsLast": true
-        }],
-        "limit": {"numElements": 5, "offset": 2}
-    }));
+        }]))
+        .field("limit", serde_json::json!({"numElements": 5, "offset": 2}))
+        .column(col("NAME"))
+        .build()
+        .0;
     let proj_cols = vec![ProjectionItem::from("NAME")];
     let proj_types = vec![ExasolType::WIDEST_VARCHAR];
     let logical_schema = vec![LogicalField {
@@ -1357,17 +1336,17 @@ fn nonzero_offset_nulls_the_effective_limit() {
 
 #[test]
 fn declined_order_by_extension_runs_after_topn_detection() {
-    let request = guard_events_request(serde_json::json!({
-        "selectList": [num_lit(1)],
-        "selectListDataTypes": [{"type": "decimal", "precision": 1, "scale": 0}],
-        "orderBy": [{
+    let request = guard_events()
+        .order_by(serde_json::json!([{
             "type": "order_by_element",
             "expression": col("NAME"),
             "isAscending": true,
             "nullsLast": true
-        }],
-        "limit": {"numElements": 5}
-    }));
+        }]))
+        .limit(5)
+        .item(num_lit(1), ExasolType::decimal(1, 0))
+        .build()
+        .0;
     let proj_cols = vec![ProjectionItem::Expr {
         expr: "1".to_string(),
     }];
@@ -1450,12 +1429,12 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
     ];
 
     for (facet, order_by) in declining_shapes {
-        let request = guard_events_request(serde_json::json!({
-            "selectList": [col("NAME")],
-            "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
-            "orderBy": order_by,
-            "limit": {"numElements": 7}
-        }));
+        let request = guard_events()
+            .order_by(order_by)
+            .limit(7)
+            .column(col("NAME"))
+            .build()
+            .0;
         let err = guard_dispatch_result(
             &request,
             vec![ProjectionItem::from("NAME")],
@@ -1484,11 +1463,7 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
         }
     }
 
-    let unordered = guard_events_request(serde_json::json!({
-        "selectList": [col("NAME")],
-        "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
-        "limit": {"numElements": 7}
-    }));
+    let unordered = guard_events().limit(7).column(col("NAME")).build().0;
     let sql = guard_dispatch_sql(
         &unordered,
         vec![ProjectionItem::from("NAME")],
@@ -1513,16 +1488,19 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
 
 #[test]
 fn lone_count_distinct_with_order_by_still_renders_limit() {
-    let request = guard_events_request(serde_json::json!({
-        "selectList": [agg_item("COUNT", Some("ID"), true)],
-        "selectListDataTypes": [{"type": "decimal", "precision": 18, "scale": 0}],
-        "orderBy": [{
+    let request = guard_events()
+        .order_by(serde_json::json!([{
             "type": "order_by_element",
             "expression": table_col("EVENTS", "ID"),
             "isAscending": true,
             "nullsLast": true
-        }]
-    }));
+        }]))
+        .item(
+            agg_item("COUNT", Some("ID"), true),
+            ExasolType::decimal(18, 0),
+        )
+        .build()
+        .0;
 
     let sql = guard_dispatch_sql(
         &request,
@@ -1558,26 +1536,19 @@ fn lone_count_distinct_with_order_by_still_renders_limit() {
 
 /// Select-list arity equals the base table's column count.
 fn widening_arity_coincidence_request() -> Json {
-    guard_events_request(serde_json::json!({
-        "selectList": [
-            table_col("EVENTS", "REGION"),
-            table_col("EVENTS", "NAME"),
-            table_col("EVENTS", "AMOUNT"),
-            table_col("EVENTS", "ID"),
-        ],
-        "selectListDataTypes": [
-            {"type": "varchar", "size": 2000000},
-            {"type": "varchar", "size": 2000000},
-            {"type": "decimal", "precision": 18, "scale": 2},
-            {"type": "decimal", "precision": 20, "scale": 0},
-        ],
-        "orderBy": [{
+    guard_events()
+        .order_by(serde_json::json!([{
             "type": "order_by_element",
             "expression": table_col("EVENTS", "NAME"),
             "isAscending": true,
             "nullsLast": true
-        }]
-    }))
+        }]))
+        .column(table_col("EVENTS", "REGION"))
+        .column(table_col("EVENTS", "NAME"))
+        .column(table_col("EVENTS", "AMOUNT"))
+        .column(table_col("EVENTS", "ID"))
+        .build()
+        .0
 }
 
 fn widening_arity_coincidence_projection() -> (Vec<ProjectionItem>, Vec<ExasolType>) {
@@ -1645,18 +1616,9 @@ fn dispatch_non_widened_projection_at_matching_arity_takes_scan_path() {
     );
 }
 
-fn timestamp_cast_select_request(precision: u64) -> Json {
-    serde_json::json!({
-        "selectList": [{
-            "type": "function_scalar_cast",
-            "name": "CAST",
-            "dataType": {"type": "TIMESTAMP", "fractionalSecondsPrecision": precision},
-            "arguments": [table_col("EVENTS", "NAME")]
-        }],
-        "selectListDataTypes": [
-            {"type": "timestamp", "fractionalSecondsPrecision": precision}
-        ],
-    })
+fn timestamp_cast_select_request(precision: u8) -> PushdownRequestBuilder {
+    let target = ExasolType::timestamp(precision);
+    guard_events().item(cast_to(target, table_col("EVENTS", "NAME")), target)
 }
 
 #[test]
@@ -1695,16 +1657,6 @@ fn accepted_timestamp_precision_cast_takes_scan_path() {
     );
 }
 
-fn refused_column_table_request(select_list: Json) -> Json {
-    refused_column_table(serde_json::json!({"type": "select", "selectList": select_list}))
-}
-
-fn refused_column_table_request_with_filter(select_list: Json, filter: Json) -> Json {
-    refused_column_table(serde_json::json!({
-        "type": "select", "selectList": select_list, "filter": filter,
-    }))
-}
-
 const REFUSED_COLUMN_TABLE_COLUMNS: &[(&str, &str)] =
     &[("int_col", "integer"), ("variant_col", "variant")];
 
@@ -1713,18 +1665,24 @@ const REFUSED_COLUMN_TABLE_COLUMNS: &[(&str, &str)] =
 const REFUSED_COLUMN_TABLE_LOG_COLUMNS: &[(&str, &str)] =
     &[("int_col", "integer"), ("variant_col", "string")];
 
-fn refused_column_table(pushdown_request: Json) -> Json {
-    let request = serde_json::json!({
-        "involvedTables": [{
-            "name": "ORDERS",
-            "columns": [
-                {"name": "INT_COL", "dataType": {"type": "decimal", "precision": 10, "scale": 0}},
-                {"name": "VARIANT_COL", "dataType": {"type": "varchar", "size": 2000000}},
-            ],
-        }],
-        "pushdownRequest": pushdown_request,
-    });
-    with_delta_notes(request, "ORDERS", REFUSED_COLUMN_TABLE_COLUMNS, &[])
+fn refused_column_table() -> PushdownRequestBuilder {
+    pushdown_request(
+        "ORDERS",
+        &[
+            ("INT_COL", ExasolType::decimal(10, 0)),
+            ("VARIANT_COL", ExasolType::WIDEST_VARCHAR),
+        ],
+    )
+    .field("type", "select")
+}
+
+fn refused_column_request(request: PushdownRequestBuilder) -> Json {
+    with_delta_notes(
+        request.build().0,
+        "ORDERS",
+        REFUSED_COLUMN_TABLE_COLUMNS,
+        &[],
+    )
 }
 
 async fn refused_column_table_storage() -> crate::scan::spec::StorageBackend {
@@ -1746,7 +1704,7 @@ async fn a_refused_column_is_refused_before_the_zero_active_files_early_return()
     let storage = refused_column_table_storage().await;
 
     let planned = delta_pushdown(
-        &refused_column_table_request(serde_json::json!([column_item("INT_COL")])),
+        &refused_column_request(refused_column_table().column(column_item("INT_COL"))),
         &catalog.uri,
         storage.clone(),
         "cat.sch.orders",
@@ -1763,7 +1721,7 @@ async fn a_refused_column_is_refused_before_the_zero_active_files_early_return()
     );
 
     let error = delta_pushdown(
-        &refused_column_table_request(serde_json::json!([column_item("VARIANT_COL")])),
+        &refused_column_request(refused_column_table().column(column_item("VARIANT_COL"))),
         &catalog.uri,
         storage,
         "cat.sch.orders",
@@ -1803,7 +1761,7 @@ async fn a_unity_catalog_pushdown_gates_the_delta_protocol_and_refuses_per_colum
     let storage = refused_protocol_table_storage().await;
 
     let error = delta_pushdown(
-        &refused_column_table_request(serde_json::json!([column_item("INT_COL")])),
+        &refused_column_request(refused_column_table().column(column_item("INT_COL"))),
         &catalog.uri,
         storage,
         "cat.sch.orders",
@@ -1839,18 +1797,10 @@ async fn a_non_pruning_delta_request_keeps_its_pre_change_field_set_and_carries_
     )])
     .await;
 
-    let request = serde_json::json!({
-        "involvedTables": [{
-            "name": "ORDERS",
-            "columns": [
-                {"name": "INT_COL", "dataType": {"type": "decimal", "precision": 10, "scale": 0}},
-            ],
-        }],
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [table_col("ORDERS", "INT_COL")],
-        },
-    });
+    let (request, _) = pushdown_request("ORDERS", &[("INT_COL", ExasolType::decimal(10, 0))])
+        .field("type", serde_json::json!("select"))
+        .column(table_col("ORDERS", "INT_COL"))
+        .build();
     let request = with_delta_notes(request, "ORDERS", &[("int_col", "integer")], &[]);
 
     let planned = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
@@ -1929,9 +1879,7 @@ async fn a_count_star_aggregate_is_admitted_over_a_table_with_a_refused_column()
     let storage = refused_column_table_storage().await;
 
     delta_pushdown(
-        &refused_column_table_request(serde_json::json!([
-            {"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false}
-        ])),
+        &refused_column_request(refused_column_table().item(serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false}), ExasolType::decimal(18, 0))),
         &catalog.uri,
         storage,
         "cat.sch.orders",
@@ -1950,12 +1898,15 @@ async fn an_aggregate_over_a_refused_column_is_refused() {
     let storage = refused_column_table_storage().await;
 
     let error = delta_pushdown(
-        &refused_column_table_request(serde_json::json!([{
-            "type": "function_aggregate",
-            "name": "MAX",
-            "arguments": [column_item("VARIANT_COL")],
-            "distinct": false,
-        }])),
+        &refused_column_request(refused_column_table().item(
+            serde_json::json!({
+                "type": "function_aggregate",
+                "name": "MAX",
+                "arguments": [column_item("VARIANT_COL")],
+                "distinct": false,
+            }),
+            ExasolType::WIDEST_VARCHAR,
+        )),
         &catalog.uri,
         storage,
         "cat.sch.orders",
@@ -1973,15 +1924,10 @@ async fn a_count_star_filtered_on_a_refused_column_is_refused() {
     let storage = refused_column_table_storage().await;
 
     let error = delta_pushdown(
-        &refused_column_table_request_with_filter(
-            serde_json::json!([
-                {"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false},
-            ]),
-            serde_json::json!({
+        &refused_column_request(refused_column_table().item(serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false}), ExasolType::decimal(18, 0)).filter(serde_json::json!({
                 "type": "predicate_is_not_null",
                 "expression": column_item("VARIANT_COL"),
-            }),
-        ),
+            }))),
         &catalog.uri,
         storage,
         "cat.sch.orders",
@@ -1995,13 +1941,15 @@ async fn a_count_star_filtered_on_a_refused_column_is_refused() {
 /// Scenario: Resolved partition columns reach the scan spec for every side
 #[test]
 fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
-    let request = guard_events_request(serde_json::json!({"type": "select"}));
+    let (request, _) = guard_events()
+        .field("type", serde_json::json!("select"))
+        .build();
     let pushdown_req = pd(&request);
     let (proj_cols, proj_types, widened) =
         project_first_table(&request, &pushdown_req).expect("the EVENTS fixture must project");
     let result = build_dispatch_sql(
         &request,
-        &pushdown_req,
+        &parsed_pushdown(&request),
         projected_columns(&proj_cols, &proj_types),
         widened,
         &column_types(&guard_col_types()),
@@ -2097,35 +2045,31 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
     );
 }
 
-fn char_cast_key(size: u64, character_set: &str) -> Json {
-    serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": {"type": "CHAR", "size": size, "characterSet": character_set},
-        "arguments": [col("NAME")]
-    })
-}
-
-fn char_grouped_request(key: Json, key_type: Json, order_by: Option<Json>) -> Json {
-    let mut body = serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [key.clone()],
-        "selectList": [key, agg_item("COUNT", None, false)],
-        "selectListDataTypes": [key_type, {"type": "decimal", "precision": 18, "scale": 0}],
-    });
-    if let Some(elements) = order_by {
-        body["orderBy"] = elements;
+/// A bare column `key` is declared in `key_type` by the table itself, as Exasol declares it.
+fn char_grouped_request(key: Json, key_type: ExasolType, order_by: Option<Json>) -> Json {
+    let key_column = key["type"] == "column";
+    let columns: Vec<(String, ExasolType)> = guard_col_types()
+        .into_iter()
+        .map(|(name, exa_type)| {
+            let is_key = key_column && key["name"] == name.as_str();
+            (name, if is_key { key_type } else { exa_type })
+        })
+        .collect();
+    let request = pushdown_request("EVENTS", &columns).group_by(vec![key.clone()]);
+    let mut request = if key_column {
+        request.column(key)
+    } else {
+        request.item(key, key_type)
     }
-    guard_events_request(body)
+    .count_star();
+    if let Some(elements) = order_by {
+        request = request.order_by(elements);
+    }
+    request.build().0
 }
 
 fn unprojected_char_grouped_request(key: Json) -> Json {
-    guard_events_request(serde_json::json!({
-        "aggregationType": "group_by",
-        "groupBy": [key],
-        "selectList": [agg_item("COUNT", None, false)],
-        "selectListDataTypes": [{"type": "decimal", "precision": 18, "scale": 0}],
-    }))
+    guard_events().group_by(vec![key]).count_star().build().0
 }
 
 /// JSON-encoded into the spec blob, then wrapped in a SQL string literal.
@@ -2140,8 +2084,8 @@ fn embedded_group_keys(fragments: &[String]) -> String {
 #[test]
 fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
     let request = char_grouped_request(
-        char_cast_key(20, "UTF8"),
-        serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"}),
+        cast_to(ExasolType::char(20), col("NAME")),
+        ExasolType::char(20),
         None,
     );
 
@@ -2171,7 +2115,7 @@ fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
 
 #[test]
 fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
-    let request = unprojected_char_grouped_request(char_cast_key(20, "UTF8"));
+    let request = unprojected_char_grouped_request(cast_to(ExasolType::char(20), col("NAME")));
 
     let sql = guard_dispatch_sql(
         &request,
@@ -2195,12 +2139,7 @@ fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
 
 #[test]
 fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
-    let request = unprojected_char_grouped_request(serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": {"type": "VARCHAR", "size": 10},
-        "arguments": [col("NAME")]
-    }));
+    let request = unprojected_char_grouped_request(cast_to(ExasolType::varchar(10), col("NAME")));
 
     let sql = guard_dispatch_sql(
         &request,
@@ -2226,8 +2165,17 @@ fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
 #[test]
 fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
     let request = char_grouped_request(
-        char_cast_key(3, "ASCII"),
-        serde_json::json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"}),
+        cast_to(
+            ExasolType::Char {
+                size: 3,
+                ascii: true,
+            },
+            col("NAME"),
+        ),
+        ExasolType::Char {
+            size: 3,
+            ascii: true,
+        },
         None,
     );
 
@@ -2257,11 +2205,7 @@ fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
 
 #[test]
 fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
-    let request = char_grouped_request(
-        col("REGION"),
-        serde_json::json!({"type": "varchar", "size": 10}),
-        None,
-    );
+    let request = char_grouped_request(col("REGION"), ExasolType::varchar(10), None);
 
     let sql = guard_dispatch_sql(
         &request,
@@ -2286,7 +2230,7 @@ fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
 fn order_by_on_a_char_declared_group_key_still_resolves_to_its_output_ordinal() {
     let request = char_grouped_request(
         col("NAME"),
-        serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"}),
+        ExasolType::char(20),
         Some(serde_json::json!([{
             "type": "order_by_element",
             "expression": col("NAME"),
@@ -2355,23 +2299,24 @@ fn with_letter_partitioned_notes(request: Json) -> Json {
 }
 
 fn letter_partitioned_request(letter: &str) -> Json {
-    with_letter_partitioned_notes(serde_json::json!({
-        "involvedTables": [{
-            "name": "PRUNED_TO_EMPTY",
-            "columns": [
-                {"name": "LETTER", "dataType": {"type": "varchar", "size": 2000000}},
-                {"name": "NUMBER", "dataType": {"type": "decimal", "precision": 10, "scale": 0}},
+    with_letter_partitioned_notes(
+        pushdown_request(
+            "PRUNED_TO_EMPTY",
+            &[
+                ("LETTER", ExasolType::WIDEST_VARCHAR),
+                ("NUMBER", ExasolType::decimal(10, 0)),
             ],
-        }],
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [
-                table_col("PRUNED_TO_EMPTY", "LETTER"),
-                table_col("PRUNED_TO_EMPTY", "NUMBER"),
-            ],
-            "filter": predicate_equal(table_col("PRUNED_TO_EMPTY", "LETTER"), str_lit(letter)),
-        },
-    }))
+        )
+        .field("type", serde_json::json!("select"))
+        .filter(predicate_equal(
+            table_col("PRUNED_TO_EMPTY", "LETTER"),
+            str_lit(letter),
+        ))
+        .column(table_col("PRUNED_TO_EMPTY", "LETTER"))
+        .column(table_col("PRUNED_TO_EMPTY", "NUMBER"))
+        .build()
+        .0,
+    )
 }
 
 /// Scenario: Equality on a partition column prunes every file in a non-matching partition
@@ -2434,22 +2379,20 @@ async fn a_delta_request_pruned_to_no_file_takes_the_empty_result_route() {
 }
 
 fn letter_partitioned_select_request() -> Json {
-    with_letter_partitioned_notes(serde_json::json!({
-        "involvedTables": [{
-            "name": "PRUNED_TO_EMPTY",
-            "columns": [
-                {"name": "LETTER", "dataType": {"type": "varchar", "size": 2000000}},
-                {"name": "NUMBER", "dataType": {"type": "decimal", "precision": 10, "scale": 0}},
+    with_letter_partitioned_notes(
+        pushdown_request(
+            "PRUNED_TO_EMPTY",
+            &[
+                ("LETTER", ExasolType::WIDEST_VARCHAR),
+                ("NUMBER", ExasolType::decimal(10, 0)),
             ],
-        }],
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [
-                table_col("PRUNED_TO_EMPTY", "LETTER"),
-                table_col("PRUNED_TO_EMPTY", "NUMBER"),
-            ],
-        },
-    }))
+        )
+        .field("type", serde_json::json!("select"))
+        .column(table_col("PRUNED_TO_EMPTY", "LETTER"))
+        .column(table_col("PRUNED_TO_EMPTY", "NUMBER"))
+        .build()
+        .0,
+    )
 }
 
 /// Scenario: The Delta reader is reached from production pushdown under the Unity Catalog kind
@@ -2552,11 +2495,11 @@ fn sentinel_effective_backend(creds: &ConnectionCreds) -> StorageBackend {
 }
 
 fn dispatch_result_for_body(
-    pushdown_req_body: Json,
+    request: PushdownRequestBuilder,
     logical_schema: Vec<LogicalField>,
     scan_storage: &ScanStorage,
 ) -> Result<String, UdfError> {
-    let request = guard_events_request(pushdown_req_body);
+    let (request, _) = request.build();
     let pushdown_req = pd(&request);
     let col_types = guard_col_types();
     let (proj_cols, proj_types, projection_widened) =
@@ -2567,7 +2510,7 @@ fn dispatch_result_for_body(
     );
     let result = build_dispatch_sql(
         &request,
-        &pushdown_req,
+        &parsed_pushdown(&request),
         projected_columns(&proj_cols, &proj_types),
         projection_widened,
         &column_types(&col_types),
@@ -2597,17 +2540,8 @@ fn dispatch_result_for_body(
         .to_string())
 }
 
-fn row_scan_body() -> Json {
-    serde_json::json!({
-        "selectList": [
-            col("REGION"),
-            col("AMOUNT"),
-        ],
-        "selectListDataTypes": [
-            {"type": "varchar", "size": 2000000},
-            {"type": "decimal", "precision": 18, "scale": 2},
-        ],
-    })
+fn row_scan_body() -> PushdownRequestBuilder {
+    guard_events().column(col("REGION")).column(col("AMOUNT"))
 }
 
 #[test]

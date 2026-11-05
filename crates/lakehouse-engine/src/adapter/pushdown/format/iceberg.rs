@@ -779,7 +779,7 @@ fn encode_initial_default(field: &iceberg::spec::NestedField) -> Option<String> 
             PrimitiveLiteral::Long(v),
         ) => v.to_string(),
         (PrimitiveType::Decimal { precision, scale }, PrimitiveLiteral::Int128(v))
-            if crate::types::mapping::exasol_representable_catalog_decimal(*precision, *scale) =>
+            if crate::types::mapping::iceberg_decimal(*precision, *scale).is_some() =>
         {
             v.to_string()
         }

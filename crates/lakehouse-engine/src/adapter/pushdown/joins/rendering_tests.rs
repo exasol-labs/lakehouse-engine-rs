@@ -59,7 +59,7 @@ fn join_condition_renders_via_translator() {
     let request = join_request(Json::Null, equi_condition());
     let detected = detected_join(&request);
     let rendered = render_broadcast_join(
-        &pd(&request),
+        &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
     )
@@ -86,7 +86,7 @@ fn join_where_filter_spanning_both_sides_renders() {
 
     let detected = detected_join(&request);
     let rendered = render_broadcast_join(
-        &pd(&request),
+        &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
     )
@@ -132,14 +132,13 @@ fn join_projection_emits_attribute_each_side_owning_type() {
 #[test]
 fn join_projection_resolves_cast_node_to_expr_not_full_row_fallback() {
     let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["selectList"] = serde_json::json!([
-        {
-            "type": "function_scalar_cast",
-            "name": "CAST",
-            "dataType": {"type": "varchar", "size": 2000000},
-            "arguments": [table_col("CUSTOMER", "C_NAME")]
-        }
-    ]);
+    request = selecting(
+        request,
+        &[(
+            cast_to(ExasolType::WIDEST_VARCHAR, table_col("CUSTOMER", "C_NAME")),
+            ExasolType::WIDEST_VARCHAR,
+        )],
+    );
 
     let (projection, _types, _widened) = broadcast_projection(&request);
 
@@ -161,13 +160,17 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
     let request = join_request(Json::Null, equi_condition());
 
     let mut coerce_request = request.clone();
-    coerce_request["pushdownRequest"]["selectList"] = serde_json::json!([
-        {
-            "type": "function_scalar",
-            "name": "UPPER",
-            "arguments": [table_col("CUSTOMER", "C_CUSTKEY")]
-        }
-    ]);
+    coerce_request = selecting(
+        coerce_request,
+        &[(
+            serde_json::json!({
+                "type": "function_scalar",
+                "name": "UPPER",
+                "arguments": [table_col("CUSTOMER", "C_CUSTKEY")]
+            }),
+            ExasolType::WIDEST_VARCHAR,
+        )],
+    );
     let (projection, _types, _widened) = broadcast_projection(&coerce_request);
     assert_eq!(
         projection.len(),
@@ -187,20 +190,30 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
     );
 
     let mut decline_request = request.clone();
-    decline_request["pushdownRequest"]["selectList"] = serde_json::json!([
-        {
-            "type": "function_scalar",
-            "name": "INSTR",
-            "arguments": [
-                table_col("CUSTOMER", "C_NAME"),
-                str_lit("b"),
-                num_lit(3)
-            ]
-        }
-    ]);
+    decline_request = selecting(
+        decline_request,
+        &[(
+            serde_json::json!({
+                "type": "function_scalar",
+                "name": "INSTR",
+                "arguments": [
+                    table_col("CUSTOMER", "C_NAME"),
+                    str_lit("b"),
+                    num_lit(3)
+                ]
+            }),
+            ExasolType::decimal(18, 0),
+        )],
+    );
     let (projection, _types, _widened) = broadcast_projection(&decline_request);
-    let expected_full_row_len = involved_table(&decline_request, "CUSTOMER").types.len()
-        + involved_table(&decline_request, "ORDERS").types.len();
+    let expected_full_row_len = involved_table(&decline_request, "CUSTOMER")
+        .unwrap()
+        .types
+        .len()
+        + involved_table(&decline_request, "ORDERS")
+            .unwrap()
+            .types
+            .len();
     assert_eq!(
         projection.len(),
         expected_full_row_len,
@@ -214,13 +227,17 @@ fn join_projection_like_guard_reaches_join_select_list() {
     let request = join_request(Json::Null, equi_condition());
 
     let mut string_request = request.clone();
-    string_request["pushdownRequest"]["selectList"] = serde_json::json!([
-        {
-            "type": "predicate_like",
-            "expression": table_col("CUSTOMER", "C_NAME"),
-            "pattern": str_lit("A%")
-        }
-    ]);
+    string_request = selecting(
+        string_request,
+        &[(
+            serde_json::json!({
+                "type": "predicate_like",
+                "expression": table_col("CUSTOMER", "C_NAME"),
+                "pattern": str_lit("A%")
+            }),
+            ExasolType::Boolean,
+        )],
+    );
     let (projection, _types, widened) = broadcast_projection(&string_request);
     assert!(
         !widened,
@@ -242,13 +259,17 @@ fn join_projection_like_guard_reaches_join_select_list() {
     );
 
     let mut decline_request = request.clone();
-    decline_request["pushdownRequest"]["selectList"] = serde_json::json!([
-        {
-            "type": "predicate_like",
-            "expression": table_col("CUSTOMER", "C_CUSTKEY"),
-            "pattern": str_lit("1%")
-        }
-    ]);
+    decline_request = selecting(
+        decline_request,
+        &[(
+            serde_json::json!({
+                "type": "predicate_like",
+                "expression": table_col("CUSTOMER", "C_CUSTKEY"),
+                "pattern": str_lit("1%")
+            }),
+            ExasolType::Boolean,
+        )],
+    );
     let (projection, _types, widened) = broadcast_projection(&decline_request);
     assert!(
         widened,
@@ -256,8 +277,14 @@ fn join_projection_like_guard_reaches_join_select_list() {
          fallback; a DECIMAL-subject LIKE must set it: \
          {projection:?}"
     );
-    let expected_full_row_len = involved_table(&decline_request, "CUSTOMER").types.len()
-        + involved_table(&decline_request, "ORDERS").types.len();
+    let expected_full_row_len = involved_table(&decline_request, "CUSTOMER")
+        .unwrap()
+        .types
+        .len()
+        + involved_table(&decline_request, "ORDERS")
+            .unwrap()
+            .types
+            .len();
     assert_eq!(
         projection.len(),
         expected_full_row_len,
@@ -549,11 +576,15 @@ fn join_side_pruning_input_unchanged_when_df_render_declines() {
 }
 
 fn customer_col_types() -> Vec<(String, ExasolType)> {
-    involved_table(&join_request(Json::Null, equi_condition()), "CUSTOMER").types
+    involved_table(&join_request(Json::Null, equi_condition()), "CUSTOMER")
+        .unwrap()
+        .types
 }
 
 fn orders_col_types() -> Vec<(String, ExasolType)> {
-    involved_table(&join_request(Json::Null, equi_condition()), "ORDERS").types
+    involved_table(&join_request(Json::Null, equi_condition()), "ORDERS")
+        .unwrap()
+        .types
 }
 
 fn like_over(column: &str, table: &str, pattern: &str) -> Json {
@@ -738,7 +769,7 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
 
     let (date_leg, date_declined) = type_screened_leg_filter(
         &filter,
-        &column_types(&involved_table(&request, "DATED").types),
+        &column_types(&involved_table(&request, "DATED").unwrap().types),
     );
     let date_sql = render_df_filter_safe(
         &date_leg.expect("the DATE side accepts the LIKE through the CAST rewrite"),
@@ -755,7 +786,7 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
 
     let (numeric_leg, numeric_declined) = type_screened_leg_filter(
         &filter,
-        &column_types(&involved_table(&request, "NUMBERED").types),
+        &column_types(&involved_table(&request, "NUMBERED").unwrap().types),
     );
     assert!(
         numeric_leg.is_none(),
@@ -771,10 +802,13 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
 
 #[test]
 fn referenced_leg_columns_narrows_to_used_columns() {
-    let pushdown_req = serde_json::json!({
-        "selectList": [table_col("CUSTOMER", "C_NAME")],
-        "filter": predicate_equal(table_col("CUSTOMER", "C_ADDRESS"), str_lit("z")),
-    });
+    let pushdown_req = pushdown_request("CUSTOMER", &[("C_NAME", ExasolType::WIDEST_VARCHAR)])
+        .filter(predicate_equal(
+            table_col("CUSTOMER", "C_ADDRESS"),
+            str_lit("z"),
+        ))
+        .column(table_col("CUSTOMER", "C_NAME"))
+        .build_pushdown();
     let condition = predicate_equal(
         table_col("CUSTOMER", "C_CUSTKEY"),
         table_col("ORDERS", "O_CUSTKEY"),
@@ -786,7 +820,7 @@ fn referenced_leg_columns_narrows_to_used_columns() {
         ("C_PHONE".to_string(), ExasolType::varchar(20)),
     ];
     let narrowed = referenced_leg_columns(
-        &pushdown_req,
+        pushdown_req.json(),
         &condition,
         &customer_orders_legs(),
         0,
@@ -836,16 +870,16 @@ fn referenced_leg_columns_keeps_all_when_select_list_absent() {
 
 #[test]
 fn referenced_leg_columns_keeps_all_when_narrowing_empty() {
-    let pushdown_req = serde_json::json!({
-        "selectList": [table_col("CUSTOMER", "C_NAME")],
-    });
+    let pushdown_req = pushdown_request("CUSTOMER", &[("C_NAME", ExasolType::WIDEST_VARCHAR)])
+        .column(table_col("CUSTOMER", "C_NAME"))
+        .build_pushdown();
     let condition = equi_condition();
     let full = vec![
         ("L_ORDERKEY".to_string(), ExasolType::decimal(20, 0)),
         ("L_QUANTITY".to_string(), ExasolType::decimal(18, 2)),
     ];
     let narrowed = referenced_leg_columns(
-        &pushdown_req,
+        pushdown_req.json(),
         &condition,
         &legs_of(&["CUSTOMER", "ORDERS", "LINEITEM"]),
         2,
@@ -1017,7 +1051,7 @@ fn render_broadcast_join_replaces_native_table_alias_in_filter_with_leg_alias() 
     });
     let detected = detected_join(&request);
     let rendered = render_broadcast_join(
-        &pd(&request),
+        &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
     )
@@ -1043,7 +1077,7 @@ fn render_broadcast_join_replaces_native_table_alias_in_condition_with_leg_alias
     let request = join_request(Json::Null, condition);
     let detected = detected_join(&request);
     let rendered = render_broadcast_join(
-        &pd(&request),
+        &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
     )
@@ -1058,15 +1092,19 @@ fn render_broadcast_join_replaces_native_table_alias_in_condition_with_leg_alias
 #[test]
 fn render_broadcast_join_replaces_native_table_alias_in_projection_with_leg_alias() {
     let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["selectList"] = serde_json::json!([
-        {"type": "function_scalar", "name": "MULT", "arguments": [
-            aliased_col("ORDERS", "O", "O_CUSTKEY"),
-            num_lit(2)
-        ]}
-    ]);
+    request = selecting(
+        request,
+        &[(
+            serde_json::json!({"type": "function_scalar", "name": "MULT", "arguments": [
+                aliased_col("ORDERS", "O", "O_CUSTKEY"),
+                num_lit(2)
+            ]}),
+            ExasolType::WIDEST_VARCHAR,
+        )],
+    );
     let detected = detected_join(&request);
     let rendered = render_broadcast_join(
-        &pd(&request),
+        &parsed_pushdown(&request),
         &detected,
         &request_sides(&request, &detected),
     )
@@ -1084,31 +1122,34 @@ fn render_broadcast_join_replaces_native_table_alias_in_projection_with_leg_alia
 #[test]
 fn unified_join_prunes_and_narrows_each_leg() {
     let request = with_identifier_notes(
-        serde_json::json!({
-            "involvedTables": [
-                {"name": "CUSTOMER", "columns": [
-                    {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                    {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
-                    {"name": "C_ADDRESS", "dataType": {"type": "varchar", "size": 100}}]},
-                {"name": "ORDERS", "columns": [
-                    {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                    {"name": "O_ORDERDATE", "dataType": {"type": "date"}},
-                    {"name": "O_TOTALPRICE", "dataType": {"type": "decimal", "precision": 20, "scale": 2}}]},
+        pushdown_request(
+            "CUSTOMER",
+            &[
+                ("C_CUSTKEY", ExasolType::decimal(20, 0)),
+                ("C_NAME", ExasolType::varchar(100)),
+                ("C_ADDRESS", ExasolType::varchar(100)),
             ],
-            "pushdownRequest": {
-                "type": "select",
-                "from": customer_orders_join(),
-                "selectList": [
-                    table_col("CUSTOMER", "C_NAME"),
-                    table_col("ORDERS", "O_ORDERDATE")],
-                "filter": {"type": "predicate_and", "expressions": [
+        )
+        .table(
+            "ORDERS",
+            &[
+                ("O_CUSTKEY", ExasolType::decimal(20, 0)),
+                ("O_ORDERDATE", ExasolType::Date),
+                ("O_TOTALPRICE", ExasolType::decimal(20, 2)),
+            ],
+        )
+        .field("type", serde_json::json!("select"))
+        .field("from", customer_orders_join())
+        .filter(serde_json::json!({"type": "predicate_and", "expressions": [
                     predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
                     {"type": "predicate_greater",
                      "left": table_col("ORDERS", "O_ORDERDATE"),
-                     "right": str_lit("1995-01-01")}]},
-            },
-            "schemaMetadataInfo": {"properties": {}},
-        }),
+                     "right": str_lit("1995-01-01")}]}))
+        .column(table_col("CUSTOMER", "C_NAME"))
+        .column(table_col("ORDERS", "O_ORDERDATE"))
+        .request_field("schemaMetadataInfo", serde_json::json!({"properties": {}}))
+        .build()
+        .0,
         &[("CUSTOMER", "lh.customer"), ("ORDERS", "lh.orders")],
     );
 
@@ -1118,7 +1159,7 @@ fn unified_join_prunes_and_narrows_each_leg() {
         resolved_side("ORDERS", vec![("s3://w/o.parquet", 100)]),
     ];
     let sql = build_n_scan_join_sql(
-        &pd(&request),
+        &parsed_pushdown(&request),
         &detected,
         &request_typed(&request, &sides),
         &two_scan_tuning(),
@@ -1165,10 +1206,12 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
     request["pushdownRequest"]["filter"] = filter.clone();
     let detected = detected_join(&request);
     let mut sides = request_sides(&request, &detected);
-    sides[0].column_types =
-        declared_column_types(&involved_table(&request, "CUSTOMER").types, &c_name);
+    sides[0].column_types = declared_column_types(
+        &involved_table(&request, "CUSTOMER").unwrap().types,
+        &c_name,
+    );
 
-    let rendered = render_broadcast_join(&pd(&request), &detected, &sides)
+    let rendered = render_broadcast_join(&parsed_pushdown(&request), &detected, &sides)
         .expect("renderable join")
         .expect("must render");
     assert_eq!(

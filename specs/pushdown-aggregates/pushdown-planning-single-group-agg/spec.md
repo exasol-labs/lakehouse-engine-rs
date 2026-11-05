@@ -96,3 +96,12 @@ The adapter advertises the supported aggregate capabilities, translates an ungro
 * *AND* the adapter SHALL otherwise route the request to the qualified single-table wrapper, which renders the HAVING itself
 * *AND* a request carrying a `COUNT(DISTINCT ...)` and a HAVING SHALL route to the qualified single-table wrapper
 * *AND* the result SHALL equal native Exasol: no row when the HAVING is false over the merged values
+
+### Scenario: The merge casts a merged value only when merging can change its type
+
+* *GIVEN* a single-group or grouped aggregate `pushdown` request that the adapter serves with the partial/merge shape
+* *WHEN* the adapter builds the outer merge SELECT
+* *THEN* the adapter SHALL cast each merged `SUM`, `COUNT`, `AVG`, and statistic, and each scalar expression over merged aggregates, to the type `selectListDataTypes` declares at that item's ordinal, because the merge can return a type other than the declared one
+* *AND* the adapter SHALL leave a merged `MIN` or `MAX` uncast when its partial column is emitted in the declared type, for example `MIN("PARTIAL_min_3")` for a `MIN` over a TIMESTAMP column, because `MIN` and `MAX` return the type of their argument
+* *AND* the adapter SHALL cast a group key whose emitted type differs from its declared type, and SHALL leave it uncast when the two types are equal, for example a key declared `VARCHAR(2000000)`
+* *AND* the merged result SHALL equal the same select list evaluated over all rows on a single node, and the pushdown SQL SHALL pass Exasol's positional type check

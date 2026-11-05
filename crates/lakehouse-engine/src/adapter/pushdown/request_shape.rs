@@ -6,11 +6,9 @@
 //! to [`RequestShape::GroupByWrapper`], which renders both natively, rather than
 //! dropping them (#195) or erroring (#198).
 
-use serde_json::Value as Json;
-
 use super::grouped_agg::{GroupedOrderBy, build_grouped_order_by_clause, render_having_over_merge};
 use super::single_group_agg::{SingleGroupItem, has_distinct};
-use super::support::ColumnTypes;
+use super::support::{ColumnTypes, PushdownRequest};
 use super::{
     GroupedAggregateDetection, detect_aggregates, detect_group_by_aggregates, ordinary_plans,
     validate_agg_col_types,
@@ -38,8 +36,12 @@ pub(super) enum RequestShape {
     RowScan,
 }
 
-pub(super) fn classify_request_shape(pushdown_req: &Json, col_types: &ColumnTypes) -> RequestShape {
-    if let Some(detection) = detect_group_by_aggregates(pushdown_req) {
+pub(super) fn classify_request_shape(
+    pushdown: &PushdownRequest,
+    col_types: &ColumnTypes,
+) -> RequestShape {
+    let pushdown_req = pushdown.json();
+    if let Some(detection) = detect_group_by_aggregates(pushdown) {
         // A SUM over a non-numeric column would produce an opaque UDF error; demote.
         if validate_agg_col_types(&detection.plans, col_types) {
             // The merge wrapper only has `GK_*`/`PARTIAL_*` columns, so an aggregate absent
@@ -75,7 +77,7 @@ pub(super) fn classify_request_shape(pushdown_req: &Json, col_types: &ColumnType
     }
 
     // Validated against ordinary plans only: a distinct item is a row-scan fan-out.
-    let Some(items) = detect_aggregates(pushdown_req)
+    let Some(items) = detect_aggregates(pushdown)
         .filter(|it| validate_agg_col_types(&ordinary_plans(it), col_types))
     else {
         return if pushdown_req.get("aggregationType").and_then(|v| v.as_str())

@@ -12,8 +12,8 @@ use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionConfig;
 use lakehouse_engine::adapter::pushdown::{
-    AggregateMergeInputs, ColumnTypes, ProjectedColumn, build_scan_driving_sql, detect_aggregates,
-    ordinary_plans,
+    AggregateMergeInputs, ColumnTypes, ProjectedColumn, PushdownRequest, build_scan_driving_sql,
+    detect_aggregates, ordinary_plans,
 };
 use lakehouse_engine::scan::spec::{
     AggKind, ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, ProjectionItem,
@@ -350,10 +350,13 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
                     {"type": "column", "name": "L_DISCOUNT"},
                 ],
             }],
-        }]
+        }],
+        "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 4}],
     });
 
-    let items = detect_aggregates(&req)
+    let pushdown =
+        PushdownRequest::parse(req).expect("the request declares a valid selectListDataTypes");
+    let items = detect_aggregates(&pushdown)
         .expect("SUM(col * col) must decompose to an aggregate plan, not a row scan");
     let plans = ordinary_plans(&items);
     assert_eq!(plans.len(), 1);

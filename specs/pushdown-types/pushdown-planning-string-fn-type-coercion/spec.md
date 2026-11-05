@@ -44,7 +44,7 @@ The adapter type-checks the string-position arguments of every pushed-down Exaso
 * *GIVEN* a `pushdown` request whose select list or filter carries a governed string `function_scalar` whose string-position argument is a bare `column` node, for example `LOWER(l_shipdate)`
 * *AND* the column's Exasol type in `involvedTables[0].columns` is `DATE`
 * *WHEN* the adapter builds the scan spec
-* *THEN* the guard SHALL replace that argument with a `function_scalar_cast` node carrying `dataType` `{"type":"VARCHAR"}`, rendering `CAST(<col> AS VARCHAR)`, exactly the shape `guard_like_subject` already emits for a DATE LIKE subject
+* *THEN* the scan spec SHALL render that argument as `CAST(<col> AS VARCHAR)`, the form a DATE LIKE subject takes (`pushdown-types/pushdown-planning-like-type-coercion`)
 * *AND* the emitted match semantics SHALL equal Exasol's implicit DATE-to-VARCHAR conversion under the default `NLS_DATE_FORMAT` of `YYYY-MM-DD`, which is the ISO-8601 text form both engines render for the Iceberg `date` primitive
 * *AND* under a session that has altered `NLS_DATE_FORMAT` away from that default the pushed-down result MAY diverge from native Exasol evaluation, because DataFusion's `CAST(Date32 AS VARCHAR)` is unconditionally ISO `YYYY-MM-DD` and the pushdown request carries no session NLS format, an accepted tracked exception, not a silent gap
 
