@@ -1434,11 +1434,13 @@ fn role_create_request() -> Json {
     })
 }
 
-fn role_join_pushdown_request() -> Json {
+/// `virtual_schema` keys the process-wide statement state, so each test names its own.
+fn role_join_pushdown_request(virtual_schema: &str) -> Json {
     with_identifier_notes(
         serde_json::json!({
         "type": "pushdown",
-        "properties": { "CATALOG_CONNECTION": "MY_CONN", "ALLOW_HTTP": "true" },
+        "schemaMetadataInfo": { "name": virtual_schema },
+        "properties":{ "CATALOG_CONNECTION": "MY_CONN", "ALLOW_HTTP": "true" },
         "involvedTables": [
             {"name": "CUSTOMER", "columns": [
                 {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0},
@@ -1516,7 +1518,7 @@ fn a_role_connection_signs_every_catalog_request_with_the_session() {
     let join = StsAndCatalog::start((200, ASSUME_ROLE_RESPONSE), (503, "{}"));
     let err = dispatch(
         &mut sigv4_role_connection(&join),
-        &role_join_pushdown_request(),
+        &role_join_pushdown_request("ROLE_SESSION_SIGNING_VS"),
     )
     .expect_err("an unavailable catalog fails the join pushdown");
     assert_signed_by_the_session(&join.catalog_requests());
@@ -1533,7 +1535,7 @@ fn a_connection_without_a_role_sends_no_sts_request() {
     let join_stub = StsAndCatalog::start((200, ASSUME_ROLE_RESPONSE), (503, "{}"));
     dispatch(
         &mut sigv4_connection(&join_stub),
-        &role_join_pushdown_request(),
+        &role_join_pushdown_request("NO_ROLE_SIGNING_VS"),
     )
     .expect_err("an unavailable catalog fails the join pushdown");
     assert_signed_by_the_stated_key_pair(&join_stub);
@@ -1542,7 +1544,10 @@ fn a_connection_without_a_role_sends_no_sts_request() {
 /// Scenario: A failed AssumeRole is a credential-safe error
 #[test]
 fn an_sts_denial_fails_the_request_before_any_catalog_request() {
-    for request in [role_create_request(), role_join_pushdown_request()] {
+    for request in [
+        role_create_request(),
+        role_join_pushdown_request("STS_DENIAL_VS"),
+    ] {
         let stub = StsAndCatalog::start((403, ACCESS_DENIED_RESPONSE), (200, EMPTY_LISTING));
         let err = dispatch(&mut sigv4_role_connection(&stub), &request)
             .expect_err("an STS denial must fail the request");
