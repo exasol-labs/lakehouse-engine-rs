@@ -1068,7 +1068,7 @@ test_saas_verify_listed_quoted_match() {
 
 test_four_scripts_ddl_saas_path_types() {
   echo "== test_four_scripts_ddl_saas_path_types =="
-  local scan dist adapter version schema
+  local scan dist adapter version export_ddl schema
   scan="$( source "$INSTALLER"; ddl_scan LHVS /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so )"
   assert_contains "scan is RUST SCALAR" "$scan" "RUST SCALAR SCRIPT"
   assert_contains "scan uses dynamic EMITS" "$scan" "EMITS (...)"
@@ -1082,6 +1082,11 @@ test_four_scripts_ddl_saas_path_types() {
   assert_contains "version RETURNS VARCHAR(100)" "$version" "RETURNS VARCHAR(100)"
   assert_not_contains "version is never EMITS" "$version" "EMITS"
   assert_contains "version references the same %udf_object path" "$version" "/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so"
+  export_ddl="$( source "$INSTALLER"; ddl_export LHVS /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so )"
+  assert_contains "export is RUST SET with dynamic input" "$export_ddl" "RUST SET SCRIPT LHVS.LAKEHOUSE_EXPORT(...)"
+  assert_contains "export RETURNS DECIMAL(18,0)" "$export_ddl" "RETURNS DECIMAL(18,0)"
+  assert_not_contains "export is never EMITS" "$export_ddl" "EMITS"
+  assert_contains "export references the same %udf_object path" "$export_ddl" "/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so"
 
   reset_env
   run_file "${HAPPY_ARGS[@]}"
@@ -1093,6 +1098,7 @@ test_four_scripts_ddl_saas_path_types() {
   assert_contains "ddl: dynamic EMITS on scan" "$log" "EMITS (...)"
   assert_contains "ddl: LAKEHOUSE_VERSION RUST SCALAR" "$log" "RUST SCALAR SCRIPT LHVS.LAKEHOUSE_VERSION"
   assert_contains "ddl: LAKEHOUSE_VERSION RETURNS VARCHAR(100)" "$log" "RETURNS VARCHAR(100)"
+  assert_not_contains "ddl: LAKEHOUSE_EXPORT is opt-in, absent by default" "$log" "LAKEHOUSE_EXPORT"
   assert_contains "ddl: DISTRIBUTE_FILES LUA SET" "$log" "LUA SET SCRIPT LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
   assert_contains "ddl: uses CREATE OR REPLACE" "$log" "CREATE OR REPLACE"
   assert_not_contains "next-step template: no CONNECTION grant for LAKEHOUSE_VERSION" "$LAST_OUT" "FOR SCRIPT LHVS.LAKEHOUSE_VERSION"
@@ -1193,6 +1199,9 @@ test_docs_describe_version_verification() {
   assert_contains "docs: by-hand appendix carries the version script DDL" \
     "$doc" "CREATE OR REPLACE RUST SCALAR SCRIPT LHVS.LAKEHOUSE_VERSION()"
   assert_contains "docs: the version script DDL declares RETURNS VARCHAR(100)" "$doc" "RETURNS VARCHAR(100)"
+  assert_contains "docs: by-hand appendix carries the export script DDL" \
+    "$doc" "CREATE OR REPLACE RUST SET SCRIPT LHVS.LAKEHOUSE_EXPORT(...)"
+  assert_contains "docs: the export script DDL declares RETURNS DECIMAL(18,0)" "$doc" "RETURNS DECIMAL(18,0)"
   assert_contains "docs: the by-hand check is the version query" "$doc" "SELECT LHVS.LAKEHOUSE_VERSION();"
   assert_not_contains "docs: no placeholder scan call is presented as a check" "$doc" "LAKEHOUSE_SCAN('x', 'y')"
 
@@ -1232,6 +1241,37 @@ test_stops_at_product_prints_template() {
   local log; log="$(log_content)"
   assert_not_contains "template: does NOT execute CREATE VIRTUAL SCHEMA" "$log" "CREATE VIRTUAL SCHEMA"
   assert_not_contains "template: does NOT execute CREATE CONNECTION" "$log" "CREATE CONNECTION"
+}
+
+test_export_is_opt_in() {
+  echo "== test_export_is_opt_in =="
+  local user out log
+  reset_env
+  run_file "${HAPPY_ARGS[@]}"
+  assert_rc_zero "export default: install succeeds" "$LAST_RC"
+  assert_not_contains "export default: no export grants printed" "$LAST_OUT" "LAKEHOUSE_EXPORT"
+  assert_not_contains "export default: no export script created" "$(log_content)" "LAKEHOUSE_EXPORT"
+
+  for user in myuser SYS; do
+    reset_env
+    run_file --account-id ACC1 --database-id DB1 --host myhost:8563 --user "$user" --password SECRETPW456 --with-export
+    assert_rc_zero "export role ($user): install succeeds" "$LAST_RC"
+    out="$LAST_OUT"
+    log="$(log_content)"
+    assert_contains "export role ($user): creates the export script" "$log" "RUST SET SCRIPT LHVS.LAKEHOUSE_EXPORT(...)"
+    assert_contains "export role ($user): export script returns DECIMAL(18,0)" "$log" "RETURNS DECIMAL(18,0)"
+    assert_contains "export role ($user): creates the role" "$out" "CREATE ROLE LAKEHOUSE_EXPORT_ROLE_LHVS;"
+    assert_contains "export role ($user): grants EXPORT" "$out" "GRANT EXPORT TO LAKEHOUSE_EXPORT_ROLE_LHVS;"
+    assert_not_contains "export role ($user): no CONNECTION privilege" "$out" "GRANT CONNECTION"
+    assert_contains "export role ($user): grants EXECUTE on the export script" "$out" \
+      "GRANT EXECUTE ON SCRIPT LHVS.LAKEHOUSE_EXPORT TO LAKEHOUSE_EXPORT_ROLE_LHVS;"
+    assert_contains "export role ($user): grants script-scoped CONNECTION access" "$out" \
+      "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT LHVS.LAKEHOUSE_EXPORT TO LAKEHOUSE_EXPORT_ROLE_LHVS;"
+    assert_contains "export role ($user): tells the operator to grant the role to exporters" "$out" \
+      "-- Exporters: GRANT LAKEHOUSE_EXPORT_ROLE_LHVS TO <user>;"
+    assert_not_contains "export role ($user): installer runs no CREATE ROLE" "$log" "CREATE ROLE"
+    assert_not_contains "export role ($user): installer runs no GRANT" "$log" "GRANT "
+  done
 }
 
 test_target_base_default_and_override() {
@@ -2495,6 +2535,7 @@ main() {
   test_version_smoke_query_and_extraction
   test_docs_describe_version_verification
   test_stops_at_product_prints_template
+  test_export_is_opt_in
   test_target_base_default_and_override
   test_external_failure_actionable
   test_stdin_piped_invocation_no_body_consumption

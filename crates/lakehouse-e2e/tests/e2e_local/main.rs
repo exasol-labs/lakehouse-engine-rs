@@ -11,6 +11,7 @@ mod count_distinct;
 mod credential_exposure;
 mod direct_storage;
 mod emit_declaration;
+mod export;
 mod harness_row_cap;
 mod identity_partition;
 mod int96_timestamp;

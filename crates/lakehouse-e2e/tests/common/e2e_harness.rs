@@ -3,6 +3,7 @@
 
 use super::exasol_ws::ExaConn;
 pub use super::exasol_ws::error_text;
+pub use super::exasol_ws::parse_int;
 use super::seed::{
     DECIMAL_18_0_VALUES_TEXT, E2E_DIM_TABLE, E2E_FACT_TABLE, FIXED_16_VALUES_TEXT,
     build_seed_catalog,
@@ -31,6 +32,7 @@ pub const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
 pub const DISTRIBUTOR_SCRIPT_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
 
 pub const VERSION_SCRIPT_NAME: &str = "LAKEHOUSE_VERSION";
+pub const EXPORT_SCRIPT_NAME: &str = "LAKEHOUSE_EXPORT";
 pub const SO_BUCKETFS_PUT_PATH: &str = "/default/udf/liblakehouse_engine.so";
 /// No leading `/`, as `%udf_object` requires.
 pub const SO_UDF_OBJECT_PATH: &str = "buckets/bfsdefault/default/udf/liblakehouse_engine.so";
@@ -193,6 +195,12 @@ EMITS (...) AS
     conn.execute(&format!(
         r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {schema}.{VERSION_SCRIPT_NAME}()
 RETURNS VARCHAR(100) AS
+%udf_object {SO_UDF_OBJECT_PATH}
+/"#
+    ));
+    conn.execute(&format!(
+        r#"CREATE OR REPLACE {LANG_ALIAS} SET SCRIPT {schema}.{EXPORT_SCRIPT_NAME}(...)
+RETURNS DECIMAL(18,0) AS
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));
@@ -483,12 +491,6 @@ pub fn parse_numeric(v: &serde_json::Value) -> f64 {
     v.as_f64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         .unwrap_or_else(|| panic!("expected numeric value, got: {v:?}"))
-}
-
-pub fn parse_int(v: &serde_json::Value) -> i64 {
-    v.as_i64()
-        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        .unwrap_or_else(|| panic!("expected integer value, got: {v:?}"))
 }
 
 pub fn split_s3_bucket_and_key(uri: &str) -> (&str, &str) {

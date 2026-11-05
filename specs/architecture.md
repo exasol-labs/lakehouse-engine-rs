@@ -26,7 +26,7 @@
 
 ## Components
 
-- udf-entry-points (crates/lakehouse-engine/src/lib.rs): exports the three UDF entry points of the single `.so` (VS adapter, `LAKEHOUSE_SCAN`, `LAKEHOUSE_VERSION`) | owns: engine version string | depends on: vs-adapter, datafusion-scan
+- udf-entry-points (crates/lakehouse-engine/src/lib.rs): exports the four UDF entry points of the single `.so` (VS adapter, `LAKEHOUSE_SCAN`, `LAKEHOUSE_VERSION`, `LAKEHOUSE_EXPORT`) | owns: engine version string | depends on: vs-adapter, datafusion-scan, export
 - vs-adapter (crates/lakehouse-engine/src/adapter/): answers Exasol Virtual Schema requests, reads the CATALOG_CONNECTION, lists the catalog tables the table filter exposes into virtual tables with one identifier note per table and one source note per column, answers a `REFRESH TABLES` by listing catalog identifiers and loading only the requested tables the table filter exposes, and routes pushdown requests through each virtual schema's statement state | owns: schema-level adapterNotes and their format (SKIPPED_TABLES, tuning values), written and read in adapter/mod.rs; the statement state (§ Constraints); the engine-side scan load that each catalog kind's client implements | depends on: vs-properties, table-filter, lakehouse-catalog, pushdown-planner, table-identity, column-notes, type-mapping, sealed-storage
 - vs-properties (crates/lakehouse-engine/src/adapter/properties.rs): declares every virtual schema property name and the value rule of each tuning property, applies the table-filter value rule to `TABLE_INCLUDE` and `TABLE_EXCLUDE`, rejects unknown names and invalid values in one error for createVirtualSchema, refresh, and setProperties, and parses each tuning value into a fixed-width typed value and the two pattern lists into one table filter; it parses properties only, never adapterNotes | owns: VS property catalog (names and tuning value rules) | depends on: table-filter
 - table-filter (crates/lakehouse-engine/src/adapter/table_filter.rs): parses the `TABLE_INCLUDE` and `TABLE_EXCLUDE` glob pattern lists and decides whether a virtual table name is exposed, with exclude winning over include | owns: table pattern syntax and the exposure rule | depends on: none
@@ -39,6 +39,7 @@
 - sealed-storage (crates/lakehouse-engine/src/scan/sealed.rs): encrypts storage credentials into the scan spec with AES-GCM under a key derived by HKDF-SHA256 from the CONNECTION password, and decrypts them in the scan UDF | owns: sealed storage envelope format | depends on: none
 - datafusion-scan (crates/lakehouse-engine/src/scan/): runs one shard per invocation as a raw scan, a partial aggregate, or a broadcast join scan, applies Iceberg positional deletes and Iceberg and Delta deletion vectors, and emits results batch by batch | owns: per-invocation Tokio runtime, DataFusion session, memory pool | depends on: scan-spec, sealed-storage, scan-object-store, type-mapping, vs-expression
 - scan-object-store (crates/lakehouse-engine/src/scan/object_store.rs): builds S3 or ADLS Gen2 object stores with a connection budget and an admission limit, and routes the two join sides by path prefix | owns: per-invocation HTTP connection pool | depends on: lakehouse-catalog
+- export (crates/lakehouse-engine/src/export.rs): validates an `EXPORT ... INTO SCRIPT` statement, checks that the export script can read the CONNECTION, renders the writer SELECT that calls the same script with a row-number group key, and, as the writer, counts the rows each invocation receives | owns: export options, writer spec format | depends on: none
 - type-mapping (crates/lakehouse-engine/src/types/): defines the Exasol SQL type, renders it as SQL text and as VS `dataType` JSON, reads it from VS `dataType` JSON, maps Arrow, Iceberg, Delta, and Hive types to it, and applies type widening rules | owns: the Exasol SQL type and its SQL and `dataType` JSON renderings | depends on: none
 - lakehouse-catalog (crates/lakehouse-catalog/): implements `CatalogClient` for Iceberg REST, Unity Catalog, and AWS Glue (a full listing that drops the identifiers a caller-supplied predicate rejects before it loads any table, an identifier-only listing, and a load of listed tables that classifies each table as the full listing does) with OAuth2, bearer, and SigV4 auth, STS role assumption, vended-storage resolution, and credential redaction, and gives the Unity Catalog and Glue sessions a single-table load outside that trait; its neutral table carries the catalog's table properties verbatim and its neutral column an opaque engine-encoded declaration slot, and it interprets neither | owns: catalog sessions, whose lifetime the adapter decides | depends on: none
 - vs-expression (crates/vs-expression/): translates VS expression JSON into DataFusion SQL and Exasol SQL fragments, and parses and rewrites the `column` nodes of a pushdown request | owns: none | depends on: none
@@ -56,6 +57,9 @@
 - LAKEHOUSE_SCAN -> datafusion-scan -> scan-object-store -> object storage: Parquet byte ranges stream into one DataFusion plan per invocation
 - datafusion-scan -> Exasol: raw and join rows leave through the Arrow C Data Interface via `ctx.emit_batch`, partial aggregates leave as SDK `Value` rows via `ctx.emit`
 - Exasol -> result: the dispatch SQL wrapper merges partial aggregates and applies the final ORDER BY and LIMIT
+- user `EXPORT ... INTO SCRIPT LAKEHOUSE_EXPORT WITH CATALOG_CONNECTION = '<connection>' ...` -> Exasol -> export: one call with the export specification (options, source column names) before any source row is read; export answers one SELECT over `DUAL`, which Exasol binds to the export source
+- generated SELECT -> LAKEHOUSE_EXPORT as writer: the source rows are grouped by `MOD(ROWNUM, G)`; Exasol multiplexes the groups, one writer invocation each, onto each node's SET-script VM pool
+- LAKEHOUSE_EXPORT writer -> Exasol: one row count per writer; Exasol reports their sum as the EXPORT statement's row count
 
 ## Interfaces
 
@@ -68,6 +72,7 @@
 - `LAKEHOUSE_SCAN(common VARCHAR, files VARCHAR)`: scalar UDF that handles one shard row, reads the JSON scan spec halves, and emits the columns that the dispatch SQL declares
 - `LAKEHOUSE_DISTRIBUTE_FILES(files VARCHAR(2000000))`: Lua SET script that emits its input rows unchanged
 - `LAKEHOUSE_VERSION()`: returns the `lakehouse-engine` crate version string
+- `LAKEHOUSE_EXPORT(...)`: SET script with two roles. Exasol calls its export hook for `EXPORT ... INTO SCRIPT <schema>.LAKEHOUSE_EXPORT WITH CATALOG_CONNECTION = '<connection>' TABLE_NAME = '<namespace>.<table>' [WRITERS_PER_NODE = '<n>'] [SINGLE_COMMIT = 'true'|'false']`. The SELECT the hook returns calls it as the writer, `LAKEHOUSE_EXPORT(<writer spec>, <source columns>...)`, which returns its group's row count as `DECIMAL(18,0)`
 - install.sh CLI: `install.sh --account-id <id> --database-id <id> --profile <p>` for SaaS, or `--dsn`, `--host`, `--target`, `--deployment`, `--bfs-*`, `--schema`, `--lakehouse-version`, `--slc-version`, `--arch`, `--skip-slc`
 - Release asset: `lakehouse-engine.tar.gz` on GitHub releases, installed to BucketFS at `udf/liblakehouse_engine.so`
 - Makefile: `cross-udf-build`, `test`, `test-e2e`, `test-e2e-lakekeeper`, `test-e2e-azure`, `test-e2e-glue`, `test-e2e-unity`, `<stack>-start`, `<stack>-wait`, `<stack>-up`, and `<stack>-down` for the E2E stacks `e2e`, `lakekeeper`, `azure`, `unity`, and `glue`, `install-slc`, `bench`
@@ -92,10 +97,11 @@
 - The adapter loads each table's metadata once per statement and prunes the file list per table reference. The scan UDF never discovers files.
 - Each node scans only its assigned files, with no overlap between shards.
 - The shard count is G = node count × `PARALLELISM_FACTOR` (default 1), clamped to at least 1 and at most min(file count, 300).
+- The export writer count is G = node count × `WRITERS_PER_NODE` (default 1), clamped to at least 1 and at most 300, or 1 with `SINGLE_COMMIT = 'true'`. Each source row reaches exactly one writer, and a source with at least G rows runs exactly G writers.
 - The DataFusion memory pool is max((memory limit − 200 MB overhead) × 0.6, 256 MiB), or 1 GiB when the limit is unknown.
 - The scan spills to `/tmp` when `/tmp` is a writable non-tmpfs disk. Otherwise it returns a `ResourcesExhausted` error past the pool budget.
 - The scan streams one `RecordBatch` at a time and never collects the full result.
-- Errors never contain credentials. Storage credentials reach the scan UDF only as a CONNECTION name or a sealed envelope.
+- Errors never contain credentials. Storage credentials reach the scan UDF only as a CONNECTION name or a sealed envelope. The export script receives only the CONNECTION name and emits no script output.
 - STS AssumeRole and Glue operations time out after 30 seconds.
 - Every Iceberg REST, Lakekeeper, Unity Catalog, and OAuth2 token request goes through the one crate-private catalog HTTP client of `lakehouse-catalog`. It ends an attempt that stays silent for 10 seconds, retries only a transient failure, up to 5 attempts, and starts no retry that could wait for its answer past 30 seconds after the first attempt. It reads an answer body for as long as the body keeps arriving.
 - Every outbound HTTP client of the adapter and the scan UDF honors `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY` from the process environment, which a script's `%env` lines set. A client that ignores them is a defect.
