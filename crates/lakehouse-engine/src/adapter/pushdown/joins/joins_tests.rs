@@ -605,93 +605,40 @@ async fn each_delta_join_leg_prunes_by_its_own_side_local_predicate() {
     );
 }
 
-/// Holds every `loadTable` response until `parties` are in flight, making concurrent
-/// resolution observable without a timing margin.
-struct RendezvousCatalog {
-    uri: String,
-}
-
-impl RendezvousCatalog {
-    async fn spawn(parties: usize) -> Self {
-        let barrier = Arc::new(tokio::sync::Barrier::new(parties));
-        let (uri, _) = spawn_fake_http_server(move |head| {
-            let barrier = Arc::clone(&barrier);
-            let target = request_target(&head).to_string();
-            async move {
-                let body = if target.starts_with("/v1/config") {
-                    "{}".to_string()
-                } else {
-                    let table = target.rsplit('/').next().unwrap_or("t").to_string();
-                    barrier.wait().await;
-                    snapshotless_load_table_body(&format!("s3://bucket/{table}"))
-                };
-                (200, "application/json", body)
-            }
-            .boxed()
-        })
-        .await;
-
-        Self { uri }
-    }
-}
-
-/// Scenario: A request's table resolutions run concurrently rather than one after another
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn join_legs_resolve_concurrently_in_leg_index_order() {
-    let catalog = RendezvousCatalog::spawn(2).await;
-    let request = with_iceberg_notes(join_request(Json::Null, equi_condition()));
-
-    let planned = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        pushdown_over(
-            &request,
-            CatalogKind::IcebergRest,
-            &catalog.uri,
-            sample_storage(),
-            "lh.customer",
-            1024,
-        ),
-    )
-    .await
-    .expect(
-        "both legs must be resolving at once; a loop that awaits each leg before starting \
-         the next can never release the catalog's rendezvous",
-    )
-    .expect("two snapshotless Iceberg legs plan the shape-correct empty result");
-
-    assert_eq!(
-        planned["type"], "pushdown",
-        "the concurrency change must leave the planned response shape untouched: {planned:?}"
-    );
-}
-
-/// Serves `objects` as `delta_object_endpoint` does, but holds each table's first `_delta_log`
-/// read until both legs' first reads are in flight, so legs whose log replays run one after the
-/// other never get an answer.
-async fn delta_log_rendezvous(objects: Vec<(String, String)>) -> StorageBackend {
+/// A fake server that holds the first request for each key `held` derives from its target until
+/// two keys' first requests are in flight, so legs that run one after the other never get an
+/// answer. Returns the server's address.
+async fn two_leg_rendezvous(
+    held: fn(&str) -> Option<String>,
+    respond: impl Fn(&str) -> (u16, &'static str, String) + Send + Sync + 'static,
+) -> String {
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let first_reads = Arc::new(Mutex::new(HashSet::new()));
-    let objects = Arc::new(objects);
-    let (endpoint, _) = spawn_fake_http_server(move |head| {
-        let (barrier, first_reads, objects) = (
+    let respond = Arc::new(respond);
+    let (address, _) = spawn_fake_http_server(move |head| {
+        let (barrier, first_reads, respond) = (
             Arc::clone(&barrier),
             Arc::clone(&first_reads),
-            Arc::clone(&objects),
+            Arc::clone(&respond),
         );
         let target = request_target(&head).to_string();
         async move {
-            let first_read = delta_log_table(&target)
-                .is_some_and(|table| first_reads.lock().expect("first reads").insert(table));
+            let first_read = held(&target)
+                .is_some_and(|key| first_reads.lock().expect("first reads").insert(key));
             if first_read {
                 barrier.wait().await;
             }
-            object_response("bucket", &target, &objects)
+            respond(&target)
         }
         .boxed()
     })
     .await;
+    address
+}
 
-    endpoint_storage(&endpoint)
+/// The table an Iceberg REST `loadTable` of `target` names.
+fn loaded_table(target: &str) -> Option<String> {
+    (!target.starts_with("/v1/config")).then(|| target.rsplit('/').next().unwrap_or("t").into())
 }
 
 /// The table whose `_delta_log` a GET or a listing of `target` reads.
@@ -701,29 +648,68 @@ fn delta_log_table(target: &str) -> Option<String> {
     before.rsplit(['/', '=']).next().map(str::to_string)
 }
 
+/// Both formats run on the production adapter's current-thread runtime, where a leg that holds
+/// the thread would starve the other.
 /// Scenario: A request's table resolutions run concurrently rather than one after another
 #[tokio::test(flavor = "current_thread")]
-async fn delta_join_legs_replay_concurrently_on_a_current_thread_runtime() {
-    let catalog = unity_delta_catalog().await;
-    let storage = delta_log_rendezvous(partitioned_delta_logs()).await;
-    let request = partitioned_legs_request();
+async fn join_legs_resolve_concurrently() {
+    let iceberg_catalog = two_leg_rendezvous(loaded_table, |target| {
+        let body = match loaded_table(target) {
+            Some(table) => snapshotless_load_table_body(&format!("s3://bucket/{table}")),
+            None => "{}".to_string(),
+        };
+        (200, "application/json", body)
+    })
+    .await;
+    let unity_catalog = unity_delta_catalog().await;
+    let objects = partitioned_delta_logs();
+    let delta_store = two_leg_rendezvous(delta_log_table, move |target| {
+        object_response("bucket", target, &objects)
+    })
+    .await;
+    let iceberg_request = with_iceberg_notes(join_request(Json::Null, equi_condition()));
+    let delta_request = partitioned_legs_request();
 
-    let planned = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders"),
-    )
-    .await
-    .expect(
-        "both legs' Delta log replays must be in flight at once; a replay that holds the \
-         runtime thread, or a leg that starts after the other ends, never releases the store's \
-         rendezvous",
-    )
-    .expect("two partitioned Delta legs plan");
+    let cases = [
+        (
+            "Iceberg loadTable",
+            pushdown_over(
+                &iceberg_request,
+                CatalogKind::IcebergRest,
+                &iceberg_catalog,
+                sample_storage(),
+                "lh.customer",
+                1024,
+            )
+            .boxed(),
+        ),
+        (
+            "Delta log replay",
+            delta_pushdown(
+                &delta_request,
+                &unity_catalog.uri,
+                endpoint_storage(&delta_store),
+                "cat.sch.orders",
+            )
+            .boxed(),
+        ),
+    ];
 
-    assert_eq!(
-        planned["type"], "pushdown",
-        "the overlap must leave the planned response shape untouched: {planned:?}"
-    );
+    for (legs, plan) in cases {
+        let planned = tokio::time::timeout(std::time::Duration::from_secs(20), plan)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{legs}: both legs must be in flight at once; a leg that holds the runtime \
+                     thread, or starts after the other ends, never releases the rendezvous"
+                )
+            })
+            .unwrap_or_else(|error| panic!("{legs}: the join plans: {error}"));
+        assert_eq!(
+            planned["type"], "pushdown",
+            "{legs}: the overlap must leave the planned response shape untouched: {planned:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

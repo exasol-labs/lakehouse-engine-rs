@@ -1,6 +1,4 @@
 use std::collections::BTreeMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::array::ArrayRef;
@@ -16,7 +14,7 @@ use lakehouse_catalog::{
 };
 use serde_json::Value as Json;
 
-use super::{ConnectionStorage, LoadedTable, PlannedFiles};
+use super::{ConnectionStorage, LoadedTable, PlannedFiles, UdfFuture};
 use crate::adapter::column_notes::{
     ColumnDeclaration, DeclaredSchema, column_refusal, unread_type_cause, variant_cause,
 };
@@ -115,7 +113,7 @@ impl IcebergTable {
         Ok(Self {
             table_name,
             table,
-            table_root,
+            table_root: ObjectLocation::from_raw(&table_root)?.to_wire(),
             effective_storage,
             name_mapping,
         })
@@ -127,7 +125,7 @@ impl LoadedTable for IcebergTable {
         &'a self,
         declared: &'a DeclaredSchema,
         filter_json: Option<&'a Json>,
-    ) -> Pin<Box<dyn Future<Output = Result<PlannedFiles, UdfError>> + Send + 'a>> {
+    ) -> UdfFuture<'a, PlannedFiles> {
         Box::pin(async move {
             let metadata = self.table.metadata();
             refuse_relaxed_nullability(metadata.current_schema(), declared)?;
@@ -160,7 +158,7 @@ impl LoadedTable for IcebergTable {
             Ok(PlannedFiles {
                 files,
                 effective_storage: self.effective_storage.clone(),
-                table_root: ObjectLocation::from_raw(&self.table_root)?.to_wire(),
+                table_root: self.table_root.clone(),
                 name_mapping: self.name_mapping.clone(),
             })
         })

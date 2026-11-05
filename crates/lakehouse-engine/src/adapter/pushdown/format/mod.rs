@@ -143,6 +143,9 @@ impl ResolvedScan {
     }
 }
 
+/// Boxed, because `async fn` in a trait is not dyn-compatible.
+pub(super) type UdfFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, UdfError>> + Send + 'a>>;
+
 /// What one reference's prune resolves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedFiles {
@@ -157,15 +160,14 @@ pub struct PlannedFiles {
 
 /// A table's filter-independent state (catalog answer, credential, metadata, log, or listing),
 /// opened once so that every reference to the table prunes the same state with its own filter
-/// and declaration. Owned, so it outlives the session that opened it. Returns a boxed future
-/// because `async fn` in a trait is not dyn-compatible.
+/// and declaration. Owned, so it outlives the session that opened it.
 pub trait LoadedTable: Send + Sync {
     /// `None` disables format-level pruning. Fails a declaration that disagrees with the table.
     fn prune<'a>(
         &'a self,
         declared: &'a DeclaredSchema,
         filter_json: Option<&'a Json>,
-    ) -> Pin<Box<dyn Future<Output = Result<PlannedFiles, UdfError>> + Send + 'a>>;
+    ) -> UdfFuture<'a, PlannedFiles>;
 }
 
 /// Under vending, `allow_http` is still the operator's consent gate for plaintext transport.

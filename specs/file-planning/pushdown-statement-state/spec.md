@@ -21,7 +21,7 @@ Governs what the pushdown requests of one statement share on one virtual schema:
 
 * *GIVEN* a statement that references one table of a virtual schema more than once, with a different filter per reference, either in one request (a self-join) or in several requests (a UNION ALL of the table with itself, or a CTE referenced twice)
 * *WHEN* the adapter plans every reference
-* *THEN* the adapter SHALL load the table once for the statement: one catalog table lookup (an Iceberg REST `loadTable` GET, a Unity Catalog table GET, or a Glue `GetTable`), at most one vended-credential request, and one read of the table's metadata file, Delta log listing, Glue partition list, or Parquet directory listing
+* *THEN* the adapter SHALL load the table once for the statement: one catalog table lookup (an Iceberg REST `loadTable` GET or a Unity Catalog table GET), at most one vended-credential request, and one Delta log listing or Parquet directory listing
 * *AND* every reference to an Iceberg or Delta table SHALL read the snapshot that was current when the statement loaded the table, as the Iceberg table spec states: "Readers use the snapshot that was current when they load the table metadata", and the Delta protocol states: "readers can read a consistent snapshot of a Delta table, even in the face of concurrent writes"
 * *AND* each reference SHALL prune the file list with its own filter, so it plans the same files that it plans as the only reference of its statement
 * *AND* each reference to a Glue Hive table SHALL list the files of the partitions that its own filter keeps, because the kept partitions differ per reference

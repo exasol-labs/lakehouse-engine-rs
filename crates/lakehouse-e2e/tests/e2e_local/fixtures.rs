@@ -173,13 +173,6 @@ pub fn setup_proxy(adapter_schema: &str, adapter_env: &[(&str, &str)], scan_env:
     );
 }
 
-pub fn password_via_proxy() -> CatalogConnectionPassword {
-    CatalogConnectionPassword {
-        endpoint: SEAWEEDFS_VIA_PROXY.to_string(),
-        ..local_stack_connection_password()
-    }
-}
-
 /// A CONNECTION that names a role whose STS endpoint only the proxy resolves.
 pub fn role_password_via_proxy() -> CatalogConnectionPassword {
     CatalogConnectionPassword {
@@ -188,14 +181,8 @@ pub fn role_password_via_proxy() -> CatalogConnectionPassword {
         aws_assume_role_arn: Some(ASSUME_ROLE_ARN.to_string()),
         aws_external_id: Some(ASSUME_ROLE_EXTERNAL_ID.to_string()),
         aws_sts_endpoint: Some(SEAWEEDFS_VIA_PROXY.to_string()),
-        ..password_via_proxy()
+        ..local_stack_connection_password().via_proxy()
     }
-}
-
-pub fn proxy_props<'a>(vs_name: &'a str, namespace: &'a str, conn_name: &'a str) -> VsProps<'a> {
-    VsProps::new(vs_name, namespace)
-        .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
-        .with_catalog_conn_name(conn_name)
 }
 
 pub fn count(sql: &str) -> i64 {
@@ -229,27 +216,28 @@ pub fn proxy_virtual_schemas() {
 
         create_virtual_schema_with_password(
             &mut conn,
-            &proxy_props(PROXY_ICEBERG_VS, E2E_NAMESPACE, "PROXY_ICEBERG_CREDS"),
+            &VsProps::new(PROXY_ICEBERG_VS, E2E_NAMESPACE).proxied("PROXY_ICEBERG_CREDS"),
             ICEBERG_REST_VIA_PROXY,
-            &password_via_proxy(),
+            &local_stack_connection_password().via_proxy(),
         );
         refresh(PROXY_ICEBERG_VS);
 
         create_virtual_schema_with_password(
             &mut conn,
-            &proxy_props(PROXY_DIRECT_VS, "", "PROXY_DIRECT_CREDS")
+            &VsProps::new(PROXY_DIRECT_VS, "")
+                .proxied("PROXY_DIRECT_CREDS")
                 .with_catalog_kind("DIRECT_STORAGE"),
             BASE_DIRECT,
             &CatalogConnectionPassword {
                 warehouse: String::new(),
-                ..password_via_proxy()
+                ..local_stack_connection_password().via_proxy()
             },
         );
         refresh(PROXY_DIRECT_VS);
 
         create_virtual_schema_with_password(
             &mut conn,
-            &proxy_props(PROXY_ROLE_VS, E2E_NAMESPACE, "PROXY_ROLE_CREDS"),
+            &VsProps::new(PROXY_ROLE_VS, E2E_NAMESPACE).proxied("PROXY_ROLE_CREDS"),
             ICEBERG_REST_VIA_PROXY,
             &role_password_via_proxy(),
         );

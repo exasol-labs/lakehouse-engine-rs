@@ -101,8 +101,7 @@ async fn resolve_with(
     };
     let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
     let connection = connection_storage(storage, &creds);
-    let load =
-        CatalogParquetTable::from_unity(UnityTableStorage::new(&session, table, &connection));
+    let load = CatalogParquetTable::from_unity(UnityTableStorage::new(&session, table, connection));
     user_outcome(resolve_declared(load, TABLE_NAME, table, filter).await)
 }
 

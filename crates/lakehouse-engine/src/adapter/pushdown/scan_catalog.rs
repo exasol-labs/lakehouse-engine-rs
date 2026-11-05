@@ -1,8 +1,6 @@
 //! The pushdown face of each catalog kind's client: the identifier rule, the permission check,
 //! and the one scan load that opens a table for its format.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use exasol_udf_sdk::error::UdfError;
@@ -13,7 +11,8 @@ use lakehouse_catalog::{
 };
 
 use super::format::{
-    CatalogParquetTable, DeltaTable, IcebergTable, ParquetDirectoryTable, UnityTableStorage,
+    CatalogParquetTable, DeltaTable, IcebergTable, ParquetDirectoryTable, UdfFuture,
+    UnityTableStorage,
 };
 use super::{ConnectionStorage, LoadedTable};
 use crate::adapter::direct_storage::DirectStorageCatalogClient;
@@ -24,8 +23,6 @@ use crate::scan::ObjectLocation;
 #[cfg(test)]
 #[path = "scan_catalog_tests.rs"]
 mod tests;
-
-type CatalogFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, UdfError>> + Send + 'a>>;
 
 /// A catalog client as pushdown uses it. Each kind's client loads a table on its own concrete
 /// session and then matches only the format tag of the loaded table, so the catalog kind is
@@ -42,7 +39,7 @@ pub(crate) trait ScanCatalog: CatalogClient {
         _gate: &'a PermissionGate,
         _identifiers: &'a [&'a str],
         _creds: &'a ConnectionCreds,
-    ) -> CatalogFuture<'a, Vec<String>> {
+    ) -> UdfFuture<'a, Vec<String>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 
@@ -51,7 +48,7 @@ pub(crate) trait ScanCatalog: CatalogClient {
         &'a self,
         table_identifier: &'a str,
         connection: ConnectionStorage<'a>,
-    ) -> CatalogFuture<'a, Arc<dyn LoadedTable>>;
+    ) -> UdfFuture<'a, Arc<dyn LoadedTable>>;
 }
 
 impl ScanCatalog for IcebergRestCatalogClient {
@@ -64,7 +61,7 @@ impl ScanCatalog for IcebergRestCatalogClient {
         gate: &'a PermissionGate,
         identifiers: &'a [&'a str],
         creds: &'a ConnectionCreds,
-    ) -> CatalogFuture<'a, Vec<String>> {
+    ) -> UdfFuture<'a, Vec<String>> {
         Box::pin(async move {
             gate.authorize(self.session().await?, identifiers, creds)
                 .await?;
@@ -76,7 +73,7 @@ impl ScanCatalog for IcebergRestCatalogClient {
         &'a self,
         table_identifier: &'a str,
         connection: ConnectionStorage<'a>,
-    ) -> CatalogFuture<'a, Arc<dyn LoadedTable>> {
+    ) -> UdfFuture<'a, Arc<dyn LoadedTable>> {
         Box::pin(async move {
             let catalog_props = CatalogProps {
                 warehouse: connection.creds.warehouse.clone(),
@@ -98,12 +95,12 @@ impl ScanCatalog for UnityCatalogSession {
         &'a self,
         table_identifier: &'a str,
         connection: ConnectionStorage<'a>,
-    ) -> CatalogFuture<'a, Arc<dyn LoadedTable>> {
+    ) -> UdfFuture<'a, Arc<dyn LoadedTable>> {
         Box::pin(async move {
             let table = self
                 .load_table(&unity_table_ident(table_identifier)?)
                 .await?;
-            open_unity_table(self, &table, &connection).await
+            open_unity_table(self, &table, connection).await
         })
     }
 }
@@ -117,7 +114,7 @@ impl ScanCatalog for GlueCatalogSession {
         &'a self,
         table_identifier: &'a str,
         connection: ConnectionStorage<'a>,
-    ) -> CatalogFuture<'a, Arc<dyn LoadedTable>> {
+    ) -> UdfFuture<'a, Arc<dyn LoadedTable>> {
         Box::pin(async move {
             let table = self
                 .load_table(&parse_glue_table_ident(table_identifier)?)
@@ -136,7 +133,7 @@ impl ScanCatalog for DirectStorageCatalogClient {
         &'a self,
         table_identifier: &'a str,
         connection: ConnectionStorage<'a>,
-    ) -> CatalogFuture<'a, Arc<dyn LoadedTable>> {
+    ) -> UdfFuture<'a, Arc<dyn LoadedTable>> {
         Box::pin(async move {
             let table_root = direct_storage_table_root(self.root(), table_identifier)?;
             let table =
@@ -151,7 +148,7 @@ impl ScanCatalog for DirectStorageCatalogClient {
 async fn open_unity_table(
     session: &UnityCatalogSession,
     table: &CatalogTable,
-    connection: &ConnectionStorage<'_>,
+    connection: ConnectionStorage<'_>,
 ) -> Result<Arc<dyn LoadedTable>, UdfError> {
     let storage = UnityTableStorage::new(session, table, connection);
     Ok(match table.format {

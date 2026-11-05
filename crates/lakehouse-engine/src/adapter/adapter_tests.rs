@@ -39,24 +39,6 @@ fn dispatch_unknown_type_errors() {
 }
 
 #[test]
-fn only_a_nonempty_virtual_schema_name_keys_the_statement_state() {
-    for (request, expected) in [
-        (
-            serde_json::json!({"schemaMetadataInfo": {"name": "VS"}}),
-            Some("VS"),
-        ),
-        (
-            serde_json::json!({"schemaMetadataInfo": {"name": ""}}),
-            None,
-        ),
-        (serde_json::json!({"schemaMetadataInfo": {}}), None),
-        (serde_json::json!({}), None),
-    ] {
-        assert_eq!(virtual_schema_name(&request), expected, "{request}");
-    }
-}
-
-#[test]
 fn refresh_and_set_properties_dispatched_not_unsupported() {
     for req_type in ["refresh", "setProperties"] {
         let req = serde_json::json!({
@@ -191,6 +173,7 @@ fn a_pushdown_never_runs_the_property_check() {
     let request = serde_json::json!({
         "type": "pushdown",
         "schemaMetadataInfo": {
+            "name": "PROPERTY_CHECK_VS",
             "properties": {
                 PROP_CATALOG_CONNECTION: "NO_SUCH_CONNECTION",
                 "NAMESPCE": "sales",
@@ -385,6 +368,7 @@ fn unity_kind_pushdown_routes_to_the_unity_catalog_loader() {
     let req = with_identifier_notes(
         serde_json::json!({
             "type": "pushdown",
+            "schemaMetadataInfo": {"name": "UNITY_ROUTING_VS"},
             "properties": {
                 "CATALOG_KIND": "UNITY_CATALOG",
                 "CATALOG_CONNECTION": "MY_CONN",

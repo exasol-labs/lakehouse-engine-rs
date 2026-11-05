@@ -34,17 +34,13 @@ impl<T> StatementStates<T> {
         }
     }
 
-    /// The state kept under `name`, built on a miss. A failed build keeps nothing, and a request
-    /// without a schema name gets a state that the map does not keep. The build runs outside the
-    /// lock, because it may wait on the network.
+    /// The state kept under `name`, built on a miss. A failed build keeps nothing. The build runs
+    /// outside the lock, because it may wait on the network.
     pub(crate) fn get_or_build<E>(
         &self,
-        name: Option<&str>,
+        name: &str,
         build: impl FnOnce() -> Result<T, E>,
     ) -> Result<Arc<T>, E> {
-        let Some(name) = name else {
-            return build().map(Arc::new);
-        };
         if let Some(state) = self.locked().get(name) {
             return Ok(Arc::clone(state));
         }

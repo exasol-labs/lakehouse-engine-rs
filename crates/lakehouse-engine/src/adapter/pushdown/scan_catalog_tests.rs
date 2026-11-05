@@ -27,7 +27,7 @@ async fn a_unity_catalog_load_refuses_an_iceberg_table() {
     let table = unity_table(TableFormat::Iceberg);
     let storage = sample_storage();
 
-    let err = open_unity_table(&session, &table, &connection_storage(&storage, &creds))
+    let err = open_unity_table(&session, &table, connection_storage(&storage, &creds))
         .await
         .err()
         .expect("a Unity Catalog table reporting the Iceberg format must be refused");

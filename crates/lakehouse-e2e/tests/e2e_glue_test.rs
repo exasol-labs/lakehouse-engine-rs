@@ -969,9 +969,7 @@ fn check_https_proxy_tunnels_glue_sts_and_s3(run: &GlueRun, conn: &mut ExaConn) 
                 None,
             ),
         ] {
-            let mut props = VsProps::new(vs, &database)
-                .with_adapter_schema(PROXY_ADAPTER_SCHEMA)
-                .with_catalog_conn_name(connection);
+            let mut props = VsProps::new(vs, &database).proxied(connection);
             if let Some(kind) = kind {
                 props = props.with_catalog_kind(kind);
             }

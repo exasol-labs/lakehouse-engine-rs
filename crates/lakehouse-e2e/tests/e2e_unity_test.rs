@@ -79,9 +79,6 @@ const EXPECTED_TABLES: &[&str] = &[
 
 /// `multi-part-stats` commits these IDs in this order, one row and one data file each.
 const MULTI_PART_STATS_IDS: [i64; 5] = [1, 2, 3, 4, 5];
-/// The distinct part of each `MULTI_PART_STATS_IDS` entry's data file name, read from the log.
-const MULTI_PART_STATS_FILES: [&str; 5] =
-    ["f98612d6", "2699f745", "ff529603", "323f4e76", "743ccd8e"];
 
 /// Outside the Delta fixtures' `s3://warehouse/delta/` prefix, so they never collide.
 const SALES_PARQUET_LOCATION: &str = "s3://warehouse/unity_parquet/sales_parquet";
@@ -2598,14 +2595,10 @@ fn create_proxy_virtual_schema() {
         create_virtual_schema_with_password(
             &mut conn,
             &VsProps::new(VS_PROXY, UNITY_NAMESPACE)
-                .with_adapter_schema(stack::PROXY_ADAPTER_SCHEMA)
-                .with_catalog_kind("UNITY_CATALOG")
-                .with_catalog_conn_name("UNITY_PROXY_CREDS"),
+                .proxied("UNITY_PROXY_CREDS")
+                .with_catalog_kind("UNITY_CATALOG"),
             stack::UNITY_CATALOG_VIA_PROXY,
-            &CatalogConnectionPassword {
-                endpoint: stack::SEAWEEDFS_VIA_PROXY.to_string(),
-                ..local_stack_connection_password()
-            },
+            &local_stack_connection_password().via_proxy(),
         );
     });
 }
@@ -2620,9 +2613,55 @@ fn unity_catalog_and_delta_log_reads_go_through_the_proxy() {
     );
 }
 
-/// How many of `pushed_sql`'s data files hold each of `MULTI_PART_STATS_IDS`.
-fn multi_part_stats_files(pushed_sql: &str) -> [usize; 5] {
-    MULTI_PART_STATS_FILES.map(|file| pushed_sql.matches(file).count())
+/// The UUID in each `MULTI_PART_STATS_IDS` entry's data file name, read from the vendored log, so
+/// a re-vendored fixture fails here rather than as a pruning error. The pushed file list carries
+/// the UUID whether or not it decodes the name's `%25`.
+fn multi_part_stats_file_ids() -> Vec<String> {
+    let log = format!(
+        "{}/../../scripts/unity/fixtures/multi-part-stats/_delta_log",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut file_of_id = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(&log).unwrap_or_else(|e| panic!("read {log}: {e}")) {
+        let commit = entry.expect("list the vendored _delta_log").path();
+        if commit
+            .extension()
+            .is_none_or(|extension| extension != "json")
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(&commit).expect("read a vendored commit");
+        for action in text.lines().map(|line| {
+            serde_json::from_str::<Json>(line).expect("a commit line is one JSON action")
+        }) {
+            assert!(
+                action.get("remove").is_none(),
+                "the multi-part-stats fixture changed: {commit:?} removes a file"
+            );
+            let Some(add) = action.get("add") else {
+                continue;
+            };
+            let stats: Json = serde_json::from_str(add["stats"].as_str().unwrap_or("{}"))
+                .expect("an add action's stats are JSON");
+            let id = stats["minValues"]["id"].as_i64();
+            assert!(
+                id.is_some() && id == stats["maxValues"]["id"].as_i64(),
+                "the multi-part-stats fixture changed: {commit:?} adds a file not of one ID"
+            );
+            let uuid = add["path"]
+                .as_str()
+                .and_then(|path| path.split("-part-00000-").nth(1))
+                .and_then(|rest| rest.strip_suffix("-c000.snappy.parquet"))
+                .unwrap_or_else(|| panic!("the multi-part-stats fixture changed: {add}"));
+            file_of_id.insert(id, uuid.to_string());
+        }
+    }
+    assert_eq!(
+        file_of_id.keys().copied().collect::<Vec<_>>(),
+        MULTI_PART_STATS_IDS.map(Some),
+        "the multi-part-stats fixture changed: it no longer adds one file per ID"
+    );
+    file_of_id.into_values().collect()
 }
 
 /// Scenario: Every reference to one table in a statement loads the table once and prunes it with its own filter
@@ -2637,11 +2676,17 @@ fn unity_delta_references_load_the_table_once_and_prune_their_own_files() {
     let self_join = format!(
         "SELECT a.ID FROM {table} a JOIN {table} b ON a.ID = b.ID WHERE a.ID <= 4 AND b.ID >= 2"
     );
+    let file_ids = multi_part_stats_file_ids();
 
     // One file per ID, so a branch's file list shows which files its own filter kept.
-    let branch_files: Vec<[usize; 5]> = pushdown_statements(&mut conn, &union)
+    let branch_files: Vec<Vec<usize>> = pushdown_statements(&mut conn, &union)
         .iter()
-        .map(|pushed| multi_part_stats_files(pushed))
+        .map(|pushed| {
+            file_ids
+                .iter()
+                .map(|id| pushed.matches(id.as_str()).count())
+                .collect()
+        })
         .collect();
     assert_eq!(
         branch_files,
@@ -2649,10 +2694,19 @@ fn unity_delta_references_load_the_table_once_and_prune_their_own_files() {
         "each UNION ALL branch lists only the files of the IDs its filter keeps"
     );
 
-    for (shape, sql, expected_ids) in [
-        ("UNION ALL", &union, vec![1, 2, 4, 5]),
-        ("self-join", &self_join, vec![2, 3, 4]),
+    for (shape, sql, expected_ids, join) in [
+        ("UNION ALL", &union, vec![1, 2, 4, 5], false),
+        ("self-join", &self_join, vec![2, 3, 4], true),
     ] {
+        let sql = format!("SELECT ID FROM ({sql}) ORDER BY ID");
+        if join {
+            // A fallback to one pushdown per occurrence would also load the table once.
+            let pushed = pushdown_statements(&mut conn, &sql);
+            assert!(
+                pushed.len() == 1 && has_broadcast_join_block(&pushed[0]),
+                "{shape}: one broadcast pushdown: {pushed:?}"
+            );
+        }
         let mut ids = Vec::new();
         let [table_gets, log_lists] = stack::count_proxy_requests(
             [
@@ -2667,11 +2721,7 @@ fn unity_delta_references_load_the_table_once_and_prune_their_own_files() {
                 )
                 .as_str(),
             ],
-            || {
-                ids = int_column(
-                    &conn.query_columns(&format!("SELECT ID FROM ({sql}) ORDER BY ID"))[0],
-                )
-            },
+            || ids = int_column(&conn.query_columns(&sql)[0]),
         );
 
         assert_eq!(ids, expected_ids, "{shape}: the IDs both filters keep");

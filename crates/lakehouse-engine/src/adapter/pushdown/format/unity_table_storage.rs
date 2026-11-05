@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{
-    CatalogTable, ConnectionCreds, StaticStoreAddress, StorageBackend, UnityCatalogSession,
+    CatalogTable, StaticStoreAddress, StorageBackend, UnityCatalogSession,
     resolve_uc_vended_storage,
 };
 use object_store::ObjectStore;
@@ -20,23 +20,19 @@ const READ_OPERATION: &str = "READ";
 pub(in crate::adapter::pushdown) struct UnityTableStorage<'a> {
     session: &'a UnityCatalogSession,
     table: &'a CatalogTable,
-    storage: &'a StorageBackend,
-    creds: &'a ConnectionCreds,
-    allow_http: bool,
+    connection: ConnectionStorage<'a>,
 }
 
 impl<'a> UnityTableStorage<'a> {
     pub(in crate::adapter::pushdown) fn new(
         session: &'a UnityCatalogSession,
         table: &'a CatalogTable,
-        connection: &ConnectionStorage<'a>,
+        connection: ConnectionStorage<'a>,
     ) -> Self {
         Self {
             session,
             table,
-            storage: connection.storage,
-            creds: connection.creds,
-            allow_http: connection.allow_http,
+            connection,
         }
     }
 
@@ -61,8 +57,13 @@ impl<'a> UnityTableStorage<'a> {
     /// Under vending, a table with no (or an empty) vending key fails rather than falling
     /// back to the static credential.
     async fn effective_storage(&self, table_root: &str) -> Result<StorageBackend, UdfError> {
-        if !self.creds.use_vended_credentials {
-            return Ok(self.storage.clone());
+        let ConnectionStorage {
+            storage,
+            creds,
+            allow_http,
+        } = self.connection;
+        if !creds.use_vended_credentials {
+            return Ok(storage.clone());
         }
 
         let vending_key = self
@@ -87,8 +88,8 @@ impl<'a> UnityTableStorage<'a> {
         resolve_uc_vended_storage(
             &vended,
             table_root,
-            self.allow_http,
-            &StaticStoreAddress::from(self.creds),
+            allow_http,
+            &StaticStoreAddress::from(creds),
         )
     }
 

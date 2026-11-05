@@ -9,9 +9,9 @@ use super::seed::{
     build_seed_catalog,
 };
 use super::stack::{
-    CatalogConnectionPassword, assert_resolves_only_through_proxy, bucketfs_port,
-    bucketfs_write_password, build_create_connection_sql, exasol_host, exasol_sql_port,
-    iceberg_catalog_url, iceberg_catalog_url_internal, lakehouse_engine_so_path,
+    CatalogConnectionPassword, PROXY_ADAPTER_SCHEMA, assert_resolves_only_through_proxy,
+    bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
+    exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal, lakehouse_engine_so_path,
     local_stack_connection_password, seaweedfs_url, upload_to_bucketfs, url_host, wait_for_proxy,
 };
 
@@ -273,6 +273,13 @@ impl<'a> VsProps<'a> {
     pub fn with_catalog_conn_name(mut self, name: &'a str) -> Self {
         self.catalog_conn_name = name;
         self
+    }
+
+    /// Served by the proxy-only scripts, through a CONNECTION of its own that names the
+    /// `-via-proxy` addresses.
+    pub fn proxied(self, conn_name: &'a str) -> Self {
+        self.with_adapter_schema(PROXY_ADAPTER_SCHEMA)
+            .with_catalog_conn_name(conn_name)
     }
 
     pub fn with_catalog_kind(mut self, kind: &'a str) -> Self {

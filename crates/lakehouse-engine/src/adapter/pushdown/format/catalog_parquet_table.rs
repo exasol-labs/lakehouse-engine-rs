@@ -1,6 +1,4 @@
-use std::future::Future;
 use std::iter;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::datatypes::DataType as ArrowType;
@@ -17,7 +15,7 @@ use super::parquet_directory_table::file_entry;
 use super::partition_predicate::PartitionPredicate;
 use super::unity_table_storage::UnityTableStorage;
 use super::{
-    LoadedTable, ParquetDirectoryTable, PlannedFiles, checked_storage_location,
+    LoadedTable, ParquetDirectoryTable, PlannedFiles, UdfFuture, checked_storage_location,
     hex_binary_partition_values, redacted,
 };
 use crate::adapter::column_notes::DeclaredSchema;
@@ -219,7 +217,7 @@ impl LoadedTable for CatalogParquetTable {
         &'a self,
         declared: &'a DeclaredSchema,
         filter_json: Option<&'a Json>,
-    ) -> Pin<Box<dyn Future<Output = Result<PlannedFiles, UdfError>> + Send + 'a>> {
+    ) -> UdfFuture<'a, PlannedFiles> {
         Box::pin(async move {
             let partition_columns = &declared.partition_columns;
             let predicate = PartitionPredicate::from_filter(

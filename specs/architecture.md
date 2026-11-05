@@ -21,7 +21,7 @@
 ```
 
 - Layered and stateless across statements, with two levels of parallelism: the Exasol cluster spreads G file shards across nodes, and DataFusion executes each shard inside one UDF invocation.
-- The VS adapter loads each table's metadata once per statement and prunes the file list per table reference. Each scan UDF invocation receives an explicit file list and discovers no files itself.
+- Each scan UDF invocation receives an explicit file list from the VS adapter and discovers no files itself.
 - No state survives statement completion (§ Constraints states what the adapter keeps within one). The scan UDF builds its Tokio runtime and DataFusion session per invocation and never caches them.
 
 ## Components
@@ -51,7 +51,7 @@
 - CREATE or REFRESH VIRTUAL SCHEMA -> vs-adapter -> lakehouse-catalog -> catalog service: table listing returns as virtual table definitions, one identifier note per table holding its catalog identifier, and one column note per column holding the declared source shape
 - REFRESH TABLES -> vs-adapter -> lakehouse-catalog -> catalog service: the namespace's catalog identifiers are listed without loading any table, only the identifiers whose Exasol name is requested are loaded and collision-checked, the response carries only the requested tables, and Exasol keeps every other virtual table with its notes
 - user query -> Exasol -> vs-adapter: one pushdown request JSON per pushed-down query block, with projection, filter, aggregates, ORDER BY, LIMIT, join tree, and each involved table's identifier note and column notes; every request of one statement on one virtual schema reaches the same adapter VM
-- vs-adapter -> catalog client -> format-readers -> lakehouse-catalog and object storage: the virtual schema's catalog client loads a table once per statement and opens its snapshot or file listing, and each table reference prunes the file list with its own filter against the declared schema the column notes carry; no reader derives a schema
+- vs-adapter -> catalog client -> format-readers -> lakehouse-catalog and object storage: the virtual schema's catalog client loads a table and opens its snapshot or file listing, and each table reference prunes the file list with its own filter against the declared schema the column notes carry; no reader derives a schema
 - format-readers -> sharding -> pushdown-planner: the file list becomes G byte-balanced shards, each serialized as `common` and `files` JSON strings in the dispatch SQL
 - dispatch SQL -> LAKEHOUSE_DISTRIBUTE_FILES -> GROUP BY shard_key -> LAKEHOUSE_SCAN: Exasol runs one scan VM per node, which scans that node's shard rows one after another
 - LAKEHOUSE_SCAN -> datafusion-scan -> scan-object-store -> object storage: Parquet byte ranges stream into one DataFusion plan per invocation
@@ -91,10 +91,9 @@
 - The engine enumerates and declares catalog tables through the `CatalogClient` trait and its neutral table and column types. `CatalogClient` has no single-table load. Each catalog kind's client loads a table for pushdown through its one scan load, declared by an engine-side extension of that trait, so `lakehouse-catalog` gains no file-planning type. The vs-adapter's one catalog-kind match is the only site that names the kind to build a client or load a table, and a scan load matches only the loaded table's format tag. In `lakehouse-catalog`, auth strategies, HTTP and signing helpers, and vended-resolution steps stay crate-private, and no AWS SDK type crosses the crate boundary.
 - Each catalog kind's identifier-only listing returns every identifier its full listing would return or skip, in listing order, without loading table metadata. Its load of listed tables admits or skips each given table exactly as the full listing does and loads no other table.
 - The Makefile's `VS_SRCS` lists every crate's sources and manifest, so a change in `lakehouse-catalog` or `vs-expression` rebuilds the `.so` before an E2E run.
-- The scan UDF keeps no cross-call state and builds its Tokio runtime per call. The adapter keeps cross-call state only for the pushdown requests of one statement, keyed by the virtual schema name: the Tokio runtime, the resolved CONNECTION, the catalog client, the permission-checked tables, and each table's loaded, unpruned state. It never keeps a pruned file list, a result, or an error.
+- The scan UDF keeps no cross-call state and builds its Tokio runtime per call. The adapter keeps cross-call state only for the pushdown requests of one statement, keyed by the virtual schema name: the Tokio runtime, the resolved CONNECTION, the catalog client, the permission-checked tables, and each table's loaded, unpruned state. It therefore loads each table's metadata once per statement and prunes the file list per table reference. It never keeps a pruned file list, a result, or an error.
 - The engine owns no persisted metadata. Exasol stores the schema-level adapterNotes values (`SKIPPED_TABLES`, tuning values), the table identifier notes, and the column notes between CREATE and pushdown.
 - A table's declared schema is decided at CREATE, REFRESH, or SET and read from its column notes at pushdown. No format reader derives a logical schema, a partition column, or a refusal at pushdown.
-- The adapter loads each table's metadata once per statement and prunes the file list per table reference. The scan UDF never discovers files.
 - Each node scans only its assigned files, with no overlap between shards.
 - The shard count is G = node count × `PARALLELISM_FACTOR` (default 1), clamped to at least 1 and at most min(file count, 300).
 - The export writer count is G = node count × `WRITERS_PER_NODE` (default 1), clamped to at least 1 and at most 300, or 1 with `SINGLE_COMMIT = 'true'`. Each source row reaches exactly one writer, and a source with at least G rows runs exactly G writers.

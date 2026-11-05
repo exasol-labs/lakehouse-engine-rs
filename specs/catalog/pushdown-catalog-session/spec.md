@@ -6,12 +6,11 @@ The adapter authenticates to an Iceberg REST catalog and looks up its `/v1/confi
 
 * The catalog-auth token and the `/v1/config` prefix are catalog-scoped, so the session computes them once per statement and virtual schema. The `loadTable` GET stays per-table because each response carries that table's own vended storage credentials.
 * A `CatalogSession` is valid for one `(catalog_uri, warehouse)` tuple. Join legs override only `CatalogProps.table`.
-* The Iceberg REST catalog client resolves its one `CatalogSession` at its first catalog request, and every table it loads for the statement runs on that session. `architecture.md` states the crate boundary.
 * The session holds the live OAuth2 bearer token in its auth strategy. Redaction at the `loadTable` error site strips both the static catalog-auth secrets and that token.
 * The adapter validates every involved-table identifier before its first catalog request. A malformed identifier issues no catalog HTTP request.
 * The scan spec's `storage` value is the only part of the scan-driving SQL that depends on how the credential is delivered. `storage-access/scan-spec-credential-reference` encodes it as a connection reference or as a sealed envelope over the backend's encoding. Each table's own vended keys still land in that table's storage block, field for field, before sealing. `storage-access/pushdown-planning-cloud-credentials` owns that gate.
-* The namespace enumeration for `createVirtualSchema` is done by `IcebergRestCatalogClient` in `lakehouse-catalog`, behind the shared `CatalogClient` trait. One `CatalogSession`, resolved at the client's first catalog request, serves the namespace listing and every `loadTable` GET, so a request runs one OAuth2 grant and one `/v1/config` lookup.
-* Related features: `catalog/rest-catalog-oauth-auth` (the three auth modes), `connection/connection-credentials-catalog-auth`, and `pushdown/pushdown-planning` (file list resolved once).
+* `IcebergRestCatalogClient` in `lakehouse-catalog`, behind the shared `CatalogClient` trait, runs the namespace enumeration for `createVirtualSchema` and the pushdown loads. It resolves its one `CatalogSession` at its first catalog request. That session serves a `createVirtualSchema` request's namespace listing and every `loadTable` GET of a statement's pushdowns, so each runs one OAuth2 grant and one `/v1/config` lookup. `architecture.md` states the crate boundary.
+* Related features: `catalog/rest-catalog-oauth-auth` (the three auth modes), `connection/connection-credentials-catalog-auth`, and `file-planning/pushdown-statement-state` (what a statement keeps).
 * The Iceberg REST `listTables` response carries only table identifiers and a next-page token (`ListTablesResponse` in `iceberg-catalog-rest`).
 
 ## Scenarios

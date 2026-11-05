@@ -284,18 +284,28 @@ pub fn proxy_log_since(since: &str) -> String {
     )
 }
 
-/// Runs `statement` and counts, for each `requests` entry, the proxy-log lines after it that
-/// contain it. It first waits past one second, because the log's `since` has second
-/// granularity and an earlier statement's lines must fall before the mark.
+/// Runs `statement` and counts, for each `requests` entry, the proxy-log lines it produced that
+/// contain it.
 pub fn count_proxy_requests<const N: usize>(
     requests: [&str; N],
     statement: impl FnOnce(),
 ) -> [usize; N] {
+    let log = proxy_log_during(statement);
+    requests.map(|request| request_count(&log, request))
+}
+
+/// The proxy-log lines that `statement` produced. It first waits past one second, because the
+/// log's `since` has second granularity and an earlier statement's lines must fall before the mark.
+pub fn proxy_log_during(statement: impl FnOnce()) -> String {
     std::thread::sleep(Duration::from_millis(1100));
     let mark = proxy_log_mark();
     statement();
-    let log = proxy_log_since(&mark);
-    requests.map(|request| log.lines().filter(|line| line.contains(request)).count())
+    proxy_log_since(&mark)
+}
+
+/// How many of `log`'s lines contain `request`.
+pub fn request_count(log: &str, request: &str) -> usize {
+    log.lines().filter(|line| line.contains(request)).count()
 }
 
 /// The file surfaces inside the DB at `/buckets/bfsdefault/default/<name>`.
@@ -398,6 +408,20 @@ pub struct CatalogConnectionPassword {
 }
 
 impl CatalogConnectionPassword {
+    /// The same CONNECTION with its SeaweedFS endpoint and token endpoint renamed to the names
+    /// only the forward proxy resolves. An empty endpoint, as under vending, stays empty.
+    pub fn via_proxy(self) -> Self {
+        Self {
+            endpoint: if self.endpoint.is_empty() {
+                self.endpoint
+            } else {
+                SEAWEEDFS_VIA_PROXY.to_string()
+            },
+            oauth2_server_uri: self.oauth2_server_uri.as_deref().map(via_proxy),
+            ..self
+        }
+    }
+
     /// Single quotes are escaped as `''` for SQL embedding.
     pub fn to_sql_password_json(&self) -> String {
         let mut obj = serde_json::json!({

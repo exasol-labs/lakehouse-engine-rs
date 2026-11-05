@@ -2,18 +2,21 @@
 //! proxy log shows how often the adapter loads a table (`specs/testing.md` § Correctness oracles).
 
 use crate::common::e2e_harness::{
-    VsProps, create_virtual_schema, create_virtual_schema_with_password, exa_conn, int_column,
-    isolated_pushdown_statement, pushdown_statements, runtime, text_column,
+    VsProps, create_virtual_schema, create_virtual_schema_with_password, exa_conn,
+    has_broadcast_join_block, int_column, isolated_pushdown_statement, join_query,
+    pushdown_statements, runtime, text_column,
 };
-use crate::common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_TOTAL_ROWS};
+use crate::common::seed::{
+    E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, SEED_TOTAL_ROWS,
+};
 use crate::common::stack::{
     ICEBERG_REST_VIA_PROXY, PROXY_ADAPTER_SCHEMA, SEAWEEDFS_VIA_PROXY, count_proxy_requests,
-    iceberg_catalog_url_internal,
+    iceberg_catalog_url_internal, local_stack_connection_password, proxy_log_during, request_count,
 };
 use crate::fixtures::{
     PROXY_DIRECT_VS, PROXY_ICEBERG_VS, PROXY_ROLE_VS, append_file, count, drop_table_if_exists,
-    ensure_id_val_table, id_val_batch, lakehouse_vs, password_via_proxy, proxy_props,
-    proxy_virtual_schemas, role_password_via_proxy, seed_catalog, vs_table,
+    ensure_id_val_table, id_val_batch, lakehouse_vs, proxy_virtual_schemas,
+    role_password_via_proxy, seed_catalog, vs_table,
 };
 
 use iceberg::NamespaceIdent;
@@ -90,20 +93,24 @@ fn each_union_branch_pushes_the_sql_it_pushes_alone() {
     );
 }
 
+/// One statement that reads tables more than once, with what the proxy log must show for it.
 struct Reference {
     shape: &'static str,
     sql: String,
-    rows: i64,
-    request: String,
-    configs: usize,
+    rows: usize,
+    /// Each table's load request, which the statement sends exactly once.
+    loads: Vec<String>,
+    /// `/v1/config` lookups, counted only for a kind that opens an Iceberg REST session.
+    configs: Option<usize>,
+    /// A join must reach the adapter as one broadcast pushdown, because a fallback to one
+    /// pushdown per table would also load each table once.
+    join: bool,
 }
 
 /// Scenario: Every reference to one table in a statement loads the table once and prunes it with its own filter
 /// Scenario: The pushdowns of one statement share one catalog session per virtual schema
 /// Scenario: Single-table pushdown builds one catalog session and reuses it
 /// Scenario: N-table join reuses one session across all legs
-/// Scenario: Absent CATALOG_KIND resolves the Iceberg REST catalog kind
-/// Scenario: A direct-storage pushdown loads its table from the directory its identifier note names
 #[test]
 fn every_reference_to_a_table_loads_it_once() {
     proxy_virtual_schemas();
@@ -114,53 +121,81 @@ fn every_reference_to_a_table_loads_it_once() {
         Reference {
             shape: "UNION ALL with a filter per branch",
             sql: format!(
-                "SELECT COUNT(*) FROM (SELECT ID FROM {events} WHERE ID <= 5 \
-                 UNION ALL SELECT ID FROM {events} WHERE ID > 15)"
+                "SELECT ID FROM {events} WHERE ID <= 5 UNION ALL SELECT ID FROM {events} WHERE ID > 15"
             ),
             rows: 10,
-            request: loads_events.clone(),
-            configs: 1,
+            loads: vec![loads_events.clone()],
+            configs: Some(1),
+            join: false,
         },
         Reference {
             shape: "CTE referenced twice with a filter per reference",
             sql: format!(
-                "WITH e AS (SELECT ID FROM {events}) SELECT COUNT(*) FROM \
-                 (SELECT ID FROM e WHERE ID <= 5 UNION ALL SELECT ID FROM e WHERE ID > 15)"
+                "WITH e AS (SELECT ID FROM {events}) \
+                 SELECT ID FROM e WHERE ID <= 5 UNION ALL SELECT ID FROM e WHERE ID > 15"
             ),
             rows: 10,
-            request: loads_events.clone(),
-            configs: 1,
+            loads: vec![loads_events.clone()],
+            configs: Some(1),
+            join: false,
         },
         Reference {
             shape: "self-join with a filter per side",
             sql: format!(
-                "SELECT COUNT(*) FROM {events} a JOIN {events} b ON a.ID = b.ID \
+                "SELECT a.ID FROM {events} a JOIN {events} b ON a.ID = b.ID \
                  WHERE a.ID <= 10 AND b.ID >= 6"
             ),
             rows: 5,
-            request: loads_events,
-            configs: 1,
+            loads: vec![loads_events],
+            configs: Some(1),
+            join: true,
+        },
+        Reference {
+            shape: "join of two tables",
+            sql: join_query(PROXY_ICEBERG_VS),
+            rows: 6,
+            loads: vec![
+                load_table_get(ICEBERG_REST_VIA_PROXY, E2E_FACT_TABLE),
+                load_table_get(ICEBERG_REST_VIA_PROXY, E2E_DIM_TABLE),
+            ],
+            configs: Some(1),
+            join: true,
         },
         Reference {
             shape: "direct-storage UNION ALL",
-            sql: format!(
-                "SELECT COUNT(*) FROM (SELECT * FROM {direct_rows} UNION ALL SELECT * FROM {direct_rows})"
-            ),
+            sql: format!("SELECT * FROM {direct_rows} UNION ALL SELECT * FROM {direct_rows}"),
             rows: 6,
-            request: directory_list("proxy_direct"),
-            configs: 0,
+            loads: vec![directory_list("proxy_direct")],
+            configs: None,
+            join: false,
         },
     ];
+    let mut conn = exa_conn();
 
     for case in cases {
+        if case.join {
+            let pushed = pushdown_statements(&mut conn, &case.sql);
+            assert!(
+                pushed.len() == 1 && has_broadcast_join_block(&pushed[0]),
+                "{}: one broadcast pushdown: {pushed:?}",
+                case.shape
+            );
+        }
         let mut rows = 0;
-        let [requests, configs] =
-            count_proxy_requests([case.request.as_str(), config_get().as_str()], || {
-                rows = count(&case.sql)
-            });
+        let log = proxy_log_during(|| rows = conn.query_columns(&case.sql)[0].len());
+
         assert_eq!(rows, case.rows, "{}: rows", case.shape);
-        assert_eq!(requests, 1, "{}: loads", case.shape);
-        assert_eq!(configs, case.configs, "{}: /v1/config lookups", case.shape);
+        for load in &case.loads {
+            assert_eq!(request_count(&log, load), 1, "{}: {load}", case.shape);
+        }
+        if let Some(configs) = case.configs {
+            assert_eq!(
+                request_count(&log, &config_get()),
+                configs,
+                "{}: /v1/config lookups",
+                case.shape
+            );
+        }
     }
 }
 
@@ -215,9 +250,9 @@ fn two_virtual_schemas_in_one_statement_load_the_table_once_each() {
     ] {
         create_virtual_schema_with_password(
             &mut conn,
-            &proxy_props(vs, E2E_NAMESPACE, creds),
+            &VsProps::new(vs, E2E_NAMESPACE).proxied(creds),
             catalog,
-            &password_via_proxy(),
+            &local_stack_connection_password().via_proxy(),
         );
     }
     // Exasol pushes a UNION ALL's trailing ORDER BY into its first virtual-schema leg only and
@@ -263,11 +298,7 @@ fn a_role_create_assumes_the_role_once() {
     let [assumptions] = count_proxy_requests([assume_role_post().as_str()], || {
         create_virtual_schema_with_password(
             &mut conn,
-            &proxy_props(
-                "REUSE_ROLE_CREATE_VS",
-                E2E_NAMESPACE,
-                "REUSE_ROLE_CREATE_CREDS",
-            ),
+            &VsProps::new("REUSE_ROLE_CREATE_VS", E2E_NAMESPACE).proxied("REUSE_ROLE_CREATE_CREDS"),
             ICEBERG_REST_VIA_PROXY,
             &role_password_via_proxy(),
         );

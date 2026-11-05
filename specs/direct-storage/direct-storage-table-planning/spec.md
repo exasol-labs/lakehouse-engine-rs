@@ -65,9 +65,3 @@ The adapter resolves a directory of Parquet files into the engine's `ScanSpec` a
 * *AND* a query on the second table that reads `X` SHALL fail at scan time the same way, naming `X`, both types, and the table's storage location
 * *AND* a query on the second table that reads only its other columns SHALL return the rows of every current data file, because planning reads no footer and the scan checks only the columns it reads
 * *AND* no error message SHALL contain a credential value
-
-### Scenario: A direct-storage pushdown loads its table from the directory its identifier note names
-
-* *GIVEN* a virtual schema with `CATALOG_KIND = 'DIRECT_STORAGE'` and a pushdown request over one of its tables
-* *WHEN* the adapter loads the table
-* *THEN* the adapter SHALL compose the table root from the CONNECTION address, the `NAMESPACE` property, and the directory name that the table's identifier note records, and SHALL list the files under that root

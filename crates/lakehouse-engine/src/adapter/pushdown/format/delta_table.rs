@@ -1,5 +1,3 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use delta_kernel::schema::{ColumnMetadataKey, MetadataValue, StructField, StructType};
@@ -10,7 +8,7 @@ use serde_json::Value as Json;
 use super::delta_predicate::to_delta_predicate;
 use super::delta_replay::DeltaSnapshot;
 use super::unity_table_storage::UnityTableStorage;
-use super::{LoadedTable, PlannedFiles, hex_binary_partition_values, redacted};
+use super::{LoadedTable, PlannedFiles, UdfFuture, hex_binary_partition_values, redacted};
 use crate::adapter::column_notes::DeclaredSchema;
 use crate::scan::spec::{FileEntry, LogicalField};
 use lakehouse_catalog::StorageBackend;
@@ -59,7 +57,7 @@ impl LoadedTable for DeltaTable {
         &'a self,
         declared: &'a DeclaredSchema,
         filter_json: Option<&'a Json>,
-    ) -> Pin<Box<dyn Future<Output = Result<PlannedFiles, UdfError>> + Send + 'a>> {
+    ) -> UdfFuture<'a, PlannedFiles> {
         Box::pin(async move {
             let snapshot = Arc::clone(&self.snapshot);
             let declared = declared.clone();

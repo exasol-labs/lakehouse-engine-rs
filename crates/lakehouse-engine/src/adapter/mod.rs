@@ -105,7 +105,7 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
             // The user is mapped before the CONNECTION is read, so a refused user costs no request.
             let permission = PermissionSettings::parse(&props)?;
             let check = permission.check_for(|| ctx.current_user())?;
-            let state = STATEMENT_STATES.get_or_build(virtual_schema_name(request), || {
+            let state = STATEMENT_STATES.get_or_build(virtual_schema_name(request)?, || {
                 build_virtual_schema_state(&*ctx, &props, &permission)
             })?;
             let script_schema = ctx.script_schema();
@@ -122,13 +122,13 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
     }
 }
 
-/// `schemaMetadataInfo.name`, the key of the virtual schema's statement state.
-fn virtual_schema_name(request: &Json) -> Option<&str> {
+/// `schemaMetadataInfo.name`, the key of the virtual schema's statement state. Exasol sends it
+/// with every pushdown.
+fn virtual_schema_name(request: &Json) -> Result<&str, UdfError> {
     request
-        .get("schemaMetadataInfo")?
-        .get("name")?
-        .as_str()
-        .filter(|name| !name.is_empty())
+        .pointer("/schemaMetadataInfo/name")
+        .and_then(Json::as_str)
+        .ok_or_else(|| UdfError::User("pushdown: the request names no virtual schema".to_string()))
 }
 
 /// The first pushdown of a statement on a virtual schema builds what its later pushdowns reuse.

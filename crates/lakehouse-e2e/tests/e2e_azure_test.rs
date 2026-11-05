@@ -474,8 +474,7 @@ fn adls_reads_tunnel_through_the_https_proxy(conn: &mut ExaConn, fixture: &Azure
     create_virtual_schema_with_password(
         conn,
         &VsProps::new(PROXY_VS, "")
-            .with_adapter_schema(stack::PROXY_ADAPTER_SCHEMA)
-            .with_catalog_conn_name("AZ_PROXY_CREDS")
+            .proxied("AZ_PROXY_CREDS")
             .with_catalog_kind("DIRECT_STORAGE"),
         &format!(
             "abfss://{}@{}.dfs.core.windows.net/direct",

@@ -1,5 +1,3 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use exasol_udf_sdk::error::UdfError;
@@ -8,7 +6,7 @@ use object_store::ObjectStore;
 use serde_json::Value as Json;
 
 use super::partition_predicate::PartitionPredicate;
-use super::{LoadedTable, PlannedFiles, redacted};
+use super::{LoadedTable, PlannedFiles, UdfFuture, redacted};
 use crate::adapter::column_notes::DeclaredSchema;
 use crate::adapter::parquet_directory::{ParquetFile, ParquetListing, PartitionKeepPredicate};
 use crate::scan::ObjectLocation;
@@ -72,7 +70,7 @@ impl LoadedTable for ParquetDirectoryTable {
         &'a self,
         declared: &'a DeclaredSchema,
         filter_json: Option<&'a Json>,
-    ) -> Pin<Box<dyn Future<Output = Result<PlannedFiles, UdfError>> + Send + 'a>> {
+    ) -> UdfFuture<'a, PlannedFiles> {
         Box::pin(async move {
             let predicate = PartitionPredicate::from_filter(filter_json, &[]);
             let keep = move |values: &_| predicate.keeps(values);

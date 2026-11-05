@@ -67,7 +67,7 @@ async fn resolve_noted(
 ) -> Result<ResolvedScan, UdfError> {
     let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
     let connection = connection_storage(storage, creds);
-    let load = DeltaTable::open(UnityTableStorage::new(&session, table, &connection));
+    let load = DeltaTable::open(UnityTableStorage::new(&session, table, connection));
     resolve_from_notes(load, &involved_notes(TABLE_NAME, notes), filter).await
 }
 
