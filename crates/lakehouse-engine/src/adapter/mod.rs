@@ -36,9 +36,7 @@ use crate::adapter::properties::{
 use crate::adapter::pushdown::{ScanCatalog, declare_columns, handle_pushdown};
 use crate::adapter::scoped_refresh::{RequestedTables, ScopedRefresh};
 use crate::adapter::skipped_tables::{SkippedTables, insert_skipped_tables, skip_kind_and_reason};
-use crate::adapter::statement_state::{
-    STATEMENT_STATES, StatementCatalog, StatementStates, VirtualSchemaState,
-};
+use crate::adapter::statement_state::{STATEMENT_STATES, StatementCatalog, VirtualSchemaState};
 use crate::adapter::table_filter::TableFilter;
 use crate::adapter::table_identity::{encode_identifier_note, read_identifier};
 use crate::adapter::tables::{
@@ -85,15 +83,11 @@ const S3_CONNECTIONS_PER_THREAD: usize = 4;
 pub fn adapter_call(ctx: &mut dyn UdfContext, json_arg: &str) -> Result<String, UdfError> {
     let request: Json = serde_json::from_str(json_arg)
         .map_err(|e| UdfError::User(format!("VS request is not valid JSON: {e}")))?;
-    let response = dispatch(ctx, &request, &STATEMENT_STATES)?;
+    let response = dispatch(ctx, &request)?;
     Ok(response.to_string())
 }
 
-fn dispatch(
-    ctx: &mut dyn UdfContext,
-    request: &Json,
-    states: &StatementStates<VirtualSchemaState>,
-) -> Result<Json, UdfError> {
+fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> {
     match request.get("type").and_then(|t| t.as_str()) {
         Some("getCapabilities") => Ok(get_capabilities_response()),
         Some("createVirtualSchema") => handle_create_virtual_schema(ctx, request),
@@ -111,7 +105,7 @@ fn dispatch(
             // The user is mapped before the CONNECTION is read, so a refused user costs no request.
             let permission = PermissionSettings::parse(&props)?;
             let check = permission.check_for(|| ctx.current_user())?;
-            let state = states.get_or_build(virtual_schema_name(request), || {
+            let state = STATEMENT_STATES.get_or_build(virtual_schema_name(request), || {
                 build_virtual_schema_state(&*ctx, &props, &permission)
             })?;
             let script_schema = ctx.script_schema();
@@ -146,12 +140,8 @@ fn build_virtual_schema_state(
     // Built before `resolve_connection_config`, which blocks on it to assume the role.
     let rt = build_runtime()?;
     let config = resolve_connection_config(ctx, props, permission, &rt)?;
-    let client =
-        construct_catalog_client(&config, props).map_err(|e| redact_error(&config.storage, e))?;
-    Ok(VirtualSchemaState::new(
-        rt,
-        StatementCatalog::new(config, client),
-    ))
+    let catalog = StatementCatalog::open(config, props)?;
+    Ok(VirtualSchemaState::new(rt, catalog))
 }
 
 /// `creds` and `storage` carry the AWS identity the request acts as — a named

@@ -10,10 +10,12 @@ use crate::common::pos_delete_fixtures::{
     deletion_vector_remaining_ids,
 };
 use crate::common::seed::{E2E_NAMESPACE, E2E_TABLE, SEED_TOTAL_ROWS};
-use crate::common::stack::{CLOSED_PROXY_URL_INTERNAL, local_stack_connection_password};
+use crate::common::stack::{
+    CLOSED_PROXY_URL_INTERNAL, ICEBERG_REST_VIA_PROXY, local_stack_connection_password,
+};
 use crate::fixtures::{
-    CATALOG_VIA_PROXY, PROXY_DIRECT_VS, PROXY_ICEBERG_VS, PROXY_ROLE_VS, count, password_via_proxy,
-    proxy_props, proxy_virtual_schemas, setup_proxy, vs_table,
+    PROXY_DIRECT_VS, PROXY_ICEBERG_VS, PROXY_ROLE_VS, count, password_via_proxy, proxy_props,
+    proxy_virtual_schemas, setup_proxy, vs_table,
 };
 
 const PROXY_PASSWORD: &str = "pr0xy-s3cret";
@@ -87,7 +89,7 @@ fn an_unreachable_proxy_fails_create_naming_the_proxy_without_its_password() {
         &mut exa_conn(),
         &proxy_props("PROXY_CLOSED_VS", E2E_NAMESPACE, "PROXY_CLOSED_CREDS")
             .with_adapter_schema(LHVS_PROXY_ENV),
-        CATALOG_VIA_PROXY,
+        ICEBERG_REST_VIA_PROXY,
         &password_via_proxy(),
     );
     let msg = error_text(&resp, "CREATE through an unreachable proxy");

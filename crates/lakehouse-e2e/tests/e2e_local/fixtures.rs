@@ -1,5 +1,5 @@
 use crate::common::e2e_harness::{
-    SCAN_SCRIPT_NAME, VsProps, create_schema_and_scripts, create_schema_and_scripts_with_env,
+    SCAN_SCRIPT_NAME, VsProps, create_proxied_schema_and_scripts, create_schema_and_scripts,
     create_virtual_schema, create_virtual_schema_with_password, exa_conn, explain_virtual_sql,
     install_slc, runtime, upload_so,
 };
@@ -13,9 +13,9 @@ use crate::common::seed::{
 };
 use crate::common::stack::{
     ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
-    ASSUME_ROLE_EXTERNAL_ID, CatalogConnectionPassword, PROXY_URL_INTERNAL,
-    assert_resolves_only_through_proxy, iceberg_catalog_url, local_stack_connection_password,
-    wait_for_exasol, wait_for_iceberg_catalog, wait_for_proxy, wait_for_seaweedfs,
+    ASSUME_ROLE_EXTERNAL_ID, CatalogConnectionPassword, ICEBERG_REST_VIA_PROXY, PROXY_URL_INTERNAL,
+    SEAWEEDFS_VIA_PROXY, iceberg_catalog_url, local_stack_connection_password, wait_for_exasol,
+    wait_for_iceberg_catalog, wait_for_seaweedfs,
 };
 use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -158,27 +158,26 @@ pub fn emits_clause(pushed_sql: &str) -> String {
 }
 
 const PROXY_ADAPTER_SCHEMA: &str = "LHVS_PROXY";
-pub const CATALOG_VIA_PROXY: &str = "http://iceberg-rest-via-proxy:8181";
-pub const STORAGE_VIA_PROXY: &str = "http://seaweedfs-via-proxy:8333";
 pub const BASE_DIRECT: &str = "s3://warehouse/proxy_direct/";
 pub const PROXY_ICEBERG_VS: &str = "PROXY_ICEBERG_VS";
 pub const PROXY_DIRECT_VS: &str = "PROXY_DIRECT_VS";
 pub const PROXY_ROLE_VS: &str = "PROXY_ROLE_VS";
 
-/// A proxy setting other than the working one needs its own `adapter_schema`, because replacing
-/// the `LHVS_PROXY` scripts would change the proxy of every virtual schema built on them.
 pub fn setup_proxy(adapter_schema: &str, adapter_env: &[(&str, &str)], scan_env: &[(&str, &str)]) {
     lakehouse_vs();
     events();
-    wait_for_proxy();
-    assert_resolves_only_through_proxy("iceberg-rest-via-proxy");
-    assert_resolves_only_through_proxy("seaweedfs-via-proxy");
-    create_schema_and_scripts_with_env(&mut exa_conn(), adapter_schema, adapter_env, scan_env);
+    create_proxied_schema_and_scripts(
+        &mut exa_conn(),
+        adapter_schema,
+        adapter_env,
+        scan_env,
+        &[ICEBERG_REST_VIA_PROXY, SEAWEEDFS_VIA_PROXY],
+    );
 }
 
 pub fn password_via_proxy() -> CatalogConnectionPassword {
     CatalogConnectionPassword {
-        endpoint: STORAGE_VIA_PROXY.to_string(),
+        endpoint: SEAWEEDFS_VIA_PROXY.to_string(),
         ..local_stack_connection_password()
     }
 }
@@ -221,7 +220,7 @@ pub fn proxy_virtual_schemas() {
         create_virtual_schema_with_password(
             &mut conn,
             &proxy_props(PROXY_ICEBERG_VS, NAMESPACE, "PROXY_ICEBERG_CREDS"),
-            CATALOG_VIA_PROXY,
+            ICEBERG_REST_VIA_PROXY,
             &password_via_proxy(),
         );
         refresh(PROXY_ICEBERG_VS);
@@ -241,13 +240,13 @@ pub fn proxy_virtual_schemas() {
         create_virtual_schema_with_password(
             &mut conn,
             &proxy_props(PROXY_ROLE_VS, E2E_NAMESPACE, "PROXY_ROLE_CREDS"),
-            CATALOG_VIA_PROXY,
+            ICEBERG_REST_VIA_PROXY,
             &CatalogConnectionPassword {
                 access_key: ASSUME_ROLE_BASE_ACCESS_KEY.to_string(),
                 secret_key: ASSUME_ROLE_BASE_SECRET_KEY.to_string(),
                 aws_assume_role_arn: Some(ASSUME_ROLE_ARN.to_string()),
                 aws_external_id: Some(ASSUME_ROLE_EXTERNAL_ID.to_string()),
-                aws_sts_endpoint: Some(STORAGE_VIA_PROXY.to_string()),
+                aws_sts_endpoint: Some(SEAWEEDFS_VIA_PROXY.to_string()),
                 ..password_via_proxy()
             },
         );

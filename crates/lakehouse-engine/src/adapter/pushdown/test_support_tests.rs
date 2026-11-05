@@ -4,7 +4,6 @@
 use super::*;
 use crate::adapter::ResolvedConnectionConfig;
 use crate::adapter::column_notes::TableNotes;
-use crate::adapter::statement_state::{StatementStates, VirtualSchemaState};
 use crate::adapter::table_identity::encode_identifier_note;
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::ProjectionItem;
@@ -1150,7 +1149,7 @@ pub(crate) async fn plan_pushdown(
     table: &str,
     join_broadcast_max_bytes: u64,
 ) -> Result<Json, UdfError> {
-    let statement = statement_catalog(connection, &get_properties(request))?;
+    let statement = StatementCatalog::open(connection, &get_properties(request))?;
     let catalog = CatalogProps {
         warehouse: "wh".into(),
         table: table.into(),
@@ -1174,19 +1173,15 @@ pub(crate) async fn plan_pushdown(
     .await
 }
 
-/// The state that the first pushdown of a statement starts from: `connection`'s own catalog
-/// client, with no table admitted or loaded.
-pub(crate) fn statement_catalog(
-    connection: ResolvedConnectionConfig,
-    props: &Json,
-) -> Result<StatementCatalog, UdfError> {
-    let client = crate::adapter::construct_catalog_client(&connection, props)?;
-    Ok(StatementCatalog::new(connection, client))
-}
-
-/// A map of its own for each test that calls `dispatch`, so no test sees another's state.
-pub(crate) fn statement_states() -> StatementStates<VirtualSchemaState> {
-    StatementStates::new()
+/// The state of a statement's first pushdown over `catalog_uri`, with an unauthenticated
+/// CONNECTION and no properties.
+pub(crate) fn statement_over(
+    kind: CatalogKind,
+    catalog_uri: &str,
+    storage: StorageBackend,
+) -> StatementCatalog {
+    let connection = resolved_connection(kind, catalog_uri, storage, unauthenticated_creds());
+    StatementCatalog::open(connection, &Json::Null).expect("the catalog client issues no request")
 }
 
 pub(crate) async fn iceberg_catalog() -> RecordingCatalog {

@@ -3,15 +3,17 @@
 
 use crate::common::e2e_harness::{
     VsProps, create_virtual_schema, create_virtual_schema_with_password, exa_conn, int_column,
-    runtime, text_column,
+    isolated_pushdown_statement, pushdown_statements, runtime, text_column,
 };
 use crate::common::pos_delete_fixtures::NAMESPACE;
 use crate::common::seed::{E2E_TABLE, SEED_TOTAL_ROWS};
-use crate::common::stack::count_proxy_requests;
+use crate::common::stack::{
+    ICEBERG_REST_VIA_PROXY, SEAWEEDFS_VIA_PROXY, count_proxy_requests, iceberg_catalog_url_internal,
+};
 use crate::fixtures::{
-    CATALOG_VIA_PROXY, PROXY_DIRECT_VS, PROXY_ICEBERG_VS, PROXY_ROLE_VS, STORAGE_VIA_PROXY,
-    append_file, count, drop_table_if_exists, ensure_id_val_table, id_val_batch, lakehouse_vs,
-    password_via_proxy, proxy_props, proxy_virtual_schemas, seed_catalog, vs_table,
+    PROXY_DIRECT_VS, PROXY_ICEBERG_VS, PROXY_ROLE_VS, append_file, count, drop_table_if_exists,
+    ensure_id_val_table, id_val_batch, lakehouse_vs, password_via_proxy, proxy_props,
+    proxy_virtual_schemas, seed_catalog, vs_table,
 };
 
 use iceberg::NamespaceIdent;
@@ -22,19 +24,19 @@ const LATER_TABLE: &str = "later";
 const LATER_VS: &str = "REUSE_LATER_VS";
 
 fn config_get() -> String {
-    format!("GET {CATALOG_VIA_PROXY}/v1/config")
+    format!("GET {ICEBERG_REST_VIA_PROXY}/v1/config")
 }
 
-fn load_table_get(table: &str) -> String {
-    format!("GET {CATALOG_VIA_PROXY}/v1/namespaces/{NAMESPACE}/tables/{table}?")
+fn load_table_get(catalog: &str, table: &str) -> String {
+    format!("GET {catalog}/v1/namespaces/{NAMESPACE}/tables/{table}?")
 }
 
 fn assume_role_post() -> String {
-    format!("POST {STORAGE_VIA_PROXY}/ ")
+    format!("POST {SEAWEEDFS_VIA_PROXY}/ ")
 }
 
 fn directory_list(directory: &str) -> String {
-    format!("GET {STORAGE_VIA_PROXY}/warehouse?list-type=2&prefix={directory}%2Frows%2F ")
+    format!("GET {SEAWEEDFS_VIA_PROXY}/warehouse?list-type=2&prefix={directory}%2Frows%2F ")
 }
 
 fn events_of(vs_name: &str) -> String {
@@ -54,7 +56,8 @@ fn a_script_reloads_the_table_for_each_of_its_statements() {
          query(\"SELECT COUNT(*) FROM {events}\")"
     ));
 
-    let [loads] = count_proxy_requests([load_table_get(E2E_TABLE).as_str()], || {
+    let loads_events = load_table_get(ICEBERG_REST_VIA_PROXY, E2E_TABLE);
+    let [loads] = count_proxy_requests([loads_events.as_str()], || {
         conn.execute(&format!("EXECUTE SCRIPT {script}()"));
     });
 
@@ -65,23 +68,26 @@ fn a_script_reloads_the_table_for_each_of_its_statements() {
 }
 
 /// Scenario: The pushdowns of one statement share one catalog session per virtual schema
-/// Scenario: Single-table pushdown builds one catalog session and reuses it
-/// Scenario: Absent CATALOG_KIND resolves the Iceberg REST catalog kind
 #[test]
-fn a_statement_authenticates_once_per_virtual_schema() {
+fn each_union_branch_pushes_the_sql_it_pushes_alone() {
     proxy_virtual_schemas();
     let events = events_of(PROXY_ICEBERG_VS);
-    let mut rows = 0;
+    let branches = [
+        format!("SELECT ID FROM {events} WHERE ID <= 5"),
+        format!("SELECT ID FROM {events} WHERE ID > 15"),
+    ];
+    let mut conn = exa_conn();
+    let alone: Vec<String> = branches
+        .iter()
+        .map(|branch| isolated_pushdown_statement(&mut conn, branch))
+        .collect();
 
-    let [configs] = count_proxy_requests([config_get().as_str()], || {
-        rows = count(&format!(
-            "SELECT COUNT(*) FROM (SELECT ID FROM {events} WHERE ID <= 5 \
-             UNION ALL SELECT ID FROM {events} WHERE ID > 15)"
-        ));
-    });
+    let together = pushdown_statements(&mut conn, &branches.join(" UNION ALL "));
 
-    assert_eq!(rows, 10);
-    assert_eq!(configs, 1, "one /v1/config lookup for the whole statement");
+    assert_eq!(
+        together, alone,
+        "each branch pushes the SQL it pushes as a statement of its own"
+    );
 }
 
 struct Reference {
@@ -93,14 +99,17 @@ struct Reference {
 }
 
 /// Scenario: Every reference to one table in a statement loads the table once and prunes it with its own filter
+/// Scenario: The pushdowns of one statement share one catalog session per virtual schema
+/// Scenario: Single-table pushdown builds one catalog session and reuses it
 /// Scenario: N-table join reuses one session across all legs
+/// Scenario: Absent CATALOG_KIND resolves the Iceberg REST catalog kind
 /// Scenario: A direct-storage pushdown loads its table from the directory its identifier note names
 #[test]
 fn every_reference_to_a_table_loads_it_once() {
     proxy_virtual_schemas();
     let events = events_of(PROXY_ICEBERG_VS);
     let direct_rows = vs_table(PROXY_DIRECT_VS, "rows");
-    let loads_events = load_table_get(E2E_TABLE);
+    let loads_events = load_table_get(ICEBERG_REST_VIA_PROXY, E2E_TABLE);
     let cases = [
         Reference {
             shape: "UNION ALL with a filter per branch",
@@ -194,14 +203,17 @@ fn a_later_statement_reads_a_file_added_after_the_first() {
 fn two_virtual_schemas_in_one_statement_load_the_table_once_each() {
     proxy_virtual_schemas();
     let mut conn = exa_conn();
-    for (vs, creds) in [
-        ("REUSE_VS_A", "REUSE_CREDS_A"),
-        ("REUSE_VS_B", "REUSE_CREDS_B"),
+    // Each CONNECTION names the catalog by its own address, so the proxy log shows which
+    // CONNECTION each load used: a virtual schema reading the other's state loads at its address.
+    let catalog_b = iceberg_catalog_url_internal();
+    for (vs, creds, catalog) in [
+        ("REUSE_VS_A", "REUSE_CREDS_A", ICEBERG_REST_VIA_PROXY),
+        ("REUSE_VS_B", "REUSE_CREDS_B", catalog_b.as_str()),
     ] {
         create_virtual_schema_with_password(
             &mut conn,
             &proxy_props(vs, NAMESPACE, creds),
-            CATALOG_VIA_PROXY,
+            catalog,
             &password_via_proxy(),
         );
     }
@@ -215,9 +227,13 @@ fn two_virtual_schemas_in_one_statement_load_the_table_once_each() {
     );
     let mut columns = Vec::new();
 
-    let [loads] = count_proxy_requests([load_table_get(E2E_TABLE).as_str()], || {
-        columns = conn.query_columns(&sql);
-    });
+    let [loads_a, loads_b] = count_proxy_requests(
+        [
+            load_table_get(ICEBERG_REST_VIA_PROXY, E2E_TABLE).as_str(),
+            load_table_get(&catalog_b, E2E_TABLE).as_str(),
+        ],
+        || columns = conn.query_columns(&sql),
+    );
 
     let expected_ids: Vec<i64> = (1..=SEED_TOTAL_ROWS as i64)
         .chain(1..=SEED_TOTAL_ROWS as i64)
@@ -228,7 +244,11 @@ fn two_virtual_schemas_in_one_statement_load_the_table_once_each() {
         .collect();
     assert_eq!(int_column(&columns[1]), expected_ids);
     assert_eq!(text_column(&columns[2]), expected_names);
-    assert_eq!(loads, 2, "one load per virtual schema");
+    assert_eq!(
+        [loads_a, loads_b],
+        [1, 1],
+        "each virtual schema loads the table once, at its own CONNECTION's address"
+    );
 }
 
 /// Scenario: The adapter assumes the role once per statement and virtual schema and substitutes the session

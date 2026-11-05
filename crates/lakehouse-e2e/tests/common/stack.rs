@@ -180,6 +180,25 @@ pub fn wait_for_iceberg_catalog() {
 
 pub const PROXY_URL_INTERNAL: &str = "http://10.84.0.12:8888";
 pub const CLOSED_PROXY_URL_INTERNAL: &str = "http://10.84.0.12:1";
+/// Only the forward proxy resolves a `-via-proxy` host, so a request that bypasses it fails.
+pub const ICEBERG_REST_VIA_PROXY: &str = "http://iceberg-rest-via-proxy:8181";
+pub const SEAWEEDFS_VIA_PROXY: &str = "http://seaweedfs-via-proxy:8333";
+pub const UNITY_CATALOG_VIA_PROXY: &str = "http://unitycatalog-via-proxy:8080";
+
+/// `url` with its host renamed to the host's `-via-proxy` name.
+pub fn via_proxy(url: &str) -> String {
+    let host_start = url.find("//").map_or(0, |at| at + 2);
+    let host_end = url[host_start..]
+        .find([':', '/'])
+        .map_or(url.len(), |at| host_start + at);
+    format!("{}-via-proxy{}", &url[..host_end], &url[host_end..])
+}
+
+/// The host of `url`, as `getent` resolves it.
+pub fn url_host(url: &str) -> &str {
+    let rest = url.split_once("//").map_or(url, |(_, rest)| rest);
+    rest.split([':', '/']).next().unwrap_or(rest)
+}
 
 /// Probes from the Exasol container, because only the UDFs there reach the proxy.
 pub fn wait_for_proxy() {

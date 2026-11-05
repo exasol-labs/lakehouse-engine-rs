@@ -13,20 +13,21 @@ use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use serde_json::Value as Json;
 
-use super::parquet_format_reader::file_entry;
+use super::parquet_directory_table::file_entry;
 use super::partition_predicate::PartitionPredicate;
 use super::unity_table_storage::{UnityTableStorage, redacted};
-use super::{LoadedTable, PlannedFiles, checked_storage_location, hex_binary_partition_values};
-use crate::adapter::column_notes::DeclaredSchema;
-use crate::adapter::parquet_directory::{
-    FilePattern, ParquetListing, PartitionKeepPredicate, list_location_files,
+use super::{
+    LoadedTable, ParquetDirectoryTable, PlannedFiles, checked_storage_location,
+    hex_binary_partition_values,
 };
+use crate::adapter::column_notes::DeclaredSchema;
+use crate::adapter::parquet_directory::{FilePattern, PartitionKeepPredicate, list_location_files};
 use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, FileEntry, LogicalField};
 use crate::scan::{ObjectLocation, build_table_root_store};
 use crate::types::mapping::arrow_type_from_tag;
 
 #[cfg(test)]
-#[path = "catalog_parquet_format_reader_tests.rs"]
+#[path = "catalog_parquet_table_tests.rs"]
 mod tests;
 
 /// The catalog is the schema authority, declared in the column notes at CREATE; files supply only
@@ -39,11 +40,7 @@ pub(in crate::adapter::pushdown) struct CatalogParquetTable {
 enum ParquetFileSource {
     /// Unity Catalog: every `.parquet` object below the table directory, valued by its
     /// `key=value` path segments.
-    TableDirectory {
-        listing: ParquetListing,
-        table_root: ObjectLocation,
-        effective_storage: StorageBackend,
-    },
+    TableDirectory(ParquetDirectoryTable),
     /// Glue: each registered partition's location, valued by the partition's Glue values and
     /// read through the CONNECTION's static storage. A partition's files are listed per
     /// reference, because each reference's filter keeps its own partitions.
@@ -63,15 +60,17 @@ impl CatalogParquetTable {
         // A Unity storage location is a URL, as the Delta kernel reads it, so its path decodes once.
         let table_root = ObjectLocation::from_url(table_root)?;
         let secrets = effective_storage.secret_values();
-        let listing = list_table_directory(&table_root, &effective_storage, &secrets)
-            .await
-            .map_err(|error| redacted(error, &secrets))?;
+        let store = build_table_root_store(
+            &effective_storage,
+            table_root.store_root().as_str(),
+            DEFAULT_S3_MAX_CONNECTIONS,
+            &secrets,
+        )
+        .map_err(|error| redacted(error, &secrets))?;
+        let directory =
+            ParquetDirectoryTable::open(&store, &table_root, &effective_storage).await?;
         Ok(Self {
-            files: ParquetFileSource::TableDirectory {
-                listing,
-                table_root,
-                effective_storage,
-            },
+            files: ParquetFileSource::TableDirectory(directory),
         })
     }
 
@@ -110,25 +109,7 @@ impl ParquetFileSource {
         keep: &PartitionKeepPredicate,
     ) -> Result<PlannedFiles, UdfError> {
         match self {
-            Self::TableDirectory {
-                listing,
-                table_root,
-                effective_storage,
-            } => {
-                let secrets = effective_storage.secret_values();
-                let files = listing
-                    .kept_files(partition_columns, keep)
-                    .map_err(|error| redacted(error, &secrets))?
-                    .into_iter()
-                    .map(|file| file_entry(file, table_root))
-                    .collect();
-                Ok(PlannedFiles {
-                    table_root: table_root.to_wire(),
-                    effective_storage: effective_storage.clone(),
-                    files,
-                    name_mapping: Vec::new(),
-                })
-            }
+            Self::TableDirectory(directory) => directory.plan(partition_columns, keep),
             Self::GluePartitions {
                 partitions,
                 store,
@@ -237,20 +218,6 @@ fn readable_partition_prefix(
         )));
     }
     Ok(location.key().clone())
-}
-
-async fn list_table_directory(
-    table_root: &ObjectLocation,
-    storage: &StorageBackend,
-    secrets: &[&str],
-) -> Result<ParquetListing, UdfError> {
-    let store = build_table_root_store(
-        storage,
-        table_root.store_root().as_str(),
-        DEFAULT_S3_MAX_CONNECTIONS,
-        secrets,
-    )?;
-    ParquetListing::list(&store, table_root.key()).await
 }
 
 impl LoadedTable for CatalogParquetTable {

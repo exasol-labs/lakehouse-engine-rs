@@ -5,7 +5,7 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 ## Background
 
 * The adapter plans a Delta table at pushdown by replaying its Delta log from object storage.
-* Within one statement, the adapter sends a table's catalog request once and its storage-credential request at most once, and lists its Delta log once. Each reference to the table reads the log with its own filter and gets its own file list.
+* `file-planning/pushdown-statement-state` states how often a statement loads a Delta table and how each reference prunes it.
 * The format that the catalog reports for a table decides how a pushdown plans it.
 * Delta never writes a partition column's value into the data file, so the adapter passes each file's partition values to the scan (`scan-read-path/scan-execution-partition-values`).
 * Pushdown under the Unity Catalog kind plans a Delta scan (`vs-adapter/catalog-kind-selection`). Deletion vectors, partition values, and column mapping apply at scan time (`scan-read-path/scan-execution-delta-deletion-vectors`, `scan-read-path/scan-execution-partition-values`).
@@ -191,5 +191,4 @@ The adapter resolves a Delta Lake table into the engine's `ScanSpec` at plan tim
 * *GIVEN* a pushdown request over a table of a Unity Catalog or Glue virtual schema
 * *WHEN* the adapter loads the table
 * *THEN* the format that the catalog's table answer reports SHALL select the plan: under Unity Catalog, the Delta tag plans a Delta scan and the Parquet tag plans the Unity Parquet scan of `unity-catalog/unity-parquet-table-planning`; under Glue, the Iceberg tag plans an Iceberg scan from the table's metadata file and the Parquet tag plans the Hive Parquet scan of `glue/glue-table-planning`
-* *AND* a format that the kind does not plan, Iceberg under Unity Catalog or Delta under Glue, SHALL fail the query with an error that names the table and the reported format, because a table planned as another format surfaces a missing log or a wrong schema instead of a clear format refusal
-* *AND* the adapter SHALL apply this refusal to the format that the pushdown's own table lookup reports, even when `createVirtualSchema` listed the table under a format the kind plans
+* *AND* a Unity Catalog table that reports the Iceberg format SHALL fail as `file-planning/pushdown-format-neutral-resolution` states in "A table the reader cannot plan fails the query loud at plan time", by the format that the pushdown's own table lookup reports, even when `createVirtualSchema` listed the table under a format the kind plans

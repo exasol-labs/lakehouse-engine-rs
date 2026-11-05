@@ -1,6 +1,6 @@
 # Feature: Pushdown Statement State
 
-Governs what the pushdown requests of one statement share on one virtual schema: the catalog session, the loaded tables, and the table resolutions. `file-planning/pushdown-format-neutral-resolution` states how each request resolves through the format-reader seam.
+Governs what the pushdown requests of one statement share on one virtual schema: the catalog session and the loaded tables. `file-planning/pushdown-format-neutral-resolution` states how each request resolves through the format-reader seam.
 
 ## Background
 
@@ -8,16 +8,6 @@ Governs what the pushdown requests of one statement share on one virtual schema:
 * The adapter keeps its state per virtual schema name for the life of that VM.
 
 ## Scenarios
-
-### Scenario: A request's table resolutions run concurrently rather than one after another
-
-* *GIVEN* a broadcast-join pushdown request whose legs each resolve one table
-* *WHEN* the adapter resolves the request's legs
-* *THEN* the adapter SHALL resolve every leg CONCURRENTLY, so a two-leg join's plan-time latency approaches its slowest leg rather than the sum of its legs
-* *AND* the concurrency SHALL apply to EVERY catalog kind and EVERY table format, so the Delta log reads of two Delta legs overlap in time instead of the second leg's reads starting after the first leg's end
-* *AND* the generated SQL and the serialized per-shard scan specs MUST NOT depend on the order in which the legs finish
-* *AND* the error a failing leg produces SHALL be the same error that the leg produces alone, and a request with more than one failing leg SHALL surface one of those errors rather than a combined or masked one
-* *AND* the per-request in-flight object-store bound SHALL be unchanged by the concurrency
 
 ### Scenario: The pushdowns of one statement share one catalog session per virtual schema
 

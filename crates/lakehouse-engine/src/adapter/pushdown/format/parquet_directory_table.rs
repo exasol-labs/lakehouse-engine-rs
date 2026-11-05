@@ -8,36 +8,61 @@ use object_store::ObjectStore;
 use serde_json::Value as Json;
 
 use super::partition_predicate::PartitionPredicate;
+use super::unity_table_storage::redacted;
 use super::{LoadedTable, PlannedFiles};
 use crate::adapter::column_notes::DeclaredSchema;
-use crate::adapter::parquet_directory::{ParquetFile, ParquetListing};
+use crate::adapter::parquet_directory::{ParquetFile, ParquetListing, PartitionKeepPredicate};
 use crate::scan::ObjectLocation;
 use crate::scan::spec::FileEntry;
 
 #[cfg(test)]
-#[path = "parquet_format_reader_tests.rs"]
+#[path = "parquet_directory_table_tests.rs"]
 mod tests;
 
 /// A directory's full listing, against which each reference declares its partition columns; no
-/// footer is read.
+/// footer is read. Serves a direct-storage table and a Unity Catalog Parquet table alike.
 pub(in crate::adapter::pushdown) struct ParquetDirectoryTable {
     listing: ParquetListing,
     table_root: ObjectLocation,
-    /// The CONNECTION's static backend; no credential-vending catalog overrides it.
+    /// The backend the listing was read through, which the scan reads the files through.
     storage: StorageBackend,
 }
 
 impl ParquetDirectoryTable {
-    /// `store` is shared by every load of the virtual schema's statement (one admission limiter).
+    /// Errors are redacted against `storage`'s secrets, because `store` reads through it.
     pub(in crate::adapter::pushdown) async fn open(
         store: &Arc<dyn ObjectStore>,
         table_root: &ObjectLocation,
         storage: &StorageBackend,
     ) -> Result<Self, UdfError> {
+        let listing = ParquetListing::list(store, table_root.key())
+            .await
+            .map_err(|error| redacted(error, &storage.secret_values()))?;
         Ok(Self {
-            listing: ParquetListing::list(store, table_root.key()).await?,
+            listing,
             table_root: table_root.clone(),
             storage: storage.clone(),
+        })
+    }
+
+    /// The listed files whose `partition_columns` values `keep` admits.
+    pub(super) fn plan(
+        &self,
+        partition_columns: &[String],
+        keep: &PartitionKeepPredicate,
+    ) -> Result<PlannedFiles, UdfError> {
+        let files = self
+            .listing
+            .kept_files(partition_columns, keep)
+            .map_err(|error| redacted(error, &self.storage.secret_values()))?
+            .into_iter()
+            .map(|file| file_entry(file, &self.table_root))
+            .collect();
+        Ok(PlannedFiles {
+            files,
+            effective_storage: self.storage.clone(),
+            table_root: self.table_root.to_wire(),
+            name_mapping: Vec::new(),
         })
     }
 }
@@ -53,19 +78,7 @@ impl LoadedTable for ParquetDirectoryTable {
         Box::pin(async move {
             let predicate = PartitionPredicate::from_filter(filter_json, &[]);
             let keep = move |values: &_| predicate.keeps(values);
-            let root = &self.table_root;
-            let files = self
-                .listing
-                .kept_files(&declared.partition_columns, &keep)?
-                .into_iter()
-                .map(|file| file_entry(file, root))
-                .collect();
-            Ok(PlannedFiles {
-                files,
-                effective_storage: self.storage.clone(),
-                table_root: root.to_wire(),
-                name_mapping: Vec::new(),
-            })
+            self.plan(&declared.partition_columns, &keep)
         })
     }
 }

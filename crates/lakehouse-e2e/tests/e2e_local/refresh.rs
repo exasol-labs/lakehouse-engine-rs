@@ -8,7 +8,6 @@ use crate::common::seed::rest_replace_current_schema;
 use crate::common::stack::{
     CatalogConnectionPassword, PROXY_URL_INTERNAL, build_create_connection_sql,
     iceberg_catalog_url, iceberg_catalog_url_internal, local_stack_connection_password,
-    wait_for_proxy,
 };
 use crate::fixtures::{
     append_file, drop_table_if_exists, ensure_id_val_table, id_val_schema, load, seed_catalog,
@@ -573,11 +572,11 @@ fn refresh_tables_heals_and_refreshes_only_the_requested_tables() {
 
     // `scripts/proxy/filter` answers TABLE_THREE's `loadTable` with 403.
     let three_declaration = declared_types(&mut conn, PARTIAL_VS, "TABLE_THREE");
-    wait_for_proxy();
-    create_schema_and_scripts_with_env(
+    create_proxied_schema_and_scripts(
         &mut conn,
         PARTIAL_ADAPTER_SCHEMA,
         &[("HTTP_PROXY", PROXY_URL_INTERNAL)],
+        &[],
         &[],
     );
     assert_query_fails(

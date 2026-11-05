@@ -2,27 +2,14 @@ use super::super::binary_filter::BinaryLayout;
 use super::super::test_support::{
     GlueEndpoint, ICEBERG_CONFIG_TARGET, ICEBERG_LOAD_TABLE_TARGET, RecordingCatalog,
     UNITY_TABLE_TARGET, UNREACHABLE_CATALOG, delta_notes, endpoint_storage, iceberg_catalog,
-    involved_notes, locationless_delta_table_body, resolved_connection, sample_storage,
-    statement_catalog, unauthenticated_creds,
+    involved_notes, locationless_delta_table_body, sample_storage, statement_over,
 };
 use super::*;
 use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::direct_storage_properties::join_storage_path;
 use crate::adapter::permission::PermissionSettings;
 use crate::adapter::properties::{PERMISSION_CHECK, USER_MAPPING};
-use crate::scan::spec::StorageBackend;
 use crate::types::exasol_type::ExasolType;
-
-/// The state of a statement's first pushdown over `catalog_uri`, with an unauthenticated
-/// CONNECTION and no properties.
-fn statement_over(
-    kind: CatalogKind,
-    catalog_uri: &str,
-    storage: StorageBackend,
-) -> StatementCatalog {
-    let connection = resolved_connection(kind, catalog_uri, storage, unauthenticated_creds());
-    statement_catalog(connection, &Json::Null).expect("the catalog client issues no request")
-}
 
 fn lakekeeper_check() -> PermissionCheck {
     PermissionSettings::parse(&serde_json::json!({
@@ -259,18 +246,6 @@ async fn an_enforced_check_admits_an_allowed_table_and_refuses_a_denied_one() {
 
         assert_eq!(resolver.is_ok(), allowed);
     }
-}
-
-#[test]
-fn only_unchecked_identifiers_are_batch_checked() {
-    let admitted = HashSet::from(["db.checked".to_string(), "db.also_checked".to_string()]);
-
-    let unchecked = unchecked_identifiers(
-        &["db.new", "db.checked", "db.other_new", "db.also_checked"],
-        &admitted,
-    );
-
-    assert_eq!(unchecked, ["db.new", "db.other_new"]);
 }
 
 #[tokio::test]

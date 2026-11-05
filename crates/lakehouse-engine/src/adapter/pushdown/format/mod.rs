@@ -16,22 +16,22 @@ use crate::types::mapping::arrow_type_from_tag;
 pub use crate::adapter::column_notes::RefusedColumn;
 
 mod catalog_declaration;
-mod catalog_parquet_format_reader;
-mod delta_format_reader;
+mod catalog_parquet_table;
 mod delta_predicate;
 mod delta_protocol;
 mod delta_replay;
 mod delta_schema;
+mod delta_table;
 pub(super) mod filter_json;
 mod iceberg;
-mod parquet_format_reader;
+mod parquet_directory_table;
 mod partition_predicate;
 mod unity_table_storage;
 
-pub(super) use catalog_parquet_format_reader::CatalogParquetTable;
-pub(super) use delta_format_reader::DeltaTable;
+pub(super) use catalog_parquet_table::CatalogParquetTable;
+pub(super) use delta_table::DeltaTable;
 pub(super) use iceberg::IcebergTable;
-pub(super) use parquet_format_reader::ParquetDirectoryTable;
+pub(super) use parquet_directory_table::ParquetDirectoryTable;
 pub(super) use unity_table_storage::UnityTableStorage;
 
 #[cfg(test)]

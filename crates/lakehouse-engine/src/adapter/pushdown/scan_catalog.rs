@@ -157,19 +157,10 @@ async fn open_unity_table(
     Ok(match table.format {
         TableFormat::Delta => Arc::new(DeltaTable::open(storage).await?),
         TableFormat::Parquet => Arc::new(CatalogParquetTable::from_unity(storage).await?),
-        TableFormat::Iceberg => {
-            return Err(UdfError::User(format!(
-                "Unity Catalog table {} reports the {:?} table format, which no Unity Catalog \
-                 reader plans",
-                catalog_identifier_string(&table.ident),
-                table.format
-            )));
-        }
+        TableFormat::Iceberg => return Err(unplanned_format("Unity Catalog", table)),
     })
 }
 
-/// The single-table load applies no listing filter, so the format its answer reports is
-/// checked here, before any storage request.
 async fn open_glue_table(
     session: &GlueCatalogSession,
     table: &CatalogTable,
@@ -180,14 +171,19 @@ async fn open_glue_table(
         TableFormat::Parquet => {
             Arc::new(CatalogParquetTable::from_glue(session, table, storage).await?)
         }
-        TableFormat::Delta => {
-            return Err(UdfError::User(format!(
-                "Glue table {} reports the {:?} table format, which no Glue reader plans",
-                catalog_identifier_string(&table.ident),
-                table.format
-            )));
-        }
+        // The Glue client tags no table Delta; the arm keeps the match exhaustive.
+        TableFormat::Delta => return Err(unplanned_format("Glue", table)),
     })
+}
+
+/// A table planned as another format surfaces a missing log or a wrong schema, so it is refused
+/// with the format its catalog reported.
+fn unplanned_format(catalog: &str, table: &CatalogTable) -> UdfError {
+    UdfError::User(format!(
+        "{catalog} table {} reports the {:?} table format, which no {catalog} reader plans",
+        catalog_identifier_string(&table.ident),
+        table.format
+    ))
 }
 
 /// `root` is the CONNECTION address already joined with `NAMESPACE`, as enumeration composes it.

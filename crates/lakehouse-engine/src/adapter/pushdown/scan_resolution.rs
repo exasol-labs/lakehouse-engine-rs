@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
@@ -42,7 +40,7 @@ impl<'a> TableScanResolver<'a> {
             client.check_identifier(identifier)?;
         }
         if let PermissionCheck::Enforced(gate) = permission {
-            let unchecked = unchecked_identifiers(table_identifiers, &statement.admitted());
+            let unchecked = statement.unchecked(table_identifiers);
             if !unchecked.is_empty() {
                 let creds = &statement.connection().creds;
                 statement.admit(client.authorize(gate, &unchecked, creds).await?);
@@ -82,24 +80,11 @@ impl<'a> TableScanResolver<'a> {
     fn require_admitted(&self, table_identifier: &str) -> Result<(), UdfError> {
         match self.permission {
             PermissionCheck::Off => Ok(()),
-            PermissionCheck::Enforced(_)
-                if self.statement.admitted().contains(table_identifier) =>
-            {
-                Ok(())
-            }
+            PermissionCheck::Enforced(_) if self.statement.is_admitted(table_identifier) => Ok(()),
             PermissionCheck::Enforced(_) => Err(UdfError::User(format!(
                 "pushdown: the Lakekeeper permission check did not cover table \
                  '{table_identifier}', so the adapter does not read it"
             ))),
         }
     }
-}
-
-/// The identifiers that no permission check of the statement admitted yet, in request order.
-fn unchecked_identifiers<'i>(identifiers: &[&'i str], admitted: &HashSet<String>) -> Vec<&'i str> {
-    identifiers
-        .iter()
-        .copied()
-        .filter(|identifier| !admitted.contains(*identifier))
-        .collect()
 }

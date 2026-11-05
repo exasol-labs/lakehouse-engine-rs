@@ -72,9 +72,10 @@ The adapter keeps a virtual schema's catalog client, its loaded tables, and its 
 
 | Option | Verdict |
 |--------|---------|
+| Keep no state, so each pushdown request loads its own tables | Rejected: a UNION ALL branch, a CTE reference, and a subquery each arrive as a request of their own, so one table loads once per request |
+| Keep one state per VM, with no key | Rejected: nothing guarantees that a VM never serves two virtual schemas of one statement, and each must use its own CONNECTION and properties |
 | Key the state by session id, statement id, or a TTL | Rejected: the VM never outlives its statement, so the name alone suffices |
 
 ### Consequences
 
 - An Exasol version that reuses one adapter VM across statements would serve stale metadata, and the name key does not protect against that.
-- `AGENTS.md`, `specs/mission.md`, and `specs/architecture.md` state the statement-scoped exception to the stateless rule.

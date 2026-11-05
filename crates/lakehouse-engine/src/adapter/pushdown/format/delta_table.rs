@@ -17,7 +17,7 @@ use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, FileEntry, LogicalField};
 use lakehouse_catalog::StorageBackend;
 
 #[cfg(test)]
-#[path = "delta_format_reader_tests.rs"]
+#[path = "delta_table_tests.rs"]
 mod tests;
 
 /// A Delta table at the version that was current when its log was opened. Each prune plans the

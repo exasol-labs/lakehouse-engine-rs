@@ -6,11 +6,12 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use exasol_udf_sdk::error::UdfError;
+use serde_json::Value as Json;
 use tokio::runtime::Runtime;
 use tokio::sync::OnceCell;
 
-use crate::adapter::ResolvedConnectionConfig;
 use crate::adapter::pushdown::{ConnectionStorage, LoadedTable, ScanCatalog};
+use crate::adapter::{ResolvedConnectionConfig, construct_catalog_client, redact_error};
 
 #[cfg(test)]
 #[path = "statement_state_tests.rs"]
@@ -33,9 +34,10 @@ impl<T> StatementStates<T> {
         }
     }
 
-    /// The state kept under `name`, built on a miss. A failed build keeps nothing, and a request
-    /// without a name gets a state that the map does not keep. The build runs outside the lock,
-    /// because it may wait on the network.
+    /// The state kept under `name`, built on a miss. A failed build keeps nothing. Exasol names
+    /// the virtual schema in every pushdown, so a nameless request is malformed and gets a state
+    /// that the map does not keep. The build runs outside the lock, because it may wait on the
+    /// network.
     pub(crate) fn get_or_build<E>(
         &self,
         name: Option<&str>,
@@ -94,13 +96,20 @@ pub(crate) struct StatementCatalog {
 type SharedLoad = Arc<OnceCell<Arc<dyn LoadedTable>>>;
 
 impl StatementCatalog {
-    pub(crate) fn new(connection: ResolvedConnectionConfig, client: Box<dyn ScanCatalog>) -> Self {
-        Self {
+    /// Builds `connection`'s catalog client, which issues no request, with no table admitted or
+    /// loaded yet.
+    pub(crate) fn open(
+        connection: ResolvedConnectionConfig,
+        props: &Json,
+    ) -> Result<Self, UdfError> {
+        let client = construct_catalog_client(&connection, props)
+            .map_err(|e| redact_error(&connection.storage, e))?;
+        Ok(Self {
             connection,
             client,
             admitted: Mutex::default(),
             loaded: Mutex::default(),
-        }
+        })
     }
 
     pub(crate) fn connection(&self) -> &ResolvedConnectionConfig {
@@ -111,19 +120,26 @@ impl StatementCatalog {
         self.client.as_ref()
     }
 
-    /// Every identifier that a permission check of the statement admitted so far.
-    pub(crate) fn admitted(&self) -> HashSet<String> {
-        self.admitted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+    pub(crate) fn is_admitted(&self, table_identifier: &str) -> bool {
+        self.admitted_tables().contains(table_identifier)
+    }
+
+    /// The `identifiers` that no permission check of the statement admitted yet, in their order.
+    pub(crate) fn unchecked<'i>(&self, identifiers: &[&'i str]) -> Vec<&'i str> {
+        let admitted = self.admitted_tables();
+        identifiers
+            .iter()
+            .copied()
+            .filter(|identifier| !admitted.contains(*identifier))
+            .collect()
+    }
+
+    fn admitted_tables(&self) -> MutexGuard<'_, HashSet<String>> {
+        self.admitted.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn admit(&self, identifiers: Vec<String>) {
-        self.admitted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(identifiers);
+        self.admitted_tables().extend(identifiers);
     }
 
     /// The first caller for an identifier loads the table, and every concurrent or later caller

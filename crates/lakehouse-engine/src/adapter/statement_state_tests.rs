@@ -1,7 +1,27 @@
 use super::*;
+use crate::adapter::catalog_kind::CatalogKind;
+use crate::adapter::pushdown::test_support::{sample_storage, statement_over};
 
 fn built(value: u32) -> impl FnOnce() -> Result<u32, String> {
     move || Ok(value)
+}
+
+#[test]
+fn only_identifiers_that_no_check_admitted_stay_unchecked() {
+    let statement = statement_over(
+        CatalogKind::IcebergRest,
+        "http://catalog.example.com",
+        sample_storage(),
+    );
+
+    statement.admit(vec!["db.checked".into(), "db.also_checked".into()]);
+
+    assert_eq!(
+        statement.unchecked(&["db.new", "db.checked", "db.other_new", "db.also_checked"]),
+        ["db.new", "db.other_new"]
+    );
+    assert!(statement.is_admitted("db.checked"));
+    assert!(!statement.is_admitted("db.new"));
 }
 
 #[test]

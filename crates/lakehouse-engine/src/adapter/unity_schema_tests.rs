@@ -3,7 +3,7 @@
 
 use super::*;
 
-use crate::adapter::pushdown::test_support::{UNREACHABLE_CATALOG, statement_states};
+use crate::adapter::pushdown::test_support::UNREACHABLE_CATALOG;
 use exasol_udf_sdk::test_support::TestContext;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -146,7 +146,7 @@ fn create_vs_request() -> Json {
 
 fn create_vs_over(mock: &MockUnityCatalog) -> Result<Json, UdfError> {
     let mut ctx = unity_conn_ctx(mock.base_url.clone(), "{}");
-    dispatch(&mut ctx, &create_vs_request(), &statement_states())
+    dispatch(&mut ctx, &create_vs_request())
 }
 
 fn long_col(name: &str) -> Json {
@@ -520,7 +520,7 @@ fn unreachable_unity_catalog_is_credential_safe_error() {
         json!({ "token": SENTINEL }).to_string(),
     );
 
-    let error = dispatch(&mut ctx, &create_vs_request(), &statement_states())
+    let error = dispatch(&mut ctx, &create_vs_request())
         .expect_err("an unreachable Unity Catalog must fail createVirtualSchema");
     let message = error.to_string();
 

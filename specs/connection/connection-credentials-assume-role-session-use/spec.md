@@ -9,6 +9,16 @@ Defines where the session of an assumed AWS IAM role replaces the CONNECTION's o
 
 ## Scenarios
 
+### Scenario: The adapter assumes the role once per statement and virtual schema and substitutes the session
+
+* *GIVEN* a CONNECTION that names a role and carries the base key pair
+* *WHEN* the adapter handles one `createVirtualSchema`, `refresh`, `setProperties`, or `pushdown` request through that CONNECTION
+* *THEN* a `createVirtualSchema`, `refresh`, or `setProperties` request, and the first pushdown request of a statement on a virtual schema, SHALL send exactly ONE `AssumeRole` call before its first catalog or object-storage request
+* *AND* a later pushdown request of the same statement on the same virtual schema SHALL send no `AssumeRole` call and SHALL use the session that the first pushdown assumed
+* *AND* the adapter SHALL use that session for every table the request resolves, including every side of a join, for catalog signing, Glue requests, non-vended object storage, and error redaction
+* *AND* the CONNECTION's acceptance validation and the sealing key SHALL use the CONNECTION as stated, not the assumed session
+* *AND* a CONNECTION that names no role SHALL cause no STS call, and the adapter MUST NOT reuse a session across statements or across virtual schemas
+
 ### Scenario: A catalog denial of a CONNECTION that names no role is a credential-safe error
 
 * *GIVEN* a CONNECTION that sets `use_sigv4` to true, carries the base key pair and `region`, and names no role
@@ -55,13 +65,3 @@ Defines where the session of an assumed AWS IAM role replaces the CONNECTION's o
 * *THEN* the block SHALL carry the session credentials ONLY inside the sealed envelope of `storage-access/scan-spec-credential-reference`, one envelope per join side, and MUST NOT carry a bare CONNECTION reference
 * *AND* the scan UDF SHALL read the session from that envelope and MUST NOT call STS, so a query costs one `AssumeRole` call whatever its shard count
 * *AND* neither the session credentials, the base `secret_key`, nor the external id SHALL appear in plaintext in the returned SQL
-
-### Scenario: The adapter assumes the role once per statement and virtual schema and substitutes the session
-
-* *GIVEN* a CONNECTION that names a role and carries the base key pair
-* *WHEN* the adapter handles one `createVirtualSchema`, `refresh`, `setProperties`, or `pushdown` request through that CONNECTION
-* *THEN* a `createVirtualSchema`, `refresh`, or `setProperties` request, and the first pushdown request of a statement on a virtual schema, SHALL send exactly ONE `AssumeRole` call before its first catalog or object-storage request
-* *AND* a later pushdown request of the same statement on the same virtual schema SHALL send no `AssumeRole` call and SHALL use the session that the first pushdown assumed
-* *AND* the adapter SHALL use that session for every table the request resolves, including every side of a join, for catalog signing, Glue requests, non-vended object storage, and error redaction
-* *AND* the CONNECTION's acceptance validation and the sealing key SHALL use the CONNECTION as stated, not the assumed session
-* *AND* a CONNECTION that names no role SHALL cause no STS call, and the adapter MUST NOT reuse a session across statements or across virtual schemas

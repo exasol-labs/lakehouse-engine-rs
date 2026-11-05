@@ -12,7 +12,7 @@ mod common;
 
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, VsProps, assert_decimal_orders_numerically,
-    assert_text_columns, create_schema_and_scripts, create_schema_and_scripts_with_env,
+    assert_text_columns, create_proxied_schema_and_scripts, create_schema_and_scripts,
     create_virtual_schema_with_password, declared_type, enumerated_table_names, error_text,
     exa_conn, exa_conn_redacting, expected_join_rows, explain_virtual_sql, fetch_join_rows,
     has_broadcast_join_block, has_two_scan_wrapper, install_slc, join_query, parse_int,
@@ -1571,12 +1571,9 @@ fn password_via_proxy(warehouse: &str, vended: bool) -> CatalogConnectionPasswor
         endpoint: if vended {
             password.endpoint.clone()
         } else {
-            "http://seaweedfs-via-proxy:8333".to_string()
+            stack::SEAWEEDFS_VIA_PROXY.to_string()
         },
-        oauth2_server_uri: password
-            .oauth2_server_uri
-            .as_deref()
-            .map(|uri| uri.replace("//keycloak:", "//keycloak-via-proxy:")),
+        oauth2_server_uri: password.oauth2_server_uri.as_deref().map(stack::via_proxy),
         ..password
     }
 }
@@ -1588,17 +1585,20 @@ fn create_proxy_virtual_schema() {
     DONE.get_or_init(|| {
         setup();
         permission_setup();
-        stack::wait_for_proxy();
-        for host in [
-            "lakekeeper-via-proxy",
-            "keycloak-via-proxy",
-            "seaweedfs-via-proxy",
-        ] {
-            stack::assert_resolves_only_through_proxy(host);
-        }
         let proxy = [("HTTP_PROXY", stack::PROXY_URL_INTERNAL)];
+        let password = password_via_proxy(WAREHOUSE_AUTHZ, false);
+        let token_uri = password
+            .oauth2_server_uri
+            .clone()
+            .expect("the OAuth2 client-credentials CONNECTION names a token endpoint");
         let mut sys = exa_conn();
-        create_schema_and_scripts_with_env(&mut sys, PROXY_ADAPTER_SCHEMA, &proxy, &proxy);
+        create_proxied_schema_and_scripts(
+            &mut sys,
+            PROXY_ADAPTER_SCHEMA,
+            &proxy,
+            &proxy,
+            &[&proxy_catalog_uri(), &token_uri, &password.endpoint],
+        );
 
         create_virtual_schema_with_password(
             &mut sys,
@@ -1608,7 +1608,7 @@ fn create_proxy_virtual_schema() {
                 .with_property("PERMISSION_CHECK", "LAKEKEEPER")
                 .with_property("USER_MAPPING", PERMISSION_USER_MAPPING),
             &proxy_catalog_uri(),
-            &password_via_proxy(WAREHOUSE_AUTHZ, false),
+            &password,
         );
         sys.execute(&format!(
             "GRANT SELECT ON SCHEMA {VS_PROXY} TO {}",
@@ -1618,7 +1618,7 @@ fn create_proxy_virtual_schema() {
 }
 
 fn proxy_catalog_uri() -> String {
-    LAKEKEEPER_CATALOG_URI_INTERNAL.replace("//lakekeeper:", "//lakekeeper-via-proxy:")
+    stack::via_proxy(LAKEKEEPER_CATALOG_URI_INTERNAL)
 }
 
 /// Scenario: Catalog, storage, and STS requests go through the proxy

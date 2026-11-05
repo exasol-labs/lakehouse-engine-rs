@@ -17,7 +17,7 @@ The adapter reads a Unity Catalog through its native REST API. It lists the tabl
 
 ### Scenario: The catalog-client trait keeps Unity Catalog's type mapping, format tag, and vending key opaque to the engine
 
-* *GIVEN* the same `UnityCatalogSession` and shared `CatalogClient` trait
+* *GIVEN* the Unity Catalog client in `lakehouse-catalog`, which implements the `CatalogClient` trait that the engine enumerates through
 * *WHEN* the engine adapter enumerates a namespace or loads one table's metadata under the Unity Catalog kind
 * *THEN* the client MUST NOT map a column type to an Exasol type, because that mapping belongs to the engine's single type-mapping home and this crate MUST NOT name the Exasol delivery mechanism
 * *AND* the neutral format tag SHALL be a closed enum naming exactly the formats the engine can plan, so a format outside it is a deserialization-time refusal rather than a value the engine matches non-exhaustively

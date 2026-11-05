@@ -5,7 +5,7 @@ Routes every pushdown request through the table-format reader seam. The reader t
 ## Background
 
 * A table's file list comes from its format's own metadata: Iceberg metadata and manifests, the Delta log, a Glue partition list, or a Parquet directory listing. Pushdown SQL shape (projection, filter, LIMIT, ORDER BY, aggregate decomposition, join eligibility) is decided from the request's SQL alone, and only file resolution differs per format.
-* Exasol sends one pushdown request per pushed-down query block, so a UNION ALL branch, each reference to a CTE, and a subquery arrive as separate requests. One adapter VM serves every request of one statement on one virtual schema.
+* `file-planning/pushdown-statement-state` states what the pushdown requests of one statement share.
 * The `storage` value of the generated SQL and of each serialized per-shard scan spec is the tagged wrapper of `storage-access/scan-spec-credential-reference`.
 
 ## Scenarios
@@ -108,3 +108,13 @@ Routes every pushdown request through the table-format reader seam. The reader t
 * *WHEN* Exasol requests the adapter's capabilities for each
 * *THEN* the adapter SHALL return the SAME capability set for all three, and MUST NOT read, branch on, or receive the catalog kind while assembling it
 * *AND* a capability the adapter advertises SHALL therefore be one it satisfies under EVERY kind, because Exasol re-applies nothing it delegated and a kind-conditional capability would return wrong rows rather than a deferred check
+
+### Scenario: A request's table resolutions run concurrently rather than one after another
+
+* *GIVEN* a broadcast-join pushdown request whose legs each resolve one table
+* *WHEN* the adapter resolves the request's legs
+* *THEN* the adapter SHALL resolve every leg CONCURRENTLY, so a two-leg join's plan-time latency approaches its slowest leg rather than the sum of its legs
+* *AND* the concurrency SHALL apply to EVERY catalog kind and EVERY table format, so the Delta log reads of two Delta legs overlap in time instead of the second leg's reads starting after the first leg's end
+* *AND* the generated SQL and the serialized per-shard scan specs MUST NOT depend on the order in which the legs finish
+* *AND* the error a failing leg produces SHALL be the same error that the leg produces alone, and a request with more than one failing leg SHALL surface one of those errors rather than a combined or masked one
+* *AND* the per-request in-flight object-store bound SHALL be unchanged by the concurrency
