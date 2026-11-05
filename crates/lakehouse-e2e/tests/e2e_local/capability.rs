@@ -3135,6 +3135,25 @@ fn cast_to_a_non_emittable_target_matches_native() {
     }
 }
 
+/// Scenario: CAST renders the mapped target type per dialect
+/// Scenario: CONCAT translates to a NULL-skipping DataFusion concat call
+#[test]
+fn boolean_to_text_in_the_single_table_wrapper_matches_native() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let table = typed_table();
+
+    // `C_BOOL || 'x'` routes each query into the Exasol-dialect wrapper.
+    let queries = [
+        "SELECT ID, C_BOOL || 'x', CAST(C_DECIMAL_A > 10 AS VARCHAR(10)) FROM {} ORDER BY ID",
+        "SELECT ID, C_BOOL || 'x', (C_DECIMAL_A > 10) || 'y' FROM {} ORDER BY ID",
+    ];
+    assert_queries_match_native_copy(&mut conn, &table, TYPED_COLUMNS, &queries);
+    for query in queries {
+        assert_single_table_wrapper(&mut conn, &query.replace("{}", &table));
+    }
+}
+
 /// Scenario: An INTERVAL, GEOMETRY, or HASHTYPE select-list item, or a TIMESTAMP WITH LOCAL TIME ZONE aggregate or GROUP BY key, is computed by Exasol over the sharded scan
 /// Scenario: The Exasol dialect renders a CHAR CAST target as CHAR, not VARCHAR
 /// Scenario: Empty-result shape matches the plan the non-empty path would commit to

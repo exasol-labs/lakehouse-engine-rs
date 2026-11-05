@@ -714,6 +714,24 @@ fn renders_cast_bool_to_varchar_uses_case_for_any_predicate_source() {
 }
 
 #[test]
+fn renders_cast_bool_to_varchar_as_plain_cast_in_exasol_dialect() {
+    let expr = json!({
+        "type": "function_scalar_cast",
+        "name": "CAST",
+        "arguments": [{
+            "type": "predicate_greater",
+            "left": col("c_acctbal"),
+            "right": num_lit(0)
+        }],
+        "dataType": {"type": "VARCHAR", "size": 10}
+    });
+    assert_eq!(
+        render_expression_exasol(&expr).unwrap(),
+        r#"CAST(("C_ACCTBAL" > 0) AS VARCHAR(10))"#
+    );
+}
+
+#[test]
 fn renders_cast_boolean() {
     let expr = cast(json!({"type": "BOOLEAN"}));
     assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS BOOLEAN)"#);
@@ -1334,7 +1352,7 @@ fn renders_concat_as_chained_pipe_operator_in_exasol_dialect() {
     });
     assert_eq!(
         render_expression_exasol(&expr).unwrap(),
-        r#"((CASE ("ACTIVE" = TRUE) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END) || '')"#
+        r#"(("ACTIVE" = TRUE) || '')"#
     );
 }
 
