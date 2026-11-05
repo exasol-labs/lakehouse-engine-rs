@@ -49,8 +49,8 @@ The adapter decomposes an ungrouped select item that is a scalar function wrappi
 * *GIVEN* an ungrouped `pushdown` request whose select list places one or more scalar-over-aggregate items before, after, and between plain aggregates, for example `SELECT MIN(L_QUANTITY), ROUND(SUM(L_QUANTITY), 2), COUNT(*), ROUND(AVG(L_EXTENDEDPRICE), 3) FROM LINEITEM`
 * *WHEN* the adapter builds the outer merge SELECT and the fan-out `EMITS` clause
 * *THEN* the adapter SHALL emit the outer merge SELECT items in the exact order the corresponding items appear in `selectList`, interleaving merged plain-aggregate expressions and merged scalar-over-aggregate expressions as required, so Exasol's positional pushdown validation passes for every arrangement
-* *AND* the adapter SHALL resolve the outer CAST for each item from the `selectListDataTypes` entry at that item's OWN `selectList` ordinal, matched by index rather than by comparing rendered SQL strings, through the same declared-type CAST a bare aggregate uses
-* *AND* the adapter SHALL resolve each partial column's `EMITS` type from the PER-PLAN declared-type list the deduplicating fold builds, and MUST NOT index the declared types by position among the `function_aggregate` items alone, because a skipped scalar item shifts every later index
+* *AND* the adapter SHALL take each item's declared type from the `selectListDataTypes` entry at that item's own `selectList` ordinal, and SHALL cast or leave uncast each merged item by the merge-cast rule of `pushdown-aggregates/pushdown-planning-single-group-agg`, so `MIN(L_QUANTITY)` stays uncast and `ROUND(SUM(L_QUANTITY), 2)`, `COUNT(*)`, and `ROUND(AVG(L_EXTENDEDPRICE), 3)` are cast
+* *AND* each partial column's `EMITS` type SHALL be the type of the aggregate that column carries, even when a scalar-over-aggregate item earlier in the select list shifts the ordinals of later aggregates
 * *AND* the returned row SHALL carry exactly one column per `selectList` item, with each column equal to that item evaluated over all rows on a single node
 
 ### Scenario: A nested aggregate the merge cannot decompose widens the projection instead of being evaluated per shard

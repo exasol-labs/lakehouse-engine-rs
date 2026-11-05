@@ -52,16 +52,6 @@ Defines the version-gated fractional-second precision Exasol declares for a cata
 * *AND* the nanosecond DIGITS SHALL be present in the data rather than zeroed upstream, established end to end rather than by reasoning about the reader: a `timestamp_ns` column seeded through the `format-version` table PROPERTY, carrying two instants that differ ONLY below the microsecond, was measured on `exasol/docker-db:2025.1.16` to be declared `TIMESTAMP(9)` with BOTH instants distinct, and on 8.29.13 to be declared bare `TIMESTAMP`, reported `TIMESTAMP(3)`, with the two collapsing to ONE
 * *AND* the INT96 exception SHALL be named: `raw_scan.rs`'s `coerce_int96 = "us"` forces an INT96 PHYSICAL column to microseconds whatever its logical type, so a nanosecond-typed column stored as INT96 arrives at microsecond; a spec-conformant Iceberg `timestamp_ns` is written as INT64 `TIMESTAMP(NANOS)` and is unaffected
 
-### Scenario: The Arrow-input type resolver stays outside the version gate
-
-* *GIVEN* `arrow_to_exasol_type` and its private `compatible_exasol_type`, the ARROW-INPUT direction, whose `DataType::Timestamp(_, _)` arm returns the bare string `TIMESTAMP`
-* *WHEN* the version gate is threaded through the catalog-declared producers
-* *THEN* neither function SHALL gain a precision parameter, and both SHALL keep their recorded signature and their recorded answer for every input byte-identical, including `TIMESTAMP` for every `Timestamp(_, _)`
-* *AND* the exclusion SHALL hold because the direct-storage kind resolves a Parquet timestamp through the version gate before it reaches the Arrow-input direction, and the only production consumer of `compatible_exasol_type` is `needs_json_fallback`, whose answer for a `Timestamp(_, _)` is `false` at every precision
-* *AND* `needs_json_fallback` SHALL keep its recorded `fn(&DataType) -> bool` signature and its answer for every input unchanged, so none of its call sites move
-* *AND* the compatible-Arrow-types table's `Timestamp(_, _) | TIMESTAMP` row SHALL stay unamended (`scan-types/type-mapping`), and a reader MUST NOT read it as governing the catalog-declared declaration this delta version-gates
-* *AND* the exclusion SHALL be stated here rather than left silent, because `arrow_to_exasol_type` looks like a gate target and an unexplained omission is indistinguishable from an oversight
-
 ### Scenario: A direct-storage Parquet timestamp declares the precision of its unit
 
 * *GIVEN* a direct-storage column whose Parquet footer declares a timestamp at `MILLIS`, `MICROS`, or `NANOS`, with or without UTC adjustment, or an INT96 timestamp
