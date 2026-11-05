@@ -9,14 +9,15 @@ Defines where the session of an assumed AWS IAM role replaces the CONNECTION's o
 
 ## Scenarios
 
-### Scenario: The adapter assumes the role once per request and substitutes the session
+### Scenario: The adapter assumes the role once per statement and virtual schema and substitutes the session
 
 * *GIVEN* a CONNECTION that names a role and carries the base key pair
 * *WHEN* the adapter handles one `createVirtualSchema`, `refresh`, `setProperties`, or `pushdown` request through that CONNECTION
-* *THEN* the adapter SHALL send exactly ONE `AssumeRole` call before its first catalog or object-storage request, and SHALL use that session for every table the request resolves, including every side of a join
-* *AND* ONE `lakehouse-catalog` function SHALL return the credential set with `access_key`, `secret_key`, and `session_token` replaced by the session's and every other field unchanged, so the catalog session, the format readers, the direct-storage store, and error redaction read the session without naming the role
-* *AND* the acceptance validation and the sealing key SHALL be computed from the CONNECTION as stated, before the replacement
-* *AND* a CONNECTION that names no role SHALL cause no STS call, and the adapter MUST NOT reuse a session across requests
+* *THEN* a `createVirtualSchema`, `refresh`, or `setProperties` request, and the first pushdown request of a statement on a virtual schema, SHALL send exactly ONE `AssumeRole` call before its first catalog or object-storage request
+* *AND* a later pushdown request of the same statement on the same virtual schema SHALL send no `AssumeRole` call and SHALL use the session that the first pushdown assumed
+* *AND* the adapter SHALL use that session for every table the request resolves, including every side of a join, for catalog signing, Glue requests, non-vended object storage, and error redaction
+* *AND* the CONNECTION's acceptance validation and the sealing key SHALL use the CONNECTION as stated, not the assumed session
+* *AND* a CONNECTION that names no role SHALL cause no STS call, and the adapter MUST NOT reuse a session across statements or across virtual schemas
 
 ### Scenario: A catalog denial of a CONNECTION that names no role is a credential-safe error
 

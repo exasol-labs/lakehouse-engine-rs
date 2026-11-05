@@ -93,8 +93,9 @@ are the storage credential for non-vended S3 access. A role leaves credential ve
 with `use_vended_credentials` on, storage is still resolved by vending (the `load_table` response
 under Iceberg REST, or Unity Catalog temporary table credentials under `CATALOG_KIND =
 'UNITY_CATALOG'`), exactly as for the same CONNECTION without a role; the session credentials sign
-only the catalog requests in that case. The adapter sends exactly one `AssumeRole` call per request
-— whatever the shard count — and does not renew the session mid-query; the STS session lasts a fixed
+only the catalog requests in that case. The adapter sends exactly one `AssumeRole` call per
+`CREATE`, `REFRESH`, or `SET PROPERTIES` request, and one per statement and virtual schema for
+pushdown, whatever the shard count. It does not renew the session mid-query; the STS session lasts a fixed
 3600 seconds (`DurationSeconds` is not configurable).
 
 **Endpoint and region.** The STS endpoint is `aws_sts_endpoint` when stated, else

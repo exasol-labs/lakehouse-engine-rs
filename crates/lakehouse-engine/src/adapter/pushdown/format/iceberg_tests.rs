@@ -1,12 +1,13 @@
 use super::super::super::test_support::{
-    BINARY_ICEBERG_LAST_COLUMN_ID, RecordingCatalog, binary_iceberg_fields,
-    declared_logical_schema, glue_catalog_table, involved_notes, load_table_body,
-    load_table_body_notes, load_table_body_with_columns, object_endpoint, resolve_from_notes,
-    sample_storage, sigv4_creds, user_message,
+    BINARY_ICEBERG_LAST_COLUMN_ID, FakeCatalog, binary_iceberg_fields, declared_logical_schema,
+    glue_catalog_table, involved_notes, load_table_body, load_table_body_notes,
+    load_table_body_with_columns, object_endpoint, resolve_from_notes, sample_storage, sigv4_creds,
+    user_message,
 };
 use super::super::ResolvedScan;
 use super::*;
 use crate::adapter::column_notes::TableNotes;
+use crate::adapter::pushdown::test_support::connection_storage;
 use iceberg::spec::{DataContentType, DataFileFormat};
 use lakehouse_catalog::{ConnectionCreds, StorageBackend, TableFormat};
 
@@ -34,7 +35,7 @@ async fn resolve_rest(
     filter_json: Option<&Json>,
 ) -> Result<ResolvedScan, UdfError> {
     let notes = load_table_body_notes(&serde_json::from_str(&body).expect("a JSON body"));
-    let catalog = RecordingCatalog::spawn(move |_target| (200, body.clone())).await;
+    let catalog = FakeCatalog::spawn(move |_target| (200, body.clone())).await;
     let session = CatalogSession::resolve(&catalog.uri, &creds.warehouse, creds)
         .await
         .expect("the SigV4 path resolves a session without contacting the catalog");
@@ -42,23 +43,18 @@ async fn resolve_rest(
         warehouse: creds.warehouse.clone(),
         table: table.into(),
     };
-    let reader = IcebergFormatReader {
-        metadata: IcebergMetadataSource::RestLoadTable {
-            session: &session,
-            catalog_props: &catalog_props,
-        },
-        connection: ConnectionStorage {
-            storage,
-            creds,
-            allow_http: true,
-        },
-    };
-    resolve_from_notes(&reader, &involved_notes("T", &notes), filter_json).await
+    let connection = connection_storage(storage, creds);
+    resolve_from_notes(
+        IcebergTable::from_rest(&session, &catalog_props, &connection),
+        &involved_notes("T", &notes),
+        filter_json,
+    )
+    .await
 }
 
-/// Scenario: The Iceberg format reader owns file resolution and binds columns by field-id
+/// Scenario: An Iceberg scan carries its delete references and binds columns by field-id
 #[tokio::test]
-async fn iceberg_reader_owns_resolution_and_keeps_its_encoding() {
+async fn an_iceberg_scan_keeps_its_field_id_encoding() {
     let storage = sample_storage();
     let body = name_mapped_load_table_body().to_string();
     let resolved = resolve_rest(body, "db.t", &sigv4_creds(), &storage, None)
@@ -1134,7 +1130,7 @@ fn assert_promotion_refusal_names_table_column_and_issue(err: UdfError) {
     }
 }
 
-/// No snapshot, so reaching the refusal proves `resolve_scan` invokes it without a manifest read.
+/// No snapshot, so reaching the refusal proves the load invokes it without a manifest read.
 #[tokio::test]
 async fn a_promoted_date_table_is_refused_filtered_or_not_and_from_either_metadata_source() {
     let body = load_table_body(serde_json::json!({
@@ -1201,15 +1197,12 @@ async fn resolve_metadata_file(
     notes: &TableNotes<'_>,
     storage: &StorageBackend,
 ) -> Result<ResolvedScan, UdfError> {
-    let reader = IcebergFormatReader {
-        metadata: IcebergMetadataSource::MetadataFile { table },
-        connection: ConnectionStorage {
-            storage,
-            creds: &sigv4_creds(),
-            allow_http: true,
-        },
-    };
-    resolve_from_notes(&reader, notes, None).await
+    resolve_from_notes(
+        IcebergTable::from_metadata_file(table, storage),
+        notes,
+        None,
+    )
+    .await
 }
 
 /// Scenario: A Glue Iceberg table is planned from its metadata location by the one Iceberg planner

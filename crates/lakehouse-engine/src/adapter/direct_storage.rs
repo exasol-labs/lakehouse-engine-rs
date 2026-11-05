@@ -52,6 +52,15 @@ impl DirectStorageCatalogClient {
         })
     }
 
+    pub(crate) fn store(&self) -> &Arc<dyn ObjectStore> {
+        &self.store
+    }
+
+    /// The CONNECTION address joined with `NAMESPACE`, below which each table is a directory.
+    pub(crate) fn root(&self) -> &ObjectLocation {
+        &self.root
+    }
+
     /// The one admission rule both listings share, so `SKIPPED_TABLES` reads the same after either.
     async fn admit(&self, ident: CatalogTableIdent) -> Result<TableAdmission, UdfError> {
         let table_root = self.root.child(&ident.name)?;
@@ -125,22 +134,6 @@ impl CatalogClient for DirectStorageCatalogClient {
                 .try_collect()
                 .await?;
             Ok(admissions.into_iter().collect())
-        })
-    }
-
-    /// Unreachable on the happy path: pushdown resolves a direct-storage table from its own
-    /// composed root instead of a catalog load, so this just returns a named error.
-    fn load_table(
-        &self,
-        ident: &CatalogTableIdent,
-    ) -> Pin<Box<dyn Future<Output = Result<CatalogTable, UdfError>> + Send + '_>> {
-        let name = ident.name.clone();
-        Box::pin(async move {
-            Err(UdfError::User(format!(
-                "direct-storage catalog kind: table '{name}' is not loaded through \
-                 CatalogClient::load_table; the pushdown path resolves a direct-storage table \
-                 from its composed root instead"
-            )))
         })
     }
 }

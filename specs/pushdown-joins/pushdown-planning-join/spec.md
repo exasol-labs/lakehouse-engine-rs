@@ -26,12 +26,12 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inne
 * *AND* a `pushdown` request whose `from` clause is a `join` node over exactly two legs joined by an equi-condition
 * *AND* the smaller side's table-metadata byte size is at or below the broadcast threshold
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL resolve BOTH sides through the SAME format-reader seam the single-table scan uses (`file-planning/pushdown-format-neutral-resolution`), obtaining each side's data-file list, per-file byte size, logical schema, table root, and effective storage exactly once, recovering each table's original-cased catalog identifier from the schema-metadata mapping by its involved-table name
+* *THEN* the adapter SHALL resolve BOTH sides the way the single-table scan resolves its table (`file-planning/pushdown-format-neutral-resolution`), taking each side's data-file list, per-file byte size, table root, and effective storage from its table's prune and its logical schema from its column notes, loading each distinct table once (`file-planning/pushdown-statement-state`), and recovering each table's original-cased catalog identifier from the schema-metadata mapping by its involved-table name
 * *AND* the adapter SHALL designate the larger side as the sharded fact side (its file list partitioned into G byte-balanced work-unit shards and driven through the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor exactly as the single-table path does) and the smaller side as the replicated dimension side
 * *AND* the adapter SHALL carry the dimension side's FULL file list, table root, logical schema, and its OWN storage value (a connection REFERENCE or sealed envelope per `storage-access/scan-spec-credential-reference`) in the shard-invariant common spec's join block, and the fact side's storage and per-shard file subset through the distributor
 * *AND* the generated scan-driving SQL SHALL drive the `LAKEHOUSE_SCAN` SCALAR EMIT UDF so that each shard invocation joins its fact-file subset against the full replicated dimension side node-locally, with no cross-shard exchange, and with NO `SELECT * FROM (...)` wrapper for an UNORDERED request; an ORDERED request carries the outer wrapper this feature's ordering scenario specifies
 * *AND* the adapter MUST NOT read either side's Parquet row data in the planning layer
-* *AND* a join whose two sides are DELTA tables reached through Unity Catalog SHALL take this same broadcast path with no Iceberg-specific step, because the resolution seam and the broadcast decision read only neutral resolved values
+* *AND* a join whose two sides are DELTA tables reached through Unity Catalog SHALL take this same broadcast path with no Iceberg-specific step, because the side resolution and the broadcast decision read only format-neutral values
 
 ### Scenario: A bare LIMIT over a broadcast-eligible join is served by the broadcast path with a per-shard post-join cap
 

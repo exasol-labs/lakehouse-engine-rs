@@ -46,35 +46,6 @@ fn client_is_reachable_as_a_boxed_catalog_client() {
 }
 
 #[tokio::test]
-async fn load_table_returns_a_clear_error_naming_the_direct_storage_kind() {
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let client = test_client(store, "s3://bucket/lake", FOLD_NO_HIVE);
-
-    let ident = CatalogTableIdent {
-        namespace: Vec::new(),
-        name: "orders".to_string(),
-    };
-    let err = client
-        .load_table(&ident)
-        .await
-        .expect_err("load_table is unreachable on this kind's happy path");
-
-    let message = err.to_string();
-    assert!(
-        message.contains("direct-storage"),
-        "must name the direct-storage kind: {message}"
-    );
-    assert!(
-        message.contains("orders"),
-        "must name the requested table: {message}"
-    );
-    assert!(
-        message.contains("load_table"),
-        "must state a direct-storage table is not loaded through load_table: {message}"
-    );
-}
-
-#[tokio::test]
 async fn first_level_directories_are_the_tables() {
     let inner = id_files_at(&[
         "lake/orders/part-0.parquet",

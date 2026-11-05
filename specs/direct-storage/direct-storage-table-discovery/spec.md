@@ -4,26 +4,12 @@ The adapter turns a storage prefix holding directories of Parquet files into enu
 
 ## Background
 
-* The direct-storage client implements `CatalogClient` and is declared in `lakehouse-engine`, not in `lakehouse-catalog`. It needs the engine-side object-store builder, and the catalog crate does not depend on `object_store` (`architecture.md`). The engine still reaches every enumeration and table-load operation through the trait.
-* The client's base path is resolved at construction from the CONNECTION address and the `NAMESPACE` property (`direct-storage/direct-storage-properties`), inside the one construction site that may name a catalog kind.
-* The base path and each listed directory name are raw object keys (`file-planning/pushdown-planning-file-encoding`). `object_store` would escape a name again if it were joined as a new path part, so the client joins it as listed.
+* The adapter resolves the base path from the CONNECTION address and the `NAMESPACE` property (`direct-storage/direct-storage-properties`).
+* The base path and each listed directory name are raw object keys (`file-planning/pushdown-planning-file-encoding`). The adapter requests a table's objects under its directory name as listed and does not escape the name again.
 * `direct-storage/parquet-directory-seam-file-listing` owns which objects under a table root count as data files and their order. This feature owns which directories are tables and how each is named.
-* `lakehouse-catalog`'s neutral skip reason has a variant for a directory holding no data file.
-* The neutral table identifier the client returns has an empty namespace, because a direct-storage table's identity is its directory name. The shared flatten and the shared recording of each virtual table's identifier note per `vs-adapter/create-virtual-schema` then produce the bare directory name without branching on catalog kind.
+* A direct-storage table's identity is its directory name, so the identifier note of its virtual table (`vs-adapter/create-virtual-schema`) records the bare directory name with no namespace.
 
 ## Scenarios
-
-### Scenario: The direct-storage client is a boxed catalog client declared in the engine crate
-
-* *GIVEN* the shared `CatalogClient` trait declared in `lakehouse-catalog`, and the engine-side object-store builder that opens a store over a storage root
-* *WHEN* the adapter constructs the catalog client for `CatalogKind::DirectStorage`
-* *THEN* the direct-storage client type SHALL be declared in `lakehouse-engine` and SHALL implement `CatalogClient`, so the adapter reaches this client's ENUMERATION through `list_tables` exactly as it does for the other kinds
-* *AND* `load_table` SHALL be UNREACHABLE for this kind, because the pushdown path resolves a direct-storage table from its COMPOSED ROOT rather than from a catalog load, and the trait's engine-side `load_table` call sites serve the catalog-backed kinds alone
-* *AND* this client's `load_table` SHALL nevertheless return a clear error naming the direct-storage kind and stating that a direct-storage table is not loaded through the catalog trait, and MUST NOT panic and MUST NOT return an empty or synthesized table, so a caller meets a message rather than a crash or a silently wrong result
-* *AND* `lakehouse-catalog` SHALL hold NO source file, NO manifest dependency, and NO public item for this kind, so the one-way crate dependency and the catalog crate's forbidden-dependency list are both unaffected
-* *AND* the adapter SHALL run the SAME listing pipeline over this client's result that it runs for the other kinds, and that pipeline MUST NOT name or match the catalog kind
-* *AND* the client SHALL surface every failure as an error value rather than a panic, and no error message SHALL contain a credential value
-* *AND* this placement SHALL be deliberate, because the catalog-backed implementors live in the catalog crate and a reader would otherwise read this one as a mistake
 
 ### Scenario: A first-level directory under the base path is a table
 

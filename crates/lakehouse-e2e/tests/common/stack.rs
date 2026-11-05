@@ -180,6 +180,28 @@ pub fn wait_for_iceberg_catalog() {
 
 pub const PROXY_URL_INTERNAL: &str = "http://10.84.0.12:8888";
 pub const CLOSED_PROXY_URL_INTERNAL: &str = "http://10.84.0.12:1";
+/// Only the forward proxy resolves a `-via-proxy` host, so a request that bypasses it fails.
+pub const ICEBERG_REST_VIA_PROXY: &str = "http://iceberg-rest-via-proxy:8181";
+pub const SEAWEEDFS_VIA_PROXY: &str = "http://seaweedfs-via-proxy:8333";
+pub const UNITY_CATALOG_VIA_PROXY: &str = "http://unitycatalog-via-proxy:8080";
+/// The adapter schema of a suite's proxy-only scripts, so their `%env` lines reach no other
+/// virtual schema.
+pub const PROXY_ADAPTER_SCHEMA: &str = "LHVS_PROXY";
+
+/// `url` with its host renamed to the host's `-via-proxy` name.
+pub fn via_proxy(url: &str) -> String {
+    let host_start = url.find("//").map_or(0, |at| at + 2);
+    let host_end = url[host_start..]
+        .find([':', '/'])
+        .map_or(url.len(), |at| host_start + at);
+    format!("{}-via-proxy{}", &url[..host_end], &url[host_end..])
+}
+
+/// The host of `url`, as `getent` resolves it.
+pub fn url_host(url: &str) -> &str {
+    let rest = url.split_once("//").map_or(url, |(_, rest)| rest);
+    rest.split([':', '/']).next().unwrap_or(rest)
+}
 
 /// Probes from the Exasol container, because only the UDFs there reach the proxy.
 pub fn wait_for_proxy() {
@@ -260,6 +282,30 @@ pub fn proxy_log_since(since: &str) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
+}
+
+/// Runs `statement` and counts, for each `requests` entry, the proxy-log lines it produced that
+/// contain it.
+pub fn count_proxy_requests<const N: usize>(
+    requests: [&str; N],
+    statement: impl FnOnce(),
+) -> [usize; N] {
+    let log = proxy_log_during(statement);
+    requests.map(|request| request_count(&log, request))
+}
+
+/// The proxy-log lines that `statement` produced. It first waits past one second, because the
+/// log's `since` has second granularity and an earlier statement's lines must fall before the mark.
+pub fn proxy_log_during(statement: impl FnOnce()) -> String {
+    std::thread::sleep(Duration::from_millis(1100));
+    let mark = proxy_log_mark();
+    statement();
+    proxy_log_since(&mark)
+}
+
+/// How many of `log`'s lines contain `request`.
+pub fn request_count(log: &str, request: &str) -> usize {
+    log.lines().filter(|line| line.contains(request)).count()
 }
 
 /// The file surfaces inside the DB at `/buckets/bfsdefault/default/<name>`.
@@ -362,6 +408,20 @@ pub struct CatalogConnectionPassword {
 }
 
 impl CatalogConnectionPassword {
+    /// The same CONNECTION with its SeaweedFS endpoint and token endpoint renamed to the names
+    /// only the forward proxy resolves. An empty endpoint, as under vending, stays empty.
+    pub fn via_proxy(self) -> Self {
+        Self {
+            endpoint: if self.endpoint.is_empty() {
+                self.endpoint
+            } else {
+                SEAWEEDFS_VIA_PROXY.to_string()
+            },
+            oauth2_server_uri: self.oauth2_server_uri.as_deref().map(via_proxy),
+            ..self
+        }
+    }
+
     /// Single quotes are escaped as `''` for SQL embedding.
     pub fn to_sql_password_json(&self) -> String {
         let mut obj = serde_json::json!({

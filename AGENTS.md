@@ -43,10 +43,10 @@ Project specifics:
 ## Architecture rules
 
 - The Virtual Schema (VS) stays thin: query translation, pushdown analysis, parallelization planning, and result schema mapping. Execution logic lives in DataFusion.
-- UDFs are stateless and disposable. They hold no cache, persist no metadata, and keep no state across calls.
-- The VS resolves metadata once per query, never once per node, and passes each UDF an explicit file list. A UDF never discovers files itself.
+- UDFs are stateless and disposable. They hold no cache, persist no metadata, and keep no state across calls. The one exception is the adapter: it keeps each virtual schema's catalog client and loaded tables for the pushdown requests of one statement, keyed by the virtual schema name, because Exasol runs one adapter VM per statement. It keeps nothing across statements. The scan UDF keeps no such state.
+- The VS loads each table's metadata once per statement, never once per node, and passes each UDF an explicit file list. A UDF never discovers files itself.
 - Each node scans only its assigned files. Assignments never overlap.
-- `ScanSpec`, `FileEntry`, and `LogicalField` stay format-neutral. Widen an existing field before adding one, and never add a format-specific struct or `Option<FormatXSpec>`. Format knowledge lives in the plan-time `FormatReader`, and the scan side dispatches on field content, never on format identity.
+- `ScanSpec`, `FileEntry`, and `LogicalField` stay format-neutral. Widen an existing field before adding one, and never add a format-specific struct or `Option<FormatXSpec>`. Format knowledge lives in each table format's plan-time `LoadedTable`, and the scan side dispatches on field content, never on format identity.
 - Once the adapter advertises a capability, Exasol delegates it fully and never re-checks it. There is no Exasol-side fallback. The adapter must generate equivalent SQL for anything within an advertised capability that it cannot push into the DataFusion scan, because omitting it returns wrong rows.
 - Arrow types never cross the `.so` boundary, because Arrow `TypeId` is not stable across it. Only SDK `Value`s and the Arrow C Data Interface structs that `ctx.emit_batch` exports cross it.
 
