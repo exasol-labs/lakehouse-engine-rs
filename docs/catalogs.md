@@ -52,8 +52,8 @@ The catalog URI goes in the `TO` clause of the CONNECTION. Every credential fiel
 | `warehouse` | yes under `ICEBERG_REST`; optional under `GLUE`; not used under `UNITY_CATALOG` | Catalog routing identifier — an AWS account id under Glue, a warehouse **name** under Lakekeeper, or whatever identifier a generic Iceberg REST catalog registered — never read as a storage location, so a URI-shaped value (as the bundled `iceberg-rest`/MinIO stack below uses) is still only an identifier. A native Unity Catalog is addressed by `catalog.schema.table` instead, so this field is not required (or read) under `CATALOG_KIND = 'UNITY_CATALOG'`. Under `CATALOG_KIND = 'GLUE'` it is the optional Glue `CatalogId` (an AWS account id) |
 | `endpoint` | yes, unless `use_sigv4` or vended credentials | S3 endpoint URL |
 | `region` | yes, unless `use_sigv4` and the address is a standard AWS Glue endpoint (`https://glue.<region>.amazonaws.com`), or vended credentials | S3 region — also the SigV4 signing region unless a standard Glue endpoint supplies its own; state it whenever a scan reads with static S3 keys |
-| `access_key` | yes, unless `use_sigv4` or vended credentials | S3 access key |
-| `secret_key` | yes, unless `use_sigv4` or vended credentials | S3 secret key |
+| `access_key` | yes, unless `use_sigv4`, vended credentials, or a public bucket under `DIRECT_STORAGE` | S3 access key |
+| `secret_key` | yes, unless `use_sigv4`, vended credentials, or a public bucket under `DIRECT_STORAGE` | S3 secret key |
 | `session_token` | no | STS session token |
 | `aws_assume_role_arn` | no | IAM role to assume; see [Assuming an AWS IAM role](#assuming-an-aws-iam-role) |
 | `aws_external_id` | no; requires `aws_assume_role_arn` | `ExternalId` for a role whose trust policy requires one |
@@ -585,6 +585,18 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
   CATALOG_CONNECTION = 'DIRECT_STORAGE_CREDS'
   CATALOG_KIND       = 'DIRECT_STORAGE'
   ALLOW_HTTP         = 'true';
+```
+
+**Public S3 buckets.** A bucket that anyone may list and read needs no key pair. Omit
+`access_key`, `secret_key`, and `session_token`, or leave them empty, and the adapter and the scan
+send unsigned requests. `region` must still name the bucket's region. No ambient AWS credential,
+such as an environment variable or an instance profile, is read in place of the missing keys.
+
+```sql
+CREATE CONNECTION PUBLIC_SAMPLES
+  TO 's3://example-public-bucket/lake'
+  USER ''
+  IDENTIFIED BY '{ "region": "eu-central-1" }';
 ```
 
 **The three properties.**

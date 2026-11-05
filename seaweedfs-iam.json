@@ -39,6 +39,13 @@
         "Write:warehouse",
         "List:warehouse"
       ]
+    },
+    {
+      "name": "anonymous",
+      "actions": [
+        "Read:public",
+        "List:public"
+      ]
     }
   ],
   "sts": {

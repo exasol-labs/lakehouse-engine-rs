@@ -5,6 +5,7 @@ use crate::scan::spec::{
 };
 use crate::scan::test_support::{inline_resolved, join_spec, minimal_spec};
 use ::object_store::ClientConfigKey;
+use ::object_store::aws::AmazonS3ConfigKey;
 use arrow::datatypes::DataType;
 use datafusion::execution::FunctionRegistry;
 use datafusion::execution::memory_pool::MemoryLimit;
@@ -183,6 +184,37 @@ fn client_options_clamp_budget_to_at_least_one() {
         Some("1".to_string()),
         "a zero budget must clamp to at least 1"
     );
+}
+
+#[test]
+fn s3_requests_go_unsigned_only_without_any_credential() {
+    let cases = [
+        ("no credential", "", "", None, true),
+        ("key pair", "testkey", "testsecret", None, false),
+        ("secret key only", "", "testsecret", None, false),
+        ("session token only", "", "", Some("testtoken"), false),
+    ];
+    for (case, access_key, secret_key, session_token, unsigned) in cases {
+        let storage = StorageProps {
+            access_key: access_key.into(),
+            secret_key: secret_key.into(),
+            session_token: session_token.map(Into::into),
+            ..Default::default()
+        };
+        let builder = s3_builder(&storage, "bucket", 1);
+        assert_eq!(
+            builder.get_config_value(&AmazonS3ConfigKey::SkipSignature),
+            Some(unsigned.to_string()),
+            "{case}: skip_signature"
+        );
+        assert_eq!(
+            builder
+                .get_config_value(&AmazonS3ConfigKey::AccessKeyId)
+                .is_some(),
+            !unsigned,
+            "{case}: an unsigned store must carry no access key"
+        );
+    }
 }
 
 #[test]
