@@ -27,7 +27,7 @@ Defines the Iceberg-to-Arrow logical schema the scan registers and the catalog-d
 * *THEN* the resolver SHALL return `DECIMAL(p,s)` if and only if `1 ≤ p ≤ 36` AND `s ≤ p`, and SHALL return `VARCHAR(2000000)` otherwise, so `p = 0` yields `VARCHAR(2000000)` rather than the invalid `DECIMAL(0,0)` and `s > p` yields `VARCHAR(2000000)` rather than an invalid shape such as `DECIMAL(5,10)`
 * *AND* the domain check SHALL have one owner, the Exasol type's DECIMAL constructor, which both catalog kinds, the logical Arrow mapping, and the `initial-default` encoding gate (`scan-read-path/scan-execution-field-id-projection-absent-fields`) read, so no two of them can classify a pair differently
 * *AND* the resolver MUST NOT fail, return a `Result`, or abort the enumeration on either bad pair, the `VARCHAR(2000000)` fallback absorbs them exactly as it absorbs `p > 36`, keeping `column_source_type_to_exasol` and `build_listing_virtual_tables` infallible
-* *AND* every pair already mapped SHALL keep its recorded answer byte-identical: `(18,4)` and `(10,2)` stay `DECIMAL(18,4)` and `DECIMAL(10,2)`, the boundary pair `(36,36)` stays `DECIMAL(36,36)` because `s ≤ p` holds there, `(1,0)` stays `DECIMAL(1,0)`, and `(38,10)` and `(18,37)` stay `VARCHAR(2000000)`
+* *AND* `(18,4)`, `(10,2)`, `(1,0)`, and the boundary pair `(36,36)` SHALL map to `DECIMAL(18,4)`, `DECIMAL(10,2)`, `DECIMAL(1,0)`, and `DECIMAL(36,36)`, and `(38,10)` and `(18,37)` SHALL map to `VARCHAR(2000000)`
 
 ### Scenario: The Iceberg-to-Arrow logical mapping reads the same DECIMAL domain guard
 
@@ -35,8 +35,8 @@ Defines the Iceberg-to-Arrow logical schema the scan registers and the catalog-d
 * *WHEN* the VS resolves that column's LOGICAL ARROW type for the scan spec's logical schema, rather than its Exasol declaration
 * *THEN* the resolver SHALL return `Decimal128(p, s)` if and only if `1 ≤ p ≤ 36` AND `s ≤ p`, and SHALL return `Utf8` otherwise, reading that predicate from the SAME single owner the Exasol-type resolver reads and MUST NOT carry its own copy of it
 * *AND* the two directions SHALL therefore be in lockstep BY CONSTRUCTION rather than by convention: for every catalog-declared decimal, `Decimal128(p,s)` accompanies the `DECIMAL(p,s)` declaration and `Utf8` accompanies the `VARCHAR(2000000)` declaration, with no pair producing one of each
-* *AND* the resolver MUST NOT return a `Decimal128` tag for a column `createVirtualSchema` declares `VARCHAR(2000000)`, the lockstep is load-bearing in both directions, which is why it is recorded rather than left implicit: such a tag pairs an Arrow decimal with a `VARCHAR` declaration, and arrow-rs rejects `precision == 0` and `scale > precision` when a `Decimal128Array` is built, so the tag would name an Arrow type the scan cannot instantiate at all
-* *AND* every Arrow answer already recorded SHALL stay byte-identical: `(18,4)`, `(36,36)`, and `(36,0)` stay `Decimal128`, and `(38,10)` and `(18,37)` stay `Utf8`, the two pairs that move are `p = 0` and `s > p`, which move from `Decimal128` to `Utf8`
+* *AND* the resolver MUST NOT return a `Decimal128` tag for a column `createVirtualSchema` declares `VARCHAR(2000000)`, because such a tag pairs an Arrow decimal with a `VARCHAR` declaration, and arrow-rs rejects `precision == 0` and `scale > precision` when a `Decimal128Array` is built, so the tag would name an Arrow type the scan cannot instantiate at all
+* *AND* `(18,4)`, `(36,36)`, and `(36,0)` SHALL map to `Decimal128`, and `(0,0)`, `(5,10)`, `(38,10)`, and `(18,37)` SHALL map to `Utf8`
 * *AND* the mapping SHALL remain the LOGICAL Iceberg-to-Arrow mapping, unaffected by physical Parquet decode coercion
 
 > The version-gated timestamp declaration precision, its default on an unreadable version, and the

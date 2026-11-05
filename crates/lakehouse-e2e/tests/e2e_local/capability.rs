@@ -12,7 +12,8 @@ use crate::common::seed::{
 };
 use crate::common::timestamp_precision::expected_timestamp_precision;
 use crate::fixtures::{
-    LAKEHOUSE_VS, events_table, lakehouse_vs, typed_table, vs_dim_table, vs_fact_table,
+    LAKEHOUSE_VS, assert_single_table_wrapper, assert_two_scan_join_wrapper, events_table,
+    lakehouse_vs, typed_table, vs_dim_table, vs_fact_table,
 };
 
 /// The fix's measured worst-case divergence from native Exasol is ~1 ULP (3.17e-16).
@@ -3094,24 +3095,6 @@ const INVALID_HASH_ERROR_PREFIX: &str = "data exception - Invalid hash format: "
 /// Every column of `TYPED_DISTINCT_PROBE` after `ID`, in declared order.
 const TYPED_COLUMNS: &str =
     "C_DECIMAL_A, C_DECIMAL_B, C_DOUBLE, C_VARCHAR, C_DATE, C_TS, C_BOOL, C_PRICE, C_QTY";
-
-/// Exasol computes the query in the qualified single-table wrapper over the sharded scan.
-fn assert_single_table_wrapper(conn: &mut ExaConn, sql: &str) {
-    let pushed = explain_virtual_sql(conn, sql);
-    assert!(
-        pushed.contains(SCAN_SCRIPT_NAME) && has_n_scan_wrapper(&pushed, 1),
-        "{sql} must run in the qualified single-table wrapper over the scan: {pushed}"
-    );
-}
-
-/// Exasol computes the join in the N-scan wrapper, not in a broadcast scan.
-fn assert_two_scan_join_wrapper(conn: &mut ExaConn, sql: &str) {
-    let pushed = explain_virtual_sql(conn, sql);
-    assert!(
-        has_two_scan_wrapper(&pushed) && !has_broadcast_join_block(&pushed),
-        "{sql} must take the N-scan join wrapper, not the broadcast join: {pushed}"
-    );
-}
 
 /// Scenario: CAST renders the mapped target type per dialect
 #[test]

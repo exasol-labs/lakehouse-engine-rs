@@ -52,4 +52,3 @@ The `createVirtualSchema` declaration flattens multi-level namespaces into table
 * *THEN* the object SHALL be `{"type": "timestamp", "fractionalSecondsPrecision": p}` when `p` is not 3, and MUST NOT carry a `precision` field, which Exasol uses only for `DECIMAL` and `INTERVAL`
 * *AND* a column of precision 3, which is Exasol's bare `TIMESTAMP`, SHALL be declared `{"type": "timestamp"}` with no `fractionalSecondsPrecision` field on every Exasol version
 * *AND* the adapter MUST NOT declare a `TIMESTAMP(p)` column as `{"type": "varchar", "size": 2000000}`
-* *AND* every other type a catalog column declares SHALL keep its recorded `dataType` object byte-identical: `BOOLEAN`, `DOUBLE PRECISION`, `DATE`, every `DECIMAL(p,s)`, and every `VARCHAR(n)`

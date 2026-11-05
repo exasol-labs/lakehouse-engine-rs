@@ -1,49 +1,150 @@
 use super::*;
 
-/// Scenario: A VARCHAR dataType renders as VARCHAR(n) and its group key is not padded
-#[test]
-fn display_renders_every_spelling_the_producers_emit_byte_for_byte() {
-    let spellings = [
-        (ExasolType::Boolean, "BOOLEAN"),
-        (ExasolType::decimal(3, 0), "DECIMAL(3,0)"),
-        (ExasolType::decimal(10, 0), "DECIMAL(10,0)"),
-        (ExasolType::decimal(20, 0), "DECIMAL(20,0)"),
-        (ExasolType::decimal(18, 6), "DECIMAL(18,6)"),
-        (ExasolType::decimal(36, 36), "DECIMAL(36,36)"),
-        (ExasolType::DoublePrecision, "DOUBLE PRECISION"),
-        (ExasolType::Date, "DATE"),
-        (ExasolType::timestamp(0), "TIMESTAMP(0)"),
-        (ExasolType::timestamp(3), "TIMESTAMP"),
-        (ExasolType::timestamp(6), "TIMESTAMP(6)"),
-        (ExasolType::timestamp(9), "TIMESTAMP(9)"),
+/// One row per type spelling a producer emits or Exasol sends: the type, its SQL rendering, its
+/// `dataType` JSON, and whether a scan UDF can emit it.
+fn renderings() -> Vec<(ExasolType, &'static str, Json, bool)> {
+    let char_ascii = |size| ExasolType::Char { size, ascii: true };
+    let varchar_ascii = |size| ExasolType::Varchar { size, ascii: true };
+    let tsltz = |precision| ExasolType::TimestampWithLocalTimeZone { precision };
+    let decimal = |precision, scale| {
         (
-            ExasolType::TimestampWithLocalTimeZone { precision: 3 },
+            ExasolType::decimal(precision, scale),
+            json!({"type": "decimal", "precision": precision, "scale": scale}),
+        )
+    };
+    let mut rows = vec![
+        (
+            ExasolType::Boolean,
+            "BOOLEAN",
+            json!({"type": "boolean"}),
+            true,
+        ),
+        (
+            ExasolType::DoublePrecision,
+            "DOUBLE PRECISION",
+            json!({"type": "double"}),
+            true,
+        ),
+        (ExasolType::Date, "DATE", json!({"type": "date"}), true),
+        (
+            ExasolType::timestamp(0),
+            "TIMESTAMP(0)",
+            json!({"type": "timestamp", "fractionalSecondsPrecision": 0}),
+            true,
+        ),
+        (
+            ExasolType::timestamp(3),
+            "TIMESTAMP",
+            json!({"type": "timestamp"}),
+            true,
+        ),
+        (
+            ExasolType::timestamp(6),
+            "TIMESTAMP(6)",
+            json!({"type": "timestamp", "fractionalSecondsPrecision": 6}),
+            true,
+        ),
+        (
+            ExasolType::timestamp(9),
+            "TIMESTAMP(9)",
+            json!({"type": "timestamp", "fractionalSecondsPrecision": 9}),
+            true,
+        ),
+        (
+            tsltz(3),
             "TIMESTAMP WITH LOCAL TIME ZONE",
+            json!({"type": "timestamp", "withLocalTimeZone": true}),
+            false,
         ),
         (
-            ExasolType::TimestampWithLocalTimeZone { precision: 6 },
+            tsltz(6),
             "TIMESTAMP(6) WITH LOCAL TIME ZONE",
+            json!({"type": "timestamp", "withLocalTimeZone": true, "fractionalSecondsPrecision": 6}),
+            false,
         ),
-        (ExasolType::char(20), "CHAR(20)"),
         (
-            ExasolType::Char {
-                size: 2000,
-                ascii: true,
-            },
+            ExasolType::char(1),
+            "CHAR(1)",
+            json!({"type": "char", "size": 1}),
+            true,
+        ),
+        (
+            ExasolType::char(3),
+            "CHAR(3)",
+            json!({"type": "char", "size": 3}),
+            true,
+        ),
+        (
+            ExasolType::char(20),
+            "CHAR(20)",
+            json!({"type": "char", "size": 20}),
+            true,
+        ),
+        (
+            ExasolType::char(2000),
+            "CHAR(2000)",
+            json!({"type": "char", "size": 2000}),
+            true,
+        ),
+        (
+            char_ascii(1),
+            "CHAR(1) ASCII",
+            json!({"type": "char", "size": 1, "characterSet": "ASCII"}),
+            true,
+        ),
+        (
+            char_ascii(3),
+            "CHAR(3) ASCII",
+            json!({"type": "char", "size": 3, "characterSet": "ASCII"}),
+            true,
+        ),
+        (
+            char_ascii(2000),
             "CHAR(2000) ASCII",
+            json!({"type": "char", "size": 2000, "characterSet": "ASCII"}),
+            true,
         ),
-        (ExasolType::varchar(32), "VARCHAR(32)"),
-        (ExasolType::WIDEST_VARCHAR, "VARCHAR(2000000)"),
         (
-            ExasolType::Varchar {
-                size: 10,
-                ascii: true,
-            },
-            "VARCHAR(10) ASCII",
+            ExasolType::varchar(1),
+            "VARCHAR(1)",
+            json!({"type": "varchar", "size": 1}),
+            true,
+        ),
+        (
+            ExasolType::varchar(32),
+            "VARCHAR(32)",
+            json!({"type": "varchar", "size": 32}),
+            true,
+        ),
+        (
+            ExasolType::WIDEST_VARCHAR,
+            "VARCHAR(2000000)",
+            json!({"type": "varchar", "size": 2_000_000}),
+            true,
+        ),
+        (
+            varchar_ascii(1),
+            "VARCHAR(1) ASCII",
+            json!({"type": "varchar", "size": 1, "characterSet": "ASCII"}),
+            true,
+        ),
+        (
+            varchar_ascii(4),
+            "VARCHAR(4) ASCII",
+            json!({"type": "varchar", "size": 4, "characterSet": "ASCII"}),
+            true,
+        ),
+        (
+            varchar_ascii(2_000_000),
+            "VARCHAR(2000000) ASCII",
+            json!({"type": "varchar", "size": 2_000_000, "characterSet": "ASCII"}),
+            true,
         ),
         (
             ExasolType::IntervalYearToMonth { precision: 2 },
             "INTERVAL YEAR(2) TO MONTH",
+            json!({"type": "interval", "fromTo": "YEAR TO MONTH", "precision": 2}),
+            false,
         ),
         (
             ExasolType::IntervalDayToSecond {
@@ -51,12 +152,87 @@ fn display_renders_every_spelling_the_producers_emit_byte_for_byte() {
                 fraction: 3,
             },
             "INTERVAL DAY(2) TO SECOND(3)",
+            json!({"type": "interval", "fromTo": "DAY TO SECONDS", "precision": 2, "fraction": 3}),
+            false,
         ),
-        (ExasolType::Geometry { srid: 0 }, "GEOMETRY(0)"),
-        (ExasolType::Hashtype { bytes: 16 }, "HASHTYPE(16 BYTE)"),
+        (
+            ExasolType::IntervalDayToSecond {
+                precision: 9,
+                fraction: 9,
+            },
+            "INTERVAL DAY(9) TO SECOND(9)",
+            json!({"type": "interval", "fromTo": "DAY TO SECONDS", "precision": 9, "fraction": 9}),
+            false,
+        ),
+        (
+            ExasolType::Geometry { srid: 0 },
+            "GEOMETRY(0)",
+            json!({"type": "geometry", "srid": 0}),
+            false,
+        ),
+        (
+            ExasolType::Geometry { srid: 4326 },
+            "GEOMETRY(4326)",
+            json!({"type": "geometry", "srid": 4326}),
+            false,
+        ),
+        (
+            ExasolType::Hashtype { bytes: 16 },
+            "HASHTYPE(16 BYTE)",
+            json!({"type": "hashtype", "bytesize": 16}),
+            false,
+        ),
     ];
-    for (exasol_type, rendered) in spellings {
-        assert_eq!(exasol_type.to_string(), rendered);
+    let decimals = [
+        ((1, 0), "DECIMAL(1,0)"),
+        ((3, 0), "DECIMAL(3,0)"),
+        ((10, 0), "DECIMAL(10,0)"),
+        ((18, 4), "DECIMAL(18,4)"),
+        ((18, 6), "DECIMAL(18,6)"),
+        ((20, 0), "DECIMAL(20,0)"),
+        ((36, 36), "DECIMAL(36,36)"),
+    ];
+    rows.extend(decimals.map(|((precision, scale), sql)| {
+        let (exasol_type, data_type) = decimal(precision, scale);
+        (exasol_type, sql, data_type, true)
+    }));
+    rows
+}
+
+/// Scenario: A VARCHAR dataType renders as VARCHAR(n) and its group key is not padded
+#[test]
+fn display_renders_every_spelling_the_producers_emit_byte_for_byte() {
+    for (exasol_type, sql, _, _) in renderings() {
+        assert_eq!(exasol_type.to_string(), sql);
+    }
+}
+
+#[test]
+fn exasol_type_to_json_renders_each_recorded_data_type_object() {
+    for (exasol_type, _, data_type, _) in renderings() {
+        assert_eq!(
+            exasol_type_to_json(&exasol_type),
+            data_type,
+            "{exasol_type}"
+        );
+    }
+}
+
+#[test]
+fn exasol_type_to_json_round_trips_every_variant() {
+    for (exasol_type, _, _, _) in renderings() {
+        assert_eq!(
+            valid(&exasol_type_to_json(&exasol_type)),
+            exasol_type,
+            "{exasol_type} must read back as itself"
+        );
+    }
+}
+
+#[test]
+fn only_the_types_a_scan_can_emit_are_udf_emittable() {
+    for (exasol_type, _, _, emittable) in renderings() {
+        assert_eq!(exasol_type.is_udf_emittable(), emittable, "{exasol_type}");
     }
 }
 
@@ -86,8 +262,7 @@ fn decimal_new_rejects_what_exasol_rejects() {
 /// Scenario: A pushdown request with a missing or invalid Exasol type fails the query
 #[test]
 fn exasol_type_from_json_refuses_an_incomplete_or_out_of_range_type() {
-    let decimal =
-        |precision: u8, scale: u8| ExasolType::Decimal(Decimal::new(precision, scale).unwrap());
+    let decimal = ExasolType::decimal;
     let cases = [
         (
             json!({"type": "decimal", "precision": 1, "scale": 0}),
@@ -361,168 +536,5 @@ fn exasol_type_from_json_reads_each_wire_form() {
     ];
     for (data_type, expected) in cases {
         assert_eq!(valid(&data_type), expected, "{data_type}");
-    }
-}
-
-#[test]
-fn only_the_types_a_scan_can_emit_are_udf_emittable() {
-    let cases = [
-        (ExasolType::Boolean, true),
-        (ExasolType::decimal(18, 2), true),
-        (ExasolType::DoublePrecision, true),
-        (ExasolType::Date, true),
-        (ExasolType::timestamp(6), true),
-        (ExasolType::char(20), true),
-        (
-            ExasolType::Char {
-                size: 3,
-                ascii: true,
-            },
-            true,
-        ),
-        (ExasolType::varchar(10), true),
-        (ExasolType::WIDEST_VARCHAR, true),
-        (
-            ExasolType::Varchar {
-                size: 2_000_000,
-                ascii: true,
-            },
-            true,
-        ),
-        (
-            ExasolType::TimestampWithLocalTimeZone { precision: 3 },
-            false,
-        ),
-        (
-            ExasolType::TimestampWithLocalTimeZone { precision: 6 },
-            false,
-        ),
-        (ExasolType::IntervalYearToMonth { precision: 2 }, false),
-        (
-            ExasolType::IntervalDayToSecond {
-                precision: 2,
-                fraction: 3,
-            },
-            false,
-        ),
-        (ExasolType::Geometry { srid: 0 }, false),
-        (ExasolType::Hashtype { bytes: 16 }, false),
-    ];
-    for (exasol_type, emittable) in cases {
-        assert_eq!(exasol_type.is_udf_emittable(), emittable, "{exasol_type}");
-    }
-}
-
-fn every_variant() -> Vec<ExasolType> {
-    let mut variants = vec![
-        ExasolType::Boolean,
-        ExasolType::DoublePrecision,
-        ExasolType::Date,
-        ExasolType::WIDEST_VARCHAR,
-        ExasolType::IntervalYearToMonth { precision: 2 },
-        ExasolType::IntervalDayToSecond {
-            precision: 9,
-            fraction: 9,
-        },
-        ExasolType::Geometry { srid: 4326 },
-        ExasolType::Hashtype { bytes: 16 },
-    ];
-    variants.extend([0, 3, 6, 9].map(ExasolType::timestamp));
-    variants.extend([3, 6].map(|precision| ExasolType::TimestampWithLocalTimeZone { precision }));
-    variants.extend(
-        [(1, 0), (10, 0), (18, 6), (36, 36)]
-            .map(|(precision, scale)| ExasolType::Decimal(Decimal::new(precision, scale).unwrap())),
-    );
-    for ascii in [false, true] {
-        variants.push(ExasolType::Char { size: 1, ascii });
-        variants.push(ExasolType::Char { size: 2000, ascii });
-        variants.push(ExasolType::Varchar { size: 1, ascii });
-        variants.push(ExasolType::Varchar {
-            size: 2_000_000,
-            ascii,
-        });
-    }
-    variants
-}
-
-#[test]
-fn exasol_type_to_json_round_trips_every_variant() {
-    for exasol_type in every_variant() {
-        assert_eq!(
-            valid(&exasol_type_to_json(&exasol_type)),
-            exasol_type,
-            "{exasol_type} must read back as itself"
-        );
-    }
-}
-
-#[test]
-fn exasol_type_to_json_renders_each_recorded_data_type_object() {
-    let cases = [
-        (ExasolType::Boolean, json!({"type": "boolean"})),
-        (ExasolType::DoublePrecision, json!({"type": "double"})),
-        (ExasolType::Date, json!({"type": "date"})),
-        (
-            ExasolType::decimal(18, 4),
-            json!({"type": "decimal", "precision": 18, "scale": 4}),
-        ),
-        (ExasolType::timestamp(3), json!({"type": "timestamp"})),
-        (
-            ExasolType::timestamp(6),
-            json!({"type": "timestamp", "fractionalSecondsPrecision": 6}),
-        ),
-        (
-            ExasolType::timestamp(0),
-            json!({"type": "timestamp", "fractionalSecondsPrecision": 0}),
-        ),
-        (
-            ExasolType::TimestampWithLocalTimeZone { precision: 3 },
-            json!({"type": "timestamp", "withLocalTimeZone": true}),
-        ),
-        (
-            ExasolType::TimestampWithLocalTimeZone { precision: 6 },
-            json!({"type": "timestamp", "withLocalTimeZone": true, "fractionalSecondsPrecision": 6}),
-        ),
-        (
-            ExasolType::WIDEST_VARCHAR,
-            json!({"type": "varchar", "size": 2_000_000}),
-        ),
-        (
-            ExasolType::Varchar {
-                size: 4,
-                ascii: true,
-            },
-            json!({"type": "varchar", "size": 4, "characterSet": "ASCII"}),
-        ),
-        (ExasolType::char(3), json!({"type": "char", "size": 3})),
-        (
-            ExasolType::Char {
-                size: 3,
-                ascii: true,
-            },
-            json!({"type": "char", "size": 3, "characterSet": "ASCII"}),
-        ),
-        (
-            ExasolType::IntervalYearToMonth { precision: 2 },
-            json!({"type": "interval", "fromTo": "YEAR TO MONTH", "precision": 2}),
-        ),
-        (
-            ExasolType::IntervalDayToSecond {
-                precision: 2,
-                fraction: 3,
-            },
-            json!({"type": "interval", "fromTo": "DAY TO SECONDS", "precision": 2, "fraction": 3}),
-        ),
-        (
-            ExasolType::Geometry { srid: 4326 },
-            json!({"type": "geometry", "srid": 4326}),
-        ),
-        (
-            ExasolType::Hashtype { bytes: 16 },
-            json!({"type": "hashtype", "bytesize": 16}),
-        ),
-    ];
-    for (exasol_type, expected) in cases {
-        assert_eq!(exasol_type_to_json(&exasol_type), expected, "{exasol_type}");
     }
 }
