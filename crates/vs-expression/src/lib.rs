@@ -915,9 +915,10 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     let args = args.ok_or_else(|| {
                         UdfError::User("function_scalar INSTR missing 'arguments'".into())
                     })?;
-                    if args.len() < 2 {
+                    // `strpos` has no start or occurrence argument, so a third would be dropped (#228).
+                    if args.len() != 2 {
                         return Err(UdfError::User(format!(
-                            "function_scalar INSTR requires 2 arguments, got {}",
+                            "function_scalar INSTR renders exactly 2 arguments, got {}",
                             args.len()
                         )));
                     }
@@ -931,9 +932,9 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     let args = args.ok_or_else(|| {
                         UdfError::User("function_scalar LOCATE missing 'arguments'".into())
                     })?;
-                    if args.len() < 2 {
+                    if args.len() != 2 {
                         return Err(UdfError::User(format!(
-                            "function_scalar LOCATE requires 2 arguments, got {}",
+                            "function_scalar LOCATE renders exactly 2 arguments, got {}",
                             args.len()
                         )));
                     }
