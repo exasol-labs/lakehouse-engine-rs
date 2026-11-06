@@ -47,11 +47,26 @@
 - **Rationale:** No component of the Lakekeeper stack can drop an answer after the catalog applied a commit: the proxy filter only answers 403 before it forwards. `specs/testing.md` § Coverage rule admits a fault-injection test for a failure that E2E cannot produce. Every other acceptance case of #566 runs as E2E on the local or the Lakekeeper stack.
 - **Promotes to ADR:** no
 
-### [6] Vended credentials are not refreshed while a writer writes its data files
+### [6] The FileIO of an export table refreshes vended credentials through the catalog's credentials endpoint before they expire
 
-- **Decision:** A writer writes its data files with the vended credentials of its create or stage-create answer. It resolves a fresh catalog session, and in parallel mode reloads the table, before it commits. The docs state that with vended credentials a writer must finish within the vended lifetime.
-- **Rationale:** Lakekeeper vends credentials for one hour (measured: 3,599 s), so only a writer that writes its files for longer than an hour fails. A staged table cannot be reloaded, so under `SINGLE_COMMIT` the commit's manifests also use the stage-create credentials. Lakekeeper also returns `client.refresh-credentials-endpoint`, and wiring it into the storage credential loader is a follow-up (#TBD).
-- **Alternatives:** Refresh through iceberg-rust's custom S3 credential loader and the catalog's credentials endpoint. Deferred to a follow-up the requester accepted; it is out of scope here.
+- **Decision:** With vended credentials, the FileIO of every table the export writes takes its S3 credentials from a credential source in `lakehouse-catalog`. The source starts with the credentials of the create, stage-create, or load answer. When they expire within five minutes, it loads new ones through the table's Iceberg REST `loadCredentials` endpoint on the CONNECTION's catalog address. The pre-read check refreshes the staged table's credentials once and writes its probe with them. On a catalog that does not advertise the endpoint, the source keeps its credentials, and a writer that outlives them fails with an error that states their expiry.
+- **Rationale:**
+  - Lakekeeper vends credentials for 3,599 s, scoped to the table location. A staged table cannot be reloaded, so under `SINGLE_COMMIT` the commit's manifests also use the vended credentials. Lakekeeper answers `loadCredentials` for a staged table with HTTP 200 and the staged location as the prefix (measured).
+  - The commit loop rebuilds the table on reloaded metadata and keeps the writer Table's FileIO (task 1.3), so the refresh lives inside that FileIO. The pinned iceberg-rust rev offers the hook: `OpenDalStorageFactory::S3 { customized_credential_load }` replaces the static key provider of every operator the FileIO builds. iceberg-rust reads neither `client.refresh-credentials-endpoint` nor `s3.session-token-expires-at-ms` itself.
+  - The five-minute margin is the prefetch time of Iceberg Java's `VendedCredentialsProvider`. Lakekeeper serves a cached credential for half its lifetime, so a refresh five minutes before expiry receives new credentials for every lifetime of at least ten minutes, the 900 s minimum of AWS STS included.
+  - The Iceberg REST spec defines `GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials` and the `/v1/config` `endpoints` list: "If a server does not send the `endpoints` field, a default set of endpoints is assumed", and that set omits `loadCredentials`. Lakekeeper lists it. The source calls the spec path on the CONNECTION's catalog address, so the catalog token reaches no other address, and the one catalog HTTP client, the proxy settings, and the export's `ALLOW_HTTP` gate apply.
+  - The pre-read refresh fails an export whose refresh would fail, before any row is read. It is also the refresh that an E2E can observe. The local SeaweedFS STS refuses a lifetime below 900 s (measured: "DurationSeconds must be between 900 and 43200 seconds"), and no E2E writer writes for the 600 s after which a 900 s credential is refreshed.
+- **Alternatives:**
+  - No refresh, with a documented one-hour limit: rejected. A `SINGLE_COMMIT` export runs one writer for the whole source, so a large export reaches the limit.
+  - Refresh after an expired-token failure instead of before expiry: rejected. The failed request is a part upload or a manifest write inside iceberg-rust, which fails the writer, so the export cannot retry it with new credentials. SeaweedFS also reports expired credentials as `InvalidAccessKeyId` (measured), which does not identify an expiry.
+  - Call the URL in `client.refresh-credentials-endpoint`: rejected, because the catalog would choose where the catalog token goes.
+  - Refresh by reloading the table: rejected, because a staged table cannot be loaded. Re-staging it is no substitute: Lakekeeper refuses a stage-create at a location that holds files (HTTP 400, measured).
+- **Consequences:**
+  - Each refresh resolves a fresh catalog session, because the writer's OAuth2 token may have expired. An expired static bearer token fails the refresh.
+  - A catalog that advertises `loadCredentials` but refuses it for a staged table fails every vended export before any row is read.
+  - Under `SINGLE_COMMIT` the refresh names the staged table. When a racing statement stages the same name at another location, the answer no longer covers the writer's location, and the refresh fails naming it.
+  - Credentials without `s3.session-token-expires-at-ms` have no known expiry, so a writer never refreshes them.
+  - Static storage keys keep `StorageBackend::file_io()` and are never refreshed.
 - **Promotes to ADR:** no
 
 ## Review Findings
@@ -84,4 +99,10 @@
 
 - **Finding:** Exasol evaluates the source before the writer reads its first row. A source that fails at row 500 therefore never reaches the writer, and the planned test could not catch a writer that creates the table before it commits.
 - **Direction change:** `export_failed_single_commit_leaves_no_table` moves to the local suite. The proxy filter answers HTTP 403 to the writes under the table's `metadata/` path, so the writer fails after it wrote its data files and before its commit, and the test asserts that a data file of the export exists. Rejected: `KILL STATEMENT` once a data file appears, because a data file appears in storage only when the writer closes it, which for a source below the 128 MiB target file size happens just before the commit. A separate scenario keeps the source-error case and states that it does not test the writer.
+- **Promotes to ADR:** no
+
+### [6] [refresh] Vended credentials are refreshed in this plan
+
+- **Finding:** The requester asked for vended-credential refresh in this plan, not in a follow-up.
+- **Direction change:** Decision [6] now refreshes vended credentials through the catalog's `loadCredentials` endpoint inside the export table's FileIO, with one refresh in the pre-read check. New task 1.7 builds the credential source, and tasks 1.2 to 1.6, 3.6, 3.7, 4.2, and 5.1 use or document it. The `export/export-iceberg-table` delta gains a Background bullet and three scenarios. The one-hour limit is gone from plan.md § Impact and task 5.1.
 - **Promotes to ADR:** no

@@ -7,6 +7,7 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 * Statement and options: export/export-options § Background.
 * Read through a virtual schema: export/export-into-script § Background.
 * Storage credentials are the CONNECTION's static storage keys or, when the CONNECTION sets `"use_vended_credentials": true`, the credentials that the catalog vends for the new table.
+* On a catalog that offers a credentials endpoint (Iceberg REST `loadCredentials`), the export refreshes vended credentials through it before they expire, and once before it reads any source row. It never refreshes static storage keys.
 * The export creates every missing level of the namespace before it reads any source row, even when it then writes no rows or fails. It creates only new tables.
 * Every export needs a catalog that accepts staged table creation (Iceberg REST `stage-create`).
 * The export writes only onto S3-compatible storage, through an Iceberg REST catalog that does not need AWS SigV4 signing.
@@ -104,6 +105,31 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 * *WHEN* a user exports the same source through each CONNECTION into a new table
 * *THEN* both exports SHALL succeed
 * *AND* each new table, read through a virtual schema, SHALL hold the source rows
+
+### Scenario: An export whose writer outlives the vended credentials succeeds
+
+* *GIVEN* a CONNECTION that sets `"use_vended_credentials": true`, to a catalog that offers a credentials endpoint
+* *AND* vended credentials that expire before the writer finishes
+* *WHEN* a user exports a source into a new table, with or without `SINGLE_COMMIT = 'true'`
+* *THEN* the export SHALL succeed
+* *AND* the new table, read through a virtual schema, SHALL hold the source rows
+
+### Scenario: A vended-credential export whose credential refresh fails is refused before any data is read
+
+* *GIVEN* a CONNECTION that sets `"use_vended_credentials": true`, to a catalog that offers a credentials endpoint but refuses the request for the table
+* *AND* a source whose rows raise an error when they are read
+* *WHEN* a user exports it
+* *THEN* the export SHALL fail before any source row is read, with an error that names the catalog and the credential refresh
+* *AND* the error MUST NOT contain a secret of the CONNECTION or a storage credential
+* *AND* the export SHALL NOT create the table
+
+### Scenario: A writer that outlives vended credentials the catalog cannot refresh fails naming their expiry
+
+* *GIVEN* a CONNECTION that sets `"use_vended_credentials": true`, to a catalog that offers no credentials endpoint
+* *AND* vended credentials that expire before the writer finishes
+* *WHEN* a user exports a source into a new table
+* *THEN* the export SHALL fail with an error that names the table and states that its vended credentials expired and that the catalog offers no credentials endpoint
+* *AND* the error MUST NOT contain a storage credential
 
 ### Scenario: A bad CONNECTION fails before any data is read
 
