@@ -3,9 +3,9 @@
 
 use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column_name};
 use serde_json::Value as Json;
-use vs_expression::{ColumnNode, render_expression, render_expression_exasol};
+use vs_expression::{ColumnNode, render_expression_exasol};
 
-use super::support::{ColumnTypes, cast_to_declared_type, quote_ident};
+use super::support::{ColumnTypes, cast_to_declared_type, quote_ident, scan_expression};
 use crate::scan::spec::ColumnRef;
 use crate::types::exasol_type::{ExasolType, MAX_DECIMAL_PRECISION};
 
@@ -92,15 +92,23 @@ pub(super) fn sentinelize_aggregates(
     }
 }
 
-pub(super) fn classify_scalar_over_aggregate(node: &Json) -> Option<Vec<AggregatePlan>> {
+/// The scalar runs in Exasol over the merged aggregates, so it is checked in the Exasol dialect;
+/// only the aggregate arguments run in the scan.
+pub(super) fn classify_scalar_over_aggregate(
+    node: &Json,
+    col_types: &ColumnTypes,
+) -> Option<Vec<AggregatePlan>> {
     let mut aggregates = Vec::new();
     let mut residual_column = false;
     let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
     if aggregates.is_empty() || residual_column {
         return None;
     }
-    render_expression(&sentinel_tree).ok()?;
-    aggregates.iter().map(parse_agg_item).collect()
+    render_expression_exasol(&sentinel_tree).ok()?;
+    aggregates
+        .iter()
+        .map(|agg| parse_agg_item(agg, col_types))
+        .collect()
 }
 
 /// Reuses the `vs-expression` translator by substitution (sentinel columns, then
@@ -110,6 +118,7 @@ pub(super) fn render_scalar_over_merge(
     node: &Json,
     plans: &[AggregatePlan],
     merged: &[String],
+    col_types: &ColumnTypes,
 ) -> Option<String> {
     let mut aggregates = Vec::new();
     let mut residual_column = false;
@@ -118,7 +127,7 @@ pub(super) fn render_scalar_over_merge(
     // targets are length-qualified (the DataFusion-side check keeps bare `VARCHAR`).
     let mut sql = render_expression_exasol(&sentinel_tree).ok()?;
     for (i, agg) in aggregates.iter().enumerate() {
-        let plan = parse_agg_item(agg)?;
+        let plan = parse_agg_item(agg, col_types)?;
         let slot = plans.iter().position(|p| *p == plan)?;
         sql = sql.replace(&agg_sentinel_token(i), merged.get(slot)?);
     }
@@ -148,19 +157,20 @@ fn column_from_first_arg(args: Option<&Vec<Json>>) -> Option<String> {
 /// `None` when there is no argument or it cannot be rendered.
 pub(super) fn arg_column_or_expr(
     args: Option<&Vec<Json>>,
+    col_types: &ColumnTypes,
 ) -> Option<(Option<String>, Option<String>)> {
     let arg = args.and_then(|a| a.first())?;
     if let Some(column) = ColumnNode::parse(arg) {
         return Some((Some(column.upper_name()), None));
     }
-    render_expression(arg).ok().map(|sql| (None, Some(sql)))
+    scan_expression(arg, col_types).map(|sql| (None, Some(sql)))
 }
 
 /// `None` for any `distinct: true` item, an unsupported function, or an
 /// unrenderable argument. STDDEV/VARIANCE accept only a bare column: their
 /// (cnt, mean, m2) decomposition has no rendered-argument form, and a plan with
 /// no argument would fail inside the scan.
-pub(super) fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
+pub(super) fn parse_agg_item(item: &Json, col_types: &ColumnTypes) -> Option<AggregatePlan> {
     if item.get("distinct").and_then(|d| d.as_bool()) == Some(true) {
         return None;
     }
@@ -181,7 +191,7 @@ pub(super) fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
                 arg_expr: None,
             },
             Some(_) => {
-                let (column, arg_expr) = arg_column_or_expr(args)?;
+                let (column, arg_expr) = arg_column_or_expr(args, col_types)?;
                 AggregatePlan {
                     kind: AggKind::CountCol,
                     column,
@@ -195,7 +205,7 @@ pub(super) fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
         .iter()
         .find(|(name, _)| *name == fn_name)
     {
-        let (column, arg_expr) = arg_column_or_expr(args)?;
+        let (column, arg_expr) = arg_column_or_expr(args, col_types)?;
         return Some(AggregatePlan {
             kind: kind.clone(),
             column,

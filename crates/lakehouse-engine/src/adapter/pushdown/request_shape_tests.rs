@@ -189,7 +189,7 @@ fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only
         .column(col("REGION"))
         .build_pushdown();
     assert!(
-        detect_group_by_aggregates(&req)
+        detect_group_by_aggregates(&req, &ColumnTypes::default())
             .expect("a group-key-only select list still detects as grouped")
             .plans
             .is_empty(),
@@ -216,7 +216,7 @@ fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper
         .count_star()
         .build_pushdown();
     assert_eq!(
-        detect_group_by_aggregates(&req)
+        detect_group_by_aggregates(&req, &ColumnTypes::default())
             .expect("grouped aggregate")
             .plans
             .len(),

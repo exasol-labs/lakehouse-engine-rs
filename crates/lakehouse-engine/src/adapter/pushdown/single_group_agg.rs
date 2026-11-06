@@ -32,7 +32,10 @@ pub struct DistinctCount {
 
 /// `None` (row-scan fallback) when any item declines; one declining item declines
 /// the whole detection.
-pub fn detect_aggregates(pushdown: &PushdownRequest) -> Option<Vec<SingleGroupItem>> {
+pub fn detect_aggregates(
+    pushdown: &PushdownRequest,
+    col_types: &ColumnTypes,
+) -> Option<Vec<SingleGroupItem>> {
     let pushdown_req = pushdown.json();
     if pushdown_req
         .get("groupBy")
@@ -52,13 +55,13 @@ pub fn detect_aggregates(pushdown: &PushdownRequest) -> Option<Vec<SingleGroupIt
     for (select_index, item) in list.iter().enumerate() {
         let resolved = if item.get("type").and_then(|t| t.as_str()) == Some("function_aggregate") {
             pushdown.emittable_select_type(select_index)?;
-            match parse_count_distinct(item) {
+            match parse_count_distinct(item, col_types) {
                 Some(distinct) => SingleGroupItem::Distinct(distinct),
-                None => SingleGroupItem::Aggregate(parse_agg_item(item)?),
+                None => SingleGroupItem::Aggregate(parse_agg_item(item, col_types)?),
             }
         } else {
             // Classified for the decline only; `ordinary_plans` re-derives the nested plans.
-            classify_scalar_over_aggregate(item)?;
+            classify_scalar_over_aggregate(item, col_types)?;
             SingleGroupItem::ScalarOverAggregate {
                 node: item.clone(),
                 declared_type: pushdown.select_type(select_index)?,
@@ -76,7 +79,7 @@ pub fn detect_aggregates(pushdown: &PushdownRequest) -> Option<Vec<SingleGroupIt
 ///
 /// `pub` so callers outside `pushdown` (integration tests) get nameable plans
 /// without naming `SingleGroupItem`.
-pub fn ordinary_plans(items: &[SingleGroupItem]) -> Vec<AggregatePlan> {
+pub fn ordinary_plans(items: &[SingleGroupItem], col_types: &ColumnTypes) -> Vec<AggregatePlan> {
     let mut plans = Vec::new();
     // The fold's accumulated types are discarded; see `single_group_plan_types`.
     let mut plan_types = Vec::new();
@@ -87,7 +90,10 @@ pub fn ordinary_plans(items: &[SingleGroupItem]) -> Vec<AggregatePlan> {
             }
             SingleGroupItem::Distinct(_) => {}
             SingleGroupItem::ScalarOverAggregate { node, .. } => {
-                for plan in classify_scalar_over_aggregate(node).into_iter().flatten() {
+                for plan in classify_scalar_over_aggregate(node, col_types)
+                    .into_iter()
+                    .flatten()
+                {
                     fold_aggregate_plan(&mut plans, &mut plan_types, plan, None);
                 }
             }
@@ -102,8 +108,9 @@ pub fn ordinary_plans(items: &[SingleGroupItem]) -> Vec<AggregatePlan> {
 pub fn single_group_plan_types(
     select_types: &[ExasolType],
     items: &[SingleGroupItem],
+    col_types: &ColumnTypes,
 ) -> Vec<ExasolType> {
-    let plans = ordinary_plans(items);
+    let plans = ordinary_plans(items, col_types);
     let mut plan_types = vec![NESTED_AGGREGATE_PLAN_TYPE; plans.len()];
 
     for (select_index, item) in items.iter().enumerate() {
@@ -144,7 +151,7 @@ pub(super) fn single_group_merge_select(
                 node,
                 declared_type,
                 ..
-            } => render_scalar_over_merge(node, plans, &merged)
+            } => render_scalar_over_merge(node, plans, &merged, col_types)
                 .map(|expr| cast_to_declared_type(&expr, *declared_type)),
         })
         .collect()
@@ -167,7 +174,7 @@ pub(super) fn is_lone_count_distinct(items: &[SingleGroupItem]) -> bool {
 
 /// `None` when the item is not a distinct `COUNT` or its argument cannot be resolved;
 /// the caller then defers to [`parse_agg_item`], which declines it.
-fn parse_count_distinct(item: &Json) -> Option<DistinctCount> {
+fn parse_count_distinct(item: &Json, col_types: &ColumnTypes) -> Option<DistinctCount> {
     if item.get("distinct").and_then(|d| d.as_bool()) != Some(true) {
         return None;
     }
@@ -180,7 +187,7 @@ fn parse_count_distinct(item: &Json) -> Option<DistinctCount> {
         return None;
     }
     let args = item.get("arguments").and_then(|a| a.as_array());
-    let (column, arg_expr) = arg_column_or_expr(args)?;
+    let (column, arg_expr) = arg_column_or_expr(args, col_types)?;
     Some(DistinctCount { column, arg_expr })
 }
 

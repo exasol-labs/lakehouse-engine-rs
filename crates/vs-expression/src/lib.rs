@@ -4,7 +4,10 @@ use serde_json::Value as Json;
 mod column_node;
 mod datetime_format;
 pub mod exasol_type;
+mod scan_typing;
 pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
+pub use scan_typing::ColumnTypeLookup;
+use scan_typing::{BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE};
 use datetime_format::{FormatTarget, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
 
@@ -674,6 +677,21 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             let args = value("arguments").and_then(|a| a.as_array());
             render_cast(args, value("dataType"), dialect)
         }
+        // Synthesized by the typed scan pass, DataFusion dialect only: an integer's text is the
+        // same in every session, so the scan may produce it.
+        INTEGER_TEXT_NODE | BOOLEAN_TEXT_NODE if dialect == Dialect::DataFusion => {
+            let arg = value("arguments")
+                .and_then(|a| a.as_array())
+                .and_then(|a| a.first())
+                .ok_or_else(|| UdfError::User(format!("{kind} missing its argument")))?;
+            let inner = render_expression_inner(arg, dialect)?
+                .ok_or_else(|| UdfError::User(format!("{kind} argument is null")))?;
+            Ok(Some(if kind == INTEGER_TEXT_NODE {
+                format!("CAST(CAST({inner} AS DECIMAL(38,0)) AS VARCHAR)")
+            } else {
+                render_bool_to_string_case(&inner)
+            }))
+        }
         // Adapter-synthesized, never sent by Exasol: the adapter has confirmed
         // the argument is a DECIMAL column being stringified.
         "decimal_to_varchar_exasol" => {
@@ -1184,21 +1202,42 @@ fn render_junction(
     }
 }
 
-/// DataFusion dialect. Use [`render_expression_exasol`] for SQL parsed by Exasol.
-pub fn render_expression(expr: &Json) -> Result<String, UdfError> {
+/// The only DataFusion-dialect entry point: the typed pass runs first, so no caller can hand the
+/// scan an expression without its column types. `Err` declines the expression.
+pub fn render_scan_expression(
+    expr: &Json,
+    columns: &dyn ColumnTypeLookup,
+) -> Result<String, UdfError> {
+    let (typed, _) = scan_typing::type_scan_tree(expr, columns)?;
+    render_expression(&typed)
+}
+
+/// [`render_scan_expression`] for a filter. `Ok(None)` when it is trivially true (`TRUE`/`NULL`).
+pub fn render_scan_filter(
+    filter_expr: &Json,
+    columns: &dyn ColumnTypeLookup,
+) -> Result<Option<String>, UdfError> {
+    let sql = render_scan_expression(filter_expr, columns)?;
+    Ok((sql != "TRUE" && sql != "NULL").then_some(sql))
+}
+
+/// DataFusion dialect, untyped. Use [`render_scan_expression`].
+pub(crate) fn render_expression(expr: &Json) -> Result<String, UdfError> {
     render_expression_inner(expr, Dialect::DataFusion)?
         .ok_or_else(|| UdfError::User("expression node is null".into()))
 }
 
 /// `None` on any failure; never panics.
-pub fn render_expression_safe(expr: &Json) -> Option<String> {
+#[cfg(test)]
+pub(crate) fn render_expression_safe(expr: &Json) -> Option<String> {
     render_expression_inner(expr, Dialect::DataFusion).ok()?
 }
 
 /// `None` when rendering fails or the filter is trivially true (`TRUE`/`NULL`). The
 /// two causes are indistinguishable; the caller decides whether a declined filter
 /// must be self-applied.
-pub fn render_df_filter_safe(filter_expr: &Json) -> Option<String> {
+#[cfg(test)]
+pub(crate) fn render_df_filter_safe(filter_expr: &Json) -> Option<String> {
     let result = render_expression_inner(filter_expr, Dialect::DataFusion).ok()??;
     if result == "TRUE" || result == "NULL" {
         None

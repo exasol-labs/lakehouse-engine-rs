@@ -2,6 +2,22 @@
 //! catalog and AdapterNotes fixtures, fake catalog and object-store endpoints, test CONNECTIONs.
 
 use super::*;
+
+/// #587 spike shims: the untyped DataFusion renderers are gone, so older tests render through
+/// the typed gate with no column type known.
+pub(crate) fn render_df_filter_safe(filter: &Json) -> Option<String> {
+    vs_expression::render_scan_filter(filter, &ColumnTypes::default())
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn render_expression_safe(expr: &Json) -> Option<String> {
+    vs_expression::render_scan_expression(expr, &ColumnTypes::default()).ok()
+}
+
+pub(crate) fn apply_type_rewrites(expr: &Json, col_types: &ColumnTypes) -> Option<Json> {
+    super::support::type_accepted_rewrite(expr, col_types)
+}
 use crate::adapter::ResolvedConnectionConfig;
 use crate::adapter::column_notes::TableNotes;
 use crate::adapter::table_identity::encode_identifier_note;

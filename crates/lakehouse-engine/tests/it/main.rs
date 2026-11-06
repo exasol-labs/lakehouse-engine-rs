@@ -22,6 +22,7 @@ mod scan_partition_values;
 mod scan_plan_shape;
 mod scan_positional_deletes;
 mod scan_telemetry;
+mod scan_text_conversion_test;
 mod scan_two_arg;
 mod shared_type_reexports;
 mod timestamp_literal_precision_test;

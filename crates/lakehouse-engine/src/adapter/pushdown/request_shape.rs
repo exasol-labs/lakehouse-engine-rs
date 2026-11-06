@@ -41,12 +41,12 @@ pub(super) fn classify_request_shape(
     col_types: &ColumnTypes,
 ) -> RequestShape {
     let pushdown_req = pushdown.json();
-    if let Some(detection) = detect_group_by_aggregates(pushdown) {
+    if let Some(detection) = detect_group_by_aggregates(pushdown, col_types) {
         // A SUM over a non-numeric column would produce an opaque UDF error; demote.
         if validate_agg_col_types(&detection.plans, col_types) {
             // The merge wrapper only has `GK_*`/`PARTIAL_*` columns, so an aggregate absent
             // from the select list cannot be sorted on there (#198).
-            let order_by = match build_grouped_order_by_clause(pushdown_req, &detection) {
+            let order_by = match build_grouped_order_by_clause(pushdown_req, &detection, col_types) {
                 Some(GroupedOrderBy::Clause(clause)) => Some(clause),
                 Some(GroupedOrderBy::Unresolvable) => return RequestShape::GroupByWrapper,
                 None => None,
@@ -60,7 +60,7 @@ pub(super) fn classify_request_shape(
                     };
                 }
                 Some(node) => {
-                    if let Some(sql) = render_having_over_merge(node, &detection.plans) {
+                    if let Some(sql) = render_having_over_merge(node, &detection.plans, col_types) {
                         return RequestShape::Grouped {
                             detection,
                             having: Some(sql),
@@ -77,8 +77,8 @@ pub(super) fn classify_request_shape(
     }
 
     // Validated against ordinary plans only: a distinct item is a row-scan fan-out.
-    let Some(items) = detect_aggregates(pushdown)
-        .filter(|it| validate_agg_col_types(&ordinary_plans(it), col_types))
+    let Some(items) = detect_aggregates(pushdown, col_types)
+        .filter(|it| validate_agg_col_types(&ordinary_plans(it, col_types), col_types))
     else {
         return if pushdown_req.get("aggregationType").and_then(|v| v.as_str())
             == Some("single_group")
@@ -94,7 +94,7 @@ pub(super) fn classify_request_shape(
             having: None,
         },
         Some(_) if has_distinct(&items) => RequestShape::SingleGroupWrapper,
-        Some(node) => match render_having_over_merge(node, &ordinary_plans(&items)) {
+        Some(node) => match render_having_over_merge(node, &ordinary_plans(&items, col_types), col_types) {
             Some(sql) => RequestShape::SingleGroupAgg {
                 items,
                 having: Some(sql),

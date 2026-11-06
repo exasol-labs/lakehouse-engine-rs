@@ -65,7 +65,7 @@ async fn explicit_cast_bool_to_varchar_renders_exasol_casing() {
         "arguments": [acctbal_greater_than_zero()],
         "dataType": {"type": "VARCHAR", "size": 10}
     });
-    let fragment = vs_expression::render_expression(&expr).expect("CAST must translate");
+    let fragment = vs_expression::render_scan_expression(&expr, &NoColumns).expect("CAST must translate");
 
     let sql = format!("SELECT {fragment} AS s FROM scan_target ORDER BY \"C_CUSTKEY\"");
     let rows = collect_strings(&ctx, &sql, "s").await;
@@ -84,7 +84,7 @@ async fn concat_predicate_matches_exasol_uppercase_not_datafusion_lowercase() {
         "name": "CONCAT",
         "arguments": [acctbal_greater_than_zero(), {"type": "literal_string", "value": ""}]
     });
-    let fragment = vs_expression::render_expression(&concat_expr).expect("CONCAT must translate");
+    let fragment = vs_expression::render_scan_expression(&concat_expr, &NoColumns).expect("CONCAT must translate");
 
     let sql_true = format!("SELECT \"C_CUSTKEY\" FROM scan_target WHERE {fragment} = 'TRUE'");
     let matched_true = collect_strings(&ctx, &sql_true, "C_CUSTKEY").await;
@@ -103,7 +103,7 @@ async fn concat_group_by_key_uses_exasol_uppercase_labels() {
         "name": "CONCAT",
         "arguments": [acctbal_greater_than_zero(), {"type": "literal_string", "value": ""}]
     });
-    let fragment = vs_expression::render_expression(&concat_expr).expect("CONCAT must translate");
+    let fragment = vs_expression::render_scan_expression(&concat_expr, &NoColumns).expect("CONCAT must translate");
 
     let sql = format!(
         "SELECT {fragment} AS g, COUNT(*) AS n FROM scan_target GROUP BY {fragment} ORDER BY g"
@@ -115,4 +115,13 @@ async fn concat_group_by_key_uses_exasol_uppercase_labels() {
         labels,
         vec![None, Some("FALSE".to_string()), Some("TRUE".to_string())]
     );
+}
+
+/// These fragments name no typed column, so no column type is known.
+struct NoColumns;
+
+impl vs_expression::ColumnTypeLookup for NoColumns {
+    fn column_type(&self, _column: &serde_json::Value) -> Option<vs_expression::exasol_type::ExasolType> {
+        None
+    }
 }

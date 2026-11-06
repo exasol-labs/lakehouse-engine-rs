@@ -895,7 +895,6 @@ fn grouped_coercion_leaves_the_group_key_columns_untouched() {
     let columns = coerce_partial_agg_columns(
         &batch,
         &declared(&[("GK_0", varchar()), ("PARTIAL_sum_0", ExaType::Int64)]),
-        1,
     )
     .expect("the grouped coercion must succeed");
 

@@ -42,7 +42,7 @@ fn context_with_timestamp_columns() -> SessionContext {
 }
 
 fn rendered_fragment(node_type: &str) -> String {
-    vs_expression::render_expression(&json!({ "type": node_type, "value": FAR_FUTURE }))
+    vs_expression::render_scan_expression(&json!({ "type": node_type, "value": FAR_FUTURE }), &NoColumns)
         .expect("render_expression must translate the timestamp literal node")
 }
 
@@ -93,5 +93,14 @@ async fn far_future_timestamp_literal_does_not_overflow_simplify_expressions() {
             rows, 1,
             "the in-range row must survive the far-future comparison: {sql}"
         );
+    }
+}
+
+/// These fragments name no typed column, so no column type is known.
+struct NoColumns;
+
+impl vs_expression::ColumnTypeLookup for NoColumns {
+    fn column_type(&self, _column: &serde_json::Value) -> Option<vs_expression::exasol_type::ExasolType> {
+        None
     }
 }

@@ -90,9 +90,7 @@ use joins::{
 use crate::scan::spec::{AggKind, AggregatePlan, StorageBackend};
 // Imported for the test mirrors of `classify_where_filter`'s two halves.
 #[cfg(test)]
-use support::apply_type_rewrites;
-#[cfg(test)]
-use vs_expression::render_df_filter_safe;
+use test_support::{apply_type_rewrites, render_df_filter_safe};
 
 #[cfg(test)]
 #[path = "test_support_tests.rs"]
@@ -347,7 +345,8 @@ pub(crate) fn build_dispatch_sql(
             let grouped_limit = limit;
             // A CHAR(n) key must be blank-padded to reproduce Exasol's CHAR grouping (#192).
             // Only the spec copy is padded; ORDER BY matching uses the unpadded fragments.
-            let group_key_types = group_key_exasol_types(pushdown, &group_keys, &select_items)?;
+            let group_key_types =
+                group_key_exasol_types(pushdown, &group_keys, &select_items, col_types)?;
             // Empty `projection` is inert on an aggregate dispatch (#145).
             let spec_template = ScanSpec {
                 common: CommonScanSpec {
@@ -444,8 +443,8 @@ pub(crate) fn build_dispatch_sql(
                     None,
                 );
             }
-            let plans = ordinary_plans(&items);
-            let plan_types = single_group_plan_types(pushdown.select_types(), &items);
+            let plans = ordinary_plans(&items, col_types);
+            let plan_types = single_group_plan_types(pushdown.select_types(), &items, col_types);
             // Assembled here because it depends on select-list classification.
             let merge_inputs = single_group_merge_select(&items, &plans, &plan_types, col_types)
                 .and_then(|merge_select| {
