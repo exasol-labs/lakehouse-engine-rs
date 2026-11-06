@@ -1243,6 +1243,33 @@ test_stops_at_product_prints_template() {
   assert_not_contains "template: does NOT execute CREATE CONNECTION" "$log" "CREATE CONNECTION"
 }
 
+test_grant_template_per_installing_user() {
+  echo "== test_grant_template_per_installing_user =="
+  local user script out
+  for user in myuser SYS; do
+    reset_env
+    run_file --account-id ACC1 --database-id DB1 --host myhost:8563 --user "$user" --password SECRETPW456
+    assert_rc_zero "grant template ($user): install succeeds" "$LAST_RC"
+    out="$LAST_OUT"
+    assert_contains "grant template ($user): prints the template to its end" "$out" "CREATE VIRTUAL SCHEMA <MY_LAKEHOUSE>"
+    if [[ "$user" == "SYS" ]]; then
+      assert_contains "grant template (SYS): says the grants are not needed" "$out" \
+        "-- SYS holds every CONNECTION implicitly; skip the grants."
+      assert_not_contains "grant template (SYS): offers no options" "$out" "Run ONE of the two options below."
+      assert_not_contains "grant template (SYS): prints no CONNECTION grant" "$out" "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT LHVS.LAKEHOUSE_"
+    else
+      assert_not_contains "grant template ($user): does not skip the grants" "$out" "skip the grants"
+      assert_contains "grant template ($user): asks for one option" "$out" "Run ONE of the two options below."
+      for script in LAKEHOUSE_ADAPTER LAKEHOUSE_SCAN; do
+        assert_contains "grant template ($user): option 1 grants $user the $script CONNECTION access" "$out" \
+          "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT LHVS.$script TO $user;"
+      done
+      assert_contains "grant template ($user): option 2 grants the role to $user" "$out" \
+        "GRANT LAKEHOUSE_ENGINE_ROLE_LHVS TO $user;"
+    fi
+  done
+}
+
 test_export_is_opt_in() {
   echo "== test_export_is_opt_in =="
   local user out log
@@ -2535,6 +2562,7 @@ main() {
   test_version_smoke_query_and_extraction
   test_docs_describe_version_verification
   test_stops_at_product_prints_template
+  test_grant_template_per_installing_user
   test_export_is_opt_in
   test_target_base_default_and_override
   test_external_failure_actionable
