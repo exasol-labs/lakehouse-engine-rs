@@ -2022,9 +2022,7 @@ fn group_key_exasol_types_resolves_char_case_key() {
         "type": "function_scalar_case",
         "name": "CASE",
         "arguments": [
-            {"type": "predicate_less",
-             "left": col("C_DECIMAL_A"),
-             "right": num_lit(0)}
+            compare("predicate_less", col("C_DECIMAL_A"), num_lit(0))
         ],
         "results": [
             str_lit("NEG"),

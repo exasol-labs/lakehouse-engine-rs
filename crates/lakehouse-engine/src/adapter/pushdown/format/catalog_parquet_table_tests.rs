@@ -1,9 +1,9 @@
-use crate::adapter::pushdown::test_support::connection_storage;
 use crate::adapter::pushdown::test_support::{
-    GlueEndpoint, ObjectEndpoint, SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, SIGV4_SECRET_KEY,
-    UNREACHABLE_CATALOG, assert_mentions, catalog_table, closed_port_storage, compare,
-    declared_notes, glue_catalog_table, involved_notes, lit, nullable_field, num_lit,
-    object_endpoint, resolve_declared, sample_storage, sigv4_creds, unauthenticated_creds,
+    GlueEndpoint, ObjectEndpoint, SALES, SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY,
+    SIGV4_SECRET_KEY, UNREACHABLE_CATALOG, and, assert_mentions, catalog_table,
+    closed_port_storage, compare, connection_storage, date_lit, declared_notes, glue_catalog_table,
+    involved_notes, nullable_field, num_lit, object_endpoint, or, predicate_equal,
+    resolve_declared, sample_storage, sigv4_creds, string_equal, table_col, unauthenticated_creds,
     unity_column, user_message,
 };
 use std::collections::BTreeMap;
@@ -11,7 +11,6 @@ use std::collections::BTreeMap;
 use super::super::ResolvedScan;
 use super::super::delta_schema::classify_spark_schema;
 use super::*;
-use crate::adapter::pushdown::test_support::{and, col, or, predicate_equal, string_equal};
 use crate::adapter::tests::parquet_fixture::{in_memory_store, values};
 use crate::adapter::tests::recording_store::RecordingStore;
 use crate::scan::spec::reconstruct_abs_uri;
@@ -278,17 +277,17 @@ async fn a_partition_predicate_prunes_under_the_declared_type() {
     let storage = served_storage(under_table(&every_file)).await.storage;
     let cases = [
         (
-            string_equal("REGION", "eu"),
+            string_equal(SALES, "REGION", "eu"),
             vec![every_file[0], every_file[2]],
         ),
         (
-            predicate_equal(col("YEAR"), num_lit("2024")),
+            predicate_equal(table_col(SALES, "YEAR"), num_lit("2024")),
             vec![every_file[0], every_file[1]],
         ),
         (
             or(vec![
-                string_equal("REGION", "us"),
-                compare("predicate_less", num_lit("10"), col("AMOUNT")),
+                string_equal(SALES, "REGION", "us"),
+                compare("predicate_less", num_lit("10"), table_col(SALES, "AMOUNT")),
             ]),
             every_file.to_vec(),
         ),
@@ -773,7 +772,7 @@ async fn a_kept_orc_or_foreign_bucket_partition_fails_naming_it_and_a_pruned_one
     );
     let objects = ["glue/orders/p_int=1/f"];
     let below_five = keep_under(
-        &compare("predicate_less", col("P_INT"), num_lit("5")),
+        &compare("predicate_less", table_col(SALES, "P_INT"), num_lit("5")),
         &[("p_int", ArrowType::Int32)],
     );
 
@@ -822,11 +821,11 @@ async fn a_kept_orc_or_foreign_bucket_partition_fails_naming_it_and_a_pruned_one
 #[tokio::test]
 async fn glue_partitions_are_pruned_on_glue_values_before_listing() {
     let filter = and(vec![
-        predicate_equal(col("P_INT"), num_lit("1")),
+        predicate_equal(table_col(SALES, "P_INT"), num_lit("1")),
         compare(
             "predicate_lessequal",
-            lit("literal_date", "2024-01-01"),
-            col("P_DATE"),
+            date_lit("2024-01-01"),
+            table_col(SALES, "P_DATE"),
         ),
     ]);
     let rows = [

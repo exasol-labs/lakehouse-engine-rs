@@ -21,7 +21,7 @@ fn renders_column_as_quoted_uppercase_ident() {
 
 #[test]
 fn renders_column_with_embedded_quotes() {
-    let expr = json!({"type": "column", "name": r#"my"col"#});
+    let expr = col(r#"my"col"#);
     let sql = render_expression(&expr).unwrap();
     assert_eq!(sql, r#""MY""COL""#);
 }
@@ -74,13 +74,13 @@ fn renders_numeric_literal() {
 
 #[test]
 fn renders_date_literal() {
-    let expr = lit("literal_date", "2024-01-15");
+    let expr = date_lit("2024-01-15");
     assert_eq!(render_expression(&expr).unwrap(), "DATE '2024-01-15'");
 }
 
 #[test]
 fn renders_timestamp_literal() {
-    let expr = lit("literal_timestamp", "2024-01-15 12:00:00");
+    let expr = timestamp_lit("2024-01-15 12:00:00");
     assert_eq!(
         render_expression(&expr).unwrap(),
         "arrow_cast('2024-01-15 12:00:00', 'Timestamp(Microsecond, None)')"
@@ -89,7 +89,7 @@ fn renders_timestamp_literal() {
 
 #[test]
 fn renders_far_future_timestamp_literal() {
-    let expr = lit("literal_timestamp", "9999-12-31 23:59:59");
+    let expr = timestamp_lit("9999-12-31 23:59:59");
     assert_eq!(
         render_expression(&expr).unwrap(),
         "arrow_cast('9999-12-31 23:59:59', 'Timestamp(Microsecond, None)')"
@@ -104,7 +104,7 @@ fn timestamp_literal_with_sub_microsecond_digits_renders_nanoseconds() {
         ("2025-06-01 00:00:00.123456000", "Microsecond"),
         ("2025-06-01 00:00:00.123456", "Microsecond"),
     ] {
-        let expr = lit("literal_timestamp", value);
+        let expr = timestamp_lit(value);
         assert_eq!(
             render_expression(&expr).unwrap(),
             format!("arrow_cast('{value}', 'Timestamp({unit}, None)')"),
@@ -634,11 +634,7 @@ fn renders_cast_bool_to_varchar_as_exasol_case_uppercase() {
     let expr = json!({
         "type": "function_scalar_cast",
         "name": "CAST",
-        "arguments": [{
-            "type": "predicate_greater",
-            "left": col("c_acctbal"),
-            "right": num_lit(0)
-        }],
+        "arguments": [compare("predicate_greater", col("c_acctbal"), num_lit(0))],
         "dataType": {"type": "VARCHAR", "size": 10}
     });
     assert_eq!(
@@ -652,10 +648,7 @@ fn renders_cast_bool_to_varchar_uses_case_for_any_predicate_source() {
     let expr = json!({
         "type": "function_scalar_cast",
         "name": "CAST",
-        "arguments": [{
-            "type": "predicate_is_null",
-            "expression": col("x")
-        }],
+        "arguments": [is_null(col("x"))],
         "dataType": {"type": "VARCHAR", "size": 10}
     });
     assert_eq!(
@@ -669,11 +662,7 @@ fn renders_cast_bool_to_varchar_as_plain_cast_in_exasol_dialect() {
     let expr = json!({
         "type": "function_scalar_cast",
         "name": "CAST",
-        "arguments": [{
-            "type": "predicate_greater",
-            "left": col("c_acctbal"),
-            "right": num_lit(0)
-        }],
+        "arguments": [compare("predicate_greater", col("c_acctbal"), num_lit(0))],
         "dataType": {"type": "VARCHAR", "size": 10}
     });
     assert_eq!(
@@ -911,7 +900,7 @@ fn renders_timestamp_utc_literal() {
 
 #[test]
 fn renders_timestamp_literals_as_bare_timestamp_in_exasol_dialect() {
-    let ts = lit("literal_timestamp", "2024-01-15 12:00:00");
+    let ts = timestamp_lit("2024-01-15 12:00:00");
     let ts_utc = lit("literal_timestamp_utc", "2024-03-01 10:00:00");
 
     let ts_exasol = render_expression_exasol(&ts).unwrap();
@@ -922,8 +911,7 @@ fn renders_timestamp_literals_as_bare_timestamp_in_exasol_dialect() {
     );
 
     assert_eq!(
-        render_expression_exasol(&lit("literal_timestamp", "2024-01-15 12:00:00' OR '1'='1"))
-            .unwrap(),
+        render_expression_exasol(&timestamp_lit("2024-01-15 12:00:00' OR '1'='1")).unwrap(),
         "TIMESTAMP '2024-01-15 12:00:00'' OR ''1''=''1'"
     );
 
@@ -1658,9 +1646,7 @@ fn renders_searched_case_without_basis() {
         "type": "function_scalar_case",
         "name": "CASE",
         "arguments": [
-            {"type": "predicate_less",
-             "left": col("SCORE"),
-             "right": num_lit("50")}
+            compare("predicate_less", col("SCORE"), num_lit("50"))
         ],
         "results": [
             str_lit("low"),
@@ -1866,7 +1852,7 @@ fn renders_week_at_year_boundary_dates() {
         let expr = json!({
             "type": "function_scalar",
             "name": "WEEK",
-            "arguments": [lit("literal_date", date)]
+            "arguments": [date_lit(date)]
         });
         assert_eq!(
             render_expression(&expr).unwrap(),
@@ -2299,7 +2285,7 @@ fn render_expression_renders_aggregate_nodes() {
     let sum_qualified = json!({
         "type": "function_aggregate",
         "name": "SUM",
-        "arguments": [{"type": "column", "name": "amount", "tableAlias": "O"}],
+        "arguments": [alias_col("O", "amount")],
         "distinct": false
     });
     assert_eq!(
@@ -3145,7 +3131,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
             r#"CAST("V" AS VARCHAR)"#,
         ),
         (
-            lit("literal_timestamp", "2024-03-01 12:34:56.789"),
+            timestamp_lit("2024-03-01 12:34:56.789"),
             "TIMESTAMP '2024-03-01 12:34:56.789'",
             "arrow_cast('2024-03-01 12:34:56.789', 'Timestamp(Microsecond, None)')",
         ),
@@ -3273,7 +3259,7 @@ fn non_timestamp_literals_render_identically_in_both_dialects() {
         (bool_lit(false), "FALSE"),
         (str_lit("it's"), "'it''s'"),
         (num_lit(42), "42"),
-        (lit("literal_date", "2024-01-15"), "DATE '2024-01-15'"),
+        (date_lit("2024-01-15"), "DATE '2024-01-15'"),
     ];
     for (node, expected) in cases {
         let node_type = node["type"].as_str().unwrap();
@@ -3319,8 +3305,8 @@ fn exasol_df_filter_suppresses_trivially_true() {
 
 #[test]
 fn a_binary_literal_renders_for_datafusion_only_and_only_as_hex() {
-    let variable = lit("literal_binary", "0a1b");
-    let fixed = json!({"type": "literal_binary", "value": "0a1b", "width": 2});
+    let variable = binary_lit("0a1b");
+    let fixed = fixed_binary_lit("0a1b", 2);
 
     assert_eq!(render_expression(&variable).unwrap(), "X'0a1b'");
     assert_eq!(
@@ -3328,5 +3314,5 @@ fn a_binary_literal_renders_for_datafusion_only_and_only_as_hex() {
         "arrow_cast(X'0a1b', 'FixedSizeBinary(2)')"
     );
     assert!(render_expression_exasol(&variable).is_err());
-    assert!(render_expression(&lit("literal_binary", "0a'")).is_err());
+    assert!(render_expression(&binary_lit("0a'")).is_err());
 }

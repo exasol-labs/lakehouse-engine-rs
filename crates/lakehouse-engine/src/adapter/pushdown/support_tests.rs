@@ -1672,9 +1672,7 @@ fn selectlist_case_node_rendered_in_emits() {
         "type": "function_scalar_case",
         "name": "CASE",
         "arguments": [
-            {"type": "predicate_less",
-             "left": col("SCORE"),
-             "right": num_lit("50")}
+            compare("predicate_less", col("SCORE"), num_lit("50"))
         ],
         "results": [
             str_lit("low"),
@@ -1865,7 +1863,7 @@ fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
 
 #[test]
 fn selectlist_plain_timestamp_literal_rendered_as_expr() {
-    let literal = lit("literal_timestamp", "2024-03-01 10:00:00");
+    let literal = timestamp_lit("2024-03-01 10:00:00");
     let (proj_cols, proj_types, _widened) = projected(
         pushdown_request("T", &[("ID", ExasolType::decimal(10, 0))])
             .item(literal, ExasolType::BARE_TIMESTAMP),
@@ -2174,15 +2172,14 @@ fn like_guard_integer_subject_declines() {
 /// Scenario: LIKE on a non-column subject is left untouched
 #[test]
 fn like_guard_non_column_subject_untouched() {
-    let filter = serde_json::json!({
-        "type": "predicate_like",
-        "expression": {
+    let filter = like(
+        serde_json::json!({
             "type": "function_scalar",
             "name": "UPPER",
             "arguments": [col("amount")]
-        },
-        "pattern": str_lit("A%")
-    });
+        }),
+        "A%",
+    );
     let col_types = vec![("AMOUNT".to_string(), ExasolType::decimal(9, 2))];
 
     let result = like_subject_type_guard(&filter, &column_types(&col_types));
@@ -2329,11 +2326,7 @@ fn like_guard_decimal_inside_case_declines() {
         "type": "function_scalar_case",
         "name": "CASE",
         "arguments": [
-            {
-                "type": "predicate_like",
-                "expression": col("amount"),
-                "pattern": str_lit("9%")
-            }
+            like(col("amount"), "9%")
         ],
         "results": [
             num_lit(1),
@@ -2359,11 +2352,7 @@ fn like_guard_date_inside_case_wraps_cast() {
         "type": "function_scalar_case",
         "name": "CASE",
         "arguments": [
-            {
-                "type": "predicate_like",
-                "expression": column.clone(),
-                "pattern": str_lit("2024%")
-            }
+            like(column.clone(), "2024%")
         ],
         "results": [then_branch.clone(), else_branch.clone()]
     });
@@ -2374,11 +2363,7 @@ fn like_guard_date_inside_case_wraps_cast() {
         "type": "function_scalar_case",
         "name": "CASE",
         "arguments": [
-            {
-                "type": "predicate_like",
-                "expression": cast_to(ExasolType::WIDEST_VARCHAR, column),
-                "pattern": str_lit("2024%")
-            }
+            like(cast_to(ExasolType::WIDEST_VARCHAR, column), "2024%")
         ],
         "results": [then_branch, else_branch]
     });
@@ -2396,11 +2381,7 @@ fn like_guard_varchar_inside_case_unchanged() {
         "type": "function_scalar_case",
         "name": "CASE",
         "arguments": [
-            {
-                "type": "predicate_like",
-                "expression": col("name"),
-                "pattern": str_lit("A%")
-            }
+            like(col("name"), "A%")
         ],
         "results": [
             num_lit(1),
@@ -2756,11 +2737,7 @@ fn rewrite_reaches_decimal_inside_case_then_branch() {
         "type": "function_scalar_case",
         "name": "CASE",
         "arguments": [
-            {
-                "type": "predicate_greater",
-                "left": col("id"),
-                "right": num_lit(0)
-            }
+            compare("predicate_greater", col("id"), num_lit(0))
         ],
         "results": [
             {
@@ -3267,11 +3244,7 @@ fn selectlist_like_inside_case_over_decimal_falls_back_to_full_row() {
         "type": "function_scalar_case",
         "name": "CASE",
         "arguments": [
-            {
-                "type": "predicate_like",
-                "expression": col("c_decimal_a"),
-                "pattern": str_lit("1%")
-            }
+            like(col("c_decimal_a"), "1%")
         ],
         "results": [
             str_lit("yes"),
@@ -3944,11 +3917,7 @@ fn project_columns_widens_on_aggregate_nested_in_function_scalar_case_item() {
     let select_item = serde_json::json!({
         "type": "function_scalar_case",
         "name": "CASE",
-        "arguments": [ {
-            "type": "predicate_less",
-            "left": col("ID"),
-            "right": num_lit(10)
-        } ],
+        "arguments": [compare("predicate_less", col("ID"), num_lit(10))],
         "results": [
             agg_item("COUNT", None, false),
             num_lit(0)

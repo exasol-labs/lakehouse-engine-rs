@@ -196,18 +196,18 @@ fn broadcast_join_declines_widened_projection() {
 #[test]
 fn broadcast_declines_on_unrenderable_filter_stays_eligible_when_absent() {
     let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["filter"] = serde_json::json!({
-        "type": "predicate_greater",
-        "left": {
+    request["pushdownRequest"]["filter"] = compare(
+        "predicate_greater",
+        serde_json::json!({
             "type": "function_scalar",
             "name": "SECOND",
             "arguments": [
                 table_col("ORDERS", "O_ORDERDATE"),
                 num_lit(3)
             ]
-        },
-        "right": num_lit(1)
-    });
+        }),
+        num_lit(1),
+    );
     let detected = detected_join(&request);
 
     assert!(
@@ -282,9 +282,9 @@ fn broadcast_keeps_plan_and_casts_like_over_date_side_column() {
 #[test]
 fn broadcast_declines_instr_with_start_position_argument() {
     let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["filter"] = serde_json::json!({
-        "type": "predicate_greater",
-        "left": {
+    request["pushdownRequest"]["filter"] = compare(
+        "predicate_greater",
+        serde_json::json!({
             "type": "function_scalar",
             "name": "INSTR",
             "arguments": [
@@ -292,9 +292,9 @@ fn broadcast_declines_instr_with_start_position_argument() {
                 str_lit("b"),
                 num_lit(3)
             ]
-        },
-        "right": num_lit(0)
-    });
+        }),
+        num_lit(0),
+    );
     let detected = detected_join(&request);
 
     let outcome = render_broadcast_join(
@@ -1152,22 +1152,24 @@ fn n_scan_type_accepted_side_local_conjunct_still_pushes_when_a_sibling_declines
 
 #[test]
 fn n_scan_leg_residual_partition_is_total_and_disjoint_with_type_screen() {
-    let request = n_scan_request_with_filter(serde_json::json!({
-        "type": "predicate_and",
-        "expressions": [
-            predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
-            like(table_col("ORDERS", "O_ORDERDATE"), "1995%"),
-            like(table_col("CUSTOMER", "C_CUSTKEY"), "1%"),
-            {"type": "predicate_greater",
-             "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
-                 table_col("ORDERS", "O_ORDERDATE"),
-                 num_lit(3)]},
-             "right": num_lit(1)},
-            {"type": "predicate_greater",
-             "left": table_col("CUSTOMER", "C_CUSTKEY"),
-             "right": table_col("ORDERS", "O_CUSTKEY")},
-        ],
-    }));
+    let request = n_scan_request_with_filter(and([
+        predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
+        like(table_col("ORDERS", "O_ORDERDATE"), "1995%"),
+        like(table_col("CUSTOMER", "C_CUSTKEY"), "1%"),
+        compare(
+            "predicate_greater",
+            serde_json::json!({"type": "function_scalar", "name": "SECOND", "arguments": [
+                table_col("ORDERS", "O_ORDERDATE"),
+                num_lit(3),
+            ]}),
+            num_lit(1),
+        ),
+        compare(
+            "predicate_greater",
+            table_col("CUSTOMER", "C_CUSTKEY"),
+            table_col("ORDERS", "O_CUSTKEY"),
+        ),
+    ]));
 
     let (legs, outer) = n_scan_legs_and_outer_where(&request);
 
@@ -1250,15 +1252,15 @@ fn join_decimal_stringification_renders_trimmed_at_both_join_sites() {
         .push(serde_json::json!(
             {"name": "O_TOTALPRICE", "dataType": {"type": "decimal", "precision": 20, "scale": 2}}
         ));
-    let filter = serde_json::json!({
-        "type": "predicate_greater",
-        "left": {
+    let filter = compare(
+        "predicate_greater",
+        serde_json::json!({
             "type": "function_scalar",
             "name": "LENGTH",
             "arguments": [table_col("ORDERS", "O_TOTALPRICE")]
-        },
-        "right": num_lit(3)
-    });
+        }),
+        num_lit(3),
+    );
     request["pushdownRequest"]["filter"] = filter;
     let detected = detected_join(&request);
 
@@ -1289,9 +1291,9 @@ fn join_decimal_stringification_renders_trimmed_at_both_join_sites() {
 
 #[test]
 fn join_instr_beyond_two_args_declines_at_both_join_sites() {
-    let filter = serde_json::json!({
-        "type": "predicate_greater",
-        "left": {
+    let filter = compare(
+        "predicate_greater",
+        serde_json::json!({
             "type": "function_scalar",
             "name": "INSTR",
             "arguments": [
@@ -1299,9 +1301,9 @@ fn join_instr_beyond_two_args_declines_at_both_join_sites() {
                 str_lit("b"),
                 num_lit(3)
             ]
-        },
-        "right": num_lit(0)
-    });
+        }),
+        num_lit(0),
+    );
     let request = n_scan_request_with_filter(filter);
 
     let (legs, outer) = n_scan_legs_and_outer_where(&request);
@@ -2664,14 +2666,14 @@ fn declined_filter_wrapper_sql(
 
 /// DataFusion declines this on arity while Exasol renders it (live-verified).
 fn second_arity_predicate() -> Json {
-    serde_json::json!({
-        "type": "predicate_greater",
-        "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
+    compare(
+        "predicate_greater",
+        serde_json::json!({"type": "function_scalar", "name": "SECOND", "arguments": [
             table_col("T", "C_TS"),
             num_lit(3),
-        ]},
-        "right": num_lit(1),
-    })
+        ]}),
+        num_lit(1),
+    )
 }
 
 #[test]
@@ -3124,8 +3126,7 @@ fn shared_column_name_with_different_types_declares_each_legs_type() {
         shared_names_request(
             &[events_column("ID"), labels_column("ID")],
             serde_json::json!({
-                "filter": {"type": "predicate_like", "expression": column,
-                           "pattern": str_lit(pattern)},
+                "filter": like(column, pattern),
             }),
         )
     };

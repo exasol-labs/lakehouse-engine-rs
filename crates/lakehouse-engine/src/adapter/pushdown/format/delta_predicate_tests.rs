@@ -1,9 +1,7 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    and, between, compare, in_list, is_not_null, is_null, not, or,
-};
-use crate::adapter::pushdown::test_support::{
-    by_name, col, lit, num_lit, predicate_equal, str_lit,
+    and, between, binary_lit, bool_lit, by_name, col, compare, date_lit, in_list, is_not_null,
+    is_null, lit, not, num_lit, or, predicate_equal, str_lit, timestamp_lit,
 };
 use delta_kernel::schema::{PrimitiveType, StructField, StructType};
 use serde_json::json;
@@ -130,7 +128,7 @@ fn not_over_an_and_that_dropped_a_conjunct_returns_none() {
 
 #[test]
 fn not_over_a_between_that_dropped_a_bound_returns_none() {
-    let child = between(col("ID"), num_lit(1), lit("literal_string", json!("ten")));
+    let child = between(col("ID"), num_lit(1), str_lit("ten"));
     let node = not(child);
 
     assert_eq!(translate(&node), None);
@@ -207,7 +205,7 @@ const TIMESTAMP_MICROS: i64 = 1_705_314_600_000_000;
 
 #[test]
 fn boolean_literal_becomes_boolean_scalar() {
-    let json_true = lit("literal_bool", json!(true));
+    let json_true = bool_lit(true);
     let string_false = lit("literal_bool", json!("FALSE"));
     let number_true = lit("literal_bool", json!(1));
 
@@ -234,7 +232,7 @@ fn unrecognized_boolean_spelling_yields_no_scalar() {
 
 #[test]
 fn exactnumeric_literal_becomes_integer_scalar() {
-    let node = lit("literal_exactnumeric", json!(5));
+    let node = num_lit(5);
 
     assert_eq!(
         literal_to_scalar(&node, &PrimitiveType::Integer),
@@ -244,7 +242,7 @@ fn exactnumeric_literal_becomes_integer_scalar() {
 
 #[test]
 fn exactnumeric_string_literal_becomes_long_scalar() {
-    let node = lit("literal_exactnumeric", json!("9007199254740993"));
+    let node = num_lit("9007199254740993");
 
     assert_eq!(
         literal_to_scalar(&node, &PrimitiveType::Long),
@@ -254,21 +252,21 @@ fn exactnumeric_string_literal_becomes_long_scalar() {
 
 #[test]
 fn exactnumeric_literal_becomes_narrow_integer_scalar() {
-    let node = lit("literal_exactnumeric", json!(300));
+    let node = num_lit(300);
 
     assert_eq!(
         literal_to_scalar(&node, &PrimitiveType::Short),
         Some(Scalar::Short(300))
     );
     assert_eq!(
-        literal_to_scalar(&lit("literal_exactnumeric", json!(7)), &PrimitiveType::Byte),
+        literal_to_scalar(&num_lit(7), &PrimitiveType::Byte),
         Some(Scalar::Byte(7))
     );
 }
 
 #[test]
 fn integer_literal_outside_the_column_range_yields_no_scalar() {
-    let node = lit("literal_exactnumeric", json!(300));
+    let node = num_lit(300);
 
     assert_eq!(literal_to_scalar(&node, &PrimitiveType::Byte), None);
 }
@@ -302,7 +300,7 @@ fn double_literal_not_exactly_representable_as_float_yields_no_scalar() {
 
 #[test]
 fn string_literal_becomes_string_scalar() {
-    let node = lit("literal_string", json!("abc"));
+    let node = str_lit("abc");
 
     assert_eq!(
         literal_to_scalar(&node, &PrimitiveType::String),
@@ -312,7 +310,7 @@ fn string_literal_becomes_string_scalar() {
 
 #[test]
 fn date_literal_becomes_days_since_the_epoch() {
-    let node = lit("literal_date", json!("2024-01-15"));
+    let node = date_lit("2024-01-15");
 
     assert_eq!(
         literal_to_scalar(&node, &PrimitiveType::Date),
@@ -322,7 +320,7 @@ fn date_literal_becomes_days_since_the_epoch() {
 
 #[test]
 fn timestamp_literal_becomes_microseconds_on_a_zoneless_column() {
-    let node = lit("literal_timestamp", json!("2024-01-15 10:30:00"));
+    let node = timestamp_lit("2024-01-15 10:30:00");
 
     assert_eq!(
         literal_to_scalar(&node, &PrimitiveType::TimestampNtz),
@@ -332,7 +330,7 @@ fn timestamp_literal_becomes_microseconds_on_a_zoneless_column() {
 
 #[test]
 fn timestamp_literal_becomes_microseconds_on_a_utc_adjusted_column() {
-    let node = lit("literal_timestamp", json!("2024-01-15 10:30:00"));
+    let node = timestamp_lit("2024-01-15 10:30:00");
 
     assert_eq!(
         literal_to_scalar(&node, &PrimitiveType::Timestamp),
@@ -342,8 +340,8 @@ fn timestamp_literal_becomes_microseconds_on_a_utc_adjusted_column() {
 
 #[test]
 fn timestamp_literal_finer_than_microseconds_yields_no_scalar() {
-    let finer = lit("literal_timestamp", json!("2024-01-15 10:30:00.123456789"));
-    let exact = lit("literal_timestamp", json!("2024-01-15 10:30:00.123456000"));
+    let finer = timestamp_lit("2024-01-15 10:30:00.123456789");
+    let exact = timestamp_lit("2024-01-15 10:30:00.123456000");
 
     assert_eq!(
         literal_to_scalar(&finer, &PrimitiveType::TimestampNtz),
@@ -374,8 +372,8 @@ fn utc_timestamp_literal_yields_no_scalar_on_a_zoneless_column() {
 
 #[test]
 fn exactnumeric_literal_rescales_to_the_decimal_column_scale() {
-    let whole = lit("literal_exactnumeric", json!(5));
-    let fractional = lit("literal_exactnumeric", json!("5.25"));
+    let whole = num_lit(5);
+    let fractional = num_lit("5.25");
     let exponent = lit("literal_double", json!("1e2"));
     let prim = PrimitiveType::Decimal(decimal_type(10, 2));
 
@@ -395,7 +393,7 @@ fn exactnumeric_literal_rescales_to_the_decimal_column_scale() {
 
 #[test]
 fn decimal_literal_finer_than_the_column_scale_yields_no_scalar() {
-    let node = lit("literal_exactnumeric", json!("5.125"));
+    let node = num_lit("5.125");
     let prim = PrimitiveType::Decimal(decimal_type(10, 2));
 
     assert_eq!(literal_to_scalar(&node, &prim), None);
@@ -403,7 +401,7 @@ fn decimal_literal_finer_than_the_column_scale_yields_no_scalar() {
 
 #[test]
 fn decimal_literal_exceeding_the_column_precision_yields_no_scalar() {
-    let node = lit("literal_exactnumeric", json!(12345));
+    let node = num_lit(12345);
     let prim = PrimitiveType::Decimal(decimal_type(3, 0));
 
     assert_eq!(literal_to_scalar(&node, &prim), None);
@@ -412,18 +410,12 @@ fn decimal_literal_exceeding_the_column_precision_yields_no_scalar() {
 #[test]
 fn empty_string_literal_yields_no_scalar() {
     assert_eq!(
-        literal_to_scalar(&lit("literal_string", json!("")), &PrimitiveType::String),
+        literal_to_scalar(&str_lit(""), &PrimitiveType::String),
         None
     );
+    assert_eq!(literal_to_scalar(&date_lit(""), &PrimitiveType::Date), None);
     assert_eq!(
-        literal_to_scalar(&lit("literal_date", json!("")), &PrimitiveType::Date),
-        None
-    );
-    assert_eq!(
-        literal_to_scalar(
-            &lit("literal_timestamp", json!("")),
-            &PrimitiveType::TimestampNtz
-        ),
+        literal_to_scalar(&timestamp_lit(""), &PrimitiveType::TimestampNtz),
         None
     );
 }
@@ -431,28 +423,16 @@ fn empty_string_literal_yields_no_scalar() {
 #[test]
 fn literal_the_column_type_cannot_represent_yields_no_scalar() {
     assert_eq!(
-        literal_to_scalar(
-            &lit("literal_string", json!("abc")),
-            &PrimitiveType::Integer
-        ),
+        literal_to_scalar(&str_lit("abc"), &PrimitiveType::Integer),
+        None
+    );
+    assert_eq!(literal_to_scalar(&num_lit(5), &PrimitiveType::String), None);
+    assert_eq!(
+        literal_to_scalar(&bool_lit(true), &PrimitiveType::Integer),
         None
     );
     assert_eq!(
-        literal_to_scalar(
-            &lit("literal_exactnumeric", json!(5)),
-            &PrimitiveType::String
-        ),
-        None
-    );
-    assert_eq!(
-        literal_to_scalar(&lit("literal_bool", json!(true)), &PrimitiveType::Integer),
-        None
-    );
-    assert_eq!(
-        literal_to_scalar(
-            &lit("literal_date", json!("2024-01-15")),
-            &PrimitiveType::Long
-        ),
+        literal_to_scalar(&date_lit("2024-01-15"), &PrimitiveType::Long),
         None
     );
 }
@@ -586,7 +566,7 @@ fn empty_in_list_returns_none_not_a_false_predicate() {
 
 #[test]
 fn in_with_type_mismatch_element_returns_none() {
-    let node = in_list(col("ID"), [num_lit(1), lit("literal_string", json!("two"))]);
+    let node = in_list(col("ID"), [num_lit(1), str_lit("two")]);
 
     assert_eq!(translate(&node), None);
 }
@@ -605,7 +585,7 @@ fn between_translates_to_a_lower_and_upper_bound_conjunction() {
 
 #[test]
 fn between_keeps_the_convertible_bound_when_the_other_fails() {
-    let node = between(col("ID"), num_lit(1), lit("literal_string", json!("ten")));
+    let node = between(col("ID"), num_lit(1), str_lit("ten"));
     let pred = translate(&node).expect("a BETWEEN must keep the bound it can translate");
 
     let expected = Predicate::ge(Expression::column(["id"]), Expression::literal(1i32));
@@ -614,11 +594,7 @@ fn between_keeps_the_convertible_bound_when_the_other_fails() {
 
 #[test]
 fn between_with_both_bounds_unconvertible_returns_none() {
-    let node = between(
-        col("ID"),
-        lit("literal_string", json!("one")),
-        lit("literal_string", json!("ten")),
-    );
+    let node = between(col("ID"), str_lit("one"), str_lit("ten"));
 
     assert_eq!(translate(&node), None);
 }
@@ -656,10 +632,7 @@ fn a_binary_literal_prunes_a_binary_column_by_its_bytes() {
     let equal_to = |literal: Json| predicate_equal(col("B"), literal);
 
     assert_eq!(
-        to_delta_predicate(
-            &equal_to(lit("literal_binary", "00abff")),
-            &by_name(&schema)
-        ),
+        to_delta_predicate(&equal_to(binary_lit("00abff")), &by_name(&schema)),
         Some(Predicate::eq(
             Expression::column(["b"]),
             Expression::literal(Scalar::Binary(vec![0x00, 0xab, 0xff]))

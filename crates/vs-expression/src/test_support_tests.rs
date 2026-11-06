@@ -2,7 +2,7 @@
 //! crates reach them through the `test-support` feature.
 
 use crate::ColumnNode;
-use serde_json::{Value as Json, json};
+use serde_json::{Map, Value as Json, json};
 
 pub fn col(name: &str) -> Json {
     ColumnNode::to_json(name, None, None)
@@ -26,7 +26,7 @@ pub fn alias_col(alias: &str, name: &str) -> Json {
 }
 
 pub fn lit(kind: &str, value: impl Into<Json>) -> Json {
-    json!({"type": kind, "value": value.into()})
+    node(kind, [("value", value.into())])
 }
 
 pub fn num_lit(value: impl Into<Json>) -> Json {
@@ -53,50 +53,81 @@ pub fn timestamp_lit(value: &str) -> Json {
     lit("literal_timestamp", value)
 }
 
+/// A hex literal retyped as bytes, as the binary-filter rewrite writes it.
+pub fn binary_lit(hex: &str) -> Json {
+    lit("literal_binary", hex)
+}
+
+/// [`binary_lit`] for a fixed-length binary column `width` bytes wide.
+pub fn fixed_binary_lit(hex: &str, width: usize) -> Json {
+    node(
+        "literal_binary",
+        [("value", hex.into()), ("width", width.into())],
+    )
+}
+
 pub fn compare(kind: &str, left: Json, right: Json) -> Json {
-    json!({"type": kind, "left": left, "right": right})
+    node(kind, [("left", left), ("right", right)])
 }
 
 pub fn predicate_equal(left: Json, right: Json) -> Json {
     compare("predicate_equal", left, right)
 }
 
-/// `name = 'value'`, the common shape of a partition-equality filter.
-pub fn string_equal(name: &str, value: &str) -> Json {
-    predicate_equal(col(name), str_lit(value))
+/// `table.name = 'value'` as Exasol sends a single-table filter: its column node names the table.
+pub fn string_equal(table: &str, name: &str, value: &str) -> Json {
+    predicate_equal(table_col(table, name), str_lit(value))
 }
 
 pub fn not(expression: Json) -> Json {
-    json!({"type": "predicate_not", "expression": expression})
+    node("predicate_not", [("expression", expression)])
 }
 
 pub fn and(expressions: impl IntoIterator<Item = Json>) -> Json {
-    let expressions: Vec<Json> = expressions.into_iter().collect();
-    json!({"type": "predicate_and", "expressions": expressions})
+    node("predicate_and", [("expressions", array(expressions))])
 }
 
 pub fn or(expressions: impl IntoIterator<Item = Json>) -> Json {
-    let expressions: Vec<Json> = expressions.into_iter().collect();
-    json!({"type": "predicate_or", "expressions": expressions})
+    node("predicate_or", [("expressions", array(expressions))])
 }
 
 pub fn is_null(expression: Json) -> Json {
-    json!({"type": "predicate_is_null", "expression": expression})
+    node("predicate_is_null", [("expression", expression)])
 }
 
 pub fn is_not_null(expression: Json) -> Json {
-    json!({"type": "predicate_is_not_null", "expression": expression})
+    node("predicate_is_not_null", [("expression", expression)])
 }
 
 pub fn in_list(expression: Json, arguments: impl IntoIterator<Item = Json>) -> Json {
-    let arguments: Vec<Json> = arguments.into_iter().collect();
-    json!({"type": "predicate_in_constlist", "expression": expression, "arguments": arguments})
+    node(
+        "predicate_in_constlist",
+        [("expression", expression), ("arguments", array(arguments))],
+    )
 }
 
 pub fn between(expression: Json, low: Json, high: Json) -> Json {
-    json!({"type": "predicate_between", "expression": expression, "left": low, "right": high})
+    node(
+        "predicate_between",
+        [("expression", expression), ("left", low), ("right", high)],
+    )
 }
 
 pub fn like(expression: Json, pattern: &str) -> Json {
-    json!({"type": "predicate_like", "expression": expression, "pattern": str_lit(pattern)})
+    node(
+        "predicate_like",
+        [("expression", expression), ("pattern", str_lit(pattern))],
+    )
+}
+
+/// Moves `fields` into a node of type `kind`. `json!` would clone every child it is handed,
+/// which nested builders repeat at each level.
+fn node<const N: usize>(kind: &str, fields: [(&str, Json); N]) -> Json {
+    let mut map = Map::from_iter([("type".to_string(), Json::from(kind))]);
+    map.extend(fields.map(|(key, value)| (key.to_string(), value)));
+    Json::Object(map)
+}
+
+fn array(nodes: impl IntoIterator<Item = Json>) -> Json {
+    Json::Array(nodes.into_iter().collect())
 }

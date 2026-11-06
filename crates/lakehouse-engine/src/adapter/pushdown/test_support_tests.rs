@@ -18,11 +18,10 @@ use lakehouse_catalog::{
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-pub(crate) use vs_expression::test_support::{
-    alias_col, aliased_col, and, between, bool_lit, col, compare, date_lit, in_list, is_not_null,
-    is_null, like, lit, not, null_lit, num_lit, or, predicate_equal, str_lit, string_equal,
-    table_col, table_column, timestamp_lit,
-};
+pub(crate) use vs_expression::test_support::*;
+
+/// The table a single-table filter fixture qualifies its columns with, as Exasol does.
+pub(crate) const SALES: &str = "SALES";
 
 type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 

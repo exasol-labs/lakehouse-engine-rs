@@ -1,10 +1,9 @@
-use crate::adapter::pushdown::test_support::{and, is_not_null};
-use crate::adapter::pushdown::test_support::{predicate_equal, str_lit, table_col};
+use crate::adapter::pushdown::test_support::{
+    PushdownRequestBuilder, and, is_not_null, predicate_equal, pushdown_request, str_lit,
+    table_col, unread_refused, user_message,
+};
 
 use super::*;
-use crate::adapter::pushdown::test_support::{
-    PushdownRequestBuilder, pushdown_request, unread_refused, user_message,
-};
 use crate::types::exasol_type::ExasolType;
 
 fn shape_col() -> RefusedColumn {

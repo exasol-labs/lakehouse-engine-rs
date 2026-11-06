@@ -444,18 +444,18 @@ fn orders_local_rendering_conjunct() -> Json {
 
 /// DataFusion refuses a two-argument `SECOND` while Exasol renders it.
 fn orders_local_declined_conjunct() -> Json {
-    serde_json::json!({
-        "type": "predicate_greater",
-        "left": {
+    compare(
+        "predicate_greater",
+        serde_json::json!({
             "type": "function_scalar",
             "name": "SECOND",
             "arguments": [
                 table_col("ORDERS", "O_ORDERDATE"),
                 num_lit(3)
             ]
-        },
-        "right": num_lit(1)
-    })
+        }),
+        num_lit(1),
+    )
 }
 
 fn orders_local_rendering_and_declined_filter() -> Json {
@@ -682,17 +682,17 @@ fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
 #[test]
 fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
     let col_types = customer_col_types();
-    let filter = serde_json::json!({
-        "type": "predicate_greater",
-        "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
+    let filter = compare(
+        "predicate_greater",
+        serde_json::json!({"type": "function_scalar", "name": "SECOND", "arguments": [
             {"type": "function_scalar_cast", "name": "CAST",
              "dataType": {"type": "VARCHAR", "size": 40},
              "arguments": [
                  table_col("CUSTOMER", "C_CUSTKEY")]},
             num_lit(3)
-        ]},
-        "right": num_lit(1)
-    });
+        ]}),
+        num_lit(1),
+    );
 
     let rewritten = apply_type_rewrites(&filter, &column_types(&col_types))
         .expect("precondition: the type pipeline ACCEPTS this tree");

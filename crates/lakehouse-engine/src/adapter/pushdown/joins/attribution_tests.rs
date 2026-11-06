@@ -1,7 +1,6 @@
 use super::*;
-use crate::adapter::pushdown::test_support::not;
 use crate::adapter::pushdown::test_support::{
-    aliased_col, col, num_lit, predicate_equal, table_col,
+    aliased_col, col, not, num_lit, predicate_equal, table_col,
 };
 
 impl super::JoinLegs {

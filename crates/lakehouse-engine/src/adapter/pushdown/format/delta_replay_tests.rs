@@ -1,4 +1,6 @@
-use crate::adapter::pushdown::test_support::{between, col, compare, num_lit, or, str_lit};
+use crate::adapter::pushdown::test_support::{
+    between, by_name, col, compare, num_lit, or, str_lit,
+};
 use crate::scan::test_support::WithFiles;
 use std::sync::Arc;
 
@@ -11,7 +13,6 @@ use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 use super::super::delta_predicate::to_delta_predicate;
 use super::*;
-use crate::adapter::pushdown::test_support::by_name;
 use crate::scan::spec::{DeleteMechanism, DeltaDeletionVectorStorage};
 
 fn local_store() -> Arc<dyn ObjectStore> {

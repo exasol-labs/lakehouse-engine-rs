@@ -1,9 +1,8 @@
 use super::*;
-use crate::adapter::pushdown::test_support::nullable_field;
 use crate::adapter::pushdown::test_support::{
-    and, between, compare, in_list, is_not_null, is_null, like, not, or,
+    and, between, binary_lit, col, compare, date_lit, in_list, is_not_null, is_null, like, not,
+    nullable_field, num_lit, or, predicate_equal, str_lit, timestamp_lit,
 };
-use crate::adapter::pushdown::test_support::{col, lit, num_lit, predicate_equal, str_lit};
 use iceberg::spec::{NestedField, Schema, Type};
 use serde_json::json;
 use std::sync::Arc;
@@ -176,7 +175,7 @@ fn between_desugars_to_range() {
 
 #[test]
 fn leaf_date_translates() {
-    let node = predicate_equal(col("EVENT_DATE"), lit("literal_date", "2024-01-15"));
+    let node = predicate_equal(col("EVENT_DATE"), date_lit("2024-01-15"));
     let pred = translate(&node).unwrap();
     let s = format!("{pred}");
     assert!(s.contains("event_date"), "got: {s}");
@@ -185,7 +184,7 @@ fn leaf_date_translates() {
 #[test]
 fn timestamp_literal_finer_than_microseconds_yields_no_datum() {
     for prim in [PrimitiveType::Timestamp, PrimitiveType::TimestampNs] {
-        let at = |value| lit("literal_timestamp", value);
+        let at = |value| timestamp_lit(value);
         assert_eq!(
             literal_to_datum(&at("2024-01-15 10:30:00.123456789"), &prim),
             None
@@ -213,13 +212,10 @@ fn and_with_untranslatable_child_keeps_translatable_conjunct() {
 
 #[test]
 fn and_all_untranslatable_returns_none() {
-    let node = json!({
-        "type": "predicate_and",
-        "expressions": [
-            {"type": "predicate_like", "expression": col("NAME"), "pattern": str_lit("A%")},
-            {"type": "predicate_like_regexp", "expression": col("NAME"), "pattern": str_lit("^B")}
-        ]
-    });
+    let node = and([
+        like(col("NAME"), "A%"),
+        json!({"type": "predicate_like_regexp", "expression": col("NAME"), "pattern": str_lit("^B")}),
+    ]);
     assert!(translate(&node).is_none());
 }
 
@@ -437,7 +433,7 @@ fn binary_schema() -> Schema {
 }
 
 fn equal_to_bytes(column: &str, hex: &str) -> Json {
-    predicate_equal(col(column), lit("literal_binary", hex))
+    predicate_equal(col(column), binary_lit(hex))
 }
 
 /// Scenario: A hex-literal filter on a binary column prunes files at plan time

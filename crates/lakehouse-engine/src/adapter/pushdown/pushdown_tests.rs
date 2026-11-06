@@ -168,15 +168,15 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
 #[test]
 fn where_filter_decimal_stringification_rewritten_to_trim() {
     let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
-    let filter_json = serde_json::json!({
-        "type": "predicate_greater",
-        "left": {
+    let filter_json = compare(
+        "predicate_greater",
+        serde_json::json!({
             "type": "function_scalar",
             "name": "LENGTH",
             "arguments": [col("c_decimal_a")]
-        },
-        "right": num_lit(5)
-    });
+        }),
+        num_lit(5),
+    );
 
     let rendered = Some(&filter_json)
         .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
@@ -266,15 +266,14 @@ fn where_filter_string_fn_over_double_declines() {
 #[test]
 fn where_filter_upper_decimal_inside_like_subject_coerced() {
     let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
-    let filter_json = serde_json::json!({
-        "type": "predicate_like",
-        "expression": {
+    let filter_json = like(
+        serde_json::json!({
             "type": "function_scalar",
             "name": "UPPER",
             "arguments": [col("c_decimal_a")]
-        },
-        "pattern": str_lit("1%")
-    });
+        }),
+        "1%",
+    );
 
     let rendered = Some(&filter_json)
         .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
@@ -297,11 +296,7 @@ fn where_filter_like_decimal_inside_case_declines_whole_filter() {
             "type": "function_scalar_case",
             "name": "CASE",
             "arguments": [
-                {
-                    "type": "predicate_like",
-                    "expression": col("amount"),
-                    "pattern": str_lit("9%")
-                }
+                like(col("amount"), "9%")
             ],
             "results": [
                 num_lit(1),
@@ -1022,31 +1017,24 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
         .unwrap();
     // `SECOND(ts, 3)` is a DataFusion arity decline Exasol renders; `LENGTH(amount) > 5`
     // is rewritten, so the equality assertion distinguishes original from rewritten.
-    let filter = serde_json::json!({
-        "type": "predicate_and",
-        "expressions": [
-            {
-                "type": "predicate_greater",
-                "left": col("id"),
-                "right": num_lit(5),
-            },
-            {
-                "type": "predicate_greater",
-                "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
-                    col("ts"),
-                    num_lit(3),
-                ]},
-                "right": num_lit(1),
-            },
-            {
-                "type": "predicate_greater",
-                "left": {"type": "function_scalar", "name": "LENGTH", "arguments": [
-                    col("amount"),
-                ]},
-                "right": num_lit(5),
-            },
-        ],
-    });
+    let filter = and([
+        compare("predicate_greater", col("id"), num_lit(5)),
+        compare(
+            "predicate_greater",
+            serde_json::json!({"type": "function_scalar", "name": "SECOND", "arguments": [
+                col("ts"),
+                num_lit(3),
+            ]}),
+            num_lit(1),
+        ),
+        compare(
+            "predicate_greater",
+            serde_json::json!({"type": "function_scalar", "name": "LENGTH", "arguments": [
+                col("amount"),
+            ]}),
+            num_lit(5),
+        ),
+    ]);
     let col_types = vec![
         ("ID".to_string(), ExasolType::decimal(20, 0)),
         ("TS".to_string(), ExasolType::BARE_TIMESTAMP),

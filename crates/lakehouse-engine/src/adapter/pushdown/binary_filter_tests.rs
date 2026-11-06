@@ -1,11 +1,11 @@
 use crate::adapter::pushdown::test_support::{
-    alias_col, and, between, col, column_types_under, compare, declared_column_types, in_list, lit,
-    not, or, predicate_equal, str_lit, string_equal,
+    SALES, alias_col, and, between, binary_lit, column_types_under, compare, declared_column_types,
+    fixed_binary_lit, in_list, not, nullable_field as field, or, predicate_equal, str_lit,
+    string_equal, table_col,
 };
 use vs_expression::render_df_filter_safe;
 
 use super::*;
-use crate::adapter::pushdown::test_support::nullable_field as field;
 use crate::types::exasol_type::ExasolType;
 
 /// The involved columns of a table whose `B` and `U` read as hex text and `S` as text.
@@ -34,11 +34,15 @@ fn rendered(filter: &Json) -> String {
 #[test]
 fn a_lowercase_hex_comparison_compares_the_raw_bytes() {
     assert_eq!(
-        rendered(&predicate_equal(col("B"), str_lit("0a1b"))),
+        rendered(&predicate_equal(table_col(SALES, "B"), str_lit("0a1b"))),
         "(\"_LH_BYTES_B\" = X'0a1b')"
     );
     assert_eq!(
-        rendered(&compare("predicate_less", str_lit("0a1b"), col("U"))),
+        rendered(&compare(
+            "predicate_less",
+            str_lit("0a1b"),
+            table_col(SALES, "U")
+        )),
         "(\"_LH_BYTES_U\" > arrow_cast(X'0a1b', 'FixedSizeBinary(2)'))",
         "a literal on the left mirrors the operator, and a fixed column gets a fixed literal"
     );
@@ -51,23 +55,27 @@ fn an_operator_the_empty_value_satisfies_also_requires_a_non_empty_value() {
         "predicate_less",
         "predicate_lessequal",
     ] {
-        let sql = rendered(&compare(op, col("B"), str_lit("0a")));
+        let sql = rendered(&compare(op, table_col(SALES, "B"), str_lit("0a")));
         assert!(sql.contains("(\"_LH_BYTES_B\" <> X'')"), "{op}: {sql}");
-        let fixed = rendered(&compare(op, col("U"), str_lit("0a0b")));
+        let fixed = rendered(&compare(op, table_col(SALES, "U"), str_lit("0a0b")));
         assert!(
             !fixed.contains("X''"),
             "a fixed value is never empty: {fixed}"
         );
     }
-    let sql = rendered(&compare("predicate_greaterequal", col("B"), str_lit("0a")));
+    let sql = rendered(&compare(
+        "predicate_greaterequal",
+        table_col(SALES, "B"),
+        str_lit("0a"),
+    ));
     assert_eq!(sql, "(\"_LH_BYTES_B\" >= X'0a')");
 }
 
 #[test]
 fn in_and_between_compare_the_raw_bytes_when_every_literal_is_hex() {
-    let in_list = in_list(col("B"), [str_lit("00"), str_lit("ff")]);
+    let in_list = in_list(table_col(SALES, "B"), [str_lit("00"), str_lit("ff")]);
     assert_eq!(rendered(&in_list), "(\"_LH_BYTES_B\" IN (X'00', X'ff'))");
-    let between = between(col("B"), str_lit("00"), str_lit("0f"));
+    let between = between(table_col(SALES, "B"), str_lit("00"), str_lit("0f"));
     assert_eq!(
         rendered(&between),
         "(\"_LH_BYTES_B\" BETWEEN X'00' AND X'0f')"
@@ -77,7 +85,7 @@ fn in_and_between_compare_the_raw_bytes_when_every_literal_is_hex() {
 #[test]
 fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
     for literal in ["0A1B", "0a1", "", "zz"] {
-        let filter = predicate_equal(col("B"), str_lit(literal));
+        let filter = predicate_equal(table_col(SALES, "B"), str_lit(literal));
         assert_eq!(
             compare_binary_bytes(
                 filter.clone(),
@@ -87,7 +95,7 @@ fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
             "{literal}"
         );
     }
-    let wrong_width = predicate_equal(col("U"), str_lit("0a"));
+    let wrong_width = predicate_equal(table_col(SALES, "U"), str_lit("0a"));
     assert_eq!(
         compare_binary_bytes(
             wrong_width.clone(),
@@ -95,7 +103,7 @@ fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
         ),
         wrong_width
     );
-    let string_column = predicate_equal(col("S"), str_lit("0a"));
+    let string_column = predicate_equal(table_col(SALES, "S"), str_lit("0a"));
     assert_eq!(
         compare_binary_bytes(
             string_column.clone(),
@@ -107,7 +115,7 @@ fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
 
 #[test]
 fn only_a_comparison_reached_through_and_or_is_rewritten() {
-    let equal = string_equal("B", "0a");
+    let equal = string_equal(SALES, "B", "0a");
     let negated = not(equal.clone());
     assert_eq!(
         compare_binary_bytes(
@@ -119,7 +127,7 @@ fn only_a_comparison_reached_through_and_or_is_rewritten() {
     );
     let junction = or([
         and([equal, negated]),
-        predicate_equal(col("S"), str_lit("x")),
+        predicate_equal(table_col(SALES, "S"), str_lit("x")),
     ]);
     assert_eq!(
         rendered(&junction),
@@ -131,8 +139,8 @@ fn only_a_comparison_reached_through_and_or_is_rewritten() {
 #[test]
 fn binary_as_string_keeps_a_variable_length_filter_on_the_text() {
     let filter = and([
-        predicate_equal(col("B"), str_lit("00ff")),
-        predicate_equal(col("U"), str_lit("00ff")),
+        predicate_equal(table_col(SALES, "B"), str_lit("00ff")),
+        predicate_equal(table_col(SALES, "U"), str_lit("00ff")),
     ]);
 
     let rewritten = compare_binary_bytes(
@@ -154,10 +162,10 @@ fn binary_as_string_keeps_a_variable_length_filter_on_the_text() {
 #[test]
 fn pruning_retypes_the_hex_literals_of_a_binary_column_at_any_depth() {
     let filter = not(or([
-        string_equal("B", "0a1b"),
-        string_equal("U", "0a0b"),
-        between(col("B"), str_lit("00"), str_lit("ff")),
-        in_list(col("B"), [str_lit("0a"), str_lit("0A")]),
+        string_equal(SALES, "B", "0a1b"),
+        string_equal(SALES, "U", "0a0b"),
+        between(table_col(SALES, "B"), str_lit("00"), str_lit("ff")),
+        in_list(table_col(SALES, "B"), [str_lit("0a"), str_lit("0A")]),
     ]));
     assert_eq!(
         with_binary_literals(
@@ -165,17 +173,10 @@ fn pruning_retypes_the_hex_literals_of_a_binary_column_at_any_depth() {
             &declared_column_types(&HEX_COLUMNS, &binary_fields())
         ),
         not(or([
-            predicate_equal(col("B"), lit("literal_binary", "0a1b")),
-            predicate_equal(
-                col("U"),
-                json!({"type": "literal_binary", "value": "0a0b", "width": 2})
-            ),
-            between(
-                col("B"),
-                lit("literal_binary", "00"),
-                lit("literal_binary", "ff")
-            ),
-            in_list(col("B"), [lit("literal_binary", "0a"), str_lit("0A")]),
+            predicate_equal(table_col(SALES, "B"), binary_lit("0a1b")),
+            predicate_equal(table_col(SALES, "U"), fixed_binary_lit("0a0b", 2)),
+            between(table_col(SALES, "B"), binary_lit("00"), binary_lit("ff")),
+            in_list(table_col(SALES, "B"), [binary_lit("0a"), str_lit("0A")]),
         ])),
         "the column keeps its name, and an uppercase literal stays text"
     );
@@ -184,10 +185,10 @@ fn pruning_retypes_the_hex_literals_of_a_binary_column_at_any_depth() {
 #[test]
 fn pruning_leaves_text_columns_and_mismatched_literals_alone() {
     for (filter, under_binary_as_string) in [
-        (string_equal("S", "0a"), false),
-        (string_equal("U", "0a"), false),
-        (string_equal("B", "0a1"), false),
-        (string_equal("B", "0a"), true),
+        (string_equal(SALES, "S", "0a"), false),
+        (string_equal(SALES, "U", "0a"), false),
+        (string_equal(SALES, "B", "0a1"), false),
+        (string_equal(SALES, "B", "0a"), true),
     ] {
         assert_eq!(
             with_binary_literals(
@@ -199,13 +200,13 @@ fn pruning_leaves_text_columns_and_mismatched_literals_alone() {
     }
     assert_eq!(
         with_binary_literals(
-            string_equal("U", "0a0b"),
+            string_equal(SALES, "U", "0a0b"),
             &column_types_under(&HEX_COLUMNS, &binary_fields(), true)
         ),
         compare(
             "predicate_equal",
-            col("U"),
-            json!({"type": "literal_binary", "value": "0a0b", "width": 2})
+            table_col(SALES, "U"),
+            fixed_binary_lit("0a0b", 2)
         ),
         "BINARY_AS_STRING leaves a fixed column hex"
     );
@@ -214,7 +215,7 @@ fn pruning_leaves_text_columns_and_mismatched_literals_alone() {
 #[test]
 fn a_binary_literal_carries_its_bytes() {
     assert_eq!(
-        literal_binary_bytes(&lit("literal_binary", "00abff")),
+        literal_binary_bytes(&binary_lit("00abff")),
         Some(vec![0x00, 0xab, 0xff])
     );
     assert_eq!(literal_binary_bytes(&str_lit("00abff")), None);
