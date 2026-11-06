@@ -58,11 +58,9 @@ async fn texts(fragment: &str) -> Vec<Option<String>> {
     let batches = df.collect().await.unwrap();
     let mut out = Vec::new();
     for batch in &batches {
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        // `CAST(... AS VARCHAR)` yields Utf8View in DataFusion; the scan's emit coerces either.
+        let utf8 = arrow::compute::cast(batch.column(0), &DataType::Utf8).unwrap();
+        let arr = utf8.as_any().downcast_ref::<StringArray>().unwrap();
         out.extend((0..arr.len()).map(|i| (!arr.is_null(i)).then(|| arr.value(i).to_string())));
     }
     out

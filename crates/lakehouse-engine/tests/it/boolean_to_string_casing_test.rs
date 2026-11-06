@@ -44,11 +44,12 @@ async fn collect_strings(ctx: &SessionContext, sql: &str, col: &str) -> Vec<Opti
     let mut out = Vec::new();
     for batch in &batches {
         let idx = batch.schema().index_of(col).unwrap();
-        let arr = batch
-            .column(idx)
+        // `CAST(... AS VARCHAR)` yields Utf8View in DataFusion; the scan's emit coerces either.
+        let utf8 = arrow::compute::cast(batch.column(idx), &DataType::Utf8).unwrap();
+        let arr = utf8
             .as_any()
             .downcast_ref::<StringArray>()
-            .expect("column must be Utf8");
+            .expect("column must be text");
         for i in 0..arr.len() {
             out.push((!arr.is_null(i)).then(|| arr.value(i).to_string()));
         }
