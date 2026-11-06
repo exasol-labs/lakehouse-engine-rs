@@ -381,11 +381,7 @@ fn projection_carried_in_common_literal_and_emits() {
 
 #[test]
 fn pushdown_translates_or_omits_predicate() {
-    let translatable = serde_json::json!({
-        "type": "predicate_greater",
-        "left": col("age"),
-        "right": num_lit(18)
-    });
+    let translatable = compare("predicate_greater", col("age"), num_lit(18));
     let filter_rendered = render_df_filter_safe(&translatable);
     assert!(
         filter_rendered.is_some(),
@@ -495,23 +491,20 @@ fn render_limit_offset_covers_absent_zero_and_nonzero_offset() {
 
 #[test]
 fn project_columns_fallback_is_duplicate_free() {
-    let (names, types, _widened) = projected(pushdown_request(
-        "EVENTS",
-        &[
-            ("id", ExasolType::decimal(20, 0)),
-            ("name", ExasolType::WIDEST_VARCHAR),
-        ],
-    )
-    .item(
-        serde_json::json!({"type": "function_scalar", "name": "TOTALLY_UNKNOWN_FN", "arguments": [
-            col("id")
-        ]}),
-        ExasolType::decimal(20, 0),
-    )
-    .item(
-        serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false}),
-        ExasolType::decimal(20, 0),
-    ));
+    let (names, types, _widened) = projected(
+        pushdown_request(
+            "EVENTS",
+            &[
+                ("id", ExasolType::decimal(20, 0)),
+                ("name", ExasolType::WIDEST_VARCHAR),
+            ],
+        )
+        .item(
+            scalar_fn("TOTALLY_UNKNOWN_FN", [col("id")]),
+            ExasolType::decimal(20, 0),
+        )
+        .item(count_star(), ExasolType::decimal(20, 0)),
+    );
 
     let unique: std::collections::HashSet<_> = names.iter().map(|p| p.emit_name()).collect();
     assert_eq!(
@@ -1116,12 +1109,7 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
     };
     use super::super::single_group_agg::{has_distinct, is_lone_count_distinct};
 
-    let cdist = |col: &str| {
-        serde_json::json!({
-            "type": "function_aggregate", "name": "COUNT", "distinct": true,
-            "arguments": [table_col("T", col)],
-        })
-    };
+    let cdist = |col: &str| agg_item_expr("COUNT", table_col("T", col), true);
     let all_cols = vec![
         ("CATEGORY".to_string(), ExasolType::varchar(25)),
         ("REGION".to_string(), ExasolType::varchar(25)),
@@ -1526,11 +1514,7 @@ fn projected(request: PushdownRequestBuilder) -> (Vec<ProjectionItem>, Vec<Exaso
 
 #[test]
 fn selectlist_scalar_expression_rendered_in_emits() {
-    let upper_expr = serde_json::json!({
-        "type": "function_scalar",
-        "name": "UPPER",
-        "arguments": [col("NAME")]
-    });
+    let upper_expr = scalar_fn("UPPER", [col("NAME")]);
     let (proj_cols, proj_types, _widened) =
         projected(id_name_request().item(upper_expr, ExasolType::WIDEST_VARCHAR));
     // An `Expr`, not a `Column`, so the scan splices it instead of quoting a phantom identifier.
@@ -1571,12 +1555,7 @@ fn selectlist_cast_node_rendered_in_emits() {
 
 #[test]
 fn selectlist_extract_node_rendered_in_emits() {
-    let extract_expr = serde_json::json!({
-        "type": "function_scalar_extract",
-        "name": "EXTRACT",
-        "toExtract": "YEAR",
-        "arguments": [col("EVENT_DATE")]
-    });
+    let extract_expr = extract("YEAR", col("EVENT_DATE"));
     let (proj_cols, _proj_types, _widened) = projected(
         pushdown_request(
             "T",
@@ -1606,19 +1585,10 @@ fn selectlist_extract_node_rendered_in_emits() {
 
 #[test]
 fn selectlist_case_node_rendered_in_emits() {
-    let case_expr = serde_json::json!({
-        "type": "function_scalar_case",
-        "name": "CASE",
-        "arguments": [
-            {"type": "predicate_less",
-             "left": col("SCORE"),
-             "right": num_lit("50")}
-        ],
-        "results": [
-            str_lit("low"),
-            str_lit("high")
-        ]
-    });
+    let case_expr = case_when(
+        [compare("predicate_less", col("SCORE"), num_lit("50"))],
+        [str_lit("low"), str_lit("high")],
+    );
     let (proj_cols, _proj_types, _widened) = projected(
         pushdown_request(
             "T",
@@ -1742,7 +1712,7 @@ fn selectlist_bare_literal_does_not_fall_back_to_full_row() {
 
 #[test]
 fn selectlist_plain_timestamp_literal_rendered_as_expr() {
-    let literal = lit("literal_timestamp", "2024-03-01 10:00:00");
+    let literal = timestamp_lit("2024-03-01 10:00:00");
     let (proj_cols, proj_types, _widened) = projected(
         pushdown_request("T", &[("ID", ExasolType::decimal(10, 0))])
             .item(literal, ExasolType::BARE_TIMESTAMP),
@@ -1797,11 +1767,7 @@ fn project_columns_emits_char_type_for_cast_to_char_item() {
 
 #[test]
 fn selectlist_untranslatable_item_falls_back_to_column() {
-    let bad_expr = serde_json::json!({
-        "type": "function_aggregate",
-        "name": "SUM",
-        "arguments": [col("AMOUNT")]
-    });
+    let bad_expr = agg_item("SUM", Some("AMOUNT"), false);
     let (proj_cols, proj_types, _widened) = projected(
         pushdown_request("T", &[("AMOUNT", ExasolType::decimal(18, 2))])
             .item(bad_expr, ExasolType::WIDEST_VARCHAR),
@@ -1893,17 +1859,10 @@ fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, ExasolType)]
 
 #[test]
 fn nested_like_decline_routes_to_wrapper_where() {
-    let filter = serde_json::json!({
-        "type": "predicate_and",
-        "expressions": [
-            predicate_equal(table_col("T", "STATUS"), str_lit("OPEN")),
-            {
-                "type": "predicate_like",
-                "expression": table_col("T", "AMOUNT"),
-                "pattern": str_lit("9%"),
-            },
-        ],
-    });
+    let filter = and([
+        string_equal("T", "STATUS", "OPEN"),
+        like(table_col("T", "AMOUNT"), "9%"),
+    ]);
     let col_types = vec![
         ("STATUS".to_string(), ExasolType::WIDEST_VARCHAR),
         ("AMOUNT".to_string(), ExasolType::decimal(9, 2)),
@@ -1924,11 +1883,7 @@ fn nested_like_decline_routes_to_wrapper_where() {
 /// Scenario: LIKE on an integer column declines the whole filter
 #[test]
 fn declined_like_on_integer_column_routes_to_wrapper_where() {
-    let filter = serde_json::json!({
-        "type": "predicate_like",
-        "expression": table_col("T", "QUANTITY"),
-        "pattern": str_lit("1%"),
-    });
+    let filter = like(table_col("T", "QUANTITY"), "1%");
     let col_types = vec![("QUANTITY".to_string(), ExasolType::decimal(20, 0))];
 
     let sql = declined_filter_wrapper_sql(&filter, &col_types);
@@ -1942,11 +1897,7 @@ fn declined_like_on_integer_column_routes_to_wrapper_where() {
 /// Scenario: LIKE on a bare column whose type cannot be resolved declines the whole filter
 #[test]
 fn declined_like_on_unresolvable_column_routes_to_wrapper_where() {
-    let filter = serde_json::json!({
-        "type": "predicate_like",
-        "expression": table_col("T", "MYSTERY"),
-        "pattern": str_lit("A%"),
-    });
+    let filter = like(table_col("T", "MYSTERY"), "A%");
     let col_types = vec![("OTHER".to_string(), ExasolType::WIDEST_VARCHAR)];
 
     let sql = declined_filter_wrapper_sql(&filter, &col_types);
@@ -2052,7 +2003,7 @@ fn decimal_rewrite_col_types() -> Vec<(String, ExasolType)> {
 }
 
 fn decimal_column() -> Json {
-    serde_json::json!({"type": "column", "name": "c_decimal_a"})
+    col("c_decimal_a")
 }
 
 #[test]
@@ -2088,21 +2039,13 @@ fn selectlist_decimal_cast_routed_not_full_row_fallback() {
 
 #[test]
 fn selectlist_nested_concat_decimal_arg_rewritten() {
-    let item = serde_json::json!({
-        "type": "function_scalar",
-        "name": "CONCAT",
-        "arguments": [
+    let item = scalar_fn(
+        "CONCAT",
+        [
             col("id"),
-            {
-                "type": "function_scalar",
-                "name": "CONCAT",
-                "arguments": [
-                    str_lit("-"),
-                    decimal_column()
-                ]
-            }
-        ]
-    });
+            scalar_fn("CONCAT", [str_lit("-"), decimal_column()]),
+        ],
+    );
     let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
         .item(item, ExasolType::WIDEST_VARCHAR)
         .build_pushdown();
@@ -2126,11 +2069,7 @@ fn selectlist_nested_concat_decimal_arg_rewritten() {
 
 #[test]
 fn selectlist_length_decimal_arg_rewritten() {
-    let item = serde_json::json!({
-        "type": "function_scalar",
-        "name": "LENGTH",
-        "arguments": [decimal_column()]
-    });
+    let item = scalar_fn("LENGTH", [decimal_column()]);
     let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
         .item(item, ExasolType::decimal(18, 0))
         .build_pushdown();
@@ -2182,11 +2121,7 @@ fn stringify_nondecimal_column_unchanged() {
 
 #[test]
 fn stringify_computed_decimal_arg_untouched() {
-    let computed = serde_json::json!({
-        "type": "function_scalar",
-        "name": "MULT",
-        "arguments": [decimal_column(), num_lit(2)]
-    });
+    let computed = scalar_fn("MULT", [decimal_column(), num_lit(2)]);
     let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
         .item(
             cast_to(ExasolType::WIDEST_VARCHAR, computed),
@@ -2217,7 +2152,7 @@ fn stringify_computed_decimal_arg_untouched() {
 
 #[test]
 fn selectlist_upper_decimal_arg_coerced_not_full_row() {
-    let item = string_fn("UPPER", vec![decimal_column()]);
+    let item = scalar_fn("UPPER", vec![decimal_column()]);
     let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
         .item(item, ExasolType::WIDEST_VARCHAR)
         .build_pushdown();
@@ -2246,7 +2181,7 @@ fn selectlist_upper_decimal_arg_coerced_not_full_row() {
 
 #[test]
 fn selectlist_lower_date_arg_cast_to_varchar() {
-    let item = string_fn("LOWER", vec![col("d")]);
+    let item = scalar_fn("LOWER", vec![col("d")]);
     let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
         .item(item, ExasolType::WIDEST_VARCHAR)
         .build_pushdown();
@@ -2272,7 +2207,7 @@ fn selectlist_lower_date_arg_cast_to_varchar() {
 #[test]
 fn selectlist_string_fn_over_double_falls_back_to_full_row() {
     let col_types = decimal_rewrite_col_types();
-    let item = string_fn("UPPER", vec![col("c_double_a")]);
+    let item = scalar_fn("UPPER", vec![col("c_double_a")]);
     let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
         .item(item, ExasolType::WIDEST_VARCHAR)
         .build_pushdown();
@@ -2298,7 +2233,7 @@ fn selectlist_string_fn_over_double_falls_back_to_full_row() {
 
 #[test]
 fn selectlist_instr_decimal_arg_coerces_first_position_only() {
-    let item = string_fn("INSTR", vec![decimal_column(), str_lit(".")]);
+    let item = scalar_fn("INSTR", vec![decimal_column(), str_lit(".")]);
     let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
         .item(item, ExasolType::decimal(18, 0))
         .build_pushdown();
@@ -2327,7 +2262,7 @@ fn selectlist_instr_decimal_arg_coerces_first_position_only() {
 #[test]
 fn selectlist_instr_with_start_position_falls_back_to_full_row() {
     let col_types = decimal_rewrite_col_types();
-    let item = string_fn("INSTR", vec![col("name"), str_lit("b"), num_lit(3)]);
+    let item = scalar_fn("INSTR", vec![col("name"), str_lit("b"), num_lit(3)]);
     let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
         .item(item, ExasolType::decimal(18, 0))
         .build_pushdown();
@@ -2355,49 +2290,27 @@ fn selectlist_predicate_node_projects_as_expr() {
     let cases: Vec<(&str, serde_json::Value, &str)> = vec![
         (
             "predicate_in_constlist",
-            serde_json::json!({
-                "type": "predicate_in_constlist",
-                "expression": col("name"),
-                "arguments": [
-                    str_lit("a"),
-                    str_lit("b"),
-                ]
-            }),
+            in_list(col("name"), [str_lit("a"), str_lit("b")]),
             r#"("NAME" IN ('a', 'b'))"#,
         ),
         (
             "predicate_between",
-            serde_json::json!({
-                "type": "predicate_between",
-                "expression": col("id"),
-                "left": num_lit(1),
-                "right": num_lit(10),
-            }),
+            between(col("id"), num_lit(1), num_lit(10)),
             r#"("ID" BETWEEN 1 AND 10)"#,
         ),
         (
             "predicate_is_null",
-            serde_json::json!({
-                "type": "predicate_is_null",
-                "expression": col("name"),
-            }),
+            is_null(col("name")),
             r#"("NAME" IS NULL)"#,
         ),
         (
             "predicate_is_not_null",
-            serde_json::json!({
-                "type": "predicate_is_not_null",
-                "expression": col("name"),
-            }),
+            is_not_null(col("name")),
             r#"("NAME" IS NOT NULL)"#,
         ),
         (
             "predicate_notequal",
-            serde_json::json!({
-                "type": "predicate_notequal",
-                "left": col("id"),
-                "right": num_lit(5),
-            }),
+            compare("predicate_notequal", col("id"), num_lit(5)),
             r#"("ID" <> 5)"#,
         ),
     ];
@@ -2434,12 +2347,7 @@ fn selectlist_predicate_node_projects_as_expr() {
 
 #[test]
 fn selectlist_function_aggregate_still_widens_to_full_row() {
-    let item = serde_json::json!({
-        "type": "function_aggregate",
-        "name": "COUNT",
-        "arguments": [],
-        "distinct": false
-    });
+    let item = count_star();
     let col_types = decimal_rewrite_col_types();
     let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
         .item(item, ExasolType::decimal(20, 0))
@@ -2472,11 +2380,7 @@ fn selectlist_function_aggregate_still_widens_to_full_row() {
 /// Scenario: A select-list LIKE over a DATE column projects the CAST-to-VARCHAR form
 #[test]
 fn selectlist_like_over_date_projects_cast_expr() {
-    let item = serde_json::json!({
-        "type": "predicate_like",
-        "expression": col("d"),
-        "pattern": str_lit("2024%")
-    });
+    let item = like(col("d"), "2024%");
     let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
         .item(item, ExasolType::Boolean)
         .build_pushdown();
@@ -2510,52 +2414,16 @@ fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
     let cases: Vec<(&str, Json)> = vec![
         (
             "c_decimal_a (DECIMAL(10,2))",
-            serde_json::json!({
-                "type": "predicate_like",
-                "expression": col("c_decimal_a"),
-                "pattern": str_lit("1%")
-            }),
+            like(col("c_decimal_a"), "1%"),
         ),
-        (
-            "id (DECIMAL(20,0), integer)",
-            serde_json::json!({
-                "type": "predicate_like",
-                "expression": col("id"),
-                "pattern": str_lit("1%")
-            }),
-        ),
+        ("id (DECIMAL(20,0), integer)", like(col("id"), "1%")),
         (
             "c_double_a (DOUBLE PRECISION)",
-            serde_json::json!({
-                "type": "predicate_like",
-                "expression": col("c_double_a"),
-                "pattern": str_lit("1%")
-            }),
+            like(col("c_double_a"), "1%"),
         ),
-        (
-            "c_bool_a (BOOLEAN)",
-            serde_json::json!({
-                "type": "predicate_like",
-                "expression": col("c_bool_a"),
-                "pattern": str_lit("1%")
-            }),
-        ),
-        (
-            "c_ts_a (TIMESTAMP)",
-            serde_json::json!({
-                "type": "predicate_like",
-                "expression": col("c_ts_a"),
-                "pattern": str_lit("1%")
-            }),
-        ),
-        (
-            "unresolvable column name",
-            serde_json::json!({
-                "type": "predicate_like",
-                "expression": col("not_a_column"),
-                "pattern": str_lit("1%")
-            }),
-        ),
+        ("c_bool_a (BOOLEAN)", like(col("c_bool_a"), "1%")),
+        ("c_ts_a (TIMESTAMP)", like(col("c_ts_a"), "1%")),
+        ("unresolvable column name", like(col("not_a_column"), "1%")),
     ];
 
     for (label, item) in cases {
@@ -2590,21 +2458,10 @@ fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
 #[test]
 fn selectlist_like_inside_case_over_decimal_falls_back_to_full_row() {
     let col_types = decimal_rewrite_col_types();
-    let case_expr = serde_json::json!({
-        "type": "function_scalar_case",
-        "name": "CASE",
-        "arguments": [
-            {
-                "type": "predicate_like",
-                "expression": col("c_decimal_a"),
-                "pattern": str_lit("1%")
-            }
-        ],
-        "results": [
-            str_lit("yes"),
-            str_lit("no")
-        ]
-    });
+    let case_expr = case_when(
+        [like(col("c_decimal_a"), "1%")],
+        [str_lit("yes"), str_lit("no")],
+    );
     let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
         .item(case_expr, ExasolType::WIDEST_VARCHAR)
         .build_pushdown();
@@ -2630,14 +2487,6 @@ fn selectlist_like_inside_case_over_decimal_falls_back_to_full_row() {
     );
     let expected_types: Vec<ExasolType> = col_types.iter().map(|(_, t)| *t).collect();
     assert_eq!(types, expected_types);
-}
-
-fn string_fn(name: &str, args: Vec<Json>) -> Json {
-    serde_json::json!({
-        "type": "function_scalar",
-        "name": name,
-        "arguments": args,
-    })
 }
 
 #[test]
@@ -2682,14 +2531,10 @@ fn assert_widens_to_full_base_row(select_item: Json, declared_type: ExasolType, 
 
 #[test]
 fn project_columns_widens_on_aggregate_nested_in_scalar_item() {
-    let select_item = serde_json::json!({
-        "type": "function_scalar",
-        "name": "ROUND",
-        "arguments": [
-            agg_item("SUM", Some("c_decimal_a"), false),
-            num_lit(2)
-        ]
-    });
+    let select_item = scalar_fn(
+        "ROUND",
+        [agg_item("SUM", Some("c_decimal_a"), false), num_lit(2)],
+    );
     let declared_type = ExasolType::decimal(18, 2);
     assert_widens_to_full_base_row(
         select_item,
@@ -2722,19 +2567,10 @@ fn project_columns_widens_on_aggregate_nested_in_function_scalar_cast_item() {
 
 #[test]
 fn project_columns_widens_on_aggregate_nested_in_function_scalar_case_item() {
-    let select_item = serde_json::json!({
-        "type": "function_scalar_case",
-        "name": "CASE",
-        "arguments": [ {
-            "type": "predicate_less",
-            "left": col("ID"),
-            "right": num_lit(10)
-        } ],
-        "results": [
-            agg_item("COUNT", None, false),
-            num_lit(0)
-        ]
-    });
+    let select_item = case_when(
+        [compare("predicate_less", col("ID"), num_lit(10))],
+        [count_star(), num_lit(0)],
+    );
     let declared_type = ExasolType::decimal(20, 0);
     assert_widens_to_full_base_row(
         select_item,
@@ -2745,14 +2581,10 @@ fn project_columns_widens_on_aggregate_nested_in_function_scalar_case_item() {
 
 #[test]
 fn project_columns_widens_on_aggregate_nested_in_arithmetic_node() {
-    let select_item = serde_json::json!({
-        "type": "function_scalar",
-        "name": "ADD",
-        "arguments": [
-            agg_item("SUM", Some("c_decimal_a"), false),
-            num_lit(1)
-        ]
-    });
+    let select_item = scalar_fn(
+        "ADD",
+        [agg_item("SUM", Some("c_decimal_a"), false), num_lit(1)],
+    );
     let declared_type = ExasolType::decimal(18, 2);
     assert_widens_to_full_base_row(
         select_item,
@@ -2763,11 +2595,11 @@ fn project_columns_widens_on_aggregate_nested_in_arithmetic_node() {
 
 #[test]
 fn project_columns_widens_on_aggregate_nested_in_predicate_node() {
-    let select_item = serde_json::json!({
-        "type": "predicate_less",
-        "left": agg_item("SUM", Some("id"), false),
-        "right": num_lit(10)
-    });
+    let select_item = compare(
+        "predicate_less",
+        agg_item("SUM", Some("id"), false),
+        num_lit(10),
+    );
     let declared_type = ExasolType::Boolean;
     assert_widens_to_full_base_row(
         select_item,
@@ -2781,14 +2613,7 @@ fn project_columns_does_not_widen_when_select_item_has_no_nested_aggregate() {
     let col_types = decimal_rewrite_col_types();
     let pushdown_req = pushdown_request("T", &col_types)
         .item(
-            serde_json::json!({
-                "type": "function_scalar",
-                "name": "ROUND",
-                "arguments": [
-                    col("C_DECIMAL_A"),
-                    num_lit(2)
-                ]
-            }),
+            scalar_fn("ROUND", [col("C_DECIMAL_A"), num_lit(2)]),
             ExasolType::decimal(18, 2),
         )
         .build_pushdown();
@@ -2938,8 +2763,8 @@ fn qualified_universe_projects_each_column_with_its_relation_and_type() {
         .table("LHS_T1", &[("X", ExasolType::varchar(10))]);
     let pushdown_req = relations
         .clone()
-        .column(serde_json::json!({"type": "column", "name": "X", "tableAlias": "LHS_T1"}))
-        .column(serde_json::json!({"type": "column", "name": "X", "tableAlias": "LHS_T0"}))
+        .column(alias_col("LHS_T1", "X"))
+        .column(alias_col("LHS_T0", "X"))
         .build_pushdown();
     let (items, types, widened) = project_split(&pushdown_req, &universe).expect("projects");
     assert!(!widened);
@@ -3121,26 +2946,14 @@ fn involved_column_with_an_unparsable_type_fails() {
     }
 }
 
-fn ts_literal(value: &str) -> Json {
-    serde_json::json!({"type": "literal_timestamp", "value": value})
-}
-
-fn ts_column() -> Json {
-    serde_json::json!({"type": "column", "name": "ts"})
-}
-
-fn timestamp_comparison(op: &str, left: Json, right: Json) -> Json {
-    serde_json::json!({"type": op, "left": left, "right": right})
-}
-
 #[test]
 fn overprecise_timestamp_literal_is_rewritten_to_the_column_precision() {
     let col_types = vec![("TS".to_string(), ExasolType::timestamp(3))];
-    let lit = ts_literal("2025-06-01 00:00:00.123500");
-    let floor = ts_literal("2025-06-01 00:00:00.123");
+    let lit = timestamp_lit("2025-06-01 00:00:00.123500");
+    let floor = timestamp_lit("2025-06-01 00:00:00.123");
     for (op, mirrored, want_op, want_right) in [
-        ("predicate_equal", false, "predicate_notequal", ts_column()),
-        ("predicate_notequal", false, "predicate_equal", ts_column()),
+        ("predicate_equal", false, "predicate_notequal", col("ts")),
+        ("predicate_notequal", false, "predicate_equal", col("ts")),
         (
             "predicate_less",
             false,
@@ -3174,13 +2987,13 @@ fn overprecise_timestamp_literal_is_rewritten_to_the_column_precision() {
         ),
     ] {
         let filter = if mirrored {
-            timestamp_comparison(op, lit.clone(), ts_column())
+            compare(op, lit.clone(), col("ts"))
         } else {
-            timestamp_comparison(op, ts_column(), lit.clone())
+            compare(op, col("ts"), lit.clone())
         };
         assert_eq!(
             rewrite_overprecise_timestamp_comparisons(&filter, &column_types(&col_types)),
-            timestamp_comparison(want_op, ts_column(), want_right),
+            compare(want_op, col("ts"), want_right),
             "{op} mirrored={mirrored}"
         );
     }
@@ -3195,7 +3008,7 @@ fn timestamp_literal_within_the_column_precision_is_unchanged() {
         (ExasolType::timestamp(3), "2025-06-01 00:00:00"),
     ] {
         let col_types = vec![("TS".to_string(), declared)];
-        let filter = timestamp_comparison("predicate_equal", ts_column(), ts_literal(value));
+        let filter = predicate_equal(col("ts"), timestamp_lit(value));
         assert_eq!(
             rewrite_overprecise_timestamp_comparisons(&filter, &column_types(&col_types)),
             filter.clone(),
@@ -3207,35 +3020,29 @@ fn timestamp_literal_within_the_column_precision_is_unchanged() {
 #[test]
 fn between_and_in_with_an_overprecise_timestamp_expand_to_rewritten_comparisons() {
     let col_types = vec![("TS".to_string(), ExasolType::timestamp(3))];
-    let fits = || ts_literal("2025-06-01 00:00:00.122");
-    let over = || ts_literal("2025-06-01 00:00:00.123500");
-    let floor = || ts_literal("2025-06-01 00:00:00.123");
+    let fits = || timestamp_lit("2025-06-01 00:00:00.122");
+    let over = || timestamp_lit("2025-06-01 00:00:00.123500");
+    let floor = || timestamp_lit("2025-06-01 00:00:00.123");
 
-    let between = serde_json::json!({
-        "type": "predicate_between", "expression": ts_column(), "left": fits(), "right": over()
-    });
+    let bounded = between(col("ts"), fits(), over());
     assert_eq!(
-        rewrite_overprecise_timestamp_comparisons(&between, &column_types(&col_types)),
-        serde_json::json!({"type": "predicate_and", "expressions": [
-            timestamp_comparison("predicate_greaterequal", ts_column(), fits()),
-            timestamp_comparison("predicate_lessequal", ts_column(), floor()),
-        ]})
+        rewrite_overprecise_timestamp_comparisons(&bounded, &column_types(&col_types)),
+        and([
+            compare("predicate_greaterequal", col("ts"), fits()),
+            compare("predicate_lessequal", col("ts"), floor())
+        ])
     );
 
-    let in_list = serde_json::json!({
-        "type": "predicate_in_constlist", "expression": ts_column(), "arguments": [over(), fits()]
-    });
+    let listed = in_list(col("ts"), [over(), fits()]);
     assert_eq!(
-        rewrite_overprecise_timestamp_comparisons(&in_list, &column_types(&col_types)),
-        serde_json::json!({"type": "predicate_or", "expressions": [
-            timestamp_comparison("predicate_notequal", ts_column(), ts_column()),
-            timestamp_comparison("predicate_equal", ts_column(), fits()),
-        ]})
+        rewrite_overprecise_timestamp_comparisons(&listed, &column_types(&col_types)),
+        or([
+            compare("predicate_notequal", col("ts"), col("ts")),
+            predicate_equal(col("ts"), fits())
+        ])
     );
 
-    let fitting_in = serde_json::json!({
-        "type": "predicate_in_constlist", "expression": ts_column(), "arguments": [fits()]
-    });
+    let fitting_in = in_list(col("ts"), [fits()]);
     assert_eq!(
         rewrite_overprecise_timestamp_comparisons(&fitting_in, &column_types(&col_types)),
         fitting_in.clone()

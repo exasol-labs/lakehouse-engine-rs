@@ -1,6 +1,6 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    aliased_col, col, num_lit, predicate_equal, table_col,
+    aliased_col, col, not, num_lit, predicate_equal, scalar_fn, table_col,
 };
 
 impl super::JoinLegs {
@@ -15,10 +15,6 @@ fn leaf(table_name: &str, table_alias: Option<&str>) -> JoinLeaf {
         table_alias: table_alias.map(str::to_string),
         table_identifier: format!("lh.{}", table_name.to_ascii_lowercase()),
     }
-}
-
-fn equal(left: Json, right: Json) -> Json {
-    predicate_equal(left, right)
 }
 
 /// `FROM FACT_ORDERS a JOIN FACT_ORDERS b` (#361's shape).
@@ -109,7 +105,7 @@ fn unattributable_column_is_reported_rather_than_resolved() {
 #[test]
 fn qualify_tags_each_self_join_occurrence_with_its_own_leg_alias() {
     let legs = self_join_legs();
-    let condition = equal(
+    let condition = predicate_equal(
         aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"),
         aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"),
     );
@@ -140,11 +136,7 @@ fn qualify_overwrites_the_request_alias_and_leaves_the_input_untouched() {
 #[test]
 fn qualify_reaches_columns_nested_in_arrays_and_function_nodes() {
     let legs = self_join_legs();
-    let expr = serde_json::json!({
-        "type": "function_scalar",
-        "name": "UPPER",
-        "arguments": [aliased_col("FACT_ORDERS", "B", "O_COMMENT")],
-    });
+    let expr = scalar_fn("UPPER", [aliased_col("FACT_ORDERS", "B", "O_COMMENT")]);
 
     let qualified = legs.qualify(&expr).expect("the nested occurrence resolves");
 
@@ -157,10 +149,7 @@ fn qualify_reaches_columns_nested_in_arrays_and_function_nodes() {
 #[test]
 fn qualify_fails_on_an_unattributable_column_naming_it() {
     let legs = self_join_legs();
-    let expr = serde_json::json!({
-        "type": "predicate_not",
-        "expression": table_col("FACT_ORDERS", "O_ORDERKEY"),
-    });
+    let expr = not(table_col("FACT_ORDERS", "O_ORDERKEY"));
 
     let err = legs.qualify(&expr).expect_err("no leg key matches");
 
@@ -172,7 +161,7 @@ fn qualify_fails_on_an_unattributable_column_naming_it() {
 #[test]
 fn legs_referenced_reports_every_leg_a_tree_touches() {
     let legs = self_join_legs();
-    let condition = equal(
+    let condition = predicate_equal(
         aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"),
         aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"),
     );
@@ -187,7 +176,7 @@ fn legs_referenced_reports_every_leg_a_tree_touches() {
 #[test]
 fn legs_referenced_flags_an_unattributed_column() {
     let legs = self_join_legs();
-    let conjunct = equal(table_col("FACT_ORDERS", "O_ORDERKEY"), num_lit("7"));
+    let conjunct = predicate_equal(table_col("FACT_ORDERS", "O_ORDERKEY"), num_lit("7"));
 
     let referenced = legs.legs_referenced(&conjunct);
 
@@ -200,7 +189,7 @@ fn legs_referenced_flags_an_unattributed_column() {
 fn legs_referenced_flags_a_column_free_expression() {
     let legs = self_join_legs();
 
-    let referenced = legs.legs_referenced(&equal(num_lit("1"), num_lit("1")));
+    let referenced = legs.legs_referenced(&predicate_equal(num_lit("1"), num_lit("1")));
 
     assert!(!referenced.any_column);
     assert!(!referenced.has_unattributed);
@@ -214,7 +203,7 @@ fn attachment_leg_is_the_highest_leg_a_cross_leg_condition_references() {
         leaf("FACT_ORDERS", Some("B")),
         leaf("FACT_ORDERS", Some("C")),
     ]);
-    let condition = equal(
+    let condition = predicate_equal(
         aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"),
         aliased_col("FACT_ORDERS", "C", "O_ORDERKEY"),
     );
@@ -225,7 +214,7 @@ fn attachment_leg_is_the_highest_leg_a_cross_leg_condition_references() {
 #[test]
 fn attachment_leg_is_the_only_leg_a_single_leg_condition_references() {
     let legs = self_join_legs();
-    let condition = equal(aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"), num_lit("7"));
+    let condition = predicate_equal(aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"), num_lit("7"));
 
     assert_eq!(legs.attachment_leg(&condition), Some(1));
 }
@@ -235,7 +224,7 @@ fn attachment_leg_is_none_for_a_column_free_condition() {
     let legs = self_join_legs();
 
     assert_eq!(
-        legs.attachment_leg(&equal(num_lit("1"), num_lit("1"))),
+        legs.attachment_leg(&predicate_equal(num_lit("1"), num_lit("1"))),
         None
     );
 }
@@ -243,7 +232,7 @@ fn attachment_leg_is_none_for_a_column_free_condition() {
 #[test]
 fn attachment_leg_is_none_when_any_column_is_unattributed() {
     let legs = self_join_legs();
-    let condition = equal(
+    let condition = predicate_equal(
         aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"),
         aliased_col("FACT_ORDERS", "Z", "O_ORDERKEY"),
     );
@@ -254,7 +243,7 @@ fn attachment_leg_is_none_when_any_column_is_unattributed() {
 #[test]
 fn conjunct_leg_is_the_single_leg_every_column_resolves_to() {
     let legs = self_join_legs();
-    let conjunct = equal(aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"), num_lit("7"));
+    let conjunct = predicate_equal(aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"), num_lit("7"));
 
     assert_eq!(legs.conjunct_leg(&conjunct), Some(1));
 }
@@ -262,17 +251,20 @@ fn conjunct_leg_is_the_single_leg_every_column_resolves_to() {
 #[test]
 fn conjunct_leg_is_none_for_a_cross_leg_unattributed_or_column_free_conjunct() {
     let legs = self_join_legs();
-    let cross_leg = equal(
+    let cross_leg = predicate_equal(
         aliased_col("FACT_ORDERS", "A", "O_ORDERKEY"),
         aliased_col("FACT_ORDERS", "B", "O_ORDERKEY"),
     );
-    let unattributed = equal(table_col("FACT_ORDERS", "O_ORDERKEY"), num_lit("7"));
-    let foreign = equal(aliased_col("DIM_CUSTOMER", "C", "C_CUSTKEY"), num_lit("7"));
+    let unattributed = predicate_equal(table_col("FACT_ORDERS", "O_ORDERKEY"), num_lit("7"));
+    let foreign = predicate_equal(aliased_col("DIM_CUSTOMER", "C", "C_CUSTKEY"), num_lit("7"));
 
     assert_eq!(legs.conjunct_leg(&cross_leg), None);
     assert_eq!(legs.conjunct_leg(&unattributed), None);
     assert_eq!(legs.conjunct_leg(&foreign), None);
-    assert_eq!(legs.conjunct_leg(&equal(num_lit("1"), num_lit("1"))), None);
+    assert_eq!(
+        legs.conjunct_leg(&predicate_equal(num_lit("1"), num_lit("1"))),
+        None
+    );
 }
 
 #[test]

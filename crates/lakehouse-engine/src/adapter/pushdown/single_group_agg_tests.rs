@@ -25,46 +25,19 @@ fn distinct_of(item: &SingleGroupItem) -> &DistinctCount {
 }
 
 fn length_expr(column: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function_scalar",
-        "name": "LENGTH",
-        "arguments": [col(column)],
-    })
+    scalar_fn("LENGTH", [col(column)])
 }
 
 /// Exasol's `MULT` node, pushed once `FN_MULT` is advertised (decision-log [7]).
 fn mult_expr(a: &str, b: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function_scalar",
-        "name": "MULT",
-        "arguments": [
-            col(a),
-            col(b),
-        ],
-    })
-}
-
-fn round_expr(inner: serde_json::Value, digits: i64) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function_scalar",
-        "name": "ROUND",
-        "arguments": [inner, num_lit(digits)],
-    })
-}
-
-fn float_div(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function_scalar",
-        "name": "FLOAT_DIV",
-        "arguments": [a, b],
-    })
+    scalar_fn("MULT", [col(a), col(b)])
 }
 
 #[test]
 fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecomposable() {
     let req = pushdown_request("T", NO_COLUMNS)
         .item(
-            round_expr(agg_item("SUM", Some("L_QUANTITY"), false), 2),
+            round_of(agg_item("SUM", Some("L_QUANTITY"), false), 2),
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
@@ -78,7 +51,7 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
 
     let variance_req = pushdown_request("T", NO_COLUMNS)
         .item(
-            round_expr(agg_item("VARIANCE", Some("C_ACCTBAL"), false), 4),
+            round_of(agg_item("VARIANCE", Some("C_ACCTBAL"), false), 4),
             ExasolType::decimal(36, 4),
         )
         .build_pushdown();
@@ -93,11 +66,8 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
             ExasolType::decimal(36, 2),
         )
         .item(
-            round_expr(
-                float_div(
-                    agg_item("SUM", Some("L_QUANTITY"), false),
-                    agg_item("COUNT", None, false),
-                ),
+            round_of(
+                float_div(agg_item("SUM", Some("L_QUANTITY"), false), count_star()),
                 2,
             ),
             ExasolType::decimal(36, 4),
@@ -112,7 +82,7 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
 
     let distinct_req = pushdown_request("T", NO_COLUMNS)
         .item(
-            round_expr(agg_item("COUNT", Some("L_ORDERKEY"), true), 2),
+            round_of(agg_item("COUNT", Some("L_ORDERKEY"), true), 2),
             ExasolType::decimal(18, 0),
         )
         .build_pushdown();
@@ -123,7 +93,7 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
 
     let median_req = pushdown_request("T", NO_COLUMNS)
         .item(
-            round_expr(agg_item("MEDIAN", Some("L_QUANTITY"), false), 2),
+            round_of(agg_item("MEDIAN", Some("L_QUANTITY"), false), 2),
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
@@ -134,14 +104,13 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
 
     let residual_req = pushdown_request("T", NO_COLUMNS)
         .item(
-            serde_json::json!({
-                "type": "function_scalar",
-                "name": "MULT",
-                "arguments": [
+            scalar_fn(
+                "MULT",
+                [
                     agg_item("SUM", Some("L_QUANTITY"), false),
                     col("L_QUANTITY"),
                 ],
-            }),
+            ),
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
@@ -167,11 +136,8 @@ fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types(
             ExasolType::decimal(36, 2),
         )
         .item(
-            round_expr(
-                float_div(
-                    agg_item("SUM", Some("L_QUANTITY"), false),
-                    agg_item("COUNT", None, false),
-                ),
+            round_of(
+                float_div(agg_item("SUM", Some("L_QUANTITY"), false), count_star()),
                 2,
             ),
             ExasolType::decimal(9, 4),
@@ -204,11 +170,8 @@ fn single_group_scalar_over_aggregate_dedups_shared_inner_aggregates() {
     let req = pushdown_request("T", NO_COLUMNS)
         .count_star()
         .item(
-            round_expr(
-                float_div(
-                    agg_item("SUM", Some("L_QUANTITY"), false),
-                    agg_item("COUNT", None, false),
-                ),
+            round_of(
+                float_div(agg_item("SUM", Some("L_QUANTITY"), false), count_star()),
                 2,
             ),
             ExasolType::decimal(36, 2),
@@ -239,11 +202,8 @@ fn single_group_scalar_over_aggregate_dedups_shared_inner_aggregates() {
 fn single_group_scalar_over_aggregate_folds_nested_plans_in_encounter_order() {
     let req = pushdown_request("T", NO_COLUMNS)
         .item(
-            round_expr(
-                float_div(
-                    agg_item("SUM", Some("L_QUANTITY"), false),
-                    agg_item("COUNT", None, false),
-                ),
+            round_of(
+                float_div(agg_item("SUM", Some("L_QUANTITY"), false), count_star()),
                 2,
             ),
             ExasolType::decimal(36, 2),
@@ -582,11 +542,7 @@ fn decimal_product_sum_partial_widens_to_decimal_36() {
 
 #[test]
 fn unrenderable_agg_arg_falls_back_to_row_scan() {
-    let unknown = serde_json::json!({
-        "type": "function_scalar",
-        "name": "TOTALLY_UNKNOWN_FN",
-        "arguments": [col("id")],
-    });
+    let unknown = scalar_fn("TOTALLY_UNKNOWN_FN", [col("id")]);
     for name in &["SUM", "MIN", "MAX", "AVG", "COUNT"] {
         let req = pushdown_request("T", NO_COLUMNS)
             .item(
@@ -861,11 +817,8 @@ fn single_group_plan_types_types_a_slot_reached_only_through_scalar_wrapper() {
     let col_types = column_types(&[("L_QUANTITY", ExasolType::decimal(15, 2))]);
     let req = pushdown_request("T", NO_COLUMNS)
         .item(
-            round_expr(
-                float_div(
-                    agg_item("SUM", Some("L_QUANTITY"), false),
-                    agg_item("COUNT", None, false),
-                ),
+            round_of(
+                float_div(agg_item("SUM", Some("L_QUANTITY"), false), count_star()),
                 2,
             ),
             ExasolType::decimal(36, 2),
@@ -885,11 +838,8 @@ fn single_group_plan_types_prefers_top_level_declared_type_for_shared_slot() {
     let col_types = column_types(&[("L_QUANTITY", ExasolType::decimal(15, 2))]);
     let req = pushdown_request("T", NO_COLUMNS)
         .item(
-            round_expr(
-                float_div(
-                    agg_item("SUM", Some("L_QUANTITY"), false),
-                    agg_item("COUNT", None, false),
-                ),
+            round_of(
+                float_div(agg_item("SUM", Some("L_QUANTITY"), false), count_star()),
                 2,
             ),
             ExasolType::decimal(9, 4),
@@ -916,11 +866,8 @@ fn single_group_plan_types_resolves_both_ends_of_an_interleaved_list() {
             ExasolType::decimal(36, 2),
         )
         .item(
-            round_expr(
-                float_div(
-                    agg_item("SUM", Some("L_QUANTITY"), false),
-                    agg_item("COUNT", None, false),
-                ),
+            round_of(
+                float_div(agg_item("SUM", Some("L_QUANTITY"), false), count_star()),
                 2,
             ),
             ExasolType::decimal(9, 4),
@@ -962,14 +909,7 @@ fn single_group_plan_types_skips_distinct_items() {
 fn single_group_plan_types_declines_a_nested_only_aggregate_over_an_untyped_expression() {
     let req = pushdown_request("T", NO_COLUMNS)
         .item(
-            round_expr(
-                serde_json::json!({
-                    "type": "function_aggregate",
-                    "name": "MIN",
-                    "arguments": [mult_expr("A", "B")],
-                }),
-                2,
-            ),
+            round_of(agg_item_expr("MIN", mult_expr("A", "B"), false), 2),
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
@@ -987,7 +927,7 @@ fn merge_select_wraps_scalar_structure_around_the_merged_partial() {
     let col_types = column_types(&[("L_QUANTITY", ExasolType::decimal(15, 2))]);
     let req = pushdown_request("T", NO_COLUMNS)
         .item(
-            round_expr(agg_item("SUM", Some("L_QUANTITY"), false), 2),
+            round_of(agg_item("SUM", Some("L_QUANTITY"), false), 2),
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
@@ -1014,11 +954,8 @@ fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
             ExasolType::decimal(36, 2),
         )
         .item(
-            round_expr(
-                float_div(
-                    agg_item("SUM", Some("L_QUANTITY"), false),
-                    agg_item("COUNT", None, false),
-                ),
+            round_of(
+                float_div(agg_item("SUM", Some("L_QUANTITY"), false), count_star()),
                 2,
             ),
             ExasolType::decimal(9, 4),
@@ -1071,7 +1008,7 @@ fn merge_select_declines_a_list_holding_a_distinct_item() {
 fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
     let node = serde_json::json!({
         "type": "function_scalar_cast", "name": "CAST",
-        "arguments": [agg_item("COUNT", None, false)]
+        "arguments": [count_star()]
     });
     let items = vec![SingleGroupItem::ScalarOverAggregate {
         node,

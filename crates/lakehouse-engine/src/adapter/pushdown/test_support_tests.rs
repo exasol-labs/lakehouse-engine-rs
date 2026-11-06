@@ -37,7 +37,69 @@ use lakehouse_catalog::{
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use vs_expression::ColumnNode;
+// Named, not globbed: a local helper of the same name would silently shadow a glob import.
+pub(crate) use vs_expression::test_support::{
+    agg_item, agg_item_expr, alias_col, aliased_col, and, between, binary_lit, bool_lit, case_when,
+    cast_json, col, compare, count_star, date_lit, extract, fixed_binary_lit, in_list, is_not_null,
+    is_null, like, lit, not, null_lit, num_lit, numbered_col, or, predicate_equal, scalar_fn,
+    str_lit, string_equal, table_col, table_column, timestamp_lit,
+};
+
+/// The table a single-table filter fixture qualifies its columns with, as Exasol does.
+pub(crate) const SALES: &str = "SALES";
+
+/// A column node of [`SALES`].
+pub(crate) fn sales_col(name: &str) -> Json {
+    table_col(SALES, name)
+}
+
+/// `SALES.name = 'value'`, the single-table string filter most pushdown tests send.
+pub(crate) fn sales_equal(name: &str, value: &str) -> Json {
+    string_equal(SALES, name, value)
+}
+
+/// `SECOND(argument, 3) > 1`: DataFusion declines it on arity while Exasol renders it.
+pub(crate) fn declined_second_predicate(argument: Json) -> Json {
+    compare(
+        "predicate_greater",
+        scalar_fn("SECOND", [argument, num_lit(3)]),
+        num_lit(1),
+    )
+}
+
+/// `ROUND(inner, digits)`.
+pub(crate) fn round_of(inner: Json, digits: i64) -> Json {
+    scalar_fn("ROUND", [inner, num_lit(digits)])
+}
+
+/// `dividend / divisor`, which Exasol sends as `FLOAT_DIV`.
+pub(crate) fn float_div(dividend: Json, divisor: Json) -> Json {
+    scalar_fn("FLOAT_DIV", [dividend, divisor])
+}
+
+/// An `ORDER BY` element; Exasol always sends both `isAscending` and `nullsLast`.
+pub(crate) fn order_by_element(expression: Json, ascending: bool, nulls_last: bool) -> Json {
+    serde_json::json!({
+        "type": "order_by_element",
+        "expression": expression,
+        "isAscending": ascending,
+        "nullsLast": nulls_last,
+    })
+}
+
+/// An involved-table column entry, typed as Exasol declares it.
+pub(crate) fn involved_column_json(name: &str, exa_type: ExasolType) -> Json {
+    serde_json::json!({"name": name, "dataType": exasol_type_to_json(&exa_type)})
+}
+
+/// An `involvedTables` entry with its typed `columns`.
+pub(crate) fn involved_table_json<N: AsRef<str>>(name: &str, columns: &[(N, ExasolType)]) -> Json {
+    let columns: Vec<Json> = columns
+        .iter()
+        .map(|(column, exa_type)| involved_column_json(column.as_ref(), *exa_type))
+        .collect();
+    serde_json::json!({"name": name, "columns": columns})
+}
 
 type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
@@ -273,18 +335,6 @@ pub(crate) fn glue_column(name: &str, hive_type: &str) -> CatalogColumn {
     )
 }
 
-pub(crate) fn col(name: &str) -> Json {
-    ColumnNode::to_json(name, None, None)
-}
-
-pub(crate) fn table_col(table: &str, name: &str) -> Json {
-    table_column(table, None, name)
-}
-
-pub(crate) fn aliased_col(table: &str, alias: &str, name: &str) -> Json {
-    table_column(table, Some(alias), name)
-}
-
 /// The per-column type map the planner builds for one table that declares no binary column.
 pub(crate) fn column_types<N: AsRef<str>>(columns: &[(N, ExasolType)]) -> ColumnTypes {
     declared_column_types(columns, &[])
@@ -373,10 +423,6 @@ pub(crate) fn request_sides(
     request_typed(request, &sides)
 }
 
-pub(crate) fn table_column(table: &str, alias: Option<&str>, name: &str) -> Json {
-    ColumnNode::to_json(name, Some(table), alias)
-}
-
 pub(crate) fn table_ref(name: &str) -> Json {
     serde_json::json!({"name": name, "type": "table"})
 }
@@ -387,42 +433,9 @@ pub(crate) fn inner_join(left: Json, right: Json, condition: Json) -> Json {
     })
 }
 
-pub(crate) fn compare(kind: &str, left: Json, right: Json) -> Json {
-    serde_json::json!({"type": kind, "left": left, "right": right})
-}
-
-pub(crate) fn predicate_equal(left: Json, right: Json) -> Json {
-    compare("predicate_equal", left, right)
-}
-
-pub(crate) fn lit(kind: &str, value: impl Into<Json>) -> Json {
-    serde_json::json!({"type": kind, "value": value.into()})
-}
-
-pub(crate) fn num_lit(value: impl Into<Json>) -> Json {
-    lit("literal_exactnumeric", value)
-}
-
-pub(crate) fn str_lit(value: &str) -> Json {
-    lit("literal_string", value)
-}
-
-pub(crate) fn bool_lit(value: bool) -> Json {
-    lit("literal_bool", value)
-}
-
-pub(crate) fn null_lit() -> Json {
-    serde_json::json!({"type": "literal_null"})
-}
-
 /// Exasol's `CAST(arg AS target)` node.
 pub(crate) fn cast_to(target: ExasolType, arg: Json) -> Json {
-    serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": exasol_type_to_json(&target),
-        "arguments": [arg],
-    })
+    cast_json(exasol_type_to_json(&target), arg)
 }
 
 pub(crate) fn customer_orders_join() -> Json {
@@ -1389,12 +1402,11 @@ pub(crate) fn nq4_request() -> Json {
     .field("type", "select")
     .column(table_col("LINEITEM", "L_ORDERKEY"))
     .column(table_col("LINEITEM", "L_EXTENDEDPRICE"))
-    .order_by(serde_json::json!([{
-        "type": "order_by_element",
-        "expression": {"type": "column", "columnNr": 1, "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
-        "isAscending": false,
-        "nullsLast": true
-    }]))
+    .order_by(serde_json::json!([order_by_element(
+        numbered_col("LINEITEM", 1, "L_EXTENDEDPRICE"),
+        false,
+        true
+    )]))
     .limit(20)
     .build()
     .0
@@ -1476,7 +1488,7 @@ impl PushdownRequestBuilder {
 
     /// A `COUNT(*)` select-list item, typed `DECIMAL(18,0)` as Exasol declares it.
     pub(crate) fn count_star(self) -> Self {
-        self.item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+        self.item(count_star(), ExasolType::decimal(18, 0))
     }
 
     /// An empty `selectList`, as Exasol sends for `SELECT RANDOM() FROM <table>`.
@@ -1546,15 +1558,7 @@ impl PushdownRequestBuilder {
         let involved_tables: Vec<Json> = self
             .tables
             .iter()
-            .map(|(name, columns)| {
-                let columns: Vec<Json> = columns
-                    .iter()
-                    .map(|(column, exa_type)| {
-                        serde_json::json!({"name": column, "dataType": exasol_type_to_json(exa_type)})
-                    })
-                    .collect();
-                serde_json::json!({"name": name, "columns": columns})
-            })
+            .map(|(name, columns)| involved_table_json(name, columns))
             .collect();
         let mut request = self.request_fields;
         request.insert("involvedTables".into(), Json::Array(involved_tables));
@@ -1633,76 +1637,9 @@ pub(crate) fn build_row_sql_with_root(
     )
 }
 
-pub(crate) fn agg_item(name: &str, column: Option<&str>, distinct: bool) -> serde_json::Value {
-    let mut args = serde_json::json!([]);
-    if let Some(c) = column {
-        args = serde_json::json!([col(c)]);
-    }
-    serde_json::json!({
-        "type": "function_aggregate",
-        "name": name,
-        "arguments": args,
-        "distinct": distinct,
-    })
-}
-
 pub(crate) fn pos_delete(path: &str, size: u64) -> DeleteMechanism {
     DeleteMechanism::IcebergPositionalDelete {
         path: path.into(),
         size,
-    }
-}
-
-pub(crate) fn agg_item_expr(
-    name: &str,
-    arg: serde_json::Value,
-    distinct: bool,
-) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function_aggregate",
-        "name": name,
-        "arguments": [arg],
-        "distinct": distinct,
-    })
-}
-
-pub(crate) mod filter_json {
-    use super::{predicate_equal, str_lit, table_col};
-    use serde_json::{Value as Json, json};
-
-    pub(crate) fn column(name: &str) -> Json {
-        table_col("SALES", name)
-    }
-
-    pub(crate) fn equal(name: &str, value: &str) -> Json {
-        predicate_equal(column(name), str_lit(value))
-    }
-
-    pub(crate) fn not(expression: Json) -> Json {
-        json!({"type": "predicate_not", "expression": expression})
-    }
-
-    pub(crate) fn and(expressions: Vec<Json>) -> Json {
-        json!({"type": "predicate_and", "expressions": expressions})
-    }
-
-    pub(crate) fn or(expressions: Vec<Json>) -> Json {
-        json!({"type": "predicate_or", "expressions": expressions})
-    }
-
-    pub(crate) fn is_null(name: &str) -> Json {
-        json!({"type": "predicate_is_null", "expression": column(name)})
-    }
-
-    pub(crate) fn is_not_null(name: &str) -> Json {
-        json!({"type": "predicate_is_not_null", "expression": column(name)})
-    }
-
-    pub(crate) fn in_list(name: &str, arguments: Vec<Json>) -> Json {
-        json!({"type": "predicate_in_constlist", "expression": column(name), "arguments": arguments})
-    }
-
-    pub(crate) fn between(name: &str, low: Json, high: Json) -> Json {
-        json!({"type": "predicate_between", "expression": column(name), "left": low, "right": high})
     }
 }

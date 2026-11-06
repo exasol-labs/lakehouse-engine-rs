@@ -71,14 +71,10 @@ fn strip_table_alias_removes_alias_preserves_table_name_and_name_recursively() {
 
     assert_eq!(
         stripped,
-        serde_json::json!({
-            "type": "function_scalar",
-            "name": "PLUS",
-            "arguments": [
-                table_col("FACT_ORDERS", "O_ORDERDATE"),
-                num_lit(1)
-            ]
-        }),
+        scalar_fn(
+            "PLUS",
+            [table_col("FACT_ORDERS", "O_ORDERDATE"), num_lit(1)]
+        ),
         "every tableAlias key must be gone at every depth, while name/tableName survive"
     );
 }

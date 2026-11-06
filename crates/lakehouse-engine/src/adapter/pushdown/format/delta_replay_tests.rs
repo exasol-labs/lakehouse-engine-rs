@@ -1,4 +1,6 @@
-use crate::adapter::pushdown::test_support::{col, num_lit, str_lit};
+use crate::adapter::pushdown::test_support::{
+    between, by_name, col, compare, num_lit, or, str_lit,
+};
 use crate::scan::test_support::WithFiles;
 use std::sync::Arc;
 
@@ -8,11 +10,9 @@ use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-use serde_json::json;
 
 use super::super::delta_predicate::to_delta_predicate;
 use super::*;
-use crate::adapter::pushdown::test_support::by_name;
 use crate::scan::spec::{DeleteMechanism, DeltaDeletionVectorStorage};
 
 fn local_store() -> Arc<dyn ObjectStore> {
@@ -1196,12 +1196,7 @@ fn pruning_under_column_mapping_records_its_observed_behavior() {
 #[test]
 fn a_between_keeps_one_bound_when_the_other_fails_to_convert() {
     let schema = open_fixture("multi-part-stats").schema();
-    let node = json!({
-        "type": "predicate_between",
-        "expression": col("ID"),
-        "left": num_lit(4),
-        "right": str_lit("ten"),
-    });
+    let node = between(col("ID"), num_lit(4), str_lit("ten"));
     let predicate = to_delta_predicate(&node, &by_name(&schema))
         .expect("a BETWEEN must keep the bound it can translate");
 
@@ -1220,10 +1215,10 @@ fn a_between_keeps_one_bound_when_the_other_fails_to_convert() {
 #[test]
 fn an_or_with_an_untranslatable_branch_keeps_every_file() {
     let schema = open_fixture("multi-part-stats").schema();
-    let node = json!({"type": "predicate_or", "expressions": [
-        {"type": "predicate_lessequal", "left": col("ID"), "right": num_lit(2)},
-        {"type": "predicate_notequal", "left": col("ID"), "right": num_lit(7)},
-    ]});
+    let node = or([
+        compare("predicate_lessequal", col("ID"), num_lit(2)),
+        compare("predicate_notequal", col("ID"), num_lit(7)),
+    ]);
 
     assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);
 

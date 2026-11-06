@@ -7,6 +7,10 @@ license.workspace = true
 [lib]
 name = "vs_expression"
 
+[features]
+# Exposes `test_support` to dependent crates. Never enabled outside tests.
+test-support = []
+
 [dependencies]
 exasol-udf-sdk = { workspace = true }
 serde_json     = { workspace = true }

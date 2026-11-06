@@ -195,10 +195,7 @@ fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
     let col_types = vec![("ID".to_string(), ExasolType::decimal(19, 0))];
     let request = pushdown_request("T", NO_COLUMNS)
         .single_group()
-        .field(
-            "having",
-            predicate_equal(agg_item("COUNT", None, false), num_lit(0)),
-        )
+        .field("having", predicate_equal(count_star(), num_lit(0)))
         .item(str_lit("X"), ExasolType::WIDEST_VARCHAR)
         .count_star()
         .build_pushdown();
@@ -293,8 +290,7 @@ fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
 fn empty_result_sql_widened_row_scan_uses_select_list_types() {
     let pushdown_req = pushdown_request("T", NO_COLUMNS)
         .item(
-            serde_json::json!({"type": "function_scalar", "name": "LENGTH", "arguments": [
-                table_col("T", "SCORE")]}),
+            scalar_fn("LENGTH", [table_col("T", "SCORE")]),
             ExasolType::decimal(18, 0),
         )
         .build_pushdown();

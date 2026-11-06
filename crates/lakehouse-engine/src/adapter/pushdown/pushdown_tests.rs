@@ -149,11 +149,7 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
         .build()
         .unwrap();
 
-    let filter_json = serde_json::json!({
-        "type": "predicate_like",
-        "expression": col("name"),
-        "pattern": str_lit("A%")
-    });
+    let filter_json = like(col("name"), "A%");
 
     let df_filter = render_df_filter_safe(&filter_json);
     assert!(
@@ -172,15 +168,11 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
 #[test]
 fn where_filter_decimal_stringification_rewritten_to_trim() {
     let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
-    let filter_json = serde_json::json!({
-        "type": "predicate_greater",
-        "left": {
-            "type": "function_scalar",
-            "name": "LENGTH",
-            "arguments": [col("c_decimal_a")]
-        },
-        "right": num_lit(5)
-    });
+    let filter_json = compare(
+        "predicate_greater",
+        scalar_fn("LENGTH", [col("c_decimal_a")]),
+        num_lit(5),
+    );
 
     let rendered = Some(&filter_json)
         .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
@@ -202,11 +194,7 @@ fn where_filter_decimal_stringification_rewritten_to_trim() {
 #[test]
 fn filter_decimal_comparison_not_rewritten() {
     let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
-    let filter_json = serde_json::json!({
-        "type": "predicate_greater",
-        "left": col("c_decimal_a"),
-        "right": num_lit(5)
-    });
+    let filter_json = compare("predicate_greater", col("c_decimal_a"), num_lit(5));
 
     let rendered = Some(&filter_json)
         .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
@@ -225,14 +213,7 @@ fn filter_decimal_comparison_not_rewritten() {
 #[test]
 fn where_filter_string_fn_under_comparison_predicate_coerced() {
     let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
-    let filter_json = predicate_equal(
-        serde_json::json!({
-            "type": "function_scalar",
-            "name": "UPPER",
-            "arguments": [col("c_decimal_a")]
-        }),
-        str_lit("X"),
-    );
+    let filter_json = predicate_equal(scalar_fn("UPPER", [col("c_decimal_a")]), str_lit("X"));
 
     let rendered = Some(&filter_json)
         .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
@@ -248,14 +229,7 @@ fn where_filter_string_fn_under_comparison_predicate_coerced() {
 #[test]
 fn where_filter_string_fn_over_double_declines() {
     let col_types = vec![("C_DOUBLE_A".to_string(), ExasolType::DoublePrecision)];
-    let filter_json = predicate_equal(
-        serde_json::json!({
-            "type": "function_scalar",
-            "name": "UPPER",
-            "arguments": [col("c_double_a")]
-        }),
-        str_lit("X"),
-    );
+    let filter_json = predicate_equal(scalar_fn("UPPER", [col("c_double_a")]), str_lit("X"));
 
     let rendered = Some(&filter_json).and_then(|f| scan_filter_sql(f, &column_types(&col_types)));
 
@@ -269,15 +243,7 @@ fn where_filter_string_fn_over_double_declines() {
 #[test]
 fn where_filter_upper_decimal_inside_like_subject_coerced() {
     let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
-    let filter_json = serde_json::json!({
-        "type": "predicate_like",
-        "expression": {
-            "type": "function_scalar",
-            "name": "UPPER",
-            "arguments": [col("c_decimal_a")]
-        },
-        "pattern": str_lit("1%")
-    });
+    let filter_json = like(scalar_fn("UPPER", [col("c_decimal_a")]), "1%");
 
     let rendered = Some(&filter_json)
         .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
@@ -295,21 +261,7 @@ fn where_filter_upper_decimal_inside_like_subject_coerced() {
 fn where_filter_like_decimal_inside_case_declines_whole_filter() {
     let col_types = vec![("AMOUNT".to_string(), ExasolType::decimal(9, 2))];
     let filter_json = predicate_equal(
-        serde_json::json!({
-            "type": "function_scalar_case",
-            "name": "CASE",
-            "arguments": [
-                {
-                    "type": "predicate_like",
-                    "expression": col("amount"),
-                    "pattern": str_lit("9%")
-                }
-            ],
-            "results": [
-                num_lit(1),
-                num_lit(0)
-            ]
-        }),
+        case_when([like(col("amount"), "9%")], [num_lit(1), num_lit(0)]),
         num_lit(1),
     );
 
@@ -801,11 +753,7 @@ fn guard_dispatch_result(
 
 /// A shape `like_subject_type_guard` declines though Exasol renders it.
 fn declined_like_on_decimal() -> Json {
-    serde_json::json!({
-        "type": "predicate_like",
-        "expression": table_col("EVENTS", "AMOUNT"),
-        "pattern": str_lit("1%"),
-    })
+    like(table_col("EVENTS", "AMOUNT"), "1%")
 }
 
 /// The empty logical schema declines the bounded top-N unconditionally, so the
@@ -877,12 +825,7 @@ fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
             "ordered top-N",
             guard_events()
                 .column(id_col.clone())
-                .order_by(serde_json::json!([{
-                    "type": "order_by_element",
-                    "expression": id_col,
-                    "isAscending": true,
-                    "nullsLast": true,
-                }]))
+                .order_by(serde_json::json!([order_by_element(id_col, true, true)]))
                 .limit(5)
                 .filter(declined.clone()),
         ),
@@ -980,14 +923,10 @@ fn declined_filter_with_a_real_select_list_keeps_the_narrowing() {
 #[test]
 fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
     let sql = dispatch_sql_for_body(guard_events().item(
-        serde_json::json!({
-            "type": "function_scalar",
-            "name": "ROUND",
-            "arguments": [
-                agg_item("SUM", Some("AMOUNT"), false),
-                num_lit(2),
-            ],
-        }),
+        scalar_fn(
+            "ROUND",
+            [agg_item("SUM", Some("AMOUNT"), false), num_lit(2)],
+        ),
         ExasolType::decimal(36, 2),
     ));
 
@@ -1028,31 +967,15 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
         .unwrap();
     // `SECOND(ts, 3)` is a DataFusion arity decline Exasol renders; `LENGTH(amount) > 5`
     // is rewritten, so the equality assertion distinguishes original from rewritten.
-    let filter = serde_json::json!({
-        "type": "predicate_and",
-        "expressions": [
-            {
-                "type": "predicate_greater",
-                "left": col("id"),
-                "right": num_lit(5),
-            },
-            {
-                "type": "predicate_greater",
-                "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
-                    col("ts"),
-                    num_lit(3),
-                ]},
-                "right": num_lit(1),
-            },
-            {
-                "type": "predicate_greater",
-                "left": {"type": "function_scalar", "name": "LENGTH", "arguments": [
-                    col("amount"),
-                ]},
-                "right": num_lit(5),
-            },
-        ],
-    });
+    let filter = and([
+        compare("predicate_greater", col("id"), num_lit(5)),
+        declined_second_predicate(col("ts")),
+        compare(
+            "predicate_greater",
+            scalar_fn("LENGTH", [col("amount")]),
+            num_lit(5),
+        ),
+    ]);
     let col_types = vec![
         ("ID".to_string(), ExasolType::decimal(20, 0)),
         ("TS".to_string(), ExasolType::BARE_TIMESTAMP),
@@ -1082,12 +1005,11 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
 #[test]
 fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
     let request = guard_events()
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": col("NAME"),
-            "isAscending": true,
-            "nullsLast": true
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            col("NAME"),
+            true,
+            true
+        )]))
         .limit(10)
         .item(num_lit(1), ExasolType::decimal(1, 0))
         .build()
@@ -1125,12 +1047,7 @@ fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
 #[test]
 fn declined_order_by_wrapper_selects_only_original_select_list() {
     let request = guard_events()
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": col("ID"),
-            "isAscending": true,
-            "nullsLast": true
-        }]))
+        .order_by(serde_json::json!([order_by_element(col("ID"), true, true)]))
         .column(col("NAME"))
         .build()
         .0;
@@ -1165,14 +1082,7 @@ fn declined_order_by_wrapper_selects_only_original_select_list() {
 
 #[test]
 fn declined_order_by_dedupes_repeated_and_projected_sort_keys() {
-    let sort_key = |name: &str| {
-        serde_json::json!({
-            "type": "order_by_element",
-            "expression": col(name),
-            "isAscending": true,
-            "nullsLast": true
-        })
-    };
+    let sort_key = |name: &str| order_by_element(col(name), true, true);
     let request = guard_events()
         .order_by(serde_json::json!([
             sort_key("NAME"),
@@ -1214,12 +1124,11 @@ fn declined_order_by_dedupes_repeated_and_projected_sort_keys() {
 #[test]
 fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
     let request = guard_events()
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": col("NAME"),
-            "isAscending": true,
-            "nullsLast": true
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            col("NAME"),
+            true,
+            true
+        )]))
         .limit(5)
         .column(col("NAME"))
         .build()
@@ -1272,12 +1181,11 @@ fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
 #[test]
 fn nonzero_offset_nulls_the_effective_limit() {
     let request = guard_events()
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": col("NAME"),
-            "isAscending": true,
-            "nullsLast": true
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            col("NAME"),
+            true,
+            true
+        )]))
         .field("limit", serde_json::json!({"numElements": 5, "offset": 2}))
         .column(col("NAME"))
         .build()
@@ -1324,12 +1232,11 @@ fn nonzero_offset_nulls_the_effective_limit() {
 #[test]
 fn declined_order_by_extension_runs_after_topn_detection() {
     let request = guard_events()
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": col("NAME"),
-            "isAscending": true,
-            "nullsLast": true
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            col("NAME"),
+            true,
+            true
+        )]))
         .limit(5)
         .item(num_lit(1), ExasolType::decimal(1, 0))
         .build()
@@ -1379,27 +1286,21 @@ fn declined_order_by_extension_runs_after_topn_detection() {
 /// Scenario: An ORDER BY the adapter cannot bound as a top-N remains correctness-safe
 #[test]
 fn declined_order_by_renders_every_reachable_ordering_or_declines() {
-    let unrenderable_expression = serde_json::json!({
-        "type": "order_by_element",
-        "expression": {"type": "no_such_node_type_in_either_dialect"},
-        "isAscending": true,
-        "nullsLast": true
-    });
+    let unrenderable_expression = order_by_element(
+        serde_json::json!({"type": "no_such_node_type_in_either_dialect"}),
+        true,
+        true,
+    );
     let column_missing_nulls_last = serde_json::json!({
         "type": "order_by_element",
         "expression": col("ID"),
         "isAscending": true
     });
-    let renderable_expression = serde_json::json!({
-        "type": "order_by_element",
-        "expression": {
-            "type": "function_scalar",
-            "name": "ABS",
-            "arguments": [table_col("EVENTS", "AMOUNT")]
-        },
-        "isAscending": false,
-        "nullsLast": true
-    });
+    let renderable_expression = order_by_element(
+        scalar_fn("ABS", [table_col("EVENTS", "AMOUNT")]),
+        false,
+        true,
+    );
     let declining_shapes = [
         (
             "every element unrenderable",
@@ -1476,12 +1377,11 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
 #[test]
 fn lone_count_distinct_with_order_by_still_renders_limit() {
     let request = guard_events()
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": table_col("EVENTS", "ID"),
-            "isAscending": true,
-            "nullsLast": true
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            table_col("EVENTS", "ID"),
+            true,
+            true
+        )]))
         .item(
             agg_item("COUNT", Some("ID"), true),
             ExasolType::decimal(18, 0),
@@ -1524,12 +1424,11 @@ fn lone_count_distinct_with_order_by_still_renders_limit() {
 /// Select-list arity equals the base table's column count.
 fn widening_arity_coincidence_request() -> Json {
     guard_events()
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": table_col("EVENTS", "NAME"),
-            "isAscending": true,
-            "nullsLast": true
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            table_col("EVENTS", "NAME"),
+            true,
+            true
+        )]))
         .column(table_col("EVENTS", "REGION"))
         .column(table_col("EVENTS", "NAME"))
         .column(table_col("EVENTS", "AMOUNT"))
@@ -1866,7 +1765,7 @@ async fn a_count_star_aggregate_is_admitted_over_a_table_with_a_refused_column()
     let storage = refused_column_table_storage().await;
 
     delta_pushdown(
-        &refused_column_request(refused_column_table().item(serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false}), ExasolType::decimal(18, 0))),
+        &refused_column_request(refused_column_table().count_star()),
         &catalog.uri,
         storage,
         "cat.sch.orders",
@@ -1886,12 +1785,7 @@ async fn an_aggregate_over_a_refused_column_is_refused() {
 
     let error = delta_pushdown(
         &refused_column_request(refused_column_table().item(
-            serde_json::json!({
-                "type": "function_aggregate",
-                "name": "MAX",
-                "arguments": [column_item("VARIANT_COL")],
-                "distinct": false,
-            }),
+            agg_item_expr("MAX", column_item("VARIANT_COL"), false),
             ExasolType::WIDEST_VARCHAR,
         )),
         &catalog.uri,
@@ -1911,10 +1805,11 @@ async fn a_count_star_filtered_on_a_refused_column_is_refused() {
     let storage = refused_column_table_storage().await;
 
     let error = delta_pushdown(
-        &refused_column_request(refused_column_table().item(serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false}), ExasolType::decimal(18, 0)).filter(serde_json::json!({
-                "type": "predicate_is_not_null",
-                "expression": column_item("VARIANT_COL"),
-            }))),
+        &refused_column_request(
+            refused_column_table()
+                .count_star()
+                .filter(is_not_null(column_item("VARIANT_COL"))),
+        ),
         &catalog.uri,
         storage,
         "cat.sch.orders",

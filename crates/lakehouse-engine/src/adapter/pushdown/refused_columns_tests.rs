@@ -1,9 +1,9 @@
-use crate::adapter::pushdown::test_support::{predicate_equal, str_lit, table_col};
+use crate::adapter::pushdown::test_support::{
+    PushdownRequestBuilder, agg_item_expr, and, is_not_null, order_by_element, predicate_equal,
+    pushdown_request, scalar_fn, str_lit, table_col, unread_refused, user_message,
+};
 
 use super::*;
-use crate::adapter::pushdown::test_support::{
-    PushdownRequestBuilder, pushdown_request, unread_refused, user_message,
-};
 use crate::types::exasol_type::ExasolType;
 
 fn shape_col() -> RefusedColumn {
@@ -40,8 +40,7 @@ fn column_node(name: &str) -> Json {
 /// Scenario: A refused column refuses only the requests that read or emit it
 #[test]
 fn a_request_touching_no_refused_column_is_admitted() {
-    let int_col_present =
-        serde_json::json!({"type": "predicate_is_not_null", "expression": column_node("INT_COL")});
+    let int_col_present = is_not_null(column_node("INT_COL"));
     let request = stats_all_types()
         .field("type", "select")
         .filter(int_col_present)
@@ -88,23 +87,19 @@ fn a_table_with_no_refused_column_admits_every_request() {
 fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
     let request = stats_all_types()
         .field("type", serde_json::json!("select"))
-        .filter(serde_json::json!({
-            "type": "predicate_and",
-            "expressions": [
-                {"type": "predicate_is_not_null", "expression": column_node("INT_COL")},
-                predicate_equal(
-                    serde_json::json!({
-                            "type": "function_scalar",
-                            "name": "UPPER",
-                            "arguments": [{
-                                "type": "function_scalar_case",
-                                "arguments": [column_node("SHAPE_COL")],
-                            }],
-                        }),
-                    str_lit("x"),
+        .filter(and([
+            is_not_null(column_node("INT_COL")),
+            predicate_equal(
+                scalar_fn(
+                    "UPPER",
+                    [serde_json::json!({
+                        "type": "function_scalar_case",
+                        "arguments": [column_node("SHAPE_COL")],
+                    })],
                 ),
-            ],
-        }))
+                str_lit("x"),
+            ),
+        ]))
         .column(column_node("INT_COL"))
         .build()
         .0;
@@ -123,8 +118,7 @@ fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
 /// Scenario: A refused column refuses only the requests that read or emit it
 #[test]
 fn a_full_row_projection_refuses_a_column_the_request_json_never_names() {
-    let int_col_present =
-        serde_json::json!({"type": "predicate_is_not_null", "expression": column_node("INT_COL")});
+    let int_col_present = is_not_null(column_node("INT_COL"));
     let request = stats_all_types()
         .field("type", "select")
         .filter(int_col_present)
@@ -171,12 +165,7 @@ fn a_widened_projection_is_still_refused_when_the_request_itself_names_a_refused
     let request = stats_all_types()
         .field("type", serde_json::json!("select"))
         .item(
-            serde_json::json!({
-                "type": "function_aggregate",
-                "name": "MAX",
-                "arguments": [column_node("SHAPE_COL")],
-                "distinct": false,
-            }),
+            agg_item_expr("MAX", column_node("SHAPE_COL"), false),
             ExasolType::WIDEST_VARCHAR,
         )
         .build()
@@ -196,12 +185,11 @@ fn a_widened_projection_is_still_refused_when_the_request_itself_names_a_refused
 fn every_refused_column_a_request_touches_is_named_in_one_error() {
     let request = stats_all_types()
         .field("type", serde_json::json!("select"))
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": column_node("VARIANT_COL"),
-            "isAscending": true,
-            "nullsLast": true,
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            column_node("VARIANT_COL"),
+            true,
+            true
+        )]))
         .column(column_node("INT_COL"))
         .build()
         .0;
