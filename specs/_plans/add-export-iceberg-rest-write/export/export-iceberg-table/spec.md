@@ -1,17 +1,17 @@
 # Feature: EXPORT INTO SCRIPT Into a New Iceberg Table
 
-The export writes the source rows as Parquet data files into a new Iceberg table, through the Iceberg REST catalog that the CONNECTION names, on S3-compatible storage. It creates the namespace and the table, and each writer commits its own files exactly once. With `SINGLE_COMMIT = 'true'` the table appears together with all its rows, or not at all (#566).
+The export writes the source rows as Parquet data files into a new Iceberg table, through the Iceberg REST catalog that the CONNECTION names, on S3-compatible storage. It creates the namespace and the table, and each writer commits its own files exactly once. With `SINGLE_COMMIT = 'true'` the table appears only together with all its rows (#566).
 
 ## Background
 
 * Statement and options: export/export-options § Background.
 * Read through a virtual schema: export/export-into-script § Background.
 * Storage credentials are the CONNECTION's static storage keys or, when the CONNECTION sets `"use_vended_credentials": true`, the credentials that the catalog vends for the new table.
-* On a catalog that offers a credentials endpoint (Iceberg REST `loadCredentials`), the export refreshes vended credentials through it before they expire, and once before it reads any source row. It never refreshes static storage keys.
-* The export creates every missing level of the namespace before it reads any source row, even when it then writes no rows or fails. It creates only new tables.
-* Every export needs a catalog that accepts staged table creation (Iceberg REST `stage-create`).
+* On a catalog that offers a credentials endpoint (Iceberg REST `loadCredentials`), the export renews vended credentials through it before they expire. It never renews static storage keys. Credentials with an expiry are renewed through the catalog's own call.
+* Before it reads any source row the export makes catalog calls only: it authenticates, refuses an existing table, and creates every missing level of the namespace, even when it then writes no rows or fails. It never writes to storage at that point, so a storage error shows when the writers write, and in parallel mode a failed export can leave an empty table behind. It creates only new tables.
+* `SINGLE_COMMIT` means the table appears only with its data. Iceberg REST does it by staged table creation (`stage-create`), so only a `SINGLE_COMMIT` export needs a catalog that accepts it.
 * The export writes only onto S3-compatible storage, through an Iceberg REST catalog that does not need AWS SigV4 signing.
-* Type mapping. The export creates format-version 2 tables. Every column is optional and carries the source column's name as Exasol reports it, so an unquoted identifier arrives in upper case. Column names must be distinct and must not name one of Iceberg's reserved metadata columns, such as `_file`.
+* Type mapping. Exasol types map to Arrow types once, and the Iceberg schema derives from the Arrow schema. The export creates format-version 2 tables. Every column is optional and carries the source column's name as Exasol reports it, so an unquoted identifier arrives in upper case. Column names must be distinct and must not name one of Iceberg's reserved metadata columns, such as `_file`.
 
   | Exasol type | Iceberg type |
   |-------------|--------------|
@@ -97,7 +97,7 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 
 * *GIVEN* a CONNECTION that sets `"use_vended_credentials": true`, and vended credentials that expire before the writer finishes
 * *WHEN* a user exports a source into a new table, with or without `SINGLE_COMMIT = 'true'`, through a catalog that offers a credentials endpoint
-* *THEN* the export SHALL succeed, and the new table, read through a virtual schema, SHALL hold the source rows
+* *THEN* the writer SHALL renew the credentials through that endpoint before they expire and the export SHALL succeed
 * *WHEN* the catalog offers no credentials endpoint
 * *THEN* the export SHALL fail with an error that names the table and states that its vended credentials expired and that the catalog offers no credentials endpoint
 * *AND* the error MUST NOT contain a storage credential
@@ -105,17 +105,38 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 ### Scenario: A bad CONNECTION fails before any data is read
 
 * *GIVEN* a source whose rows raise an error when they are read
-* *WHEN* a user exports it through a CONNECTION whose catalog address is unreachable, whose catalog credentials are wrong, whose static storage keys cannot write to the catalog's storage, or whose catalog refuses to refresh the vended credentials
-* *THEN* the export SHALL fail before any source row is read, with an error that names the catalog, the storage, or the credential refresh as the failing side
+* *WHEN* a user exports it through a CONNECTION whose catalog address is unreachable or whose catalog credentials are wrong
+* *THEN* the export SHALL fail before any source row is read, with an error that names the catalog as the failing side
 * *AND* the error MUST NOT contain a secret of the CONNECTION or a storage credential
 * *AND* the export SHALL NOT create the table
 
-### Scenario: A CONNECTION or catalog the export does not support is refused before any data is read
+### Scenario: A wrong storage key fails the writer, naming the storage
+
+* *GIVEN* a CONNECTION whose static storage keys cannot write to the catalog's storage, and a source of 1,000 rows
+* *WHEN* a user exports it
+* *THEN* the export SHALL fail with an error that names the storage as the failing side and contains no storage credential
+* *AND* with `SINGLE_COMMIT = 'true'` the export SHALL NOT create the table, and without it the table, if it exists, SHALL hold no rows
+
+### Scenario: A CONNECTION the export does not support is refused before any data is read
 
 * *GIVEN* a source whose rows raise an error when they are read
-* *WHEN* a user exports it, with or without `SINGLE_COMMIT`, through a CONNECTION with Azure storage credentials, one that signs catalog requests with AWS SigV4, a catalog whose table location is not on S3-compatible storage, or a catalog that refuses staged table creation
-* *THEN* the export SHALL fail before any source row is read, with an error that names the unsupported storage, signing, or location scheme, or states that the export needs staged table creation
+* *WHEN* a user exports it, with or without `SINGLE_COMMIT`, through a CONNECTION with Azure storage credentials, or one that signs catalog requests with AWS SigV4
+* *THEN* the export SHALL fail before any source row is read, with an error that names the unsupported storage or signing
 * *AND* the export SHALL NOT create the table
+
+### Scenario: A table location outside S3-compatible storage is refused
+
+* *GIVEN* a catalog that answers a table location whose scheme is not `s3` or `s3a`
+* *WHEN* a user exports into a new table
+* *THEN* the writer SHALL fail with an error that names the table and the scheme
+
+### Scenario: SINGLE_COMMIT on a catalog without staged creation fails and creates no table
+
+* *GIVEN* a catalog that refuses staged table creation
+* *WHEN* a user exports a source of 1,000 rows with `SINGLE_COMMIT = 'true'`
+* *THEN* the export SHALL fail with an error that names the catalog and states that `SINGLE_COMMIT` needs staged table creation
+* *AND* the export SHALL NOT create the table
+* *AND* the same export without `SINGLE_COMMIT` SHALL succeed
 
 ### Scenario: SINGLE_COMMIT creates the table together with its rows
 

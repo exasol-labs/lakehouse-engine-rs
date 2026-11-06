@@ -3,20 +3,20 @@
 ## Interview
 
 - Q: SINGLE_COMMIT atomicity route → A: raw REST `stage-create` (iceberg-rust hardcodes false), commit with assert-create; table appears only with its data
-- Q: Pre-read check for a bad CONNECTION → A: catalog `namespace_exists` call plus a probe write/delete with static storage keys in `generate_export_sql`; vended keys only get the catalog check (scoped to a table that may not exist yet). Superseded by decision [1] after review.
+- Q: Pre-read check for a bad CONNECTION → A: catalog calls only (connect, authenticate, table absent, create namespace). A storage error shows when the writers write. Replaces an earlier storage probe after review (decision [1]).
 - Q: Concurrent and retried commits → A: raise `commit.retry.num-retries` on the created table and tag each snapshot with an export-id summary property, re-checked before every re-commit
 
 ## Design Decisions
 
-### [1] The pre-read check probes storage at a staged table location, for static and vended credentials alike
+### [1] The pre-read check makes catalog calls only, and never probes storage
 
-- **Decision:** Before any source row is read, the export creates the missing namespace levels, stage-creates the target table without committing it, and writes and deletes one probe object at the staged location. It uses the credentials the writers will use: the CONNECTION's static keys, or the credentials vended in the stage-create answer.
-- **Rationale:** Interview answer 2 limited vended credentials to a catalog call, because no table location exists before the table does. A stage-create answer carries the location and, on Lakekeeper, vended credentials scoped to it, and the staged table stays invisible and reserves nothing (measured, plan.md § Context). One probe path then covers static keys, vending, and an `http://` vended endpoint without `ALLOW_HTTP`.
-- **Alternatives:** Probe static keys at the namespace `location` property: the namespace may not exist yet, and the Iceberg REST spec does not require that property.
+- **Decision:** Before any source row is read, the export connects and authenticates to the catalog, refuses an existing table, and creates the missing namespace levels. It writes no probe object and stages no table. A storage error (wrong keys, no write access) shows when the writers write.
+- **Rationale:** A probe catches only storage errors. In return it needed a catalog with staged creation (an optional Iceberg REST feature that Glue, Delta, and direct storage lack), could leave an object that no table owns, added an early credential refresh and its own E2E tests, and in parallel mode checked the staged location, not the location the writers use. Catalog calls exist for every catalog the export will gain, so they are the common pre-read check.
+- **Alternatives:** Probe at a staged table location (rejected in review, reasons above). Probe at the namespace `location` property: the namespace may not exist yet, and the Iceberg REST spec does not require that property.
 - **Consequences:**
-  - Every export, parallel mode included, needs a catalog that accepts `stage-create: true`. On a catalog that refuses it, every export fails before any source row is read, naming the catalog.
   - A missing namespace is created even when the export later fails or writes no rows.
-  - The probe delete is best effort, so storage that refuses deletes keeps one probe object under a location no table uses.
+  - A wrong storage key fails the writer, not the pre-read check. In parallel mode the first writer may already have created the table, so the failed export can leave an empty table behind. Under `SINGLE_COMMIT` no table exists.
+  - Staged creation is needed only for `SINGLE_COMMIT` (decision [8]).
 - **Promotes to ADR:** no
 
 ### [2] The export commit loop belongs to lakehouse-catalog and re-checks the writer's tag before every re-commit
@@ -24,6 +24,7 @@
 - **Decision:** iceberg-rust builds a writer's snapshot, and `lakehouse-catalog` sends the commit through its own catalog HTTP client. After a conflict or an uncertain outcome, the loop reloads the table with all snapshots and commits again only when no snapshot carries the writer's tag. It retries HTTP 409, 429, 502, 503, 504, and uncertain network outcomes with bounded backoff and a bounded attempt count, and never retries authentication (401, 403), schema, invalid-request, or existing-table errors.
 - **Rationale:** Rule-2 criteria 2 and 4. iceberg-rust's `Transaction::commit` re-applies after HTTP 409, and the catalog HTTP client repeats a POST after HTTP 502 or 504, so a commit whose answer was lost returns 409 and a blind re-apply adds its rows twice. The Iceberg REST spec answers a commit with 500, 502, or 504 when "the commit state is unknown". `RestCatalog` would also bypass the one catalog HTTP client that § Constraints requires. ADR digest search (export, write, commit, stage, retry): no ADR covers catalog writes.
 - **Alternatives:** `RestCatalog` with `Transaction::commit` and a raised retry count, as in the spike: duplicate rows and a bypassed client.
+- **Open:** The catalog HTTP client retries every POST, so a commit can be retried by it and by this loop under different rules. Which catalog writes are safe to repeat, who retries them, and how a writer learns an unknown outcome is an open question (plan.md § Open Questions), not decided here.
 - **Consequences:**
   - The loop reads the table's `commit.retry.num-retries`, which the export sets to 20 on the tables it creates (interview answer 3).
   - A writer whose last commit outcome is unknown (HTTP 500 included) fails and keeps its data files, because they may be in the table.
@@ -52,33 +53,56 @@
 - **Rationale:** No component of the Lakekeeper stack can drop an answer after the catalog applied a commit: the proxy filter answers 403 before it forwards. `specs/testing.md` § Coverage rule admits a fault-injection test for a failure that E2E cannot produce.
 - **Promotes to ADR:** no
 
-### [6] The FileIO of an export table refreshes vended credentials through the catalog's credentials endpoint before they expire
+### [6] Storage credentials with an expiry are renewed before they expire, and the renew call belongs to the catalog
 
-- **Decision:** With vended credentials, the FileIO of every table the export writes takes its S3 credentials from a credential source in `lakehouse-catalog`. The source starts with the credentials of the create, stage-create, or load answer, and loads new ones through the table's Iceberg REST `loadCredentials` endpoint on the CONNECTION's catalog address when they expire within five minutes. The pre-read check refreshes the staged table's credentials once. On a catalog that does not advertise the endpoint, a writer that outlives its credentials fails with an error that states their expiry.
+- **Decision:** `lakehouse-catalog` gets one expiring-credential holder: a value, its expiry, a renewal skew, an injectable clock, and a lock so concurrent callers wait for one renewal. The Unity OAuth token source (`unity/auth.rs`, `OAUTH_REFRESH_SKEW_SECS`) moves onto it, so the pattern exists once. The export's vended storage credentials are its second user, with Iceberg REST's `loadCredentials` as the renew call. Unity's temporary credentials and an assumed AWS role plug in later by supplying their own renew call.
 - **Rationale:**
   - A writer can outlive Lakekeeper's 3,599 s credentials. Under `SINGLE_COMMIT` the staged table cannot be reloaded, and Lakekeeper answers `loadCredentials` for a staged table (plan.md § Context).
-  - The commit loop keeps the writer table's FileIO (task 1.3), so the refresh lives in that FileIO, through iceberg-rust's `customized_credential_load` hook.
-  - Five minutes is the prefetch time of Iceberg Java's `VendedCredentialsProvider`. Lakekeeper serves a cached credential for half its lifetime, so the refresh gets new credentials for every lifetime of ten minutes or more, the 900 s STS minimum included.
+  - The commit loop keeps the writer table's FileIO (task 1.3), so the renewal lives in that FileIO, through iceberg-rust's `customized_credential_load` hook.
+  - Five minutes is the prefetch time of Iceberg Java's `VendedCredentialsProvider`. Lakekeeper serves a cached credential for half its lifetime, so the renewal gets new credentials for every lifetime of ten minutes or more, the 900 s STS minimum included.
   - The Iceberg REST spec defines `loadCredentials` and the `/v1/config` `endpoints` list: "If a server does not send the `endpoints` field, a default set of endpoints is assumed", and that set omits `loadCredentials`. The spec path on the CONNECTION's catalog address keeps the catalog token on that address, under the one catalog HTTP client, the proxy settings, and `ALLOW_HTTP`.
-  - The pre-read refresh fails an export whose refresh would fail before any row is read, and it is the refresh an E2E can observe, because no E2E writer outlives a 900 s credential.
 - **Alternatives:**
-  - No refresh, with a documented one-hour limit: a `SINGLE_COMMIT` export runs one writer for the whole source.
-  - Refresh after an expired-token failure: the failed request inside iceberg-rust fails the writer, and SeaweedFS reports expiry as `InvalidAccessKeyId`.
+  - No renewal, with a documented one-hour limit: a `SINGLE_COMMIT` export runs one writer for the whole source.
+  - Renew after an expired-token failure: the failed request inside iceberg-rust fails the writer, and SeaweedFS reports expiry as `InvalidAccessKeyId`.
   - Call `client.refresh-credentials-endpoint`: the catalog would choose where the catalog token goes.
   - Reload the table: a staged table cannot be loaded, and re-staging at a location that holds files answers HTTP 400.
+  - A second, export-only token cache: the pattern would exist twice.
 - **Consequences:**
-  - Each refresh resolves a fresh catalog session, because the writer's OAuth2 token may have expired. An expired static bearer token fails the refresh.
-  - A catalog that advertises `loadCredentials` but refuses it for a staged table fails every vended export before any row is read.
-  - Under `SINGLE_COMMIT`, a racing statement that stages the same name at another location makes the refresh fail, naming the location.
-  - Credentials without `s3.session-token-expires-at-ms` are never refreshed. Static storage keys keep `StorageBackend::file_io()`.
+  - A renewal resolves a fresh catalog session, because the writer's OAuth2 token may have expired. An expired static bearer token fails the renewal.
+  - Under `SINGLE_COMMIT`, a racing statement that stages the same name at another location makes the renewal fail, naming the location.
+  - Credentials without `s3.session-token-expires-at-ms` are never renewed. Static storage keys keep `StorageBackend::file_io()`.
+  - With the storage probe gone (decision [1]), no E2E can observe a renewal, because no E2E writer outlives a 900 s credential. Unit tests with `spawn_server` prove the time trigger, the `loadCredentials` request, and the refusals (decision [5]).
+- **Promotes to ADR:** no
+
+### [7] There is no final commit step, so each writer commits on its own
+
+- **Decision:** Each writer commits its own data files. The export has no step that runs once after all writers finish, and `SINGLE_COMMIT` trades speed for atomicity by running one writer.
+- **Rationale:** Exasol's UDF model has no step after the last group of a SET script. A final commit would need a second statement or a coordinator, which the engine does not have (mission: no background processes, no state across statements). The consequences hold for every catalog the export gains.
+- **Alternatives:** A coordinator writer that waits for all others: Exasol gives writers no channel to each other and may run them in any order.
+- **Consequences:**
+  - A failed parallel export can leave the commits of some writers in the table.
+  - Exactly-once per writer (decision [2]) is the only duplicate protection.
+  - Atomic exports are single-writer.
+- **Promotes to ADR:** yes
+
+### [8] The export is a fixed flow of steps, with Iceberg REST as its first implementation
+
+- **Decision:** The export does four steps for every target: (1) connect to the catalog and check the target, (2) create the table or open it, (3) turn rows into Parquet files, (4) commit the files. Steps 1, 2, and 4 sit behind an `ExportTarget` trait in `export/target.rs`, implemented first by `export/iceberg_rest.rs`. Step 3 is the same for every target and lives in `export/writer.rs`. Staged creation, snapshot tags, and `loadCredentials` appear only in the Iceberg REST implementation.
+- **Rationale:** The read side separates catalog from table format. Unity with Delta, Glue, and direct storage will add implementations, not reshape the flow. This plan builds only Iceberg REST.
+- **Alternatives:** Iceberg REST calls inside the writer: the next catalog reshapes the flow.
+- **Consequences:**
+  - `SINGLE_COMMIT` means "the table appears only with its data". Iceberg REST does it by staged creation, Delta would write its first log entry with the data, and a target with no such mechanism refuses the option. Without a probe, staged creation is needed only for `SINGLE_COMMIT`.
+  - Types map Exasol to Arrow once (`export/arrow_schema.rs`, which owns the type rules and refusals), and the Iceberg schema derives from the Arrow schema. Delta and plain Parquet will derive theirs the same way. The Parquet writer needs the Arrow schema anyway.
+  - The writer follows the target table's schema: it binds source columns to table fields by name and takes decimal scales from the table, so append (#567) adds only the schema-matching rules. "Table exists" is then the only create-only check.
+- **Architecture:** § Components (export), § Data Flow
 - **Promotes to ADR:** no
 
 ## Review Findings
 
-### [1] [plan-review] Decision [1] replaces interview answer 2
+### [1] [pr-review] The storage probe is removed from the pre-read check
 
-- **Finding:** Decision [1] replaces interview answer 2 and adds two user-visible effects: a missing namespace is created before any row is read, and every export needs a catalog that accepts `stage-create: true`.
-- **Direction change:** The requester accepted decision [1]. plan.md § Impact, the `export/export-iceberg-table` delta, and task 4.1 state both effects.
+- **Finding:** The probe needed staged creation for every export and could not become a common pre-read check for other catalogs.
+- **Direction change:** Decision [1] keeps catalog calls only. Parallel mode can leave an empty table behind, and plan.md § Impact and task 4.1 state it.
 - **Promotes to ADR:** no
 
 ### [2] [spike] A storage fault, not a source error, proves that a failed SINGLE_COMMIT export leaves no table
