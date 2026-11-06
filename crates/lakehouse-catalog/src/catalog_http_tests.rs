@@ -229,16 +229,14 @@ async fn close_after_request(mut stream: TcpStream) {
     read_request(&mut stream).await;
 }
 
-/// A listener whose accept queue is full, so the kernel drops every further connection's SYN.
-/// The returned values hold the queue full and must outlive the test's requests. The SYN drop
-/// holds on Linux but not on macOS, so this helper and its callers are Linux-only.
-#[cfg(target_os = "linux")]
+/// A listener whose full accept queue makes the kernel drop every further SYN; the returned values
+/// hold it full. Backlog 1, because macOS reads 0 as `kern.ipc.somaxconn` (128).
 async fn spawn_full_backlog_listener() -> (SocketAddr, TcpListener, Vec<TcpStream>) {
     let socket = tokio::net::TcpSocket::new_v4().expect("a TCP socket");
     socket
         .bind("127.0.0.1:0".parse().unwrap())
         .expect("bind a loopback port");
-    let listener = socket.listen(0).expect("listen with no backlog");
+    let listener = socket.listen(1).expect("listen with a backlog of 1");
     let address = listener.local_addr().expect("local_addr");
     let mut queued = Vec::new();
     while queued.len() < 64 {
@@ -247,7 +245,7 @@ async fn spawn_full_backlog_listener() -> (SocketAddr, TcpListener, Vec<TcpStrea
             _ => return (address, listener, queued),
         }
     }
-    panic!("the accept queue of a listen(0) socket never filled");
+    panic!("the accept queue of a listen(1) socket never filled");
 }
 
 fn get(http: &CatalogHttp, url: &str) -> Request {
@@ -362,7 +360,6 @@ async fn a_body_that_stalls_fails_at_the_read_timeout_without_a_retry() {
 }
 
 /// Scenario: A catalog that stays silent fails the request within 30 seconds
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_connection_that_never_completes_ends_at_the_connect_timeout() {
     let (address, _listener, _queued) = spawn_full_backlog_listener().await;
