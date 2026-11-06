@@ -275,9 +275,6 @@ pub(crate) fn type_scan_tree(
     let class = match node_kind {
         "literal_null" => TypeClass::Null,
         "literal_bool" => TypeClass::Boolean,
-        // Adapter-synthesized from a hex text literal compared with a binary column, which
-        // Exasol declares as text.
-        "literal_binary" => TypeClass::TEXT,
         "literal_string" => {
             let text = node.get("value").and_then(Json::as_str).unwrap_or("");
             TypeClass::Text {
