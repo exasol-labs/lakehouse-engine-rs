@@ -564,9 +564,9 @@ async fn unloadable_table_is_reported_skipped_not_failed() {
     );
 }
 
-/// Scenario: A non-404 per-table load failure aborts createVirtualSchema
+/// Scenario: Any other per-table load failure aborts createVirtualSchema
 #[tokio::test]
-async fn non_404_load_failure_aborts_the_batch() {
+async fn any_other_load_failure_aborts_the_batch() {
     let (uri, _log) =
         spawn_mock_catalog(&["prod"], &["orders", "hive_events"], &[], &["hive_events"]).await;
     let client = IcebergRestCatalogClient::new(uri, creds_no_auth());

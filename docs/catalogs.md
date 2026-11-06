@@ -389,7 +389,9 @@ Databricks keeps its entries so. An OSS Unity Catalog registrant must send them.
 > A Databricks-managed Delta table is also reachable through the **Iceberg REST** kind, via its
 > UniForm Iceberg metadata — use the AWS Glue or generic-REST recipes above for that route instead.
 > The two routes have different correctness dependencies (Iceberg deletes vs. Delta deletion
-> vectors); pick one deliberately rather than mixing them for the same table.
+> vectors); pick one deliberately rather than mixing them for the same table. On that route, a
+> table that Unity Catalog cannot serve as Iceberg, such as a Delta table without UniForm, is
+> skipped and listed in [SKIPPED_TABLES](#reading-skipped_tables).
 
 **Self-hosted / OSS, no catalog auth** (matches the bundled Docker stack, whose Unity Catalog server
 has auth disabled and whose Delta files sit in the same SeaweedFS bucket the Iceberg recipes use; the

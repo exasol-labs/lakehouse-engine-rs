@@ -245,10 +245,12 @@ impl IcebergRestCatalogClient {
     ) -> Result<TableAdmission, UdfError> {
         match self.load_on_session(session, ident).await {
             Ok(table) => Ok(TableAdmission::Admitted(table)),
-            Err(err) if err.is_not_found() => Ok(TableAdmission::Skipped(SkippedTable {
-                ident: ident.clone(),
-                reason: SkipReason::NotLoadableIcebergTable,
-            })),
+            Err(err) if err.is_not_an_iceberg_table() => {
+                Ok(TableAdmission::Skipped(SkippedTable {
+                    ident: ident.clone(),
+                    reason: SkipReason::NotLoadableIcebergTable,
+                }))
+            }
             Err(err) => Err(err.into()),
         }
     }

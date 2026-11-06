@@ -38,6 +38,36 @@ fn only_408_429_502_503_504_are_transient_statuses() {
 }
 
 #[test]
+fn a_404_or_unitys_not_iceberg_400_marks_a_table_not_iceberg() {
+    let unity = r#"{"error":{"message":"Table 'main.mixed.delta_t' is not an Iceberg compatible table. [ErrorCode: 1000]","type":"BadRequestException","code":400}}"#;
+    let cases = [
+        (Some(404), "{}", true),
+        (Some(400), unity, true),
+        (
+            Some(400),
+            r#"{"error":{"message":"Must supply a proper catalog in warehouse property.","type":"BadRequestException","code":400}}"#,
+            false,
+        ),
+        (Some(403), unity, false),
+        (Some(500), unity, false),
+        (None, unity, false),
+    ];
+    for (status, body, expected) in cases {
+        let error = CatalogRequestError::new(
+            status.map(|s| StatusCode::from_u16(s).unwrap()),
+            format!("loadTable failed with HTTP {status:?}: {body}"),
+        )
+        .named("mixed.delta_t");
+
+        assert_eq!(
+            error.is_not_an_iceberg_table(),
+            expected,
+            "{status:?} {body}"
+        );
+    }
+}
+
+#[test]
 fn retry_after_reads_delay_seconds_and_http_dates() {
     let imf_fixdate = "Sun, 06 Nov 1994 08:49:37 GMT";
     let stated = UNIX_EPOCH + Duration::from_secs(784_111_777);
