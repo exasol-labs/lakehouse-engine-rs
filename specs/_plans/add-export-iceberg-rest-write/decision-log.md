@@ -11,98 +11,84 @@
 ### [1] The pre-read check probes storage at a staged table location, for static and vended credentials alike
 
 - **Decision:** Before any source row is read, the export creates the missing namespace levels, stage-creates the target table without committing it, and writes and deletes one probe object at the staged location. It uses the credentials the writers will use: the CONNECTION's static keys, or the credentials vended in the stage-create answer.
-- **Rationale:** Interview answer 2 limited vended credentials to a catalog call because no table location exists before the table does. A stage-create answer carries the location and, on Lakekeeper, vended credentials scoped to it. Measured on the local Lakekeeper stack: HTTP 200, `metadata.location` set, vended keys present, the staged table invisible, and a later create of the same name succeeds, so staging reserves nothing. One probe path then covers static keys, vending, and an `http://` vended endpoint without `ALLOW_HTTP`.
-- **Alternatives:** Probe static keys at the namespace `location` property. Rejected: the namespace may not exist yet, and the Iceberg REST spec does not require that property.
+- **Rationale:** Interview answer 2 limited vended credentials to a catalog call, because no table location exists before the table does. A stage-create answer carries the location and, on Lakekeeper, vended credentials scoped to it, and the staged table stays invisible and reserves nothing (measured, plan.md § Context). One probe path then covers static keys, vending, and an `http://` vended endpoint without `ALLOW_HTTP`.
+- **Alternatives:** Probe static keys at the namespace `location` property: the namespace may not exist yet, and the Iceberg REST spec does not require that property.
 - **Consequences:**
-  - Every export, parallel mode included, needs a catalog that accepts `stage-create: true`. Lakekeeper and the local Iceberg REST fixture accept it. On a catalog that refuses it, every export fails before any source row is read, with an error that names the catalog and states that the export needs staged table creation.
+  - Every export, parallel mode included, needs a catalog that accepts `stage-create: true`. On a catalog that refuses it, every export fails before any source row is read, naming the catalog.
   - A missing namespace is created even when the export later fails or writes no rows.
   - The probe delete is best effort, so storage that refuses deletes keeps one probe object under a location no table uses.
 - **Promotes to ADR:** no
 
 ### [2] The export commit loop belongs to lakehouse-catalog and re-checks the writer's tag before every re-commit
 
-- **Decision:** iceberg-rust builds a writer's snapshot (manifests, manifest list, and the commit's updates), and `lakehouse-catalog` sends the commit through its own catalog HTTP client. After a conflict or an unknown outcome, the loop reloads the table with all snapshots and commits again only when no snapshot carries the writer's tag.
-- **Rationale:** Rule-2 criteria 2 and 4. iceberg-rust's `Transaction::commit` reloads and re-applies after HTTP 409, and the catalog HTTP client repeats a POST after HTTP 502 or 504. A commit the catalog applied but whose answer was lost therefore returns 409, and a blind re-apply adds the rows twice. The Iceberg REST spec answers a commit with 500, 502, or 504 when "the commit state is unknown". iceberg-rust's `RestCatalog` would also bypass the one catalog HTTP client that § Constraints requires. ADR digest search (export, write, commit, stage): no ADR covers catalog writes.
-- **Alternatives:** `RestCatalog` with `Transaction::commit` and a raised retry count, as in the spike. Rejected for the duplicate rows and the bypassed client.
-- **Consequences:** The loop reads the table's `commit.retry.num-retries`, which the export sets to 20 on the tables it creates, as interview answer 3 chose. Later write features reuse the loop instead of iceberg-rust's. A rev bump of iceberg-rust runs the Lakekeeper export E2E before merge.
+- **Decision:** iceberg-rust builds a writer's snapshot, and `lakehouse-catalog` sends the commit through its own catalog HTTP client. After a conflict or an uncertain outcome, the loop reloads the table with all snapshots and commits again only when no snapshot carries the writer's tag. It retries HTTP 409, 429, 502, 503, 504, and uncertain network outcomes with bounded backoff and a bounded attempt count, and never retries authentication (401, 403), schema, invalid-request, or existing-table errors.
+- **Rationale:** Rule-2 criteria 2 and 4. iceberg-rust's `Transaction::commit` re-applies after HTTP 409, and the catalog HTTP client repeats a POST after HTTP 502 or 504, so a commit whose answer was lost returns 409 and a blind re-apply adds its rows twice. The Iceberg REST spec answers a commit with 500, 502, or 504 when "the commit state is unknown". `RestCatalog` would also bypass the one catalog HTTP client that § Constraints requires. ADR digest search (export, write, commit, stage, retry): no ADR covers catalog writes.
+- **Alternatives:** `RestCatalog` with `Transaction::commit` and a raised retry count, as in the spike: duplicate rows and a bypassed client.
+- **Consequences:**
+  - The loop reads the table's `commit.retry.num-retries`, which the export sets to 20 on the tables it creates (interview answer 3).
+  - A writer whose last commit outcome is unknown (HTTP 500 included) fails and keeps its data files, because they may be in the table.
+  - Later write features reuse the loop. A rev bump of iceberg-rust runs the Lakekeeper export E2E before merge.
 - **Architecture:** § Components, § Constraints
 - **Promotes to ADR:** yes
 
 ### [3] TIMESTAMP(7) to TIMESTAMP(9) are refused, not truncated
 
-- **Decision:** The export refuses `TIMESTAMP(p)` with p > 6 with the unsupported-type error, which suggests a cast to `TIMESTAMP(6)`. It reads p from the column's declared precision.
-- **Rationale:** Exasol truncates a `TIMESTAMP(7)` to `TIMESTAMP(9)` value to microseconds before the UDF reads it, without an error (in-UDF spike: `.999999999` arrives as `.999999`). The writer cannot see the lost digits, so a refusal by declared precision is the only way to keep the acceptance criterion that every value reads back unchanged. A plain `TIMESTAMP` reports as `TIMESTAMP(3)`, so only explicitly declared precisions above 6 are affected.
-- **Alternatives:** Write the truncated value: rejected, a silent value change. Create version 3 tables with `timestamp_ns`: rejected, because the nanoseconds are gone before the export reads the value.
+- **Decision:** The export refuses `TIMESTAMP(p)` with p > 6, read from the column's declared precision, with the unsupported-type error, which suggests a cast to `TIMESTAMP(6)`.
+- **Rationale:** Exasol truncates these values to microseconds before the UDF reads them, without an error (measured: `.999999999` arrives as `.999999`). The writer cannot see the lost digits, so only a refusal by declared precision keeps every value unchanged on read-back. A plain `TIMESTAMP` reports as `TIMESTAMP(3)` and is unaffected.
+- **Alternatives:**
+  - Write the truncated value: a silent value change.
+  - Create version 3 tables with `timestamp_ns`: the nanoseconds are gone before the export reads the value.
 - **Promotes to ADR:** no
 
 ### [4] ALLOW_HTTP is an export option
 
 - **Decision:** The export takes `ALLOW_HTTP` as a WITH option, default `false`. Without it the export refuses every plain-HTTP request it would send: catalog, OAuth2 server, STS, and static or vended storage. The virtual schema property keeps its own, narrower gate.
-- **Rationale:** An export has no virtual schema, so the consent gate of ADR `allow-http-threaded-as-vended-selector-parameter` needs its own carrier. The option conforms to that ADR: consent is explicit, defaults to false, and is never derived from an endpoint's scheme. The checks run only on the export's path, in the export module and the export-only write session, so the virtual schema behaves as before.
+- **Rationale:** An export has no virtual schema, so the consent gate of ADR `allow-http-threaded-as-vended-selector-parameter` needs its own carrier. The option conforms to that ADR: consent is explicit, defaults to false, and is never derived from an endpoint's scheme. Only the export's own code checks it, so virtual schemas behave as before.
 - **Promotes to ADR:** no
 
 ### [5] A fault-injection test proves the retried unknown-outcome commit
 
 - **Decision:** A `lakehouse-catalog` test proves "A commit retried after an unknown outcome adds its rows once" with the existing `spawn_server` helper replaying recorded Lakekeeper answers. The Lakekeeper E2E proves the tags that the check reads.
-- **Rationale:** No component of the Lakekeeper stack can drop an answer after the catalog applied a commit: the proxy filter only answers 403 before it forwards. `specs/testing.md` § Coverage rule admits a fault-injection test for a failure that E2E cannot produce. Every other acceptance case of #566 runs as E2E on the local or the Lakekeeper stack.
+- **Rationale:** No component of the Lakekeeper stack can drop an answer after the catalog applied a commit: the proxy filter answers 403 before it forwards. `specs/testing.md` § Coverage rule admits a fault-injection test for a failure that E2E cannot produce.
 - **Promotes to ADR:** no
 
 ### [6] The FileIO of an export table refreshes vended credentials through the catalog's credentials endpoint before they expire
 
-- **Decision:** With vended credentials, the FileIO of every table the export writes takes its S3 credentials from a credential source in `lakehouse-catalog`. The source starts with the credentials of the create, stage-create, or load answer. When they expire within five minutes, it loads new ones through the table's Iceberg REST `loadCredentials` endpoint on the CONNECTION's catalog address. The pre-read check refreshes the staged table's credentials once and writes its probe with them. On a catalog that does not advertise the endpoint, the source keeps its credentials, and a writer that outlives them fails with an error that states their expiry.
+- **Decision:** With vended credentials, the FileIO of every table the export writes takes its S3 credentials from a credential source in `lakehouse-catalog`. The source starts with the credentials of the create, stage-create, or load answer, and loads new ones through the table's Iceberg REST `loadCredentials` endpoint on the CONNECTION's catalog address when they expire within five minutes. The pre-read check refreshes the staged table's credentials once. On a catalog that does not advertise the endpoint, a writer that outlives its credentials fails with an error that states their expiry.
 - **Rationale:**
-  - Lakekeeper vends credentials for 3,599 s, scoped to the table location. A staged table cannot be reloaded, so under `SINGLE_COMMIT` the commit's manifests also use the vended credentials. Lakekeeper answers `loadCredentials` for a staged table with HTTP 200 and the staged location as the prefix (measured).
-  - The commit loop rebuilds the table on reloaded metadata and keeps the writer Table's FileIO (task 1.3), so the refresh lives inside that FileIO. The pinned iceberg-rust rev offers the hook: `OpenDalStorageFactory::S3 { customized_credential_load }` replaces the static key provider of every operator the FileIO builds. iceberg-rust reads neither `client.refresh-credentials-endpoint` nor `s3.session-token-expires-at-ms` itself.
-  - The five-minute margin is the prefetch time of Iceberg Java's `VendedCredentialsProvider`. Lakekeeper serves a cached credential for half its lifetime, so a refresh five minutes before expiry receives new credentials for every lifetime of at least ten minutes, the 900 s minimum of AWS STS included.
-  - The Iceberg REST spec defines `GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials` and the `/v1/config` `endpoints` list: "If a server does not send the `endpoints` field, a default set of endpoints is assumed", and that set omits `loadCredentials`. Lakekeeper lists it. The source calls the spec path on the CONNECTION's catalog address, so the catalog token reaches no other address, and the one catalog HTTP client, the proxy settings, and the export's `ALLOW_HTTP` gate apply.
-  - The pre-read refresh fails an export whose refresh would fail, before any row is read. It is also the refresh that an E2E can observe. The local SeaweedFS STS refuses a lifetime below 900 s (measured: "DurationSeconds must be between 900 and 43200 seconds"), and no E2E writer writes for the 600 s after which a 900 s credential is refreshed.
+  - A writer can outlive Lakekeeper's 3,599 s credentials. Under `SINGLE_COMMIT` the staged table cannot be reloaded, and Lakekeeper answers `loadCredentials` for a staged table (plan.md § Context).
+  - The commit loop keeps the writer table's FileIO (task 1.3), so the refresh lives in that FileIO, through iceberg-rust's `customized_credential_load` hook.
+  - Five minutes is the prefetch time of Iceberg Java's `VendedCredentialsProvider`. Lakekeeper serves a cached credential for half its lifetime, so the refresh gets new credentials for every lifetime of ten minutes or more, the 900 s STS minimum included.
+  - The Iceberg REST spec defines `loadCredentials` and the `/v1/config` `endpoints` list: "If a server does not send the `endpoints` field, a default set of endpoints is assumed", and that set omits `loadCredentials`. The spec path on the CONNECTION's catalog address keeps the catalog token on that address, under the one catalog HTTP client, the proxy settings, and `ALLOW_HTTP`.
+  - The pre-read refresh fails an export whose refresh would fail before any row is read, and it is the refresh an E2E can observe, because no E2E writer outlives a 900 s credential.
 - **Alternatives:**
-  - No refresh, with a documented one-hour limit: rejected. A `SINGLE_COMMIT` export runs one writer for the whole source, so a large export reaches the limit.
-  - Refresh after an expired-token failure instead of before expiry: rejected. The failed request is a part upload or a manifest write inside iceberg-rust, which fails the writer, so the export cannot retry it with new credentials. SeaweedFS also reports expired credentials as `InvalidAccessKeyId` (measured), which does not identify an expiry.
-  - Call the URL in `client.refresh-credentials-endpoint`: rejected, because the catalog would choose where the catalog token goes.
-  - Refresh by reloading the table: rejected, because a staged table cannot be loaded. Re-staging it is no substitute: Lakekeeper refuses a stage-create at a location that holds files (HTTP 400, measured).
+  - No refresh, with a documented one-hour limit: a `SINGLE_COMMIT` export runs one writer for the whole source.
+  - Refresh after an expired-token failure: the failed request inside iceberg-rust fails the writer, and SeaweedFS reports expiry as `InvalidAccessKeyId`.
+  - Call `client.refresh-credentials-endpoint`: the catalog would choose where the catalog token goes.
+  - Reload the table: a staged table cannot be loaded, and re-staging at a location that holds files answers HTTP 400.
 - **Consequences:**
   - Each refresh resolves a fresh catalog session, because the writer's OAuth2 token may have expired. An expired static bearer token fails the refresh.
   - A catalog that advertises `loadCredentials` but refuses it for a staged table fails every vended export before any row is read.
-  - Under `SINGLE_COMMIT` the refresh names the staged table. When a racing statement stages the same name at another location, the answer no longer covers the writer's location, and the refresh fails naming it.
-  - Credentials without `s3.session-token-expires-at-ms` have no known expiry, so a writer never refreshes them.
-  - Static storage keys keep `StorageBackend::file_io()` and are never refreshed.
+  - Under `SINGLE_COMMIT`, a racing statement that stages the same name at another location makes the refresh fail, naming the location.
+  - Credentials without `s3.session-token-expires-at-ms` are never refreshed. Static storage keys keep `StorageBackend::file_io()`.
 - **Promotes to ADR:** no
 
 ## Review Findings
 
-### [1] [plan-review] Decision [1] replaces interview answer 2, and the requester accepted it
+### [1] [plan-review] Decision [1] replaces interview answer 2
 
-- **Finding:** Decision [1] replaced interview answer 2 and added two user-visible effects: a missing namespace is created before any row is read, and every export needs a catalog that accepts `stage-create: true`.
-- **Direction change:** The requester accepted decision [1] as written. Decision [1] Consequences, plan.md § Impact, the `export/export-iceberg-table` delta (a Background line and the scenario "A catalog that refuses staged table creation fails the export before any data is read"), and docs task 5.1 now state the stage-create requirement, the namespace side effect, and the error a refusing catalog produces.
+- **Finding:** Decision [1] replaces interview answer 2 and adds two user-visible effects: a missing namespace is created before any row is read, and every export needs a catalog that accepts `stage-create: true`.
+- **Direction change:** The requester accepted decision [1]. plan.md § Impact, the `export/export-iceberg-table` delta, and task 4.1 state both effects.
 - **Promotes to ADR:** no
 
-### [2] [plan-review] The export's ALLOW_HTTP gates every plain-HTTP request in the export's own code
+### [2] [spike] A storage fault, not a source error, proves that a failed SINGLE_COMMIT export leaves no table
 
-- **Finding:** No task refused an `http://` catalog address or static storage endpoint, and a gate in the shared `CatalogSession::resolve` would also change virtual schemas.
-- **Direction change:** Decision [4] now gives the export option a wider gate than the virtual schema property. Only the export's path checks it (tasks 1.2 and 3.5).
+- **Finding:** Exasol evaluates the source before the writer reads its first row, so a failing source never reaches the writer.
+- **Direction change:** The local E2E injects a proxy storage fault after the writer wrote its data files and before its commit. Rejected: `KILL STATEMENT` once a data file appears, because a data file appears only when the writer closes it, just before the commit.
 - **Promotes to ADR:** no
 
-### [3] [spike] Exasol truncates TIMESTAMP(9) values before the export reads them
-
-- **Finding:** The in-UDF spike measured that a `TIMESTAMP(9)` value reaches the UDF truncated to microseconds, without an error.
-- **Direction change:** Decision [3] keeps the refusal and now rests on this measurement. A version 3 `timestamp_ns` table is no longer a lossless alternative. Task 5.1 documents the reason.
-- **Promotes to ADR:** no
-
-### [4] [spike] Exasol refuses most unsupported column types before the writer runs
-
-- **Finding:** `GEOMETRY`, `HASHTYPE`, `INTERVAL`, and `TIMESTAMP WITH LOCAL TIME ZONE` columns fail with Exasol's own error before any writer code runs, and for `GEOMETRY` and `INTERVAL YEAR TO MONTH` the error names no column. The plan stated that the writer refused them, naming the column.
-- **Direction change:** The unsupported-type scenario is split. Exasol's errors are the expected outcome for those types, which issue #566 accepts. The writer's own refusal, which names the column and its type, covers `TIMESTAMP(7)` to `TIMESTAMP(9)` and any type outside the allowlist. Task 2.1 classifies a column by `typ` and `type_name` together, using the measured spellings, instead of by `type_name` alone.
-- **Promotes to ADR:** no
-
-### [5] [spike] A storage fault after the data files are written proves that a failed SINGLE_COMMIT export leaves no table
-
-- **Finding:** Exasol evaluates the source before the writer reads its first row. A source that fails at row 500 therefore never reaches the writer, and the planned test could not catch a writer that creates the table before it commits.
-- **Direction change:** `export_failed_single_commit_leaves_no_table` moves to the local suite. The proxy filter answers HTTP 403 to the writes under the table's `metadata/` path, so the writer fails after it wrote its data files and before its commit, and the test asserts that a data file of the export exists. Rejected: `KILL STATEMENT` once a data file appears, because a data file appears in storage only when the writer closes it, which for a source below the 128 MiB target file size happens just before the commit. A separate scenario keeps the source-error case and states that it does not test the writer.
-- **Promotes to ADR:** no
-
-### [6] [refresh] Vended credentials are refreshed in this plan
+### [3] [refresh] Vended credentials are refreshed in this plan
 
 - **Finding:** The requester asked for vended-credential refresh in this plan, not in a follow-up.
-- **Direction change:** Decision [6] now refreshes vended credentials through the catalog's `loadCredentials` endpoint inside the export table's FileIO, with one refresh in the pre-read check. New task 1.7 builds the credential source, and tasks 1.2 to 1.6, 3.6, 3.7, 4.2, and 5.1 use or document it. The `export/export-iceberg-table` delta gains a Background bullet and three scenarios. The one-hour limit is gone from plan.md § Impact and task 5.1.
+- **Direction change:** Decision [6] and tasks 1.7, 3.2, and 4.1.
 - **Promotes to ADR:** no

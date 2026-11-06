@@ -9,6 +9,7 @@ A user exports an Exasol table, a query over virtual schema tables, or a query t
 
 * Statement, options, and writer count: export/export-options § Background.
 * "Read through a virtual schema" means a `SELECT` over a virtual schema that the same CONNECTION backs and that lists the new table.
+* A source with no rows creates no table and has its column types checked by no writer, so a zero-row source with a `TIMESTAMP(7)` to `TIMESTAMP(9)` column also succeeds with a row count of 0.
 <!-- /DELTA:CHANGED -->
 
 ## Scenarios
