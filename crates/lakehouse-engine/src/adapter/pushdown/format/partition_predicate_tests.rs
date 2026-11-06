@@ -1,7 +1,7 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    SALES, and, between, binary_lit, bool_lit, compare, date_lit, in_list, is_not_null, is_null,
-    like, lit, not, null_lit, num_lit, or, predicate_equal, sales_col, str_lit, string_equal,
+    and, between, binary_lit, bool_lit, compare, date_lit, in_list, is_not_null, is_null, like,
+    lit, not, null_lit, num_lit, or, predicate_equal, sales_col, sales_equal, scalar_fn, str_lit,
     timestamp_lit,
 };
 use arrow::datatypes::TimeUnit;
@@ -51,11 +51,7 @@ fn region_files() -> [BTreeMap<String, Option<String>>; 4] {
 fn partition_nodes_evaluate_under_three_valued_logic() {
     let files = year_files();
     let cases: Vec<(&str, Json, [bool; 3])> = vec![
-        (
-            "=",
-            string_equal(SALES, "YEAR", "2026"),
-            [true, false, false],
-        ),
+        ("=", sales_equal("YEAR", "2026"), [true, false, false]),
         (
             "= with the column on the right",
             predicate_equal(str_lit("2026"), sales_col("YEAR")),
@@ -79,22 +75,19 @@ fn partition_nodes_evaluate_under_three_valued_logic() {
         ),
         (
             "NOT over a NULL comparison stays NULL",
-            not(string_equal(SALES, "YEAR", "2026")),
+            not(sales_equal("YEAR", "2026")),
             [false, true, false],
         ),
         (
             "OR",
-            or([
-                string_equal(SALES, "YEAR", "2026"),
-                is_null(sales_col("YEAR")),
-            ]),
+            or([sales_equal("YEAR", "2026"), is_null(sales_col("YEAR"))]),
             [true, false, true],
         ),
         (
             "AND",
             and([
                 is_not_null(sales_col("YEAR")),
-                not(string_equal(SALES, "YEAR", "2025")),
+                not(sales_equal("YEAR", "2025")),
             ]),
             [true, false, false],
         ),
@@ -186,41 +179,32 @@ fn a_non_partition_node_never_prunes() {
         ("NOT over it", not(on_a_data_column()), [true, true, true]),
         (
             "OR with a partition node",
-            or([string_equal(SALES, "YEAR", "2025"), on_a_data_column()]),
+            or([sales_equal("YEAR", "2025"), on_a_data_column()]),
             [true, true, true],
         ),
         (
             "AND with a partition node prunes by the partition node alone",
-            and([string_equal(SALES, "YEAR", "2025"), on_a_data_column()]),
+            and([sales_equal("YEAR", "2025"), on_a_data_column()]),
             [false, true, false],
         ),
         (
             "NOT over an AND it cannot decide",
-            not(and([
-                string_equal(SALES, "YEAR", "2026"),
-                on_a_data_column(),
-            ])),
+            not(and([sales_equal("YEAR", "2026"), on_a_data_column()])),
             [true, true, true],
         ),
         (
             "NOT over an OR prunes only where the partition node decides the OR",
-            not(or([
-                string_equal(SALES, "YEAR", "2025"),
-                on_a_data_column(),
-            ])),
+            not(or([sales_equal("YEAR", "2025"), on_a_data_column()])),
             [true, false, false],
         ),
         (
             "a column that names no partition key",
-            string_equal(SALES, "NAME", "2025"),
+            sales_equal("NAME", "2025"),
             [true, true, true],
         ),
         (
             "a function over the partition column",
-            predicate_equal(
-                json!({"type": "function_scalar", "name": "UPPER", "arguments": [sales_col("YEAR")]}),
-                str_lit("2025"),
-            ),
+            predicate_equal(scalar_fn("UPPER", [sales_col("YEAR")]), str_lit("2025")),
             [true, true, true],
         ),
         (
@@ -256,7 +240,7 @@ fn a_non_partition_node_never_prunes() {
         ),
         (
             "an empty string, which Exasol reads as NULL",
-            string_equal(SALES, "YEAR", ""),
+            sales_equal("YEAR", ""),
             [true, true, true],
         ),
         (
@@ -306,7 +290,7 @@ fn a_filter_column_resolves_to_a_partition_key_by_its_uppercase_fold() {
     for key in ["year", "Year", "YEAR"] {
         let files = [file_with(key, Some("2026")), file_with(key, Some("2025"))];
         assert_eq!(
-            kept(&string_equal(SALES, "YEAR", "2026"), &files),
+            kept(&sales_equal("YEAR", "2026"), &files),
             [true, false],
             "the Exasol column YEAR resolves the key '{key}'"
         );
@@ -317,7 +301,7 @@ fn a_filter_column_resolves_to_a_partition_key_by_its_uppercase_fold() {
         file_with("größe", Some("s")),
     ];
     assert_eq!(
-        kept(&string_equal(SALES, "GRÖSSE", "xl"), &non_ascii),
+        kept(&sales_equal("GRÖSSE", "xl"), &non_ascii),
         [true, false],
         "the fold is Unicode uppercasing, the one the declaration uses"
     );
@@ -406,7 +390,7 @@ fn partition_values_compare_under_their_declared_type() {
         ),
         (
             "region = 'eu' in codepoint order",
-            string_equal(SALES, "REGION", "eu"),
+            sales_equal("REGION", "eu"),
             two_files("region", "eu", "us"),
         ),
         (
@@ -441,7 +425,7 @@ fn an_undecidable_comparison_keeps_the_file() {
     let cases: Vec<(&str, Json, [FileValues; 2])> = vec![
         (
             "a string literal on an integer column",
-            string_equal(SALES, "YEAR", "2024"),
+            sales_equal("YEAR", "2024"),
             two_files("year", "2024", "2025"),
         ),
         (
@@ -498,12 +482,12 @@ fn an_undecidable_comparison_keeps_the_file() {
         ),
         (
             "a string literal on a boolean column",
-            string_equal(SALES, "ACTIVE", "true"),
+            sales_equal("ACTIVE", "true"),
             two_files("active", "true", "false"),
         ),
         (
             "a string literal on a column of another declared type",
-            string_equal(SALES, "PAYLOAD", "x"),
+            sales_equal("PAYLOAD", "x"),
             two_files("payload", "x", "y"),
         ),
     ];
@@ -576,7 +560,7 @@ fn a_binary_literal_compares_a_logged_value_by_its_utf8_bytes() {
         [true, false, false, false]
     );
     assert_eq!(
-        kept_under(&string_equal(SALES, "PART", "4142"), &declared, &files),
+        kept_under(&sales_equal("PART", "4142"), &declared, &files),
         [true; 4],
         "only the retyped literal names bytes"
     );

@@ -1,7 +1,7 @@
 use crate::adapter::pushdown::test_support::{
-    SALES, alias_col, and, between, binary_lit, column_types_under, compare, declared_column_types,
+    alias_col, and, between, binary_lit, column_types_under, compare, declared_column_types,
     fixed_binary_lit, in_list, not, nullable_field as field, or, predicate_equal, sales_col,
-    str_lit, string_equal,
+    sales_equal, str_lit,
 };
 use vs_expression::render_df_filter_safe;
 
@@ -34,7 +34,7 @@ fn rendered(filter: &Json) -> String {
 #[test]
 fn a_lowercase_hex_comparison_compares_the_raw_bytes() {
     assert_eq!(
-        rendered(&string_equal(SALES, "B", "0a1b")),
+        rendered(&sales_equal("B", "0a1b")),
         "(\"_LH_BYTES_B\" = X'0a1b')"
     );
     assert_eq!(
@@ -81,7 +81,7 @@ fn in_and_between_compare_the_raw_bytes_when_every_literal_is_hex() {
 #[test]
 fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
     for literal in ["0A1B", "0a1", "", "zz"] {
-        let filter = string_equal(SALES, "B", literal);
+        let filter = sales_equal("B", literal);
         assert_eq!(
             compare_binary_bytes(
                 filter.clone(),
@@ -91,7 +91,7 @@ fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
             "{literal}"
         );
     }
-    let wrong_width = string_equal(SALES, "U", "0a");
+    let wrong_width = sales_equal("U", "0a");
     assert_eq!(
         compare_binary_bytes(
             wrong_width.clone(),
@@ -99,7 +99,7 @@ fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
         ),
         wrong_width
     );
-    let string_column = string_equal(SALES, "S", "0a");
+    let string_column = sales_equal("S", "0a");
     assert_eq!(
         compare_binary_bytes(
             string_column.clone(),
@@ -111,7 +111,7 @@ fn a_literal_that_names_no_byte_string_compares_the_hex_text() {
 
 #[test]
 fn only_a_comparison_reached_through_and_or_is_rewritten() {
-    let equal = string_equal(SALES, "B", "0a");
+    let equal = sales_equal("B", "0a");
     let negated = not(equal.clone());
     assert_eq!(
         compare_binary_bytes(
@@ -121,7 +121,7 @@ fn only_a_comparison_reached_through_and_or_is_rewritten() {
         negated,
         "NOT turns the empty value's false into true, where Exasol keeps NULL"
     );
-    let junction = or([and([equal, negated]), string_equal(SALES, "S", "x")]);
+    let junction = or([and([equal, negated]), sales_equal("S", "x")]);
     assert_eq!(
         rendered(&junction),
         "(((\"_LH_BYTES_B\" = X'0a') AND (NOT (\"B\" = '0a'))) OR (\"S\" = 'x'))"
@@ -131,10 +131,7 @@ fn only_a_comparison_reached_through_and_or_is_rewritten() {
 /// Scenario: BINARY_AS_STRING reads a variable-length binary column as UTF-8 text
 #[test]
 fn binary_as_string_keeps_a_variable_length_filter_on_the_text() {
-    let filter = and([
-        string_equal(SALES, "B", "00ff"),
-        string_equal(SALES, "U", "00ff"),
-    ]);
+    let filter = and([sales_equal("B", "00ff"), sales_equal("U", "00ff")]);
 
     let rewritten = compare_binary_bytes(
         filter.clone(),
@@ -155,8 +152,8 @@ fn binary_as_string_keeps_a_variable_length_filter_on_the_text() {
 #[test]
 fn pruning_retypes_the_hex_literals_of_a_binary_column_at_any_depth() {
     let filter = not(or([
-        string_equal(SALES, "B", "0a1b"),
-        string_equal(SALES, "U", "0a0b"),
+        sales_equal("B", "0a1b"),
+        sales_equal("U", "0a0b"),
         between(sales_col("B"), str_lit("00"), str_lit("ff")),
         in_list(sales_col("B"), [str_lit("0a"), str_lit("0A")]),
     ]));
@@ -178,10 +175,10 @@ fn pruning_retypes_the_hex_literals_of_a_binary_column_at_any_depth() {
 #[test]
 fn pruning_leaves_text_columns_and_mismatched_literals_alone() {
     for (filter, under_binary_as_string) in [
-        (string_equal(SALES, "S", "0a"), false),
-        (string_equal(SALES, "U", "0a"), false),
-        (string_equal(SALES, "B", "0a1"), false),
-        (string_equal(SALES, "B", "0a"), true),
+        (sales_equal("S", "0a"), false),
+        (sales_equal("U", "0a"), false),
+        (sales_equal("B", "0a1"), false),
+        (sales_equal("B", "0a"), true),
     ] {
         assert_eq!(
             with_binary_literals(
@@ -193,7 +190,7 @@ fn pruning_leaves_text_columns_and_mismatched_literals_alone() {
     }
     assert_eq!(
         with_binary_literals(
-            string_equal(SALES, "U", "0a0b"),
+            sales_equal("U", "0a0b"),
             &column_types_under(&HEX_COLUMNS, &binary_fields(), true)
         ),
         predicate_equal(sales_col("U"), fixed_binary_lit("0a0b", 2)),

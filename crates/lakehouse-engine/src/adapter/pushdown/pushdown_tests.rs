@@ -170,11 +170,7 @@ fn where_filter_decimal_stringification_rewritten_to_trim() {
     let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
     let filter_json = compare(
         "predicate_greater",
-        serde_json::json!({
-            "type": "function_scalar",
-            "name": "LENGTH",
-            "arguments": [col("c_decimal_a")]
-        }),
+        scalar_fn("LENGTH", [col("c_decimal_a")]),
         num_lit(5),
     );
 
@@ -219,14 +215,7 @@ fn filter_decimal_comparison_not_rewritten() {
 #[test]
 fn where_filter_string_fn_under_comparison_predicate_coerced() {
     let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
-    let filter_json = predicate_equal(
-        serde_json::json!({
-            "type": "function_scalar",
-            "name": "UPPER",
-            "arguments": [col("c_decimal_a")]
-        }),
-        str_lit("X"),
-    );
+    let filter_json = predicate_equal(scalar_fn("UPPER", [col("c_decimal_a")]), str_lit("X"));
 
     let rendered = Some(&filter_json)
         .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
@@ -243,14 +232,7 @@ fn where_filter_string_fn_under_comparison_predicate_coerced() {
 #[test]
 fn where_filter_string_fn_over_double_declines() {
     let col_types = vec![("C_DOUBLE_A".to_string(), ExasolType::DoublePrecision)];
-    let filter_json = predicate_equal(
-        serde_json::json!({
-            "type": "function_scalar",
-            "name": "UPPER",
-            "arguments": [col("c_double_a")]
-        }),
-        str_lit("X"),
-    );
+    let filter_json = predicate_equal(scalar_fn("UPPER", [col("c_double_a")]), str_lit("X"));
 
     let rendered = Some(&filter_json)
         .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
@@ -266,14 +248,7 @@ fn where_filter_string_fn_over_double_declines() {
 #[test]
 fn where_filter_upper_decimal_inside_like_subject_coerced() {
     let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
-    let filter_json = like(
-        serde_json::json!({
-            "type": "function_scalar",
-            "name": "UPPER",
-            "arguments": [col("c_decimal_a")]
-        }),
-        "1%",
-    );
+    let filter_json = like(scalar_fn("UPPER", [col("c_decimal_a")]), "1%");
 
     let rendered = Some(&filter_json)
         .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
@@ -292,17 +267,7 @@ fn where_filter_upper_decimal_inside_like_subject_coerced() {
 fn where_filter_like_decimal_inside_case_declines_whole_filter() {
     let col_types = vec![("AMOUNT".to_string(), ExasolType::decimal(9, 2))];
     let filter_json = predicate_equal(
-        serde_json::json!({
-            "type": "function_scalar_case",
-            "name": "CASE",
-            "arguments": [
-                like(col("amount"), "9%")
-            ],
-            "results": [
-                num_lit(1),
-                num_lit(0)
-            ]
-        }),
+        case_when([like(col("amount"), "9%")], [num_lit(1), num_lit(0)]),
         num_lit(1),
     );
 
@@ -971,14 +936,10 @@ fn declined_filter_with_a_real_select_list_keeps_the_narrowing() {
 #[test]
 fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
     let sql = dispatch_sql_for_body(guard_events().item(
-        serde_json::json!({
-            "type": "function_scalar",
-            "name": "ROUND",
-            "arguments": [
-                agg_item("SUM", Some("AMOUNT"), false),
-                num_lit(2),
-            ],
-        }),
+        scalar_fn(
+            "ROUND",
+            [agg_item("SUM", Some("AMOUNT"), false), num_lit(2)],
+        ),
         ExasolType::decimal(36, 2),
     ));
 
@@ -1019,19 +980,10 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
     // is rewritten, so the equality assertion distinguishes original from rewritten.
     let filter = and([
         compare("predicate_greater", col("id"), num_lit(5)),
+        declined_second_predicate(col("ts")),
         compare(
             "predicate_greater",
-            serde_json::json!({"type": "function_scalar", "name": "SECOND", "arguments": [
-                col("ts"),
-                num_lit(3),
-            ]}),
-            num_lit(1),
-        ),
-        compare(
-            "predicate_greater",
-            serde_json::json!({"type": "function_scalar", "name": "LENGTH", "arguments": [
-                col("amount"),
-            ]}),
+            scalar_fn("LENGTH", [col("amount")]),
             num_lit(5),
         ),
     ]);
@@ -1381,11 +1333,7 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
     });
     let renderable_expression = serde_json::json!({
         "type": "order_by_element",
-        "expression": {
-            "type": "function_scalar",
-            "name": "ABS",
-            "arguments": [table_col("EVENTS", "AMOUNT")]
-        },
+        "expression": scalar_fn("ABS", [table_col("EVENTS", "AMOUNT")]),
         "isAscending": false,
         "nullsLast": true
     });
@@ -1855,7 +1803,9 @@ async fn a_count_star_aggregate_is_admitted_over_a_table_with_a_refused_column()
     let storage = refused_column_table_storage().await;
 
     delta_pushdown(
-        &refused_column_request(refused_column_table().item(serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false}), ExasolType::decimal(18, 0))),
+        &refused_column_request(
+            refused_column_table().item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0)),
+        ),
         &catalog.uri,
         storage,
         "cat.sch.orders",
@@ -1875,12 +1825,7 @@ async fn an_aggregate_over_a_refused_column_is_refused() {
 
     let error = delta_pushdown(
         &refused_column_request(refused_column_table().item(
-            serde_json::json!({
-                "type": "function_aggregate",
-                "name": "MAX",
-                "arguments": [column_item("VARIANT_COL")],
-                "distinct": false,
-            }),
+            agg_item_expr("MAX", column_item("VARIANT_COL"), false),
             ExasolType::WIDEST_VARCHAR,
         )),
         &catalog.uri,
@@ -1900,7 +1845,11 @@ async fn a_count_star_filtered_on_a_refused_column_is_refused() {
     let storage = refused_column_table_storage().await;
 
     let error = delta_pushdown(
-        &refused_column_request(refused_column_table().item(serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false}), ExasolType::decimal(18, 0)).filter(is_not_null(column_item("VARIANT_COL")))),
+        &refused_column_request(
+            refused_column_table()
+                .item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+                .filter(is_not_null(column_item("VARIANT_COL"))),
+        ),
         &catalog.uri,
         storage,
         "cat.sch.orders",

@@ -1,6 +1,6 @@
 use crate::adapter::pushdown::test_support::{
-    PushdownRequestBuilder, and, is_not_null, predicate_equal, pushdown_request, str_lit,
-    table_col, unread_refused, user_message,
+    PushdownRequestBuilder, agg_item_expr, and, is_not_null, predicate_equal, pushdown_request,
+    scalar_fn, str_lit, table_col, unread_refused, user_message,
 };
 
 use super::*;
@@ -90,14 +90,13 @@ fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
         .filter(and([
             is_not_null(column_node("INT_COL")),
             predicate_equal(
-                serde_json::json!({
-                    "type": "function_scalar",
-                    "name": "UPPER",
-                    "arguments": [{
+                scalar_fn(
+                    "UPPER",
+                    [serde_json::json!({
                         "type": "function_scalar_case",
                         "arguments": [column_node("SHAPE_COL")],
-                    }],
-                }),
+                    })],
+                ),
                 str_lit("x"),
             ),
         ]))
@@ -166,12 +165,7 @@ fn a_widened_projection_is_still_refused_when_the_request_itself_names_a_refused
     let request = stats_all_types()
         .field("type", serde_json::json!("select"))
         .item(
-            serde_json::json!({
-                "type": "function_aggregate",
-                "name": "MAX",
-                "arguments": [column_node("SHAPE_COL")],
-                "distinct": false,
-            }),
+            agg_item_expr("MAX", column_node("SHAPE_COL"), false),
             ExasolType::WIDEST_VARCHAR,
         )
         .build()

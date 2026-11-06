@@ -143,8 +143,7 @@ fn broadcast_join_declines_widened_projection() {
     request = selecting(
         request,
         &[(
-            serde_json::json!({"type": "function_scalar", "name": "UPPER", "arguments": [
-            table_col("CUSTOMER", "C_NAME")]}),
+            scalar_fn("UPPER", [table_col("CUSTOMER", "C_NAME")]),
             ExasolType::varchar(100),
         )],
     );
@@ -196,18 +195,8 @@ fn broadcast_join_declines_widened_projection() {
 #[test]
 fn broadcast_declines_on_unrenderable_filter_stays_eligible_when_absent() {
     let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["filter"] = compare(
-        "predicate_greater",
-        serde_json::json!({
-            "type": "function_scalar",
-            "name": "SECOND",
-            "arguments": [
-                table_col("ORDERS", "O_ORDERDATE"),
-                num_lit(3)
-            ]
-        }),
-        num_lit(1),
-    );
+    request["pushdownRequest"]["filter"] =
+        declined_second_predicate(table_col("ORDERS", "O_ORDERDATE"));
     let detected = detected_join(&request);
 
     assert!(
@@ -284,15 +273,10 @@ fn broadcast_declines_instr_with_start_position_argument() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = compare(
         "predicate_greater",
-        serde_json::json!({
-            "type": "function_scalar",
-            "name": "INSTR",
-            "arguments": [
-                table_col("CUSTOMER", "C_NAME"),
-                str_lit("b"),
-                num_lit(3)
-            ]
-        }),
+        scalar_fn(
+            "INSTR",
+            [table_col("CUSTOMER", "C_NAME"), str_lit("b"), num_lit(3)],
+        ),
         num_lit(0),
     );
     let detected = detected_join(&request);
@@ -811,10 +795,7 @@ fn n_scan_wrapper_qualifies_every_clause_by_leg() {
         aliased_col("FACT_ORDERS", alias, "O_CUSTKEY")
     }
     fn sum_of(alias: &str) -> Json {
-        serde_json::json!({
-            "type": "function_aggregate", "name": "SUM", "distinct": false,
-            "arguments": [custkey(alias)]
-        })
+        agg_item_expr("SUM", custkey(alias), false)
     }
     let mut request = self_join_request(&[Some("A"), Some("B")]);
     request["pushdownRequest"]["aggregationType"] = serde_json::json!("group_by");
@@ -1156,14 +1137,7 @@ fn n_scan_leg_residual_partition_is_total_and_disjoint_with_type_screen() {
         string_equal("CUSTOMER", "C_NAME", "ACME"),
         like(table_col("ORDERS", "O_ORDERDATE"), "1995%"),
         like(table_col("CUSTOMER", "C_CUSTKEY"), "1%"),
-        compare(
-            "predicate_greater",
-            serde_json::json!({"type": "function_scalar", "name": "SECOND", "arguments": [
-                table_col("ORDERS", "O_ORDERDATE"),
-                num_lit(3),
-            ]}),
-            num_lit(1),
-        ),
+        declined_second_predicate(table_col("ORDERS", "O_ORDERDATE")),
         compare(
             "predicate_greater",
             table_col("CUSTOMER", "C_CUSTKEY"),
@@ -1254,11 +1228,7 @@ fn join_decimal_stringification_renders_trimmed_at_both_join_sites() {
         ));
     let filter = compare(
         "predicate_greater",
-        serde_json::json!({
-            "type": "function_scalar",
-            "name": "LENGTH",
-            "arguments": [table_col("ORDERS", "O_TOTALPRICE")]
-        }),
+        scalar_fn("LENGTH", [table_col("ORDERS", "O_TOTALPRICE")]),
         num_lit(3),
     );
     request["pushdownRequest"]["filter"] = filter;
@@ -1293,15 +1263,10 @@ fn join_decimal_stringification_renders_trimmed_at_both_join_sites() {
 fn join_instr_beyond_two_args_declines_at_both_join_sites() {
     let filter = compare(
         "predicate_greater",
-        serde_json::json!({
-            "type": "function_scalar",
-            "name": "INSTR",
-            "arguments": [
-                table_col("CUSTOMER", "C_NAME"),
-                str_lit("b"),
-                num_lit(3)
-            ]
-        }),
+        scalar_fn(
+            "INSTR",
+            [table_col("CUSTOMER", "C_NAME"), str_lit("b"), num_lit(3)],
+        ),
         num_lit(0),
     );
     let request = n_scan_request_with_filter(filter);
@@ -1326,13 +1291,9 @@ fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
     request = selecting(
         request,
         &[
+            (agg_item("COUNT", None, false), ExasolType::decimal(18, 0)),
             (
-                serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": []}),
-                ExasolType::decimal(18, 0),
-            ),
-            (
-                serde_json::json!({"type": "function_aggregate", "name": "MIN", "arguments": [
-            table_col("ORDERS", "O_ORDERDATE")]}),
+                agg_item_expr("MIN", table_col("ORDERS", "O_ORDERDATE"), false),
                 ExasolType::Date,
             ),
         ],
@@ -1381,26 +1342,32 @@ fn single_scan_legs(table_name: &str) -> JoinLegs {
 #[test]
 fn render_expression_qualified_renders_scalar_over_aggregate() {
     let legs = seam_legs();
-    let sum_case = serde_json::json!({
-        "type": "function_aggregate", "name": "SUM", "distinct": false,
-        "arguments": [{
-            "type": "function_scalar", "name": "CASE", "arguments": [
+    let sum_case = agg_item_expr(
+        "SUM",
+        scalar_fn(
+            "CASE",
+            [
                 string_equal("LINEITEM", "L_RETURNFLAG", "R"),
                 num_lit(1),
-                num_lit(0)]}]
-    });
-    let count_star = serde_json::json!({
-        "type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false
-    });
-    let item = serde_json::json!({
-        "type": "function_scalar", "name": "ROUND", "arguments": [
-            {"type": "function_scalar", "name": "FLOAT_DIV", "arguments": [
-                {"type": "function_scalar", "name": "MULT", "arguments": [
-                    lit("literal_double", 100.0),
-                    sum_case]},
-                count_star]},
-            num_lit(2)]
-    });
+                num_lit(0),
+            ],
+        ),
+        false,
+    );
+    let count_star = agg_item("COUNT", None, false);
+    let item = scalar_fn(
+        "ROUND",
+        [
+            scalar_fn(
+                "FLOAT_DIV",
+                [
+                    scalar_fn("MULT", [lit("literal_double", 100.0), sum_case]),
+                    count_star,
+                ],
+            ),
+            num_lit(2),
+        ],
+    );
 
     let sql = render_expression_qualified(&item, &legs)
         .expect("every reference names exactly one leg")
@@ -1419,10 +1386,7 @@ fn render_expression_qualified_renders_scalar_over_aggregate() {
 fn render_expression_qualified_top_level_aggregate_byte_compatible() {
     let legs = seam_legs();
 
-    let sum = serde_json::json!({
-        "type": "function_aggregate", "name": "SUM", "distinct": false,
-        "arguments": [table_col("ORDERS", "O_TOTALPRICE")]
-    });
+    let sum = agg_item_expr("SUM", table_col("ORDERS", "O_TOTALPRICE"), false);
     assert_eq!(
         render_expression_qualified(&sum, &legs)
             .expect("every reference names exactly one leg")
@@ -1430,9 +1394,7 @@ fn render_expression_qualified_top_level_aggregate_byte_compatible() {
         Some(r#"SUM("LHS_T1"."O_TOTALPRICE")"#)
     );
 
-    let count_star = serde_json::json!({
-        "type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false
-    });
+    let count_star = agg_item("COUNT", None, false);
     assert_eq!(
         render_expression_qualified(&count_star, &legs)
             .expect("every reference names exactly one leg")
@@ -1440,10 +1402,7 @@ fn render_expression_qualified_top_level_aggregate_byte_compatible() {
         Some("COUNT(*)")
     );
 
-    let count_distinct = serde_json::json!({
-        "type": "function_aggregate", "name": "COUNT", "distinct": true,
-        "arguments": [table_col("CUSTOMER", "C_CUSTKEY")]
-    });
+    let count_distinct = agg_item_expr("COUNT", table_col("CUSTOMER", "C_CUSTKEY"), true);
     assert_eq!(
         render_expression_qualified(&count_distinct, &legs)
             .expect("every reference names exactly one leg")
@@ -1455,16 +1414,17 @@ fn render_expression_qualified_top_level_aggregate_byte_compatible() {
 #[test]
 fn qualified_count_distinct_cast_char_renders_exasol_char_target() {
     let legs = seam_legs();
-    let item = serde_json::json!({
-        "type": "function_aggregate", "name": "COUNT", "distinct": true,
-        "arguments": [cast_to(
+    let item = agg_item_expr(
+        "COUNT",
+        cast_to(
             ExasolType::Char {
                 size: 20,
                 ascii: true,
             },
             table_col("CUSTOMER", "C_VARCHAR"),
-        )]
-    });
+        ),
+        true,
+    );
     let sql = render_expression_qualified(&item, &legs)
         .expect("every reference names exactly one leg")
         .expect("COUNT(DISTINCT CAST(col AS CHAR(20))) must render for the qualified wrapper");
@@ -1557,8 +1517,7 @@ fn order_by_over_join_renders_qualified_in_unified_wrapper() {
 fn order_by_expression_renders_qualified_in_unified_wrapper() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["orderBy"] = serde_json::json!([
-        {"expression": {"type": "function_scalar", "name": "UPPER", "arguments": [
-            table_col("ORDERS", "O_ORDERDATE")]},
+        {"expression": scalar_fn("UPPER", [table_col("ORDERS", "O_ORDERDATE")]),
          "isAscending": false, "nullsLast": true},
     ]);
 
@@ -1611,8 +1570,7 @@ fn join_window_classification_covers_every_forcing_and_served_shape() {
 
     let mut ordered_by_expression = join_request(Json::Null, equi_condition());
     ordered_by_expression["pushdownRequest"]["orderBy"] = serde_json::json!([
-        {"expression": {"type": "function_scalar", "name": "UPPER", "arguments": [
-            table_col("ORDERS", "O_ORDERDATE")]},
+        {"expression": scalar_fn("UPPER", [table_col("ORDERS", "O_ORDERDATE")]),
          "isAscending": false, "nullsLast": true},
     ]);
     assert!(matches!(
@@ -1623,10 +1581,7 @@ fn join_window_classification_covers_every_forcing_and_served_shape() {
     let mut aggregate_item = join_request(Json::Null, equi_condition());
     aggregate_item = selecting(
         aggregate_item,
-        &[(
-            serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": []}),
-            ExasolType::decimal(18, 0),
-        )],
+        &[(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))],
     );
     assert!(matches!(
         classify_join_window(&pd(&aggregate_item)),
@@ -1663,10 +1618,7 @@ fn aggregate_over_join_classifies_before_the_render_that_would_error() {
     }
     request = selecting(
         request,
-        &[(
-            serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": []}),
-            ExasolType::decimal(18, 0),
-        )],
+        &[(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))],
     );
     let pushdown_req = pd(&request);
 
@@ -2312,11 +2264,10 @@ fn fallback_projection_narrows_to_referenced_columns() {
         "isAscending": true,
         "nullsLast": false,
     }]);
-    let region_flag = serde_json::json!({"type": "function_scalar", "name": "CASE", "arguments": [
-        string_equal("T", "REGION", "R"),
-        num_lit(1),
-        num_lit(0),
-    ]});
+    let region_flag = scalar_fn(
+        "CASE",
+        [string_equal("T", "REGION", "R"), num_lit(1), num_lit(0)],
+    );
     let sum_case = agg_item_expr("SUM", region_flag, false);
     let rich_req = pushdown_request("T", &[("GK", ExasolType::WIDEST_VARCHAR)])
         .group_by(vec![table_col("T", "GK")])
@@ -2400,13 +2351,11 @@ fn fallback_projection_narrows_to_referenced_columns() {
     ];
     let sg_req = pushdown_request("T", NO_COLUMNS)
         .item(
-            serde_json::json!({"type": "function_aggregate", "name": "COUNT", "distinct": true,
-             "arguments": [table_col("T", "A")]}),
+            agg_item_expr("COUNT", table_col("T", "A"), true),
             ExasolType::WIDEST_VARCHAR,
         )
         .item(
-            serde_json::json!({"type": "function_aggregate", "name": "COUNT", "distinct": true,
-             "arguments": [table_col("T", "B")]}),
+            agg_item_expr("COUNT", table_col("T", "B"), true),
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
@@ -2664,21 +2613,9 @@ fn declined_filter_wrapper_sql(
     )
 }
 
-/// DataFusion declines this on arity while Exasol renders it (live-verified).
-fn second_arity_predicate() -> Json {
-    compare(
-        "predicate_greater",
-        serde_json::json!({"type": "function_scalar", "name": "SECOND", "arguments": [
-            table_col("T", "C_TS"),
-            num_lit(3),
-        ]}),
-        num_lit(1),
-    )
-}
-
 #[test]
 fn single_table_wrapper_renders_declined_predicate_in_exasol_dialect() {
-    let declined = second_arity_predicate();
+    let declined = declined_second_predicate(table_col("T", "C_TS"));
     assert!(
         render_expression_safe(&declined).is_none()
             && render_expression_exasol_safe(&declined).is_some(),
@@ -2795,8 +2732,7 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
         .field("groupBy", serde_json::json!([table_col("T", "ID")]))
         .order_by(serde_json::json!([{
             "type": "order_by_element",
-            "expression": {"type": "function_scalar", "name": "UPPER", "arguments": [
-                table_col("T", "NAME")]},
+            "expression": scalar_fn("UPPER", [table_col("T", "NAME")]),
             "isAscending": false,
             "nullsLast": true
         }]))
@@ -2859,23 +2795,15 @@ fn offset_carrying_seam_fixtures() -> Vec<(&'static str, PushdownRequest, JoinLe
     ]);
 
     let id = table_col("EVENTS", "ID");
-    let mod_key = serde_json::json!({
-        "type": "function_scalar", "name": "MOD",
-        "arguments": [id.clone(), num_lit(4)]
-    });
+    let mod_key = scalar_fn("MOD", [id.clone(), num_lit(4)]);
     let ascending = |expr: &Json| {
         serde_json::json!({
             "type": "order_by_element", "expression": expr,
             "isAscending": true, "nullsLast": false
         })
     };
-    let count_distinct_id = serde_json::json!({
-        "type": "function_aggregate", "name": "COUNT",
-        "arguments": [id.clone()], "distinct": true
-    });
-    let count_star = serde_json::json!({
-        "type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false
-    });
+    let count_distinct_id = agg_item_expr("COUNT", id.clone(), true);
+    let count_star = agg_item("COUNT", None, false);
     let id_a = aliased_col("EVENTS", "A", "ID");
     let score_a = aliased_col("EVENTS", "A", "SCORE");
     let name_a = aliased_col("EVENTS", "A", "NAME");

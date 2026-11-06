@@ -293,8 +293,7 @@ fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
 fn empty_result_sql_widened_row_scan_uses_select_list_types() {
     let pushdown_req = pushdown_request("T", NO_COLUMNS)
         .item(
-            serde_json::json!({"type": "function_scalar", "name": "LENGTH", "arguments": [
-                table_col("T", "SCORE")]}),
+            scalar_fn("LENGTH", [table_col("T", "SCORE")]),
             ExasolType::decimal(18, 0),
         )
         .build_pushdown();

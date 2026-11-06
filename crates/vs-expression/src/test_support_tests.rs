@@ -120,6 +120,90 @@ pub fn like(expression: Json, pattern: &str) -> Json {
     )
 }
 
+pub fn scalar_fn(name: &str, arguments: impl IntoIterator<Item = Json>) -> Json {
+    node(
+        "function_scalar",
+        [("name", name.into()), ("arguments", array(arguments))],
+    )
+}
+
+/// `CAST(argument AS data_type)` with a raw `dataType` node, which may be one Exasol never sends.
+pub fn cast_json(data_type: Json, argument: Json) -> Json {
+    node(
+        "function_scalar_cast",
+        [
+            ("name", "CAST".into()),
+            ("arguments", array([argument])),
+            ("dataType", data_type),
+        ],
+    )
+}
+
+/// `EXTRACT(field FROM argument)`.
+pub fn extract(field: &str, argument: Json) -> Json {
+    node(
+        "function_scalar_extract",
+        [
+            ("name", "EXTRACT".into()),
+            ("toExtract", field.into()),
+            ("arguments", array([argument])),
+        ],
+    )
+}
+
+/// Searched `CASE WHEN conditions[i] THEN results[i] ... END`; one extra result is the ELSE.
+pub fn case_when(
+    conditions: impl IntoIterator<Item = Json>,
+    results: impl IntoIterator<Item = Json>,
+) -> Json {
+    node(
+        "function_scalar_case",
+        [
+            ("name", "CASE".into()),
+            ("arguments", array(conditions)),
+            ("results", array(results)),
+        ],
+    )
+}
+
+/// Simple `CASE basis WHEN values[i] THEN results[i] ... END`; one extra result is the ELSE.
+pub fn case_of(
+    basis: Json,
+    values: impl IntoIterator<Item = Json>,
+    results: impl IntoIterator<Item = Json>,
+) -> Json {
+    node(
+        "function_scalar_case",
+        [
+            ("name", "CASE".into()),
+            ("basis", basis),
+            ("arguments", array(values)),
+            ("results", array(results)),
+        ],
+    )
+}
+
+/// An aggregate over `column`, or over no argument (`COUNT(*)`) when `column` is `None`.
+pub fn agg_item(name: &str, column: Option<&str>, distinct: bool) -> Json {
+    aggregate(name, column.map(col), distinct)
+}
+
+/// An aggregate over one argument expression.
+pub fn agg_item_expr(name: &str, argument: Json, distinct: bool) -> Json {
+    aggregate(name, [argument], distinct)
+}
+
+fn aggregate(name: &str, arguments: impl IntoIterator<Item = Json>, distinct: bool) -> Json {
+    node(
+        "function_aggregate",
+        [
+            ("name", name.into()),
+            ("arguments", array(arguments)),
+            ("distinct", distinct.into()),
+        ],
+    )
+}
+
 /// Moves `fields` into a node of type `kind`. `json!` would clone every child it is handed,
 /// which nested builders repeat at each level.
 fn node<const N: usize>(kind: &str, fields: [(&str, Json); N]) -> Json {

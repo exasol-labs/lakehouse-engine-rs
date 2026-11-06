@@ -1,6 +1,6 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    aliased_col, col, not, num_lit, predicate_equal, table_col,
+    aliased_col, col, not, num_lit, predicate_equal, scalar_fn, table_col,
 };
 
 impl super::JoinLegs {
@@ -136,11 +136,7 @@ fn qualify_overwrites_the_request_alias_and_leaves_the_input_untouched() {
 #[test]
 fn qualify_reaches_columns_nested_in_arrays_and_function_nodes() {
     let legs = self_join_legs();
-    let expr = serde_json::json!({
-        "type": "function_scalar",
-        "name": "UPPER",
-        "arguments": [aliased_col("FACT_ORDERS", "B", "O_COMMENT")],
-    });
+    let expr = scalar_fn("UPPER", [aliased_col("FACT_ORDERS", "B", "O_COMMENT")]);
 
     let qualified = legs.qualify(&expr).expect("the nested occurrence resolves");
 

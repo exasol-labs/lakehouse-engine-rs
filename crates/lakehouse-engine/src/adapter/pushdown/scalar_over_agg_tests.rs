@@ -1,21 +1,18 @@
 use super::*;
-use crate::adapter::pushdown::test_support::{EXASOL_TYPE_SPELLINGS, col, num_lit};
+use crate::adapter::pushdown::test_support::{
+    EXASOL_TYPE_SPELLINGS, agg_item, col, num_lit, scalar_fn,
+};
 
 fn agg(name: &str, column: &str, distinct: bool) -> Json {
-    serde_json::json!({
-        "type": "function_aggregate", "name": name, "distinct": distinct,
-        "arguments": [col(column)]
-    })
+    agg_item(name, Some(column), distinct)
 }
 
 fn count_star() -> Json {
-    serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": []})
+    agg_item("COUNT", None, false)
 }
 
 fn binary(name: &str, left: Json, right: Json) -> Json {
-    serde_json::json!({
-        "type": "function_scalar", "name": name, "arguments": [left, right]
-    })
+    scalar_fn(name, [left, right])
 }
 
 fn sum_over_count() -> Json {
@@ -23,10 +20,7 @@ fn sum_over_count() -> Json {
 }
 
 fn round_of(inner: Json, digits: i64) -> Json {
-    serde_json::json!({
-        "type": "function_scalar", "name": "ROUND",
-        "arguments": [inner, num_lit(digits)]
-    })
+    scalar_fn("ROUND", [inner, num_lit(digits)])
 }
 
 fn plan_of(node: &Json) -> AggregatePlan {

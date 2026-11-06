@@ -162,11 +162,7 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
     coerce_request = selecting(
         coerce_request,
         &[(
-            serde_json::json!({
-                "type": "function_scalar",
-                "name": "UPPER",
-                "arguments": [table_col("CUSTOMER", "C_CUSTKEY")]
-            }),
+            scalar_fn("UPPER", [table_col("CUSTOMER", "C_CUSTKEY")]),
             ExasolType::WIDEST_VARCHAR,
         )],
     );
@@ -192,15 +188,10 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
     decline_request = selecting(
         decline_request,
         &[(
-            serde_json::json!({
-                "type": "function_scalar",
-                "name": "INSTR",
-                "arguments": [
-                    table_col("CUSTOMER", "C_NAME"),
-                    str_lit("b"),
-                    num_lit(3)
-                ]
-            }),
+            scalar_fn(
+                "INSTR",
+                [table_col("CUSTOMER", "C_NAME"), str_lit("b"), num_lit(3)],
+            ),
             ExasolType::decimal(18, 0),
         )],
     );
@@ -442,26 +433,10 @@ fn orders_local_rendering_conjunct() -> Json {
     )
 }
 
-/// DataFusion refuses a two-argument `SECOND` while Exasol renders it.
-fn orders_local_declined_conjunct() -> Json {
-    compare(
-        "predicate_greater",
-        serde_json::json!({
-            "type": "function_scalar",
-            "name": "SECOND",
-            "arguments": [
-                table_col("ORDERS", "O_ORDERDATE"),
-                num_lit(3)
-            ]
-        }),
-        num_lit(1),
-    )
-}
-
 fn orders_local_rendering_and_declined_filter() -> Json {
     and([
         orders_local_rendering_conjunct(),
-        orders_local_declined_conjunct(),
+        declined_second_predicate(table_col("ORDERS", "O_ORDERDATE")),
     ])
 }
 
@@ -469,7 +444,7 @@ fn orders_local_rendering_and_declined_filter() -> Json {
 fn declined_side_local_conjunct_partitions_to_residual() {
     let filter = orders_local_rendering_and_declined_filter();
     let rendering = orders_local_rendering_conjunct();
-    let declined = orders_local_declined_conjunct();
+    let declined = declined_second_predicate(table_col("ORDERS", "O_ORDERDATE"));
     assert!(
         !datafusion_renderable(&declined) && datafusion_renderable(&rendering),
         "precondition: exactly one of the two conjuncts declines for DataFusion"
@@ -601,7 +576,10 @@ fn type_screened_leg_filter_pushes_whole_accepted_set_rewritten() {
 #[test]
 fn type_screened_leg_filter_declines_whole_set_when_no_conjunct_survives() {
     let decimal_like = like(table_col("ORDERS", "O_CUSTKEY"), "1%");
-    let filter = and([decimal_like.clone(), orders_local_declined_conjunct()]);
+    let filter = and([
+        decimal_like.clone(),
+        declined_second_predicate(table_col("ORDERS", "O_ORDERDATE")),
+    ]);
 
     let (leg, declined) = type_screened_leg_filter(&filter, &column_types(&orders_col_types()));
 
@@ -640,7 +618,10 @@ fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
         ),
         (
             "all declined",
-            and([decimal_like.clone(), orders_local_declined_conjunct()]),
+            and([
+                decimal_like.clone(),
+                declined_second_predicate(table_col("ORDERS", "O_ORDERDATE")),
+            ]),
         ),
         ("mixed", mixed.clone()),
     ];
@@ -682,17 +663,10 @@ fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
 #[test]
 fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
     let col_types = customer_col_types();
-    let filter = compare(
-        "predicate_greater",
-        serde_json::json!({"type": "function_scalar", "name": "SECOND", "arguments": [
-            {"type": "function_scalar_cast", "name": "CAST",
-             "dataType": {"type": "VARCHAR", "size": 40},
-             "arguments": [
-                 table_col("CUSTOMER", "C_CUSTKEY")]},
-            num_lit(3)
-        ]}),
-        num_lit(1),
-    );
+    let filter = declined_second_predicate(cast_json(
+        serde_json::json!({"type": "VARCHAR", "size": 40}),
+        table_col("CUSTOMER", "C_CUSTKEY"),
+    ));
 
     let rewritten = apply_type_rewrites(&filter, &column_types(&col_types))
         .expect("precondition: the type pipeline ACCEPTS this tree");
@@ -1057,10 +1031,10 @@ fn render_broadcast_join_replaces_native_table_alias_in_projection_with_leg_alia
     request = selecting(
         request,
         &[(
-            serde_json::json!({"type": "function_scalar", "name": "MULT", "arguments": [
-                aliased_col("ORDERS", "O", "O_CUSTKEY"),
-                num_lit(2)
-            ]}),
+            scalar_fn(
+                "MULT",
+                [aliased_col("ORDERS", "O", "O_CUSTKEY"), num_lit(2)],
+            ),
             ExasolType::WIDEST_VARCHAR,
         )],
     );

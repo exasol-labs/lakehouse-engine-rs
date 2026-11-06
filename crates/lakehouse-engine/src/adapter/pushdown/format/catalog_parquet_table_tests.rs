@@ -1,10 +1,9 @@
 use crate::adapter::pushdown::test_support::{
-    GlueEndpoint, ObjectEndpoint, SALES, SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY,
-    SIGV4_SECRET_KEY, UNREACHABLE_CATALOG, and, assert_mentions, catalog_table,
-    closed_port_storage, compare, connection_storage, date_lit, declared_notes, glue_catalog_table,
-    involved_notes, nullable_field, num_lit, object_endpoint, or, predicate_equal,
-    resolve_declared, sales_col, sample_storage, sigv4_creds, string_equal, unauthenticated_creds,
-    unity_column, user_message,
+    GlueEndpoint, ObjectEndpoint, SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, SIGV4_SECRET_KEY,
+    UNREACHABLE_CATALOG, and, assert_mentions, catalog_table, closed_port_storage, compare,
+    connection_storage, date_lit, declared_notes, glue_catalog_table, involved_notes,
+    nullable_field, num_lit, object_endpoint, or, predicate_equal, resolve_declared, sales_col,
+    sales_equal, sample_storage, sigv4_creds, unauthenticated_creds, unity_column, user_message,
 };
 use std::collections::BTreeMap;
 
@@ -277,7 +276,7 @@ async fn a_partition_predicate_prunes_under_the_declared_type() {
     let storage = served_storage(under_table(&every_file)).await.storage;
     let cases = [
         (
-            string_equal(SALES, "REGION", "eu"),
+            sales_equal("REGION", "eu"),
             vec![every_file[0], every_file[2]],
         ),
         (
@@ -286,7 +285,7 @@ async fn a_partition_predicate_prunes_under_the_declared_type() {
         ),
         (
             or([
-                string_equal(SALES, "REGION", "us"),
+                sales_equal("REGION", "us"),
                 compare("predicate_less", num_lit("10"), sales_col("AMOUNT")),
             ]),
             every_file.to_vec(),

@@ -150,9 +150,7 @@ fn lineitem_logical_schema() -> Vec<LogicalField> {
 fn parse_sort_flags_reads_direction_and_nulls_without_column_gate() {
     let expression_element = serde_json::json!({
         "type": "order_by_element",
-        "expression": {"type": "function_scalar", "name": "ABS", "arguments": [
-            col("L_EXTENDEDPRICE")
-        ]},
+        "expression": scalar_fn("ABS", [col("L_EXTENDEDPRICE")]),
         "isAscending": false,
         "nullsLast": true
     });
@@ -392,9 +390,7 @@ fn order_by_element(expression: Json, ascending: bool, nulls_last: bool) -> Json
 }
 
 fn abs_of(column: &str) -> Json {
-    serde_json::json!({"type": "function_scalar", "name": "ABS", "arguments": [
-        table_col("LINEITEM", column)
-    ]})
+    scalar_fn("ABS", [table_col("LINEITEM", column)])
 }
 
 #[test]
@@ -439,10 +435,13 @@ fn declined_order_by_expression_appends_referenced_columns_as_hidden() {
 
 #[test]
 fn declined_order_by_two_expression_keys_renders_both_and_leaks_none() {
-    let sum_expr = serde_json::json!({"type": "function_scalar", "name": "ADD", "arguments": [
-        table_col("LINEITEM", "L_EXTENDEDPRICE"),
-        table_col("LINEITEM", "L_ORDERKEY")
-    ]});
+    let sum_expr = scalar_fn(
+        "ADD",
+        [
+            table_col("LINEITEM", "L_EXTENDEDPRICE"),
+            table_col("LINEITEM", "L_ORDERKEY"),
+        ],
+    );
     let request = lineitem_order_by_request(
         &["L_ORDERKEY"],
         serde_json::json!([
@@ -574,9 +573,7 @@ fn unsupported_order_by_shape_declines_topn() {
     let mut expr_key = nq4_request();
     expr_key["pushdownRequest"]["orderBy"] = serde_json::json!([{
         "type": "order_by_element",
-        "expression": {"type": "function_scalar", "name": "ABS", "arguments": [
-            col("L_EXTENDEDPRICE")
-        ]},
+        "expression": scalar_fn("ABS", [col("L_EXTENDEDPRICE")]),
         "isAscending": false,
         "nullsLast": true
     }]);

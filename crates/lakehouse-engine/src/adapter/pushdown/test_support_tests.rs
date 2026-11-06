@@ -28,6 +28,20 @@ pub(crate) fn sales_col(name: &str) -> Json {
     table_col(SALES, name)
 }
 
+/// `SALES.name = 'value'`, the single-table string filter most pushdown tests send.
+pub(crate) fn sales_equal(name: &str, value: &str) -> Json {
+    string_equal(SALES, name, value)
+}
+
+/// `SECOND(argument, 3) > 1`: DataFusion declines it on arity while Exasol renders it.
+pub(crate) fn declined_second_predicate(argument: Json) -> Json {
+    compare(
+        "predicate_greater",
+        scalar_fn("SECOND", [argument, num_lit(3)]),
+        num_lit(1),
+    )
+}
+
 type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 /// The one fake HTTP server: it records each request's head and body, then answers with what
@@ -362,12 +376,7 @@ pub(crate) fn inner_join(left: Json, right: Json, condition: Json) -> Json {
 
 /// Exasol's `CAST(arg AS target)` node.
 pub(crate) fn cast_to(target: ExasolType, arg: Json) -> Json {
-    serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": exasol_type_to_json(&target),
-        "arguments": [arg],
-    })
+    cast_json(exasol_type_to_json(&target), arg)
 }
 
 pub(crate) fn customer_orders_join() -> Json {
@@ -1585,35 +1594,9 @@ pub(crate) fn build_row_sql_with_root(
     )
 }
 
-pub(crate) fn agg_item(name: &str, column: Option<&str>, distinct: bool) -> serde_json::Value {
-    let mut args = serde_json::json!([]);
-    if let Some(c) = column {
-        args = serde_json::json!([col(c)]);
-    }
-    serde_json::json!({
-        "type": "function_aggregate",
-        "name": name,
-        "arguments": args,
-        "distinct": distinct,
-    })
-}
-
 pub(crate) fn pos_delete(path: &str, size: u64) -> DeleteMechanism {
     DeleteMechanism::IcebergPositionalDelete {
         path: path.into(),
         size,
     }
-}
-
-pub(crate) fn agg_item_expr(
-    name: &str,
-    arg: serde_json::Value,
-    distinct: bool,
-) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function_aggregate",
-        "name": name,
-        "arguments": [arg],
-        "distinct": distinct,
-    })
 }

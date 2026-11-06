@@ -3,7 +3,7 @@ use super::*;
 use crate::adapter::column_notes::TableNotes;
 use crate::adapter::parquet_directory::MergeMode;
 use crate::adapter::pushdown::test_support::{
-    SALES, num_lit, predicate_equal, resolve_from_notes, sales_col, sample_storage, string_equal,
+    num_lit, predicate_equal, resolve_from_notes, sales_col, sales_equal, sample_storage,
     unread_refused,
 };
 use crate::adapter::tests::parquet_fixture::{
@@ -290,7 +290,7 @@ async fn a_numeric_literal_prunes_no_direct_storage_file() {
     let pruned = resolve(
         &store,
         MergeMode::FoldEveryFile,
-        Some(&string_equal(SALES, "YEAR", "2024")),
+        Some(&sales_equal("YEAR", "2024")),
     )
     .await;
 
@@ -334,7 +334,7 @@ async fn a_column_only_pruned_files_carry_reads_null() {
     .await;
     let notes = enumerate(&store, MergeMode::FoldEveryFile).await;
 
-    let pruned = try_resolve(&store, &notes, Some(&string_equal(SALES, "YEAR", "2025")))
+    let pruned = try_resolve(&store, &notes, Some(&sales_equal("YEAR", "2025")))
         .await
         .expect("the kept file resolves a scan");
 

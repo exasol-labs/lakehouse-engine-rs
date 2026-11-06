@@ -23,6 +23,7 @@ use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, session_config_for_spec,
 };
 use lakehouse_engine::types::exasol_type::ExasolType;
+use vs_expression::test_support::{agg_item_expr, col, scalar_fn};
 
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -338,19 +339,11 @@ fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) 
 #[test]
 fn sum_two_column_product_emits_aggregates_not_raw_scan() {
     let req = serde_json::json!({
-        "selectList": [{
-            "type": "function_aggregate",
-            "name": "SUM",
-            "distinct": false,
-            "arguments": [{
-                "type": "function_scalar",
-                "name": "MULT",
-                "arguments": [
-                    vs_expression::test_support::col("L_EXTENDEDPRICE"),
-                    vs_expression::test_support::col("L_DISCOUNT"),
-                ],
-            }],
-        }],
+        "selectList": [agg_item_expr(
+            "SUM",
+            scalar_fn("MULT", [col("L_EXTENDEDPRICE"), col("L_DISCOUNT")]),
+            false,
+        )],
         "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 4}],
     });
 

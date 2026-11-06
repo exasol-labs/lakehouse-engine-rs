@@ -12,10 +12,7 @@ use crate::scan::test_support::WithFiles;
 
 #[test]
 fn scalar_over_merge_casts_to_exasol_char_target() {
-    let sum_node = serde_json::json!({
-        "type": "function_aggregate", "name": "SUM", "distinct": false,
-        "arguments": [col("x")]
-    });
+    let sum_node = agg_item("SUM", Some("x"), false);
     let plans = vec![parse_agg_item(&sum_node).expect("SUM(x) must parse to a plan")];
     let node = cast_to(
         ExasolType::Char {
@@ -43,10 +40,7 @@ fn scalar_over_merge_casts_to_exasol_char_target() {
 
 #[test]
 fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
-    let sum_node = serde_json::json!({
-        "type": "function_aggregate", "name": "SUM", "distinct": false,
-        "arguments": [col("x")]
-    });
+    let sum_node = agg_item("SUM", Some("x"), false);
     let plans = vec![parse_agg_item(&sum_node).expect("SUM(x) must parse to a plan")];
     let char_type = ExasolType::Char {
         size: 20,
@@ -236,24 +230,11 @@ fn grouped_request(
 }
 
 fn mod_item(column: &str, divisor: i64) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function_scalar",
-        "name": "MOD",
-        "arguments": [
-            col(column),
-            num_lit(divisor),
-        ],
-    })
+    scalar_fn("MOD", [col(column), num_lit(divisor)])
 }
 
 fn upper_item(column: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function_scalar",
-        "name": "UPPER",
-        "arguments": [
-            col(column),
-        ],
-    })
+    scalar_fn("UPPER", [col(column)])
 }
 
 #[test]
@@ -430,8 +411,7 @@ fn detect_group_by_unsupported_expression_falls_back() {
 
 #[test]
 fn detect_group_by_mixed_select_falls_back() {
-    let year =
-        serde_json::json!({"type": "function_scalar", "name": "YEAR", "arguments": [col("TS")]});
+    let year = scalar_fn("YEAR", [col("TS")]);
     let req = grouped_request(NO_COLUMNS, vec![col("REGION")])
         .item(year, ExasolType::WIDEST_VARCHAR)
         .count_star()
@@ -1421,34 +1401,27 @@ fn grouped_wrapper_agg_first_with_having_ordering() {
 }
 
 fn case_flag_eq(column: &str, val: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "function_scalar_case",
-        "name": "CASE",
-        "arguments": [
-            predicate_equal(col(column), str_lit(val))
-        ],
-        "results": [
-            num_lit(1),
-            num_lit(0)
-        ]
-    })
+    case_when(
+        [predicate_equal(col(column), str_lit(val))],
+        [num_lit(1), num_lit(0)],
+    )
 }
 
 fn round_pct_over_aggregates() -> serde_json::Value {
-    serde_json::json!({
-        "type": "function_scalar",
-        "name": "ROUND",
-        "arguments": [
-            {"type": "function_scalar", "name": "FLOAT_DIV", "arguments": [
-                {"type": "function_scalar", "name": "MULT", "arguments": [
-                    lit("literal_double", 100.0),
-                    agg_item_expr("SUM", case_flag_eq("L_RETURNFLAG", "R"), false)
-                ]},
-                agg_item("COUNT", None, false)
-            ]},
-            num_lit(2)
-        ]
-    })
+    let returned = agg_item_expr("SUM", case_flag_eq("L_RETURNFLAG", "R"), false);
+    scalar_fn(
+        "ROUND",
+        [
+            scalar_fn(
+                "FLOAT_DIV",
+                [
+                    scalar_fn("MULT", [lit("literal_double", 100.0), returned]),
+                    agg_item("COUNT", None, false),
+                ],
+            ),
+            num_lit(2),
+        ],
+    )
 }
 
 fn soa_col_types() -> Vec<(String, ExasolType)> {
@@ -1651,13 +1624,19 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
     .group_by(vec![table_col("LINEITEM", "L_RETURNFLAG")])
     .column(table_col("LINEITEM", "L_RETURNFLAG"))
     .item(
-        serde_json::json!({"type": "function_scalar", "name": "ROUND", "arguments": [
-            {"type": "function_scalar", "name": "FLOAT_DIV", "arguments": [
-                agg_item_expr("SUM", table_col("LINEITEM", "X"), false),
-                agg_item_expr("COUNT", table_col("LINEITEM", "Y"), true)
-            ]},
-            num_lit(2)
-        ]}),
+        scalar_fn(
+            "ROUND",
+            [
+                scalar_fn(
+                    "FLOAT_DIV",
+                    [
+                        agg_item_expr("SUM", table_col("LINEITEM", "X"), false),
+                        agg_item_expr("COUNT", table_col("LINEITEM", "Y"), true),
+                    ],
+                ),
+                num_lit(2),
+            ],
+        ),
         ExasolType::decimal(5, 2),
     )
     .build();
@@ -2018,17 +1997,10 @@ fn group_key_types_multi_key_mixed_types() {
 
 #[test]
 fn group_key_exasol_types_resolves_char_case_key() {
-    let case_key = serde_json::json!({
-        "type": "function_scalar_case",
-        "name": "CASE",
-        "arguments": [
-            compare("predicate_less", col("C_DECIMAL_A"), num_lit(0))
-        ],
-        "results": [
-            str_lit("NEG"),
-            str_lit("POS")
-        ]
-    });
+    let case_key = case_when(
+        [compare("predicate_less", col("C_DECIMAL_A"), num_lit(0))],
+        [str_lit("NEG"), str_lit("POS")],
+    );
     let req = grouped_request(NO_COLUMNS, vec![case_key.clone()])
         .item(
             case_key,
@@ -2752,11 +2724,10 @@ fn grouped_stat_aggregate_over_expression_argument_declines() {
 
 #[test]
 fn scalar_over_stat_aggregate_with_expression_argument_declines() {
-    let sqrt_over_stat = serde_json::json!({
-        "type": "function_scalar",
-        "name": "SQRT",
-        "arguments": [agg_item_expr("STDDEV", mod_item("SCORE", 4), false)],
-    });
+    let sqrt_over_stat = scalar_fn(
+        "SQRT",
+        [agg_item_expr("STDDEV", mod_item("SCORE", 4), false)],
+    );
     assert!(
         classify_scalar_over_aggregate(&sqrt_over_stat).is_none(),
         "a scalar wrapping a stat aggregate over an expression must not classify"
@@ -2855,12 +2826,8 @@ fn sum_and_stat_aggregates_accept_only_double_and_decimal_columns() {
 #[test]
 fn unprojected_group_key_with_an_invalid_cast_type_fails() {
     let invalid = serde_json::json!({"type": "CHAR", "characterSet": "ASCII"});
-    let key = serde_json::json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "dataType": invalid.clone(),
-        "arguments": [col("NAME")],
-    });
+    // The engine's `cast_to` takes an `ExasolType`, which cannot hold this invalid type.
+    let key = cast_json(invalid.clone(), col("NAME"));
     let req = grouped_request(NO_COLUMNS, vec![key])
         .count_star()
         .build_pushdown();
