@@ -591,8 +591,8 @@ async fn each_delta_join_leg_prunes_by_its_own_side_local_predicate() {
     let storage = two_delta_legs_each_pruned_by_its_own_local_filter().await;
     let mut request = partitioned_legs_request();
     request["pushdownRequest"]["filter"] = and([
-        predicate_equal(table_col("CUSTOMER", "C_REGION"), str_lit("us")),
-        predicate_equal(table_col("ORDERS", "O_STATUS"), str_lit("open")),
+        string_equal("CUSTOMER", "C_REGION", "us"),
+        string_equal("ORDERS", "O_STATUS", "open"),
     ]);
 
     let result = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")

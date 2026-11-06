@@ -75,7 +75,7 @@ fn join_condition_renders_via_translator() {
 fn join_where_filter_spanning_both_sides_renders() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = and([
-        predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
+        string_equal("CUSTOMER", "C_NAME", "ACME"),
         compare(
             "predicate_greater",
             table_col("ORDERS", "O_ORDERDATE"),
@@ -294,7 +294,7 @@ fn join_projection_like_guard_reaches_join_select_list() {
 #[test]
 fn leg_local_filter_attributes_conjuncts_to_owning_leg() {
     let filter = and([
-        predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
+        string_equal("CUSTOMER", "C_NAME", "ACME"),
         compare(
             "predicate_greater",
             table_col("ORDERS", "O_ORDERDATE"),
@@ -329,7 +329,7 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
             table_col("CUSTOMER", "C_CUSTKEY"),
             table_col("ORDERS", "O_CUSTKEY"),
         ),
-        predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
+        string_equal("CUSTOMER", "C_NAME", "ACME"),
     ]);
     let legs = customer_orders_legs();
     let cust = render_df_filter_safe(
@@ -346,7 +346,7 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
     );
 
     let or_filter = or([
-        predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
+        string_equal("CUSTOMER", "C_NAME", "ACME"),
         compare(
             "predicate_greater",
             table_col("ORDERS", "O_ORDERDATE"),
@@ -357,8 +357,8 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
     assert!(leg_local_filter(&or_filter, &legs, 1).is_none());
 
     let one_side_or = or([
-        predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
-        predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("GLOBEX")),
+        string_equal("CUSTOMER", "C_NAME", "ACME"),
+        string_equal("CUSTOMER", "C_NAME", "GLOBEX"),
     ]);
     assert!(
         leg_local_filter(&one_side_or, &legs, 0).is_some(),
@@ -369,7 +369,7 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
 
 #[test]
 fn leg_local_filter_handles_a_single_conjunct() {
-    let single = predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME"));
+    let single = string_equal("CUSTOMER", "C_NAME", "ACME");
     let legs = customer_orders_legs();
     assert!(leg_local_filter(&single, &legs, 0).is_some());
     assert!(leg_local_filter(&single, &legs, 1).is_none());
@@ -379,7 +379,7 @@ fn leg_local_filter_handles_a_single_conjunct() {
 fn leg_local_filter_attributes_shared_column_by_leg_not_name() {
     let filter = and([
         compare("predicate_greater", table_col("EVENTS", "ID"), num_lit(5)),
-        predicate_equal(table_col("LABELS", "LABEL"), str_lit("x")),
+        string_equal("LABELS", "LABEL", "x"),
     ]);
 
     let legs = legs_of(&["EVENTS", "LABELS"]);
@@ -574,7 +574,7 @@ fn conjunct_count(filter: Option<&Json>) -> usize {
 
 #[test]
 fn type_screened_leg_filter_pushes_whole_accepted_set_rewritten() {
-    let filter = and(vec![
+    let filter = and([
         like(table_col("ORDERS", "O_ORDERDATE"), "1995%"),
         orders_local_rendering_conjunct(),
     ]);
@@ -601,7 +601,7 @@ fn type_screened_leg_filter_pushes_whole_accepted_set_rewritten() {
 #[test]
 fn type_screened_leg_filter_declines_whole_set_when_no_conjunct_survives() {
     let decimal_like = like(table_col("ORDERS", "O_CUSTKEY"), "1%");
-    let filter = and(vec![decimal_like.clone(), orders_local_declined_conjunct()]);
+    let filter = and([decimal_like.clone(), orders_local_declined_conjunct()]);
 
     let (leg, declined) = type_screened_leg_filter(&filter, &column_types(&orders_col_types()));
 
@@ -628,7 +628,7 @@ fn type_screened_leg_filter_declines_whole_set_when_no_conjunct_survives() {
 fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
     let date_like = like(table_col("ORDERS", "O_ORDERDATE"), "1995%");
     let decimal_like = like(table_col("ORDERS", "O_CUSTKEY"), "1%");
-    let mixed = and(vec![
+    let mixed = and([
         date_like.clone(),
         decimal_like.clone(),
         orders_local_rendering_conjunct(),
@@ -636,11 +636,11 @@ fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
     let cases = [
         (
             "all accepted",
-            and(vec![date_like, orders_local_rendering_conjunct()]),
+            and([date_like, orders_local_rendering_conjunct()]),
         ),
         (
             "all declined",
-            and(vec![decimal_like.clone(), orders_local_declined_conjunct()]),
+            and([decimal_like.clone(), orders_local_declined_conjunct()]),
         ),
         ("mixed", mixed.clone()),
     ];
@@ -768,10 +768,7 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
 #[test]
 fn referenced_leg_columns_narrows_to_used_columns() {
     let pushdown_req = pushdown_request("CUSTOMER", &[("C_NAME", ExasolType::WIDEST_VARCHAR)])
-        .filter(predicate_equal(
-            table_col("CUSTOMER", "C_ADDRESS"),
-            str_lit("z"),
-        ))
+        .filter(string_equal("CUSTOMER", "C_ADDRESS", "z"))
         .column(table_col("CUSTOMER", "C_NAME"))
         .build_pushdown();
     let condition = predicate_equal(
@@ -1106,7 +1103,7 @@ fn unified_join_prunes_and_narrows_each_leg() {
         .field("type", serde_json::json!("select"))
         .field("from", customer_orders_join())
         .filter(and([
-            predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
+            string_equal("CUSTOMER", "C_NAME", "ACME"),
             compare(
                 "predicate_greater",
                 table_col("ORDERS", "O_ORDERDATE"),
@@ -1169,7 +1166,7 @@ fn unified_join_prunes_and_narrows_each_leg() {
 #[test]
 fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
     let c_name = [nullable_field("c_name", "binary")];
-    let filter = predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("0a1b"));
+    let filter = string_equal("CUSTOMER", "C_NAME", "0a1b");
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = filter.clone();
     let detected = detected_join(&request);

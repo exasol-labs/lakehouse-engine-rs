@@ -1015,7 +1015,7 @@ fn join_conditions_greedy_attach_and_side_local_pushdown() {
             ),
         )
         .filter(and([
-            predicate_equal(table_col("N1", "N1_NAME"), str_lit("ACME")),
+            string_equal("N1", "N1_NAME", "ACME"),
             compare(
                 "predicate_greater",
                 table_col("FACT", "F_VALUE"),
@@ -1153,7 +1153,7 @@ fn n_scan_type_accepted_side_local_conjunct_still_pushes_when_a_sibling_declines
 #[test]
 fn n_scan_leg_residual_partition_is_total_and_disjoint_with_type_screen() {
     let request = n_scan_request_with_filter(and([
-        predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
+        string_equal("CUSTOMER", "C_NAME", "ACME"),
         like(table_col("ORDERS", "O_ORDERDATE"), "1995%"),
         like(table_col("CUSTOMER", "C_CUSTKEY"), "1%"),
         compare(
@@ -1385,7 +1385,7 @@ fn render_expression_qualified_renders_scalar_over_aggregate() {
         "type": "function_aggregate", "name": "SUM", "distinct": false,
         "arguments": [{
             "type": "function_scalar", "name": "CASE", "arguments": [
-                predicate_equal(table_col("LINEITEM", "L_RETURNFLAG"), str_lit("R")),
+                string_equal("LINEITEM", "L_RETURNFLAG", "R"),
                 num_lit(1),
                 num_lit(0)]}]
     });
@@ -2132,7 +2132,7 @@ fn fallback_leg_fan_out_spec_never_carries_a_limit_or_sort() {
 fn golden_n_scan_join_sql_unchanged() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = and([
-        predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME")),
+        string_equal("CUSTOMER", "C_NAME", "ACME"),
         compare(
             "predicate_greater",
             table_col("ORDERS", "O_ORDERDATE"),
@@ -2313,7 +2313,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
         "nullsLast": false,
     }]);
     let region_flag = serde_json::json!({"type": "function_scalar", "name": "CASE", "arguments": [
-        predicate_equal(table_col("T", "REGION"), str_lit("R")),
+        string_equal("T", "REGION", "R"),
         num_lit(1),
         num_lit(0),
     ]});
@@ -3225,8 +3225,7 @@ fn column_without_a_single_leg_fails_broadcast_with_the_fallback_error() {
     let mut no_table_name = join_request(Json::Null, equi_condition());
     no_table_name = selecting(no_table_name, &[(col("C_NAME"), ExasolType::varchar(100))]);
     let mut undeclared_table = join_request(Json::Null, equi_condition());
-    undeclared_table["pushdownRequest"]["filter"] =
-        predicate_equal(table_col("NOPE", "C_NAME"), str_lit("ACME"));
+    undeclared_table["pushdownRequest"]["filter"] = string_equal("NOPE", "C_NAME", "ACME");
     for (label, request) in [
         ("no tableName", no_table_name),
         ("an undeclared tableName", undeclared_table),

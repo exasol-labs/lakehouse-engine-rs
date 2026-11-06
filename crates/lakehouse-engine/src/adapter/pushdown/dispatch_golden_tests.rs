@@ -9,7 +9,7 @@ use super::test_support::{
 };
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    aliased_col, col, compare, customer_orders_join, num_lit, predicate_equal, str_lit, table_col,
+    aliased_col, col, compare, customer_orders_join, num_lit, string_equal, table_col,
 };
 use crate::scan::spec::ProjectionItem;
 use crate::types::exasol_type::ExasolType;
@@ -886,7 +886,7 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
         include_str!("testdata/dispatch_golden/rendering_single_table.sql")
     );
 
-    let renderable_filter = predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME"));
+    let renderable_filter = string_equal("CUSTOMER", "C_NAME", "ACME");
     let (request, _) = two_table_join_request(Some(renderable_filter));
     let join = two_table_detected_join(&request);
     let rendered = render_broadcast_join(

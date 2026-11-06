@@ -2259,7 +2259,7 @@ fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, ExasolType)]
 #[test]
 fn nested_like_decline_routes_to_wrapper_where() {
     let filter = and([
-        predicate_equal(table_col("T", "STATUS"), str_lit("OPEN")),
+        string_equal("T", "STATUS", "OPEN"),
         like(table_col("T", "AMOUNT"), "9%"),
     ]);
     let col_types = vec![
