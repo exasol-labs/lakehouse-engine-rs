@@ -346,8 +346,8 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
                 "type": "function_scalar",
                 "name": "MULT",
                 "arguments": [
-                    {"type": "column", "name": "L_EXTENDEDPRICE"},
-                    {"type": "column", "name": "L_DISCOUNT"},
+                    vs_expression::test_support::col("L_EXTENDEDPRICE"),
+                    vs_expression::test_support::col("L_DISCOUNT"),
                 ],
             }],
         }],

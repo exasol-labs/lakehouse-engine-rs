@@ -1,7 +1,7 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
     SALES, and, between, binary_lit, bool_lit, compare, date_lit, in_list, is_not_null, is_null,
-    like, lit, not, null_lit, num_lit, or, predicate_equal, str_lit, string_equal, table_col,
+    like, lit, not, null_lit, num_lit, or, predicate_equal, sales_col, str_lit, string_equal,
     timestamp_lit,
 };
 use arrow::datatypes::TimeUnit;
@@ -9,7 +9,7 @@ use serde_json::json;
 
 /// A filter no partition column can decide.
 fn on_a_data_column() -> Json {
-    predicate_equal(table_col(SALES, "ID"), num_lit("1"))
+    predicate_equal(sales_col("ID"), num_lit("1"))
 }
 
 fn file_with(key: &str, value: Option<&str>) -> BTreeMap<String, Option<String>> {
@@ -58,34 +58,23 @@ fn partition_nodes_evaluate_under_three_valued_logic() {
         ),
         (
             "= with the column on the right",
-            predicate_equal(str_lit("2026"), table_col(SALES, "YEAR")),
+            predicate_equal(str_lit("2026"), sales_col("YEAR")),
             [true, false, false],
         ),
         (
             "<>",
-            compare(
-                "predicate_notequal",
-                table_col(SALES, "YEAR"),
-                str_lit("2026"),
-            ),
+            compare("predicate_notequal", sales_col("YEAR"), str_lit("2026")),
             [false, true, false],
         ),
         (
             "IN",
-            in_list(
-                table_col(SALES, "YEAR"),
-                vec![str_lit("2026"), str_lit("2024")],
-            ),
+            in_list(sales_col("YEAR"), [str_lit("2026"), str_lit("2024")]),
             [true, false, false],
         ),
-        (
-            "IS NULL",
-            is_null(table_col(SALES, "YEAR")),
-            [false, false, true],
-        ),
+        ("IS NULL", is_null(sales_col("YEAR")), [false, false, true]),
         (
             "IS NOT NULL",
-            is_not_null(table_col(SALES, "YEAR")),
+            is_not_null(sales_col("YEAR")),
             [true, true, false],
         ),
         (
@@ -95,23 +84,23 @@ fn partition_nodes_evaluate_under_three_valued_logic() {
         ),
         (
             "OR",
-            or(vec![
+            or([
                 string_equal(SALES, "YEAR", "2026"),
-                is_null(table_col(SALES, "YEAR")),
+                is_null(sales_col("YEAR")),
             ]),
             [true, false, true],
         ),
         (
             "AND",
-            and(vec![
-                is_not_null(table_col(SALES, "YEAR")),
+            and([
+                is_not_null(sales_col("YEAR")),
                 not(string_equal(SALES, "YEAR", "2025")),
             ]),
             [true, false, false],
         ),
         (
             "NOT over IS NULL",
-            not(is_null(table_col(SALES, "YEAR"))),
+            not(is_null(sales_col("YEAR"))),
             [true, true, false],
         ),
     ];
@@ -131,71 +120,47 @@ fn range_and_between_nodes_evaluate_under_three_valued_logic() {
     let cases: Vec<(&str, Json, [bool; 4])> = vec![
         (
             ">",
-            compare(
-                "predicate_greater",
-                table_col(SALES, "REGION"),
-                str_lit("Z"),
-            ),
+            compare("predicate_greater", sales_col("REGION"), str_lit("Z")),
             [false, true, true, false],
         ),
         (
             ">=",
-            compare(
-                "predicate_greaterequal",
-                table_col(SALES, "REGION"),
-                str_lit("a"),
-            ),
+            compare("predicate_greaterequal", sales_col("REGION"), str_lit("a")),
             [false, true, true, false],
         ),
         (
             "<",
-            compare("predicate_less", table_col(SALES, "REGION"), str_lit("z")),
+            compare("predicate_less", sales_col("REGION"), str_lit("z")),
             [true, true, false, false],
         ),
         (
             "<=",
-            compare(
-                "predicate_lessequal",
-                table_col(SALES, "REGION"),
-                str_lit("a"),
-            ),
+            compare("predicate_lessequal", sales_col("REGION"), str_lit("a")),
             [true, true, false, false],
         ),
         (
             "> with the column on the right flips to <",
-            compare(
-                "predicate_greater",
-                str_lit("a"),
-                table_col(SALES, "REGION"),
-            ),
+            compare("predicate_greater", str_lit("a"), sales_col("REGION")),
             [true, false, false, false],
         ),
         (
             "<= with the column on the right flips to >=",
-            compare(
-                "predicate_lessequal",
-                str_lit("a"),
-                table_col(SALES, "REGION"),
-            ),
+            compare("predicate_lessequal", str_lit("a"), sales_col("REGION")),
             [false, true, true, false],
         ),
         (
             "BETWEEN",
-            between(table_col(SALES, "REGION"), str_lit("B"), str_lit("a")),
+            between(sales_col("REGION"), str_lit("B"), str_lit("a")),
             [true, true, false, false],
         ),
         (
             "BETWEEN with its bounds reversed holds for no value",
-            between(table_col(SALES, "REGION"), str_lit("a"), str_lit("B")),
+            between(sales_col("REGION"), str_lit("a"), str_lit("B")),
             [false, false, false, false],
         ),
         (
             "NOT BETWEEN",
-            not(between(
-                table_col(SALES, "REGION"),
-                str_lit("B"),
-                str_lit("a"),
-            )),
+            not(between(sales_col("REGION"), str_lit("B"), str_lit("a"))),
             [false, false, true, false],
         ),
     ];
@@ -221,23 +186,17 @@ fn a_non_partition_node_never_prunes() {
         ("NOT over it", not(on_a_data_column()), [true, true, true]),
         (
             "OR with a partition node",
-            or(vec![
-                string_equal(SALES, "YEAR", "2025"),
-                on_a_data_column(),
-            ]),
+            or([string_equal(SALES, "YEAR", "2025"), on_a_data_column()]),
             [true, true, true],
         ),
         (
             "AND with a partition node prunes by the partition node alone",
-            and(vec![
-                string_equal(SALES, "YEAR", "2025"),
-                on_a_data_column(),
-            ]),
+            and([string_equal(SALES, "YEAR", "2025"), on_a_data_column()]),
             [false, true, false],
         ),
         (
             "NOT over an AND it cannot decide",
-            not(and(vec![
+            not(and([
                 string_equal(SALES, "YEAR", "2026"),
                 on_a_data_column(),
             ])),
@@ -245,7 +204,7 @@ fn a_non_partition_node_never_prunes() {
         ),
         (
             "NOT over an OR prunes only where the partition node decides the OR",
-            not(or(vec![
+            not(or([
                 string_equal(SALES, "YEAR", "2025"),
                 on_a_data_column(),
             ])),
@@ -258,21 +217,20 @@ fn a_non_partition_node_never_prunes() {
         ),
         (
             "a function over the partition column",
-            compare(
-                "predicate_equal",
-                json!({"type": "function_scalar", "name": "UPPER", "arguments": [table_col(SALES, "YEAR")]}),
+            predicate_equal(
+                json!({"type": "function_scalar", "name": "UPPER", "arguments": [sales_col("YEAR")]}),
                 str_lit("2025"),
             ),
             [true, true, true],
         ),
         (
             "an operator this module does not evaluate",
-            like(table_col(SALES, "YEAR"), "2025%"),
+            like(sales_col("YEAR"), "2025%"),
             [true, true, true],
         ),
         (
             "two partition columns compared with each other",
-            predicate_equal(table_col(SALES, "YEAR"), table_col(SALES, "YEAR")),
+            predicate_equal(sales_col("YEAR"), sales_col("YEAR")),
             [true, true, true],
         ),
         (
@@ -283,17 +241,17 @@ fn a_non_partition_node_never_prunes() {
         ("an OR with no operand", or(Vec::new()), [true, true, true]),
         (
             "an IN with no element",
-            in_list(table_col(SALES, "YEAR"), Vec::new()),
+            in_list(sales_col("YEAR"), Vec::new()),
             [true, true, true],
         ),
         (
             "a node without a type",
-            json!({"left": table_col(SALES, "YEAR")}),
+            json!({"left": sales_col("YEAR")}),
             [true, true, true],
         ),
         (
             "a numeric literal, which Exasol compares numerically",
-            predicate_equal(table_col(SALES, "YEAR"), num_lit("2024")),
+            predicate_equal(sales_col("YEAR"), num_lit("2024")),
             [true, true, true],
         ),
         (
@@ -303,30 +261,27 @@ fn a_non_partition_node_never_prunes() {
         ),
         (
             "a NULL literal",
-            predicate_equal(table_col(SALES, "YEAR"), null_lit()),
+            predicate_equal(sales_col("YEAR"), null_lit()),
             [true, true, true],
         ),
         (
             "an IN list holding one non-string element",
-            in_list(
-                table_col(SALES, "YEAR"),
-                vec![str_lit("2024"), num_lit("2023")],
-            ),
+            in_list(sales_col("YEAR"), [str_lit("2024"), num_lit("2023")]),
             [true, true, true],
         ),
         (
             "an IN list holding one empty string",
-            in_list(table_col(SALES, "YEAR"), vec![str_lit("2024"), str_lit("")]),
+            in_list(sales_col("YEAR"), [str_lit("2024"), str_lit("")]),
             [true, true, true],
         ),
         (
             "a BETWEEN with one non-string bound",
-            between(table_col(SALES, "YEAR"), str_lit("2023"), num_lit("2024")),
+            between(sales_col("YEAR"), str_lit("2023"), num_lit("2024")),
             [true, true, true],
         ),
         (
             "a range comparison against an empty string",
-            compare("predicate_greater", table_col(SALES, "YEAR"), str_lit("")),
+            compare("predicate_greater", sales_col("YEAR"), str_lit("")),
             [true, true, true],
         ),
     ];
@@ -399,28 +354,28 @@ fn partition_values_compare_under_their_declared_type() {
     let cases: Vec<(&str, Json, [FileValues; 2])> = vec![
         (
             "year < 10 orders integers numerically, where a string order ranks '10' first",
-            compare("predicate_less", table_col(SALES, "YEAR"), num_lit("10")),
+            compare("predicate_less", sales_col("YEAR"), num_lit("10")),
             two_files("year", "9", "10"),
         ),
         (
             "10 > year flips to year < 10",
-            compare("predicate_greater", num_lit("10"), table_col(SALES, "YEAR")),
+            compare("predicate_greater", num_lit("10"), sales_col("YEAR")),
             two_files("year", "9", "10"),
         ),
         (
             "an integer IN list",
-            in_list(table_col(SALES, "YEAR"), vec![num_lit("9"), num_lit("11")]),
+            in_list(sales_col("YEAR"), [num_lit("9"), num_lit("11")]),
             two_files("year", "9", "10"),
         ),
         (
             "day = DATE '2024-03-01'",
-            predicate_equal(table_col(SALES, "DAY"), date_lit("2024-03-01")),
+            predicate_equal(sales_col("DAY"), date_lit("2024-03-01")),
             two_files("day", "2024-03-01", "2024-02-29"),
         ),
         (
             "a date BETWEEN",
             between(
-                table_col(SALES, "DAY"),
+                sales_col("DAY"),
                 date_lit("2024-02-01"),
                 date_lit("2024-02-29"),
             ),
@@ -430,25 +385,21 @@ fn partition_values_compare_under_their_declared_type() {
             "amount >= 1.50",
             compare(
                 "predicate_greaterequal",
-                table_col(SALES, "AMOUNT"),
+                sales_col("AMOUNT"),
                 num_lit("1.50"),
             ),
             two_files("amount", "1.5", "1.49"),
         ),
         (
             "an integral literal on a decimal column",
-            compare(
-                "predicate_greater",
-                table_col(SALES, "AMOUNT"),
-                num_lit("2"),
-            ),
+            compare("predicate_greater", sales_col("AMOUNT"), num_lit("2")),
             two_files("amount", "10.00", "1.99"),
         ),
         (
             "ts < TIMESTAMP '2024-03-01 00:00:00'",
             compare(
                 "predicate_less",
-                table_col(SALES, "TS"),
+                sales_col("TS"),
                 timestamp_lit("2024-03-01 00:00:00"),
             ),
             two_files("ts", "2024-02-29 23:59:59.999999", "2024-03-01 00:00:00"),
@@ -460,11 +411,7 @@ fn partition_values_compare_under_their_declared_type() {
         ),
         (
             "active = TRUE",
-            compare(
-                "predicate_equal",
-                table_col(SALES, "ACTIVE"),
-                bool_lit(true),
-            ),
+            predicate_equal(sales_col("ACTIVE"), bool_lit(true)),
             two_files("active", "true", "false"),
         ),
     ];
@@ -478,7 +425,7 @@ fn partition_values_compare_under_their_declared_type() {
     }
     assert_eq!(
         kept_under(
-            &compare("predicate_less", table_col(SALES, "YEAR"), num_lit("10")),
+            &compare("predicate_less", sales_col("YEAR"), num_lit("10")),
             &declared,
             &[file_with("year", None)],
         ),
@@ -499,65 +446,52 @@ fn an_undecidable_comparison_keeps_the_file() {
         ),
         (
             "a fractional literal on an integer column, which truncation would decide",
-            predicate_equal(table_col(SALES, "YEAR"), num_lit("2024.5")),
+            predicate_equal(sales_col("YEAR"), num_lit("2024.5")),
             two_files("year", "2024", "2025"),
         ),
         (
             "an integer literal outside the column's range, which wrapping would decide",
-            predicate_equal(table_col(SALES, "TINY"), num_lit("300")),
+            predicate_equal(sales_col("TINY"), num_lit("300")),
             two_files("tiny", "44", "45"),
         ),
         (
             "a literal finer than the decimal scale, which rounding would decide",
-            predicate_equal(table_col(SALES, "AMOUNT"), num_lit("1.555")),
+            predicate_equal(sales_col("AMOUNT"), num_lit("1.555")),
             two_files("amount", "1.55", "1.56"),
         ),
         (
             "a timestamp literal finer than the column's unit, which truncation would decide",
             compare(
                 "predicate_less",
-                table_col(SALES, "TS_MS"),
+                sales_col("TS_MS"),
                 timestamp_lit("2024-03-01 00:00:00.000500"),
             ),
             two_files("ts_ms", "2024-03-01 00:00:00", "2024-03-01 00:00:00.001"),
         ),
         (
             "a comparison on a float column",
-            compare(
-                "predicate_greater",
-                table_col(SALES, "RATIO"),
-                num_lit("1.0"),
-            ),
+            compare("predicate_greater", sales_col("RATIO"), num_lit("1.0")),
             two_files("ratio", "0.5", "2.0"),
         ),
         (
             "a double literal on an integer column",
-            compare(
-                "predicate_equal",
-                table_col(SALES, "YEAR"),
-                lit("literal_double", json!("2024")),
-            ),
+            predicate_equal(sales_col("YEAR"), lit("literal_double", json!("2024"))),
             two_files("year", "2024", "2025"),
         ),
         (
             "a timestamp literal on a date column",
-            compare(
-                "predicate_equal",
-                table_col(SALES, "DAY"),
-                timestamp_lit("2024-03-01 00:00:00"),
-            ),
+            predicate_equal(sales_col("DAY"), timestamp_lit("2024-03-01 00:00:00")),
             two_files("day", "2024-03-01", "2024-03-02"),
         ),
         (
             "a date literal on a timestamp column",
-            predicate_equal(table_col(SALES, "TS"), date_lit("2024-03-01")),
+            predicate_equal(sales_col("TS"), date_lit("2024-03-01")),
             two_files("ts", "2024-03-01 00:00:00", "2024-03-02 00:00:00"),
         ),
         (
             "a UTC timestamp literal on a timestamp column",
-            compare(
-                "predicate_equal",
-                table_col(SALES, "TS"),
+            predicate_equal(
+                sales_col("TS"),
                 lit("literal_timestamp_utc", json!("2024-03-01 00:00:00")),
             ),
             two_files("ts", "2024-03-01 00:00:00", "2024-03-02 00:00:00"),
@@ -581,7 +515,7 @@ fn an_undecidable_comparison_keeps_the_file() {
             "{label}: kept per file"
         );
     }
-    let year_2024 = predicate_equal(table_col(SALES, "YEAR"), num_lit("2024"));
+    let year_2024 = predicate_equal(sales_col("YEAR"), num_lit("2024"));
     assert_eq!(
         kept_under(&year_2024, &declared, &two_files("year", "abc", "2025")),
         [true, false],
@@ -594,13 +528,13 @@ fn an_empty_partition_value_is_null_as_the_scan_reads_it() {
     let files = [file_with("year", Some(""))];
     for (declared, bound) in [(Vec::new(), str_lit("9")), (typed_columns(), num_lit("9"))] {
         assert_eq!(
-            kept_under(&is_null(table_col(SALES, "YEAR")), &declared, &files),
+            kept_under(&is_null(sales_col("YEAR")), &declared, &files),
             [true],
             "IS NULL holds for an empty value under {declared:?}"
         );
         assert_eq!(
             kept_under(
-                &compare("predicate_less", table_col(SALES, "YEAR"), bound),
+                &compare("predicate_less", sales_col("YEAR"), bound),
                 &declared,
                 &files,
             ),
@@ -620,11 +554,9 @@ fn a_binary_literal_compares_a_logged_value_by_its_utf8_bytes() {
         file_with("part", Some("")),
         file_with("part", None),
     ];
-    let bytes = |hex: &str| binary_lit(hex);
-
     assert_eq!(
         kept_under(
-            &predicate_equal(table_col(SALES, "PART"), bytes("4142")),
+            &predicate_equal(sales_col("PART"), binary_lit("4142")),
             &declared,
             &files
         ),
@@ -635,8 +567,8 @@ fn a_binary_literal_compares_a_logged_value_by_its_utf8_bytes() {
         kept_under(
             &not(compare(
                 "predicate_greater",
-                table_col(SALES, "PART"),
-                bytes("4142")
+                sales_col("PART"),
+                binary_lit("4142")
             )),
             &declared,
             &files
@@ -644,11 +576,7 @@ fn a_binary_literal_compares_a_logged_value_by_its_utf8_bytes() {
         [true, false, false, false]
     );
     assert_eq!(
-        kept_under(
-            &predicate_equal(table_col(SALES, "PART"), str_lit("4142")),
-            &declared,
-            &files
-        ),
+        kept_under(&string_equal(SALES, "PART", "4142"), &declared, &files),
         [true; 4],
         "only the retyped literal names bytes"
     );

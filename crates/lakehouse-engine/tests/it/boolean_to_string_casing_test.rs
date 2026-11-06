@@ -10,6 +10,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use serde_json::json;
+use vs_expression::test_support::{col, compare, num_lit, str_lit};
 
 /// Field names are uppercase because `render_expression` uppercases and
 /// double-quotes column names.
@@ -31,11 +32,7 @@ fn context_with_acctbal() -> SessionContext {
 }
 
 fn acctbal_greater_than_zero() -> serde_json::Value {
-    json!({
-        "type": "predicate_greater",
-        "left": {"type": "column", "name": "c_acctbal"},
-        "right": {"type": "literal_exactnumeric", "value": 0}
-    })
+    compare("predicate_greater", col("c_acctbal"), num_lit(0))
 }
 
 async fn collect_strings(ctx: &SessionContext, sql: &str, col: &str) -> Vec<Option<String>> {
@@ -82,7 +79,7 @@ async fn concat_predicate_matches_exasol_uppercase_not_datafusion_lowercase() {
     let concat_expr = json!({
         "type": "function_scalar",
         "name": "CONCAT",
-        "arguments": [acctbal_greater_than_zero(), {"type": "literal_string", "value": ""}]
+        "arguments": [acctbal_greater_than_zero(), str_lit("")]
     });
     let fragment = vs_expression::render_expression(&concat_expr).expect("CONCAT must translate");
 
@@ -101,7 +98,7 @@ async fn concat_group_by_key_uses_exasol_uppercase_labels() {
     let concat_expr = json!({
         "type": "function_scalar",
         "name": "CONCAT",
-        "arguments": [acctbal_greater_than_zero(), {"type": "literal_string", "value": ""}]
+        "arguments": [acctbal_greater_than_zero(), str_lit("")]
     });
     let fragment = vs_expression::render_expression(&concat_expr).expect("CONCAT must translate");
 

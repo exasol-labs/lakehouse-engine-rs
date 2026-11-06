@@ -23,6 +23,11 @@ pub(crate) use vs_expression::test_support::*;
 /// The table a single-table filter fixture qualifies its columns with, as Exasol does.
 pub(crate) const SALES: &str = "SALES";
 
+/// A column node of [`SALES`].
+pub(crate) fn sales_col(name: &str) -> Json {
+    table_col(SALES, name)
+}
+
 type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 /// The one fake HTTP server: it records each request's head and body, then answers with what
