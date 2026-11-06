@@ -309,11 +309,13 @@ pub(crate) fn type_scan_tree(
         | "predicate_greaterequal"
         | "predicate_between"
         | "predicate_in_constlist" => {
-            let mut operands: Vec<TypeClass> = ["expression", "left", "right"]
+            let mut operands: Vec<(&Json, TypeClass)> = ["expression", "left", "right"]
                 .iter()
-                .filter_map(|field| class_of(field))
+                .filter_map(|field| Some((node.get(*field)?, class_of(field)?)))
                 .collect();
-            operands.extend(classes_of("arguments"));
+            if let Some(Json::Array(args)) = node.get("arguments") {
+                operands.extend(args.iter().zip(classes_of("arguments")));
+            }
             compare_without_session_parse(node, &operands)?;
             TypeClass::Boolean
         }
@@ -374,14 +376,51 @@ pub(crate) fn type_scan_tree(
     Ok((out, class))
 }
 
+/// Exasol's exact type of `node` where the request states it: the node's own `dataType` (a CAST)
+/// or a column's type. `None` otherwise: callers decline rather than copy Exasol's typing rules,
+/// which depend on literal values, the session, and the version (#476).
+pub fn exact_expression_type(node: &Json, columns: &dyn ColumnTypeLookup) -> Option<ExasolType> {
+    if let Some(data_type) = node.get("dataType") {
+        return exasol_type_from_json(data_type).ok();
+    }
+    if kind(node) == "column" {
+        columns.column_type(node)
+    } else {
+        None
+    }
+}
+
+/// A digits-only literal reads as the same integer in every session, so comparing it with an
+/// integer needs no session setting.
+fn is_session_free_integer_text(node: &Json) -> bool {
+    kind(node) == "literal_string"
+        && node.get("value").and_then(Json::as_str).is_some_and(|s| {
+            let digits = s.strip_prefix('-').unwrap_or(s);
+            (1..=18).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
 /// Exasol compares text with a date, timestamp, or number by converting the text with the
 /// session's NLS settings; DataFusion always parses ISO dates and a `.` decimal point.
-fn compare_without_session_parse(node: &Json, operands: &[TypeClass]) -> Result<(), UdfError> {
-    let has_text = operands.iter().any(|c| matches!(c, TypeClass::Text { .. }));
-    let has_non_text = operands
+fn compare_without_session_parse(
+    node: &Json,
+    operands: &[(&Json, TypeClass)],
+) -> Result<(), UdfError> {
+    let text: Vec<&Json> = operands
         .iter()
-        .any(|c| !matches!(c, TypeClass::Text { .. } | TypeClass::Null));
-    if has_text && has_non_text {
+        .filter(|(_, c)| matches!(c, TypeClass::Text { .. }))
+        .map(|(n, _)| *n)
+        .collect();
+    let non_text: Vec<TypeClass> = operands
+        .iter()
+        .map(|(_, c)| *c)
+        .filter(|c| !matches!(c, TypeClass::Text { .. } | TypeClass::Null))
+        .collect();
+    let integer_against_digits = non_text
+        .iter()
+        .all(|c| matches!(c, TypeClass::Integer { .. }))
+        && text.iter().all(|n| is_session_free_integer_text(n));
+    if !text.is_empty() && !non_text.is_empty() && !integer_against_digits {
         return Err(decline(format!(
             "comparing text with another type parses the text by the session's NLS settings: {}",
             short(node)

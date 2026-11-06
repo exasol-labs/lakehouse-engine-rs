@@ -2,9 +2,8 @@ use crate::scan::spec::AggregatePlan;
 use serde_json::Value as Json;
 
 use super::scalar_over_agg::{
-    NESTED_AGGREGATE_PLAN_TYPE, arg_column_or_expr, cast_merge_items,
-    classify_scalar_over_aggregate, fold_aggregate_plan, merge_select_items, parse_agg_item,
-    render_scalar_over_merge,
+    arg_column_or_expr, cast_merge_items, classify_scalar_over_aggregate, fold_aggregate_plan,
+    nested_aggregate_type, parse_agg_item, render_scalar_over_merge,
 };
 use super::support::{ColumnTypes, PushdownRequest, cast_to_declared_type};
 use crate::types::exasol_type::ExasolType;
@@ -90,7 +89,7 @@ pub fn ordinary_plans(items: &[SingleGroupItem], col_types: &ColumnTypes) -> Vec
             }
             SingleGroupItem::Distinct(_) => {}
             SingleGroupItem::ScalarOverAggregate { node, .. } => {
-                for plan in classify_scalar_over_aggregate(node, col_types)
+                for (plan, _) in classify_scalar_over_aggregate(node, col_types)
                     .into_iter()
                     .flatten()
                 {
@@ -102,30 +101,42 @@ pub fn ordinary_plans(items: &[SingleGroupItem], col_types: &ColumnTypes) -> Vec
     plans
 }
 
-/// Aligned 1:1 with `ordinary_plans(items)`. This list also types the scan's
-/// `EMITS`, so a slot reached only through a nested aggregate takes
-/// [`NESTED_AGGREGATE_PLAN_TYPE`] rather than the `VARCHAR(2000000)` default.
+/// Aligned 1:1 with `ordinary_plans(items)`. This list also types the scan's `EMITS`. A
+/// top-level item's declared type wins; a slot reached only through a nested aggregate takes
+/// [`nested_aggregate_type`]. `None` when any slot has no exact type (#476).
 pub fn single_group_plan_types(
     select_types: &[ExasolType],
     items: &[SingleGroupItem],
     col_types: &ColumnTypes,
-) -> Vec<ExasolType> {
+) -> Option<Vec<ExasolType>> {
     let plans = ordinary_plans(items, col_types);
-    let mut plan_types = vec![NESTED_AGGREGATE_PLAN_TYPE; plans.len()];
-
+    let mut plan_types: Vec<Option<ExasolType>> = vec![None; plans.len()];
+    let slot_of = |plan: &AggregatePlan| {
+        plans
+            .iter()
+            .position(|p| p == plan)
+            .expect("ordinary_plans folds every aggregate plan in")
+    };
     for (select_index, item) in items.iter().enumerate() {
-        if let SingleGroupItem::Aggregate(plan) = item {
-            let slot = plans
-                .iter()
-                .position(|p| p == plan)
-                .expect("ordinary_plans folds every top-level Aggregate item's plan in");
-            if let Some(&declared) = select_types.get(select_index) {
-                plan_types[slot] = declared;
+        match item {
+            SingleGroupItem::Aggregate(plan) => {
+                plan_types[slot_of(plan)] = select_types.get(select_index).copied();
+            }
+            SingleGroupItem::Distinct(_) => {}
+            SingleGroupItem::ScalarOverAggregate { node, .. } => {
+                for (plan, agg) in classify_scalar_over_aggregate(node, col_types)
+                    .into_iter()
+                    .flatten()
+                {
+                    let slot = &mut plan_types[slot_of(&plan)];
+                    if slot.is_none() {
+                        *slot = nested_aggregate_type(&agg, &plan, col_types);
+                    }
+                }
             }
         }
     }
-
-    plan_types
+    plan_types.into_iter().collect()
 }
 
 /// `None` when any item has no merge expression (a `COUNT(DISTINCT)` or an
@@ -137,7 +148,7 @@ pub(super) fn single_group_merge_select(
     plan_types: &[ExasolType],
     col_types: &ColumnTypes,
 ) -> Option<Vec<String>> {
-    let merged = merge_select_items(plans);
+    // Cast before any outer scalar applies, so `SUM(a) / 2` stays exact (#476).
     let cast_merged = cast_merge_items(plans, plan_types, col_types);
     items
         .iter()
@@ -151,7 +162,7 @@ pub(super) fn single_group_merge_select(
                 node,
                 declared_type,
                 ..
-            } => render_scalar_over_merge(node, plans, &merged, col_types)
+            } => render_scalar_over_merge(node, plans, &cast_merged, col_types)
                 .map(|expr| cast_to_declared_type(&expr, *declared_type)),
         })
         .collect()

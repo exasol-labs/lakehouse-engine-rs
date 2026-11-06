@@ -827,7 +827,7 @@ fn stat_aggregate_over_bare_column_still_parses() {
 fn single_group_plan_types_returns_empty_vec_for_no_items() {
     assert_eq!(
         single_group_plan_types(&[], &[], &ColumnTypes::default()),
-        Vec::<ExasolType>::new()
+        Some(Vec::<ExasolType>::new())
     );
 }
 
@@ -848,16 +848,17 @@ fn single_group_plan_types_aligns_with_bare_aggregate_select_list() {
         .expect("a bare aggregate list must decompose");
     assert_eq!(
         single_group_plan_types(req.select_types(), &items, &ColumnTypes::default()),
-        vec![
+        Some(vec![
             ExasolType::decimal(36, 2),
             ExasolType::decimal(18, 0),
             ExasolType::decimal(9, 4),
-        ]
+        ])
     );
 }
 
 #[test]
-fn single_group_plan_types_defaults_when_reached_only_through_scalar_wrapper() {
+fn single_group_plan_types_types_a_slot_reached_only_through_scalar_wrapper() {
+    let col_types = column_types(&[("L_QUANTITY", ExasolType::decimal(15, 2))]);
     let req = pushdown_request("T", NO_COLUMNS)
         .item(
             round_expr(
@@ -870,20 +871,19 @@ fn single_group_plan_types_defaults_when_reached_only_through_scalar_wrapper() {
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
-    let items =
-        detect_aggregates(&req, &ColumnTypes::default()).expect("ROUND(SUM/COUNT) must decompose");
+    let items = detect_aggregates(&req, &col_types).expect("ROUND(SUM/COUNT) must decompose");
     assert_eq!(
-        single_group_plan_types(req.select_types(), &items, &ColumnTypes::default()),
-        vec![ExasolType::DoublePrecision, ExasolType::DoublePrecision],
+        single_group_plan_types(req.select_types(), &items, &col_types),
+        Some(vec![ExasolType::decimal(26, 2), ExasolType::decimal(18, 0)]),
         "neither nested aggregate has a top-level select-list entry of its own, so \
-         both slots take the nested-only numeric default"
+         both slots take Exasol's result type of the aggregate"
     );
 }
 
 #[test]
 fn single_group_plan_types_prefers_top_level_declared_type_for_shared_slot() {
+    let col_types = column_types(&[("L_QUANTITY", ExasolType::decimal(15, 2))]);
     let req = pushdown_request("T", NO_COLUMNS)
-        .count_star()
         .item(
             round_expr(
                 float_div(
@@ -892,16 +892,19 @@ fn single_group_plan_types_prefers_top_level_declared_type_for_shared_slot() {
                 ),
                 2,
             ),
+            ExasolType::decimal(9, 4),
+        )
+        .item(
+            agg_item("SUM", Some("L_QUANTITY"), false),
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
-    let items = detect_aggregates(&req, &ColumnTypes::default())
-        .expect("COUNT(*) + ROUND(SUM/COUNT) must decompose");
+    let items = detect_aggregates(&req, &col_types).expect("ROUND(SUM/COUNT) + SUM must decompose");
     assert_eq!(
-        single_group_plan_types(req.select_types(), &items, &ColumnTypes::default()),
-        vec![ExasolType::decimal(18, 0), ExasolType::DoublePrecision],
-        "slot 0 (COUNT) takes its bare declared type; slot 1 (SUM) has no top-level \
-         occurrence and keeps the nested-only numeric default"
+        single_group_plan_types(req.select_types(), &items, &col_types),
+        Some(vec![ExasolType::decimal(36, 2), ExasolType::decimal(18, 0)]),
+        "slot 0 (SUM) takes its top-level declared type, not the nested DECIMAL(26,2); \
+         slot 1 (COUNT) has no top-level occurrence and takes its nested type"
     );
 }
 
@@ -928,7 +931,7 @@ fn single_group_plan_types_resolves_both_ends_of_an_interleaved_list() {
         .expect("an interleaved list must decompose");
     assert_eq!(
         single_group_plan_types(req.select_types(), &items, &ColumnTypes::default()),
-        vec![ExasolType::decimal(36, 2), ExasolType::decimal(18, 0)],
+        Some(vec![ExasolType::decimal(36, 2), ExasolType::decimal(18, 0)]),
         "slot 0 (SUM) takes ordinal 0's type; slot 1 (COUNT) takes ordinal 2's type, \
          never ordinal 1's scalar-item type"
     );
@@ -950,13 +953,13 @@ fn single_group_plan_types_skips_distinct_items() {
         .expect("SUM + COUNT(DISTINCT) must decompose");
     assert_eq!(
         single_group_plan_types(req.select_types(), &items, &ColumnTypes::default()),
-        vec![ExasolType::decimal(36, 2)],
+        Some(vec![ExasolType::decimal(36, 2)]),
         "the COUNT(DISTINCT) item contributes no ordinary-aggregate slot"
     );
 }
 
 #[test]
-fn nested_only_expression_argument_min_emits_a_numeric_partial_column() {
+fn single_group_plan_types_declines_a_nested_only_aggregate_over_an_untyped_expression() {
     let req = pushdown_request("T", NO_COLUMNS)
         .item(
             round_expr(
@@ -972,33 +975,34 @@ fn nested_only_expression_argument_min_emits_a_numeric_partial_column() {
         .build_pushdown();
     let items = detect_aggregates(&req, &ColumnTypes::default())
         .expect("ROUND(MIN(A * B), 2) must decompose");
-    let plans = ordinary_plans(&items, &ColumnTypes::default());
-    let plan_types = single_group_plan_types(req.select_types(), &items, &ColumnTypes::default());
     assert_eq!(
-        partial_emits_items(&plans, &ColumnTypes::default(), &plan_types),
-        vec![r#""PARTIAL_min_0" DOUBLE PRECISION"#.to_string()],
-        "a nested-only MIN over an expression must emit a numeric partial column"
+        single_group_plan_types(req.select_types(), &items, &ColumnTypes::default()),
+        None,
+        "a guessed partial type would break the merge, so an untyped MIN(A * B) declines (#476)"
     );
 }
 
 #[test]
 fn merge_select_wraps_scalar_structure_around_the_merged_partial() {
+    let col_types = column_types(&[("L_QUANTITY", ExasolType::decimal(15, 2))]);
     let req = pushdown_request("T", NO_COLUMNS)
         .item(
             round_expr(agg_item("SUM", Some("L_QUANTITY"), false), 2),
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
-    let items = detect_aggregates(&req, &ColumnTypes::default())
-        .expect("ROUND(SUM(col), 2) must decompose");
-    let plans = ordinary_plans(&items, &ColumnTypes::default());
-    let plan_types = single_group_plan_types(req.select_types(), &items, &ColumnTypes::default());
+    let items = detect_aggregates(&req, &col_types).expect("ROUND(SUM(col), 2) must decompose");
+    let plans = ordinary_plans(&items, &col_types);
+    let plan_types = single_group_plan_types(req.select_types(), &items, &col_types)
+        .expect("SUM over a typed column is exactly typed");
 
     assert_eq!(
-        single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
+        single_group_merge_select(&items, &plans, &plan_types, &col_types),
         Some(vec![
-            r#"CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(36,2))"#.to_string()
-        ])
+            r#"CAST(ROUND(CAST(SUM("PARTIAL_sum_0") AS DECIMAL(26,2)), 2) AS DECIMAL(36,2))"#
+                .to_string()
+        ]),
+        "the merged SUM is cast to Exasol's SUM type before ROUND applies (#476)"
     );
 }
 
@@ -1024,13 +1028,14 @@ fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
     let items = detect_aggregates(&req, &ColumnTypes::default())
         .expect("an interleaved list must decompose");
     let plans = ordinary_plans(&items, &ColumnTypes::default());
-    let plan_types = single_group_plan_types(req.select_types(), &items, &ColumnTypes::default());
+    let plan_types = single_group_plan_types(req.select_types(), &items, &ColumnTypes::default())
+        .expect("every slot is exactly typed");
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
         Some(vec![
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2))"#.to_string(),
-            r#"CAST(ROUND((SUM("PARTIAL_sum_0") / SUM("PARTIAL_count_1")), 2) AS DECIMAL(9,4))"#
+            r#"CAST(ROUND((CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2)) / CAST(SUM("PARTIAL_count_1") AS DECIMAL(18,0))), 2) AS DECIMAL(9,4))"#
                 .to_string(),
             r#"CAST(SUM("PARTIAL_count_1") AS DECIMAL(18,0))"#.to_string(),
         ])
@@ -1052,7 +1057,8 @@ fn merge_select_declines_a_list_holding_a_distinct_item() {
     let items = detect_aggregates(&req, &ColumnTypes::default())
         .expect("SUM + COUNT(DISTINCT) must decompose");
     let plans = ordinary_plans(&items, &ColumnTypes::default());
-    let plan_types = single_group_plan_types(req.select_types(), &items, &ColumnTypes::default());
+    let plan_types = single_group_plan_types(req.select_types(), &items, &ColumnTypes::default())
+        .expect("every slot is exactly typed");
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
@@ -1072,7 +1078,8 @@ fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
         declared_type: ExasolType::decimal(18, 0),
     }];
     let plans = ordinary_plans(&items, &ColumnTypes::default());
-    let plan_types = single_group_plan_types(&[], &items, &ColumnTypes::default());
+    let plan_types = single_group_plan_types(&[], &items, &ColumnTypes::default())
+        .expect("an unclassifiable scalar contributes no slot to type");
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
@@ -1097,7 +1104,8 @@ fn merge_select_emits_one_item_per_selectlist_item_for_duplicate_aggregates() {
     let items = detect_aggregates(&req, &ColumnTypes::default())
         .expect("a duplicated aggregate must decompose");
     let plans = ordinary_plans(&items, &ColumnTypes::default());
-    let plan_types = single_group_plan_types(req.select_types(), &items, &ColumnTypes::default());
+    let plan_types = single_group_plan_types(req.select_types(), &items, &ColumnTypes::default())
+        .expect("every slot is exactly typed");
     assert_eq!(plans.len(), 1, "one partial column for both occurrences");
 
     assert_eq!(

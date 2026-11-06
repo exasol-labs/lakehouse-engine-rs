@@ -3,39 +3,68 @@
 
 use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column_name};
 use serde_json::Value as Json;
-use vs_expression::{ColumnNode, render_expression_exasol};
+use vs_expression::{ColumnNode, exact_expression_type, render_expression_exasol};
 
 use super::support::{ColumnTypes, cast_to_declared_type, quote_ident, scan_expression};
 use crate::scan::spec::ColumnRef;
 use crate::types::exasol_type::{ExasolType, MAX_DECIMAL_PRECISION};
 
-/// Declared type of a plan slot reached only through a nested aggregate. Numeric,
-/// not `VARCHAR`, because the per-plan type also types the scan's `EMITS`: a
-/// character type would make an expression-argument MIN/MAX lexicographic.
-pub(super) const NESTED_AGGREGATE_PLAN_TYPE: ExasolType = ExasolType::DoublePrecision;
-
 /// Deduplicates by `AggregatePlan` equality so an aggregate used bare and nested
 /// collapses to one `PARTIAL_*` column (decision-log [4]). A `Some` declared type
-/// always overwrites a slot a nested occurrence created with the default.
+/// always overwrites the slot's type.
 pub(super) fn fold_aggregate_plan(
     plans: &mut Vec<AggregatePlan>,
-    plan_types: &mut Vec<ExasolType>,
+    plan_types: &mut Vec<Option<ExasolType>>,
     plan: AggregatePlan,
     declared: Option<ExasolType>,
 ) -> usize {
     match plans.iter().position(|p| *p == plan) {
         Some(slot) => {
-            if let Some(ty) = declared {
-                plan_types[slot] = ty;
+            if declared.is_some() {
+                plan_types[slot] = declared;
             }
             slot
         }
         None => {
             let slot = plans.len();
             plans.push(plan);
-            plan_types.push(declared.unwrap_or(NESTED_AGGREGATE_PLAN_TYPE));
+            plan_types.push(declared);
             slot
         }
+    }
+}
+
+/// Exasol's result type of an aggregate the select list does not type. `None` when it depends on
+/// an argument without an exact type: a guessed partial type breaks the merge (#476).
+pub(super) fn nested_aggregate_type(
+    agg: &Json,
+    plan: &AggregatePlan,
+    col_types: &ColumnTypes,
+) -> Option<ExasolType> {
+    match plan.kind {
+        AggKind::Count | AggKind::CountCol => Some(ExasolType::decimal(18, 0)),
+        AggKind::Sum | AggKind::Min | AggKind::Max => {
+            let arg = agg.get("arguments")?.as_array()?.first()?;
+            let arg_type = exact_expression_type(arg, col_types)?;
+            if plan.kind == AggKind::Sum {
+                sum_result_type(arg_type)
+            } else {
+                Some(arg_type)
+            }
+        }
+        _ => Some(ExasolType::DoublePrecision),
+    }
+}
+
+/// Exasol types `SUM` over `DECIMAL(p,s)` as `DECIMAL(min(p+11, 36), s)`.
+fn sum_result_type(arg_type: ExasolType) -> Option<ExasolType> {
+    match arg_type {
+        ExasolType::DoublePrecision => Some(arg_type),
+        ExasolType::Decimal(decimal) => Some(ExasolType::decimal(
+            (decimal.precision() + 11).min(MAX_DECIMAL_PRECISION),
+            decimal.scale(),
+        )),
+        _ => None,
     }
 }
 
@@ -94,10 +123,11 @@ pub(super) fn sentinelize_aggregates(
 
 /// The scalar runs in Exasol over the merged aggregates, so it is checked in the Exasol dialect;
 /// only the aggregate arguments run in the scan.
+/// Each plan comes with its aggregate node, which [`nested_aggregate_type`] types.
 pub(super) fn classify_scalar_over_aggregate(
     node: &Json,
     col_types: &ColumnTypes,
-) -> Option<Vec<AggregatePlan>> {
+) -> Option<Vec<(AggregatePlan, Json)>> {
     let mut aggregates = Vec::new();
     let mut residual_column = false;
     let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
@@ -106,8 +136,8 @@ pub(super) fn classify_scalar_over_aggregate(
     }
     render_expression_exasol(&sentinel_tree).ok()?;
     aggregates
-        .iter()
-        .map(|agg| parse_agg_item(agg, col_types))
+        .into_iter()
+        .map(|agg| Some((parse_agg_item(&agg, col_types)?, agg)))
         .collect()
 }
 

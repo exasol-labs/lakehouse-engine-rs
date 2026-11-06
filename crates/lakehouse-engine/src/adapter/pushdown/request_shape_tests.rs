@@ -249,7 +249,7 @@ fn grouped_order_by_group_key_classifies_grouped_with_resolved_clause() {
     match classify_request_shape(&req, &col_types()) {
         RequestShape::Grouped { order_by, .. } => assert_eq!(
             order_by.as_deref(),
-            Some("1 ASC NULLS LAST"),
+            Some(r#""GK_0" ASC NULLS LAST"#),
             "the classifier must carry the resolved merge ORDER BY"
         ),
         other => panic!("expected Grouped, got {other:?}"),
@@ -269,6 +269,7 @@ fn single_group_numeric_aggregate_classifies_as_single_group() {
         RequestShape::SingleGroupAgg {
             items,
             having: None,
+            ..
         } => assert_eq!(items.len(), 1),
         other => panic!("expected SingleGroupAgg, got {other:?}"),
     }

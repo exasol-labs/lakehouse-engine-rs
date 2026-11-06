@@ -476,22 +476,6 @@ fn orders_local_declined_conjunct() -> Json {
     })
 }
 
-fn orders_local_rendering_and_declined_filter() -> Json {
-    serde_json::json!({
-        "type": "predicate_and",
-        "expressions": [
-            orders_local_rendering_conjunct(),
-            orders_local_declined_conjunct(),
-        ],
-    })
-}
-
-fn customer_col_types() -> Vec<(String, ExasolType)> {
-    involved_table(&join_request(Json::Null, equi_condition()), "CUSTOMER")
-        .unwrap()
-        .types
-}
-
 fn orders_col_types() -> Vec<(String, ExasolType)> {
     involved_table(&join_request(Json::Null, equi_condition()), "ORDERS")
         .unwrap()

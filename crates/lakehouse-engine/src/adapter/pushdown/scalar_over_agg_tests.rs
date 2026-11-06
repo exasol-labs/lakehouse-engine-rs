@@ -1,5 +1,7 @@
 use super::*;
-use crate::adapter::pushdown::test_support::{EXASOL_TYPE_SPELLINGS, col, num_lit};
+use crate::adapter::pushdown::test_support::{
+    EXASOL_TYPE_SPELLINGS, cast_to, col, column_types, num_lit,
+};
 
 fn agg(name: &str, column: &str, distinct: bool) -> Json {
     serde_json::json!({
@@ -79,7 +81,7 @@ fn fold_keeps_structurally_different_aggregates_in_separate_slots() {
 }
 
 #[test]
-fn fold_defaults_a_nested_only_occurrence_to_double_precision() {
+fn fold_leaves_a_nested_only_occurrence_untyped() {
     let mut plans = Vec::new();
     let mut types = Vec::new();
 
@@ -90,7 +92,7 @@ fn fold_defaults_a_nested_only_occurrence_to_double_precision() {
         None,
     );
 
-    assert_eq!(types, vec![ExasolType::DoublePrecision]);
+    assert_eq!(types, vec![None]);
 }
 
 #[test]
@@ -114,8 +116,8 @@ fn fold_declared_type_overwrites_a_slot_created_by_a_nested_occurrence() {
     assert_eq!(slot, 0);
     assert_eq!(
         types,
-        vec![ExasolType::decimal(18, 2)],
-        "a top-level occurrence's declared type must win over the nested default"
+        vec![Some(ExasolType::decimal(18, 2))],
+        "a top-level occurrence's declared type must fill the slot a nested occurrence left untyped"
     );
 }
 
@@ -137,7 +139,7 @@ fn fold_keeps_a_declared_type_when_a_nested_occurrence_follows_it() {
         None,
     );
 
-    assert_eq!(types, vec![ExasolType::decimal(18, 2)]);
+    assert_eq!(types, vec![Some(ExasolType::decimal(18, 2))]);
 }
 
 #[test]
@@ -197,7 +199,10 @@ fn classify_returns_the_nested_plans_in_encounter_order() {
 
     assert_eq!(
         plans,
-        vec![plan_of(&agg("SUM", "X", false)), plan_of(&count_star())]
+        vec![
+            (plan_of(&agg("SUM", "X", false)), agg("SUM", "X", false)),
+            (plan_of(&count_star()), count_star()),
+        ]
     );
 }
 
@@ -214,7 +219,10 @@ fn classify_accepts_a_bare_aggregate_as_its_own_single_plan() {
     let plans = classify_scalar_over_aggregate(&agg("SUM", "X", false), &ColumnTypes::default())
         .expect("a bare aggregate is structurally decomposable");
 
-    assert_eq!(plans, vec![plan_of(&agg("SUM", "X", false))]);
+    assert_eq!(
+        plans,
+        vec![(plan_of(&agg("SUM", "X", false)), agg("SUM", "X", false))]
+    );
 }
 
 #[test]
@@ -308,14 +316,14 @@ fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
         .expect("ROUND(SUM(X) / COUNT(*), 2) must classify as scalar-over-aggregate");
 
     let mut grouped_plans = vec![plan_of(&agg("COUNT", "L_ORDERKEY", false))];
-    let mut grouped_types = vec![ExasolType::decimal(18, 0)];
-    for plan in &nested {
+    let mut grouped_types = vec![Some(ExasolType::decimal(18, 0))];
+    for (plan, _) in &nested {
         fold_aggregate_plan(&mut grouped_plans, &mut grouped_types, plan.clone(), None);
     }
 
     let mut single_group_plans: Vec<AggregatePlan> = Vec::new();
-    let mut single_group_types: Vec<ExasolType> = Vec::new();
-    for plan in &nested {
+    let mut single_group_types: Vec<Option<ExasolType>> = Vec::new();
+    for (plan, _) in &nested {
         fold_aggregate_plan(
             &mut single_group_plans,
             &mut single_group_types,
@@ -389,4 +397,48 @@ fn sum_widens_a_decimal_to_precision_36_and_every_other_variant_to_double() {
         };
         assert_eq!(sum_emit_type(exa_type), expected, "{exa_type}");
     }
+}
+
+fn nested_type_of(agg_node: &Json, col_types: &ColumnTypes) -> Option<ExasolType> {
+    let plan = parse_agg_item(agg_node, col_types).expect("test aggregate must parse to a plan");
+    nested_aggregate_type(agg_node, &plan, col_types)
+}
+
+#[test]
+fn nested_aggregate_type_is_exasols_result_type_of_the_aggregate() {
+    let col_types = column_types(&[("X", ExasolType::decimal(9, 2))]);
+    let cases = [
+        ("COUNT(*)", count_star(), ExasolType::decimal(18, 0)),
+        (
+            "SUM over DECIMAL(9,2) widens by 11 digits",
+            agg("SUM", "X", false),
+            ExasolType::decimal(20, 2),
+        ),
+        (
+            "MAX over a CAST takes the CAST's type, not the column's",
+            serde_json::json!({
+                "type": "function_aggregate", "name": "MAX", "distinct": false,
+                "arguments": [cast_to(ExasolType::decimal(5, 1), col("X"))]
+            }),
+            ExasolType::decimal(5, 1),
+        ),
+    ];
+    for (label, agg_node, expected) in cases {
+        assert_eq!(
+            nested_type_of(&agg_node, &col_types),
+            Some(expected),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn nested_aggregate_type_declines_an_argument_without_an_exact_type() {
+    let col_types = column_types(&[("X", ExasolType::decimal(9, 2))]);
+    let max_of_expression = serde_json::json!({
+        "type": "function_aggregate", "name": "MAX", "distinct": false,
+        "arguments": [binary("ADD", col("X"), num_lit(1))]
+    });
+
+    assert_eq!(nested_type_of(&max_of_expression, &col_types), None);
 }

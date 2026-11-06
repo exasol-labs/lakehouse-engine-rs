@@ -2,6 +2,7 @@ use super::super::detect_aggregates;
 use super::super::joins::{
     FanOutProjection, build_qualified_single_table_fallback_sql, referenced_columns,
 };
+use super::super::scalar_over_agg::merge_select_items;
 use super::super::support::{
     DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, involved_columns, shard_count,
 };
@@ -306,6 +307,47 @@ fn grouped_spec(result: &GroupedAggregateDetection) -> ScanSpec {
     .with_files(vec![])
 }
 
+/// The grouped ORDER BY over `detection`'s merge, scoped as `classify_request_shape` scopes it.
+fn order_by_over_merge(
+    req: &PushdownRequest,
+    detection: &GroupedAggregateDetection,
+    col_types: &ColumnTypes,
+) -> Option<GroupedOrderBy> {
+    let merged = cast_merge_items(&detection.plans, &detection.plan_types, col_types);
+    let scope = MergeScope {
+        plans: &detection.plans,
+        merged: &merged,
+        group_keys: &detection.group_keys,
+    };
+    build_grouped_order_by_clause(req.json(), &scope, col_types)
+}
+
+/// A HAVING over `detection`'s merge, scoped as `classify_request_shape` scopes it.
+fn having_over_merge(
+    node: &Json,
+    detection: &GroupedAggregateDetection,
+    col_types: &ColumnTypes,
+) -> Option<String> {
+    let merged = cast_merge_items(&detection.plans, &detection.plan_types, col_types);
+    let scope = MergeScope {
+        plans: &detection.plans,
+        merged: &merged,
+        group_keys: &detection.group_keys,
+    };
+    render_having_over_merge(node, &scope, col_types)
+}
+
+/// A HAVING over `plans` alone, each merged by its uncast partial merge, with no group key.
+fn having_over_plans(node: &Json, plans: &[AggregatePlan]) -> Option<String> {
+    let merged = merge_select_items(plans);
+    let scope = MergeScope {
+        plans,
+        merged: &merged,
+        group_keys: &[],
+    };
+    render_having_over_merge(node, &scope, &ColumnTypes::default())
+}
+
 #[test]
 fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
     let req = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
@@ -322,9 +364,11 @@ fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
     let result =
         detect_group_by_aggregates(&req, &ColumnTypes::default()).expect("grouped aggregate");
     assert_eq!(
-        build_grouped_order_by_clause(req.json(), &result, &ColumnTypes::default()),
-        Some(GroupedOrderBy::Clause("1 ASC NULLS LAST".to_string())),
-        "grouped ORDER BY must map the sort key to its 1-based output ordinal"
+        order_by_over_merge(&req, &result, &ColumnTypes::default()),
+        Some(GroupedOrderBy::Clause(
+            r#""GK_0" ASC NULLS LAST"#.to_string()
+        )),
+        "grouped ORDER BY must sort a group key on its typed GK_* column"
     );
 
     let group_key_types = group_key_exasol_types(
@@ -348,10 +392,10 @@ fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         None,
-        Some("1 ASC NULLS LAST"),
+        Some(r#""GK_0" ASC NULLS LAST"#),
     );
     assert!(
-        sql.contains(" ORDER BY 1 ASC NULLS LAST"),
+        sql.contains(r#" ORDER BY "GK_0" ASC NULLS LAST"#),
         "merge SQL must render the explicit final ORDER BY: {sql}"
     );
     assert!(!sql.contains("LIMIT"), "no LIMIT requested: {sql}");
@@ -384,11 +428,13 @@ fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
     let detection =
         detect_group_by_aggregates(&req, &ColumnTypes::default()).expect("grouped aggregate");
     assert_eq!(
-        build_grouped_order_by_clause(req.json(), &detection, &ColumnTypes::default()),
+        order_by_over_merge(&req, &detection, &ColumnTypes::default()),
         Some(GroupedOrderBy::Clause(
-            r#"SUM("PARTIAL_sum_0") DESC NULLS LAST, 1 ASC NULLS FIRST"#.to_string()
+            r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2)) DESC NULLS LAST, "GK_0" ASC NULLS FIRST"#
+                .to_string()
         )),
-        "an aggregate sort key must render as its merged partial, a group key as its ordinal"
+        "an aggregate sort key must render as its typed merged partial, a group key as its \
+         GK_* column"
     );
 }
 
@@ -408,7 +454,7 @@ fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
     let detection =
         detect_group_by_aggregates(&req, &ColumnTypes::default()).expect("grouped aggregate");
     assert_eq!(
-        build_grouped_order_by_clause(req.json(), &detection, &ColumnTypes::default()),
+        order_by_over_merge(&req, &detection, &ColumnTypes::default()),
         Some(GroupedOrderBy::Unresolvable),
         "an aggregate with no matching plan must not resolve to a fabricated partial"
     );
@@ -475,7 +521,8 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
         .field("type", "select")
         .item(null_lit(), ExasolType::Boolean)
         .build_pushdown();
-    let result = detect_group_by_aggregates(&req, &ColumnTypes::default()).expect(
+    let col_types = column_types(&[("ID", ExasolType::decimal(20, 0))]);
+    let result = detect_group_by_aggregates(&req, &col_types).expect(
         "composed literal-only selectList must preserve GROUP BY, not fall back to row scan",
     );
     assert_eq!(result.group_keys.len(), 1, "one group key from groupBy");
@@ -501,13 +548,8 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
     );
 
     // A row-scan fallback would return one row per source row, not per group.
-    let group_key_types = group_key_exasol_types(
-        &req,
-        &result.group_keys,
-        &result.select_items,
-        &ColumnTypes::default(),
-    )
-    .unwrap();
+    let group_key_types =
+        group_key_exasol_types(&req, &result.group_keys, &result.select_items, &col_types).unwrap();
     let sql = build_grouped_aggregate_scan_sql(
         &CommonScanSpec {
             aggregates: Some(result.plans.clone()),
@@ -524,7 +566,7 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
         &result.select_items,
         None,
         0,
-        &column_types(&[("ID", ExasolType::decimal(20, 0))]),
+        &col_types,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         None,
@@ -845,7 +887,7 @@ fn build_grouped_agg_sql(
         &spec_template,
         &shards,
         &group_keys,
-        &[],
+        &vec![GROUP_KEY_EMIT_TYPE; group_keys.len()],
         &agg_plans,
         &vec![ExasolType::DoublePrecision; agg_plans.len()],
         &select_items,
@@ -994,7 +1036,7 @@ fn grouped_common_blob_has_no_limit() {
         &spec_template,
         &shards,
         &["\"REGION\"".to_string()],
-        &[],
+        &[GROUP_KEY_EMIT_TYPE],
         &[AggregatePlan {
             kind: AggKind::Count,
             column: None,
@@ -1043,7 +1085,7 @@ fn grouped_merge_offset_never_reaches_per_shard_spec() {
         &spec_template,
         &shards,
         &["\"REGION\"".to_string()],
-        &[],
+        &[GROUP_KEY_EMIT_TYPE],
         &[AggregatePlan {
             kind: AggKind::Count,
             column: None,
@@ -1092,7 +1134,7 @@ fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
         &spec_template,
         &shards,
         &["\"REGION\"".to_string()],
-        &[],
+        &[GROUP_KEY_EMIT_TYPE],
         &[AggregatePlan {
             kind: AggKind::Count,
             column: None,
@@ -1767,8 +1809,8 @@ fn render_having_over_merge_rewrites_aggregate_to_partial() {
         column: Some("SCORE".into()),
         arg_expr: None,
     }];
-    let rendered = render_having_over_merge(&having, &plans, &ColumnTypes::default())
-        .expect("HAVING over a known aggregate must render");
+    let rendered =
+        having_over_plans(&having, &plans).expect("HAVING over a known aggregate must render");
     assert_eq!(
         rendered, r#"(SUM("PARTIAL_sum_0") > 250)"#,
         "HAVING must reference the merged partial, not the source column: {rendered}"
@@ -1804,7 +1846,7 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
         "left": agg_item("SUM", Some("SCORE"), false),
         "right": num_lit(250),
     });
-    let having = render_having_over_merge(&having_node, &detection.plans, &ColumnTypes::default())
+    let having = having_over_merge(&having_node, &detection, &ColumnTypes::default())
         .expect("HAVING must render over the merge decomposition");
 
     let col_types: Vec<(String, ExasolType)> =
@@ -1836,8 +1878,8 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
     let having_pos = sql.find("HAVING").expect("must contain HAVING");
     let having_clause = &sql[having_pos..];
     assert!(
-        having_clause.contains(r#"SUM("PARTIAL_sum_0") > 250"#),
-        "HAVING clause must use the merge expression: {having_clause}"
+        having_clause.contains(r#"CAST(SUM("PARTIAL_sum_0") AS DOUBLE PRECISION) > 250"#),
+        "HAVING clause must use the typed merge expression: {having_clause}"
     );
     assert!(
         !having_clause.contains(r#""SCORE""#) && !having_clause.contains("SUM(\"SCORE\")"),
@@ -1858,8 +1900,26 @@ fn render_having_over_merge_declines_unknown_aggregate() {
         arg_expr: None,
     }];
     assert!(
-        render_having_over_merge(&having, &plans, &ColumnTypes::default()).is_none(),
+        having_over_plans(&having, &plans).is_none(),
         "HAVING over an aggregate absent from the plans must not render"
+    );
+}
+
+#[test]
+fn having_over_a_group_key_reads_its_gk_column() {
+    let columns = [("REGION", ExasolType::varchar(100))];
+    let col_types = column_types(&columns);
+    let req = grouped_request(&columns, vec![col("REGION")])
+        .column(col("REGION"))
+        .count_star()
+        .build_pushdown();
+    let detection = detect_group_by_aggregates(&req, &col_types).expect("grouped aggregate");
+    let having = predicate_equal(col("REGION"), str_lit("EU"));
+
+    assert_eq!(
+        having_over_merge(&having, &detection, &col_types),
+        Some(r#"("GK_0" = 'EU')"#.to_string()),
+        "the merge has no source column, so a group key operand reads GK_0 (#551)"
     );
 }
 
@@ -1952,7 +2012,7 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
         "left": agg_item("SUM", Some("SCORE"), false),
         "right": num_lit(100),
     });
-    let having = render_having_over_merge(&having_node, &detection.plans, &ColumnTypes::default())
+    let having = having_over_merge(&having_node, &detection, &ColumnTypes::default())
         .expect("HAVING must render over the merge decomposition");
 
     let col_types: Vec<(String, ExasolType)> =
@@ -2216,6 +2276,33 @@ fn group_key_exasol_types_resolves_varchar_type_for_unprojected_group_key() {
 }
 
 #[test]
+fn unprojected_computed_group_key_without_a_cast_declines_the_split() {
+    let col_types = column_types(&[("ID", ExasolType::decimal(18, 0))]);
+    let req = grouped_request(NO_COLUMNS, vec![mod_item("ID", 4)])
+        .count_star()
+        .build_pushdown();
+
+    assert!(
+        detect_group_by_aggregates(&req, &col_types).is_none(),
+        "an unprojected MOD(ID, 4) key has no exact type to travel in (#476)"
+    );
+}
+
+#[test]
+fn unprojected_cast_group_key_keeps_its_cast_type() {
+    let col_types = column_types(&[("ID", ExasolType::decimal(18, 0))]);
+    let key = cast_to(ExasolType::decimal(9, 0), mod_item("ID", 4));
+    let req = grouped_request(NO_COLUMNS, vec![key])
+        .count_star()
+        .build_pushdown();
+
+    let detection =
+        detect_group_by_aggregates(&req, &col_types).expect("a CAST key states its exact type");
+
+    assert_eq!(detection.group_key_types, vec![ExasolType::decimal(9, 0)]);
+}
+
+#[test]
 fn group_key_exasol_types_prefers_select_list_type_over_group_by_type() {
     let req = grouped_request(NO_COLUMNS, vec![cast_to(ExasolType::char(20), col("NAME"))])
         .item(
@@ -2255,8 +2342,9 @@ fn constant_projection_casts_literal_to_char() {
         )
         .count_star()
         .build_pushdown();
-    let detection = detect_group_by_aggregates(&req, &ColumnTypes::default())
-        .expect("must detect grouped aggregate");
+    let col_types = column_types(&[("REGION", ExasolType::varchar(100))]);
+    let detection =
+        detect_group_by_aggregates(&req, &col_types).expect("must detect grouped aggregate");
 
     let projection = detection
         .select_items
@@ -2555,7 +2643,7 @@ fn having_clause_appears_in_outer_wrapper_only() {
         &spec_template,
         &shards,
         &[r#""REGION""#.to_string()],
-        &[],
+        &[GROUP_KEY_EMIT_TYPE],
         &[AggregatePlan {
             kind: AggKind::Sum,
             column: Some("AMOUNT".into()),
@@ -2584,252 +2672,6 @@ fn having_clause_appears_in_outer_wrapper_only() {
     assert!(
         having_pos > group_by_pos,
         "HAVING must appear after GROUP BY: {sql}"
-    );
-}
-
-const OVER_LENGTH_VALUE: &str = "over-length-value-abcdefg";
-
-/// Spelled out independently of the production formatter so a changed construct fails.
-fn expected_pad(fragment: &str, width: u32) -> String {
-    format!(
-        "CASE WHEN character_length({fragment}) < {width} \
-             THEN rpad({fragment}, {width}) ELSE {fragment} END"
-    )
-}
-
-#[test]
-fn char_declared_group_key_is_blank_padded_to_its_declared_width() {
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#.to_string();
-
-    let padded =
-        blank_pad_char_group_keys(std::slice::from_ref(&fragment), &[ExasolType::char(20)]);
-
-    assert_eq!(
-        padded,
-        vec![expected_pad(&fragment, 20)],
-        "a CHAR(20)-declared group key must be blank-padded to 20 characters on the \
-             DataFusion side: {padded:?}"
-    );
-}
-
-#[test]
-fn ascii_suffixed_char_group_key_width_is_parsed_before_the_suffix() {
-    let fragment = "CASE WHEN \"C_DECIMAL_A\" < 0 THEN 'NEG' ELSE 'POS' END".to_string();
-
-    let padded = blank_pad_char_group_keys(
-        std::slice::from_ref(&fragment),
-        &[ExasolType::Char {
-            size: 3,
-            ascii: true,
-        }],
-    );
-
-    assert_eq!(
-        padded,
-        vec![expected_pad(&fragment, 3)],
-        "a `CHAR(3) ASCII` group key must be padded to 3, not left unpadded because of \
-             the character-set suffix: {padded:?}"
-    );
-}
-
-#[test]
-fn char_pad_leaves_an_over_length_value_unmodified() {
-    let fragment = r#""NAME""#.to_string();
-
-    let padded =
-        blank_pad_char_group_keys(std::slice::from_ref(&fragment), &[ExasolType::char(20)])
-            .pop()
-            .expect("one padded group key");
-
-    assert!(
-        padded.starts_with(&format!("CASE WHEN character_length({fragment}) < 20 THEN")),
-        "the pad must be guarded by a shorter-than-width test, never unconditional: {padded}"
-    );
-    assert!(
-        padded.ends_with(&format!("ELSE {fragment} END")),
-        "an over-length value must pass through the ELSE branch unmodified: {padded}"
-    );
-    assert_eq!(
-        padded.matches("rpad(").count(),
-        1,
-        "rpad must appear exactly once, inside the guarded THEN branch: {padded}"
-    );
-    for truncating in ["substr", "substring", "left("] {
-        assert!(
-            !padded.contains(truncating),
-            "the pad must contain no truncating construct ({truncating}): {padded}"
-        );
-    }
-}
-
-/// Scenario: A VARCHAR dataType renders as VARCHAR(n) and its group key is not padded
-#[test]
-fn varchar_declared_group_key_is_left_unpadded() {
-    let keys = vec![r#""REGION""#.to_string()];
-
-    let padded = blank_pad_char_group_keys(&keys, &[ExasolType::varchar(10)]);
-
-    assert_eq!(
-        padded, keys,
-        "a VARCHAR-declared group key must be left unpadded: {padded:?}"
-    );
-}
-
-#[test]
-fn multi_key_pad_applies_only_to_the_char_slot() {
-    let keys = vec![
-        r#""REGION""#.to_string(),
-        r#"CAST("NAME" AS VARCHAR)"#.to_string(),
-    ];
-
-    let padded = blank_pad_char_group_keys(
-        &keys,
-        &[
-            ExasolType::varchar(10),
-            ExasolType::Char {
-                size: 5,
-                ascii: true,
-            },
-        ],
-    );
-
-    assert_eq!(
-        padded,
-        vec![keys[0].clone(), expected_pad(&keys[1], 5)],
-        "only the CHAR-declared slot may be padded, at its own width: {padded:?}"
-    );
-}
-
-#[tokio::test]
-async fn padded_group_key_merges_trailing_blank_variants_without_truncating() {
-    use arrow::array::{Array, Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    use datafusion::execution::context::SessionContext;
-    use std::sync::Arc;
-
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("V", DataType::Utf8, true)])),
-        vec![Arc::new(StringArray::from(vec![
-            Some("ab"),
-            Some("ab   "),
-            Some("cd"),
-            Some(OVER_LENGTH_VALUE),
-            None,
-        ]))],
-    )
-    .expect("fixture batch");
-    let ctx = SessionContext::new();
-    ctx.register_batch("t", batch)
-        .expect("fixture table registers");
-
-    let padded = blank_pad_char_group_keys(&[r#""V""#.to_string()], &[ExasolType::char(20)])
-        .pop()
-        .expect("one padded group key");
-    let sql = format!(r#"SELECT {padded}, COUNT(*) FROM (SELECT "V" FROM t) GROUP BY {padded}"#);
-
-    let batches = ctx
-        .sql(&sql)
-        .await
-        .expect("the padded group key must plan in DataFusion")
-        .collect()
-        .await
-        .expect("the padded group key must evaluate in DataFusion");
-
-    let mut groups: Vec<(Option<String>, i64)> = Vec::new();
-    for batch in &batches {
-        let keys = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("group key column is Utf8");
-        let counts = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("count column is Int64");
-        for row in 0..batch.num_rows() {
-            let key = if keys.is_null(row) {
-                None
-            } else {
-                Some(keys.value(row).to_string())
-            };
-            groups.push((key, counts.value(row)));
-        }
-    }
-    groups.sort();
-
-    assert_eq!(
-        groups.len(),
-        4,
-        "'ab' and 'ab   ' must merge into ONE group, leaving 4 groups: {groups:?}"
-    );
-    let merged = format!("{:<20}", "ab");
-    assert_eq!(
-        groups
-            .iter()
-            .find(|(k, _)| k.as_deref() == Some(merged.as_str()))
-            .map(|(_, c)| *c),
-        Some(2),
-        "'ab' and 'ab   ' must both pad to {merged:?} and count 2: {groups:?}"
-    );
-    assert_eq!(
-        groups
-            .iter()
-            .find(|(k, _)| k.as_deref() == Some(OVER_LENGTH_VALUE))
-            .map(|(_, c)| *c),
-        Some(1),
-        "the {} -character value must survive unmodified, never truncated to 20: {groups:?}",
-        OVER_LENGTH_VALUE.len()
-    );
-    assert_eq!(
-        groups.iter().find(|(k, _)| k.is_none()).map(|(_, c)| *c),
-        Some(1),
-        "a NULL group key must stay NULL through the pad: {groups:?}"
-    );
-}
-
-#[tokio::test]
-async fn padded_case_fragment_plans_and_evaluates_in_datafusion() {
-    use arrow::array::StringArray;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    use datafusion::execution::context::SessionContext;
-    use std::sync::Arc;
-
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("V", DataType::Utf8, true)])),
-        vec![Arc::new(StringArray::from(vec![Some("ab"), Some("cd")]))],
-    )
-    .expect("fixture batch");
-    let ctx = SessionContext::new();
-    ctx.register_batch("t", batch)
-        .expect("fixture table registers");
-
-    let case_fragment = r#"CASE WHEN "V" = 'ab' THEN 'NEG' ELSE 'POS' END"#.to_string();
-    let padded = blank_pad_char_group_keys(
-        &[case_fragment],
-        &[ExasolType::Char {
-            size: 3,
-            ascii: true,
-        }],
-    )
-    .pop()
-    .expect("one padded group key");
-    let sql = format!(r#"SELECT {padded}, COUNT(*) FROM (SELECT "V" FROM t) GROUP BY {padded}"#);
-
-    let batches = ctx
-        .sql(&sql)
-        .await
-        .expect("a padded CASE fragment must plan in DataFusion")
-        .collect()
-        .await
-        .expect("a padded CASE fragment must evaluate in DataFusion");
-
-    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(
-        total, 2,
-        "the two equal-length CASE results must stay two groups: {batches:?}"
     );
 }
 
@@ -2885,31 +2727,10 @@ fn having_over_stat_aggregate_with_expression_argument_declines() {
         arg_expr: None,
     }];
     assert!(
-        render_having_over_merge(&having, &plans, &ColumnTypes::default()).is_none(),
+        having_over_plans(&having, &plans).is_none(),
         "a HAVING over a stat aggregate with an expression argument must not \
              render over the merge wrapper"
     );
-}
-
-#[test]
-fn only_a_char_group_key_has_a_pad_width() {
-    for exa_type in EXASOL_TYPE_SPELLINGS {
-        let expected = match exa_type {
-            ExasolType::Char { size, .. } => Some(size),
-            ExasolType::Boolean
-            | ExasolType::Decimal(_)
-            | ExasolType::DoublePrecision
-            | ExasolType::Date
-            | ExasolType::Timestamp { .. }
-            | ExasolType::TimestampWithLocalTimeZone { .. }
-            | ExasolType::IntervalYearToMonth { .. }
-            | ExasolType::IntervalDayToSecond { .. }
-            | ExasolType::Geometry { .. }
-            | ExasolType::Hashtype { .. }
-            | ExasolType::Varchar { .. } => None,
-        };
-        assert_eq!(char_width(&exa_type), expected, "{exa_type}");
-    }
 }
 
 #[test]
@@ -2950,14 +2771,13 @@ fn sum_and_stat_aggregates_accept_only_double_and_decimal_columns() {
     }
 }
 
-/// Scenario: A pushdown request with a missing or invalid Exasol type fails the query
 #[test]
-fn unprojected_group_key_with_an_invalid_cast_type_fails() {
+fn unprojected_group_key_with_an_invalid_cast_type_has_no_type() {
     let invalid = serde_json::json!({"type": "CHAR", "characterSet": "ASCII"});
     let key = serde_json::json!({
         "type": "function_scalar_cast",
         "name": "CAST",
-        "dataType": invalid.clone(),
+        "dataType": invalid,
         "arguments": [col("NAME")],
     });
     let req = grouped_request(NO_COLUMNS, vec![key])
@@ -2968,15 +2788,14 @@ fn unprojected_group_key_with_an_invalid_cast_type_fails() {
         select_index: 0,
     }];
 
-    match group_key_exasol_types(
-        &req,
-        &[r#""NAME""#.to_string()],
-        &unprojected,
-        &ColumnTypes::default(),
-    ) {
-        Err(UdfError::User(message)) => {
-            assert!(message.contains(&invalid.to_string()), "{message}")
-        }
-        other => panic!("the invalid key type must fail the request, got {other:?}"),
-    }
+    assert_eq!(
+        group_key_exasol_types(
+            &req,
+            &[r#""NAME""#.to_string()],
+            &unprojected,
+            &ColumnTypes::default(),
+        ),
+        None,
+        "an invalid key type has no exact type, so the grouped split declines"
+    );
 }

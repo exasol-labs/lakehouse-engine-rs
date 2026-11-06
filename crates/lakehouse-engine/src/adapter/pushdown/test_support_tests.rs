@@ -1505,13 +1505,6 @@ impl PushdownRequestBuilder {
         self.field("limit", serde_json::json!({"numElements": num_elements}))
     }
 
-    /// `selectListDataTypes` as `raw` spells it, or absent for `None`, in place of the list the
-    /// item types derive: for a test that pins an absent, invalid, or miscounted list.
-    pub(crate) fn select_list_data_types(mut self, raw: Option<Json>) -> Self {
-        self.raw_select_list_data_types = Some(raw);
-        self
-    }
-
     /// Any other `pushdownRequest` key, such as `having`, `from`, or `type`.
     pub(crate) fn field(mut self, key: &str, value: impl Into<Json>) -> Self {
         self.fields.insert(key.to_string(), value.into());

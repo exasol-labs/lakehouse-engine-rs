@@ -197,3 +197,42 @@ fn comparing_text_with_a_date_or_number_declines() {
     let filter = json!({"type": "predicate_equal", "left": col("S"), "right": text});
     assert!(render(&filter).is_ok());
 }
+
+#[test]
+fn an_integer_compares_with_a_digits_only_literal() {
+    let filter = |column: &str, value: &str| json!({"type": "predicate_equal", "left": col(column), "right": {"type": "literal_string", "value": value}});
+    assert!(render(&filter("I", "3")).is_ok(), "I = '3' must render");
+    for (column, value) in [("I", "3.5"), ("N", "3"), ("D", "2024-01-01")] {
+        assert!(
+            render(&filter(column, value)).is_err(),
+            "{column} = '{value}' must decline"
+        );
+    }
+}
+
+#[test]
+fn exact_expression_type_is_the_type_the_request_states() {
+    let sum = scalar(
+        "ADD",
+        vec![
+            col("I"),
+            json!({"type": "literal_exactnumeric", "value": 1}),
+        ],
+    );
+    let cases = [
+        (
+            "CAST",
+            cast(col("I"), varchar(10)),
+            Some(ExasolType::varchar(10)),
+        ),
+        ("column", col("N"), Some(ExasolType::decimal(9, 2))),
+        ("other node", sum, None),
+    ];
+    for (label, node, expected) in cases {
+        assert_eq!(
+            exact_expression_type(&node, &columns()),
+            expected,
+            "{label}"
+        );
+    }
+}

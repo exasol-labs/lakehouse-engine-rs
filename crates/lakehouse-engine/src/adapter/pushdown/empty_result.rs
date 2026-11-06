@@ -3,7 +3,7 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 use super::GroupedSelectItem;
-use super::grouped_agg::{group_key_exasol_types, select_item_index};
+use super::grouped_agg::select_item_index;
 use super::joins::EmptyRelation;
 use super::request_shape::{RequestShape, classify_request_shape};
 use super::support::{
@@ -23,19 +23,11 @@ pub(super) fn empty_result_sql(
     relation: &EmptyRelation,
 ) -> Result<Json, UdfError> {
     match classify_request_shape(pushdown, col_types) {
-        RequestShape::Grouped { detection, .. } => {
-            let group_key_types = group_key_exasol_types(
-                pushdown,
-                &detection.group_keys,
-                &detection.select_items,
-                col_types,
-            )?;
-            Ok(empty_grouped_sql(
-                &group_key_types,
-                &detection.plan_types,
-                &detection.select_items,
-            ))
-        }
+        RequestShape::Grouped { detection, .. } => Ok(empty_grouped_sql(
+            &detection.group_key_types,
+            &detection.plan_types,
+            &detection.select_items,
+        )),
         // Mirrors the non-empty wrapper's `selectList`-shaped output; a full-row shape
         // would trip Exasol's positional `04000` check. Both arms carry a non-empty
         // `selectList`, so `select_types()` holds one type per item.

@@ -1000,7 +1000,9 @@ fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
     ));
 
     assert!(
-        sql.starts_with(r#"SELECT CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(36,2)) FROM ("#),
+        sql.starts_with(
+            r#"SELECT CAST(ROUND(CAST(SUM("PARTIAL_sum_0") AS DECIMAL(29,2)), 2) AS DECIMAL(36,2)) FROM ("#
+        ),
         "the merge SELECT must wrap the merged partial in the scalar structure, \
          not emit a bare unwrapped SUM: {sql}"
     );
@@ -2082,62 +2084,6 @@ fn embedded_group_keys(fragments: &[String]) -> String {
 }
 
 #[test]
-fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
-    let request = char_grouped_request(
-        cast_to(ExasolType::char(20), col("NAME")),
-        ExasolType::char(20),
-        None,
-    );
-
-    let sql = guard_dispatch_sql(
-        &request,
-        vec![ProjectionItem::from("NAME")],
-        vec![ExasolType::WIDEST_VARCHAR],
-        false,
-        None,
-        Vec::new(),
-    );
-
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#;
-    let padded = format!(
-        "CASE WHEN character_length({fragment}) < 20 THEN rpad({fragment}, 20) \
-             ELSE {fragment} END"
-    );
-    assert!(
-        sql.contains(&embedded_group_keys(std::slice::from_ref(&padded))),
-        "the scan spec must carry the blank-padded group key {padded}: {sql}"
-    );
-    assert!(
-        sql.contains(r#"CAST("GK_0" AS CHAR(20))"#),
-        "the outer merge wrapper must still cast the staging column to CHAR(20): {sql}"
-    );
-}
-
-#[test]
-fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
-    let request = unprojected_char_grouped_request(cast_to(ExasolType::char(20), col("NAME")));
-
-    let sql = guard_dispatch_sql(
-        &request,
-        vec![ProjectionItem::from("NAME")],
-        vec![ExasolType::WIDEST_VARCHAR],
-        false,
-        None,
-        Vec::new(),
-    );
-
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#;
-    let padded = format!(
-        "CASE WHEN character_length({fragment}) < 20 THEN rpad({fragment}, 20) \
-             ELSE {fragment} END"
-    );
-    assert!(
-        sql.contains(&embedded_group_keys(std::slice::from_ref(&padded))),
-        "an unprojected CHAR(20) group key must still reach the scan padded: {sql}"
-    );
-}
-
-#[test]
 fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     let request = unprojected_char_grouped_request(cast_to(ExasolType::varchar(10), col("NAME")));
 
@@ -2163,47 +2109,6 @@ fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
 }
 
 #[test]
-fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
-    let request = char_grouped_request(
-        cast_to(
-            ExasolType::Char {
-                size: 3,
-                ascii: true,
-            },
-            col("NAME"),
-        ),
-        ExasolType::Char {
-            size: 3,
-            ascii: true,
-        },
-        None,
-    );
-
-    let sql = guard_dispatch_sql(
-        &request,
-        vec![ProjectionItem::from("NAME")],
-        vec![ExasolType::WIDEST_VARCHAR],
-        false,
-        None,
-        Vec::new(),
-    );
-
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#;
-    let padded = format!(
-        "CASE WHEN character_length({fragment}) < 3 THEN rpad({fragment}, 3) \
-             ELSE {fragment} END"
-    );
-    assert!(
-        sql.contains(&embedded_group_keys(std::slice::from_ref(&padded))),
-        "a `CHAR(3) ASCII` group key must reach the scan padded to 3: {sql}"
-    );
-    assert!(
-        sql.contains(r#"CAST("GK_0" AS CHAR(3) ASCII)"#),
-        "the outer merge wrapper must still cast the staging column to CHAR(3) ASCII: {sql}"
-    );
-}
-
-#[test]
 fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     let request = char_grouped_request(col("REGION"), ExasolType::varchar(10), None);
 
@@ -2223,39 +2128,6 @@ fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     assert!(
         !sql.contains("rpad("),
         "no pad may be emitted for a VARCHAR-declared group key: {sql}"
-    );
-}
-
-#[test]
-fn order_by_on_a_char_declared_group_key_still_resolves_to_its_output_ordinal() {
-    let request = char_grouped_request(
-        col("NAME"),
-        ExasolType::char(20),
-        Some(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": col("NAME"),
-            "isAscending": true,
-            "nullsLast": true
-        }])),
-    );
-
-    let sql = guard_dispatch_sql(
-        &request,
-        vec![ProjectionItem::from("NAME")],
-        vec![ExasolType::WIDEST_VARCHAR],
-        false,
-        None,
-        Vec::new(),
-    );
-
-    assert!(
-        sql.contains("ORDER BY 1"),
-        "the sort on the CHAR-declared group key must resolve to output ordinal 1: {sql}"
-    );
-    assert!(
-        sql.contains("rpad("),
-        "the DataFusion-side copy must still be padded alongside the resolved \
-             ORDER BY: {sql}"
     );
 }
 

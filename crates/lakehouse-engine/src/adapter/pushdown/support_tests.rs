@@ -3,7 +3,6 @@ use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, SortKey, StorageProps};
 use crate::scan::test_support::WithFiles;
-use vs_expression::strip_table_alias;
 
 fn delete_spec_template() -> ScanSpec {
     CommonScanSpec {
@@ -1858,18 +1857,6 @@ fn filter_in_common_arg() {
     );
 }
 
-fn timestamp_comparison(op: &str, left: Json, right: Json) -> Json {
-    serde_json::json!({"type": op, "left": left, "right": right})
-}
-
-fn ts_column() -> Json {
-    serde_json::json!({"type": "column", "name": "ts"})
-}
-
-fn ts_literal(value: &str) -> Json {
-    serde_json::json!({"type": "literal_timestamp", "value": value})
-}
-
 /// Asserts the fixture genuinely declines, since a quietly rendering fixture would
 /// assert nothing.
 fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, ExasolType)]) -> String {
@@ -2678,17 +2665,6 @@ fn string_fn(name: &str, args: Vec<Json>) -> Json {
     })
 }
 
-fn trimmed_decimal(name: &str) -> Json {
-    serde_json::json!({
-        "type": "decimal_to_varchar_exasol",
-        "arguments": [col(name)],
-    })
-}
-
-fn equals(left: Json, right: Json) -> Json {
-    predicate_equal(left, right)
-}
-
 #[test]
 fn column_exa_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
     let node = col("STRAßE");
@@ -2980,14 +2956,6 @@ fn shared_name_universe() -> ColumnTypes {
     ])
 }
 
-fn like_over(subject: Json) -> Json {
-    serde_json::json!({
-        "type": "predicate_like",
-        "expression": subject,
-        "pattern": str_lit("a%"),
-    })
-}
-
 #[test]
 fn qualified_universe_projects_each_column_with_its_relation_and_type() {
     let universe = shared_name_universe();
@@ -3027,10 +2995,6 @@ fn qualified_universe_projects_each_column_with_its_relation_and_type() {
         full_types,
         vec![ExasolType::decimal(18, 0), ExasolType::varchar(10)]
     );
-}
-
-fn one_column_of(exa_type: ExasolType) -> ColumnTypes {
-    column_types(&[("X", exa_type)])
 }
 
 #[test]
@@ -3154,9 +3118,6 @@ fn a_concatenation_lists_each_map_in_turn() {
         ]
     );
 }
-
-/// The types a request's select list parses to, or a phrase its refusal names.
-type ParseOutcome = Result<Vec<ExasolType>, String>;
 
 /// Scenario: A pushdown request with a missing or invalid Exasol type fails the query
 #[test]
