@@ -45,10 +45,10 @@ The `createVirtualSchema` response's schema-level `adapterNotes` records the res
 
 ### Scenario: Every skipped table is recorded with its reason under every catalog kind
 
-* *GIVEN* one listing per catalog kind that skips entries: Iceberg REST (a table whose `loadTable` returns 404), Unity Catalog (a view), direct storage (a directory holding no data file), and Glue (an ORC table and a partition-projection table)
+* *GIVEN* one listing per catalog kind that skips entries: Iceberg REST (a table whose `loadTable` returns 404, and one that returns 400), Unity Catalog (a view), direct storage (a directory holding no data file), and Glue (an ORC table and a partition-projection table)
 * *WHEN* createVirtualSchema, setProperties, or a refresh that carries no `requestedTables` completes
 * *THEN* adapterNotes SHALL carry a `SKIPPED_TABLES` entry holding a JSON array with one object per skipped entry, in listing order, whose `table` is the catalog identifier and whose `reason` states why the entry was skipped
-* *AND* the `reason` SHALL be `catalog reported it is not a loadable Iceberg table` for Iceberg REST and `holds no data file` for direct storage, and SHALL name the catalog value that decided the skip, such as `table_type=VIEW`, for Unity Catalog and Glue
+* *AND* the `reason` SHALL be `catalog reported it is not a loadable Iceberg table` for an Iceberg REST 404, the load error for an Iceberg REST 400, and `holds no data file` for direct storage, and SHALL name the catalog value that decided the skip, such as `table_type=VIEW`, for Unity Catalog and Glue
 * *AND* the adapter SHALL write one warning line per skip that states the same reason
 * *AND* no reason SHALL contain a credential value
 

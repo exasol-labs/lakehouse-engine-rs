@@ -231,6 +231,10 @@ impl CatalogRequestError {
         self.status == Some(StatusCode::NOT_FOUND)
     }
 
+    pub(crate) fn is_bad_request(&self) -> bool {
+        self.status == Some(StatusCode::BAD_REQUEST)
+    }
+
     /// Prefixes the message with the table's dotted identifier, for every kind of failure.
     pub(crate) fn named(self, identifier: &str) -> Self {
         Self::new(

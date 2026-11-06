@@ -3,13 +3,13 @@
 //! diff in one of them is always a regression, never an expected update.
 
 use super::test_support::{
-    PushdownRequestBuilder, agg_item, broadcast_sides, column_types, parsed_pushdown, pd,
-    projected_columns, pushdown_request, request_sides, request_typed, sample_scan_storage,
-    sample_storage, with_identifier_notes,
+    PushdownRequestBuilder, agg_item, agg_item_expr, broadcast_sides, column_types, count_star,
+    float_div, parsed_pushdown, pd, projected_columns, pushdown_request, request_sides,
+    request_typed, round_of, sample_scan_storage, sample_storage, with_identifier_notes,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    aliased_col, col, customer_orders_join, num_lit, predicate_equal, str_lit, table_col,
+    aliased_col, col, compare, customer_orders_join, num_lit, string_equal, table_col,
 };
 use crate::scan::spec::ProjectionItem;
 use crate::types::exasol_type::ExasolType;
@@ -54,11 +54,7 @@ pub(super) fn grouped_request() -> (Json, Vec<ExasolType>) {
 /// HAVING matches no projected plan, so it routes to `GroupByWrapper` (#195).
 fn unmergeable_having_request() -> (Json, Vec<ExasolType>) {
     let (mut request, item_types) = grouped_request();
-    request["pushdownRequest"]["having"] = serde_json::json!({
-        "type": "predicate_greater",
-        "left": agg_item("COUNT", None, false),
-        "right": num_lit(0),
-    });
+    request["pushdownRequest"]["having"] = compare("predicate_greater", count_star(), num_lit(0));
     (request, item_types)
 }
 
@@ -126,14 +122,7 @@ pub(super) fn single_group_agg_request() -> (Json, Vec<ExasolType>) {
 fn nested_aggregate_decline_request() -> (Json, Vec<ExasolType>) {
     events_request()
         .item(
-            serde_json::json!({
-                "type": "function_scalar",
-                "name": "ROUND",
-                "arguments": [
-                    agg_item("SUM", Some("AMOUNT"), true),
-                    num_lit(2)
-                ]
-            }),
+            round_of(agg_item("SUM", Some("AMOUNT"), true), 2),
             ExasolType::decimal(36, 2),
         )
         .build()
@@ -142,14 +131,7 @@ fn nested_aggregate_decline_request() -> (Json, Vec<ExasolType>) {
 fn single_group_scalar_over_aggregate_request() -> (Json, Vec<ExasolType>) {
     events_request()
         .item(
-            serde_json::json!({
-                "type": "function_scalar",
-                "name": "ROUND",
-                "arguments": [
-                    agg_item("SUM", Some("AMOUNT"), false),
-                    num_lit(2)
-                ]
-            }),
+            round_of(agg_item("SUM", Some("AMOUNT"), false), 2),
             ExasolType::decimal(36, 2),
         )
         .build()
@@ -158,28 +140,17 @@ fn single_group_scalar_over_aggregate_request() -> (Json, Vec<ExasolType>) {
 /// The nested `COUNT(*)` must dedup against the bare item's partial column.
 fn single_group_scalar_over_aggregate_dedup_request() -> (Json, Vec<ExasolType>) {
     events_request()
-        .item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+        .count_star()
         .item(round_of_sum_over_count(), ExasolType::decimal(36, 2))
         .build()
 }
 
 /// `ROUND(SUM(AMOUNT) / COUNT(*), 2)`.
 fn round_of_sum_over_count() -> Json {
-    serde_json::json!({
-        "type": "function_scalar",
-        "name": "ROUND",
-        "arguments": [
-            {
-                "type": "function_scalar",
-                "name": "FLOAT_DIV",
-                "arguments": [
-                    agg_item("SUM", Some("AMOUNT"), false),
-                    agg_item("COUNT", None, false),
-                ]
-            },
-            num_lit(2)
-        ]
-    })
+    round_of(
+        float_div(agg_item("SUM", Some("AMOUNT"), false), count_star()),
+        2,
+    )
 }
 
 fn single_group_scalar_over_aggregate_interleaved_request() -> (Json, Vec<ExasolType>) {
@@ -189,21 +160,14 @@ fn single_group_scalar_over_aggregate_interleaved_request() -> (Json, Vec<Exasol
             ExasolType::decimal(36, 2),
         )
         .item(round_of_sum_over_count(), ExasolType::decimal(9, 4))
-        .item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+        .count_star()
         .build()
 }
 
 fn single_group_scalar_over_variance_request() -> (Json, Vec<ExasolType>) {
     events_request()
         .item(
-            serde_json::json!({
-                "type": "function_scalar",
-                "name": "ROUND",
-                "arguments": [
-                    agg_item("VARIANCE", Some("AMOUNT"), false),
-                    num_lit(4)
-                ]
-            }),
+            round_of(agg_item("VARIANCE", Some("AMOUNT"), false), 4),
             ExasolType::decimal(36, 4),
         )
         .build()
@@ -521,12 +485,7 @@ fn aliased_grouped_request() -> (Json, Vec<ExasolType>) {
         .group_by(vec![column("REGION")])
         .column(column("REGION"))
         .item(
-            serde_json::json!({
-                "type": "function_aggregate",
-                "name": "SUM",
-                "arguments": [column("AMOUNT")],
-                "distinct": false,
-            }),
+            agg_item_expr("SUM", column("AMOUNT"), false),
             ExasolType::decimal(36, 2),
         )
         .build()
@@ -571,14 +530,7 @@ fn aliased_single_table_group_by_renders_bare_group_key_and_select_expr() {
 
 fn aliased_multi_count_distinct_decline_request() -> (Json, Vec<ExasolType>) {
     let column = |name: &str| aliased_col("EVENTS", "E", name);
-    let count_distinct = |name: &str| {
-        serde_json::json!({
-            "type": "function_aggregate",
-            "name": "COUNT",
-            "arguments": [column(name)],
-            "distinct": true,
-        })
-    };
+    let count_distinct = |name: &str| agg_item_expr("COUNT", column(name), true);
     events_request()
         .item(count_distinct("ID"), ExasolType::decimal(18, 0))
         .item(count_distinct("NAME"), ExasolType::decimal(18, 0))
@@ -649,7 +601,7 @@ fn all_agg_kinds_select_list() -> Vec<(Json, ExasolType)> {
     let double = ExasolType::DoublePrecision;
     let timestamp = ExasolType::BARE_TIMESTAMP;
     vec![
-        (agg_item("COUNT", None, false), count),
+        (count_star(), count),
         (agg_item("COUNT", Some("id"), false), count),
         (agg_item("SUM", Some("score"), false), double),
         (agg_item("MIN", Some("ts"), false), timestamp),
@@ -886,7 +838,7 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
         include_str!("testdata/dispatch_golden/rendering_single_table.sql")
     );
 
-    let renderable_filter = predicate_equal(table_col("CUSTOMER", "C_NAME"), str_lit("ACME"));
+    let renderable_filter = string_equal("CUSTOMER", "C_NAME", "ACME");
     let (request, _) = two_table_join_request(Some(renderable_filter));
     let join = two_table_detected_join(&request);
     let rendered = render_broadcast_join(

@@ -97,6 +97,7 @@ pub fn skip_kind_and_reason(entry: &SkippedTable) -> (&'static str, String) {
             "non-Iceberg table",
             "catalog reported it is not a loadable Iceberg table".to_string(),
         ),
+        SkipReason::LoadRejected { detail } => ("unloadable table", detail.clone()),
         SkipReason::NotDeltaBaseTable { detail } => ("non-Delta-base entry", detail.clone()),
         SkipReason::NoDataFile => ("directory", "holds no data file".to_string()),
         SkipReason::NotPlannableGlueTable { detail } => ("Glue table", detail.clone()),
