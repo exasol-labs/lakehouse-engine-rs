@@ -124,6 +124,10 @@ pub const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkipReason {
     NotLoadableIcebergTable,
+    /// `detail` is the load error, e.g. Databricks' 400 for a table it cannot serve as Iceberg.
+    LoadRejected {
+        detail: String,
+    },
     /// `detail` names the offending value verbatim, e.g. `table_type=VIEW`.
     NotDeltaBaseTable {
         detail: String,
@@ -248,6 +252,12 @@ impl IcebergRestCatalogClient {
             Err(err) if err.is_not_found() => Ok(TableAdmission::Skipped(SkippedTable {
                 ident: ident.clone(),
                 reason: SkipReason::NotLoadableIcebergTable,
+            })),
+            Err(err) if err.is_bad_request() => Ok(TableAdmission::Skipped(SkippedTable {
+                ident: ident.clone(),
+                reason: SkipReason::LoadRejected {
+                    detail: err.to_string(),
+                },
             })),
             Err(err) => Err(err.into()),
         }

@@ -86,7 +86,7 @@ The adapter authenticates to an Iceberg REST catalog and looks up its `/v1/confi
 * *WHEN* the Iceberg REST client lists the namespace's identifiers and then loads the tables the adapter selects
 * *THEN* the identifier listing SHALL call only the namespace and table listing endpoints, besides the session's grant and `/v1/config` lookup, and SHALL issue no `loadTable` GET
 * *AND* the load SHALL reuse the listing's `CatalogSession` and issue one `loadTable` GET per given identifier through the load helper the full listing uses
-* *AND* a table the catalog reports as not a loadable Iceberg table SHALL be skipped with the `NotLoadableIcebergTable` reason the full listing gives it, and any other load failure SHALL fail the load
+* *AND* a table the catalog reports as not a loadable Iceberg table SHALL be skipped with the reason the full listing gives it, and any other load failure SHALL fail the load
 
 ### Scenario: A failed config lookup fails the request
 
@@ -102,4 +102,4 @@ The adapter authenticates to an Iceberg REST catalog and looks up its `/v1/confi
 * *THEN* the returned error SHALL name the table by its dotted catalog identifier `sales.eu.orders`, the form its identifier note records
 * *AND* the error SHALL carry the cause: the HTTP status and the redacted answer body, every cause the HTTP client reports, or the parse failure
 * *AND* a pushdown's `loadTable` that answers HTTP 404 SHALL fail with an error that names the table in the same way
-* *AND* naming the table MUST NOT change which enumeration loads are skipped, so an enumeration `loadTable` that answers HTTP 404 SHALL still skip the table with the `NotLoadableIcebergTable` reason
+* *AND* naming the table MUST NOT change which enumeration loads are skipped, so an enumeration `loadTable` that answers HTTP 404 or 400 SHALL still skip the table per `vs-adapter/create-virtual-schema` instead of failing
