@@ -278,7 +278,8 @@ jobs:
       - name: ShellCheck
         run: shellcheck -s bash deploy/scripts/install.sh deploy/scripts/tests/install.test.sh
 
-      - name: Unit tests (stubbed exapump/curl, no network)
+      # Bash 3.2 is the floor install.sh promises (stock macOS)
+      - name: Unit tests under bash 3.2 (stubbed exapump/curl, no network)
         run: make test-install
 
   # Tests the installer against a real prior release on a runner with no
