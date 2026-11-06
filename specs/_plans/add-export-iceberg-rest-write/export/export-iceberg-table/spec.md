@@ -138,7 +138,7 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 * *AND* the export SHALL NOT create the table
 * *AND* the same export without `SINGLE_COMMIT` SHALL succeed
 
-### Scenario: SINGLE_COMMIT creates the table together with its rows
+### Scenario: SINGLE_COMMIT creates the table only together with its rows
 
 * *GIVEN* a table that does not exist and a source of 1,000 rows
 * *WHEN* a user exports it with `SINGLE_COMMIT = 'true'`

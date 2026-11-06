@@ -2,7 +2,7 @@
 
 ## Interview
 
-- Q: SINGLE_COMMIT atomicity route → A: raw REST `stage-create` (iceberg-rust hardcodes false), commit with assert-create; table appears only with its data
+- Q: SINGLE_COMMIT atomicity route → A: `SINGLE_COMMIT` means the table appears only with its data. Iceberg REST does it by raw `stage-create` (iceberg-rust hardcodes false) and a commit with assert-create. Atomicity is single-writer because the export has no final commit (decision [7])
 - Q: Pre-read check for a bad CONNECTION → A: catalog calls only (connect, authenticate, table absent, create namespace). A storage error shows when the writers write. Replaces an earlier storage probe after review (decision [1]).
 - Q: Concurrent and retried commits → A: raise `commit.retry.num-retries` on the created table and tag each snapshot with an export-id summary property, re-checked before every re-commit
 
@@ -22,7 +22,7 @@
 ### [2] The export commit loop belongs to lakehouse-catalog and re-checks the writer's tag before every re-commit
 
 - **Decision:** iceberg-rust builds a writer's snapshot, and `lakehouse-catalog` sends the commit through its own catalog HTTP client. After a conflict or an uncertain outcome, the loop reloads the table with all snapshots and commits again only when no snapshot carries the writer's tag. It retries HTTP 409, 429, 502, 503, 504, and uncertain network outcomes with bounded backoff and a bounded attempt count, and never retries authentication (401, 403), schema, invalid-request, or existing-table errors.
-- **Rationale:** Rule-2 criteria 2 and 4. iceberg-rust's `Transaction::commit` re-applies after HTTP 409, and the catalog HTTP client repeats a POST after HTTP 502 or 504, so a commit whose answer was lost returns 409 and a blind re-apply adds its rows twice. The Iceberg REST spec answers a commit with 500, 502, or 504 when "the commit state is unknown". `RestCatalog` would also bypass the one catalog HTTP client that § Constraints requires. ADR digest search (export, write, commit, stage, retry): no ADR covers catalog writes.
+- **Rationale:** No final commit exists (decision [7]), so each writer's commit must be safe to repeat. Rule-2 criteria 2 and 4. iceberg-rust's `Transaction::commit` re-applies after HTTP 409, and the catalog HTTP client repeats a POST after HTTP 502 or 504, so a commit whose answer was lost returns 409 and a blind re-apply adds its rows twice. The Iceberg REST spec answers a commit with 500, 502, or 504 when "the commit state is unknown". `RestCatalog` would also bypass the one catalog HTTP client that § Constraints requires. ADR digest search (export, write, commit, stage, retry): no ADR covers catalog writes.
 - **Alternatives:** `RestCatalog` with `Transaction::commit` and a raised retry count, as in the spike: duplicate rows and a bypassed client.
 - **Open:** The catalog HTTP client retries every POST, so a commit can be retried by it and by this loop under different rules. Which catalog writes are safe to repeat, who retries them, and how a writer learns an unknown outcome is an open question (plan.md § Open Questions), not decided here.
 - **Consequences:**
@@ -76,13 +76,14 @@
 
 ### [7] There is no final commit step, so each writer commits on its own
 
-- **Decision:** Each writer commits its own data files. The export has no step that runs once after all writers finish, and `SINGLE_COMMIT` trades speed for atomicity by running one writer.
+- **Decision:** Exasol's UDF model has no step that runs after all writers finish, so the export has no single final commit. Each writer commits its own data files. That is why a failed parallel export can leave partial data, and why `SINGLE_COMMIT` exists: it trades speed for atomicity by running one writer, whose one commit makes the table appear only with its data. This drives the whole commit design (decision [2]) and holds for every catalog the export gains.
 - **Rationale:** Exasol's UDF model has no step after the last group of a SET script. A final commit would need a second statement or a coordinator, which the engine does not have (mission: no background processes, no state across statements). The consequences hold for every catalog the export gains.
 - **Alternatives:** A coordinator writer that waits for all others: Exasol gives writers no channel to each other and may run them in any order.
 - **Consequences:**
   - A failed parallel export can leave the commits of some writers in the table.
   - Exactly-once per writer (decision [2]) is the only duplicate protection.
-  - Atomic exports are single-writer.
+  - Atomic exports are single-writer (`SINGLE_COMMIT`).
+  - Every later catalog implements per-writer commits plus its own way of making a single-writer table appear only with its data (decision [8]).
 - **Promotes to ADR:** yes
 
 ### [8] The export is a fixed flow of steps, with Iceberg REST as its first implementation
