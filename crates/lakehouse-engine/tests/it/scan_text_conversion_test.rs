@@ -9,8 +9,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
-use serde_json::{Value as Json, json};
-use vs_expression::exasol_type::ExasolType;
+use serde_json::Value as Json;
+use vs_expression::exasol_type::{ExasolType, exasol_type_to_json};
+use vs_expression::test_support::{cast_json, col, scalar_fn};
 
 struct Columns;
 
@@ -67,9 +68,7 @@ async fn texts(fragment: &str) -> Vec<Option<String>> {
 }
 
 fn cast_to_varchar(name: &str) -> Json {
-    json!({"type": "function_scalar_cast",
-           "dataType": {"type": "VARCHAR", "size": 2000000, "characterSet": "UTF8"},
-           "arguments": [{"type": "column", "name": name}]})
+    cast_json(exasol_type_to_json(&ExasolType::WIDEST_VARCHAR), col(name))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -102,7 +101,7 @@ async fn integer_and_boolean_columns_convert_to_exasol_text() {
             Some("TRUE".into())
         ]
     );
-    let upper = json!({"type": "function_scalar", "name": "UPPER", "arguments": [{"type": "column", "name": "QTY"}]});
+    let upper = scalar_fn("UPPER", [col("QTY")]);
     assert_eq!(
         texts(&render(&upper)).await,
         vec![
