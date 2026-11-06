@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use super::super::ResolvedScan;
 use super::super::delta_schema::classify_spark_schema;
 use super::*;
-use crate::adapter::pushdown::test_support::filter_json::{and, column, equal, or};
+use crate::adapter::pushdown::test_support::{and, col, or, predicate_equal, string_equal};
 use crate::adapter::tests::parquet_fixture::{in_memory_store, values};
 use crate::adapter::tests::recording_store::RecordingStore;
 use crate::scan::spec::reconstruct_abs_uri;
@@ -277,15 +277,18 @@ async fn a_partition_predicate_prunes_under_the_declared_type() {
     ];
     let storage = served_storage(under_table(&every_file)).await.storage;
     let cases = [
-        (equal("REGION", "eu"), vec![every_file[0], every_file[2]]),
         (
-            compare("predicate_equal", column("YEAR"), num_lit("2024")),
+            string_equal("REGION", "eu"),
+            vec![every_file[0], every_file[2]],
+        ),
+        (
+            predicate_equal(col("YEAR"), num_lit("2024")),
             vec![every_file[0], every_file[1]],
         ),
         (
             or(vec![
-                equal("REGION", "us"),
-                compare("predicate_less", num_lit("10"), column("AMOUNT")),
+                string_equal("REGION", "us"),
+                compare("predicate_less", num_lit("10"), col("AMOUNT")),
             ]),
             every_file.to_vec(),
         ),
@@ -770,7 +773,7 @@ async fn a_kept_orc_or_foreign_bucket_partition_fails_naming_it_and_a_pruned_one
     );
     let objects = ["glue/orders/p_int=1/f"];
     let below_five = keep_under(
-        &compare("predicate_less", column("P_INT"), num_lit("5")),
+        &compare("predicate_less", col("P_INT"), num_lit("5")),
         &[("p_int", ArrowType::Int32)],
     );
 
@@ -819,11 +822,11 @@ async fn a_kept_orc_or_foreign_bucket_partition_fails_naming_it_and_a_pruned_one
 #[tokio::test]
 async fn glue_partitions_are_pruned_on_glue_values_before_listing() {
     let filter = and(vec![
-        compare("predicate_equal", column("P_INT"), num_lit("1")),
+        predicate_equal(col("P_INT"), num_lit("1")),
         compare(
             "predicate_lessequal",
             lit("literal_date", "2024-01-01"),
-            column("P_DATE"),
+            col("P_DATE"),
         ),
     ]);
     let rows = [

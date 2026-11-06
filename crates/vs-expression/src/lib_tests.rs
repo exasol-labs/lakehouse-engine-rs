@@ -28,14 +28,14 @@ fn renders_column_with_embedded_quotes() {
 
 #[test]
 fn renders_table_qualified_column_when_alias_present() {
-    let expr = json!({"type": "column", "name": "id", "tableAlias": "LHS_FACT"});
+    let expr = alias_col("LHS_FACT", "id");
     let sql = render_expression(&expr).unwrap();
     assert_eq!(sql, r#""LHS_FACT"."ID""#);
 }
 
 #[test]
 fn empty_table_alias_falls_back_to_bare_column() {
-    let expr = json!({"type": "column", "name": "id", "tableAlias": ""});
+    let expr = alias_col("", "id");
     let sql = render_expression(&expr).unwrap();
     assert_eq!(sql, r#""ID""#);
 }
@@ -121,74 +121,58 @@ fn renders_simple_equality() {
 
 #[test]
 fn renders_and_predicate() {
-    let expr = json!({
-        "type": "predicate_and",
-        "expressions": [
-            {"type": "predicate_greater", "left": col("age"), "right": num_lit(18)},
-            {"type": "predicate_less", "left": col("age"), "right": num_lit(65)}
-        ]
-    });
+    let expr = and([
+        compare("predicate_greater", col("age"), num_lit(18)),
+        compare("predicate_less", col("age"), num_lit(65)),
+    ]);
     let sql = render_expression(&expr).unwrap();
     assert!(sql.contains("AND"), "AND not found in: {sql}");
 }
 
 #[test]
 fn renders_or_predicate() {
-    let expr = json!({
-        "type": "predicate_or",
-        "expressions": [
-            predicate_equal(col("status"), str_lit("A")),
-            predicate_equal(col("status"), str_lit("B"))
-        ]
-    });
+    let expr = or([
+        predicate_equal(col("status"), str_lit("A")),
+        predicate_equal(col("status"), str_lit("B")),
+    ]);
     let sql = render_expression(&expr).unwrap();
     assert!(sql.contains("OR"), "OR not found in: {sql}");
 }
 
 #[test]
 fn renders_not_predicate() {
-    let expr = json!({
-        "type": "predicate_not",
-        "expression": predicate_equal(col("active"), bool_lit(true))
-    });
+    let expr = not(predicate_equal(col("active"), bool_lit(true)));
     let sql = render_expression(&expr).unwrap();
     assert!(sql.contains("NOT"), "NOT not found in: {sql}");
 }
 
 #[test]
 fn renders_empty_and_as_true() {
-    let expr = json!({"type": "predicate_and", "expressions": []});
+    let expr = and([]);
     assert_eq!(render_expression(&expr).unwrap(), "TRUE");
 }
 
 #[test]
 fn renders_empty_or_as_false() {
-    let expr = json!({"type": "predicate_or", "expressions": []});
+    let expr = or([]);
     assert_eq!(render_expression(&expr).unwrap(), "FALSE");
 }
 
 #[test]
 fn renders_is_null() {
-    let expr = json!({"type": "predicate_is_null", "expression": col("x")});
+    let expr = is_null(col("x"));
     assert_eq!(render_expression(&expr).unwrap(), r#"("X" IS NULL)"#);
 }
 
 #[test]
 fn renders_is_not_null() {
-    let expr = json!({"type": "predicate_is_not_null", "expression": col("x")});
+    let expr = is_not_null(col("x"));
     assert_eq!(render_expression(&expr).unwrap(), r#"("X" IS NOT NULL)"#);
 }
 
 #[test]
 fn renders_in_constlist() {
-    let expr = json!({
-        "type": "predicate_in_constlist",
-        "expression": col("status"),
-        "arguments": [
-            str_lit("A"),
-            str_lit("B")
-        ]
-    });
+    let expr = in_list(col("status"), [str_lit("A"), str_lit("B")]);
     let sql = render_expression(&expr).unwrap();
     assert!(sql.contains("IN"), "IN not found: {sql}");
     assert!(sql.contains("'A'"), "'A' not found: {sql}");
@@ -197,25 +181,16 @@ fn renders_in_constlist() {
 
 #[test]
 fn renders_empty_in_as_false() {
-    let expr = json!({
-        "type": "predicate_in_constlist",
-        "expression": col("x"),
-        "arguments": []
-    });
+    let expr = in_list(col("x"), []);
     assert_eq!(render_expression(&expr).unwrap(), "FALSE");
 }
 
 #[test]
 fn renders_in_constlist_strips_null() {
-    let expr = json!({
-        "type": "predicate_in_constlist",
-        "expression": col("status"),
-        "arguments": [
-            str_lit("A"),
-            null_lit(),
-            lit("literal_date", Json::Null)
-        ]
-    });
+    let expr = in_list(
+        col("status"),
+        [str_lit("A"), null_lit(), lit("literal_date", Json::Null)],
+    );
     let sql = render_expression(&expr).unwrap();
     assert!(sql.contains("'A'"), "'A' not found: {sql}");
     assert!(!sql.contains("NULL"), "NULL should not survive: {sql}");
@@ -223,43 +198,23 @@ fn renders_in_constlist_strips_null() {
 
 #[test]
 fn renders_all_null_in_as_false() {
-    let expr = json!({
-        "type": "predicate_in_constlist",
-        "expression": col("x"),
-        "arguments": [
-            null_lit(),
-            lit("literal_date", Json::Null)
-        ]
-    });
+    let expr = in_list(col("x"), [null_lit(), lit("literal_date", Json::Null)]);
     assert_eq!(render_expression(&expr).unwrap(), "FALSE");
 }
 
 #[test]
 fn renders_not_in_constlist_strips_null() {
-    let expr = json!({
-        "type": "predicate_not",
-        "expression": {
-            "type": "predicate_in_constlist",
-            "expression": col("status"),
-            "arguments": [
-                str_lit("A"),
-                null_lit(),
-                lit("literal_date", Json::Null)
-            ]
-        }
-    });
+    let expr = not(in_list(
+        col("status"),
+        [str_lit("A"), null_lit(), lit("literal_date", Json::Null)],
+    ));
     let sql = render_expression(&expr).unwrap();
     assert_eq!(sql, r#"(NOT ("STATUS" IN ('A')))"#);
 }
 
 #[test]
 fn renders_between() {
-    let expr = json!({
-        "type": "predicate_between",
-        "expression": col("age"),
-        "left": num_lit(18),
-        "right": num_lit(65)
-    });
+    let expr = between(col("age"), num_lit(18), num_lit(65));
     let sql = render_expression(&expr).unwrap();
     assert!(sql.contains("BETWEEN"), "BETWEEN not found: {sql}");
     assert!(sql.contains("18"), "low bound not found: {sql}");
@@ -268,11 +223,7 @@ fn renders_between() {
 
 #[test]
 fn renders_like_without_escape() {
-    let expr = json!({
-        "type": "predicate_like",
-        "expression": col("name"),
-        "pattern": str_lit("A%")
-    });
+    let expr = like(col("name"), "A%");
     let sql = render_expression(&expr).unwrap();
     assert!(sql.contains("LIKE"), "LIKE not found: {sql}");
     assert!(!sql.contains("ESCAPE"), "ESCAPE should be absent: {sql}");
@@ -3076,7 +3027,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
             scalar(
                 "CASE",
                 vec![
-                    json!({"type": "predicate_greater", "left": col("x"), "right": num_lit(0)}),
+                    compare("predicate_greater", col("x"), num_lit(0)),
                     num_lit(1),
                     num_lit(0),
                 ],

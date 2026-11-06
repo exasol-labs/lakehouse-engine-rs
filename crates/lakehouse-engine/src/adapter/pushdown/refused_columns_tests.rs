@@ -1,3 +1,4 @@
+use crate::adapter::pushdown::test_support::{and, is_not_null};
 use crate::adapter::pushdown::test_support::{predicate_equal, str_lit, table_col};
 
 use super::*;
@@ -40,8 +41,7 @@ fn column_node(name: &str) -> Json {
 /// Scenario: A refused column refuses only the requests that read or emit it
 #[test]
 fn a_request_touching_no_refused_column_is_admitted() {
-    let int_col_present =
-        serde_json::json!({"type": "predicate_is_not_null", "expression": column_node("INT_COL")});
+    let int_col_present = is_not_null(column_node("INT_COL"));
     let request = stats_all_types()
         .field("type", "select")
         .filter(int_col_present)
@@ -88,23 +88,20 @@ fn a_table_with_no_refused_column_admits_every_request() {
 fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
     let request = stats_all_types()
         .field("type", serde_json::json!("select"))
-        .filter(serde_json::json!({
-            "type": "predicate_and",
-            "expressions": [
-                {"type": "predicate_is_not_null", "expression": column_node("INT_COL")},
-                predicate_equal(
-                    serde_json::json!({
-                            "type": "function_scalar",
-                            "name": "UPPER",
-                            "arguments": [{
-                                "type": "function_scalar_case",
-                                "arguments": [column_node("SHAPE_COL")],
-                            }],
-                        }),
-                    str_lit("x"),
-                ),
-            ],
-        }))
+        .filter(and([
+            is_not_null(column_node("INT_COL")),
+            predicate_equal(
+                serde_json::json!({
+                    "type": "function_scalar",
+                    "name": "UPPER",
+                    "arguments": [{
+                        "type": "function_scalar_case",
+                        "arguments": [column_node("SHAPE_COL")],
+                    }],
+                }),
+                str_lit("x"),
+            ),
+        ]))
         .column(column_node("INT_COL"))
         .build()
         .0;
@@ -123,8 +120,7 @@ fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
 /// Scenario: A refused column refuses only the requests that read or emit it
 #[test]
 fn a_full_row_projection_refuses_a_column_the_request_json_never_names() {
-    let int_col_present =
-        serde_json::json!({"type": "predicate_is_not_null", "expression": column_node("INT_COL")});
+    let int_col_present = is_not_null(column_node("INT_COL"));
     let request = stats_all_types()
         .field("type", "select")
         .filter(int_col_present)

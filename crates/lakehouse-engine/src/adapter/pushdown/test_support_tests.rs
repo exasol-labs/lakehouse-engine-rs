@@ -18,7 +18,11 @@ use lakehouse_catalog::{
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use vs_expression::ColumnNode;
+pub(crate) use vs_expression::test_support::{
+    alias_col, aliased_col, and, between, bool_lit, col, compare, date_lit, in_list, is_not_null,
+    is_null, like, lit, not, null_lit, num_lit, or, predicate_equal, str_lit, string_equal,
+    table_col, table_column, timestamp_lit,
+};
 
 type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
@@ -254,18 +258,6 @@ pub(crate) fn glue_column(name: &str, hive_type: &str) -> CatalogColumn {
     )
 }
 
-pub(crate) fn col(name: &str) -> Json {
-    ColumnNode::to_json(name, None, None)
-}
-
-pub(crate) fn table_col(table: &str, name: &str) -> Json {
-    table_column(table, None, name)
-}
-
-pub(crate) fn aliased_col(table: &str, alias: &str, name: &str) -> Json {
-    table_column(table, Some(alias), name)
-}
-
 /// The per-column type map the planner builds for one table that declares no binary column.
 pub(crate) fn column_types<N: AsRef<str>>(columns: &[(N, ExasolType)]) -> ColumnTypes {
     declared_column_types(columns, &[])
@@ -354,10 +346,6 @@ pub(crate) fn request_sides(
     request_typed(request, &sides)
 }
 
-pub(crate) fn table_column(table: &str, alias: Option<&str>, name: &str) -> Json {
-    ColumnNode::to_json(name, Some(table), alias)
-}
-
 pub(crate) fn table_ref(name: &str) -> Json {
     serde_json::json!({"name": name, "type": "table"})
 }
@@ -366,34 +354,6 @@ pub(crate) fn inner_join(left: Json, right: Json, condition: Json) -> Json {
     serde_json::json!({
         "type": "join", "join_type": "inner", "left": left, "right": right, "condition": condition
     })
-}
-
-pub(crate) fn compare(kind: &str, left: Json, right: Json) -> Json {
-    serde_json::json!({"type": kind, "left": left, "right": right})
-}
-
-pub(crate) fn predicate_equal(left: Json, right: Json) -> Json {
-    compare("predicate_equal", left, right)
-}
-
-pub(crate) fn lit(kind: &str, value: impl Into<Json>) -> Json {
-    serde_json::json!({"type": kind, "value": value.into()})
-}
-
-pub(crate) fn num_lit(value: impl Into<Json>) -> Json {
-    lit("literal_exactnumeric", value)
-}
-
-pub(crate) fn str_lit(value: &str) -> Json {
-    lit("literal_string", value)
-}
-
-pub(crate) fn bool_lit(value: bool) -> Json {
-    lit("literal_bool", value)
-}
-
-pub(crate) fn null_lit() -> Json {
-    serde_json::json!({"type": "literal_null"})
 }
 
 /// Exasol's `CAST(arg AS target)` node.
@@ -1652,45 +1612,4 @@ pub(crate) fn agg_item_expr(
         "arguments": [arg],
         "distinct": distinct,
     })
-}
-
-pub(crate) mod filter_json {
-    use super::{predicate_equal, str_lit, table_col};
-    use serde_json::{Value as Json, json};
-
-    pub(crate) fn column(name: &str) -> Json {
-        table_col("SALES", name)
-    }
-
-    pub(crate) fn equal(name: &str, value: &str) -> Json {
-        predicate_equal(column(name), str_lit(value))
-    }
-
-    pub(crate) fn not(expression: Json) -> Json {
-        json!({"type": "predicate_not", "expression": expression})
-    }
-
-    pub(crate) fn and(expressions: Vec<Json>) -> Json {
-        json!({"type": "predicate_and", "expressions": expressions})
-    }
-
-    pub(crate) fn or(expressions: Vec<Json>) -> Json {
-        json!({"type": "predicate_or", "expressions": expressions})
-    }
-
-    pub(crate) fn is_null(name: &str) -> Json {
-        json!({"type": "predicate_is_null", "expression": column(name)})
-    }
-
-    pub(crate) fn is_not_null(name: &str) -> Json {
-        json!({"type": "predicate_is_not_null", "expression": column(name)})
-    }
-
-    pub(crate) fn in_list(name: &str, arguments: Vec<Json>) -> Json {
-        json!({"type": "predicate_in_constlist", "expression": column(name), "arguments": arguments})
-    }
-
-    pub(crate) fn between(name: &str, low: Json, high: Json) -> Json {
-        json!({"type": "predicate_between", "expression": column(name), "left": low, "right": high})
-    }
 }

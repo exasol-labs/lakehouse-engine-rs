@@ -149,11 +149,7 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
         .build()
         .unwrap();
 
-    let filter_json = serde_json::json!({
-        "type": "predicate_like",
-        "expression": col("name"),
-        "pattern": str_lit("A%")
-    });
+    let filter_json = like(col("name"), "A%");
 
     let df_filter = render_df_filter_safe(&filter_json);
     assert!(
@@ -203,11 +199,7 @@ fn where_filter_decimal_stringification_rewritten_to_trim() {
 #[test]
 fn filter_decimal_comparison_not_rewritten() {
     let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
-    let filter_json = serde_json::json!({
-        "type": "predicate_greater",
-        "left": col("c_decimal_a"),
-        "right": num_lit(5)
-    });
+    let filter_json = compare("predicate_greater", col("c_decimal_a"), num_lit(5));
 
     let rendered = Some(&filter_json)
         .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
@@ -809,11 +801,7 @@ fn guard_dispatch_result(
 
 /// A shape `like_subject_type_guard` declines though Exasol renders it.
 fn declined_like_on_decimal() -> Json {
-    serde_json::json!({
-        "type": "predicate_like",
-        "expression": table_col("EVENTS", "AMOUNT"),
-        "pattern": str_lit("1%"),
-    })
+    like(table_col("EVENTS", "AMOUNT"), "1%")
 }
 
 /// The empty logical schema declines the bounded top-N unconditionally, so the
@@ -1924,10 +1912,7 @@ async fn a_count_star_filtered_on_a_refused_column_is_refused() {
     let storage = refused_column_table_storage().await;
 
     let error = delta_pushdown(
-        &refused_column_request(refused_column_table().item(serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false}), ExasolType::decimal(18, 0)).filter(serde_json::json!({
-                "type": "predicate_is_not_null",
-                "expression": column_item("VARIANT_COL"),
-            }))),
+        &refused_column_request(refused_column_table().item(serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false}), ExasolType::decimal(18, 0)).filter(is_not_null(column_item("VARIANT_COL")))),
         &catalog.uri,
         storage,
         "cat.sch.orders",

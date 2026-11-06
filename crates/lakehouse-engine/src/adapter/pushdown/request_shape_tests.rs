@@ -69,11 +69,11 @@ fn grouped_having_unmatched_aggregate_falls_through_to_wrapper() {
         .group_by(vec![col("REGION")])
         .field(
             "having",
-            serde_json::json!({
-                "type": "predicate_greater",
-                "left": agg_item("SUM", Some("AMOUNT"), false),
-                "right": num_lit(10),
-            }),
+            compare(
+                "predicate_greater",
+                agg_item("SUM", Some("AMOUNT"), false),
+                num_lit(10),
+            ),
         )
         .column(col("REGION"))
         .count_star()
@@ -91,21 +91,18 @@ fn grouped_having_mixed_junction_falls_through_to_wrapper() {
         .group_by(vec![col("REGION")])
         .field(
             "having",
-            serde_json::json!({
-                "type": "predicate_and",
-                "expressions": [
-                    {
-                        "type": "predicate_greater",
-                        "left": agg_item("COUNT", None, false),
-                        "right": num_lit(0),
-                    },
-                    {
-                        "type": "predicate_greater",
-                        "left": agg_item("SUM", Some("AMOUNT"), false),
-                        "right": num_lit(10),
-                    },
-                ],
-            }),
+            and([
+                compare(
+                    "predicate_greater",
+                    agg_item("COUNT", None, false),
+                    num_lit(0),
+                ),
+                compare(
+                    "predicate_greater",
+                    agg_item("SUM", Some("AMOUNT"), false),
+                    num_lit(10),
+                ),
+            ]),
         )
         .column(col("REGION"))
         .count_star()
@@ -123,11 +120,11 @@ fn grouped_having_fully_matched_stays_grouped() {
         .group_by(vec![col("REGION")])
         .field(
             "having",
-            serde_json::json!({
-                "type": "predicate_greater",
-                "left": agg_item("SUM", Some("AMOUNT"), false),
-                "right": num_lit(10),
-            }),
+            compare(
+                "predicate_greater",
+                agg_item("SUM", Some("AMOUNT"), false),
+                num_lit(10),
+            ),
         )
         .column(col("REGION"))
         .item(
@@ -159,11 +156,11 @@ fn grouped_having_distinct_aggregate_falls_through_to_wrapper() {
         .group_by(vec![col("REGION")])
         .field(
             "having",
-            serde_json::json!({
-                "type": "predicate_greater",
-                "left": agg_item("COUNT", Some("ID"), true),
-                "right": num_lit(1),
-            }),
+            compare(
+                "predicate_greater",
+                agg_item("COUNT", Some("ID"), true),
+                num_lit(1),
+            ),
         )
         .column(col("REGION"))
         .count_star()
@@ -325,11 +322,11 @@ fn single_group(select_list: Json, having: Option<Json>) -> PushdownRequest {
 }
 
 fn count_greater_than(n: i64) -> Json {
-    serde_json::json!({
-        "type": "predicate_greater",
-        "left": agg_item("COUNT", None, false),
-        "right": num_lit(n),
-    })
+    compare(
+        "predicate_greater",
+        agg_item("COUNT", None, false),
+        num_lit(n),
+    )
 }
 
 #[test]
@@ -362,11 +359,11 @@ fn single_group_that_does_not_split_never_classifies_as_row_scan() {
         single_group(serde_json::json!([literal]), Some(count_greater_than(0))),
         single_group(
             serde_json::json!([agg_item("COUNT", None, false)]),
-            Some(serde_json::json!({
-                "type": "predicate_greater",
-                "left": agg_item("MAX", Some("AMOUNT"), false),
-                "right": num_lit(0),
-            })),
+            Some(compare(
+                "predicate_greater",
+                agg_item("MAX", Some("AMOUNT"), false),
+                num_lit(0),
+            )),
         ),
         single_group(
             serde_json::json!([agg_item("COUNT", Some("ID"), true)]),

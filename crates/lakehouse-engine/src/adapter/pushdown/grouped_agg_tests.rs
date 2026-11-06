@@ -639,11 +639,11 @@ fn detect_group_by_aggregates_aggregate_first_with_having_preserves_order() {
         .group_by(vec![mod_item("ID", 4)])
         .field(
             "having",
-            serde_json::json!({
-                "type": "predicate_greater",
-                "left": agg_item("SUM", Some("SCORE"), false),
-                "right": num_lit(100),
-            }),
+            compare(
+                "predicate_greater",
+                agg_item("SUM", Some("SCORE"), false),
+                num_lit(100),
+            ),
         )
         .item(
             agg_item("SUM", Some("SCORE"), false),
@@ -1715,11 +1715,11 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
 
 #[test]
 fn render_having_over_merge_rewrites_aggregate_to_partial() {
-    let having = serde_json::json!({
-        "type": "predicate_greater",
-        "left": agg_item("SUM", Some("SCORE"), false),
-        "right": num_lit(250),
-    });
+    let having = compare(
+        "predicate_greater",
+        agg_item("SUM", Some("SCORE"), false),
+        num_lit(250),
+    );
     let plans = vec![AggregatePlan {
         kind: AggKind::Sum,
         column: Some("SCORE".into()),
@@ -1751,11 +1751,11 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
         group_key_exasol_types(&req, &detection.group_keys, &detection.select_items).unwrap();
     let aggregate_types = detection.plan_types.clone();
 
-    let having_node = serde_json::json!({
-        "type": "predicate_greater",
-        "left": agg_item("SUM", Some("SCORE"), false),
-        "right": num_lit(250),
-    });
+    let having_node = compare(
+        "predicate_greater",
+        agg_item("SUM", Some("SCORE"), false),
+        num_lit(250),
+    );
     let having = render_having_over_merge(&having_node, &detection.plans)
         .expect("HAVING must render over the merge decomposition");
 
@@ -1799,11 +1799,11 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
 
 #[test]
 fn render_having_over_merge_declines_unknown_aggregate() {
-    let having = serde_json::json!({
-        "type": "predicate_greater",
-        "left": agg_item("COUNT", None, false),
-        "right": num_lit(10),
-    });
+    let having = compare(
+        "predicate_greater",
+        agg_item("COUNT", None, false),
+        num_lit(10),
+    );
     let plans = vec![AggregatePlan {
         kind: AggKind::Sum,
         column: Some("SCORE".into()),
@@ -1887,11 +1887,11 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
         group_key_exasol_types(&req, &detection.group_keys, &detection.select_items).unwrap();
     let aggregate_types = detection.plan_types.clone();
 
-    let having_node = serde_json::json!({
-        "type": "predicate_greater",
-        "left": agg_item("SUM", Some("SCORE"), false),
-        "right": num_lit(100),
-    });
+    let having_node = compare(
+        "predicate_greater",
+        agg_item("SUM", Some("SCORE"), false),
+        num_lit(100),
+    );
     let having = render_having_over_merge(&having_node, &detection.plans)
         .expect("HAVING must render over the merge decomposition");
 
@@ -2777,11 +2777,11 @@ fn scalar_over_stat_aggregate_with_expression_argument_declines() {
 
 #[test]
 fn having_over_stat_aggregate_with_expression_argument_declines() {
-    let having = serde_json::json!({
-        "type": "predicate_greater",
-        "left": agg_item_expr("STDDEV", mod_item("SCORE", 4), false),
-        "right": lit("literal_double", 5.0),
-    });
+    let having = compare(
+        "predicate_greater",
+        agg_item_expr("STDDEV", mod_item("SCORE", 4), false),
+        lit("literal_double", 5.0),
+    );
     let plans = vec![AggregatePlan {
         kind: AggKind::StddevSamp,
         column: None,

@@ -54,11 +54,11 @@ fn outer_join_is_ineligible() {
 
 #[test]
 fn non_equi_two_table_join_is_served_by_unified_fallback() {
-    let condition = serde_json::json!({
-        "type": "predicate_less",
-        "left": table_col("CUSTOMER", "C_CUSTKEY"),
-        "right": table_col("ORDERS", "O_CUSTKEY"),
-    });
+    let condition = compare(
+        "predicate_less",
+        table_col("CUSTOMER", "C_CUSTKEY"),
+        table_col("ORDERS", "O_CUSTKEY"),
+    );
     let request = join_request(Json::Null, condition.clone());
     match detect_join(&request, &pd(&request)).expect("served, not declined") {
         JoinShape::Join(join) => {

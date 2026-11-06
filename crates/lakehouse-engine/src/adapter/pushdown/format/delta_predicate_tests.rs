@@ -1,5 +1,8 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
+    and, between, compare, in_list, is_not_null, is_null, not, or,
+};
+use crate::adapter::pushdown::test_support::{
     by_name, col, lit, num_lit, predicate_equal, str_lit,
 };
 use delta_kernel::schema::{PrimitiveType, StructField, StructType};
@@ -70,14 +73,14 @@ fn every_comparison_translates_and_flips_to_its_mirror_with_the_column_on_the_ri
 
 #[test]
 fn notequal_returns_none() {
-    let node = json!({"type": "predicate_notequal", "left": col("ID"), "right": num_lit(5)});
+    let node = compare("predicate_notequal", col("ID"), num_lit(5));
 
     assert_eq!(translate(&node), None);
 }
 
 #[test]
 fn is_null_on_a_column_translates() {
-    let node = json!({"type": "predicate_is_null", "expression": col("ID")});
+    let node = is_null(col("ID"));
     let pred = translate(&node).expect("IS NULL on an existing column must translate");
 
     let expected = Predicate::is_null(Expression::column(["id"]));
@@ -86,7 +89,7 @@ fn is_null_on_a_column_translates() {
 
 #[test]
 fn is_not_null_on_a_column_translates() {
-    let node = json!({"type": "predicate_is_not_null", "expression": col("ID")});
+    let node = is_not_null(col("ID"));
     let pred = translate(&node).expect("IS NOT NULL on an existing column must translate");
 
     let expected = Predicate::is_not_null(Expression::column(["id"]));
@@ -96,7 +99,7 @@ fn is_not_null_on_a_column_translates() {
 #[test]
 fn not_negates_its_translatable_child() {
     let child = predicate_equal(col("ID"), num_lit(5));
-    let node = json!({"type": "predicate_not", "expression": child});
+    let node = not(child);
     let pred = translate(&node).expect("NOT over a translatable child must translate");
 
     let expected = Predicate::not(Predicate::eq(
@@ -108,43 +111,38 @@ fn not_negates_its_translatable_child() {
 
 #[test]
 fn not_of_an_untranslatable_child_returns_none() {
-    let child = json!({"type": "predicate_notequal", "left": col("ID"), "right": num_lit(5)});
-    let node = json!({"type": "predicate_not", "expression": child});
+    let child = compare("predicate_notequal", col("ID"), num_lit(5));
+    let node = not(child);
 
     assert_eq!(translate(&node), None);
 }
 
 #[test]
 fn not_over_an_and_that_dropped_a_conjunct_returns_none() {
-    let child = json!({"type": "predicate_and", "expressions": [
+    let child = and([
         predicate_equal(col("ID"), num_lit(5)),
-        {"type": "predicate_notequal", "left": col("ID"), "right": num_lit(7)},
-    ]});
-    let node = json!({"type": "predicate_not", "expression": child});
+        compare("predicate_notequal", col("ID"), num_lit(7)),
+    ]);
+    let node = not(child);
 
     assert_eq!(translate(&node), None);
 }
 
 #[test]
 fn not_over_a_between_that_dropped_a_bound_returns_none() {
-    let child = json!({
-        "type": "predicate_between",
-        "expression": col("ID"),
-        "left": num_lit(1),
-        "right": lit("literal_string", json!("ten")),
-    });
-    let node = json!({"type": "predicate_not", "expression": child});
+    let child = between(col("ID"), num_lit(1), lit("literal_string", json!("ten")));
+    let node = not(child);
 
     assert_eq!(translate(&node), None);
 }
 
 #[test]
 fn not_over_a_fully_translatable_and_negates_the_whole_conjunction() {
-    let child = json!({"type": "predicate_and", "expressions": [
-        {"type": "predicate_greaterequal", "left": col("ID"), "right": num_lit(1)},
-        {"type": "predicate_lessequal", "left": col("ID"), "right": num_lit(9)},
-    ]});
-    let node = json!({"type": "predicate_not", "expression": child});
+    let child = and([
+        compare("predicate_greaterequal", col("ID"), num_lit(1)),
+        compare("predicate_lessequal", col("ID"), num_lit(9)),
+    ]);
+    let node = not(child);
     let pred = translate(&node).expect("NOT over a fully translatable AND must translate");
 
     let expected = Predicate::not(Predicate::and_from([
@@ -468,10 +466,10 @@ fn unknown_literal_kind_yields_no_scalar() {
 
 #[test]
 fn and_of_two_translatable_children_folds_a_conjunction() {
-    let node = json!({"type": "predicate_and", "expressions": [
-        {"type": "predicate_greaterequal", "left": col("ID"), "right": num_lit(5)},
-        {"type": "predicate_less", "left": col("ID"), "right": num_lit(9)},
-    ]});
+    let node = and([
+        compare("predicate_greaterequal", col("ID"), num_lit(5)),
+        compare("predicate_less", col("ID"), num_lit(9)),
+    ]);
     let pred = translate(&node).expect("an AND of two translatable conjuncts must translate");
 
     let expected = Predicate::and(
@@ -483,10 +481,10 @@ fn and_of_two_translatable_children_folds_a_conjunction() {
 
 #[test]
 fn and_with_untranslatable_child_keeps_translatable_conjunct() {
-    let node = json!({"type": "predicate_and", "expressions": [
+    let node = and([
         predicate_equal(col("ID"), num_lit(5)),
-        {"type": "predicate_notequal", "left": col("ID"), "right": num_lit(7)},
-    ]});
+        compare("predicate_notequal", col("ID"), num_lit(7)),
+    ]);
     let pred = translate(&node).expect("an AND must keep the conjuncts it can translate");
 
     let expected = Predicate::eq(Expression::column(["id"]), Expression::literal(5i32));
@@ -495,27 +493,27 @@ fn and_with_untranslatable_child_keeps_translatable_conjunct() {
 
 #[test]
 fn and_all_untranslatable_returns_none_not_a_true_predicate() {
-    let node = json!({"type": "predicate_and", "expressions": [
-        {"type": "predicate_notequal", "left": col("ID"), "right": num_lit(5)},
-        {"type": "predicate_notequal", "left": col("ID"), "right": num_lit(7)},
-    ]});
+    let node = and([
+        compare("predicate_notequal", col("ID"), num_lit(5)),
+        compare("predicate_notequal", col("ID"), num_lit(7)),
+    ]);
 
     assert_eq!(translate(&node), None);
 }
 
 #[test]
 fn and_over_an_empty_expression_list_returns_none() {
-    let node = json!({"type": "predicate_and", "expressions": []});
+    let node = and([]);
 
     assert_eq!(translate(&node), None);
 }
 
 #[test]
 fn or_of_two_translatable_children_folds_a_disjunction() {
-    let node = json!({"type": "predicate_or", "expressions": [
+    let node = or([
         predicate_equal(col("ID"), num_lit(5)),
         predicate_equal(col("ID"), num_lit(7)),
-    ]});
+    ]);
     let pred = translate(&node).expect("an OR of two translatable disjuncts must translate");
 
     let expected = Predicate::or(
@@ -527,17 +525,17 @@ fn or_of_two_translatable_children_folds_a_disjunction() {
 
 #[test]
 fn or_with_untranslatable_child_returns_none() {
-    let node = json!({"type": "predicate_or", "expressions": [
+    let node = or([
         predicate_equal(col("ID"), num_lit(5)),
-        {"type": "predicate_notequal", "left": col("ID"), "right": num_lit(7)},
-    ]});
+        compare("predicate_notequal", col("ID"), num_lit(7)),
+    ]);
 
     assert_eq!(translate(&node), None);
 }
 
 #[test]
 fn or_over_an_empty_expression_list_returns_none() {
-    let node = json!({"type": "predicate_or", "expressions": []});
+    let node = or([]);
 
     assert_eq!(translate(&node), None);
 }
@@ -568,11 +566,7 @@ fn fold_or_over_only_untranslatable_children_returns_none() {
 
 #[test]
 fn in_list_translates_to_an_or_chain_of_equalities() {
-    let node = json!({
-        "type": "predicate_in_constlist",
-        "expression": col("ID"),
-        "arguments": [num_lit(1), num_lit(2), num_lit(3)],
-    });
+    let node = in_list(col("ID"), [num_lit(1), num_lit(2), num_lit(3)]);
     let pred = translate(&node).expect("an IN list of translatable literals must translate");
 
     let expected = Predicate::or_from([
@@ -585,34 +579,21 @@ fn in_list_translates_to_an_or_chain_of_equalities() {
 
 #[test]
 fn empty_in_list_returns_none_not_a_false_predicate() {
-    let node = json!({
-        "type": "predicate_in_constlist",
-        "expression": col("ID"),
-        "arguments": [],
-    });
+    let node = in_list(col("ID"), []);
 
     assert_eq!(translate(&node), None);
 }
 
 #[test]
 fn in_with_type_mismatch_element_returns_none() {
-    let node = json!({
-        "type": "predicate_in_constlist",
-        "expression": col("ID"),
-        "arguments": [num_lit(1), lit("literal_string", json!("two"))],
-    });
+    let node = in_list(col("ID"), [num_lit(1), lit("literal_string", json!("two"))]);
 
     assert_eq!(translate(&node), None);
 }
 
 #[test]
 fn between_translates_to_a_lower_and_upper_bound_conjunction() {
-    let node = json!({
-        "type": "predicate_between",
-        "expression": col("ID"),
-        "left": num_lit(1),
-        "right": num_lit(10),
-    });
+    let node = between(col("ID"), num_lit(1), num_lit(10));
     let pred = translate(&node).expect("a BETWEEN with two convertible bounds must translate");
 
     let expected = Predicate::and_from([
@@ -624,12 +605,7 @@ fn between_translates_to_a_lower_and_upper_bound_conjunction() {
 
 #[test]
 fn between_keeps_the_convertible_bound_when_the_other_fails() {
-    let node = json!({
-        "type": "predicate_between",
-        "expression": col("ID"),
-        "left": num_lit(1),
-        "right": lit("literal_string", json!("ten")),
-    });
+    let node = between(col("ID"), num_lit(1), lit("literal_string", json!("ten")));
     let pred = translate(&node).expect("a BETWEEN must keep the bound it can translate");
 
     let expected = Predicate::ge(Expression::column(["id"]), Expression::literal(1i32));
@@ -638,12 +614,11 @@ fn between_keeps_the_convertible_bound_when_the_other_fails() {
 
 #[test]
 fn between_with_both_bounds_unconvertible_returns_none() {
-    let node = json!({
-        "type": "predicate_between",
-        "expression": col("ID"),
-        "left": lit("literal_string", json!("one")),
-        "right": lit("literal_string", json!("ten")),
-    });
+    let node = between(
+        col("ID"),
+        lit("literal_string", json!("one")),
+        lit("literal_string", json!("ten")),
+    );
 
     assert_eq!(translate(&node), None);
 }

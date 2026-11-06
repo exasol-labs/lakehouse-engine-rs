@@ -9,7 +9,7 @@ use super::test_support::{
 };
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    aliased_col, col, customer_orders_join, num_lit, predicate_equal, str_lit, table_col,
+    aliased_col, col, compare, customer_orders_join, num_lit, predicate_equal, str_lit, table_col,
 };
 use crate::scan::spec::ProjectionItem;
 use crate::types::exasol_type::ExasolType;
@@ -54,11 +54,11 @@ pub(super) fn grouped_request() -> (Json, Vec<ExasolType>) {
 /// HAVING matches no projected plan, so it routes to `GroupByWrapper` (#195).
 fn unmergeable_having_request() -> (Json, Vec<ExasolType>) {
     let (mut request, item_types) = grouped_request();
-    request["pushdownRequest"]["having"] = serde_json::json!({
-        "type": "predicate_greater",
-        "left": agg_item("COUNT", None, false),
-        "right": num_lit(0),
-    });
+    request["pushdownRequest"]["having"] = compare(
+        "predicate_greater",
+        agg_item("COUNT", None, false),
+        num_lit(0),
+    );
     (request, item_types)
 }
 

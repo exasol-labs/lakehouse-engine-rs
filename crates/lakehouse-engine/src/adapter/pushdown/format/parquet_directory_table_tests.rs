@@ -2,9 +2,9 @@ use super::super::{RefusedColumn, ResolvedScan};
 use super::*;
 use crate::adapter::column_notes::TableNotes;
 use crate::adapter::parquet_directory::MergeMode;
-use crate::adapter::pushdown::test_support::filter_json::{column, equal};
+use crate::adapter::pushdown::test_support::{col, predicate_equal, string_equal};
 use crate::adapter::pushdown::test_support::{
-    compare, num_lit, resolve_from_notes, sample_storage, unread_refused,
+    num_lit, resolve_from_notes, sample_storage, unread_refused,
 };
 use crate::adapter::tests::parquet_fixture::{
     directory_options, enumerated_notes, in_memory_store, nullable, parquet_bytes,
@@ -285,12 +285,12 @@ async fn a_numeric_literal_prunes_no_direct_storage_file() {
     ])
     .await;
 
-    let numeric = compare("predicate_equal", column("YEAR"), num_lit("2024"));
+    let numeric = predicate_equal(col("YEAR"), num_lit("2024"));
     let unpruned = resolve(&store, MergeMode::FoldEveryFile, Some(&numeric)).await;
     let pruned = resolve(
         &store,
         MergeMode::FoldEveryFile,
-        Some(&equal("YEAR", "2024")),
+        Some(&string_equal("YEAR", "2024")),
     )
     .await;
 
@@ -334,7 +334,7 @@ async fn a_column_only_pruned_files_carry_reads_null() {
     .await;
     let notes = enumerate(&store, MergeMode::FoldEveryFile).await;
 
-    let pruned = try_resolve(&store, &notes, Some(&equal("YEAR", "2025")))
+    let pruned = try_resolve(&store, &notes, Some(&string_equal("YEAR", "2025")))
         .await
         .expect("the kept file resolves a scan");
 
