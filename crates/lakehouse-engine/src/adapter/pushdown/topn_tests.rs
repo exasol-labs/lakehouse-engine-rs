@@ -32,11 +32,16 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
         "plan_scan_sql mirrors only the no-decline dispatch path; a declined-filter fixture needs build_dispatch_sql, not this helper"
     );
 
-    let items = detect_aggregates(&pushdown, &ColumnTypes::default())
-        .filter(|it| validate_agg_col_types(&ordinary_plans(it, &ColumnTypes::default()), &column_types(&col_types)));
+    let items = detect_aggregates(&pushdown, &ColumnTypes::default()).filter(|it| {
+        validate_agg_col_types(
+            &ordinary_plans(it, &ColumnTypes::default()),
+            &column_types(&col_types),
+        )
+    });
     let merge_inputs = items.as_deref().map(|it| {
         let plans = ordinary_plans(it, &ColumnTypes::default());
-        let plan_types = single_group_plan_types(pushdown.select_types(), it, &ColumnTypes::default());
+        let plan_types =
+            single_group_plan_types(pushdown.select_types(), it, &ColumnTypes::default());
         let merge_select =
             single_group_merge_select(it, &plans, &plan_types, &column_types(&col_types))
                 .expect("plan_scan_sql mirrors only fixtures whose merge SELECT assembles in full");

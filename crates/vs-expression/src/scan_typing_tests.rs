@@ -62,9 +62,27 @@ fn session_formatted_sources_decline_at_every_text_position() {
         let cases = [
             ("explicit CAST", cast(col(source), varchar(2_000_000))),
             ("LIKE subject", like(col(source))),
-            ("|| operand", scalar("CONCAT", vec![col(source), json!({"type": "literal_string", "value": "x"})])),
-            ("string-function argument", scalar("UPPER", vec![col(source)])),
-            ("nested", scalar("SUBSTR", vec![cast(col(source), varchar(2_000_000)), json!({"type": "literal_exactnumeric", "value": 1})])),
+            (
+                "|| operand",
+                scalar(
+                    "CONCAT",
+                    vec![col(source), json!({"type": "literal_string", "value": "x"})],
+                ),
+            ),
+            (
+                "string-function argument",
+                scalar("UPPER", vec![col(source)]),
+            ),
+            (
+                "nested",
+                scalar(
+                    "SUBSTR",
+                    vec![
+                        cast(col(source), varchar(2_000_000)),
+                        json!({"type": "literal_exactnumeric", "value": 1}),
+                    ],
+                ),
+            ),
         ];
         for (position, expr) in cases {
             assert!(
@@ -95,9 +113,21 @@ fn integer_and_text_sources_keep_their_pushdown() {
 
 #[test]
 fn a_computed_integer_converts_like_a_column() {
-    let sum = scalar("ADD", vec![col("I"), json!({"type": "literal_exactnumeric", "value": 2023})]);
+    let sum = scalar(
+        "ADD",
+        vec![
+            col("I"),
+            json!({"type": "literal_exactnumeric", "value": 2023}),
+        ],
+    );
     assert!(render(&cast(sum, varchar(2_000_000))).is_ok());
-    let quotient = scalar("FLOAT_DIV", vec![col("I"), json!({"type": "literal_exactnumeric", "value": 2})]);
+    let quotient = scalar(
+        "FLOAT_DIV",
+        vec![
+            col("I"),
+            json!({"type": "literal_exactnumeric", "value": 2}),
+        ],
+    );
     assert!(render(&cast(quotient, varchar(2_000_000))).is_err());
 }
 
@@ -124,16 +154,31 @@ fn sized_ascii_and_char_targets_push_only_when_the_source_guarantees_the_result(
 
 #[test]
 fn text_parsed_by_session_settings_declines() {
-    let text = scalar("CONCAT", vec![json!({"type": "literal_string", "value": "2024-01-0"}), col("I")]);
+    let text = scalar(
+        "CONCAT",
+        vec![
+            json!({"type": "literal_string", "value": "2024-01-0"}),
+            col("I"),
+        ],
+    );
     for target in [
         json!({"type": "DATE"}),
         json!({"type": "TIMESTAMP", "withLocalTimeZone": false, "fractionalSecondsPrecision": 3}),
         json!({"type": "DOUBLE"}),
         json!({"type": "DECIMAL", "precision": 10, "scale": 1}),
     ] {
-        assert!(render(&cast(text.clone(), target.clone())).is_err(), "{target}");
+        assert!(
+            render(&cast(text.clone(), target.clone())).is_err(),
+            "{target}"
+        );
     }
-    assert!(render(&cast(text, json!({"type": "DECIMAL", "precision": 10, "scale": 0}))).is_ok());
+    assert!(
+        render(&cast(
+            text,
+            json!({"type": "DECIMAL", "precision": 10, "scale": 0})
+        ))
+        .is_ok()
+    );
 }
 
 #[test]

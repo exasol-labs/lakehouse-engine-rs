@@ -20,10 +20,9 @@ use super::planning::{
     DetectedJoin, JoinSides, JoinWindowPlan, ResolvedJoinSide, classify_join_window,
 };
 use super::rendering::{
-    conjoin_filters, cross_leg_residual_filter, leg_local_filter,
-    projection_item_select_sql, referenced_clause_values, referenced_leg_columns,
-    render_df_filter_qualified, render_expression_qualified, 
-    type_screened_leg_filter,
+    conjoin_filters, cross_leg_residual_filter, leg_local_filter, projection_item_select_sql,
+    referenced_clause_values, referenced_leg_columns, render_df_filter_qualified,
+    render_expression_qualified, type_screened_leg_filter,
 };
 
 /// Exasol rejects a longer identifier (`maximum length of identifier exceeded`, verified live

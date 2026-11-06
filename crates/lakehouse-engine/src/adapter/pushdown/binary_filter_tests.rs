@@ -1,7 +1,7 @@
+use crate::adapter::pushdown::test_support::render_df_filter_safe;
 use crate::adapter::pushdown::test_support::{
     column_types_under, compare, declared_column_types, lit, str_lit,
 };
-use crate::adapter::pushdown::test_support::render_df_filter_safe;
 
 use super::*;
 use crate::adapter::pushdown::test_support::filter_json::column;

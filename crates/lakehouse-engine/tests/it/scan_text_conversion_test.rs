@@ -58,7 +58,11 @@ async fn texts(fragment: &str) -> Vec<Option<String>> {
     let batches = df.collect().await.unwrap();
     let mut out = Vec::new();
     for batch in &batches {
-        let arr = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         out.extend((0..arr.len()).map(|i| (!arr.is_null(i)).then(|| arr.value(i).to_string())));
     }
     out
@@ -75,19 +79,39 @@ async fn integer_and_boolean_columns_convert_to_exasol_text() {
     let render = |e: &Json| vs_expression::render_scan_expression(e, &Columns).unwrap();
     assert_eq!(
         texts(&render(&cast_to_varchar("QTY"))).await,
-        vec![Some("-12".into()), Some("0".into()), Some("1234567890123".into()), None]
+        vec![
+            Some("-12".into()),
+            Some("0".into()),
+            Some("1234567890123".into()),
+            None
+        ]
     );
     assert_eq!(
         texts(&render(&cast_to_varchar("D9"))).await,
-        vec![Some("-5".into()), Some("0".into()), Some("123456789".into()), None]
+        vec![
+            Some("-5".into()),
+            Some("0".into()),
+            Some("123456789".into()),
+            None
+        ]
     );
     assert_eq!(
         texts(&render(&cast_to_varchar("B"))).await,
-        vec![Some("TRUE".into()), Some("FALSE".into()), None, Some("TRUE".into())]
+        vec![
+            Some("TRUE".into()),
+            Some("FALSE".into()),
+            None,
+            Some("TRUE".into())
+        ]
     );
     let upper = json!({"type": "function_scalar", "name": "UPPER", "arguments": [{"type": "column", "name": "QTY"}]});
     assert_eq!(
         texts(&render(&upper)).await,
-        vec![Some("-12".into()), Some("0".into()), Some("1234567890123".into()), None]
+        vec![
+            Some("-12".into()),
+            Some("0".into()),
+            Some("1234567890123".into()),
+            None
+        ]
     );
 }

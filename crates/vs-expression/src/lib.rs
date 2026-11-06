@@ -6,10 +6,10 @@ mod datetime_format;
 pub mod exasol_type;
 mod scan_typing;
 pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
-pub use scan_typing::ColumnTypeLookup;
-use scan_typing::{BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE};
 use datetime_format::{FormatTarget, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
+pub use scan_typing::ColumnTypeLookup;
+use scan_typing::{BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE};
 
 /// Which parser consumes the rendered fragment: DataFusion inside the scan UDF
 /// (`ScanSpec` filter/projection/group keys) or Exasol for the outer wrapper SQL.

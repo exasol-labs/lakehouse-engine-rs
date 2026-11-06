@@ -46,7 +46,8 @@ pub(super) fn classify_request_shape(
         if validate_agg_col_types(&detection.plans, col_types) {
             // The merge wrapper only has `GK_*`/`PARTIAL_*` columns, so an aggregate absent
             // from the select list cannot be sorted on there (#198).
-            let order_by = match build_grouped_order_by_clause(pushdown_req, &detection, col_types) {
+            let order_by = match build_grouped_order_by_clause(pushdown_req, &detection, col_types)
+            {
                 Some(GroupedOrderBy::Clause(clause)) => Some(clause),
                 Some(GroupedOrderBy::Unresolvable) => return RequestShape::GroupByWrapper,
                 None => None,
@@ -94,13 +95,15 @@ pub(super) fn classify_request_shape(
             having: None,
         },
         Some(_) if has_distinct(&items) => RequestShape::SingleGroupWrapper,
-        Some(node) => match render_having_over_merge(node, &ordinary_plans(&items, col_types), col_types) {
-            Some(sql) => RequestShape::SingleGroupAgg {
-                items,
-                having: Some(sql),
-            },
-            None => RequestShape::SingleGroupWrapper,
-        },
+        Some(node) => {
+            match render_having_over_merge(node, &ordinary_plans(&items, col_types), col_types) {
+                Some(sql) => RequestShape::SingleGroupAgg {
+                    items,
+                    having: Some(sql),
+                },
+                None => RequestShape::SingleGroupWrapper,
+            }
+        }
     }
 }
 

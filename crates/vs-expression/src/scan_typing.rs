@@ -301,8 +301,13 @@ pub(crate) fn type_scan_tree(
             }
             TypeClass::Boolean
         }
-        "predicate_equal" | "predicate_notequal" | "predicate_less" | "predicate_lessequal"
-        | "predicate_greater" | "predicate_greaterequal" | "predicate_between"
+        "predicate_equal"
+        | "predicate_notequal"
+        | "predicate_less"
+        | "predicate_lessequal"
+        | "predicate_greater"
+        | "predicate_greaterequal"
+        | "predicate_between"
         | "predicate_in_constlist" => {
             let mut operands: Vec<TypeClass> = ["expression", "left", "right"]
                 .iter()
@@ -314,7 +319,11 @@ pub(crate) fn type_scan_tree(
         }
         k if k.starts_with("predicate_") => TypeClass::Boolean,
         "function_scalar_extract" => {
-            match node.get("toExtract").and_then(Json::as_str).map(str::to_uppercase) {
+            match node
+                .get("toExtract")
+                .and_then(Json::as_str)
+                .map(str::to_uppercase)
+            {
                 Some(f) if matches!(f.as_str(), "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE") => {
                     TypeClass::INTEGER
                 }
@@ -368,9 +377,7 @@ pub(crate) fn type_scan_tree(
 /// Exasol compares text with a date, timestamp, or number by converting the text with the
 /// session's NLS settings; DataFusion always parses ISO dates and a `.` decimal point.
 fn compare_without_session_parse(node: &Json, operands: &[TypeClass]) -> Result<(), UdfError> {
-    let has_text = operands
-        .iter()
-        .any(|c| matches!(c, TypeClass::Text { .. }));
+    let has_text = operands.iter().any(|c| matches!(c, TypeClass::Text { .. }));
     let has_non_text = operands
         .iter()
         .any(|c| !matches!(c, TypeClass::Text { .. } | TypeClass::Null));

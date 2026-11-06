@@ -24,13 +24,12 @@ pub(super) fn empty_result_sql(
 ) -> Result<Json, UdfError> {
     match classify_request_shape(pushdown, col_types) {
         RequestShape::Grouped { detection, .. } => {
-            let group_key_types =
-                group_key_exasol_types(
-                    pushdown,
-                    &detection.group_keys,
-                    &detection.select_items,
-                    col_types,
-                )?;
+            let group_key_types = group_key_exasol_types(
+                pushdown,
+                &detection.group_keys,
+                &detection.select_items,
+                col_types,
+            )?;
             Ok(empty_grouped_sql(
                 &group_key_types,
                 &detection.plan_types,

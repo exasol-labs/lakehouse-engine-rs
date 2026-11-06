@@ -750,7 +750,10 @@ pub(super) fn project_columns(
                     // select-list arity (#190).
                     t if is_literal_selectlist_item(t) || is_pushable_expression_node(t) => {
                         // The EMITS column type must equal Exasol's declared type.
-                        match (scan_expression(e, all_cols), pushdown.emittable_select_type(i)) {
+                        match (
+                            scan_expression(e, all_cols),
+                            pushdown.emittable_select_type(i),
+                        ) {
                             (Some(sql_frag), Some(exa_type)) => {
                                 projected.push(ProjectedColumn {
                                     item: ProjectionItem::Expr { expr: sql_frag },

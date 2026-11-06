@@ -30,7 +30,8 @@ fn round_of(inner: Json, digits: i64) -> Json {
 }
 
 fn plan_of(node: &Json) -> AggregatePlan {
-    parse_agg_item(node, &ColumnTypes::default()).expect("test fixture aggregate must parse to a plan")
+    parse_agg_item(node, &ColumnTypes::default())
+        .expect("test fixture aggregate must parse to a plan")
 }
 
 #[test]
@@ -219,7 +220,11 @@ fn classify_accepts_a_bare_aggregate_as_its_own_single_plan() {
 #[test]
 fn classify_declines_a_distinct_inner_aggregate() {
     assert!(
-        classify_scalar_over_aggregate(&round_of(agg("SUM", "X", true), 2), &ColumnTypes::default()).is_none(),
+        classify_scalar_over_aggregate(
+            &round_of(agg("SUM", "X", true), 2),
+            &ColumnTypes::default()
+        )
+        .is_none(),
         "an undecomposable DISTINCT inner aggregate must decline the whole item"
     );
 }
@@ -248,8 +253,13 @@ fn render_leaves_no_sentinel_token_behind() {
     let node = round_of(agg("SUM", "X", false), 2);
     let plans = vec![plan_of(&agg("SUM", "X", false))];
 
-    let sql = render_scalar_over_merge(&node, &plans, &["<MERGED_SUM>".to_string()], &ColumnTypes::default())
-        .expect("a single-aggregate item must render");
+    let sql = render_scalar_over_merge(
+        &node,
+        &plans,
+        &["<MERGED_SUM>".to_string()],
+        &ColumnTypes::default(),
+    )
+    .expect("a single-aggregate item must render");
 
     assert!(
         !sql.contains(&agg_sentinel_token(0)),
@@ -263,7 +273,13 @@ fn render_declines_an_aggregate_absent_from_the_plans() {
     let plans = vec![plan_of(&count_star())];
 
     assert!(
-        render_scalar_over_merge(&node, &plans, &["<MERGED_COUNT>".to_string()], &ColumnTypes::default()).is_none(),
+        render_scalar_over_merge(
+            &node,
+            &plans,
+            &["<MERGED_COUNT>".to_string()],
+            &ColumnTypes::default()
+        )
+        .is_none(),
         "an aggregate with no merge slot cannot be rendered"
     );
 }
@@ -274,7 +290,13 @@ fn render_declines_when_the_merged_list_is_shorter_than_the_matched_slot() {
     let plans = vec![plan_of(&count_star()), plan_of(&agg("SUM", "X", false))];
 
     assert!(
-        render_scalar_over_merge(&node, &plans, &["<MERGED_COUNT>".to_string()], &ColumnTypes::default()).is_none(),
+        render_scalar_over_merge(
+            &node,
+            &plans,
+            &["<MERGED_COUNT>".to_string()],
+            &ColumnTypes::default()
+        )
+        .is_none(),
         "a merged list not aligned with plans must decline, not panic"
     );
 }
@@ -325,11 +347,20 @@ fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
         "SUM(\"PARTIAL_count_2\")".to_string(),
     ];
 
-    let grouped_sql = render_scalar_over_merge(&node, &grouped_plans, &grouped_merged, &ColumnTypes::default())
-        .expect("the grouped-shaped caller must render");
-    let single_group_sql =
-        render_scalar_over_merge(&node, &single_group_plans, &single_group_merged, &ColumnTypes::default())
-            .expect("the single-group-shaped caller must render");
+    let grouped_sql = render_scalar_over_merge(
+        &node,
+        &grouped_plans,
+        &grouped_merged,
+        &ColumnTypes::default(),
+    )
+    .expect("the grouped-shaped caller must render");
+    let single_group_sql = render_scalar_over_merge(
+        &node,
+        &single_group_plans,
+        &single_group_merged,
+        &ColumnTypes::default(),
+    )
+    .expect("the single-group-shaped caller must render");
 
     assert_eq!(
         grouped_sql, single_group_sql,

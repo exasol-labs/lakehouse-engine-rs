@@ -345,7 +345,12 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     // that reads text by the session's NLS settings (#587). Only an unprojected key whose type
     // is unknown travels as text: the merge groups on it but never outputs it.
     let gk_types: Vec<ExasolType> = (0..group_keys.len())
-        .map(|i| group_key_types.get(i).copied().unwrap_or(GROUP_KEY_EMIT_TYPE))
+        .map(|i| {
+            group_key_types
+                .get(i)
+                .copied()
+                .unwrap_or(GROUP_KEY_EMIT_TYPE)
+        })
         .collect();
     let gk_emits: Vec<String> = gk_types
         .iter()
