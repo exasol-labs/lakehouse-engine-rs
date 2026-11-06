@@ -1077,7 +1077,11 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
     let (leg, declined) = type_screened_leg_filter(&filter, &sides[0].column_types);
     assert!(declined.is_none(), "{declined:?}");
     assert_eq!(
-        render_df_filter_safe(&leg.expect("the leg takes the comparison")).as_deref(),
+        scan_filter_sql(
+            &leg.expect("the leg takes the comparison"),
+            &sides[0].column_types
+        )
+        .as_deref(),
         Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#)
     );
 }

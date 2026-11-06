@@ -679,41 +679,6 @@ fn renders_cast_char_as_exasol_char() {
 }
 
 #[test]
-fn renders_cast_bool_to_varchar_as_exasol_case_uppercase() {
-    let expr = json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "arguments": [{
-            "type": "predicate_greater",
-            "left": col("c_acctbal"),
-            "right": num_lit(0)
-        }],
-        "dataType": {"type": "VARCHAR", "size": 10}
-    });
-    assert_eq!(
-        render_expression(&expr).unwrap(),
-        r#"(CASE ("C_ACCTBAL" > 0) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)"#
-    );
-}
-
-#[test]
-fn renders_cast_bool_to_varchar_uses_case_for_any_predicate_source() {
-    let expr = json!({
-        "type": "function_scalar_cast",
-        "name": "CAST",
-        "arguments": [{
-            "type": "predicate_is_null",
-            "expression": col("x")
-        }],
-        "dataType": {"type": "VARCHAR", "size": 10}
-    });
-    assert_eq!(
-        render_expression(&expr).unwrap(),
-        r#"(CASE ("X" IS NULL) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)"#
-    );
-}
-
-#[test]
 fn renders_cast_bool_to_varchar_as_plain_cast_in_exasol_dialect() {
     let expr = json!({
         "type": "function_scalar_cast",
@@ -874,50 +839,6 @@ fn renders_cast_nested_function_scalar_defensive() {
         "dataType": {"type": "VARCHAR", "size": 100}
     });
     assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
-}
-
-#[test]
-fn renders_decimal_to_varchar_exasol() {
-    let expr = json!({
-        "type": "decimal_to_varchar_exasol",
-        "arguments": [col("c_decimal_a")]
-    });
-    let expected = format_decimal_exasol_style(r#""C_DECIMAL_A""#);
-    assert_eq!(render_expression(&expr).unwrap(), expected);
-    assert_eq!(render_expression_safe(&expr).unwrap(), expected);
-}
-
-#[test]
-fn decimal_to_varchar_exasol_wrong_arity_errors() {
-    let no_args = json!({
-        "type": "decimal_to_varchar_exasol",
-        "arguments": []
-    });
-    let two_args = json!({
-        "type": "decimal_to_varchar_exasol",
-        "arguments": [
-            col("c_decimal_a"),
-            col("c_decimal_b")
-        ]
-    });
-    for expr in [&no_args, &two_args] {
-        assert!(
-            render_expression(expr).is_err(),
-            "decimal_to_varchar_exasol with non-unary arguments must raise: {expr}"
-        );
-        assert!(
-            render_expression_safe(expr).is_none(),
-            "decimal_to_varchar_exasol with non-unary arguments must be None in safe mode: {expr}"
-        );
-    }
-}
-
-#[test]
-fn format_decimal_exasol_style_renders_exact_regex_sql() {
-    assert_eq!(
-        format_decimal_exasol_style("some_col"),
-        r#"regexp_replace(regexp_replace(CAST(some_col AS VARCHAR), '(\.[0-9]*[1-9])0+$', '\1'), '\.0+$', '')"#
-    );
 }
 
 #[test]
@@ -1297,22 +1218,6 @@ fn renders_concat_as_nullif_wrapped_concat_call() {
     assert_eq!(
         render_expression(&expr).unwrap(),
         r#"nullif(concat("A", "B", "C"), '')"#
-    );
-}
-
-#[test]
-fn renders_concat_bool_operand_as_exasol_case() {
-    let expr = json!({
-        "type": "function_scalar",
-        "name": "CONCAT",
-        "arguments": [
-            predicate_equal(col("active"), bool_lit(true)),
-            str_lit("")
-        ]
-    });
-    assert_eq!(
-        render_expression(&expr).unwrap(),
-        r#"nullif(concat((CASE ("ACTIVE" = TRUE) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END), ''), '')"#
     );
 }
 
@@ -1857,7 +1762,10 @@ fn renders_to_date_to_timestamp() {
         "name": "TO_DATE",
         "arguments": [col("s")]
     });
-    assert_eq!(render_expression(&expr).unwrap(), r#"to_date("S")"#);
+    assert!(
+        render_expression(&expr).is_err(),
+        "without a format Exasol parses by the session"
+    );
 
     let expr2 = json!({
         "type": "function_scalar",
@@ -1877,7 +1785,7 @@ fn renders_to_date_to_timestamp() {
         "name": "TO_TIMESTAMP",
         "arguments": [col("s")]
     });
-    assert_eq!(render_expression(&expr3).unwrap(), r#"to_timestamp("S")"#);
+    assert!(render_expression(&expr3).is_err());
 
     let expr4 = json!({
         "type": "function_scalar",
@@ -2822,10 +2730,9 @@ fn renders_to_date_to_timestamp_verbatim_in_exasol_dialect() {
             format!(r#"{exasol_name}("S")"#),
             "the Exasol dialect must render {exasol_name} verbatim"
         );
-        assert_eq!(
-            render_expression(&bare).unwrap(),
-            format!(r#"{df_name}("S")"#),
-            "the DataFusion dialect must stay unchanged for {exasol_name}"
+        assert!(
+            render_expression(&bare).is_err(),
+            "without a format the DataFusion dialect must decline {exasol_name}"
         );
 
         let formatted = json!({

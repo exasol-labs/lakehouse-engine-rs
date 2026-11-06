@@ -15,8 +15,11 @@ pub(crate) fn render_expression_safe(expr: &Json) -> Option<String> {
     vs_expression::render_scan_expression(expr, &ColumnTypes::default()).ok()
 }
 
-pub(crate) fn apply_type_rewrites(expr: &Json, col_types: &ColumnTypes) -> Option<Json> {
-    super::support::type_accepted_rewrite(expr, col_types)
+/// The scan's typed filter SQL, `None` when it declines or the filter is trivially true.
+pub(crate) fn scan_filter_sql(filter: &Json, col_types: &ColumnTypes) -> Option<String> {
+    super::support::scan_filter(filter, col_types)
+        .ok()
+        .flatten()
 }
 use crate::adapter::ResolvedConnectionConfig;
 use crate::adapter::column_notes::TableNotes;

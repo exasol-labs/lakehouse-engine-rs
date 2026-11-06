@@ -1972,37 +1972,13 @@ fn expr_tree_applies_f_to_children_before_their_parent() {
         } else {
             out["child_type_seen"] = node["expression"]["type"].clone();
         }
-        Some(out)
-    })
-    .expect("an always-Some closure must never decline");
+        out
+    });
 
     assert_eq!(
         out["child_type_seen"],
         Json::from("inner_rewritten"),
         "the parent must see its already-rewritten child: {out}"
-    );
-}
-
-#[test]
-fn expr_tree_decline_deep_in_the_tree_propagates_to_the_root() {
-    let tree = serde_json::json!({
-        "type": "root",
-        "expressions": [
-            {"type": "keep"},
-            {"type": "branch", "left": {"type": "decline_here"}},
-        ],
-    });
-
-    let out = rewrite_expr_tree(&tree, &|node| {
-        if node.get("type").and_then(|t| t.as_str()) == Some("decline_here") {
-            return None;
-        }
-        Some(node.clone())
-    });
-
-    assert_eq!(
-        out, None,
-        "a declined descendant must decline the whole tree"
     );
 }
 
@@ -2020,9 +1996,8 @@ fn expr_tree_recurses_only_into_curated_fields_of_the_expected_shape() {
     let out = rewrite_expr_tree(&tree, &|node| {
         let mut out = node.clone();
         out["visited"] = Json::Bool(true);
-        Some(out)
-    })
-    .expect("an always-Some closure must never decline");
+        out
+    });
 
     assert_eq!(
         out["expression"]["visited"],
@@ -2057,8 +2032,8 @@ fn expr_tree_applies_f_to_a_non_object_node() {
         serde_json::json!([1, 2]),
     ] {
         assert_eq!(
-            rewrite_expr_tree(&leaf, &|_| Some(Json::from("touched"))),
-            Some(Json::from("touched")),
+            rewrite_expr_tree(&leaf, &|_| Json::from("touched")),
+            Json::from("touched"),
             "a non-object node must be handed to `f`: {leaf}"
         );
     }
@@ -3144,4 +3119,186 @@ fn involved_column_with_an_unparsable_type_fails() {
             other => panic!("the column must fail with {named}, got {other:?}"),
         }
     }
+}
+
+fn ts_literal(value: &str) -> Json {
+    serde_json::json!({"type": "literal_timestamp", "value": value})
+}
+
+fn ts_column() -> Json {
+    serde_json::json!({"type": "column", "name": "ts"})
+}
+
+fn timestamp_comparison(op: &str, left: Json, right: Json) -> Json {
+    serde_json::json!({"type": op, "left": left, "right": right})
+}
+
+#[test]
+fn overprecise_timestamp_literal_is_rewritten_to_the_column_precision() {
+    let col_types = vec![("TS".to_string(), ExasolType::timestamp(3))];
+    let lit = ts_literal("2025-06-01 00:00:00.123500");
+    let floor = ts_literal("2025-06-01 00:00:00.123");
+    for (op, mirrored, want_op, want_right) in [
+        ("predicate_equal", false, "predicate_notequal", ts_column()),
+        ("predicate_notequal", false, "predicate_equal", ts_column()),
+        (
+            "predicate_less",
+            false,
+            "predicate_lessequal",
+            floor.clone(),
+        ),
+        (
+            "predicate_lessequal",
+            false,
+            "predicate_lessequal",
+            floor.clone(),
+        ),
+        (
+            "predicate_greater",
+            false,
+            "predicate_greater",
+            floor.clone(),
+        ),
+        (
+            "predicate_greaterequal",
+            false,
+            "predicate_greater",
+            floor.clone(),
+        ),
+        ("predicate_less", true, "predicate_greater", floor.clone()),
+        (
+            "predicate_greaterequal",
+            true,
+            "predicate_lessequal",
+            floor.clone(),
+        ),
+    ] {
+        let filter = if mirrored {
+            timestamp_comparison(op, lit.clone(), ts_column())
+        } else {
+            timestamp_comparison(op, ts_column(), lit.clone())
+        };
+        assert_eq!(
+            rewrite_overprecise_timestamp_comparisons(&filter, &column_types(&col_types)),
+            timestamp_comparison(want_op, ts_column(), want_right),
+            "{op} mirrored={mirrored}"
+        );
+    }
+}
+
+#[test]
+fn timestamp_literal_within_the_column_precision_is_unchanged() {
+    for (declared, value) in [
+        (ExasolType::BARE_TIMESTAMP, "2025-06-01 00:00:00.123000"),
+        (ExasolType::timestamp(6), "2025-06-01 00:00:00.123456"),
+        (ExasolType::timestamp(9), "2025-06-01 00:00:00.123456789"),
+        (ExasolType::timestamp(3), "2025-06-01 00:00:00"),
+    ] {
+        let col_types = vec![("TS".to_string(), declared)];
+        let filter = timestamp_comparison("predicate_equal", ts_column(), ts_literal(value));
+        assert_eq!(
+            rewrite_overprecise_timestamp_comparisons(&filter, &column_types(&col_types)),
+            filter.clone(),
+            "{declared} = {value}"
+        );
+    }
+}
+
+#[test]
+fn between_and_in_with_an_overprecise_timestamp_expand_to_rewritten_comparisons() {
+    let col_types = vec![("TS".to_string(), ExasolType::timestamp(3))];
+    let fits = || ts_literal("2025-06-01 00:00:00.122");
+    let over = || ts_literal("2025-06-01 00:00:00.123500");
+    let floor = || ts_literal("2025-06-01 00:00:00.123");
+
+    let between = serde_json::json!({
+        "type": "predicate_between", "expression": ts_column(), "left": fits(), "right": over()
+    });
+    assert_eq!(
+        rewrite_overprecise_timestamp_comparisons(&between, &column_types(&col_types)),
+        serde_json::json!({"type": "predicate_and", "expressions": [
+            timestamp_comparison("predicate_greaterequal", ts_column(), fits()),
+            timestamp_comparison("predicate_lessequal", ts_column(), floor()),
+        ]})
+    );
+
+    let in_list = serde_json::json!({
+        "type": "predicate_in_constlist", "expression": ts_column(), "arguments": [over(), fits()]
+    });
+    assert_eq!(
+        rewrite_overprecise_timestamp_comparisons(&in_list, &column_types(&col_types)),
+        serde_json::json!({"type": "predicate_or", "expressions": [
+            timestamp_comparison("predicate_notequal", ts_column(), ts_column()),
+            timestamp_comparison("predicate_equal", ts_column(), fits()),
+        ]})
+    );
+
+    let fitting_in = serde_json::json!({
+        "type": "predicate_in_constlist", "expression": ts_column(), "arguments": [fits()]
+    });
+    assert_eq!(
+        rewrite_overprecise_timestamp_comparisons(&fitting_in, &column_types(&col_types)),
+        fitting_in.clone()
+    );
+}
+
+#[test]
+fn selectlist_tstz_literal_widens_via_emits_type_gate() {
+    let literal = lit("literal_timestamp_utc", "2024-03-01 10:00:00");
+    assert!(
+        render_expression_safe(&literal).is_some(),
+        "literal_timestamp_utc must render via render_expression_safe"
+    );
+    let (proj_cols, proj_types, widened) = projected(id_name_request().item(
+        literal,
+        ExasolType::TimestampWithLocalTimeZone { precision: 3 },
+    ));
+    assert!(
+        widened,
+        "a TIMESTAMP WITH LOCAL TIME ZONE literal must widen the projection \
+         so the RowScan dispatcher routes it to the qualified wrapper"
+    );
+    assert_eq!(
+        proj_cols,
+        vec![
+            ProjectionItem::Column("ID".into()),
+            ProjectionItem::Column("NAME".into()),
+        ],
+        "a TIMESTAMP WITH LOCAL TIME ZONE literal must widen to the full base row: {proj_cols:?}"
+    );
+    assert_eq!(
+        proj_types,
+        vec![ExasolType::decimal(10, 0), ExasolType::varchar(100)]
+    );
+}
+
+#[test]
+fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
+    let literal = lit("literal_timestamputc", "2024-03-01 10:00:00");
+    assert!(
+        render_expression_safe(&literal).is_none(),
+        "the DataFusion dialect must keep declining the real wire name (#242): \
+         a render here would silently start pushing TSTZ predicates into the \
+         scan filter"
+    );
+    let (proj_cols, proj_types, widened) = projected(id_name_request().item(
+        literal,
+        ExasolType::TimestampWithLocalTimeZone { precision: 3 },
+    ));
+    assert!(
+        widened,
+        "the real-wire-name TSTZ literal must widen the projection so the \
+         RowScan dispatcher routes it to the qualified wrapper"
+    );
+    assert_eq!(
+        proj_cols,
+        vec![
+            ProjectionItem::Column("ID".into()),
+            ProjectionItem::Column("NAME".into()),
+        ]
+    );
+    assert_eq!(
+        proj_types,
+        vec![ExasolType::decimal(10, 0), ExasolType::varchar(100)]
+    );
 }

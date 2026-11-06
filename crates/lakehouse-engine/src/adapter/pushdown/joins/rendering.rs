@@ -4,7 +4,7 @@ use vs_expression::{
     render_df_filter_exasol_safe, render_expression_exasol_safe, walk_column_nodes,
 };
 
-use super::super::support::{ColumnTypes, quote_ident, type_accepted_rewrite};
+use super::super::support::{ColumnTypes, quote_ident, scan_accepts};
 use super::attribution::{ColumnLeg, JoinLegs, UnattributableColumn};
 
 pub(super) fn projection_item_select_sql(item: &ProjectionItem) -> String {
@@ -87,29 +87,23 @@ pub(super) fn cross_leg_residual_filter(filter: &Json, legs: &JoinLegs) -> Optio
     partition_conjuncts(filter, |c| legs.conjunct_leg(c).is_none())
 }
 
-/// Returns `(leg_filter, type_declined)`: a total per-conjunct partition, the first half
-/// rewritten for the leg, the second raw for the Exasol-dialect outer WHERE.
+/// Returns `(leg_filter, type_declined)`: a total per-conjunct partition, the first half for the
+/// leg's scan, the second for the Exasol-dialect outer WHERE.
 ///
 /// Not [`classify_where_filter`](super::super::support::classify_where_filter), which
 /// classifies a whole filter against one type universe: an N-scan leg's conjuncts name only
 /// that leg's columns, so the leg's own unqualified `col_types`, known only after
 /// attribution, binds each one by name. Per conjunct, so one declined conjunct doesn't
-/// forfeit its siblings. Renderability is established on the rewritten tree via
-/// [`type_accepted_rewrite`]; if the re-formed tree fails it, the whole side-local set
-/// becomes residual (fail closed: applied in the wrapper is slower, applied nowhere is wrong).
+/// forfeit its siblings.
 pub(super) fn type_screened_leg_filter(
     side_local: &Json,
     col_types: &ColumnTypes,
 ) -> (Option<Json>, Option<Json>) {
-    let accepts = |c: &Json| type_accepted_rewrite(c, col_types).is_some();
-    let declined = partition_conjuncts(side_local, |c| !accepts(c));
-    match partition_conjuncts(side_local, accepts) {
-        None => (None, declined),
-        Some(accepted) => match type_accepted_rewrite(&accepted, col_types) {
-            Some(rewritten) => (Some(rewritten), declined),
-            None => (None, Some(side_local.clone())),
-        },
-    }
+    let accepts = |c: &Json| scan_accepts(c, col_types);
+    (
+        partition_conjuncts(side_local, accepts),
+        partition_conjuncts(side_local, |c| !accepts(c)),
+    )
 }
 
 /// Inputs must be disjoint conjunct sets; nothing is de-duplicated.

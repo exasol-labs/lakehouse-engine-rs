@@ -85,9 +85,8 @@ use joins::{
 
 #[cfg(test)]
 use crate::scan::spec::{AggKind, AggregatePlan, StorageBackend};
-// Imported for the test mirrors of `classify_where_filter`'s two halves.
 #[cfg(test)]
-use test_support::{apply_type_rewrites, render_df_filter_safe};
+use test_support::{render_df_filter_safe, scan_filter_sql};
 
 #[cfg(test)]
 #[path = "test_support_tests.rs"]

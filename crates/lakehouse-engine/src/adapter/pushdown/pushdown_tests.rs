@@ -183,8 +183,7 @@ fn where_filter_decimal_stringification_rewritten_to_trim() {
     });
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f))
+        .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
         .expect("LENGTH(decimal) > 5 must render to a DataFusion filter");
 
     let trim_wrapper = "regexp_replace(regexp_replace(CAST(";
@@ -210,8 +209,7 @@ fn filter_decimal_comparison_not_rewritten() {
     });
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f))
+        .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
         .expect("c_decimal_a > 5 must render to a DataFusion filter");
 
     assert_eq!(
@@ -237,8 +235,7 @@ fn where_filter_string_fn_under_comparison_predicate_coerced() {
     );
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f))
+        .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
         .expect("UPPER(decimal) = 'X' must render to a DataFusion filter");
 
     assert!(
@@ -260,9 +257,7 @@ fn where_filter_string_fn_over_double_declines() {
         str_lit("X"),
     );
 
-    let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f));
+    let rendered = Some(&filter_json).and_then(|f| scan_filter_sql(f, &column_types(&col_types)));
 
     assert!(
         rendered.is_none(),
@@ -285,8 +280,7 @@ fn where_filter_upper_decimal_inside_like_subject_coerced() {
     });
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f))
+        .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
         .expect("UPPER(decimal) LIKE '1%' must render to a DataFusion filter");
 
     assert!(
@@ -319,9 +313,7 @@ fn where_filter_like_decimal_inside_case_declines_whole_filter() {
         num_lit(1),
     );
 
-    let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f));
+    let rendered = Some(&filter_json).and_then(|f| scan_filter_sql(f, &column_types(&col_types)));
 
     assert!(
         rendered.is_none(),
@@ -1066,13 +1058,6 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
         ("TS".to_string(), ExasolType::BARE_TIMESTAMP),
         ("AMOUNT".to_string(), ExasolType::decimal(18, 2)),
     ];
-    assert_ne!(
-        apply_type_rewrites(&filter, &column_types(&col_types)).as_ref(),
-        Some(&filter),
-        "fixture precondition: the type rewrites must CHANGE this tree, so the \
-             assertion below can tell the original from the rewritten one"
-    );
-
     let (scan_filter, declined) = classify_where_filter(Some(&filter), &column_types(&col_types));
 
     assert!(

@@ -3,6 +3,7 @@ use crate::scan::spec::{
     CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec, ScanStorage, SortKey,
     StorageBackend, relation_alias, render_ordered,
 };
+use crate::types::exasol_type::exasol_type_from_json;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::strip_table_alias;
@@ -228,8 +229,9 @@ fn render_self_applied_where(
 }
 
 /// An absent/empty select list projects every column of every leg. Every item but a bare column
-/// renders cast to its declared type: Exasol sends `''` and `NULL` alike as a bare `literal_null`
-/// but types them differently, so only the declared type reproduces the item's type (#587).
+/// or a CAST to its declared type renders cast to that type: Exasol sends `''` and `NULL` alike
+/// as a bare `literal_null` but types them differently, so only the declared type reproduces
+/// the item's type (#587).
 fn n_scan_join_select_items(
     pushdown: &PushdownRequest,
     legs: &JoinLegs,
@@ -253,7 +255,14 @@ fn n_scan_join_select_items(
                     let declared = pushdown.select_type(select_index).ok_or_else(|| {
                         join_render_decline("a select-list item has no declared type")
                     })?;
-                    cast_to_declared_type(&rendered, declared)
+                    let own_type = item
+                        .get("dataType")
+                        .and_then(|t| exasol_type_from_json(t).ok());
+                    if own_type == Some(declared) {
+                        rendered
+                    } else {
+                        cast_to_declared_type(&rendered, declared)
+                    }
                 };
                 items.push(ProjectionItem::Expr { expr: sql });
             }
@@ -372,7 +381,6 @@ pub(in super::super) fn build_n_scan_join_sql(
 
     let pushdown_req = pushdown.json();
     let where_filter = pushdown_req.get("filter").filter(|f| !f.is_null());
-    let leg_eligible = where_filter.cloned();
 
     // All conditions go in as one array so `referenced_leg_columns` keeps any side column a
     // condition references.
@@ -382,13 +390,11 @@ pub(in super::super) fn build_n_scan_join_sql(
     for (i, side) in sides.iter().enumerate() {
         let narrowed =
             referenced_leg_columns(pushdown_req, &all_conditions, &legs, i, cols_per_side[i]);
-        let (side_filter, side_declined) = match leg_eligible
-            .as_ref()
-            .and_then(|f| leg_local_filter(f, &legs, i))
-        {
-            Some(side_local) => type_screened_leg_filter(&side_local, cols_per_side[i]),
-            None => (None, None),
-        };
+        let (side_filter, side_declined) =
+            match where_filter.and_then(|f| leg_local_filter(f, &legs, i)) {
+                Some(side_local) => type_screened_leg_filter(&side_local, cols_per_side[i]),
+                None => (None, None),
+            };
         // Disjoint by attribution, so no conjunct is double-applied.
         type_declined = conjoin_filters(type_declined, side_declined);
         fan_outs.push(build_side_fan_out_sql(
@@ -401,14 +407,9 @@ pub(in super::super) fn build_n_scan_join_sql(
         )?);
     }
 
-    // Three disjoint sets that, with the per-side leg filters, partition the request's filter.
+    // With the per-side leg filters, these partition the request's filter.
     let residual = conjoin_filters(
-        conjoin_filters(
-            leg_eligible
-                .as_ref()
-                .and_then(|f| cross_leg_residual_filter(f, &legs)),
-            None,
-        ),
+        where_filter.and_then(|f| cross_leg_residual_filter(f, &legs)),
         type_declined,
     );
     let filter = match &residual {

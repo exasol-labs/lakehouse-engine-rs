@@ -134,10 +134,6 @@ impl ExasolType {
         matches!(self, Self::Char { .. } | Self::Varchar { .. })
     }
 
-    pub fn is_decimal(&self) -> bool {
-        matches!(self, Self::Decimal(_))
-    }
-
     /// The fractional-second digits a plain `TIMESTAMP` holds.
     pub fn fractional_digits(&self) -> Option<u8> {
         match self {

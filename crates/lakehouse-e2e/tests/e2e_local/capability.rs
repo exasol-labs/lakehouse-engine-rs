@@ -1553,7 +1553,7 @@ fn e2e_order_by_column_referenced_only_in_projected_expression() {
 
 // Exasol's DECIMAL→VARCHAR conversion trims trailing scale zeros and drops an all-zero
 // fraction (`30.00` → `"30"`) (#211). Expected strings come from an independent Rust
-// oracle, never from the production `format_decimal_exasol_style`.
+// oracle.
 
 const TYPED_DECIMAL_A_UNSCALED: [(i64, Option<i128>); 12] = [
     (1, Some(1050)),
@@ -1570,7 +1570,7 @@ const TYPED_DECIMAL_A_UNSCALED: [(i64, Option<i128>); 12] = [
     (12, Some(3000)),
 ];
 
-/// From scratch, not `format_decimal_exasol_style`, so it is an independent oracle.
+/// From scratch, so it is an independent oracle.
 fn exasol_trim_decimal_string(unscaled: i128, scale: u32) -> String {
     let negative = unscaled < 0;
     let digits = unscaled.unsigned_abs().to_string();

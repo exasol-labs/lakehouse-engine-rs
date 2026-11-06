@@ -210,6 +210,110 @@ fn an_integer_compares_with_a_digits_only_literal() {
     }
 }
 
+fn text(value: &str) -> Json {
+    json!({"type": "literal_string", "value": value})
+}
+
+fn searched_case(results: Vec<Json>) -> Json {
+    let condition = json!({"type": "predicate_is_not_null", "expression": col("I")});
+    json!({"type": "function_scalar_case", "arguments": [condition], "results": results})
+}
+
+#[test]
+fn text_converted_implicitly_outside_a_comparison_declines() {
+    let cases = [
+        (
+            "GREATEST",
+            scalar("GREATEST", vec![col("D"), text("2024-01-02")]),
+        ),
+        ("LEAST", scalar("LEAST", vec![col("F"), text("1.5")])),
+        (
+            "NULLIF",
+            scalar("NULLIF", vec![col("D"), text("2024-01-01")]),
+        ),
+        (
+            "CASE result",
+            searched_case(vec![col("D"), text("2024-01-02")]),
+        ),
+        (
+            "simple CASE",
+            json!({"type": "function_scalar_case", "basis": col("D"),
+                "arguments": [text("2024-01-01")],
+                "results": [{"type": "literal_exactnumeric", "value": "1"}, {"type": "literal_exactnumeric", "value": "0"}]}),
+        ),
+        (
+            "date function",
+            scalar("DAYS_BETWEEN", vec![col("D"), text("2024-01-01")]),
+        ),
+        ("arithmetic", scalar("ADD", vec![col("I"), text("1")])),
+        (
+            "numeric parameter",
+            scalar("SUBSTR", vec![col("S"), text("2")]),
+        ),
+        (
+            "EXTRACT",
+            json!({"type": "function_scalar_extract", "toExtract": "YEAR", "arguments": [text("2024-01-01")]}),
+        ),
+        (
+            "boolean operand",
+            json!({"type": "predicate_and", "expressions": [text("TRUE"), {"type": "literal_bool", "value": true}]}),
+        ),
+    ];
+    for (label, expr) in cases {
+        assert!(render(&expr).is_err(), "{label} must decline");
+    }
+}
+
+#[test]
+fn text_where_exasol_takes_text_keeps_its_pushdown() {
+    let cases = [
+        (
+            "GREATEST over text",
+            scalar("GREATEST", vec![col("S"), text("m")]),
+        ),
+        (
+            "CASE over text and NULL",
+            searched_case(vec![text("a"), json!({"type": "literal_null"})]),
+        ),
+        (
+            "simple CASE over text",
+            json!({"type": "function_scalar_case", "basis": col("S"),
+                "arguments": [text("a")],
+                "results": [{"type": "literal_exactnumeric", "value": "1"}, {"type": "literal_exactnumeric", "value": "0"}]}),
+        ),
+        (
+            "DATE_TRUNC unit",
+            scalar("DATE_TRUNC", vec![text("month"), col("TS")]),
+        ),
+        (
+            "TO_DATE format",
+            scalar("TO_DATE", vec![col("S"), text("YYYY-MM-DD")]),
+        ),
+        (
+            "LPAD fill",
+            scalar(
+                "LPAD",
+                vec![
+                    col("S"),
+                    json!({"type": "literal_exactnumeric", "value": "5"}),
+                    text("x"),
+                ],
+            ),
+        ),
+        (
+            "integer and digits",
+            json!({"type": "predicate_equal", "left": col("I"), "right": text("3")}),
+        ),
+    ];
+    for (label, expr) in cases {
+        assert!(
+            render(&expr).is_ok(),
+            "{label} must render: {:?}",
+            render(&expr)
+        );
+    }
+}
+
 #[test]
 fn exact_expression_type_is_the_type_the_request_states() {
     let sum = scalar(

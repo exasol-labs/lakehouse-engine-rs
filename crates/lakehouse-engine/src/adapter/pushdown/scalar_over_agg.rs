@@ -154,7 +154,7 @@ pub(super) fn render_scalar_over_merge(
     let mut residual_column = false;
     let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
     // Exasol dialect: spliced into SQL that Exasol itself parses, so character CAST
-    // targets are length-qualified (the DataFusion-side check keeps bare `VARCHAR`).
+    // targets are length-qualified.
     let mut sql = render_expression_exasol(&sentinel_tree).ok()?;
     for (i, agg) in aggregates.iter().enumerate() {
         let plan = parse_agg_item(agg, col_types)?;

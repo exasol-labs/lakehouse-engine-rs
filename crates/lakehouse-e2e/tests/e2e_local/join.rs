@@ -1169,10 +1169,10 @@ fn e2e_n_scan_declined_side_local_conjunct_applied_in_outer_where() {
     );
 }
 
-// `apply_type_rewrites` runs at both join WHERE sites: each case renders correctly or
+// The typed scan check runs at both join WHERE sites: each case renders correctly or
 // declines and self-applies (#215, #223, #228, #285).
 
-/// `like_subject_type_guard` has no DECIMAL coercion, so this declines the broadcast plan.
+/// A LIKE over the join column `O_CUSTKEY`, an integer DECIMAL.
 fn like_on_custkey_join_query(vs_name: &str) -> String {
     format!(
         "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \

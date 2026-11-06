@@ -372,28 +372,20 @@ const EXPR_ARRAY_FIELDS: [&str; 3] = ["expressions", "arguments", "results"];
 /// Curated deliberately; see [`rewrite_expr_tree`].
 const EXPR_SINGLE_FIELDS: [&str; 5] = ["expression", "pattern", "left", "right", "basis"];
 
-/// Post-order is load-bearing: Exasol encodes `a||b||c` as `CONCAT(a, CONCAT(b, c))`,
-/// so only a check that sees rewritten children reaches nested occurrences, and an
-/// already-coerced inner argument is not re-wrapped.
-///
-/// `f` returning `None` declines the whole tree; the caller must self-apply it.
-///
-/// The child fields are curated rather than walking every map value, so a
-/// `dataType` sub-object or a `name` identifier is never handed to `f`.
-fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Option<Json>) -> Option<Json> {
+/// Post-order, so `f` sees rewritten children. The child fields are curated rather than walking
+/// every map value, so a `dataType` sub-object or a `name` identifier is never handed to `f`.
+fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Json) -> Json {
     let mut out = node.clone();
     for field in EXPR_ARRAY_FIELDS {
         if let Some(Json::Array(children)) = node.get(field) {
-            let rewritten: Option<Vec<Json>> =
-                children.iter().map(|c| rewrite_expr_tree(c, f)).collect();
-            out[field] = Json::Array(rewritten?);
+            out[field] = Json::Array(children.iter().map(|c| rewrite_expr_tree(c, f)).collect());
         }
     }
     for field in EXPR_SINGLE_FIELDS {
         if let Some(child) = node.get(field)
             && child.is_object()
         {
-            out[field] = rewrite_expr_tree(child, f)?;
+            out[field] = rewrite_expr_tree(child, f);
         }
     }
     f(&out)
@@ -540,8 +532,7 @@ impl ColumnTypes {
     }
 }
 
-/// Deliberately does not test the node's `type`: callers treat a non-column node as a
-/// pass-through but an unresolved type as a decline.
+/// The Exasol type of the column `node` names; `None` when it names no column of `col_types`.
 fn column_exa_type(node: &Json, col_types: &ColumnTypes) -> Option<ExasolType> {
     col_types
         .resolve(node)
@@ -550,9 +541,9 @@ fn column_exa_type(node: &Json, col_types: &ColumnTypes) -> Option<ExasolType> {
 
 /// DataFusion truncates a timestamp literal to its column's unit, while Exasol compares at full
 /// precision (#461). Workaround for apache/datafusion#22142, fixed by apache/datafusion#22906.
-fn rewrite_overprecise_timestamp_comparisons(node: &Json, col_types: &ColumnTypes) -> Option<Json> {
+fn rewrite_overprecise_timestamp_comparisons(node: &Json, col_types: &ColumnTypes) -> Json {
     rewrite_expr_tree(node, &|out: &Json| {
-        Some(rewrite_timestamp_comparison(out, col_types).unwrap_or_else(|| out.clone()))
+        rewrite_timestamp_comparison(out, col_types).unwrap_or_else(|| out.clone())
     })
 }
 
@@ -655,31 +646,30 @@ impl ColumnTypeLookup for ColumnTypes {
 
 /// The adapter's own rewrites of a tree the scan computes: the timestamp-literal floor (#461) and
 /// the binary byte comparison. They need the column types, so they run here, once.
-fn scan_rewrite(expr: &Json, col_types: &ColumnTypes) -> Option<Json> {
-    let tree = rewrite_overprecise_timestamp_comparisons(expr, col_types)?;
-    Some(compare_binary_bytes(tree, col_types))
+fn scan_rewrite(expr: &Json, col_types: &ColumnTypes) -> Json {
+    compare_binary_bytes(
+        rewrite_overprecise_timestamp_comparisons(expr, col_types),
+        col_types,
+    )
 }
 
 /// The sole owner of "SQL the DataFusion scan computes": every path renders through it, so every
 /// path runs the same typed checks (#587). `None` declines, and the caller must apply the
 /// expression in Exasol or decline the shape.
 pub(super) fn scan_expression(expr: &Json, col_types: &ColumnTypes) -> Option<String> {
-    render_scan_expression(&scan_rewrite(expr, col_types)?, col_types).ok()
+    render_scan_expression(&scan_rewrite(expr, col_types), col_types).ok()
 }
 
 /// [`scan_expression`] for a filter: `Ok(None)` when it is trivially true, `Err(())` when the
 /// scan declines it.
 pub(super) fn scan_filter(filter: &Json, col_types: &ColumnTypes) -> Result<Option<String>, ()> {
-    let tree = scan_rewrite(filter, col_types).ok_or(())?;
-    render_scan_filter(&tree, col_types).map_err(|_| ())
+    render_scan_filter(&scan_rewrite(filter, col_types), col_types).map_err(|_| ())
 }
 
-/// The rewritten tree when the scan accepts it, for a caller that keeps the tree and renders it
-/// later through [`scan_filter`] with the same column types.
-pub(super) fn type_accepted_rewrite(expr: &Json, col_types: &ColumnTypes) -> Option<Json> {
-    let tree = scan_rewrite(expr, col_types)?;
-    render_scan_expression(&tree, col_types).ok()?;
-    Some(tree)
+/// Whether the scan computes `expr`, for a caller that keeps the tree and renders it later
+/// through [`scan_filter`] with the same column types.
+pub(super) fn scan_accepts(expr: &Json, col_types: &ColumnTypes) -> bool {
+    scan_expression(expr, col_types).is_some()
 }
 
 /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`).

@@ -157,29 +157,6 @@ fn is_empty_opt(value: Option<&str>) -> bool {
     matches!(value, None | Some(""))
 }
 
-/// Detects a boolean operand converted to string (CAST or `||`), which must render
-/// Exasol's `TRUE`/`FALSE` casing rather than DataFusion's lowercase cast.
-fn is_boolean_producing(kind: &str) -> bool {
-    matches!(
-        kind,
-        "literal_bool"
-            | "predicate_equal"
-            | "predicate_notequal"
-            | "predicate_less"
-            | "predicate_lessequal"
-            | "predicate_greater"
-            | "predicate_greaterequal"
-            | "predicate_and"
-            | "predicate_or"
-            | "predicate_not"
-            | "predicate_is_null"
-            | "predicate_is_not_null"
-            | "predicate_in_constlist"
-            | "predicate_between"
-            | "predicate_like"
-    )
-}
-
 /// DataFusion dialect only: Exasol's `TRUE`/`FALSE` casing instead of DataFusion's lowercase;
 /// NULL stays NULL rather than becoming `'NULL'` or `'FALSE'`.
 fn render_bool_to_string_case(bool_expr: &str) -> String {
@@ -257,8 +234,8 @@ fn render_args(args: &[Json], dialect: Dialect) -> Result<Vec<String>, UdfError>
         .collect()
 }
 
-/// Renders a one-argument conversion as is. With a format it renders only a `literal_string` the
-/// translation covers, and errs otherwise so the caller declines.
+/// Renders only a `literal_string` format the translation covers, and errs otherwise so the
+/// caller declines.
 fn render_to_datetime(
     target: FormatTarget,
     args: Option<&Vec<Json>>,
@@ -274,10 +251,9 @@ fn render_to_datetime(
         [] => Err(UdfError::User(format!(
             "function_scalar {node} requires at least 1 argument"
         ))),
-        [source] => {
-            let source = render_conversion_source(node, source, dialect)?;
-            Ok(Some(format!("{function}({source})")))
-        }
+        [_] => Err(UdfError::User(format!(
+            "function_scalar {node} without a format parses by the session's NLS settings"
+        ))),
         [source, format] => {
             let pattern = format
                 .get("type")
@@ -348,14 +324,6 @@ fn datafusion_cast_target(target: ExasolType) -> Result<String, UdfError> {
     })
 }
 
-/// Reproduces Exasol's shortest-form DECIMAL->string conversion. The caller MUST
-/// have confirmed `expr_sql` is DECIMAL-typed: it blindly strips zeros after a `.`.
-fn format_decimal_exasol_style(expr_sql: &str) -> String {
-    format!(
-        "regexp_replace(regexp_replace(CAST({expr_sql} AS VARCHAR), '(\\.[0-9]*[1-9])0+$', '\\1'), '\\.0+$', '')"
-    )
-}
-
 /// The scalar UDF the DataFusion dialect renders `FLOAT_DIV` as, registered
 /// by `lakehouse-engine`. It MUST take two arguments coerced to `Float64` (Exasol's
 /// `FN_FLOAT_DIV` is always float division), return `Float64`, propagate `NULL`, and
@@ -377,15 +345,6 @@ fn render_cast(
     let data_type = data_type.ok_or_else(|| UdfError::User("CAST missing 'dataType'".into()))?;
     let target = exasol_type_from_json(data_type)?;
     let target_type = render_cast_target(target, dialect)?;
-
-    let source_is_boolean = args[0]
-        .get("type")
-        .and_then(|t| t.as_str())
-        .is_some_and(is_boolean_producing);
-    if dialect == Dialect::DataFusion && target.is_character() && source_is_boolean {
-        return Ok(Some(render_bool_to_string_case(&inner)));
-    }
-
     Ok(Some(format!("CAST({inner} AS {target_type})")))
 }
 
@@ -692,25 +651,6 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 render_bool_to_string_case(&inner)
             }))
         }
-        // Adapter-synthesized, never sent by Exasol: the adapter has confirmed
-        // the argument is a DECIMAL column being stringified.
-        "decimal_to_varchar_exasol" => {
-            let args = value("arguments")
-                .and_then(|a| a.as_array())
-                .ok_or_else(|| {
-                    UdfError::User("decimal_to_varchar_exasol missing 'arguments'".into())
-                })?;
-            if args.len() != 1 {
-                return Err(UdfError::User(format!(
-                    "decimal_to_varchar_exasol requires exactly 1 argument, got {}",
-                    args.len()
-                )));
-            }
-            let inner = render_expression_inner(&args[0], dialect)?.ok_or_else(|| {
-                UdfError::User("decimal_to_varchar_exasol argument is null".into())
-            })?;
-            Ok(Some(format_decimal_exasol_style(&inner)))
-        }
         "function_scalar" => {
             let fn_name = value("name")
                 .and_then(|n| n.as_str())
@@ -852,7 +792,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     }))
                 }
                 // DataFusion's `concat` never collapses an all-empty result to NULL
-                // as Exasol's `||` does; boolean operands need Exasol casing.
+                // as Exasol's `||` does.
                 "CONCAT" => {
                     let args = args.ok_or_else(|| {
                         UdfError::User("function_scalar CONCAT missing 'arguments'".into())
@@ -865,18 +805,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     let rendered = args
                         .iter()
                         .map(|arg| {
-                            let r = render_expression_inner(arg, dialect)?.ok_or_else(|| {
+                            render_expression_inner(arg, dialect)?.ok_or_else(|| {
                                 UdfError::User("CONCAT argument rendered to null".into())
-                            })?;
-                            let is_bool = dialect == Dialect::DataFusion
-                                && arg
-                                    .get("type")
-                                    .and_then(|t| t.as_str())
-                                    .is_some_and(is_boolean_producing);
-                            Ok(if is_bool {
-                                render_bool_to_string_case(&r)
-                            } else {
-                                r
                             })
                         })
                         .collect::<Result<Vec<String>, UdfError>>()?;

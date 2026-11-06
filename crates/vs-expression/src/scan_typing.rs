@@ -1,6 +1,6 @@
 //! The typed pass every expression the scan computes goes through. It derives each node's type
-//! class as Exasol types it, and declines a conversion to text whose result Exasol formats by
-//! session settings the pushdown request does not carry (#587).
+//! class as Exasol types it, and declines a conversion to or from text that Exasol formats or
+//! parses by session settings the pushdown request does not carry (#587).
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
@@ -217,7 +217,8 @@ fn cast_from_text(source: &Json, class: TypeClass, target: ExasolType) -> Result
 }
 
 /// Rewrites `node` for the DataFusion dialect and derives its class. Post-order, so a check sees
-/// rewritten children.
+/// rewritten children. Text passes only where Exasol takes text; anywhere else Exasol converts it
+/// implicitly by the session's NLS settings, so the node declines.
 pub(crate) fn type_scan_tree(
     node: &Json,
     columns: &dyn ColumnTypeLookup,
@@ -271,6 +272,13 @@ pub(crate) fn type_scan_tree(
             .find(|(f, _)| *f == field)
             .map(|(_, c)| *c)
     };
+    let all_children = || -> Vec<TypeClass> {
+        array_classes
+            .iter()
+            .flat_map(|(_, c)| c.iter().copied())
+            .chain(single_classes.iter().map(|(_, c)| *c))
+            .collect()
+    };
 
     let class = match node_kind {
         "literal_null" => TypeClass::Null,
@@ -319,8 +327,13 @@ pub(crate) fn type_scan_tree(
             compare_without_session_parse(node, &operands)?;
             TypeClass::Boolean
         }
-        k if k.starts_with("predicate_") => TypeClass::Boolean,
+        "predicate_is_null" | "predicate_is_not_null" => TypeClass::Boolean,
+        k if k.starts_with("predicate_") => {
+            refuse_implicit_text(node, &all_children())?;
+            TypeClass::Boolean
+        }
         "function_scalar_extract" => {
+            refuse_implicit_text(node, &all_children())?;
             match node
                 .get("toExtract")
                 .and_then(Json::as_str)
@@ -332,10 +345,20 @@ pub(crate) fn type_scan_tree(
                 _ => TypeClass::Other,
             }
         }
-        "function_scalar_case" => classes_of("results")
-            .into_iter()
-            .reduce(TypeClass::union)
-            .unwrap_or(TypeClass::Other),
+        "function_scalar_case" => {
+            match (node.get("basis"), class_of("basis")) {
+                // A simple CASE compares its basis with each WHEN value.
+                (Some(basis), Some(basis_class)) => {
+                    let mut operands = vec![(basis, basis_class)];
+                    if let Some(Json::Array(whens)) = node.get("arguments") {
+                        operands.extend(whens.iter().zip(classes_of("arguments")));
+                    }
+                    compare_without_session_parse(node, &operands)?;
+                }
+                _ => refuse_implicit_text(node, &classes_of("arguments"))?,
+            }
+            unify_branches(node, &classes_of("results"))?
+        }
         "function_scalar_cast" => cast_class(&mut out, &classes_of("arguments"))?,
         "function_scalar" => {
             let fn_name = node
@@ -352,8 +375,21 @@ pub(crate) fn type_scan_tree(
                         "{fn_name} without a format parses by the session's NLS settings"
                     )));
                 }
-                for i in string_positions(&fn_name, args.len()) {
+                let text_positions = string_positions(&fn_name, args.len());
+                for &i in &text_positions {
                     out["arguments"][i] = to_text(out["arguments"][i].take(), args[i])?;
+                }
+                if matches!(fn_name.as_str(), "GREATEST" | "LEAST" | "NULLIF") {
+                    unify_branches(node, &args)?;
+                } else {
+                    let parameters = text_parameter_positions(&fn_name);
+                    let converted: Vec<TypeClass> = args
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !text_positions.contains(i) && !parameters.contains(i))
+                        .map(|(_, c)| *c)
+                        .collect();
+                    refuse_implicit_text(node, &converted)?;
                 }
                 function_class(&fn_name, &args)
             }
@@ -368,10 +404,16 @@ pub(crate) fn type_scan_tree(
             match name.as_str() {
                 "COUNT" => TypeClass::INTEGER,
                 "MIN" | "MAX" => args.first().copied().unwrap_or(TypeClass::Other),
-                _ => TypeClass::Other,
+                _ => {
+                    refuse_implicit_text(node, &args)?;
+                    TypeClass::Other
+                }
             }
         }
-        _ => TypeClass::Other,
+        _ => {
+            refuse_implicit_text(node, &all_children())?;
+            TypeClass::Other
+        }
     };
     Ok((out, class))
 }
@@ -427,6 +469,47 @@ fn compare_without_session_parse(
         )));
     }
     Ok(())
+}
+
+/// Text in a position that expects a date, timestamp, number, or boolean: Exasol converts it by
+/// the session's NLS settings, and DataFusion parses ISO dates and a `.` or fails to plan.
+fn refuse_implicit_text(node: &Json, operands: &[TypeClass]) -> Result<(), UdfError> {
+    if operands.iter().any(|c| matches!(c, TypeClass::Text { .. })) {
+        return Err(decline(format!(
+            "converting a text operand to another type parses it by the session's NLS settings: {}",
+            short(node)
+        )));
+    }
+    Ok(())
+}
+
+/// The class of values Exasol brings to one type (CASE results, GREATEST, LEAST, NULLIF). Text
+/// among other types converts by the session's NLS settings.
+fn unify_branches(node: &Json, branches: &[TypeClass]) -> Result<TypeClass, UdfError> {
+    let has_text = branches.iter().any(|c| matches!(c, TypeClass::Text { .. }));
+    let has_other = branches
+        .iter()
+        .any(|c| !matches!(c, TypeClass::Text { .. } | TypeClass::Null));
+    if has_text && has_other {
+        return Err(decline(format!(
+            "bringing text and another type to one type parses the text by the session's NLS settings: {}",
+            short(node)
+        )));
+    }
+    Ok(branches
+        .iter()
+        .copied()
+        .reduce(TypeClass::union)
+        .unwrap_or(TypeClass::Other))
+}
+
+/// Text arguments that are parameters, not values: a format model or a unit.
+fn text_parameter_positions(fn_name: &str) -> &'static [usize] {
+    match fn_name {
+        "DATE_TRUNC" => &[0],
+        "TO_DATE" | "TO_TIMESTAMP" => &[1],
+        _ => &[],
+    }
 }
 
 fn cast_class(out: &mut Json, args: &[TypeClass]) -> Result<TypeClass, UdfError> {
