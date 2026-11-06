@@ -195,13 +195,13 @@ lint:
 coverage:
 	cargo llvm-cov --workspace --lcov --output-path lcov-unit.info
 
-# Bash 3.2 is the floor install.sh promises (stock macOS). The image has no
-# /bin/bash, so the suite runs through sh rather than this Makefile's SHELL.
+# Bash 3.2 is the floor install.sh promises (stock macOS). The image keeps bash in
+# /usr/local/bin, so link /bin/bash for the suite's nested `make` (SHELL := /bin/bash).
 INSTALL_TEST_BASH_IMAGE ?= bash:3.2.57
 
 test-install:
 	docker run --rm -v "$(CURDIR):/w" -w /w $(INSTALL_TEST_BASH_IMAGE) \
-	  sh -c 'apk add --no-cache -q jq make python3 && bash deploy/scripts/tests/install.test.sh'
+	  sh -c 'ln -sf /usr/local/bin/bash /bin/bash && apk add --no-cache -q jq make python3 && bash deploy/scripts/tests/install.test.sh'
 
 lint-install:
 	@command -v shellcheck >/dev/null 2>&1 \

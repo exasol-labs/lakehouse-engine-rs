@@ -2303,12 +2303,18 @@ slc_url_from_make_output() {
 
 makefile_slc_url_arch_aware() {
   echo "== makefile_slc_url_arch_aware =="
-  local default_url x86_url aarch64_url arm64_url
+  local default_url x86_url aarch64_url arm64_url sdk_version
+  # make exits 0 even when its $(shell) version lookup fails, so pin the URL to the version.
+  sdk_version="$(grep '^exasol-udf-sdk' "$REPO_ROOT/Cargo.toml" | grep -o '"[0-9][^"]*"' | head -1 | tr -d '"')"
+  if [[ -n "$sdk_version" ]]; then pass "makefile arch: the root Cargo.toml pins exasol-udf-sdk"
+  else fail "makefile arch: the root Cargo.toml pins exasol-udf-sdk" "no version found"; fi
 
   run_make_install_slc_dry ""
   assert_rc_zero "makefile arch: an unset ARCH is accepted" "$MAKE_RC"
   default_url="$(slc_url_from_make_output "$MAKE_OUT")"
   assert_contains "makefile arch: an unset ARCH composes an lc-rust release URL" "$default_url" "lc-rust-"
+  assert_contains "makefile arch: the URL carries the exasol-udf-sdk pin" "$default_url" \
+    "/v$sdk_version/lc-rust-$sdk_version"
   assert_not_contains "makefile arch: an unset ARCH composes the unsuffixed URL" "$default_url" "-aarch64"
 
   run_make_install_slc_dry "x86_64"
