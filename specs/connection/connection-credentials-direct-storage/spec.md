@@ -48,7 +48,7 @@ Extends `connection/connection-credentials` with the `CatalogKind::DirectStorage
 * *GIVEN* a virtual schema resolving `CatalogKind::DirectStorage` whose CONNECTION address names an S3 bucket that allows anonymous listing and reading, and whose JSON password omits `access_key`, `secret_key`, and `session_token` or leaves them empty
 * *WHEN* the adapter lists the base path at `CREATE VIRTUAL SCHEMA` and a query scans one of its tables
 * *THEN* the adapter and the scan UDF SHALL send unsigned S3 requests, so the virtual schema is created and the query returns the bucket's rows
-* *AND* the engine MUST NOT read an ambient AWS credential, such as an environment variable or an instance profile, in place of the missing key pair (#590)
+* *AND* the engine MUST NOT read an ambient AWS credential, such as an environment variable or an instance profile, in place of the missing key pair
 * *AND* a CONNECTION that supplies any of the three fields SHALL sign its S3 requests as before
 
 ### Scenario: Credential vending is unreachable under the direct-storage kind

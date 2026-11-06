@@ -589,8 +589,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 
 **Public S3 buckets.** A bucket that anyone may list and read needs no key pair. Omit
 `access_key`, `secret_key`, and `session_token`, or leave them empty, and the adapter and the scan
-send unsigned requests. `region` must still name the bucket's region. No ambient AWS credential,
-such as an environment variable or an instance profile, is read in place of the missing keys.
+send unsigned requests. `region` must still name the bucket's region.
 
 ```sql
 CREATE CONNECTION PUBLIC_SAMPLES
