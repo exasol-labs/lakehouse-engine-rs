@@ -44,8 +44,6 @@ const CATALOG_POLICY: RetryPolicy = RetryPolicy {
 /// redacted, so a secret that the cut splits was already replaced.
 pub(crate) const MAX_QUOTED_BODY_BYTES: usize = 4096;
 
-const UNITY_NOT_ICEBERG_MESSAGE: &str = "is not an Iceberg compatible table";
-
 /// The HTTP client of one catalog session. Callers build a request with [`Self::get`] or
 /// [`Self::post`] and send it only through [`Self::send_json`], [`Self::send`], or
 /// [`Self::send_capped`], so every catalog request gets the same timeouts and retries. A retry
@@ -228,14 +226,13 @@ impl CatalogRequestError {
         Self::new(None, message)
     }
 
-    /// The catalog has no loadable Iceberg table under this name: a 404, or the 400 that Unity
-    /// Catalog's Iceberg REST endpoint answers for a table it cannot serve as Iceberg.
-    pub(crate) fn is_not_an_iceberg_table(&self) -> bool {
-        match self.status {
-            Some(StatusCode::NOT_FOUND) => true,
-            Some(StatusCode::BAD_REQUEST) => self.message.contains(UNITY_NOT_ICEBERG_MESSAGE),
-            _ => false,
-        }
+    /// A 404 answer: the catalog has no loadable Iceberg table under this name.
+    pub(crate) fn is_not_found(&self) -> bool {
+        self.status == Some(StatusCode::NOT_FOUND)
+    }
+
+    pub(crate) fn is_bad_request(&self) -> bool {
+        self.status == Some(StatusCode::BAD_REQUEST)
     }
 
     /// Prefixes the message with the table's dotted identifier, for every kind of failure.
