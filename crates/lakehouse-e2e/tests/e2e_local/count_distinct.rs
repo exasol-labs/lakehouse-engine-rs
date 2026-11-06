@@ -13,7 +13,7 @@ use crate::common::seed::{
     typed_product_distinct, typed_ts_case_distinct, typed_ts_distinct, typed_varchar_char_distinct,
     typed_varchar_distinct, typed_varchar_upper_distinct,
 };
-use crate::fixtures::{LAKEHOUSE_VS, lakehouse_vs, typed_table};
+use crate::fixtures::{LAKEHOUSE_VS, assert_single_table_wrapper, lakehouse_vs, typed_table};
 
 fn distinct_table() -> String {
     format!("{LAKEHOUSE_VS}.{}", E2E_DISTINCT_TABLE.to_uppercase())
@@ -27,23 +27,7 @@ fn high_card_table() -> String {
 /// UDF in a scalar subquery, `04000`) nor a bare row scan (Exasol never
 /// re-aggregates a declined pushdown), so it must be the `LHS_T0` wrapper.
 fn assert_qualified_wrapper_pushed_down(conn: &mut ExaConn, query_sql: &str) {
-    let explain_sql = format!("EXPLAIN VIRTUAL {query_sql}");
-    let resp = conn.execute(&explain_sql);
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let cols = conn.fetch_result_columns(result_set);
-
-    let pushed_sql: String = cols
-        .iter()
-        .flat_map(|col| col.iter())
-        .filter_map(|v| v.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    assert!(
-        pushed_sql.contains("LHS_T0"),
-        "EXPLAIN VIRTUAL output must be the qualified single-table wrapper (one \
-         aliased raw fan-out subquery, 'AS LHS_T0'), got:\n{pushed_sql}"
-    );
+    let pushed_sql = assert_single_table_wrapper(conn, query_sql);
     assert!(
         pushed_sql.to_uppercase().contains("COUNT(DISTINCT"),
         "the wrapper must render each COUNT(DISTINCT) verbatim over the materialized \
@@ -67,18 +51,7 @@ fn assert_qualified_wrapper_pushed_down(conn: &mut ExaConn, query_sql: &str) {
 }
 
 fn assert_count_distinct_fan_out_pushed_down(conn: &mut ExaConn, query_sql: &str) {
-    let explain_sql = format!("EXPLAIN VIRTUAL {query_sql}");
-    let resp = conn.execute(&explain_sql);
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let cols = conn.fetch_result_columns(result_set);
-
-    let pushed_sql: String = cols
-        .iter()
-        .flat_map(|col| col.iter())
-        .filter_map(|v| v.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-
+    let pushed_sql = explain_virtual_sql(conn, query_sql);
     assert!(
         pushed_sql.to_uppercase().contains("COUNT(DISTINCT"),
         "EXPLAIN VIRTUAL output must contain a native COUNT(DISTINCT ...) merge \

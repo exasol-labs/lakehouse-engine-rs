@@ -25,7 +25,7 @@ pub(crate) use binary_filter::literal_binary_bytes;
 
 mod support;
 pub use support::{
-    AggregateMergeInputs, ColumnTypes, ProjectedColumn, build_fan_out_inner,
+    AggregateMergeInputs, ColumnTypes, ProjectedColumn, PushdownRequest, build_fan_out_inner,
     build_scan_driving_sql, shard_count,
 };
 use support::{
@@ -121,23 +121,25 @@ pub(crate) async fn handle_pushdown(
     s3_max_connections: usize,
     join_broadcast_max_bytes: u64,
 ) -> Result<Json, UdfError> {
-    let pushdown_req = request
-        .get("pushdownRequest")
-        .cloned()
-        .unwrap_or(Json::Null);
+    let pushdown = PushdownRequest::parse(
+        request
+            .get("pushdownRequest")
+            .cloned()
+            .unwrap_or(Json::Null),
+    )?;
 
     let props = get_properties(request);
 
     // Join handling must run first: this path resolves only `involvedTables[0]`, so a
     // join falling through would silently scan one table. `Ineligible` is a hard error
     // because Exasol does not re-plan on an adapter error.
-    match detect_join(request, &pushdown_req)? {
+    match detect_join(request, pushdown.json())? {
         JoinShape::NotAJoin => {}
         JoinShape::Ineligible(reason) => return Err(ineligible_join_decline(reason)),
         JoinShape::Join(join) => {
             return plan_join(
                 request,
-                &pushdown_req,
+                &pushdown,
                 &join,
                 statement,
                 permission,
@@ -158,17 +160,18 @@ pub(crate) async fn handle_pushdown(
     }
 
     // Strip every `tableAlias` after the join gate and before any read (#193).
-    let pushdown_req = strip_table_alias(&pushdown_req);
+    let pushdown = pushdown.with_json(strip_table_alias(pushdown.json()));
+    let pushdown_req = pushdown.json();
 
     let filter_json_raw = pushdown_req.get("filter").filter(|f| !f.is_null());
 
-    let involved = involved_columns(request, |tables| tables.first());
+    let involved = involved_columns(request, |tables| tables.first())?;
 
-    let limit = extract_limit(&pushdown_req);
+    let limit = extract_limit(pushdown_req);
 
     // A limit is withheld from any ORDER BY request not matched as a bounded top-N, so
     // a bare LIMIT never precedes an ordering the adapter did not render (decision [4]).
-    let has_order_by = order_by_present(&pushdown_req);
+    let has_order_by = order_by_present(pushdown_req);
 
     let resolver =
         TableScanResolver::for_request(statement, permission, &[catalog.table.as_str()], &props)
@@ -187,7 +190,7 @@ pub(crate) async fn handle_pushdown(
     ) = resolver
         .resolve(&catalog.table, filter_json_raw, &involved)
         .await?;
-    let (projection, projection_widened) = project_columns(&pushdown_req, &col_types)?;
+    let (projection, projection_widened) = project_columns(&pushdown, &col_types)?;
     // `filter_json_raw` stays unmodified: format-level pruning must see the original
     // predicate tree, whatever the adapter declines.
     let binary_as_string = resolve_binary_as_string(&props);
@@ -213,7 +216,7 @@ pub(crate) async fn handle_pushdown(
 
     if files.is_empty() {
         return empty_result_sql(
-            &pushdown_req,
+            &pushdown,
             &projection,
             projection_widened,
             &col_types,
@@ -231,7 +234,7 @@ pub(crate) async fn handle_pushdown(
 
     build_dispatch_sql(
         request,
-        &pushdown_req,
+        &pushdown,
         projection,
         projection_widened,
         &col_types,
@@ -263,7 +266,7 @@ pub(crate) async fn handle_pushdown(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_dispatch_sql(
     request: &Json,
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     mut projection: Vec<ProjectedColumn>,
     projection_widened: bool,
     col_types: &ColumnTypes,
@@ -287,6 +290,7 @@ pub(crate) fn build_dispatch_sql(
     s3_max_connections: usize,
     binary_as_string: bool,
 ) -> Result<Json, UdfError> {
+    let pushdown_req = pushdown.json();
     let base = CommonScanSpec {
         table_root: table_root.clone(),
         projection: Vec::new(),
@@ -315,7 +319,7 @@ pub(crate) fn build_dispatch_sql(
     if let Some(declined) = declined_filter {
         return qualified_single_table_fallback_pushdown(
             request,
-            pushdown_req,
+            pushdown,
             &base,
             None,
             shards,
@@ -326,7 +330,7 @@ pub(crate) fn build_dispatch_sql(
         );
     }
 
-    let single_group_merge = match classify_request_shape(pushdown_req, col_types) {
+    let single_group_merge = match classify_request_shape(pushdown, col_types) {
         RequestShape::Grouped {
             detection,
             having,
@@ -343,7 +347,7 @@ pub(crate) fn build_dispatch_sql(
             let grouped_limit = limit;
             // A CHAR(n) key must be blank-padded to reproduce Exasol's CHAR grouping (#192).
             // Only the spec copy is padded; ORDER BY matching uses the unpadded fragments.
-            let group_key_types = group_key_exasol_types(pushdown_req, &group_keys, &select_items);
+            let group_key_types = group_key_exasol_types(pushdown, &group_keys, &select_items)?;
             // Empty `projection` is inert on an aggregate dispatch (#145).
             let spec_template = ScanSpec {
                 common: CommonScanSpec {
@@ -383,7 +387,7 @@ pub(crate) fn build_dispatch_sql(
             // untranslatable filter never reaches this arm.
             return qualified_single_table_fallback_pushdown(
                 request,
-                pushdown_req,
+                pushdown,
                 &base,
                 filter.clone(),
                 shards,
@@ -430,7 +434,7 @@ pub(crate) fn build_dispatch_sql(
             if has_distinct(&items) {
                 return qualified_single_table_fallback_pushdown(
                     request,
-                    pushdown_req,
+                    pushdown,
                     &base,
                     filter.clone(),
                     shards,
@@ -441,10 +445,10 @@ pub(crate) fn build_dispatch_sql(
                 );
             }
             let plans = ordinary_plans(&items);
-            let plan_types = single_group_plan_types(pushdown_req, &items);
+            let plan_types = single_group_plan_types(pushdown.select_types(), &items);
             // Assembled here because it depends on select-list classification.
-            let merge_inputs =
-                single_group_merge_select(&items, &plans, &plan_types).and_then(|merge_select| {
+            let merge_inputs = single_group_merge_select(&items, &plans, &plan_types, col_types)
+                .and_then(|merge_select| {
                     AggregateMergeInputs::new(plan_types, merge_select, limit)
                         .map(|inputs| inputs.with_having(having))
                 });
@@ -452,7 +456,7 @@ pub(crate) fn build_dispatch_sql(
                 // Defensive: a shortened select list fails Exasol's positional validation.
                 return qualified_single_table_fallback_pushdown(
                     request,
-                    pushdown_req,
+                    pushdown,
                     &base,
                     filter.clone(),
                     shards,
@@ -472,7 +476,7 @@ pub(crate) fn build_dispatch_sql(
             if projection_widened {
                 return qualified_single_table_fallback_pushdown(
                     request,
-                    pushdown_req,
+                    pushdown,
                     &base,
                     filter.clone(),
                     shards,

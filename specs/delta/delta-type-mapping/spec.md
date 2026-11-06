@@ -31,8 +31,7 @@ The adapter maps each type a Delta table schema can declare onto an Arrow tag or
 
 * *GIVEN* a Delta table schema declaring one column of each type in the native set, exactly
   `boolean`, `byte`, `short`, `integer`, `long`, `float`, `double`, `string`, `date`, `timestamp`,
-  `timestamp without time zone`, and `decimal(p,s)` whose `p` and `s` satisfy Exasol's catalog-decimal
-  domain
+  `timestamp without time zone`, and `decimal(p,s)` with `1 ≤ p ≤ 36` and `0 ≤ s ≤ p`
 * *WHEN* the Delta format reader resolves that table's scan
 * *THEN* each column SHALL carry exactly the Arrow tag this table gives it, and SHALL carry its
   nullability from the Delta schema:
@@ -50,33 +49,23 @@ The adapter maps each type a Delta table schema can declare onto an Arrow tag or
   | `date` | `date32` | DATE |
   | `timestamp` | `timestamptz_us` | TIMESTAMP(6) on Exasol 2025.x and later, TIMESTAMP on 8.x |
   | `timestamp without time zone` | `timestamp_us` | TIMESTAMP(6) on Exasol 2025.x and later, TIMESTAMP on 8.x |
-  | `decimal(p,s)`, `1 ≤ p ≤ 36` and `s ≤ p` | `decimal128(p,s)` | DECIMAL(p,s) |
+  | `decimal(p,s)`, `1 ≤ p ≤ 36` and `0 ≤ s ≤ p` | `decimal128(p,s)` | DECIMAL(p,s) |
 
 * *AND* `byte` and `short` SHALL both carry the `int32` tag, and the Delta reader MUST NOT
   tag either column `int8` or `int16`, because the Parquet reader produces physical `Int8` and
-  `Int16` and the scan's physical-expression adapter widens each to logical `Int32`
-  losslessly
-* *AND* `compatible_exasol_type` SHALL return `DECIMAL(3,0)`, `DECIMAL(5,0)`, and `DECIMAL(10,0)` for `byte`, `short`, and `integer`, exactly as the table above declares
-* *AND* the decimal domain check SHALL read the SINGLE shared
-  `exasol_representable_catalog_decimal` predicate in `crates/lakehouse-engine/src/types/mapping.rs`
-  and MUST NOT carry its own copy, so the Delta, Iceberg, and Unity Catalog answers stay in lockstep
-  by construction, as `scan-types/type-mapping` requires
-* *AND* the two TIMESTAMP declarations SHALL read the version rule and both declaration strings from
-  the SINGLE owner `scan-types/type-mapping` specifies, so a Delta timestamp and an Iceberg
-  timestamp are declared at the same precision by construction; this table mirrors that answer and
-  MUST NOT restate the rule or either literal
+  `Int16` and the scan widens each to logical `Int32` losslessly
+* *AND* a Delta timestamp SHALL be declared at the precision `scan-types/type-mapping` gives an Iceberg timestamp on the same Exasol version
 * *AND* only the fractional-second precision of the two timestamp rows SHALL depend on the Exasol version, and it SHALL differ on the 2025.x arm only
 
 ### Scenario: A Delta type Exasol cannot represent natively is surfaced as a VARCHAR rendering
 
-* *GIVEN* a Delta table schema declaring one column of each type in the text-rendered set, exactly `decimal(p,s)` outside Exasol's catalog-decimal domain (`p = 0`, `p > 36`, or `s > p`), `void`, `interval year to month`, `interval day to second`, and a CONTAINER type, `array<E>`, `struct<…>`, or `map<K,V>`, every one of whose member types is itself from the native set, from this set, or is itself such a container, applied recursively
+* *GIVEN* a Delta table schema declaring one column of each type in the text-rendered set, exactly `decimal(p,s)` outside `1 ≤ p ≤ 36` and `0 ≤ s ≤ p` (`p = 0`, `p > 36`, or `s > p`), `void`, `interval year to month`, `interval day to second`, and a CONTAINER type, `array<E>`, `struct<…>`, or `map<K,V>`, every one of whose member types is itself from the native set, from this set, or is itself such a container, applied recursively
 * *WHEN* the Delta format reader resolves that table's scan
 * *THEN* each such column SHALL carry the `utf8` Arrow tag and SHALL be declared to Exasol as `VARCHAR(2000000)`, as the Iceberg mapping does for its equivalents
 * *AND* `struct` and `map` SHALL be members of THIS set and MUST NOT be refused, so a `map` column and a nested `struct` column are queryable
-* *AND* the container rule SHALL be RECURSIVE on every member type, an `array`'s element, a `struct`'s every field, and a `map`'s key AND value, and the recursion SHALL be based on whether each member is JSON-RENDERABLE, not on `can_cast_types`, so `array<struct<…>>`, `map<string, array<integer>>`, and `array<binary>` are mappable while `struct<v: variant>` is not
+* *AND* the container rule SHALL be RECURSIVE on every member type, an `array`'s element, a `struct`'s every field, and a `map`'s key AND value, and the recursion SHALL be based on whether each member is JSON-RENDERABLE, not on whether Arrow can cast it to text, so `array<struct<…>>`, `map<string, array<integer>>`, and `array<binary>` are mappable while `struct<v: variant>` is not
 * *AND* an `array`, `struct`, or `map` column SHALL be surfaced as STRICT JSON per `scan-types/nested-json-rendering`, so an `array` of integers returns a JSON array of bare numbers rather than `[1, 2]` display text
 * *AND* a `void` column SHALL read as all-NULL rather than as an error or an empty string, and a `void` field NESTED inside a container SHALL render as an explicit JSON `null`, because the protocol requires writers to omit it from every data file and readers to *"reconstruct them as all-`null` columns"*
-* *AND* an out-of-Exasol-domain `decimal` SHALL reach this set through the SAME shared `exasol_representable_catalog_decimal` predicate the native set reads, so no decimal pair can be classified native by one call site and text-rendered by another
 * *AND* an out-of-domain `decimal` NESTED inside a container SHALL keep the container mappable, because the JSON renderer renders a decimal as a bare JSON number at any depth with no Exasol DECIMAL domain to satisfy
 
 ### Scenario: A Delta type whose Arrow form cannot be rendered faithfully is refused by name

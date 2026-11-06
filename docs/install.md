@@ -19,6 +19,7 @@ lists every step in order.
 
 ## Prerequisites
 
+- Exasol 8.29.x or later.
 - `curl` on the machine that runs the install command. `tar` is also required for BucketFS
   targets (the install script extracts `liblakehouse_engine.so` out of the engine archive
   locally before uploading it); SaaS targets upload the tarball as-is and don't need it.

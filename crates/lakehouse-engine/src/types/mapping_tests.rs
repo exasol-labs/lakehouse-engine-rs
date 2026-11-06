@@ -6,6 +6,7 @@ use crate::tests::hive_type_cases::{
 use arrow::datatypes::DataType;
 use iceberg::spec::{PrimitiveType, Type};
 use lakehouse_catalog::ColumnSourceType;
+use serde_json::json;
 
 /// Scenario: Compatible Arrow types map to their Exasol type
 #[test]
@@ -77,7 +78,6 @@ fn compatible_types_map_to_exasol_type() {
     );
 }
 
-/// Scenario: In-range Decimal128 maps to a precise Exasol DECIMAL
 #[test]
 fn decimal128_in_range_maps_to_decimal() {
     assert_eq!(
@@ -94,22 +94,17 @@ fn decimal128_in_range_maps_to_decimal() {
     );
 }
 
-/// Scenario: Out-of-range Decimal128 falls back to VARCHAR via JSON
 #[test]
 fn decimal128_out_of_range_maps_to_varchar_json() {
-    assert_eq!(
-        arrow_to_exasol_type(&DataType::Decimal128(38, 10)).to_string(),
-        "VARCHAR(2000000)"
-    );
-    assert_eq!(
-        arrow_to_exasol_type(&DataType::Decimal128(18, 37)).to_string(),
-        "VARCHAR(2000000)"
-    );
-    assert_eq!(
-        arrow_to_exasol_type(&DataType::Decimal128(38, 38)).to_string(),
-        "VARCHAR(2000000)"
-    );
-    assert!(needs_json_fallback(&DataType::Decimal128(38, 6)));
+    for (precision, scale) in [(38, 10), (18, 37), (38, 38), (38, 6), (10, -2), (5, 10)] {
+        let decimal = DataType::Decimal128(precision, scale);
+        assert_eq!(
+            arrow_to_exasol_type(&decimal),
+            ExasolType::WIDEST_VARCHAR,
+            "{decimal}"
+        );
+        assert!(needs_json_fallback(&decimal), "{decimal}");
+    }
 }
 
 /// Scenario: Incompatible Arrow types are serialized to JSON VARCHAR
@@ -630,97 +625,6 @@ fn date_time_family_types_and_fallback_flags() {
     let ts_tz = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
     assert_eq!(arrow_to_exasol_type(&ts_tz).to_string(), "TIMESTAMP");
     assert!(!needs_json_fallback(&ts_tz));
-}
-
-#[test]
-fn exasol_type_from_json_reads_with_local_time_zone_flag() {
-    let tstz = serde_json::json!({"type": "timestamp", "withLocalTimeZone": true});
-    assert_eq!(
-        exasol_type_from_json(&tstz).to_string(),
-        "TIMESTAMP WITH LOCAL TIME ZONE"
-    );
-
-    let ts = serde_json::json!({"type": "timestamp"});
-    assert_eq!(exasol_type_from_json(&ts).to_string(), "TIMESTAMP");
-}
-
-#[test]
-fn exasol_type_from_json_reads_timestamp_fractional_seconds_precision() {
-    let ts0 = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": 0});
-    assert_eq!(exasol_type_from_json(&ts0).to_string(), "TIMESTAMP(0)");
-
-    let ts6 = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": 6});
-    assert_eq!(exasol_type_from_json(&ts6).to_string(), "TIMESTAMP(6)");
-
-    let ts9 = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": 9});
-    assert_eq!(exasol_type_from_json(&ts9).to_string(), "TIMESTAMP(9)");
-
-    let ts_absent = serde_json::json!({"type": "timestamp"});
-    assert_eq!(exasol_type_from_json(&ts_absent).to_string(), "TIMESTAMP");
-
-    let tstz_with_precision = serde_json::json!({
-        "type": "timestamp",
-        "withLocalTimeZone": true,
-        "fractionalSecondsPrecision": 7
-    });
-    assert_eq!(
-        exasol_type_from_json(&tstz_with_precision).to_string(),
-        "TIMESTAMP WITH LOCAL TIME ZONE"
-    );
-}
-
-#[test]
-fn exasol_type_from_json_caps_timestamp_precision_at_nine() {
-    for (digits, expected) in [(9, 9), (10, 9), (300, 9)] {
-        let ts = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": digits});
-        assert_eq!(
-            exasol_type_from_json(&ts),
-            ExasolType::timestamp(expected),
-            "fractionalSecondsPrecision {digits}"
-        );
-    }
-}
-
-#[test]
-fn exasol_type_from_json_propagates_ascii_character_set() {
-    let ascii = serde_json::json!({"type": "VARCHAR", "size": 4, "characterSet": "ASCII"});
-    assert_eq!(
-        exasol_type_from_json(&ascii).to_string(),
-        "VARCHAR(4) ASCII"
-    );
-
-    let no_charset = serde_json::json!({"type": "VARCHAR", "size": 4});
-    assert_eq!(exasol_type_from_json(&no_charset).to_string(), "VARCHAR(4)");
-}
-
-#[test]
-fn exasol_type_from_json_renders_char_type() {
-    let ascii = serde_json::json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"});
-    assert_eq!(exasol_type_from_json(&ascii).to_string(), "CHAR(3) ASCII");
-}
-
-#[test]
-fn exasol_type_from_json_propagates_char_ascii_character_set() {
-    let utf8 = serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"});
-    assert_eq!(exasol_type_from_json(&utf8).to_string(), "CHAR(20)");
-
-    let no_charset = serde_json::json!({"type": "CHAR", "size": 20});
-    assert_eq!(exasol_type_from_json(&no_charset).to_string(), "CHAR(20)");
-}
-
-#[test]
-fn exasol_type_from_json_caps_char_size_at_exasol_maximum() {
-    let oversized = serde_json::json!({"type": "CHAR", "size": 9999});
-    assert_eq!(exasol_type_from_json(&oversized).to_string(), "CHAR(2000)");
-}
-
-#[test]
-fn exasol_type_from_json_char_without_size_falls_back_to_unknown_width() {
-    let no_size = serde_json::json!({"type": "CHAR"});
-    assert_eq!(
-        exasol_type_from_json(&no_size).to_string(),
-        "VARCHAR(2000000)"
-    );
 }
 
 #[test]
@@ -1281,131 +1185,5 @@ fn arrow_input_resolver_stays_outside_the_timestamp_version_gate() {
         ))
         .to_string(),
         "TIMESTAMP"
-    );
-}
-
-fn every_variant() -> Vec<ExasolType> {
-    let mut variants = vec![
-        ExasolType::Boolean,
-        ExasolType::DoublePrecision,
-        ExasolType::Date,
-        ExasolType::TimestampWithLocalTimeZone,
-        ExasolType::Timestamp { precision: None },
-        ExasolType::WIDEST_VARCHAR,
-    ];
-    variants.extend([0, 3, 6, 9].map(|digits| ExasolType::Timestamp {
-        precision: Some(digits),
-    }));
-    variants.extend(
-        [(1, 0), (10, 0), (18, 6), (36, 36)]
-            .map(|(precision, scale)| ExasolType::Decimal { precision, scale }),
-    );
-    for ascii in [false, true] {
-        variants.push(ExasolType::Char { size: 1, ascii });
-        variants.push(ExasolType::Char { size: 2000, ascii });
-        variants.push(ExasolType::Varchar { size: 1, ascii });
-        variants.push(ExasolType::Varchar {
-            size: 2_000_000,
-            ascii,
-        });
-    }
-    variants
-}
-
-/// Scenario: A TIMESTAMP(p) column declaration serializes fractionalSecondsPrecision
-#[test]
-fn exasol_type_to_json_round_trips_every_variant() {
-    for exasol_type in every_variant() {
-        assert_eq!(
-            exasol_type_from_json(&exasol_type_to_json(&exasol_type)),
-            exasol_type,
-            "{exasol_type} must read back as itself"
-        );
-    }
-}
-
-#[test]
-fn exasol_type_to_json_renders_each_recorded_data_type_object() {
-    let cases = [
-        (ExasolType::Boolean, json!({"type": "boolean"})),
-        (ExasolType::DoublePrecision, json!({"type": "double"})),
-        (ExasolType::Date, json!({"type": "date"})),
-        (
-            ExasolType::decimal(18, 4),
-            json!({"type": "decimal", "precision": 18, "scale": 4}),
-        ),
-        (
-            ExasolType::decimal(10, -2),
-            json!({"type": "decimal", "precision": 10, "scale": -2}),
-        ),
-        (
-            ExasolType::Timestamp { precision: None },
-            json!({"type": "timestamp"}),
-        ),
-        (
-            ExasolType::timestamp(6),
-            json!({"type": "timestamp", "fractionalSecondsPrecision": 6}),
-        ),
-        (
-            ExasolType::timestamp(0),
-            json!({"type": "timestamp", "fractionalSecondsPrecision": 0}),
-        ),
-        (
-            ExasolType::TimestampWithLocalTimeZone,
-            json!({"type": "timestamp", "withLocalTimeZone": true}),
-        ),
-        (
-            ExasolType::WIDEST_VARCHAR,
-            json!({"type": "varchar", "size": 2_000_000}),
-        ),
-        (
-            ExasolType::Varchar {
-                size: 4,
-                ascii: true,
-            },
-            json!({"type": "varchar", "size": 4, "characterSet": "ASCII"}),
-        ),
-        (ExasolType::char(3), json!({"type": "char", "size": 3})),
-        (
-            ExasolType::Char {
-                size: 3,
-                ascii: true,
-            },
-            json!({"type": "char", "size": 3, "characterSet": "ASCII"}),
-        ),
-    ];
-    for (exasol_type, expected) in cases {
-        assert_eq!(exasol_type_to_json(&exasol_type), expected, "{exasol_type}");
-    }
-}
-
-#[test]
-fn exasol_type_from_json_defaults_and_caps_a_decimal_and_a_varchar() {
-    assert_eq!(
-        exasol_type_from_json(&json!({"type": "decimal"})).to_string(),
-        "DECIMAL(18,0)"
-    );
-    assert_eq!(
-        exasol_type_from_json(&json!({"type": "decimal", "precision": 10})).to_string(),
-        "DECIMAL(10,0)"
-    );
-    for out_of_range in [
-        json!({"type": "decimal", "precision": 300, "scale": 2}),
-        json!({"type": "decimal", "precision": 10, "scale": 200}),
-        json!({"type": "decimal", "precision": 37, "scale": 0}),
-    ] {
-        assert_eq!(
-            exasol_type_from_json(&out_of_range),
-            ExasolType::WIDEST_VARCHAR,
-            "{out_of_range}"
-        );
-    }
-    assert_eq!(
-        exasol_type_from_json(&json!({"type": "varchar"})).to_string(),
-        "VARCHAR(2000000)"
-    );
-    assert_eq!(
-        exasol_type_from_json(&json!({"type": "varchar", "size": 9_999_999})).to_string(),
-        "VARCHAR(2000000)"
     );
 }

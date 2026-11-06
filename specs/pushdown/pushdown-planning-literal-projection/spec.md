@@ -25,3 +25,12 @@ Projects bare literal or constant select-list items positionally into the scan-d
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL push a rendered select-list item as a positional `Expr` ONLY when its declared EMITS type is a valid Exasol UDF EMITS output type, so an item declared `TIMESTAMP WITH LOCAL TIME ZONE` SHALL route the whole request to the qualified single-table wrapper instead, the same routing `pushdown-capabilities/pushdown-planning-capability-extensions` specifies in full, which this feature cross-references rather than restates
 * *AND* projected `TIMESTAMP WITH LOCAL TIME ZONE` constants SHALL NOT "remain unsupported" as a permanent tracked exception: `(#218)` is a real fix, not a documented gap, the value Exasol computes natively is reproduced via the qualified wrapper's `CAST(CONVERT_TZ(…) AS TIMESTAMP WITH LOCAL TIME ZONE)` rendering, and the full-base-row response this scenario previously described is an INVALID pushdown response Exasol rejects with SQL state `04000`, not a correct-but-unaccelerated fallback
+
+### Scenario: A NULL select item in an Exasol-rendered wrapper keeps its declared type
+
+* *GIVEN* a request the adapter serves with the qualified single-table wrapper or the N-scan join wrapper
+* *AND* whose select list carries a bare NULL literal, the form in which Exasol sends `CAST(NULL AS <type>)`, with `selectListDataTypes` declaring `<type>` at that ordinal, for example `SELECT id, CAST(NULL AS GEOMETRY) FROM vs.t`
+* *WHEN* the adapter renders the wrapper's select list
+* *THEN* the item SHALL render as `CAST(NULL AS <declared type>)`
+* *AND* the query SHALL return NULL in a column of the declared type, as native Exasol does
+* *AND* the adapter MUST NOT render a bare `NULL`, whose type Exasol infers on its own and then rejects with `Data type mismatch` against the declared type

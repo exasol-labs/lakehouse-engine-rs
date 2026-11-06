@@ -4,13 +4,10 @@ When plan-time file pruning eliminates every data file, the adapter returns a `p
 
 ## Background
 
-* The adapter resolves the data-file list once (`pushdown/pushdown-planning`), from the Iceberg or Delta reader, and the pushed filter can reduce that list to zero files.
-* Exasol validates each `pushdown` response's columns positionally against the request's `selectListDataTypes`. A response with a different column count or declared types is rejected (SQL code 04000, for example `Expected number of columns is 1 but pushdown query has 4`).
-* With zero files there is nothing to scan, so the empty-result response does not invoke the scan fan-out UDF and references no data file.
-* The declared column types come from the same sources the non-empty path uses: the row projection's declared types, `selectListDataTypes` for grouped aggregates, and Exasol's own typing of the request for an aggregate without GROUP BY.
-* When an aggregate request carries no `selectListDataTypes` (absent or empty), the empty path renders the full-row-projection shape while the non-empty path renders its select-list shape. The column counts can differ in that case, which affects only shapes the adapter declines to push down.
-* Exasol computes empty-aggregate semantics itself, over the zero-row relation the single-group empty shape selects from.
-* A single request classifier owns the routing decision for both paths. A grouped request that does not decompose yields the qualified single-table wrapper (`GroupByWrapper`) shape on both.
+* The adapter resolves the data-file list once (`pushdown/pushdown-planning`), and the pushed filter can reduce it to zero files. With zero files the empty-result response invokes no scan fan-out and references no data file.
+* Exasol validates each `pushdown` response's columns positionally against the request's `selectListDataTypes` and rejects a different column count or type (SQL code 04000, for example `Expected number of columns is 1 but pushdown query has 4`).
+* The declared column types come from the sources the non-empty path uses: the row projection's declared types, `selectListDataTypes` for grouped aggregates, and Exasol's own typing of the request for an aggregate without GROUP BY. Exasol computes empty-aggregate semantics itself, over the zero-row relation the single-group empty shape selects from.
+* A grouped request that does not decompose yields the qualified single-table wrapper shape on both.
 * Credentials never appear in any empty-result SQL string or error message.
 
 ## Scenarios
@@ -45,12 +42,12 @@ When plan-time file pruning eliminates every data file, the adapter returns a `p
 
 * *GIVEN* any `pushdown` request whose filter prunes 100% of the table's data files during plan-time file pruning, whichever table format's reader resolved that list
 * *WHEN* the adapter reaches the zero-files short-circuit
-* *THEN* the adapter SHALL choose the empty-result shape using the SAME plan-detection priority the non-empty path uses, grouped aggregate first, then single-group aggregate, then row scan
+* *THEN* the adapter SHALL choose the empty-result shape using the same plan-detection priority the non-empty path uses, grouped aggregate first, then single-group aggregate, then row scan
 * *AND* a request Exasol marks `aggregationType: single_group` SHALL take the single-group empty shape whether or not the non-empty path decomposes it, and never the row-scan empty shape
-* *AND* the empty and non-empty paths SHALL derive that priority and those validation gates from one shared request classifier, so the ROUTING decision is shared by construction rather than kept in lockstep by convention; each path then renders its own shape from that shared decision
-* *AND* that shared classifier SHALL raise NO grouped-tier hard error, so a grouped request that does not decompose, for any reason, including a non-numeric aggregate column type or a HAVING the adapter cannot merge, whether or not a HAVING is present, SHALL yield the qualified single-table wrapper (`GroupByWrapper`) shape identically on the empty and non-empty paths
-* *AND* the empty grouped-fallback (`GroupByWrapper`) shape SHALL type its columns from `selectListDataTypes` when present, a positional shape Exasol accepts against it, not a raw row projection, and when `selectListDataTypes` is absent or empty SHALL fall back to the full-row-projection empty shape, matching the pre-refactor empty-result behavior byte-for-byte (this refactor changes routing structure, not column-shape selection)
-* *AND* the short-circuit SHALL be reached from the RESOLVED FILE LIST alone, so an Iceberg table whose manifests pruned to zero files and a Delta table whose `add` statistics pruned to zero files take the identical path and return the identical shape
+* *AND* the empty and non-empty paths SHALL choose the same shape for the same request
+* *AND* a grouped request that does not decompose, for any reason, including a non-numeric aggregate column type, a select-list item the scan cannot emit, or a HAVING the adapter cannot merge, SHALL yield the qualified single-table wrapper shape identically on the empty and non-empty paths
+* *AND* the empty grouped-fallback shape SHALL type its columns from `selectListDataTypes`, a positional shape Exasol accepts, not a raw row projection
+* *AND* the short-circuit SHALL be reached from the resolved file list alone, so an Iceberg table whose manifests pruned to zero files and a Delta table whose `add` statistics pruned to zero files take the identical path and return the identical shape
 
 ### Scenario: An empty-result plan carries no storage block at all
 

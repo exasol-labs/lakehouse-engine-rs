@@ -47,12 +47,8 @@ The `createVirtualSchema` declaration flattens multi-level namespaces into table
 
 ### Scenario: A TIMESTAMP(p) column declaration serializes fractionalSecondsPrecision
 
-* *GIVEN* a resolved Exasol type `TIMESTAMP(p)` for an integer precision `p` in 0-9, the shape the version gate now produces for a catalog timestamp column
-* *WHEN* `exasol_type_to_json` converts that type into the response's column `dataType` object
-* *THEN* it SHALL return `{"type": "timestamp", "fractionalSecondsPrecision": p}`, reading the field name `fractionalSecondsPrecision`, the same name its inverse `exasol_type_from_json` reads, and MUST NOT emit a `precision` field, which Exasol uses only for `DECIMAL` and `INTERVAL`
-* *AND* it MUST NOT declare a `TIMESTAMP(p)` column as `{"type": "varchar", "size": 2000000}`, a silently wrong column type rather than a rejected request
-* *AND* a bare `TIMESTAMP` type SHALL keep returning `{"type": "timestamp"}` with NO `fractionalSecondsPrecision` field, so the 8.x arm's declaration is byte-identical to the one recorded today
-* *AND* `TIMESTAMP WITH LOCAL TIME ZONE` SHALL keep returning `{"type": "timestamp", "withLocalTimeZone": true}` with no precision field, and its inverse `exasol_type_from_json` SHALL read `withLocalTimeZone` before any precision field
-* *AND* every other type a catalog column declares SHALL keep its recorded `dataType` object byte-identical: `BOOLEAN`, `DOUBLE PRECISION`, `DATE`, every `DECIMAL(p,s)`, and every `VARCHAR(n)`
-* *AND* a `CHAR(n)` type or an `ASCII` character type, which no catalog column declares, SHALL serialize to the `dataType` object that `exasol_type_from_json` reads back as the same type
-* *AND* Exasol SHALL declare the resulting virtual column as `TIMESTAMP(6)` in `SYS.EXA_ALL_COLUMNS` and echo `fractionalSecondsPrecision` back on the pushdown request's `involvedTables` column `dataType`, both captured against a live Exasol 2025.x instance rather than asserted from documentation
+* *GIVEN* a catalog timestamp column that the adapter declares `TIMESTAMP(p)` for a precision `p` in 0-9
+* *WHEN* the `createVirtualSchema` response declares the column's `dataType` object
+* *THEN* the object SHALL be `{"type": "timestamp", "fractionalSecondsPrecision": p}` when `p` is not 3, and MUST NOT carry a `precision` field, which Exasol uses only for `DECIMAL` and `INTERVAL`
+* *AND* a column of precision 3, which is Exasol's bare `TIMESTAMP`, SHALL be declared `{"type": "timestamp"}` with no `fractionalSecondsPrecision` field on every Exasol version
+* *AND* the adapter MUST NOT declare a `TIMESTAMP(p)` column as `{"type": "varchar", "size": 2000000}`

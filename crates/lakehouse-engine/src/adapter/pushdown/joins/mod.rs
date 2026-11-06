@@ -11,7 +11,8 @@ use super::empty_result::empty_result_sql;
 use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
 use super::support::{
-    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident,
+    ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, PushdownRequest, SCAN_UDF_NAME, project_columns,
+    quote_ident,
 };
 
 mod attribution;
@@ -111,7 +112,7 @@ fn ensure_no_side_refuses_a_referenced_column(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn plan_join(
     request: &Json,
-    pushdown_req: &Json,
+    pushdown: &PushdownRequest,
     join: &DetectedJoin,
     statement: &StatementCatalog,
     permission: &PermissionCheck,
@@ -127,6 +128,7 @@ pub(super) async fn plan_join(
     s3_max_connections: usize,
     join_broadcast_max_bytes: u64,
 ) -> Result<Json, UdfError> {
+    let pushdown_req = pushdown.json();
     let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
     // Built once for every leg, so every leg's identifier passes its rule before any catalog
     // request.
@@ -142,11 +144,11 @@ pub(super) async fn plan_join(
     let side_filters: Vec<Option<Json>> = (0..join.tables.len())
         .map(|leg| filter.and_then(|f| leg_local_filter(f, &legs, leg)))
         .collect();
-    let involved: Vec<_> = join
+    let involved = join
         .tables
         .iter()
         .map(|leaf| involved_table(request, &leaf.table_name))
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     // `try_join_all` preserves leg order, which later steps index by.
     let sides: Vec<ResolvedJoinSide> =
         try_join_all(join.tables.iter().zip(&side_filters).zip(&involved).map(
@@ -166,10 +168,10 @@ pub(super) async fn plan_join(
 
     if sides.iter().any(|s| s.files.is_empty()) {
         let combined = ColumnTypes::concat(sides.iter().map(|side| &side.column_types));
-        let (projection, widened) = project_columns(pushdown_req, &combined)?;
+        let (projection, widened) = project_columns(pushdown, &combined)?;
         let cols_per_leg = sides.iter().map(|side| side.column_types.clone()).collect();
         return empty_result_sql(
-            pushdown_req,
+            pushdown,
             &projection,
             widened,
             &combined,
@@ -203,7 +205,7 @@ pub(super) async fn plan_join(
         let candidate =
             select_broadcast_sides(sides[0].clone(), sides[1].clone(), join_broadcast_max_bytes);
         if candidate.broadcast_eligible
-            && let Some(rendered) = render_broadcast_join(pushdown_req, join, &sides)?
+            && let Some(rendered) = render_broadcast_join(pushdown, join, &sides)?
             && let Some(sql) = build_broadcast_join_sql(
                 &candidate,
                 &rendered,
@@ -217,7 +219,7 @@ pub(super) async fn plan_join(
     }
 
     let sql = build_n_scan_join_sql(
-        pushdown_req,
+        pushdown,
         join,
         &sides,
         &inputs,

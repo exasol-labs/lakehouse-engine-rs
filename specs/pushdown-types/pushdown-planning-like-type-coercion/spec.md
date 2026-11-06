@@ -33,8 +33,8 @@ The adapter type-checks the subject of every pushed-down `LIKE` before rendering
 * *GIVEN* a `pushdown` request whose filter carries a `predicate_like` whose `expression` is a bare `column` node
 * *AND* the column's Exasol type in `involvedTables[0].columns` is `DATE`
 * *WHEN* the adapter builds the DataFusion scan-spec filter
-* *THEN* the adapter SHALL rewrap the subject as an explicit CAST-to-VARCHAR node (`function_scalar_cast` with target `{"type":"VARCHAR"}`) before rendering, so the emitted DataFusion SQL casts the DATE column to text and the LIKE matches against the `YYYY-MM-DD` string form
-* *AND* the rewrite SHALL apply ONLY to the JSON tree fed to the DataFusion filter renderer, leaving the raw filter tree forwarded to Iceberg file pruning unchanged
+* *THEN* the scan-spec filter SHALL carry the LIKE with its subject rendered as `CAST(<col> AS VARCHAR)`, so the LIKE matches against the `YYYY-MM-DD` string form of the DATE column
+* *AND* file pruning SHALL keep the same data files it keeps for the same predicate without the CAST
 * *AND* the emitted match semantics SHALL equal Exasol's implicit DATE-to-VARCHAR cast under the default `NLS_DATE_FORMAT` of `YYYY-MM-DD`, which is the ISO-8601 date text form both engines render for the Iceberg `date` primitive (calendar date without timezone, days from 1970-01-01)
 * *AND* under a session that has altered `NLS_DATE_FORMAT` away from the `YYYY-MM-DD` default, the pushed-down match MAY diverge from native Exasol evaluation, because DataFusion's `CAST(Date32 AS VARCHAR)` is unconditionally ISO `YYYY-MM-DD` and the pushdown request carries no session NLS format for the adapter to reproduce, an accepted, accurately-scoped tracked exception, not a silent gap
 
@@ -94,13 +94,11 @@ The adapter type-checks the subject of every pushed-down `LIKE` before rendering
 ### Scenario: A select-list LIKE over a DATE column projects the CAST-to-VARCHAR form
 
 * *GIVEN* a `pushdown` request whose SELECT LIST carries a `predicate_like` whose `expression` is a bare `column` node, for example `SELECT c_date LIKE '2024%' FROM …`
-* *AND* the column's Exasol type in the projection's column universe is `DATE`
-* *WHEN* the adapter resolves the select list into the scan-spec projection in `project_columns`
-* *THEN* the adapter SHALL run the same subject dispatch on the item that it runs on a WHERE-clause LIKE, rewrapping the subject as a `function_scalar_cast` node with target `{"type":"VARCHAR"}` before rendering
-* *AND* the item SHALL project as ONE positional rendered expression carrying `(CAST(<col> AS VARCHAR) LIKE <pattern>)`, NOT as the full-base-row fallback, so the projection stays one item per select-list item
+* *AND* the column's Exasol type in the request's involved-table columns is `DATE`
+* *WHEN* the adapter resolves the select list into the scan-spec projection
+* *THEN* the scan-spec projection SHALL carry the item as ONE positional rendered expression, `(CAST(<col> AS VARCHAR) LIKE <pattern>)`, the subject form a WHERE-clause DATE LIKE takes, NOT as the full-base-row fallback, so the projection stays one item per select-list item
 * *AND* a `VARCHAR(n)` or `CHAR(n)` subject SHALL project its rendered fragment unchanged and keep its pushdown
-* *AND* the rewrite SHALL apply ONLY to the JSON tree fed to the projection renderer, leaving the raw filter tree forwarded to Iceberg file pruning unchanged
-* *AND* the DATE match semantics SHALL carry the same default-`NLS_DATE_FORMAT` fidelity, and the same altered-session-format tracked exception, that the WHERE-clause DATE scenario records, because the identical CAST node is emitted
+* *AND* the DATE match semantics SHALL carry the same default-`NLS_DATE_FORMAT` fidelity, and the same altered-session-format tracked exception, that the WHERE-clause DATE scenario records, because the scan renders the same CAST
 
 ### Scenario: A select-list LIKE over a non-string column widens the projection to the full base row
 

@@ -25,8 +25,8 @@ use crate::common::timestamp_precision::{
     ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
 };
 use crate::fixtures::{
-    LAKEHOUSE_VS, events_table, explain_virtual_pushdown_sql, lakehouse_vs, typed_table,
-    vs_dim_table, vs_fact_table, vs_lineitem_table,
+    LAKEHOUSE_VS, emits_clause, events_table, explain_virtual_pushdown_sql, lakehouse_vs,
+    typed_table, vs_dim_table, vs_fact_table, vs_lineitem_table,
 };
 
 /// Its recorded `DF_THREADS_PER_UDF` reads back the core count the adapter VM detected.
@@ -3771,5 +3771,88 @@ fn test_concat_null_operand_concatenates_non_null_parts() {
         all_null_pushed.contains("nullif(concat("),
         "the pushed scan spec must carry the nullif(concat(...), '') \
          rendering of CONCAT, not a bare concat or chained ||, got:\n{all_null_pushed}"
+    );
+}
+
+/// The select list of the merge that wraps the scan: the pushdown SQL up to its `FROM (`.
+fn outer_merge_select_list(pushdown_sql: &str) -> &str {
+    let select_list_end = pushdown_sql
+        .find(" FROM (")
+        .unwrap_or_else(|| panic!("no FROM clause in the pushdown SQL:\n{pushdown_sql}"));
+    &pushdown_sql["SELECT ".len()..select_list_end]
+}
+
+/// Scenario: The merge casts a merged value only when merging can change its type
+/// Scenario: Expression-argument partial and merge column types come from the declared aggregate type
+/// Scenario: Scalar-over-aggregate and plain aggregate items interleave in select-list order with per-item declared types
+/// Scenario: A MIN or MAX over a CHAR-typed expression declares a CHAR partial column
+#[test]
+fn merge_casts_only_values_whose_type_merging_changes() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let table = typed_table();
+
+    let single_group = "SELECT MIN(C_TS), MAX(C_TS), SUM(C_QTY), COUNT(*), MIN(C_QTY + 1), \
+                        ROUND(SUM(C_QTY), 2) FROM {}";
+    let char_group = "SELECT C_VARCHAR, MIN(CAST(C_VARCHAR AS CHAR(20))), SUM(C_QTY) FROM {} \
+                      GROUP BY C_VARCHAR";
+    let date_group = "SELECT C_DATE, SUM(C_QTY) FROM {} GROUP BY C_DATE";
+
+    let single_group_sql =
+        isolated_pushdown_statement(&mut conn, &single_group.replace("{}", &table));
+    let merge = outer_merge_select_list(&single_group_sql);
+    assert!(
+        merge.starts_with(
+            "MIN(\"PARTIAL_min_0\"), MAX(\"PARTIAL_max_1\"), CAST(SUM(\"PARTIAL_sum_2\") AS DECIMAL("
+        ),
+        "MIN and MAX return their argument's type, so their merges stay uncast while SUM is \
+         cast: {merge}"
+    );
+    for fragment in [
+        "CAST(SUM(\"PARTIAL_count_3\") AS DECIMAL(",
+        ", MIN(\"PARTIAL_min_4\"), CAST(ROUND(SUM(\"PARTIAL_sum_2\"), 2) AS DECIMAL(",
+    ] {
+        assert!(
+            merge.contains(fragment),
+            "the merge must hold {fragment}, with COUNT and the scalar over SUM cast and \
+             MIN(C_QTY + 1) uncast: {merge}"
+        );
+    }
+    assert!(
+        !merge.contains("CAST(MIN(") && !merge.contains("CAST(MAX("),
+        "no MIN or MAX merge may be cast: {merge}"
+    );
+
+    let char_group_sql = isolated_pushdown_statement(&mut conn, &char_group.replace("{}", &table));
+    let merge = outer_merge_select_list(&char_group_sql);
+    assert!(
+        merge.starts_with(
+            "\"GK_0\", MIN(\"PARTIAL_min_0\"), CAST(SUM(\"PARTIAL_sum_1\") AS DECIMAL("
+        ),
+        "a key declared VARCHAR(2000000), the type the scan emits, stays uncast, and the CHAR \
+         MIN merge too: {merge}"
+    );
+    let emits = emits_clause(&char_group_sql);
+    assert!(
+        emits.contains("\"PARTIAL_min_0\" CHAR(20)") && emits.contains("\"GK_0\" VARCHAR(2000000)"),
+        "the partial of the CHAR MIN must declare CHAR(20) and the key VARCHAR(2000000): {emits}"
+    );
+
+    let date_group_sql = isolated_pushdown_statement(&mut conn, &date_group.replace("{}", &table));
+    let merge = outer_merge_select_list(&date_group_sql);
+    assert!(
+        merge.starts_with("CAST(\"GK_0\" AS DATE), CAST(SUM(\"PARTIAL_sum_0\") AS DECIMAL("),
+        "a DATE key travels as text, so its merge casts it back: {merge}"
+    );
+
+    assert_queries_match_native_copy(
+        &mut conn,
+        &table,
+        "C_VARCHAR, C_DATE, C_TS, C_QTY",
+        &[
+            single_group,
+            &format!("{char_group} ORDER BY C_VARCHAR"),
+            &format!("{date_group} ORDER BY C_DATE"),
+        ],
     );
 }

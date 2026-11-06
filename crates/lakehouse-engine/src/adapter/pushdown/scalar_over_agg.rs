@@ -5,8 +5,9 @@ use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column
 use serde_json::Value as Json;
 use vs_expression::{ColumnNode, render_expression, render_expression_exasol};
 
-use super::support::{cast_to_declared_type, quote_ident};
-use crate::types::exasol_type::ExasolType;
+use super::support::{ColumnTypes, cast_to_declared_type, quote_ident};
+use crate::scan::spec::ColumnRef;
+use crate::types::exasol_type::{ExasolType, MAX_DECIMAL_PRECISION};
 
 /// Declared type of a plan slot reached only through a nested aggregate. Numeric,
 /// not `VARCHAR`, because the per-plan type also types the scan's `EMITS`: a
@@ -322,17 +323,100 @@ pub(super) fn merge_select_items(aggregates: &[AggregatePlan]) -> Vec<String> {
         .collect()
 }
 
-/// Exasol strictly validates pushdown output column types, so each merge expression
-/// is cast to its declared type (uncast when none or the `VARCHAR(2000000)` default).
+/// Exasol strictly validates pushdown output column types, so a merge expression is cast to its
+/// declared type unless merging keeps a type that already matches: MIN and MAX return the type
+/// their partial column is emitted in.
 pub(super) fn cast_merge_items(
     aggregates: &[AggregatePlan],
     aggregate_types: &[ExasolType],
+    col_types: &ColumnTypes,
 ) -> Vec<String> {
+    debug_assert_eq!(aggregates.len(), aggregate_types.len());
     merge_select_items(aggregates)
         .into_iter()
-        .enumerate()
-        .map(|(i, expr)| cast_to_declared_type(&expr, aggregate_types.get(i).copied()))
+        .zip(aggregates)
+        .zip(aggregate_types)
+        .map(|((expr, plan), &declared)| {
+            if merge_keeps_declared_type(plan, declared, col_types) {
+                expr
+            } else {
+                cast_to_declared_type(&expr, declared)
+            }
+        })
         .collect()
+}
+
+fn merge_keeps_declared_type(
+    plan: &AggregatePlan,
+    declared: ExasolType,
+    col_types: &ColumnTypes,
+) -> bool {
+    match plan.kind.partial_columns() {
+        [column @ (PartialAggColumn::Min | PartialAggColumn::Max)] => {
+            partial_column_type(plan, *column, col_types, Some(declared)) == declared
+        }
+        _ => false,
+    }
+}
+
+const PARTIAL_COUNT_TYPE: ExasolType = ExasolType::decimal(20, 0);
+
+/// The type the scan emits `column` of `plan` in. Counts are DECIMAL(20,0); SUM widens
+/// DECIMAL(p,s) to DECIMAL(36,s) against overflow; AVG and stat sums are DOUBLE PRECISION
+/// (reconstructed in floating point); MIN/MAX use the argument's exact type. `declared` is the
+/// sole type source for an expression-argument aggregate, which has no source column.
+pub(super) fn partial_column_type(
+    plan: &AggregatePlan,
+    column: PartialAggColumn,
+    col_types: &ColumnTypes,
+    declared: Option<ExasolType>,
+) -> ExasolType {
+    let argument_type = || {
+        col_type_for(
+            plan.column.as_deref(),
+            plan.arg_expr.as_deref(),
+            col_types,
+            declared,
+        )
+    };
+    match column {
+        PartialAggColumn::CountStar
+        | PartialAggColumn::CountArg
+        | PartialAggColumn::AvgCnt
+        | PartialAggColumn::StatCnt => PARTIAL_COUNT_TYPE,
+        PartialAggColumn::AvgSum | PartialAggColumn::StatMean | PartialAggColumn::StatM2 => {
+            ExasolType::DoublePrecision
+        }
+        PartialAggColumn::Sum => sum_emit_type(argument_type()),
+        PartialAggColumn::Min | PartialAggColumn::Max => argument_type(),
+    }
+}
+
+/// An expression-argument aggregate has no source column, so it takes `declared`.
+pub(super) fn col_type_for(
+    column: Option<&str>,
+    arg_expr: Option<&str>,
+    col_types: &ColumnTypes,
+    declared: Option<ExasolType>,
+) -> ExasolType {
+    if column.is_none()
+        && arg_expr.is_some()
+        && let Some(ty) = declared
+    {
+        return ty;
+    }
+    column
+        .and_then(|col| col_types.get(&ColumnRef::from(col)))
+        .map_or(ExasolType::DoublePrecision, |column_type| {
+            column_type.exa_type
+        })
+}
+
+fn sum_emit_type(col_ty: ExasolType) -> ExasolType {
+    match col_ty {
+        ExasolType::Decimal(decimal) => ExasolType::decimal(MAX_DECIMAL_PRECISION, decimal.scale()),
+        _ => ExasolType::DoublePrecision,
+    }
 }
 
 #[cfg(test)]

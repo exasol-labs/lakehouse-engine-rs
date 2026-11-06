@@ -25,33 +25,27 @@ pub(super) fn join_request(from_extra: Json, condition: Json) -> Json {
     from["condition"] = condition;
 
     with_identifier_notes(
-        serde_json::json!({
-            "involvedTables": [
-                {
-                    "name": "CUSTOMER",
-                    "columns": [
-                        {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                        {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
-                    ],
-                },
-                {
-                    "name": "ORDERS",
-                    "columns": [
-                        {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                        {"name": "O_ORDERDATE", "dataType": {"type": "date"}},
-                    ],
-                },
+        pushdown_request(
+            "CUSTOMER",
+            &[
+                ("C_CUSTKEY", ExasolType::decimal(20, 0)),
+                ("C_NAME", ExasolType::varchar(100)),
             ],
-            "pushdownRequest": {
-                "type": "select",
-                "from": from,
-                "selectList": [
-                    table_col("CUSTOMER", "C_NAME"),
-                    table_col("ORDERS", "O_ORDERDATE"),
-                ],
-            },
-            "schemaMetadataInfo": {"properties": {}},
-        }),
+        )
+        .table(
+            "ORDERS",
+            &[
+                ("O_CUSTKEY", ExasolType::decimal(20, 0)),
+                ("O_ORDERDATE", ExasolType::Date),
+            ],
+        )
+        .field("type", serde_json::json!("select"))
+        .field("from", from)
+        .column(table_col("CUSTOMER", "C_NAME"))
+        .column(table_col("ORDERS", "O_ORDERDATE"))
+        .request_field("schemaMetadataInfo", serde_json::json!({"properties": {}}))
+        .build()
+        .0,
         &[("CUSTOMER", "lh.customer"), ("ORDERS", "lh.orders")],
     )
 }
@@ -66,34 +60,44 @@ pub(super) fn equi_condition() -> Json {
 /// `(CUSTOMER ⋈ ORDERS) ⋈ LINEITEM`.
 pub(super) fn three_table_join_request() -> Json {
     with_identifier_notes(
-        serde_json::json!({
-            "involvedTables": [
-                {"name": "CUSTOMER", "columns": [
-                    {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                    {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}}]},
-                {"name": "ORDERS", "columns": [
-                    {"name": "O_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                    {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
-                {"name": "LINEITEM", "columns": [
-                    {"name": "L_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                    {"name": "L_QUANTITY", "dataType": {"type": "decimal", "precision": 15, "scale": 2}}]},
+        pushdown_request(
+            "CUSTOMER",
+            &[
+                ("C_CUSTKEY", ExasolType::decimal(20, 0)),
+                ("C_NAME", ExasolType::varchar(100)),
             ],
-            "pushdownRequest": {
-                "type": "select",
-                "from": inner_join(
-                    customer_orders_join(),
-                    table_ref("LINEITEM"),
-                    predicate_equal(
-                        table_col("ORDERS", "O_ORDERKEY"),
-                        table_col("LINEITEM", "L_ORDERKEY"),
-                    ),
+        )
+        .table(
+            "ORDERS",
+            &[
+                ("O_ORDERKEY", ExasolType::decimal(20, 0)),
+                ("O_CUSTKEY", ExasolType::decimal(20, 0)),
+            ],
+        )
+        .table(
+            "LINEITEM",
+            &[
+                ("L_ORDERKEY", ExasolType::decimal(20, 0)),
+                ("L_QUANTITY", ExasolType::decimal(15, 2)),
+            ],
+        )
+        .field("type", serde_json::json!("select"))
+        .field(
+            "from",
+            inner_join(
+                customer_orders_join(),
+                table_ref("LINEITEM"),
+                predicate_equal(
+                    table_col("ORDERS", "O_ORDERKEY"),
+                    table_col("LINEITEM", "L_ORDERKEY"),
                 ),
-                "selectList": [
-                    table_col("CUSTOMER", "C_NAME"),
-                    table_col("LINEITEM", "L_QUANTITY")],
-            },
-            "schemaMetadataInfo": {"properties": {}},
-        }),
+            ),
+        )
+        .column(table_col("CUSTOMER", "C_NAME"))
+        .column(table_col("LINEITEM", "L_QUANTITY"))
+        .request_field("schemaMetadataInfo", serde_json::json!({"properties": {}}))
+        .build()
+        .0,
         &[
             ("CUSTOMER", "lh.customer"),
             ("ORDERS", "lh.orders"),
@@ -105,53 +109,67 @@ pub(super) fn three_table_join_request() -> Json {
 /// NQ3 shape: `((PART ⋈ PARTSUPP) ⋈ SUPPLIER) ⋈ NATION`.
 pub(super) fn nq3_join_request() -> Json {
     with_identifier_notes(
-        serde_json::json!({
-            "involvedTables": [
-                {"name": "PART", "columns": [
-                    {"name": "P_PARTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                    {"name": "P_NAME", "dataType": {"type": "varchar", "size": 100}}]},
-                {"name": "PARTSUPP", "columns": [
-                    {"name": "PS_PARTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                    {"name": "PS_SUPPKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                    {"name": "PS_AVAILQTY", "dataType": {"type": "decimal", "precision": 15, "scale": 0}}]},
-                {"name": "SUPPLIER", "columns": [
-                    {"name": "S_SUPPKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                    {"name": "S_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
-                {"name": "NATION", "columns": [
-                    {"name": "N_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                    {"name": "N_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+        pushdown_request(
+            "PART",
+            &[
+                ("P_PARTKEY", ExasolType::decimal(20, 0)),
+                ("P_NAME", ExasolType::varchar(100)),
             ],
-            "pushdownRequest": {
-                "type": "select",
-                "from": inner_join(
+        )
+        .table(
+            "PARTSUPP",
+            &[
+                ("PS_PARTKEY", ExasolType::decimal(20, 0)),
+                ("PS_SUPPKEY", ExasolType::decimal(20, 0)),
+                ("PS_AVAILQTY", ExasolType::decimal(15, 0)),
+            ],
+        )
+        .table(
+            "SUPPLIER",
+            &[
+                ("S_SUPPKEY", ExasolType::decimal(20, 0)),
+                ("S_NATIONKEY", ExasolType::decimal(20, 0)),
+            ],
+        )
+        .table(
+            "NATION",
+            &[
+                ("N_NATIONKEY", ExasolType::decimal(20, 0)),
+                ("N_NAME", ExasolType::varchar(100)),
+            ],
+        )
+        .field("type", serde_json::json!("select"))
+        .field(
+            "from",
+            inner_join(
+                inner_join(
                     inner_join(
-                        inner_join(
-                            table_ref("PART"),
-                            table_ref("PARTSUPP"),
-                            predicate_equal(
-                                table_col("PART", "P_PARTKEY"),
-                                table_col("PARTSUPP", "PS_PARTKEY"),
-                            ),
-                        ),
-                        table_ref("SUPPLIER"),
+                        table_ref("PART"),
+                        table_ref("PARTSUPP"),
                         predicate_equal(
-                            table_col("PARTSUPP", "PS_SUPPKEY"),
-                            table_col("SUPPLIER", "S_SUPPKEY"),
+                            table_col("PART", "P_PARTKEY"),
+                            table_col("PARTSUPP", "PS_PARTKEY"),
                         ),
                     ),
-                    table_ref("NATION"),
+                    table_ref("SUPPLIER"),
                     predicate_equal(
-                        table_col("SUPPLIER", "S_NATIONKEY"),
-                        table_col("NATION", "N_NATIONKEY"),
+                        table_col("PARTSUPP", "PS_SUPPKEY"),
+                        table_col("SUPPLIER", "S_SUPPKEY"),
                     ),
                 ),
-                "selectList": [
-                    table_col("PART", "P_NAME"),
-                    table_col("PARTSUPP", "PS_AVAILQTY"),
-                    table_col("NATION", "N_NAME")],
-            },
-            "schemaMetadataInfo": {"properties": {}},
-        }),
+                table_ref("NATION"),
+                predicate_equal(
+                    table_col("SUPPLIER", "S_NATIONKEY"),
+                    table_col("NATION", "N_NATIONKEY"),
+                ),
+            ),
+        )
+        .column(table_col("PART", "P_NAME"))
+        .column(table_col("PARTSUPP", "PS_AVAILQTY"))
+        .column(table_col("NATION", "N_NAME"))
+        .request_field("schemaMetadataInfo", serde_json::json!({"properties": {}}))
+        .build()
+        .0,
         &[
             ("PART", "lh.part"),
             ("PARTSUPP", "lh.partsupp"),
@@ -185,19 +203,19 @@ pub(super) fn self_join_request(leg_aliases: &[Option<&str>]) -> Json {
     }
 
     with_identifier_notes(
-        serde_json::json!({
-            "involvedTables": [
-                {"name": "FACT_ORDERS", "columns": [
-                    {"name": "O_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-                    {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+        pushdown_request(
+            "FACT_ORDERS",
+            &[
+                ("O_ORDERKEY", ExasolType::decimal(20, 0)),
+                ("O_CUSTKEY", ExasolType::decimal(20, 0)),
             ],
-            "pushdownRequest": {
-                "type": "select",
-                "from": from,
-                "selectList": [order_key(leg_aliases[0])],
-            },
-            "schemaMetadataInfo": {"properties": {}},
-        }),
+        )
+        .field("type", serde_json::json!("select"))
+        .field("from", from)
+        .column(order_key(leg_aliases[0]))
+        .request_field("schemaMetadataInfo", serde_json::json!({"properties": {}}))
+        .build()
+        .0,
         &[("FACT_ORDERS", "lh.fact_orders")],
     )
 }
@@ -224,7 +242,9 @@ pub(super) fn broadcast_projection(request: &Json) -> (Vec<ProjectionItem>, Vec<
             .enumerate()
             .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
     );
-    let (items, types, widened) = project_split(&qualified, &leg_types).expect("projectable");
+    let (items, types, widened) =
+        project_split(&parsed_pushdown(request).with_json(qualified), &leg_types)
+            .expect("projectable");
     (items, types, widened)
 }
 
@@ -315,16 +335,17 @@ const ORDERS_COLUMNS: &[(&str, &str)] = &[("o_custkey", "long"), ("variant_col",
 /// which the reader refuses as a whole table, while the notes alone decide the column's refusal.
 const ORDERS_LOG_COLUMNS: &[(&str, &str)] = &[("o_custkey", "long"), ("variant_col", "string")];
 
-fn delta_join_request(select_list: Json) -> Json {
+/// `None` selects every column, as `SELECT *` does.
+fn delta_join_request(select_list: Option<Vec<Json>>) -> Json {
     let request = delta_join_request_over(
-        serde_json::json!([
-            {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-            {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
-        ]),
-        serde_json::json!([
-            {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-            {"name": "VARIANT_COL", "dataType": {"type": "varchar", "size": 2000000}},
-        ]),
+        &[
+            ("C_CUSTKEY", ExasolType::decimal(20, 0)),
+            ("C_NAME", ExasolType::varchar(100)),
+        ],
+        &[
+            ("O_CUSTKEY", ExasolType::decimal(20, 0)),
+            ("VARIANT_COL", ExasolType::WIDEST_VARCHAR),
+        ],
         select_list,
     );
     let request = with_delta_notes(request, "CUSTOMER", CUSTOMER_COLUMNS, &[]);
@@ -333,23 +354,21 @@ fn delta_join_request(select_list: Json) -> Json {
 
 /// Lets a test declare the same column name on both legs.
 fn delta_join_request_over(
-    customer_columns: Json,
-    orders_columns: Json,
-    select_list: Json,
+    customer_columns: &[(&str, ExasolType)],
+    orders_columns: &[(&str, ExasolType)],
+    select_list: Option<Vec<Json>>,
 ) -> Json {
+    let request = pushdown_request("CUSTOMER", customer_columns)
+        .table("ORDERS", orders_columns)
+        .field("type", "select")
+        .field("from", customer_orders_join())
+        .request_field("schemaMetadataInfo", serde_json::json!({"properties": {}}));
+    let request = select_list
+        .into_iter()
+        .flatten()
+        .fold(request, PushdownRequestBuilder::column);
     with_identifier_notes(
-        serde_json::json!({
-            "involvedTables": [
-                {"name": "CUSTOMER", "columns": customer_columns},
-                {"name": "ORDERS", "columns": orders_columns},
-            ],
-            "pushdownRequest": {
-                "type": "select",
-                "from": customer_orders_join(),
-                "selectList": select_list,
-            },
-            "schemaMetadataInfo": {"properties": {}},
-        }),
+        request.build().0,
         &[
             ("CUSTOMER", "cat.sch.customer"),
             ("ORDERS", "cat.sch.orders"),
@@ -361,11 +380,11 @@ fn delta_join_request_over(
 async fn a_refused_delta_column_reached_through_a_join_leg_is_refused() {
     let catalog = unity_delta_catalog().await;
     let storage = two_delta_legs_one_refusing_variant_col().await;
-    let mappable = serde_json::json!([
+    let mappable = Some(vec![
         table_col("CUSTOMER", "C_NAME"),
         table_col("ORDERS", "O_CUSTKEY"),
     ]);
-    let reaching_refused = serde_json::json!([
+    let reaching_refused = Some(vec![
         table_col("CUSTOMER", "C_NAME"),
         table_col("ORDERS", "VARIANT_COL"),
     ]);
@@ -412,16 +431,16 @@ async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable
     ])
     .await;
     let request = delta_join_request_over(
-        serde_json::json!([
-            {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-            {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
-            {"name": "VARIANT_COL", "dataType": {"type": "varchar", "size": 2000000}},
-        ]),
-        serde_json::json!([
-            {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-            {"name": "VARIANT_COL", "dataType": {"type": "varchar", "size": 2000000}},
-        ]),
-        serde_json::json!([table_col("CUSTOMER", "VARIANT_COL"),]),
+        &[
+            ("C_CUSTKEY", ExasolType::decimal(20, 0)),
+            ("C_NAME", ExasolType::varchar(100)),
+            ("VARIANT_COL", ExasolType::WIDEST_VARCHAR),
+        ],
+        &[
+            ("O_CUSTKEY", ExasolType::decimal(20, 0)),
+            ("VARIANT_COL", ExasolType::WIDEST_VARCHAR),
+        ],
+        Some(vec![table_col("CUSTOMER", "VARIANT_COL")]),
     );
     let request = with_delta_notes(request, "CUSTOMER", &customer_columns, &[]);
     let request = with_delta_notes(request, "ORDERS", ORDERS_COLUMNS, &[]);
@@ -435,7 +454,7 @@ async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable
 async fn an_unqualified_column_reference_is_charged_to_every_join_side() {
     let catalog = unity_delta_catalog().await;
     let storage = two_delta_legs_one_refusing_variant_col().await;
-    let request = delta_join_request(serde_json::json!([col("VARIANT_COL"),]));
+    let request = delta_join_request(Some(vec![col("VARIANT_COL")]));
 
     let error = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
         .await
@@ -448,7 +467,7 @@ async fn an_unqualified_column_reference_is_charged_to_every_join_side() {
 async fn a_select_star_join_is_refused_by_the_side_declaring_the_refused_column() {
     let catalog = unity_delta_catalog().await;
     let storage = two_delta_legs_one_refusing_variant_col().await;
-    let request = delta_join_request(Json::Null);
+    let request = delta_join_request(None);
 
     let error = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
         .await
@@ -549,15 +568,15 @@ fn partitioned_delta_logs() -> Vec<(String, String)> {
 /// carrying the notes CREATE records for it.
 fn partitioned_legs_request() -> Json {
     let request = delta_join_request_over(
-        serde_json::json!([
-            {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-            {"name": "C_REGION", "dataType": {"type": "varchar", "size": 100}},
-        ]),
-        serde_json::json!([
-            {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-            {"name": "O_STATUS", "dataType": {"type": "varchar", "size": 100}},
-        ]),
-        serde_json::json!([
+        &[
+            ("C_CUSTKEY", ExasolType::decimal(20, 0)),
+            ("C_REGION", ExasolType::varchar(100)),
+        ],
+        &[
+            ("O_CUSTKEY", ExasolType::decimal(20, 0)),
+            ("O_STATUS", ExasolType::varchar(100)),
+        ],
+        Some(vec![
             table_col("CUSTOMER", "C_REGION"),
             table_col("ORDERS", "O_STATUS"),
         ]),

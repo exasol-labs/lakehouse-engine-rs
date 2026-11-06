@@ -1,7 +1,8 @@
 use crate::common::e2e_harness::{
     SCAN_SCRIPT_NAME, VsProps, create_proxied_schema_and_scripts, create_schema_and_scripts,
     create_virtual_schema, create_virtual_schema_with_password, exa_conn, explain_virtual_sql,
-    install_slc, runtime, upload_so,
+    has_broadcast_join_block, has_n_scan_wrapper, has_two_scan_wrapper, install_slc, runtime,
+    upload_so,
 };
 use crate::common::exasol_ws::ExaConn;
 use crate::common::raw_parquet::write_parquet_fixture;
@@ -129,6 +130,26 @@ pub fn assert_pushed_to_scan_udf(conn: &mut ExaConn, sql: &str, shape: &str) {
     assert!(
         pushed.contains(SCAN_SCRIPT_NAME),
         "{shape} must drive the scan UDF: {pushed}"
+    );
+}
+
+/// Exasol computes the query in the qualified single-table wrapper over the sharded scan, and
+/// returns that pushdown SQL.
+pub fn assert_single_table_wrapper(conn: &mut ExaConn, sql: &str) -> String {
+    let pushed = explain_virtual_sql(conn, sql);
+    assert!(
+        pushed.contains(SCAN_SCRIPT_NAME) && has_n_scan_wrapper(&pushed, 1),
+        "{sql} must run in the qualified single-table wrapper over the scan: {pushed}"
+    );
+    pushed
+}
+
+/// Exasol computes the join in the N-scan wrapper, not in a broadcast scan.
+pub fn assert_two_scan_join_wrapper(conn: &mut ExaConn, sql: &str) {
+    let pushed = explain_virtual_sql(conn, sql);
+    assert!(
+        has_two_scan_wrapper(&pushed) && !has_broadcast_join_block(&pushed),
+        "{sql} must take the N-scan join wrapper, not the broadcast join: {pushed}"
     );
 }
 

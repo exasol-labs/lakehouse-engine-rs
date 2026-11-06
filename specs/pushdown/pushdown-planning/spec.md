@@ -64,11 +64,11 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 ### Scenario: Projected CAST expression preserves the declared TIMESTAMP fractional-seconds precision in its EMITS type
 
 * *GIVEN* a row-scan `pushdown` request whose select list carries an expression item, for example `CAST(c_ts AS TIMESTAMP(6))`, whose parallel `selectListDataTypes` entry is `{"type":"TIMESTAMP","fractionalSecondsPrecision":6}`
-* *WHEN* the adapter derives the scalar scan UDF's EMITS column type for that item via `exasol_type_from_json`
-* *THEN* the derived EMITS type SHALL be `TIMESTAMP(6)`, reading the precision from the `fractionalSecondsPrecision` field, Exasol's documented data-type field for a TIMESTAMP's fractional-seconds precision (default 3), verified against Exasol's virtual-schema data-type API and the reference fixture `pushdown_request_alltypes.json`; the `DECIMAL` arm's `precision`/`scale` keys MUST NOT be read for a TIMESTAMP
-* *AND* when `fractionalSecondsPrecision` is absent the derived EMITS type SHALL be bare `TIMESTAMP`, equivalent to Exasol's default `TIMESTAMP(3)`, preserving the current behavior asserted by `exasol_type_from_json_reads_with_local_time_zone_flag`
-* *AND* a `withLocalTimeZone: true` timestamp dataType SHALL still map to `TIMESTAMP WITH LOCAL TIME ZONE` and SHALL take precedence over any precision rendering, leaving the WLTZ branch unchanged
-* *AND* this EMITS-precision derivation and the vs-expression CAST-render precision fix (`sql-comprehension/vs-expression-translator-cast`) SHALL ship together, because Exasol's `EXPLAIN VIRTUAL` type check (`Data type mismatch ... Expected TIMESTAMP(6), but got TIMESTAMP(3)`, SQL error 04000) compares the outer query's expected column type against the EMITS-declared type, and fixing only one of the two collapse points still fails the check; this scenario governs the pushed-down CAST *expression's* declared target type and MUST NOT be conflated with `scan-types/type-mapping`'s "Iceberg timestamptz maps to plain Exasol TIMESTAMP" scenario, which governs a raw column's `createVirtualSchema` schema declaration (always bare `TIMESTAMP`)
+* *WHEN* the adapter derives the scalar scan UDF's EMITS column type for that item
+* *THEN* the derived EMITS type SHALL be `TIMESTAMP(6)`, reading the precision from the `fractionalSecondsPrecision` field, Exasol's data-type field for a TIMESTAMP's fractional-seconds precision; a `precision` or `scale` key on a TIMESTAMP `dataType` MUST NOT set its precision
+* *AND* when `fractionalSecondsPrecision` is absent the derived EMITS type SHALL be bare `TIMESTAMP`, equivalent to Exasol's default `TIMESTAMP(3)`
+* *AND* a `withLocalTimeZone: true` dataType SHALL be `TIMESTAMP(p) WITH LOCAL TIME ZONE`, which the scan cannot emit, so the item routes per `pushdown-capabilities/pushdown-planning-capability-extensions`
+* *AND* the EMITS type and the CAST target the adapter renders for the same item (`sql-comprehension/vs-expression-translator-cast`) SHALL carry the same precision, because Exasol's `EXPLAIN VIRTUAL` type check (`Data type mismatch ... Expected TIMESTAMP(6), but got TIMESTAMP(3)`, SQL error 04000) compares the outer query's expected column type against the EMITS-declared type; this scenario governs the pushed-down CAST expression's declared target type, not a raw column's `createVirtualSchema` declaration, which `scan-types/type-mapping` governs
 
 ### Scenario: Pushdown reads the cluster node count from the UDF handshake
 
@@ -87,3 +87,22 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 * *AND* the adapter SHALL still return a successful `pushdown` response
 
 *Credential-reference invariant:* the common scan-spec literal carries a connection REFERENCE or sealed envelope, never a plaintext credential. See `storage-access/scan-spec-credential-reference` for the full contract.
+
+### Scenario: A pushdown request with a missing or invalid Exasol type fails the query
+
+* *GIVEN* a `pushdown` request that lacks `selectListDataTypes`, or whose `selectListDataTypes` entry, involved-table column, or CAST node carries a `dataType` that is incomplete, names a type Exasol does not define, or lies outside Exasol's limits
+* *AND* Exasol's limits are DECIMAL precision 1 to 36 with scale 0 to the precision, CHAR size 1 to 2,000, VARCHAR size 1 to 2,000,000, TIMESTAMP precision 0 to 9, INTERVAL leading precision 1 to 9 and fraction 0 to 9, and HASHTYPE size 1 to 1,024 bytes
+* *WHEN* the adapter plans the pushdown
+* *THEN* the adapter SHALL fail the query with an error that names the missing `selectListDataTypes` or the offending `dataType` object
+* *AND* the adapter MUST NOT substitute a default for an absent field, except precision 3 for an absent TIMESTAMP `fractionalSecondsPrecision`, which Exasol 8.x omits, `false` for an absent `withLocalTimeZone`, and UTF8 for an absent `characterSet`, which Exasol sends only for ASCII, and MUST NOT cap or clamp a value or declare `VARCHAR(2000000)` in place of the type
+* *AND* a request whose `selectList` holds one or more items SHALL fail the query when `selectListDataTypes` holds a different number of entries
+
+### Scenario: Every request of a supported Exasol version passes the strict type check
+
+* *GIVEN* Exasol 8.29.x or later
+* *WHEN* a query over a virtual table sends the adapter a `pushdown` request
+* *THEN* the request SHALL carry `selectListDataTypes` with one complete `dataType` per select-list item, and the adapter SHALL plan it without a type error
+* *AND* a `dataType` that omits only the fields the scenario "A pushdown request with a missing or invalid Exasol type fails the query" defaults SHALL be valid
+* *AND* an absent or JSON-null `selectList`, which Exasol sends for `SELECT *` with one `selectListDataTypes` entry per table column, SHALL skip the count check
+* *AND* an empty `selectList` with an empty `selectListDataTypes`, which Exasol sends for `SELECT RANDOM() FROM <vs>.<table>`, SHALL pass the count check
+* *AND* the query SHALL return as many rows as native Exasol returns for it

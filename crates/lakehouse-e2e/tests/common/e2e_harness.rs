@@ -10,9 +10,9 @@ use super::seed::{
 };
 use super::stack::{
     CatalogConnectionPassword, PROXY_ADAPTER_SCHEMA, assert_resolves_only_through_proxy,
-    bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
-    exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal, lakehouse_engine_so_path,
-    local_stack_connection_password, seaweedfs_url, upload_to_bucketfs, url_host, wait_for_proxy,
+    build_create_connection_sql, exasol_host, exasol_sql_port, iceberg_catalog_url,
+    iceberg_catalog_url_internal, lakehouse_engine_so_path, local_stack_connection_password,
+    put_to_bucketfs, seaweedfs_url, upload_to_bucketfs, url_host, wait_for_proxy,
 };
 
 use futures::TryStreamExt;
@@ -22,7 +22,6 @@ use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 pub const SYS_PASSWORD: &str = "exasol";
 pub const SCHEMA_NAME: &str = "LHVS";
@@ -76,29 +75,7 @@ pub fn install_slc() {
         "SLC tarball is empty — download failed"
     );
 
-    let password = bucketfs_write_password();
-    let bfs_url = format!(
-        "https://{}:{}{}",
-        exasol_host(),
-        bucketfs_port(),
-        SLC_BUCKETFS_PUT_PATH
-    );
-    let client = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(120))
-        .build()
-        .expect("BucketFS client");
-    let resp = client
-        .put(&bfs_url)
-        .basic_auth("w", Some(&password))
-        .body(tarball_bytes.to_vec())
-        .send()
-        .unwrap_or_else(|e| panic!("BucketFS PUT SLC to {bfs_url}: {e}"));
-    assert!(
-        resp.status().is_success(),
-        "BucketFS PUT SLC returned {} — expected 2xx",
-        resp.status()
-    );
+    put_to_bucketfs(tarball_bytes.to_vec(), SLC_BUCKETFS_PUT_PATH);
 
     let mut conn = exa_conn();
     let rust_def = format!(
@@ -1043,7 +1020,16 @@ pub fn assert_decimal_orders_numerically(
     }
 }
 
-const NATIVE_COPY: &str = "FILTER_ORACLE.NATIVE_COPY";
+pub const NATIVE_COPY: &str = "FILTER_ORACLE.NATIVE_COPY";
+
+/// Copies `table` natively, so a query over the copy is the oracle for the same query over the
+/// virtual table.
+pub fn create_native_copy(conn: &mut ExaConn, table: &str, columns: &str) {
+    conn.execute("CREATE SCHEMA IF NOT EXISTS FILTER_ORACLE");
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {NATIVE_COPY} AS SELECT ID, {columns} FROM {table}"
+    ));
+}
 
 /// A native copy holds the values Exasol reads, so each filter must select the same `ID`s from
 /// it as from the virtual `table`. A timestamp column holds only where the declaration keeps
@@ -1054,10 +1040,7 @@ pub fn assert_filters_match_native_copy(
     columns: &str,
     filters: &[&str],
 ) {
-    conn.execute("CREATE SCHEMA IF NOT EXISTS FILTER_ORACLE");
-    conn.execute(&format!(
-        "CREATE OR REPLACE TABLE {NATIVE_COPY} AS SELECT ID, {columns} FROM {table}"
-    ));
+    create_native_copy(conn, table, columns);
     let ids = |conn: &mut ExaConn, from: &str, filter: &str| -> Vec<String> {
         let sql = format!("SELECT TO_CHAR(ID) FROM {from} WHERE {filter} ORDER BY ID");
         conn.query_columns(&sql)
@@ -1075,6 +1058,25 @@ pub fn assert_filters_match_native_copy(
             ids(conn, table, filter),
             ids(conn, NATIVE_COPY, filter),
             "WHERE {filter} on {table} must select the rows native Exasol selects"
+        );
+    }
+}
+
+/// Each query names its table as `{}`. It must return the same columns, in the same order, over
+/// the virtual `table` as over a native copy of `columns`, so a query that needs a row order
+/// carries its own `ORDER BY`.
+pub fn assert_queries_match_native_copy(
+    conn: &mut ExaConn,
+    table: &str,
+    columns: &str,
+    queries: &[&str],
+) {
+    create_native_copy(conn, table, columns);
+    for query in queries {
+        assert_eq!(
+            conn.query_columns(&query.replace("{}", table)),
+            conn.query_columns(&query.replace("{}", NATIVE_COPY)),
+            "{query} on {table} must return what native Exasol returns"
         );
     }
 }

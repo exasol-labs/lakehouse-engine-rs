@@ -91,11 +91,11 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 
 ### Scenario: A predicate unrenderable under both dialects returns a clean error
 
-* *GIVEN* a `pushdown` request whose filter carries a node no dialect can express, for example a `CAST` to `INTERVAL`, `GEOMETRY`, `HASHTYPE`, or `TIMESTAMP WITH LOCAL TIME ZONE`, delegated because `FN_CAST` is advertised
+* *GIVEN* a `pushdown` request whose filter carries a node that neither the DataFusion dialect nor the Exasol dialect renders, such as a node type the translator does not know
 * *WHEN* the adapter attempts to self-apply the predicate in its outer `WHERE`
 * *THEN* the adapter SHALL return a client-facing error naming the unrenderable predicate, at both the single-table wrapper and the N-scan wrapper
 * *AND* the adapter MUST NOT return SQL that omits the predicate, so the query SHALL fail rather than return rows the predicate would have excluded
-* *AND* the error SHALL redact no more and no less than the existing wrapper refusal site already redacts, because this is a new route to an existing outcome and not a new failure mode
+* *AND* the error SHALL redact exactly what the wrapper's other refusals redact
 * *AND* Exasol SHALL NOT re-plan on that error, so the failure is final and visible to the client
 
 ### Scenario: An absent filter is distinguished from a declined filter at every site
