@@ -2,7 +2,7 @@
 //! queried with no catalog service. FAILS (never skips) when the stack is unreachable.
 
 use crate::common::e2e_harness::{
-    VARCHAR_JSON, VsProps, assert_binary_columns_match_native_copy,
+    SCAN_SCRIPT_NAME, VARCHAR_JSON, VsProps, assert_binary_columns_match_native_copy,
     assert_decimal_orders_numerically, assert_filters_match_native_copy,
     assert_hex_literal_compares_bytes, assert_notes_well_formed, assert_query_fails,
     assert_refused_column, assert_text_columns, assert_type_matrix, column_adapter_notes,
@@ -61,6 +61,8 @@ const BASE_REFRESH: &str = "s3://warehouse/direct_refresh/";
 const BASE_REFRESH_NAMES: &str = "s3://warehouse/direct_refresh_names/";
 const BASE_TABLE_FILTER: &str = "s3://warehouse/direct_table_filter/";
 const BASE_AWKWARD: &str = "s3://warehouse/direct_awkward_names/";
+/// Only SeaweedFS's `anonymous` identity (`seaweedfs-iam.json`) makes this bucket readable unsigned.
+const BASE_PUBLIC: &str = "s3://public/direct_public/";
 
 const VS_DIRECT: &str = "DIRECT_LAKEHOUSE";
 const VS_DIRECT_NARROW: &str = "DIRECT_LAKEHOUSE_NARROW";
@@ -75,6 +77,7 @@ const VS_REFRESH: &str = "DIRECT_REFRESH_VS";
 const VS_REFRESH_NAMES: &str = "DIRECT_REFRESH_NAMES_VS";
 const VS_TABLE_FILTER: &str = "DIRECT_TABLE_FILTER_VS";
 const VS_AWKWARD: &str = "DIRECT_AWKWARD_NAMES_VS";
+const VS_PUBLIC: &str = "DIRECT_PUBLIC_VS";
 
 const CONN_DIRECT: &str = "DIRECT_STORAGE_CREDS";
 const CONN_INCOMPATIBLE: &str = "DIRECT_STORAGE_INCOMPATIBLE_CREDS";
@@ -84,6 +87,7 @@ const CONN_REFRESH: &str = "DIRECT_STORAGE_REFRESH_CREDS";
 const CONN_REFRESH_NAMES: &str = "DIRECT_STORAGE_REFRESH_NAMES_CREDS";
 const CONN_TABLE_FILTER: &str = "DIRECT_STORAGE_TABLE_FILTER_CREDS";
 const CONN_AWKWARD: &str = "DIRECT_STORAGE_AWKWARD_NAMES_CREDS";
+const CONN_PUBLIC: &str = "DIRECT_STORAGE_PUBLIC_CREDS";
 
 /// No `warehouse`: the direct-storage kind rejects that field.
 fn direct_storage_password() -> CatalogConnectionPassword {
@@ -3778,4 +3782,39 @@ fn directories_whose_names_need_escaping_are_served_and_read() {
         let ids: Vec<i64> = conn.query_columns(&sql)[0].iter().map(parse_int).collect();
         assert_eq!(ids, [id as i64], "{directory} reads its own file");
     }
+}
+
+/// Scenario: A CONNECTION without storage credentials reads a public S3 bucket unsigned
+#[test]
+fn a_connection_without_credentials_reads_a_public_bucket_unsigned() {
+    stack();
+    let mut conn = exa_conn();
+    put_refresh_file(
+        BASE_PUBLIC,
+        "events/part-0.parquet",
+        vec![("ID", int64_column(&[1, 2, 3]))],
+    );
+
+    create_virtual_schema_with_password(
+        &mut conn,
+        &direct_vs(VS_PUBLIC, CONN_PUBLIC),
+        BASE_PUBLIC,
+        &CatalogConnectionPassword {
+            access_key: String::new(),
+            secret_key: String::new(),
+            ..direct_storage_password()
+        },
+    );
+
+    let sql = format!(
+        "SELECT ID FROM {} ORDER BY ID",
+        vs_table(VS_PUBLIC, "EVENTS")
+    );
+    let ids: Vec<i64> = conn.query_columns(&sql)[0].iter().map(parse_int).collect();
+    assert_eq!(ids, [1, 2, 3], "the public bucket's rows read unsigned");
+    let pushed = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed.contains(SCAN_SCRIPT_NAME),
+        "the rows must come from the scan UDF: {pushed}"
+    );
 }
