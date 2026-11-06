@@ -1,19 +1,9 @@
 use super::*;
-use crate::exasol_type::exasol_type_to_json;
 use crate::render_scan_expression;
 use crate::test_support::*;
 
-struct Columns(Vec<(&'static str, ExasolType)>);
-
-impl ColumnTypeLookup for Columns {
-    fn column_type(&self, column: &Json) -> Option<ExasolType> {
-        let name = column.get("name")?.as_str()?.to_uppercase();
-        self.0.iter().find(|(n, _)| *n == name).map(|(_, t)| *t)
-    }
-}
-
-fn columns() -> Columns {
-    Columns(vec![
+fn columns() -> TypedColumns {
+    typed_columns(&[
         ("D", ExasolType::Date),
         ("TS", ExasolType::timestamp(6)),
         ("B", ExasolType::Boolean),
@@ -23,14 +13,6 @@ fn columns() -> Columns {
         ("S", ExasolType::WIDEST_VARCHAR),
         ("S10", ExasolType::varchar(10)),
     ])
-}
-
-fn cast(arg: Json, target: ExasolType) -> Json {
-    cast_json(exasol_type_to_json(&target), arg)
-}
-
-fn ascii_varchar(size: u32) -> ExasolType {
-    ExasolType::Varchar { size, ascii: true }
 }
 
 fn date_like(subject: Json) -> Json {
@@ -47,7 +29,7 @@ fn session_formatted_sources_decline_at_every_text_position() {
         let cases = [
             (
                 "explicit CAST",
-                cast(col(source), ExasolType::WIDEST_VARCHAR),
+                cast_to(ExasolType::WIDEST_VARCHAR, col(source)),
             ),
             ("LIKE subject", date_like(col(source))),
             (
@@ -62,7 +44,7 @@ fn session_formatted_sources_decline_at_every_text_position() {
                 "nested",
                 scalar_fn(
                     "SUBSTR",
-                    [cast(col(source), ExasolType::WIDEST_VARCHAR), num_lit(1)],
+                    [cast_to(ExasolType::WIDEST_VARCHAR, col(source)), num_lit(1)],
                 ),
             ),
         ];
@@ -79,7 +61,7 @@ fn session_formatted_sources_decline_at_every_text_position() {
 #[test]
 fn integer_and_text_sources_keep_their_pushdown() {
     assert_eq!(
-        render(&cast(col("I"), ExasolType::WIDEST_VARCHAR)).unwrap(),
+        render(&cast_to(ExasolType::WIDEST_VARCHAR, col("I"))).unwrap(),
         r#"CAST(CAST(CAST("I" AS DECIMAL(38,0)) AS VARCHAR) AS VARCHAR)"#
     );
     assert_eq!(
@@ -99,30 +81,48 @@ fn integer_and_text_sources_keep_their_pushdown() {
 #[test]
 fn a_computed_integer_converts_like_a_column() {
     let sum = scalar_fn("ADD", [col("I"), num_lit(2023)]);
-    assert!(render(&cast(sum, ExasolType::WIDEST_VARCHAR)).is_ok());
+    assert!(render(&cast_to(ExasolType::WIDEST_VARCHAR, sum)).is_ok());
     let quotient = scalar_fn("FLOAT_DIV", [col("I"), num_lit(2)]);
-    assert!(render(&cast(quotient, ExasolType::WIDEST_VARCHAR)).is_err());
+    assert!(render(&cast_to(ExasolType::WIDEST_VARCHAR, quotient)).is_err());
 }
 
 #[test]
 fn a_boolean_column_converts_to_exasol_casing() {
     assert_eq!(
-        render(&cast(col("B"), ExasolType::WIDEST_VARCHAR)).unwrap(),
+        render(&cast_to(ExasolType::WIDEST_VARCHAR, col("B"))).unwrap(),
         r#"CAST((CASE "B" WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END) AS VARCHAR)"#
     );
-    assert!(render(&cast(col("B"), ExasolType::varchar(4))).is_err());
+    assert!(render(&cast_to(ExasolType::varchar(4), col("B"))).is_err());
 }
 
 #[test]
 fn sized_ascii_and_char_targets_push_only_when_the_source_guarantees_the_result() {
-    assert!(render(&cast(col("S"), ExasolType::varchar(10))).is_err());
-    assert!(render(&cast(col("S"), ascii_varchar(2_000_000))).is_err());
-    assert!(render(&cast(col("S"), ExasolType::char(10))).is_err());
-    assert!(render(&cast(col("S10"), ExasolType::varchar(10))).is_ok());
-    assert!(render(&cast(col("I"), ExasolType::varchar(10))).is_ok());
-    assert!(render(&cast(col("I"), ExasolType::varchar(9))).is_err());
-    assert!(render(&cast(col("I"), ascii_varchar(10))).is_ok());
-    assert!(render(&cast(col("I"), ExasolType::char(10))).is_err());
+    assert!(render(&cast_to(ExasolType::varchar(10), col("S"))).is_err());
+    assert!(
+        render(&cast_to(
+            ExasolType::Varchar {
+                size: 2_000_000,
+                ascii: true
+            },
+            col("S")
+        ))
+        .is_err()
+    );
+    assert!(render(&cast_to(ExasolType::char(10), col("S"))).is_err());
+    assert!(render(&cast_to(ExasolType::varchar(10), col("S10"))).is_ok());
+    assert!(render(&cast_to(ExasolType::varchar(10), col("I"))).is_ok());
+    assert!(render(&cast_to(ExasolType::varchar(9), col("I"))).is_err());
+    assert!(
+        render(&cast_to(
+            ExasolType::Varchar {
+                size: 10,
+                ascii: true
+            },
+            col("I")
+        ))
+        .is_ok()
+    );
+    assert!(render(&cast_to(ExasolType::char(10), col("I"))).is_err());
 }
 
 #[test]
@@ -134,9 +134,9 @@ fn text_parsed_by_session_settings_declines() {
         ExasolType::DoublePrecision,
         ExasolType::decimal(10, 1),
     ] {
-        assert!(render(&cast(text.clone(), target)).is_err(), "{target}");
+        assert!(render(&cast_to(target, text.clone())).is_err(), "{target}");
     }
-    assert!(render(&cast(text, ExasolType::decimal(10, 0))).is_ok());
+    assert!(render(&cast_to(ExasolType::decimal(10, 0), text)).is_ok());
 }
 
 #[test]
@@ -255,7 +255,7 @@ fn exact_expression_type_is_the_type_the_request_states() {
     let cases = [
         (
             "CAST",
-            cast(col("I"), ExasolType::varchar(10)),
+            cast_to(ExasolType::varchar(10), col("I")),
             Some(ExasolType::varchar(10)),
         ),
         ("column", col("N"), Some(ExasolType::decimal(9, 2))),

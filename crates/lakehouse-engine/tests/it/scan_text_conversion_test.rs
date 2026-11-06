@@ -10,20 +10,15 @@ use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use serde_json::Value as Json;
-use vs_expression::exasol_type::{ExasolType, exasol_type_to_json};
-use vs_expression::test_support::{cast_json, col, scalar_fn};
+use vs_expression::exasol_type::ExasolType;
+use vs_expression::test_support::{TypedColumns, cast_to, col, scalar_fn, typed_columns};
 
-struct Columns;
-
-impl vs_expression::ColumnTypeLookup for Columns {
-    fn column_type(&self, column: &Json) -> Option<ExasolType> {
-        match column.get("name")?.as_str()? {
-            "QTY" => Some(ExasolType::decimal(20, 0)),
-            "D9" => Some(ExasolType::decimal(9, 0)),
-            "B" => Some(ExasolType::Boolean),
-            _ => None,
-        }
-    }
+fn columns() -> TypedColumns {
+    typed_columns(&[
+        ("QTY", ExasolType::decimal(20, 0)),
+        ("D9", ExasolType::decimal(9, 0)),
+        ("B", ExasolType::Boolean),
+    ])
 }
 
 fn context() -> SessionContext {
@@ -67,15 +62,11 @@ async fn texts(fragment: &str) -> Vec<Option<String>> {
     out
 }
 
-fn cast_to_varchar(name: &str) -> Json {
-    cast_json(exasol_type_to_json(&ExasolType::WIDEST_VARCHAR), col(name))
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integer_and_boolean_columns_convert_to_exasol_text() {
-    let render = |e: &Json| vs_expression::render_scan_expression(e, &Columns).unwrap();
+    let render = |e: &Json| vs_expression::render_scan_expression(e, &columns()).unwrap();
     assert_eq!(
-        texts(&render(&cast_to_varchar("QTY"))).await,
+        texts(&render(&cast_to(ExasolType::WIDEST_VARCHAR, col("QTY")))).await,
         vec![
             Some("-12".into()),
             Some("0".into()),
@@ -84,7 +75,7 @@ async fn integer_and_boolean_columns_convert_to_exasol_text() {
         ]
     );
     assert_eq!(
-        texts(&render(&cast_to_varchar("D9"))).await,
+        texts(&render(&cast_to(ExasolType::WIDEST_VARCHAR, col("D9")))).await,
         vec![
             Some("-5".into()),
             Some("0".into()),
@@ -93,7 +84,7 @@ async fn integer_and_boolean_columns_convert_to_exasol_text() {
         ]
     );
     assert_eq!(
-        texts(&render(&cast_to_varchar("B"))).await,
+        texts(&render(&cast_to(ExasolType::WIDEST_VARCHAR, col("B")))).await,
         vec![
             Some("TRUE".into()),
             Some("FALSE".into()),

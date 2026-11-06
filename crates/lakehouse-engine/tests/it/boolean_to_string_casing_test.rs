@@ -9,8 +9,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
-use serde_json::json;
-use vs_expression::test_support::{cast_json, col, compare, num_lit, scalar_fn, str_lit};
+use vs_expression::exasol_type::ExasolType;
+use vs_expression::test_support::{
+    TypedColumns, cast_to, col, compare, num_lit, scalar_fn, str_lit,
+};
 
 /// Field names are uppercase because `render_expression` uppercases and
 /// double-quotes column names.
@@ -57,12 +59,9 @@ async fn collect_strings(ctx: &SessionContext, sql: &str, col: &str) -> Vec<Opti
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_cast_bool_to_varchar_renders_exasol_casing() {
     let ctx = context_with_acctbal();
-    let expr = cast_json(
-        json!({"type": "VARCHAR", "size": 10}),
-        acctbal_greater_than_zero(),
-    );
-    let fragment =
-        vs_expression::render_scan_expression(&expr, &NoColumns).expect("CAST must translate");
+    let expr = cast_to(ExasolType::varchar(10), acctbal_greater_than_zero());
+    let fragment = vs_expression::render_scan_expression(&expr, &TypedColumns::default())
+        .expect("CAST must translate");
 
     let sql = format!("SELECT {fragment} AS s FROM scan_target ORDER BY \"C_CUSTKEY\"");
     let rows = collect_strings(&ctx, &sql, "s").await;
@@ -77,7 +76,7 @@ async fn explicit_cast_bool_to_varchar_renders_exasol_casing() {
 async fn concat_predicate_matches_exasol_uppercase_not_datafusion_lowercase() {
     let ctx = context_with_acctbal();
     let concat_expr = scalar_fn("CONCAT", [acctbal_greater_than_zero(), str_lit("")]);
-    let fragment = vs_expression::render_scan_expression(&concat_expr, &NoColumns)
+    let fragment = vs_expression::render_scan_expression(&concat_expr, &TypedColumns::default())
         .expect("CONCAT must translate");
 
     let sql_true = format!("SELECT \"C_CUSTKEY\" FROM scan_target WHERE {fragment} = 'TRUE'");
@@ -93,7 +92,7 @@ async fn concat_predicate_matches_exasol_uppercase_not_datafusion_lowercase() {
 async fn concat_group_by_key_uses_exasol_uppercase_labels() {
     let ctx = context_with_acctbal();
     let concat_expr = scalar_fn("CONCAT", [acctbal_greater_than_zero(), str_lit("")]);
-    let fragment = vs_expression::render_scan_expression(&concat_expr, &NoColumns)
+    let fragment = vs_expression::render_scan_expression(&concat_expr, &TypedColumns::default())
         .expect("CONCAT must translate");
 
     let sql = format!(
@@ -106,16 +105,4 @@ async fn concat_group_by_key_uses_exasol_uppercase_labels() {
         labels,
         vec![None, Some("FALSE".to_string()), Some("TRUE".to_string())]
     );
-}
-
-/// These fragments name no typed column, so no column type is known.
-struct NoColumns;
-
-impl vs_expression::ColumnTypeLookup for NoColumns {
-    fn column_type(
-        &self,
-        _column: &serde_json::Value,
-    ) -> Option<vs_expression::exasol_type::ExasolType> {
-        None
-    }
 }
