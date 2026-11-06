@@ -278,12 +278,9 @@ jobs:
       - name: ShellCheck
         run: shellcheck -s bash deploy/scripts/install.sh deploy/scripts/tests/install.test.sh
 
-      # Bash 3.2 is the floor install.sh promises (stock macOS); bash 4+ syntax
-      # passes on the runner's bash 5 and crashes there (#283, #430).
+      # Bash 3.2 is the floor install.sh promises (stock macOS)
       - name: Unit tests under bash 3.2 (stubbed exapump/curl, no network)
-        run: |
-          docker run --rm -v "$PWD:/w" -w /w bash:3.2.57 \
-            sh -c 'apk add --no-cache -q jq make python3 && bash deploy/scripts/tests/install.test.sh'
+        run: make test-install
 
   # Tests the installer against a real prior release on a runner with no
   # prereqs preinstalled, not this PR's .so. SaaS mode has no CI job (#252).
