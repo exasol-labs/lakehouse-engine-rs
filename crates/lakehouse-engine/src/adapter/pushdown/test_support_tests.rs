@@ -18,7 +18,13 @@ use lakehouse_catalog::{
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-pub(crate) use vs_expression::test_support::*;
+// Named, not globbed: a local helper of the same name would silently shadow a glob import.
+pub(crate) use vs_expression::test_support::{
+    agg_item, agg_item_expr, alias_col, aliased_col, and, between, binary_lit, bool_lit, case_when,
+    cast_json, col, compare, count_star, date_lit, extract, fixed_binary_lit, in_list, is_not_null,
+    is_null, like, lit, not, null_lit, num_lit, numbered_col, or, predicate_equal, scalar_fn,
+    str_lit, string_equal, table_col, table_column, timestamp_lit,
+};
 
 /// The table a single-table filter fixture qualifies its columns with, as Exasol does.
 pub(crate) const SALES: &str = "SALES";
@@ -40,6 +46,40 @@ pub(crate) fn declined_second_predicate(argument: Json) -> Json {
         scalar_fn("SECOND", [argument, num_lit(3)]),
         num_lit(1),
     )
+}
+
+/// `ROUND(inner, digits)`.
+pub(crate) fn round_of(inner: Json, digits: i64) -> Json {
+    scalar_fn("ROUND", [inner, num_lit(digits)])
+}
+
+/// `dividend / divisor`, which Exasol sends as `FLOAT_DIV`.
+pub(crate) fn float_div(dividend: Json, divisor: Json) -> Json {
+    scalar_fn("FLOAT_DIV", [dividend, divisor])
+}
+
+/// An `ORDER BY` element; Exasol always sends both `isAscending` and `nullsLast`.
+pub(crate) fn order_by_element(expression: Json, ascending: bool, nulls_last: bool) -> Json {
+    serde_json::json!({
+        "type": "order_by_element",
+        "expression": expression,
+        "isAscending": ascending,
+        "nullsLast": nulls_last,
+    })
+}
+
+/// An involved-table column entry, typed as Exasol declares it.
+pub(crate) fn involved_column_json(name: &str, exa_type: ExasolType) -> Json {
+    serde_json::json!({"name": name, "dataType": exasol_type_to_json(&exa_type)})
+}
+
+/// An `involvedTables` entry with its typed `columns`.
+pub(crate) fn involved_table_json<N: AsRef<str>>(name: &str, columns: &[(N, ExasolType)]) -> Json {
+    let columns: Vec<Json> = columns
+        .iter()
+        .map(|(column, exa_type)| involved_column_json(column.as_ref(), *exa_type))
+        .collect();
+    serde_json::json!({"name": name, "columns": columns})
 }
 
 type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
@@ -1343,12 +1383,11 @@ pub(crate) fn nq4_request() -> Json {
     .field("type", "select")
     .column(table_col("LINEITEM", "L_ORDERKEY"))
     .column(table_col("LINEITEM", "L_EXTENDEDPRICE"))
-    .order_by(serde_json::json!([{
-        "type": "order_by_element",
-        "expression": {"type": "column", "columnNr": 1, "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
-        "isAscending": false,
-        "nullsLast": true
-    }]))
+    .order_by(serde_json::json!([order_by_element(
+        numbered_col("LINEITEM", 1, "L_EXTENDEDPRICE"),
+        false,
+        true
+    )]))
     .limit(20)
     .build()
     .0
@@ -1430,7 +1469,7 @@ impl PushdownRequestBuilder {
 
     /// A `COUNT(*)` select-list item, typed `DECIMAL(18,0)` as Exasol declares it.
     pub(crate) fn count_star(self) -> Self {
-        self.item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+        self.item(count_star(), ExasolType::decimal(18, 0))
     }
 
     /// An empty `selectList`, as Exasol sends for `SELECT RANDOM() FROM <table>`.
@@ -1507,15 +1546,7 @@ impl PushdownRequestBuilder {
         let involved_tables: Vec<Json> = self
             .tables
             .iter()
-            .map(|(name, columns)| {
-                let columns: Vec<Json> = columns
-                    .iter()
-                    .map(|(column, exa_type)| {
-                        serde_json::json!({"name": column, "dataType": exasol_type_to_json(exa_type)})
-                    })
-                    .collect();
-                serde_json::json!({"name": name, "columns": columns})
-            })
+            .map(|(name, columns)| involved_table_json(name, columns))
             .collect();
         let mut request = self.request_fields;
         request.insert("involvedTables".into(), Json::Array(involved_tables));

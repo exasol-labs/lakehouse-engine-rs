@@ -1,6 +1,6 @@
 use crate::adapter::pushdown::test_support::{
-    PushdownRequestBuilder, agg_item_expr, and, is_not_null, predicate_equal, pushdown_request,
-    scalar_fn, str_lit, table_col, unread_refused, user_message,
+    PushdownRequestBuilder, agg_item_expr, and, is_not_null, order_by_element, predicate_equal,
+    pushdown_request, scalar_fn, str_lit, table_col, unread_refused, user_message,
 };
 
 use super::*;
@@ -185,12 +185,11 @@ fn a_widened_projection_is_still_refused_when_the_request_itself_names_a_refused
 fn every_refused_column_a_request_touches_is_named_in_one_error() {
     let request = stats_all_types()
         .field("type", serde_json::json!("select"))
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": column_node("VARIANT_COL"),
-            "isAscending": true,
-            "nullsLast": true,
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            column_node("VARIANT_COL"),
+            true,
+            true
+        )]))
         .column(column_node("INT_COL"))
         .build()
         .0;

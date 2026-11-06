@@ -4,6 +4,7 @@ use super::super::tests::{
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
+use crate::types::exasol_type::ExasolType;
 
 #[test]
 fn genuine_inner_equi_join_is_detected_with_both_idents() {
@@ -176,10 +177,13 @@ fn four_table_inner_join_is_unified_join() {
 #[test]
 fn detect_join_follows_from_tree_not_involved_tables_count() {
     let mut request = join_request(Json::Null, equi_condition());
-    request["involvedTables"].as_array_mut().unwrap().push(serde_json::json!({
-        "name": "NATION",
-        "columns": [{"name": "N_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}],
-    }));
+    request["involvedTables"]
+        .as_array_mut()
+        .unwrap()
+        .push(involved_table_json(
+            "NATION",
+            &[("N_NATIONKEY", ExasolType::decimal(20, 0))],
+        ));
     match detect_join(&request, &pd(&request)).expect("tree-driven, no decline") {
         JoinShape::Join(join) => {
             let names: Vec<&str> = join.tables.iter().map(|t| t.table_name.as_str()).collect();

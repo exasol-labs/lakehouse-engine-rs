@@ -555,7 +555,7 @@ fn project_columns_fallback_is_duplicate_free() {
             scalar_fn("TOTALLY_UNKNOWN_FN", [col("id")]),
             ExasolType::decimal(20, 0),
         )
-        .item(agg_item("COUNT", None, false), ExasolType::decimal(20, 0)),
+        .item(count_star(), ExasolType::decimal(20, 0)),
     );
 
     let unique: std::collections::HashSet<_> = names.iter().map(|p| p.emit_name()).collect();
@@ -2987,7 +2987,7 @@ fn selectlist_predicate_node_projects_as_expr() {
 
 #[test]
 fn selectlist_function_aggregate_still_widens_to_full_row() {
-    let item = agg_item("COUNT", None, false);
+    let item = count_star();
     let col_types = decimal_rewrite_col_types();
     let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
         .item(item, ExasolType::decimal(20, 0))
@@ -3755,7 +3755,7 @@ fn project_columns_widens_on_aggregate_nested_in_function_scalar_cast_item() {
 fn project_columns_widens_on_aggregate_nested_in_function_scalar_case_item() {
     let select_item = case_when(
         [compare("predicate_less", col("ID"), num_lit(10))],
-        [agg_item("COUNT", None, false), num_lit(0)],
+        [count_star(), num_lit(0)],
     );
     let declared_type = ExasolType::decimal(20, 0);
     assert_widens_to_full_base_row(

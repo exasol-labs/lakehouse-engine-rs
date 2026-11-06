@@ -148,12 +148,8 @@ fn lineitem_logical_schema() -> Vec<LogicalField> {
 
 #[test]
 fn parse_sort_flags_reads_direction_and_nulls_without_column_gate() {
-    let expression_element = serde_json::json!({
-        "type": "order_by_element",
-        "expression": scalar_fn("ABS", [col("L_EXTENDEDPRICE")]),
-        "isAscending": false,
-        "nullsLast": true
-    });
+    let expression_element =
+        order_by_element(scalar_fn("ABS", [col("L_EXTENDEDPRICE")]), false, true);
     assert_eq!(
         parse_sort_flags(&expression_element),
         Some((false, true)),
@@ -164,12 +160,7 @@ fn parse_sort_flags_reads_direction_and_nulls_without_column_gate() {
         "the bare-column gate must still reject the same element"
     );
 
-    let column_element = serde_json::json!({
-        "type": "order_by_element",
-        "expression": table_col("LINEITEM", "L_ORDERKEY"),
-        "isAscending": true,
-        "nullsLast": false
-    });
+    let column_element = order_by_element(table_col("LINEITEM", "L_ORDERKEY"), true, false);
     assert_eq!(parse_sort_flags(&column_element), Some((true, false)));
 
     for missing in ["isAscending", "nullsLast"] {
@@ -297,12 +288,11 @@ fn zero_offset_still_matches_bounded_topn_byte_identically() {
 
 #[test]
 fn order_by_present_without_topn_match_withholds_per_shard_limit() {
-    let order_by = serde_json::json!([{
-        "type": "order_by_element",
-        "expression": {"type": "column", "columnNr": 1, "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
-        "isAscending": false,
-        "nullsLast": true
-    }]);
+    let order_by = serde_json::json!([order_by_element(
+        numbered_col("LINEITEM", 1, "L_EXTENDEDPRICE"),
+        false,
+        true
+    )]);
     let (request, _) = pushdown_request(
         "LINEITEM",
         &[
@@ -378,15 +368,6 @@ fn lineitem_order_by_request(select_list: &[&str], order_by: Json, limit: Option
         request = request.limit(n);
     }
     request.build().0
-}
-
-fn order_by_element(expression: Json, ascending: bool, nulls_last: bool) -> Json {
-    serde_json::json!({
-        "type": "order_by_element",
-        "expression": expression,
-        "isAscending": ascending,
-        "nullsLast": nulls_last
-    })
 }
 
 fn abs_of(column: &str) -> Json {
@@ -543,10 +524,7 @@ fn unsupported_order_by_shape_declines_topn() {
     );
 
     let mut join = nq4_request();
-    let extra_table = serde_json::json!({
-        "name": "ORDERS",
-        "columns": [{"name": "O_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]
-    });
+    let extra_table = involved_table_json("ORDERS", &[("O_ORDERKEY", ExasolType::decimal(20, 0))]);
     join.get_mut("involvedTables")
         .and_then(|v| v.as_array_mut())
         .unwrap()
@@ -571,12 +549,11 @@ fn unsupported_order_by_shape_declines_topn() {
     );
 
     let mut expr_key = nq4_request();
-    expr_key["pushdownRequest"]["orderBy"] = serde_json::json!([{
-        "type": "order_by_element",
-        "expression": scalar_fn("ABS", [col("L_EXTENDEDPRICE")]),
-        "isAscending": false,
-        "nullsLast": true
-    }]);
+    expr_key["pushdownRequest"]["orderBy"] = serde_json::json!([order_by_element(
+        scalar_fn("ABS", [col("L_EXTENDEDPRICE")]),
+        false,
+        true
+    )]);
     assert!(
         detect_topn(
             &expr_key,
@@ -697,12 +674,11 @@ fn unbounded_order_by_falls_back_correctness_safe() {
 
 #[test]
 fn row_scan_decline_order_by_no_limit_wraps_outer_order_by() {
-    let order_by = serde_json::json!([{
-        "type": "order_by_element",
-        "expression": {"type": "column", "columnNr": 1, "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
-        "isAscending": false,
-        "nullsLast": true
-    }]);
+    let order_by = serde_json::json!([order_by_element(
+        numbered_col("LINEITEM", 1, "L_EXTENDEDPRICE"),
+        false,
+        true
+    )]);
     let (request, _) = pushdown_request(
         "LINEITEM",
         &[
@@ -747,14 +723,13 @@ fn aggregate_merge_renders_request_limit_zero_through_plan_composition() {
     )
     .field("type", serde_json::json!("select"))
     .single_group()
-    .order_by(serde_json::json!([{
-        "type": "order_by_element",
-        "expression": agg_item("COUNT", None, false),
-        "isAscending": false,
-        "nullsLast": true
-    }]))
+    .order_by(serde_json::json!([order_by_element(
+        count_star(),
+        false,
+        true
+    )]))
     .limit(0)
-    .item(agg_item("COUNT", None, false), ExasolType::decimal(20, 0))
+    .item(count_star(), ExasolType::decimal(20, 0))
     .build();
     let files = vec![
         ("s3://w/part-0.parquet".to_string(), 1000u64),

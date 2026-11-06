@@ -245,7 +245,10 @@ async fn spawn_full_backlog_listener() -> (SocketAddr, TcpListener, Vec<TcpStrea
         match tokio::time::timeout(ms(100), TcpStream::connect(address)).await {
             Ok(Ok(stream)) => queued.push(stream),
             Ok(Err(error)) => {
-                panic!("the kernel refused a connect to a full accept queue: {error}")
+                panic!(
+                    "connect {} to the backlog listener failed: {error}",
+                    queued.len() + 1
+                )
             }
             Err(_) => return (address, listener, queued),
         }

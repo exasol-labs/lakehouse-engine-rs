@@ -276,13 +276,8 @@ fn grouped_spec(result: &GroupedAggregateDetection) -> ScanSpec {
 fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
     let req = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
         .column(col("ID"))
-        .item(agg_item("COUNT", None, false), ExasolType::decimal(20, 0))
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": col("ID"),
-            "isAscending": true,
-            "nullsLast": true,
-        }]))
+        .item(count_star(), ExasolType::decimal(20, 0))
+        .order_by(serde_json::json!([order_by_element(col("ID"), true, true)]))
         .build_pushdown();
 
     let result = detect_group_by_aggregates(&req).expect("grouped aggregate");
@@ -326,18 +321,8 @@ fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
             ExasolType::decimal(36, 2),
         )
         .order_by(serde_json::json!([
-            {
-                "type": "order_by_element",
-                "expression": agg_item("SUM", Some("AMOUNT"), false),
-                "isAscending": false,
-                "nullsLast": true,
-            },
-            {
-                "type": "order_by_element",
-                "expression": col("ID"),
-                "isAscending": true,
-                "nullsLast": false,
-            },
+            order_by_element(agg_item("SUM", Some("AMOUNT"), false), false, true),
+            order_by_element(col("ID"), true, false),
         ]))
         .build_pushdown();
 
@@ -355,13 +340,12 @@ fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
 fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
     let req = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
         .column(col("ID"))
-        .item(agg_item("COUNT", None, false), ExasolType::decimal(20, 0))
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": agg_item("SUM", Some("AMOUNT"), false),
-            "isAscending": false,
-            "nullsLast": true,
-        }]))
+        .item(count_star(), ExasolType::decimal(20, 0))
+        .order_by(serde_json::json!([order_by_element(
+            agg_item("SUM", Some("AMOUNT"), false),
+            false,
+            true
+        )]))
         .build_pushdown();
 
     let detection = detect_group_by_aggregates(&req).expect("grouped aggregate");
@@ -424,8 +408,7 @@ fn detect_group_by_mixed_select_falls_back() {
 
 #[test]
 fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
-    let group_key =
-        serde_json::json!({ "columnNr": 0, "name": "ID", "tableName": "EVENTS", "type": "column" });
+    let group_key = numbered_col("EVENTS", 0, "ID");
     let req = pushdown_request("T", NO_COLUMNS)
         .field("from", table_ref("EVENTS"))
         .group_by(vec![group_key])
@@ -501,7 +484,7 @@ fn literal_bool_selectlist_item_classifies_as_constant_not_group_key() {
     let req = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
         .column(col("ID"))
         .item(bool_lit(true), ExasolType::Boolean)
-        .item(agg_item("COUNT", None, false), ExasolType::decimal(20, 0))
+        .item(count_star(), ExasolType::decimal(20, 0))
         .build_pushdown();
     let result = detect_group_by_aggregates(&req).expect(
         "a literal_bool selectList item must classify as Constant, not abort detection to None",
@@ -1069,13 +1052,8 @@ fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
 fn grouped_merge_renders_limit_offset_in_clause_order() {
     let req = grouped_request(&[("ID", ExasolType::decimal(20, 0))], vec![col("ID")])
         .column(col("ID"))
-        .item(agg_item("COUNT", None, false), ExasolType::decimal(20, 0))
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": col("ID"),
-            "isAscending": true,
-            "nullsLast": true,
-        }]))
+        .item(count_star(), ExasolType::decimal(20, 0))
+        .order_by(serde_json::json!([order_by_element(col("ID"), true, true)]))
         .build_pushdown();
 
     let result = detect_group_by_aggregates(&req).expect("grouped aggregate");
@@ -1416,7 +1394,7 @@ fn round_pct_over_aggregates() -> serde_json::Value {
                 "FLOAT_DIV",
                 [
                     scalar_fn("MULT", [lit("literal_double", 100.0), returned]),
-                    agg_item("COUNT", None, false),
+                    count_star(),
                 ],
             ),
             num_lit(2),
@@ -1778,11 +1756,7 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
 
 #[test]
 fn render_having_over_merge_declines_unknown_aggregate() {
-    let having = compare(
-        "predicate_greater",
-        agg_item("COUNT", None, false),
-        num_lit(10),
-    );
+    let having = compare("predicate_greater", count_star(), num_lit(10));
     let plans = vec![AggregatePlan {
         kind: AggKind::Sum,
         column: Some("SCORE".into()),

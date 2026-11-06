@@ -699,10 +699,11 @@ async fn a_failed_glue_call_names_the_operation_the_subject_and_the_cause() {
     }
 
     let unanswered = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let timed_out = "within 30 seconds";
     for (address, cause) in [
         (
             format!("http://{}", unanswered.local_addr().expect("local_addr")),
-            "within 30 seconds",
+            timed_out,
         ),
         (
             // Port 1 refuses on Linux and macOS, and is never an ephemeral port a fake server takes.
@@ -714,7 +715,6 @@ async fn a_failed_glue_call_names_the_operation_the_subject_and_the_cause() {
 
         assert!(message.contains("database 'sales'"), "{message}");
         assert!(message.contains(cause), "{message}");
-        let timed_out = "within 30 seconds";
         assert_eq!(message.contains(timed_out), cause == timed_out, "{message}");
         assert_no_credential(&message);
     }

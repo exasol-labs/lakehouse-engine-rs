@@ -697,11 +697,8 @@ fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
 fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
     let request = serde_json::json!({
         "involvedTables": [
-            {"name": "DATED", "columns": [
-                {"name": "SHARED_KEY", "dataType": {"type": "date"}}]},
-            {"name": "NUMBERED", "columns": [
-                {"name": "SHARED_KEY",
-                 "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+            involved_table_json("DATED", &[("SHARED_KEY", ExasolType::Date)]),
+            involved_table_json("NUMBERED", &[("SHARED_KEY", ExasolType::decimal(20, 0))]),
         ]
     });
     let filter = like(table_col("DATED", "SHARED_KEY"), "1995%");

@@ -92,11 +92,7 @@ fn grouped_having_mixed_junction_falls_through_to_wrapper() {
         .field(
             "having",
             and([
-                compare(
-                    "predicate_greater",
-                    agg_item("COUNT", None, false),
-                    num_lit(0),
-                ),
+                compare("predicate_greater", count_star(), num_lit(0)),
                 compare(
                     "predicate_greater",
                     agg_item("SUM", Some("AMOUNT"), false),
@@ -176,12 +172,11 @@ fn grouped_having_distinct_aggregate_falls_through_to_wrapper() {
 fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only() {
     let req = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
         .group_by(vec![col("REGION")])
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": agg_item("SUM", Some("AMOUNT"), false),
-            "isAscending": false,
-            "nullsLast": true,
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            agg_item("SUM", Some("AMOUNT"), false),
+            false,
+            true
+        )]))
         .field("limit", serde_json::json!(5))
         .column(col("REGION"))
         .build_pushdown();
@@ -203,12 +198,11 @@ fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only
 fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper() {
     let req = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
         .group_by(vec![col("REGION")])
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": agg_item("SUM", Some("AMOUNT"), false),
-            "isAscending": false,
-            "nullsLast": true,
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            agg_item("SUM", Some("AMOUNT"), false),
+            false,
+            true
+        )]))
         .column(col("REGION"))
         .count_star()
         .build_pushdown();
@@ -231,12 +225,11 @@ fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper
 fn grouped_order_by_group_key_classifies_grouped_with_resolved_clause() {
     let req = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
         .group_by(vec![col("REGION")])
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": col("REGION"),
-            "isAscending": true,
-            "nullsLast": true,
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            col("REGION"),
+            true,
+            true
+        )]))
         .column(col("REGION"))
         .item(
             agg_item("SUM", Some("AMOUNT"), false),
@@ -322,17 +315,13 @@ fn single_group(select_list: Json, having: Option<Json>) -> PushdownRequest {
 }
 
 fn count_greater_than(n: i64) -> Json {
-    compare(
-        "predicate_greater",
-        agg_item("COUNT", None, false),
-        num_lit(n),
-    )
+    compare("predicate_greater", count_star(), num_lit(n))
 }
 
 #[test]
 fn single_group_having_over_a_split_aggregate_renders_over_the_merge() {
     let req = single_group(
-        serde_json::json!([agg_item("COUNT", None, false)]),
+        serde_json::json!([count_star()]),
         Some(count_greater_than(100)),
     );
     match classify_request_shape(&req, &col_types()) {
@@ -352,13 +341,10 @@ fn single_group_that_does_not_split_never_classifies_as_row_scan() {
             serde_json::json!([agg_item("SUM", Some("NAME"), false)]),
             None,
         ),
-        single_group(
-            serde_json::json!([literal.clone(), agg_item("COUNT", None, false)]),
-            None,
-        ),
+        single_group(serde_json::json!([literal.clone(), count_star()]), None),
         single_group(serde_json::json!([literal]), Some(count_greater_than(0))),
         single_group(
-            serde_json::json!([agg_item("COUNT", None, false)]),
+            serde_json::json!([count_star()]),
             Some(compare(
                 "predicate_greater",
                 agg_item("MAX", Some("AMOUNT"), false),

@@ -23,6 +23,7 @@ use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, session_config_for_spec,
 };
 use lakehouse_engine::types::exasol_type::ExasolType;
+use vs_expression::exasol_type::exasol_type_to_json;
 use vs_expression::test_support::{agg_item_expr, col, scalar_fn};
 
 use parquet::arrow::ArrowWriter;
@@ -344,7 +345,7 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
             scalar_fn("MULT", [col("L_EXTENDEDPRICE"), col("L_DISCOUNT")]),
             false,
         )],
-        "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 4}],
+        "selectListDataTypes": [exasol_type_to_json(&ExasolType::decimal(36, 4))],
     });
 
     let pushdown =

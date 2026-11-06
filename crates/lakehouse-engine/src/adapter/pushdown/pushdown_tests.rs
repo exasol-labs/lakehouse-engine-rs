@@ -833,12 +833,7 @@ fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
             "ordered top-N",
             guard_events()
                 .column(id_col.clone())
-                .order_by(serde_json::json!([{
-                    "type": "order_by_element",
-                    "expression": id_col,
-                    "isAscending": true,
-                    "nullsLast": true,
-                }]))
+                .order_by(serde_json::json!([order_by_element(id_col, true, true)]))
                 .limit(5)
                 .filter(declined.clone()),
         ),
@@ -1023,12 +1018,11 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
 #[test]
 fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
     let request = guard_events()
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": col("NAME"),
-            "isAscending": true,
-            "nullsLast": true
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            col("NAME"),
+            true,
+            true
+        )]))
         .limit(10)
         .item(num_lit(1), ExasolType::decimal(1, 0))
         .build()
@@ -1066,12 +1060,7 @@ fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
 #[test]
 fn declined_order_by_wrapper_selects_only_original_select_list() {
     let request = guard_events()
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": col("ID"),
-            "isAscending": true,
-            "nullsLast": true
-        }]))
+        .order_by(serde_json::json!([order_by_element(col("ID"), true, true)]))
         .column(col("NAME"))
         .build()
         .0;
@@ -1106,14 +1095,7 @@ fn declined_order_by_wrapper_selects_only_original_select_list() {
 
 #[test]
 fn declined_order_by_dedupes_repeated_and_projected_sort_keys() {
-    let sort_key = |name: &str| {
-        serde_json::json!({
-            "type": "order_by_element",
-            "expression": col(name),
-            "isAscending": true,
-            "nullsLast": true
-        })
-    };
+    let sort_key = |name: &str| order_by_element(col(name), true, true);
     let request = guard_events()
         .order_by(serde_json::json!([
             sort_key("NAME"),
@@ -1155,12 +1137,11 @@ fn declined_order_by_dedupes_repeated_and_projected_sort_keys() {
 #[test]
 fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
     let request = guard_events()
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": col("NAME"),
-            "isAscending": true,
-            "nullsLast": true
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            col("NAME"),
+            true,
+            true
+        )]))
         .limit(5)
         .column(col("NAME"))
         .build()
@@ -1213,12 +1194,11 @@ fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
 #[test]
 fn nonzero_offset_nulls_the_effective_limit() {
     let request = guard_events()
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": col("NAME"),
-            "isAscending": true,
-            "nullsLast": true
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            col("NAME"),
+            true,
+            true
+        )]))
         .field("limit", serde_json::json!({"numElements": 5, "offset": 2}))
         .column(col("NAME"))
         .build()
@@ -1265,12 +1245,11 @@ fn nonzero_offset_nulls_the_effective_limit() {
 #[test]
 fn declined_order_by_extension_runs_after_topn_detection() {
     let request = guard_events()
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": col("NAME"),
-            "isAscending": true,
-            "nullsLast": true
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            col("NAME"),
+            true,
+            true
+        )]))
         .limit(5)
         .item(num_lit(1), ExasolType::decimal(1, 0))
         .build()
@@ -1320,23 +1299,21 @@ fn declined_order_by_extension_runs_after_topn_detection() {
 /// Scenario: An ORDER BY the adapter cannot bound as a top-N remains correctness-safe
 #[test]
 fn declined_order_by_renders_every_reachable_ordering_or_declines() {
-    let unrenderable_expression = serde_json::json!({
-        "type": "order_by_element",
-        "expression": {"type": "no_such_node_type_in_either_dialect"},
-        "isAscending": true,
-        "nullsLast": true
-    });
+    let unrenderable_expression = order_by_element(
+        serde_json::json!({"type": "no_such_node_type_in_either_dialect"}),
+        true,
+        true,
+    );
     let column_missing_nulls_last = serde_json::json!({
         "type": "order_by_element",
         "expression": col("ID"),
         "isAscending": true
     });
-    let renderable_expression = serde_json::json!({
-        "type": "order_by_element",
-        "expression": scalar_fn("ABS", [table_col("EVENTS", "AMOUNT")]),
-        "isAscending": false,
-        "nullsLast": true
-    });
+    let renderable_expression = order_by_element(
+        scalar_fn("ABS", [table_col("EVENTS", "AMOUNT")]),
+        false,
+        true,
+    );
     let declining_shapes = [
         (
             "every element unrenderable",
@@ -1413,12 +1390,11 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
 #[test]
 fn lone_count_distinct_with_order_by_still_renders_limit() {
     let request = guard_events()
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": table_col("EVENTS", "ID"),
-            "isAscending": true,
-            "nullsLast": true
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            table_col("EVENTS", "ID"),
+            true,
+            true
+        )]))
         .item(
             agg_item("COUNT", Some("ID"), true),
             ExasolType::decimal(18, 0),
@@ -1461,12 +1437,11 @@ fn lone_count_distinct_with_order_by_still_renders_limit() {
 /// Select-list arity equals the base table's column count.
 fn widening_arity_coincidence_request() -> Json {
     guard_events()
-        .order_by(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": table_col("EVENTS", "NAME"),
-            "isAscending": true,
-            "nullsLast": true
-        }]))
+        .order_by(serde_json::json!([order_by_element(
+            table_col("EVENTS", "NAME"),
+            true,
+            true
+        )]))
         .column(table_col("EVENTS", "REGION"))
         .column(table_col("EVENTS", "NAME"))
         .column(table_col("EVENTS", "AMOUNT"))
@@ -1803,9 +1778,7 @@ async fn a_count_star_aggregate_is_admitted_over_a_table_with_a_refused_column()
     let storage = refused_column_table_storage().await;
 
     delta_pushdown(
-        &refused_column_request(
-            refused_column_table().item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0)),
-        ),
+        &refused_column_request(refused_column_table().count_star()),
         &catalog.uri,
         storage,
         "cat.sch.orders",
@@ -1847,7 +1820,7 @@ async fn a_count_star_filtered_on_a_refused_column_is_refused() {
     let error = delta_pushdown(
         &refused_column_request(
             refused_column_table()
-                .item(agg_item("COUNT", None, false), ExasolType::decimal(18, 0))
+                .count_star()
                 .filter(is_not_null(column_item("VARIANT_COL"))),
         ),
         &catalog.uri,
@@ -2153,12 +2126,11 @@ fn order_by_on_a_char_declared_group_key_still_resolves_to_its_output_ordinal() 
     let request = char_grouped_request(
         col("NAME"),
         ExasolType::char(20),
-        Some(serde_json::json!([{
-            "type": "order_by_element",
-            "expression": col("NAME"),
-            "isAscending": true,
-            "nullsLast": true
-        }])),
+        Some(serde_json::json!([order_by_element(
+            col("NAME"),
+            true,
+            true
+        )])),
     );
 
     let sql = guard_dispatch_sql(

@@ -195,10 +195,7 @@ fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
     let col_types = vec![("ID".to_string(), ExasolType::decimal(19, 0))];
     let request = pushdown_request("T", NO_COLUMNS)
         .single_group()
-        .field(
-            "having",
-            predicate_equal(agg_item("COUNT", None, false), num_lit(0)),
-        )
+        .field("having", predicate_equal(count_star(), num_lit(0)))
         .item(str_lit("X"), ExasolType::WIDEST_VARCHAR)
         .count_star()
         .build_pushdown();

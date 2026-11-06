@@ -1062,14 +1062,7 @@ fn concat_missing_arguments_or_null_argument_errors_in_both_dialects() {
     assert!(render_expression_safe(&expr).is_none());
     assert!(render_expression_exasol_safe(&expr).is_none());
 
-    let expr = json!({
-        "type": "function_scalar",
-        "name": "CONCAT",
-        "arguments": [
-            col("a"),
-            null
-        ]
-    });
+    let expr = scalar_fn("CONCAT", [col("a"), Json::Null]);
     let expected = "CONCAT argument rendered to null";
     assert_eq!(render_expression(&expr).unwrap_err().to_string(), expected);
     assert_eq!(
@@ -1599,25 +1592,18 @@ fn bitwise_operator_functions_fall_through() {
 fn undeclared_scalar_function_declines_in_both_dialects() {
     // Beyond SUBSTRING/SOUNDEX, the rows pin the gate's edges: case-insensitive lookup,
     // declaration checked before `arguments`, and a missing `name`.
-    let arg = json!([col("a")]);
     let cases = [
-        (
-            "SUBSTRING",
-            json!({"type": "function_scalar", "name": "SUBSTRING", "arguments": arg.clone()}),
-        ),
-        (
-            "SOUNDEX",
-            json!({"type": "function_scalar", "name": "SOUNDEX", "arguments": arg.clone()}),
-        ),
-        (
-            "SUBSTRING",
-            json!({"type": "function_scalar", "name": "substring", "arguments": arg.clone()}),
-        ),
+        ("SUBSTRING", scalar_fn("SUBSTRING", [col("a")])),
+        ("SOUNDEX", scalar_fn("SOUNDEX", [col("a")])),
+        ("SUBSTRING", scalar_fn("substring", [col("a")])),
         (
             "SUBSTRING",
             json!({"type": "function_scalar", "name": "SUBSTRING"}),
         ),
-        ("", json!({"type": "function_scalar", "arguments": arg})),
+        (
+            "",
+            json!({"type": "function_scalar", "arguments": [col("a")]}),
+        ),
     ];
     for (declined_name, expr) in cases {
         let expected = format!("unsupported scalar function: {declined_name}");
@@ -1690,7 +1676,7 @@ fn render_expression_renders_aggregate_nodes() {
     let sum = agg_item("SUM", Some("col"), false);
     assert_eq!(render_expression(&sum).unwrap(), r#"SUM("COL")"#);
 
-    let count_star = agg_item("COUNT", None, false);
+    let count_star = count_star();
     assert_eq!(render_expression(&count_star).unwrap(), "COUNT(*)");
 
     let count_distinct = agg_item("COUNT", Some("col"), true);
@@ -1723,7 +1709,7 @@ fn render_expression_renders_scalar_wrapping_aggregates() {
         ),
         false,
     );
-    let count_star = agg_item("COUNT", None, false);
+    let count_star = count_star();
     let round = scalar_fn(
         "ROUND",
         [

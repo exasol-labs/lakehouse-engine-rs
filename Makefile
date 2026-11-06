@@ -183,8 +183,8 @@ fmt:
 fmt-check:
 	cargo fmt --all -- --check
 
-# `--all-features` reaches the E2E targets, which `required-features` hides otherwise. Only
-# lakehouse-e2e declares features, and they enable no dependency feature.
+# `--all-features` reaches the E2E targets, which `required-features` hides otherwise. It also
+# enables vs-expression's `test-support`, which only adds the test builders to its library.
 lint:
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 

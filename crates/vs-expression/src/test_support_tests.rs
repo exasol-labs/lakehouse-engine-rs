@@ -1,5 +1,5 @@
-//! Builders for Exasol pushdown-request JSON nodes: columns, literals, and predicates. Dependent
-//! crates reach them through the `test-support` feature.
+//! Builders for Exasol pushdown-request JSON nodes: columns, literals, predicates, scalar
+//! functions, CAST, EXTRACT, CASE, and aggregates. Dependent crates enable `test-support`.
 
 use crate::ColumnNode;
 use serde_json::{Map, Value as Json, json};
@@ -18,6 +18,13 @@ pub fn table_col(table: &str, name: &str) -> Json {
 
 pub fn aliased_col(table: &str, alias: &str, name: &str) -> Json {
     table_column(table, Some(alias), name)
+}
+
+/// A column node as Exasol sends it, with the column's 0-based position in its virtual table.
+pub fn numbered_col(table: &str, column_nr: u32, name: &str) -> Json {
+    let mut column = table_col(table, name);
+    column["columnNr"] = column_nr.into();
+    column
 }
 
 /// A column node qualified by its relation alias only, as a rewritten join leg writes it.
@@ -190,18 +197,25 @@ pub fn agg_item(name: &str, column: Option<&str>, distinct: bool) -> Json {
 
 /// An aggregate over one argument expression.
 pub fn agg_item_expr(name: &str, argument: Json, distinct: bool) -> Json {
-    aggregate(name, [argument], distinct)
+    aggregate(name, Some(argument), distinct)
 }
 
-fn aggregate(name: &str, arguments: impl IntoIterator<Item = Json>, distinct: bool) -> Json {
-    node(
-        "function_aggregate",
-        [
-            ("name", name.into()),
-            ("arguments", array(arguments)),
-            ("distinct", distinct.into()),
-        ],
-    )
+/// `COUNT(*)`.
+pub fn count_star() -> Json {
+    agg_item("COUNT", None, false)
+}
+
+/// Exasol writes `arguments` only when there is one (never for `COUNT(*)`) and `distinct` only
+/// for a DISTINCT aggregate.
+fn aggregate(name: &str, argument: Option<Json>, distinct: bool) -> Json {
+    let mut aggregate = node("function_aggregate", [("name", name.into())]);
+    if let Some(argument) = argument {
+        aggregate["arguments"] = array([argument]);
+    }
+    if distinct {
+        aggregate["distinct"] = true.into();
+    }
+    aggregate
 }
 
 /// Moves `fields` into a node of type `kind`. `json!` would clone every child it is handed,
