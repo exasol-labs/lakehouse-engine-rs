@@ -229,9 +229,8 @@ async fn close_after_request(mut stream: TcpStream) {
     read_request(&mut stream).await;
 }
 
-/// A listener whose full accept queue makes the kernel drop every further SYN; the returned values
-/// hold it full. Backlog 1, because macOS reads 0 as `kern.ipc.somaxconn` (128). Only the probe
-/// that stalls waits out the 1 s timeout, which a slow connect on a loaded host stays under.
+/// A listener whose full accept queue makes Linux and macOS drop every further SYN; the returned
+/// values hold it full. Backlog 1, because macOS reads 0 as `kern.ipc.somaxconn` (128).
 async fn spawn_full_backlog_listener() -> (SocketAddr, TcpListener, Vec<TcpStream>) {
     let socket = tokio::net::TcpSocket::new_v4().expect("a TCP socket");
     socket
@@ -241,9 +240,14 @@ async fn spawn_full_backlog_listener() -> (SocketAddr, TcpListener, Vec<TcpStrea
     let address = listener.local_addr().expect("local_addr");
     let mut queued = Vec::new();
     while queued.len() < 64 {
-        match tokio::time::timeout(ms(1_000), TcpStream::connect(address)).await {
+        // `timeout` polls the connect before its deadline, so only a dropped SYN times out, however
+        // late a loaded host polls.
+        match tokio::time::timeout(ms(100), TcpStream::connect(address)).await {
             Ok(Ok(stream)) => queued.push(stream),
-            _ => return (address, listener, queued),
+            Ok(Err(error)) => {
+                panic!("the kernel refused a connect to a full accept queue: {error}")
+            }
+            Err(_) => return (address, listener, queued),
         }
     }
     panic!("the accept queue of a listen(1) socket never filled");
