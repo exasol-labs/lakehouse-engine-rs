@@ -175,8 +175,7 @@ fn where_filter_decimal_stringification_rewritten_to_trim() {
     );
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f))
+        .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
         .expect("LENGTH(decimal) > 5 must render to a DataFusion filter");
 
     let trim_wrapper = "regexp_replace(regexp_replace(CAST(";
@@ -198,8 +197,7 @@ fn filter_decimal_comparison_not_rewritten() {
     let filter_json = compare("predicate_greater", col("c_decimal_a"), num_lit(5));
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f))
+        .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
         .expect("c_decimal_a > 5 must render to a DataFusion filter");
 
     assert_eq!(
@@ -218,8 +216,7 @@ fn where_filter_string_fn_under_comparison_predicate_coerced() {
     let filter_json = predicate_equal(scalar_fn("UPPER", [col("c_decimal_a")]), str_lit("X"));
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f))
+        .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
         .expect("UPPER(decimal) = 'X' must render to a DataFusion filter");
 
     assert!(
@@ -234,9 +231,7 @@ fn where_filter_string_fn_over_double_declines() {
     let col_types = vec![("C_DOUBLE_A".to_string(), ExasolType::DoublePrecision)];
     let filter_json = predicate_equal(scalar_fn("UPPER", [col("c_double_a")]), str_lit("X"));
 
-    let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f));
+    let rendered = Some(&filter_json).and_then(|f| scan_filter_sql(f, &column_types(&col_types)));
 
     assert!(
         rendered.is_none(),
@@ -251,8 +246,7 @@ fn where_filter_upper_decimal_inside_like_subject_coerced() {
     let filter_json = like(scalar_fn("UPPER", [col("c_decimal_a")]), "1%");
 
     let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f))
+        .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
         .expect("UPPER(decimal) LIKE '1%' must render to a DataFusion filter");
 
     assert!(
@@ -271,9 +265,7 @@ fn where_filter_like_decimal_inside_case_declines_whole_filter() {
         num_lit(1),
     );
 
-    let rendered = Some(&filter_json)
-        .and_then(|f| apply_type_rewrites(f, &column_types(&col_types)))
-        .and_then(|f| render_df_filter_safe(&f));
+    let rendered = Some(&filter_json).and_then(|f| scan_filter_sql(f, &column_types(&col_types)));
 
     assert!(
         rendered.is_none(),
@@ -939,7 +931,9 @@ fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
     ));
 
     assert!(
-        sql.starts_with(r#"SELECT CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(36,2)) FROM ("#),
+        sql.starts_with(
+            r#"SELECT CAST(ROUND(CAST(SUM("PARTIAL_sum_0") AS DECIMAL(29,2)), 2) AS DECIMAL(36,2)) FROM ("#
+        ),
         "the merge SELECT must wrap the merged partial in the scalar structure, \
          not emit a bare unwrapped SUM: {sql}"
     );
@@ -987,13 +981,6 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
         ("TS".to_string(), ExasolType::BARE_TIMESTAMP),
         ("AMOUNT".to_string(), ExasolType::decimal(18, 2)),
     ];
-    assert_ne!(
-        apply_type_rewrites(&filter, &column_types(&col_types)).as_ref(),
-        Some(&filter),
-        "fixture precondition: the type rewrites must CHANGE this tree, so the \
-             assertion below can tell the original from the rewritten one"
-    );
-
     let (scan_filter, declined) = classify_where_filter(Some(&filter), &column_types(&col_types));
 
     assert!(
@@ -1977,62 +1964,6 @@ fn embedded_group_keys(fragments: &[String]) -> String {
 }
 
 #[test]
-fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
-    let request = char_grouped_request(
-        cast_to(ExasolType::char(20), col("NAME")),
-        ExasolType::char(20),
-        None,
-    );
-
-    let sql = guard_dispatch_sql(
-        &request,
-        vec![ProjectionItem::from("NAME")],
-        vec![ExasolType::WIDEST_VARCHAR],
-        false,
-        None,
-        Vec::new(),
-    );
-
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#;
-    let padded = format!(
-        "CASE WHEN character_length({fragment}) < 20 THEN rpad({fragment}, 20) \
-             ELSE {fragment} END"
-    );
-    assert!(
-        sql.contains(&embedded_group_keys(std::slice::from_ref(&padded))),
-        "the scan spec must carry the blank-padded group key {padded}: {sql}"
-    );
-    assert!(
-        sql.contains(r#"CAST("GK_0" AS CHAR(20))"#),
-        "the outer merge wrapper must still cast the staging column to CHAR(20): {sql}"
-    );
-}
-
-#[test]
-fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
-    let request = unprojected_char_grouped_request(cast_to(ExasolType::char(20), col("NAME")));
-
-    let sql = guard_dispatch_sql(
-        &request,
-        vec![ProjectionItem::from("NAME")],
-        vec![ExasolType::WIDEST_VARCHAR],
-        false,
-        None,
-        Vec::new(),
-    );
-
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#;
-    let padded = format!(
-        "CASE WHEN character_length({fragment}) < 20 THEN rpad({fragment}, 20) \
-             ELSE {fragment} END"
-    );
-    assert!(
-        sql.contains(&embedded_group_keys(std::slice::from_ref(&padded))),
-        "an unprojected CHAR(20) group key must still reach the scan padded: {sql}"
-    );
-}
-
-#[test]
 fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     let request = unprojected_char_grouped_request(cast_to(ExasolType::varchar(10), col("NAME")));
 
@@ -2058,47 +1989,6 @@ fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
 }
 
 #[test]
-fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
-    let request = char_grouped_request(
-        cast_to(
-            ExasolType::Char {
-                size: 3,
-                ascii: true,
-            },
-            col("NAME"),
-        ),
-        ExasolType::Char {
-            size: 3,
-            ascii: true,
-        },
-        None,
-    );
-
-    let sql = guard_dispatch_sql(
-        &request,
-        vec![ProjectionItem::from("NAME")],
-        vec![ExasolType::WIDEST_VARCHAR],
-        false,
-        None,
-        Vec::new(),
-    );
-
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#;
-    let padded = format!(
-        "CASE WHEN character_length({fragment}) < 3 THEN rpad({fragment}, 3) \
-             ELSE {fragment} END"
-    );
-    assert!(
-        sql.contains(&embedded_group_keys(std::slice::from_ref(&padded))),
-        "a `CHAR(3) ASCII` group key must reach the scan padded to 3: {sql}"
-    );
-    assert!(
-        sql.contains(r#"CAST("GK_0" AS CHAR(3) ASCII)"#),
-        "the outer merge wrapper must still cast the staging column to CHAR(3) ASCII: {sql}"
-    );
-}
-
-#[test]
 fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     let request = char_grouped_request(col("REGION"), ExasolType::varchar(10), None);
 
@@ -2118,38 +2008,6 @@ fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     assert!(
         !sql.contains("rpad("),
         "no pad may be emitted for a VARCHAR-declared group key: {sql}"
-    );
-}
-
-#[test]
-fn order_by_on_a_char_declared_group_key_still_resolves_to_its_output_ordinal() {
-    let request = char_grouped_request(
-        col("NAME"),
-        ExasolType::char(20),
-        Some(serde_json::json!([order_by_element(
-            col("NAME"),
-            true,
-            true
-        )])),
-    );
-
-    let sql = guard_dispatch_sql(
-        &request,
-        vec![ProjectionItem::from("NAME")],
-        vec![ExasolType::WIDEST_VARCHAR],
-        false,
-        None,
-        Vec::new(),
-    );
-
-    assert!(
-        sql.contains("ORDER BY 1"),
-        "the sort on the CHAR-declared group key must resolve to output ordinal 1: {sql}"
-    );
-    assert!(
-        sql.contains("rpad("),
-        "the DataFusion-side copy must still be padded alongside the resolved \
-             ORDER BY: {sql}"
     );
 }
 

@@ -21,10 +21,29 @@ use tokio::net::TcpListener;
 // Named, not globbed: a local helper of the same name would silently shadow a glob import.
 pub(crate) use vs_expression::test_support::{
     agg_item, agg_item_expr, alias_col, aliased_col, and, between, binary_lit, bool_lit, case_when,
-    cast_json, col, compare, count_star, date_lit, extract, fixed_binary_lit, in_list, is_not_null,
-    is_null, like, lit, not, null_lit, num_lit, numbered_col, or, predicate_equal, scalar_fn,
-    str_lit, string_equal, table_col, table_column, timestamp_lit,
+    cast_json, cast_to, col, compare, count_star, date_lit, extract, fixed_binary_lit, in_list,
+    is_not_null, is_null, like, lit, not, null_lit, num_lit, numbered_col, or, predicate_equal,
+    scalar_fn, str_lit, string_equal, table_col, table_column, timestamp_lit,
 };
+
+/// #587 spike shims: the untyped DataFusion renderers are gone, so older tests render through
+/// the typed gate with no column type known.
+pub(crate) fn render_df_filter_safe(filter: &Json) -> Option<String> {
+    vs_expression::render_scan_filter(filter, &ColumnTypes::default())
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn render_expression_safe(expr: &Json) -> Option<String> {
+    vs_expression::render_scan_expression(expr, &ColumnTypes::default()).ok()
+}
+
+/// The scan's typed filter SQL, `None` when it declines or the filter is trivially true.
+pub(crate) fn scan_filter_sql(filter: &Json, col_types: &ColumnTypes) -> Option<String> {
+    super::support::scan_filter(filter, col_types)
+        .ok()
+        .flatten()
+}
 
 /// The table a single-table filter fixture qualifies its columns with, as Exasol does.
 pub(crate) const SALES: &str = "SALES";
@@ -412,11 +431,6 @@ pub(crate) fn inner_join(left: Json, right: Json, condition: Json) -> Json {
     serde_json::json!({
         "type": "join", "join_type": "inner", "left": left, "right": right, "condition": condition
     })
-}
-
-/// Exasol's `CAST(arg AS target)` node.
-pub(crate) fn cast_to(target: ExasolType, arg: Json) -> Json {
-    cast_json(exasol_type_to_json(&target), arg)
 }
 
 pub(crate) fn customer_orders_join() -> Json {
@@ -1499,13 +1513,6 @@ impl PushdownRequestBuilder {
 
     pub(crate) fn limit(self, num_elements: u64) -> Self {
         self.field("limit", serde_json::json!({"numElements": num_elements}))
-    }
-
-    /// `selectListDataTypes` as `raw` spells it, or absent for `None`, in place of the list the
-    /// item types derive: for a test that pins an absent, invalid, or miscounted list.
-    pub(crate) fn select_list_data_types(mut self, raw: Option<Json>) -> Self {
-        self.raw_select_list_data_types = Some(raw);
-        self
     }
 
     /// Any other `pushdownRequest` key, such as `having`, `from`, or `type`.

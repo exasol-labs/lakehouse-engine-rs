@@ -350,9 +350,9 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
 
     let pushdown =
         PushdownRequest::parse(req).expect("the request declares a valid selectListDataTypes");
-    let items = detect_aggregates(&pushdown)
+    let items = detect_aggregates(&pushdown, &ColumnTypes::default())
         .expect("SUM(col * col) must decompose to an aggregate plan, not a row scan");
-    let plans = ordinary_plans(&items);
+    let plans = ordinary_plans(&items, &ColumnTypes::default());
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0].kind, AggKind::Sum);
     assert!(

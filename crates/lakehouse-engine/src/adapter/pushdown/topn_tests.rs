@@ -32,18 +32,24 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
         "plan_scan_sql mirrors only the no-decline dispatch path; a declined-filter fixture needs build_dispatch_sql, not this helper"
     );
 
-    let items = detect_aggregates(&pushdown)
-        .filter(|it| validate_agg_col_types(&ordinary_plans(it), &column_types(&col_types)));
+    let items = detect_aggregates(&pushdown, &ColumnTypes::default()).filter(|it| {
+        validate_agg_col_types(
+            &ordinary_plans(it, &ColumnTypes::default()),
+            &column_types(&col_types),
+        )
+    });
     let merge_inputs = items.as_deref().map(|it| {
-        let plans = ordinary_plans(it);
-        let plan_types = single_group_plan_types(pushdown.select_types(), it);
+        let plans = ordinary_plans(it, &ColumnTypes::default());
+        let plan_types =
+            single_group_plan_types(pushdown.select_types(), it, &ColumnTypes::default())
+                .expect("plan_scan_sql mirrors only fixtures whose aggregates are exactly typed");
         let merge_select =
             single_group_merge_select(it, &plans, &plan_types, &column_types(&col_types))
                 .expect("plan_scan_sql mirrors only fixtures whose merge SELECT assembles in full");
         AggregateMergeInputs::new(plan_types, merge_select, limit)
             .expect("one merge item per select-list item is never empty")
     });
-    let aggregates = items.map(|it| ordinary_plans(&it));
+    let aggregates = items.map(|it| ordinary_plans(&it, &ColumnTypes::default()));
     // An aggregate select list always widens (aggregates stay off the projection), and
     // production guards widening only on the `RowScan` arm.
     assert!(

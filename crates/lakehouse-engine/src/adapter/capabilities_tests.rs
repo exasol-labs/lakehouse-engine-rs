@@ -49,8 +49,11 @@ fn reports_group_by_capabilities() {
     .count_star()
     .column(col("YEAR"))
     .build_pushdown();
-    let detection = crate::adapter::pushdown::detect_group_by_aggregates(&multi_key_group_by)
-        .expect("multi-key GROUP BY must be detected by the backing pushdown path");
+    let detection = crate::adapter::pushdown::detect_group_by_aggregates(
+        &multi_key_group_by,
+        &crate::adapter::pushdown::ColumnTypes::default(),
+    )
+    .expect("multi-key GROUP BY must be detected by the backing pushdown path");
     assert_eq!(
         detection.group_keys.len(),
         2,

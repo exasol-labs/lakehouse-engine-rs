@@ -1,9 +1,9 @@
+use crate::adapter::pushdown::test_support::render_df_filter_safe;
 use crate::adapter::pushdown::test_support::{
     alias_col, and, between, binary_lit, column_types_under, compare, declared_column_types,
     fixed_binary_lit, in_list, not, nullable_field as field, or, predicate_equal, sales_col,
     sales_equal, str_lit,
 };
-use vs_expression::render_df_filter_safe;
 
 use super::*;
 use crate::types::exasol_type::ExasolType;

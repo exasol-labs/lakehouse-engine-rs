@@ -1553,7 +1553,7 @@ fn e2e_order_by_column_referenced_only_in_projected_expression() {
 
 // Exasol's DECIMAL→VARCHAR conversion trims trailing scale zeros and drops an all-zero
 // fraction (`30.00` → `"30"`) (#211). Expected strings come from an independent Rust
-// oracle, never from the production `format_decimal_exasol_style`.
+// oracle.
 
 const TYPED_DECIMAL_A_UNSCALED: [(i64, Option<i128>); 12] = [
     (1, Some(1050)),
@@ -1570,7 +1570,7 @@ const TYPED_DECIMAL_A_UNSCALED: [(i64, Option<i128>); 12] = [
     (12, Some(3000)),
 ];
 
-/// From scratch, not `format_decimal_exasol_style`, so it is an independent oracle.
+/// From scratch, so it is an independent oracle.
 fn exasol_trim_decimal_string(unscaled: i128, scale: u32) -> String {
     let negative = unscaled < 0;
     let digits = unscaled.unsigned_abs().to_string();
@@ -2367,7 +2367,7 @@ fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
          back to the raw-row wrapper, got:\n{pushed2}"
     );
     assert!(
-        pushed2.contains("ORDER BY SUM(\"PARTIAL_sum_"),
+        pushed2.contains("ORDER BY CAST(SUM(\"PARTIAL_sum_"),
         "the merge ORDER BY must reference the merged partial column, not a \
          base column, got:\n{pushed2}"
     );
@@ -3483,6 +3483,14 @@ fn over_length_char_group_key_raises_truncation_error_like_native() {
         "expected Exasol's UDF-emit truncation error (sqlCode 22002, \"string \
          data, right truncation\"), got sqlCode={sql_code:?} message={message:?}: {resp}"
     );
+
+    query_error(
+        &mut conn,
+        &format!(
+            "SELECT COUNT(*) c FROM {} GROUP BY CAST({CHAR_PAD_COL} AS CHAR(20))",
+            vs_char_pad_table()
+        ),
+    );
 }
 
 #[test]
@@ -3566,6 +3574,205 @@ fn e2e_float_div_decimal_over_decimal_matches_native_oracle() {
         "pushed-down C_DECIMAL_A/C_DECIMAL_B at id=6 must match the native \
          oracle {oracle_value} (decimal/decimal FLOAT_DIV must not truncate \
          to scale 6), got {vs_value}"
+    );
+}
+
+/// `None` leaves the path unasserted, for a shape whose routing Exasol decides.
+const SPLIT_AGGREGATE_CASES: &[(&str, Option<bool>)] = &[
+    ("SELECT LENGTH(MAX(UPPER(C_VARCHAR))) FROM {T}", Some(false)),
+    (
+        "SELECT C_BOOL, LENGTH(MAX(UPPER(C_VARCHAR))) FROM {T} GROUP BY C_BOOL",
+        Some(false),
+    ),
+    ("SELECT MAX(UPPER(C_VARCHAR)) || '!' FROM {T}", Some(false)),
+    (
+        "SELECT MIN(LOWER(C_VARCHAR)) || MAX(UPPER(C_VARCHAR)) FROM {T}",
+        Some(false),
+    ),
+    (
+        "SELECT CASE WHEN MAX(CASE WHEN C_VARCHAR = 'aa' THEN 'Y' ELSE 'N' END) = 'Y' \
+         THEN 1 ELSE 0 END FROM {T}",
+        Some(false),
+    ),
+    (
+        "SELECT YEAR(MAX(DATE_TRUNC('month', C_DATE))) FROM {T}",
+        Some(false),
+    ),
+    (
+        "SELECT C_BOOL, YEAR(MAX(DATE_TRUNC('month', C_DATE))) FROM {T} GROUP BY C_BOOL",
+        Some(false),
+    ),
+    (
+        "SELECT ROUND(SUM(C_DECIMAL_B * C_DECIMAL_B), 8) FROM {T}",
+        Some(false),
+    ),
+    (
+        "SELECT C_BOOL, ROUND(SUM(C_DECIMAL_B * C_DECIMAL_B), 8) FROM {T} GROUP BY C_BOOL",
+        Some(false),
+    ),
+    (
+        "SELECT MAX(C_DOUBLE * 2) + 1, SUM(C_DOUBLE * 3) + 1 FROM {T}",
+        Some(false),
+    ),
+    (
+        "SELECT 'X', LENGTH(MAX(UPPER(C_VARCHAR))) FROM {T}",
+        Some(false),
+    ),
+    (
+        "SELECT MONTH(MIN(CAST(C_DATE AS TIMESTAMP))) FROM {T}",
+        Some(true),
+    ),
+    (
+        "SELECT MAX(UPPER(C_VARCHAR)), LENGTH(MAX(UPPER(C_VARCHAR))) FROM {T}",
+        Some(true),
+    ),
+    (
+        "SELECT LENGTH(MAX(C_VARCHAR)), YEAR(MAX(C_DATE)) FROM {T}",
+        Some(true),
+    ),
+    ("SELECT AVG(LENGTH(C_VARCHAR)) FROM {T}", Some(true)),
+    ("SELECT COUNT(UPPER(C_VARCHAR)) * 2 FROM {T}", Some(true)),
+    ("SELECT SUM(C_DECIMAL_B) / 2 FROM {T}", Some(true)),
+    (
+        "SELECT C_BOOL, SUM(C_DECIMAL_B) / 2 FROM {T} GROUP BY C_BOOL",
+        Some(true),
+    ),
+    (
+        "SELECT C_DECIMAL_A, COUNT(*) FROM {T} GROUP BY C_DECIMAL_A ORDER BY C_DECIMAL_A",
+        Some(true),
+    ),
+    (
+        "SELECT C_DOUBLE, COUNT(*) FROM {T} GROUP BY C_DOUBLE ORDER BY C_DOUBLE DESC",
+        Some(true),
+    ),
+    (
+        "SELECT (C_DOUBLE - 2) * 0, COUNT(*) FROM {T} GROUP BY (C_DOUBLE - 2) * 0",
+        Some(true),
+    ),
+    (
+        "SELECT C_VARCHAR, COUNT(*) FROM {T} GROUP BY C_VARCHAR HAVING C_VARCHAR > 'b'",
+        None,
+    ),
+    (
+        "SELECT C_DATE, COUNT(*) FROM {T} GROUP BY C_DATE ORDER BY C_DATE",
+        Some(true),
+    ),
+    (
+        "SELECT C_TS, COUNT(*) FROM {T} GROUP BY C_TS ORDER BY 1 DESC",
+        Some(true),
+    ),
+    (
+        "SELECT C_BOOL, COUNT(*) FROM {T} GROUP BY C_BOOL HAVING COUNT(*) > 1",
+        Some(true),
+    ),
+    (
+        "SELECT C_BOOL, C_DATE, SUM(C_QTY) FROM {T} GROUP BY C_BOOL, C_DATE ORDER BY 2, 1",
+        Some(true),
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY C_DOUBLE ORDER BY C_DOUBLE",
+        Some(true),
+    ),
+    (
+        "SELECT UPPER(C_VARCHAR), COUNT(*) FROM {T} GROUP BY UPPER(C_VARCHAR)",
+        Some(true),
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} GROUP BY UPPER(C_VARCHAR)",
+        Some(false),
+    ),
+];
+
+/// Over the CHAR pad table. The scan declines a CAST to CHAR, so each case takes the wrapper.
+const CHAR_CAST_SPLIT_CASES: &[(&str, Option<bool>)] = &[
+    (
+        "SELECT CAST(VAL AS CHAR(4)), COUNT(*) FROM {T} \
+         WHERE VAL <> 'over-length-value-abcdefg' GROUP BY CAST(VAL AS CHAR(4))",
+        Some(false),
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} \
+         WHERE VAL <> 'over-length-value-abcdefg' GROUP BY CAST(VAL AS CHAR(4))",
+        Some(false),
+    ),
+    (
+        "SELECT CAST(VAL AS CHAR(4)) FROM {T} WHERE VAL = 'ab   '",
+        Some(false),
+    ),
+];
+
+/// `NATIVE_COPY` holds a native copy of `table`, which each query names as `{T}`.
+fn split_aggregate_failures(
+    conn: &mut ExaConn,
+    table: &str,
+    cases: &[(&str, Option<bool>)],
+) -> Vec<String> {
+    cases
+        .iter()
+        .filter_map(|(query, split)| split_aggregate_mismatch(conn, table, query, *split))
+        .collect()
+}
+
+fn split_aggregate_mismatch(
+    conn: &mut ExaConn,
+    table: &str,
+    query: &str,
+    split: Option<bool>,
+) -> Option<String> {
+    let vs_query = query.replace("{T}", table);
+    let read = |conn: &mut ExaConn, sql: &str| {
+        let (types, mut rows) = typed_result(conn, sql);
+        if !sql.contains("ORDER BY") {
+            rows.sort();
+        }
+        (types, rows)
+    };
+    let actual = read(conn, &vs_query);
+    let expected = read(conn, &query.replace("{T}", NATIVE_COPY));
+    if actual != expected {
+        return Some(format!(
+            "`{query}`: got {actual:?}, the oracle {expected:?}"
+        ));
+    }
+    let split = split?;
+    let plan = isolated_pushdown_statement(conn, &vs_query);
+    let holds = if split {
+        plan.contains("PARTIAL_")
+    } else {
+        has_n_scan_wrapper(&plan, 1) && !plan.contains("PARTIAL_")
+    };
+    (!holds).then(|| format!("`{query}` took the wrong path (split: {split}): {plan}"))
+}
+
+/// Scenario: A nested aggregate over an expression declines the split
+/// Scenario: A nested aggregate takes the result type Exasol gives it
+/// Scenario: A merged aggregate under a scalar keeps its native type
+/// Scenario: A group key travels with its exact type
+/// Scenario: An unprojected bare-column group key takes its column type
+/// Scenario: An unprojected group key without an exact type declines the split
+#[test]
+fn e2e_split_aggregate_columns_match_native_oracle() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+
+    let typed = typed_table();
+    create_native_copy(&mut conn, &typed, TYPED_COLUMNS);
+    let mut failures = split_aggregate_failures(&mut conn, &typed, SPLIT_AGGREGATE_CASES);
+
+    let char_pad = vs_char_pad_table();
+    create_full_native_copy(&mut conn, &char_pad);
+    failures.extend(split_aggregate_failures(
+        &mut conn,
+        &char_pad,
+        CHAR_CAST_SPLIT_CASES,
+    ));
+
+    assert!(
+        failures.is_empty(),
+        "{} of {} split-aggregate cases failed:\n{}",
+        failures.len(),
+        SPLIT_AGGREGATE_CASES.len() + CHAR_CAST_SPLIT_CASES.len(),
+        failures.join("\n")
     );
 }
 

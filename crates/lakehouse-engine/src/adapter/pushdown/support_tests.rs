@@ -3,58 +3,6 @@ use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, SortKey, StorageProps};
 use crate::scan::test_support::WithFiles;
-use vs_expression::{render_df_filter_safe, strip_table_alias};
-
-#[test]
-fn datafusion_renderable_true_for_a_rendering_predicate() {
-    let expr = compare("predicate_greater", col("AGE"), num_lit(18));
-
-    assert!(datafusion_renderable(&expr));
-}
-
-#[test]
-fn datafusion_renderable_false_for_second_with_precision_arity_decline() {
-    let expr = scalar_fn("SECOND", [col("TS"), num_lit(3)]);
-
-    assert!(!datafusion_renderable(&expr));
-}
-
-#[test]
-fn datafusion_renderable_true_for_trivially_true_literal() {
-    let expr = bool_lit(true);
-
-    assert!(datafusion_renderable(&expr));
-}
-
-#[test]
-fn datafusion_renderable_answer_unchanged_by_strip_table_alias() {
-    let mut with_alias = scalar_fn("SECOND", [aliased_col("T", "O", "TS"), num_lit(3)]);
-    with_alias["tableAlias"] = "O".into();
-    let stripped = strip_table_alias(&with_alias);
-
-    assert_eq!(
-        datafusion_renderable(&with_alias),
-        datafusion_renderable(&stripped),
-        "stripping tableAlias must not change whether the DataFusion dialect accepts the predicate"
-    );
-    assert!(
-        !datafusion_renderable(&stripped),
-        "SECOND(ts, 3) must still decline once table-alias-stripped"
-    );
-
-    let renders_with_alias = compare("predicate_greater", aliased_col("T", "O", "TS"), num_lit(1));
-    let renders_stripped = strip_table_alias(&renders_with_alias);
-
-    assert_eq!(
-        datafusion_renderable(&renders_with_alias),
-        datafusion_renderable(&renders_stripped),
-        "stripping tableAlias must not change whether a RENDERING predicate is still accepted"
-    );
-    assert!(
-        datafusion_renderable(&renders_stripped),
-        "TS > 1 must still render once table-alias-stripped"
-    );
-}
 
 fn delete_spec_template() -> ScanSpec {
     CommonScanSpec {
@@ -1173,7 +1121,7 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
         .build();
     let pushdown = parsed_pushdown(&request);
 
-    let items = super::super::detect_aggregates(&pushdown)
+    let items = super::super::detect_aggregates(&pushdown, &ColumnTypes::default())
         .expect("two COUNT(DISTINCT) items are detected as distinct fan-out descriptors");
     assert!(
         has_distinct(&items),
@@ -1763,67 +1711,6 @@ fn selectlist_bare_literal_does_not_fall_back_to_full_row() {
 }
 
 #[test]
-fn selectlist_tstz_literal_widens_via_emits_type_gate() {
-    let literal = lit("literal_timestamp_utc", "2024-03-01 10:00:00");
-    assert!(
-        render_expression_safe(&literal).is_some(),
-        "literal_timestamp_utc must render via render_expression_safe"
-    );
-    let (proj_cols, proj_types, widened) = projected(id_name_request().item(
-        literal,
-        ExasolType::TimestampWithLocalTimeZone { precision: 3 },
-    ));
-    assert!(
-        widened,
-        "a TIMESTAMP WITH LOCAL TIME ZONE literal must widen the projection \
-         so the RowScan dispatcher routes it to the qualified wrapper"
-    );
-    assert_eq!(
-        proj_cols,
-        vec![
-            ProjectionItem::Column("ID".into()),
-            ProjectionItem::Column("NAME".into()),
-        ],
-        "a TIMESTAMP WITH LOCAL TIME ZONE literal must widen to the full base row: {proj_cols:?}"
-    );
-    assert_eq!(
-        proj_types,
-        vec![ExasolType::decimal(10, 0), ExasolType::varchar(100)]
-    );
-}
-
-#[test]
-fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
-    let literal = lit("literal_timestamputc", "2024-03-01 10:00:00");
-    assert!(
-        render_expression_safe(&literal).is_none(),
-        "the DataFusion dialect must keep declining the real wire name (#242): \
-         a render here would silently start pushing TSTZ predicates into the \
-         scan filter"
-    );
-    let (proj_cols, proj_types, widened) = projected(id_name_request().item(
-        literal,
-        ExasolType::TimestampWithLocalTimeZone { precision: 3 },
-    ));
-    assert!(
-        widened,
-        "the real-wire-name TSTZ literal must widen the projection so the \
-         RowScan dispatcher routes it to the qualified wrapper"
-    );
-    assert_eq!(
-        proj_cols,
-        vec![
-            ProjectionItem::Column("ID".into()),
-            ProjectionItem::Column("NAME".into()),
-        ]
-    );
-    assert_eq!(
-        proj_types,
-        vec![ExasolType::decimal(10, 0), ExasolType::varchar(100)]
-    );
-}
-
-#[test]
 fn selectlist_plain_timestamp_literal_rendered_as_expr() {
     let literal = timestamp_lit("2024-03-01 10:00:00");
     let (proj_cols, proj_types, _widened) = projected(
@@ -1936,243 +1823,6 @@ fn filter_in_common_arg() {
     );
 }
 
-/// Scenario: LIKE on a VARCHAR or CHAR column pushes down unchanged
-#[test]
-fn like_guard_varchar_subject_unchanged() {
-    let filter = like(col("name"), "A%");
-    let col_types = vec![("NAME".to_string(), ExasolType::WIDEST_VARCHAR)];
-
-    let result = like_subject_type_guard(&filter, &column_types(&col_types));
-    assert_eq!(
-        result,
-        Some(filter),
-        "VARCHAR subject must be returned unchanged"
-    );
-}
-
-/// Scenario: LIKE on a VARCHAR or CHAR column pushes down unchanged
-#[test]
-fn like_guard_char_subject_unchanged() {
-    let filter = like(col("code"), "A%");
-    let col_types = vec![(
-        "CODE".to_string(),
-        ExasolType::Char {
-            size: 3,
-            ascii: true,
-        },
-    )];
-
-    let result = like_subject_type_guard(&filter, &column_types(&col_types));
-    assert_eq!(
-        result,
-        Some(filter),
-        "CHAR subject must be returned unchanged"
-    );
-}
-
-/// Scenario: LIKE on a DATE column pushes down wrapped in CAST-to-VARCHAR
-#[test]
-fn like_guard_date_subject_wraps_cast() {
-    let column = col("signup_date");
-    let filter = like(column.clone(), "2024%");
-    let col_types = vec![("SIGNUP_DATE".to_string(), ExasolType::Date)];
-
-    let result = like_subject_type_guard(&filter, &column_types(&col_types));
-    let expected = like(cast_to(ExasolType::WIDEST_VARCHAR, column), "2024%");
-    assert_eq!(
-        result,
-        Some(expected),
-        "DATE subject must be rewrapped in CAST(<col> AS VARCHAR)"
-    );
-}
-
-/// Scenario: LIKE on a DECIMAL column declines the whole filter
-#[test]
-fn like_guard_decimal_subject_declines() {
-    let filter = like(col("amount"), "9%");
-    let col_types = vec![("AMOUNT".to_string(), ExasolType::decimal(9, 2))];
-
-    let result = like_subject_type_guard(&filter, &column_types(&col_types));
-    assert_eq!(
-        result, None,
-        "DECIMAL subject must decline the whole filter"
-    );
-}
-
-#[test]
-fn type_rewrite_pipeline_runs_like_guard() {
-    let filter = like(col("amount"), "9%");
-    let col_types = vec![("AMOUNT".to_string(), ExasolType::decimal(9, 2))];
-
-    assert_eq!(
-        apply_type_rewrites(&filter, &column_types(&col_types)),
-        None,
-        "the type-rewrite pipeline's LIKE-subject guard must decline a DECIMAL subject"
-    );
-}
-
-#[test]
-fn overprecise_timestamp_literal_is_rewritten_to_the_column_precision() {
-    let col_types = vec![("TS".to_string(), ExasolType::timestamp(3))];
-    let lit = timestamp_lit("2025-06-01 00:00:00.123500");
-    let floor = timestamp_lit("2025-06-01 00:00:00.123");
-    for (op, mirrored, want_op, want_right) in [
-        ("predicate_equal", false, "predicate_notequal", col("ts")),
-        ("predicate_notequal", false, "predicate_equal", col("ts")),
-        (
-            "predicate_less",
-            false,
-            "predicate_lessequal",
-            floor.clone(),
-        ),
-        (
-            "predicate_lessequal",
-            false,
-            "predicate_lessequal",
-            floor.clone(),
-        ),
-        (
-            "predicate_greater",
-            false,
-            "predicate_greater",
-            floor.clone(),
-        ),
-        (
-            "predicate_greaterequal",
-            false,
-            "predicate_greater",
-            floor.clone(),
-        ),
-        ("predicate_less", true, "predicate_greater", floor.clone()),
-        (
-            "predicate_greaterequal",
-            true,
-            "predicate_lessequal",
-            floor.clone(),
-        ),
-    ] {
-        let filter = if mirrored {
-            compare(op, lit.clone(), col("ts"))
-        } else {
-            compare(op, col("ts"), lit.clone())
-        };
-        assert_eq!(
-            apply_type_rewrites(&filter, &column_types(&col_types)),
-            Some(compare(want_op, col("ts"), want_right)),
-            "{op} mirrored={mirrored}"
-        );
-    }
-}
-
-#[test]
-fn timestamp_literal_within_the_column_precision_is_unchanged() {
-    for (declared, value) in [
-        (ExasolType::BARE_TIMESTAMP, "2025-06-01 00:00:00.123000"),
-        (ExasolType::timestamp(6), "2025-06-01 00:00:00.123456"),
-        (ExasolType::timestamp(9), "2025-06-01 00:00:00.123456789"),
-        (ExasolType::timestamp(3), "2025-06-01 00:00:00"),
-    ] {
-        let col_types = vec![("TS".to_string(), declared)];
-        let filter = predicate_equal(col("ts"), timestamp_lit(value));
-        assert_eq!(
-            apply_type_rewrites(&filter, &column_types(&col_types)),
-            Some(filter.clone()),
-            "{declared} = {value}"
-        );
-    }
-}
-
-#[test]
-fn between_and_in_with_an_overprecise_timestamp_expand_to_rewritten_comparisons() {
-    let col_types = vec![("TS".to_string(), ExasolType::timestamp(3))];
-    let fits = || timestamp_lit("2025-06-01 00:00:00.122");
-    let over = || timestamp_lit("2025-06-01 00:00:00.123500");
-    let floor = || timestamp_lit("2025-06-01 00:00:00.123");
-
-    let bounded = between(col("ts"), fits(), over());
-    assert_eq!(
-        apply_type_rewrites(&bounded, &column_types(&col_types)),
-        Some(and([
-            compare("predicate_greaterequal", col("ts"), fits()),
-            compare("predicate_lessequal", col("ts"), floor())
-        ]))
-    );
-
-    let listed = in_list(col("ts"), [over(), fits()]);
-    assert_eq!(
-        apply_type_rewrites(&listed, &column_types(&col_types)),
-        Some(or([
-            compare("predicate_notequal", col("ts"), col("ts")),
-            predicate_equal(col("ts"), fits())
-        ]))
-    );
-
-    let fitting_in = in_list(col("ts"), [fits()]);
-    assert_eq!(
-        apply_type_rewrites(&fitting_in, &column_types(&col_types)),
-        Some(fitting_in.clone())
-    );
-}
-
-/// Scenario: LIKE on an integer column declines the whole filter
-#[test]
-fn like_guard_integer_subject_declines() {
-    let filter = like(col("quantity"), "1%");
-    let col_types = vec![("QUANTITY".to_string(), ExasolType::decimal(20, 0))];
-
-    let result = like_subject_type_guard(&filter, &column_types(&col_types));
-    assert_eq!(
-        result, None,
-        "integer (DECIMAL(20,0)) subject must decline the whole filter"
-    );
-}
-
-/// Scenario: LIKE on a non-column subject is left untouched
-#[test]
-fn like_guard_non_column_subject_untouched() {
-    let filter = like(scalar_fn("UPPER", [col("amount")]), "A%");
-    let col_types = vec![("AMOUNT".to_string(), ExasolType::decimal(9, 2))];
-
-    let result = like_subject_type_guard(&filter, &column_types(&col_types));
-    assert_eq!(
-        result,
-        Some(filter),
-        "non-column LIKE subject must be left unchanged"
-    );
-}
-
-/// Scenario: LIKE on a bare column whose type cannot be resolved declines the whole filter
-#[test]
-fn like_guard_unresolvable_column_declines() {
-    let filter = like(col("mystery"), "A%");
-    let col_types = vec![("OTHER".to_string(), ExasolType::WIDEST_VARCHAR)];
-
-    let result = like_subject_type_guard(&filter, &column_types(&col_types));
-    assert_eq!(
-        result, None,
-        "unresolvable column subject must decline the whole filter"
-    );
-}
-
-/// Scenario: A nested non-string LIKE declines the entire enclosing filter
-#[test]
-fn like_guard_nested_decimal_declines_whole_filter() {
-    let filter = and([
-        predicate_equal(col("status"), str_lit("OPEN")),
-        and([like(col("amount"), "9%")]),
-    ]);
-    let col_types = vec![
-        ("STATUS".to_string(), ExasolType::WIDEST_VARCHAR),
-        ("AMOUNT".to_string(), ExasolType::decimal(9, 2)),
-    ];
-
-    let result = like_subject_type_guard(&filter, &column_types(&col_types));
-    assert_eq!(
-        result, None,
-        "a nested non-string LIKE must decline the whole top-level filter"
-    );
-}
-
 /// Asserts the fixture genuinely declines, since a quietly rendering fixture would
 /// assert nothing.
 fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, ExasolType)]) -> String {
@@ -2260,69 +1910,6 @@ fn declined_like_on_unresolvable_column_routes_to_wrapper_where() {
 }
 
 #[test]
-fn like_guard_not_wrapped_decimal_declines() {
-    let filter = not(like(col("amount"), "9%"));
-    let col_types = vec![("AMOUNT".to_string(), ExasolType::decimal(9, 2))];
-
-    let result = like_subject_type_guard(&filter, &column_types(&col_types));
-    assert_eq!(
-        result, None,
-        "a DECIMAL LIKE inside predicate_not must decline the whole filter"
-    );
-}
-
-#[test]
-fn like_guard_decimal_inside_case_declines() {
-    let filter = case_when([like(col("amount"), "9%")], [num_lit(1), num_lit(0)]);
-    let col_types = vec![("AMOUNT".to_string(), ExasolType::decimal(9, 2))];
-
-    let result = like_subject_type_guard(&filter, &column_types(&col_types));
-    assert_eq!(
-        result, None,
-        "a DECIMAL LIKE buried in a function_scalar_case's arguments must decline \
-         the whole filter: {result:?}"
-    );
-}
-
-#[test]
-fn like_guard_date_inside_case_wraps_cast() {
-    let column = col("signup_date");
-    let then_branch = num_lit(1);
-    let else_branch = num_lit(0);
-    let filter = case_when(
-        [like(column.clone(), "2024%")],
-        [then_branch.clone(), else_branch.clone()],
-    );
-    let col_types = vec![("SIGNUP_DATE".to_string(), ExasolType::Date)];
-
-    let result = like_subject_type_guard(&filter, &column_types(&col_types));
-    let expected = case_when(
-        [like(cast_to(ExasolType::WIDEST_VARCHAR, column), "2024%")],
-        [then_branch, else_branch],
-    );
-    assert_eq!(
-        result,
-        Some(expected),
-        "a DATE LIKE buried in a function_scalar_case's arguments must be rewrapped \
-         in CAST(<col> AS VARCHAR) in place, with the CASE's results preserved: {result:?}"
-    );
-}
-
-#[test]
-fn like_guard_varchar_inside_case_unchanged() {
-    let filter = case_when([like(col("name"), "A%")], [num_lit(1), num_lit(0)]);
-    let col_types = vec![("NAME".to_string(), ExasolType::varchar(20))];
-
-    let result = like_subject_type_guard(&filter, &column_types(&col_types));
-    assert_eq!(
-        result,
-        Some(filter),
-        "a VARCHAR LIKE buried in a function_scalar_case's arguments must be \
-         returned unchanged: {result:?}"
-    );
-}
-
-#[test]
 fn expr_tree_applies_f_to_children_before_their_parent() {
     let tree = serde_json::json!({
         "type": "outer",
@@ -2336,37 +1923,13 @@ fn expr_tree_applies_f_to_children_before_their_parent() {
         } else {
             out["child_type_seen"] = node["expression"]["type"].clone();
         }
-        Some(out)
-    })
-    .expect("an always-Some closure must never decline");
+        out
+    });
 
     assert_eq!(
         out["child_type_seen"],
         Json::from("inner_rewritten"),
         "the parent must see its already-rewritten child: {out}"
-    );
-}
-
-#[test]
-fn expr_tree_decline_deep_in_the_tree_propagates_to_the_root() {
-    let tree = serde_json::json!({
-        "type": "root",
-        "expressions": [
-            {"type": "keep"},
-            {"type": "branch", "left": {"type": "decline_here"}},
-        ],
-    });
-
-    let out = rewrite_expr_tree(&tree, &|node| {
-        if node.get("type").and_then(|t| t.as_str()) == Some("decline_here") {
-            return None;
-        }
-        Some(node.clone())
-    });
-
-    assert_eq!(
-        out, None,
-        "a declined descendant must decline the whole tree"
     );
 }
 
@@ -2384,9 +1947,8 @@ fn expr_tree_recurses_only_into_curated_fields_of_the_expected_shape() {
     let out = rewrite_expr_tree(&tree, &|node| {
         let mut out = node.clone();
         out["visited"] = Json::Bool(true);
-        Some(out)
-    })
-    .expect("an always-Some closure must never decline");
+        out
+    });
 
     assert_eq!(
         out["expression"]["visited"],
@@ -2421,8 +1983,8 @@ fn expr_tree_applies_f_to_a_non_object_node() {
         serde_json::json!([1, 2]),
     ] {
         assert_eq!(
-            rewrite_expr_tree(&leaf, &|_| Some(Json::from("touched"))),
-            Some(Json::from("touched")),
+            rewrite_expr_tree(&leaf, &|_| Json::from("touched")),
+            Json::from("touched"),
             "a non-object node must be handed to `f`: {leaf}"
         );
     }
@@ -2442,208 +2004,6 @@ fn decimal_rewrite_col_types() -> Vec<(String, ExasolType)> {
 
 fn decimal_column() -> Json {
     col("c_decimal_a")
-}
-
-#[test]
-fn decimal_rewrite_passes_through_non_object_node() {
-    let col_types = decimal_rewrite_col_types();
-    for node in [
-        Json::Null,
-        serde_json::json!("UPPER"),
-        serde_json::json!(7),
-        serde_json::json!([1, 2]),
-    ] {
-        assert_eq!(
-            rewrite_decimal_stringifications(&node, &column_types(&col_types)),
-            node.clone(),
-            "a non-object node must be passed through: {node}"
-        );
-    }
-}
-
-#[test]
-fn rewrite_cast_decimal_to_varchar_replaces_whole_node() {
-    let node = cast_to(ExasolType::WIDEST_VARCHAR, decimal_column());
-    let out = rewrite_decimal_stringifications(&node, &column_types(&decimal_rewrite_col_types()));
-
-    assert_eq!(
-        out.get("type").and_then(|t| t.as_str()),
-        Some("decimal_to_varchar_exasol"),
-        "the whole CAST node must be replaced, not nested: {out}"
-    );
-    let inner = &out["arguments"][0];
-    assert_eq!(
-        inner.get("name").and_then(|n| n.as_str()),
-        Some("c_decimal_a"),
-        "the wrapped node must be the original column: {out}"
-    );
-    let sql = render_expression_safe(&out).expect("must render");
-    assert!(
-        sql.contains(r#"CAST("C_DECIMAL_A" AS VARCHAR)"#) && sql.contains("regexp_replace"),
-        "must render via format_decimal_exasol_style: {sql}"
-    );
-}
-
-#[test]
-fn rewrite_cast_decimal_to_char_replaces_whole_node() {
-    let node = cast_to(ExasolType::char(20), decimal_column());
-    let out = rewrite_decimal_stringifications(&node, &column_types(&decimal_rewrite_col_types()));
-    assert_eq!(
-        out.get("type").and_then(|t| t.as_str()),
-        Some("decimal_to_varchar_exasol"),
-        "CAST AS CHAR over a DECIMAL column must also be rewritten: {out}"
-    );
-}
-
-#[test]
-fn rewrite_nested_concat_wraps_only_inner_decimal() {
-    let node = scalar_fn(
-        "CONCAT",
-        [
-            col("id"),
-            scalar_fn("CONCAT", [str_lit("-"), col("c_decimal_a")]),
-        ],
-    );
-    let out = rewrite_decimal_stringifications(&node, &column_types(&decimal_rewrite_col_types()));
-
-    // ID is DECIMAL(20,0), so as a direct outer-CONCAT argument it is wrapped too.
-    assert_eq!(out.get("name").and_then(|n| n.as_str()), Some("CONCAT"));
-    let outer_args = out["arguments"].as_array().unwrap();
-    assert_eq!(
-        outer_args.len(),
-        2,
-        "outer CONCAT arg count preserved: {out}"
-    );
-
-    let inner = &outer_args[1];
-    assert_eq!(inner.get("name").and_then(|n| n.as_str()), Some("CONCAT"));
-    let inner_args = inner["arguments"].as_array().unwrap();
-    assert_eq!(
-        inner_args[0].get("type").and_then(|t| t.as_str()),
-        Some("literal_string"),
-        "the '-' literal must be untouched: {out}"
-    );
-    assert_eq!(
-        inner_args[1].get("type").and_then(|t| t.as_str()),
-        Some("decimal_to_varchar_exasol"),
-        "the inner C_DECIMAL_A must be wrapped (post-order recursion reached it): {out}"
-    );
-    assert_eq!(
-        inner_args[1]["arguments"][0]
-            .get("name")
-            .and_then(|n| n.as_str()),
-        Some("c_decimal_a"),
-    );
-}
-
-#[test]
-fn rewrite_concat_wraps_only_decimal_leaves_varchar() {
-    let node = scalar_fn("CONCAT", [col("name"), col("c_decimal_a")]);
-    let out = rewrite_decimal_stringifications(&node, &column_types(&decimal_rewrite_col_types()));
-    let args = out["arguments"].as_array().unwrap();
-    assert_eq!(
-        args[0].get("type").and_then(|t| t.as_str()),
-        Some("column"),
-        "the VARCHAR column must stay a bare column: {out}"
-    );
-    assert_eq!(
-        args[1].get("type").and_then(|t| t.as_str()),
-        Some("decimal_to_varchar_exasol"),
-        "the DECIMAL column must be wrapped: {out}"
-    );
-}
-
-#[test]
-fn rewrite_length_wraps_decimal_argument() {
-    let node = scalar_fn("LENGTH", [decimal_column()]);
-    let out = rewrite_decimal_stringifications(&node, &column_types(&decimal_rewrite_col_types()));
-    assert_eq!(out.get("name").and_then(|n| n.as_str()), Some("LENGTH"));
-    assert_eq!(
-        out["arguments"][0].get("type").and_then(|t| t.as_str()),
-        Some("decimal_to_varchar_exasol"),
-        "LENGTH's DECIMAL argument must be wrapped: {out}"
-    );
-}
-
-#[test]
-fn rewrite_non_decimal_argument_unchanged() {
-    let col_types = decimal_rewrite_col_types();
-
-    let cast_varchar = cast_to(ExasolType::WIDEST_VARCHAR, col("name"));
-    assert_eq!(
-        rewrite_decimal_stringifications(&cast_varchar, &column_types(&col_types)),
-        cast_varchar,
-        "CAST of a VARCHAR column must be unchanged"
-    );
-
-    let length_date = scalar_fn("LENGTH", [col("d")]);
-    assert_eq!(
-        rewrite_decimal_stringifications(&length_date, &column_types(&col_types)),
-        length_date,
-        "LENGTH of a DATE column must be unchanged"
-    );
-}
-
-#[test]
-fn rewrite_computed_expression_argument_unchanged() {
-    let computed = scalar_fn("MULT", [decimal_column(), num_lit(2)]);
-    let col_types = decimal_rewrite_col_types();
-
-    let cast = cast_to(ExasolType::WIDEST_VARCHAR, computed.clone());
-    assert_eq!(
-        rewrite_decimal_stringifications(&cast, &column_types(&col_types)),
-        cast,
-        "CAST of a computed DECIMAL expression must be left unchanged: it is not a bare column"
-    );
-
-    let concat = scalar_fn("CONCAT", [col("name"), computed]);
-    assert_eq!(
-        rewrite_decimal_stringifications(&concat, &column_types(&col_types)),
-        concat,
-        "a computed-expression CONCAT argument must be left unchanged"
-    );
-}
-
-#[test]
-fn rewrite_non_stringifying_context_unchanged() {
-    let col_types = decimal_rewrite_col_types();
-
-    let cmp = compare("predicate_greater", decimal_column(), num_lit(5));
-    assert_eq!(
-        rewrite_decimal_stringifications(&cmp, &column_types(&col_types)),
-        cmp,
-        "a DECIMAL column in a comparison must not be wrapped"
-    );
-
-    let cast_double = cast_to(ExasolType::DoublePrecision, decimal_column());
-    assert_eq!(
-        rewrite_decimal_stringifications(&cast_double, &column_types(&col_types)),
-        cast_double,
-        "CAST(decimal AS DOUBLE) must not be wrapped"
-    );
-}
-
-#[test]
-fn rewrite_reaches_decimal_inside_case_then_branch() {
-    let node = case_when(
-        [compare("predicate_greater", col("id"), num_lit(0))],
-        [scalar_fn("CONCAT", [str_lit("x"), col("c_decimal_a")])],
-    );
-    let out = rewrite_decimal_stringifications(&node, &column_types(&decimal_rewrite_col_types()));
-
-    let then_concat = &out["results"][0];
-    assert_eq!(
-        then_concat.get("name").and_then(|n| n.as_str()),
-        Some("CONCAT"),
-        "the CASE THEN CONCAT must be preserved: {out}"
-    );
-    assert_eq!(
-        then_concat["arguments"][1]
-            .get("type")
-            .and_then(|t| t.as_str()),
-        Some("decimal_to_varchar_exasol"),
-        "the DECIMAL inside the CASE THEN CONCAT must be wrapped: {out}"
-    );
 }
 
 #[test]
@@ -3130,516 +2490,6 @@ fn selectlist_like_inside_case_over_decimal_falls_back_to_full_row() {
 }
 
 #[test]
-fn string_position_args_coerces_every_argument_of_all_string_functions() {
-    for name in ["CONCAT", "TRIM", "LTRIM", "RTRIM", "REPLACE", "TRANSLATE"] {
-        assert_eq!(
-            string_position_args(name, 1),
-            StringPositionArgs::Coerce(vec![0]),
-            "{name}/1 must coerce index 0"
-        );
-        assert_eq!(
-            string_position_args(name, 2),
-            StringPositionArgs::Coerce(vec![0, 1]),
-            "{name}/2 must coerce both indices"
-        );
-        assert_eq!(
-            string_position_args(name, 3),
-            StringPositionArgs::Coerce(vec![0, 1, 2]),
-            "{name}/3 must coerce every index"
-        );
-    }
-}
-
-#[test]
-fn string_position_args_coerces_first_argument_only() {
-    for name in [
-        "LOWER",
-        "UPPER",
-        "ASCII",
-        "INITCAP",
-        "REVERSE",
-        "LENGTH",
-        "OCTET_LENGTH",
-        "UNICODE",
-        "SUBSTR",
-        "REPEAT",
-        "LEFT",
-        "RIGHT",
-    ] {
-        for arg_count in 1..=3 {
-            assert_eq!(
-                string_position_args(name, arg_count),
-                StringPositionArgs::Coerce(vec![0]),
-                "{name}/{arg_count} must coerce index 0 only"
-            );
-        }
-    }
-}
-
-#[test]
-fn string_position_args_excludes_numeric_arguments() {
-    for name in ["LPAD", "RPAD"] {
-        assert_eq!(
-            string_position_args(name, 2),
-            StringPositionArgs::Coerce(vec![0]),
-            "{name}/2 has no pad-string argument to coerce"
-        );
-        assert_eq!(
-            string_position_args(name, 3),
-            StringPositionArgs::Coerce(vec![0, 2]),
-            "{name}/3 must coerce the subject and the pad string, never the length"
-        );
-    }
-}
-
-#[test]
-fn string_position_args_not_governed_for_chr_and_non_string_functions() {
-    for name in ["CHR", "UNICODECHR", "ABS", "CASE"] {
-        for arg_count in 0..=3 {
-            assert_eq!(
-                string_position_args(name, arg_count),
-                StringPositionArgs::NotGoverned,
-                "{name}/{arg_count} must not be governed"
-            );
-        }
-    }
-}
-
-#[test]
-fn string_position_args_matches_lowercase_function_name() {
-    assert_eq!(
-        string_position_args("upper", 1),
-        string_position_args("UPPER", 1),
-        "a lowercase name must resolve like its uppercase form"
-    );
-    assert_eq!(
-        string_position_args("upper", 1),
-        StringPositionArgs::Coerce(vec![0])
-    );
-    assert_eq!(
-        string_position_args("instr", 3),
-        StringPositionArgs::Decline,
-        "a lowercase name must reach the arity decline too"
-    );
-}
-
-#[test]
-fn string_position_args_never_returns_out_of_range_index() {
-    let governed = [
-        "CONCAT",
-        "TRIM",
-        "LTRIM",
-        "RTRIM",
-        "REPLACE",
-        "TRANSLATE",
-        "LOWER",
-        "UPPER",
-        "ASCII",
-        "INITCAP",
-        "REVERSE",
-        "LENGTH",
-        "OCTET_LENGTH",
-        "UNICODE",
-        "SUBSTR",
-        "REPEAT",
-        "LEFT",
-        "RIGHT",
-        "LPAD",
-        "RPAD",
-        "INSTR",
-        "LOCATE",
-    ];
-    for name in governed {
-        for arg_count in 0..=5 {
-            if let StringPositionArgs::Coerce(indices) = string_position_args(name, arg_count) {
-                for i in indices {
-                    assert!(
-                        i < arg_count,
-                        "{name}/{arg_count} returned out-of-range index {i}"
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn string_position_args_declines_instr_locate_beyond_two_args() {
-    assert_eq!(
-        string_position_args("INSTR", 3),
-        StringPositionArgs::Decline,
-        "INSTR/3 drops its start-position argument — must decline"
-    );
-    assert_eq!(
-        string_position_args("INSTR", 4),
-        StringPositionArgs::Decline,
-        "INSTR/4 drops its start-position and occurrence arguments — must decline"
-    );
-    assert_eq!(
-        string_position_args("LOCATE", 3),
-        StringPositionArgs::Decline,
-        "LOCATE/3 drops its start-position argument — must decline"
-    );
-    for name in ["INSTR", "LOCATE"] {
-        assert_eq!(
-            string_position_args(name, 2),
-            StringPositionArgs::Coerce(vec![0, 1]),
-            "{name}/2 is rendered faithfully and must coerce both arguments"
-        );
-    }
-}
-
-fn trimmed_decimal(name: &str) -> Json {
-    serde_json::json!({
-        "type": "decimal_to_varchar_exasol",
-        "arguments": [col(name)],
-    })
-}
-
-#[test]
-fn string_fn_guard_passes_through_non_object_node() {
-    let col_types = decimal_rewrite_col_types();
-    for node in [
-        Json::Null,
-        serde_json::json!("UPPER"),
-        serde_json::json!(7),
-        serde_json::json!([1, 2]),
-    ] {
-        assert_eq!(
-            string_function_arg_type_guard(&node, &column_types(&col_types)),
-            Some(node.clone()),
-            "a non-object node must be passed through: {node}"
-        );
-    }
-}
-
-/// Scenario: A string-position VARCHAR or CHAR column argument pushes down unchanged
-#[test]
-fn string_fn_guard_leaves_varchar_argument_unchanged() {
-    let col_types = decimal_rewrite_col_types();
-    for name in ["UPPER", "LOWER", "TRIM", "LTRIM", "CONCAT", "LENGTH"] {
-        let node = scalar_fn(name, vec![col("name")]);
-        assert_eq!(
-            string_function_arg_type_guard(&node, &column_types(&col_types)),
-            Some(node.clone()),
-            "{name} over a VARCHAR column must be unchanged"
-        );
-    }
-    let char_types = vec![("C_CHAR_A".to_string(), ExasolType::char(10))];
-    let node = scalar_fn("UPPER", vec![col("c_char_a")]);
-    assert_eq!(
-        string_function_arg_type_guard(&node, &column_types(&char_types)),
-        Some(node.clone()),
-        "a CHAR column argument must be unchanged"
-    );
-}
-
-#[test]
-fn string_fn_guard_wraps_decimal_argument_in_trim() {
-    let col_types = decimal_rewrite_col_types();
-
-    let out = string_function_arg_type_guard(
-        &scalar_fn("UPPER", vec![decimal_column()]),
-        &column_types(&col_types),
-    );
-    assert_eq!(
-        out,
-        Some(scalar_fn("UPPER", vec![trimmed_decimal("c_decimal_a")])),
-        "UPPER's DECIMAL argument must be wrapped in the trimmed-string node"
-    );
-
-    for name in ["TRIM", "LTRIM"] {
-        assert_eq!(
-            string_function_arg_type_guard(
-                &scalar_fn(name, vec![decimal_column()]),
-                &column_types(&col_types)
-            ),
-            Some(scalar_fn(name, vec![trimmed_decimal("c_decimal_a")])),
-            "{name}'s DECIMAL argument must be wrapped"
-        );
-    }
-
-    assert_eq!(
-        string_function_arg_type_guard(
-            &scalar_fn("UPPER", vec![col("id")]),
-            &column_types(&col_types)
-        ),
-        Some(scalar_fn("UPPER", vec![trimmed_decimal("id")])),
-        "an integer DECIMAL(p,0) argument must be wrapped too"
-    );
-
-    let sql = render_expression_safe(
-        &string_function_arg_type_guard(
-            &scalar_fn("UPPER", vec![decimal_column()]),
-            &column_types(&col_types),
-        )
-        .expect("must not decline"),
-    )
-    .expect("must render");
-    assert_eq!(
-        sql,
-        r#"upper(regexp_replace(regexp_replace(CAST("C_DECIMAL_A" AS VARCHAR), '(\.[0-9]*[1-9])0+$', '\1'), '\.0+$', ''))"#,
-        "UPPER over a DECIMAL column must render the trimmed form: {sql}"
-    );
-}
-
-/// Scenario: A string-position DATE column argument is wrapped in an explicit CAST to VARCHAR
-#[test]
-fn string_fn_guard_casts_date_argument_to_varchar() {
-    let col_types = decimal_rewrite_col_types();
-    assert_eq!(
-        string_function_arg_type_guard(
-            &scalar_fn("LOWER", vec![col("d")]),
-            &column_types(&col_types)
-        ),
-        Some(scalar_fn(
-            "LOWER",
-            vec![cast_to(ExasolType::WIDEST_VARCHAR, col("d"))]
-        )),
-        "LOWER's DATE argument must be wrapped in CAST(<col> AS VARCHAR)"
-    );
-}
-
-#[test]
-fn string_fn_guard_declines_boolean_double_and_timestamp_arguments() {
-    let col_types = decimal_rewrite_col_types();
-    for column in ["c_bool_a", "c_double_a", "c_ts_a"] {
-        for name in ["UPPER", "TRIM", "CONCAT", "LENGTH"] {
-            assert_eq!(
-                string_function_arg_type_guard(
-                    &scalar_fn(name, vec![col(column)]),
-                    &column_types(&col_types)
-                ),
-                None,
-                "{name} over {column} must decline"
-            );
-        }
-    }
-}
-
-/// Scenario: A string-position argument whose column name does not resolve declines fail-safe
-#[test]
-fn string_fn_guard_declines_unresolved_column_name() {
-    let col_types = decimal_rewrite_col_types();
-    assert_eq!(
-        string_function_arg_type_guard(
-            &scalar_fn("UPPER", vec![col("mystery")]),
-            &column_types(&col_types)
-        ),
-        None,
-        "an unresolvable column argument must decline"
-    );
-}
-
-#[test]
-fn string_fn_guard_declines_nameless_column_node() {
-    let col_types = decimal_rewrite_col_types();
-    let node = scalar_fn("UPPER", vec![serde_json::json!({"type": "column"})]);
-    assert_eq!(
-        string_function_arg_type_guard(&node, &column_types(&col_types)),
-        None,
-        "a nameless column argument must decline"
-    );
-}
-
-#[test]
-fn string_fn_guard_reaches_function_under_comparison_predicate() {
-    let col_types = decimal_rewrite_col_types();
-    let node = predicate_equal(scalar_fn("UPPER", vec![decimal_column()]), str_lit("X"));
-    assert_eq!(
-        string_function_arg_type_guard(&node, &column_types(&col_types)),
-        Some(predicate_equal(
-            scalar_fn("UPPER", vec![trimmed_decimal("c_decimal_a")]),
-            str_lit("X"),
-        )),
-        "a string function under `left` must be coerced"
-    );
-}
-
-#[test]
-fn string_fn_guard_nested_decline_propagates_to_root() {
-    let col_types = decimal_rewrite_col_types();
-    let filter = and([
-        predicate_equal(col("name"), str_lit("X")),
-        not(predicate_equal(
-            scalar_fn("UPPER", vec![col("c_double_a")]),
-            str_lit("X"),
-        )),
-    ]);
-    assert_eq!(
-        string_function_arg_type_guard(&filter, &column_types(&col_types)),
-        None,
-        "a nested non-coercible string function must decline the whole tree"
-    );
-}
-
-#[test]
-fn string_fn_guard_leaves_numeric_position_arguments_untouched() {
-    let col_types = decimal_rewrite_col_types();
-
-    assert_eq!(
-        string_function_arg_type_guard(
-            &scalar_fn("SUBSTR", vec![decimal_column(), col("id"), col("id")]),
-            &column_types(&col_types)
-        ),
-        Some(scalar_fn(
-            "SUBSTR",
-            vec![trimmed_decimal("c_decimal_a"), col("id"), col("id")]
-        )),
-        "SUBSTR's start and length arguments must stay bare columns"
-    );
-
-    for name in ["REPEAT", "LEFT", "RIGHT"] {
-        assert_eq!(
-            string_function_arg_type_guard(
-                &scalar_fn(name, vec![decimal_column(), col("id")]),
-                &column_types(&col_types)
-            ),
-            Some(scalar_fn(
-                name,
-                vec![trimmed_decimal("c_decimal_a"), col("id")]
-            )),
-            "{name}'s numeric argument must stay a bare column"
-        );
-    }
-
-    // LPAD(str, length, pad): index 0 and 2 coerced, index 1 untouched.
-    assert_eq!(
-        string_function_arg_type_guard(
-            &scalar_fn("LPAD", vec![decimal_column(), col("id"), col("d")]),
-            &column_types(&col_types)
-        ),
-        Some(scalar_fn(
-            "LPAD",
-            vec![
-                trimmed_decimal("c_decimal_a"),
-                col("id"),
-                cast_to(ExasolType::WIDEST_VARCHAR, col("d"))
-            ]
-        )),
-        "LPAD must coerce the subject and the pad string, never the length"
-    );
-
-    let length_literal = num_lit(10);
-    assert_eq!(
-        string_function_arg_type_guard(
-            &scalar_fn("LPAD", vec![decimal_column(), length_literal.clone()]),
-            &column_types(&col_types)
-        ),
-        Some(scalar_fn(
-            "LPAD",
-            vec![trimmed_decimal("c_decimal_a"), length_literal]
-        )),
-        "a 2-argument LPAD must coerce index 0 only"
-    );
-}
-
-#[test]
-fn string_fn_guard_coerces_both_instr_and_locate_arguments() {
-    let col_types = decimal_rewrite_col_types();
-
-    assert_eq!(
-        string_function_arg_type_guard(
-            &scalar_fn("INSTR", vec![decimal_column(), col("d")]),
-            &column_types(&col_types)
-        ),
-        Some(scalar_fn(
-            "INSTR",
-            vec![
-                trimmed_decimal("c_decimal_a"),
-                cast_to(ExasolType::WIDEST_VARCHAR, col("d"))
-            ]
-        )),
-        "INSTR must coerce both of its arguments"
-    );
-
-    assert_eq!(
-        string_function_arg_type_guard(
-            &scalar_fn("LOCATE", vec![col("d"), decimal_column()]),
-            &column_types(&col_types)
-        ),
-        Some(scalar_fn(
-            "LOCATE",
-            vec![
-                cast_to(ExasolType::WIDEST_VARCHAR, col("d")),
-                trimmed_decimal("c_decimal_a")
-            ]
-        )),
-        "LOCATE must coerce both of its arguments"
-    );
-}
-
-#[test]
-fn string_fn_guard_declines_instr_locate_beyond_two_args() {
-    let col_types = decimal_rewrite_col_types();
-    let start = num_lit(3);
-
-    assert_eq!(
-        string_function_arg_type_guard(
-            &scalar_fn("INSTR", vec![col("name"), col("name"), start.clone()]),
-            &column_types(&col_types)
-        ),
-        None,
-        "INSTR/3 over VARCHAR arguments must still decline"
-    );
-    assert_eq!(
-        string_function_arg_type_guard(
-            &scalar_fn(
-                "INSTR",
-                vec![col("name"), col("name"), start.clone(), start.clone()]
-            ),
-            &column_types(&col_types)
-        ),
-        None,
-        "INSTR/4 over VARCHAR arguments must still decline"
-    );
-    assert_eq!(
-        string_function_arg_type_guard(
-            &scalar_fn("LOCATE", vec![col("name"), col("name"), start]),
-            &column_types(&col_types)
-        ),
-        None,
-        "LOCATE/3 over VARCHAR arguments must still decline"
-    );
-}
-
-#[test]
-fn string_fn_guard_excludes_chr_and_unicodechr() {
-    let col_types = decimal_rewrite_col_types();
-    for name in ["CHR", "UNICODECHR"] {
-        for arg in ["id", "c_double_a"] {
-            let node = scalar_fn(name, vec![col(arg)]);
-            assert_eq!(
-                string_function_arg_type_guard(&node, &column_types(&col_types)),
-                Some(node.clone()),
-                "{name}({arg}) must be left completely untouched"
-            );
-        }
-    }
-
-    let nested = scalar_fn("CHR", vec![scalar_fn("LENGTH", vec![decimal_column()])]);
-    assert_eq!(
-        string_function_arg_type_guard(&nested, &column_types(&col_types)),
-        Some(scalar_fn(
-            "CHR",
-            vec![scalar_fn("LENGTH", vec![trimmed_decimal("c_decimal_a")])]
-        )),
-        "a governed function under CHR must still be coerced"
-    );
-}
-
-#[test]
-fn string_fn_guard_resolves_case_mismatched_column_name() {
-    let col_types = decimal_rewrite_col_types();
-    let node = scalar_fn("UPPER", vec![col("C_DeCiMaL_a")]);
-    assert_eq!(
-        string_function_arg_type_guard(&node, &column_types(&col_types)),
-        Some(scalar_fn("UPPER", vec![trimmed_decimal("C_DeCiMaL_a")])),
-        "a mixed-case column name must resolve against the uppercase map"
-    );
-}
-
-#[test]
 fn column_exa_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
     let node = col("STRAßE");
     let unicode_folded = [("STRASSE".to_string(), ExasolType::WIDEST_VARCHAR)];
@@ -3654,42 +2504,6 @@ fn column_exa_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
         column_exa_type(&node, &column_types(&ascii_folded)),
         None,
         "`to_ascii_uppercase` leaves `STRAßE`, which the Unicode fold cannot match"
-    );
-}
-
-#[test]
-fn string_fn_guard_leaves_computed_argument_unchanged() {
-    let col_types = decimal_rewrite_col_types();
-
-    let literal = scalar_fn("UPPER", vec![str_lit("x")]);
-    assert_eq!(
-        string_function_arg_type_guard(&literal, &column_types(&col_types)),
-        Some(literal.clone()),
-        "a literal argument must be left unchanged without declining"
-    );
-
-    let computed = scalar_fn(
-        "UPPER",
-        vec![scalar_fn("MULT", vec![decimal_column(), num_lit(2)])],
-    );
-    assert_eq!(
-        string_function_arg_type_guard(&computed, &column_types(&col_types)),
-        Some(computed.clone()),
-        "a computed argument must be left unchanged without declining"
-    );
-}
-
-#[test]
-fn string_fn_guard_coerces_inner_nested_string_function() {
-    let col_types = decimal_rewrite_col_types();
-    let node = scalar_fn("UPPER", vec![scalar_fn("TRIM", vec![decimal_column()])]);
-    assert_eq!(
-        string_function_arg_type_guard(&node, &column_types(&col_types)),
-        Some(scalar_fn(
-            "UPPER",
-            vec![scalar_fn("TRIM", vec![trimmed_decimal("c_decimal_a")])]
-        )),
-        "the inner TRIM's DECIMAL argument must be coerced exactly once"
     );
 }
 
@@ -3942,43 +2756,6 @@ fn shared_name_universe() -> ColumnTypes {
     ])
 }
 
-fn like_over(subject: Json) -> Json {
-    like(subject, "a%")
-}
-
-#[test]
-fn qualified_universe_types_a_shared_column_name_by_its_own_relation() {
-    let universe = shared_name_universe();
-    let varchar_leg = like_over(alias_col("LHS_T1", "x"));
-    assert_eq!(
-        apply_type_rewrites(&varchar_leg, &universe),
-        Some(varchar_leg.clone()),
-        "LHS_T1's X is VARCHAR, so its LIKE passes even though LHS_T0's X, listed first, is DECIMAL"
-    );
-    let decimal_leg = like_over(alias_col("LHS_T0", "X"));
-    assert_eq!(
-        apply_type_rewrites(&decimal_leg, &universe),
-        None,
-        "LHS_T0's X is DECIMAL, so its LIKE declines"
-    );
-    let unqualified = like_over(col("X"));
-    assert_eq!(
-        apply_type_rewrites(&unqualified, &universe),
-        None,
-        "a qualified entry never binds a node without its relation alias"
-    );
-}
-
-#[test]
-fn unqualified_universe_types_a_column_by_name_whatever_its_alias() {
-    let universe = column_types(&[("X", ExasolType::varchar(10))]);
-    let aliased = like_over(alias_col("O", "x"));
-    assert_eq!(
-        apply_type_rewrites(&aliased, &universe),
-        Some(aliased.clone())
-    );
-}
-
 #[test]
 fn qualified_universe_projects_each_column_with_its_relation_and_type() {
     let universe = shared_name_universe();
@@ -4018,86 +2795,6 @@ fn qualified_universe_projects_each_column_with_its_relation_and_type() {
         full_types,
         vec![ExasolType::decimal(18, 0), ExasolType::varchar(10)]
     );
-}
-
-fn one_column_of(exa_type: ExasolType) -> ColumnTypes {
-    column_types(&[("X", exa_type)])
-}
-
-#[test]
-fn like_subject_guard_keeps_character_casts_date_and_declines_every_other_variant() {
-    let like = like_over(col("X"));
-    for exa_type in EXASOL_TYPE_SPELLINGS {
-        let mut date_cast = like.clone();
-        date_cast["expression"] = wrap_cast_to_varchar(&col("X"));
-        let expected = match exa_type {
-            ExasolType::Char { .. } | ExasolType::Varchar { .. } => Some(like.clone()),
-            ExasolType::Date => Some(date_cast),
-            ExasolType::Boolean
-            | ExasolType::Decimal(_)
-            | ExasolType::DoublePrecision
-            | ExasolType::Timestamp { .. }
-            | ExasolType::TimestampWithLocalTimeZone { .. }
-            | ExasolType::IntervalYearToMonth { .. }
-            | ExasolType::IntervalDayToSecond { .. }
-            | ExasolType::Geometry { .. }
-            | ExasolType::Hashtype { .. } => None,
-        };
-        assert_eq!(
-            guard_like_subject(&like, &one_column_of(exa_type)),
-            expected,
-            "{exa_type}"
-        );
-    }
-}
-
-#[test]
-fn string_position_coercion_answers_per_variant() {
-    for exa_type in EXASOL_TYPE_SPELLINGS {
-        let expected = match exa_type {
-            ExasolType::Char { .. } | ExasolType::Varchar { .. } => Some(col("X")),
-            ExasolType::Date => Some(wrap_cast_to_varchar(&col("X"))),
-            ExasolType::Decimal(_) => Some(wrap_decimal_to_varchar(&col("X"))),
-            ExasolType::Boolean
-            | ExasolType::DoublePrecision
-            | ExasolType::Timestamp { .. }
-            | ExasolType::TimestampWithLocalTimeZone { .. }
-            | ExasolType::IntervalYearToMonth { .. }
-            | ExasolType::IntervalDayToSecond { .. }
-            | ExasolType::Geometry { .. }
-            | ExasolType::Hashtype { .. } => None,
-        };
-        assert_eq!(
-            coerce_string_position_arg(&col("X"), &one_column_of(exa_type)),
-            expected,
-            "{exa_type}"
-        );
-    }
-}
-
-#[test]
-fn only_a_decimal_column_is_a_bare_decimal_column() {
-    for exa_type in EXASOL_TYPE_SPELLINGS {
-        let expected = match exa_type {
-            ExasolType::Decimal(_) => true,
-            ExasolType::Boolean
-            | ExasolType::DoublePrecision
-            | ExasolType::Date
-            | ExasolType::Timestamp { .. }
-            | ExasolType::TimestampWithLocalTimeZone { .. }
-            | ExasolType::IntervalYearToMonth { .. }
-            | ExasolType::IntervalDayToSecond { .. }
-            | ExasolType::Geometry { .. }
-            | ExasolType::Hashtype { .. }
-            | ExasolType::Char { .. }
-            | ExasolType::Varchar { .. } => false,
-        };
-        assert_eq!(
-            is_bare_decimal_column(&col("X"), &one_column_of(exa_type)),
-            expected,
-            "{exa_type}"
-        );
-    }
 }
 
 #[test]
@@ -4222,72 +2919,6 @@ fn a_concatenation_lists_each_map_in_turn() {
     );
 }
 
-/// The types a request's select list parses to, or a phrase its refusal names.
-type ParseOutcome = Result<Vec<ExasolType>, String>;
-
-/// Scenario: A pushdown request with a missing or invalid Exasol type fails the query
-#[test]
-fn select_list_data_types_check_answers_per_request_shape() {
-    let columns = [
-        ("ID", ExasolType::decimal(20, 0)),
-        ("NAME", ExasolType::varchar(10)),
-    ];
-    let full_row = vec![ExasolType::decimal(20, 0), ExasolType::varchar(10)];
-    let one_item = || pushdown_request("T", &columns).column(col("ID"));
-    let invalid_entry = serde_json::json!({"type": "decimal", "precision": 37, "scale": 0});
-    let cases: [(&str, PushdownRequestBuilder, ParseOutcome); 7] = [
-        (
-            "an absent list",
-            one_item().select_list_data_types(None),
-            Err("selectListDataTypes".into()),
-        ),
-        (
-            "an invalid entry",
-            one_item().select_list_data_types(Some(serde_json::json!([invalid_entry]))),
-            Err(invalid_entry.to_string()),
-        ),
-        (
-            "more entries than items",
-            one_item().select_list_data_types(Some(serde_json::json!([
-                exasol_type_to_json(&ExasolType::decimal(20, 0)),
-                exasol_type_to_json(&ExasolType::varchar(10)),
-            ]))),
-            Err("2 selectListDataTypes entries for 1 selectList items".into()),
-        ),
-        (
-            "fewer entries than items",
-            one_item().select_list_data_types(Some(serde_json::json!([]))),
-            Err("0 selectListDataTypes entries for 1 selectList items".into()),
-        ),
-        (
-            "an absent selectList",
-            pushdown_request("T", &columns),
-            Ok(full_row.clone()),
-        ),
-        (
-            "a JSON-null selectList",
-            pushdown_request("T", &columns).field("selectList", Json::Null),
-            Ok(full_row),
-        ),
-        (
-            "an empty selectList",
-            pushdown_request("T", &columns).empty_select_list(),
-            Ok(Vec::new()),
-        ),
-    ];
-    for (shape, request, expected) in cases {
-        let parsed = PushdownRequest::parse(pd(&request.build().0))
-            .map(|parsed| parsed.select_types().to_vec());
-        match (parsed, expected) {
-            (Ok(types), Ok(expected)) => assert_eq!(types, expected, "{shape}"),
-            (Err(UdfError::User(message)), Err(named)) => {
-                assert!(message.contains(&named), "{shape}: {message}");
-            }
-            (outcome, expected) => panic!("{shape}: got {outcome:?}, expected {expected:?}"),
-        }
-    }
-}
-
 /// Scenario: A pushdown request with a missing or invalid Exasol type fails the query
 #[test]
 fn involved_column_with_an_unparsable_type_fails() {
@@ -4313,4 +2944,168 @@ fn involved_column_with_an_unparsable_type_fails() {
             other => panic!("the column must fail with {named}, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn overprecise_timestamp_literal_is_rewritten_to_the_column_precision() {
+    let col_types = vec![("TS".to_string(), ExasolType::timestamp(3))];
+    let lit = timestamp_lit("2025-06-01 00:00:00.123500");
+    let floor = timestamp_lit("2025-06-01 00:00:00.123");
+    for (op, mirrored, want_op, want_right) in [
+        ("predicate_equal", false, "predicate_notequal", col("ts")),
+        ("predicate_notequal", false, "predicate_equal", col("ts")),
+        (
+            "predicate_less",
+            false,
+            "predicate_lessequal",
+            floor.clone(),
+        ),
+        (
+            "predicate_lessequal",
+            false,
+            "predicate_lessequal",
+            floor.clone(),
+        ),
+        (
+            "predicate_greater",
+            false,
+            "predicate_greater",
+            floor.clone(),
+        ),
+        (
+            "predicate_greaterequal",
+            false,
+            "predicate_greater",
+            floor.clone(),
+        ),
+        ("predicate_less", true, "predicate_greater", floor.clone()),
+        (
+            "predicate_greaterequal",
+            true,
+            "predicate_lessequal",
+            floor.clone(),
+        ),
+    ] {
+        let filter = if mirrored {
+            compare(op, lit.clone(), col("ts"))
+        } else {
+            compare(op, col("ts"), lit.clone())
+        };
+        assert_eq!(
+            rewrite_overprecise_timestamp_comparisons(&filter, &column_types(&col_types)),
+            compare(want_op, col("ts"), want_right),
+            "{op} mirrored={mirrored}"
+        );
+    }
+}
+
+#[test]
+fn timestamp_literal_within_the_column_precision_is_unchanged() {
+    for (declared, value) in [
+        (ExasolType::BARE_TIMESTAMP, "2025-06-01 00:00:00.123000"),
+        (ExasolType::timestamp(6), "2025-06-01 00:00:00.123456"),
+        (ExasolType::timestamp(9), "2025-06-01 00:00:00.123456789"),
+        (ExasolType::timestamp(3), "2025-06-01 00:00:00"),
+    ] {
+        let col_types = vec![("TS".to_string(), declared)];
+        let filter = predicate_equal(col("ts"), timestamp_lit(value));
+        assert_eq!(
+            rewrite_overprecise_timestamp_comparisons(&filter, &column_types(&col_types)),
+            filter.clone(),
+            "{declared} = {value}"
+        );
+    }
+}
+
+#[test]
+fn between_and_in_with_an_overprecise_timestamp_expand_to_rewritten_comparisons() {
+    let col_types = vec![("TS".to_string(), ExasolType::timestamp(3))];
+    let fits = || timestamp_lit("2025-06-01 00:00:00.122");
+    let over = || timestamp_lit("2025-06-01 00:00:00.123500");
+    let floor = || timestamp_lit("2025-06-01 00:00:00.123");
+
+    let bounded = between(col("ts"), fits(), over());
+    assert_eq!(
+        rewrite_overprecise_timestamp_comparisons(&bounded, &column_types(&col_types)),
+        and([
+            compare("predicate_greaterequal", col("ts"), fits()),
+            compare("predicate_lessequal", col("ts"), floor())
+        ])
+    );
+
+    let listed = in_list(col("ts"), [over(), fits()]);
+    assert_eq!(
+        rewrite_overprecise_timestamp_comparisons(&listed, &column_types(&col_types)),
+        or([
+            compare("predicate_notequal", col("ts"), col("ts")),
+            predicate_equal(col("ts"), fits())
+        ])
+    );
+
+    let fitting_in = in_list(col("ts"), [fits()]);
+    assert_eq!(
+        rewrite_overprecise_timestamp_comparisons(&fitting_in, &column_types(&col_types)),
+        fitting_in.clone()
+    );
+}
+
+#[test]
+fn selectlist_tstz_literal_widens_via_emits_type_gate() {
+    let literal = lit("literal_timestamp_utc", "2024-03-01 10:00:00");
+    assert!(
+        render_expression_safe(&literal).is_some(),
+        "literal_timestamp_utc must render via render_expression_safe"
+    );
+    let (proj_cols, proj_types, widened) = projected(id_name_request().item(
+        literal,
+        ExasolType::TimestampWithLocalTimeZone { precision: 3 },
+    ));
+    assert!(
+        widened,
+        "a TIMESTAMP WITH LOCAL TIME ZONE literal must widen the projection \
+         so the RowScan dispatcher routes it to the qualified wrapper"
+    );
+    assert_eq!(
+        proj_cols,
+        vec![
+            ProjectionItem::Column("ID".into()),
+            ProjectionItem::Column("NAME".into()),
+        ],
+        "a TIMESTAMP WITH LOCAL TIME ZONE literal must widen to the full base row: {proj_cols:?}"
+    );
+    assert_eq!(
+        proj_types,
+        vec![ExasolType::decimal(10, 0), ExasolType::varchar(100)]
+    );
+}
+
+#[test]
+fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
+    let literal = lit("literal_timestamputc", "2024-03-01 10:00:00");
+    assert!(
+        render_expression_safe(&literal).is_none(),
+        "the DataFusion dialect must keep declining the real wire name (#242): \
+         a render here would silently start pushing TSTZ predicates into the \
+         scan filter"
+    );
+    let (proj_cols, proj_types, widened) = projected(id_name_request().item(
+        literal,
+        ExasolType::TimestampWithLocalTimeZone { precision: 3 },
+    ));
+    assert!(
+        widened,
+        "the real-wire-name TSTZ literal must widen the projection so the \
+         RowScan dispatcher routes it to the qualified wrapper"
+    );
+    assert_eq!(
+        proj_cols,
+        vec![
+            ProjectionItem::Column("ID".into()),
+            ProjectionItem::Column("NAME".into()),
+        ]
+    );
+    assert_eq!(
+        proj_types,
+        vec![ExasolType::decimal(10, 0), ExasolType::varchar(100)]
+    );
 }

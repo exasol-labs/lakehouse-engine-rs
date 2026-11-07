@@ -41,7 +41,8 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("ROUND(SUM(col), 2) must decompose");
+    let items = detect_aggregates(&req, &ColumnTypes::default())
+        .expect("ROUND(SUM(col), 2) must decompose");
     assert_eq!(items.len(), 1, "one select item, one resolved item");
     assert!(
         !has_distinct(&items),
@@ -55,7 +56,7 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
         )
         .build_pushdown();
     assert!(
-        detect_aggregates(&variance_req).is_some(),
+        detect_aggregates(&variance_req, &ColumnTypes::default()).is_some(),
         "ROUND(VARIANCE(col), 4) must decompose rather than reach DataFusion by name"
     );
 
@@ -73,7 +74,7 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
         )
         .build_pushdown();
     assert_eq!(
-        detect_aggregates(&interleaved)
+        detect_aggregates(&interleaved, &ColumnTypes::default())
             .expect("an interleaved list must decompose")
             .len(),
         2
@@ -86,7 +87,7 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
         )
         .build_pushdown();
     assert!(
-        detect_aggregates(&distinct_req).is_none(),
+        detect_aggregates(&distinct_req, &ColumnTypes::default()).is_none(),
         "ROUND(COUNT(DISTINCT col), 2) must decline the whole detection"
     );
 
@@ -97,7 +98,7 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
         )
         .build_pushdown();
     assert!(
-        detect_aggregates(&median_req).is_none(),
+        detect_aggregates(&median_req, &ColumnTypes::default()).is_none(),
         "ROUND(MEDIAN(col), 2) must decline the whole detection"
     );
 
@@ -114,7 +115,7 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
         )
         .build_pushdown();
     assert!(
-        detect_aggregates(&residual_req).is_none(),
+        detect_aggregates(&residual_req, &ColumnTypes::default()).is_none(),
         "a residual bare column must decline the whole detection"
     );
 
@@ -122,7 +123,7 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
         .item(length_expr("L_COMMENT"), ExasolType::decimal(18, 0))
         .build_pushdown();
     assert!(
-        detect_aggregates(&scalar_only).is_none(),
+        detect_aggregates(&scalar_only, &ColumnTypes::default()).is_none(),
         "a scalar item with no nested aggregate must still decline"
     );
 }
@@ -143,7 +144,8 @@ fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types(
         )
         .count_star()
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("an interleaved list must decompose");
+    let items = detect_aggregates(&req, &ColumnTypes::default())
+        .expect("an interleaved list must decompose");
     assert_eq!(items.len(), 3);
     assert_eq!(agg_of(&items[0]).kind, AggKind::Sum);
     assert!(
@@ -160,7 +162,7 @@ fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types(
     );
     assert_eq!(agg_of(&items[2]).kind, AggKind::Count);
 
-    assert_eq!(ordinary_plans(&items).len(), 2);
+    assert_eq!(ordinary_plans(&items, &ColumnTypes::default()).len(), 2);
 }
 
 #[test]
@@ -175,8 +177,9 @@ fn single_group_scalar_over_aggregate_dedups_shared_inner_aggregates() {
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("COUNT(*) + ROUND(SUM/COUNT) must decompose");
-    let plans = ordinary_plans(&items);
+    let items = detect_aggregates(&req, &ColumnTypes::default())
+        .expect("COUNT(*) + ROUND(SUM/COUNT) must decompose");
+    let plans = ordinary_plans(&items, &ColumnTypes::default());
     assert_eq!(
         plans.len(),
         2,
@@ -206,8 +209,9 @@ fn single_group_scalar_over_aggregate_folds_nested_plans_in_encounter_order() {
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("ROUND(SUM/COUNT) must decompose");
-    let plans = ordinary_plans(&items);
+    let items =
+        detect_aggregates(&req, &ColumnTypes::default()).expect("ROUND(SUM/COUNT) must decompose");
+    let plans = ordinary_plans(&items, &ColumnTypes::default());
     assert_eq!(plans.len(), 2, "{plans:?}");
     assert_eq!(plans[0].kind, AggKind::Sum);
     assert_eq!(plans[1].kind, AggKind::Count);
@@ -226,8 +230,9 @@ fn ordinary_plans_unchanged_for_bare_aggregate_select_lists() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("a bare aggregate list must decompose");
-    let plans = ordinary_plans(&items);
+    let items = detect_aggregates(&req, &ColumnTypes::default())
+        .expect("a bare aggregate list must decompose");
+    let plans = ordinary_plans(&items, &ColumnTypes::default());
     assert_eq!(plans.len(), 3);
     assert_eq!(plans[0].kind, AggKind::Sum);
     assert_eq!(plans[1].kind, AggKind::Count);
@@ -239,7 +244,7 @@ fn detect_count_star_produces_count_no_column() {
     let req = pushdown_request("T", NO_COLUMNS)
         .count_star()
         .build_pushdown();
-    let plans = detect_aggregates(&req).expect("should detect COUNT(*)");
+    let plans = detect_aggregates(&req, &ColumnTypes::default()).expect("should detect COUNT(*)");
     assert_eq!(plans.len(), 1);
     assert_eq!(agg_of(&plans[0]).kind, AggKind::Count);
     assert!(agg_of(&plans[0]).column.is_none());
@@ -253,7 +258,7 @@ fn detect_count_col_produces_count_col() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let plans = detect_aggregates(&req).expect("should detect COUNT(col)");
+    let plans = detect_aggregates(&req, &ColumnTypes::default()).expect("should detect COUNT(col)");
     assert_eq!(agg_of(&plans[0]).kind, AggKind::CountCol);
     assert_eq!(agg_of(&plans[0]).column.as_deref(), Some("AMOUNT"));
 }
@@ -278,7 +283,7 @@ fn detect_sum_min_max_avg_produce_correct_plans() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let plans = detect_aggregates(&req).expect("should detect all four");
+    let plans = detect_aggregates(&req, &ColumnTypes::default()).expect("should detect all four");
     assert_eq!(agg_of(&plans[0]).kind, AggKind::Sum);
     assert_eq!(agg_of(&plans[0]).column.as_deref(), Some("AMOUNT"));
     assert_eq!(agg_of(&plans[1]).kind, AggKind::Min);
@@ -299,7 +304,7 @@ fn detect_aggregates_falls_back_on_group_by() {
         )
         .build_pushdown();
     assert!(
-        detect_aggregates(&req).is_none(),
+        detect_aggregates(&req, &ColumnTypes::default()).is_none(),
         "must fall back when GROUP BY is present"
     );
 }
@@ -313,7 +318,7 @@ fn detect_aggregates_falls_back_on_distinct() {
         )
         .build_pushdown();
     assert!(
-        detect_aggregates(&req).is_none(),
+        detect_aggregates(&req, &ColumnTypes::default()).is_none(),
         "must fall back when a non-COUNT DISTINCT is present"
     );
 }
@@ -331,7 +336,7 @@ fn detect_aggregates_falls_back_on_unsupported_function() {
         )
         .build_pushdown();
     assert!(
-        detect_aggregates(&req).is_none(),
+        detect_aggregates(&req, &ColumnTypes::default()).is_none(),
         "must fall back when any item is unsupported"
     );
 }
@@ -342,7 +347,7 @@ fn detect_aggregates_falls_back_on_column_select() {
         .column(col("region"))
         .build_pushdown();
     assert!(
-        detect_aggregates(&req).is_none(),
+        detect_aggregates(&req, &ColumnTypes::default()).is_none(),
         "must fall back when select list contains non-aggregate"
     );
 }
@@ -352,7 +357,7 @@ fn detect_aggregates_returns_none_for_empty_select_list() {
     let req = pushdown_request("T", NO_COLUMNS)
         .empty_select_list()
         .build_pushdown();
-    assert!(detect_aggregates(&req).is_none());
+    assert!(detect_aggregates(&req, &ColumnTypes::default()).is_none());
 }
 
 #[test]
@@ -384,7 +389,8 @@ fn bare_column_aggregates_unchanged_regression() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let plans = detect_aggregates(&req).expect("bare-column aggregates must decompose");
+    let plans = detect_aggregates(&req, &ColumnTypes::default())
+        .expect("bare-column aggregates must decompose");
     assert!(
         plans.iter().all(|p| agg_of(p).arg_expr.is_none()),
         "bare-column aggregates must never populate arg_expr: {plans:?}"
@@ -424,7 +430,8 @@ fn expression_arg_partial_and_merge_types_from_declared_type() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let plans = detect_aggregates(&req).expect("expression-argument SUM must decompose");
+    let plans = detect_aggregates(&req, &ColumnTypes::default())
+        .expect("expression-argument SUM must decompose");
     assert_eq!(agg_of(&plans[0]).kind, AggKind::Sum);
     assert!(
         agg_of(&plans[0]).column.is_none(),
@@ -497,10 +504,10 @@ fn decimal_product_sum_partial_widens_to_decimal_36() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let items =
-        detect_aggregates(&req).expect("SUM(col * col) must decompose, not fall back to scan");
+    let items = detect_aggregates(&req, &ColumnTypes::default())
+        .expect("SUM(col * col) must decompose, not fall back to scan");
     assert_eq!(items.len(), 1);
-    let plans = ordinary_plans(&items);
+    let plans = ordinary_plans(&items, &ColumnTypes::default());
     assert_eq!(plans[0].kind, AggKind::Sum);
     assert!(
         plans[0].column.is_none(),
@@ -544,7 +551,7 @@ fn unrenderable_agg_arg_falls_back_to_row_scan() {
             )
             .build_pushdown();
         assert!(
-            detect_aggregates(&req).is_none(),
+            detect_aggregates(&req, &ColumnTypes::default()).is_none(),
             "{name} over an unrenderable argument must fall back to row scan"
         );
     }
@@ -555,7 +562,7 @@ fn unrenderable_agg_arg_falls_back_to_row_scan() {
         )
         .build_pushdown();
     assert!(
-        detect_aggregates(&req).is_none(),
+        detect_aggregates(&req, &ColumnTypes::default()).is_none(),
         "COUNT(DISTINCT unrenderable) must fall back to row scan"
     );
 }
@@ -568,14 +575,15 @@ fn count_distinct_builds_distinct_row_scan_spec() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("single-group COUNT(DISTINCT) must decompose");
+    let items = detect_aggregates(&req, &ColumnTypes::default())
+        .expect("single-group COUNT(DISTINCT) must decompose");
     assert_eq!(items.len(), 1);
     assert!(has_distinct(&items), "the item must be a distinct fan-out");
     let dc = distinct_of(&items[0]);
     assert_eq!(dc.column.as_deref(), Some("L_SHIPMODE"));
     assert!(dc.arg_expr.is_none());
     assert!(
-        ordinary_plans(&items).is_empty(),
+        ordinary_plans(&items, &ColumnTypes::default()).is_empty(),
         "a COUNT(DISTINCT) item must not appear among the ordinary aggregate plans"
     );
 
@@ -585,7 +593,8 @@ fn count_distinct_builds_distinct_row_scan_spec() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let items_expr = detect_aggregates(&req_expr).expect("COUNT(DISTINCT expr) must decompose");
+    let items_expr = detect_aggregates(&req_expr, &ColumnTypes::default())
+        .expect("COUNT(DISTINCT expr) must decompose");
     let dc_expr = distinct_of(&items_expr[0]);
     assert!(dc_expr.column.is_none());
     assert_eq!(
@@ -602,7 +611,8 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let items = detect_aggregates(&lone).expect("a lone COUNT(DISTINCT) decomposes");
+    let items = detect_aggregates(&lone, &ColumnTypes::default())
+        .expect("a lone COUNT(DISTINCT) decomposes");
     assert!(
         has_distinct(&items) && is_lone_count_distinct(&items),
         "a lone COUNT(DISTINCT) is the only shape that fans out (Case 1)"
@@ -618,7 +628,8 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let items = detect_aggregates(&multi).expect("multiple distinct items still detect");
+    let items = detect_aggregates(&multi, &ColumnTypes::default())
+        .expect("multiple distinct items still detect");
     assert!(
         has_distinct(&items) && !is_lone_count_distinct(&items),
         "more than one COUNT(DISTINCT) must decline the fan-out (Case 2)"
@@ -634,7 +645,8 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let items = detect_aggregates(&mixed).expect("distinct-plus-ordinary still detects");
+    let items = detect_aggregates(&mixed, &ColumnTypes::default())
+        .expect("distinct-plus-ordinary still detects");
     assert!(
         has_distinct(&items) && !is_lone_count_distinct(&items),
         "a distinct mixed with an ordinary aggregate must decline the fan-out (Case 3)"
@@ -649,7 +661,7 @@ fn lone_expression_count_distinct_declines_fan_out_to_wrapper() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let items = detect_aggregates(&expr)
+    let items = detect_aggregates(&expr, &ColumnTypes::default())
         .expect("a lone COUNT(DISTINCT expr) still decomposes to a distinct item");
     assert_eq!(items.len(), 1);
     let dc = distinct_of(&items[0]);
@@ -676,8 +688,8 @@ fn lone_expression_count_distinct_declines_fan_out_to_wrapper() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    let bare_items =
-        detect_aggregates(&bare).expect("a lone bare-column COUNT(DISTINCT) decomposes");
+    let bare_items = detect_aggregates(&bare, &ColumnTypes::default())
+        .expect("a lone bare-column COUNT(DISTINCT) decomposes");
     assert!(
         is_lone_count_distinct(&bare_items),
         "a lone BARE-COLUMN COUNT(DISTINCT) is unaffected — it still fans out (Case 1)"
@@ -699,7 +711,7 @@ fn non_decomposable_aggregate_falls_back_to_row_scan() {
             )
             .build_pushdown();
         assert!(
-            detect_aggregates(&req).is_none(),
+            detect_aggregates(&req, &ColumnTypes::default()).is_none(),
             "{name} must fall back to row scan"
         );
     }
@@ -710,7 +722,7 @@ fn non_decomposable_aggregate_falls_back_to_row_scan() {
         )
         .build_pushdown();
     assert!(
-        detect_aggregates(&req_distinct).is_none(),
+        detect_aggregates(&req_distinct, &ColumnTypes::default()).is_none(),
         "SUM(DISTINCT) must fall back to row scan"
     );
 }
@@ -726,8 +738,8 @@ fn parse_agg_item_recognises_stat_functions() {
         ("VAR_POP", AggKind::VarPop),
     ] {
         let item = agg_item(name, Some("AMOUNT"), false);
-        let plan =
-            parse_agg_item(&item).unwrap_or_else(|| panic!("{name} must parse to a stat plan"));
+        let plan = parse_agg_item(&item, &ColumnTypes::default())
+            .unwrap_or_else(|| panic!("{name} must parse to a stat plan"));
         assert_eq!(
             plan.kind, *expected_kind,
             "{name} must map to {:?}",
@@ -742,14 +754,14 @@ fn stat_aggregate_over_expression_argument_declines() {
     for arg in [length_expr("SCORE"), mult_expr("SCORE", "ID")] {
         let item = agg_item_expr("STDDEV", arg.clone(), false);
         assert!(
-            parse_agg_item(&item).is_none(),
+            parse_agg_item(&item, &ColumnTypes::default()).is_none(),
             "STDDEV over a non-column argument must decline: {arg}"
         );
         let req = pushdown_request("T", NO_COLUMNS)
             .item(item, ExasolType::WIDEST_VARCHAR)
             .build_pushdown();
         assert!(
-            detect_aggregates(&req).is_none(),
+            detect_aggregates(&req, &ColumnTypes::default()).is_none(),
             "one declining stat aggregate must decline the whole select list: {arg}"
         );
     }
@@ -757,8 +769,11 @@ fn stat_aggregate_over_expression_argument_declines() {
 
 #[test]
 fn stat_aggregate_over_bare_column_still_parses() {
-    let plan = parse_agg_item(&agg_item("STDDEV", Some("SCORE"), false))
-        .expect("STDDEV over a bare column must still parse");
+    let plan = parse_agg_item(
+        &agg_item("STDDEV", Some("SCORE"), false),
+        &ColumnTypes::default(),
+    )
+    .expect("STDDEV over a bare column must still parse");
     assert_eq!(plan.kind, AggKind::Stddev);
     assert_eq!(plan.column.as_deref(), Some("SCORE"));
     assert_eq!(plan.arg_expr, None);
@@ -766,7 +781,10 @@ fn stat_aggregate_over_bare_column_still_parses() {
 
 #[test]
 fn single_group_plan_types_returns_empty_vec_for_no_items() {
-    assert_eq!(single_group_plan_types(&[], &[]), Vec::<ExasolType>::new());
+    assert_eq!(
+        single_group_plan_types(&[], &[], &ColumnTypes::default()),
+        Some(Vec::<ExasolType>::new())
+    );
 }
 
 #[test]
@@ -782,19 +800,21 @@ fn single_group_plan_types_aligns_with_bare_aggregate_select_list() {
             ExasolType::decimal(9, 4),
         )
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("a bare aggregate list must decompose");
+    let items = detect_aggregates(&req, &ColumnTypes::default())
+        .expect("a bare aggregate list must decompose");
     assert_eq!(
-        single_group_plan_types(req.select_types(), &items),
-        vec![
+        single_group_plan_types(req.select_types(), &items, &ColumnTypes::default()),
+        Some(vec![
             ExasolType::decimal(36, 2),
             ExasolType::decimal(18, 0),
             ExasolType::decimal(9, 4),
-        ]
+        ])
     );
 }
 
 #[test]
-fn single_group_plan_types_defaults_when_reached_only_through_scalar_wrapper() {
+fn single_group_plan_types_types_a_slot_reached_only_through_scalar_wrapper() {
+    let col_types = column_types(&[("L_QUANTITY", ExasolType::decimal(15, 2))]);
     let req = pushdown_request("T", NO_COLUMNS)
         .item(
             round_of(
@@ -804,33 +824,37 @@ fn single_group_plan_types_defaults_when_reached_only_through_scalar_wrapper() {
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("ROUND(SUM/COUNT) must decompose");
+    let items = detect_aggregates(&req, &col_types).expect("ROUND(SUM/COUNT) must decompose");
     assert_eq!(
-        single_group_plan_types(req.select_types(), &items),
-        vec![ExasolType::DoublePrecision, ExasolType::DoublePrecision],
+        single_group_plan_types(req.select_types(), &items, &col_types),
+        Some(vec![ExasolType::decimal(26, 2), ExasolType::decimal(18, 0)]),
         "neither nested aggregate has a top-level select-list entry of its own, so \
-         both slots take the nested-only numeric default"
+         both slots take Exasol's result type of the aggregate"
     );
 }
 
 #[test]
 fn single_group_plan_types_prefers_top_level_declared_type_for_shared_slot() {
+    let col_types = column_types(&[("L_QUANTITY", ExasolType::decimal(15, 2))]);
     let req = pushdown_request("T", NO_COLUMNS)
-        .count_star()
         .item(
             round_of(
                 float_div(agg_item("SUM", Some("L_QUANTITY"), false), count_star()),
                 2,
             ),
+            ExasolType::decimal(9, 4),
+        )
+        .item(
+            agg_item("SUM", Some("L_QUANTITY"), false),
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("COUNT(*) + ROUND(SUM/COUNT) must decompose");
+    let items = detect_aggregates(&req, &col_types).expect("ROUND(SUM/COUNT) + SUM must decompose");
     assert_eq!(
-        single_group_plan_types(req.select_types(), &items),
-        vec![ExasolType::decimal(18, 0), ExasolType::DoublePrecision],
-        "slot 0 (COUNT) takes its bare declared type; slot 1 (SUM) has no top-level \
-         occurrence and keeps the nested-only numeric default"
+        single_group_plan_types(req.select_types(), &items, &col_types),
+        Some(vec![ExasolType::decimal(36, 2), ExasolType::decimal(18, 0)]),
+        "slot 0 (SUM) takes its top-level declared type, not the nested DECIMAL(26,2); \
+         slot 1 (COUNT) has no top-level occurrence and takes its nested type"
     );
 }
 
@@ -850,10 +874,11 @@ fn single_group_plan_types_resolves_both_ends_of_an_interleaved_list() {
         )
         .count_star()
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("an interleaved list must decompose");
+    let items = detect_aggregates(&req, &ColumnTypes::default())
+        .expect("an interleaved list must decompose");
     assert_eq!(
-        single_group_plan_types(req.select_types(), &items),
-        vec![ExasolType::decimal(36, 2), ExasolType::decimal(18, 0)],
+        single_group_plan_types(req.select_types(), &items, &ColumnTypes::default()),
+        Some(vec![ExasolType::decimal(36, 2), ExasolType::decimal(18, 0)]),
         "slot 0 (SUM) takes ordinal 0's type; slot 1 (COUNT) takes ordinal 2's type, \
          never ordinal 1's scalar-item type"
     );
@@ -871,49 +896,53 @@ fn single_group_plan_types_skips_distinct_items() {
             ExasolType::decimal(18, 0),
         )
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("SUM + COUNT(DISTINCT) must decompose");
+    let items = detect_aggregates(&req, &ColumnTypes::default())
+        .expect("SUM + COUNT(DISTINCT) must decompose");
     assert_eq!(
-        single_group_plan_types(req.select_types(), &items),
-        vec![ExasolType::decimal(36, 2)],
+        single_group_plan_types(req.select_types(), &items, &ColumnTypes::default()),
+        Some(vec![ExasolType::decimal(36, 2)]),
         "the COUNT(DISTINCT) item contributes no ordinary-aggregate slot"
     );
 }
 
 #[test]
-fn nested_only_expression_argument_min_emits_a_numeric_partial_column() {
+fn single_group_plan_types_declines_a_nested_only_aggregate_over_an_untyped_expression() {
     let req = pushdown_request("T", NO_COLUMNS)
         .item(
             round_of(agg_item_expr("MIN", mult_expr("A", "B"), false), 2),
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("ROUND(MIN(A * B), 2) must decompose");
-    let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(req.select_types(), &items);
+    let items = detect_aggregates(&req, &ColumnTypes::default())
+        .expect("ROUND(MIN(A * B), 2) must decompose");
     assert_eq!(
-        partial_emits_items(&plans, &ColumnTypes::default(), &plan_types),
-        vec![r#""PARTIAL_min_0" DOUBLE PRECISION"#.to_string()],
-        "a nested-only MIN over an expression must emit a numeric partial column"
+        single_group_plan_types(req.select_types(), &items, &ColumnTypes::default()),
+        None,
+        "a guessed partial type would break the merge, so an untyped MIN(A * B) declines (#476)"
     );
 }
 
 #[test]
 fn merge_select_wraps_scalar_structure_around_the_merged_partial() {
+    let col_types = column_types(&[("L_QUANTITY", ExasolType::decimal(15, 2))]);
     let req = pushdown_request("T", NO_COLUMNS)
         .item(
             round_of(agg_item("SUM", Some("L_QUANTITY"), false), 2),
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("ROUND(SUM(col), 2) must decompose");
-    let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(req.select_types(), &items);
+    let items = detect_aggregates(&req, &col_types).expect("ROUND(SUM(col), 2) must decompose");
+    let plans = ordinary_plans(&items, &col_types);
+    let plan_types = single_group_plan_types(req.select_types(), &items, &col_types)
+        .expect("SUM over a typed column is exactly typed");
 
     assert_eq!(
-        single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
+        single_group_merge_select(&items, &plans, &plan_types, &col_types),
         Some(vec![
-            r#"CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(36,2))"#.to_string()
-        ])
+            r#"CAST(ROUND(CAST(SUM("PARTIAL_sum_0") AS DECIMAL(26,2)), 2) AS DECIMAL(36,2))"#
+                .to_string()
+        ]),
+        "the merged SUM is cast to Exasol's SUM type before ROUND applies (#476)"
     );
 }
 
@@ -933,15 +962,17 @@ fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
         )
         .count_star()
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("an interleaved list must decompose");
-    let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(req.select_types(), &items);
+    let items = detect_aggregates(&req, &ColumnTypes::default())
+        .expect("an interleaved list must decompose");
+    let plans = ordinary_plans(&items, &ColumnTypes::default());
+    let plan_types = single_group_plan_types(req.select_types(), &items, &ColumnTypes::default())
+        .expect("every slot is exactly typed");
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
         Some(vec![
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2))"#.to_string(),
-            r#"CAST(ROUND((SUM("PARTIAL_sum_0") / SUM("PARTIAL_count_1")), 2) AS DECIMAL(9,4))"#
+            r#"CAST(ROUND((CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2)) / CAST(SUM("PARTIAL_count_1") AS DECIMAL(18,0))), 2) AS DECIMAL(9,4))"#
                 .to_string(),
             r#"CAST(SUM("PARTIAL_count_1") AS DECIMAL(18,0))"#.to_string(),
         ])
@@ -960,9 +991,11 @@ fn merge_select_declines_a_list_holding_a_distinct_item() {
             ExasolType::decimal(18, 0),
         )
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("SUM + COUNT(DISTINCT) must decompose");
-    let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(req.select_types(), &items);
+    let items = detect_aggregates(&req, &ColumnTypes::default())
+        .expect("SUM + COUNT(DISTINCT) must decompose");
+    let plans = ordinary_plans(&items, &ColumnTypes::default());
+    let plan_types = single_group_plan_types(req.select_types(), &items, &ColumnTypes::default())
+        .expect("every slot is exactly typed");
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
@@ -981,8 +1014,9 @@ fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
         node,
         declared_type: ExasolType::decimal(18, 0),
     }];
-    let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&[], &items);
+    let plans = ordinary_plans(&items, &ColumnTypes::default());
+    let plan_types = single_group_plan_types(&[], &items, &ColumnTypes::default())
+        .expect("an unclassifiable scalar contributes no slot to type");
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
@@ -1004,9 +1038,11 @@ fn merge_select_emits_one_item_per_selectlist_item_for_duplicate_aggregates() {
             ExasolType::decimal(36, 2),
         )
         .build_pushdown();
-    let items = detect_aggregates(&req).expect("a duplicated aggregate must decompose");
-    let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(req.select_types(), &items);
+    let items = detect_aggregates(&req, &ColumnTypes::default())
+        .expect("a duplicated aggregate must decompose");
+    let plans = ordinary_plans(&items, &ColumnTypes::default());
+    let plan_types = single_group_plan_types(req.select_types(), &items, &ColumnTypes::default())
+        .expect("every slot is exactly typed");
     assert_eq!(plans.len(), 1, "one partial column for both occurrences");
 
     assert_eq!(

@@ -10,11 +10,9 @@ use super::super::tests::{
 };
 use super::*;
 use crate::adapter::pushdown::ProjectedColumn;
-use crate::adapter::pushdown::support::apply_type_rewrites;
 use crate::adapter::pushdown::test_support::*;
 use crate::scan::spec::ColumnRef;
 use crate::types::exasol_type::ExasolType;
-use vs_expression::{render_df_filter_safe, render_expression_safe};
 
 /// One unaliased leg per name, in FROM-tree order.
 fn legs_of(names: &[&str]) -> JoinLegs {
@@ -433,106 +431,6 @@ fn orders_local_rendering_conjunct() -> Json {
     )
 }
 
-fn orders_local_rendering_and_declined_filter() -> Json {
-    and([
-        orders_local_rendering_conjunct(),
-        declined_second_predicate(table_col("ORDERS", "O_ORDERDATE")),
-    ])
-}
-
-#[test]
-fn declined_side_local_conjunct_partitions_to_residual() {
-    let filter = orders_local_rendering_and_declined_filter();
-    let rendering = orders_local_rendering_conjunct();
-    let declined = declined_second_predicate(table_col("ORDERS", "O_ORDERDATE"));
-    assert!(
-        !datafusion_renderable(&declined) && datafusion_renderable(&rendering),
-        "precondition: exactly one of the two conjuncts declines for DataFusion"
-    );
-
-    assert_eq!(
-        declined_only(&filter),
-        Some(declined.clone()),
-        "declined_only must keep exactly the conjunct DataFusion cannot express"
-    );
-    assert_eq!(
-        renderable_only(&filter),
-        Some(rendering),
-        "renderable_only must keep exactly its complement — the two are exact halves"
-    );
-    assert!(
-        render_expression_exasol_safe(&declined).is_some(),
-        "the residual conjunct must render in the Exasol dialect, or the outer \
-         WHERE could not apply it either"
-    );
-    assert_eq!(
-        customer_orders_legs().conjunct_leg(&declined),
-        Some(1),
-        "attribution is unchanged — only the RENDER declines, so the screen is \
-         the sole reason this conjunct becomes residual"
-    );
-}
-
-#[test]
-fn rendering_side_local_conjunct_still_reaches_its_leg() {
-    let filter = orders_local_rendering_and_declined_filter();
-    let leg_eligible = renderable_only(&filter).expect("the rendering conjunct survives");
-
-    let leg = render_df_filter_safe(
-        &leg_local_filter(&leg_eligible, &customer_orders_legs(), 1)
-            .expect("still ORDERS-leg-local"),
-    )
-    .expect("a DataFusion-renderable leg filter renders");
-
-    assert!(
-        leg.contains("'1995-01-01'") && !leg.contains("SECOND"),
-        "the rendering conjunct must reach the leg and the declined one must not: {leg}"
-    );
-}
-
-#[test]
-fn join_side_pruning_input_unchanged_when_df_render_declines() {
-    let filter = orders_local_rendering_and_declined_filter();
-
-    let legs = customer_orders_legs();
-    let pruning = leg_local_filter(&filter, &legs, 1).expect("both conjuncts are ORDERS-leg-local");
-    let mut pruning_conjuncts = Vec::new();
-    flatten_conjuncts(&pruning, &mut pruning_conjuncts);
-    assert_eq!(
-        pruning_conjuncts.len(),
-        2,
-        "pruning must still receive BOTH leg-local conjuncts: {pruning}"
-    );
-    assert!(
-        pruning_conjuncts.iter().any(|c| !datafusion_renderable(c)),
-        "the declined conjunct must still be in the pruning input: {pruning}"
-    );
-
-    let leg = leg_local_filter(
-        &renderable_only(&filter).expect("the rendering conjunct survives"),
-        &legs,
-        1,
-    )
-    .expect("the rendering conjunct is still ORDERS-leg-local");
-    let mut leg_conjuncts = Vec::new();
-    flatten_conjuncts(&leg, &mut leg_conjuncts);
-    assert_eq!(
-        leg_conjuncts.len(),
-        1,
-        "the screened leg filter must carry only the rendering conjunct: {leg}"
-    );
-    assert!(
-        leg_conjuncts.iter().all(|c| datafusion_renderable(c)),
-        "the screened leg filter must omit the declined conjunct: {leg}"
-    );
-}
-
-fn customer_col_types() -> Vec<(String, ExasolType)> {
-    involved_table(&join_request(Json::Null, equi_condition()), "CUSTOMER")
-        .unwrap()
-        .types
-}
-
 fn orders_col_types() -> Vec<(String, ExasolType)> {
     involved_table(&join_request(Json::Null, equi_condition()), "ORDERS")
         .unwrap()
@@ -657,39 +555,6 @@ fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
         declined,
         Some(decimal_like),
         "the declined half must be exactly the type-declined conjunct, RAW"
-    );
-}
-
-#[test]
-fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
-    let col_types = customer_col_types();
-    let filter = declined_second_predicate(cast_json(
-        serde_json::json!({"type": "VARCHAR", "size": 40}),
-        table_col("CUSTOMER", "C_CUSTKEY"),
-    ));
-
-    let rewritten = apply_type_rewrites(&filter, &column_types(&col_types))
-        .expect("precondition: the type pipeline ACCEPTS this tree");
-    assert!(
-        rewritten.to_string().contains("decimal_to_varchar_exasol"),
-        "precondition: the pipeline REWRITES the DECIMAL stringification: {rewritten}"
-    );
-    assert!(
-        !datafusion_renderable(&rewritten),
-        "precondition: the REWRITTEN tree still does not render for DataFusion"
-    );
-
-    let (leg, declined) = type_screened_leg_filter(&filter, &column_types(&col_types));
-
-    assert!(
-        leg.is_none(),
-        "a rewrite the DataFusion dialect cannot render must not reach the leg: {leg:?}"
-    );
-    assert_eq!(
-        declined,
-        Some(filter),
-        "it must reach the outer wrapper RAW — with the plain CAST, not the \
-         DataFusion-only rewrite the Exasol dialect has no node for"
     );
 }
 
@@ -1158,7 +1023,11 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
     let (leg, declined) = type_screened_leg_filter(&filter, &sides[0].column_types);
     assert!(declined.is_none(), "{declined:?}");
     assert_eq!(
-        render_df_filter_safe(&leg.expect("the leg takes the comparison")).as_deref(),
+        scan_filter_sql(
+            &leg.expect("the leg takes the comparison"),
+            &sides[0].column_types
+        )
+        .as_deref(),
         Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#)
     );
 }

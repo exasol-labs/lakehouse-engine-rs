@@ -4,9 +4,12 @@ use serde_json::Value as Json;
 mod column_node;
 mod datetime_format;
 pub mod exasol_type;
+mod scan_typing;
 pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
 use datetime_format::{FormatTarget, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
+use scan_typing::{BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE};
+pub use scan_typing::{ColumnTypeLookup, exact_expression_type};
 
 /// Which parser consumes the rendered fragment: DataFusion inside the scan UDF
 /// (`ScanSpec` filter/projection/group keys) or Exasol for the outer wrapper SQL.
@@ -154,29 +157,6 @@ fn is_empty_opt(value: Option<&str>) -> bool {
     matches!(value, None | Some(""))
 }
 
-/// Detects a boolean operand converted to string (CAST or `||`), which must render
-/// Exasol's `TRUE`/`FALSE` casing rather than DataFusion's lowercase cast.
-fn is_boolean_producing(kind: &str) -> bool {
-    matches!(
-        kind,
-        "literal_bool"
-            | "predicate_equal"
-            | "predicate_notequal"
-            | "predicate_less"
-            | "predicate_lessequal"
-            | "predicate_greater"
-            | "predicate_greaterequal"
-            | "predicate_and"
-            | "predicate_or"
-            | "predicate_not"
-            | "predicate_is_null"
-            | "predicate_is_not_null"
-            | "predicate_in_constlist"
-            | "predicate_between"
-            | "predicate_like"
-    )
-}
-
 /// DataFusion dialect only: Exasol's `TRUE`/`FALSE` casing instead of DataFusion's lowercase;
 /// NULL stays NULL rather than becoming `'NULL'` or `'FALSE'`.
 fn render_bool_to_string_case(bool_expr: &str) -> String {
@@ -254,8 +234,8 @@ fn render_args(args: &[Json], dialect: Dialect) -> Result<Vec<String>, UdfError>
         .collect()
 }
 
-/// Renders a one-argument conversion as is. With a format it renders only a `literal_string` the
-/// translation covers, and errs otherwise so the caller declines.
+/// Renders only a `literal_string` format the translation covers, and errs otherwise so the
+/// caller declines.
 fn render_to_datetime(
     target: FormatTarget,
     args: Option<&Vec<Json>>,
@@ -271,10 +251,9 @@ fn render_to_datetime(
         [] => Err(UdfError::User(format!(
             "function_scalar {node} requires at least 1 argument"
         ))),
-        [source] => {
-            let source = render_conversion_source(node, source, dialect)?;
-            Ok(Some(format!("{function}({source})")))
-        }
+        [_] => Err(UdfError::User(format!(
+            "function_scalar {node} without a format parses by the session's NLS settings"
+        ))),
         [source, format] => {
             let pattern = format
                 .get("type")
@@ -345,14 +324,6 @@ fn datafusion_cast_target(target: ExasolType) -> Result<String, UdfError> {
     })
 }
 
-/// Reproduces Exasol's shortest-form DECIMAL->string conversion. The caller MUST
-/// have confirmed `expr_sql` is DECIMAL-typed: it blindly strips zeros after a `.`.
-fn format_decimal_exasol_style(expr_sql: &str) -> String {
-    format!(
-        "regexp_replace(regexp_replace(CAST({expr_sql} AS VARCHAR), '(\\.[0-9]*[1-9])0+$', '\\1'), '\\.0+$', '')"
-    )
-}
-
 /// The scalar UDF the DataFusion dialect renders `FLOAT_DIV` as, registered
 /// by `lakehouse-engine`. It MUST take two arguments coerced to `Float64` (Exasol's
 /// `FN_FLOAT_DIV` is always float division), return `Float64`, propagate `NULL`, and
@@ -374,15 +345,6 @@ fn render_cast(
     let data_type = data_type.ok_or_else(|| UdfError::User("CAST missing 'dataType'".into()))?;
     let target = exasol_type_from_json(data_type)?;
     let target_type = render_cast_target(target, dialect)?;
-
-    let source_is_boolean = args[0]
-        .get("type")
-        .and_then(|t| t.as_str())
-        .is_some_and(is_boolean_producing);
-    if dialect == Dialect::DataFusion && target.is_character() && source_is_boolean {
-        return Ok(Some(render_bool_to_string_case(&inner)));
-    }
-
     Ok(Some(format!("CAST({inner} AS {target_type})")))
 }
 
@@ -674,24 +636,20 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             let args = value("arguments").and_then(|a| a.as_array());
             render_cast(args, value("dataType"), dialect)
         }
-        // Adapter-synthesized, never sent by Exasol: the adapter has confirmed
-        // the argument is a DECIMAL column being stringified.
-        "decimal_to_varchar_exasol" => {
-            let args = value("arguments")
+        // Synthesized by the typed scan pass, DataFusion dialect only: an integer's text is the
+        // same in every session, so the scan may produce it.
+        INTEGER_TEXT_NODE | BOOLEAN_TEXT_NODE if dialect == Dialect::DataFusion => {
+            let arg = value("arguments")
                 .and_then(|a| a.as_array())
-                .ok_or_else(|| {
-                    UdfError::User("decimal_to_varchar_exasol missing 'arguments'".into())
-                })?;
-            if args.len() != 1 {
-                return Err(UdfError::User(format!(
-                    "decimal_to_varchar_exasol requires exactly 1 argument, got {}",
-                    args.len()
-                )));
-            }
-            let inner = render_expression_inner(&args[0], dialect)?.ok_or_else(|| {
-                UdfError::User("decimal_to_varchar_exasol argument is null".into())
-            })?;
-            Ok(Some(format_decimal_exasol_style(&inner)))
+                .and_then(|a| a.first())
+                .ok_or_else(|| UdfError::User(format!("{kind} missing its argument")))?;
+            let inner = render_expression_inner(arg, dialect)?
+                .ok_or_else(|| UdfError::User(format!("{kind} argument is null")))?;
+            Ok(Some(if kind == INTEGER_TEXT_NODE {
+                format!("CAST(CAST({inner} AS DECIMAL(38,0)) AS VARCHAR)")
+            } else {
+                render_bool_to_string_case(&inner)
+            }))
         }
         "function_scalar" => {
             let fn_name = value("name")
@@ -834,7 +792,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     }))
                 }
                 // DataFusion's `concat` never collapses an all-empty result to NULL
-                // as Exasol's `||` does; boolean operands need Exasol casing.
+                // as Exasol's `||` does.
                 "CONCAT" => {
                     let args = args.ok_or_else(|| {
                         UdfError::User("function_scalar CONCAT missing 'arguments'".into())
@@ -847,18 +805,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     let rendered = args
                         .iter()
                         .map(|arg| {
-                            let r = render_expression_inner(arg, dialect)?.ok_or_else(|| {
+                            render_expression_inner(arg, dialect)?.ok_or_else(|| {
                                 UdfError::User("CONCAT argument rendered to null".into())
-                            })?;
-                            let is_bool = dialect == Dialect::DataFusion
-                                && arg
-                                    .get("type")
-                                    .and_then(|t| t.as_str())
-                                    .is_some_and(is_boolean_producing);
-                            Ok(if is_bool {
-                                render_bool_to_string_case(&r)
-                            } else {
-                                r
                             })
                         })
                         .collect::<Result<Vec<String>, UdfError>>()?;
@@ -897,9 +845,10 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     let args = args.ok_or_else(|| {
                         UdfError::User("function_scalar INSTR missing 'arguments'".into())
                     })?;
-                    if args.len() < 2 {
+                    // `strpos` has no start or occurrence argument, so a third would be dropped (#228).
+                    if args.len() != 2 {
                         return Err(UdfError::User(format!(
-                            "function_scalar INSTR requires 2 arguments, got {}",
+                            "function_scalar INSTR renders exactly 2 arguments, got {}",
                             args.len()
                         )));
                     }
@@ -913,9 +862,9 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     let args = args.ok_or_else(|| {
                         UdfError::User("function_scalar LOCATE missing 'arguments'".into())
                     })?;
-                    if args.len() < 2 {
+                    if args.len() != 2 {
                         return Err(UdfError::User(format!(
-                            "function_scalar LOCATE requires 2 arguments, got {}",
+                            "function_scalar LOCATE renders exactly 2 arguments, got {}",
                             args.len()
                         )));
                     }
@@ -1184,21 +1133,42 @@ fn render_junction(
     }
 }
 
-/// DataFusion dialect. Use [`render_expression_exasol`] for SQL parsed by Exasol.
-pub fn render_expression(expr: &Json) -> Result<String, UdfError> {
+/// The only DataFusion-dialect entry point: the typed pass runs first, so no caller can hand the
+/// scan an expression without its column types. `Err` declines the expression.
+pub fn render_scan_expression(
+    expr: &Json,
+    columns: &dyn ColumnTypeLookup,
+) -> Result<String, UdfError> {
+    let (typed, _) = scan_typing::type_scan_tree(expr, columns)?;
+    render_expression(&typed)
+}
+
+/// [`render_scan_expression`] for a filter. `Ok(None)` when it is trivially true (`TRUE`/`NULL`).
+pub fn render_scan_filter(
+    filter_expr: &Json,
+    columns: &dyn ColumnTypeLookup,
+) -> Result<Option<String>, UdfError> {
+    let sql = render_scan_expression(filter_expr, columns)?;
+    Ok((sql != "TRUE" && sql != "NULL").then_some(sql))
+}
+
+/// DataFusion dialect, untyped. Use [`render_scan_expression`].
+pub(crate) fn render_expression(expr: &Json) -> Result<String, UdfError> {
     render_expression_inner(expr, Dialect::DataFusion)?
         .ok_or_else(|| UdfError::User("expression node is null".into()))
 }
 
 /// `None` on any failure; never panics.
-pub fn render_expression_safe(expr: &Json) -> Option<String> {
+#[cfg(test)]
+pub(crate) fn render_expression_safe(expr: &Json) -> Option<String> {
     render_expression_inner(expr, Dialect::DataFusion).ok()?
 }
 
 /// `None` when rendering fails or the filter is trivially true (`TRUE`/`NULL`). The
 /// two causes are indistinguishable; the caller decides whether a declined filter
 /// must be self-applied.
-pub fn render_df_filter_safe(filter_expr: &Json) -> Option<String> {
+#[cfg(test)]
+pub(crate) fn render_df_filter_safe(filter_expr: &Json) -> Option<String> {
     let result = render_expression_inner(filter_expr, Dialect::DataFusion).ok()??;
     if result == "TRUE" || result == "NULL" {
         None

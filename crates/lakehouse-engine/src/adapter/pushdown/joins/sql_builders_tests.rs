@@ -12,7 +12,7 @@ use super::*;
 use crate::adapter::pushdown::test_support::*;
 use crate::scan::spec::{ColumnRef, SortKey, StorageBackend, StorageProps};
 use crate::types::exasol_type::{ExasolType, exasol_type_to_json};
-use vs_expression::{render_expression_exasol_safe, render_expression_safe};
+use vs_expression::render_expression_exasol_safe;
 
 /// The N-scan wrapper over the two-table `request`, its CUSTOMER and ORDERS sides one file each.
 fn n_scan_sql(request: &Json) -> Result<String, UdfError> {
