@@ -4,13 +4,13 @@ The adapter authenticates to an Iceberg REST catalog once per statement and virt
 
 ## Background
 
-* The catalog-auth token and the `/v1/config` prefix are catalog-scoped, so the session computes them once per statement and virtual schema. The prefix changes only when the CONNECTION names another catalog or warehouse, so createVirtualSchema, refresh, and setProperties look it up and record it as `CATALOG_PREFIX` (`vs-properties/create-virtual-schema-adapter-notes`), and a pushdown reuses it.
-* Scoped exception to the Iceberg REST OpenAPI `getConfig`: "All REST clients should first call this route to get catalog configuration properties from the server". The adapter calls it when it writes the schema metadata and treats that as the client's startup. After an `ALTER CONNECTION` to another catalog or warehouse, the user runs `ALTER VIRTUAL SCHEMA ... REFRESH`. The `loadTable` GET stays per-table because each response carries that table's own vended storage credentials.
+* The catalog-auth token is catalog-scoped, so the session obtains it once per statement and virtual schema. The prefix changes only when the CONNECTION names another catalog or warehouse, so createVirtualSchema, refresh, and setProperties look it up and record it as `CATALOG_PREFIX` (`vs-properties/create-virtual-schema-adapter-notes`), and every pushdown reuses it. The `loadTable` GET stays per-table because each response carries that table's own vended storage credentials.
+* Scoped exception to the Iceberg REST OpenAPI `getConfig`: "All REST clients should first call this route to get catalog configuration properties from the server". The adapter calls it when it writes the schema metadata and treats that as the client's startup. After an `ALTER CONNECTION` to another catalog or warehouse, the user runs `ALTER VIRTUAL SCHEMA ... REFRESH`.
 * A `CatalogSession` is valid for one `(catalog_uri, warehouse)` tuple. Join legs override only `CatalogProps.table`.
 * The session holds the live OAuth2 bearer token in its auth strategy. Redaction at the `loadTable` error site strips both the static catalog-auth secrets and that token.
 * The adapter validates every involved-table identifier before its first catalog request. A malformed identifier issues no catalog HTTP request.
 * The scan spec's `storage` value is the only part of the scan-driving SQL that depends on how the credential is delivered. `storage-access/scan-spec-credential-reference` encodes it as a connection reference or as a sealed envelope over the backend's encoding. Each table's own vended keys still land in that table's storage block, field for field, before sealing. `storage-access/pushdown-planning-cloud-credentials` owns that gate.
-* `IcebergRestCatalogClient` in `lakehouse-catalog`, behind the shared `CatalogClient` trait, runs the namespace enumeration for `createVirtualSchema` and the pushdown loads. It resolves its one `CatalogSession` at its first catalog request. That session serves a `createVirtualSchema` request's namespace listing and every `loadTable` GET of a statement's pushdowns, so each runs one OAuth2 grant and at most one `/v1/config` lookup. `architecture.md` states the crate boundary.
+* `IcebergRestCatalogClient` in `lakehouse-catalog`, behind the shared `CatalogClient` trait, runs the namespace enumeration for `createVirtualSchema` and the pushdown loads. It resolves its one `CatalogSession` at its first catalog request. That session serves a `createVirtualSchema` request's namespace listing and every `loadTable` GET of a statement's pushdowns, so a `createVirtualSchema`, `refresh`, or `setProperties` request runs one OAuth2 grant and one `/v1/config` lookup, and a statement's pushdowns run one OAuth2 grant and none. `architecture.md` states the crate boundary.
 * Related features: `catalog/rest-catalog-oauth-auth` (the three auth modes), `connection/connection-credentials-catalog-auth`, and `file-planning/pushdown-statement-state` (what a statement keeps).
 * The Iceberg REST `listTables` response carries only table identifiers and a next-page token (`ListTablesResponse` in `iceberg-catalog-rest`).
 
@@ -20,7 +20,7 @@ The adapter authenticates to an Iceberg REST catalog once per statement and virt
 
 * *GIVEN* the first pushdown request of a statement on a virtual schema over an Iceberg REST catalog, with one involved table
 * *WHEN* the adapter resolves the file list for the involved table
-* *THEN* the OAuth2 client-credentials grant and the `/v1/config` prefix lookup SHALL each run at most once for the statement, before the table's `loadTable` GET
+* *THEN* the OAuth2 client-credentials grant SHALL run at most once for the statement, before the table's `loadTable` GET, and the adapter SHALL send no `/v1/config` request
 * *AND* the table's `loadTable` GET SHALL carry that grant's token and that prefix, and the success-path catalog request URLs MUST be the URLs that the same table yields as the only table of its statement
 * *AND* the resolved file list, the per-shard scan-spec storage, and the scan-driving SQL MUST NOT depend on how many requests of the statement share the grant and the prefix, EXCEPT for the `storage` VALUE, which `storage-access/scan-spec-credential-reference` encodes as a connection reference carrying no credential or as a sealed envelope over the backend's encoding
 
@@ -28,7 +28,7 @@ The adapter authenticates to an Iceberg REST catalog once per statement and virt
 
 * *GIVEN* an inner-join pushdown over N legs on a virtual schema over an Iceberg REST catalog, where two legs may name the same table, as a self-join does
 * *WHEN* the adapter resolves every leg's file list
-* *THEN* the OAuth2 client-credentials grant and the `/v1/config` prefix lookup SHALL run at most once for the whole request, not once per leg
+* *THEN* the OAuth2 client-credentials grant SHALL run at most once for the whole request, not once per leg, and the adapter SHALL send no `/v1/config` request
 * *AND* the adapter SHALL issue at most one `loadTable` GET per distinct table of the request, so a two-leg self-join issues one, and SHALL issue none for a table that an earlier pushdown of the statement loaded
 
 ### Scenario: A pushdown takes the catalog prefix from the schema notes
@@ -37,7 +37,6 @@ The adapter authenticates to an Iceberg REST catalog once per statement and virt
 * *WHEN* the adapter resolves the statement's catalog session
 * *THEN* the adapter MUST NOT send a `/v1/config` request
 * *AND* every `loadTable` GET SHALL carry the recorded prefix, so its URL equals the one the `/v1/config` prefix yields
-* *AND* a virtual schema whose notes hold no `CATALOG_PREFIX`, because an earlier adapter version wrote them, SHALL look the prefix up once per statement, as before
 
 ### Scenario: Per-table loadTable GET is preserved so per-table vended credentials are returned
 
@@ -84,7 +83,7 @@ The adapter authenticates to an Iceberg REST catalog once per statement and virt
 
 * *GIVEN* a single-table or an N-table join pushdown request under OAuth2 client-credentials catalog auth, on a virtual schema with `PERMISSION_CHECK = 'LAKEKEEPER'` whose Lakekeeper answer allows every table
 * *WHEN* the adapter checks permissions and resolves every table's file list
-* *THEN* the OAuth2 grant and the `/v1/config` lookup SHALL each run at most once for the statement, as they do with the check off
+* *THEN* the OAuth2 grant SHALL run at most once for the statement and the adapter SHALL send no `/v1/config` request, as with the check off
 * *AND* the batch-check SHALL carry the bearer token of that one grant
 * *AND* a request that reads a table that no earlier pushdown of the statement checked SHALL add exactly one request, the batch-check, after the session resolves and before the first `loadTable` GET of those tables, and SHALL leave every other request of "Single-table pushdown builds one catalog session and reuses it" and "N-table join reuses one session across all legs" unchanged
 * *AND* a request whose tables earlier pushdowns of the statement all checked SHALL add no request
@@ -100,7 +99,7 @@ The adapter authenticates to an Iceberg REST catalog once per statement and virt
 ### Scenario: A failed config lookup fails the request
 
 * *GIVEN* a CONNECTION without `use_sigv4` whose `GET {uri}/v1/config?warehouse={warehouse}` fails or answers a non-success status, for example for an unknown warehouse name
-* *WHEN* the adapter resolves the catalog session of a `createVirtualSchema`, `REFRESH`, or `SET PROPERTIES` request, or of a pushdown on a virtual schema whose notes hold no `CATALOG_PREFIX`
+* *WHEN* the adapter resolves the catalog session of a `createVirtualSchema`, `REFRESH`, or `SET PROPERTIES` request
 * *THEN* the request SHALL fail with an error that names the warehouse and carries the catalog's answer
 * *AND* the adapter MUST NOT fall back to an empty prefix, because an unprefixed request reaches the catalog's default warehouse or answers every table with HTTP 404
 

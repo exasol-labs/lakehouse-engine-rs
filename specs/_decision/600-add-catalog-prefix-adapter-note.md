@@ -24,4 +24,3 @@ createVirtualSchema, refresh, and setProperties record the prefix their catalog 
 ### Consequences
 
 - After an `ALTER CONNECTION` to another catalog or warehouse, the user runs `ALTER VIRTUAL SCHEMA ... REFRESH`.
-- A virtual schema whose notes hold no `CATALOG_PREFIX` still looks the prefix up per statement.
