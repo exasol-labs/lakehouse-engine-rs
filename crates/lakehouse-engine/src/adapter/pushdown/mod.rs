@@ -25,12 +25,12 @@ pub(crate) use binary_filter::literal_binary_bytes;
 
 mod support;
 pub use support::{
-    AggregateMergeInputs, ColumnTypes, ProjectedColumn, PushdownRequest, build_fan_out_inner,
-    build_scan_driving_sql, shard_count,
+    AggregateMergeInputs, ColumnTypes, ProjectedColumn, PushdownRequest, ScanTranslator,
+    build_fan_out_inner, build_scan_driving_sql, shard_count,
 };
 use support::{
-    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, classify_where_filter, extract_limit,
-    involved_columns, order_by_present, project_columns, projection_items, scan_storage_for,
+    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, extract_limit, involved_columns, order_by_present,
+    project_columns, projection_items, scan_storage_for,
 };
 use vs_expression::strip_table_alias;
 
@@ -86,7 +86,7 @@ use joins::{
 #[cfg(test)]
 use crate::scan::spec::{AggKind, AggregatePlan, StorageBackend};
 #[cfg(test)]
-use test_support::{render_df_filter_safe, scan_filter_sql};
+use test_support::scan_filter_sql;
 
 #[cfg(test)]
 #[path = "test_support_tests.rs"]
@@ -184,11 +184,12 @@ pub(crate) async fn handle_pushdown(
     ) = resolver
         .resolve(&catalog.table, filter_json_raw, &involved)
         .await?;
-    let (projection, projection_widened) = project_columns(&pushdown, &col_types)?;
+    let scan = ScanTranslator::new(&col_types);
+    let (projection, projection_widened) = project_columns(&pushdown, scan)?;
     // `filter_json_raw` stays unmodified: format-level pruning must see the original
     // predicate tree, whatever the adapter declines.
     let binary_as_string = resolve_binary_as_string(&props);
-    let (filter, declined_filter) = classify_where_filter(filter_json_raw, &col_types);
+    let (filter, declined_filter) = scan.split_where(filter_json_raw);
     let conn = statement.connection();
     let scan_storage = scan_storage_for(
         &conn.creds,
@@ -213,7 +214,7 @@ pub(crate) async fn handle_pushdown(
             &pushdown,
             &projection,
             projection_widened,
-            &col_types,
+            scan,
             &EmptyRelation::single_scan(request, &col_types),
         );
     }
@@ -231,7 +232,7 @@ pub(crate) async fn handle_pushdown(
         &pushdown,
         projection,
         projection_widened,
-        &col_types,
+        scan,
         filter,
         declined_filter,
         limit,
@@ -263,7 +264,7 @@ pub(crate) fn build_dispatch_sql(
     pushdown: &PushdownRequest,
     mut projection: Vec<ProjectedColumn>,
     projection_widened: bool,
-    col_types: &ColumnTypes,
+    scan: ScanTranslator<'_>,
     filter: Option<String>,
     declined_filter: Option<&Json>,
     limit: Option<u64>,
@@ -317,14 +318,14 @@ pub(crate) fn build_dispatch_sql(
             &base,
             None,
             shards,
-            col_types,
+            scan.columns(),
             udf_name,
             distribute_udf_name,
             Some(declined),
         );
     }
 
-    let single_group_merge = match classify_request_shape(pushdown, col_types) {
+    let single_group_merge = match classify_request_shape(pushdown, scan) {
         RequestShape::Grouped {
             detection,
             having,
@@ -365,7 +366,7 @@ pub(crate) fn build_dispatch_sql(
                 pushdown.select_types(),
                 grouped_limit,
                 support::extract_offset(pushdown_req),
-                col_types,
+                scan,
                 udf_name,
                 distribute_udf_name,
                 having.as_deref(),
@@ -379,7 +380,7 @@ pub(crate) fn build_dispatch_sql(
                     &base,
                     filter.clone(),
                     shards,
-                    col_types,
+                    scan.columns(),
                     udf_name,
                     distribute_udf_name,
                     None,
@@ -398,7 +399,7 @@ pub(crate) fn build_dispatch_sql(
                 &base,
                 filter.clone(),
                 shards,
-                col_types,
+                scan.columns(),
                 udf_name,
                 distribute_udf_name,
                 None,
@@ -431,7 +432,7 @@ pub(crate) fn build_dispatch_sql(
                     &base_spec,
                     shards,
                     &items,
-                    col_types,
+                    scan.columns(),
                     limit,
                     udf_name,
                     distribute_udf_name,
@@ -449,20 +450,20 @@ pub(crate) fn build_dispatch_sql(
                     &base,
                     filter.clone(),
                     shards,
-                    col_types,
+                    scan.columns(),
                     udf_name,
                     distribute_udf_name,
                     None,
                 );
             }
-            let plans = ordinary_plans(&items, col_types);
+            let plans = ordinary_plans(&items, scan);
             // Assembled here because it depends on select-list classification.
             let merge_inputs = single_group_merge_select(
                 &items,
                 &plans,
                 &plan_types,
                 pushdown.select_types(),
-                col_types,
+                scan,
             )
             .and_then(|merge_select| {
                 AggregateMergeInputs::new(plan_types, merge_select, limit)
@@ -476,7 +477,7 @@ pub(crate) fn build_dispatch_sql(
                     &base,
                     filter.clone(),
                     shards,
-                    col_types,
+                    scan.columns(),
                     udf_name,
                     distribute_udf_name,
                     None,
@@ -496,7 +497,7 @@ pub(crate) fn build_dispatch_sql(
                     &base,
                     filter.clone(),
                     shards,
-                    col_types,
+                    scan.columns(),
                     udf_name,
                     distribute_udf_name,
                     None,
@@ -550,7 +551,7 @@ pub(crate) fn build_dispatch_sql(
         // Exasol does not re-sort a delegated ordering, so an unrenderable key must
         // decline before any SQL is built (#198).
         topn::ensure_every_sort_key_renders(&keys)?;
-        topn::extend_projection_with_sort_keys(&mut projection, &keys, col_types);
+        topn::extend_projection_with_sort_keys(&mut projection, &keys, scan.columns());
         keys
     } else {
         Vec::new()
@@ -588,7 +589,7 @@ pub(crate) fn build_dispatch_sql(
         shards,
         &projection,
         effective_limit,
-        col_types,
+        scan.columns(),
         merge_inputs.as_ref(),
         udf_name,
         distribute_udf_name,

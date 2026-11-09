@@ -227,9 +227,9 @@ fn broadcast_declines_on_unrenderable_filter_stays_eligible_when_absent() {
 }
 
 #[test]
-fn broadcast_declines_like_over_decimal_side_column() {
+fn broadcast_declines_like_over_date_side_column() {
     let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["filter"] = like(table_col("CUSTOMER", "C_CUSTKEY"), "1%");
+    request["pushdownRequest"]["filter"] = like(table_col("ORDERS", "O_ORDERDATE"), "1995%");
     let detected = detected_join(&request);
 
     let outcome = render_broadcast_join(
@@ -240,16 +240,15 @@ fn broadcast_declines_like_over_decimal_side_column() {
     .expect("a type-declined filter is a clean decline, not an error");
     assert!(
         outcome.is_none(),
-        "LIKE over a DECIMAL side column must decline the broadcast plan \
-         (Ok(None)) so the request falls through to the N-scan fallback, which \
-         self-applies it"
+        "a DATE's text depends on NLS_DATE_FORMAT, so the broadcast plan declines \
+         and the N-scan fallback self-applies the LIKE"
     );
 }
 
 #[test]
-fn broadcast_keeps_plan_and_casts_like_over_date_side_column() {
+fn broadcast_keeps_plan_for_like_over_integer_side_column() {
     let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["filter"] = like(table_col("ORDERS", "O_ORDERDATE"), "1995%");
+    request["pushdownRequest"]["filter"] = like(table_col("CUSTOMER", "C_CUSTKEY"), "1%");
     let detected = detected_join(&request);
 
     let rendered = render_broadcast_join(
@@ -257,15 +256,14 @@ fn broadcast_keeps_plan_and_casts_like_over_date_side_column() {
         &detected,
         &request_sides(&request, &detected),
     )
-    .expect("a DATE LIKE subject must not error")
-    .expect("a DATE LIKE subject must keep the broadcast plan, not decline");
+    .expect("an integer LIKE subject must not error")
+    .expect("an integer LIKE subject must keep the broadcast plan");
     let filter = rendered
         .filter
-        .expect("the rewritten LIKE must still render as a scan-spec filter");
+        .expect("the LIKE renders as a scan-spec filter");
     assert!(
-        filter.contains(r#"CAST("LHS_T1"."O_ORDERDATE" AS VARCHAR)"#) && filter.contains("LIKE"),
-        "the DATE subject must be rewrapped in CAST-to-VARCHAR form before the \
-         LIKE: {filter}"
+        filter.contains(r#"CAST(CAST("LHS_T0"."C_CUSTKEY" AS DECIMAL(38,0)) AS VARCHAR) LIKE"#),
+        "{filter}"
     );
 }
 
@@ -336,7 +334,7 @@ fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
     request["pushdownRequest"]["filter"] = compare(
         "predicate_greater",
         table_col("ORDERS", "O_ORDERDATE"),
-        str_lit("1995-01-01"),
+        date_lit("1995-01-01"),
     );
     let sql = n_scan_sql(&request).expect("the two-table unified fallback must build");
 
@@ -829,7 +827,9 @@ fn n_scan_wrapper_qualifies_every_clause_by_leg() {
     .expect("every clause must render against its own occurrence's leg");
 
     assert!(
-        sql.contains(r#"SELECT "LHS_T0"."O_CUSTKEY", SUM("LHS_T1"."O_CUSTKEY")"#),
+        sql.contains(
+            r#"SELECT "LHS_T0"."O_CUSTKEY", CAST(SUM("LHS_T1"."O_CUSTKEY") AS DECIMAL(36,0))"#
+        ),
         "the select list must qualify each item to its own occurrence: {sql}"
     );
     assert!(
@@ -1068,31 +1068,30 @@ fn n_scan_request_with_filter(filter: Json) -> Json {
 
 #[test]
 fn n_scan_type_declined_side_local_conjunct_moves_to_outer_where() {
-    let request = n_scan_request_with_filter(like(table_col("ORDERS", "O_CUSTKEY"), "1%"));
-
-    let (legs, outer) = n_scan_legs_and_outer_where(&request);
-
-    assert!(
-        outer.contains(r#""LHS_T1"."O_CUSTKEY""#) && outer.contains("LIKE"),
-        "the type-declined conjunct must be self-applied table-qualified in the \
-         outer WHERE: {outer}"
-    );
-    assert!(
-        !legs.contains("LIKE"),
-        "it must NOT also reach the fan-out leg — that is the tree DataFusion \
-         cannot coerce: {legs}"
-    );
-}
-
-#[test]
-fn n_scan_date_like_side_local_conjunct_reaches_leg_as_cast() {
     let request = n_scan_request_with_filter(like(table_col("ORDERS", "O_ORDERDATE"), "1995%"));
 
     let (legs, outer) = n_scan_legs_and_outer_where(&request);
 
     assert!(
-        legs.contains(r#"CAST(\"O_ORDERDATE\" AS VARCHAR)"#) && legs.contains("LIKE"),
-        "the DATE LIKE subject must reach its leg CAST to VARCHAR: {legs}"
+        outer.contains(r#""LHS_T1"."O_ORDERDATE""#) && outer.contains("LIKE"),
+        "the type-declined conjunct must be self-applied table-qualified in the \
+         outer WHERE: {outer}"
+    );
+    assert!(
+        !legs.contains("LIKE"),
+        "it must NOT also reach the fan-out leg: {legs}"
+    );
+}
+
+#[test]
+fn n_scan_integer_like_side_local_conjunct_reaches_leg_as_text() {
+    let request = n_scan_request_with_filter(like(table_col("ORDERS", "O_CUSTKEY"), "1%"));
+
+    let (legs, outer) = n_scan_legs_and_outer_where(&request);
+
+    assert!(
+        legs.contains(r#"CAST(CAST(\"O_CUSTKEY\" AS DECIMAL(38,0)) AS VARCHAR) LIKE"#),
+        "the integer LIKE subject must reach its leg as canonical text: {legs}"
     );
     assert!(
         outer.is_empty(),
@@ -1116,8 +1115,8 @@ fn n_scan_type_accepted_side_local_conjunct_still_pushes_when_a_sibling_declines
         "exactly the type-accepted LIKE may reach the legs: {legs}"
     );
     assert!(
-        legs.contains(r#"CAST(\"O_ORDERDATE\" AS VARCHAR)"#),
-        "and it must arrive rewritten: {legs}"
+        legs.contains(r#"CAST(CAST(\"O_CUSTKEY\" AS DECIMAL(38,0)) AS VARCHAR)"#),
+        "and it must be the integer one: {legs}"
     );
     assert_eq!(
         outer.matches("LIKE").count(),
@@ -1125,8 +1124,8 @@ fn n_scan_type_accepted_side_local_conjunct_still_pushes_when_a_sibling_declines
         "exactly the type-declined LIKE may reach the outer WHERE: {outer}"
     );
     assert!(
-        outer.contains(r#""LHS_T1"."O_CUSTKEY""#),
-        "and it must be the DECIMAL one, table-qualified: {outer}"
+        outer.contains(r#""LHS_T1"."O_ORDERDATE""#),
+        "and it must be the DATE one, table-qualified: {outer}"
     );
 }
 
@@ -1156,19 +1155,20 @@ fn n_scan_leg_residual_partition_is_total_and_disjoint_with_type_screen() {
         "conjunct 1 must not be double-applied in the outer WHERE: {outer}"
     );
     assert_eq!(
-        legs.matches(r#"CAST(\"O_ORDERDATE\" AS VARCHAR)"#).count(),
+        legs.matches(r#"CAST(CAST(\"C_CUSTKEY\" AS DECIMAL(38,0)) AS VARCHAR)"#)
+            .count(),
         1,
-        "conjunct 2 belongs to the ORDERS leg, rewritten, exactly once: {legs}"
+        "conjunct 3 belongs to the CUSTOMER leg, as text, exactly once: {legs}"
     );
     assert_eq!(
         legs.matches("LIKE").count(),
         1,
-        "conjunct 2 is the ONLY LIKE any leg may carry: {legs}"
+        "conjunct 3 is the ONLY LIKE any leg may carry: {legs}"
     );
     assert_eq!(
         outer.matches("LIKE").count(),
         1,
-        "conjunct 3 is the only LIKE the outer WHERE carries: {outer}"
+        "conjunct 2 is the only LIKE the outer WHERE carries: {outer}"
     );
     assert!(
         outer.contains("SECOND"),
@@ -1213,49 +1213,6 @@ fn join_like_over_varchar_side_column_pushes_down_unchanged() {
         outer.is_empty(),
         "a conjunct both join sites accept must not also land in the outer \
          WHERE: {outer}"
-    );
-}
-
-#[test]
-fn join_decimal_stringification_renders_trimmed_at_both_join_sites() {
-    let mut request = join_request(Json::Null, equi_condition());
-    request["involvedTables"][1]["columns"]
-        .as_array_mut()
-        .unwrap()
-        .push(involved_column_json(
-            "O_TOTALPRICE",
-            ExasolType::decimal(20, 2),
-        ));
-    let filter = compare(
-        "predicate_greater",
-        scalar_fn("LENGTH", [table_col("ORDERS", "O_TOTALPRICE")]),
-        num_lit(3),
-    );
-    request["pushdownRequest"]["filter"] = filter;
-    let detected = detected_join(&request);
-
-    let trim_wrapper = "regexp_replace(regexp_replace(CAST(";
-
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_sides(&request, &detected),
-    )
-    .expect("LENGTH(DECIMAL) > 3 must not error")
-    .expect("a renderable decimal-stringification rewrite must keep the broadcast plan");
-    let filter = rendered
-        .filter
-        .expect("the rewritten filter must still render as a scan-spec filter");
-    assert!(
-        filter.contains(&format!(r#"{trim_wrapper}"LHS_T1"."O_TOTALPRICE""#)),
-        "the broadcast filter must carry the decimal_to_varchar_exasol trim \
-         form over the ORDERS leg's column: {filter}"
-    );
-
-    let (legs, _outer) = n_scan_legs_and_outer_where(&request);
-    assert!(
-        legs.contains(trim_wrapper),
-        "the ORDERS fan-out leg must carry the same trim form: {legs}"
     );
 }
 
@@ -1312,7 +1269,9 @@ fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
         "MIN must qualify its argument to the owning side: {sql}"
     );
     assert!(
-        sql.starts_with(r#"SELECT COUNT(*), MIN("LHS_T1"."O_ORDERDATE") FROM"#),
+        sql.starts_with(
+            r#"SELECT CAST(COUNT(*) AS DECIMAL(18,0)), CAST(MIN("LHS_T1"."O_ORDERDATE") AS DATE) FROM"#
+        ),
         "the outer SELECT must be exactly the two aggregate columns: {sql}"
     );
     assert!(
@@ -2089,7 +2048,7 @@ fn golden_n_scan_join_sql_unchanged() {
         compare(
             "predicate_greater",
             table_col("ORDERS", "O_ORDERDATE"),
-            str_lit("1995-01-01"),
+            date_lit("1995-01-01"),
         ),
         compare(
             "predicate_greater",
@@ -2100,7 +2059,7 @@ fn golden_n_scan_join_sql_unchanged() {
     let actual = n_scan_sql(&request).expect("the two-table unified fallback must build");
     assert_eq!(
         actual,
-        r#"SELECT "LHS_T0"."C_NAME", "LHS_T1"."O_ORDERDATE" FROM (SELECT SCAN('{"table_root":"s3://warehouse/lh/customer","projection":["C_CUSTKEY","C_NAME"],"filter":"(\"C_NAME\" = ''ACME'')","logical_schema":[{"field_id":1,"name":"CUSTOMER_KEY","arrow_type":"int64","nullable":false}],"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" INNER JOIN (SELECT SCAN('{"table_root":"s3://warehouse/lh/orders","projection":["O_CUSTKEY","O_ORDERDATE"],"filter":"(\"O_ORDERDATE\" > ''1995-01-01'')","logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/o-0.parquet",100]]') EMITS ("O_CUSTKEY" DECIMAL(20,0), "O_ORDERDATE" DATE)) AS "LHS_T1" ON (("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")) WHERE (("LHS_T0"."C_CUSTKEY" > "LHS_T1"."O_CUSTKEY"))"#
+        r#"SELECT "LHS_T0"."C_NAME", "LHS_T1"."O_ORDERDATE" FROM (SELECT SCAN('{"table_root":"s3://warehouse/lh/customer","projection":["C_CUSTKEY","C_NAME"],"filter":"(\"C_NAME\" = ''ACME'')","logical_schema":[{"field_id":1,"name":"CUSTOMER_KEY","arrow_type":"int64","nullable":false}],"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" INNER JOIN (SELECT SCAN('{"table_root":"s3://warehouse/lh/orders","projection":["O_CUSTKEY","O_ORDERDATE"],"filter":"(\"O_ORDERDATE\" > DATE ''1995-01-01'')","logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/o-0.parquet",100]]') EMITS ("O_CUSTKEY" DECIMAL(20,0), "O_ORDERDATE" DATE)) AS "LHS_T1" ON (("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")) WHERE (("LHS_T0"."C_CUSTKEY" > "LHS_T1"."O_CUSTKEY"))"#
     );
 }
 
@@ -2115,7 +2074,7 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
             ],
         )],
     });
-    let pushdown_req = pushdown_request("CUSTOMER", &[("C_NAME", ExasolType::WIDEST_VARCHAR)])
+    let pushdown_req = pushdown_request("CUSTOMER", &[("C_NAME", ExasolType::varchar(100))])
         .group_by(vec![table_col("CUSTOMER", "C_NAME")])
         .column(table_col("CUSTOMER", "C_NAME"))
         .count_star()
@@ -2141,7 +2100,7 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
     .expect("the grouped qualified fallback must build");
     assert_eq!(
         actual,
-        r#"SELECT "LHS_T0"."C_NAME", COUNT(*) FROM (SELECT SCAN('{"projection":["C_CUSTKEY","C_NAME"],"storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" GROUP BY "LHS_T0"."C_NAME""#
+        r#"SELECT "LHS_T0"."C_NAME", CAST(COUNT(*) AS DECIMAL(18,0)) FROM (SELECT SCAN('{"projection":["C_CUSTKEY","C_NAME"],"storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" GROUP BY "LHS_T0"."C_NAME""#
     );
 }
 
@@ -3055,10 +3014,13 @@ fn shared_column_name_with_different_types_declares_each_legs_type() {
         varchar_leg.contains(r#""filter":"(\"LHS_T1\".\"SCORE\" LIKE ''a%'')""#),
         "the filter reads LABELS' own SCORE: {varchar_leg}"
     );
-    assert_eq!(
-        shared_names_broadcast_sql(&like(events_column("SCORE"), "1%")),
-        None,
-        "LIKE on the DECIMAL leg's SCORE still declines the broadcast plan"
+    let integer_leg = shared_names_broadcast_sql(&like(events_column("SCORE"), "1%"))
+        .expect("LIKE on the integer leg's SCORE converts it and keeps the plan");
+    assert!(
+        integer_leg.contains(
+            r#""filter":"(CAST(CAST(\"LHS_T0\".\"SCORE\" AS DECIMAL(38,0)) AS VARCHAR) LIKE ''1%'')""#
+        ),
+        "the filter converts EVENTS' own integer SCORE: {integer_leg}"
     );
 }
 

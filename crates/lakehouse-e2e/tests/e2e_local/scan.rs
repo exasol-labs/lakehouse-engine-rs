@@ -3813,7 +3813,7 @@ fn outer_merge_select_list(pushdown_sql: &str) -> &str {
 /// Scenario: The merge casts a merged value only when merging can change its type
 /// Scenario: Expression-argument partial and merge column types come from the declared aggregate type
 /// Scenario: Scalar-over-aggregate and plain aggregate items interleave in select-list order with per-item declared types
-/// Scenario: A MIN or MAX over a CHAR-typed expression declares a CHAR partial column
+/// Scenario: A group key travels with its exact type
 #[test]
 fn merge_casts_only_values_whose_type_merging_changes() {
     lakehouse_vs();
@@ -3838,7 +3838,7 @@ fn merge_casts_only_values_whose_type_merging_changes() {
     );
     for fragment in [
         "CAST(SUM(\"PARTIAL_count_3\") AS DECIMAL(",
-        ", MIN(\"PARTIAL_min_4\"), CAST(ROUND(SUM(\"PARTIAL_sum_2\"), 2) AS DECIMAL(",
+        ", MIN(\"PARTIAL_min_4\"), CAST(ROUND(CAST(SUM(\"PARTIAL_sum_2\") AS DECIMAL(",
     ] {
         assert!(
             merge.contains(fragment),
@@ -3852,26 +3852,18 @@ fn merge_casts_only_values_whose_type_merging_changes() {
     );
 
     let char_group_sql = isolated_pushdown_statement(&mut conn, &char_group.replace("{}", &table));
-    let merge = outer_merge_select_list(&char_group_sql);
     assert!(
-        merge.starts_with(
-            "\"GK_0\", MIN(\"PARTIAL_min_0\"), CAST(SUM(\"PARTIAL_sum_1\") AS DECIMAL("
-        ),
-        "a key declared VARCHAR(2000000), the type the scan emits, stays uncast, and the CHAR \
-         MIN merge too: {merge}"
-    );
-    let emits = emits_clause(&char_group_sql);
-    assert!(
-        emits.contains("\"PARTIAL_min_0\" CHAR(20)") && emits.contains("\"GK_0\" VARCHAR(2000000)"),
-        "the partial of the CHAR MIN must declare CHAR(20) and the key VARCHAR(2000000): {emits}"
+        !char_group_sql.contains("PARTIAL_"),
+        "the scan does not blank-pad, so a CAST to CHAR declines the split: {char_group_sql}"
     );
 
     let date_group_sql = isolated_pushdown_statement(&mut conn, &date_group.replace("{}", &table));
     let merge = outer_merge_select_list(&date_group_sql);
     assert!(
-        merge.starts_with("CAST(\"GK_0\" AS DATE), CAST(SUM(\"PARTIAL_sum_0\") AS DECIMAL("),
-        "a DATE key travels as text, so its merge casts it back: {merge}"
+        merge.starts_with("\"GK_0\", CAST(SUM(\"PARTIAL_sum_0\") AS DECIMAL("),
+        "a DATE key travels typed, so the merge reads it uncast: {merge}"
     );
+    assert!(emits_clause(&date_group_sql).contains("\"GK_0\" DATE"));
 
     assert_queries_match_native_copy(
         &mut conn,

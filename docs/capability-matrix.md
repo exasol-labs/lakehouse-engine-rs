@@ -157,7 +157,7 @@ sends the query to the adapter.
 | `HOURS_BETWEEN` | ✓ |  |
 | `INITCAP` | ✓ | Non-ASCII text can differ. See [Semantic differences](semantic-differences.md). |
 | `INSERT` |  |  |
-| `INSTR` | ✓ |  |
+| `INSTR` | ✓ | With a start position or an occurrence, it runs in Exasol SQL. |
 | `IS_BOOLEAN` |  |  |
 | `IS_DATE` |  |  |
 | `IS_DSINTERVAL` |  |  |
@@ -171,7 +171,7 @@ sends the query to the adapter.
 | `LENGTH` | ✓ |  |
 | `LN` | ✓ |  |
 | `LOCALTIMESTAMP` |  | The scan has no clock, time zone, or statement anchor. Exasol evaluates it once per statement. |
-| `LOCATE` | ✓ |  |
+| `LOCATE` | ✓ | With a start position or an occurrence, it runs in Exasol SQL. |
 | `LOG` | ✓ |  |
 | `LOWER` | ✓ | Non-ASCII text can differ. See [Semantic differences](semantic-differences.md). |
 | `LPAD` | ✓ |  |

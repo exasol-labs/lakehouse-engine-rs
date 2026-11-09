@@ -2,6 +2,23 @@ use super::*;
 use crate::test_support::*;
 use serde_json::json;
 
+/// `None` on any failure; never panics.
+fn render_expression_safe(expr: &Json) -> Option<String> {
+    render_expression_inner(expr, Dialect::DataFusion).ok()?
+}
+
+/// `None` when rendering fails or the filter is trivially true (`TRUE`/`NULL`). The
+/// two causes are indistinguishable; the caller decides whether a declined filter
+/// must be self-applied.
+fn render_df_filter_safe(filter_expr: &Json) -> Option<String> {
+    let result = render_expression_inner(filter_expr, Dialect::DataFusion).ok()??;
+    if result == "TRUE" || result == "NULL" {
+        None
+    } else {
+        Some(result)
+    }
+}
+
 /// Exasol's `CAST("X" AS data_type)` node.
 fn cast(data_type: Json) -> Json {
     cast_json(data_type, col("x"))
@@ -1849,22 +1866,20 @@ fn renders_string_family_verbatim_in_exasol_dialect() {
 }
 
 #[test]
-fn renders_instr_locate_verbatim_with_start_arg_in_exasol_dialect() {
-    // The DataFusion dialect's strpos drops a third (start) argument, a known limitation of
-    // that rendering.
+fn instr_locate_with_start_arg_render_in_exasol_and_decline_in_datafusion() {
     let instr = scalar_fn("INSTR", [str_lit("hello"), str_lit("l"), num_lit(3)]);
     assert_eq!(
         render_expression_exasol(&instr).unwrap(),
         "INSTR('hello', 'l', 3)"
     );
-    assert_eq!(render_expression(&instr).unwrap(), "strpos('hello', 'l')");
+    assert!(render_expression(&instr).is_err());
 
     let locate = scalar_fn("LOCATE", [str_lit("l"), str_lit("hello"), num_lit(3)]);
     assert_eq!(
         render_expression_exasol(&locate).unwrap(),
         "LOCATE('l', 'hello', 3)"
     );
-    assert_eq!(render_expression(&locate).unwrap(), "strpos('hello', 'l')");
+    assert!(render_expression(&locate).is_err());
 }
 
 #[test]

@@ -96,33 +96,40 @@ fn a_boolean_column_converts_to_exasol_casing() {
 }
 
 #[test]
-fn sized_ascii_and_char_targets_push_only_when_the_source_guarantees_the_result() {
-    assert!(render(&cast_to(ExasolType::varchar(10), col("S"))).is_err());
-    assert!(
-        render(&cast_to(
-            ExasolType::Varchar {
-                size: 2_000_000,
-                ascii: true
-            },
-            col("S")
-        ))
-        .is_err()
+fn text_casts_to_shorter_or_ascii_varchar_unchecked_and_decline_char() {
+    let ascii = |size| ExasolType::Varchar { size, ascii: true };
+    let cases = [
+        (
+            "text to shorter VARCHAR",
+            ExasolType::varchar(10),
+            "S",
+            true,
+        ),
+        ("text to ASCII", ascii(2_000_000), "S", true),
+        ("text to CHAR", ExasolType::char(10), "S", false),
+        (
+            "integer to fitting VARCHAR",
+            ExasolType::varchar(10),
+            "I",
+            true,
+        ),
+        ("integer to fitting ASCII", ascii(10), "I", true),
+        (
+            "integer to short VARCHAR",
+            ExasolType::varchar(9),
+            "I",
+            false,
+        ),
+        ("integer to CHAR", ExasolType::char(10), "I", false),
+    ];
+    for (label, target, column, pushed) in cases {
+        let rendered = render(&cast_to(target, col(column)));
+        assert_eq!(rendered.is_ok(), pushed, "{label}: {rendered:?}");
+    }
+    assert_eq!(
+        render(&cast_to(ExasolType::varchar(10), col("S"))).unwrap(),
+        r#"CAST("S" AS VARCHAR)"#
     );
-    assert!(render(&cast_to(ExasolType::char(10), col("S"))).is_err());
-    assert!(render(&cast_to(ExasolType::varchar(10), col("S10"))).is_ok());
-    assert!(render(&cast_to(ExasolType::varchar(10), col("I"))).is_ok());
-    assert!(render(&cast_to(ExasolType::varchar(9), col("I"))).is_err());
-    assert!(
-        render(&cast_to(
-            ExasolType::Varchar {
-                size: 10,
-                ascii: true
-            },
-            col("I")
-        ))
-        .is_ok()
-    );
-    assert!(render(&cast_to(ExasolType::char(10), col("I"))).is_err());
 }
 
 #[test]
@@ -158,12 +165,45 @@ fn comparing_text_with_a_date_or_number_declines() {
 #[test]
 fn an_integer_compares_with_a_digits_only_literal() {
     let filter = |column: &str, value: &str| predicate_equal(col(column), str_lit(value));
-    assert!(render(&filter("I", "3")).is_ok(), "I = '3' must render");
     for (column, value) in [("I", "3.5"), ("N", "3"), ("D", "2024-01-01")] {
         assert!(
             render(&filter(column, value)).is_err(),
             "{column} = '{value}' must decline"
         );
+    }
+}
+
+#[test]
+fn a_digits_only_literal_against_an_integer_renders_as_the_number_it_reads_as() {
+    let cases = [
+        (
+            "overflowing the column",
+            predicate_equal(col("I"), str_lit("2147483648")),
+            r#"("I" = 2147483648)"#,
+        ),
+        (
+            "leading zeros",
+            predicate_equal(str_lit("007"), col("I")),
+            r#"(7 = "I")"#,
+        ),
+        (
+            "negative zero",
+            predicate_equal(col("I"), str_lit("-0")),
+            r#"("I" = 0)"#,
+        ),
+        (
+            "IN",
+            in_list(col("I"), [str_lit("1"), str_lit("-02")]),
+            r#"("I" IN (1, -2))"#,
+        ),
+        (
+            "BETWEEN",
+            between(col("I"), str_lit("1"), str_lit("10")),
+            r#"("I" BETWEEN 1 AND 10)"#,
+        ),
+    ];
+    for (label, expr, expected) in cases {
+        assert_eq!(render(&expr).unwrap(), expected, "{label}");
     }
 }
 

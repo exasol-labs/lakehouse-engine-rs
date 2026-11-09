@@ -151,7 +151,10 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
 
     let filter_json = like(col("name"), "A%");
 
-    let df_filter = render_df_filter_safe(&filter_json);
+    let df_filter = scan_filter_sql(
+        &filter_json,
+        &column_types(&[("NAME", ExasolType::WIDEST_VARCHAR)]),
+    );
     assert!(
         df_filter.is_some(),
         "LIKE filter must still produce a DataFusion SQL string: {df_filter:?}"
@@ -162,32 +165,6 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
     assert!(
         iceberg_pred.is_none(),
         "LIKE filter must produce no Iceberg predicate"
-    );
-}
-
-#[test]
-fn where_filter_decimal_stringification_rewritten_to_trim() {
-    let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
-    let filter_json = compare(
-        "predicate_greater",
-        scalar_fn("LENGTH", [col("c_decimal_a")]),
-        num_lit(5),
-    );
-
-    let rendered = Some(&filter_json)
-        .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
-        .expect("LENGTH(decimal) > 5 must render to a DataFusion filter");
-
-    let trim_wrapper = "regexp_replace(regexp_replace(CAST(";
-    assert_eq!(
-        rendered.matches(trim_wrapper).count(),
-        1,
-        "the rewritten filter must carry the Exasol decimal-trim form EXACTLY ONCE \
-             (string-fn guard wraps it, decimal rewrite must then no-op): {rendered}"
-    );
-    assert!(
-        !rendered.contains(r#"character_length("C_DECIMAL_A")"#),
-        "the filter must NOT stringify the bare decimal column untrimmed: {rendered}"
     );
 }
 
@@ -211,50 +188,26 @@ fn filter_decimal_comparison_not_rewritten() {
 }
 
 #[test]
-fn where_filter_string_fn_under_comparison_predicate_coerced() {
-    let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
-    let filter_json = predicate_equal(scalar_fn("UPPER", [col("c_decimal_a")]), str_lit("X"));
-
-    let rendered = Some(&filter_json)
-        .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
-        .expect("UPPER(decimal) = 'X' must render to a DataFusion filter");
-
-    assert!(
-        rendered.contains("regexp_replace(regexp_replace(CAST("),
-        "the DECIMAL argument nested under predicate_equal's left must be coerced \
-             into the Exasol decimal-trim form: {rendered}"
-    );
-}
-
-#[test]
-fn where_filter_string_fn_over_double_declines() {
-    let col_types = vec![("C_DOUBLE_A".to_string(), ExasolType::DoublePrecision)];
-    let filter_json = predicate_equal(scalar_fn("UPPER", [col("c_double_a")]), str_lit("X"));
-
-    let rendered = Some(&filter_json).and_then(|f| scan_filter_sql(f, &column_types(&col_types)));
-
-    assert!(
-        rendered.is_none(),
-        "UPPER over a DOUBLE PRECISION column must decline the whole filter, \
-             not push a possibly-wrong text comparison: {rendered:?}"
-    );
-}
-
-#[test]
-fn where_filter_upper_decimal_inside_like_subject_coerced() {
-    let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
-    let filter_json = like(scalar_fn("UPPER", [col("c_decimal_a")]), "1%");
-
-    let rendered = Some(&filter_json)
-        .and_then(|f| scan_filter_sql(f, &column_types(&col_types)))
-        .expect("UPPER(decimal) LIKE '1%' must render to a DataFusion filter");
-
-    assert!(
-        rendered.contains("regexp_replace(regexp_replace(CAST("),
-        "the DECIMAL argument nested inside the LIKE subject's UPPER call must be \
-             coerced into the Exasol decimal-trim form, even though guard_like_subject \
-             itself leaves this non-bare-column LIKE subject untouched: {rendered}"
-    );
+fn where_filter_string_fn_over_session_formatted_number_declines() {
+    let col_types = vec![
+        ("C_DOUBLE_A".to_string(), ExasolType::DoublePrecision),
+        ("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2)),
+    ];
+    for column in ["c_double_a", "c_decimal_a"] {
+        let cases = [
+            predicate_equal(scalar_fn("UPPER", [col(column)]), str_lit("X")),
+            compare(
+                "predicate_greater",
+                scalar_fn("LENGTH", [col(column)]),
+                num_lit(5),
+            ),
+            like(scalar_fn("UPPER", [col(column)]), "1%"),
+        ];
+        for filter in cases {
+            let rendered = scan_filter_sql(&filter, &column_types(&col_types));
+            assert!(rendered.is_none(), "{column}: {rendered:?}");
+        }
+    }
 }
 
 #[test]
@@ -728,7 +681,7 @@ fn guard_dispatch_result(
         &PushdownRequest::parse(pushdown_req.clone())?,
         projected_columns(&proj_cols, &proj_types),
         projection_widened,
-        &column_types(&guard_col_types()),
+        ScanTranslator::new(&column_types(&guard_col_types())),
         None,
         None,
         limit,
@@ -761,19 +714,17 @@ fn declined_like_on_decimal() -> Json {
 fn dispatch_sql_for_body(request: PushdownRequestBuilder) -> String {
     let (request, _) = request.build();
     let pushdown_req = pd(&request);
-    let col_types = guard_col_types();
+    let col_types = first_table_column_types(&request);
     let (proj_cols, proj_types, projection_widened) =
         project_first_table(&request, &pushdown_req).expect("the fixture must project");
-    let (filter, declined_filter) = classify_where_filter(
-        pushdown_req.get("filter").filter(|f| !f.is_null()),
-        &column_types(&col_types),
-    );
+    let (filter, declined_filter) = ScanTranslator::new(&col_types)
+        .split_where(pushdown_req.get("filter").filter(|f| !f.is_null()));
     let result = build_dispatch_sql(
         &request,
         &parsed_pushdown(&request),
         projected_columns(&proj_cols, &proj_types),
         projection_widened,
-        &column_types(&col_types),
+        ScanTranslator::new(&col_types),
         filter,
         declined_filter,
         extract_limit(&pushdown_req),
@@ -854,7 +805,7 @@ fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
 fn trivially_true_filter_omitted_without_wrapper() {
     let trivially_true = bool_lit(true);
     let (filter, declined) =
-        classify_where_filter(Some(&trivially_true), &column_types(&guard_col_types()));
+        ScanTranslator::new(&column_types(&guard_col_types())).split_where(Some(&trivially_true));
     assert!(
         filter.is_none() && declined.is_none(),
         "a trivially-true filter is neither pushed nor declined: {filter:?} {declined:?}"
@@ -981,7 +932,8 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
         ("TS".to_string(), ExasolType::BARE_TIMESTAMP),
         ("AMOUNT".to_string(), ExasolType::decimal(18, 2)),
     ];
-    let (scan_filter, declined) = classify_where_filter(Some(&filter), &column_types(&col_types));
+    let (scan_filter, declined) =
+        ScanTranslator::new(&column_types(&col_types)).split_where(Some(&filter));
 
     assert!(
         scan_filter.is_none(),
@@ -1504,7 +1456,9 @@ fn dispatch_non_widened_projection_at_matching_arity_takes_scan_path() {
 
 fn timestamp_cast_select_request(precision: u8) -> PushdownRequestBuilder {
     let target = ExasolType::timestamp(precision);
-    guard_events().item(cast_to(target, table_col("EVENTS", "NAME")), target)
+    let mut columns = guard_col_types();
+    columns.push(("TS".to_string(), ExasolType::timestamp(9)));
+    pushdown_request("EVENTS", &columns).item(cast_to(target, table_col("EVENTS", "TS")), target)
 }
 
 #[test]
@@ -1512,7 +1466,7 @@ fn declined_timestamp_precision_cast_routes_to_qualified_wrapper() {
     let sql = dispatch_sql_for_body(timestamp_cast_select_request(2));
 
     assert!(
-        sql.starts_with(r#"SELECT CAST("LHS_T0"."NAME" AS TIMESTAMP(2)) FROM ("#),
+        sql.starts_with(r#"SELECT CAST("LHS_T0"."TS" AS TIMESTAMP(2)) FROM ("#),
         "the declined CAST must be computed in the wrapper's outer select list: {sql}"
     );
     assert!(
@@ -1524,7 +1478,7 @@ fn declined_timestamp_precision_cast_routes_to_qualified_wrapper() {
         .map(|at| &sql[at..])
         .unwrap_or_else(|| panic!("the wrapper must still drive the scan UDF: {sql}"));
     assert!(
-        emits.contains(r#""NAME" VARCHAR(2000000)"#) && !emits.contains("TIMESTAMP"),
+        emits.contains(r#""TS" TIMESTAMP(9)"#) && !emits.contains("TIMESTAMP(2)"),
         "the scan must emit the raw column, never the declined CAST target: {sql}"
     );
 }
@@ -1834,7 +1788,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         &parsed_pushdown(&request),
         projected_columns(&proj_cols, &proj_types),
         widened,
-        &column_types(&guard_col_types()),
+        ScanTranslator::new(&column_types(&guard_col_types())),
         None,
         None,
         None,
@@ -2256,16 +2210,14 @@ fn dispatch_result_for_body(
     let col_types = guard_col_types();
     let (proj_cols, proj_types, projection_widened) =
         project_first_table(&request, &pushdown_req).expect("the fixture must project");
-    let (filter, declined_filter) = classify_where_filter(
-        pushdown_req.get("filter").filter(|f| !f.is_null()),
-        &column_types(&col_types),
-    );
+    let (filter, declined_filter) = ScanTranslator::new(&column_types(&col_types))
+        .split_where(pushdown_req.get("filter").filter(|f| !f.is_null()));
     let result = build_dispatch_sql(
         &request,
         &parsed_pushdown(&request),
         projected_columns(&proj_cols, &proj_types),
         projection_widened,
-        &column_types(&col_types),
+        ScanTranslator::new(&column_types(&col_types)),
         filter,
         declined_filter,
         extract_limit(&pushdown_req),

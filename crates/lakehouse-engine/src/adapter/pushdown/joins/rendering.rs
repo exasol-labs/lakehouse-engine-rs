@@ -3,10 +3,10 @@ use crate::types::exasol_type::ExasolType;
 use serde_json::Value as Json;
 use vs_expression::{
     ColumnNode, ColumnTypeLookup, SqlFragment, exact_expression_type, render_df_filter_exasol_safe,
-    render_expression_exasol_safe, walk_column_nodes,
+    render_expression_exasol_safe, strip_table_alias, walk_column_nodes,
 };
 
-use super::super::support::{ColumnTypes, quote_ident, scan_accepts};
+use super::super::support::{ColumnTypes, ScanTranslator, quote_ident};
 use super::attribution::{ColumnLeg, JoinLegs, UnattributableColumn};
 
 /// Types a raw request column by the leg it belongs to, so a name two legs share takes its own
@@ -118,23 +118,30 @@ pub(super) fn cross_leg_residual_filter(filter: &Json, legs: &JoinLegs) -> Optio
     partition_conjuncts(filter, |c| legs.conjunct_leg(c).is_none())
 }
 
-/// Returns `(leg_filter, type_declined)`: a total per-conjunct partition, the first half for the
-/// leg's scan, the second for the Exasol-dialect outer WHERE.
+/// Returns `(leg_filter_sql, type_declined)`: a total per-conjunct partition, the first half
+/// rendered for the leg's scan, the second for the Exasol-dialect outer WHERE.
 ///
-/// Not [`classify_where_filter`](super::super::support::classify_where_filter), which
-/// classifies a whole filter against one type universe: an N-scan leg's conjuncts name only
-/// that leg's columns, so the leg's own unqualified `col_types`, known only after
-/// attribution, binds each one by name. Per conjunct, so one declined conjunct doesn't
-/// forfeit its siblings.
+/// Not [`ScanTranslator::split_where`], which classifies a whole filter against one type
+/// universe: an N-scan leg's conjuncts name only that leg's columns, so the leg's own unqualified
+/// `col_types`, known only after attribution, binds each one by name. Per conjunct, so one
+/// declined conjunct doesn't forfeit its siblings. Rendered here, so no later render can decline
+/// a kept conjunct.
 pub(super) fn type_screened_leg_filter(
     side_local: &Json,
     col_types: &ColumnTypes,
-) -> (Option<Json>, Option<Json>) {
-    let accepts = |c: &Json| scan_accepts(c, col_types);
-    (
-        partition_conjuncts(side_local, accepts),
-        partition_conjuncts(side_local, |c| !accepts(c)),
-    )
+) -> (Option<String>, Option<Json>) {
+    let scan = ScanTranslator::new(col_types);
+    // Bare: the fan-out relation exposes bare uppercase names, so an alias would not resolve.
+    let accepts = |c: &Json| scan.accepts(&strip_table_alias(c));
+    let kept = partition_conjuncts(side_local, accepts);
+    let declined = partition_conjuncts(side_local, |c| !accepts(c));
+    match kept
+        .map(|k| scan.filter(&strip_table_alias(&k)))
+        .transpose()
+    {
+        Ok(sql) => (sql.flatten(), declined),
+        Err(()) => (None, Some(side_local.clone())),
+    }
 }
 
 /// Inputs must be disjoint conjunct sets; nothing is de-duplicated.

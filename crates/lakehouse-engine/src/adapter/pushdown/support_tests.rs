@@ -1121,7 +1121,7 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
         .build();
     let pushdown = parsed_pushdown(&request);
 
-    let items = super::super::detect_aggregates(&pushdown, &ColumnTypes::default())
+    let items = super::super::detect_aggregates(&pushdown, untyped_scan())
         .expect("two COUNT(DISTINCT) items are detected as distinct fan-out descriptors");
     assert!(
         has_distinct(&items),
@@ -1548,7 +1548,7 @@ fn selectlist_cast_node_rendered_in_emits() {
     );
     let rendered = proj_cols[0].emit_name();
     assert!(
-        rendered.contains(r#"CAST("ID" AS VARCHAR)"#),
+        rendered.contains(r#"CAST(CAST("ID" AS DECIMAL(38,0)) AS VARCHAR)"#),
         "projection must contain the rendered CAST expression: {proj_cols:?}"
     );
 }
@@ -1730,9 +1730,9 @@ fn selectlist_plain_timestamp_literal_rendered_as_expr() {
 }
 
 #[test]
-fn project_columns_emits_char_type_for_cast_to_char_item() {
+fn project_columns_widens_for_a_cast_to_char_item() {
     let cast_item = cast_to(ExasolType::char(20), col("c_varchar"));
-    let (proj_cols, proj_types, widened) = projected(
+    let (_, _, widened) = projected(
         pushdown_request(
             "T",
             &[
@@ -1745,23 +1745,8 @@ fn project_columns_emits_char_type_for_cast_to_char_item() {
     );
 
     assert!(
-        !widened,
-        "a CAST-to-CHAR item must not raise the full-base-row widening signal (#196)"
-    );
-    assert_eq!(
-        proj_cols.len(),
-        2,
-        "must project exactly the two select-list items, no full-row fallback: {proj_cols:?}"
-    );
-    assert!(
-        matches!(proj_cols[1], ProjectionItem::Expr { .. }),
-        "the CAST-to-CHAR item must stay a rendered expression, not fall back to the \
-         full base row: {proj_cols:?}"
-    );
-    assert_eq!(
-        proj_types,
-        vec![ExasolType::decimal(20, 0), ExasolType::char(20)],
-        "the CAST-to-CHAR item must be declared CHAR(20), not VARCHAR(20): {proj_types:?}"
+        widened,
+        "the scan does not blank-pad, so a CAST to CHAR runs in Exasol"
     );
 }
 
@@ -1826,7 +1811,8 @@ fn filter_in_common_arg() {
 /// Asserts the fixture genuinely declines, since a quietly rendering fixture would
 /// assert nothing.
 fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, ExasolType)]) -> String {
-    let (scan_filter, declined) = classify_where_filter(Some(filter), &column_types(col_types));
+    let (scan_filter, declined) =
+        ScanTranslator::new(&column_types(col_types)).split_where(Some(filter));
     assert!(
         scan_filter.is_none(),
         "fixture precondition: a declining filter must never reach the scan spec: \
@@ -1880,21 +1866,20 @@ fn nested_like_decline_routes_to_wrapper_where() {
     );
 }
 
-/// Scenario: LIKE on an integer column declines the whole filter
 #[test]
-fn declined_like_on_integer_column_routes_to_wrapper_where() {
-    let filter = like(table_col("T", "QUANTITY"), "1%");
-    let col_types = vec![("QUANTITY".to_string(), ExasolType::decimal(20, 0))];
+fn declined_like_on_date_column_routes_to_wrapper_where() {
+    let filter = like(table_col("T", "SHIPPED"), "2024%");
+    let col_types = vec![("SHIPPED".to_string(), ExasolType::Date)];
 
     let sql = declined_filter_wrapper_sql(&filter, &col_types);
 
     assert!(
-        sql.contains(r#"AS "LHS_T0" WHERE ("LHS_T0"."QUANTITY" LIKE '1%')"#),
-        "the integer-column LIKE must be applied in the wrapper WHERE: {sql}"
+        sql.contains(r#"AS "LHS_T0" WHERE ("LHS_T0"."SHIPPED" LIKE '2024%')"#),
+        "the DATE-column LIKE must be applied in the wrapper WHERE: {sql}"
     );
 }
 
-/// Scenario: LIKE on a bare column whose type cannot be resolved declines the whole filter
+/// Scenario: A column of unknown type declines
 #[test]
 fn declined_like_on_unresolvable_column_routes_to_wrapper_where() {
     let filter = like(table_col("T", "MYSTERY"), "A%");
@@ -2002,97 +1987,6 @@ fn decimal_rewrite_col_types() -> Vec<(String, ExasolType)> {
     ]
 }
 
-fn decimal_column() -> Json {
-    col("c_decimal_a")
-}
-
-#[test]
-fn selectlist_decimal_cast_routed_not_full_row_fallback() {
-    let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
-        .item(
-            cast_to(ExasolType::WIDEST_VARCHAR, decimal_column()),
-            ExasolType::varchar(20),
-        )
-        .build_pushdown();
-    let (items, types, _widened) =
-        project_split(&pushdown_req, &column_types(&decimal_rewrite_col_types()))
-            .expect("must project");
-
-    assert_eq!(
-        items.len(),
-        1,
-        "the CAST-to-VARCHAR item must project to a single expression, not the full base row: {items:?}"
-    );
-    let ProjectionItem::Expr { expr } = &items[0] else {
-        panic!("must be a rendered expression, not a bare column / full-row fallback: {items:?}");
-    };
-    assert!(
-        expr.contains(r#"CAST("C_DECIMAL_A" AS VARCHAR)"#) && expr.contains("regexp_replace"),
-        "the projected expression must render the trimmed DECIMAL→string form: {expr}"
-    );
-    assert_eq!(
-        types,
-        vec![ExasolType::varchar(20)],
-        "the EMITS type must stay the item's declared selectListDataTypes type"
-    );
-}
-
-#[test]
-fn selectlist_nested_concat_decimal_arg_rewritten() {
-    let item = scalar_fn(
-        "CONCAT",
-        [
-            col("id"),
-            scalar_fn("CONCAT", [str_lit("-"), decimal_column()]),
-        ],
-    );
-    let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
-        .item(item, ExasolType::WIDEST_VARCHAR)
-        .build_pushdown();
-    let (items, _types, _widened) =
-        project_split(&pushdown_req, &column_types(&decimal_rewrite_col_types()))
-            .expect("must project");
-
-    assert_eq!(
-        items.len(),
-        1,
-        "the nested-CONCAT item must project to a single expression, not the full base row: {items:?}"
-    );
-    let ProjectionItem::Expr { expr } = &items[0] else {
-        panic!("must be a rendered expression, not a bare column / full-row fallback: {items:?}");
-    };
-    assert!(
-        expr.contains(r#"regexp_replace(regexp_replace(CAST("C_DECIMAL_A" AS VARCHAR)"#),
-        "the inner C_DECIMAL_A argument must be rendered through the trim wrapper: {expr}"
-    );
-}
-
-#[test]
-fn selectlist_length_decimal_arg_rewritten() {
-    let item = scalar_fn("LENGTH", [decimal_column()]);
-    let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
-        .item(item, ExasolType::decimal(18, 0))
-        .build_pushdown();
-    let (items, _types, _widened) =
-        project_split(&pushdown_req, &column_types(&decimal_rewrite_col_types()))
-            .expect("must project");
-
-    assert_eq!(
-        items.len(),
-        1,
-        "the LENGTH item must project to a single expression, not the full base row: {items:?}"
-    );
-    let ProjectionItem::Expr { expr } = &items[0] else {
-        panic!("must be a rendered expression, not a bare column / full-row fallback: {items:?}");
-    };
-    assert!(
-        expr.contains(
-            "character_length(regexp_replace(regexp_replace(CAST(\"C_DECIMAL_A\" AS VARCHAR)"
-        ),
-        "LENGTH over a DECIMAL column must render the trim-wrapped character_length: {expr}"
-    );
-}
-
 #[test]
 fn stringify_nondecimal_column_unchanged() {
     let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
@@ -2119,144 +2013,55 @@ fn stringify_nondecimal_column_unchanged() {
     );
 }
 
+/// Scenario: A select item the scan declines widens the projection to the full base row
 #[test]
-fn stringify_computed_decimal_arg_untouched() {
-    let computed = scalar_fn("MULT", [decimal_column(), num_lit(2)]);
-    let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
-        .item(
-            cast_to(ExasolType::WIDEST_VARCHAR, computed),
-            ExasolType::WIDEST_VARCHAR,
-        )
-        .build_pushdown();
-    let (items, _types, _widened) =
-        project_split(&pushdown_req, &column_types(&decimal_rewrite_col_types()))
-            .expect("must project");
-
-    assert_eq!(
-        items.len(),
-        1,
-        "must project a single expression: {items:?}"
-    );
-    let ProjectionItem::Expr { expr } = &items[0] else {
-        panic!("must be a rendered expression, not a full-row fallback: {items:?}");
-    };
-    assert_eq!(
-        expr, r#"CAST(("C_DECIMAL_A" * 2) AS VARCHAR)"#,
-        "a CAST of a computed DECIMAL expression must render unchanged: {expr}"
-    );
-    assert!(
-        !expr.contains("regexp_replace"),
-        "a computed-expression CAST must not be trimmed (tracked exception #223): {expr}"
-    );
-}
-
-#[test]
-fn selectlist_upper_decimal_arg_coerced_not_full_row() {
-    let item = scalar_fn("UPPER", vec![decimal_column()]);
-    let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
-        .item(item, ExasolType::WIDEST_VARCHAR)
-        .build_pushdown();
-    let (items, types, _widened) =
-        project_split(&pushdown_req, &column_types(&decimal_rewrite_col_types()))
-            .expect("must project");
-
-    assert_eq!(
-        items.len(),
-        1,
-        "UPPER(c_decimal_a) must project a single expression, not the full base row: {items:?}"
-    );
-    let ProjectionItem::Expr { expr } = &items[0] else {
-        panic!("must be a rendered expression, not a full-row fallback: {items:?}");
-    };
-    assert!(
-        expr.contains(r#"upper(regexp_replace(regexp_replace(CAST("C_DECIMAL_A" AS VARCHAR)"#),
-        "UPPER's DECIMAL argument must render through the trimmed decimal-to-string form: {expr}"
-    );
-    assert_eq!(
-        types,
-        vec![ExasolType::WIDEST_VARCHAR],
-        "the EMITS type must stay the item's declared selectListDataTypes type"
-    );
-}
-
-#[test]
-fn selectlist_lower_date_arg_cast_to_varchar() {
-    let item = scalar_fn("LOWER", vec![col("d")]);
-    let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
-        .item(item, ExasolType::WIDEST_VARCHAR)
-        .build_pushdown();
-    let (items, _types, _widened) =
-        project_split(&pushdown_req, &column_types(&decimal_rewrite_col_types()))
-            .expect("must project");
-
-    assert_eq!(
-        items.len(),
-        1,
-        "LOWER(c_date) must project a single expression, not the full base row: {items:?}"
-    );
-    let ProjectionItem::Expr { expr } = &items[0] else {
-        panic!("must be a rendered expression, not a full-row fallback: {items:?}");
-    };
-    assert!(
-        expr.contains(r#"CAST("D" AS VARCHAR)"#),
-        "LOWER's DATE argument must be wrapped in CAST(<col> AS VARCHAR): {expr}"
-    );
-}
-
-/// Scenario: A non-coercible resolvable column type in a select-list string function falls back to the full base row
-#[test]
-fn selectlist_string_fn_over_double_falls_back_to_full_row() {
+fn selectlist_session_formatted_text_falls_back_to_full_row() {
     let col_types = decimal_rewrite_col_types();
-    let item = scalar_fn("UPPER", vec![col("c_double_a")]);
-    let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
-        .item(item, ExasolType::WIDEST_VARCHAR)
-        .build_pushdown();
-    let (items, types, _widened) =
-        project_split(&pushdown_req, &column_types(&col_types)).expect("must project");
-
-    assert_eq!(
-        items.len(),
-        col_types.len(),
-        "UPPER(c_double_a) must fall back to the full base row, not a truncated projection: {items:?}"
-    );
+    let cases = [
+        ("UPPER(DOUBLE)", scalar_fn("UPPER", vec![col("c_double_a")])),
+        (
+            "UPPER(DECIMAL(10,2))",
+            scalar_fn("UPPER", vec![col("c_decimal_a")]),
+        ),
+        ("LOWER(DATE)", scalar_fn("LOWER", vec![col("d")])),
+        (
+            "CAST(DECIMAL(10,2) AS VARCHAR)",
+            cast_to(ExasolType::WIDEST_VARCHAR, col("c_decimal_a")),
+        ),
+        (
+            "CAST(computed DECIMAL AS VARCHAR)",
+            cast_to(
+                ExasolType::WIDEST_VARCHAR,
+                scalar_fn("MULT", [col("c_decimal_a"), num_lit(2)]),
+            ),
+        ),
+        (
+            "nested CONCAT over DECIMAL",
+            scalar_fn(
+                "CONCAT",
+                [
+                    col("id"),
+                    scalar_fn("CONCAT", [str_lit("-"), col("c_decimal_a")]),
+                ],
+            ),
+        ),
+    ];
     let expected_names: Vec<ProjectionItem> = col_types
         .iter()
         .map(|(n, _)| ProjectionItem::from(n.clone()))
         .collect();
-    assert_eq!(
-        items, expected_names,
-        "the full-row fallback must project every base column unchanged"
-    );
     let expected_types: Vec<ExasolType> = col_types.iter().map(|(_, t)| *t).collect();
-    assert_eq!(types, expected_types);
-}
+    for (label, item) in cases {
+        let pushdown_req = pushdown_request("T", &col_types)
+            .item(item, ExasolType::WIDEST_VARCHAR)
+            .build_pushdown();
+        let (items, types, widened) =
+            project_split(&pushdown_req, &column_types(&col_types)).expect("must project");
 
-#[test]
-fn selectlist_instr_decimal_arg_coerces_first_position_only() {
-    let item = scalar_fn("INSTR", vec![decimal_column(), str_lit(".")]);
-    let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
-        .item(item, ExasolType::decimal(18, 0))
-        .build_pushdown();
-    let (items, _types, _widened) =
-        project_split(&pushdown_req, &column_types(&decimal_rewrite_col_types()))
-            .expect("must project");
-
-    assert_eq!(
-        items.len(),
-        1,
-        "INSTR(c_decimal_a, '.') must project a single expression, not the full base row: {items:?}"
-    );
-    let ProjectionItem::Expr { expr } = &items[0] else {
-        panic!("must be a rendered expression, not a full-row fallback: {items:?}");
-    };
-    assert!(
-        expr.starts_with(r#"strpos(regexp_replace(regexp_replace(CAST("C_DECIMAL_A" AS VARCHAR)"#),
-        "INSTR's first (string) argument must render the trimmed decimal form: {expr}"
-    );
-    assert!(
-        expr.ends_with("'.')"),
-        "INSTR's second (substring) argument, a literal, must be left untouched: {expr}"
-    );
+        assert!(widened, "{label}");
+        assert_eq!(items, expected_names, "{label}");
+        assert_eq!(types, expected_types, "{label}");
+    }
 }
 
 #[test]
@@ -2377,37 +2182,29 @@ fn selectlist_function_aggregate_still_widens_to_full_row() {
     assert_eq!(types, expected_types);
 }
 
-/// Scenario: A select-list LIKE over a DATE column projects the CAST-to-VARCHAR form
 #[test]
-fn selectlist_like_over_date_projects_cast_expr() {
-    let item = like(col("d"), "2024%");
-    let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
-        .item(item, ExasolType::Boolean)
-        .build_pushdown();
-    let (items, types, widened) =
-        project_split(&pushdown_req, &column_types(&decimal_rewrite_col_types()))
-            .expect("must project");
+fn selectlist_like_over_integer_or_boolean_projects_its_text() {
+    let col_types = decimal_rewrite_col_types();
+    for (subject, text) in [
+        ("id", r#"CAST(CAST("ID" AS DECIMAL(38,0)) AS VARCHAR)"#),
+        ("c_bool_a", "'TRUE'"),
+    ] {
+        let pushdown_req = pushdown_request("T", &col_types)
+            .item(like(col(subject), "1%"), ExasolType::Boolean)
+            .build_pushdown();
+        let (items, types, widened) =
+            project_split(&pushdown_req, &column_types(&col_types)).expect("must project");
 
-    assert!(
-        !widened,
-        "a DATE LIKE subject rewraps, it must not widen to the full base row"
-    );
-    assert_eq!(
-        items.len(),
-        1,
-        "the DATE LIKE item must project a single expression, not the full base row: {items:?}"
-    );
-    let ProjectionItem::Expr { expr } = &items[0] else {
-        panic!("must be a rendered expression, not a full-row fallback: {items:?}");
-    };
-    assert!(
-        expr.contains(r#"CAST("D" AS VARCHAR)"#) && expr.contains("LIKE"),
-        "the DATE subject must be rewrapped in CAST(<col> AS VARCHAR) before the LIKE: {expr}"
-    );
-    assert_eq!(types, vec![ExasolType::Boolean]);
+        assert!(!widened, "{subject}");
+        let [ProjectionItem::Expr { expr }] = items.as_slice() else {
+            panic!("{subject} must project one expression: {items:?}");
+        };
+        assert!(expr.contains(text) && expr.contains("LIKE"), "{expr}");
+        assert_eq!(types, vec![ExasolType::Boolean]);
+    }
 }
 
-/// Scenario: A select-list LIKE over a non-string column widens the projection to the full base row
+/// Scenario: A select item the scan declines widens the projection to the full base row
 #[test]
 fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
     let col_types = decimal_rewrite_col_types();
@@ -2416,12 +2213,11 @@ fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
             "c_decimal_a (DECIMAL(10,2))",
             like(col("c_decimal_a"), "1%"),
         ),
-        ("id (DECIMAL(20,0), integer)", like(col("id"), "1%")),
+        ("d (DATE)", like(col("d"), "1%")),
         (
             "c_double_a (DOUBLE PRECISION)",
             like(col("c_double_a"), "1%"),
         ),
-        ("c_bool_a (BOOLEAN)", like(col("c_bool_a"), "1%")),
         ("c_ts_a (TIMESTAMP)", like(col("c_ts_a"), "1%")),
         ("unresolvable column name", like(col("not_a_column"), "1%")),
     ];
@@ -2781,7 +2577,8 @@ fn qualified_universe_projects_each_column_with_its_relation_and_type() {
     );
 
     let select_star = relations.build_pushdown();
-    let (projection, _) = project_columns(&select_star, &universe).expect("projects");
+    let (projection, _) =
+        project_columns(&select_star, ScanTranslator::new(&universe)).expect("projects");
     let (full_row, full_types) = split_projection(&projection);
     assert_eq!(
         full_row,

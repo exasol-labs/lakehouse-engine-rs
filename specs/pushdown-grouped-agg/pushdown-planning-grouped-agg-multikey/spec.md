@@ -8,7 +8,7 @@ Extends `pushdown-grouped-agg/pushdown-planning-grouped-agg` to a GROUP BY with 
 * `vs_expression::render_expression` (raising mode) renders each key. A tuple can mix column references and scalar expressions. If any element fails to render, the adapter falls back to row scanning for the whole request and never pushes a subset of the keys.
 * Evidence that a multi-key GROUP BY was pushed down is the scan spec's `group_keys` field and the outer wrapper's `PARTIAL_*` merge columns. `GROUP BY shard_key` is absent when a filter prunes the file list to a single shard.
 * Expression keys use scalar functions Exasol advertises and so sends as pushed group keys, such as `MOD`, `UPPER`, and `YEAR`. The translator renders arithmetic operators and `CAST`, but Exasol does not advertise them, so it does not send them as group keys.
-* Each `GK_{i}` column's declared type comes from the `selectListDataTypes` entry at that key's own `selectList` index, matched by index and not by comparing rendered SQL. A `DECIMAL` key and a `VARCHAR` key each get their own CAST and not a shared `VARCHAR(2000000)`.
+* Each `GK_{i}` column's declared type comes from the `selectListDataTypes` entry at that key's own `selectList` index, matched by index and not by comparing rendered SQL. A `DECIMAL` key and a `VARCHAR` key each declare their own `GK_{i}` type.
 
 
 ## Scenarios
@@ -33,7 +33,7 @@ Extends `pushdown-grouped-agg/pushdown-planning-grouped-agg` to a GROUP BY with 
 ### Scenario: Each group key in a multi-key tuple resolves its own declared result type
 
 * *GIVEN* a grouped aggregate `pushdown` request with two or more group keys of differing declared Exasol types (e.g. a `DECIMAL` key and a `VARCHAR` key), possibly interleaved with aggregates in `selectList`
-* *WHEN* the adapter resolves each group key's Exasol-declared result type and builds the outer wrapper cast list
-* *THEN* the adapter SHALL resolve each `GK_{i}` column's declared type from the `selectListDataTypes` entry at that key's OWN `selectList` index (matched by index, not by comparing rendered SQL strings), so each of the N keys receives its correct CAST rather than a shared or defaulted `VARCHAR(2000000)`
-* *AND* the outer wrapper SELECT SHALL emit each group-key cast expression at the ordinal position that key occupied in the user's `selectList`, so a mixed-type multi-key result passes Exasol's positional `selectListDataTypes` validation for any interleaving of keys and aggregates
+* *WHEN* the adapter resolves each group key's Exasol-declared result type and builds the outer wrapper
+* *THEN* the adapter SHALL resolve each `GK_{i}` column's declared type from the `selectListDataTypes` entry at that key's OWN `selectList` index (matched by index, not by comparing rendered SQL strings), so each of the N keys declares its own `GK_{i}` type
+* *AND* the outer wrapper SELECT SHALL emit each `GK_{i}` column at the ordinal position that key occupied in the user's `selectList`, so a mixed-type multi-key result passes Exasol's positional `selectListDataTypes` validation for any interleaving of keys and aggregates
 * *AND* the merged per-group result SHALL equal the result of the same multi-key grouped aggregate evaluated over all rows on a single node

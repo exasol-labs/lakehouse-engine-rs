@@ -48,13 +48,12 @@ The adapter declares a pushed-down result column as Exasol `CHAR(n)` when Exasol
 * *AND* a NESTED CHAR CAST, `CAST(CAST(SUM(<col>) AS CHAR(20) ASCII) AS CHAR(20) ASCII)` on the grouped-merge path, SHALL render `CHAR(20) ASCII` at BOTH levels, because the renderer recurses into itself
 * *AND* Exasol SHALL perform the grouping and DISTINCT evaluation natively over the padded `CHAR` value in these wrappers, so no adapter-side padding is required on this path
 
-### Scenario: A MIN or MAX over a CHAR-typed expression declares a CHAR partial column
+### Scenario: A MIN or MAX over a CAST to CHAR runs in the qualified wrapper
 
-* *GIVEN* a `group_by` `pushdown` request whose `selectList` carries `MIN(CAST(<col> AS CHAR(20)))`, an aggregate over an expression argument, not a bare column, with that ordinal's `selectListDataTypes` entry declaring `{"type":"CHAR","size":20}`
-* *WHEN* the adapter builds the partial `EMITS` clause and the outer merge SELECT
-* *THEN* the partial column SHALL be declared `"PARTIAL_min_0" CHAR(20)`, because an expression-argument aggregate carries its declared type and MIN and MAX accept any argument type
-* *AND* the outer merge item SHALL be the uncast `MIN("PARTIAL_min_0")`, because the partial column already carries the declared `CHAR(20)` (`pushdown-aggregates/pushdown-planning-single-group-agg`)
-* *AND* the pushdown MUST NOT be declined for this shape, because `CHAR(n)` is both a valid `EMITS` output type and a valid `CAST` target
+* *GIVEN* a `group_by` `pushdown` request whose `selectList` carries `MIN(CAST(<col> AS CHAR(20)))`
+* *WHEN* the adapter plans the request
+* *THEN* the adapter SHALL route it to the qualified wrapper, because the scan does not blank-pad (`pushdown-types/pushdown-planning-scan-text-conversion`)
+* *AND* the result SHALL equal native Exasol
 
 ### Scenario: A VARCHAR dataType renders as VARCHAR(n) and its group key is not padded
 
@@ -67,7 +66,6 @@ The adapter declares a pushed-down result column as Exasol `CHAR(n)` when Exasol
 ### Scenario: A CHAR-typed LIKE subject keeps pushing down unchanged
 
 * *GIVEN* a `pushdown` request whose filter carries a `predicate_like` over a bare `column` whose type in `involvedTables[0].columns` resolves to `CHAR(n)`
-* *WHEN* the LIKE subject type guard dispatches on that type (see `pushdown-types/pushdown-planning-like-type-coercion`)
-* *THEN* the guard SHALL classify `CHAR(n)` as a string subject and leave the predicate unchanged
-* *AND* the guard MUST NOT decline the filter, because a CHAR subject needs no coercion
+* *WHEN* the scan translator renders the filter
+* *THEN* it SHALL treat `CHAR(n)` as text and keep the predicate in the scan unchanged
 * *AND* this SHALL be a forward-compatibility guard only, because no Iceberg or Arrow source type produces a CHAR base column today

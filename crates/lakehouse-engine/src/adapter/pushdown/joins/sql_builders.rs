@@ -5,14 +5,12 @@ use crate::scan::spec::{
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-use vs_expression::strip_table_alias;
 
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
-    ColumnTypes, ProjectedColumn, PushdownRequest, build_scan_driving_sql, classify_where_filter,
+    ColumnTypes, ProjectedColumn, PushdownRequest, ScanTranslator, build_scan_driving_sql,
     collect_all_column_names, extract_limit, extract_offset, output_select_list, project_columns,
-    projection_items, quote_ident, render_limit_offset, scan_expression, scan_filter,
-    scan_storage_for, shard_count,
+    projection_items, quote_ident, render_limit_offset, scan_storage_for, shard_count,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_flags, wrap_declined_order_by};
 use super::attribution::{JoinLegs, UnattributableColumn};
@@ -67,18 +65,19 @@ pub(crate) fn render_broadcast_join(
             .enumerate()
             .map(|(leg, side)| (legs.leg_alias(leg), &side.column_types)),
     );
+    let scan = ScanTranslator::new(&col_types);
     // Not the filter renderer, which would suppress a trivially-true boolean. A declined condition
     // loses broadcast eligibility and takes the N-scan fallback (#587).
-    let Some(condition) = scan_expression(&condition_tree, &col_types).map(|f| f.sql) else {
+    let Some(condition) = scan.expression(&condition_tree).map(|f| f.sql) else {
         return Ok(None);
     };
     let filter_json = qualified.json().get("filter").filter(|f| !f.is_null());
-    let (filter, declined) = classify_where_filter(filter_json, &col_types);
+    let (filter, declined) = scan.split_where(filter_json);
     if declined.is_some() {
         return Ok(None);
     }
 
-    let (projection, widened) = project_columns(&qualified, &col_types)?;
+    let (projection, widened) = project_columns(&qualified, scan)?;
     // A widened projection is the full two-table row, the wrong shape for a broadcast fan-out
     // (#196).
     if widened
@@ -321,7 +320,7 @@ fn outer_wrapper_clauses(
 /// render leg-qualified (`"LHS_T{i}"."COL"`), so shared column or table names are safe.
 ///
 /// Each leg receives only leg-local conjuncts passing
-/// [`type_screened_leg_filter`] (which also rewrites them). Everything else (cross-leg,
+/// [`type_screened_leg_filter`]. Everything else (cross-leg,
 /// OR-spanning, untagged, declined, type-declined, unattachable conditions) goes to the
 /// outer WHERE, each parenthesized; nothing is omitted. The fan-out loop must run before the
 /// residual is assembled, since the type screen can hand conjuncts back.
@@ -390,7 +389,7 @@ pub(in super::super) fn build_n_scan_join_sql(
         fan_outs.push(build_side_fan_out_sql(
             side,
             &narrowed,
-            side_filter.as_ref(),
+            side_filter,
             inputs,
             udf_name,
             distribute_udf_name,
@@ -500,13 +499,11 @@ fn scan_storage_for_side(
     )
 }
 
-/// `side_filter` arrives pre-screened and pre-rewritten by the caller: this function cannot
-/// route a decline to the outer wrapper, so a decline swallowed here would be applied
-/// nowhere. `columns` must expose every column any outer clause references.
+/// `side_filter` is the leg filter [`type_screened_leg_filter`] rendered. `columns` must expose every column any outer clause references.
 pub(super) fn build_side_fan_out_sql(
     side: &ResolvedJoinSide,
     columns: &ColumnTypes,
-    side_filter: Option<&Json>,
+    filter: Option<String>,
     inputs: &JoinScanRequestConfig<'_>,
     udf_name: &str,
     distribute_udf_name: &str,
@@ -514,14 +511,6 @@ pub(super) fn build_side_fan_out_sql(
     let projection = columns.projection();
 
     let shards = shard_side(side, inputs);
-
-    // Bare: the fan-out relation exposes bare uppercase names, so an alias would not resolve.
-    let filter = match side_filter.map(strip_table_alias) {
-        None => None,
-        Some(f) => scan_filter(&f, &side.column_types).map_err(|()| {
-            join_render_decline("a pre-screened leg filter was declined by the typed scan render")
-        })?,
-    };
     let spec = join_fan_out_scan_spec(side, projection_items(&projection), filter, None, inputs)?;
     Ok(build_scan_driving_sql(
         &spec,

@@ -7,7 +7,7 @@ use vs_expression::SqlFragment;
 use super::joins::EmptyRelation;
 use super::request_shape::{RequestShape, classify_request_shape};
 use super::support::{
-    ColumnTypes, ProjectedColumn, PushdownRequest, emits_ident, output_select_list,
+    ProjectedColumn, PushdownRequest, ScanTranslator, emits_ident, output_select_list,
 };
 
 /// Routes through the same [`classify_request_shape`] as the non-empty dispatcher,
@@ -19,10 +19,10 @@ pub(super) fn empty_result_sql(
     pushdown: &PushdownRequest,
     projection: &[ProjectedColumn],
     projection_widened: bool,
-    col_types: &ColumnTypes,
+    scan: ScanTranslator<'_>,
     relation: &EmptyRelation,
 ) -> Result<Json, UdfError> {
-    match classify_request_shape(pushdown, col_types) {
+    match classify_request_shape(pushdown, scan) {
         // Mirrors the non-empty merge's and wrapper's `selectList`-shaped output; a full-row shape
         // would trip Exasol's positional `04000` check. Both arms carry a non-empty
         // `selectList`, so `select_types()` holds one type per item.

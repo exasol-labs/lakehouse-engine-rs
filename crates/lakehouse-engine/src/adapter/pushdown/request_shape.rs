@@ -11,7 +11,7 @@ use super::grouped_agg::{
 };
 use super::scalar_over_agg::cast_merge_items;
 use super::single_group_agg::{SingleGroupItem, has_distinct, single_group_plan_types};
-use super::support::{ColumnTypes, PushdownRequest};
+use super::support::{PushdownRequest, ScanTranslator};
 use super::{
     GroupedAggregateDetection, detect_aggregates, detect_group_by_aggregates, ordinary_plans,
     validate_agg_col_types,
@@ -44,14 +44,14 @@ pub(super) enum RequestShape {
 
 pub(super) fn classify_request_shape(
     pushdown: &PushdownRequest,
-    col_types: &ColumnTypes,
+    scan: ScanTranslator<'_>,
 ) -> RequestShape {
     let pushdown_req = pushdown.json();
     // A SUM over a non-numeric column would produce an opaque UDF error; demote.
-    if let Some(detection) = detect_group_by_aggregates(pushdown, col_types)
-        && validate_agg_col_types(&detection.plans, col_types)
+    if let Some(detection) = detect_group_by_aggregates(pushdown, scan)
+        && validate_agg_col_types(&detection.plans, scan.columns())
     {
-        let merged = cast_merge_items(&detection.plans, &detection.plan_types, col_types);
+        let merged = cast_merge_items(&detection.plans, &detection.plan_types, scan.columns());
         let scope = MergeScope {
             plans: &detection.plans,
             merged: &merged,
@@ -59,14 +59,14 @@ pub(super) fn classify_request_shape(
         };
         // The merge wrapper only has `GK_*`/`PARTIAL_*` columns, so an aggregate absent
         // from the select list cannot be sorted on there (#198).
-        let order_by = match build_grouped_order_by_clause(pushdown_req, &scope, col_types) {
+        let order_by = match build_grouped_order_by_clause(pushdown_req, &scope, scan) {
             Some(GroupedOrderBy::Clause(clause)) => Some(clause),
             Some(GroupedOrderBy::Unresolvable) => return RequestShape::GroupByWrapper,
             None => None,
         };
         let having = match pushdown_req.get("having").filter(|h| !h.is_null()) {
             None => None,
-            Some(node) => match render_having_over_merge(node, &scope, col_types) {
+            Some(node) => match render_having_over_merge(node, &scope, scan) {
                 Some(sql) => Some(sql),
                 None => return RequestShape::GroupByWrapper,
             },
@@ -84,10 +84,10 @@ pub(super) fn classify_request_shape(
 
     // Validated against ordinary plans only: a distinct item is a row-scan fan-out. A nested
     // aggregate without an exact type declines to the wrapper (#476).
-    let Some((items, plan_types)) = detect_aggregates(pushdown, col_types)
-        .filter(|it| validate_agg_col_types(&ordinary_plans(it, col_types), col_types))
+    let Some((items, plan_types)) = detect_aggregates(pushdown, scan)
+        .filter(|it| validate_agg_col_types(&ordinary_plans(it, scan), scan.columns()))
         .and_then(|it| {
-            let plan_types = single_group_plan_types(pushdown.select_types(), &it, col_types)?;
+            let plan_types = single_group_plan_types(pushdown.select_types(), &it, scan)?;
             Some((it, plan_types))
         })
     else {
@@ -103,14 +103,14 @@ pub(super) fn classify_request_shape(
         None => None,
         Some(_) if has_distinct(&items) => return RequestShape::SingleGroupWrapper,
         Some(node) => {
-            let plans = ordinary_plans(&items, col_types);
-            let merged = cast_merge_items(&plans, &plan_types, col_types);
+            let plans = ordinary_plans(&items, scan);
+            let merged = cast_merge_items(&plans, &plan_types, scan.columns());
             let scope = MergeScope {
                 plans: &plans,
                 merged: &merged,
                 group_keys: &[],
             };
-            match render_having_over_merge(node, &scope, col_types) {
+            match render_having_over_merge(node, &scope, scan) {
                 Some(sql) => Some(sql),
                 None => return RequestShape::SingleGroupWrapper,
             }

@@ -74,7 +74,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 * *GIVEN* a VS expression node of type `function_scalar` named `TO_DATE` or `TO_TIMESTAMP` with a string source argument and an optional format argument
 * *WHEN* `render_expression` processes the node
-* *THEN* with one argument `TO_DATE` SHALL render as `to_date(<source_sql>)` and `TO_TIMESTAMP` SHALL render as `to_timestamp(<source_sql>)`
+* *THEN* with one argument the DataFusion dialect SHALL decline the node, because Exasol parses the source by the session's `NLS_DATE_FORMAT` or `NLS_TIMESTAMP_FORMAT` (`pushdown-types/pushdown-planning-scan-text-conversion`)
 * *AND* with a format argument the DataFusion dialect SHALL translate the format or decline the node, as `sql-functions/vs-expression-translator-datetime-format` specifies, and MUST NOT forward an Exasol format model to a DataFusion parser
 * *AND* `render_expression_exasol` SHALL render `TO_DATE(<args>)` / `TO_TIMESTAMP(<args>)`, forwarding the format argument unchanged, so Exasol interprets the format model it sent
 

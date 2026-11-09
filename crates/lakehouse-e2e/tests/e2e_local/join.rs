@@ -1183,9 +1183,7 @@ fn like_on_custkey_join_query(vs_name: &str) -> String {
     )
 }
 
-/// The subject is rewrapped as `CAST(<col> AS VARCHAR)`, so the broadcast plan survives.
-/// Expected rows run the same pattern through the single-table WHERE path, so the
-/// result is independent of the session's `NLS_DATE_FORMAT`.
+/// Expected rows run the same pattern through the single-table WHERE path.
 fn like_on_orderdate_join_query(vs_name: &str) -> String {
     format!(
         "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
@@ -1196,120 +1194,71 @@ fn like_on_orderdate_join_query(vs_name: &str) -> String {
     )
 }
 
-/// Scenario: A broadcast-join filter over a non-string LIKE subject declines the broadcast plan
+fn assert_join_matches_single_table_rows(
+    conn: &mut ExaConn,
+    vs_name: &str,
+    query: &str,
+    fact_where: &str,
+) {
+    let actual = columns_to_sorted_pairs(&conn.query_columns(query));
+    let expected = expected_join_rows_with_fact_where(conn, vs_name, fact_where);
+    assert!(
+        !expected.is_empty() && expected.len() < FACT_ORDERS_ROWS,
+        "{fact_where} must narrow the fact table, got {} rows",
+        expected.len()
+    );
+    assert_eq!(actual, expected);
+}
+
+/// Scenario: A broadcast join keeps its plan for an integer LIKE
 #[test]
-fn e2e_broadcast_like_on_decimal_column_falls_back_and_filters() {
+fn e2e_broadcast_like_on_decimal_column_stays_broadcast_and_filters() {
     setup_e2e();
     let mut conn = exa_conn();
 
     let query = like_on_custkey_join_query(VS_NAME);
     let pushed = explain_virtual_sql(&mut conn, &query);
-    assert!(
-        has_two_scan_wrapper(&pushed),
-        "LIKE over the DECIMAL O_CUSTKEY column must decline the broadcast \
-         plan and fall back to the N-scan wrapper (LHS_T0/LHS_T1):\n{pushed}"
-    );
-    assert!(
-        !has_broadcast_join_block(&pushed),
-        "LIKE over a DECIMAL side column must NOT ride the broadcast in-UDF \
-         join unfiltered (no common-blob join block may appear):\n{pushed}"
-    );
-    assert!(
-        !pushed.contains(r#""filter":""#),
-        "a type-declined LIKE-over-DECIMAL conjunct must not reach any leg's \
-         scan-spec filter:\n{pushed}"
-    );
-    assert!(
-        pushed.contains("LIKE"),
-        "the type-declined conjunct must still be self-applied in the \
-         wrapper's own outer WHERE, not dropped:\n{pushed}"
-    );
+    assert!(has_broadcast_join_block(&pushed), "{pushed}");
+    assert!(pushed.contains(r#""filter":""#), "{pushed}");
 
-    let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
-    let expected = expected_join_rows_with_fact_where(&mut conn, VS_NAME, "O_CUSTKEY LIKE '1%'");
-    assert!(
-        !expected.is_empty(),
-        "expected at least one row for O_CUSTKEY LIKE '1%' (order keys 1 and \
-         6 reference customer 1)"
-    );
-    assert_eq!(
-        actual, expected,
-        "the N-scan fallback result must equal the independently computed \
-         (single-table ground truth) join.\nactual:   {actual:?}\nexpected: {expected:?}"
-    );
+    assert_join_matches_single_table_rows(&mut conn, VS_NAME, &query, "O_CUSTKEY LIKE '1%'");
 }
 
-/// Scenario: A broadcast-join filter over a DATE LIKE subject keeps the broadcast plan
+/// Scenario: A join condition or filter that converts a date to text takes the N-scan fallback
 #[test]
-fn e2e_broadcast_like_on_date_column_stays_broadcast_and_filters() {
+fn e2e_broadcast_like_on_date_column_falls_back_and_filters() {
     setup_e2e();
     let mut conn = exa_conn();
 
     let query = like_on_orderdate_join_query(VS_NAME);
     let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(has_two_scan_wrapper(&pushed), "{pushed}");
+    assert!(!pushed.contains(r#""filter":""#), "{pushed}");
     assert!(
-        has_broadcast_join_block(&pushed),
-        "LIKE over a DATE side column must KEEP the broadcast plan (the CAST \
-         rewrite still renders for DataFusion):\n{pushed}"
-    );
-    assert!(
-        pushed.contains("CAST(") && pushed.contains("O_ORDERDATE"),
-        "the DATE LIKE subject must be rewrapped in CAST(...) before the \
-         LIKE:\n{pushed}"
+        pushed.contains("LIKE"),
+        "the outer WHERE applies the LIKE: {pushed}"
     );
 
-    let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
-    let expected =
-        expected_join_rows_with_fact_where(&mut conn, VS_NAME, "O_ORDERDATE LIKE '2024-01-0%'");
-    assert!(
-        !expected.is_empty() && expected.len() < FACT_ORDERS_ROWS,
-        "O_ORDERDATE LIKE '2024-01-0%' must genuinely narrow the \
-         {FACT_ORDERS_ROWS}-row fact table (order 10, 2024-01-10, must be \
-         excluded), got {} matching rows",
-        expected.len()
-    );
-    assert_eq!(
-        actual, expected,
-        "the broadcast join result must equal the independently computed \
-         (single-table ground truth) join.\nactual:   {actual:?}\nexpected: {expected:?}"
+    assert_join_matches_single_table_rows(
+        &mut conn,
+        VS_NAME,
+        &query,
+        "O_ORDERDATE LIKE '2024-01-0%'",
     );
 }
 
+/// Scenario: An N-scan leg filter keeps the conjuncts the scan computes
 #[test]
-fn e2e_n_scan_like_on_decimal_side_column_applied_in_outer_where() {
+fn e2e_n_scan_like_on_decimal_side_column_filters_in_its_leg() {
     setup_e2e();
     let mut conn = exa_conn();
 
     let query = like_on_custkey_join_query(VS_NAME_LOW);
     let pushed = explain_virtual_sql(&mut conn, &query);
-    assert!(
-        has_two_scan_wrapper(&pushed),
-        "VS_NAME_LOW must always emit the N-scan wrapper (LHS_T0/LHS_T1):\n{pushed}"
-    );
-    assert!(
-        !pushed.contains(r#""filter":""#),
-        "a type-declined LIKE-over-DECIMAL side-local conjunct must not reach \
-         its leg's scan-spec filter:\n{pushed}"
-    );
-    assert!(
-        pushed.contains("LIKE"),
-        "the type-declined conjunct must still be self-applied in the \
-         wrapper's own outer WHERE, not dropped:\n{pushed}"
-    );
+    assert!(has_two_scan_wrapper(&pushed), "{pushed}");
+    assert!(pushed.contains(r#""filter":""#), "{pushed}");
 
-    let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
-    let expected =
-        expected_join_rows_with_fact_where(&mut conn, VS_NAME_LOW, "O_CUSTKEY LIKE '1%'");
-    assert!(
-        !expected.is_empty(),
-        "expected at least one row for O_CUSTKEY LIKE '1%' (order keys 1 and \
-         6 reference customer 1)"
-    );
-    assert_eq!(
-        actual, expected,
-        "the N-scan result must equal the independently computed (single-table \
-         ground truth) join.\nactual:   {actual:?}\nexpected: {expected:?}"
-    );
+    assert_join_matches_single_table_rows(&mut conn, VS_NAME_LOW, &query, "O_CUSTKEY LIKE '1%'");
 }
 
 #[test]

@@ -26,8 +26,7 @@ pub(crate) use vs_expression::test_support::{
     scalar_fn, str_lit, string_equal, table_col, table_column, timestamp_lit,
 };
 
-/// #587 spike shims: the untyped DataFusion renderers are gone, so older tests render through
-/// the typed gate with no column type known.
+/// Renders through the typed scan gate with no column type known.
 pub(crate) fn render_df_filter_safe(filter: &Json) -> Option<String> {
     vs_expression::render_scan_filter(filter, &ColumnTypes::default())
         .ok()
@@ -42,9 +41,14 @@ pub(crate) fn render_expression_safe(expr: &Json) -> Option<String> {
 
 /// The scan's typed filter SQL, `None` when it declines or the filter is trivially true.
 pub(crate) fn scan_filter_sql(filter: &Json, col_types: &ColumnTypes) -> Option<String> {
-    super::support::scan_filter(filter, col_types)
-        .ok()
-        .flatten()
+    ScanTranslator::new(col_types).filter(filter).ok().flatten()
+}
+
+/// A translator that knows no column type.
+pub(crate) fn untyped_scan() -> ScanTranslator<'static> {
+    static NO_COLUMNS: std::sync::LazyLock<ColumnTypes> =
+        std::sync::LazyLock::new(ColumnTypes::default);
+    ScanTranslator::new(&NO_COLUMNS)
 }
 
 /// The table a single-table filter fixture qualifies its columns with, as Exasol does.
@@ -502,7 +506,7 @@ pub(crate) fn project_split(
     pushdown: &PushdownRequest,
     all_cols: &ColumnTypes,
 ) -> Result<(Vec<ProjectionItem>, Vec<ExasolType>, bool), UdfError> {
-    let (projection, widened) = support::project_columns(pushdown, all_cols)?;
+    let (projection, widened) = support::project_columns(pushdown, ScanTranslator::new(all_cols))?;
     let (items, types) = split_projection(&projection);
     Ok((items, types, widened))
 }

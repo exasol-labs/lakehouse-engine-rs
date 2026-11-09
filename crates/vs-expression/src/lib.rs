@@ -638,8 +638,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             let args = value("arguments").and_then(|a| a.as_array());
             render_cast(args, value("dataType"), dialect)
         }
-        // Synthesized by the typed scan pass, DataFusion dialect only: an integer's text is the
-        // same in every session, so the scan may produce it.
+        // Synthesized by the typed scan pass, DataFusion dialect only: integer and boolean text
+        // is the same in every session, so the scan may produce it.
         INTEGER_TEXT_NODE | BOOLEAN_TEXT_NODE if dialect == Dialect::DataFusion => {
             let arg = value("arguments")
                 .and_then(|a| a.as_array())
@@ -1165,25 +1165,6 @@ pub fn render_scan_filter(
 pub(crate) fn render_expression(expr: &Json) -> Result<String, UdfError> {
     render_expression_inner(expr, Dialect::DataFusion)?
         .ok_or_else(|| UdfError::User("expression node is null".into()))
-}
-
-/// `None` on any failure; never panics.
-#[cfg(test)]
-pub(crate) fn render_expression_safe(expr: &Json) -> Option<String> {
-    render_expression_inner(expr, Dialect::DataFusion).ok()?
-}
-
-/// `None` when rendering fails or the filter is trivially true (`TRUE`/`NULL`). The
-/// two causes are indistinguishable; the caller decides whether a declined filter
-/// must be self-applied.
-#[cfg(test)]
-pub(crate) fn render_df_filter_safe(filter_expr: &Json) -> Option<String> {
-    let result = render_expression_inner(filter_expr, Dialect::DataFusion).ok()??;
-    if result == "TRUE" || result == "NULL" {
-        None
-    } else {
-        Some(result)
-    }
 }
 
 /// Exasol dialect, for SQL parsed by Exasol itself (join and grouped-aggregate

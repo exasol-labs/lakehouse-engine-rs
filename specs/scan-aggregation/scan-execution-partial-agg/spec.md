@@ -10,7 +10,7 @@ The scan UDF computes node-local aggregates in DataFusion and emits per-shard pa
 * The path registers the full logical table schema and builds its DataFusion query from `aggregates`. It does not consult `projection`. DataFusion's projection pushdown derives the physical column set from the query text.
 * Only SDK `Value` types cross the `.so` boundary, no Arrow types.
 * The SDK validates every emitted `Value` against the declared output column. The UDF coerces each partial-aggregate column to the Arrow type its declared `ExaType` (from `UdfContext::output_column`) requires before converting the cell, as the raw-row path does.
-* Group-key columns keep their `value_to_gk_string` stringification (declared `VARCHAR(2000000)`) and are not coerced, because an Arrow cast would change the group-key text and the merge identity across shards.
+* Group-key columns are coerced like the partial-aggregate columns, to the exact type the adapter declares for each `GK_i` (`pushdown-aggregates/pushdown-planning-split-aggregate-types`).
 * The declared-`Numeric` payload rule is owned by `datafusion-scan/scan-execution-value-conversion` and applies on both emit paths. It covers an out-of-range `precision` or `scale` only, because `ExaType::Numeric` holds no absent one.
 * `partial_row_from_batch` converts each coerced cell to a `Value` through `arrow_value_at`, which reads the array at its own unit, so a `TIMESTAMP(9)` column keeps its digits. `MIN` and `MAX` are valid over any comparable type, so `MIN`/`MAX` over a nanosecond timestamp column reaches this path.
 * `Value::Timestamp` carries a nanosecond-resolved `chrono::NaiveDateTime`. Whether the SLC's wire encoding preserves those digits is measured on the live engine, because the encoding lives in the language container.
@@ -70,10 +70,10 @@ The scan UDF computes node-local aggregates in DataFusion and emits per-shard pa
 
 ### Scenario: Every emitted partial-aggregate cell matches its declared output column
 
-* *GIVEN* a partial-aggregate scan whose declared output columns include a `DOUBLE PRECISION` `AvgSum`, `StatMean` or `StatM2` column, a `DECIMAL(36,s)` `Sum` column, a `MIN`/`MAX` column declared with its source column's Exasol type, and a `DOUBLE PRECISION` column the adapter declares for an aggregate reached only nested inside a scalar
-* *AND* a DataFusion result batch whose aggregate column types diverge from those declarations, for example a `Decimal128(29,0)` sum for `AVG(<iceberg long>)`, a `Decimal128` sum for `AVG(<iceberg decimal>)`, a `Decimal128(37,s)` sum over a wide decimal, a `Decimal128(p,0)` minimum for a column declared `DECIMAL(p,0)` with `p` at most 18, and a `Decimal128` value for the nested aggregate declared `DOUBLE PRECISION`
+* *GIVEN* a partial-aggregate scan whose declared output columns include a `DOUBLE PRECISION` `AvgSum`, `StatMean` or `StatM2` column, a `DECIMAL(36,s)` `Sum` column, a `MIN`/`MAX` column declared with its source column's Exasol type, and a `DECIMAL(p,0)` group-key column
+* *AND* a DataFusion result batch whose aggregate column types diverge from those declarations, for example a `Decimal128(29,0)` sum for `AVG(<iceberg long>)`, a `Decimal128` sum for `AVG(<iceberg decimal>)`, a `Decimal128(37,s)` sum over a wide decimal, a `Decimal128(p,0)` minimum for a column declared `DECIMAL(p,0)` with `p` at most 18, and an `Int64` group key declared `DECIMAL(p,0)`
 * *WHEN* the scan UDF builds the partial row
-* *THEN* the UDF SHALL coerce each partial-aggregate column to the Arrow type the declared `ExaType` from `UdfContext::output_column` requires, before converting the cell to a `Value`
+* *THEN* the UDF SHALL coerce each group-key and partial-aggregate column to the Arrow type the declared `ExaType` from `UdfContext::output_column` requires, before converting the cell to a `Value`
 * *AND* the emitted `Value` variant SHALL be one the SDK's `column_accepts` rule admits for that declared column, so no partial-aggregate query fails with an `output column … is … but the value is …` error
 * *AND* a partial-aggregate column whose declared `Numeric` reports a `precision` or `scale` outside what `Decimal128` represents SHALL fail the call naming that column, under the same rule the Arrow `emit_batch` path applies, so neither path substitutes a string value into a numeric column
 * *AND* that rule SHALL carry no absent-payload half, because `ExaType::Numeric` holds no absent `precision` or `scale` (`datafusion-scan/scan-execution-value-conversion`)
@@ -81,5 +81,4 @@ The scan UDF computes node-local aggregates in DataFusion and emits per-shard pa
 * *AND* the conversion MUST NOT normalize the instant to a single `i64` count: a count of nanoseconds spans only 1677-2262, narrower than the instants an Iceberg or Delta source carries, and a count of microseconds drops a nanosecond column's last three digits
 * *AND* `AVG`, `STDDEV`, `STDDEV_POP`, `VARIANCE` and `VAR_POP` over an integer or decimal column SHALL return the same values they returned before the SDK bump
 * *AND* the UDF MUST NOT add a per-aggregate-kind cast to the partial SELECT SQL, because the declared column is the one authority and reading it covers every kind at once
-* *AND* group-key columns SHALL keep their existing `value_to_gk_string` stringification, unchanged and uncoerced, so the merge identity of a group is unaffected
 * *AND* a shard with no matching rows SHALL keep emitting its existing null partial row, whose `Value::Int64` counters and `Value::Null` cells the declared columns already admit

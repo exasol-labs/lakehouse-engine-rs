@@ -1,8 +1,9 @@
 use super::super::single_group_agg::{single_group_merge_select, single_group_plan_types};
+use super::super::support::ScanTranslator;
 use super::super::support::projection_items;
 use super::super::support::{
     AggregateMergeInputs, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, build_scan_driving_sql,
-    classify_where_filter, involved_columns, order_by_present, project_columns, shard_count,
+    involved_columns, order_by_present, project_columns, shard_count,
 };
 use super::super::test_support::*;
 use super::super::{detect_aggregates, ordinary_plans, validate_agg_col_types};
@@ -15,46 +16,46 @@ use crate::types::exasol_type::ExasolType;
 fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize) -> String {
     let pushdown = parsed_pushdown(request);
     let pushdown_req = pushdown.json();
-    let (mut projection, widened) =
-        project_columns(&pushdown, &first_table_column_types(request)).unwrap();
+    let (mut projection, widened) = project_columns(
+        &pushdown,
+        ScanTranslator::new(&first_table_column_types(request)),
+    )
+    .unwrap();
     let limit = extract_limit(pushdown_req);
     let has_order_by = order_by_present(pushdown_req);
     let col_types = involved_columns(request, |tables| tables.first())
         .unwrap()
         .types;
     // Covers only the no-decline half; a declining fixture belongs on `build_dispatch_sql`.
-    let (filter, declined_filter) = classify_where_filter(
-        pushdown_req.get("filter").filter(|f| !f.is_null()),
-        &column_types(&col_types),
-    );
+    let (filter, declined_filter) = ScanTranslator::new(&column_types(&col_types))
+        .split_where(pushdown_req.get("filter").filter(|f| !f.is_null()));
     assert!(
         declined_filter.is_none(),
         "plan_scan_sql mirrors only the no-decline dispatch path; a declined-filter fixture needs build_dispatch_sql, not this helper"
     );
 
-    let items = detect_aggregates(&pushdown, &ColumnTypes::default()).filter(|it| {
+    let items = detect_aggregates(&pushdown, untyped_scan()).filter(|it| {
         validate_agg_col_types(
-            &ordinary_plans(it, &ColumnTypes::default()),
+            &ordinary_plans(it, untyped_scan()),
             &column_types(&col_types),
         )
     });
     let merge_inputs = items.as_deref().map(|it| {
-        let plans = ordinary_plans(it, &ColumnTypes::default());
-        let plan_types =
-            single_group_plan_types(pushdown.select_types(), it, &ColumnTypes::default())
-                .expect("plan_scan_sql mirrors only fixtures whose aggregates are exactly typed");
+        let plans = ordinary_plans(it, untyped_scan());
+        let plan_types = single_group_plan_types(pushdown.select_types(), it, untyped_scan())
+            .expect("plan_scan_sql mirrors only fixtures whose aggregates are exactly typed");
         let merge_select = single_group_merge_select(
             it,
             &plans,
             &plan_types,
             pushdown.select_types(),
-            &column_types(&col_types),
+            ScanTranslator::new(&column_types(&col_types)),
         )
         .expect("plan_scan_sql mirrors only fixtures whose merge SELECT assembles in full");
         AggregateMergeInputs::new(plan_types, merge_select, limit)
             .expect("one merge item per select-list item is never empty")
     });
-    let aggregates = items.map(|it| ordinary_plans(&it, &ColumnTypes::default()));
+    let aggregates = items.map(|it| ordinary_plans(&it, untyped_scan()));
     // An aggregate select list always widens (aggregates stay off the projection), and
     // production guards widening only on the `RowScan` arm.
     assert!(

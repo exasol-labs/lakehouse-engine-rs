@@ -96,6 +96,10 @@ pub fn events_table() -> String {
     vs_table(LAKEHOUSE_VS, E2E_TABLE)
 }
 
+/// Every column of `TYPED_DISTINCT_PROBE` after `ID`, in declared order.
+pub const TYPED_COLUMNS: &str =
+    "C_DECIMAL_A, C_DECIMAL_B, C_DOUBLE, C_VARCHAR, C_DATE, C_TS, C_BOOL, C_PRICE, C_QTY";
+
 pub fn typed_table() -> String {
     vs_table(LAKEHOUSE_VS, E2E_TYPED_TABLE)
 }

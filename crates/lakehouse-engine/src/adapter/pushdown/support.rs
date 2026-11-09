@@ -14,8 +14,8 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::HashMap;
 use vs_expression::{
-    ColumnNode, ColumnTypeLookup, SqlFragment, render_scan_expression, render_scan_filter,
-    walk_column_nodes,
+    ColumnNode, ColumnTypeLookup, SqlFragment, exact_expression_type, render_scan_expression,
+    render_scan_filter, walk_column_nodes,
 };
 
 use super::binary_filter::{BinaryLayout, compare_binary_bytes};
@@ -654,37 +654,52 @@ fn scan_rewrite(expr: &Json, col_types: &ColumnTypes) -> Json {
     )
 }
 
-/// The sole owner of "SQL the DataFusion scan computes": every path renders through it, so every
-/// path runs the same typed checks (#587). `None` declines, and the caller must apply the
-/// expression in Exasol or decline the shape.
-pub(super) fn scan_expression(expr: &Json, col_types: &ColumnTypes) -> Option<SqlFragment> {
-    render_scan_expression(&scan_rewrite(expr, col_types), col_types).ok()
+/// The sole owner of "SQL the DataFusion scan computes": every path renders through it with the
+/// same column types, so every path runs the same typed checks and an aggregate re-derived in
+/// HAVING or ORDER BY renders exactly as at detection (#587).
+#[derive(Debug, Clone, Copy)]
+pub struct ScanTranslator<'a> {
+    columns: &'a ColumnTypes,
 }
 
-/// [`scan_expression`] for a filter: `Ok(None)` when it is trivially true, `Err(())` when the
-/// scan declines it.
-pub(super) fn scan_filter(filter: &Json, col_types: &ColumnTypes) -> Result<Option<String>, ()> {
-    render_scan_filter(&scan_rewrite(filter, col_types), col_types).map_err(|_| ())
-}
+impl<'a> ScanTranslator<'a> {
+    pub fn new(columns: &'a ColumnTypes) -> Self {
+        Self { columns }
+    }
 
-/// Whether the scan computes `expr`, for a caller that keeps the tree and renders it later
-/// through [`scan_filter`] with the same column types.
-pub(super) fn scan_accepts(expr: &Json, col_types: &ColumnTypes) -> bool {
-    scan_expression(expr, col_types).is_some()
-}
+    pub(super) fn columns(self) -> &'a ColumnTypes {
+        self.columns
+    }
 
-/// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`).
-/// `declined` is the original, un-rewritten tree, which Exasol applies itself.
-pub(super) fn classify_where_filter<'a>(
-    filter_json_raw: Option<&'a Json>,
-    col_types: &ColumnTypes,
-) -> (Option<String>, Option<&'a Json>) {
-    match filter_json_raw {
-        None => (None, None),
-        Some(raw) => match scan_filter(raw, col_types) {
-            Ok(sql) => (sql, None),
-            Err(()) => (None, Some(raw)),
-        },
+    /// `None` declines: the caller applies the expression in Exasol or declines the shape.
+    pub(super) fn expression(self, expr: &Json) -> Option<SqlFragment> {
+        render_scan_expression(&scan_rewrite(expr, self.columns), self.columns).ok()
+    }
+
+    /// `Ok(None)` when the filter is trivially true, `Err(())` when the scan declines it.
+    pub(super) fn filter(self, filter: &Json) -> Result<Option<String>, ()> {
+        render_scan_filter(&scan_rewrite(filter, self.columns), self.columns).map_err(|_| ())
+    }
+
+    pub(super) fn accepts(self, expr: &Json) -> bool {
+        self.expression(expr).is_some()
+    }
+
+    /// The type the request states for `expr`: a CAST's target or a column's type.
+    pub(super) fn exact_type(self, expr: &Json) -> Option<ExasolType> {
+        exact_expression_type(expr, self.columns)
+    }
+
+    /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`). `declined` is the
+    /// original, un-rewritten tree, which Exasol applies itself.
+    pub(super) fn split_where(self, filter: Option<&Json>) -> (Option<String>, Option<&Json>) {
+        match filter {
+            None => (None, None),
+            Some(raw) => match self.filter(raw) {
+                Ok(sql) => (sql, None),
+                Err(()) => (None, Some(raw)),
+            },
+        }
     }
 }
 
@@ -695,8 +710,9 @@ pub(super) fn classify_where_filter<'a>(
 /// can coincide. A missing or empty select list is not a widening.
 pub(super) fn project_columns(
     pushdown: &PushdownRequest,
-    all_cols: &ColumnTypes,
+    scan: ScanTranslator<'_>,
 ) -> Result<(Vec<ProjectedColumn>, bool), UdfError> {
+    let all_cols = scan.columns();
     let Some((first_col, first)) = all_cols.0.first() else {
         return Err(UdfError::User(
             "pushdown request has no column metadata".into(),
@@ -741,10 +757,7 @@ pub(super) fn project_columns(
                     // select-list arity (#190).
                     t if is_literal_selectlist_item(t) || is_pushable_expression_node(t) => {
                         // The EMITS column type must equal Exasol's declared type.
-                        match (
-                            scan_expression(e, all_cols),
-                            pushdown.emittable_select_type(i),
-                        ) {
+                        match (scan.expression(e), pushdown.emittable_select_type(i)) {
                             (Some(fragment), Some(exa_type)) => {
                                 projected.push(ProjectedColumn {
                                     item: ProjectionItem::Expr { expr: fragment.sql },

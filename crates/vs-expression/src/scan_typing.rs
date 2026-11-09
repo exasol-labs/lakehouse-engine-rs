@@ -4,7 +4,7 @@
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use crate::exasol_type::{ExasolType, MAX_VARCHAR_SIZE, exasol_type_from_json};
+use crate::exasol_type::{ExasolType, exasol_type_from_json};
 
 /// The Exasol type of a `column` node, keyed however the caller binds columns.
 pub trait ColumnTypeLookup {
@@ -14,8 +14,8 @@ pub trait ColumnTypeLookup {
 /// The part of a node's Exasol type that decides whether the scan may convert it to text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TypeClass {
-    /// CHAR or VARCHAR. `max_chars` and `ascii` only when the source states them.
-    Text { max_chars: Option<u32>, ascii: bool },
+    /// CHAR or VARCHAR.
+    Text,
     /// DECIMAL(p,0). Its text form is the same in every session.
     Integer { precision: Option<u8> },
     /// `TRUE` or `FALSE` in every session.
@@ -29,10 +29,7 @@ pub(crate) enum TypeClass {
 impl TypeClass {
     fn of(ty: ExasolType) -> Self {
         match ty {
-            ExasolType::Char { size, ascii } | ExasolType::Varchar { size, ascii } => Self::Text {
-                max_chars: Some(size),
-                ascii,
-            },
+            ExasolType::Char { .. } | ExasolType::Varchar { .. } => Self::Text,
             ExasolType::Decimal(d) if d.scale() == 0 => Self::Integer {
                 precision: Some(d.precision()),
             },
@@ -41,17 +38,13 @@ impl TypeClass {
         }
     }
 
-    const TEXT: Self = Self::Text {
-        max_chars: None,
-        ascii: false,
-    };
     const INTEGER: Self = Self::Integer { precision: None };
 
     /// The class Exasol gives a CASE, GREATEST, or LEAST over these branches.
     fn union(self, other: Self) -> Self {
         match (self, other) {
             (Self::Null, c) | (c, Self::Null) => c,
-            (Self::Text { .. }, Self::Text { .. }) => Self::TEXT,
+            (Self::Text, Self::Text) => Self::Text,
             (Self::Integer { .. }, Self::Integer { .. }) => Self::INTEGER,
             (Self::Boolean, Self::Boolean) => Self::Boolean,
             _ => Self::Other,
@@ -83,7 +76,7 @@ fn wrap(node_type: &str, arg: Json) -> Json {
 /// argument.
 fn to_text(node: Json, class: TypeClass) -> Result<Json, UdfError> {
     match class {
-        TypeClass::Text { .. } | TypeClass::Null => Ok(node),
+        TypeClass::Text | TypeClass::Null => Ok(node),
         TypeClass::Integer { .. } => Ok(wrap(INTEGER_TEXT_NODE, node)),
         TypeClass::Boolean => Ok(wrap(BOOLEAN_TEXT_NODE, node)),
         TypeClass::Other => Err(decline(format!(
@@ -136,7 +129,7 @@ fn function_class(fn_name: &str, args: &[TypeClass]) -> TypeClass {
             .unwrap_or(TypeClass::Other),
         "CONCAT" | "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE"
         | "REPEAT" | "REVERSE" | "LPAD" | "RPAD" | "INITCAP" | "LEFT" | "RIGHT" | "TRANSLATE"
-        | "CHR" | "UNICODECHR" => TypeClass::TEXT,
+        | "CHR" | "UNICODECHR" => TypeClass::Text,
         "ASCII" | "UNICODE" | "LENGTH" | "OCTET_LENGTH" | "INSTR" | "LOCATE" | "YEAR" | "MONTH"
         | "DAY" | "HOUR" | "MINUTE" | "WEEK" => TypeClass::INTEGER,
         _ => TypeClass::Other,
@@ -148,12 +141,13 @@ fn integer_text_width(precision: Option<u8>) -> u32 {
     u32::from(precision.unwrap_or(crate::exasol_type::MAX_DECIMAL_PRECISION)) + 1
 }
 
-/// An explicit CAST to CHAR or VARCHAR: pushed only when the source type guarantees Exasol's
-/// result, including its length check, blank padding, and ASCII check.
+/// An explicit CAST to CHAR or VARCHAR. Text into a shorter VARCHAR or an ASCII target runs
+/// unchecked, a documented difference (`docs/semantic-differences.md`); CHAR declines, because the
+/// scan does not blank-pad.
 fn cast_to_text(source: Json, class: TypeClass, target: ExasolType) -> Result<Json, UdfError> {
-    let (size, ascii, is_char) = match target {
-        ExasolType::Char { size, ascii } => (size, ascii, true),
-        ExasolType::Varchar { size, ascii } => (size, ascii, false),
+    let (size, is_char) = match target {
+        ExasolType::Char { size, .. } => (size, true),
+        ExasolType::Varchar { size, .. } => (size, false),
         _ => unreachable!("cast_to_text called with a non-character target"),
     };
     let refuse = |why: &str| {
@@ -166,20 +160,7 @@ fn cast_to_text(source: Json, class: TypeClass, target: ExasolType) -> Result<Js
         return refuse("blank-pads, which the scan does not reproduce");
     }
     match class {
-        TypeClass::Null => Ok(source),
-        TypeClass::Text {
-            max_chars,
-            ascii: source_ascii,
-        } => {
-            let fits = size == MAX_VARCHAR_SIZE || max_chars.is_some_and(|m| m <= size);
-            if !fits {
-                return refuse("checks the length, which the scan does not reproduce");
-            }
-            if ascii && !source_ascii {
-                return refuse("checks for ASCII, which the scan does not reproduce");
-            }
-            Ok(source)
-        }
+        TypeClass::Null | TypeClass::Text => Ok(source),
         TypeClass::Integer { precision } => {
             if integer_text_width(precision) > size {
                 return refuse("may not fit the integer's text");
@@ -207,7 +188,7 @@ fn cast_from_text(source: &Json, class: TypeClass, target: ExasolType) -> Result
         ExasolType::Decimal(d) => d.scale() > 0,
         _ => false,
     };
-    if session_parsed && matches!(class, TypeClass::Text { .. }) {
+    if session_parsed && matches!(class, TypeClass::Text) {
         return Err(decline(format!(
             "CAST of text {} to {target} parses by the session's NLS settings",
             short(source)
@@ -283,13 +264,7 @@ pub(crate) fn type_scan_tree(
     let class = match node_kind {
         "literal_null" => TypeClass::Null,
         "literal_bool" => TypeClass::Boolean,
-        "literal_string" => {
-            let text = node.get("value").and_then(Json::as_str).unwrap_or("");
-            TypeClass::Text {
-                max_chars: u32::try_from(text.chars().count()).ok(),
-                ascii: text.is_ascii(),
-            }
-        }
+        "literal_string" => TypeClass::Text,
         "literal_exactnumeric" => match node.get("value") {
             Some(Json::Number(n)) if n.is_i64() || n.is_u64() => TypeClass::Integer {
                 precision: u8::try_from(n.to_string().trim_start_matches('-').len()).ok(),
@@ -324,7 +299,7 @@ pub(crate) fn type_scan_tree(
             if let Some(Json::Array(args)) = node.get("arguments") {
                 operands.extend(args.iter().zip(classes_of("arguments")));
             }
-            compare_without_session_parse(node, &operands)?;
+            compare_without_session_parse(node, &mut out, &operands)?;
             TypeClass::Boolean
         }
         "predicate_is_null" | "predicate_is_not_null" => TypeClass::Boolean,
@@ -353,7 +328,7 @@ pub(crate) fn type_scan_tree(
                     if let Some(Json::Array(whens)) = node.get("arguments") {
                         operands.extend(whens.iter().zip(classes_of("arguments")));
                     }
-                    compare_without_session_parse(node, &operands)?;
+                    compare_without_session_parse(node, &mut out, &operands)?;
                 }
                 _ => refuse_implicit_text(node, &classes_of("arguments"))?,
             }
@@ -443,38 +418,69 @@ fn is_session_free_integer_text(node: &Json) -> bool {
 }
 
 /// Exasol compares text with a date, timestamp, or number by converting the text with the
-/// session's NLS settings; DataFusion always parses ISO dates and a `.` decimal point.
+/// session's NLS settings; DataFusion always parses ISO dates and a `.` decimal point. A digits-only
+/// literal against integers reads the same in every session, so it becomes the number it reads as:
+/// DataFusion would cast it to the column's type and fail when it overflows.
 fn compare_without_session_parse(
     node: &Json,
+    out: &mut Json,
     operands: &[(&Json, TypeClass)],
 ) -> Result<(), UdfError> {
     let text: Vec<&Json> = operands
         .iter()
-        .filter(|(_, c)| matches!(c, TypeClass::Text { .. }))
+        .filter(|(_, c)| matches!(c, TypeClass::Text))
         .map(|(n, _)| *n)
         .collect();
     let non_text: Vec<TypeClass> = operands
         .iter()
         .map(|(_, c)| *c)
-        .filter(|c| !matches!(c, TypeClass::Text { .. } | TypeClass::Null))
+        .filter(|c| !matches!(c, TypeClass::Text | TypeClass::Null))
         .collect();
+    if text.is_empty() || non_text.is_empty() {
+        return Ok(());
+    }
     let integer_against_digits = non_text
         .iter()
         .all(|c| matches!(c, TypeClass::Integer { .. }))
         && text.iter().all(|n| is_session_free_integer_text(n));
-    if !text.is_empty() && !non_text.is_empty() && !integer_against_digits {
+    if !integer_against_digits {
         return Err(decline(format!(
             "comparing text with another type parses the text by the session's NLS settings: {}",
             short(node)
         )));
     }
+    let to_number = |operand: &mut Json| {
+        if is_session_free_integer_text(operand) {
+            *operand = integer_literal(operand["value"].as_str().unwrap_or_default());
+        }
+    };
+    for field in ["expression", "left", "right", "basis"] {
+        if let Some(operand) = out.get_mut(field) {
+            to_number(operand);
+        }
+    }
+    if let Some(Json::Array(args)) = out.get_mut("arguments") {
+        args.iter_mut().for_each(to_number);
+    }
     Ok(())
+}
+
+fn integer_literal(digits: &str) -> Json {
+    let (sign, digits) = match digits.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", digits),
+    };
+    let value = match digits.trim_start_matches('0') {
+        "" => "0".to_string(),
+        trimmed => format!("{sign}{trimmed}"),
+    };
+    serde_json::json!({"type": "literal_exactnumeric", "value": value})
 }
 
 /// Text in a position that expects a date, timestamp, number, or boolean: Exasol converts it by
 /// the session's NLS settings, and DataFusion parses ISO dates and a `.` or fails to plan.
 fn refuse_implicit_text(node: &Json, operands: &[TypeClass]) -> Result<(), UdfError> {
-    if operands.iter().any(|c| matches!(c, TypeClass::Text { .. })) {
+    if operands.iter().any(|c| matches!(c, TypeClass::Text)) {
         return Err(decline(format!(
             "converting a text operand to another type parses it by the session's NLS settings: {}",
             short(node)
@@ -486,10 +492,10 @@ fn refuse_implicit_text(node: &Json, operands: &[TypeClass]) -> Result<(), UdfEr
 /// The class of values Exasol brings to one type (CASE results, GREATEST, LEAST, NULLIF). Text
 /// among other types converts by the session's NLS settings.
 fn unify_branches(node: &Json, branches: &[TypeClass]) -> Result<TypeClass, UdfError> {
-    let has_text = branches.iter().any(|c| matches!(c, TypeClass::Text { .. }));
+    let has_text = branches.iter().any(|c| matches!(c, TypeClass::Text));
     let has_other = branches
         .iter()
-        .any(|c| !matches!(c, TypeClass::Text { .. } | TypeClass::Null));
+        .any(|c| !matches!(c, TypeClass::Text | TypeClass::Null));
     if has_text && has_other {
         return Err(decline(format!(
             "bringing text and another type to one type parses the text by the session's NLS settings: {}",

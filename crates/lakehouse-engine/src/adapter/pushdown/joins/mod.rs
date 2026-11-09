@@ -10,6 +10,7 @@ use serde_json::Value as Json;
 use super::empty_result::empty_result_sql;
 use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
+use super::support::ScanTranslator;
 use super::support::{
     ColumnTypes, DISTRIBUTE_FILES_UDF_NAME, PushdownRequest, SCAN_UDF_NAME, project_columns,
     quote_ident,
@@ -168,13 +169,13 @@ pub(super) async fn plan_join(
 
     if sides.iter().any(|s| s.files.is_empty()) {
         let combined = ColumnTypes::concat(sides.iter().map(|side| &side.column_types));
-        let (projection, widened) = project_columns(pushdown, &combined)?;
+        let (projection, widened) = project_columns(pushdown, ScanTranslator::new(&combined))?;
         let cols_per_leg = sides.iter().map(|side| side.column_types.clone()).collect();
         return empty_result_sql(
             pushdown,
             &projection,
             widened,
-            &combined,
+            ScanTranslator::new(&combined),
             &EmptyRelation::join(join, cols_per_leg),
         );
     }

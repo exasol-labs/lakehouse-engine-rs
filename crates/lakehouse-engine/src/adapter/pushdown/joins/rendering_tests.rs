@@ -77,7 +77,7 @@ fn join_where_filter_spanning_both_sides_renders() {
         compare(
             "predicate_greater",
             table_col("ORDERS", "O_ORDERDATE"),
-            str_lit("1995-01-01"),
+            date_lit("1995-01-01"),
         ),
     ]);
 
@@ -153,7 +153,7 @@ fn join_projection_resolves_cast_node_to_expr_not_full_row_fallback() {
 }
 
 #[test]
-fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
+fn join_projection_string_fn_converts_integer_and_declines_unrenderable_arity() {
     let request = join_request(Json::Null, equi_condition());
 
     let mut coerce_request = request.clone();
@@ -175,11 +175,8 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
         panic!("must be a rendered expression, not a bare column: {projection:?}");
     };
     assert!(
-        expr.contains(
-            r#"upper(regexp_replace(regexp_replace(CAST("LHS_T0"."C_CUSTKEY" AS VARCHAR)"#
-        ),
-        "UPPER's DECIMAL argument must render through the trimmed decimal-to-string \
-         form: {expr}"
+        expr.contains(r#"upper(CAST(CAST("LHS_T0"."C_CUSTKEY" AS DECIMAL(38,0)) AS VARCHAR))"#),
+        "UPPER's integer argument must render through the canonical integer text: {expr}"
     );
 
     let mut decline_request = request.clone();
@@ -246,7 +243,7 @@ fn join_projection_like_guard_reaches_join_select_list() {
     decline_request = selecting(
         decline_request,
         &[(
-            like(table_col("CUSTOMER", "C_CUSTKEY"), "1%"),
+            like(table_col("ORDERS", "O_ORDERDATE"), "1%"),
             ExasolType::Boolean,
         )],
     );
@@ -254,7 +251,7 @@ fn join_projection_like_guard_reaches_join_select_list() {
     assert!(
         widened,
         "the widening flag is what declines the broadcast join to the N-scan \
-         fallback; a DECIMAL-subject LIKE must set it: \
+         fallback; a DATE-subject LIKE must set it: \
          {projection:?}"
     );
     let expected_full_row_len = involved_table(&decline_request, "CUSTOMER")
@@ -282,33 +279,17 @@ fn join_projection_like_guard_reaches_join_select_list() {
 
 #[test]
 fn leg_local_filter_attributes_conjuncts_to_owning_leg() {
-    let filter = and([
-        string_equal("CUSTOMER", "C_NAME", "ACME"),
-        compare(
-            "predicate_greater",
-            table_col("ORDERS", "O_ORDERDATE"),
-            str_lit("1995-01-01"),
-        ),
-    ]);
+    let name = string_equal("CUSTOMER", "C_NAME", "ACME");
+    let date = compare(
+        "predicate_greater",
+        table_col("ORDERS", "O_ORDERDATE"),
+        date_lit("1995-01-01"),
+    );
+    let filter = and([name.clone(), date.clone()]);
 
     let legs = customer_orders_legs();
-    let cust = render_df_filter_safe(
-        &leg_local_filter(&filter, &legs, 0).expect("a CUSTOMER-local conjunct exists"),
-    )
-    .expect("renders");
-    assert!(
-        cust.contains("C_NAME") && !cust.contains("O_ORDERDATE"),
-        "CUSTOMER side-local filter must carry only C_NAME: {cust}"
-    );
-
-    let ord = render_df_filter_safe(
-        &leg_local_filter(&filter, &legs, 1).expect("an ORDERS-local conjunct exists"),
-    )
-    .expect("renders");
-    assert!(
-        ord.contains("O_ORDERDATE") && !ord.contains("C_NAME"),
-        "ORDERS side-local filter must carry only O_ORDERDATE: {ord}"
-    );
+    assert_eq!(leg_local_filter(&filter, &legs, 0), Some(name));
+    assert_eq!(leg_local_filter(&filter, &legs, 1), Some(date));
 }
 
 #[test]
@@ -321,13 +302,10 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
         string_equal("CUSTOMER", "C_NAME", "ACME"),
     ]);
     let legs = customer_orders_legs();
-    let cust = render_df_filter_safe(
-        &leg_local_filter(&filter, &legs, 0).expect("CUSTOMER-local conjunct present"),
-    )
-    .expect("renders");
-    assert!(
-        cust.contains("C_NAME") && !cust.contains("O_CUSTKEY"),
-        "the cross-table conjunct must NOT be pushed to CUSTOMER: {cust}"
+    assert_eq!(
+        leg_local_filter(&filter, &legs, 0),
+        Some(string_equal("CUSTOMER", "C_NAME", "ACME")),
+        "the cross-table conjunct must NOT be pushed to CUSTOMER"
     );
     assert!(
         leg_local_filter(&filter, &legs, 1).is_none(),
@@ -339,7 +317,7 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
         compare(
             "predicate_greater",
             table_col("ORDERS", "O_ORDERDATE"),
-            str_lit("1995-01-01"),
+            date_lit("1995-01-01"),
         ),
     ]);
     assert!(leg_local_filter(&or_filter, &legs, 0).is_none());
@@ -366,28 +344,16 @@ fn leg_local_filter_handles_a_single_conjunct() {
 
 #[test]
 fn leg_local_filter_attributes_shared_column_by_leg_not_name() {
-    let filter = and([
-        compare("predicate_greater", table_col("EVENTS", "ID"), num_lit(5)),
-        string_equal("LABELS", "LABEL", "x"),
-    ]);
+    let id = compare("predicate_greater", table_col("EVENTS", "ID"), num_lit(5));
+    let label = string_equal("LABELS", "LABEL", "x");
+    let filter = and([id.clone(), label.clone()]);
 
     let legs = legs_of(&["EVENTS", "LABELS"]);
-    let events = render_df_filter_safe(
-        &leg_local_filter(&filter, &legs, 0).expect("EVENTS.ID conjunct is leg-local"),
-    )
-    .expect("renders");
-    assert!(
-        events.contains("ID") && events.contains('5'),
-        "EVENTS side-local filter must carry the ID > 5 predicate: {events}"
-    );
-
-    let labels = render_df_filter_safe(
-        &leg_local_filter(&filter, &legs, 1).expect("LABELS.LABEL conjunct is leg-local"),
-    )
-    .expect("renders");
-    assert!(
-        labels.contains("LABEL") && !labels.contains('5'),
-        "the EVENTS.ID predicate must NOT be applied to LABELS despite the shared name: {labels}"
+    assert_eq!(leg_local_filter(&filter, &legs, 0), Some(id));
+    assert_eq!(
+        leg_local_filter(&filter, &legs, 1),
+        Some(label),
+        "the EVENTS.ID predicate must NOT be applied to LABELS despite the shared name"
     );
 }
 
@@ -426,8 +392,8 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
 fn orders_local_rendering_conjunct() -> Json {
     compare(
         "predicate_greater",
-        table_col("ORDERS", "O_ORDERDATE"),
-        str_lit("1995-01-01"),
+        aliased_col("FACT_ORDERS", "O", "O_ORDERDATE"),
+        date_lit("1995-01-01"),
     )
 }
 
@@ -437,125 +403,60 @@ fn orders_col_types() -> Vec<(String, ExasolType)> {
         .types
 }
 
-fn conjunct_count(filter: Option<&Json>) -> usize {
-    filter.map_or(0, |f| {
-        let mut out = Vec::new();
-        flatten_conjuncts(f, &mut out);
-        out.len()
-    })
-}
-
 #[test]
-fn type_screened_leg_filter_pushes_whole_accepted_set_rewritten() {
+fn type_screened_leg_filter_renders_the_accepted_set_bare() {
     let filter = and([
-        like(table_col("ORDERS", "O_ORDERDATE"), "1995%"),
+        like(table_col("ORDERS", "O_CUSTKEY"), "1%"),
         orders_local_rendering_conjunct(),
     ]);
 
     let (leg, declined) = type_screened_leg_filter(&filter, &column_types(&orders_col_types()));
 
-    assert!(
-        declined.is_none(),
-        "no conjunct declines, so nothing may be handed to the outer wrapper: {declined:?}"
-    );
+    assert_eq!(declined, None);
     let leg = leg.expect("an all-accepted side-local set must reach its leg");
-    assert_eq!(
-        conjunct_count(Some(&leg)),
-        2,
+    assert!(
+        leg.contains("O_CUSTKEY") && leg.contains("O_ORDERDATE"),
         "both accepted conjuncts must reach the leg: {leg}"
     );
-    let rendered = render_df_filter_safe(&leg).expect("the rewritten set must render");
     assert!(
-        rendered.contains(r#"CAST("O_ORDERDATE" AS VARCHAR)"#) && rendered.contains("LIKE"),
-        "the DATE LIKE subject must reach the leg CAST to VARCHAR, not bare: {rendered}"
+        !leg.contains(r#""O"."#),
+        "the leg filter must be bare, never alias-qualified: {leg}"
+    );
+}
+
+#[test]
+fn type_screened_leg_filter_keeps_accepted_conjuncts_beside_a_declined_one() {
+    let date_like = like(table_col("ORDERS", "O_ORDERDATE"), "1995%");
+    let filter = and([
+        date_like.clone(),
+        like(table_col("ORDERS", "O_CUSTKEY"), "1%"),
+    ]);
+
+    let (leg, declined) = type_screened_leg_filter(&filter, &column_types(&orders_col_types()));
+
+    let leg = leg.expect("the integer LIKE stays in the scan");
+    assert!(
+        leg.contains("O_CUSTKEY") && !leg.contains("O_ORDERDATE"),
+        "{leg}"
+    );
+    assert_eq!(
+        declined,
+        Some(date_like),
+        "the declined half is the raw tree"
     );
 }
 
 #[test]
 fn type_screened_leg_filter_declines_whole_set_when_no_conjunct_survives() {
-    let decimal_like = like(table_col("ORDERS", "O_CUSTKEY"), "1%");
     let filter = and([
-        decimal_like.clone(),
+        like(table_col("ORDERS", "O_ORDERDATE"), "1995%"),
         declined_second_predicate(table_col("ORDERS", "O_ORDERDATE")),
     ]);
 
     let (leg, declined) = type_screened_leg_filter(&filter, &column_types(&orders_col_types()));
 
-    assert!(
-        leg.is_none(),
-        "no conjunct may be pushed when every one of them declines: {leg:?}"
-    );
-    let declined = declined.expect("a fully declined side-local set must go residual");
-    let mut conjuncts = Vec::new();
-    flatten_conjuncts(&declined, &mut conjuncts);
-    assert_eq!(
-        conjuncts.len(),
-        2,
-        "both declined conjuncts must reach the outer wrapper: {declined}"
-    );
-    assert!(
-        conjuncts.contains(&&decimal_like),
-        "the DECIMAL LIKE must be carried RAW so the Exasol dialect can render it: \
-         {declined}"
-    );
-}
-
-#[test]
-fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
-    let date_like = like(table_col("ORDERS", "O_ORDERDATE"), "1995%");
-    let decimal_like = like(table_col("ORDERS", "O_CUSTKEY"), "1%");
-    let mixed = and([
-        date_like.clone(),
-        decimal_like.clone(),
-        orders_local_rendering_conjunct(),
-    ]);
-    let cases = [
-        (
-            "all accepted",
-            and([date_like, orders_local_rendering_conjunct()]),
-        ),
-        (
-            "all declined",
-            and([
-                decimal_like.clone(),
-                declined_second_predicate(table_col("ORDERS", "O_ORDERDATE")),
-            ]),
-        ),
-        ("mixed", mixed.clone()),
-    ];
-
-    for (label, filter) in cases {
-        let input = conjunct_count(Some(&filter));
-        let (leg, declined) = type_screened_leg_filter(&filter, &column_types(&orders_col_types()));
-        assert_eq!(
-            conjunct_count(leg.as_ref()) + conjunct_count(declined.as_ref()),
-            input,
-            "{label}: every conjunct must land in exactly one half — none dropped, \
-             none double-applied"
-        );
-        if leg.is_none() {
-            assert_eq!(
-                conjunct_count(declined.as_ref()),
-                input,
-                "{label}: fail closed — with no leg half the declined half must carry \
-                 the WHOLE side-local set"
-            );
-        }
-    }
-
-    let (leg, declined) = type_screened_leg_filter(&mixed, &column_types(&orders_col_types()));
-    let leg_sql = render_df_filter_safe(&leg.expect("the two accepted conjuncts form a leg"))
-        .expect("the rewritten accepted set must render for DataFusion");
-    assert!(
-        leg_sql.contains(r#"CAST("O_ORDERDATE" AS VARCHAR)"#) && !leg_sql.contains("O_CUSTKEY"),
-        "one type-declining conjunct must not forfeit its side's other pushable \
-         conjuncts: {leg_sql}"
-    );
-    assert_eq!(
-        declined,
-        Some(decimal_like),
-        "the declined half must be exactly the type-declined conjunct, RAW"
-    );
+    assert_eq!(leg, None);
+    assert_eq!(declined, Some(filter));
 }
 
 #[test]
@@ -567,38 +468,21 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
         ]
     });
     let filter = like(table_col("DATED", "SHARED_KEY"), "1995%");
+    let screen = |table: &str| {
+        type_screened_leg_filter(
+            &filter,
+            &column_types(&involved_table(&request, table).unwrap().types),
+        )
+    };
 
-    let (date_leg, date_declined) = type_screened_leg_filter(
-        &filter,
-        &column_types(&involved_table(&request, "DATED").unwrap().types),
-    );
-    let date_sql = render_df_filter_safe(
-        &date_leg.expect("the DATE side accepts the LIKE through the CAST rewrite"),
-    )
-    .expect("the CAST-rewrapped LIKE renders for DataFusion");
-    assert!(
-        date_sql.contains(r#"CAST("SHARED_KEY" AS VARCHAR)"#),
-        "the DATE side must push the CAST-rewritten LIKE into its leg: {date_sql}"
-    );
-    assert!(
-        date_declined.is_none(),
-        "the DATE side declines nothing: {date_declined:?}"
-    );
-
-    let (numeric_leg, numeric_declined) = type_screened_leg_filter(
-        &filter,
-        &column_types(&involved_table(&request, "NUMBERED").unwrap().types),
-    );
-    assert!(
-        numeric_leg.is_none(),
-        "the DECIMAL side has no safe rewrite, so nothing may reach its leg: \
-         {numeric_leg:?}"
-    );
     assert_eq!(
-        numeric_declined,
-        Some(filter),
-        "the DECIMAL side must hand the SAME conjunct to the outer wrapper RAW"
+        screen("DATED"),
+        (None, Some(filter.clone())),
+        "a DATE's text depends on NLS_DATE_FORMAT, so the DATE side declines"
     );
+    let (numeric_leg, numeric_declined) = screen("NUMBERED");
+    assert!(numeric_leg.is_some_and(|sql| sql.contains("SHARED_KEY")));
+    assert_eq!(numeric_declined, None);
 }
 
 #[test]
@@ -717,51 +601,29 @@ fn column_collectors_keep_divergent_case_folding() {
 }
 
 #[test]
-fn side_fan_out_pushes_bare_side_local_filter_into_common_blob() {
+fn side_fan_out_pushes_side_local_filter_into_common_blob() {
     let side = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]);
-    let cols = vec![
-        ("O_CUSTKEY".to_string(), ExasolType::decimal(20, 0)),
-        ("O_ORDERDATE".to_string(), ExasolType::Date),
-    ];
-    let filter = compare(
-        "predicate_greater",
-        aliased_col("FACT_ORDERS", "O", "O_ORDERDATE"),
-        str_lit("1995-01-01"),
-    );
+    let cols = vec![("O_ORDERDATE".to_string(), ExasolType::Date)];
+    let fan_out = |filter: Option<String>| {
+        let sql = build_side_fan_out_sql(
+            &side,
+            &column_types(&cols),
+            filter,
+            &two_scan_tuning(),
+            "SCAN",
+            "DISTRIBUTE",
+        )
+        .expect("selecting the wire storage must succeed");
+        common_arg_literal(&sql).to_string()
+    };
 
-    let sql_with = build_side_fan_out_sql(
-        &side,
-        &column_types(&cols),
-        Some(&filter),
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("selecting the wire storage must succeed");
-    let common = common_arg_literal(&sql_with);
+    let common = fan_out(Some(r#""O_ORDERDATE" > DATE '1995-01-01'"#.to_string()));
     assert!(
         common.contains("\"filter\"") && common.contains("O_ORDERDATE"),
-        "the side-local filter must be pushed into the fan-out common blob: {common}"
+        "{common}"
     );
-    assert!(
-        !common.contains(r#"\"O\".\"O_ORDERDATE\""#) && !common.contains(r#""O"."O_ORDERDATE""#),
-        "the fan-out filter MUST be bare (alias stripped), never alias-qualified: {common}"
-    );
-
-    let sql_without = build_side_fan_out_sql(
-        &side,
-        &column_types(&cols),
-        None,
-        &two_scan_tuning(),
-        "SCAN",
-        "DISTRIBUTE",
-    )
-    .expect("selecting the wire storage must succeed");
-    let common_none = common_arg_literal(&sql_without);
-    assert!(
-        !common_none.contains("\"filter\""),
-        "no side-local filter ⇒ no filter field in the common blob: {common_none}"
-    );
+    let common_none = fan_out(None);
+    assert!(!common_none.contains("\"filter\""), "{common_none}");
 }
 
 #[test]
@@ -845,7 +707,7 @@ fn render_broadcast_join_replaces_native_table_alias_in_filter_with_leg_alias() 
     request["pushdownRequest"]["filter"] = compare(
         "predicate_greater",
         aliased_col("ORDERS", "O", "O_ORDERDATE"),
-        str_lit("1995-01-01"),
+        date_lit("1995-01-01"),
     );
     let detected = detected_join(&request);
     let rendered = render_broadcast_join(
@@ -943,7 +805,7 @@ fn unified_join_prunes_and_narrows_each_leg() {
             compare(
                 "predicate_greater",
                 table_col("ORDERS", "O_ORDERDATE"),
-                str_lit("1995-01-01"),
+                date_lit("1995-01-01"),
             ),
         ]))
         .column(table_col("CUSTOMER", "C_NAME"))
@@ -1022,12 +884,5 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
 
     let (leg, declined) = type_screened_leg_filter(&filter, &sides[0].column_types);
     assert!(declined.is_none(), "{declined:?}");
-    assert_eq!(
-        scan_filter_sql(
-            &leg.expect("the leg takes the comparison"),
-            &sides[0].column_types
-        )
-        .as_deref(),
-        Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#)
-    );
+    assert_eq!(leg.as_deref(), Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#));
 }

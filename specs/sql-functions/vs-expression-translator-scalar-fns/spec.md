@@ -56,6 +56,7 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *THEN* the translator SHALL render the node as the corresponding DataFusion SQL function applied to its rendered arguments in order, using these name mappings: `LENGTH`→`character_length`, `INSTR`/`LOCATE`→`strpos` (with operands ordered string-then-substring per DataFusion `strpos(string, substring)`), `UNICODE`→`ascii`, `UNICODECHR`→`chr`, and all other listed names lower-cased to their identically-named DataFusion function
 * *AND* each argument SHALL be rendered recursively by the translator
 * *AND* `LOCATE`/`INSTR` argument reordering MUST preserve the Exasol semantics of "position of substring within string"
+* *AND* an `INSTR` or `LOCATE` node with more than two arguments SHALL decline, because `strpos` takes no start position or occurrence
 * *AND* `CONCAT` SHALL be rendered by its own dedicated per-dialect rule, specified in `sql-functions/vs-expression-translator-concat`, not by this name-mapping table
 
 ### Scenario: String scalar functions render verbatim in the Exasol dialect
@@ -64,7 +65,7 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *WHEN* `render_expression_exasol` processes the node
 * *THEN* the translator SHALL return `<NAME>(<args_sql>)` using the function's own uppercased Exasol name and its arguments in the order received, with no name mapping and no operand reordering
 * *AND* `INSTR` and `LOCATE` in particular MUST keep Exasol's own argument order and MUST NOT render as `strpos(...)`, which Exasol rejects with `function or script STRPOS not found` (SQL code 42000)
-* *AND* an `INSTR` or `LOCATE` node carrying Exasol's optional start-position or occurrence argument SHALL render with that argument forwarded unchanged, because Exasol's native function accepts it, this is what lets the arity decline in `pushdown-types/pushdown-planning-string-fn-type-coercion` still evaluate correctly on the Exasol side
+* *AND* an `INSTR` or `LOCATE` node carrying Exasol's optional start-position or occurrence argument SHALL render with that argument forwarded unchanged, because Exasol's native function accepts it
 * *AND* the DataFusion-dialect rendering of every listed name MUST remain byte-identical to the preceding scenario
 
 ### Scenario: CASE expression translates to SQL CASE WHEN

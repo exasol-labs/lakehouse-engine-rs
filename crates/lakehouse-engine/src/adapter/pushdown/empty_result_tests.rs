@@ -84,7 +84,7 @@ fn empty_result_sql_dispatches_by_plan_shape() {
         &grouped,
         &projected_columns(&proj, &proj_types),
         false,
-        &column_types(&col_types),
+        ScanTranslator::new(&column_types(&col_types)),
         &relation(&col_types),
     )
     .unwrap()["sql"]
@@ -112,7 +112,7 @@ fn empty_result_sql_dispatches_by_plan_shape() {
             &single,
             &projected_columns(&proj, &proj_types),
             false,
-            &column_types(col_types),
+            ScanTranslator::new(&column_types(col_types)),
             &relation(col_types),
         )
         .unwrap()["sql"]
@@ -122,7 +122,8 @@ fn empty_result_sql_dispatches_by_plan_shape() {
         assert_eq!(
             sql,
             format!(
-                "SELECT SUM(\"{column}\") FROM (SELECT CAST(NULL AS {ty}) AS \"{column}\" \
+                "SELECT CAST(SUM(\"{column}\") AS DECIMAL(36,2)) FROM (SELECT CAST(NULL AS {ty}) \
+                 AS \"{column}\" \
                  FROM DUAL WHERE 1=0) AS \"LHS_T0\""
             )
         );
@@ -142,7 +143,7 @@ fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
         &request,
         &projected_columns(&[], &[]),
         false,
-        &column_types(&col_types),
+        ScanTranslator::new(&column_types(&col_types)),
         &relation(&col_types),
     )
     .unwrap()["sql"]
@@ -151,7 +152,8 @@ fn empty_single_group_evaluates_constants_and_having_over_the_empty_relation() {
         .to_string();
     assert_eq!(
         sql,
-        "SELECT 'X', COUNT(*) FROM (SELECT CAST(NULL AS DECIMAL(19,0)) AS \"ID\" FROM DUAL \
+        "SELECT CAST('X' AS VARCHAR(2000000)), CAST(COUNT(*) AS DECIMAL(18,0)) FROM (SELECT \
+         CAST(NULL AS DECIMAL(19,0)) AS \"ID\" FROM DUAL \
          WHERE 1=0) AS \"LHS_T0\" HAVING (COUNT(*) = 0)"
     );
 }
@@ -175,7 +177,7 @@ fn empty_files_grouped_non_numeric_aggregate_uses_selectlist_shape() {
         &grouped_non_numeric,
         &projected_columns(&proj, &proj_types),
         false,
-        &column_types(&col_types),
+        ScanTranslator::new(&column_types(&col_types)),
         &relation(&col_types),
     )
     .unwrap()["sql"]
@@ -210,7 +212,7 @@ fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
         &grouped_having,
         &projected_columns(&proj, &proj_types),
         false,
-        &column_types(&col_types),
+        ScanTranslator::new(&column_types(&col_types)),
         &relation(&col_types),
     )
     .unwrap()["sql"]
@@ -240,7 +242,10 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
     ];
     assert!(
         matches!(
-            classify_request_shape(&pushdown_req, &column_types(&col_types)),
+            classify_request_shape(
+                &pushdown_req,
+                ScanTranslator::new(&column_types(&col_types))
+            ),
             RequestShape::RowScan
         ),
         "the fixture must classify as RowScan for this test to exercise its arm"
@@ -253,7 +258,7 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
         &pushdown_req,
         &projected_columns(&proj, &proj_types),
         true,
-        &column_types(&col_types),
+        ScanTranslator::new(&column_types(&col_types)),
         &relation(&col_types),
     )
     .expect("the widened empty row-scan result must build")["sql"]
@@ -270,7 +275,7 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
         &pushdown_req,
         &projected_columns(&proj, &proj_types),
         false,
-        &column_types(&col_types),
+        ScanTranslator::new(&column_types(&col_types)),
         &relation(&col_types),
     )
     .expect("the non-widened empty row-scan result must build")["sql"]

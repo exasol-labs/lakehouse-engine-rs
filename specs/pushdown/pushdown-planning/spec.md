@@ -11,7 +11,7 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 * The adapter reads the node count from `UdfContext::node_count()` per pushdown, not from `adapterNotes`. It captures the value in `dispatch` before the tokio runtime is entered and passes it to planning as a plain integer. `node_count()` returns `0` only without a live handshake, and `0` maps to a node count of `1`.
 * The common spec's `projection` field carries the projected columns only for the row-scan and join paths. An aggregate or GROUP BY request leaves it empty: see `pushdown-aggregates/pushdown-planning-single-group-agg` and `pushdown-grouped-agg/pushdown-planning-grouped-agg`.
 * Exasol does not re-apply a predicate whose capability the adapter advertised, so the adapter's own SQL applies any predicate it cannot translate. See `pushdown/pushdown-declined-filter-self-apply`. An absent or trivially-true filter is omitted and the wrapper-free scan is unchanged. A declined filter routes to the qualified single-table wrapper, which applies the predicate in its `WHERE`.
-* The type-aware LIKE rule is in `pushdown-types/pushdown-planning-like-type-coercion`.
+* Which expressions the scan computes is decided by `pushdown-types/pushdown-planning-scan-text-conversion`.
 * The plan-time file-pruning predicate has a per-format owner. For Iceberg it is `iceberg::expr::Predicate`, owned by `file-planning/pushdown-file-pruning`. For Delta it is the Delta stats predicate, owned by `delta/delta-file-pruning`. Scenario clauses naming `iceberg::expr::Predicate` describe the Iceberg arm.
 
 ## Scenarios
@@ -31,7 +31,7 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL translate the predicate into the shard-invariant common spec passed to the UDF, and the translation SHALL be ALL-OR-NOTHING over the whole top-level filter
 * *AND* a filter the adapter cannot render for DataFusion SHALL be self-applied in the qualified wrapper's `WHERE` rather than omitted, per `pushdown/pushdown-declined-filter-self-apply`
-* *AND* before translating a `predicate_like` whose subject is a bare `column` node, the adapter SHALL apply the type-aware LIKE rule (see `pushdown-types/pushdown-planning-like-type-coercion`), because DataFusion performs no implicit non-string-to-VARCHAR coercion and would hard-fail the scan on a LIKE over a non-string column
+* *AND* the adapter SHALL render the filter through the typed scan translator (`pushdown-types/pushdown-planning-scan-text-conversion`), because DataFusion performs no implicit conversion to text
 * *AND* the adapter SHALL ALSO translate the soundly-translatable conjuncts into an `iceberg::expr::Predicate` applied to the Iceberg table scan as a file-pruning filter, dropping any node it cannot translate soundly rather than skipping a file that could match
 * *AND* the DataFusion scan SHALL always apply the full common-spec filter, so the Iceberg pruning filter only narrows which files are opened and never changes the result set
 

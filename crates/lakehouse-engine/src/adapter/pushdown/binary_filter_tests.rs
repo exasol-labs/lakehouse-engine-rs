@@ -24,11 +24,10 @@ fn binary_fields() -> [LogicalField; 3] {
 }
 
 fn rendered(filter: &Json) -> String {
-    render_df_filter_safe(&compare_binary_bytes(
-        filter.clone(),
-        &declared_column_types(&HEX_COLUMNS, &binary_fields()),
-    ))
-    .expect("renders")
+    let types = declared_column_types(&HEX_COLUMNS, &binary_fields());
+    vs_expression::render_scan_filter(&compare_binary_bytes(filter.clone(), &types), &types)
+        .expect("renders")
+        .expect("a comparison is never trivially true")
 }
 
 #[test]

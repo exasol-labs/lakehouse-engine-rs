@@ -12,8 +12,8 @@ use crate::common::seed::{
 };
 use crate::common::timestamp_precision::expected_timestamp_precision;
 use crate::fixtures::{
-    LAKEHOUSE_VS, assert_single_table_wrapper, assert_two_scan_join_wrapper, events_table,
-    lakehouse_vs, typed_table, vs_dim_table, vs_fact_table,
+    LAKEHOUSE_VS, TYPED_COLUMNS, assert_single_table_wrapper, assert_two_scan_join_wrapper,
+    events_table, lakehouse_vs, typed_table, vs_dim_table, vs_fact_table,
 };
 
 /// The fix's measured worst-case divergence from native Exasol is ~1 ULP (3.17e-16).
@@ -3092,10 +3092,6 @@ fn e2e_declined_filter_select_star_returns_full_row_shape() {
 /// Native Exasol raises this for a value that is no hash, and the virtual table must raise it too.
 const INVALID_HASH_ERROR_PREFIX: &str = "data exception - Invalid hash format: ";
 
-/// Every column of `TYPED_DISTINCT_PROBE` after `ID`, in declared order.
-const TYPED_COLUMNS: &str =
-    "C_DECIMAL_A, C_DECIMAL_B, C_DOUBLE, C_VARCHAR, C_DATE, C_TS, C_BOOL, C_PRICE, C_QTY";
-
 /// Scenario: CAST renders the mapped target type per dialect
 #[test]
 fn cast_to_a_non_emittable_target_matches_native() {
@@ -3143,10 +3139,10 @@ fn boolean_to_text_in_the_single_table_wrapper_matches_native() {
     let mut conn = exa_conn();
     let table = typed_table();
 
-    // `C_BOOL || 'x'` routes each query into the Exasol-dialect wrapper.
+    // A date converted to text routes each query into the Exasol-dialect wrapper.
     let queries = [
-        "SELECT ID, C_BOOL || 'x', CAST(C_DECIMAL_A > 10 AS VARCHAR(10)) FROM {} ORDER BY ID",
-        "SELECT ID, C_BOOL || 'x', (C_DECIMAL_A > 10) || 'y' FROM {} ORDER BY ID",
+        "SELECT ID, C_DATE || 'x', CAST(C_DECIMAL_A > 10 AS VARCHAR(10)) FROM {} ORDER BY ID",
+        "SELECT ID, C_DATE || 'x', (C_DECIMAL_A > 10) || 'y' FROM {} ORDER BY ID",
     ];
     assert_queries_match_native_copy(&mut conn, &table, TYPED_COLUMNS, &queries);
     for query in queries {
@@ -3463,7 +3459,7 @@ fn over_length_char_group_key_raises_truncation_error_like_native() {
         vs_char_pad_table()
     );
 
-    // Assert the pushdown carries the CHAR declaration; native Exasol raises the same error class.
+    // The scan does not blank-pad, so Exasol applies the CAST and raises its own error.
     let pushed = explain_virtual_sql(&mut conn, &sql);
     assert!(
         pushed.contains("CHAR(20)") && !pushed.contains("VARCHAR(20)"),
@@ -3503,7 +3499,7 @@ fn over_length_char_projection_fails_cleanly() {
         vs_char_pad_table()
     );
 
-    // Assert the pushdown carries the CHAR declaration; native Exasol raises the same error class.
+    // The scan does not blank-pad, so Exasol applies the CAST and raises its own error.
     let pushed = explain_virtual_sql(&mut conn, &sql);
     assert!(
         pushed.contains("CHAR(20)") && !pushed.contains("VARCHAR(20)"),
@@ -3519,9 +3515,9 @@ fn over_length_char_projection_fails_cleanly() {
     .to_ascii_lowercase();
     let sql_code = resp["exception"]["sqlCode"].as_str().unwrap_or_default();
     assert!(
-        sql_code.contains("22002"),
-        "expected Exasol's UDF-emit truncation error (sqlCode 22002, \"string \
-         data, right truncation\"), got sqlCode={sql_code:?} message={message:?}: {resp}"
+        sql_code.contains("22001") && message.contains("right truncation"),
+        "expected native Exasol's CAST truncation error (sqlCode 22001), got \
+         sqlCode={sql_code:?} message={message:?}: {resp}"
     );
 }
 
@@ -3802,7 +3798,7 @@ fn e2e_to_date_to_timestamp_translated_format_matches_native() {
     let mut conn = exa_conn();
 
     let date_sql = format!(
-        "SELECT TO_DATE(CAST(event_date AS VARCHAR(10)), 'YYYY-MM-DD') FROM {} WHERE id = 1",
+        "SELECT TO_DATE('2024-01-' || LPAD(id, 2, '0'), 'YYYY-MM-DD') FROM {} WHERE id = 1",
         events_table()
     );
     let native_date = first_cell(&mut conn, "SELECT TO_DATE('2024-01-01', 'YYYY-MM-DD')");
@@ -3810,7 +3806,7 @@ fn e2e_to_date_to_timestamp_translated_format_matches_native() {
     assert_eq!(native_date, "2024-01-01");
 
     let timestamp_sql = format!(
-        "SELECT TO_TIMESTAMP(CAST(event_date AS VARCHAR(10)) || ' 10:11:12', \
+        "SELECT TO_TIMESTAMP('2024-01-' || LPAD(id, 2, '0') || ' 10:11:12', \
          'YYYY-MM-DD HH24:MI:SS') FROM {} WHERE id = 1",
         events_table()
     );
@@ -3821,7 +3817,7 @@ fn e2e_to_date_to_timestamp_translated_format_matches_native() {
     assert_eq!(first_cell(&mut conn, &timestamp_sql), native_timestamp);
 
     let filter_sql = format!(
-        "SELECT id FROM {} WHERE TO_TIMESTAMP(CAST(event_date AS VARCHAR(10)) || ' 10:11:12.250', \
+        "SELECT id FROM {} WHERE TO_TIMESTAMP('2024-01-' || LPAD(id, 2, '0') || ' 10:11:12.250', \
          'yyyy-mm-dd hh24:mi:ss.ff3') > TIMESTAMP '2024-01-15 10:11:12.000' ORDER BY id",
         events_table()
     );
@@ -3853,7 +3849,7 @@ fn e2e_to_timestamp_microsecond_fraction_filters_in_scan() {
     let mut conn = exa_conn();
 
     let sql = format!(
-        "SELECT id FROM {} WHERE TO_TIMESTAMP(CAST(event_date AS VARCHAR(10)) || ' 10:11:12.000500', \
+        "SELECT id FROM {} WHERE TO_TIMESTAMP('2024-01-' || LPAD(id, 2, '0') || ' 10:11:12.000500', \
          'YYYY-MM-DD HH24:MI:SS.FF6') > TIMESTAMP '2024-01-15 10:11:12.000' ORDER BY id",
         events_table()
     );
@@ -3890,7 +3886,7 @@ fn e2e_to_date_translated_format_fails_on_rejected_input() {
     assert_query_fails(
         &mut conn,
         &format!(
-            "SELECT TO_DATE(CAST(event_date AS VARCHAR(10)), 'YYYY-DD-MM') FROM {} WHERE id = 13",
+            "SELECT TO_DATE('2024-01-' || LPAD(id, 2, '0'), 'YYYY-DD-MM') FROM {} WHERE id = 13",
             events_table()
         ),
         &["2024-01-13", "%Y-%d-%m"],
