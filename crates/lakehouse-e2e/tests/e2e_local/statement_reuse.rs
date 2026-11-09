@@ -100,9 +100,6 @@ struct Reference {
     rows: usize,
     /// Each table's load request, which the statement sends exactly once.
     loads: Vec<String>,
-    /// `/v1/config` lookups, counted only for a kind that opens an Iceberg REST session. The
-    /// create stored the prefix, so a pushdown sends none.
-    configs: Option<usize>,
     /// The pushdowns the statement reaches the adapter as, so a merged statement cannot pass the
     /// counts vacuously. A single one must be a broadcast join, because a fallback to one
     /// pushdown per table would also load each table once.
@@ -128,7 +125,6 @@ fn every_reference_to_a_table_loads_it_once() {
             ),
             rows: 10,
             loads: vec![loads_events.clone()],
-            configs: Some(0),
             pushdowns: 2,
         },
         Reference {
@@ -139,7 +135,6 @@ fn every_reference_to_a_table_loads_it_once() {
             ),
             rows: 10,
             loads: vec![loads_events.clone()],
-            configs: Some(0),
             pushdowns: 2,
         },
         Reference {
@@ -150,7 +145,6 @@ fn every_reference_to_a_table_loads_it_once() {
             ),
             rows: 5,
             loads: vec![loads_events],
-            configs: Some(0),
             pushdowns: 1,
         },
         Reference {
@@ -161,7 +155,6 @@ fn every_reference_to_a_table_loads_it_once() {
                 load_table_get(ICEBERG_REST_VIA_PROXY, E2E_FACT_TABLE),
                 load_table_get(ICEBERG_REST_VIA_PROXY, E2E_DIM_TABLE),
             ],
-            configs: Some(0),
             pushdowns: 1,
         },
         Reference {
@@ -169,7 +162,6 @@ fn every_reference_to_a_table_loads_it_once() {
             sql: format!("SELECT * FROM {direct_rows} UNION ALL SELECT * FROM {direct_rows}"),
             rows: 6,
             loads: vec![directory_list("proxy_direct")],
-            configs: None,
             pushdowns: 2,
         },
     ];
@@ -192,14 +184,12 @@ fn every_reference_to_a_table_loads_it_once() {
         for load in &case.loads {
             assert_eq!(request_count(&log, load), 1, "{}: {load}", case.shape);
         }
-        if let Some(configs) = case.configs {
-            assert_eq!(
-                request_count(&log, &config_get()),
-                configs,
-                "{}: /v1/config lookups",
-                case.shape
-            );
-        }
+        assert_eq!(
+            request_count(&log, &config_get()),
+            0,
+            "{}: a pushdown takes the prefix from the schema notes",
+            case.shape
+        );
     }
 }
 
