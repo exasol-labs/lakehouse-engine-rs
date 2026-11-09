@@ -44,6 +44,7 @@ fn context_with_timestamp_columns() -> SessionContext {
 fn rendered_fragment(node_type: &str) -> String {
     vs_expression::render_scan_expression(&lit(node_type, FAR_FUTURE), &TypedColumns::default())
         .expect("render_expression must translate the timestamp literal node")
+        .sql
 }
 
 async fn assert_no_nanosecond_overflow(ctx: &SessionContext, sql: &str) -> usize {

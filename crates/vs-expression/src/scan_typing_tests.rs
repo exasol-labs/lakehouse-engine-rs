@@ -1,6 +1,6 @@
 use super::*;
-use crate::render_scan_expression;
 use crate::test_support::*;
+use crate::{SqlFragment, render_scan_expression};
 
 fn columns() -> TypedColumns {
     typed_columns(&[
@@ -20,7 +20,7 @@ fn date_like(subject: Json) -> Json {
 }
 
 fn render(expr: &Json) -> Result<String, UdfError> {
-    render_scan_expression(expr, &columns())
+    render_scan_expression(expr, &columns()).map(|fragment| fragment.sql)
 }
 
 #[test]
@@ -268,4 +268,33 @@ fn exact_expression_type_is_the_type_the_request_states() {
             "{label}"
         );
     }
+}
+
+#[test]
+fn a_scan_fragment_carries_the_column_or_cast_type_it_emits() {
+    let typed = |expr: &Json| render_scan_expression(expr, &columns()).unwrap().ty;
+    assert_eq!(typed(&col("D")), Some(ExasolType::Date));
+    assert_eq!(
+        typed(&cast_to(ExasolType::decimal(12, 0), col("I"))),
+        Some(ExasolType::decimal(12, 0))
+    );
+    assert_eq!(typed(&scalar_fn("UPPER", [col("S")])), None);
+}
+
+#[test]
+fn a_scan_fragment_of_a_sized_text_cast_is_any_text() {
+    let fragment =
+        render_scan_expression(&cast_to(ExasolType::varchar(20), col("S10")), &columns());
+    assert_eq!(fragment.unwrap().ty, Some(ExasolType::WIDEST_VARCHAR));
+}
+
+#[test]
+fn an_exasol_fragment_keeps_its_cast_target_and_column_type() {
+    let typed = |expr: &Json| crate::render_exasol_fragment(expr, &columns()).unwrap();
+    assert_eq!(
+        typed(&cast_to(ExasolType::char(3), col("S10"))),
+        SqlFragment::new(r#"CAST("S10" AS CHAR(3))"#, Some(ExasolType::char(3)))
+    );
+    assert_eq!(typed(&col("N")).ty, Some(ExasolType::decimal(9, 2)));
+    assert_eq!(typed(&null_lit()).ty, None);
 }

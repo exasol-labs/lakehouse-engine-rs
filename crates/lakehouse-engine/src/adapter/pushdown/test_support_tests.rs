@@ -35,7 +35,9 @@ pub(crate) fn render_df_filter_safe(filter: &Json) -> Option<String> {
 }
 
 pub(crate) fn render_expression_safe(expr: &Json) -> Option<String> {
-    vs_expression::render_scan_expression(expr, &ColumnTypes::default()).ok()
+    vs_expression::render_scan_expression(expr, &ColumnTypes::default())
+        .ok()
+        .map(|fragment| fragment.sql)
 }
 
 /// The scan's typed filter SQL, `None` when it declines or the filter is trivially true.

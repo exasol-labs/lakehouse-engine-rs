@@ -151,13 +151,9 @@ fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types(
     assert!(
         matches!(
             &items[1],
-            SingleGroupItem::ScalarOverAggregate {
-                declared_type,
-                node,
-            } if *declared_type == ExasolType::decimal(9, 4) && node == &req.json()["selectList"][1]
+            SingleGroupItem::ScalarOverAggregate { node } if node == &req.json()["selectList"][1]
         ),
-        "item 1 must be a ScalarOverAggregate at ordinal 1 carrying its own \
-         declared type and the verbatim node: {:?}",
+        "item 1 must be a ScalarOverAggregate at ordinal 1 carrying the verbatim node: {:?}",
         items[1]
     );
     assert_eq!(agg_of(&items[2]).kind, AggKind::Count);
@@ -923,6 +919,32 @@ fn single_group_plan_types_declines_a_nested_only_aggregate_over_an_untyped_expr
 }
 
 #[test]
+fn merge_select_keeps_a_scalar_cast_to_its_declared_type_uncast() {
+    let col_types = column_types(&[("L_QUANTITY", ExasolType::decimal(15, 2))]);
+    let req = pushdown_request("T", NO_COLUMNS)
+        .item(
+            cast_to(
+                ExasolType::WIDEST_VARCHAR,
+                agg_item("SUM", Some("L_QUANTITY"), false),
+            ),
+            ExasolType::WIDEST_VARCHAR,
+        )
+        .build_pushdown();
+    let items = detect_aggregates(&req, &col_types).expect("CAST(SUM(col)) must decompose");
+    let plans = ordinary_plans(&items, &col_types);
+    let plan_types = single_group_plan_types(req.select_types(), &items, &col_types)
+        .expect("SUM over a typed column is exactly typed");
+
+    assert_eq!(
+        single_group_merge_select(&items, &plans, &plan_types, req.select_types(), &col_types),
+        Some(vec![
+            r#"CAST(CAST(SUM("PARTIAL_sum_0") AS DECIMAL(26,2)) AS VARCHAR(2000000))"#.to_string()
+        ]),
+        "the scalar's own CAST already has the declared type, so the output adds none"
+    );
+}
+
+#[test]
 fn merge_select_wraps_scalar_structure_around_the_merged_partial() {
     let col_types = column_types(&[("L_QUANTITY", ExasolType::decimal(15, 2))]);
     let req = pushdown_request("T", NO_COLUMNS)
@@ -937,7 +959,7 @@ fn merge_select_wraps_scalar_structure_around_the_merged_partial() {
         .expect("SUM over a typed column is exactly typed");
 
     assert_eq!(
-        single_group_merge_select(&items, &plans, &plan_types, &col_types),
+        single_group_merge_select(&items, &plans, &plan_types, req.select_types(), &col_types),
         Some(vec![
             r#"CAST(ROUND(CAST(SUM("PARTIAL_sum_0") AS DECIMAL(26,2)), 2) AS DECIMAL(36,2))"#
                 .to_string()
@@ -969,7 +991,7 @@ fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
         .expect("every slot is exactly typed");
 
     assert_eq!(
-        single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
+        single_group_merge_select(&items, &plans, &plan_types, req.select_types(), &ColumnTypes::default()),
         Some(vec![
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2))"#.to_string(),
             r#"CAST(ROUND((CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2)) / CAST(SUM("PARTIAL_count_1") AS DECIMAL(18,0))), 2) AS DECIMAL(9,4))"#
@@ -998,7 +1020,13 @@ fn merge_select_declines_a_list_holding_a_distinct_item() {
         .expect("every slot is exactly typed");
 
     assert_eq!(
-        single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
+        single_group_merge_select(
+            &items,
+            &plans,
+            &plan_types,
+            req.select_types(),
+            &ColumnTypes::default()
+        ),
         None,
         "a distinct item carries no merge expression, so the whole assembly declines"
     );
@@ -1010,16 +1038,19 @@ fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
         "type": "function_scalar_cast", "name": "CAST",
         "arguments": [count_star()]
     });
-    let items = vec![SingleGroupItem::ScalarOverAggregate {
-        node,
-        declared_type: ExasolType::decimal(18, 0),
-    }];
+    let items = vec![SingleGroupItem::ScalarOverAggregate { node }];
     let plans = ordinary_plans(&items, &ColumnTypes::default());
     let plan_types = single_group_plan_types(&[], &items, &ColumnTypes::default())
         .expect("an unclassifiable scalar contributes no slot to type");
 
     assert_eq!(
-        single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
+        single_group_merge_select(
+            &items,
+            &plans,
+            &plan_types,
+            &[ExasolType::decimal(18, 0)],
+            &ColumnTypes::default()
+        ),
         None,
         "an unrenderable scalar structure carries no merge expression, so the \
          whole assembly declines"
@@ -1046,7 +1077,13 @@ fn merge_select_emits_one_item_per_selectlist_item_for_duplicate_aggregates() {
     assert_eq!(plans.len(), 1, "one partial column for both occurrences");
 
     assert_eq!(
-        single_group_merge_select(&items, &plans, &plan_types, &ColumnTypes::default()),
+        single_group_merge_select(
+            &items,
+            &plans,
+            &plan_types,
+            req.select_types(),
+            &ColumnTypes::default()
+        ),
         Some(vec![
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2))"#.to_string(),
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2))"#.to_string(),

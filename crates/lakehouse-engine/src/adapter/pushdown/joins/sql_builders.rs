@@ -3,17 +3,16 @@ use crate::scan::spec::{
     CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec, ScanStorage, SortKey,
     StorageBackend, relation_alias, render_ordered,
 };
-use crate::types::exasol_type::exasol_type_from_json;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::strip_table_alias;
 
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
-    ColumnTypes, ProjectedColumn, PushdownRequest, build_scan_driving_sql, cast_to_declared_type,
-    classify_where_filter, collect_all_column_names, extract_limit, extract_offset,
-    project_columns, projection_items, quote_ident, render_limit_offset, scan_expression,
-    scan_filter, scan_storage_for, shard_count,
+    ColumnTypes, ProjectedColumn, PushdownRequest, build_scan_driving_sql, classify_where_filter,
+    collect_all_column_names, extract_limit, extract_offset, output_select_list, project_columns,
+    projection_items, quote_ident, render_limit_offset, scan_expression, scan_filter,
+    scan_storage_for, shard_count,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_flags, wrap_declined_order_by};
 use super::attribution::{JoinLegs, UnattributableColumn};
@@ -23,7 +22,7 @@ use super::planning::{
 use super::rendering::{
     conjoin_filters, cross_leg_residual_filter, leg_local_filter, projection_item_select_sql,
     referenced_clause_values, referenced_leg_columns, render_df_filter_qualified,
-    render_expression_qualified, type_screened_leg_filter,
+    render_expression_qualified, render_select_item_qualified, type_screened_leg_filter,
 };
 
 /// Exasol rejects a longer identifier (`maximum length of identifier exceeded`, verified live
@@ -70,7 +69,7 @@ pub(crate) fn render_broadcast_join(
     );
     // Not the filter renderer, which would suppress a trivially-true boolean. A declined condition
     // loses broadcast eligibility and takes the N-scan fallback (#587).
-    let Some(condition) = scan_expression(&condition_tree, &col_types) else {
+    let Some(condition) = scan_expression(&condition_tree, &col_types).map(|f| f.sql) else {
         return Ok(None);
     };
     let filter_json = qualified.json().get("filter").filter(|f| !f.is_null());
@@ -228,10 +227,9 @@ fn render_self_applied_where(
     )))
 }
 
-/// An absent/empty select list projects every column of every leg. Every item but a bare column
-/// or a CAST to its declared type renders cast to that type: Exasol sends `''` and `NULL` alike
-/// as a bare `literal_null` but types them differently, so only the declared type reproduces
-/// the item's type (#587).
+/// An absent/empty select list projects every column of every leg. An item whose type the request
+/// does not state renders cast to its declared type: Exasol sends `''` and `NULL` alike as a bare
+/// `literal_null` but types them differently, so only the declared type reproduces it (#587).
 fn n_scan_join_select_items(
     pushdown: &PushdownRequest,
     legs: &JoinLegs,
@@ -239,9 +237,9 @@ fn n_scan_join_select_items(
 ) -> Result<Vec<ProjectionItem>, UdfError> {
     match pushdown.json().get("selectList") {
         Some(Json::Array(list)) if !list.is_empty() => {
-            let mut items = Vec::with_capacity(list.len());
-            for (select_index, item) in list.iter().enumerate() {
-                let rendered = render_expression_qualified(item, legs)
+            let mut fragments = Vec::with_capacity(list.len());
+            for item in list {
+                let fragment = render_select_item_qualified(item, legs, cols_per_leg)
                     .map_err(unattributable_decline)?
                     .ok_or_else(|| {
                         join_render_decline(
@@ -249,24 +247,16 @@ fn n_scan_join_select_items(
                              N-scan join",
                         )
                     })?;
-                let sql = if item.get("type").and_then(Json::as_str) == Some("column") {
-                    rendered
-                } else {
-                    let declared = pushdown.select_type(select_index).ok_or_else(|| {
-                        join_render_decline("a select-list item has no declared type")
-                    })?;
-                    let own_type = item
-                        .get("dataType")
-                        .and_then(|t| exasol_type_from_json(t).ok());
-                    if own_type == Some(declared) {
-                        rendered
-                    } else {
-                        cast_to_declared_type(&rendered, declared)
-                    }
-                };
-                items.push(ProjectionItem::Expr { expr: sql });
+                fragments.push(fragment);
             }
-            Ok(items)
+            let items =
+                output_select_list(fragments, pushdown.select_types()).ok_or_else(|| {
+                    join_render_decline("the select list and its declared types differ in length")
+                })?;
+            Ok(items
+                .into_iter()
+                .map(|expr| ProjectionItem::Expr { expr })
+                .collect())
         }
         _ => Ok(n_full_row_qualified_items(legs, cols_per_leg)),
     }

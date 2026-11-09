@@ -343,7 +343,7 @@ pub(crate) fn build_dispatch_sql(
             // Empty `projection` is inert on an aggregate dispatch (#145).
             let spec_template = ScanSpec {
                 common: CommonScanSpec {
-                    filter,
+                    filter: filter.clone(),
                     limit: grouped_limit,
                     aggregates: Some(grouped_agg_plans.clone()),
                     group_keys: Some(group_keys.clone()),
@@ -362,6 +362,7 @@ pub(crate) fn build_dispatch_sql(
                 &grouped_agg_plans,
                 &aggregate_types,
                 &select_items,
+                pushdown.select_types(),
                 grouped_limit,
                 support::extract_offset(pushdown_req),
                 col_types,
@@ -370,6 +371,20 @@ pub(crate) fn build_dispatch_sql(
                 having.as_deref(),
                 grouped_order_by.as_deref(),
             );
+            let Some(sql) = sql else {
+                // Defensive: a shortened select list fails Exasol's positional validation.
+                return qualified_single_table_fallback_pushdown(
+                    request,
+                    pushdown,
+                    &base,
+                    filter.clone(),
+                    shards,
+                    col_types,
+                    udf_name,
+                    distribute_udf_name,
+                    None,
+                );
+            };
             return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
         }
         RequestShape::GroupByWrapper | RequestShape::SingleGroupWrapper => {
@@ -442,11 +457,17 @@ pub(crate) fn build_dispatch_sql(
             }
             let plans = ordinary_plans(&items, col_types);
             // Assembled here because it depends on select-list classification.
-            let merge_inputs = single_group_merge_select(&items, &plans, &plan_types, col_types)
-                .and_then(|merge_select| {
-                    AggregateMergeInputs::new(plan_types, merge_select, limit)
-                        .map(|inputs| inputs.with_having(having))
-                });
+            let merge_inputs = single_group_merge_select(
+                &items,
+                &plans,
+                &plan_types,
+                pushdown.select_types(),
+                col_types,
+            )
+            .and_then(|merge_select| {
+                AggregateMergeInputs::new(plan_types, merge_select, limit)
+                    .map(|inputs| inputs.with_having(having))
+            });
             let Some(merge_inputs) = merge_inputs else {
                 // Defensive: a shortened select list fails Exasol's positional validation.
                 return qualified_single_table_fallback_pushdown(

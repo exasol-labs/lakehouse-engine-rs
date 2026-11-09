@@ -61,7 +61,8 @@ async fn explicit_cast_bool_to_varchar_renders_exasol_casing() {
     let ctx = context_with_acctbal();
     let expr = cast_to(ExasolType::varchar(10), acctbal_greater_than_zero());
     let fragment = vs_expression::render_scan_expression(&expr, &TypedColumns::default())
-        .expect("CAST must translate");
+        .expect("CAST must translate")
+        .sql;
 
     let sql = format!("SELECT {fragment} AS s FROM scan_target ORDER BY \"C_CUSTKEY\"");
     let rows = collect_strings(&ctx, &sql, "s").await;
@@ -77,7 +78,8 @@ async fn concat_predicate_matches_exasol_uppercase_not_datafusion_lowercase() {
     let ctx = context_with_acctbal();
     let concat_expr = scalar_fn("CONCAT", [acctbal_greater_than_zero(), str_lit("")]);
     let fragment = vs_expression::render_scan_expression(&concat_expr, &TypedColumns::default())
-        .expect("CONCAT must translate");
+        .expect("CONCAT must translate")
+        .sql;
 
     let sql_true = format!("SELECT \"C_CUSTKEY\" FROM scan_target WHERE {fragment} = 'TRUE'");
     let matched_true = collect_strings(&ctx, &sql_true, "C_CUSTKEY").await;
@@ -93,7 +95,8 @@ async fn concat_group_by_key_uses_exasol_uppercase_labels() {
     let ctx = context_with_acctbal();
     let concat_expr = scalar_fn("CONCAT", [acctbal_greater_than_zero(), str_lit("")]);
     let fragment = vs_expression::render_scan_expression(&concat_expr, &TypedColumns::default())
-        .expect("CONCAT must translate");
+        .expect("CONCAT must translate")
+        .sql;
 
     let sql = format!(
         "SELECT {fragment} AS g, COUNT(*) AS n FROM scan_target GROUP BY {fragment} ORDER BY g"

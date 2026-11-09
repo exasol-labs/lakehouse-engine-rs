@@ -3,7 +3,7 @@ use crate::scan::spec::{
 };
 use crate::types::exasol_type::ExasolType;
 use serde_json::Value as Json;
-use vs_expression::{ColumnNode, exact_expression_type, render_expression_exasol};
+use vs_expression::{ColumnNode, SqlFragment, render_exasol_fragment};
 
 use super::scalar_over_agg::{
     cast_merge_items, classify_scalar_over_aggregate, col_type_for, fold_aggregate_plan,
@@ -11,7 +11,7 @@ use super::scalar_over_agg::{
     with_stat_grand_means,
 };
 use super::support::{
-    ColumnTypes, PushdownRequest, build_fan_out_inner, cast_to_declared_type, quote_ident,
+    ColumnTypes, PushdownRequest, build_fan_out_inner, output_select_list, quote_ident,
     render_limit_offset, scan_expression,
 };
 use super::topn::parse_sort_flags;
@@ -31,19 +31,15 @@ pub enum GroupedSelectItem {
         select_index: usize,
     },
     /// Exasol's "count the groups" rewrite (a `literal_null`-only select list). It
-    /// contributes no aggregate plan; `projection` is the literal already cast to its
-    /// declared type, never reused as a column identifier.
+    /// contributes no aggregate plan; `projection` is the literal in the Exasol dialect, never
+    /// reused as a column identifier.
     Constant {
         select_index: usize,
-        projection: String,
+        projection: SqlFragment,
     },
     /// Nested aggregates fold into the shared `plans`; the wrapper renders over the
-    /// merged partials only, cast to `declared_type` for Exasol's positional type check.
-    ScalarOverAggregate {
-        select_index: usize,
-        node: Json,
-        declared_type: ExasolType,
-    },
+    /// merged partials only.
+    ScalarOverAggregate { select_index: usize, node: Json },
 }
 
 pub(super) fn select_item_index(item: &GroupedSelectItem) -> usize {
@@ -65,15 +61,6 @@ pub struct GroupedAggregateDetection {
     /// Aligned 1:1 with `plans`, not with the `selectList`.
     pub plan_types: Vec<ExasolType>,
     pub select_items: Vec<GroupedSelectItem>,
-}
-
-fn constant_projection_sql(
-    select_types: &[ExasolType],
-    select_index: usize,
-    rendered: &str,
-) -> Option<String> {
-    let declared = select_types.get(select_index).copied()?;
-    Some(cast_to_declared_type(rendered, declared))
 }
 
 /// Shared by `detect_group_by_aggregates` and `project_columns` so the two
@@ -111,10 +98,11 @@ pub fn detect_group_by_aggregates(
         .filter(|a| !a.is_empty())?;
 
     // Any group-key render failure collapses the whole result.
-    let mut group_keys = Vec::with_capacity(group_by.len());
+    let mut key_fragments = Vec::with_capacity(group_by.len());
     for node in group_by {
-        group_keys.push(scan_expression(node, col_types)?);
+        key_fragments.push(scan_expression(node, col_types)?);
     }
+    let group_keys: Vec<String> = key_fragments.iter().map(|key| key.sql.clone()).collect();
 
     let list = pushdown_req.get("selectList").and_then(|v| v.as_array())?;
     if list.is_empty() {
@@ -139,9 +127,7 @@ pub fn detect_group_by_aggregates(
             }
             // Exasol dialect: the constant is projected by the Exasol-parsed merge (#550).
             t if is_literal_selectlist_item(t) => {
-                let rendered = render_expression_exasol(item).ok()?;
-                let projection =
-                    constant_projection_sql(pushdown.select_types(), select_index, &rendered)?;
+                let projection = render_exasol_fragment(item, col_types).ok()?;
                 select_items.push(GroupedSelectItem::Constant {
                     select_index,
                     projection,
@@ -150,7 +136,7 @@ pub fn detect_group_by_aggregates(
             _ => {
                 // A group-key projection: a column or an expression rendering to a group key.
                 if let Some(group_key_slot) = scan_expression(item, col_types)
-                    .and_then(|sql| group_keys.iter().position(|gk| *gk == sql))
+                    .and_then(|key| group_keys.iter().position(|gk| *gk == key.sql))
                 {
                     pushdown.emittable_select_type(select_index)?;
                     select_items.push(GroupedSelectItem::GroupKey {
@@ -171,7 +157,6 @@ pub fn detect_group_by_aggregates(
                 select_items.push(GroupedSelectItem::ScalarOverAggregate {
                     select_index,
                     node: item.clone(),
-                    declared_type: pushdown.select_type(select_index)?,
                 });
             }
         }
@@ -179,7 +164,7 @@ pub fn detect_group_by_aggregates(
 
     // Typed here, before the shape is chosen, so a key or nested aggregate without an exact
     // type declines the split, and HAVING and ORDER BY can reference typed `GK_*` keys.
-    let group_key_types = group_key_exasol_types(pushdown, &group_keys, &select_items, col_types)?;
+    let group_key_types = group_key_exasol_types(pushdown, &key_fragments, &select_items)?;
     Some(GroupedAggregateDetection {
         group_keys,
         group_key_types,
@@ -190,17 +175,16 @@ pub fn detect_group_by_aggregates(
 }
 
 /// A projected key takes `selectListDataTypes` (matched by index, not rendered SQL, and
-/// authoritative since Exasol type-checks it). An unprojected key takes its exact type: a CAST's
-/// `dataType` or a bare column's type. A constant key travels as [`GROUP_KEY_EMIT_TYPE`]. `None`
-/// for any other key: text transport would skip the emit's value checks and could not be
-/// referenced typed by HAVING (#476, #551).
+/// authoritative since Exasol type-checks it). An unprojected key takes its fragment's type: a
+/// CAST's or a bare column's. A constant key travels as [`CONSTANT_KEY_EMIT_TYPE`]. `None` for any
+/// other key: text transport would skip the emit's value checks and could not be referenced typed
+/// by HAVING (#476, #551).
 pub(super) fn group_key_exasol_types(
     pushdown: &PushdownRequest,
-    group_keys: &[String],
+    group_keys: &[SqlFragment],
     select_items: &[GroupedSelectItem],
-    col_types: &ColumnTypes,
 ) -> Option<Vec<ExasolType>> {
-    let mut types: Vec<Option<ExasolType>> = vec![None; group_keys.len()];
+    let mut types: Vec<Option<ExasolType>> = group_keys.iter().map(|key| key.ty).collect();
     for item in select_items {
         if let GroupedSelectItem::GroupKey {
             group_key_slot,
@@ -216,15 +200,14 @@ pub(super) fn group_key_exasol_types(
     types
         .into_iter()
         .enumerate()
-        .map(|(slot, projected)| {
-            projected.or_else(|| {
+        .map(|(slot, typed)| {
+            typed.or_else(|| {
                 let node = group_by?.get(slot)?;
                 let constant = node
                     .get("type")
                     .and_then(|t| t.as_str())
                     .is_some_and(is_literal_selectlist_item);
-                exact_expression_type(node, col_types)
-                    .or_else(|| constant.then_some(GROUP_KEY_EMIT_TYPE))
+                constant.then_some(CONSTANT_KEY_EMIT_TYPE)
             })
         })
         .collect()
@@ -287,7 +270,7 @@ fn group_key_slot(expr: &Json, scope: &MergeScope<'_>, col_types: &ColumnTypes) 
     if scope.group_keys.is_empty() {
         return None;
     }
-    let rendered = scan_expression(expr, col_types)?;
+    let rendered = scan_expression(expr, col_types)?.sql;
     scope.group_keys.iter().position(|gk| *gk == rendered)
 }
 
@@ -307,6 +290,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     aggregates: &[AggregatePlan],
     aggregate_types: &[ExasolType],
     select_items: &[GroupedSelectItem],
+    select_types: &[ExasolType],
     limit: Option<u64>,
     offset: u64,
     col_types: &ColumnTypes,
@@ -314,7 +298,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     distribute_udf_name: &str,
     having: Option<&str>,
     order_by: Option<&str>,
-) -> String {
+) -> Option<String> {
     // A key travels in its declared type, so the merge groups typed values and needs no cast
     // that reads text by the session's NLS settings (#587).
     debug_assert_eq!(group_keys.len(), group_key_types.len());
@@ -337,23 +321,24 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     // not the inner keys-first fan-out order.
     let mut ordered = select_items.to_vec();
     ordered.sort_by_key(select_item_index);
-    let outer_select: Vec<String> = ordered
+    let fragments = ordered
         .iter()
-        .filter_map(|item| match item {
-            GroupedSelectItem::GroupKey { group_key_slot, .. } => {
-                Some(group_key_column(*group_key_slot))
-            }
-            GroupedSelectItem::Aggregate { plan_slot, .. } => merge_items.get(*plan_slot).cloned(),
+        .map(|item| match item {
+            GroupedSelectItem::GroupKey { group_key_slot, .. } => Some(SqlFragment::new(
+                group_key_column(*group_key_slot),
+                group_key_types.get(*group_key_slot).copied(),
+            )),
+            GroupedSelectItem::Aggregate { plan_slot, .. } => Some(SqlFragment::new(
+                merge_items.get(*plan_slot)?.clone(),
+                aggregate_types.get(*plan_slot).copied(),
+            )),
             GroupedSelectItem::Constant { projection, .. } => Some(projection.clone()),
-            GroupedSelectItem::ScalarOverAggregate {
-                node,
-                declared_type,
-                ..
-            } => render_scalar_over_merge(node, aggregates, &merge_items, col_types)
-                .map(|expr| cast_to_declared_type(&expr, *declared_type)),
+            GroupedSelectItem::ScalarOverAggregate { node, .. } => {
+                render_scalar_over_merge(node, aggregates, &merge_items, col_types)
+            }
         })
-        .collect();
-    let outer_select_str = outer_select.join(", ");
+        .collect::<Option<Vec<_>>>()?;
+    let outer_select_str = output_select_list(fragments, select_types)?.join(", ");
 
     let outer_group_by: Vec<String> = (0..group_keys.len()).map(group_key_column).collect();
     let outer_group_by_str = outer_group_by.join(", ");
@@ -387,11 +372,11 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     }
 
     sql.push_str(&render_limit_offset(limit, offset));
-    sql
+    Some(sql)
 }
 
-/// The scan emits every group key as text, which the merge casts back to the key's declared type.
-const GROUP_KEY_EMIT_TYPE: ExasolType = ExasolType::WIDEST_VARCHAR;
+/// An unprojected constant key only groups, so any type holding its text works.
+const CONSTANT_KEY_EMIT_TYPE: ExasolType = ExasolType::WIDEST_VARCHAR;
 
 pub(super) fn partial_emits_items(
     aggregates: &[AggregatePlan],
@@ -546,7 +531,7 @@ fn render_scalar_over_merge_with_keys(
     if residual {
         return None;
     }
-    let mut sql = render_scalar_over_merge(&substituted, scope.plans, scope.merged, col_types)?;
+    let mut sql = render_scalar_over_merge(&substituted, scope.plans, scope.merged, col_types)?.sql;
     for slot in 0..scope.group_keys.len() {
         sql = sql.replace(
             &quote_ident(&group_key_sentinel(slot)),

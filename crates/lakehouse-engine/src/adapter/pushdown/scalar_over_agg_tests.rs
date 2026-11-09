@@ -241,7 +241,8 @@ fn render_substitutes_the_callers_merged_expressions_by_plan_slot() {
     let merged = vec!["<MERGED_COUNT>".to_string(), "<MERGED_SUM>".to_string()];
 
     let sql = render_scalar_over_merge(&node, &plans, &merged, &ColumnTypes::default())
-        .expect("a classified scalar-over-aggregate must render over the merge wrapper");
+        .expect("a classified scalar-over-aggregate must render over the merge wrapper")
+        .sql;
 
     assert_eq!(sql, "ROUND((<MERGED_SUM> / <MERGED_COUNT>), 2)");
 }
@@ -257,7 +258,8 @@ fn render_leaves_no_sentinel_token_behind() {
         &["<MERGED_SUM>".to_string()],
         &ColumnTypes::default(),
     )
-    .expect("a single-aggregate item must render");
+    .expect("a single-aggregate item must render")
+    .sql;
 
     assert!(
         !sql.contains(&agg_sentinel_token(0)),
@@ -354,14 +356,16 @@ fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
         &grouped_merged,
         &ColumnTypes::default(),
     )
-    .expect("the grouped-shaped caller must render");
+    .expect("the grouped-shaped caller must render")
+    .sql;
     let single_group_sql = render_scalar_over_merge(
         &node,
         &single_group_plans,
         &single_group_merged,
         &ColumnTypes::default(),
     )
-    .expect("the single-group-shaped caller must render");
+    .expect("the single-group-shaped caller must render")
+    .sql;
 
     assert_eq!(
         grouped_sql, single_group_sql,

@@ -3,9 +3,12 @@
 
 use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column_name};
 use serde_json::Value as Json;
-use vs_expression::{ColumnNode, exact_expression_type, render_expression_exasol};
+use vs_expression::{
+    ColumnNode, SqlFragment, exact_expression_type, render_exasol_fragment,
+    render_expression_exasol,
+};
 
-use super::support::{ColumnTypes, cast_to_declared_type, quote_ident, scan_expression};
+use super::support::{ColumnTypes, quote_ident, scan_expression};
 use crate::scan::spec::ColumnRef;
 use crate::types::exasol_type::{ExasolType, MAX_DECIMAL_PRECISION};
 
@@ -144,24 +147,26 @@ pub(super) fn classify_scalar_over_aggregate(
 /// Reuses the `vs-expression` translator by substitution (sentinel columns, then
 /// string-replace with `merged` at each plan's slot) so it cannot drift from the
 /// translator's scalar rendering. Shared with HAVING rendering (decision-log [2]).
+/// Substitution keeps the fragment's type: it comes from the scalar's own CAST, never from an
+/// aggregate.
 pub(super) fn render_scalar_over_merge(
     node: &Json,
     plans: &[AggregatePlan],
     merged: &[String],
     col_types: &ColumnTypes,
-) -> Option<String> {
+) -> Option<SqlFragment> {
     let mut aggregates = Vec::new();
     let mut residual_column = false;
     let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
     // Exasol dialect: spliced into SQL that Exasol itself parses, so character CAST
     // targets are length-qualified.
-    let mut sql = render_expression_exasol(&sentinel_tree).ok()?;
+    let SqlFragment { mut sql, ty } = render_exasol_fragment(&sentinel_tree, col_types).ok()?;
     for (i, agg) in aggregates.iter().enumerate() {
         let plan = parse_agg_item(agg, col_types)?;
         let slot = plans.iter().position(|p| *p == plan)?;
         sql = sql.replace(&agg_sentinel_token(i), merged.get(slot)?);
     }
-    Some(sql)
+    Some(SqlFragment::new(sql, ty))
 }
 
 const EXPR_CAPABLE_AGG_KINDS: &[(&str, AggKind)] = &[
@@ -193,7 +198,7 @@ pub(super) fn arg_column_or_expr(
     if let Some(column) = ColumnNode::parse(arg) {
         return Some((Some(column.upper_name()), None));
     }
-    scan_expression(arg, col_types).map(|sql| (None, Some(sql)))
+    scan_expression(arg, col_types).map(|arg| (None, Some(arg.sql)))
 }
 
 /// `None` for any `distinct: true` item, an unsupported function, or an
@@ -363,9 +368,8 @@ pub(super) fn merge_select_items(aggregates: &[AggregatePlan]) -> Vec<String> {
         .collect()
 }
 
-/// Exasol strictly validates pushdown output column types, so a merge expression is cast to its
-/// declared type unless merging keeps a type that already matches: MIN and MAX return the type
-/// their partial column is emitted in.
+/// Each merged aggregate in its native type, so an outer scalar, HAVING, or the output sees the
+/// type Exasol would (#476).
 pub(super) fn cast_merge_items(
     aggregates: &[AggregatePlan],
     aggregate_types: &[ExasolType],
@@ -376,26 +380,24 @@ pub(super) fn cast_merge_items(
         .into_iter()
         .zip(aggregates)
         .zip(aggregate_types)
-        .map(|((expr, plan), &declared)| {
-            if merge_keeps_declared_type(plan, declared, col_types) {
-                expr
-            } else {
-                cast_to_declared_type(&expr, declared)
-            }
+        .map(|((sql, plan), &native)| {
+            SqlFragment::new(sql, merged_type(plan, native, col_types)).as_type(native)
         })
         .collect()
 }
 
-fn merge_keeps_declared_type(
+/// The type of a merge expression as written: MIN and MAX keep the type their partial column is
+/// emitted in. `None` for the rest, whose `SUM` or arithmetic Exasol types by its own rules.
+fn merged_type(
     plan: &AggregatePlan,
-    declared: ExasolType,
+    native: ExasolType,
     col_types: &ColumnTypes,
-) -> bool {
+) -> Option<ExasolType> {
     match plan.kind.partial_columns() {
         [column @ (PartialAggColumn::Min | PartialAggColumn::Max)] => {
-            partial_column_type(plan, *column, col_types, Some(declared)) == declared
+            Some(partial_column_type(plan, *column, col_types, Some(native)))
         }
-        _ => false,
+        _ => None,
     }
 }
 

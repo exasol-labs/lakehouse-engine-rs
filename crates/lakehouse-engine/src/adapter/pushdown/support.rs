@@ -14,7 +14,8 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::HashMap;
 use vs_expression::{
-    ColumnNode, ColumnTypeLookup, render_scan_expression, render_scan_filter, walk_column_nodes,
+    ColumnNode, ColumnTypeLookup, SqlFragment, render_scan_expression, render_scan_filter,
+    walk_column_nodes,
 };
 
 use super::binary_filter::{BinaryLayout, compare_binary_bytes};
@@ -656,7 +657,7 @@ fn scan_rewrite(expr: &Json, col_types: &ColumnTypes) -> Json {
 /// The sole owner of "SQL the DataFusion scan computes": every path renders through it, so every
 /// path runs the same typed checks (#587). `None` declines, and the caller must apply the
 /// expression in Exasol or decline the shape.
-pub(super) fn scan_expression(expr: &Json, col_types: &ColumnTypes) -> Option<String> {
+pub(super) fn scan_expression(expr: &Json, col_types: &ColumnTypes) -> Option<SqlFragment> {
     render_scan_expression(&scan_rewrite(expr, col_types), col_types).ok()
 }
 
@@ -744,9 +745,9 @@ pub(super) fn project_columns(
                             scan_expression(e, all_cols),
                             pushdown.emittable_select_type(i),
                         ) {
-                            (Some(sql_frag), Some(exa_type)) => {
+                            (Some(fragment), Some(exa_type)) => {
                                 projected.push(ProjectedColumn {
-                                    item: ProjectionItem::Expr { expr: sql_frag },
+                                    item: ProjectionItem::Expr { expr: fragment.sql },
                                     exa_type,
                                 });
                             }
@@ -914,10 +915,21 @@ fn is_pushable_expression_node(node_type: &str) -> bool {
     )
 }
 
-/// Exasol type-checks each pushdown output column against its declared type, so a value
-/// computed in Exasol SQL whose type can differ is cast to the declared type.
-pub(super) fn cast_to_declared_type(expr: &str, declared: ExasolType) -> String {
-    format!("CAST({expr} AS {declared})")
+/// The one builder of a pushdown output select list. Exasol type-checks each output column
+/// against its declared type, so an item is cast unless its fragment already has that type.
+/// `None` when the item count differs from the declared types, which Exasol would reject.
+pub(super) fn output_select_list(
+    items: impl IntoIterator<Item = SqlFragment>,
+    select_types: &[ExasolType],
+) -> Option<Vec<String>> {
+    let items: Vec<SqlFragment> = items.into_iter().collect();
+    (items.len() == select_types.len()).then(|| {
+        items
+            .iter()
+            .zip(select_types)
+            .map(|(item, &declared)| item.as_type(declared))
+            .collect()
+    })
 }
 
 /// The scan-spec storage block: a CONNECTION reference only when the scan UDF can

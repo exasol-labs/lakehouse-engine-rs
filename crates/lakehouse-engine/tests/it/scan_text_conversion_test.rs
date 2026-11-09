@@ -64,7 +64,11 @@ async fn texts(fragment: &str) -> Vec<Option<String>> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integer_and_boolean_columns_convert_to_exasol_text() {
-    let render = |e: &Json| vs_expression::render_scan_expression(e, &columns()).unwrap();
+    let render = |e: &Json| {
+        vs_expression::render_scan_expression(e, &columns())
+            .unwrap()
+            .sql
+    };
     assert_eq!(
         texts(&render(&cast_to(ExasolType::WIDEST_VARCHAR, col("QTY")))).await,
         vec![

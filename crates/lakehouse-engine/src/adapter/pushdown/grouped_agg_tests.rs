@@ -10,6 +10,7 @@ use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::{CommonScanSpec, ScanStorage};
 use crate::scan::test_support::WithFiles;
+use vs_expression::SqlFragment;
 
 #[test]
 fn scalar_over_merge_casts_to_exasol_char_target() {
@@ -30,7 +31,8 @@ fn scalar_over_merge_casts_to_exasol_char_target() {
         &merge_select_items(&plans),
         &ColumnTypes::default(),
     )
-    .expect("CAST over a mergeable aggregate must render");
+    .expect("CAST over a mergeable aggregate must render")
+    .sql;
     assert!(
         sql.contains("CHAR(20) ASCII"),
         "Exasol-parsed merge wrapper needs the declared length-qualified CHAR \
@@ -63,7 +65,8 @@ fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
         &merge_select_items(&plans),
         &ColumnTypes::default(),
     )
-    .expect("a nested CAST over a mergeable aggregate must render");
+    .expect("a nested CAST over a mergeable aggregate must render")
+    .sql;
     assert_eq!(
         sql.matches("CHAR(20) ASCII").count(),
         2,
@@ -347,13 +350,7 @@ fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
         "grouped ORDER BY must sort a group key on its typed GK_* column"
     );
 
-    let group_key_types = group_key_exasol_types(
-        &req,
-        &result.group_keys,
-        &result.select_items,
-        &ColumnTypes::default(),
-    )
-    .unwrap();
+    let group_key_types = result.group_key_types.clone();
     let sql = build_grouped_aggregate_scan_sql(
         &grouped_spec(&result),
         &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
@@ -362,6 +359,7 @@ fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
         &result.plans,
         &result.plan_types,
         &result.select_items,
+        req.select_types(),
         None,
         0,
         &column_types(&[("ID", ExasolType::decimal(20, 0))]),
@@ -369,7 +367,8 @@ fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
         DISTRIBUTE_FILES_UDF_NAME,
         None,
         Some(r#""GK_0" ASC NULLS LAST"#),
-    );
+    )
+    .expect("the merge select list renders");
     assert!(
         sql.contains(r#" ORDER BY "GK_0" ASC NULLS LAST"#),
         "merge SQL must render the explicit final ORDER BY: {sql}"
@@ -511,8 +510,7 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
     );
 
     // A row-scan fallback would return one row per source row, not per group.
-    let group_key_types =
-        group_key_exasol_types(&req, &result.group_keys, &result.select_items, &col_types).unwrap();
+    let group_key_types = result.group_key_types.clone();
     let sql = build_grouped_aggregate_scan_sql(
         &CommonScanSpec {
             aggregates: Some(result.plans.clone()),
@@ -527,6 +525,7 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
         &result.plans,
         &result.plan_types,
         &result.select_items,
+        req.select_types(),
         None,
         0,
         &col_types,
@@ -534,7 +533,8 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
         DISTRIBUTE_FILES_UDF_NAME,
         None,
         None,
-    );
+    )
+    .expect("the merge select list renders");
     assert!(
         !sql.contains(r#""NULL""#),
         "grouped scan SQL must not reference a phantom \"NULL\" identifier: {sql}"
@@ -766,6 +766,7 @@ fn detect_group_by_all_expression_multi_key() {
         &result.plans,
         &aggregate_types,
         &result.select_items,
+        req.select_types(),
         None,
         0,
         &column_types(&col_types),
@@ -773,7 +774,8 @@ fn detect_group_by_all_expression_multi_key() {
         DISTRIBUTE_FILES_UDF_NAME,
         None,
         None,
-    );
+    )
+    .expect("the merge select list renders");
     assert!(
         sql.contains("% 4"),
         "built SQL must carry the MOD key rendered on its own: {sql}"
@@ -850,10 +852,15 @@ fn build_grouped_agg_sql(
         &spec_template,
         &shards,
         &group_keys,
-        &vec![GROUP_KEY_EMIT_TYPE; group_keys.len()],
+        &vec![ExasolType::WIDEST_VARCHAR; group_keys.len()],
         &agg_plans,
         &vec![ExasolType::DoublePrecision; agg_plans.len()],
         &select_items,
+        &select_types_of(
+            &select_items,
+            &vec![ExasolType::WIDEST_VARCHAR; group_keys.len()],
+            &vec![ExasolType::DoublePrecision; agg_plans.len()],
+        ),
         None,
         0,
         &column_types(&col_types),
@@ -862,6 +869,7 @@ fn build_grouped_agg_sql(
         None,
         None,
     )
+    .expect("the merge select list renders")
 }
 
 #[test]
@@ -999,7 +1007,7 @@ fn grouped_common_blob_has_no_limit() {
         &spec_template,
         &shards,
         &["\"REGION\"".to_string()],
-        &[GROUP_KEY_EMIT_TYPE],
+        &[ExasolType::WIDEST_VARCHAR],
         &[AggregatePlan {
             kind: AggKind::Count,
             column: None,
@@ -1007,6 +1015,11 @@ fn grouped_common_blob_has_no_limit() {
         }],
         &[ExasolType::decimal(18, 0)],
         &keys_first_select_items(1, 1),
+        &select_types_of(
+            &keys_first_select_items(1, 1),
+            &[ExasolType::WIDEST_VARCHAR],
+            &[ExasolType::decimal(18, 0)],
+        ),
         Some(100),
         0,
         &column_types(&col_types),
@@ -1014,7 +1027,8 @@ fn grouped_common_blob_has_no_limit() {
         DISTRIBUTE_FILES_UDF_NAME,
         None,
         None,
-    );
+    )
+    .expect("the merge select list renders");
     let common = common_arg_literal(&sql);
     assert!(
         !common.contains("\"limit\""),
@@ -1048,7 +1062,7 @@ fn grouped_merge_offset_never_reaches_per_shard_spec() {
         &spec_template,
         &shards,
         &["\"REGION\"".to_string()],
-        &[GROUP_KEY_EMIT_TYPE],
+        &[ExasolType::WIDEST_VARCHAR],
         &[AggregatePlan {
             kind: AggKind::Count,
             column: None,
@@ -1056,6 +1070,11 @@ fn grouped_merge_offset_never_reaches_per_shard_spec() {
         }],
         &[ExasolType::decimal(18, 0)],
         &keys_first_select_items(1, 1),
+        &select_types_of(
+            &keys_first_select_items(1, 1),
+            &[ExasolType::WIDEST_VARCHAR],
+            &[ExasolType::decimal(18, 0)],
+        ),
         Some(100),
         3,
         &column_types(&col_types),
@@ -1063,7 +1082,8 @@ fn grouped_merge_offset_never_reaches_per_shard_spec() {
         DISTRIBUTE_FILES_UDF_NAME,
         None,
         Some("1 ASC NULLS LAST"),
-    );
+    )
+    .expect("the merge select list renders");
     let common = common_arg_literal(&sql);
     assert!(
         !common.contains("\"limit\"") && !common.contains("\"offset\""),
@@ -1097,7 +1117,7 @@ fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
         &spec_template,
         &shards,
         &["\"REGION\"".to_string()],
-        &[GROUP_KEY_EMIT_TYPE],
+        &[ExasolType::WIDEST_VARCHAR],
         &[AggregatePlan {
             kind: AggKind::Count,
             column: None,
@@ -1105,6 +1125,11 @@ fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
         }],
         &[ExasolType::decimal(18, 0)],
         &keys_first_select_items(1, 1),
+        &select_types_of(
+            &keys_first_select_items(1, 1),
+            &[ExasolType::WIDEST_VARCHAR],
+            &[ExasolType::decimal(18, 0)],
+        ),
         Some(100),
         0,
         &column_types(&col_types),
@@ -1112,7 +1137,8 @@ fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
         DISTRIBUTE_FILES_UDF_NAME,
         None,
         None,
-    );
+    )
+    .expect("the merge select list renders");
     assert!(
         sql.ends_with(" LIMIT 100"),
         "zero offset must render the bare pre-offset LIMIT clause: {sql}"
@@ -1133,13 +1159,7 @@ fn grouped_merge_renders_limit_offset_in_clause_order() {
 
     let result =
         detect_group_by_aggregates(&req, &ColumnTypes::default()).expect("grouped aggregate");
-    let group_key_types = group_key_exasol_types(
-        &req,
-        &result.group_keys,
-        &result.select_items,
-        &ColumnTypes::default(),
-    )
-    .unwrap();
+    let group_key_types = result.group_key_types.clone();
     let sql = build_grouped_aggregate_scan_sql(
         &grouped_spec(&result),
         &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
@@ -1148,6 +1168,7 @@ fn grouped_merge_renders_limit_offset_in_clause_order() {
         &result.plans,
         &result.plan_types,
         &result.select_items,
+        req.select_types(),
         Some(2),
         1,
         &column_types(&[("ID", ExasolType::decimal(20, 0))]),
@@ -1155,7 +1176,8 @@ fn grouped_merge_renders_limit_offset_in_clause_order() {
         DISTRIBUTE_FILES_UDF_NAME,
         None,
         Some("1 ASC NULLS LAST"),
-    );
+    )
+    .expect("the merge select list renders");
     assert!(
         sql.ends_with(" ORDER BY 1 ASC NULLS LAST LIMIT 2 OFFSET 1"),
         "merge SQL must render GROUP BY … ORDER BY … LIMIT n OFFSET m in that order: {sql}"
@@ -1286,6 +1308,7 @@ fn build_grouped_agg_sql_with_select_items(
         &agg_plans,
         &aggregate_types,
         &select_items,
+        &select_types_of(&select_items, &group_key_types, &aggregate_types),
         None,
         0,
         &column_types(&col_types),
@@ -1294,6 +1317,7 @@ fn build_grouped_agg_sql_with_select_items(
         having,
         None,
     )
+    .expect("the merge select list renders")
 }
 
 #[test]
@@ -1495,9 +1519,7 @@ fn soa_col_types() -> Vec<(String, ExasolType)> {
 fn build_grouped_from_detection(req: &PushdownRequest) -> String {
     let d = detect_group_by_aggregates(req, &ColumnTypes::default())
         .expect("must detect the grouped scalar-over-aggregate pushdown");
-    let group_key_types =
-        group_key_exasol_types(req, &d.group_keys, &d.select_items, &ColumnTypes::default())
-            .unwrap();
+    let group_key_types = d.group_key_types.clone();
     let spec_template = CommonScanSpec {
         aggregates: Some(d.plans.clone()),
         group_keys: Some(d.group_keys.clone()),
@@ -1513,6 +1535,7 @@ fn build_grouped_from_detection(req: &PushdownRequest) -> String {
         &d.plans,
         &d.plan_types,
         &d.select_items,
+        req.select_types(),
         None,
         0,
         &column_types(&soa_col_types()),
@@ -1521,6 +1544,7 @@ fn build_grouped_from_detection(req: &PushdownRequest) -> String {
         None,
         None,
     )
+    .expect("the merge select list renders")
 }
 
 #[test]
@@ -1549,11 +1573,10 @@ fn grouped_scalar_over_aggregate_detects_and_dedups_inner_aggregates() {
             &d.select_items[3],
             GroupedSelectItem::ScalarOverAggregate {
                 select_index: 3,
-                declared_type,
                 ..
-            } if *declared_type == ExasolType::decimal(5, 2)
+            }
         ),
-        "item 3 must be a ScalarOverAggregate with its declared type: {:?}",
+        "item 3 must be a ScalarOverAggregate: {:?}",
         d.select_items[3]
     );
 
@@ -1789,13 +1812,7 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
         .build_pushdown();
     let detection = detect_group_by_aggregates(&req, &ColumnTypes::default())
         .expect("must detect grouped aggregate");
-    let group_key_types = group_key_exasol_types(
-        &req,
-        &detection.group_keys,
-        &detection.select_items,
-        &ColumnTypes::default(),
-    )
-    .unwrap();
+    let group_key_types = detection.group_key_types.clone();
     let aggregate_types = detection.plan_types.clone();
 
     let having_node = compare(
@@ -1824,6 +1841,7 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
         &detection.plans,
         &aggregate_types,
         &detection.select_items,
+        req.select_types(),
         None,
         0,
         &column_types(&col_types),
@@ -1831,7 +1849,8 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
         DISTRIBUTE_FILES_UDF_NAME,
         Some(&having),
         None,
-    );
+    )
+    .expect("the merge select list renders");
     let having_pos = sql.find("HAVING").expect("must contain HAVING");
     let having_clause = &sql[having_pos..];
     assert!(
@@ -1887,13 +1906,7 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
         .build_pushdown();
     let detection = detect_group_by_aggregates(&req, &ColumnTypes::default())
         .expect("must detect grouped aggregate");
-    let group_key_types = group_key_exasol_types(
-        &req,
-        &detection.group_keys,
-        &detection.select_items,
-        &ColumnTypes::default(),
-    )
-    .unwrap();
+    let group_key_types = detection.group_key_types.clone();
     let aggregate_types = detection.plan_types.clone();
 
     let col_types: Vec<(String, ExasolType)> =
@@ -1914,6 +1927,7 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
         &detection.plans,
         &aggregate_types,
         &detection.select_items,
+        req.select_types(),
         None,
         0,
         &column_types(&col_types),
@@ -1921,7 +1935,8 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
         DISTRIBUTE_FILES_UDF_NAME,
         None,
         None,
-    );
+    )
+    .expect("the merge select list renders");
 
     let items = outer_select_items(&sql);
     assert_eq!(items.len(), 2, "outer SELECT must have 2 items: {items:?}");
@@ -1951,13 +1966,7 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
     let detection = detect_group_by_aggregates(&req, &ColumnTypes::default())
         .expect("must detect grouped aggregate");
     assert_eq!(detection.group_keys.len(), 2, "two group keys");
-    let group_key_types = group_key_exasol_types(
-        &req,
-        &detection.group_keys,
-        &detection.select_items,
-        &ColumnTypes::default(),
-    )
-    .unwrap();
+    let group_key_types = detection.group_key_types.clone();
     let aggregate_types = detection.plan_types.clone();
 
     let having_node = compare(
@@ -1989,6 +1998,7 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
         &detection.plans,
         &aggregate_types,
         &detection.select_items,
+        req.select_types(),
         Some(2),
         0,
         &column_types(&col_types),
@@ -1996,7 +2006,8 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
         DISTRIBUTE_FILES_UDF_NAME,
         Some(&having),
         None,
-    );
+    )
+    .expect("the merge select list renders");
 
     let shard_group_end = sql
         .find("GROUP BY shard_key")
@@ -2048,10 +2059,9 @@ fn group_key_type_resolved_by_index_not_string_match() {
     let detection = detect_group_by_aggregates(&req, &ColumnTypes::default())
         .expect("must detect grouped aggregate");
 
-    let group_keys = vec![r#"("id" % 4)"#.to_string()];
+    let group_keys = vec![SqlFragment::new(r#"("id" % 4)"#, None)];
     let select_items = detection.select_items.clone();
-    let types =
-        group_key_exasol_types(&req, &group_keys, &select_items, &ColumnTypes::default()).unwrap();
+    let types = group_key_exasol_types(&req, &group_keys, &select_items).unwrap();
 
     assert_eq!(
         types,
@@ -2075,13 +2085,7 @@ fn group_key_types_multi_key_mixed_types() {
         .expect("must detect grouped aggregate");
     assert_eq!(detection.group_keys.len(), 2, "two group keys");
 
-    let types = group_key_exasol_types(
-        &req,
-        &detection.group_keys,
-        &detection.select_items,
-        &ColumnTypes::default(),
-    )
-    .unwrap();
+    let types = detection.group_key_types.clone();
 
     assert_eq!(types.len(), 2, "one declared type per group key");
     assert_eq!(
@@ -2117,13 +2121,7 @@ fn group_key_exasol_types_resolves_char_case_key() {
         .expect("equal-length CASE group key must be detected as a grouped aggregate");
     assert_eq!(detection.group_keys.len(), 1, "one group key");
 
-    let types = group_key_exasol_types(
-        &req,
-        &detection.group_keys,
-        &detection.select_items,
-        &ColumnTypes::default(),
-    )
-    .unwrap();
+    let types = detection.group_key_types.clone();
 
     assert_eq!(
         types,
@@ -2146,13 +2144,7 @@ fn group_key_exasol_types_resolves_varchar_key_unchanged() {
     let detection = detect_group_by_aggregates(&req, &ColumnTypes::default())
         .expect("must detect grouped aggregate");
 
-    let types = group_key_exasol_types(
-        &req,
-        &detection.group_keys,
-        &detection.select_items,
-        &ColumnTypes::default(),
-    )
-    .unwrap();
+    let types = detection.group_key_types.clone();
 
     assert_eq!(
         types,
@@ -2177,13 +2169,7 @@ fn group_key_exasol_types_resolves_char_type_for_unprojected_group_key() {
         "fixture precondition: the group key must NOT appear in the select list"
     );
 
-    let types = group_key_exasol_types(
-        &req,
-        &detection.group_keys,
-        &detection.select_items,
-        &ColumnTypes::default(),
-    )
-    .unwrap();
+    let types = detection.group_key_types.clone();
 
     assert_eq!(
         types,
@@ -2204,13 +2190,7 @@ fn group_key_exasol_types_resolves_varchar_type_for_unprojected_group_key() {
     let detection = detect_group_by_aggregates(&req, &ColumnTypes::default())
         .expect("an unprojected group key must still detect as a grouped aggregate");
 
-    let types = group_key_exasol_types(
-        &req,
-        &detection.group_keys,
-        &detection.select_items,
-        &ColumnTypes::default(),
-    )
-    .unwrap();
+    let types = detection.group_key_types.clone();
 
     assert_eq!(
         types,
@@ -2258,13 +2238,7 @@ fn group_key_exasol_types_prefers_select_list_type_over_group_by_type() {
     let detection = detect_group_by_aggregates(&req, &ColumnTypes::default())
         .expect("must detect grouped aggregate");
 
-    let types = group_key_exasol_types(
-        &req,
-        &detection.group_keys,
-        &detection.select_items,
-        &ColumnTypes::default(),
-    )
-    .unwrap();
+    let types = detection.group_key_types.clone();
 
     assert_eq!(
         types,
@@ -2294,7 +2268,10 @@ fn constant_projection_casts_literal_to_char() {
         .select_items
         .iter()
         .find_map(|item| match item {
-            GroupedSelectItem::Constant { projection, .. } => Some(projection.clone()),
+            GroupedSelectItem::Constant {
+                projection,
+                select_index,
+            } => Some(projection.as_type(req.select_types()[*select_index])),
             _ => None,
         })
         .expect("the literal_string item must classify as Constant");
@@ -2587,7 +2564,7 @@ fn having_clause_appears_in_outer_wrapper_only() {
         &spec_template,
         &shards,
         &[r#""REGION""#.to_string()],
-        &[GROUP_KEY_EMIT_TYPE],
+        &[ExasolType::WIDEST_VARCHAR],
         &[AggregatePlan {
             kind: AggKind::Sum,
             column: Some("AMOUNT".into()),
@@ -2595,6 +2572,11 @@ fn having_clause_appears_in_outer_wrapper_only() {
         }],
         &[ExasolType::DoublePrecision],
         &keys_first_select_items(1, 1),
+        &select_types_of(
+            &keys_first_select_items(1, 1),
+            &[ExasolType::WIDEST_VARCHAR],
+            &[ExasolType::DoublePrecision],
+        ),
         None,
         0,
         &column_types(&col_types),
@@ -2602,7 +2584,8 @@ fn having_clause_appears_in_outer_wrapper_only() {
         DISTRIBUTE_FILES_UDF_NAME,
         having_filter.as_deref(),
         None,
-    );
+    )
+    .expect("the merge select list renders");
     assert!(
         sql.contains("HAVING"),
         "outer wrapper must contain HAVING: {sql}"
@@ -2728,13 +2711,26 @@ fn unprojected_group_key_with_an_invalid_cast_type_has_no_type() {
     }];
 
     assert_eq!(
-        group_key_exasol_types(
-            &req,
-            &[r#""NAME""#.to_string()],
-            &unprojected,
-            &ColumnTypes::default(),
-        ),
+        group_key_exasol_types(&req, &[SqlFragment::new(r#""NAME""#, None)], &unprojected,),
         None,
         "an invalid key type has no exact type, so the grouped split declines"
     );
+}
+
+/// The types Exasol declares for a select list of only keys and aggregates: each one's own type.
+fn select_types_of(
+    items: &[GroupedSelectItem],
+    key_types: &[ExasolType],
+    plan_types: &[ExasolType],
+) -> Vec<ExasolType> {
+    let mut ordered = items.to_vec();
+    ordered.sort_by_key(select_item_index);
+    ordered
+        .iter()
+        .map(|item| match item {
+            GroupedSelectItem::GroupKey { group_key_slot, .. } => key_types[*group_key_slot],
+            GroupedSelectItem::Aggregate { plan_slot, .. } => plan_types[*plan_slot],
+            other => panic!("only a key or an aggregate has its own type: {other:?}"),
+        })
+        .collect()
 }

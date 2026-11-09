@@ -4,10 +4,12 @@ use serde_json::Value as Json;
 mod column_node;
 mod datetime_format;
 pub mod exasol_type;
+mod fragment;
 mod scan_typing;
 pub use column_node::{ColumnNode, rewrite_table_aliases, strip_table_alias, walk_column_nodes};
 use datetime_format::{FormatTarget, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
+pub use fragment::SqlFragment;
 use scan_typing::{BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE};
 pub use scan_typing::{ColumnTypeLookup, exact_expression_type};
 
@@ -1135,12 +1137,19 @@ fn render_junction(
 
 /// The only DataFusion-dialect entry point: the typed pass runs first, so no caller can hand the
 /// scan an expression without its column types. `Err` declines the expression.
+///
+/// `ty` is the type of the value the scan computes, as the scan emits it. A CHAR or VARCHAR CAST
+/// renders as unsized VARCHAR, so its value is any text, not the target's length.
 pub fn render_scan_expression(
     expr: &Json,
     columns: &dyn ColumnTypeLookup,
-) -> Result<String, UdfError> {
+) -> Result<SqlFragment, UdfError> {
     let (typed, _) = scan_typing::type_scan_tree(expr, columns)?;
-    render_expression(&typed)
+    let ty = exact_expression_type(expr, columns).map(|ty| match ty {
+        ExasolType::Char { .. } | ExasolType::Varchar { .. } => ExasolType::WIDEST_VARCHAR,
+        other => other,
+    });
+    Ok(SqlFragment::new(render_expression(&typed)?, ty))
 }
 
 /// [`render_scan_expression`] for a filter. `Ok(None)` when it is trivially true (`TRUE`/`NULL`).
@@ -1148,7 +1157,7 @@ pub fn render_scan_filter(
     filter_expr: &Json,
     columns: &dyn ColumnTypeLookup,
 ) -> Result<Option<String>, UdfError> {
-    let sql = render_scan_expression(filter_expr, columns)?;
+    let sql = render_scan_expression(filter_expr, columns)?.sql;
     Ok((sql != "TRUE" && sql != "NULL").then_some(sql))
 }
 
@@ -1183,6 +1192,18 @@ pub(crate) fn render_df_filter_safe(filter_expr: &Json) -> Option<String> {
 pub fn render_expression_exasol(expr: &Json) -> Result<String, UdfError> {
     render_expression_inner(expr, Dialect::Exasol)?
         .ok_or_else(|| UdfError::User("expression node is null".into()))
+}
+
+/// [`render_expression_exasol`] for an output select item, typed where the request states the
+/// type: the Exasol dialect renders a CAST's target and a column as they are.
+pub fn render_exasol_fragment(
+    expr: &Json,
+    columns: &dyn ColumnTypeLookup,
+) -> Result<SqlFragment, UdfError> {
+    Ok(SqlFragment::new(
+        render_expression_exasol(expr)?,
+        exact_expression_type(expr, columns),
+    ))
 }
 
 /// `None` on any failure.

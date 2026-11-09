@@ -2819,14 +2819,38 @@ fn only_a_plain_timestamp_declares_timestamp_digits() {
 }
 
 #[test]
-fn cast_to_declared_type_casts_a_genuine_varchar_2000000() {
+fn output_select_list_casts_an_untyped_item_to_every_declared_type() {
     for exa_type in EXASOL_TYPE_SPELLINGS {
         assert_eq!(
-            cast_to_declared_type("x", exa_type),
-            format!("CAST(x AS {exa_type})"),
+            output_select_list([SqlFragment::new("x", None)], &[exa_type]),
+            Some(vec![format!("CAST(x AS {exa_type})")]),
             "{exa_type}"
         );
     }
+}
+
+#[test]
+fn output_select_list_keeps_an_item_that_already_has_its_declared_type() {
+    let items = [
+        SqlFragment::new(r#""GK_0""#, Some(ExasolType::Date)),
+        SqlFragment::new(r#""GK_1""#, Some(ExasolType::decimal(9, 0))),
+    ];
+    assert_eq!(
+        output_select_list(items, &[ExasolType::Date, ExasolType::decimal(18, 0)]),
+        Some(vec![
+            r#""GK_0""#.to_string(),
+            r#"CAST("GK_1" AS DECIMAL(18,0))"#.to_string()
+        ])
+    );
+}
+
+#[test]
+fn output_select_list_declines_a_list_of_another_length() {
+    let items = [SqlFragment::new("x", None)];
+    assert_eq!(
+        output_select_list(items, &[ExasolType::Date, ExasolType::Date]),
+        None
+    );
 }
 
 fn layouts_of(column_types: &ColumnTypes) -> Vec<(&str, ExasolType, Option<BinaryLayout>)> {

@@ -5,8 +5,9 @@ use super::scalar_over_agg::{
     arg_column_or_expr, cast_merge_items, classify_scalar_over_aggregate, fold_aggregate_plan,
     nested_aggregate_type, parse_agg_item, render_scalar_over_merge,
 };
-use super::support::{ColumnTypes, PushdownRequest, cast_to_declared_type};
+use super::support::{ColumnTypes, PushdownRequest, output_select_list};
 use crate::types::exasol_type::ExasolType;
+use vs_expression::SqlFragment;
 
 /// A `COUNT(DISTINCT ...)` is not an aggregate partial: it is its own DISTINCT
 /// row-scan fan-out counted by an outer Exasol-native `COUNT(DISTINCT "V")`.
@@ -18,7 +19,6 @@ pub enum SingleGroupItem {
     /// each nested aggregate's merged expression.
     ScalarOverAggregate {
         node: Json,
-        declared_type: ExasolType,
     },
 }
 
@@ -61,10 +61,7 @@ pub fn detect_aggregates(
         } else {
             // Classified for the decline only; `ordinary_plans` re-derives the nested plans.
             classify_scalar_over_aggregate(item, col_types)?;
-            SingleGroupItem::ScalarOverAggregate {
-                node: item.clone(),
-                declared_type: pushdown.select_type(select_index)?,
-            }
+            SingleGroupItem::ScalarOverAggregate { node: item.clone() }
         };
         items.push(resolved);
     }
@@ -146,26 +143,28 @@ pub(super) fn single_group_merge_select(
     items: &[SingleGroupItem],
     plans: &[AggregatePlan],
     plan_types: &[ExasolType],
+    select_types: &[ExasolType],
     col_types: &ColumnTypes,
 ) -> Option<Vec<String>> {
     // Cast before any outer scalar applies, so `SUM(a) / 2` stays exact (#476).
     let cast_merged = cast_merge_items(plans, plan_types, col_types);
-    items
+    let fragments = items
         .iter()
         .map(|item| match item {
             SingleGroupItem::Aggregate(plan) => {
                 let slot = plans.iter().position(|p| p == plan)?;
-                cast_merged.get(slot).cloned()
+                Some(SqlFragment::new(
+                    cast_merged.get(slot)?.clone(),
+                    plan_types.get(slot).copied(),
+                ))
             }
             SingleGroupItem::Distinct(_) => None,
-            SingleGroupItem::ScalarOverAggregate {
-                node,
-                declared_type,
-                ..
-            } => render_scalar_over_merge(node, plans, &cast_merged, col_types)
-                .map(|expr| cast_to_declared_type(&expr, *declared_type)),
+            SingleGroupItem::ScalarOverAggregate { node } => {
+                render_scalar_over_merge(node, plans, &cast_merged, col_types)
+            }
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    output_select_list(fragments, select_types)
 }
 
 pub(super) fn has_distinct(items: &[SingleGroupItem]) -> bool {
