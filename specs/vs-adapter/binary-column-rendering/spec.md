@@ -13,6 +13,7 @@ A binary column reads as lowercase hexadecimal text on every source and at every
 * Lowercase hex sorts in the order of the bytes, so a range filter, `MIN`, `MAX`, and `ORDER BY` over the text match the bytes.
 * Exasol pushes a filter literal on a binary column as a plain string literal. Exasol compares strings case-sensitively, and only lowercase hex of whole bytes names a byte string.
 * The Iceberg table spec serializes a `uuid` bound as a "16-byte big-endian value" (Appendix B) but defines no order over `uuid` values (apache/iceberg#14216). Iceberg Java merges a data file's row-group bounds and builds a manifest's partition summary with signed 64-bit comparisons, and other writers compare unsigned bytes, so a reader cannot tell which order a stored `uuid` bound follows. Parquet orders `UUID` statistics as unsigned bytes (Parquet LogicalTypes § UUID).
+* Named trade-off: because that order is unknown, a `uuid` filter prunes no Iceberg manifest or data file, including by an Iceberg partition transform such as `bucket`.
 * `BINARY_AS_STRING` mirrors Spark's `spark.sql.parquet.binaryAsString` for writers that store text as binary, such as Impala, Hive, and early Spark.
 
 ## Scenarios
@@ -57,7 +58,6 @@ A binary column reads as lowercase hexadecimal text on every source and at every
 * *THEN* the adapter SHALL plan the file, because no `uuid` comparison reaches plan-time pruning of manifests, partition values, or column bounds
 * *AND* the query SHALL return every row that holds one of the values
 * *AND* the scan SHALL still compare the raw bytes, so Parquet statistics prune row groups
-* *AND* named trade-off: a `uuid` filter prunes no Iceberg manifest or data file, including by an Iceberg partition transform such as `bucket`
 
 ### Scenario: A binary value too long for its hex rendering fails the query
 

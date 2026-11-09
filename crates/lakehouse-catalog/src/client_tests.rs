@@ -372,7 +372,7 @@ fn oauth_creds() -> ConnectionCreds {
 /// Scenario: A scoped refresh lists Iceberg identifiers and loads the requested tables on one session
 #[tokio::test]
 async fn empty_namespace_builds_no_session_and_no_grant() {
-    let client = IcebergRestCatalogClient::new("http://127.0.0.1:1".into(), oauth_creds());
+    let client = IcebergRestCatalogClient::new("http://127.0.0.1:1".into(), oauth_creds(), None);
 
     let listing = client
         .load_listed_tables(&[])
@@ -389,7 +389,7 @@ async fn empty_namespace_builds_no_session_and_no_grant() {
 #[tokio::test]
 async fn list_tables_over_empty_namespace_lists_nothing() {
     let (uri, log) = spawn_mock_catalog(&["sales"], &[], &[], &[]).await;
-    let client = IcebergRestCatalogClient::new(uri, oauth_creds());
+    let client = IcebergRestCatalogClient::new(uri, oauth_creds(), None);
 
     let listing = client
         .list_tables(&["sales".to_string()], &|_| true)
@@ -414,7 +414,7 @@ async fn enumeration_builds_exactly_one_session() {
         use_vended_credentials: true,
         ..oauth_creds()
     };
-    let client = IcebergRestCatalogClient::new(uri, creds);
+    let client = IcebergRestCatalogClient::new(uri, creds, None);
 
     let listing = client
         .list_tables(&["sales".to_string()], &|_| true)
@@ -455,7 +455,7 @@ async fn enumeration_builds_exactly_one_session() {
 #[tokio::test]
 async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
     let (uri, _log) = spawn_mock_catalog(&["sales"], &["orders", "customers"], &[], &[]).await;
-    let client = IcebergRestCatalogClient::new(uri, creds_no_auth());
+    let client = IcebergRestCatalogClient::new(uri, creds_no_auth(), None);
 
     let listing = client
         .list_tables(&["sales".to_string()], &|_| true)
@@ -487,7 +487,7 @@ async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
 #[tokio::test]
 async fn rest_listing_projects_the_loaded_metadata_into_the_neutral_table() {
     let (uri, _log) = spawn_mock_catalog(&["sales"], &["orders"], &[], &[]).await;
-    let client = IcebergRestCatalogClient::new(uri, creds_no_auth());
+    let client = IcebergRestCatalogClient::new(uri, creds_no_auth(), None);
     let ident = CatalogTableIdent {
         namespace: vec!["sales".to_string()],
         name: "orders".to_string(),
@@ -543,7 +543,7 @@ async fn unloadable_table_is_reported_skipped_not_failed() {
         &[],
     )
     .await;
-    let client = IcebergRestCatalogClient::new(uri, creds_no_auth());
+    let client = IcebergRestCatalogClient::new(uri, creds_no_auth(), None);
 
     let listing = client
         .list_tables(&["prod".to_string()], &|_| true)
@@ -588,7 +588,7 @@ async fn unloadable_table_is_reported_skipped_not_failed() {
 async fn non_404_load_failure_aborts_the_batch() {
     let (uri, _log) =
         spawn_mock_catalog(&["prod"], &["orders", "hive_events"], &[], &["hive_events"]).await;
-    let client = IcebergRestCatalogClient::new(uri, creds_no_auth());
+    let client = IcebergRestCatalogClient::new(uri, creds_no_auth(), None);
 
     let result = client.list_tables(&["prod".to_string()], &|_| true).await;
 
@@ -601,4 +601,33 @@ async fn non_404_load_failure_aborts_the_batch() {
     let message = error.to_string();
     assert!(message.contains("prod.hive_events"), "{message}");
     assert!(message.contains("HTTP 500"), "{message}");
+}
+
+#[tokio::test]
+async fn catalog_prefix_is_the_resolved_session_prefix() {
+    let unresolved =
+        IcebergRestCatalogClient::new("http://127.0.0.1:1".into(), sigv4_creds(), None);
+    assert_eq!(unresolved.catalog_prefix(), None, "no session, no prefix");
+
+    for (stored, expected) in [
+        (None, "catalogs/123456789012"),
+        (Some(""), ""),
+        (Some("stored"), "stored"),
+    ] {
+        let client = IcebergRestCatalogClient::new(
+            "http://127.0.0.1:1".into(),
+            sigv4_creds(),
+            stored.map(str::to_string),
+        );
+        client
+            .session()
+            .await
+            .expect("SigV4 resolves with no request");
+
+        assert_eq!(
+            client.catalog_prefix().as_deref(),
+            Some(expected),
+            "stored {stored:?}"
+        );
+    }
 }

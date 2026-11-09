@@ -93,16 +93,21 @@ pub struct CatalogSession {
 }
 
 impl CatalogSession {
-    /// A failed OAuth2 grant or config lookup is an error. Credential values never appear in any
-    /// returned error.
+    /// A `catalog_prefix` that an earlier session found spares the `/v1/config` lookup. A failed
+    /// OAuth2 grant or config lookup is an error. Credential values never appear in any returned
+    /// error.
     pub async fn resolve(
         catalog_uri: &str,
         warehouse: &str,
+        catalog_prefix: Option<String>,
         creds: &ConnectionCreds,
     ) -> Result<CatalogSession, UdfError> {
         let http = CatalogHttp::new();
         let auth = resolve_catalog_auth(&http, catalog_uri, creds).await?;
-        let prefix = resolve_load_table_prefix(&http, catalog_uri, warehouse, &auth, creds).await?;
+        let prefix = match catalog_prefix {
+            Some(prefix) => prefix,
+            None => resolve_load_table_prefix(&http, catalog_uri, warehouse, &auth, creds).await?,
+        };
         Ok(CatalogSession {
             http,
             catalog_uri: catalog_uri.to_string(),
