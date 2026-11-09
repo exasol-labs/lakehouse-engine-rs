@@ -7,11 +7,11 @@ The export writes the source rows as Parquet data files into a new Iceberg table
 * Statement and options: export/export-options § Background.
 * Read through a virtual schema: export/export-into-script § Background.
 * Storage credentials are the CONNECTION's static storage keys or, when the CONNECTION sets `"use_vended_credentials": true`, the credentials that the catalog vends for the new table.
-* On a catalog that offers a credentials endpoint (Iceberg REST `loadCredentials`), the export renews vended credentials through it before they expire. It never renews static storage keys. Credentials with an expiry are renewed through the catalog's own call.
+* On a catalog that offers a credentials endpoint (Iceberg REST `loadCredentials`), the export renews vended credentials through it before they expire.
 * Before it reads any source row the export makes catalog calls only: it authenticates, refuses an existing table, and creates every missing level of the namespace, even when it then writes no rows or fails. It never writes to storage at that point, so a storage error shows when the writers write, and in parallel mode a failed export can leave an empty table behind. It creates only new tables.
 * `SINGLE_COMMIT` means the table appears only with its data. Iceberg REST does it by staged table creation (`stage-create`), so only a `SINGLE_COMMIT` export needs a catalog that accepts it.
 * The export writes only onto S3-compatible storage, through an Iceberg REST catalog that does not need AWS SigV4 signing.
-* Type mapping. Exasol types map to Arrow types once, and the Iceberg schema derives from the Arrow schema. The export creates format-version 2 tables. Every column is optional and carries the source column's name as Exasol reports it, so an unquoted identifier arrives in upper case. Column names must be distinct and must not name one of Iceberg's reserved metadata columns, such as `_file`.
+* Type mapping. The export creates format-version 2 tables. Every column is optional and carries the source column's name as Exasol reports it, so an unquoted identifier arrives in upper case. Column names must be distinct and must not name one of Iceberg's reserved metadata columns, such as `_file`.
 
   | Exasol type | Iceberg type |
   |-------------|--------------|
