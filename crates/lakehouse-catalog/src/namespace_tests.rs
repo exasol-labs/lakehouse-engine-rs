@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::*;
+use std::time::Duration;
 
 #[test]
 fn parse_table_ident_splits_namespace_table() {
@@ -37,18 +38,10 @@ fn parse_table_ident_handles_multilevel_namespace() {
     assert_eq!(tbl3, "orders");
 }
 
-fn sigv4_creds() -> ConnectionCreds {
-    let mut creds = base_creds();
-    creds.use_sigv4 = true;
-    creds.region = "eu-west-1".into();
-    creds.warehouse = "123456789012".into();
-    creds
-}
-
 #[tokio::test]
 async fn list_namespace_tables_rejects_empty_namespace() {
     let creds = sigv4_creds();
-    let session = CatalogSession::resolve("http://unused.invalid", &creds.warehouse, &creds)
+    let session = CatalogSession::resolve("http://unused.invalid", &creds.warehouse, None, &creds)
         .await
         .expect("a SigV4 session resolves without any network access");
 
@@ -67,7 +60,7 @@ async fn list_namespace_tables_rejects_empty_namespace() {
 async fn signed_listing_lists_only_the_configured_namespace_under_the_catalogs_prefix() {
     let (catalog_uri, heads) = spawn_recording_catalog(EMPTY_LISTING).await;
     let creds = sigv4_creds();
-    let session = CatalogSession::resolve(&catalog_uri, &creds.warehouse, &creds)
+    let session = CatalogSession::resolve(&catalog_uri, &creds.warehouse, None, &creds)
         .await
         .expect("a SigV4 session resolves without any network access");
 
@@ -97,7 +90,7 @@ const EMPTY_LISTING: &str = r#"{"identifiers":[],"namespaces":[]}"#;
 async fn a_refused_catalog_connection_names_its_cause_signed_or_not() {
     let mut creds = base_creds();
     let Err(UdfError::User(msg)) =
-        CatalogSession::resolve(CLOSED_PORT_URI, &creds.warehouse, &creds).await
+        CatalogSession::resolve(CLOSED_PORT_URI, &creds.warehouse, None, &creds).await
     else {
         panic!("an unsigned session reads /v1/config, so a closed port must fail it");
     };
@@ -109,7 +102,7 @@ async fn a_refused_catalog_connection_names_its_cause_signed_or_not() {
 
     creds.use_sigv4 = true;
     creds.region = "us-east-1".into();
-    let session = CatalogSession::resolve(CLOSED_PORT_URI, &creds.warehouse, &creds)
+    let session = CatalogSession::resolve(CLOSED_PORT_URI, &creds.warehouse, None, &creds)
         .await
         .expect("a SigV4 session resolves without the catalog");
     let Err(UdfError::User(msg)) =
@@ -122,4 +115,45 @@ async fn a_refused_catalog_connection_names_its_cause_signed_or_not() {
             && msg.contains(CLOSED_PORT_CAUSE),
         "{msg}"
     );
+}
+
+#[test]
+fn direct_children_keeps_only_namespaces_one_level_below_the_parent() {
+    let ns = |parts: &[&str]| NamespaceIdent::from_strs(parts).unwrap();
+    let listed = [
+        &["ds"][..],
+        &["ds", "a"],
+        &["ds", "a", "b"],
+        &["ds", "ds"],
+        &["dsx", "a"],
+        &["other", "ds"],
+    ];
+
+    let children = direct_children(&ns(&["ds"]), listed.iter().map(|p| ns(p)).collect());
+
+    assert_eq!(children, [ns(&["ds", "a"]), ns(&["ds", "ds"])]);
+}
+
+/// Scenario: Enumeration descends only into direct children of the listed namespace
+#[tokio::test]
+async fn listing_terminates_when_the_catalog_ignores_parent() {
+    let (catalog_uri, _) = spawn_recording_catalog(
+        r#"{"identifiers":[{"namespace":["ds"],"name":"t"}],"namespaces":[["ds"]]}"#,
+    )
+    .await;
+    let creds = base_creds();
+    let session = CatalogSession::resolve(&catalog_uri, &creds.warehouse, None, &creds)
+        .await
+        .expect("the session resolves against the stub");
+    let root = ["ds".to_string()];
+
+    let tables = tokio::time::timeout(
+        Duration::from_secs(1),
+        list_namespace_tables(&session, &root, &creds),
+    )
+    .await
+    .expect("the listing must terminate")
+    .expect("the listing must succeed");
+
+    assert_eq!(tables, [TableIdent::from_strs(["ds", "t"]).unwrap()]);
 }

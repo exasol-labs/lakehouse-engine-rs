@@ -33,6 +33,15 @@ pub(crate) fn base_creds() -> ConnectionCreds {
     }
 }
 
+/// SigV4 creds resolve a session without contacting the catalog.
+pub(crate) fn sigv4_creds() -> ConnectionCreds {
+    let mut creds = base_creds();
+    creds.use_sigv4 = true;
+    creds.region = "eu-west-1".into();
+    creds.warehouse = "123456789012".into();
+    creds
+}
+
 pub(crate) fn s3_payload(backend: StorageBackend) -> StorageProps {
     match backend {
         StorageBackend::S3(props) => props,

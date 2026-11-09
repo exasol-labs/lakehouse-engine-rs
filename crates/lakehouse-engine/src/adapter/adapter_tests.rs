@@ -461,9 +461,47 @@ impl Default for super::TuningNotes {
 }
 
 fn parsed_notes(request: &Json, tuning: &TuningNotes, skipped: &[SkippedTable]) -> Json {
-    let notes = build_adapter_notes(request, tuning, &SkippedTables::listed(skipped));
+    let notes = build_adapter_notes(request, tuning, &SkippedTables::listed(skipped), None);
     serde_json::from_str(notes.as_str().expect("adapterNotes is a JSON string"))
         .expect("adapterNotes is valid JSON")
+}
+
+#[test]
+fn build_adapter_notes_writes_or_removes_the_catalog_prefix() {
+    let refresh = json!({
+        "type": "refresh",
+        "schemaMetadataInfo": {"adapterNotes": json!({NOTE_CATALOG_PREFIX: "stale"}).to_string()},
+    });
+    for (prefix, expected) in [
+        (Some("ns-prefix"), json!("ns-prefix")),
+        (Some(""), json!("")),
+        (None, Json::Null),
+    ] {
+        let notes = build_adapter_notes(
+            &refresh,
+            &TuningNotes::default(),
+            &SkippedTables::default(),
+            prefix.map(str::to_string),
+        );
+        let parsed: Json = serde_json::from_str(notes.as_str().unwrap()).unwrap();
+
+        assert_eq!(parsed[NOTE_CATALOG_PREFIX], expected, "prefix {prefix:?}");
+    }
+}
+
+#[test]
+fn stored_catalog_prefix_keeps_an_empty_prefix() {
+    let request = |notes: Json| json!({"schemaMetadataInfo": {"adapterNotes": notes.to_string()}});
+
+    assert_eq!(
+        stored_catalog_prefix(&request(json!({NOTE_CATALOG_PREFIX: ""}))),
+        Some(String::new())
+    );
+    assert_eq!(
+        stored_catalog_prefix(&request(json!({"PARALLELISM_FACTOR": "1"}))),
+        None,
+        "a schema created before the note existed discovers the prefix"
+    );
 }
 
 #[test]
@@ -513,6 +551,7 @@ fn refresh_writes_an_identifier_note_on_every_returned_table() {
                 &request,
                 &TuningNotes::default(),
                 &SkippedTables::listed(&listing.skipped),
+                None,
             ),
         }),
     );
@@ -575,6 +614,7 @@ fn adapter_notes_carry_parallelism_factor() {
             ..TuningNotes::default()
         },
         &SkippedTables::default(),
+        None,
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
@@ -663,7 +703,7 @@ fn df_batch_size_uses_supplied_value() {
     );
 
     let req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(&req, &tuning, &SkippedTables::default());
+    let notes = build_adapter_notes(&req, &tuning, &SkippedTables::default(), None);
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
     let pushdown_req = serde_json::json!({
@@ -756,6 +796,7 @@ fn join_broadcast_max_bytes_round_trips_through_adapter_notes() {
             ..TuningNotes::default()
         },
         &SkippedTables::default(),
+        None,
     );
 
     let pushdown_req = serde_json::json!({
@@ -781,6 +822,7 @@ fn memory_budget_params_round_trip_through_adapter_notes() {
             ..TuningNotes::default()
         },
         &SkippedTables::default(),
+        None,
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 

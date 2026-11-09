@@ -88,7 +88,7 @@ async fn list_child_namespaces(
 ) -> Result<Vec<NamespaceIdent>, UdfError> {
     let url = namespaces_url(session, None);
     let parent = ns.to_url_string();
-    list_pages(
+    let listed = list_pages(
         session,
         &url,
         &[("parent", parent.as_str())],
@@ -96,7 +96,16 @@ async fn list_child_namespaces(
         |page: ListNamespaceResponse| (page.namespaces, page.next_page_token),
     )
     .await
-    .map_err(|e| listing_error("list namespaces under", ns, e))
+    .map_err(|e| listing_error("list namespaces under", ns, e))?;
+    Ok(direct_children(ns, listed))
+}
+
+/// A catalog that ignores `parent` would otherwise send the walk back to `parent` forever.
+fn direct_children(parent: &NamespaceIdent, listed: Vec<NamespaceIdent>) -> Vec<NamespaceIdent> {
+    listed
+        .into_iter()
+        .filter(|child| child.len() == parent.len() + 1 && child.starts_with(parent))
+        .collect()
 }
 
 async fn list_pages<P: DeserializeOwned, T>(
