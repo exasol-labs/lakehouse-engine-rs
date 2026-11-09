@@ -249,7 +249,7 @@ struct RequestLog {
 async fn spawn_mock_catalog(
     namespace: &[&str],
     tables: &[&str],
-    not_loadable: &[&str],
+    not_loadable: &[(&str, &'static str)],
     server_error: &[&str],
 ) -> (String, Arc<Mutex<RequestLog>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -258,7 +258,10 @@ async fn spawn_mock_catalog(
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
     let uri = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let log = Arc::new(Mutex::new(RequestLog::default()));
-    let not_loadable: Vec<String> = not_loadable.iter().map(|s| s.to_string()).collect();
+    let not_loadable: Vec<(String, &str)> = not_loadable
+        .iter()
+        .map(|(table, status)| (table.to_string(), *status))
+        .collect();
     let server_error: Vec<String> = server_error.iter().map(|s| s.to_string()).collect();
     let list_tables_body = list_tables_response(namespace, tables);
 
@@ -302,11 +305,8 @@ async fn spawn_mock_catalog(
                     .push(request.to_string());
                 if server_error.iter().any(|t| t == table) {
                     ("500 Internal Server Error", String::new())
-                } else if not_loadable.iter().any(|t| t == table) {
-                    (
-                        "404 Not Found",
-                        r#"{"error":"not an iceberg table"}"#.to_string(),
-                    )
+                } else if let Some((_, status)) = not_loadable.iter().find(|(t, _)| t == table) {
+                    (*status, r#"{"error":"not an iceberg table"}"#.to_string())
                 } else {
                     ("200 OK", load_table_body(table))
                 }
@@ -533,8 +533,16 @@ async fn rest_listing_projects_the_loaded_metadata_into_the_neutral_table() {
 /// Scenario: A failed loadTable names the table it loads
 #[tokio::test]
 async fn unloadable_table_is_reported_skipped_not_failed() {
-    let (uri, _log) =
-        spawn_mock_catalog(&["prod"], &["orders", "hive_events"], &["hive_events"], &[]).await;
+    let (uri, _log) = spawn_mock_catalog(
+        &["prod"],
+        &["orders", "hive_events", "delta_events"],
+        &[
+            ("hive_events", "404 Not Found"),
+            ("delta_events", "400 Bad Request"),
+        ],
+        &[],
+    )
+    .await;
     let client = IcebergRestCatalogClient::new(uri, creds_no_auth());
 
     let listing = client
@@ -553,18 +561,29 @@ async fn unloadable_table_is_reported_skipped_not_failed() {
     );
     assert_eq!(
         listing.skipped,
-        vec![SkippedTable {
-            ident: CatalogTableIdent {
-                namespace: vec!["prod".to_string()],
-                name: "hive_events".to_string(),
+        vec![
+            SkippedTable {
+                ident: CatalogTableIdent {
+                    namespace: vec!["prod".to_string()],
+                    name: "hive_events".to_string(),
+                },
+                reason: SkipReason::NotLoadableIcebergTable,
             },
-            reason: SkipReason::NotLoadableIcebergTable,
-        }],
-        "the 404 table is reported skipped, verbatim"
+            SkippedTable {
+                ident: CatalogTableIdent {
+                    namespace: vec!["prod".to_string()],
+                    name: "delta_events".to_string(),
+                },
+                reason: SkipReason::LoadRejected {
+                    detail: r#"failed to load table 'prod.delta_events': catalog request failed with HTTP 400: {"error":"not an iceberg table"}"#.to_string(),
+                },
+            },
+        ],
+        "the 404 and 400 tables are reported skipped, verbatim"
     );
 }
 
-/// Scenario: A non-404 per-table load failure aborts createVirtualSchema
+/// Scenario: Any other per-table load failure aborts createVirtualSchema
 #[tokio::test]
 async fn non_404_load_failure_aborts_the_batch() {
     let (uri, _log) =
