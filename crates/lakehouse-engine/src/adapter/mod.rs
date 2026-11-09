@@ -259,7 +259,7 @@ fn handle_create_virtual_schema(
 
     let tuning = resolve_tuning_notes(&checked.tuning, resolve_nr_of_cores());
     let adapter_notes =
-        build_adapter_notes(request, &tuning, &skipped_tables, client.persisted_prefix());
+        build_adapter_notes(request, &tuning, &skipped_tables, client.catalog_prefix());
 
     let schema_metadata = json!({
         "tables": tables_json,
@@ -481,7 +481,7 @@ fn client_of_kind(
     match config.catalog_kind {
         CatalogKind::IcebergRest => Ok(Box::new(
             IcebergRestCatalogClient::new(catalog_uri.clone(), creds.clone())
-                .with_stored_prefix(catalog_prefix),
+                .with_catalog_prefix(catalog_prefix),
         )),
         CatalogKind::UnityCatalogNative => Ok(Box::new(UnityCatalogSession::new(
             catalog_uri,

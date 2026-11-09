@@ -299,7 +299,7 @@ async fn assumed_session_signs_load_table_and_namespace_enumeration() {
         let session_creds = crate::resolve_aws_identity(stated, &load_table_uri, true)
             .await
             .expect("the stub answers a well-formed AssumeRoleResponse");
-        let session = CatalogSession::resolve(&load_table_uri, WAREHOUSE, &session_creds)
+        let session = CatalogSession::resolve(&load_table_uri, WAREHOUSE, None, &session_creds)
             .await
             .expect("a SigV4 session resolves without any network access");
         let catalog = CatalogProps {
@@ -310,7 +310,7 @@ async fn assumed_session_signs_load_table_and_namespace_enumeration() {
             .await
             .expect("the session-signed loadTable must succeed");
         let enumeration_session =
-            CatalogSession::resolve(&enumeration_uri, WAREHOUSE, &session_creds)
+            CatalogSession::resolve(&enumeration_uri, WAREHOUSE, None, &session_creds)
                 .await
                 .expect("a SigV4 session resolves without any network access");
         crate::namespace::list_namespace_tables(
@@ -371,7 +371,7 @@ async fn catalog_session_resolve_sigv4_no_config_roundtrip() {
     creds.use_sigv4 = true;
     creds.region = String::new();
 
-    let session = CatalogSession::resolve(catalog_uri, warehouse, &creds)
+    let session = CatalogSession::resolve(catalog_uri, warehouse, None, &creds)
         .await
         .expect("sigv4 session resolution must not fail without any network access");
 
@@ -399,7 +399,7 @@ async fn a_failed_config_lookup_fails_the_session() {
     .await;
 
     let Err(UdfError::User(msg)) =
-        CatalogSession::resolve(&uri, "wrong-wh", &creds_no_auth()).await
+        CatalogSession::resolve(&uri, "wrong-wh", None, &creds_no_auth()).await
     else {
         panic!("a 404 config answer must fail the session");
     };
@@ -520,7 +520,7 @@ async fn a_resent_sigv4_load_table_carries_its_first_signature() {
     let mut creds = base_creds();
     creds.use_sigv4 = true;
     creds.warehouse = "123456789012".into();
-    let session = CatalogSession::resolve(&uri, &creds.warehouse, &creds)
+    let session = CatalogSession::resolve(&uri, &creds.warehouse, None, &creds)
         .await
         .expect("a SigV4 session resolves without any network access");
     let catalog = CatalogProps {
@@ -572,7 +572,7 @@ async fn every_iceberg_rest_request_kind_succeeds_after_one_503() {
     oauth_creds.client_id = Some("client-id".into());
     oauth_creds.client_secret = Some(CLIENT_SECRET.into());
 
-    let oauth_session = CatalogSession::resolve(&grant_uri, "wh", &oauth_creds)
+    let oauth_session = CatalogSession::resolve(&grant_uri, "wh", None, &oauth_creds)
         .await
         .expect("a 503 on the grant and the config lookup is retried to success");
     assert!(matches!(oauth_session.auth, CatalogAuth::Bearer(ref t) if t == OAUTH_ACCESS_TOKEN));
@@ -608,7 +608,7 @@ async fn every_iceberg_rest_request_kind_succeeds_after_one_503() {
         }
     })
     .await;
-    let listing_session = CatalogSession::resolve(&listing_uri, "wh", &creds_no_auth())
+    let listing_session = CatalogSession::resolve(&listing_uri, "wh", None, &creds_no_auth())
         .await
         .expect("the config lookup succeeds");
     let tables = crate::namespace::list_namespace_tables(
@@ -657,7 +657,7 @@ async fn every_iceberg_rest_request_kind_succeeds_after_one_503() {
         }
     })
     .await;
-    let pushdown_session = CatalogSession::resolve(&pushdown_uri, "wh", &creds_no_auth())
+    let pushdown_session = CatalogSession::resolve(&pushdown_uri, "wh", None, &creds_no_auth())
         .await
         .expect("the config lookup succeeds");
     let catalog = CatalogProps {

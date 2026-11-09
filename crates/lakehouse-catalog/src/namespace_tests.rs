@@ -41,7 +41,7 @@ fn parse_table_ident_handles_multilevel_namespace() {
 #[tokio::test]
 async fn list_namespace_tables_rejects_empty_namespace() {
     let creds = sigv4_creds();
-    let session = CatalogSession::resolve("http://unused.invalid", &creds.warehouse, &creds)
+    let session = CatalogSession::resolve("http://unused.invalid", &creds.warehouse, None, &creds)
         .await
         .expect("a SigV4 session resolves without any network access");
 
@@ -60,7 +60,7 @@ async fn list_namespace_tables_rejects_empty_namespace() {
 async fn signed_listing_lists_only_the_configured_namespace_under_the_catalogs_prefix() {
     let (catalog_uri, heads) = spawn_recording_catalog(EMPTY_LISTING).await;
     let creds = sigv4_creds();
-    let session = CatalogSession::resolve(&catalog_uri, &creds.warehouse, &creds)
+    let session = CatalogSession::resolve(&catalog_uri, &creds.warehouse, None, &creds)
         .await
         .expect("a SigV4 session resolves without any network access");
 
@@ -90,7 +90,7 @@ const EMPTY_LISTING: &str = r#"{"identifiers":[],"namespaces":[]}"#;
 async fn a_refused_catalog_connection_names_its_cause_signed_or_not() {
     let mut creds = base_creds();
     let Err(UdfError::User(msg)) =
-        CatalogSession::resolve(CLOSED_PORT_URI, &creds.warehouse, &creds).await
+        CatalogSession::resolve(CLOSED_PORT_URI, &creds.warehouse, None, &creds).await
     else {
         panic!("an unsigned session reads /v1/config, so a closed port must fail it");
     };
@@ -102,7 +102,7 @@ async fn a_refused_catalog_connection_names_its_cause_signed_or_not() {
 
     creds.use_sigv4 = true;
     creds.region = "us-east-1".into();
-    let session = CatalogSession::resolve(CLOSED_PORT_URI, &creds.warehouse, &creds)
+    let session = CatalogSession::resolve(CLOSED_PORT_URI, &creds.warehouse, None, &creds)
         .await
         .expect("a SigV4 session resolves without the catalog");
     let Err(UdfError::User(msg)) =
@@ -142,7 +142,7 @@ async fn listing_terminates_when_the_catalog_ignores_parent() {
     )
     .await;
     let creds = base_creds();
-    let session = CatalogSession::resolve(&catalog_uri, &creds.warehouse, &creds)
+    let session = CatalogSession::resolve(&catalog_uri, &creds.warehouse, None, &creds)
         .await
         .expect("the session resolves against the stub");
     let root = ["ds".to_string()];

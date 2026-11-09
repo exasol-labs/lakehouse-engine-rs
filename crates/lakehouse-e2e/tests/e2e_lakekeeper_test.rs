@@ -1549,12 +1549,12 @@ fn a_statement_sends_one_token_request_and_one_batch_check_per_new_table() {
     let again = format!("SELECT 1 FROM {events} WHERE ID > 15");
     let further = format!("SELECT 1 FROM {dim}");
     let prefix = lakekeeper::warehouse_prefix(WAREHOUSE_AUTHZ);
+    let loads_events = events_load_table_get(&prefix);
     assert_eq!(
         schema_notes(&mut exa_conn(), VS_PROXY).get("CATALOG_PREFIX"),
         Some(&Value::String(prefix)),
         "the create stores Lakekeeper's non-empty prefix"
     );
-    let loads_events = events_load_table_get();
     // Each branch filters its own rows, so every branch is a pushdown of its own. Re-checking
     // every table a pushdown reads would send one batch-check per pushdown instead.
     let cases = [
@@ -1650,11 +1650,10 @@ fn token_post() -> String {
 }
 
 /// Carries Lakekeeper's own prefix, so a load on any other prefix is not counted.
-fn events_load_table_get() -> String {
+fn events_load_table_get(prefix: &str) -> String {
     format!(
-        "GET {}/v1/{}/namespaces/{E2E_NAMESPACE}/tables/{E2E_TABLE}?",
-        proxy_catalog_uri(),
-        lakekeeper::warehouse_prefix(WAREHOUSE_AUTHZ)
+        "GET {}/v1/{prefix}/namespaces/{E2E_NAMESPACE}/tables/{E2E_TABLE}?",
+        proxy_catalog_uri()
     )
 }
 
@@ -1673,8 +1672,9 @@ fn a_create_without_catalog_kind_lists_on_one_grant_and_reads_through_load_table
             &lakekeeper_connection_password(WAREHOUSE_AUTHZ, false).via_proxy(),
         );
     });
+    let loads_events = events_load_table_get(&lakekeeper::warehouse_prefix(WAREHOUSE_AUTHZ));
     let mut rows = 0;
-    let [loads] = stack::count_proxy_requests([events_load_table_get().as_str()], || {
+    let [loads] = stack::count_proxy_requests([loads_events.as_str()], || {
         rows = sys.query_scalar_i64(&format!(
             "SELECT COUNT(*) FROM {vs}.{}",
             E2E_TABLE.to_uppercase()

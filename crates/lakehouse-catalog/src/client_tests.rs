@@ -604,9 +604,9 @@ async fn non_404_load_failure_aborts_the_batch() {
 }
 
 #[tokio::test]
-async fn persisted_prefix_is_the_resolved_session_prefix() {
+async fn catalog_prefix_is_the_resolved_session_prefix() {
     let unresolved = IcebergRestCatalogClient::new("http://127.0.0.1:1".into(), sigv4_creds());
-    assert_eq!(unresolved.persisted_prefix(), None, "no session, no prefix");
+    assert_eq!(unresolved.catalog_prefix(), None, "no session, no prefix");
 
     for (stored, expected) in [
         (None, "catalogs/123456789012"),
@@ -614,14 +614,14 @@ async fn persisted_prefix_is_the_resolved_session_prefix() {
         (Some("stored"), "stored"),
     ] {
         let client = IcebergRestCatalogClient::new("http://127.0.0.1:1".into(), sigv4_creds())
-            .with_stored_prefix(stored.map(str::to_string));
+            .with_catalog_prefix(stored.map(str::to_string));
         client
             .session()
             .await
             .expect("SigV4 resolves with no request");
 
         assert_eq!(
-            client.persisted_prefix().as_deref(),
+            client.catalog_prefix().as_deref(),
             Some(expected),
             "stored {stored:?}"
         );
