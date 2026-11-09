@@ -16,7 +16,7 @@ The `createVirtualSchema` response's schema-level `adapterNotes` records the res
 
 * *GIVEN* an Exasol session that has installed the VS adapter script, with the catalog and storage connection properties supplied
 * *WHEN* Exasol sends a `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL write exactly these schema-level entries into the returned `adapterNotes`: `PARALLELISM_FACTOR`, `DF_THREADING_MODE`, `DF_TARGET_PARTITIONS`, `DF_THREADS_PER_UDF`, `DF_BATCH_SIZE`, `MEMORY_POOL_FRACTION`, `INSTANCE_OVERHEAD_MB`, `S3_MAX_CONNECTIONS`, `JOIN_BROADCAST_MAX_BYTES`, and `SKIPPED_TABLES`, plus `SKIPPED_TABLES_OMITTED` when it caps the skip list and `CATALOG_PREFIX` under the Iceberg REST catalog kind
+* *THEN* the adapter SHALL write exactly these schema-level entries into the returned `adapterNotes`: `PARALLELISM_FACTOR`, `DF_THREADING_MODE`, `DF_TARGET_PARTITIONS`, `DF_THREADS_PER_UDF`, `DF_BATCH_SIZE`, `MEMORY_POOL_FRACTION`, `INSTANCE_OVERHEAD_MB`, `S3_MAX_CONNECTIONS`, `JOIN_BROADCAST_MAX_BYTES`, `METADATA_READ_CONCURRENCY`, and `SKIPPED_TABLES`, plus `SKIPPED_TABLES_OMITTED` when it caps the skip list and `CATALOG_PREFIX` under the Iceberg REST catalog kind
 * *AND* a `refresh` or `setProperties` response SHALL carry the same entries and keep every other entry of the persisted `adapterNotes`, per `vs-adapter/refresh-and-set-properties`, so an inherited node-count entry stays unread
 * *AND* the adapter MUST NOT write an entry for the cluster node count or the per-node core count, because every pushdown reads the node count from its own UDF handshake and derives the core count itself
 

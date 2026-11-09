@@ -107,6 +107,7 @@ pub(crate) async fn enumerated_notes(
         Arc::clone(store),
         base_path,
         options,
+        lakehouse_catalog::DEFAULT_METADATA_READ_CONCURRENCY,
     )
     .expect("the fixture base path is a valid storage URI")
     .list_tables(&[], &|_| true)

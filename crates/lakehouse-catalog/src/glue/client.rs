@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 
 use aws_sdk_glue::error::{ProvideErrorMetadata, SdkError};
@@ -12,9 +13,9 @@ use crate::redaction::redact_error_text;
 use crate::sigv4::required_signing_region;
 use crate::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogPartition, CatalogTable,
-    CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds, PartitionFormat,
-    SkipReason, SkippedTable, StorageBackend, TableAdmission, TableFormat,
-    catalog_identifier_string, read_iceberg_metadata_file,
+    CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds,
+    DEFAULT_METADATA_READ_CONCURRENCY, PartitionFormat, SkipReason, SkippedTable, StorageBackend,
+    TableAdmission, TableFormat, catalog_identifier_string, read_iceberg_metadata_file,
 };
 
 use super::partitions::neutral_partition;
@@ -22,14 +23,13 @@ use super::routing::{Route, route};
 use super::sdk::{catalog_id, error_text, glue_client, next_page_token};
 use super::trim_location;
 
-const METADATA_READ_CONCURRENCY: usize = 16;
-
 /// Glue Data Catalog metadata as neutral tables and partitions.
 pub struct GlueCatalogSession {
     client: aws_sdk_glue::Client,
     storage: StorageBackend,
     catalog_id: Option<String>,
     secrets: Vec<String>,
+    metadata_read_concurrency: NonZeroUsize,
 }
 
 impl GlueCatalogSession {
@@ -51,7 +51,17 @@ impl GlueCatalogSession {
             storage,
             catalog_id: catalog_id(&creds.warehouse),
             secrets,
+            metadata_read_concurrency: DEFAULT_METADATA_READ_CONCURRENCY,
         })
+    }
+
+    pub fn with_metadata_read_concurrency(mut self, concurrency: NonZeroUsize) -> Self {
+        self.metadata_read_concurrency = concurrency;
+        self
+    }
+
+    pub fn metadata_read_concurrency(&self) -> NonZeroUsize {
+        self.metadata_read_concurrency
     }
 
     /// The registered partitions of a Parquet table, each value keyed by its partition column.
@@ -231,7 +241,7 @@ impl CatalogClient for GlueCatalogSession {
                 })
                 .filter(|(ident, _)| futures::future::ready(exposes(ident)))
                 .map(|(ident, table)| self.admit(ident, table))
-                .buffered(METADATA_READ_CONCURRENCY)
+                .buffered(self.metadata_read_concurrency.get())
                 .try_collect()
                 .await?;
             Ok(admissions.into_iter().collect())
@@ -269,7 +279,7 @@ impl CatalogClient for GlueCatalogSession {
                     let table = self.get_table(&ident).await?;
                     self.admit(ident, table).await
                 })
-                .buffered(METADATA_READ_CONCURRENCY)
+                .buffered(self.metadata_read_concurrency.get())
                 .try_collect()
                 .await?;
             Ok(admissions.into_iter().collect())

@@ -20,8 +20,13 @@ fn test_client(
     base_path: &str,
     options: DirectoryOptions,
 ) -> DirectStorageCatalogClient {
-    DirectStorageCatalogClient::over_store(store, base_path, options)
-        .expect("the fixture base path is a valid storage URI")
+    DirectStorageCatalogClient::over_store(
+        store,
+        base_path,
+        options,
+        lakehouse_catalog::DEFAULT_METADATA_READ_CONCURRENCY,
+    )
+    .expect("the fixture base path is a valid storage URI")
 }
 
 fn id_file() -> Vec<u8> {
@@ -279,6 +284,7 @@ async fn a_non_utc_timezone_column_is_declared_at_its_normalized_tag() {
         &(Arc::clone(&inner) as Arc<dyn ObjectStore>),
         &StorePath::from("lake/events"),
         FOLD_NO_HIVE,
+        lakehouse_catalog::DEFAULT_METADATA_READ_CONCURRENCY,
     )
     .await
     .expect("the fixture directory folds");

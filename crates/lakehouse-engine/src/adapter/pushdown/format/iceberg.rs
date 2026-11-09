@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use arrow::array::ArrayRef;
@@ -41,6 +42,7 @@ pub(in crate::adapter::pushdown) struct IcebergTable {
     table_root: String,
     effective_storage: StorageBackend,
     name_mapping: Vec<NameMappingEntry>,
+    manifest_concurrency: NonZeroUsize,
 }
 
 /// A table's identity and its metadata once it passed the pre-storage checks, with the storage
@@ -61,8 +63,12 @@ impl IcebergTable {
         session: &CatalogSession,
         catalog_props: &CatalogProps,
         connection: &ConnectionStorage<'_>,
+        manifest_concurrency: NonZeroUsize,
     ) -> Result<Self, UdfError> {
-        Self::open(rest_metadata(session, catalog_props, connection).await?)
+        Self::open(
+            rest_metadata(session, catalog_props, connection).await?,
+            manifest_concurrency,
+        )
     }
 
     /// Loads from a metastore's pointer to the current `metadata.json` (Iceberg § Metastore
@@ -70,13 +76,17 @@ impl IcebergTable {
     pub(in crate::adapter::pushdown) async fn from_metadata_file(
         table: &CatalogTable,
         storage: &StorageBackend,
+        manifest_concurrency: NonZeroUsize,
     ) -> Result<Self, UdfError> {
-        Self::open(file_metadata(table, storage).await?)
+        Self::open(file_metadata(table, storage).await?, manifest_concurrency)
     }
 
     /// Errors are redacted against the effective storage's secrets, since its `file_io` is what
     /// talks to object storage.
-    fn open(checked: CheckedMetadata) -> Result<Self, UdfError> {
+    fn open(
+        checked: CheckedMetadata,
+        manifest_concurrency: NonZeroUsize,
+    ) -> Result<Self, UdfError> {
         let CheckedMetadata {
             table_name,
             table_ident,
@@ -116,6 +126,7 @@ impl IcebergTable {
             table_root: ObjectLocation::from_raw(&table_root)?.to_wire(),
             effective_storage,
             name_mapping,
+            manifest_concurrency,
         })
     }
 }
@@ -140,8 +151,14 @@ impl LoadedTable for IcebergTable {
             let predicate = filter_json
                 .zip(scanned)
                 .and_then(|(filter, scanned)| to_iceberg_predicate(filter, declared, &scanned));
-            let tasks =
-                plan_file_tasks(self.table.clone(), table_name, predicate, &secrets).await?;
+            let tasks = plan_file_tasks(
+                self.table.clone(),
+                table_name,
+                predicate,
+                self.manifest_concurrency,
+                &secrets,
+            )
+            .await?;
             // Delete paths are relativized later in `relativize_shards_to_root`, like data-file
             // paths.
             let files = tasks
@@ -469,9 +486,16 @@ async fn plan_file_tasks(
     table: iceberg::table::Table,
     table_name: &str,
     predicate: Option<iceberg::expr::Predicate>,
+    manifest_concurrency: NonZeroUsize,
     secrets: &[&str],
 ) -> Result<Vec<iceberg::scan::FileScanTask>, UdfError> {
-    let mut scan_builder = table.scan();
+    let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    // iceberg-rust sets the manifest-file limit only together with the CPU-bound entry limit.
+    let mut scan_builder = table
+        .scan()
+        .with_concurrency_limit(manifest_concurrency.get())
+        .with_manifest_entry_concurrency_limit(cores)
+        .with_data_file_concurrency_limit(cores);
     if let Some(predicate) = predicate {
         scan_builder = scan_builder.with_filter(predicate);
     }

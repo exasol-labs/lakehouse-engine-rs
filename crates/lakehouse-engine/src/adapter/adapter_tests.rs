@@ -2,7 +2,7 @@ use super::*;
 use crate::adapter::properties::{
     PROP_DF_BATCH_SIZE, PROP_DF_TARGET_PARTITIONS, PROP_DF_THREADING_MODE, PROP_DF_THREADS_PER_UDF,
     PROP_INSTANCE_OVERHEAD_MB, PROP_JOIN_BROADCAST_MAX_BYTES, PROP_MEMORY_POOL_FRACTION,
-    PROP_PARALLELISM_FACTOR, PROP_S3_MAX_CONNECTIONS,
+    PROP_METADATA_READ_CONCURRENCY, PROP_PARALLELISM_FACTOR, PROP_S3_MAX_CONNECTIONS,
 };
 use crate::adapter::pushdown::test_support::{
     NO_COLUMNS, customer_orders_join, pushdown_request, table_col,
@@ -456,6 +456,7 @@ impl Default for super::TuningNotes {
             instance_overhead_mb: DEFAULT_INSTANCE_OVERHEAD_MB,
             s3_max_connections: DEFAULT_S3_MAX_CONNECTIONS,
             join_broadcast_max_bytes: DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+            metadata_read_concurrency: DEFAULT_METADATA_READ_CONCURRENCY,
         }
     }
 }
@@ -784,6 +785,28 @@ fn resolve_join_broadcast_max_bytes_defaults_and_reads_the_supplied_value() {
         1,
     );
     assert_eq!(valid.join_broadcast_max_bytes, 67_108_864);
+}
+
+#[test]
+fn metadata_read_concurrency_defaults_to_16_and_round_trips_through_adapter_notes() {
+    let note_for = |props: Json| {
+        let notes = build_adapter_notes(
+            &serde_json::json!({"type": "createVirtualSchema"}),
+            &resolved_tuning(props, 2),
+            &SkippedTables::default(),
+            None,
+        );
+        stored_metadata_read_concurrency(&serde_json::json!({
+            "type": "pushdown",
+            "schemaMetadataInfo": { "adapterNotes": notes.as_str().unwrap() },
+        }))
+        .get()
+    };
+    assert_eq!(note_for(serde_json::json!({})), 16);
+    assert_eq!(
+        note_for(serde_json::json!({ PROP_METADATA_READ_CONCURRENCY: "3" })),
+        3
+    );
 }
 
 #[test]
@@ -1298,7 +1321,13 @@ fn resolve_config_over(
         .enable_all()
         .build()
         .expect("build the request runtime");
-    resolve_connection_config(&ctx, props, &PermissionSettings::Off, &rt)
+    resolve_connection_config(
+        &ctx,
+        props,
+        &PermissionSettings::Off,
+        DEFAULT_METADATA_READ_CONCURRENCY,
+        &rt,
+    )
 }
 
 #[test]

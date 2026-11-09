@@ -12,8 +12,9 @@ use std::collections::BTreeMap;
 const PREFIX: &str = "invalid virtual schema properties:";
 
 /// Name, minimum, and maximum of each whole-number tuning property.
-const WHOLE_NUMBER_RANGES: [(&str, &str, &str); 7] = [
+const WHOLE_NUMBER_RANGES: [(&str, &str, &str); 8] = [
     ("PARALLELISM_FACTOR", "1", "255"),
+    ("METADATA_READ_CONCURRENCY", "1", "255"),
     ("DATAFUSION_THREADS_PER_UDF", "1", "65535"),
     ("DATAFUSION_TARGET_PARTITIONS", "1", "65535"),
     ("S3_MAX_CONNECTIONS", "1", "65535"),
@@ -193,6 +194,7 @@ fn create_suggests_the_nearest_known_property_name() {
 /// Scenario: Adapter records the instance-overhead megabytes in the virtual-schema adapterNotes
 /// Scenario: FIXED mode uses the operator-supplied thread and partition values verbatim
 /// Scenario: FIXED value overrides the AUTO derivation at createVirtualSchema
+/// Scenario: Adapter records the metadata read concurrency in the virtual-schema adapterNotes
 #[test]
 fn create_accepts_every_known_property_name() {
     const VS: &str = "PV_ALL_NAMES";
@@ -212,6 +214,7 @@ fn create_accepts_every_known_property_name() {
             ("INSTANCE_OVERHEAD_MB", "100"),
             ("JOIN_BROADCAST_MAX_BYTES", "1048576"),
             ("S3_MAX_CONNECTIONS", "7"),
+            ("METADATA_READ_CONCURRENCY", "4"),
             ("MERGE_SCHEMA", "false"),
             ("HIVE_PARTITIONING", "false"),
             ("USER_MAPPING", "{{ user }}"),
@@ -231,6 +234,7 @@ fn create_accepts_every_known_property_name() {
         ("INSTANCE_OVERHEAD_MB", "100"),
         ("JOIN_BROADCAST_MAX_BYTES", "1048576"),
         ("S3_MAX_CONNECTIONS", "7"),
+        ("METADATA_READ_CONCURRENCY", "4"),
     ] {
         assert_eq!(
             notes.get(key).map(String::as_str),
@@ -302,6 +306,7 @@ fn create_without_tuning_properties_records_the_defaults() {
         ("MEMORY_POOL_FRACTION", "0.6"),
         ("INSTANCE_OVERHEAD_MB", "200"),
         ("JOIN_BROADCAST_MAX_BYTES", "134217728"),
+        ("METADATA_READ_CONCURRENCY", "16"),
     ] {
         assert_eq!(
             notes.get(key).map(String::as_str),
@@ -394,6 +399,16 @@ fn create_rejects_each_invalid_tuning_value() {
             "a number greater than 0 and at most 1",
         ),
         ("DATAFUSION_THREADING_MODE", "garbage", "AUTO or FIXED"),
+        (
+            "METADATA_READ_CONCURRENCY",
+            "0",
+            "a whole number from 1 to 255",
+        ),
+        (
+            "METADATA_READ_CONCURRENCY",
+            "2.5",
+            "a whole number from 1 to 255",
+        ),
         ("ALLOW_HTTP", "yes", "TRUE or FALSE"),
     ] {
         let mut props = base_props();
@@ -580,6 +595,10 @@ fn set_properties_rejects_problems_and_keeps_the_schema() {
                 "a number greater than 0 and at most 1",
             ),
         ),
+        (
+            "SET METADATA_READ_CONCURRENCY = '0'",
+            invalid_value("METADATA_READ_CONCURRENCY", "0", &whole_number("1", "255")),
+        ),
     ] {
         let sql = format!("ALTER VIRTUAL SCHEMA {VS} {statement}");
         let msg = query_error(&mut conn, &sql);
@@ -618,7 +637,8 @@ fn persist_stray_properties(conn: &mut ExaConn) {
          {STUB_ADAPTER_SCHEMA}.{ADAPTER_SCRIPT_NAME} AS\n{PERSISTING_ADAPTER_BODY}\n/"
     ));
     conn.execute(&format!(
-        "ALTER VIRTUAL SCHEMA {STRAY_VS} SET {STRAY_NAME} = 'x' MEMORY_POOL_FRACTION = '60'"
+        "ALTER VIRTUAL SCHEMA {STRAY_VS} SET {STRAY_NAME} = 'x' MEMORY_POOL_FRACTION = '60' \
+         METADATA_READ_CONCURRENCY = '0'"
     ));
     create_schema_and_scripts_in(conn, STUB_ADAPTER_SCHEMA);
 }
@@ -657,17 +677,25 @@ fn stray_persisted_properties_block_refresh_but_not_queries() {
                 "MEMORY_POOL_FRACTION",
                 "60",
                 "a number greater than 0 and at most 1"
+            ))
+            && msg.contains(&invalid_value(
+                "METADATA_READ_CONCURRENCY",
+                "0",
+                &whole_number("1", "255")
             )),
         "REFRESH must list every stray property: {msg}"
     );
     assert_eq!(conn.query_scalar_i64(&count), SEED_TOTAL_ROWS as i64);
 
     conn.execute(&format!(
-        "ALTER VIRTUAL SCHEMA {STRAY_VS} SET {STRAY_NAME} = null MEMORY_POOL_FRACTION = null"
+        "ALTER VIRTUAL SCHEMA {STRAY_VS} SET {STRAY_NAME} = null MEMORY_POOL_FRACTION = null \
+         METADATA_READ_CONCURRENCY = null"
     ));
     let persisted = persisted_properties(&mut conn, STRAY_VS);
     assert!(
-        !persisted.contains_key(STRAY_NAME) && !persisted.contains_key("MEMORY_POOL_FRACTION"),
+        !persisted.contains_key(STRAY_NAME)
+            && !persisted.contains_key("MEMORY_POOL_FRACTION")
+            && !persisted.contains_key("METADATA_READ_CONCURRENCY"),
         "SET ... = null must remove the stray properties: {persisted:?}"
     );
     conn.execute(&refresh);

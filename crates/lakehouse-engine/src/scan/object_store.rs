@@ -258,21 +258,19 @@ fn apply_admission_limit<T: ObjectStore>(
     }
 }
 
-/// Unmeasured, deliberately conservative default.
-pub(crate) const DIRECT_STORAGE_ADMISSION_LIMIT: usize = 16;
-
 /// Derives the idle-connection budget from the admission cap so the two knobs never drift apart.
 pub(crate) fn build_admission_limited_store(
     backend: &StorageBackend,
     store_url: &Url,
+    admission_limit: usize,
     all_secrets: &[&str],
 ) -> Result<Arc<dyn ObjectStore>, UdfError> {
     build_undecorated_store(
         backend,
         store_url,
         StoreBounds {
-            connection_budget: DIRECT_STORAGE_ADMISSION_LIMIT,
-            admission_limit: Some(DIRECT_STORAGE_ADMISSION_LIMIT),
+            connection_budget: admission_limit,
+            admission_limit: Some(admission_limit),
         },
         all_secrets,
     )

@@ -9,7 +9,9 @@ use super::*;
 use crate::adapter::column_notes::TableNotes;
 use crate::adapter::pushdown::test_support::connection_storage;
 use iceberg::spec::{DataContentType, DataFileFormat};
-use lakehouse_catalog::{ConnectionCreds, StorageBackend, TableFormat};
+use lakehouse_catalog::{
+    ConnectionCreds, DEFAULT_METADATA_READ_CONCURRENCY, StorageBackend, TableFormat,
+};
 
 fn name_mapped_load_table_body() -> Json {
     load_table_body(serde_json::json!({
@@ -45,7 +47,12 @@ async fn resolve_rest(
     };
     let connection = connection_storage(storage, creds);
     resolve_from_notes(
-        IcebergTable::from_rest(&session, &catalog_props, &connection),
+        IcebergTable::from_rest(
+            &session,
+            &catalog_props,
+            &connection,
+            DEFAULT_METADATA_READ_CONCURRENCY,
+        ),
         &involved_notes("T", &notes),
         filter_json,
     )
@@ -246,7 +253,7 @@ async fn an_unreadable_manifest_list_fails_planning_naming_its_cause() {
         .build()
         .expect("table");
 
-    let error = plan_file_tasks(table, "db.t", None, &[])
+    let error = plan_file_tasks(table, "db.t", None, DEFAULT_METADATA_READ_CONCURRENCY, &[])
         .await
         .expect_err("an unreadable manifest list must fail planning");
 
@@ -1198,7 +1205,7 @@ async fn resolve_metadata_file(
     storage: &StorageBackend,
 ) -> Result<ResolvedScan, UdfError> {
     resolve_from_notes(
-        IcebergTable::from_metadata_file(table, storage),
+        IcebergTable::from_metadata_file(table, storage, DEFAULT_METADATA_READ_CONCURRENCY),
         notes,
         None,
     )
