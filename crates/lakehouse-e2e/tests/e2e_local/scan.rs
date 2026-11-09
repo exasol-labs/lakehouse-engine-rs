@@ -20,7 +20,10 @@ use crate::common::seed::{
     initdef_columns, seed_added_columns_initial_default, seed_renamed_column,
     typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev, typed_id_avg_stddev,
 };
-use crate::common::stack::{exasol_container, iceberg_catalog_url, iceberg_catalog_url_internal};
+use crate::common::stack::{
+    CatalogConnectionPassword, build_create_connection_sql, exasol_container, iceberg_catalog_url,
+    iceberg_catalog_url_internal, local_stack_connection_password,
+};
 use crate::common::timestamp_precision::{
     ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
 };
@@ -1119,10 +1122,13 @@ fn order_by_without_limit_falls_back_correctly() {
 
 /// Scenario: createVirtualSchema adapterNotes omit the cluster node count
 /// Scenario: Adapter derives the per-node core count from available_parallelism() on every request
+/// Scenario: The Iceberg REST catalog prefix is recorded at schema level
 #[test]
-fn create_vs_omits_cluster_nodes_from_adapter_notes() {
+fn schema_notes_hold_the_tuning_keys_and_the_catalog_prefix() {
     const NOTES_VS: &str = "LHVS_NOTE_KEYS";
-    const EXPECTED_KEYS: [&str; 10] = [
+    const NOTES_DIRECT_CONN: &str = "LHVS_NOTE_KEYS_DIRECT";
+    const EXPECTED_KEYS: [&str; 11] = [
+        "CATALOG_PREFIX",
         "DF_BATCH_SIZE",
         "DF_TARGET_PARTITIONS",
         "DF_THREADING_MODE",
@@ -1145,8 +1151,12 @@ fn create_vs_omits_cluster_nodes_from_adapter_notes() {
         keys.sort_unstable();
         assert_eq!(
             keys, EXPECTED_KEYS,
-            "ADAPTER_NOTES after {after} must hold exactly the tuning keys and SKIPPED_TABLES, \
-             with no node count or core count: {notes:?}"
+            "ADAPTER_NOTES after {after} must hold exactly the tuning keys, SKIPPED_TABLES, \
+             and CATALOG_PREFIX, with no node count or core count: {notes:?}"
+        );
+        assert_eq!(
+            notes["CATALOG_PREFIX"], "",
+            "{after}: the local REST catalog serves an empty prefix"
         );
     };
 
@@ -1157,6 +1167,24 @@ fn create_vs_omits_cluster_nodes_from_adapter_notes() {
         "ALTER VIRTUAL SCHEMA {NOTES_VS} SET PARALLELISM_FACTOR = '1'"
     ));
     assert_exact_keys(&mut conn, "SET");
+
+    conn.execute(&build_create_connection_sql(
+        NOTES_DIRECT_CONN,
+        "s3://warehouse/lhvs_note_keys/",
+        &CatalogConnectionPassword {
+            warehouse: String::new(),
+            ..local_stack_connection_password()
+        },
+    ));
+    conn.execute(&format!(
+        "ALTER VIRTUAL SCHEMA {NOTES_VS} SET CATALOG_KIND = 'DIRECT_STORAGE' \
+         CATALOG_CONNECTION = '{NOTES_DIRECT_CONN}'"
+    ));
+    let notes = schema_notes(&mut conn, NOTES_VS);
+    assert!(
+        !notes.contains_key("CATALOG_PREFIX"),
+        "a switch away from Iceberg REST drops the prefix: {notes:?}"
+    );
 }
 
 /// Scenario: The adapter detects the node's CPU affinity set

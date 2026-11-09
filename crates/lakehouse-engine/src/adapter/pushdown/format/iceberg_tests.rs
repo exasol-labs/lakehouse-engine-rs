@@ -36,7 +36,7 @@ async fn resolve_rest(
 ) -> Result<ResolvedScan, UdfError> {
     let notes = load_table_body_notes(&serde_json::from_str(&body).expect("a JSON body"));
     let catalog = FakeCatalog::spawn(move |_target| (200, body.clone())).await;
-    let session = CatalogSession::resolve(&catalog.uri, &creds.warehouse, creds)
+    let session = CatalogSession::resolve(&catalog.uri, &creds.warehouse, None, creds)
         .await
         .expect("the SigV4 path resolves a session without contacting the catalog");
     let catalog_props = CatalogProps {

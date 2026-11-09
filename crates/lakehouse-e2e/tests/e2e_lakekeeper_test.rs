@@ -16,7 +16,7 @@ use common::e2e_harness::{
     create_virtual_schema_with_password, declared_type, enumerated_table_names, error_text,
     exa_conn, exa_conn_redacting, expected_join_rows, explain_virtual_sql, fetch_join_rows,
     has_broadcast_join_block, has_two_scan_wrapper, install_slc, join_query, parse_int,
-    projection_rows, runtime, upload_so, value_to_string,
+    projection_rows, runtime, schema_notes, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
@@ -1527,6 +1527,8 @@ fn a_union_statement_checks_every_table_its_pushdowns_read() {
 /// Scenario: One batch-check per pushdown decides every table that no earlier pushdown of the statement checked
 /// Scenario: The Lakekeeper permission check reuses the statement's one catalog session
 /// Scenario: The pushdowns of one statement share one catalog session per virtual schema
+/// Scenario: The Iceberg REST catalog prefix is recorded at schema level
+/// Scenario: A pushdown takes the catalog prefix from the schema notes
 #[test]
 fn a_statement_sends_one_token_request_and_one_batch_check_per_new_table() {
     create_proxy_virtual_schema();
@@ -1546,6 +1548,13 @@ fn a_statement_sends_one_token_request_and_one_batch_check_per_new_table() {
     let first = format!("SELECT 1 FROM {events} WHERE ID <= 5");
     let again = format!("SELECT 1 FROM {events} WHERE ID > 15");
     let further = format!("SELECT 1 FROM {dim}");
+    let prefix = lakekeeper::warehouse_prefix(WAREHOUSE_AUTHZ);
+    let loads_events = events_load_table_get(&prefix);
+    assert_eq!(
+        schema_notes(&mut exa_conn(), VS_PROXY).get("CATALOG_PREFIX"),
+        Some(&Value::String(prefix)),
+        "the create stores Lakekeeper's non-empty prefix"
+    );
     // Each branch filters its own rows, so every branch is a pushdown of its own. Re-checking
     // every table a pushdown reads would send one batch-check per pushdown instead.
     let cases = [
@@ -1568,7 +1577,7 @@ fn a_statement_sends_one_token_request_and_one_batch_check_per_new_table() {
                 token.as_str(),
                 &format!("GET {}/v1/config", proxy_catalog_uri()),
                 batch_check.as_str(),
-                events_load_table_get().as_str(),
+                loads_events.as_str(),
             ],
             || rows = connect_as(ALLOWED_USER).query_scalar_i64(&sql),
         );
@@ -1576,9 +1585,10 @@ fn a_statement_sends_one_token_request_and_one_batch_check_per_new_table() {
         assert_eq!(rows, expected_rows, "{shape}: rows");
         assert_eq!(
             [tokens, configs, batch_checks, loads],
-            [1, 1, expected_batch_checks, 1],
-            "{shape}: one token POST, one /v1/config GET, one batch-check POST per table no \
-             earlier pushdown checked, and one loadTable GET of the events table"
+            [1, 0, expected_batch_checks, 1],
+            "{shape}: one token POST, no /v1/config GET, one batch-check POST per table no \
+             earlier pushdown checked, and one loadTable GET of the events table on the stored \
+             prefix"
         );
     }
 }
@@ -1639,8 +1649,12 @@ fn token_post() -> String {
     )
 }
 
-fn events_load_table_get() -> String {
-    format!("/namespaces/{E2E_NAMESPACE}/tables/{E2E_TABLE}?")
+/// Carries Lakekeeper's own prefix, so a load on any other prefix is not counted.
+fn events_load_table_get(prefix: &str) -> String {
+    format!(
+        "GET {}/v1/{prefix}/namespaces/{E2E_NAMESPACE}/tables/{E2E_TABLE}?",
+        proxy_catalog_uri()
+    )
 }
 
 /// Scenario: Absent CATALOG_KIND resolves the Iceberg REST catalog kind
@@ -1658,8 +1672,9 @@ fn a_create_without_catalog_kind_lists_on_one_grant_and_reads_through_load_table
             &lakekeeper_connection_password(WAREHOUSE_AUTHZ, false).via_proxy(),
         );
     });
+    let loads_events = events_load_table_get(&lakekeeper::warehouse_prefix(WAREHOUSE_AUTHZ));
     let mut rows = 0;
-    let [loads] = stack::count_proxy_requests([events_load_table_get().as_str()], || {
+    let [loads] = stack::count_proxy_requests([loads_events.as_str()], || {
         rows = sys.query_scalar_i64(&format!(
             "SELECT COUNT(*) FROM {vs}.{}",
             E2E_TABLE.to_uppercase()

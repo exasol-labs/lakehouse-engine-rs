@@ -1168,7 +1168,7 @@ pub(crate) async fn pushdown_over(
     join_broadcast_max_bytes: u64,
 ) -> Result<Json, UdfError> {
     let connection = resolved_connection(kind, catalog_uri, storage, unauthenticated_creds());
-    let statement = StatementCatalog::open(connection, &get_properties(request))?;
+    let statement = StatementCatalog::open(connection, &get_properties(request), None)?;
     let catalog = CatalogProps {
         warehouse: "wh".into(),
         table: table.into(),
@@ -1200,7 +1200,8 @@ pub(crate) fn statement_over(
     storage: StorageBackend,
 ) -> StatementCatalog {
     let connection = resolved_connection(kind, catalog_uri, storage, unauthenticated_creds());
-    StatementCatalog::open(connection, &Json::Null).expect("the catalog client issues no request")
+    StatementCatalog::open(connection, &Json::Null, None)
+        .expect("the catalog client issues no request")
 }
 
 /// A CONNECTION's storage view that allows HTTP.
