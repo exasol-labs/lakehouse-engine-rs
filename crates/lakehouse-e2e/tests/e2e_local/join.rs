@@ -1183,15 +1183,53 @@ fn like_join_query(vs_name: &str, filter: &str) -> String {
 
 /// A LIKE over the join column `O_CUSTKEY`, an integer DECIMAL.
 const CUSTKEY_LIKE: &str = "o.O_CUSTKEY LIKE '1%'";
+/// Matches the first nine order dates as the default `NLS_DATE_FORMAT` writes them, and no date
+/// under `DMY`.
 const ORDERDATE_LIKE: &str = "o.O_ORDERDATE LIKE '2024-01-0%'";
+const DEFAULT_SESSION: &str = "";
+const DMY: &str = "NLS_DATE_FORMAT = 'DD.MM.YYYY'";
+/// [`ORDERDATE_LIKE`] for dates written under `DMY`, so it matches no date by default.
+const ORDERDATE_LIKE_DMY: &str = "o.O_ORDERDATE LIKE '0_.01.2024'";
 
 fn custkey_like(custkey: &str) -> bool {
     custkey.starts_with('1')
 }
 
-/// The default `NLS_DATE_FORMAT` writes `YYYY-MM-DD`.
-fn orderdate_like(orderdate: &str) -> bool {
-    orderdate.starts_with("2024-01-0")
+/// Holds native copies of the fact and dimension tables under their virtual names, so a join
+/// query that names its schema `{T}` runs over either.
+const JOIN_ORACLE: &str = "JOIN_ORACLE";
+
+fn copy_join_tables_natively(conn: &mut ExaConn) {
+    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {JOIN_ORACLE}"));
+    for (native, virtual_table) in [
+        (vs_fact_table(JOIN_ORACLE), vs_fact_table(VS_NAME)),
+        (vs_dim_table(JOIN_ORACLE), vs_dim_table(VS_NAME)),
+    ] {
+        conn.execute(&format!(
+            "CREATE OR REPLACE TABLE {native} AS SELECT * FROM {virtual_table}"
+        ));
+    }
+}
+
+/// `query` names its schema `{T}`. Over `vs_name` it must return what it returns natively and
+/// take the N-scan fallback, whose pushdown statement this returns.
+#[track_caller]
+fn assert_n_scan_join_matches_native(conn: &mut ExaConn, vs_name: &str, query: &str) -> String {
+    let path = PathCheck::NScan(2);
+    if let Some(failure) = native_copy_mismatch(conn, vs_name, JOIN_ORACLE, query, path) {
+        panic!("{failure}");
+    }
+    isolated_pushdown_statement(conn, &query.replace("{T}", vs_name))
+}
+
+/// Proves `query`, which names its schema `{T}`, cannot match its native result vacuously.
+#[track_caller]
+fn assert_narrows_fact_table(conn: &mut ExaConn, query: &str) {
+    let native_rows = conn.query_row_count(&query.replace("{T}", JOIN_ORACLE));
+    assert!(
+        native_rows > 0 && native_rows < FACT_ORDERS_ROWS as i64,
+        "{query} must narrow the fact table, got {native_rows} rows natively"
+    );
 }
 
 /// The oracle applies the filter in the test process, so no engine render computes it.
@@ -1220,7 +1258,7 @@ fn e2e_broadcast_like_on_decimal_column_stays_broadcast_and_filters() {
     let query = like_join_query(VS_NAME, CUSTKEY_LIKE);
     let pushed = explain_virtual_sql(&mut conn, &query);
     assert!(has_broadcast_join_block(&pushed), "{pushed}");
-    assert!(pushed.contains(r#""filter":""#), "{pushed}");
+    assert!(pushed.contains(SCAN_FILTER), "{pushed}");
 
     assert_join_rows_kept(&mut conn, VS_NAME, &query, |custkey, _| {
         custkey_like(custkey)
@@ -1231,18 +1269,22 @@ fn e2e_broadcast_like_on_decimal_column_stays_broadcast_and_filters() {
 #[test]
 fn e2e_broadcast_like_on_date_column_falls_back_and_filters() {
     setup_e2e();
-    let mut conn = exa_conn();
+    copy_join_tables_natively(&mut exa_conn());
 
-    let query = like_join_query(VS_NAME, ORDERDATE_LIKE);
-    let pushed = explain_virtual_sql(&mut conn, &query);
-    assert!(has_two_scan_wrapper(&pushed), "{pushed}");
-    assert!(!pushed.contains(r#""filter":""#), "{pushed}");
-    assert!(
-        pushed.contains("LIKE"),
-        "the outer WHERE applies the LIKE: {pushed}"
-    );
-
-    assert_join_rows_kept(&mut conn, VS_NAME, &query, |_, date| orderdate_like(date));
+    for (setting, own_format_filter) in
+        [(DEFAULT_SESSION, ORDERDATE_LIKE), (DMY, ORDERDATE_LIKE_DMY)]
+    {
+        let mut conn = exa_session(setting);
+        assert_narrows_fact_table(&mut conn, &like_join_query("{T}", own_format_filter));
+        for filter in [ORDERDATE_LIKE, ORDERDATE_LIKE_DMY] {
+            let query = like_join_query("{T}", filter);
+            let pushed = assert_n_scan_join_matches_native(&mut conn, VS_NAME, &query);
+            assert!(
+                !pushed.contains(SCAN_FILTER) && pushed.contains(r#"."O_ORDERDATE" LIKE"#),
+                "[{setting}] the outer WHERE, not a scan, applies {filter}: {pushed}"
+            );
+        }
+    }
 }
 
 /// Scenario: An N-scan leg filter keeps the conjuncts the scan computes
@@ -1250,18 +1292,24 @@ fn e2e_broadcast_like_on_date_column_falls_back_and_filters() {
 fn e2e_n_scan_leg_keeps_its_computed_conjunct_beside_a_declined_one() {
     setup_e2e();
     let mut conn = exa_conn();
+    copy_join_tables_natively(&mut conn);
 
-    let query = like_join_query(VS_NAME_LOW, &format!("{CUSTKEY_LIKE} AND {ORDERDATE_LIKE}"));
-    let pushed = explain_virtual_sql(&mut conn, &query);
-    assert!(has_two_scan_wrapper(&pushed), "{pushed}");
+    let query = like_join_query("{T}", &format!("{CUSTKEY_LIKE} AND {ORDERDATE_LIKE}"));
+    assert_narrows_fact_table(&mut conn, &query);
+    let pushed = assert_n_scan_join_matches_native(&mut conn, VS_NAME_LOW, &query);
+
+    // A scan-spec filter doubles the quotes of its literals, and `'1%'` also occurs inside `''1%''`.
+    let count = |needle: &str| pushed.matches(needle).count();
     assert!(
-        pushed.contains(r#""filter":""#) && pushed.contains(r#"."O_ORDERDATE" LIKE"#),
-        "the integer LIKE filters in its leg and the DATE LIKE in the outer WHERE: {pushed}"
+        count(SCAN_FILTER) == 1 && count("''1%''") == 1 && count("'1%'") == 1,
+        "the integer LIKE must filter once, in its leg's scan, and nowhere else: {pushed}"
     );
-
-    assert_join_rows_kept(&mut conn, VS_NAME_LOW, &query, |custkey, date| {
-        custkey_like(custkey) && orderdate_like(date)
-    });
+    assert!(
+        count("''2024-01-0%''") == 0
+            && count(r#"."O_ORDERDATE" LIKE '2024-01-0%'"#) == 1
+            && count("'2024-01-0%'") == 1,
+        "the DATE LIKE must filter once, in the outer WHERE, and nowhere else: {pushed}"
+    );
 }
 
 #[test]
@@ -1313,8 +1361,8 @@ fn e2e_join_instr_with_start_position_returns_native_result() {
     );
 }
 
-/// Exasol drops an all-zero fractional part (#211); asserts the seed invariant so a
-/// non-zero scale digit fails here rather than silently changing the oracle.
+/// Exasol writes a whole DECIMAL without its zero fraction, so the oracle is the integer part;
+/// asserts the seed keeps every value whole.
 fn expected_totalprice_text(order_key: usize) -> String {
     let divisor = 10_i64
         .pow(u32::try_from(O_TOTALPRICE_PS.1).expect("the O_TOTALPRICE scale is non-negative"));
@@ -1932,8 +1980,8 @@ fn e2e_three_leg_self_join_matches_single_node() {
     assert_eq!(
         actual.len(),
         FACT_ORDERS_ROWS,
-        "expected {FACT_ORDERS_ROWS} self-matched rows, not the pre-fix \
-         three-way cross product of {}: {actual:?}",
+        "expected {FACT_ORDERS_ROWS} self-matched rows, not the three-way cross \
+         product of {}: {actual:?}",
         FACT_ORDERS_ROWS * FACT_ORDERS_ROWS * FACT_ORDERS_ROWS
     );
     assert_eq!(

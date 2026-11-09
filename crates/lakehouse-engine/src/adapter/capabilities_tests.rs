@@ -59,10 +59,10 @@ fn reports_group_by_capabilities() {
         detection.group_keys
     );
     assert_eq!(
-        detection.plans.len(),
+        detection.aggregates.plans.len(),
         1,
         "backing path must detect the aggregate over the tuple keys: {:?}",
-        detection.plans
+        detection.aggregates.plans
     );
 
     assert!(

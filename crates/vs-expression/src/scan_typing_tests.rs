@@ -23,10 +23,13 @@ fn render(expr: &Json) -> Result<String, UdfError> {
     render_scan_expression(expr, &columns()).map(|fragment| fragment.sql)
 }
 
+/// Exasol converts these by the session's NLS settings: a date or non-integer number at a text
+/// position, or text compared with a date or number.
 #[test]
-fn session_formatted_sources_decline_at_every_text_position() {
+fn session_dependent_text_conversions_decline() {
+    let mut cases: Vec<(String, Json)> = Vec::new();
     for source in ["D", "TS", "F", "N"] {
-        let cases = [
+        let positions = [
             (
                 "explicit CAST",
                 cast_to(ExasolType::WIDEST_VARCHAR, col(source)),
@@ -48,13 +51,28 @@ fn session_formatted_sources_decline_at_every_text_position() {
                 ),
             ),
         ];
-        for (position, expr) in cases {
-            assert!(
-                render(&expr).is_err(),
-                "{source} as {position} must decline, rendered {:?}",
-                render(&expr)
-            );
-        }
+        cases.extend(positions.map(|(position, expr)| (format!("{source} as {position}"), expr)));
+    }
+    for (column, value) in [
+        ("D", "2024-01-01"),
+        ("TS", "2024-01-01"),
+        ("N", "2024-01-01"),
+        ("F", "2024-01-01"),
+        ("I", "2024-01-01"),
+        ("I", "3.5"),
+        ("N", "3"),
+    ] {
+        cases.push((
+            format!("{column} = '{value}'"),
+            predicate_equal(col(column), str_lit(value)),
+        ));
+    }
+    for (label, expr) in cases {
+        assert!(
+            render(&expr).is_err(),
+            "{label} must decline, rendered {:?}",
+            render(&expr)
+        );
     }
 }
 
@@ -162,10 +180,33 @@ fn integer_and_text_sources_keep_their_pushdown() {
 
 #[test]
 fn a_computed_integer_converts_like_a_column() {
-    let sum = scalar_fn("ADD", [col("I"), num_lit(2023)]);
-    assert!(render(&cast_to(ExasolType::WIDEST_VARCHAR, sum)).is_ok());
-    let quotient = scalar_fn("FLOAT_DIV", [col("I"), num_lit(2)]);
-    assert!(render(&cast_to(ExasolType::WIDEST_VARCHAR, quotient)).is_err());
+    let to_text = |expr| cast_to(ExasolType::WIDEST_VARCHAR, expr);
+    let cases = [
+        (
+            "integer sum",
+            to_text(scalar_fn("ADD", [col("I"), num_lit(2023)])),
+            true,
+        ),
+        (
+            "quotient",
+            to_text(scalar_fn("FLOAT_DIV", [col("I"), num_lit(2)])),
+            false,
+        ),
+        (
+            "EXTRACT YEAR",
+            scalar_fn("CONCAT", [extract("YEAR", col("D")), str_lit("x")]),
+            true,
+        ),
+        (
+            "EXTRACT SECOND",
+            scalar_fn("CONCAT", [extract("SECOND", col("TS")), str_lit("x")]),
+            false,
+        ),
+    ];
+    for (label, expr, pushed) in cases {
+        let rendered = render(&expr);
+        assert_eq!(rendered.is_ok(), pushed, "{label}: {rendered:?}");
+    }
 }
 
 #[test]
@@ -184,28 +225,40 @@ fn text_casts_to_shorter_or_ascii_varchar_unchecked_and_decline_char() {
         (
             "text to shorter VARCHAR",
             ExasolType::varchar(10),
-            "S",
+            col("S"),
             true,
         ),
-        ("text to ASCII", ascii(2_000_000), "S", true),
-        ("text to CHAR", ExasolType::char(10), "S", false),
+        ("text to ASCII", ascii(2_000_000), col("S"), true),
+        ("text to CHAR", ExasolType::char(10), col("S"), false),
         (
             "integer to fitting VARCHAR",
             ExasolType::varchar(10),
-            "I",
+            col("I"),
             true,
         ),
-        ("integer to fitting ASCII", ascii(10), "I", true),
+        ("integer to fitting ASCII", ascii(10), col("I"), true),
         (
             "integer to short VARCHAR",
             ExasolType::varchar(9),
-            "I",
+            col("I"),
             false,
         ),
-        ("integer to CHAR", ExasolType::char(10), "I", false),
+        ("integer to CHAR", ExasolType::char(10), col("I"), false),
+        (
+            "integer literal to fitting VARCHAR",
+            ExasolType::varchar(6),
+            num_lit(12345),
+            true,
+        ),
+        (
+            "integer literal to short VARCHAR",
+            ExasolType::varchar(3),
+            num_lit(12345),
+            false,
+        ),
     ];
-    for (label, target, column, pushed) in cases {
-        let rendered = render(&cast_to(target, col(column)));
+    for (label, target, source, pushed) in cases {
+        let rendered = render(&cast_to(target, source));
         assert_eq!(rendered.is_ok(), pushed, "{label}: {rendered:?}");
     }
     assert_eq!(
@@ -232,27 +285,6 @@ fn text_parsed_by_session_settings_declines() {
 fn a_comparison_without_text_conversion_is_untouched() {
     let filter = compare("predicate_less", col("D"), date_lit("2025-01-01"));
     assert_eq!(render(&filter).unwrap(), r#"("D" < DATE '2025-01-01')"#);
-}
-
-#[test]
-fn comparing_text_with_a_date_or_number_declines() {
-    for column in ["D", "TS", "N", "F", "I"] {
-        let filter = predicate_equal(col(column), str_lit("2024-01-01"));
-        assert!(render(&filter).is_err(), "{column} = text must decline");
-    }
-    let filter = predicate_equal(col("S"), str_lit("2024-01-01"));
-    assert!(render(&filter).is_ok());
-}
-
-#[test]
-fn text_against_a_non_integer_or_a_non_digit_literal_declines() {
-    let filter = |column: &str, value: &str| predicate_equal(col(column), str_lit(value));
-    for (column, value) in [("I", "3.5"), ("N", "3"), ("D", "2024-01-01")] {
-        assert!(
-            render(&filter(column, value)).is_err(),
-            "{column} = '{value}' must decline"
-        );
-    }
 }
 
 #[test]
@@ -324,6 +356,8 @@ fn text_converted_implicitly_outside_a_comparison_declines() {
         ),
         ("EXTRACT", extract("YEAR", str_lit("2024-01-01"))),
         ("boolean operand", and([str_lit("TRUE"), bool_lit(true)])),
+        ("SUM", agg_item("SUM", Some("S"), false)),
+        ("AVG", agg_item("AVG", Some("S"), false)),
     ];
     for (label, expr) in cases {
         assert!(render(&expr).is_err(), "{label} must decline");
@@ -360,6 +394,10 @@ fn text_where_exasol_takes_text_keeps_its_pushdown() {
         (
             "integer and digits",
             predicate_equal(col("I"), str_lit("3")),
+        ),
+        (
+            "text and date-shaped text",
+            predicate_equal(col("S"), str_lit("2024-01-01")),
         ),
     ];
     for (label, expr) in cases {

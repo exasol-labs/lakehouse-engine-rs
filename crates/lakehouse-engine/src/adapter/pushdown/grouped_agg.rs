@@ -6,9 +6,9 @@ use serde_json::Value as Json;
 use vs_expression::{ColumnNode, SqlFragment, render_exasol_fragment};
 
 use super::scalar_over_agg::{
-    cast_merge_items, classify_scalar_over_aggregate, col_type_for, fold_aggregate_plan,
-    fold_nested_plans, parse_agg_item, partial_column_type, render_scalar_over_merge,
-    with_stat_grand_means,
+    TypedPlans, classify_scalar_over_aggregate, col_type_for, fold_aggregate_plan,
+    fold_nested_plans, is_aggregate_node, parse_agg_item, partial_column_type,
+    render_scalar_over_merge, substitute_subtrees, with_stat_grand_means,
 };
 use super::support::{
     ColumnTypes, PushdownRequest, ScanTranslator, build_fan_out_inner, output_select_list,
@@ -56,12 +56,9 @@ pub struct GroupedAggregateDetection {
     pub group_keys: Vec<String>,
     /// Aligned 1:1 with `group_keys`: the type each `GK_i` is emitted, merged, and output in.
     pub group_key_types: Vec<ExasolType>,
-    /// Deduplicated by `AggregatePlan` equality across top-level and nested occurrences.
-    pub plans: Vec<AggregatePlan>,
-    /// Aligned 1:1 with `plans`, not with the `selectList`.
-    pub plan_types: Vec<ExasolType>,
-    /// Aligned 1:1 with `plans`: each merged aggregate cast to its native type.
-    pub merged: Vec<String>,
+    /// Deduplicated by `AggregatePlan` equality across top-level and nested occurrences, and
+    /// aligned with `plan_slot`, not with the `selectList`.
+    pub aggregates: TypedPlans,
     pub select_items: Vec<GroupedSelectItem>,
 }
 
@@ -163,14 +160,11 @@ pub fn detect_group_by_aggregates(
     // Typed here, before the shape is chosen, so a key or nested aggregate without an exact
     // type declines the split, and HAVING and ORDER BY can reference typed `GK_*` keys.
     let group_key_types = group_key_exasol_types(pushdown, &key_fragments, &select_items)?;
-    let plan_types: Vec<ExasolType> = plan_types.into_iter().collect::<Option<_>>()?;
-    let merged = cast_merge_items(&plans, &plan_types, scan.columns());
+    let aggregates = TypedPlans::new(plans, plan_types, scan.columns())?;
     Some(GroupedAggregateDetection {
         group_keys,
         group_key_types,
-        plans,
-        plan_types,
-        merged,
+        aggregates,
         select_items,
     })
 }
@@ -214,16 +208,19 @@ fn group_key_exasol_types(
 /// What HAVING and ORDER BY over the merge can reference: the merged aggregates and the `GK_*`
 /// keys, which travel typed.
 pub(super) struct MergeScope<'a> {
-    pub plans: &'a [AggregatePlan],
-    /// Aligned with `plans` and cast to each aggregate's native type, so an outer scalar or
-    /// comparison sees the type Exasol would (#476).
-    pub merged: &'a [String],
+    /// Each merge cast to its aggregate's native type, so an outer scalar or comparison sees the
+    /// type Exasol would (#476).
+    pub aggregates: &'a TypedPlans,
     /// Rendered scan fragments, aligned with `GK_*`; empty for a single-group aggregate.
     pub group_keys: &'a [String],
 }
 
+fn group_key_name(slot: usize) -> String {
+    format!("GK_{slot}")
+}
+
 fn group_key_column(slot: usize) -> String {
-    format!(r#""GK_{slot}""#)
+    quote_ident(&group_key_name(slot))
 }
 
 /// Exasol does not re-sort a delegated `ORDER BY`, so the merge must sort itself.
@@ -278,15 +275,13 @@ pub(super) enum GroupedOrderBy {
     Unresolvable,
 }
 
-// Two call sites and every argument is a distinct resolved plan input.
+// Every argument is a distinct resolved plan input.
 #[allow(clippy::too_many_arguments)]
 pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
     shards: &[Vec<E>],
     group_key_types: &[ExasolType],
-    aggregates: &[AggregatePlan],
-    aggregate_types: &[ExasolType],
-    merge_items: &[String],
+    aggregates: &TypedPlans,
     select_items: &[GroupedSelectItem],
     select_types: &[ExasolType],
     limit: Option<u64>,
@@ -303,7 +298,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
         .enumerate()
         .map(|(i, ty)| format!("{} {ty}", group_key_column(i)))
         .collect();
-    let partial_items = partial_emits_items(aggregates, scan.columns(), aggregate_types);
+    let partial_items = partial_emits_items(&aggregates.plans, scan.columns(), &aggregates.types);
     let all_emits: Vec<String> = gk_emits
         .iter()
         .chain(partial_items.iter())
@@ -323,12 +318,12 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
                 group_key_types.get(*group_key_slot).copied(),
             )),
             GroupedSelectItem::Aggregate { plan_slot, .. } => Some(SqlFragment::new(
-                merge_items.get(*plan_slot)?.clone(),
-                aggregate_types.get(*plan_slot).copied(),
+                aggregates.merged.get(*plan_slot)?.clone(),
+                aggregates.types.get(*plan_slot).copied(),
             )),
             GroupedSelectItem::Constant { projection, .. } => Some(projection.clone()),
             GroupedSelectItem::ScalarOverAggregate { node, .. } => {
-                render_scalar_over_merge(node, aggregates, merge_items, scan)
+                render_scalar_over_merge(node, &aggregates.plans, &aggregates.merged, scan)
             }
         })
         .collect::<Option<Vec<_>>>()?;
@@ -349,7 +344,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
         distribute_udf_name,
     );
 
-    let from = with_stat_grand_means(&fan_out, aggregates, &outer_group_by);
+    let from = with_stat_grand_means(&fan_out, &aggregates.plans, &outer_group_by);
 
     let mut sql = format!("SELECT {outer_select_str} FROM ({from}) GROUP BY {outer_group_by_str}");
 
@@ -427,8 +422,8 @@ pub(super) fn render_having_over_merge(
 
     if kind == "function_aggregate" {
         let plan = parse_agg_item(node, scan)?;
-        let idx = scope.plans.iter().position(|p| *p == plan)?;
-        return scope.merged.get(idx).cloned();
+        let idx = scope.aggregates.plans.iter().position(|p| *p == plan)?;
+        return scope.aggregates.merged.get(idx).cloned();
     }
 
     match kind {
@@ -508,10 +503,6 @@ fn render_having_operand(
     }
 }
 
-fn group_key_sentinel(slot: usize) -> String {
-    format!("__LH_GK_{slot}__")
-}
-
 /// A scalar that mixes group keys and aggregates, such as `C_QTY + SUM(ID)`: each group-key
 /// column reads its `GK_*` column. `None` while any other source column remains, because the
 /// merge has none (#551).
@@ -521,55 +512,26 @@ fn render_scalar_over_merge_with_keys(
     scan: ScanTranslator<'_>,
 ) -> Option<String> {
     let mut residual = false;
-    let substituted = sentinelize_group_keys(node, scope, scan, &mut residual);
+    // Stops at an aggregate: its argument runs in the scan, not over the merge.
+    let substituted = substitute_subtrees(node, &mut |subtree| {
+        if is_aggregate_node(subtree) {
+            return Some(subtree.clone());
+        }
+        ColumnNode::parse(subtree)?;
+        Some(match group_key_slot(subtree, scope, scan) {
+            Some(slot) => ColumnNode::to_json(&group_key_name(slot), None, None),
+            None => {
+                residual = true;
+                subtree.clone()
+            }
+        })
+    });
     if residual {
         return None;
     }
-    let mut sql = render_scalar_over_merge(&substituted, scope.plans, scope.merged, scan)?.sql;
-    for slot in 0..scope.group_keys.len() {
-        sql = sql.replace(
-            &quote_ident(&group_key_sentinel(slot)),
-            &group_key_column(slot),
-        );
-    }
-    Some(sql)
-}
-
-/// Stops at an aggregate: its argument runs in the scan, not over the merge.
-fn sentinelize_group_keys(
-    node: &Json,
-    scope: &MergeScope<'_>,
-    scan: ScanTranslator<'_>,
-    residual: &mut bool,
-) -> Json {
-    match node {
-        Json::Object(map) => {
-            if map.get("type").and_then(Json::as_str) == Some("function_aggregate") {
-                return node.clone();
-            }
-            if ColumnNode::parse(node).is_some() {
-                return match group_key_slot(node, scope, scan) {
-                    Some(slot) => ColumnNode::to_json(&group_key_sentinel(slot), None, None),
-                    None => {
-                        *residual = true;
-                        node.clone()
-                    }
-                };
-            }
-            Json::Object(
-                map.iter()
-                    .map(|(k, v)| (k.clone(), sentinelize_group_keys(v, scope, scan, residual)))
-                    .collect(),
-            )
-        }
-        Json::Array(items) => Json::Array(
-            items
-                .iter()
-                .map(|v| sentinelize_group_keys(v, scope, scan, residual))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
+    let aggregates = scope.aggregates;
+    render_scalar_over_merge(&substituted, &aggregates.plans, &aggregates.merged, scan)
+        .map(|fragment| fragment.sql)
 }
 
 fn render_having_junction(

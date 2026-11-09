@@ -182,11 +182,7 @@ fn single_group_scalar_over_aggregate_dedups_shared_inner_aggregates() {
     );
     assert_eq!(
         plans[0],
-        AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None
-        },
+        count_plan(),
         "slot 0 is the bare COUNT(*), which the nested occurrence reuses"
     );
     assert_eq!(plans[1].kind, AggKind::Sum);
@@ -403,11 +399,7 @@ fn bare_column_aggregates_unchanged_regression() {
         ("SCORE".to_string(), ExasolType::DoublePrecision),
         ("TS".to_string(), ExasolType::BARE_TIMESTAMP),
     ];
-    let sum_only = vec![AggregatePlan {
-        kind: AggKind::Sum,
-        column: Some("AMOUNT".into()),
-        arg_expr: None,
-    }];
+    let sum_only = vec![column_plan(AggKind::Sum, "AMOUNT")];
     let emits = partial_emits_items(
         &sum_only,
         &column_types(&col_types),
@@ -932,7 +924,7 @@ fn merge_select_keeps_a_scalar_cast_to_its_declared_type_uncast() {
         .build_pushdown();
     let items = detect_aggregates(&req, ScanTranslator::new(&col_types))
         .expect("CAST(SUM(col)) must decompose");
-    let plans = SingleGroupPlans::new(&items, req.select_types(), ScanTranslator::new(&col_types))
+    let plans = single_group_plans(&items, req.select_types(), ScanTranslator::new(&col_types))
         .expect("SUM over a typed column is exactly typed");
 
     assert_eq!(
@@ -960,7 +952,7 @@ fn merge_select_wraps_scalar_structure_around_the_merged_partial() {
         .build_pushdown();
     let items = detect_aggregates(&req, ScanTranslator::new(&col_types))
         .expect("ROUND(SUM(col), 2) must decompose");
-    let plans = SingleGroupPlans::new(&items, req.select_types(), ScanTranslator::new(&col_types))
+    let plans = single_group_plans(&items, req.select_types(), ScanTranslator::new(&col_types))
         .expect("SUM over a typed column is exactly typed");
 
     assert_eq!(
@@ -996,7 +988,7 @@ fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
         .build_pushdown();
     let items =
         detect_aggregates(&req, untyped_scan()).expect("an interleaved list must decompose");
-    let plans = SingleGroupPlans::new(&items, req.select_types(), untyped_scan())
+    let plans = single_group_plans(&items, req.select_types(), untyped_scan())
         .expect("every slot is exactly typed");
 
     assert_eq!(
@@ -1024,7 +1016,7 @@ fn merge_select_declines_a_list_holding_a_distinct_item() {
         .build_pushdown();
     let items =
         detect_aggregates(&req, untyped_scan()).expect("SUM + COUNT(DISTINCT) must decompose");
-    let plans = SingleGroupPlans::new(&items, req.select_types(), untyped_scan())
+    let plans = single_group_plans(&items, req.select_types(), untyped_scan())
         .expect("every slot is exactly typed");
 
     assert_eq!(
@@ -1044,7 +1036,7 @@ fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
         node,
         nested: vec![],
     }];
-    let plans = SingleGroupPlans::new(&items, &[], untyped_scan())
+    let plans = single_group_plans(&items, &[], untyped_scan())
         .expect("an unclassifiable scalar contributes no slot to type");
 
     assert_eq!(
@@ -1074,7 +1066,7 @@ fn merge_select_emits_one_item_per_selectlist_item_for_duplicate_aggregates() {
         .build_pushdown();
     let items =
         detect_aggregates(&req, untyped_scan()).expect("a duplicated aggregate must decompose");
-    let plans = SingleGroupPlans::new(&items, req.select_types(), untyped_scan())
+    let plans = single_group_plans(&items, req.select_types(), untyped_scan())
         .expect("every slot is exactly typed");
     assert_eq!(
         plans.plans.len(),

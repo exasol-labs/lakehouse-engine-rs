@@ -101,43 +101,51 @@ pub(super) fn sentinel_column_node(i: usize) -> Json {
     ColumnNode::to_json(&agg_sentinel_name(i), None, None)
 }
 
-/// Recursion stops at a `function_aggregate`, so a column inside an aggregate is
-/// not residual. `residual_column` flags a bare column outside any aggregate: the
-/// merge wrapper exposes only `GK_*`/`PARTIAL_*`, so such a node cannot render there.
+/// Copies `node`, replacing each object subtree for which `substitute` returns `Some`; the walk
+/// does not descend into a replaced subtree.
+pub(super) fn substitute_subtrees(
+    node: &Json,
+    substitute: &mut impl FnMut(&Json) -> Option<Json>,
+) -> Json {
+    match node {
+        Json::Object(map) => substitute(node).unwrap_or_else(|| {
+            Json::Object(
+                map.iter()
+                    .map(|(key, value)| (key.clone(), substitute_subtrees(value, substitute)))
+                    .collect(),
+            )
+        }),
+        Json::Array(items) => Json::Array(
+            items
+                .iter()
+                .map(|value| substitute_subtrees(value, substitute))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+pub(super) fn is_aggregate_node(node: &Json) -> bool {
+    node.get("type").and_then(Json::as_str) == Some("function_aggregate")
+}
+
+/// A column inside an aggregate is not residual. `residual_column` flags a bare column outside
+/// any aggregate: the merge wrapper exposes only `GK_*`/`PARTIAL_*`, so it cannot render there.
 pub(super) fn sentinelize_aggregates(
     node: &Json,
     aggregates: &mut Vec<Json>,
     residual_column: &mut bool,
 ) -> Json {
-    match node {
-        Json::Object(map) => match map.get("type").and_then(|t| t.as_str()) {
-            Some("function_aggregate") => {
-                let i = aggregates.len();
-                aggregates.push(node.clone());
-                sentinel_column_node(i)
-            }
-            _ => {
-                if ColumnNode::parse(node).is_some() {
-                    *residual_column = true;
-                }
-                let mut out = serde_json::Map::with_capacity(map.len());
-                for (key, value) in map {
-                    out.insert(
-                        key.clone(),
-                        sentinelize_aggregates(value, aggregates, residual_column),
-                    );
-                }
-                Json::Object(out)
-            }
-        },
-        Json::Array(items) => Json::Array(
-            items
-                .iter()
-                .map(|v| sentinelize_aggregates(v, aggregates, residual_column))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
+    substitute_subtrees(node, &mut |subtree| {
+        if is_aggregate_node(subtree) {
+            aggregates.push(subtree.clone());
+            return Some(sentinel_column_node(aggregates.len() - 1));
+        }
+        if ColumnNode::parse(subtree).is_some() {
+            *residual_column = true;
+        }
+        None
+    })
 }
 
 /// The scalar runs in Exasol over the merged aggregates, so it is checked in the Exasol dialect.
@@ -379,6 +387,34 @@ pub(super) fn merge_select_items(aggregates: &[AggregatePlan]) -> Vec<String> {
             | AggKind::Stddev => stat_merge(&plan.kind, i),
         })
         .collect()
+}
+
+/// Deduplicated aggregate plans, each with its native type and its merge expression, typed once
+/// per request.
+#[derive(Debug, Clone)]
+pub struct TypedPlans {
+    pub plans: Vec<AggregatePlan>,
+    /// Aligned with `plans`; also types the scan's `EMITS`.
+    pub types: Vec<ExasolType>,
+    /// Aligned with `plans`, cast before any outer scalar applies so `SUM(a) / 2` stays exact.
+    pub merged: Vec<String>,
+}
+
+impl TypedPlans {
+    /// `None` when any slot has no exact type: a guessed partial type breaks the merge (#476).
+    pub(super) fn new(
+        plans: Vec<AggregatePlan>,
+        types: Vec<Option<ExasolType>>,
+        col_types: &ColumnTypes,
+    ) -> Option<Self> {
+        let types: Vec<ExasolType> = types.into_iter().collect::<Option<_>>()?;
+        let merged = cast_merge_items(&plans, &types, col_types);
+        Some(Self {
+            plans,
+            types,
+            merged,
+        })
+    }
 }
 
 /// Each merged aggregate in its native type, so an outer scalar, HAVING, or the output sees the

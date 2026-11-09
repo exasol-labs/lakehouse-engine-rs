@@ -80,7 +80,7 @@ The scan computes these functions when DataFusion can render the whole filter or
 | Date / time | `FN_DATE_TRUNC`, `FN_DAY`, `FN_DAYS_BETWEEN`, `FN_EXTRACT`, `FN_HOUR`, `FN_HOURS_BETWEEN`, `FN_MINUTE`, `FN_MINUTES_BETWEEN`, `FN_MONTH`, `FN_SECOND`, `FN_SECONDS_BETWEEN`, `FN_TO_DATE`, `FN_TO_TIMESTAMP`, `FN_WEEK`, `FN_YEAR` | `WHERE YEAR(ts) = 2024` |
 | Conditional | `FN_CASE`, `FN_GREATEST`, `FN_LEAST`, `FN_NULLIFZERO`, `FN_ZEROIFNULL` | `SELECT CASE WHEN x > 0 THEN 'p' END` |
 
-`INSTR` and `LOCATE` with a start position or an occurrence run in Exasol SQL. With two arguments they run in the scan.
+`INSTR` with a start position or an occurrence, and `LOCATE` with a start position, run in Exasol SQL. With two arguments they run in the scan.
 
 ### Text and session settings
 

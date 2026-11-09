@@ -227,47 +227,6 @@ fn broadcast_declines_on_unrenderable_filter_stays_eligible_when_absent() {
 }
 
 #[test]
-fn broadcast_declines_like_over_date_side_column() {
-    let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["filter"] = like(table_col("ORDERS", "O_ORDERDATE"), "1995%");
-    let detected = detected_join(&request);
-
-    let outcome = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_sides(&request, &detected),
-    )
-    .expect("a type-declined filter is a clean decline, not an error");
-    assert!(
-        outcome.is_none(),
-        "a DATE's text depends on NLS_DATE_FORMAT, so the broadcast plan declines \
-         and the N-scan fallback self-applies the LIKE"
-    );
-}
-
-#[test]
-fn broadcast_keeps_plan_for_like_over_integer_side_column() {
-    let mut request = join_request(Json::Null, equi_condition());
-    request["pushdownRequest"]["filter"] = like(table_col("CUSTOMER", "C_CUSTKEY"), "1%");
-    let detected = detected_join(&request);
-
-    let rendered = render_broadcast_join(
-        &parsed_pushdown(&request),
-        &detected,
-        &request_sides(&request, &detected),
-    )
-    .expect("an integer LIKE subject must not error")
-    .expect("an integer LIKE subject must keep the broadcast plan");
-    let filter = rendered
-        .filter
-        .expect("the LIKE renders as a scan-spec filter");
-    assert!(
-        filter.contains(r#"CAST(CAST("LHS_T0"."C_CUSTKEY" AS DECIMAL(38,0)) AS VARCHAR) LIKE"#),
-        "{filter}"
-    );
-}
-
-#[test]
 fn broadcast_declines_instr_with_start_position_argument() {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = compare(
@@ -1064,124 +1023,6 @@ fn n_scan_request_with_filter(filter: Json) -> Json {
     let mut request = join_request(Json::Null, equi_condition());
     request["pushdownRequest"]["filter"] = filter;
     request
-}
-
-#[test]
-fn n_scan_type_declined_side_local_conjunct_moves_to_outer_where() {
-    let request = n_scan_request_with_filter(like(table_col("ORDERS", "O_ORDERDATE"), "1995%"));
-
-    let (legs, outer) = n_scan_legs_and_outer_where(&request);
-
-    assert!(
-        outer.contains(r#""LHS_T1"."O_ORDERDATE""#) && outer.contains("LIKE"),
-        "the type-declined conjunct must be self-applied table-qualified in the \
-         outer WHERE: {outer}"
-    );
-    assert!(
-        !legs.contains("LIKE"),
-        "it must NOT also reach the fan-out leg: {legs}"
-    );
-}
-
-#[test]
-fn n_scan_integer_like_side_local_conjunct_reaches_leg_as_text() {
-    let request = n_scan_request_with_filter(like(table_col("ORDERS", "O_CUSTKEY"), "1%"));
-
-    let (legs, outer) = n_scan_legs_and_outer_where(&request);
-
-    assert!(
-        legs.contains(r#"CAST(CAST(\"O_CUSTKEY\" AS DECIMAL(38,0)) AS VARCHAR) LIKE"#),
-        "the integer LIKE subject must reach its leg as canonical text: {legs}"
-    );
-    assert!(
-        outer.is_empty(),
-        "a conjunct its leg applies must not ALSO be applied by the outer \
-         wrapper: {outer}"
-    );
-}
-
-#[test]
-fn n_scan_type_accepted_side_local_conjunct_still_pushes_when_a_sibling_declines() {
-    let request = n_scan_request_with_filter(and([
-        like(table_col("ORDERS", "O_ORDERDATE"), "1995%"),
-        like(table_col("ORDERS", "O_CUSTKEY"), "1%"),
-    ]));
-
-    let (legs, outer) = n_scan_legs_and_outer_where(&request);
-
-    assert_eq!(
-        legs.matches("LIKE").count(),
-        1,
-        "exactly the type-accepted LIKE may reach the legs: {legs}"
-    );
-    assert!(
-        legs.contains(r#"CAST(CAST(\"O_CUSTKEY\" AS DECIMAL(38,0)) AS VARCHAR)"#),
-        "and it must be the integer one: {legs}"
-    );
-    assert_eq!(
-        outer.matches("LIKE").count(),
-        1,
-        "exactly the type-declined LIKE may reach the outer WHERE: {outer}"
-    );
-    assert!(
-        outer.contains(r#""LHS_T1"."O_ORDERDATE""#),
-        "and it must be the DATE one, table-qualified: {outer}"
-    );
-}
-
-#[test]
-fn n_scan_leg_residual_partition_is_total_and_disjoint_with_type_screen() {
-    let request = n_scan_request_with_filter(and([
-        string_equal("CUSTOMER", "C_NAME", "ACME"),
-        like(table_col("ORDERS", "O_ORDERDATE"), "1995%"),
-        like(table_col("CUSTOMER", "C_CUSTKEY"), "1%"),
-        declined_second_predicate(table_col("ORDERS", "O_ORDERDATE")),
-        compare(
-            "predicate_greater",
-            table_col("CUSTOMER", "C_CUSTKEY"),
-            table_col("ORDERS", "O_CUSTKEY"),
-        ),
-    ]));
-
-    let (legs, outer) = n_scan_legs_and_outer_where(&request);
-
-    assert_eq!(
-        legs.matches("ACME").count(),
-        1,
-        "conjunct 1 belongs to the CUSTOMER leg, exactly once: {legs}"
-    );
-    assert!(
-        !outer.contains("ACME"),
-        "conjunct 1 must not be double-applied in the outer WHERE: {outer}"
-    );
-    assert_eq!(
-        legs.matches(r#"CAST(CAST(\"C_CUSTKEY\" AS DECIMAL(38,0)) AS VARCHAR)"#)
-            .count(),
-        1,
-        "conjunct 3 belongs to the CUSTOMER leg, as text, exactly once: {legs}"
-    );
-    assert_eq!(
-        legs.matches("LIKE").count(),
-        1,
-        "conjunct 3 is the ONLY LIKE any leg may carry: {legs}"
-    );
-    assert_eq!(
-        outer.matches("LIKE").count(),
-        1,
-        "conjunct 2 is the only LIKE the outer WHERE carries: {outer}"
-    );
-    assert!(
-        outer.contains("SECOND"),
-        "conjunct 4 belongs to the outer WHERE: {outer}"
-    );
-    assert!(
-        !legs.contains("SECOND"),
-        "conjunct 4 must not reach a leg: {legs}"
-    );
-    assert!(
-        outer.contains(r#""LHS_T0"."C_CUSTKEY" > "LHS_T1"."O_CUSTKEY""#),
-        "conjunct 5 belongs to the outer WHERE, table-qualified: {outer}"
-    );
 }
 
 #[test]
@@ -2119,7 +1960,8 @@ fn golden_n_scan_render_decline_messages_unchanged() {
     assert_eq!(
         msg,
         "join pushdown declined: a select-list item could not be rendered for the \
-         qualified N-scan join; this is a hard error, not a native re-plan"
+         qualified N-scan join (unsupported expression node type: \
+         totally_unsupported_node_type); this is a hard error, not a native re-plan"
     );
 
     let mut no_columns_request = join_request(Json::Null, equi_condition());

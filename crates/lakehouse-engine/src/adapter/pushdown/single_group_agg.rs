@@ -2,7 +2,7 @@ use crate::scan::spec::AggregatePlan;
 use serde_json::Value as Json;
 
 use super::scalar_over_agg::{
-    arg_column_or_expr, cast_merge_items, classify_scalar_over_aggregate, fold_aggregate_plan,
+    TypedPlans, arg_column_or_expr, classify_scalar_over_aggregate, fold_aggregate_plan,
     fold_nested_plans, parse_agg_item, render_scalar_over_merge,
 };
 use super::support::{PushdownRequest, ScanTranslator, output_select_list};
@@ -72,31 +72,13 @@ pub fn detect_aggregates(
 }
 
 /// The partial plans of a single-group select list, typed and merged once per request.
-#[derive(Debug)]
-pub struct SingleGroupPlans {
-    pub plans: Vec<AggregatePlan>,
-    /// Aligned with `plans`; also types the scan's `EMITS`.
-    pub types: Vec<ExasolType>,
-    /// Aligned with `plans`, cast before any outer scalar applies so `SUM(a) / 2` stays exact.
-    pub merged: Vec<String>,
-}
-
-impl SingleGroupPlans {
-    /// `None` when any slot has no exact type (#476).
-    pub fn new(
-        items: &[SingleGroupItem],
-        select_types: &[ExasolType],
-        scan: ScanTranslator<'_>,
-    ) -> Option<Self> {
-        let (plans, types) = fold_single_group_plans(items, select_types, scan);
-        let types: Vec<ExasolType> = types.into_iter().collect::<Option<_>>()?;
-        let merged = cast_merge_items(&plans, &types, scan.columns());
-        Some(Self {
-            plans,
-            types,
-            merged,
-        })
-    }
+pub fn single_group_plans(
+    items: &[SingleGroupItem],
+    select_types: &[ExasolType],
+    scan: ScanTranslator<'_>,
+) -> Option<TypedPlans> {
+    let (plans, types) = fold_single_group_plans(items, select_types, scan);
+    TypedPlans::new(plans, types, scan.columns())
 }
 
 /// Dedup is a correctness requirement: the merge rewrite binds each nested aggregate to the
@@ -128,7 +110,7 @@ pub(super) fn fold_single_group_plans(
 /// narrower select list fails Exasol's positional validation.
 pub(super) fn single_group_merge_select(
     items: &[SingleGroupItem],
-    plans: &SingleGroupPlans,
+    plans: &TypedPlans,
     select_types: &[ExasolType],
     scan: ScanTranslator<'_>,
 ) -> Option<Vec<String>> {

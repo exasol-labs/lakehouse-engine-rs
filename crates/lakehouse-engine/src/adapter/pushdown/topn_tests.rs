@@ -6,7 +6,7 @@ use super::super::support::{
     involved_columns, order_by_present, project_columns, shard_count,
 };
 use super::super::test_support::*;
-use super::super::{SingleGroupPlans, detect_aggregates, validate_agg_col_types};
+use super::super::{detect_aggregates, single_group_plans, validate_agg_col_types};
 use super::*;
 use crate::scan::spec::{CommonScanSpec, FileEntry, ScanStorage};
 use crate::scan::test_support::WithFiles;
@@ -37,7 +37,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let scan_columns = column_types(&col_types);
     let scan = ScanTranslator::new(&scan_columns);
     let plans = detect_aggregates(&pushdown, scan).and_then(|items| {
-        let plans = SingleGroupPlans::new(&items, pushdown.select_types(), scan)?;
+        let plans = single_group_plans(&items, pushdown.select_types(), scan)?;
         validate_agg_col_types(&plans.plans, &scan_columns).then_some((items, plans))
     });
     let merge_inputs = plans.as_ref().map(|(items, plans)| {

@@ -2,7 +2,7 @@ use crate::scan::spec::ProjectionItem;
 use crate::types::exasol_type::ExasolType;
 use serde_json::Value as Json;
 use vs_expression::{
-    ColumnNode, ColumnTypeLookup, SqlFragment, conjoin_scan_filters, exact_expression_type,
+    ColumnNode, ColumnTypeLookup, conjoin_scan_filters, exact_expression_type,
     render_df_filter_exasol_safe, render_expression_exasol_safe, strip_table_alias,
     walk_column_nodes,
 };
@@ -26,17 +26,14 @@ impl ColumnTypeLookup for LegColumnTypes<'_> {
     }
 }
 
-/// A select item of the qualified wrapper: rendered leg-qualified, typed from the raw request
-/// node, whose columns still name their own tables.
-pub(super) fn render_select_item_qualified(
+/// A qualified-wrapper select item's type, read from the raw request node, whose columns still
+/// name their own tables.
+pub(super) fn select_item_type(
     item: &Json,
     legs: &JoinLegs,
     cols_per_leg: &[&ColumnTypes],
-) -> Result<Option<SqlFragment>, UnattributableColumn> {
-    let qualified = legs.qualify(item)?;
-    let types = LegColumnTypes { legs, cols_per_leg };
-    let ty = exact_expression_type(item, &types);
-    Ok(render_expression_exasol_safe(&qualified).map(|sql| SqlFragment::new(sql, ty)))
+) -> Option<ExasolType> {
+    exact_expression_type(item, &LegColumnTypes { legs, cols_per_leg })
 }
 
 pub(super) fn projection_item_select_sql(item: &ProjectionItem) -> String {

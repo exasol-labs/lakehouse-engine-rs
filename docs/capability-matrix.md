@@ -171,7 +171,7 @@ sends the query to the adapter.
 | `LENGTH` | ✓ |  |
 | `LN` | ✓ |  |
 | `LOCALTIMESTAMP` |  | The scan has no clock, time zone, or statement anchor. Exasol evaluates it once per statement. |
-| `LOCATE` | ✓ | With a start position or an occurrence, it runs in Exasol SQL. |
+| `LOCATE` | ✓ | With a start position, it runs in Exasol SQL. |
 | `LOG` | ✓ |  |
 | `LOWER` | ✓ | Non-ASCII text can differ. See [Semantic differences](semantic-differences.md). |
 | `LPAD` | ✓ |  |

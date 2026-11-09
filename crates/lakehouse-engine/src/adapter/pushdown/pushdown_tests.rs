@@ -117,11 +117,7 @@ fn catalog_auth_secrets_never_in_a_role_scan_spec() {
 fn grouped_scan_spec_carries_group_keys() {
     let group_keys = vec!["\"REGION\"".to_string(), "YEAR(\"TS\")".to_string()];
     let spec = CommonScanSpec {
-        aggregates: Some(vec![AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        }]),
+        aggregates: Some(vec![count_plan()]),
         group_keys: Some(group_keys.clone()),
         storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
@@ -756,7 +752,6 @@ fn dispatch_for_body(request: PushdownRequestBuilder) -> Result<Json, UdfError> 
     )
 }
 
-/// Scenario: A pushdown request with a missing or invalid Exasol type fails the query
 #[test]
 fn grouped_request_with_an_invalid_cast_key_type_fails() {
     let invalid = serde_json::json!({"type": "CHAR", "characterSet": "ASCII"});

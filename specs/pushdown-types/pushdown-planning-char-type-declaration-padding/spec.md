@@ -6,7 +6,7 @@ A `CHAR(n)` value returns what native Exasol returns: blank-padded to `n`, trail
 
 * Exasol declares a string-literal expression `CHAR`, not `VARCHAR`, when every branch has the same length. On Exasol 2025.2.1, `CASE WHEN c_acctbal<0 THEN 'NEG' ELSE 'POS' END` is `CHAR(3) ASCII` and `CASE WHEN id>10 THEN 'high' ELSE 'low' END` is `VARCHAR(4) ASCII`.
 * `CHAR(n)` and `CHAR(n) ASCII` are valid UDF `EMITS` output types. Exasol space-pads a shorter value emitted into a `CHAR(n)` column and rejects a longer one.
-* Exasol's `CAST(x AS CHAR(n))` drops trailing blanks beyond `n` and fails with SQL state 22001 for non-blank excess.
+* Exasol's `CAST(x AS CHAR(n))` drops trailing blanks beyond `n` and fails with a right-truncation error for non-blank excess.
 * The scan does not blank-pad, so a CAST of text to `CHAR(n)` runs in Exasol (`pushdown-types/pushdown-planning-scan-text-conversion`). A `CHAR` group key that the scan computes therefore comes only from a `CHAR` column or a `CHAR` literal expression, whose values are already `n` characters wide, and travels as a typed `CHAR(n)` `GK_i` column (`pushdown-aggregates/pushdown-planning-split-aggregate-types`).
 * `pushdown-types/pushdown-planning-char-type-declaration` covers how the `CHAR` type string is rendered.
 
@@ -26,7 +26,7 @@ A `CHAR(n)` value returns what native Exasol returns: blank-padded to `n`, trail
 * *WHEN* the query runs through the Virtual Schema
 * *THEN* Exasol SHALL apply the CAST, so each shorter value is space-padded to `n`
 * *AND* values that differ only in trailing blanks SHALL form one group, including blanks beyond `n`
-* *AND* a value with non-blank characters beyond `n` SHALL fail the statement with Exasol's right-truncation error: SQL state 22001 for a select item, as natively, and 22002 when the query groups on the CAST, because Exasol evaluates it over the scanned rows
+* *AND* a value with non-blank characters beyond `n` SHALL fail the statement with Exasol's right-truncation error, as natively
 
 ### Scenario: The CHAR declaration query shapes execute end to end through the Virtual Schema
 

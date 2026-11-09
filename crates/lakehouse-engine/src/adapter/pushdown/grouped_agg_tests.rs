@@ -89,16 +89,8 @@ fn grouped_count_distinct_falls_back_to_row_scan() {
 #[test]
 fn partial_emits_min_max_preserve_date_timestamp_type() {
     let plans = vec![
-        AggregatePlan {
-            kind: AggKind::Min,
-            column: Some("EVENT_DATE".into()),
-            arg_expr: None,
-        },
-        AggregatePlan {
-            kind: AggKind::Max,
-            column: Some("EVENT_TS".into()),
-            arg_expr: None,
-        },
+        column_plan(AggKind::Min, "EVENT_DATE"),
+        column_plan(AggKind::Max, "EVENT_TS"),
     ];
     let col_types = vec![
         ("EVENT_DATE".to_string(), ExasolType::Date),
@@ -119,11 +111,7 @@ fn partial_emits_min_max_preserve_date_timestamp_type() {
 
 #[test]
 fn partial_emits_sum_integer_stays_decimal() {
-    let plans = vec![AggregatePlan {
-        kind: AggKind::Sum,
-        column: Some("AMOUNT".into()),
-        arg_expr: None,
-    }];
+    let plans = vec![column_plan(AggKind::Sum, "AMOUNT")];
     let col_types = vec![("AMOUNT".to_string(), ExasolType::decimal(20, 0))];
     let emits = partial_emits_items(&plans, &column_types(&col_types), &[]);
     assert!(
@@ -140,11 +128,7 @@ fn partial_emits_sum_integer_stays_decimal() {
 
 #[test]
 fn partial_emits_sum_double_stays_double() {
-    let plans = vec![AggregatePlan {
-        kind: AggKind::Sum,
-        column: Some("SCORE".into()),
-        arg_expr: None,
-    }];
+    let plans = vec![column_plan(AggKind::Sum, "SCORE")];
     let col_types = vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
     let emits = partial_emits_items(&plans, &column_types(&col_types), &[]);
     assert!(
@@ -157,22 +141,14 @@ fn partial_emits_sum_double_stays_double() {
 #[test]
 fn aggregate_falls_back_to_row_scan_for_sum_of_non_numeric() {
     let col_types_varchar = vec![("NAME".to_string(), ExasolType::WIDEST_VARCHAR)];
-    let sum_varchar = vec![AggregatePlan {
-        kind: AggKind::Sum,
-        column: Some("NAME".into()),
-        arg_expr: None,
-    }];
+    let sum_varchar = vec![column_plan(AggKind::Sum, "NAME")];
     assert!(
         !validate_agg_col_types(&sum_varchar, &column_types(&col_types_varchar)),
         "SUM over VARCHAR must fail validation (fall back to row scan)"
     );
 
     let col_types_date = vec![("EVENT_DATE".to_string(), ExasolType::Date)];
-    let sum_date = vec![AggregatePlan {
-        kind: AggKind::Sum,
-        column: Some("EVENT_DATE".into()),
-        arg_expr: None,
-    }];
+    let sum_date = vec![column_plan(AggKind::Sum, "EVENT_DATE")];
     assert!(
         !validate_agg_col_types(&sum_date, &column_types(&col_types_date)),
         "SUM over DATE must fail validation (fall back to row scan)"
@@ -197,7 +173,7 @@ fn grouped_aggregate_sum_over_varchar_falls_back_via_type_validation() {
         "detect_group_by_aggregates must accept the shape: {}",
         req.json()
     );
-    let agg_plans = detected.unwrap().plans;
+    let agg_plans = detected.unwrap().aggregates.plans;
 
     let col_types = vec![
         ("REGION".to_string(), ExasolType::WIDEST_VARCHAR),
@@ -254,11 +230,8 @@ fn detect_group_by_aggregates_column_key() {
     .build_pushdown();
     let result =
         detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
-    let GroupedAggregateDetection {
-        group_keys: keys,
-        plans,
-        ..
-    } = result;
+    let keys = result.group_keys;
+    let plans = result.aggregates.plans;
     assert_eq!(keys.len(), 1, "one group key");
     assert!(
         keys[0].contains("REGION"),
@@ -269,14 +242,161 @@ fn detect_group_by_aggregates_column_key() {
     assert_eq!(plans[0].kind, AggKind::Count);
 }
 
-fn grouped_spec(result: &GroupedAggregateDetection) -> ScanSpec {
-    CommonScanSpec {
-        aggregates: Some(result.plans.clone()),
-        group_keys: Some(result.group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+/// The merge SQL of a grouped aggregate, built as the dispatcher builds it: one shard, and no
+/// LIMIT, OFFSET, HAVING, or ORDER BY until a test sets one.
+struct GroupedSql {
+    spec: ScanSpec,
+    shards: Vec<Vec<FileEntry>>,
+    group_key_types: Vec<ExasolType>,
+    aggregates: TypedPlans,
+    select_items: Vec<GroupedSelectItem>,
+    select_types: Vec<ExasolType>,
+    columns: ColumnTypes,
+    limit: Option<u64>,
+    offset: u64,
+    having: Option<String>,
+    order_by: Option<String>,
+}
+
+impl GroupedSql {
+    /// Over `detection`, with no column type known to the merge render.
+    fn of(detection: &GroupedAggregateDetection, req: &PushdownRequest) -> Self {
+        Self::with(
+            detection.group_keys.clone(),
+            detection.group_key_types.clone(),
+            detection.aggregates.clone(),
+            detection.select_items.clone(),
+            req.select_types().to_vec(),
+        )
     }
-    .with_files(vec![])
+
+    /// Keys first, then one aggregate per plan, each output in its own type. The merge render
+    /// knows `AMOUNT` and `SCORE` as `DOUBLE PRECISION`.
+    fn keys_first(keys: &[(&str, ExasolType)], plans: Vec<(AggregatePlan, ExasolType)>) -> Self {
+        let columns = column_types(&[
+            ("AMOUNT", ExasolType::DoublePrecision),
+            ("SCORE", ExasolType::DoublePrecision),
+        ]);
+        let (plans, types): (Vec<_>, Vec<_>) =
+            plans.into_iter().map(|(plan, ty)| (plan, Some(ty))).unzip();
+        let aggregates =
+            TypedPlans::new(plans, types, &columns).expect("every aggregate has a type");
+        let group_key_types: Vec<ExasolType> = keys.iter().map(|(_, ty)| *ty).collect();
+        let select_items = keys_first_select_items(keys.len(), aggregates.plans.len());
+        let select_types = select_types_of(&select_items, &group_key_types, &aggregates.types);
+        Self {
+            columns,
+            ..Self::with(
+                keys.iter().map(|(key, _)| key.to_string()).collect(),
+                group_key_types,
+                aggregates,
+                select_items,
+                select_types,
+            )
+        }
+    }
+
+    fn with(
+        group_keys: Vec<String>,
+        group_key_types: Vec<ExasolType>,
+        aggregates: TypedPlans,
+        select_items: Vec<GroupedSelectItem>,
+        select_types: Vec<ExasolType>,
+    ) -> Self {
+        let spec = CommonScanSpec {
+            aggregates: Some(aggregates.plans.clone()),
+            group_keys: Some(group_keys),
+            storage: ScanStorage::Inline(sample_storage()),
+            ..Default::default()
+        }
+        .with_files(vec![]);
+        Self {
+            spec,
+            shards: vec![vec![FileEntry::new("s3://wh/f0.parquet", 1)]],
+            group_key_types,
+            aggregates,
+            select_items,
+            select_types,
+            columns: ColumnTypes::default(),
+            limit: None,
+            offset: 0,
+            having: None,
+            order_by: None,
+        }
+    }
+
+    /// Reorders the select list; each item keeps its own type.
+    fn select_items(mut self, select_items: Vec<GroupedSelectItem>) -> Self {
+        self.select_types =
+            select_types_of(&select_items, &self.group_key_types, &self.aggregates.types);
+        self.select_items = select_items;
+        self
+    }
+
+    fn columns(mut self, columns: ColumnTypes) -> Self {
+        self.columns = columns;
+        self
+    }
+
+    /// `files` of one byte each, partitioned into `g` shards.
+    fn files(mut self, files: Vec<String>, g: usize) -> Self {
+        let entries = files
+            .into_iter()
+            .map(|path| FileEntry::new(path, 1))
+            .collect();
+        self.shards = crate::adapter::sharding::partition_files_by_bytes(entries, g);
+        self
+    }
+
+    fn shards(mut self, shards: Vec<Vec<FileEntry>>) -> Self {
+        self.shards = shards;
+        self
+    }
+
+    /// A LIMIT on the scan template, which the per-shard partial must never carry.
+    fn template_limit(mut self, limit: u64) -> Self {
+        self.spec.common.limit = Some(limit);
+        self
+    }
+
+    fn limit(mut self, limit: u64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    fn offset(mut self, offset: u64) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    fn having(mut self, having: &str) -> Self {
+        self.having = Some(having.to_string());
+        self
+    }
+
+    fn order_by(mut self, order_by: &str) -> Self {
+        self.order_by = Some(order_by.to_string());
+        self
+    }
+
+    fn build(&self) -> String {
+        build_grouped_aggregate_scan_sql(
+            &self.spec,
+            &self.shards,
+            &self.group_key_types,
+            &self.aggregates,
+            &self.select_items,
+            &self.select_types,
+            self.limit,
+            self.offset,
+            ScanTranslator::new(&self.columns),
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+            self.having.as_deref(),
+            self.order_by.as_deref(),
+        )
+        .expect("the merge select list renders")
+    }
 }
 
 /// The grouped ORDER BY over `detection`'s merge, scoped as `classify_request_shape` scopes it.
@@ -285,10 +405,8 @@ fn order_by_over_merge(
     detection: &GroupedAggregateDetection,
     col_types: &ColumnTypes,
 ) -> Option<GroupedOrderBy> {
-    let merged = cast_merge_items(&detection.plans, &detection.plan_types, col_types);
     let scope = MergeScope {
-        plans: &detection.plans,
-        merged: &merged,
+        aggregates: &detection.aggregates,
         group_keys: &detection.group_keys,
     };
     build_grouped_order_by_clause(req.json(), &scope, ScanTranslator::new(col_types))
@@ -300,10 +418,8 @@ fn having_over_merge(
     detection: &GroupedAggregateDetection,
     col_types: &ColumnTypes,
 ) -> Option<String> {
-    let merged = cast_merge_items(&detection.plans, &detection.plan_types, col_types);
     let scope = MergeScope {
-        plans: &detection.plans,
-        merged: &merged,
+        aggregates: &detection.aggregates,
         group_keys: &detection.group_keys,
     };
     render_having_over_merge(node, &scope, ScanTranslator::new(col_types))
@@ -311,10 +427,14 @@ fn having_over_merge(
 
 /// A HAVING over `plans` alone, each merged by its uncast partial merge, with no group key.
 fn having_over_plans(node: &Json, plans: &[AggregatePlan]) -> Option<String> {
-    let merged = merge_select_items(plans);
+    // The HAVING rewrite reads only the plans and their merges, never the types.
+    let aggregates = TypedPlans {
+        plans: plans.to_vec(),
+        types: Vec::new(),
+        merged: merge_select_items(plans),
+    };
     let scope = MergeScope {
-        plans,
-        merged: &merged,
+        aggregates: &aggregates,
         group_keys: &[],
     };
     render_having_over_merge(node, &scope, untyped_scan())
@@ -337,25 +457,10 @@ fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
         "grouped ORDER BY must sort a group key on its typed GK_* column"
     );
 
-    let group_key_types = result.group_key_types.clone();
-    let sql = build_grouped_aggregate_scan_sql(
-        &grouped_spec(&result),
-        &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
-        &group_key_types,
-        &result.plans,
-        &result.plan_types,
-        &result.merged,
-        &result.select_items,
-        req.select_types(),
-        None,
-        0,
-        ScanTranslator::new(&column_types(&[("ID", ExasolType::decimal(20, 0))])),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        None,
-        Some(r#""GK_0" ASC NULLS LAST"#),
-    )
-    .expect("the merge select list renders");
+    let sql = GroupedSql::of(&result, &req)
+        .columns(column_types(&[("ID", ExasolType::decimal(20, 0))]))
+        .order_by(r#""GK_0" ASC NULLS LAST"#)
+        .build();
     assert!(
         sql.contains(r#" ORDER BY "GK_0" ASC NULLS LAST"#),
         "merge SQL must render the explicit final ORDER BY: {sql}"
@@ -427,12 +532,12 @@ fn detect_group_by_aggregates_expression_key() {
     assert!(result.is_some(), "renderable expression key must succeed");
     let GroupedAggregateDetection {
         group_keys: keys,
-        plans,
+        aggregates,
         ..
     } = result.unwrap();
     assert_eq!(keys.len(), 1);
     assert!(keys[0].contains("="), "rendered expression must contain =");
-    assert_eq!(plans[0].kind, AggKind::Sum);
+    assert_eq!(aggregates.plans[0].kind, AggKind::Sum);
 }
 
 #[test]
@@ -482,7 +587,7 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
         result.group_keys[0]
     );
     assert!(
-        result.plans.is_empty(),
+        result.aggregates.plans.is_empty(),
         "a literal placeholder contributes no aggregate plan"
     );
     assert!(
@@ -498,31 +603,7 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
     );
 
     // A row-scan fallback would return one row per source row, not per group.
-    let group_key_types = result.group_key_types.clone();
-    let sql = build_grouped_aggregate_scan_sql(
-        &CommonScanSpec {
-            aggregates: Some(result.plans.clone()),
-            group_keys: Some(result.group_keys.clone()),
-            storage: ScanStorage::Inline(sample_storage()),
-            ..Default::default()
-        }
-        .with_files(vec![]),
-        &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
-        &group_key_types,
-        &result.plans,
-        &result.plan_types,
-        &result.merged,
-        &result.select_items,
-        req.select_types(),
-        None,
-        0,
-        ScanTranslator::new(&col_types),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        None,
-        None,
-    )
-    .expect("the merge select list renders");
+    let sql = GroupedSql::of(&result, &req).columns(col_types).build();
     assert!(
         !sql.contains(r#""NULL""#),
         "grouped scan SQL must not reference a phantom \"NULL\" identifier: {sql}"
@@ -573,7 +654,7 @@ fn detect_group_by_aggregates_preserves_select_list_order() {
     let result =
         detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
     assert_eq!(result.group_keys.len(), 1, "one group key");
-    assert_eq!(result.plans.len(), 1, "one aggregate plan");
+    assert_eq!(result.aggregates.plans.len(), 1, "one aggregate plan");
     assert_eq!(
         result.select_items,
         vec![
@@ -610,7 +691,7 @@ fn detect_group_by_aggregates_interleaved_multi_key_preserves_order() {
     let result =
         detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
     assert_eq!(result.group_keys.len(), 2, "two group keys");
-    assert_eq!(result.plans.len(), 1, "one aggregate plan");
+    assert_eq!(result.aggregates.plans.len(), 1, "one aggregate plan");
     assert_eq!(
         result.select_items,
         vec![
@@ -718,7 +799,7 @@ fn detect_group_by_all_expression_multi_key() {
         "key 1 must render the UPPER expression: {:?}",
         result.group_keys
     );
-    assert_eq!(result.plans.len(), 1, "one aggregate plan");
+    assert_eq!(result.aggregates.plans.len(), 1, "one aggregate plan");
     assert_eq!(
         result.select_items,
         vec![
@@ -739,35 +820,7 @@ fn detect_group_by_all_expression_multi_key() {
         result.select_items
     );
 
-    let col_types: Vec<(String, ExasolType)> = vec![];
-    let group_key_types = vec![ExasolType::WIDEST_VARCHAR; 2];
-    let aggregate_types = vec![ExasolType::decimal(18, 0)];
-    let spec_template = CommonScanSpec {
-        aggregates: Some(result.plans.clone()),
-        group_keys: Some(result.group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
-    let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
-    let sql = build_grouped_aggregate_scan_sql(
-        &spec_template,
-        &shards,
-        &group_key_types,
-        &result.plans,
-        &aggregate_types,
-        &result.merged,
-        &result.select_items,
-        req.select_types(),
-        None,
-        0,
-        ScanTranslator::new(&column_types(&col_types)),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        None,
-        None,
-    )
-    .expect("the merge select list renders");
+    let sql = GroupedSql::of(&result, &req).build();
     assert!(
         sql.contains("% 4"),
         "built SQL must carry the MOD key rendered on its own: {sql}"
@@ -819,69 +872,29 @@ fn keys_first_select_items(group_keys: usize, aggregates: usize) -> Vec<GroupedS
     items
 }
 
+/// Keys output as `VARCHAR(2000000)`, aggregates as `DOUBLE PRECISION`, over `files` in `g` shards.
 fn build_grouped_agg_sql(
-    group_keys: Vec<String>,
+    group_keys: &[&str],
     agg_plans: Vec<AggregatePlan>,
     files: Vec<String>,
     g: usize,
 ) -> String {
-    let col_types: Vec<(String, ExasolType)> = vec![
-        ("AMOUNT".to_string(), ExasolType::DoublePrecision),
-        ("SCORE".to_string(), ExasolType::DoublePrecision),
-    ];
-    let spec_template = CommonScanSpec {
-        aggregates: Some(agg_plans.clone()),
-        group_keys: Some(group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
-    let files_with_sizes: Vec<FileEntry> =
-        files.into_iter().map(|p| FileEntry::new(p, 1)).collect();
-    let shards = crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, g);
-    let select_items = keys_first_select_items(group_keys.len(), agg_plans.len());
-    build_grouped_aggregate_scan_sql(
-        &spec_template,
-        &shards,
-        &vec![ExasolType::WIDEST_VARCHAR; group_keys.len()],
-        &agg_plans,
-        &vec![ExasolType::DoublePrecision; agg_plans.len()],
-        &cast_merge_items(
-            &agg_plans,
-            &vec![ExasolType::DoublePrecision; agg_plans.len()],
-            ScanTranslator::new(&column_types(&col_types)).columns(),
-        ),
-        &select_items,
-        &select_types_of(
-            &select_items,
-            &vec![ExasolType::WIDEST_VARCHAR; group_keys.len()],
-            &vec![ExasolType::DoublePrecision; agg_plans.len()],
-        ),
-        None,
-        0,
-        ScanTranslator::new(&column_types(&col_types)),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        None,
-        None,
-    )
-    .expect("the merge select list renders")
+    let keys: Vec<(&str, ExasolType)> = group_keys
+        .iter()
+        .map(|key| (*key, ExasolType::WIDEST_VARCHAR))
+        .collect();
+    let plans = agg_plans
+        .into_iter()
+        .map(|plan| (plan, ExasolType::DoublePrecision))
+        .collect();
+    GroupedSql::keys_first(&keys, plans).files(files, g).build()
 }
 
 #[test]
 fn grouped_fan_out_common_once_files_per_shard() {
     let files: Vec<String> = (0..2).map(|i| format!("s3://w/f{i}.parquet")).collect();
     let g = shard_count(2, 1, files.len());
-    let sql = build_grouped_agg_sql(
-        vec!["\"REGION\"".into()],
-        vec![AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        }],
-        files,
-        g,
-    );
+    let sql = build_grouped_agg_sql(&[r#""REGION""#], vec![count_plan()], files, g);
     assert!(
         !sql.contains("IPROC()"),
         "grouped SQL must NOT contain IPROC(): {sql}"
@@ -919,16 +932,7 @@ fn grouped_fan_out_common_once_files_per_shard() {
 fn grouped_group_by_shard_key_inside_distributor() {
     let files: Vec<String> = (0..2).map(|i| format!("s3://w/f{i}.parquet")).collect();
     let g = shard_count(2, 1, files.len());
-    let sql = build_grouped_agg_sql(
-        vec!["\"REGION\"".into()],
-        vec![AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        }],
-        files,
-        g,
-    );
+    let sql = build_grouped_agg_sql(&[r#""REGION""#], vec![count_plan()], files, g);
 
     assert!(
         sql.contains("AS shards(shard_key, files) GROUP BY shard_key"),
@@ -957,12 +961,8 @@ fn grouped_group_by_shard_key_inside_distributor() {
 #[test]
 fn grouped_single_shard_short_circuits_distributor() {
     let sql = build_grouped_agg_sql(
-        vec!["\"REGION\"".into()],
-        vec![AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        }],
+        &[r#""REGION""#],
+        vec![count_plan()],
         vec!["s3://w/only.parquet".into()],
         1,
     );
@@ -981,58 +981,17 @@ fn grouped_single_shard_short_circuits_distributor() {
     );
 }
 
+/// `SELECT "REGION", COUNT(*) ... GROUP BY "REGION"`.
+fn region_count_sql() -> GroupedSql {
+    GroupedSql::keys_first(
+        &[(r#""REGION""#, ExasolType::WIDEST_VARCHAR)],
+        vec![(count_plan(), ExasolType::decimal(18, 0))],
+    )
+}
+
 #[test]
 fn grouped_common_blob_has_no_limit() {
-    let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
-    let g = shard_count(1, 1, files.len());
-    let col_types = vec![("AMOUNT".to_string(), ExasolType::DoublePrecision)];
-    let spec_template = CommonScanSpec {
-        limit: Some(100),
-        aggregates: Some(vec![AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        }]),
-        group_keys: Some(vec!["\"REGION\"".into()]),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
-    let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
-    let sql = build_grouped_aggregate_scan_sql(
-        &spec_template,
-        &shards,
-        &[ExasolType::WIDEST_VARCHAR],
-        &[AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        }],
-        &[ExasolType::decimal(18, 0)],
-        &cast_merge_items(
-            &[AggregatePlan {
-                kind: AggKind::Count,
-                column: None,
-                arg_expr: None,
-            }],
-            &[ExasolType::decimal(18, 0)],
-            ScanTranslator::new(&column_types(&col_types)).columns(),
-        ),
-        &keys_first_select_items(1, 1),
-        &select_types_of(
-            &keys_first_select_items(1, 1),
-            &[ExasolType::WIDEST_VARCHAR],
-            &[ExasolType::decimal(18, 0)],
-        ),
-        Some(100),
-        0,
-        ScanTranslator::new(&column_types(&col_types)),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        None,
-        None,
-    )
-    .expect("the merge select list renders");
+    let sql = region_count_sql().template_limit(100).limit(100).build();
     let common = common_arg_literal(&sql);
     assert!(
         !common.contains("\"limit\""),
@@ -1046,56 +1005,12 @@ fn grouped_common_blob_has_no_limit() {
 
 #[test]
 fn grouped_merge_offset_never_reaches_per_shard_spec() {
-    let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
-    let g = shard_count(1, 1, files.len());
-    let col_types = vec![("AMOUNT".to_string(), ExasolType::DoublePrecision)];
-    let spec_template = CommonScanSpec {
-        limit: Some(100),
-        aggregates: Some(vec![AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        }]),
-        group_keys: Some(vec!["\"REGION\"".into()]),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
-    let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
-    let sql = build_grouped_aggregate_scan_sql(
-        &spec_template,
-        &shards,
-        &[ExasolType::WIDEST_VARCHAR],
-        &[AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        }],
-        &[ExasolType::decimal(18, 0)],
-        &cast_merge_items(
-            &[AggregatePlan {
-                kind: AggKind::Count,
-                column: None,
-                arg_expr: None,
-            }],
-            &[ExasolType::decimal(18, 0)],
-            ScanTranslator::new(&column_types(&col_types)).columns(),
-        ),
-        &keys_first_select_items(1, 1),
-        &select_types_of(
-            &keys_first_select_items(1, 1),
-            &[ExasolType::WIDEST_VARCHAR],
-            &[ExasolType::decimal(18, 0)],
-        ),
-        Some(100),
-        3,
-        ScanTranslator::new(&column_types(&col_types)),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        None,
-        Some("1 ASC NULLS LAST"),
-    )
-    .expect("the merge select list renders");
+    let sql = region_count_sql()
+        .template_limit(100)
+        .limit(100)
+        .offset(3)
+        .order_by("1 ASC NULLS LAST")
+        .build();
     let common = common_arg_literal(&sql);
     assert!(
         !common.contains("\"limit\"") && !common.contains("\"offset\""),
@@ -1109,56 +1024,7 @@ fn grouped_merge_offset_never_reaches_per_shard_spec() {
 
 #[test]
 fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
-    let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
-    let g = shard_count(1, 1, files.len());
-    let col_types = vec![("AMOUNT".to_string(), ExasolType::DoublePrecision)];
-    let spec_template = CommonScanSpec {
-        limit: Some(100),
-        aggregates: Some(vec![AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        }]),
-        group_keys: Some(vec!["\"REGION\"".into()]),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
-    let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
-    let sql = build_grouped_aggregate_scan_sql(
-        &spec_template,
-        &shards,
-        &[ExasolType::WIDEST_VARCHAR],
-        &[AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        }],
-        &[ExasolType::decimal(18, 0)],
-        &cast_merge_items(
-            &[AggregatePlan {
-                kind: AggKind::Count,
-                column: None,
-                arg_expr: None,
-            }],
-            &[ExasolType::decimal(18, 0)],
-            ScanTranslator::new(&column_types(&col_types)).columns(),
-        ),
-        &keys_first_select_items(1, 1),
-        &select_types_of(
-            &keys_first_select_items(1, 1),
-            &[ExasolType::WIDEST_VARCHAR],
-            &[ExasolType::decimal(18, 0)],
-        ),
-        Some(100),
-        0,
-        ScanTranslator::new(&column_types(&col_types)),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        None,
-        None,
-    )
-    .expect("the merge select list renders");
+    let sql = region_count_sql().template_limit(100).limit(100).build();
     assert!(
         sql.ends_with(" LIMIT 100"),
         "zero offset must render the bare pre-offset LIMIT clause: {sql}"
@@ -1178,25 +1044,12 @@ fn grouped_merge_renders_limit_offset_in_clause_order() {
         .build_pushdown();
 
     let result = detect_group_by_aggregates(&req, untyped_scan()).expect("grouped aggregate");
-    let group_key_types = result.group_key_types.clone();
-    let sql = build_grouped_aggregate_scan_sql(
-        &grouped_spec(&result),
-        &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
-        &group_key_types,
-        &result.plans,
-        &result.plan_types,
-        &result.merged,
-        &result.select_items,
-        req.select_types(),
-        Some(2),
-        1,
-        ScanTranslator::new(&column_types(&[("ID", ExasolType::decimal(20, 0))])),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        None,
-        Some("1 ASC NULLS LAST"),
-    )
-    .expect("the merge select list renders");
+    let sql = GroupedSql::of(&result, &req)
+        .columns(column_types(&[("ID", ExasolType::decimal(20, 0))]))
+        .limit(2)
+        .offset(1)
+        .order_by("1 ASC NULLS LAST")
+        .build();
     assert!(
         sql.ends_with(" ORDER BY 1 ASC NULLS LAST LIMIT 2 OFFSET 1"),
         "merge SQL must render GROUP BY … ORDER BY … LIMIT n OFFSET m in that order: {sql}"
@@ -1216,19 +1069,8 @@ fn grouped_aggregate_wrapper_sql_groups_by_user_key_cols() {
     let files: Vec<String> = (0..2).map(|i| format!("s3://w/f{i}.parquet")).collect();
     let g = shard_count(2, 1, files.len());
     let sql = build_grouped_agg_sql(
-        vec!["\"REGION\"".into(), "\"YEAR\"".into()],
-        vec![
-            AggregatePlan {
-                kind: AggKind::Count,
-                column: None,
-                arg_expr: None,
-            },
-            AggregatePlan {
-                kind: AggKind::Sum,
-                column: Some("AMOUNT".into()),
-                arg_expr: None,
-            },
-        ],
+        &[r#""REGION""#, r#""YEAR""#],
+        vec![count_plan(), column_plan(AggKind::Sum, "AMOUNT")],
         files,
         g,
     );
@@ -1307,40 +1149,18 @@ fn build_grouped_agg_sql_with_select_items(
     select_items: Vec<GroupedSelectItem>,
     having: Option<&str>,
 ) -> String {
-    let col_types: Vec<(String, ExasolType)> = vec![
-        ("AMOUNT".to_string(), ExasolType::DoublePrecision),
-        ("SCORE".to_string(), ExasolType::DoublePrecision),
-    ];
-    let spec_template = CommonScanSpec {
-        aggregates: Some(agg_plans.clone()),
-        group_keys: Some(group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
+    let keys: Vec<(&str, ExasolType)> = group_keys
+        .iter()
+        .map(String::as_str)
+        .zip(group_key_types)
+        .collect();
+    let sql = GroupedSql::keys_first(&keys, agg_plans.into_iter().zip(aggregate_types).collect())
+        .select_items(select_items);
+    match having {
+        Some(having) => sql.having(having),
+        None => sql,
     }
-    .with_files(vec![]);
-    let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
-    build_grouped_aggregate_scan_sql(
-        &spec_template,
-        &shards,
-        &group_key_types,
-        &agg_plans,
-        &aggregate_types,
-        &cast_merge_items(
-            &agg_plans,
-            &aggregate_types,
-            ScanTranslator::new(&column_types(&col_types)).columns(),
-        ),
-        &select_items,
-        &select_types_of(&select_items, &group_key_types, &aggregate_types),
-        None,
-        0,
-        ScanTranslator::new(&column_types(&col_types)),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        having,
-        None,
-    )
-    .expect("the merge select list renders")
+    .build()
 }
 
 #[test]
@@ -1348,11 +1168,7 @@ fn grouped_wrapper_agg_before_key_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
         vec![r#"("ID" % 4)"#.to_string()],
         vec![ExasolType::decimal(9, 0)],
-        vec![AggregatePlan {
-            kind: AggKind::Sum,
-            column: Some("SCORE".into()),
-            arg_expr: None,
-        }],
+        vec![column_plan(AggKind::Sum, "SCORE")],
         vec![ExasolType::DoublePrecision],
         vec![
             GroupedSelectItem::Aggregate {
@@ -1387,11 +1203,7 @@ fn grouped_wrapper_interleaved_multi_key_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
         vec![r#""REGION""#.to_string(), r#""YEAR""#.to_string()],
         vec![ExasolType::varchar(100), ExasolType::decimal(4, 0)],
-        vec![AggregatePlan {
-            kind: AggKind::Sum,
-            column: Some("SCORE".into()),
-            arg_expr: None,
-        }],
+        vec![column_plan(AggKind::Sum, "SCORE")],
         vec![ExasolType::DoublePrecision],
         vec![
             GroupedSelectItem::GroupKey {
@@ -1434,11 +1246,7 @@ fn grouped_wrapper_expr_key_after_agg_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
         vec![r#"("ID" % 4)"#.to_string()],
         vec![ExasolType::decimal(9, 0)],
-        vec![AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        }],
+        vec![count_plan()],
         vec![ExasolType::decimal(18, 0)],
         vec![
             GroupedSelectItem::Aggregate {
@@ -1469,11 +1277,7 @@ fn grouped_wrapper_agg_first_with_having_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
         vec![r#"("ID" % 4)"#.to_string()],
         vec![ExasolType::decimal(9, 0)],
-        vec![AggregatePlan {
-            kind: AggKind::Sum,
-            column: Some("SCORE".into()),
-            arg_expr: None,
-        }],
+        vec![column_plan(AggKind::Sum, "SCORE")],
         vec![ExasolType::DoublePrecision],
         vec![
             GroupedSelectItem::Aggregate {
@@ -1544,34 +1348,10 @@ fn soa_col_types() -> Vec<(String, ExasolType)> {
 
 /// Mirrors the production grouped branch of `handle_pushdown`.
 fn build_grouped_from_detection(req: &PushdownRequest) -> String {
-    let d = detect_group_by_aggregates(req, ScanTranslator::new(&column_types(&soa_col_types())))
+    let columns = column_types(&soa_col_types());
+    let d = detect_group_by_aggregates(req, ScanTranslator::new(&columns))
         .expect("must detect the grouped scalar-over-aggregate pushdown");
-    let group_key_types = d.group_key_types.clone();
-    let spec_template = CommonScanSpec {
-        aggregates: Some(d.plans.clone()),
-        group_keys: Some(d.group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
-    build_grouped_aggregate_scan_sql(
-        &spec_template,
-        &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
-        &group_key_types,
-        &d.plans,
-        &d.plan_types,
-        &d.merged,
-        &d.select_items,
-        req.select_types(),
-        None,
-        0,
-        ScanTranslator::new(&column_types(&soa_col_types())),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        None,
-        None,
-    )
-    .expect("the merge select list renders")
+    GroupedSql::of(&d, req).columns(columns).build()
 }
 
 #[test]
@@ -1608,12 +1388,13 @@ fn grouped_scalar_over_aggregate_detects_and_dedups_inner_aggregates() {
     );
 
     assert_eq!(
-        d.plans.len(),
+        d.aggregates.plans.len(),
         4,
         "inner SUM(CASE) + COUNT(*) fold in; the two COUNT(*) dedup to one: {:?}",
-        d.plans
+        d.aggregates.plans
     );
     let count_plans = d
+        .aggregates
         .plans
         .iter()
         .filter(|p| matches!(p.kind, AggKind::Count | AggKind::CountCol))
@@ -1621,10 +1402,11 @@ fn grouped_scalar_over_aggregate_detects_and_dedups_inner_aggregates() {
     assert_eq!(
         count_plans, 1,
         "the shared COUNT(*) must be a single plan: {:?}",
-        d.plans
+        d.aggregates.plans
     );
 
     let count_slot = d
+        .aggregates
         .plans
         .iter()
         .position(|p| matches!(p.kind, AggKind::Count | AggKind::CountCol))
@@ -1811,11 +1593,7 @@ fn render_having_over_merge_rewrites_aggregate_to_partial() {
         agg_item("SUM", Some("SCORE"), false),
         num_lit(250),
     );
-    let plans = vec![AggregatePlan {
-        kind: AggKind::Sum,
-        column: Some("SCORE".into()),
-        arg_expr: None,
-    }];
+    let plans = vec![column_plan(AggKind::Sum, "SCORE")];
     let rendered =
         having_over_plans(&having, &plans).expect("HAVING over a known aggregate must render");
     assert_eq!(
@@ -1826,6 +1604,10 @@ fn render_having_over_merge_rewrites_aggregate_to_partial() {
         !rendered.contains(r#""SCORE""#) && !rendered.contains("SUM(\"SCORE\")"),
         "HAVING must NOT reference the source column SCORE: {rendered}"
     );
+}
+
+fn score_double() -> ColumnTypes {
+    column_types(&[("SCORE", ExasolType::DoublePrecision)])
 }
 
 #[test]
@@ -1839,8 +1621,6 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
         .build_pushdown();
     let detection =
         detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
-    let group_key_types = detection.group_key_types.clone();
-    let aggregate_types = detection.plan_types.clone();
 
     let having_node = compare(
         "predicate_greater",
@@ -1850,34 +1630,10 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
     let having = having_over_merge(&having_node, &detection, &ColumnTypes::default())
         .expect("HAVING must render over the merge decomposition");
 
-    let col_types: Vec<(String, ExasolType)> =
-        vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
-    let spec_template = CommonScanSpec {
-        aggregates: Some(detection.plans.clone()),
-        group_keys: Some(detection.group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
-    let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
-    let sql = build_grouped_aggregate_scan_sql(
-        &spec_template,
-        &shards,
-        &group_key_types,
-        &detection.plans,
-        &aggregate_types,
-        &detection.merged,
-        &detection.select_items,
-        req.select_types(),
-        None,
-        0,
-        ScanTranslator::new(&column_types(&col_types)),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        Some(&having),
-        None,
-    )
-    .expect("the merge select list renders");
+    let sql = GroupedSql::of(&detection, &req)
+        .columns(score_double())
+        .having(&having)
+        .build();
     let having_pos = sql.find("HAVING").expect("must contain HAVING");
     let having_clause = &sql[having_pos..];
     assert!(
@@ -1893,11 +1649,7 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
 #[test]
 fn render_having_over_merge_declines_unknown_aggregate() {
     let having = compare("predicate_greater", count_star(), num_lit(10));
-    let plans = vec![AggregatePlan {
-        kind: AggKind::Sum,
-        column: Some("SCORE".into()),
-        arg_expr: None,
-    }];
+    let plans = vec![column_plan(AggKind::Sum, "SCORE")];
     assert!(
         having_over_plans(&having, &plans).is_none(),
         "HAVING over an aggregate absent from the plans must not render"
@@ -1963,37 +1715,9 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
         .build_pushdown();
     let detection =
         detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
-    let group_key_types = detection.group_key_types.clone();
-    let aggregate_types = detection.plan_types.clone();
-
-    let col_types: Vec<(String, ExasolType)> =
-        vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
-    let spec_template = CommonScanSpec {
-        aggregates: Some(detection.plans.clone()),
-        group_keys: Some(detection.group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
-    let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
-    let sql = build_grouped_aggregate_scan_sql(
-        &spec_template,
-        &shards,
-        &group_key_types,
-        &detection.plans,
-        &aggregate_types,
-        &detection.merged,
-        &detection.select_items,
-        req.select_types(),
-        None,
-        0,
-        ScanTranslator::new(&column_types(&col_types)),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        None,
-        None,
-    )
-    .expect("the merge select list renders");
+    let sql = GroupedSql::of(&detection, &req)
+        .columns(score_double())
+        .build();
 
     let items = outer_select_items(&sql);
     assert_eq!(items.len(), 2, "outer SELECT must have 2 items: {items:?}");
@@ -2023,8 +1747,6 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
     let detection =
         detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
     assert_eq!(detection.group_keys.len(), 2, "two group keys");
-    let group_key_types = detection.group_key_types.clone();
-    let aggregate_types = detection.plan_types.clone();
 
     let having_node = compare(
         "predicate_greater",
@@ -2034,37 +1756,15 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
     let having = having_over_merge(&having_node, &detection, &ColumnTypes::default())
         .expect("HAVING must render over the merge decomposition");
 
-    let col_types: Vec<(String, ExasolType)> =
-        vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
-    let spec_template = CommonScanSpec {
-        aggregates: Some(detection.plans.clone()),
-        group_keys: Some(detection.group_keys.clone()),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
-    let shards = vec![
-        vec![("s3://wh/f0.parquet".to_string(), 1u64)],
-        vec![("s3://wh/f1.parquet".to_string(), 1u64)],
-    ];
-    let sql = build_grouped_aggregate_scan_sql(
-        &spec_template,
-        &shards,
-        &group_key_types,
-        &detection.plans,
-        &aggregate_types,
-        &detection.merged,
-        &detection.select_items,
-        req.select_types(),
-        Some(2),
-        0,
-        ScanTranslator::new(&column_types(&col_types)),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        Some(&having),
-        None,
-    )
-    .expect("the merge select list renders");
+    let sql = GroupedSql::of(&detection, &req)
+        .columns(score_double())
+        .shards(vec![
+            vec![FileEntry::new("s3://wh/f0.parquet", 1)],
+            vec![FileEntry::new("s3://wh/f1.parquet", 1)],
+        ])
+        .limit(2)
+        .having(&having)
+        .build();
 
     let shard_group_end = sql
         .find("GROUP BY shard_key")
@@ -2380,11 +2080,7 @@ fn stat_aggregate_emits_three_partial_columns() {
         AggKind::StddevSamp,
         AggKind::Stddev,
     ] {
-        let plans = vec![AggregatePlan {
-            kind: kind.clone(),
-            column: Some("SCORE".into()),
-            arg_expr: None,
-        }];
+        let plans = vec![column_plan(kind.clone(), "SCORE")];
         let col_types = vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
         let items = partial_emits_items(&plans, &column_types(&col_types), &[]);
         assert_eq!(
@@ -2470,11 +2166,7 @@ fn scan_select_list_and_emits_agree_per_agg_kind() {
 
 #[test]
 fn var_pop_merge_formula_divides_by_n() {
-    let plans = vec![AggregatePlan {
-        kind: AggKind::VarPop,
-        column: Some("X".into()),
-        arg_expr: None,
-    }];
+    let plans = vec![column_plan(AggKind::VarPop, "X")];
     let sql = merge_select_items(&plans).join(", ");
     assert!(
         sql.contains("NULLIF"),
@@ -2488,11 +2180,7 @@ fn var_pop_merge_formula_divides_by_n() {
 
 #[test]
 fn var_samp_merge_formula_divides_by_n_minus_1() {
-    let plans = vec![AggregatePlan {
-        kind: AggKind::VarSamp,
-        column: Some("X".into()),
-        arg_expr: None,
-    }];
+    let plans = vec![column_plan(AggKind::VarSamp, "X")];
     let sql = merge_select_items(&plans).join(", ");
     assert!(
         sql.contains("<= 1"),
@@ -2506,11 +2194,7 @@ fn var_samp_merge_formula_divides_by_n_minus_1() {
 
 #[test]
 fn stddev_pop_merge_formula_uses_sqrt() {
-    let plans = vec![AggregatePlan {
-        kind: AggKind::StddevPop,
-        column: Some("X".into()),
-        arg_expr: None,
-    }];
+    let plans = vec![column_plan(AggKind::StddevPop, "X")];
     let sql = merge_select_items(&plans).join(", ");
     assert!(sql.contains("SQRT("), "stddev_pop must use SQRT: {sql}");
     assert!(
@@ -2521,11 +2205,7 @@ fn stddev_pop_merge_formula_uses_sqrt() {
 
 #[test]
 fn stddev_samp_merge_formula_uses_sqrt_and_n_minus_1() {
-    let plans = vec![AggregatePlan {
-        kind: AggKind::StddevSamp,
-        column: Some("X".into()),
-        arg_expr: None,
-    }];
+    let plans = vec![column_plan(AggKind::StddevSamp, "X")];
     let sql = merge_select_items(&plans).join(", ");
     assert!(sql.contains("SQRT("), "stddev_samp must use SQRT: {sql}");
     assert!(
@@ -2541,11 +2221,7 @@ fn stddev_samp_merge_formula_uses_sqrt_and_n_minus_1() {
 #[test]
 fn variance_and_stddev_merge_return_zero_for_one_value() {
     for kind in [AggKind::Variance, AggKind::Stddev] {
-        let plans = vec![AggregatePlan {
-            kind: kind.clone(),
-            column: Some("X".into()),
-            arg_expr: None,
-        }];
+        let plans = vec![column_plan(kind.clone(), "X")];
         let sql = merge_select_items(&plans).join(", ");
         assert!(
             sql.contains(r#"CASE WHEN SUM("PARTIAL_stat_cnt_0") = 1 THEN 0 ELSE"#),
@@ -2560,58 +2236,15 @@ fn variance_and_stddev_merge_return_zero_for_one_value() {
 
 #[test]
 fn having_clause_appears_in_outer_wrapper_only() {
-    let having_filter = Some(r#"(SUM("AMOUNT") > 100)"#.to_string());
-    let spec_template = CommonScanSpec {
-        projection: vec!["REGION".into(), "AMOUNT".into()],
-        aggregates: Some(vec![AggregatePlan {
-            kind: AggKind::Sum,
-            column: Some("AMOUNT".into()),
-            arg_expr: None,
-        }]),
-        group_keys: Some(vec![r#""REGION""#.to_string()]),
-        storage: ScanStorage::Inline(sample_storage()),
-        ..Default::default()
-    }
-    .with_files(vec![]);
-    let shards = vec![vec![("s3://wh/f.parquet".to_string(), 1u64)]];
-    let col_types = vec![
-        ("REGION".to_string(), ExasolType::WIDEST_VARCHAR),
-        ("AMOUNT".to_string(), ExasolType::DoublePrecision),
-    ];
-    let sql = build_grouped_aggregate_scan_sql(
-        &spec_template,
-        &shards,
-        &[ExasolType::WIDEST_VARCHAR],
-        &[AggregatePlan {
-            kind: AggKind::Sum,
-            column: Some("AMOUNT".into()),
-            arg_expr: None,
-        }],
-        &[ExasolType::DoublePrecision],
-        &cast_merge_items(
-            &[AggregatePlan {
-                kind: AggKind::Sum,
-                column: Some("AMOUNT".into()),
-                arg_expr: None,
-            }],
-            &[ExasolType::DoublePrecision],
-            ScanTranslator::new(&column_types(&col_types)).columns(),
-        ),
-        &keys_first_select_items(1, 1),
-        &select_types_of(
-            &keys_first_select_items(1, 1),
-            &[ExasolType::WIDEST_VARCHAR],
-            &[ExasolType::DoublePrecision],
-        ),
-        None,
-        0,
-        ScanTranslator::new(&column_types(&col_types)),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        having_filter.as_deref(),
-        None,
+    let sql = GroupedSql::keys_first(
+        &[(r#""REGION""#, ExasolType::WIDEST_VARCHAR)],
+        vec![(
+            column_plan(AggKind::Sum, "AMOUNT"),
+            ExasolType::DoublePrecision,
+        )],
     )
-    .expect("the merge select list renders");
+    .having(r#"(SUM("AMOUNT") > 100)"#)
+    .build();
     assert!(
         sql.contains("HAVING"),
         "outer wrapper must contain HAVING: {sql}"
@@ -2687,13 +2320,7 @@ fn having_over_stat_aggregate_with_expression_argument_declines() {
 
 #[test]
 fn sum_and_stat_aggregates_accept_only_double_and_decimal_columns() {
-    let plans = |kind: AggKind| {
-        vec![AggregatePlan {
-            kind,
-            column: Some("X".to_string()),
-            arg_expr: None,
-        }]
-    };
+    let plans = |kind: AggKind| vec![column_plan(kind, "X")];
     for exa_type in EXASOL_TYPE_SPELLINGS {
         let col_types = vec![("X".to_string(), exa_type)];
         let expected = match exa_type {

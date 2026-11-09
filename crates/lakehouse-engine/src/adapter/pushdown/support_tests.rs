@@ -527,18 +527,7 @@ fn project_columns_fallback_is_duplicate_free() {
 
 #[test]
 fn aggregate_query_builds_partial_agg_spec() {
-    let agg_plans = vec![
-        AggregatePlan {
-            kind: AggKind::Sum,
-            column: Some("AMOUNT".into()),
-            arg_expr: None,
-        },
-        AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        },
-    ];
+    let agg_plans = vec![column_plan(AggKind::Sum, "AMOUNT"), count_plan()];
     let merge_inputs = AggregateMergeInputs::new(
         Vec::new(),
         cast_merge_items(
@@ -750,11 +739,7 @@ fn build_agg_sql(
 
 #[test]
 fn aggregate_merge_renders_having_then_request_limit() {
-    let plans = vec![AggregatePlan {
-        kind: AggKind::Count,
-        column: None,
-        arg_expr: None,
-    }];
+    let plans = vec![count_plan()];
     let merge_select = cast_merge_items(
         &plans,
         &[ExasolType::decimal(18, 0)],
@@ -786,26 +771,10 @@ fn aggregate_merge_renders_having_then_request_limit() {
 #[test]
 fn aggregate_wrapper_merges_partials() {
     let plans = vec![
-        AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        },
-        AggregatePlan {
-            kind: AggKind::Sum,
-            column: Some("AMOUNT".into()),
-            arg_expr: None,
-        },
-        AggregatePlan {
-            kind: AggKind::Min,
-            column: Some("TS".into()),
-            arg_expr: None,
-        },
-        AggregatePlan {
-            kind: AggKind::Max,
-            column: Some("TS".into()),
-            arg_expr: None,
-        },
+        count_plan(),
+        column_plan(AggKind::Sum, "AMOUNT"),
+        column_plan(AggKind::Min, "TS"),
+        column_plan(AggKind::Max, "TS"),
     ];
 
     let files = vec![
@@ -870,18 +839,7 @@ fn aggregate_wrapper_merges_partials() {
 
 #[test]
 fn aggregate_merge_over_scalar_scan_no_wrapper() {
-    let plans = vec![
-        AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        },
-        AggregatePlan {
-            kind: AggKind::Sum,
-            column: Some("AMOUNT".into()),
-            arg_expr: None,
-        },
-    ];
+    let plans = vec![count_plan(), column_plan(AggKind::Sum, "AMOUNT")];
     let sql = build_agg_sql(
         plans,
         vec!["s3://w/f0.parquet".into(), "s3://w/f1.parquet".into()],
@@ -904,11 +862,7 @@ fn aggregate_merge_over_scalar_scan_no_wrapper() {
 
 #[test]
 fn aggregate_single_shard_merge_over_fromless_scalar_scan() {
-    let plans = vec![AggregatePlan {
-        kind: AggKind::Count,
-        column: None,
-        arg_expr: None,
-    }];
+    let plans = vec![count_plan()];
     let sql = build_agg_sql(plans, vec!["s3://w/only.parquet".into()], 1);
 
     assert!(
@@ -965,11 +919,7 @@ fn aggregate_merge_splices_caller_select_items_and_types_emits_per_plan() {
 
 #[test]
 fn avg_wrapper_divides_sum_by_count_guarded() {
-    let plans = vec![AggregatePlan {
-        kind: AggKind::Avg,
-        column: Some("SCORE".into()),
-        arg_expr: None,
-    }];
+    let plans = vec![column_plan(AggKind::Avg, "SCORE")];
     let files = vec![
         "s3://warehouse/f0.parquet".into(),
         "s3://warehouse/f1.parquet".into(),
@@ -1009,18 +959,7 @@ fn avg_wrapper_divides_sum_by_count_guarded() {
 
 #[test]
 fn single_shard_aggregate_still_uses_merge_wrapper() {
-    let plans = vec![
-        AggregatePlan {
-            kind: AggKind::Count,
-            column: None,
-            arg_expr: None,
-        },
-        AggregatePlan {
-            kind: AggKind::Avg,
-            column: Some("SCORE".into()),
-            arg_expr: None,
-        },
-    ];
+    let plans = vec![count_plan(), column_plan(AggKind::Avg, "SCORE")];
     let files = vec!["s3://warehouse/f0.parquet".into()];
     let sql = build_agg_sql(plans, files, 1);
 

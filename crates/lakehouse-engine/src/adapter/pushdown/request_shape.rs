@@ -9,7 +9,8 @@
 use super::grouped_agg::{
     GroupedOrderBy, MergeScope, build_grouped_order_by_clause, render_having_over_merge,
 };
-use super::single_group_agg::{SingleGroupItem, SingleGroupPlans, has_distinct};
+use super::scalar_over_agg::TypedPlans;
+use super::single_group_agg::{SingleGroupItem, has_distinct, single_group_plans};
 use super::support::{PushdownRequest, ScanTranslator};
 use super::{
     GroupedAggregateDetection, detect_aggregates, detect_group_by_aggregates,
@@ -32,7 +33,7 @@ pub(super) enum RequestShape {
     /// Ordinary aggregate column types passed [`validate_agg_col_types`].
     SingleGroupAgg {
         items: Vec<SingleGroupItem>,
-        plans: SingleGroupPlans,
+        aggregates: TypedPlans,
         having: Option<String>,
     },
     SingleGroupWrapper,
@@ -46,11 +47,10 @@ pub(super) fn classify_request_shape(
     let pushdown_req = pushdown.json();
     // A SUM over a non-numeric column would produce an opaque UDF error; demote.
     if let Some(detection) = detect_group_by_aggregates(pushdown, scan)
-        && validate_agg_col_types(&detection.plans, scan.columns())
+        && validate_agg_col_types(&detection.aggregates.plans, scan.columns())
     {
         let scope = MergeScope {
-            plans: &detection.plans,
-            merged: &detection.merged,
+            aggregates: &detection.aggregates,
             group_keys: &detection.group_keys,
         };
         // The merge wrapper only has `GK_*`/`PARTIAL_*` columns, so an aggregate absent
@@ -80,9 +80,9 @@ pub(super) fn classify_request_shape(
 
     // Validated against ordinary plans only: a distinct item is a row-scan fan-out. A nested
     // aggregate without an exact type declines to the wrapper (#476).
-    let Some((items, plans)) = detect_aggregates(pushdown, scan).and_then(|items| {
-        let plans = SingleGroupPlans::new(&items, pushdown.select_types(), scan)?;
-        validate_agg_col_types(&plans.plans, scan.columns()).then_some((items, plans))
+    let Some((items, aggregates)) = detect_aggregates(pushdown, scan).and_then(|items| {
+        let aggregates = single_group_plans(&items, pushdown.select_types(), scan)?;
+        validate_agg_col_types(&aggregates.plans, scan.columns()).then_some((items, aggregates))
     }) else {
         return if pushdown_req.get("aggregationType").and_then(|v| v.as_str())
             == Some("single_group")
@@ -97,8 +97,7 @@ pub(super) fn classify_request_shape(
         Some(_) if has_distinct(&items) => return RequestShape::SingleGroupWrapper,
         Some(node) => {
             let scope = MergeScope {
-                plans: &plans.plans,
-                merged: &plans.merged,
+                aggregates: &aggregates,
                 group_keys: &[],
             };
             match render_having_over_merge(node, &scope, scan) {
@@ -109,7 +108,7 @@ pub(super) fn classify_request_shape(
     };
     RequestShape::SingleGroupAgg {
         items,
-        plans,
+        aggregates,
         having,
     }
 }

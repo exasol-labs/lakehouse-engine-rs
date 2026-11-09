@@ -3822,13 +3822,13 @@ fn merge_casts_only_values_whose_type_merging_changes() {
     let table = typed_table();
 
     let single_group = "SELECT MIN(C_TS), MAX(C_TS), SUM(C_QTY), COUNT(*), MIN(C_QTY + 1), \
-                        ROUND(SUM(C_QTY), 2) FROM {}";
-    let char_group = "SELECT C_VARCHAR, MIN(CAST(C_VARCHAR AS CHAR(20))), SUM(C_QTY) FROM {} \
+                        ROUND(SUM(C_QTY), 2) FROM {T}";
+    let char_group = "SELECT C_VARCHAR, MIN(CAST(C_VARCHAR AS CHAR(20))), SUM(C_QTY) FROM {T} \
                       GROUP BY C_VARCHAR";
-    let date_group = "SELECT C_DATE, SUM(C_QTY) FROM {} GROUP BY C_DATE";
+    let date_group = "SELECT C_DATE, SUM(C_QTY) FROM {T} GROUP BY C_DATE";
 
     let single_group_sql =
-        isolated_pushdown_statement(&mut conn, &single_group.replace("{}", &table));
+        isolated_pushdown_statement(&mut conn, &single_group.replace("{T}", &table));
     let merge = outer_merge_select_list(&single_group_sql);
     assert!(
         merge.starts_with(
@@ -3852,14 +3852,14 @@ fn merge_casts_only_values_whose_type_merging_changes() {
         "no MIN or MAX merge may be cast: {merge}"
     );
 
-    let char_group_sql = isolated_pushdown_statement(&mut conn, &char_group.replace("{}", &table));
+    let char_group_sql = isolated_pushdown_statement(&mut conn, &char_group.replace("{T}", &table));
     assert!(
-        has_n_scan_wrapper(&char_group_sql, 1) && !char_group_sql.contains("PARTIAL_"),
+        PathCheck::Wrapper.holds(char_group, &char_group_sql),
         "the scan does not blank-pad, so a MIN over a CAST to CHAR runs in the qualified \
          wrapper: {char_group_sql}"
     );
 
-    let date_group_sql = isolated_pushdown_statement(&mut conn, &date_group.replace("{}", &table));
+    let date_group_sql = isolated_pushdown_statement(&mut conn, &date_group.replace("{T}", &table));
     let merge = outer_merge_select_list(&date_group_sql);
     assert!(
         merge.starts_with("\"GK_0\", CAST(SUM(\"PARTIAL_sum_0\") AS DECIMAL("),

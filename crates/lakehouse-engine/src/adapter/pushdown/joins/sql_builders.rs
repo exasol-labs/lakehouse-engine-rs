@@ -5,7 +5,7 @@ use crate::scan::spec::{
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-use vs_expression::render_expression_exasol;
+use vs_expression::{SqlFragment, render_expression_exasol};
 
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
@@ -21,7 +21,7 @@ use super::planning::{
 use super::rendering::{
     conjoin_filters, cross_leg_residual_filter, leg_local_filter, projection_item_select_sql,
     referenced_clause_values, referenced_leg_columns, render_df_filter_qualified,
-    render_expression_qualified, render_select_item_qualified, screen_leg_filter,
+    render_expression_qualified, screen_leg_filter, select_item_type,
 };
 
 /// Exasol rejects a longer identifier (`maximum length of identifier exceeded`, verified live
@@ -239,15 +239,11 @@ fn n_scan_join_select_items(
         Some(Json::Array(list)) if !list.is_empty() => {
             let mut fragments = Vec::with_capacity(list.len());
             for item in list {
-                let fragment = render_select_item_qualified(item, legs, cols_per_leg)
-                    .map_err(unattributable_decline)?
-                    .ok_or_else(|| {
-                        join_render_decline(
-                            "a select-list item could not be rendered for the qualified \
-                             N-scan join",
-                        )
-                    })?;
-                fragments.push(fragment);
+                let sql = render_required_clause(item, legs, "a select-list item")?;
+                fragments.push(SqlFragment::new(
+                    sql,
+                    select_item_type(item, legs, cols_per_leg),
+                ));
             }
             let items =
                 output_select_list(fragments, pushdown.select_types()).ok_or_else(|| {

@@ -57,7 +57,7 @@ mod topn;
 use topn::{detect_topn, parse_order_by_keys};
 
 mod single_group_agg;
-pub use single_group_agg::{SingleGroupPlans, detect_aggregates};
+pub use single_group_agg::{detect_aggregates, single_group_plans};
 use single_group_agg::{has_distinct, is_lone_count_distinct, single_group_merge_select};
 
 mod grouped_agg;
@@ -67,6 +67,7 @@ pub use grouped_agg::{
 };
 
 mod scalar_over_agg;
+pub use scalar_over_agg::TypedPlans;
 
 mod request_shape;
 use request_shape::{RequestShape, classify_request_shape};
@@ -325,6 +326,20 @@ pub(crate) fn build_dispatch_sql(
         );
     }
 
+    let fallback = || {
+        qualified_single_table_fallback_pushdown(
+            request,
+            pushdown,
+            &base,
+            filter.clone(),
+            shards,
+            scan.columns(),
+            udf_name,
+            distribute_udf_name,
+            None,
+        )
+    };
+
     let single_group_merge = match classify_request_shape(pushdown, scan) {
         RequestShape::Grouped {
             detection,
@@ -334,9 +349,7 @@ pub(crate) fn build_dispatch_sql(
             let GroupedAggregateDetection {
                 group_keys,
                 group_key_types,
-                plans: grouped_agg_plans,
-                plan_types: grouped_agg_types,
-                merged,
+                aggregates,
                 select_items,
             } = detection;
             // Safe to apply the outer LIMIT: the merge renders its own ORDER BY, and the
@@ -347,7 +360,7 @@ pub(crate) fn build_dispatch_sql(
                 common: CommonScanSpec {
                     filter: filter.clone(),
                     limit: grouped_limit,
-                    aggregates: Some(grouped_agg_plans.clone()),
+                    aggregates: Some(aggregates.plans.clone()),
                     group_keys: Some(group_keys.clone()),
                     ..base.clone()
                 },
@@ -359,9 +372,7 @@ pub(crate) fn build_dispatch_sql(
                 &spec_template,
                 shards,
                 &group_key_types,
-                &grouped_agg_plans,
-                &grouped_agg_types,
-                &merged,
+                &aggregates,
                 &select_items,
                 pushdown.select_types(),
                 grouped_limit,
@@ -374,17 +385,7 @@ pub(crate) fn build_dispatch_sql(
             );
             let Some(sql) = sql else {
                 // Defensive: a shortened select list fails Exasol's positional validation.
-                return qualified_single_table_fallback_pushdown(
-                    request,
-                    pushdown,
-                    &base,
-                    filter.clone(),
-                    shards,
-                    scan.columns(),
-                    udf_name,
-                    distribute_udf_name,
-                    None,
-                );
+                return fallback();
             };
             return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
         }
@@ -393,21 +394,11 @@ pub(crate) fn build_dispatch_sql(
             // `selectList` columns (`04000` otherwise). The qualified wrapper lets Exasol
             // aggregate the materialized rows (#82). No outer WHERE is needed: an
             // untranslatable filter never reaches this arm.
-            return qualified_single_table_fallback_pushdown(
-                request,
-                pushdown,
-                &base,
-                filter.clone(),
-                shards,
-                scan.columns(),
-                udf_name,
-                distribute_udf_name,
-                None,
-            );
+            return fallback();
         }
         RequestShape::SingleGroupAgg {
             items,
-            plans,
+            aggregates,
             having,
         } => {
             // Lone bare-column COUNT(DISTINCT): the only fan-out shape. LIMIT goes only on
@@ -444,38 +435,18 @@ pub(crate) fn build_dispatch_sql(
             // subqueries ("emitting function in expression"). Use the qualified wrapper,
             // narrowed to referenced columns (#160).
             if has_distinct(&items) {
-                return qualified_single_table_fallback_pushdown(
-                    request,
-                    pushdown,
-                    &base,
-                    filter.clone(),
-                    shards,
-                    scan.columns(),
-                    udf_name,
-                    distribute_udf_name,
-                    None,
-                );
+                return fallback();
             }
             let merge_select =
-                single_group_merge_select(&items, &plans, pushdown.select_types(), scan);
-            let SingleGroupPlans { plans, types, .. } = plans;
+                single_group_merge_select(&items, &aggregates, pushdown.select_types(), scan);
+            let TypedPlans { plans, types, .. } = aggregates;
             let merge_inputs = merge_select.and_then(|merge_select| {
                 AggregateMergeInputs::new(types, merge_select, limit)
                     .map(|inputs| inputs.with_having(having))
             });
             let Some(merge_inputs) = merge_inputs else {
                 // Defensive: a shortened select list fails Exasol's positional validation.
-                return qualified_single_table_fallback_pushdown(
-                    request,
-                    pushdown,
-                    &base,
-                    filter.clone(),
-                    shards,
-                    scan.columns(),
-                    udf_name,
-                    distribute_udf_name,
-                    None,
-                );
+                return fallback();
             };
             Some((plans, merge_inputs))
         }
@@ -485,17 +456,7 @@ pub(crate) fn build_dispatch_sql(
             // widening signal, never by comparing column counts, which misses widenings
             // whose base-row width equals the select-list arity (#196).
             if projection_widened {
-                return qualified_single_table_fallback_pushdown(
-                    request,
-                    pushdown,
-                    &base,
-                    filter.clone(),
-                    shards,
-                    scan.columns(),
-                    udf_name,
-                    distribute_udf_name,
-                    None,
-                );
+                return fallback();
             }
             None
         }

@@ -184,6 +184,7 @@ fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only
     assert!(
         detect_group_by_aggregates(&req, untyped_scan())
             .expect("a group-key-only select list still detects as grouped")
+            .aggregates
             .plans
             .is_empty(),
         "the group-key-only shape must reach the classifier with an EMPTY plan list"
@@ -210,6 +211,7 @@ fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper
     assert_eq!(
         detect_group_by_aggregates(&req, untyped_scan())
             .expect("grouped aggregate")
+            .aggregates
             .plans
             .len(),
         1,

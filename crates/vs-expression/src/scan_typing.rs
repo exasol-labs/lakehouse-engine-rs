@@ -97,46 +97,156 @@ fn short(node: &Json) -> String {
     }
 }
 
-/// Indices of the arguments Exasol converts to text, per function and arity (#210).
-fn string_positions(fn_name: &str, arg_count: usize) -> Vec<usize> {
-    let all = || (0..arg_count).collect();
-    let first = || vec![0];
-    match fn_name {
-        "CONCAT" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "TRANSLATE" => all(),
-        "LOWER" | "UPPER" | "ASCII" | "INITCAP" | "REVERSE" | "LENGTH" | "OCTET_LENGTH"
-        | "UNICODE" | "SUBSTR" | "REPEAT" | "LEFT" | "RIGHT" | "TO_DATE" | "TO_TIMESTAMP" => {
-            first()
-        }
-        "LPAD" | "RPAD" if arg_count > 2 => vec![0, 2],
-        "LPAD" | "RPAD" => first(),
-        "INSTR" | "LOCATE" => vec![0, 1],
-        _ => Vec::new(),
-    }
-    .into_iter()
-    .filter(|i| *i < arg_count)
-    .collect()
+/// Which arguments of a function Exasol converts to text (#210).
+#[derive(Clone, Copy)]
+enum TextArgs {
+    Never,
+    All,
+    First,
+    FirstTwo,
+    /// The subject, and the fill of the three-argument form.
+    Pad,
 }
 
-fn function_class(fn_name: &str, args: &[TypeClass]) -> TypeClass {
-    let all_integer = || {
-        args.iter()
-            .all(|c| matches!(c, TypeClass::Integer { .. } | TypeClass::Null))
-    };
-    match fn_name {
-        "ADD" | "SUB" | "MULT" | "MOD" | "NEG" | "ABS" if all_integer() => TypeClass::INTEGER,
-        "ZEROIFNULL" | "NULLIFZERO" | "NULLIF" => args.first().copied().unwrap_or(TypeClass::Other),
-        "GREATEST" | "LEAST" => args
-            .iter()
-            .copied()
-            .reduce(TypeClass::union)
-            .unwrap_or(TypeClass::Other),
-        "CONCAT" | "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE"
-        | "REPEAT" | "REVERSE" | "LPAD" | "RPAD" | "INITCAP" | "LEFT" | "RIGHT" | "TRANSLATE"
-        | "CHR" | "UNICODECHR" => TypeClass::Text,
-        "ASCII" | "UNICODE" | "LENGTH" | "OCTET_LENGTH" | "INSTR" | "LOCATE" | "YEAR" | "MONTH"
-        | "DAY" | "HOUR" | "MINUTE" | "WEEK" => TypeClass::INTEGER,
-        _ => TypeClass::Other,
+/// How a function's result class follows from its arguments' classes.
+#[derive(Clone, Copy)]
+enum ResultRule {
+    Text,
+    Integer,
+    /// An integer when every argument is an integer or NULL.
+    IntegerOverIntegers,
+    FirstArgument,
+    Other,
+}
+
+/// What the typed pass and the renderer know about one scalar function.
+#[derive(Clone, Copy)]
+struct ScalarFunction {
+    name: &'static str,
+    text_args: TextArgs,
+    /// Text arguments that are parameters, not values: a format model or a unit.
+    parameters: &'static [usize],
+    result: ResultRule,
+    /// The renderer's generic arm emits it as a same-arity DataFusion string call.
+    string_call: bool,
+}
+
+impl ScalarFunction {
+    const fn new(name: &'static str, text_args: TextArgs, result: ResultRule) -> Self {
+        Self {
+            name,
+            text_args,
+            parameters: &[],
+            result,
+            string_call: false,
+        }
     }
+
+    const fn string_call(self) -> Self {
+        Self {
+            string_call: true,
+            ..self
+        }
+    }
+
+    const fn parameters(self, parameters: &'static [usize]) -> Self {
+        Self { parameters, ..self }
+    }
+
+    /// Indices of the arguments Exasol converts to text, for this arity.
+    fn string_positions(self, arg_count: usize) -> Vec<usize> {
+        let positions = match self.text_args {
+            TextArgs::Never => Vec::new(),
+            TextArgs::All => (0..arg_count).collect(),
+            TextArgs::First => vec![0],
+            TextArgs::FirstTwo => vec![0, 1],
+            TextArgs::Pad if arg_count > 2 => vec![0, 2],
+            TextArgs::Pad => vec![0],
+        };
+        positions.into_iter().filter(|i| *i < arg_count).collect()
+    }
+
+    fn class(self, args: &[TypeClass]) -> TypeClass {
+        match self.result {
+            ResultRule::Text => TypeClass::Text,
+            ResultRule::Integer => TypeClass::INTEGER,
+            ResultRule::IntegerOverIntegers
+                if args
+                    .iter()
+                    .all(|c| matches!(c, TypeClass::Integer { .. } | TypeClass::Null)) =>
+            {
+                TypeClass::INTEGER
+            }
+            ResultRule::FirstArgument => args.first().copied().unwrap_or(TypeClass::Other),
+            ResultRule::IntegerOverIntegers | ResultRule::Other => TypeClass::Other,
+        }
+    }
+}
+
+const UNLISTED: ScalarFunction = ScalarFunction::new("", TextArgs::Never, ResultRule::Other);
+
+/// The one per-function table; a name absent here takes no text and types as `Other`.
+const SCALAR_FUNCTIONS: &[ScalarFunction] = {
+    use ResultRule as R;
+    use ScalarFunction as F;
+    use TextArgs as T;
+    &[
+        F::new("CONCAT", T::All, R::Text),
+        F::new("TRIM", T::All, R::Text).string_call(),
+        F::new("LTRIM", T::All, R::Text).string_call(),
+        F::new("RTRIM", T::All, R::Text).string_call(),
+        F::new("REPLACE", T::All, R::Text).string_call(),
+        F::new("TRANSLATE", T::All, R::Text).string_call(),
+        F::new("LOWER", T::First, R::Text).string_call(),
+        F::new("UPPER", T::First, R::Text).string_call(),
+        F::new("INITCAP", T::First, R::Text).string_call(),
+        F::new("REVERSE", T::First, R::Text).string_call(),
+        F::new("SUBSTR", T::First, R::Text).string_call(),
+        F::new("REPEAT", T::First, R::Text).string_call(),
+        F::new("LEFT", T::First, R::Text).string_call(),
+        F::new("RIGHT", T::First, R::Text).string_call(),
+        F::new("LPAD", T::Pad, R::Text).string_call(),
+        F::new("RPAD", T::Pad, R::Text).string_call(),
+        F::new("CHR", T::Never, R::Text).string_call(),
+        F::new("UNICODECHR", T::Never, R::Text).string_call(),
+        F::new("ASCII", T::First, R::Integer).string_call(),
+        F::new("UNICODE", T::First, R::Integer).string_call(),
+        F::new("LENGTH", T::First, R::Integer).string_call(),
+        F::new("OCTET_LENGTH", T::First, R::Integer).string_call(),
+        F::new("INSTR", T::FirstTwo, R::Integer),
+        F::new("LOCATE", T::FirstTwo, R::Integer),
+        F::new("TO_DATE", T::First, R::Other).parameters(&[1]),
+        F::new("TO_TIMESTAMP", T::First, R::Other).parameters(&[1]),
+        F::new("DATE_TRUNC", T::Never, R::Other).parameters(&[0]),
+        F::new("YEAR", T::Never, R::Integer),
+        F::new("MONTH", T::Never, R::Integer),
+        F::new("DAY", T::Never, R::Integer),
+        F::new("HOUR", T::Never, R::Integer),
+        F::new("MINUTE", T::Never, R::Integer),
+        F::new("WEEK", T::Never, R::Integer),
+        F::new("ADD", T::Never, R::IntegerOverIntegers),
+        F::new("SUB", T::Never, R::IntegerOverIntegers),
+        F::new("MULT", T::Never, R::IntegerOverIntegers),
+        F::new("MOD", T::Never, R::IntegerOverIntegers),
+        F::new("NEG", T::Never, R::IntegerOverIntegers),
+        F::new("ABS", T::Never, R::IntegerOverIntegers),
+        F::new("ZEROIFNULL", T::Never, R::FirstArgument),
+        F::new("NULLIFZERO", T::Never, R::FirstArgument),
+        F::new("NULLIF", T::Never, R::FirstArgument),
+    ]
+};
+
+fn scalar_function(fn_name: &str) -> ScalarFunction {
+    SCALAR_FUNCTIONS
+        .iter()
+        .find(|f| f.name == fn_name)
+        .copied()
+        .unwrap_or(UNLISTED)
+}
+
+/// Whether the renderer emits upper-case `fn_name` as a same-arity DataFusion string call.
+pub(crate) fn is_string_call(fn_name: &str) -> bool {
+    scalar_function(fn_name).string_call
 }
 
 /// The widest text an integer of `precision` digits converts to, sign included.
@@ -348,23 +458,30 @@ pub(crate) fn type_scan_tree(
                 cast_class(&mut out, &classes_of("arguments"))?
             } else {
                 let args = classes_of("arguments");
-                let text_positions = string_positions(&fn_name, args.len());
+                let function = scalar_function(&fn_name);
+                let text_positions = function.string_positions(args.len());
                 for &i in &text_positions {
                     out["arguments"][i] = to_text(out["arguments"][i].take(), args[i])?;
                 }
-                if matches!(fn_name.as_str(), "GREATEST" | "LEAST" | "NULLIF") {
-                    unify_branches(node, &args)?;
-                } else {
-                    let parameters = text_parameter_positions(&fn_name);
-                    let converted: Vec<TypeClass> = args
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| !text_positions.contains(i) && !parameters.contains(i))
-                        .map(|(_, c)| *c)
-                        .collect();
-                    refuse_implicit_text(node, &converted)?;
+                match fn_name.as_str() {
+                    "GREATEST" | "LEAST" => unify_branches(node, &args)?,
+                    "NULLIF" => {
+                        unify_branches(node, &args)?;
+                        function.class(&args)
+                    }
+                    _ => {
+                        let converted: Vec<TypeClass> = args
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| {
+                                !text_positions.contains(i) && !function.parameters.contains(i)
+                            })
+                            .map(|(_, c)| *c)
+                            .collect();
+                        refuse_implicit_text(node, &converted)?;
+                        function.class(&args)
+                    }
                 }
-                function_class(&fn_name, &args)
             }
         }
         "function_aggregate" => {
@@ -503,15 +620,6 @@ fn unify_branches(node: &Json, branches: &[TypeClass]) -> Result<TypeClass, UdfE
         .copied()
         .reduce(TypeClass::union)
         .unwrap_or(TypeClass::Other))
-}
-
-/// Text arguments that are parameters, not values: a format model or a unit.
-fn text_parameter_positions(fn_name: &str) -> &'static [usize] {
-    match fn_name {
-        "DATE_TRUNC" => &[0],
-        "TO_DATE" | "TO_TIMESTAMP" => &[1],
-        _ => &[],
-    }
 }
 
 fn cast_class(out: &mut Json, args: &[TypeClass]) -> Result<TypeClass, UdfError> {

@@ -28,15 +28,11 @@ pub(crate) use vs_expression::test_support::{
 
 /// Renders through the typed scan gate with no column type known.
 pub(crate) fn untyped_scan_filter(filter: &Json) -> Option<String> {
-    vs_expression::render_scan_filter(filter, &ColumnTypes::default())
-        .ok()
-        .flatten()
+    scan_filter_sql(filter, &ColumnTypes::default())
 }
 
 pub(crate) fn untyped_scan_expression(expr: &Json) -> Option<String> {
-    vs_expression::render_scan_expression(expr, &ColumnTypes::default())
-        .ok()
-        .map(|fragment| fragment.sql)
+    untyped_scan().expression(expr).map(|fragment| fragment.sql)
 }
 
 /// The scan's typed filter SQL, `None` when it declines or the filter is trivially true.
@@ -58,7 +54,25 @@ pub(crate) fn single_group_plan_types(
     items: &[single_group_agg::SingleGroupItem],
     scan: ScanTranslator<'_>,
 ) -> Option<Vec<ExasolType>> {
-    SingleGroupPlans::new(items, select_types, scan).map(|plans| plans.types)
+    single_group_plans(items, select_types, scan).map(|plans| plans.types)
+}
+
+/// `COUNT(*)`'s partial plan.
+pub(crate) fn count_plan() -> AggregatePlan {
+    AggregatePlan {
+        kind: AggKind::Count,
+        column: None,
+        arg_expr: None,
+    }
+}
+
+/// The partial plan of `kind` over a bare `column`.
+pub(crate) fn column_plan(kind: AggKind, column: &str) -> AggregatePlan {
+    AggregatePlan {
+        kind,
+        column: Some(column.to_string()),
+        arg_expr: None,
+    }
 }
 
 /// A translator that knows no column type.

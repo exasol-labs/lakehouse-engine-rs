@@ -6,22 +6,18 @@
 use crate::common::e2e_harness::*;
 use crate::common::exasol_ws::ExaConn;
 use crate::common::seed::{
-    CHAR_PAD_COL, CHAR_PAD_OTHER, CHAR_PAD_OVER_LENGTH, CHAR_PAD_SHORT,
-    CHAR_PAD_SHORT_TRAILING_SPACE, CHAR_PAD_TOTAL_ROWS, E2E_CHAR_PAD_TABLE, ExpectedValue,
+    CHAR_PAD_COL, CHAR_PAD_OVER_LENGTH, CHAR_PAD_SHORT_TRAILING_SPACE, ExpectedValue,
     TYPED_TABLE_TOTAL_ROWS,
 };
 use crate::common::timestamp_precision::expected_timestamp_precision;
 use crate::fixtures::{
-    LAKEHOUSE_VS, TYPED_COLUMNS, assert_single_table_wrapper, assert_two_scan_join_wrapper,
-    events_table, lakehouse_vs, typed_table, vs_dim_table, vs_fact_table,
+    TYPED_COLUMNS, assert_single_table_wrapper, assert_two_scan_join_wrapper, events_table,
+    lakehouse_vs, typed_table, vs_char_pad_table, vs_dim_table, vs_fact_table,
 };
 
-/// The fix's measured worst-case divergence from native Exasol is ~1 ULP (3.17e-16).
+/// The measured worst-case divergence of the scan's float division from native Exasol is
+/// ~1 ULP (3.17e-16).
 const FLOAT_DIV_ORACLE_REL_TOLERANCE: f64 = 1e-15;
-
-fn vs_char_pad_table() -> String {
-    format!("{LAKEHOUSE_VS}.{}", E2E_CHAR_PAD_TABLE.to_uppercase())
-}
 
 #[test]
 fn e2e_advertises_inner_equi_join_capability() {
@@ -480,6 +476,22 @@ fn e2e_selectlist_predicate_projection_pushdown() {
     }
 }
 
+/// `c_decimal_a` by `id`, unscaled at scale 2.
+const TYPED_DECIMAL_A_UNSCALED: [(i64, Option<i128>); 12] = [
+    (1, Some(1050)),
+    (2, Some(2025)),
+    (3, None),
+    (4, Some(3000)),
+    (5, Some(1050)),
+    (6, Some(4099)),
+    (7, Some(1050)),
+    (8, Some(5000)),
+    (9, Some(2025)),
+    (10, None),
+    (11, Some(6000)),
+    (12, Some(3000)),
+];
+
 /// `c_decimal_a` is absent: `TYPED_DECIMAL_A_UNSCALED` already tracks it.
 struct TypedProbeRow {
     id: i64,
@@ -908,7 +920,7 @@ fn e2e_now_family_projection_matches_native_session_local_value() {
     assert!(
         offset_seconds != 0.0,
         "fixture precondition: the session's UTC offset must be non-zero, or the \
-         assertion below passes regardless of whether #238 is fixed"
+         assertion below passes whichever zone the adapter applies (#238)"
     );
 
     for expr in ["CURRENT_TIMESTAMP", "SYSTIMESTAMP"] {
@@ -924,8 +936,7 @@ fn e2e_now_family_projection_matches_native_session_local_value() {
             "{expr}'s deviation between the native value and the VS-projected value \
              ({deviation}s) must be near zero — this is the sharp assertion that \
              fails if the adapter ever ships the UTC instant instead of Exasol's own \
-             session-local value (the pre-#238 defect, {offset_seconds}s under this \
-             session's zone)"
+             session-local value ({offset_seconds}s off under this session's zone, #238)"
         );
     }
 }
@@ -1551,85 +1562,6 @@ fn e2e_order_by_column_referenced_only_in_projected_expression() {
     }
 }
 
-// Exasol's DECIMAL→VARCHAR conversion trims trailing scale zeros and drops an all-zero
-// fraction (`30.00` → `"30"`) (#211). Expected strings come from an independent Rust
-// oracle.
-
-const TYPED_DECIMAL_A_UNSCALED: [(i64, Option<i128>); 12] = [
-    (1, Some(1050)),
-    (2, Some(2025)),
-    (3, None),
-    (4, Some(3000)),
-    (5, Some(1050)),
-    (6, Some(4099)),
-    (7, Some(1050)),
-    (8, Some(5000)),
-    (9, Some(2025)),
-    (10, None),
-    (11, Some(6000)),
-    (12, Some(3000)),
-];
-
-/// From scratch, so it is an independent oracle.
-fn exasol_trim_decimal_string(unscaled: i128, scale: u32) -> String {
-    let negative = unscaled < 0;
-    let digits = unscaled.unsigned_abs().to_string();
-    let scale = scale as usize;
-    let digits = if digits.len() <= scale {
-        format!("{}{digits}", "0".repeat(scale + 1 - digits.len()))
-    } else {
-        digits
-    };
-    let (int_part, frac_part) = digits.split_at(digits.len() - scale);
-    let frac_trimmed = frac_part.trim_end_matches('0');
-
-    let mut out = int_part.to_string();
-    if !frac_trimmed.is_empty() {
-        out.push('.');
-        out.push_str(frac_trimmed);
-    }
-    if negative {
-        out = format!("-{out}");
-    }
-    out
-}
-
-#[test]
-fn exasol_trim_decimal_string_matches_documented_values() {
-    assert_eq!(exasol_trim_decimal_string(1050, 2), "10.5");
-    assert_eq!(exasol_trim_decimal_string(2025, 2), "20.25");
-    assert_eq!(exasol_trim_decimal_string(3000, 2), "30");
-    assert_eq!(exasol_trim_decimal_string(4099, 2), "40.99");
-    assert_eq!(exasol_trim_decimal_string(5000, 2), "50");
-    assert_eq!(exasol_trim_decimal_string(6000, 2), "60");
-}
-
-#[test]
-fn e2e_decimal_cast_trims_trailing_zeros() {
-    lakehouse_vs();
-    let mut conn = exa_conn();
-
-    let sql = format!(
-        "SELECT id, CAST(c_decimal_a AS VARCHAR(20)) FROM {} WHERE id IN (1,4,6) ORDER BY id",
-        typed_table()
-    );
-    let cols = conn.query_columns(&sql);
-    assert_eq!(cols.len(), 2, "expected 2 columns (id, CAST): {cols:?}");
-    assert_eq!(cols[0].len(), 3, "expected 3 rows (id 1,4,6): {cols:?}");
-
-    let expected = ["10.5", "30", "40.99"];
-    for (i, exp) in expected.iter().enumerate() {
-        let s = cols[1][i]
-            .as_str()
-            .unwrap_or_else(|| panic!("CAST result at row {i} is not a string: {:?}", cols[1][i]));
-        assert_eq!(
-            s, *exp,
-            "row {i}: CAST(c_decimal_a AS VARCHAR(20)) must be {exp:?}, got {s:?} \
-             (pre-fix code returned the untrimmed fixed-scale string, e.g. \"10.50\")"
-        );
-    }
-}
-
 #[test]
 fn e2e_issue_189_shape_equivalent_local_verification() {
     lakehouse_vs();
@@ -1666,136 +1598,8 @@ fn e2e_issue_189_shape_equivalent_local_verification() {
     }
 }
 
-#[test]
-fn e2e_decimal_concat_trims_trailing_zeros() {
-    lakehouse_vs();
-    let mut conn = exa_conn();
-
-    let sql = format!(
-        "SELECT id, id||'-'||c_decimal_a FROM {} WHERE id IN (1,4) ORDER BY id",
-        typed_table()
-    );
-    let cols = conn.query_columns(&sql);
-    assert_eq!(cols.len(), 2, "expected 2 columns (id, CONCAT): {cols:?}");
-    assert_eq!(cols[0].len(), 2, "expected 2 rows (id 1,4): {cols:?}");
-
-    let expected = ["1-10.5", "4-30"];
-    for (i, exp) in expected.iter().enumerate() {
-        let s = cols[1][i].as_str().unwrap_or_else(|| {
-            panic!("CONCAT result at row {i} is not a string: {:?}", cols[1][i])
-        });
-        assert_eq!(
-            s, *exp,
-            "row {i}: id||'-'||c_decimal_a must be {exp:?}, got {s:?} \
-             (pre-fix code returned \"1-10.50\" / \"4-30.00\")"
-        );
-    }
-}
-
-#[test]
-fn e2e_decimal_length_reflects_trimmed_string() {
-    lakehouse_vs();
-    let mut conn = exa_conn();
-
-    let sql = format!(
-        "SELECT id, LENGTH(c_decimal_a) FROM {} WHERE id IN (1,4,6) ORDER BY id",
-        typed_table()
-    );
-    let cols = conn.query_columns(&sql);
-    assert_eq!(cols.len(), 2, "expected 2 columns (id, LENGTH): {cols:?}");
-    assert_eq!(cols[0].len(), 3, "expected 3 rows (id 1,4,6): {cols:?}");
-
-    // Untrimmed "10.50" / "30.00" / "40.99" would all be 5 characters.
-    let expected = [4i64, 2, 5];
-    for (i, exp) in expected.iter().enumerate() {
-        let len = parse_int(&cols[1][i]);
-        assert_eq!(
-            len, *exp,
-            "row {i}: LENGTH(c_decimal_a) must be {exp}, got {len} \
-             (pre-fix code returned 5 uniformly)"
-        );
-    }
-}
-
-#[test]
-fn e2e_decimal_length_where_count_matches_trimmed_semantics() {
-    lakehouse_vs();
-    let mut conn = exa_conn();
-    let t = typed_table();
-
-    let expected_lengths: Vec<(i64, Option<i64>)> = TYPED_DECIMAL_A_UNSCALED
-        .iter()
-        .map(|&(id, unscaled)| {
-            (
-                id,
-                unscaled.map(|v| exasol_trim_decimal_string(v, 2).len() as i64),
-            )
-        })
-        .collect();
-
-    let expected_count = expected_lengths
-        .iter()
-        .filter(|(_, len)| len.is_some_and(|l| l > 4))
-        .count() as i64;
-    let untrimmed_count = expected_lengths
-        .iter()
-        .filter(|(_, len)| len.is_some())
-        .count() as i64;
-
-    // Every untrimmed value is 5 characters, so a differing count is what discriminates
-    // old from new behavior.
-    assert_ne!(
-        expected_count, untrimmed_count,
-        "expected trimmed-length count must differ from the untrimmed-length \
-         (bug) count of {untrimmed_count} for this test to discriminate \
-         old vs. new code"
-    );
-
-    let row_sql = format!("SELECT id, LENGTH(c_decimal_a) FROM {t} ORDER BY id");
-    let cols = conn.query_columns(&row_sql);
-    assert_eq!(cols.len(), 2, "expected 2 columns (id, LENGTH): {cols:?}");
-    assert_eq!(cols[0].len(), 12, "expected all 12 seed rows: {cols:?}");
-
-    for (i, &(expected_id, expected_len)) in expected_lengths.iter().enumerate() {
-        let id = parse_int(&cols[0][i]);
-        assert_eq!(
-            id, expected_id,
-            "row {i}: id must be {expected_id}, got {id}"
-        );
-        match expected_len {
-            Some(len) => {
-                let actual = parse_int(&cols[1][i]);
-                assert_eq!(
-                    actual, len,
-                    "id={id}: LENGTH(c_decimal_a) must be {len}, got {actual} \
-                     (a pre-fix build would return the untrimmed length 5 here)"
-                );
-            }
-            None => {
-                assert!(
-                    cols[1][i].is_null(),
-                    "id={id}: LENGTH(c_decimal_a) must be NULL for a NULL cell, got {:?}",
-                    cols[1][i]
-                );
-            }
-        }
-    }
-
-    let count_sql = format!("SELECT COUNT(*) FROM {t} WHERE LENGTH(c_decimal_a) > 4");
-    let count_cols = conn.query_columns(&count_sql);
-    let actual_count = parse_int(&count_cols[0][0]);
-    assert_eq!(
-        actual_count, expected_count,
-        "COUNT(*) WHERE LENGTH(c_decimal_a) > 4 must be {expected_count} \
-         (trimmed-string LENGTH semantics), got {actual_count} — a pre-fix \
-         build would return {untrimmed_count} (every non-NULL row, via the \
-         untrimmed fixed-scale string length)"
-    );
-}
-
-// String functions over non-string arguments (#210): Exasol converts implicitly, but
-// DataFusion refuses. VARCHAR/CHAR pass through, DATE is CAST to VARCHAR, DECIMAL uses
-// the trimmed rendering, and other types decline to native Exasol.
+// String functions over non-string arguments: Exasol converts them to text implicitly,
+// which DataFusion refuses, so the scan writes an integer's text itself.
 
 #[test]
 fn e2e_upper_varchar_pushdown() {
@@ -1842,106 +1646,9 @@ fn e2e_upper_id_trims_to_plain_integer_string() {
     );
 }
 
-#[test]
-fn e2e_ltrim_decimal_trims_trailing_zeros() {
-    lakehouse_vs();
-    let mut conn = exa_conn();
-
-    let sql = format!(
-        "SELECT id, LTRIM(c_decimal_a) FROM {} WHERE id IN (1,4,6) ORDER BY id",
-        typed_table()
-    );
-    let cols = conn.query_columns(&sql);
-    assert_eq!(cols.len(), 2, "expected 2 columns (id, LTRIM): {cols:?}");
-    assert_eq!(cols[0].len(), 3, "expected 3 rows (id 1,4,6): {cols:?}");
-
-    let ids = [1i64, 4, 6];
-    for (i, &expected_id) in ids.iter().enumerate() {
-        let id = parse_int(&cols[0][i]);
-        assert_eq!(
-            id, expected_id,
-            "row {i}: id must be {expected_id}, got {id}"
-        );
-
-        let unscaled = TYPED_DECIMAL_A_UNSCALED
-            .iter()
-            .find(|&&(row_id, _)| row_id == expected_id)
-            .unwrap_or_else(|| panic!("no TYPED_DECIMAL_A_UNSCALED entry for id={expected_id}"))
-            .1
-            .unwrap_or_else(|| panic!("id={expected_id} c_decimal_a must not be NULL"));
-        let expected = exasol_trim_decimal_string(unscaled, 2);
-
-        let s = cols[1][i]
-            .as_str()
-            .unwrap_or_else(|| panic!("LTRIM result at row {i} is not a string: {:?}", cols[1][i]));
-        assert_eq!(
-            s, expected,
-            "row {i} (id={id}): LTRIM(c_decimal_a) must be {expected:?}, got {s:?}"
-        );
-    }
-}
-
-#[test]
-fn e2e_lower_date_formats_as_iso() {
-    lakehouse_vs();
-    let mut conn = exa_conn();
-
-    let sql = format!("SELECT LOWER(c_date) FROM {} WHERE id = 1", typed_table());
-    let cols = conn.query_columns(&sql);
-    assert_eq!(cols.len(), 1, "expected 1 column (LOWER(c_date)): {cols:?}");
-    assert_eq!(cols[0].len(), 1, "expected 1 row (id=1): {cols:?}");
-
-    let lower = cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("LOWER(c_date) not a string: {:?}", cols[0][0]));
-    assert_eq!(
-        lower, "2024-01-01",
-        "LOWER(c_date) for id=1 must be \"2024-01-01\", got {lower:?}"
-    );
-}
-
-#[test]
-fn e2e_instr_decimal_finds_dot_position_in_trimmed_text() {
-    lakehouse_vs();
-    let mut conn = exa_conn();
-
-    let sql = format!(
-        "SELECT id, INSTR(c_decimal_a, '.') FROM {} WHERE id IN (1,4,6) ORDER BY id",
-        typed_table()
-    );
-    let cols = conn.query_columns(&sql);
-    assert_eq!(cols.len(), 2, "expected 2 columns (id, INSTR): {cols:?}");
-    assert_eq!(cols[0].len(), 3, "expected 3 rows (id 1,4,6): {cols:?}");
-
-    let ids = [1i64, 4, 6];
-    for (i, &expected_id) in ids.iter().enumerate() {
-        let id = parse_int(&cols[0][i]);
-        assert_eq!(
-            id, expected_id,
-            "row {i}: id must be {expected_id}, got {id}"
-        );
-
-        let unscaled = TYPED_DECIMAL_A_UNSCALED
-            .iter()
-            .find(|&&(row_id, _)| row_id == expected_id)
-            .unwrap_or_else(|| panic!("no TYPED_DECIMAL_A_UNSCALED entry for id={expected_id}"))
-            .1
-            .unwrap_or_else(|| panic!("id={expected_id} c_decimal_a must not be NULL"));
-        let trimmed = exasol_trim_decimal_string(unscaled, 2);
-        let expected_pos = trimmed.find('.').map(|i| i as i64 + 1).unwrap_or(0);
-
-        let pos = parse_int(&cols[1][i]);
-        assert_eq!(
-            pos, expected_pos,
-            "row {i} (id={id}): INSTR(c_decimal_a, '.') must be {expected_pos} \
-             (position within trimmed text {trimmed:?}), got {pos}"
-        );
-    }
-}
-
-// BOOLEAN, DOUBLE and TIMESTAMP string-function arguments decline to native Exasol.
-// Each result is compared with an in-session native oracle over a bare literal, so a
-// regressed guard either hard-fails or returns DataFusion's divergent formatting.
+// The scan writes a BOOLEAN as `TRUE`/`FALSE`, and Exasol computes a DOUBLE or TIMESTAMP
+// string-function argument. Each result is compared with a native oracle over a bare literal,
+// because DataFusion's own formatting of these types differs from Exasol's.
 
 #[test]
 fn e2e_upper_double_declines_to_native_oracle() {
@@ -2108,7 +1815,7 @@ fn e2e_instr_arity_decline_selectlist_matches_native_oracle() {
     assert_eq!(
         vs_value, 2,
         "INSTR(c_varchar, 'a', 2) for id=1 (\"aa\") must be 2 (native decline), \
-         got {vs_value} (a regressed coerce-not-decline build would return 1)"
+         got {vs_value} (a strpos that drops the start position returns 1)"
     );
 }
 
@@ -2134,8 +1841,8 @@ fn e2e_instr_arity_decline_where_matches_native_oracle() {
     assert!(
         ids.contains(&4),
         "WHERE INSTR(c_varchar, 'b', 3) = 0 must include id=4 (\"bb\", native \
-         decline gives 0), got ids={ids:?} (a regressed coerce build would \
-         compute strpos('bb','b')=1, never matching id=4)"
+         decline gives 0), got ids={ids:?} (a strpos that drops the start \
+         position returns 1 for 'bb', never matching id=4)"
     );
 }
 
@@ -2527,8 +2234,8 @@ fn e2e_order_by_aggregate_with_limit_zero_returns_no_rows() {
     );
 }
 
-// Dialect-aware rendering in Exasol-parsed wrapper SQL (#209): pre-fix, DataFusion
-// function names reached Exasol and were rejected (42000). The TPC-H-shaped repros are
+// Dialect-aware rendering in Exasol-parsed wrapper SQL (#209): Exasol rejects a DataFusion
+// function name with 42000. The TPC-H-shaped repros are
 // retargeted onto `events`/`typed_distinct_probe`, each compared with an in-session
 // native oracle.
 
@@ -2927,9 +2634,8 @@ fn e2e_now_family_matches_native_oracle() {
         1,
         "SELECT SYSTIMESTAMP FROM {} must return exactly one distinct value \
          across all rows (statement-constancy Exasol guarantees); a \
-         regressed pushdown of now() into the scan instead returns one \
-         value PER SHARD (measured as two over this two-file table \
-         pre-withdrawal), got {distinct_vs:?}",
+         pushdown of now() into the scan instead returns one \
+         value PER SHARD (two over this two-file table), got {distinct_vs:?}",
         typed_table()
     );
     let vs_ts = parse_exasol_timestamp(vs_values[0]);
@@ -2950,7 +2656,7 @@ fn e2e_now_family_matches_native_oracle() {
     assert!(
         delta <= 60,
         "VS SYSTIMESTAMP ({vs_ts}) must be within 60s of the native oracle \
-         SYSTIMESTAMP ({oracle_ts}); a regressed build pushing now() \
+         SYSTIMESTAMP ({oracle_ts}); a scan computing now() \
          UTC-naively into the scan would diverge by a whole zone offset \
          (>= 1h) from Exasol's own {db_timezone}-zoned clock, got \
          delta={delta}s"
@@ -3141,12 +2847,12 @@ fn boolean_to_text_in_the_single_table_wrapper_matches_native() {
 
     // A date converted to text routes each query into the Exasol-dialect wrapper.
     let queries = [
-        "SELECT ID, C_DATE || 'x', CAST(C_DECIMAL_A > 10 AS VARCHAR(10)) FROM {} ORDER BY ID",
-        "SELECT ID, C_DATE || 'x', (C_DECIMAL_A > 10) || 'y' FROM {} ORDER BY ID",
+        "SELECT ID, C_DATE || 'x', CAST(C_DECIMAL_A > 10 AS VARCHAR(10)) FROM {T} ORDER BY ID",
+        "SELECT ID, C_DATE || 'x', (C_DECIMAL_A > 10) || 'y' FROM {T} ORDER BY ID",
     ];
     assert_queries_match_native_copy(&mut conn, &table, TYPED_COLUMNS, &queries);
     for query in queries {
-        assert_single_table_wrapper(&mut conn, &query.replace("{}", &table));
+        assert_single_table_wrapper(&mut conn, &query.replace("{T}", &table));
     }
 }
 
@@ -3160,32 +2866,32 @@ fn non_emittable_select_items_match_native() {
     let table = typed_table();
 
     let single_table = [
-        "SELECT ID, C_TS - C_TS FROM {} ORDER BY ID",
-        "SELECT C_TS - C_TS, COUNT(*) FROM {} GROUP BY C_TS - C_TS ORDER BY 1",
-        "SELECT MIN(C_TS - C_TS) FROM {}",
-        "SELECT MIN(CAST(C_TS AS TIMESTAMP WITH LOCAL TIME ZONE)) FROM {}",
-        "SELECT CAST(C_TS AS TIMESTAMP WITH LOCAL TIME ZONE), COUNT(*) FROM {} \
+        "SELECT ID, C_TS - C_TS FROM {T} ORDER BY ID",
+        "SELECT C_TS - C_TS, COUNT(*) FROM {T} GROUP BY C_TS - C_TS ORDER BY 1",
+        "SELECT MIN(C_TS - C_TS) FROM {T}",
+        "SELECT MIN(CAST(C_TS AS TIMESTAMP WITH LOCAL TIME ZONE)) FROM {T}",
+        "SELECT CAST(C_TS AS TIMESTAMP WITH LOCAL TIME ZONE), COUNT(*) FROM {T} \
          GROUP BY CAST(C_TS AS TIMESTAMP WITH LOCAL TIME ZONE) ORDER BY 1",
         // The INTERVAL item routes both ASCII casts into the Exasol-dialect wrapper.
         "SELECT ID, C_TS - C_TS, CAST(C_VARCHAR AS VARCHAR(10) ASCII), \
-         CAST(C_VARCHAR AS CHAR(5) ASCII) FROM {} ORDER BY ID",
+         CAST(C_VARCHAR AS CHAR(5) ASCII) FROM {T} ORDER BY ID",
         "SELECT ID, CAST(CASE WHEN C_VARCHAR = 'aa' THEN 'POINT (1 2)' END AS GEOMETRY) \
-         FROM {} ORDER BY ID",
+         FROM {T} ORDER BY ID",
         "SELECT ID, CAST(CASE WHEN C_VARCHAR = 'aa' THEN '00000000000000000000000000000000' \
-         END AS HASHTYPE) FROM {} ORDER BY ID",
+         END AS HASHTYPE) FROM {T} ORDER BY ID",
     ];
     // The pairs of `cc` rows hold different timestamps, so the interval is not always zero.
-    let join = "SELECT a.ID, b.ID, a.C_TS - b.C_TS FROM {} a JOIN {} b ON a.C_VARCHAR = b.C_VARCHAR \
+    let join = "SELECT a.ID, b.ID, a.C_TS - b.C_TS FROM {T} a JOIN {T} b ON a.C_VARCHAR = b.C_VARCHAR \
                 ORDER BY a.ID, b.ID";
-    let pruned = "SELECT C_TS - C_TS, COUNT(*) FROM {} WHERE ID < 0 GROUP BY C_TS - C_TS";
+    let pruned = "SELECT C_TS - C_TS, COUNT(*) FROM {T} WHERE ID < 0 GROUP BY C_TS - C_TS";
     let queries: Vec<&str> = single_table.iter().copied().chain([join, pruned]).collect();
     assert_queries_match_native_copy(&mut conn, &table, TYPED_COLUMNS, &queries);
 
     for query in single_table {
-        assert_single_table_wrapper(&mut conn, &query.replace("{}", &table));
+        assert_single_table_wrapper(&mut conn, &query.replace("{T}", &table));
     }
-    assert_two_scan_join_wrapper(&mut conn, &join.replace("{}", &table));
-    let pruned_sql = pruned.replace("{}", &table);
+    assert_two_scan_join_wrapper(&mut conn, &join.replace("{T}", &table));
+    let pruned_sql = pruned.replace("{T}", &table);
     assert_eq!(
         conn.query_row_count(&pruned_sql),
         0,
@@ -3248,17 +2954,17 @@ fn strict_type_check_accepts_every_request_shape() {
         &table,
         TYPED_COLUMNS,
         &[
-            "SELECT * FROM {} ORDER BY ID",
-            "SELECT ID, CAST(C_TS AS TIMESTAMP) FROM {} ORDER BY ID",
-            "SELECT ID, CAST(C_VARCHAR AS VARCHAR(2000000)) FROM {} ORDER BY ID",
+            "SELECT * FROM {T} ORDER BY ID",
+            "SELECT ID, CAST(C_TS AS TIMESTAMP) FROM {T} ORDER BY ID",
+            "SELECT ID, CAST(C_VARCHAR AS VARCHAR(2000000)) FROM {T} ORDER BY ID",
         ],
     );
 
     // Exasol sends an empty `selectList` for `RANDOM()`, and its values differ per run.
-    let random = "SELECT RANDOM() FROM {}";
+    let random = "SELECT RANDOM() FROM {T}";
     assert_eq!(
-        conn.query_row_count(&random.replace("{}", &table)),
-        conn.query_row_count(&random.replace("{}", NATIVE_COPY)),
+        conn.query_row_count(&random.replace("{T}", &table)),
+        conn.query_row_count(&random.replace("{T}", NATIVE_COPY)),
         "{random} must return as many rows as native Exasol"
     );
 }
@@ -3325,12 +3031,15 @@ fn char_declared_pushdown_shapes_match_native() {
         "CAST(name AS CHAR(20)) must be \"event-01\" plus 12 trailing spaces, got {padded:?}"
     );
 
-    // Assert the pushdown carries CHAR(20); a declined pushdown would pass the value checks.
-    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    // The scan does not blank-pad, so the wrapper applies the CAST, rendered as CHAR.
+    let pushed_sql = isolated_pushdown_statement(&mut conn, &sql);
+    assert!(
+        PathCheck::Wrapper.holds(&sql, &pushed_sql) && !pushed_sql.contains(SCAN_ITEM),
+        "Exasol must compute CAST(name AS CHAR(20)) in the wrapper, not the scan: {pushed_sql}"
+    );
     assert!(
         pushed_sql.contains("CHAR(20)") && !pushed_sql.contains("VARCHAR(20)"),
-        "expected the pushed SQL for CAST(name AS CHAR(20)) to declare CHAR(20) \
-         (not VARCHAR(20)), got: {pushed_sql}"
+        "the wrapper must cast to CHAR(20), not VARCHAR(20): {pushed_sql}"
     );
 
     let sql = format!(
@@ -3382,148 +3091,26 @@ fn char_declared_pushdown_shapes_match_native() {
 
 /// Scenario: A CAST to CHAR returns Exasol's padded value
 #[test]
-fn char_group_key_merges_trailing_space_variants_like_native() {
-    lakehouse_vs();
-    let mut conn = exa_conn();
-
-    let sql = format!(
-        "SELECT CAST({CHAR_PAD_COL} AS CHAR(30)) g, COUNT(*) c FROM {} GROUP BY 1",
-        vs_char_pad_table()
-    );
-
-    // Assert the pushdown carries CHAR(30); native Exasol would merge the same way.
-    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
-    assert!(
-        pushed_sql.contains("CHAR(30)") && !pushed_sql.contains("VARCHAR(30)"),
-        "expected the pushed SQL to declare the group key CHAR(30) (not \
-         VARCHAR(30)), proving the blank-pad merge behavior was actually \
-         pushed down: {pushed_sql}"
-    );
-
-    let cols = conn.query_columns(&sql);
-    assert_eq!(cols.len(), 2, "expected 2 columns (g, c): {cols:?}");
-    assert_eq!(
-        cols[0].len(),
-        3,
-        "expected 3 groups ({CHAR_PAD_TOTAL_ROWS} rows minus the \
-         '{CHAR_PAD_SHORT}'/'{CHAR_PAD_SHORT_TRAILING_SPACE}' merge): {cols:?}"
-    );
-
-    let groups: Vec<(String, i64)> = cols[0]
-        .iter()
-        .zip(cols[1].iter())
-        .map(|(g, c)| {
-            (
-                g.as_str().unwrap_or_default().trim_end().to_string(),
-                parse_int(c),
-            )
-        })
-        .collect();
-
-    let merged = groups
-        .iter()
-        .find(|(g, _)| g == CHAR_PAD_SHORT)
-        .unwrap_or_else(|| panic!("expected a merged group for {CHAR_PAD_SHORT:?}: {groups:?}"));
-    assert_eq!(
-        merged.1, 2,
-        "'{CHAR_PAD_SHORT}' and '{CHAR_PAD_SHORT_TRAILING_SPACE}' must merge into ONE \
-         group with count 2: {groups:?}"
-    );
-
-    let other = groups
-        .iter()
-        .find(|(g, _)| g == CHAR_PAD_OTHER)
-        .unwrap_or_else(|| panic!("expected a singleton group for '{CHAR_PAD_OTHER}': {groups:?}"));
-    assert_eq!(
-        other.1, 1,
-        "'{CHAR_PAD_OTHER}' must remain its own singleton group: {groups:?}"
-    );
-
-    let over_length = groups
-        .iter()
-        .find(|(g, _)| g == CHAR_PAD_OVER_LENGTH)
-        .unwrap_or_else(|| {
-            panic!("expected a singleton group for the over-length value: {groups:?}")
-        });
-    assert_eq!(
-        over_length.1, 1,
-        "the 25-character over-length value must be its own singleton group \
-         under CHAR(30): {groups:?}"
-    );
-}
-
-/// Scenario: A CAST to CHAR returns Exasol's padded value
-#[test]
 fn over_length_char_group_key_raises_truncation_error_like_native() {
     lakehouse_vs();
     let mut conn = exa_conn();
+    let table = vs_char_pad_table();
+    create_full_native_copy(&mut conn, &table);
 
-    let sql = format!(
-        "SELECT CAST({CHAR_PAD_COL} AS CHAR(20)) g, COUNT(*) c FROM {} GROUP BY 1",
-        vs_char_pad_table()
-    );
-
-    // The scan does not blank-pad, so Exasol applies the CAST and raises its own error.
-    let pushed = explain_virtual_sql(&mut conn, &sql);
-    assert!(
-        pushed.contains("CHAR(20)") && !pushed.contains("VARCHAR(20)"),
-        "expected the pushed SQL to declare CHAR(20) (not VARCHAR(20)), got: {pushed}"
-    );
-
-    let resp = conn.try_execute(&sql);
-
-    let message = error_text(
-        &resp,
-        &format!("GROUP BY on a CHAR(20) key over a 25-character value ({sql})"),
-    )
-    .to_ascii_lowercase();
-    let sql_code = resp["exception"]["sqlCode"].as_str().unwrap_or_default();
-    assert!(
-        sql_code.contains("22002"),
-        "expected Exasol's CAST truncation error, which it raises as sqlCode 22002 over the \
-         scanned rows, got sqlCode={sql_code:?} message={message:?}: {resp}"
-    );
-
-    assert_query_fails(
-        &mut conn,
-        &format!(
-            "SELECT COUNT(*) c FROM {} GROUP BY CAST({CHAR_PAD_COL} AS CHAR(20))",
-            vs_char_pad_table()
-        ),
-        &["right truncation"],
-    );
-}
-
-#[test]
-fn over_length_char_projection_fails_cleanly() {
-    lakehouse_vs();
-    let mut conn = exa_conn();
-
-    let sql = format!(
-        "SELECT CAST({CHAR_PAD_COL} AS CHAR(20)) FROM {}",
-        vs_char_pad_table()
-    );
-
-    // The scan does not blank-pad, so Exasol applies the CAST and raises its own error.
-    let pushed = explain_virtual_sql(&mut conn, &sql);
-    assert!(
-        pushed.contains("CHAR(20)") && !pushed.contains("VARCHAR(20)"),
-        "expected the pushed SQL to declare CHAR(20) (not VARCHAR(20)), got: {pushed}"
-    );
-
-    let resp = conn.try_execute(&sql);
-
-    let message = error_text(
-        &resp,
-        &format!("CAST(val AS CHAR(20)) over a 25-character value ({sql})"),
-    )
-    .to_ascii_lowercase();
-    let sql_code = resp["exception"]["sqlCode"].as_str().unwrap_or_default();
-    assert!(
-        sql_code.contains("22001") && message.contains("right truncation"),
-        "expected native Exasol's CAST truncation error (sqlCode 22001), got \
-         sqlCode={sql_code:?} message={message:?}: {resp}"
-    );
+    for query in [
+        format!("SELECT CAST({CHAR_PAD_COL} AS CHAR(20)) g, COUNT(*) c FROM {{T}} GROUP BY 1"),
+        format!("SELECT COUNT(*) c FROM {{T}} GROUP BY CAST({CHAR_PAD_COL} AS CHAR(20))"),
+    ] {
+        let vs_query = query.replace("{T}", &table);
+        let pushed = isolated_pushdown_statement(&mut conn, &vs_query);
+        assert!(
+            PathCheck::Wrapper.holds(&query, &pushed),
+            "the scan does not blank-pad, so Exasol must group on the CAST: {pushed}"
+        );
+        for sql in [vs_query, query.replace("{T}", NATIVE_COPY)] {
+            assert_query_fails(&mut conn, &sql, &["right truncation"]);
+        }
+    }
 }
 
 #[test]
@@ -3578,164 +3165,145 @@ fn e2e_float_div_decimal_over_decimal_matches_native_oracle() {
     );
 }
 
-/// `None` leaves the path unasserted, for a shape whose routing Exasol decides.
-const SPLIT_AGGREGATE_CASES: &[(&str, Option<bool>)] = &[
-    ("SELECT LENGTH(MAX(UPPER(C_VARCHAR))) FROM {T}", Some(false)),
+/// `Unchecked` is a shape whose routing Exasol decides.
+const SPLIT_AGGREGATE_CASES: &[(&str, PathCheck<'static>)] = &[
+    (
+        "SELECT LENGTH(MAX(UPPER(C_VARCHAR))) FROM {T}",
+        PathCheck::Wrapper,
+    ),
     (
         "SELECT C_BOOL, LENGTH(MAX(UPPER(C_VARCHAR))) FROM {T} GROUP BY C_BOOL",
-        Some(false),
+        PathCheck::Wrapper,
     ),
-    ("SELECT MAX(UPPER(C_VARCHAR)) || '!' FROM {T}", Some(false)),
+    (
+        "SELECT MAX(UPPER(C_VARCHAR)) || '!' FROM {T}",
+        PathCheck::Wrapper,
+    ),
     (
         "SELECT MIN(LOWER(C_VARCHAR)) || MAX(UPPER(C_VARCHAR)) FROM {T}",
-        Some(false),
+        PathCheck::Wrapper,
     ),
     (
         "SELECT CASE WHEN MAX(CASE WHEN C_VARCHAR = 'aa' THEN 'Y' ELSE 'N' END) = 'Y' \
          THEN 1 ELSE 0 END FROM {T}",
-        Some(false),
+        PathCheck::Wrapper,
     ),
     (
         "SELECT YEAR(MAX(DATE_TRUNC('month', C_DATE))) FROM {T}",
-        Some(false),
+        PathCheck::Wrapper,
     ),
     (
         "SELECT C_BOOL, YEAR(MAX(DATE_TRUNC('month', C_DATE))) FROM {T} GROUP BY C_BOOL",
-        Some(false),
+        PathCheck::Wrapper,
     ),
     (
         "SELECT ROUND(SUM(C_DECIMAL_B * C_DECIMAL_B), 8) FROM {T}",
-        Some(false),
+        PathCheck::Wrapper,
     ),
     (
         "SELECT C_BOOL, ROUND(SUM(C_DECIMAL_B * C_DECIMAL_B), 8) FROM {T} GROUP BY C_BOOL",
-        Some(false),
+        PathCheck::Wrapper,
     ),
     (
         "SELECT MAX(C_DOUBLE * 2) + 1, SUM(C_DOUBLE * 3) + 1 FROM {T}",
-        Some(false),
+        PathCheck::Wrapper,
     ),
     (
         "SELECT 'X', LENGTH(MAX(UPPER(C_VARCHAR))) FROM {T}",
-        Some(false),
+        PathCheck::Wrapper,
     ),
     (
         "SELECT MONTH(MIN(CAST(C_DATE AS TIMESTAMP))) FROM {T}",
-        Some(true),
+        PathCheck::Split,
     ),
     (
         "SELECT MAX(UPPER(C_VARCHAR)), LENGTH(MAX(UPPER(C_VARCHAR))) FROM {T}",
-        Some(true),
+        PathCheck::Split,
     ),
     (
         "SELECT LENGTH(MAX(C_VARCHAR)), YEAR(MAX(C_DATE)) FROM {T}",
-        Some(true),
+        PathCheck::Split,
     ),
-    ("SELECT AVG(LENGTH(C_VARCHAR)) FROM {T}", Some(true)),
-    ("SELECT COUNT(UPPER(C_VARCHAR)) * 2 FROM {T}", Some(true)),
-    ("SELECT SUM(C_DECIMAL_B) / 2 FROM {T}", Some(true)),
+    ("SELECT AVG(LENGTH(C_VARCHAR)) FROM {T}", PathCheck::Split),
+    (
+        "SELECT COUNT(UPPER(C_VARCHAR)) * 2 FROM {T}",
+        PathCheck::Split,
+    ),
+    ("SELECT SUM(C_DECIMAL_B) / 2 FROM {T}", PathCheck::Split),
     (
         "SELECT C_BOOL, SUM(C_DECIMAL_B) / 2 FROM {T} GROUP BY C_BOOL",
-        Some(true),
+        PathCheck::Split,
     ),
     (
         "SELECT C_DECIMAL_A, COUNT(*) FROM {T} GROUP BY C_DECIMAL_A ORDER BY C_DECIMAL_A",
-        Some(true),
+        PathCheck::Split,
     ),
     (
         "SELECT C_DOUBLE, COUNT(*) FROM {T} GROUP BY C_DOUBLE ORDER BY C_DOUBLE DESC",
-        Some(true),
+        PathCheck::Split,
     ),
     (
         "SELECT (C_DOUBLE - 2) * 0, COUNT(*) FROM {T} GROUP BY (C_DOUBLE - 2) * 0",
-        Some(true),
+        PathCheck::Split,
     ),
     (
         "SELECT C_VARCHAR, COUNT(*) FROM {T} GROUP BY C_VARCHAR HAVING C_VARCHAR > 'b'",
-        None,
+        PathCheck::Unchecked,
     ),
     (
         "SELECT C_DATE, COUNT(*) FROM {T} GROUP BY C_DATE ORDER BY C_DATE",
-        Some(true),
+        PathCheck::Split,
     ),
     (
         "SELECT C_TS, COUNT(*) FROM {T} GROUP BY C_TS ORDER BY 1 DESC",
-        Some(true),
+        PathCheck::Split,
     ),
     (
         "SELECT C_BOOL, COUNT(*) FROM {T} GROUP BY C_BOOL HAVING COUNT(*) > 1",
-        Some(true),
+        PathCheck::Split,
     ),
     (
         "SELECT C_BOOL, C_DATE, SUM(C_QTY) FROM {T} GROUP BY C_BOOL, C_DATE ORDER BY 2, 1",
-        Some(true),
+        PathCheck::Split,
     ),
     (
         "SELECT COUNT(*) FROM {T} GROUP BY C_DOUBLE ORDER BY C_DOUBLE",
-        Some(true),
+        PathCheck::Split,
     ),
     (
         "SELECT UPPER(C_VARCHAR), COUNT(*) FROM {T} GROUP BY UPPER(C_VARCHAR)",
-        Some(true),
+        PathCheck::Split,
     ),
     (
         "SELECT COUNT(*) FROM {T} GROUP BY UPPER(C_VARCHAR)",
-        Some(false),
+        PathCheck::Wrapper,
     ),
 ];
 
-/// Over the CHAR pad table. The scan declines a CAST to CHAR, so each case takes the wrapper.
-const CHAR_CAST_SPLIT_CASES: &[(&str, Option<bool>)] = &[
-    (
-        "SELECT CAST(VAL AS CHAR(4)), COUNT(*) FROM {T} \
-         WHERE VAL <> 'over-length-value-abcdefg' GROUP BY CAST(VAL AS CHAR(4))",
-        Some(false),
-    ),
-    (
-        "SELECT COUNT(*) FROM {T} \
-         WHERE VAL <> 'over-length-value-abcdefg' GROUP BY CAST(VAL AS CHAR(4))",
-        Some(false),
-    ),
-    (
-        "SELECT CAST(VAL AS CHAR(4)) FROM {T} WHERE VAL = 'ab   '",
-        Some(false),
-    ),
-];
-
-/// `NATIVE_COPY` holds a native copy of `table`, which each query names as `{T}`.
-fn split_aggregate_failures(
-    conn: &mut ExaConn,
-    table: &str,
-    cases: &[(&str, Option<bool>)],
-) -> Vec<String> {
-    cases
-        .iter()
-        .filter_map(|(query, split)| split_aggregate_mismatch(conn, table, query, *split))
-        .collect()
-}
-
-fn split_aggregate_mismatch(
-    conn: &mut ExaConn,
-    table: &str,
-    query: &str,
-    split: Option<bool>,
-) -> Option<String> {
-    let vs_query = query.replace("{T}", table);
-    let actual = comparable_result(conn, &vs_query);
-    let expected = comparable_result(conn, &query.replace("{T}", NATIVE_COPY));
-    if actual != expected {
-        return Some(format!(
-            "`{query}`: got {actual:?}, the oracle {expected:?}"
-        ));
-    }
-    let split = split?;
-    let plan = isolated_pushdown_statement(conn, &vs_query);
-    let holds = if split {
-        plan.contains("PARTIAL_")
-    } else {
-        has_n_scan_wrapper(&plan, 1) && !plan.contains("PARTIAL_")
-    };
-    (!holds).then(|| format!("`{query}` took the wrong path (split: {split}): {plan}"))
+/// Over the CHAR pad table. The scan does not blank-pad, so Exasol applies each CAST to CHAR.
+fn char_cast_cases() -> Vec<(String, PathCheck<'static>)> {
+    let cast = |n: u32| format!("CAST({CHAR_PAD_COL} AS CHAR({n}))");
+    let fits = format!("{CHAR_PAD_COL} <> '{CHAR_PAD_OVER_LENGTH}'");
+    [
+        format!(
+            "SELECT {}, COUNT(*) FROM {{T}} WHERE {fits} GROUP BY {}",
+            cast(4),
+            cast(4)
+        ),
+        format!(
+            "SELECT COUNT(*) FROM {{T}} WHERE {fits} GROUP BY {}",
+            cast(4)
+        ),
+        format!(
+            "SELECT {} FROM {{T}} WHERE {CHAR_PAD_COL} = '{CHAR_PAD_SHORT_TRAILING_SPACE}'",
+            cast(4)
+        ),
+        format!("SELECT {} g, COUNT(*) c FROM {{T}} GROUP BY 1", cast(30)),
+        format!("SELECT {} FROM {{T}}", cast(20)),
+    ]
+    .into_iter()
+    .map(|query| (query, PathCheck::Wrapper))
+    .collect()
 }
 
 /// Scenario: A nested aggregate over an expression declines the split
@@ -3744,6 +3312,7 @@ fn split_aggregate_mismatch(
 /// Scenario: A group key travels with its exact type
 /// Scenario: An unprojected bare-column group key takes its column type
 /// Scenario: An unprojected group key without an exact type declines the split
+/// Scenario: A CAST to CHAR returns Exasol's padded value
 #[test]
 fn e2e_split_aggregate_columns_match_native_oracle() {
     lakehouse_vs();
@@ -3751,21 +3320,25 @@ fn e2e_split_aggregate_columns_match_native_oracle() {
 
     let typed = typed_table();
     create_native_copy(&mut conn, &typed, TYPED_COLUMNS);
-    let mut failures = split_aggregate_failures(&mut conn, &typed, SPLIT_AGGREGATE_CASES);
+    let mut failures: Vec<String> = SPLIT_AGGREGATE_CASES
+        .iter()
+        .filter_map(|(query, path)| {
+            native_copy_mismatch(&mut conn, &typed, NATIVE_COPY, query, *path)
+        })
+        .collect();
 
     let char_pad = vs_char_pad_table();
     create_full_native_copy(&mut conn, &char_pad);
-    failures.extend(split_aggregate_failures(
-        &mut conn,
-        &char_pad,
-        CHAR_CAST_SPLIT_CASES,
-    ));
+    let char_cases = char_cast_cases();
+    failures.extend(char_cases.iter().filter_map(|(query, path)| {
+        native_copy_mismatch(&mut conn, &char_pad, NATIVE_COPY, query, *path)
+    }));
 
     assert!(
         failures.is_empty(),
         "{} of {} split-aggregate cases failed:\n{}",
         failures.len(),
-        SPLIT_AGGREGATE_CASES.len() + CHAR_CAST_SPLIT_CASES.len(),
+        SPLIT_AGGREGATE_CASES.len() + char_cases.len(),
         failures.join("\n")
     );
 }

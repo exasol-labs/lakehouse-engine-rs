@@ -822,14 +822,12 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     }))
                 }
                 // DataFusion dialect only; the Exasol dialect renders these at the gate.
-                "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE"
-                | "REPEAT" | "REVERSE" | "LPAD" | "RPAD" | "ASCII" | "CHR" | "INITCAP" | "LEFT"
-                | "RIGHT" | "TRANSLATE" | "LENGTH" | "OCTET_LENGTH" | "UNICODE" | "UNICODECHR" => {
+                name if scan_typing::is_string_call(name) => {
                     let args = args.ok_or_else(|| {
                         UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
                     })?;
                     let lower;
-                    let df_name = match fn_name.as_str() {
+                    let df_name = match name {
                         "LENGTH" => "character_length",
                         "OCTET_LENGTH" => "octet_length",
                         "UNICODE" => "ascii",

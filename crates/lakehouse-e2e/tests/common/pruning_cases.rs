@@ -2,7 +2,8 @@
 //! binary provisions its format's copy of the fixture; these checks are shared by every format.
 
 use super::e2e_harness::{
-    SCAN_SCRIPT_NAME, comparable_result, isolated_pushdown_statement, parse_int, value_to_string,
+    PathCheck, SCAN_FILTER, SCAN_SCRIPT_NAME, isolated_pushdown_statement, native_copy_mismatch,
+    parse_int, value_to_string,
 };
 use super::exasol_ws::ExaConn;
 use super::pruning_fixture::{
@@ -33,7 +34,7 @@ enum Placement {
 
 impl Placement {
     fn holds(self, plan: &str) -> bool {
-        let scan_filter = plan.contains(SCAN_FILTER_MARKER);
+        let scan_filter = plan.contains(SCAN_FILTER);
         match self {
             Placement::Scan => scan_filter,
             Placement::OuterWhere => plan.contains(OUTER_WHERE_ALIAS) && !scan_filter,
@@ -41,7 +42,6 @@ impl Placement {
     }
 }
 
-const SCAN_FILTER_MARKER: &str = "\"filter\":\"";
 const OUTER_WHERE_ALIAS: &str = "LHS_T0";
 
 #[derive(Clone, Copy, Debug)]
@@ -404,9 +404,13 @@ impl Format {
 }
 
 fn oracle_mismatch(conn: &mut ExaConn, query: &str, format: Format) -> Option<String> {
-    let actual = comparable_result(conn, &query.replace("{T}", &format.table()));
-    let expected = comparable_result(conn, &query.replace("{T}", PRUNING_ORACLE_TABLE));
-    (actual != expected).then(|| format!("`{query}`: got {actual:?}, the oracle {expected:?}"))
+    native_copy_mismatch(
+        conn,
+        &format.table(),
+        PRUNING_ORACLE_TABLE,
+        query,
+        PathCheck::Unchecked,
+    )
 }
 
 fn path_mismatch(conn: &mut ExaConn, query: &str, format: Format, pruned: bool) -> Option<String> {
@@ -436,13 +440,12 @@ const SINGLE_GROUP_SHAPES: &[(&str, bool)] = &[
 ];
 
 fn shape_mismatch(conn: &mut ExaConn, query: &str, format: Format, split: bool) -> Option<String> {
-    let plan = isolated_pushdown_statement(conn, &query.replace("{T}", &format.table()));
-    let holds = if split {
-        plan.contains("PARTIAL_") && (!query.contains(" HAVING ") || plan.contains(" HAVING "))
+    let path = if split {
+        PathCheck::Split
     } else {
-        plan.contains(&format!("AS \"{OUTER_WHERE_ALIAS}\"")) && !plan.contains("PARTIAL_")
+        PathCheck::Wrapper
     };
-    (!holds).then(|| format!("`{query}` took the wrong path (split: {split}): {plan}"))
+    native_copy_mismatch(conn, &format.table(), PRUNING_ORACLE_TABLE, query, path)
 }
 
 pub fn assert_single_group_aggregates_match_oracle(conn: &mut ExaConn, format: Format) {
