@@ -441,6 +441,24 @@ pub fn lakekeeper_warehouse_storage_profile(warehouse_name: &str) -> serde_json:
         })
 }
 
+/// The REST path prefix Lakekeeper's own `/v1/config` serves for `warehouse_name`.
+pub fn warehouse_prefix(warehouse_name: &str) -> String {
+    let config: serde_json::Value = http_client()
+        .get(format!("{}/v1/config", catalog_uri_host()))
+        .query(&[("warehouse", warehouse_name)])
+        .bearer_auth(keycloak_client_credentials_token())
+        .send()
+        .and_then(|resp| resp.error_for_status())
+        .and_then(|resp| resp.json())
+        .unwrap_or_else(|e| panic!("Lakekeeper config for warehouse {warehouse_name}: {e}"));
+    // The Iceberg REST spec lets `overrides` win over `defaults`; Lakekeeper serves `defaults`.
+    ["overrides", "defaults"]
+        .iter()
+        .find_map(|map| config[map]["prefix"].as_str())
+        .unwrap_or_else(|| panic!("Lakekeeper config for {warehouse_name} names no prefix"))
+        .to_string()
+}
+
 /// The access-delegated `loadTable` response, fetched as any Iceberg REST client would, so a
 /// fixture check reads Lakekeeper's own vended credentials and not the adapter's reading of them.
 pub fn load_table_with_vended_credentials(
@@ -449,10 +467,11 @@ pub fn load_table_with_vended_credentials(
     table: &str,
 ) -> LoadTableResult {
     let token = keycloak_client_credentials_token();
-    let base = catalog_uri_host();
-    let prefix = catalog_prefix(warehouse_name, &token);
-
-    let url = format!("{base}/v1/{prefix}/namespaces/{namespace}/tables/{table}");
+    let prefix = warehouse_prefix(warehouse_name);
+    let url = format!(
+        "{}/v1/{prefix}/namespaces/{namespace}/tables/{table}",
+        catalog_uri_host()
+    );
     let resp = http_client()
         .get(&url)
         .header("X-Iceberg-Access-Delegation", "vended-credentials")
@@ -468,29 +487,11 @@ pub fn load_table_with_vended_credentials(
         .unwrap_or_else(|e| panic!("Lakekeeper loadTable {url} is not a LoadTableResult: {e}"))
 }
 
-/// The Iceberg REST path prefix of the warehouse, from its `GET /v1/config`.
-fn catalog_prefix(warehouse_name: &str, token: &str) -> String {
-    let config: serde_json::Value = http_client()
-        .get(format!("{}/v1/config", catalog_uri_host()))
-        .query(&[("warehouse", warehouse_name)])
-        .bearer_auth(token)
-        .send()
-        .and_then(|resp| resp.error_for_status())
-        .and_then(|resp| resp.json())
-        .unwrap_or_else(|e| panic!("Lakekeeper config for warehouse {warehouse_name}: {e}"));
-    // The Iceberg REST spec lets `overrides` win over `defaults`; Lakekeeper serves `defaults`.
-    ["overrides", "defaults"]
-        .iter()
-        .find_map(|map| config[map]["prefix"].as_str())
-        .unwrap_or_else(|| panic!("Lakekeeper config for {warehouse_name} names no prefix"))
-        .to_string()
-}
-
 /// The metadata of `table`, a `<namespace>.<table>` name, with every snapshot and the
 /// `metadata-log`, or `None` when the warehouse holds no such table.
 pub fn table_metadata(warehouse_name: &str, table: &str) -> Option<serde_json::Value> {
     let token = keycloak_client_credentials_token();
-    let prefix = catalog_prefix(warehouse_name, &token);
+    let prefix = warehouse_prefix(warehouse_name);
     let (namespace, name) = table
         .rsplit_once('.')
         .unwrap_or_else(|| panic!("{table} is not a <namespace>.<table> name"));

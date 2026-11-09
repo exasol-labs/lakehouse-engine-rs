@@ -113,6 +113,7 @@ fn both_clients_are_catalog_client_trait_objects() {
     let iceberg: Box<dyn CatalogClient> = Box::new(IcebergRestCatalogClient::new(
         "http://catalog".into(),
         connection_creds(),
+        None,
     ));
     let unity: Box<dyn CatalogClient> =
         Box::new(UnityCatalogSession::new("http://unity", connection_creds()));

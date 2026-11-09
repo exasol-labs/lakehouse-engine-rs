@@ -98,7 +98,7 @@ pub(crate) async fn session(uri: &str, use_vended_credentials: bool) -> CatalogS
         use_vended_credentials,
         ..Default::default()
     };
-    CatalogSession::resolve(uri, "wh", &creds)
+    CatalogSession::resolve(uri, "wh", None, &creds)
         .await
         .expect("a session over the fake catalog")
 }

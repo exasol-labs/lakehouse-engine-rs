@@ -36,7 +36,7 @@ impl IcebergRestTarget {
         } = &self.connection;
         let creds = resolve_aws_identity(creds.clone(), address, *allow_http).await?;
         let storage = WriteStorage::of(&creds, *allow_http);
-        let session = CatalogSession::resolve(address, &creds.warehouse, &creds)
+        let session = CatalogSession::resolve(address, &creds.warehouse, None, &creds)
             .await
             .map_err(|error| {
                 refusal(format_args!(

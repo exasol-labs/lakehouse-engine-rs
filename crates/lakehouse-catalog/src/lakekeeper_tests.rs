@@ -159,7 +159,7 @@ async fn check_against(
         ..crate::test_support::base_creds()
     };
     let catalog_uri = format!("{uri}/catalog");
-    let session = CatalogSession::resolve(&catalog_uri, "wh", &creds).await?;
+    let session = CatalogSession::resolve(&catalog_uri, "wh", None, &creds).await?;
     lakekeeper_batch_check(&session, PRINCIPAL, tables, &creds).await
 }
 
@@ -244,7 +244,7 @@ async fn a_batch_check_answered_503_once_succeeds_at_the_second_attempt() {
         ..crate::test_support::base_creds()
     };
     let catalog_uri = format!("{uri}/catalog");
-    let session = CatalogSession::resolve(&catalog_uri, "wh", &creds)
+    let session = CatalogSession::resolve(&catalog_uri, "wh", None, &creds)
         .await
         .expect("the config lookup succeeds");
 

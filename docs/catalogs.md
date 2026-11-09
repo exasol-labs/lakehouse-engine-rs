@@ -178,6 +178,10 @@ those notes against the table's current snapshot.
   snapshot the query reads. A filter on a renamed column prunes by that column's own bounds. A
   column whose field id the snapshot's schema lacks prunes no file.
 
+**Changing the CONNECTION.** `CREATE VIRTUAL SCHEMA`, `REFRESH`, and `SET PROPERTIES` record the
+catalog's REST path prefix, and queries reuse it. After an `ALTER CONNECTION` that points the
+CONNECTION at another catalog or warehouse, run `ALTER VIRTUAL SCHEMA ... REFRESH`.
+
 ## AWS Glue Iceberg REST (SigV4)
 
 The catalog URI is the Glue Iceberg REST endpoint. `warehouse` is the AWS **account id**, not an `s3://` path. The adapter derives the Glue REST prefix `catalogs/{account-id}` from it automatically. Turn `use_sigv4` on. `access_key` and `secret_key` then become required, and they sign the catalog requests. When the CONNECTION's address is a standard, commercial AWS Glue endpoint of the form `https://glue.<region>.amazonaws.com` — as below — that endpoint supplies its own SigV4 signing region, so `region` may be omitted for signing purposes; any other Glue endpoint (AWS GovCloud, AWS China, FIPS, a VPC interface endpoint, a private or proxy host) still requires a stated `region`. `region` also places the S3 store, independently of whatever region signs the catalog request, so state it whenever a scan reads data with static S3 keys — even against a standard endpoint. Omit `endpoint`. With `path_style: false`, the S3 client derives the standard AWS endpoint from `region`. The account id below is a placeholder, so substitute your own.

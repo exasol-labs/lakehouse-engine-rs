@@ -213,31 +213,49 @@ pub trait CatalogClient: Send + Sync {
         &self,
         idents: &[CatalogTableIdent],
     ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>>;
+
+    /// The catalog prefix a resolved session found, for a later client to reuse. `None` for a
+    /// kind without one.
+    fn catalog_prefix(&self) -> Option<String> {
+        None
+    }
 }
 
 /// One [`CatalogSession`], resolved on first use, serves the listing and every load, so all the
-/// requests the client serves share one OAuth2 grant and one `/v1/config` lookup.
+/// requests the client serves share one OAuth2 grant and at most one `/v1/config` lookup.
 pub struct IcebergRestCatalogClient {
     catalog_uri: String,
     creds: ConnectionCreds,
+    catalog_prefix: Option<String>,
     session: OnceCell<CatalogSession>,
 }
 
 impl IcebergRestCatalogClient {
-    pub fn new(catalog_uri: String, creds: ConnectionCreds) -> Self {
+    /// A `catalog_prefix` found by an earlier client spares the session its `/v1/config` lookup.
+    pub fn new(
+        catalog_uri: String,
+        creds: ConnectionCreds,
+        catalog_prefix: Option<String>,
+    ) -> Self {
         Self {
             catalog_uri,
             creds,
+            catalog_prefix,
             session: OnceCell::new(),
         }
     }
 
     /// The client's one session, resolved by the first call, so every later request reuses its
-    /// OAuth2 grant and `/v1/config` prefix.
+    /// OAuth2 grant and catalog prefix.
     pub async fn session(&self) -> Result<&CatalogSession, UdfError> {
         self.session
             .get_or_try_init(|| {
-                CatalogSession::resolve(&self.catalog_uri, &self.creds.warehouse, &self.creds)
+                CatalogSession::resolve(
+                    &self.catalog_uri,
+                    &self.creds.warehouse,
+                    self.catalog_prefix.clone(),
+                    &self.creds,
+                )
             })
             .await
     }
@@ -314,6 +332,12 @@ impl CatalogClient for IcebergRestCatalogClient {
                 .await?;
             Ok(admissions.into_iter().collect())
         })
+    }
+
+    fn catalog_prefix(&self) -> Option<String> {
+        self.session
+            .get()
+            .map(|session| session.prefix().to_string())
     }
 }
 

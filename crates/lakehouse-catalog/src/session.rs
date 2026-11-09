@@ -179,22 +179,31 @@ impl From<CatalogSendError> for UdfError {
 }
 
 impl CatalogSession {
-    /// A failed OAuth2 grant or config lookup is an error. Credential values never appear in any
-    /// returned error. The session keeps `creds` for the auth and redaction of its own requests.
+    /// A `catalog_prefix` that an earlier session found spares the `/v1/config` lookup. A failed
+    /// OAuth2 grant or config lookup is an error. Credential values never appear in any returned
+    /// error. The session keeps `creds` for the auth and redaction of its own requests.
     pub async fn resolve(
         catalog_uri: &str,
         warehouse: &str,
+        catalog_prefix: Option<String>,
         creds: &ConnectionCreds,
     ) -> Result<CatalogSession, UdfError> {
         let http = CatalogHttp::new();
         let auth = resolve_catalog_auth(&http, catalog_uri, creds, system_clock()).await?;
-        let config = resolve_served_config(&http, catalog_uri, warehouse, &auth, creds).await?;
+        let (prefix, endpoints) = match catalog_prefix {
+            Some(prefix) => (prefix, None),
+            None => {
+                let config =
+                    resolve_served_config(&http, catalog_uri, warehouse, &auth, creds).await?;
+                (config.prefix, config.endpoints)
+            }
+        };
         Ok(CatalogSession {
             http,
             catalog_uri: catalog_uri.to_string(),
             auth,
-            prefix: config.prefix,
-            endpoints: config.endpoints,
+            prefix,
+            endpoints,
             creds: creds.clone(),
         })
     }
