@@ -1,0 +1,11 @@
+{
+  "error": {
+    "message": "Tabular with the same name already exists in the namespace",
+    "type": "AlreadyExistsException",
+    "code": 409,
+    "stack": [
+      "Error creating tabular in catalog",
+      "Error ID: 01a1bf47-b2ef-7343-8972-463eac17a463"
+    ]
+  }
+}

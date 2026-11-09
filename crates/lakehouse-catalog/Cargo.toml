@@ -1,11 +1,16 @@
 [package]
 name = "lakehouse-catalog"
-version = "0.8.3"
+version = "0.10.0"
 edition = "2024"
 license.workspace = true
 
 [lib]
 name = "lakehouse_catalog"
+
+[features]
+# Exposes the fake catalog server of `test_support` to dependent crates' tests. Never enabled
+# outside tests.
+test-support = ["tokio/net", "tokio/io-util"]
 
 [dependencies]
 exasol-udf-sdk = { workspace = true }
@@ -36,3 +41,6 @@ http       = { workspace = true }
 
 # AWS STS AssumeRole.
 aws-sdk-sts = { workspace = true }
+
+[dev-dependencies]
+reqsign-core = { workspace = true }

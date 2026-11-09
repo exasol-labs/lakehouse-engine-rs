@@ -1,5 +1,8 @@
 //! Credential values never appear in an error message produced by this module.
 
+use crate::connection::{
+    parse_creds, password_object, supplied_azure_fields, supplied_s3_fields, validate_shared_creds,
+};
 use crate::exasol::catalog_connection_name;
 use crate::scan::sealed::{
     SealedStorageKey, connection_password_carries_key_material, derive_sealed_storage_key,
@@ -10,7 +13,6 @@ use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{StorageCreds, scheme_of};
 
 use super::catalog_kind::CatalogKind;
-use super::nonempty_str;
 
 pub const REQUIRED_KEY: &str = "warehouse";
 
@@ -45,20 +47,10 @@ pub fn read_connection(
         )));
     }
 
-    let json: serde_json::Value = serde_json::from_str(&conn.password).map_err(|_| {
-        UdfError::User(format!(
-            "CONNECTION '{name}' password is not a valid JSON object"
-        ))
-    })?;
-
-    if !json.is_object() {
-        return Err(UdfError::User(format!(
-            "CONNECTION '{name}' password is not a valid JSON object"
-        )));
-    }
-
+    let json = password_object(name, &conn.password)?;
     let creds = parse_kind_creds(name, &json, kind)?;
-    validate_creds(name, &creds, kind, &uri)?;
+    validate_kind_preconditions(name, &creds, kind, &uri)?;
+    validate_shared_creds(name, &creds, &uri)?;
     let sealed_storage_key = connection_password_carries_key_material(&creds)
         .then(|| derive_sealed_storage_key(&conn.password));
     Ok(Resolved {
@@ -84,22 +76,6 @@ fn parse_kind_creds(
         creds.use_sigv4 = true;
     }
     Ok(creds)
-}
-
-fn validate_creds(
-    name: &str,
-    creds: &ConnectionCreds,
-    kind: CatalogKind,
-    address: &str,
-) -> Result<(), UdfError> {
-    validate_kind_preconditions(name, creds, kind, address)?;
-    validate_azure_storage_creds(name, creds)?;
-    validate_assume_role_creds(name, creds)?;
-    validate_sigv4_creds(name, creds, address)?;
-    validate_exclusive_catalog_auth_creds(name, creds)?;
-    validate_oauth2_creds(name, creds)?;
-    validate_path_style_with_endpoint(name, creds)?;
-    Ok(())
 }
 
 fn validate_kind_preconditions(
@@ -210,173 +186,6 @@ fn validate_direct_storage_preconditions(
     Ok(())
 }
 
-fn validate_azure_storage_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
-    let azure_fields = supplied_azure_fields(creds);
-    if azure_fields.is_empty() {
-        return Ok(());
-    }
-
-    let s3_fields = supplied_s3_fields(creds);
-    if !s3_fields.is_empty() {
-        return Err(UdfError::User(format!(
-            "CONNECTION '{name}' supplies Azure storage credential field(s) {} together \
-             with S3 storage credential field(s) {}; Azure and S3 storage credentials \
-             cannot both be supplied on one CONNECTION",
-            azure_fields.join(", "),
-            s3_fields.join(", ")
-        )));
-    }
-
-    let mut defects: Vec<&str> = Vec::new();
-    if creds.account_name.is_none() {
-        defects.push("account_name is missing");
-    }
-    match (creds.account_key.is_some(), creds.sas_token.is_some()) {
-        (true, true) => defects.push("account_key and sas_token are both present"),
-        (false, false) => defects.push("neither account_key nor sas_token is present"),
-        (true, false) | (false, true) => {}
-    }
-    if !defects.is_empty() {
-        return Err(UdfError::User(format!(
-            "CONNECTION '{name}' supplies Azure storage credential field(s) {}; an Azure \
-             CONNECTION requires account_name and exactly one of account_key and sas_token: {}",
-            azure_fields.join(", "),
-            defects.join("; ")
-        )));
-    }
-    Ok(())
-}
-
-/// Runs before the SigV4 check so a role CONNECTION missing its key pair is told
-/// that the role needs it, not only that SigV4 does.
-fn validate_assume_role_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
-    if creds.assume_role_arn().is_none() {
-        let orphaned = flagged_fields(&[
-            ("aws_external_id", creds.aws_external_id.is_some()),
-            ("aws_sts_endpoint", creds.aws_sts_endpoint.is_some()),
-        ]);
-        if orphaned.is_empty() {
-            return Ok(());
-        }
-        return Err(UdfError::User(format!(
-            "CONNECTION '{name}' supplies field(s) {} without aws_assume_role_arn; they \
-             configure AWS IAM role assumption, so each requires aws_assume_role_arn",
-            orphaned.join(", ")
-        )));
-    }
-    let missing = flagged_fields(&[
-        ("access_key", creds.access_key.is_empty()),
-        ("secret_key", creds.secret_key.is_empty()),
-    ]);
-    if missing.is_empty() {
-        return Ok(());
-    }
-    Err(UdfError::User(format!(
-        "CONNECTION '{name}' names aws_assume_role_arn but is missing field(s) {}; the \
-         role is assumed with the CONNECTION's own access_key and secret_key, and no \
-         ambient AWS credential, such as an environment variable or an instance \
-         profile, is read",
-        missing.join(", ")
-    )))
-}
-
-fn flagged_fields<'a>(flags: &[(&'a str, bool)]) -> Vec<&'a str> {
-    flags
-        .iter()
-        .filter_map(|&(field, flag)| flag.then_some(field))
-        .collect()
-}
-
-fn validate_sigv4_creds(
-    name: &str,
-    creds: &ConnectionCreds,
-    catalog_uri: &str,
-) -> Result<(), UdfError> {
-    if creds.use_sigv4 && creds.has_catalog_auth() {
-        return Err(UdfError::User(format!(
-            "CONNECTION '{name}' enables SigV4 signing together with catalog \
-             token/OAuth authentication; these cannot both be enabled"
-        )));
-    }
-
-    if creds.use_sigv4 {
-        let mut missing: Vec<&str> = Vec::new();
-        if creds.access_key.is_empty() {
-            missing.push("access_key");
-        }
-        if creds.secret_key.is_empty() {
-            missing.push("secret_key");
-        }
-        if creds.sigv4_signing_region(catalog_uri).is_none() {
-            missing.push("region");
-        }
-        if !missing.is_empty() {
-            let glue_hint = if missing.contains(&"region") {
-                "; a CONNECTION whose address is a standard AWS Glue endpoint of the form \
-                 https://glue.<region>.amazonaws.com can omit region"
-            } else {
-                ""
-            };
-            return Err(UdfError::User(format!(
-                "CONNECTION '{name}' enables SigV4 signing but is missing field(s) \
-                 required when SigV4 signing is enabled: {}{glue_hint}",
-                missing.join(", ")
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_exclusive_catalog_auth_creds(
-    name: &str,
-    creds: &ConnectionCreds,
-) -> Result<(), UdfError> {
-    if creds.token.is_some() && creds.client_id.is_some() && creds.client_secret.is_some() {
-        return Err(UdfError::User(format!(
-            "CONNECTION '{name}' supplies a token together with a complete \
-             client_id/client_secret pair; these are mutually exclusive, \
-             remove one: token, client_id, client_secret"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_oauth2_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
-    match (creds.client_id.is_some(), creds.client_secret.is_some()) {
-        (true, false) => Err(UdfError::User(format!(
-            "CONNECTION '{name}' OAuth2 client credentials require both \
-             client_id and client_secret; missing field: client_secret"
-        ))),
-        (false, true) => Err(UdfError::User(format!(
-            "CONNECTION '{name}' OAuth2 client credentials require both \
-             client_id and client_secret; missing field: client_id"
-        ))),
-        _ => Ok(()),
-    }
-}
-
-fn validate_path_style_with_endpoint(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
-    if !creds.endpoint.is_empty() && creds.path_style.is_none() && !creds.use_vended_credentials {
-        return Err(UdfError::User(format!(
-            "CONNECTION '{name}' supplies a storage endpoint but states no path_style; \
-             an absent path_style resolves to false, which discards the endpoint and \
-             derives an AWS host from region instead — set path_style to true or false"
-        )));
-    }
-    Ok(())
-}
-
-fn supplied_azure_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
-    [
-        ("account_name", creds.account_name.is_some()),
-        ("account_key", creds.account_key.is_some()),
-        ("sas_token", creds.sas_token.is_some()),
-    ]
-    .into_iter()
-    .filter_map(|(field, supplied)| supplied.then_some(field))
-    .collect()
-}
-
 fn supplied_catalog_auth_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
     [
         ("token", creds.token.is_some()),
@@ -388,61 +197,6 @@ fn supplied_catalog_auth_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
     .into_iter()
     .filter_map(|(field, supplied)| supplied.then_some(field))
     .collect()
-}
-
-fn supplied_s3_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
-    [
-        ("endpoint", !creds.endpoint.is_empty()),
-        ("region", !creds.region.is_empty()),
-        ("access_key", !creds.access_key.is_empty()),
-        ("secret_key", !creds.secret_key.is_empty()),
-        ("session_token", creds.session_token.is_some()),
-    ]
-    .into_iter()
-    .filter_map(|(field, supplied)| supplied.then_some(field))
-    .collect()
-}
-
-fn parse_creds(json: &serde_json::Value) -> ConnectionCreds {
-    let StorageCreds {
-        endpoint,
-        region,
-        access_key,
-        secret_key,
-        session_token,
-        path_style,
-        account_name,
-        account_key,
-        sas_token,
-    } = StorageCreds::from_json(json);
-    ConnectionCreds {
-        warehouse: nonempty_str(json, "warehouse").unwrap_or("").to_string(),
-        endpoint,
-        region,
-        access_key,
-        secret_key,
-        session_token,
-        path_style,
-        use_sigv4: json
-            .get("use_sigv4")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        use_vended_credentials: json
-            .get("use_vended_credentials")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        token: nonempty_str(json, "token").map(|s| s.to_string()),
-        client_id: nonempty_str(json, "client_id").map(|s| s.to_string()),
-        client_secret: nonempty_str(json, "client_secret").map(|s| s.to_string()),
-        oauth2_server_uri: nonempty_str(json, "oauth2_server_uri").map(|s| s.to_string()),
-        scope: nonempty_str(json, "scope").map(|s| s.to_string()),
-        account_name,
-        account_key,
-        sas_token,
-        aws_assume_role_arn: nonempty_str(json, "aws_assume_role_arn").map(|s| s.to_string()),
-        aws_external_id: nonempty_str(json, "aws_external_id").map(|s| s.to_string()),
-        aws_sts_endpoint: nonempty_str(json, "aws_sts_endpoint").map(|s| s.to_string()),
-    }
 }
 
 pub fn storage_block(creds: &ConnectionCreds, allow_http: bool) -> StorageBackend {

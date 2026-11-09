@@ -1,0 +1,121 @@
+{
+  "metadata-location": "s3://warehouse/lakehouse_vended/01a1bf3b-863b-7a71-a04f-6c41dd312eb2/metadata/00001-01a1bf4c-9f0a-73b1-88c9-7476163d3fe6.gz.metadata.json",
+  "metadata": {
+    "format-version": 2,
+    "table-uuid": "01a1bf3b-863b-7a71-a04f-6c41dd312eb2",
+    "location": "s3://warehouse/lakehouse_vended/01a1bf3b-863b-7a71-a04f-6c41dd312eb2",
+    "last-sequence-number": 1,
+    "last-updated-ms": 1794210832128,
+    "last-column-id": 2,
+    "schemas": [
+      {
+        "schema-id": 0,
+        "type": "struct",
+        "fields": [
+          {
+            "id": 1,
+            "name": "ID",
+            "required": false,
+            "type": "decimal(18,0)"
+          },
+          {
+            "id": 2,
+            "name": "V",
+            "required": false,
+            "type": "string"
+          }
+        ]
+      }
+    ],
+    "current-schema-id": 0,
+    "partition-specs": [
+      {
+        "spec-id": 0,
+        "fields": []
+      }
+    ],
+    "default-spec-id": 0,
+    "last-partition-id": 999,
+    "properties": {
+      "commit.retry.num-retries": "20",
+      "lakehouse.export-id": "0123456789abcdef0123456789abcdef"
+    },
+    "current-snapshot-id": 2010301460695075654,
+    "snapshot-log": [
+      {
+        "snapshot-id": 2010301460695075654,
+        "timestamp-ms": 1794210832128
+      }
+    ],
+    "metadata-log": [
+      {
+        "metadata-file": "s3://warehouse/lakehouse_vended/01a1bf3b-863b-7a71-a04f-6c41dd312eb2/metadata/00000-01a1bf3b-863e-7501-b509-87089ee4c733.gz.metadata.json",
+        "timestamp-ms": 1794209711678
+      }
+    ],
+    "sort-orders": [
+      {
+        "order-id": 0,
+        "fields": []
+      }
+    ],
+    "default-sort-order-id": 0,
+    "refs": {
+      "main": {
+        "snapshot-id": 2010301460695075654,
+        "type": "branch"
+      }
+    },
+    "snapshots": [
+      {
+        "snapshot-id": 2010301460695075654,
+        "sequence-number": 1,
+        "timestamp-ms": 1794210832128,
+        "manifest-list": "s3://warehouse/lakehouse_vended/01a1bf3b-863b-7a71-a04f-6c41dd312eb2/metadata/snap-2010301460695075654-0-01a1bf4c-9ec1-7251-9608-a2b8d39550b8.avro",
+        "summary": {
+          "operation": "append",
+          "total-equality-deletes": "0",
+          "lakehouse.export-writer": "00112233aabbccdd",
+          "iceberg-version": "Apache Iceberg Rust 0.10.1",
+          "total-delete-files": "0",
+          "added-records": "10",
+          "total-files-size": "1024",
+          "added-data-files": "1",
+          "added-files-size": "1024",
+          "total-data-files": "1",
+          "total-position-deletes": "0",
+          "lakehouse.export-id": "0123456789abcdef0123456789abcdef",
+          "total-records": "10"
+        },
+        "schema-id": 0
+      }
+    ]
+  },
+  "config": {
+    "s3.region": "us-east-1",
+    "s3.session-token": "LOADED_SESSION_TOKEN_PLACEHOLDER",
+    "region": "us-east-1",
+    "s3.secret-access-key": "LOADED_SECRET_ACCESS_KEY_PLACEHOLDER",
+    "s3.path-style-access": "true",
+    "s3.endpoint": "http://seaweedfs:8333/",
+    "s3.access-key-id": "LOADED_ACCESS_KEY_ID_PLACEHOLDER",
+    "client.region": "us-east-1"
+  },
+  "storage-credentials": [
+    {
+      "prefix": "s3://warehouse/lakehouse_vended/01a1bf3b-863b-7a71-a04f-6c41dd312eb2",
+      "config": {
+        "s3.session-token": "LOADED_SESSION_TOKEN_PLACEHOLDER",
+        "expiration-time": "1794213311000",
+        "client.region": "us-east-1",
+        "s3.access-key-id": "LOADED_ACCESS_KEY_ID_PLACEHOLDER",
+        "s3.region": "us-east-1",
+        "s3.endpoint": "http://seaweedfs:8333/",
+        "s3.path-style-access": "true",
+        "s3.secret-access-key": "LOADED_SECRET_ACCESS_KEY_PLACEHOLDER",
+        "s3.session-token-expires-at-ms": "1794213311000",
+        "client.refresh-credentials-endpoint": "http://localhost:28181/catalog/v1/7bad4ef0-d8f8-11f1-b803-af792d513a2c/namespaces/a2%5Ffixture%5Fns/tables/t/credentials"
+      }
+    }
+  ]
+}

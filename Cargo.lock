@@ -3417,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-catalog"
-version = "0.8.3"
+version = "0.10.0"
 dependencies = [
  "aws-credential-types",
  "aws-sdk-glue",
@@ -3433,12 +3433,29 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
+ "reqsign-core",
  "reqwest 0.12.28",
  "rustls",
  "serde",
  "serde_json",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "lakehouse-catalog-write"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "exasol-udf-sdk",
+ "iceberg",
+ "iceberg-catalog-rest",
+ "lakehouse-catalog",
+ "rand 0.8.6",
+ "reqsign-core",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -3478,7 +3495,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -3496,6 +3513,7 @@ dependencies = [
  "hkdf",
  "iceberg",
  "lakehouse-catalog",
+ "lakehouse-catalog-write",
  "minijinja",
  "object_store",
  "parquet",
@@ -6093,7 +6111,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vs-expression"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "exasol-udf-sdk",
  "regex",

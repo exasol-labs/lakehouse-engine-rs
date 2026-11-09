@@ -1,10 +1,10 @@
+use super::writer::tests::{CONNECTION, Calls, fake_target};
 use super::*;
 use exasol_udf_sdk::connection::ConnectionObject;
 use exasol_udf_sdk::test_support::TestContext;
 use exasol_udf_sdk::value::Value;
 
-const CONNECTION: &str = "LAKEHOUSE_CATALOG_CREDS";
-const WRITER_SPEC: &str = r#"{"connection":"LAKEHOUSE_CATALOG_CREDS"}"#;
+const WRITER_SPEC: &str = r#"{"connection":"LAKEHOUSE_CATALOG_CREDS","table":"ns.t","export_id":"00ff","columns":["ID"],"single_commit":false,"allow_http":false}"#;
 const SENTINELS: [&str; 3] = [
     "https://sentinel-address.example",
     "sentinel-user",
@@ -16,12 +16,17 @@ fn sentinel_connection() -> ConnectionObject {
         kind: "password".to_string(),
         address: SENTINELS[0].to_string(),
         user: SENTINELS[1].to_string(),
-        password: SENTINELS[2].to_string(),
+        password: serde_json::json!({ "warehouse": "wh", "token": SENTINELS[2] }).to_string(),
     }
 }
 
 fn granted(ctx: TestContext) -> TestContext {
     ctx.with_connection(CONNECTION, sentinel_connection())
+}
+
+/// The hook over a target that records its calls and makes no request.
+fn hook(ctx: &mut TestContext, json: &str) -> Result<String, UdfError> {
+    export_hook(ctx, json, fake_target(&Calls::default(), None))
 }
 
 fn hook_context() -> TestContext {
@@ -81,21 +86,36 @@ fn assert_no_connection_value(text: &str, what: &str) {
     }
 }
 
+fn export_spec_with_columns(columns: &[&str]) -> String {
+    let mut spec: serde_json::Value =
+        serde_json::from_str(&export_spec_json(no_at_clause(), no_extra())).unwrap();
+    spec["source_column_names"] = serde_json::json!(columns);
+    spec.to_string()
+}
+
+/// The writer spec literal of a generated writer SELECT, unquoted.
+fn rendered_writer_spec(sql: &str) -> serde_json::Value {
+    let start = sql.find("('").expect("the spec literal opens") + 2;
+    let end = sql.rfind("}', ").expect("the spec literal closes") + 1;
+    serde_json::from_str(&sql[start..end].replace("''", "'")).expect("the spec is JSON")
+}
+
 /// Scenario: No CONNECTION value appears in the generated SQL or an error
 #[test]
 fn generated_sql_and_errors_carry_no_connection_value() {
-    let sql = generate_export_sql(
+    let sql = hook(
         &mut granted(hook_context()),
         &export_spec_json(no_at_clause(), no_extra()),
     )
     .expect("a valid export yields SQL");
     assert!(
-        sql.starts_with(&format!(
-            r#"SELECT "LHVS"."LAKEHOUSE_EXPORT"('{WRITER_SPEC}', "T"."A") FROM DUAL GROUP BY "#
-        )),
+        sql.starts_with(r#"SELECT "LHVS"."LAKEHOUSE_EXPORT"('{"#),
         "{sql}"
     );
-    assert!(sql.ends_with("GROUP BY MOD(ROWNUM, 2)"), "{sql}");
+    assert!(
+        sql.ends_with(r#"}', "T"."A") FROM DUAL GROUP BY MOD(ROWNUM, 2)"#),
+        "{sql}"
+    );
     assert_no_connection_value(&sql, "the generated SQL");
 
     let inline = serde_json::json!({"connection_information": {
@@ -166,22 +186,31 @@ fn hook_refuses_a_specification_it_cannot_parse() {
 }
 
 #[test]
-fn writer_returns_the_exact_row_count_of_its_group() {
-    let cases = [("one row", 1), ("several rows", 5), ("many rows", 1_000)];
+fn the_hook_prepares_its_target_before_it_answers() {
+    let calls = Calls::default();
 
-    for (case, rows) in cases {
-        let group = (0..rows).map(|id| writer_row(WRITER_SPEC, id)).collect();
-        let counted = run_writer(&mut granted(writer_context(group)))
-            .unwrap_or_else(|e| panic!("{case}: {e:?}"));
-        assert_eq!(counted, rows, "{case}");
-    }
+    let sql = export_hook(
+        &mut granted(hook_context()),
+        &export_spec_json(no_at_clause(), no_extra()),
+        fake_target(&calls, None),
+    );
+
+    assert!(sql.is_ok(), "{sql:?}");
+    assert_eq!(
+        calls.recorded(),
+        ["target ns.t at https://sentinel-address.example", "prepare"]
+    );
 }
 
 #[test]
-fn writer_counts_zero_for_an_empty_group() {
-    let counted = run_writer(&mut writer_context(vec![])).expect("an empty group counts");
+fn a_target_that_refuses_the_table_fails_the_hook_with_its_error() {
+    let refused = export_hook(
+        &mut granted(hook_context()),
+        &export_spec_json(no_at_clause(), no_extra()),
+        fake_target(&Calls::default(), Some("prepare")),
+    );
 
-    assert_eq!(counted, 0);
+    assert_eq!(error_text(refused), "prepare failed");
 }
 
 #[test]
@@ -209,6 +238,88 @@ fn writer_refuses_a_first_argument_that_is_not_a_writer_spec() {
 }
 
 #[test]
+fn writer_refuses_a_spec_whose_table_breaks_the_table_name_rule() {
+    let forged = WRITER_SPEC.replace(r#""table":"ns.t""#, r#""table":"t""#);
+
+    let message = error_text(run_writer(&mut granted(writer_context(vec![writer_row(
+        &forged, 1,
+    )]))));
+
+    assert!(
+        message.contains("TABLE_NAME = 't' is not of the form"),
+        "{message}"
+    );
+}
+
+#[test]
+fn the_writer_reads_the_spec_the_hook_renders_with_a_fresh_export_id() {
+    let render = || {
+        let sql = hook(
+            &mut granted(hook_context()),
+            &export_spec_with_columns(&[r#""T"."ID""#, r#""T"."a""b""#]),
+        )
+        .expect("a valid export yields SQL");
+        rendered_writer_spec(&sql)
+    };
+    let (first, second) = (render(), render());
+
+    let export_id = first["export_id"].as_str().expect("an export ID");
+    assert_eq!(export_id.len(), 32, "{export_id}");
+    assert!(
+        export_id.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{export_id}"
+    );
+    assert_ne!(first["export_id"], second["export_id"]);
+    assert_eq!(
+        first,
+        serde_json::json!({
+            "connection": CONNECTION,
+            "table": "ns.t",
+            "export_id": export_id,
+            "columns": ["ID", "a\"b"],
+            "single_commit": false,
+            "allow_http": false,
+        })
+    );
+    let mut writer = writer_context(vec![writer_row(&first.to_string(), 1)]);
+    writer.next().unwrap();
+    let read = WriterSpec::read(&writer).expect("the writer accepts it");
+    assert_eq!(read.render(), first.to_string());
+}
+
+#[test]
+fn column_names_are_the_last_identifier_of_each_reference_unescaped() {
+    let names = column_names(&[
+        r#""T"."A""#.to_string(),
+        r#""T"."a""b""#.to_string(),
+        r#""S"."T"."a.b""#.to_string(),
+    ])
+    .expect("distinct, unreserved names");
+
+    assert_eq!(names, ["A", "a\"b", "a.b"]);
+}
+
+#[test]
+fn a_repeated_column_name_is_refused_asking_for_a_distinct_alias() {
+    let message = error_text(column_names(&[
+        r#""T"."A""#.to_string(),
+        r#""U"."A""#.to_string(),
+    ]));
+
+    assert!(message.contains("column A appears twice"), "{message}");
+    assert!(message.contains("distinct alias"), "{message}");
+}
+
+/// Scenario: A source column name the new table cannot hold is refused before any data is read
+#[test]
+fn a_column_named_like_an_iceberg_metadata_column_is_refused() {
+    let message = error_text(column_names(&[r#""T"."_file""#.to_string()]));
+
+    assert!(message.contains("column _file"), "{message}");
+    assert!(message.contains("reserved"), "{message}");
+}
+
+#[test]
 fn missing_grant_without_a_known_user_names_a_user_placeholder() {
     let mut ctx = TestContext::set(vec![writer_row(WRITER_SPEC, 1)]).with_script_schema("LHVS");
 
@@ -218,208 +329,6 @@ fn missing_grant_without_a_known_user_names_a_user_placeholder() {
         message.contains("FOR SCRIPT LHVS.LAKEHOUSE_EXPORT TO <user>"),
         "{message}"
     );
-}
-
-mod options {
-    use super::super::*;
-    use exasol_udf_sdk::connection::ConnectionObject;
-
-    const CONNECTION: &str = "LAKEHOUSE_CATALOG_CREDS";
-    const SENTINELS: [&str; 3] = ["sentinel-address", "sentinel-user", "sentinel-password"];
-
-    fn spec_with(parameters: &[(&str, &str)]) -> ExportSpec {
-        let mut with = vec![("CATALOG_CONNECTION", CONNECTION)];
-        with.extend_from_slice(parameters);
-        ExportSpec {
-            has_truncate: false,
-            has_replace: false,
-            created_by: None,
-            source_column_names: vec![r#""T"."A""#.to_string()],
-            connection_information: None,
-            connection_name: None,
-            parameters: with
-                .iter()
-                .map(|(key, value)| Parameter {
-                    key: key.to_string(),
-                    value: value.to_string(),
-                })
-                .collect(),
-        }
-    }
-
-    fn valid_spec() -> ExportSpec {
-        spec_with(&[("TABLE_NAME", "ns.t")])
-    }
-
-    fn inline_connection() -> ConnectionObject {
-        ConnectionObject {
-            kind: "password".to_string(),
-            address: SENTINELS[0].to_string(),
-            user: SENTINELS[1].to_string(),
-            password: SENTINELS[2].to_string(),
-        }
-    }
-
-    fn refusal_message(spec: &ExportSpec) -> String {
-        match ExportOptions::from_spec(spec) {
-            Err(UdfError::User(message)) => message,
-            other => panic!("expected a UdfError::User refusal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn refused_statements_name_the_offending_part_and_its_accepted_form() {
-        let truncate = ExportSpec {
-            has_truncate: true,
-            ..valid_spec()
-        };
-        let named_at = ExportSpec {
-            connection_name: Some(CONNECTION.to_string()),
-            ..valid_spec()
-        };
-        let inline = ExportSpec {
-            connection_information: Some(inline_connection()),
-            ..valid_spec()
-        };
-        let appends = "only appends rows";
-        let table_form = "'<namespace>.<table>'";
-        let integer_form = "a whole number from 1 to";
-        let cases: Vec<(&str, ExportSpec, Vec<&str>)> = vec![
-            ("TRUNCATE", truncate, vec!["TRUNCATE", appends]),
-            (
-                "named AT clause",
-                named_at,
-                vec!["AT clause", "CATALOG_CONNECTION"],
-            ),
-            (
-                "inline AT clause",
-                inline,
-                vec!["AT clause", "CATALOG_CONNECTION"],
-            ),
-            (
-                "CATALOG_CONNECTION missing",
-                ExportSpec {
-                    parameters: vec![Parameter {
-                        key: "TABLE_NAME".to_string(),
-                        value: "ns.t".to_string(),
-                    }],
-                    ..valid_spec()
-                },
-                vec!["CATALOG_CONNECTION", "is required"],
-            ),
-            (
-                "TABLE_NAME missing",
-                spec_with(&[("WRITERS_PER_NODE", "2")]),
-                vec!["TABLE_NAME", "is required", table_form],
-            ),
-            (
-                "TABLE_NAME without namespace",
-                spec_with(&[("TABLE_NAME", "t")]),
-                vec!["TABLE_NAME = 't'", table_form],
-            ),
-            (
-                "TABLE_NAME with empty namespace level",
-                spec_with(&[("TABLE_NAME", "a..t")]),
-                vec!["TABLE_NAME = 'a..t'", table_form],
-            ),
-            (
-                "unknown option",
-                spec_with(&[("TABLE_NAME", "ns.t"), ("FORMAT", "csv")]),
-                vec![
-                    "unknown option FORMAT",
-                    "CATALOG_CONNECTION, TABLE_NAME, WRITERS_PER_NODE, and SINGLE_COMMIT",
-                ],
-            ),
-            (
-                "WRITERS_PER_NODE zero",
-                spec_with(&[("TABLE_NAME", "ns.t"), ("WRITERS_PER_NODE", "0")]),
-                vec!["WRITERS_PER_NODE = '0'", integer_form],
-            ),
-            (
-                "SINGLE_COMMIT not a boolean",
-                spec_with(&[("TABLE_NAME", "ns.t"), ("SINGLE_COMMIT", "yes")]),
-                vec!["SINGLE_COMMIT = 'yes'", "'true' or 'false'"],
-            ),
-            (
-                "WRITERS_PER_NODE with SINGLE_COMMIT",
-                spec_with(&[
-                    ("TABLE_NAME", "ns.t"),
-                    ("WRITERS_PER_NODE", "2"),
-                    ("SINGLE_COMMIT", "TRUE"),
-                ]),
-                vec!["WRITERS_PER_NODE", "SINGLE_COMMIT = 'true'"],
-            ),
-        ];
-
-        for (case, spec, expected) in cases {
-            let message = refusal_message(&spec);
-            assert!(
-                message.starts_with("LAKEHOUSE_EXPORT: "),
-                "{case}: message {message:?} lacks the script prefix"
-            );
-            for fragment in expected {
-                assert!(
-                    message.contains(fragment),
-                    "{case}: message {message:?} lacks {fragment:?}"
-                );
-            }
-            for sentinel in SENTINELS {
-                assert!(
-                    !message.contains(sentinel),
-                    "{case}: message {message:?} echoes the inline CONNECTION value {sentinel:?}"
-                );
-            }
-        }
-    }
-
-    type AcceptedCase = (
-        &'static str,
-        Vec<(&'static str, &'static str)>,
-        WriterLayout,
-    );
-
-    #[test]
-    fn accepted_statements_yield_the_connection_and_writer_layout() {
-        let cases: Vec<AcceptedCase> = vec![
-            (
-                "defaults",
-                vec![("TABLE_NAME", "ns.t")],
-                WriterLayout::PerNode(1),
-            ),
-            (
-                "WRITERS_PER_NODE",
-                vec![("WRITERS_PER_NODE", "3"), ("TABLE_NAME", "ns.t")],
-                WriterLayout::PerNode(3),
-            ),
-            (
-                "SINGLE_COMMIT false",
-                vec![("TABLE_NAME", "ns.t"), ("SINGLE_COMMIT", "FALSE")],
-                WriterLayout::PerNode(1),
-            ),
-            (
-                "WRITERS_PER_NODE with SINGLE_COMMIT false",
-                vec![
-                    ("TABLE_NAME", "ns.t"),
-                    ("SINGLE_COMMIT", "false"),
-                    ("WRITERS_PER_NODE", "2"),
-                ],
-                WriterLayout::PerNode(2),
-            ),
-        ];
-
-        for (case, parameters, writers) in cases {
-            let options = ExportOptions::from_spec(&spec_with(&parameters))
-                .unwrap_or_else(|e| panic!("{case}: expected acceptance, got {e:?}"));
-            assert_eq!(
-                options,
-                ExportOptions {
-                    connection_name: CONNECTION.to_string(),
-                    writers,
-                },
-                "{case}"
-            );
-        }
-    }
 }
 
 mod sql {

@@ -181,6 +181,8 @@ pub const BASE_DIRECT: &str = "s3://warehouse/proxy_direct/";
 pub const PROXY_ICEBERG_VS: &str = "PROXY_ICEBERG_VS";
 pub const PROXY_DIRECT_VS: &str = "PROXY_DIRECT_VS";
 pub const PROXY_ROLE_VS: &str = "PROXY_ROLE_VS";
+/// The CONNECTION of `PROXY_ICEBERG_VS`, which names the `-via-proxy` catalog and storage.
+pub const PROXY_ICEBERG_CREDS: &str = "PROXY_ICEBERG_CREDS";
 
 pub fn setup_proxy(adapter_schema: &str, adapter_env: &[(&str, &str)], scan_env: &[(&str, &str)]) {
     lakehouse_vs();
@@ -237,7 +239,7 @@ pub fn proxy_virtual_schemas() {
 
         create_virtual_schema_with_password(
             &mut conn,
-            &VsProps::new(PROXY_ICEBERG_VS, E2E_NAMESPACE).proxied("PROXY_ICEBERG_CREDS"),
+            &VsProps::new(PROXY_ICEBERG_VS, E2E_NAMESPACE).proxied(PROXY_ICEBERG_CREDS),
             ICEBERG_REST_VIA_PROXY,
             &local_stack_connection_password().via_proxy(),
         );

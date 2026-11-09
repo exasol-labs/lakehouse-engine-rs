@@ -2,7 +2,7 @@
 //! Credential values never appear in any returned error.
 
 use crate::auth::{CatalogAuth, redact_catalog_auth_error};
-use crate::catalog_http::{CatalogHttp, CatalogRequestError, quote_body};
+use crate::catalog_http::{CatalogHttp, CatalogRequestError, RepeatSafety, quote_body};
 use crate::redaction::redact_error_text;
 use crate::{ConnectionCreds, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
@@ -11,24 +11,26 @@ use iceberg::spec::TableMetadata;
 /// A batch-check answer is small, so a larger 2xx answer is refused.
 pub(crate) const MAX_ANSWER_BYTES: usize = 64 * 1024;
 
-/// The OAuth2 grant-obtained bearer token is not in `creds`, so it is redacted explicitly.
-fn redact_catalog_text(msg: &str, auth: &CatalogAuth, creds: &ConnectionCreds) -> String {
-    let bearer = match auth {
-        CatalogAuth::Bearer(token) => Some(token.as_str()),
-        CatalogAuth::Sigv4 { .. } | CatalogAuth::None => None,
-    };
-    redact_catalog_auth_error(msg, creds, bearer)
+/// An OAuth2 grant-obtained bearer token is not in `creds`, so every one the session held is
+/// redacted explicitly.
+pub(crate) fn redact_catalog_text(
+    msg: &str,
+    auth: &CatalogAuth,
+    creds: &ConnectionCreds,
+) -> String {
+    redact_catalog_auth_error(msg, creds, &auth.held_bearers())
 }
 
-fn build_signed_request(
+/// Renews an OAuth2 token that reached its renewal point before the request carries it.
+pub(crate) async fn build_signed_request(
     builder: reqwest::RequestBuilder,
     auth: &CatalogAuth,
     creds: &ConnectionCreds,
 ) -> Result<reqwest::Request, UdfError> {
     let redact = |msg: &str| redact_catalog_text(msg, auth, creds);
-    let builder = match auth {
-        CatalogAuth::Bearer(token) => builder.bearer_auth(token),
-        CatalogAuth::Sigv4 { .. } | CatalogAuth::None => builder,
+    let builder = match auth.bearer().await? {
+        Some(token) => builder.bearer_auth(token),
+        None => builder,
     };
     let request = builder.build().map_err(|e| {
         UdfError::User(format!(
@@ -52,8 +54,13 @@ fn build_signed_request(
                 redact(&e.to_string())
             ))
         }),
-        CatalogAuth::Bearer(_) | CatalogAuth::None => Ok(request),
+        CatalogAuth::Bearer(_) | CatalogAuth::OAuth2(_) | CatalogAuth::None => Ok(request),
     }
+}
+
+/// Asks the catalog to vend storage credentials with its answer.
+pub(crate) fn delegating_access(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    builder.header("X-Iceberg-Access-Delegation", "vended-credentials")
 }
 
 pub(crate) async fn authed_get_json<T: serde::de::DeserializeOwned>(
@@ -65,11 +72,12 @@ pub(crate) async fn authed_get_json<T: serde::de::DeserializeOwned>(
 ) -> Result<T, CatalogRequestError> {
     let mut builder = http.get(url).header("accept", "application/json");
     if send_access_delegation {
-        builder = builder.header("X-Iceberg-Access-Delegation", "vended-credentials");
+        builder = delegating_access(builder);
     }
     let request = build_signed_request(builder, auth, creds)
+        .await
         .map_err(|e| CatalogRequestError::without_status(e.to_string()))?;
-    http.send_json(request, "catalog request", |msg| {
+    http.send_json(request, RepeatSafety::Safe, "catalog request", |msg| {
         redact_catalog_text(msg, auth, creds)
     })
     .await
@@ -97,9 +105,9 @@ pub(crate) async fn authed_post_json(
         .header("accept", "application/json")
         .header("content-type", "application/json")
         .body(body);
-    let request = build_signed_request(builder, auth, creds)?;
+    let request = build_signed_request(builder, auth, creds).await?;
     let answer = http
-        .send_capped(request, MAX_ANSWER_BYTES)
+        .send_capped(request, RepeatSafety::Safe, MAX_ANSWER_BYTES)
         .await
         .map_err(|error| {
             UdfError::User(format!(

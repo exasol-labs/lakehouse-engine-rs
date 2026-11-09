@@ -3,11 +3,12 @@ use crate::scan::convert::check_date32_in_exasol_range;
 use crate::scan::diagnostics::PhaseTimers;
 use crate::scan::exasol_numeric::numeric_overflow;
 use crate::scan::raised_failure::session_raised_failure;
+use crate::types::exasol_type::{ExasolType, UdfColumnType, exasol_type_from_column_info};
 use crate::types::mapping::TimestampPrecision;
 use arrow::array::ArrayRef;
 use arrow::compute::CastOptions;
 use arrow::compute::kernels::cast::cast_with_options;
-use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
@@ -187,42 +188,40 @@ pub(crate) fn coerce_column(
     })
 }
 
-/// The reported variant IS the bin Exasol chose, so nothing is re-derived from a type string.
+/// The scan's layer over the one column-metadata reader: the integer bins emit as the
+/// `Int32` and `Int64` Exasol reported, and an unrecognized column as `Utf8` JSON text.
 pub(crate) fn target_arrow_type(declared: &ColumnInfo) -> Result<DataType, UdfError> {
-    Ok(match &declared.typ {
-        ExaType::Boolean => DataType::Boolean,
-        ExaType::Double => DataType::Float64,
-        ExaType::Int32 => DataType::Int32,
-        ExaType::Int64 => DataType::Int64,
-        ExaType::Numeric { precision, scale } => decimal_target(declared, *precision, *scale)?,
-        ExaType::Date => DataType::Date32,
-        ExaType::Timestamp { precision } => DataType::Timestamp(
-            TimestampPrecision::from_declared_digits(*precision).arrow_unit(),
+    let exasol_type = match (&declared.typ, exasol_type_from_column_info(declared)) {
+        (ExaType::Int32, _) => return Ok(DataType::Int32),
+        (ExaType::Int64, _) => return Ok(DataType::Int64),
+        (ExaType::Numeric { precision, scale }, UdfColumnType::Unrecognized { .. }) => {
+            return Err(drifted_decimal(declared, *precision, *scale));
+        }
+        (_, UdfColumnType::Unrecognized { .. }) => return Ok(DataType::Utf8),
+        (_, UdfColumnType::Known(exasol_type)) => exasol_type,
+    };
+    Ok(match exasol_type {
+        ExasolType::Boolean => DataType::Boolean,
+        ExasolType::DoublePrecision => DataType::Float64,
+        ExasolType::Decimal(decimal) => {
+            DataType::Decimal128(decimal.precision(), decimal.scale() as i8)
+        }
+        ExasolType::Date => DataType::Date32,
+        ExasolType::Timestamp { precision } => DataType::Timestamp(
+            TimestampPrecision::from_declared_digits(precision.into()).arrow_unit(),
             None,
         ),
-        ExaType::String { .. } | ExaType::Char { .. } | ExaType::Unsupported => DataType::Utf8,
+        _ => DataType::Utf8,
     })
 }
 
-/// A pair outside `Decimal128`'s range is drift: fail rather than put text into a numeric column.
-fn decimal_target(declared: &ColumnInfo, precision: u32, scale: u32) -> Result<DataType, UdfError> {
-    let representable = u8::try_from(precision)
-        .ok()
-        .zip(i8::try_from(scale).ok())
-        .filter(|(p, s)| {
-            *p >= 1
-                && *p <= DECIMAL128_MAX_PRECISION
-                && *s <= DECIMAL128_MAX_SCALE
-                && *s <= *p as i8
-        });
-    match representable {
-        Some((p, s)) => Ok(DataType::Decimal128(p, s)),
-        None => Err(UdfError::User(format!(
-            "emit failed: output column {} is declared NUMERIC with precision {precision} \
-             and scale {scale}, which is not a decimal the emit boundary can represent",
-            declared.name
-        ))),
-    }
+/// A pair outside Exasol's DECIMAL domain is drift: fail rather than put text into a numeric column.
+fn drifted_decimal(declared: &ColumnInfo, precision: u32, scale: u32) -> UdfError {
+    UdfError::User(format!(
+        "emit failed: output column {} is declared NUMERIC with precision {precision} \
+         and scale {scale}, which is not a decimal the emit boundary can represent",
+        declared.name
+    ))
 }
 
 /// A checked-division failure is recognised first, BY TYPE, so a user's division by zero is not

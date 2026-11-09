@@ -2,18 +2,15 @@
 //! must never appear in any returned error.
 
 use crate::ConnectionCreds;
-use crate::catalog_http::CatalogHttp;
+use crate::auth::OAUTH_REFRESH_SKEW_SECS;
+use crate::catalog_http::{CatalogHttp, RepeatSafety};
 use crate::creds::{SuppliedCatalogAuth, non_empty};
 use crate::error_chain;
+use crate::expiring::{ExpiringCredential, Lease, system_clock};
 use crate::redaction::redact_error_text;
 use exasol_udf_sdk::error::UdfError;
 use serde::Deserialize;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-/// Refresh this early so a bearer never expires in flight; the grant returns no
-/// refresh token, so renewal is a fresh mint.
-const OAUTH_REFRESH_SKEW_SECS: u64 = 60;
+use std::time::Duration;
 
 const OAUTH_DEFAULT_SCOPE: &str = "all-apis";
 
@@ -43,14 +40,6 @@ impl UnityAuth {
     }
 }
 
-struct CachedToken {
-    token: String,
-    refresh_at: Instant,
-}
-
-/// Injected so the refresh decision is testable without a real clock.
-type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
-
 /// One source per session, so a whole enumeration reuses one minted token.
 pub(crate) struct OAuthTokenSource {
     http: CatalogHttp,
@@ -58,32 +47,15 @@ pub(crate) struct OAuthTokenSource {
     client_id: String,
     client_secret: String,
     scope: String,
-    cache: Mutex<Option<CachedToken>>,
-    clock: Clock,
+    token: ExpiringCredential<String>,
 }
 
 impl OAuthTokenSource {
     pub(crate) async fn bearer(&self) -> Result<String, UdfError> {
-        {
-            // Guard dropped before `.await` so the future stays `Send`.
-            let cache = self.cache.lock().unwrap();
-            if let Some(cached) = cache.as_ref()
-                && (self.clock)() < cached.refresh_at
-            {
-                return Ok(cached.token.clone());
-            }
-        }
-        let (token, expires_in) = self.mint().await?;
-        let refresh_at = (self.clock)()
-            + Duration::from_secs(expires_in.saturating_sub(OAUTH_REFRESH_SKEW_SECS));
-        *self.cache.lock().unwrap() = Some(CachedToken {
-            token: token.clone(),
-            refresh_at,
-        });
-        Ok(token)
+        self.token.get(|now_ms| self.mint(now_ms)).await
     }
 
-    async fn mint(&self) -> Result<(String, u64), UdfError> {
+    async fn mint(&self, now_ms: u64) -> Result<Lease<String>, UdfError> {
         let redact = |msg: &str| redact_error_text(msg, &[self.client_secret.as_str()]);
         let form = [
             ("grant_type", "client_credentials"),
@@ -97,7 +69,10 @@ impl OAuthTokenSource {
             .form(&form)
             .build()
             .map_err(|e| UdfError::User(format!("{GRANT} failed: {}", redact(&error_chain(&e)))))?;
-        let parsed: OAuthTokenResponse = self.http.send_json(request, GRANT, redact).await?;
+        let parsed: OAuthTokenResponse = self
+            .http
+            .send_json(request, RepeatSafety::Safe, GRANT, redact)
+            .await?;
         if parsed.access_token.is_empty() {
             return Err(UdfError::User(format!("{GRANT} returned no access_token")));
         }
@@ -106,7 +81,10 @@ impl OAuthTokenSource {
             .expires_in
             .filter(|&secs| secs > 0)
             .ok_or_else(|| UdfError::User(format!("{GRANT} returned no usable expires_in")))?;
-        Ok((parsed.access_token, expires_in))
+        Ok(Lease {
+            value: parsed.access_token,
+            expires_at_ms: Some(now_ms.saturating_add(expires_in.saturating_mul(1000))),
+        })
     }
 }
 
@@ -144,8 +122,10 @@ pub(crate) fn resolve_unity_auth(
                 client_id: client_id.to_string(),
                 client_secret: client_secret.to_string(),
                 scope,
-                cache: Mutex::new(None),
-                clock: Arc::new(Instant::now),
+                token: ExpiringCredential::new(
+                    Duration::from_secs(OAUTH_REFRESH_SKEW_SECS),
+                    system_clock(),
+                ),
             }))
         }
     }

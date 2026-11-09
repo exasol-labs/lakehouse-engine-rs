@@ -6,6 +6,7 @@ mod catalog_http;
 mod client;
 mod creds;
 mod error_chain;
+mod expiring;
 mod glue;
 mod iceberg_io;
 mod lakekeeper;
@@ -18,10 +19,14 @@ mod sts;
 mod unity;
 mod vended;
 
+#[cfg(any(test, feature = "test-support"))]
+#[path = "exported_test_support_tests.rs"]
+pub mod exported_test_support;
 #[cfg(test)]
 #[path = "test_support_tests.rs"]
 mod test_support;
 
+pub use catalog_http::RepeatSafety;
 pub use client::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogPartition, CatalogTable,
     CatalogTableIdent, CatalogTableType, ColumnSourceType, HIVE_DEFAULT_PARTITION,
@@ -30,15 +35,22 @@ pub use client::{
 };
 pub use creds::{CatalogProps, ConnectionCreds, StorageCreds, StorageProps};
 pub use error_chain::error_chain;
+pub use expiring::{
+    AtRenewalPoint, EpochClock, ExpiringCredential, Lease, RenewalPoint, system_clock,
+};
 pub use glue::{GlueCatalogSession, parse_glue_table_ident};
 pub use iceberg_io::read_iceberg_metadata_file;
+pub use iceberg_storage_opendal::{AwsCredential, CustomAwsCredentialLoader};
 pub use lakekeeper::{TableReadDecision, lakekeeper_batch_check, lakekeeper_management_url};
 pub use namespace::parse_table_ident;
 pub use redaction::{redact_credentials, redact_error_text, redact_secret_values};
-pub use session::{CatalogSession, load_table_any_auth};
+pub use session::{
+    CatalogResponse, CatalogSendError, CatalogSession, load_table_any_auth, namespace_tables_path,
+    table_ident_path,
+};
 pub use storage::{AdlsCred, StaticStoreAddress, StorageBackend, scheme_of};
 pub use sts::resolve_aws_identity;
 
-pub use vended::resolve_vended_storage;
+pub use vended::{VendedS3Credentials, resolve_vended_storage, vended_s3_credentials};
 
 pub use unity::{TemporaryTableCredentials, UnityCatalogSession, resolve_uc_vended_storage};

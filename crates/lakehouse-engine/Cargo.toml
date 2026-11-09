@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.58.0"
+version = "0.59.0"
 edition = "2024"
 license.workspace = true
 
@@ -13,6 +13,7 @@ exasol-udf-macros = { workspace = true }
 
 vs-expression     = { path = "../vs-expression" }
 lakehouse-catalog = { path = "../lakehouse-catalog" }
+lakehouse-catalog-write = { path = "../lakehouse-catalog-write" }
 
 arrow      = { workspace = true, features = ["json"] }
 parquet    = { workspace = true }
@@ -71,6 +72,7 @@ rand    = "0.8"
 tokio               = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 exasol-udf-sdk      = { workspace = true, features = ["test-support"] }
 vs-expression       = { path = "../vs-expression", features = ["test-support"] }
+lakehouse-catalog   = { path = "../lakehouse-catalog", features = ["test-support"] }
 arrow               = { workspace = true, features = ["ipc"] }
 parquet             = { workspace = true }
 tempfile            = { version = "3" }

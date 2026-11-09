@@ -15,9 +15,10 @@ UDF_BUILDER_IMAGE ?= rust:1.98.1-trixie
 
 # Real-file target so E2E targets never run against a stale binary.
 VS_SO   := target/release/liblakehouse_engine.so
-VS_SRCS := $(shell find crates/lakehouse-engine/src crates/lakehouse-catalog/src crates/vs-expression/src -name '*.rs') \
+VS_SRCS := $(shell find crates/lakehouse-engine/src crates/lakehouse-catalog/src crates/lakehouse-catalog-write/src crates/vs-expression/src -name '*.rs') \
            crates/lakehouse-engine/Cargo.toml \
            crates/lakehouse-catalog/Cargo.toml \
+           crates/lakehouse-catalog-write/Cargo.toml \
            crates/vs-expression/Cargo.toml \
            Cargo.toml \
            .cargo/config.toml \

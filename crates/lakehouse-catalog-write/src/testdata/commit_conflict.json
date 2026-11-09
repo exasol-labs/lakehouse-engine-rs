@@ -1,0 +1,10 @@
+{
+  "error": {
+    "message": "CatalogCommitConflicts => Requirement failed: Branch or tag `main` not found",
+    "type": "CatalogCommitConflicts",
+    "code": 409,
+    "stack": [
+      "Error ID: 01a1bf3b-af15-7e03-9549-f504705bff0e"
+    ]
+  }
+}
