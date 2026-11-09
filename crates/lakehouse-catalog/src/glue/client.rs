@@ -13,9 +13,9 @@ use crate::redaction::redact_error_text;
 use crate::sigv4::required_signing_region;
 use crate::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogPartition, CatalogTable,
-    CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds,
-    DEFAULT_METADATA_READ_CONCURRENCY, PartitionFormat, SkipReason, SkippedTable, StorageBackend,
-    TableAdmission, TableFormat, catalog_identifier_string, read_iceberg_metadata_file,
+    CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds, PartitionFormat,
+    SkipReason, SkippedTable, StorageBackend, TableAdmission, TableFormat,
+    catalog_identifier_string, read_iceberg_metadata_file,
 };
 
 use super::partitions::neutral_partition;
@@ -38,6 +38,7 @@ impl GlueCatalogSession {
         address: &str,
         storage: StorageBackend,
         creds: ConnectionCreds,
+        metadata_read_concurrency: NonZeroUsize,
     ) -> Result<Self, UdfError> {
         let region = required_signing_region(&creds, address)?;
         let secrets = creds
@@ -51,13 +52,8 @@ impl GlueCatalogSession {
             storage,
             catalog_id: catalog_id(&creds.warehouse),
             secrets,
-            metadata_read_concurrency: DEFAULT_METADATA_READ_CONCURRENCY,
+            metadata_read_concurrency,
         })
-    }
-
-    pub fn with_metadata_read_concurrency(mut self, concurrency: NonZeroUsize) -> Self {
-        self.metadata_read_concurrency = concurrency;
-        self
     }
 
     pub fn metadata_read_concurrency(&self) -> NonZeroUsize {

@@ -501,10 +501,12 @@ fn client_of_kind(
     let (catalog_uri, storage, creds) = (&config.catalog_uri, &config.storage, &config.creds);
     let metadata_read_concurrency = config.metadata_read_concurrency;
     match config.catalog_kind {
-        CatalogKind::IcebergRest => Ok(Box::new(
-            IcebergRestCatalogClient::new(catalog_uri.clone(), creds.clone(), catalog_prefix)
-                .with_metadata_read_concurrency(metadata_read_concurrency),
-        )),
+        CatalogKind::IcebergRest => Ok(Box::new(IcebergRestCatalogClient::new(
+            catalog_uri.clone(),
+            creds.clone(),
+            catalog_prefix,
+            metadata_read_concurrency,
+        ))),
         CatalogKind::UnityCatalogNative => Ok(Box::new(UnityCatalogSession::new(
             catalog_uri,
             creds.clone(),
@@ -522,10 +524,12 @@ fn client_of_kind(
             )?;
             Ok(Box::new(client))
         }
-        CatalogKind::Glue => Ok(Box::new(
-            GlueCatalogSession::new(catalog_uri, storage.clone(), creds.clone())?
-                .with_metadata_read_concurrency(metadata_read_concurrency),
-        )),
+        CatalogKind::Glue => Ok(Box::new(GlueCatalogSession::new(
+            catalog_uri,
+            storage.clone(),
+            creds.clone(),
+            metadata_read_concurrency,
+        )?)),
     }
 }
 

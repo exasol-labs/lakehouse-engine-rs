@@ -9,7 +9,7 @@ The adapter records the computed resource budgets in the `createVirtualSchema` r
 * The parallelism factor is a VS or connection property recorded in `adapterNotes`. When absent, it defaults to 1, one shard per node.
 * `DATAFUSION_THREADING_MODE` (`AUTO` or `FIXED`, default `AUTO`) selects the threading configuration. `FIXED` uses `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF` as given, each falling back to its `AUTO` value. `AUTO` gives the node's single scan instance every core (`scan-runtime/scan-execution-threading`). Only the resolved integers reach the per-shard scan spec.
 * `MEMORY_POOL_FRACTION` (default `0.6`) and `INSTANCE_OVERHEAD_MB` (default `200`) are independent VS or connection properties. The adapter records both in `adapterNotes` and copies them into every per-shard scan spec. The scan UDF sizes its DataFusion pool to `fraction × (per_instance_limit − overhead_bytes)`.
-* `METADATA_READ_CONCURRENCY` (default `16`) bounds the adapter's concurrent metadata reads. These reads wait on the network, so the bound does not follow the core count. At the default, Iceberg manifests of up to about 8 MB each hold at most about 128 MB in the adapter.
+* `METADATA_READ_CONCURRENCY` (default `16`) bounds the adapter's concurrent metadata reads.
 * `vs-properties/create-virtual-schema-adapter-notes` covers how the core count is discovered, why it is not recorded, and why the cluster node count is not recorded.
 
 ## Scenarios

@@ -242,19 +242,15 @@ impl IcebergRestCatalogClient {
         catalog_uri: String,
         creds: ConnectionCreds,
         catalog_prefix: Option<String>,
+        metadata_read_concurrency: NonZeroUsize,
     ) -> Self {
         Self {
             catalog_uri,
             creds,
             catalog_prefix,
-            metadata_read_concurrency: DEFAULT_METADATA_READ_CONCURRENCY,
+            metadata_read_concurrency,
             session: OnceCell::new(),
         }
-    }
-
-    pub fn with_metadata_read_concurrency(mut self, concurrency: NonZeroUsize) -> Self {
-        self.metadata_read_concurrency = concurrency;
-        self
     }
 
     pub fn metadata_read_concurrency(&self) -> NonZeroUsize {

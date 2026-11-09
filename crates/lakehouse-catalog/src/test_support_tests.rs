@@ -10,6 +10,19 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+/// An Iceberg REST client with no stored catalog prefix, at the default metadata read concurrency.
+pub(crate) fn rest_client(
+    uri: impl Into<String>,
+    creds: ConnectionCreds,
+) -> crate::IcebergRestCatalogClient {
+    crate::IcebergRestCatalogClient::new(
+        uri.into(),
+        creds,
+        None,
+        crate::DEFAULT_METADATA_READ_CONCURRENCY,
+    )
+}
+
 pub(crate) fn base_creds() -> ConnectionCreds {
     ConnectionCreds {
         warehouse: "warehouse".into(),

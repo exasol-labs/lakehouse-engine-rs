@@ -550,7 +550,7 @@ async fn a_resent_sigv4_load_table_carries_its_first_signature() {
 /// Scenario: Every catalog request kind is bounded and retried
 #[tokio::test]
 async fn every_iceberg_rest_request_kind_succeeds_after_one_503() {
-    use crate::client::{CatalogClient, CatalogTableIdent, IcebergRestCatalogClient};
+    use crate::client::{CatalogClient, CatalogTableIdent};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // OAuth2 grant and /v1/config: both run during `CatalogSession::resolve`.
@@ -634,7 +634,7 @@ async fn every_iceberg_rest_request_kind_succeeds_after_one_503() {
         }
     })
     .await;
-    let client = IcebergRestCatalogClient::new(enum_uri, creds_no_auth(), None);
+    let client = rest_client(enum_uri, creds_no_auth());
     let ident = CatalogTableIdent {
         namespace: vec!["db".into()],
         name: "orders".into(),
