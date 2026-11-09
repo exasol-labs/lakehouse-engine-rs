@@ -479,10 +479,11 @@ fn client_of_kind(
 ) -> Result<Box<dyn ScanCatalog>, UdfError> {
     let (catalog_uri, storage, creds) = (&config.catalog_uri, &config.storage, &config.creds);
     match config.catalog_kind {
-        CatalogKind::IcebergRest => Ok(Box::new(
-            IcebergRestCatalogClient::new(catalog_uri.clone(), creds.clone())
-                .with_catalog_prefix(catalog_prefix),
-        )),
+        CatalogKind::IcebergRest => Ok(Box::new(IcebergRestCatalogClient::new(
+            catalog_uri.clone(),
+            creds.clone(),
+            catalog_prefix,
+        ))),
         CatalogKind::UnityCatalogNative => Ok(Box::new(UnityCatalogSession::new(
             catalog_uri,
             creds.clone(),

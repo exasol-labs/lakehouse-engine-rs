@@ -231,19 +231,18 @@ pub struct IcebergRestCatalogClient {
 }
 
 impl IcebergRestCatalogClient {
-    pub fn new(catalog_uri: String, creds: ConnectionCreds) -> Self {
+    /// A `catalog_prefix` found by an earlier client spares the session its `/v1/config` lookup.
+    pub fn new(
+        catalog_uri: String,
+        creds: ConnectionCreds,
+        catalog_prefix: Option<String>,
+    ) -> Self {
         Self {
             catalog_uri,
             creds,
-            catalog_prefix: None,
+            catalog_prefix,
             session: OnceCell::new(),
         }
-    }
-
-    /// A `prefix` found by an earlier client spares the session its `/v1/config` lookup.
-    pub fn with_catalog_prefix(mut self, prefix: Option<String>) -> Self {
-        self.catalog_prefix = prefix;
-        self
     }
 
     /// The client's one session, resolved by the first call, so every later request reuses its

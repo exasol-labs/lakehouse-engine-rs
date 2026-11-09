@@ -632,7 +632,7 @@ async fn every_iceberg_rest_request_kind_succeeds_after_one_503() {
         }
     })
     .await;
-    let client = IcebergRestCatalogClient::new(enum_uri, creds_no_auth());
+    let client = IcebergRestCatalogClient::new(enum_uri, creds_no_auth(), None);
     let ident = CatalogTableIdent {
         namespace: vec!["db".into()],
         name: "orders".into(),
