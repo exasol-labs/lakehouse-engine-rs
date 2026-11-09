@@ -100,7 +100,8 @@ struct Reference {
     rows: usize,
     /// Each table's load request, which the statement sends exactly once.
     loads: Vec<String>,
-    /// `/v1/config` lookups, counted only for a kind that opens an Iceberg REST session.
+    /// `/v1/config` lookups, counted only for a kind that opens an Iceberg REST session. The
+    /// create stored the prefix, so a pushdown sends none.
     configs: Option<usize>,
     /// The pushdowns the statement reaches the adapter as, so a merged statement cannot pass the
     /// counts vacuously. A single one must be a broadcast join, because a fallback to one
@@ -112,6 +113,7 @@ struct Reference {
 /// Scenario: The pushdowns of one statement share one catalog session per virtual schema
 /// Scenario: Single-table pushdown builds one catalog session and reuses it
 /// Scenario: N-table join reuses one session across all legs
+/// Scenario: A pushdown takes the catalog prefix from the schema notes
 #[test]
 fn every_reference_to_a_table_loads_it_once() {
     proxy_virtual_schemas();
@@ -126,7 +128,7 @@ fn every_reference_to_a_table_loads_it_once() {
             ),
             rows: 10,
             loads: vec![loads_events.clone()],
-            configs: Some(1),
+            configs: Some(0),
             pushdowns: 2,
         },
         Reference {
@@ -137,7 +139,7 @@ fn every_reference_to_a_table_loads_it_once() {
             ),
             rows: 10,
             loads: vec![loads_events.clone()],
-            configs: Some(1),
+            configs: Some(0),
             pushdowns: 2,
         },
         Reference {
@@ -148,7 +150,7 @@ fn every_reference_to_a_table_loads_it_once() {
             ),
             rows: 5,
             loads: vec![loads_events],
-            configs: Some(1),
+            configs: Some(0),
             pushdowns: 1,
         },
         Reference {
@@ -159,7 +161,7 @@ fn every_reference_to_a_table_loads_it_once() {
                 load_table_get(ICEBERG_REST_VIA_PROXY, E2E_FACT_TABLE),
                 load_table_get(ICEBERG_REST_VIA_PROXY, E2E_DIM_TABLE),
             ],
-            configs: Some(1),
+            configs: Some(0),
             pushdowns: 1,
         },
         Reference {

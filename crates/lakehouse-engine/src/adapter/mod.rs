@@ -75,6 +75,7 @@ const DEFAULT_INSTANCE_OVERHEAD_MB: u64 = 200;
 const NOTE_JOIN_BROADCAST_MAX_BYTES: &str = "JOIN_BROADCAST_MAX_BYTES";
 const DEFAULT_JOIN_BROADCAST_MAX_BYTES: u64 = 134_217_728;
 const NOTE_S3_MAX_CONNECTIONS: &str = "S3_MAX_CONNECTIONS";
+const NOTE_CATALOG_PREFIX: &str = "CATALOG_PREFIX";
 /// Connections per decode thread: S3 range GETs are latency-bound, so several in flight per
 /// thread keep the NIC busy, and idle pooled connections are far cheaper than threads.
 const S3_CONNECTIONS_PER_THREAD: usize = 4;
@@ -105,7 +106,12 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
             let permission = PermissionSettings::parse(&props)?;
             let check = permission.check_for(|| ctx.current_user())?;
             let state = STATEMENT_STATES.get_or_build(virtual_schema_name(request)?, || {
-                build_virtual_schema_state(&*ctx, &props, &permission)
+                build_virtual_schema_state(
+                    &*ctx,
+                    &props,
+                    &permission,
+                    stored_catalog_prefix(request),
+                )
             })?;
             let script_schema = ctx.script_schema();
             let cluster_nodes = cluster_nodes_from_context(ctx);
@@ -135,11 +141,12 @@ fn build_virtual_schema_state(
     ctx: &dyn UdfContext,
     props: &Json,
     permission: &PermissionSettings,
+    catalog_prefix: Option<String>,
 ) -> Result<VirtualSchemaState, UdfError> {
     // Built before `resolve_connection_config`, which blocks on it to assume the role.
     let rt = build_runtime()?;
     let config = resolve_connection_config(ctx, props, permission, &rt)?;
-    let catalog = StatementCatalog::open(config, props)?;
+    let catalog = StatementCatalog::open(config, props, catalog_prefix)?;
     Ok(VirtualSchemaState::new(rt, catalog))
 }
 
@@ -231,7 +238,7 @@ fn handle_create_virtual_schema(
         }
     };
 
-    let client = construct_catalog_client(&config, &props)?;
+    let client = construct_catalog_client(&config, &props, None)?;
     let (listing, skipped_tables) = rt
         .block_on(list_source(
             client.as_ref(),
@@ -251,7 +258,8 @@ fn handle_create_virtual_schema(
     }
 
     let tuning = resolve_tuning_notes(&checked.tuning, resolve_nr_of_cores());
-    let adapter_notes = build_adapter_notes(request, &tuning, &skipped_tables);
+    let adapter_notes =
+        build_adapter_notes(request, &tuning, &skipped_tables, client.persisted_prefix());
 
     let schema_metadata = json!({
         "tables": tables_json,
@@ -437,6 +445,14 @@ fn parse_adapter_notes(request: &Json) -> serde_json::Map<String, Json> {
         .unwrap_or_default()
 }
 
+/// Unlike [`adapter_note`], keeps an empty value: an empty catalog prefix is valid.
+fn stored_catalog_prefix(request: &Json) -> Option<String> {
+    parse_adapter_notes(request)
+        .get(NOTE_CATALOG_PREFIX)
+        .and_then(Json::as_str)
+        .map(str::to_string)
+}
+
 fn adapter_note(request: &Json, key: &str) -> Option<String> {
     parse_adapter_notes(request)
         .get(key)
@@ -451,20 +467,22 @@ fn adapter_note(request: &Json, key: &str) -> Option<String> {
 fn construct_catalog_client(
     config: &ResolvedConnectionConfig,
     props: &Json,
+    catalog_prefix: Option<String>,
 ) -> Result<Box<dyn ScanCatalog>, UdfError> {
-    client_of_kind(config, props).map_err(|e| redact_error(&config.storage, e))
+    client_of_kind(config, props, catalog_prefix).map_err(|e| redact_error(&config.storage, e))
 }
 
 fn client_of_kind(
     config: &ResolvedConnectionConfig,
     props: &Json,
+    catalog_prefix: Option<String>,
 ) -> Result<Box<dyn ScanCatalog>, UdfError> {
     let (catalog_uri, storage, creds) = (&config.catalog_uri, &config.storage, &config.creds);
     match config.catalog_kind {
-        CatalogKind::IcebergRest => Ok(Box::new(IcebergRestCatalogClient::new(
-            catalog_uri.clone(),
-            creds.clone(),
-        ))),
+        CatalogKind::IcebergRest => Ok(Box::new(
+            IcebergRestCatalogClient::new(catalog_uri.clone(), creds.clone())
+                .with_stored_prefix(catalog_prefix),
+        )),
         CatalogKind::UnityCatalogNative => Ok(Box::new(UnityCatalogSession::new(
             catalog_uri,
             creds.clone(),
@@ -557,7 +575,12 @@ struct TuningNotes {
 }
 
 /// Exasol rejects a raw-object adapterNotes, so it is a JSON string; pre-existing notes are merged.
-fn build_adapter_notes(request: &Json, tuning: &TuningNotes, skipped: &SkippedTables) -> Json {
+fn build_adapter_notes(
+    request: &Json,
+    tuning: &TuningNotes,
+    skipped: &SkippedTables,
+    catalog_prefix: Option<String>,
+) -> Json {
     let &TuningNotes {
         parallelism_factor,
         df_threading_mode,
@@ -606,6 +629,10 @@ fn build_adapter_notes(request: &Json, tuning: &TuningNotes, skipped: &SkippedTa
         NOTE_JOIN_BROADCAST_MAX_BYTES.to_string(),
         Json::String(join_broadcast_max_bytes.to_string()),
     );
+    match catalog_prefix {
+        Some(prefix) => notes.insert(NOTE_CATALOG_PREFIX.to_string(), Json::String(prefix)),
+        None => notes.remove(NOTE_CATALOG_PREFIX),
+    };
     insert_skipped_tables(&mut notes, skipped);
     Json::String(Json::Object(notes).to_string())
 }

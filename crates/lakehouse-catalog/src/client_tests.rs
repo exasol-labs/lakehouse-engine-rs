@@ -602,3 +602,28 @@ async fn non_404_load_failure_aborts_the_batch() {
     assert!(message.contains("prod.hive_events"), "{message}");
     assert!(message.contains("HTTP 500"), "{message}");
 }
+
+#[tokio::test]
+async fn persisted_prefix_is_the_resolved_session_prefix() {
+    let unresolved = IcebergRestCatalogClient::new("http://127.0.0.1:1".into(), sigv4_creds());
+    assert_eq!(unresolved.persisted_prefix(), None, "no session, no prefix");
+
+    for (stored, expected) in [
+        (None, "catalogs/123456789012"),
+        (Some(""), ""),
+        (Some("stored"), "stored"),
+    ] {
+        let client = IcebergRestCatalogClient::new("http://127.0.0.1:1".into(), sigv4_creds())
+            .with_stored_prefix(stored.map(str::to_string));
+        client
+            .session()
+            .await
+            .expect("SigV4 resolves with no request");
+
+        assert_eq!(
+            client.persisted_prefix().as_deref(),
+            Some(expected),
+            "stored {stored:?}"
+        );
+    }
+}

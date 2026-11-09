@@ -96,8 +96,9 @@ impl StatementCatalog {
     pub(crate) fn open(
         connection: ResolvedConnectionConfig,
         props: &Json,
+        catalog_prefix: Option<String>,
     ) -> Result<Self, UdfError> {
-        let client = construct_catalog_client(&connection, props)?;
+        let client = construct_catalog_client(&connection, props, catalog_prefix)?;
         Ok(Self {
             connection,
             client,

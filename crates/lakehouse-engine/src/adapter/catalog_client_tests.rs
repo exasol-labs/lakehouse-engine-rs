@@ -8,7 +8,7 @@ type ListingPipeline =
     fn(&[String], &CatalogListing, EngineTimestampSupport) -> Result<Vec<Json>, UdfError>;
 
 type CatalogClientConstruction =
-    fn(&ResolvedConnectionConfig, &Json) -> Result<Box<dyn ScanCatalog>, UdfError>;
+    fn(&ResolvedConnectionConfig, &Json, Option<String>) -> Result<Box<dyn ScanCatalog>, UdfError>;
 
 #[test]
 fn construction_site_is_exhaustive_and_fallible_for_every_kind() {
@@ -27,6 +27,7 @@ fn construction_site_is_exhaustive_and_fallible_for_every_kind() {
         construct_catalog_client(
             &resolved_connection(CatalogKind::Glue, address, storage, creds),
             &json!({}),
+            None,
         )
     };
 

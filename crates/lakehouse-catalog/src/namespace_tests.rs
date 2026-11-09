@@ -38,14 +38,6 @@ fn parse_table_ident_handles_multilevel_namespace() {
     assert_eq!(tbl3, "orders");
 }
 
-fn sigv4_creds() -> ConnectionCreds {
-    let mut creds = base_creds();
-    creds.use_sigv4 = true;
-    creds.region = "eu-west-1".into();
-    creds.warehouse = "123456789012".into();
-    creds
-}
-
 #[tokio::test]
 async fn list_namespace_tables_rejects_empty_namespace() {
     let creds = sigv4_creds();
