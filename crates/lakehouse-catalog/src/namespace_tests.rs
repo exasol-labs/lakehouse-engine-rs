@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::*;
+use std::time::Duration;
 
 #[test]
 fn parse_table_ident_splits_namespace_table() {
@@ -122,4 +123,45 @@ async fn a_refused_catalog_connection_names_its_cause_signed_or_not() {
             && msg.contains(CLOSED_PORT_CAUSE),
         "{msg}"
     );
+}
+
+#[test]
+fn direct_children_keeps_only_namespaces_one_level_below_the_parent() {
+    let ns = |parts: &[&str]| NamespaceIdent::from_strs(parts).unwrap();
+    let listed = [
+        &["ds"][..],
+        &["ds", "a"],
+        &["ds", "a", "b"],
+        &["ds", "ds"],
+        &["dsx", "a"],
+        &["other", "ds"],
+    ];
+
+    let children = direct_children(&ns(&["ds"]), listed.iter().map(|p| ns(p)).collect());
+
+    assert_eq!(children, [ns(&["ds", "a"]), ns(&["ds", "ds"])]);
+}
+
+/// Scenario: Enumeration descends only into direct children of the listed namespace
+#[tokio::test]
+async fn listing_terminates_when_the_catalog_ignores_parent() {
+    let (catalog_uri, _) = spawn_recording_catalog(
+        r#"{"identifiers":[{"namespace":["ds"],"name":"t"}],"namespaces":[["ds"]]}"#,
+    )
+    .await;
+    let creds = base_creds();
+    let session = CatalogSession::resolve(&catalog_uri, &creds.warehouse, &creds)
+        .await
+        .expect("the session resolves against the stub");
+    let root = ["ds".to_string()];
+
+    let tables = tokio::time::timeout(
+        Duration::from_secs(1),
+        list_namespace_tables(&session, &root, &creds),
+    )
+    .await
+    .expect("the listing must terminate")
+    .expect("the listing must succeed");
+
+    assert_eq!(tables, [TableIdent::from_strs(["ds", "t"]).unwrap()]);
 }
