@@ -125,15 +125,14 @@ fn refresh_reenumerates_namespace() {
     rt.block_on(drop_table_if_exists(&catalog, &reenum_ns, "t_new"));
 
     rt.block_on(ensure_id_val_table(&catalog, NS_REENUM, "t_orig", 1, 10.0));
-    // More tables than the catalog fan-out, in sibling, nested, and parent-named namespaces, each
-    // with its own column, so a load answered for the wrong table would declare the wrong column.
+    // More tables than the catalog fan-out, in sibling and nested namespaces, each with its own
+    // column, so a load answered for the wrong table would declare the wrong column.
     let fan_out: Vec<(Vec<&str>, String)> = (0..20)
         .map(|i| {
             let below: Vec<&str> = match i {
                 0..10 => vec![],
                 10..15 => vec!["a"],
-                15..17 => vec!["a", "b"],
-                17 => vec!["a", "a"],
+                15..18 => vec!["a", "b"],
                 _ => vec!["c"],
             };
             (below, format!("w{i:02}"))

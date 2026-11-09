@@ -97,11 +97,15 @@ async fn list_child_namespaces(
     )
     .await
     .map_err(|e| listing_error("list namespaces under", ns, e))?;
-    // A catalog that ignores `parent` would otherwise send the walk back to `ns` forever.
-    Ok(listed
+    Ok(direct_children(ns, listed))
+}
+
+/// A catalog that ignores `parent` would otherwise send the walk back to `parent` forever.
+fn direct_children(parent: &NamespaceIdent, listed: Vec<NamespaceIdent>) -> Vec<NamespaceIdent> {
+    listed
         .into_iter()
-        .filter(|child| child.len() == ns.len() + 1 && child.starts_with(ns))
-        .collect())
+        .filter(|child| child.len() == parent.len() + 1 && child.starts_with(parent))
+        .collect()
 }
 
 async fn list_pages<P: DeserializeOwned, T>(
