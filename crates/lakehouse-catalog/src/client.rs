@@ -222,10 +222,6 @@ pub trait CatalogClient: Send + Sync {
     }
 }
 
-/// How many metadata reads one adapter request keeps in flight. The reads wait on the network,
-/// so the limit does not follow the core count.
-pub const DEFAULT_METADATA_READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
-
 /// One [`CatalogSession`], resolved on first use, serves the listing and every load, so all the
 /// requests the client serves share one OAuth2 grant and at most one `/v1/config` lookup.
 pub struct IcebergRestCatalogClient {

@@ -494,7 +494,7 @@ async fn resolve_glue(
         glue_address,
         storage.clone(),
         sigv4_creds(),
-        lakehouse_catalog::DEFAULT_METADATA_READ_CONCURRENCY,
+        crate::adapter::DEFAULT_METADATA_READ_CONCURRENCY,
     )
     .expect("the CONNECTION region signs the session");
     let load = CatalogParquetTable::from_glue(&session, table, storage);

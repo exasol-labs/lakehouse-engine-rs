@@ -617,7 +617,7 @@ async fn catalog_prefix_is_the_resolved_session_prefix() {
             "http://127.0.0.1:1".into(),
             sigv4_creds(),
             stored.map(str::to_string),
-            crate::DEFAULT_METADATA_READ_CONCURRENCY,
+            crate::test_support::METADATA_READ_CONCURRENCY,
         );
         client
             .session()

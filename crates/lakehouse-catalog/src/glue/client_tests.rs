@@ -69,7 +69,7 @@ fn session_at(address: &str) -> GlueCatalogSession {
         address,
         storage,
         creds,
-        crate::DEFAULT_METADATA_READ_CONCURRENCY,
+        crate::test_support::METADATA_READ_CONCURRENCY,
     )
     .expect("a signing region");
     let config = session.client.config();
@@ -772,7 +772,7 @@ fn a_session_without_a_signing_region_is_refused() {
         "http://127.0.0.1:1",
         StorageBackend::S3(StorageProps::default()),
         creds,
-        crate::DEFAULT_METADATA_READ_CONCURRENCY,
+        crate::test_support::METADATA_READ_CONCURRENCY,
     );
 
     assert!(result.is_err(), "no signing region, no session");

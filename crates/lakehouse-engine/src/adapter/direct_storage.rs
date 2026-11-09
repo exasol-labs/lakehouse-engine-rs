@@ -42,7 +42,7 @@ impl DirectStorageCatalogClient {
         let store = crate::scan::build_admission_limited_store(
             backend,
             &store_url,
-            metadata_read_concurrency.get(),
+            metadata_read_concurrency,
             all_secrets,
         )?;
         Self::over_store(store, base_path, options, metadata_read_concurrency)

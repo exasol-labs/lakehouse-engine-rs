@@ -51,9 +51,8 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;
 use lakehouse_catalog::{
-    CatalogClient, CatalogListing, CatalogTableIdent, DEFAULT_METADATA_READ_CONCURRENCY,
-    GlueCatalogSession, IcebergRestCatalogClient, SkippedTable, UnityCatalogSession,
-    resolve_aws_identity,
+    CatalogClient, CatalogListing, CatalogTableIdent, GlueCatalogSession, IcebergRestCatalogClient,
+    SkippedTable, UnityCatalogSession, resolve_aws_identity,
 };
 use serde_json::{Value as Json, json};
 use std::num::NonZeroUsize;
@@ -77,6 +76,8 @@ const NOTE_JOIN_BROADCAST_MAX_BYTES: &str = "JOIN_BROADCAST_MAX_BYTES";
 const DEFAULT_JOIN_BROADCAST_MAX_BYTES: u64 = 134_217_728;
 const NOTE_S3_MAX_CONNECTIONS: &str = "S3_MAX_CONNECTIONS";
 const NOTE_METADATA_READ_CONCURRENCY: &str = "METADATA_READ_CONCURRENCY";
+/// The reads wait on the network, so the default does not follow the core count.
+const DEFAULT_METADATA_READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 const NOTE_CATALOG_PREFIX: &str = "CATALOG_PREFIX";
 /// Connections per decode thread: S3 range GETs are latency-bound, so several in flight per
 /// thread keep the NIC busy, and idle pooled connections are far cheaper than threads.

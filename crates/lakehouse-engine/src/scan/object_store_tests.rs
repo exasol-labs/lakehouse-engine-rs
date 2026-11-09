@@ -1022,8 +1022,9 @@ fn build_admission_limited_store_wraps_the_s3_backend_in_a_limit_store() {
     let backend = s3_backend("http://s3.example.com", "secret");
     let store_url = Url::parse("s3://test-bucket").expect("URL must parse");
 
-    let store = build_admission_limited_store(&backend, &store_url, 7, &[])
-        .expect("an S3 backend must build an admission-limited store");
+    let store =
+        build_admission_limited_store(&backend, &store_url, NonZeroUsize::new(7).unwrap(), &[])
+            .expect("an S3 backend must build an admission-limited store");
 
     assert!(
         store.to_string().starts_with("LimitStore(7, "),
@@ -1041,8 +1042,9 @@ fn build_admission_limited_store_wraps_the_adls_backend_in_a_limit_store() {
     let store_url =
         Url::parse("abfss://container@acct.dfs.core.windows.net").expect("URL must parse");
 
-    let store = build_admission_limited_store(&backend, &store_url, 7, &[])
-        .expect("an Adls backend must build an admission-limited store");
+    let store =
+        build_admission_limited_store(&backend, &store_url, NonZeroUsize::new(7).unwrap(), &[])
+            .expect("an Adls backend must build an admission-limited store");
 
     assert!(
         store.to_string().starts_with("LimitStore(7, "),

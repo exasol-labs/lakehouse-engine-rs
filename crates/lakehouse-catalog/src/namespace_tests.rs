@@ -49,7 +49,7 @@ async fn list_namespace_tables_rejects_empty_namespace() {
         &session,
         &[],
         &creds,
-        crate::DEFAULT_METADATA_READ_CONCURRENCY,
+        crate::test_support::METADATA_READ_CONCURRENCY,
     )
     .await
     .unwrap_err();
@@ -73,7 +73,7 @@ async fn signed_listing_lists_only_the_configured_namespace_under_the_catalogs_p
         &session,
         &["db".to_string()],
         &creds,
-        crate::DEFAULT_METADATA_READ_CONCURRENCY,
+        crate::test_support::METADATA_READ_CONCURRENCY,
     )
     .await
     .expect("the signed listing must succeed against the stub");
@@ -119,7 +119,7 @@ async fn a_refused_catalog_connection_names_its_cause_signed_or_not() {
         &session,
         &["db".to_string()],
         &creds,
-        crate::DEFAULT_METADATA_READ_CONCURRENCY,
+        crate::test_support::METADATA_READ_CONCURRENCY,
     )
     .await
     else {
@@ -168,7 +168,7 @@ async fn listing_terminates_when_the_catalog_ignores_parent() {
             &session,
             &root,
             &creds,
-            crate::DEFAULT_METADATA_READ_CONCURRENCY,
+            crate::test_support::METADATA_READ_CONCURRENCY,
         ),
     )
     .await

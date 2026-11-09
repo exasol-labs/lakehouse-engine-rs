@@ -24,9 +24,9 @@ mod test_support;
 
 pub use client::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogPartition, CatalogTable,
-    CatalogTableIdent, CatalogTableType, ColumnSourceType, DEFAULT_METADATA_READ_CONCURRENCY,
-    HIVE_DEFAULT_PARTITION, IcebergRestCatalogClient, PartitionFormat, SkipReason, SkippedTable,
-    TableAdmission, TableFormat, catalog_identifier_string,
+    CatalogTableIdent, CatalogTableType, ColumnSourceType, HIVE_DEFAULT_PARTITION,
+    IcebergRestCatalogClient, PartitionFormat, SkipReason, SkippedTable, TableAdmission,
+    TableFormat, catalog_identifier_string,
 };
 pub use creds::{CatalogProps, ConnectionCreds, StorageCreds, StorageProps};
 pub use error_chain::error_chain;

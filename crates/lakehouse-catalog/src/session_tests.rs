@@ -317,7 +317,7 @@ async fn assumed_session_signs_load_table_and_namespace_enumeration() {
             &enumeration_session,
             &["db".to_string()],
             &session_creds,
-            crate::DEFAULT_METADATA_READ_CONCURRENCY,
+            crate::test_support::METADATA_READ_CONCURRENCY,
         )
         .await
         .expect("the session-signed enumeration must succeed");
@@ -616,7 +616,7 @@ async fn every_iceberg_rest_request_kind_succeeds_after_one_503() {
         &listing_session,
         &["db".to_string()],
         &creds_no_auth(),
-        crate::DEFAULT_METADATA_READ_CONCURRENCY,
+        crate::test_support::METADATA_READ_CONCURRENCY,
     )
     .await
     .expect("a 503 on the listing is retried to success");

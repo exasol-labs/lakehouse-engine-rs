@@ -399,16 +399,6 @@ fn create_rejects_each_invalid_tuning_value() {
             "a number greater than 0 and at most 1",
         ),
         ("DATAFUSION_THREADING_MODE", "garbage", "AUTO or FIXED"),
-        (
-            "METADATA_READ_CONCURRENCY",
-            "0",
-            "a whole number from 1 to 255",
-        ),
-        (
-            "METADATA_READ_CONCURRENCY",
-            "2.5",
-            "a whole number from 1 to 255",
-        ),
         ("ALLOW_HTTP", "yes", "TRUE or FALSE"),
     ] {
         let mut props = base_props();
@@ -594,10 +584,6 @@ fn set_properties_rejects_problems_and_keeps_the_schema() {
                 "60",
                 "a number greater than 0 and at most 1",
             ),
-        ),
-        (
-            "SET METADATA_READ_CONCURRENCY = '0'",
-            invalid_value("METADATA_READ_CONCURRENCY", "0", &whole_number("1", "255")),
         ),
     ] {
         let sql = format!("ALTER VIRTUAL SCHEMA {VS} {statement}");

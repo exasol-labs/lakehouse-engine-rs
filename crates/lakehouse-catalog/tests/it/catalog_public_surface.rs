@@ -113,7 +113,7 @@ fn both_clients_are_catalog_client_trait_objects() {
         "http://catalog".into(),
         connection_creds(),
         None,
-        lakehouse_catalog::DEFAULT_METADATA_READ_CONCURRENCY,
+        std::num::NonZeroUsize::MIN,
     ));
     let unity: Box<dyn CatalogClient> =
         Box::new(UnityCatalogSession::new("http://unity", connection_creds()));
@@ -378,7 +378,7 @@ fn glue_additions_are_reachable_through_neutral_types_only() {
         "https://glue.eu-west-1.amazonaws.com",
         storage.clone(),
         connection_creds(),
-        lakehouse_catalog::DEFAULT_METADATA_READ_CONCURRENCY,
+        std::num::NonZeroUsize::MIN,
     )
     .expect("the Glue endpoint names its signing region");
 

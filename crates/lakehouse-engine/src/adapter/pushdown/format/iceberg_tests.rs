@@ -6,12 +6,11 @@ use super::super::super::test_support::{
 };
 use super::super::ResolvedScan;
 use super::*;
+use crate::adapter::DEFAULT_METADATA_READ_CONCURRENCY;
 use crate::adapter::column_notes::TableNotes;
 use crate::adapter::pushdown::test_support::connection_storage;
 use iceberg::spec::{DataContentType, DataFileFormat};
-use lakehouse_catalog::{
-    ConnectionCreds, DEFAULT_METADATA_READ_CONCURRENCY, StorageBackend, TableFormat,
-};
+use lakehouse_catalog::{ConnectionCreds, StorageBackend, TableFormat};
 
 fn name_mapped_load_table_body() -> Json {
     load_table_body(serde_json::json!({

@@ -16,6 +16,7 @@ use object_store::{
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use url::{Position, Url};
 
@@ -262,15 +263,15 @@ fn apply_admission_limit<T: ObjectStore>(
 pub(crate) fn build_admission_limited_store(
     backend: &StorageBackend,
     store_url: &Url,
-    admission_limit: usize,
+    admission_limit: NonZeroUsize,
     all_secrets: &[&str],
 ) -> Result<Arc<dyn ObjectStore>, UdfError> {
     build_undecorated_store(
         backend,
         store_url,
         StoreBounds {
-            connection_budget: admission_limit,
-            admission_limit: Some(admission_limit),
+            connection_budget: admission_limit.get(),
+            admission_limit: Some(admission_limit.get()),
         },
         all_secrets,
     )
