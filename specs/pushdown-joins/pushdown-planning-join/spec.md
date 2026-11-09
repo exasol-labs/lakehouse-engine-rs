@@ -101,7 +101,7 @@ Extends pushdown planning (`pushdown/pushdown-planning`) with the broadcast inne
 * *AND* a filter that is PRESENT and non-trivial but that DECLINES, because the scan translator declines it, SHALL cause the adapter to decline the broadcast plan and take the unified unaccelerated fallback, exactly as an unrenderable join condition does, because the broadcast SQL carries no outer `WHERE` in which the predicate could be applied
 * *AND* the adapter SHALL distinguish an ABSENT or trivially-true filter, which leaves the broadcast plan eligible and emits no scan-spec filter, from a DECLINED one, which forfeits the broadcast plan
 * *AND* the adapter MUST NOT emit a broadcast plan whose scan spec omits a declined predicate, because the result would carry extra rows, see `pushdown/pushdown-declined-filter-self-apply`
-* *AND* every column reference in the filter and in any select-list expression SHALL be qualified with its leg's relation alias BEFORE the pipeline runs, replacing Exasol's native `tableAlias`, because the scan aliases each relation with the alias the join block carries for it
+* *AND* every column reference in the filter and in any select-list expression SHALL be qualified with its leg's relation alias BEFORE the scan translator renders it, replacing Exasol's native `tableAlias`, because the scan aliases each relation with the alias the join block carries for it
 
 ### Scenario: Join condition is rendered via the vs-expression translator
 

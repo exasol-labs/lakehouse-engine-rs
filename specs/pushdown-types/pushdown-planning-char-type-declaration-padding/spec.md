@@ -26,7 +26,7 @@ A `CHAR(n)` value returns what native Exasol returns: blank-padded to `n`, trail
 * *WHEN* the query runs through the Virtual Schema
 * *THEN* Exasol SHALL apply the CAST, so each shorter value is space-padded to `n`
 * *AND* values that differ only in trailing blanks SHALL form one group, including blanks beyond `n`
-* *AND* a value with non-blank characters beyond `n` SHALL fail the statement with SQL state 22001, as natively
+* *AND* a value with non-blank characters beyond `n` SHALL fail the statement with Exasol's right-truncation error: SQL state 22001 for a select item, as natively, and 22002 when the query groups on the CAST, because Exasol evaluates it over the scanned rows
 
 ### Scenario: The CHAR declaration query shapes execute end to end through the Virtual Schema
 

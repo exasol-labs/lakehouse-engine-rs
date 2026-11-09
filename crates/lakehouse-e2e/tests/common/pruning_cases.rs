@@ -2,7 +2,7 @@
 //! binary provisions its format's copy of the fixture; these checks are shared by every format.
 
 use super::e2e_harness::{
-    SCAN_SCRIPT_NAME, isolated_pushdown_statement, parse_int, typed_result, value_to_string,
+    SCAN_SCRIPT_NAME, comparable_result, isolated_pushdown_statement, parse_int, value_to_string,
 };
 use super::exasol_ws::ExaConn;
 use super::pruning_fixture::{
@@ -403,15 +403,9 @@ impl Format {
     }
 }
 
-fn typed_rows(conn: &mut ExaConn, sql: &str) -> (Vec<serde_json::Value>, Vec<Vec<String>>) {
-    let (types, mut rows) = typed_result(conn, sql);
-    rows.sort();
-    (types, rows)
-}
-
 fn oracle_mismatch(conn: &mut ExaConn, query: &str, format: Format) -> Option<String> {
-    let actual = typed_rows(conn, &query.replace("{T}", &format.table()));
-    let expected = typed_rows(conn, &query.replace("{T}", PRUNING_ORACLE_TABLE));
+    let actual = comparable_result(conn, &query.replace("{T}", &format.table()));
+    let expected = comparable_result(conn, &query.replace("{T}", PRUNING_ORACLE_TABLE));
     (actual != expected).then(|| format!("`{query}`: got {actual:?}, the oracle {expected:?}"))
 }
 

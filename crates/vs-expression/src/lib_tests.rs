@@ -4,19 +4,11 @@ use serde_json::json;
 
 /// `None` on any failure; never panics.
 fn render_expression_safe(expr: &Json) -> Option<String> {
-    render_expression_inner(expr, Dialect::DataFusion).ok()?
+    render_expression(expr).ok()
 }
 
-/// `None` when rendering fails or the filter is trivially true (`TRUE`/`NULL`). The
-/// two causes are indistinguishable; the caller decides whether a declined filter
-/// must be self-applied.
-fn render_df_filter_safe(filter_expr: &Json) -> Option<String> {
-    let result = render_expression_inner(filter_expr, Dialect::DataFusion).ok()??;
-    if result == "TRUE" || result == "NULL" {
-        None
-    } else {
-        Some(result)
-    }
+fn scan_filter(filter: &Json) -> Result<Option<String>, UdfError> {
+    render_scan_filter(filter, &typed_columns::<&str>(&[]))
 }
 
 /// Exasol's `CAST("X" AS data_type)` node.
@@ -669,15 +661,31 @@ fn unsupported_node_returns_none_in_safe_mode() {
 }
 
 #[test]
-fn true_filter_returns_none_in_safe_mode() {
-    let expr = bool_lit(true);
-    assert!(render_df_filter_safe(&expr).is_none());
+fn trivially_true_scan_filters_render_as_no_filter() {
+    assert_eq!(scan_filter(&bool_lit(true)).unwrap(), None);
+    assert_eq!(scan_filter(&null_lit()).unwrap(), None);
+    assert_eq!(
+        scan_filter(&bool_lit(false)).unwrap().as_deref(),
+        Some("FALSE")
+    );
 }
 
 #[test]
-fn null_filter_returns_none_in_safe_mode() {
-    let expr = null_lit();
-    assert!(render_df_filter_safe(&expr).is_none());
+fn conjoined_scan_filters_render_as_their_predicate_and() {
+    let conjuncts = [
+        predicate_equal(num_lit(1), num_lit(1)),
+        predicate_equal(num_lit(2), num_lit(2)),
+    ];
+    let one_by_one = conjuncts
+        .iter()
+        .map(|c| scan_filter(c).unwrap().unwrap())
+        .collect();
+    assert_eq!(
+        conjoin_scan_filters(one_by_one),
+        scan_filter(&and(conjuncts)).unwrap()
+    );
+    assert_eq!(conjoin_scan_filters(vec!["TRUE".into()]), None);
+    assert_eq!(conjoin_scan_filters(Vec::new()), None);
 }
 
 #[test]
@@ -1490,7 +1498,7 @@ fn regexp_like_predicate_declines_in_both_dialects() {
         expected
     );
     assert!(render_expression_safe(&expr).is_none());
-    assert!(render_df_filter_safe(&expr).is_none());
+    assert!(scan_filter(&expr).is_err());
     assert!(render_expression_exasol_safe(&expr).is_none());
     assert!(render_df_filter_exasol_safe(&expr).is_none());
 }

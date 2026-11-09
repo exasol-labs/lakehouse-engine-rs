@@ -3,6 +3,7 @@ use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, SortKey, StorageProps};
 use crate::scan::test_support::WithFiles;
+use crate::types::exasol_type::exasol_type_to_json;
 
 fn delete_spec_template() -> ScanSpec {
     CommonScanSpec {
@@ -382,7 +383,7 @@ fn projection_carried_in_common_literal_and_emits() {
 #[test]
 fn pushdown_translates_or_omits_predicate() {
     let translatable = compare("predicate_greater", col("age"), num_lit(18));
-    let filter_rendered = render_df_filter_safe(&translatable);
+    let filter_rendered = untyped_scan_filter(&translatable);
     assert!(
         filter_rendered.is_some(),
         "translatable predicate must produce a filter string"
@@ -400,7 +401,7 @@ fn pushdown_translates_or_omits_predicate() {
     // Kept out of the scan spec only; the adapter still self-applies it (see
     // `declined_filter_routes_every_dispatch_shape_to_qualified_wrapper`).
     let untranslatable = serde_json::json!({"type": "fn_custom_agg", "args": []});
-    let omitted = render_df_filter_safe(&untranslatable);
+    let omitted = untyped_scan_filter(&untranslatable);
     assert!(
         omitted.is_none(),
         "untranslatable predicate must be omitted (None), not mistranslated"
@@ -1781,7 +1782,7 @@ fn filter_in_common_arg() {
 
     let filter_json = predicate_equal(col("id"), num_lit(42));
 
-    let df_filter = render_df_filter_safe(&filter_json);
+    let df_filter = untyped_scan_filter(&filter_json);
     assert!(
         df_filter.is_some(),
         "translatable filter must produce a DataFusion SQL string"
@@ -1879,7 +1880,6 @@ fn declined_like_on_date_column_routes_to_wrapper_where() {
     );
 }
 
-/// Scenario: A column of unknown type declines
 #[test]
 fn declined_like_on_unresolvable_column_routes_to_wrapper_where() {
     let filter = like(table_col("T", "MYSTERY"), "A%");
@@ -1975,7 +1975,7 @@ fn expr_tree_applies_f_to_a_non_object_node() {
     }
 }
 
-fn decimal_rewrite_col_types() -> Vec<(String, ExasolType)> {
+fn mixed_col_types() -> Vec<(String, ExasolType)> {
     vec![
         ("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2)),
         ("ID".to_string(), ExasolType::decimal(20, 0)),
@@ -1989,15 +1989,14 @@ fn decimal_rewrite_col_types() -> Vec<(String, ExasolType)> {
 
 #[test]
 fn stringify_nondecimal_column_unchanged() {
-    let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
+    let pushdown_req = pushdown_request("T", &mixed_col_types())
         .item(
             cast_to(ExasolType::WIDEST_VARCHAR, col("name")),
             ExasolType::varchar(20),
         )
         .build_pushdown();
     let (items, _types, _widened) =
-        project_split(&pushdown_req, &column_types(&decimal_rewrite_col_types()))
-            .expect("must project");
+        project_split(&pushdown_req, &column_types(&mixed_col_types())).expect("must project");
 
     assert_eq!(
         items.len(),
@@ -2009,24 +2008,30 @@ fn stringify_nondecimal_column_unchanged() {
     };
     assert_eq!(
         expr, r#"CAST("NAME" AS VARCHAR)"#,
-        "a CAST over a non-DECIMAL column must render unchanged, exactly as before this fix: {expr}"
+        "a CAST of text to text renders unchanged: {expr}"
     );
 }
 
-/// Scenario: A select item the scan declines widens the projection to the full base row
 #[test]
-fn selectlist_session_formatted_text_falls_back_to_full_row() {
-    let col_types = decimal_rewrite_col_types();
+fn selectlist_items_the_scan_declines_widen_to_the_full_base_row() {
+    let col_types = mixed_col_types();
+    let text = ExasolType::WIDEST_VARCHAR;
     let cases = [
-        ("UPPER(DOUBLE)", scalar_fn("UPPER", vec![col("c_double_a")])),
+        (
+            "UPPER(DOUBLE)",
+            scalar_fn("UPPER", vec![col("c_double_a")]),
+            text,
+        ),
         (
             "UPPER(DECIMAL(10,2))",
             scalar_fn("UPPER", vec![col("c_decimal_a")]),
+            text,
         ),
-        ("LOWER(DATE)", scalar_fn("LOWER", vec![col("d")])),
+        ("LOWER(DATE)", scalar_fn("LOWER", vec![col("d")]), text),
         (
             "CAST(DECIMAL(10,2) AS VARCHAR)",
             cast_to(ExasolType::WIDEST_VARCHAR, col("c_decimal_a")),
+            text,
         ),
         (
             "CAST(computed DECIMAL AS VARCHAR)",
@@ -2034,6 +2039,7 @@ fn selectlist_session_formatted_text_falls_back_to_full_row() {
                 ExasolType::WIDEST_VARCHAR,
                 scalar_fn("MULT", [col("c_decimal_a"), num_lit(2)]),
             ),
+            text,
         ),
         (
             "nested CONCAT over DECIMAL",
@@ -2044,6 +2050,33 @@ fn selectlist_session_formatted_text_falls_back_to_full_row() {
                     scalar_fn("CONCAT", [str_lit("-"), col("c_decimal_a")]),
                 ],
             ),
+            text,
+        ),
+        (
+            "INSTR with a start position",
+            scalar_fn("INSTR", vec![col("name"), str_lit("b"), num_lit(3)]),
+            ExasolType::decimal(18, 0),
+        ),
+        (
+            "LIKE over DECIMAL(10,2)",
+            like(col("c_decimal_a"), "1%"),
+            ExasolType::Boolean,
+        ),
+        ("LIKE over DATE", like(col("d"), "1%"), ExasolType::Boolean),
+        (
+            "LIKE over DOUBLE",
+            like(col("c_double_a"), "1%"),
+            ExasolType::Boolean,
+        ),
+        (
+            "LIKE over TIMESTAMP",
+            like(col("c_ts_a"), "1%"),
+            ExasolType::Boolean,
+        ),
+        (
+            "LIKE over an unresolvable column",
+            like(col("not_a_column"), "1%"),
+            ExasolType::Boolean,
         ),
     ];
     let expected_names: Vec<ProjectionItem> = col_types
@@ -2051,9 +2084,9 @@ fn selectlist_session_formatted_text_falls_back_to_full_row() {
         .map(|(n, _)| ProjectionItem::from(n.clone()))
         .collect();
     let expected_types: Vec<ExasolType> = col_types.iter().map(|(_, t)| *t).collect();
-    for (label, item) in cases {
+    for (label, item, declared) in cases {
         let pushdown_req = pushdown_request("T", &col_types)
-            .item(item, ExasolType::WIDEST_VARCHAR)
+            .item(item, declared)
             .build_pushdown();
         let (items, types, widened) =
             project_split(&pushdown_req, &column_types(&col_types)).expect("must project");
@@ -2062,31 +2095,6 @@ fn selectlist_session_formatted_text_falls_back_to_full_row() {
         assert_eq!(items, expected_names, "{label}");
         assert_eq!(types, expected_types, "{label}");
     }
-}
-
-#[test]
-fn selectlist_instr_with_start_position_falls_back_to_full_row() {
-    let col_types = decimal_rewrite_col_types();
-    let item = scalar_fn("INSTR", vec![col("name"), str_lit("b"), num_lit(3)]);
-    let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
-        .item(item, ExasolType::decimal(18, 0))
-        .build_pushdown();
-    let (items, _types, _widened) =
-        project_split(&pushdown_req, &column_types(&col_types)).expect("must project");
-
-    assert_eq!(
-        items.len(),
-        col_types.len(),
-        "the arity-decline INSTR must fall back to the full base row, not a truncated strpos: {items:?}"
-    );
-    let expected_names: Vec<ProjectionItem> = col_types
-        .iter()
-        .map(|(n, _)| ProjectionItem::from(n.clone()))
-        .collect();
-    assert_eq!(
-        items, expected_names,
-        "the full-row fallback must project every base column unchanged"
-    );
 }
 
 /// Scenario: Scalar select-list expression is pushed into the scan-driving query
@@ -2121,11 +2129,11 @@ fn selectlist_predicate_node_projects_as_expr() {
     ];
 
     for (node_type, item, expected_frag) in cases {
-        let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
+        let pushdown_req = pushdown_request("T", &mixed_col_types())
             .item(item, ExasolType::Boolean)
             .build_pushdown();
         let (items, types, _widened) =
-            project_split(&pushdown_req, &column_types(&decimal_rewrite_col_types()))
+            project_split(&pushdown_req, &column_types(&mixed_col_types()))
                 .unwrap_or_else(|e| panic!("[{node_type}] must project: {e}"));
 
         assert_eq!(
@@ -2153,8 +2161,8 @@ fn selectlist_predicate_node_projects_as_expr() {
 #[test]
 fn selectlist_function_aggregate_still_widens_to_full_row() {
     let item = count_star();
-    let col_types = decimal_rewrite_col_types();
-    let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
+    let col_types = mixed_col_types();
+    let pushdown_req = pushdown_request("T", &mixed_col_types())
         .item(item, ExasolType::decimal(20, 0))
         .build_pushdown();
     let (items, types, widened) =
@@ -2184,7 +2192,7 @@ fn selectlist_function_aggregate_still_widens_to_full_row() {
 
 #[test]
 fn selectlist_like_over_integer_or_boolean_projects_its_text() {
-    let col_types = decimal_rewrite_col_types();
+    let col_types = mixed_col_types();
     for (subject, text) in [
         ("id", r#"CAST(CAST("ID" AS DECIMAL(38,0)) AS VARCHAR)"#),
         ("c_bool_a", "'TRUE'"),
@@ -2204,61 +2212,14 @@ fn selectlist_like_over_integer_or_boolean_projects_its_text() {
     }
 }
 
-/// Scenario: A select item the scan declines widens the projection to the full base row
-#[test]
-fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
-    let col_types = decimal_rewrite_col_types();
-    let cases: Vec<(&str, Json)> = vec![
-        (
-            "c_decimal_a (DECIMAL(10,2))",
-            like(col("c_decimal_a"), "1%"),
-        ),
-        ("d (DATE)", like(col("d"), "1%")),
-        (
-            "c_double_a (DOUBLE PRECISION)",
-            like(col("c_double_a"), "1%"),
-        ),
-        ("c_ts_a (TIMESTAMP)", like(col("c_ts_a"), "1%")),
-        ("unresolvable column name", like(col("not_a_column"), "1%")),
-    ];
-
-    for (label, item) in cases {
-        let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
-            .item(item, ExasolType::Boolean)
-            .build_pushdown();
-        let (items, types, widened) = project_split(&pushdown_req, &column_types(&col_types))
-            .unwrap_or_else(|e| panic!("[{label}] must project (Ok), not error: {e}"));
-
-        assert!(
-            widened,
-            "[{label}] a non-string LIKE subject must widen to the full base row"
-        );
-        assert_eq!(
-            items.len(),
-            col_types.len(),
-            "[{label}] must fall back to the full base row, not a truncated projection: {items:?}"
-        );
-        let expected_names: Vec<ProjectionItem> = col_types
-            .iter()
-            .map(|(n, _)| ProjectionItem::from(n.clone()))
-            .collect();
-        assert_eq!(
-            items, expected_names,
-            "[{label}] the full-row fallback must project every base column unchanged"
-        );
-        let expected_types: Vec<ExasolType> = col_types.iter().map(|(_, t)| *t).collect();
-        assert_eq!(types, expected_types, "[{label}] EMITS types mismatch");
-    }
-}
-
 #[test]
 fn selectlist_like_inside_case_over_decimal_falls_back_to_full_row() {
-    let col_types = decimal_rewrite_col_types();
+    let col_types = mixed_col_types();
     let case_expr = case_when(
         [like(col("c_decimal_a"), "1%")],
         [str_lit("yes"), str_lit("no")],
     );
-    let pushdown_req = pushdown_request("T", &decimal_rewrite_col_types())
+    let pushdown_req = pushdown_request("T", &mixed_col_types())
         .item(case_expr, ExasolType::WIDEST_VARCHAR)
         .build_pushdown();
     let (items, types, widened) =
@@ -2304,7 +2265,7 @@ fn column_exa_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
 }
 
 fn assert_widens_to_full_base_row(select_item: Json, declared_type: ExasolType, why: &str) {
-    let col_types = decimal_rewrite_col_types();
+    let col_types = mixed_col_types();
     let pushdown_req = pushdown_request("T", &col_types)
         .item(select_item, declared_type)
         .build_pushdown();
@@ -2406,7 +2367,7 @@ fn project_columns_widens_on_aggregate_nested_in_predicate_node() {
 
 #[test]
 fn project_columns_does_not_widen_when_select_item_has_no_nested_aggregate() {
-    let col_types = decimal_rewrite_col_types();
+    let col_types = mixed_col_types();
     let pushdown_req = pushdown_request("T", &col_types)
         .item(
             scalar_fn("ROUND", [col("C_DECIMAL_A"), num_lit(2)]),
@@ -2740,6 +2701,72 @@ fn a_concatenation_lists_each_map_in_turn() {
     );
 }
 
+/// The types a request's select list parses to, or a phrase its refusal names.
+type ParseOutcome = Result<Vec<ExasolType>, String>;
+
+/// Scenario: A pushdown request with a missing or invalid Exasol type fails the query
+#[test]
+fn select_list_data_types_check_answers_per_request_shape() {
+    let columns = [
+        ("ID", ExasolType::decimal(20, 0)),
+        ("NAME", ExasolType::varchar(10)),
+    ];
+    let full_row = vec![ExasolType::decimal(20, 0), ExasolType::varchar(10)];
+    let one_item = || pushdown_request("T", &columns).column(col("ID"));
+    let invalid_entry = serde_json::json!({"type": "decimal", "precision": 37, "scale": 0});
+    let cases: [(&str, PushdownRequestBuilder, ParseOutcome); 7] = [
+        (
+            "an absent list",
+            one_item().select_list_data_types(None),
+            Err("selectListDataTypes".into()),
+        ),
+        (
+            "an invalid entry",
+            one_item().select_list_data_types(Some(serde_json::json!([invalid_entry]))),
+            Err(invalid_entry.to_string()),
+        ),
+        (
+            "more entries than items",
+            one_item().select_list_data_types(Some(serde_json::json!([
+                exasol_type_to_json(&ExasolType::decimal(20, 0)),
+                exasol_type_to_json(&ExasolType::varchar(10)),
+            ]))),
+            Err("2 selectListDataTypes entries for 1 selectList items".into()),
+        ),
+        (
+            "fewer entries than items",
+            one_item().select_list_data_types(Some(serde_json::json!([]))),
+            Err("0 selectListDataTypes entries for 1 selectList items".into()),
+        ),
+        (
+            "an absent selectList",
+            pushdown_request("T", &columns),
+            Ok(full_row.clone()),
+        ),
+        (
+            "a JSON-null selectList",
+            pushdown_request("T", &columns).field("selectList", Json::Null),
+            Ok(full_row),
+        ),
+        (
+            "an empty selectList",
+            pushdown_request("T", &columns).empty_select_list(),
+            Ok(Vec::new()),
+        ),
+    ];
+    for (shape, request, expected) in cases {
+        let parsed = PushdownRequest::parse(pd(&request.build().0))
+            .map(|parsed| parsed.select_types().to_vec());
+        match (parsed, expected) {
+            (Ok(types), Ok(expected)) => assert_eq!(types, expected, "{shape}"),
+            (Err(UdfError::User(message)), Err(named)) => {
+                assert!(message.contains(&named), "{shape}: {message}");
+            }
+            (outcome, expected) => panic!("{shape}: got {outcome:?}, expected {expected:?}"),
+        }
+    }
+}
+
 /// Scenario: A pushdown request with a missing or invalid Exasol type fails the query
 #[test]
 fn involved_column_with_an_unparsable_type_fails() {
@@ -2874,8 +2901,8 @@ fn between_and_in_with_an_overprecise_timestamp_expand_to_rewritten_comparisons(
 fn selectlist_tstz_literal_widens_via_emits_type_gate() {
     let literal = lit("literal_timestamp_utc", "2024-03-01 10:00:00");
     assert!(
-        render_expression_safe(&literal).is_some(),
-        "literal_timestamp_utc must render via render_expression_safe"
+        untyped_scan_expression(&literal).is_some(),
+        "literal_timestamp_utc must render via untyped_scan_expression"
     );
     let (proj_cols, proj_types, widened) = projected(id_name_request().item(
         literal,
@@ -2904,7 +2931,7 @@ fn selectlist_tstz_literal_widens_via_emits_type_gate() {
 fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
     let literal = lit("literal_timestamputc", "2024-03-01 10:00:00");
     assert!(
-        render_expression_safe(&literal).is_none(),
+        untyped_scan_expression(&literal).is_none(),
         "the DataFusion dialect must keep declining the real wire name (#242): \
          a render here would silently start pushing TSTZ predicates into the \
          scan filter"

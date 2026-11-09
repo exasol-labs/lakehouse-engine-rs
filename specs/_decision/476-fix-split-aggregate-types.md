@@ -25,5 +25,3 @@ Every partial and group-key column of a split aggregate takes its type from Exas
 ### Consequences
 
 - A nested `MIN`, `MAX`, or `SUM` over an expression, and an unprojected expression key, run through the wrapper, which ships the scanned rows to Exasol. Selecting the same aggregate on its own keeps the split path.
-- A `CHAR(n)` key needs no DataFusion-side pad: the scan computes a `CHAR` key only from a `CHAR` column or literal, and Exasol pads the emitted value.
-- If Exasol sends a type for every expression node, the same rule keeps those requests on the split path without new typing code.

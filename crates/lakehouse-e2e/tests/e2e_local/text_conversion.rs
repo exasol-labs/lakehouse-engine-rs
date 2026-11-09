@@ -14,6 +14,8 @@ const DEFAULT: &str = "";
 
 const FILTER_IN_SCAN: &str = r#""filter":""#;
 const SPLIT: &str = "PARTIAL_";
+/// A select expression the scan computes; absent when the projection widens to the base row.
+const ITEM_IN_SCAN: &str = "_LH_PROJ_";
 
 /// `(session setting, query over {T}, marker, in_scan)`: the pushdown must contain `marker` when
 /// `in_scan` holds and must not otherwise. An empty marker leaves the path unasserted.
@@ -35,7 +37,7 @@ const CASES: &[Case] = &[
     (
         DMY,
         "SELECT ID, CAST(C_DATE AS VARCHAR(10)) FROM {T}",
-        "",
+        ITEM_IN_SCAN,
         false,
     ),
     (
@@ -47,7 +49,7 @@ const CASES: &[Case] = &[
     (
         DMY,
         "SELECT C_QTY, MAX(CAST(C_DATE AS VARCHAR(10))) FROM {T} GROUP BY C_QTY HAVING MAX(CAST(C_DATE AS VARCHAR(10))) > '01'",
-        "",
+        SPLIT,
         false,
     ),
     (
@@ -59,7 +61,7 @@ const CASES: &[Case] = &[
     (
         DEFAULT,
         "SELECT ID, CAST(C_TS AS VARCHAR(40)) FROM {T}",
-        "",
+        ITEM_IN_SCAN,
         false,
     ),
     (
@@ -77,7 +79,7 @@ const CASES: &[Case] = &[
     (
         DEFAULT,
         "SELECT C_DECIMAL_A || '' K, COUNT(*) FROM {T} GROUP BY C_DECIMAL_A || ''",
-        "",
+        SPLIT,
         false,
     ),
     (
@@ -125,25 +127,25 @@ const CASES: &[Case] = &[
     (
         DEFAULT,
         "SELECT ID, C_DECIMAL_A || '' FROM {T} WHERE ID = 1",
-        "",
+        ITEM_IN_SCAN,
         false,
     ),
     (
         DEFAULT,
         "SELECT ID, C_BOOL || 'x', C_DECIMAL_A || '' FROM {T} WHERE ID = 1",
-        "",
+        ITEM_IN_SCAN,
         false,
     ),
     (
         DEFAULT,
         "SELECT ID, C_BOOL || 'x', C_DOUBLE || '' FROM {T} WHERE ID = 1",
-        "",
+        ITEM_IN_SCAN,
         false,
     ),
     (
         DEFAULT,
         "SELECT ID, C_BOOL || 'x', C_DECIMAL_A || 'x' FROM {T} WHERE ID = 1",
-        "",
+        ITEM_IN_SCAN,
         false,
     ),
     (
@@ -215,8 +217,8 @@ const CASES: &[Case] = &[
     (
         DEFAULT,
         "SELECT ID, CAST(C_QTY AS VARCHAR(21)) FROM {T}",
-        "",
-        false,
+        ITEM_IN_SCAN,
+        true,
     ),
     (
         COMMA,
@@ -224,8 +226,8 @@ const CASES: &[Case] = &[
         SPLIT,
         true,
     ),
-    (DEFAULT, "SELECT MAX(UPPER(C_QTY)) FROM {T}", "", false),
-    (DEFAULT, "SELECT COUNT(UPPER(C_QTY)) FROM {T}", "", false),
+    (DEFAULT, "SELECT MAX(UPPER(C_QTY)) FROM {T}", SPLIT, true),
+    (DEFAULT, "SELECT COUNT(UPPER(C_QTY)) FROM {T}", SPLIT, true),
     (
         DEFAULT,
         "SELECT CAST(C_DECIMAL_A AS VARCHAR(20)), COUNT(*) FROM {T} GROUP BY CAST(C_DECIMAL_A AS VARCHAR(20))",
@@ -235,19 +237,19 @@ const CASES: &[Case] = &[
     (
         DEFAULT,
         "SELECT ID, UPPER(C_DOUBLE * 1.5E0) FROM {T}",
-        "",
+        ITEM_IN_SCAN,
         false,
     ),
     (
         DEFAULT,
         "SELECT ID, CAST(C_TS + INTERVAL '1' HOUR AS VARCHAR(30)) FROM {T}",
-        "",
+        ITEM_IN_SCAN,
         false,
     ),
     (
         DEFAULT,
         "SELECT ID, CAST(C_VARCHAR AS CHAR(5)) || '|' FROM {T}",
-        "",
+        ITEM_IN_SCAN,
         false,
     ),
     (
@@ -268,6 +270,24 @@ const CASES: &[Case] = &[
         SPLIT,
         false,
     ),
+    (
+        DEFAULT,
+        "SELECT ID FROM {T} WHERE LOCATE('a', C_VARCHAR) = 2",
+        FILTER_IN_SCAN,
+        true,
+    ),
+    (
+        DEFAULT,
+        "SELECT ID FROM {T} WHERE INSTR(C_VARCHAR, 'a') = 2",
+        FILTER_IN_SCAN,
+        true,
+    ),
+    (
+        DEFAULT,
+        "SELECT ID FROM {T} WHERE CAST(C_VARCHAR AS CHAR(5)) = C_VARCHAR",
+        FILTER_IN_SCAN,
+        false,
+    ),
 ];
 
 /// Rows sorted unless the query orders them, or the error class: the rejected value and the
@@ -286,11 +306,7 @@ fn outcome(
             .trim()
             .to_string());
     }
-    let (types, mut rows) = typed_result(conn, sql);
-    if !sql.contains("ORDER BY") {
-        rows.sort();
-    }
-    Ok((types, rows))
+    Ok(comparable_result(conn, sql))
 }
 
 fn session(setting: &str) -> ExaConn {
@@ -323,6 +339,9 @@ fn mismatch(table: &str, (setting, query, marker, in_scan): &Case) -> Option<Str
 /// Scenario: Text the session format converts runs in Exasol
 /// Scenario: Integer and boolean text runs in the scan
 /// Scenario: A group key travels with its exact type
+/// Scenario: A CAST of text to CHAR runs in Exasol
+/// Scenario: INSTR and LOCATE with a start position run in Exasol
+/// Scenario: A select item the scan declines widens the projection to the full base row
 #[test]
 fn text_conversions_match_native_under_session_settings() {
     lakehouse_vs();

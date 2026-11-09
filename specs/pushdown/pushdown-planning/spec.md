@@ -40,7 +40,7 @@ Translates an Exasol query against the virtual schema into a pushdown plan. The 
 * *GIVEN* a single-table `pushdown` request carrying a non-null `filter` that the DataFusion-bound render declines, of any dispatch shape, row scan, top-N, single-group aggregate, grouped aggregate, or `COUNT(DISTINCT)`
 * *WHEN* the pushdown dispatcher selects the SQL shape
 * *THEN* the dispatcher SHALL route the request to the qualified single-table wrapper BEFORE the routing classifier runs, so one route serves every dispatch shape
-* *AND* the request's ORIGINAL filter tree SHALL still be forwarded to Iceberg-level file pruning unchanged, because pruning reads the un-rewritten tree and only ever removes files that provably cannot match
+* *AND* the request's ORIGINAL filter tree SHALL still be forwarded to Iceberg-level file pruning unchanged, because pruning reads the raw request tree and only ever removes files that provably cannot match
 * *AND* the wrapper's returned column count, order, and declared types SHALL equal what the request's `selectList` declares, and an absent, JSON-null, or empty `selectList` SHALL return the FULL base row rather than only the columns the declined predicate references, so the route never trips Exasol's positional `04000` validation
 * *AND* a request whose filter renders, or which carries no filter, SHALL take its existing dispatch shape with the emitted SQL byte-identical to its pre-change output
 

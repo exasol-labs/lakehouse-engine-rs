@@ -58,6 +58,88 @@ fn session_formatted_sources_decline_at_every_text_position() {
     }
 }
 
+/// A DOUBLE declines wherever Exasol converts it to text, so a rule that converted every
+/// argument would decline the numeric positions too.
+#[test]
+fn only_string_positions_convert_to_text() {
+    let cases = [
+        (
+            "SUBSTR start",
+            scalar_fn("SUBSTR", [col("S"), col("F")]),
+            true,
+        ),
+        (
+            "SUBSTR length",
+            scalar_fn("SUBSTR", [col("S"), num_lit(1), col("F")]),
+            true,
+        ),
+        (
+            "SUBSTR subject",
+            scalar_fn("SUBSTR", [col("F"), num_lit(1)]),
+            false,
+        ),
+        (
+            "REPEAT count",
+            scalar_fn("REPEAT", [col("S"), col("F")]),
+            true,
+        ),
+        ("LEFT length", scalar_fn("LEFT", [col("S"), col("F")]), true),
+        (
+            "RIGHT length",
+            scalar_fn("RIGHT", [col("S"), col("F")]),
+            true,
+        ),
+        (
+            "LPAD/2 length",
+            scalar_fn("LPAD", [col("S"), col("F")]),
+            true,
+        ),
+        (
+            "LPAD/3 length",
+            scalar_fn("LPAD", [col("S"), col("F"), str_lit("x")]),
+            true,
+        ),
+        (
+            "LPAD/3 fill",
+            scalar_fn("LPAD", [col("S"), num_lit(5), col("F")]),
+            false,
+        ),
+        (
+            "RPAD/3 fill",
+            scalar_fn("RPAD", [col("S"), num_lit(5), col("F")]),
+            false,
+        ),
+        ("CHR code", scalar_fn("CHR", [col("F")]), true),
+        ("UNICODECHR code", scalar_fn("UNICODECHR", [col("F")]), true),
+        (
+            "a string function under CHR",
+            scalar_fn("CHR", [scalar_fn("LENGTH", [col("F")])]),
+            false,
+        ),
+    ];
+    for (position, expr, pushed) in cases {
+        let rendered = render(&expr);
+        assert_eq!(rendered.is_ok(), pushed, "{position}: {rendered:?}");
+    }
+}
+
+/// Scenario: A column of unknown type declines
+#[test]
+fn a_column_of_unknown_type_declines_where_it_meets_text() {
+    for expr in [
+        like(col("UNKNOWN"), "1%"),
+        scalar_fn("UPPER", [col("UNKNOWN")]),
+        predicate_equal(col("UNKNOWN"), str_lit("1")),
+        cast_to(ExasolType::WIDEST_VARCHAR, col("UNKNOWN")),
+    ] {
+        assert!(render(&expr).is_err(), "{expr} must decline");
+    }
+    assert!(
+        render(&predicate_equal(col("UNKNOWN"), num_lit(1))).is_ok(),
+        "no text conversion, so the column's type does not matter"
+    );
+}
+
 #[test]
 fn integer_and_text_sources_keep_their_pushdown() {
     assert_eq!(
@@ -97,7 +179,7 @@ fn a_boolean_column_converts_to_exasol_casing() {
 
 #[test]
 fn text_casts_to_shorter_or_ascii_varchar_unchecked_and_decline_char() {
-    let ascii = |size| ExasolType::Varchar { size, ascii: true };
+    let ascii = ascii_varchar;
     let cases = [
         (
             "text to shorter VARCHAR",
@@ -163,7 +245,7 @@ fn comparing_text_with_a_date_or_number_declines() {
 }
 
 #[test]
-fn an_integer_compares_with_a_digits_only_literal() {
+fn text_against_a_non_integer_or_a_non_digit_literal_declines() {
     let filter = |column: &str, value: &str| predicate_equal(col(column), str_lit(value));
     for (column, value) in [("I", "3.5"), ("N", "3"), ("D", "2024-01-01")] {
         assert!(

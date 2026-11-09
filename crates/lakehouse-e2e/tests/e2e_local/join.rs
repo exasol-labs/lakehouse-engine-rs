@@ -1172,39 +1172,40 @@ fn e2e_n_scan_declined_side_local_conjunct_applied_in_outer_where() {
 // The typed scan check runs at both join WHERE sites: each case renders correctly or
 // declines and self-applies (#215, #223, #228, #285).
 
+fn like_join_query(vs_name: &str, filter: &str) -> String {
+    format!(
+        "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
+         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY WHERE {filter}",
+        vs_fact_table(vs_name),
+        vs_dim_table(vs_name)
+    )
+}
+
 /// A LIKE over the join column `O_CUSTKEY`, an integer DECIMAL.
-fn like_on_custkey_join_query(vs_name: &str) -> String {
-    format!(
-        "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
-         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY \
-         WHERE o.O_CUSTKEY LIKE '1%'",
-        vs_fact_table(vs_name),
-        vs_dim_table(vs_name)
-    )
+const CUSTKEY_LIKE: &str = "o.O_CUSTKEY LIKE '1%'";
+const ORDERDATE_LIKE: &str = "o.O_ORDERDATE LIKE '2024-01-0%'";
+
+fn custkey_like(custkey: &str) -> bool {
+    custkey.starts_with('1')
 }
 
-/// Expected rows run the same pattern through the single-table WHERE path.
-fn like_on_orderdate_join_query(vs_name: &str) -> String {
-    format!(
-        "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
-         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY \
-         WHERE o.O_ORDERDATE LIKE '2024-01-0%'",
-        vs_fact_table(vs_name),
-        vs_dim_table(vs_name)
-    )
+/// The default `NLS_DATE_FORMAT` writes `YYYY-MM-DD`.
+fn orderdate_like(orderdate: &str) -> bool {
+    orderdate.starts_with("2024-01-0")
 }
 
-fn assert_join_matches_single_table_rows(
+/// The oracle applies the filter in the test process, so no engine render computes it.
+fn assert_join_rows_kept(
     conn: &mut ExaConn,
     vs_name: &str,
     query: &str,
-    fact_where: &str,
+    keep: impl Fn(&str, &str) -> bool,
 ) {
     let actual = columns_to_sorted_pairs(&conn.query_columns(query));
-    let expected = expected_join_rows_with_fact_where(conn, vs_name, fact_where);
+    let expected = expected_join_rows_kept(conn, vs_name, keep);
     assert!(
         !expected.is_empty() && expected.len() < FACT_ORDERS_ROWS,
-        "{fact_where} must narrow the fact table, got {} rows",
+        "{query} must narrow the fact table, got {} rows",
         expected.len()
     );
     assert_eq!(actual, expected);
@@ -1216,12 +1217,14 @@ fn e2e_broadcast_like_on_decimal_column_stays_broadcast_and_filters() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    let query = like_on_custkey_join_query(VS_NAME);
+    let query = like_join_query(VS_NAME, CUSTKEY_LIKE);
     let pushed = explain_virtual_sql(&mut conn, &query);
     assert!(has_broadcast_join_block(&pushed), "{pushed}");
     assert!(pushed.contains(r#""filter":""#), "{pushed}");
 
-    assert_join_matches_single_table_rows(&mut conn, VS_NAME, &query, "O_CUSTKEY LIKE '1%'");
+    assert_join_rows_kept(&mut conn, VS_NAME, &query, |custkey, _| {
+        custkey_like(custkey)
+    });
 }
 
 /// Scenario: A join condition or filter that converts a date to text takes the N-scan fallback
@@ -1230,7 +1233,7 @@ fn e2e_broadcast_like_on_date_column_falls_back_and_filters() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    let query = like_on_orderdate_join_query(VS_NAME);
+    let query = like_join_query(VS_NAME, ORDERDATE_LIKE);
     let pushed = explain_virtual_sql(&mut conn, &query);
     assert!(has_two_scan_wrapper(&pushed), "{pushed}");
     assert!(!pushed.contains(r#""filter":""#), "{pushed}");
@@ -1239,26 +1242,26 @@ fn e2e_broadcast_like_on_date_column_falls_back_and_filters() {
         "the outer WHERE applies the LIKE: {pushed}"
     );
 
-    assert_join_matches_single_table_rows(
-        &mut conn,
-        VS_NAME,
-        &query,
-        "O_ORDERDATE LIKE '2024-01-0%'",
-    );
+    assert_join_rows_kept(&mut conn, VS_NAME, &query, |_, date| orderdate_like(date));
 }
 
 /// Scenario: An N-scan leg filter keeps the conjuncts the scan computes
 #[test]
-fn e2e_n_scan_like_on_decimal_side_column_filters_in_its_leg() {
+fn e2e_n_scan_leg_keeps_its_computed_conjunct_beside_a_declined_one() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    let query = like_on_custkey_join_query(VS_NAME_LOW);
+    let query = like_join_query(VS_NAME_LOW, &format!("{CUSTKEY_LIKE} AND {ORDERDATE_LIKE}"));
     let pushed = explain_virtual_sql(&mut conn, &query);
     assert!(has_two_scan_wrapper(&pushed), "{pushed}");
-    assert!(pushed.contains(r#""filter":""#), "{pushed}");
+    assert!(
+        pushed.contains(r#""filter":""#) && pushed.contains(r#"."O_ORDERDATE" LIKE"#),
+        "the integer LIKE filters in its leg and the DATE LIKE in the outer WHERE: {pushed}"
+    );
 
-    assert_join_matches_single_table_rows(&mut conn, VS_NAME_LOW, &query, "O_CUSTKEY LIKE '1%'");
+    assert_join_rows_kept(&mut conn, VS_NAME_LOW, &query, |custkey, date| {
+        custkey_like(custkey) && orderdate_like(date)
+    });
 }
 
 #[test]

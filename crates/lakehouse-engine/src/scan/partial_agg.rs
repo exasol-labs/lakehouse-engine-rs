@@ -87,8 +87,8 @@ pub(super) async fn run_partial_aggregate(
     Ok(())
 }
 
-/// Group keys are coerced to their declared type like every other column (#587). An empty shard
-/// emits zero rows, not a null fallback row: the outer wrapper re-groups partials from all shards.
+/// Group keys travel in their declared type, so every shard emits the same key values. An empty
+/// shard emits zero rows, not a null fallback row: the outer wrapper re-groups partials.
 async fn run_grouped_partial_aggregate(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,

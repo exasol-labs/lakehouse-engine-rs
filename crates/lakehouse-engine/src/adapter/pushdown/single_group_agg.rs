@@ -3,7 +3,7 @@ use serde_json::Value as Json;
 
 use super::scalar_over_agg::{
     arg_column_or_expr, cast_merge_items, classify_scalar_over_aggregate, fold_aggregate_plan,
-    nested_aggregate_type, parse_agg_item, render_scalar_over_merge,
+    fold_nested_plans, parse_agg_item, render_scalar_over_merge,
 };
 use super::support::{PushdownRequest, ScanTranslator, output_select_list};
 use crate::types::exasol_type::ExasolType;
@@ -19,6 +19,7 @@ pub enum SingleGroupItem {
     /// each nested aggregate's merged expression.
     ScalarOverAggregate {
         node: Json,
+        nested: Vec<(AggregatePlan, Json)>,
     },
 }
 
@@ -59,9 +60,10 @@ pub fn detect_aggregates(
                 None => SingleGroupItem::Aggregate(parse_agg_item(item, scan)?),
             }
         } else {
-            // Classified for the decline only; `ordinary_plans` re-derives the nested plans.
-            classify_scalar_over_aggregate(item, scan)?;
-            SingleGroupItem::ScalarOverAggregate { node: item.clone() }
+            SingleGroupItem::ScalarOverAggregate {
+                node: item.clone(),
+                nested: classify_scalar_over_aggregate(item, scan)?,
+            }
         };
         items.push(resolved);
     }
@@ -69,71 +71,56 @@ pub fn detect_aggregates(
     Some(items)
 }
 
-/// Dedup is a correctness requirement: the merge rewrite binds each nested
-/// aggregate to the first structurally-equal slot, so duplicates would misalign
-/// with the `EMITS` columns (decision-log [6]).
-///
-/// `pub` so callers outside `pushdown` (integration tests) get nameable plans
-/// without naming `SingleGroupItem`.
-pub fn ordinary_plans(items: &[SingleGroupItem], scan: ScanTranslator<'_>) -> Vec<AggregatePlan> {
-    let mut plans = Vec::new();
-    // The fold's accumulated types are discarded; see `single_group_plan_types`.
-    let mut plan_types = Vec::new();
-    for item in items {
-        match item {
-            SingleGroupItem::Aggregate(plan) => {
-                fold_aggregate_plan(&mut plans, &mut plan_types, plan.clone(), None);
-            }
-            SingleGroupItem::Distinct(_) => {}
-            SingleGroupItem::ScalarOverAggregate { node, .. } => {
-                for (plan, _) in classify_scalar_over_aggregate(node, scan)
-                    .into_iter()
-                    .flatten()
-                {
-                    fold_aggregate_plan(&mut plans, &mut plan_types, plan, None);
-                }
-            }
-        }
-    }
-    plans
+/// The partial plans of a single-group select list, typed and merged once per request.
+#[derive(Debug)]
+pub struct SingleGroupPlans {
+    pub plans: Vec<AggregatePlan>,
+    /// Aligned with `plans`; also types the scan's `EMITS`.
+    pub types: Vec<ExasolType>,
+    /// Aligned with `plans`, cast before any outer scalar applies so `SUM(a) / 2` stays exact.
+    pub merged: Vec<String>,
 }
 
-/// Aligned 1:1 with `ordinary_plans(items)`. This list also types the scan's `EMITS`. A
-/// top-level item's declared type wins; a slot reached only through a nested aggregate takes
-/// [`nested_aggregate_type`]. `None` when any slot has no exact type (#476).
-pub fn single_group_plan_types(
-    select_types: &[ExasolType],
+impl SingleGroupPlans {
+    /// `None` when any slot has no exact type (#476).
+    pub fn new(
+        items: &[SingleGroupItem],
+        select_types: &[ExasolType],
+        scan: ScanTranslator<'_>,
+    ) -> Option<Self> {
+        let (plans, types) = fold_single_group_plans(items, select_types, scan);
+        let types: Vec<ExasolType> = types.into_iter().collect::<Option<_>>()?;
+        let merged = cast_merge_items(&plans, &types, scan.columns());
+        Some(Self {
+            plans,
+            types,
+            merged,
+        })
+    }
+}
+
+/// Dedup is a correctness requirement: the merge rewrite binds each nested aggregate to the
+/// first structurally-equal slot, so duplicates would misalign with the `EMITS` columns.
+pub(super) fn fold_single_group_plans(
     items: &[SingleGroupItem],
+    select_types: &[ExasolType],
     scan: ScanTranslator<'_>,
-) -> Option<Vec<ExasolType>> {
-    let plans = ordinary_plans(items, scan);
-    let mut plan_types: Vec<Option<ExasolType>> = vec![None; plans.len()];
-    let slot_of = |plan: &AggregatePlan| {
-        plans
-            .iter()
-            .position(|p| p == plan)
-            .expect("ordinary_plans folds every aggregate plan in")
-    };
+) -> (Vec<AggregatePlan>, Vec<Option<ExasolType>>) {
+    let mut plans = Vec::new();
+    let mut plan_types = Vec::new();
     for (select_index, item) in items.iter().enumerate() {
         match item {
             SingleGroupItem::Aggregate(plan) => {
-                plan_types[slot_of(plan)] = select_types.get(select_index).copied();
+                let declared = select_types.get(select_index).copied();
+                fold_aggregate_plan(&mut plans, &mut plan_types, plan.clone(), declared);
             }
             SingleGroupItem::Distinct(_) => {}
-            SingleGroupItem::ScalarOverAggregate { node, .. } => {
-                for (plan, agg) in classify_scalar_over_aggregate(node, scan)
-                    .into_iter()
-                    .flatten()
-                {
-                    let slot = &mut plan_types[slot_of(&plan)];
-                    if slot.is_none() {
-                        *slot = nested_aggregate_type(&agg, &plan, scan);
-                    }
-                }
+            SingleGroupItem::ScalarOverAggregate { nested, .. } => {
+                fold_nested_plans(&mut plans, &mut plan_types, nested, scan);
             }
         }
     }
-    plan_types.into_iter().collect()
+    (plans, plan_types)
 }
 
 /// `None` when any item has no merge expression (a `COUNT(DISTINCT)` or an
@@ -141,26 +128,23 @@ pub fn single_group_plan_types(
 /// narrower select list fails Exasol's positional validation.
 pub(super) fn single_group_merge_select(
     items: &[SingleGroupItem],
-    plans: &[AggregatePlan],
-    plan_types: &[ExasolType],
+    plans: &SingleGroupPlans,
     select_types: &[ExasolType],
     scan: ScanTranslator<'_>,
 ) -> Option<Vec<String>> {
-    // Cast before any outer scalar applies, so `SUM(a) / 2` stays exact (#476).
-    let cast_merged = cast_merge_items(plans, plan_types, scan.columns());
     let fragments = items
         .iter()
         .map(|item| match item {
             SingleGroupItem::Aggregate(plan) => {
-                let slot = plans.iter().position(|p| p == plan)?;
+                let slot = plans.plans.iter().position(|p| p == plan)?;
                 Some(SqlFragment::new(
-                    cast_merged.get(slot)?.clone(),
-                    plan_types.get(slot).copied(),
+                    plans.merged.get(slot)?.clone(),
+                    plans.types.get(slot).copied(),
                 ))
             }
             SingleGroupItem::Distinct(_) => None,
-            SingleGroupItem::ScalarOverAggregate { node } => {
-                render_scalar_over_merge(node, plans, &cast_merged, scan)
+            SingleGroupItem::ScalarOverAggregate { node, .. } => {
+                render_scalar_over_merge(node, &plans.plans, &plans.merged, scan)
             }
         })
         .collect::<Option<Vec<_>>>()?;

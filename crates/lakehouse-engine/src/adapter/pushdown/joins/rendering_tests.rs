@@ -49,7 +49,7 @@ fn self_join_legs() -> JoinLegs {
 #[test]
 fn join_condition_renders_via_translator() {
     assert_eq!(
-        render_expression_safe(&equi_condition()).as_deref(),
+        untyped_scan_expression(&equi_condition()).as_deref(),
         Some(r#"("C_CUSTKEY" = "O_CUSTKEY")"#),
         "the equi-condition must render to a bare-name DataFusion boolean expr"
     );
@@ -369,7 +369,7 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
     ]);
     let legs = self_join_legs();
 
-    let occurrence_a = render_df_filter_safe(
+    let occurrence_a = untyped_scan_filter(
         &leg_local_filter(&filter, &legs, 0).expect("occurrence A's conjunct is leg-local"),
     )
     .expect("renders");
@@ -378,7 +378,7 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
         "occurrence A's leg-local filter must carry only its own conjunct: {occurrence_a}"
     );
 
-    let occurrence_b = render_df_filter_safe(
+    let occurrence_b = untyped_scan_filter(
         &leg_local_filter(&filter, &legs, 1).expect("occurrence B's conjunct is leg-local"),
     )
     .expect("renders");
@@ -404,13 +404,13 @@ fn orders_col_types() -> Vec<(String, ExasolType)> {
 }
 
 #[test]
-fn type_screened_leg_filter_renders_the_accepted_set_bare() {
+fn screen_leg_filter_renders_the_accepted_set_bare() {
     let filter = and([
         like(table_col("ORDERS", "O_CUSTKEY"), "1%"),
         orders_local_rendering_conjunct(),
     ]);
 
-    let (leg, declined) = type_screened_leg_filter(&filter, &column_types(&orders_col_types()));
+    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()));
 
     assert_eq!(declined, None);
     let leg = leg.expect("an all-accepted side-local set must reach its leg");
@@ -425,14 +425,14 @@ fn type_screened_leg_filter_renders_the_accepted_set_bare() {
 }
 
 #[test]
-fn type_screened_leg_filter_keeps_accepted_conjuncts_beside_a_declined_one() {
+fn screen_leg_filter_keeps_accepted_conjuncts_beside_a_declined_one() {
     let date_like = like(table_col("ORDERS", "O_ORDERDATE"), "1995%");
     let filter = and([
         date_like.clone(),
         like(table_col("ORDERS", "O_CUSTKEY"), "1%"),
     ]);
 
-    let (leg, declined) = type_screened_leg_filter(&filter, &column_types(&orders_col_types()));
+    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()));
 
     let leg = leg.expect("the integer LIKE stays in the scan");
     assert!(
@@ -447,20 +447,38 @@ fn type_screened_leg_filter_keeps_accepted_conjuncts_beside_a_declined_one() {
 }
 
 #[test]
-fn type_screened_leg_filter_declines_whole_set_when_no_conjunct_survives() {
+fn leg_pruning_input_keeps_the_conjunct_the_scan_declines() {
+    let date_like = like(table_col("ORDERS", "O_ORDERDATE"), "1995%");
+    let custkey_like = like(table_col("ORDERS", "O_CUSTKEY"), "1%");
+    let filter = and([date_like.clone(), custkey_like.clone()]);
+
+    let pruning = leg_local_filter(&filter, &customer_orders_legs(), 1)
+        .expect("both conjuncts are ORDERS-leg-local");
+    let (_, declined) = screen_leg_filter(&pruning, &column_types(&orders_col_types()));
+
+    assert_eq!(declined, Some(date_like.clone()));
+    assert_eq!(
+        pruning,
+        and([date_like, custkey_like]),
+        "pruning keeps the declined conjunct, raw"
+    );
+}
+
+#[test]
+fn screen_leg_filter_declines_whole_set_when_no_conjunct_survives() {
     let filter = and([
         like(table_col("ORDERS", "O_ORDERDATE"), "1995%"),
         declined_second_predicate(table_col("ORDERS", "O_ORDERDATE")),
     ]);
 
-    let (leg, declined) = type_screened_leg_filter(&filter, &column_types(&orders_col_types()));
+    let (leg, declined) = screen_leg_filter(&filter, &column_types(&orders_col_types()));
 
     assert_eq!(leg, None);
     assert_eq!(declined, Some(filter));
 }
 
 #[test]
-fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
+fn screen_leg_filter_uses_owning_side_types_for_shared_column_name() {
     let request = serde_json::json!({
         "involvedTables": [
             involved_table_json("DATED", &[("SHARED_KEY", ExasolType::Date)]),
@@ -469,7 +487,7 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
     });
     let filter = like(table_col("DATED", "SHARED_KEY"), "1995%");
     let screen = |table: &str| {
-        type_screened_leg_filter(
+        screen_leg_filter(
             &filter,
             &column_types(&involved_table(&request, table).unwrap().types),
         )
@@ -882,7 +900,7 @@ fn both_join_paths_compare_a_hex_literal_on_a_binary_column_by_its_bytes() {
         Some(r#"("LHS_T0"."_LH_BYTES_C_NAME" = X'0a1b')"#)
     );
 
-    let (leg, declined) = type_screened_leg_filter(&filter, &sides[0].column_types);
+    let (leg, declined) = screen_leg_filter(&filter, &sides[0].column_types);
     assert!(declined.is_none(), "{declined:?}");
     assert_eq!(leg.as_deref(), Some(r#"("_LH_BYTES_C_NAME" = X'0a1b')"#));
 }

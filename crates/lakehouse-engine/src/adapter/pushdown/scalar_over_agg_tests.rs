@@ -394,13 +394,37 @@ fn nested_type_of(agg_node: &Json, col_types: &ColumnTypes) -> Option<ExasolType
 
 #[test]
 fn nested_aggregate_type_is_exasols_result_type_of_the_aggregate() {
-    let col_types = column_types(&[("X", ExasolType::decimal(9, 2))]);
+    let col_types = column_types(&[
+        ("X", ExasolType::decimal(9, 2)),
+        ("W", ExasolType::decimal(30, 2)),
+        ("F", ExasolType::DoublePrecision),
+    ]);
     let cases = [
         ("COUNT(*)", count_star(), ExasolType::decimal(18, 0)),
         (
             "SUM over DECIMAL(9,2) widens by 11 digits",
             agg_item("SUM", Some("X"), false),
             ExasolType::decimal(20, 2),
+        ),
+        (
+            "SUM over DECIMAL(30,2) caps at precision 36",
+            agg_item("SUM", Some("W"), false),
+            ExasolType::decimal(36, 2),
+        ),
+        (
+            "SUM over DOUBLE stays DOUBLE",
+            agg_item("SUM", Some("F"), false),
+            ExasolType::DoublePrecision,
+        ),
+        (
+            "AVG over a DECIMAL is DOUBLE",
+            agg_item("AVG", Some("X"), false),
+            ExasolType::DoublePrecision,
+        ),
+        (
+            "STDDEV over a DECIMAL is DOUBLE",
+            agg_item("STDDEV", Some("X"), false),
+            ExasolType::DoublePrecision,
         ),
         (
             "MAX over a CAST takes the CAST's type, not the column's",

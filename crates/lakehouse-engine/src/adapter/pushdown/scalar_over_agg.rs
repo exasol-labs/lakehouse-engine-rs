@@ -3,7 +3,10 @@
 
 use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column_name};
 use serde_json::Value as Json;
-use vs_expression::{ColumnNode, SqlFragment, render_exasol_fragment, render_expression_exasol};
+use vs_expression::{
+    ColumnNode, SqlFragment, exact_expression_type, render_exasol_fragment,
+    render_expression_exasol,
+};
 
 use super::support::{ColumnTypes, ScanTranslator, quote_ident};
 use crate::scan::spec::ColumnRef;
@@ -34,6 +37,22 @@ pub(super) fn fold_aggregate_plan(
     }
 }
 
+/// A slot a top-level item declares keeps that type; a nested-only slot takes
+/// [`nested_aggregate_type`], so the outcome does not depend on select-list order.
+pub(super) fn fold_nested_plans(
+    plans: &mut Vec<AggregatePlan>,
+    plan_types: &mut Vec<Option<ExasolType>>,
+    nested: &[(AggregatePlan, Json)],
+    scan: ScanTranslator<'_>,
+) {
+    for (plan, agg) in nested {
+        let slot = fold_aggregate_plan(plans, plan_types, plan.clone(), None);
+        if plan_types[slot].is_none() {
+            plan_types[slot] = nested_aggregate_type(agg, plan, scan);
+        }
+    }
+}
+
 /// Exasol's result type of an aggregate the select list does not type. `None` when it depends on
 /// an argument without an exact type: a guessed partial type breaks the merge (#476).
 pub(super) fn nested_aggregate_type(
@@ -45,7 +64,7 @@ pub(super) fn nested_aggregate_type(
         AggKind::Count | AggKind::CountCol => Some(ExasolType::decimal(18, 0)),
         AggKind::Sum | AggKind::Min | AggKind::Max => {
             let arg = agg.get("arguments")?.as_array()?.first()?;
-            let arg_type = scan.exact_type(arg)?;
+            let arg_type = exact_expression_type(arg, scan.columns())?;
             if plan.kind == AggKind::Sum {
                 sum_result_type(arg_type)
             } else {
@@ -121,8 +140,7 @@ pub(super) fn sentinelize_aggregates(
     }
 }
 
-/// The scalar runs in Exasol over the merged aggregates, so it is checked in the Exasol dialect;
-/// only the aggregate arguments run in the scan.
+/// The scalar runs in Exasol over the merged aggregates, so it is checked in the Exasol dialect.
 /// Each plan comes with its aggregate node, which [`nested_aggregate_type`] types.
 pub(super) fn classify_scalar_over_aggregate(
     node: &Json,
@@ -141,11 +159,8 @@ pub(super) fn classify_scalar_over_aggregate(
         .collect()
 }
 
-/// Reuses the `vs-expression` translator by substitution (sentinel columns, then
-/// string-replace with `merged` at each plan's slot) so it cannot drift from the
-/// translator's scalar rendering. Shared with HAVING rendering (decision-log [2]).
-/// Substitution keeps the fragment's type: it comes from the scalar's own CAST, never from an
-/// aggregate.
+/// Renders through the translator with sentinel columns, then substitutes each `merged` slot, so
+/// it cannot drift from the translator; the type comes from the scalar's own CAST.
 pub(super) fn render_scalar_over_merge(
     node: &Json,
     plans: &[AggregatePlan],

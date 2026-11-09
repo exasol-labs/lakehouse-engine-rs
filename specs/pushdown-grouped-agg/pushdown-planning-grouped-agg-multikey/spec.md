@@ -7,7 +7,7 @@ Extends `pushdown-grouped-agg/pushdown-planning-grouped-agg` to a GROUP BY with 
 * `pushdown-grouped-agg/pushdown-planning-grouped-agg` covers the detection, wrapper ordering, shard fan-out, LIMIT exclusion, and NULL grouping shared by every key count. The detection and scan-driving SQL builder accept a group-key list of any length and emit `GK_0..GK_{n-1}`.
 * `vs_expression::render_expression` (raising mode) renders each key. A tuple can mix column references and scalar expressions. If any element fails to render, the adapter falls back to row scanning for the whole request and never pushes a subset of the keys.
 * Evidence that a multi-key GROUP BY was pushed down is the scan spec's `group_keys` field and the outer wrapper's `PARTIAL_*` merge columns. `GROUP BY shard_key` is absent when a filter prunes the file list to a single shard.
-* Expression keys use scalar functions Exasol advertises and so sends as pushed group keys, such as `MOD`, `UPPER`, and `YEAR`. The translator renders arithmetic operators and `CAST`, but Exasol does not advertise them, so it does not send them as group keys.
+* Exasol sends expression keys as pushed group keys: scalar functions such as `MOD`, `UPPER`, and `YEAR`, arithmetic such as `qty * 2`, and `CAST`.
 * Each `GK_{i}` column's declared type comes from the `selectListDataTypes` entry at that key's own `selectList` index, matched by index and not by comparing rendered SQL. A `DECIMAL` key and a `VARCHAR` key each declare their own `GK_{i}` type.
 
 

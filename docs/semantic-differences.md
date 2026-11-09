@@ -115,4 +115,8 @@ The scan computes a cast of text to a `VARCHAR(n)` shorter than its source, or t
 | `WHERE CAST(val \|\| 'abcdefghij' AS VARCHAR(5)) IS NOT NULL` | returns rows | right-truncation error |
 | `WHERE CAST(val \|\| 'é' AS VARCHAR(10) ASCII) IS NOT NULL` | returns rows | error |
 
-A cast to `CHAR(n)`, and every conversion of a date, timestamp, or non-integer number to text, runs in Exasol SQL and matches native Exasol ([Capabilities](capabilities.md#text-and-session-settings)).
+A cast to `CHAR(n)`, and every conversion of a date, timestamp, or non-integer number to text, runs in Exasol SQL and matches native Exasol ([Capabilities](capabilities.md#text-and-session-settings)), apart from the SQL state of a grouped `CHAR` truncation below.
+
+## SQL state of a CHAR truncation in a grouped query
+
+A grouped query that casts a value too long for `CHAR(n)` fails with the same "string data, right truncation" error as native Exasol, but with SQL state 22002 instead of 22001. Exasol evaluates the CAST over the rows the scan returns. A select item without grouping fails with 22001, as natively.

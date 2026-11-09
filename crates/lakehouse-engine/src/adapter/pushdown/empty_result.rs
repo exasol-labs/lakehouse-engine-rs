@@ -2,13 +2,9 @@ use crate::types::exasol_type::ExasolType;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use vs_expression::SqlFragment;
-
 use super::joins::EmptyRelation;
 use super::request_shape::{RequestShape, classify_request_shape};
-use super::support::{
-    ProjectedColumn, PushdownRequest, ScanTranslator, emits_ident, output_select_list,
-};
+use super::support::{ProjectedColumn, PushdownRequest, ScanTranslator, emits_ident};
 
 /// Routes through the same [`classify_request_shape`] as the non-empty dispatcher,
 /// so empty and non-empty positional column shapes cannot diverge.
@@ -41,8 +37,10 @@ pub(super) fn empty_result_sql(
 }
 
 fn empty_select_list_typed_sql(select_types: &[ExasolType]) -> Json {
-    let nulls = select_types.iter().map(|_| SqlFragment::new("NULL", None));
-    let items = output_select_list(nulls, select_types).unwrap_or_default();
+    let items: Vec<String> = select_types
+        .iter()
+        .map(|ty| format!("CAST(NULL AS {ty})"))
+        .collect();
     let sql = format!("SELECT {} FROM DUAL WHERE 1=0", items.join(", "));
     serde_json::json!({"type": "pushdown", "sql": sql})
 }

@@ -29,7 +29,7 @@ pub(crate) enum TypeClass {
 impl TypeClass {
     fn of(ty: ExasolType) -> Self {
         match ty {
-            ExasolType::Char { .. } | ExasolType::Varchar { .. } => Self::Text,
+            ty if ty.is_character() => Self::Text,
             ExasolType::Decimal(d) if d.scale() == 0 => Self::Integer {
                 precision: Some(d.precision()),
             },
@@ -57,8 +57,11 @@ pub(crate) const INTEGER_TEXT_NODE: &str = "scan_integer_text";
 /// Synthetic node: a boolean operand converted to Exasol's `TRUE`/`FALSE`.
 pub(crate) const BOOLEAN_TEXT_NODE: &str = "scan_boolean_text";
 
-const EXPR_ARRAY_FIELDS: [&str; 3] = ["expressions", "arguments", "results"];
-const EXPR_SINGLE_FIELDS: [&str; 5] = ["expression", "pattern", "left", "right", "basis"];
+/// The child fields that hold expressions. Curated, so a walk never hands a `dataType` object or
+/// a `name` identifier to its visitor.
+pub const EXPR_ARRAY_FIELDS: [&str; 3] = ["expressions", "arguments", "results"];
+/// See [`EXPR_ARRAY_FIELDS`].
+pub const EXPR_SINGLE_FIELDS: [&str; 5] = ["expression", "pattern", "left", "right", "basis"];
 
 fn decline(reason: String) -> UdfError {
     UdfError::User(format!("the scan cannot compute this expression: {reason}"))
@@ -345,11 +348,6 @@ pub(crate) fn type_scan_tree(
                 cast_class(&mut out, &classes_of("arguments"))?
             } else {
                 let args = classes_of("arguments");
-                if matches!(fn_name.as_str(), "TO_DATE" | "TO_TIMESTAMP") && args.len() == 1 {
-                    return Err(decline(format!(
-                        "{fn_name} without a format parses by the session's NLS settings"
-                    )));
-                }
                 let text_positions = string_positions(&fn_name, args.len());
                 for &i in &text_positions {
                     out["arguments"][i] = to_text(out["arguments"][i].take(), args[i])?;
@@ -417,10 +415,8 @@ fn is_session_free_integer_text(node: &Json) -> bool {
         })
 }
 
-/// Exasol compares text with a date, timestamp, or number by converting the text with the
-/// session's NLS settings; DataFusion always parses ISO dates and a `.` decimal point. A digits-only
-/// literal against integers reads the same in every session, so it becomes the number it reads as:
-/// DataFusion would cast it to the column's type and fail when it overflows.
+/// Exasol parses text compared with a date or number by the session's NLS settings. A digits-only
+/// literal against integers reads the same in every session, so it renders as that number.
 fn compare_without_session_parse(
     node: &Json,
     out: &mut Json,

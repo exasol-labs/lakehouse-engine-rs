@@ -9,14 +9,12 @@
 use super::grouped_agg::{
     GroupedOrderBy, MergeScope, build_grouped_order_by_clause, render_having_over_merge,
 };
-use super::scalar_over_agg::cast_merge_items;
-use super::single_group_agg::{SingleGroupItem, has_distinct, single_group_plan_types};
+use super::single_group_agg::{SingleGroupItem, SingleGroupPlans, has_distinct};
 use super::support::{PushdownRequest, ScanTranslator};
 use super::{
-    GroupedAggregateDetection, detect_aggregates, detect_group_by_aggregates, ordinary_plans,
+    GroupedAggregateDetection, detect_aggregates, detect_group_by_aggregates,
     validate_agg_col_types,
 };
-use crate::types::exasol_type::ExasolType;
 
 #[derive(Debug)]
 pub(super) enum RequestShape {
@@ -31,11 +29,10 @@ pub(super) enum RequestShape {
     /// columns are the `selectList` items, never a bare row scan (Exasol's positional
     /// column-count check fails with `04000`).
     GroupByWrapper,
-    /// Ordinary aggregate column types passed [`validate_agg_col_types`]. `plan_types` is
-    /// aligned with `ordinary_plans(items)`, every slot exactly typed.
+    /// Ordinary aggregate column types passed [`validate_agg_col_types`].
     SingleGroupAgg {
         items: Vec<SingleGroupItem>,
-        plan_types: Vec<ExasolType>,
+        plans: SingleGroupPlans,
         having: Option<String>,
     },
     SingleGroupWrapper,
@@ -51,10 +48,9 @@ pub(super) fn classify_request_shape(
     if let Some(detection) = detect_group_by_aggregates(pushdown, scan)
         && validate_agg_col_types(&detection.plans, scan.columns())
     {
-        let merged = cast_merge_items(&detection.plans, &detection.plan_types, scan.columns());
         let scope = MergeScope {
             plans: &detection.plans,
-            merged: &merged,
+            merged: &detection.merged,
             group_keys: &detection.group_keys,
         };
         // The merge wrapper only has `GK_*`/`PARTIAL_*` columns, so an aggregate absent
@@ -84,13 +80,10 @@ pub(super) fn classify_request_shape(
 
     // Validated against ordinary plans only: a distinct item is a row-scan fan-out. A nested
     // aggregate without an exact type declines to the wrapper (#476).
-    let Some((items, plan_types)) = detect_aggregates(pushdown, scan)
-        .filter(|it| validate_agg_col_types(&ordinary_plans(it, scan), scan.columns()))
-        .and_then(|it| {
-            let plan_types = single_group_plan_types(pushdown.select_types(), &it, scan)?;
-            Some((it, plan_types))
-        })
-    else {
+    let Some((items, plans)) = detect_aggregates(pushdown, scan).and_then(|items| {
+        let plans = SingleGroupPlans::new(&items, pushdown.select_types(), scan)?;
+        validate_agg_col_types(&plans.plans, scan.columns()).then_some((items, plans))
+    }) else {
         return if pushdown_req.get("aggregationType").and_then(|v| v.as_str())
             == Some("single_group")
         {
@@ -103,11 +96,9 @@ pub(super) fn classify_request_shape(
         None => None,
         Some(_) if has_distinct(&items) => return RequestShape::SingleGroupWrapper,
         Some(node) => {
-            let plans = ordinary_plans(&items, scan);
-            let merged = cast_merge_items(&plans, &plan_types, scan.columns());
             let scope = MergeScope {
-                plans: &plans,
-                merged: &merged,
+                plans: &plans.plans,
+                merged: &plans.merged,
                 group_keys: &[],
             };
             match render_having_over_merge(node, &scope, scan) {
@@ -118,7 +109,7 @@ pub(super) fn classify_request_shape(
     };
     RequestShape::SingleGroupAgg {
         items,
-        plan_types,
+        plans,
         having,
     }
 }

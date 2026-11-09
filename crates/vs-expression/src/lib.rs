@@ -11,7 +11,9 @@ use datetime_format::{FormatTarget, strftime_pattern};
 use exasol_type::{ExasolType, exasol_type_from_json};
 pub use fragment::SqlFragment;
 use scan_typing::{BOOLEAN_TEXT_NODE, INTEGER_TEXT_NODE};
-pub use scan_typing::{ColumnTypeLookup, exact_expression_type};
+pub use scan_typing::{
+    ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, exact_expression_type,
+};
 
 /// Which parser consumes the rendered fragment: DataFusion inside the scan UDF
 /// (`ScanSpec` filter/projection/group keys) or Exasol for the outer wrapper SQL.
@@ -1126,28 +1128,30 @@ fn render_junction(
             }
         }
     }
-    if parts.is_empty() {
-        Ok(empty_value.to_string())
-    } else if parts.len() == 1 {
-        Ok(parts.into_iter().next().unwrap())
-    } else {
-        Ok(format!("({})", parts.join(op)))
+    Ok(join_junction(parts, op, empty_value))
+}
+
+fn join_junction(mut parts: Vec<String>, op: &str, empty_value: &str) -> String {
+    match parts.len() {
+        0 => empty_value.to_string(),
+        1 => parts.remove(0),
+        _ => format!("({})", parts.join(op)),
     }
 }
 
-/// The only DataFusion-dialect entry point: the typed pass runs first, so no caller can hand the
-/// scan an expression without its column types. `Err` declines the expression.
-///
-/// `ty` is the type of the value the scan computes, as the scan emits it. A CHAR or VARCHAR CAST
-/// renders as unsized VARCHAR, so its value is any text, not the target's length.
+/// The only DataFusion-dialect entry point, so every scan expression is typed first. `Err` declines.
+/// A CHAR or VARCHAR CAST renders unsized, so its fragment type is the widest VARCHAR.
 pub fn render_scan_expression(
     expr: &Json,
     columns: &dyn ColumnTypeLookup,
 ) -> Result<SqlFragment, UdfError> {
     let (typed, _) = scan_typing::type_scan_tree(expr, columns)?;
-    let ty = exact_expression_type(expr, columns).map(|ty| match ty {
-        ExasolType::Char { .. } | ExasolType::Varchar { .. } => ExasolType::WIDEST_VARCHAR,
-        other => other,
+    let ty = exact_expression_type(expr, columns).map(|ty| {
+        if ty.is_character() {
+            ExasolType::WIDEST_VARCHAR
+        } else {
+            ty
+        }
     });
     Ok(SqlFragment::new(render_expression(&typed)?, ty))
 }
@@ -1157,8 +1161,21 @@ pub fn render_scan_filter(
     filter_expr: &Json,
     columns: &dyn ColumnTypeLookup,
 ) -> Result<Option<String>, UdfError> {
-    let sql = render_scan_expression(filter_expr, columns)?.sql;
-    Ok((sql != "TRUE" && sql != "NULL").then_some(sql))
+    Ok(non_trivial_filter(
+        render_scan_expression(filter_expr, columns)?.sql,
+    ))
+}
+
+/// The filter [`render_scan_filter`] renders for the `AND` of conjuncts rendered one by one.
+pub fn conjoin_scan_filters(conjuncts: Vec<String>) -> Option<String> {
+    if conjuncts.is_empty() {
+        return None;
+    }
+    non_trivial_filter(join_junction(conjuncts, " AND ", "TRUE"))
+}
+
+fn non_trivial_filter(sql: String) -> Option<String> {
+    (sql != "TRUE" && sql != "NULL").then_some(sql)
 }
 
 /// DataFusion dialect, untyped. Use [`render_scan_expression`].

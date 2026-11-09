@@ -8,7 +8,7 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 * Three sites render the DataFusion-bound WHERE filter, and each returns `Option<String>`: the single-table path (`handle_pushdown`), the broadcast-join path (`render_broadcast_join`) and the N-scan per-leg path (`build_side_fan_out_sql`). `None` covers three outcomes: no filter, a filter that renders trivially true, and a declined filter. Only the declined filter must not be omitted.
 * A filter declines when the scan translator declines it (`pushdown-types/pushdown-planning-scan-text-conversion`).
 * `render_expression_safe` does not suppress a trivially-true result, so it returns `None` only for a declined filter. `crates/vs-expression` owns the trivially-true rule, and no call site re-tests it.
-* Self-application renders the original request filter tree, not the type-rewritten tree. Exasol applies its own implicit coercions, including non-string-to-VARCHAR, which DataFusion refuses.
+* Self-application renders the original request filter tree, so Exasol applies its own conversions with the session's settings.
 * A predicate unrenderable under both the DataFusion and the Exasol dialect is applied nowhere. The adapter returns a clean error, the same refusal as `pushdown/pushdown-planning-selectlist-expressions`. A self-applied predicate whose Exasol render is trivially true emits no clause and is not an error, so the adapter decides the error from a non-suppressing render.
 * `handle_pushdown` computes the decline classification once per path and passes it down.
 * The self-applied predicate must precede any aggregation, grouping or truncation the request carries. The single-table path therefore routes a declined filter through the qualified single-table wrapper, whose raw fan-out has no aggregate, sort or LIMIT.
@@ -80,10 +80,9 @@ Guarantees that the adapter evaluates every WHERE predicate it accepts. The adap
 * *AND* the partition SHALL remain total and disjoint: a conjunct is pushed into a leg if and only if it is side-local to exactly one table AND the scan translator renders it against that side's own column metadata; every other conjunct is residual, so no conjunct is dropped and none is applied twice
 * *AND* the screen SHALL run PER SIDE and PER CONJUNCT AFTER attribution, because two N-scan sides MAY declare the same column name with different Exasol types and only the owning side's metadata resolves it correctly
 * *AND* a side-local conjunct the scan translator renders SHALL still be pushed into its leg exactly as before, so per-leg row-group pruning and row filtering are unchanged for every conjunct the adapter can push
-* *AND* the filter each leg receives SHALL be the SQL the partition rendered, so the leg's own render cannot decline
-* *AND* if a side's re-formed accepted-conjunct tree does not itself survive the pipeline, OR survives but is not DataFusion-renderable, that side's ENTIRE side-local set SHALL become residual, so no conjunct is ever applied nowhere
+* *AND* each side-local conjunct SHALL be rendered exactly once, against its side's column types, and the filter each leg receives SHALL be the conjunction of the accepted conjuncts' rendered SQL, so no second render can decline it
 * *AND* the side-local predicate each side forwards to Iceberg manifest pruning SHALL still carry the declined conjunct in RAW form, because the screen governs only what a leg renders and pruning only ever removes files that provably cannot match
-* *AND* the residual conjunct the outer wrapper renders SHALL be the RAW conjunct in the Exasol dialect, which is renderable by construction for a type decline because Exasol applies the implicit non-string-to-VARCHAR coercion DataFusion refuses
+* *AND* the residual conjunct the outer wrapper renders SHALL be the RAW conjunct in the Exasol dialect, so Exasol applies its own conversions with the session's settings
 * *AND* the returned rows SHALL equal native Exasol evaluation of the same join
 
 ### Scenario: A predicate unrenderable under both dialects returns a clean error

@@ -58,13 +58,12 @@ One renderer serves every inner equi-join outside the two-leg broadcast contract
 * *AND* every OTHER conjunct SHALL be RESIDUAL and remain in the outer wrapper's `WHERE`: cross-leg, OR-spanning, untagged, column-free, leg-local-but-unrenderable, or leg-local-but-declined
 * *AND* the partition SHALL stay total and disjoint under the added condition, so no conjunct is dropped and none is applied twice
 * *AND* a decline SHALL cost only the offending CONJUNCT's leg pushdown, so the same leg's other leg-local conjuncts SHALL still be pushed into its fan-out
-* *AND* the leg's filter SHALL be the SQL the screen rendered, so no second render can decline it
+* *AND* each leg-local conjunct SHALL be rendered exactly once, against its leg's column types, and the leg's filter SHALL be the conjunction of the accepted conjuncts' rendered SQL, so no second render can decline it
 * *AND* each leg's Iceberg manifest-pruning predicate SHALL keep every conjunct attributed to THAT LEG in its RAW form, declined or not, so no decline SHALL change which files are opened, and a conjunct attributed to a DIFFERENT leg of the same table MUST NOT reach it
-* *AND* the residual conjunct the outer wrapper renders SHALL be the RAW conjunct in the Exasol dialect, which applies the implicit non-string-to-VARCHAR coercion DataFusion refuses
+* *AND* the residual conjunct the outer wrapper renders SHALL be the RAW conjunct in the Exasol dialect, so Exasol applies its own conversions with the session's settings
 * *AND* a non-empty residual set that the NON-SUPPRESSING qualified Exasol render also cannot express SHALL return the wrapper's client-facing error, because the predicate can be applied nowhere and returning rows without it would be wrong
 * *AND* a non-empty residual set that renders trivially true SHALL emit no outer `WHERE` and SHALL NOT error, so the error decision MUST NOT be taken from the trivially-true-suppressing render's empty result
-* *AND* if the re-formed accepted-conjunct tree of a leg does not itself survive the pipeline, OR survives but is not DataFusion-renderable, that leg's ENTIRE leg-local set SHALL become residual, so no conjunct is ever applied nowhere
-* *AND* an N-scan request in which no table occurs twice and whose filter triggers no rewrite and no type decline SHALL emit the SQL that the golden-SQL fixtures pin for that shape
+* *AND* an N-scan request in which no table occurs twice and whose filter has no declined conjunct SHALL emit the SQL that the golden-SQL fixtures pin for that shape
 * *AND* the returned result SHALL equal the result of the same inner join evaluated on a single node, for any assignment of conditions to join points
 
 ### Scenario: Aggregate over a join routes through the unified qualified wrapper

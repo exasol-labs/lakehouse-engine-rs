@@ -14,8 +14,8 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::HashMap;
 use vs_expression::{
-    ColumnNode, ColumnTypeLookup, SqlFragment, exact_expression_type, render_scan_expression,
-    render_scan_filter, walk_column_nodes,
+    ColumnNode, ColumnTypeLookup, EXPR_ARRAY_FIELDS, EXPR_SINGLE_FIELDS, SqlFragment,
+    render_scan_expression, render_scan_filter, walk_column_nodes,
 };
 
 use super::binary_filter::{BinaryLayout, compare_binary_bytes};
@@ -367,14 +367,8 @@ pub(super) fn involved_columns<'r>(
     })
 }
 
-/// Curated deliberately; see [`rewrite_expr_tree`].
-const EXPR_ARRAY_FIELDS: [&str; 3] = ["expressions", "arguments", "results"];
-
-/// Curated deliberately; see [`rewrite_expr_tree`].
-const EXPR_SINGLE_FIELDS: [&str; 5] = ["expression", "pattern", "left", "right", "basis"];
-
-/// Post-order, so `f` sees rewritten children. The child fields are curated rather than walking
-/// every map value, so a `dataType` sub-object or a `name` identifier is never handed to `f`.
+/// Post-order over [`EXPR_ARRAY_FIELDS`] and [`EXPR_SINGLE_FIELDS`], so `f` sees rewritten
+/// children.
 fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Json) -> Json {
     let mut out = node.clone();
     for field in EXPR_ARRAY_FIELDS {
@@ -655,8 +649,7 @@ fn scan_rewrite(expr: &Json, col_types: &ColumnTypes) -> Json {
 }
 
 /// The sole owner of "SQL the DataFusion scan computes": every path renders through it with the
-/// same column types, so every path runs the same typed checks and an aggregate re-derived in
-/// HAVING or ORDER BY renders exactly as at detection (#587).
+/// same column types, so every path runs the same typed checks (#587).
 #[derive(Debug, Clone, Copy)]
 pub struct ScanTranslator<'a> {
     columns: &'a ColumnTypes,
@@ -676,18 +669,9 @@ impl<'a> ScanTranslator<'a> {
         render_scan_expression(&scan_rewrite(expr, self.columns), self.columns).ok()
     }
 
-    /// `Ok(None)` when the filter is trivially true, `Err(())` when the scan declines it.
-    pub(super) fn filter(self, filter: &Json) -> Result<Option<String>, ()> {
-        render_scan_filter(&scan_rewrite(filter, self.columns), self.columns).map_err(|_| ())
-    }
-
-    pub(super) fn accepts(self, expr: &Json) -> bool {
-        self.expression(expr).is_some()
-    }
-
-    /// The type the request states for `expr`: a CAST's target or a column's type.
-    pub(super) fn exact_type(self, expr: &Json) -> Option<ExasolType> {
-        exact_expression_type(expr, self.columns)
+    /// `Ok(None)` when the filter is trivially true; `Err` names why the scan declines it.
+    pub(super) fn filter(self, filter: &Json) -> Result<Option<String>, UdfError> {
+        render_scan_filter(&scan_rewrite(filter, self.columns), self.columns)
     }
 
     /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`). `declined` is the
@@ -697,7 +681,7 @@ impl<'a> ScanTranslator<'a> {
             None => (None, None),
             Some(raw) => match self.filter(raw) {
                 Ok(sql) => (sql, None),
-                Err(()) => (None, Some(raw)),
+                Err(_) => (None, Some(raw)),
             },
         }
     }

@@ -2007,7 +2007,7 @@ fn e2e_upper_timestamp_declines_to_native_oracle() {
 }
 
 #[test]
-fn e2e_upper_boolean_declines_to_native_oracle() {
+fn e2e_upper_boolean_matches_native() {
     lakehouse_vs();
     let mut conn = exa_conn();
 
@@ -3265,6 +3265,8 @@ fn strict_type_check_accepts_every_request_shape() {
 
 // #192: CHAR-declared pushdown shapes.
 
+/// Scenario: An equal-length CASE group key resolves to a CHAR group-key type
+/// Scenario: The CHAR declaration query shapes execute end to end through the Virtual Schema
 #[test]
 fn char_declared_pushdown_shapes_match_native() {
     lakehouse_vs();
@@ -3296,9 +3298,9 @@ fn char_declared_pushdown_shapes_match_native() {
     // Assert the pushdown carries CHAR(3); a declined pushdown would pass the value checks.
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
     assert!(
-        pushed_sql.contains("CHAR(3)") && !pushed_sql.contains("VARCHAR(3)"),
-        "expected the pushed SQL for the equal-length CASE GROUP BY key to \
-         declare CHAR(3) (not VARCHAR(3)), got: {pushed_sql}"
+        pushed_sql.contains(r#""GK_0" CHAR(3) ASCII"#),
+        "expected the scan to emit the equal-length CASE GROUP BY key as \
+         \"GK_0\" CHAR(3) ASCII, got: {pushed_sql}"
     );
 
     let sql = format!(
@@ -3378,6 +3380,7 @@ fn char_declared_pushdown_shapes_match_native() {
     }
 }
 
+/// Scenario: A CAST to CHAR returns Exasol's padded value
 #[test]
 fn char_group_key_merges_trailing_space_variants_like_native() {
     lakehouse_vs();
@@ -3449,6 +3452,7 @@ fn char_group_key_merges_trailing_space_variants_like_native() {
     );
 }
 
+/// Scenario: A CAST to CHAR returns Exasol's padded value
 #[test]
 fn over_length_char_group_key_raises_truncation_error_like_native() {
     lakehouse_vs();
@@ -3476,16 +3480,17 @@ fn over_length_char_group_key_raises_truncation_error_like_native() {
     let sql_code = resp["exception"]["sqlCode"].as_str().unwrap_or_default();
     assert!(
         sql_code.contains("22002"),
-        "expected Exasol's UDF-emit truncation error (sqlCode 22002, \"string \
-         data, right truncation\"), got sqlCode={sql_code:?} message={message:?}: {resp}"
+        "expected Exasol's CAST truncation error, which it raises as sqlCode 22002 over the \
+         scanned rows, got sqlCode={sql_code:?} message={message:?}: {resp}"
     );
 
-    query_error(
+    assert_query_fails(
         &mut conn,
         &format!(
             "SELECT COUNT(*) c FROM {} GROUP BY CAST({CHAR_PAD_COL} AS CHAR(20))",
             vs_char_pad_table()
         ),
+        &["right truncation"],
     );
 }
 
@@ -3716,15 +3721,8 @@ fn split_aggregate_mismatch(
     split: Option<bool>,
 ) -> Option<String> {
     let vs_query = query.replace("{T}", table);
-    let read = |conn: &mut ExaConn, sql: &str| {
-        let (types, mut rows) = typed_result(conn, sql);
-        if !sql.contains("ORDER BY") {
-            rows.sort();
-        }
-        (types, rows)
-    };
-    let actual = read(conn, &vs_query);
-    let expected = read(conn, &query.replace("{T}", NATIVE_COPY));
+    let actual = comparable_result(conn, &vs_query);
+    let expected = comparable_result(conn, &query.replace("{T}", NATIVE_COPY));
     if actual != expected {
         return Some(format!(
             "`{query}`: got {actual:?}, the oracle {expected:?}"

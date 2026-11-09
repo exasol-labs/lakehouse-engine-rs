@@ -341,10 +341,10 @@ fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
     let sql = build_grouped_aggregate_scan_sql(
         &grouped_spec(&result),
         &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
-        &result.group_keys,
         &group_key_types,
         &result.plans,
         &result.plan_types,
+        &result.merged,
         &result.select_items,
         req.select_types(),
         None,
@@ -508,10 +508,10 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
         }
         .with_files(vec![]),
         &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
-        &result.group_keys,
         &group_key_types,
         &result.plans,
         &result.plan_types,
+        &result.merged,
         &result.select_items,
         req.select_types(),
         None,
@@ -753,10 +753,10 @@ fn detect_group_by_all_expression_multi_key() {
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
         &shards,
-        &result.group_keys,
         &group_key_types,
         &result.plans,
         &aggregate_types,
+        &result.merged,
         &result.select_items,
         req.select_types(),
         None,
@@ -843,10 +843,14 @@ fn build_grouped_agg_sql(
     build_grouped_aggregate_scan_sql(
         &spec_template,
         &shards,
-        &group_keys,
         &vec![ExasolType::WIDEST_VARCHAR; group_keys.len()],
         &agg_plans,
         &vec![ExasolType::DoublePrecision; agg_plans.len()],
+        &cast_merge_items(
+            &agg_plans,
+            &vec![ExasolType::DoublePrecision; agg_plans.len()],
+            ScanTranslator::new(&column_types(&col_types)).columns(),
+        ),
         &select_items,
         &select_types_of(
             &select_items,
@@ -998,7 +1002,6 @@ fn grouped_common_blob_has_no_limit() {
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
         &shards,
-        &["\"REGION\"".to_string()],
         &[ExasolType::WIDEST_VARCHAR],
         &[AggregatePlan {
             kind: AggKind::Count,
@@ -1006,6 +1009,15 @@ fn grouped_common_blob_has_no_limit() {
             arg_expr: None,
         }],
         &[ExasolType::decimal(18, 0)],
+        &cast_merge_items(
+            &[AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+                arg_expr: None,
+            }],
+            &[ExasolType::decimal(18, 0)],
+            ScanTranslator::new(&column_types(&col_types)).columns(),
+        ),
         &keys_first_select_items(1, 1),
         &select_types_of(
             &keys_first_select_items(1, 1),
@@ -1053,7 +1065,6 @@ fn grouped_merge_offset_never_reaches_per_shard_spec() {
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
         &shards,
-        &["\"REGION\"".to_string()],
         &[ExasolType::WIDEST_VARCHAR],
         &[AggregatePlan {
             kind: AggKind::Count,
@@ -1061,6 +1072,15 @@ fn grouped_merge_offset_never_reaches_per_shard_spec() {
             arg_expr: None,
         }],
         &[ExasolType::decimal(18, 0)],
+        &cast_merge_items(
+            &[AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+                arg_expr: None,
+            }],
+            &[ExasolType::decimal(18, 0)],
+            ScanTranslator::new(&column_types(&col_types)).columns(),
+        ),
         &keys_first_select_items(1, 1),
         &select_types_of(
             &keys_first_select_items(1, 1),
@@ -1108,7 +1128,6 @@ fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
         &shards,
-        &["\"REGION\"".to_string()],
         &[ExasolType::WIDEST_VARCHAR],
         &[AggregatePlan {
             kind: AggKind::Count,
@@ -1116,6 +1135,15 @@ fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
             arg_expr: None,
         }],
         &[ExasolType::decimal(18, 0)],
+        &cast_merge_items(
+            &[AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+                arg_expr: None,
+            }],
+            &[ExasolType::decimal(18, 0)],
+            ScanTranslator::new(&column_types(&col_types)).columns(),
+        ),
         &keys_first_select_items(1, 1),
         &select_types_of(
             &keys_first_select_items(1, 1),
@@ -1154,10 +1182,10 @@ fn grouped_merge_renders_limit_offset_in_clause_order() {
     let sql = build_grouped_aggregate_scan_sql(
         &grouped_spec(&result),
         &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
-        &result.group_keys,
         &group_key_types,
         &result.plans,
         &result.plan_types,
+        &result.merged,
         &result.select_items,
         req.select_types(),
         Some(2),
@@ -1294,10 +1322,14 @@ fn build_grouped_agg_sql_with_select_items(
     build_grouped_aggregate_scan_sql(
         &spec_template,
         &shards,
-        &group_keys,
         &group_key_types,
         &agg_plans,
         &aggregate_types,
+        &cast_merge_items(
+            &agg_plans,
+            &aggregate_types,
+            ScanTranslator::new(&column_types(&col_types)).columns(),
+        ),
         &select_items,
         &select_types_of(&select_items, &group_key_types, &aggregate_types),
         None,
@@ -1525,10 +1557,10 @@ fn build_grouped_from_detection(req: &PushdownRequest) -> String {
     build_grouped_aggregate_scan_sql(
         &spec_template,
         &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
-        &d.group_keys,
         &group_key_types,
         &d.plans,
         &d.plan_types,
+        &d.merged,
         &d.select_items,
         req.select_types(),
         None,
@@ -1831,10 +1863,10 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
         &shards,
-        &detection.group_keys,
         &group_key_types,
         &detection.plans,
         &aggregate_types,
+        &detection.merged,
         &detection.select_items,
         req.select_types(),
         None,
@@ -1892,6 +1924,35 @@ fn having_over_a_group_key_reads_its_gk_column() {
 }
 
 #[test]
+fn having_over_a_key_inside_a_scalar_with_an_aggregate_reads_both_merged() {
+    let columns = [
+        ("K", ExasolType::decimal(9, 0)),
+        ("V", ExasolType::decimal(9, 0)),
+    ];
+    let col_types = column_types(&columns);
+    let req = grouped_request(&columns, vec![col("K")])
+        .column(col("K"))
+        .item(
+            agg_item("SUM", Some("V"), false),
+            ExasolType::decimal(20, 0),
+        )
+        .build_pushdown();
+    let detection = detect_group_by_aggregates(&req, ScanTranslator::new(&col_types))
+        .expect("grouped aggregate");
+    let having = compare(
+        "predicate_greater",
+        scalar_fn("ADD", [col("K"), agg_item("SUM", Some("V"), false)]),
+        num_lit(10),
+    );
+
+    assert_eq!(
+        having_over_merge(&having, &detection, &col_types),
+        Some(r#"(("GK_0" + CAST(SUM("PARTIAL_sum_0") AS DECIMAL(20,0))) > 10)"#.to_string()),
+        "HAVING k + SUM(v) > 10 reads GK_0 and the merged SUM (#551)"
+    );
+}
+
+#[test]
 fn grouped_wrapper_outer_select_follows_select_list_order() {
     let req = grouped_request(NO_COLUMNS, vec![mod_item("ID", 4)])
         .item(
@@ -1918,10 +1979,10 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
         &shards,
-        &detection.group_keys,
         &group_key_types,
         &detection.plans,
         &aggregate_types,
+        &detection.merged,
         &detection.select_items,
         req.select_types(),
         None,
@@ -1989,10 +2050,10 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
         &shards,
-        &detection.group_keys,
         &group_key_types,
         &detection.plans,
         &aggregate_types,
+        &detection.merged,
         &detection.select_items,
         req.select_types(),
         Some(2),
@@ -2520,7 +2581,6 @@ fn having_clause_appears_in_outer_wrapper_only() {
     let sql = build_grouped_aggregate_scan_sql(
         &spec_template,
         &shards,
-        &[r#""REGION""#.to_string()],
         &[ExasolType::WIDEST_VARCHAR],
         &[AggregatePlan {
             kind: AggKind::Sum,
@@ -2528,6 +2588,15 @@ fn having_clause_appears_in_outer_wrapper_only() {
             arg_expr: None,
         }],
         &[ExasolType::DoublePrecision],
+        &cast_merge_items(
+            &[AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("AMOUNT".into()),
+                arg_expr: None,
+            }],
+            &[ExasolType::DoublePrecision],
+            ScanTranslator::new(&column_types(&col_types)).columns(),
+        ),
         &keys_first_select_items(1, 1),
         &select_types_of(
             &keys_first_select_items(1, 1),
@@ -2652,26 +2721,6 @@ fn sum_and_stat_aggregates_accept_only_double_and_decimal_columns() {
             "MIN over {exa_type} needs no numeric type"
         );
     }
-}
-
-#[test]
-fn unprojected_group_key_with_an_invalid_cast_type_has_no_type() {
-    let invalid = serde_json::json!({"type": "CHAR", "characterSet": "ASCII"});
-    // The engine's `cast_to` takes an `ExasolType`, which cannot hold this invalid type.
-    let key = cast_json(invalid, col("NAME"));
-    let req = grouped_request(NO_COLUMNS, vec![key])
-        .count_star()
-        .build_pushdown();
-    let unprojected = [GroupedSelectItem::Aggregate {
-        plan_slot: 0,
-        select_index: 0,
-    }];
-
-    assert_eq!(
-        group_key_exasol_types(&req, &[SqlFragment::new(r#""NAME""#, None)], &unprojected,),
-        None,
-        "an invalid key type has no exact type, so the grouped split declines"
-    );
 }
 
 /// The types Exasol declares for a select list of only keys and aggregates: each one's own type.

@@ -2,8 +2,9 @@ use crate::scan::spec::ProjectionItem;
 use crate::types::exasol_type::ExasolType;
 use serde_json::Value as Json;
 use vs_expression::{
-    ColumnNode, ColumnTypeLookup, SqlFragment, exact_expression_type, render_df_filter_exasol_safe,
-    render_expression_exasol_safe, strip_table_alias, walk_column_nodes,
+    ColumnNode, ColumnTypeLookup, SqlFragment, conjoin_scan_filters, exact_expression_type,
+    render_df_filter_exasol_safe, render_expression_exasol_safe, strip_table_alias,
+    walk_column_nodes,
 };
 
 use super::super::support::{ColumnTypes, ScanTranslator, quote_ident};
@@ -78,15 +79,20 @@ fn flatten_conjuncts<'a>(filter: &'a Json, out: &mut Vec<&'a Json>) {
     out.push(filter);
 }
 
-/// `None` when nothing is kept, the bare conjunct for one, else a `predicate_and`.
 fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Json> {
     let mut conjuncts = Vec::new();
     flatten_conjuncts(filter, &mut conjuncts);
-    let mut kept: Vec<Json> = conjuncts
-        .into_iter()
-        .filter(|&c| keep(c))
-        .cloned()
-        .collect();
+    conjoin(
+        conjuncts
+            .into_iter()
+            .filter(|&c| keep(c))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// `None` when nothing is kept, the bare conjunct for one, else a `predicate_and`.
+fn conjoin(mut kept: Vec<Json>) -> Option<Json> {
     match kept.len() {
         0 => None,
         1 => kept.pop(),
@@ -104,8 +110,8 @@ fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Js
 /// Its consumers deliberately receive different trees:
 /// (a) manifest pruning gets it raw, so every leg-local conjunct prunes even when
 /// DataFusion cannot render it;
-/// (b) the leg's `ScanSpec.filter` gets it screened by [`type_screened_leg_filter`];
-/// (c) the outer wrapper's WHERE gets the raw type-declined conjuncts (Exasol dialect).
+/// (b) the leg's `ScanSpec.filter` gets the conjuncts [`screen_leg_filter`] renders;
+/// (c) the outer wrapper's WHERE gets the raw declined conjuncts (Exasol dialect).
 /// Cross-leg and OR-spanning conjuncts go only to the outer WHERE.
 pub(super) fn leg_local_filter(filter: &Json, legs: &JoinLegs, leg: usize) -> Option<Json> {
     partition_conjuncts(filter, |c| legs.conjunct_leg(c) == Some(leg))
@@ -118,30 +124,25 @@ pub(super) fn cross_leg_residual_filter(filter: &Json, legs: &JoinLegs) -> Optio
     partition_conjuncts(filter, |c| legs.conjunct_leg(c).is_none())
 }
 
-/// Returns `(leg_filter_sql, type_declined)`: a total per-conjunct partition, the first half
-/// rendered for the leg's scan, the second for the Exasol-dialect outer WHERE.
-///
-/// Not [`ScanTranslator::split_where`], which classifies a whole filter against one type
-/// universe: an N-scan leg's conjuncts name only that leg's columns, so the leg's own unqualified
-/// `col_types`, known only after attribution, binds each one by name. Per conjunct, so one
-/// declined conjunct doesn't forfeit its siblings. Rendered here, so no later render can decline
-/// a kept conjunct.
-pub(super) fn type_screened_leg_filter(
+/// Returns `(leg_filter_sql, declined)`. Each conjunct renders once against the leg's own
+/// columns, so one declined conjunct costs only itself and no later render can decline the rest.
+pub(super) fn screen_leg_filter(
     side_local: &Json,
     col_types: &ColumnTypes,
 ) -> (Option<String>, Option<Json>) {
     let scan = ScanTranslator::new(col_types);
-    // Bare: the fan-out relation exposes bare uppercase names, so an alias would not resolve.
-    let accepts = |c: &Json| scan.accepts(&strip_table_alias(c));
-    let kept = partition_conjuncts(side_local, accepts);
-    let declined = partition_conjuncts(side_local, |c| !accepts(c));
-    match kept
-        .map(|k| scan.filter(&strip_table_alias(&k)))
-        .transpose()
-    {
-        Ok(sql) => (sql.flatten(), declined),
-        Err(()) => (None, Some(side_local.clone())),
+    let mut conjuncts = Vec::new();
+    flatten_conjuncts(side_local, &mut conjuncts);
+    let mut rendered = Vec::new();
+    let mut declined = Vec::new();
+    for conjunct in conjuncts {
+        // Bare: the fan-out relation exposes bare uppercase names, so an alias would not resolve.
+        match scan.expression(&strip_table_alias(conjunct)) {
+            Some(fragment) => rendered.push(fragment.sql),
+            None => declined.push(conjunct.clone()),
+        }
     }
+    (conjoin_scan_filters(rendered), conjoin(declined))
 }
 
 /// Inputs must be disjoint conjunct sets; nothing is de-duplicated.

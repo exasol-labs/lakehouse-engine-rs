@@ -1,4 +1,4 @@
-use crate::adapter::pushdown::test_support::render_df_filter_safe;
+use crate::adapter::pushdown::test_support::untyped_scan_filter;
 use crate::adapter::pushdown::test_support::{
     alias_col, and, between, binary_lit, column_types_under, compare, declared_column_types,
     fixed_binary_lit, in_list, not, nullable_field as field, or, predicate_equal, sales_col,
@@ -221,7 +221,7 @@ fn per_relation_detection_resolves_a_shared_column_name_by_its_own_relation() {
     ]);
     let on = |alias: &str| predicate_equal(alias_col(alias, "X"), str_lit("0a1b"));
     assert_eq!(
-        render_df_filter_safe(&compare_binary_bytes(on("LHS_T0"), &columns)).expect("renders"),
+        untyped_scan_filter(&compare_binary_bytes(on("LHS_T0"), &columns)).expect("renders"),
         "(\"LHS_T0\".\"_LH_BYTES_X\" = X'0a1b')",
         "the binary leg compares its own relation's raw bytes"
     );

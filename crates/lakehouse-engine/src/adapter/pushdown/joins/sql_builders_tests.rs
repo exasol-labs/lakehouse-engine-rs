@@ -2154,7 +2154,8 @@ fn golden_n_scan_render_decline_messages_unchanged() {
     assert_eq!(
         msg,
         "join pushdown declined: a GROUP BY key could not be rendered for the qualified \
-         N-scan join; this is a hard error, not a native re-plan"
+         N-scan join (unsupported expression node type: totally_unsupported_node_type); \
+         this is a hard error, not a native re-plan"
     );
 
     let having_req = serde_json::json!({ "having": unrenderable() });
@@ -2165,7 +2166,8 @@ fn golden_n_scan_render_decline_messages_unchanged() {
     assert_eq!(
         msg,
         "join pushdown declined: HAVING could not be rendered for the qualified \
-         N-scan join; this is a hard error, not a native re-plan"
+         N-scan join (unsupported expression node type: totally_unsupported_node_type); \
+         this is a hard error, not a native re-plan"
     );
 
     let order_by_req = serde_json::json!({
@@ -2433,7 +2435,7 @@ fn referenced_columns_falls_back_to_first_column() {
 fn n_scan_join_untranslatable_select_item_is_hard_error() {
     let unknown = serde_json::json!({"type": "no_such_node_type_in_either_dialect"});
     assert!(
-        render_expression_safe(&unknown).is_none()
+        untyped_scan_expression(&unknown).is_none()
             && render_expression_exasol_safe(&unknown).is_none(),
         "the fixture node must be untranslatable under BOTH dialects"
     );
@@ -2575,7 +2577,7 @@ fn declined_filter_wrapper_sql(
 fn single_table_wrapper_renders_declined_predicate_in_exasol_dialect() {
     let declined = declined_second_predicate(table_col("T", "C_TS"));
     assert!(
-        render_expression_safe(&declined).is_none()
+        untyped_scan_expression(&declined).is_none()
             && render_expression_exasol_safe(&declined).is_some(),
         "fixture precondition: SECOND(C_TS, 3) must decline for DataFusion and \
          render for Exasol"

@@ -57,7 +57,7 @@ mod topn;
 use topn::{detect_topn, parse_order_by_keys};
 
 mod single_group_agg;
-pub use single_group_agg::{detect_aggregates, ordinary_plans};
+pub use single_group_agg::{SingleGroupPlans, detect_aggregates};
 use single_group_agg::{has_distinct, is_lone_count_distinct, single_group_merge_select};
 
 mod grouped_agg;
@@ -336,6 +336,7 @@ pub(crate) fn build_dispatch_sql(
                 group_key_types,
                 plans: grouped_agg_plans,
                 plan_types: grouped_agg_types,
+                merged,
                 select_items,
             } = detection;
             // Safe to apply the outer LIMIT: the merge renders its own ORDER BY, and the
@@ -352,16 +353,15 @@ pub(crate) fn build_dispatch_sql(
                 },
                 files: vec![],
             };
-            // From detection, never a `selectList`-keyed lookup: nested aggregates would
-            // misalign it.
-            let aggregate_types = grouped_agg_types;
+            // Types come from detection, never a `selectList`-keyed lookup: nested aggregates
+            // would misalign it.
             let sql = build_grouped_aggregate_scan_sql(
                 &spec_template,
                 shards,
-                &group_keys,
                 &group_key_types,
                 &grouped_agg_plans,
-                &aggregate_types,
+                &grouped_agg_types,
+                &merged,
                 &select_items,
                 pushdown.select_types(),
                 grouped_limit,
@@ -407,7 +407,7 @@ pub(crate) fn build_dispatch_sql(
         }
         RequestShape::SingleGroupAgg {
             items,
-            plan_types,
+            plans,
             having,
         } => {
             // Lone bare-column COUNT(DISTINCT): the only fan-out shape. LIMIT goes only on
@@ -456,17 +456,11 @@ pub(crate) fn build_dispatch_sql(
                     None,
                 );
             }
-            let plans = ordinary_plans(&items, scan);
-            // Assembled here because it depends on select-list classification.
-            let merge_inputs = single_group_merge_select(
-                &items,
-                &plans,
-                &plan_types,
-                pushdown.select_types(),
-                scan,
-            )
-            .and_then(|merge_select| {
-                AggregateMergeInputs::new(plan_types, merge_select, limit)
+            let merge_select =
+                single_group_merge_select(&items, &plans, pushdown.select_types(), scan);
+            let SingleGroupPlans { plans, types, .. } = plans;
+            let merge_inputs = merge_select.and_then(|merge_select| {
+                AggregateMergeInputs::new(types, merge_select, limit)
                     .map(|inputs| inputs.with_having(having))
             });
             let Some(merge_inputs) = merge_inputs else {

@@ -860,6 +860,19 @@ pub fn typed_result(conn: &mut ExaConn, sql: &str) -> (Vec<serde_json::Value>, V
     (types, rows)
 }
 
+/// [`typed_result`] with its rows sorted unless the query orders them, so two plans of one query
+/// compare equal.
+pub fn comparable_result(
+    conn: &mut ExaConn,
+    sql: &str,
+) -> (Vec<serde_json::Value>, Vec<Vec<String>>) {
+    let (types, mut rows) = typed_result(conn, sql);
+    if !sql.contains("ORDER BY") {
+        rows.sort();
+    }
+    (types, rows)
+}
+
 pub fn value_to_string(v: &serde_json::Value) -> String {
     v.as_str()
         .map(str::to_string)
@@ -1222,19 +1235,29 @@ pub fn assert_binary_values_refused(
 /// Ground truth independent of join pushdown: both tables read un-joined through the VS
 /// and joined in-process.
 pub fn expected_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
-    expected_join_rows_with_fact_where(
+    join_in_process(
         conn,
         vs_name,
         &format!("O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}'"),
+        |_, _| true,
     )
 }
 
-/// Applies `fact_where` through the single-table WHERE path, independent of the join
-/// pushdown under test.
-pub fn expected_join_rows_with_fact_where(
+/// Keeps the fact rows for which `keep(custkey, orderdate)` holds, in the test process, so no
+/// engine render computes the expected rows.
+pub fn expected_join_rows_kept(
+    conn: &mut ExaConn,
+    vs_name: &str,
+    keep: impl Fn(&str, &str) -> bool,
+) -> Vec<(String, String)> {
+    join_in_process(conn, vs_name, "TRUE", keep)
+}
+
+fn join_in_process(
     conn: &mut ExaConn,
     vs_name: &str,
     fact_where: &str,
+    keep: impl Fn(&str, &str) -> bool,
 ) -> Vec<(String, String)> {
     let dim_cols = conn.query_columns(&format!(
         "SELECT C_CUSTKEY, C_NAME FROM {}",
@@ -1256,13 +1279,14 @@ pub fn expected_join_rows_with_fact_where(
     let mut rows: Vec<(String, String)> = fact_cols[0]
         .iter()
         .zip(fact_cols[1].iter())
-        .map(|(custkey, date)| {
-            let key = value_to_string(custkey);
+        .map(|(custkey, date)| (value_to_string(custkey), value_to_string(date)))
+        .filter(|(key, date)| keep(key, date))
+        .map(|(key, date)| {
             let name = custkey_to_name
                 .get(&key)
                 .unwrap_or_else(|| panic!("fact O_CUSTKEY {key} has no matching customer"))
                 .clone();
-            (name, value_to_string(date))
+            (name, date)
         })
         .collect();
     rows.sort();

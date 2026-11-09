@@ -19,6 +19,11 @@ pub fn typed_columns<N: AsRef<str>>(columns: &[(N, ExasolType)]) -> TypedColumns
     )
 }
 
+/// `VARCHAR(size) ASCII`.
+pub fn ascii_varchar(size: u32) -> ExasolType {
+    ExasolType::Varchar { size, ascii: true }
+}
+
 impl ColumnTypeLookup for TypedColumns {
     fn column_type(&self, column: &Json) -> Option<ExasolType> {
         let name = column.get("name")?.as_str()?.to_uppercase();

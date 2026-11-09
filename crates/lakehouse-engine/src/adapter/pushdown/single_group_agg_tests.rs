@@ -150,7 +150,7 @@ fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types(
     assert!(
         matches!(
             &items[1],
-            SingleGroupItem::ScalarOverAggregate { node } if node == &req.json()["selectList"][1]
+            SingleGroupItem::ScalarOverAggregate { node, .. } if node == &req.json()["selectList"][1]
         ),
         "item 1 must be a ScalarOverAggregate at ordinal 1 carrying the verbatim node: {:?}",
         items[1]
@@ -932,16 +932,13 @@ fn merge_select_keeps_a_scalar_cast_to_its_declared_type_uncast() {
         .build_pushdown();
     let items = detect_aggregates(&req, ScanTranslator::new(&col_types))
         .expect("CAST(SUM(col)) must decompose");
-    let plans = ordinary_plans(&items, ScanTranslator::new(&col_types));
-    let plan_types =
-        single_group_plan_types(req.select_types(), &items, ScanTranslator::new(&col_types))
-            .expect("SUM over a typed column is exactly typed");
+    let plans = SingleGroupPlans::new(&items, req.select_types(), ScanTranslator::new(&col_types))
+        .expect("SUM over a typed column is exactly typed");
 
     assert_eq!(
         single_group_merge_select(
             &items,
             &plans,
-            &plan_types,
             req.select_types(),
             ScanTranslator::new(&col_types)
         ),
@@ -963,16 +960,13 @@ fn merge_select_wraps_scalar_structure_around_the_merged_partial() {
         .build_pushdown();
     let items = detect_aggregates(&req, ScanTranslator::new(&col_types))
         .expect("ROUND(SUM(col), 2) must decompose");
-    let plans = ordinary_plans(&items, ScanTranslator::new(&col_types));
-    let plan_types =
-        single_group_plan_types(req.select_types(), &items, ScanTranslator::new(&col_types))
-            .expect("SUM over a typed column is exactly typed");
+    let plans = SingleGroupPlans::new(&items, req.select_types(), ScanTranslator::new(&col_types))
+        .expect("SUM over a typed column is exactly typed");
 
     assert_eq!(
         single_group_merge_select(
             &items,
             &plans,
-            &plan_types,
             req.select_types(),
             ScanTranslator::new(&col_types)
         ),
@@ -1002,12 +996,11 @@ fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
         .build_pushdown();
     let items =
         detect_aggregates(&req, untyped_scan()).expect("an interleaved list must decompose");
-    let plans = ordinary_plans(&items, untyped_scan());
-    let plan_types = single_group_plan_types(req.select_types(), &items, untyped_scan())
+    let plans = SingleGroupPlans::new(&items, req.select_types(), untyped_scan())
         .expect("every slot is exactly typed");
 
     assert_eq!(
-        single_group_merge_select(&items, &plans, &plan_types, req.select_types(), untyped_scan()),
+        single_group_merge_select(&items, &plans, req.select_types(), untyped_scan()),
         Some(vec![
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2))"#.to_string(),
             r#"CAST(ROUND((CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2)) / CAST(SUM("PARTIAL_count_1") AS DECIMAL(18,0))), 2) AS DECIMAL(9,4))"#
@@ -1031,18 +1024,11 @@ fn merge_select_declines_a_list_holding_a_distinct_item() {
         .build_pushdown();
     let items =
         detect_aggregates(&req, untyped_scan()).expect("SUM + COUNT(DISTINCT) must decompose");
-    let plans = ordinary_plans(&items, untyped_scan());
-    let plan_types = single_group_plan_types(req.select_types(), &items, untyped_scan())
+    let plans = SingleGroupPlans::new(&items, req.select_types(), untyped_scan())
         .expect("every slot is exactly typed");
 
     assert_eq!(
-        single_group_merge_select(
-            &items,
-            &plans,
-            &plan_types,
-            req.select_types(),
-            untyped_scan()
-        ),
+        single_group_merge_select(&items, &plans, req.select_types(), untyped_scan()),
         None,
         "a distinct item carries no merge expression, so the whole assembly declines"
     );
@@ -1054,16 +1040,17 @@ fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
         "type": "function_scalar_cast", "name": "CAST",
         "arguments": [count_star()]
     });
-    let items = vec![SingleGroupItem::ScalarOverAggregate { node }];
-    let plans = ordinary_plans(&items, untyped_scan());
-    let plan_types = single_group_plan_types(&[], &items, untyped_scan())
+    let items = vec![SingleGroupItem::ScalarOverAggregate {
+        node,
+        nested: vec![],
+    }];
+    let plans = SingleGroupPlans::new(&items, &[], untyped_scan())
         .expect("an unclassifiable scalar contributes no slot to type");
 
     assert_eq!(
         single_group_merge_select(
             &items,
             &plans,
-            &plan_types,
             &[ExasolType::decimal(18, 0)],
             untyped_scan()
         ),
@@ -1087,19 +1074,16 @@ fn merge_select_emits_one_item_per_selectlist_item_for_duplicate_aggregates() {
         .build_pushdown();
     let items =
         detect_aggregates(&req, untyped_scan()).expect("a duplicated aggregate must decompose");
-    let plans = ordinary_plans(&items, untyped_scan());
-    let plan_types = single_group_plan_types(req.select_types(), &items, untyped_scan())
+    let plans = SingleGroupPlans::new(&items, req.select_types(), untyped_scan())
         .expect("every slot is exactly typed");
-    assert_eq!(plans.len(), 1, "one partial column for both occurrences");
+    assert_eq!(
+        plans.plans.len(),
+        1,
+        "one partial column for both occurrences"
+    );
 
     assert_eq!(
-        single_group_merge_select(
-            &items,
-            &plans,
-            &plan_types,
-            req.select_types(),
-            untyped_scan()
-        ),
+        single_group_merge_select(&items, &plans, req.select_types(), untyped_scan()),
         Some(vec![
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2))"#.to_string(),
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2))"#.to_string(),

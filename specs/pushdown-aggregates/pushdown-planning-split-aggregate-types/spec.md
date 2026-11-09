@@ -7,10 +7,9 @@ Every column a split aggregate emits and merges carries the exact type native Ex
 * Exasol sends `selectListDataTypes`, one type per select-list item. A nested node, such as the `MAX(UPPER(s))` inside `LENGTH(MAX(UPPER(s)))`, and an unprojected `groupBy` node carry no type, except a `CAST` node, whose `dataType` is its target type.
 * A guessed type breaks the merge. A text, date, or timestamp value fails the emit or the merge, a `DOUBLE` partial over an exact expression loses digits, and a key staged as text is read back by the session's NLS format and splits values that are equal in Exasol, such as `-0.0` and `0.0`.
 * An expression's exact type comes from its `selectListDataTypes` entry when it is a select-list item, else from its own `dataType` (a `CAST`), else from `involvedTables` when it is a bare column.
-* Native Exasol types an aggregate as follows (verified live): `COUNT` is `DECIMAL(18,0)`; `AVG`, `STDDEV`, and `VARIANCE` and their variants are `DOUBLE`; `SUM` over `DECIMAL(p,s)` is `DECIMAL(min(p+11, 36), s)` and over `DOUBLE` is `DOUBLE`; `MIN` and `MAX` take the argument's type.
+* Native Exasol types an aggregate as follows: `COUNT` is `DECIMAL(18,0)`; `AVG`, `STDDEV`, and `VARIANCE` and their variants are `DOUBLE`; `SUM` over `DECIMAL(p,s)` is `DECIMAL(min(p+11, 36), s)` and over `DOUBLE` is `DOUBLE`; `MIN` and `MAX` take the argument's type.
 * The adapter does not infer the type of an arbitrary expression. Exasol's typing rules depend on literal values, the session, and the Exasol version, so an adapter copy of them would drift.
 * A constant group key forms one group whatever type carries it, so it is staged as `VARCHAR(2000000)`.
-* Iceberg spec compliance: checked, not engaged. This feature changes only the Exasol types the adapter declares for partial and group-key columns (Apache Iceberg table spec, "Schemas and Data Types").
 
 ## Scenarios
 
@@ -22,7 +21,7 @@ Every column a split aggregate emits and merges carries the exact type native Ex
 * *WHEN* the adapter plans the request
 * *THEN* the adapter SHALL route it to the qualified wrapper
 * *AND* the result SHALL equal native Exasol over the same rows, including every decimal digit
-* *AND* the same request on every path SHALL match native Exasol: every file pruned, files scanned with no matching row, and matching rows
+* *AND* the result SHALL match native Exasol whether every file is pruned, the scanned files hold no matching row, or rows match
 
 ### Scenario: A nested aggregate takes the result type Exasol gives it
 
@@ -38,7 +37,7 @@ Every column a split aggregate emits and merges carries the exact type native Ex
 * *GIVEN* a split aggregate whose select list, `HAVING`, or `ORDER BY` applies a scalar to an aggregate, such as `SUM(a) / 2` over a `DECIMAL(15,2)` column
 * *WHEN* the adapter renders the merge
 * *THEN* the merged aggregate SHALL be cast to its native type before the scalar applies, as in `CAST(SUM("PARTIAL_sum_0") AS DECIMAL(26,2)) / 2`
-* *AND* the scalar SHALL therefore take the type and value native Exasol computes, although the partial `SUM` column is widened to `DECIMAL(36,s)`
+* *AND* the scalar SHALL therefore take the type and value native Exasol computes
 * *AND* a select item that already has its declared type, such as `CAST(SUM(x) AS VARCHAR(2000000))`, SHALL get no second cast
 
 ### Scenario: A group key travels with its exact type

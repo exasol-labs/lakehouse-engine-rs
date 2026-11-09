@@ -8,7 +8,7 @@
 
 ### Context
 
-Exasol writes and reads DATE, TIMESTAMP, DOUBLE, and non-integer DECIMAL text by the session's NLS settings, which the pushdown request does not carry. The adapter decided per call site whether the scan may compute an expression, and paths that skipped the type checks returned wrong text or wrong rows (#587).
+Exasol writes and reads DATE, TIMESTAMP, DOUBLE, and non-integer DECIMAL text by the session's NLS settings, which the pushdown request does not carry. Type checks ran per path, and paths without them returned wrong text or rows (#587).
 
 ### Decision
 

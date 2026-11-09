@@ -704,7 +704,7 @@ fn guard_dispatch_result(
     )
 }
 
-/// A shape `like_subject_type_guard` declines though Exasol renders it.
+/// A filter the scan declines though Exasol renders it.
 fn declined_like_on_decimal() -> Json {
     like(table_col("EVENTS", "AMOUNT"), "1%")
 }
@@ -712,6 +712,15 @@ fn declined_like_on_decimal() -> Json {
 /// The empty logical schema declines the bounded top-N unconditionally, so the
 /// decline route must win on its own.
 fn dispatch_sql_for_body(request: PushdownRequestBuilder) -> String {
+    let result =
+        dispatch_for_body(request).expect("build_dispatch_sql must succeed for this fixture");
+    result["sql"]
+        .as_str()
+        .expect("pushdown response must carry a sql field")
+        .to_string()
+}
+
+fn dispatch_for_body(request: PushdownRequestBuilder) -> Result<Json, UdfError> {
     let (request, _) = request.build();
     let pushdown_req = pd(&request);
     let col_types = first_table_column_types(&request);
@@ -719,7 +728,7 @@ fn dispatch_sql_for_body(request: PushdownRequestBuilder) -> String {
         project_first_table(&request, &pushdown_req).expect("the fixture must project");
     let (filter, declined_filter) = ScanTranslator::new(&col_types)
         .split_where(pushdown_req.get("filter").filter(|f| !f.is_null()));
-    let result = build_dispatch_sql(
+    build_dispatch_sql(
         &request,
         &parsed_pushdown(&request),
         projected_columns(&proj_cols, &proj_types),
@@ -745,11 +754,23 @@ fn dispatch_sql_for_body(request: PushdownRequestBuilder) -> String {
         8,
         false,
     )
-    .expect("build_dispatch_sql must succeed for this fixture");
-    result["sql"]
-        .as_str()
-        .expect("pushdown response must carry a sql field")
-        .to_string()
+}
+
+/// Scenario: A pushdown request with a missing or invalid Exasol type fails the query
+#[test]
+fn grouped_request_with_an_invalid_cast_key_type_fails() {
+    let invalid = serde_json::json!({"type": "CHAR", "characterSet": "ASCII"});
+    // The engine's `cast_to` takes an `ExasolType`, which cannot hold this invalid type.
+    let request = pushdown_request("T", &[("NAME", ExasolType::varchar(10))])
+        .group_by(vec![cast_json(invalid.clone(), col("NAME"))])
+        .count_star();
+
+    match dispatch_for_body(request) {
+        Err(UdfError::User(message)) => {
+            assert!(message.contains(&invalid.to_string()), "{message}")
+        }
+        other => panic!("the invalid key type must fail the query, got {other:?}"),
+    }
 }
 
 #[test]

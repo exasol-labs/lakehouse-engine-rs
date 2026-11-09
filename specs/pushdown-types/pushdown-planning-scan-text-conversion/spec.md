@@ -7,9 +7,8 @@ The scan computes an expression only when DataFusion returns what native Exasol 
 * Exasol writes a DATE by `NLS_DATE_FORMAT`, a TIMESTAMP by `NLS_TIMESTAMP_FORMAT`, and a DOUBLE or a DECIMAL with a scale above 0 by `NLS_NUMERIC_CHARACTERS`, and reads text into these types by the same settings. The pushdown request carries none of them. DataFusion always uses ISO dates, a `T` timestamp separator, and a `.` decimal point.
 * An integer (`DECIMAL(p,0)`) has the same text in every session. A BOOLEAN is `TRUE` or `FALSE` in every session; the scan renders it through a CASE, because DataFusion writes lowercase.
 * Exasol converts text implicitly in a comparison, `IN`, `BETWEEN`, `CASE`, `COALESCE`, `NVL`, `GREATEST`, `LEAST`, `NULLIF`, and the argument of a non-text function or operator. It takes text without conversion in `LIKE`, `||`, string-function text arguments, text-to-text comparisons and CASTs, and a format or unit parameter.
-* Every path that renders SQL for the scan goes through one `ScanTranslator` that holds the request's column types: the WHERE filter, the select list, GROUP BY keys, aggregate arguments, `COUNT(DISTINCT expr)`, the broadcast join condition and filter, and each N-scan leg filter. A HAVING or ORDER BY aggregate therefore renders exactly as it did at detection.
+* Every path that renders SQL for the scan goes through one translator that holds the request's column types: the WHERE filter, the select list, GROUP BY keys, aggregate arguments, `COUNT(DISTINCT expr)`, the broadcast join condition and filter, and each N-scan leg filter.
 * A declined expression takes the path's existing fallback: a WHERE filter runs in the qualified wrapper (`pushdown/pushdown-declined-filter-self-apply`), a select item widens the projection to the full base row, an aggregate or group key routes to the qualified wrapper, and a join condition or filter loses the broadcast plan.
-* Iceberg spec compliance: checked, not engaged. This feature decides where an expression runs. It changes no type mapping, field resolution, or pruning (Apache Iceberg table spec, "Schemas and Data Types").
 
 ## Scenarios
 
@@ -44,7 +43,9 @@ The scan computes an expression only when DataFusion returns what native Exasol 
 * *GIVEN* a CAST of a text value to a `VARCHAR(n)` shorter than its source, or to an `ASCII` target
 * *WHEN* the scan computes it
 * *THEN* the scan SHALL keep the whole value, with no length or ASCII check
-* *AND* `docs/semantic-differences.md` SHALL document the differences from native Exasol: a value that does not fit returns a result in a filter where Exasol fails, trailing spaces beyond `n` that Exasol cuts stay, and a select item over such a value fails at the emit
+* *AND* a value that does not fit SHALL return a result in a filter, where native Exasol fails
+* *AND* trailing spaces beyond `n`, which native Exasol cuts, SHALL stay
+* *AND* a select item over a value that does not fit SHALL fail at the emit
 
 ### Scenario: INSTR and LOCATE with a start position run in Exasol
 

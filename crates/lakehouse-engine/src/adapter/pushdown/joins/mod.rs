@@ -169,13 +169,14 @@ pub(super) async fn plan_join(
 
     if sides.iter().any(|s| s.files.is_empty()) {
         let combined = ColumnTypes::concat(sides.iter().map(|side| &side.column_types));
-        let (projection, widened) = project_columns(pushdown, ScanTranslator::new(&combined))?;
+        let scan = ScanTranslator::new(&combined);
+        let (projection, widened) = project_columns(pushdown, scan)?;
         let cols_per_leg = sides.iter().map(|side| side.column_types.clone()).collect();
         return empty_result_sql(
             pushdown,
             &projection,
             widened,
-            ScanTranslator::new(&combined),
+            scan,
             &EmptyRelation::join(join, cols_per_leg),
         );
     }

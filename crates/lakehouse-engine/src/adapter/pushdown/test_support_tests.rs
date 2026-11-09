@@ -27,13 +27,13 @@ pub(crate) use vs_expression::test_support::{
 };
 
 /// Renders through the typed scan gate with no column type known.
-pub(crate) fn render_df_filter_safe(filter: &Json) -> Option<String> {
+pub(crate) fn untyped_scan_filter(filter: &Json) -> Option<String> {
     vs_expression::render_scan_filter(filter, &ColumnTypes::default())
         .ok()
         .flatten()
 }
 
-pub(crate) fn render_expression_safe(expr: &Json) -> Option<String> {
+pub(crate) fn untyped_scan_expression(expr: &Json) -> Option<String> {
     vs_expression::render_scan_expression(expr, &ColumnTypes::default())
         .ok()
         .map(|fragment| fragment.sql)
@@ -42,6 +42,23 @@ pub(crate) fn render_expression_safe(expr: &Json) -> Option<String> {
 /// The scan's typed filter SQL, `None` when it declines or the filter is trivially true.
 pub(crate) fn scan_filter_sql(filter: &Json, col_types: &ColumnTypes) -> Option<String> {
     ScanTranslator::new(col_types).filter(filter).ok().flatten()
+}
+
+/// The deduplicated partial plans of a single-group select list, whatever their types.
+pub(crate) fn ordinary_plans(
+    items: &[single_group_agg::SingleGroupItem],
+    scan: ScanTranslator<'_>,
+) -> Vec<crate::scan::spec::AggregatePlan> {
+    single_group_agg::fold_single_group_plans(items, &[], scan).0
+}
+
+/// The plans' exact types, `None` when any slot has none.
+pub(crate) fn single_group_plan_types(
+    select_types: &[ExasolType],
+    items: &[single_group_agg::SingleGroupItem],
+    scan: ScanTranslator<'_>,
+) -> Option<Vec<ExasolType>> {
+    SingleGroupPlans::new(items, select_types, scan).map(|plans| plans.types)
 }
 
 /// A translator that knows no column type.
@@ -1520,6 +1537,12 @@ impl PushdownRequestBuilder {
 
     pub(crate) fn limit(self, num_elements: u64) -> Self {
         self.field("limit", serde_json::json!({"numElements": num_elements}))
+    }
+
+    /// The raw `selectListDataTypes` value, `None` to omit the key.
+    pub(crate) fn select_list_data_types(mut self, raw: Option<Json>) -> Self {
+        self.raw_select_list_data_types = Some(raw);
+        self
     }
 
     /// Any other `pushdownRequest` key, such as `having`, `from`, or `type`.

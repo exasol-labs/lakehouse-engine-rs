@@ -13,7 +13,7 @@ use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionConfig;
 use lakehouse_engine::adapter::pushdown::{
     AggregateMergeInputs, ColumnTypes, ProjectedColumn, PushdownRequest, ScanTranslator,
-    build_scan_driving_sql, detect_aggregates, ordinary_plans,
+    SingleGroupPlans, build_scan_driving_sql, detect_aggregates,
 };
 use lakehouse_engine::scan::spec::{
     AggKind, ColumnRef, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, ProjectionItem,
@@ -354,7 +354,9 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
     let scan = ScanTranslator::new(&columns);
     let items = detect_aggregates(&pushdown, scan)
         .expect("SUM(col * col) must decompose to an aggregate plan, not a row scan");
-    let plans = ordinary_plans(&items, scan);
+    let plans = SingleGroupPlans::new(&items, pushdown.select_types(), scan)
+        .expect("a top-level SUM takes its declared type")
+        .plans;
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0].kind, AggKind::Sum);
     assert!(

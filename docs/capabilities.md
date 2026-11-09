@@ -101,8 +101,6 @@ A WHERE that holds such a condition runs entirely in Exasol SQL, prunes no files
 | `TO_DATE(s)` | `TO_DATE(s, 'YYYY-MM-DD')` |
 | `MAX(CAST(d AS VARCHAR(10)))` | `CAST(MAX(d) AS VARCHAR(10))` |
 
-`YEAR(d) = 2024` runs in the scan but prunes no files. The date range does both.
-
 ## Aggregation
 
 When DataFusion can render the aggregates and group keys, each shard computes a partial aggregate and Exasol SQL merges them. Otherwise the scan only filters and projects, and Exasol SQL aggregates the scanned rows. `HAVING` always runs in Exasol SQL, over the merged aggregates.

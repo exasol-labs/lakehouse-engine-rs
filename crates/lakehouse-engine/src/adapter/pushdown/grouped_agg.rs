@@ -7,7 +7,7 @@ use vs_expression::{ColumnNode, SqlFragment, render_exasol_fragment};
 
 use super::scalar_over_agg::{
     cast_merge_items, classify_scalar_over_aggregate, col_type_for, fold_aggregate_plan,
-    nested_aggregate_type, parse_agg_item, partial_column_type, render_scalar_over_merge,
+    fold_nested_plans, parse_agg_item, partial_column_type, render_scalar_over_merge,
     with_stat_grand_means,
 };
 use super::support::{
@@ -42,7 +42,7 @@ pub enum GroupedSelectItem {
     ScalarOverAggregate { select_index: usize, node: Json },
 }
 
-pub(super) fn select_item_index(item: &GroupedSelectItem) -> usize {
+fn select_item_index(item: &GroupedSelectItem) -> usize {
     match item {
         GroupedSelectItem::GroupKey { select_index, .. }
         | GroupedSelectItem::Aggregate { select_index, .. }
@@ -60,6 +60,8 @@ pub struct GroupedAggregateDetection {
     pub plans: Vec<AggregatePlan>,
     /// Aligned 1:1 with `plans`, not with the `selectList`.
     pub plan_types: Vec<ExasolType>,
+    /// Aligned 1:1 with `plans`: each merged aggregate cast to its native type.
+    pub merged: Vec<String>,
     pub select_items: Vec<GroupedSelectItem>,
 }
 
@@ -148,13 +150,8 @@ pub fn detect_group_by_aggregates(
                 }
                 // Otherwise a scalar wrapping aggregates; `None` declines the whole grouped
                 // detection, routing to the qualified wrapper (never a bare row scan).
-                for (plan, agg) in classify_scalar_over_aggregate(item, scan)? {
-                    let derived = nested_aggregate_type(&agg, &plan, scan);
-                    let slot = fold_aggregate_plan(&mut plans, &mut plan_types, plan, None);
-                    if plan_types[slot].is_none() {
-                        plan_types[slot] = derived;
-                    }
-                }
+                let nested = classify_scalar_over_aggregate(item, scan)?;
+                fold_nested_plans(&mut plans, &mut plan_types, &nested, scan);
                 select_items.push(GroupedSelectItem::ScalarOverAggregate {
                     select_index,
                     node: item.clone(),
@@ -166,21 +163,21 @@ pub fn detect_group_by_aggregates(
     // Typed here, before the shape is chosen, so a key or nested aggregate without an exact
     // type declines the split, and HAVING and ORDER BY can reference typed `GK_*` keys.
     let group_key_types = group_key_exasol_types(pushdown, &key_fragments, &select_items)?;
+    let plan_types: Vec<ExasolType> = plan_types.into_iter().collect::<Option<_>>()?;
+    let merged = cast_merge_items(&plans, &plan_types, scan.columns());
     Some(GroupedAggregateDetection {
         group_keys,
         group_key_types,
         plans,
-        plan_types: plan_types.into_iter().collect::<Option<_>>()?,
+        plan_types,
+        merged,
         select_items,
     })
 }
 
-/// A projected key takes `selectListDataTypes` (matched by index, not rendered SQL, and
-/// authoritative since Exasol type-checks it). An unprojected key takes its fragment's type: a
-/// CAST's or a bare column's. A constant key travels as [`CONSTANT_KEY_EMIT_TYPE`]. `None` for any
-/// other key: text transport would skip the emit's value checks and could not be referenced typed
-/// by HAVING (#476, #551).
-pub(super) fn group_key_exasol_types(
+/// A projected key takes its `selectListDataTypes` entry, an unprojected one its CAST's or column's
+/// type, a constant [`CONSTANT_KEY_EMIT_TYPE`]. `None` for any other key (#476, #551).
+fn group_key_exasol_types(
     pushdown: &PushdownRequest,
     group_keys: &[SqlFragment],
     select_items: &[GroupedSelectItem],
@@ -286,10 +283,10 @@ pub(super) enum GroupedOrderBy {
 pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
     shards: &[Vec<E>],
-    group_keys: &[String],
     group_key_types: &[ExasolType],
     aggregates: &[AggregatePlan],
     aggregate_types: &[ExasolType],
+    merge_items: &[String],
     select_items: &[GroupedSelectItem],
     select_types: &[ExasolType],
     limit: Option<u64>,
@@ -300,9 +297,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     having: Option<&str>,
     order_by: Option<&str>,
 ) -> Option<String> {
-    // A key travels in its declared type, so the merge groups typed values and needs no cast
-    // that reads text by the session's NLS settings (#587).
-    debug_assert_eq!(group_keys.len(), group_key_types.len());
+    // Keys travel typed, so the merge groups values without reading text by NLS settings.
     let gk_emits: Vec<String> = group_key_types
         .iter()
         .enumerate()
@@ -315,8 +310,6 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
         .cloned()
         .collect();
     let emits = all_emits.join(", ");
-
-    let merge_items = cast_merge_items(aggregates, aggregate_types, scan.columns());
 
     // Exasol validates this SELECT positionally, so it follows `selectList` order,
     // not the inner keys-first fan-out order.
@@ -335,13 +328,13 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
             )),
             GroupedSelectItem::Constant { projection, .. } => Some(projection.clone()),
             GroupedSelectItem::ScalarOverAggregate { node, .. } => {
-                render_scalar_over_merge(node, aggregates, &merge_items, scan)
+                render_scalar_over_merge(node, aggregates, merge_items, scan)
             }
         })
         .collect::<Option<Vec<_>>>()?;
     let outer_select_str = output_select_list(fragments, select_types)?.join(", ");
 
-    let outer_group_by: Vec<String> = (0..group_keys.len()).map(group_key_column).collect();
+    let outer_group_by: Vec<String> = (0..group_key_types.len()).map(group_key_column).collect();
     let outer_group_by_str = outer_group_by.join(", ");
 
     // The common blob is shared by all shards, so building it with `limit = None`
