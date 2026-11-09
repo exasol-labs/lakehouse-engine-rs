@@ -490,8 +490,13 @@ async fn resolve_glue(
     storage: &StorageBackend,
     filter: Option<&Json>,
 ) -> Result<ResolvedScan, String> {
-    let session = GlueCatalogSession::new(glue_address, storage.clone(), sigv4_creds())
-        .expect("the CONNECTION region signs the session");
+    let session = GlueCatalogSession::new(
+        glue_address,
+        storage.clone(),
+        sigv4_creds(),
+        crate::adapter::DEFAULT_METADATA_READ_CONCURRENCY,
+    )
+    .expect("the CONNECTION region signs the session");
     let load = CatalogParquetTable::from_glue(&session, table, storage);
     user_outcome(resolve_declared(load, GLUE_TABLE_NAME, table, filter).await)
 }

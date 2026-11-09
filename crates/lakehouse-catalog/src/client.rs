@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 
 use exasol_udf_sdk::error::UdfError;
@@ -13,7 +14,7 @@ use tokio::sync::OnceCell;
 
 use crate::ConnectionCreds;
 use crate::catalog_http::CatalogRequestError;
-use crate::namespace::{CATALOG_REQUEST_CONCURRENCY, list_namespace_tables};
+use crate::namespace::list_namespace_tables;
 use crate::session::{CatalogSession, load_table_schema_metadata};
 
 /// Namespace carried as segments, never a joined dotted string: a segment may
@@ -227,6 +228,7 @@ pub struct IcebergRestCatalogClient {
     catalog_uri: String,
     creds: ConnectionCreds,
     catalog_prefix: Option<String>,
+    metadata_read_concurrency: NonZeroUsize,
     session: OnceCell<CatalogSession>,
 }
 
@@ -236,13 +238,19 @@ impl IcebergRestCatalogClient {
         catalog_uri: String,
         creds: ConnectionCreds,
         catalog_prefix: Option<String>,
+        metadata_read_concurrency: NonZeroUsize,
     ) -> Self {
         Self {
             catalog_uri,
             creds,
             catalog_prefix,
+            metadata_read_concurrency,
             session: OnceCell::new(),
         }
+    }
+
+    pub fn metadata_read_concurrency(&self) -> NonZeroUsize {
+        self.metadata_read_concurrency
     }
 
     /// The client's one session, resolved by the first call, so every later request reuses its
@@ -307,7 +315,13 @@ impl CatalogClient for IcebergRestCatalogClient {
         let namespace = namespace.to_vec();
         Box::pin(async move {
             let session = self.session().await?;
-            let idents = list_namespace_tables(session, &namespace, &self.creds).await?;
+            let idents = list_namespace_tables(
+                session,
+                &namespace,
+                &self.creds,
+                self.metadata_read_concurrency,
+            )
+            .await?;
             Ok(idents.iter().map(neutral_ident).collect())
         })
     }
@@ -327,7 +341,7 @@ impl CatalogClient for IcebergRestCatalogClient {
             let session = self.session().await?;
             let admissions: Vec<TableAdmission> = stream::iter(idents)
                 .map(|ident| async move { self.admit_on_session(session, &ident).await })
-                .buffered(CATALOG_REQUEST_CONCURRENCY)
+                .buffered(self.metadata_read_concurrency.get())
                 .try_collect()
                 .await?;
             Ok(admissions.into_iter().collect())

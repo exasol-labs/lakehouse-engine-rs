@@ -47,6 +47,7 @@ async fn resolve(
         &(Arc::clone(probe) as Arc<dyn ObjectStore>),
         &root(),
         directory_options(merge_mode, true),
+        crate::adapter::DEFAULT_METADATA_READ_CONCURRENCY,
     )
     .await
 }
@@ -403,6 +404,7 @@ async fn hive_partitioning_off_parses_no_segment_and_checks_no_collision() {
         &(probe as Arc<dyn ObjectStore>),
         &root(),
         directory_options(MergeMode::FoldEveryFile, false),
+        crate::adapter::DEFAULT_METADATA_READ_CONCURRENCY,
     )
     .await
     .expect("no keys, so no collision check");

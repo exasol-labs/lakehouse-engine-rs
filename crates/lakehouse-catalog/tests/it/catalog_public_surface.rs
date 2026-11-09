@@ -113,6 +113,7 @@ fn both_clients_are_catalog_client_trait_objects() {
         "http://catalog".into(),
         connection_creds(),
         None,
+        std::num::NonZeroUsize::MIN,
     ));
     let unity: Box<dyn CatalogClient> =
         Box::new(UnityCatalogSession::new("http://unity", connection_creds()));
@@ -366,13 +367,18 @@ fn unity_catalog_public_items_are_reachable() {
 
 #[test]
 fn glue_additions_are_reachable_through_neutral_types_only() {
-    let new: fn(&str, StorageBackend, ConnectionCreds) -> Result<GlueCatalogSession, UdfError> =
-        GlueCatalogSession::new;
+    let new: fn(
+        &str,
+        StorageBackend,
+        ConnectionCreds,
+        std::num::NonZeroUsize,
+    ) -> Result<GlueCatalogSession, UdfError> = GlueCatalogSession::new;
     let storage = StorageBackend::S3(StorageProps::default());
     let session = new(
         "https://glue.eu-west-1.amazonaws.com",
         storage.clone(),
         connection_creds(),
+        std::num::NonZeroUsize::MIN,
     )
     .expect("the Glue endpoint names its signing region");
 

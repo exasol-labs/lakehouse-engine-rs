@@ -47,7 +47,7 @@ An Exasol user registers every Iceberg table in a configured namespace as a virt
 
 * *GIVEN* an Iceberg REST namespace whose tables and descendant namespaces outnumber the enumeration's request cap
 * *WHEN* the adapter enumerates it at `createVirtualSchema` or `REFRESH`
-* *THEN* the adapter SHALL list the namespaces of one depth concurrently and load the listed tables concurrently, at most 16 namespaces or 16 tables at a time, and SHALL declare every table with its own columns
+* *THEN* the adapter SHALL list the namespaces of one depth concurrently and load the listed tables concurrently, at most `METADATA_READ_CONCURRENCY` namespaces or tables at a time, and SHALL declare every table with its own columns
 * *AND* every table and namespace listing SHALL request each following page with the previous page's `next-page-token` until a page carries none
 * *AND* each enumeration `loadTable` SHALL request `snapshots=refs` and SHALL NOT send `X-Iceberg-Access-Delegation`, because enumeration reads only the current schema, while the Iceberg REST OpenAPI default for `snapshots` is `all` and a delegation header asks the catalog to mint storage credentials
 
