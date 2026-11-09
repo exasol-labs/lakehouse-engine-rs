@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::*;
+use std::time::Duration;
 
 #[test]
 fn parse_table_ident_splits_namespace_table() {
@@ -122,4 +123,61 @@ async fn a_refused_catalog_connection_names_its_cause_signed_or_not() {
             && msg.contains(CLOSED_PORT_CAUSE),
         "{msg}"
     );
+}
+
+/// Answers `parent` listings with `namespaces` whatever the parent, and one table `t` per namespace.
+async fn spawn_parent_ignoring_catalog(namespaces: &'static str) -> String {
+    let (catalog_uri, _) = spawn_server("application/json", move |request| {
+        let path = request.split(' ').nth(1).unwrap_or_default();
+        if path.ends_with("/v1/config") {
+            (200, r#"{"defaults":{},"overrides":{}}"#.into())
+        } else if let Some(ns) = path
+            .strip_prefix("/v1/namespaces/")
+            .and_then(|rest| rest.strip_suffix("/tables"))
+        {
+            let parts: Vec<&str> = ns.split("%1F").collect();
+            let identifiers = serde_json::json!([{ "namespace": parts, "name": "t" }]);
+            (
+                200,
+                serde_json::json!({ "identifiers": identifiers }).to_string(),
+            )
+        } else {
+            (200, format!(r#"{{"namespaces":{namespaces}}}"#))
+        }
+    })
+    .await;
+    catalog_uri
+}
+
+/// Scenario: Enumeration descends only into direct children of the listed namespace
+#[tokio::test]
+async fn listing_descends_only_into_direct_children_when_the_catalog_ignores_parent() {
+    for (case, namespaces, expected) in [
+        ("top level only", r#"[["ds"]]"#, &["ds.t"][..]),
+        (
+            "every level and lookalikes",
+            r#"[["ds"],["ds","a"],["ds","a","b"],["ds","a","ds"],["dsx"],["other","ds"]]"#,
+            &["ds.a.b.t", "ds.a.ds.t", "ds.a.t", "ds.t"][..],
+        ),
+    ] {
+        let catalog_uri = spawn_parent_ignoring_catalog(namespaces).await;
+        let creds = base_creds();
+        let session = CatalogSession::resolve(&catalog_uri, &creds.warehouse, &creds)
+            .await
+            .expect("the session resolves against the stub");
+
+        let root = ["ds".to_string()];
+        let listing = list_namespace_tables(&session, &root, &creds);
+        let tables = tokio::time::timeout(Duration::from_secs(5), listing)
+            .await
+            .unwrap_or_else(|_| panic!("{case}: the listing must terminate"))
+            .unwrap_or_else(|e| panic!("{case}: the listing must succeed: {e}"));
+
+        let mut names: Vec<String> = tables
+            .iter()
+            .map(|t| format!("{}.{}", t.namespace().join("."), t.name()))
+            .collect();
+        names.sort();
+        assert_eq!(names, expected, "{case}");
+    }
 }

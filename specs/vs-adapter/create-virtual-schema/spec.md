@@ -51,6 +51,13 @@ An Exasol user registers every Iceberg table in a configured namespace as a virt
 * *AND* every table and namespace listing SHALL request each following page with the previous page's `next-page-token` until a page carries none
 * *AND* each enumeration `loadTable` SHALL request `snapshots=refs` and SHALL NOT send `X-Iceberg-Access-Delegation`, because enumeration reads only the current schema, while the Iceberg REST OpenAPI default for `snapshots` is `all` and a delegation header asks the catalog to mint storage credentials
 
+### Scenario: Enumeration descends only into direct children of the listed namespace
+
+* *GIVEN* an Iceberg REST catalog that answers `GET /namespaces?parent=<ns>` with namespaces that are not direct children of `<ns>`, such as `<ns>` itself or every top-level namespace
+* *WHEN* the adapter enumerates the configured namespace
+* *THEN* the adapter SHALL descend only into the listed namespaces that extend `<ns>` by exactly one level, because the Iceberg REST `listNamespaces` operation states that `GET /namespaces?parent=accounting` "must return a namespace, ["accounting", "tax"] only"
+* *AND* the enumeration SHALL finish and declare each table once
+
 ### Scenario: One non-Iceberg table in the namespace is skipped rather than aborting the schema
 
 * *GIVEN* a `createVirtualSchema` request whose configured namespace contains a mix of Iceberg tables and at least one non-Iceberg table (e.g. an AWS Glue Hive external table) that the catalog's table listing returns but whose per-table `loadTable` request returns HTTP 404, the Iceberg REST OpenAPI `NoSuchTableException` response ("table to load does not exist"), which AWS Glue returns as `NoSuchIcebergTableException: Input table is not an iceberg table`
