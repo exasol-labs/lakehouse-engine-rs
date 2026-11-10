@@ -1363,3 +1363,74 @@ fn vended_adls_backend_holds_the_sas_state_never_the_account_key_state() {
         StorageBackend::S3(_) => panic!("an abfss:// location must not resolve to S3"),
     }
 }
+
+const S3_ANCHOR: &str = "s3://bucket/db/t";
+const EXPIRES_AT_MS: &str = "1700000000000";
+
+/// The S3 keys of a covering `storage_credentials` entry, with `key` replaced by `value`, or
+/// removed when `value` is `None`.
+fn s3_entry_with(key: &str, value: Option<&str>) -> iceberg_catalog_rest::LoadTableResult {
+    let mut entry = vec![
+        ("s3.access-key-id", VENDED_AK),
+        ("s3.secret-access-key", VENDED_SK),
+        ("s3.session-token", VENDED_TOK),
+        ("s3.endpoint", "https://storage.example"),
+        ("s3.session-token-expires-at-ms", EXPIRES_AT_MS),
+    ];
+    entry.retain(|(entry_key, _)| *entry_key != key);
+    if let Some(value) = value {
+        entry.push((key, value));
+    }
+    make_load_table_result(
+        Some(vec![(S3_ANCHOR, entry)]),
+        vec![
+            ("s3.access-key-id", STATIC_AK),
+            ("s3.secret-access-key", STATIC_SK),
+        ],
+    )
+}
+
+#[test]
+fn vended_s3_credentials_are_the_selected_source_with_its_optional_values_and_expiry() {
+    let full = vended_s3_credentials(&s3_entry_with("", None), S3_ANCHOR).unwrap();
+    let flat = vended_s3_credentials(&vended_result_flat_config(), S3_ANCHOR).unwrap();
+
+    assert_eq!(
+        (full.access_key_id.as_str(), full.secret_access_key.as_str()),
+        (VENDED_AK, VENDED_SK)
+    );
+    assert_eq!(full.session_token.as_deref(), Some(VENDED_TOK));
+    assert_eq!(full.endpoint.as_deref(), Some("https://storage.example"));
+    assert_eq!(full.expires_at_ms, Some(1_700_000_000_000));
+    assert_eq!(flat.access_key_id, VENDED_AK);
+    assert_eq!((flat.endpoint, flat.expires_at_ms), (None, None));
+}
+
+#[test]
+fn vended_s3_credentials_without_a_key_or_a_readable_expiry_are_refused_naming_the_key() {
+    for (key, value) in [
+        ("s3.access-key-id", None),
+        ("s3.secret-access-key", Some("")),
+        ("s3.session-token-expires-at-ms", Some("tomorrow")),
+    ] {
+        let error = vended_s3_credentials(&s3_entry_with(key, value), S3_ANCHOR).unwrap_err();
+
+        assert!(matches!(error, UdfError::User(_)), "{error:?}");
+        let message = error.to_string();
+        assert_refused(&message, S3_ANCHOR, &[key]);
+        assert!(!message.contains("tomorrow"), "{message}");
+    }
+}
+
+#[test]
+fn vended_s3_credentials_debug_shows_no_value() {
+    let credentials = vended_s3_credentials(&s3_entry_with("", None), S3_ANCHOR).unwrap();
+
+    let shown = format!("{credentials:?}");
+
+    assert_names_no_credential_value(&shown);
+    assert!(
+        !shown.contains("storage.example") && !shown.contains(EXPIRES_AT_MS),
+        "{shown}"
+    );
+}

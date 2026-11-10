@@ -1,4 +1,5 @@
 use super::*;
+use crate::expiring::system_clock;
 use crate::redaction::{redact_credentials, redact_secret_values};
 use crate::test_support::*;
 
@@ -49,12 +50,13 @@ async fn oauth2_grant_built_from_client_credentials() {
     });
 
     let http = CatalogHttp::new();
-    let token = oauth2_client_credentials_grant(&http, &catalog_uri, &creds)
+    let auth = resolve_catalog_auth(&http, &catalog_uri, &creds, system_clock())
         .await
         .expect("grant must succeed");
 
     assert_eq!(
-        token, OAUTH_ACCESS_TOKEN,
+        auth.held_bearers(),
+        [OAUTH_ACCESS_TOKEN],
         "returned access_token must match server response"
     );
 }
@@ -66,9 +68,10 @@ async fn oauth2_grant_transport_failure_names_its_cause() {
     creds.client_secret = Some(CLIENT_SECRET.into());
 
     let http = CatalogHttp::with_policy(SHORT_POLICY);
-    let err = oauth2_client_credentials_grant(&http, CLOSED_PORT_URI, &creds)
+    let err = resolve_catalog_auth(&http, CLOSED_PORT_URI, &creds, system_clock())
         .await
-        .expect_err("a closed token endpoint must fail the grant");
+        .err()
+        .expect("a closed token endpoint must fail the grant");
 
     let msg = err.to_string();
     assert!(
@@ -85,39 +88,14 @@ async fn an_oauth2_token_url_without_a_scheme_names_the_parse_cause() {
     creds.client_secret = Some(CLIENT_SECRET.into());
     creds.oauth2_server_uri = Some("not-a-url".into());
 
-    let err = oauth2_client_credentials_grant(&CatalogHttp::new(), CLOSED_PORT_URI, &creds)
+    let err = resolve_catalog_auth(&CatalogHttp::new(), CLOSED_PORT_URI, &creds, system_clock())
         .await
-        .expect_err("an unparseable token URL must fail the grant");
+        .err()
+        .expect("an unparseable token URL must fail the grant");
 
     let msg = err.to_string();
     assert!(msg.contains("relative URL without a base"), "{msg}");
     assert!(!msg.contains(CLIENT_SECRET), "{msg}");
-}
-
-#[tokio::test]
-async fn oauth2_grant_errors_for_the_validation_rejected_shape() {
-    let mut creds = creds_no_auth();
-    creds.token = Some(BEARER_TOK.into());
-    creds.client_id = Some("client-id-sentinel".into());
-    creds.client_secret = Some(CLIENT_SECRET.into());
-
-    let http = CatalogHttp::new();
-    // A closed port: re-deriving pair completeness would yield a transport error instead.
-    let err = oauth2_client_credentials_grant(&http, "http://127.0.0.1:1", &creds)
-        .await
-        .expect_err("a validation-rejected token+pair shape must not reach the token endpoint");
-
-    let UdfError::User(msg) = err else {
-        panic!("an unresolvable auth mode must surface as a user error, got {err:?}");
-    };
-    assert!(
-        msg.contains("complete client_id/client_secret pair"),
-        "the grant must refuse on the mode owner's answer, not on a transport error: {msg}"
-    );
-    assert!(
-        !msg.contains(CLIENT_SECRET),
-        "the refusal must not leak the client secret: {msg}"
-    );
 }
 
 /// Scenario: Both catalog kinds redact catalog request errors through one credential set
@@ -136,7 +114,7 @@ fn redact_catalog_auth_error_strips_client_id_oauth_uri_scope() {
         "catalog error: client_id={CLIENT_ID_SENTINEL} uri={OAUTH_URI_SENTINEL} scope={SCOPE_SENTINEL}"
     );
 
-    let redacted = redact_catalog_auth_error(&raw, &creds, None);
+    let redacted = redact_catalog_auth_error(&raw, &creds, &[]);
 
     assert!(
         !redacted.contains(CLIENT_ID_SENTINEL),
@@ -160,7 +138,8 @@ fn redact_catalog_auth_error_strips_a_bearer_that_contains_a_credential_field() 
     let mut creds = creds_no_auth();
     creds.scope = Some("all-apis".into());
 
-    let redacted = redact_catalog_auth_error(&format!("rejected {BEARER}"), &creds, Some(BEARER));
+    let redacted =
+        redact_catalog_auth_error(&format!("rejected {BEARER}"), &creds, &[BEARER.to_string()]);
 
     assert_eq!(redacted, "rejected [REDACTED]");
 }
@@ -173,7 +152,7 @@ fn auth_error_sites_apply_the_value_pass_first() {
     creds.token = Some(SAS_SHAPED_TOKEN.into());
 
     let raw = format!("upstream error echoed {SAS_SHAPED_TOKEN}");
-    let redacted = redact_catalog_auth_error(&raw, &creds, None);
+    let redacted = redact_catalog_auth_error(&raw, &creds, &[]);
 
     assert!(
         !redacted.contains(SAS_SHAPED_TOKEN),
@@ -199,9 +178,14 @@ async fn resolve_catalog_auth_selects_one_strategy_per_non_network_shape() {
 
     let mut sigv4_creds = creds_no_auth();
     sigv4_creds.use_sigv4 = true;
-    let auth = resolve_catalog_auth(&http, "https://catalog.example.com", &sigv4_creds)
-        .await
-        .expect("sigv4 resolution must not fail");
+    let auth = resolve_catalog_auth(
+        &http,
+        "https://catalog.example.com",
+        &sigv4_creds,
+        system_clock(),
+    )
+    .await
+    .expect("sigv4 resolution must not fail");
     assert!(
         matches!(&auth, CatalogAuth::Sigv4 { region } if region == "us-east-1"),
         "use_sigv4 must resolve to CatalogAuth::Sigv4 carrying the stated region"
@@ -209,9 +193,14 @@ async fn resolve_catalog_auth_selects_one_strategy_per_non_network_shape() {
 
     let mut bearer_creds = creds_no_auth();
     bearer_creds.token = Some(BEARER_TOK.into());
-    let auth = resolve_catalog_auth(&http, "https://catalog.example.com", &bearer_creds)
-        .await
-        .expect("bearer resolution must not fail");
+    let auth = resolve_catalog_auth(
+        &http,
+        "https://catalog.example.com",
+        &bearer_creds,
+        system_clock(),
+    )
+    .await
+    .expect("bearer resolution must not fail");
     match auth {
         CatalogAuth::Bearer(token) => assert_eq!(
             token, BEARER_TOK,
@@ -221,9 +210,14 @@ async fn resolve_catalog_auth_selects_one_strategy_per_non_network_shape() {
     }
 
     let no_auth_creds = creds_no_auth();
-    let auth = resolve_catalog_auth(&http, "https://catalog.example.com", &no_auth_creds)
-        .await
-        .expect("no-auth resolution must not fail");
+    let auth = resolve_catalog_auth(
+        &http,
+        "https://catalog.example.com",
+        &no_auth_creds,
+        system_clock(),
+    )
+    .await
+    .expect("no-auth resolution must not fail");
     assert!(
         matches!(auth, CatalogAuth::None),
         "no auth fields supplied must resolve to CatalogAuth::None"
@@ -242,8 +236,13 @@ async fn sigv4_auth_refuses_without_signing_region() {
     let http = CatalogHttp::new();
     let creds = sigv4_creds_stating_region("");
 
-    let Err(UdfError::User(msg)) =
-        resolve_catalog_auth(&http, "https://catalog.example.com/iceberg", &creds).await
+    let Err(UdfError::User(msg)) = resolve_catalog_auth(
+        &http,
+        "https://catalog.example.com/iceberg",
+        &creds,
+        system_clock(),
+    )
+    .await
     else {
         panic!("a SigV4 CONNECTION with no signing region must be refused as a user error");
     };
@@ -259,7 +258,7 @@ async fn resolve_catalog_auth_is_unauthenticated_for_the_validation_rejected_sha
     creds.client_id = Some("client-id-sentinel".into());
     creds.client_secret = Some(CLIENT_SECRET.into());
 
-    let auth = resolve_catalog_auth(&http, "http://127.0.0.1:1", &creds)
+    let auth = resolve_catalog_auth(&http, "http://127.0.0.1:1", &creds, system_clock())
         .await
         .expect(
             "a validation-rejected token+pair shape must resolve without contacting the network",

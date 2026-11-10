@@ -1,15 +1,28 @@
 use super::*;
 use crate::catalog_http::CatalogHttp;
-use crate::test_support::{CLOSED_PORT_CAUSE, CLOSED_PORT_URI, base_creds};
+use crate::expiring::EpochClock;
+use crate::test_support::{CLOSED_PORT_CAUSE, CLOSED_PORT_URI, base_creds, clock_reading};
 use crate::unity::mock_server::spawn;
 use crate::{CatalogClient, UnityCatalogSession};
 use exasol_udf_sdk::error::UdfError;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const MINTED_TOKEN: &str = "MINTED-ACCESS-TOKEN";
 const OAUTH_SECRET_SENTINEL: &str = "OAUTH_CLIENT_SECRET_SENTINEL_VALUE";
+
+/// A token source for the grant at `token_url`, its holder reading `clock`.
+fn token_source(token_url: String, clock: EpochClock) -> OAuthTokenSource {
+    OAuthTokenSource {
+        http: CatalogHttp::new(),
+        token_url,
+        client_id: "client-abc".to_string(),
+        client_secret: "secret-xyz".to_string(),
+        scope: "all-apis".to_string(),
+        token: ExpiringCredential::new(Duration::from_secs(OAUTH_REFRESH_SKEW_SECS), clock),
+    }
+}
 
 #[tokio::test]
 async fn pat_is_applied_as_bearer_verbatim() {
@@ -104,17 +117,11 @@ async fn oauth_token_is_cached_and_refreshed_before_expiry() {
     })
     .await;
 
-    let ticks = Arc::new(Mutex::new(Instant::now()));
-    let clock_ticks = ticks.clone();
-    let source = OAuthTokenSource {
-        http: CatalogHttp::new(),
-        token_url: format!("{}/oidc/v1/token", server.base_url),
-        client_id: "client-abc".to_string(),
-        client_secret: "secret-xyz".to_string(),
-        scope: "all-apis".to_string(),
-        cache: Mutex::new(None),
-        clock: Arc::new(move || *clock_ticks.lock().unwrap()),
-    };
+    let ticks = Arc::new(AtomicU64::new(0));
+    let source = token_source(
+        format!("{}/oidc/v1/token", server.base_url),
+        clock_reading(&ticks),
+    );
 
     let first = source.bearer().await.expect("first mint");
     let reused = source.bearer().await.expect("cached reuse");
@@ -129,7 +136,7 @@ async fn oauth_token_is_cached_and_refreshed_before_expiry() {
     );
 
     // Expiry 120s minus 60s skew: refresh point is +60s.
-    *ticks.lock().unwrap() += Duration::from_secs(61);
+    ticks.fetch_add(61_000, Ordering::SeqCst);
     let refreshed = source.bearer().await.expect("refresh mint");
     assert_eq!(
         grants.load(Ordering::SeqCst),
@@ -148,15 +155,7 @@ async fn oauth_grant_missing_expires_in_is_a_clear_error() {
         )
     })
     .await;
-    let source = OAuthTokenSource {
-        http: CatalogHttp::new(),
-        token_url: format!("{}/oidc/v1/token", server.base_url),
-        client_id: "client-abc".to_string(),
-        client_secret: "secret-xyz".to_string(),
-        scope: "all-apis".to_string(),
-        cache: Mutex::new(None),
-        clock: Arc::new(Instant::now),
-    };
+    let source = token_source(format!("{}/oidc/v1/token", server.base_url), system_clock());
 
     let err = source
         .bearer()
@@ -181,15 +180,7 @@ async fn oauth_grant_zero_expires_in_is_a_clear_error() {
         )
     })
     .await;
-    let source = OAuthTokenSource {
-        http: CatalogHttp::new(),
-        token_url: format!("{}/oidc/v1/token", server.base_url),
-        client_id: "client-abc".to_string(),
-        client_secret: "secret-xyz".to_string(),
-        scope: "all-apis".to_string(),
-        cache: Mutex::new(None),
-        clock: Arc::new(Instant::now),
-    };
+    let source = token_source(format!("{}/oidc/v1/token", server.base_url), system_clock());
 
     let err = source
         .bearer()
