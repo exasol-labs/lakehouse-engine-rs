@@ -2,19 +2,16 @@
 //! fault injection, and readers for the HTTP requests those servers receive.
 
 use crate::catalog_http::RetryPolicy;
+use crate::expiring::EpochClock;
 use crate::{ConnectionCreds, StorageBackend, StorageProps};
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
-
-pub(crate) use crate::exported_test_support::{
-    clock_reading, header_value, read_request, request_body, spawn_server,
-    spawn_server_with_headers,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 /// The adapter's default; no catalog test depends on how many reads run at once.
 pub(crate) const METADATA_READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
@@ -25,6 +22,12 @@ pub(crate) fn rest_client(
     creds: ConnectionCreds,
 ) -> crate::IcebergRestCatalogClient {
     crate::IcebergRestCatalogClient::new(uri.into(), creds, None, METADATA_READ_CONCURRENCY)
+}
+
+/// A clock that reads `time`, so a test moves it by storing a new epoch millisecond.
+pub(crate) fn clock_reading(time: &Arc<AtomicU64>) -> EpochClock {
+    let time = time.clone();
+    Arc::new(move || time.load(Ordering::SeqCst))
 }
 
 pub(crate) fn base_creds() -> ConnectionCreds {
@@ -115,6 +118,56 @@ pub(crate) async fn spawn_recording_sts(
     spawn_server("text/xml", move |_| (status, body.clone())).await
 }
 
+/// Answers each request, head and body, with the status and body `respond` returns for it,
+/// recording each request in order.
+pub(crate) async fn spawn_server(
+    content_type: &'static str,
+    respond: impl Fn(&str) -> (u16, String) + Send + 'static,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    spawn_server_with_headers(content_type, move |request| {
+        let (status, body) = respond(request);
+        (status, Vec::new(), body)
+    })
+    .await
+}
+
+/// [`spawn_server`], where `respond` also returns extra response headers, such as `Retry-After`.
+pub(crate) async fn spawn_server_with_headers(
+    content_type: &'static str,
+    respond: impl Fn(&str) -> (u16, Vec<(&'static str, String)>, String) + Send + 'static,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let base_uri = format!("http://{}", listener.local_addr().expect("local_addr"));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let request = read_request(&mut stream).await;
+            let (status, headers, body) = respond(&request);
+            recorded.lock().unwrap().push(request);
+            let reason = reqwest::StatusCode::from_u16(status)
+                .ok()
+                .and_then(|code| code.canonical_reason())
+                .unwrap_or("Stub");
+            let extra: String = headers
+                .iter()
+                .map(|(name, value)| format!("{name}: {value}\r\n"))
+                .collect();
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{extra}\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+
+    (base_uri, requests)
+}
+
 /// Answers each request with HTTP 200 headers announcing 100 body bytes, sends 10 of them, and then
 /// holds the connection open without sending more.
 pub(crate) async fn spawn_header_stalling_server() -> String {
@@ -151,8 +204,47 @@ pub(crate) const SHORT_POLICY: RetryPolicy = RetryPolicy {
 /// reqwest's text for a request or body read that reached its read timeout.
 pub(crate) const TIMED_OUT_CAUSE: &str = "operation timed out";
 
+pub(crate) async fn read_request(stream: &mut TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&request[..end]);
+            let length =
+                header_value(&head, "content-length").map_or(0, |n| n.parse().unwrap_or(0));
+            if request.len() >= end + 4 + length {
+                break;
+            }
+        }
+        let read = stream.read(&mut chunk).await.unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+    }
+    String::from_utf8_lossy(&request).into_owned()
+}
+
 pub(crate) fn authorization_header(head: &str) -> Option<&str> {
     header_value(head, "authorization")
+}
+
+/// The value of header `name` in a recorded request, matched
+/// case-insensitively, or `None` when the request did not carry it.
+pub(crate) fn header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+    request
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (header, value) = line.split_once(':')?;
+            header.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+}
+
+/// The body of a recorded request.
+pub(crate) fn request_body(request: &str) -> &str {
+    request.split_once("\r\n\r\n").map_or("", |(_, body)| body)
 }
 
 /// One layer of a synthetic error chain: its text and the cause below it.

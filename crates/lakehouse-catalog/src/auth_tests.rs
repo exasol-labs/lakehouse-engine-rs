@@ -54,10 +54,19 @@ async fn oauth2_grant_built_from_client_credentials() {
         .await
         .expect("grant must succeed");
 
+    let (builder, carried) = auth
+        .apply(reqwest::Client::new().get("http://catalog.example/v1/config"))
+        .await
+        .expect("a seeded token needs no renewal");
     assert_eq!(
-        auth.held_bearers(),
-        [OAUTH_ACCESS_TOKEN],
+        carried.as_deref(),
+        Some(OAUTH_ACCESS_TOKEN),
         "returned access_token must match server response"
+    );
+    let request = builder.build().expect("request builds");
+    assert_eq!(
+        request.headers()["authorization"],
+        format!("Bearer {OAUTH_ACCESS_TOKEN}")
     );
 }
 
@@ -114,7 +123,7 @@ fn redact_catalog_auth_error_strips_client_id_oauth_uri_scope() {
         "catalog error: client_id={CLIENT_ID_SENTINEL} uri={OAUTH_URI_SENTINEL} scope={SCOPE_SENTINEL}"
     );
 
-    let redacted = redact_catalog_auth_error(&raw, &creds, &[]);
+    let redacted = redact_catalog_auth_error(&raw, &creds, None);
 
     assert!(
         !redacted.contains(CLIENT_ID_SENTINEL),
@@ -138,8 +147,7 @@ fn redact_catalog_auth_error_strips_a_bearer_that_contains_a_credential_field() 
     let mut creds = creds_no_auth();
     creds.scope = Some("all-apis".into());
 
-    let redacted =
-        redact_catalog_auth_error(&format!("rejected {BEARER}"), &creds, &[BEARER.to_string()]);
+    let redacted = redact_catalog_auth_error(&format!("rejected {BEARER}"), &creds, Some(BEARER));
 
     assert_eq!(redacted, "rejected [REDACTED]");
 }
@@ -152,7 +160,7 @@ fn auth_error_sites_apply_the_value_pass_first() {
     creds.token = Some(SAS_SHAPED_TOKEN.into());
 
     let raw = format!("upstream error echoed {SAS_SHAPED_TOKEN}");
-    let redacted = redact_catalog_auth_error(&raw, &creds, &[]);
+    let redacted = redact_catalog_auth_error(&raw, &creds, None);
 
     assert!(
         !redacted.contains(SAS_SHAPED_TOKEN),
@@ -268,4 +276,49 @@ async fn resolve_catalog_auth_is_unauthenticated_for_the_validation_rejected_sha
         matches!(auth, CatalogAuth::None),
         "a validation-rejected token+pair shape must classify as unauthenticated"
     );
+}
+
+#[test]
+fn a_grant_answer_becomes_a_lease_on_the_clock_that_read_now() {
+    const NOW_MS: u64 = 1_000;
+    let answer = |expires_in: serde_json::Value| {
+        let mut body = serde_json::json!({"access_token": "tok"});
+        if !expires_in.is_null() {
+            body["expires_in"] = expires_in;
+        }
+        body
+    };
+    for (expires_in, require_expiry, expected) in [
+        (serde_json::json!(120), false, Some(Some(121_000))),
+        (serde_json::json!(120), true, Some(Some(121_000))),
+        (serde_json::json!(30), true, Some(Some(31_000))),
+        (serde_json::Value::Null, false, Some(None)),
+        (serde_json::Value::Null, true, None),
+        (serde_json::json!(0), false, Some(None)),
+        (serde_json::json!(0), true, None),
+    ] {
+        let lease = lease_from_grant_answer(&answer(expires_in.clone()), NOW_MS, require_expiry);
+
+        match expected {
+            Some(expires_at_ms) => {
+                let lease = lease.unwrap();
+                assert_eq!(lease.value, "tok");
+                assert_eq!(lease.expires_at_ms, expires_at_ms, "{expires_in}");
+            }
+            None => assert_eq!(
+                lease.err().unwrap(),
+                GrantAnswerError::NoUsableExpiry,
+                "{expires_in}"
+            ),
+        }
+    }
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({"access_token": ""}),
+    ] {
+        assert_eq!(
+            lease_from_grant_answer(&body, NOW_MS, false).err().unwrap(),
+            GrantAnswerError::NoAccessToken
+        );
+    }
 }

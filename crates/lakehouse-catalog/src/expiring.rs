@@ -1,8 +1,8 @@
 //! The one holder of a credential that expires, such as an OAuth2 token or vended storage
-//! credentials: it renews the value before it expires and remembers every value it held.
+//! credentials: it renews the value before it expires.
 
 use std::future::Future;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Reads wall-clock time as Unix epoch milliseconds, the unit of every expiry a holder keeps and
@@ -45,18 +45,20 @@ pub enum AtRenewalPoint {
 }
 
 /// A credential that is renewed once it comes within the renewal skew of its expiry, so a request
-/// never carries a value that expires in flight. Callers wait on one lock for the renewal, so a
-/// value that reaches its renewal point is renewed once however many callers arrive. It keeps
-/// every value it held, so error text can be stripped of each one.
+/// never carries a value that expires in flight. The skew is at most half the lease's lifetime, so
+/// a lease shorter than the skew is still shared for its first half. Callers wait on one lock for
+/// the renewal, so a value that reaches its renewal point is renewed once however many callers
+/// arrive.
 pub struct ExpiringCredential<T> {
     current: tokio::sync::Mutex<Holding<T>>,
-    held: Mutex<Vec<T>>,
     skew_ms: u64,
     clock: EpochClock,
 }
 
 struct Holding<T> {
     lease: Option<Lease<T>>,
+    /// The epoch millisecond the lease is due for renewal; `None` for a lease that never expires.
+    renew_at_ms: Option<u64>,
     renewed_at_ms: Option<u64>,
 }
 
@@ -72,13 +74,17 @@ impl<T: Clone> ExpiringCredential<T> {
     }
 
     fn holding(lease: Option<Lease<T>>, skew: Duration, clock: EpochClock) -> Self {
+        let skew_ms = u64::try_from(skew.as_millis()).unwrap_or(u64::MAX);
+        let renew_at_ms = lease
+            .as_ref()
+            .and_then(|lease| renew_at(lease, skew_ms, clock()));
         Self {
-            held: Mutex::new(lease.iter().map(|lease| lease.value.clone()).collect()),
             current: tokio::sync::Mutex::new(Holding {
                 lease,
+                renew_at_ms,
                 renewed_at_ms: None,
             }),
-            skew_ms: u64::try_from(skew.as_millis()).unwrap_or(u64::MAX),
+            skew_ms,
             clock,
         }
     }
@@ -108,8 +114,8 @@ impl<T: Clone> ExpiringCredential<T> {
         let mut current = self.current.lock().await;
         let now_ms = (self.clock)();
         if let Some(lease) = &current.lease {
-            let Some(expires_at_ms) = lease.expires_at_ms.filter(|_| self.is_due(lease, now_ms))
-            else {
+            let due = current.renew_at_ms.is_some_and(|at| now_ms >= at);
+            let Some(expires_at_ms) = lease.expires_at_ms.filter(|_| due) else {
                 return Ok(lease.value.clone());
             };
             let point = RenewalPoint {
@@ -122,35 +128,23 @@ impl<T: Clone> ExpiringCredential<T> {
             }
         }
         let renewed = renew(now_ms).await?;
-        self.remember(&renewed.value);
         let value = renewed.value.clone();
         *current = Holding {
+            renew_at_ms: renew_at(&renewed, self.skew_ms, now_ms),
             lease: Some(renewed),
             renewed_at_ms: Some(now_ms),
         };
         Ok(value)
     }
+}
 
-    /// Every value this holder has held, the current one included, oldest first.
-    pub fn held_values(&self) -> Vec<T> {
-        self.held
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
-    fn is_due(&self, lease: &Lease<T>, now_ms: u64) -> bool {
-        lease
-            .expires_at_ms
-            .is_some_and(|expires_at_ms| now_ms.saturating_add(self.skew_ms) >= expires_at_ms)
-    }
-
-    fn remember(&self, value: &T) {
-        self.held
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(value.clone());
-    }
+/// The skew is capped at half the lifetime, so a short lease is due after its first half instead of
+/// at once, which would renew it on every call.
+fn renew_at<T>(lease: &Lease<T>, skew_ms: u64, granted_at_ms: u64) -> Option<u64> {
+    lease.expires_at_ms.map(|expires_at_ms| {
+        let lifetime_ms = expires_at_ms.saturating_sub(granted_at_ms);
+        expires_at_ms - skew_ms.min(lifetime_ms / 2)
+    })
 }
 
 #[cfg(test)]

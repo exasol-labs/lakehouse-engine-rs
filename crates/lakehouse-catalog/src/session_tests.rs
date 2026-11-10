@@ -1,8 +1,5 @@
 use super::*;
-use crate::expiring::EpochClock;
 use crate::test_support::*;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 #[test]
 fn build_load_table_url_with_warehouse_prefix() {
@@ -16,20 +13,6 @@ fn build_load_table_url_with_warehouse_prefix() {
         url,
         "https://glue.us-east-1.amazonaws.com/iceberg/v1/123456789012/namespaces/db/tables/events?snapshots=refs",
         "URL must follow {{uri}}/v1/{{warehouse}}/namespaces/{{ns}}/tables/{{table}} pattern"
-    );
-}
-
-#[test]
-fn the_table_routes_join_a_multi_level_namespace_with_the_unit_separator() {
-    let table = TableIdent::from_strs(["sales", "eu", "orders"]).unwrap();
-
-    assert_eq!(
-        namespace_tables_path(&table.namespace),
-        "namespaces/sales\u{1f}eu/tables"
-    );
-    assert_eq!(
-        table_ident_path(&table),
-        "namespaces/sales\u{1f}eu/tables/orders"
     );
 }
 
@@ -157,10 +140,9 @@ async fn sigv4_resolve_prefix_derives_catalogs_segment() {
     };
 
     let http = CatalogHttp::new();
-    let result = resolve_served_config(&http, &catalog_uri, warehouse, &auth, &creds)
+    let result = resolve_load_table_prefix(&http, &catalog_uri, warehouse, &auth, &creds)
         .await
-        .expect("prefix")
-        .prefix;
+        .expect("prefix");
 
     assert_eq!(
         result,
@@ -205,10 +187,10 @@ async fn non_sigv4_config_prefix_resolution_uses_config_endpoint() {
     let auth = CatalogAuth::None;
 
     let http = CatalogHttp::new();
-    let result = resolve_served_config(&http, &catalog_uri, "original-warehouse", &auth, &creds)
-        .await
-        .expect("prefix")
-        .prefix;
+    let result =
+        resolve_load_table_prefix(&http, &catalog_uri, "original-warehouse", &auth, &creds)
+            .await
+            .expect("prefix");
 
     assert_eq!(
         result, resolved_prefix,
@@ -246,10 +228,9 @@ async fn non_sigv4_no_config_prefix_yields_empty_not_warehouse() {
     let auth = CatalogAuth::None;
 
     let http = CatalogHttp::new();
-    let result = resolve_served_config(&http, &catalog_uri, warehouse, &auth, &creds)
+    let result = resolve_load_table_prefix(&http, &catalog_uri, warehouse, &auth, &creds)
         .await
-        .expect("prefix")
-        .prefix;
+        .expect("prefix");
 
     assert_eq!(
         result, "",
@@ -459,8 +440,6 @@ fn session_over(http: CatalogHttp, catalog_uri: &str) -> CatalogSession {
         catalog_uri: catalog_uri.to_string(),
         auth: CatalogAuth::None,
         prefix: String::new(),
-        endpoints: None,
-        creds: creds_no_auth(),
     }
 }
 
@@ -597,7 +576,12 @@ async fn every_iceberg_rest_request_kind_succeeds_after_one_503() {
     let oauth_session = CatalogSession::resolve(&grant_uri, "wh", None, &oauth_creds)
         .await
         .expect("a 503 on the grant and the config lookup is retried to success");
-    assert_eq!(oauth_session.auth.held_bearers(), [OAUTH_ACCESS_TOKEN]);
+    let (_, carried) = oauth_session
+        .auth
+        .apply(reqwest::Client::new().get("http://catalog.example/v1/config"))
+        .await
+        .expect("the granted token needs no renewal");
+    assert_eq!(carried.as_deref(), Some(OAUTH_ACCESS_TOKEN));
     let posts: Vec<String> = grant_requests
         .lock()
         .unwrap()
@@ -690,441 +674,4 @@ async fn every_iceberg_rest_request_kind_succeeds_after_one_503() {
     load_table_any_auth(&pushdown_session, &catalog, &creds_no_auth())
         .await
         .expect("a 503 on the pushdown load is retried to success");
-}
-
-const CREDENTIALS_ROUTE: &str =
-    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials";
-
-fn table_t() -> TableIdent {
-    TableIdent::from_strs(["db", "t"]).expect("a valid identifier")
-}
-
-/// [`session_over`] with a REST prefix, the given auth, and CONNECTION credentials.
-fn prefixed_session(auth: CatalogAuth, creds: ConnectionCreds) -> CatalogSession {
-    CatalogSession {
-        prefix: "wh-prefix".into(),
-        auth,
-        creds,
-        ..session_over(CatalogHttp::new(), "https://catalog.example.com/catalog")
-    }
-}
-
-#[tokio::test]
-async fn the_request_method_builds_an_authorized_prefixed_request() {
-    let body = serde_json::json!({"name": "t"});
-    for (vends, sent_body) in [(true, Some(&body)), (false, None)] {
-        let creds = ConnectionCreds {
-            use_vended_credentials: vends,
-            ..creds_no_auth()
-        };
-        let session = prefixed_session(CatalogAuth::Bearer(BEARER_TOK.into()), creds);
-
-        let request = session
-            .build_request(Method::POST, "namespaces/db/tables", sent_body)
-            .await
-            .expect("the request builds");
-
-        assert_eq!(request.method(), Method::POST);
-        assert_eq!(
-            request.url().as_str(),
-            "https://catalog.example.com/catalog/v1/wh-prefix/namespaces/db/tables"
-        );
-        let header = |name: &str| {
-            request
-                .headers()
-                .get(name)
-                .map(|value| value.to_str().unwrap().to_string())
-        };
-        assert_eq!(
-            header("authorization"),
-            Some(format!("Bearer {BEARER_TOK}"))
-        );
-        assert_eq!(
-            header("x-iceberg-access-delegation").as_deref(),
-            vends.then_some("vended-credentials"),
-            "vends={vends}"
-        );
-        assert_eq!(
-            header("content-type").as_deref(),
-            sent_body.map(|_| "application/json"),
-            "vends={vends}"
-        );
-        let sent = request.body().and_then(|body| body.as_bytes());
-        assert_eq!(
-            sent.map(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).unwrap()),
-            sent_body.cloned()
-        );
-    }
-}
-
-/// Scenario: A request that changes catalog state is sent once after a transient failure
-#[tokio::test]
-async fn the_request_method_returns_a_whole_answer_and_repeats_only_a_safe_request() {
-    let gateway_page = "x".repeat(100 * 1024);
-    for (safety, attempts, status) in [(RepeatSafety::Unsafe, 1, 504), (RepeatSafety::Safe, 2, 200)]
-    {
-        let answered = std::sync::atomic::AtomicUsize::new(0);
-        let page = gateway_page.clone();
-        let (uri, requests) = spawn_server("text/html", move |_| {
-            match answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
-                0 => (504, page.clone()),
-                _ => (200, "{}".into()),
-            }
-        })
-        .await;
-        let session = session_over(CatalogHttp::with_policy(SHORT_POLICY), &uri);
-
-        let answer = session
-            .post(
-                "namespaces",
-                &serde_json::json!({"namespace": ["db"]}),
-                safety,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(answer.status, status, "{safety:?}");
-        assert_eq!(requests.lock().unwrap().len(), attempts, "{safety:?}");
-        if safety == RepeatSafety::Unsafe {
-            assert_eq!(answer.body, gateway_page.as_bytes(), "no 64 KiB cap");
-        }
-    }
-}
-
-#[tokio::test]
-async fn a_send_without_an_answer_tells_whether_the_catalog_may_have_applied_it() {
-    let refused = session_over(CatalogHttp::with_policy(SHORT_POLICY), CLOSED_PORT_URI);
-    let stalling = session_over(
-        CatalogHttp::with_policy(SHORT_POLICY),
-        &spawn_header_stalling_server().await,
-    );
-
-    let body = serde_json::json!({"namespace": ["db"]});
-    let unsent = refused
-        .post("namespaces", &body, RepeatSafety::Unsafe)
-        .await
-        .err()
-        .expect("a refused connection fails");
-    let unknown = stalling
-        .post("namespaces", &body, RepeatSafety::Unsafe)
-        .await
-        .err()
-        .expect("a stalled answer fails");
-
-    assert!(matches!(unsent, CatalogSendError::Unsent(_)), "{unsent:?}");
-    assert!(
-        matches!(unknown, CatalogSendError::OutcomeUnknown(_)),
-        "{unknown:?}"
-    );
-    let unsent = UdfError::from(unsent).to_string();
-    let unknown = UdfError::from(unknown).to_string();
-    assert!(
-        unsent.starts_with("the catalog request POST ") && unsent.contains(CLOSED_PORT_CAUSE),
-        "{unsent}"
-    );
-    assert!(unknown.contains(TIMED_OUT_CAUSE), "{unknown}");
-}
-
-#[test]
-fn a_quoted_body_is_stripped_of_the_session_secrets_and_cut() {
-    let creds = ConnectionCreds {
-        client_secret: Some(CLIENT_SECRET.into()),
-        ..creds_no_auth()
-    };
-    let session = prefixed_session(CatalogAuth::Bearer(BEARER_TOK.into()), creds);
-    let body = format!(
-        "{BEARER_TOK} {CLIENT_SECRET} {}",
-        "x".repeat(crate::catalog_http::MAX_QUOTED_BODY_BYTES)
-    );
-
-    let quoted = session.quote(body.as_bytes());
-
-    assert!(!quoted.contains(BEARER_TOK), "{quoted}");
-    assert!(!quoted.contains(CLIENT_SECRET), "{quoted}");
-    assert!(quoted.contains("truncated"), "{quoted}");
-}
-
-#[test]
-fn a_table_exists_on_a_2xx_answer_and_is_absent_on_404() {
-    for (status, existence) in [
-        (200, Some(true)),
-        (204, Some(true)),
-        (404, Some(false)),
-        (403, None),
-        (409, None),
-        (500, None),
-    ] {
-        assert_eq!(table_existence(status), existence, "HTTP {status}");
-    }
-}
-
-#[test]
-fn offered_endpoints_are_the_routes_the_config_lists() {
-    let listing = serde_json::json!({"endpoints": [
-        "get /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
-        "not-a-route",
-    ]});
-    for (config, offered) in [
-        (listing, true),
-        (
-            serde_json::json!({"endpoints": ["GET /v1/{prefix}/namespaces"]}),
-            false,
-        ),
-        (serde_json::json!({"defaults": {}}), false),
-    ] {
-        let session = CatalogSession {
-            endpoints: endpoints_from_config(&config),
-            ..session_over(CatalogHttp::new(), "https://catalog.example.com")
-        };
-
-        assert_eq!(
-            session.offers_endpoint(CREDENTIALS_ROUTE),
-            offered,
-            "{config}"
-        );
-        assert!(!session.offers_endpoint("not-a-route"), "{config}");
-    }
-}
-
-const CREDENTIALS_ANSWER: &str = r#"{"storage-credentials": [
-  {"prefix": "s3://bucket/", "config": {"s3.access-key-id": "WIDE_AK", "s3.secret-access-key": "WIDE_SK"}},
-  {"prefix": "S3://bucket/db/t", "config": {"s3.access-key-id": "TABLE_AK", "s3.secret-access-key": "TABLE_SK"}}
-]}"#;
-
-#[test]
-fn a_credentials_answer_yields_the_longest_covering_entry() {
-    let credentials = read_credentials(CREDENTIALS_ANSWER.as_bytes(), "s3://bucket/db/t/data")
-        .expect("an entry covers the location");
-
-    assert_eq!(credentials["s3.access-key-id"], "TABLE_AK");
-}
-
-#[test]
-fn a_credentials_answer_that_covers_nothing_or_is_malformed_fails_quoting_none_of_it() {
-    for (body, location, cause) in [
-        (
-            CREDENTIALS_ANSWER,
-            "s3://other/db/t",
-            "covers s3://other/db/t",
-        ),
-        (
-            r#"{"storage-credentials": "WIDE_AK"}"#,
-            "s3://bucket/db/t",
-            "invalid JSON at line 1",
-        ),
-    ] {
-        let error = read_credentials(body.as_bytes(), location).unwrap_err();
-
-        assert!(error.contains(cause), "{error}");
-        assert!(
-            !error.contains("WIDE_AK") && !error.contains("TABLE_AK"),
-            "{error}"
-        );
-    }
-}
-
-/// The answers of a catalog that is briefly unavailable once for each request kind, then serves a
-/// table and its credentials.
-fn busy_once_catalog() -> impl Fn(&str) -> (u16, String) + Send + 'static {
-    let seen = Mutex::new(std::collections::HashSet::new());
-    move |request: &str| {
-        let line = request.lines().next().unwrap_or_default().to_string();
-        if seen.lock().unwrap().insert(line.clone()) {
-            return (503, "{\"error\":\"busy\"}".into());
-        }
-        match line.split(' ').nth(1).unwrap_or_default() {
-            path if path.ends_with("/credentials") => (200, CREDENTIALS_ANSWER.into()),
-            path if path.ends_with("?snapshots=all") => (200, LOAD_TABLE_BODY.into()),
-            _ => (204, String::new()),
-        }
-    }
-}
-
-#[tokio::test]
-async fn every_session_read_is_repeated_after_a_transient_failure() {
-    let (uri, requests) = spawn_server("application/json", busy_once_catalog()).await;
-    let session = CatalogSession {
-        creds: ConnectionCreds {
-            use_vended_credentials: true,
-            ..creds_no_auth()
-        },
-        ..session_over(CatalogHttp::with_policy(SHORT_POLICY), &uri)
-    };
-    let table = table_t();
-
-    let exists = session.table_exists(&table).await.expect("HEAD succeeds");
-    let loaded = session
-        .load_table_with_all_snapshots(&table)
-        .await
-        .expect("the load succeeds");
-    let credentials = session
-        .load_credentials(&table, "s3://bucket/db/t")
-        .await
-        .expect("loadCredentials succeeds");
-
-    assert!(exists);
-    assert_eq!(loaded.metadata.location(), "s3://warehouse/db/events");
-    assert_eq!(credentials.access_key_id, "TABLE_AK");
-    let requests = requests.lock().unwrap();
-    let lines: Vec<&str> = requests
-        .iter()
-        .map(|request| request.lines().next().unwrap_or_default())
-        .collect();
-    assert_eq!(
-        lines,
-        [
-            "HEAD /v1/namespaces/db/tables/t HTTP/1.1",
-            "HEAD /v1/namespaces/db/tables/t HTTP/1.1",
-            "GET /v1/namespaces/db/tables/t?snapshots=all HTTP/1.1",
-            "GET /v1/namespaces/db/tables/t?snapshots=all HTTP/1.1",
-            "GET /v1/namespaces/db/tables/t/credentials HTTP/1.1",
-            "GET /v1/namespaces/db/tables/t/credentials HTTP/1.1",
-        ]
-    );
-    assert!(requests.iter().all(
-        |request| header_value(request, "x-iceberg-access-delegation")
-            == Some("vended-credentials")
-    ));
-}
-
-#[tokio::test]
-async fn a_session_read_that_stays_refused_names_the_table_and_the_status() {
-    let (uri, _) = spawn_server("application/json", |_| (503, "{}".into())).await;
-    let session = session_over(CatalogHttp::with_policy(SHORT_POLICY), &uri);
-    let table = table_t();
-
-    let existence = session.table_exists(&table).await.unwrap_err().to_string();
-    let credentials = session
-        .load_credentials(&table, "s3://bucket/db/t")
-        .await
-        .unwrap_err()
-        .to_string();
-
-    assert!(
-        existence.contains("'db.t'") && existence.contains("HTTP 503"),
-        "{existence}"
-    );
-    assert!(
-        credentials.contains("'db.t'") && credentials.contains("HTTP 503"),
-        "{credentials}"
-    );
-}
-
-/// A token endpoint that answers grant N with `tok-N`, stating `expires_in` when given, and a
-/// catalog that answers every other request with `answer`.
-fn granting_catalog(
-    expires_in: Option<u64>,
-    answer: (u16, &'static str),
-) -> impl Fn(&str) -> (u16, String) + Send + 'static {
-    let grants = std::sync::atomic::AtomicUsize::new(0);
-    move |request: &str| {
-        if !request.starts_with("POST /v1/oauth/tokens") {
-            return (answer.0, answer.1.into());
-        }
-        let grant = grants.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let lifetime = expires_in.map_or(String::new(), |secs| format!(r#","expires_in":{secs}"#));
-        (
-            200,
-            format!(r#"{{"access_token":"tok-{grant}"{lifetime}}}"#),
-        )
-    }
-}
-
-/// A session in OAuth2 mode whose first grant ran at the time `clock` reads.
-async fn oauth_session(catalog_uri: &str, clock: EpochClock) -> CatalogSession {
-    let creds = ConnectionCreds {
-        client_id: Some("client-id".into()),
-        client_secret: Some(CLIENT_SECRET.into()),
-        ..creds_no_auth()
-    };
-    let http = CatalogHttp::new();
-    let auth = resolve_catalog_auth(&http, catalog_uri, &creds, clock)
-        .await
-        .expect("the first grant succeeds");
-    CatalogSession {
-        auth,
-        creds,
-        ..session_over(http, catalog_uri)
-    }
-}
-
-/// The bearer of every request other than a grant, in order.
-fn catalog_bearers(requests: &Mutex<Vec<String>>) -> Vec<String> {
-    requests
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|request| !request.starts_with("POST /v1/oauth/tokens"))
-        .map(|request| {
-            authorization_header(request)
-                .unwrap_or_default()
-                .to_string()
-        })
-        .collect()
-}
-
-/// Scenario: An OAuth2 token that reaches its renewal point is renewed once
-#[tokio::test]
-async fn a_token_at_its_renewal_point_is_granted_anew_once_for_the_requests_after_it() {
-    let (uri, requests) =
-        spawn_server("application/json", granting_catalog(Some(120), (204, ""))).await;
-    let time = Arc::new(AtomicU64::new(0));
-    let session = oauth_session(&uri, clock_reading(&time)).await;
-    let table = table_t();
-
-    session.table_exists(&table).await.unwrap();
-    time.store(61_000, Ordering::SeqCst);
-    let (first, second) = tokio::join!(session.table_exists(&table), session.table_exists(&table));
-    session.table_exists(&table).await.unwrap();
-
-    assert!(first.unwrap() && second.unwrap());
-    assert_eq!(
-        catalog_bearers(&requests),
-        [
-            "Bearer tok-1",
-            "Bearer tok-2",
-            "Bearer tok-2",
-            "Bearer tok-2"
-        ]
-    );
-    assert_eq!(session.auth.held_bearers(), ["tok-1", "tok-2"]);
-}
-
-/// Scenario: An OAuth2 token that reaches its renewal point is renewed once
-#[tokio::test]
-async fn a_token_granted_without_expires_in_is_kept_for_the_life_of_the_session() {
-    let (uri, requests) = spawn_server("application/json", granting_catalog(None, (204, ""))).await;
-    let time = Arc::new(AtomicU64::new(0));
-    let session = oauth_session(&uri, clock_reading(&time)).await;
-
-    time.store(u64::MAX, Ordering::SeqCst);
-    session.table_exists(&table_t()).await.unwrap();
-
-    assert_eq!(catalog_bearers(&requests), ["Bearer tok-1"]);
-}
-
-/// Scenario: An OAuth2 token that reaches its renewal point is renewed once
-#[tokio::test]
-async fn no_token_the_session_held_appears_in_an_error() {
-    let (uri, _) = spawn_server(
-        "application/json",
-        granting_catalog(Some(120), (401, "rejected tok-1 and tok-2")),
-    )
-    .await;
-    let time = Arc::new(AtomicU64::new(0));
-    let session = oauth_session(&uri, clock_reading(&time)).await;
-
-    time.store(61_000, Ordering::SeqCst);
-    let message = session
-        .load_table_with_all_snapshots(&table_t())
-        .await
-        .unwrap_err()
-        .to_string();
-
-    assert!(message.contains("HTTP 401"), "{message}");
-    assert!(
-        !message.contains("tok-1") && !message.contains("tok-2"),
-        "{message}"
-    );
-    assert_eq!(session.auth.held_bearers(), ["tok-1", "tok-2"]);
 }

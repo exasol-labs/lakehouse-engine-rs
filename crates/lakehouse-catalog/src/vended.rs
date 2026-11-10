@@ -7,48 +7,12 @@ use crate::storage::{
     location_host, s3_backend, scheme_of,
 };
 use exasol_udf_sdk::error::UdfError;
-use iceberg_catalog_rest::{LoadTableResult, StorageCredential};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fmt;
 
 /// Host-suffixed per the iceberg Java `AzureProperties` convention, not the Iceberg REST
 /// spec; downstream readers only understand the flat `adls.sas-token`.
 const VENDED_SAS_TOKEN_KEY_PREFIX: &str = "adls.sas-token.";
-const S3_ACCESS_KEY_ID: &str = "s3.access-key-id";
-const S3_SECRET_ACCESS_KEY: &str = "s3.secret-access-key";
-const S3_SESSION_TOKEN: &str = "s3.session-token";
-const S3_ENDPOINT: &str = "s3.endpoint";
-const S3_EXPIRES_AT_MS: &str = "s3.session-token-expires-at-ms";
-
-/// The S3 credentials a catalog vends for one table location, for a writer that renews them
-/// before they expire. The vended config keys stay known to this crate alone, and `Debug` shows
-/// no value.
-pub struct VendedS3Credentials {
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub session_token: Option<String>,
-    /// The storage endpoint the catalog vends with the credentials, if any.
-    pub endpoint: Option<String>,
-    /// When the credentials expire, in epoch milliseconds; `None` when the catalog states none.
-    pub expires_at_ms: Option<u64>,
-}
-
-impl fmt::Debug for VendedS3Credentials {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VendedS3Credentials")
-            .finish_non_exhaustive()
-    }
-}
-
-/// The S3 credentials `answer` vends for `location`, read from the same credential source that
-/// [`resolve_vended_storage`] selects. A refusal names the missing or unreadable key, never a value.
-pub fn vended_s3_credentials(
-    answer: &LoadTableResult,
-    location: &str,
-) -> Result<VendedS3Credentials, UdfError> {
-    s3_credentials(vended_credential_config(answer, location), location)
-}
 
 /// `anchor` must be the table's OWN location (what `storage_credentials[*].prefix` is
 /// matched against), so a catalog URI is refused rather than falling through to the
@@ -56,13 +20,13 @@ pub fn vended_s3_credentials(
 /// `endpoint`/`region` wins per field, and an address neither side supplies is left to
 /// AWS's default chain.
 pub fn resolve_vended_storage(
-    result: &LoadTableResult,
+    result: &iceberg_catalog_rest::LoadTableResult,
     anchor: &str,
     allow_http: bool,
     address: &StaticStoreAddress,
 ) -> Result<StorageBackend, UdfError> {
     let scheme = scheme_of(anchor);
-    let vended = vended_credential_config(result, anchor);
+    let vended = select_credential_source(result, anchor);
     match classify_vended_scheme(&scheme) {
         Some(VendedBackendKind::S3) => s3_backend(
             iceberg_vended_s3(vended, anchor)?,
@@ -80,35 +44,27 @@ pub fn resolve_vended_storage(
     }
 }
 
-/// The vended storage config that applies to `location`, per the Iceberg REST spec: the covering
-/// `storage-credentials` entry, else the flat `config` map. A matched entry is authoritative for
-/// the whole set; the two sources never mix. It carries credentials, so never quote it.
-pub(crate) fn vended_credential_config<'a>(
-    result: &'a LoadTableResult,
+/// Per the Iceberg REST spec: the longest non-empty matching `prefix` entry, else the
+/// flat `config` map. A matched entry is authoritative for the whole set; the two
+/// sources never mix. Schemes are compared lowercased (RFC 3986 §3.1).
+fn select_credential_source<'a>(
+    result: &'a iceberg_catalog_rest::LoadTableResult,
     location: &str,
 ) -> &'a HashMap<String, String> {
+    let location = lowercase_scheme(location);
     result
         .storage_credentials
-        .as_deref()
-        .and_then(|credentials| covering_credential(credentials, location))
-        .unwrap_or(&result.config)
-}
-
-/// The config of the longest non-empty `prefix` entry that `location` starts with. Schemes are
-/// compared lowercased (RFC 3986 §3.1).
-pub(crate) fn covering_credential<'a>(
-    credentials: &'a [StorageCredential],
-    location: &str,
-) -> Option<&'a HashMap<String, String>> {
-    let location = lowercase_scheme(location);
-    credentials
-        .iter()
-        .filter(|entry| {
-            !entry.prefix.is_empty()
-                && location.starts_with(lowercase_scheme(&entry.prefix).as_ref())
+        .as_ref()
+        .and_then(|credentials| {
+            credentials
+                .iter()
+                .filter(|entry| {
+                    !entry.prefix.is_empty()
+                        && location.starts_with(lowercase_scheme(&entry.prefix).as_ref())
+                })
+                .max_by_key(|entry| entry.prefix.len())
         })
-        .max_by_key(|entry| entry.prefix.len())
-        .map(|entry| &entry.config)
+        .map_or(&result.config, |entry| &entry.config)
 }
 
 /// Only the scheme is folded (RFC 3986 §3.1); buckets and keys are case-sensitive.
@@ -123,37 +79,13 @@ fn lowercase_scheme(uri: &str) -> Cow<'_, str> {
 
 fn iceberg_vended_s3(vended: &HashMap<String, String>, anchor: &str) -> Result<VendedS3, UdfError> {
     Ok(VendedS3 {
-        access_key: required_vended_value(vended, S3_ACCESS_KEY_ID, anchor)?,
-        secret_key: required_vended_value(vended, S3_SECRET_ACCESS_KEY, anchor)?,
-        session_token: vended_config_value(vended, S3_SESSION_TOKEN),
+        access_key: required_vended_value(vended, "s3.access-key-id", anchor)?,
+        secret_key: required_vended_value(vended, "s3.secret-access-key", anchor)?,
+        session_token: vended_config_value(vended, "s3.session-token"),
         region: vended_config_value(vended, "client.region"),
-        endpoint: vended_config_value(vended, S3_ENDPOINT),
+        endpoint: vended_config_value(vended, "s3.endpoint"),
         path_style: vended_config_value(vended, "s3.path-style-access")
             .and_then(|value| value.parse::<bool>().ok()),
-    })
-}
-
-/// The scan's storage resolution ignores the expiry, so only this read refuses an unreadable one.
-pub(crate) fn s3_credentials(
-    vended: &HashMap<String, String>,
-    anchor: &str,
-) -> Result<VendedS3Credentials, UdfError> {
-    let expires_at_ms = vended_config_value(vended, S3_EXPIRES_AT_MS)
-        .map(|value| {
-            value.parse::<u64>().map_err(|_| {
-                UdfError::User(format!(
-                    "the catalog vended credentials for table location {anchor} whose \
-                     {S3_EXPIRES_AT_MS} is no epoch millisecond"
-                ))
-            })
-        })
-        .transpose()?;
-    Ok(VendedS3Credentials {
-        access_key_id: required_vended_value(vended, S3_ACCESS_KEY_ID, anchor)?,
-        secret_access_key: required_vended_value(vended, S3_SECRET_ACCESS_KEY, anchor)?,
-        session_token: vended_config_value(vended, S3_SESSION_TOKEN),
-        endpoint: vended_config_value(vended, S3_ENDPOINT),
-        expires_at_ms,
     })
 }
 

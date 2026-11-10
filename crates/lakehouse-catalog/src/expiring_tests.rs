@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::clock_reading;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const SKEW: Duration = Duration::from_secs(60);
@@ -36,12 +37,13 @@ async fn a_lease_is_renewed_once_it_is_within_the_skew_of_its_expiry() {
         (EXPIRES_AT_MS - SKEW.as_millis() as u64, true),
         (EXPIRES_AT_MS + 1, true),
     ] {
-        let time = Arc::new(AtomicU64::new(now_ms));
+        let time = Arc::new(AtomicU64::new(0));
         let holder = ExpiringCredential::seeded(
             lease("seed", Some(EXPIRES_AT_MS)),
             SKEW,
             clock_reading(&time),
         );
+        time.store(now_ms, Ordering::SeqCst);
         let renewals = AtomicUsize::new(0);
 
         let value = holder.get(|_| renew_to("renewed", &renewals)).await;
@@ -119,24 +121,25 @@ async fn a_failed_renewal_keeps_the_held_lease_and_returns_the_error() {
 
     assert_eq!(failed, Err("grant refused".to_string()));
     assert_eq!(retried, Ok("renewed".to_string()));
-    assert_eq!(holder.held_values(), ["seed", "renewed"]);
 }
 
 #[tokio::test]
-async fn held_values_lists_every_value_held_oldest_first() {
-    let time = Arc::new(AtomicU64::new(0));
-    let holder = ExpiringCredential::seeded(lease("seed", Some(0)), SKEW, clock_reading(&time));
-    let renewals = AtomicUsize::new(0);
+async fn a_lease_shorter_than_the_skew_is_shared_for_its_first_half() {
+    for (now_ms, renewed) in [(0, false), (14_999, false), (15_000, true)] {
+        let time = Arc::new(AtomicU64::new(0));
+        let holder =
+            ExpiringCredential::seeded(lease("seed", Some(30_000)), SKEW, clock_reading(&time));
+        time.store(now_ms, Ordering::SeqCst);
+        let renewals = AtomicUsize::new(0);
 
-    holder
-        .get(|_| async { Ok::<_, String>(lease("second", Some(0))) })
-        .await
-        .unwrap();
-    holder.get(|_| renew_to("third", &renewals)).await.unwrap();
-    holder.get(|_| renew_to("unused", &renewals)).await.unwrap();
+        let first = holder.get(|_| renew_to("renewed", &renewals)).await;
+        let second = holder.get(|_| renew_to("again", &renewals)).await;
 
-    assert_eq!(holder.held_values(), ["seed", "second", "third"]);
-    assert_eq!(renewals.load(Ordering::SeqCst), 1);
+        let expected = if renewed { "renewed" } else { "seed" };
+        assert_eq!(first, Ok(expected.to_string()), "at {now_ms} ms");
+        assert_eq!(second, Ok(expected.to_string()), "at {now_ms} ms");
+        assert_eq!(renewals.load(Ordering::SeqCst), usize::from(renewed));
+    }
 }
 
 #[tokio::test]
@@ -179,7 +182,6 @@ async fn a_decision_that_fails_returns_its_error_and_keeps_the_lease() {
 
     assert_eq!(failed, Err("expired".to_string()));
     assert_eq!(renewals.load(Ordering::SeqCst), 0);
-    assert_eq!(holder.held_values(), ["seed"]);
 }
 
 #[tokio::test]

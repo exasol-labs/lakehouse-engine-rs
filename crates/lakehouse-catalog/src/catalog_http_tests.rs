@@ -893,18 +893,5 @@ async fn a_request_unsafe_to_repeat_is_sent_once_after_a_timeout() {
         .unwrap_err();
 
     assert!(error.render(identity).contains(TIMED_OUT_CAUSE));
-    assert!(!error.is_unsent());
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn a_refused_connection_sent_nothing() {
-    let http = CatalogHttp::with_policy(SHORT_POLICY);
-
-    let error = http
-        .send(post(&http, CLOSED_PORT_URI), RepeatSafety::Unsafe)
-        .await
-        .unwrap_err();
-
-    assert!(error.is_unsent(), "{}", error.render(identity));
 }

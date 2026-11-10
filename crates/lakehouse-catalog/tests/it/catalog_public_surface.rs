@@ -89,7 +89,6 @@ fn demoted_and_deleted_functions_are_not_declared_public() {
             "pub fn build_s3_file_io",
             "pub fn s3_backend_from_vended",
             "pub fn adls_backend_from_vended",
-            "pub fn vended_credential_config",
         ] {
             assert!(
                 !declares(source, mechanism),
@@ -730,7 +729,7 @@ fn shared_vended_policy_steps_are_not_public() {
     let lib = source("lib.rs");
     for (_, item) in SHARED_STEPS {
         assert!(
-            !declares(lib, item),
+            !lib.contains(item),
             "lib.rs must not re-export the shared vended policy step `{item}` — the crate \
              exposes the two concept-level selectors, not the policy they share"
         );
