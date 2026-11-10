@@ -63,6 +63,13 @@ The scan computes an expression only when DataFusion returns what native Exasol 
 * *AND* the result SHALL equal native Exasol under any `NLS_NUMERIC_CHARACTERS`, including the native error for text that does not parse
 * *AND* the same aggregate over a DOUBLE, a DECIMAL, or an arithmetic expression over them SHALL keep the split
 
+### Scenario: A numeric aggregate over a bare NULL runs in Exasol
+
+* *GIVEN* a `SUM`, `AVG`, `STDDEV`, or `VARIANCE` aggregate, or one of their `_POP` and `_SAMP` forms, whose argument is a NULL literal, such as `SUM(NULL)` or `SUM(CAST(NULL AS DECIMAL(10,0)))`, which Exasol sends as a bare NULL
+* *WHEN* the adapter plans the request, with or without GROUP BY
+* *THEN* the aggregate SHALL NOT split into scan partials, and the qualified wrapper SHALL compute it in Exasol
+* *AND* the result SHALL equal native Exasol
+
 ### Scenario: A column of unknown type declines
 
 * *GIVEN* an expression that converts a column to text or compares it with text, or a numeric aggregate over the column, where the column has no type in the request's column metadata

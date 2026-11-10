@@ -573,6 +573,7 @@ fn numeric_aggregates_take_only_numbers() {
         cast_to(ExasolType::varchar(30), col("I")),
         case_when([col("B")], [col("B"), bool_lit(false)]),
         scalar_fn("ADD", [col("D"), col("I")]),
+        null_lit(),
     ];
     for name in ["SUM", "AVG", "STDDEV", "VAR_SAMP"] {
         for argument in &numbers {
@@ -585,8 +586,10 @@ fn numeric_aggregates_take_only_numbers() {
         }
     }
     for name in ["MIN", "MAX", "COUNT"] {
-        let expr = agg_item_expr(name, col("S"), false);
-        assert!(render(&expr).is_ok(), "{expr} needs no number");
+        for argument in [col("S"), null_lit()] {
+            let expr = agg_item_expr(name, argument, false);
+            assert!(render(&expr).is_ok(), "{expr} needs no number");
+        }
     }
 }
 

@@ -549,6 +549,10 @@ fn numeric_aggregate(node: &Json, name: &str, args: &[TypeClass]) -> Result<Type
             short(node)
         )));
     }
+    // DataFusion cannot sum an untyped NULL, and Exasol folds a CAST of NULL to a bare NULL.
+    if args.contains(&TypeClass::Null) {
+        return Err(decline(format!("{name} over a bare NULL: {}", short(node))));
+    }
     Ok(if name == "SUM" && args.iter().all(|c| c.is_integer()) {
         TypeClass::INTEGER
     } else {

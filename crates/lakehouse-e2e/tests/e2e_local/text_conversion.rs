@@ -334,6 +334,21 @@ const CASES: &[Case] = &[
         query: "SELECT SUM(C_DECIMAL_A), SUM(C_DECIMAL_A * C_QTY) FROM {T}",
         path: Split,
     },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT SUM(NULL), AVG(NULL) FROM {T}",
+        path: Wrapper,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT C_QTY, SUM(NULL), AVG(NULL) FROM {T} GROUP BY C_QTY",
+        path: Wrapper,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT SUM(CAST(NULL AS DECIMAL(10,0))) FROM {T}",
+        path: Wrapper,
+    },
 ];
 
 const ERROR_CASES: &[Case] = &[
@@ -389,6 +404,7 @@ fn mismatch(table: &str, case: &Case, expect: Expect) -> Option<String> {
 /// Scenario: A widened derived projection routes to a native wrapper on every path
 /// Scenario: A join condition or filter that converts a date to text takes the N-scan fallback
 /// Scenario: A numeric aggregate over text or BOOLEAN runs in Exasol
+/// Scenario: A numeric aggregate over a bare NULL runs in Exasol
 #[test]
 fn text_conversions_match_native_under_session_settings() {
     lakehouse_vs();
