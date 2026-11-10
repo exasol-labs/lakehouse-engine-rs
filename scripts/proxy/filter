@@ -1,1 +1,3 @@
 /v1/namespaces/e2e_refresh_partial/tables/table_three([?]|$)
+/v1/namespaces/e2e_export_no_stage/tables([?]|$)
+/e2e_export_sc_fail_[0-9a-z_]+/t/metadata/
