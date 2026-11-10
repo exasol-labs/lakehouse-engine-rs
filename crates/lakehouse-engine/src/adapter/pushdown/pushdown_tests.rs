@@ -661,33 +661,35 @@ fn guard_dispatch_sql(
         .to_string()
 }
 
-/// An unrenderable pushed sort key is a `User` error, not SQL.
-fn guard_dispatch_result(
+/// [`build_dispatch_sql`] over the sample file list and scan settings, as the dispatcher calls it.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_with(
     request: &Json,
-    proj_cols: Vec<ProjectionItem>,
-    proj_types: Vec<ExasolType>,
+    projection: Vec<ProjectedColumn>,
     projection_widened: bool,
+    col_types: &ColumnTypes,
+    (filter, declined_filter): (Option<String>, Option<&Json>),
     limit: Option<u64>,
     logical_schema: Vec<LogicalField>,
+    scan_storage: &ScanStorage,
 ) -> Result<Json, UdfError> {
     let pushdown_req = pd(request);
-    let has_order_by = order_by_present(&pushdown_req);
     build_dispatch_sql(
         request,
         &PushdownRequest::parse(pushdown_req.clone())?,
-        projected_columns(&proj_cols, &proj_types),
+        projection,
         projection_widened,
-        ScanTranslator::new(&column_types(&guard_col_types())),
-        None,
-        None,
+        ScanTranslator::new(col_types),
+        filter,
+        declined_filter,
         limit,
-        has_order_by,
+        order_by_present(&pushdown_req),
         &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
         "s3://warehouse/db/events".to_string(),
         logical_schema,
         Vec::new(),
         Vec::new(),
-        &sample_scan_storage(),
+        scan_storage,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         4,
@@ -697,6 +699,50 @@ fn guard_dispatch_result(
         200,
         8,
         false,
+    )
+}
+
+/// [`dispatch_with`] after the dispatcher's own projection and WHERE split of `request`.
+fn dispatch_planned(
+    request: &Json,
+    col_types: &ColumnTypes,
+    logical_schema: Vec<LogicalField>,
+    scan_storage: &ScanStorage,
+) -> Result<Json, UdfError> {
+    let pushdown_req = pd(request);
+    let (proj_cols, proj_types, projection_widened) =
+        project_first_table(request, &pushdown_req).expect("the fixture must project");
+    let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
+    dispatch_with(
+        request,
+        projected_columns(&proj_cols, &proj_types),
+        projection_widened,
+        col_types,
+        ScanTranslator::new(col_types).split_where(filter),
+        extract_limit(&pushdown_req),
+        logical_schema,
+        scan_storage,
+    )
+}
+
+/// An unrenderable pushed sort key is a `User` error, not SQL.
+fn guard_dispatch_result(
+    request: &Json,
+    proj_cols: Vec<ProjectionItem>,
+    proj_types: Vec<ExasolType>,
+    projection_widened: bool,
+    limit: Option<u64>,
+    logical_schema: Vec<LogicalField>,
+) -> Result<Json, UdfError> {
+    dispatch_with(
+        request,
+        projected_columns(&proj_cols, &proj_types),
+        projection_widened,
+        &column_types(&guard_col_types()),
+        (None, None),
+        limit,
+        logical_schema,
+        &sample_scan_storage(),
     )
 }
 
@@ -718,37 +764,11 @@ fn dispatch_sql_for_body(request: PushdownRequestBuilder) -> String {
 
 fn dispatch_for_body(request: PushdownRequestBuilder) -> Result<Json, UdfError> {
     let (request, _) = request.build();
-    let pushdown_req = pd(&request);
-    let col_types = first_table_column_types(&request);
-    let (proj_cols, proj_types, projection_widened) =
-        project_first_table(&request, &pushdown_req).expect("the fixture must project");
-    let (filter, declined_filter) = ScanTranslator::new(&col_types)
-        .split_where(pushdown_req.get("filter").filter(|f| !f.is_null()));
-    build_dispatch_sql(
+    dispatch_planned(
         &request,
-        &parsed_pushdown(&request),
-        projected_columns(&proj_cols, &proj_types),
-        projection_widened,
-        ScanTranslator::new(&col_types),
-        filter,
-        declined_filter,
-        extract_limit(&pushdown_req),
-        order_by_present(&pushdown_req),
-        &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
-        "s3://warehouse/db/events".to_string(),
-        Vec::new(),
-        Vec::new(),
+        &first_table_column_types(&request),
         Vec::new(),
         &sample_scan_storage(),
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        4,
-        8192,
-        2,
-        0.6,
-        200,
-        8,
-        false,
     )
 }
 
@@ -2222,37 +2242,11 @@ fn dispatch_result_for_body(
     scan_storage: &ScanStorage,
 ) -> Result<String, UdfError> {
     let (request, _) = request.build();
-    let pushdown_req = pd(&request);
-    let col_types = guard_col_types();
-    let (proj_cols, proj_types, projection_widened) =
-        project_first_table(&request, &pushdown_req).expect("the fixture must project");
-    let (filter, declined_filter) = ScanTranslator::new(&column_types(&col_types))
-        .split_where(pushdown_req.get("filter").filter(|f| !f.is_null()));
-    let result = build_dispatch_sql(
+    let result = dispatch_planned(
         &request,
-        &parsed_pushdown(&request),
-        projected_columns(&proj_cols, &proj_types),
-        projection_widened,
-        ScanTranslator::new(&column_types(&col_types)),
-        filter,
-        declined_filter,
-        extract_limit(&pushdown_req),
-        order_by_present(&pushdown_req),
-        &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
-        "s3://warehouse/db/events".to_string(),
+        &column_types(&guard_col_types()),
         logical_schema,
-        Vec::new(),
-        Vec::new(),
         scan_storage,
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
-        4,
-        8192,
-        2,
-        0.6,
-        200,
-        8,
-        false,
     )?;
     Ok(result["sql"]
         .as_str()

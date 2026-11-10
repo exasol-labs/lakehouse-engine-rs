@@ -669,20 +669,15 @@ impl<'a> ScanTranslator<'a> {
         render_scan_expression(&scan_rewrite(expr, self.columns), self.columns).ok()
     }
 
-    /// `Ok(None)` when the filter is trivially true; `Err` names why the scan declines it.
-    pub(super) fn filter(self, filter: &Json) -> Result<Option<String>, UdfError> {
-        render_scan_filter(&scan_rewrite(filter, self.columns), self.columns)
-    }
-
-    /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`). `declined` is the
-    /// original, un-rewritten tree, which Exasol applies itself.
+    /// Returns `(scan_filter, declined)`, mutually exclusive (`_decision/045`). `scan_filter` is
+    /// `None` for a trivially true filter; `declined` is the raw tree, which Exasol applies itself.
     pub(super) fn split_where(self, filter: Option<&Json>) -> (Option<String>, Option<&Json>) {
-        match filter {
-            None => (None, None),
-            Some(raw) => match self.filter(raw) {
-                Ok(sql) => (sql, None),
-                Err(_) => (None, Some(raw)),
-            },
+        let Some(raw) = filter else {
+            return (None, None);
+        };
+        match render_scan_filter(&scan_rewrite(raw, self.columns), self.columns) {
+            Ok(sql) => (sql, None),
+            Err(_) => (None, Some(raw)),
         }
     }
 }
@@ -912,9 +907,8 @@ fn is_pushable_expression_node(node_type: &str) -> bool {
     )
 }
 
-/// The one builder of a pushdown output select list. Exasol type-checks each output column
-/// against its declared type, so an item is cast unless its fragment already has that type.
-/// `None` when the item count differs from the declared types, which Exasol would reject.
+/// The one builder of a pushdown output select list: each item is cast to its declared type
+/// unless it already has it. `None` when the item count differs from the declared types.
 pub(super) fn output_select_list(
     items: impl IntoIterator<Item = SqlFragment>,
     select_types: &[ExasolType],

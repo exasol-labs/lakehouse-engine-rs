@@ -111,8 +111,13 @@ pub fn exa_conn() -> ExaConn {
     ExaConn::connect(&exasol_host(), exasol_sql_port(), "sys", SYS_PASSWORD)
 }
 
-/// An [`exa_conn`] whose session applies `setting`, such as `NLS_DATE_FORMAT = 'DD.MM.YYYY'`;
-/// an empty `setting` keeps the defaults.
+/// The [`exa_session`] setting that keeps the session defaults.
+pub const DEFAULT_SESSION: &str = "";
+/// A date format under which no ISO date text parses.
+pub const DMY: &str = "NLS_DATE_FORMAT = 'DD.MM.YYYY'";
+
+/// An [`exa_conn`] whose session applies `setting`, such as [`DMY`]; [`DEFAULT_SESSION`] keeps
+/// the defaults.
 pub fn exa_session(setting: &str) -> ExaConn {
     let mut conn = exa_conn();
     if !setting.is_empty() {
@@ -859,6 +864,9 @@ fn comparable_outcome(conn: &mut ExaConn, sql: &str) -> Outcome {
     let resp = conn.try_execute(sql);
     if resp["status"] == "error" {
         let text = error_text(&resp, sql);
+        // A CAST Exasol evaluates over the scanned rows fails in a UDF VM, which prefixes the
+        // same error message.
+        let text = text.strip_prefix("VM error: ").unwrap_or(&text);
         return Err(text
             .split([';', '('])
             .next()
@@ -928,19 +936,33 @@ impl PathCheck<'_> {
     }
 }
 
+/// What the native query returns. A case states it, so a query that fails on both sides for a
+/// reason the case did not intend, such as a misspelled column, does not pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expect {
+    Rows,
+    Error,
+}
+
 /// `query` names its table `{T}`. Over `vs_table` it must have the outcome it has over
-/// `native_table`, the same rows or the same error class, and its pushdown must take `path`.
-/// Returns what differs.
+/// `native_table`, which must be `expect`: the same rows or the same error class. Its pushdown
+/// must take `path`. Returns what differs.
 pub fn native_copy_mismatch(
     conn: &mut ExaConn,
     vs_table: &str,
     native_table: &str,
     query: &str,
     path: PathCheck<'_>,
+    expect: Expect,
 ) -> Option<String> {
     let vs_query = query.replace("{T}", vs_table);
     let actual = comparable_outcome(conn, &vs_query);
     let expected = comparable_outcome(conn, &query.replace("{T}", native_table));
+    if expected.is_err() != (expect == Expect::Error) {
+        return Some(format!(
+            "`{query}`: native must return {expect:?}, got {expected:?}"
+        ));
+    }
     if actual != expected {
         return Some(format!("`{query}`: got {actual:?}, native {expected:?}"));
     }
@@ -1199,7 +1221,14 @@ fn assert_no_native_mismatch(conn: &mut ExaConn, table: &str, queries: &[&str]) 
     let failures: Vec<String> = queries
         .iter()
         .filter_map(|query| {
-            native_copy_mismatch(conn, table, NATIVE_COPY, query, PathCheck::Unchecked)
+            native_copy_mismatch(
+                conn,
+                table,
+                NATIVE_COPY,
+                query,
+                PathCheck::Unchecked,
+                Expect::Rows,
+            )
         })
         .collect();
     assert!(

@@ -37,7 +37,7 @@ pub(crate) fn untyped_scan_expression(expr: &Json) -> Option<String> {
 
 /// The scan's typed filter SQL, `None` when it declines or the filter is trivially true.
 pub(crate) fn scan_filter_sql(filter: &Json, col_types: &ColumnTypes) -> Option<String> {
-    ScanTranslator::new(col_types).filter(filter).ok().flatten()
+    ScanTranslator::new(col_types).split_where(Some(filter)).0
 }
 
 /// The deduplicated partial plans of a single-group select list, whatever their types.

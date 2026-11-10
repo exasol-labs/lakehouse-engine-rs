@@ -4,7 +4,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ## Background
 
-The translator serves two SQL parsers through one recursive walker. The DataFusion entry points (`render_expression`, `render_expression_safe`, `render_df_filter_safe`) feed DataFusion's SQL frontend inside the scan UDF. The Exasol entry points (`render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe`) feed outer wrapper SQL that Exasol's own engine parses.
+The translator serves two SQL parsers through one recursive walker. The DataFusion entry points (`render_scan_expression`, `render_scan_filter`) feed DataFusion's SQL frontend inside the scan UDF. The Exasol entry points (`render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe`) feed outer wrapper SQL that Exasol's own engine parses.
 
 In the DataFusion dialect, most Exasol `FN_*` names lower-case to the DataFusion function of the same name. These need explicit aliasing: `SIGN`→`signum`, `LENGTH`→`character_length`, `MOD`→`%` operator, `INSTR`/`LOCATE`→`strpos` (with operand reorder), `UNICODE`→`ascii`, `UNICODECHR`→`chr`, `NULLIFZERO`→`nullif(x,0)`, `ZEROIFNULL`→`coalesce(x,0)`.
 
@@ -97,5 +97,5 @@ These constructs are excluded from the verbatim rule and keep a dedicated render
 * *GIVEN* a VS expression node of type `function_scalar` named `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`, or `REGEXP_COUNT`
 * *WHEN* `render_expression` processes the node in raising mode
 * *THEN* the translator SHALL return the error `unsupported scalar function: <NAME>`
-* *AND* `render_expression_safe` SHALL return `None` for the same node without panicking, and `render_expression_exasol` / `render_expression_exasol_safe` SHALL decline these five names identically, one capability set serves both dialects, so the Exasol dialect's verbatim rule MUST NOT widen the translated set
+* *AND* `render_scan_expression` SHALL return an error for the same node without panicking, and `render_expression_exasol` / `render_expression_exasol_safe` SHALL decline these five names identically, one capability set serves both dialects, so the Exasol dialect's verbatim rule MUST NOT widen the translated set
 * *AND* the adapter SHALL NOT advertise `FN_PRED_REGEXP_LIKE`, `FN_REGEXP_REPLACE`, `FN_REGEXP_SUBSTR`, `FN_REGEXP_INSTR`, or `FN_REGEXP_COUNT`, so Exasol evaluates each of them

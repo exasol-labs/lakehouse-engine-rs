@@ -6,14 +6,12 @@ use crate::common::e2e_harness::*;
 use crate::common::seed::{CHAR_PAD_COL, CHAR_PAD_TOTAL_ROWS};
 use crate::fixtures::{LAKEHOUSE_VS, TYPED_COLUMNS, lakehouse_vs, typed_table, vs_char_pad_table};
 
-const DMY: &str = "NLS_DATE_FORMAT = 'DD.MM.YYYY'";
 const YDM: &str = "NLS_DATE_FORMAT = 'YYYY-DD-MM'";
 const TS_DMY: &str = "NLS_TIMESTAMP_FORMAT = 'DD.MM.YYYY HH24:MI:SS.FF6'";
 const COMMA: &str = "NLS_NUMERIC_CHARACTERS = ',.'";
-const DEFAULT: &str = "";
 
 /// `query` over `{T}`, run in a session with `setting` applied, must match native Exasol and take
-/// `path`.
+/// `path`. Native Exasol returns rows for [`CASES`] and raises an error for [`ERROR_CASES`].
 struct Case {
     setting: &'static str,
     query: &'static str,
@@ -57,32 +55,32 @@ const CASES: &[Case] = &[
         path: Lacks(SCAN_FILTER),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, CAST(C_DECIMAL_A AS VARCHAR(20)) FROM {T}",
         path: Lacks(SCAN_ITEM),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, ID || '-' || C_DECIMAL_A FROM {T}",
         path: Lacks(SCAN_ITEM),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, LENGTH(C_DECIMAL_A) FROM {T}",
         path: Lacks(SCAN_ITEM),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, LTRIM(C_DECIMAL_A) FROM {T}",
         path: Lacks(SCAN_ITEM),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, INSTR(C_DECIMAL_A, '.') FROM {T}",
         path: Lacks(SCAN_ITEM),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID FROM {T} WHERE LENGTH(C_DECIMAL_A) > 4",
         path: Lacks(SCAN_FILTER),
     },
@@ -117,22 +115,22 @@ const CASES: &[Case] = &[
         path: Lacks(SCAN_FILTER),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, CAST(C_TS AS VARCHAR(40)) FROM {T}",
         path: Lacks(SCAN_ITEM),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID FROM {T} WHERE CAST(C_TS AS VARCHAR(40)) LIKE '2024-01-01 %'",
         path: Lacks(SCAN_FILTER),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID FROM {T} WHERE CAST(C_BOOL AS VARCHAR(2000000)) = 'TRUE'",
         path: Has(SCAN_FILTER),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT C_DECIMAL_A || '' K, COUNT(*) FROM {T} GROUP BY C_DECIMAL_A || ''",
         path: Wrapper,
     },
@@ -172,48 +170,28 @@ const CASES: &[Case] = &[
         path: Split,
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, C_DECIMAL_A || '' FROM {T} WHERE ID = 1",
         path: Lacks(SCAN_ITEM),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, C_BOOL || 'x', C_DECIMAL_A || '' FROM {T} WHERE ID = 1",
         path: Lacks(SCAN_ITEM),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, C_BOOL || 'x', C_DOUBLE || '' FROM {T} WHERE ID = 1",
         path: Lacks(SCAN_ITEM),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, C_BOOL || 'x', C_DECIMAL_A || 'x' FROM {T} WHERE ID = 1",
         path: Lacks(SCAN_ITEM),
     },
     Case {
-        setting: DMY,
-        query: "SELECT ID FROM {T} WHERE C_DATE = '2024-01-01'",
-        path: Lacks(SCAN_FILTER),
-    },
-    Case {
-        setting: DMY,
-        query: "SELECT ID FROM {T} WHERE TO_DATE('2024-01-0' || (MOD(ID, 9) + 1)) = C_DATE",
-        path: Lacks(SCAN_FILTER),
-    },
-    Case {
         setting: TS_DMY,
         query: "SELECT ID FROM {T} WHERE TO_TIMESTAMP('01.01.2024 00:00:00.' || (MOD(ID, 9) + 1) || '00000') >= C_TS",
-        path: Lacks(SCAN_FILTER),
-    },
-    Case {
-        setting: DMY,
-        query: "SELECT ID FROM {T} WHERE COALESCE(C_DATE, '2024-01-02') = C_DATE",
-        path: Lacks(SCAN_FILTER),
-    },
-    Case {
-        setting: DMY,
-        query: "SELECT ID FROM {T} WHERE DAYS_BETWEEN(C_DATE, '2024-01-01') > 0",
         path: Lacks(SCAN_FILTER),
     },
     Case {
@@ -222,17 +200,7 @@ const CASES: &[Case] = &[
         path: Lacks(SCAN_FILTER),
     },
     Case {
-        setting: COMMA,
-        query: "SELECT ID FROM {T} WHERE CAST(C_QTY || '.5' AS DECIMAL(10,1)) > 0",
-        path: Lacks(SCAN_FILTER),
-    },
-    Case {
-        setting: COMMA,
-        query: "SELECT ID FROM {T} WHERE CAST(C_QTY || '.5' AS DOUBLE) > 0",
-        path: Lacks(SCAN_FILTER),
-    },
-    Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID FROM {T} WHERE C_QTY + '1' > 2",
         path: Lacks(SCAN_FILTER),
     },
@@ -247,32 +215,32 @@ const CASES: &[Case] = &[
         path: Has(SCAN_FILTER),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID FROM {T} WHERE C_QTY IN ('3', '007')",
         path: Has(SCAN_FILTER),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID FROM {T} WHERE C_QTY BETWEEN '2' AND '004'",
         path: Has(SCAN_FILTER),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, CAST(C_QTY AS VARCHAR(21)) FROM {T}",
         path: Has(SCAN_ITEM),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, CAST(C_QTY AS VARCHAR(5)) FROM {T}",
         path: Lacks(SCAN_ITEM),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID FROM {T} WHERE CAST(C_QTY AS VARCHAR(5)) LIKE '1%'",
         path: Lacks(SCAN_FILTER),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, CAST(C_BOOL AS VARCHAR(4)) FROM {T} WHERE C_BOOL",
         path: Lacks(SCAN_ITEM),
     },
@@ -282,70 +250,103 @@ const CASES: &[Case] = &[
         path: Split,
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT MAX(UPPER(C_QTY)) FROM {T}",
         path: Split,
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT COUNT(UPPER(C_QTY)) FROM {T}",
         path: Split,
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT CAST(C_DECIMAL_A AS VARCHAR(20)), COUNT(*) FROM {T} GROUP BY CAST(C_DECIMAL_A AS VARCHAR(20))",
         path: Wrapper,
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, UPPER(C_DOUBLE * 1.5E0) FROM {T}",
         path: Lacks(SCAN_ITEM),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, CAST(C_TS + INTERVAL '1' HOUR AS VARCHAR(30)) FROM {T}",
         path: Lacks(SCAN_ITEM),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID, CAST(C_VARCHAR AS CHAR(5)) || '|' FROM {T}",
         path: Lacks(SCAN_ITEM),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT C_QTY, TIMESTAMP '2024-01-01 00:00:00', SUM(ID) FROM {T} GROUP BY C_QTY",
         path: Split,
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID FROM {T} WHERE LOCATE('a', C_VARCHAR, 2) = 2",
         path: Lacks(SCAN_FILTER),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT INSTR(C_VARCHAR, 'a', 2), COUNT(*) FROM {T} GROUP BY INSTR(C_VARCHAR, 'a', 2)",
         path: Wrapper,
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID FROM {T} WHERE LOCATE('a', C_VARCHAR) = 2",
         path: Has(SCAN_FILTER),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID FROM {T} WHERE INSTR(C_VARCHAR, 'a') = 2",
         path: Has(SCAN_FILTER),
     },
     Case {
-        setting: DEFAULT,
+        setting: DEFAULT_SESSION,
         query: "SELECT ID FROM {T} WHERE CAST(C_VARCHAR AS CHAR(5)) = C_VARCHAR",
         path: Lacks(SCAN_FILTER),
     },
 ];
 
-fn mismatch(table: &str, case: &Case) -> Option<String> {
+const ERROR_CASES: &[Case] = &[
+    Case {
+        setting: DMY,
+        query: "SELECT ID FROM {T} WHERE C_DATE = '2024-01-01'",
+        path: Lacks(SCAN_FILTER),
+    },
+    Case {
+        setting: DMY,
+        query: "SELECT ID FROM {T} WHERE TO_DATE('2024-01-0' || (MOD(ID, 9) + 1)) = C_DATE",
+        path: Lacks(SCAN_FILTER),
+    },
+    Case {
+        setting: DMY,
+        query: "SELECT ID FROM {T} WHERE COALESCE(C_DATE, '2024-01-02') = C_DATE",
+        path: Lacks(SCAN_FILTER),
+    },
+    Case {
+        setting: DMY,
+        query: "SELECT ID FROM {T} WHERE DAYS_BETWEEN(C_DATE, '2024-01-01') > 0",
+        path: Lacks(SCAN_FILTER),
+    },
+    Case {
+        setting: COMMA,
+        query: "SELECT ID FROM {T} WHERE CAST(C_QTY || '.5' AS DECIMAL(10,1)) > 0",
+        path: Lacks(SCAN_FILTER),
+    },
+    Case {
+        setting: COMMA,
+        query: "SELECT ID FROM {T} WHERE CAST(C_QTY || '.5' AS DOUBLE) > 0",
+        path: Lacks(SCAN_FILTER),
+    },
+];
+
+fn mismatch(table: &str, case: &Case, expect: Expect) -> Option<String> {
     let mut conn = exa_session(case.setting);
-    native_copy_mismatch(&mut conn, table, NATIVE_COPY, case.query, case.path)
+    native_copy_mismatch(&mut conn, table, NATIVE_COPY, case.query, case.path, expect)
         .map(|failure| format!("[{}] {failure}", case.setting))
 }
 
@@ -354,8 +355,8 @@ fn mismatch(table: &str, case: &Case) -> Option<String> {
 /// Scenario: A digits-only literal compares with an integer as a number
 /// Scenario: A group key travels with its exact type
 /// Scenario: A CAST of text to CHAR runs in Exasol
-/// Scenario: INSTR and LOCATE with a start position run in Exasol
-/// Scenario: A select item the scan declines widens the projection to the full base row
+/// Scenario: String scalar functions translate to DataFusion string calls
+/// Scenario: A widened derived projection routes to a native wrapper on every path
 /// Scenario: A join condition or filter that converts a date to text takes the N-scan fallback
 #[test]
 fn text_conversions_match_native_under_session_settings() {
@@ -363,16 +364,20 @@ fn text_conversions_match_native_under_session_settings() {
     let table = typed_table();
     create_native_copy(&mut exa_conn(), &table, TYPED_COLUMNS);
 
-    let failures: Vec<String> = CASES
+    let cases = CASES
         .iter()
-        .filter_map(|case| mismatch(&table, case))
+        .map(|case| (case, Expect::Rows))
+        .chain(ERROR_CASES.iter().map(|case| (case, Expect::Error)));
+    let failures: Vec<String> = cases
+        .clone()
+        .filter_map(|(case, expect)| mismatch(&table, case, expect))
         .collect();
 
     assert!(
         failures.is_empty(),
         "{} of {} cases differ:\n{}",
         failures.len(),
-        CASES.len(),
+        cases.count(),
         failures.join("\n")
     );
 }

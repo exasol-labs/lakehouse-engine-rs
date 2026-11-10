@@ -415,6 +415,18 @@ impl TypedPlans {
             merged,
         })
     }
+
+    pub(super) fn slot_of(&self, plan: &AggregatePlan) -> Option<usize> {
+        self.plans.iter().position(|p| p == plan)
+    }
+
+    /// The merged expression of `slot` with its native type.
+    pub(super) fn fragment(&self, slot: usize) -> Option<SqlFragment> {
+        Some(SqlFragment::new(
+            self.merged.get(slot)?.clone(),
+            self.types.get(slot).copied(),
+        ))
+    }
 }
 
 /// Each merged aggregate in its native type, so an outer scalar, HAVING, or the output sees the

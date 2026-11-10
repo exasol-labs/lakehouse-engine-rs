@@ -42,7 +42,7 @@ pub(crate) struct RenderedJoinPushdown {
 
 /// `Ok(None)` is a clean decline to the N-scan fallback when the condition won't render, the
 /// projection widened to the full row (#196), a projected output name exceeds Exasol's
-/// identifier limit, or the WHERE filter declines through [`classify_where_filter`]: broadcast
+/// identifier limit, or the WHERE filter declines through [`ScanTranslator::split_where`]: broadcast
 /// has no outer WHERE to apply a declined predicate. `Err` for a request with no column
 /// metadata at all, or with a column no single leg owns.
 ///
@@ -227,9 +227,8 @@ fn render_self_applied_where(
     )))
 }
 
-/// An absent/empty select list projects every column of every leg. An item whose type the request
-/// does not state renders cast to its declared type: Exasol sends `''` and `NULL` alike as a bare
-/// `literal_null` but types them differently, so only the declared type reproduces it (#587).
+/// An absent/empty select list projects every column of every leg. An item without a stated type
+/// is cast to its declared type: Exasol sends `''` and `NULL` alike as `literal_null` (#587).
 fn n_scan_join_select_items(
     pushdown: &PushdownRequest,
     legs: &JoinLegs,
@@ -316,10 +315,8 @@ fn outer_wrapper_clauses(
 /// owned by [`JoinLegs`], so self-join occurrences stay distinct legs (#361). All references
 /// render leg-qualified (`"LHS_T{i}"."COL"`), so shared column or table names are safe.
 ///
-/// Each leg receives the leg-local conjuncts [`screen_leg_filter`] renders. Everything else
-/// (cross-leg, OR-spanning, untagged, declined, unattachable) goes to the outer WHERE, each
-/// parenthesized; nothing is omitted. The fan-out loop runs first, since the screen hands
-/// declined conjuncts back.
+/// Each leg receives the leg-local conjuncts [`screen_leg_filter`] renders; every other conjunct,
+/// declined ones included, goes to the outer WHERE, so the fan-out loop runs first.
 ///
 /// `Err` (hard, no native re-plan) only when the wrapper cannot be built, including a
 /// residual neither dialect renders: a predicate applicable nowhere must fail the query.

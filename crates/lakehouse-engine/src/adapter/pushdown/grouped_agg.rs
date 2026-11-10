@@ -223,13 +223,8 @@ fn group_key_column(slot: usize) -> String {
     quote_ident(&group_key_name(slot))
 }
 
-/// Exasol does not re-sort a delegated `ORDER BY`, so the merge must sort itself.
-/// Group keys sort on their typed `GK_*` column, projected or not. Aggregate keys render
-/// as their merged expression; no hidden output column is added, so Exasol's positional
-/// validation is unaffected.
-///
-/// `None` without an `orderBy`. Anything unexpressible over the merge is
-/// [`GroupedOrderBy::Unresolvable`], routing to the qualified wrapper (#198).
+/// Exasol does not re-sort a delegated `ORDER BY`, so the merge sorts itself, on the keys a HAVING
+/// operand reads, with no hidden output column. `None` without an `orderBy` (#198).
 pub(super) fn build_grouped_order_by_clause(
     pushdown_req: &Json,
     scope: &MergeScope<'_>,
@@ -248,12 +243,8 @@ pub(super) fn build_grouped_order_by_clause(
         let Some(expr) = element.get("expression") else {
             return Some(GroupedOrderBy::Unresolvable);
         };
-        let ordering = match group_key_slot(expr, scope, scan) {
-            Some(slot) => group_key_column(slot),
-            None => match render_having_over_merge(expr, scope, scan) {
-                Some(merged) => merged,
-                None => return Some(GroupedOrderBy::Unresolvable),
-            },
+        let Some(ordering) = render_merge_operand(Some(expr), scope, scan) else {
+            return Some(GroupedOrderBy::Unresolvable);
         };
         parts.push(render_ordered(&ordering, ascending, nulls_last));
     }
@@ -317,10 +308,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
                 group_key_column(*group_key_slot),
                 group_key_types.get(*group_key_slot).copied(),
             )),
-            GroupedSelectItem::Aggregate { plan_slot, .. } => Some(SqlFragment::new(
-                aggregates.merged.get(*plan_slot)?.clone(),
-                aggregates.types.get(*plan_slot).copied(),
-            )),
+            GroupedSelectItem::Aggregate { plan_slot, .. } => aggregates.fragment(*plan_slot),
             GroupedSelectItem::Constant { projection, .. } => Some(projection.clone()),
             GroupedSelectItem::ScalarOverAggregate { node, .. } => {
                 render_scalar_over_merge(node, &aggregates.plans, &aggregates.merged, scan)
@@ -405,10 +393,8 @@ pub fn validate_agg_col_types(aggregates: &[AggregatePlan], col_types: &ColumnTy
     true
 }
 
-/// The merge wrapper has only `GK_*`/`PARTIAL_*` columns, so each aggregate is
-/// rewritten to its merged expression and each group key to its `GK_*` column. `None` for an
-/// aggregate not among `plans` or an unsupported node, so the caller never emits a wrong or
-/// dropped HAVING.
+/// Rewrites each aggregate to its merged expression and each group key to its `GK_*` column.
+/// `None` for an aggregate not among the plans or an unsupported node, never a dropped HAVING.
 pub(super) fn render_having_over_merge(
     node: &Json,
     scope: &MergeScope<'_>,
@@ -422,15 +408,15 @@ pub(super) fn render_having_over_merge(
 
     if kind == "function_aggregate" {
         let plan = parse_agg_item(node, scan)?;
-        let idx = scope.aggregates.plans.iter().position(|p| *p == plan)?;
-        return scope.aggregates.merged.get(idx).cloned();
+        let slot = scope.aggregates.slot_of(&plan)?;
+        return scope.aggregates.merged.get(slot).cloned();
     }
 
     match kind {
         "predicate_and" => render_having_junction(child("expressions"), scope, " AND ", scan),
         "predicate_or" => render_having_junction(child("expressions"), scope, " OR ", scan),
         "predicate_not" => {
-            let inner = render_having_operand(child("expression"), scope, scan)?;
+            let inner = render_merge_operand(child("expression"), scope, scan)?;
             Some(format!("(NOT {inner})"))
         }
         "predicate_equal"
@@ -448,29 +434,30 @@ pub(super) fn render_having_over_merge(
                 "predicate_greaterequal" => ">=",
                 _ => unreachable!(),
             };
-            let left = render_having_operand(child("left"), scope, scan)?;
-            let right = render_having_operand(child("right"), scope, scan)?;
+            let left = render_merge_operand(child("left"), scope, scan)?;
+            let right = render_merge_operand(child("right"), scope, scan)?;
             Some(format!("({left} {op} {right})"))
         }
         "predicate_between" => {
-            let target = render_having_operand(child("expression"), scope, scan)?;
-            let low = render_having_operand(child("left"), scope, scan)?;
-            let high = render_having_operand(child("right"), scope, scan)?;
+            let target = render_merge_operand(child("expression"), scope, scan)?;
+            let low = render_merge_operand(child("left"), scope, scan)?;
+            let high = render_merge_operand(child("right"), scope, scan)?;
             Some(format!("({target} BETWEEN {low} AND {high})"))
         }
         "predicate_is_null" => {
-            let inner = render_having_operand(child("expression"), scope, scan)?;
+            let inner = render_merge_operand(child("expression"), scope, scan)?;
             Some(format!("({inner} IS NULL)"))
         }
         "predicate_is_not_null" => {
-            let inner = render_having_operand(child("expression"), scope, scan)?;
+            let inner = render_merge_operand(child("expression"), scope, scan)?;
             Some(format!("({inner} IS NOT NULL)"))
         }
         _ => None,
     }
 }
 
-fn render_having_operand(
+/// A HAVING operand or ORDER BY key over the merge, which has only `GK_*` and `PARTIAL_*` columns.
+fn render_merge_operand(
     node: Option<&Json>,
     scope: &MergeScope<'_>,
     scan: ScanTranslator<'_>,
@@ -503,9 +490,8 @@ fn render_having_operand(
     }
 }
 
-/// A scalar that mixes group keys and aggregates, such as `C_QTY + SUM(ID)`: each group-key
-/// column reads its `GK_*` column. `None` while any other source column remains, because the
-/// merge has none (#551).
+/// A scalar over group keys and aggregates, such as `C_QTY + SUM(ID)`, with each key read from its
+/// `GK_*` column. `None` while another source column remains, because the merge has none (#551).
 fn render_scalar_over_merge_with_keys(
     node: &Json,
     scope: &MergeScope<'_>,

@@ -3089,30 +3089,6 @@ fn char_declared_pushdown_shapes_match_native() {
     }
 }
 
-/// Scenario: A CAST to CHAR returns Exasol's padded value
-#[test]
-fn over_length_char_group_key_raises_truncation_error_like_native() {
-    lakehouse_vs();
-    let mut conn = exa_conn();
-    let table = vs_char_pad_table();
-    create_full_native_copy(&mut conn, &table);
-
-    for query in [
-        format!("SELECT CAST({CHAR_PAD_COL} AS CHAR(20)) g, COUNT(*) c FROM {{T}} GROUP BY 1"),
-        format!("SELECT COUNT(*) c FROM {{T}} GROUP BY CAST({CHAR_PAD_COL} AS CHAR(20))"),
-    ] {
-        let vs_query = query.replace("{T}", &table);
-        let pushed = isolated_pushdown_statement(&mut conn, &vs_query);
-        assert!(
-            PathCheck::Wrapper.holds(&query, &pushed),
-            "the scan does not blank-pad, so Exasol must group on the CAST: {pushed}"
-        );
-        for sql in [vs_query, query.replace("{T}", NATIVE_COPY)] {
-            assert_query_fails(&mut conn, &sql, &["right truncation"]);
-        }
-    }
-}
-
 #[test]
 fn e2e_float_div_decimal_over_int_matches_native_oracle() {
     lakehouse_vs();
@@ -3251,6 +3227,18 @@ const SPLIT_AGGREGATE_CASES: &[(&str, PathCheck<'static>)] = &[
         PathCheck::Unchecked,
     ),
     (
+        "SELECT C_QTY, SUM(ID) FROM {T} GROUP BY C_QTY HAVING C_QTY + SUM(ID) > 10",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT SUM(ID) FROM {T} GROUP BY C_QTY HAVING C_QTY + SUM(ID) > 10",
+        PathCheck::Split,
+    ),
+    (
+        "SELECT C_QTY, SUM(ID) FROM {T} GROUP BY C_QTY ORDER BY C_QTY + SUM(ID) DESC, C_QTY LIMIT 3",
+        PathCheck::Split,
+    ),
+    (
         "SELECT C_DATE, COUNT(*) FROM {T} GROUP BY C_DATE ORDER BY C_DATE",
         PathCheck::Split,
     ),
@@ -3280,30 +3268,49 @@ const SPLIT_AGGREGATE_CASES: &[(&str, PathCheck<'static>)] = &[
     ),
 ];
 
-/// Over the CHAR pad table. The scan does not blank-pad, so Exasol applies each CAST to CHAR.
-fn char_cast_cases() -> Vec<(String, PathCheck<'static>)> {
+/// Over the CHAR pad table. The scan does not blank-pad, so Exasol applies each CAST to CHAR, and
+/// the over-length value fails a `CHAR(20)` with Exasol's right-truncation error.
+fn char_cast_cases() -> Vec<(String, Expect)> {
     let cast = |n: u32| format!("CAST({CHAR_PAD_COL} AS CHAR({n}))");
     let fits = format!("{CHAR_PAD_COL} <> '{CHAR_PAD_OVER_LENGTH}'");
     [
-        format!(
-            "SELECT {}, COUNT(*) FROM {{T}} WHERE {fits} GROUP BY {}",
-            cast(4),
-            cast(4)
+        (
+            format!(
+                "SELECT {}, COUNT(*) FROM {{T}} WHERE {fits} GROUP BY {}",
+                cast(4),
+                cast(4)
+            ),
+            Expect::Rows,
         ),
-        format!(
-            "SELECT COUNT(*) FROM {{T}} WHERE {fits} GROUP BY {}",
-            cast(4)
+        (
+            format!(
+                "SELECT COUNT(*) FROM {{T}} WHERE {fits} GROUP BY {}",
+                cast(4)
+            ),
+            Expect::Rows,
         ),
-        format!(
-            "SELECT {} FROM {{T}} WHERE {CHAR_PAD_COL} = '{CHAR_PAD_SHORT_TRAILING_SPACE}'",
-            cast(4)
+        (
+            format!(
+                "SELECT {} FROM {{T}} WHERE {CHAR_PAD_COL} = '{CHAR_PAD_SHORT_TRAILING_SPACE}'",
+                cast(4)
+            ),
+            Expect::Rows,
         ),
-        format!("SELECT {} g, COUNT(*) c FROM {{T}} GROUP BY 1", cast(30)),
-        format!("SELECT {} FROM {{T}}", cast(20)),
+        (
+            format!("SELECT {} g, COUNT(*) c FROM {{T}} GROUP BY 1", cast(30)),
+            Expect::Rows,
+        ),
+        (format!("SELECT {} FROM {{T}}", cast(20)), Expect::Error),
+        (
+            format!("SELECT {} g, COUNT(*) c FROM {{T}} GROUP BY 1", cast(20)),
+            Expect::Error,
+        ),
+        (
+            format!("SELECT COUNT(*) c FROM {{T}} GROUP BY {}", cast(20)),
+            Expect::Error,
+        ),
     ]
-    .into_iter()
-    .map(|query| (query, PathCheck::Wrapper))
-    .collect()
+    .into()
 }
 
 /// Scenario: A nested aggregate over an expression declines the split
@@ -3323,15 +3330,22 @@ fn e2e_split_aggregate_columns_match_native_oracle() {
     let mut failures: Vec<String> = SPLIT_AGGREGATE_CASES
         .iter()
         .filter_map(|(query, path)| {
-            native_copy_mismatch(&mut conn, &typed, NATIVE_COPY, query, *path)
+            native_copy_mismatch(&mut conn, &typed, NATIVE_COPY, query, *path, Expect::Rows)
         })
         .collect();
 
     let char_pad = vs_char_pad_table();
     create_full_native_copy(&mut conn, &char_pad);
     let char_cases = char_cast_cases();
-    failures.extend(char_cases.iter().filter_map(|(query, path)| {
-        native_copy_mismatch(&mut conn, &char_pad, NATIVE_COPY, query, *path)
+    failures.extend(char_cases.iter().filter_map(|(query, expect)| {
+        native_copy_mismatch(
+            &mut conn,
+            &char_pad,
+            NATIVE_COPY,
+            query,
+            PathCheck::Wrapper,
+            *expect,
+        )
     }));
 
     assert!(

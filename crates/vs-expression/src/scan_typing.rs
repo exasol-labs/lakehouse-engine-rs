@@ -1,10 +1,10 @@
-//! The typed pass every expression the scan computes goes through. It derives each node's type
-//! class as Exasol types it, and declines a conversion to or from text that Exasol formats or
-//! parses by session settings the pushdown request does not carry (#587).
+//! The typed pass of every expression the scan computes. It declines a conversion to or from text
+//! that Exasol formats by session settings the pushdown request does not carry (#587).
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 use crate::exasol_type::{ExasolType, exasol_type_from_json};
+use crate::scalar_functions::{ResultRule, ScalarFunction, TextArgs, UNLISTED, scalar_function};
 
 /// The Exasol type of a `column` node, keyed however the caller binds columns.
 pub trait ColumnTypeLookup {
@@ -97,62 +97,7 @@ fn short(node: &Json) -> String {
     }
 }
 
-/// Which arguments of a function Exasol converts to text (#210).
-#[derive(Clone, Copy)]
-enum TextArgs {
-    Never,
-    All,
-    First,
-    FirstTwo,
-    /// The subject, and the fill of the three-argument form.
-    Pad,
-}
-
-/// How a function's result class follows from its arguments' classes.
-#[derive(Clone, Copy)]
-enum ResultRule {
-    Text,
-    Integer,
-    /// An integer when every argument is an integer or NULL.
-    IntegerOverIntegers,
-    FirstArgument,
-    Other,
-}
-
-/// What the typed pass and the renderer know about one scalar function.
-#[derive(Clone, Copy)]
-struct ScalarFunction {
-    name: &'static str,
-    text_args: TextArgs,
-    /// Text arguments that are parameters, not values: a format model or a unit.
-    parameters: &'static [usize],
-    result: ResultRule,
-    /// The renderer's generic arm emits it as a same-arity DataFusion string call.
-    string_call: bool,
-}
-
 impl ScalarFunction {
-    const fn new(name: &'static str, text_args: TextArgs, result: ResultRule) -> Self {
-        Self {
-            name,
-            text_args,
-            parameters: &[],
-            result,
-            string_call: false,
-        }
-    }
-
-    const fn string_call(self) -> Self {
-        Self {
-            string_call: true,
-            ..self
-        }
-    }
-
-    const fn parameters(self, parameters: &'static [usize]) -> Self {
-        Self { parameters, ..self }
-    }
-
     /// Indices of the arguments Exasol converts to text, for this arity.
     fn string_positions(self, arg_count: usize) -> Vec<usize> {
         let positions = match self.text_args {
@@ -178,75 +123,18 @@ impl ScalarFunction {
                 TypeClass::INTEGER
             }
             ResultRule::FirstArgument => args.first().copied().unwrap_or(TypeClass::Other),
+            ResultRule::Unified => args
+                .iter()
+                .copied()
+                .reduce(TypeClass::union)
+                .unwrap_or(TypeClass::Other),
             ResultRule::IntegerOverIntegers | ResultRule::Other => TypeClass::Other,
         }
     }
 }
 
-const UNLISTED: ScalarFunction = ScalarFunction::new("", TextArgs::Never, ResultRule::Other);
-
-/// The one per-function table; a name absent here takes no text and types as `Other`.
-const SCALAR_FUNCTIONS: &[ScalarFunction] = {
-    use ResultRule as R;
-    use ScalarFunction as F;
-    use TextArgs as T;
-    &[
-        F::new("CONCAT", T::All, R::Text),
-        F::new("TRIM", T::All, R::Text).string_call(),
-        F::new("LTRIM", T::All, R::Text).string_call(),
-        F::new("RTRIM", T::All, R::Text).string_call(),
-        F::new("REPLACE", T::All, R::Text).string_call(),
-        F::new("TRANSLATE", T::All, R::Text).string_call(),
-        F::new("LOWER", T::First, R::Text).string_call(),
-        F::new("UPPER", T::First, R::Text).string_call(),
-        F::new("INITCAP", T::First, R::Text).string_call(),
-        F::new("REVERSE", T::First, R::Text).string_call(),
-        F::new("SUBSTR", T::First, R::Text).string_call(),
-        F::new("REPEAT", T::First, R::Text).string_call(),
-        F::new("LEFT", T::First, R::Text).string_call(),
-        F::new("RIGHT", T::First, R::Text).string_call(),
-        F::new("LPAD", T::Pad, R::Text).string_call(),
-        F::new("RPAD", T::Pad, R::Text).string_call(),
-        F::new("CHR", T::Never, R::Text).string_call(),
-        F::new("UNICODECHR", T::Never, R::Text).string_call(),
-        F::new("ASCII", T::First, R::Integer).string_call(),
-        F::new("UNICODE", T::First, R::Integer).string_call(),
-        F::new("LENGTH", T::First, R::Integer).string_call(),
-        F::new("OCTET_LENGTH", T::First, R::Integer).string_call(),
-        F::new("INSTR", T::FirstTwo, R::Integer),
-        F::new("LOCATE", T::FirstTwo, R::Integer),
-        F::new("TO_DATE", T::First, R::Other).parameters(&[1]),
-        F::new("TO_TIMESTAMP", T::First, R::Other).parameters(&[1]),
-        F::new("DATE_TRUNC", T::Never, R::Other).parameters(&[0]),
-        F::new("YEAR", T::Never, R::Integer),
-        F::new("MONTH", T::Never, R::Integer),
-        F::new("DAY", T::Never, R::Integer),
-        F::new("HOUR", T::Never, R::Integer),
-        F::new("MINUTE", T::Never, R::Integer),
-        F::new("WEEK", T::Never, R::Integer),
-        F::new("ADD", T::Never, R::IntegerOverIntegers),
-        F::new("SUB", T::Never, R::IntegerOverIntegers),
-        F::new("MULT", T::Never, R::IntegerOverIntegers),
-        F::new("MOD", T::Never, R::IntegerOverIntegers),
-        F::new("NEG", T::Never, R::IntegerOverIntegers),
-        F::new("ABS", T::Never, R::IntegerOverIntegers),
-        F::new("ZEROIFNULL", T::Never, R::FirstArgument),
-        F::new("NULLIFZERO", T::Never, R::FirstArgument),
-        F::new("NULLIF", T::Never, R::FirstArgument),
-    ]
-};
-
-fn scalar_function(fn_name: &str) -> ScalarFunction {
-    SCALAR_FUNCTIONS
-        .iter()
-        .find(|f| f.name == fn_name)
-        .copied()
-        .unwrap_or(UNLISTED)
-}
-
-/// Whether the renderer emits upper-case `fn_name` as a same-arity DataFusion string call.
-pub(crate) fn is_string_call(fn_name: &str) -> bool {
-    scalar_function(fn_name).string_call
+fn typed_function(fn_name: &str) -> ScalarFunction {
+    scalar_function(fn_name).unwrap_or(UNLISTED)
 }
 
 /// The widest text an integer of `precision` digits converts to, sign included.
@@ -254,15 +142,15 @@ fn integer_text_width(precision: Option<u8>) -> u32 {
     u32::from(precision.unwrap_or(crate::exasol_type::MAX_DECIMAL_PRECISION)) + 1
 }
 
-/// An explicit CAST to CHAR or VARCHAR. Text into a shorter VARCHAR or an ASCII target runs
-/// unchecked, a documented difference (`docs/semantic-differences.md`); CHAR declines, because the
-/// scan does not blank-pad.
-fn cast_to_text(source: Json, class: TypeClass, target: ExasolType) -> Result<Json, UdfError> {
-    let (size, is_char) = match target {
-        ExasolType::Char { size, .. } => (size, true),
-        ExasolType::Varchar { size, .. } => (size, false),
-        _ => unreachable!("cast_to_text called with a non-character target"),
-    };
+/// A CAST to CHAR or VARCHAR. Text into a shorter VARCHAR or ASCII runs unchecked
+/// (`docs/semantic-differences.md`); CHAR declines, because the scan does not blank-pad.
+fn cast_to_text(
+    source: Json,
+    class: TypeClass,
+    target: ExasolType,
+    size: u32,
+    is_char: bool,
+) -> Result<Json, UdfError> {
     let refuse = |why: &str| {
         Err(decline(format!(
             "CAST of {} to {target} {why}",
@@ -310,9 +198,8 @@ fn cast_from_text(source: &Json, class: TypeClass, target: ExasolType) -> Result
     Ok(())
 }
 
-/// Rewrites `node` for the DataFusion dialect and derives its class. Post-order, so a check sees
-/// rewritten children. Text passes only where Exasol takes text; anywhere else Exasol converts it
-/// implicitly by the session's NLS settings, so the node declines.
+/// Rewrites `node` for the DataFusion dialect and derives its class, post-order. Text passes only
+/// where Exasol takes text; elsewhere Exasol converts it by the session's NLS settings.
 pub(crate) fn type_scan_tree(
     node: &Json,
     columns: &dyn ColumnTypeLookup,
@@ -378,17 +265,18 @@ pub(crate) fn type_scan_tree(
         "literal_null" => TypeClass::Null,
         "literal_bool" => TypeClass::Boolean,
         "literal_string" => TypeClass::Text,
-        "literal_exactnumeric" => match node.get("value") {
-            Some(Json::Number(n)) if n.is_i64() || n.is_u64() => TypeClass::Integer {
-                precision: u8::try_from(n.to_string().trim_start_matches('-').len()).ok(),
-            },
-            Some(Json::String(s)) if s.bytes().all(|b| b.is_ascii_digit() || b == b'-') => {
-                TypeClass::Integer {
-                    precision: u8::try_from(s.trim_start_matches('-').len()).ok(),
-                }
-            }
-            _ => TypeClass::Other,
-        },
+        "literal_exactnumeric" => {
+            let text = match node.get("value") {
+                Some(Json::Number(n)) if n.is_i64() || n.is_u64() => Some(n.to_string()),
+                Some(Json::String(s)) => Some(s.clone()),
+                _ => None,
+            };
+            text.as_deref()
+                .and_then(integer_digits)
+                .map_or(TypeClass::Other, |digits| TypeClass::Integer {
+                    precision: Some(digits),
+                })
+        }
         "predicate_like" => {
             for field in ["expression", "pattern"] {
                 if let Some(class) = class_of(field) {
@@ -422,16 +310,9 @@ pub(crate) fn type_scan_tree(
         }
         "function_scalar_extract" => {
             refuse_implicit_text(node, &all_children())?;
-            match node
-                .get("toExtract")
+            node.get("toExtract")
                 .and_then(Json::as_str)
-                .map(str::to_uppercase)
-            {
-                Some(f) if matches!(f.as_str(), "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE") => {
-                    TypeClass::INTEGER
-                }
-                _ => TypeClass::Other,
-            }
+                .map_or(TypeClass::Other, |field| typed_function(field).class(&[]))
         }
         "function_scalar_case" => {
             match (node.get("basis"), class_of("basis")) {
@@ -458,29 +339,24 @@ pub(crate) fn type_scan_tree(
                 cast_class(&mut out, &classes_of("arguments"))?
             } else {
                 let args = classes_of("arguments");
-                let function = scalar_function(&fn_name);
+                let function = typed_function(&fn_name);
                 let text_positions = function.string_positions(args.len());
                 for &i in &text_positions {
                     out["arguments"][i] = to_text(out["arguments"][i].take(), args[i])?;
                 }
-                match fn_name.as_str() {
-                    "GREATEST" | "LEAST" => unify_branches(node, &args)?,
-                    "NULLIF" => {
-                        unify_branches(node, &args)?;
-                        function.class(&args)
-                    }
-                    _ => {
-                        let converted: Vec<TypeClass> = args
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| {
-                                !text_positions.contains(i) && !function.parameters.contains(i)
-                            })
-                            .map(|(_, c)| *c)
-                            .collect();
-                        refuse_implicit_text(node, &converted)?;
-                        function.class(&args)
-                    }
+                if function.result == ResultRule::Unified {
+                    unify_branches(node, &args)?
+                } else {
+                    let converted: Vec<TypeClass> = args
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| {
+                            !text_positions.contains(i) && !function.parameters.contains(i)
+                        })
+                        .map(|(_, c)| *c)
+                        .collect();
+                    refuse_implicit_text(node, &converted)?;
+                    function.class(&args)
                 }
             }
         }
@@ -508,9 +384,8 @@ pub(crate) fn type_scan_tree(
     Ok((out, class))
 }
 
-/// Exasol's exact type of `node` where the request states it: the node's own `dataType` (a CAST)
-/// or a column's type. `None` otherwise: callers decline rather than copy Exasol's typing rules,
-/// which depend on literal values, the session, and the version (#476).
+/// The type the request states for `node`: a CAST's `dataType` or a column's type. `None`
+/// otherwise, because Exasol's expression typing depends on values, session, and version (#476).
 pub fn exact_expression_type(node: &Json, columns: &dyn ColumnTypeLookup) -> Option<ExasolType> {
     if let Some(data_type) = node.get("dataType") {
         return exasol_type_from_json(data_type).ok();
@@ -522,14 +397,24 @@ pub fn exact_expression_type(node: &Json, columns: &dyn ColumnTypeLookup) -> Opt
     }
 }
 
-/// A digits-only literal reads as the same integer in every session, so comparing it with an
-/// integer needs no session setting.
+/// The digit count of `text` when it is digits with an optional leading minus sign.
+fn integer_digits(text: &str) -> Option<u8> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    u8::try_from(digits.len()).ok()
+}
+
+/// A literal of at most 18 digits reads as the same integer in every session, so comparing it with
+/// an integer needs no session setting.
 fn is_session_free_integer_text(node: &Json) -> bool {
     kind(node) == "literal_string"
-        && node.get("value").and_then(Json::as_str).is_some_and(|s| {
-            let digits = s.strip_prefix('-').unwrap_or(s);
-            (1..=18).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
-        })
+        && node
+            .get("value")
+            .and_then(Json::as_str)
+            .and_then(integer_digits)
+            .is_some_and(|digits| digits <= 18)
 }
 
 /// Exasol parses text compared with a date or number by the session's NLS settings. A digits-only
@@ -629,11 +514,18 @@ fn cast_class(out: &mut Json, args: &[TypeClass]) -> Result<TypeClass, UdfError>
         .transpose()?
         .ok_or_else(|| UdfError::User("CAST missing 'dataType'".into()))?;
     let source_class = args.first().copied().unwrap_or(TypeClass::Other);
-    if target.is_character() {
-        let source = out["arguments"][0].take();
-        out["arguments"][0] = cast_to_text(source, source_class, target)?;
-    } else {
-        cast_from_text(&out["arguments"][0], source_class, target)?;
+    let source = out
+        .get_mut("arguments")
+        .and_then(|args| args.get_mut(0))
+        .ok_or_else(|| UdfError::User("CAST missing its argument".into()))?;
+    match target {
+        ExasolType::Char { size, .. } => {
+            *source = cast_to_text(source.take(), source_class, target, size, true)?;
+        }
+        ExasolType::Varchar { size, .. } => {
+            *source = cast_to_text(source.take(), source_class, target, size, false)?;
+        }
+        _ => cast_from_text(source, source_class, target)?,
     }
     Ok(TypeClass::of(target))
 }

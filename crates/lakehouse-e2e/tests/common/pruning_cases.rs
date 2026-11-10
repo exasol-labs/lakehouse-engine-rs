@@ -2,8 +2,8 @@
 //! binary provisions its format's copy of the fixture; these checks are shared by every format.
 
 use super::e2e_harness::{
-    PathCheck, SCAN_FILTER, SCAN_SCRIPT_NAME, isolated_pushdown_statement, native_copy_mismatch,
-    parse_int, value_to_string,
+    Expect, PathCheck, SCAN_FILTER, SCAN_SCRIPT_NAME, isolated_pushdown_statement,
+    native_copy_mismatch, parse_int, value_to_string,
 };
 use super::exasol_ws::ExaConn;
 use super::pruning_fixture::{
@@ -410,6 +410,7 @@ fn oracle_mismatch(conn: &mut ExaConn, query: &str, format: Format) -> Option<St
         PRUNING_ORACLE_TABLE,
         query,
         PathCheck::Unchecked,
+        Expect::Rows,
     )
 }
 
@@ -445,7 +446,14 @@ fn shape_mismatch(conn: &mut ExaConn, query: &str, format: Format, split: bool) 
     } else {
         PathCheck::Wrapper
     };
-    native_copy_mismatch(conn, &format.table(), PRUNING_ORACLE_TABLE, query, path)
+    native_copy_mismatch(
+        conn,
+        &format.table(),
+        PRUNING_ORACLE_TABLE,
+        query,
+        path,
+        Expect::Rows,
+    )
 }
 
 pub fn assert_single_group_aggregates_match_oracle(conn: &mut ExaConn, format: Format) {

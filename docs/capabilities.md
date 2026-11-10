@@ -91,7 +91,7 @@ Exasol writes a DATE, TIMESTAMP, DOUBLE, or DECIMAL with a scale as text, and re
 
 Integers and BOOLEAN convert to text in the scan, and an integer compared with a digits-only literal (`id = '3'`) stays in the scan. A CAST to `CHAR(n)` runs in Exasol SQL, because the scan does not blank-pad.
 
-A WHERE that holds such a condition runs entirely in Exasol SQL, prunes no files, and in a join loses the broadcast plan. Write the literal in its type, or give the format:
+Such a condition runs in Exasol SQL. On a single table it takes the whole WHERE with it, so the scan filters no rows, and in a join it loses the broadcast plan, though an N-scan join leg keeps its other conditions. File pruning still uses the conditions it can read, but the converted one prunes nothing. Write the literal in its type, or give the format:
 
 | Runs in Exasol SQL | Runs in the scan |
 |---|---|

@@ -47,24 +47,11 @@ The scan computes an expression only when DataFusion returns what native Exasol 
 * *AND* trailing spaces beyond `n`, which native Exasol cuts, SHALL stay
 * *AND* a select item over a value that does not fit SHALL fail at the emit
 
-### Scenario: INSTR and LOCATE with a start position run in Exasol
-
-* *GIVEN* `INSTR` with a start position or an occurrence, or `LOCATE` with a start position
-* *WHEN* the adapter plans the request
-* *THEN* the scan SHALL NOT compute it, and the result SHALL equal native Exasol
-* *AND* `INSTR` and `LOCATE` with two arguments SHALL run in the scan
-
 ### Scenario: A column of unknown type declines
 
 * *GIVEN* an expression that converts a column to text or compares it with text, where the column has no type in the request's column metadata
 * *WHEN* the adapter plans the request
 * *THEN* the scan SHALL NOT compute the expression
-
-### Scenario: A select item the scan declines widens the projection to the full base row
-
-* *GIVEN* a select item the scan does not compute, outside an aggregate request
-* *WHEN* the adapter builds the projection
-* *THEN* the projection SHALL widen to every column of the base row, and Exasol SHALL compute the item, with no error and no omitted filter
 
 ### Scenario: A broadcast join keeps its plan for an integer LIKE
 
@@ -79,11 +66,3 @@ The scan computes an expression only when DataFusion returns what native Exasol 
 * *WHEN* the adapter renders the join
 * *THEN* the join SHALL lose the broadcast plan and take the N-scan fallback, whose outer WHERE applies the conversion in Exasol
 * *AND* the rows SHALL equal native Exasol under any `NLS_DATE_FORMAT`
-
-### Scenario: An N-scan leg filter keeps the conjuncts the scan computes
-
-* *GIVEN* an N-scan join whose WHERE filter holds several conjuncts local to one leg, some of which the scan declines against that leg's own column types
-* *WHEN* the adapter builds the leg
-* *THEN* the leg's scan filter SHALL hold every conjunct the scan computes, rendered once against the leg's bare column names
-* *AND* every declined conjunct SHALL go to the outer WHERE, so no conjunct is applied twice or nowhere
-* *AND* two legs that share a column name SHALL each be checked against their own column's type

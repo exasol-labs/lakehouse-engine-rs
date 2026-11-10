@@ -2134,13 +2134,9 @@ fn scan_select_list_and_emits_agree_per_agg_kind() {
     ];
     let col_types = vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
 
-    let plan_for = |kind: &AggKind| AggregatePlan {
-        kind: kind.clone(),
-        column: match kind {
-            AggKind::Count => None,
-            _ => Some("SCORE".to_string()),
-        },
-        arg_expr: None,
+    let plan_for = |kind: &AggKind| match kind {
+        AggKind::Count => count_plan(),
+        _ => column_plan(kind.clone(), "SCORE"),
     };
 
     for kind in &all_kinds {

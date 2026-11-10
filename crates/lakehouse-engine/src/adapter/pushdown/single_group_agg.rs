@@ -7,7 +7,6 @@ use super::scalar_over_agg::{
 };
 use super::support::{PushdownRequest, ScanTranslator, output_select_list};
 use crate::types::exasol_type::ExasolType;
-use vs_expression::SqlFragment;
 
 /// A `COUNT(DISTINCT ...)` is not an aggregate partial: it is its own DISTINCT
 /// row-scan fan-out counted by an outer Exasol-native `COUNT(DISTINCT "V")`.
@@ -117,13 +116,7 @@ pub(super) fn single_group_merge_select(
     let fragments = items
         .iter()
         .map(|item| match item {
-            SingleGroupItem::Aggregate(plan) => {
-                let slot = plans.plans.iter().position(|p| p == plan)?;
-                Some(SqlFragment::new(
-                    plans.merged.get(slot)?.clone(),
-                    plans.types.get(slot).copied(),
-                ))
-            }
+            SingleGroupItem::Aggregate(plan) => plans.fragment(plans.slot_of(plan)?),
             SingleGroupItem::Distinct(_) => None,
             SingleGroupItem::ScalarOverAggregate { node, .. } => {
                 render_scalar_over_merge(node, &plans.plans, &plans.merged, scan)

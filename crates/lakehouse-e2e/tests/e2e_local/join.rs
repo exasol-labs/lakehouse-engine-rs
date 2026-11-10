@@ -1186,8 +1186,6 @@ const CUSTKEY_LIKE: &str = "o.O_CUSTKEY LIKE '1%'";
 /// Matches the first nine order dates as the default `NLS_DATE_FORMAT` writes them, and no date
 /// under `DMY`.
 const ORDERDATE_LIKE: &str = "o.O_ORDERDATE LIKE '2024-01-0%'";
-const DEFAULT_SESSION: &str = "";
-const DMY: &str = "NLS_DATE_FORMAT = 'DD.MM.YYYY'";
 /// [`ORDERDATE_LIKE`] for dates written under `DMY`, so it matches no date by default.
 const ORDERDATE_LIKE_DMY: &str = "o.O_ORDERDATE LIKE '0_.01.2024'";
 
@@ -1216,7 +1214,9 @@ fn copy_join_tables_natively(conn: &mut ExaConn) {
 #[track_caller]
 fn assert_n_scan_join_matches_native(conn: &mut ExaConn, vs_name: &str, query: &str) -> String {
     let path = PathCheck::NScan(2);
-    if let Some(failure) = native_copy_mismatch(conn, vs_name, JOIN_ORACLE, query, path) {
+    if let Some(failure) =
+        native_copy_mismatch(conn, vs_name, JOIN_ORACLE, query, path, Expect::Rows)
+    {
         panic!("{failure}");
     }
     isolated_pushdown_statement(conn, &query.replace("{T}", vs_name))
@@ -1287,7 +1287,7 @@ fn e2e_broadcast_like_on_date_column_falls_back_and_filters() {
     }
 }
 
-/// Scenario: An N-scan leg filter keeps the conjuncts the scan computes
+/// Scenario: Join conditions attach greedily by LEG set and leg-local filters push into each leg
 #[test]
 fn e2e_n_scan_leg_keeps_its_computed_conjunct_beside_a_declined_one() {
     setup_e2e();

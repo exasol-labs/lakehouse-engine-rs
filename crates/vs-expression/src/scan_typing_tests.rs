@@ -127,6 +127,21 @@ fn only_string_positions_convert_to_text() {
             scalar_fn("RPAD", [col("S"), num_lit(5), col("F")]),
             false,
         ),
+        (
+            "CONCAT second operand",
+            scalar_fn("CONCAT", [str_lit("x"), col("F")]),
+            false,
+        ),
+        (
+            "REPLACE replacement",
+            scalar_fn("REPLACE", [col("S"), str_lit("a"), col("F")]),
+            false,
+        ),
+        (
+            "INSTR substring",
+            scalar_fn("INSTR", [col("S"), col("F")]),
+            false,
+        ),
         ("CHR code", scalar_fn("CHR", [col("F")]), true),
         ("UNICODECHR code", scalar_fn("UNICODECHR", [col("F")]), true),
         (
@@ -188,8 +203,48 @@ fn a_computed_integer_converts_like_a_column() {
             true,
         ),
         (
+            "sum with a non-integer",
+            to_text(scalar_fn("ADD", [col("I"), col("N")])),
+            false,
+        ),
+        (
             "quotient",
             to_text(scalar_fn("FLOAT_DIV", [col("I"), num_lit(2)])),
+            false,
+        ),
+        (
+            "CASE over integers",
+            to_text(searched_case([col("I"), num_lit(1)])),
+            true,
+        ),
+        (
+            "CASE over an integer and a boolean",
+            to_text(searched_case([col("I"), col("B")])),
+            false,
+        ),
+        (
+            "ZEROIFNULL of an integer",
+            scalar_fn(
+                "CONCAT",
+                [scalar_fn("ZEROIFNULL", [col("I")]), str_lit("x")],
+            ),
+            true,
+        ),
+        (
+            "ZEROIFNULL of a decimal",
+            scalar_fn(
+                "CONCAT",
+                [scalar_fn("ZEROIFNULL", [col("N")]), str_lit("x")],
+            ),
+            false,
+        ),
+        ("COUNT", to_text(count_star()), true),
+        (
+            "MIN of a date",
+            scalar_fn(
+                "CONCAT",
+                [agg_item_expr("MIN", col("D"), false), str_lit("x")],
+            ),
             false,
         ),
         (
@@ -216,6 +271,7 @@ fn a_boolean_column_converts_to_exasol_casing() {
         r#"CAST((CASE "B" WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END) AS VARCHAR)"#
     );
     assert!(render(&cast_to(ExasolType::varchar(4), col("B"))).is_err());
+    assert!(render(&cast_to(ExasolType::varchar(5), col("B"))).is_ok());
 }
 
 #[test]
@@ -315,9 +371,20 @@ fn a_digits_only_literal_against_an_integer_renders_as_the_number_it_reads_as() 
             between(col("I"), str_lit("1"), str_lit("10")),
             r#"("I" BETWEEN 1 AND 10)"#,
         ),
+        (
+            "18 digits",
+            predicate_equal(col("I"), str_lit("123456789012345678")),
+            r#"("I" = 123456789012345678)"#,
+        ),
     ];
     for (label, expr, expected) in cases {
         assert_eq!(render(&expr).unwrap(), expected, "{label}");
+    }
+    for literal in ["1234567890123456789", "", "-", "1-2"] {
+        assert!(
+            render(&predicate_equal(col("I"), str_lit(literal))).is_err(),
+            "'{literal}' is not a session-free integer"
+        );
     }
 }
 
