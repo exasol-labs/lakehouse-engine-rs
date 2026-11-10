@@ -2837,6 +2837,27 @@ fn cast_to_a_non_emittable_target_matches_native() {
     }
 }
 
+/// Scenario: Only a TRUE filter is suppressed, and a NULL filter keeps no row
+#[test]
+fn a_null_condition_keeps_no_row() {
+    lakehouse_vs();
+    let mut conn = exa_conn();
+    let table = typed_table();
+
+    // Exasol folds each condition to a bare `literal_null` filter; `''` is NULL in Exasol.
+    let queries = [
+        "SELECT ID FROM {T} WHERE NULL LIKE '%b%' ORDER BY ID",
+        "SELECT ID FROM {T} WHERE '' LIKE '%b%' ORDER BY ID",
+        "SELECT ID FROM {T} WHERE NULL = 1 ORDER BY ID",
+        "SELECT ID FROM {T} WHERE NULL BETWEEN 1 AND 2 ORDER BY ID",
+        "SELECT ID FROM {T} WHERE NOT (NULL LIKE 'a') ORDER BY ID",
+        "SELECT COUNT(*) FROM {T} WHERE NULL = 1",
+        "SELECT C_VARCHAR, COUNT(*) FROM {T} WHERE NULL = 1 GROUP BY C_VARCHAR ORDER BY 1",
+        "SELECT a.ID, b.ID FROM {T} a JOIN {T} b ON a.ID = b.ID WHERE NULL = 1 ORDER BY 1",
+    ];
+    assert_queries_match_native_copy(&mut conn, &table, TYPED_COLUMNS, &queries);
+}
+
 /// Scenario: CAST renders the mapped target type per dialect
 /// Scenario: CONCAT translates to a NULL-skipping DataFusion concat call
 #[test]

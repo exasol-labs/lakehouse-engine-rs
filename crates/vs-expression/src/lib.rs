@@ -1013,7 +1013,7 @@ pub fn render_scan_expression(
     Ok(SqlFragment::new(render_expression(&typed)?, ty))
 }
 
-/// [`render_scan_expression`] for a filter. `Ok(None)` when it is trivially true (`TRUE`/`NULL`).
+/// [`render_scan_expression`] for a filter. `Ok(None)` when it is trivially true (`TRUE`).
 pub fn render_scan_filter(
     filter_expr: &Json,
     columns: &dyn ColumnTypeLookup,
@@ -1031,8 +1031,13 @@ pub fn conjoin_scan_filters(conjuncts: Vec<String>) -> Option<String> {
     non_trivial_filter(join_junction(conjuncts, " AND ", "TRUE"))
 }
 
+/// A `NULL` condition keeps no row, like `FALSE`. Exasol folds `''` to `NULL` too.
 fn non_trivial_filter(sql: String) -> Option<String> {
-    (sql != "TRUE" && sql != "NULL").then_some(sql)
+    match sql.as_str() {
+        "TRUE" => None,
+        "NULL" => Some("FALSE".into()),
+        _ => Some(sql),
+    }
 }
 
 /// DataFusion dialect, untyped. Use [`render_scan_expression`].
@@ -1068,12 +1073,7 @@ pub fn render_expression_exasol_safe(expr: &Json) -> Option<String> {
 
 /// [`render_expression_exasol_safe`] for a filter: also `None` when it is trivially true.
 pub fn render_df_filter_exasol_safe(filter_expr: &Json) -> Option<String> {
-    let result = render_expression_inner(filter_expr, Dialect::Exasol).ok()??;
-    if result == "TRUE" || result == "NULL" {
-        None
-    } else {
-        Some(result)
-    }
+    non_trivial_filter(render_expression_inner(filter_expr, Dialect::Exasol).ok()??)
 }
 
 #[cfg(test)]

@@ -641,13 +641,15 @@ fn unsupported_node_returns_error() {
 }
 
 #[test]
-fn trivially_true_scan_filters_render_as_no_filter() {
-    assert_eq!(scan_filter(&bool_lit(true)).unwrap(), None);
-    assert_eq!(scan_filter(&null_lit()).unwrap(), None);
-    assert_eq!(
-        scan_filter(&bool_lit(false)).unwrap().as_deref(),
-        Some("FALSE")
-    );
+fn only_a_true_scan_filter_renders_as_no_filter() {
+    for (filter, expected) in [
+        (bool_lit(true), None),
+        (bool_lit(false), Some("FALSE")),
+        (null_lit(), Some("FALSE")),
+    ] {
+        assert_eq!(scan_filter(&filter).unwrap().as_deref(), expected);
+        assert_eq!(render_df_filter_exasol_safe(&filter).as_deref(), expected);
+    }
 }
 
 #[test]
@@ -665,6 +667,10 @@ fn conjoined_scan_filters_render_as_their_predicate_and() {
         scan_filter(&and(conjuncts)).unwrap()
     );
     assert_eq!(conjoin_scan_filters(vec!["TRUE".into()]), None);
+    assert_eq!(
+        conjoin_scan_filters(vec!["NULL".into()]).as_deref(),
+        Some("FALSE")
+    );
     assert_eq!(conjoin_scan_filters(Vec::new()), None);
 }
 
@@ -2468,15 +2474,6 @@ fn literal_double_renders_as_a_double_cast_only_in_the_datafusion_dialect() {
         assert_eq!(render_expression(&node).unwrap(), datafusion);
         assert_eq!(render_expression_exasol(&node).unwrap(), exasol);
     }
-}
-
-#[test]
-fn exasol_df_filter_suppresses_trivially_true() {
-    let true_filter = bool_lit(true);
-    assert!(render_df_filter_exasol_safe(&true_filter).is_none());
-
-    let null_filter = null_lit();
-    assert!(render_df_filter_exasol_safe(&null_filter).is_none());
 }
 
 #[test]
