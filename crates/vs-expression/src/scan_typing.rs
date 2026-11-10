@@ -224,80 +224,91 @@ pub(crate) fn type_scan_tree(
     if !node.is_object() {
         return Ok((node.clone(), TypeClass::Other));
     }
-    let node_kind = kind(node);
-    if node_kind == "column" {
+    if kind(node) == "column" {
         let class = columns
             .column_type(node)
             .map_or(TypeClass::Other, TypeClass::of);
         return Ok((node.clone(), class));
     }
+    let (mut out, children) = type_children(node, columns)?;
+    let class = node_class(node, &mut out, &children)?;
+    Ok((out, class))
+}
 
-    let mut out = node.clone();
-    let mut array_classes: Vec<(&str, Vec<TypeClass>)> = Vec::new();
-    for field in EXPR_ARRAY_FIELDS {
-        if let Some(Json::Array(children)) = node.get(field) {
-            let mut rewritten = Vec::with_capacity(children.len());
-            let mut classes = Vec::with_capacity(children.len());
-            for child in children {
-                let (c, class) = type_scan_tree(child, columns)?;
-                rewritten.push(c);
-                classes.push(class);
-            }
-            out[field] = Json::Array(rewritten);
-            array_classes.push((field, classes));
-        }
-    }
-    let mut single_classes: Vec<(&str, TypeClass)> = Vec::new();
-    for field in EXPR_SINGLE_FIELDS {
-        if let Some(child) = node.get(field)
-            && child.is_object()
-        {
-            let (c, class) = type_scan_tree(child, columns)?;
-            out[field] = c;
-            single_classes.push((field, class));
-        }
-    }
-    let classes_of = |field: &str| -> Vec<TypeClass> {
-        array_classes
+/// The classes of a node's typed child expressions, by field.
+#[derive(Default)]
+struct ChildClasses {
+    arrays: Vec<(&'static str, Vec<TypeClass>)>,
+    singles: Vec<(&'static str, TypeClass)>,
+}
+
+impl ChildClasses {
+    fn of(&self, field: &str) -> Vec<TypeClass> {
+        self.arrays
             .iter()
             .find(|(f, _)| *f == field)
             .map(|(_, c)| c.clone())
             .unwrap_or_default()
-    };
-    let class_of = |field: &str| -> Option<TypeClass> {
-        single_classes
+    }
+
+    fn one(&self, field: &str) -> Option<TypeClass> {
+        self.singles
             .iter()
             .find(|(f, _)| *f == field)
             .map(|(_, c)| *c)
-    };
-    let all_children = || -> Vec<TypeClass> {
-        array_classes
+    }
+
+    fn all(&self) -> Vec<TypeClass> {
+        self.arrays
             .iter()
             .flat_map(|(_, c)| c.iter().copied())
-            .chain(single_classes.iter().map(|(_, c)| *c))
+            .chain(self.singles.iter().map(|(_, c)| *c))
             .collect()
-    };
+    }
+}
 
-    let class = match node_kind {
+/// Types each child expression of `node`, returning `node` with its children rewritten.
+fn type_children(
+    node: &Json,
+    columns: &dyn ColumnTypeLookup,
+) -> Result<(Json, ChildClasses), UdfError> {
+    let mut out = node.clone();
+    let mut children = ChildClasses::default();
+    for field in EXPR_ARRAY_FIELDS {
+        if let Some(Json::Array(items)) = node.get(field) {
+            let (rewritten, classes): (Vec<Json>, Vec<TypeClass>) = items
+                .iter()
+                .map(|item| type_scan_tree(item, columns))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .unzip();
+            out[field] = Json::Array(rewritten);
+            children.arrays.push((field, classes));
+        }
+    }
+    for field in EXPR_SINGLE_FIELDS {
+        if let Some(child) = node.get(field)
+            && child.is_object()
+        {
+            let (rewritten, class) = type_scan_tree(child, columns)?;
+            out[field] = rewritten;
+            children.singles.push((field, class));
+        }
+    }
+    Ok((out, children))
+}
+
+/// The class of a non-column `node` whose children are typed, rewriting `out` where needed.
+fn node_class(node: &Json, out: &mut Json, children: &ChildClasses) -> Result<TypeClass, UdfError> {
+    let class = match kind(node) {
         "literal_null" => TypeClass::Null,
         "literal_bool" => TypeClass::Boolean,
         "literal_string" => TypeClass::Text,
         "literal_double" => TypeClass::Number,
-        "literal_exactnumeric" => {
-            let text = match node.get("value") {
-                Some(Json::Number(n)) if n.is_i64() || n.is_u64() => Some(n.to_string()),
-                Some(Json::String(s)) => Some(s.clone()),
-                _ => None,
-            };
-            text.as_deref()
-                .and_then(integer_digits)
-                .map_or(TypeClass::Number, |digits| TypeClass::Integer {
-                    precision: Some(digits),
-                })
-        }
+        "literal_exactnumeric" => exact_numeric_class(node),
         "predicate_like" => {
             for field in ["expression", "pattern"] {
-                if let Some(class) = class_of(field) {
+                if let Some(class) = children.one(field) {
                     out[field] = to_text(out[field].take(), class)?;
                 }
             }
@@ -313,95 +324,112 @@ pub(crate) fn type_scan_tree(
         | "predicate_in_constlist" => {
             let mut operands: Vec<(&Json, TypeClass)> = ["expression", "left", "right"]
                 .iter()
-                .filter_map(|field| Some((node.get(*field)?, class_of(field)?)))
+                .filter_map(|field| Some((node.get(*field)?, children.one(field)?)))
                 .collect();
             if let Some(Json::Array(args)) = node.get("arguments") {
-                operands.extend(args.iter().zip(classes_of("arguments")));
+                operands.extend(args.iter().zip(children.of("arguments")));
             }
-            compare_without_session_parse(node, &mut out, &operands)?;
+            compare_without_session_parse(node, out, &operands)?;
             TypeClass::Boolean
         }
         "predicate_is_null" | "predicate_is_not_null" => TypeClass::Boolean,
         k if k.starts_with("predicate_") => {
-            refuse_implicit_text(node, &all_children())?;
+            refuse_implicit_text(node, &children.all())?;
             TypeClass::Boolean
         }
         "function_scalar_extract" => {
-            refuse_implicit_text(node, &all_children())?;
+            refuse_implicit_text(node, &children.all())?;
             node.get("toExtract")
                 .and_then(Json::as_str)
                 .map_or(TypeClass::Other, |field| typed_function(field).class(&[]))
         }
-        "function_scalar_case" => {
-            match (node.get("basis"), class_of("basis")) {
-                // A simple CASE compares its basis with each WHEN value.
-                (Some(basis), Some(basis_class)) => {
-                    let mut operands = vec![(basis, basis_class)];
-                    if let Some(Json::Array(whens)) = node.get("arguments") {
-                        operands.extend(whens.iter().zip(classes_of("arguments")));
-                    }
-                    compare_without_session_parse(node, &mut out, &operands)?;
-                }
-                _ => refuse_implicit_text(node, &classes_of("arguments"))?,
-            }
-            unify_branches(node, &classes_of("results"))?
-        }
-        "function_scalar_cast" => cast_class(&mut out, &classes_of("arguments"))?,
-        "function_scalar" => {
-            let fn_name = node
-                .get("name")
-                .and_then(Json::as_str)
-                .unwrap_or("")
-                .to_uppercase();
-            if fn_name == "CAST" {
-                cast_class(&mut out, &classes_of("arguments"))?
-            } else {
-                let args = classes_of("arguments");
-                let function = typed_function(&fn_name);
-                let text_positions = function.string_positions(args.len());
-                for &i in &text_positions {
-                    out["arguments"][i] = to_text(out["arguments"][i].take(), args[i])?;
-                }
-                if function.result == ResultRule::Unified {
-                    unify_branches(node, &args)?
-                } else {
-                    let converted: Vec<TypeClass> = args
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| {
-                            !text_positions.contains(i) && !function.parameters.contains(i)
-                        })
-                        .map(|(_, c)| *c)
-                        .collect();
-                    refuse_implicit_text(node, &converted)?;
-                    function.class(&args)
-                }
-            }
-        }
-        "function_aggregate" => {
-            let name = node
-                .get("name")
-                .and_then(Json::as_str)
-                .unwrap_or("")
-                .to_uppercase();
-            let args = classes_of("arguments");
-            match name.as_str() {
-                "COUNT" => TypeClass::INTEGER,
-                "MIN" | "MAX" => args.first().copied().unwrap_or(TypeClass::Other),
-                "SUM" | "AVG" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" | "VARIANCE"
-                | "VAR_POP" | "VAR_SAMP" => numeric_aggregate(node, &name, &args)?,
-                _ => {
-                    refuse_implicit_text(node, &args)?;
-                    TypeClass::Other
-                }
-            }
-        }
+        "function_scalar_case" => case_class(node, out, children)?,
+        "function_scalar_cast" => cast_class(out, &children.of("arguments"))?,
+        "function_scalar" => scalar_function_class(node, out, &children.of("arguments"))?,
+        "function_aggregate" => aggregate_class(node, &children.of("arguments"))?,
         _ => {
-            refuse_implicit_text(node, &all_children())?;
+            refuse_implicit_text(node, &children.all())?;
             TypeClass::Other
         }
     };
-    Ok((out, class))
+    Ok(class)
+}
+
+fn upper_name(node: &Json) -> String {
+    node.get("name")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_uppercase()
+}
+
+/// An exact numeric literal is an integer of its digit count, or a fractional number.
+fn exact_numeric_class(node: &Json) -> TypeClass {
+    let text = match node.get("value") {
+        Some(Json::Number(n)) if n.is_i64() || n.is_u64() => Some(n.to_string()),
+        Some(Json::String(s)) => Some(s.clone()),
+        _ => None,
+    };
+    text.as_deref()
+        .and_then(integer_digits)
+        .map_or(TypeClass::Number, |digits| TypeClass::Integer {
+            precision: Some(digits),
+        })
+}
+
+fn case_class(node: &Json, out: &mut Json, children: &ChildClasses) -> Result<TypeClass, UdfError> {
+    match (node.get("basis"), children.one("basis")) {
+        // A simple CASE compares its basis with each WHEN value.
+        (Some(basis), Some(basis_class)) => {
+            let mut operands = vec![(basis, basis_class)];
+            if let Some(Json::Array(whens)) = node.get("arguments") {
+                operands.extend(whens.iter().zip(children.of("arguments")));
+            }
+            compare_without_session_parse(node, out, &operands)?;
+        }
+        _ => refuse_implicit_text(node, &children.of("arguments"))?,
+    }
+    unify_branches(node, &children.of("results"))
+}
+
+fn scalar_function_class(
+    node: &Json,
+    out: &mut Json,
+    args: &[TypeClass],
+) -> Result<TypeClass, UdfError> {
+    let fn_name = upper_name(node);
+    if fn_name == "CAST" {
+        return cast_class(out, args);
+    }
+    let function = typed_function(&fn_name);
+    let text_positions = function.string_positions(args.len());
+    for &i in &text_positions {
+        out["arguments"][i] = to_text(out["arguments"][i].take(), args[i])?;
+    }
+    if function.result == ResultRule::Unified {
+        return unify_branches(node, args);
+    }
+    let converted: Vec<TypeClass> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !text_positions.contains(i) && !function.parameters.contains(i))
+        .map(|(_, c)| *c)
+        .collect();
+    refuse_implicit_text(node, &converted)?;
+    Ok(function.class(args))
+}
+
+fn aggregate_class(node: &Json, args: &[TypeClass]) -> Result<TypeClass, UdfError> {
+    let name = upper_name(node);
+    match name.as_str() {
+        "COUNT" => Ok(TypeClass::INTEGER),
+        "MIN" | "MAX" => Ok(args.first().copied().unwrap_or(TypeClass::Other)),
+        "SUM" | "AVG" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" | "VARIANCE" | "VAR_POP"
+        | "VAR_SAMP" => numeric_aggregate(node, &name, args),
+        _ => {
+            refuse_implicit_text(node, args)?;
+            Ok(TypeClass::Other)
+        }
+    }
 }
 
 /// The type the request states for `node`: a CAST's `dataType` or a column's type. `None`
