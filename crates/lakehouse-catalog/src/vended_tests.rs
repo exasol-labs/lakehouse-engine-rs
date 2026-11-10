@@ -1412,6 +1412,7 @@ fn vended_s3_credentials_without_a_key_or_a_readable_expiry_are_refused_naming_t
         ("s3.access-key-id", None),
         ("s3.secret-access-key", Some("")),
         ("s3.session-token-expires-at-ms", Some("tomorrow")),
+        ("s3.session-token-expires-at-ms", Some("")),
     ] {
         let error = vended_s3_credentials(&s3_entry_with(key, value), S3_ANCHOR).unwrap_err();
 

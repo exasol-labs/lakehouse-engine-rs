@@ -56,11 +56,11 @@ pub enum RepeatSafety {
 pub(crate) const MAX_QUOTED_BODY_BYTES: usize = 4096;
 
 /// The HTTP client of one catalog session. Callers build a request with [`Self::get`],
-/// [`Self::post`], or [`Self::request`] and send it only through [`Self::send_json`],
-/// [`Self::send`], or [`Self::send_capped`], so every catalog request gets the same timeouts and
-/// retries. A retry re-sends a clone of the request as the caller built and signed it: every retry
-/// starts within the window, long before a SigV4 signature or an OAuth token reaches its renewal
-/// point, so this type needs no knowledge of auth or signing.
+/// [`Self::post`], or [`Self::request`] and send it only through [`Self::send_json`], [`Self::send`], or
+/// [`Self::send_capped`], so every catalog request gets the same timeouts and retries. A retry
+/// re-sends a clone of the request as the caller built and signed it, `Authorization` included, so
+/// this type needs no knowledge of auth or signing. A token whose lifetime is under twice the retry
+/// window can expire between attempts, and the catalog then answers 401, which is not retried.
 #[derive(Clone)]
 pub(crate) struct CatalogHttp {
     client: reqwest::Client,

@@ -16,25 +16,24 @@ use std::time::Duration;
 pub(crate) const OAUTH_REFRESH_SKEW_SECS: u64 = 60;
 
 /// Strips the literal auth values too, so a value echoed without a recognizable
-/// label cannot leak. The bearers go first, so a field value one contains cannot split it.
+/// label cannot leak. The bearer goes first, so a field value it contains cannot split it.
 pub(crate) fn redact_catalog_auth_error(
     msg: &str,
     creds: &ConnectionCreds,
-    bearers: &[String],
+    bearer: Option<&str>,
 ) -> String {
-    let fields = [
+    let secrets: Vec<&str> = [
+        bearer,
         creds.token.as_deref(),
         // Stripping the bare secret also covers the joined `<id>:<secret>` credential.
         creds.client_secret.as_deref(),
         creds.client_id.as_deref(),
         creds.oauth2_server_uri.as_deref(),
         creds.scope.as_deref(),
-    ];
-    let secrets: Vec<&str> = bearers
-        .iter()
-        .map(String::as_str)
-        .chain(fields.into_iter().flatten())
-        .collect();
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     redact_error_text(msg, &secrets)
 }
 
@@ -48,23 +47,128 @@ pub(crate) enum CatalogAuth {
 }
 
 impl CatalogAuth {
-    /// The bearer token a request carries now, after an OAuth2 token that reached its renewal
-    /// point was granted anew; `None` when requests carry no bearer.
-    pub(crate) async fn bearer(&self) -> Result<Option<String>, UdfError> {
-        match self {
-            Self::Bearer(token) => Ok(Some(token.clone())),
-            Self::OAuth2(token) => token.bearer().await.map(Some),
-            Self::Sigv4 { .. } | Self::None => Ok(None),
-        }
+    /// Puts the bearer on `builder`, after an OAuth2 token that reached its renewal point was
+    /// granted anew, and returns the token the request carries, so the caller redacts exactly it.
+    /// A request that carries no bearer returns `None`.
+    pub(crate) async fn apply(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<(reqwest::RequestBuilder, Option<String>), UdfError> {
+        let bearer = match self {
+            Self::Bearer(token) => Some(token.clone()),
+            Self::OAuth2(token) => Some(token.bearer().await?),
+            Self::Sigv4 { .. } | Self::None => None,
+        };
+        Ok(match bearer {
+            Some(token) => (builder.bearer_auth(&token), Some(token)),
+            None => (builder, None),
+        })
     }
+}
 
-    /// Every bearer token this auth has held, so an error can be stripped of each one.
-    pub(crate) fn held_bearers(&self) -> Vec<String> {
-        match self {
-            Self::Bearer(token) => vec![token.clone()],
-            Self::OAuth2(token) => token.token.held_values(),
-            Self::Sigv4 { .. } | Self::None => Vec::new(),
+/// How a grant presents the client credentials to the token endpoint.
+#[derive(Clone, Copy)]
+pub(crate) enum ClientAuthentication {
+    /// `client_id` and `client_secret` in the form body, as the Iceberg REST OAuth2 endpoint reads.
+    Form,
+    /// HTTP Basic, as the Unity Catalog token endpoint reads.
+    Basic,
+}
+
+/// An OAuth2 client-credentials grant, kept so its token can be granted again.
+pub(crate) struct ClientCredentialsGrant {
+    pub(crate) http: CatalogHttp,
+    pub(crate) token_url: String,
+    pub(crate) client_id: String,
+    pub(crate) client_secret: String,
+    pub(crate) scope: Option<String>,
+    pub(crate) authentication: ClientAuthentication,
+    /// Names the grant in errors.
+    pub(crate) label: &'static str,
+    /// A token answer without a usable `expires_in` is an error when set, because the token could
+    /// never be renewed; otherwise the token is kept for the life of the session, since the
+    /// Iceberg REST token answer requires only `access_token`.
+    pub(crate) require_expiry: bool,
+}
+
+/// Why a grant answer yields no lease.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GrantAnswerError {
+    NoAccessToken,
+    NoUsableExpiry,
+}
+
+/// Reads a grant answer into a lease whose expiry is on the clock that read `now_ms`. A missing
+/// or zero `expires_in` is no lifetime: the token is kept for the session, or refused when the
+/// grant requires one.
+pub(crate) fn lease_from_grant_answer(
+    answer: &serde_json::Value,
+    now_ms: u64,
+    require_expiry: bool,
+) -> Result<Lease<String>, GrantAnswerError> {
+    let access_token = answer
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or(GrantAnswerError::NoAccessToken)?;
+    let expires_at_ms = answer
+        .get("expires_in")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|&secs| secs > 0)
+        .map(|secs| now_ms.saturating_add(secs.saturating_mul(1000)));
+    if require_expiry && expires_at_ms.is_none() {
+        return Err(GrantAnswerError::NoUsableExpiry);
+    }
+    Ok(Lease {
+        value: access_token.to_string(),
+        expires_at_ms,
+    })
+}
+
+impl ClientCredentialsGrant {
+    async fn request(&self, now_ms: u64) -> Result<Lease<String>, UdfError> {
+        let label = self.label;
+        let redact_secret = |msg: &str| redact_error_text(msg, &[self.client_secret.as_str()]);
+        let mut form: Vec<(&str, &str)> = vec![("grant_type", OAUTH2_GRANT_TYPE)];
+        if matches!(self.authentication, ClientAuthentication::Form) {
+            form.push(("client_id", &self.client_id));
+            form.push(("client_secret", &self.client_secret));
         }
+        if let Some(scope) = &self.scope {
+            form.push(("scope", scope));
+        }
+
+        let mut builder = self
+            .http
+            .post(&self.token_url)
+            .header("accept", "application/json")
+            .form(&form);
+        if matches!(self.authentication, ClientAuthentication::Basic) {
+            builder = builder.basic_auth(&self.client_id, Some(&self.client_secret));
+        }
+        let request = builder.build().map_err(|e| {
+            UdfError::User(format!(
+                "failed to build {label} request: {}",
+                redact_secret(&error_chain(&e))
+            ))
+        })?;
+
+        let body: serde_json::Value = self
+            .http
+            .send_json(request, RepeatSafety::Safe, label, redact_secret)
+            .await?;
+
+        lease_from_grant_answer(&body, now_ms, self.require_expiry).map_err(|error| {
+            UdfError::User(match error {
+                GrantAnswerError::NoAccessToken => format!(
+                    "{label} response missing access_token: {}",
+                    redact_secret(&body.to_string())
+                ),
+                GrantAnswerError::NoUsableExpiry => {
+                    format!("{label} response has no usable expires_in")
+                }
+            })
+        })
     }
 }
 
@@ -76,6 +180,14 @@ pub(crate) struct OAuth2Token {
 }
 
 impl OAuth2Token {
+    /// Holds no token, so the first [`Self::bearer`] runs the grant.
+    pub(crate) fn lazy(grant: ClientCredentialsGrant, clock: EpochClock) -> Self {
+        Self {
+            grant,
+            token: ExpiringCredential::new(Duration::from_secs(OAUTH_REFRESH_SKEW_SECS), clock),
+        }
+    }
+
     /// Runs the session's first grant, so a refused grant fails the session before any other
     /// catalog request.
     async fn granted(grant: ClientCredentialsGrant, clock: EpochClock) -> Result<Self, UdfError> {
@@ -87,7 +199,7 @@ impl OAuth2Token {
         })
     }
 
-    async fn bearer(&self) -> Result<String, UdfError> {
+    pub(crate) async fn bearer(&self) -> Result<String, UdfError> {
         self.token.get(|now_ms| self.grant.request(now_ms)).await
     }
 }
@@ -96,74 +208,6 @@ const OAUTH2_GRANT_TYPE: &str = "client_credentials";
 
 /// Iceberg REST catalog convention, used when no `oauth2_server_uri` is supplied.
 const OAUTH2_DEFAULT_TOKEN_PATH: &str = "/v1/oauth/tokens";
-
-/// One session's client-credentials grant, kept so the session can run it again.
-struct ClientCredentialsGrant {
-    http: CatalogHttp,
-    token_url: String,
-    client_id: String,
-    client_secret: String,
-    scope: Option<String>,
-}
-
-impl ClientCredentialsGrant {
-    /// A token whose answer states no `expires_in` is kept for the life of the session, because
-    /// the Iceberg REST token answer requires only `access_token`.
-    async fn request(&self, now_ms: u64) -> Result<Lease<String>, UdfError> {
-        let redact_secret = |msg: &str| redact_error_text(msg, &[self.client_secret.as_str()]);
-        let mut form: Vec<(&str, &str)> = vec![
-            ("grant_type", OAUTH2_GRANT_TYPE),
-            ("client_id", &self.client_id),
-            ("client_secret", &self.client_secret),
-        ];
-        if let Some(scope) = &self.scope {
-            form.push(("scope", scope));
-        }
-
-        let request = self
-            .http
-            .post(&self.token_url)
-            .header("accept", "application/json")
-            .form(&form)
-            .build()
-            .map_err(|e| {
-                UdfError::User(format!(
-                    "failed to build OAuth2 token request: {}",
-                    redact_secret(&error_chain(&e))
-                ))
-            })?;
-
-        let body: serde_json::Value = self
-            .http
-            .send_json(
-                request,
-                RepeatSafety::Safe,
-                "OAuth2 token request",
-                redact_secret,
-            )
-            .await?;
-
-        let access_token = body
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                UdfError::User(format!(
-                    "OAuth2 token response missing access_token: {}",
-                    redact_secret(&body.to_string())
-                ))
-            })?;
-        let expires_at_ms = body
-            .get("expires_in")
-            .and_then(serde_json::Value::as_u64)
-            .map(|secs| now_ms.saturating_add(secs.saturating_mul(1000)));
-
-        Ok(Lease {
-            value: access_token.to_string(),
-            expires_at_ms,
-        })
-    }
-}
 
 /// SigV4 and token/OAuth never co-occur (`validate_creds` rule 4). SigV4 is
 /// refused when neither the credentials nor `catalog_uri` yield a signing region. An OAuth2
@@ -199,6 +243,9 @@ pub(crate) async fn resolve_catalog_auth(
                 client_id: client_id.to_string(),
                 client_secret: client_secret.to_string(),
                 scope: non_empty(&creds.scope).map(str::to_string),
+                authentication: ClientAuthentication::Form,
+                label: "OAuth2 token request",
+                require_expiry: false,
             };
             let token = OAuth2Token::granted(grant, clock).await?;
             Ok(CatalogAuth::OAuth2(Box::new(token)))
