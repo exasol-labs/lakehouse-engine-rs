@@ -75,6 +75,9 @@ const DEFAULT_INSTANCE_OVERHEAD_MB: u64 = 200;
 const NOTE_JOIN_BROADCAST_MAX_BYTES: &str = "JOIN_BROADCAST_MAX_BYTES";
 const DEFAULT_JOIN_BROADCAST_MAX_BYTES: u64 = 134_217_728;
 const NOTE_S3_MAX_CONNECTIONS: &str = "S3_MAX_CONNECTIONS";
+const NOTE_METADATA_READ_CONCURRENCY: &str = "METADATA_READ_CONCURRENCY";
+/// The reads wait on the network, so the default does not follow the core count.
+const DEFAULT_METADATA_READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 const NOTE_CATALOG_PREFIX: &str = "CATALOG_PREFIX";
 /// Connections per decode thread: S3 range GETs are latency-bound, so several in flight per
 /// thread keep the NIC busy, and idle pooled connections are far cheaper than threads.
@@ -111,6 +114,7 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
                     &props,
                     &permission,
                     stored_catalog_prefix(request),
+                    stored_metadata_read_concurrency(request),
                 )
             })?;
             let script_schema = ctx.script_schema();
@@ -142,10 +146,11 @@ fn build_virtual_schema_state(
     props: &Json,
     permission: &PermissionSettings,
     catalog_prefix: Option<String>,
+    metadata_read_concurrency: NonZeroUsize,
 ) -> Result<VirtualSchemaState, UdfError> {
     // Built before `resolve_connection_config`, which blocks on it to assume the role.
     let rt = build_runtime()?;
-    let config = resolve_connection_config(ctx, props, permission, &rt)?;
+    let config = resolve_connection_config(ctx, props, permission, metadata_read_concurrency, &rt)?;
     let catalog = StatementCatalog::open(config, props, catalog_prefix)?;
     Ok(VirtualSchemaState::new(rt, catalog))
 }
@@ -160,6 +165,7 @@ pub struct ResolvedConnectionConfig {
     pub(crate) catalog_kind: CatalogKind,
     pub(crate) connection_name: String,
     pub(crate) sealed_storage_key: Option<SealedStorageKey>,
+    pub(crate) metadata_read_concurrency: NonZeroUsize,
 }
 
 impl ResolvedConnectionConfig {
@@ -172,8 +178,10 @@ impl ResolvedConnectionConfig {
     }
 }
 
+/// iceberg-rust spawns its per-manifest-entry planning work, which then spreads over the cores.
 fn build_runtime() -> Result<tokio::runtime::Runtime, UdfError> {
-    tokio::runtime::Builder::new_current_thread()
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(resolve_nr_of_cores() as usize)
         .enable_all()
         .build()
         .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))
@@ -185,6 +193,7 @@ fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &Json,
     permission: &PermissionSettings,
+    metadata_read_concurrency: NonZeroUsize,
     rt: &tokio::runtime::Runtime,
 ) -> Result<ResolvedConnectionConfig, UdfError> {
     let kind = catalog_kind::resolve_catalog_kind(props)?;
@@ -208,6 +217,7 @@ fn resolve_connection_config(
         catalog_kind: kind,
         connection_name: connection_name.to_string(),
         sealed_storage_key: resolved.sealed_storage_key,
+        metadata_read_concurrency,
     })
 }
 
@@ -224,8 +234,15 @@ fn handle_create_virtual_schema(
     let checked = check_properties(&props)?;
     // Validated only: listing runs as the CONNECTION's identity, with no permission check.
     let permission = PermissionSettings::parse(&props)?;
+    let tuning = resolve_tuning_notes(&checked.tuning, resolve_nr_of_cores());
     let rt = build_runtime()?;
-    let config = resolve_connection_config(ctx, &props, &permission, &rt)?;
+    let config = resolve_connection_config(
+        ctx,
+        &props,
+        &permission,
+        tuning.metadata_read_concurrency,
+        &rt,
+    )?;
 
     // Optional under direct storage: the CONNECTION address alone denotes the storage subtree.
     let configured_ns: Vec<String> = match config.catalog_kind {
@@ -257,7 +274,6 @@ fn handle_create_virtual_schema(
         udf_log!(ctx, warn, "{}", skip_warning(entry));
     }
 
-    let tuning = resolve_tuning_notes(&checked.tuning, resolve_nr_of_cores());
     let adapter_notes =
         build_adapter_notes(request, &tuning, &skipped_tables, client.catalog_prefix());
 
@@ -445,6 +461,12 @@ fn parse_adapter_notes(request: &Json) -> serde_json::Map<String, Json> {
         .unwrap_or_default()
 }
 
+fn stored_metadata_read_concurrency(request: &Json) -> NonZeroUsize {
+    adapter_note(request, NOTE_METADATA_READ_CONCURRENCY)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_METADATA_READ_CONCURRENCY)
+}
+
 /// Unlike [`adapter_note`], keeps an empty value: an empty catalog prefix is valid.
 fn stored_catalog_prefix(request: &Json) -> Option<String> {
     parse_adapter_notes(request)
@@ -478,11 +500,13 @@ fn client_of_kind(
     catalog_prefix: Option<String>,
 ) -> Result<Box<dyn ScanCatalog>, UdfError> {
     let (catalog_uri, storage, creds) = (&config.catalog_uri, &config.storage, &config.creds);
+    let metadata_read_concurrency = config.metadata_read_concurrency;
     match config.catalog_kind {
         CatalogKind::IcebergRest => Ok(Box::new(IcebergRestCatalogClient::new(
             catalog_uri.clone(),
             creds.clone(),
             catalog_prefix,
+            metadata_read_concurrency,
         ))),
         CatalogKind::UnityCatalogNative => Ok(Box::new(UnityCatalogSession::new(
             catalog_uri,
@@ -496,6 +520,7 @@ fn client_of_kind(
                 storage,
                 &resolved.base_path,
                 resolved.directory_options(),
+                metadata_read_concurrency,
                 &secrets,
             )?;
             Ok(Box::new(client))
@@ -504,6 +529,7 @@ fn client_of_kind(
             catalog_uri,
             storage.clone(),
             creds.clone(),
+            metadata_read_concurrency,
         )?)),
     }
 }
@@ -573,6 +599,7 @@ struct TuningNotes {
     instance_overhead_mb: u64,
     s3_max_connections: usize,
     join_broadcast_max_bytes: u64,
+    metadata_read_concurrency: NonZeroUsize,
 }
 
 /// Exasol rejects a raw-object adapterNotes, so it is a JSON string; pre-existing notes are merged.
@@ -592,6 +619,7 @@ fn build_adapter_notes(
         instance_overhead_mb,
         s3_max_connections,
         join_broadcast_max_bytes,
+        metadata_read_concurrency,
     } = tuning;
     let mut notes = parse_adapter_notes(request);
     notes.insert(
@@ -629,6 +657,10 @@ fn build_adapter_notes(
     notes.insert(
         NOTE_JOIN_BROADCAST_MAX_BYTES.to_string(),
         Json::String(join_broadcast_max_bytes.to_string()),
+    );
+    notes.insert(
+        NOTE_METADATA_READ_CONCURRENCY.to_string(),
+        Json::String(metadata_read_concurrency.to_string()),
     );
     match catalog_prefix {
         Some(prefix) => notes.insert(NOTE_CATALOG_PREFIX.to_string(), Json::String(prefix)),
@@ -687,6 +719,9 @@ fn resolve_tuning_notes(checked: &TuningProperties, nr_of_cores: u32) -> TuningN
         join_broadcast_max_bytes: checked
             .join_broadcast_max_bytes
             .map_or(DEFAULT_JOIN_BROADCAST_MAX_BYTES, |n| n.get()),
+        metadata_read_concurrency: checked
+            .metadata_read_concurrency
+            .map_or(DEFAULT_METADATA_READ_CONCURRENCY, NonZeroUsize::from),
     }
 }
 

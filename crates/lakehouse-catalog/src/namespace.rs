@@ -8,9 +8,7 @@ use futures::{StreamExt, TryStreamExt};
 use iceberg::{NamespaceIdent, TableIdent};
 use iceberg_catalog_rest::{ListNamespaceResponse, ListTablesResponse};
 use serde::de::DeserializeOwned;
-
-/// Bounds the namespaces listed, or tables loaded, at once.
-pub(crate) const CATALOG_REQUEST_CONCURRENCY: usize = 16;
+use std::num::NonZeroUsize;
 
 /// The last `.`-delimited segment is the table name, all preceding ones the
 /// namespace. Errors when the input contains no `.`.
@@ -32,6 +30,7 @@ pub(crate) async fn list_namespace_tables(
     session: &CatalogSession,
     configured_ns: &[String],
     creds: &ConnectionCreds,
+    concurrency: NonZeroUsize,
 ) -> Result<Vec<TableIdent>, UdfError> {
     let root = NamespaceIdent::from_vec(configured_ns.to_vec()).map_err(|e| {
         UdfError::User(format!(
@@ -56,7 +55,7 @@ pub(crate) async fn list_namespace_tables(
                     Ok((list_tables(session, &ns, creds).await?, Vec::new()))
                 }
             })
-            .buffered(CATALOG_REQUEST_CONCURRENCY)
+            .buffered(concurrency.get())
             .try_collect()
             .await?;
         level = Vec::new();

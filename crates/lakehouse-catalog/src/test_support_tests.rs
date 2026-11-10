@@ -5,6 +5,7 @@ use crate::catalog_http::RetryPolicy;
 use crate::{ConnectionCreds, StorageBackend, StorageProps};
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -14,6 +15,17 @@ pub(crate) use crate::exported_test_support::{
     clock_reading, header_value, read_request, request_body, spawn_server,
     spawn_server_with_headers,
 };
+
+/// The adapter's default; no catalog test depends on how many reads run at once.
+pub(crate) const METADATA_READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
+
+/// An Iceberg REST client with no stored catalog prefix.
+pub(crate) fn rest_client(
+    uri: impl Into<String>,
+    creds: ConnectionCreds,
+) -> crate::IcebergRestCatalogClient {
+    crate::IcebergRestCatalogClient::new(uri.into(), creds, None, METADATA_READ_CONCURRENCY)
+}
 
 pub(crate) fn base_creds() -> ConnectionCreds {
     ConnectionCreds {

@@ -65,7 +65,13 @@ fn session_at(address: &str) -> GlueCatalogSession {
         path_style: true,
         ..StorageProps::default()
     });
-    let mut session = GlueCatalogSession::new(address, storage, creds).expect("a signing region");
+    let mut session = GlueCatalogSession::new(
+        address,
+        storage,
+        creds,
+        crate::test_support::METADATA_READ_CONCURRENCY,
+    )
+    .expect("a signing region");
     let config = session.client.config();
     let retry = config.retry_config().expect("a retry policy").clone();
     session.client = aws_sdk_glue::Client::from_conf(
@@ -766,6 +772,7 @@ fn a_session_without_a_signing_region_is_refused() {
         "http://127.0.0.1:1",
         StorageBackend::S3(StorageProps::default()),
         creds,
+        crate::test_support::METADATA_READ_CONCURRENCY,
     );
 
     assert!(result.is_err(), "no signing region, no session");

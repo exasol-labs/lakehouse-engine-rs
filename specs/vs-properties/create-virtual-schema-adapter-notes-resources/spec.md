@@ -9,6 +9,7 @@ The adapter records the computed resource budgets in the `createVirtualSchema` r
 * The parallelism factor is a VS or connection property recorded in `adapterNotes`. When absent, it defaults to 1, one shard per node.
 * `DATAFUSION_THREADING_MODE` (`AUTO` or `FIXED`, default `AUTO`) selects the threading configuration. `FIXED` uses `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF` as given, each falling back to its `AUTO` value. `AUTO` gives the node's single scan instance every core (`scan-runtime/scan-execution-threading`). Only the resolved integers reach the per-shard scan spec.
 * `MEMORY_POOL_FRACTION` (default `0.6`) and `INSTANCE_OVERHEAD_MB` (default `200`) are independent VS or connection properties. The adapter records both in `adapterNotes` and copies them into every per-shard scan spec. The scan UDF sizes its DataFusion pool to `fraction × (per_instance_limit − overhead_bytes)`.
+* `METADATA_READ_CONCURRENCY` (default `16`) bounds the adapter's concurrent metadata reads.
 * `vs-properties/create-virtual-schema-adapter-notes` covers how the core count is discovered, why it is not recorded, and why the cluster node count is not recorded.
 
 ## Scenarios
@@ -75,6 +76,21 @@ The adapter records the computed resource budgets in the `createVirtualSchema` r
 * *AND* the adapter SHALL default the instance-overhead megabytes to `200` when the `INSTANCE_OVERHEAD_MB` property is absent or empty
 * *AND* the adapter SHALL use the supplied value when it is in the range `vs-properties/property-value-validation` gives the property, persisting the overhead nowhere other than that returned `adapterNotes`
 * *AND* any other value SHALL fail the request per `vs-properties/property-value-validation`, and the adapter MUST NOT default it to `200`
+
+### Scenario: Adapter records the metadata read concurrency in the virtual-schema adapterNotes
+
+* *GIVEN* a `createVirtualSchema`, `refresh`, or `setProperties` request that may supply a `METADATA_READ_CONCURRENCY` property
+* *WHEN* the adapter resolves the request's properties
+* *THEN* the adapter SHALL record the supplied value as the `METADATA_READ_CONCURRENCY` entry of the returned `adapterNotes`, and `16` when the property is absent or empty
+* *AND* a value outside the range `vs-properties/property-value-validation` gives the property SHALL fail the request, and the adapter MUST NOT default it to `16`
+
+### Scenario: Planning keeps at most METADATA_READ_CONCURRENCY metadata reads in flight
+
+* *GIVEN* a virtual schema whose resolved metadata read concurrency is N
+* *WHEN* the adapter reads Iceberg manifests at pushdown, loads catalog tables or Glue metadata during listing, or reads direct-storage Parquet footers
+* *THEN* the adapter SHALL keep at most N of those reads in flight at once, whatever the core count of the adapter VM
+* *AND* a pushdown SHALL take N from the `adapterNotes`, so an invalid persisted property does not change it
+* *AND* the scan UDF MUST NOT read N
 
 ### Scenario: Recorded memory budget controls round-trip into the scan spec
 

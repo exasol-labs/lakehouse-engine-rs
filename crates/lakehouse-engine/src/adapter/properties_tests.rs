@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 
-const ALL_NAMES: [&str; 20] = [
+const ALL_NAMES: [&str; 21] = [
     "CATALOG_KIND",
     "CATALOG_CONNECTION",
     "NAMESPACE",
@@ -15,6 +15,7 @@ const ALL_NAMES: [&str; 20] = [
     "INSTANCE_OVERHEAD_MB",
     "JOIN_BROADCAST_MAX_BYTES",
     "S3_MAX_CONNECTIONS",
+    "METADATA_READ_CONCURRENCY",
     "MERGE_SCHEMA",
     "HIVE_PARTITIONING",
     "BINARY_AS_STRING",
@@ -25,8 +26,9 @@ const ALL_NAMES: [&str; 20] = [
 ];
 
 /// Name, minimum, and maximum of each whole-number tuning property.
-const WHOLE_NUMBER_RANGES: [(&str, &str, &str); 7] = [
+const WHOLE_NUMBER_RANGES: [(&str, &str, &str); 8] = [
     ("PARALLELISM_FACTOR", "1", "255"),
+    ("METADATA_READ_CONCURRENCY", "1", "255"),
     ("DATAFUSION_THREADS_PER_UDF", "1", "65535"),
     ("DATAFUSION_TARGET_PARTITIONS", "1", "65535"),
     ("S3_MAX_CONNECTIONS", "1", "65535"),
@@ -75,6 +77,7 @@ fn every_known_name_passes() {
         ("INSTANCE_OVERHEAD_MB", "100"),
         ("JOIN_BROADCAST_MAX_BYTES", "1024"),
         ("S3_MAX_CONNECTIONS", "16"),
+        ("METADATA_READ_CONCURRENCY", "32"),
         ("MERGE_SCHEMA", "not-checked-here"),
         ("HIVE_PARTITIONING", "not-checked-here"),
         ("BINARY_AS_STRING", "true"),
@@ -84,7 +87,7 @@ fn every_known_name_passes() {
         ("TABLE_EXCLUDE", "TMP_*"),
     ];
     let names: Vec<&str> = valid_values.iter().map(|(name, _)| *name).collect();
-    assert_eq!(names, ALL_NAMES, "the fixture must cover the 20 names");
+    assert_eq!(names, ALL_NAMES, "the fixture must cover the 21 names");
     assert_eq!(
         PROPERTY_NAMES.into_iter().collect::<BTreeSet<&str>>(),
         ALL_NAMES.into_iter().collect::<BTreeSet<&str>>(),
@@ -165,6 +168,7 @@ fn whole_number_tuning_values_return_their_typed_value() {
         ("DATAFUSION_THREADS_PER_UDF", "65535"),
         ("DATAFUSION_TARGET_PARTITIONS", "12"),
         ("S3_MAX_CONNECTIONS", "9"),
+        ("METADATA_READ_CONCURRENCY", "1"),
         ("INSTANCE_OVERHEAD_MB", "0"),
         ("DATAFUSION_BATCH_SIZE", "4294967295"),
         ("JOIN_BROADCAST_MAX_BYTES", "18446744073709551615"),
@@ -178,6 +182,7 @@ fn whole_number_tuning_values_return_their_typed_value() {
     assert_eq!(tuning.df_threads_per_udf.map(|n| n.get()), Some(65535));
     assert_eq!(tuning.df_target_partitions.map(|n| n.get()), Some(12));
     assert_eq!(tuning.s3_max_connections.map(|n| n.get()), Some(9));
+    assert_eq!(tuning.metadata_read_concurrency.map(|n| n.get()), Some(1));
     assert_eq!(tuning.instance_overhead_mb, Some(0));
     assert_eq!(tuning.df_batch_size.map(|n| n.get()), Some(u32::MAX));
     assert_eq!(

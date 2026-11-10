@@ -55,11 +55,10 @@ The adapter turns a storage prefix holding directories of Parquet files into enu
 
 * *GIVEN* an adapter call that enumerates many tables at `createVirtualSchema`, and a pushdown call that resolves both sides of a two-table join
 * *WHEN* the adapter opens object storage for that call
-* *THEN* the adapter SHALL build EXACTLY ONE object store per adapter call, wrapped in an admission limiter with a fixed in-flight request cap, and SHALL share that one store across every table the call touches
+* *THEN* the adapter SHALL build EXACTLY ONE object store per adapter call, wrapped in an admission limiter whose in-flight request cap is `METADATA_READ_CONCURRENCY`, and SHALL share that one store across every table the call touches
 * *AND* the cap SHALL therefore bound the WHOLE call, so a two-table join holds at most the cap in flight in total rather than the cap per side
-* *AND* the store's HTTP connection-retention budget SHALL be at least the limiter's cap, so an admitted request never finds its connection already evicted, and the two values SHALL be derived from ONE declared constant rather than set independently
+* *AND* the store's HTTP connection-retention budget SHALL be at least the limiter's cap, so an admitted request never finds its connection already evicted, and the two values SHALL be derived from ONE value rather than set independently
 * *AND* the limiter SHALL be an application-level admission gate, DISTINCT from the scan UDF's per-instance connection budget that `scan-runtime/scan-execution-connection-concurrency` owns, and MUST NOT read or modify that budget
-* *AND* the cap SHALL be a deliberately conservative fixed value, because a refresh sweeping many thousands of footers tolerates far more concurrency than a per-query plan
 
 ### Scenario: A refresh that a column pair fails keeps the previous declaration queryable
 

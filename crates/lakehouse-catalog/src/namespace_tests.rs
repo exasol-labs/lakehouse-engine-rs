@@ -45,9 +45,14 @@ async fn list_namespace_tables_rejects_empty_namespace() {
         .await
         .expect("a SigV4 session resolves without any network access");
 
-    let err = list_namespace_tables(&session, &[], &creds)
-        .await
-        .unwrap_err();
+    let err = list_namespace_tables(
+        &session,
+        &[],
+        &creds,
+        crate::test_support::METADATA_READ_CONCURRENCY,
+    )
+    .await
+    .unwrap_err();
 
     assert!(
         err.to_string().contains("invalid namespace ''"),
@@ -64,9 +69,14 @@ async fn signed_listing_lists_only_the_configured_namespace_under_the_catalogs_p
         .await
         .expect("a SigV4 session resolves without any network access");
 
-    list_namespace_tables(&session, &["db".to_string()], &creds)
-        .await
-        .expect("the signed listing must succeed against the stub");
+    list_namespace_tables(
+        &session,
+        &["db".to_string()],
+        &creds,
+        crate::test_support::METADATA_READ_CONCURRENCY,
+    )
+    .await
+    .expect("the signed listing must succeed against the stub");
 
     let heads = heads.lock().unwrap();
     let [head] = heads.as_slice() else {
@@ -105,8 +115,13 @@ async fn a_refused_catalog_connection_names_its_cause_signed_or_not() {
     let session = CatalogSession::resolve(CLOSED_PORT_URI, &creds.warehouse, None, &creds)
         .await
         .expect("a SigV4 session resolves without the catalog");
-    let Err(UdfError::User(msg)) =
-        list_namespace_tables(&session, &["db".to_string()], &creds).await
+    let Err(UdfError::User(msg)) = list_namespace_tables(
+        &session,
+        &["db".to_string()],
+        &creds,
+        crate::test_support::METADATA_READ_CONCURRENCY,
+    )
+    .await
     else {
         panic!("a closed catalog port must fail the listing as a user error");
     };
@@ -149,7 +164,12 @@ async fn listing_terminates_when_the_catalog_ignores_parent() {
 
     let tables = tokio::time::timeout(
         Duration::from_secs(1),
-        list_namespace_tables(&session, &root, &creds),
+        list_namespace_tables(
+            &session,
+            &root,
+            &creds,
+            crate::test_support::METADATA_READ_CONCURRENCY,
+        ),
     )
     .await
     .expect("the listing must terminate")

@@ -1,6 +1,5 @@
 //! Single source of truth for a prefix's Parquet file list, partition columns, and folded schema,
 //! so table enumeration and query planning can't disagree about a table's columns.
-use crate::scan::DIRECT_STORAGE_ADMISSION_LIMIT;
 use crate::scan::parquet_reader::SizedParquetReader;
 use crate::types::widening::widen;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -15,6 +14,7 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::basic::{ConvertedType, LogicalType, Type as PhysicalType};
 use parquet::schema::types::ColumnDescriptor;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 /// Which files' footers are folded and whose paths declare the partition keys.
@@ -110,6 +110,7 @@ pub async fn resolve_parquet_directory(
     store: &Arc<dyn ObjectStore>,
     prefix: &StorePath,
     options: DirectoryOptions,
+    footer_concurrency: NonZeroUsize,
 ) -> Result<ParquetDirectory, UdfError> {
     let raw_files = list_data_files(store, prefix, options.hive_partitioning).await?;
     let sampled = &raw_files[..raw_files.len().min(1)];
@@ -127,7 +128,7 @@ pub async fn resolve_parquet_directory(
     // Index items, because a reference item trips rustc's higher-ranked `Send` check.
     let mut footers = stream::iter(0..sources.len())
         .map(|i| read_footer(Arc::clone(store), sources[i].path.clone(), sources[i].size))
-        .buffered(DIRECT_STORAGE_ADMISSION_LIMIT)
+        .buffered(footer_concurrency.get())
         .zip(stream::iter(&sources));
     let mut fold = SchemaFold::new(&key_columns);
     while let Some((footer, source)) = footers.next().await {

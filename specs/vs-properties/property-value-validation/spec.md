@@ -24,7 +24,7 @@
 
 * *GIVEN* a `createVirtualSchema`, `refresh`, or `setProperties` request whose effective properties hold a whole-number tuning property with a non-empty value
 * *WHEN* the adapter checks the value
-* *THEN* the adapter SHALL accept only a whole number in the property's range: `PARALLELISM_FACTOR` from 1 to 255; `DATAFUSION_THREADS_PER_UDF`, `DATAFUSION_TARGET_PARTITIONS`, and `S3_MAX_CONNECTIONS` from 1 to 65535; `INSTANCE_OVERHEAD_MB` from 0 to 65535; `DATAFUSION_BATCH_SIZE` from 1 to 4294967295; and `JOIN_BROADCAST_MAX_BYTES` from 1 to 18446744073709551615
+* *THEN* the adapter SHALL accept only a whole number in the property's range: `PARALLELISM_FACTOR` and `METADATA_READ_CONCURRENCY` from 1 to 255; `DATAFUSION_THREADS_PER_UDF`, `DATAFUSION_TARGET_PARTITIONS`, and `S3_MAX_CONNECTIONS` from 1 to 65535; `INSTANCE_OVERHEAD_MB` from 0 to 65535; `DATAFUSION_BATCH_SIZE` from 1 to 4294967295; and `JOIN_BROADCAST_MAX_BYTES` from 1 to 18446744073709551615
 * *AND* the adapter SHALL reject every other value with the expectation `a whole number from <minimum> to <maximum>`, so `DATAFUSION_THREADS_PER_UDF = '100000'` fails with `expected a whole number from 1 to 65535`
 * *AND* a value too large for the range, however many digits it has, SHALL fail with that same expectation
 * *AND* `S3_MAX_CONNECTIONS = 'AUTO'` and `S3_MAX_CONNECTIONS = '0'` SHALL fail, because only an absent property selects the derived budget of `scan-runtime/scan-execution-connection-concurrency`
