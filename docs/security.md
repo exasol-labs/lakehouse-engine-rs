@@ -77,7 +77,7 @@ Readers still need only the reader grants, not membership in the role. Every mem
 
 ### Export grants
 
-> **In development.** Export is not ready for use: it counts rows and writes nothing to the lakehouse. Permissions may change.
+> **In development.** Export is not ready for use. Permissions may change.
 
 A user who runs `EXPORT ... INTO SCRIPT <schema>.LAKEHOUSE_EXPORT` (see [Export](export.md)) holds the export role, not the engine role. The installer prints the role's statements in its next-step template only when you pass `--with-export`, and runs none of them, because it runs before any CONNECTION exists. Create the CONNECTION, run the statements as a DBA, then grant the role to each exporting user:
 
@@ -91,6 +91,8 @@ GRANT LAKEHOUSE_EXPORT_ROLE_<schema> TO <user>;
 ```
 
 The export names the CONNECTION in a `WITH CATALOG_CONNECTION` option, never in an `AT` clause, so the role needs no `CONNECTION` privilege. The script-scoped `ACCESS` grant alone decides who exports through which CONNECTION. Grant the role only to users who may use the CONNECTION's credentials.
+
+The export acts as the CONNECTION's catalog identity and writes with its storage credentials, not as the exporting user. The [Lakekeeper permission check](#lakekeeper-permission-check) does not apply to exports, so an exporting user can create a table anywhere that identity may create one.
 
 ### Re-installing
 
@@ -126,7 +128,13 @@ The virtual schema's owner holds both, and so does every member of a role that o
 
 ### Who can bypass the export script
 
-A holder of the [export role](#export-grants) can call `LAKEHOUSE_EXPORT` directly in a `SELECT`, with a forged writer spec and any rows. That call runs the writer and skips every check the export call makes: the options, the writer count, and `SINGLE_COMMIT`. The writer therefore treats its writer spec as untrusted input. Grant the export role only to users who may export any rows through the CONNECTION.
+A holder of the [export role](#export-grants) can call `LAKEHOUSE_EXPORT` directly in a `SELECT`, with a forged writer spec and any rows. That call runs the writer and skips every check the export call makes: the options, the writer count, `SINGLE_COMMIT`, and the check for an existing table. The writer therefore treats its writer spec as untrusted input. Such a call can:
+
+- create a table anywhere the CONNECTION's catalog identity may create one,
+- carry its own `allow_http`, so it can send requests over plain HTTP without the statement's `ALLOW_HTTP`,
+- append rows to a table an export created, when its forged `export_id` equals the table's `lakehouse.export-id`.
+
+Grant the export role only to users who may export any rows through the CONNECTION.
 
 ## Lakekeeper permission check
 
@@ -184,6 +192,7 @@ If Lakekeeper is unreachable or does not answer within 30 seconds, retries inclu
 - **Table listing.** Every user who may query the virtual schema sees all table names, column names, and column types, including those of tables the user cannot read. Querying such a table is refused.
 - **Storage access.** Data is read with the CONNECTION's storage credentials, including credentials that Lakekeeper vends, and these are not scoped to the querying user. The check is enforced by the adapter, not by the catalog or the storage layer.
 - **Users who can bypass the adapter.** The virtual schema's owner, every member of an owning role, and every other user listed in [Who can bypass the adapter](#who-can-bypass-the-adapter) can run a scan plan without the check. A reader with only the reader grants cannot obtain a scan plan for a table it may not read, or run one captured by another user.
+- **Exports.** An export writes as the CONNECTION's catalog identity and checks no user. See [Export grants](#export-grants).
 - **Changing the settings.** The virtual schema's owner, every member of an owning role, a user with `ALTER` on the virtual schema, and a user with `ALTER ANY VIRTUAL SCHEMA` can set `PERMISSION_CHECK` to an empty value or change `USER_MAPPING`. Either change turns the check off, or changes the principal, for every user of the virtual schema. A user with only `SELECT` on the virtual schema cannot change either property.
 
 ### Out of scope

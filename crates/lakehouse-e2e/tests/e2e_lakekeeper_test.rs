@@ -6,9 +6,11 @@
 //!
 //! Two distinct OAuth2 client-credentials implementations are verified:
 //! `iceberg-catalog-rest`'s built-in client (createVirtualSchema enumeration) and
-//! the adapter's own `oauth2_client_credentials_grant` (scan/file resolution).
+//! the adapter's own `ClientCredentialsGrant` (scan/file resolution).
 
 mod common;
+#[path = "e2e_lakekeeper/export_write.rs"]
+mod export_write;
 
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, VsProps, assert_decimal_orders_numerically,
