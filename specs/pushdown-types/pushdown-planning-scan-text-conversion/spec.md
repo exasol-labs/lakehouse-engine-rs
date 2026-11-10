@@ -7,7 +7,8 @@ The scan computes an expression only when DataFusion returns what native Exasol 
 * Exasol writes a DATE by `NLS_DATE_FORMAT`, a TIMESTAMP by `NLS_TIMESTAMP_FORMAT`, and a DOUBLE or a DECIMAL with a scale above 0 by `NLS_NUMERIC_CHARACTERS`, and reads text into these types by the same settings. The pushdown request carries none of them. DataFusion always uses ISO dates, a `T` timestamp separator, and a `.` decimal point.
 * An integer (`DECIMAL(p,0)`) has the same text in every session. A BOOLEAN is `TRUE` or `FALSE` in every session.
 * Exasol converts text implicitly in a comparison, `IN`, `BETWEEN`, `CASE`, `COALESCE`, `NVL`, `GREATEST`, `LEAST`, `NULLIF`, and the argument of a non-text function or operator. It takes text without conversion in `LIKE`, `||`, string-function text arguments, text-to-text comparisons and CASTs, and a format or unit parameter.
-* The rule holds for every expression the scan computes: the WHERE filter, the select list, GROUP BY keys, aggregate arguments, `COUNT(DISTINCT expr)`, the broadcast join condition and filter, and each N-scan leg filter.
+* The rule holds for every expression the scan computes: the WHERE filter, the select list, GROUP BY keys, aggregates and their arguments, `COUNT(DISTINCT expr)`, the broadcast join condition and filter, and each N-scan leg filter. An aggregate is typed as a whole, so a bare-column argument meets the same checks as an expression.
+* `SUM`, `AVG`, `STDDEV`, and `VARIANCE` with their `_POP` and `_SAMP` forms convert text to a number by `NLS_NUMERIC_CHARACTERS` and a BOOLEAN to 1 or 0. DataFusion computes them only over numbers.
 * A declined expression takes the path's existing fallback: a WHERE filter runs in the qualified wrapper (`pushdown/pushdown-declined-filter-self-apply`), a select item widens the projection to the full base row, an aggregate or group key routes to the qualified wrapper, and a join condition or filter loses the broadcast plan.
 
 ## Scenarios
@@ -54,9 +55,17 @@ The scan computes an expression only when DataFusion returns what native Exasol 
 * *AND* trailing spaces beyond `n`, which native Exasol cuts, SHALL stay
 * *AND* a select item over a value that does not fit SHALL fail at the emit
 
+### Scenario: A numeric aggregate over text or BOOLEAN runs in Exasol
+
+* *GIVEN* a `SUM`, `AVG`, `STDDEV`, or `VARIANCE` aggregate, or one of their `_POP` and `_SAMP` forms, whose argument is text, a BOOLEAN, a DATE, a TIMESTAMP, or an expression of one of these types, such as `AVG(flag)` or `SUM(CAST(qty AS VARCHAR(20)))`
+* *WHEN* the adapter plans the request
+* *THEN* the aggregate SHALL NOT split into scan partials, and the qualified wrapper SHALL compute it in Exasol
+* *AND* the result SHALL equal native Exasol under any `NLS_NUMERIC_CHARACTERS`, including the native error for text that does not parse
+* *AND* the same aggregate over a DOUBLE, a DECIMAL, or an arithmetic expression over them SHALL keep the split
+
 ### Scenario: A column of unknown type declines
 
-* *GIVEN* an expression that converts a column to text or compares it with text, where the column has no type in the request's column metadata
+* *GIVEN* an expression that converts a column to text or compares it with text, or a numeric aggregate over the column, where the column has no type in the request's column metadata
 * *WHEN* the adapter plans the request
 * *THEN* the scan SHALL NOT compute the expression
 

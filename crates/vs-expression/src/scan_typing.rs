@@ -22,7 +22,10 @@ pub(crate) enum TypeClass {
     Boolean,
     /// A NULL literal, NULL in every type.
     Null,
-    /// DATE, TIMESTAMP, DOUBLE, DECIMAL(p,s>0), or a type this pass does not derive.
+    /// DOUBLE, DECIMAL(p,s>0), or a number of unproven scale. Its text form follows
+    /// `NLS_NUMERIC_CHARACTERS`.
+    Number,
+    /// DATE, TIMESTAMP, or a type this pass does not derive.
     Other,
 }
 
@@ -33,6 +36,7 @@ impl TypeClass {
             ExasolType::Decimal(d) if d.scale() == 0 => Self::Integer {
                 precision: Some(d.precision()),
             },
+            ExasolType::Decimal(_) | ExasolType::DoublePrecision => Self::Number,
             ExasolType::Boolean => Self::Boolean,
             _ => Self::Other,
         }
@@ -40,12 +44,23 @@ impl TypeClass {
 
     const INTEGER: Self = Self::Integer { precision: None };
 
+    fn is_numeric(self) -> bool {
+        matches!(self, Self::Integer { .. } | Self::Number | Self::Null)
+    }
+
+    fn is_integer(self) -> bool {
+        matches!(self, Self::Integer { .. } | Self::Null)
+    }
+
     /// The class Exasol gives a CASE, GREATEST, or LEAST over these branches.
     fn union(self, other: Self) -> Self {
         match (self, other) {
             (Self::Null, c) | (c, Self::Null) => c,
             (Self::Text, Self::Text) => Self::Text,
             (Self::Integer { .. }, Self::Integer { .. }) => Self::INTEGER,
+            (Self::Integer { .. } | Self::Number, Self::Integer { .. } | Self::Number) => {
+                Self::Number
+            }
             (Self::Boolean, Self::Boolean) => Self::Boolean,
             _ => Self::Other,
         }
@@ -82,7 +97,7 @@ fn to_text(node: Json, class: TypeClass) -> Result<Json, UdfError> {
         TypeClass::Text | TypeClass::Null => Ok(node),
         TypeClass::Integer { .. } => Ok(wrap(INTEGER_TEXT_NODE, node)),
         TypeClass::Boolean => Ok(wrap(BOOLEAN_TEXT_NODE, node)),
-        TypeClass::Other => Err(decline(format!(
+        TypeClass::Number | TypeClass::Other => Err(decline(format!(
             "converting {} to text depends on the session's NLS settings",
             short(&node)
         ))),
@@ -115,12 +130,12 @@ impl ScalarFunction {
         match self.result {
             ResultRule::Text => TypeClass::Text,
             ResultRule::Integer => TypeClass::INTEGER,
-            ResultRule::IntegerOverIntegers
-                if args
-                    .iter()
-                    .all(|c| matches!(c, TypeClass::Integer { .. } | TypeClass::Null)) =>
+            ResultRule::Number => TypeClass::Number,
+            ResultRule::Arithmetic if args.iter().all(|c| c.is_integer()) => TypeClass::INTEGER,
+            ResultRule::Arithmetic | ResultRule::NumberOverNumbers
+                if args.iter().all(|c| c.is_numeric()) =>
             {
-                TypeClass::INTEGER
+                TypeClass::Number
             }
             ResultRule::FirstArgument => args.first().copied().unwrap_or(TypeClass::Other),
             ResultRule::Unified => args
@@ -128,7 +143,9 @@ impl ScalarFunction {
                 .copied()
                 .reduce(TypeClass::union)
                 .unwrap_or(TypeClass::Other),
-            ResultRule::IntegerOverIntegers | ResultRule::Other => TypeClass::Other,
+            ResultRule::Arithmetic | ResultRule::NumberOverNumbers | ResultRule::Other => {
+                TypeClass::Other
+            }
         }
     }
 }
@@ -174,7 +191,7 @@ fn cast_to_text(
             }
             Ok(wrap(BOOLEAN_TEXT_NODE, source))
         }
-        TypeClass::Other => refuse("depends on the session's NLS settings"),
+        TypeClass::Number | TypeClass::Other => refuse("depends on the session's NLS settings"),
     }
 }
 
@@ -265,6 +282,7 @@ pub(crate) fn type_scan_tree(
         "literal_null" => TypeClass::Null,
         "literal_bool" => TypeClass::Boolean,
         "literal_string" => TypeClass::Text,
+        "literal_double" => TypeClass::Number,
         "literal_exactnumeric" => {
             let text = match node.get("value") {
                 Some(Json::Number(n)) if n.is_i64() || n.is_u64() => Some(n.to_string()),
@@ -273,7 +291,7 @@ pub(crate) fn type_scan_tree(
             };
             text.as_deref()
                 .and_then(integer_digits)
-                .map_or(TypeClass::Other, |digits| TypeClass::Integer {
+                .map_or(TypeClass::Number, |digits| TypeClass::Integer {
                     precision: Some(digits),
                 })
         }
@@ -370,6 +388,8 @@ pub(crate) fn type_scan_tree(
             match name.as_str() {
                 "COUNT" => TypeClass::INTEGER,
                 "MIN" | "MAX" => args.first().copied().unwrap_or(TypeClass::Other),
+                "SUM" | "AVG" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" | "VARIANCE"
+                | "VAR_POP" | "VAR_SAMP" => numeric_aggregate(node, &name, &args)?,
                 _ => {
                     refuse_implicit_text(node, &args)?;
                     TypeClass::Other
@@ -489,6 +509,23 @@ fn refuse_implicit_text(node: &Json, operands: &[TypeClass]) -> Result<(), UdfEr
         )));
     }
     Ok(())
+}
+
+/// DataFusion aggregates only numbers here. Exasol also converts text by the session's NLS
+/// settings and BOOLEAN to 1 or 0, so those run in Exasol.
+fn numeric_aggregate(node: &Json, name: &str, args: &[TypeClass]) -> Result<TypeClass, UdfError> {
+    refuse_implicit_text(node, args)?;
+    if !args.iter().all(|c| c.is_numeric()) {
+        return Err(decline(format!(
+            "{name} over a value that is not a number: {}",
+            short(node)
+        )));
+    }
+    Ok(if name == "SUM" && args.iter().all(|c| c.is_integer()) {
+        TypeClass::INTEGER
+    } else {
+        TypeClass::Number
+    })
 }
 
 /// The class of values Exasol brings to one type (CASE results, GREATEST, LEAST, NULLIF). Text

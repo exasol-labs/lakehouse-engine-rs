@@ -1386,8 +1386,10 @@ fn expected_orderdate_text(order_key: usize) -> String {
         .to_string()
 }
 
+/// Exasol writes a DECIMAL by `NLS_NUMERIC_CHARACTERS`, so a join filter over its text loses the
+/// broadcast plan and Exasol applies it.
 #[test]
-fn e2e_join_decimal_stringification_matches_native_at_both_surfaces() {
+fn e2e_join_filter_over_decimal_text_runs_in_exasol() {
     setup_e2e();
     let mut conn = exa_conn();
     let where_clause = "LENGTH(O_TOTALPRICE) > 3";
@@ -1424,9 +1426,14 @@ fn e2e_join_decimal_stringification_matches_native_at_both_surfaces() {
 
         assert_eq!(
             actual, expected,
-            "{vs_name}: the join result under a DECIMAL-stringification WHERE \
-             filter must equal the seed-derived expectation.\nactual:   \
+            "{vs_name}: the join result under a WHERE filter over DECIMAL text \
+             must equal the seed-derived expectation.\nactual:   \
              {actual:?}\nexpected: {expected:?}"
+        );
+        let pushed = explain_virtual_sql(&mut conn, &query);
+        assert!(
+            !has_broadcast_join_block(&pushed),
+            "{vs_name}: a filter over DECIMAL text must not run in the broadcast scan: {pushed}"
         );
     }
 }

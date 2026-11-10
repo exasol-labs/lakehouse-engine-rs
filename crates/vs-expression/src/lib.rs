@@ -884,9 +884,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 }
                 "TO_DATE" => render_to_datetime(FormatTarget::Date, args, dialect),
                 "TO_TIMESTAMP" => render_to_datetime(FormatTarget::Timestamp, args, dialect),
-                // ADD_HOURS/ADD_MINUTES are not translated: Exasol types
-                // ADD_HOURS(DATE, n) as TIMESTAMP(0), which a type-blind translator
-                // cannot reproduce.
+                // ADD_HOURS/ADD_MINUTES are not translated: Exasol types ADD_HOURS(DATE, n) as
+                // TIMESTAMP(0), and the typed pass does not tell a DATE from a TIMESTAMP.
                 //
                 // DATE - DATE yields an Int64 day count in DataFusion; Exasol uses only
                 // the date part of a timestamp.

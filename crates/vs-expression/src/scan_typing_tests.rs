@@ -548,3 +548,65 @@ fn an_exasol_fragment_keeps_its_cast_target_and_column_type() {
     assert_eq!(typed(&col("N")).ty, Some(ExasolType::decimal(9, 2)));
     assert_eq!(typed(&null_lit()).ty, None);
 }
+
+/// DataFusion sums, averages, and deviates only numbers. Exasol also converts text by the
+/// session's NLS settings and BOOLEAN to 1 or 0, so those run in Exasol.
+#[test]
+fn numeric_aggregates_take_only_numbers() {
+    let numbers = [
+        col("I"),
+        col("N"),
+        col("F"),
+        scalar_fn("MULT", [col("I"), col("N")]),
+        scalar_fn("SQRT", [col("I")]),
+        scalar_fn("FLOAT_DIV", [col("I"), col("I")]),
+        scalar_fn("LENGTH", [col("S")]),
+        case_when([col("B")], [col("I"), col("N")]),
+        cast_to(ExasolType::decimal(10, 2), col("I")),
+    ];
+    let not_numbers = [
+        col("S"),
+        col("B"),
+        col("D"),
+        col("TS"),
+        col("UNKNOWN"),
+        cast_to(ExasolType::varchar(30), col("I")),
+        case_when([col("B")], [col("B"), bool_lit(false)]),
+        scalar_fn("ADD", [col("D"), col("I")]),
+    ];
+    for name in ["SUM", "AVG", "STDDEV", "VAR_SAMP"] {
+        for argument in &numbers {
+            let expr = agg_item_expr(name, argument.clone(), false);
+            assert!(render(&expr).is_ok(), "{expr} must stay in the scan");
+        }
+        for argument in &not_numbers {
+            let expr = agg_item_expr(name, argument.clone(), false);
+            assert!(render(&expr).is_err(), "{expr} must decline");
+        }
+    }
+    for name in ["MIN", "MAX", "COUNT"] {
+        let expr = agg_item_expr(name, col("S"), false);
+        assert!(render(&expr).is_ok(), "{expr} needs no number");
+    }
+}
+
+/// A function over integers that can return a fraction is a number, not an integer, so its text
+/// still declines.
+#[test]
+fn a_fractional_function_of_integers_is_not_integer_text() {
+    let fractional = [
+        scalar_fn("SQRT", [col("I")]),
+        scalar_fn("LN", [col("I")]),
+        scalar_fn("ROUND", [col("I")]),
+        scalar_fn("FLOAT_DIV", [col("I"), col("I")]),
+    ];
+    for function in fractional {
+        let expr = cast_to(ExasolType::varchar(50), function);
+        assert!(render(&expr).is_err(), "{expr} must decline");
+    }
+    let integer = cast_to(
+        ExasolType::varchar(50),
+        scalar_fn("MULT", [col("I"), col("I")]),
+    );
+    assert!(render(&integer).is_ok(), "{integer} is integer text");
+}

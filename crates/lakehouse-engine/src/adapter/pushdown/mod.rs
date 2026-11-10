@@ -63,7 +63,7 @@ use single_group_agg::{has_distinct, is_lone_count_distinct, single_group_merge_
 mod grouped_agg;
 pub use grouped_agg::{
     GroupedAggregateDetection, GroupedSelectItem, build_grouped_aggregate_scan_sql,
-    detect_group_by_aggregates, validate_agg_col_types,
+    detect_group_by_aggregates,
 };
 
 mod scalar_over_agg;
@@ -419,7 +419,7 @@ pub(crate) fn build_dispatch_sql(
                     },
                     files: vec![],
                 };
-                let sql = support::build_count_distinct_scan_sql(
+                let Some(sql) = support::build_count_distinct_scan_sql(
                     &base_spec,
                     shards,
                     &items,
@@ -427,7 +427,9 @@ pub(crate) fn build_dispatch_sql(
                     limit,
                     udf_name,
                     distribute_udf_name,
-                );
+                ) else {
+                    return fallback();
+                };
                 return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
             }
             // Multiple or mixed distincts: the bare row scan would fail Exasol's positional
@@ -439,9 +441,9 @@ pub(crate) fn build_dispatch_sql(
             }
             let merge_select =
                 single_group_merge_select(&items, &aggregates, pushdown.select_types(), scan);
-            let TypedPlans { plans, types, .. } = aggregates;
+            let TypedPlans { plans, emits, .. } = aggregates;
             let merge_inputs = merge_select.and_then(|merge_select| {
-                AggregateMergeInputs::new(types, merge_select, limit)
+                AggregateMergeInputs::new(emits, merge_select, limit)
                     .map(|inputs| inputs.with_having(having))
             });
             let Some(merge_inputs) = merge_inputs else {
@@ -544,7 +546,6 @@ pub(crate) fn build_dispatch_sql(
         shards,
         &projection,
         effective_limit,
-        scan.columns(),
         merge_inputs.as_ref(),
         udf_name,
         distribute_udf_name,

@@ -8,7 +8,7 @@ use super::super::support::{
 };
 use super::super::test_support::*;
 use super::*;
-use crate::scan::spec::{CommonScanSpec, ScanStorage};
+use crate::scan::spec::{AggKind, CommonScanSpec, ScanStorage};
 use crate::scan::test_support::WithFiles;
 use vs_expression::SqlFragment;
 
@@ -16,7 +16,7 @@ use vs_expression::SqlFragment;
 fn scalar_over_merge_casts_to_exasol_char_target() {
     let sum_node = agg_item("SUM", Some("x"), false);
     let plans =
-        vec![parse_agg_item(&sum_node, untyped_scan()).expect("SUM(x) must parse to a plan")];
+        vec![parse_agg_item(&sum_node, aggregate_scan()).expect("SUM(x) must parse to a plan")];
     let node = cast_to(
         ExasolType::Char {
             size: 20,
@@ -24,9 +24,10 @@ fn scalar_over_merge_casts_to_exasol_char_target() {
         },
         sum_node,
     );
-    let sql = render_scalar_over_merge(&node, &plans, &merge_select_items(&plans), untyped_scan())
-        .expect("CAST over a mergeable aggregate must render")
-        .sql;
+    let sql =
+        render_scalar_over_merge(&node, &plans, &merge_select_items(&plans), aggregate_scan())
+            .expect("CAST over a mergeable aggregate must render")
+            .sql;
     assert!(
         sql.contains("CHAR(20) ASCII"),
         "Exasol-parsed merge wrapper needs the declared length-qualified CHAR \
@@ -46,15 +47,16 @@ fn scalar_over_merge_casts_to_exasol_char_target() {
 fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
     let sum_node = agg_item("SUM", Some("x"), false);
     let plans =
-        vec![parse_agg_item(&sum_node, untyped_scan()).expect("SUM(x) must parse to a plan")];
+        vec![parse_agg_item(&sum_node, aggregate_scan()).expect("SUM(x) must parse to a plan")];
     let char_type = ExasolType::Char {
         size: 20,
         ascii: true,
     };
     let node = cast_to(char_type, cast_to(char_type, sum_node));
-    let sql = render_scalar_over_merge(&node, &plans, &merge_select_items(&plans), untyped_scan())
-        .expect("a nested CAST over a mergeable aggregate must render")
-        .sql;
+    let sql =
+        render_scalar_over_merge(&node, &plans, &merge_select_items(&plans), aggregate_scan())
+            .expect("a nested CAST over a mergeable aggregate must render")
+            .sql;
     assert_eq!(
         sql.matches("CHAR(20) ASCII").count(),
         2,
@@ -77,11 +79,11 @@ fn grouped_count_distinct_falls_back_to_row_scan() {
         )
         .build_pushdown();
     assert!(
-        detect_group_by_aggregates(&req, untyped_scan()).is_none(),
+        detect_group_by_aggregates(&req, aggregate_scan()).is_none(),
         "grouped COUNT(DISTINCT) must still decline (row-scan fallback)"
     );
     assert!(
-        detect_aggregates(&req, untyped_scan()).is_none(),
+        detect_aggregates(&req, aggregate_scan()).is_none(),
         "the single-group path rejects any request carrying a non-empty GROUP BY"
     );
 }
@@ -96,7 +98,8 @@ fn partial_emits_min_max_preserve_date_timestamp_type() {
         ("EVENT_DATE".to_string(), ExasolType::Date),
         ("EVENT_TS".to_string(), ExasolType::BARE_TIMESTAMP),
     ];
-    let emits = partial_emits_items(&plans, &column_types(&col_types), &[]);
+    let emits = partial_emits_items(&plans, &column_types(&col_types), &[])
+        .expect("every partial column is typed");
     assert!(
         emits[0].contains("DATE") && !emits[0].contains("DOUBLE"),
         "MIN over DATE must emit DATE, not DOUBLE: {:?}",
@@ -113,7 +116,8 @@ fn partial_emits_min_max_preserve_date_timestamp_type() {
 fn partial_emits_sum_integer_stays_decimal() {
     let plans = vec![column_plan(AggKind::Sum, "AMOUNT")];
     let col_types = vec![("AMOUNT".to_string(), ExasolType::decimal(20, 0))];
-    let emits = partial_emits_items(&plans, &column_types(&col_types), &[]);
+    let emits = partial_emits_items(&plans, &column_types(&col_types), &[])
+        .expect("every partial column is typed");
     assert!(
         emits[0].contains("DECIMAL") && !emits[0].contains("DOUBLE"),
         "SUM over DECIMAL integer must emit DECIMAL, not DOUBLE: {:?}",
@@ -130,7 +134,8 @@ fn partial_emits_sum_integer_stays_decimal() {
 fn partial_emits_sum_double_stays_double() {
     let plans = vec![column_plan(AggKind::Sum, "SCORE")];
     let col_types = vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
-    let emits = partial_emits_items(&plans, &column_types(&col_types), &[]);
+    let emits = partial_emits_items(&plans, &column_types(&col_types), &[])
+        .expect("every partial column is typed");
     assert!(
         emits[0].contains("DOUBLE PRECISION"),
         "SUM over DOUBLE must emit DOUBLE PRECISION: {:?}",
@@ -139,67 +144,23 @@ fn partial_emits_sum_double_stays_double() {
 }
 
 #[test]
-fn aggregate_falls_back_to_row_scan_for_sum_of_non_numeric() {
-    let col_types_varchar = vec![("NAME".to_string(), ExasolType::WIDEST_VARCHAR)];
-    let sum_varchar = vec![column_plan(AggKind::Sum, "NAME")];
-    assert!(
-        !validate_agg_col_types(&sum_varchar, &column_types(&col_types_varchar)),
-        "SUM over VARCHAR must fail validation (fall back to row scan)"
-    );
-
-    let col_types_date = vec![("EVENT_DATE".to_string(), ExasolType::Date)];
-    let sum_date = vec![column_plan(AggKind::Sum, "EVENT_DATE")];
-    assert!(
-        !validate_agg_col_types(&sum_date, &column_types(&col_types_date)),
-        "SUM over DATE must fail validation (fall back to row scan)"
-    );
-}
-
-#[test]
-fn grouped_aggregate_sum_over_varchar_falls_back_via_type_validation() {
-    let req = pushdown_request("T", &[("REGION", ExasolType::WIDEST_VARCHAR)])
+fn grouped_aggregate_sum_over_varchar_declines_the_split() {
+    let columns = [
+        ("REGION", ExasolType::WIDEST_VARCHAR),
+        ("NAME", ExasolType::WIDEST_VARCHAR),
+    ];
+    let req = pushdown_request("T", &columns)
         .group_by(vec![col("REGION")])
         .column(col("REGION"))
-        // NAME is VARCHAR — invalid for SUM
         .item(
             agg_item("SUM", Some("NAME"), false),
-            ExasolType::WIDEST_VARCHAR,
+            ExasolType::DoublePrecision,
         )
         .build_pushdown();
-
-    let detected = detect_group_by_aggregates(&req, untyped_scan());
+    let col_types = column_types(&columns);
     assert!(
-        detected.is_some(),
-        "detect_group_by_aggregates must accept the shape: {}",
-        req.json()
-    );
-    let agg_plans = detected.unwrap().aggregates.plans;
-
-    let col_types = vec![
-        ("REGION".to_string(), ExasolType::WIDEST_VARCHAR),
-        ("NAME".to_string(), ExasolType::WIDEST_VARCHAR),
-    ];
-    assert!(
-        !validate_agg_col_types(&agg_plans, &column_types(&col_types)),
-        "validate_agg_col_types must fail for SUM over VARCHAR (fall back to row scan)"
-    );
-
-    let col_types_date = vec![
-        ("REGION".to_string(), ExasolType::WIDEST_VARCHAR),
-        ("NAME".to_string(), ExasolType::Date),
-    ];
-    assert!(
-        !validate_agg_col_types(&agg_plans, &column_types(&col_types_date)),
-        "validate_agg_col_types must fail for SUM over DATE (fall back to row scan)"
-    );
-
-    let col_types_numeric = vec![
-        ("REGION".to_string(), ExasolType::WIDEST_VARCHAR),
-        ("NAME".to_string(), ExasolType::DoublePrecision),
-    ];
-    assert!(
-        validate_agg_col_types(&agg_plans, &column_types(&col_types_numeric)),
-        "validate_agg_col_types must pass for SUM over DOUBLE PRECISION"
+        detect_group_by_aggregates(&req, ScanTranslator::new(&col_types)).is_none(),
+        "SUM over VARCHAR parses the text by the session's NLS settings, so the split declines"
     );
 }
 
@@ -229,7 +190,7 @@ fn detect_group_by_aggregates_column_key() {
     .count_star()
     .build_pushdown();
     let result =
-        detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
+        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
     let keys = result.group_keys;
     let plans = result.aggregates.plans;
     assert_eq!(keys.len(), 1, "one group key");
@@ -432,12 +393,13 @@ fn having_over_plans(node: &Json, plans: &[AggregatePlan]) -> Option<String> {
         plans: plans.to_vec(),
         types: Vec::new(),
         merged: merge_select_items(plans),
+        emits: Vec::new(),
     };
     let scope = MergeScope {
         aggregates: &aggregates,
         group_keys: &[],
     };
-    render_having_over_merge(node, &scope, untyped_scan())
+    render_having_over_merge(node, &scope, aggregate_scan())
 }
 
 #[test]
@@ -448,9 +410,9 @@ fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
         .order_by(serde_json::json!([order_by_element(col("ID"), true, true)]))
         .build_pushdown();
 
-    let result = detect_group_by_aggregates(&req, untyped_scan()).expect("grouped aggregate");
+    let result = detect_group_by_aggregates(&req, aggregate_scan()).expect("grouped aggregate");
     assert_eq!(
-        order_by_over_merge(&req, &result, &ColumnTypes::default()),
+        order_by_over_merge(&req, &result, aggregate_scan().columns()),
         Some(GroupedOrderBy::Clause(
             r#""GK_0" ASC NULLS LAST"#.to_string()
         )),
@@ -482,9 +444,9 @@ fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
         ]))
         .build_pushdown();
 
-    let detection = detect_group_by_aggregates(&req, untyped_scan()).expect("grouped aggregate");
+    let detection = detect_group_by_aggregates(&req, aggregate_scan()).expect("grouped aggregate");
     assert_eq!(
-        order_by_over_merge(&req, &detection, &ColumnTypes::default()),
+        order_by_over_merge(&req, &detection, aggregate_scan().columns()),
         Some(GroupedOrderBy::Clause(
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2)) DESC NULLS LAST, "GK_0" ASC NULLS FIRST"#
                 .to_string()
@@ -506,9 +468,9 @@ fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
         )]))
         .build_pushdown();
 
-    let detection = detect_group_by_aggregates(&req, untyped_scan()).expect("grouped aggregate");
+    let detection = detect_group_by_aggregates(&req, aggregate_scan()).expect("grouped aggregate");
     assert_eq!(
-        order_by_over_merge(&req, &detection, &ColumnTypes::default()),
+        order_by_over_merge(&req, &detection, aggregate_scan().columns()),
         Some(GroupedOrderBy::Unresolvable),
         "an aggregate with no matching plan must not resolve to a fabricated partial"
     );
@@ -549,7 +511,7 @@ fn detect_group_by_unsupported_expression_falls_back() {
     .count_star()
     .build_pushdown();
     assert!(
-        detect_group_by_aggregates(&req, untyped_scan()).is_none(),
+        detect_group_by_aggregates(&req, aggregate_scan()).is_none(),
         "unsupported expression must fall back to None"
     );
 }
@@ -562,7 +524,7 @@ fn detect_group_by_mixed_select_falls_back() {
         .count_star()
         .build_pushdown();
     assert!(
-        detect_group_by_aggregates(&req, untyped_scan()).is_none(),
+        detect_group_by_aggregates(&req, aggregate_scan()).is_none(),
         "non-aggregate non-column in selectList must fall back"
     );
 }
@@ -625,7 +587,7 @@ fn literal_bool_selectlist_item_classifies_as_constant_not_group_key() {
         .item(bool_lit(true), ExasolType::Boolean)
         .item(count_star(), ExasolType::decimal(20, 0))
         .build_pushdown();
-    let result = detect_group_by_aggregates(&req, untyped_scan()).expect(
+    let result = detect_group_by_aggregates(&req, aggregate_scan()).expect(
         "a literal_bool selectList item must classify as Constant, not abort detection to None",
     );
     assert!(
@@ -652,7 +614,7 @@ fn detect_group_by_aggregates_preserves_select_list_order() {
         .item(mod_item("ID", 4), ExasolType::WIDEST_VARCHAR)
         .build_pushdown();
     let result =
-        detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
+        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
     assert_eq!(result.group_keys.len(), 1, "one group key");
     assert_eq!(result.aggregates.plans.len(), 1, "one aggregate plan");
     assert_eq!(
@@ -689,7 +651,7 @@ fn detect_group_by_aggregates_interleaved_multi_key_preserves_order() {
     .column(col("YEAR"))
     .build_pushdown();
     let result =
-        detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
+        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
     assert_eq!(result.group_keys.len(), 2, "two group keys");
     assert_eq!(result.aggregates.plans.len(), 1, "one aggregate plan");
     assert_eq!(
@@ -720,7 +682,7 @@ fn detect_group_by_aggregates_expr_key_after_agg_preserves_order() {
         .item(mod_item("ID", 4), ExasolType::WIDEST_VARCHAR)
         .build_pushdown();
     let result =
-        detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
+        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
     assert_eq!(
         result.select_items,
         vec![
@@ -757,7 +719,7 @@ fn detect_group_by_aggregates_aggregate_first_with_having_preserves_order() {
         .item(mod_item("ID", 4), ExasolType::WIDEST_VARCHAR)
         .build_pushdown();
     let result =
-        detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
+        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
     assert_eq!(
         result.select_items,
         vec![
@@ -849,7 +811,7 @@ fn detect_group_by_all_expression_multi_key() {
     .count_star()
     .build_pushdown();
     assert!(
-        detect_group_by_aggregates(&bad_req, untyped_scan()).is_none(),
+        detect_group_by_aggregates(&bad_req, aggregate_scan()).is_none(),
         "one untranslatable tuple element must force full fallback to None"
     );
 }
@@ -1043,7 +1005,7 @@ fn grouped_merge_renders_limit_offset_in_clause_order() {
         .order_by(serde_json::json!([order_by_element(col("ID"), true, true)]))
         .build_pushdown();
 
-    let result = detect_group_by_aggregates(&req, untyped_scan()).expect("grouped aggregate");
+    let result = detect_group_by_aggregates(&req, aggregate_scan()).expect("grouped aggregate");
     let sql = GroupedSql::of(&result, &req)
         .columns(column_types(&[("ID", ExasolType::decimal(20, 0))]))
         .limit(2)
@@ -1537,7 +1499,7 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
     let pushdown = parsed_pushdown(&request);
 
     assert!(
-        detect_group_by_aggregates(&pushdown, untyped_scan()).is_none(),
+        detect_group_by_aggregates(&pushdown, aggregate_scan()).is_none(),
         "a nested COUNT(DISTINCT) must decline the grouped partial/merge path"
     );
 
@@ -1620,14 +1582,14 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
         .item(mod_item("ID", 4), ExasolType::decimal(9, 0))
         .build_pushdown();
     let detection =
-        detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
+        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
 
     let having_node = compare(
         "predicate_greater",
         agg_item("SUM", Some("SCORE"), false),
         num_lit(250),
     );
-    let having = having_over_merge(&having_node, &detection, &ColumnTypes::default())
+    let having = having_over_merge(&having_node, &detection, aggregate_scan().columns())
         .expect("HAVING must render over the merge decomposition");
 
     let sql = GroupedSql::of(&detection, &req)
@@ -1714,7 +1676,7 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
         .item(mod_item("ID", 4), ExasolType::decimal(9, 0))
         .build_pushdown();
     let detection =
-        detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
+        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
     let sql = GroupedSql::of(&detection, &req)
         .columns(score_double())
         .build();
@@ -1745,7 +1707,7 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
     .item(mod_item("ID", 4), ExasolType::decimal(9, 0))
     .build_pushdown();
     let detection =
-        detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
+        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
     assert_eq!(detection.group_keys.len(), 2, "two group keys");
 
     let having_node = compare(
@@ -1753,7 +1715,7 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
         agg_item("SUM", Some("SCORE"), false),
         num_lit(100),
     );
-    let having = having_over_merge(&having_node, &detection, &ColumnTypes::default())
+    let having = having_over_merge(&having_node, &detection, aggregate_scan().columns())
         .expect("HAVING must render over the merge decomposition");
 
     let sql = GroupedSql::of(&detection, &req)
@@ -1814,7 +1776,7 @@ fn group_key_type_resolved_by_index_not_string_match() {
         .item(mod_item("ID", 4), ExasolType::decimal(9, 0))
         .build_pushdown();
     let detection =
-        detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
+        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
 
     let group_keys = vec![SqlFragment::new(r#"("id" % 4)"#, None)];
     let select_items = detection.select_items.clone();
@@ -1839,7 +1801,7 @@ fn group_key_types_multi_key_mixed_types() {
     .count_star()
     .build_pushdown();
     let detection =
-        detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
+        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
     assert_eq!(detection.group_keys.len(), 2, "two group keys");
 
     let types = detection.group_key_types.clone();
@@ -1874,7 +1836,7 @@ fn group_key_exasol_types_resolves_char_case_key() {
         )
         .count_star()
         .build_pushdown();
-    let detection = detect_group_by_aggregates(&req, untyped_scan())
+    let detection = detect_group_by_aggregates(&req, aggregate_scan())
         .expect("equal-length CASE group key must be detected as a grouped aggregate");
     assert_eq!(detection.group_keys.len(), 1, "one group key");
 
@@ -1899,7 +1861,7 @@ fn group_key_exasol_types_resolves_varchar_key_unchanged() {
         .count_star()
         .build_pushdown();
     let detection =
-        detect_group_by_aggregates(&req, untyped_scan()).expect("must detect grouped aggregate");
+        detect_group_by_aggregates(&req, aggregate_scan()).expect("must detect grouped aggregate");
 
     let types = detection.group_key_types.clone();
 
@@ -2049,13 +2011,13 @@ fn detect_group_by_aggregates_no_group_by_type_returns_none() {
         .field("groupBy", serde_json::json!([col("REGION")]))
         .count_star()
         .build_pushdown();
-    assert!(detect_group_by_aggregates(&req1, untyped_scan()).is_none());
+    assert!(detect_group_by_aggregates(&req1, aggregate_scan()).is_none());
 
     let req2 = pushdown_request("T", NO_COLUMNS)
         .single_group()
         .count_star()
         .build_pushdown();
-    assert!(detect_group_by_aggregates(&req2, untyped_scan()).is_none());
+    assert!(detect_group_by_aggregates(&req2, aggregate_scan()).is_none());
 }
 
 #[test]
@@ -2067,7 +2029,7 @@ fn detect_group_by_aggregates_empty_group_by_returns_none() {
             ExasolType::WIDEST_VARCHAR,
         )
         .build_pushdown();
-    assert!(detect_group_by_aggregates(&req, untyped_scan()).is_none());
+    assert!(detect_group_by_aggregates(&req, aggregate_scan()).is_none());
 }
 
 #[test]
@@ -2082,7 +2044,8 @@ fn stat_aggregate_emits_three_partial_columns() {
     ] {
         let plans = vec![column_plan(kind.clone(), "SCORE")];
         let col_types = vec![("SCORE".to_string(), ExasolType::DoublePrecision)];
-        let items = partial_emits_items(&plans, &column_types(&col_types), &[]);
+        let items = partial_emits_items(&plans, &column_types(&col_types), &[])
+            .expect("every partial column is typed");
         assert_eq!(
             items.len(),
             3,
@@ -2143,7 +2106,9 @@ fn scan_select_list_and_emits_agree_per_agg_kind() {
         let plans = vec![plan_for(kind)];
         let scan_names = partial_names_in(&crate::scan::build_partial_agg_sql(&plans, "aliased"));
         let emits_names = partial_names_in(
-            &partial_emits_items(&plans, &column_types(&col_types), &[]).join(", "),
+            &partial_emits_items(&plans, &column_types(&col_types), &[])
+                .expect("every partial column is typed")
+                .join(", "),
         );
         assert_eq!(
             scan_names, emits_names,
@@ -2155,7 +2120,11 @@ fn scan_select_list_and_emits_agree_per_agg_kind() {
     let mixed: Vec<AggregatePlan> = all_kinds.iter().map(plan_for).collect();
     assert_eq!(
         partial_names_in(&crate::scan::build_partial_agg_sql(&mixed, "aliased")),
-        partial_names_in(&partial_emits_items(&mixed, &column_types(&col_types), &[]).join(", ")),
+        partial_names_in(
+            &partial_emits_items(&mixed, &column_types(&col_types), &[])
+                .expect("every partial column is typed")
+                .join(", ")
+        ),
         "mixed-arity plan list: scan SELECT list and EMITS clause disagree"
     );
 }
@@ -2267,7 +2236,7 @@ fn grouped_stat_aggregate_over_expression_argument_declines() {
         )
         .build_pushdown();
     assert!(
-        detect_group_by_aggregates(&req, untyped_scan()).is_none(),
+        detect_group_by_aggregates(&req, aggregate_scan()).is_none(),
         "a grouped STDDEV over an expression argument must decline the grouped \
              partial/merge path"
     );
@@ -2280,7 +2249,7 @@ fn scalar_over_stat_aggregate_with_expression_argument_declines() {
         [agg_item_expr("STDDEV", mod_item("SCORE", 4), false)],
     );
     assert!(
-        classify_scalar_over_aggregate(&sqrt_over_stat, untyped_scan()).is_none(),
+        classify_scalar_over_aggregate(&sqrt_over_stat, aggregate_scan()).is_none(),
         "a scalar wrapping a stat aggregate over an expression must not classify"
     );
 
@@ -2289,7 +2258,7 @@ fn scalar_over_stat_aggregate_with_expression_argument_declines() {
         .item(sqrt_over_stat, ExasolType::DoublePrecision)
         .build_pushdown();
     assert!(
-        detect_group_by_aggregates(&req, untyped_scan()).is_none(),
+        detect_group_by_aggregates(&req, aggregate_scan()).is_none(),
         "an unclassifiable scalar-over-aggregate item must decline the whole \
              grouped detection"
     );
@@ -2314,12 +2283,14 @@ fn having_over_stat_aggregate_with_expression_argument_declines() {
     );
 }
 
+/// Exasol converts text by the session's NLS settings and BOOLEAN to 1 or 0; DataFusion sums,
+/// averages, and deviates only numbers.
 #[test]
-fn sum_and_stat_aggregates_accept_only_double_and_decimal_columns() {
-    let plans = |kind: AggKind| vec![column_plan(kind, "X")];
+fn numeric_aggregates_split_only_over_double_and_decimal_columns() {
     for exa_type in EXASOL_TYPE_SPELLINGS {
-        let col_types = vec![("X".to_string(), exa_type)];
-        let expected = match exa_type {
+        let col_types = column_types(&[("X", exa_type)]);
+        let scan = ScanTranslator::new(&col_types);
+        let numeric = match exa_type {
             ExasolType::DoublePrecision | ExasolType::Decimal(_) => true,
             ExasolType::Boolean
             | ExasolType::Date
@@ -2332,18 +2303,40 @@ fn sum_and_stat_aggregates_accept_only_double_and_decimal_columns() {
             | ExasolType::Char { .. }
             | ExasolType::Varchar { .. } => false,
         };
-        for kind in [AggKind::Sum, AggKind::Stddev] {
+        for name in ["SUM", "AVG", "STDDEV", "VAR_POP"] {
             assert_eq!(
-                validate_agg_col_types(&plans(kind.clone()), &column_types(&col_types)),
-                expected,
-                "{kind:?} over {exa_type}"
+                parse_agg_item(&agg_item(name, Some("X"), false), scan).is_some(),
+                numeric,
+                "{name} over {exa_type}"
             );
         }
-        assert!(
-            validate_agg_col_types(&plans(AggKind::Min), &column_types(&col_types)),
-            "MIN over {exa_type} needs no numeric type"
-        );
+        for name in ["MIN", "MAX", "COUNT"] {
+            assert!(
+                parse_agg_item(&agg_item(name, Some("X"), false), scan).is_some(),
+                "{name} over {exa_type} needs no numeric type"
+            );
+        }
     }
+}
+
+/// An expression argument meets the same rule as a column: the integer text of `CAST(i AS
+/// VARCHAR)` is still text to SUM.
+#[test]
+fn numeric_aggregates_over_a_text_or_boolean_expression_decline() {
+    let col_types = column_types(&[("I", ExasolType::decimal(9, 0)), ("B", ExasolType::Boolean)]);
+    let scan = ScanTranslator::new(&col_types);
+    let cases = [
+        cast_to(ExasolType::varchar(30), col("I")),
+        case_when([col("B")], [col("B"), bool_lit(false)]),
+    ];
+    for argument in cases {
+        let sum = agg_item_expr("SUM", argument.clone(), false);
+        assert!(parse_agg_item(&sum, scan).is_none(), "{sum}");
+        let avg = agg_item_expr("AVG", argument, false);
+        assert!(parse_agg_item(&avg, scan).is_none(), "{avg}");
+    }
+    let number = agg_item_expr("SUM", scalar_fn("MULT", [col("I"), col("I")]), false);
+    assert!(parse_agg_item(&number, scan).is_some(), "{number}");
 }
 
 /// The types Exasol declares for a select list of only keys and aggregates: each one's own type.

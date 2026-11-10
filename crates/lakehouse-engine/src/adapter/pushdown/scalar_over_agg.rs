@@ -8,6 +8,7 @@ use vs_expression::{
     render_expression_exasol,
 };
 
+use super::grouped_agg::partial_emits_items;
 use super::support::{ColumnTypes, ScanTranslator, quote_ident};
 use crate::scan::spec::ColumnRef;
 use crate::types::exasol_type::{ExasolType, MAX_DECIMAL_PRECISION};
@@ -222,14 +223,15 @@ pub(super) fn arg_column_or_expr(
     scan.expression(arg).map(|arg| (None, Some(arg.sql)))
 }
 
-/// `None` for any `distinct: true` item, an unsupported function, or an
-/// unrenderable argument. STDDEV/VARIANCE accept only a bare column: their
-/// (cnt, mean, m2) decomposition has no rendered-argument form, and a plan with
-/// no argument would fail inside the scan.
+/// `None` for any `distinct: true` item, an unsupported function, or an aggregate the scan does
+/// not compute. STDDEV/VARIANCE accept only a bare column: their (cnt, mean, m2) decomposition
+/// has no rendered-argument form, and a plan with no argument would fail inside the scan.
 pub(super) fn parse_agg_item(item: &Json, scan: ScanTranslator<'_>) -> Option<AggregatePlan> {
     if item.get("distinct").and_then(|d| d.as_bool()) == Some(true) {
         return None;
     }
+    // Typed as a whole, so a bare-column argument meets the same checks as an expression (#587).
+    scan.expression(item)?;
 
     let fn_name = item
         .get("name")
@@ -398,21 +400,26 @@ pub struct TypedPlans {
     pub types: Vec<ExasolType>,
     /// Aligned with `plans`, cast before any outer scalar applies so `SUM(a) / 2` stays exact.
     pub merged: Vec<String>,
+    /// The scan's typed `PARTIAL_*` `EMITS` items, in plan order.
+    pub emits: Vec<String>,
 }
 
 impl TypedPlans {
-    /// `None` when any slot has no exact type: a guessed partial type breaks the merge (#476).
+    /// `None` when any slot or partial column has no exact type: a guessed partial type breaks
+    /// the merge (#476).
     pub(super) fn new(
         plans: Vec<AggregatePlan>,
         types: Vec<Option<ExasolType>>,
         col_types: &ColumnTypes,
     ) -> Option<Self> {
         let types: Vec<ExasolType> = types.into_iter().collect::<Option<_>>()?;
+        let emits = partial_emits_items(&plans, col_types, &types)?;
         let merged = cast_merge_items(&plans, &types, col_types);
         Some(Self {
             plans,
             types,
             merged,
+            emits,
         })
     }
 
@@ -456,7 +463,7 @@ fn merged_type(
 ) -> Option<ExasolType> {
     match plan.kind.partial_columns() {
         [column @ (PartialAggColumn::Min | PartialAggColumn::Max)] => {
-            Some(partial_column_type(plan, *column, col_types, Some(native)))
+            partial_column_type(plan, *column, col_types, Some(native))
         }
         _ => None,
     }
@@ -467,13 +474,14 @@ const PARTIAL_COUNT_TYPE: ExasolType = ExasolType::decimal(20, 0);
 /// The type the scan emits `column` of `plan` in. Counts are DECIMAL(20,0); SUM widens
 /// DECIMAL(p,s) to DECIMAL(36,s) against overflow; AVG and stat sums are DOUBLE PRECISION
 /// (reconstructed in floating point); MIN/MAX use the argument's exact type. `declared` is the
-/// sole type source for an expression-argument aggregate, which has no source column.
+/// sole type source for an expression-argument aggregate, which has no source column. `None` when
+/// the argument's type is unknown.
 pub(super) fn partial_column_type(
     plan: &AggregatePlan,
     column: PartialAggColumn,
     col_types: &ColumnTypes,
     declared: Option<ExasolType>,
-) -> ExasolType {
+) -> Option<ExasolType> {
     let argument_type = || {
         col_type_for(
             plan.column.as_deref(),
@@ -486,39 +494,38 @@ pub(super) fn partial_column_type(
         PartialAggColumn::CountStar
         | PartialAggColumn::CountArg
         | PartialAggColumn::AvgCnt
-        | PartialAggColumn::StatCnt => PARTIAL_COUNT_TYPE,
+        | PartialAggColumn::StatCnt => Some(PARTIAL_COUNT_TYPE),
         PartialAggColumn::AvgSum | PartialAggColumn::StatMean | PartialAggColumn::StatM2 => {
-            ExasolType::DoublePrecision
+            Some(ExasolType::DoublePrecision)
         }
-        PartialAggColumn::Sum => sum_emit_type(argument_type()),
+        PartialAggColumn::Sum => sum_emit_type(argument_type()?),
         PartialAggColumn::Min | PartialAggColumn::Max => argument_type(),
     }
 }
 
 /// An expression-argument aggregate has no source column, so it takes `declared`.
-pub(super) fn col_type_for(
+fn col_type_for(
     column: Option<&str>,
     arg_expr: Option<&str>,
     col_types: &ColumnTypes,
     declared: Option<ExasolType>,
-) -> ExasolType {
-    if column.is_none()
-        && arg_expr.is_some()
-        && let Some(ty) = declared
-    {
-        return ty;
+) -> Option<ExasolType> {
+    match (column, arg_expr) {
+        (Some(col), _) => col_types
+            .get(&ColumnRef::from(col))
+            .map(|column_type| column_type.exa_type),
+        (None, Some(_)) => declared,
+        (None, None) => None,
     }
-    column
-        .and_then(|col| col_types.get(&ColumnRef::from(col)))
-        .map_or(ExasolType::DoublePrecision, |column_type| {
-            column_type.exa_type
-        })
 }
 
-fn sum_emit_type(col_ty: ExasolType) -> ExasolType {
+fn sum_emit_type(col_ty: ExasolType) -> Option<ExasolType> {
     match col_ty {
-        ExasolType::Decimal(decimal) => ExasolType::decimal(MAX_DECIMAL_PRECISION, decimal.scale()),
-        _ => ExasolType::DoublePrecision,
+        ExasolType::Decimal(decimal) => {
+            Some(ExasolType::decimal(MAX_DECIMAL_PRECISION, decimal.scale()))
+        }
+        ExasolType::DoublePrecision => Some(col_ty),
+        _ => None,
     }
 }
 

@@ -82,6 +82,31 @@ pub(crate) fn untyped_scan() -> ScanTranslator<'static> {
     ScanTranslator::new(&NO_COLUMNS)
 }
 
+/// The numeric columns the aggregate fixtures sum, average, or deviate over.
+pub(crate) const AGGREGATED_COLUMNS: [&str; 12] = [
+    "X",
+    "V",
+    "W",
+    "F",
+    "ID",
+    "AMOUNT",
+    "SCORE",
+    "L_QUANTITY",
+    "L_EXTENDEDPRICE",
+    "L_DISCOUNT",
+    "C_ACCTBAL",
+    "C_DECIMAL_A",
+];
+
+/// A translator that types [`AGGREGATED_COLUMNS`] as DOUBLE PRECISION and knows no other column,
+/// so the scan computes the fixtures' numeric aggregates.
+pub(crate) fn aggregate_scan() -> ScanTranslator<'static> {
+    static AGGREGATED: std::sync::LazyLock<ColumnTypes> = std::sync::LazyLock::new(|| {
+        column_types(&AGGREGATED_COLUMNS.map(|name| (name, ExasolType::DoublePrecision)))
+    });
+    ScanTranslator::new(&AGGREGATED)
+}
+
 /// The table a single-table filter fixture qualifies its columns with, as Exasol does.
 pub(crate) const SALES: &str = "SALES";
 
@@ -1352,11 +1377,6 @@ pub(crate) fn build_sql_for_fixture_n(
     limit: Option<u64>,
     cluster_nodes: usize,
 ) -> String {
-    let col_types: Vec<(String, ExasolType)> = proj_cols
-        .iter()
-        .cloned()
-        .zip(proj_types.iter().cloned())
-        .collect();
     let proj_items: Vec<ProjectionItem> = proj_cols
         .iter()
         .cloned()
@@ -1379,7 +1399,6 @@ pub(crate) fn build_sql_for_fixture_n(
         &shards,
         &projected_columns(&proj_items, &proj_types),
         limit,
-        &column_types(&col_types),
         None,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -1644,11 +1663,6 @@ pub(crate) fn build_row_sql_with_root(
     proj_types: Vec<ExasolType>,
     cluster_nodes: usize,
 ) -> String {
-    let col_types: Vec<(String, ExasolType)> = proj_cols
-        .iter()
-        .cloned()
-        .zip(proj_types.iter().cloned())
-        .collect();
     let proj_items: Vec<ProjectionItem> = proj_cols
         .iter()
         .cloned()
@@ -1670,7 +1684,6 @@ pub(crate) fn build_row_sql_with_root(
         &shards,
         &projected_columns(&proj_items, &proj_types),
         None,
-        &column_types(&col_types),
         None,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,

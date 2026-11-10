@@ -1,5 +1,5 @@
-use super::grouped_agg::{is_literal_selectlist_item, partial_emits_items};
-use super::scalar_over_agg::{col_type_for, with_stat_grand_means};
+use super::grouped_agg::is_literal_selectlist_item;
+use super::scalar_over_agg::with_stat_grand_means;
 use super::single_group_agg::{DistinctCount, SingleGroupItem};
 use crate::adapter::column_notes::TableNotes;
 use crate::adapter::connection::ConnectionCreds;
@@ -38,7 +38,8 @@ pub(super) fn shard_files_json<E: Clone + Into<FileEntry>>(files: &[E]) -> Strin
 /// `request_limit` is the raw request limit, rendered as a trailing `LIMIT n` on the
 /// one-row merge (a no-op for `n >= 1`, correct for `n = 0`).
 pub struct AggregateMergeInputs {
-    plan_types: Vec<ExasolType>,
+    /// [`TypedPlans::emits`](super::TypedPlans).
+    partial_emits: Vec<String>,
     merge_select: Vec<String>,
     having: Option<String>,
     request_limit: Option<u64>,
@@ -48,7 +49,7 @@ impl AggregateMergeInputs {
     /// `None` for an empty `merge_select`: a narrower select list would fail Exasol's
     /// positional validation, so the caller must use its fallback.
     pub fn new(
-        plan_types: Vec<ExasolType>,
+        partial_emits: Vec<String>,
         merge_select: Vec<String>,
         request_limit: Option<u64>,
     ) -> Option<Self> {
@@ -56,7 +57,7 @@ impl AggregateMergeInputs {
             return None;
         }
         Some(Self {
-            plan_types,
+            partial_emits,
             merge_select,
             having: None,
             request_limit,
@@ -77,7 +78,6 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     shards: &[Vec<E>],
     projection: &[ProjectedColumn],
     limit: Option<u64>,
-    col_types: &ColumnTypes,
     merge_inputs: Option<&AggregateMergeInputs>,
     udf_name: &str,
     distribute_udf_name: &str,
@@ -94,7 +94,6 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
             spec_template,
             shards,
             aggregates,
-            col_types,
             inputs,
             udf_name,
             distribute_udf_name,
@@ -175,13 +174,11 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
     shards: &[Vec<E>],
     aggregates: &[AggregatePlan],
-    col_types: &ColumnTypes,
     inputs: &AggregateMergeInputs,
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> String {
-    let emits_items = partial_emits_items(aggregates, col_types, &inputs.plan_types);
-    let emits = emits_items.join(", ");
+    let emits = inputs.partial_emits.join(", ");
     let merge_select = inputs.merge_select.join(", ");
 
     let fan_out = build_fan_out_inner(spec_template, shards, &emits, udf_name, distribute_udf_name);
@@ -198,7 +195,8 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
 }
 
 /// `SELECT COUNT(DISTINCT "V") FROM (<fan-out>)`. LIMIT goes only on the outer
-/// wrapper: inside the fan-out it would truncate a shard's distinct set.
+/// wrapper: inside the fan-out it would truncate a shard's distinct set. `None` when the
+/// column's type is unknown.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
     base_spec: &ScanSpec,
@@ -208,7 +206,7 @@ pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
     limit: Option<u64>,
     udf_name: &str,
     distribute_udf_name: &str,
-) -> String {
+) -> Option<String> {
     let [SingleGroupItem::Distinct(dc)] = items else {
         unreachable!(
             "build_count_distinct_scan_sql is dispatched only for a lone COUNT(DISTINCT) (Case 1)"
@@ -221,12 +219,12 @@ pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
         col_types,
         udf_name,
         distribute_udf_name,
-    );
+    )?;
     let mut sql = format!(r#"SELECT COUNT(DISTINCT "V") FROM ({fan_out})"#);
     if let Some(n) = limit {
         sql.push_str(&format!(" LIMIT {n}"));
     }
-    sql
+    Some(sql)
 }
 
 /// `"V"` carries the column's raw values, declared with its exact Exasol type, so
@@ -238,7 +236,7 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
     col_types: &ColumnTypes,
     udf_name: &str,
     distribute_udf_name: &str,
-) -> String {
+) -> Option<String> {
     let Some(col) = dc.column.as_deref() else {
         unreachable!(
             "build_distinct_fan_out is dispatched only for a lone bare-column \
@@ -246,7 +244,7 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
              single-table wrapper instead"
         )
     };
-    let value_type = col_type_for(Some(col), None, col_types, None);
+    let value_type = col_types.get(&ColumnRef::from(col))?.exa_type;
     let proj_item = ProjectionItem::from(col);
     let arg_sql = quote_ident(col);
     let null_pred = format!("({arg_sql} IS NOT NULL)");
@@ -268,7 +266,13 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
         files: base_spec.files.clone(),
     };
     let emits = format!(r#""V" {value_type}"#);
-    build_fan_out_inner(&spec, shards, &emits, udf_name, distribute_udf_name)
+    Some(build_fan_out_inner(
+        &spec,
+        shards,
+        &emits,
+        udf_name,
+        distribute_udf_name,
+    ))
 }
 
 /// A nested distributor does the `GROUP BY shard_key` fan-out, wrapped by an outer
@@ -692,11 +696,11 @@ pub(super) fn project_columns(
     scan: ScanTranslator<'_>,
 ) -> Result<(Vec<ProjectedColumn>, bool), UdfError> {
     let all_cols = scan.columns();
-    let Some((first_col, first)) = all_cols.0.first() else {
+    if all_cols.0.is_empty() {
         return Err(UdfError::User(
             "pushdown request has no column metadata".into(),
         ));
-    };
+    }
     let full_row = || all_cols.projection();
 
     // Repeating `first_col` for an unprojectable item would duplicate EMITS
@@ -718,18 +722,14 @@ pub(super) fn project_columns(
                 let item_type = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match item_type {
                     "column" => {
-                        let (column, exa_type) = match (all_cols.resolve(e), column_node_ref(e)) {
-                            (Some((column, column_type)), _) => {
-                                (column.clone(), column_type.exa_type)
-                            }
-                            (None, Some(named)) => {
-                                (ColumnRef::from(named.name), ExasolType::WIDEST_VARCHAR)
-                            }
-                            (None, None) => (first_col.clone(), first.exa_type),
+                        // A column without a known type would declare a guessed EMITS type.
+                        let Some((column, column_type)) = all_cols.resolve(e) else {
+                            needs_full_fallback = true;
+                            continue;
                         };
                         projected.push(ProjectedColumn {
-                            item: ProjectionItem::Column(column),
-                            exa_type,
+                            item: ProjectionItem::Column(column.clone()),
+                            exa_type: column_type.exa_type,
                         });
                     }
                     // A literal is pushed positionally so the emitted arity equals the

@@ -12,10 +12,7 @@ use super::grouped_agg::{
 use super::scalar_over_agg::TypedPlans;
 use super::single_group_agg::{SingleGroupItem, has_distinct, single_group_plans};
 use super::support::{PushdownRequest, ScanTranslator};
-use super::{
-    GroupedAggregateDetection, detect_aggregates, detect_group_by_aggregates,
-    validate_agg_col_types,
-};
+use super::{GroupedAggregateDetection, detect_aggregates, detect_group_by_aggregates};
 
 #[derive(Debug)]
 pub(super) enum RequestShape {
@@ -30,7 +27,6 @@ pub(super) enum RequestShape {
     /// columns are the `selectList` items, never a bare row scan (Exasol's positional
     /// column-count check fails with `04000`).
     GroupByWrapper,
-    /// Ordinary aggregate column types passed [`validate_agg_col_types`].
     SingleGroupAgg {
         items: Vec<SingleGroupItem>,
         aggregates: TypedPlans,
@@ -45,10 +41,7 @@ pub(super) fn classify_request_shape(
     scan: ScanTranslator<'_>,
 ) -> RequestShape {
     let pushdown_req = pushdown.json();
-    // A SUM over a non-numeric column would produce an opaque UDF error; demote.
-    if let Some(detection) = detect_group_by_aggregates(pushdown, scan)
-        && validate_agg_col_types(&detection.aggregates.plans, scan.columns())
-    {
+    if let Some(detection) = detect_group_by_aggregates(pushdown, scan) {
         let scope = MergeScope {
             aggregates: &detection.aggregates,
             group_keys: &detection.group_keys,
@@ -78,11 +71,10 @@ pub(super) fn classify_request_shape(
         return RequestShape::GroupByWrapper;
     }
 
-    // Validated against ordinary plans only: a distinct item is a row-scan fan-out. A nested
-    // aggregate without an exact type declines to the wrapper (#476).
+    // A nested aggregate without an exact type declines to the wrapper (#476).
     let Some((items, aggregates)) = detect_aggregates(pushdown, scan).and_then(|items| {
         let aggregates = single_group_plans(&items, pushdown.select_types(), scan)?;
-        validate_agg_col_types(&aggregates.plans, scan.columns()).then_some((items, aggregates))
+        Some((items, aggregates))
     }) else {
         return if pushdown_req.get("aggregationType").and_then(|v| v.as_str())
             == Some("single_group")

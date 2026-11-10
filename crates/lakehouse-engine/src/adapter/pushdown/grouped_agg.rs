@@ -1,14 +1,12 @@
-use crate::scan::spec::{
-    AggKind, AggregatePlan, FileEntry, ScanSpec, partial_column_name, render_ordered,
-};
+use crate::scan::spec::{AggregatePlan, FileEntry, ScanSpec, partial_column_name, render_ordered};
 use crate::types::exasol_type::ExasolType;
 use serde_json::Value as Json;
 use vs_expression::{ColumnNode, SqlFragment, render_exasol_fragment};
 
 use super::scalar_over_agg::{
-    TypedPlans, classify_scalar_over_aggregate, col_type_for, fold_aggregate_plan,
-    fold_nested_plans, is_aggregate_node, parse_agg_item, partial_column_type,
-    render_scalar_over_merge, substitute_subtrees, with_stat_grand_means,
+    TypedPlans, classify_scalar_over_aggregate, fold_aggregate_plan, fold_nested_plans,
+    is_aggregate_node, parse_agg_item, partial_column_type, render_scalar_over_merge,
+    substitute_subtrees, with_stat_grand_means,
 };
 use super::support::{
     ColumnTypes, PushdownRequest, ScanTranslator, build_fan_out_inner, output_select_list,
@@ -289,10 +287,9 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
         .enumerate()
         .map(|(i, ty)| format!("{} {ty}", group_key_column(i)))
         .collect();
-    let partial_items = partial_emits_items(&aggregates.plans, scan.columns(), &aggregates.types);
     let all_emits: Vec<String> = gk_emits
         .iter()
-        .chain(partial_items.iter())
+        .chain(aggregates.emits.iter())
         .cloned()
         .collect();
     let emits = all_emits.join(", ");
@@ -355,42 +352,24 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
 /// An unprojected constant key only groups, so any type holding its text works.
 const CONSTANT_KEY_EMIT_TYPE: ExasolType = ExasolType::WIDEST_VARCHAR;
 
+/// `None` when a partial column has no exact type.
 pub(super) fn partial_emits_items(
     aggregates: &[AggregatePlan],
     col_types: &ColumnTypes,
     aggregate_types: &[ExasolType],
-) -> Vec<String> {
+) -> Option<Vec<String>> {
     aggregates
         .iter()
         .enumerate()
         .flat_map(|(i, plan)| {
             let declared = aggregate_types.get(i).copied();
             plan.kind.partial_columns().iter().map(move |col| {
-                let ty = partial_column_type(plan, *col, col_types, declared);
+                let ty = partial_column_type(plan, *col, col_types, declared)?;
                 let name = partial_column_name(*col, i);
-                format!(r#""{name}" {ty}"#)
+                Some(format!(r#""{name}" {ty}"#))
             })
         })
         .collect()
-}
-
-/// SUM and STDDEV/VARIANCE need a numeric target; `false` routes to a row scan. An
-/// expression-argument aggregate resolves to the numeric `DOUBLE PRECISION` default.
-pub fn validate_agg_col_types(aggregates: &[AggregatePlan], col_types: &ColumnTypes) -> bool {
-    for plan in aggregates {
-        if plan.kind == AggKind::Sum || plan.kind.is_stat() {
-            let ty = col_type_for(
-                plan.column.as_deref(),
-                plan.arg_expr.as_deref(),
-                col_types,
-                None,
-            );
-            if !matches!(ty, ExasolType::DoublePrecision | ExasolType::Decimal(_)) {
-                return false;
-            }
-        }
-    }
-    true
 }
 
 /// Rewrites each aggregate to its merged expression and each group key to its `GK_*` column.

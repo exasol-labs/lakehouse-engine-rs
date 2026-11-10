@@ -165,7 +165,7 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
 }
 
 #[test]
-fn filter_decimal_comparison_not_rewritten() {
+fn a_decimal_compared_with_a_number_renders_its_bare_column() {
     let col_types = vec![("C_DECIMAL_A".to_string(), ExasolType::decimal(10, 2))];
     let filter_json = compare("predicate_greater", col("c_decimal_a"), num_lit(5));
 
@@ -176,10 +176,6 @@ fn filter_decimal_comparison_not_rewritten() {
     assert_eq!(
         rendered, r#"("C_DECIMAL_A" > 5)"#,
         "a DECIMAL column in a comparison must stay a bare, unwrapped column reference: {rendered}"
-    );
-    assert!(
-        !rendered.contains("regexp_replace"),
-        "a non-stringifying filter context must not be trimmed: {rendered}"
     );
 }
 

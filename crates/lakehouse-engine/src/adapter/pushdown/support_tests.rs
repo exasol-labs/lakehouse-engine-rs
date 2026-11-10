@@ -100,7 +100,6 @@ fn adapter_carries_delete_refs_per_shard_minimal_common_spec() {
             &[ExasolType::decimal(20, 0)],
         ),
         None,
-        &ColumnTypes::default(),
         None,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -548,13 +547,11 @@ fn aggregate_query_builds_partial_agg_spec() {
     .with_files(vec![]);
 
     let shards = vec![vec![("s3://warehouse/f.parquet".to_string(), 1u64)]];
-    let col_types = vec![("AMOUNT".to_string(), ExasolType::DoublePrecision)];
     let sql = build_scan_driving_sql(
         &spec_template,
         &shards,
         &projected_columns(&["AMOUNT".into()], &[ExasolType::DoublePrecision]),
         None,
-        &column_types(&col_types),
         Some(&merge_inputs),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -687,7 +684,6 @@ fn common_spec_carries_s3_max_connections_exactly_once() {
         &shards,
         &projected_columns(&["ID".into()], &[ExasolType::decimal(20, 0)]),
         None,
-        &ColumnTypes::default(),
         None,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -730,7 +726,6 @@ fn build_agg_sql(
         &shards,
         &projected_columns(&[], &[]),
         None,
-        &ColumnTypes::default(),
         Some(&merge_inputs),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -760,7 +755,6 @@ fn aggregate_merge_renders_having_then_request_limit() {
         &shards,
         &projected_columns(&[], &[]),
         None,
-        &ColumnTypes::default(),
         Some(&merge_inputs),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -894,15 +888,17 @@ fn aggregate_merge_splices_caller_select_items_and_types_emits_per_plan() {
     .with_files(vec![]);
     let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
     let merge_select = vec![r#"CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(30,4))"#.to_string()];
-    let merge_inputs =
-        AggregateMergeInputs::new(vec![ExasolType::decimal(30, 4)], merge_select, None)
-            .expect("the fixture's merge SELECT is not empty");
+    let merge_inputs = AggregateMergeInputs::new(
+        vec![r#""PARTIAL_sum_0" DECIMAL(36,4)"#.to_string()],
+        merge_select,
+        None,
+    )
+    .expect("the fixture's merge SELECT is not empty");
     let sql = build_scan_driving_sql(
         &spec_template,
         &shards,
         &projected_columns(&[], &[]),
         None,
-        &ColumnTypes::default(),
         Some(&merge_inputs),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -1014,7 +1010,8 @@ fn count_distinct_wrapper_uses_native_count_distinct() {
         None,
         r#""VS_SCHEMA".LAKEHOUSE_SCAN"#,
         r#""VS_SCHEMA".LAKEHOUSE_DISTRIBUTE_FILES"#,
-    );
+    )
+    .expect("the distinct column is typed");
 
     assert!(
         sql.starts_with(r#"SELECT COUNT(DISTINCT "V") FROM ("#),
@@ -1179,7 +1176,8 @@ fn count_distinct_fan_out_omits_limit_offset_order_by() {
         Some(1),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
-    );
+    )
+    .expect("the distinct column is typed");
     assert_only_outer_limit_no_order_by(&sql1, "Case 1");
 }
 
@@ -1377,7 +1375,6 @@ fn scan_driving_sql_groups_by_shard_key_not_iproc() {
         &shards,
         &projected_columns(&["ID".into()], &[ExasolType::decimal(20, 0)]),
         None,
-        &ColumnTypes::default(),
         None,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -1412,7 +1409,6 @@ fn single_shard_collapses_to_single_invocation() {
         &shards,
         &projected_columns(&["ID".into()], &[ExasolType::decimal(20, 0)]),
         None,
-        &ColumnTypes::default(),
         None,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -1927,7 +1923,7 @@ fn mixed_col_types() -> Vec<(String, ExasolType)> {
 }
 
 #[test]
-fn stringify_nondecimal_column_unchanged() {
+fn a_text_to_text_cast_renders_unchanged() {
     let pushdown_req = pushdown_request("T", &mixed_col_types())
         .item(
             cast_to(ExasolType::WIDEST_VARCHAR, col("name")),

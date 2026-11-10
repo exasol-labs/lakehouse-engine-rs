@@ -309,6 +309,31 @@ const CASES: &[Case] = &[
         query: "SELECT ID FROM {T} WHERE CAST(C_VARCHAR AS CHAR(5)) = C_VARCHAR",
         path: Lacks(SCAN_FILTER),
     },
+    Case {
+        setting: COMMA,
+        query: "SELECT AVG(CAST(ID AS VARCHAR(30))) FROM {T}",
+        path: Wrapper,
+    },
+    Case {
+        setting: COMMA,
+        query: "SELECT C_QTY, SUM(CAST(ID AS VARCHAR(30))) FROM {T} GROUP BY C_QTY",
+        path: Wrapper,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT AVG(C_BOOL), SUM(C_BOOL) FROM {T}",
+        path: Wrapper,
+    },
+    Case {
+        setting: DEFAULT_SESSION,
+        query: "SELECT C_QTY, AVG(C_BOOL) FROM {T} GROUP BY C_QTY",
+        path: Wrapper,
+    },
+    Case {
+        setting: COMMA,
+        query: "SELECT SUM(C_DECIMAL_A), SUM(C_DECIMAL_A * C_QTY) FROM {T}",
+        path: Split,
+    },
 ];
 
 const ERROR_CASES: &[Case] = &[
@@ -342,6 +367,11 @@ const ERROR_CASES: &[Case] = &[
         query: "SELECT ID FROM {T} WHERE CAST(C_QTY || '.5' AS DOUBLE) > 0",
         path: Lacks(SCAN_FILTER),
     },
+    Case {
+        setting: COMMA,
+        query: "SELECT AVG(C_VARCHAR) FROM {T}",
+        path: Wrapper,
+    },
 ];
 
 fn mismatch(table: &str, case: &Case, expect: Expect) -> Option<String> {
@@ -358,6 +388,7 @@ fn mismatch(table: &str, case: &Case, expect: Expect) -> Option<String> {
 /// Scenario: String scalar functions translate to DataFusion string calls
 /// Scenario: A widened derived projection routes to a native wrapper on every path
 /// Scenario: A join condition or filter that converts a date to text takes the N-scan fallback
+/// Scenario: A numeric aggregate over text or BOOLEAN runs in Exasol
 #[test]
 fn text_conversions_match_native_under_session_settings() {
     lakehouse_vs();

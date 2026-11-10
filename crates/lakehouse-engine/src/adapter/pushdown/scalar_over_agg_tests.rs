@@ -1,7 +1,7 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    EXASOL_TYPE_SPELLINGS, agg_item, agg_item_expr, cast_to, col, column_types, count_star,
-    float_div, num_lit, round_of, scalar_fn, untyped_scan,
+    EXASOL_TYPE_SPELLINGS, agg_item, agg_item_expr, aggregate_scan, cast_to, col, column_types,
+    count_star, float_div, num_lit, round_of, scalar_fn,
 };
 
 fn sum_over_count() -> Json {
@@ -9,7 +9,7 @@ fn sum_over_count() -> Json {
 }
 
 fn plan_of(node: &Json) -> AggregatePlan {
-    parse_agg_item(node, untyped_scan()).expect("test fixture aggregate must parse to a plan")
+    parse_agg_item(node, aggregate_scan()).expect("test fixture aggregate must parse to a plan")
 }
 
 #[test]
@@ -173,7 +173,7 @@ fn sentinelize_flags_a_bare_column_outside_any_aggregate() {
 fn classify_returns_the_nested_plans_in_encounter_order() {
     let node = round_of(sum_over_count(), 2);
 
-    let plans = classify_scalar_over_aggregate(&node, untyped_scan())
+    let plans = classify_scalar_over_aggregate(&node, aggregate_scan())
         .expect("ROUND(SUM(x) / COUNT(*), 2) must classify as a scalar-over-aggregate");
 
     assert_eq!(
@@ -191,15 +191,16 @@ fn classify_returns_the_nested_plans_in_encounter_order() {
 #[test]
 fn classify_declines_a_node_with_no_nested_aggregate() {
     assert!(
-        classify_scalar_over_aggregate(&round_of(col("X"), 2), untyped_scan()).is_none(),
+        classify_scalar_over_aggregate(&round_of(col("X"), 2), aggregate_scan()).is_none(),
         "a plain scalar over a column is not a scalar-over-aggregate"
     );
 }
 
 #[test]
 fn classify_accepts_a_bare_aggregate_as_its_own_single_plan() {
-    let plans = classify_scalar_over_aggregate(&agg_item("SUM", Some("X"), false), untyped_scan())
-        .expect("a bare aggregate is structurally decomposable");
+    let plans =
+        classify_scalar_over_aggregate(&agg_item("SUM", Some("X"), false), aggregate_scan())
+            .expect("a bare aggregate is structurally decomposable");
 
     assert_eq!(
         plans,
@@ -215,7 +216,7 @@ fn classify_declines_a_distinct_inner_aggregate() {
     assert!(
         classify_scalar_over_aggregate(
             &round_of(agg_item("SUM", Some("X"), true), 2),
-            untyped_scan()
+            aggregate_scan()
         )
         .is_none(),
         "an undecomposable DISTINCT inner aggregate must decline the whole item"
@@ -226,7 +227,7 @@ fn classify_declines_a_distinct_inner_aggregate() {
 fn classify_declines_a_residual_column_outside_the_aggregate() {
     let node = scalar_fn("ADD", [agg_item("SUM", Some("X"), false), col("Y")]);
 
-    assert!(classify_scalar_over_aggregate(&node, untyped_scan()).is_none());
+    assert!(classify_scalar_over_aggregate(&node, aggregate_scan()).is_none());
 }
 
 #[test]
@@ -238,7 +239,7 @@ fn render_substitutes_the_callers_merged_expressions_by_plan_slot() {
     ];
     let merged = vec!["<MERGED_COUNT>".to_string(), "<MERGED_SUM>".to_string()];
 
-    let sql = render_scalar_over_merge(&node, &plans, &merged, untyped_scan())
+    let sql = render_scalar_over_merge(&node, &plans, &merged, aggregate_scan())
         .expect("a classified scalar-over-aggregate must render over the merge wrapper")
         .sql;
 
@@ -250,10 +251,14 @@ fn render_leaves_no_sentinel_token_behind() {
     let node = round_of(agg_item("SUM", Some("X"), false), 2);
     let plans = vec![plan_of(&agg_item("SUM", Some("X"), false))];
 
-    let sql =
-        render_scalar_over_merge(&node, &plans, &["<MERGED_SUM>".to_string()], untyped_scan())
-            .expect("a single-aggregate item must render")
-            .sql;
+    let sql = render_scalar_over_merge(
+        &node,
+        &plans,
+        &["<MERGED_SUM>".to_string()],
+        aggregate_scan(),
+    )
+    .expect("a single-aggregate item must render")
+    .sql;
 
     assert!(
         !sql.contains(&agg_sentinel_token(0)),
@@ -271,7 +276,7 @@ fn render_declines_an_aggregate_absent_from_the_plans() {
             &node,
             &plans,
             &["<MERGED_COUNT>".to_string()],
-            untyped_scan()
+            aggregate_scan()
         )
         .is_none(),
         "an aggregate with no merge slot cannot be rendered"
@@ -291,7 +296,7 @@ fn render_declines_when_the_merged_list_is_shorter_than_the_matched_slot() {
             &node,
             &plans,
             &["<MERGED_COUNT>".to_string()],
-            untyped_scan()
+            aggregate_scan()
         )
         .is_none(),
         "a merged list not aligned with plans must decline, not panic"
@@ -301,7 +306,7 @@ fn render_declines_when_the_merged_list_is_shorter_than_the_matched_slot() {
 #[test]
 fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
     let node = round_of(sum_over_count(), 2);
-    let nested = classify_scalar_over_aggregate(&node, untyped_scan())
+    let nested = classify_scalar_over_aggregate(&node, aggregate_scan())
         .expect("ROUND(SUM(X) / COUNT(*), 2) must classify as scalar-over-aggregate");
 
     let mut grouped_plans = vec![plan_of(&agg_item("COUNT", Some("L_ORDERKEY"), false))];
@@ -345,14 +350,14 @@ fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
     ];
 
     let grouped_sql =
-        render_scalar_over_merge(&node, &grouped_plans, &grouped_merged, untyped_scan())
+        render_scalar_over_merge(&node, &grouped_plans, &grouped_merged, aggregate_scan())
             .expect("the grouped-shaped caller must render")
             .sql;
     let single_group_sql = render_scalar_over_merge(
         &node,
         &single_group_plans,
         &single_group_merged,
-        untyped_scan(),
+        aggregate_scan(),
     )
     .expect("the single-group-shaped caller must render")
     .sql;
@@ -366,12 +371,12 @@ fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
 }
 
 #[test]
-fn sum_widens_a_decimal_to_precision_36_and_every_other_variant_to_double() {
+fn sum_widens_a_decimal_to_precision_36_keeps_a_double_and_types_nothing_else() {
     for exa_type in EXASOL_TYPE_SPELLINGS {
         let expected = match exa_type {
-            ExasolType::Decimal(decimal) => ExasolType::decimal(36, decimal.scale()),
+            ExasolType::Decimal(decimal) => Some(ExasolType::decimal(36, decimal.scale())),
+            ExasolType::DoublePrecision => Some(ExasolType::DoublePrecision),
             ExasolType::Boolean
-            | ExasolType::DoublePrecision
             | ExasolType::Date
             | ExasolType::Timestamp { .. }
             | ExasolType::TimestampWithLocalTimeZone { .. }
@@ -380,7 +385,7 @@ fn sum_widens_a_decimal_to_precision_36_and_every_other_variant_to_double() {
             | ExasolType::Geometry { .. }
             | ExasolType::Hashtype { .. }
             | ExasolType::Char { .. }
-            | ExasolType::Varchar { .. } => ExasolType::DoublePrecision,
+            | ExasolType::Varchar { .. } => None,
         };
         assert_eq!(sum_emit_type(exa_type), expected, "{exa_type}");
     }

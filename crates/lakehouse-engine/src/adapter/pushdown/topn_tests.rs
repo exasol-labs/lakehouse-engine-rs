@@ -6,7 +6,7 @@ use super::super::support::{
     involved_columns, order_by_present, project_columns, shard_count,
 };
 use super::super::test_support::*;
-use super::super::{detect_aggregates, single_group_plans, validate_agg_col_types};
+use super::super::{detect_aggregates, single_group_plans};
 use super::*;
 use crate::scan::spec::{CommonScanSpec, FileEntry, ScanStorage};
 use crate::scan::test_support::WithFiles;
@@ -38,12 +38,12 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let scan = ScanTranslator::new(&scan_columns);
     let plans = detect_aggregates(&pushdown, scan).and_then(|items| {
         let plans = single_group_plans(&items, pushdown.select_types(), scan)?;
-        validate_agg_col_types(&plans.plans, &scan_columns).then_some((items, plans))
+        Some((items, plans))
     });
     let merge_inputs = plans.as_ref().map(|(items, plans)| {
         let merge_select = single_group_merge_select(items, plans, pushdown.select_types(), scan)
             .expect("plan_scan_sql mirrors only fixtures whose merge SELECT assembles in full");
-        AggregateMergeInputs::new(plans.types.clone(), merge_select, limit)
+        AggregateMergeInputs::new(plans.emits.clone(), merge_select, limit)
             .expect("one merge item per select-list item is never empty")
     });
     let aggregates = plans.map(|(_, plans)| plans.plans);
@@ -106,7 +106,6 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
         &shards,
         &projection,
         effective_limit,
-        &column_types(&col_types),
         merge_inputs.as_ref(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,

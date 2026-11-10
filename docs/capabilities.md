@@ -87,7 +87,8 @@ The scan computes these functions when DataFusion can render the whole filter or
 Exasol writes a DATE, TIMESTAMP, DOUBLE, or DECIMAL with a scale as text, and reads text as one of these types, by the session's NLS settings. The pushdown request does not carry them, so these conversions run in Exasol SQL:
 
 - a CAST between text and one of these types, and `TO_DATE` or `TO_TIMESTAMP` without a format;
-- text that meets one of these types in a comparison, `IN`, `LIKE`, `||`, a string function, `CASE`, `COALESCE`, `GREATEST`, or arithmetic.
+- text that meets one of these types in a comparison, `IN`, `LIKE`, `||`, a string function, `CASE`, `COALESCE`, `GREATEST`, or arithmetic;
+- `SUM`, `AVG`, `STDDEV`, or `VARIANCE` over text or a BOOLEAN, which Exasol converts to a number. The aggregate runs in Exasol SQL instead of splitting into scan partials.
 
 Integers and BOOLEAN convert to text in the scan, and an integer compared with a digits-only literal (`id = '3'`) stays in the scan unless the literal has more digits than the integer's precision. A CAST to `CHAR(n)` runs in Exasol SQL, because the scan does not blank-pad.
 
