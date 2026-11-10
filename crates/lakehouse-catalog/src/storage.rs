@@ -9,7 +9,7 @@ use iceberg::io::{
     ADLS_ACCOUNT_KEY, ADLS_ACCOUNT_NAME, ADLS_SAS_TOKEN, FileIOBuilder, S3_ACCESS_KEY_ID,
     S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
 };
-use iceberg_storage_opendal::OpenDalStorageFactory;
+use iceberg_storage_opendal::{CustomAwsCredentialLoader, OpenDalStorageFactory};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -123,6 +123,28 @@ impl StorageBackend {
             },
             Self::Adls { .. } => OpenDalStorageFactory::Azdls,
         };
+        self.file_io_from(factory)
+    }
+
+    /// [`Self::file_io`] whose S3 requests are signed with the credentials `loader` provides,
+    /// which replace the stored keys, so a writer's credentials can be renewed while it runs.
+    /// Fails on ADLS storage, whose requests the loader cannot sign.
+    pub fn file_io_with_credential_loader(
+        &self,
+        loader: CustomAwsCredentialLoader,
+    ) -> Result<iceberg::io::FileIO, UdfError> {
+        let Self::S3(_) = self else {
+            return Err(UdfError::User(
+                "an AWS credential loader signs only S3 storage requests, but the storage is ADLS"
+                    .into(),
+            ));
+        };
+        Ok(self.file_io_from(OpenDalStorageFactory::S3 {
+            customized_credential_load: Some(loader),
+        }))
+    }
+
+    fn file_io_from(&self, factory: OpenDalStorageFactory) -> iceberg::io::FileIO {
         FileIOBuilder::new(Arc::new(factory))
             .with_props(self.catalog_storage_props())
             .build()

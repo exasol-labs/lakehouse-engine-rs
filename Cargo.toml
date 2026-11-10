@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lakehouse-engine", "crates/lakehouse-catalog", "crates/vs-expression", "crates/lakehouse-e2e"]
+members = ["crates/lakehouse-engine", "crates/lakehouse-catalog", "crates/lakehouse-catalog-write", "crates/vs-expression", "crates/lakehouse-e2e"]
 # Build the UDF .so only via `make cross-udf-build` (rust:1.98.1-trixie): the SDK
 # fingerprint embeds the rustc hash, so a host-built .so is rejected at load.
 resolver = "2"
@@ -38,8 +38,16 @@ iceberg              = { git = "https://github.com/apache/iceberg-rust", rev = "
 iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "da5cc19a9f7c9e8ea14dc40d4a82974cd26def42" }
 # RestCatalog requires a StorageFactory; iceberg core ships no S3 one.
 iceberg-storage-opendal = { git = "https://github.com/apache/iceberg-rust", rev = "da5cc19a9f7c9e8ea14dc40d4a82974cd26def42", default-features = false, features = ["opendal-s3"] }
+# Names the `Context` of `ProvideCredential::provide_credential`, which iceberg-storage-opendal does
+# not re-export. Pinned to the version it resolves, so both name the same trait.
+reqsign-core = { version = "=3.3.2" }
 
 tokio = { version = "1", features = ["rt", "macros"] }
+
+# The private `iceberg::Catalog` impl of the catalog write crate.
+async-trait = { version = "0.1" }
+# Backoff jitter of catalog writes; the line the engine already links.
+rand        = { version = "0.8" }
 
 # Also the SLC version (fingerprint must match). `make install-slc` and
 # deploy/scripts/install.sh scrape this line, so keep `version` inline.

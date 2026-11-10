@@ -40,6 +40,7 @@ pub use expiring::{
 };
 pub use glue::{GlueCatalogSession, parse_glue_table_ident};
 pub use iceberg_io::read_iceberg_metadata_file;
+pub use iceberg_storage_opendal::{AwsCredential, CustomAwsCredentialLoader};
 pub use lakekeeper::{TableReadDecision, lakekeeper_batch_check, lakekeeper_management_url};
 pub use namespace::parse_table_ident;
 pub use redaction::{redact_credentials, redact_error_text, redact_secret_values};

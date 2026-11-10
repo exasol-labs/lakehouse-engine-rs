@@ -1,0 +1,79 @@
+{
+  "metadata-location": null,
+  "metadata": {
+    "format-version": 2,
+    "table-uuid": "01a1bf3b-af23-7020-ac26-0a0912b927ee",
+    "location": "s3://warehouse/lakehouse_vended/01a1bf3b-af23-7020-ac26-0a0912b927ee",
+    "last-sequence-number": 0,
+    "last-updated-ms": 1794209722150,
+    "last-column-id": 2,
+    "schemas": [
+      {
+        "schema-id": 0,
+        "type": "struct",
+        "fields": [
+          {
+            "id": 1,
+            "name": "ID",
+            "required": false,
+            "type": "decimal(18,0)"
+          },
+          {
+            "id": 2,
+            "name": "V",
+            "required": false,
+            "type": "string"
+          }
+        ]
+      }
+    ],
+    "current-schema-id": 0,
+    "partition-specs": [
+      {
+        "spec-id": 0,
+        "fields": []
+      }
+    ],
+    "default-spec-id": 0,
+    "last-partition-id": 999,
+    "properties": {
+      "lakehouse.export-id": "0123456789abcdef0123456789abcdef",
+      "commit.retry.num-retries": "20"
+    },
+    "sort-orders": [
+      {
+        "order-id": 0,
+        "fields": []
+      }
+    ],
+    "default-sort-order-id": 0,
+    "refs": {}
+  },
+  "config": {
+    "s3.session-token": "STAGED_SESSION_TOKEN_PLACEHOLDER",
+    "s3.path-style-access": "true",
+    "client.region": "us-east-1",
+    "s3.access-key-id": "STAGED_ACCESS_KEY_ID_PLACEHOLDER",
+    "s3.secret-access-key": "STAGED_SECRET_ACCESS_KEY_PLACEHOLDER",
+    "s3.endpoint": "http://seaweedfs:8333/",
+    "region": "us-east-1",
+    "s3.region": "us-east-1"
+  },
+  "storage-credentials": [
+    {
+      "prefix": "s3://warehouse/lakehouse_vended/01a1bf3b-af23-7020-ac26-0a0912b927ee",
+      "config": {
+        "s3.session-token": "STAGED_SESSION_TOKEN_PLACEHOLDER",
+        "s3.region": "us-east-1",
+        "s3.session-token-expires-at-ms": "1794213322000",
+        "expiration-time": "1794213322000",
+        "client.region": "us-east-1",
+        "s3.endpoint": "http://seaweedfs:8333/",
+        "client.refresh-credentials-endpoint": "http://localhost:28181/catalog/v1/7bad4ef0-d8f8-11f1-b803-af792d513a2c/namespaces/a2%5Ffixture%5Fns/tables/staged/credentials",
+        "s3.secret-access-key": "STAGED_SECRET_ACCESS_KEY_PLACEHOLDER",
+        "s3.access-key-id": "STAGED_ACCESS_KEY_ID_PLACEHOLDER",
+        "s3.path-style-access": "true"
+      }
+    }
+  ]
+}

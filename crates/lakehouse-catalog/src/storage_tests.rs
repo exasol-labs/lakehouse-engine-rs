@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::s3_payload;
+use iceberg_storage_opendal::{AwsCredential, ProvideCredential};
 
 const ENDPOINT: &str = "http://minio.local:9000";
 const REGION: &str = "us-east-1";
@@ -124,6 +125,58 @@ fn file_io_is_configured_from_exactly_the_catalog_storage_props() {
         populated_backend().file_io().config().props(),
         &expected_populated_config()
     );
+}
+
+/// A credential loader that has no credential to give.
+#[derive(Debug)]
+struct NoCredential;
+
+impl ProvideCredential for NoCredential {
+    type Credential = AwsCredential;
+
+    async fn provide_credential(
+        &self,
+        _ctx: &reqsign_core::Context,
+    ) -> reqsign_core::Result<Option<AwsCredential>> {
+        Ok(None)
+    }
+}
+
+fn no_credential_loader() -> CustomAwsCredentialLoader {
+    CustomAwsCredentialLoader::new(NoCredential)
+}
+
+#[tokio::test]
+async fn a_credential_loader_replaces_the_stored_keys_of_s3_requests() {
+    let file_io = populated_backend()
+        .file_io_with_credential_loader(no_credential_loader())
+        .expect("an S3 backend takes a credential loader");
+
+    let error = file_io.exists("s3://bucket/key").await.unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to load signing credential"),
+        "the request is signed by the loader, not by the stored keys: {error}"
+    );
+    assert_eq!(file_io.config().props(), &expected_populated_config());
+}
+
+#[test]
+fn a_credential_loader_is_refused_for_adls_storage() {
+    let backend = StorageBackend::Adls {
+        account_name: "myaccount".into(),
+        cred: AdlsCred::AccountKey("azure-static-key-secret".into()),
+    };
+
+    let Err(UdfError::User(message)) =
+        backend.file_io_with_credential_loader(no_credential_loader())
+    else {
+        panic!("an ADLS backend must refuse an AWS credential loader");
+    };
+
+    assert!(message.contains("ADLS"), "{message}");
 }
 
 #[test]
