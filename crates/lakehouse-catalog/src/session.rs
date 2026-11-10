@@ -1,9 +1,7 @@
 use crate::auth::{CatalogAuth, resolve_catalog_auth};
 use crate::catalog_http::{CatalogHttp, CatalogRequestError, RepeatSafety, quote_body};
 use crate::expiring::system_clock;
-use crate::iceberg_io::{
-    authed_get_json, build_signed_request, delegating_access, redact_catalog_text,
-};
+use crate::iceberg_io::{authed_get_json, build_signed_request, redact_catalog_text};
 use crate::namespace::parse_table_ident;
 use crate::redaction::redact_credentials;
 use crate::vended::{covering_credential, s3_credentials};
@@ -33,8 +31,13 @@ fn tables_path(namespace: &str) -> String {
     format!("namespaces/{namespace}/tables")
 }
 
+/// A table name is one path segment, so a reserved character such as `#`, `?`, or `/` is
+/// percent-encoded instead of changing the route.
 fn table_path(namespace: &str, table_name: &str) -> String {
-    format!("{}/{table_name}", tables_path(namespace))
+    let segment: String = url::form_urlencoded::byte_serialize(table_name.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20");
+    format!("{}/{segment}", tables_path(namespace))
 }
 
 /// The Iceberg REST route of the tables in `namespace` (`namespaces/{namespace}/tables`), relative
@@ -44,16 +47,36 @@ pub fn namespace_tables_path(namespace: &NamespaceIdent) -> String {
 }
 
 /// The Iceberg REST route of `table` (`namespaces/{namespace}/tables/{table}`), relative to the
-/// session's prefix: where it is loaded, checked, and committed to.
+/// session's prefix: where it is loaded, checked, and committed to. The table name is
+/// percent-encoded as one path segment.
 pub fn table_ident_path(table: &TableIdent) -> String {
     table_path(&table.namespace.to_url_string(), &table.name)
 }
 
-fn build_load_table_url(catalog_uri: &str, prefix: &str, ns: &str, table_name: &str) -> String {
+/// Which snapshots a `loadTable` answer lists.
+#[derive(Clone, Copy)]
+enum Snapshots {
+    /// Only those a branch or tag references; the current one is enough to read a table.
+    Referenced,
+    /// Every snapshot, so a writer can find its own tagged commit among the ancestors.
+    All,
+}
+
+fn build_load_table_url(
+    catalog_uri: &str,
+    prefix: &str,
+    ns: &str,
+    table_name: &str,
+    snapshots: Snapshots,
+) -> String {
+    let mode = match snapshots {
+        Snapshots::Referenced => "refs",
+        Snapshots::All => "all",
+    };
     catalog_url(
         catalog_uri,
         prefix,
-        &format!("{}?snapshots=refs", table_path(ns, table_name)),
+        &format!("{}?snapshots={mode}", table_path(ns, table_name)),
     )
 }
 
@@ -94,10 +117,19 @@ fn endpoints_from_config(config: &serde_json::Value) -> Option<Vec<Endpoint>> {
     )
 }
 
+/// What a session knows of the endpoints its catalog offers.
+enum ServedEndpoints {
+    /// The session took its prefix from a stored note and never called `/v1/config`.
+    NotAsked,
+    /// `/v1/config` answered without an `endpoints` list, so only the spec's default set is served.
+    Unlisted,
+    Listed(Vec<Endpoint>),
+}
+
 /// What `/v1/config` tells a session: its REST prefix and the endpoints the catalog lists.
 struct ServedConfig {
     prefix: String,
-    endpoints: Option<Vec<Endpoint>>,
+    endpoints: ServedEndpoints,
 }
 
 /// A config without a prefix yields an EMPTY prefix, never the warehouse: a warehouse like
@@ -112,7 +144,7 @@ async fn resolve_served_config(
     if let CatalogAuth::Sigv4 { .. } = auth {
         return Ok(ServedConfig {
             prefix: glue_catalog_prefix(warehouse),
-            endpoints: None,
+            endpoints: ServedEndpoints::NotAsked,
         });
     }
     let encoded_warehouse: String =
@@ -126,7 +158,8 @@ async fn resolve_served_config(
         .await
         .map(|config| ServedConfig {
             prefix: prefix_from_config(&config),
-            endpoints: endpoints_from_config(&config),
+            endpoints: endpoints_from_config(&config)
+                .map_or(ServedEndpoints::Unlisted, ServedEndpoints::Listed),
         })
         .map_err(|e| {
             UdfError::User(format!(
@@ -144,7 +177,7 @@ pub struct CatalogSession {
     catalog_uri: String,
     auth: CatalogAuth,
     prefix: String,
-    endpoints: Option<Vec<Endpoint>>,
+    endpoints: ServedEndpoints,
     creds: ConnectionCreds,
 }
 
@@ -153,6 +186,8 @@ pub struct CatalogSession {
 pub struct CatalogResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    /// The bearer token the request carried, which [`CatalogSession::quote`] strips.
+    bearer: Option<String>,
 }
 
 /// Why [`CatalogSession::post`] has no answer to return. Each message is redacted.
@@ -181,7 +216,8 @@ impl From<CatalogSendError> for UdfError {
 impl CatalogSession {
     /// A `catalog_prefix` that an earlier session found spares the `/v1/config` lookup. A failed
     /// OAuth2 grant or config lookup is an error. Credential values never appear in any returned
-    /// error. The session keeps `creds` for the auth and redaction of its own requests.
+    /// error. The session keeps `creds` for the auth, access delegation, and redaction of every
+    /// request it sends.
     pub async fn resolve(
         catalog_uri: &str,
         warehouse: &str,
@@ -191,7 +227,7 @@ impl CatalogSession {
         let http = CatalogHttp::new();
         let auth = resolve_catalog_auth(&http, catalog_uri, creds, system_clock()).await?;
         let (prefix, endpoints) = match catalog_prefix {
-            Some(prefix) => (prefix, None),
+            Some(prefix) => (prefix, ServedEndpoints::NotAsked),
             None => {
                 let config =
                     resolve_served_config(&http, catalog_uri, warehouse, &auth, creds).await?;
@@ -226,15 +262,19 @@ impl CatalogSession {
     }
 
     /// Whether the catalog's `/v1/config` answer lists `route`, such as
-    /// `GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials`. Without an
-    /// `endpoints` list it answers no, so ask only about a route outside the spec's default set.
-    pub fn offers_endpoint(&self, route: &str) -> bool {
-        let Ok(route) = route.parse::<Endpoint>() else {
-            return false;
-        };
-        self.endpoints
-            .as_ref()
-            .is_some_and(|endpoints| endpoints.contains(&route))
+    /// `GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials`. `None` means the
+    /// session never read that answer, because it took its prefix from a stored note, so the
+    /// catalog may offer the route. Without an `endpoints` list the answer is `Some(false)`, so
+    /// ask only about a route outside the spec's default set.
+    pub fn offers_endpoint(&self, route: &str) -> Option<bool> {
+        let route = route.parse::<Endpoint>().ok();
+        match &self.endpoints {
+            ServedEndpoints::NotAsked => None,
+            ServedEndpoints::Unlisted => Some(false),
+            ServedEndpoints::Listed(endpoints) => {
+                Some(route.is_some_and(|route| endpoints.contains(&route)))
+            }
+        }
     }
 
     /// POSTs a state-changing request, such as a namespace or table creation, a stage-create, or a
@@ -259,7 +299,7 @@ impl CatalogSession {
         body: Option<&serde_json::Value>,
         safety: RepeatSafety,
     ) -> Result<CatalogResponse, CatalogSendError> {
-        let request = self
+        let (request, bearer) = self
             .build_request(method, path, body)
             .await
             .map_err(|error| CatalogSendError::Unsent(error.to_string()))?;
@@ -267,7 +307,7 @@ impl CatalogSession {
         let answer = self.http.send(request, safety).await.map_err(|error| {
             let message = format!(
                 "the catalog request {target} failed: {}",
-                error.render(|msg| self.redact(msg))
+                error.render(|msg| redact_catalog_text(msg, &self.creds, bearer.as_deref()))
             );
             if error.is_unsent() {
                 CatalogSendError::Unsent(message)
@@ -278,13 +318,16 @@ impl CatalogSession {
         Ok(CatalogResponse {
             status: answer.status.as_u16(),
             body: answer.body,
+            bearer,
         })
     }
 
-    /// `body` as an error may show it: stripped of every catalog secret and token of the session,
-    /// then cut.
-    pub fn quote(&self, body: &[u8]) -> String {
-        quote_body(body, |msg| self.redact(msg))
+    /// The body of `answer` as an error may show it: stripped of every catalog secret of the
+    /// session and of the bearer token the request carried, then cut.
+    pub fn quote(&self, answer: &CatalogResponse) -> String {
+        quote_body(&answer.body, |msg| {
+            redact_catalog_text(msg, &self.creds, answer.bearer.as_deref())
+        })
     }
 
     /// Whether the catalog holds table `ident`: a 2xx answer to `HEAD` on the table is yes, 404
@@ -312,20 +355,14 @@ impl CatalogSession {
         &self,
         ident: &TableIdent,
     ) -> Result<LoadTableResult, UdfError> {
-        let url = catalog_url(
-            &self.catalog_uri,
-            &self.prefix,
-            &format!("{}?snapshots=all", table_ident_path(ident)),
-        );
-        authed_get_json::<LoadTableResult>(
-            &self.http,
-            &url,
-            &self.auth,
+        self.load_table(
+            &ident.namespace,
+            &ident.name,
             self.creds.use_vended_credentials,
-            &self.creds,
+            Snapshots::All,
         )
         .await
-        .map_err(|error| error.named(&ident.to_string()).into())
+        .map_err(UdfError::from)
     }
 
     /// The S3 credentials that the catalog's `loadCredentials` endpoint vends for table `ident`:
@@ -340,36 +377,36 @@ impl CatalogSession {
         let answer = self
             .send(Method::GET, &path, None, RepeatSafety::Safe)
             .await?;
-        let table = ident;
         if !(200..300).contains(&answer.status) {
             return Err(UdfError::User(format!(
-                "loadCredentials of table '{table}' answered HTTP {}",
+                "loadCredentials of table '{ident}' answered HTTP {}",
                 answer.status
             )));
         }
         let config = read_credentials(&answer.body, location).map_err(|cause| {
-            UdfError::User(format!("loadCredentials of table '{table}' {cause}"))
+            UdfError::User(format!("loadCredentials of table '{ident}' {cause}"))
         })?;
         s3_credentials(&config, location).map_err(|error| {
             UdfError::User(format!(
-                "loadCredentials of table '{table}' failed: {error}"
+                "loadCredentials of table '{ident}' failed: {error}"
             ))
         })
     }
 
+    /// The request and the bearer token it carries, which an error of the request redacts.
     async fn build_request(
         &self,
         method: Method,
         path: &str,
         body: Option<&serde_json::Value>,
-    ) -> Result<Request, UdfError> {
+    ) -> Result<(Request, Option<String>), UdfError> {
         let url = catalog_url(&self.catalog_uri, &self.prefix, path);
         let mut builder = self
             .http
             .request(method, url)
             .header("accept", "application/json");
         if self.creds.use_vended_credentials {
-            builder = delegating_access(builder);
+            builder = builder.header("X-Iceberg-Access-Delegation", "vended-credentials");
         }
         if let Some(body) = body {
             builder = builder.json(body);
@@ -377,8 +414,32 @@ impl CatalogSession {
         build_signed_request(builder, &self.auth, &self.creds).await
     }
 
-    fn redact(&self, msg: &str) -> String {
-        redact_catalog_text(msg, &self.auth, &self.creds)
+    /// Names the table in every failure, so the enumeration load, `load_table_any_auth`, and a
+    /// writer's load all report which table could not be loaded.
+    async fn load_table(
+        &self,
+        namespace: &NamespaceIdent,
+        table_name: &str,
+        send_access_delegation: bool,
+        snapshots: Snapshots,
+    ) -> Result<LoadTableResult, CatalogRequestError> {
+        let url = build_load_table_url(
+            &self.catalog_uri,
+            &self.prefix,
+            &namespace.to_url_string(),
+            table_name,
+            snapshots,
+        );
+        let identifier = format!("{}.{table_name}", namespace.join("."));
+        authed_get_json::<LoadTableResult>(
+            &self.http,
+            &url,
+            &self.auth,
+            send_access_delegation,
+            &self.creds,
+        )
+        .await
+        .map_err(|error| error.named(&identifier))
     }
 }
 
@@ -413,23 +474,22 @@ fn read_credentials(body: &[u8], location: &str) -> Result<HashMap<String, Strin
 
 /// Self-issued because `RestCatalog::load_table` drops the response
 /// `config`/`storage_credentials` needed for vended credentials. Sends
-/// `X-Iceberg-Access-Delegation: vended-credentials` only when
-/// `creds.use_vended_credentials`. Credential values never appear in the error.
+/// `X-Iceberg-Access-Delegation: vended-credentials` only when the session's CONNECTION sets
+/// `use_vended_credentials`. Credential values never appear in the error.
 pub async fn load_table_any_auth(
     session: &CatalogSession,
     catalog: &CatalogProps,
-    creds: &ConnectionCreds,
 ) -> Result<LoadTableResult, UdfError> {
     let (ns_ident, table_name) = parse_table_ident(&catalog.table)?;
-    load_table(
-        session,
-        &ns_ident,
-        &table_name,
-        creds.use_vended_credentials,
-        creds,
-    )
-    .await
-    .map_err(UdfError::from)
+    session
+        .load_table(
+            &ns_ident,
+            &table_name,
+            session.creds.use_vended_credentials,
+            Snapshots::Referenced,
+        )
+        .await
+        .map_err(UdfError::from)
 }
 
 /// The enumeration reads only the current schema, so it asks for no delegated access.
@@ -437,39 +497,11 @@ pub(crate) async fn load_table_schema_metadata(
     session: &CatalogSession,
     namespace: &NamespaceIdent,
     table_name: &str,
-    creds: &ConnectionCreds,
 ) -> Result<TableMetadata, CatalogRequestError> {
-    load_table(session, namespace, table_name, false, creds)
+    session
+        .load_table(namespace, table_name, false, Snapshots::Referenced)
         .await
         .map(|result| result.metadata)
-}
-
-/// Names the table in every failure, so the enumeration load and `load_table_any_auth` both
-/// report which table could not be loaded. Asks for `snapshots=refs`: both callers read only the
-/// current snapshot, which the `main` branch always references.
-async fn load_table(
-    session: &CatalogSession,
-    namespace: &NamespaceIdent,
-    table_name: &str,
-    send_access_delegation: bool,
-    creds: &ConnectionCreds,
-) -> Result<LoadTableResult, CatalogRequestError> {
-    let url = build_load_table_url(
-        &session.catalog_uri,
-        &session.prefix,
-        &namespace.to_url_string(),
-        table_name,
-    );
-    let identifier = format!("{}.{table_name}", namespace.join("."));
-    authed_get_json::<LoadTableResult>(
-        &session.http,
-        &url,
-        &session.auth,
-        send_access_delegation,
-        creds,
-    )
-    .await
-    .map_err(|error| error.named(&identifier))
 }
 
 #[cfg(test)]

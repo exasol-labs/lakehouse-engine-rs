@@ -15,7 +15,6 @@ When the CONNECTION sets `use_vended_credentials` to true, the adapter resolves 
 * A credential never appears in returned SQL or in an error message, except that a vended value appears in the SQL as the sealed envelope's ciphertext (`storage-access/scan-spec-credential-reference`). `redact_credentials` matches the `adls.sas-token` label by case-insensitive substring and truncates to the next delimiter. Every error path returns `Result` and never panics, because a panic in a UDF is an abnormal VM exit that kills every sibling VM of the statement part. Every error names the location's storage host, scheme, or expected config key.
 * `file-planning/pushdown-planning-file-resolution` rejects an absent table location before the vended and static split, so this feature never sees one.
 * See `storage-access/pushdown-planning-cloud-credentials` for SigV4 catalog signing, the Glue REST prefix, and the static-credential path.
-* The export writer reads the S3 credentials a create, stage-create, load, or `loadCredentials` answer vends through `vended_s3_credentials` and `CatalogSession::load_credentials`, which apply the same credential-source selection and return a `VendedS3Credentials` value with the expiry from `s3.session-token-expires-at-ms`.
 
 ## Scenarios
 

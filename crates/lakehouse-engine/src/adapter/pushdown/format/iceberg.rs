@@ -195,7 +195,7 @@ async fn rest_metadata(
         allow_http,
     } = *connection;
     let table_name = &catalog_props.table;
-    let result = load_table_any_auth(session, catalog_props, creds).await?;
+    let result = load_table_any_auth(session, catalog_props).await?;
     // The REST URI names no object store and `warehouse` is only a routing identifier.
     let table_root = checked_table_root(&result.metadata, table_name, || {
         UdfError::User(format!(

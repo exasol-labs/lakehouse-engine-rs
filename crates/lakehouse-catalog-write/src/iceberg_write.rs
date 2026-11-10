@@ -530,7 +530,7 @@ impl TableWriteSession {
             "the catalog {} answered HTTP {}: {}",
             self.catalog_uri(),
             answer.status,
-            self.session.quote(&answer.body)
+            self.session.quote(&answer)
         );
         match answer.status {
             409 => Sent::Conflict(cause),

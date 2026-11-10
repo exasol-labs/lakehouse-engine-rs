@@ -7,21 +7,25 @@ use crate::{CatalogClient, UnityCatalogSession};
 use exasol_udf_sdk::error::UdfError;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 const MINTED_TOKEN: &str = "MINTED-ACCESS-TOKEN";
 const OAUTH_SECRET_SENTINEL: &str = "OAUTH_CLIENT_SECRET_SENTINEL_VALUE";
 
 /// A token source for the grant at `token_url`, its holder reading `clock`.
-fn token_source(token_url: String, clock: EpochClock) -> OAuthTokenSource {
-    OAuthTokenSource {
-        http: CatalogHttp::new(),
-        token_url,
-        client_id: "client-abc".to_string(),
-        client_secret: "secret-xyz".to_string(),
-        scope: "all-apis".to_string(),
-        token: ExpiringCredential::new(Duration::from_secs(OAUTH_REFRESH_SKEW_SECS), clock),
-    }
+fn token_source(token_url: String, clock: EpochClock) -> OAuth2Token {
+    OAuth2Token::lazy(
+        ClientCredentialsGrant {
+            http: CatalogHttp::new(),
+            token_url,
+            client_id: "client-abc".to_string(),
+            client_secret: "secret-xyz".to_string(),
+            scope: Some("all-apis".to_string()),
+            authentication: ClientAuthentication::Basic,
+            label: GRANT,
+            require_expiry: true,
+        },
+        clock,
+    )
 }
 
 #[tokio::test]

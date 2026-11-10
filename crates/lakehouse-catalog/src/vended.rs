@@ -134,11 +134,13 @@ fn iceberg_vended_s3(vended: &HashMap<String, String>, anchor: &str) -> Result<V
 }
 
 /// The scan's storage resolution ignores the expiry, so only this read refuses an unreadable one.
+/// An expiry that is present but empty is unreadable, not absent.
 pub(crate) fn s3_credentials(
     vended: &HashMap<String, String>,
     anchor: &str,
 ) -> Result<VendedS3Credentials, UdfError> {
-    let expires_at_ms = vended_config_value(vended, S3_EXPIRES_AT_MS)
+    let expires_at_ms = vended
+        .get(S3_EXPIRES_AT_MS)
         .map(|value| {
             value.parse::<u64>().map_err(|_| {
                 UdfError::User(format!(
@@ -148,11 +150,12 @@ pub(crate) fn s3_credentials(
             })
         })
         .transpose()?;
+    let s3 = iceberg_vended_s3(vended, anchor)?;
     Ok(VendedS3Credentials {
-        access_key_id: required_vended_value(vended, S3_ACCESS_KEY_ID, anchor)?,
-        secret_access_key: required_vended_value(vended, S3_SECRET_ACCESS_KEY, anchor)?,
-        session_token: vended_config_value(vended, S3_SESSION_TOKEN),
-        endpoint: vended_config_value(vended, S3_ENDPOINT),
+        access_key_id: s3.access_key,
+        secret_access_key: s3.secret_key,
+        session_token: s3.session_token,
+        endpoint: s3.endpoint,
         expires_at_ms,
     })
 }
