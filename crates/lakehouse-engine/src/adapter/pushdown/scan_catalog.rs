@@ -79,8 +79,13 @@ impl ScanCatalog for IcebergRestCatalogClient {
                 warehouse: connection.creds.warehouse.clone(),
                 table: table_identifier.to_string(),
             };
-            let table =
-                IcebergTable::from_rest(self.session().await?, &catalog_props, &connection).await?;
+            let table = IcebergTable::from_rest(
+                self.session().await?,
+                &catalog_props,
+                &connection,
+                self.metadata_read_concurrency(),
+            )
+            .await?;
             Ok(Arc::new(table) as Arc<dyn LoadedTable>)
         })
     }
@@ -164,7 +169,10 @@ async fn open_glue_table(
     storage: &StorageBackend,
 ) -> Result<Arc<dyn LoadedTable>, UdfError> {
     Ok(match table.format {
-        TableFormat::Iceberg => Arc::new(IcebergTable::from_metadata_file(table, storage).await?),
+        TableFormat::Iceberg => Arc::new(
+            IcebergTable::from_metadata_file(table, storage, session.metadata_read_concurrency())
+                .await?,
+        ),
         TableFormat::Parquet => {
             Arc::new(CatalogParquetTable::from_glue(session, table, storage).await?)
         }

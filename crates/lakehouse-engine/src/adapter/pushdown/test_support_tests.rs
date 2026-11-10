@@ -1284,6 +1284,7 @@ pub(crate) fn resolved_connection(
         catalog_kind: kind,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
+        metadata_read_concurrency: crate::adapter::DEFAULT_METADATA_READ_CONCURRENCY,
     }
 }
 

@@ -2,8 +2,8 @@ use crate::adapter::column_notes::{ColumnDeclaration, column_refusal, unread_typ
 use crate::adapter::parquet_directory::{
     DirectoryOptions, ParquetDirectory, RefusedLeaf, resolve_parquet_directory,
 };
+use crate::scan::ObjectLocation;
 use crate::scan::spec::{LogicalField, NestedField, NestedMembers, StorageBackend};
-use crate::scan::{DIRECT_STORAGE_ADMISSION_LIMIT, ObjectLocation};
 use crate::types::mapping::{arrow_type_to_tag, needs_json_fallback};
 use arrow::datatypes::{DataType, Field, FieldRef};
 use exasol_udf_sdk::error::UdfError;
@@ -15,6 +15,7 @@ use lakehouse_catalog::{
 };
 use object_store::ObjectStore;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -25,6 +26,7 @@ pub struct DirectStorageCatalogClient {
     /// The CONNECTION address names its key raw, like the folder names listed below it.
     root: ObjectLocation,
     options: DirectoryOptions,
+    metadata_read_concurrency: NonZeroUsize,
 }
 
 impl DirectStorageCatalogClient {
@@ -33,22 +35,30 @@ impl DirectStorageCatalogClient {
         backend: &StorageBackend,
         base_path: &str,
         options: DirectoryOptions,
+        metadata_read_concurrency: NonZeroUsize,
         all_secrets: &[&str],
     ) -> Result<Self, UdfError> {
         let store_url = ObjectLocation::from_raw(base_path)?.store_root().clone();
-        let store = crate::scan::build_admission_limited_store(backend, &store_url, all_secrets)?;
-        Self::over_store(store, base_path, options)
+        let store = crate::scan::build_admission_limited_store(
+            backend,
+            &store_url,
+            metadata_read_concurrency,
+            all_secrets,
+        )?;
+        Self::over_store(store, base_path, options, metadata_read_concurrency)
     }
 
     pub(crate) fn over_store(
         store: Arc<dyn ObjectStore>,
         base_path: &str,
         options: DirectoryOptions,
+        metadata_read_concurrency: NonZeroUsize,
     ) -> Result<Self, UdfError> {
         Ok(Self {
             store,
             root: ObjectLocation::from_raw(base_path)?,
             options,
+            metadata_read_concurrency,
         })
     }
 
@@ -64,8 +74,13 @@ impl DirectStorageCatalogClient {
     /// The one admission rule both listings share, so `SKIPPED_TABLES` reads the same after either.
     async fn admit(&self, ident: CatalogTableIdent) -> Result<TableAdmission, UdfError> {
         let table_root = self.root.child(&ident.name)?;
-        let directory =
-            resolve_parquet_directory(&self.store, table_root.key(), self.options).await?;
+        let directory = resolve_parquet_directory(
+            &self.store,
+            table_root.key(),
+            self.options,
+            self.metadata_read_concurrency,
+        )
+        .await?;
         if directory.files.is_empty() {
             return Ok(TableAdmission::Skipped(SkippedTable {
                 ident,
@@ -130,7 +145,7 @@ impl CatalogClient for DirectStorageCatalogClient {
         Box::pin(async move {
             let admissions: Vec<TableAdmission> = stream::iter(idents)
                 .map(|ident| self.admit(ident))
-                .buffered(DIRECT_STORAGE_ADMISSION_LIMIT)
+                .buffered(self.metadata_read_concurrency.get())
                 .try_collect()
                 .await?;
             Ok(admissions.into_iter().collect())

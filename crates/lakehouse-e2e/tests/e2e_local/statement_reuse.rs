@@ -1,5 +1,6 @@
 //! Counts the requests that one statement sends through the forward proxy, because only the
-//! proxy log shows how often the adapter loads a table (`specs/testing.md` § Correctness oracles).
+//! proxy log shows how often, and how many at once, the adapter reads table metadata
+//! (`specs/testing.md` § Correctness oracles).
 
 use crate::common::e2e_harness::{
     VsProps, create_virtual_schema, create_virtual_schema_with_password, exa_conn,
@@ -24,6 +25,11 @@ use iceberg::NamespaceIdent;
 const LATER_NAMESPACE: &str = "e2e_statement_reuse_later";
 const LATER_TABLE: &str = "later";
 const LATER_VS: &str = "REUSE_LATER_VS";
+const MANIFESTS_NAMESPACE: &str = "e2e_statement_reuse_manifests";
+const MANIFESTS_TABLE: &str = "manifests";
+const MANIFESTS_VS: &str = "REUSE_MANIFESTS_VS";
+/// One append per row, and each append commits one manifest.
+const MANIFESTS: i64 = 8;
 
 fn config_get() -> String {
     format!("GET {ICEBERG_REST_VIA_PROXY}/v1/config")
@@ -319,4 +325,86 @@ fn a_role_session_serves_every_pushdown_of_a_statement() {
         assumptions, 1,
         "one AssumeRole call for the whole statement"
     );
+}
+
+/// The manifest GETs in `log`, and the most of them the proxy held open at once. A manifest is
+/// an `.avro` file under `metadata/` that is not a `snap-` manifest list.
+fn manifest_reads(log: &str) -> (usize, usize) {
+    let mut open = std::collections::HashSet::new();
+    let (mut reads, mut peak) = (0, 0);
+    for line in log.lines() {
+        if let Some(fd) = proxy_fd(line, "Request (file descriptor ") {
+            let manifest =
+                line.contains("/metadata/") && line.contains(".avro ") && !line.contains("/snap-");
+            if manifest {
+                reads += 1;
+                open.insert(fd);
+                peak = peak.max(open.len());
+            } else {
+                open.remove(&fd);
+            }
+        } else if let Some(fd) = proxy_fd(line, "Closed connection between local client (fd:") {
+            open.remove(&fd);
+        }
+    }
+    (reads, peak)
+}
+
+fn proxy_fd<'l>(line: &'l str, marker: &str) -> Option<&'l str> {
+    let rest = &line[line.find(marker)? + marker.len()..];
+    rest.split(|c: char| !c.is_ascii_digit()).next()
+}
+
+/// Scenario: Planning keeps at most METADATA_READ_CONCURRENCY metadata reads in flight
+#[test]
+fn planning_keeps_at_most_the_configured_manifest_reads_in_flight() {
+    proxy_virtual_schemas();
+    let rt = runtime();
+    let catalog = seed_catalog(rt, "lakehouse-e2e-statement-reuse-manifests");
+    let namespace = NamespaceIdent::new(MANIFESTS_NAMESPACE.to_string());
+    rt.block_on(async {
+        drop_table_if_exists(&catalog, &namespace, MANIFESTS_TABLE).await;
+        ensure_id_val_table(&catalog, MANIFESTS_NAMESPACE, MANIFESTS_TABLE, 1, 1.0).await;
+        for id in 2..=MANIFESTS {
+            append_file(
+                &catalog,
+                MANIFESTS_NAMESPACE,
+                MANIFESTS_TABLE,
+                id_val_batch(id, 1.0),
+            )
+            .await;
+        }
+    });
+    let mut conn = exa_conn();
+    create_virtual_schema_with_password(
+        &mut conn,
+        &VsProps::new(MANIFESTS_VS, MANIFESTS_NAMESPACE).proxied("REUSE_MANIFESTS_CREDS"),
+        ICEBERG_REST_VIA_PROXY,
+        &local_stack_connection_password().via_proxy(),
+    );
+    let sql = format!(
+        "SELECT COUNT(*) FROM {}",
+        vs_table(MANIFESTS_VS, MANIFESTS_TABLE)
+    );
+
+    // The bound of 1 fails under the core-count default, and the lower bound of 2 proves that
+    // the fixture can show reads in flight together.
+    for (concurrency, peaks) in [("4", 2..=4), ("1", 1..=1)] {
+        conn.execute(&format!(
+            "ALTER VIRTUAL SCHEMA {MANIFESTS_VS} SET METADATA_READ_CONCURRENCY = '{concurrency}'"
+        ));
+        let mut rows = 0;
+        let log = proxy_log_during(|| rows = count(&sql));
+
+        let (reads, peak) = manifest_reads(&log);
+        assert_eq!(rows, MANIFESTS, "{concurrency}: rows");
+        assert_eq!(
+            reads, MANIFESTS as usize,
+            "{concurrency}: one GET per manifest"
+        );
+        assert!(
+            peaks.contains(&peak),
+            "{concurrency}: {peak} manifest GETs in flight at once, expected {peaks:?}"
+        );
+    }
 }

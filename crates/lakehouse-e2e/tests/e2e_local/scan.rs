@@ -1127,7 +1127,7 @@ fn order_by_without_limit_falls_back_correctly() {
 fn schema_notes_hold_the_tuning_keys_and_the_catalog_prefix() {
     const NOTES_VS: &str = "LHVS_NOTE_KEYS";
     const NOTES_DIRECT_CONN: &str = "LHVS_NOTE_KEYS_DIRECT";
-    const EXPECTED_KEYS: [&str; 11] = [
+    const EXPECTED_KEYS: [&str; 12] = [
         "CATALOG_PREFIX",
         "DF_BATCH_SIZE",
         "DF_TARGET_PARTITIONS",
@@ -1136,6 +1136,7 @@ fn schema_notes_hold_the_tuning_keys_and_the_catalog_prefix() {
         "INSTANCE_OVERHEAD_MB",
         "JOIN_BROADCAST_MAX_BYTES",
         "MEMORY_POOL_FRACTION",
+        "METADATA_READ_CONCURRENCY",
         "PARALLELISM_FACTOR",
         "S3_MAX_CONNECTIONS",
         "SKIPPED_TABLES",

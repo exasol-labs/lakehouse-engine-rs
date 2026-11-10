@@ -28,6 +28,7 @@ pub(super) const PROP_INSTANCE_OVERHEAD_MB: &str = "INSTANCE_OVERHEAD_MB";
 pub(super) const PROP_JOIN_BROADCAST_MAX_BYTES: &str = "JOIN_BROADCAST_MAX_BYTES";
 // Mirrors the native `IMPORT FROM PARQUET` `MaxConnections` knob.
 pub(super) const PROP_S3_MAX_CONNECTIONS: &str = "S3_MAX_CONNECTIONS";
+pub(super) const PROP_METADATA_READ_CONCURRENCY: &str = "METADATA_READ_CONCURRENCY";
 pub(super) const PROP_MERGE_SCHEMA: &str = "MERGE_SCHEMA";
 pub(super) const PROP_HIVE_PARTITIONING: &str = "HIVE_PARTITIONING";
 // Like Spark's `spark.sql.parquet.binaryAsString`, for writers that store text as binary.
@@ -39,7 +40,7 @@ const PROP_TABLE_EXCLUDE: &str = "TABLE_EXCLUDE";
 
 /// Every name a virtual schema may set; the value rules of the properties whose owning module
 /// checks the value stay in that module.
-const PROPERTY_NAMES: [&str; 20] = [
+const PROPERTY_NAMES: [&str; 21] = [
     PROP_CATALOG_KIND,
     PROP_CATALOG_CONNECTION,
     PROP_NAMESPACE,
@@ -53,6 +54,7 @@ const PROPERTY_NAMES: [&str; 20] = [
     PROP_INSTANCE_OVERHEAD_MB,
     PROP_JOIN_BROADCAST_MAX_BYTES,
     PROP_S3_MAX_CONNECTIONS,
+    PROP_METADATA_READ_CONCURRENCY,
     PROP_MERGE_SCHEMA,
     PROP_HIVE_PARTITIONING,
     PROP_BINARY_AS_STRING,
@@ -85,6 +87,7 @@ pub(super) struct TuningProperties {
     pub(super) instance_overhead_mb: Option<u16>,
     pub(super) join_broadcast_max_bytes: Option<NonZeroU64>,
     pub(super) s3_max_connections: Option<NonZeroU16>,
+    pub(super) metadata_read_concurrency: Option<NonZeroU8>,
 }
 
 /// The checked values that the create-time resolution reads without parsing a string again.
@@ -217,6 +220,7 @@ impl<'a> TuningChecker<'a> {
             instance_overhead_mb: self.whole_number(PROP_INSTANCE_OVERHEAD_MB),
             join_broadcast_max_bytes: self.whole_number(PROP_JOIN_BROADCAST_MAX_BYTES),
             s3_max_connections: self.whole_number(PROP_S3_MAX_CONNECTIONS),
+            metadata_read_concurrency: self.whole_number(PROP_METADATA_READ_CONCURRENCY),
         }
     }
 

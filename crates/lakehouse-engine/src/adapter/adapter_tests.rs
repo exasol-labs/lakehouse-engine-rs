@@ -456,6 +456,7 @@ impl Default for super::TuningNotes {
             instance_overhead_mb: DEFAULT_INSTANCE_OVERHEAD_MB,
             s3_max_connections: DEFAULT_S3_MAX_CONNECTIONS,
             join_broadcast_max_bytes: DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+            metadata_read_concurrency: DEFAULT_METADATA_READ_CONCURRENCY,
         }
     }
 }
@@ -1298,7 +1299,13 @@ fn resolve_config_over(
         .enable_all()
         .build()
         .expect("build the request runtime");
-    resolve_connection_config(&ctx, props, &PermissionSettings::Off, &rt)
+    resolve_connection_config(
+        &ctx,
+        props,
+        &PermissionSettings::Off,
+        DEFAULT_METADATA_READ_CONCURRENCY,
+        &rt,
+    )
 }
 
 #[test]
